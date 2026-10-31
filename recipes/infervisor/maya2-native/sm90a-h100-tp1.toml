@@ -81,10 +81,10 @@ PLOW_NV_DENSE_TUNE = "1"
 PLOW_NV_FA_FOLD = "1"
 
 [capabilities]
-masked_padding = "Maya2 speech-LM prompts are short (<512) and padded directly into packed prefill launches"
-segment_roles = "Maya2 Qwen3-1.7B backbone uses native SM90 CUTLASS/CUDA kernels; cuBLASLt dense decode is incompatible with cb0 2049 head"
-generated_kernels = "Native CUTLASS/SM90a attention and GEMV kernels built into interp_sm90a.cubin"
-cublaslt_prefill = "Maya2 uses native SM90 CUTLASS projection kernels for prompt prefill"
+masked_padding = "structural: request chunk limits (masked padding) are Gemma 4 only (crates/devgen/src/lib.rs:9382), and the packed contract needs the plow_pf_masked_padding_abi object capability (crates/plow-asset/src/packed_prefill.rs:87), which only the hd256/hd512 attention and Gemma 4 GLU objects declare; Maya2 is hd128 GQA2 on interp_sm90a*. Unmasked pad rows fit: prompts < 512 rows, max_ctx 2048"
+segment_roles = "OFF pending promotion; the route wins. Both cuBLASLt routes declare segment roles: prefill Lt 3.0-3.3x (cublaslt_prefill), decode Lt (PLOW_EMIT_DECODE_CUBLASLT=1) step ms at ctx 512 vs interpreter B1 2.15/2.21, B8 2.42/2.13 (loses), B32 2.85/3.11, B64 3.56/5.52, B128 5.01/7.72; logits rel-L2 0.019-0.027, top1 1.0, KL <= 0.0045. The cb0 2049 head is not an obstacle: the lm_head is routed only with PLOW_EMIT_DECODE_CUBLASLT_HEAD (crates/devgen/src/dense_cublaslt.rs:623). Decode Lt stops at 128 rows (crates/plow-asset/src/segment_roles.rs:262, crates/devgen/src/dense_cublaslt.rs:628), so rungs 160-256 need the ladder capped at 128. H100 gpu03, same step_bench, ABBA: /opt/dlami/nvme/lava-tts/maya2-caps/run1, run3"
+generated_kernels = "structural: no generated role for hd128 GQA2 attention (16 q / 8 kv heads); the sm_90a catalog tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json has hd256/hd512 entries only, matched on head width (crates/devgen/src/gen_kernels.rs:406,414)"
+cublaslt_prefill = "OFF pending promotion; the route wins. PLOW_EMIT_PREFILL_CUBLASLT=1 (784 projection segments) packed prefill ms vs interpreter GEMM: 64 rows 3.91/12.78, 128 4.15/13.57, 256 4.66/14.38, 512 5.91/17.57, 8x64 5.34/16.99, 4x128 5.35/17.46 (20-27% vs 6-9% of the 0.84 ms weight / 989 TFLOP/s floor). Decode programs are op-identical, and greedy decode streams after a packed prefill are identical (fnv 22622861cb922c55 at 8x64). H100 gpu03, same step_bench, ABBA: /opt/dlami/nvme/lava-tts/maya2-caps/run2, run3"
 
 [bench]
 kind = "speech"
