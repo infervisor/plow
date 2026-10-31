@@ -562,6 +562,9 @@ pub struct AppState {
     models_roots: std::sync::OnceLock<Vec<std::path::PathBuf>>,
     #[cfg(feature = "cpu")]
     portable: std::sync::OnceLock<Arc<portable::PortableManager>>,
+    /// slug → its engine's config (`config::bundle_config`), set before the engine loads; the
+    /// dispatcher and engine thread run under it.
+    engine_cfg: RwLock<FxHashMap<String, &'static crate::config::RuntimeConfig>>,
     /// Operator-set residency overrides, slug → state. Absent = [`Residency::Auto`].
     /// Only the control plane writes here; the manager and the request path read it.
     residency: RwLock<FxHashMap<String, Residency>>,
@@ -653,6 +656,7 @@ impl AppState {
             models_roots: std::sync::OnceLock::new(),
             #[cfg(feature = "cpu")]
             portable: std::sync::OnceLock::new(),
+            engine_cfg: RwLock::new(FxHashMap::default()),
             residency: RwLock::new(FxHashMap::default()),
             control: Mutex::new(FxHashMap::default()),
             started: openai::now_secs(),
@@ -1128,6 +1132,16 @@ impl AppState {
     /// The assets-dir allow-list. Empty until `install_models_roots`.
     pub fn models_roots(&self) -> &[std::path::PathBuf] {
         self.models_roots.get().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Record the config `slug`'s engine runs under.
+    pub fn set_engine_config(&self, slug: &str, cfg: &'static crate::config::RuntimeConfig) {
+        self.engine_cfg.write().insert(slug.to_string(), cfg);
+    }
+
+    /// The config `slug`'s engine runs under; `None` = the process config.
+    pub fn engine_config(&self, slug: &str) -> Option<&'static crate::config::RuntimeConfig> {
+        self.engine_cfg.read().get(slug).copied()
     }
 
     /// Residency state of `slug` (defaults to [`Residency::Auto`]).

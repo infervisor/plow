@@ -1141,6 +1141,17 @@ pub fn spawn(
     state: Arc<AppState>,
     cfg: MuxConfig,
 ) -> ModelMux {
+    // The model's own engine config for everything the dispatcher reads, here and in its task.
+    let engine_cfg = state.engine_config(&slug);
+    crate::config::scoped(engine_cfg, || spawn_scoped(slug, bundle, state, cfg))
+}
+
+fn spawn_scoped(
+    slug: String,
+    bundle: Arc<ModelBundle>,
+    state: Arc<AppState>,
+    cfg: MuxConfig,
+) -> ModelMux {
     let preempt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let preempt_seen = Arc::clone(&preempt_flag);
     let preempt_notify = Arc::new(tokio::sync::Notify::new());
@@ -1346,6 +1357,7 @@ pub fn spawn(
         .filter(|cpus| !cpus.is_empty() && crate::config::RuntimeConfig::get().dp_numa_pin);
     let downstream = state.downstream(&slug);
 
+    let dispatcher_scope = crate::config::current_scope();
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
         let mut fair = Fair::default();
@@ -2047,9 +2059,12 @@ pub fn spawn(
             let joined = match &engine_thread {
                 Some(t) => t.run(tick).await,
                 None if inline_tick => crate::exec::engine_thread::run_inline(tick),
-                None => tokio::task::spawn_blocking(tick)
-                    .await
-                    .map_err(|e| e.to_string()),
+                None => {
+                    let scope = crate::config::current_scope();
+                    tokio::task::spawn_blocking(move || crate::config::scoped(scope, tick))
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             };
 
             let t_returned = Instant::now();
@@ -2210,6 +2225,7 @@ pub fn spawn(
         metrics.decode_rung_admission.store(0, Ordering::Relaxed);
         metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
     };
+    let dispatcher = crate::config::Scoped::new(dispatcher_scope, dispatcher);
     if inline_tick {
         std::thread::Builder::new()
             .name(dispatcher_name)

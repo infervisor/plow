@@ -5477,6 +5477,70 @@ pub(crate) fn host_mem_available() -> Option<(u64, u64)> {
 /// Host RAM the pinned tier leaves to the rest of the machine: an eighth of it, at least
 /// 16 GiB (pinned pages cannot be reclaimed; a co-tenant build must not OOM-kill the server).
 /// `host_tier_auto` returns `(default tier capacity, host reserve)`; see [`host_tier_default`].
+/// Host-tier bytes granted to live engines' block stores, and the process budget they share.
+static HOST_TIER_GRANTED: AtomicU64 = AtomicU64::new(0);
+static HOST_TIER_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+/// One engine's share of the process host-tier budget, returned when its store goes.
+#[derive(Debug)]
+pub(crate) struct HostTierGrant(u64);
+
+impl HostTierGrant {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Drop for HostTierGrant {
+    fn drop(&mut self) {
+        HOST_TIER_GRANTED.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
+
+/// Grant an engine asking `requested` host-tier bytes its share. The tier pins host memory and
+/// never gives it back, so co-served engines draw from ONE budget — the largest any engine has
+/// asked (its packet's `PLOW_VMM_HOST_CACHE_MIB`, or the auto size) — never one each: the second
+/// of two 64 GiB engines gets what the first left. A lone engine gets exactly what it asked.
+pub(crate) fn host_tier_grant(requested: u64) -> HostTierGrant {
+    HOST_TIER_BUDGET.fetch_max(requested, Ordering::AcqRel);
+    let mut granted = HOST_TIER_GRANTED.load(Ordering::Acquire);
+    loop {
+        // Re-read every attempt: a larger request may have raised the budget meanwhile.
+        let budget = HOST_TIER_BUDGET.load(Ordering::Acquire);
+        let give = requested.min(budget.saturating_sub(granted));
+        match HOST_TIER_GRANTED.compare_exchange_weak(
+            granted,
+            granted + give,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return HostTierGrant(give),
+            Err(now) => granted = now,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn co_served_engines_share_one_host_tier_budget() {
+    const G: u64 = 1 << 30;
+    let first = host_tier_grant(64 * G);
+    assert_eq!(first.bytes(), 64 * G, "a lone engine gets what it asked");
+    let second = host_tier_grant(64 * G);
+    assert_eq!(second.bytes(), 0, "never two 64 GiB tiers in one process");
+    drop(first);
+    let third = host_tier_grant(16 * G);
+    assert_eq!(third.bytes(), 16 * G);
+    let fourth = host_tier_grant(64 * G);
+    assert_eq!(
+        fourth.bytes(),
+        48 * G,
+        "what the others left of the largest request"
+    );
+    drop((second, third, fourth));
+    assert_eq!(HOST_TIER_GRANTED.load(Ordering::Acquire), 0);
+}
+
 pub(crate) fn host_tier_auto() -> Option<(u64, u64)> {
     let (avail, total) = host_mem_available()?;
     Some((host_tier_default(avail, total), host_reserve(total)))

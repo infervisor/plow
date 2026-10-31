@@ -801,7 +801,10 @@ impl ModelManager {
             let vmm = device
                 .compute_capability()
                 .and_then(|cap| device.granularity().ok().map(|g| (g, cap)));
-            let plan = BlobPlan::from_dir_with_device(&dir, vmm, Some(&ckpt))?;
+            let cfg = crate::config::bundle_config(&dir)?;
+            let plan = crate::config::scoped(Some(cfg), || {
+                BlobPlan::from_dir_with_device(&dir, vmm, Some(&ckpt))
+            })?;
             tracing::info!(
                 %slug,
                 weights_gib = gib(plan.weights_bytes),
@@ -881,7 +884,10 @@ impl ModelManager {
             .device
             .compute_capability()
             .and_then(|cap| self.device.granularity().ok().map(|g| (g, cap)));
-        let plan = BlobPlan::from_dir_with_device(&dir, vmm, Some(&ckpt))?;
+        let cfg = crate::config::bundle_config(&dir)?;
+        let plan = crate::config::scoped(Some(cfg), || {
+            BlobPlan::from_dir_with_device(&dir, vmm, Some(&ckpt))
+        })?;
         tracing::info!(
             %slug,
             dir = %dir.display(),
@@ -1574,9 +1580,12 @@ impl ModelManager {
                 tracing::error!(%slug, holders, "engine still referenced at evict — VRAM leak");
             }
         }
-        on_own_thread("plow-unload", move || drop(engine))
-            .await
-            .map_err(EnsureError::Load)?;
+        let cfg = state.engine_config(slug);
+        on_own_thread("plow-unload", move || {
+            crate::config::scoped(cfg, || drop(engine))
+        })
+        .await
+        .map_err(EnsureError::Load)?;
         let engine_ms = ms(t1);
         if let Ok(bundle) = state.registry.get(state.model_of(slug)) {
             let device = self.ordinal();
@@ -1625,7 +1634,12 @@ impl ModelManager {
         //
         // So this is a refusal, not a warning: a diagnostic knob must not be
         // able to deadlock a device by being left set.
-        if crate::config::RuntimeConfig::get().nv.pf_seg_noncoop {
+        // This bundle's own knobs: every step of its load below runs under them.
+        let cfg = crate::config::bundle_config(&m.dir).map_err(EnsureError::Load)?;
+        state.set_engine_config(&m.slug, cfg);
+        // Either side running non-cooperative launches is the hazard: per-engine configs let
+        // one model set it and its co-tenant not.
+        {
             let co_tenants: Vec<String> = self
                 .models
                 .read()
@@ -1634,7 +1648,15 @@ impl ModelManager {
                 .map(|o| o.slug.clone())
                 .filter(|slug| self.is_resident(slug))
                 .collect();
-            if !co_tenants.is_empty() {
+            let noncoop = |c: Option<&crate::config::RuntimeConfig>| {
+                c.unwrap_or_else(|| crate::config::RuntimeConfig::get())
+                    .nv
+                    .pf_seg_noncoop
+            };
+            if !co_tenants.is_empty()
+                && (cfg.nv.pf_seg_noncoop
+                    || co_tenants.iter().any(|s| noncoop(state.engine_config(s))))
+            {
                 return Err(EnsureError::Load(RuntimeError::Rejected(format!(
                     "refusing to make {} co-resident with {:?} while PLOW_PF_SEG_NONCOOP is set: \
                      non-cooperative launch assumes the device is otherwise idle, and a co-tenant \
@@ -1671,13 +1693,16 @@ impl ModelManager {
         let pool_before = self.device.pool_bytes();
         let device = Arc::clone(&self.device);
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
-        let engine = on_own_thread("plow-load", move || device.load_engine(&dir, &ckpt))
-            .await
-            .and_then(|engine| engine)
-            .map_err(EnsureError::Load)?;
+        let engine = on_own_thread("plow-load", move || {
+            crate::config::scoped(Some(cfg), || device.load_engine(&dir, &ckpt))
+        })
+        .await
+        .and_then(|engine| engine)
+        .map_err(EnsureError::Load)?;
         #[cfg(feature = "cuda")]
         if let crate::serve::engine::ServeEngine::Cuda(ref gpu) = engine {
-            mux::check_speech_packet(gpu).map_err(EnsureError::Load)?;
+            crate::config::scoped(Some(cfg), || mux::check_speech_packet(gpu))
+                .map_err(EnsureError::Load)?;
         }
         let (free_after, _) = self.device.mem_info().map_err(EnsureError::Load)?;
         let pool_after = self.device.pool_bytes();
@@ -1710,8 +1735,10 @@ impl ModelManager {
         let bind_state = Arc::clone(&state);
         let slug = m.slug.clone();
         let bound = on_own_thread("plow-bind", move || -> Result<()> {
-            crate::asr::serving::bind(&bind_state, &slug)?;
-            crate::tts::serving::bind(&bind_state, &slug).map_err(RuntimeError::Msg)
+            crate::config::scoped(Some(cfg), || {
+                crate::asr::serving::bind(&bind_state, &slug)?;
+                crate::tts::serving::bind(&bind_state, &slug).map_err(RuntimeError::Msg)
+            })
         })
         .await
         .and_then(|bound| bound);

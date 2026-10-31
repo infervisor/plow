@@ -2821,6 +2821,15 @@ fn select_compat<T>(parsed: T, environment: Option<T>, allow_environment: bool) 
 }
 
 impl RuntimeConfig {
+    /// The environment as a fallback for an env-backed field, read only before the process
+    /// config exists (library embedders): an initialized config already parsed it, and an
+    /// engine config deliberately ignores what startup exported for another bundle.
+    fn env_fallback(var: &str) -> Option<String> {
+        (!Self::is_initialized())
+            .then(|| Self::env_nonempty(var))
+            .flatten()
+    }
+
     fn env_bool(var: &str) -> Option<bool> {
         let value = std::env::var(var).ok()?;
         Some(matches!(
@@ -2925,7 +2934,7 @@ impl RuntimeConfig {
             .nv
             .vmm_live_rings_models
             .clone()
-            .or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+            .or_else(|| Self::env_fallback("PLOW_VMM_LIVE_RINGS_MODELS"));
         let listed = spec.is_some_and(|spec| {
             served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
         });
@@ -2942,7 +2951,7 @@ impl RuntimeConfig {
             .nv
             .vmm_live_rings_models
             .clone()
-            .or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+            .or_else(|| Self::env_fallback("PLOW_VMM_LIVE_RINGS_MODELS"));
         spec.is_some_and(|spec| {
             served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
         })
@@ -2960,7 +2969,7 @@ impl RuntimeConfig {
     pub fn live_ctx(&self) -> Option<u32> {
         self.amd
             .live_ctx
-            .or_else(|| Self::env_nonempty("PLOW_LIVE_CTX").and_then(|v| v.parse().ok()))
+            .or_else(|| Self::env_fallback("PLOW_LIVE_CTX").and_then(|v| v.parse().ok()))
     }
 
     /// Live bound for the packet in `assets_dir`: its served name's `--live-ctx-models` entry,
@@ -2970,7 +2979,7 @@ impl RuntimeConfig {
             .amd
             .live_ctx_models
             .clone()
-            .or_else(|| Self::env_nonempty("PLOW_LIVE_CTX_MODELS"));
+            .or_else(|| Self::env_fallback("PLOW_LIVE_CTX_MODELS"));
         let per_model = spec.and_then(|spec| {
             let slug = served_name(assets_dir)?;
             spec.split(',').find_map(|kv| {
@@ -3315,6 +3324,14 @@ impl RuntimeConfig {
     /// `env` attributes do the reading, so the `PLOW_*` contract holds for
     /// every entry point. Cold-path accessor — one atomic load once cached.
     pub fn get() -> &'static RuntimeConfig {
+        if let Some(c) = SCOPED.with(std::cell::Cell::get) {
+            return c;
+        }
+        Self::process()
+    }
+
+    /// The process config, ignoring any engine scope.
+    fn process() -> &'static RuntimeConfig {
         if let Some(c) = RUNTIME_CONFIG.get() {
             return c;
         }
@@ -3329,6 +3346,222 @@ impl RuntimeConfig {
             EnvOnly::parse_from(["plowrt"]).cfg
         })
     }
+}
+
+thread_local! {
+    /// The engine config of the model this thread is working for ([`scoped`]): what
+    /// [`RuntimeConfig::get`] returns while it is set.
+    static SCOPED: std::cell::Cell<Option<&'static RuntimeConfig>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The engine scope this thread runs under, to carry onto a thread or task it starts.
+pub fn current_scope() -> Option<&'static RuntimeConfig> {
+    SCOPED.with(std::cell::Cell::get)
+}
+
+/// Run `f` with `cfg` as this thread's engine scope (`None` = the process config), restoring
+/// the previous scope after, also on unwind.
+pub fn scoped<R>(cfg: Option<&'static RuntimeConfig>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<&'static RuntimeConfig>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPED.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(SCOPED.with(|s| s.replace(cfg)));
+    f()
+}
+
+/// A future polled (and dropped) under an engine scope: a model's dispatcher task, which tokio
+/// may poll on any worker thread.
+pub struct Scoped<F: std::future::Future> {
+    cfg: Option<&'static RuntimeConfig>,
+    fut: Option<std::pin::Pin<Box<F>>>,
+}
+
+impl<F: std::future::Future> Scoped<F> {
+    pub fn new(cfg: Option<&'static RuntimeConfig>, fut: F) -> Self {
+        Scoped {
+            cfg,
+            fut: Some(Box::pin(fut)),
+        }
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for Scoped<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let this = self.get_mut();
+        let fut = this.fut.as_mut().expect("polled after completion");
+        scoped(this.cfg, || fut.as_mut().poll(cx))
+    }
+}
+
+impl<F: std::future::Future> Drop for Scoped<F> {
+    fn drop(&mut self) {
+        let fut = self.fut.take();
+        scoped(self.cfg, || drop(fut));
+    }
+}
+
+/// The settings every engine config starts from: runtime args given on the command line, and
+/// the packet serve defaults startup exported into the environment (which are not the
+/// operator's, and so lose to each engine's own bundle).
+pub struct Startup {
+    cli: Vec<(String, Vec<std::ffi::OsString>)>,
+    exported: std::collections::BTreeMap<String, String>,
+}
+
+static STARTUP: OnceLock<Startup> = OnceLock::new();
+
+impl Startup {
+    /// `cli`: arg id -> raw values given on the command line; `exported`: what startup exported.
+    pub fn new(
+        cli: Vec<(String, Vec<std::ffi::OsString>)>,
+        exported: std::collections::BTreeMap<String, String>,
+    ) -> Startup {
+        Startup { cli, exported }
+    }
+
+    pub fn from_matches(
+        m: &clap::ArgMatches,
+        exported: impl IntoIterator<Item = (String, String)>,
+    ) -> Startup {
+        use clap::Args;
+        let cmd = RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+        let cli = cmd
+            .get_arguments()
+            .map(|a| a.get_id().as_str())
+            .filter(|id| m.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
+            .filter_map(|id| {
+                let raw = m.get_raw(id)?.map(|v| v.to_os_string()).collect();
+                Some((id.to_string(), raw))
+            })
+            .collect();
+        Startup {
+            cli,
+            exported: exported.into_iter().collect(),
+        }
+    }
+}
+
+/// Record the startup inputs of [`bundle_config`] (once, from `main`, after the CLI parse).
+pub fn record_startup(startup: Startup) {
+    let _ = STARTUP.set(startup);
+}
+
+/// The config of an engine whose bundle asks `defaults` (engine-scoped `(env, value)` pairs).
+/// Per engine-scoped knob: the command line, else the operator's environment, else `defaults`,
+/// else the built-in default; every process-scoped knob as the process has it.
+///
+/// Built by the same clap parse as the process config, with each packet default as the arg's
+/// default value (one value parser, one precedence), never by rewriting argv or the environment.
+pub fn resolve_engine(
+    st: &Startup,
+    defaults: &[(String, String)],
+) -> std::result::Result<RuntimeConfig, String> {
+    use clap::{Args, FromArgMatches};
+    fn leak(v: &str) -> &'static str {
+        Box::leak(v.to_owned().into_boxed_str())
+    }
+    let mut cmd = RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+    let args: Vec<(String, Option<String>)> = cmd
+        .get_arguments()
+        .map(|a| {
+            let env = a.get_env().map(|e| e.to_string_lossy().into_owned());
+            (a.get_id().to_string(), env)
+        })
+        .collect();
+    for (id, env) in args {
+        if let Some((_, raw)) = st.cli.iter().find(|(i, _)| *i == id) {
+            let vals: Vec<&'static std::ffi::OsStr> = raw
+                .iter()
+                .map(|v| &*Box::leak(v.clone().into_boxed_os_str()))
+                .collect();
+            cmd = cmd.mut_arg(&id, |a| a.env(None::<&'static str>).default_values(vals));
+            continue;
+        }
+        let Some(env) = env else { continue };
+        if crate::knob_spec::knob_scope(&env) != Some(crate::knob_spec::KnobScope::Engine) {
+            continue;
+        }
+        let exported = st.exported.contains_key(&env);
+        if !exported && std::env::var_os(&env).is_some() {
+            continue;
+        }
+        let own = defaults
+            .iter()
+            .find(|(k, _)| *k == env)
+            .map(|(_, v)| leak(v));
+        cmd = cmd.mut_arg(&id, |a| {
+            let a = if exported {
+                a.env(None::<&'static str>)
+            } else {
+                a
+            };
+            match own {
+                Some(v) => a.default_value(v),
+                None => a,
+            }
+        });
+    }
+    let m = cmd
+        .try_get_matches_from(["plowrt"])
+        .map_err(|e| e.to_string())?;
+    RuntimeConfig::from_arg_matches(&m).map_err(|e| e.to_string())
+}
+
+/// The engine config for the bundle in `dir`: [`resolve_engine`] over its packet's engine-scoped
+/// serve defaults, resolved once per bundle and defaults (an engine owns the `&'static` and
+/// every reload of the bundle shares it). The process config itself when they agree — a
+/// single-model serve, whose startup exported exactly this bundle's defaults. Without a
+/// recorded startup (a library embedder) the process config.
+pub fn bundle_config(dir: &std::path::Path) -> crate::Result<&'static RuntimeConfig> {
+    let process = RuntimeConfig::process();
+    let Some(st) = STARTUP.get() else {
+        return Ok(process);
+    };
+    let all = crate::asset::serve::bundle_serve_defaults(dir)?
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let (defaults, shared): (Vec<_>, Vec<_>) = all.into_iter().partition(|(k, _)| {
+        crate::knob_spec::knob_scope(k) == Some(crate::knob_spec::KnobScope::Engine)
+    });
+    for (key, value) in &shared {
+        if std::env::var(key).ok().as_deref() != Some(value.as_str()) {
+            tracing::warn!(
+                bundle = %dir.display(), knob = %key, packet = %value,
+                "packet serve default is process-wide; this model runs with the process value"
+            );
+        }
+    }
+    static CACHE: std::sync::Mutex<
+        Vec<(
+            std::path::PathBuf,
+            Vec<(String, String)>,
+            &'static RuntimeConfig,
+        )>,
+    > = std::sync::Mutex::new(Vec::new());
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, cfg)) = cache.iter().find(|(d, k, _)| *d == canon && *k == defaults) {
+        return Ok(cfg);
+    }
+    let cfg = resolve_engine(st, &defaults).map_err(|e| {
+        crate::RuntimeError::Rejected(format!("{}: engine config: {e}", dir.display()))
+    })?;
+    let cfg: &'static RuntimeConfig = if format!("{cfg:?}") == format!("{process:?}") {
+        process
+    } else {
+        tracing::info!(bundle = %dir.display(), defaults = ?defaults, "engine config resolved for the bundle");
+        Box::leak(Box::new(cfg))
+    };
+    cache.push((canon, defaults, cfg));
+    Ok(cfg)
 }
 
 /// Explicit runtime settings from the resolved CLI, in replayable environment spelling.

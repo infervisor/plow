@@ -1158,6 +1158,12 @@ async fn async_main(
         tracing::info!(%key, %value, %source, "serve default from the assets");
     }
     RuntimeConfig::init(cli.rt_cfg);
+    plowrt::config::record_startup(plowrt::config::Startup::from_matches(
+        &matches,
+        asset_defaults
+            .iter()
+            .map(|(k, v, _)| (k.clone(), v.clone())),
+    ));
     let _ = plowrt::obs::serving::started_at_unix_ms();
     plowrt::knob_spec::warn_removed_env();
     match cli.cmd {

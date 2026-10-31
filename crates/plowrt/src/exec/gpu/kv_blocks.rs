@@ -251,6 +251,8 @@ pub struct BlockServe {
     _grower_stop: WorkerStop,
     /// `kernel`'s module: unloaded with the store server, or every reload pinned another.
     _segcopy: Option<OwnedModule>,
+    /// This store's share of the process host-tier budget.
+    _host_grant: crate::memory::vmm::HostTierGrant,
 }
 
 struct OwnedModule(Arc<CudaBackend>, crate::device::Module);
@@ -281,9 +283,10 @@ impl BlockServe {
         be: &Arc<CudaBackend>,
         v: &VmmServe,
         device_cap: u64,
-        host_cap: u64,
+        host_grant: crate::memory::vmm::HostTierGrant,
         state_tensors: &[(usize, u64)],
     ) -> Result<Arc<Self>> {
+        let host_cap = host_grant.bytes();
         let kv = v.kv.as_ref().expect("block store needs the prefix pool");
         let g = kv.geometry();
         let block_rows = kv.block_rows();
@@ -419,6 +422,7 @@ impl BlockServe {
             _grower_stop: grower_stop,
             stats: Mutex::new(BlockServeStats::default()),
             _segcopy: segcopy,
+            _host_grant: host_grant,
         }))
     }
 
