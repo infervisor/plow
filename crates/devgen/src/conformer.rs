@@ -1056,8 +1056,8 @@ pub fn append_chunk_step(
         let bv = b.tensor(layer.attention.bias_v, u64::from(w) * 4);
         last = b.emit(
             DevOp::RelativeAttentionF32,
-            // query_row0 > 0: a block per (item, new row, head).
-            repeated_cus(n_cu, n * spec.heads),
+            // query_row0 > 0: a block per (item, new row, head), strided past u16::MAX slices.
+            repeated_cus(n_cu, (n * spec.heads).min(u32::from(u16::MAX))),
             &[last],
             |d| {
                 d.t[..8].copy_from_slice(&[ctx, qw, kw, vw, position, bu, bv, key_start]);
