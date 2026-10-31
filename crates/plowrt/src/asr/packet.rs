@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use plow_asset::speech_contract::{self, TokenOutput};
 
@@ -71,10 +72,13 @@ impl PacketRnntTranscriber {
         let mut windows = Vec::new();
         let mut steps = stream.steps;
         if finish {
-            let features = self.frontend.extract(&stream.samples)?;
-            let rows = self.execution.final_rows(features.frames)?;
+            // Only the frames from this window on (partial streaming stepped complete windows,
+            // so it starts inside the recording); they equal the whole recording's.
+            let first = start(steps);
+            let (features, _) = self.frontend.extract_partial(&stream.samples, first)?;
+            let rows = self.execution.final_rows(first + features.frames)?;
             while steps * w.rows < rows {
-                let (from, to) = (start(steps) * w.bins, end(steps) * w.bins);
+                let (from, to) = ((start(steps) - first) * w.bins, (end(steps) - first) * w.bins);
                 let mut window = vec![0.0; to - from];
                 let len = features.values.len();
                 let values = &features.values[from.min(len)..to.min(len)];
@@ -157,6 +161,7 @@ impl Transcriber for PacketRnntTranscriber {
     /// Steps the streams in rounds, a round taking the next window of every stream with one left
     /// (up to `PacketRnnt::stream_batch` per launch).
     fn stream_push_batch(&mut self, pushes: &[StreamPush<'_>]) -> Vec<Result<String>> {
+        let started = Instant::now();
         let mut results: Vec<Option<Result<String>>> = pushes.iter().map(|_| None).collect();
         // (push, stream, its windows): out of the map while they step.
         let mut active = Vec::with_capacity(pushes.len());
@@ -178,7 +183,9 @@ impl Transcriber for PacketRnntTranscriber {
                 }
             }
         }
+        let mel_us = started.elapsed().as_micros() as u64;
         let batch = self.execution.stream_batch();
+        let (mut rounds, mut launches) = (0, 0);
         for round in 0.. {
             let members: Vec<usize> = (0..active.len())
                 .filter(|&a| results[active[a].0].is_none() && active[a].2.len() > round)
@@ -186,7 +193,9 @@ impl Transcriber for PacketRnntTranscriber {
             if members.is_empty() {
                 break;
             }
+            rounds += 1;
             for launch in members.chunks(batch) {
+                launches += 1;
                 let mut steps = Vec::with_capacity(launch.len());
                 let mut next = launch.iter().copied().peekable();
                 for (a, (_, stream, windows)) in active.iter_mut().enumerate() {
@@ -218,6 +227,15 @@ impl Transcriber for PacketRnntTranscriber {
                 }
             }
         }
+        tracing::debug!(
+            pushes = pushes.len(),
+            finishes = pushes.iter().filter(|push| push.finish).count(),
+            rounds,
+            launches,
+            mel_us,
+            total_us = started.elapsed().as_micros() as u64,
+            "rnnt stream push batch"
+        );
         for (index, stream, _) in active {
             let result = results[index]
                 .take()
