@@ -59,6 +59,10 @@ const STAGING: usize = 4;
 const WORKSPACE_BYTES: u64 = 128 << 20;
 /// Split-KV upper bound (the exported combine's log_max_splits 7).
 const MAX_SPLITS: u32 = 128;
+/// Page-table columns past the widest request, each the request's own last page. lean-plow
+/// `page_envelope.v1` (`Plow.PageEnvelope.route_safe`) needs `MAX_SPLITS <= TABLE_PAD + 1`.
+const TABLE_PAD: u32 = MAX_SPLITS;
+const _: () = assert!(MAX_SPLITS <= TABLE_PAD + 1);
 const SMS: u32 = 132;
 
 /// One routed `FlashPrefill(Fp8)` site. Addresses are the slot-0 tensor bases.
@@ -680,9 +684,9 @@ impl LibAttention {
         // The TMA paged path (KV tile = one 64-row page) indexes the table unguarded: an empty
         // split's producer still loads V at its first block, split_idx x per-split blocks, which
         // can reach n + splits - 2 for a request of n pages (the non-TMA path checks rows against
-        // kv_len). Every row carries MAX_SPLITS columns past the widest request, filled with the
+        // kv_len). Every row carries TABLE_PAD columns past the widest request, filled with the
         // request's own last page.
-        let width = width + MAX_SPLITS;
+        let width = width + TABLE_PAD;
         // `>=`: a full gather list would reach PT_OFF and overwrite the word before row 0.
         if (self.direct.is_none() && pages >= POOL_PAGES)
             || u64::from(width) * requests.len() as u64
@@ -1065,6 +1069,75 @@ mod tests {
         );
         let stale = container(ABI, "adapters", &stale);
         assert!(check(stale.clone(), &declare(&stale, ABI)).contains("ABI"));
+    }
+
+    /// The TMA paged entries (KV tile = page) and the table pad `plan` writes satisfy
+    /// `page_envelope.v1` at the split rule's cap; the split rule never exceeds the cap; a pad one
+    /// short of `MAX_SPLITS - 1` and the row-predicated hd256 tile are refused.
+    #[test]
+    #[ignore = "requires built plow_verify; CPU-only"]
+    fn paged_table_pad_satisfies_the_lean_envelope() {
+        const HD512: &str =
+            "lib_flash_prefill_v2:fa4:hd=512:heads=16:kv_heads=1,2:layout=head_major:dtype=bf16";
+        const HD256: &str =
+            "lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16";
+        let route = |abi: &str, kv_tile: u32, pad: u32| {
+            serde_json::json!({"abi": abi, "page": PAGE, "kv_tile": kv_tile,
+                "max_splits": MAX_SPLITS, "pad": pad})
+        };
+        let mut routes = Vec::new();
+        for abi in [HD512, HD256] {
+            let parsed = LibraryAbi::parse(abi).unwrap();
+            for &kv_heads in &parsed.kv_heads {
+                for (requests, max_q, max_kv) in [(1, 1, 1 << 20), (1, 64, 65536), (4, 512, 8192)] {
+                    let launch = Launch {
+                        rows: requests * max_q,
+                        requests,
+                        width: 0,
+                        pages: 0,
+                        max_q,
+                        max_kv,
+                        tail: (0, 0),
+                        head: 0,
+                    };
+                    let splits = launch.splits(&parsed, kv_heads, u64::MAX);
+                    assert!((1..=MAX_SPLITS).contains(&splits), "{abi} {splits}");
+                }
+                let kv_tile = tiles(&parsed, kv_heads).1;
+                if kv_tile == PAGE {
+                    routes.push(route(abi, kv_tile, TABLE_PAD));
+                }
+            }
+        }
+        assert!(
+            routes.iter().all(|r| r["abi"] == HD512) && !routes.is_empty(),
+            "hd512 is the TMA paged route; hd256 loads row-predicated"
+        );
+        let payload = |routes: Vec<serde_json::Value>| {
+            (
+                "page_envelope.v1",
+                serde_json::json!({"schema": 1, "routes": routes}),
+            )
+        };
+        let cases = [
+            ("runtime pad", payload(routes), true),
+            (
+                "pad MAX_SPLITS - 2",
+                payload(vec![route(HD512, PAGE, MAX_SPLITS - 2)]),
+                false,
+            ),
+            ("unpadded", payload(vec![route(HD512, PAGE, 0)]), false),
+            (
+                "hd256 tile",
+                payload(vec![route(HD256, 80, TABLE_PAD)]),
+                false,
+            ),
+        ];
+        let requests: Vec<_> = cases.iter().map(|c| c.1.clone()).collect();
+        let certs = lean_verify::call_batch(&requests).unwrap();
+        for ((what, _, ok), cert) in cases.iter().zip(certs) {
+            assert_eq!(cert.ok, *ok, "{what}: {:?}", cert.reason);
+        }
     }
 
     #[test]

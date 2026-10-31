@@ -116,6 +116,7 @@ empty input is not complete.
 | KV ring / VMM lifecycle | `kv_ring.v1` per packet with packed prefill over a sliding ring; `vmm_trace.v1` on runtime traces (CPU lane) | done (§11) |
 | multimodal slab lifecycle | reserve/stage/release/unload invariants (Phase 4) | Rust tests only |
 | speech fusions | `speech_fusion.v1` per packet with a fused site | done (§12); no production packet has one |
+| paged library attention table | `page_envelope.v1` on the runtime's split cap and table pad (CPU lane) | done (§13) |
 
 ## 5. Proof roots
 
@@ -385,3 +386,26 @@ obligation to the packet that owns the pipeline. Load-time `strict` does not re-
 - **Assumptions.**
   - Programs run in index order, one after another. This holds for forward-pipeline sequences.
   - The arithmetic premises are those of `Plow.Speech`.
+
+## 13. Paged table envelope (`page_envelope.v1`)
+
+`Plow/PageEnvelope.lean` models the paged producer of the library flash prefill attention (TMA KV
+branch): per (request, tile, split) it reads page-table columns `hi − 1`, `[lo, hi)` and `lo`.
+
+- **Input.** Routes `{abi, page, kv_tile, max_splits, pad}`.
+- **Contract (`Route.Contract`).** `0 < page`, `kv_tile = page`, `0 < max_splits ≤ pad + 1`.
+  A KV tile other than the page is refused: the model does not apply.
+- **Theorems.**
+  - `checkRoute_sound`.
+  - `route_safe`: for any request of `kv_len > 0` rows, any tile limit, and any split count up to
+    `max_splits`, every column read lies in `[−1, width + pad)`; `−1` only for an empty tile.
+  - `read_in_envelope`, `padded_entry_own`: a non-negative read finds one of the request's own pages.
+  - `unpadded_overreads`, `envelope_tight`: `pad = 0` over-reads; `pad ≥ max_splits − 1` is necessary.
+- **Source.** The pad and split cap are runtime constants, not packet data. The ignored test
+  `exec::gpu::lib_attention::tests::paged_table_pad_satisfies_the_lean_envelope` sends `PAGE`,
+  `MAX_SPLITS`, `TABLE_PAD` (the pad `plan` writes) and each ABI's KV tile from `tiles`, and checks
+  the split rule never exceeds `MAX_SPLITS`. The hd 512 head-major route is the TMA paged one; hd 256
+  loads row-predicated and is out of scope. A pad of `MAX_SPLITS − 2`, no pad, and the hd 256 tile
+  are refused. A const assert in `lib_attention.rs` repeats the hypothesis at compile time.
+- **Out of scope.** The loader read set is modelled from the upstream source, not derived from
+  machine code. The word before row 0 (`n_block_max = 0`) is written by `plan`, outside the model.

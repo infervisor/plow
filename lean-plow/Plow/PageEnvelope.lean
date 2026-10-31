@@ -16,7 +16,14 @@ loader a page id it did not write this launch (`padded_entry_own`).
 
 `unpadded_overreads`: with no padding (`pad = 0`, the table plowrt uploaded before the fix) a
 one-page request at `S = 2` reads column 1, one past its row: the stale entry of bug 2.
+
+Endpoint `page_envelope.v1`: a route is the loader's page (rows), its KV tile (rows), the split
+cap of the runtime split rule and the padding columns the runtime writes per table row.
+`checkRoute_sound` + `route_safe`: for an accepted route every launch, any request length and any
+split count up to the cap reads only inside its padded row. The loader's read set is the model
+above, not derived from machine code; the word before row 0 is the runtime's to write.
 -/
+import Lean.Data.Json
 
 namespace Plow.PageEnvelope
 
@@ -105,5 +112,67 @@ theorem envelope_tight (pad : Nat) :
   have : (1 + (pad + 2) - 1) / (pad + 2) = 1 := by
     rw [show 1 + (pad + 2) - 1 = pad + 2 by omega]; exact Nat.div_self (by omega)
   simp [this]
+
+/-! ## Endpoint `page_envelope.v1` -/
+
+structure Route where
+  page : Nat
+  kvTile : Nat
+  maxSplits : Nat
+  pad : Nat
+  deriving Repr
+
+/-- One KV block is one page (the TMA paged path), and the pad covers the split cap. -/
+def Route.Contract (r : Route) : Prop :=
+  0 < r.page ∧ r.kvTile = r.page ∧ 0 < r.maxSplits ∧ r.maxSplits ≤ r.pad + 1
+
+instance (r : Route) : Decidable r.Contract := by unfold Route.Contract; exact inferInstance
+
+def checkRoute (r : Route) : Bool := decide r.Contract
+
+theorem checkRoute_sound (r : Route) (h : checkRoute r = true) : r.Contract :=
+  of_decide_eq_true h
+
+/-- A request of `kvLen > 0` rows owns `ceil(kvLen / page)` columns of a row `width` wide; a tile
+    reads at most `ceil(kvLen / kvTile)` KV blocks; the rule picks any `S ≤ maxSplits`. -/
+theorem route_safe (r : Route) (h : r.Contract) {kvLen nmax width S s : Nat} {c : Int}
+    (hk : 0 < kvLen) (hn : nmax ≤ (kvLen + r.kvTile - 1) / r.kvTile)
+    (hw : (kvLen + r.page - 1) / r.page ≤ width) (hS : 0 < S) (hSm : S ≤ r.maxSplits)
+    (hs : s < S) (hr : Reads nmax S s c) :
+    (-1 ≤ c ∧ c < (width : Int) + r.pad) ∧ (c = -1 → nmax = 0) := by
+  obtain ⟨hp, ht, _, hpad⟩ := h
+  rw [ht] at hn
+  have hN0 : 0 < (kvLen + r.page - 1) / r.page :=
+    (Nat.le_div_iff_mul_le hp).mpr (by omega)
+  exact read_in_envelope hN0 hn hw hS (by omega) hs hr
+
+def exactKeys (j : Lean.Json) (keys : List String) : Except String Unit := do
+  let obj ← j.getObj?
+  let present := obj.toArray.map (·.1) |>.toList
+  for k in present do
+    if !keys.contains k then throw s!"unknown field {k}"
+  for k in keys do
+    if !present.contains k then throw s!"missing field {k}"
+
+def nat (j : Lean.Json) (k : String) : Except String Nat := j.getObjValAs? Nat k
+
+def parseRoute (j : Lean.Json) : Except String (String × Route) := do
+  exactKeys j ["abi", "page", "kv_tile", "max_splits", "pad"]
+  return (← j.getObjValAs? String "abi", {
+    page := (← nat j "page"), kvTile := (← nat j "kv_tile"),
+    maxSplits := (← nat j "max_splits"), pad := (← nat j "pad") })
+
+def run (j : Lean.Json) : Except String String := do
+  exactKeys j ["schema", "routes"]
+  if (← nat j "schema") != 1 then throw "unsupported page_envelope schema"
+  let raw ← j.getObjValAs? (List Lean.Json) "routes"
+  if raw.isEmpty then throw "no routes"
+  let routes ← raw.mapM parseRoute
+  for (abi, r) in routes do
+    if r.kvTile != r.page then
+      throw s!"{abi}: KV tile {r.kvTile} is not the page {r.page}; the paged read model does not apply"
+    if !checkRoute r then
+      throw s!"{abi}: pad {r.pad} does not cover {r.maxSplits} splits (needs pad ≥ splits − 1, envelope_tight)"
+  return s!"checkRoute_sound + route_safe: {routes.length} paged routes read only their own padded page-table row; loader read set modelled, not derived from machine code"
 
 end Plow.PageEnvelope
