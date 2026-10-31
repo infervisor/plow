@@ -2031,12 +2031,27 @@ mod tests {
         let stages = [[3, 2, 1, 1]; 3];
         let capacities = [200, 400, 3000];
         // 185 frames: 24 rows + 6 trailing, 32 in whole steps: more than 200 frames' 25 rows.
-        assert_eq!(encoder_index(&capacities, 185, &stages, 6, Some(4)).unwrap(), Some(1));
-        assert_eq!(encoder_index(&capacities, 185, &stages, 6, None).unwrap(), Some(0));
+        assert_eq!(
+            encoder_index(&capacities, 185, &stages, 6, Some(4)).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            encoder_index(&capacities, 185, &stages, 6, None).unwrap(),
+            Some(0)
+        );
         // 100 frames: 13 + 6 rows, 20 in whole steps.
-        assert_eq!(encoder_index(&capacities, 100, &stages, 6, Some(4)).unwrap(), Some(0));
+        assert_eq!(
+            encoder_index(&capacities, 100, &stages, 6, Some(4)).unwrap(),
+            Some(0)
+        );
         // 2990 frames: 374 + 6 rows outgrow 3000 frames' 375; it still holds the frames.
-        assert_eq!(encoder_index(&capacities, 2990, &stages, 6, Some(4)).unwrap(), Some(2));
-        assert_eq!(encoder_index(&capacities, 3001, &stages, 6, Some(4)).unwrap(), None);
+        assert_eq!(
+            encoder_index(&capacities, 2990, &stages, 6, Some(4)).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            encoder_index(&capacities, 3001, &stages, 6, Some(4)).unwrap(),
+            None
+        );
     }
 }

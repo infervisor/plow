@@ -45,7 +45,7 @@ impl Default for FinalizationPolicy {
     }
 }
 
-/// Audio for one stream of [`Transcriber::stream_push_batch`].
+/// Audio for one stream of [`Transcriber::stream_push_round`].
 #[derive(Clone, Copy)]
 pub struct StreamPush<'a> {
     pub id: u64,
@@ -110,7 +110,7 @@ pub trait Transcriber: Send {
         let _ = id;
     }
 
-    /// Whether [`Transcriber::stream_push_batch`] answers finals (`finish`).
+    /// Whether [`Transcriber::stream_push_round`] answers finals (`finish`).
     fn stream_finals(&self) -> bool {
         false
     }
@@ -120,19 +120,44 @@ pub trait Transcriber: Send {
         None
     }
 
-    /// [`Transcriber::stream_push`] for several streams at once (one per id), their steps sharing
-    /// launches. Returns each stream's text in order.
+    /// Appends each push's audio to its stream (one push per id) and steps the next window of
+    /// each, their steps sharing launches. A push answers its stream's text once the stream has no
+    /// window left (a finished stream then closes); `None`: push it again, with no more audio, to
+    /// step the next.
+    fn stream_push_round(
+        &mut self,
+        pushes: &[StreamPush<'_>],
+    ) -> Vec<crate::Result<Option<String>>> {
+        push_alone(self, pushes)
+    }
+
+    /// [`Transcriber::stream_push`] for several streams at once (one per id), in rounds of
+    /// [`Transcriber::stream_push_round`]. Returns each stream's text in order.
     fn stream_push_batch(&mut self, pushes: &[StreamPush<'_>]) -> Vec<crate::Result<String>> {
-        pushes
-            .iter()
-            .map(|push| {
-                if push.finish {
-                    return Err(crate::RuntimeError::Rejected(
-                        "this ASR engine answers no finals from its stream".into(),
-                    ));
+        let mut answers: Vec<Option<crate::Result<String>>> = pushes.iter().map(|_| None).collect();
+        let mut round: Vec<(usize, StreamPush<'_>)> = pushes.iter().copied().enumerate().collect();
+        while !round.is_empty() {
+            let current: Vec<StreamPush<'_>> = round.iter().map(|(_, push)| *push).collect();
+            let results = self.stream_push_round(&current);
+            let mut next = Vec::with_capacity(round.len());
+            for ((index, push), result) in round.into_iter().zip(results) {
+                match result {
+                    Ok(None) => next.push((
+                        index,
+                        StreamPush {
+                            samples: &[],
+                            ..push
+                        },
+                    )),
+                    Ok(Some(text)) => answers[index] = Some(Ok(text)),
+                    Err(error) => answers[index] = Some(Err(error)),
                 }
-                self.stream_push(push.id, push.samples, &mut |_| {})
-            })
+            }
+            round = next;
+        }
+        answers
+            .into_iter()
+            .map(|answer| answer.expect("every push is answered"))
             .collect()
     }
 
@@ -158,6 +183,26 @@ pub trait Transcriber: Send {
             })
             .collect())
     }
+}
+
+/// Each push through [`Transcriber::stream_push`], all its windows at once (no finals).
+fn push_alone<T: Transcriber + ?Sized>(
+    engine: &mut T,
+    pushes: &[StreamPush<'_>],
+) -> Vec<crate::Result<Option<String>>> {
+    pushes
+        .iter()
+        .map(|push| {
+            if push.finish {
+                return Err(crate::RuntimeError::Rejected(
+                    "this ASR engine answers no finals from its stream".into(),
+                ));
+            }
+            engine
+                .stream_push(push.id, push.samples, &mut |_| {})
+                .map(Some)
+        })
+        .collect()
 }
 
 impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
@@ -217,6 +262,13 @@ impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
 
     fn stream_slots(&self) -> Option<usize> {
         (**self).stream_slots()
+    }
+
+    fn stream_push_round(
+        &mut self,
+        pushes: &[StreamPush<'_>],
+    ) -> Vec<crate::Result<Option<String>>> {
+        (**self).stream_push_round(pushes)
     }
 
     fn stream_push_batch(&mut self, pushes: &[StreamPush<'_>]) -> Vec<crate::Result<String>> {
