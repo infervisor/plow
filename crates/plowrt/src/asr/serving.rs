@@ -332,7 +332,8 @@ fn collapse_repeats(text: &str) -> Option<String> {
 struct AsrMux {
     tx: mpsc::Sender<AsrJob>,
     metrics: Arc<crate::obs::Metrics>,
-    /// The engine's batched streams: how many can be open, and whether they answer finals.
+    /// The engine's batched streams: how many sessions can hold one (upload streams keep the
+    /// rest), and whether they answer finals.
     stream_slots: Option<usize>,
     stream_finals: bool,
 }
@@ -364,6 +365,95 @@ struct OpenStream {
 
 /// Audio a final may have left to push into its stream; past it the final transcribes offline.
 const FINAL_STREAM_LAG: usize = 2 * SAMPLE_RATE as usize;
+
+/// Upload streams a round steps while sessions hold engine streams: a short launch after theirs
+/// (8 x 32 rows: ~65 ms on an H100) keeps their next windows' wait short.
+const UPLOAD_LANES_BESIDE_STREAMS: usize = 8;
+
+/// A whole recording stepping in an engine upload stream (`Transcriber::upload_open`).
+struct Upload {
+    job: AsrJob,
+    id: u64,
+    /// Its audio went in with its first round's push.
+    pushed: bool,
+}
+
+/// Opens upload streams for the queued whole recordings, oldest first, up to `batch` stepping;
+/// the rest wait (all of them while the engine has no stream slot free).
+fn open_uploads(
+    engine: &mut dyn Transcriber,
+    uploading: &mut Vec<Upload>,
+    offline: &mut VecDeque<AsrJob>,
+    batch: usize,
+) {
+    while uploading.len() < batch {
+        let Some(job) = offline.pop_front() else {
+            break;
+        };
+        match engine.upload_open() {
+            Ok(Some(id)) => uploading.push(Upload {
+                job,
+                id,
+                pushed: false,
+            }),
+            Ok(None) => {
+                offline.push_front(job);
+                break;
+            }
+            Err(error) => finish_job(job, Err(error)),
+        }
+    }
+}
+
+/// One round of upload streams: the oldest `lanes` push (all their audio, the round they join)
+/// and step a window; each answers its job once its stream has decoded everything.
+fn step_uploads(engine: &mut dyn Transcriber, uploading: &mut Vec<Upload>, lanes: usize) {
+    for upload in std::mem::take(uploading) {
+        if upload.job.cancel.load(Ordering::Relaxed) || upload.job.respond.is_closed() {
+            engine.stream_close(upload.id);
+            finish_job(
+                upload.job,
+                Err(crate::RuntimeError::Rejected("ASR cancelled".into())),
+            );
+        } else {
+            uploading.push(upload);
+        }
+    }
+    let waiting = uploading.split_off(lanes.min(uploading.len()));
+    let pushes: Vec<_> = uploading
+        .iter()
+        .map(|upload| StreamPush {
+            id: upload.id,
+            samples: if upload.pushed {
+                &[]
+            } else {
+                &upload.job.samples
+            },
+            finish: true,
+        })
+        .collect();
+    let results = engine.stream_push_round(&pushes);
+    drop(pushes);
+    for (mut upload, result) in std::mem::take(uploading).into_iter().zip(results) {
+        upload.pushed = true;
+        let text = match result {
+            Ok(None) => {
+                uploading.push(upload);
+                continue;
+            }
+            Ok(Some(text)) => Ok(text),
+            Err(error) => Err(error),
+        };
+        let result = text.and_then(|text| {
+            Ok(Transcript {
+                text,
+                language: engine.language(upload.job.language.as_deref())?,
+            })
+        });
+        finish_job(upload.job, result);
+    }
+    uploading.extend(waiting);
+}
 
 /// One round of the recordings' engine streams. Jobs that continue their recording's stream
 /// (partials, and finals when the engine answers them from the stream) take it one at a time:
@@ -517,10 +607,14 @@ impl AsrMux {
         let batch_capacity = engine.batch_capacity().max(1);
         let finalization = engine.finalization_policy();
         let stream_slots = engine.stream_slots();
+        let upload_batch = engine.upload_batch();
         let stream_finals =
             engine.stream_finals() && crate::config::RuntimeConfig::get().asr_stream_finals;
-        let ingress_capacity = batch_capacity.saturating_mul(4).max(min_queue);
-        let queue = ingress_capacity.max(stream_slots.unwrap_or(0).saturating_mul(3));
+        let ingress_capacity = batch_capacity
+            .max(upload_batch)
+            .saturating_mul(4)
+            .max(min_queue);
+        let queue = ingress_capacity + stream_slots.unwrap_or(0).saturating_mul(3);
         let (tx, mut rx) = mpsc::channel::<AsrJob>(queue);
         std::thread::Builder::new()
             .name("plow-asr-engine".into())
@@ -528,9 +622,14 @@ impl AsrMux {
                 let mut offline = VecDeque::with_capacity(batch_capacity);
                 let mut streams: Vec<OpenStream> = Vec::new();
                 let (mut stepping, mut waiting) = (Vec::new(), Vec::new());
+                let mut uploading: Vec<Upload> = Vec::new();
                 loop {
                     let mut cohort = Vec::with_capacity(batch_capacity);
-                    if offline.is_empty() && stepping.is_empty() && waiting.is_empty() {
+                    if offline.is_empty()
+                        && stepping.is_empty()
+                        && waiting.is_empty()
+                        && uploading.is_empty()
+                    {
                         let Some(first) = rx.blocking_recv() else {
                             break;
                         };
@@ -593,6 +692,20 @@ impl AsrMux {
                         continuing,
                         &mut offline,
                     );
+                    // Whole recordings: one alone takes a batch's single launch; with company they
+                    // step as upload streams after the stream round, and the rest wait for one.
+                    if upload_batch != 0 && (!uploading.is_empty() || offline.len() > 1) {
+                        open_uploads(&mut *engine, &mut uploading, &mut offline, upload_batch);
+                        if !uploading.is_empty() {
+                            let lanes = if streams.is_empty() {
+                                upload_batch
+                            } else {
+                                UPLOAD_LANES_BESIDE_STREAMS.min(upload_batch)
+                            };
+                            step_uploads(&mut *engine, &mut uploading, lanes);
+                            continue;
+                        }
+                    }
                     // One batch of whole recordings per round: stream rounds go between them.
                     let take = offline.len().min(batch_capacity);
                     if take == 0 {
@@ -657,7 +770,7 @@ impl AsrMux {
             Self {
                 tx,
                 metrics,
-                stream_slots,
+                stream_slots: stream_slots.map(|slots| slots.saturating_sub(upload_batch)),
                 stream_finals,
             },
             ingress_capacity,
@@ -3035,6 +3148,109 @@ mod tests {
         assert_eq!(text(a.await.unwrap()), "1 5");
         round(vec![(2, 0, true)]);
         assert_eq!(text(b.await.unwrap()), "2 5");
+    }
+
+    #[tokio::test]
+    async fn a_lone_upload_runs_offline_and_a_burst_steps_as_upload_streams() {
+        type Round = Vec<(u64, usize)>;
+        /// Two upload streams a round, a window per 100 samples; each call waits for the go.
+        struct Uploads {
+            rounds: std::sync::mpsc::Sender<Round>,
+            go: std::sync::mpsc::Receiver<()>,
+            streams: HashMap<u64, (usize, usize)>,
+            opened: u64,
+        }
+        impl Transcriber for Uploads {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(
+                &mut self,
+                samples: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                self.rounds.send(vec![(0, samples.len())]).unwrap();
+                self.go.recv().unwrap();
+                Ok(Transcript {
+                    text: format!("offline {}", samples.len()),
+                    language: None,
+                })
+            }
+            fn stream_slots(&self) -> Option<usize> {
+                Some(4)
+            }
+            fn upload_batch(&self) -> usize {
+                2
+            }
+            fn upload_open(&mut self) -> crate::Result<Option<u64>> {
+                self.opened += 1;
+                self.streams.insert(self.opened, (0, 0));
+                Ok(Some(self.opened))
+            }
+            fn stream_push_round(
+                &mut self,
+                pushes: &[StreamPush<'_>],
+            ) -> Vec<crate::Result<Option<String>>> {
+                let round = pushes.iter().map(|p| (p.id, p.samples.len()));
+                self.rounds.send(round.collect()).unwrap();
+                self.go.recv().unwrap();
+                pushes
+                    .iter()
+                    .map(|push| {
+                        assert!(push.finish);
+                        let (samples, stepped) = self.streams.get_mut(&push.id).unwrap();
+                        *samples += push.samples.len();
+                        *stepped += 1;
+                        Ok((*stepped == *samples / 100).then(|| format!("upload {stepped}")))
+                    })
+                    .collect()
+            }
+        }
+        let (rounds, observed) = std::sync::mpsc::channel();
+        let (go, gate) = std::sync::mpsc::channel();
+        let engine = Uploads {
+            rounds,
+            go: gate,
+            streams: Default::default(),
+            opened: 0,
+        };
+        let (mux, uploads, _) = AsrMux::spawn(Box::new(engine));
+        assert_eq!((uploads, mux.stream_slots), (8, Some(2)));
+        let submit = |samples: usize| {
+            mux.submit_with(
+                vec![0.0; samples],
+                None,
+                String::new(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                None,
+                true,
+            )
+            .unwrap()
+        };
+        let round = |expected: Round| {
+            let pushes = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(pushes, expected);
+            go.send(()).unwrap();
+        };
+        let text = |reply: crate::Result<Transcript>| reply.unwrap().text;
+        // Alone: the offline pass. Three more queue behind it and step as upload streams, two
+        // at a time, oldest first; the third opens when the second finishes.
+        let a = submit(200);
+        let observed_round = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(observed_round, vec![(0, 200)]);
+        let (b, c, d) = (submit(300), submit(100), submit(200));
+        go.send(()).unwrap();
+        assert_eq!(text(a.await.unwrap()), "offline 200");
+        round(vec![(1, 300), (2, 100)]);
+        assert_eq!(text(c.await.unwrap()), "upload 1");
+        round(vec![(1, 0), (3, 200)]);
+        round(vec![(1, 0), (3, 0)]);
+        assert_eq!(text(b.await.unwrap()), "upload 3");
+        assert_eq!(text(d.await.unwrap()), "upload 2");
+        assert!(observed.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -3,15 +3,16 @@
 //! file: both texts, the matched word prefix, and push latency. An engine with stream finals also
 //! finishes the stream: its final must equal the offline transcript. With `BATCH` > 0, the files
 //! then stream again `BATCH` at a time (`stream_push_batch`, one piece of each per call): each
-//! final must equal the file's lone final. A last JSON line sums up.
+//! final must equal the file's lone final. `UPLOADS` 1: the batched pass opens upload streams
+//! (`upload_open`) and pushes each file whole, as uploads do. A last JSON line sums up.
 //!
-//!   asr_stream_check PACKET TOKENIZER [BACKEND] [CHUNK_MS] [BATCH] -- AUDIO.wav...
+//!   asr_stream_check PACKET TOKENIZER [BACKEND] [CHUNK_MS] [BATCH] [UPLOADS] -- AUDIO.wav...
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::asr::{frontend::decode_wav, load_packet_transcriber, StreamPush};
     use std::{path::Path, sync::atomic::AtomicBool, time::Instant};
 
     const USAGE: &str =
-        "usage: asr_stream_check PACKET TOKENIZER [BACKEND] [CHUNK_MS] [BATCH] -- AUDIO.wav...";
+        "usage: asr_stream_check PACKET TOKENIZER [BACKEND] [CHUNK_MS] [BATCH] [UPLOADS] -- AUDIO.wav...";
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -25,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = option(3).map_or("auto", String::as_str);
     let chunk_ms: usize = option(4).map_or(Ok(320), |v| v.parse())?;
     let batch: usize = option(5).map_or(Ok(0), |v| v.parse())?;
+    let uploads = option(6).is_some_and(|v| v == "1");
     let mut loaded = load_packet_transcriber(Path::new(&args[1]), Path::new(&args[2]), backend)?;
     let finals = loaded.engine.stream_finals();
     let cancel = AtomicBool::new(false);
@@ -96,14 +98,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ids = group
                 .iter()
                 .map(|_| {
-                    loaded
-                        .engine
-                        .stream_open()?
-                        .ok_or("packet has no encoder stream".into())
+                    let id = if uploads {
+                        loaded.engine.upload_open()?
+                    } else {
+                        loaded.engine.stream_open()?
+                    };
+                    id.ok_or("packet has no such stream".into())
                 })
                 .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-            let piece = 16 * chunk_ms;
             let longest = group.iter().map(|c| c.1.len()).max().unwrap_or(0);
+            let piece = if uploads { longest.max(1) } else { 16 * chunk_ms };
             let mut texts: Vec<Option<String>> = vec![None; group.len()];
             for offset in (0..=longest.div_ceil(piece) * piece).step_by(piece) {
                 let pushes: Vec<_> = group
@@ -150,7 +154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         serde_json::json!({
             "clips": clips.len(), "stream_finals": finals, "final_equals_offline": final_equal,
-            "batch": batch, "batched_equals_alone": batched_equal, "batched_push_ms_total": batched_ms,
+            "batch": batch, "uploads": uploads, "batched_equals_alone": batched_equal,
+            "batched_push_ms_total": batched_ms,
         })
     );
     Ok(())

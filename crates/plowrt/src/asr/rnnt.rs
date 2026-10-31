@@ -64,6 +64,11 @@ pub struct PacketRnnt {
     batch: Option<BatchBinding>,
     /// Batched streams; preferred over `stream` (CUDA, with the batched decode).
     chunk: Option<ChunkBinding>,
+    /// Upload streams (`upload.*` roles): batched streams of more rows per step in `chunk`'s
+    /// cache slots.
+    upload: Option<ChunkBinding>,
+    /// Cache rows no open batched stream holds.
+    free: Vec<u32>,
     /// Vocabulary, detokenizer and language (ASR contract >= 1).
     output: Option<TokenOutput>,
 }
@@ -153,8 +158,9 @@ struct StreamBinding {
     pool: Vec<Vec<PacketTensor>>,
 }
 
-/// Batched cache-aware streams (`chunk.*` pipeline roles): a launch steps many streams, each
-/// with its caches in a row of slot-indexed tables, and the batched decode takes their rows.
+/// Batched cache-aware streams (`chunk.*` pipeline roles, or an upload geometry's `upload.*`): a
+/// launch steps many streams, each with its caches in a row of slot-indexed tables, and the
+/// batched decode takes their rows.
 struct ChunkBinding {
     /// (streams, first-window, later-window and step program sequences), ascending.
     rungs: Vec<(usize, [Vec<usize>; 3])>,
@@ -175,33 +181,33 @@ struct ChunkBinding {
     predictor_slot0: u32,
     /// The scratch cache row of padding items (the tables' last).
     scratch: u32,
-    /// Cache rows no open stream holds.
-    free: Vec<u32>,
     /// Host staging of a launch's windows and per-item tables.
     windows: [Vec<f32>; 2],
     lanes: [Vec<u32>; 4],
 }
 
 impl ChunkBinding {
-    fn bind(pipeline: &BoundPacketPipeline, batch: &BatchBinding, bins: usize) -> Result<Self> {
+    /// `role`: `chunk`, or `upload` for the upload geometry (the cache slots, encoder-table rows
+    /// and predictor slots are the `chunk.*` parameters' either way).
+    fn bind(
+        pipeline: &BoundPacketPipeline,
+        batch: &BatchBinding,
+        bins: usize,
+        role: &str,
+    ) -> Result<Self> {
         let invalid = || RuntimeError::Rejected("packet batched stream geometry is invalid".into());
         let param = |name| usize_parameter(pipeline, name);
+        let step = format!("{role}.step.");
         let mut items: Vec<usize> = pipeline
             .programs()
-            .filter_map(|(role, _)| {
-                role.strip_prefix("chunk.step.")?
-                    .split('.')
-                    .next()?
-                    .parse()
-                    .ok()
-            })
+            .filter_map(|(name, _)| name.strip_prefix(&step)?.split('.').next()?.parse().ok())
             .collect();
         items.sort_unstable();
         items.dedup();
         let rungs = items
             .into_iter()
             .map(|n| {
-                let sequence = |kind| pipeline.program_sequence(&format!("chunk.{kind}.{n}"));
+                let sequence = |kind| pipeline.program_sequence(&format!("{role}.{kind}.{n}"));
                 Ok((
                     n,
                     [sequence("first")?, sequence("next")?, sequence("step")?],
@@ -209,14 +215,9 @@ impl ChunkBinding {
             })
             .collect::<Result<Vec<_>>>()?;
         let slots = u32::try_from(param("chunk.slots")?).map_err(|_| invalid())?;
-        let (first, next) = (
-            pipeline.tensor("chunk.input.first")?,
-            pipeline.tensor("chunk.input.next")?,
-        );
-        let (index, slot) = (
-            pipeline.tensor("chunk.index")?,
-            pipeline.tensor("chunk.slot")?,
-        );
+        let tensor = |name| pipeline.tensor(&format!("{role}.{name}"));
+        let (first, next) = (tensor("input.first")?, tensor("input.next")?);
+        let (index, slot) = (tensor("index")?, tensor("slot")?);
         // Rows per step and window frames follow from the per-stream tensors' sizes.
         let max_items = slot.bytes / 4;
         let per_stream = |bytes: usize, unit: usize| {
@@ -232,8 +233,8 @@ impl ChunkBinding {
             next,
             index,
             slot,
-            pos: pipeline.tensor("chunk.pos")?,
-            key_start: pipeline.tensor("chunk.key_start")?,
+            pos: tensor("pos")?,
+            key_start: tensor("key_start")?,
             rows,
             left_rows: param("chunk.left_rows")?,
             first_input_frames,
@@ -242,12 +243,15 @@ impl ChunkBinding {
                 .checked_sub(first_input_frames)
                 .ok_or_else(invalid)?,
             bins,
-            next_row0: param("chunk.next_row0")?,
+            // An upload geometry's later windows start past its widest step's first ones.
+            next_row0: match role {
+                "chunk" => param("chunk.next_row0")?,
+                _ => max_items * rows,
+            },
             encoder_row0: param("chunk.encoder_row0")?,
             predictor_slot0: u32::try_from(param("chunk.predictor_slot0")?)
                 .map_err(|_| invalid())?,
             scratch: slots.saturating_sub(1),
-            free: (0..slots.saturating_sub(1)).rev().collect(),
             windows: Default::default(),
             lanes: Default::default(),
             rungs,
@@ -277,6 +281,18 @@ impl ChunkBinding {
     }
 }
 
+impl ChunkBinding {
+    fn windows(&self) -> StreamWindows {
+        StreamWindows {
+            first: self.first_input_frames,
+            step: self.step_input_frames,
+            history: self.history_input_frames,
+            bins: self.bins,
+            rows: self.rows,
+        }
+    }
+}
+
 /// One open stream: its state (a device copy, or a batched stream's cache row) and the greedy
 /// decoder's position.
 pub struct RnntStream {
@@ -289,6 +305,14 @@ pub struct RnntStream {
     slot: Option<u32>,
     predicted: bool,
     fresh: bool,
+    /// An upload stream ([`PacketRnnt::upload_open`]): it steps in the upload geometry.
+    upload: bool,
+}
+
+impl RnntStream {
+    pub fn is_upload(&self) -> bool {
+        self.upload
+    }
 }
 
 /// Mel frames the stream reads per step: the first window, later windows, and how many of a later
@@ -455,15 +479,27 @@ impl PacketRnnt {
             .optional_parameter("batch.slots")
             .map(|slots| BatchBinding::bind(&pipeline, slots, row_bytes))
             .transpose()?;
-        let chunk = match &batch {
-            Some(batch) if backend == "cuda" && pipeline.program("chunk.init").is_ok() => {
-                let bins = usize_parameter(&pipeline, "audio.frontend.bins")?;
-                let binding = ChunkBinding::bind(&pipeline, batch, bins)?;
-                runtime.run(pipeline.program("chunk.init")?)?;
-                Some(binding)
+        let mut chunks = |role: &str| -> Result<Option<ChunkBinding>> {
+            match &batch {
+                Some(batch)
+                    if backend == "cuda" && pipeline.program(&format!("{role}.init")).is_ok() =>
+                {
+                    let bins = usize_parameter(&pipeline, "audio.frontend.bins")?;
+                    let binding = ChunkBinding::bind(&pipeline, batch, bins, role)?;
+                    runtime.run(pipeline.program(&format!("{role}.init"))?)?;
+                    Ok(Some(binding))
+                }
+                _ => Ok(None),
             }
-            _ => None,
         };
+        let chunk = chunks("chunk")?;
+        let upload = match chunk {
+            Some(_) => chunks("upload")?,
+            None => None,
+        };
+        let free = chunk
+            .as_ref()
+            .map_or(Vec::new(), |c| (0..c.scratch).rev().collect());
         let state_zeros = vec![0; states.iter().map(|state| state.bytes).max().unwrap_or(0)];
         let output = match pipeline.optional_parameter(speech_contract::CONTRACT) {
             None => None,
@@ -520,6 +556,8 @@ impl PacketRnnt {
             stream,
             batch,
             chunk,
+            upload,
+            free,
             output,
         })
     }
@@ -536,13 +574,7 @@ impl PacketRnnt {
     /// The mel windows of the packet's encoder stream, if it carries one this backend can run.
     pub fn stream_windows(&self) -> Option<StreamWindows> {
         if let Some(c) = &self.chunk {
-            return Some(StreamWindows {
-                first: c.first_input_frames,
-                step: c.step_input_frames,
-                history: c.history_input_frames,
-                bins: c.bins,
-                rows: c.rows,
-            });
+            return Some(c.windows());
         }
         self.stream.as_ref().map(|s| StreamWindows {
             first: s.first_input_frames,
@@ -553,12 +585,25 @@ impl PacketRnnt {
         })
     }
 
+    /// An upload stream's windows ([`Self::upload_open`]); `None` without upload streams.
+    pub fn upload_windows(&self) -> Option<StreamWindows> {
+        self.upload.as_ref().map(ChunkBinding::windows)
+    }
+
     /// Streams one [`Self::stream_step_batch`] steps at most: 1 without batched streams.
     pub fn stream_batch(&self) -> usize {
         self.chunk
             .as_ref()
             .and_then(|c| c.rungs.last())
             .map_or(1, |rung| rung.0)
+    }
+
+    /// Upload streams one [`Self::stream_step_batch`] steps at most: 0 without upload streams.
+    pub fn upload_batch(&self) -> usize {
+        self.upload
+            .as_ref()
+            .and_then(|c| c.rungs.last())
+            .map_or(0, |rung| rung.0)
     }
 
     /// Batched streams that can be open at once; `None`: unbounded (one state copy each).
@@ -588,13 +633,13 @@ impl PacketRnnt {
             slot: None,
             predicted: false,
             fresh: true,
+            upload: false,
         };
-        if let Some(chunk) = &mut self.chunk {
+        if self.chunk.is_some() {
             // Caches read as zeros at a stream's first step, so a reused row needs no reset.
-            stream.slot =
-                Some(chunk.free.pop().ok_or_else(|| {
-                    RuntimeError::Overloaded("every ASR stream slot is open".into())
-                })?);
+            stream.slot = Some(self.free.pop().ok_or_else(|| {
+                RuntimeError::Overloaded("every ASR stream slot is open".into())
+            })?);
             return Ok(stream);
         }
         let binding = self
@@ -618,10 +663,23 @@ impl PacketRnnt {
         Ok(stream)
     }
 
+    /// Open an upload stream: a batched stream that steps [`Self::upload_windows`] in the
+    /// streams' cache slots (a whole recording at a time, its windows pushed at once).
+    pub fn upload_open(&mut self) -> Result<RnntStream> {
+        if self.upload.is_none() {
+            return Err(RuntimeError::Rejected(
+                "packet has no upload streams".into(),
+            ));
+        }
+        let mut stream = self.stream_open()?;
+        stream.upload = true;
+        Ok(stream)
+    }
+
     pub fn stream_close(&mut self, stream: RnntStream) {
-        match (stream.slot, &mut self.chunk, &mut self.stream) {
-            (Some(slot), Some(chunk), _) => chunk.free.push(slot),
-            (None, _, Some(binding)) => binding.pool.push(stream.saved),
+        match (stream.slot, &mut self.stream) {
+            (Some(slot), _) => self.free.push(slot),
+            (None, Some(binding)) => binding.pool.push(stream.saved),
             _ => {}
         }
     }
@@ -637,7 +695,8 @@ impl PacketRnnt {
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         if stream.slot.is_some() {
-            let rows = self.chunk.as_ref().map_or(0, |c| c.rows);
+            let chunk = if stream.upload { &self.upload } else { &self.chunk };
+            let rows = chunk.as_ref().map_or(0, |c| c.rows);
             let tokens = self
                 .stream_step_batch(&mut [(stream, window, rows)])?
                 .pop()
@@ -661,15 +720,27 @@ impl PacketRnnt {
         Ok(tokens)
     }
 
-    /// One step of several batched streams in one launch (at most [`Self::stream_batch`]): each
-    /// `(stream, window, rows)` takes `window` as [`Self::stream_step`] does and decodes the first
-    /// `rows` of the step's encoder rows (all of them but on a stream's final step). Returns each
-    /// stream's tokens, as its steps alone decode them.
+    /// One step of several batched streams in one launch (at most [`Self::stream_batch`], or
+    /// [`Self::upload_batch`] upload streams; one kind per launch): each `(stream, window, rows)`
+    /// takes `window` as [`Self::stream_step`] does and decodes the first `rows` of the step's
+    /// encoder rows (all of them but on a stream's final step). Returns each stream's tokens, as
+    /// its steps alone decode them.
     pub fn stream_step_batch(
         &mut self,
         steps: &mut [(&mut RnntStream, &[f32], usize)],
     ) -> Result<Vec<Vec<u32>>> {
-        let (Some(mut chunk), Some(batch)) = (self.chunk.take(), self.batch.take()) else {
+        let upload = steps.first().is_some_and(|(stream, ..)| stream.upload);
+        if steps.iter().any(|(stream, ..)| stream.upload != upload) {
+            return Err(RuntimeError::Rejected(
+                "a batched stream step takes live or upload streams, not both".into(),
+            ));
+        }
+        let binding = if upload {
+            &mut self.upload
+        } else {
+            &mut self.chunk
+        };
+        let (Some(mut chunk), Some(batch)) = (binding.take(), self.batch.take()) else {
             return Err(RuntimeError::Rejected(
                 "packet has no batched encoder stream".into(),
             ));
@@ -677,7 +748,11 @@ impl PacketRnnt {
         self.runtime.begin_execution()?;
         let result = self.chunk_step_active(&mut chunk, &batch, steps);
         let ended = self.runtime.end_execution();
-        self.chunk = Some(chunk);
+        *(if upload {
+            &mut self.upload
+        } else {
+            &mut self.chunk
+        }) = Some(chunk);
         self.batch = Some(batch);
         result.and_then(|tokens| ended.map(|()| tokens))
     }

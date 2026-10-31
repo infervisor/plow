@@ -67,16 +67,40 @@ impl PacketRnntTranscriber {
         self.execution.backend()
     }
 
+    fn insert(&mut self, rnnt: RnntStream) -> u64 {
+        let id = self.next_stream;
+        self.next_stream += 1;
+        self.streams.insert(
+            id,
+            TranscriberStream {
+                rnnt,
+                samples: Vec::new(),
+                steps: 0,
+                tokens: Vec::new(),
+                cut: VecDeque::new(),
+                cut_finish: false,
+            },
+        );
+        id
+    }
+
+    /// The windows `stream` steps: an upload stream's, or the live streams'.
+    fn geometry(&self, stream: &TranscriberStream) -> Result<StreamWindows> {
+        if stream.rnnt.is_upload() {
+            self.execution.upload_windows()
+        } else {
+            self.execution.stream_windows()
+        }
+        .ok_or_else(|| rejected("packet has no encoder stream"))
+    }
+
     /// The mel windows `stream`'s audio completes past its steps (see [`Self::windows`]).
     fn pending_windows(
         &self,
         stream: &TranscriberStream,
         finish: bool,
     ) -> Result<Vec<(Vec<f32>, usize)>> {
-        let w = self
-            .execution
-            .stream_windows()
-            .ok_or_else(|| rejected("packet has no encoder stream"))?;
+        let w = self.geometry(stream)?;
         let frames = self
             .frontend
             .extract_partial(&stream.samples, window_start(&w, stream.steps))?;
@@ -131,14 +155,19 @@ impl PacketRnntTranscriber {
     /// over the rayon pool.
     fn next_frames<'a>(
         &self,
-        w: &StreamWindows,
         streams: impl Iterator<Item = &'a TranscriberStream>,
     ) -> Vec<Result<(LogMelFeatures, usize)>> {
-        let inputs: Vec<(&[f32], usize)> = streams
-            .map(|stream| (stream.samples.as_slice(), window_start(w, stream.steps)))
+        let inputs: Vec<Result<(&[f32], usize)>> = streams
+            .map(|stream| {
+                let w = self.geometry(stream)?;
+                Ok((stream.samples.as_slice(), window_start(&w, stream.steps)))
+            })
             .collect();
         let frontend = &self.frontend;
-        let extract = |&(samples, from): &(&[f32], usize)| frontend.extract_partial(samples, from);
+        let extract = |input: &Result<(&[f32], usize)>| {
+            let &(samples, from) = input.as_ref().map_err(|error| rejected(error.to_string()))?;
+            frontend.extract_partial(samples, from)
+        };
         #[cfg(feature = "hf-tokenizer")]
         {
             use rayon::prelude::*;
@@ -170,20 +199,23 @@ impl Transcriber for PacketRnntTranscriber {
             return Ok(None);
         }
         let rnnt = self.execution.stream_open()?;
-        let id = self.next_stream;
-        self.next_stream += 1;
-        self.streams.insert(
-            id,
-            TranscriberStream {
-                rnnt,
-                samples: Vec::new(),
-                steps: 0,
-                tokens: Vec::new(),
-                cut: VecDeque::new(),
-                cut_finish: false,
-            },
-        );
-        Ok(Some(id))
+        Ok(Some(self.insert(rnnt)))
+    }
+
+    /// An upload stream; `None` without upload streams or with every cache slot open.
+    fn upload_open(&mut self) -> Result<Option<u64>> {
+        if self.execution.upload_windows().is_none() {
+            return Ok(None);
+        }
+        match self.execution.upload_open() {
+            Ok(rnnt) => Ok(Some(self.insert(rnnt))),
+            Err(RuntimeError::Overloaded(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn upload_batch(&self) -> usize {
+        self.execution.upload_batch()
     }
 
     /// Runs one encoder step per whole window of final mel frames the new audio completes.
@@ -224,12 +256,12 @@ impl Transcriber for PacketRnntTranscriber {
     }
 
     /// One window of every pushed stream with one left, up to one launch of
-    /// `PacketRnnt::stream_batch` streams. A push cuts its windows the round it joins; its later
-    /// rounds step them.
+    /// `PacketRnnt::stream_batch` live streams and one of `PacketRnnt::upload_batch` upload
+    /// streams. A push cuts its windows the round it joins; its later rounds step them.
     fn stream_push_round(&mut self, pushes: &[StreamPush<'_>]) -> Vec<Result<Option<String>>> {
-        let (Some(w), Some(_)) = (self.execution.stream_windows(), self.stream_slots()) else {
+        if self.stream_slots().is_none() {
             return crate::asr::push_alone(self, pushes);
-        };
+        }
         let started = Instant::now();
         let mut results: Vec<Option<Result<Option<String>>>> =
             pushes.iter().map(|_| None).collect();
@@ -250,7 +282,7 @@ impl Transcriber for PacketRnntTranscriber {
             .collect();
         let cutting = active.iter().zip(&recut).filter(|(_, recut)| **recut);
         let mut frames = self
-            .next_frames(&w, cutting.map(|((_, stream), _)| stream))
+            .next_frames(cutting.map(|((_, stream), _)| stream))
             .into_iter();
         // (push, stream, its next window and rows, whether it is the last)
         let mut stepping = Vec::with_capacity(active.len());
@@ -258,10 +290,9 @@ impl Transcriber for PacketRnntTranscriber {
         for ((index, mut stream), recut) in active.into_iter().zip(recut) {
             if recut {
                 let finish = pushes[index].finish;
-                let windows = frames
-                    .next()
-                    .expect("frames per cut")
-                    .and_then(|frames| self.windows(&w, stream.steps, frames, finish));
+                let windows = frames.next().expect("frames per cut").and_then(|frames| {
+                    self.windows(&self.geometry(&stream)?, stream.steps, frames, finish)
+                });
                 match windows {
                     Ok(windows) => (stream.cut, stream.cut_finish) = (windows.into(), finish),
                     Err(error) => {
@@ -281,19 +312,33 @@ impl Transcriber for PacketRnntTranscriber {
             }
         }
         let mel_us = started.elapsed().as_micros() as u64;
-        // One launch a round, finals first: a second launch would hold every final in the round
-        // for both. The rest step next round, in push order.
-        stepping.sort_by_key(|(index, ..)| !pushes[*index].finish);
-        let deferred = stepping.split_off(stepping.len().min(self.execution.stream_batch()));
+        // One launch a round per geometry, live streams first and finals first: a second launch
+        // would hold every final in the round for both. The rest step next round, in push order.
+        stepping.sort_by_key(|(index, stream, ..)| {
+            (stream.rnnt.is_upload(), !pushes[*index].finish)
+        });
+        let live = stepping
+            .iter()
+            .take_while(|(_, stream, ..)| !stream.rnnt.is_upload())
+            .count();
+        let mut uploads = stepping.split_off(live);
+        let deferred: Vec<_> = stepping
+            .split_off(live.min(self.execution.stream_batch()))
+            .into_iter()
+            .chain(uploads.split_off(uploads.len().min(self.execution.upload_batch())))
+            .collect();
         let deferred_count = deferred.len();
         for (index, mut stream, window, _) in deferred {
             stream.cut.push_front(window);
             self.streams.insert(pushes[index].id, stream);
             results[index] = Some(Ok(None));
         }
-        let launches = usize::from(!stepping.is_empty());
-        if launches > 0 {
-            let launch = &mut stepping[..];
+        let mut launches = 0;
+        for launch in [&mut stepping[..], &mut uploads[..]] {
+            if launch.is_empty() {
+                continue;
+            }
+            launches += 1;
             let mut steps: Vec<_> = launch
                 .iter_mut()
                 .map(|(_, stream, (window, rows), _)| (&mut stream.rnnt, window.as_slice(), *rows))
@@ -324,6 +369,7 @@ impl Transcriber for PacketRnntTranscriber {
             pushes = pushes.len(),
             finishes = pushes.iter().filter(|push| push.finish).count(),
             stepped = stepping.len(),
+            uploads = uploads.len(),
             deferred = deferred_count,
             launches,
             mel_us,
@@ -332,6 +378,7 @@ impl Transcriber for PacketRnntTranscriber {
         );
         let stepped = stepping
             .into_iter()
+            .chain(uploads)
             .map(|(index, stream, _, last)| (index, stream, last));
         for (index, stream, last) in stepped.chain(done.into_iter().map(|(i, s)| (i, s, true))) {
             let result = results[index]

@@ -120,6 +120,18 @@ pub trait Transcriber: Send {
         None
     }
 
+    /// Open a stream for a whole recording (an upload): one push brings all its audio with
+    /// `finish`, and [`Transcriber::stream_push_round`] steps it in launches of upload streams
+    /// apart from the live ones. `None`: no upload streams, or every stream slot is open.
+    fn upload_open(&mut self) -> crate::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Upload streams one round steps at most; 0 without upload streams.
+    fn upload_batch(&self) -> usize {
+        0
+    }
+
     /// Appends each push's audio to its stream (one push per id) and steps the next window of
     /// each, their steps sharing launches (an engine may defer some to the next round). A push
     /// answers its stream's text once the stream has no window left (a finished stream then
@@ -262,6 +274,14 @@ impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
 
     fn stream_slots(&self) -> Option<usize> {
         (**self).stream_slots()
+    }
+
+    fn upload_open(&mut self) -> crate::Result<Option<u64>> {
+        (**self).upload_open()
+    }
+
+    fn upload_batch(&self) -> usize {
+        (**self).upload_batch()
     }
 
     fn stream_push_round(
