@@ -386,8 +386,9 @@ mod tests {
             c.observe_launch(128, false, 4, 90.0);
         }
         assert!(!c.ride(128, false, 4));
-        // Riding really costs ~nothing: the fast explorations refill the window.
-        run(&mut c, 8 * EXPLORE, 128, 4, |r| if r { 31.4 } else { 31.0 });
+        // Riding really costs ~nothing: the first explored ride surprises, and the fast
+        // explorations refill the window within two EXPLORE windows.
+        run(&mut c, 2 * EXPLORE, 128, 4, |r| if r { 31.4 } else { 31.0 });
         let rode = run(&mut c, 64, 128, 4, |r| if r { 31.4 } else { 31.0 });
         assert!(
             rode >= 64 - 64 / EXPLORE - 1,
@@ -453,6 +454,25 @@ mod tests {
         assert!(
             explored <= 128 / EXPLORE + 1,
             "{explored} explorations in 128 decisions"
+        );
+    }
+
+    #[test]
+    fn only_a_sample_more_than_twice_off_the_median_re_arms_fast_exploration() {
+        let mut c = RideCost::default();
+        warm(&mut c, 120.0, 0.50, 27.0);
+        let fast = |c: &mut RideCost| c.bucket(2048).arms[0].fast;
+        c.observe_launch(2048, false, 50, 120.0 + 50.0 * 0.9);
+        assert_eq!(fast(&mut c), 0, "0.9 ms/row is within 2x of 0.5");
+        c.observe_launch(2048, false, 50, 120.0 + 50.0 * 1.1);
+        assert_eq!(fast(&mut c), (K / 2) as u32, "1.1 ms/row is over 2x");
+        let mut c = RideCost::default();
+        warm(&mut c, 31.0, 0.0, 17.0);
+        c.observe_launch(2048, false, 4, 31.0 + 4.0 * 0.08);
+        assert_eq!(
+            fast(&mut c),
+            0,
+            "free rides jitter under the 0.05 ms/row floor"
         );
     }
 

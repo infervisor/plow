@@ -7164,18 +7164,18 @@ fn gpu_prefill_batched_pass(
         };
         // Riders that would push the planned rows past the decision's bucket (the launch then
         // runs at the next rung): priced apart from riders its padding holds (`sched::ride`).
-        let ride_spills = {
-            let (per_launch, rows) = plan_rows(feeds.len());
-            e.pf_cover_rows(rows.min(per_launch) + feeds.len()) > ride_key
-        };
-        if std::mem::take(&mut ride_open)
+        let planned = plan_rows(decode_rows);
+        let ride_spills = e.pf_cover_rows(planned.1.min(planned.0) + decode_rows) > ride_key;
+        let (per_launch, _) = if std::mem::take(&mut ride_open)
             && !budget_on
             && !ride.ride(ride_key, ride_spills, feeds.len())
         {
             unified = false;
             decode_rows = 0;
-        }
-        let (per_launch, _) = plan_rows(decode_rows);
+            plan_rows(0)
+        } else {
+            planned
+        };
         let step = crate::sched::step::plan(
             e.step_backend(),
             crate::sched::step::Tick {
