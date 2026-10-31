@@ -14,12 +14,16 @@
 //! A launch's cost is the median of its bucket's last [`K`] samples, not a running mean: one
 //! stalled launch (a 70 ms rung-128 tail with 3 riders against a 31 ms norm) priced a rider at
 //! 13 ms, and the bucket then declined 1210 of 1276 rides at ~free rider cost (Qwen3.8-27B FP8).
-//! Until a bucket holds `K` riding samples, and for `K / 2` explorations after its decision
-//! flips, the other arm runs every [`EXPLORE_FAST`] launches so a contaminated window refills.
+//! While an arm declines and holds fewer than `K` riding samples, or for `K / 2` explorations
+//! after a sample landed more than [`SURPRISE`]x off its median, it rides every [`EXPLORE_FAST`]
+//! launches so a contaminated window refills. A decision that flips with the rider count is not
+//! a surprise: re-arming on flips explored 1 launch in 11 on Gemma-4-26B (TTFT P99 +20%).
 
 /// Launches per bucket between forced runs of the arm the policy is not using.
 pub const EXPLORE: u32 = 32;
-/// The exploration interval while a bucket's riding window is filling or just flipped.
+/// A riding sample this far off its arm's median re-arms fast exploration.
+pub const SURPRISE: f64 = 2.0;
+/// The exploration interval while an arm's riding window is filling or was just surprised.
 pub const EXPLORE_FAST: u32 = 4;
 /// Samples per estimate window.
 pub const K: usize = 8;
@@ -89,9 +93,8 @@ struct Arm {
     /// Per riding row: launch ms over the bucket's `pure` median, divided by the riding rows.
     per_row: Window,
     since_explore: u32,
-    /// Explorations left at [`EXPLORE_FAST`] after the decision flipped, and the last decision.
+    /// Explorations left at [`EXPLORE_FAST`] after a surprising sample.
     fast: u32,
-    last: Option<bool>,
 }
 
 /// Per-engine cost estimates for [`RideCost::ride`].
@@ -151,14 +154,24 @@ impl RideCost {
     }
 
     /// One prefill launch of `bucket` rows that carried `decode_rows` riding rows, `ms` long.
-    /// `spills`: the riders pushed the launch past `bucket` into a wider rung.
+    /// `spills`: the arm the ride decision asked (riders predicted past `bucket`).
     pub fn observe_launch(&mut self, bucket: usize, spills: bool, decode_rows: usize, ms: f64) {
         let b = self.bucket(bucket);
         match (decode_rows, b.pure.median()) {
             (0, _) => b.pure.add(ms),
-            (d, Some(pure)) => b.arms[usize::from(spills)]
-                .per_row
-                .add((ms - pure).max(0.0) / d as f64),
+            (d, Some(pure)) => {
+                let arm = &mut b.arms[usize::from(spills)];
+                let x = (ms - pure).max(0.0) / d as f64;
+                // Per-row costs below this are noise around a free ride, not a different cost.
+                const FLOOR: f64 = 0.05;
+                if arm.per_row.len == K {
+                    let m = arm.per_row.median().unwrap_or(x).max(FLOOR);
+                    if x.max(FLOOR) > SURPRISE * m || m > SURPRISE * x.max(FLOOR) {
+                        arm.fast = (K / 2) as u32;
+                    }
+                }
+                arm.per_row.add(x);
+            }
             _ => {}
         }
     }
@@ -251,11 +264,8 @@ impl RideCost {
             (None, _, _) => false,
             _ => true,
         };
-        if arm.last.is_some_and(|last| last != prefer) {
-            arm.fast = (K / 2) as u32;
-        }
-        arm.last = Some(prefer);
-        let interval = if arm.per_row.len < K || arm.fast > 0 {
+        // Only a declining arm needs its riding window refilled: a riding one samples every launch.
+        let interval = if !prefer && (arm.per_row.len < K || arm.fast > 0) {
             EXPLORE_FAST
         } else {
             EXPLORE
@@ -420,6 +430,30 @@ mod tests {
             "a spilling ride costs 47 ms against a 17 ms step"
         );
         assert!(c.ride(128, false, 4), "a ride that fits costs ~0.4 ms");
+    }
+
+    #[test]
+    fn a_rider_count_that_flips_the_decision_does_not_re_arm_exploration() {
+        // A stable 0.5 ms/row against a 27 ms step: 20 riders ride, 100 do not.
+        let mut c = RideCost::default();
+        warm(&mut c, 120.0, 0.50, 27.0);
+        let mut explored = 0;
+        for i in 0..128 {
+            let rows = [20, 20, 20, 100][i % 4];
+            let prefer = rows as f64 * 0.5 <= 27.0;
+            let r = c.ride(2048, false, rows);
+            explored += u32::from(r != prefer);
+            c.observe_launch(
+                2048,
+                false,
+                if r { rows } else { 0 },
+                if r { 120.0 + 0.5 * rows as f64 } else { 120.0 },
+            );
+        }
+        assert!(
+            explored <= 128 / EXPLORE + 1,
+            "{explored} explorations in 128 decisions"
+        );
     }
 
     #[test]

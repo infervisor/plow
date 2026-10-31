@@ -7116,10 +7116,50 @@ fn gpu_prefill_batched_pass(
             None => (launch_cap, launch_max),
         };
         let ride_key = e.pf_pack_budget(avail.min(launch_cap));
-        // Riders that push the launch's rows past its bucket run it at the next rung: priced
-        // apart from riders the bucket's padding holds (`sched::ride`).
-        let ride_spills =
-            e.pf_cover_rows(avail.min(launch_cap).min(ride_key) + feeds.len()) > ride_key;
+        // The launch's prompt rows and bucket for `decode_rows` riders: caps, overlay, adaptive
+        // packing, then the rider trim. The ride decision prices the plan riding would run.
+        let plan_rows = |decode_rows: usize| {
+            let per_launch = launch_cap.min(launch_max.saturating_sub(decode_rows));
+            // Every overlay row of a launch is staged at once: bound its rows by the overlay's.
+            let per_launch = per_launch.min(overlay_rows.unwrap_or(usize::MAX)).max(1);
+            let per_launch = if adaptive {
+                let mut queue: Vec<(u64, usize)> = candidates
+                    .iter()
+                    .map(|c| (c.arrival, c.span.n_rows as usize))
+                    .collect();
+                queue.sort_unstable_by_key(|&(arrival, _)| arrival);
+                let rows: Vec<usize> = queue.into_iter().map(|(_, rows)| rows).collect();
+                queue_pack_rows(&rows, pf_chunk_cost_rows(), per_launch)
+            } else {
+                per_launch
+            };
+            let rows = avail.min(per_launch);
+            let bucket = e.pf_pack_budget(rows);
+            // Under the unified token batch the decode rows ride in this launch, and the batch takes
+            // the smallest bucket holding every row.
+            // An indivisible media span cut by a trim would leave the launch empty: it spills instead.
+            let trim = !media_spans
+                && trim_for_riders(
+                    bucket,
+                    e.pf_cover_rows(rows.min(bucket) + decode_rows),
+                    decode_rows,
+                    rows,
+                    avail - rows,
+                );
+            let per_launch = if trim {
+                bucket.saturating_sub(decode_rows).max(1)
+            } else {
+                bucket
+            }
+            .min(per_launch);
+            (per_launch, rows)
+        };
+        // Riders that would push the planned rows past the decision's bucket (the launch then
+        // runs at the next rung): priced apart from riders its padding holds (`sched::ride`).
+        let ride_spills = {
+            let (per_launch, rows) = plan_rows(feeds.len());
+            e.pf_cover_rows(rows.min(per_launch) + feeds.len()) > ride_key
+        };
         if std::mem::take(&mut ride_open)
             && !budget_on
             && !ride.ride(ride_key, ride_spills, feeds.len())
@@ -7127,39 +7167,7 @@ fn gpu_prefill_batched_pass(
             unified = false;
             decode_rows = 0;
         }
-        let per_launch = launch_cap.min(launch_max.saturating_sub(decode_rows));
-        // Every overlay row of a launch is staged at once: bound its rows by the overlay's.
-        let per_launch = per_launch.min(overlay_rows.unwrap_or(usize::MAX)).max(1);
-        let per_launch = if adaptive {
-            let mut queue: Vec<(u64, usize)> = candidates
-                .iter()
-                .map(|c| (c.arrival, c.span.n_rows as usize))
-                .collect();
-            queue.sort_unstable_by_key(|&(arrival, _)| arrival);
-            let rows: Vec<usize> = queue.into_iter().map(|(_, rows)| rows).collect();
-            queue_pack_rows(&rows, pf_chunk_cost_rows(), per_launch)
-        } else {
-            per_launch
-        };
-        let rows = avail.min(per_launch);
-        let bucket = e.pf_pack_budget(rows);
-        // Under the unified token batch the decode rows ride in this launch, and the batch takes the
-        // smallest bucket holding every row.
-        // An indivisible media span cut by a trim would leave the launch empty: it spills instead.
-        let trim = !media_spans
-            && trim_for_riders(
-                bucket,
-                e.pf_cover_rows(rows.min(bucket) + decode_rows),
-                decode_rows,
-                rows,
-                avail - rows,
-            );
-        let per_launch = if trim {
-            bucket.saturating_sub(decode_rows).max(1)
-        } else {
-            bucket
-        }
-        .min(per_launch);
+        let (per_launch, _) = plan_rows(decode_rows);
         let step = crate::sched::step::plan(
             e.step_backend(),
             crate::sched::step::Tick {
@@ -7383,7 +7391,9 @@ fn gpu_prefill_batched_pass(
         if let (true, Some(ms)) = (res.is_ok(), observed) {
             // The rung actually launched: the smallest bucket holding the packed rows and riders.
             let rung = e.pf_cover_rows(pack.iter().map(|p| p.2).sum::<usize>() + riders);
-            ride.observe_launch(ride_key, rung > ride_key, riders, ms);
+            // Priced under the arm the decision asked: trims and caps after the decision change
+            // the rows, so the arm is a decision context, not the rung that ran.
+            ride.observe_launch(ride_key, ride_spills, riders, ms);
             // Only `rows_within` (the ITL budget) reads the rung's own time.
             if pf_itl_budget_ms() > 0 {
                 ride.observe_rung(rung, ms);
