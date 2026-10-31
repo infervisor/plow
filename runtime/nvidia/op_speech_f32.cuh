@@ -1372,9 +1372,13 @@ struct SpQ8Epi {
 };
 /* At most this many rows (a stream step, the RNNT predictor and joint) take the GEMV walk. */
 #define SPQ_GEMV_ROWS 8u
+/* Rows per pass of a pinned GEMV walk over more rows (a batched predictor or joint), when they fit
+ * the arena: every pass reads all the weights. */
+#define SPQ_GEMV_PASS_ROWS 32u
 /* A warp per output column walks K in Q8_0 blocks (lane = element), every row's sum in a register,
  * then one fixed-order warp reduction: bandwidth-bound on the weights, every slice's warps sharing
- * the columns. */
+ * the columns. A row's sum is the same whatever ROWS. */
+template <unsigned ROWS>
 static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                                                   const SpQ8Epi& ep, unsigned m, unsigned n, unsigned k,
                                                   unsigned slice, unsigned nblk) {
@@ -1388,20 +1392,20 @@ static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, c
     }
     for (unsigned c = slice * PLOW_NV_WARPS + warp; c < n; c += nblk * PLOW_NV_WARPS) {
         const uint8_t* row = w + (size_t)c * blocks * 34u;
-        float acc[SPQ_GEMV_ROWS];
+        float acc[ROWS];
 #pragma unroll
-        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) acc[r] = 0.f;
+        for (unsigned r = 0; r < ROWS; r++) acc[r] = 0.f;
 #pragma unroll 4
         for (unsigned b = 0; b < blocks; b++) {
             const uint8_t* block = row + b * 34u;
             const float wv = __fmul_rn(sp_f16(*(const uint16_t*)block), (float)((const int8_t*)(block + 2))[lane]);
             const float* xk = x + b * 32u + lane;
 #pragma unroll
-            for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++)
+            for (unsigned r = 0; r < ROWS; r++)
                 if (r < m) acc[r] = fmaf(xk[(size_t)r * k], wv, acc[r]);
         }
 #pragma unroll
-        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) {
+        for (unsigned r = 0; r < ROWS; r++) {
             if (r >= m) break;
             float v = acc[r];
             for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -1423,10 +1427,18 @@ static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const
     const SpRowQ8 lb{w, k};
     const SpQ8Epi ep{out, bias, n, activation == 1u};
     if (path == 1u || (path == 0u && m <= SPQ_GEMV_ROWS)) {
-        /* Rows in groups of SPQ_GEMV_ROWS: each row sums exactly as it would in a launch of its own. */
+        /* Rows in groups: each row sums exactly as it would in a launch of its own. */
+        if (m > SPQ_GEMV_ROWS && (size_t)SPQ_GEMV_PASS_ROWS * k <= SP_ARENA_FLOATS) {
+            for (unsigned r0 = 0; r0 < m; r0 += SPQ_GEMV_PASS_ROWS)
+                sp_q8_gemv<SPQ_GEMV_PASS_ROWS>(x + (size_t)r0 * k, w,
+                                               SpQ8Epi{out + (size_t)r0 * n, bias, n, activation == 1u},
+                                               m - r0 < SPQ_GEMV_PASS_ROWS ? m - r0 : SPQ_GEMV_PASS_ROWS, n, k,
+                                               slice, nblk);
+            return;
+        }
         for (unsigned r0 = 0; r0 < m; r0 += SPQ_GEMV_ROWS)
-            sp_q8_gemv(x + (size_t)r0 * k, w, SpQ8Epi{out + (size_t)r0 * n, bias, n, activation == 1u},
-                       m - r0 < SPQ_GEMV_ROWS ? m - r0 : SPQ_GEMV_ROWS, n, k, slice, nblk);
+            sp_q8_gemv<SPQ_GEMV_ROWS>(x + (size_t)r0 * k, w, SpQ8Epi{out + (size_t)r0 * n, bias, n, activation == 1u},
+                                      m - r0 < SPQ_GEMV_ROWS ? m - r0 : SPQ_GEMV_ROWS, n, k, slice, nblk);
         return;
     }
     /* 64x64 tiles when 128x128 ones leave slices idle (the small-M conformer rows). */
@@ -2243,14 +2255,22 @@ static __device__ __forceinline__ void sp_relative_attention_rows(
             if (lane == 0) scores[kr - first] = s;
         }
         __syncthreads();
+        /* The exps in parallel, their sum in key order by one thread: the values and the order of the
+         * serial softmax (the sign of a zero maximum changes no exp). */
+        const unsigned n = last - first;
+        float mx = -INFINITY;
+        for (unsigned j = lane; j < n; j += 32u) mx = fmaxf(mx, scores[j]);
+        mx = sp_warp_max(mx);
+        for (unsigned j = threadIdx.x; j < n; j += PLOW_NV_THREADS) probs[j] = sp_expf(__fsub_rn(scores[j], mx));
+        __syncthreads();
         if (threadIdx.x == 0) {
-            float mx = -INFINITY;
-            for (unsigned kr = first; kr < last; kr++) mx = fmaxf(mx, scores[kr - first]);
             float den = 0.f;
-            for (unsigned kr = first; kr < last; kr++) den = __fadd_rn(den, sp_expf(__fsub_rn(scores[kr - first], mx)));
-            for (unsigned kr = first; kr < last; kr++)
-                probs[kr - first] = __fdiv_rn(sp_expf(__fsub_rn(scores[kr - first], mx)), den);
+            for (unsigned j = 0; j < n; j++) den = __fadd_rn(den, probs[j]);
+            scores[0] = den;
         }
+        __syncthreads();
+        const float den = scores[0];
+        for (unsigned j = threadIdx.x; j < n; j += PLOW_NV_THREADS) probs[j] = __fdiv_rn(probs[j], den);
         __syncthreads();
         for (unsigned c = threadIdx.x; c < hw; c += PLOW_NV_THREADS) {
             float acc = 0.f;

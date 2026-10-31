@@ -603,10 +603,22 @@ fn emit_q8(
 ) -> u32 {
     let weight = b.tensor(weight_name, u64::from(n) * u64::from(k / 32) * 34);
     // At most 8 rows the kernel walks columns warp by warp (SPQ_GEMV_ROWS): every CU takes a share.
+    // Above, a slice per 128x128 tile when their waves over the CUs beat the 64x64 tiles' (a 128
+    // tile takes ~2.8 times as long, measured at 1024 rows); the kernel takes 64x64 tiles when the
+    // 128x128 ones are fewer than the slices. The tile never changes a result.
     let tiles = if m <= 8 {
         b.n_cu()
     } else {
-        m.div_ceil(64) * n.div_ceil(64)
+        let (large, small) = (
+            m.div_ceil(128) * n.div_ceil(128),
+            m.div_ceil(64) * n.div_ceil(64),
+        );
+        let waves = |tiles: u32| tiles.div_ceil(b.n_cu());
+        if 3 * waves(large) <= waves(small) {
+            large
+        } else {
+            small
+        }
     };
     b.emit(
         DevOp::Q8GemmF32,

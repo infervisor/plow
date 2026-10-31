@@ -1412,7 +1412,7 @@ static void t_q8_path(unsigned path, unsigned m_small, unsigned m_big, unsigned 
     char name[64];
     snprintf(name, sizeof name, "Q8GemmF32 path %u %ux%ux%u", path, m_big, n, k);
     Case c;
-    unsigned big = c.out((size_t)m_big * n), small = c.out((size_t)m_small * n);
+    unsigned big = c.out((size_t)m_big * n), small = c.out((size_t)m_small * n), last = c.out((size_t)m_small * n);
     unsigned x = c.f32((size_t)m_big * k, 1.f), w = q8_weights(c, n, k), b = c.f32(n, 0.3f);
     c.in.op = PLOW_DOP_Q8_GEMM_F32;
     c.in.t[0] = big; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
@@ -1421,8 +1421,34 @@ static void t_q8_path(unsigned path, unsigned m_small, unsigned m_big, unsigned 
     PlowDevInst alone = c.in;
     alone.t[0] = small; alone.i[0] = m_small;
     launch(alone, c.dev);
-    const std::vector<uint32_t> batched = fetch(c, big), own = fetch(c, small);
-    verdict(name, "rows alone == rows in the launch", std::equal(own.begin(), own.end(), batched.begin()));
+    /* The launch's last rows too (a_row0): they sit in its last group of rows. */
+    PlowDevInst tail = alone;
+    tail.t[0] = last; tail.i[4] = m_big - m_small;
+    launch(tail, c.dev);
+    const std::vector<uint32_t> batched = fetch(c, big), own = fetch(c, small), own_last = fetch(c, last);
+    verdict(name, "rows alone == rows in the launch",
+            std::equal(own.begin(), own.end(), batched.begin()) &&
+                std::equal(own_last.begin(), own_last.end(), batched.end() - own_last.size()));
+}
+
+/* Q8GemmF32 tiles (path 2): 128x128 tiles (as many slices as tiles) give the 64x64 tiles' bits. */
+static void t_q8_tiles(unsigned m, unsigned n, unsigned k) {
+    char name[64];
+    snprintf(name, sizeof name, "Q8GemmF32 tiles %ux%ux%u", m, n, k);
+    Case c;
+    unsigned small = c.out((size_t)m * n), large = c.out((size_t)m * n);
+    unsigned x = c.f32((size_t)m * k, 1.f), w = q8_weights(c, n, k), b = c.f32(n, 0.3f);
+    c.in.op = PLOW_DOP_Q8_GEMM_F32;
+    c.in.t[0] = small; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
+    c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[7] = 2;
+    run(name, c, g_q8_gemm_f32, {small}, FP32);
+    PlowDevInst one = c.in;
+    one.t[0] = large;
+    const int slices = g_nblk;
+    g_nblk = (int)(((m + SPG_BM - 1) / SPG_BM) * ((n + SPG_BN - 1) / SPG_BN));
+    launch(one, c.dev);
+    g_nblk = slices;
+    verdict(name, "128x128 tiles == 64x64 tiles", fetch(c, large) == fetch(c, small));
 }
 
 /* Item `b` of an [items][bytes] tensor as a tensor of its own. */
@@ -1514,6 +1540,24 @@ static void bench_q8_paths() {
             }
         }
     }
+}
+
+/* RelativeAttentionF32 at Nemotron's batched stream steps: `items` windows of `rows` rows, the rows from
+ * query_row0 querying (live 60/56, upload 88/56), every key filled. */
+static void bench_relative_items(unsigned items, unsigned rows, unsigned query_row0) {
+    Case c;
+    const unsigned width = 1024;
+    const size_t n = (size_t)items * rows * width;
+    unsigned o = c.out(n), q = c.f32(n, 1.f), k = c.f32(n, 1.f), v = c.f32(n, 1.f);
+    unsigned p = c.f32((size_t)(2 * rows - 1) * width, 1.f), u = c.f32(width, 0.3f), bv = c.f32(width, 0.3f);
+    c.in.op = PLOW_DOP_RELATIVE_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = p; c.in.t[5] = u; c.in.t[6] = bv;
+    c.in.t[7] = c.u32(std::vector<uint32_t>(items, 0u));
+    c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = 8; c.in.i[3] = 4; c.in.i[4] = 14;
+    c.in.i[5] = query_row0; c.in.i[6] = items;
+    char name[64];
+    snprintf(name, sizeof name, "RelativeAttentionF32 items=%u rows=%u from %u", items, rows, query_row0);
+    bench(name, c, 0, 0);
 }
 
 /* Per-item prefix rows (AttentionF32 flags bit 5, t5 = pre_b per item). Separate Q/K/V; own K/V
@@ -1851,6 +1895,8 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && !strcmp(argv[1], "--bench-asr")) {
         bench_q8_paths();
+        bench_relative_items(128, 60, 56);
+        bench_relative_items(32, 88, 56);
         return 0;
     }
     t_dense("DenseGemmF32 qwen q 300x1024x1024", 300, 1024, 1024, 1 | 4, 0, 0, 0, 0, true);
@@ -1868,9 +1914,15 @@ int main(int argc, char** argv) {
     t_q8(20, 96, 256, 1);
     t_q8_path(1, 4, 20, 96, 256);
     t_q8_path(1, 5, 37, 130, 512);
+    /* A batched joint's rows: GEMV passes of 32 rows (32, 32, 6) against an 8-row launch. */
+    t_q8_path(1, 8, 70, 640, 640);
+    t_q8_tiles(200, 300, 256);
+    t_q8_tiles(150, 260, 1024);
     t_q8_path(2, 4, 70, 130, 512);
     /* Nemotron's stream window: 14 chunks of 4 rows of keys, then the step's 4 query rows. */
     t_relative_items("RelativeAttentionF32 stream items", 60, 1024, 8, 4, 14, 56, {56, 52, 0, 8, 56});
+    /* An upload stream's window: the same 56 rows of keys, then 32 query rows. */
+    t_relative_items("RelativeAttentionF32 upload items", 88, 1024, 8, 4, 14, 56, {56, 24, 0, 8, 56});
     t_relative_items("RelativeAttentionF32 chunked items", 40, 256, 4, 8, 2, 0, {0, 3, 17});
     t_relative_items("RelativeAttentionF32 full items", 21, 640, 2, 1, 0xFFFFFFFFu, 0, {21, 9, 15});
     t_dwconv_items(5, 12, 1024, 9);
