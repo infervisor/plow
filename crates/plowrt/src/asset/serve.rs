@@ -343,10 +343,9 @@ fn objects_dir_with(explicit: Option<&str>, assets_dir: &Path) -> Option<PathBuf
         })
 }
 
-/// `serve.json` serve-knob defaults of the bundles in `asset_dirs`, plus the cuBLASLt table a
-/// self-contained bundle carries (`cublaslt_algos.jsonl` for `PLOW_LT_ALGOS`), as
-/// `(knob, value, source)`. A bundle's `objects/` is not exported: each bundle resolves it
-/// itself ([`objects_dir`]). A knob the environment already sets is left out, so an explicit
+/// `serve.json` serve-knob defaults of the bundles in `asset_dirs`, as `(knob, value, source)`.
+/// A bundle's `objects/` and `cublaslt_algos.jsonl` are not exported: each engine resolves its
+/// own ([`objects_dir`], `Lt::load`), so co-served bundles do not collide on them. A knob the environment already sets is left out, so an explicit
 /// setting always wins. Every packet-carried key must be a registered runtime knob.
 pub fn asset_env_defaults(
     asset_dirs: &[PathBuf],
@@ -394,15 +393,6 @@ pub fn asset_env_defaults(
                     put(key, value.clone(), pkt.display().to_string(), &mut out)?;
                 }
             }
-        }
-        let lt = dir.join("cublaslt_algos.jsonl");
-        if lt.is_file() && env("PLOW_LT_ALGOS_WRITE").is_none() {
-            put(
-                "PLOW_LT_ALGOS",
-                lt.display().to_string(),
-                dir.display().to_string(),
-                &mut out,
-            )?;
         }
     }
     Ok(out)
@@ -778,6 +768,20 @@ mod tests {
         assert!(!got.iter().any(|(k, _, _)| k == "PLOW_PF_SEG_DIR"));
         std::fs::remove_dir_all(with).unwrap();
         std::fs::remove_dir_all(without).unwrap();
+    }
+
+    /// Each co-served bundle's cuBLASLt table stays with its engine: exported process-wide, two
+    /// production bundles refused to start side by side.
+    #[test]
+    fn co_served_lt_tables_do_not_collide() {
+        let a = bundle("lt-a", None);
+        let b = bundle("lt-b", None);
+        std::fs::write(a.join("cublaslt_algos.jsonl"), "").unwrap();
+        std::fs::write(b.join("cublaslt_algos.jsonl"), "").unwrap();
+        let got = asset_env_defaults(&[a.clone(), b.clone()], |_| None).unwrap();
+        assert!(!got.iter().any(|(k, _, _)| k == "PLOW_LT_ALGOS"), "{got:?}");
+        std::fs::remove_dir_all(a).unwrap();
+        std::fs::remove_dir_all(b).unwrap();
     }
 
     #[test]
