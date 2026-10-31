@@ -1644,15 +1644,20 @@ impl ModelManager {
             }
         }
 
-        // The turn mode is fixed when the turns are installed, from the startup tenant count: a
-        // model loaded later beside another on a group that started with one runs without turns.
+        // Turns are installed from the startup tenant count: a model loaded later beside another
+        // raises its group's turn from `Free`; on HSA a group still not round-robin (an explicit
+        // --co-sched) is refused.
+        let others = self
+            .models
+            .read()
+            .iter()
+            .filter(|o| o.slug != m.slug && self.is_resident(&o.slug))
+            .count();
+        state.upgrade_turn(&m.slug, others, self.device.co_tenants_need_rr());
         if unturned_co_tenancy(
             self.device.co_tenants_need_rr(),
             state.device_turn(&m.slug).map(|t| t.mode()),
-            self.models
-                .read()
-                .iter()
-                .any(|o| o.slug != m.slug && self.is_resident(&o.slug)),
+            others > 0,
         ) {
             return Err(EnsureError::Load(RuntimeError::Rejected(format!(
                 "refusing to make {} co-resident on a device group whose co-tenant turns are not \

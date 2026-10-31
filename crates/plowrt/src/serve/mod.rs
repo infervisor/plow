@@ -997,6 +997,22 @@ impl AppState {
         });
     }
 
+    /// `slug` is about to run beside `others` engines on its group: raise an unordered turn to
+    /// what a startup with them all would have picked (`policy::co_sched`).
+    pub fn upgrade_turn(&self, slug: &str, others: usize, amd: bool) {
+        if others == 0 {
+            return;
+        }
+        let Some(turn) = self.device_turn(slug) else {
+            return;
+        };
+        let want = policy::co_sched(others + 1, amd);
+        if turn.upgrade(want) {
+            policy::set_co_sched(want);
+            tracing::info!(%slug, tenants = others + 1, mode = ?want, "co-tenant turns raised for a runtime load");
+        }
+    }
+
     /// `slug`'s downstream credit (created on first use; unlimited until a stage sets a limit).
     pub fn downstream(&self, slug: &str) -> Arc<crate::sched::admission::DownstreamCredit> {
         let known = self.downstream.read().get(slug).cloned();
