@@ -3374,24 +3374,42 @@ thread_local! {
 /// unscoped config read in engine code is a wrong-model read.
 static ENGINES_DIVERGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Source files whose code runs for one model's engine.
-const ENGINE_SOURCES: &[&str] = &[
-    "crates/plowrt/src/exec/",
-    "crates/plowrt/src/memory/",
-    "crates/plowrt/src/serve/engine.rs",
-    "crates/plowrt/src/serve/mux.rs",
-];
+/// Source files whose code runs for one model's engine, relative to this crate's `src/`.
+const ENGINE_SOURCES: &[&str] = &["exec/", "memory/", "serve/engine.rs", "serve/mux.rs"];
 
 fn engine_source(file: &str) -> bool {
-    ENGINE_SOURCES.iter().any(|p| file.starts_with(p))
+    // `Location::file` spells paths as `file!()` does in this build (workspace-relative,
+    // absolute or remapped): strip the same prefix this file has.
+    let src = file!().strip_suffix("config.rs").unwrap_or("");
+    let Some(rel) = file.strip_prefix(src) else {
+        return false;
+    };
+    ENGINE_SOURCES.iter().any(|p| rel.starts_with(p))
+}
+
+/// Mark engine configs as diverged, so the engine-scope check of [`RuntimeConfig::get`] runs
+/// without a co-served bundle (tests).
+#[doc(hidden)]
+pub fn check_engine_scope() {
+    ENGINES_DIVERGE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cold]
 #[inline(never)]
 fn unscoped_engine_read(at: &'static std::panic::Location<'static>) {
-    if !engine_source(at.file()) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Sites already reported (release): one bit per hashed site, so a repeated read costs one
+    // load and no lock (a collision only drops a second site's warning).
+    static SEEN: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (at.file(), at.line(), at.column()).hash(&mut h);
+    let h = h.finish() as usize % (64 * 64);
+    let (word, bit) = (&SEEN[h / 64], 1u64 << (h % 64));
+    if word.load(Ordering::Relaxed) & bit != 0 || !engine_source(at.file()) {
         return;
     }
+    let first = word.fetch_or(bit, Ordering::Relaxed) & bit == 0;
     let thread = std::thread::current();
     let msg = format!(
         "engine code read the runtime config with no engine scope at {at} on thread {:?}: \
@@ -3401,10 +3419,7 @@ fn unscoped_engine_read(at: &'static std::panic::Location<'static>) {
     if cfg!(debug_assertions) {
         panic!("{msg}");
     }
-    static SEEN: std::sync::Mutex<Vec<(&'static str, u32)>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&(at.file(), at.line())) {
-        seen.push((at.file(), at.line()));
+    if first {
         tracing::warn!("{msg}");
     }
 }
@@ -3733,15 +3748,20 @@ mod scope_tests {
     /// The check covers the engine's sources and nothing on the request path.
     #[test]
     fn engine_sources_are_the_engine_and_dispatcher() {
-        assert!(engine_source("crates/plowrt/src/exec/gpu.rs"));
-        assert!(engine_source("crates/plowrt/src/memory/vmm.rs"));
-        assert!(engine_source("crates/plowrt/src/serve/mux.rs"));
-        assert!(!engine_source("crates/plowrt/src/serve/chat.rs"));
-        assert!(!engine_source("crates/plowrt/src/main.rs"));
-        // Paths as `Location` spells them in this build.
-        assert!(std::panic::Location::caller()
-            .file()
-            .starts_with("crates/plowrt/src/"));
+        let src = file!().strip_suffix("config.rs").unwrap();
+        for (f, engine) in [
+            ("exec/gpu.rs", true),
+            ("memory/vmm.rs", true),
+            ("serve/mux.rs", true),
+            ("serve/chat.rs", false),
+            ("main.rs", false),
+        ] {
+            assert_eq!(engine_source(&format!("{src}{f}")), engine, "{f}");
+        }
+        assert!(
+            !engine_source("exec/gpu.rs"),
+            "a path outside this crate's sources"
+        );
     }
 }
 

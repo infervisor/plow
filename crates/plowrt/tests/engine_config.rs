@@ -195,3 +195,28 @@ fn command_line_settings_resolve_as_the_process_parse() {
     let got = format!("{:?}", resolve_engine(&st, &[]).unwrap());
     assert_eq!(got, want);
 }
+
+/// Once engine configs diverge, engine code reading the config with no engine scope is a
+/// wrong-model read: it panics in a debug build; under a scope (or one its thread inherited) it
+/// reads that scope.
+#[cfg(feature = "hsa")]
+#[test]
+fn an_unscoped_engine_read_is_caught_once_engines_diverge() {
+    use plowrt::config::{check_engine_scope, inherit, scoped};
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let plan = || plowrt::exec::amd::plan_chunks(&[512, 1024], 1500).map(|v| v.len());
+    let before = plan().unwrap();
+    check_engine_scope();
+    let unscoped = std::panic::catch_unwind(plan);
+    let msg = *unscoped.unwrap_err().downcast::<String>().unwrap();
+    assert!(
+        msg.contains("no engine scope at") && msg.contains("exec/amd.rs"),
+        "{msg}"
+    );
+    let cfg: &'static RuntimeConfig = Box::leak(Box::new(
+        resolve_engine(&Startup::new(Vec::new(), BTreeMap::new()), &[]).unwrap(),
+    ));
+    assert_eq!(scoped(Some(cfg), plan).unwrap(), before);
+    let helper = scoped(Some(cfg), || std::thread::spawn(inherit(plan)));
+    assert_eq!(helper.join().unwrap().unwrap(), before);
+}
