@@ -211,6 +211,11 @@ pub fn set_checkpoint(asset_dir: &Path, checkpoint: &Path) -> Result<()> {
     }
 }
 
+/// Forget `asset_dir`'s explicit checkpoint pairing (a control-plane registration rolled back).
+pub fn clear_checkpoint(asset_dir: &Path) {
+    explicit_checkpoints().write().remove(&map_key(asset_dir));
+}
+
 /// Split one `--assets` value, `<dir>[,checkpoint=<path>][,slug=<name>]`, and record the
 /// pairing. A value that names an existing path is taken literally (a directory name may contain
 /// a comma).
@@ -338,69 +343,76 @@ fn objects_dir_with(explicit: Option<&str>, assets_dir: &Path) -> Option<PathBuf
         })
 }
 
-/// `serve.json` serve-knob defaults of the bundles in `asset_dirs`, plus the cuBLASLt table a
-/// self-contained bundle carries (`cublaslt_algos.jsonl` for `PLOW_LT_ALGOS`), as
-/// `(knob, value, source)`. A bundle's `objects/` is not exported: each bundle resolves it
-/// itself ([`objects_dir`]). A knob the environment already sets is left out, so an explicit
-/// setting always wins. Every packet-carried key must be a registered runtime knob.
+/// `serve.json` serve-knob defaults of the bundles in `asset_dirs`, as `(knob, value, source)`:
+/// what startup exports into the environment. A bundle's `objects/` and `cublaslt_algos.jsonl`
+/// are not exported: each engine resolves its own ([`objects_dir`], `Lt::load`). A knob the
+/// environment already sets is left out, so an explicit setting always wins.
+///
+/// Two bundles may ask different values of an ENGINE-scoped knob (`knob_spec::knob_scope`):
+/// each engine resolves its own bundle's ([`crate::config::bundle_config`]), and the first value
+/// is what non-engine code sees. A process-scoped knob has one value, so a disagreement there
+/// is refused.
 pub fn asset_env_defaults(
     asset_dirs: &[PathBuf],
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut out: Vec<(String, String, String)> = Vec::new();
-    let mut put = |key: &str,
-                   value: String,
-                   source: String,
-                   out: &mut Vec<(String, String, String)>|
-     -> Result<()> {
-        if env(key).is_some() {
-            return Ok(());
-        }
-        if let Some((_, have, from)) = out.iter().find(|(k, _, _)| k == key) {
-            if *have != value {
-                return Err(RuntimeError::Rejected(format!(
-                    "{key}: {from} asks for {have} and {source} for {value}; set {key} explicitly to serve both"
-                )));
-            }
-            return Ok(());
-        }
-        out.push((key.to_string(), value, source));
-        Ok(())
-    };
     for dir in asset_dirs {
-        if let Some(pkt) = crate::asset::devblob::DevBlob::find_in_dir(dir)? {
-            if let Some(bytes) = read_section(&pkt)? {
-                let m = ServeManifest::parse(&bytes).map_err(RuntimeError::Device)?;
-                for (key, value) in &m.serve_defaults {
-                    if crate::knob_spec::is_removed_env(key) {
-                        tracing::warn!(
-                            knob = key.as_str(),
-                            packet = %pkt.display(),
-                            "packet serve default names a removed knob; ignored"
-                        );
-                        continue;
-                    }
-                    if !crate::knob_spec::is_runtime_env(key) {
-                        return Err(RuntimeError::Rejected(format!(
-                            "{}: serve default {key} is not a registered plowrt runtime knob",
-                            pkt.display()
-                        )));
-                    }
-                    put(key, value.clone(), pkt.display().to_string(), &mut out)?;
-                }
+        let Some((pkt, defaults)) = bundle_serve_defaults(dir)? else {
+            continue;
+        };
+        let source = pkt.display().to_string();
+        for (key, value) in defaults {
+            if env(&key).is_some() {
+                continue;
             }
-        }
-        let lt = dir.join("cublaslt_algos.jsonl");
-        if lt.is_file() && env("PLOW_LT_ALGOS_WRITE").is_none() {
-            put(
-                "PLOW_LT_ALGOS",
-                lt.display().to_string(),
-                dir.display().to_string(),
-                &mut out,
-            )?;
+            if let Some((_, have, from)) = out.iter().find(|(k, _, _)| *k == key) {
+                if *have != value
+                    && crate::knob_spec::knob_scope(&key)
+                        != Some(crate::knob_spec::KnobScope::Engine)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "{key}: {from} asks for {have} and {source} for {value}; it is one value \
+                         per process, set {key} explicitly to serve both"
+                    )));
+                }
+                continue;
+            }
+            out.push((key, value, source.clone()));
         }
     }
     Ok(out)
+}
+
+/// The packet serve defaults of the bundle in `dir` (`None` without a device packet), every
+/// key a registered runtime knob; removed knobs are dropped with a warning.
+pub fn bundle_serve_defaults(dir: &Path) -> Result<Option<(PathBuf, Vec<(String, String)>)>> {
+    let Some(pkt) = crate::asset::devblob::DevBlob::find_in_dir(dir)? else {
+        return Ok(None);
+    };
+    let Some(bytes) = read_section(&pkt)? else {
+        return Ok(Some((pkt, Vec::new())));
+    };
+    let m = ServeManifest::parse(&bytes).map_err(RuntimeError::Device)?;
+    let mut out = Vec::with_capacity(m.serve_defaults.len());
+    for (key, value) in &m.serve_defaults {
+        if crate::knob_spec::is_removed_env(key) {
+            tracing::warn!(
+                knob = key.as_str(),
+                packet = %pkt.display(),
+                "packet serve default names a removed knob; ignored"
+            );
+            continue;
+        }
+        if !crate::knob_spec::is_runtime_env(key) {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: serve default {key} is not a registered plowrt runtime knob",
+                pkt.display()
+            )));
+        }
+        out.push((key.clone(), value.clone()));
+    }
+    Ok(Some((pkt, out)))
 }
 
 /// The runtime contract this plowrt implements. A bundle whose `build.json`
@@ -1021,6 +1033,58 @@ mod tests {
         assert!(!got.iter().any(|(k, _, _)| k == "PLOW_PF_SEG_DIR"));
         std::fs::remove_dir_all(with).unwrap();
         std::fs::remove_dir_all(without).unwrap();
+    }
+
+    /// Two bundles may ask different values of an engine knob (each engine resolves its own);
+    /// a process-wide knob has one value, so disagreeing there is refused.
+    #[test]
+    fn co_served_defaults_conflict_only_on_process_knobs() {
+        let with = |name: &str, pairs: &[(&str, &str)]| {
+            let mut m = ServeManifest {
+                version: 1,
+                ..Default::default()
+            };
+            for (k, v) in pairs {
+                m.serve_defaults.insert(k.to_string(), v.to_string());
+            }
+            bundle(name, Some(&m))
+        };
+        let a = with(
+            "scope-a",
+            &[
+                ("PLOW_DECODE_MAX_RUNG", "128"),
+                ("PLOW_MAX_QUEUED_REQUESTS", "64"),
+            ],
+        );
+        let b = with("scope-b", &[("PLOW_DECODE_MAX_RUNG", "64")]);
+        let c = with("scope-c", &[("PLOW_MAX_QUEUED_REQUESTS", "8")]);
+        let got = asset_env_defaults(&[a.clone(), b.clone()], |_| None).unwrap();
+        assert!(got
+            .iter()
+            .any(|(k, v, _)| k == "PLOW_DECODE_MAX_RUNG" && v == "128"));
+        let e = asset_env_defaults(&[a.clone(), c.clone()], |_| None).unwrap_err();
+        assert!(e.to_string().contains("PLOW_MAX_QUEUED_REQUESTS"), "{e}");
+        assert_eq!(
+            bundle_serve_defaults(&b).unwrap().unwrap().1,
+            vec![("PLOW_DECODE_MAX_RUNG".to_string(), "64".to_string())]
+        );
+        for d in [a, b, c] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// Each co-served bundle's cuBLASLt table stays with its engine: exported process-wide, two
+    /// production bundles refused to start side by side.
+    #[test]
+    fn co_served_lt_tables_do_not_collide() {
+        let a = bundle("lt-a", None);
+        let b = bundle("lt-b", None);
+        std::fs::write(a.join("cublaslt_algos.jsonl"), "").unwrap();
+        std::fs::write(b.join("cublaslt_algos.jsonl"), "").unwrap();
+        let got = asset_env_defaults(&[a.clone(), b.clone()], |_| None).unwrap();
+        assert!(!got.iter().any(|(k, _, _)| k == "PLOW_LT_ALGOS"), "{got:?}");
+        std::fs::remove_dir_all(a).unwrap();
+        std::fs::remove_dir_all(b).unwrap();
     }
 
     #[test]

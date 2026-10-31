@@ -2128,12 +2128,18 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                       nblk, arena);
         break;
     case PLOW_DOP_GEMV_F32_OUT:
+        /* Flag modes: Maya 2 depth programs, speech object only (inlined elsewhere they grew every entry
+         * frame). Mode 0 stays ungated: fish_depth programs run it here, outside the arm inventory. */
         if (in->i[7])
+#if PLOW_NV_SPEECH
             d_gemv_f32out_mode((float*)TEN(0), TEN(1), TEN(2), (in->i[7] & 4u) ? (const float*)TEN(3) : nullptr,
                                (in->i[7] & 8u) ? (const float*)TEN(4) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(5) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(6) : nullptr, in->fj[0].f, in->i[7],
                                in->i[3], in->i[0], in->i[1], in->i[2], slice, nblk, arena);
+#else
+            __trap();
+#endif
         else
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
                           in->i[1], in->i[2], slice, nblk);
@@ -2144,6 +2150,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                        (unsigned*)TEN(7), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7],
                        in->fj[1].u, slice, nblk, arena);
         break;
+#if !defined(PLOW_HAS_EMBED_FRAME_BF16) || PLOW_HAS_EMBED_FRAME_BF16
     case PLOW_DOP_EMBED_FRAME_BF16:
         d_embed_frame((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
                       (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4),
@@ -2151,6 +2158,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                       in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], in->fj[0].f, in->fj[1].f, slice, nblk,
                       arena);
         break;
+#endif
 
     /* Terminal row selection for the unified token batch. One arm serves BOTH NVIDIA images:
      * interp_sm90a.cu is a wrapper TU that renames the public symbols and then includes this
