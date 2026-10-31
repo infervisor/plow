@@ -894,6 +894,7 @@ impl GpuEngine {
         let ids: Vec<BlockId> = plan.iter().map(|&(_, _, id)| id).collect();
         let mut srcs = Vec::with_capacity(ids.len());
         let hold = bs.store.hold_sources(ids, &mut srcs)?;
+        let t_held = t0.elapsed();
         let mut fenced = 0u64;
         // The recurrent state a first packed prefill reads from the block itself.
         let defer = bs
@@ -924,7 +925,19 @@ impl GpuEngine {
                 };
                 descs[range].push(self.block_desc(b, class, row0, va));
             }
-            self.run_blocks(&descs, false)
+            let t_run = t0.elapsed();
+            let r = self.run_blocks(&descs, false);
+            if crate::config::RuntimeConfig::get().pf_packlog {
+                let host = srcs.iter().filter(|s| s.from_host).count();
+                eprintln!(
+                    "PACKLOG GATHER slot={b} blocks={} host={host} fenced={fenced} reap_hold_us={} fence_us={} run_us={}",
+                    plan.len(),
+                    t_held.as_micros(),
+                    (t_run - t_held).as_micros(),
+                    (t0.elapsed() - t_run).as_micros()
+                );
+            }
+            r
         })();
         // Inside a launch window a successful gather is drained by the step
         // (`flush_deferred_attach` drops the holds); outside one the holds retire behind an

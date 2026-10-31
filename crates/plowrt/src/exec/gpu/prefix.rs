@@ -634,7 +634,11 @@ impl GpuEngine {
         let Some((_, kv)) = self.vmm_prefix() else {
             return Ok(());
         };
+        let host_t = crate::config::RuntimeConfig::get()
+            .pf_packlog
+            .then(std::time::Instant::now);
         let att = kv.try_attach_keyed(b, prompt, key.or(staged))?;
+        let mut marks = [0u64; 2];
         let attached = att.is_some();
         let att_rows = att.as_ref().map(|a| a.rows).unwrap_or(0);
         tracing::debug!(
@@ -649,7 +653,13 @@ impl GpuEngine {
         };
         let restored = (|| {
             // The slot's own blocks hold the prefix: map them, then gather every row.
+            if let Some(t) = host_t {
+                marks[0] = t.elapsed().as_nanos() as u64;
+            }
             kv.ensure_rows(b, a.rows + 1)?;
+            if let Some(t) = host_t {
+                marks[1] = t.elapsed().as_nanos() as u64;
+            }
             match a.blocks {
                 Some(handle) => self.blocks_gather(b, handle),
                 None => Err(RuntimeError::Rejected(
@@ -665,10 +675,22 @@ impl GpuEngine {
             }
             return Err(error);
         }
+        let gathered = host_t.map(|t| t.elapsed().as_nanos() as u64);
         if self.window_open {
             self.deferred_attach.push(b);
         } else {
             kv.finish_attach(b);
+        }
+        if let (Some(t), Some(gathered)) = (host_t, gathered) {
+            let us = |ns: u64| ns as f64 / 1e3;
+            eprintln!(
+                "PACKLOG ATTACH slot={b} rows={} lookup_us={:.0} map_us={:.0} gather_us={:.0} finish_us={:.0}",
+                a.rows,
+                us(marks[0]),
+                us(marks[1] - marks[0]),
+                us(gathered - marks[1]),
+                us(t.elapsed().as_nanos() as u64 - gathered)
+            );
         }
         self.pos[b] = a.rows;
         self.vmm_attached[b] = a.rows;
