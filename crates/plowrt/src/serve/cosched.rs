@@ -517,6 +517,14 @@ impl Turn {
         }
     }
 
+    /// [`Self::finish`] when `early_release` (`PLOW_COSCHED_EARLY_RELEASE`); otherwise the hold
+    /// is kept until the next [`Self::take_due`], the policy before early release.
+    pub fn finish_if(&mut self, turn: &DeviceTurn, early_release: bool, due: impl FnOnce() -> Due) {
+        if early_release {
+            self.finish(turn, due());
+        }
+    }
+
     /// Give the device back now, whatever is left of the quantum.
     pub fn release(&mut self) {
         self.guard = None;
@@ -629,6 +637,98 @@ mod tests {
         a.take_due(&dt, due).await;
         a.finish(&dt, due);
         assert!(a.held(), "deadline holder yielded with nobody waiting");
+    }
+
+    /// A waiter queued behind `dt`'s holder; the receiver fires once it holds the device.
+    fn queue_waiter(dt: &Arc<DeviceTurn>, due: Option<Due>) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let dt = Arc::clone(dt);
+        tokio::spawn(async move {
+            let mut t = Turn::default();
+            match due {
+                Some(due) => t.take_due(&dt, due).await,
+                None => t.take(&dt).await,
+            }
+            let _ = tx.send(());
+            t.release();
+        });
+        rx
+    }
+
+    async fn woken(rx: oneshot::Receiver<()>) {
+        tokio::time::timeout(Duration::from_millis(500), rx)
+            .await
+            .expect("the waiter did not get the device from finish")
+            .unwrap();
+    }
+
+    /// A Deadline holder hands the device on from `finish`, without taking again, to a waiter
+    /// that outranks it, or to a tied one once its quantum is spent; the waiter runs at once.
+    #[tokio::test]
+    async fn finish_hands_a_deadline_turn_to_the_waiter() {
+        let dt = Arc::new(DeviceTurn::new(CoSched::Deadline, 4));
+        let now = Instant::now();
+        let mine = due_in(now, 5000, 0);
+        let mut a = Turn::default();
+        a.take_due(&dt, mine).await;
+        let rx = queue_waiter(&dt, Some(due_in(now, 100, 0)));
+        while dt.tightest_waiter().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        a.finish(&dt, mine);
+        assert!(!a.held(), "an outranked holder kept the device");
+        woken(rx).await;
+
+        let now = Instant::now();
+        let mine = due_in(now, 1000, 0);
+        let mut a = Turn::default();
+        a.take_due(&dt, mine).await;
+        let mut rx = queue_waiter(&dt, Some(due_in(now, 1000, 0)));
+        while dt.tightest_waiter().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        a.finish(&dt, mine);
+        assert!(a.held(), "a tie handed over inside the quantum");
+        assert!(rx.try_recv().is_err());
+        tokio::time::sleep(DEADLINE_QUANTUM).await;
+        a.finish(&dt, mine);
+        assert!(!a.held(), "a tie kept the device past the quantum");
+        woken(rx).await;
+    }
+
+    /// An Rr holder hands the device on from `finish` on the tick that spends its quantum, and
+    /// the queued waiter runs without the holder taking again.
+    #[tokio::test]
+    async fn finish_hands_a_spent_rr_turn_to_the_waiter() {
+        let dt = Arc::new(DeviceTurn::new(CoSched::Rr, 2));
+        let due = Due::from_urgency(Urgency::Normal, Instant::now());
+        let mut a = Turn::default();
+        a.take(&dt).await;
+        let mut rx = queue_waiter(&dt, None);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        a.finish(&dt, due);
+        assert!(a.held());
+        assert!(rx.try_recv().is_err(), "the waiter ran inside the quantum");
+        a.take(&dt).await;
+        a.finish(&dt, due);
+        assert!(!a.held());
+        woken(rx).await;
+    }
+
+    /// `PLOW_COSCHED_EARLY_RELEASE=false` restores the old policy: the hold is kept after the
+    /// tick (and its urgency is not even derived) until the next take.
+    #[tokio::test]
+    async fn without_early_release_a_spent_hold_is_kept() {
+        let dt = DeviceTurn::new(CoSched::Rr, 1);
+        let due = Due::from_urgency(Urgency::Normal, Instant::now());
+        let mut a = Turn::default();
+        a.take(&dt).await;
+        a.finish_if(&dt, false, || {
+            unreachable!("urgency derived without early release")
+        });
+        assert!(a.held());
+        a.finish_if(&dt, true, || due);
+        assert!(!a.held());
     }
 
     /// A quantum of N means N consecutive ticks, then the turn goes back to the

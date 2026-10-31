@@ -1410,6 +1410,8 @@ fn spawn_scoped(
         // model parks, so an idle model never sits on a device its co-tenant is
         // waiting for.
         let mut turn = crate::serve::cosched::Turn::default();
+        // Process-scoped: one co-scheduling policy for every tenant of the device.
+        let early_release = crate::config::RuntimeConfig::process_get().cosched_early_release;
         let cost_id = crate::sched::cost::id(&slug);
         #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         let has_gpu = false;
@@ -2071,12 +2073,6 @@ fn spawn_scoped(
             };
 
             let t_returned = Instant::now();
-            if let (Some(dt), true) = (
-                &device_turn,
-                crate::config::RuntimeConfig::get().cosched_early_release,
-            ) {
-                turn.finish(dt, due);
-            }
             let service = t_returned - t_service_start;
             let ms = service.as_secs_f64() * 1e3;
             let host_disp_ns = host_last_return
@@ -2206,6 +2202,12 @@ fn spawn_scoped(
                     slots = (0..capacity).map(|_| None).collect();
                     obs = None;
                 }
+            }
+            // `due` again: a request that finished during the tick no longer sets the urgency.
+            if let Some(dt) = &device_turn {
+                turn.finish_if(dt, early_release, || {
+                    tick_due(&slots, &waiting, cost_id, Instant::now())
+                });
             }
 
             // Post-tick: drain OOB events from the executor. Handles faults,

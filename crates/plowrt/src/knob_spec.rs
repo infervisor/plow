@@ -1184,6 +1184,7 @@ mod tests {
             "PLOW_SLAB_KEEP",
             "PLOW_THROUGHPUT_K",
             "PLOW_DRAIN_TIMEOUT_MS",
+            "PLOW_COSCHED_EARLY_RELEASE",
         ] {
             assert_eq!(knob_scope(e), Some(KnobScope::Process), "{e}");
         }
