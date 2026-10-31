@@ -205,7 +205,7 @@ impl SpeechContract {
             text_encoder: p.strings.get("text.encoder").cloned(),
             clone: None,
         };
-        if let Some(encoder) = p.strings.get("clone.encoder") {
+        if let Some(encoder) = p.strings.get(crate::exec::packet_runtime::CLONE_ENCODER) {
             let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {
                 match p.strings.get(k) {
                     Some(ids) => ids

@@ -314,7 +314,33 @@ pub fn stage_packet(model_pkt: &Path, key: &str, legacy: &str) -> Result<std::pa
     Ok(model_pkt.with_file_name(PacketAsset::load(model_pkt)?.stage_file(key, legacy)?))
 }
 
+/// The pipeline string naming the clone stage's reference encoder packet.
+pub const CLONE_ENCODER: &str = "clone.encoder";
+
+fn beside_packet(key: &str, name: &str) -> Result<String> {
+    if !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." {
+        Ok(name.to_string())
+    } else {
+        Err(RuntimeError::Rejected(format!(
+            "{key} {name:?} is not a file name beside the packet"
+        )))
+    }
+}
+
 impl PacketAsset {
+    #[cfg(test)]
+    pub(crate) fn from_pipelines(
+        pipelines: Vec<plow_asset::packet_pipeline::PacketPipeline>,
+    ) -> Self {
+        Self {
+            pipelines: PacketPipelines {
+                version: 1,
+                pipelines,
+            },
+            sections: Default::default(),
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let image = std::fs::read(path).map_err(|source| RuntimeError::Io {
             path: path.to_owned(),
@@ -381,21 +407,29 @@ impl PacketAsset {
     /// The sidecar packet a pipeline names under `key` (e.g. `encoder.packet`), else `legacy`
     /// for a packet emitted before the name was carried. A bare file name beside the packet.
     pub fn stage_file(&self, key: &str, legacy: &str) -> Result<String> {
-        let named = self.pipelines().iter().find_map(|p| p.strings.get(key));
-        match named {
+        match self.pipelines().iter().find_map(|p| p.strings.get(key)) {
             None => Ok(legacy.to_string()),
-            Some(name)
-                if !name.is_empty()
-                    && !name.contains(['/', '\\'])
-                    && name != "."
-                    && name != ".." =>
-            {
-                Ok(name.clone())
-            }
-            Some(name) => Err(RuntimeError::Rejected(format!(
-                "{key} {name:?} is not a file name beside the packet"
-            ))),
+            Some(name) => beside_packet(key, name),
         }
+    }
+
+    /// Whether a pipeline names the sidecar packet under `key`.
+    pub fn names_stage(&self, key: &str) -> bool {
+        self.pipelines().iter().any(|p| p.strings.contains_key(key))
+    }
+
+    /// Every sibling packet the pipelines declare: each `*.packet` stage and the clone stage's
+    /// reference encoder ([`CLONE_ENCODER`]). Bare file names beside the packet, once each.
+    pub fn stage_files(&self) -> Result<Vec<String>> {
+        let mut out = std::collections::BTreeSet::new();
+        for p in self.pipelines() {
+            for (key, name) in &p.strings {
+                if key.ends_with(".packet") || key == CLONE_ENCODER {
+                    out.insert(beside_packet(key, name)?);
+                }
+            }
+        }
+        Ok(out.into_iter().collect())
     }
 
     pub fn bind(&self, name: &str, runtime: &dyn PacketRuntime) -> Result<BoundPacketPipeline> {
