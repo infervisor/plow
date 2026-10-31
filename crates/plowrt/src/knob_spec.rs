@@ -253,6 +253,86 @@ const C_PF_SEG_GEMM_SMALL: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
+/// The prefill segment classing must mirror the emitter's (`DevProg::seg_classes_with`): a runtime
+/// value the packet was not emitted with sends segments to objects built without those arms. A
+/// co-served packet's `PLOW_PF_SEG_FA512=1` under one emitted `PLOW_SEG_FA512=all` put hd256 flash on
+/// its FATLITE flash-class object: a trap and a poisoned context on its first prefill.
+const C_PF_SEG_FA512: &[Constraint] = &[Constraint {
+    id: "pf_seg_fa512_matches_emit",
+    formula: F::And(&[
+            F::Implies(
+                &F::Atom("rt.pf_seg_fa512", Cmp::Eq, Val::Str("1")),
+                &F::Atom("emit.seg_fa512", Cmp::Eq, Val::Str("1")),
+            ),
+            F::Implies(
+                &F::Atom("rt.pf_seg_fa512", Cmp::Eq, Val::Str("all")),
+                &F::Atom("emit.seg_fa512", Cmp::Eq, Val::Str("all")),
+            ),
+            F::Implies(
+                &F::And(&[
+                    F::Atom("rt.pf_seg_fa512", Cmp::Ne, Val::Unset),
+                    F::Atom("rt.pf_seg_fa512", Cmp::Ne, Val::Str("1")),
+                    F::Atom("rt.pf_seg_fa512", Cmp::Ne, Val::Str("all")),
+                ]),
+                &F::Or(&[
+                    F::Atom("emit.seg_fa512", Cmp::Eq, Val::Unset),
+                    F::Atom("emit.seg_fa512", Cmp::Eq, Val::Str("0")),
+                ]),
+            ),
+    ]),
+    site: "crates/plowrt/src/asset/devblob.rs seg_classes_with: PLOW_PF_SEG_FA512 mirrors the emit-side PLOW_SEG_FA512",
+    check: Check::Load,
+}];
+
+/// Pure modes `1` and `fp8` class identically and load the same objects unless `PLOW_PF_SEG_V2`
+/// routes `QuantFp8` by mode, so either serves a packet emitted with the other.
+const C_PF_SEG_PURE: &[Constraint] = &[Constraint {
+    id: "pf_seg_pure_matches_emit",
+    formula: F::And(&[
+        F::Implies(
+            &F::Or(&[
+                F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("1")),
+                F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("fp8")),
+            ]),
+            &F::Or(&[
+                F::And(&[
+                    F::Atom("rt.pf_seg_v2", Cmp::Eq, Val::Unset),
+                    F::Or(&[
+                        F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("1")),
+                        F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("fp8")),
+                    ]),
+                ]),
+                F::And(&[
+                    F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("1")),
+                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("1")),
+                ]),
+                F::And(&[
+                    F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("fp8")),
+                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("fp8")),
+                ]),
+            ]),
+        ),
+        F::Implies(
+            &F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("w8a16")),
+            &F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("w8a16")),
+        ),
+        F::Implies(
+            &F::And(&[
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Unset),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("1")),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("fp8")),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("w8a16")),
+            ]),
+            &F::Or(&[
+                F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Unset),
+                F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("0")),
+            ]),
+        ),
+    ]),
+    site: "crates/plowrt/src/asset/devblob.rs seg_classes_with: PLOW_PF_SEG_PURE mirrors the emit-side PLOW_SEG_PURE_GEMM",
+    check: Check::Load,
+}];
+
 const C_CHANNEL_MLP_RUNTIME: &[Constraint] = &[Constraint {
     id: "channel_mlp_runtime_exclusive",
     formula: F::Implies(
@@ -297,6 +377,9 @@ type Reader = fn(&RuntimeConfig) -> Val<'_>;
 const READERS: &[(&str, Reader)] = &[
     ("rt.pf_seg_dir", |c| opt_str(&c.nv.pf_seg_dir)),
     ("rt.pf_seg_gemm_small", |c| opt_str(&c.nv.pf_seg_gemm_small)),
+    ("rt.pf_seg_pure", |c| opt_str(&c.nv.pf_seg_pure)),
+    ("rt.pf_seg_fa512", |c| opt_str(&c.nv.pf_seg_fa512)),
+    ("rt.pf_seg_v2", |c| opt_str(&c.nv.pf_seg_v2)),
     ("rt.mla_pf_v2", |c| Val::Bool(c.amd.mla_pf_v2)),
     ("rt.serial", |c| Val::Bool(c.apple.serial)),
     ("rt.ane_mlp", |c| Val::Bool(c.apple.ane_mlp)),
@@ -470,6 +553,13 @@ pub fn check_knobs(knobs: &Value, rt: &RuntimeConfig) -> std::result::Result<(),
     let c = &knob_gen::CONSTRAINTS[i];
     let mut vars = Vec::new();
     c.formula.vars(&mut vars);
+    let mut seen = Vec::new();
+    vars.retain(|v| {
+        !seen.contains(v) && {
+            seen.push(*v);
+            true
+        }
+    });
     let shown: Vec<String> = vars
         .iter()
         .filter_map(|v| {
@@ -884,8 +974,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.l2_place_dispatch", Some("PLOW_L2_PLACE_DISPATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_dir", Some("PLOW_PF_SEG_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_seg_gemm_small", Some("PLOW_PF_SEG_GEMM_SMALL"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_GEMM_SMALL),
-    KnobSpec::new("rt.pf_seg_pure", Some("PLOW_PF_SEG_PURE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.pf_seg_fa512", Some("PLOW_PF_SEG_FA512"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.pf_seg_pure", Some("PLOW_PF_SEG_PURE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_PURE),
+    KnobSpec::new("rt.pf_seg_fa512", Some("PLOW_PF_SEG_FA512"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_FA512),
     KnobSpec::new("rt.pf_seg_fa256_gqa2", Some("PLOW_PF_SEG_FA256_GQA2"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_graph", Some("PLOW_PF_SEG_GRAPH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pf_shared_tail", Some("PLOW_PF_SHARED_TAIL"), Layer::Runtime, Domain::Bool, ON, DIAG),
@@ -1937,6 +2027,43 @@ mod tests {
         k["values"]["emit.glm_xr_band"] = 2.into();
         let err = check_knobs(&k, &rt).unwrap_err();
         assert!(err.contains("seq_par_excludes_two_shot_seams"), "{err}");
+    }
+
+    /// gemma-4-e4b (emitted `PLOW_SEG_FA512=all`) under a co-tenant's `PLOW_PF_SEG_FA512=1` trapped
+    /// on its first prefill; the load check now refuses any runtime classing the packet lacks.
+    #[test]
+    fn load_check_refuses_a_segment_classing_the_packet_was_not_emitted_for() {
+        let mut k = production_knobs();
+        k["values"]["emit.seg_fa512"] = "all".into();
+        k["values"]["emit.seg_pure_gemm"] = "1".into();
+        let mut rt = runtime_config();
+        rt.amd.mla_pf_v2 = true;
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_fa512 = Some("all".into());
+        rt.nv.pf_seg_pure = Some("1".into());
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_fa512 = Some("1".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_fa512_matches_emit"), "{err}");
+        assert_eq!(err.matches("rt.pf_seg_fa512=").count(), 1, "{err}");
+        rt.nv.pf_seg_fa512 = None;
+        // `fp8` classes like the emitted `1` unless PLOW_PF_SEG_V2 routes by mode.
+        rt.nv.pf_seg_pure = Some("fp8".into());
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_v2 = Some("q8".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_pure_matches_emit"), "{err}");
+        rt.nv.pf_seg_v2 = None;
+        rt.nv.pf_seg_pure = Some("w8a16".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_pure_matches_emit"), "{err}");
+        // A packet emitted without the classing runs only without it.
+        k["values"]["emit.seg_fa512"] = Value::Null;
+        rt.nv.pf_seg_pure = None;
+        rt.nv.pf_seg_fa512 = Some("1".into());
+        assert!(check_knobs(&k, &rt).is_err());
+        rt.nv.pf_seg_fa512 = Some("0".into());
+        check_knobs(&k, &rt).unwrap();
     }
 
     #[test]
