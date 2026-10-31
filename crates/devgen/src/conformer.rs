@@ -785,7 +785,10 @@ pub fn append_stream_step(
             &format!("state.stream.conv.{l}"),
             u64::from(tail) * row_bytes,
         );
-        let position = b.tensor(&stream_position(l), u64::from(2 * window - 1) * row_bytes);
+        let position = b.tensor(
+            &position_tensor(STREAM_POSITION, l),
+            u64::from(2 * window - 1) * row_bytes,
+        );
         dep = Some(feed_forward(&mut b, rs, *layer, x, d0, large, dep, true));
         let norm = emit_norm(&mut b, rs, x, d0, layer.attention.norm, dep);
         let mut last = norm;
@@ -929,6 +932,8 @@ pub struct ChunkInputs<'a> {
     pub key_start: &'a str,
     /// u32 per item, each `rows` (a constant the packet initializes): how far the caches shift.
     pub shift: &'a str,
+    /// Prefix of the per-layer relative-position projections [`stream_init`] fills for `rows`.
+    pub position: &'a str,
 }
 
 /// A batched stream's cache table (`slots` rows) for one layer: `kind` is `k`, `v` or `conv`.
@@ -1039,7 +1044,10 @@ pub fn append_chunk_step(
         let k_cache = b.tensor(&chunk_state("k", l), u64::from(slots * left) * row_bytes);
         let v_cache = b.tensor(&chunk_state("v", l), u64::from(slots * left) * row_bytes);
         let conv_cache = b.tensor(&chunk_state("conv", l), u64::from(slots * tail) * row_bytes);
-        let position = b.tensor(&stream_position(l), u64::from(2 * window - 1) * row_bytes);
+        let position = b.tensor(
+            &position_tensor(inputs.position, l),
+            u64::from(2 * window - 1) * row_bytes,
+        );
         dep = Some(feed_forward(&mut b, rs, *layer, x, d0, large, dep, true));
         let mut last = emit_norm(&mut b, rs, x, d0, layer.attention.norm, dep);
         for (out, weight) in [
@@ -1171,13 +1179,14 @@ pub fn append_chunk_step(
     })
 }
 
-/// The stream's per-layer relative-position projections: input independent, so one program fills
-/// them once per packet load (`window` = left context + step rows).
+/// The stream's per-layer relative-position projections (`{position}.{layer}`): input independent,
+/// so one program fills them once per packet load (`window` = left context + step rows).
 pub fn stream_init(
     spec: ConformerSpec<'_>,
     layers: &[ConformerLayerWeights<'_>],
     rows: u32,
     n_cu: u32,
+    position: &str,
 ) -> Result<Model, String> {
     if !spec.causal_convolution || spec.left_chunks == u32::MAX {
         return Err(
@@ -1197,7 +1206,7 @@ pub fn stream_init(
     let mut dep = None;
     for (l, layer) in layers.iter().enumerate() {
         let position = b.tensor(
-            &stream_position(l),
+            &position_tensor(position, l),
             u64::from(2 * window - 1) * u64::from(spec.width) * 4,
         );
         dep = Some(emit_q8(
@@ -1226,8 +1235,11 @@ pub fn stream_init(
     })
 }
 
-fn stream_position(layer: usize) -> String {
-    format!("act.stream.position.{layer}")
+/// The single stream's position projections; batched streams of its rows share them.
+pub const STREAM_POSITION: &str = "act.stream.position";
+
+fn position_tensor(prefix: &str, layer: usize) -> String {
+    format!("{prefix}.{layer}")
 }
 
 /// `out[out_row0..+rows] = x[x_row0..+rows]` (`width` FP32 columns per row).
@@ -1322,6 +1334,7 @@ mod tests {
             pos: "in.test.pos",
             key_start: "in.test.key_start",
             shift: "in.test.shift",
+            position: STREAM_POSITION,
         };
         // spec(): chunks of 4, one chunk of left context, kernel 3: window 8, conv tail 2.
         let prefix = append_chunk_step(spec(), &[layer()], 4, 3, 4, 5, 24, inputs).unwrap();

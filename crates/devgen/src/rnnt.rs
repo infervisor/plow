@@ -70,6 +70,7 @@ pub struct RnntPackets {
     encoder_buckets: BTreeMap<u32, Vec<usize>>,
     stream: Option<StreamPrograms>,
     chunk: Option<ChunkPrograms>,
+    upload: Option<ChunkPrograms>,
     batched: Option<BatchedDecode>,
     /// Frames each TDT duration logit advances (`spec.durations` values).
     tdt_durations: Vec<u32>,
@@ -147,8 +148,6 @@ struct ChunkPrograms {
     rungs: Vec<(u32, [Vec<usize>; 3])>,
 }
 
-const CHUNK_FIRST: &str = "in.chunk.first";
-const CHUNK_NEXT: &str = "in.chunk.next";
 const CHUNK_JOINT: &str = "act.chunk.joint";
 
 /// Names of a batched stream step's per-step inputs.
@@ -159,7 +158,51 @@ pub const CHUNK_INPUTS: crate::conformer::ChunkInputs<'static> = crate::conforme
     pos: "in.chunk.pos",
     key_start: "in.chunk.key_start",
     shift: "in.chunk.shift",
+    position: crate::conformer::STREAM_POSITION,
 };
+
+/// The upload geometry's: its own window inputs, row tables and positions; the staging table and
+/// activations are the live streams' (their launches never overlap).
+pub const UPLOAD_INPUTS: crate::conformer::ChunkInputs<'static> = crate::conformer::ChunkInputs {
+    staging: "act.chunk.staging",
+    index: "in.upload.index",
+    slot: "in.upload.slot",
+    pos: "in.upload.pos",
+    key_start: "in.upload.key_start",
+    shift: "in.upload.shift",
+    position: "act.upload.position",
+};
+
+/// A batched stream geometry: the live streams' (`chunk.*` roles) or the uploads' (`upload.*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkKind {
+    Live,
+    Upload,
+}
+
+impl ChunkKind {
+    fn role(self) -> &'static str {
+        match self {
+            Self::Live => "chunk",
+            Self::Upload => "upload",
+        }
+    }
+
+    pub fn inputs(self) -> crate::conformer::ChunkInputs<'static> {
+        match self {
+            Self::Live => CHUNK_INPUTS,
+            Self::Upload => UPLOAD_INPUTS,
+        }
+    }
+
+    /// The first and later mel windows.
+    fn windows(self) -> [&'static str; 2] {
+        match self {
+            Self::Live => ["in.chunk.first", "in.chunk.next"],
+            Self::Upload => ["in.upload.first", "in.upload.next"],
+        }
+    }
+}
 
 /// `Q8GemmF32` path `i7`: tiles at any row count.
 const Q8_TILES: u32 = 2;
@@ -341,8 +384,13 @@ impl RnntPackets {
     /// the encoder layers over `items` streams picked from it, then the joint encoder projection
     /// into `act.rnnt.batch.encoder` from `encoder_row0`. Every Q8 GEMM takes tiles, so a stream's
     /// rows do not depend on the batch. `chunk.init` fills the positions once.
+    ///
+    /// [`ChunkKind::Upload`] adds a second geometry after the live one (`upload.*` roles, inputs
+    /// [`UPLOAD_INPUTS`]): more rows per step in the same cache slots, encoder-table rows and
+    /// predictor slots.
     pub fn add_chunk_stream(
         &mut self,
+        kind: ChunkKind,
         geometry: ChunkGeometry,
         init: Model,
         rungs: Vec<ChunkRung>,
@@ -352,7 +400,23 @@ impl RnntPackets {
             .compiled_prompt_index
             .ok_or("a stream needs a compiled RNNT prompt")?;
         let max_items = rungs.last().map_or(0, |rung| rung.items);
-        if self.chunk.is_some()
+        let shares_live = |live: &ChunkPrograms| {
+            let l = live.geometry;
+            (l.slots, l.left_rows, l.encoder_row0, l.predictor_slot0)
+                == (
+                    geometry.slots,
+                    geometry.left_rows,
+                    geometry.encoder_row0,
+                    geometry.predictor_slot0,
+                )
+        };
+        let placed = match kind {
+            ChunkKind::Live => self.chunk.is_some(),
+            ChunkKind::Upload => {
+                self.upload.is_some() || !self.chunk.as_ref().is_some_and(shares_live)
+            }
+        };
+        if placed
             || rungs.first().is_none_or(|rung| rung.items == 0)
             || !rungs.windows(2).all(|pair| pair[0].items < pair[1].items)
             || geometry.rows == 0
@@ -368,6 +432,8 @@ impl RnntPackets {
             self.spec.joint_width,
         );
         let staging_rows = 2 * max_items * rows;
+        let names = kind.inputs();
+        let [first_input, next_input] = kind.windows();
         let n_cu = self.model.n_cu;
         let mut sequences = Vec::with_capacity(rungs.len());
         for rung in rungs {
@@ -388,7 +454,7 @@ impl RnntPackets {
                 rename(&mut prefix.model, &conv_input, input)?;
                 let mut b = builder(n_cu, prefix.model.tensors.clone());
                 let staging = b.tensor(
-                    CHUNK_INPUTS.staging,
+                    names.staging,
                     u64::from(staging_rows) * u64::from(width) * 4,
                 );
                 b.emit(DevOp::CopyColsF32, b.all(), &[], |d| {
@@ -414,10 +480,10 @@ impl RnntPackets {
                 pin_q8(&mut model, &sequence, Q8_TILES);
                 graft(&mut self.model, model, &sequence)
             };
-            let first = windows(rung.first, CHUNK_FIRST, 0, 0)?;
+            let first = windows(rung.first, first_input, 0, 0)?;
             let next = windows(
                 rung.next,
-                CHUNK_NEXT,
+                next_input,
                 geometry.step_keep_row0,
                 max_items * rows,
             )?;
@@ -485,13 +551,8 @@ impl RnntPackets {
         }
         // The per-step inputs at the widest rung, whatever the steps declared.
         let mut b = builder(n_cu, Vec::new());
-        b.tensor(CHUNK_INPUTS.index, u64::from(max_items * rows) * 4);
-        for name in [
-            CHUNK_INPUTS.slot,
-            CHUNK_INPUTS.pos,
-            CHUNK_INPUTS.key_start,
-            CHUNK_INPUTS.shift,
-        ] {
+        b.tensor(names.index, u64::from(max_items * rows) * 4);
+        for name in [names.slot, names.pos, names.key_start, names.shift] {
             b.tensor(name, u64::from(max_items) * 4);
         }
         let inputs = Model {
@@ -510,15 +571,19 @@ impl RnntPackets {
             .model
             .tensors
             .iter_mut()
-            .filter(|t| t.name == CHUNK_INPUTS.shift)
+            .filter(|t| t.name == names.shift)
         {
             tensor.init = Some(shift.repeat(tensor.bytes as usize / 4));
         }
-        self.chunk = Some(ChunkPrograms {
+        let programs = Some(ChunkPrograms {
             geometry,
             init,
             rungs: sequences,
         });
+        match kind {
+            ChunkKind::Live => self.chunk = programs,
+            ChunkKind::Upload => self.upload = programs,
+        }
         Ok(())
     }
 
@@ -1046,20 +1111,28 @@ impl RnntPackets {
                 parameters.insert(name.into(), u64::from(value));
             }
         }
-        if let Some(chunk) = &self.chunk {
-            let g = chunk.geometry;
-            programs.insert("chunk.init".into(), chunk.init as u32);
+        let chunks = [
+            (ChunkKind::Live, &self.chunk),
+            (ChunkKind::Upload, &self.upload),
+        ];
+        for (kind, chunk) in chunks
+            .into_iter()
+            .filter_map(|(k, c)| Some((k, c.as_ref()?)))
+        {
+            let (g, role, inputs) = (chunk.geometry, kind.role(), kind.inputs());
+            programs.insert(format!("{role}.init"), chunk.init as u32);
             for (items, sequences) in &chunk.rungs {
-                for (kind, sequence) in ["first", "next", "step"].into_iter().zip(sequences) {
+                for (step, sequence) in ["first", "next", "step"].into_iter().zip(sequences) {
                     for (stage, &program) in sequence.iter().enumerate() {
-                        programs.insert(format!("chunk.{kind}.{items}.{stage}"), program as u32);
+                        programs.insert(format!("{role}.{step}.{items}.{stage}"), program as u32);
                     }
                 }
             }
             let max_items = chunk.rungs.last().map_or(0, |rung| rung.0);
-            for (role, name, frames) in [
-                ("chunk.input.first", CHUNK_FIRST, g.first_input_frames),
-                ("chunk.input.next", CHUNK_NEXT, g.step_input_frames),
+            let [first, next] = kind.windows();
+            for (window, name, frames) in [
+                ("first", first, g.first_input_frames),
+                ("next", next, g.step_input_frames),
             ] {
                 let windows = u64::from(max_items) * u64::from(frames) * 4;
                 let bytes = self
@@ -1072,7 +1145,7 @@ impl RnntPackets {
                     return Err(format!("{name} does not hold {max_items} windows"));
                 }
                 tensors.insert(
-                    role.into(),
+                    format!("{role}.input.{window}"),
                     PipelineTensor {
                         name: name.into(),
                         dtype: PipelineDType::F32,
@@ -1080,20 +1153,25 @@ impl RnntPackets {
                     },
                 );
             }
-            for (role, name, count) in [
-                ("chunk.index", CHUNK_INPUTS.index, max_items * g.rows),
-                ("chunk.slot", CHUNK_INPUTS.slot, max_items),
-                ("chunk.pos", CHUNK_INPUTS.pos, max_items),
-                ("chunk.key_start", CHUNK_INPUTS.key_start, max_items),
+            for (table, name, count) in [
+                ("index", inputs.index, max_items * g.rows),
+                ("slot", inputs.slot, max_items),
+                ("pos", inputs.pos, max_items),
+                ("key_start", inputs.key_start, max_items),
             ] {
                 tensors.insert(
-                    role.into(),
+                    format!("{role}.{table}"),
                     PipelineTensor {
                         name: name.into(),
                         dtype: PipelineDType::U32,
                         shape: vec![u64::from(count)],
                     },
                 );
+            }
+            // The upload geometry takes the live one's (`add_chunk_stream`); its later windows'
+            // rows start at `max_items * rows` too.
+            if kind == ChunkKind::Upload {
+                continue;
             }
             // The rest follows from the tensors (pipelines hold at most 64 parameters): rows per
             // stream from `chunk.index` over `chunk.slot`, window frames from the inputs, and a
@@ -1392,6 +1470,7 @@ fn lower_inner(
         encoder_buckets: BTreeMap::new(),
         stream: None,
         chunk: None,
+        upload: None,
         batched: None,
         tdt_durations: Vec::new(),
         output: None,
@@ -2613,7 +2692,51 @@ mod tests {
         };
         let init = stand_in("act.test.table", "act.stream.position.0", 1).model;
         packets
-            .add_chunk_stream(geometry, init, vec![rung(1), rung(2)], &weights)
+            .add_chunk_stream(
+                ChunkKind::Live,
+                geometry,
+                init,
+                vec![rung(1), rung(2)],
+                &weights,
+            )
+            .unwrap();
+        // Uploads: 6 rows per step in the same slots; 12 mel frames subsample to 7 rows, 16 to 9.
+        let upload = ChunkGeometry {
+            rows: 6,
+            first_input_frames: 12,
+            step_input_frames: 16,
+            ..geometry
+        };
+        let upload_rung = ChunkRung {
+            items: 1,
+            first: subsample(12, 1),
+            next: subsample(16, 1),
+            step: stand_in(UPLOAD_INPUTS.staging, "act.chunk.x", 6),
+        };
+        let upload_init = || stand_in("act.test.table", "act.upload.position.0", 1).model;
+        assert!(packets
+            .add_chunk_stream(
+                ChunkKind::Upload,
+                ChunkGeometry { slots: 4, ..upload },
+                upload_init(),
+                vec![upload_rung],
+                &weights
+            )
+            .is_err());
+        let upload_rung = ChunkRung {
+            items: 1,
+            first: subsample(12, 1),
+            next: subsample(16, 1),
+            step: stand_in(UPLOAD_INPUTS.staging, "act.chunk.x", 6),
+        };
+        packets
+            .add_chunk_stream(
+                ChunkKind::Upload,
+                upload,
+                upload_init(),
+                vec![upload_rung],
+                &weights,
+            )
             .unwrap();
 
         let section = packets.pipeline_section(63, 10, 0).unwrap();
@@ -2636,8 +2759,9 @@ mod tests {
             .collect();
         // Each rung's two window projections and its joint encoder projection.
         assert_eq!(paths, [Q8_TILES; 6]);
-        assert_eq!(name(program("chunk.first.2.0").insts[0].t[1]), CHUNK_FIRST);
-        assert_eq!(name(program("chunk.next.2.0").insts[0].t[1]), CHUNK_NEXT);
+        let [first_input, next_input] = ChunkKind::Live.windows();
+        assert_eq!(name(program("chunk.first.2.0").insts[0].t[1]), first_input);
+        assert_eq!(name(program("chunk.next.2.0").insts[0].t[1]), next_input);
         // First windows' rows 0.. into the staging's first half, later windows' rows 2.. into
         // the second.
         let first = &program("chunk.first.2.2").insts[0];
@@ -2668,7 +2792,8 @@ mod tests {
                 .bytes
         };
         assert_eq!(bytes("act.rnnt.encoder_joint"), bytes3(3, 32, 4));
-        assert_eq!(bytes(BATCH_ENCODER), bytes3(6 + 4, 32, 4));
+        // The upload step's 6 rows from row 6 outgrow the live streams' 4.
+        assert_eq!(bytes(BATCH_ENCODER), bytes3(6 + 6, 32, 4));
         let shift = packets
             .model
             .tensors
@@ -2685,9 +2810,36 @@ mod tests {
         assert_eq!(pipeline.tensors["chunk.slot"].shape, [2]);
         assert_eq!(pipeline.parameters["chunk.next_row0"], 4);
         assert_eq!(pipeline.parameters["chunk.predictor_slot0"], 2);
+        // The upload geometry: its own windows, row tables, shift and positions.
+        let upload: Vec<_> = pipeline
+            .programs
+            .keys()
+            .filter(|role| role.starts_with("upload."))
+            .collect();
+        assert_eq!(upload.len(), 3 * 3 + 1);
+        let [first_input, next_input] = ChunkKind::Upload.windows();
+        assert_eq!(name(program("upload.first.1.0").insts[0].t[1]), first_input);
+        assert_eq!(name(program("upload.next.1.0").insts[0].t[1]), next_input);
+        let next = &program("upload.next.1.2").insts[0];
+        assert_eq!(next.i, [1, 6, 32, 32, 64, 32, 6 * 32, 0]);
+        assert_eq!(pipeline.tensors["upload.input.first"].shape, [1, 12, 7]);
+        assert_eq!(pipeline.tensors["upload.input.next"].shape, [1, 16, 7]);
+        assert_eq!(pipeline.tensors["upload.index"].shape, [6]);
+        assert_eq!(pipeline.tensors["upload.slot"].shape, [1]);
+        let upload_shift = packets
+            .model
+            .tensors
+            .iter()
+            .find(|t| t.name == UPLOAD_INPUTS.shift)
+            .unwrap();
+        assert_eq!(upload_shift.init.as_deref(), Some(&6u32.to_ne_bytes()[..]));
+        assert!(pipeline
+            .parameters
+            .keys()
+            .all(|p| !p.starts_with("upload.")));
         let init = stand_in("act.test.table", "act.stream.position.0", 1).model;
         assert!(packets
-            .add_chunk_stream(geometry, init, vec![rung(1)], &weights)
+            .add_chunk_stream(ChunkKind::Live, geometry, init, vec![rung(1)], &weights)
             .is_err());
     }
 }
