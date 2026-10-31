@@ -316,6 +316,8 @@ pub fn stage_packet(model_pkt: &Path, key: &str, legacy: &str) -> Result<std::pa
 
 /// The pipeline string naming the clone stage's reference encoder packet.
 pub const CLONE_ENCODER: &str = "clone.encoder";
+/// The pipeline string naming a speech pipeline's text-encoder sub-bundle.
+pub const TEXT_ENCODER: &str = "text.encoder";
 
 fn beside_packet(key: &str, name: &str) -> Result<String> {
     if !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." {
@@ -418,18 +420,29 @@ impl PacketAsset {
         self.pipelines().iter().any(|p| p.strings.contains_key(key))
     }
 
-    /// Every sibling packet the pipelines declare: each `*.packet` stage and the clone stage's
-    /// reference encoder ([`CLONE_ENCODER`]). Bare file names beside the packet, once each.
-    pub fn stage_files(&self) -> Result<Vec<String>> {
-        let mut out = std::collections::BTreeSet::new();
+    /// Every sibling packet the pipelines declare, by stage: each `*.packet` stage and the
+    /// clone stage's reference encoder ([`CLONE_ENCODER`]), as bare file names beside the
+    /// packet. Each stage binds its own runtime, so two stages naming one file are two entries.
+    pub fn stage_files(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let mut out = std::collections::BTreeMap::new();
         for p in self.pipelines() {
             for (key, name) in &p.strings {
                 if key.ends_with(".packet") || key == CLONE_ENCODER {
-                    out.insert(beside_packet(key, name)?);
+                    out.insert(key.clone(), beside_packet(key, name)?);
                 }
             }
         }
-        Ok(out.into_iter().collect())
+        Ok(out)
+    }
+
+    /// The text-encoder sub-bundle a speech pipeline declares ([`TEXT_ENCODER`]), a bare name
+    /// beside the packet.
+    pub fn text_encoder(&self) -> Result<Option<String>> {
+        self.pipelines()
+            .iter()
+            .find_map(|p| p.strings.get(TEXT_ENCODER))
+            .map(|name| beside_packet(TEXT_ENCODER, name))
+            .transpose()
     }
 
     pub fn bind(&self, name: &str, runtime: &dyn PacketRuntime) -> Result<BoundPacketPipeline> {
