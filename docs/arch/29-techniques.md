@@ -819,6 +819,21 @@ Kernels and objects: `crates/plowrt/src/device/cuda/lt.rs` (library binding, loa
 selection, `PLOW_LT_ALGOS` table), `moe_lt_sm90.cu` glue.
 Status: CUDA only.
 
+### N-concatenated projections (derived weights)
+
+What it computes: projections that read the same activation (gate|up) as one GEMM
+over their weights concatenated along N, block-scale grids concatenated the same way; consumers
+read their columns of the one row-pitched output.
+Examples: the block-scaled FP8 Qwen3.5-style dense MLP.
+Packet ABI: `derived_weights.json` (`crates/plow-asset/src/derived_weights.rs`) lists each `cat/`
+tensor's checkpoint sources (axis 0, optional BF16 -> F32 widen); `GluPitched` (230). Emit:
+`PLOW_FP8_BLOCK_CONCAT`. Runtime contract 4: a packet using any of these declares it and a
+runtime that cannot serve them refuses the packet at load.
+Kernels and objects: the loader assembles `cat/` tensors (`asset/checkpoint.rs`), the cuBLASLt
+route runs the one GEMM, `d_glu_pitched` runs in the sm_90a interpreter, light and light_quant
+entries.
+Status: sm_90a (cuBLASLt decode and prefill); the HSA loader refuses contract-4 packets.
+
 
 ## 6. Multi-token drafting and speculative decode
 
@@ -989,6 +1004,7 @@ fastconformer RNNT, fish-s2.
 | MXFP4 dense projections (ops 91-93 family) | emitted-not-served (decode GEMV only) | same | served (Kimi-K3 recipe) | dispatch only (no recipe) |
 | FP8 KV cache | served | served (sm_89 recipes) | served | dispatch only (no recipe) |
 | Library GEMM routes (cuBLASLt / hipBLASLt) | served (segment roles) | served, no recipe (Lt is CUDA-generic) | served (`amd_gemm_lt.rs`) | n/a |
+| N-concatenated projections (derived weights, contract 4) | served (block-FP8 Lt, trial recipe) | missing (no FP8 block Lt emit) | missing (refused at load) | missing |
 | MTP chain drafter + verify | served (`exec/gpu/spec*.rs`) | served, no recipe | missing | missing |
 | DSpark block drafter | emitted-not-served (refused) | emitted-not-served | missing | missing |
 | Multimodal soft tokens (ops 206-210) | served (trial recipes only, `mm_parity` gate) | served, no recipe | missing (refused) | missing (refused) |
@@ -996,6 +1012,8 @@ fastconformer RNNT, fish-s2.
 | Speech front-ends (conformer, RNNT, codec LM, f32 speech ops) | served | served (sm_89 recipes) | missing | missing (4 of 7 f32 ops) |
 
 ### What each missing cell needs
+
+- **N-concatenated projections on gfx942**: the HSA loader needs the `derived_weights.json` assembly (`Checkpoint::concatenated`), `GluPitched` in `runtime/amd/interp.hip`, and the hipBLASLt route over the concatenated shape; until then `asset::serve::refuse_concat_features` rejects such a packet.
 
 - **KV-shared tail on gfx942**: needs a port of the runtime gather (`crates/plowrt/src/exec/gpu/shared_tail.rs` `shared_tail_enqueue`/`shared_tail_rows`) into `exec/amd.rs`, reading the same `kv_shared_tail` section (`crates/plow-asset/src/kv_shared_tail.rs`). No new device op: it reuses the flash ops over the source layer's cache.
 - **KV-shared tail on CPU**: the same gather in `serve/cpu_serve.rs`'s prefill path. Not verified whether any CPU emit carries the section.

@@ -496,12 +496,9 @@ fn show_version(v: usize) -> String {
 /// Fail closed when a packet uses a contract-gated feature its `build.json` does not declare
 /// (a load-time concatenated weight or `GluPitched`: `RUNTIME_CONTRACT_CONCAT`), so dropping
 /// `runtime_requires` cannot route such a packet past an older runtime's refusal.
-pub fn check_packet_contract(
-    packet: &Path,
-    blob: &crate::asset::devblob::DevBlob,
-    raw: &[u8],
-) -> Result<()> {
-    let concat = blob
+/// The first contract-4 feature `blob` uses (derived concat weights, a row-pitched source), if any.
+pub fn concat_feature(blob: &crate::asset::devblob::DevBlob, raw: &[u8]) -> Result<Option<String>> {
+    Ok(blob
         .reserved_metadata(raw, plow_asset::derived_weights::SECTION)?
         .map(|_| plow_asset::derived_weights::SECTION.to_string())
         .or_else(|| {
@@ -514,9 +511,48 @@ pub fn check_packet_contract(
             blob.progs
                 .iter()
                 .flat_map(|p| &p.insts)
-                .any(|d| d.op == packet::dev::DevOp::GluPitched as u16)
-                .then(|| "GluPitched".to_string())
-        });
+                .find_map(pitched_source)
+                .map(|(op, _)| format!("a row-pitched {op:?} source"))
+        }))
+}
+
+/// Refuse a packet with contract-4 features on a backend that does not implement them.
+pub fn refuse_concat_features(blob: &crate::asset::devblob::DevBlob, raw: &[u8]) -> Result<()> {
+    match concat_feature(blob, raw)? {
+        Some(feature) => Err(RuntimeError::Rejected(format!(
+            "packet uses derived concat weights / pitched ops (contract {}: {feature}) that this \
+             backend does not implement",
+            plow_asset::RUNTIME_CONTRACT_CONCAT
+        ))),
+        None => Ok(()),
+    }
+}
+
+pub fn check_packet_contract(
+    packet: &Path,
+    blob: &crate::asset::devblob::DevBlob,
+    raw: &[u8],
+) -> Result<()> {
+    let concat = concat_feature(blob, raw)?;
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if let Some((op, footprint)) = pitched_source(d) {
+            let slot = if op == packet::dev::DevOp::QwenQGateSplit {
+                2
+            } else {
+                1
+            };
+            let bytes = |h: u16| blob.tensors.get(usize::from(h)).map(|t| t.bytes);
+            let fits = footprint
+                .zip(bytes(d.t[slot]))
+                .is_some_and(|(elements, have)| elements.checked_mul(2).is_some_and(|b| b <= have));
+            if !fits {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {op:?} reads past its row-pitched source",
+                    packet.display()
+                )));
+            }
+        }
+    }
     let Some(feature) = concat else {
         return Ok(());
     };
@@ -530,6 +566,27 @@ pub fn check_packet_contract(
         )));
     }
     Ok(())
+}
+
+/// An instruction that reads a row-pitched source (an N-concatenated projection's output): the
+/// op and the source elements it reads, `None` when its pitch fields are inconsistent.
+fn pitched_source(d: &packet::dev::DevInst64) -> Option<(packet::dev::DevOp, Option<u64>)> {
+    use packet::dev::DevOp;
+    let op = DevOp::from_u16(d.op)?;
+    let span = |rows: u64, stride: u64, col: u64, width: u64| {
+        (width > 0 && rows > 0 && col + width <= stride)
+            .then(|| (rows - 1).checked_mul(stride)?.checked_add(col + width))
+            .flatten()
+    };
+    let (i, w) = (|k: usize| u64::from(d.i[k]), u64::from(d.fj[2]));
+    match op {
+        DevOp::GluPitched => {
+            let (n, width) = (i(0), i(2));
+            let rows = (width > 0 && n % width == 0).then(|| n / width);
+            Some((op, rows.and_then(|r| span(r, i(3), i(4), width))))
+        }
+        _ => None,
+    }
 }
 
 /// Fail closed when this runtime cannot serve the bundle: an older runtime contract than it
@@ -590,6 +647,9 @@ mod tests {
                 &[],
                 |d| {
                     d.t[..2].copy_from_slice(&[out, w]);
+                    if pitched {
+                        d.i[..5].copy_from_slice(&[2, 1, 2, 4, 2]);
+                    }
                 },
             );
             let p = b.finish();
@@ -614,6 +674,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let pkt = dir.join("model.pkt");
         assert!(check(&pkt, blob(false, false)).is_ok());
+        // The HSA loader refuses every contract-4 feature outright.
+        let (b, r) = blob(false, false);
+        assert!(refuse_concat_features(&b, &r).is_ok());
+        for (c, p) in [(true, false), (false, true)] {
+            let (b, r) = blob(c, p);
+            let err = refuse_concat_features(&b, &r).unwrap_err().to_string();
+            assert!(err.contains("does not implement"), "{err}");
+        }
         for (c, p) in [(true, false), (false, true)] {
             std::fs::remove_file(dir.join("build.json")).ok();
             assert!(check(&pkt, blob(c, p)).is_err());

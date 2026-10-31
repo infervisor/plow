@@ -8801,6 +8801,7 @@ impl AmdEngine {
         // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
         let mut blob = DevBlob::parse_l2(&raw, true)?;
+        crate::asset::serve::refuse_concat_features(&blob, &raw)?;
         crate::certificate_checks::check_packet(blob_path, &raw, &blob)?;
         let shards = crate::asset::shard::DeclaredShards::from_blob(&blob, &raw)?;
         // BEFORE anything reads the blob's geometry: `max_ctx`, the KV slot
