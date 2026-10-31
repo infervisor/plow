@@ -792,7 +792,13 @@ struct LoadFailure {
     delay: Duration,
     /// [`bundle_stamp`] at the failure: a changed bundle retries at once.
     stamp: u64,
+    /// When a refused request last re-read the stamp (at most every [`STAMP_EVERY`]).
+    checked: Instant,
 }
+
+/// How often a refused request re-reads the bundle's files (a directory walk on the request
+/// thread).
+const STAMP_EVERY: Duration = Duration::from_secs(5);
 
 const LOAD_BACKOFF_MIN: Duration = Duration::from_secs(30);
 const LOAD_BACKOFF_MAX: Duration = Duration::from_secs(600);
@@ -1234,6 +1240,10 @@ impl ModelManager {
             return Ok(());
         }
 
+        // A model in load backoff is shed here, not queued behind the switch lock.
+        if let Some(m) = self.managed(slug) {
+            self.load_backoff(&m)?;
+        }
         // The switch runs on a task of its own: a request future dropped mid-switch (client gone)
         // released the lock between installing the engine and its dispatcher, and the model then
         // read as resident with nothing serving it.
@@ -1705,6 +1715,7 @@ impl ModelManager {
                         at: Instant::now(),
                         delay,
                         stamp,
+                        checked: Instant::now(),
                     },
                 );
             }
@@ -1719,15 +1730,28 @@ impl ModelManager {
     /// `Err(Backoff)` while `m`'s last failed load is inside its backoff and its bundle files are
     /// unchanged; a demand load may try it otherwise.
     fn load_backoff(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
-        let Some(f) = self.failed.lock().get(&m.slug).cloned() else {
-            return Ok(());
+        let (why, left, stamp) = {
+            let mut failed = self.failed.lock();
+            let Some(f) = failed.get_mut(&m.slug) else {
+                return Ok(());
+            };
+            let left = f.delay.saturating_sub(f.at.elapsed());
+            if left.is_zero() {
+                return Ok(());
+            }
+            let restat = f.checked.elapsed() >= STAMP_EVERY;
+            if restat {
+                f.checked = Instant::now();
+            }
+            (f.why.clone(), left, restat.then_some(f.stamp))
         };
-        let left = f.delay.saturating_sub(f.at.elapsed());
-        if left.is_zero() || bundle_stamp(m) != f.stamp {
+        if stamp.is_some_and(|s| bundle_stamp(m) != s) {
+            // A changed bundle is a new one: forget the failure (its retry starts over).
+            self.failed.lock().remove(&m.slug);
             return Ok(());
         }
         Err(EnsureError::Backoff {
-            why: f.why,
+            why,
             retry_after: left,
         })
     }
@@ -2170,6 +2194,18 @@ mod tests {
         assert_eq!(want, LOAD_BACKOFF_MAX);
         // The copy finishes: the file grew, so the next request retries inside the backoff.
         std::fs::write(dir.join("model.pkt"), b"partial, now complete").unwrap();
+        assert!(
+            matches!(
+                mgr.ensure_resident("m").await,
+                Err(EnsureError::Backoff { .. })
+            ),
+            "the files are re-read at most every STAMP_EVERY"
+        );
+        {
+            let mut f = mgr.failed.lock();
+            let f = f.get_mut("m").unwrap();
+            f.checked = Instant::now().checked_sub(STAMP_EVERY).unwrap();
+        }
         assert!(matches!(
             mgr.ensure_resident("m").await,
             Err(EnsureError::Load(_))
