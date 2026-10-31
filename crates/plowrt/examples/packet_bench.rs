@@ -1,7 +1,8 @@
 //! Time one program role of a packet on the CUDA packet runtime (inputs left zeroed):
-//! `packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep]`. With `--sweep` every instruction cap
-//! 0..=n_inst is timed in this process (JSON lines `{"cap":..,"us":..}`): the marginal cost of
-//! instruction i is us(cap = i + 1) - us(cap = i). With `--each` and ROLE a prefix, every program
+//! `packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep[=CAPS]]`. With `--sweep` every instruction
+//! cap 0..=n_inst (or 0..=CAPS) is timed in this process (JSON lines `{"cap":..,"op":..,"blocks":..,
+//! "us":..}`, `op` the instruction cap - 1 adds): the marginal cost of instruction i is
+//! us(cap = i + 1) - us(cap = i). With `--each` and ROLE a prefix, every program
 //! of the role sequence `ROLE.<n>` is timed alone (JSON lines `{"role":..,"program":..,"us":..}`);
 //! with `--seq` the whole sequence is timed as one CUDA graph.
 //! `PB_PRE=ROLE,..` runs those programs once first (e.g. the encoder, so a CFM program sees real
@@ -17,7 +18,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::gpu::packet_exec::CudaPacketRuntime;
     use plowrt::exec::packet_runtime::{PacketAsset, PacketRuntime};
     let args: Vec<String> = std::env::args().collect();
-    let sweep = args.iter().any(|a| a == "--sweep");
+    let sweep = args.iter().any(|a| a == "--sweep" || a.starts_with("--sweep="));
+    let caps: Option<usize> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--sweep="))
+        .map(str::parse)
+        .transpose()?;
     let each = args.iter().any(|a| a == "--each");
     let pos: Vec<&String> = args
         .iter()
@@ -25,7 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|a| !a.starts_with("--"))
         .collect();
     if !(3..=4).contains(&pos.len()) {
-        return Err("usage: packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep|--each]".into());
+        return Err(
+            "usage: packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep[=CAPS]|--each]".into(),
+        );
     }
     let path = std::path::Path::new(pos[0]);
     let iters: usize = pos.get(3).map_or(Ok(50), |s| s.parse())?;
@@ -87,12 +95,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if sweep {
         let raw = std::fs::read(path)?;
-        let n_inst = plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program]
-            .insts
-            .len();
-        for cap in 0..=n_inst {
+        let insts = std::mem::take(
+            &mut plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program].insts,
+        );
+        for cap in 0..=caps.map_or(insts.len(), |c| c.min(insts.len())) {
             rt.set_debug_max_inst(cap as u32)?;
-            println!("{{\"cap\":{cap},\"us\":{:.2}}}", time(&mut rt)?);
+            let (op, blocks) = cap.checked_sub(1).map_or((String::new(), 0), |i| {
+                let op = insts[i].op;
+                let name = packet::dev::DevOp::from_u16(op).map(|o| format!("{o:?}"));
+                (name.unwrap_or_else(|| op.to_string()), insts[i].blocks)
+            });
+            println!(
+                "{{\"cap\":{cap},\"op\":\"{op}\",\"blocks\":{blocks},\"us\":{:.2}}}",
+                time(&mut rt)?
+            );
         }
         rt.set_debug_max_inst(u32::MAX)?;
     }
