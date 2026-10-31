@@ -1081,12 +1081,16 @@ mod tests {
             "lib_flash_prefill_v2:fa4:hd=512:heads=16:kv_heads=1,2:layout=head_major:dtype=bf16";
         const HD256: &str =
             "lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16";
+        // One block row: the uncapped rule would pick SMS splits.
+        const ONE_HEAD: &str =
+            "lib_flash_prefill_v2:fa4:hd=512:heads=1:kv_heads=1:layout=head_major:dtype=bf16";
         let route = |abi: &str, kv_tile: u32, pad: u32| {
             serde_json::json!({"abi": abi, "page": PAGE, "kv_tile": kv_tile,
                 "max_splits": MAX_SPLITS, "pad": pad})
         };
         let mut routes = Vec::new();
-        for abi in [HD512, HD256] {
+        let mut widest = 0;
+        for abi in [HD512, HD256, ONE_HEAD] {
             let parsed = LibraryAbi::parse(abi).unwrap();
             for &kv_heads in &parsed.kv_heads {
                 for (requests, max_q, max_kv) in [(1, 1, 1 << 20), (1, 64, 65536), (4, 512, 8192)] {
@@ -1102,6 +1106,7 @@ mod tests {
                     };
                     let splits = launch.splits(&parsed, kv_heads, u64::MAX);
                     assert!((1..=MAX_SPLITS).contains(&splits), "{abi} {splits}");
+                    widest = widest.max(splits);
                 }
                 let kv_tile = tiles(&parsed, kv_heads).1;
                 if kv_tile == PAGE {
@@ -1109,8 +1114,9 @@ mod tests {
                 }
             }
         }
+        assert_eq!(widest, MAX_SPLITS, "the cap is reached");
         assert!(
-            routes.iter().all(|r| r["abi"] == HD512) && !routes.is_empty(),
+            routes.iter().all(|r| r["abi"] != HD256) && routes.len() == 3,
             "hd512 is the TMA paged route; hd256 loads row-predicated"
         );
         let payload = |routes: Vec<serde_json::Value>| {
