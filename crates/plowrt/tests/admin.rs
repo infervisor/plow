@@ -639,3 +639,57 @@ fn startup_models_roots_are_explicit_roots_asset_parents_and_the_store() {
     assert!(startup_models_roots(&[], &[], None).is_empty());
     assert!(!all.contains(&cwd) && !all.contains(&cwd.join("models")));
 }
+
+/// A registered model whose dispatcher is gone (an unload or eviction after admission) is
+/// unavailable, not missing: 503 `model_unloaded`, while an unknown name stays 404.
+#[tokio::test]
+async fn a_registered_model_without_a_dispatcher_is_unavailable_not_missing() {
+    let state = make_state();
+    let router = app(Arc::clone(&state));
+    let ask = |uri: &'static str, model: &'static str| {
+        let router = router.clone();
+        async move {
+            let body = if uri.ends_with("chat/completions") {
+                serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+            } else {
+                serde_json::json!({"model": model, "prompt": "hi"})
+            };
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, body_string(resp).await)
+        }
+    };
+    for uri in ["/v1/chat/completions", "/v1/completions"] {
+        let (status, body) = ask(uri, "state-model").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        assert!(body.contains("model_unloaded"), "{uri}: {body}");
+        let (status, body) = ask(uri, "never-registered").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+}
+
+/// One drain rule for every unload: the request's bound, else `PLOW_DRAIN_TIMEOUT_MS`, else
+/// 30 s; 0 preempts at once.
+#[test]
+fn unload_drain_defaults_to_a_bounded_drain() {
+    use plowrt::serve::admin::unload_drain;
+    use std::time::Duration;
+    assert_eq!(unload_drain(Some(0)), None);
+    assert_eq!(unload_drain(Some(250)), Some(Duration::from_millis(250)));
+    if plowrt::config::RuntimeConfig::get()
+        .drain_timeout_ms()
+        .is_none()
+    {
+        assert_eq!(unload_drain(None), Some(Duration::from_secs(30)));
+    }
+}

@@ -1158,6 +1158,12 @@ async fn async_main(
         tracing::info!(%key, %value, %source, "serve default from the assets");
     }
     RuntimeConfig::init(cli.rt_cfg);
+    plowrt::config::record_startup(plowrt::config::Startup::from_matches(
+        &matches,
+        asset_defaults
+            .iter()
+            .map(|(k, v, _)| (k.clone(), v.clone())),
+    ));
     let _ = plowrt::obs::serving::started_at_unix_ms();
     plowrt::knob_spec::warn_removed_env();
     match cli.cmd {
@@ -4651,8 +4657,10 @@ async fn bringup_runtime(
                         Some((s.slug.clone(), bundle.dir.clone(), ckpt))
                     })
                     .collect();
+                let width = u32::try_from(group.ordinals.len()).unwrap_or(u32::MAX);
                 let mgr = Arc::new(plowrt::serve::manager::ModelManager::from_hsa(
                     be,
+                    width,
                     &state,
                     mux_cfg,
                     group_models,
@@ -4667,6 +4675,7 @@ async fn bringup_runtime(
                 if let Ok(be) = plowrt::device::hsa::HsaBackend::new(d) {
                     if let Ok(mgr) = plowrt::serve::manager::ModelManager::from_hsa(
                         Arc::new(be),
+                        1,
                         &state,
                         mux_cfg,
                         Vec::new(),

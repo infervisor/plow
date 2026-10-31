@@ -324,6 +324,8 @@ driver_api! {
 
 thread_local! {
     static LAST_CTX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Modules this thread loaded inside [`CudaBackend::unload_modules_on_err`].
+    static LOAD_SCOPE: std::cell::RefCell<Option<Vec<u64>>> = const { std::cell::RefCell::new(None) };
 }
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -2351,6 +2353,38 @@ impl CudaBackend {
         )
     }
 
+    /// Run `f` (an engine load) and, when it fails, unload every module this thread loaded
+    /// inside it. Modules are not RAII, so a load refused after its first `module_load` (a
+    /// rejected object, an OOM mid-load) otherwise pinned the cubins and their image copies
+    /// until process exit, once per failed attempt. Modules a failed load's own teardown
+    /// already unloaded are skipped.
+    pub fn unload_modules_on_err<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let outer = LOAD_SCOPE.with(|s| s.borrow_mut().replace(Vec::new()));
+        // A panicking load is swept too, then resumes unwinding.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let ids = LOAD_SCOPE.with(|s| std::mem::replace(&mut *s.borrow_mut(), outer));
+        let ids = ids.unwrap_or_default();
+        if let Ok(Ok(_)) = &r {
+            LOAD_SCOPE.with(|s| {
+                if let Some(outer) = s.borrow_mut().as_mut() {
+                    outer.extend(ids);
+                }
+            });
+        } else {
+            let swept = ids
+                .into_iter()
+                .filter(|&id| self.module_unload(&Module { id }).is_ok())
+                .count();
+            tracing::debug!(swept, "unloaded the modules of a failed load");
+        }
+        r.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    /// Modules currently loaded through this backend (lifecycle accounting).
+    pub fn live_modules(&self) -> usize {
+        self.modules.lock().len()
+    }
+
     /// `(free, total)` device memory in bytes (`cuMemGetInfo`) — the VRAM
     /// ledger the unload/reload lifecycle tests assert against.
     pub fn mem_info(&self) -> Result<(u64, u64)> {
@@ -3051,6 +3085,11 @@ impl Backend for CudaBackend {
         let id = self.next_module.fetch_add(1, Ordering::Relaxed);
         self.modules.lock().insert(id, m as usize);
         self.module_images.lock().insert(id, image.to_vec());
+        LOAD_SCOPE.with(|s| {
+            if let Some(ids) = s.borrow_mut().as_mut() {
+                ids.push(id);
+            }
+        });
         Ok(Module { id })
     }
     fn launch_persistent(&self, module: &Module, _cfg: LaunchCfg) -> Result<()> {
