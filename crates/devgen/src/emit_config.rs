@@ -1770,6 +1770,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMV_DECODE_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemv_decode_role: bool,
 
+    /// Concatenate same-input block-scaled FP8 projections along N at load (`cat/` weights, one
+    /// cuBLASLt GEMM; gate|up feeds `GluPitched`). Packets need runtime contract 4.
+    #[arg(long, env = "PLOW_FP8_BLOCK_CONCAT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fp8_block_concat: bool,
+
     #[arg(long, env = "PLOW_QWEN_FP8_M1_TMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_fp8_m1_tma: bool,
 
@@ -2318,6 +2323,7 @@ impl EmitConfig {
             gemv_decode_role: env_bool("PLOW_GEMV_DECODE_ROLE"),
             decode_objects: None,
             decode_projection_tuning: false,
+            fp8_block_concat: env_bool("PLOW_FP8_BLOCK_CONCAT"),
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),

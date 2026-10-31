@@ -920,6 +920,58 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
     }
 }
 
+/* Op 230: d_glu over one row-pitched gate|up input (an N-concatenated projection's output),
+ * per element d_glu's vector-path math: out[r*width + p] = bf16(act(g) * u),
+ * g = gu[r*in_stride + p], u = gu[r*in_stride + up_col + p]. */
+static __device__ __forceinline__ float glu_pitched_one(float g, float u, unsigned act) {
+    float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh_pf(g);
+#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
+    if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
+#endif
+    return a * u;
+}
+static __device__ void d_glu_pitched(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ gu,
+                                     unsigned n, unsigned act, unsigned width, unsigned in_stride,
+                                     unsigned up_col, unsigned slice, unsigned nblk) {
+    if (((width | in_stride | up_col) & 7u) == 0) {
+        const unsigned n8 = n >> 3, w8 = width >> 3, step = nblk * PLOW_NV_THREADS;
+        auto src = [&](unsigned v) {
+            const unsigned r = v / w8;
+            return gu + (size_t)r * in_stride + (v - r * w8) * 8;
+        };
+        auto one = [&](const bf16v8& g, const bf16v8& u) {
+            bf16v8 o;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                o.x[j] = __float2bfloat16(glu_pitched_one(__bfloat162float(g.x[j]), __bfloat162float(u.x[j]), act));
+            return o;
+        };
+        /* Four gate/up pairs loaded before any is consumed, as d_glu. */
+        unsigned v = slice * PLOW_NV_THREADS + threadIdx.x;
+        for (; v + 3u * step < n8; v += 4u * step) {
+            bf16v8 g[4], u[4];
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const __nv_bfloat16* p = src(v + (unsigned)k * step);
+                g[k] = ld_glob8(p);
+                u[k] = ld_glob8(p + up_col);
+            }
+#pragma unroll
+            for (int k = 0; k < 4; k++) st_glob8(out + (size_t)(v + (unsigned)k * step) * 8, one(g[k], u[k]));
+        }
+        for (; v < n8; v += step) {
+            const __nv_bfloat16* p = src(v);
+            st_glob8(out + (size_t)v * 8, one(ld_glob8(p), ld_glob8(p + up_col)));
+        }
+        return;
+    }
+    for (unsigned i = slice * PLOW_NV_THREADS + threadIdx.x; i < n; i += nblk * PLOW_NV_THREADS) {
+        const unsigned r = i / width, p = i - r * width;
+        const __nv_bfloat16* src = gu + (size_t)r * in_stride + p;
+        out[i] = __float2bfloat16(glu_pitched_one(__bfloat162float(src[0]), __bfloat162float(src[up_col]), act));
+    }
+}
+
 /* Greedy argmax, per-block partial. See amax_pack() in sm120_common.cuh for the packed-key
  * contract — it is reproduced BIT-EXACTLY from AMD, so ties break identically.
  * `part` needs no zeroing: every block writes its own slot unconditionally.

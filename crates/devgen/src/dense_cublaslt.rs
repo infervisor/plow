@@ -785,7 +785,21 @@ pub(crate) fn runtime_requires(model: &Model, sections: &[SectionData]) -> serde
         (gemm && d.i[5] == packet::dev::FP8_BLOCK_GROUP)
             || (d.op == DevOp::QuantFp8 as u16 && d.i[3] == packet::dev::FP8_BLOCK_GROUP)
     });
-    let contract = if block_fp8 {
+    let concat = model
+        .tensors
+        .iter()
+        .any(|t| t.name.starts_with(packet::names::CONCAT_PREFIX))
+        || sections
+            .iter()
+            .any(|s| s.name == plow_asset::derived_weights::SECTION)
+        || model.progs.iter().flat_map(|p| &p.insts).any(|d| {
+            d.op == DevOp::GluPitched as u16
+                || (d.op == DevOp::QwenQGateSplit as u16 && d.i[3] != 0)
+                || (d.op == DevOp::QwenHeadNormRope as u16 && d.j[1] != 0)
+        });
+    let contract = if concat {
+        plow_asset::RUNTIME_CONTRACT_CONCAT
+    } else if block_fp8 {
         plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
     } else {
         plow_asset::RUNTIME_CONTRACT_BASE
@@ -1181,6 +1195,36 @@ mod tests {
             runtime_requires(&ladder, &[])["plowrt_contract"],
             plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
         );
+        // A derived-weights section, a cat/ tensor or GluPitched alone needs the concat contract.
+        let derived = SectionData {
+            kind: SECT_METADATA,
+            name: plow_asset::derived_weights::SECTION.into(),
+            data: Vec::new(),
+        };
+        assert_eq!(
+            runtime_requires(&ladder, &[derived])["plowrt_contract"],
+            plow_asset::RUNTIME_CONTRACT_CONCAT
+        );
+        ladder.progs[0].insts[0].op = DevOp::GluPitched as u16;
+        assert_eq!(
+            runtime_requires(&ladder, &[])["plowrt_contract"],
+            plow_asset::RUNTIME_CONTRACT_CONCAT
+        );
+        // So does a pitched q|gate split or head-norm source; their legacy forms do not.
+        let mut pitched = |op: DevOp, i3: u32, j1: u32| {
+            ladder.progs[0].insts[0] = saved.clone();
+            ladder.progs[0].insts[0].op = op as u16;
+            (ladder.progs[0].insts[0].i[3], ladder.progs[0].insts[0].j[1]) = (i3, j1);
+            runtime_requires(&ladder, &[])["plowrt_contract"].clone()
+        };
+        let concat = serde_json::json!(plow_asset::RUNTIME_CONTRACT_CONCAT);
+        assert_eq!(pitched(DevOp::QwenQGateSplit, 14336, 0), concat);
+        assert_eq!(
+            pitched(DevOp::QwenHeadNormRope, 0, 14336 | 12288 << 16),
+            concat
+        );
+        assert_ne!(pitched(DevOp::QwenQGateSplit, 0, 0), concat);
+        assert_ne!(pitched(DevOp::QwenHeadNormRope, 0, 0), concat);
         ladder.progs[0].insts[0] = saved;
         let root = std::env::temp_dir().join(format!("devgen-lt-store-{}", std::process::id()));
         let out = root.join("out");

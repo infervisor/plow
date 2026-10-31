@@ -8,7 +8,8 @@
 //!   block_run <asset-dir> bench --batch 1,2,4,8 --ctx 128,512,1024,4096
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
 //!                              [--pf-chunk N] [--pf-cap ROWS]
-//!   block_run <asset-dir> decode-check [--batch B --ctx T --steps N --out y.npy]
+//!   block_run <asset-dir> decode-check [--batch B --ctx T --steps N | --batch-seq 48,1,8]
+//!                              [--out y.npy] [--poison name,name]
 //!                              [--dump-tensors name,name --dump-dir dir]
 //!   block_run <asset-dir> mixed-check --rows 128 --decode 1
 //!   block_run <asset-dir> packed-check [--requests 16 --query-rows 128 --kv-base 4096]
@@ -155,7 +156,13 @@ mod cuda {
     }
 
     fn parse_list(s: &str) -> Vec<usize> {
-        s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
+        s.split(',')
+            .map(|x| {
+                x.trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("bad list entry {x:?} in {s:?}"))
+            })
+            .collect()
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -654,12 +661,32 @@ mod cuda {
         out_name: &str,
         flag: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bsz: usize = flag("--batch").and_then(|s| s.parse().ok()).unwrap_or(1);
         let t: usize = flag("--ctx").and_then(|s| s.parse().ok()).unwrap_or(1024);
-        let steps: usize = flag("--steps").and_then(|s| s.parse().ok()).unwrap_or(4);
-        if bsz == 0 || bsz > e.batch() || !e.has_prefill() {
+        // `--batch-seq 48,1,48`: step s decodes slots 0..seq[s] (the rest idle), so the engine
+        // changes rung between steps; otherwise `--batch` slots for `--steps` steps.
+        let seq: Vec<usize> = match flag("--batch-seq") {
+            Some(s) => parse_list(&s),
+            None => {
+                let bsz: usize = flag("--batch").and_then(|s| s.parse().ok()).unwrap_or(1);
+                let steps: usize = flag("--steps").and_then(|s| s.parse().ok()).unwrap_or(4);
+                vec![bsz; steps]
+            }
+        };
+        let (bsz, steps) = (seq.iter().copied().max().unwrap_or(0), seq.len());
+        if steps == 0 || seq.contains(&0) || bsz > e.batch() || !e.has_prefill() {
             return Err("decode-check needs 0 < batch <= engine batch and a prefill object".into());
         }
+        // `--poison a,b`: every byte of these tensors set to 0xff before each step, so a step
+        // that reads what it did not write this step shows up as non-finite or changed output.
+        let poison: Vec<String> = flag("--poison")
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
         let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
         let xin = synth(t, hidden);
         let mut last = vec![0u32; bsz];
@@ -669,22 +696,32 @@ mod cuda {
             *tok = e.prefill_slot(b, &prompt)?;
         }
         let rows = synth(steps * bsz, hidden);
-        let mut out = Vec::with_capacity(steps * bsz * hidden);
+        let mut out = Vec::with_capacity(seq.iter().sum::<usize>() * hidden);
         let mut toks = Vec::new();
-        for s in 0..steps {
-            e.upload_activation("act.x", &rows[s * bsz * hidden..(s + 1) * bsz * hidden])?;
-            let feeds: Vec<_> = last.iter().enumerate().map(|(b, &tk)| (b, tk)).collect();
+        for (s, &n) in seq.iter().enumerate() {
+            for name in &poison {
+                let bytes = e
+                    .tensor_bytes(name)
+                    .ok_or_else(|| format!("unknown poison tensor {name:?}"))?;
+                e.write_tensor(name, 0, &vec![0xffu8; usize::try_from(bytes)?])?;
+            }
+            e.upload_activation("act.x", &rows[s * bsz * hidden..(s * bsz + n) * hidden])?;
+            let feeds: Vec<_> = last[..n]
+                .iter()
+                .enumerate()
+                .map(|(b, &tk)| (b, tk))
+                .collect();
             e.step_slots(&feeds, &mut toks)?;
-            if toks.len() >= bsz {
-                last.copy_from_slice(&toks[..bsz]);
+            if toks.len() >= n {
+                last[..n].copy_from_slice(&toks[..n]);
             }
             let y = e.download_activation(out_name)?;
-            out.extend_from_slice(&y[..bsz * hidden]);
+            out.extend_from_slice(&y[..n * hidden]);
         }
         let bad = out.iter().filter(|v| !v.is_finite()).count();
-        println!("decode-check: B={bsz} T={t} steps={steps} non-finite={bad}");
+        println!("decode-check: B={bsz} T={t} steps={steps} seq={seq:?} non-finite={bad}");
         if let Some(p) = flag("--out") {
-            npy::write_f32(Path::new(&p), &[steps * bsz, hidden], &out)?;
+            npy::write_f32(Path::new(&p), &[out.len() / hidden, hidden], &out)?;
             println!("  wrote {p}");
         }
         // Raw allocations after the last step (`--dump-tensors a,b --dump-dir d`): d/<name>.bin.

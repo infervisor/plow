@@ -268,6 +268,8 @@ struct Emitter<'a> {
     quant_input: Option<(u32, u32)>,
     /// Decode projection fusions (one walk for z/a/b, for k/v, for gate/up/SiLU) on every rung.
     fuse: bool,
+    /// Same-input block-FP8 projections run as one N-concatenated GEMM (PLOW_FP8_BLOCK_CONCAT).
+    concat: bool,
     /// The residual + norm prologue (`Fold`) on this rung.
     fold: bool,
     /// `(stream, addend)` of a residual add waiting for the stream's next norm.
@@ -307,6 +309,62 @@ impl Fold {
         d.f[0] = eps;
         d.f[1] = 1.0;
     }
+}
+
+thread_local! {
+    /// The `cat/` tensors this thread's emits declared, by label: [`derived_section`] writes
+    /// the ones a model binds into `derived_weights.json`.
+    static DERIVED: std::cell::RefCell<
+        std::collections::BTreeMap<String, plow_asset::derived_weights::DerivedTensor>,
+    > = Default::default();
+}
+
+/// The label of checkpoint tensors `sources` concatenated along axis 0 (widened to f32 when
+/// `widen_f32`), recorded for [`derived_section`].
+fn derive<S: AsRef<str>>(sources: &[S], widen_f32: bool) -> String {
+    let sources: Vec<String> = sources.iter().map(|s| s.as_ref().to_string()).collect();
+    let name = packet::names::concat_label(&sources[0]);
+    DERIVED.with(|d| {
+        let spec = plow_asset::derived_weights::DerivedTensor {
+            name: name.clone(),
+            sources,
+            widen_f32,
+        };
+        let prev = d.borrow_mut().insert(name.clone(), spec.clone());
+        assert!(prev.is_none_or(|p| p == spec), "{name}: two derivations");
+    });
+    name
+}
+
+/// `derived_weights.json` for the `cat/` tensors `m` declares.
+fn derived_section(m: &Model) -> Option<packet::devbuild::SectionData> {
+    use plow_asset::derived_weights::{DerivedWeights, SECTION, VERSION};
+    let tensors: Vec<_> = DERIVED.with(|d| {
+        let d = d.borrow();
+        m.tensors
+            .iter()
+            .filter(|t| t.name.starts_with(packet::names::CONCAT_PREFIX))
+            .map(|t| d.get(&t.name).cloned().expect("undeclared cat/ tensor"))
+            .collect()
+    });
+    (!tensors.is_empty()).then(|| packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: SECTION.into(),
+        data: serde_json::to_vec(&DerivedWeights {
+            version: VERSION,
+            tensors,
+        })
+        .expect("derived weights json"),
+    })
+}
+
+/// The checkpoint tensors a declared tensor reads: a `cat/` tensor's sources, an `f32/`
+/// view's source, otherwise itself.
+fn checkpoint_sources(name: &str) -> Vec<String> {
+    if name.starts_with(packet::names::CONCAT_PREFIX) {
+        return DERIVED.with(|d| d.borrow()[name].sources.clone());
+    }
+    vec![name.strip_prefix("f32/").unwrap_or(name).to_string()]
 }
 
 impl Emitter<'_> {
@@ -357,8 +415,26 @@ impl Emitter<'_> {
         self.b.tensor(name, elems * 2)
     }
     fn proj(&mut self, out: u32, src: u32, name: &str, n: u32, k: u32, dep: u32) -> u32 {
+        self.proj_leaves(out, src, &[name], n, k, dep)
+    }
+    /// One projection over checkpoint weights `leaves` concatenated along N (`n` = their total
+    /// rows): block-scaled FP8 only when there is more than one.
+    fn proj_leaves(
+        &mut self,
+        out: u32,
+        src: u32,
+        leaves: &[&str],
+        n: u32,
+        k: u32,
+        dep: u32,
+    ) -> u32 {
+        let name = leaves[0];
         let quantized = self.quantized(name);
         let block = quantized && self.c.block_fp8.is_some();
+        assert!(
+            leaves.len() == 1 || (block && leaves.iter().all(|l| self.quantized(l))),
+            "{leaves:?}: only block-scaled FP8 projections concatenate"
+        );
         let (op, w, scale) = if block {
             assert!(
                 n % 128 == 0 && k % 512 == 0,
@@ -366,14 +442,19 @@ impl Emitter<'_> {
                  weight scale rows at a 4-float stride; the widened grid is packed)"
             );
             // The hub tensors: e4m3 bytes verbatim, the BF16 128x128 scale grid widened to f32
-            // at load (exact; `f32/` names a widened checkpoint tensor).
+            // at load (exact; `f32/` names a widened checkpoint tensor, `cat/` a concatenation
+            // along N, which keeps both row-major grids' K stride).
+            let (weight, grid) = if let [leaf] = leaves {
+                (leaf.to_string(), format!("f32/{leaf}_scale_inv"))
+            } else {
+                let grids: Vec<String> = leaves.iter().map(|l| format!("{l}_scale_inv")).collect();
+                (derive(leaves, false), derive(&grids, true))
+            };
             (
                 DevOp::GemvFp8,
-                self.b.tensor(name, n as u64 * k as u64),
-                self.b.tensor(
-                    &format!("f32/{name}_scale_inv"),
-                    u64::from(n / 128) * u64::from(k / 128) * 4,
-                ),
+                self.b.tensor(&weight, n as u64 * k as u64),
+                self.b
+                    .tensor(&grid, u64::from(n / 128) * u64::from(k / 128) * 4),
             )
         } else if quantized {
             (
@@ -752,6 +833,22 @@ impl Emitter<'_> {
         normalize: bool,
         dep: u32,
     ) -> u32 {
+        self.headnorm_at(out, src, 0, gamma, heads, cache, normalize, dep)
+    }
+    /// [`Self::headnorm`] reading `src` at `source` (j1: row pitch | column << 16, elements;
+    /// 0 = contiguous `[rows][heads][hd]`).
+    #[allow(clippy::too_many_arguments)]
+    fn headnorm_at(
+        &mut self,
+        out: u32,
+        src: u32,
+        source: u32,
+        gamma: u32,
+        heads: u32,
+        cache: bool,
+        normalize: bool,
+        dep: u32,
+    ) -> u32 {
         self.b
             .emit(DevOp::QwenHeadNormRope, self.b.all(), &[dep], |d| {
                 d.t[..7].copy_from_slice(&[
@@ -779,6 +876,7 @@ impl Emitter<'_> {
                 };
                 d.f[0] = self.c.eps;
                 d.f[1] = if normalize { 1.0 } else { 0.0 };
+                d.j[1] = source;
             })
     }
     fn full(&mut self, layer: usize, hn: u32, mixed: u32, dep: u32, fold: Option<&Fold>) -> u32 {
@@ -786,11 +884,8 @@ impl Emitter<'_> {
         let p = format!("{}layers.{layer}.self_attn", c.prefix);
         let qd = c.heads * c.hd;
         let kd = c.kv_heads * c.hd;
-        let packed = self.act("qgate", 2 * qd);
         let qg = self.act("qg", qd);
         let gate = self.act("qgate.gate", qd);
-        let kg = self.act("kg", kd);
-        let vg = self.act("vg", kd);
         let q = self.act("q", qd);
         let at = self.act("at", qd);
         let kc = self.b.tensor(
@@ -804,51 +899,95 @@ impl Emitter<'_> {
         let qn = self.weight(&format!("{p}.q_norm.weight"), c.hd as u64);
         let kn = self.weight(&format!("{p}.k_norm.weight"), c.hd as u64);
         let q_name = format!("{p}.q_proj.weight");
-        let dp = match fold {
-            Some(f) => self.proj_fold(packed, hn, &q_name, 2 * qd, c.hidden, f, dep),
-            None => self.proj(packed, hn, &q_name, 2 * qd, c.hidden, dep),
-        };
-        let dq = self
-            .b
-            .emit(DevOp::QwenQGateSplit, self.b.all(), &[dp], |d| {
-                d.t[..4].copy_from_slice(&[qg, gate, packed, self.active]);
-                d.i[..3].copy_from_slice(&[c.heads, c.hd, self.batch]);
-            });
-        let dq = self.headnorm(q, qg, qn, c.heads, false, true, dq);
-        let (dk, dv) = if self.fuse {
-            // k and v share the normalized input: one two-output walk.
-            let wk = self.weight(&format!("{p}.k_proj.weight"), kd as u64 * c.hidden as u64);
-            let wv = self.weight(&format!("{p}.v_proj.weight"), kd as u64 * c.hidden as u64);
-            let kv_dep = if self.projection_dag { dp } else { dq };
-            let dkv = self.b.emit(DevOp::GemvQkv, self.b.all(), &[kv_dep], |d| {
-                d.t[..7].copy_from_slice(&[kg, hn, wk, vg, wv, TENSOR_NONE, TENSOR_NONE]);
-                d.i[..5].copy_from_slice(&[self.batch, kd, c.hidden, kd, 0]);
-            });
-            let dk = self.headnorm(kc, kg, kn, c.kv_heads, true, true, dkv);
-            let dv = self.headnorm(vc, vg, TENSOR_NONE, c.kv_heads, true, false, dk);
-            (dk, dv)
-        } else {
-            let dk = self.proj(
-                kg,
-                hn,
-                &format!("{p}.k_proj.weight"),
-                kd,
-                c.hidden,
-                if self.projection_dag { dep } else { dq },
-            );
-            let dk = self.headnorm(kc, kg, kn, c.kv_heads, true, true, dk);
-            let dv = self.proj(
-                vg,
-                hn,
-                &format!("{p}.v_proj.weight"),
-                kd,
-                c.hidden,
-                if self.projection_dag { dep } else { dk },
-            );
-            (
+        let names = [
+            q_name.clone(),
+            format!("{p}.k_proj.weight"),
+            format!("{p}.v_proj.weight"),
+        ];
+        let (dq, dk, dv) = if self.concat
+            && fold.is_none()
+            && !self.fuse
+            && names.iter().all(|n| self.quantized(n))
+        {
+            // q|gate, k and v as one N-concatenated projection: the split and both KV writers
+            // read their columns of one row-pitched output.
+            let width = 2 * qd + 2 * kd;
+            assert!(width < 1 << 16, "{p}: q|k|v row pitch must fit 16 bits");
+            let qkv = self.act("qkv", width);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let dp = self.proj_leaves(qkv, hn, &names, width, c.hidden, dep);
+            let dq = self
+                .b
+                .emit(DevOp::QwenQGateSplit, self.b.all(), &[dp], |d| {
+                    d.t[..4].copy_from_slice(&[qg, gate, qkv, self.active]);
+                    d.i[..4].copy_from_slice(&[c.heads, c.hd, self.batch, width]);
+                });
+            let dq = self.headnorm(q, qg, qn, c.heads, false, true, dq);
+            let source = |col: u32| width | (col << 16);
+            let k_dep = if self.projection_dag { dp } else { dq };
+            let dk = self.headnorm_at(kc, qkv, source(2 * qd), kn, c.kv_heads, true, true, k_dep);
+            let dv = self.headnorm_at(
+                vc,
+                qkv,
+                source(2 * qd + kd),
+                TENSOR_NONE,
+                c.kv_heads,
+                true,
+                false,
                 dk,
-                self.headnorm(vc, vg, TENSOR_NONE, c.kv_heads, true, false, dv),
-            )
+            );
+            (dq, dk, dv)
+        } else {
+            let packed = self.act("qgate", 2 * qd);
+            let kg = self.act("kg", kd);
+            let vg = self.act("vg", kd);
+            let dp = match fold {
+                Some(f) => self.proj_fold(packed, hn, &q_name, 2 * qd, c.hidden, f, dep),
+                None => self.proj(packed, hn, &q_name, 2 * qd, c.hidden, dep),
+            };
+            let dq = self
+                .b
+                .emit(DevOp::QwenQGateSplit, self.b.all(), &[dp], |d| {
+                    d.t[..4].copy_from_slice(&[qg, gate, packed, self.active]);
+                    d.i[..3].copy_from_slice(&[c.heads, c.hd, self.batch]);
+                });
+            let dq = self.headnorm(q, qg, qn, c.heads, false, true, dq);
+            let (dk, dv) = if self.fuse {
+                // k and v share the normalized input: one two-output walk.
+                let wk = self.weight(&format!("{p}.k_proj.weight"), kd as u64 * c.hidden as u64);
+                let wv = self.weight(&format!("{p}.v_proj.weight"), kd as u64 * c.hidden as u64);
+                let kv_dep = if self.projection_dag { dp } else { dq };
+                let dkv = self.b.emit(DevOp::GemvQkv, self.b.all(), &[kv_dep], |d| {
+                    d.t[..7].copy_from_slice(&[kg, hn, wk, vg, wv, TENSOR_NONE, TENSOR_NONE]);
+                    d.i[..5].copy_from_slice(&[self.batch, kd, c.hidden, kd, 0]);
+                });
+                let dk = self.headnorm(kc, kg, kn, c.kv_heads, true, true, dkv);
+                let dv = self.headnorm(vc, vg, TENSOR_NONE, c.kv_heads, true, false, dk);
+                (dk, dv)
+            } else {
+                let dk = self.proj(
+                    kg,
+                    hn,
+                    &format!("{p}.k_proj.weight"),
+                    kd,
+                    c.hidden,
+                    if self.projection_dag { dep } else { dq },
+                );
+                let dk = self.headnorm(kc, kg, kn, c.kv_heads, true, true, dk);
+                let dv = self.proj(
+                    vg,
+                    hn,
+                    &format!("{p}.v_proj.weight"),
+                    kd,
+                    c.hidden,
+                    if self.projection_dag { dep } else { dk },
+                );
+                (
+                    dk,
+                    self.headnorm(vc, vg, TENSOR_NONE, c.kv_heads, true, false, dv),
+                )
+            };
+            (dq, dk, dv)
         };
         // PLOW_EMIT_GEN_KERNELS: one-split flash prefill with the fused bf16 epilogue (t5 = at,
         // no FlashMerge), the contract of a generated flash-prefill role (gen_flash_prefill.cu);
@@ -1167,6 +1306,12 @@ fn phase(
         share_quant,
         quant_input: None,
         fuse: fuse_decode,
+        concat: emit_config::active().fp8_block_concat
+            && fp8
+            && emit_config::active().w8a8
+            && c.block_fp8.is_some()
+            && !fuse_decode
+            && !fuse_mlp,
         fold: fold_norm,
         pending_residual: None,
         ctx,
@@ -1188,8 +1333,21 @@ fn phase(
     let mut pending = TENSOR_NONE;
     let hn = e.act("hn", c.hidden);
     let mixed = e.act("mixed", c.hidden);
-    let gate = e.act("gt", c.inter);
-    let up = e.act("ut", c.inter);
+    // gate|up as one N-concatenated block-FP8 projection (`cat/` weights) read by GluPitched.
+    let gu = (e.concat
+        && (0..c.layers.len())
+            .filter(|l| c.block.as_ref().is_none_or(|range| range.contains(l)))
+            .all(|l| {
+                ["gate", "up"]
+                    .iter()
+                    .all(|x| e.quantized(&format!("{}layers.{l}.mlp.{x}_proj.weight", c.prefix)))
+            }))
+    .then(|| e.act("gu", 2 * c.inter));
+    let (gate, up) = if gu.is_some() {
+        (TENSOR_NONE, TENSOR_NONE)
+    } else {
+        (e.act("gt", c.inter), e.act("ut", c.inter))
+    };
     let fu = e.act("fu", c.inter);
     let logits =
         e.b.tensor("act.logits", u64::from(decode_slots) * c.vocab as u64 * 2);
@@ -1292,6 +1450,16 @@ fn phase(
                 d.t[..7].copy_from_slice(&[gate, hn, wg, up, wu, TENSOR_NONE, TENSOR_NONE]);
                 d.i[..5].copy_from_slice(&[batch, c.inter, c.hidden, c.inter, 0]);
             })
+        } else if let Some(gu) = gu {
+            let (g, u) = (
+                format!("{p}.mlp.gate_proj.weight"),
+                format!("{p}.mlp.up_proj.weight"),
+            );
+            dep = e.proj_leaves(gu, hn, &[&g, &u], 2 * c.inter, c.hidden, dep);
+            e.b.emit(DevOp::GluPitched, e.b.all(), &[dep], |d| {
+                d.t[..2].copy_from_slice(&[fu, gu]);
+                d.i[..5].copy_from_slice(&[batch * c.inter, 1, c.inter, 2 * c.inter, c.inter]);
+            })
         } else {
             let gate_dep = e.proj(
                 gate,
@@ -1310,7 +1478,7 @@ fn phase(
                 gate_dep,
             )
         };
-        if !fuse_decode {
+        if !fuse_decode && gu.is_none() {
             dep = e.b.emit(DevOp::Glu, e.b.all(), &[dep], |d| {
                 d.t[..3].copy_from_slice(&[fu, gate, up]);
                 d.i[..2].copy_from_slice(&[batch * c.inter, 1]);
@@ -1618,17 +1786,18 @@ pub(super) fn run(
         &c.prefix,
         &m.tensors
             .iter()
-            .filter_map(|t| {
+            .flat_map(|t| {
                 // Sidecars are derived from these exact checkpoint matrices; scales add no source.
                 // A re-keyed checkpoint ships the twin itself in place of its bf16 source.
-                if let Some(name) = t.name.strip_prefix("f32/") {
-                    return Some(name.to_string());
+                // `f32/` and `cat/` derivations read their checkpoint leaves.
+                if t.name.starts_with("f32/") || t.name.starts_with(packet::names::CONCAT_PREFIX) {
+                    return checkpoint_sources(&t.name);
                 }
                 match t.name.strip_prefix("fp8/") {
-                    Some(name) if name.ends_with("_scale") => None,
-                    Some(_) if shipped.contains(&t.name) => Some(t.name.clone()),
-                    Some(name) => Some(name.to_string()),
-                    None => Some(t.name.clone()),
+                    Some(name) if name.ends_with("_scale") => vec![],
+                    Some(_) if shipped.contains(&t.name) => vec![t.name.clone()],
+                    Some(name) => vec![name.to_string()],
+                    None => vec![t.name.clone()],
                 }
             })
             .collect::<Vec<_>>(),
@@ -1645,6 +1814,7 @@ pub(super) fn run(
     if let Some(section) = segment_roles(&m) {
         sections.push(section);
     }
+    sections.extend(derived_section(&m));
     // PLOW_EMIT_PREFILL_CUBLASLT: the dense projections of every prefill bucket as isolated
     // cuBLASLt segments (the Gemma route; shapes in segment_roles::CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES).
     // The ordinary Qwen prefill otherwise runs every GEMM on the generic interpreter object.
@@ -2450,6 +2620,109 @@ mod tests {
         assert_eq!(
             crate::dense_cublaslt::runtime_requires(&m, &[])["plowrt_contract"],
             plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
+        );
+    }
+
+    #[test]
+    fn block_fp8_concat_reads_gate_up_as_one_projection() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        struct Restore(emit_config::EmitConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                emit_config::install(self.0.clone());
+            }
+        }
+        let restore = Restore(emit_config::active().clone());
+        let mut cfg = restore.0.clone();
+        cfg.fp8 = true;
+        cfg.w8a8 = true;
+        cfg.decode_cublaslt = true;
+        cfg.qwen_fp8_m1_tma = false;
+        cfg.fp8_block_concat = true;
+        cfg.qwen_w8a8_prefill = true;
+        emit_config::install(cfg);
+        let mut hub = fixture();
+        let bf16: Vec<_> = (0..3)
+            .flat_map(|l| {
+                ["a", "b"]
+                    .map(|x| format!("model.language_model.layers.{l}.linear_attn.in_proj_{x}"))
+            })
+            .collect();
+        hub["quantization_config"] = serde_json::json!({"quant_method":"fp8","fmt":"e4m3",
+            "activation_scheme":"dynamic","weight_block_size":[128,128],
+            "modules_to_not_convert":bf16});
+        let c = Config::parse(&hub);
+        let (inter, hidden) = (17408u32, 5120u32);
+        let m = model_prefill(&c, 8192, 132, 0, &[128], 3, true);
+        for (prog, batch) in [(0, 128u32), (1, 3)] {
+            let insts = &m.progs[prog].insts;
+            assert_eq!(
+                insts.iter().filter(|d| d.op == DevOp::Glu as u16).count(),
+                0
+            );
+            let glus: Vec<_> = insts
+                .iter()
+                .filter(|d| d.op == DevOp::GluPitched as u16)
+                .collect();
+            assert!(!glus.is_empty());
+            for glu in glus {
+                assert_eq!(&glu.i[..5], &[batch * inter, 1, inter, 2 * inter, inter]);
+                assert_eq!(glu.t[2], TENSOR_NONE);
+                let gemm = insts
+                    .iter()
+                    .find(|d| d.op == DevOp::GemmFp8 as u16 && d.t[0] == glu.t[1])
+                    .expect("gate|up GEMM");
+                assert_eq!(&gemm.i[..3], &[batch, 2 * inter, hidden]);
+                let w = &m.tensors[gemm.t[2] as usize].name;
+                let s = &m.tensors[gemm.t[4] as usize].name;
+                let section = derived_section(&m).unwrap();
+                let derived =
+                    plow_asset::derived_weights::DerivedWeights::parse(&section.data).unwrap();
+                let (w, s) = (derived.get(w).unwrap(), derived.get(s).unwrap());
+                assert!(!w.widen_f32 && s.widen_f32);
+                assert!(w.sources[0].ends_with("mlp.gate_proj.weight"));
+                assert!(w.sources[1].ends_with("mlp.up_proj.weight"));
+                let grids: Vec<String> =
+                    w.sources.iter().map(|l| format!("{l}_scale_inv")).collect();
+                assert_eq!(s.sources, grids);
+                assert!(
+                    m.tensors[gemm.t[0] as usize].bytes
+                        >= u64::from(batch.next_multiple_of(4)) * u64::from(2 * inter) * 2
+                );
+            }
+            // q|gate, k, v: one projection whose split and KV writers read pitched columns.
+            let width = 2 * 24 * 256 + 2 * 4 * 256;
+            let split = insts
+                .iter()
+                .find(|d| d.op == DevOp::QwenQGateSplit as u16)
+                .expect("q/gate split");
+            assert_eq!(&split.i[..4], &[24, 256, batch, width]);
+            let qkv = insts
+                .iter()
+                .find(|d| d.op == DevOp::GemmFp8 as u16 && d.t[0] == split.t[2])
+                .expect("q|k|v GEMM");
+            assert_eq!(&qkv.i[..3], &[batch, width, hidden]);
+            let section = derived_section(&m).unwrap();
+            let derived =
+                plow_asset::derived_weights::DerivedWeights::parse(&section.data).unwrap();
+            let sources = &derived
+                .get(&m.tensors[qkv.t[2] as usize].name)
+                .unwrap()
+                .sources;
+            for (s, x) in sources.iter().zip(["q", "k", "v"]) {
+                assert!(s.ends_with(&format!("self_attn.{x}_proj.weight")), "{s}");
+            }
+            let writers: Vec<u32> = insts
+                .iter()
+                .filter(|d| d.op == DevOp::QwenHeadNormRope as u16 && d.t[1] == split.t[2])
+                .map(|d| d.j[1])
+                .collect();
+            assert_eq!(writers, [width | (12288 << 16), width | (13312 << 16)]);
+        }
+        assert_eq!(
+            crate::dense_cublaslt::runtime_requires(&m, &[])["plowrt_contract"],
+            plow_asset::RUNTIME_CONTRACT_CONCAT
         );
     }
 

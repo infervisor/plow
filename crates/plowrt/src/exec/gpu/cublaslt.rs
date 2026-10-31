@@ -703,8 +703,10 @@ pub(super) fn light_segments(
                     op(inst),
                     Some(DevOp::NormResidual | DevOp::NormResidualNorm | DevOp::GluStrided)
                 );
-                if matches!(op(inst), Some(DevOp::AddNorm | DevOp::Glu))
-                    || (functions.gemma && gemma_op)
+                if matches!(
+                    op(inst),
+                    Some(DevOp::AddNorm | DevOp::Glu | DevOp::GluPitched)
+                ) || (functions.gemma && gemma_op)
                 {
                     return Some((seg, vec![(inst, 0)]));
                 }
@@ -796,7 +798,7 @@ pub(super) fn prefill_light_segments(
     light_segments_matching(g, library, 3, |d| match DevOp::from_u16(d.op) {
         Some(DevOp::RmsNorm) => d.t[3] == none && d.t[4] == none,
         Some(DevOp::Residual) => true,
-        Some(DevOp::Glu) => d.i[1] == 1,
+        Some(DevOp::Glu | DevOp::GluPitched) => d.i[1] == 1,
         _ => false,
     })
 }
@@ -825,7 +827,7 @@ pub(super) fn qwen_light_segments(
             | DevOp::QwenGdnGatePrep
             | DevOp::Residual,
         ) => true,
-        Some(DevOp::Glu) => d.i[1] == 1,
+        Some(DevOp::Glu | DevOp::GluPitched) => d.i[1] == 1,
         _ => false,
     });
     if let Some(devp) = quant {
@@ -928,13 +930,31 @@ fn light_quant_pair(
             usize::MAX,
             &[(0, row), (1, row), (2, row)],
         ),
+        // One gu input, row pitch i3, up at column i4: the kernel's 8-byte loads need both
+        // 4-aligned.
+        DevOp::GluPitched => (
+            pd.i[1] == 1
+                && u64::from(pd.i[0]) == u64::from(m) * u64::from(k)
+                && pd.i[2] == k
+                && pd.i[3] % 4 == 0
+                && pd.i[4] % 4 == 0
+                && u64::from(pd.i[4]) + u64::from(k) <= u64::from(pd.i[3])
+                && pd.t[2] == none,
+            usize::MAX,
+            &[
+                (
+                    1,
+                    (u64::from(m - 1) * u64::from(pd.i[3]) + u64::from(pd.i[4]) + u64::from(k)) * 2,
+                ),
+                (0, row),
+            ],
+        ),
         _ => return None,
     };
-    let required = |slot: usize| {
-        matches!(
-            (DevOp::from_u16(pd.op), slot),
-            (_, 0..=2) | (Some(DevOp::QwenGatedNorm), 3)
-        )
+    let required = |slot: usize| match DevOp::from_u16(pd.op) {
+        Some(DevOp::GluPitched) => slot <= 1,
+        Some(DevOp::QwenGatedNorm) => slot <= 3,
+        _ => slot <= 2,
     };
     let range = |h: u16| devp.get(usize::from(h)).map(|t| (t.base, t.base + t.len));
     let (xq, gs) = (range(qd.t[0])?, range(qd.t[2])?);
@@ -964,6 +984,8 @@ fn light_quant_pair(
     // active mask.
     let alias_ok = if pd.op == DevOp::QwenRmsNorm as u16 {
         pairwise(&present(&[0, 1, 2, 3, 4]))
+    } else if pd.op == DevOp::GluPitched as u16 {
+        pairwise(&present(&[0, 1]))
     } else {
         present(&[active])
             .iter()

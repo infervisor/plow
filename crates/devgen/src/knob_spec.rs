@@ -1479,6 +1479,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.attention_pf_role", Some("PLOW_ATTENTION_PF_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.attention_pf_isolate", Some("PLOW_ATTENTION_PF_ISOLATE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemv_decode_role", Some("PLOW_GEMV_DECODE_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.fp8_block_concat", Some("PLOW_FP8_BLOCK_CONCAT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fp8_m1_tma", Some("PLOW_QWEN_FP8_M1_TMA"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_w8a8_prefill", Some("PLOW_QWEN_W8A8_PREFILL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt", Some("PLOW_EMIT_DECODE_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

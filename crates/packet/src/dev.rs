@@ -1805,8 +1805,10 @@ pub enum DevOp {
     /// `t0=out t1=core t2=z t3=gamma t4=active?` · `i0=HV i1=V i2=B` · `f0=eps`.
     QwenGatedNorm = 138,
     /// Deinterleave each head of BF16 packed[B,H,2*D] into Q/gate[B,H,D]; optional I32 active[B].
+    /// `in_stride` (elements, 0 = 2*H*D) is packed's row pitch when it is the q|gate block at
+    /// column 0 of an N-concatenated projection's output (runtime contract 4).
     ///
-    /// `t0=Q t1=gate t2=packed t3=active?` · `i0=H i1=D i2=B`.
+    /// `t0=Q t1=gate t2=packed t3=active?` · `i0=H i1=D i2=B i3=in_stride?`.
     QwenQGateSplit = 139,
     /// BF16 out[B,width] = x times sigmoid(gate), with sigmoid rounded to BF16 before multiplication. Output may alias x; optional I32 active[B].
     ///
@@ -1818,7 +1820,10 @@ pub enum DevOp {
     QwenRmsNorm = 141,
     /// D=256; rotary is 0 or 64. BF16 x[rows,H,D] and optional gamma[D]. FP32 cos/sin tables are required when rotary is nonzero and round to BF16 before rotation; normalization also rounds to BF16 first. Optional I32 pos[rows] defaults to zero; optional I32 active[rows] masks writes. ctx=0 writes contiguous output; otherwise writes KV[slot,H,ctx,D]. prefill=1 treats rows as query tokens and writes the single selected KV slot, while decode uses one slot per row.
     ///
-    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill` · `f0=eps f1=gamma_offset`.
+    /// `source` (j1, 0 = contiguous x) is `in_stride | in_col << 16` in elements: x's row pitch and
+    /// column inside an N-concatenated projection's output (runtime contract 4).
+    ///
+    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill` · `f0=eps f1=gamma_offset` · `j1=source?`.
     QwenHeadNormRope = 142,
     /// BF16 causal convolution plus SiLU for exactly T valid tokens: x/out[T,C], weight[C,W], mutable oldest-first history[1,C,W-1]. Updates history after the chunk.
     ///
@@ -2552,6 +2557,12 @@ pub enum DevOp {
     /// · `j1=T`. `gate_eps`, `oscale` (0 = 1) and `T` are f32 bit patterns; `out_res` may alias
     /// `res`.
     MuseNormGateNorm = 229,
+    /// [`DevOp::Glu`] over one row-pitched input holding both halves (an N-concatenated
+    /// gate|up projection's output): `out[r*width + p] = bf16(act(g) * u)` with
+    /// `g = gu[r*in_stride + p]`, `u = gu[r*in_stride + up_col + p]`, the act and rounding of op 5.
+    /// `t0=out t1=gu` · `i0=n i1=act i2=width i3=in_stride i4=up_col` · `f0=alpha f1=limit`.
+    /// `n = rows*width`; strides and `up_col` count elements; requires `up_col + width <= in_stride`.
+    GluPitched = 230,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2849,6 +2860,7 @@ impl DevOp {
         DevOp::MuseResidualGate,
         DevOp::MuseMoeCombineNorm,
         DevOp::MuseNormGateNorm,
+        DevOp::GluPitched,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -3099,6 +3111,7 @@ impl DevOp {
             DevOp::MuseResidualGate => "PLOW_DOP_MUSE_RESIDUAL_GATE",
             DevOp::MuseMoeCombineNorm => "PLOW_DOP_MUSE_MOE_COMBINE_NORM",
             DevOp::MuseNormGateNorm => "PLOW_DOP_MUSE_NORM_GATE_NORM",
+            DevOp::GluPitched => "PLOW_DOP_GLU_PITCHED",
         }
     }
 
@@ -3167,7 +3180,8 @@ impl DevOp {
     /// front-ends).
     /// 225 -> 226 for `TrimSilenceF32 = 225` (reference-audio silence trim).
     /// 226 -> 230 for `MuseRmsNorm = 226` .. `MuseNormGateNorm = 229` (Muse Spark).
-    pub const COUNT: u16 = 230;
+    /// 230 -> 231 for `GluPitched = 230` (N-concatenated gate|up projections).
+    pub const COUNT: u16 = 231;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

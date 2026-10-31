@@ -434,10 +434,24 @@ static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16
     }
 }
 
+/* in_stride: packed's row pitch in elements (0 = 2 * heads * dim; an N-concatenated projection's
+ * output carries the q|gate block at column 0 of a wider row). */
 static __device__ void d_qwen_q_gate_split(__nv_bfloat16* q, __nv_bfloat16* gate,
     const __nv_bfloat16* packed, const int* active, unsigned heads, unsigned dim,
-    unsigned batch, unsigned slice, unsigned nblk) {
+    unsigned batch, unsigned slice, unsigned nblk, unsigned in_stride = 0) {
     const unsigned cols = heads * dim;
+    if (in_stride) {
+        const unsigned c8 = cols / 8u, n8 = batch * c8;
+        if ((dim & 7u) || (in_stride & 7u)) { if (threadIdx.x == 0) __trap(); return; }
+        for (unsigned i8 = slice * blockDim.x + threadIdx.x; i8 < n8; i8 += nblk * blockDim.x) {
+            const unsigned row = i8 / c8, i = (i8 - row * c8) * 8u;
+            if (active && active[row] <= 0) continue;
+            const size_t src = (size_t)row * in_stride + (i / dim) * 2 * dim + i % dim;
+            *(uint4*)(q + (size_t)row * cols + i) = *(const uint4*)(packed + src);
+            *(uint4*)(gate + (size_t)row * cols + i) = *(const uint4*)(packed + src + dim);
+        }
+        return;
+    }
     if ((dim & 7u) == 0) {
         // Eight elements (16 bytes) per thread step; the scalar loop was latency-bound at
         // 4096 x 6144 elements (0.25 ms per op).
@@ -769,8 +783,11 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
     const __nv_bfloat16* gamma, const float* cos, const float* sin, const int* positions,
     const int* active, unsigned heads, unsigned dim, unsigned rotary, unsigned batch,
     unsigned context, unsigned normalize, float eps, float offset, unsigned slice, unsigned nblk,
-    unsigned prefill = 0, const int* pfslot = nullptr) {
+    unsigned prefill = 0, const int* pfslot = nullptr, unsigned source = 0) {
     if (dim != 256 || (rotary != 0 && rotary != 64)) { if (threadIdx.x == 0) __trap(); return; }
+    /* source (j1): 0 = in[rows][heads][dim]; else in_stride | in_col << 16 (elements), the row
+     * pitch and column of this projection inside an N-concatenated output. */
+    const unsigned in_stride = source ? (source & 0xFFFFu) : heads * dim, in_col = source >> 16;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
     for (unsigned row = slice * warps + warp; row < batch * heads; row += nblk * warps) {
         const unsigned slot = row / heads, head = row % heads;
@@ -783,7 +800,8 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
         float x[8], sum = 0.f;
 #pragma unroll
         for (unsigned j = 0; j < 8; j++) {
-            x[j] = __bfloat162float(in[(size_t)row * dim + lane + j * 32]); sum += x[j] * x[j];
+            x[j] = __bfloat162float(in[(size_t)slot * in_stride + in_col + head * dim + lane + j * 32]);
+            sum += x[j] * x[j];
         }
         if (normalize) {
             const float inv = rsqrtf(qwen_warp_sum(sum) / dim + eps);
