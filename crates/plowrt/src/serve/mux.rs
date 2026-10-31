@@ -873,7 +873,7 @@ impl ModelMux {
     /// prefill) are at the cap, so a new one would only queue into a long TTFT; a load balancer
     /// can spill it instead. A soft bound: the seated count refreshes once per dispatcher tick.
     fn shed_queue_depth(&self) -> bool {
-        let cap = crate::config::RuntimeConfig::get().shed_queue_depth;
+        let cap = crate::config::RuntimeConfig::process_get().shed_queue_depth;
         cap > 0 && {
             let waiting = self.metrics.queued_requests.load(Ordering::Relaxed)
                 + self.metrics.prefill_waiting.load(Ordering::Relaxed);
@@ -1141,9 +1141,12 @@ pub fn spawn(
     state: Arc<AppState>,
     cfg: MuxConfig,
 ) -> ModelMux {
-    // The model's own engine config for everything the dispatcher reads, here and in its task.
-    let engine_cfg = state.engine_config(&slug);
-    crate::config::scoped(engine_cfg, || spawn_scoped(slug, bundle, state, cfg))
+    // The model's own engine config for everything the dispatcher reads, here and in its task;
+    // a model loaded without one (portable, bucketed) runs the process config by design.
+    let engine_cfg = state
+        .engine_config(&slug)
+        .unwrap_or_else(crate::config::RuntimeConfig::process_get);
+    crate::config::scoped(Some(engine_cfg), || spawn_scoped(slug, bundle, state, cfg))
 }
 
 fn spawn_scoped(

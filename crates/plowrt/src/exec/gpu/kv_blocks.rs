@@ -362,13 +362,13 @@ impl BlockServe {
             let stop = Arc::clone(&grower_stop.0);
             std::thread::Builder::new()
                 .name("kv-store-free".into())
-                .spawn(move || {
+                .spawn(crate::config::inherit(move || {
                     while !stop.load(Ordering::Relaxed) {
                         if !store.free_step() {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         }
                     }
-                })
+                }))
                 .map_err(|e| RuntimeError::Rejected(format!("kv store: free worker: {e}")))?;
         }
         if host_cap > 0 {
@@ -376,13 +376,13 @@ impl BlockServe {
             let stop = Arc::clone(&grower_stop.0);
             std::thread::Builder::new()
                 .name("kv-store-host-grower".into())
-                .spawn(move || {
+                .spawn(crate::config::inherit(move || {
                     while !stop.load(Ordering::Relaxed) {
                         if !store.host_grow_step() {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         }
                     }
-                })
+                }))
                 .map_err(|e| RuntimeError::Rejected(format!("kv store: host grower: {e}")))?;
         }
         tracing::info!(

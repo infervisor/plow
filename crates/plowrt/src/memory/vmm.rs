@@ -1947,7 +1947,7 @@ impl VmmKv {
         let premap_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
             .name("vmm-premap".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 while let Ok(job) = rx.recv() {
                     let s = &premap_shared;
                     match job {
@@ -1988,7 +1988,7 @@ impl VmmKv {
                         }
                     }
                 }
-            })
+            }))
             .map_err(|e| RuntimeError::Device(format!("vmm premap thread: {e}")))?;
         pool.premap_join = Some(join);
 
@@ -2044,7 +2044,7 @@ impl VmmKv {
         let (t_s, t_stop) = (Arc::clone(&self.shared), Arc::clone(&stop));
         let join = std::thread::Builder::new()
             .name("vmm-kv-pool".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 for _ in 0..target {
                     if t_stop.load(Ordering::Acquire) || t_s.inner.lock().pooled.len() >= target {
                         break;
@@ -2064,7 +2064,7 @@ impl VmmKv {
                         Err(_) => break,
                     }
                 }
-            });
+            }));
         if let Ok(j) = join {
             self.precreate = Some((stop, j));
         }
@@ -2172,7 +2172,7 @@ impl VmmKv {
         let shared = Arc::clone(s);
         let join = match std::thread::Builder::new()
             .name("vmm-host-tier".into())
-            .spawn(move || host_tier_thread(&shared))
+            .spawn(crate::config::inherit(move || host_tier_thread(&shared)))
         {
             Ok(join) => join,
             Err(e) => {
@@ -3432,7 +3432,7 @@ impl VmmKv {
         let flag = Arc::clone(&stop);
         let spawned = std::thread::Builder::new()
             .name("vmm-spill-ahead".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 while !flag.load(Ordering::Relaxed) {
                     store.reap();
                     // Spills in flight count as headroom already, and few are queued at once:
@@ -3447,7 +3447,7 @@ impl VmmKv {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                 }
-            });
+            }));
         match spawned {
             Ok(j) => self.spill_ahead = Some((stop, j)),
             Err(e) => tracing::warn!(error = %e, "vmm: spill-ahead thread not started"),
@@ -3460,7 +3460,7 @@ impl VmmKv {
         let shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
             .name("vmm-restore".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 while !flag.load(Ordering::Relaxed) {
                     let job = {
                         let mut jobs = shared.restore_jobs.lock();
@@ -3484,7 +3484,7 @@ impl VmmKv {
                         None => {}
                     }
                 }
-            });
+            }));
         match spawned {
             Ok(j) => self.restorer = Some((stop, j)),
             Err(e) => {
@@ -6744,7 +6744,7 @@ impl VmmSlab {
         let (t_ops, t_shared) = (Arc::clone(&ops), Arc::clone(&shared));
         let join = std::thread::Builder::new()
             .name("wslab-map".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 let mut off = 0u64;
                 while off < reserved {
                     if t_shared.m.lock().stop {
@@ -6795,7 +6795,7 @@ impl VmmSlab {
                 if !pooled.is_empty() {
                     t_ops.pool_put(pooled);
                 }
-            })
+            }))
             .map_err(|e| RuntimeError::Device(format!("vmm slab mapper thread: {e}")))?;
         Ok(VmmSlab {
             ops,

@@ -27,7 +27,7 @@ fn pool() -> &'static Mutex<Pool> {
                 let done_tx = done_tx.clone();
                 std::thread::Builder::new()
                     .name(format!("plow-rank-{i}"))
-                    .spawn(move || {
+                    .spawn(crate::config::inherit(move || {
                         while let Ok(job) = rx.recv() {
                             let ok =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_ok();
@@ -35,7 +35,7 @@ fn pool() -> &'static Mutex<Pool> {
                                 break;
                             }
                         }
-                    })
+                    }))
                     .expect("spawn rank pool worker");
                 tx
             })

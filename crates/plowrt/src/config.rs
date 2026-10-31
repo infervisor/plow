@@ -3323,10 +3323,25 @@ impl RuntimeConfig {
     /// without running `main()`'s CLI parse; parsing an empty argv lets clap's
     /// `env` attributes do the reading, so the `PLOW_*` contract holds for
     /// every entry point. Cold-path accessor — one atomic load once cached.
+    ///
+    /// Engine code (`exec/`, `memory/`, the dispatcher) must run under its model's scope once
+    /// models diverge: an unscoped read there would take another model's knobs. That is checked
+    /// at the caller — a panic in debug builds, one warning per call site in release.
+    #[track_caller]
+    #[inline]
     pub fn get() -> &'static RuntimeConfig {
         if let Some(c) = SCOPED.with(std::cell::Cell::get) {
             return c;
         }
+        if ENGINES_DIVERGE.load(std::sync::atomic::Ordering::Relaxed) {
+            unscoped_engine_read(std::panic::Location::caller());
+        }
+        Self::process()
+    }
+
+    /// The process config, for a process-scoped knob read in engine code (exempt from the
+    /// engine-scope check of [`Self::get`]).
+    pub fn process_get() -> &'static RuntimeConfig {
         Self::process()
     }
 
@@ -3355,6 +3370,45 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Some engine runs a config other than the process one ([`bundle_config`]): from then on an
+/// unscoped config read in engine code is a wrong-model read.
+static ENGINES_DIVERGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Source files whose code runs for one model's engine.
+const ENGINE_SOURCES: &[&str] = &[
+    "crates/plowrt/src/exec/",
+    "crates/plowrt/src/memory/",
+    "crates/plowrt/src/serve/engine.rs",
+    "crates/plowrt/src/serve/mux.rs",
+];
+
+fn engine_source(file: &str) -> bool {
+    ENGINE_SOURCES.iter().any(|p| file.starts_with(p))
+}
+
+#[cold]
+#[inline(never)]
+fn unscoped_engine_read(at: &'static std::panic::Location<'static>) {
+    if !engine_source(at.file()) {
+        return;
+    }
+    let thread = std::thread::current();
+    let msg = format!(
+        "engine code read the runtime config with no engine scope at {at} on thread {:?}: \
+         with co-served models it gets the process config, not its own model's",
+        thread.name().unwrap_or("<unnamed>")
+    );
+    if cfg!(debug_assertions) {
+        panic!("{msg}");
+    }
+    static SEEN: std::sync::Mutex<Vec<(&'static str, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&(at.file(), at.line())) {
+        seen.push((at.file(), at.line()));
+        tracing::warn!("{msg}");
+    }
+}
+
 /// The engine scope this thread runs under, to carry onto a thread or task it starts.
 pub fn current_scope() -> Option<&'static RuntimeConfig> {
     SCOPED.with(std::cell::Cell::get)
@@ -3371,6 +3425,13 @@ pub fn scoped<R>(cfg: Option<&'static RuntimeConfig>, f: impl FnOnce() -> R) -> 
     }
     let _restore = Restore(SCOPED.with(|s| s.replace(cfg)));
     f()
+}
+
+/// `f` under the calling thread's engine scope, for a thread an engine starts (its host-tier
+/// grower, spill-ahead, store workers): without it, the thread read the process config.
+pub fn inherit<R>(f: impl FnOnce() -> R) -> impl FnOnce() -> R {
+    let scope = current_scope();
+    move || scoped(scope, f)
 }
 
 /// A future polled (and dropped) under an engine scope: a model's dispatcher task, which tokio
@@ -3558,6 +3619,7 @@ pub fn bundle_config(dir: &std::path::Path) -> crate::Result<&'static RuntimeCon
         process
     } else {
         tracing::info!(bundle = %dir.display(), defaults = ?defaults, "engine config resolved for the bundle");
+        ENGINES_DIVERGE.store(true, std::sync::atomic::Ordering::Relaxed);
         Box::leak(Box::new(cfg))
     };
     cache.push((canon, defaults, cfg));
@@ -3625,6 +3687,62 @@ fn parse_pf_hold(spec: &str) -> Option<(u32, f64, usize)> {
         None => 16,
     };
     it.next().is_none().then_some((rows, ms, min_decode))
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    /// The scope follows the thread and the tasks and threads an engine starts, and is
+    /// restored after.
+    #[test]
+    fn engine_scope_follows_its_threads_and_restores() {
+        let cfg: &'static RuntimeConfig = Box::leak(Box::new(RuntimeConfig::process().clone()));
+        let is = move |c: &RuntimeConfig| std::ptr::eq(c, cfg);
+        assert!(!is(RuntimeConfig::get()));
+        scoped(Some(cfg), || {
+            assert!(is(RuntimeConfig::get()));
+            let inherited = std::thread::spawn(inherit(move || is(RuntimeConfig::get())));
+            assert!(
+                inherited.join().unwrap(),
+                "a spawned helper inherits the scope"
+            );
+            let bare = std::thread::spawn(move || is(RuntimeConfig::get()));
+            assert!(!bare.join().unwrap());
+            scoped(None, || assert!(!is(RuntimeConfig::get())));
+            assert!(
+                is(RuntimeConfig::get()),
+                "an inner scope restores the outer one"
+            );
+        });
+        assert!(!is(RuntimeConfig::get()));
+        let r = std::panic::catch_unwind(|| scoped(Some(cfg), || panic!("unwind")));
+        assert!(r.is_err());
+        assert!(!is(RuntimeConfig::get()), "restored on unwind");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let polled = rt.block_on(async move {
+            let fut = Scoped::new(Some(cfg), async move { is(RuntimeConfig::get()) });
+            tokio::spawn(fut).await.unwrap()
+        });
+        assert!(polled, "polled under the scope");
+    }
+
+    /// The check covers the engine's sources and nothing on the request path.
+    #[test]
+    fn engine_sources_are_the_engine_and_dispatcher() {
+        assert!(engine_source("crates/plowrt/src/exec/gpu.rs"));
+        assert!(engine_source("crates/plowrt/src/memory/vmm.rs"));
+        assert!(engine_source("crates/plowrt/src/serve/mux.rs"));
+        assert!(!engine_source("crates/plowrt/src/serve/chat.rs"));
+        assert!(!engine_source("crates/plowrt/src/main.rs"));
+        // Paths as `Location` spells them in this build.
+        assert!(std::panic::Location::caller()
+            .file()
+            .starts_with("crates/plowrt/src/"));
+    }
 }
 
 #[cfg(test)]
