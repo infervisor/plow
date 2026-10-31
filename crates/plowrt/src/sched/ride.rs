@@ -10,10 +10,52 @@
 //!
 //! Riding is the default while an estimate is missing. One launch in [`EXPLORE`] per bucket takes
 //! the arm the policy did not choose, so neither estimate goes stale while the other wins.
+//!
+//! A launch's cost is the median of its bucket's last [`K`] samples, not a running mean: one
+//! stalled launch (a 70 ms rung-128 tail with 3 riders against a 31 ms norm) priced a rider at
+//! 13 ms, and the bucket then declined 1210 of 1276 rides at ~free rider cost (Qwen3.8-27B FP8).
+//! Until a bucket holds `K` riding samples, and for `K / 2` explorations after its decision
+//! flips, the other arm runs every [`EXPLORE_FAST`] launches so a contaminated window refills.
 
 /// Launches per bucket between forced runs of the arm the policy is not using.
 pub const EXPLORE: u32 = 32;
+/// The exploration interval while a bucket's riding window is filling or just flipped.
+pub const EXPLORE_FAST: u32 = 4;
+/// Samples per estimate window.
+pub const K: usize = 8;
 const ALPHA: f64 = 0.2;
+const SUMMARY_EVERY: u64 = 2048;
+
+/// The last [`K`] samples; `median` of an even count is the mean of the middle pair.
+#[derive(Clone, Copy, Debug, Default)]
+struct Window {
+    v: [f64; K],
+    len: usize,
+    next: usize,
+}
+
+impl Window {
+    fn add(&mut self, x: f64) {
+        self.v[self.next] = x;
+        self.next = (self.next + 1) % K;
+        self.len = (self.len + 1).min(K);
+    }
+
+    fn median(&self) -> Option<f64> {
+        if self.len == 0 {
+            return None;
+        }
+        let mut v = self.v;
+        let s = &mut v[..self.len];
+        s.sort_unstable_by(f64::total_cmp);
+        let m = self.len / 2;
+        Some(if self.len % 2 == 1 {
+            s[m]
+        } else {
+            (s[m - 1] + s[m]) / 2.0
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Ewma(Option<f64>);
@@ -28,18 +70,23 @@ impl Ewma {
 struct Bucket {
     rows: usize,
     /// Launch ms with no decode rows.
-    pure: Ewma,
-    /// Extra launch ms over `pure`, and the riding rows that caused it (their ratio is the
-    /// per-row cost, weighted by rows so a one-row launch's jitter does not set it).
-    extra: Ewma,
-    riders: Ewma,
+    pure: Window,
+    /// Per riding row: launch ms over the `pure` median, divided by the riding rows.
+    per_row: Window,
     /// Launch ms with or without decode rows: what a riding row waits for.
     total: Ewma,
     since_explore: u32,
+    /// Explorations left at [`EXPLORE_FAST`] after the decision flipped, and the last decision.
+    fast: u32,
+    last: Option<bool>,
+    /// Decisions: rode, declined, and how many of either were forced explorations.
+    rode: u64,
+    declined: u64,
+    explored: u64,
 }
 
 /// Per-engine cost estimates for [`RideCost::ride`].
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct RideCost {
     buckets: Vec<Bucket>,
     /// Standalone decode step ms, keyed by the covering width in `widths`.
@@ -49,6 +96,7 @@ pub struct RideCost {
     ladder: Vec<usize>,
     /// [`RideCost::rows_within`] calls since the measured rung above the cap last re-ran.
     since_reprobe: u32,
+    decisions: u64,
 }
 
 impl RideCost {
@@ -96,12 +144,9 @@ impl RideCost {
     /// One prefill launch of `bucket` rows that carried `decode_rows` riding rows, `ms` long.
     pub fn observe_launch(&mut self, bucket: usize, decode_rows: usize, ms: f64) {
         let b = self.bucket(bucket);
-        match (decode_rows, b.pure.0) {
+        match (decode_rows, b.pure.median()) {
             (0, _) => b.pure.add(ms),
-            (d, Some(pure)) => {
-                b.extra.add((ms - pure).max(0.0));
-                b.riders.add(d as f64);
-            }
+            (d, Some(pure)) => b.per_row.add((ms - pure).max(0.0) / d as f64),
             _ => {}
         }
     }
@@ -184,19 +229,61 @@ impl RideCost {
     pub fn ride(&mut self, bucket: usize, decode_rows: usize) -> bool {
         let step = self.step(decode_rows);
         let b = self.bucket(bucket);
-        let per_row = b.extra.0.zip(b.riders.0).map(|(e, d)| e / d);
-        let prefer = match (b.pure.0, per_row, step) {
+        let prefer = match (b.pure.median(), b.per_row.median(), step) {
             (Some(_), Some(r), Some(s)) => r * decode_rows as f64 <= s,
             // Without a pure sample neither the per-row cost nor its comparison exists: measure it.
             (None, _, _) => false,
             _ => true,
         };
-        b.since_explore += 1;
-        if b.since_explore >= EXPLORE {
-            b.since_explore = 0;
-            return !prefer;
+        if b.last.is_some_and(|last| last != prefer) {
+            b.fast = (K / 2) as u32;
         }
-        prefer
+        b.last = Some(prefer);
+        let interval = if b.per_row.len < K || b.fast > 0 {
+            EXPLORE_FAST
+        } else {
+            EXPLORE
+        };
+        b.since_explore += 1;
+        let explore = b.pure.len > 0 && b.since_explore >= interval;
+        if explore {
+            b.since_explore = 0;
+            b.fast = b.fast.saturating_sub(1);
+            b.explored += 1;
+        }
+        let ride = prefer != explore;
+        if ride {
+            b.rode += 1;
+        } else {
+            b.declined += 1;
+        }
+        // A server stopped by a signal never drops its engines: log the counts as they grow too.
+        self.decisions += 1;
+        if self.decisions.is_multiple_of(SUMMARY_EVERY) {
+            if let Some(summary) = self.decision_summary() {
+                tracing::info!(%summary, "ride decisions per prefill bucket (rows:rode/declined/explored)");
+            }
+        }
+        ride
+    }
+
+    /// One line per bucket with any decision: `rows:rode/declined/explored`.
+    pub fn decision_summary(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .buckets
+            .iter()
+            .filter(|b| b.rode + b.declined > 0)
+            .map(|b| format!("{}:{}/{}/{}", b.rows, b.rode, b.declined, b.explored))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
+}
+
+impl Drop for RideCost {
+    fn drop(&mut self) {
+        if let Some(summary) = self.decision_summary() {
+            tracing::info!(%summary, "ride decisions per prefill bucket (rows:rode/declined/explored)");
+        }
     }
 }
 
@@ -206,11 +293,107 @@ mod tests {
 
     fn warm(c: &mut RideCost, pure: f64, per_row: f64, step: f64) {
         c.set_widths(&[32, 64, 128]);
-        c.observe_launch(2048, 0, pure);
-        c.observe_launch(2048, 50, pure + 50.0 * per_row);
+        for _ in 0..K {
+            c.observe_launch(2048, 0, pure);
+        }
+        for _ in 0..K {
+            c.observe_launch(2048, 50, pure + 50.0 * per_row);
+        }
         for rows in [20, 50, 100] {
             c.observe_step(rows, step);
         }
+    }
+
+    /// Decisions over `n` launches of `bucket` with `rows` riders, each observed at the cost of
+    /// its arm (`launch(ride)`); returns how many rode.
+    fn run(
+        c: &mut RideCost,
+        n: u32,
+        bucket: usize,
+        rows: usize,
+        launch: impl Fn(bool) -> f64,
+    ) -> u32 {
+        let mut rode = 0;
+        for _ in 0..n {
+            let r = c.ride(bucket, rows);
+            rode += u32::from(r);
+            c.observe_launch(bucket, if r { rows } else { 0 }, launch(r));
+        }
+        rode
+    }
+
+    #[test]
+    fn one_stalled_launch_does_not_stop_riding() {
+        // Rung-128 tail: 31 ms pure, ~free riders, 17 ms decode step.
+        let mut c = RideCost::default();
+        warm(&mut c, 31.0, 0.05, 17.0);
+        c.observe_launch(2048, 3, 70.8);
+        c.observe_launch(2048, 2, 45.2);
+        assert!(
+            c.ride(2048, 3),
+            "two stalls in a window of eight leave the median cheap"
+        );
+        let rode = run(&mut c, 64, 2048, 4, |r| if r { 31.2 } else { 31.0 });
+        assert!(rode >= 64 - 64 / EXPLORE - 1, "rode {rode} of 64");
+    }
+
+    #[test]
+    fn a_sustained_high_rider_cost_still_declines() {
+        // Gemma-4-12B at 8192: 0.50 ms/row riding against a 0.27 ms/row step.
+        let mut c = RideCost::default();
+        warm(&mut c, 120.0, 0.50, 27.0);
+        let rode = run(&mut c, 64, 2048, 100, |r| if r { 170.0 } else { 120.0 });
+        assert!(
+            rode <= 64 / EXPLORE + 1,
+            "rode {rode} of 64: only explorations"
+        );
+    }
+
+    #[test]
+    fn a_contaminated_start_recovers_within_a_bounded_number_of_launches() {
+        let mut c = RideCost::default();
+        c.set_widths(&[64]);
+        c.observe_step(8, 17.0);
+        c.observe_launch(128, 0, 31.0);
+        // The first riding samples all stalled.
+        for _ in 0..K {
+            c.observe_launch(128, 4, 90.0);
+        }
+        assert!(!c.ride(128, 4));
+        // Riding really costs ~nothing: the fast explorations refill the window.
+        run(&mut c, 8 * EXPLORE, 128, 4, |r| if r { 31.4 } else { 31.0 });
+        let rode = run(&mut c, 64, 128, 4, |r| if r { 31.4 } else { 31.0 });
+        assert!(
+            rode >= 64 - 64 / EXPLORE - 1,
+            "rode {rode} of 64 after recovery"
+        );
+    }
+
+    #[test]
+    fn a_turn_from_cheap_to_expensive_riders_is_followed() {
+        let mut c = RideCost::default();
+        warm(&mut c, 31.0, 0.05, 17.0);
+        run(
+            &mut c,
+            4 * EXPLORE,
+            2048,
+            8,
+            |r| if r { 80.0 } else { 31.0 },
+        );
+        let rode = run(&mut c, 64, 2048, 8, |r| if r { 80.0 } else { 31.0 });
+        assert!(
+            rode <= 64 / EXPLORE + 1,
+            "rode {rode} of 64 once riders turned expensive"
+        );
+    }
+
+    #[test]
+    fn decisions_are_counted_per_bucket() {
+        let mut c = RideCost::default();
+        warm(&mut c, 31.0, 0.05, 17.0);
+        run(&mut c, EXPLORE, 2048, 4, |_| 31.0);
+        let s = c.decision_summary().unwrap();
+        assert_eq!(s, format!("2048:{}/1/1", EXPLORE - 1));
     }
 
     #[test]
