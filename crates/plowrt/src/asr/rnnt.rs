@@ -1011,19 +1011,23 @@ impl PacketRnnt {
         Ok(items.into_iter().map(|item| item.tokens).collect())
     }
 
-    /// The smallest encoder capacity holding `valid_input_frames`, and its valid encoder frames.
+    /// The smallest encoder capacity holding `valid_input_frames` (with a stream, its decoded rows
+    /// in whole stream steps), and its valid encoder frames.
     fn encoder_for(&self, valid_input_frames: usize) -> Result<(usize, usize)> {
-        let encoder = self
-            .encoder_programs
-            .iter()
-            .position(|&(capacity, _)| capacity >= valid_input_frames)
-            .ok_or_else(|| {
-                RuntimeError::Rejected(format!(
-                    "packet has no encoder capacity for {valid_input_frames} frames"
-                ))
-            })?;
-        let frames =
-            self.valid_encoder_frames(valid_input_frames, self.encoder_programs[encoder].0)?;
+        let capacities: Vec<usize> = self.encoder_programs.iter().map(|e| e.0).collect();
+        let encoder = encoder_index(
+            &capacities,
+            valid_input_frames,
+            &self.frame_transform,
+            self.trailing_frames,
+            self.stream_windows().map(|w| w.rows),
+        )?
+        .ok_or_else(|| {
+            RuntimeError::Rejected(format!(
+                "packet has no encoder capacity for {valid_input_frames} frames"
+            ))
+        })?;
+        let frames = self.valid_encoder_frames(valid_input_frames, capacities[encoder])?;
         Ok((encoder, frames))
     }
 
@@ -1506,6 +1510,31 @@ fn bounded_transformed_frame_count(
     Ok(transformed_frame_count(valid_frames, stages)?
         .saturating_add(trailing_frames)
         .min(transformed_frame_count(capacity, stages)?))
+}
+
+/// The smallest of `capacities` (input frames, ascending) holding `valid_frames` and, with
+/// `step_rows`, their decoded rows rounded up to whole steps. A stream final computes whole steps
+/// and no row attends past its step, so an encoder holding them decodes the stream's rows. Past
+/// the largest, the smallest holding the frames.
+fn encoder_index(
+    capacities: &[usize],
+    valid_frames: usize,
+    stages: &[[usize; 4]],
+    trailing_frames: usize,
+    step_rows: Option<usize>,
+) -> Result<Option<usize>> {
+    let Some(holding) = capacities.iter().position(|&c| c >= valid_frames) else {
+        return Ok(None);
+    };
+    let Some(step_rows) = step_rows else {
+        return Ok(Some(holding));
+    };
+    let rows = (transformed_frame_count(valid_frames, stages)? + trailing_frames)
+        .next_multiple_of(step_rows);
+    let whole = capacities[holding..]
+        .iter()
+        .position(|&c| transformed_frame_count(c, stages).is_ok_and(|frames| frames >= rows));
+    Ok(Some(holding + whole.unwrap_or(0)))
 }
 
 impl GreedyRnnt {
@@ -1995,5 +2024,19 @@ mod tests {
             bounded_transformed_frame_count(799, 800, &[[1, 1, 0, 0]], 2).unwrap(),
             800
         );
+    }
+
+    #[test]
+    fn encoder_holds_a_stream_final_in_whole_steps() {
+        let stages = [[3, 2, 1, 1]; 3];
+        let capacities = [200, 400, 3000];
+        // 185 frames: 24 rows + 6 trailing, 32 in whole steps: more than 200 frames' 25 rows.
+        assert_eq!(encoder_index(&capacities, 185, &stages, 6, Some(4)).unwrap(), Some(1));
+        assert_eq!(encoder_index(&capacities, 185, &stages, 6, None).unwrap(), Some(0));
+        // 100 frames: 13 + 6 rows, 20 in whole steps.
+        assert_eq!(encoder_index(&capacities, 100, &stages, 6, Some(4)).unwrap(), Some(0));
+        // 2990 frames: 374 + 6 rows outgrow 3000 frames' 375; it still holds the frames.
+        assert_eq!(encoder_index(&capacities, 2990, &stages, 6, Some(4)).unwrap(), Some(2));
+        assert_eq!(encoder_index(&capacities, 3001, &stages, 6, Some(4)).unwrap(), None);
     }
 }
