@@ -482,6 +482,33 @@ pub enum EnsureError {
     /// Another switch held the switch lock past `PLOW_SWITCH_TIMEOUT_MS`. Shed with 503 +
     /// Retry-After.
     SwitchTimeout(Duration),
+    /// The model's last load failed and its retry backoff has not expired (its bundle files are
+    /// unchanged). Shed with 503 + Retry-After `retry_after`.
+    Backoff { why: String, retry_after: Duration },
+}
+
+impl EnsureError {
+    /// `r` with this refusal's Retry-After header, when it has one.
+    pub fn with_retry_after(&self, mut r: axum::response::Response) -> axum::response::Response {
+        if let Some(d) = self.retry_after() {
+            r.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(d.as_secs().max(1)),
+            );
+        }
+        r
+    }
+
+    /// Retry-After for a shed request, `None` when retrying unchanged cannot help.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => {
+                Some(Duration::from_secs(30))
+            }
+            EnsureError::Backoff { retry_after, .. } => Some(*retry_after),
+            EnsureError::Unloaded | EnsureError::Load(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for EnsureError {
@@ -502,6 +529,11 @@ impl std::fmt::Display for EnsureError {
                 f,
                 "another model switch is still in progress after {} s; retry later",
                 d.as_secs()
+            ),
+            EnsureError::Backoff { why, retry_after } => write!(
+                f,
+                "model load failed: {why}; next attempt in {} s",
+                retry_after.as_secs().max(1)
             ),
         }
     }
@@ -746,10 +778,45 @@ pub struct ModelManager {
     /// The server runtime. A dispatcher asking for growth runs its own executor on a busy
     /// thread, where a task spawned locally would wait for the load to stop.
     runtime: Option<tokio::runtime::Handle>,
-    /// slug → why its last load failed (other than out of memory). A demand load refuses the
-    /// model with it before evicting anyone: a deterministic failure otherwise took a healthy
-    /// co-tenant down on every request. An explicit load or a re-registration retries.
-    failed: Mutex<FxHashMap<String, String>>,
+    /// slug → its last failed load (other than out of memory). Demand loads back off before
+    /// evicting anyone: a deterministic failure otherwise took a healthy co-tenant down on every
+    /// request. A success, an explicit load or deregistration clears it.
+    failed: Mutex<FxHashMap<String, LoadFailure>>,
+}
+
+/// A failed load and when the next demand load may retry it.
+#[derive(Clone, Debug)]
+struct LoadFailure {
+    why: String,
+    at: Instant,
+    delay: Duration,
+    /// [`bundle_stamp`] at the failure: a changed bundle retries at once.
+    stamp: u64,
+}
+
+const LOAD_BACKOFF_MIN: Duration = Duration::from_secs(30);
+const LOAD_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+/// Name, size and mtime of every file directly in the bundle and checkpoint dirs, hashed: a
+/// bundle being copied or replaced changes it.
+fn bundle_stamp(m: &Managed) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for dir in [&m.dir, &m.ckpt] {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut files: Vec<_> = rd
+            .flatten()
+            .filter_map(|e| {
+                let md = e.metadata().ok()?;
+                Some((e.file_name(), md.len(), md.modified().ok()))
+            })
+            .collect();
+        files.sort();
+        files.hash(&mut h);
+    }
+    h.finish()
 }
 
 impl ModelManager {
@@ -1213,14 +1280,10 @@ impl ModelManager {
             self.touch(slug);
             return Ok(());
         }
-        if let Some(why) = self.failed.lock().get(slug) {
-            return Err(EnsureError::Load(RuntimeError::Rejected(format!(
-                "{slug}: its last load failed ({why}); an explicit load retries it"
-            ))));
-        }
         let m = self
             .managed(slug)
             .ok_or_else(|| EnsureError::Load(RuntimeError::UnknownModel(slug.into())))?;
+        self.load_backoff(&m)?;
         let need = self.required(slug).expect("managed") + RESERVE;
         let mut report = SwitchReport {
             target: slug.to_string(),
@@ -1527,7 +1590,7 @@ impl ModelManager {
             .filter(|m| !self.is_resident(&m.slug))
             // Never speculatively reload what an operator unloaded.
             .filter(|m| state.residency(&m.slug).admits())
-            .filter(|m| !self.failed.lock().contains_key(&m.slug))
+            .filter(|m| self.load_backoff(m).is_ok())
             .filter(|m| {
                 let credit = pool.min(m.plan.slab_reusable());
                 self.required(&m.slug)
@@ -1627,7 +1690,23 @@ impl ModelManager {
         let r = self.load_model_once(m).await;
         match &r {
             Err(EnsureError::Load(e)) if !is_oom(e) => {
-                self.failed.lock().insert(m.slug.clone(), e.to_string());
+                let stamp = bundle_stamp(m);
+                let mut failed = self.failed.lock();
+                // Doubles per failure of the same bundle files; a changed bundle starts over.
+                let delay = match failed.get(&m.slug) {
+                    Some(f) if f.stamp == stamp => (f.delay * 2).min(LOAD_BACKOFF_MAX),
+                    _ => LOAD_BACKOFF_MIN,
+                };
+                tracing::warn!(slug = %m.slug, error = %e, retry_s = delay.as_secs(), "planner: load failed — demand loads back off");
+                failed.insert(
+                    m.slug.clone(),
+                    LoadFailure {
+                        why: e.to_string(),
+                        at: Instant::now(),
+                        delay,
+                        stamp,
+                    },
+                );
             }
             Ok(()) => {
                 self.failed.lock().remove(&m.slug);
@@ -1635,6 +1714,22 @@ impl ModelManager {
             Err(_) => {}
         }
         r
+    }
+
+    /// `Err(Backoff)` while `m`'s last failed load is inside its backoff and its bundle files are
+    /// unchanged; a demand load may try it otherwise.
+    fn load_backoff(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
+        let Some(f) = self.failed.lock().get(&m.slug).cloned() else {
+            return Ok(());
+        };
+        let left = f.delay.saturating_sub(f.at.elapsed());
+        if left.is_zero() || bundle_stamp(m) != f.stamp {
+            return Ok(());
+        }
+        Err(EnsureError::Backoff {
+            why: f.why,
+            retry_after: left,
+        })
     }
 
     async fn load_model_once(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
@@ -1976,10 +2071,8 @@ mod tests {
         }
     }
 
-    /// A model whose load failed (other than out of memory) is refused by later demand loads
-    /// before the planner evicts anyone; an explicit load retries it.
-    #[tokio::test]
-    async fn a_failed_load_is_not_retried_by_demand_loads() {
+    /// A manager over one model, `m` in `dir`, whose every load fails (no registry entry).
+    fn failing_manager(dir: &Path) -> (Arc<AppState>, Arc<ModelManager>) {
         let backend: Arc<dyn crate::device::Backend> =
             Arc::new(crate::device::cpu::CpuBackend::new(1));
         let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
@@ -1996,8 +2089,8 @@ mod tests {
             mux_cfg: MuxConfig::default(),
             models: RwLock::new(vec![Managed {
                 slug: "m".into(),
-                dir: "/nonexistent".into(),
-                ckpt: "/nonexistent".into(),
+                dir: dir.into(),
+                ckpt: dir.into(),
                 plan,
             }]),
             switch: tokio::sync::Mutex::new(()),
@@ -2009,18 +2102,84 @@ mod tests {
             failed: Mutex::default(),
             runtime: None,
         });
-        let first = mgr.ensure_resident("m").await.unwrap_err().to_string();
-        assert!(!first.contains("last load failed"), "{first}");
-        let again = mgr.ensure_resident("m").await.unwrap_err().to_string();
-        assert!(again.contains("its last load failed"), "{again}");
+        (state, mgr)
+    }
+
+    /// A model whose load failed (other than out of memory) is shed by later demand loads with
+    /// the recorded error and a Retry-After, before the planner evicts anyone; an explicit load
+    /// retries it, and deregistration forgets it.
+    #[tokio::test]
+    async fn a_failed_load_backs_off_demand_loads() {
+        let (_state, mgr) = failing_manager(Path::new("/nonexistent"));
+        let first = mgr.ensure_resident("m").await.unwrap_err();
+        assert!(matches!(first, EnsureError::Load(_)), "{first}");
+        let again = mgr.ensure_resident("m").await.unwrap_err();
+        let EnsureError::Backoff { why, retry_after } = &again else {
+            panic!("{again}");
+        };
+        assert!(first.to_string().contains(why.as_str()), "{again}");
+        assert!(*retry_after <= LOAD_BACKOFF_MIN && again.retry_after() == Some(*retry_after));
         assert!(mgr.preload_candidate().is_none());
-        let explicit = mgr.load("m", false).await.unwrap_err().to_string();
+        let explicit = mgr.load("m", false).await.unwrap_err();
         assert!(
-            !explicit.contains("last load failed"),
+            matches!(explicit, EnsureError::Load(_)),
             "an explicit load retries: {explicit}"
         );
         assert!(mgr.deregister("m"));
         assert!(mgr.failed.lock().is_empty());
+    }
+
+    /// The backoff expires: the next demand load retries, and a repeat failure of the same
+    /// bundle doubles the wait up to the cap. Changed bundle files retry at once and start over.
+    #[tokio::test]
+    async fn a_load_backoff_expires_doubles_and_resets_on_a_changed_bundle() {
+        let dir = std::env::temp_dir().join(format!("plowrt_backoff_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.pkt"), b"partial").unwrap();
+        let (_state, mgr) = failing_manager(&dir);
+        let delay = |mgr: &ModelManager| mgr.failed.lock()["m"].delay;
+        let expire = |mgr: &ModelManager| {
+            let mut f = mgr.failed.lock();
+            let f = f.get_mut("m").unwrap();
+            f.at = Instant::now().checked_sub(f.delay).unwrap();
+        };
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Load(_))
+        ));
+        assert_eq!(delay(&mgr), LOAD_BACKOFF_MIN);
+        let mut want = LOAD_BACKOFF_MIN;
+        for _ in 0..6 {
+            assert!(matches!(
+                mgr.ensure_resident("m").await,
+                Err(EnsureError::Backoff { .. })
+            ));
+            expire(&mgr);
+            assert!(
+                mgr.preload_candidate().is_some(),
+                "expired: the preloader may try it"
+            );
+            assert!(matches!(
+                mgr.ensure_resident("m").await,
+                Err(EnsureError::Load(_))
+            ));
+            want = (want * 2).min(LOAD_BACKOFF_MAX);
+            assert_eq!(delay(&mgr), want);
+        }
+        assert_eq!(want, LOAD_BACKOFF_MAX);
+        // The copy finishes: the file grew, so the next request retries inside the backoff.
+        std::fs::write(dir.join("model.pkt"), b"partial, now complete").unwrap();
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Load(_))
+        ));
+        assert_eq!(
+            delay(&mgr),
+            LOAD_BACKOFF_MIN,
+            "a changed bundle starts over"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A TP engine spans `tp` devices from its group's first; past the group they belong to

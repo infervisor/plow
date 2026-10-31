@@ -167,9 +167,16 @@ async fn chat_completions_with(
         {
             if let Some(Err(e)) = ensured {
                 return match e {
-                    EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
+                    EnsureError::WontFit { .. }
+                    | EnsureError::SwitchTimeout(_)
+                    | EnsureError::Backoff { .. } => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        [("retry-after", "30")],
+                        [(
+                            "retry-after",
+                            e.retry_after()
+                                .map_or(30, |d| d.as_secs().max(1))
+                                .to_string(),
+                        )],
                         Json(serde_json::json!({"error": e.to_string()})),
                     )
                         .into_response(),

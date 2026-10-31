@@ -632,7 +632,9 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             Err(e @ EnsureError::WontFit { .. }) => err(StatusCode::CONFLICT, e),
             Err(e @ EnsureError::Unloaded) => err(StatusCode::CONFLICT, e),
             Err(EnsureError::Load(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-            Err(e @ EnsureError::SwitchTimeout(_)) => err(StatusCode::SERVICE_UNAVAILABLE, e),
+            Err(e @ (EnsureError::SwitchTimeout(_) | EnsureError::Backoff { .. })) => {
+                err(StatusCode::SERVICE_UNAVAILABLE, e)
+            }
         }
     }
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
@@ -781,7 +783,7 @@ async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Respo
             Err(e @ (EnsureError::WontFit { .. } | EnsureError::Unloaded)) => {
                 return err(StatusCode::CONFLICT, format_args!("{key}: {e}"))
             }
-            Err(e @ EnsureError::SwitchTimeout(_)) => {
+            Err(e @ (EnsureError::SwitchTimeout(_) | EnsureError::Backoff { .. })) => {
                 return err(StatusCode::SERVICE_UNAVAILABLE, format_args!("{key}: {e}"))
             }
             Err(EnsureError::Load(e)) => {
