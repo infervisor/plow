@@ -349,16 +349,32 @@ fi
 echo "[$(date -Is)] $LABEL ACQUIRED gpus=[$GOT] (waited ${W}s) pid=$$" >> "$LOG"
 
 # Own process group (job control), so the whole job tree stops with the lease: a killed
-# lease used to leave its servers on the card with no lease at all.
+# lease used to leave its servers on the card with no lease at all. A descendant that makes its
+# own group or session (timeout(1) without --foreground, setsid) escapes that kill and is
+# reparented to init once its parent dies, so every job process also carries GPULEASE_JOB and the
+# stop sweeps /proc for it: a soak's memcheck server once held 77 GiB for a minute after its lease.
+JOB_TOKEN="$$.$(proc_start $$)"
 set -m
-"$@" &
+GPULEASE_JOB="$JOB_TOKEN" "$@" &
 CHILD=$!
 set +m
+job_procs() {
+  grep -Flzx "GPULEASE_JOB=$JOB_TOKEN" /proc/[0-9]*/environ 2>/dev/null |
+    sed -n 's#^/proc/\([0-9]*\)/environ$#\1#p' | grep -vx "$$"
+}
+# Each pass re-scans, so a process forked after the previous scan is caught by the next one.
 stop_child() {
-  local i
-  kill -TERM -- "-$CHILD" 2>/dev/null || return 0
-  for i in $(seq 1 20); do kill -0 -- "-$CHILD" 2>/dev/null || return 0; sleep 0.5; done
-  kill -KILL -- "-$CHILD" 2>/dev/null
+  local i p sig=TERM
+  for i in $(seq 1 30); do
+    [ "$i" -gt 20 ] && sig=KILL
+    kill -"$sig" -- "-$CHILD" 2>/dev/null
+    p=$(job_procs)
+    [ -n "$p" ] && kill -"$sig" $p 2>/dev/null
+    if [ -z "$p" ] && ! kill -0 -- "-$CHILD" 2>/dev/null; then return 0; fi
+    sleep 0.5
+  done
+  echo "[$(date -Is)] $LABEL WARN job processes survived the stop: $(job_procs | tr '\n' ' ')" | tee -a "$LOG" >&2
+  return 0
 }
 STOPPED=""
 trap 'STOPPED=signal; stop_child' TERM INT HUP

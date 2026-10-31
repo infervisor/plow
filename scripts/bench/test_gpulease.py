@@ -68,6 +68,36 @@ def test_strays_left_by_the_command_are_stopped_with_the_lease(env, tmp_path):
     wait_for(lambda: not alive(int(pidfile.read_text())))
 
 
+def descendants(pid):
+    kids = []
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        kids += [int(k) for k in (task / "children").read_text().split()]
+    return kids + [d for k in kids for d in descendants(k)]
+
+
+@pytest.mark.parametrize("escape", ["setsid", "timeout 300"])
+def test_a_process_that_left_the_job_group_is_stopped_with_the_lease(env, tmp_path, escape):
+    # timeout(1) and setsid put their command in a new group, out of reach of the lease's
+    # group kill; once the job's shell exits the stray is reparented to init.
+    pidfile, groupfile = tmp_path / "pid", tmp_path / "group"
+    for label, tail in (("escape", "; sleep 300"), ("escape-exit", "")):
+        pidfile.unlink(missing_ok=True)
+        run = lease(env, label, "bash", "-c", f"echo $$ > {groupfile}; {escape} sleep 300 & echo $! > {pidfile}{tail}")
+        wait_for(lambda: pidfile.exists() and pidfile.read_text().strip())
+        stray = int(pidfile.read_text())
+        try:
+            if tail:
+                wait_for(lambda: os.getpgid(stray) != os.getpgid(int(groupfile.read_text())))
+            tree = [stray, *descendants(stray)]
+        except (ProcessLookupError, FileNotFoundError):
+            tree = [stray]  # the lease already ended and stopped it
+        if tail:
+            run.send_signal(signal.SIGTERM)
+        run.wait(30)
+        for pid in tree:
+            wait_for(lambda: not alive(pid))
+
+
 def test_hold_limit_preempts_only_when_someone_waits(env, tmp_path):
     alone = lease(env, "--max-hold", "1", "alone", "sleep", "4")
     assert alone.wait(30) == 0
