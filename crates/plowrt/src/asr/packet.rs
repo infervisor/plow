@@ -1,6 +1,7 @@
 //! `rnnt.greedy.v1` packets as a [`Transcriber`]: frontend, greedy decode, detokenizer and
 //! language all from the packet (ASR contract, `plow_asset::speech_contract`).
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -20,12 +21,23 @@ pub struct PacketRnntTranscriber {
     next_stream: u64,
 }
 
-/// One open encoder stream: the recording so far, the steps taken and the tokens decoded.
+/// One open encoder stream: the recording so far, the steps taken, the tokens decoded and the
+/// windows from `steps` on that a push cut for its later rounds (`cut_finish`: through the final).
 struct TranscriberStream {
     rnnt: RnntStream,
     samples: Vec<f32>,
     steps: usize,
     tokens: Vec<u32>,
+    cut: VecDeque<(Vec<f32>, usize)>,
+    cut_finish: bool,
+}
+
+impl TranscriberStream {
+    /// Whether `push` steps on through the windows already cut: it brings no audio and finishes
+    /// exactly when they run through the final (a superseded partial's stop short of it).
+    fn continues(&self, push: &StreamPush<'_>) -> bool {
+        push.samples.is_empty() && !self.cut.is_empty() && self.cut_finish == push.finish
+    }
 }
 
 impl PacketRnntTranscriber {
@@ -117,14 +129,13 @@ impl PacketRnntTranscriber {
 
     /// Each stream's mel frames from its next window on (`extract_partial`), the streams spread
     /// over the rayon pool.
-    fn next_frames(
+    fn next_frames<'a>(
         &self,
         w: &StreamWindows,
-        streams: &[(usize, TranscriberStream)],
+        streams: impl Iterator<Item = &'a TranscriberStream>,
     ) -> Vec<Result<(LogMelFeatures, usize)>> {
         let inputs: Vec<(&[f32], usize)> = streams
-            .iter()
-            .map(|(_, stream)| (stream.samples.as_slice(), window_start(w, stream.steps)))
+            .map(|stream| (stream.samples.as_slice(), window_start(w, stream.steps)))
             .collect();
         let frontend = &self.frontend;
         let extract = |&(samples, from): &(&[f32], usize)| frontend.extract_partial(samples, from);
@@ -168,6 +179,8 @@ impl Transcriber for PacketRnntTranscriber {
                 samples: Vec::new(),
                 steps: 0,
                 tokens: Vec::new(),
+                cut: VecDeque::new(),
+                cut_finish: false,
             },
         );
         Ok(Some(id))
@@ -187,6 +200,7 @@ impl Transcriber for PacketRnntTranscriber {
         stream.samples.extend_from_slice(samples);
         let windows = self.pending_windows(&self.streams[&id], false)?;
         let stream = self.streams.get_mut(&id).expect("present");
+        stream.cut.clear();
         for (window, _) in windows {
             let (output, before) = (&self.output, &stream.tokens);
             let tokens = self
@@ -210,6 +224,7 @@ impl Transcriber for PacketRnntTranscriber {
     }
 
     /// One window of every pushed stream with one left, in launches of `PacketRnnt::stream_batch`.
+    /// A push cuts its windows the round it joins; its later rounds step them.
     fn stream_push_round(&mut self, pushes: &[StreamPush<'_>]) -> Vec<Result<Option<String>>> {
         let (Some(w), Some(_)) = (self.execution.stream_windows(), self.stream_slots()) else {
             return crate::asr::push_alone(self, pushes);
@@ -228,24 +243,40 @@ impl Transcriber for PacketRnntTranscriber {
                 None => results[index] = Some(Err(rejected("unknown ASR stream"))),
             }
         }
-        let frames = self.next_frames(&w, &active);
+        let recut: Vec<bool> = active
+            .iter()
+            .map(|(index, stream)| !stream.continues(&pushes[*index]))
+            .collect();
+        let cutting = active.iter().zip(&recut).filter(|(_, recut)| **recut);
+        let mut frames = self
+            .next_frames(&w, cutting.map(|((_, stream), _)| stream))
+            .into_iter();
         // (push, stream, its next window and rows, whether it is the last)
         let mut stepping = Vec::with_capacity(active.len());
         let mut done = Vec::new();
-        for ((index, stream), frames) in active.into_iter().zip(frames) {
-            let windows = frames
-                .and_then(|frames| self.windows(&w, stream.steps, frames, pushes[index].finish));
-            match windows {
-                Ok(windows) if !windows.is_empty() => {
-                    let last = windows.len() == 1;
-                    let next = windows.into_iter().next().expect("a window");
+        for ((index, mut stream), recut) in active.into_iter().zip(recut) {
+            if recut {
+                let finish = pushes[index].finish;
+                let windows = frames
+                    .next()
+                    .expect("frames per cut")
+                    .and_then(|frames| self.windows(&w, stream.steps, frames, finish));
+                match windows {
+                    Ok(windows) => (stream.cut, stream.cut_finish) = (windows.into(), finish),
+                    Err(error) => {
+                        stream.cut.clear();
+                        results[index] = Some(Err(error));
+                        done.push((index, stream));
+                        continue;
+                    }
+                }
+            }
+            match stream.cut.pop_front() {
+                Some(next) => {
+                    let last = stream.cut.is_empty();
                     stepping.push((index, stream, next, last));
                 }
-                Ok(_) => done.push((index, stream)),
-                Err(error) => {
-                    results[index] = Some(Err(error));
-                    done.push((index, stream));
-                }
+                None => done.push((index, stream)),
             }
         }
         let mel_us = started.elapsed().as_micros() as u64;
@@ -268,7 +299,8 @@ impl Transcriber for PacketRnntTranscriber {
                 Err(error) => {
                     let message = error.to_string();
                     let mut error = Some(error);
-                    for (index, ..) in launch.iter() {
+                    for (index, stream, ..) in launch.iter_mut() {
+                        stream.cut.clear();
                         let error = error
                             .take()
                             .unwrap_or_else(|| RuntimeError::Msg(message.clone()));
