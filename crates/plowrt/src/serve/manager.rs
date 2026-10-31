@@ -781,8 +781,10 @@ pub struct ModelManager {
     /// slug → its last failed load (other than out of memory). Demand loads back off before
     /// evicting anyone: a deterministic failure otherwise took a healthy co-tenant down on every
     /// request. A success, an explicit load or deregistration clears it.
-    failed: Mutex<FxHashMap<String, LoadFailure>>,
+    failed: Failures,
 }
+
+type Failures = Arc<Mutex<FxHashMap<String, LoadFailure>>>;
 
 /// A failed load and when the next demand load may retry it.
 #[derive(Clone, Debug)]
@@ -790,25 +792,45 @@ struct LoadFailure {
     why: String,
     at: Instant,
     delay: Duration,
-    /// [`bundle_stamp`] at the failure: a changed bundle retries at once.
+    /// [`bundle_stamp`] at the failure: a changed bundle retries.
     stamp: u64,
-    /// When a refused request last re-read the stamp (at most every [`STAMP_EVERY`]).
+    /// Identifies this failure: a background stamp re-read applies only to the failure it was
+    /// taken for, never to a newer one recorded meanwhile.
+    gen: u64,
+    /// When the last background re-read of the stamp started (at most every [`STAMP_EVERY`]).
     checked: Instant,
+    /// A re-read is in flight (one per model).
+    refreshing: bool,
 }
 
-/// How often a refused request re-reads the bundle's files (a directory walk on the request
-/// thread).
+/// How often a refused request starts a background re-read of the bundle's files.
 const STAMP_EVERY: Duration = Duration::from_secs(5);
+
+static FAILURE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Apply a re-read `stamp` of `slug`'s bundle files taken for failure `gen`: a changed bundle
+/// forgets that failure, so the next demand load retries it. A newer failure is left alone.
+fn apply_stamp(failed: &Mutex<FxHashMap<String, LoadFailure>>, slug: &str, gen: u64, stamp: u64) {
+    let mut failed = failed.lock();
+    let Some(f) = failed.get_mut(slug).filter(|f| f.gen == gen) else {
+        return;
+    };
+    if f.stamp == stamp {
+        f.refreshing = false;
+    } else {
+        failed.remove(slug);
+    }
+}
 
 const LOAD_BACKOFF_MIN: Duration = Duration::from_secs(30);
 const LOAD_BACKOFF_MAX: Duration = Duration::from_secs(600);
 
 /// Name, size and mtime of every file directly in the bundle and checkpoint dirs, hashed: a
 /// bundle being copied or replaced changes it.
-fn bundle_stamp(m: &Managed) -> u64 {
+fn bundle_stamp(dir: &Path, ckpt: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for dir in [&m.dir, &m.ckpt] {
+    for dir in [dir, ckpt] {
         let Ok(rd) = std::fs::read_dir(dir) else {
             continue;
         };
@@ -919,7 +941,7 @@ impl ModelManager {
             budget,
             last_switch: Mutex::new(None),
             growing: std::sync::atomic::AtomicBool::new(false),
-            failed: Mutex::default(),
+            failed: Failures::default(),
             runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
@@ -1700,7 +1722,10 @@ impl ModelManager {
         let r = self.load_model_once(m).await;
         match &r {
             Err(EnsureError::Load(e)) if !is_oom(e) => {
-                let stamp = bundle_stamp(m);
+                let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
+                let stamp = tokio::task::spawn_blocking(move || bundle_stamp(&dir, &ckpt))
+                    .await
+                    .unwrap_or_default();
                 let mut failed = self.failed.lock();
                 // Doubles per failure of the same bundle files; a changed bundle starts over.
                 let delay = match failed.get(&m.slug) {
@@ -1715,7 +1740,9 @@ impl ModelManager {
                         at: Instant::now(),
                         delay,
                         stamp,
+                        gen: FAILURE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         checked: Instant::now(),
+                        refreshing: false,
                     },
                 );
             }
@@ -1727,31 +1754,29 @@ impl ModelManager {
         r
     }
 
-    /// `Err(Backoff)` while `m`'s last failed load is inside its backoff and its bundle files are
-    /// unchanged; a demand load may try it otherwise.
+    /// `Err(Backoff)` while `m`'s last failed load is inside its backoff; a demand load may try
+    /// it otherwise. Never touches the filesystem: every [`STAMP_EVERY`] it starts one background
+    /// re-read of the bundle's files, and a changed bundle is retried once that lands.
     fn load_backoff(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
-        let (why, left, stamp) = {
-            let mut failed = self.failed.lock();
-            let Some(f) = failed.get_mut(&m.slug) else {
-                return Ok(());
-            };
-            let left = f.delay.saturating_sub(f.at.elapsed());
-            if left.is_zero() {
-                return Ok(());
-            }
-            let restat = f.checked.elapsed() >= STAMP_EVERY;
-            if restat {
-                f.checked = Instant::now();
-            }
-            (f.why.clone(), left, restat.then_some(f.stamp))
+        let mut failed = self.failed.lock();
+        let Some(f) = failed.get_mut(&m.slug) else {
+            return Ok(());
         };
-        if stamp.is_some_and(|s| bundle_stamp(m) != s) {
-            // A changed bundle is a new one: forget the failure (its retry starts over).
-            self.failed.lock().remove(&m.slug);
+        let left = f.delay.saturating_sub(f.at.elapsed());
+        if left.is_zero() {
             return Ok(());
         }
+        if !f.refreshing && f.checked.elapsed() >= STAMP_EVERY {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                f.refreshing = true;
+                f.checked = Instant::now();
+                let (map, slug, gen) = (Arc::clone(&self.failed), m.slug.clone(), f.gen);
+                let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
+                rt.spawn_blocking(move || apply_stamp(&map, &slug, gen, bundle_stamp(&dir, &ckpt)));
+            }
+        }
         Err(EnsureError::Backoff {
-            why,
+            why: f.why.clone(),
             retry_after: left,
         })
     }
@@ -2123,7 +2148,7 @@ mod tests {
             budget: None,
             last_switch: Mutex::new(None),
             growing: std::sync::atomic::AtomicBool::new(false),
-            failed: Mutex::default(),
+            failed: Failures::default(),
             runtime: None,
         });
         (state, mgr)
@@ -2192,20 +2217,29 @@ mod tests {
             assert_eq!(delay(&mgr), want);
         }
         assert_eq!(want, LOAD_BACKOFF_MAX);
-        // The copy finishes: the file grew, so the next request retries inside the backoff.
+        // The copy finishes: the file grew. Inside the re-read interval nothing reads it.
         std::fs::write(dir.join("model.pkt"), b"partial, now complete").unwrap();
-        assert!(
-            matches!(
-                mgr.ensure_resident("m").await,
-                Err(EnsureError::Backoff { .. })
-            ),
-            "the files are re-read at most every STAMP_EVERY"
-        );
-        {
-            let mut f = mgr.failed.lock();
-            let f = f.get_mut("m").unwrap();
-            f.checked = Instant::now().checked_sub(STAMP_EVERY).unwrap();
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Backoff { .. })
+        ));
+        assert!(!mgr.failed.lock()["m"].refreshing);
+        // Past it, the request still sheds at once and starts the one background re-read.
+        mgr.failed.lock().get_mut("m").unwrap().checked =
+            Instant::now().checked_sub(STAMP_EVERY).unwrap();
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Backoff { .. })
+        ));
+        // The re-read lands: the changed bundle's failure is forgotten, the next request retries
+        // and a new failure starts over.
+        for _ in 0..500 {
+            if !mgr.failed.lock().contains_key("m") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(!mgr.failed.lock().contains_key("m"));
         assert!(matches!(
             mgr.ensure_resident("m").await,
             Err(EnsureError::Load(_))
@@ -2216,6 +2250,63 @@ mod tests {
             "a changed bundle starts over"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stamp re-read applies only to the failure it was taken for: one landing after a newer
+    /// failure was recorded (the old one expired and the retry failed again) leaves it alone.
+    #[test]
+    fn a_stale_stamp_reread_never_clears_a_newer_failure() {
+        let failed = Failures::default();
+        let record = |gen, stamp| LoadFailure {
+            why: "bad".into(),
+            at: Instant::now(),
+            delay: LOAD_BACKOFF_MIN,
+            stamp,
+            gen,
+            checked: Instant::now(),
+            refreshing: true,
+        };
+        failed.lock().insert("m".into(), record(2, 7));
+        apply_stamp(&failed, "m", 1, 8);
+        let f = failed.lock()["m"].clone();
+        assert!((f.gen, f.stamp, f.refreshing) == (2, 7, true), "{f:?}");
+        apply_stamp(&failed, "m", 2, 7);
+        assert!(
+            !failed.lock()["m"].refreshing,
+            "unchanged: the next re-read may run"
+        );
+        apply_stamp(&failed, "m", 2, 8);
+        assert!(
+            failed.lock().is_empty(),
+            "changed: the failure is forgotten"
+        );
+        apply_stamp(&failed, "m", 2, 8);
+        assert!(failed.lock().is_empty());
+    }
+
+    /// While a re-read is in flight no request starts another, and none waits for it.
+    #[tokio::test]
+    async fn one_stamp_reread_per_model_is_in_flight() {
+        let (_state, mgr) = failing_manager(Path::new("/nonexistent"));
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Load(_))
+        ));
+        let past = Instant::now().checked_sub(STAMP_EVERY).unwrap();
+        {
+            let mut f = mgr.failed.lock();
+            let f = f.get_mut("m").unwrap();
+            (f.refreshing, f.checked) = (true, past);
+        }
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Backoff { .. })
+        ));
+        let f = mgr.failed.lock()["m"].clone();
+        assert!(
+            f.refreshing && f.checked == past,
+            "no second re-read started: {f:?}"
+        );
     }
 
     /// A TP engine spans `tp` devices from its group's first; past the group they belong to
