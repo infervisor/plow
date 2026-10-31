@@ -693,3 +693,93 @@ fn unload_drain_defaults_to_a_bounded_drain() {
         assert_eq!(unload_drain(None), Some(Duration::from_secs(30)));
     }
 }
+
+/// Two slugs registered from one bundle dir: one's rollback (its load failed) must never clear
+/// the dir's checkpoint pairing while the other sits between pairing and registry publication,
+/// or the other reads its tokenizer and config from a fallback checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollback_never_unpairs_a_bundle_another_slug_is_registering() {
+    use plowrt::serve::admin::{forget_checkpoint, pair_and_publish};
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("plowrt_pairing_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    common::write_bundle(&base.join("bundle"), "shared");
+    let dir = base.join("bundle").canonicalize().unwrap();
+    let ckpt = base.join("requested-checkpoint");
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let state = Arc::new(AppState::new(Registry::new(), execset));
+    for round in 0..1000 {
+        // `a` registers and rolls back (its load failed) while `b` registers from the same dir.
+        let failing = {
+            let (state, dir, ckpt) = (Arc::clone(&state), dir.clone(), ckpt.clone());
+            tokio::spawn(async move {
+                for _ in 0..4 {
+                    pair_and_publish(&state, &dir, &ckpt, "a").await.unwrap();
+                    state.registry.unload("a").unwrap();
+                    forget_checkpoint(&state, &dir).await;
+                }
+            })
+        };
+        let registering = {
+            let (state, dir, ckpt) = (Arc::clone(&state), dir.clone(), ckpt.clone());
+            tokio::spawn(async move { pair_and_publish(&state, &dir, &ckpt, "b").await })
+        };
+        failing.await.unwrap();
+        registering.await.unwrap().unwrap();
+        assert_eq!(
+            plowrt::asset::serve::checkpoint_dir(&dir),
+            ckpt,
+            "round {round}: b is registered but its pairing was cleared"
+        );
+        state.registry.unload("b").unwrap();
+        forget_checkpoint(&state, &dir).await;
+        assert_ne!(plowrt::asset::serve::checkpoint_dir(&dir), ckpt);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The interleaving itself, held open: a slug paired but not yet published keeps the pairing
+/// lock, and a rollback's forget waits for it, then finds the slug published and keeps the pairing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollback_waits_for_a_pending_pairing() {
+    use plowrt::serve::admin::{forget_checkpoint, pairing_lock};
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("plowrt_pending_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    common::write_bundle(&base.join("bundle"), "shared");
+    let dir = base.join("bundle").canonicalize().unwrap();
+    let ckpt = base.join("requested-checkpoint");
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let state = Arc::new(AppState::new(Registry::new(), execset));
+
+    // The rollback names the dir through a symlink (a store reached via a linked home): the
+    // same pairing, so the same lock.
+    let linked = base.join("linked");
+    std::os::unix::fs::symlink(&dir, &linked).unwrap();
+    let pending = pairing_lock(&dir).await;
+    plowrt::asset::serve::set_checkpoint(&dir, &ckpt).unwrap();
+    let rollback = {
+        let (state, linked) = (Arc::clone(&state), linked.clone());
+        tokio::spawn(async move { forget_checkpoint(&state, &linked).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !rollback.is_finished(),
+        "the rollback waits for the pending registration"
+    );
+    assert_eq!(plowrt::asset::serve::checkpoint_dir(&dir), ckpt);
+    state.registry.load(&dir, Some("b".into())).unwrap();
+    drop(pending);
+    rollback.await.unwrap();
+    assert_eq!(
+        plowrt::asset::serve::checkpoint_dir(&dir),
+        ckpt,
+        "b is published from the dir: its pairing stays"
+    );
+    state.registry.unload("b").unwrap();
+    forget_checkpoint(&state, &linked).await;
+    assert_ne!(plowrt::asset::serve::checkpoint_dir(&dir), ckpt);
+    let _ = std::fs::remove_dir_all(&base);
+}
