@@ -469,9 +469,173 @@ async fn load_without_assets_field_finds_local_bundle_under_models_root() {
 }
 
 #[tokio::test]
-async fn load_without_assets_field_reports_clear_error_when_model_does_not_exist() {
+async fn load_without_assets_field_and_no_models_root_is_refused() {
     let resp = post("/v1/models/load", r#"{"model":"non-existent-anywhere"}"#).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body = body_string(resp).await;
-    assert!(body.contains("not found locally") || body.contains("unknown model"));
+    assert!(body.contains("no --models-root"), "{body}");
+}
+
+/// A root holding one loadable bundle, `inside`, plus a bundle `outside` it, and an admin
+/// router whose only allow-list entry is the root.
+fn rooted(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, axum::Router) {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("plowrt_roots_{tag}_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("root");
+    let outside = base.join("outside");
+    common::write_bundle(&root.join("inside"), "inside");
+    common::write_bundle(&outside, "outside");
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let state = Arc::new(AppState::new(Registry::new(), execset));
+    state.install_models_roots(vec![root.clone()]);
+    (root, outside, plowrt::serve::admin_app(state))
+}
+
+async fn load_model(router: axum::Router, model: &str) -> (StatusCode, String) {
+    let body = serde_json::json!({ "model": model }).to_string();
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_string(resp).await)
+}
+
+/// `model` without `assets` names a bundle UNDER a root. An absolute path, a `..` walk and a
+/// symlink out of the root used to be loaded from wherever they pointed — executing its cubins
+/// with the allow-list never consulted. Reaching the manager stage (501 here, no GPU) is the
+/// tell that the path was accepted.
+#[tokio::test]
+async fn load_by_name_never_leaves_the_models_roots() {
+    let (root, outside, router) = rooted("escape");
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    let absolute = outside.display().to_string();
+    for model in [
+        absolute.as_str(),
+        "../outside",
+        "inside/../../outside",
+        "link",
+    ] {
+        let (status, body) = load_model(router.clone(), model).await;
+        assert!(
+            status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+            "{model}: {status} {body}"
+        );
+        assert!(
+            !body.contains("no model manager"),
+            "{model} was accepted: {body}"
+        );
+    }
+    let (status, body) = load_model(router, "inside").await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// An explicit `assets` dir is held to the same test, symlinks included.
+#[tokio::test]
+async fn load_with_assets_through_a_symlink_out_of_the_root_is_refused() {
+    let (root, outside, router) = rooted("assets-link");
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    let body = serde_json::json!({
+        "model": "m", "assets": root.join("link").display().to_string()
+    })
+    .to_string();
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// A `checkpoint` override is read by the load (weights, tokenizer, templates): it must sit
+/// under a root like the assets dir, whether the bundle is named by `assets` or by name.
+#[tokio::test]
+async fn a_checkpoint_override_outside_the_roots_is_refused() {
+    let (root, outside, router) = rooted("ckpt");
+    std::fs::create_dir_all(root.join("ckpt")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("ckpt-link")).unwrap();
+    let inside = root.join("inside").display().to_string();
+    let send = |body: serde_json::Value| {
+        let router = router.clone();
+        async move {
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/models/load")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, body_string(resp).await)
+        }
+    };
+    for ckpt in [
+        outside.display().to_string(),
+        root.join("ckpt-link").display().to_string(),
+        root.join("../outside").display().to_string(),
+    ] {
+        for body in [
+            serde_json::json!({"model": "m", "assets": inside, "checkpoint": ckpt}),
+            serde_json::json!({"model": "inside", "checkpoint": ckpt}),
+        ] {
+            let (status, text) = send(body.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}: {text}");
+        }
+    }
+    let ok = root.join("ckpt").display().to_string();
+    let (status, text) =
+        send(serde_json::json!({"model": "m", "assets": inside, "checkpoint": ok})).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{text}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// The startup allow-list: `--models-root`, the parents of the `--assets` dirs (a single-asset
+/// serve reaches its siblings with no flag), the store's `bundles/` — and never the working
+/// directory, whatever it is.
+#[test]
+fn startup_models_roots_are_explicit_roots_asset_parents_and_the_store() {
+    use plowrt::serve::admin::startup_models_roots;
+    use std::path::PathBuf;
+    let cwd = std::env::current_dir().unwrap();
+    let single = startup_models_roots(&[], &[PathBuf::from("/srv/models/e4b")], None);
+    assert_eq!(single, vec![PathBuf::from("/srv/models")]);
+    let all = startup_models_roots(
+        &["/data/roots".into()],
+        &[
+            PathBuf::from("/srv/models/e4b"),
+            PathBuf::from("/srv/models/g12"),
+        ],
+        Some(PathBuf::from("/home/u/.plow/bundles")),
+    );
+    assert_eq!(
+        all,
+        vec![
+            PathBuf::from("/data/roots"),
+            PathBuf::from("/srv/models"),
+            PathBuf::from("/home/u/.plow/bundles"),
+        ]
+    );
+    assert!(startup_models_roots(&[], &[], None).is_empty());
+    assert!(!all.contains(&cwd) && !all.contains(&cwd.join("models")));
 }

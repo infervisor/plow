@@ -474,6 +474,9 @@ fn run_streams(
             if let Some(index) = streams.iter().position(|o| o.id == id) {
                 if job.finish {
                     streams.swap_remove(index);
+                } else if result.is_err() {
+                    // The stream's state is unknown: the next partial reopens it from the start.
+                    engine.stream_close(streams.swap_remove(index).id);
                 } else {
                     streams[index].pushed = job.samples.len();
                 }
@@ -2958,6 +2961,73 @@ mod tests {
         );
         let log = log.lock();
         assert_eq!(log.pushed, [(1, 100), (1, 150), (2, 50)]);
+        assert_eq!(log.closed, [1]);
+    }
+
+    #[tokio::test]
+    async fn cohort_reopens_a_stream_whose_push_failed() {
+        #[derive(Default)]
+        struct Log {
+            opened: u64,
+            pushed: Vec<(u64, usize)>,
+            closed: Vec<u64>,
+        }
+        struct Failing(Arc<parking_lot::Mutex<Log>>);
+        impl Transcriber for Failing {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                unreachable!("partials stream")
+            }
+            fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+                let mut log = self.0.lock();
+                log.opened += 1;
+                Ok(Some(log.opened))
+            }
+            fn stream_push(
+                &mut self,
+                id: u64,
+                samples: &[f32],
+                _: &mut dyn FnMut(&str),
+            ) -> crate::Result<String> {
+                let mut log = self.0.lock();
+                log.pushed.push((id, samples.len()));
+                if log.pushed.len() == 2 {
+                    return Err(crate::RuntimeError::Msg("step failed".into()));
+                }
+                Ok(format!("stream {id}"))
+            }
+            fn stream_close(&mut self, id: u64) {
+                self.0.lock().closed.push(id);
+            }
+        }
+        let log = Arc::new(parking_lot::Mutex::new(Log::default()));
+        let (mux, _, _) = AsrMux::spawn(Box::new(Failing(log.clone())));
+        let recording: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
+        let run = |samples: usize| {
+            mux.submit_with(
+                vec![0.0; samples],
+                None,
+                String::new(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Some(Arc::downgrade(&recording)),
+                false,
+            )
+            .unwrap()
+        };
+        assert_eq!(run(100).await.unwrap().unwrap().text, "stream 1");
+        assert!(run(250).await.unwrap().is_err());
+        assert_eq!(run(300).await.unwrap().unwrap().text, "stream 2");
+        let log = log.lock();
+        assert_eq!(log.pushed, [(1, 100), (1, 150), (2, 300)]);
         assert_eq!(log.closed, [1]);
     }
 

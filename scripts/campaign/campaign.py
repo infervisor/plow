@@ -1641,7 +1641,8 @@ def cmd_rung_sweep(a: argparse.Namespace) -> None:
         (out / "choice.json").write_text(json.dumps(choice, indent=1) + "\n")
         (out / "choice.md").write_text(rung_sweep.table(choice))
         (out / "resources.md").write_text(rung_sweep.resource_table(res))
-        (out / "recipe-snippet.toml").write_text(rung_sweep.snippet(choice, r))
+        (out / "recipe-snippet.toml").write_text(
+            rung_sweep.snippet(choice, r, [str(out / "choice.json"), str(out / "resources.md")]))
         print((out / "choice.md").read_text())
         print(f"rung-sweep: {out / 'choice.json'}, {out / 'resources.md'}, {out / 'recipe-snippet.toml'}")
         return

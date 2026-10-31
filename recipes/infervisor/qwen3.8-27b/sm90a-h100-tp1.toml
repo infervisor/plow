@@ -312,6 +312,11 @@ gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one sh
 # cell 415 total tok/s, TPOT p99 19.97 ms, TTFT p99 242 ms. Wins TTFT P99 (0.48x) and memory; loses
 # throughput (0.87x) and TPOT (1.19x) here and in every wider cell (c32 0.67x, c64 0.58x: the 40 ms
 # B32 step, ladder tops at 48 slots).
+[rung_choices.PLOW_EMIT_ATTN_LIBRARY]
+# Library vs declared native role, every prefill rung (see the PLOW_BUILD_FA4_* comment above).
+label = "qualified"
+evidence = ["lib-attn2 2026-10-29 plowrt a50a58555, packet 48cf345c9314: chunk 4096/1024/512/128 1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/3.996 s; FP32 gate c1/c8/c32 PASS", "docs/bringup/results/qwen38-27b-h100/comparison.md", "docs/arch/28-library-attention.md"]
+
 [measured]
 tok_s = 40.9
 p50_tpot_ms = 23.8

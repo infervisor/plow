@@ -237,8 +237,8 @@ isolated block, including ragged rungs, before full-model accuracy and matched s
 unmeasured rung or a correctness/resource failure keeps the candidate experimental.
 
 **Per-rung knob values.** An emit knob that only picks a rung program's op or library route is
-declared rung-eligible in `crates/devgen/src/knob_spec.rs` (`.per_rung(&["prefill"])`; today only
-`PLOW_NO_GLU_FUSE`). Choose it per rung, not packet-wide:
+declared rung-eligible in `crates/devgen/src/knob_spec.rs` (`.per_rung(...)`; today
+`PLOW_NO_GLU_FUSE` and `PLOW_EMIT_ATTN_LIBRARY`). Choose it per rung, not packet-wide:
 `campaign.py rung-sweep <recipe> --knob K --values 0,1 --stage build|run|score|verify`
 (`scripts/campaign/README.md`, "Per-rung knob choices") times every rung in every value arm in one
 queue job, compares the same launches' logits, lists object resources and writes the
@@ -248,6 +248,9 @@ mixed-rung emit test (`crates/devgen/tests/rung_env.rs`). The score labels a cho
 unless accuracy is accepted (bitwise, or `--kl-max` + `--top1-min`), the arms' objects show no
 spills, and `--roofline` / `--library-resources` records are given; only `qualified` choices go
 into a production recipe, and the mixed packet then needs its own full gates (FP32 included).
+A `validated` recipe that states a rung-eligible knob (packet-wide or per rung) carries
+`[rung_choices.<KNOB>]` with `label = "qualified"` and the measurement as `evidence`; the snippet
+writes it and `check_recipe.py` refuses a validated recipe without it.
 
 Store tuning evidence with source and object SHA256s, exact compiler/cubin flags, launch geometry,
 device/compiler versions, shape/precision and correctness results. A Git commit is useful
