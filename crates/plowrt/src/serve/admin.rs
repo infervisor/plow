@@ -69,6 +69,10 @@ pub struct UnloadRequest {
     /// Select the rank by the device its group starts at.
     #[serde(default)]
     pub device: Option<u32>,
+    /// Drain timeout in milliseconds for in-flight requests. `Some(0)` preempts immediately;
+    /// unset defaults to bounded drain via `PLOW_DRAIN_TIMEOUT_MS` (or 30 s).
+    #[serde(default)]
+    pub drain_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,7 +172,6 @@ pub(super) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
-#[cfg(feature = "cuda")]
 const MIB: u64 = 1 << 20;
 
 /// Resolve a requested assets dir against the `--models-root` allow-list.
@@ -177,12 +180,8 @@ const MIB: u64 = 1 << 20;
 /// symlinks cannot walk out of a root. An empty allow-list refuses everything
 /// rather than defaulting open.
 fn resolve_assets(state: &AppState, dir: &str) -> std::result::Result<PathBuf, Response> {
-    let roots = state.models_roots();
-    if roots.is_empty() {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            "no --models-root is configured, so no assets dir may be loaded by request",
-        ));
+    if state.models_roots().is_empty() {
+        return Err(no_roots());
     }
     let canon = PathBuf::from(dir).canonicalize().map_err(|e| {
         err(
@@ -190,6 +189,36 @@ fn resolve_assets(state: &AppState, dir: &str) -> std::result::Result<PathBuf, R
             format_args!("assets dir {dir}: {e}"),
         )
     })?;
+    authorize(state, canon)
+}
+
+/// The allow-list a serve starts with: every `--models-root`, the parents of the assets dirs
+/// it was started with (two bundles side by side need no flag), and the local store's
+/// `bundles/`, where signature-checked pulls land. Never the working directory: started in `/`
+/// (systemd's default) that made every directory on the host loadable.
+pub fn startup_models_roots(
+    explicit: &[String],
+    assets: &[PathBuf],
+    store_bundles: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = explicit.iter().map(PathBuf::from).collect();
+    roots.extend(assets.iter().filter_map(|a| a.parent().map(PathBuf::from)));
+    roots.extend(store_bundles);
+    roots.dedup();
+    roots
+}
+
+fn no_roots() -> Response {
+    err(
+        StatusCode::FORBIDDEN,
+        "no --models-root is configured, so no assets dir may be loaded by request",
+    )
+}
+
+/// The one allow-list test every assets dir a load names or finds must pass: `canon` (already
+/// canonical) sits under a `--models-root`.
+fn authorize(state: &AppState, canon: PathBuf) -> std::result::Result<PathBuf, Response> {
+    let roots = state.models_roots();
     if !roots.iter().any(|r| canon.starts_with(r)) {
         return Err(err(
             StatusCode::FORBIDDEN,
@@ -207,6 +236,284 @@ fn resolve_assets(state: &AppState, dir: &str) -> std::result::Result<PathBuf, R
     Ok(canon)
 }
 
+fn find_local_bundle(
+    state: &AppState,
+    model: &str,
+    req_checkpoint: Option<&str>,
+) -> Option<(PathBuf, PathBuf)> {
+    let has_model_files = |dir: &std::path::Path| {
+        dir.is_dir()
+            && (dir.join("manifest.toml").is_file()
+                || dir.join("weights.json").is_file()
+                || dir.join("config.json").is_file()
+                || dir.join("s3gen.pkt").is_file()
+                || dir.join("codec.pkt").is_file())
+    };
+
+    // A NAME under a root, never a path: an absolute `model` would replace the root in `join`,
+    // and the canonical result must still sit under a root (no `..` or symlink out).
+    let roots = state.models_roots();
+    let model_path = std::path::Path::new(model);
+    if model_path.is_relative() {
+        for root in roots {
+            let Ok(canon) = root.join(model_path).canonicalize() else {
+                continue;
+            };
+            if roots.iter().any(|r| canon.starts_with(r)) && has_model_files(&canon) {
+                let ckpt = req_checkpoint
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&canon));
+                return Some((canon, ckpt));
+            }
+        }
+    }
+
+    if let Ok(st) = crate::dist::Store::open_default() {
+        if let Ok(r) = crate::dist::reference::parse(model) {
+            if let Some(variant_id) = st.pinned(&r.pin_key()) {
+                let bdir = st.root().join("bundles").join(&variant_id);
+                if has_model_files(&bdir) {
+                    let ckpt = req_checkpoint
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&bdir));
+                    return Some((bdir, ckpt));
+                }
+            }
+        }
+        for p in st.list() {
+            if p.reference == model || p.reference.ends_with(&format!("/{}", model)) {
+                if has_model_files(&p.dir) {
+                    let ckpt = req_checkpoint
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&p.dir));
+                    return Some((p.dir, ckpt));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "dist")]
+async fn fetch_from_pdist_and_hf(
+    state: &AppState,
+    model: &str,
+    req_checkpoint: Option<&str>,
+) -> std::result::Result<(PathBuf, PathBuf), String> {
+    let model_str = model.to_string();
+    let req_ckpt = req_checkpoint.map(|s| s.to_string());
+    let backend = state.execset.backend().clone();
+
+    tokio::task::spawn_blocking(move || -> std::result::Result<(PathBuf, PathBuf), String> {
+        let mut r = crate::dist::reference::parse(&model_str)
+            .map_err(|e| format!("parse model reference {model_str:?}: {e}"))?;
+        if r.registry == crate::dist::reference::DEFAULT_REGISTRY {
+            r.registry = crate::config::RuntimeConfig::get().registry.clone();
+        }
+
+        let f = crate::dist::transport(&r.registry)
+            .map_err(|e| format!("connect to registry {}: {e}", r.registry))?;
+        let st = crate::dist::Store::open_default()
+            .map_err(|e| format!("open store: {e}"))?;
+        let _lock = st.lock().map_err(|e| format!("lock store: {e}"))?;
+
+        let live = crate::dist::live_target(&[backend]);
+        let trust = crate::dist::sign::Trust::for_registry(
+            crate::config::RuntimeConfig::signing_env().1.as_deref(),
+            &r.registry,
+        ).map_err(|e| format!("verify trust for {}: {e}", r.registry))?;
+
+        let c = plow_asset::dist::Constraints::default();
+        let resolved = crate::dist::pull::resolve_trusted(&*f, &r, &live, c, &trust)
+            .map_err(|e| format!("resolve variant for {model_str} from {}: {e}", r.registry))?;
+
+        let (dir, t) = crate::dist::pull::pull(&st, &*f, &resolved)
+            .map_err(|e| format!("pull bundle for {model_str}: {e}"))?;
+        tracing::info!(model = %model_str, transfer = %t, dir = %dir.display(), "pulled bundle from pdist");
+
+        let dist_snapshot = (resolved.bundle.checkpoint.source == plow_asset::dist::DIST_SOURCE)
+            .then(|| crate::dist::weights::dist_snapshot_path(st.root(), &resolved.bundle))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+
+        let ckpt = req_ckpt
+            .map(PathBuf::from)
+            .or_else(|| crate::config::RuntimeConfig::get().checkpoint.clone().map(PathBuf::from))
+            .or(dist_snapshot)
+            .unwrap_or_else(|| crate::dist::prepare::farm_path(st.root(), &resolved.bundle));
+
+        let ckpt = if ckpt.is_dir() {
+            ckpt
+        } else if resolved.bundle.checkpoint.source.starts_with("hf:") {
+            let c = &resolved.bundle.checkpoint;
+            tracing::info!(
+                source = %c.source,
+                revision = %c.revision,
+                shards = c.shards,
+                "fetching checkpoint weights from Hugging Face"
+            );
+            crate::dist::weights::fetch(st.root(), &c.source, &c.revision, c.shards)
+                .map_err(|e| format!("fetch Hugging Face weights {}: {e}", c.source))?
+        } else {
+            return Err(format!(
+                "{} needs checkpoint {}, but it is not available locally or on Hugging Face",
+                model_str, resolved.bundle.checkpoint.source
+            ));
+        };
+
+        let farm = crate::dist::prepare::build(st.root(), &resolved.bundle, &dir, &ckpt)
+            .map_err(|e| format!("build checkpoint farm for {model_str}: {e}"))?;
+
+        let _ = st.pin(&r.pin_key(), &resolved.variant.variant_id);
+        tracing::info!(
+            model = %model_str,
+            bundle = %dir.display(),
+            checkpoint = %farm.dir.display(),
+            shards = farm.shards,
+            "prepared model bundle and checkpoint"
+        );
+        Ok((dir, farm.dir))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+}
+
+#[cfg(not(feature = "dist"))]
+async fn fetch_from_pdist_and_hf(
+    _state: &AppState,
+    model: &str,
+    _req_checkpoint: Option<&str>,
+) -> std::result::Result<(PathBuf, PathBuf), String> {
+    Err(format!(
+        "model {model:?} is not available locally; downloading from pdist and Hugging Face requires plowrt built with --features dist"
+    ))
+}
+
+/// A bundle for an unregistered `model` named without `assets`: a local one, else a pdist pull.
+/// Either way the directory passes [`authorize`] — a path in `model` (absolute, relative to the
+/// working directory, or `..` out of a root) is held to the same allow-list as `assets`, and a pull
+/// is refused before any download when the store it lands in is not under a root.
+async fn resolve_or_fetch_assets(
+    state: &AppState,
+    model: &str,
+    req_checkpoint: Option<&str>,
+) -> std::result::Result<(PathBuf, PathBuf), Response> {
+    if state.models_roots().is_empty() {
+        return Err(no_roots());
+    }
+    if let Some((dir, ckpt)) = find_local_bundle(state, model, req_checkpoint) {
+        return Ok((authorize(state, dir)?, ckpt));
+    }
+    if let Ok(st) = crate::dist::Store::open_default() {
+        let bundles = st.root().join("bundles");
+        let bundles = bundles.canonicalize().unwrap_or(bundles);
+        authorize(state, bundles)?;
+    }
+    let (dir, ckpt) = fetch_from_pdist_and_hf(state, model, req_checkpoint)
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::NOT_FOUND,
+                format_args!(
+                    "model {model:?} not registered, not found locally, and download failed: {e}"
+                ),
+            )
+        })?;
+    let dir = dir.canonicalize().map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format_args!("{}: {e}", dir.display()),
+        )
+    })?;
+    Ok((authorize(state, dir)?, ckpt))
+}
+
+/// Undo a registration this load made: the manager plan, registry entry (and its aliases),
+/// group and checkpoint pairing.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+async fn roll_back(
+    state: &AppState,
+    mgr: &crate::serve::manager::ModelManager,
+    slug: &str,
+    dir: &std::path::Path,
+) {
+    if let Err(e) = mgr.unload_and_deregister(slug, true).await {
+        tracing::warn!(%slug, error = %e, "load rollback: deregister failed");
+    }
+    forget_checkpoint(state, dir).await;
+}
+
+/// Serializes `dir`'s checkpoint pairing with the registrations that rely on it: a pairing set
+/// for one slug and not yet backed by its registry entry must not be cleared by another slug's
+/// rollback (the slug would then read its tokenizer and config from a fallback checkpoint while
+/// its manager keeps the requested weights).
+#[doc(hidden)]
+pub async fn pairing_lock(dir: &std::path::Path) -> tokio::sync::OwnedMutexGuard<()> {
+    // Its own key space, not the per-slug control locks: a slug may be any string.
+    type Locks = std::collections::HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::Mutex<Option<Locks>> = std::sync::Mutex::new(None);
+    let lock = {
+        let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let locks = locks.get_or_insert_with(Default::default);
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        let dir = canonical(dir);
+        match locks.get(&dir).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(dir, Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
+/// Pair `dir` with `ckpt` and publish `slug` from it to the registry, under the dir's pairing
+/// lock. On failure nothing of it is left.
+#[doc(hidden)]
+pub async fn pair_and_publish(
+    state: &AppState,
+    dir: &std::path::Path,
+    ckpt: &std::path::Path,
+    slug: &str,
+) -> std::result::Result<(), (StatusCode, String)> {
+    let _pairing = pairing_lock(dir).await;
+    crate::asset::serve::set_checkpoint(dir, ckpt)
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    if let Err(e) = state.registry.load(dir, Some(slug.to_string())) {
+        forget_unshared(state, dir);
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
+    Ok(())
+}
+
+/// Drop `dir`'s checkpoint pairing unless another registered slug still serves it.
+#[doc(hidden)]
+pub async fn forget_checkpoint(state: &AppState, dir: &std::path::Path) {
+    let _pairing = pairing_lock(dir).await;
+    forget_unshared(state, dir);
+}
+
+fn forget_unshared(state: &AppState, dir: &std::path::Path) {
+    let dir = canonical(dir);
+    let shared = state.registry.slugs().iter().any(|s| {
+        state
+            .registry
+            .get(s)
+            .is_ok_and(|b| canonical(&b.dir) == dir)
+    });
+    if !shared {
+        crate::asset::serve::clear_checkpoint(&dir);
+    }
+}
+
+/// The key the checkpoint pairing map uses (`asset::serve::map_key`).
+fn canonical(dir: &std::path::Path) -> PathBuf {
+    dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
+}
+
 /// `POST /v1/models/load` — make a model resident, registering its assets dir
 /// first when the slug is new.
 pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadRequest>) -> Response {
@@ -217,7 +524,7 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
 }
 async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
     req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if let Some(keys) = dp_targets(&state, &req.model, req.rank, req.device) {
         return match keys {
             Ok(keys) => dp_load(&state, keys, req.evict).await,
@@ -229,23 +536,43 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
     // security boundary, and a boundary that only fires on builds which happen
     // to have a GPU manager is not one — the refusal must not depend on how far
     // the request would otherwise have got.
-    let assets = match req.assets.as_deref().map(|d| resolve_assets(&state, d)) {
-        Some(Err(refusal)) => return refusal,
-        Some(Ok(dir)) => Some(dir),
-        None => None,
+    //
+    // A checkpoint override names a directory the load reads (weights, tokenizer, templates):
+    // held to the same allow-list as the assets dir.
+    if let Some(c) = req.checkpoint.take() {
+        match resolve_assets(&state, &c) {
+            Ok(dir) => req.checkpoint = Some(dir.display().to_string()),
+            Err(refusal) => return refusal,
+        }
+    }
+    let (assets, checkpoint_override) = if let Some(d) = req.assets.as_deref() {
+        match resolve_assets(&state, d) {
+            Ok(dir) => (Some(dir), req.checkpoint.as_deref().map(PathBuf::from)),
+            Err(refusal) => return refusal,
+        }
+    } else if !state.registry.contains(&req.model) {
+        match resolve_or_fetch_assets(&state, &req.model, req.checkpoint.as_deref()).await {
+            Ok((dir, ckpt)) => (Some(dir), Some(ckpt)),
+            Err(refusal) => return refusal,
+        }
+    } else {
+        (None, req.checkpoint.as_deref().map(PathBuf::from))
     };
 
     #[cfg(feature = "cpu")]
     if let Some(manager) = state.portable_manager() {
+        if let Some(ref ckpt) = checkpoint_override {
+            req.checkpoint = Some(ckpt.display().to_string());
+        }
         return manager.load(&state, req, assets).await;
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     {
         if state.managers().is_empty() {
             return err(
                 StatusCode::NOT_IMPLEMENTED,
-                "no GPU model manager on this server",
+                "no model manager on this server",
             );
         }
 
@@ -277,10 +604,11 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         let Some((group, mgr)) = target else {
             return err(
                 StatusCode::NOT_IMPLEMENTED,
-                "no GPU model manager on this server",
+                "no model manager on this server",
             );
         };
 
+        let mut registered_dir: Option<PathBuf> = None;
         if let Some(dir) = assets {
             // Registering the bundle is what makes the tokenizer, chat template
             // and bucket ladder reachable; registering with the manager is what
@@ -295,37 +623,35 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                     );
                 }
             }
+            let ckpt = checkpoint_override
+                .or_else(|| req.checkpoint.as_ref().map(PathBuf::from))
+                .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&dir));
             if newly_registered {
                 // The pairing is recorded first so the bundle's pin check and every HF-file read
                 // at load see the requested checkpoint.
-                if let Some(c) = &req.checkpoint {
-                    if let Err(e) =
-                        crate::asset::serve::set_checkpoint(&dir, std::path::Path::new(c))
-                    {
-                        return err(StatusCode::CONFLICT, e);
-                    }
-                }
-                if let Err(e) = state.registry.load(&dir, Some(req.model.clone())) {
-                    return err(StatusCode::BAD_REQUEST, e);
+                if let Err((status, e)) = pair_and_publish(&state, &dir, &ckpt, &req.model).await {
+                    return err(status, e);
                 }
             }
-            let ckpt = req
-                .checkpoint
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&dir));
-            if let Err(e) = mgr.register(&req.model, dir, ckpt) {
+            if let Err(e) = mgr.register(&req.model, dir.clone(), ckpt) {
                 if newly_registered {
                     let _ = state.registry.unload(&req.model);
+                    forget_checkpoint(&state, &dir).await;
                 }
                 return err(StatusCode::BAD_REQUEST, e);
             }
+            state.set_slug_group(&req.model, group);
             for alias in &req.aliases {
                 if let Err(e) = state.registry.add_alias(alias.clone(), &req.model) {
+                    if newly_registered {
+                        roll_back(&state, &mgr, &req.model, &dir).await;
+                    }
                     return err(StatusCode::BAD_REQUEST, e);
                 }
             }
-            state.set_slug_group(&req.model, group);
+            if newly_registered {
+                registered_dir = Some(dir);
+            }
         }
 
         if !mgr.manages(&req.model) {
@@ -339,7 +665,13 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         }
 
         use crate::serve::manager::EnsureError;
-        return match mgr.load(&req.model, req.evict).await {
+        let loaded = mgr.load(&req.model, req.evict).await;
+        // A model this call registered and could not load leaves no trace: kept, it stayed in
+        // the catalogue and every request for it paid another full load attempt.
+        if let (Err(_), Some(dir)) = (&loaded, &registered_dir) {
+            roll_back(&state, &mgr, &req.model, dir).await;
+        }
+        match loaded {
             Ok(load_ms) => Json(LoadResponse {
                 model: req.model,
                 state: "resident",
@@ -352,15 +684,17 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             Err(e @ EnsureError::WontFit { .. }) => err(StatusCode::CONFLICT, e),
             Err(e @ EnsureError::Unloaded) => err(StatusCode::CONFLICT, e),
             Err(EnsureError::Load(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-            Err(e @ EnsureError::SwitchTimeout(_)) => err(StatusCode::SERVICE_UNAVAILABLE, e),
-        };
+            Err(e @ (EnsureError::SwitchTimeout(_) | EnsureError::Backoff { .. })) => {
+                err(StatusCode::SERVICE_UNAVAILABLE, e)
+            }
+        }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     {
-        let _ = (state, req, assets);
+        let _ = (state, req, assets, checkpoint_override);
         err(
             StatusCode::NOT_IMPLEMENTED,
-            "model load/unload needs a GPU backend",
+            "no model manager on this server",
         )
     }
 }
@@ -378,7 +712,7 @@ pub async fn unload(
 }
 async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response {
     req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if let Some(keys) = dp_targets(&state, &req.model, req.rank, req.device) {
         if req.deregister {
             return err(
@@ -387,7 +721,7 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
             );
         }
         return match keys {
-            Ok(keys) => dp_unload(&state, keys).await,
+            Ok(keys) => dp_unload(&state, keys, req.drain_timeout_ms).await,
             Err(refusal) => refusal,
         };
     }
@@ -396,7 +730,7 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
     if let Some(manager) = state.portable_manager() {
         return manager.unload(&state, req).await;
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     {
         let Some(mgr) = state.manager_for(&req.model).cloned() else {
             return err(
@@ -411,7 +745,14 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
             );
         }
         use crate::serve::manager::EnsureError;
-        let report = match mgr.unload_and_deregister(&req.model, req.deregister).await {
+        let report = match mgr
+            .unload_with_drain(
+                &req.model,
+                req.deregister,
+                unload_drain(req.drain_timeout_ms),
+            )
+            .await
+        {
             Ok(r) => r,
             Err(EnsureError::Load(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -427,19 +768,30 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
         })
         .into_response();
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     {
-        let _ = (state, req);
+        let _ = state;
         err(
-            StatusCode::NOT_IMPLEMENTED,
-            "model load/unload needs a GPU backend",
+            StatusCode::NOT_FOUND,
+            format_args!("unknown model {:?}", req.model),
         )
     }
 }
 
+/// How long an unload lets in-flight generations finish before preempting the rest: the
+/// request's `drain_timeout_ms`, else `PLOW_DRAIN_TIMEOUT_MS`, else 30 s. `None` (a 0) preempts
+/// at once. One rule for every backend: ordinary GPU unloads used to preempt at once and the
+/// CPU/Metal ones to drain unbounded, against the documented 30 s.
+pub fn unload_drain(drain_timeout_ms: Option<u64>) -> Option<std::time::Duration> {
+    let ms = drain_timeout_ms
+        .or_else(|| crate::config::RuntimeConfig::get().drain_timeout_ms())
+        .unwrap_or(30_000);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
 /// The instance keys a load/unload of `model` addresses, when it is a DP model or one of its
 /// ranks: `None` for an ordinary model.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 fn dp_targets(
     state: &AppState,
     model: &str,
@@ -466,7 +818,7 @@ fn dp_targets(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Response {
     use crate::serve::manager::EnsureError;
     let mut load_ms = 0f64;
@@ -483,7 +835,7 @@ async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Respo
             Err(e @ (EnsureError::WontFit { .. } | EnsureError::Unloaded)) => {
                 return err(StatusCode::CONFLICT, format_args!("{key}: {e}"))
             }
-            Err(e @ EnsureError::SwitchTimeout(_)) => {
+            Err(e @ (EnsureError::SwitchTimeout(_) | EnsureError::Backoff { .. })) => {
                 return err(StatusCode::SERVICE_UNAVAILABLE, format_args!("{key}: {e}"))
             }
             Err(EnsureError::Load(e)) => {
@@ -502,13 +854,13 @@ async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Respo
     .into_response()
 }
 
-#[cfg(feature = "cuda")]
-async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
-    let bound = std::time::Duration::from_millis(
-        crate::config::RuntimeConfig::get()
-            .drain_timeout_ms()
-            .unwrap_or(30_000),
-    );
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+async fn dp_unload(
+    state: &Arc<AppState>,
+    keys: Vec<String>,
+    drain_timeout_ms: Option<u64>,
+) -> Response {
+    let bound = unload_drain(drain_timeout_ms).unwrap_or_default();
     let mut total = UnloadResponse {
         model: keys.join(","),
         state: "unloaded",
@@ -518,27 +870,37 @@ async fn dp_unload(state: &Arc<AppState>, keys: Vec<String>) -> Response {
         pool_trimmed_mib: 0,
         deregistered: false,
     };
-    for key in &keys {
-        let _control = state.control_lock(key).await;
-        let Some(mgr) = state.manager_for(key).cloned() else {
-            return err(
-                StatusCode::NOT_FOUND,
-                format_args!("no model manager serves {key:?}"),
-            );
-        };
-        match mgr.unload_rank(key, bound).await {
+    let tasks: Vec<_> = keys
+        .into_iter()
+        .map(|key| {
+            let state = Arc::clone(state);
+            async move {
+                let _control = state.control_lock(&key).await;
+                let Some(mgr) = state.manager_for(&key).cloned() else {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format_args!("no model manager serves {key:?}"),
+                    ));
+                };
+                mgr.unload_rank(&key, bound).await.map_err(|e| {
+                    err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format_args!("{key}: {e}"),
+                    )
+                })
+            }
+        })
+        .collect();
+
+    for res in futures::future::join_all(tasks).await {
+        match res {
             Ok(r) => {
                 total.stop_ms = total.stop_ms.max(r.stop_ms);
-                total.unload_ms += r.unload_ms;
+                total.unload_ms = total.unload_ms.max(r.unload_ms);
                 total.freed_mib += r.freed / MIB;
                 total.pool_trimmed_mib += r.pool_trimmed / MIB;
             }
-            Err(e) => {
-                return err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format_args!("{key}: {e}"),
-                )
-            }
+            Err(refusal) => return refusal,
         }
     }
     Json(total).into_response()
@@ -584,7 +946,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
                     .collect()
             }),
         };
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         if let Some(set) = dp {
             let mgr = state.manager_for(&set.ranks[0].key);
             entry.required_mib = mgr
@@ -594,7 +956,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
             models.push(entry);
             continue;
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         if let Some(mgr) = state.manager_for(&slug) {
             entry.required_mib = mgr.required(&slug).map(|b| b / MIB);
             if let Some(plan) = mgr.plan(&slug) {
@@ -609,7 +971,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
 
     #[allow(unused_mut)]
     let mut groups: Vec<GroupStatus> = Vec::new();
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     for (i, mgr) in state.managers().iter().enumerate() {
         let (free, total) = mgr.device_mem_info().unwrap_or((0, 0));
         groups.push(GroupStatus {
@@ -632,7 +994,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
         register: false,
         eviction: false,
     };
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if !state.managers().is_empty() {
         capabilities = ControlCapabilities {
             load: true,

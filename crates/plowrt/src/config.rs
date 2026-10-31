@@ -309,6 +309,12 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-vad-packet", env = "PLOW_ASR_VAD_PACKET", global = true)]
     pub asr_vad_packet: Option<std::path::PathBuf>,
 
+    /// WebSocket finals from the session's batched encoder stream (packets with one): the stream
+    /// runs as audio arrives and its final decodes the offline transcription's rows. Off: each
+    /// final transcribes the whole recording again.
+    #[arg(long = "asr-stream-finals", env = "PLOW_ASR_STREAM_FINALS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub asr_stream_finals: bool,
+
     /// Write spoken digit runs in transcripts as numerals (`asr::numerals`): "nine one eight seven
     /// three four one five three eight" becomes "918-734-1538".
     #[arg(long = "asr-numerals", env = "PLOW_ASR_NUMERALS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -858,8 +864,9 @@ pub struct RuntimeConfig {
     ///
     /// This is a security boundary, not ergonomics: loading a bundle loads and
     /// EXECUTES its cubins/hsaco, so an unconstrained path in a request body is
-    /// arbitrary code execution. Unset = only the assets dirs the process was
-    /// started with (their parents) are reachable.
+    /// arbitrary code execution. Always reachable as well: the parents of the
+    /// assets dirs the process was started with, and the local store's
+    /// `bundles/` (signature-checked pulls). Never the working directory.
     #[arg(
         long = "models-root",
         env = "PLOW_MODELS_ROOT",
@@ -1869,6 +1876,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "qwen-light-decode", env = "PLOW_QWEN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub qwen_light_decode: bool,
 
+    /// A routed decode segment [producer -> QuantFp8 in 1x128 groups] (RMSNorm, gated norm,
+    /// SiLU Glu, sigmoid gate) runs as one `plow_<arch>_light_quant[_norm]` launch instead of an
+    /// interpreter window; needs the object's `plow_light_quant_abi` 1.
+    #[arg(long = "light-quant", env = "PLOW_LIGHT_QUANT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub light_quant: bool,
+
     /// A packed Qwen3.5 prefill chunk's segments between its per-tick launches (the external GDN
     /// segments, the rider attention) replay as CUDA graph pieces captured once per bucket
     /// (needs `--pf-seg-graph`).
@@ -2808,6 +2821,15 @@ fn select_compat<T>(parsed: T, environment: Option<T>, allow_environment: bool) 
 }
 
 impl RuntimeConfig {
+    /// The environment as a fallback for an env-backed field, read only before the process
+    /// config exists (library embedders): an initialized config already parsed it, and an
+    /// engine config deliberately ignores what startup exported for another bundle.
+    fn env_fallback(var: &str) -> Option<String> {
+        (!Self::is_initialized())
+            .then(|| Self::env_nonempty(var))
+            .flatten()
+    }
+
     fn env_bool(var: &str) -> Option<bool> {
         let value = std::env::var(var).ok()?;
         Some(matches!(
@@ -2912,7 +2934,7 @@ impl RuntimeConfig {
             .nv
             .vmm_live_rings_models
             .clone()
-            .or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+            .or_else(|| Self::env_fallback("PLOW_VMM_LIVE_RINGS_MODELS"));
         let listed = spec.is_some_and(|spec| {
             served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
         });
@@ -2929,7 +2951,7 @@ impl RuntimeConfig {
             .nv
             .vmm_live_rings_models
             .clone()
-            .or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+            .or_else(|| Self::env_fallback("PLOW_VMM_LIVE_RINGS_MODELS"));
         spec.is_some_and(|spec| {
             served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
         })
@@ -2947,7 +2969,7 @@ impl RuntimeConfig {
     pub fn live_ctx(&self) -> Option<u32> {
         self.amd
             .live_ctx
-            .or_else(|| Self::env_nonempty("PLOW_LIVE_CTX").and_then(|v| v.parse().ok()))
+            .or_else(|| Self::env_fallback("PLOW_LIVE_CTX").and_then(|v| v.parse().ok()))
     }
 
     /// Live bound for the packet in `assets_dir`: its served name's `--live-ctx-models` entry,
@@ -2957,7 +2979,7 @@ impl RuntimeConfig {
             .amd
             .live_ctx_models
             .clone()
-            .or_else(|| Self::env_nonempty("PLOW_LIVE_CTX_MODELS"));
+            .or_else(|| Self::env_fallback("PLOW_LIVE_CTX_MODELS"));
         let per_model = spec.and_then(|spec| {
             let slug = served_name(assets_dir)?;
             spec.split(',').find_map(|kv| {
@@ -3301,7 +3323,30 @@ impl RuntimeConfig {
     /// without running `main()`'s CLI parse; parsing an empty argv lets clap's
     /// `env` attributes do the reading, so the `PLOW_*` contract holds for
     /// every entry point. Cold-path accessor — one atomic load once cached.
+    ///
+    /// Engine code (`exec/`, `memory/`, the dispatcher) must run under its model's scope once
+    /// models diverge: an unscoped read there would take another model's knobs. That is checked
+    /// at the caller — a panic in debug builds, one warning per call site in release.
+    #[track_caller]
+    #[inline]
     pub fn get() -> &'static RuntimeConfig {
+        if let Some(c) = SCOPED.with(std::cell::Cell::get) {
+            return c;
+        }
+        if ENGINES_DIVERGE.load(std::sync::atomic::Ordering::Relaxed) {
+            unscoped_engine_read(std::panic::Location::caller());
+        }
+        Self::process()
+    }
+
+    /// The process config, for a process-scoped knob read in engine code (exempt from the
+    /// engine-scope check of [`Self::get`]).
+    pub fn process_get() -> &'static RuntimeConfig {
+        Self::process()
+    }
+
+    /// The process config, ignoring any engine scope.
+    fn process() -> &'static RuntimeConfig {
         if let Some(c) = RUNTIME_CONFIG.get() {
             return c;
         }
@@ -3316,6 +3361,284 @@ impl RuntimeConfig {
             EnvOnly::parse_from(["plowrt"]).cfg
         })
     }
+}
+
+thread_local! {
+    /// The engine config of the model this thread is working for ([`scoped`]): what
+    /// [`RuntimeConfig::get`] returns while it is set.
+    static SCOPED: std::cell::Cell<Option<&'static RuntimeConfig>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Some engine runs a config other than the process one ([`bundle_config`]): from then on an
+/// unscoped config read in engine code is a wrong-model read.
+static ENGINES_DIVERGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Source files whose code runs for one model's engine, relative to this crate's `src/`.
+const ENGINE_SOURCES: &[&str] = &["exec/", "memory/", "serve/engine.rs", "serve/mux.rs"];
+
+fn engine_source(file: &str) -> bool {
+    // `Location::file` spells paths as `file!()` does in this build (workspace-relative,
+    // absolute or remapped): strip the same prefix this file has.
+    let src = file!().strip_suffix("config.rs").unwrap_or("");
+    let Some(rel) = file.strip_prefix(src) else {
+        return false;
+    };
+    ENGINE_SOURCES.iter().any(|p| rel.starts_with(p))
+}
+
+/// Mark engine configs as diverged, so the engine-scope check of [`RuntimeConfig::get`] runs
+/// without a co-served bundle (tests).
+#[doc(hidden)]
+pub fn check_engine_scope() {
+    ENGINES_DIVERGE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cold]
+#[inline(never)]
+fn unscoped_engine_read(at: &'static std::panic::Location<'static>) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Sites already reported (release): one bit per hashed site, so a repeated read costs one
+    // load and no lock (a collision only drops a second site's warning).
+    static SEEN: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (at.file(), at.line(), at.column()).hash(&mut h);
+    let h = h.finish() as usize % (64 * 64);
+    let (word, bit) = (&SEEN[h / 64], 1u64 << (h % 64));
+    if word.load(Ordering::Relaxed) & bit != 0 || !engine_source(at.file()) {
+        return;
+    }
+    let first = word.fetch_or(bit, Ordering::Relaxed) & bit == 0;
+    let thread = std::thread::current();
+    let msg = format!(
+        "engine code read the runtime config with no engine scope at {at} on thread {:?}: \
+         with co-served models it gets the process config, not its own model's",
+        thread.name().unwrap_or("<unnamed>")
+    );
+    if cfg!(debug_assertions) {
+        panic!("{msg}");
+    }
+    if first {
+        tracing::warn!("{msg}");
+    }
+}
+
+/// The engine scope this thread runs under, to carry onto a thread or task it starts.
+pub fn current_scope() -> Option<&'static RuntimeConfig> {
+    SCOPED.with(std::cell::Cell::get)
+}
+
+/// Run `f` with `cfg` as this thread's engine scope (`None` = the process config), restoring
+/// the previous scope after, also on unwind.
+pub fn scoped<R>(cfg: Option<&'static RuntimeConfig>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<&'static RuntimeConfig>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPED.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(SCOPED.with(|s| s.replace(cfg)));
+    f()
+}
+
+/// `f` under the calling thread's engine scope, for a thread an engine starts (its host-tier
+/// grower, spill-ahead, store workers): without it, the thread read the process config.
+pub fn inherit<R>(f: impl FnOnce() -> R) -> impl FnOnce() -> R {
+    let scope = current_scope();
+    move || scoped(scope, f)
+}
+
+/// A future polled (and dropped) under an engine scope: a model's dispatcher task, which tokio
+/// may poll on any worker thread.
+pub struct Scoped<F: std::future::Future> {
+    cfg: Option<&'static RuntimeConfig>,
+    fut: Option<std::pin::Pin<Box<F>>>,
+}
+
+impl<F: std::future::Future> Scoped<F> {
+    pub fn new(cfg: Option<&'static RuntimeConfig>, fut: F) -> Self {
+        Scoped {
+            cfg,
+            fut: Some(Box::pin(fut)),
+        }
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for Scoped<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let this = self.get_mut();
+        let fut = this.fut.as_mut().expect("polled after completion");
+        scoped(this.cfg, || fut.as_mut().poll(cx))
+    }
+}
+
+impl<F: std::future::Future> Drop for Scoped<F> {
+    fn drop(&mut self) {
+        let fut = self.fut.take();
+        scoped(self.cfg, || drop(fut));
+    }
+}
+
+/// The settings every engine config starts from: runtime args given on the command line, and
+/// the packet serve defaults startup exported into the environment (which are not the
+/// operator's, and so lose to each engine's own bundle).
+pub struct Startup {
+    cli: Vec<(String, Vec<std::ffi::OsString>)>,
+    exported: std::collections::BTreeMap<String, String>,
+}
+
+static STARTUP: OnceLock<Startup> = OnceLock::new();
+
+impl Startup {
+    /// `cli`: arg id -> raw values given on the command line; `exported`: what startup exported.
+    pub fn new(
+        cli: Vec<(String, Vec<std::ffi::OsString>)>,
+        exported: std::collections::BTreeMap<String, String>,
+    ) -> Startup {
+        Startup { cli, exported }
+    }
+
+    pub fn from_matches(
+        m: &clap::ArgMatches,
+        exported: impl IntoIterator<Item = (String, String)>,
+    ) -> Startup {
+        use clap::Args;
+        let cmd = RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+        let cli = cmd
+            .get_arguments()
+            .map(|a| a.get_id().as_str())
+            .filter(|id| m.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
+            .filter_map(|id| {
+                let raw = m.get_raw(id)?.map(|v| v.to_os_string()).collect();
+                Some((id.to_string(), raw))
+            })
+            .collect();
+        Startup {
+            cli,
+            exported: exported.into_iter().collect(),
+        }
+    }
+}
+
+/// Record the startup inputs of [`bundle_config`] (once, from `main`, after the CLI parse).
+pub fn record_startup(startup: Startup) {
+    let _ = STARTUP.set(startup);
+}
+
+/// The config of an engine whose bundle asks `defaults` (engine-scoped `(env, value)` pairs).
+/// Per engine-scoped knob: the command line, else the operator's environment, else `defaults`,
+/// else the built-in default; every process-scoped knob as the process has it.
+///
+/// Built by the same clap parse as the process config, with each packet default as the arg's
+/// default value (one value parser, one precedence), never by rewriting argv or the environment.
+pub fn resolve_engine(
+    st: &Startup,
+    defaults: &[(String, String)],
+) -> std::result::Result<RuntimeConfig, String> {
+    use clap::{Args, FromArgMatches};
+    fn leak(v: &str) -> &'static str {
+        Box::leak(v.to_owned().into_boxed_str())
+    }
+    let mut cmd = RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+    let args: Vec<(String, Option<String>)> = cmd
+        .get_arguments()
+        .map(|a| {
+            let env = a.get_env().map(|e| e.to_string_lossy().into_owned());
+            (a.get_id().to_string(), env)
+        })
+        .collect();
+    for (id, env) in args {
+        if let Some((_, raw)) = st.cli.iter().find(|(i, _)| *i == id) {
+            let vals: Vec<&'static std::ffi::OsStr> = raw
+                .iter()
+                .map(|v| &*Box::leak(v.clone().into_boxed_os_str()))
+                .collect();
+            cmd = cmd.mut_arg(&id, |a| a.env(None::<&'static str>).default_values(vals));
+            continue;
+        }
+        let Some(env) = env else { continue };
+        if crate::knob_spec::knob_scope(&env) != Some(crate::knob_spec::KnobScope::Engine) {
+            continue;
+        }
+        let exported = st.exported.contains_key(&env);
+        if !exported && std::env::var_os(&env).is_some() {
+            continue;
+        }
+        let own = defaults
+            .iter()
+            .find(|(k, _)| *k == env)
+            .map(|(_, v)| leak(v));
+        cmd = cmd.mut_arg(&id, |a| {
+            let a = if exported {
+                a.env(None::<&'static str>)
+            } else {
+                a
+            };
+            match own {
+                Some(v) => a.default_value(v),
+                None => a,
+            }
+        });
+    }
+    let m = cmd
+        .try_get_matches_from(["plowrt"])
+        .map_err(|e| e.to_string())?;
+    RuntimeConfig::from_arg_matches(&m).map_err(|e| e.to_string())
+}
+
+/// The engine config for the bundle in `dir`: [`resolve_engine`] over its packet's engine-scoped
+/// serve defaults, resolved once per bundle and defaults (an engine owns the `&'static` and
+/// every reload of the bundle shares it). The process config itself when they agree — a
+/// single-model serve, whose startup exported exactly this bundle's defaults. Without a
+/// recorded startup (a library embedder) the process config.
+pub fn bundle_config(dir: &std::path::Path) -> crate::Result<&'static RuntimeConfig> {
+    let process = RuntimeConfig::process();
+    let Some(st) = STARTUP.get() else {
+        return Ok(process);
+    };
+    let all = crate::asset::serve::bundle_serve_defaults(dir)?
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let (defaults, shared): (Vec<_>, Vec<_>) = all.into_iter().partition(|(k, _)| {
+        crate::knob_spec::knob_scope(k) == Some(crate::knob_spec::KnobScope::Engine)
+    });
+    for (key, value) in &shared {
+        if std::env::var(key).ok().as_deref() != Some(value.as_str()) {
+            tracing::warn!(
+                bundle = %dir.display(), knob = %key, packet = %value,
+                "packet serve default is process-wide; this model runs with the process value"
+            );
+        }
+    }
+    static CACHE: std::sync::Mutex<
+        Vec<(
+            std::path::PathBuf,
+            Vec<(String, String)>,
+            &'static RuntimeConfig,
+        )>,
+    > = std::sync::Mutex::new(Vec::new());
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, cfg)) = cache.iter().find(|(d, k, _)| *d == canon && *k == defaults) {
+        return Ok(cfg);
+    }
+    let cfg = resolve_engine(st, &defaults).map_err(|e| {
+        crate::RuntimeError::Rejected(format!("{}: engine config: {e}", dir.display()))
+    })?;
+    let cfg: &'static RuntimeConfig = if format!("{cfg:?}") == format!("{process:?}") {
+        process
+    } else {
+        tracing::info!(bundle = %dir.display(), defaults = ?defaults, "engine config resolved for the bundle");
+        ENGINES_DIVERGE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Box::leak(Box::new(cfg))
+    };
+    cache.push((canon, defaults, cfg));
+    Ok(cfg)
 }
 
 /// Explicit runtime settings from the resolved CLI, in replayable environment spelling.
@@ -3379,6 +3702,67 @@ fn parse_pf_hold(spec: &str) -> Option<(u32, f64, usize)> {
         None => 16,
     };
     it.next().is_none().then_some((rows, ms, min_decode))
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    /// The scope follows the thread and the tasks and threads an engine starts, and is
+    /// restored after.
+    #[test]
+    fn engine_scope_follows_its_threads_and_restores() {
+        let cfg: &'static RuntimeConfig = Box::leak(Box::new(RuntimeConfig::process().clone()));
+        let is = move |c: &RuntimeConfig| std::ptr::eq(c, cfg);
+        assert!(!is(RuntimeConfig::get()));
+        scoped(Some(cfg), || {
+            assert!(is(RuntimeConfig::get()));
+            let inherited = std::thread::spawn(inherit(move || is(RuntimeConfig::get())));
+            assert!(
+                inherited.join().unwrap(),
+                "a spawned helper inherits the scope"
+            );
+            let bare = std::thread::spawn(move || is(RuntimeConfig::get()));
+            assert!(!bare.join().unwrap());
+            scoped(None, || assert!(!is(RuntimeConfig::get())));
+            assert!(
+                is(RuntimeConfig::get()),
+                "an inner scope restores the outer one"
+            );
+        });
+        assert!(!is(RuntimeConfig::get()));
+        let r = std::panic::catch_unwind(|| scoped(Some(cfg), || panic!("unwind")));
+        assert!(r.is_err());
+        assert!(!is(RuntimeConfig::get()), "restored on unwind");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let polled = rt.block_on(async move {
+            let fut = Scoped::new(Some(cfg), async move { is(RuntimeConfig::get()) });
+            tokio::spawn(fut).await.unwrap()
+        });
+        assert!(polled, "polled under the scope");
+    }
+
+    /// The check covers the engine's sources and nothing on the request path.
+    #[test]
+    fn engine_sources_are_the_engine_and_dispatcher() {
+        let src = file!().strip_suffix("config.rs").unwrap();
+        for (f, engine) in [
+            ("exec/gpu.rs", true),
+            ("memory/vmm.rs", true),
+            ("serve/mux.rs", true),
+            ("serve/chat.rs", false),
+            ("main.rs", false),
+        ] {
+            assert_eq!(engine_source(&format!("{src}{f}")), engine, "{f}");
+        }
+        assert!(
+            !engine_source("exec/gpu.rs"),
+            "a path outside this crate's sources"
+        );
+    }
 }
 
 #[cfg(test)]

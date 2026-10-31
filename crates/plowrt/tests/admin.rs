@@ -283,3 +283,503 @@ async fn lifecycle_operations_serialize_per_model_without_blocking_other_models(
     );
     drop(other);
 }
+
+#[tokio::test]
+async fn version_endpoint_answers_with_current_version() {
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn unload_request_deserializes_drain_timeout() {
+    let req: plowrt::serve::admin::UnloadRequest = serde_json::from_str(
+        r#"{"model":"target-model","deregister":true,"drain_timeout_ms":15000}"#,
+    )
+    .unwrap();
+    assert_eq!(req.model, "target-model");
+    assert!(req.deregister);
+    assert_eq!(req.drain_timeout_ms, Some(15000));
+}
+
+#[tokio::test]
+async fn endpoints_are_cached_on_bundle_at_registration() {
+    let state = make_state();
+    let bundle = state.registry.get("state-model").unwrap();
+    assert_eq!(bundle.endpoints(), &["chat/completions", "completions"]);
+    assert!(!bundle.is_speech());
+    assert!(!bundle.is_audio());
+}
+
+#[cfg(feature = "cpu")]
+#[tokio::test]
+async fn portable_manager_unload_honors_drain_timeout() {
+    let state = make_state();
+    let mgr = plowrt::serve::portable::PortableManager::new(MuxConfig::default());
+    mgr.register(
+        "state-model".into(),
+        std::path::PathBuf::from("/nonexistent"),
+    );
+    state.install_portable_manager(mgr);
+
+    let req = plowrt::serve::admin::UnloadRequest {
+        model: "state-model".into(),
+        deregister: false,
+        rank: None,
+        device: None,
+        drain_timeout_ms: Some(10),
+    };
+    let resp = state.portable_manager().unwrap().unload(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn unloaded_asr_model_reports_audio_endpoints_in_catalogue() {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plowrt_asr_test_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    common::write_bundle(&dir, "asr-model");
+    std::fs::write(dir.join("audio_lm_contract.json"), b"{}").unwrap();
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    registry.load(&dir, None).unwrap();
+    let state = Arc::new(AppState::new(registry, execset));
+    let app = app(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let m = val["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "asr-model")
+        .expect("asr-model in catalogue");
+    assert_eq!(
+        m["x_plow_endpoints"],
+        serde_json::json!(["audio/transcriptions", "audio/transcriptions/stream"])
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn server_brings_up_cleanly_with_zero_assets() {
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    let state = Arc::new(AppState::new(registry, execset));
+    let router = app(Arc::clone(&state)).merge(plowrt::serve::admin_app(Arc::clone(&state)));
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_string(resp).await;
+    assert_eq!(status, StatusCode::OK, "response body: {body}");
+    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(val["data"].as_array().unwrap().len(), 0);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn load_without_assets_field_finds_local_bundle_under_models_root() {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("plowrt_root_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    common::write_bundle(&root.join("dynamic-model"), "dynamic-model");
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    let state = Arc::new(AppState::new(registry, execset));
+    state.install_models_roots(vec![root.clone()]);
+
+    let router = plowrt::serve::admin_app(Arc::clone(&state));
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"dynamic-model"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body = body_string(resp).await;
+    // Without a GPU manager, the request successfully resolved the local bundle under models_root
+    // (advancing past 404 NOT_FOUND) and reached the manager stage (501 NOT_IMPLEMENTED).
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "response body: {body}");
+    assert!(body.contains("no model manager on this server"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn load_without_assets_field_and_no_models_root_is_refused() {
+    let resp = post("/v1/models/load", r#"{"model":"non-existent-anywhere"}"#).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_string(resp).await;
+    assert!(body.contains("no --models-root"), "{body}");
+}
+
+/// A root holding one loadable bundle, `inside`, plus a bundle `outside` it, and an admin
+/// router whose only allow-list entry is the root.
+fn rooted(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, axum::Router) {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("plowrt_roots_{tag}_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("root");
+    let outside = base.join("outside");
+    common::write_bundle(&root.join("inside"), "inside");
+    common::write_bundle(&outside, "outside");
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let state = Arc::new(AppState::new(Registry::new(), execset));
+    state.install_models_roots(vec![root.clone()]);
+    (root, outside, plowrt::serve::admin_app(state))
+}
+
+async fn load_model(router: axum::Router, model: &str) -> (StatusCode, String) {
+    let body = serde_json::json!({ "model": model }).to_string();
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_string(resp).await)
+}
+
+/// `model` without `assets` names a bundle UNDER a root. An absolute path, a `..` walk and a
+/// symlink out of the root used to be loaded from wherever they pointed — executing its cubins
+/// with the allow-list never consulted. Reaching the manager stage (501 here, no GPU) is the
+/// tell that the path was accepted.
+#[tokio::test]
+async fn load_by_name_never_leaves_the_models_roots() {
+    let (root, outside, router) = rooted("escape");
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    let absolute = outside.display().to_string();
+    for model in [
+        absolute.as_str(),
+        "../outside",
+        "inside/../../outside",
+        "link",
+    ] {
+        let (status, body) = load_model(router.clone(), model).await;
+        assert!(
+            status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+            "{model}: {status} {body}"
+        );
+        assert!(
+            !body.contains("no model manager"),
+            "{model} was accepted: {body}"
+        );
+    }
+    let (status, body) = load_model(router, "inside").await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// An explicit `assets` dir is held to the same test, symlinks included.
+#[tokio::test]
+async fn load_with_assets_through_a_symlink_out_of_the_root_is_refused() {
+    let (root, outside, router) = rooted("assets-link");
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    let body = serde_json::json!({
+        "model": "m", "assets": root.join("link").display().to_string()
+    })
+    .to_string();
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// A `checkpoint` override is read by the load (weights, tokenizer, templates): it must sit
+/// under a root like the assets dir, whether the bundle is named by `assets` or by name.
+#[tokio::test]
+async fn a_checkpoint_override_outside_the_roots_is_refused() {
+    let (root, outside, router) = rooted("ckpt");
+    std::fs::create_dir_all(root.join("ckpt")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("ckpt-link")).unwrap();
+    let inside = root.join("inside").display().to_string();
+    let send = |body: serde_json::Value| {
+        let router = router.clone();
+        async move {
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/models/load")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, body_string(resp).await)
+        }
+    };
+    for ckpt in [
+        outside.display().to_string(),
+        root.join("ckpt-link").display().to_string(),
+        root.join("../outside").display().to_string(),
+    ] {
+        for body in [
+            serde_json::json!({"model": "m", "assets": inside, "checkpoint": ckpt}),
+            serde_json::json!({"model": "inside", "checkpoint": ckpt}),
+        ] {
+            let (status, text) = send(body.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}: {text}");
+        }
+    }
+    let ok = root.join("ckpt").display().to_string();
+    let (status, text) =
+        send(serde_json::json!({"model": "m", "assets": inside, "checkpoint": ok})).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{text}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// The startup allow-list: `--models-root`, the parents of the `--assets` dirs (a single-asset
+/// serve reaches its siblings with no flag), the store's `bundles/` — and never the working
+/// directory, whatever it is.
+#[test]
+fn startup_models_roots_are_explicit_roots_asset_parents_and_the_store() {
+    use plowrt::serve::admin::startup_models_roots;
+    use std::path::PathBuf;
+    let cwd = std::env::current_dir().unwrap();
+    let single = startup_models_roots(&[], &[PathBuf::from("/srv/models/e4b")], None);
+    assert_eq!(single, vec![PathBuf::from("/srv/models")]);
+    let all = startup_models_roots(
+        &["/data/roots".into()],
+        &[
+            PathBuf::from("/srv/models/e4b"),
+            PathBuf::from("/srv/models/g12"),
+        ],
+        Some(PathBuf::from("/home/u/.plow/bundles")),
+    );
+    assert_eq!(
+        all,
+        vec![
+            PathBuf::from("/data/roots"),
+            PathBuf::from("/srv/models"),
+            PathBuf::from("/home/u/.plow/bundles"),
+        ]
+    );
+    assert!(startup_models_roots(&[], &[], None).is_empty());
+    assert!(!all.contains(&cwd) && !all.contains(&cwd.join("models")));
+}
+
+/// A registered model whose dispatcher is gone (an unload or eviction after admission) is
+/// unavailable, not missing: 503 `model_unloaded`, while an unknown name stays 404.
+#[tokio::test]
+async fn a_registered_model_without_a_dispatcher_is_unavailable_not_missing() {
+    let state = make_state();
+    let router = app(Arc::clone(&state));
+    let ask = |uri: &'static str, model: &'static str| {
+        let router = router.clone();
+        async move {
+            let body = if uri.ends_with("chat/completions") {
+                serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+            } else {
+                serde_json::json!({"model": model, "prompt": "hi"})
+            };
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, body_string(resp).await)
+        }
+    };
+    for uri in ["/v1/chat/completions", "/v1/completions"] {
+        let (status, body) = ask(uri, "state-model").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        assert!(body.contains("model_unloaded"), "{uri}: {body}");
+        let (status, body) = ask(uri, "never-registered").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+}
+
+/// One drain rule for every unload: the request's bound, else `PLOW_DRAIN_TIMEOUT_MS`, else
+/// 30 s; 0 preempts at once.
+#[test]
+fn unload_drain_defaults_to_a_bounded_drain() {
+    use plowrt::serve::admin::unload_drain;
+    use std::time::Duration;
+    assert_eq!(unload_drain(Some(0)), None);
+    assert_eq!(unload_drain(Some(250)), Some(Duration::from_millis(250)));
+    if plowrt::config::RuntimeConfig::get()
+        .drain_timeout_ms()
+        .is_none()
+    {
+        assert_eq!(unload_drain(None), Some(Duration::from_secs(30)));
+    }
+}
+
+/// Two slugs registered from one bundle dir: one's rollback (its load failed) must never clear
+/// the dir's checkpoint pairing while the other sits between pairing and registry publication,
+/// or the other reads its tokenizer and config from a fallback checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollback_never_unpairs_a_bundle_another_slug_is_registering() {
+    use plowrt::serve::admin::{forget_checkpoint, pair_and_publish};
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("plowrt_pairing_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    common::write_bundle(&base.join("bundle"), "shared");
+    let dir = base.join("bundle").canonicalize().unwrap();
+    let ckpt = base.join("requested-checkpoint");
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let state = Arc::new(AppState::new(Registry::new(), execset));
+    for round in 0..1000 {
+        // `a` registers and rolls back (its load failed) while `b` registers from the same dir.
+        let failing = {
+            let (state, dir, ckpt) = (Arc::clone(&state), dir.clone(), ckpt.clone());
+            tokio::spawn(async move {
+                for _ in 0..4 {
+                    pair_and_publish(&state, &dir, &ckpt, "a").await.unwrap();
+                    state.registry.unload("a").unwrap();
+                    forget_checkpoint(&state, &dir).await;
+                }
+            })
+        };
+        let registering = {
+            let (state, dir, ckpt) = (Arc::clone(&state), dir.clone(), ckpt.clone());
+            tokio::spawn(async move { pair_and_publish(&state, &dir, &ckpt, "b").await })
+        };
+        failing.await.unwrap();
+        registering.await.unwrap().unwrap();
+        assert_eq!(
+            plowrt::asset::serve::checkpoint_dir(&dir),
+            ckpt,
+            "round {round}: b is registered but its pairing was cleared"
+        );
+        state.registry.unload("b").unwrap();
+        forget_checkpoint(&state, &dir).await;
+        assert_ne!(plowrt::asset::serve::checkpoint_dir(&dir), ckpt);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The interleaving itself, held open: a slug paired but not yet published keeps the pairing
+/// lock, and a rollback's forget waits for it, then finds the slug published and keeps the pairing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollback_waits_for_a_pending_pairing() {
+    use plowrt::serve::admin::{forget_checkpoint, pairing_lock};
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("plowrt_pending_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    common::write_bundle(&base.join("bundle"), "shared");
+    let dir = base.join("bundle").canonicalize().unwrap();
+    let ckpt = base.join("requested-checkpoint");
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let state = Arc::new(AppState::new(Registry::new(), execset));
+
+    // The rollback names the dir through a symlink (a store reached via a linked home): the
+    // same pairing, so the same lock.
+    let linked = base.join("linked");
+    std::os::unix::fs::symlink(&dir, &linked).unwrap();
+    let pending = pairing_lock(&dir).await;
+    plowrt::asset::serve::set_checkpoint(&dir, &ckpt).unwrap();
+    let rollback = {
+        let (state, linked) = (Arc::clone(&state), linked.clone());
+        tokio::spawn(async move { forget_checkpoint(&state, &linked).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !rollback.is_finished(),
+        "the rollback waits for the pending registration"
+    );
+    assert_eq!(plowrt::asset::serve::checkpoint_dir(&dir), ckpt);
+    state.registry.load(&dir, Some("b".into())).unwrap();
+    drop(pending);
+    rollback.await.unwrap();
+    assert_eq!(
+        plowrt::asset::serve::checkpoint_dir(&dir),
+        ckpt,
+        "b is published from the dir: its pairing stays"
+    );
+    state.registry.unload("b").unwrap();
+    forget_checkpoint(&state, &linked).await;
+    assert_ne!(plowrt::asset::serve::checkpoint_dir(&dir), ckpt);
+    let _ = std::fs::remove_dir_all(&base);
+}

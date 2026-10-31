@@ -294,6 +294,16 @@ tokenizer = "{env:PLOW_FP8_CKPT}"
 model_id = "gemma-4-26b-a4b-it-fp8"
 gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
 
+[rung_choices.PLOW_EMIT_ATTN_LIBRARY]
+# Library vs declared native role, every prefill rung (see the PLOW_BUILD_FA4_* comment above).
+label = "qualified"
+evidence = ["lib-attn 2026-10-29 bin3 4b261f8a, packet caf6c4a47ba6: chunk 128/512/1024/2048 2.32/0.74/0.51/0.42 -> 1.99/0.68/0.46/0.37 s; FP32 gate c1/c8/c16 PASS, c32 2 of 3", "/opt/dlami/nvme/lava-tts/lib-attn/promo (gate-g26, ctl, prod-g26-lib)", "docs/arch/28-library-attention.md"]
+
+[rung_choices.PLOW_NO_GLU_FUSE]
+# Lt gate|up vs fused GLU role per prefill rung (see the PLOW_NO_GLU_FUSE comment above).
+label = "qualified"
+evidence = ["2026-10-15 packet bd9c0722e368, plowrt 2dff2171: rungs 128/256/1024/4096 15.69/17.53/26.46/81.33 vs 17.24/18.33/30.81/96.23 ms; FP32 + long gate PASS", "g26-pfrung REPORT.md sections 6 and 13-14 (res2, ab/g-p1, ab/gl-p1)"]
+
 [measured]
 tok_s = 951.5
 p50_tpot_ms = 123.4

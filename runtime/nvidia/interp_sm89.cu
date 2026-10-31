@@ -28,6 +28,8 @@
 #define plow_sm120_light_flash plow_sm89_light_flash
 #define plow_sm120_light_pf plow_sm89_light_pf
 #define plow_sm120_light_qnorm plow_sm89_light_qnorm
+#define plow_sm120_light_quant plow_sm89_light_quant
+#define plow_sm120_light_quant_norm plow_sm89_light_quant_norm
 #define plow_sm120_light_router plow_sm89_light_router
 #define plow_sm120_rider_flash256 plow_sm89_rider_flash256
 #define plow_sm120_rider_flash512 plow_sm89_rider_flash512

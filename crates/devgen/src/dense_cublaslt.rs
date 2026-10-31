@@ -434,7 +434,7 @@ fn prefill_eligible(model: &Model, op: &packet::dev::DevInst, rows: u32, profile
             && plow_asset::segment_roles::cublaslt_prefill_fp8(profile, rows, op.i[1], op.i[2])
             && op.i[3..5].iter().all(|&value| value == 0)
             && (op.i[5] == 0
-                || block && op.i[1] % 128 == 0 && op.i[2] % 128 == 0 && op.i[6..] == [0, 0])
+                || block && op.i[1] % 128 == 0 && op.i[2] % 512 == 0 && op.i[6..] == [0, 0])
             && op.t[5..]
                 .iter()
                 .all(|&tensor| tensor == packet::dev::TENSOR_NONE)
@@ -778,11 +778,13 @@ pub(crate) fn runtime_requires(model: &Model, sections: &[SectionData]) -> serde
     } else {
         None
     };
-    let block_fp8 = model
-        .progs
-        .iter()
-        .flat_map(|p| &p.insts)
-        .any(|d| d.op == DevOp::GemmFp8 as u16 && d.i[5] == packet::dev::FP8_BLOCK_GROUP);
+    let block_fp8 = model.progs.iter().flat_map(|p| &p.insts).any(|d| {
+        let gemm = [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8]
+            .iter()
+            .any(|&op| d.op == op as u16);
+        (gemm && d.i[5] == packet::dev::FP8_BLOCK_GROUP)
+            || (d.op == DevOp::QuantFp8 as u16 && d.i[3] == packet::dev::FP8_BLOCK_GROUP)
+    });
     let contract = if block_fp8 {
         plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
     } else {
@@ -1171,6 +1173,15 @@ mod tests {
             runtime_requires(&ladder, &[]),
             serde_json::json!({"plowrt_contract": plow_asset::RUNTIME_CONTRACT_BASE})
         );
+        // A block-scaled activation quant alone needs the block contract.
+        let saved = ladder.progs[0].insts[0].clone();
+        ladder.progs[0].insts[0].op = DevOp::QuantFp8 as u16;
+        ladder.progs[0].insts[0].i[3] = packet::dev::FP8_BLOCK_GROUP;
+        assert_eq!(
+            runtime_requires(&ladder, &[])["plowrt_contract"],
+            plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
+        );
+        ladder.progs[0].insts[0] = saved;
         let root = std::env::temp_dir().join(format!("devgen-lt-store-{}", std::process::id()));
         let out = root.join("out");
         let cell = root.join("nvidia/sm_90a/h100-sxm5");

@@ -61,8 +61,77 @@ pub struct PacketRnnt {
     profiling: bool,
     last_profile: Option<RnntProfile>,
     stream: Option<StreamBinding>,
+    batch: Option<BatchBinding>,
+    /// Batched streams; preferred over `stream` (CUDA, with the batched decode).
+    chunk: Option<ChunkBinding>,
     /// Vocabulary, detokenizer and language (ASR contract >= 1).
     output: Option<TokenOutput>,
+}
+
+/// The batched decode programs (`batch.*` pipeline roles): slot-indexed predictor state and a
+/// table of encoder rows the joint reads by index.
+struct BatchBinding {
+    /// (recordings, program) and (joint rows, program), ascending.
+    predict: Vec<(usize, usize)>,
+    joint: Vec<(usize, usize)>,
+    token: PacketTensor,
+    state_index: PacketTensor,
+    slot: PacketTensor,
+    row_index: PacketTensor,
+    row_slot: PacketTensor,
+    ids: PacketTensor,
+    encoder: PacketTensor,
+    /// Predictor state rows; the last is the scratch slot of padding lanes.
+    slots: u32,
+    encoder_rows: u32,
+}
+
+impl BatchBinding {
+    fn bind(pipeline: &BoundPacketPipeline, slots: u64, row_bytes: usize) -> Result<Self> {
+        let rungs = |prefix: &str| -> Vec<(usize, usize)> {
+            let mut rungs: Vec<_> = pipeline
+                .programs()
+                .filter_map(|(role, program)| {
+                    Some((role.strip_prefix(prefix)?.parse().ok()?, program))
+                })
+                .collect();
+            rungs.sort_unstable();
+            rungs
+        };
+        let invalid = || RuntimeError::Rejected("packet batched RNNT geometry is invalid".into());
+        let predict = rungs("batch.predict.");
+        let joint = rungs("batch.joint.");
+        let slots = u32::try_from(slots).map_err(|_| invalid())?;
+        let encoder_rows =
+            u32::try_from(pipeline.parameter("batch.encoder_rows")?).map_err(|_| invalid())?;
+        let binding = Self {
+            token: pipeline.tensor("batch.token")?,
+            state_index: pipeline.tensor("batch.state_index")?,
+            slot: pipeline.tensor("batch.slot")?,
+            row_index: pipeline.tensor("batch.row_index")?,
+            row_slot: pipeline.tensor("batch.row_slot")?,
+            ids: pipeline.tensor("batch.ids")?,
+            encoder: pipeline.tensor("batch.encoder")?,
+            predict,
+            joint,
+            slots,
+            encoder_rows,
+        };
+        let (Some(&(items, _)), Some(&(rows, _))) = (binding.predict.last(), binding.joint.last())
+        else {
+            return Err(invalid());
+        };
+        let lanes = [binding.token, binding.state_index, binding.slot];
+        let row_lanes = [binding.row_index, binding.row_slot, binding.ids];
+        if slots < 2
+            || lanes.iter().any(|t| t.bytes != items * 4)
+            || row_lanes.iter().any(|t| t.bytes != rows * 4)
+            || binding.encoder.bytes != encoder_rows as usize * row_bytes
+        {
+            return Err(invalid());
+        }
+        Ok(binding)
+    }
 }
 
 /// A cache-aware encoder stream (`stream.*` pipeline roles): each step turns one mel window into
@@ -84,22 +153,159 @@ struct StreamBinding {
     pool: Vec<Vec<PacketTensor>>,
 }
 
-/// One open stream: a device copy of its state and the greedy decoder's position.
+/// Batched cache-aware streams (`chunk.*` pipeline roles): a launch steps many streams, each
+/// with its caches in a row of slot-indexed tables, and the batched decode takes their rows.
+struct ChunkBinding {
+    /// (streams, first-window, later-window and step program sequences), ascending.
+    rungs: Vec<(usize, [Vec<usize>; 3])>,
+    first: PacketTensor,
+    next: PacketTensor,
+    index: PacketTensor,
+    slot: PacketTensor,
+    pos: PacketTensor,
+    key_start: PacketTensor,
+    rows: usize,
+    left_rows: usize,
+    first_input_frames: usize,
+    step_input_frames: usize,
+    history_input_frames: usize,
+    bins: usize,
+    next_row0: usize,
+    encoder_row0: usize,
+    predictor_slot0: u32,
+    /// The scratch cache row of padding items (the tables' last).
+    scratch: u32,
+    /// Cache rows no open stream holds.
+    free: Vec<u32>,
+    /// Host staging of a launch's windows and per-item tables.
+    windows: [Vec<f32>; 2],
+    lanes: [Vec<u32>; 4],
+}
+
+impl ChunkBinding {
+    fn bind(pipeline: &BoundPacketPipeline, batch: &BatchBinding, bins: usize) -> Result<Self> {
+        let invalid = || RuntimeError::Rejected("packet batched stream geometry is invalid".into());
+        let param = |name| usize_parameter(pipeline, name);
+        let mut items: Vec<usize> = pipeline
+            .programs()
+            .filter_map(|(role, _)| {
+                role.strip_prefix("chunk.step.")?
+                    .split('.')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        items.sort_unstable();
+        items.dedup();
+        let rungs = items
+            .into_iter()
+            .map(|n| {
+                let sequence = |kind| pipeline.program_sequence(&format!("chunk.{kind}.{n}"));
+                Ok((
+                    n,
+                    [sequence("first")?, sequence("next")?, sequence("step")?],
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let slots = u32::try_from(param("chunk.slots")?).map_err(|_| invalid())?;
+        let (first, next) = (
+            pipeline.tensor("chunk.input.first")?,
+            pipeline.tensor("chunk.input.next")?,
+        );
+        let (index, slot) = (
+            pipeline.tensor("chunk.index")?,
+            pipeline.tensor("chunk.slot")?,
+        );
+        // Rows per step and window frames follow from the per-stream tensors' sizes.
+        let max_items = slot.bytes / 4;
+        let per_stream = |bytes: usize, unit: usize| {
+            (max_items != 0 && unit != 0 && bytes % (max_items * unit) == 0)
+                .then(|| bytes / (max_items * unit))
+                .ok_or_else(invalid)
+        };
+        let rows = per_stream(index.bytes, 4)?;
+        let first_input_frames = per_stream(first.bytes, bins * 4)?;
+        let step_input_frames = per_stream(next.bytes, bins * 4)?;
+        let binding = Self {
+            first,
+            next,
+            index,
+            slot,
+            pos: pipeline.tensor("chunk.pos")?,
+            key_start: pipeline.tensor("chunk.key_start")?,
+            rows,
+            left_rows: param("chunk.left_rows")?,
+            first_input_frames,
+            step_input_frames,
+            history_input_frames: step_input_frames
+                .checked_sub(first_input_frames)
+                .ok_or_else(invalid)?,
+            bins,
+            next_row0: param("chunk.next_row0")?,
+            encoder_row0: param("chunk.encoder_row0")?,
+            predictor_slot0: u32::try_from(param("chunk.predictor_slot0")?)
+                .map_err(|_| invalid())?,
+            scratch: slots.saturating_sub(1),
+            free: (0..slots.saturating_sub(1)).rev().collect(),
+            windows: Default::default(),
+            lanes: Default::default(),
+            rungs,
+        };
+        let streams = slots.saturating_sub(1);
+        if binding.rungs.last().is_none_or(|rung| rung.0 != max_items)
+            || streams == 0
+            || rows == 0
+            || [binding.pos, binding.key_start]
+                .iter()
+                .any(|t| t.bytes != max_items * 4)
+            || binding.next_row0 < max_items * rows
+            || binding
+                .encoder_row0
+                .checked_add(max_items * rows)
+                .is_none_or(|end| end > batch.encoder_rows as usize)
+            || binding
+                .predictor_slot0
+                .checked_add(streams)
+                .is_none_or(|end| end >= batch.slots)
+            || batch
+                .predict
+                .last()
+                .is_none_or(|&(lanes, _)| lanes < max_items)
+            || batch
+                .joint
+                .last()
+                .is_none_or(|&(rows, _)| rows < max_items * binding.rows)
+        {
+            return Err(invalid());
+        }
+        Ok(binding)
+    }
+}
+
+/// One open stream: its state (a device copy, or a batched stream's cache row) and the greedy
+/// decoder's position.
 pub struct RnntStream {
     saved: Vec<PacketTensor>,
     previous_token: u32,
     active_bank: usize,
     steps: usize,
+    /// A batched stream's cache row; its predictor slot holds the output for `previous_token`
+    /// (`predicted`), or no state yet (`fresh`).
+    slot: Option<u32>,
+    predicted: bool,
+    fresh: bool,
 }
 
 /// Mel frames the stream reads per step: the first window, later windows, and how many of a later
-/// window's leading frames repeat the previous step's.
+/// window's leading frames repeat the previous step's; the encoder rows a step adds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamWindows {
     pub first: usize,
     pub step: usize,
     pub history: usize,
     pub bins: usize,
+    pub rows: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -251,6 +457,19 @@ impl PacketRnnt {
         } else {
             None
         };
+        let batch = pipeline
+            .optional_parameter("batch.slots")
+            .map(|slots| BatchBinding::bind(&pipeline, slots, row_bytes))
+            .transpose()?;
+        let chunk = match &batch {
+            Some(batch) if backend == "cuda" && pipeline.program("chunk.init").is_ok() => {
+                let bins = usize_parameter(&pipeline, "audio.frontend.bins")?;
+                let binding = ChunkBinding::bind(&pipeline, batch, bins)?;
+                runtime.run(pipeline.program("chunk.init")?)?;
+                Some(binding)
+            }
+            _ => None,
+        };
         let state_zeros = vec![0; states.iter().map(|state| state.bytes).max().unwrap_or(0)];
         let output = match pipeline.optional_parameter(speech_contract::CONTRACT) {
             None => None,
@@ -305,6 +524,8 @@ impl PacketRnnt {
             profiling: false,
             last_profile: None,
             stream,
+            batch,
+            chunk,
             output,
         })
     }
@@ -320,16 +541,75 @@ impl PacketRnnt {
 
     /// The mel windows of the packet's encoder stream, if it carries one this backend can run.
     pub fn stream_windows(&self) -> Option<StreamWindows> {
+        if let Some(c) = &self.chunk {
+            return Some(StreamWindows {
+                first: c.first_input_frames,
+                step: c.step_input_frames,
+                history: c.history_input_frames,
+                bins: c.bins,
+                rows: c.rows,
+            });
+        }
         self.stream.as_ref().map(|s| StreamWindows {
             first: s.first_input_frames,
             step: s.step_input_frames,
             history: s.history_input_frames,
             bins: s.bins,
+            rows: s.rows,
         })
+    }
+
+    /// Streams one [`Self::stream_step_batch`] steps at most: 1 without batched streams.
+    pub fn stream_batch(&self) -> usize {
+        self.chunk
+            .as_ref()
+            .and_then(|c| c.rungs.last())
+            .map_or(1, |rung| rung.0)
+    }
+
+    /// Batched streams that can be open at once; `None`: unbounded (one state copy each).
+    pub fn stream_slots(&self) -> Option<usize> {
+        self.chunk.as_ref().map(|c| c.scratch as usize)
+    }
+
+    /// Encoder rows the offline transcription of `valid_input_frames` mel frames decodes: a
+    /// stream's final steps decode up to the same row. `None` when they cannot reproduce it.
+    pub fn final_rows(&self, valid_input_frames: usize) -> Result<Option<usize>> {
+        match self.encoder_for(valid_input_frames) {
+            Ok((encoder, frames)) => {
+                let bucket = transformed_frame_count(
+                    self.encoder_programs[encoder].0,
+                    &self.frame_transform,
+                )?;
+                let step = self.stream_windows().map_or(1, |w| w.rows);
+                Ok(steps_stay_in_bucket(frames, step, bucket).then_some(frames))
+            }
+            Err(_) => Ok(Some(
+                transformed_frame_count(valid_input_frames, &self.frame_transform)?
+                    + self.trailing_frames,
+            )),
+        }
     }
 
     /// Open a stream: zeroed caches and predictor, the decoder at the blank token.
     pub fn stream_open(&mut self) -> Result<RnntStream> {
+        let mut stream = RnntStream {
+            saved: Vec::new(),
+            previous_token: self.blank_id,
+            active_bank: 0,
+            steps: 0,
+            slot: None,
+            predicted: false,
+            fresh: true,
+        };
+        if let Some(chunk) = &mut self.chunk {
+            // Caches read as zeros at a stream's first step, so a reused row needs no reset.
+            stream.slot =
+                Some(chunk.free.pop().ok_or_else(|| {
+                    RuntimeError::Overloaded("every ASR stream slot is open".into())
+                })?);
+            return Ok(stream);
+        }
         let binding = self
             .stream
             .as_mut()
@@ -347,17 +627,15 @@ impl PacketRnnt {
                 .map(|state| self.runtime.create_tensor(state.bytes))
                 .collect::<Result<_>>()?,
         };
-        Ok(RnntStream {
-            saved,
-            previous_token: self.blank_id,
-            active_bank: 0,
-            steps: 0,
-        })
+        stream.saved = saved;
+        Ok(stream)
     }
 
     pub fn stream_close(&mut self, stream: RnntStream) {
-        if let Some(binding) = &mut self.stream {
-            binding.pool.push(stream.saved);
+        match (stream.slot, &mut self.chunk, &mut self.stream) {
+            (Some(slot), Some(chunk), _) => chunk.free.push(slot),
+            (None, _, Some(binding)) => binding.pool.push(stream.saved),
+            _ => {}
         }
     }
 
@@ -371,6 +649,17 @@ impl PacketRnnt {
         window: &[f32],
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
+        if stream.slot.is_some() {
+            let rows = self.chunk.as_ref().map_or(0, |c| c.rows);
+            let tokens = self
+                .stream_step_batch(&mut [(stream, window, rows)])?
+                .pop()
+                .unwrap_or_default();
+            if !tokens.is_empty() {
+                on_emit(&tokens);
+            }
+            return Ok(tokens);
+        }
         let binding = self
             .stream
             .take()
@@ -383,6 +672,163 @@ impl PacketRnnt {
         ended?;
         stream.steps += 1;
         Ok(tokens)
+    }
+
+    /// One step of several batched streams in one launch (at most [`Self::stream_batch`]): each
+    /// `(stream, window, rows)` takes `window` as [`Self::stream_step`] does and decodes the first
+    /// `rows` of the step's encoder rows (all of them but on a stream's final step). Returns each
+    /// stream's tokens, as its steps alone decode them.
+    pub fn stream_step_batch(
+        &mut self,
+        steps: &mut [(&mut RnntStream, &[f32], usize)],
+    ) -> Result<Vec<Vec<u32>>> {
+        let (Some(mut chunk), Some(batch)) = (self.chunk.take(), self.batch.take()) else {
+            return Err(RuntimeError::Rejected(
+                "packet has no batched encoder stream".into(),
+            ));
+        };
+        self.runtime.begin_execution()?;
+        let result = self.chunk_step_active(&mut chunk, &batch, steps);
+        let ended = self.runtime.end_execution();
+        self.chunk = Some(chunk);
+        self.batch = Some(batch);
+        result.and_then(|tokens| ended.map(|()| tokens))
+    }
+
+    fn chunk_step_active(
+        &mut self,
+        chunk: &mut ChunkBinding,
+        batch: &BatchBinding,
+        steps: &mut [(&mut RnntStream, &[f32], usize)],
+    ) -> Result<Vec<Vec<u32>>> {
+        let rung = |count: usize| chunk.rungs.iter().position(|rung| rung.0 >= count);
+        let Some(step_rung) = rung(steps.len()).filter(|_| !steps.is_empty()) else {
+            return Err(RuntimeError::Rejected(format!(
+                "a batched stream step takes 1..={} streams",
+                chunk.rungs.last().map_or(0, |rung| rung.0)
+            )));
+        };
+        let (r, left) = (chunk.rows, chunk.left_rows);
+        let [first, next] = &mut chunk.windows;
+        let [index, slot, pos, key_start] = &mut chunk.lanes;
+        for buffer in [&mut *index, &mut *slot, &mut *pos, &mut *key_start] {
+            buffer.clear();
+        }
+        first.clear();
+        next.clear();
+        let (mut firsts, mut nexts) = (0, 0);
+        for (stream, window, rows) in steps.iter() {
+            let (Some(cache_row), true) = (stream.slot, *rows <= r) else {
+                return Err(RuntimeError::Rejected(
+                    "batched stream step needs open batched streams".into(),
+                ));
+            };
+            let (frames, row0) = if stream.steps == 0 {
+                firsts += 1;
+                (chunk.first_input_frames, (firsts - 1) * r)
+            } else {
+                nexts += 1;
+                (chunk.step_input_frames, chunk.next_row0 + (nexts - 1) * r)
+            };
+            if window.len() != frames * chunk.bins {
+                return Err(RuntimeError::Rejected(format!(
+                    "stream window has {} values, expected {}",
+                    window.len(),
+                    frames * chunk.bins
+                )));
+            }
+            if stream.steps == 0 {
+                &mut *first
+            } else {
+                &mut *next
+            }
+            .extend_from_slice(window);
+            index.extend((row0..row0 + r).map(|row| row as u32));
+            slot.push(cache_row);
+            pos.push(stream.steps.min(u32::MAX as usize) as u32);
+            // Keys before this window row are not filled yet: the stream's first chunks.
+            key_start.push(left.saturating_sub(stream.steps.saturating_mul(r)) as u32);
+        }
+        // Padding items read zeros (past the staging table, at a first step) into the scratch row.
+        let lanes = chunk.rungs[step_rung].0;
+        index.resize(lanes * r, u32::MAX);
+        slot.resize(lanes, chunk.scratch);
+        pos.resize(lanes, 0);
+        key_start.resize(lanes, left as u32);
+        let mut programs = Vec::new();
+        for (count, kind, tensor, values) in [
+            (firsts, 0, chunk.first, &*first),
+            (nexts, 1, chunk.next, &*next),
+        ] {
+            if count != 0 {
+                self.runtime
+                    .write_tensor_at(tensor, 0, bytemuck::cast_slice(values))?;
+                let rung = rung(count).expect("within the step rung");
+                programs.extend_from_slice(&chunk.rungs[rung].1[kind]);
+            }
+        }
+        for (tensor, values) in [
+            (chunk.index, &*index),
+            (chunk.slot, &*slot),
+            (chunk.pos, &*pos),
+            (chunk.key_start, &*key_start),
+        ] {
+            self.runtime
+                .write_tensor_at(tensor, 0, bytemuck::cast_slice(values))?;
+        }
+        programs.extend_from_slice(&chunk.rungs[step_rung].1[2]);
+        let started = Instant::now();
+        self.runtime.run_sequence(&programs)?;
+        let encoder_us = self.runtime.last_run_us();
+        let encoder_wall = started.elapsed();
+        let mut items: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .map(|(i, (stream, _, rows))| BatchItem {
+                slot: chunk.predictor_slot0 + stream.slot.expect("checked"),
+                base: chunk.encoder_row0 + i * r,
+                frames: *rows,
+                frame: 0,
+                symbols_at_frame: 0,
+                previous_token: stream.previous_token,
+                predicted: stream.predicted,
+                fresh: stream.fresh,
+                tokens: Vec::new(),
+            })
+            .collect();
+        let mut execution = PacketBatchExecution {
+            runtime: &mut *self.runtime,
+            batch,
+            blank_id: self.blank_id,
+            lanes: Vec::new(),
+            ids: Vec::new(),
+        };
+        decode_batch(
+            &mut execution,
+            &mut items,
+            self.blank_id,
+            self.max_symbols_per_frame,
+            self.joint_batch_max,
+        )?;
+        tracing::debug!(
+            streams = steps.len(),
+            lanes,
+            encoder_us,
+            encoder_wall_us = encoder_wall.as_micros() as u64,
+            decode_us = (started.elapsed() - encoder_wall).as_micros() as u64,
+            "rnnt batched stream step"
+        );
+        Ok(steps
+            .iter_mut()
+            .zip(items)
+            .map(|((stream, _, _), item)| {
+                stream.previous_token = item.previous_token;
+                stream.predicted = item.predicted;
+                stream.fresh = item.fresh;
+                stream.steps += 1;
+                item.tokens
+            })
+            .collect())
     }
 
     fn stream_step_active(
@@ -507,6 +953,79 @@ impl PacketRnnt {
         valid_input_frames: usize,
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
+        let (encoder, frames) = self.encoder_for(valid_input_frames)?;
+        self.transcribe_input_with_encoder_frames(input, frames, encoder, on_emit)
+    }
+
+    /// Recordings one [`Self::transcribe_batch_input_frames`] call takes; 0 without the packet's
+    /// batched decode.
+    pub fn batch_capacity(&self) -> usize {
+        self.batch.as_ref().map_or(0, |batch| match &self.chunk {
+            // The slots and rows past these are the batched streams'.
+            Some(chunk) => (chunk.predictor_slot0 as usize).min(chunk.encoder_row0 / self.frames),
+            None => (batch.slots as usize - 1).min(batch.encoder_rows as usize / self.frames),
+        })
+    }
+
+    /// [`Self::transcribe_input_frames`] for several recordings (input, valid input frames): each
+    /// encoder runs alone, then one greedy decode steps them all together. Each recording's
+    /// tokens equal its own [`Self::transcribe_input_frames`].
+    pub fn transcribe_batch_input_frames(
+        &mut self,
+        inputs: &[(&[f32], usize)],
+    ) -> Result<Vec<Vec<u32>>> {
+        if inputs.is_empty() || inputs.len() > self.batch_capacity() {
+            return Err(RuntimeError::Rejected(format!(
+                "batched RNNT decode needs 1..={} recordings",
+                self.batch_capacity()
+            )));
+        }
+        let batch = self.batch.take().expect("checked by batch_capacity");
+        self.runtime.begin_execution()?;
+        let result = self.transcribe_batch_active(&batch, inputs);
+        let ended = self.runtime.end_execution();
+        self.batch = Some(batch);
+        result.and_then(|tokens| ended.map(|()| tokens))
+    }
+
+    fn transcribe_batch_active(
+        &mut self,
+        batch: &BatchBinding,
+        inputs: &[(&[f32], usize)],
+    ) -> Result<Vec<Vec<u32>>> {
+        let mut items = Vec::with_capacity(inputs.len());
+        for (index, &(input, valid_input_frames)) in inputs.iter().enumerate() {
+            let (encoder, frames) = self.encoder_for(valid_input_frames)?;
+            self.encode(input, frames, encoder)?;
+            let base = index * self.frames;
+            self.runtime.copy_tensor(
+                self.encoder_joint,
+                0,
+                batch.encoder,
+                base * self.row_bytes,
+                frames * self.row_bytes,
+            )?;
+            items.push(BatchItem::new(index as u32, base, frames, self.blank_id));
+        }
+        let mut execution = PacketBatchExecution {
+            runtime: &mut *self.runtime,
+            batch,
+            blank_id: self.blank_id,
+            lanes: Vec::new(),
+            ids: Vec::new(),
+        };
+        decode_batch(
+            &mut execution,
+            &mut items,
+            self.blank_id,
+            self.max_symbols_per_frame,
+            self.joint_batch_max,
+        )?;
+        Ok(items.into_iter().map(|item| item.tokens).collect())
+    }
+
+    /// The smallest encoder capacity holding `valid_input_frames`, and its valid encoder frames.
+    fn encoder_for(&self, valid_input_frames: usize) -> Result<(usize, usize)> {
         let encoder = self
             .encoder_programs
             .iter()
@@ -518,7 +1037,27 @@ impl PacketRnnt {
             })?;
         let frames =
             self.valid_encoder_frames(valid_input_frames, self.encoder_programs[encoder].0)?;
-        self.transcribe_input_with_encoder_frames(input, frames, encoder, on_emit)
+        Ok((encoder, frames))
+    }
+
+    /// Run encoder `encoder` on `input`, leaving its rows in `encoder.joint`.
+    fn encode(&mut self, input: &[f32], frames: usize, encoder: usize) -> Result<()> {
+        if input.len() != self.input_elements() {
+            return Err(RuntimeError::Rejected(format!(
+                "packet RNNT input has {} elements, expected {}",
+                input.len(),
+                self.input_elements()
+            )));
+        }
+        self.runtime
+            .write_tensor(self.input, bytemuck::cast_slice(input))?;
+        if let Some(valid_rows) = self.valid_rows {
+            let valid = u32::try_from(frames)
+                .map_err(|_| RuntimeError::Rejected("encoder frame count overflows".into()))?;
+            self.runtime
+                .write_tensor(valid_rows, &valid.to_ne_bytes())?;
+        }
+        self.runtime.run_sequence(&self.encoder_programs[encoder].1)
     }
 
     fn transcribe_input_with_encoder_frames(
@@ -541,27 +1080,11 @@ impl PacketRnnt {
         encoder: usize,
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
-        if input.len() != self.input_elements() {
-            return Err(RuntimeError::Rejected(format!(
-                "packet RNNT input has {} elements, expected {}",
-                input.len(),
-                self.input_elements()
-            )));
-        }
         for &state in &self.states {
             self.runtime
                 .write_tensor(state, &self.state_zeros[..state.bytes])?;
         }
-        self.runtime
-            .write_tensor(self.input, bytemuck::cast_slice(input))?;
-        if let Some(valid_rows) = self.valid_rows {
-            let valid = u32::try_from(frames)
-                .map_err(|_| RuntimeError::Rejected("encoder frame count overflows".into()))?;
-            self.runtime
-                .write_tensor(valid_rows, &valid.to_ne_bytes())?;
-        }
-        self.runtime
-            .run_sequence(&self.encoder_programs[encoder].1)?;
+        self.encode(input, frames, encoder)?;
         let mut profile = self.profiling.then(|| RnntProfile {
             encoder_runtime_us: self.runtime.last_run_us(),
             ..RnntProfile::default()
@@ -718,6 +1241,220 @@ impl RnntExecution for PacketRnntExecution<'_> {
     }
 }
 
+/// One recording of a [`decode_batch`]: encoder rows `base..base + frames` of the batch encoder
+/// table, decoded with the predictor state of `slot`.
+pub struct BatchItem {
+    slot: u32,
+    base: usize,
+    frames: usize,
+    frame: usize,
+    symbols_at_frame: usize,
+    previous_token: u32,
+    /// The slot's predictor output is current (computed for `previous_token`).
+    predicted: bool,
+    /// The slot's state is not this recording's yet: the predictor starts from zeros.
+    fresh: bool,
+    tokens: Vec<u32>,
+}
+
+impl BatchItem {
+    pub fn new(slot: u32, base: usize, frames: usize, blank_id: u32) -> Self {
+        Self {
+            slot,
+            base,
+            frames,
+            frame: 0,
+            symbols_at_frame: 0,
+            previous_token: blank_id,
+            predicted: false,
+            fresh: true,
+            tokens: Vec::new(),
+        }
+    }
+
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+}
+
+/// A predictor lane of a batched step: embed `token` into the state of `slot` (zeros when `fresh`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchPredict {
+    pub slot: u32,
+    pub token: u32,
+    pub fresh: bool,
+}
+
+/// Device side of [`decode_batch`].
+pub trait BatchedRnntExecution {
+    /// Joint rows one step evaluates at most.
+    fn max_rows(&self) -> usize;
+    /// Run the predictor lanes, then the joint for `rows` (slot, encoder row), writing each row's
+    /// argmax to `ids`.
+    fn step(
+        &mut self,
+        predict: &[BatchPredict],
+        rows: &[(u32, u32)],
+        ids: &mut [u32],
+    ) -> Result<()>;
+}
+
+/// [`GreedyRnnt::decode`] for many recordings per launch. Each step predicts for the recordings
+/// that emitted (or start) and evaluates up to `window` frames of every unfinished one; a joint
+/// row depends only on its frame and its recording's tokens, so each recording decodes exactly
+/// as it would alone.
+pub fn decode_batch(
+    execution: &mut dyn BatchedRnntExecution,
+    items: &mut [BatchItem],
+    blank_id: u32,
+    max_symbols_per_frame: usize,
+    window: usize,
+) -> Result<()> {
+    if max_symbols_per_frame == 0 || window == 0 || items.len() > execution.max_rows() {
+        return Err(RuntimeError::Rejected(
+            "invalid batched RNNT decode geometry".into(),
+        ));
+    }
+    let (mut predict, mut rows, mut spans, mut ids) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    loop {
+        let active = items.iter().filter(|item| item.frame < item.frames).count();
+        if active == 0 {
+            return Ok(());
+        }
+        let width = window.min(execution.max_rows() / active);
+        predict.clear();
+        rows.clear();
+        spans.clear();
+        for (index, item) in items.iter().enumerate() {
+            if item.frame >= item.frames {
+                continue;
+            }
+            if !item.predicted {
+                predict.push(BatchPredict {
+                    slot: item.slot,
+                    token: item.previous_token,
+                    fresh: item.fresh,
+                });
+            }
+            let count = width.min(item.frames - item.frame);
+            spans.push((index, rows.len(), count));
+            let first = item.base + item.frame;
+            rows.extend((first..first + count).map(|row| (item.slot, row as u32)));
+        }
+        ids.clear();
+        ids.resize(rows.len(), blank_id);
+        execution.step(&predict, &rows, &mut ids)?;
+        for &(index, start, count) in &spans {
+            let item = &mut items[index];
+            item.predicted = true;
+            item.fresh = false;
+            let evaluated = &ids[start..start + count];
+            let Some(offset) = evaluated.iter().position(|&token| token != blank_id) else {
+                item.frame += count;
+                item.symbols_at_frame = 0;
+                continue;
+            };
+            if offset != 0 {
+                item.symbols_at_frame = 0;
+            }
+            item.frame += offset;
+            let token = evaluated[offset];
+            item.tokens.push(token);
+            item.previous_token = token;
+            item.predicted = false;
+            item.symbols_at_frame += 1;
+            if item.symbols_at_frame == max_symbols_per_frame {
+                item.frame += 1;
+                item.symbols_at_frame = 0;
+            }
+        }
+    }
+}
+
+struct PacketBatchExecution<'a> {
+    runtime: &'a mut dyn PacketRuntime,
+    batch: &'a BatchBinding,
+    blank_id: u32,
+    lanes: Vec<u32>,
+    ids: Vec<u32>,
+}
+
+impl PacketBatchExecution<'_> {
+    /// The smallest rung holding `count`.
+    fn rung(rungs: &[(usize, usize)], count: usize) -> Result<(usize, usize)> {
+        rungs
+            .iter()
+            .copied()
+            .find(|&(capacity, _)| capacity >= count)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(format!("no batched RNNT program holds {count} lanes"))
+            })
+    }
+
+    /// Write `values` then `pad` up to `count` lanes.
+    fn write(
+        &mut self,
+        tensor: PacketTensor,
+        values: impl Iterator<Item = u32>,
+        pad: u32,
+        count: usize,
+    ) -> Result<()> {
+        self.lanes.clear();
+        self.lanes.extend(values);
+        self.lanes.resize(count, pad);
+        self.runtime
+            .write_tensor_at(tensor, 0, bytemuck::cast_slice(&self.lanes))
+    }
+}
+
+impl BatchedRnntExecution for PacketBatchExecution<'_> {
+    fn max_rows(&self) -> usize {
+        self.batch.joint.last().map_or(0, |&(rows, _)| rows)
+    }
+
+    fn step(
+        &mut self,
+        predict: &[BatchPredict],
+        rows: &[(u32, u32)],
+        ids: &mut [u32],
+    ) -> Result<()> {
+        let batch = self.batch;
+        let mut programs = Vec::with_capacity(2);
+        if !predict.is_empty() {
+            let (lanes, program) = Self::rung(&batch.predict, predict.len())?;
+            // Padding lanes embed blank from zeros into the scratch slot.
+            let (beyond, scratch) = (batch.slots, batch.slots - 1);
+            self.write(
+                batch.token,
+                predict.iter().map(|p| p.token),
+                self.blank_id,
+                lanes,
+            )?;
+            let state = |p: &BatchPredict| if p.fresh { beyond } else { p.slot };
+            self.write(batch.state_index, predict.iter().map(state), beyond, lanes)?;
+            self.write(batch.slot, predict.iter().map(|p| p.slot), scratch, lanes)?;
+            programs.push(program);
+        }
+        let (count, program) = Self::rung(&batch.joint, rows.len())?;
+        // Padding rows read zeros: past the encoder table and past the slots.
+        self.write(
+            batch.row_index,
+            rows.iter().map(|r| r.1),
+            batch.encoder_rows,
+            count,
+        )?;
+        self.write(batch.row_slot, rows.iter().map(|r| r.0), batch.slots, count)?;
+        programs.push(program);
+        self.runtime.run_sequence(&programs)?;
+        self.ids.resize(count, 0);
+        self.runtime
+            .read_tensor_at(batch.ids, 0, bytemuck::cast_slice_mut(&mut self.ids))?;
+        ids.copy_from_slice(&self.ids[..rows.len()]);
+        Ok(())
+    }
+}
+
 fn usize_parameter(pipeline: &BoundPacketPipeline, name: &str) -> Result<usize> {
     usize::try_from(pipeline.parameter(name)?)
         .map_err(|_| RuntimeError::Rejected(format!("packet parameter {name:?} overflows")))
@@ -771,6 +1508,13 @@ fn transformed_frame_count(mut frames: usize, stages: &[[usize; 4]]) -> Result<u
         frames = (padded - kernel) / stride + 1;
     }
     Ok(frames)
+}
+
+/// Whether stream steps of `step` encoder rows decoding `rows` stay within an offline encoder
+/// bucket of `bucket` rows. The steps encode whole attention chunks; offline, a chunk the bucket
+/// cuts short has fewer keys, so its rows differ from the stream's.
+fn steps_stay_in_bucket(rows: usize, step: usize, bucket: usize) -> bool {
+    rows.div_ceil(step).saturating_mul(step) <= bucket
 }
 
 fn bounded_transformed_frame_count(
@@ -993,6 +1737,15 @@ mod tests {
     }
 
     #[test]
+    fn stream_finals_stay_in_the_offline_bucket() {
+        // Nemotron's 200-frame bucket: 25 rows, attention chunks of 4.
+        assert!(steps_stay_in_bucket(24, 4, 25));
+        assert!(!steps_stay_in_bucket(25, 4, 25));
+        assert!(steps_stay_in_bucket(100, 4, 100));
+        assert!(steps_stay_in_bucket(1, 1, 1));
+    }
+
+    #[test]
     fn batches_a_blank_run_and_restarts_at_the_emitting_frame() {
         let mut execution = Scripted {
             frames: 3,
@@ -1081,6 +1834,153 @@ mod tests {
             .with_tdt_durations(&[0, 1, 2, 3, 4]);
         assert_eq!(decoder.decode(&mut limited).unwrap(), [4, 4]);
         assert_eq!(limited.calls, [0, 0, 1]);
+    }
+
+    /// Mostly blank (13); now and then a token, sometimes several at one frame.
+    fn scripted(history: &[u32], frame: usize) -> u32 {
+        let h = history
+            .iter()
+            .fold(frame as u64 * 0x9e37_79b9 + 7, |h, &t| {
+                h.wrapping_mul(31).wrapping_add(u64::from(t) + 1)
+            });
+        let h = (h ^ (h >> 13)).wrapping_mul(0x5bd1_e995);
+        let h = h ^ (h >> 29);
+        if h % 3 == 0 {
+            1 + (h >> 8) as u32 % 7
+        } else {
+            13
+        }
+    }
+
+    /// One recording through the batch-1 interface: the joint sees the committed tokens and the
+    /// pending prediction's token.
+    struct ScriptedRecording {
+        frames: usize,
+        window: usize,
+        committed: Vec<u32>,
+        pending: Vec<u32>,
+    }
+
+    impl RnntExecution for ScriptedRecording {
+        fn frames(&self) -> usize {
+            self.frames
+        }
+
+        fn predict(&mut self, previous_token: u32) -> Result<()> {
+            self.pending = self.committed.clone();
+            self.pending.push(previous_token);
+            Ok(())
+        }
+
+        fn joint_argmax(&mut self, first_frame: usize, output: &mut [u32]) -> Result<usize> {
+            let rows = output.len().min(self.window);
+            for (row, out) in output[..rows].iter_mut().enumerate() {
+                *out = scripted(&self.pending, first_frame + row);
+            }
+            Ok(rows)
+        }
+
+        fn commit_prediction(&mut self) {
+            self.committed = self.pending.clone();
+        }
+    }
+
+    /// Slot states as token histories; rows are `base[slot] + frame`.
+    struct ScriptedBatch {
+        history: Vec<Vec<u32>>,
+        base: Vec<usize>,
+        max_rows: usize,
+        steps: usize,
+    }
+
+    impl BatchedRnntExecution for ScriptedBatch {
+        fn max_rows(&self) -> usize {
+            self.max_rows
+        }
+
+        fn step(
+            &mut self,
+            predict: &[BatchPredict],
+            rows: &[(u32, u32)],
+            ids: &mut [u32],
+        ) -> Result<()> {
+            assert!(rows.len() <= self.max_rows && rows.len() == ids.len());
+            self.steps += 1;
+            for p in predict {
+                let history = &mut self.history[p.slot as usize];
+                if p.fresh {
+                    history.clear();
+                }
+                history.push(p.token);
+            }
+            for (id, &(slot, row)) in ids.iter_mut().zip(rows) {
+                let slot = slot as usize;
+                *id = scripted(&self.history[slot], row as usize - self.base[slot]);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn batched_decode_matches_each_recording_alone() {
+        let frames = [0, 1, 5, 17, 40, 3, 64, 9];
+        for (window, max_rows, max_symbols) in [(16, 64, 10), (1, 8, 2), (4, 12, 1), (16, 8, 3)] {
+            let mut alone = Vec::new();
+            for &n in &frames {
+                let mut recording = ScriptedRecording {
+                    frames: n,
+                    window: 3,
+                    committed: Vec::new(),
+                    pending: Vec::new(),
+                };
+                alone.push(
+                    GreedyRnnt::new(13, max_symbols)
+                        .unwrap()
+                        .decode(&mut recording)
+                        .unwrap(),
+                );
+            }
+            let base: Vec<usize> = frames
+                .iter()
+                .scan(0, |next, &n| {
+                    let base = *next;
+                    *next += n + 2;
+                    Some(base)
+                })
+                .collect();
+            let mut items: Vec<_> = frames
+                .iter()
+                .zip(&base)
+                .enumerate()
+                .map(|(slot, (&n, &base))| BatchItem::new(slot as u32, base, n, 13))
+                .collect();
+            let mut execution = ScriptedBatch {
+                history: vec![vec![99]; frames.len()],
+                base,
+                max_rows,
+                steps: 0,
+            };
+            decode_batch(&mut execution, &mut items, 13, max_symbols, window).unwrap();
+            for (item, expected) in items.iter().zip(&alone) {
+                assert_eq!(
+                    item.tokens(),
+                    &expected[..],
+                    "window {window} max_rows {max_rows}"
+                );
+            }
+            assert!(
+                alone.iter().map(Vec::len).sum::<usize>() > 10,
+                "the script emits"
+            );
+        }
+        let mut execution = ScriptedBatch {
+            history: vec![Vec::new(); 3],
+            base: vec![0; 3],
+            max_rows: 2,
+            steps: 0,
+        };
+        let mut items: Vec<_> = (0..3).map(|slot| BatchItem::new(slot, 0, 4, 13)).collect();
+        assert!(decode_batch(&mut execution, &mut items, 13, 10, 4).is_err());
     }
 
     #[test]

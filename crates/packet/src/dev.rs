@@ -1976,9 +1976,11 @@ pub enum DevOp {
     GemmAffineQ4 = 162,
     /// GGUF Q8_0 projection with FP32 activations and output. The weight is `[N,K]` in canonical
     /// 34-byte blocks (FP16 scale followed by 32 signed bytes); optional FP32 bias is added before
-    /// `activation` (0 = identity, 1 = SiLU).
+    /// `activation` (0 = identity, 1 = SiLU). `path` fixes the kernel, whose two paths round
+    /// differently: 0 = by row count (the GEMV walk at most 8 rows, tiles above), 1 = the GEMV
+    /// walk, 2 = tiles. A fixed path keeps each row's result independent of the launch's rows.
     /// `t0=C(f32) t1=A(f32) t2=W(q8_0) t3=bias?` ·
-    /// `i0=M i1=N i2=K i3=activation i4=a_row0`.
+    /// `i0=M i1=N i2=K i3=activation i4=a_row0 i7=path`.
     Q8GemmF32 = 163,
     /// FP32 LayerNorm with population variance and optional FP32 affine parameters.
     /// Numerical flag `i2` bit 0 rounds each output to BF16; bit 1 computes mean and variance
@@ -1994,7 +1996,9 @@ pub enum DevOp {
     /// `t0=out t1=x` · `i0=rows i1=width`.
     GluF32 = 166,
     /// FP32 causal depthwise convolution with FP16 `[channels,kernel]` weights and zero left pad.
-    /// `t0=out t1=x t2=weight(f16)` · `i0=rows i1=channels i2=kernel`.
+    /// Rows come in items of `rows_per_item` (0 = one item); taps before an item's first row read
+    /// zero.
+    /// `t0=out t1=x t2=weight(f16)` · `i0=rows i1=channels i2=kernel i3=rows_per_item`.
     CausalDepthwiseConv1dF32 = 167,
     /// FP32 relative-position attention. Q/K/V/position/context are `[rows,width]`, position has
     /// `2*rows-1` rows, and u/v are `[heads,width/heads]`. `left_chunks = u32::MAX` selects full
@@ -2003,8 +2007,10 @@ pub enum DevOp {
     /// window); full attention: the valid rows of a padded input, so later keys are excluded and
     /// later context rows are written as zeros.
     /// `i5` (0 = all) skips the query rows before it; their context rows are not written.
+    /// `i6` items (0 = 1): Q/K/V/context are `[items,rows,width]`, each item its own sequence with
+    /// its own `t7` entry (`u32[items]`); the position rows are shared.
     /// `t0=context t1=query t2=key t3=value t4=position t5=bias_u t6=bias_v t7=key_start?` ·
-    /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks i5=query_row0`.
+    /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks i5=query_row0 i6=items`.
     RelativeAttentionF32 = 168,
     /// Elementwise FP32 SiLU: `out = x / (1 + exp(-x))`; output may alias input.
     /// `t0=out t1=x` · `i0=n`.

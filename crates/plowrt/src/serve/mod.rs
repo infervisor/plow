@@ -23,7 +23,7 @@ mod golden_tests;
 #[allow(dead_code)]
 pub mod head;
 pub mod logprobs;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub mod manager;
 pub mod mm;
 pub mod models;
@@ -545,7 +545,7 @@ pub struct AppState {
     /// manager holds is already per-card — one free-VRAM figure, one slab pool,
     /// one LRU order, one switch lock — so instancing it per group keeps a load
     /// on GPU 1 from serializing behind a switch on GPU 0.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     managers: std::sync::OnceLock<Vec<Arc<manager::ModelManager>>>,
     /// slug → device-group index. The request path reads it to find the group
     /// serving a model; the control plane reports it. NOT vendor-gated: the
@@ -562,6 +562,9 @@ pub struct AppState {
     models_roots: std::sync::OnceLock<Vec<std::path::PathBuf>>,
     #[cfg(feature = "cpu")]
     portable: std::sync::OnceLock<Arc<portable::PortableManager>>,
+    /// slug → its engine's config (`config::bundle_config`), set before the engine loads; the
+    /// dispatcher and engine thread run under it.
+    engine_cfg: RwLock<FxHashMap<String, &'static crate::config::RuntimeConfig>>,
     /// Operator-set residency overrides, slug → state. Absent = [`Residency::Auto`].
     /// Only the control plane writes here; the manager and the request path read it.
     residency: RwLock<FxHashMap<String, Residency>>,
@@ -646,13 +649,14 @@ impl AppState {
             #[cfg(feature = "cuda")]
             kv_store: RwLock::new(FxHashMap::default()),
             mm: RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
             managers: std::sync::OnceLock::new(),
             slug_group: RwLock::new(FxHashMap::default()),
             turns: std::sync::OnceLock::new(),
             models_roots: std::sync::OnceLock::new(),
             #[cfg(feature = "cpu")]
             portable: std::sync::OnceLock::new(),
+            engine_cfg: RwLock::new(FxHashMap::default()),
             residency: RwLock::new(FxHashMap::default()),
             control: Mutex::new(FxHashMap::default()),
             started: openai::now_secs(),
@@ -787,7 +791,7 @@ impl AppState {
 
     /// Make some rank of `set` serve: a no-op while one does; otherwise load one whose residency
     /// admits (S1 switch on its group).
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub async fn dp_admit(&self, set: &dp::DpSet) -> std::result::Result<(), manager::EnsureError> {
         if set.ranks.iter().any(|r| r.is_up()) {
             return Ok(());
@@ -938,6 +942,10 @@ impl AppState {
     pub fn remove_gpu_engine(&self, slug: &str) -> Option<Arc<Mutex<engine::ServeEngine>>> {
         #[cfg(any(feature = "cuda", feature = "hsa"))]
         self.vmm_stats.write().remove(slug);
+        // The metrics handle shares the KV block store (device blocks, the pinned host tier and
+        // its threads): kept here, it outlived every unload and each reload added another.
+        #[cfg(feature = "cuda")]
+        self.kv_store.write().remove(slug);
         if let Some((set, r)) = self.dp_rank(slug) {
             set.set_probe(r, None);
         }
@@ -947,14 +955,14 @@ impl AppState {
     }
 
     /// Install the per-group residency managers (once, at startup).
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn install_managers(&self, m: Vec<Arc<manager::ModelManager>>) {
-        self.install_device_turns(m.len(), true);
+        self.install_device_turns(m.len(), cfg!(feature = "cuda"));
         let _ = self.managers.set(m);
     }
 
     /// Install one manager — the single-group case, and what tests use.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn install_manager(&self, m: Arc<manager::ModelManager>) {
         self.install_managers(vec![m]);
     }
@@ -991,6 +999,26 @@ impl AppState {
             }
             turns
         });
+    }
+
+    /// `slug` is about to run beside `others` engines on its group: raise an unordered turn to
+    /// what a startup with them all would have picked (`policy::co_sched`).
+    ///
+    /// Not on AMD: a co-tenant's tick already in flight under `free` overlaps the new tenant's
+    /// first ordered one, harmless on CUDA (throughput) and a possible whole-grid wait on HSA,
+    /// whose groups must be started `--co-sched rr` to share (the manager refuses otherwise).
+    pub fn upgrade_turn(&self, slug: &str, others: usize, amd: bool) {
+        if others == 0 || amd {
+            return;
+        }
+        let Some(turn) = self.device_turn(slug) else {
+            return;
+        };
+        let want = policy::co_sched(others + 1, amd);
+        if turn.upgrade(want) {
+            policy::set_co_sched(want);
+            tracing::info!(%slug, tenants = others + 1, mode = ?want, "co-tenant turns raised for a runtime load");
+        }
     }
 
     /// `slug`'s downstream credit (created on first use; unlimited until a stage sets a limit).
@@ -1036,7 +1064,7 @@ impl AppState {
     }
 
     /// Every installed manager, one per device group.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn managers(&self) -> &[Arc<manager::ModelManager>] {
         self.managers.get().map(Vec::as_slice).unwrap_or(&[])
     }
@@ -1046,7 +1074,7 @@ impl AppState {
     /// Placement is the authority; the fallback scan exists for managers
     /// installed without a placement pass (tests, and the single-group case),
     /// and for a slug registered at runtime before its group was recorded.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn manager_for(&self, slug: &str) -> Option<&Arc<manager::ModelManager>> {
         let managers = self.managers();
         if let Some(g) = self.slug_group(slug) {
@@ -1059,7 +1087,7 @@ impl AppState {
 
     /// The manager a NEW model should be registered with: the named group, or
     /// the one with the most free memory when the caller did not name one.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn manager_for_new(
         &self,
         group: Option<usize>,
@@ -1104,6 +1132,16 @@ impl AppState {
     /// The assets-dir allow-list. Empty until `install_models_roots`.
     pub fn models_roots(&self) -> &[std::path::PathBuf] {
         self.models_roots.get().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Record the config `slug`'s engine runs under.
+    pub fn set_engine_config(&self, slug: &str, cfg: &'static crate::config::RuntimeConfig) {
+        self.engine_cfg.write().insert(slug.to_string(), cfg);
+    }
+
+    /// The config `slug`'s engine runs under; `None` = the process config.
+    pub fn engine_config(&self, slug: &str) -> Option<&'static crate::config::RuntimeConfig> {
+        self.engine_cfg.read().get(slug).copied()
     }
 
     /// Residency state of `slug` (defaults to [`Residency::Auto`]).
@@ -1378,6 +1416,13 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/completions", post(completion::completions))
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
+        .route("/v1/tokenize", post(tokenize::tokenize))
+        .route("/v1/detokenize", post(tokenize::detokenize))
+        .route("/models", get(models::list_models))
+        .route(
+            "/models/:id",
+            get(models::get_model).fallback(models::model_route_fallback),
+        )
         .route("/v1/models", get(models::list_models))
         // GET only, with a 404 fallback for every other method. The admin
         // routes live at `/v1/models/load|unload|status`, and a bare
@@ -1394,6 +1439,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         // `/healthz`, so all of them got a 404 from a healthy server.
         .route("/health", get(healthz))
         .route("/healthz", get(healthz))
+        .route("/version", get(version_handler))
         .route("/metrics", get(metrics_handler))
         .route("/v1/metrics", get(metrics_snapshot_handler))
         .route("/trace", get(trace_handler))
@@ -1441,6 +1487,16 @@ async fn healthz(
             ),
         )
     }
+}
+
+/// `GET /version` — vLLM parity version endpoint.
+async fn version_handler() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION")
+        })),
+    )
 }
 
 /// Models that can no longer serve (a fatal device fault or an ASR encoder exit), and DP ranks

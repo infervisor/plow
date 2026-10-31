@@ -67,22 +67,17 @@ fn speech_card(state: &AppState, canonical: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// The routes `canonical` serves: its card's `x_plow_endpoints`. Exact for a bound (resident)
-/// model; a managed model that is not resident reads as a text model until its switch binds it.
+/// The routes `canonical` serves: its card's `x_plow_endpoints`.
 pub(crate) fn endpoints(state: &AppState, canonical: &str) -> Vec<&'static str> {
-    #[cfg(feature = "cuda")]
-    if crate::tts::serving::serves_speech(state, canonical) {
-        // A speech LM's tokens are codec / speech ids: it serves audio, not text.
-        return vec!["audio/speech"];
-    } else if crate::asr::serving::serves_audio(state, canonical)
-        || crate::asr::serving::packet_model_names()
-            .iter()
-            .any(|n| n == canonical)
+    if let Ok(bundle) = state.registry.get(canonical) {
+        return bundle.endpoints().to_vec();
+    }
+    if crate::asr::serving::packet_model_names()
+        .iter()
+        .any(|n| n == canonical)
     {
-        // An audio LM's prompt contract needs audio: transcription only, as a packet ASR card.
         return vec!["audio/transcriptions", "audio/transcriptions/stream"];
     }
-    let _ = (state, canonical);
     vec!["chat/completions", "completions"]
 }
 
@@ -104,6 +99,28 @@ pub(crate) fn unserved(model: &str, endpoint: &str, served: &[&str]) -> Response
         ),
         "invalid_request_error",
         Some("model_not_supported_for_endpoint"),
+        Some("model".into()),
+    )
+}
+
+/// No dispatcher took `model`: 404 when it is not registered; 503 `model_unloaded` when it is
+/// (an unload or eviction removed its dispatcher after admission), which reads as a missing
+/// model otherwise.
+pub(crate) fn unrouted(state: &AppState, model: &str) -> Response {
+    if state.registry.contains(model) {
+        return crate::serve::api_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("model '{model}' is not being served right now (unloaded or switching)"),
+            "server_error",
+            Some("model_unloaded"),
+            Some("model".into()),
+        );
+    }
+    crate::serve::api_error(
+        axum::http::StatusCode::NOT_FOUND,
+        format!("no model registered for '{model}'."),
+        "invalid_request_error",
+        Some("model_not_found"),
         Some("model".into()),
     )
 }

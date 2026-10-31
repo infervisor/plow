@@ -32,15 +32,30 @@ class FloorTests(unittest.TestCase):
             block_roofline.decode_floor(self.progs, 8, 4096, CEIL, 2, 2, None)
 
     def test_packed_attention_is_charged_per_request_at_its_prefix(self):
-        one, _ = block_roofline.packed_floor(self.progs, 1, 64, 4096, 0, 0, CEIL, 2, 2, None)
-        two, _ = block_roofline.packed_floor(self.progs, 2, 64, 4096, 0, 0, CEIL, 2, 2, None)
+        one, _, _ = block_roofline.packed_floor(self.progs, 1, 64, 4096, 0, 0, CEIL, 2, 2, None)
+        two, _, _ = block_roofline.packed_floor(self.progs, 2, 64, 4096, 0, 0, CEIL, 2, 2, None)
         prog = self.progs[0]
         p = dict(prog[2][2][3], n_q=64, q_pos0=4096, n_kv=4160)
         nbytes, flops = block_roofline.op_roof.cost("FlashPrefill", p, 64, 4096, 2, 2)
         attn = max(nbytes / (CEIL[0] * 1e6), flops / (CEIL[1] * 1e9))
-        self.assertAlmostEqual(two - one, attn)
+        linear = lambda rows: sum(block_roofline.op_roof.cost(op, dict(q, rows=rows, M=rows), rows, 0, 2, 2)[0]
+                                  / (CEIL[0] * 1e6) for _, op, _, q in prog[2] if op != "FlashPrefill")
+        # Two 64-row requests fill the 128-row bucket; one leaves 64 padding rows unpriced.
+        self.assertAlmostEqual(two - one, attn + linear(128) - linear(64))
         with self.assertRaisesRegex(ValueError, "no prefill bucket holds 129 rows"):
             block_roofline.packed_floor(self.progs, 1, 128, 0, 1, 0, CEIL, 2, 2, None)
+
+    def test_padding_rows_are_reported_not_priced(self):
+        full, full_pad, _ = block_roofline.packed_floor(self.progs, 1, 128, 0, 0, 0, CEIL, 2, 2, None)
+        half, half_pad, priced = block_roofline.packed_floor(self.progs, 1, 64, 0, 0, 0, CEIL, 2, 2, None)
+        self.assertEqual(full_pad, 0.0)
+        self.assertGreater(half_pad, 0.0)
+        self.assertEqual(priced[0][1], 2 * 2 * 64 * 2816)  # RmsNorm at the 64 real rows
+        rows = block_roofline.build_rows(self.progs, {"layer": 0, "kind": ["full_attn"]},
+                                         {("prefill", 1, 64, 0, 0, 0): 1.0}, {}, {}, CEIL, 2, 2, None)
+        self.assertIn("(bucket 128: 64 pad rows, +", rows[0]["point"])
+        self.assertAlmostEqual(rows[0]["pad_floor_ms"], half_pad)
+        self.assertLess(half, full)
 
     def test_rows_join_measurements_and_render_delta(self):
         plow = block_roofline.measured_points({"sweep": [
@@ -50,7 +65,8 @@ class FloorTests(unittest.TestCase):
         current = {("decode", 1, 4096): 0.125}
         rows = block_roofline.build_rows(self.progs, {"layer": 3, "kind": ["full_attn", "dense_ffn"]},
                                          plow, current, {}, CEIL, 2, 2, None)
-        self.assertEqual([r["point"] for r in rows], ["decode B=1, ctx 4096", "prefill 1x64 rows, prior 0"])
+        self.assertEqual([r["point"] for r in rows], ["decode B=1, ctx 4096",
+                                                  "prefill 1x64 rows, prior 0 (bucket 128: 64 pad rows, +0.001 ms floor)"])
         text = block_roofline.table(rows)
         self.assertIn("| L3 full_attn+dense_ffn, decode B=1, ctx 4096 | 0.100 ms |", text)
         self.assertIn("-0.025 ms (-20.0%)", text)

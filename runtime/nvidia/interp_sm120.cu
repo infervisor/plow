@@ -327,6 +327,7 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #if PLOW_NV_QWEN_GDN
 #include "op_qwen_gdn.cuh"
 #endif
+#include "quant_group.cuh"
 #include "op_moe.cuh"        /* Gemma-4 26B-A4B bf16 MoE decode bodies (router/glu/down/combine) */
 #include "op_mamba.cuh"      /* Nemotron-3 Mamba-2 SSD mixer (UNVERIFIED on GPU; nvcc-compile only) */
 
@@ -2127,12 +2128,18 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                       nblk, arena);
         break;
     case PLOW_DOP_GEMV_F32_OUT:
+        /* Flag modes: Maya 2 depth programs, speech object only (inlined elsewhere they grew every entry
+         * frame). Mode 0 stays ungated: fish_depth programs run it here, outside the arm inventory. */
         if (in->i[7])
+#if PLOW_NV_SPEECH
             d_gemv_f32out_mode((float*)TEN(0), TEN(1), TEN(2), (in->i[7] & 4u) ? (const float*)TEN(3) : nullptr,
                                (in->i[7] & 8u) ? (const float*)TEN(4) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(5) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(6) : nullptr, in->fj[0].f, in->i[7],
                                in->i[3], in->i[0], in->i[1], in->i[2], slice, nblk, arena);
+#else
+            __trap();
+#endif
         else
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
                           in->i[1], in->i[2], slice, nblk);
@@ -2143,6 +2150,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                        (unsigned*)TEN(7), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7],
                        in->fj[1].u, slice, nblk, arena);
         break;
+#if !defined(PLOW_HAS_EMBED_FRAME_BF16) || PLOW_HAS_EMBED_FRAME_BF16
     case PLOW_DOP_EMBED_FRAME_BF16:
         d_embed_frame((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
                       (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4),
@@ -2150,6 +2158,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                       in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], in->fj[0].f, in->fj[1].f, slice, nblk,
                       arena);
         break;
+#endif
 
     /* Terminal row selection for the unified token batch. One arm serves BOTH NVIDIA images:
      * interp_sm90a.cu is a wrapper TU that renames the public symbols and then includes this
@@ -3631,7 +3640,7 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
     case PLOW_DOP_GEMV:
 #if PLOW_NV_GEMV_XK
         if (in->i[3] == 0u || in->i[3] == 8u)
-            if (const unsigned sb = gvmma_xk_sb(in->i[0], in->i[1], in->i[2], nblk)) {
+            if (const unsigned sb = gvmma_xk_sb(in->i[0], in->i[1], in->i[2], nblk, in->i[0] <= GV_MM_MAX)) {
                 if (slice < (in->i[1] >> 6) * sb)
                     gvmma_pf_xk((PLOW_NV_GEMV_PF_OPS & 1u) ? W(2) : nullptr, in->i[3] == 8u ? W(3) : nullptr,
                                 in->i[3] == 8u ? W(4) : nullptr, in->i[0], in->i[1], in->i[2], slice, sb);
@@ -3653,7 +3662,7 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
     case PLOW_DOP_GEMV_QKV:
 #if PLOW_NV_GEMV_XK && PLOW_NV_GEMV_XK_QKV
         if (!((in->i[1] | in->i[3]) & 63u))
-            if (const unsigned sb = gvmma_xk_sb(in->i[0], in->i[1] + in->i[3] + in->i[4], in->i[2], nblk)) {
+            if (const unsigned sb = gvmma_xk_sb(in->i[0], in->i[1] + in->i[3] + in->i[4], in->i[2], nblk, in->i[0] <= GV_MM_MAX)) {
                 const unsigned gn = (slice / sb) << 6, nq = in->i[1], nqk = nq + in->i[3];
                 if ((PLOW_NV_GEMV_PF_OPS & 4u) && slice < ((nqk + in->i[4]) >> 6) * sb)
                     gvmma_pf_xk(gn < nq ? W(2) : gn < nqk ? W(4) : W(6), nullptr, nullptr, in->i[0], 0u, in->i[2],
@@ -4513,6 +4522,239 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
         in->fj[0].f, in->fj[1].f, blockIdx.x, gridDim.x, part, (const __nv_bfloat16*)LIGHT_TEN(4));
 #undef LIGHT_TEN
 }
+#if PLOW_NV_FP8_LT_DECODE && !PLOW_NV_PREFILL && PLOW_NV_THREADS == 256
+/* A routed decode segment [producer -> QuantFp8 (1x128 groups)] as one launch (exec/gpu/cublaslt.rs
+ * light_quant_pair), d_quant_fp8_group's scale and rounding applied to the producer's bf16 output
+ * without a reread from global memory (quant_group.cuh: the same bits without __fdiv_rn's
+ * serialized slow-path calls). The producer math is the decode interpreter body's, per element and
+ * in its summation order, so the bf16 output, FP8 bytes and scales are the window's:
+ *  - QwenRmsNorm (a whole-row reduction, `light_quant_norm`): one block per padded row, the
+ *    block-per-row walk of d_qwen_rmsnorm (element d on thread d % 256, ascending, block_sum); the
+ *    bf16 row is staged in shared memory and each warp quantizes groups warp, warp + 8, ...
+ *  - QwenGatedNorm (head dim 128 = the group), SiLU Glu, QwenSigmoidGate: one warp per
+ *    (row, group), eight per block.
+ * Inactive rows skip the producer and quantize the row as it stands; pad rows (row >= M) get zero
+ * bytes and scales. The host checks operand identities, shapes and allocation ranges. */
+extern "C" __device__ unsigned PLOW_SYM(plow_light_quant_abi) = 1;
+/* Four contiguous elements of one lane (lane * 4 within the group): d_quant_fp8_group's packing. */
+static __device__ __forceinline__ void lq_store4(uint8_t* xq, float* gs, size_t at, unsigned gi,
+                                                 const float (&v)[4], unsigned lane) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; j++) amax = fmaxf(amax, fabsf(v[j]));
+    amax = warp_max32(amax);
+    const float s = qg_scale(amax);
+    float q[4];
+    qg_quant4(v, amax, s, q);
+    *reinterpret_cast<unsigned*>(xq + at) =
+        (unsigned)pack_fp8_e4m3(q[0], q[1]) | ((unsigned)pack_fp8_e4m3(q[2], q[3]) << 16);
+    if (lane == 0) gs[gi] = s;
+}
+/* The producer and the quant by value with their tensor pointers resolved at load (null = absent):
+ * a launch starts on its operands, not on dependent loads of the instruction and tensor tables. */
+struct PlowLightQuantOp {
+    PlowDevInst d;
+    void* t[8];
+};
+struct PlowLightQuantArgs {
+    PlowLightQuantOp p, q;
+};
+static_assert(sizeof(PlowDevInst) == 64 && sizeof(PlowLightQuantOp) == 128 && sizeof(PlowLightQuantArgs) == 256,
+              "exec/gpu/cublaslt.rs LightQuantArgs layout");
+#define LIGHT_TEN(k) (a.p.t[k])
+/* The RMSNorm producer on its own entry: its register-held row would otherwise set the pointwise
+ * entry's register budget. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_quant_norm)(const __grid_constant__ PlowLightQuantArgs a) {
+    constexpr unsigned RB = 32, NT = PLOW_NV_THREADS;
+    __shared__ float part[32];
+    __shared__ __align__(16) __nv_bfloat16 srow[RB * NT];
+    const PlowDevInst* in = &a.p.d;
+    const PlowDevInst* qd = &a.q.d;
+    const unsigned M = qd->i[0], K = qd->i[1], Rp = qd->i[4], groups = K >> 7;
+    uint8_t* xq = (uint8_t*)a.q.t[0];
+    float* gs = (float*)a.q.t[2];
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    if (in->op != PLOW_DOP_QWEN_RMSNORM) __trap();
+    const unsigned row = blockIdx.x;
+    if (row >= M) {
+        for (unsigned g = warp; g < groups; g += PLOW_NV_WARPS) {
+            *reinterpret_cast<unsigned*>(xq + (size_t)row * K + g * 128u + lane * 4u) = 0u;
+            if (lane == 0) gs[g * Rp + row] = 0.0f;
+        }
+        return;
+    }
+    /* The host routes only pairwise-disjoint out / in / gamma / active / radd allocations. */
+    __nv_bfloat16* __restrict__ out = (__nv_bfloat16*)LIGHT_TEN(0);
+    __nv_bfloat16* __restrict__ rin = (__nv_bfloat16*)LIGHT_TEN(1);
+    const __nv_bfloat16* __restrict__ gamma = (const __nv_bfloat16*)LIGHT_TEN(2);
+    const int* active = (const int*)LIGHT_TEN(3);
+    const __nv_bfloat16* __restrict__ radd = (const __nv_bfloat16*)LIGHT_TEN(4);
+    const unsigned dim = in->i[0];
+    const float eps = in->fj[0].f, offset = in->fj[1].f;
+    const size_t base = (size_t)row * dim;
+    if (active && active[row] <= 0) {
+#pragma unroll
+        for (unsigned k = 0; k < RB; k++) {
+            const unsigned d = threadIdx.x + k * NT;
+            if (d < dim) srow[d] = out[base + d];
+        }
+    } else {
+        /* d_qwen_rmsnorm's walk: element d on thread d % 256, ascending, block_sum. Chunks of CH
+         * elements per thread: every load of a chunk is issued before its math, gamma with the
+         * row, ahead of the block reduction. */
+        constexpr unsigned CH = 16;
+        float x[RB], gm[RB], sum = 0.f;
+#pragma unroll
+        for (unsigned c = 0; c < RB; c += CH) {
+            if (c * NT >= dim) break;
+            float av[CH];
+#pragma unroll
+            for (unsigned j = 0; j < CH; j++) {
+                const unsigned d = threadIdx.x + (c + j) * NT;
+                x[c + j] = d < dim ? __bfloat162float(rin[base + d]) : 0.f;
+                av[j] = radd && d < dim ? __bfloat162float(radd[base + d]) : 0.f;
+                gm[c + j] = d < dim ? __bfloat162float(gamma[d]) + offset : 0.f;
+            }
+#pragma unroll
+            for (unsigned j = 0; j < CH; j++) {
+                const unsigned d = threadIdx.x + (c + j) * NT;
+                if (d >= dim) continue;
+                if (radd) {
+                    const __nv_bfloat16 r = __float2bfloat16(x[c + j] + av[j]);
+                    rin[base + d] = r;
+                    x[c + j] = __bfloat162float(r);
+                }
+                sum += x[c + j] * x[c + j];
+            }
+        }
+        const float inv = rsqrtf(block_sum(sum, part) / dim + eps);
+#pragma unroll
+        for (unsigned k = 0; k < RB; k++) {
+            const unsigned d = threadIdx.x + k * NT;
+            if (d < dim) {
+                const __nv_bfloat16 v = __float2bfloat16(x[k] * inv * gm[k]);
+                out[base + d] = v;
+                srow[d] = v;
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll 4
+    for (unsigned g = warp; g < groups; g += PLOW_NV_WARPS) {
+        const unsigned e = g * 128u + lane * 4u;
+        const uint2 raw = *reinterpret_cast<const uint2*>(srow + e);
+        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) v[j] = __bfloat162float(b[j]);
+        lq_store4(xq, gs, (size_t)row * K + e, g * Rp + row, v, lane);
+    }
+}
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_quant)(const __grid_constant__ PlowLightQuantArgs a) {
+    const PlowDevInst* in = &a.p.d;
+    const PlowDevInst* qd = &a.q.d;
+    const unsigned M = qd->i[0], K = qd->i[1], Rp = qd->i[4], groups = K >> 7;
+    uint8_t* xq = (uint8_t*)a.q.t[0];
+    float* gs = (float*)a.q.t[2];
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned w = blockIdx.x * PLOW_NV_WARPS + warp;
+    if (w >= Rp * groups) return;
+    const unsigned row = w / groups, g = w - row * groups;
+    const size_t at = (size_t)row * K + g * 128u + lane * 4u;
+    if (row >= M) {
+        *reinterpret_cast<unsigned*>(xq + at) = 0u;
+        if (lane == 0) gs[g * Rp + row] = 0.0f;
+        return;
+    }
+    __nv_bfloat16* out = (__nv_bfloat16*)LIGHT_TEN(0);
+    switch (in->op) {
+    case PLOW_DOP_GLU: {
+        const uint2 rg = *reinterpret_cast<const uint2*>((const __nv_bfloat16*)LIGHT_TEN(1) + at);
+        const uint2 ru = *reinterpret_cast<const uint2*>((const __nv_bfloat16*)LIGHT_TEN(2) + at);
+        const __nv_bfloat16* pg = reinterpret_cast<const __nv_bfloat16*>(&rg);
+        const __nv_bfloat16* pu = reinterpret_cast<const __nv_bfloat16*>(&ru);
+        alignas(8) __nv_bfloat16 ob[4];
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float a = act_silu(__bfloat162float(pg[j]));
+            ob[j] = __float2bfloat16(a * __bfloat162float(pu[j]));
+            v[j] = __bfloat162float(ob[j]);
+        }
+        *reinterpret_cast<uint2*>(out + at) = *reinterpret_cast<const uint2*>(ob);
+        lq_store4(xq, gs, at, g * Rp + row, v, lane);
+        break;
+    }
+    case PLOW_DOP_QWEN_SIGMOID_GATE: {
+        const int* active = (const int*)LIGHT_TEN(3);
+        float v[4];
+        if (active && active[row] <= 0) {
+            const uint2 ro = *reinterpret_cast<const uint2*>(out + at);
+            const __nv_bfloat16* po = reinterpret_cast<const __nv_bfloat16*>(&ro);
+#pragma unroll
+            for (int j = 0; j < 4; j++) v[j] = __bfloat162float(po[j]);
+        } else {
+            const uint2 ri = *reinterpret_cast<const uint2*>((const __nv_bfloat16*)LIGHT_TEN(1) + at);
+            const uint2 rg = *reinterpret_cast<const uint2*>((const __nv_bfloat16*)LIGHT_TEN(2) + at);
+            const __nv_bfloat16* pi = reinterpret_cast<const __nv_bfloat16*>(&ri);
+            const __nv_bfloat16* pg = reinterpret_cast<const __nv_bfloat16*>(&rg);
+            alignas(8) __nv_bfloat16 ob[4];
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float gt = __bfloat162float(__float2bfloat16(qwen_sigmoid(__bfloat162float(pg[j]))));
+                ob[j] = __float2bfloat16(__bfloat162float(pi[j]) * gt);
+                v[j] = __bfloat162float(ob[j]);
+            }
+            *reinterpret_cast<uint2*>(out + at) = *reinterpret_cast<const uint2*>(ob);
+        }
+        lq_store4(xq, gs, at, g * Rp + row, v, lane);
+        break;
+    }
+    case PLOW_DOP_QWEN_GATED_NORM: {
+        /* d_qwen_gated_norm<false>, dim 128: lane holds elements lane + 32 j. */
+        const int* active = (const int*)LIGHT_TEN(4);
+        const size_t off = (size_t)row * K + g * 128u;
+        float v[4];
+        if (active && active[row] <= 0) {
+#pragma unroll
+            for (int j = 0; j < 4; j++) v[j] = __bfloat162float(out[off + lane + 32 * j]);
+        } else {
+            const __nv_bfloat16* core = (const __nv_bfloat16*)LIGHT_TEN(1);
+            const __nv_bfloat16* z = (const __nv_bfloat16*)LIGHT_TEN(2);
+            const __nv_bfloat16* gamma = (const __nv_bfloat16*)LIGHT_TEN(3);
+            float c[4], sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) { c[j] = __bfloat162float(core[off + lane + 32 * j]); sum += c[j] * c[j]; }
+            const float inv = rsqrtf(qwen_warp_sum(sum) / 128u + in->fj[0].f);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned d = lane + 32 * j;
+                const float gz = __bfloat162float(z[off + d]);
+                const __nv_bfloat16 b = __float2bfloat16(c[j] * inv * __bfloat162float(gamma[d]) * qwen_silu(gz));
+                out[off + d] = b;
+                v[j] = __bfloat162float(b);
+            }
+        }
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) amax = fmaxf(amax, fabsf(v[j]));
+        amax = warp_max32(amax);
+        const float s = qg_scale(amax);
+        float q[4];
+        qg_quant4(v, amax, s, q);
+#pragma unroll
+        for (int j = 0; j < 4; j++) xq[off + lane + 32 * j] = (uint8_t)(pack_fp8_e4m3(q[j], 0.0f) & 0xffu);
+        if (lane == 0) gs[(size_t)g * Rp + row] = s;
+        break;
+    }
+    default:
+        __trap();
+    }
+#undef LIGHT_TEN
+}
+#endif
 #endif
 #if PLOW_NV_GEMMA
 extern "C" __device__ unsigned PLOW_SYM(plow_light_gemma) = 1;
