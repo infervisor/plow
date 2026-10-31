@@ -223,8 +223,9 @@ impl Transcriber for PacketRnntTranscriber {
         self.execution.stream_slots()
     }
 
-    /// One window of every pushed stream with one left, in launches of `PacketRnnt::stream_batch`.
-    /// A push cuts its windows the round it joins; its later rounds step them.
+    /// One window of every pushed stream with one left, up to one launch of
+    /// `PacketRnnt::stream_batch` streams. A push cuts its windows the round it joins; its later
+    /// rounds step them.
     fn stream_push_round(&mut self, pushes: &[StreamPush<'_>]) -> Vec<Result<Option<String>>> {
         let (Some(w), Some(_)) = (self.execution.stream_windows(), self.stream_slots()) else {
             return crate::asr::push_alone(self, pushes);
@@ -280,9 +281,19 @@ impl Transcriber for PacketRnntTranscriber {
             }
         }
         let mel_us = started.elapsed().as_micros() as u64;
-        let mut launches = 0;
-        for launch in stepping.chunks_mut(self.execution.stream_batch()) {
-            launches += 1;
+        // One launch a round, finals first: a second launch would hold every final in the round
+        // for both. The rest step next round, in push order.
+        stepping.sort_by_key(|(index, ..)| !pushes[*index].finish);
+        let deferred = stepping.split_off(stepping.len().min(self.execution.stream_batch()));
+        let deferred_count = deferred.len();
+        for (index, mut stream, window, _) in deferred {
+            stream.cut.push_front(window);
+            self.streams.insert(pushes[index].id, stream);
+            results[index] = Some(Ok(None));
+        }
+        let launches = usize::from(!stepping.is_empty());
+        if launches > 0 {
+            let launch = &mut stepping[..];
             let mut steps: Vec<_> = launch
                 .iter_mut()
                 .map(|(_, stream, (window, rows), _)| (&mut stream.rnnt, window.as_slice(), *rows))
@@ -313,6 +324,7 @@ impl Transcriber for PacketRnntTranscriber {
             pushes = pushes.len(),
             finishes = pushes.iter().filter(|push| push.finish).count(),
             stepped = stepping.len(),
+            deferred = deferred_count,
             launches,
             mel_us,
             total_us = started.elapsed().as_micros() as u64,

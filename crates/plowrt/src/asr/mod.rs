@@ -121,9 +121,9 @@ pub trait Transcriber: Send {
     }
 
     /// Appends each push's audio to its stream (one push per id) and steps the next window of
-    /// each, their steps sharing launches. A push answers its stream's text once the stream has no
-    /// window left (a finished stream then closes); `None`: push it again, with no more audio, to
-    /// step the next.
+    /// each, their steps sharing launches (an engine may defer some to the next round). A push
+    /// answers its stream's text once the stream has no window left (a finished stream then
+    /// closes); `None`: push it again, with no more audio, to step the next.
     fn stream_push_round(
         &mut self,
         pushes: &[StreamPush<'_>],
