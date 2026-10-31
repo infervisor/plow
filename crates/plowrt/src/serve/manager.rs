@@ -376,7 +376,9 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
         .transpose()?
         .flatten()
     {
-        total += BlobPlan::from_dir(&pkt.with_file_name(sub))?.tensor_total();
+        // Plus an engine's non-tensor overhead: the parent's calibration runs before sidecars
+        // bind and never sees it.
+        total += BlobPlan::from_dir(&pkt.with_file_name(sub))?.tensor_total() + DEFAULT_OVERHEAD;
     }
     for name in sidecar_files(asset.as_ref())? {
         let path = pkt.with_file_name(name);
