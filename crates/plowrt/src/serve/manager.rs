@@ -356,8 +356,8 @@ impl BlobPlan {
 
 const GRAPH_BYTES_PER_PROGRAM: u64 = 320 << 10;
 
-/// Device bytes of the speech pipeline's sibling packets beside `pkt` (Qwen3-ASR `encoder.pkt`,
-/// codec `codec.pkt`, Chatterbox `s3gen.pkt`), bound after the engine load. Each binds a CUDA
+/// Device bytes of the speech pipeline's sibling packets beside `pkt` ([`sidecar_files`]),
+/// bound after the engine load. Each binds a CUDA
 /// packet runtime (`CudaPacketRuntime::load_on`) that `cuMemAlloc`s every packet tensor
 /// (activation and batch buffers at their compiled capacity), one counter slab and eight
 /// uploads per program, then captures every program sequence as a CUDA graph.
@@ -369,15 +369,18 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
     };
     let asset = crate::exec::packet_runtime::PacketAsset::load_if_present(pkt)?;
     let mut total = 0u64;
-    for (key, legacy) in [
-        ("encoder.packet", "encoder.pkt"),
-        ("codec.packet", "codec.pkt"),
-        ("vocoder.packet", "s3gen.pkt"),
-    ] {
-        let name = match &asset {
-            Some(asset) => asset.stage_file(key, legacy)?,
-            None => legacy.to_string(),
-        };
+    // A text-encoder sub-bundle loads as an engine of its own.
+    if let Some(sub) = asset
+        .as_ref()
+        .map(|a| a.text_encoder())
+        .transpose()?
+        .flatten()
+    {
+        // Plus an engine's non-tensor overhead: the parent's calibration runs before sidecars
+        // bind and never sees it.
+        total += BlobPlan::from_dir(&pkt.with_file_name(sub))?.tensor_total() + DEFAULT_OVERHEAD;
+    }
+    for name in sidecar_files(asset.as_ref())? {
         let path = pkt.with_file_name(name);
         if !path.is_file() {
             continue;
@@ -415,6 +418,28 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
             + alloc(counters);
     }
     Ok(total)
+}
+
+/// The sibling packets the speech pipeline binds, one per stage (each binds its own runtime):
+/// every stage its pipelines declare (the clone stage's reference encoder included), plus the
+/// file names packets emitted before stage names were carried bind by default.
+fn sidecar_files(asset: Option<&crate::exec::packet_runtime::PacketAsset>) -> Result<Vec<String>> {
+    let unnamed = [
+        ("encoder.packet", "encoder.pkt"),
+        ("codec.packet", "codec.pkt"),
+        ("vocoder.packet", "s3gen.pkt"),
+        ("voice_cond.packet", crate::tts::voice_cond::PACKET),
+    ];
+    let mut stages = match asset {
+        Some(asset) => asset.stage_files()?,
+        None => Default::default(),
+    };
+    for (key, file) in unnamed {
+        stages
+            .entry(key.to_string())
+            .or_insert_with(|| file.to_string());
+    }
+    Ok(stages.into_values().collect())
 }
 
 /// One registered (not necessarily resident) model.
@@ -2307,6 +2332,62 @@ mod tests {
             f.refreshing && f.checked == past,
             "no second re-read started: {f:?}"
         );
+    }
+
+    /// The planner counts every sibling packet the speech pipeline binds, from the stages the
+    /// packet declares: a clone stage's reference encoder too (it was missing, and KV sized to
+    /// fill the device left its bind out of memory).
+    #[test]
+    fn sidecar_set_is_the_declared_speech_stages() {
+        use crate::exec::packet_runtime::PacketAsset;
+        let pipeline = |strings: &[(&str, &str)]| plow_asset::packet_pipeline::PacketPipeline {
+            name: "speech".into(),
+            driver: crate::tts::DRIVER.into(),
+            programs: Default::default(),
+            tensors: Default::default(),
+            parameters: Default::default(),
+            strings: strings
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        let clone = PacketAsset::from_pipelines(vec![pipeline(&[
+            ("prompt.template", "{voice}{input}"),
+            ("codec.packet", "codec_dac.pkt"),
+            ("clone.encoder", "ref_encoder.pkt"),
+            ("voice_cond.packet", "cond.pkt"),
+        ])]);
+        let mut files = sidecar_files(Some(&clone)).unwrap();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                "codec_dac.pkt",
+                "cond.pkt",
+                "encoder.pkt",
+                "ref_encoder.pkt",
+                "s3gen.pkt"
+            ],
+            "declared stages, plus the default names of the stages it does not name"
+        );
+        let mut unnamed = sidecar_files(None).unwrap();
+        unnamed.sort();
+        assert_eq!(
+            unnamed,
+            ["codec.pkt", "encoder.pkt", "s3gen.pkt", "voice_cond.pkt"]
+        );
+        // Two stages binding one file bind two runtimes: counted twice.
+        let shared = PacketAsset::from_pipelines(vec![pipeline(&[
+            ("codec.packet", "codec.pkt"),
+            ("clone.encoder", "codec.pkt"),
+        ])]);
+        let files = sidecar_files(Some(&shared)).unwrap();
+        assert_eq!(files.iter().filter(|f| *f == "codec.pkt").count(), 2);
+        let escaping = PacketAsset::from_pipelines(vec![pipeline(&[(
+            "clone.encoder",
+            "../other/ref_encoder.pkt",
+        )])]);
+        assert!(sidecar_files(Some(&escaping)).is_err());
     }
 
     /// A TP engine spans `tp` devices from its group's first; past the group they belong to
