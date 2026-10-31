@@ -551,6 +551,25 @@ pub fn check_packet_contract(
                     packet.display()
                 )));
             }
+            // Outputs are written row by row while later rows of the source are still unread.
+            let outputs: &[usize] = if op == packet::dev::DevOp::QwenQGateSplit {
+                &[0, 1]
+            } else {
+                &[0]
+            };
+            if outputs.iter().any(|&o| d.t[o] == d.t[slot]) {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {op:?} writes the row-pitched source it reads",
+                    packet.display()
+                )));
+            }
+            // The pitched split moves 16-byte vectors.
+            if op == packet::dev::DevOp::QwenQGateSplit && (d.i[1] % 8 != 0 || d.i[3] % 8 != 0) {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {op:?} pitch or head dim is not a multiple of 8 elements",
+                    packet.display()
+                )));
+            }
         }
     }
     let Some(feature) = concat else {
@@ -584,6 +603,10 @@ fn pitched_source(d: &packet::dev::DevInst64) -> Option<(packet::dev::DevOp, Opt
             let (n, width) = (i(0), i(2));
             let rows = (width > 0 && n % width == 0).then(|| n / width);
             Some((op, rows.and_then(|r| span(r, i(3), i(4), width))))
+        }
+        DevOp::QwenQGateSplit if d.i[3] != 0 => Some((op, span(i(2), i(3), 0, 2 * i(0) * i(1)))),
+        DevOp::QwenHeadNormRope if w != 0 => {
+            Some((op, span(i(3), w & 0xFFFF, w >> 16, i(0) * i(1))))
         }
         _ => None,
     }
@@ -629,6 +652,67 @@ pub fn check_runtime(
 mod tests {
     use super::*;
     use packet::devbuild::{Model, SectionData};
+
+    #[test]
+    fn pitched_sources_must_fit_their_tensor() {
+        use packet::dev::DevOp;
+        // rows 2; split H 1 x D 8 (q|gate width 16); HNR H 1 x D 2 (KV width 2).
+        let blob = |op: DevOp, stride: u32, col: u32, src_bytes: u64, alias: bool| {
+            let mut b = packet::devbuild::Builder::new(1);
+            let out = b.tensor("act.out", 64);
+            let src = if alias {
+                out
+            } else {
+                b.tensor("act.qkv", src_bytes)
+            };
+            b.emit(op, vec![0], &[], |d| {
+                if op == DevOp::QwenQGateSplit {
+                    d.t[..3].copy_from_slice(&[out, out, src]);
+                    d.i[..4].copy_from_slice(&[1, 8, 2, stride]);
+                } else {
+                    d.t[..2].copy_from_slice(&[out, src]);
+                    d.i[..4].copy_from_slice(&[1, 2, 0, 2]);
+                    d.j[1] = stride | (col << 16);
+                }
+            });
+            let p = b.finish();
+            let raw = Model {
+                n_cu: 1,
+                target: 0,
+                tensors: p.tensors.clone(),
+                progs: vec![p],
+                prog_t: vec![1],
+                gen: vec![],
+                kv_row_insts: vec![],
+            }
+            .to_blob();
+            (crate::asset::devblob::DevBlob::parse(&raw).unwrap(), raw)
+        };
+        let dir = std::env::temp_dir().join(format!("plowrt-pitched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("build.json"),
+            serde_json::json!({"runtime_requires": {"plowrt_contract": 4}}).to_string(),
+        )
+        .unwrap();
+        let pkt = dir.join("model.pkt");
+        let ok = |(b, r): (crate::asset::devblob::DevBlob, Vec<u8>)| {
+            check_packet_contract(&pkt, &b, &r).is_ok()
+        };
+        // Last row ends at 24 + 16 = 40 elements (q|gate) / 12 + 10 + 2 = 24 (v at column 10).
+        assert!(ok(blob(DevOp::QwenQGateSplit, 24, 0, 80, false)));
+        assert!(!ok(blob(DevOp::QwenQGateSplit, 24, 0, 78, false)));
+        assert!(!ok(blob(DevOp::QwenQGateSplit, 12, 0, 400, false)));
+        // a pitch off the 16-byte vector, or an output aliasing the source
+        assert!(!ok(blob(DevOp::QwenQGateSplit, 20, 0, 400, false)));
+        assert!(!ok(blob(DevOp::QwenQGateSplit, 24, 0, 64, true)));
+        assert!(ok(blob(DevOp::QwenHeadNormRope, 12, 10, 48, false)));
+        assert!(!ok(blob(DevOp::QwenHeadNormRope, 12, 10, 46, false)));
+        assert!(!ok(blob(DevOp::QwenHeadNormRope, 12, 11, 400, false)));
+        assert!(!ok(blob(DevOp::QwenHeadNormRope, 12, 10, 64, true)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn concatenated_weights_and_pitched_glu_require_their_contract() {

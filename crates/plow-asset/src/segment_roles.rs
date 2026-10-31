@@ -364,13 +364,15 @@ pub const CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES: [(u32, u32); 5] = [
 /// [q | gate] projection, GDN 16 k x 128 + 48 v x 128): q|gate, k/v, o and GDN out (K = 6144),
 /// gate/up, down, GDN in_proj_qkv, in_proj_z, and the 48-wide a/b projections (the interpreter's
 /// 128-wide tensor-core tiles ran them as eight CTAs per 1024 rows: 17.9 ms of a 122 ms prefill
-/// with their preps, floor 0.9), and gate|up concatenated along N (`PLOW_FP8_BLOCK_CONCAT`).
-pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 9] = [
+/// with their preps, floor 0.9), and gate|up and q|gate|k|v concatenated along N
+/// (`PLOW_FP8_BLOCK_CONCAT`).
+pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 10] = [
     (12288, 5120),
     (1024, 5120),
     (5120, 6144),
     (17408, 5120),
     (34816, 5120),
+    (14336, 5120),
     (5120, 17408),
     (10240, 5120),
     (6144, 5120),

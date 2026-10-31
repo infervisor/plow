@@ -792,11 +792,11 @@ pub(crate) fn runtime_requires(model: &Model, sections: &[SectionData]) -> serde
         || sections
             .iter()
             .any(|s| s.name == plow_asset::derived_weights::SECTION)
-        || model
-            .progs
-            .iter()
-            .flat_map(|p| &p.insts)
-            .any(|d| d.op == DevOp::GluPitched as u16);
+        || model.progs.iter().flat_map(|p| &p.insts).any(|d| {
+            d.op == DevOp::GluPitched as u16
+                || (d.op == DevOp::QwenQGateSplit as u16 && d.i[3] != 0)
+                || (d.op == DevOp::QwenHeadNormRope as u16 && d.j[1] != 0)
+        });
     let contract = if concat {
         plow_asset::RUNTIME_CONTRACT_CONCAT
     } else if block_fp8 {
@@ -1210,6 +1210,21 @@ mod tests {
             runtime_requires(&ladder, &[])["plowrt_contract"],
             plow_asset::RUNTIME_CONTRACT_CONCAT
         );
+        // So does a pitched q|gate split or head-norm source; their legacy forms do not.
+        let mut pitched = |op: DevOp, i3: u32, j1: u32| {
+            ladder.progs[0].insts[0] = saved.clone();
+            ladder.progs[0].insts[0].op = op as u16;
+            (ladder.progs[0].insts[0].i[3], ladder.progs[0].insts[0].j[1]) = (i3, j1);
+            runtime_requires(&ladder, &[])["plowrt_contract"].clone()
+        };
+        let concat = serde_json::json!(plow_asset::RUNTIME_CONTRACT_CONCAT);
+        assert_eq!(pitched(DevOp::QwenQGateSplit, 14336, 0), concat);
+        assert_eq!(
+            pitched(DevOp::QwenHeadNormRope, 0, 14336 | 12288 << 16),
+            concat
+        );
+        assert_ne!(pitched(DevOp::QwenQGateSplit, 0, 0), concat);
+        assert_ne!(pitched(DevOp::QwenHeadNormRope, 0, 0), concat);
         ladder.progs[0].insts[0] = saved;
         let root = std::env::temp_dir().join(format!("devgen-lt-store-{}", std::process::id()));
         let out = root.join("out");

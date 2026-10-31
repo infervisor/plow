@@ -268,6 +268,8 @@ struct Emitter<'a> {
     quant_input: Option<(u32, u32)>,
     /// Decode projection fusions (one walk for z/a/b, for k/v, for gate/up/SiLU) on every rung.
     fuse: bool,
+    /// Same-input block-FP8 projections run as one N-concatenated GEMM (PLOW_FP8_BLOCK_CONCAT).
+    concat: bool,
     /// The residual + norm prologue (`Fold`) on this rung.
     fold: bool,
     /// `(stream, addend)` of a residual add waiting for the stream's next norm.
@@ -831,6 +833,22 @@ impl Emitter<'_> {
         normalize: bool,
         dep: u32,
     ) -> u32 {
+        self.headnorm_at(out, src, 0, gamma, heads, cache, normalize, dep)
+    }
+    /// [`Self::headnorm`] reading `src` at `source` (j1: row pitch | column << 16, elements;
+    /// 0 = contiguous `[rows][heads][hd]`).
+    #[allow(clippy::too_many_arguments)]
+    fn headnorm_at(
+        &mut self,
+        out: u32,
+        src: u32,
+        source: u32,
+        gamma: u32,
+        heads: u32,
+        cache: bool,
+        normalize: bool,
+        dep: u32,
+    ) -> u32 {
         self.b
             .emit(DevOp::QwenHeadNormRope, self.b.all(), &[dep], |d| {
                 d.t[..7].copy_from_slice(&[
@@ -858,6 +876,7 @@ impl Emitter<'_> {
                 };
                 d.f[0] = self.c.eps;
                 d.f[1] = if normalize { 1.0 } else { 0.0 };
+                d.j[1] = source;
             })
     }
     fn full(&mut self, layer: usize, hn: u32, mixed: u32, dep: u32, fold: Option<&Fold>) -> u32 {
@@ -865,11 +884,8 @@ impl Emitter<'_> {
         let p = format!("{}layers.{layer}.self_attn", c.prefix);
         let qd = c.heads * c.hd;
         let kd = c.kv_heads * c.hd;
-        let packed = self.act("qgate", 2 * qd);
         let qg = self.act("qg", qd);
         let gate = self.act("qgate.gate", qd);
-        let kg = self.act("kg", kd);
-        let vg = self.act("vg", kd);
         let q = self.act("q", qd);
         let at = self.act("at", qd);
         let kc = self.b.tensor(
@@ -883,51 +899,95 @@ impl Emitter<'_> {
         let qn = self.weight(&format!("{p}.q_norm.weight"), c.hd as u64);
         let kn = self.weight(&format!("{p}.k_norm.weight"), c.hd as u64);
         let q_name = format!("{p}.q_proj.weight");
-        let dp = match fold {
-            Some(f) => self.proj_fold(packed, hn, &q_name, 2 * qd, c.hidden, f, dep),
-            None => self.proj(packed, hn, &q_name, 2 * qd, c.hidden, dep),
-        };
-        let dq = self
-            .b
-            .emit(DevOp::QwenQGateSplit, self.b.all(), &[dp], |d| {
-                d.t[..4].copy_from_slice(&[qg, gate, packed, self.active]);
-                d.i[..3].copy_from_slice(&[c.heads, c.hd, self.batch]);
-            });
-        let dq = self.headnorm(q, qg, qn, c.heads, false, true, dq);
-        let (dk, dv) = if self.fuse {
-            // k and v share the normalized input: one two-output walk.
-            let wk = self.weight(&format!("{p}.k_proj.weight"), kd as u64 * c.hidden as u64);
-            let wv = self.weight(&format!("{p}.v_proj.weight"), kd as u64 * c.hidden as u64);
-            let kv_dep = if self.projection_dag { dp } else { dq };
-            let dkv = self.b.emit(DevOp::GemvQkv, self.b.all(), &[kv_dep], |d| {
-                d.t[..7].copy_from_slice(&[kg, hn, wk, vg, wv, TENSOR_NONE, TENSOR_NONE]);
-                d.i[..5].copy_from_slice(&[self.batch, kd, c.hidden, kd, 0]);
-            });
-            let dk = self.headnorm(kc, kg, kn, c.kv_heads, true, true, dkv);
-            let dv = self.headnorm(vc, vg, TENSOR_NONE, c.kv_heads, true, false, dk);
-            (dk, dv)
-        } else {
-            let dk = self.proj(
-                kg,
-                hn,
-                &format!("{p}.k_proj.weight"),
-                kd,
-                c.hidden,
-                if self.projection_dag { dep } else { dq },
-            );
-            let dk = self.headnorm(kc, kg, kn, c.kv_heads, true, true, dk);
-            let dv = self.proj(
-                vg,
-                hn,
-                &format!("{p}.v_proj.weight"),
-                kd,
-                c.hidden,
-                if self.projection_dag { dep } else { dk },
-            );
-            (
+        let names = [
+            q_name.clone(),
+            format!("{p}.k_proj.weight"),
+            format!("{p}.v_proj.weight"),
+        ];
+        let (dq, dk, dv) = if self.concat
+            && fold.is_none()
+            && !self.fuse
+            && names.iter().all(|n| self.quantized(n))
+        {
+            // q|gate, k and v as one N-concatenated projection: the split and both KV writers
+            // read their columns of one row-pitched output.
+            let width = 2 * qd + 2 * kd;
+            assert!(width < 1 << 16, "{p}: q|k|v row pitch must fit 16 bits");
+            let qkv = self.act("qkv", width);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let dp = self.proj_leaves(qkv, hn, &names, width, c.hidden, dep);
+            let dq = self
+                .b
+                .emit(DevOp::QwenQGateSplit, self.b.all(), &[dp], |d| {
+                    d.t[..4].copy_from_slice(&[qg, gate, qkv, self.active]);
+                    d.i[..4].copy_from_slice(&[c.heads, c.hd, self.batch, width]);
+                });
+            let dq = self.headnorm(q, qg, qn, c.heads, false, true, dq);
+            let source = |col: u32| width | (col << 16);
+            let k_dep = if self.projection_dag { dp } else { dq };
+            let dk = self.headnorm_at(kc, qkv, source(2 * qd), kn, c.kv_heads, true, true, k_dep);
+            let dv = self.headnorm_at(
+                vc,
+                qkv,
+                source(2 * qd + kd),
+                TENSOR_NONE,
+                c.kv_heads,
+                true,
+                false,
                 dk,
-                self.headnorm(vc, vg, TENSOR_NONE, c.kv_heads, true, false, dv),
-            )
+            );
+            (dq, dk, dv)
+        } else {
+            let packed = self.act("qgate", 2 * qd);
+            let kg = self.act("kg", kd);
+            let vg = self.act("vg", kd);
+            let dp = match fold {
+                Some(f) => self.proj_fold(packed, hn, &q_name, 2 * qd, c.hidden, f, dep),
+                None => self.proj(packed, hn, &q_name, 2 * qd, c.hidden, dep),
+            };
+            let dq = self
+                .b
+                .emit(DevOp::QwenQGateSplit, self.b.all(), &[dp], |d| {
+                    d.t[..4].copy_from_slice(&[qg, gate, packed, self.active]);
+                    d.i[..3].copy_from_slice(&[c.heads, c.hd, self.batch]);
+                });
+            let dq = self.headnorm(q, qg, qn, c.heads, false, true, dq);
+            let (dk, dv) = if self.fuse {
+                // k and v share the normalized input: one two-output walk.
+                let wk = self.weight(&format!("{p}.k_proj.weight"), kd as u64 * c.hidden as u64);
+                let wv = self.weight(&format!("{p}.v_proj.weight"), kd as u64 * c.hidden as u64);
+                let kv_dep = if self.projection_dag { dp } else { dq };
+                let dkv = self.b.emit(DevOp::GemvQkv, self.b.all(), &[kv_dep], |d| {
+                    d.t[..7].copy_from_slice(&[kg, hn, wk, vg, wv, TENSOR_NONE, TENSOR_NONE]);
+                    d.i[..5].copy_from_slice(&[self.batch, kd, c.hidden, kd, 0]);
+                });
+                let dk = self.headnorm(kc, kg, kn, c.kv_heads, true, true, dkv);
+                let dv = self.headnorm(vc, vg, TENSOR_NONE, c.kv_heads, true, false, dk);
+                (dk, dv)
+            } else {
+                let dk = self.proj(
+                    kg,
+                    hn,
+                    &format!("{p}.k_proj.weight"),
+                    kd,
+                    c.hidden,
+                    if self.projection_dag { dep } else { dq },
+                );
+                let dk = self.headnorm(kc, kg, kn, c.kv_heads, true, true, dk);
+                let dv = self.proj(
+                    vg,
+                    hn,
+                    &format!("{p}.v_proj.weight"),
+                    kd,
+                    c.hidden,
+                    if self.projection_dag { dep } else { dk },
+                );
+                (
+                    dk,
+                    self.headnorm(vc, vg, TENSOR_NONE, c.kv_heads, true, false, dv),
+                )
+            };
+            (dq, dk, dv)
         };
         // PLOW_EMIT_GEN_KERNELS: one-split flash prefill with the fused bf16 epilogue (t5 = at,
         // no FlashMerge), the contract of a generated flash-prefill role (gen_flash_prefill.cu);
@@ -1246,6 +1306,12 @@ fn phase(
         share_quant,
         quant_input: None,
         fuse: fuse_decode,
+        concat: emit_config::active().fp8_block_concat
+            && fp8
+            && emit_config::active().w8a8
+            && c.block_fp8.is_some()
+            && !fuse_decode
+            && !fuse_mlp,
         fold: fold_norm,
         pending_residual: None,
         ctx,
@@ -1268,12 +1334,7 @@ fn phase(
     let hn = e.act("hn", c.hidden);
     let mixed = e.act("mixed", c.hidden);
     // gate|up as one N-concatenated block-FP8 projection (`cat/` weights) read by GluPitched.
-    let gu = (emit_config::active().fp8_block_concat
-        && e.fp8
-        && e.w8a8
-        && c.block_fp8.is_some()
-        && !fuse_decode
-        && !fuse_mlp
+    let gu = (e.concat
         && (0..c.layers.len())
             .filter(|l| c.block.as_ref().is_none_or(|range| range.contains(l)))
             .all(|l| {
@@ -2630,6 +2691,34 @@ mod tests {
                         >= u64::from(batch.next_multiple_of(4)) * u64::from(2 * inter) * 2
                 );
             }
+            // q|gate, k, v: one projection whose split and KV writers read pitched columns.
+            let width = 2 * 24 * 256 + 2 * 4 * 256;
+            let split = insts
+                .iter()
+                .find(|d| d.op == DevOp::QwenQGateSplit as u16)
+                .expect("q/gate split");
+            assert_eq!(&split.i[..4], &[24, 256, batch, width]);
+            let qkv = insts
+                .iter()
+                .find(|d| d.op == DevOp::GemmFp8 as u16 && d.t[0] == split.t[2])
+                .expect("q|k|v GEMM");
+            assert_eq!(&qkv.i[..3], &[batch, width, hidden]);
+            let section = derived_section(&m).unwrap();
+            let derived =
+                plow_asset::derived_weights::DerivedWeights::parse(&section.data).unwrap();
+            let sources = &derived
+                .get(&m.tensors[qkv.t[2] as usize].name)
+                .unwrap()
+                .sources;
+            for (s, x) in sources.iter().zip(["q", "k", "v"]) {
+                assert!(s.ends_with(&format!("self_attn.{x}_proj.weight")), "{s}");
+            }
+            let writers: Vec<u32> = insts
+                .iter()
+                .filter(|d| d.op == DevOp::QwenHeadNormRope as u16 && d.t[1] == split.t[2])
+                .map(|d| d.j[1])
+                .collect();
+            assert_eq!(writers, [width | (12288 << 16), width | (13312 << 16)]);
         }
         assert_eq!(
             crate::dense_cublaslt::runtime_requires(&m, &[])["plowrt_contract"],

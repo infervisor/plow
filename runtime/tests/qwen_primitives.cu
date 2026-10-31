@@ -22,7 +22,7 @@
 #ifndef PLOW_NV_FP8_M1_BK1024
 #define PLOW_NV_FP8_M1_BK1024 0
 #endif
-struct Args { void* t[8]; int i[8]; union {float f; int j;} fj[2]; };
+struct Args { void* t[8]; int i[8]; union {float f; int j;} fj[3]; };
 #define TEN(n) in->t[n]
 __global__ void run(unsigned op, Args args) {
 extern __shared__ __nv_bfloat16 arena[];
@@ -85,7 +85,7 @@ switch(op) {
     case PLOW_DOP_QWEN_Q_GATE_SPLIT:
         d_qwen_q_gate_split((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const int*)TEN(3),
-            in->i[0], in->i[1], in->i[2], slice, nblk);
+            in->i[0], in->i[1], in->i[2], slice, nblk, in->i[3]);
         break;
     case PLOW_DOP_QWEN_SIGMOID_GATE:
         d_qwen_sigmoid_gate((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
@@ -100,7 +100,8 @@ switch(op) {
         d_qwen_headnorm_rope((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
             (const int*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1], in->i[2],
-            in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6]);
+            in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6],
+            nullptr, (unsigned)in->fj[2].j);
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
         d_qwen_gdn_conv_prefill<false>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),

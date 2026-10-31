@@ -821,17 +821,18 @@ Status: CUDA only.
 
 ### N-concatenated projections (derived weights)
 
-What it computes: projections that read the same activation (gate|up) as one GEMM
+What it computes: projections that read the same activation (gate|up, q|gate|k|v) as one GEMM
 over their weights concatenated along N, block-scale grids concatenated the same way; consumers
 read their columns of the one row-pitched output.
-Examples: the block-scaled FP8 Qwen3.5-style dense MLP.
+Examples: the block-scaled FP8 Qwen3.5-style dense MLP and full-attention projections.
 Packet ABI: `derived_weights.json` (`crates/plow-asset/src/derived_weights.rs`) lists each `cat/`
-tensor's checkpoint sources (axis 0, optional BF16 -> F32 widen); `GluPitched` (230). Emit:
+tensor's checkpoint sources (axis 0, optional BF16 -> F32 widen); `GluPitched` (230); the row
+pitch of `QwenQGateSplit` (`i3`) and `QwenHeadNormRope` (`j1` = pitch | column << 16). Emit:
 `PLOW_FP8_BLOCK_CONCAT`. Runtime contract 4: a packet using any of these declares it and a
 runtime that cannot serve them refuses the packet at load.
 Kernels and objects: the loader assembles `cat/` tensors (`asset/checkpoint.rs`), the cuBLASLt
-route runs the one GEMM, `d_glu_pitched` runs in the sm_90a interpreter, light and light_quant
-entries.
+route runs the one GEMM, `d_glu_pitched` and the pitched split/KV-writer bodies run in the
+sm_90a interpreter, light and light_quant entries.
 Status: sm_90a (cuBLASLt decode and prefill); the HSA loader refuses contract-4 packets.
 
 
@@ -1013,7 +1014,7 @@ fastconformer RNNT, fish-s2.
 
 ### What each missing cell needs
 
-- **N-concatenated projections on gfx942**: the HSA loader needs the `derived_weights.json` assembly (`Checkpoint::concatenated`), `GluPitched` in `runtime/amd/interp.hip`, and the hipBLASLt route over the concatenated shape; until then `asset::serve::refuse_concat_features` rejects such a packet.
+- **N-concatenated projections on gfx942**: the HSA loader needs the `derived_weights.json` assembly (`Checkpoint::concatenated`), `GluPitched` and the two pitched sources in `runtime/amd/interp.hip` (`d_qwen_q_gate_split` / `d_qwen_headnorm_rope` addressing), and the hipBLASLt route over the concatenated shape; until then `asset::serve::refuse_concat_features` rejects such a packet.
 
 - **KV-shared tail on gfx942**: needs a port of the runtime gather (`crates/plowrt/src/exec/gpu/shared_tail.rs` `shared_tail_enqueue`/`shared_tail_rows`) into `exec/amd.rs`, reading the same `kv_shared_tail` section (`crates/plow-asset/src/kv_shared_tail.rs`). No new device op: it reuses the flash ops over the source layer's cache.
 - **KV-shared tail on CPU**: the same gather in `serve/cpu_serve.rs`'s prefill path. Not verified whether any CPU emit carries the section.
