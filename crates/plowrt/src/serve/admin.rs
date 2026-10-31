@@ -441,21 +441,77 @@ async fn roll_back(
     if let Err(e) = mgr.unload_and_deregister(slug, true).await {
         tracing::warn!(%slug, error = %e, "load rollback: deregister failed");
     }
-    forget_checkpoint(state, dir);
+    forget_checkpoint(state, dir).await;
+}
+
+/// Serializes `dir`'s checkpoint pairing with the registrations that rely on it: a pairing set
+/// for one slug and not yet backed by its registry entry must not be cleared by another slug's
+/// rollback (the slug would then read its tokenizer and config from a fallback checkpoint while
+/// its manager keeps the requested weights).
+#[doc(hidden)]
+pub async fn pairing_lock(dir: &std::path::Path) -> tokio::sync::OwnedMutexGuard<()> {
+    // Its own key space, not the per-slug control locks: a slug may be any string.
+    type Locks = std::collections::HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::Mutex<Option<Locks>> = std::sync::Mutex::new(None);
+    let lock = {
+        let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let locks = locks.get_or_insert_with(Default::default);
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        let dir = canonical(dir);
+        match locks.get(&dir).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(dir, Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
+/// Pair `dir` with `ckpt` and publish `slug` from it to the registry, under the dir's pairing
+/// lock. On failure nothing of it is left.
+#[doc(hidden)]
+pub async fn pair_and_publish(
+    state: &AppState,
+    dir: &std::path::Path,
+    ckpt: &std::path::Path,
+    slug: &str,
+) -> std::result::Result<(), (StatusCode, String)> {
+    let _pairing = pairing_lock(dir).await;
+    crate::asset::serve::set_checkpoint(dir, ckpt)
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    if let Err(e) = state.registry.load(dir, Some(slug.to_string())) {
+        forget_unshared(state, dir);
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
+    Ok(())
 }
 
 /// Drop `dir`'s checkpoint pairing unless another registered slug still serves it.
-#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-fn forget_checkpoint(state: &AppState, dir: &std::path::Path) {
+#[doc(hidden)]
+pub async fn forget_checkpoint(state: &AppState, dir: &std::path::Path) {
+    let _pairing = pairing_lock(dir).await;
+    forget_unshared(state, dir);
+}
+
+fn forget_unshared(state: &AppState, dir: &std::path::Path) {
+    let dir = canonical(dir);
     let shared = state.registry.slugs().iter().any(|s| {
         state
             .registry
             .get(s)
-            .is_ok_and(|b| b.dir.canonicalize().ok().as_deref() == Some(dir))
+            .is_ok_and(|b| canonical(&b.dir) == dir)
     });
     if !shared {
-        crate::asset::serve::clear_checkpoint(dir);
+        crate::asset::serve::clear_checkpoint(&dir);
     }
+}
+
+/// The key the checkpoint pairing map uses (`asset::serve::map_key`).
+fn canonical(dir: &std::path::Path) -> PathBuf {
+    dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
 }
 
 /// `POST /v1/models/load` — make a model resident, registering its assets dir
@@ -573,18 +629,14 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             if newly_registered {
                 // The pairing is recorded first so the bundle's pin check and every HF-file read
                 // at load see the requested checkpoint.
-                if let Err(e) = crate::asset::serve::set_checkpoint(&dir, &ckpt) {
-                    return err(StatusCode::CONFLICT, e);
-                }
-                if let Err(e) = state.registry.load(&dir, Some(req.model.clone())) {
-                    forget_checkpoint(&state, &dir);
-                    return err(StatusCode::BAD_REQUEST, e);
+                if let Err((status, e)) = pair_and_publish(&state, &dir, &ckpt, &req.model).await {
+                    return err(status, e);
                 }
             }
             if let Err(e) = mgr.register(&req.model, dir.clone(), ckpt) {
                 if newly_registered {
                     let _ = state.registry.unload(&req.model);
-                    forget_checkpoint(&state, &dir);
+                    forget_checkpoint(&state, &dir).await;
                 }
                 return err(StatusCode::BAD_REQUEST, e);
             }
