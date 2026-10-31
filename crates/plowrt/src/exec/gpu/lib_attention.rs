@@ -490,8 +490,9 @@ impl LibAttention {
         object: &SegmentObject,
     ) -> Result<()> {
         let (library, _, mut fa4, mut adapters) = open(be, assets_dir, object)?;
-        fa4.unload(be)?;
+        let fa4_unloaded = fa4.unload(be);
         adapters.unload(be)?;
+        fa4_unloaded?;
         tracing::info!(
             library = %library.display(),
             adapter_symbols = ?ADAPTER_SYMBOLS,
@@ -509,58 +510,70 @@ impl LibAttention {
         direct: Option<Direct>,
         cache: Cache,
     ) -> Result<Self> {
-        let (library, declared, fa4, adapters) = open(be, assets_dir, object)?;
+        let (library, declared, mut fa4, mut adapters) = open(be, assets_dir, object)?;
         let f16 = declared.f16;
-        if direct.is_none() && !gathers(&declared) {
-            return Err(RuntimeError::Rejected(format!(
-                "{}: an FP8 KV cache needs the hd512 head-major gather",
-                library.display()
-            )));
-        }
-        if cache.slots == 0 || cache.rows == 0 || cache.rows % PAGE != 0 {
-            return Err(RuntimeError::Rejected(
-                "library attention: source cache geometry".into(),
-            ));
-        }
-        if let Some(d) = direct {
-            if (d.slots, d.kv_stride) != (cache.slots, cache.rows) {
-                return Err(RuntimeError::Rejected(
-                    "library attention: direct geometry differs from the source cache".into(),
-                ));
-            }
-            if f16 {
+        // Both modules are loaded: a refusal or failed allocation below unloads them again.
+        let rest = (|| {
+            if direct.is_none() && !gathers(&declared) {
                 return Err(RuntimeError::Rejected(format!(
-                    "{}: a BF16 KV cache needs the bf16 library",
+                    "{}: an FP8 KV cache needs the hd512 head-major gather",
                     library.display()
                 )));
             }
-            if d.kv_stride % PAGE != 0
-                || u64::from(d.slots) * u64::from(d.kv_heads) * u64::from(d.kv_stride)
-                    / u64::from(PAGE)
-                    > i32::MAX as u64
-            {
+            if cache.slots == 0 || cache.rows == 0 || cache.rows % PAGE != 0 {
                 return Err(RuntimeError::Rejected(
-                    "library attention: cache geometry".into(),
+                    "library attention: source cache geometry".into(),
                 ));
             }
-        }
-        let pool_bytes = if direct.is_some() {
-            16
-        } else {
-            u64::from(max_kv_heads) * u64::from(POOL_ROWS) * u64::from(declared.head_dim) * 2
+            if let Some(d) = direct {
+                if (d.slots, d.kv_stride) != (cache.slots, cache.rows) {
+                    return Err(RuntimeError::Rejected(
+                        "library attention: direct geometry differs from the source cache".into(),
+                    ));
+                }
+                if f16 {
+                    return Err(RuntimeError::Rejected(format!(
+                        "{}: a BF16 KV cache needs the bf16 library",
+                        library.display()
+                    )));
+                }
+                if d.kv_stride % PAGE != 0
+                    || u64::from(d.slots) * u64::from(d.kv_heads) * u64::from(d.kv_stride)
+                        / u64::from(PAGE)
+                        > i32::MAX as u64
+                {
+                    return Err(RuntimeError::Rejected(
+                        "library attention: cache geometry".into(),
+                    ));
+                }
+            }
+            let pool_bytes = if direct.is_some() {
+                16
+            } else {
+                u64::from(max_kv_heads) * u64::from(POOL_ROWS) * u64::from(declared.head_dim) * 2
+            };
+            let pool_k = be.alloc(0, pool_bytes)?;
+            let pool_v = be.alloc(0, pool_bytes)?;
+            let table = be.alloc(0, TABLE_BYTES)?;
+            let workspace = be.alloc(0, WORKSPACE_BYTES)?;
+            let mut staging = Vec::with_capacity(STAGING);
+            for _ in 0..STAGING {
+                staging.push(Staging {
+                    host: be.host_alloc_pinned(TABLE_BYTES as usize)?,
+                    done: be.event_create(false)?,
+                    pending: false,
+                });
+            }
+            Ok((pool_bytes, pool_k, pool_v, table, workspace, staging))
+        })();
+        let (pool_bytes, pool_k, pool_v, table, workspace, staging) = match rest {
+            Ok(rest) => rest,
+            Err(e) => {
+                let _ = fa4.unload(be);
+                let _ = adapters.unload(be);
+                return Err(e);
+            }
         };
-        let pool_k = be.alloc(0, pool_bytes)?;
-        let pool_v = be.alloc(0, pool_bytes)?;
-        let table = be.alloc(0, TABLE_BYTES)?;
-        let workspace = be.alloc(0, WORKSPACE_BYTES)?;
-        let mut staging = Vec::with_capacity(STAGING);
-        for _ in 0..STAGING {
-            staging.push(Staging {
-                host: be.host_alloc_pinned(TABLE_BYTES as usize)?,
-                done: be.event_create(false)?,
-                pending: false,
-            });
-        }
         LOADED.store(true, Ordering::Relaxed);
         tracing::info!(
             library = %library.display(),

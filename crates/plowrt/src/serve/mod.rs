@@ -938,6 +938,10 @@ impl AppState {
     pub fn remove_gpu_engine(&self, slug: &str) -> Option<Arc<Mutex<engine::ServeEngine>>> {
         #[cfg(any(feature = "cuda", feature = "hsa"))]
         self.vmm_stats.write().remove(slug);
+        // The metrics handle shares the KV block store (device blocks, the pinned host tier and
+        // its threads): kept here, it outlived every unload and each reload added another.
+        #[cfg(feature = "cuda")]
+        self.kv_store.write().remove(slug);
         if let Some((set, r)) = self.dp_rank(slug) {
             set.set_probe(r, None);
         }

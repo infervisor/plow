@@ -1492,8 +1492,11 @@ pub fn spawn(
                 // jobs never had their chance to be dequeued and admitted,
                 // and a stream that ends with no terminal chunk is
                 // indistinguishable from a crash (the shed path at the
-                // admission gate sets the precedent).
-                while let Ok(msg) = rx.try_recv() {
+                // admission gate sets the precedent). Closed first, then drained to the end: a
+                // job sent after a last `try_recv` (or on a permit taken before the close) was
+                // lost with no terminal at all. `recv` ends once the buffer and permits are spent.
+                rx.close();
+                while let Some(msg) = rx.recv().await {
                     note_dequeued(&msg, &metrics);
                     match msg {
                         MuxMsg::Drain(done) => {

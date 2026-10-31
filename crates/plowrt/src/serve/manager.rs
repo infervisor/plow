@@ -529,6 +529,19 @@ pub trait ManagerDevice: Send + Sync {
     fn supports_tp(&self) -> bool {
         false
     }
+    /// Modules loaded on the device, when the backend counts them (lifecycle accounting).
+    fn live_modules(&self) -> Option<usize> {
+        None
+    }
+    /// Devices in this manager's group, from its first ordinal: the widest TP it can host.
+    fn group_width(&self) -> u32 {
+        1
+    }
+    /// Co-resident engines here are safe only under round-robin turns (HSA: separate queues
+    /// give no whole-grid residency, and no cooperative-launch refusal turns that into an error).
+    fn co_tenants_need_rr(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -565,7 +578,9 @@ impl ManagerDevice for CudaManagerDevice {
     }
     fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
         let be = Arc::clone(&self.be);
-        let mut engine = crate::exec::gpu::GpuEngine::load(be, dir, ckpt)?;
+        let mut engine = self
+            .be
+            .unload_modules_on_err(|| crate::exec::gpu::GpuEngine::load(be, dir, ckpt))?;
         if crate::config::RuntimeConfig::get().nv.spec {
             match engine.spec_serve_enable(dir) {
                 Ok(limits) => tracing::info!(?limits, "speculative decoding on"),
@@ -579,17 +594,22 @@ impl ManagerDevice for CudaManagerDevice {
     fn is_sibling_resident(&self, dir: &Path) -> bool {
         crate::exec::gpu::packet_exec::resident_in(dir, self.be.device_ordinal)
     }
+    fn live_modules(&self) -> Option<usize> {
+        Some(self.be.live_modules())
+    }
 }
 
 #[cfg(feature = "hsa")]
 pub struct HsaManagerDevice {
     be: Arc<crate::device::hsa::HsaBackend>,
+    width: u32,
 }
 
 #[cfg(feature = "hsa")]
 impl HsaManagerDevice {
-    pub fn new(be: Arc<crate::device::hsa::HsaBackend>) -> Self {
-        Self { be }
+    /// `width`: devices in the group starting at `be`'s ordinal.
+    pub fn new(be: Arc<crate::device::hsa::HsaBackend>, width: u32) -> Self {
+        Self { be, width }
     }
 }
 
@@ -639,6 +659,12 @@ impl ManagerDevice for HsaManagerDevice {
         false
     }
     fn supports_tp(&self) -> bool {
+        true
+    }
+    fn group_width(&self) -> u32 {
+        self.width
+    }
+    fn co_tenants_need_rr(&self) -> bool {
         true
     }
 }
@@ -746,13 +772,14 @@ impl ModelManager {
     #[cfg(feature = "hsa")]
     pub fn from_hsa(
         be: Arc<crate::device::hsa::HsaBackend>,
+        width: u32,
         state: &Arc<AppState>,
         mux_cfg: MuxConfig,
         models: Vec<(String, PathBuf, PathBuf)>,
         budget: Option<u64>,
     ) -> Result<ModelManager> {
         Self::with_device(
-            Arc::new(HsaManagerDevice::new(be)),
+            Arc::new(HsaManagerDevice::new(be, width)),
             state,
             mux_cfg,
             models,
@@ -1128,13 +1155,32 @@ impl ModelManager {
             return Ok(());
         }
 
-        let _g = match switch_timeout() {
-            Some(d) => tokio::time::timeout(d, self.switch.lock())
-                .await
-                .map_err(|_| EnsureError::SwitchTimeout(d))?,
-            None => self.switch.lock().await,
-        };
-        self.ensure_resident_locked(slug).await
+        // The switch runs on a task of its own: a request future dropped mid-switch (client gone)
+        // released the lock between installing the engine and its dispatcher, and the model then
+        // read as resident with nothing serving it.
+        let mgr = Arc::clone(self);
+        let slug = slug.to_string();
+        tokio::spawn(async move {
+            let _g = match switch_timeout() {
+                Some(d) => tokio::time::timeout(d, mgr.switch.lock())
+                    .await
+                    .map_err(|_| EnsureError::SwitchTimeout(d))?,
+                None => mgr.switch.lock().await,
+            };
+            mgr.ensure_resident_locked(&slug).await
+        })
+        .await
+        .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("model switch task: {e}"))))?
+    }
+
+    /// An engine with no dispatcher (a load cut off between the two) serves nothing and is not
+    /// resident for any caller: take it down so the load runs again.
+    async fn clear_partial(&self, slug: &str) -> std::result::Result<(), EnsureError> {
+        if self.is_resident(slug) && !self.is_serving(slug) {
+            tracing::warn!(%slug, "planner: engine installed without a dispatcher — reloading");
+            self.evict(slug, Stop::Now).await?;
+        }
+        Ok(())
     }
 
     async fn ensure_resident_locked(
@@ -1150,6 +1196,7 @@ impl ModelManager {
         if !state.residency(slug).admits() {
             return Err(EnsureError::Unloaded);
         }
+        self.clear_partial(slug).await?;
         if self.is_resident(slug) {
             self.touch(slug);
             return Ok(());
@@ -1321,12 +1368,15 @@ impl ModelManager {
         // window rather than merely narrowing it.
         state.set_residency(slug, crate::serve::Residency::Unloading);
 
-        let (free_before, _) = self.device.mem_info().map_err(EnsureError::Load)?;
-        let (stop_ms, unload_ms) = self.evict(slug, stop).await?;
-        let pool_trimmed = self.device.pool_trim(0);
-        let (free_after, _) = self.device.mem_info().map_err(EnsureError::Load)?;
-
+        let free_before = self.device.mem_info().map_or(0, |(free, _)| free);
+        // Unloaded on failure too: the dispatcher is already gone, and only an explicit load
+        // (which this state asks for) brings the model back — `Unloading` stuck it refusing.
+        let evicted = self.evict(slug, stop).await;
         state.set_residency(slug, crate::serve::Residency::Unloaded);
+        let (stop_ms, unload_ms) = evicted?;
+        let pool_trimmed = self.device.pool_trim(0);
+        let free_after = self.device.mem_info().map_or(0, |(free, _)| free);
+
         self.last_use.lock().remove(slug);
 
         let report = UnloadReport {
@@ -1381,6 +1431,7 @@ impl ModelManager {
         slug: &str,
         evict_lru: bool,
     ) -> std::result::Result<f64, EnsureError> {
+        self.clear_partial(slug).await?;
         if self.is_resident(slug) {
             self.touch(slug);
             return Ok(0.0);
@@ -1450,19 +1501,23 @@ impl ModelManager {
         let pool = self.device.pool_bytes();
         let (free, headroom) = (self.free_vram().ok()?, self.planned_headroom().ok()?);
         let state = self.state.upgrade()?;
-        let last_use = self.last_use.lock();
-        self.models
-            .read()
+        // Cloned out first: `required` takes the models lock again, and a recursive read behind
+        // a queued registration's write deadlocks.
+        let models = self.models.read().clone();
+        let fits: Vec<String> = models
             .iter()
             .filter(|m| !self.is_resident(&m.slug))
             // Never speculatively reload what an operator unloaded.
             .filter(|m| state.residency(&m.slug).admits())
             .filter(|m| {
                 let credit = pool.min(m.plan.slab_reusable());
-                self.required(&m.slug).expect("managed") + RESERVE <= (free + credit).min(headroom)
+                self.required(&m.slug)
+                    .is_some_and(|need| need + RESERVE <= (free + credit).min(headroom))
             })
-            .max_by_key(|m| last_use.get(&m.slug).copied())
             .map(|m| m.slug.clone())
+            .collect();
+        let last_use = self.last_use.lock();
+        fits.into_iter().max_by_key(|s| last_use.get(s).copied())
     }
 
     /// Tear one resident model down: remove the mux (new submits fail fast),
@@ -1539,7 +1594,8 @@ impl ModelManager {
         }
         let unload_ms = ms(t1);
         let (free, _) = self.device.mem_info().map_err(EnsureError::Load)?;
-        tracing::info!(%slug, drain_ms, unload_ms, engine_ms, free_gib = gib(free), "model evicted");
+        let modules = self.device.live_modules();
+        tracing::info!(%slug, drain_ms, unload_ms, engine_ms, free_gib = gib(free), ?modules, "model evicted");
         Ok((drain_ms, unload_ms))
     }
 
@@ -1586,6 +1642,24 @@ impl ModelManager {
                     m.slug, co_tenants
                 ))));
             }
+        }
+
+        // The turn mode is fixed when the turns are installed, from the startup tenant count: a
+        // model loaded later beside another on a group that started with one runs without turns.
+        if unturned_co_tenancy(
+            self.device.co_tenants_need_rr(),
+            state.device_turn(&m.slug).map(|t| t.mode()),
+            self.models
+                .read()
+                .iter()
+                .any(|o| o.slug != m.slug && self.is_resident(&o.slug)),
+        ) {
+            return Err(EnsureError::Load(RuntimeError::Rejected(format!(
+                "refusing to make {} co-resident on a device group whose co-tenant turns are not \
+                 round-robin: HSA queues give no whole-grid residency, so two engines can wait on \
+                 each other's blocks forever. Start the server with --co-sched rr to share a group.",
+                m.slug
+            ))));
         }
 
         let (free_before, _) = self.device.mem_info().map_err(EnsureError::Load)?;
@@ -1646,14 +1720,37 @@ impl ModelManager {
     }
 }
 
+/// A load that would put a second engine on a device needing round-robin turns while its
+/// turn is not round-robin.
+fn unturned_co_tenancy(
+    needs_rr: bool,
+    turn: Option<crate::serve::cosched::CoSched>,
+    co_resident: bool,
+) -> bool {
+    needs_rr && co_resident && turn != Some(crate::serve::cosched::CoSched::Rr)
+}
+
 /// Refuse a bundle compiled for tensor parallelism when the device does not support TP.
 fn check_device_tp(device: &dyn ManagerDevice, slug: &str, dir: &Path) -> Result<()> {
-    let tp = tp_degree(dir)?;
+    check_tp(device, slug, tp_degree(dir)?)
+}
+
+fn check_tp(device: &dyn ManagerDevice, slug: &str, tp: u32) -> Result<()> {
     if tp > 1 && !device.supports_tp() {
         return Err(RuntimeError::Rejected(format!(
             "{slug} declares tensor-parallel degree {tp}, and this model manager device is \
              single-device (one backend per engine). Serving it here would load one shard \
              and answer with it. Compile a TP1 bundle, or serve it on a backend supporting TP (e.g. AMD HSA)."
+        )));
+    }
+    // The engine spans `tp` devices from the group's first: past the group they belong to other
+    // managers, whose planners never see this load.
+    if tp > device.group_width() {
+        return Err(RuntimeError::Rejected(format!(
+            "{slug} declares tensor-parallel degree {tp}, and its device group starting at {} \
+             has {} device(s); start the server with a placement whose groups are {tp} wide",
+            device.device_ordinal(),
+            device.group_width()
         )));
     }
     Ok(())
@@ -1783,6 +1880,67 @@ mod tests {
         assert_eq!(p.weights_bytes, 10 * weights.len() as u64);
         assert_eq!(p.kv_bytes, 5);
         assert_eq!(p.other_bytes, 7 * 2 + 3);
+    }
+
+    struct Group(u32);
+
+    impl ManagerDevice for Group {
+        fn device_ordinal(&self) -> u8 {
+            2
+        }
+        fn mem_info(&self) -> Result<(u64, u64)> {
+            Ok((0, 0))
+        }
+        fn granularity(&self) -> Result<u64> {
+            Ok(4096)
+        }
+        fn compute_capability(&self) -> Option<(u32, u32)> {
+            None
+        }
+        fn pool_bytes(&self) -> u64 {
+            0
+        }
+        fn pool_trim(&self, _: u64) -> u64 {
+            0
+        }
+        fn load_engine(&self, _: &Path, _: &Path) -> Result<crate::serve::engine::ServeEngine> {
+            unreachable!()
+        }
+        fn is_sibling_resident(&self, _: &Path) -> bool {
+            false
+        }
+        fn supports_tp(&self) -> bool {
+            true
+        }
+        fn group_width(&self) -> u32 {
+            self.0
+        }
+    }
+
+    /// A TP engine spans `tp` devices from its group's first; past the group they belong to
+    /// other managers, which never planned for it.
+    #[test]
+    fn a_tp_bundle_must_fit_its_device_group() {
+        assert!(check_tp(&Group(4), "m", 4).is_ok());
+        assert!(check_tp(&Group(4), "m", 2).is_ok());
+        let e = check_tp(&Group(1), "m", 4).unwrap_err().to_string();
+        assert!(e.contains("starting at 2 has 1 device"), "{e}");
+        assert!(check_tp(&HostManagerDevice::new(), "m", 2).is_err());
+        assert!(check_tp(&HostManagerDevice::new(), "m", 1).is_ok());
+    }
+
+    /// A device group installed with one tenant (or none: a zero-asset start) runs free turns,
+    /// and the mode is fixed at install. On HSA a second engine loaded there later is refused.
+    #[test]
+    fn hsa_co_tenancy_needs_round_robin_turns() {
+        use crate::serve::cosched::CoSched;
+        assert!(unturned_co_tenancy(true, Some(CoSched::Free), true));
+        assert!(unturned_co_tenancy(true, None, true));
+        assert!(!unturned_co_tenancy(true, Some(CoSched::Rr), true));
+        assert!(!unturned_co_tenancy(true, Some(CoSched::Free), false));
+        assert!(!unturned_co_tenancy(false, Some(CoSched::Free), true));
+        assert!(HostManagerDevice::new().group_width() == 1);
+        assert!(!HostManagerDevice::new().co_tenants_need_rr());
     }
 
     #[test]

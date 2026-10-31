@@ -429,6 +429,35 @@ async fn resolve_or_fetch_assets(
     Ok((authorize(state, dir)?, ckpt))
 }
 
+/// Undo a registration this load made: the manager plan, registry entry (and its aliases),
+/// group and checkpoint pairing.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+async fn roll_back(
+    state: &AppState,
+    mgr: &crate::serve::manager::ModelManager,
+    slug: &str,
+    dir: &std::path::Path,
+) {
+    if let Err(e) = mgr.unload_and_deregister(slug, true).await {
+        tracing::warn!(%slug, error = %e, "load rollback: deregister failed");
+    }
+    forget_checkpoint(state, dir);
+}
+
+/// Drop `dir`'s checkpoint pairing unless another registered slug still serves it.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+fn forget_checkpoint(state: &AppState, dir: &std::path::Path) {
+    let shared = state.registry.slugs().iter().any(|s| {
+        state
+            .registry
+            .get(s)
+            .is_ok_and(|b| b.dir.canonicalize().ok().as_deref() == Some(dir))
+    });
+    if !shared {
+        crate::asset::serve::clear_checkpoint(dir);
+    }
+}
+
 /// `POST /v1/models/load` — make a model resident, registering its assets dir
 /// first when the slug is new.
 pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadRequest>) -> Response {
@@ -523,6 +552,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             );
         };
 
+        let mut registered_dir: Option<PathBuf> = None;
         if let Some(dir) = assets {
             // Registering the bundle is what makes the tokenizer, chat template
             // and bucket ladder reachable; registering with the manager is what
@@ -547,21 +577,29 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                     return err(StatusCode::CONFLICT, e);
                 }
                 if let Err(e) = state.registry.load(&dir, Some(req.model.clone())) {
+                    forget_checkpoint(&state, &dir);
                     return err(StatusCode::BAD_REQUEST, e);
                 }
             }
-            if let Err(e) = mgr.register(&req.model, dir, ckpt) {
+            if let Err(e) = mgr.register(&req.model, dir.clone(), ckpt) {
                 if newly_registered {
                     let _ = state.registry.unload(&req.model);
+                    forget_checkpoint(&state, &dir);
                 }
                 return err(StatusCode::BAD_REQUEST, e);
             }
+            state.set_slug_group(&req.model, group);
             for alias in &req.aliases {
                 if let Err(e) = state.registry.add_alias(alias.clone(), &req.model) {
+                    if newly_registered {
+                        roll_back(&state, &mgr, &req.model, &dir).await;
+                    }
                     return err(StatusCode::BAD_REQUEST, e);
                 }
             }
-            state.set_slug_group(&req.model, group);
+            if newly_registered {
+                registered_dir = Some(dir);
+            }
         }
 
         if !mgr.manages(&req.model) {
@@ -575,7 +613,13 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         }
 
         use crate::serve::manager::EnsureError;
-        match mgr.load(&req.model, req.evict).await {
+        let loaded = mgr.load(&req.model, req.evict).await;
+        // A model this call registered and could not load leaves no trace: kept, it stayed in
+        // the catalogue and every request for it paid another full load attempt.
+        if let (Err(_), Some(dir)) = (&loaded, &registered_dir) {
+            roll_back(&state, &mgr, &req.model, dir).await;
+        }
+        match loaded {
             Ok(load_ms) => Json(LoadResponse {
                 model: req.model,
                 state: "resident",
@@ -646,16 +690,13 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
                 format_args!("unknown model {:?}", req.model),
             );
         }
-        let drain = match req.drain_timeout_ms {
-            Some(0) => None,
-            Some(ms) => Some(std::time::Duration::from_millis(ms)),
-            None => crate::config::RuntimeConfig::get()
-                .drain_timeout_ms()
-                .map(std::time::Duration::from_millis),
-        };
         use crate::serve::manager::EnsureError;
         let report = match mgr
-            .unload_with_drain(&req.model, req.deregister, drain)
+            .unload_with_drain(
+                &req.model,
+                req.deregister,
+                unload_drain(req.drain_timeout_ms),
+            )
             .await
         {
             Ok(r) => r,
@@ -681,6 +722,17 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
             format_args!("unknown model {:?}", req.model),
         )
     }
+}
+
+/// How long an unload lets in-flight generations finish before preempting the rest: the
+/// request's `drain_timeout_ms`, else `PLOW_DRAIN_TIMEOUT_MS`, else 30 s. `None` (a 0) preempts
+/// at once. One rule for every backend: ordinary GPU unloads used to preempt at once and the
+/// CPU/Metal ones to drain unbounded, against the documented 30 s.
+pub fn unload_drain(drain_timeout_ms: Option<u64>) -> Option<std::time::Duration> {
+    let ms = drain_timeout_ms
+        .or_else(|| crate::config::RuntimeConfig::get().drain_timeout_ms())
+        .unwrap_or(30_000);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 
 /// The instance keys a load/unload of `model` addresses, when it is a DP model or one of its
@@ -754,15 +806,7 @@ async fn dp_unload(
     keys: Vec<String>,
     drain_timeout_ms: Option<u64>,
 ) -> Response {
-    let bound = match drain_timeout_ms {
-        Some(0) => std::time::Duration::from_millis(0),
-        Some(ms) => std::time::Duration::from_millis(ms),
-        None => std::time::Duration::from_millis(
-            crate::config::RuntimeConfig::get()
-                .drain_timeout_ms()
-                .unwrap_or(30_000),
-        ),
-    };
+    let bound = unload_drain(drain_timeout_ms).unwrap_or_default();
     let mut total = UnloadResponse {
         model: keys.join(","),
         state: "unloaded",

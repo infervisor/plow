@@ -211,6 +211,11 @@ pub fn set_checkpoint(asset_dir: &Path, checkpoint: &Path) -> Result<()> {
     }
 }
 
+/// Forget `asset_dir`'s explicit checkpoint pairing (a control-plane registration rolled back).
+pub fn clear_checkpoint(asset_dir: &Path) {
+    explicit_checkpoints().write().remove(&map_key(asset_dir));
+}
+
 /// Split one `--assets` value, `<dir>[,checkpoint=<path>][,slug=<name>]`, and record the
 /// pairing. A value that names an existing path is taken literally (a directory name may contain
 /// a comma).

@@ -249,6 +249,18 @@ pub struct BlockServe {
     held: Mutex<Vec<Vec<Hold>>>,
     stats: Mutex<BlockServeStats>,
     _grower_stop: WorkerStop,
+    /// `kernel`'s module: unloaded with the store server, or every reload pinned another.
+    _segcopy: Option<OwnedModule>,
+}
+
+struct OwnedModule(Arc<CudaBackend>, crate::device::Module);
+
+impl Drop for OwnedModule {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.module_unload(&self.1) {
+            tracing::warn!(error = %e, "kv store: segment-copy module unload");
+        }
+    }
 }
 
 /// Stops the store's worker threads when dropped: with the `BlockServe`, or on a failed
@@ -317,16 +329,16 @@ impl BlockServe {
         .iter()
         .chain(state_tensors.iter().map(|(_, bytes)| bytes))
         .all(|b| b % 16 == 0);
-        let kernel = if vector_ok {
+        let (kernel, segcopy) = if vector_ok {
             match Self::load_kernel(be) {
-                Ok(f) => Some(f),
+                Ok((f, m)) => (Some(f), Some(OwnedModule(Arc::clone(be), m))),
                 Err(e) => {
                     tracing::warn!(error = %e, "kv store: segment-copy kernel unavailable, memcpy loop");
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
         };
         let store = Arc::new(KvStore::new(
             Arc::clone(be) as Arc<dyn crate::memory::kv_store::StoreOps>,
@@ -406,14 +418,21 @@ impl BlockServe {
             held: Mutex::new((0..batch).map(|_| Vec::new()).collect()),
             _grower_stop: grower_stop,
             stats: Mutex::new(BlockServeStats::default()),
+            _segcopy: segcopy,
         }))
     }
 
-    fn load_kernel(be: &Arc<CudaBackend>) -> Result<KernelFn> {
+    fn load_kernel(be: &Arc<CudaBackend>) -> Result<(KernelFn, crate::device::Module)> {
         let mut image = SEGCOPY_PTX.as_bytes().to_vec();
         image.push(0);
         let module = crate::device::Backend::module_load(&**be, &image)?;
-        be.get_function(&module, SEGCOPY_ENTRY)
+        match be.get_function(&module, SEGCOPY_ENTRY) {
+            Ok(f) => Ok((f, module)),
+            Err(e) => {
+                let _ = be.module_unload(&module);
+                Err(e)
+            }
+        }
     }
 
     pub fn stats(&self) -> BlockServeStats {
