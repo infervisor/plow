@@ -32,6 +32,8 @@ use std::sync::Arc;
 
 const ROWS_PER_BLOCK: u32 = 32;
 const CHUNK_BYTES: u64 = 8 << 20;
+/// Least pause after each pinned host chunk the grower allocates (see the grower thread).
+const HOST_GROW_GAP: std::time::Duration = std::time::Duration::from_millis(1);
 /// Device headroom the spill-ahead thread keeps for publishes when a host tier is armed
 /// (`VmmKv::spawn_spill_ahead`): about a second of boundaries at the production rate.
 pub const SPILL_AHEAD_BYTES: u64 = 2 << 30;
@@ -378,9 +380,18 @@ impl BlockServe {
                 .name("kv-store-host-grower".into())
                 .spawn(crate::config::inherit(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        if !store.host_grow_step() {
-                            std::thread::sleep(std::time::Duration::from_millis(2));
-                        }
+                        let t = std::time::Instant::now();
+                        let grew = store.host_grow_step();
+                        // Pinning holds the driver's context lock. Back to back, the grower held
+                        // it nearly all the time while a cold tier filled (26B BF16, 8 MiB
+                        // chunks: 30 GiB in a minute) and the engine thread's CUDA calls waited
+                        // seconds behind it in admission, launch or readback. Leave the lock
+                        // free at least as long as each pin held it.
+                        std::thread::sleep(if grew {
+                            t.elapsed().max(HOST_GROW_GAP)
+                        } else {
+                            std::time::Duration::from_millis(2)
+                        });
                     }
                 }))
                 .map_err(|e| RuntimeError::Rejected(format!("kv store: host grower: {e}")))?;

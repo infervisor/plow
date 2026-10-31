@@ -205,6 +205,8 @@ pub(crate) struct Lt {
     stored: std::collections::HashMap<StoredKey, Algo>,
     /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
     write: Option<std::path::PathBuf>,
+    /// Set once this engine has warned that it times a plan no table pins.
+    unpinned_warned: std::sync::atomic::AtomicBool,
 }
 
 impl Lt {
@@ -257,6 +259,7 @@ impl Lt {
             workspace,
             stored,
             write,
+            unpinned_warned: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -1172,6 +1175,22 @@ impl Plan {
                 "cuBLASLt algorithm reused from an earlier load"
             );
             return Ok(());
+        }
+        if self.lt.write.is_none()
+            && !self
+                .lt
+                .unpinned_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                m,
+                n,
+                k,
+                pinned_shapes = self.lt.stored.len(),
+                "cuBLASLt plan timed at load: no cublaslt_algos.jsonl row pins it, so the \
+                 algorithm (and its reduction order) can differ between server starts; record \
+                 the bundle's table (campaign probe)"
+            );
         }
         match pair {
             Some(pair) => self.select_pair(candidates, m, n, k, weight, pair, rows)?,

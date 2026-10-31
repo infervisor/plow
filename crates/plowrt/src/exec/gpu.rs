@@ -10303,8 +10303,13 @@ impl GpuEngine {
             }
         }
         let base = self.cfg_slab()?.counts.base + (slot * vocab * 4) as u64;
-        self.be.memcpy_htod(base, bytemuck::cast_slice(&row))?;
-        self.be.synchronize()
+        // On the engine stream: a context-wide synchronize also waits for every co-tenant's work.
+        // SAFETY: `row` outlives the stream synchronize below; `base` spans `vocab` u32 counts.
+        unsafe {
+            self.be
+                .memcpy_htod_async(base, bytemuck::cast_slice(&row), &self.stream)?;
+        }
+        self.be.stream_synchronize(&self.stream)
     }
 
     /// Stage guided draws for the next [`Self::step_slots_sampled`] (`steps == 1`) or
@@ -10884,8 +10889,8 @@ impl GpuEngine {
                         return Err(RuntimeError::Device(format!(
                             "PLOW_PF_SEG_FA512=all classes hd256 flash onto {fa_file}, but that \
                              object was built without its hd256 arm (PLOW_BUILD_FA_HD256=1) — \
-                             it would trap on the first hd256 segment. Rebuild the object or set \
-                             PLOW_PF_SEG_FA512=1."
+                             it would trap on the first hd256 segment. Rebuild the object, or re-emit \
+                             the packet with PLOW_SEG_FA512=1 (the runtime value must match it)."
                         )));
                     }
                     Some((m3, f3, s3, g3))

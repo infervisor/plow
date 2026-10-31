@@ -851,6 +851,12 @@ pub struct RuntimeConfig {
     )]
     pub cosched_max_wait_ms: Option<u32>,
 
+    /// Expert: under `--co-sched rr|deadline`, hand a spent device turn on as soon as the tick
+    /// returns instead of at the model's next tick (`serve::cosched::Turn::finish`); `false` is
+    /// the rollback.
+    #[arg(long = "cosched-early-release", env = "PLOW_COSCHED_EARLY_RELEASE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", hide = true, global = true)]
+    pub cosched_early_release: bool,
+
     /// `serve --max-queued-requests` when that flag is 0 (a packet serve default lands here).
     #[arg(
         long = "serve-max-queued-requests",
