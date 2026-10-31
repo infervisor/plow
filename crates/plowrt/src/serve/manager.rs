@@ -746,6 +746,10 @@ pub struct ModelManager {
     /// The server runtime. A dispatcher asking for growth runs its own executor on a busy
     /// thread, where a task spawned locally would wait for the load to stop.
     runtime: Option<tokio::runtime::Handle>,
+    /// slug → why its last load failed (other than out of memory). A demand load refuses the
+    /// model with it before evicting anyone: a deterministic failure otherwise took a healthy
+    /// co-tenant down on every request. An explicit load or a re-registration retries.
+    failed: Mutex<FxHashMap<String, String>>,
 }
 
 impl ModelManager {
@@ -842,6 +846,7 @@ impl ModelManager {
             budget,
             last_switch: Mutex::new(None),
             growing: std::sync::atomic::AtomicBool::new(false),
+            failed: Mutex::default(),
             runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
@@ -919,6 +924,7 @@ impl ModelManager {
         drop(models);
         self.overhead.lock().remove(slug);
         self.last_use.lock().remove(slug);
+        self.failed.lock().remove(slug);
         tracing::info!(%slug, "planner: model deregistered");
         true
     }
@@ -1207,6 +1213,11 @@ impl ModelManager {
             self.touch(slug);
             return Ok(());
         }
+        if let Some(why) = self.failed.lock().get(slug) {
+            return Err(EnsureError::Load(RuntimeError::Rejected(format!(
+                "{slug}: its last load failed ({why}); an explicit load retries it"
+            ))));
+        }
         let m = self
             .managed(slug)
             .ok_or_else(|| EnsureError::Load(RuntimeError::UnknownModel(slug.into())))?;
@@ -1419,6 +1430,7 @@ impl ModelManager {
         }
         let _g = self.switch.lock().await;
         let state = self.state()?;
+        self.failed.lock().remove(slug);
         let was = state.residency(slug);
         // `ensure_resident` and the fit path below both refuse a pinned slug,
         // so the pin has to come off first — and go back on if the load fails,
@@ -1515,6 +1527,7 @@ impl ModelManager {
             .filter(|m| !self.is_resident(&m.slug))
             // Never speculatively reload what an operator unloaded.
             .filter(|m| state.residency(&m.slug).admits())
+            .filter(|m| !self.failed.lock().contains_key(&m.slug))
             .filter(|m| {
                 let credit = pool.min(m.plan.slab_reusable());
                 self.required(&m.slug)
@@ -1611,6 +1624,20 @@ impl ModelManager {
     /// Load `m`'s engine (blocking H2D on the blocking pool), install it, and
     /// spawn its dispatcher. Calibrates the overhead cache on first load.
     async fn load_model(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
+        let r = self.load_model_once(m).await;
+        match &r {
+            Err(EnsureError::Load(e)) if !is_oom(e) => {
+                self.failed.lock().insert(m.slug.clone(), e.to_string());
+            }
+            Ok(()) => {
+                self.failed.lock().remove(&m.slug);
+            }
+            Err(_) => {}
+        }
+        r
+    }
+
+    async fn load_model_once(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
         let state = self.state()?;
         let bundle = state
             .registry
@@ -1947,6 +1974,53 @@ mod tests {
         fn group_width(&self) -> u32 {
             self.0
         }
+    }
+
+    /// A model whose load failed (other than out of memory) is refused by later demand loads
+    /// before the planner evicts anyone; an explicit load retries it.
+    #[tokio::test]
+    async fn a_failed_load_is_not_retried_by_demand_loads() {
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        let plan = BlobPlan {
+            weights_bytes: 1 << 20,
+            kv_bytes: 0,
+            other_bytes: 0,
+            sidecar_bytes: 0,
+        };
+        let mgr = Arc::new(ModelManager {
+            state: Arc::downgrade(&state),
+            device: Arc::new(HostManagerDevice::new()),
+            mux_cfg: MuxConfig::default(),
+            models: RwLock::new(vec![Managed {
+                slug: "m".into(),
+                dir: "/nonexistent".into(),
+                ckpt: "/nonexistent".into(),
+                plan,
+            }]),
+            switch: tokio::sync::Mutex::new(()),
+            last_use: Mutex::default(),
+            overhead: Mutex::default(),
+            budget: None,
+            last_switch: Mutex::new(None),
+            growing: std::sync::atomic::AtomicBool::new(false),
+            failed: Mutex::default(),
+            runtime: None,
+        });
+        let first = mgr.ensure_resident("m").await.unwrap_err().to_string();
+        assert!(!first.contains("last load failed"), "{first}");
+        let again = mgr.ensure_resident("m").await.unwrap_err().to_string();
+        assert!(again.contains("its last load failed"), "{again}");
+        assert!(mgr.preload_candidate().is_none());
+        let explicit = mgr.load("m", false).await.unwrap_err().to_string();
+        assert!(
+            !explicit.contains("last load failed"),
+            "an explicit load retries: {explicit}"
+        );
+        assert!(mgr.deregister("m"));
+        assert!(mgr.failed.lock().is_empty());
     }
 
     /// A TP engine spans `tp` devices from its group's first; past the group they belong to
