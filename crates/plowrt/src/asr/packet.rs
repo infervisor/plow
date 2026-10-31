@@ -76,8 +76,9 @@ impl PacketRnntTranscriber {
             while steps * w.rows < rows {
                 let (from, to) = (start(steps) * w.bins, end(steps) * w.bins);
                 let mut window = vec![0.0; to - from];
-                let have = features.values.len().min(to).saturating_sub(from);
-                window[..have].copy_from_slice(&features.values[from..from + have]);
+                let len = features.values.len();
+                let values = &features.values[from.min(len)..to.min(len)];
+                window[..values.len()].copy_from_slice(values);
                 windows.push((window, w.rows.min(rows - steps * w.rows)));
                 steps += 1;
             }
