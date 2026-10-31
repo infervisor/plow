@@ -562,6 +562,9 @@ pub struct AppState {
     models_roots: std::sync::OnceLock<Vec<std::path::PathBuf>>,
     #[cfg(feature = "cpu")]
     portable: std::sync::OnceLock<Arc<portable::PortableManager>>,
+    /// slug → its engine's config (`config::bundle_config`), set before the engine loads; the
+    /// dispatcher and engine thread run under it.
+    engine_cfg: RwLock<FxHashMap<String, &'static crate::config::RuntimeConfig>>,
     /// Operator-set residency overrides, slug → state. Absent = [`Residency::Auto`].
     /// Only the control plane writes here; the manager and the request path read it.
     residency: RwLock<FxHashMap<String, Residency>>,
@@ -653,6 +656,7 @@ impl AppState {
             models_roots: std::sync::OnceLock::new(),
             #[cfg(feature = "cpu")]
             portable: std::sync::OnceLock::new(),
+            engine_cfg: RwLock::new(FxHashMap::default()),
             residency: RwLock::new(FxHashMap::default()),
             control: Mutex::new(FxHashMap::default()),
             started: openai::now_secs(),
@@ -938,6 +942,10 @@ impl AppState {
     pub fn remove_gpu_engine(&self, slug: &str) -> Option<Arc<Mutex<engine::ServeEngine>>> {
         #[cfg(any(feature = "cuda", feature = "hsa"))]
         self.vmm_stats.write().remove(slug);
+        // The metrics handle shares the KV block store (device blocks, the pinned host tier and
+        // its threads): kept here, it outlived every unload and each reload added another.
+        #[cfg(feature = "cuda")]
+        self.kv_store.write().remove(slug);
         if let Some((set, r)) = self.dp_rank(slug) {
             set.set_probe(r, None);
         }
@@ -991,6 +999,26 @@ impl AppState {
             }
             turns
         });
+    }
+
+    /// `slug` is about to run beside `others` engines on its group: raise an unordered turn to
+    /// what a startup with them all would have picked (`policy::co_sched`).
+    ///
+    /// Not on AMD: a co-tenant's tick already in flight under `free` overlaps the new tenant's
+    /// first ordered one, harmless on CUDA (throughput) and a possible whole-grid wait on HSA,
+    /// whose groups must be started `--co-sched rr` to share (the manager refuses otherwise).
+    pub fn upgrade_turn(&self, slug: &str, others: usize, amd: bool) {
+        if others == 0 || amd {
+            return;
+        }
+        let Some(turn) = self.device_turn(slug) else {
+            return;
+        };
+        let want = policy::co_sched(others + 1, amd);
+        if turn.upgrade(want) {
+            policy::set_co_sched(want);
+            tracing::info!(%slug, tenants = others + 1, mode = ?want, "co-tenant turns raised for a runtime load");
+        }
     }
 
     /// `slug`'s downstream credit (created on first use; unlimited until a stage sets a limit).
@@ -1104,6 +1132,16 @@ impl AppState {
     /// The assets-dir allow-list. Empty until `install_models_roots`.
     pub fn models_roots(&self) -> &[std::path::PathBuf] {
         self.models_roots.get().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Record the config `slug`'s engine runs under.
+    pub fn set_engine_config(&self, slug: &str, cfg: &'static crate::config::RuntimeConfig) {
+        self.engine_cfg.write().insert(slug.to_string(), cfg);
+    }
+
+    /// The config `slug`'s engine runs under; `None` = the process config.
+    pub fn engine_config(&self, slug: &str) -> Option<&'static crate::config::RuntimeConfig> {
+        self.engine_cfg.read().get(slug).copied()
     }
 
     /// Residency state of `slug` (defaults to [`Residency::Auto`]).

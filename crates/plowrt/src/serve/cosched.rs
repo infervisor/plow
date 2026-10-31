@@ -39,6 +39,7 @@ use tokio::sync::{oneshot, Mutex, OwnedMutexGuard};
 
 /// How co-resident models take the device.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CoSched {
     /// No host-side ordering: private streams, driver admission. Default.
     #[default]
@@ -50,6 +51,16 @@ pub enum CoSched {
     /// ahead of partials; least slack within a band, and work about to miss (a stream about to
     /// underrun) ahead of all. A waiter is due by [`MAX_WAIT`] after it queued, so nothing starves.
     Deadline,
+}
+
+impl CoSched {
+    fn from_u8(v: u8) -> CoSched {
+        match v {
+            1 => CoSched::Rr,
+            2 => CoSched::Deadline,
+            _ => CoSched::Free,
+        }
+    }
 }
 
 impl std::str::FromStr for CoSched {
@@ -75,7 +86,9 @@ impl std::str::FromStr for CoSched {
 /// releases and goes to the back of the queue.
 #[derive(Debug)]
 pub struct DeviceTurn {
-    mode: CoSched,
+    /// A [`CoSched`]; raised once from `Free` when a group gains its second tenant at runtime
+    /// ([`Self::upgrade`]).
+    mode: std::sync::atomic::AtomicU8,
     quantum: u32,
     turn: Arc<Mutex<()>>,
     prio: Arc<parking_lot::Mutex<PrioState>>,
@@ -354,7 +367,7 @@ impl PrioHold {
 impl DeviceTurn {
     pub fn new(mode: CoSched, quantum: u32) -> DeviceTurn {
         DeviceTurn {
-            mode,
+            mode: std::sync::atomic::AtomicU8::new(mode as u8),
             // A zero quantum would release the turn without ever using it and
             // spin the queue; one tick is the smallest meaningful share.
             quantum: quantum.max(1),
@@ -371,7 +384,24 @@ impl DeviceTurn {
     }
 
     pub fn mode(&self) -> CoSched {
-        self.mode
+        CoSched::from_u8(self.mode.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Order an unordered group: a group installed with one tenant (or none: a zero-asset start)
+    /// runs `Free`, and a model loaded beside it later needs what a startup with both would
+    /// have picked. Only `Free` is raised — nothing holds a turn there — and once.
+    pub fn upgrade(&self, to: CoSched) -> bool {
+        use std::sync::atomic::Ordering;
+        to != CoSched::Free
+            && self
+                .mode
+                .compare_exchange(
+                    CoSched::Free as u8,
+                    to as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
     }
 
     pub fn quantum(&self) -> u32 {
@@ -380,7 +410,7 @@ impl DeviceTurn {
 
     /// Whether a caller must hold a turn before ticking.
     pub fn ordered(&self) -> bool {
-        self.mode != CoSched::Free
+        self.mode() != CoSched::Free
     }
 
     /// [`Self::outranked_due`] for a model whose most urgent work, starting now, is `mine`.
@@ -391,7 +421,7 @@ impl DeviceTurn {
     /// Whether a model due `mine` is outranked by a waiting co-tenant right now: it should keep
     /// its next tick short.
     pub fn outranked_due(&self, mine: Due) -> bool {
-        if self.mode != CoSched::Deadline {
+        if self.mode() != CoSched::Deadline {
             return false;
         }
         let now = Instant::now();
@@ -401,7 +431,7 @@ impl DeviceTurn {
 
     /// The best-ranked waiter's `Due` (starvation bound applied), if anyone waits.
     pub fn tightest_waiter(&self) -> Option<Due> {
-        if self.mode != CoSched::Deadline {
+        if self.mode() != CoSched::Deadline {
             return None;
         }
         let now = Instant::now();
@@ -444,7 +474,7 @@ impl Turn {
 
     /// [`Self::take`] for a model whose most urgent work is `due` ([`CoSched::Deadline`]).
     pub async fn take_due(&mut self, turn: &DeviceTurn, due: Due) {
-        if turn.mode == CoSched::Deadline {
+        if turn.mode() == CoSched::Deadline {
             if let (Some(hold), Some(since)) = (&self.prio, self.since) {
                 if !hold.0.lock().should_yield(due, since, Instant::now()) {
                     self.used += 1;
@@ -496,6 +526,34 @@ mod tests {
         assert_eq!("round-robin".parse::<CoSched>().unwrap(), CoSched::Rr);
         assert_eq!("deadline".parse::<CoSched>().unwrap(), CoSched::Deadline);
         assert!("fair".parse::<CoSched>().is_err());
+    }
+
+    /// A group installed unordered (one tenant, or none) is raised once when a second model
+    /// loads beside it at runtime; an ordered group keeps the mode it was installed with.
+    #[test]
+    fn only_a_free_turn_is_raised_and_only_once() {
+        let dt = DeviceTurn::serving(CoSched::Free);
+        assert!(!dt.upgrade(CoSched::Free));
+        assert!(dt.upgrade(CoSched::Deadline));
+        assert_eq!(dt.mode(), CoSched::Deadline);
+        assert!(dt.ordered());
+        assert!(!dt.upgrade(CoSched::Rr));
+        assert_eq!(dt.mode(), CoSched::Deadline);
+        let rr = DeviceTurn::serving(CoSched::Rr);
+        assert!(!rr.upgrade(CoSched::Deadline));
+        assert_eq!(rr.mode(), CoSched::Rr);
+    }
+
+    /// A runtime-raised turn serializes like an installed one.
+    #[tokio::test]
+    async fn a_raised_turn_serializes_ticks() {
+        let dt = DeviceTurn::new(CoSched::Free, 1);
+        let mut a = Turn::default();
+        a.take(&dt).await;
+        assert!(dt.turn.try_lock().is_ok(), "free holds nothing");
+        assert!(dt.upgrade(CoSched::Rr));
+        a.take(&dt).await;
+        assert!(dt.turn.try_lock().is_err(), "rr holds the device");
     }
 
     /// Free must never serialize anything — that is the entire difference

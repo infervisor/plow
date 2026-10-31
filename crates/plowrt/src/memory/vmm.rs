@@ -1947,7 +1947,7 @@ impl VmmKv {
         let premap_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
             .name("vmm-premap".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 while let Ok(job) = rx.recv() {
                     let s = &premap_shared;
                     match job {
@@ -1988,7 +1988,7 @@ impl VmmKv {
                         }
                     }
                 }
-            })
+            }))
             .map_err(|e| RuntimeError::Device(format!("vmm premap thread: {e}")))?;
         pool.premap_join = Some(join);
 
@@ -2044,7 +2044,7 @@ impl VmmKv {
         let (t_s, t_stop) = (Arc::clone(&self.shared), Arc::clone(&stop));
         let join = std::thread::Builder::new()
             .name("vmm-kv-pool".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 for _ in 0..target {
                     if t_stop.load(Ordering::Acquire) || t_s.inner.lock().pooled.len() >= target {
                         break;
@@ -2064,7 +2064,7 @@ impl VmmKv {
                         Err(_) => break,
                     }
                 }
-            });
+            }));
         if let Ok(j) = join {
             self.precreate = Some((stop, j));
         }
@@ -2172,7 +2172,7 @@ impl VmmKv {
         let shared = Arc::clone(s);
         let join = match std::thread::Builder::new()
             .name("vmm-host-tier".into())
-            .spawn(move || host_tier_thread(&shared))
+            .spawn(crate::config::inherit(move || host_tier_thread(&shared)))
         {
             Ok(join) => join,
             Err(e) => {
@@ -3432,7 +3432,7 @@ impl VmmKv {
         let flag = Arc::clone(&stop);
         let spawned = std::thread::Builder::new()
             .name("vmm-spill-ahead".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 while !flag.load(Ordering::Relaxed) {
                     store.reap();
                     // Spills in flight count as headroom already, and few are queued at once:
@@ -3447,7 +3447,7 @@ impl VmmKv {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                 }
-            });
+            }));
         match spawned {
             Ok(j) => self.spill_ahead = Some((stop, j)),
             Err(e) => tracing::warn!(error = %e, "vmm: spill-ahead thread not started"),
@@ -3460,7 +3460,7 @@ impl VmmKv {
         let shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
             .name("vmm-restore".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 while !flag.load(Ordering::Relaxed) {
                     let job = {
                         let mut jobs = shared.restore_jobs.lock();
@@ -3484,7 +3484,7 @@ impl VmmKv {
                         None => {}
                     }
                 }
-            });
+            }));
         match spawned {
             Ok(j) => self.restorer = Some((stop, j)),
             Err(e) => {
@@ -5477,6 +5477,70 @@ pub(crate) fn host_mem_available() -> Option<(u64, u64)> {
 /// Host RAM the pinned tier leaves to the rest of the machine: an eighth of it, at least
 /// 16 GiB (pinned pages cannot be reclaimed; a co-tenant build must not OOM-kill the server).
 /// `host_tier_auto` returns `(default tier capacity, host reserve)`; see [`host_tier_default`].
+/// Host-tier bytes granted to live engines' block stores, and the process budget they share.
+static HOST_TIER_GRANTED: AtomicU64 = AtomicU64::new(0);
+static HOST_TIER_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+/// One engine's share of the process host-tier budget, returned when its store goes.
+#[derive(Debug)]
+pub(crate) struct HostTierGrant(u64);
+
+impl HostTierGrant {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Drop for HostTierGrant {
+    fn drop(&mut self) {
+        HOST_TIER_GRANTED.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
+
+/// Grant an engine asking `requested` host-tier bytes its share. The tier pins host memory and
+/// never gives it back, so co-served engines draw from ONE budget — the largest any engine has
+/// asked (its packet's `PLOW_VMM_HOST_CACHE_MIB`, or the auto size) — never one each: the second
+/// of two 64 GiB engines gets what the first left. A lone engine gets exactly what it asked.
+pub(crate) fn host_tier_grant(requested: u64) -> HostTierGrant {
+    HOST_TIER_BUDGET.fetch_max(requested, Ordering::AcqRel);
+    let mut granted = HOST_TIER_GRANTED.load(Ordering::Acquire);
+    loop {
+        // Re-read every attempt: a larger request may have raised the budget meanwhile.
+        let budget = HOST_TIER_BUDGET.load(Ordering::Acquire);
+        let give = requested.min(budget.saturating_sub(granted));
+        match HOST_TIER_GRANTED.compare_exchange_weak(
+            granted,
+            granted + give,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return HostTierGrant(give),
+            Err(now) => granted = now,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn co_served_engines_share_one_host_tier_budget() {
+    const G: u64 = 1 << 30;
+    let first = host_tier_grant(64 * G);
+    assert_eq!(first.bytes(), 64 * G, "a lone engine gets what it asked");
+    let second = host_tier_grant(64 * G);
+    assert_eq!(second.bytes(), 0, "never two 64 GiB tiers in one process");
+    drop(first);
+    let third = host_tier_grant(16 * G);
+    assert_eq!(third.bytes(), 16 * G);
+    let fourth = host_tier_grant(64 * G);
+    assert_eq!(
+        fourth.bytes(),
+        48 * G,
+        "what the others left of the largest request"
+    );
+    drop((second, third, fourth));
+    assert_eq!(HOST_TIER_GRANTED.load(Ordering::Acquire), 0);
+}
+
 pub(crate) fn host_tier_auto() -> Option<(u64, u64)> {
     let (avail, total) = host_mem_available()?;
     Some((host_tier_default(avail, total), host_reserve(total)))
@@ -6680,7 +6744,7 @@ impl VmmSlab {
         let (t_ops, t_shared) = (Arc::clone(&ops), Arc::clone(&shared));
         let join = std::thread::Builder::new()
             .name("wslab-map".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 let mut off = 0u64;
                 while off < reserved {
                     if t_shared.m.lock().stop {
@@ -6731,7 +6795,7 @@ impl VmmSlab {
                 if !pooled.is_empty() {
                     t_ops.pool_put(pooled);
                 }
-            })
+            }))
             .map_err(|e| RuntimeError::Device(format!("vmm slab mapper thread: {e}")))?;
         Ok(VmmSlab {
             ops,

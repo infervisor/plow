@@ -771,7 +771,7 @@ pub(super) async fn route(
         let (key, mux) = match dp.as_deref() {
             Some(set) => {
                 if let Err(e) = state.dp_admit(set).await {
-                    return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
+                    return Err(e.with_retry_after(failure(StatusCode::SERVICE_UNAVAILABLE, &e)));
                 }
                 match state.dp_route(set, session, None, exclude) {
                     Some((rank, mux, _, _)) => {
@@ -789,7 +789,9 @@ pub(super) async fn route(
                         .ensure_resident(&slug)
                         .await
                     {
-                        return Err(failure(StatusCode::SERVICE_UNAVAILABLE, e));
+                        return Err(
+                            e.with_retry_after(failure(StatusCode::SERVICE_UNAVAILABLE, &e))
+                        );
                     }
                 }
                 (slug.clone(), state.mux(&slug))

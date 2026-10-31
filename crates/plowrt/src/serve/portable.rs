@@ -158,25 +158,14 @@ impl PortableManager {
         state.set_residency(&req.model, Residency::Unloading);
         let started = Instant::now();
         if let Some(m) = state.remove_mux(&req.model) {
-            match req.drain_timeout_ms {
-                Some(0) => m.preempt().await,
-                Some(ms) => {
-                    let deadline = Duration::from_millis(ms);
+            match crate::serve::admin::unload_drain(req.drain_timeout_ms) {
+                None => m.preempt().await,
+                Some(deadline) => {
                     if tokio::time::timeout(deadline, m.drain()).await.is_err() {
-                        tracing::info!(model = %req.model, timeout_ms = ms, "drain deadline passed — preempting live generations");
+                        tracing::info!(model = %req.model, timeout_ms = deadline.as_millis() as u64, "drain deadline passed — preempting live generations");
                         m.preempt().await;
                     }
                 }
-                None => match crate::config::RuntimeConfig::get().drain_timeout_ms() {
-                    None => m.drain().await,
-                    Some(ms) => {
-                        let deadline = Duration::from_millis(ms);
-                        if tokio::time::timeout(deadline, m.drain()).await.is_err() {
-                            tracing::info!(model = %req.model, timeout_ms = ms, "drain deadline passed — preempting live generations");
-                            m.preempt().await;
-                        }
-                    }
-                },
             }
         }
         let stop_ms = started.elapsed().as_secs_f64() * 1000.0;

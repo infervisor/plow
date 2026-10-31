@@ -180,12 +180,8 @@ const MIB: u64 = 1 << 20;
 /// symlinks cannot walk out of a root. An empty allow-list refuses everything
 /// rather than defaulting open.
 fn resolve_assets(state: &AppState, dir: &str) -> std::result::Result<PathBuf, Response> {
-    let roots = state.models_roots();
-    if roots.is_empty() {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            "no --models-root is configured, so no assets dir may be loaded by request",
-        ));
+    if state.models_roots().is_empty() {
+        return Err(no_roots());
     }
     let canon = PathBuf::from(dir).canonicalize().map_err(|e| {
         err(
@@ -193,6 +189,36 @@ fn resolve_assets(state: &AppState, dir: &str) -> std::result::Result<PathBuf, R
             format_args!("assets dir {dir}: {e}"),
         )
     })?;
+    authorize(state, canon)
+}
+
+/// The allow-list a serve starts with: every `--models-root`, the parents of the assets dirs
+/// it was started with (two bundles side by side need no flag), and the local store's
+/// `bundles/`, where signature-checked pulls land. Never the working directory: started in `/`
+/// (systemd's default) that made every directory on the host loadable.
+pub fn startup_models_roots(
+    explicit: &[String],
+    assets: &[PathBuf],
+    store_bundles: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = explicit.iter().map(PathBuf::from).collect();
+    roots.extend(assets.iter().filter_map(|a| a.parent().map(PathBuf::from)));
+    roots.extend(store_bundles);
+    roots.dedup();
+    roots
+}
+
+fn no_roots() -> Response {
+    err(
+        StatusCode::FORBIDDEN,
+        "no --models-root is configured, so no assets dir may be loaded by request",
+    )
+}
+
+/// The one allow-list test every assets dir a load names or finds must pass: `canon` (already
+/// canonical) sits under a `--models-root`.
+fn authorize(state: &AppState, canon: PathBuf) -> std::result::Result<PathBuf, Response> {
+    let roots = state.models_roots();
     if !roots.iter().any(|r| canon.starts_with(r)) {
         return Err(err(
             StatusCode::FORBIDDEN,
@@ -224,20 +250,16 @@ fn find_local_bundle(
                 || dir.join("codec.pkt").is_file())
     };
 
-    let p = std::path::Path::new(model);
-    if let Ok(canon) = p.canonicalize() {
-        if has_model_files(&canon) {
-            let ckpt = req_checkpoint
-                .map(PathBuf::from)
-                .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&canon));
-            return Some((canon, ckpt));
-        }
-    }
-
-    for root in state.models_roots() {
-        let cand = root.join(model);
-        if let Ok(canon) = cand.canonicalize() {
-            if has_model_files(&canon) {
+    // A NAME under a root, never a path: an absolute `model` would replace the root in `join`,
+    // and the canonical result must still sit under a root (no `..` or symlink out).
+    let roots = state.models_roots();
+    let model_path = std::path::Path::new(model);
+    if model_path.is_relative() {
+        for root in roots {
+            let Ok(canon) = root.join(model_path).canonicalize() else {
+                continue;
+            };
+            if roots.iter().any(|r| canon.starts_with(r)) && has_model_files(&canon) {
                 let ckpt = req_checkpoint
                     .map(PathBuf::from)
                     .unwrap_or_else(|| crate::asset::serve::checkpoint_dir(&canon));
@@ -368,15 +390,72 @@ async fn fetch_from_pdist_and_hf(
     ))
 }
 
+/// A bundle for an unregistered `model` named without `assets`: a local one, else a pdist pull.
+/// Either way the directory passes [`authorize`] — a path in `model` (absolute, relative to the
+/// working directory, or `..` out of a root) is held to the same allow-list as `assets`, and a pull
+/// is refused before any download when the store it lands in is not under a root.
 async fn resolve_or_fetch_assets(
     state: &AppState,
     model: &str,
     req_checkpoint: Option<&str>,
-) -> std::result::Result<(PathBuf, PathBuf), String> {
-    if let Some(pair) = find_local_bundle(state, model, req_checkpoint) {
-        return Ok(pair);
+) -> std::result::Result<(PathBuf, PathBuf), Response> {
+    if state.models_roots().is_empty() {
+        return Err(no_roots());
     }
-    fetch_from_pdist_and_hf(state, model, req_checkpoint).await
+    if let Some((dir, ckpt)) = find_local_bundle(state, model, req_checkpoint) {
+        return Ok((authorize(state, dir)?, ckpt));
+    }
+    if let Ok(st) = crate::dist::Store::open_default() {
+        let bundles = st.root().join("bundles");
+        let bundles = bundles.canonicalize().unwrap_or(bundles);
+        authorize(state, bundles)?;
+    }
+    let (dir, ckpt) = fetch_from_pdist_and_hf(state, model, req_checkpoint)
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::NOT_FOUND,
+                format_args!(
+                    "model {model:?} not registered, not found locally, and download failed: {e}"
+                ),
+            )
+        })?;
+    let dir = dir.canonicalize().map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format_args!("{}: {e}", dir.display()),
+        )
+    })?;
+    Ok((authorize(state, dir)?, ckpt))
+}
+
+/// Undo a registration this load made: the manager plan, registry entry (and its aliases),
+/// group and checkpoint pairing.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+async fn roll_back(
+    state: &AppState,
+    mgr: &crate::serve::manager::ModelManager,
+    slug: &str,
+    dir: &std::path::Path,
+) {
+    if let Err(e) = mgr.unload_and_deregister(slug, true).await {
+        tracing::warn!(%slug, error = %e, "load rollback: deregister failed");
+    }
+    forget_checkpoint(state, dir);
+}
+
+/// Drop `dir`'s checkpoint pairing unless another registered slug still serves it.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+fn forget_checkpoint(state: &AppState, dir: &std::path::Path) {
+    let shared = state.registry.slugs().iter().any(|s| {
+        state
+            .registry
+            .get(s)
+            .is_ok_and(|b| b.dir.canonicalize().ok().as_deref() == Some(dir))
+    });
+    if !shared {
+        crate::asset::serve::clear_checkpoint(dir);
+    }
 }
 
 /// `POST /v1/models/load` — make a model resident, registering its assets dir
@@ -401,6 +480,15 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
     // security boundary, and a boundary that only fires on builds which happen
     // to have a GPU manager is not one — the refusal must not depend on how far
     // the request would otherwise have got.
+    //
+    // A checkpoint override names a directory the load reads (weights, tokenizer, templates):
+    // held to the same allow-list as the assets dir.
+    if let Some(c) = req.checkpoint.take() {
+        match resolve_assets(&state, &c) {
+            Ok(dir) => req.checkpoint = Some(dir.display().to_string()),
+            Err(refusal) => return refusal,
+        }
+    }
     let (assets, checkpoint_override) = if let Some(d) = req.assets.as_deref() {
         match resolve_assets(&state, d) {
             Ok(dir) => (Some(dir), req.checkpoint.as_deref().map(PathBuf::from)),
@@ -409,15 +497,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
     } else if !state.registry.contains(&req.model) {
         match resolve_or_fetch_assets(&state, &req.model, req.checkpoint.as_deref()).await {
             Ok((dir, ckpt)) => (Some(dir), Some(ckpt)),
-            Err(e) => {
-                return err(
-                    StatusCode::NOT_FOUND,
-                    format_args!(
-                        "model {:?} not registered, not found locally, and download failed: {e}",
-                        req.model
-                    ),
-                );
-            }
+            Err(refusal) => return refusal,
         }
     } else {
         (None, req.checkpoint.as_deref().map(PathBuf::from))
@@ -472,6 +552,7 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             );
         };
 
+        let mut registered_dir: Option<PathBuf> = None;
         if let Some(dir) = assets {
             // Registering the bundle is what makes the tokenizer, chat template
             // and bucket ladder reachable; registering with the manager is what
@@ -496,21 +577,29 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                     return err(StatusCode::CONFLICT, e);
                 }
                 if let Err(e) = state.registry.load(&dir, Some(req.model.clone())) {
+                    forget_checkpoint(&state, &dir);
                     return err(StatusCode::BAD_REQUEST, e);
                 }
             }
-            if let Err(e) = mgr.register(&req.model, dir, ckpt) {
+            if let Err(e) = mgr.register(&req.model, dir.clone(), ckpt) {
                 if newly_registered {
                     let _ = state.registry.unload(&req.model);
+                    forget_checkpoint(&state, &dir);
                 }
                 return err(StatusCode::BAD_REQUEST, e);
             }
+            state.set_slug_group(&req.model, group);
             for alias in &req.aliases {
                 if let Err(e) = state.registry.add_alias(alias.clone(), &req.model) {
+                    if newly_registered {
+                        roll_back(&state, &mgr, &req.model, &dir).await;
+                    }
                     return err(StatusCode::BAD_REQUEST, e);
                 }
             }
-            state.set_slug_group(&req.model, group);
+            if newly_registered {
+                registered_dir = Some(dir);
+            }
         }
 
         if !mgr.manages(&req.model) {
@@ -524,7 +613,13 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         }
 
         use crate::serve::manager::EnsureError;
-        match mgr.load(&req.model, req.evict).await {
+        let loaded = mgr.load(&req.model, req.evict).await;
+        // A model this call registered and could not load leaves no trace: kept, it stayed in
+        // the catalogue and every request for it paid another full load attempt.
+        if let (Err(_), Some(dir)) = (&loaded, &registered_dir) {
+            roll_back(&state, &mgr, &req.model, dir).await;
+        }
+        match loaded {
             Ok(load_ms) => Json(LoadResponse {
                 model: req.model,
                 state: "resident",
@@ -537,7 +632,9 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             Err(e @ EnsureError::WontFit { .. }) => err(StatusCode::CONFLICT, e),
             Err(e @ EnsureError::Unloaded) => err(StatusCode::CONFLICT, e),
             Err(EnsureError::Load(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-            Err(e @ EnsureError::SwitchTimeout(_)) => err(StatusCode::SERVICE_UNAVAILABLE, e),
+            Err(e @ (EnsureError::SwitchTimeout(_) | EnsureError::Backoff { .. })) => {
+                err(StatusCode::SERVICE_UNAVAILABLE, e)
+            }
         }
     }
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
@@ -595,16 +692,13 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
                 format_args!("unknown model {:?}", req.model),
             );
         }
-        let drain = match req.drain_timeout_ms {
-            Some(0) => None,
-            Some(ms) => Some(std::time::Duration::from_millis(ms)),
-            None => crate::config::RuntimeConfig::get()
-                .drain_timeout_ms()
-                .map(std::time::Duration::from_millis),
-        };
         use crate::serve::manager::EnsureError;
         let report = match mgr
-            .unload_with_drain(&req.model, req.deregister, drain)
+            .unload_with_drain(
+                &req.model,
+                req.deregister,
+                unload_drain(req.drain_timeout_ms),
+            )
             .await
         {
             Ok(r) => r,
@@ -630,6 +724,17 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
             format_args!("unknown model {:?}", req.model),
         )
     }
+}
+
+/// How long an unload lets in-flight generations finish before preempting the rest: the
+/// request's `drain_timeout_ms`, else `PLOW_DRAIN_TIMEOUT_MS`, else 30 s. `None` (a 0) preempts
+/// at once. One rule for every backend: ordinary GPU unloads used to preempt at once and the
+/// CPU/Metal ones to drain unbounded, against the documented 30 s.
+pub fn unload_drain(drain_timeout_ms: Option<u64>) -> Option<std::time::Duration> {
+    let ms = drain_timeout_ms
+        .or_else(|| crate::config::RuntimeConfig::get().drain_timeout_ms())
+        .unwrap_or(30_000);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 
 /// The instance keys a load/unload of `model` addresses, when it is a DP model or one of its
@@ -678,7 +783,7 @@ async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Respo
             Err(e @ (EnsureError::WontFit { .. } | EnsureError::Unloaded)) => {
                 return err(StatusCode::CONFLICT, format_args!("{key}: {e}"))
             }
-            Err(e @ EnsureError::SwitchTimeout(_)) => {
+            Err(e @ (EnsureError::SwitchTimeout(_) | EnsureError::Backoff { .. })) => {
                 return err(StatusCode::SERVICE_UNAVAILABLE, format_args!("{key}: {e}"))
             }
             Err(EnsureError::Load(e)) => {
@@ -703,15 +808,7 @@ async fn dp_unload(
     keys: Vec<String>,
     drain_timeout_ms: Option<u64>,
 ) -> Response {
-    let bound = match drain_timeout_ms {
-        Some(0) => std::time::Duration::from_millis(0),
-        Some(ms) => std::time::Duration::from_millis(ms),
-        None => std::time::Duration::from_millis(
-            crate::config::RuntimeConfig::get()
-                .drain_timeout_ms()
-                .unwrap_or(30_000),
-        ),
-    };
+    let bound = unload_drain(drain_timeout_ms).unwrap_or_default();
     let mut total = UnloadResponse {
         model: keys.join(","),
         state: "unloaded",

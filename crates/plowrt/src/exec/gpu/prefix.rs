@@ -572,10 +572,12 @@ impl GpuEngine {
                     // Host tier: what the host-reserve rule allows now, unless the knob names
                     // a size (cut to the same rule by the store's growth check) or 0 (off).
                     let auto = crate::memory::vmm::host_tier_auto();
-                    let host_cap = match rt.vmm_host_cache_bytes() {
-                        None => auto.map_or(0, |(cap, _)| cap),
-                        Some(cap) => cap,
-                    };
+                    let host_cap =
+                        crate::memory::vmm::host_tier_grant(match rt.vmm_host_cache_bytes() {
+                            None => auto.map_or(0, |(cap, _)| cap),
+                            Some(cap) => cap,
+                        });
+                    let host_on = host_cap.bytes() > 0;
                     match super::kv_blocks::BlockServe::new(
                         be,
                         &serve,
@@ -597,7 +599,7 @@ impl GpuEngine {
                                     as std::sync::Arc<dyn crate::memory::vmm::SnapBlocks>,
                                 true,
                             );
-                            if host_cap > 0 {
+                            if host_on {
                                 kv.spawn_spill_ahead(
                                     blocks.store(),
                                     super::kv_blocks::SPILL_AHEAD_BYTES,

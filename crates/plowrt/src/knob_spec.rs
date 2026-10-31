@@ -503,6 +503,179 @@ pub fn warn_removed_env() {
     }
 }
 
+/// Where a runtime knob's value lives when one process serves several models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnobScope {
+    /// Configures one model's engine (routes, kernels, KV, its dispatcher): resolved per bundle,
+    /// explicit setting > the bundle's packet default > the built-in default
+    /// ([`crate::config::bundle_config`]).
+    Engine,
+    /// One value for the process (listeners, placement, admission across models, request-path
+    /// parsing, shared pools, diagnostics). Every raw environment read is process-wide.
+    Process,
+}
+
+/// Knob families (env-name prefixes) that configure a model's engine.
+const ENGINE_FAMILIES: &[&str] = &[
+    "PLOW_AMD_",
+    "PLOW_ATTNRES_",
+    "PLOW_CPU_",
+    "PLOW_DECODE_",
+    "PLOW_DSA_",
+    "PLOW_GEN_DECODE_",
+    "PLOW_GLM_",
+    "PLOW_HSACO",
+    "PLOW_KDA_",
+    "PLOW_KV_",
+    "PLOW_LT_",
+    "PLOW_MLA_",
+    "PLOW_MOE_",
+    "PLOW_NV_",
+    "PLOW_PF_",
+    "PLOW_PREFIX_",
+    "PLOW_QWEN_",
+    "PLOW_SEG_",
+    "PLOW_SPEC",
+    "PLOW_TB_",
+    "PLOW_TP_",
+    "PLOW_VMM_",
+];
+
+/// Single engine knobs outside those families.
+const ENGINE_KNOBS: &[&str] = &[
+    "PLOW_AFFINE_Q4_DIR",
+    "PLOW_CFG_DEVICE",
+    "PLOW_CTR_DBUF",
+    "PLOW_DSTEP_EVERY",
+    "PLOW_FP8_DIR",
+    "PLOW_FUSION",
+    "PLOW_GLOBAL_QUEUE",
+    "PLOW_HSA_DRAIN_BLOCKED",
+    "PLOW_L2_PLACE_DISPATCH",
+    "PLOW_LAUNCH_ROWS",
+    "PLOW_LIGHT_QUANT",
+    "PLOW_LIVE_CTX",
+    "PLOW_LIVE_CTX_MODELS",
+    "PLOW_LM_ROW0",
+    "PLOW_LOWRUNG_MAX",
+    "PLOW_MULTISTEP",
+    "PLOW_MXFP4_DIR",
+    "PLOW_OUT_RANGE",
+    "PLOW_OVERSUB",
+    "PLOW_PACKED_PREFILL_ROUTE",
+    "PLOW_PHASE_OBJECTS",
+    "PLOW_PREFILL_LIGHT",
+    "PLOW_RAGGED_CHUNK",
+    "PLOW_SHARE_CKPT",
+    "PLOW_STATE_CLEAR_DEVICE",
+    "PLOW_STATIC",
+    "PLOW_TERMINAL_LT",
+    "PLOW_TOKEN_BATCH_ROWS",
+    "PLOW_TOKEN_BATCH_WIDE",
+    "PLOW_UPLOAD_DIRECT",
+    "PLOW_UPLOAD_SLOTS",
+    "PLOW_WEIGHT_SLAB",
+    "PLOW_WEIGHT_VMM",
+    "PLOW_XR_TAG_SLOT",
+];
+
+/// Process-wide knob families.
+const PROCESS_FAMILIES: &[&str] = &[
+    "PLOW_ANE_",
+    "PLOW_API_",
+    "PLOW_ASR_",
+    "PLOW_CHAT_",
+    "PLOW_CO_SCHED",
+    "PLOW_COSCHED_",
+    "PLOW_DP",
+    "PLOW_DUMP_",
+    "PLOW_ENCODE_",
+    "PLOW_HET_",
+    "PLOW_HTTP_",
+    "PLOW_METAL_",
+    "PLOW_MM_",
+    "PLOW_OVERLOAD",
+    "PLOW_PFX_",
+    "PLOW_PIN",
+    "PLOW_PUBLISH_",
+    "PLOW_REASONING",
+    "PLOW_ROUTE_",
+    "PLOW_SESSION_",
+    "PLOW_SNAP_",
+    "PLOW_TEST_",
+    "PLOW_TICK_",
+    "PLOW_TRACE_",
+    "PLOW_TTS_",
+    "PLOW_TURN_",
+];
+
+/// Single process-wide knobs.
+const PROCESS_KNOBS: &[&str] = &[
+    "PLOW_ANE",
+    "PLOW_BACKEND",
+    "PLOW_CHECKPOINT",
+    "PLOW_CTR_SNAP",
+    "PLOW_DEFAULT_CHAT_TEMPLATE_KWARGS",
+    "PLOW_DEV_SAMPLE",
+    "PLOW_DEVICES",
+    "PLOW_DRAIN_TIMEOUT_MS",
+    "PLOW_DSTEP_LOG",
+    "PLOW_ENABLE_REASONING",
+    "PLOW_EXIT_ON_ENGINE_DEATH",
+    "PLOW_GENERATION_CONFIG",
+    "PLOW_HOME",
+    "PLOW_HOST_TIMING",
+    "PLOW_LADDER_DEBUG",
+    "PLOW_LEAN_QUALIFY",
+    "PLOW_LIBCUDA",
+    "PLOW_LOAD_PROFILE",
+    "PLOW_MAX_QUEUED_REQUESTS",
+    "PLOW_MAX_REPLY_TOKENS",
+    "PLOW_MODELS_ROOT",
+    "PLOW_NATIVE_LAUNCH_TIMING",
+    "PLOW_OBJECTIVE",
+    "PLOW_OVERRIDE_GENERATION_CONFIG",
+    "PLOW_PLACE",
+    "PLOW_PREFETCH",
+    "PLOW_PREFETCH_THREADS",
+    "PLOW_PREFILL_SEG_TIMING",
+    "PLOW_PRELOAD",
+    "PLOW_REGISTRY",
+    "PLOW_RENDER_YIELD_MARGIN_MS",
+    "PLOW_RT_MAX_CTX",
+    "PLOW_SHED_QUEUE_DEPTH",
+    "PLOW_SIGNING_KEY",
+    "PLOW_SLAB_KEEP",
+    "PLOW_STEP_TIME",
+    "PLOW_SWITCH_TIMEOUT_MS",
+    "PLOW_TBT_SLO_MS",
+    "PLOW_TENS_SNAP",
+    "PLOW_TRUSTED_KEYS",
+    "PLOW_TTFT_LOG",
+    "PLOW_TTFT_SLO_MS",
+    "PLOW_VRAM_BUDGET_MIB",
+];
+
+/// [`KnobScope`] of the knob `env` names; `None` for a name no table classifies (the
+/// `every_knob_has_a_scope` test keeps that set empty for registered knobs). A raw environment
+/// read cannot be scoped, so a knob only [`RAW_ENV`] registers is process-wide; one that is also
+/// a runtime arg is read raw only before the config exists (`config::env_fallback`).
+pub fn knob_scope(env: &str) -> Option<KnobScope> {
+    let runtime = RUNTIME.iter().any(|k| k.env == Some(env));
+    if PROCESS_KNOBS.contains(&env) || (!runtime && RAW_ENV.iter().any(|k| k.env == Some(env))) {
+        return Some(KnobScope::Process);
+    }
+    if ENGINE_KNOBS.contains(&env) {
+        return Some(KnobScope::Engine);
+    }
+    let family = |f: &[&str]| f.iter().any(|p| env.starts_with(p));
+    match (family(ENGINE_FAMILIES), family(PROCESS_FAMILIES)) {
+        (true, false) => Some(KnobScope::Engine),
+        (false, true) => Some(KnobScope::Process),
+        _ => None,
+    }
+}
+
 /// Whether `env` names a live runtime knob: what a packet's `serve.json` may carry a default for.
 pub fn is_runtime_env(env: &str) -> bool {
     RUNTIME
@@ -962,6 +1135,58 @@ pub const RAW_ENV: &[KnobSpec] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every registered knob is classified engine or process-wide: a model co-served with
+    /// another resolves its own engine knobs and shares the rest. A new knob outside every
+    /// table fails here until it is placed.
+    #[test]
+    fn every_knob_has_a_scope() {
+        let unscoped: Vec<&str> = RUNTIME
+            .iter()
+            .chain(RAW_ENV)
+            .filter_map(|k| k.env)
+            .filter(|e| knob_scope(e).is_none())
+            .collect();
+        assert!(unscoped.is_empty(), "knobs without a scope: {unscoped:?}");
+        // The families and the single lists never overlap: a knob is one or the other.
+        for e in ENGINE_KNOBS {
+            assert!(!PROCESS_KNOBS.contains(e), "{e} in both lists");
+        }
+    }
+
+    /// What the production packets carry resolves where it acts: their engine knobs per bundle,
+    /// the mux queue bound and the speech front-end settings once per process.
+    #[test]
+    fn packet_serve_knobs_scope_as_they_act() {
+        for e in [
+            "PLOW_PF_SEG_PURE",
+            "PLOW_PF_SEG_FA512",
+            "PLOW_PF_INTERLEAVE",
+            "PLOW_PF_NORM_ROW_BLOCKS",
+            "PLOW_DECODE_MAX_RUNG",
+            "PLOW_MULTISTEP",
+            "PLOW_VMM_PREFIX",
+            "PLOW_VMM_LIVE_RINGS",
+            "PLOW_VMM_HOST_CACHE_MIB",
+            "PLOW_LT_RUNG_ALGOS",
+            "PLOW_PREFIX_CACHE",
+            "PLOW_KV_POOL_MIB",
+            "PLOW_TERMINAL_LT",
+            "PLOW_AMD_ROUTER_NATIVE",
+        ] {
+            assert_eq!(knob_scope(e), Some(KnobScope::Engine), "{e}");
+        }
+        for e in [
+            "PLOW_MAX_QUEUED_REQUESTS",
+            "PLOW_TTS_REALTIME",
+            "PLOW_ASR_ENCODE_HOLD_MS",
+            "PLOW_SLAB_KEEP",
+            "PLOW_THROUGHPUT_K",
+            "PLOW_DRAIN_TIMEOUT_MS",
+        ] {
+            assert_eq!(knob_scope(e), Some(KnobScope::Process), "{e}");
+        }
+    }
     use plow_asset::knob::test_util::{check_table, env_reads, files, plow_tokens, ArgFacts};
     use plow_asset::knob::{Formula, KnobSpec, TargetSpec};
     use std::path::PathBuf;

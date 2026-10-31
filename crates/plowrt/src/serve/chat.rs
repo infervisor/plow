@@ -154,7 +154,7 @@ async fn chat_completions_with(
             Some("model".into()),
         );
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     {
         use crate::serve::manager::EnsureError;
         let ensured = match state.dp_set(&req.model) {
@@ -167,9 +167,16 @@ async fn chat_completions_with(
         {
             if let Some(Err(e)) = ensured {
                 return match e {
-                    EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => (
+                    EnsureError::WontFit { .. }
+                    | EnsureError::SwitchTimeout(_)
+                    | EnsureError::Backoff { .. } => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        [("retry-after", "30")],
+                        [(
+                            "retry-after",
+                            e.retry_after()
+                                .map_or(30, |d| d.as_secs().max(1))
+                                .to_string(),
+                        )],
                         Json(serde_json::json!({"error": e.to_string()})),
                     )
                         .into_response(),
@@ -499,13 +506,7 @@ async fn chat_completions_with(
         dp.is_some() || direct.is_some(),
         state.registry.get(&req.model),
     ) else {
-        return crate::serve::api_error(
-            axum::http::StatusCode::NOT_FOUND,
-            format!("no model registered for '{}'.", req.model),
-            "invalid_request_error",
-            Some("model_not_found"),
-            Some("model".into()),
-        );
+        return crate::serve::models::unrouted(&state, &req.model);
     };
     let ingress = direct.as_ref().map(|m| m.ingress());
     // Tokenize HERE, on the handler task — the dispatcher loop is the

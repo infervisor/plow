@@ -143,22 +143,35 @@ impl Fa4 {
                 "built from {upstream:?}, the runtime's stub transcribes {UPSTREAM:?}"
             )));
         }
-        let mut entries = Vec::new();
-        for (e, role) in kernel_entries(&m.entries).map_err(refuse)? {
-            let kernel = Kernel::load(be, image, e)?;
-            let first = &e.exemplars[0];
-            let p = Prepared {
-                kernel,
-                role,
-                kv_heads: e.kv_heads,
-                smem: first.smem,
-                block: first.block,
-            };
-            check_exemplars(be, geometry, &p, e)
-                .map_err(|why| refuse(format!("{}: {why}", e.name)))?;
-            entries.push(p);
+        let mut fa4 = Fa4 {
+            geometry,
+            entries: Vec::new(),
+        };
+        // Every entry loaded so far is unloaded again when a later one is refused.
+        let loaded = (|| {
+            for (e, role) in kernel_entries(&m.entries).map_err(refuse)? {
+                let kernel = Kernel::load(be, image, e)?;
+                let first = &e.exemplars[0];
+                fa4.entries.push(Prepared {
+                    kernel,
+                    role,
+                    kv_heads: e.kv_heads,
+                    smem: first.smem,
+                    block: first.block,
+                });
+                let p = fa4.entries.last().expect("pushed");
+                check_exemplars(be, geometry, p, e)
+                    .map_err(|why| refuse(format!("{}: {why}", e.name)))?;
+            }
+            Ok(())
+        })();
+        match loaded {
+            Ok(()) => Ok(fa4),
+            Err(e) => {
+                let _ = fa4.unload(be);
+                Err(e)
+            }
         }
-        Ok(Fa4 { geometry, entries })
     }
 
     pub(super) fn unload(&mut self, be: &CudaBackend) -> Result<()> {

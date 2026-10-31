@@ -5572,7 +5572,7 @@ impl GpuEngine {
             ))
         } else if cublaslt_enabled {
             Some(cublaslt::ProjectionBackend::Lt(
-                crate::device::cuda::lt::Lt::load(&be)?,
+                crate::device::cuda::lt::Lt::load(&be, Some(assets_dir))?,
             ))
         } else {
             None
@@ -5580,7 +5580,7 @@ impl GpuEngine {
         let cublaslt_prefill = if prefill_cublaslt_enabled {
             let lt = match &cublaslt {
                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                _ => crate::device::cuda::lt::Lt::load(&be)?,
+                _ => crate::device::cuda::lt::Lt::load(&be, Some(assets_dir))?,
             };
             Some(cublaslt::ProjectionBackend::Lt(lt))
         } else {
@@ -5591,7 +5591,7 @@ impl GpuEngine {
             Some(match (&cublaslt, &cublaslt_prefill) {
                 (Some(cublaslt::ProjectionBackend::Lt(lt)), _)
                 | (_, Some(cublaslt::ProjectionBackend::Lt(lt))) => Arc::clone(lt),
-                _ => crate::device::cuda::lt::Lt::load(&be)?,
+                _ => crate::device::cuda::lt::Lt::load(&be, Some(assets_dir))?,
             })
         } else {
             None
@@ -6769,7 +6769,7 @@ impl GpuEngine {
             } else {
                 let lt = match &cublaslt_prefill {
                     Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                    _ => crate::device::cuda::lt::Lt::load(&be)?,
+                    _ => crate::device::cuda::lt::Lt::load(&be, Some(assets_dir))?,
                 };
                 let object = attention_gemm::object(assets_dir).ok_or_else(|| {
                     RuntimeError::Rejected("PLOW_PF_ATTN_GEMM: softmax object vanished".into())
@@ -11578,7 +11578,7 @@ impl GpuEngine {
                         if moe_lt.as_ref().is_none_or(|owner| !owner.fits(segment)) {
                             let lt = match cublaslt_backend {
                                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                                _ => crate::device::cuda::lt::Lt::load(be)?,
+                                _ => crate::device::cuda::lt::Lt::load(be, Some(assets_dir))?,
                             };
                             let directories: Vec<&Path> =
                                 seg_dir.as_deref().into_iter().chain([assets_dir]).collect();

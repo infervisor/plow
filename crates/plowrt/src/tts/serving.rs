@@ -983,13 +983,13 @@ async fn speech_with(
         let routed = match dp.as_deref() {
             Some(set) => {
                 if let Err(e) = state.dp_admit(set).await {
-                    return crate::serve::api_error(
+                    return e.with_retry_after(crate::serve::api_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         e.to_string(),
                         "server_error",
                         None,
                         None,
-                    );
+                    ));
                 }
                 state
                     .dp_route(set, ids.session.as_deref(), None, exclude)
@@ -1003,13 +1003,13 @@ async fn speech_with(
                 if let Some(mgr) = state.manager_for(&req.model) {
                     if mgr.manages(&req.model) {
                         if let Err(e) = mgr.ensure_resident(&req.model).await {
-                            return crate::serve::api_error(
+                            return e.with_retry_after(crate::serve::api_error(
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 e.to_string(),
                                 "server_error",
                                 None,
                                 None,
-                            );
+                            ));
                         }
                     }
                 }

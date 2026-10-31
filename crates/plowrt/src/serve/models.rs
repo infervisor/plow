@@ -103,6 +103,28 @@ pub(crate) fn unserved(model: &str, endpoint: &str, served: &[&str]) -> Response
     )
 }
 
+/// No dispatcher took `model`: 404 when it is not registered; 503 `model_unloaded` when it is
+/// (an unload or eviction removed its dispatcher after admission), which reads as a missing
+/// model otherwise.
+pub(crate) fn unrouted(state: &AppState, model: &str) -> Response {
+    if state.registry.contains(model) {
+        return crate::serve::api_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("model '{model}' is not being served right now (unloaded or switching)"),
+            "server_error",
+            Some("model_unloaded"),
+            Some("model".into()),
+        );
+    }
+    crate::serve::api_error(
+        axum::http::StatusCode::NOT_FOUND,
+        format!("no model registered for '{model}'."),
+        "invalid_request_error",
+        Some("model_not_found"),
+        Some("model".into()),
+    )
+}
+
 /// A packet ASR model hosted beside the registry (`--asr-packet`): transcription only.
 #[cfg(feature = "cuda")]
 fn audio_card(state: &AppState, id: String) -> ModelCard {
