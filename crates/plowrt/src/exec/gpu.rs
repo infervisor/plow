@@ -10867,8 +10867,8 @@ impl GpuEngine {
                         return Err(RuntimeError::Device(format!(
                             "PLOW_PF_SEG_FA512=all classes hd256 flash onto {fa_file}, but that \
                              object was built without its hd256 arm (PLOW_BUILD_FA_HD256=1) — \
-                             it would trap on the first hd256 segment. Rebuild the object or set \
-                             PLOW_PF_SEG_FA512=1."
+                             it would trap on the first hd256 segment. Rebuild the object, or re-emit \
+                             the packet with PLOW_SEG_FA512=1 (the runtime value must match it)."
                         )));
                     }
                     Some((m3, f3, s3, g3))

@@ -284,33 +284,50 @@ const C_PF_SEG_FA512: &[Constraint] = &[Constraint {
     check: Check::Load,
 }];
 
+/// Pure modes `1` and `fp8` class identically and load the same objects unless `PLOW_PF_SEG_V2`
+/// routes `QuantFp8` by mode, so either serves a packet emitted with the other.
 const C_PF_SEG_PURE: &[Constraint] = &[Constraint {
     id: "pf_seg_pure_matches_emit",
     formula: F::And(&[
-            F::Implies(
-                &F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("1")),
-                &F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("1")),
-            ),
-            F::Implies(
-                &F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("fp8")),
-                &F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("fp8")),
-            ),
-            F::Implies(
-                &F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("w8a16")),
-                &F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("w8a16")),
-            ),
-            F::Implies(
-                &F::And(&[
-                    F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Unset),
-                    F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("1")),
-                    F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("fp8")),
-                    F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("w8a16")),
+        F::Implies(
+            &F::Or(&[
+                F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("1")),
+                F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("fp8")),
+            ]),
+            &F::Or(&[
+                F::And(&[
+                    F::Atom("rt.pf_seg_v2", Cmp::Eq, Val::Unset),
+                    F::Or(&[
+                        F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("1")),
+                        F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("fp8")),
+                    ]),
                 ]),
-                &F::Or(&[
-                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Unset),
-                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("0")),
+                F::And(&[
+                    F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("1")),
+                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("1")),
                 ]),
-            ),
+                F::And(&[
+                    F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("fp8")),
+                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("fp8")),
+                ]),
+            ]),
+        ),
+        F::Implies(
+            &F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("w8a16")),
+            &F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("w8a16")),
+        ),
+        F::Implies(
+            &F::And(&[
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Unset),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("1")),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("fp8")),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("w8a16")),
+            ]),
+            &F::Or(&[
+                F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Unset),
+                F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("0")),
+            ]),
+        ),
     ]),
     site: "crates/plowrt/src/asset/devblob.rs seg_classes_with: PLOW_PF_SEG_PURE mirrors the emit-side PLOW_SEG_PURE_GEMM",
     check: Check::Load,
@@ -362,6 +379,7 @@ const READERS: &[(&str, Reader)] = &[
     ("rt.pf_seg_gemm_small", |c| opt_str(&c.nv.pf_seg_gemm_small)),
     ("rt.pf_seg_pure", |c| opt_str(&c.nv.pf_seg_pure)),
     ("rt.pf_seg_fa512", |c| opt_str(&c.nv.pf_seg_fa512)),
+    ("rt.pf_seg_v2", |c| opt_str(&c.nv.pf_seg_v2)),
     ("rt.mla_pf_v2", |c| Val::Bool(c.amd.mla_pf_v2)),
     ("rt.serial", |c| Val::Bool(c.apple.serial)),
     ("rt.ane_mlp", |c| Val::Bool(c.apple.ane_mlp)),
@@ -2019,7 +2037,14 @@ mod tests {
         let err = check_knobs(&k, &rt).unwrap_err();
         assert!(err.contains("pf_seg_fa512_matches_emit"), "{err}");
         rt.nv.pf_seg_fa512 = None;
+        // `fp8` classes like the emitted `1` unless PLOW_PF_SEG_V2 routes by mode.
         rt.nv.pf_seg_pure = Some("fp8".into());
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_v2 = Some("q8".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_pure_matches_emit"), "{err}");
+        rt.nv.pf_seg_v2 = None;
+        rt.nv.pf_seg_pure = Some("w8a16".into());
         let err = check_knobs(&k, &rt).unwrap_err();
         assert!(err.contains("pf_seg_pure_matches_emit"), "{err}");
         // A packet emitted without the classing runs only without it.
