@@ -229,6 +229,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         g.l2_domains != 0
             || (!segmented && (g.gq_seg_ofs.len() != 2 || g.check_coarse_single_segment().is_err()))
     }) {
+        if crate::config::RuntimeConfig::get().nv.ladder_debug {
+            eprintln!("ladder: placed, segmented or opaque program keeps the widest rung");
+        }
         return Ok(false);
     }
     let widest = programs.last().expect("multiple programs");
@@ -277,6 +280,14 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                         return Err(reject("FP8 instruction rows disagree with rung width"));
                     }
                     d.i[0] = 1;
+                    // Block-scaled QuantFp8 (i3 = the 1x128 group): i4 = the rung's rows padded to
+                    // the activation-scale layout's multiple of 4.
+                    if op == DevOp::QuantFp8 && d.i[3] == packet::dev::FP8_BLOCK_GROUP {
+                        if d.i[4] != g.t.next_multiple_of(4) {
+                            return Err(reject("FP8 group-scale rows disagree with rung width"));
+                        }
+                        d.i[4] = 1;
+                    }
                     // Native W8A8 rungs (devgen qwen35.rs `proj`): only the single-row rung binds
                     // its weight TMA map in i[7] (i[6] is the prefill input map); the per-rung
                     // maps are a rung-local choice, not program shape.
@@ -468,6 +479,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         }
     }
     if !compatible {
+        if crate::config::RuntimeConfig::get().nv.ladder_debug {
+            eprintln!("ladder: an instruction has no row normalization arm");
+        }
         return Ok(false);
     }
     let tensor_id = |name: &str| blob.tensors.iter().position(|t| t.name == name);
@@ -509,6 +523,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
             || (fp8 && d.i[6] == 64)
             || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) && !hnr_fold(d))
         {
+            if crate::config::RuntimeConfig::get().nv.ladder_debug {
+                eprintln!("ladder: unsupported FlashDecode geometry or bound slot/fold operands");
+            }
             return Ok(false);
         }
         let (heads, hd, stride, window, mask) = (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7]);
@@ -566,6 +583,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         return Err(reject("FP8 KV scale aliases cache data"));
     }
     if caches.is_empty() {
+        if crate::config::RuntimeConfig::get().nv.ladder_debug {
+            eprintln!("ladder: no KV cache read by the widest rung");
+        }
         return Ok(false);
     }
     for g in programs {
