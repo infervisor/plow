@@ -553,6 +553,13 @@ pub fn check_knobs(knobs: &Value, rt: &RuntimeConfig) -> std::result::Result<(),
     let c = &knob_gen::CONSTRAINTS[i];
     let mut vars = Vec::new();
     c.formula.vars(&mut vars);
+    let mut seen = Vec::new();
+    vars.retain(|v| {
+        !seen.contains(v) && {
+            seen.push(*v);
+            true
+        }
+    });
     let shown: Vec<String> = vars
         .iter()
         .filter_map(|v| {
@@ -2036,6 +2043,7 @@ mod tests {
         rt.nv.pf_seg_fa512 = Some("1".into());
         let err = check_knobs(&k, &rt).unwrap_err();
         assert!(err.contains("pf_seg_fa512_matches_emit"), "{err}");
+        assert_eq!(err.matches("rt.pf_seg_fa512=").count(), 1, "{err}");
         rt.nv.pf_seg_fa512 = None;
         // `fp8` classes like the emitted `1` unless PLOW_PF_SEG_V2 routes by mode.
         rt.nv.pf_seg_pure = Some("fp8".into());
