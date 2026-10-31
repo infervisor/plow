@@ -71,18 +71,27 @@ struct Bucket {
     rows: usize,
     /// Launch ms with no decode rows.
     pure: Window,
-    /// Per riding row: launch ms over the `pure` median, divided by the riding rows.
-    per_row: Window,
+    /// `[fits, spills]`, by whether the riders push the launch past this bucket into the next
+    /// rung (a 128-row chunk with riders runs at 1024: 78 ms against 31 ms; a 30-row tail's
+    /// riders are ~free).
+    arms: [Arm; 2],
     /// Launch ms with or without decode rows: what a riding row waits for.
     total: Ewma,
-    since_explore: u32,
-    /// Explorations left at [`EXPLORE_FAST`] after the decision flipped, and the last decision.
-    fast: u32,
-    last: Option<bool>,
     /// Decisions: rode, declined, and how many of either were forced explorations.
     rode: u64,
     declined: u64,
     explored: u64,
+}
+
+/// One spill class of a bucket: its rider cost and its exploration cadence.
+#[derive(Clone, Copy, Debug, Default)]
+struct Arm {
+    /// Per riding row: launch ms over the bucket's `pure` median, divided by the riding rows.
+    per_row: Window,
+    since_explore: u32,
+    /// Explorations left at [`EXPLORE_FAST`] after the decision flipped, and the last decision.
+    fast: u32,
+    last: Option<bool>,
 }
 
 /// Per-engine cost estimates for [`RideCost::ride`].
@@ -142,11 +151,14 @@ impl RideCost {
     }
 
     /// One prefill launch of `bucket` rows that carried `decode_rows` riding rows, `ms` long.
-    pub fn observe_launch(&mut self, bucket: usize, decode_rows: usize, ms: f64) {
+    /// `spills`: the riders pushed the launch past `bucket` into a wider rung.
+    pub fn observe_launch(&mut self, bucket: usize, spills: bool, decode_rows: usize, ms: f64) {
         let b = self.bucket(bucket);
         match (decode_rows, b.pure.median()) {
             (0, _) => b.pure.add(ms),
-            (d, Some(pure)) => b.per_row.add((ms - pure).max(0.0) / d as f64),
+            (d, Some(pure)) => b.arms[usize::from(spills)]
+                .per_row
+                .add((ms - pure).max(0.0) / d as f64),
             _ => {}
         }
     }
@@ -225,30 +237,34 @@ impl RideCost {
         )
     }
 
-    /// Whether `decode_rows` rows should ride the next launch of `bucket` rows.
-    pub fn ride(&mut self, bucket: usize, decode_rows: usize) -> bool {
+    /// Whether `decode_rows` rows should ride the next launch of `bucket` rows; `spills`: riding
+    /// them would push the launch past `bucket` into a wider rung.
+    pub fn ride(&mut self, bucket: usize, spills: bool, decode_rows: usize) -> bool {
         let step = self.step(decode_rows);
         let b = self.bucket(bucket);
-        let prefer = match (b.pure.median(), b.per_row.median(), step) {
+        let measured = b.pure.len > 0;
+        let pure = b.pure.median();
+        let arm = &mut b.arms[usize::from(spills)];
+        let prefer = match (pure, arm.per_row.median(), step) {
             (Some(_), Some(r), Some(s)) => r * decode_rows as f64 <= s,
             // Without a pure sample neither the per-row cost nor its comparison exists: measure it.
             (None, _, _) => false,
             _ => true,
         };
-        if b.last.is_some_and(|last| last != prefer) {
-            b.fast = (K / 2) as u32;
+        if arm.last.is_some_and(|last| last != prefer) {
+            arm.fast = (K / 2) as u32;
         }
-        b.last = Some(prefer);
-        let interval = if b.per_row.len < K || b.fast > 0 {
+        arm.last = Some(prefer);
+        let interval = if arm.per_row.len < K || arm.fast > 0 {
             EXPLORE_FAST
         } else {
             EXPLORE
         };
-        b.since_explore += 1;
-        let explore = b.pure.len > 0 && b.since_explore >= interval;
+        arm.since_explore += 1;
+        let explore = measured && arm.since_explore >= interval;
         if explore {
-            b.since_explore = 0;
-            b.fast = b.fast.saturating_sub(1);
+            arm.since_explore = 0;
+            arm.fast = arm.fast.saturating_sub(1);
             b.explored += 1;
         }
         let ride = prefer != explore;
@@ -294,10 +310,10 @@ mod tests {
     fn warm(c: &mut RideCost, pure: f64, per_row: f64, step: f64) {
         c.set_widths(&[32, 64, 128]);
         for _ in 0..K {
-            c.observe_launch(2048, 0, pure);
+            c.observe_launch(2048, false, 0, pure);
         }
         for _ in 0..K {
-            c.observe_launch(2048, 50, pure + 50.0 * per_row);
+            c.observe_launch(2048, false, 50, pure + 50.0 * per_row);
         }
         for rows in [20, 50, 100] {
             c.observe_step(rows, step);
@@ -315,9 +331,9 @@ mod tests {
     ) -> u32 {
         let mut rode = 0;
         for _ in 0..n {
-            let r = c.ride(bucket, rows);
+            let r = c.ride(bucket, false, rows);
             rode += u32::from(r);
-            c.observe_launch(bucket, if r { rows } else { 0 }, launch(r));
+            c.observe_launch(bucket, false, if r { rows } else { 0 }, launch(r));
         }
         rode
     }
@@ -327,10 +343,10 @@ mod tests {
         // Rung-128 tail: 31 ms pure, ~free riders, 17 ms decode step.
         let mut c = RideCost::default();
         warm(&mut c, 31.0, 0.05, 17.0);
-        c.observe_launch(2048, 3, 70.8);
-        c.observe_launch(2048, 2, 45.2);
+        c.observe_launch(2048, false, 3, 70.8);
+        c.observe_launch(2048, false, 2, 45.2);
         assert!(
-            c.ride(2048, 3),
+            c.ride(2048, false, 3),
             "two stalls in a window of eight leave the median cheap"
         );
         let rode = run(&mut c, 64, 2048, 4, |r| if r { 31.2 } else { 31.0 });
@@ -354,12 +370,12 @@ mod tests {
         let mut c = RideCost::default();
         c.set_widths(&[64]);
         c.observe_step(8, 17.0);
-        c.observe_launch(128, 0, 31.0);
+        c.observe_launch(128, false, 0, 31.0);
         // The first riding samples all stalled.
         for _ in 0..K {
-            c.observe_launch(128, 4, 90.0);
+            c.observe_launch(128, false, 4, 90.0);
         }
-        assert!(!c.ride(128, 4));
+        assert!(!c.ride(128, false, 4));
         // Riding really costs ~nothing: the fast explorations refill the window.
         run(&mut c, 8 * EXPLORE, 128, 4, |r| if r { 31.4 } else { 31.0 });
         let rode = run(&mut c, 64, 128, 4, |r| if r { 31.4 } else { 31.0 });
@@ -388,6 +404,25 @@ mod tests {
     }
 
     #[test]
+    fn spilling_rides_do_not_price_rides_that_fit() {
+        // Rung 128: 31 ms pure; riders inside it ~free; riders pushing a 128-row chunk into the
+        // 1024 rung cost 78 ms. A 30-row tail with 4 riders still fits.
+        let mut c = RideCost::default();
+        c.set_widths(&[1, 4, 8, 16, 32, 48]);
+        c.observe_step(4, 17.0);
+        for _ in 0..K {
+            c.observe_launch(128, false, 0, 31.0);
+            c.observe_launch(128, true, 4, 78.0);
+            c.observe_launch(128, false, 4, 31.4);
+        }
+        assert!(
+            !c.ride(128, true, 4),
+            "a spilling ride costs 47 ms against a 17 ms step"
+        );
+        assert!(c.ride(128, false, 4), "a ride that fits costs ~0.4 ms");
+    }
+
+    #[test]
     fn decisions_are_counted_per_bucket() {
         let mut c = RideCost::default();
         warm(&mut c, 31.0, 0.05, 17.0);
@@ -400,8 +435,8 @@ mod tests {
     fn rides_only_while_the_rows_cost_less_than_a_step() {
         let mut c = RideCost::default();
         warm(&mut c, 45.0, 0.16, 14.0);
-        assert!(c.ride(2048, 50)); // 8.0 <= 14
-        assert!(!c.ride(2048, 100)); // 16.0 > 14
+        assert!(c.ride(2048, false, 50)); // 8.0 <= 14
+        assert!(!c.ride(2048, false, 100)); // 16.0 > 14
     }
 
     #[test]
@@ -409,11 +444,11 @@ mod tests {
         let mut c = RideCost::default();
         c.set_widths(&[64]);
         assert!(
-            !c.ride(1024, 10),
+            !c.ride(1024, false, 10),
             "no pure sample yet: run the launch without riders"
         );
         warm(&mut c, 45.0, 0.16, 14.0);
-        let arms: Vec<bool> = (0..EXPLORE).map(|_| c.ride(2048, 50)).collect();
+        let arms: Vec<bool> = (0..EXPLORE).map(|_| c.ride(2048, false, 50)).collect();
         assert_eq!(
             arms.iter().filter(|&&r| !r).count(),
             1,
@@ -494,8 +529,49 @@ mod tests {
     fn a_step_estimate_is_needed_to_leave_the_default() {
         let mut c = RideCost::default();
         c.set_widths(&[64]);
-        c.observe_launch(2048, 0, 45.0);
-        c.observe_launch(2048, 40, 70.0);
-        assert!(c.ride(2048, 40), "no step estimate: keep riding");
+        c.observe_launch(2048, false, 0, 45.0);
+        c.observe_launch(2048, false, 40, 70.0);
+        assert!(c.ride(2048, false, 40), "no step estimate: keep riding");
+    }
+
+    #[test]
+    #[ignore = "replays a PACKLOG-derived trace: RIDE_REPLAY=<csv>"]
+    fn replay_trace() {
+        let mut c = RideCost::default();
+        c.set_widths(&[1, 4, 8, 16, 32, 48]);
+        let (mut agree, mut n, mut live_rode, mut would_ride, mut declined_fit) = (0, 0, 0, 0, 0);
+        for line in std::fs::read_to_string(std::env::var("RIDE_REPLAY").unwrap())
+            .unwrap()
+            .lines()
+        {
+            let f: Vec<&str> = line.split(',').collect();
+            let num = |i: usize| f[i].parse::<f64>().unwrap();
+            match f[0] {
+                "S" => c.observe_step(num(1) as usize, num(2)),
+                _ => {
+                    let (feeds, ms, riders, live) =
+                        (num(1) as usize, num(2), num(3) as usize, f[4] == "1");
+                    let (rows, rung) = (num(5) as usize, num(6) as usize);
+                    if feeds > 0 {
+                        let spills = rows.min(128) + feeds > 128;
+                        let r = c.ride(128, spills, feeds);
+                        declined_fit += usize::from(!r && !spills);
+                        n += 1;
+                        agree += usize::from(r == live);
+                        live_rode += usize::from(live);
+                        would_ride += usize::from(r);
+                    }
+                    c.observe_launch(128, rung > 128, riders, ms);
+                }
+            }
+        }
+        eprintln!("decisions {n}: live rode {live_rode}, replay rode {would_ride}, agree {agree}, declined while fitting {declined_fit}");
+        eprintln!("{:?}", c.decision_summary());
+        let b = c.buckets.iter().find(|b| b.rows == 128).unwrap();
+        eprintln!(
+            "pure {:?} per_row {:?}",
+            b.pure.median(),
+            b.arms.map(|a| a.per_row.median())
+        );
     }
 }

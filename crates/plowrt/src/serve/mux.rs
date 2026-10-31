@@ -7116,7 +7116,14 @@ fn gpu_prefill_batched_pass(
             None => (launch_cap, launch_max),
         };
         let ride_key = e.pf_pack_budget(avail.min(launch_cap));
-        if std::mem::take(&mut ride_open) && !budget_on && !ride.ride(ride_key, feeds.len()) {
+        // Riders that push the launch's rows past its bucket run it at the next rung: priced
+        // apart from riders the bucket's padding holds (`sched::ride`).
+        let ride_spills =
+            e.pf_cover_rows(avail.min(launch_cap).min(ride_key) + feeds.len()) > ride_key;
+        if std::mem::take(&mut ride_open)
+            && !budget_on
+            && !ride.ride(ride_key, ride_spills, feeds.len())
+        {
             unified = false;
             decode_rows = 0;
         }
@@ -7374,10 +7381,10 @@ fn gpu_prefill_batched_pass(
         // `ride_launch_ms` takes out what the host measured.
         let observed = ride_launch_ms(t_launch.elapsed().as_secs_f64() * 1e3, window_time);
         if let (true, Some(ms)) = (res.is_ok(), observed) {
-            ride.observe_launch(ride_key, riders, ms);
             // The rung actually launched: the smallest bucket holding the packed rows and riders.
-            // Only `rows_within` (the ITL budget) reads it.
             let rung = e.pf_cover_rows(pack.iter().map(|p| p.2).sum::<usize>() + riders);
+            ride.observe_launch(ride_key, rung > ride_key, riders, ms);
+            // Only `rows_within` (the ITL budget) reads the rung's own time.
             if pf_itl_budget_ms() > 0 {
                 ride.observe_rung(rung, ms);
             }
