@@ -500,6 +500,23 @@ impl Turn {
         self.used += 1;
     }
 
+    /// After a tick: when the hold is spent (the quantum used up, or a waiter this model would
+    /// yield to under [`CoSched::Deadline`]), hand the device on now rather than at the next
+    /// [`Self::take_due`], so the co-tenant enqueues during this model's between-tick host work.
+    pub fn finish(&mut self, turn: &DeviceTurn, due: Due) {
+        let spent = match turn.mode() {
+            CoSched::Free => false,
+            CoSched::Rr => self.used >= turn.quantum(),
+            CoSched::Deadline => match (&self.prio, self.since) {
+                (Some(hold), Some(since)) => hold.0.lock().should_yield(due, since, Instant::now()),
+                _ => false,
+            },
+        };
+        if spent {
+            self.release();
+        }
+    }
+
     /// Give the device back now, whatever is left of the quantum.
     pub fn release(&mut self) {
         self.guard = None;
@@ -591,6 +608,27 @@ mod tests {
             blocked.await.unwrap(),
             "B never got the turn after A released"
         );
+    }
+
+    /// `finish` hands a spent hold on at the tick's end and keeps one with ticks left; under
+    /// deadline it keeps the device while nobody waits.
+    #[tokio::test]
+    async fn finish_releases_only_a_spent_hold() {
+        let dt = DeviceTurn::new(CoSched::Rr, 2);
+        let mut a = Turn::default();
+        let due = Due::from_urgency(Urgency::Normal, Instant::now());
+        a.take(&dt).await;
+        a.finish(&dt, due);
+        assert!(a.held(), "one tick of a two-tick quantum left");
+        a.take(&dt).await;
+        a.finish(&dt, due);
+        assert!(!a.held(), "spent quantum still held after the tick");
+
+        let dt = DeviceTurn::new(CoSched::Deadline, 4);
+        let mut a = Turn::default();
+        a.take_due(&dt, due).await;
+        a.finish(&dt, due);
+        assert!(a.held(), "deadline holder yielded with nobody waiting");
     }
 
     /// A quantum of N means N consecutive ticks, then the turn goes back to the

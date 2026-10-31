@@ -2071,6 +2071,12 @@ fn spawn_scoped(
             };
 
             let t_returned = Instant::now();
+            if let (Some(dt), true) = (
+                &device_turn,
+                crate::config::RuntimeConfig::get().cosched_early_release,
+            ) {
+                turn.finish(dt, due);
+            }
             let service = t_returned - t_service_start;
             let ms = service.as_secs_f64() * 1e3;
             let host_disp_ns = host_last_return

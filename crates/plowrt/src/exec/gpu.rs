@@ -10286,8 +10286,13 @@ impl GpuEngine {
             }
         }
         let base = self.cfg_slab()?.counts.base + (slot * vocab * 4) as u64;
-        self.be.memcpy_htod(base, bytemuck::cast_slice(&row))?;
-        self.be.synchronize()
+        // On the engine stream: a context-wide synchronize also waits for every co-tenant's work.
+        // SAFETY: `row` outlives the stream synchronize below; `base` spans `vocab` u32 counts.
+        unsafe {
+            self.be
+                .memcpy_htod_async(base, bytemuck::cast_slice(&row), &self.stream)?;
+        }
+        self.be.stream_synchronize(&self.stream)
     }
 
     /// Stage guided draws for the next [`Self::step_slots_sampled`] (`steps == 1`) or
