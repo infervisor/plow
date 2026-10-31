@@ -493,6 +493,45 @@ fn show_version(v: usize) -> String {
     format!("{}.{}.{}", v / 10000, v / 100 % 100, v % 100)
 }
 
+/// Fail closed when a packet uses a contract-gated feature its `build.json` does not declare
+/// (a load-time concatenated weight or `GluPitched`: `RUNTIME_CONTRACT_CONCAT`), so dropping
+/// `runtime_requires` cannot route such a packet past an older runtime's refusal.
+pub fn check_packet_contract(
+    packet: &Path,
+    blob: &crate::asset::devblob::DevBlob,
+    raw: &[u8],
+) -> Result<()> {
+    let concat = blob
+        .reserved_metadata(raw, plow_asset::derived_weights::SECTION)?
+        .map(|_| plow_asset::derived_weights::SECTION.to_string())
+        .or_else(|| {
+            blob.tensors
+                .iter()
+                .find(|t| t.name.starts_with(packet::names::CONCAT_PREFIX))
+                .map(|t| t.name.clone())
+        })
+        .or_else(|| {
+            blob.progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .any(|d| d.op == packet::dev::DevOp::GluPitched as u16)
+                .then(|| "GluPitched".to_string())
+        });
+    let Some(feature) = concat else {
+        return Ok(());
+    };
+    let dir = packet.parent().unwrap_or(Path::new("."));
+    let declared = runtime_requires(dir)?.plowrt_contract;
+    if declared < plow_asset::RUNTIME_CONTRACT_CONCAT {
+        return Err(RuntimeError::Rejected(format!(
+            "{}: uses {feature} but declares plowrt contract {declared} (needs {})",
+            packet.display(),
+            plow_asset::RUNTIME_CONTRACT_CONCAT
+        )));
+    }
+    Ok(())
+}
+
 /// Fail closed when this runtime cannot serve the bundle: an older runtime contract than it
 /// declares, or a cuBLASLt (`lt`: the library this process binds, or why none loads) older than
 /// it needs.
@@ -533,6 +572,63 @@ pub fn check_runtime(
 mod tests {
     use super::*;
     use packet::devbuild::{Model, SectionData};
+
+    #[test]
+    fn concatenated_weights_and_pitched_glu_require_their_contract() {
+        use packet::dev::DevOp;
+        let blob = |concat: bool, pitched: bool| {
+            let mut b = packet::devbuild::Builder::new(1);
+            let out = b.tensor("act.out", 8);
+            let w = b.tensor(if concat { "cat/a.weight" } else { "a.weight" }, 8);
+            b.emit(
+                if pitched {
+                    DevOp::GluPitched
+                } else {
+                    DevOp::Glu
+                },
+                vec![0],
+                &[],
+                |d| {
+                    d.t[..2].copy_from_slice(&[out, w]);
+                },
+            );
+            let p = b.finish();
+            let raw = Model {
+                n_cu: 1,
+                target: 0,
+                tensors: p.tensors.clone(),
+                progs: vec![p],
+                prog_t: vec![1],
+                gen: vec![],
+                kv_row_insts: vec![],
+            }
+            .to_blob();
+            (crate::asset::devblob::DevBlob::parse(&raw).unwrap(), raw)
+        };
+        let check = |pkt: &Path, (blob, raw): (crate::asset::devblob::DevBlob, Vec<u8>)| {
+            check_packet_contract(pkt, &blob, &raw)
+        };
+        let dir =
+            std::env::temp_dir().join(format!("plowrt-concat-contract-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkt = dir.join("model.pkt");
+        assert!(check(&pkt, blob(false, false)).is_ok());
+        for (c, p) in [(true, false), (false, true)] {
+            std::fs::remove_file(dir.join("build.json")).ok();
+            assert!(check(&pkt, blob(c, p)).is_err());
+            for (declared, ok) in [(3, false), (4, true)] {
+                std::fs::write(
+                    dir.join("build.json"),
+                    serde_json::json!({"runtime_requires": {"plowrt_contract": declared}})
+                        .to_string(),
+                )
+                .unwrap();
+                assert_eq!(check(&pkt, blob(c, p)).is_ok(), ok, "{c} {p} {declared}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn asset_args_pair_a_bundle_with_its_checkpoint() {

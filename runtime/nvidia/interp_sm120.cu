@@ -2176,6 +2176,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                       in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk);
         break;
 
+    case PLOW_DOP_GLU_PITCHED:
+        d_glu_pitched((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), in->i[0], in->i[1], in->i[2],
+                      in->i[3], in->i[4], slice, nblk);
+        break;
+
 #if PLOW_NV_PREFILL && defined(PLOW_NV_PF_GEMV_HEAD) && PLOW_NV_PF_GEMV_HEAD
     /* ---- PX-6 recommendation A: the M=1 GEMV arm, in the PREFILL object, for lm_head only ----
      *
@@ -4282,6 +4287,10 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
         d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
               in->i[0], in->i[1], slice, nblk);
         break;
+    case PLOW_DOP_GLU_PITCHED:
+        d_glu_pitched((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), in->i[0], in->i[1],
+                      in->i[2], in->i[3], in->i[4], slice, nblk);
+        break;
 #if PLOW_NV_GEMMA
     case PLOW_DOP_NORM_RESIDUAL:
         d_norm_residual((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
@@ -4438,6 +4447,11 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
         d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
               in->i[0], in->i[1], slice, nblk);
         break;
+    case PLOW_DOP_GLU_PITCHED:
+        if (in->i[1] != PLOW_ACT_SILU_) __trap();
+        d_glu_pitched((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), in->i[0], in->i[1],
+                      in->i[2], in->i[3], in->i[4], slice, nblk);
+        break;
 #if PLOW_NV_QWEN_GDN
     /* The Qwen3.5 chain's prefill pointwise arms (exec/gpu.rs qwen_light_segments): the same
      * bodies and operands as the prefill interpreter window (the <true> fast-path
@@ -4523,7 +4537,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
  *  - QwenRmsNorm (a whole-row reduction, `light_quant_norm`): one block per padded row, the
  *    block-per-row walk of d_qwen_rmsnorm (element d on thread d % 256, ascending, block_sum); the
  *    bf16 row is staged in shared memory and each warp quantizes groups warp, warp + 8, ...
- *  - QwenGatedNorm (head dim 128 = the group), SiLU Glu, QwenSigmoidGate: one warp per
+ *  - QwenGatedNorm (head dim 128 = the group), SiLU Glu (plain or pitched), QwenSigmoidGate: one warp per
  *    (row, group), eight per block.
  * Inactive rows skip the producer and quantize the row as it stands; pad rows (row >= M) get zero
  * bytes and scales. The host checks operand identities, shapes and allocation ranges. */
@@ -4665,6 +4679,24 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     case PLOW_DOP_GLU: {
         const uint2 rg = *reinterpret_cast<const uint2*>((const __nv_bfloat16*)LIGHT_TEN(1) + at);
         const uint2 ru = *reinterpret_cast<const uint2*>((const __nv_bfloat16*)LIGHT_TEN(2) + at);
+        const __nv_bfloat16* pg = reinterpret_cast<const __nv_bfloat16*>(&rg);
+        const __nv_bfloat16* pu = reinterpret_cast<const __nv_bfloat16*>(&ru);
+        alignas(8) __nv_bfloat16 ob[4];
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float a = act_silu(__bfloat162float(pg[j]));
+            ob[j] = __float2bfloat16(a * __bfloat162float(pu[j]));
+            v[j] = __bfloat162float(ob[j]);
+        }
+        *reinterpret_cast<uint2*>(out + at) = *reinterpret_cast<const uint2*>(ob);
+        lq_store4(xq, gs, at, g * Rp + row, v, lane);
+        break;
+    }
+    case PLOW_DOP_GLU_PITCHED: {
+        const __nv_bfloat16* src = (const __nv_bfloat16*)LIGHT_TEN(1) + (size_t)row * in->i[3] + g * 128u + lane * 4u;
+        const uint2 rg = *reinterpret_cast<const uint2*>(src);
+        const uint2 ru = *reinterpret_cast<const uint2*>(src + in->i[4]);
         const __nv_bfloat16* pg = reinterpret_cast<const __nv_bfloat16*>(&rg);
         const __nv_bfloat16* pu = reinterpret_cast<const __nv_bfloat16*>(&ru);
         alignas(8) __nv_bfloat16 ob[4];

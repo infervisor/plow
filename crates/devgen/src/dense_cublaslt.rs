@@ -785,7 +785,21 @@ pub(crate) fn runtime_requires(model: &Model, sections: &[SectionData]) -> serde
         (gemm && d.i[5] == packet::dev::FP8_BLOCK_GROUP)
             || (d.op == DevOp::QuantFp8 as u16 && d.i[3] == packet::dev::FP8_BLOCK_GROUP)
     });
-    let contract = if block_fp8 {
+    let concat = model
+        .tensors
+        .iter()
+        .any(|t| t.name.starts_with(packet::names::CONCAT_PREFIX))
+        || sections
+            .iter()
+            .any(|s| s.name == plow_asset::derived_weights::SECTION)
+        || model
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .any(|d| d.op == DevOp::GluPitched as u16);
+    let contract = if concat {
+        plow_asset::RUNTIME_CONTRACT_CONCAT
+    } else if block_fp8 {
         plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
     } else {
         plow_asset::RUNTIME_CONTRACT_BASE
@@ -1180,6 +1194,21 @@ mod tests {
         assert_eq!(
             runtime_requires(&ladder, &[])["plowrt_contract"],
             plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
+        );
+        // A derived-weights section, a cat/ tensor or GluPitched alone needs the concat contract.
+        let derived = SectionData {
+            kind: SECT_METADATA,
+            name: plow_asset::derived_weights::SECTION.into(),
+            data: Vec::new(),
+        };
+        assert_eq!(
+            runtime_requires(&ladder, &[derived])["plowrt_contract"],
+            plow_asset::RUNTIME_CONTRACT_CONCAT
+        );
+        ladder.progs[0].insts[0].op = DevOp::GluPitched as u16;
+        assert_eq!(
+            runtime_requires(&ladder, &[])["plowrt_contract"],
+            plow_asset::RUNTIME_CONTRACT_CONCAT
         );
         ladder.progs[0].insts[0] = saved;
         let root = std::env::temp_dir().join(format!("devgen-lt-store-{}", std::process::id()));

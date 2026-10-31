@@ -291,7 +291,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::MuseNormGateNorm => a_rows("i0=rows"),
         DevOp::RowRms => a_rows("i0=rows"),
         DevOp::Residual | DevOp::Sum4Bf16 => a_elem("i0=n"),
-        DevOp::Glu => a_elem("i0=n"),
+        DevOp::Glu | DevOp::GluPitched => a_elem("i0=n"),
         DevOp::Embed => a_rows("i0=ntok, t2=ids per row"),
         DevOp::SoftCap => a_elem("i0=n"),
         DevOp::NormResidual => a_rows("i0=rows"),

@@ -91,13 +91,13 @@ pub fn class_of(op: DevOp) -> RowClass {
         // Nothing here reads a position or couples two rows. Dense projections, norms,
         // elementwise, quantization, argmax, the collectives, and the whole MoE routing /
         // grouping / combine chain, whose row maps are built from the batch it is given.
-        Nop | RmsNorm | RowRms | Residual | Sum4Bf16 | Glu | SituGlu | SoftCap | LayerNorm
-        | NormResidual | AddNorm | NormResidualNorm | PerLayerInput | GluStrided | QuantFp8
-        | ZeroF32 | CastF32Bf16 | MlaOutGate | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit
-        | QwenSigmoidGate | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32 | EmbedF16F32
-        | EmbedOverlayBf16 | EmbedPosBf16 | EmbedFrameBf16 | SampleFishBf16 | GemvF32Out
-        | SampleSmallF32 | LstmCellF32 | ReluF32 | BroadcastAddF32 | QuantFp8Block128
-        | MuseRmsNorm | MuseResidualGate | MuseNormGateNorm => RowClass::A,
+        Nop | RmsNorm | RowRms | Residual | Sum4Bf16 | Glu | GluPitched | SituGlu | SoftCap
+        | LayerNorm | NormResidual | AddNorm | NormResidualNorm | PerLayerInput | GluStrided
+        | QuantFp8 | ZeroF32 | CastF32Bf16 | MlaOutGate | KdaGatedNorm | QwenGatedNorm
+        | QwenQGateSplit | QwenSigmoidGate | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32
+        | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16 | EmbedFrameBf16 | SampleFishBf16
+        | GemvF32Out | SampleSmallF32 | LstmCellF32 | ReluF32 | BroadcastAddF32
+        | QuantFp8Block128 | MuseRmsNorm | MuseResidualGate | MuseNormGateNorm => RowClass::A,
         // `Embed` gathers rows of the EMBEDDING TABLE by token id — one id per row, no
         // position, no cross-row coupling. It is not a hidden-row gather; `RowGather` is.
         Embed => RowClass::A,

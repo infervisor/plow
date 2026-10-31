@@ -4090,6 +4090,8 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
+        crate::asset::serve::check_packet_contract(&pkt, &blob, &raw)?;
+        let derived_weights = crate::asset::checkpoint::derived_weights(&blob, &raw)?;
         let missing = crate::asset::checkpoint::missing_weights(&blob, &raw, checkpoint_dir)?;
         if !missing.is_empty() {
             return Err(crate::asset::checkpoint::missing_weights_error(
@@ -5000,7 +5002,22 @@ impl GpuEngine {
                     && td.init.is_none()
                     && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
                 {
-                    if let Some(wide) = ckpt.widened_f32(&td.name, td.bytes) {
+                    let assembled = if td.name.starts_with(packet::names::CONCAT_PREFIX) {
+                        let spec = derived_weights
+                            .as_ref()
+                            .and_then(|d| d.get(&td.name))
+                            .ok_or_else(|| {
+                                RuntimeError::Rejected(format!(
+                                    "{}: no {} entry",
+                                    td.name,
+                                    plow_asset::derived_weights::SECTION
+                                ))
+                            })?;
+                        Some(ckpt.concatenated(spec, td.bytes))
+                    } else {
+                        ckpt.widened_f32(&td.name, td.bytes)
+                    };
+                    if let Some(wide) = assembled {
                         let wide = wide?;
                         for (o, chunk) in wide.chunks(STAGE).enumerate() {
                             let dst = mem.base + (o * STAGE) as u64;

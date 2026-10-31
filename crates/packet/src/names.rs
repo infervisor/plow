@@ -111,6 +111,23 @@ pub fn is_host_filled_table(name: &str) -> bool {
     )
 }
 
+/// Prefix of a tensor the loader assembles from checkpoint tensors listed in the packet's
+/// `derived_weights.json` section (`plow_asset::derived_weights`); the name is only a label.
+pub const CONCAT_PREFIX: &str = "cat/";
+
+/// A blob-unique label for the concatenation whose first source is `first`: `cat/<first>`, or a
+/// hash of it when that would not fit the blob's name field.
+pub fn concat_label(first: &str) -> String {
+    let label = format!("{CONCAT_PREFIX}{first}");
+    if label.len() < crate::devbuild::NAME_LEN {
+        return label;
+    }
+    let h = first.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
+    format!("{CONCAT_PREFIX}{h:016x}")
+}
+
 /// True when this declared tensor's bytes must come from the checkpoint.
 ///
 /// Note what is deliberately NOT here: any mention of `model.`. The weight namespace is the
@@ -126,6 +143,16 @@ pub fn is_checkpoint_weight(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concatenation_labels_fit_the_blob_name_field_and_stay_weights() {
+        assert_eq!(concat_label("a.weight"), "cat/a.weight");
+        let long = "x".repeat(100);
+        let l = concat_label(&long);
+        assert!(l.starts_with(CONCAT_PREFIX) && l.len() < crate::devbuild::NAME_LEN);
+        assert_ne!(l, concat_label(&"y".repeat(100)));
+        assert!(is_checkpoint_weight(&l));
+    }
 
     #[test]
     fn encoder_split_k_scratch_is_not_an_external_weight() {

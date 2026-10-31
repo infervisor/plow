@@ -138,6 +138,7 @@ const DOC: &[S] = &[
     S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "pair_mode", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },
     S { op: DevOp::Residual, t: &["out", "a", "b", "pre?"], i: &["n"], f: &["scale"], j: &[] },
     S { op: DevOp::Glu, t: &["out", "gate", "up"], i: &["n", "act"], f: &["alpha", "limit"], j: &[] },
+    S { op: DevOp::GluPitched, t: &["out", "gu"], i: &["n", "act", "width", "in_stride", "up_col"], f: &["alpha", "limit"], j: &[] },
     S { op: DevOp::Embed, t: &["out", "table", "ids"], i: &["ntok", "hidden", "pad"], f: &["scale"], j: &[] },
     S { op: DevOp::SoftCap, t: &["out", "x"], i: &["n"], f: &["cap"], j: &[] },
     S { op: DevOp::Gemm, t: &["C", "A", "B", "", "", "", "", "bias?"], i: &["M", "N", "K"], f: &[], j: &[] },

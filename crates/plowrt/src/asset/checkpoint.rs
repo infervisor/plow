@@ -191,6 +191,7 @@ pub(crate) fn missing_weights(
                 .collect()
         })
         .unwrap_or_default();
+    let derived = derived_weights(blob, raw)?;
     let mut have = std::collections::HashSet::new();
     for path in shard_paths(dir)? {
         use std::io::Read;
@@ -225,10 +226,58 @@ pub(crate) fn missing_weights(
             !caches.contains(i)
                 && t.init.is_none()
                 && is_checkpoint_tensor(*i, &t.name, packed.as_ref())
-                && !have.contains(t.name.strip_prefix("f32/").unwrap_or(&t.name))
+                && !match derived.as_ref().and_then(|d| d.get(&t.name)) {
+                    Some(spec) => spec.sources.iter().all(|source| have.contains(source)),
+                    None => have.contains(t.name.strip_prefix("f32/").unwrap_or(&t.name)),
+                }
         })
         .map(|(_, t)| t.name.clone())
         .collect())
+}
+
+/// The packet's `derived_weights.json` section, when it carries one.
+pub(crate) fn derived_weights(
+    blob: &crate::asset::devblob::DevBlob,
+    raw: &[u8],
+) -> Result<Option<plow_asset::derived_weights::DerivedWeights>> {
+    let derived = blob
+        .reserved_metadata(raw, plow_asset::derived_weights::SECTION)?
+        .map(|bytes| {
+            plow_asset::derived_weights::DerivedWeights::parse(bytes)
+                .map_err(RuntimeError::Rejected)
+        })
+        .transpose()?;
+    // Every `cat/` tensor is assembled from its entry, never initialized or generated, and every
+    // entry names a declared tensor.
+    let generated: std::collections::HashSet<u32> = blob.gen.iter().map(|g| g.tensor).collect();
+    for (i, t) in blob.tensors.iter().enumerate() {
+        if t.name.starts_with(packet::names::CONCAT_PREFIX)
+            && (t.init.is_some()
+                || generated.contains(&(i as u32))
+                || derived.as_ref().and_then(|d| d.get(&t.name)).is_none())
+        {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: a {} tensor needs a {} entry and no packet bytes",
+                t.name,
+                packet::names::CONCAT_PREFIX,
+                plow_asset::derived_weights::SECTION
+            )));
+        }
+    }
+    if let Some(d) = &derived {
+        if let Some(t) = d
+            .tensors
+            .iter()
+            .find(|e| !blob.tensors.iter().any(|t| t.name == e.name))
+        {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: `{}` is not a tensor of this packet",
+                plow_asset::derived_weights::SECTION,
+                t.name
+            )));
+        }
+    }
+    Ok(derived)
 }
 
 /// The load refusal for [`missing_weights`]: names the tensors and, for the FP8 lm_head twin, the
@@ -590,35 +639,68 @@ impl Checkpoint {
     /// for any other name.
     pub(crate) fn widened_f32(&self, name: &str, bytes: u64) -> Option<Result<Vec<u8>>> {
         let source = name.strip_prefix("f32/")?;
-        Some((|| {
+        Some(self.assemble(name, &[source], true, bytes))
+    }
+
+    /// The bytes of a `derived_weights.json` tensor: its sources back to back along axis 0
+    /// (same dtype and trailing dims), widened to f32 when declared, `bytes` long.
+    pub(crate) fn concatenated(
+        &self,
+        spec: &plow_asset::derived_weights::DerivedTensor,
+        bytes: u64,
+    ) -> Result<Vec<u8>> {
+        let sources: Vec<&str> = spec.sources.iter().map(String::as_str).collect();
+        self.assemble(&spec.name, &sources, spec.widen_f32, bytes)
+    }
+
+    fn assemble(&self, name: &str, leaves: &[&str], widen: bool, bytes: u64) -> Result<Vec<u8>> {
+        let mut parts = Vec::with_capacity(leaves.len());
+        for &leaf in leaves {
             let e = self
                 .index
-                .get(source)
-                .ok_or_else(|| RuntimeError::Device(format!("MISSING WEIGHT: {source}")))?;
+                .get(leaf)
+                .ok_or_else(|| RuntimeError::Device(format!("MISSING WEIGHT: {leaf}")))?;
             let (map, off) = &self.shards[e.shard];
             let src = map
                 .get(off + e.range.start..off + e.range.end)
-                .ok_or_else(|| RuntimeError::Device(format!("{source}: range past the shard")))?;
-            let out: Vec<u8> = match e.dtype {
-                safetensors::Dtype::BF16 => src
-                    .chunks_exact(2)
-                    .flat_map(|b| [0, 0, b[0], b[1]])
-                    .collect(),
-                safetensors::Dtype::F32 => src.to_vec(),
+                .ok_or_else(|| RuntimeError::Device(format!("{leaf}: range past the shard")))?;
+            parts.push((e, src));
+        }
+        let (first, _) = parts[0];
+        if leaves.len() > 1
+            && parts.iter().any(|(e, _)| {
+                e.dtype != first.dtype || e.shape.is_empty() || e.shape[1..] != first.shape[1..]
+            })
+        {
+            return Err(RuntimeError::Device(format!(
+                "{name}: concatenated sources disagree on dtype or trailing dims"
+            )));
+        }
+        let mut out = Vec::new();
+        for (_, src) in parts {
+            if !widen {
+                out.extend_from_slice(src);
+                continue;
+            }
+            match first.dtype {
+                safetensors::Dtype::BF16 => {
+                    out.extend(src.chunks_exact(2).flat_map(|b| [0, 0, b[0], b[1]]))
+                }
+                safetensors::Dtype::F32 => out.extend_from_slice(src),
                 other => {
                     return Err(RuntimeError::Device(format!(
-                        "{name}: source {source} is {other:?}, not BF16/F32"
+                        "{name}: source is {other:?}, not BF16/F32"
                     )))
                 }
-            };
-            if out.len() as u64 != bytes {
-                return Err(RuntimeError::Device(format!(
-                    "SIZE MISMATCH {name} (want {bytes} got {})",
-                    out.len()
-                )));
             }
-            Ok(out)
-        })())
+        }
+        if out.len() as u64 != bytes {
+            return Err(RuntimeError::Device(format!(
+                "SIZE MISMATCH {name} (want {bytes} got {})",
+                out.len()
+            )));
+        }
+        Ok(out)
     }
 
     /// Tensor bytes **and** shape — what a row-parallel shard needs.
@@ -911,6 +993,117 @@ mod missing_weights_tests {
         b.extend(h);
         b.extend(vec![0u8; 2 * names.len()]);
         std::fs::write(path, b).unwrap();
+    }
+
+    /// `(name, dtype, shape, bytes)` tensors in one shard.
+    fn shard_with(path: &Path, tensors: &[(&str, &str, &[usize], Vec<u8>)]) {
+        let (mut hdr, mut data) = (serde_json::Map::new(), Vec::new());
+        for (n, dtype, shape, bytes) in tensors {
+            hdr.insert(
+                (*n).into(),
+                serde_json::json!({"dtype": dtype, "shape": shape,
+                    "data_offsets": [data.len(), data.len() + bytes.len()]}),
+            );
+            data.extend_from_slice(bytes);
+        }
+        let h = serde_json::to_vec(&hdr).unwrap();
+        let mut b = (h.len() as u64).to_le_bytes().to_vec();
+        b.extend(h);
+        b.extend(data);
+        std::fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn concatenations_are_byte_exact_and_refuse_mismatched_sources() {
+        let dir = std::env::temp_dir().join(format!("plow-concat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b): (Vec<u8>, Vec<u8>) = ((0..12).collect(), (100..106).collect());
+        let (sa, sb) = (vec![0x80, 0x3f, 0x00, 0x40], vec![0x40, 0x40]);
+        shard_with(
+            &dir.join("model.safetensors"),
+            &[
+                ("a", "F8_E4M3", &[4, 3], a.clone()),
+                ("b", "F8_E4M3", &[2, 3], b.clone()),
+                ("a_s", "BF16", &[2, 1], sa),
+                ("b_s", "BF16", &[1, 1], sb),
+                ("c", "F8_E4M3", &[2, 2], vec![0; 4]),
+                ("d", "BF16", &[2, 3], vec![0; 12]),
+            ],
+        );
+        let ck = Checkpoint::open(&dir).unwrap();
+        let spec = |sources: &[&str], widen_f32: bool| plow_asset::derived_weights::DerivedTensor {
+            name: "cat/x".into(),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            widen_f32,
+        };
+        let cat = ck.concatenated(&spec(&["a", "b"], false), 18).unwrap();
+        assert_eq!(cat, [a, b].concat());
+        let wide = ck.concatenated(&spec(&["a_s", "b_s"], true), 12).unwrap();
+        let f: Vec<f32> = wide
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(f, [1.0, 2.0, 3.0]);
+        assert_eq!(ck.widened_f32("f32/b_s", 4).unwrap().unwrap(), wide[8..]);
+        for (sources, widen, bytes) in [
+            (&["a", "b"][..], false, 17),
+            (&["a", "c"], false, 16),
+            (&["a", "d"], false, 24),
+            (&["a", "zz"], false, 12),
+            (&["a", "b"], true, 72),
+        ] {
+            assert!(
+                ck.concatenated(&spec(sources, widen), bytes).is_err(),
+                "{sources:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cat_tensors_need_a_section_entry_and_no_packet_bytes() {
+        let blob = |init: bool, section: Option<&str>| {
+            let mut b = Builder::new(1);
+            let out = b.tensor("act.out", 8);
+            let w = if init {
+                b.tensor_init("cat/a.weight", vec![0; 8])
+            } else {
+                b.tensor("cat/a.weight", 8)
+            };
+            b.emit(DevOp::Glu, vec![0], &[], |d| {
+                d.t[..2].copy_from_slice(&[out, w])
+            });
+            let p = b.finish();
+            let m = Model {
+                n_cu: 1,
+                target: 0,
+                tensors: p.tensors.clone(),
+                progs: vec![p],
+                prog_t: vec![1],
+                gen: vec![],
+                kv_row_insts: vec![],
+            };
+            let sections: Vec<_> = section
+                .map(|name| packet::devbuild::SectionData {
+                    kind: packet::devbuild::SECT_METADATA,
+                    name: plow_asset::derived_weights::SECTION.into(),
+                    data: format!(
+                        r#"{{"version":1,"tensors":[{{"name":"{name}","sources":["a.weight","b.weight"]}}]}}"#
+                    )
+                    .into_bytes(),
+                })
+                .into_iter()
+                .collect();
+            let raw = m.to_blob_v6(&sections);
+            (crate::asset::devblob::DevBlob::parse(&raw).unwrap(), raw)
+        };
+        let ok =
+            |(b, r): (crate::asset::devblob::DevBlob, Vec<u8>)| derived_weights(&b, &r).is_ok();
+        assert!(ok(blob(false, Some("cat/a.weight"))));
+        assert!(!ok(blob(false, None)));
+        assert!(!ok(blob(true, Some("cat/a.weight"))));
+        assert!(!ok(blob(false, Some("cat/other.weight"))));
     }
 
     #[test]

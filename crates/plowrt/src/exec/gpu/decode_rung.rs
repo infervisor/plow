@@ -285,7 +285,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                         d.i[7] = 0;
                     }
                 }
-                Some(DevOp::Residual | DevOp::Glu | DevOp::SoftCap) => {
+                Some(DevOp::Residual | DevOp::Glu | DevOp::GluPitched | DevOp::SoftCap) => {
                     if d.i[0] == 0 || d.i[0] % g.t != 0 {
                         return Err(reject("invalid elementwise row extent"));
                     }

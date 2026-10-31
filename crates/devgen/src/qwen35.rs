@@ -309,6 +309,62 @@ impl Fold {
     }
 }
 
+thread_local! {
+    /// The `cat/` tensors this thread's emits declared, by label: [`derived_section`] writes
+    /// the ones a model binds into `derived_weights.json`.
+    static DERIVED: std::cell::RefCell<
+        std::collections::BTreeMap<String, plow_asset::derived_weights::DerivedTensor>,
+    > = Default::default();
+}
+
+/// The label of checkpoint tensors `sources` concatenated along axis 0 (widened to f32 when
+/// `widen_f32`), recorded for [`derived_section`].
+fn derive<S: AsRef<str>>(sources: &[S], widen_f32: bool) -> String {
+    let sources: Vec<String> = sources.iter().map(|s| s.as_ref().to_string()).collect();
+    let name = packet::names::concat_label(&sources[0]);
+    DERIVED.with(|d| {
+        let spec = plow_asset::derived_weights::DerivedTensor {
+            name: name.clone(),
+            sources,
+            widen_f32,
+        };
+        let prev = d.borrow_mut().insert(name.clone(), spec.clone());
+        assert!(prev.is_none_or(|p| p == spec), "{name}: two derivations");
+    });
+    name
+}
+
+/// `derived_weights.json` for the `cat/` tensors `m` declares.
+fn derived_section(m: &Model) -> Option<packet::devbuild::SectionData> {
+    use plow_asset::derived_weights::{DerivedWeights, SECTION, VERSION};
+    let tensors: Vec<_> = DERIVED.with(|d| {
+        let d = d.borrow();
+        m.tensors
+            .iter()
+            .filter(|t| t.name.starts_with(packet::names::CONCAT_PREFIX))
+            .map(|t| d.get(&t.name).cloned().expect("undeclared cat/ tensor"))
+            .collect()
+    });
+    (!tensors.is_empty()).then(|| packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: SECTION.into(),
+        data: serde_json::to_vec(&DerivedWeights {
+            version: VERSION,
+            tensors,
+        })
+        .expect("derived weights json"),
+    })
+}
+
+/// The checkpoint tensors a declared tensor reads: a `cat/` tensor's sources, an `f32/`
+/// view's source, otherwise itself.
+fn checkpoint_sources(name: &str) -> Vec<String> {
+    if name.starts_with(packet::names::CONCAT_PREFIX) {
+        return DERIVED.with(|d| d.borrow()[name].sources.clone());
+    }
+    vec![name.strip_prefix("f32/").unwrap_or(name).to_string()]
+}
+
 impl Emitter<'_> {
     fn proj_fold(
         &mut self,
@@ -357,8 +413,26 @@ impl Emitter<'_> {
         self.b.tensor(name, elems * 2)
     }
     fn proj(&mut self, out: u32, src: u32, name: &str, n: u32, k: u32, dep: u32) -> u32 {
+        self.proj_leaves(out, src, &[name], n, k, dep)
+    }
+    /// One projection over checkpoint weights `leaves` concatenated along N (`n` = their total
+    /// rows): block-scaled FP8 only when there is more than one.
+    fn proj_leaves(
+        &mut self,
+        out: u32,
+        src: u32,
+        leaves: &[&str],
+        n: u32,
+        k: u32,
+        dep: u32,
+    ) -> u32 {
+        let name = leaves[0];
         let quantized = self.quantized(name);
         let block = quantized && self.c.block_fp8.is_some();
+        assert!(
+            leaves.len() == 1 || (block && leaves.iter().all(|l| self.quantized(l))),
+            "{leaves:?}: only block-scaled FP8 projections concatenate"
+        );
         let (op, w, scale) = if block {
             assert!(
                 n % 128 == 0 && k % 512 == 0,
@@ -366,14 +440,19 @@ impl Emitter<'_> {
                  weight scale rows at a 4-float stride; the widened grid is packed)"
             );
             // The hub tensors: e4m3 bytes verbatim, the BF16 128x128 scale grid widened to f32
-            // at load (exact; `f32/` names a widened checkpoint tensor).
+            // at load (exact; `f32/` names a widened checkpoint tensor, `cat/` a concatenation
+            // along N, which keeps both row-major grids' K stride).
+            let (weight, grid) = if let [leaf] = leaves {
+                (leaf.to_string(), format!("f32/{leaf}_scale_inv"))
+            } else {
+                let grids: Vec<String> = leaves.iter().map(|l| format!("{l}_scale_inv")).collect();
+                (derive(leaves, false), derive(&grids, true))
+            };
             (
                 DevOp::GemvFp8,
-                self.b.tensor(name, n as u64 * k as u64),
-                self.b.tensor(
-                    &format!("f32/{name}_scale_inv"),
-                    u64::from(n / 128) * u64::from(k / 128) * 4,
-                ),
+                self.b.tensor(&weight, n as u64 * k as u64),
+                self.b
+                    .tensor(&grid, u64::from(n / 128) * u64::from(k / 128) * 4),
             )
         } else if quantized {
             (
@@ -1188,8 +1267,26 @@ fn phase(
     let mut pending = TENSOR_NONE;
     let hn = e.act("hn", c.hidden);
     let mixed = e.act("mixed", c.hidden);
-    let gate = e.act("gt", c.inter);
-    let up = e.act("ut", c.inter);
+    // gate|up as one N-concatenated block-FP8 projection (`cat/` weights) read by GluPitched.
+    let gu = (emit_config::active().fp8_block_concat
+        && e.fp8
+        && e.w8a8
+        && c.block_fp8.is_some()
+        && !fuse_decode
+        && !fuse_mlp
+        && (0..c.layers.len())
+            .filter(|l| c.block.as_ref().is_none_or(|range| range.contains(l)))
+            .all(|l| {
+                ["gate", "up"]
+                    .iter()
+                    .all(|x| e.quantized(&format!("{}layers.{l}.mlp.{x}_proj.weight", c.prefix)))
+            }))
+    .then(|| e.act("gu", 2 * c.inter));
+    let (gate, up) = if gu.is_some() {
+        (TENSOR_NONE, TENSOR_NONE)
+    } else {
+        (e.act("gt", c.inter), e.act("ut", c.inter))
+    };
     let fu = e.act("fu", c.inter);
     let logits =
         e.b.tensor("act.logits", u64::from(decode_slots) * c.vocab as u64 * 2);
@@ -1292,6 +1389,16 @@ fn phase(
                 d.t[..7].copy_from_slice(&[gate, hn, wg, up, wu, TENSOR_NONE, TENSOR_NONE]);
                 d.i[..5].copy_from_slice(&[batch, c.inter, c.hidden, c.inter, 0]);
             })
+        } else if let Some(gu) = gu {
+            let (g, u) = (
+                format!("{p}.mlp.gate_proj.weight"),
+                format!("{p}.mlp.up_proj.weight"),
+            );
+            dep = e.proj_leaves(gu, hn, &[&g, &u], 2 * c.inter, c.hidden, dep);
+            e.b.emit(DevOp::GluPitched, e.b.all(), &[dep], |d| {
+                d.t[..2].copy_from_slice(&[fu, gu]);
+                d.i[..5].copy_from_slice(&[batch * c.inter, 1, c.inter, 2 * c.inter, c.inter]);
+            })
         } else {
             let gate_dep = e.proj(
                 gate,
@@ -1310,7 +1417,7 @@ fn phase(
                 gate_dep,
             )
         };
-        if !fuse_decode {
+        if !fuse_decode && gu.is_none() {
             dep = e.b.emit(DevOp::Glu, e.b.all(), &[dep], |d| {
                 d.t[..3].copy_from_slice(&[fu, gate, up]);
                 d.i[..2].copy_from_slice(&[batch * c.inter, 1]);
@@ -1618,17 +1725,18 @@ pub(super) fn run(
         &c.prefix,
         &m.tensors
             .iter()
-            .filter_map(|t| {
+            .flat_map(|t| {
                 // Sidecars are derived from these exact checkpoint matrices; scales add no source.
                 // A re-keyed checkpoint ships the twin itself in place of its bf16 source.
-                if let Some(name) = t.name.strip_prefix("f32/") {
-                    return Some(name.to_string());
+                // `f32/` and `cat/` derivations read their checkpoint leaves.
+                if t.name.starts_with("f32/") || t.name.starts_with(packet::names::CONCAT_PREFIX) {
+                    return checkpoint_sources(&t.name);
                 }
                 match t.name.strip_prefix("fp8/") {
-                    Some(name) if name.ends_with("_scale") => None,
-                    Some(_) if shipped.contains(&t.name) => Some(t.name.clone()),
-                    Some(name) => Some(name.to_string()),
-                    None => Some(t.name.clone()),
+                    Some(name) if name.ends_with("_scale") => vec![],
+                    Some(_) if shipped.contains(&t.name) => vec![t.name.clone()],
+                    Some(name) => vec![name.to_string()],
+                    None => vec![t.name.clone()],
                 }
             })
             .collect::<Vec<_>>(),
@@ -1645,6 +1753,7 @@ pub(super) fn run(
     if let Some(section) = segment_roles(&m) {
         sections.push(section);
     }
+    sections.extend(derived_section(&m));
     // PLOW_EMIT_PREFILL_CUBLASLT: the dense projections of every prefill bucket as isolated
     // cuBLASLt segments (the Gemma route; shapes in segment_roles::CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES).
     // The ordinary Qwen prefill otherwise runs every GEMM on the generic interpreter object.
@@ -2450,6 +2559,81 @@ mod tests {
         assert_eq!(
             crate::dense_cublaslt::runtime_requires(&m, &[])["plowrt_contract"],
             plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
+        );
+    }
+
+    #[test]
+    fn block_fp8_concat_reads_gate_up_as_one_projection() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        struct Restore(emit_config::EmitConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                emit_config::install(self.0.clone());
+            }
+        }
+        let restore = Restore(emit_config::active().clone());
+        let mut cfg = restore.0.clone();
+        cfg.fp8 = true;
+        cfg.w8a8 = true;
+        cfg.decode_cublaslt = true;
+        cfg.qwen_fp8_m1_tma = false;
+        cfg.fp8_block_concat = true;
+        cfg.qwen_w8a8_prefill = true;
+        emit_config::install(cfg);
+        let mut hub = fixture();
+        let bf16: Vec<_> = (0..3)
+            .flat_map(|l| {
+                ["a", "b"]
+                    .map(|x| format!("model.language_model.layers.{l}.linear_attn.in_proj_{x}"))
+            })
+            .collect();
+        hub["quantization_config"] = serde_json::json!({"quant_method":"fp8","fmt":"e4m3",
+            "activation_scheme":"dynamic","weight_block_size":[128,128],
+            "modules_to_not_convert":bf16});
+        let c = Config::parse(&hub);
+        let (inter, hidden) = (17408u32, 5120u32);
+        let m = model_prefill(&c, 8192, 132, 0, &[128], 3, true);
+        for (prog, batch) in [(0, 128u32), (1, 3)] {
+            let insts = &m.progs[prog].insts;
+            assert_eq!(
+                insts.iter().filter(|d| d.op == DevOp::Glu as u16).count(),
+                0
+            );
+            let glus: Vec<_> = insts
+                .iter()
+                .filter(|d| d.op == DevOp::GluPitched as u16)
+                .collect();
+            assert!(!glus.is_empty());
+            for glu in glus {
+                assert_eq!(&glu.i[..5], &[batch * inter, 1, inter, 2 * inter, inter]);
+                assert_eq!(glu.t[2], TENSOR_NONE);
+                let gemm = insts
+                    .iter()
+                    .find(|d| d.op == DevOp::GemmFp8 as u16 && d.t[0] == glu.t[1])
+                    .expect("gate|up GEMM");
+                assert_eq!(&gemm.i[..3], &[batch, 2 * inter, hidden]);
+                let w = &m.tensors[gemm.t[2] as usize].name;
+                let s = &m.tensors[gemm.t[4] as usize].name;
+                let section = derived_section(&m).unwrap();
+                let derived =
+                    plow_asset::derived_weights::DerivedWeights::parse(&section.data).unwrap();
+                let (w, s) = (derived.get(w).unwrap(), derived.get(s).unwrap());
+                assert!(!w.widen_f32 && s.widen_f32);
+                assert!(w.sources[0].ends_with("mlp.gate_proj.weight"));
+                assert!(w.sources[1].ends_with("mlp.up_proj.weight"));
+                let grids: Vec<String> =
+                    w.sources.iter().map(|l| format!("{l}_scale_inv")).collect();
+                assert_eq!(s.sources, grids);
+                assert!(
+                    m.tensors[gemm.t[0] as usize].bytes
+                        >= u64::from(batch.next_multiple_of(4)) * u64::from(2 * inter) * 2
+                );
+            }
+        }
+        assert_eq!(
+            crate::dense_cublaslt::runtime_requires(&m, &[])["plowrt_contract"],
+            plow_asset::RUNTIME_CONTRACT_CONCAT
         );
     }
 

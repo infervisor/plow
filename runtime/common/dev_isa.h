@@ -1558,6 +1558,10 @@ enum {
      * i0=rows i1=dim i2=mode1 i3=mode2 i4=band width (0: none) i5=gate eps (f32 bits)
      * i6=out_n scale (f32 bits, 0 = 1) f0=eps1 f1=eps2 j1=T (f32 bits). */
     PLOW_DOP_MUSE_NORM_GATE_NORM = 229,
+    /* Op 5 over one row-pitched gate|up input: out[r*i2 + p] = bf16(act(g) * u),
+     * g = gu[r*i3 + p], u = gu[r*i3 + i4 + p]. t0=out t1=gu i0=n (rows*width) i1=act
+     * i2=width i3=in_stride i4=up_col (elements) f0=alpha f1=limit. */
+    PLOW_DOP_GLU_PITCHED = 230,
 
     PLOW_DOP__COUNT
 };

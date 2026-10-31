@@ -2552,6 +2552,12 @@ pub enum DevOp {
     /// · `j1=T`. `gate_eps`, `oscale` (0 = 1) and `T` are f32 bit patterns; `out_res` may alias
     /// `res`.
     MuseNormGateNorm = 229,
+    /// [`DevOp::Glu`] over one row-pitched input holding both halves (an N-concatenated
+    /// gate|up projection's output): `out[r*width + p] = bf16(act(g) * u)` with
+    /// `g = gu[r*in_stride + p]`, `u = gu[r*in_stride + up_col + p]`, the act and rounding of op 5.
+    /// `t0=out t1=gu` · `i0=n i1=act i2=width i3=in_stride i4=up_col` · `f0=alpha f1=limit`.
+    /// `n = rows*width`; strides and `up_col` count elements; requires `up_col + width <= in_stride`.
+    GluPitched = 230,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2849,6 +2855,7 @@ impl DevOp {
         DevOp::MuseResidualGate,
         DevOp::MuseMoeCombineNorm,
         DevOp::MuseNormGateNorm,
+        DevOp::GluPitched,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -3099,6 +3106,7 @@ impl DevOp {
             DevOp::MuseResidualGate => "PLOW_DOP_MUSE_RESIDUAL_GATE",
             DevOp::MuseMoeCombineNorm => "PLOW_DOP_MUSE_MOE_COMBINE_NORM",
             DevOp::MuseNormGateNorm => "PLOW_DOP_MUSE_NORM_GATE_NORM",
+            DevOp::GluPitched => "PLOW_DOP_GLU_PITCHED",
         }
     }
 
@@ -3167,7 +3175,8 @@ impl DevOp {
     /// front-ends).
     /// 225 -> 226 for `TrimSilenceF32 = 225` (reference-audio silence trim).
     /// 226 -> 230 for `MuseRmsNorm = 226` .. `MuseNormGateNorm = 229` (Muse Spark).
-    pub const COUNT: u16 = 230;
+    /// 230 -> 231 for `GluPitched = 230` (N-concatenated gate|up projections).
+    pub const COUNT: u16 = 231;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
