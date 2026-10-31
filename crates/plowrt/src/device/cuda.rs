@@ -2360,24 +2360,24 @@ impl CudaBackend {
     /// already unloaded are skipped.
     pub fn unload_modules_on_err<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let outer = LOAD_SCOPE.with(|s| s.borrow_mut().replace(Vec::new()));
-        let r = f();
+        // A panicking load is swept too, then resumes unwinding.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         let ids = LOAD_SCOPE.with(|s| std::mem::replace(&mut *s.borrow_mut(), outer));
         let ids = ids.unwrap_or_default();
-        match &r {
-            Ok(_) => LOAD_SCOPE.with(|s| {
+        if let Ok(Ok(_)) = &r {
+            LOAD_SCOPE.with(|s| {
                 if let Some(outer) = s.borrow_mut().as_mut() {
                     outer.extend(ids);
                 }
-            }),
-            Err(e) => {
-                let swept = ids
-                    .into_iter()
-                    .filter(|&id| self.module_unload(&Module { id }).is_ok())
-                    .count();
-                tracing::debug!(swept, error = %e, "unloaded the modules of a failed load");
-            }
+            });
+        } else {
+            let swept = ids
+                .into_iter()
+                .filter(|&id| self.module_unload(&Module { id }).is_ok())
+                .count();
+            tracing::debug!(swept, "unloaded the modules of a failed load");
         }
-        r
+        r.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
     /// Modules currently loaded through this backend (lifecycle accounting).

@@ -999,8 +999,12 @@ impl AppState {
 
     /// `slug` is about to run beside `others` engines on its group: raise an unordered turn to
     /// what a startup with them all would have picked (`policy::co_sched`).
+    ///
+    /// Not on AMD: a co-tenant's tick already in flight under `free` overlaps the new tenant's
+    /// first ordered one, harmless on CUDA (throughput) and a possible whole-grid wait on HSA,
+    /// whose groups must be started `--co-sched rr` to share (the manager refuses otherwise).
     pub fn upgrade_turn(&self, slug: &str, others: usize, amd: bool) {
-        if others == 0 {
+        if others == 0 || amd {
             return;
         }
         let Some(turn) = self.device_turn(slug) else {

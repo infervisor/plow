@@ -1645,8 +1645,8 @@ impl ModelManager {
         }
 
         // Turns are installed from the startup tenant count: a model loaded later beside another
-        // raises its group's turn from `Free`; on HSA a group still not round-robin (an explicit
-        // --co-sched) is refused.
+        // raises its group's turn from `Free` (CUDA); an HSA group not started round-robin is
+        // refused (`AppState::upgrade_turn`).
         let others = self
             .models
             .read()
