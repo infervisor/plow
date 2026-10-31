@@ -1494,13 +1494,15 @@ static void t_dwconv_items(unsigned items, unsigned item_rows, unsigned ch, unsi
     verdict(name, "each item == the item alone", same);
 }
 
-/* Q8GemmF32 at Nemotron's shapes: the GEMV walk (path 1) against tiles (path 2) by row count. */
+/* Q8GemmF32 at Nemotron's shapes: the GEMV walk (path 1) against tiles (path 2) by row count, then
+ * tiles alone at an upload launch's rows. */
 static void bench_q8_paths() {
     const unsigned shapes[][2] = {{1024, 1024}, {4096, 1024}, {1024, 4096}, {2048, 1024}, {13088, 640}, {2560, 640}};
     for (const auto& shape : shapes) {
         const unsigned n = shape[0], k = shape[1];
-        for (unsigned m : {1u, 4u, 8u, 16u, 32u, 64u, 128u, 256u}) {
+        for (unsigned m : {1u, 4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u, 1024u, 2048u}) {
             for (unsigned path : {1u, 2u}) {
+                if (path == 1u && m > 256u) continue;
                 Case c;
                 unsigned o = c.out((size_t)m * n), x = c.f32((size_t)m * k, 1.f), w = q8_weights(c, n, k);
                 c.in.op = PLOW_DOP_Q8_GEMM_F32;
