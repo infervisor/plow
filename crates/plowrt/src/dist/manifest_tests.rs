@@ -669,6 +669,37 @@ fn a_mismatched_packet_stamp_is_refused_at_pack_time() {
     assert!(e.contains("records no pairing hash"), "{e}");
 }
 
+/// A build that plans BF16 cuBLASLt shapes ships the table that pins them, whatever the recipe's
+/// serve env says: an unpinned plan is re-timed at every load and its numerics re-roll.
+#[test]
+fn a_build_with_bf16_lt_shapes_needs_its_algorithm_table() {
+    let dir = speech_assets("lt-table");
+    let objset = objset_for(&dir);
+    std::fs::write(
+        dir.join("build.json"),
+        br#"{"pairing":{"hash":"0x541009da5f9890c1"},
+             "cublaslt":{"shapes":[{"phase":"prefill","rows":256,"m":256,"n":1024,"k":4096,"dtype":"bf16"}]}}"#,
+    )
+    .unwrap();
+    assert!(veena().required.is_empty());
+    build_bundle(&dir, &veena(), Some(&objset), &BundleArgs::default()).unwrap();
+
+    std::fs::remove_file(dir.join("cublaslt_algos.jsonl")).unwrap();
+    let e = build_bundle(&dir, &veena(), Some(&objset), &BundleArgs::default())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("plans 1 BF16 cuBLASLt shape(s)"), "{e}");
+
+    // FP8 plans take the heuristic algorithm, not a timed one: no table needed.
+    std::fs::write(
+        dir.join("build.json"),
+        br#"{"pairing":{"hash":"0x541009da5f9890c1"},
+             "cublaslt":{"shapes":[{"phase":"prefill","rows":256,"m":256,"n":1024,"k":4096,"dtype":"e4m3"}]}}"#,
+    )
+    .unwrap();
+    build_bundle(&dir, &veena(), Some(&objset), &BundleArgs::default()).unwrap();
+}
+
 #[test]
 fn a_directory_without_a_packet_is_not_an_asset_directory() {
     let dir = speech_assets("nopacket");

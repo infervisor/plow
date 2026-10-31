@@ -960,6 +960,17 @@ pub fn build_bundle(
             )));
         }
     }
+    // Without a table plowrt times every BF16 cuBLASLt plan at load, and the pick (a split-K
+    // reduction among them) re-rolls per server start: greedy output then differs between starts.
+    let lt_shapes = lt_bf16_shapes(&build_json);
+    if lt_shapes > 0 && !files.iter().any(|f| f.name == "cublaslt_algos.jsonl") {
+        return Err(bad(format!(
+            "{}: build.json plans {lt_shapes} BF16 cuBLASLt shape(s) but there is no \
+             cublaslt_algos.jsonl; serving would time them at every load and its numerics would \
+             vary per start. Run the campaign probe step to record the table",
+            assets.display()
+        )));
+    }
     if !unclaimed.is_empty() {
         // stderr: an `--out`-less run prints the manifest to stdout.
         eprintln!(
@@ -1103,6 +1114,19 @@ fn classify(name: &str) -> Option<&'static str> {
         return Some("sidecar_packet");
     }
     None
+}
+
+/// `build.json` `cublaslt.shapes` with dtype `bf16`: the plans plowrt selects by load-time timing
+/// unless the bundle's table pins them.
+fn lt_bf16_shapes(build_json: &serde_json::Value) -> usize {
+    build_json
+        .pointer("/cublaslt/shapes")
+        .and_then(|s| s.as_array())
+        .map_or(0, |s| {
+            s.iter()
+                .filter(|x| x.get("dtype").and_then(|d| d.as_str()) == Some("bf16"))
+                .count()
+        })
 }
 
 fn read_json_if_present(p: &Path) -> Result<serde_json::Value> {
