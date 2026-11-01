@@ -1526,7 +1526,16 @@ where
             .map(|p| p.t as usize)
             .max()
             .unwrap_or(1);
-        let row = t.bytes as usize / widest;
+        // Row-major ops whose width the instruction states; the rest by tensor stride.
+        use packet::dev::DevOp as O;
+        let width = |k: usize| d.i[k] as usize;
+        let row = match packet::dev::DevOp::from_u16(d.op) {
+            Some(O::Gemv | O::GemvFp8 | O::GemvGlu | O::GemvGluFp8 | O::RmsNorm)
+            | Some(O::NormResidualNorm | O::Embed) => width(1) * 2,
+            Some(O::HeadNormRope) => width(1) * width(2) * 2,
+            Some(O::FlashMerge) => width(1) * width(3) * 2,
+            _ => t.bytes as usize / widest,
+        };
         let mut out = Vec::new();
         for r in [ra, rb] {
             e.set_debug_min_rung(r);

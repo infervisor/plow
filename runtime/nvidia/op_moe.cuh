@@ -215,6 +215,11 @@ __device__ __forceinline__ float plow_moe_act(float g, unsigned act) {
  * MoE ones; only the output map differs (direct weight+scale pointers, no routing table).
  * x is read straight from global (re-read per warp, resident in L1/L2) — matches AMD. */
 
+/* Batch-invariant decode (set by the runtime): every row count takes the B=1 router association,
+ * the grouped expert arm and one row's K split, so a row's MoE output never depends on its
+ * launch width. */
+extern "C" __device__ unsigned plow_batch_invariant = 0;
+
 /* DENSE_GLU_FP8_BLK (op 47): fu[n] = act(gate_n·x) * (up_n·x), n in [0,N). N=intermediate,
  * K=hidden. Wg/Wu = e4m3[N][K]; Sg/Su = block-scale grids [ceil(N/128)][ceil(K/128)] f32. */
 static __device__ void d_dense_glu_fp8_blk(bf16* __restrict__ fu, const bf16* __restrict__ x,
@@ -881,7 +886,8 @@ static __device__ __noinline__ void plow_moe_router_score_v9(
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const float x = __bfloat162float(xv[q].x[j]), s = __bfloat162float(sv[q].x[j]);
-                h2[v * 8u + j] = nrow == 1u ? x * invrms * s * root : x * invrms * (s * root);
+                h2[v * 8u + j] = (nrow == 1u || plow_batch_invariant) ? x * invrms * s * root
+                                                                      : x * invrms * (s * root);
             }
         }
         __syncthreads();
@@ -1986,9 +1992,6 @@ __device__ __forceinline__ bool plow_moe_tc_ok(unsigned N, unsigned K) {
 #ifndef PLOW_MOE_FP8_TC_DD
 #define PLOW_MOE_FP8_TC_DD 4
 #endif
-/* Batch-invariant decode (set by the runtime): every row count takes the grouped arm and the
- * K split one row's share would pick, so a row's expert sums never depend on its launch width. */
-extern "C" __device__ unsigned plow_batch_invariant = 0;
 /* DOWN's K (I_moe = 704 on the 26B) is only 11 chunks: at the dense depth a warp pays three
  * exposed round trips per tile. */
 #ifndef PLOW_MOE_TC_UD
