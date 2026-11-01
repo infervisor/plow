@@ -3,8 +3,9 @@
 // entry) run in 16-byte vectors. A layout entry is one (tensor, head) run of a store class: slot
 // `s`, slot row `r` at `dev + s * slot_stride + r * row_bytes`, its copy in the block at
 // `block + block_off`, `bytes` long (16-byte aligned and sized). Shipped as PTX (`kv_segcopy.ptx`,
-// embedded in plowrt and JIT-compiled by the driver at load); regenerate with
-//   nvcc -arch=sm_90 -O3 -ptx -o runtime/nvidia/kv_segcopy.ptx runtime/nvidia/kv_segcopy.cu
+// embedded in plowrt and JIT-compiled by the driver at load). `.target sm_89`, the oldest served
+// arch: an sm_90 target does not load on Ada; the sm_90 SASS is the same. Regenerate with
+//   nvcc -arch=sm_89 -O3 -ptx -o runtime/nvidia/kv_segcopy.ptx runtime/nvidia/kv_segcopy.cu
 #include <cstdint>
 struct plow_kv_layout {
     uint64_t dev;
