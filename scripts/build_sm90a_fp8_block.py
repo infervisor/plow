@@ -4,7 +4,7 @@
 so it is built before the emit, which hashes it into segment_roles.json (PLOW_EMIT_DECODE_FP8_BLOCK).
 
 Recipe use: a `[[prep]]` step with `args = ["{out}/assets"]`. Toolchain: PLOW_NVCC (default
-/usr/local/cuda/bin/nvcc), NVCC_PREPEND_FLAGS / NVCC_APPEND_FLAGS as for build_sm90a_cubin.sh.
+/usr/local/cuda/bin/nvcc), PLOW_NVCC_PATH, NVCC_PREPEND_FLAGS / NVCC_APPEND_FLAGS as for build_sm90a_cubin.sh.
 """
 import os
 import pathlib
@@ -24,7 +24,7 @@ def command(nvcc, out):
 
 def build(assets):
     nvcc = os.environ.get("PLOW_NVCC", "/usr/local/cuda/bin/nvcc")
-    env = {"PATH": f"{os.path.dirname(nvcc)}:/usr/bin:/bin"}
+    env = {"PATH": os.environ.get("PLOW_NVCC_PATH") or f"{os.path.dirname(nvcc)}:/usr/bin:/bin"}
     for k in ("NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS"):
         if os.environ.get(k):
             env[k] = os.environ[k]
