@@ -32,6 +32,7 @@ nix develop --command env \
   PLOW_MAX_CHUNK=2048 \
   ./target/release/plowc \
   --hf-dir $CKPT \
+  --served-name gemma-4-12b-it \
   --out $ASSETS
 ```
 <!-- /plow:recipe:emit -->

@@ -128,7 +128,7 @@ max_ctx = 16384
 precision = "w8a8"
 
 [emit]
-args = ["--segmented"]
+args = ["--segmented", "--served-name", "gemma-4-12b-it-fp8"]
 [emit.env]
 PLOW_GLU_QUANT_FUSE = "1"
 # Decode B=128 attention: light FP8 attention, 16-byte K loads, direct V conversion. The light
@@ -237,7 +237,7 @@ outlen = 128
 warmups = 2
 seed = 42
 tokenizer = "{env:GEMMA12B_CHECKPOINT}"
-model_id = "checkpoint"
+model_id = "gemma-4-12b-it-fp8"
 gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one short sentence.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
 
 [bench.profiles.realtime]

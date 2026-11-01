@@ -89,7 +89,7 @@ CC = "/usr/bin/gcc-14"
 
 [emit]
 emit = "devblob+cubin"
-args = []
+args = ["--served-name", "qwen3.8-27b-fp8"]
 [emit.env]
 PLOW_FP8 = "1"
 PLOW_W8A8 = "1"
@@ -129,7 +129,6 @@ outlen = 128
 warmups = 2
 seed = 42
 tokenizer = "{env:QWEN38_FP8_CHECKPOINT}"
-# The served slug (the checkpoint directory basename, lowercased), not "checkpoint".
 model_id = "qwen3.8-27b-fp8"
 gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 

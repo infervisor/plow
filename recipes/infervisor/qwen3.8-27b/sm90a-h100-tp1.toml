@@ -201,7 +201,7 @@ args = ["{out}/assets", "hd256", "24", "4"]
 
 [emit]
 emit = "devblob+cubin"
-args = []
+args = ["--served-name", "qwen3.8-27b"]
 [emit.env]
 PLOW_QWEN_PREFILL = "128,512,1024,4096"
 PLOW_DECODE_BATCH = "4"
@@ -305,7 +305,7 @@ outlen = 128
 warmups = 2
 seed = 42
 tokenizer = "{env:QWEN38_CHECKPOINT}"
-model_id = "checkpoint"
+model_id = "qwen3.8-27b"
 gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 # Served c1 (grid43full, docs/bringup/results/qwen38-27b-h100/comparison.md): vLLM 0.28 at the same
