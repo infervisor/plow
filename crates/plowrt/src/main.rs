@@ -4231,9 +4231,7 @@ async fn bringup_runtime(
                     slug: slug.clone(),
                     model: slug.clone(),
                     tp: plowrt::serve::manager::tp_degree(dir)?,
-                    required: plan.tensor_total()
-                        + plowrt::serve::manager::DEFAULT_OVERHEAD
-                        + plowrt::serve::manager::RESERVE,
+                    required: plan.required(plan.overhead_bound) + plowrt::serve::manager::RESERVE,
                     device: None,
                 });
             }

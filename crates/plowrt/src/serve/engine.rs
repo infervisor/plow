@@ -458,6 +458,17 @@ impl ServeEngine {
         }
     }
 
+    /// Free device memory the KV admission budget leaves unbudgeted. A co-resident load that
+    /// takes it starves this engine's admission.
+    pub fn kv_admit_reserve(&self) -> u64 {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.kv_admit_reserve(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
     /// KV bytes one cache row takes (0: unknown).
     pub fn kv_row_bytes(&self) -> u64 {
         match self {
