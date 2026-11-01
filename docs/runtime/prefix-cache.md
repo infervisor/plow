@@ -131,7 +131,7 @@ snapshot is never freed on any path (LRU, retire, radix leaf eviction, strict pu
 eviction; a node's snapshots are freed one by one so each unlinks while the rest are indexed); `parent.rows < rows` and the parent lies on the chain; children sets hold
 retained ids only; a retire needs exactly one retained continuation.
 
-### Host tier: level 2 of the LRU (`PLOW_VMM_HOST_CACHE_MIB`)
+### Host tier: level 2 of the LRU (`PLOW_HOST_KVCACHE_SIZE`)
 
 Production's loss is retention: at 300-370 requests/min the device holds a prompt end for 47-57 s
 against a median think time of 45 s, so a quarter of the turns come back after their end was
@@ -194,7 +194,7 @@ lives, spills (the store's pinned host tier) or dies; the
 store owns the bytes. Copies run as one `plow_kv_segcopy` launch per publish or attach.
 The host tier is on by default and sized by the host-reserve rule: `MemAvailable` minus an
 eighth of RAM (at least 16 GiB), capped at a quarter of RAM, at start, and it stops growing for good if `MemAvailable` would
-fall under that reserve (`kv store: host tier frozen`); `PLOW_VMM_HOST_CACHE_MIB` names a size
+fall under that reserve (`kv store: host tier frozen`); `PLOW_HOST_KVCACHE_SIZE` names a size
 instead, under the same rule.
 `/metrics`: `plowrt_kv_store_*` (residency per tier, dedup hits, fills, reclaims, refusals,
 spills, restores, publishes, gathers, segments, launches). Recurrent models (Qwen3.8 GDN) get

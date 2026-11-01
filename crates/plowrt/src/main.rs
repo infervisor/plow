@@ -1046,6 +1046,10 @@ impl SelectArgs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = plowrt::knob_spec::refuse_renamed_env() {
+        eprintln!("plowrt: {e}");
+        std::process::exit(2);
+    }
     // Before the runtime starts threads and before the CLI reads the environment.
     let asset_defaults = apply_asset_env_defaults();
     let result = tokio::runtime::Builder::new_multi_thread()
