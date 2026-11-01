@@ -191,6 +191,12 @@ const QWEN_PF_GRAPH: Status = Status::Candidate {
 /// The packed compact terminal ran its lm_head on the prefill object's tiled MMA arm: one
 /// 1.8-2.0 ms window per tick (seg960 at 4K) for 2.5 GB of weights, ~40% of the byte floor;
 /// the routed decode rungs read the same weights through cuBLASLt at ~2.6 TB/s.
+const FP8_BLOCK_NATIVE: Status = Status::Candidate {
+    evidence: &[
+        "packet-declared native block-FP8 decode object (segment_roles NATIVE_DECODE_FP8_BLOCK); single-projection screen in the qwen FP8 decode campaign",
+        "`=0` serves the declared projections on cuBLASLt (same packet A/B)",
+    ],
+};
 const TERMINAL_LT: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (srvprof_clk15k, segtime108): one interp_pf window of 1.8-2.0 ms per mixed tick = the compact terminal (gather, norm, head, argmax, fin) at 4K and 15K",
@@ -992,6 +998,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lt_algos_write", Some("PLOW_LT_ALGOS_WRITE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.lt_pair", Some("PLOW_LT_PAIR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.lt_rung_algos", Some("PLOW_LT_RUNG_ALGOS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.fp8_block_native", Some("PLOW_NV_FP8_BLOCK_NATIVE"), Layer::Runtime, Domain::Bool, ON, FP8_BLOCK_NATIVE),
     KnobSpec::new("rt.lt_fp8_fast_accum_max_k", Some("PLOW_LT_FP8_FAST_ACCUM_MAX_K"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_norm_row_blocks", Some("PLOW_PF_NORM_ROW_BLOCKS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),

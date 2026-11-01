@@ -1842,6 +1842,12 @@ pub(super) fn run(
         )
         .unwrap_or_else(|error| panic!("generated kernels: {error}"));
     }
+    // PLOW_EMIT_DECODE_FP8_BLOCK: the measured decode block-FP8 projections on the native object.
+    if emit_config::active().decode_fp8_block {
+        let routed = crate::dense_cublaslt::apply_fp8_block(&m, &mut sections, Path::new(out))
+            .unwrap_or_else(|error| panic!("native FP8 block decode: {error}"));
+        eprintln!("  native FP8 block decode: {routed} projection segments");
+    }
     // PLOW_EMIT_ATTN_LIBRARY: the declared library segments keep the roles chosen above.
     let selected = crate::library_attention::apply_output_object(&m, &mut sections, Path::new(out))
         .unwrap_or_else(|error| panic!("library attention: {error}"));

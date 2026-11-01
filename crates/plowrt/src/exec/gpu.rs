@@ -90,6 +90,7 @@ use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
 mod fish_depth;
 pub use fish_depth::{FishInfo, FishRow};
+mod fp8_block;
 mod gen_decode;
 mod mixed_step;
 mod moe_lt;
@@ -5594,6 +5595,23 @@ impl GpuEngine {
         } else {
             None
         };
+        let fp8_block = match (
+            &cublaslt,
+            segment_roles.as_ref().and_then(|r| {
+                r.objects
+                    .get(&plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK)
+            }),
+        ) {
+            (Some(cublaslt::ProjectionBackend::Lt(_)), Some(object)) => {
+                fp8_block::Fp8Block::load(&be, assets_dir, object, profile.tag)?
+            }
+            (_, Some(_)) => {
+                return Err(RuntimeError::Rejected(
+                    "native FP8 block object requires cuBLASLt decode projections".into(),
+                ))
+            }
+            _ => None,
+        };
         let cublaslt_prefill = if prefill_cublaslt_enabled {
             let lt = match &cublaslt {
                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
@@ -5861,6 +5879,7 @@ impl GpuEngine {
         let projection_decode = if let Some(lt) = &cublaslt {
             cublaslt::library_routes(cublaslt::prepare_routes(
                 lt,
+                fp8_block.as_ref(),
                 cublaslt_segments,
                 &mut insts,
                 &devp,
@@ -6179,6 +6198,7 @@ impl GpuEngine {
                         };
                         let routes = cublaslt::prepare_routes(
                             lt,
+                            fp8_block.as_ref(),
                             segments,
                             &mut insts,
                             &devp,
@@ -11584,6 +11604,7 @@ impl GpuEngine {
                             "cuBLASLt prefill roles require the BF16 library backend".into(),
                         )
                     })?,
+                    None,
                     projection_segments,
                     &mut h_inst,
                     devp,

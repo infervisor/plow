@@ -2007,6 +2007,7 @@ pub(super) enum ProjectionBackend {
 enum ProjectionPlan {
     Lt(Arc<crate::device::cuda::lt::Plan>),
     Native(native_decode::Plan),
+    Fp8Block(fp8_block::Plan),
     Folded,
 }
 
@@ -2015,6 +2016,7 @@ impl ProjectionPlan {
         match self {
             Self::Lt(p) => p.run(input, weight, output, stream),
             Self::Native(p) => p.run(input, weight, output, stream),
+            Self::Fp8Block(p) => p.run(input, weight, output, stream),
             Self::Folded => Ok(()),
         }
     }
@@ -2162,6 +2164,7 @@ pub(super) fn ordered_waits_for(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_routes(
     backend: &ProjectionBackend,
+    fp8_block: Option<&Arc<fp8_block::Fp8Block>>,
     segments: Vec<Option<DecodeSegment>>,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
@@ -2206,6 +2209,7 @@ pub(super) fn prepare_routes(
     let mut plans = std::collections::HashMap::new();
     let mut pair_plans = std::collections::HashMap::new();
     let mut fp8_plans = 0usize;
+    let mut fp8_native = 0usize;
     let mut pairs = 0usize;
     let mut index = 0;
     while index < segments.len() {
@@ -2288,15 +2292,27 @@ pub(super) fn prepare_routes(
                 .nv
                 .lt_fp8_fast_accum_max_k
                 .is_some_and(|max_k| segment.k <= max_k);
-            let plan = ProjectionPlan::Lt(lt.fp8_plan(
-                lt_m,
-                segment.n,
-                segment.k,
-                scales[1],
-                scales[0],
-                !decode && fast_k && !segment.block,
-                segment.block,
-            )?);
+            let native = match fp8_block.filter(|_| segment.block && decode) {
+                Some(owner) => owner.plan(
+                    segment.m, segment.n, segment.k, input, weight, scales[0], scales[1],
+                )?,
+                None => None,
+            };
+            let plan = match native {
+                Some(plan) => {
+                    fp8_native += 1;
+                    ProjectionPlan::Fp8Block(plan)
+                }
+                None => ProjectionPlan::Lt(lt.fp8_plan(
+                    lt_m,
+                    segment.n,
+                    segment.k,
+                    scales[1],
+                    scales[0],
+                    !decode && fast_k && !segment.block,
+                    segment.block,
+                )?),
+            };
             fp8_plans += 1;
             insts[segment.instruction].op = DevOp::Nop as u16;
             routes.push(Some(CublasLtDecodeRoute {
@@ -2484,6 +2500,7 @@ pub(super) fn prepare_routes(
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
         fp8_plans,
+        fp8_native,
         pairs,
         native = matches!(backend, ProjectionBackend::Native(_)),
         "projection routes prepared"
