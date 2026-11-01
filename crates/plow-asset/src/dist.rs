@@ -669,17 +669,16 @@ fn is_plain_name(s: &str) -> bool {
     matches!(c.next(), Some(std::path::Component::Normal(_))) && c.next().is_none()
 }
 
-/// An objset object name: one plain component, or one under [`SEGMENT_OBJECTS_DIR`].
+/// An objset object name: one plain component, or one under [`SEGMENT_OBJECTS_DIR`]. Checked
+/// segment by segment as written: `Path` would drop a trailing `/` or `/.` and pass a name
+/// that materializes as a directory.
 fn is_object_name(s: &str) -> bool {
-    // `Path` drops a trailing separator, so `x/` would pass as a plain name and land as a
-    // directory; `objects` itself is the directory; `\` is a separator elsewhere.
-    !s.ends_with('/')
-        && !s.contains('\\')
-        && s != SEGMENT_OBJECTS_DIR
-        && (is_plain_name(s)
-            || s.strip_prefix(SEGMENT_OBJECTS_DIR)
-                .and_then(|rest| rest.strip_prefix('/'))
-                .is_some_and(is_plain_name))
+    let plain = |seg: &str| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\');
+    match s.split('/').collect::<Vec<_>>().as_slice() {
+        [name] => plain(name) && *name != SEGMENT_OBJECTS_DIR,
+        [dir, name] => *dir == SEGMENT_OBJECTS_DIR && plain(name),
+        _ => false,
+    }
 }
 
 /// A path that stays under the directory it is joined to: relative, `/`

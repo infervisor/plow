@@ -825,6 +825,10 @@ fn objset_rejects_structural_damage() {
         "objects/../x.elf",
         "objects/d/x.elf",
         "objects//x.elf",
+        "objects",
+        "objects/x.cubin/.",
+        "x.elf/.",
+        "objects/..\\x.elf",
     ] {
         let mut o = base.clone();
         o.objects[0].name = name.into();

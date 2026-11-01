@@ -1042,7 +1042,10 @@ fn a_target_that_ships_objects_needs_them_somewhere() {
     )
     .unwrap_err()
     .to_string();
-    assert!(e.contains("no *.cubin, *.aot or objects/ objects found"), "{e}");
+    assert!(
+        e.contains("no *.cubin, *.aot or objects/ objects found"),
+        "{e}"
+    );
 }
 
 /// The GDN prefill library is loaded from beside the packet, so it travels
