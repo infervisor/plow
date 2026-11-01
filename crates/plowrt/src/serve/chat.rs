@@ -168,6 +168,7 @@ async fn chat_completions_with(
             if let Some(Err(e)) = ensured {
                 return match e {
                     EnsureError::WontFit { .. }
+                    | EnsureError::NoKvRoom(_)
                     | EnsureError::SwitchTimeout(_)
                     | EnsureError::Backoff { .. } => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,

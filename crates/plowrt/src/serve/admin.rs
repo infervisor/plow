@@ -682,6 +682,8 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
             // what is already resident. Retrying unchanged will not help;
             // asking for eviction, or unloading something, will.
             Err(e @ EnsureError::WontFit { .. }) => err(StatusCode::CONFLICT, e),
+            // Loaded and rolled back: the device cannot back one full-context sequence.
+            Err(e @ EnsureError::NoKvRoom(_)) => err(StatusCode::INSUFFICIENT_STORAGE, e),
             Err(e @ EnsureError::Unloaded) => err(StatusCode::CONFLICT, e),
             Err(EnsureError::Load(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
             Err(e @ (EnsureError::SwitchTimeout(_) | EnsureError::Backoff { .. })) => {
@@ -848,6 +850,9 @@ async fn dp_load(state: &Arc<AppState>, keys: Vec<String>, evict: bool) -> Respo
             Ok(ms) => load_ms = load_ms.max(ms),
             Err(e @ (EnsureError::WontFit { .. } | EnsureError::Unloaded)) => {
                 return err(StatusCode::CONFLICT, format_args!("{key}: {e}"))
+            }
+            Err(e @ EnsureError::NoKvRoom(_)) => {
+                return err(StatusCode::INSUFFICIENT_STORAGE, format_args!("{key}: {e}"))
             }
             Err(e @ (EnsureError::SwitchTimeout(_) | EnsureError::Backoff { .. })) => {
                 return err(StatusCode::SERVICE_UNAVAILABLE, format_args!("{key}: {e}"))

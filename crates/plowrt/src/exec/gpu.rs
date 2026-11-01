@@ -8249,6 +8249,11 @@ impl GpuEngine {
         Some(budget)
     }
 
+    /// Free device memory this engine's KV admission leaves unbudgeted (fixed at load).
+    pub fn kv_admit_reserve(&self) -> u64 {
+        self.kv_admit_reserve
+    }
+
     pub fn kv_pressure_events(&self) -> u64 {
         self.kv_pressure_events
     }

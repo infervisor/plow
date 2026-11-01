@@ -146,12 +146,24 @@ pub struct BlobPlan {
     pub other_bytes: u64,
     /// Speech pipeline sibling packets, allocated when the pipeline binds after the engine load.
     pub sidecar_bytes: u64,
+    /// Non-tensor load overhead charged until a load of this bundle measures it:
+    /// [`DEFAULT_OVERHEAD`] plus the prefill graphs a CUDA load warms ([`seg_graph_bound`]).
+    pub overhead_bound: u64,
+    /// KV one sequence at the planned context maps on admission, beyond the planned tensors.
+    /// A resident model keeps at least this much admission budget.
+    pub min_kv_bytes: u64,
 }
 
 impl BlobPlan {
     /// Sum of the planned tensor bytes.
     pub fn tensor_total(&self) -> u64 {
         self.weights_bytes + self.kv_bytes + self.other_bytes + self.sidecar_bytes
+    }
+
+    /// What a resident engine of this plan holds: its tensors, `overhead` and one full-context
+    /// sequence's KV.
+    pub fn required(&self, overhead: u64) -> u64 {
+        self.tensor_total() + overhead + self.min_kv_bytes
     }
 
     /// Bytes of this model's load the weight slab can satisfy from pooled
@@ -221,6 +233,8 @@ impl BlobPlan {
             kv_bytes: 0,
             other_bytes: 0,
             sidecar_bytes: sidecar_bytes(&pkt)?,
+            overhead_bound: DEFAULT_OVERHEAD,
+            min_kv_bytes: 0,
         };
         for t in &blob.tensors {
             plan.add(&t.name, t.bytes);
@@ -228,6 +242,7 @@ impl BlobPlan {
         #[cfg(feature = "cuda")]
         if let Some((granularity, capability)) = device_vmm {
             let config = crate::config::RuntimeConfig::get();
+            plan.overhead_bound += seg_graph_bound(&blob);
             let manifest = match narrowed {
                 true => blob.with_packet_view(plow_asset::live_kv::emit).ok(),
                 false => crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?,
@@ -330,6 +345,7 @@ impl BlobPlan {
                         })?
                         + resident
                         + crate::memory::vmm::kv_pool_cap();
+                plan.min_kv_bytes = demand_virtual_bytes / u64::from(geo.batch.max(1));
             } else if let Some(layout) = prefix_layout {
                 let geo = &layout.geo;
                 geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
@@ -346,6 +362,7 @@ impl BlobPlan {
                 plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
                     RuntimeError::Rejected("prefix KV plan tensor classification".into())
                 })? + crate::memory::vmm::kv_pool_cap();
+                plan.min_kv_bytes = virtual_bytes / u64::from(geo.batch.max(1));
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -355,6 +372,29 @@ impl BlobPlan {
 }
 
 const GRAPH_BYTES_PER_PROGRAM: u64 = 320 << 10;
+
+/// Device bytes a CUDA load's prefill graph warmup takes per prefill segment and decode slot,
+/// across the whole-chain and routed-piece graphs it captures. Measured on H100: 6.1 KiB
+/// (Gemma-4 E4B BF16), 8.1 KiB (12B FP8), 9.3 KiB (26B FP8).
+const SEG_GRAPH_BYTES_PER_SEGMENT_SLOT: u64 = 12 << 10;
+
+/// Bound on the device memory `GpuEngine::load` takes warming prefill segment graphs: every
+/// segmented prefill program is captured for every decode slot. Up to 8.9 GiB on an H100, the
+/// bulk of a CUDA engine's non-tensor overhead.
+fn seg_graph_bound(blob: &DevBlob) -> u64 {
+    let nv = &crate::config::RuntimeConfig::get().nv;
+    if !nv.pf_seg_graph || nv.pf_seg_time || nv.pf_seg_fatonly {
+        return 0;
+    }
+    let slots = blob.decode_prog().map_or(0, |g| u64::from(g.t));
+    let segments: u64 = blob
+        .prefill_progs()
+        .iter()
+        .map(|p| p.stream.iter().map(|e| e.seg as u64 + 1).max().unwrap_or(1))
+        .filter(|&n| n > 1)
+        .sum();
+    segments * slots * SEG_GRAPH_BYTES_PER_SEGMENT_SLOT
+}
 
 /// Device bytes of the speech pipeline's sibling packets beside `pkt` ([`sidecar_files`]),
 /// bound after the engine load. Each binds a CUDA
@@ -501,6 +541,9 @@ pub enum EnsureError {
     /// Even after evicting every other resident model the target cannot fit.
     /// Shed with 503 + Retry-After.
     WontFit { need: u64, free: u64 },
+    /// The model loaded, but left it (or a co-resident model) less KV admission budget than
+    /// one sequence at its full context commits, so the load was rolled back. Says why.
+    NoKvRoom(String),
     /// The operator unloaded this model (or is unloading it). Demand loading is
     /// deliberately NOT attempted — otherwise the next request would silently
     /// undo the unload. Cleared by an explicit load.
@@ -530,9 +573,9 @@ impl EnsureError {
     /// Retry-After for a shed request, `None` when retrying unchanged cannot help.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            EnsureError::WontFit { .. } | EnsureError::SwitchTimeout(_) => {
-                Some(Duration::from_secs(30))
-            }
+            EnsureError::WontFit { .. }
+            | EnsureError::NoKvRoom(_)
+            | EnsureError::SwitchTimeout(_) => Some(Duration::from_secs(30)),
             EnsureError::Backoff { retry_after, .. } => Some(*retry_after),
             EnsureError::Unloaded | EnsureError::Load(_) => None,
         }
@@ -548,6 +591,7 @@ impl std::fmt::Display for EnsureError {
                 need >> 20,
                 free >> 20
             ),
+            EnsureError::NoKvRoom(why) => write!(f, "model does not fit: {why}"),
             EnsureError::Unloaded => write!(
                 f,
                 "model was unloaded by the operator — load it again to serve it"
@@ -793,8 +837,13 @@ pub struct ModelManager {
     switch: tokio::sync::Mutex<()>,
     /// slug → last request time (LRU eviction order).
     last_use: Mutex<FxHashMap<String, Instant>>,
-    /// slug → measured non-tensor overhead (first-load calibration).
-    overhead: Mutex<FxHashMap<String, u64>>,
+    /// Assets dir → the largest non-tensor overhead a load of it measured. Keyed by bundle, not
+    /// slug: every slug serving one bundle loads the same engine, and a reload measures less
+    /// (the driver keeps freed graph memory for reuse), so the largest measurement stands.
+    overhead: Mutex<FxHashMap<PathBuf, u64>>,
+    /// Resident slug → free memory it needs to keep admitting one full-context sequence: its KV
+    /// admission reserve plus that sequence's KV. A co-resident load must leave it free.
+    kv_claims: Mutex<FxHashMap<String, u64>>,
     /// Optional VRAM budget cap (bytes): the planner pretends the card has
     /// only this much. Forces switching on hardware where models co-fit
     /// (tests, A/B) — `PLOW_VRAM_BUDGET_MIB` in `main`.
@@ -966,6 +1015,7 @@ impl ModelManager {
             switch: tokio::sync::Mutex::new(()),
             last_use: Mutex::new(FxHashMap::default()),
             overhead: Mutex::new(FxHashMap::default()),
+            kv_claims: Mutex::new(FxHashMap::default()),
             budget,
             last_switch: Mutex::new(None),
             growing: std::sync::atomic::AtomicBool::new(false),
@@ -1043,9 +1093,12 @@ impl ModelManager {
         let Some(i) = models.iter().position(|m| m.slug == slug) else {
             return false;
         };
-        models.remove(i);
+        let dir = models.remove(i).dir;
+        let shared = models.iter().any(|m| m.dir == dir);
         drop(models);
-        self.overhead.lock().remove(slug);
+        if !shared {
+            self.overhead.lock().remove(&dir);
+        }
         self.last_use.lock().remove(slug);
         self.failed.lock().remove(slug);
         tracing::info!(%slug, "planner: model deregistered");
@@ -1082,17 +1135,21 @@ impl ModelManager {
             .map(|m| m.plan)
     }
 
-    /// Planner requirement for `slug`: tensor total + (measured|default)
-    /// overhead. `None` for unmanaged slugs.
+    /// Planner requirement for `slug`: [`BlobPlan::required`] at its bundle's measured overhead,
+    /// or the plan's bound before any load of the bundle measured one. First loads, reloads and
+    /// residents are all charged this. `None` for unmanaged slugs.
     pub fn required(&self, slug: &str) -> Option<u64> {
         let m = self.managed(slug)?;
-        let ovh = self
-            .overhead
-            .lock()
-            .get(slug)
-            .copied()
-            .unwrap_or(DEFAULT_OVERHEAD);
-        Some(m.plan.tensor_total() + ovh)
+        Some(Self::charge(&m, &self.overhead.lock()))
+    }
+
+    fn charge(m: &Managed, overhead: &FxHashMap<PathBuf, u64>) -> u64 {
+        m.plan.required(
+            overhead
+                .get(&m.dir)
+                .copied()
+                .unwrap_or(m.plan.overhead_bound),
+        )
     }
 
     /// Least-recently-used resident model other than `target`, idle ones first.
@@ -1192,10 +1249,17 @@ impl ModelManager {
         })
     }
 
-    /// Bytes a load may plan on: free VRAM plus `credit` (reusable pooled chunks), but never
-    /// what resident models are planned to still commit (live KV slots, KV pools).
+    /// Bytes a load may plan on: free VRAM plus `credit` (reusable pooled chunks) less what
+    /// residents need free to keep admitting ([`Self::kv_claims`]), but never what resident
+    /// models are planned to still commit (live KV slots, KV pools).
     fn fit_capacity(&self, credit: u64) -> Result<u64> {
-        Ok((self.free_vram()? + credit).min(self.planned_headroom()?))
+        Ok((self.free_vram()? + credit)
+            .saturating_sub(self.kv_claimed())
+            .min(self.planned_headroom()?))
+    }
+
+    fn kv_claimed(&self) -> u64 {
+        self.kv_claims.lock().values().sum()
     }
 
     /// The device (or budget) less every resident model's planned requirement.
@@ -1208,9 +1272,7 @@ impl ModelManager {
             .read()
             .iter()
             .filter(|m| self.is_resident(&m.slug))
-            .map(|m| {
-                m.plan.tensor_total() + overhead.get(&m.slug).copied().unwrap_or(DEFAULT_OVERHEAD)
-            })
+            .map(|m| Self::charge(m, &overhead))
             .sum();
         Ok(cap.saturating_sub(planned))
     }
@@ -1404,6 +1466,14 @@ impl ModelManager {
                         return Err(EnsureError::WontFit { need, free });
                     };
                     tracing::warn!(%slug, %victim, error = %e, "planner: switch load out of memory — evicting");
+                    let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
+                    report.evicted.push((victim, drain_ms, unload_ms));
+                }
+                Err(e @ EnsureError::NoKvRoom(_)) => {
+                    let Some(victim) = self.lru_victim(slug) else {
+                        return Err(e);
+                    };
+                    tracing::warn!(%slug, %victim, error = %e, "planner: switch left no KV room — evicting");
                     let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
                     report.evicted.push((victim, drain_ms, unload_ms));
                 }
@@ -1641,6 +1711,7 @@ impl ModelManager {
     fn preload_candidate(&self) -> Option<String> {
         let pool = self.device.pool_bytes();
         let (free, headroom) = (self.free_vram().ok()?, self.planned_headroom().ok()?);
+        let claimed = self.kv_claimed();
         let state = self.state.upgrade()?;
         // Cloned out first: `required` takes the models lock again, and a recursive read behind
         // a queued registration's write deadlocks.
@@ -1653,8 +1724,9 @@ impl ModelManager {
             .filter(|m| self.load_backoff(m).is_ok())
             .filter(|m| {
                 let credit = pool.min(m.plan.slab_reusable());
-                self.required(&m.slug)
-                    .is_some_and(|need| need + RESERVE <= (free + credit).min(headroom))
+                self.required(&m.slug).is_some_and(|need| {
+                    need + RESERVE <= (free + credit).saturating_sub(claimed).min(headroom)
+                })
             })
             .map(|m| m.slug.clone())
             .collect();
@@ -1707,6 +1779,7 @@ impl ModelManager {
 
         let t1 = Instant::now();
         let engine = state.remove_gpu_engine(slug);
+        self.kv_claims.lock().remove(slug);
         if let Some(e) = &engine {
             let holders = Arc::strong_count(e);
             if holders > 1 {
@@ -1916,7 +1989,8 @@ impl ModelManager {
         let measured = used.saturating_sub(m.plan.tensor_total() - m.plan.sidecar_bytes);
         self.overhead
             .lock()
-            .entry(m.slug.clone())
+            .entry(m.dir.clone())
+            .and_modify(|o| *o = (*o).max(measured))
             .or_insert(measured);
         tracing::info!(
             slug = %m.slug,
@@ -1945,10 +2019,67 @@ impl ModelManager {
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(EnsureError::Load(e));
         }
+        if let Err(e) = self.claim_kv(&state, &m.slug) {
+            tracing::warn!(slug = %m.slug, error = %e, "planner: loaded model left without KV room — unloading");
+            let _ = self.evict(&m.slug, Stop::Now).await;
+            return Err(e);
+        }
         let mux = mux::spawn(m.slug.clone(), bundle, Arc::clone(&state), self.mux_cfg);
         state.install_mux(m.slug.clone(), mux);
         Ok(())
     }
+
+    /// After `slug`'s load and before its mux: refuse it unless its KV admission budget backs
+    /// one sequence at its full context and the device still leaves every co-resident model
+    /// its claim; otherwise record its own claim.
+    fn claim_kv(&self, state: &AppState, slug: &str) -> std::result::Result<(), EnsureError> {
+        let Some(engine) = state.gpu_engine(slug) else {
+            return Ok(());
+        };
+        let (budget, reserve, ctx) = {
+            let e = engine.lock();
+            (e.kv_admission_budget(), e.kv_admit_reserve(), e.max_ctx())
+        };
+        let Some(budget) = budget else {
+            return Ok(());
+        };
+        let need = budget.bytes_for_rows(ctx as u64);
+        if need > budget.budget_bytes {
+            return Err(EnsureError::NoKvRoom(format!(
+                "{slug} loaded with a {} MiB KV admission budget and one {ctx}-token sequence \
+                 needs {} MiB",
+                budget.budget_bytes >> 20,
+                need >> 20
+            )));
+        }
+        let free = self.free_vram().map_err(EnsureError::Load)?;
+        let mut claims = self.kv_claims.lock();
+        let others: u64 = claims
+            .iter()
+            .filter(|(s, _)| s.as_str() != slug)
+            .map(|(_, &c)| c)
+            .sum();
+        check_co_tenant_claims(slug, free, others)?;
+        claims.insert(slug.to_string(), reserve + need);
+        Ok(())
+    }
+}
+
+/// `free` after `slug` loaded must still cover what co-resident models claim.
+fn check_co_tenant_claims(
+    slug: &str,
+    free: u64,
+    claimed: u64,
+) -> std::result::Result<(), EnsureError> {
+    if free < claimed {
+        return Err(EnsureError::NoKvRoom(format!(
+            "loading {slug} leaves {} MiB free and the co-resident models need {} MiB to keep \
+             admitting one full-context sequence each",
+            free >> 20,
+            claimed >> 20
+        )));
+    }
+    Ok(())
 }
 
 /// A load that would put a second engine on a device needing round-robin turns while its
@@ -2044,6 +2175,8 @@ mod tests {
             kv_bytes: 0,
             other_bytes: 0,
             sidecar_bytes: 0,
+            overhead_bound: 0,
+            min_kv_bytes: 0,
         };
         p.add("model.layers.0.self_attn.q_proj.weight", 100);
         p.add("fp8/model.layers.0.mlp.down_proj", 50);
@@ -2084,6 +2217,8 @@ mod tests {
             kv_bytes: 0,
             other_bytes: 0,
             sidecar_bytes: 0,
+            overhead_bound: 0,
+            min_kv_bytes: 0,
         };
         let weights = [
             "lm_head.weight",
@@ -2150,29 +2285,45 @@ mod tests {
 
     /// A manager over one model, `m` in `dir`, whose every load fails (no registry entry).
     fn failing_manager(dir: &Path) -> (Arc<AppState>, Arc<ModelManager>) {
-        let backend: Arc<dyn crate::device::Backend> =
-            Arc::new(crate::device::cpu::CpuBackend::new(1));
-        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
-        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
         let plan = BlobPlan {
             weights_bytes: 1 << 20,
             kv_bytes: 0,
             other_bytes: 0,
             sidecar_bytes: 0,
+            overhead_bound: DEFAULT_OVERHEAD,
+            min_kv_bytes: 0,
         };
+        manager_over(Arc::new(HostManagerDevice::new()), &[("m", dir, plan)])
+    }
+
+    /// A manager over `models` on `device`, none of them loadable (no registry entry).
+    fn manager_over(
+        device: Arc<dyn ManagerDevice>,
+        models: &[(&str, &Path, BlobPlan)],
+    ) -> (Arc<AppState>, Arc<ModelManager>) {
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
         let mgr = Arc::new(ModelManager {
             state: Arc::downgrade(&state),
-            device: Arc::new(HostManagerDevice::new()),
+            device,
             mux_cfg: MuxConfig::default(),
-            models: RwLock::new(vec![Managed {
-                slug: "m".into(),
-                dir: dir.into(),
-                ckpt: dir.into(),
-                plan,
-            }]),
+            models: RwLock::new(
+                models
+                    .iter()
+                    .map(|&(slug, dir, plan)| Managed {
+                        slug: slug.into(),
+                        dir: dir.into(),
+                        ckpt: dir.into(),
+                        plan,
+                    })
+                    .collect(),
+            ),
             switch: tokio::sync::Mutex::new(()),
             last_use: Mutex::default(),
             overhead: Mutex::default(),
+            kv_claims: Mutex::default(),
             budget: None,
             last_switch: Mutex::new(None),
             growing: std::sync::atomic::AtomicBool::new(false),
@@ -2180,6 +2331,150 @@ mod tests {
             runtime: None,
         });
         (state, mgr)
+    }
+
+    struct Mem {
+        free: u64,
+        total: u64,
+    }
+
+    impl ManagerDevice for Mem {
+        fn device_ordinal(&self) -> u8 {
+            0
+        }
+        fn mem_info(&self) -> Result<(u64, u64)> {
+            Ok((self.free, self.total))
+        }
+        fn granularity(&self) -> Result<u64> {
+            Ok(2 << 20)
+        }
+        fn compute_capability(&self) -> Option<(u32, u32)> {
+            None
+        }
+        fn pool_bytes(&self) -> u64 {
+            0
+        }
+        fn pool_trim(&self, _: u64) -> u64 {
+            0
+        }
+        fn load_engine(&self, _: &Path, _: &Path) -> Result<crate::serve::engine::ServeEngine> {
+            unreachable!("admission refuses before loading")
+        }
+        fn is_sibling_resident(&self, _: &Path) -> bool {
+            false
+        }
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    /// The RC5 two-slug Gemma-4 E4B case: 36 GiB of tensors, 128 MiB of KV per full-context
+    /// sequence, a 7.5 GiB packet bound on the graph warmup.
+    fn e4b_plan() -> BlobPlan {
+        BlobPlan {
+            weights_bytes: 14 * GIB,
+            kv_bytes: 20 * GIB,
+            other_bytes: 2 * GIB,
+            sidecar_bytes: 0,
+            overhead_bound: DEFAULT_OVERHEAD + 7 * GIB + GIB / 2,
+            min_kv_bytes: 128 << 20,
+        }
+    }
+
+    /// Before any load of a bundle the planner charges the packet's overhead bound; after one,
+    /// every slug of that bundle is charged the largest overhead a load of it measured, with
+    /// the one-sequence KV floor on top either way.
+    #[test]
+    fn overhead_is_charged_per_bundle_and_bounded_before_a_load() {
+        let dir = Path::new("/bundle/e4b");
+        let plan = e4b_plan();
+        let (_state, mgr) = manager_over(
+            Arc::new(Mem {
+                free: 80 * GIB,
+                total: 80 * GIB,
+            }),
+            &[("a", dir, plan), ("b", dir, plan)],
+        );
+        let tensors = plan.tensor_total();
+        assert_eq!(
+            mgr.required("b"),
+            Some(tensors + plan.overhead_bound + plan.min_kv_bytes),
+            "a first load is charged the packet bound, never DEFAULT_OVERHEAD alone"
+        );
+        mgr.overhead.lock().insert(dir.into(), 3905 << 20);
+        assert_eq!(
+            mgr.required("b"),
+            Some(tensors + (3905 << 20) + plan.min_kv_bytes),
+            "a slug of a measured bundle is charged what its sibling measured"
+        );
+        assert_eq!(mgr.required("a"), mgr.required("b"));
+        // A reload measures less (the driver kept the freed graph memory); the largest stands.
+        mgr.overhead
+            .lock()
+            .entry(dir.into())
+            .and_modify(|o| *o = (*o).max(381 << 20));
+        assert_eq!(mgr.overhead.lock()[dir], 3905 << 20);
+        assert!(mgr.deregister("a"));
+        assert!(
+            mgr.overhead.lock().contains_key(dir),
+            "the bundle still serves b"
+        );
+        assert!(mgr.deregister("b"));
+        assert!(mgr.overhead.lock().is_empty());
+    }
+
+    /// A second slug that would starve the first one's KV admission is refused before it loads:
+    /// the free memory a resident needs to admit one full-context sequence is not capacity.
+    #[tokio::test]
+    async fn a_load_that_starves_a_resident_of_kv_is_refused_before_loading() {
+        let dir = Path::new("/bundle/e4b");
+        let plan = e4b_plan();
+        // e4b-a resident: 39.8 GiB used of 79 GiB, 4.3 GiB reserve + 128 MiB claimed.
+        let free = 79 * GIB - (39 * GIB + 870 * (1 << 20));
+        let (_state, mgr) = manager_over(
+            Arc::new(Mem {
+                free,
+                total: 79 * GIB,
+            }),
+            &[("b", dir, plan)],
+        );
+        mgr.overhead.lock().insert(dir.into(), 3905 << 20);
+        let need = mgr.required("b").unwrap() + RESERVE;
+        assert!(need > free, "the RC5 smoke admitted this on 36 GiB planned");
+        let e = mgr.load("b", false).await.unwrap_err();
+        assert!(
+            matches!(e, EnsureError::WontFit { need: n, .. } if n == need),
+            "{e}"
+        );
+        // Room for the tensors and overhead alone is not enough while a resident claims KV.
+        let (_state, mgr) = manager_over(
+            Arc::new(Mem {
+                free: need + GIB,
+                total: 160 * GIB,
+            }),
+            &[("b", dir, plan)],
+        );
+        mgr.overhead.lock().insert(dir.into(), 3905 << 20);
+        assert!(mgr.fit_capacity(0).unwrap() >= need);
+        mgr.kv_claims
+            .lock()
+            .insert("a".into(), 4358 * (1 << 20) + plan.min_kv_bytes);
+        assert!(mgr.fit_capacity(0).unwrap() < need);
+        let e = mgr.load("b", false).await.unwrap_err();
+        assert!(matches!(e, EnsureError::WontFit { .. }), "{e}");
+        assert_eq!(e.retry_after(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn a_load_must_leave_co_residents_their_kv_claims() {
+        assert!(check_co_tenant_claims("b", 5 * GIB, 4 * GIB).is_ok());
+        let e = check_co_tenant_claims("b", 2 * GIB, 4 * GIB).unwrap_err();
+        assert!(matches!(e, EnsureError::NoKvRoom(_)), "{e}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("2048 MiB free") && msg.contains("4096 MiB"),
+            "{msg}"
+        );
+        assert!(e.retry_after().is_some());
     }
 
     /// A model whose load failed (other than out of memory) is shed by later demand loads with
