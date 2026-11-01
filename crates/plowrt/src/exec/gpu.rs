@@ -2641,7 +2641,7 @@ pub struct GpuEngine {
     gemv_wide: Option<Arc<decode_object::BoundDecodeObject>>,
     gemv_wide_modules: [Option<Arc<decode_object::BoundDecodeObject>>; 2],
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
-    /// (bucket, slot-tensor-base, segment range) — one cuGraphLaunch replaces ~480 kernel
+    /// (bucket, tensor-table base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
     seg_graphs:
         std::collections::HashMap<(usize, u64, usize, usize), crate::device::cuda::GraphExec>,
@@ -2715,6 +2715,10 @@ pub struct GpuEngine {
     /// launch selects its table through the kernarg (`tens_slot_base`) —
     /// nothing is rewritten or restored. Empty at B == 1.
     d_tens_slots: Vec<DeviceMem>,
+    /// The table a slot > 0 chunk chain reads: slot b's table is copied in, in stream order,
+    /// before the chain. One seg graph per bucket/range then serves every slot; per-slot graphs
+    /// held ~10 KiB of driver host memory per node (12B FP8, B=128: 15k graphs, 22 GiB).
+    d_tens_pf: Option<DeviceMem>,
     _tensor_bindings: Vec<TensorBindings>,
     /// Rank-3 KV descriptors bind slot-specific addresses and outlive every slot table use.
     _kv_tmap_slots: Vec<DeviceMem>,
@@ -6632,6 +6636,11 @@ impl GpuEngine {
                 d_tens_slots.push(mem);
             }
         }
+        let d_tens_pf = if d_tens_slots.is_empty() {
+            None
+        } else {
+            Some(be.alloc(0, (ptrs.len() * 8) as u64)?)
+        };
 
         if let Some(pack) = &packed_prefill {
             for (m, table) in pack.maps.iter().zip(&packed_map_ptrs) {
@@ -7677,6 +7686,7 @@ impl GpuEngine {
             _d_gq_cursor: d_gq_cursor,
             d_tens,
             d_tens_slots,
+            d_tens_pf,
             _tensor_bindings: tensor_bindings,
             _kv_tmap_slots: kv_tmap_slots,
             _tables: vec![
@@ -7838,7 +7848,9 @@ impl GpuEngine {
             && !config.nv.pf_seg_time
             && !config.nv.pf_seg_fatonly
         {
-            let warmup_slots = engine.batch;
+            let tables: Vec<u64> = std::iter::once(engine.d_tens.base)
+                .chain(engine.d_tens_pf.as_ref().map(|m| m.base))
+                .collect();
             let t_warmup = std::time::Instant::now();
             // Routed buckets (attention-GEMM segments) are warmed too: the route only fires
             // for a slice >= pf_attn_gemm_min_rows, so a pack of short slices in a >= 1024-row
@@ -7851,14 +7863,13 @@ impl GpuEngine {
                     engine.prefill[bi].seg_class.len(),
                     &engine.prefill[bi].packet_segment_roles,
                 ) {
-                    for b in 0..warmup_slots {
+                    for &tensors in &tables {
                         let mut arg = engine.prefill[bi].kernarg;
-                        arg.tensors = engine.tens_slot_base(b);
+                        arg.tensors = tensors;
                         if let Err(e) = engine.warm_seg_graphs(bi, &arg) {
                             tracing::warn!(
                                 error = %e,
                                 bucket = bi,
-                                slot = b,
                                 "prefill seg graph warmup failed"
                             );
                             break;
@@ -7868,7 +7879,7 @@ impl GpuEngine {
             }
             tracing::info!(
                 buckets = engine.prefill.len(),
-                slots = warmup_slots,
+                tables = tables.len(),
                 graphs = engine.seg_graphs.len(),
                 elapsed_ms = t_warmup.elapsed().as_millis(),
                 "prefill seg graphs warmed up"
@@ -12403,8 +12414,16 @@ impl GpuEngine {
             (bkt.d_ctr.base, bkt.ctr_bytes, bkt.kernarg)
         };
         // Slot selection is a kernarg field: the launch reads slot b's
-        // prebuilt tensor table (kv.* shifted to its ring); nothing uploads.
-        arg.tensors = self.tens_slot_base(b);
+        // prebuilt tensor table (kv.* shifted to its ring), through the shared
+        // prefill table for b > 0.
+        arg.tensors = match (&self.d_tens_pf, b) {
+            (Some(pf), 1..) => {
+                self.be
+                    .memcpy_dtod_async(pf.base, self.tens_slot_base(b), pf.len, &self.stream)?;
+                pf.base
+            }
+            _ => self.tens_slot_base(b),
+        };
         // One async fill re-arms the bucket's counters AND its tail GQ cursor.
         self.be
             .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
