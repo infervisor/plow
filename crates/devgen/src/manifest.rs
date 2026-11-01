@@ -2675,9 +2675,35 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
     out
 }
 
+/// Opcodes whose interpreter arms compile only under their `PLOW_PACKET_HAS_*` define
+/// (`runtime/nvidia/op_elementwise.cuh` GLU_PITCHED_ARMS): derived from the arm union, so a
+/// program instruction the union misses would build objects without its case.
+const PACKET_GATED_OPS: [DevOp; 1] = [DevOp::GluPitched];
+
+/// The packet-gated opcodes some program instruction uses that `union` (which sets their
+/// `PLOW_PACKET_HAS_*` defines) does not hold.
+fn ungated_packet_ops(m: &Model, union: &BTreeSet<Arm>) -> Vec<DevOp> {
+    PACKET_GATED_OPS
+        .into_iter()
+        .filter(|&op| {
+            m.progs
+                .iter()
+                .any(|p| p.insts.iter().any(|d| d.op == op as u16))
+                && !union.iter().any(|a| a.op == op_name(op))
+        })
+        .collect()
+}
+
 fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: bool) -> Value {
     let progs = program_arms(m);
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
+    // A gated-out case traps at its first launch: refuse the packet here instead.
+    let missing = ungated_packet_ops(m, &union);
+    assert!(
+        missing.is_empty(),
+        "packet programs use {missing:?} but the object arm set does not: its \
+         PLOW_PACKET_HAS_* define would compile the case out"
+    );
     let mut objects = object_inventory(&progs, arch, packed_prefill);
     let kda_intra_wave_items_required = m.progs.iter().any(|p| {
         p.stream.iter().any(|e| {
@@ -3813,6 +3839,49 @@ mod tests {
         assert_eq!(cases["programs"][1]["kind"], "decode");
         assert_eq!(cases["programs"][1]["rows"], 8);
         assert!(cases["performance_evidence"].is_null());
+    }
+
+    #[test]
+    fn glu_pitched_compiles_only_for_a_packet_that_emits_it() {
+        let plain = config_header(&build(&model(), "sm_90a"));
+        assert!(plain.contains("#define PLOW_PACKET_HAS_GLU_PITCHED 0\n"));
+        let mut m = model();
+        m.progs[1]
+            .insts
+            .push(inst(DevOp::GluPitched, [64, 0, 32, 64, 32, 0, 0, 0]));
+        let pitched = config_header(&build(&m, "sm_90a"));
+        assert!(pitched.contains("#define PLOW_PACKET_HAS_GLU_PITCHED 1\n"));
+    }
+
+    #[test]
+    fn a_gated_op_the_object_arm_set_misses_is_refused() {
+        let mut m = model();
+        m.progs[1].insts.push(inst(DevOp::GluPitched, [0; 8]));
+        assert_eq!(
+            ungated_packet_ops(&m, &BTreeSet::new()),
+            vec![DevOp::GluPitched]
+        );
+        let union: BTreeSet<Arm> = program_arms(&m)
+            .iter()
+            .flat_map(|p| p.arms.iter().cloned())
+            .collect();
+        assert!(ungated_packet_ops(&m, &union).is_empty());
+        assert!(ungated_packet_ops(&model(), &BTreeSet::new()).is_empty());
+
+        // Segmented: the GQ stream covers segment 0 only, so its arm set misses the GluPitched
+        // instruction (a light-segment-only op) and the build refuses the packet.
+        let mut m = model();
+        let p = &mut m.progs[1];
+        p.insts = vec![inst(DevOp::Gemv, [0; 8]), inst(DevOp::GluPitched, [0; 8])];
+        let ent = |inst: u32, seg: u16| packet::dev::StreamEnt {
+            inst,
+            seg,
+            ..Default::default()
+        };
+        p.stream = vec![ent(0, 0), ent(1, 1)];
+        p.gq_stream = vec![ent(0, 0)];
+        p.gq_seg_ofs = vec![0, 1, 1];
+        assert!(std::panic::catch_unwind(|| build(&m, "sm_90a")).is_err());
     }
 
     /// The manifest must reflect the STREAM. An op nothing emitted must not

@@ -923,6 +923,18 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
 /* Op 230: d_glu over one row-pitched gate|up input (an N-concatenated projection's output),
  * per element d_glu's vector-path math: out[r*width + p] = bf16(act(g) * u),
  * g = gu[r*in_stride + p], u = gu[r*in_stride + up_col + p]. */
+/* GluPitched (an N-concatenated gate|up's GLU) compiles only for a packet that emits it: the
+ * unexecuted arms cost Gemma-4-E4B decode B1 +2.1% (interp_sm90a.cubin +2.2%, light_pf 72 -> 73
+ * registers). Without a packet config (the general objects, the harnesses) it stays. A packet
+ * that emits the op with its define at 0 is refused at emit, and the gated-out case traps. */
+#ifndef GLU_PITCHED_ARMS
+#if defined(PLOW_PACKET_HAS_GLU_PITCHED) && !PLOW_PACKET_HAS_GLU_PITCHED
+#define GLU_PITCHED_ARMS 0
+#else
+#define GLU_PITCHED_ARMS 1
+#endif
+#endif
+#if GLU_PITCHED_ARMS
 static __device__ __forceinline__ float glu_pitched_one(float g, float u, unsigned act) {
     float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh_pf(g);
 #if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
@@ -971,6 +983,7 @@ static __device__ void d_glu_pitched(__nv_bfloat16* __restrict__ out, const __nv
         out[i] = __float2bfloat16(glu_pitched_one(__bfloat162float(src[0]), __bfloat162float(src[up_col]), act));
     }
 }
+#endif /* GLU_PITCHED_ARMS */
 
 /* Greedy argmax, per-block partial. See amax_pack() in sm120_common.cuh for the packed-key
  * contract — it is reproduced BIT-EXACTLY from AMD, so ties break identically.

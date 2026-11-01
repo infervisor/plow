@@ -2184,10 +2184,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                       in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk);
         break;
 
+#if GLU_PITCHED_ARMS
     case PLOW_DOP_GLU_PITCHED:
         d_glu_pitched((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), in->i[0], in->i[1], in->i[2],
                       in->i[3], in->i[4], slice, nblk);
         break;
+#endif
 
 #if PLOW_NV_PREFILL && defined(PLOW_NV_PF_GEMV_HEAD) && PLOW_NV_PF_GEMV_HEAD
     /* ---- PX-6 recommendation A: the M=1 GEMV arm, in the PREFILL object, for lm_head only ----
@@ -4295,10 +4297,12 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
         d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
               in->i[0], in->i[1], slice, nblk);
         break;
+#if GLU_PITCHED_ARMS
     case PLOW_DOP_GLU_PITCHED:
         d_glu_pitched((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), in->i[0], in->i[1],
                       in->i[2], in->i[3], in->i[4], slice, nblk);
         break;
+#endif
 #if PLOW_NV_GEMMA
     case PLOW_DOP_NORM_RESIDUAL:
         d_norm_residual((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
@@ -4455,11 +4459,13 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
         d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
               in->i[0], in->i[1], slice, nblk);
         break;
+#if GLU_PITCHED_ARMS
     case PLOW_DOP_GLU_PITCHED:
         if (in->i[1] != PLOW_ACT_SILU_) __trap();
         d_glu_pitched((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), in->i[0], in->i[1],
                       in->i[2], in->i[3], in->i[4], slice, nblk);
         break;
+#endif
 #if PLOW_NV_QWEN_GDN
     /* The Qwen3.5 chain's prefill pointwise arms (exec/gpu.rs qwen_light_segments): the same
      * bodies and operands as the prefill interpreter window (the <true> fast-path
@@ -4701,6 +4707,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
         lq_store4(xq, gs, at, g * Rp + row, v, lane);
         break;
     }
+#if GLU_PITCHED_ARMS
     case PLOW_DOP_GLU_PITCHED: {
         const __nv_bfloat16* src = (const __nv_bfloat16*)LIGHT_TEN(1) + (size_t)row * in->i[3] + g * 128u + lane * 4u;
         const uint2 rg = *reinterpret_cast<const uint2*>(src);
@@ -4719,6 +4726,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
         lq_store4(xq, gs, at, g * Rp + row, v, lane);
         break;
     }
+#endif
     case PLOW_DOP_QWEN_SIGMOID_GATE: {
         const int* active = (const int*)LIGHT_TEN(3);
         float v[4];
