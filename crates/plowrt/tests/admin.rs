@@ -786,6 +786,7 @@ async fn a_rollback_waits_for_a_pending_pairing() {
 
 /// Load → deregister → register the same assets against another checkpoint: deregistration
 /// takes the dir's checkpoint pairing with it (kept, the re-registration was refused, 409).
+#[cfg(feature = "cpu")]
 #[tokio::test]
 async fn deregistration_clears_the_bundles_checkpoint_pairing() {
     use plowrt::serve::admin::pair_and_publish;
