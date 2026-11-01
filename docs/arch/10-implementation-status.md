@@ -292,8 +292,8 @@ alone is ~10.7k lines and emits the shipped GLM-5.3 TP8 programs.
 | DPU integration | 🔲 | Needed for cross-node RDMA |
 | Dynamic indirection table | 🔲 | Needed for MoE routing |
 | In-place packet rewriting | 🔲 | Fine-grained dynamism |
-| Speculative decoding, MTP assistant drafter | 🔧 | CUDA; Gemma-4 12B/26B. AMD accept kernel untested |
-| Speculative decoding, DSpark block drafter | 🔲 | Paused; D1/D2 on branch `g12-dspark`, plan in [25-dspark-pending.md](25-dspark-pending.md) |
+| Speculative decoding, MTP assistant drafter | 🔧 | CUDA; Gemma-4 12B/26B, embedded or external drafter; batch-invariant verify. AMD accept kernel untested. See [30-speculative-decoding.md](30-speculative-decoding.md) |
+| Speculative decoding, DSpark block drafter | 🔲 | Paused; D1/D2 embedded only, plan in [25-dspark-pending.md](25-dspark-pending.md); pluggable form in [30](30-speculative-decoding.md) §5 |
 | Prefix cache retention (host tier, session-end demotion) and KV block store | 🔲 | Design in [26-kv-block-store.md](26-kv-block-store.md); retention simulation done, nothing implemented |
 
 ---

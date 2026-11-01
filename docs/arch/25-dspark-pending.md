@@ -4,7 +4,8 @@
 decoder. DSpark phases D1 (target-side context) and D2 (draft program) were implemented and gated on
 branch `g12-dspark` (`e3a556c5`) and merged on 2026-10-26 (`172dd6f7b`), off unless emitted with
 `PLOW_SPEC_KIND=gemma4_dspark`; D3 (serving) is not built: `spec_serve` refuses block drafters. This page
-records what exists, what was measured and the plan to finish it.
+records what exists, what was measured and the plan to finish it. The pluggable (external drafter)
+form and its target requirements are in [30-speculative-decoding.md](30-speculative-decoding.md) §5.
 
 ## What DSpark is
 

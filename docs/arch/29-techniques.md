@@ -838,6 +838,9 @@ Status: sm_90a (cuBLASLt decode and prefill); the HSA loader refuses contract-4 
 
 ## 6. Multi-token drafting and speculative decode
 
+External (pluggable) drafters, target identity and batch-invariant verify:
+[30-speculative-decoding.md](30-speculative-decoding.md).
+
 ### Chain drafter (MTP assistant)
 
 What it computes: a small draft network proposes `k` tokens per sequence by chaining: step `j`
