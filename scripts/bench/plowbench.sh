@@ -490,6 +490,21 @@ pb_metrics_stop() {
     PB_METRICS_PID=
 }
 
+# pb_host_start <resdir> <root-pid> [metrics-url] / pb_host_stop — sample the server's host process
+# tree (RSS, Pss, VmLck/VmPin, cores busy, threads, processes, MemAvailable, mapped libraries and,
+# with a plowrt /metrics URL, the pinned KV host tier) every PB_HOST_MS (2000) ms into
+# <resdir>/host.tsv and, on stop, the session summary <resdir>/host.json (scripts/bench/host_res.py).
+pb_host_start() {
+    python3 "$(dirname "${BASH_SOURCE[0]}")/host_res.py" sample --root-pid "$2" --json "$1/host.json" \
+        --tsv "$1/host.tsv" --interval-ms "${PB_HOST_MS:-2000}" ${3:+--metrics-url "$3"} 2> "$1/host.log" &
+    PB_HOST_PID=$!
+}
+pb_host_stop() {
+    [ -n "${PB_HOST_PID:-}" ] || return 0
+    kill "$PB_HOST_PID" 2>/dev/null; wait "$PB_HOST_PID" 2>/dev/null
+    PB_HOST_PID=
+}
+
 # pb_result <resdir> <tag> — print the result JSON path, wherever the client decided to put it.
 pb_result() {
     local res="$1" tag="$2" p

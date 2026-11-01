@@ -35,6 +35,10 @@
 # Records <resdir>/provenance.json for the strict report (serving_comparison.py render): plow needs
 # KV_DTYPE (or PRECISION) and, for a PLOWRT outside a git checkout, PLOWRT_GIT_SHA.
 # READY_S (900) bounds the server readiness wait; a large MoE load needs ~3600.
+# Host resources (scripts/bench/host_res.py, every PB_HOST_MS=2000 ms over the server's process tree):
+# host.tsv/host.json for the session, <tag>.host.json per cell, footprint.json (binary, packet or
+# site-packages and compile caches, mapped libraries, ready_s.txt), <tag>.client_time.txt (client
+# wall/user/sys s, max RSS KiB). `host_res.py report <plow-res> <vllm-res> --cell <tag>` tables them.
 # AMD host (amd-smi, no nvidia-smi): peak memory is board VRAM over the visible GPUs
 # (gpu_peak_mem.py --amd); PYREF is normally scripts/bench/vllm-rocm-client.sh (Docker image).
 # CPU host (no nvidia-smi/amd-smi): peak memory is the server's summed Pss (cpu_peak_mem.py), vLLM drops
@@ -66,6 +70,7 @@ SERVER_CONTAINER=
 VLLM_GPU_ARGS="--gpu-memory-utilization ${VLLM_MEM:-0.85}"
 [ -n "$CPU_HOST" ] && VLLM_GPU_ARGS=
 PB_SERVER_PORT=${PORT:-$(pb_free_port)} PB_SERVER_LOG=$RES/server.log
+SERVER_T0=$(date +%s.%N)
 if [ "$SIDE" = plow ]; then
     : "${ASSETS:?plow assets dir}"
     cp "${PLOWRT:-$HERE/target/release/plowrt}" "$RES/plowrt"
@@ -90,12 +95,30 @@ else
         ${VLLM_ARGS:-} > "$PB_SERVER_LOG" 2>&1 &
 fi
 PB_SERVER_PID=$!
+# Host resources of the whole server tree for the whole session (host.tsv/host.json); split per
+# cell (<tag>.host.json) and sized on disk (footprint.json) on exit: scripts/bench/host_res.py.
+host_metrics=; [ "$SIDE" = plow ] && host_metrics=http://127.0.0.1:$PB_SERVER_PORT/metrics
+pb_host_start "$RES" "$PB_SERVER_PID" "$host_metrics"
 if [ "$SIDE" = plow ]; then server_args=${SERVE_ARGS:-}
 elif [ "$SIDE" = llamacpp ]; then server_args="${LLAMA_ARGS:-}"
 else server_args="${VLLM_GPU_ARGS:+$VLLM_GPU_ARGS }--max-num-seqs 256 ${VLLM_ARGS:-}"; fi
 python3 "$HERE/scripts/bench/serving_comparison.py" record "$RES" --side "$SIDE" --hf "$HF" --reps "$REPS" \
     --server-args="$server_args" --sampled="$SAMPLED" --pyref "$PYREF" --assets "${ASSETS:-}" \
     --plowrt "${PLOWRT:-}" --repo "$HERE" ${GGUF:+--gguf "$GGUF"} ${LLAMA_IMAGE:+--llama-image "$LLAMA_IMAGE"}
+host_finish() {
+    [ -f "$RES/cells.log" ] && [ -f "$RES/host.tsv" ] && python3 "$HERE/scripts/bench/host_res.py" cells "$RES"
+    if [ "$SIDE" = plow ]; then
+        python3 "$HERE/scripts/bench/host_res.py" footprint "$RES" --side plow --plowrt "$RES/plowrt" \
+            --assets "$ASSETS" --hf "$HF"
+    else
+        python3 "$HERE/scripts/bench/host_res.py" footprint "$RES" --side "$SIDE" --pyref "$PYREF" --hf "$HF"
+    fi
+}
+# Client wall/user/sys seconds and max RSS (KiB) into <file>, when GNU time is installed.
+timed() { # file cmd...
+    local out=$1; shift
+    if [ -x /usr/bin/time ]; then /usr/bin/time -f '%e %U %S %M' -o "$out" "$@"; else "$@"; fi
+}
 memory_sampler_pid=
 memory_start() { # tag
     if [ -n "$CPU_HOST" ]; then
@@ -127,8 +150,9 @@ memory_finish() { # tag
             --root-pid "$PB_SERVER_PID" > "$RES/$1.peak_gpu_memory_mib.txt"
     fi
 }
-trap 'memory_stop; pb_metrics_stop; pb_serve_stop; [ -n "$SERVER_CONTAINER" ] && sudo -n docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1' EXIT
+trap 'memory_stop; pb_metrics_stop; pb_host_stop; pb_serve_stop; host_finish; [ -n "$SERVER_CONTAINER" ] && sudo -n docker rm -f "$SERVER_CONTAINER" >/dev/null 2>&1' EXIT
 pb_serve_wait "${READY_S:-900}" || exit 3
+awk -v a="$SERVER_T0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f\n", b - a }' > "$RES/ready_s.txt"
 if [ "${3:-}" = --needle ]; then
     needle_template_args=()
     if [ -n "${NEEDLE_CHAT_TEMPLATE_HF:-}" ]; then
@@ -162,7 +186,7 @@ if [ "${3:-}" = --agentic ] || [ "${3:-}" = --prod ]; then
         local tag=$1 mode=$2 c=$3 rep=$4; shift 4
         echo "CELL_BEGIN $tag $(date +%s.%N)" >> "$RES/cells.log"
         memory_start "$tag"
-        "$PYREF" "$HERE/scripts/bench/agentic_turns.py" --url "http://127.0.0.1:$PB_SERVER_PORT" \
+        timed "$RES/$tag.client_time.txt" "$PYREF" "$HERE/scripts/bench/agentic_turns.py" --url "http://127.0.0.1:$PB_SERVER_PORT" \
             --model "$MODEL" --tokenizer "$HF" --sessions "$c" --turns "${AGENTIC_TURNS:-10}" \
             --target-tokens "${AGENTIC_TARGET:-15600}" --max-tokens "${AGENTIC_MAX_TOKENS:-128}" \
             --api "${AGENTIC_API:-chat}" --seed $(( 7001 + mode * 1000003 + c * 131 + rep * 7919 )) \
@@ -183,7 +207,7 @@ if [ "${3:-}" = --agentic ] || [ "${3:-}" = --prod ]; then
         echo "CELL_BEGIN $tag $(date +%s.%N)" >> "$RES/cells.log"
         memory_start "$tag"
         # shellcheck disable=SC2086
-        "$PYREF" "$HERE/scripts/bench/agentic_turns.py" --url "http://127.0.0.1:$PB_SERVER_PORT" \
+        timed "$RES/$tag.client_time.txt" "$PYREF" "$HERE/scripts/bench/agentic_turns.py" --url "http://127.0.0.1:$PB_SERVER_PORT" \
             --model "$MODEL" --tokenizer "$HF" --open-loop --rate "$rate" --duration "${PROD_DURATION:-300}" \
             --warmup "${PROD_WARMUP:-75}" --cooldown "${PROD_COOLDOWN:-25}" --api "${AGENTIC_API:-chat}" \
             --seed $(( 9001 + mode * 1000003 + m * 131 + rep * 7919 )) ${PROD_ARGS:-} \
