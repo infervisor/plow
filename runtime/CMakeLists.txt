@@ -113,7 +113,9 @@ target_include_directories(plow_cpu_dev PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev)
 target_compile_options(plow_cpu_dev PRIVATE -Wall -Wextra -Werror -O2)
-set_target_properties(plow_cpu_dev PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# ISO C11 as plowrt/build.rs compiles it: CMake's default gnu11 lets gcc contract a*b+c into FMA
+# in the AVX-512/AMX tiers, so the tests would check different rounding than plowrt ships.
+set_target_properties(plow_cpu_dev PROPERTIES POSITION_INDEPENDENT_CODE ON C_EXTENSIONS OFF)
 if(NOT WIN32)
     target_link_libraries(plow_cpu_dev PUBLIC m)
 endif()
