@@ -35,6 +35,7 @@ nix develop --command env \
   PLOW_EMIT_PACKED_PREFILL=1 \
   PLOW_EMIT_PREFILL_CUBLASLT=1 \
   PLOW_FP8=1 \
+  PLOW_FP8_BLOCK_CONCAT=1 \
   PLOW_NV_FA_RG_U=8 \
   PLOW_NV_FA_RG_WIDE=1 \
   PLOW_NV_GEMV_K8_B1=1 \
@@ -47,6 +48,7 @@ nix develop --command env \
   PLOW_W8A8=1 \
   ./target/release/plowc \
   --hf-dir $CKPT \
+  --served-name qwen3.8-27b-fp8 \
   --out $ASSETS
 ```
 <!-- /plow:recipe:emit -->

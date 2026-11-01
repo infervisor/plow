@@ -50,7 +50,7 @@ re-checks an emit-time obligation and has no stage of its own.
 | G | Staged-LDS fit | Every always-staged GEMV instance fits the decode object's LDS arena | `{"arena", "ops": [...]}` | `Plow.LdsFit.fits_of_check_ok` |
 
 Versioned endpoints, checked at qualification (`plowrt qualify`), not carried as compiler
-receipts (details: [`lean-correctness-inventory.md`](lean-correctness-inventory.md) §10–12):
+receipts (details: [`lean-correctness-inventory.md`](lean-correctness-inventory.md) §10–13):
 
 | ID | Proves | Input derived by | Backing theorems |
 |----|--------|------------------|------------------|
@@ -58,6 +58,7 @@ receipts (details: [`lean-correctness-inventory.md`](lean-correctness-inventory.
 | `kv_ring.v1` | No packed prefill launch writes a sliding-ring row its own queries read | `plow_asset::kv_ring` (runtime planner) | `Plow.KvRing.checkLaunch_sound`, `launch_safe_masked`, `slots_distinct` |
 | `vmm_trace.v1` | VMM driver traces keep mappings on live handles, disjoint, inside reservations; everything returned | `memory::vmm` mock traces (test) | `Plow.KvRing.traceOk_sound`, `step_preserves` |
 | `speech_fusion.v1` | Fused LayerNorm prologue / Conv1dF32 row_scale sites meet `Plow.Speech`'s preconditions | `plow_asset::speech_fusion` | `Plow.SpeechFusion.ln_site_gemm_eq`, `conv_site_in_bounds`, `conv_site_eq` |
+| `page_envelope.v1` | The paged library attention loader reads only its request's padded page-table row, at every split count up to the cap | `exec::gpu::lib_attention` constants (test) | `Plow.PageEnvelope.checkRoute_sound`, `route_safe`, `envelope_tight` |
 
 Detail per checkpoint:
 

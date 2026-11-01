@@ -151,7 +151,7 @@ def cost(op, p, rows, ctx, wb, kvb):
         return 2 * tensors * g("rows", rows) * g("feat"), 0
     if op == "GluStrided":
         return 6 * g("rows", rows) * g("width"), 0
-    if op in ("Glu", "Residual"):
+    if op in ("Glu", "GluPitched", "Residual"):
         return 6 * g("n"), 0
     if op == "HeadNormRope":
         return 4 * g("ntok") * g("nhead") * g("hd"), 0

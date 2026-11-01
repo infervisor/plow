@@ -21,6 +21,25 @@ pub mod realtime;
 pub mod ref_encoder;
 #[cfg(feature = "cuda")]
 pub mod serving;
+#[cfg(not(feature = "cuda"))]
+pub mod serving {
+    use crate::serve::AppState;
+    use std::path::Path;
+
+    pub fn preload(_state: &AppState) -> Result<(), String> {
+        Ok(())
+    }
+    pub fn bind(_state: &AppState, _slug: &str) -> Result<(), String> {
+        Ok(())
+    }
+    pub fn release(_dir: &Path, _device: u8) {}
+    pub fn serves_speech(_slug: &str, _dir: &Path) -> bool {
+        false
+    }
+    pub fn speech_spec(_slug: &str, _dir: &Path) -> Option<serde_json::Value> {
+        None
+    }
+}
 #[cfg(feature = "cuda")]
 pub mod text_encoder;
 #[cfg(feature = "cuda")]
@@ -183,10 +202,13 @@ impl SpeechContract {
             depth: get("frames.depth").unwrap_or(0) != 0,
             breeze_sampler: get("frames.depth_sampler").unwrap_or(0) == 1,
             instructions: p.strings.get("prompt.instructions").cloned(),
-            text_encoder: p.strings.get("text.encoder").cloned(),
+            text_encoder: p
+                .strings
+                .get(crate::exec::packet_runtime::TEXT_ENCODER)
+                .cloned(),
             clone: None,
         };
-        if let Some(encoder) = p.strings.get("clone.encoder") {
+        if let Some(encoder) = p.strings.get(crate::exec::packet_runtime::CLONE_ENCODER) {
             let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {
                 match p.strings.get(k) {
                     Some(ids) => ids

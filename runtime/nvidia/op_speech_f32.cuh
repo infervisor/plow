@@ -1803,7 +1803,10 @@ static __device__ __noinline__ void d_gemm_f32(float* __restrict__ out, const __
             SpRowBf16{w, k, k, vec && sp_aligned(w, 8)}, SpPlainEpi{out, n}, slice, nblk, arena);
 }
 
-/* Q8GemmF32 (163). k must be a multiple of 32 (Q8_0 block). */
+/* Q8GemmF32 (163). k must be a multiple of 32 (Q8_0 block). i7 fixes the kernel path: 0 = by row
+ * count (the GEMV walk at most SPQ_GEMV_ROWS rows, tiles above), 1 = the GEMV walk, 2 = tiles. The
+ * two paths round differently, so a fixed one keeps every row's result independent of how many
+ * rows share the launch. */
 struct SpQ8Epi {
     float* out; const float* bias; unsigned n, silu;
     __device__ void operator()(unsigned m, unsigned c, float acc) const {
@@ -1855,15 +1858,19 @@ static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, c
 static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const float* __restrict__ x,
                                      const uint8_t* __restrict__ w, const float* __restrict__ bias,
                                      unsigned m, unsigned n, unsigned k, unsigned activation,
-                                     unsigned a_row0, unsigned slice, unsigned nblk, float* arena) {
+                                     unsigned a_row0, unsigned path, unsigned slice, unsigned nblk,
+                                     float* arena) {
     arena = sp_smem;
-    if (k & 31u) { __trap(); return; }
+    if ((k & 31u) || path > 2u) { __trap(); return; }
     x += (size_t)a_row0 * k;
     const SpRowF32 la{x, k, sp_aligned(x, 16)};
     const SpRowQ8 lb{w, k};
     const SpQ8Epi ep{out, bias, n, activation == 1u};
-    if (m <= SPQ_GEMV_ROWS) {
-        sp_q8_gemv(x, w, ep, m, n, k, slice, nblk);
+    if (path == 1u || (path == 0u && m <= SPQ_GEMV_ROWS)) {
+        /* Rows in groups of SPQ_GEMV_ROWS: each row sums exactly as it would in a launch of its own. */
+        for (unsigned r0 = 0; r0 < m; r0 += SPQ_GEMV_ROWS)
+            sp_q8_gemv(x + (size_t)r0 * k, w, SpQ8Epi{out + (size_t)r0 * n, bias, n, activation == 1u},
+                       m - r0 < SPQ_GEMV_ROWS ? m - r0 : SPQ_GEMV_ROWS, n, k, slice, nblk);
         return;
     }
     /* 64x64 tiles when 128x128 ones leave slices idle (the small-M conformer rows). */
@@ -2692,17 +2699,20 @@ static __device__ __noinline__ void d_broadcast_add_f32(float* out, const float*
     SP_FOR_EACH(i, rows * width) out[i] = __fadd_rn(m[i], v[i % width]);
 }
 
-/* CausalDepthwiseConv1dF32 (167): f16 weights [channel][kernel], taps summed in order. */
+/* CausalDepthwiseConv1dF32 (167): f16 weights [channel][kernel], taps summed in order. Rows come in
+ * items of `item_rows` (0 = one item); taps stop at the item's first row. */
 static __device__ __noinline__ void d_causal_dwconv1d_f32(float* out, const float* x, const uint16_t* w,
                                              unsigned rows, unsigned channels, unsigned kernel,
-                                             unsigned slice, unsigned nblk) {
+                                             unsigned item_rows, unsigned slice, unsigned nblk) {
+    if (!item_rows) item_rows = rows;
     SP_FOR_EACH(i, rows * channels) {
-        const unsigned r = i / channels, c = i - r * channels;
+        const unsigned r = i / channels, c = i - r * channels, ir = r % item_rows;
         float sum = 0.f;
         for (unsigned tap = 0; tap < kernel; tap++) {
-            const int src = (int)r + (int)tap + 1 - (int)kernel;
+            const int src = (int)ir + (int)tap + 1 - (int)kernel;
             if (src >= 0)
-                sum = __fadd_rn(sum, __fmul_rn(x[(size_t)src * channels + c], sp_f16(w[(size_t)c * kernel + tap])));
+                sum = __fadd_rn(sum, __fmul_rn(x[(size_t)(r - ir + src) * channels + c],
+                                               sp_f16(w[(size_t)c * kernel + tap])));
         }
         out[i] = sum;
     }
@@ -3109,15 +3119,26 @@ __device__ __forceinline__ float sp_rel_score(const float* q, const float* k, co
  * exactly as the warp-per-item body does, so the rows match the offline encoder's bit for bit. */
 #define SPR_MAX_KEYS (SP_ARENA_FLOATS / 2u)
 static __device__ __forceinline__ void sp_relative_attention_rows(
-    float* __restrict__ context, const float* __restrict__ query, const float* __restrict__ key,
-    const float* __restrict__ value, const float* __restrict__ position, const float* __restrict__ bias_u,
+    float* __restrict__ context_items, const float* __restrict__ query_items, const float* __restrict__ key_items,
+    const float* __restrict__ value_items, const float* __restrict__ position, const float* __restrict__ bias_u,
     const float* __restrict__ bias_v, unsigned rows, unsigned width, unsigned heads, unsigned chunk,
-    unsigned left_chunks, unsigned key0, unsigned query_row0, unsigned slice, unsigned nblk, unsigned valid) {
+    unsigned left_chunks, const unsigned* __restrict__ key_start, unsigned query_row0, unsigned items,
+    unsigned slice, unsigned nblk) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
     float* scores = sp_smem;
     float* probs = sp_smem + SPR_MAX_KEYS;
-    for (unsigned item = query_row0 * heads + slice; item < rows * heads; item += nblk) {
+    const unsigned per_item = (rows - query_row0) * heads;
+    for (unsigned unit = slice; unit < items * per_item; unit += nblk) {
+        const unsigned b = unit / per_item, item = query_row0 * heads + (unit - b * per_item);
         const unsigned qr = item / heads, head = item - qr * heads;
+        const size_t base = (size_t)b * rows * width;
+        unsigned key0 = 0, valid = rows;
+        if (key_start && left_chunks == 0xFFFFFFFFu) valid = key_start[b] < rows ? key_start[b] : rows;
+        else if (key_start) key0 = key_start[b];
+        float* __restrict__ context = context_items + base;
+        const float* __restrict__ query = query_items + base;
+        const float* __restrict__ key = key_items + base;
+        const float* __restrict__ value = value_items + base;
         if (qr >= valid) {
             /* A padded row: nothing reads it, but it must not hold a stale or non-finite value. */
             for (unsigned c = threadIdx.x; c < hw; c += PLOW_NV_THREADS)
@@ -3160,34 +3181,39 @@ static __device__ __forceinline__ void sp_relative_attention_rows(
         __syncthreads();
     }
 }
-static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__ context, const float* __restrict__ query,
-                                                const float* __restrict__ key, const float* __restrict__ value,
+/* i6 items (0 = 1): q/k/v/context are [items][rows][width], each item its own sequence with its
+ * own t7 entry; the position rows are shared. */
+static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__ context_items,
+                                                const float* __restrict__ query_items,
+                                                const float* __restrict__ key_items,
+                                                const float* __restrict__ value_items,
                                                 const float* __restrict__ position, const float* __restrict__ bias_u,
                                                 const float* __restrict__ bias_v, unsigned rows, unsigned width,
                                                 unsigned heads, unsigned chunk, unsigned left_chunks,
                                                 unsigned slice, unsigned nblk,
                                                 const unsigned* __restrict__ key_start = nullptr,
-                                                unsigned query_row0 = 0) {
+                                                unsigned query_row0 = 0, unsigned items = 1) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, hw = width / heads;
-    if (left_chunks == 0xFFFFFFFFu) {
-        /* Full context, t7 (optional): the valid rows of a padded bucket. Later keys are masked
-         * and later query rows written as zeros. */
-        const unsigned valid = key_start && *key_start < rows ? *key_start : rows;
-        sp_relative_attention_rows(context, query, key, value, position, bias_u, bias_v, rows, width, heads, chunk,
-                                   left_chunks, 0u, query_row0, slice, nblk, valid);
+    if (!items) items = 1;
+    if (query_row0 >= rows) return;
+    /* Full context, t7 (optional): the valid rows of a padded bucket; later keys are masked and
+     * later query rows written as zeros. Chunked, t7: keys before that row are not filled yet (a
+     * stream's first chunks). */
+    if (left_chunks == 0xFFFFFFFFu || query_row0 != 0u) {
+        sp_relative_attention_rows(context_items, query_items, key_items, value_items, position, bias_u, bias_v,
+                                   rows, width, heads, chunk, left_chunks, key_start, query_row0, items, slice,
+                                   nblk);
         return;
     }
-    /* t7 (optional): keys before this row are not filled yet (a stream's first chunks). */
-    const unsigned key0 = key_start ? *key_start : 0u;
-    if (query_row0 != 0u) {
-        sp_relative_attention_rows(context, query, key, value, position, bias_u, bias_v, rows, width, heads, chunk,
-                                   left_chunks, key0, query_row0, slice, nblk, rows);
-        return;
-    }
-    /* i5: only query rows from here on are wanted (a stream step's new rows). */
-    for (unsigned item = query_row0 * heads + slice * PLOW_NV_WARPS + warp; item < rows * heads;
-         item += nblk * PLOW_NV_WARPS) {
+    for (unsigned unit = slice * PLOW_NV_WARPS + warp; unit < items * rows * heads; unit += nblk * PLOW_NV_WARPS) {
+        const unsigned b = unit / (rows * heads), item = unit - b * rows * heads;
         const unsigned qr = item / heads, head = item - qr * heads;
+        const size_t base = (size_t)b * rows * width;
+        const unsigned key0 = key_start ? key_start[b] : 0u;
+        float* __restrict__ context = context_items + base;
+        const float* __restrict__ query = query_items + base;
+        const float* __restrict__ key = key_items + base;
+        const float* __restrict__ value = value_items + base;
         unsigned first = 0, last = rows;
         if (left_chunks != 0xFFFFFFFFu) {
             const unsigned qc = qr / chunk;
@@ -6222,7 +6248,7 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
     switch (in->op) {
     SP_CASE(Q8_GEMM_F32)
         d_q8_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const uint8_t*)SP_TEN(2), (const float*)SP_TEN(3),
-                      in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk, arena);
+                      in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[7], slice, nblk, arena);
         break;
     SP_CASE(LAYERNORM_F32)
         d_layernorm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2), (const float*)SP_TEN(3),
@@ -6237,13 +6263,13 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         break;
     SP_CASE(CAUSAL_DEPTHWISE_CONV1D_F32)
         d_causal_dwconv1d_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const uint16_t*)SP_TEN(2), in->i[0],
-                              in->i[1], in->i[2], slice, nblk);
+                              in->i[1], in->i[2], in->i[3], slice, nblk);
         break;
     SP_CASE(RELATIVE_ATTENTION_F32)
         d_relative_attention_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2),
                                  (const float*)SP_TEN(3), (const float*)SP_TEN(4), (const float*)SP_TEN(5),
                                  (const float*)SP_TEN(6), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
-                                 slice, nblk, (const unsigned*)SP_TEN(7), in->i[5]);
+                                 slice, nblk, (const unsigned*)SP_TEN(7), in->i[5], in->i[6]);
         break;
     SP_CASE(SILU_F32)
         d_silu_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], slice, nblk);

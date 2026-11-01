@@ -206,7 +206,7 @@ impl WorkerPool {
             let ex = exec.clone();
             let h = match std::thread::Builder::new()
                 .name(format!("plow-cpu-{node}-{w}"))
-                .spawn(move || worker_main(init, sh, ex))
+                .spawn(crate::config::inherit(move || worker_main(init, sh, ex)))
             {
                 Ok(h) => h,
                 Err(e) => {

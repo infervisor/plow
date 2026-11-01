@@ -914,6 +914,263 @@ pub fn append_stream_step(
     })
 }
 
+/// Per-step inputs of a batched stream step ([`append_chunk_step`]), written by the host.
+#[derive(Clone, Copy)]
+pub struct ChunkInputs<'a> {
+    /// f32 rows the step's windows subsampled to; `index` picks each item's `rows` of them.
+    pub staging: &'a str,
+    /// u32 per new row: its staging row (past the table: zeros, a padding item).
+    pub index: &'a str,
+    /// u32 per item: the stream's row of the cache tables.
+    pub slot: &'a str,
+    /// u32 per item: steps the stream took before this one (0: its caches read as zeros).
+    pub pos: &'a str,
+    /// u32 per item: the first attention-window row holding a frame (`left` on a first step).
+    pub key_start: &'a str,
+    /// u32 per item, each `rows` (a constant the packet initializes): how far the caches shift.
+    pub shift: &'a str,
+}
+
+/// A batched stream's cache table (`slots` rows) for one layer: `kind` is `k`, `v` or `conv`.
+pub fn chunk_state(kind: &str, layer: usize) -> String {
+    format!("state.chunk.{kind}.{layer}")
+}
+
+/// One cache-aware stream step for `items` streams at once, `rows` new encoder frames (whole
+/// attention chunks) each: `act.chunk.x` (`items * rows` x width) gathers the items' rows from
+/// the staging table, then runs every layer. Row-local work runs over all rows; each stream's
+/// attention window `[key/value cache | new rows]` and convolution window `[conv cache | new
+/// rows]` come from its row of `slots`-row cache tables ([`chunk_state`]; zeros while `pos` is 0)
+/// and the windows' tails go back. Every row computes in the offline encoder's order once the
+/// caller pins the program's Q8 GEMMs to tiles. Run [`stream_init`] once for the positions.
+#[allow(clippy::too_many_arguments)]
+pub fn append_chunk_step(
+    spec: ConformerSpec<'_>,
+    layers: &[ConformerLayerWeights<'_>],
+    n_cu: u32,
+    items: u32,
+    rows: u32,
+    slots: u32,
+    staging_rows: u32,
+    inputs: ChunkInputs<'_>,
+) -> Result<PacketPrefix, String> {
+    let left = stream_left_rows(&spec);
+    let window = left + rows;
+    validate(
+        ConformerSpec {
+            frames: window,
+            ..spec
+        },
+        layers,
+        n_cu,
+    )?;
+    if !spec.causal_convolution || spec.left_chunks == u32::MAX {
+        return Err(
+            "a cache-aware stream needs causal convolutions and chunk-limited attention".into(),
+        );
+    }
+    if rows == 0 || rows % spec.chunk_size != 0 || left == 0 || items == 0 || slots == 0 {
+        return Err("a batched stream step needs whole chunks, items and cache slots".into());
+    }
+    let tail = spec.convolution_kernel - 1;
+    let n = items * rows;
+    let w = spec.width;
+    let row_bytes = u64::from(w) * 4;
+    let rs = ConformerSpec { frames: n, ..spec };
+    let mut b = Builder::new(n_cu);
+    b.set_tensor_dedup(true);
+    let staging = b.tensor(inputs.staging, u64::from(staging_rows) * row_bytes);
+    let index = b.tensor(inputs.index, u64::from(n) * 4);
+    let [slot, pos, key_start, shift] = [inputs.slot, inputs.pos, inputs.key_start, inputs.shift]
+        .map(|name| b.tensor(name, u64::from(items) * 4));
+    let x = b.tensor("act.chunk.x", u64::from(n) * row_bytes);
+    let [d0, d1, q, k, v] = ["d0", "d1", "q", "k", "v"]
+        .map(|t| b.tensor(&format!("act.chunk.{t}"), u64::from(n) * row_bytes));
+    let large = b.tensor(
+        "act.chunk.large",
+        u64::from(n) * u64::from(spec.feed_forward_width.max(2 * w)) * 4,
+    );
+    let [qw, kw, vw, ctx] = ["qw", "kw", "vw", "ctx"].map(|t| {
+        b.tensor(
+            &format!("act.chunk.{t}"),
+            u64::from(items * window) * row_bytes,
+        )
+    });
+    let [gw, cw] = ["gw", "cw"].map(|t| {
+        b.tensor(
+            &format!("act.chunk.{t}"),
+            u64::from(items * (tail + rows)) * row_bytes,
+        )
+    });
+    let mut dep = Some(b.emit(DevOp::GatherRowsF32, b.all(), &[], |d| {
+        d.t[..3].copy_from_slice(&[x, staging, index]);
+        d.i = [n, w, staging_rows, 1, 1, 1, 0, 0];
+    }));
+    // StreamTailF32 over `l`-row caches: gather `[cache | new rows]` windows from `src`, or store
+    // each window's last `l` rows back.
+    let tail_op =
+        |b: &mut Builder, window: u32, src: u32, cache: u32, l: u32, store: bool, dep: u32| {
+            b.emit(DevOp::StreamTailF32, b.all(), &[dep], |d| {
+                if store {
+                    d.t[..5].copy_from_slice(&[TENSOR_NONE, window, cache, slot, shift]);
+                    d.i = [items, l, rows, w, w, 0, 0, 1];
+                } else {
+                    d.t[..6].copy_from_slice(&[window, src, cache, slot, shift, pos]);
+                    d.i = [items, l, rows, w, w, 0, w, 0];
+                }
+                d.j[0] = slots;
+            })
+        };
+    // Item rows between `[items][rows]` and the windows' `[items][from_rows]` at `row0`.
+    let move_rows =
+        |b: &mut Builder, out: u32, x: u32, into_window: bool, window: u32, row0: u32, dep: u32| {
+            b.emit(DevOp::CopyColsF32, b.all(), &[dep], |d| {
+                d.t[..2].copy_from_slice(&[out, x]);
+                let (from, to) = if into_window { (0, row0) } else { (row0, 0) };
+                d.i = [items, rows, w, w, from * w, w, to * w, 0];
+                d.j = if into_window {
+                    [rows * w, window * w]
+                } else {
+                    [window * w, rows * w]
+                };
+            })
+        };
+    for (l, layer) in layers.iter().enumerate() {
+        let k_cache = b.tensor(&chunk_state("k", l), u64::from(slots * left) * row_bytes);
+        let v_cache = b.tensor(&chunk_state("v", l), u64::from(slots * left) * row_bytes);
+        let conv_cache = b.tensor(&chunk_state("conv", l), u64::from(slots * tail) * row_bytes);
+        let position = b.tensor(&stream_position(l), u64::from(2 * window - 1) * row_bytes);
+        dep = Some(feed_forward(&mut b, rs, *layer, x, d0, large, dep, true));
+        let mut last = emit_norm(&mut b, rs, x, d0, layer.attention.norm, dep);
+        for (out, weight) in [
+            (q, layer.attention.query),
+            (k, layer.attention.key),
+            (v, layer.attention.value),
+        ] {
+            last = emit_q8(&mut b, out, d0, weight, n, w, w, 0, 0, Some(last));
+        }
+        last = tail_op(&mut b, kw, k, k_cache, left, false, last);
+        last = tail_op(&mut b, vw, v, v_cache, left, false, last);
+        last = move_rows(&mut b, qw, q, true, window, left, last);
+        let bu = b.tensor(layer.attention.bias_u, u64::from(w) * 4);
+        let bv = b.tensor(layer.attention.bias_v, u64::from(w) * 4);
+        last = b.emit(
+            DevOp::RelativeAttentionF32,
+            // query_row0 > 0: a block per (item, new row, head).
+            repeated_cus(n_cu, n * spec.heads),
+            &[last],
+            |d| {
+                d.t[..8].copy_from_slice(&[ctx, qw, kw, vw, position, bu, bv, key_start]);
+                d.i[..7].copy_from_slice(&[
+                    window,
+                    w,
+                    spec.heads,
+                    spec.chunk_size,
+                    spec.left_chunks,
+                    left,
+                    items,
+                ]);
+            },
+        );
+        last = tail_op(&mut b, kw, TENSOR_NONE, k_cache, left, true, last);
+        last = tail_op(&mut b, vw, TENSOR_NONE, v_cache, left, true, last);
+        last = move_rows(&mut b, d1, ctx, false, window, left, last);
+        last = emit_q8(
+            &mut b,
+            d0,
+            d1,
+            layer.attention.output,
+            n,
+            w,
+            w,
+            0,
+            0,
+            Some(last),
+        );
+        dep = Some(emit_add(&mut b, rs, x, x, d0, 1.0, Some(last)));
+
+        let norm = emit_norm(&mut b, rs, x, d0, layer.convolution.norm, dep);
+        let pointwise = emit_q8(
+            &mut b,
+            large,
+            d0,
+            layer.convolution.pointwise_in,
+            n,
+            w * 2,
+            w,
+            0,
+            0,
+            Some(norm),
+        );
+        let glu = b.emit(DevOp::GluF32, b.all(), &[pointwise], |d| {
+            d.t[0] = d1;
+            d.t[1] = large;
+            d.i[0] = n;
+            d.i[1] = w;
+        });
+        last = tail_op(&mut b, gw, d1, conv_cache, tail, false, glu);
+        let depthwise_weight = b.tensor(
+            layer.convolution.depthwise,
+            u64::from(w) * u64::from(spec.convolution_kernel) * 2,
+        );
+        last = b.emit(DevOp::CausalDepthwiseConv1dF32, b.all(), &[last], |d| {
+            d.t[..3].copy_from_slice(&[cw, gw, depthwise_weight]);
+            d.i[..4].copy_from_slice(&[
+                items * (tail + rows),
+                w,
+                spec.convolution_kernel,
+                tail + rows,
+            ]);
+        });
+        last = tail_op(&mut b, gw, TENSOR_NONE, conv_cache, tail, true, last);
+        last = move_rows(&mut b, d0, cw, false, tail + rows, tail, last);
+        let channel_norm = emit_norm(
+            &mut b,
+            rs,
+            d0,
+            d1,
+            layer.convolution.channel_norm,
+            Some(last),
+        );
+        let activated = b.emit(DevOp::SiluF32, b.all(), &[channel_norm], |d| {
+            d.t[..2].copy_from_slice(&[d1, d1]);
+            d.i[0] = n * w;
+        });
+        let convolution = emit_q8(
+            &mut b,
+            d0,
+            d1,
+            layer.convolution.pointwise_out,
+            n,
+            w,
+            w,
+            0,
+            0,
+            Some(activated),
+        );
+        dep = Some(emit_add(&mut b, rs, x, x, d0, 1.0, Some(convolution)));
+        dep = Some(feed_forward(&mut b, rs, *layer, x, d0, large, dep, false));
+        dep = Some(emit_norm(&mut b, rs, x, x, layer.output_norm, dep));
+    }
+    let tensors = b.tensors();
+    let program = b.finish();
+    Ok(PacketPrefix {
+        model: Model {
+            n_cu,
+            target: 0,
+            tensors,
+            progs: vec![program],
+            prog_t: vec![n],
+            kv_row_insts: Vec::new(),
+            gen: Vec::new(),
+        },
+        programs: vec![0],
+        input: staging,
+        output: x,
+        input_shape: vec![u64::from(staging_rows), u64::from(w)],
+    })
+}
+
 /// The stream's per-layer relative-position projections: input independent, so one program fills
 /// them once per packet load (`window` = left context + step rows).
 pub fn stream_init(
@@ -1054,6 +1311,71 @@ mod tests {
             position_center: 15,
             epsilon: 1e-5,
         }
+    }
+
+    #[test]
+    fn chunk_step_windows_each_stream_from_its_cache_rows() {
+        let inputs = ChunkInputs {
+            staging: "act.test.staging",
+            index: "in.test.index",
+            slot: "in.test.slot",
+            pos: "in.test.pos",
+            key_start: "in.test.key_start",
+            shift: "in.test.shift",
+        };
+        // spec(): chunks of 4, one chunk of left context, kernel 3: window 8, conv tail 2.
+        let prefix = append_chunk_step(spec(), &[layer()], 4, 3, 4, 5, 24, inputs).unwrap();
+        let insts = &prefix.model.progs[0].insts;
+        let name = |t: u32| prefix.model.tensors[t as usize].name.as_str();
+        let of = |op: DevOp| -> Vec<_> {
+            insts
+                .iter()
+                .filter(|d| DevOp::from_u16(d.op) == Some(op))
+                .collect()
+        };
+        assert_eq!(DevOp::from_u16(insts[0].op), Some(DevOp::GatherRowsF32));
+        assert_eq!(insts[0].i, [12, 32, 24, 1, 1, 1, 0, 0]);
+        assert_eq!(name(insts[0].t[1]), "act.test.staging");
+        // Key and value windows, their stores after the attention, the conv window and its store.
+        let tails = of(DevOp::StreamTailF32);
+        assert_eq!(tails.len(), 6);
+        assert_eq!(tails[0].i, [3, 4, 4, 32, 32, 0, 32, 0]);
+        assert_eq!(tails[2].i, [3, 4, 4, 32, 32, 0, 0, 1]);
+        assert_eq!(tails[4].i, [3, 2, 4, 32, 32, 0, 32, 0]);
+        assert_eq!(tails[5].i, [3, 2, 4, 32, 32, 0, 0, 1]);
+        assert!(tails.iter().all(|d| d.j[0] == 5));
+        assert_eq!(name(tails[0].t[2]), "state.chunk.k.0");
+        assert_eq!(name(tails[4].t[2]), "state.chunk.conv.0");
+        assert_eq!(name(tails[0].t[5]), "in.test.pos");
+        assert_eq!(
+            prefix.model.tensors[tails[0].t[2] as usize].bytes,
+            5 * 4 * 32 * 4
+        );
+        let attention = of(DevOp::RelativeAttentionF32);
+        assert_eq!(attention[0].i[..7], [8, 32, 2, 4, 1, 4, 3]);
+        assert_eq!(name(attention[0].t[7]), "in.test.key_start");
+        assert_eq!(
+            of(DevOp::CausalDepthwiseConv1dF32)[0].i[..4],
+            [18, 32, 3, 6]
+        );
+        // Queries into the windows, contexts and convolution rows out of them.
+        let copies = of(DevOp::CopyColsF32);
+        assert_eq!(copies.len(), 3);
+        assert_eq!(
+            (copies[0].i, copies[0].j),
+            ([3, 4, 32, 32, 0, 32, 128, 0], [128, 256])
+        );
+        assert_eq!(
+            (copies[1].i, copies[1].j),
+            ([3, 4, 32, 32, 128, 32, 0, 0], [256, 128])
+        );
+        assert_eq!(
+            (copies[2].i, copies[2].j),
+            ([3, 4, 32, 32, 64, 32, 0, 0], [192, 128])
+        );
+        assert_eq!(name(prefix.output), "act.chunk.x");
+        // Partial chunks are refused.
+        assert!(append_chunk_step(spec(), &[layer()], 4, 3, 3, 5, 24, inputs).is_err());
     }
 
     #[test]

@@ -196,6 +196,18 @@ impl Endpointer {
             .map(|o| (o.index, &self.buf[(o.start - self.base) as usize..]))
     }
 
+    /// The open segment's index and the audio it keeps whenever silence closes it: through
+    /// [`CONTEXT`] past its last speech, so a closed segment's audio extends this.
+    pub fn open_kept_audio(&self) -> Option<(u64, &[f32])> {
+        self.open.as_ref().map(|o| {
+            let end = (o.last_speech_end + CONTEXT as u64).min(self.end());
+            (
+                o.index,
+                &self.buf[(o.start - self.base) as usize..(end - self.base) as usize],
+            )
+        })
+    }
+
     fn end(&self) -> u64 {
         self.base + self.buf.len() as u64
     }

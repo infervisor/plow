@@ -210,6 +210,7 @@ the top); steps 3-6 run only for a block-level winner.
 | 3 | per-rung accuracy, resources + measured roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx; instruction-cap sweeps for native decode only), then `scripts/bench/step_boundary.sh <assets> <out>` (ctx 4094/4095/4096/8191/8192 under `CUDA_LAUNCH_BLOCKING`: live KV commits 4096-row blocks and a kernel that stages rows past kv_len faults only there), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op). Library-routed decode needs `op_roof.py --nsys` with JSON disassembly and a measured CUDA trace; prefill CUDA graphs use `--nsys-correlation <id>` for exact packet-segment mapping, while `--segtime` covers per-chunk prefill diagnostics. No measurement = floor only. Use block/route harnesses below for other kernels; GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
 | 4 | full-model accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2, media parity `mm_parity`); `--score-only` re-scores, `--dry-run` prints `run.sh` (under `gpuq.py`, queue `bash <out>/run.sh` from the dry run, then `--score-only`: `gate` itself leases) |
 | 5 | serving grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); agentic multi-turn with prefix caching on both sides: `llm_grid.sh plow\|vllm <res> --agentic` (`agentic_turns.py`, c32/64/128 x 10 turns to ~16K); open-loop production mix (Poisson sessions, think time, sampled turns/lengths, goodput): `PROD_RATES='0.5 1' llm_grid.sh plow\|vllm <res> --prod` (`agentic_turns.py --open-loop`, cells `q<1000*rate>`); speech: `scripts/tts/tts_bench.py`, `scripts/asr/nvidia/served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
+| 5a | host resources of both arms | recorded by every `llm_grid.sh` run (`scripts/bench/host_res.py`: server-tree RSS (Pss opt-in: `PB_HOST_PSS=1`, it stalls large servers), VmLck/VmPin, cores busy, threads, processes, MemAvailable, mapped libraries, plowrt pinned KV host tier, client CPU, ready time, binary/packet/site-packages/cache footprint); `host_res.py report <plow-res> <vllm-res> --cell <tag>` prints the plow/vLLM table |
 | 6 | audit waterfall | `scripts/bench/waterfall.py <res>/plow <res>/vllm`: grid with spread, reference prefix-cache hits (fails > 5%), wall ms/request split (mixed, prefill-only, decode, host gap, idle, padding, riders), decode ms/step side by side. `vllm_metrics.py cells`, `packlog_audit.py`, `nsys_busy.py` are its parts |
 | 7 | fix, one variable | kernel/runtime change in your own detached worktree |
 | 8 | verify the patch | `scripts/campaign/verify_patch.sh <patch>`: applies to HEAD in a private index, archives `git write-tree`, builds bins/examples/tests, plowrt lib (cuda+hsa), knob tests, plow-asset + packet tests, `lean` (in-tree verifier build, proof audit, approved verifier, CPU-verifier suites via `scripts/lean_correctness_ci.sh`) for Lean/receipt changes, `perf` (checkpoint P, `perf_gate_ci.sh`) for knob registry changes, py_compile / `bash -n` / TOML of touched scripts |
@@ -237,8 +238,8 @@ isolated block, including ragged rungs, before full-model accuracy and matched s
 unmeasured rung or a correctness/resource failure keeps the candidate experimental.
 
 **Per-rung knob values.** An emit knob that only picks a rung program's op or library route is
-declared rung-eligible in `crates/devgen/src/knob_spec.rs` (`.per_rung(&["prefill"])`; today only
-`PLOW_NO_GLU_FUSE`). Choose it per rung, not packet-wide:
+declared rung-eligible in `crates/devgen/src/knob_spec.rs` (`.per_rung(...)`; today
+`PLOW_NO_GLU_FUSE` and `PLOW_EMIT_ATTN_LIBRARY`). Choose it per rung, not packet-wide:
 `campaign.py rung-sweep <recipe> --knob K --values 0,1 --stage build|run|score|verify`
 (`scripts/campaign/README.md`, "Per-rung knob choices") times every rung in every value arm in one
 queue job, compares the same launches' logits, lists object resources and writes the
@@ -248,6 +249,9 @@ mixed-rung emit test (`crates/devgen/tests/rung_env.rs`). The score labels a cho
 unless accuracy is accepted (bitwise, or `--kl-max` + `--top1-min`), the arms' objects show no
 spills, and `--roofline` / `--library-resources` records are given; only `qualified` choices go
 into a production recipe, and the mixed packet then needs its own full gates (FP32 included).
+A `validated` recipe that states a rung-eligible knob (packet-wide or per rung) carries
+`[rung_choices.<KNOB>]` with `label = "qualified"` and the measurement as `evidence`; the snippet
+writes it and `check_recipe.py` refuses a validated recipe without it.
 
 Store tuning evidence with source and object SHA256s, exact compiler/cubin flags, launch geometry,
 device/compiler versions, shape/precision and correctness results. A Git commit is useful

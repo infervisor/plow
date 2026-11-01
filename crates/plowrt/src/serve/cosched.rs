@@ -39,6 +39,7 @@ use tokio::sync::{oneshot, Mutex, OwnedMutexGuard};
 
 /// How co-resident models take the device.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CoSched {
     /// No host-side ordering: private streams, driver admission. Default.
     #[default]
@@ -50,6 +51,16 @@ pub enum CoSched {
     /// ahead of partials; least slack within a band, and work about to miss (a stream about to
     /// underrun) ahead of all. A waiter is due by [`MAX_WAIT`] after it queued, so nothing starves.
     Deadline,
+}
+
+impl CoSched {
+    fn from_u8(v: u8) -> CoSched {
+        match v {
+            1 => CoSched::Rr,
+            2 => CoSched::Deadline,
+            _ => CoSched::Free,
+        }
+    }
 }
 
 impl std::str::FromStr for CoSched {
@@ -75,7 +86,9 @@ impl std::str::FromStr for CoSched {
 /// releases and goes to the back of the queue.
 #[derive(Debug)]
 pub struct DeviceTurn {
-    mode: CoSched,
+    /// A [`CoSched`]; raised once from `Free` when a group gains its second tenant at runtime
+    /// ([`Self::upgrade`]).
+    mode: std::sync::atomic::AtomicU8,
     quantum: u32,
     turn: Arc<Mutex<()>>,
     prio: Arc<parking_lot::Mutex<PrioState>>,
@@ -354,7 +367,7 @@ impl PrioHold {
 impl DeviceTurn {
     pub fn new(mode: CoSched, quantum: u32) -> DeviceTurn {
         DeviceTurn {
-            mode,
+            mode: std::sync::atomic::AtomicU8::new(mode as u8),
             // A zero quantum would release the turn without ever using it and
             // spin the queue; one tick is the smallest meaningful share.
             quantum: quantum.max(1),
@@ -371,7 +384,24 @@ impl DeviceTurn {
     }
 
     pub fn mode(&self) -> CoSched {
-        self.mode
+        CoSched::from_u8(self.mode.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Order an unordered group: a group installed with one tenant (or none: a zero-asset start)
+    /// runs `Free`, and a model loaded beside it later needs what a startup with both would
+    /// have picked. Only `Free` is raised — nothing holds a turn there — and once.
+    pub fn upgrade(&self, to: CoSched) -> bool {
+        use std::sync::atomic::Ordering;
+        to != CoSched::Free
+            && self
+                .mode
+                .compare_exchange(
+                    CoSched::Free as u8,
+                    to as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
     }
 
     pub fn quantum(&self) -> u32 {
@@ -380,7 +410,7 @@ impl DeviceTurn {
 
     /// Whether a caller must hold a turn before ticking.
     pub fn ordered(&self) -> bool {
-        self.mode != CoSched::Free
+        self.mode() != CoSched::Free
     }
 
     /// [`Self::outranked_due`] for a model whose most urgent work, starting now, is `mine`.
@@ -391,7 +421,7 @@ impl DeviceTurn {
     /// Whether a model due `mine` is outranked by a waiting co-tenant right now: it should keep
     /// its next tick short.
     pub fn outranked_due(&self, mine: Due) -> bool {
-        if self.mode != CoSched::Deadline {
+        if self.mode() != CoSched::Deadline {
             return false;
         }
         let now = Instant::now();
@@ -401,7 +431,7 @@ impl DeviceTurn {
 
     /// The best-ranked waiter's `Due` (starvation bound applied), if anyone waits.
     pub fn tightest_waiter(&self) -> Option<Due> {
-        if self.mode != CoSched::Deadline {
+        if self.mode() != CoSched::Deadline {
             return None;
         }
         let now = Instant::now();
@@ -444,7 +474,7 @@ impl Turn {
 
     /// [`Self::take`] for a model whose most urgent work is `due` ([`CoSched::Deadline`]).
     pub async fn take_due(&mut self, turn: &DeviceTurn, due: Due) {
-        if turn.mode == CoSched::Deadline {
+        if turn.mode() == CoSched::Deadline {
             if let (Some(hold), Some(since)) = (&self.prio, self.since) {
                 if !hold.0.lock().should_yield(due, since, Instant::now()) {
                     self.used += 1;
@@ -468,6 +498,31 @@ impl Turn {
             self.used = 0;
         }
         self.used += 1;
+    }
+
+    /// After a tick: when the hold is spent (the quantum used up, or a waiter this model would
+    /// yield to under [`CoSched::Deadline`]), hand the device on now rather than at the next
+    /// [`Self::take_due`], so the co-tenant enqueues during this model's between-tick host work.
+    pub fn finish(&mut self, turn: &DeviceTurn, due: Due) {
+        let spent = match turn.mode() {
+            CoSched::Free => false,
+            CoSched::Rr => self.used >= turn.quantum(),
+            CoSched::Deadline => match (&self.prio, self.since) {
+                (Some(hold), Some(since)) => hold.0.lock().should_yield(due, since, Instant::now()),
+                _ => false,
+            },
+        };
+        if spent {
+            self.release();
+        }
+    }
+
+    /// [`Self::finish`] when `early_release` (`PLOW_COSCHED_EARLY_RELEASE`); otherwise the hold
+    /// is kept until the next [`Self::take_due`], the policy before early release.
+    pub fn finish_if(&mut self, turn: &DeviceTurn, early_release: bool, due: impl FnOnce() -> Due) {
+        if early_release {
+            self.finish(turn, due());
+        }
     }
 
     /// Give the device back now, whatever is left of the quantum.
@@ -496,6 +551,34 @@ mod tests {
         assert_eq!("round-robin".parse::<CoSched>().unwrap(), CoSched::Rr);
         assert_eq!("deadline".parse::<CoSched>().unwrap(), CoSched::Deadline);
         assert!("fair".parse::<CoSched>().is_err());
+    }
+
+    /// A group installed unordered (one tenant, or none) is raised once when a second model
+    /// loads beside it at runtime; an ordered group keeps the mode it was installed with.
+    #[test]
+    fn only_a_free_turn_is_raised_and_only_once() {
+        let dt = DeviceTurn::serving(CoSched::Free);
+        assert!(!dt.upgrade(CoSched::Free));
+        assert!(dt.upgrade(CoSched::Deadline));
+        assert_eq!(dt.mode(), CoSched::Deadline);
+        assert!(dt.ordered());
+        assert!(!dt.upgrade(CoSched::Rr));
+        assert_eq!(dt.mode(), CoSched::Deadline);
+        let rr = DeviceTurn::serving(CoSched::Rr);
+        assert!(!rr.upgrade(CoSched::Deadline));
+        assert_eq!(rr.mode(), CoSched::Rr);
+    }
+
+    /// A runtime-raised turn serializes like an installed one.
+    #[tokio::test]
+    async fn a_raised_turn_serializes_ticks() {
+        let dt = DeviceTurn::new(CoSched::Free, 1);
+        let mut a = Turn::default();
+        a.take(&dt).await;
+        assert!(dt.turn.try_lock().is_ok(), "free holds nothing");
+        assert!(dt.upgrade(CoSched::Rr));
+        a.take(&dt).await;
+        assert!(dt.turn.try_lock().is_err(), "rr holds the device");
     }
 
     /// Free must never serialize anything — that is the entire difference
@@ -533,6 +616,119 @@ mod tests {
             blocked.await.unwrap(),
             "B never got the turn after A released"
         );
+    }
+
+    /// `finish` hands a spent hold on at the tick's end and keeps one with ticks left; under
+    /// deadline it keeps the device while nobody waits.
+    #[tokio::test]
+    async fn finish_releases_only_a_spent_hold() {
+        let dt = DeviceTurn::new(CoSched::Rr, 2);
+        let mut a = Turn::default();
+        let due = Due::from_urgency(Urgency::Normal, Instant::now());
+        a.take(&dt).await;
+        a.finish(&dt, due);
+        assert!(a.held(), "one tick of a two-tick quantum left");
+        a.take(&dt).await;
+        a.finish(&dt, due);
+        assert!(!a.held(), "spent quantum still held after the tick");
+
+        let dt = DeviceTurn::new(CoSched::Deadline, 4);
+        let mut a = Turn::default();
+        a.take_due(&dt, due).await;
+        a.finish(&dt, due);
+        assert!(a.held(), "deadline holder yielded with nobody waiting");
+    }
+
+    /// A waiter queued behind `dt`'s holder; the receiver fires once it holds the device.
+    fn queue_waiter(dt: &Arc<DeviceTurn>, due: Option<Due>) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let dt = Arc::clone(dt);
+        tokio::spawn(async move {
+            let mut t = Turn::default();
+            match due {
+                Some(due) => t.take_due(&dt, due).await,
+                None => t.take(&dt).await,
+            }
+            let _ = tx.send(());
+            t.release();
+        });
+        rx
+    }
+
+    async fn woken(rx: oneshot::Receiver<()>) {
+        tokio::time::timeout(Duration::from_millis(500), rx)
+            .await
+            .expect("the waiter did not get the device from finish")
+            .unwrap();
+    }
+
+    /// A Deadline holder hands the device on from `finish`, without taking again, to a waiter
+    /// that outranks it, or to a tied one once its quantum is spent; the waiter runs at once.
+    #[tokio::test]
+    async fn finish_hands_a_deadline_turn_to_the_waiter() {
+        let dt = Arc::new(DeviceTurn::new(CoSched::Deadline, 4));
+        let now = Instant::now();
+        let mine = due_in(now, 5000, 0);
+        let mut a = Turn::default();
+        a.take_due(&dt, mine).await;
+        let rx = queue_waiter(&dt, Some(due_in(now, 100, 0)));
+        while dt.tightest_waiter().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        a.finish(&dt, mine);
+        assert!(!a.held(), "an outranked holder kept the device");
+        woken(rx).await;
+
+        let now = Instant::now();
+        let mine = due_in(now, 1000, 0);
+        let mut a = Turn::default();
+        a.take_due(&dt, mine).await;
+        let mut rx = queue_waiter(&dt, Some(due_in(now, 1000, 0)));
+        while dt.tightest_waiter().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        a.finish(&dt, mine);
+        assert!(a.held(), "a tie handed over inside the quantum");
+        assert!(rx.try_recv().is_err());
+        tokio::time::sleep(DEADLINE_QUANTUM).await;
+        a.finish(&dt, mine);
+        assert!(!a.held(), "a tie kept the device past the quantum");
+        woken(rx).await;
+    }
+
+    /// An Rr holder hands the device on from `finish` on the tick that spends its quantum, and
+    /// the queued waiter runs without the holder taking again.
+    #[tokio::test]
+    async fn finish_hands_a_spent_rr_turn_to_the_waiter() {
+        let dt = Arc::new(DeviceTurn::new(CoSched::Rr, 2));
+        let due = Due::from_urgency(Urgency::Normal, Instant::now());
+        let mut a = Turn::default();
+        a.take(&dt).await;
+        let mut rx = queue_waiter(&dt, None);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        a.finish(&dt, due);
+        assert!(a.held());
+        assert!(rx.try_recv().is_err(), "the waiter ran inside the quantum");
+        a.take(&dt).await;
+        a.finish(&dt, due);
+        assert!(!a.held());
+        woken(rx).await;
+    }
+
+    /// `PLOW_COSCHED_EARLY_RELEASE=false` restores the old policy: the hold is kept after the
+    /// tick (and its urgency is not even derived) until the next take.
+    #[tokio::test]
+    async fn without_early_release_a_spent_hold_is_kept() {
+        let dt = DeviceTurn::new(CoSched::Rr, 1);
+        let due = Due::from_urgency(Urgency::Normal, Instant::now());
+        let mut a = Turn::default();
+        a.take(&dt).await;
+        a.finish_if(&dt, false, || {
+            unreachable!("urgency derived without early release")
+        });
+        assert!(a.held());
+        a.finish_if(&dt, true, || due);
+        assert!(!a.held());
     }
 
     /// A quantum of N means N consecutive ticks, then the turn goes back to the

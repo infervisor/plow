@@ -205,10 +205,18 @@ pub(crate) struct Lt {
     stored: std::collections::HashMap<StoredKey, Algo>,
     /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
     write: Option<std::path::PathBuf>,
+    /// Set once this engine has warned that it times a plan no table pins.
+    unpinned_warned: std::sync::atomic::AtomicBool,
 }
 
 impl Lt {
-    pub(crate) fn load(be: &Arc<CudaBackend>) -> Result<Arc<Self>> {
+    /// `assets_dir`: the engine's bundle, whose `cublaslt_algos.jsonl` pins its shapes unless
+    /// `PLOW_LT_ALGOS` names a table (or `PLOW_LT_ALGOS_WRITE` is recording one). Per engine, not
+    /// per process: two co-served bundles carry two tables.
+    pub(crate) fn load(
+        be: &Arc<CudaBackend>,
+        assets_dir: Option<&std::path::Path>,
+    ) -> Result<Arc<Self>> {
         be.bind()?;
         let api = Api::load()?;
         let workspace = be.alloc(0, 256 * 1024 * 1024)?;
@@ -219,7 +227,10 @@ impl Lt {
         }
         let nv = &crate::config::RuntimeConfig::get().nv;
         let mut stored = std::collections::HashMap::new();
-        if let Some(path) = nv.lt_algos.as_deref().map(std::path::PathBuf::from) {
+        let own = assets_dir
+            .map(|d| d.join("cublaslt_algos.jsonl"))
+            .filter(|p| nv.lt_algos_write.is_none() && p.is_file());
+        if let Some(path) = nv.lt_algos.as_deref().map(std::path::PathBuf::from).or(own) {
             let text = std::fs::read_to_string(&path).map_err(|e| {
                 RuntimeError::Device(format!("PLOW_LT_ALGOS {}: {e}", path.display()))
             })?;
@@ -248,6 +259,7 @@ impl Lt {
             workspace,
             stored,
             write,
+            unpinned_warned: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -1164,6 +1176,22 @@ impl Plan {
             );
             return Ok(());
         }
+        if self.lt.write.is_none()
+            && !self
+                .lt
+                .unpinned_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                m,
+                n,
+                k,
+                pinned_shapes = self.lt.stored.len(),
+                "cuBLASLt plan timed at load: no cublaslt_algos.jsonl row pins it, so the \
+                 algorithm (and its reduction order) can differ between server starts; record \
+                 the bundle's table (campaign probe)"
+            );
+        }
         match pair {
             Some(pair) => self.select_pair(candidates, m, n, k, weight, pair, rows)?,
             None => self.select_timed(candidates, m, n, k, weight, rows, ns)?,
@@ -1586,7 +1614,7 @@ mod tests {
     #[ignore = "requires a leased SM90 GPU and cuBLASLt 12.9 or newer"]
     fn fp8_vector_scales_follow_rows_channels_and_plan_identity() -> Result<()> {
         let be = Arc::new(CudaBackend::new(0)?);
-        let lt = Lt::load(&be)?;
+        let lt = Lt::load(&be, None)?;
         let stream = be.stream_create()?;
         let (m, n, k) = (128usize, 512usize, 3840usize);
         let input = be.alloc(0, (m * k) as u64)?;

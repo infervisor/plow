@@ -89,7 +89,7 @@ CC = "/usr/bin/gcc-14"
 
 [emit]
 emit = "devblob+cubin"
-args = []
+args = ["--served-name", "qwen3.8-27b-fp8"]
 [emit.env]
 PLOW_FP8 = "1"
 PLOW_W8A8 = "1"
@@ -103,6 +103,7 @@ PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "1"
+PLOW_FP8_BLOCK_CONCAT = "1"
 PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal_ilv,attn_dec_hd256_gqa6_ilv"
 PLOW_QWEN_KV_INTERLEAVE = "1"
 PLOW_EMIT_PACKED_PREFILL = "1"
@@ -128,7 +129,6 @@ outlen = 128
 warmups = 2
 seed = 42
 tokenizer = "{env:QWEN38_FP8_CHECKPOINT}"
-# The served slug (the checkpoint directory basename, lowercased), not "checkpoint".
 model_id = "qwen3.8-27b-fp8"
 gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 

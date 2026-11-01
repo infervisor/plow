@@ -45,8 +45,26 @@ impl Default for FinalizationPolicy {
     }
 }
 
+/// Audio for one stream of [`Transcriber::stream_push_batch`].
+#[derive(Clone, Copy)]
+pub struct StreamPush<'a> {
+    pub id: u64,
+    pub samples: &'a [f32],
+    /// The recording ends here: the text is its final transcript (what [`Transcriber::transcribe`]
+    /// answers for the whole recording) and the stream closes.
+    pub finish: bool,
+}
+
+/// The refusal of a non-empty prompt by an engine that cannot condition on one.
+pub const CONTEXT_UNSUPPORTED: &str = "speech context is not implemented";
+
 pub trait Transcriber: Send {
     fn language(&self, requested: Option<&str>) -> crate::Result<Option<String>>;
+    /// Whether a request's prompt (`context`) conditions the transcript. An engine that cannot
+    /// refuses a non-empty one ([`CONTEXT_UNSUPPORTED`]) on every path, streamed or offline.
+    fn accepts_context(&self) -> bool {
+        true
+    }
     fn finalization_policy(&self) -> FinalizationPolicy {
         FinalizationPolicy::default()
     }
@@ -100,6 +118,32 @@ pub trait Transcriber: Send {
         let _ = id;
     }
 
+    /// Whether [`Transcriber::stream_push_batch`] answers finals (`finish`).
+    fn stream_finals(&self) -> bool {
+        false
+    }
+
+    /// Streams that can be open at once; `None`: no fixed limit.
+    fn stream_slots(&self) -> Option<usize> {
+        None
+    }
+
+    /// [`Transcriber::stream_push`] for several streams at once (one per id), their steps sharing
+    /// launches. Returns each stream's text in order.
+    fn stream_push_batch(&mut self, pushes: &[StreamPush<'_>]) -> Vec<crate::Result<String>> {
+        pushes
+            .iter()
+            .map(|push| {
+                if push.finish {
+                    return Err(crate::RuntimeError::Rejected(
+                        "this ASR engine answers no finals from its stream".into(),
+                    ));
+                }
+                self.stream_push(push.id, push.samples, &mut |_| {})
+            })
+            .collect()
+    }
+
     fn transcribe_batch(
         &mut self,
         requests: &[TranscriptionInput<'_>],
@@ -127,6 +171,10 @@ pub trait Transcriber: Send {
 impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
     fn language(&self, requested: Option<&str>) -> crate::Result<Option<String>> {
         (**self).language(requested)
+    }
+
+    fn accepts_context(&self) -> bool {
+        (**self).accepts_context()
     }
 
     fn batch_capacity(&self) -> usize {
@@ -173,6 +221,18 @@ impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
 
     fn stream_close(&mut self, id: u64) {
         (**self).stream_close(id)
+    }
+
+    fn stream_finals(&self) -> bool {
+        (**self).stream_finals()
+    }
+
+    fn stream_slots(&self) -> Option<usize> {
+        (**self).stream_slots()
+    }
+
+    fn stream_push_batch(&mut self, pushes: &[StreamPush<'_>]) -> Vec<crate::Result<String>> {
+        (**self).stream_push_batch(pushes)
     }
 
     fn transcribe_batch(

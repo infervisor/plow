@@ -71,6 +71,9 @@ pub struct ModelBundle {
         std::sync::OnceLock<std::result::Result<Arc<crate::serve::think::ThinkMarkers>, String>>,
     /// vLLM `--chat-template`, set once at startup; replaces the packet's template.
     template_override: std::sync::OnceLock<Arc<crate::serve::template::ChatTemplate>>,
+    is_speech: bool,
+    is_audio: bool,
+    endpoints: Vec<&'static str>,
 }
 
 impl ModelBundle {
@@ -144,6 +147,34 @@ impl ModelBundle {
             &serve,
             chat_template.as_ref().and_then(|t| t.reasoning),
         );
+
+        #[cfg(feature = "cuda")]
+        let is_speech = crate::tts::guided_lm::GuidedLmContract::load(&dir)
+            .ok()
+            .flatten()
+            .is_some()
+            || crate::tts::SpeechContract::load(&dir)
+                .ok()
+                .flatten()
+                .is_some();
+        #[cfg(not(feature = "cuda"))]
+        let is_speech = crate::tts::SpeechContract::load(&dir)
+            .ok()
+            .flatten()
+            .is_some();
+
+        let is_audio = !is_speech
+            && (dir.join("audio_lm_contract.json").is_file()
+                || crate::asr::serving::is_audio_lm(&dir).unwrap_or(false));
+
+        let endpoints = if is_speech {
+            vec!["audio/speech"]
+        } else if is_audio {
+            vec!["audio/transcriptions", "audio/transcriptions/stream"]
+        } else {
+            vec!["chat/completions", "completions"]
+        };
+
         Ok(ModelBundle {
             dir,
             manifest,
@@ -157,7 +188,22 @@ impl ModelBundle {
             reasoning_specials: std::sync::OnceLock::new(),
             think_markers: std::sync::OnceLock::new(),
             template_override: std::sync::OnceLock::new(),
+            is_speech,
+            is_audio,
+            endpoints,
         })
+    }
+
+    pub fn is_speech(&self) -> bool {
+        self.is_speech
+    }
+
+    pub fn is_audio(&self) -> bool {
+        self.is_audio
+    }
+
+    pub fn endpoints(&self) -> &[&'static str] {
+        &self.endpoints
     }
 
     /// The tokenizer's special-token text, for stripping after tool-call parsing.

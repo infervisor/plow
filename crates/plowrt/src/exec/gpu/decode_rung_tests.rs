@@ -191,6 +191,65 @@ fn fp8_cublaslt_ladder_normalizes_rows_and_rejects_wrong_extent() {
 }
 
 #[test]
+fn block_fp8_quant_ladder_pins_group_scale_rows_to_the_padded_rung() {
+    // The cuBLASLt fixture with a QuantFp8 (1x128 groups) in the interpreter segment ahead of
+    // the routed projection.
+    let quant = |blob: &mut DevBlob, i3: u32, rows4: &dyn Fn(u32) -> u32| {
+        for g in &mut blob.progs {
+            let d = &mut g.insts[4];
+            d.i = [g.t, 16, 0, i3, rows4(g.t), 0, 0, 0];
+        }
+    };
+    let (mut blob, metadata) = cublaslt_fixture();
+    blob.tensors.push(DevTensor {
+        name: "activation.scale".into(),
+        bytes: 16 * 4,
+        init: None,
+    });
+    for g in &mut blob.progs {
+        let mut q = DevInst64 {
+            op: DevOp::QuantFp8 as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        q.t[..3].copy_from_slice(&[9, 8, 11]);
+        g.insts.insert(4, q);
+        g.n_counter = 6;
+        g.succs = (0..6).collect();
+        g.waits = (0..5)
+            .map(|id| packet::dev::Wait { id, threshold: 1 })
+            .collect();
+        g.stream = (0..6)
+            .map(|pc| StreamEnt {
+                inst: pc,
+                seg: u16::from(pc == 5),
+                succ_ofs: pc,
+                succ_len: 1,
+                wait_ofs: pc.saturating_sub(1),
+                wait_len: u16::from(pc != 0),
+                ..Default::default()
+            })
+            .collect();
+        g.gq_stream = g.stream.clone();
+        g.stream_len = vec![6];
+        g.gq_seg_ofs = vec![0, 5, 6];
+    }
+    let group = packet::dev::FP8_BLOCK_GROUP;
+    quant(&mut blob, group, &|t| t.next_multiple_of(4));
+    assert!(validate_cublaslt_ladder(&blob, &metadata).unwrap());
+    // One rung off, or every rung at the widest rung's padding: the scale stride a narrow
+    // rung's GEMM reads would disagree with what its quant wrote.
+    blob.progs[1].insts[4].i[4] += 4;
+    assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
+    quant(&mut blob, group, &|_| 16);
+    assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
+    // Per-token quant (no group) keeps its own contract: i4 is not a row extent.
+    quant(&mut blob, 0, &|_| 0);
+    assert!(validate_cublaslt_ladder(&blob, &metadata).unwrap());
+}
+
+#[test]
 fn cublaslt_ladder_requires_complete_equivalent_roles_and_dependencies() {
     let (blob, mut metadata) = cublaslt_fixture();
     assert!(validate_cublaslt_ladder(&blob, &metadata).unwrap());
@@ -1776,5 +1835,26 @@ fn rung_patch_images_preserve_uploaded_mutated_insts() {
     assert_ne!(
         image[1].i[0], g_insts[1].i[0],
         "does not revert to raw blob insts"
+    );
+}
+
+#[test]
+#[ignore = "CPU-only actual packet check; set TEST_LADDER_ASSETS (and PLOW_LADDER_DEBUG=1 for the reason)"]
+fn actual_packet_ladder_qualification() {
+    let assets = std::path::PathBuf::from(std::env::var("TEST_LADDER_ASSETS").unwrap());
+    let raw = std::fs::read(DevBlob::find_in_dir(&assets).unwrap().unwrap()).unwrap();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let roles = segment_role_metadata(&blob, &raw).unwrap();
+    let qualified = match &roles {
+        Some(roles) => validate_cublaslt_ladder(&blob, roles),
+        None => validate_decode_ladder(&blob),
+    };
+    eprintln!(
+        "decode rungs {:?}: narrow addressing qualified = {qualified:?}",
+        blob.decode_rungs()
+    );
+    assert!(
+        matches!(qualified, Ok(true)),
+        "narrow rungs not qualified: {qualified:?}"
     );
 }

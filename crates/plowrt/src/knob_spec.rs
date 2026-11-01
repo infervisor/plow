@@ -206,6 +206,14 @@ const QWEN_LIGHT_DECODE: Status = Status::Candidate {
     ],
 };
 
+/// A routed decode segment [producer -> QuantFp8 1x128 groups] as one `light_quant` launch.
+const LIGHT_QUANT: Status = Status::Candidate {
+    evidence: &[
+        "qwen-fp8-decode campaign (Qwen3.8-27B FP8 hub, H100): 4 interpreter windows per layer [norm|gate|glu -> group quant], 257 per step at 15-29 us (6.55 ms of 21.9 ms B1)",
+        "`=0` is the rollback to interpreter windows",
+    ],
+};
+
 /// Runtime knobs change no packet byte; their scope is the route a workload takes.
 /// G1 (review log #85) skips union segments inside the sparse prefill programs; the packet does not
 /// change, so the route is its whole scope.
@@ -243,6 +251,86 @@ const C_PF_SEG_GEMM_SMALL: &[Constraint] = &[Constraint {
     ),
     site: "crates/plowrt/src/exec/gpu.rs: PLOW_PF_SEG_GEMM_SMALL requires PLOW_PF_SEG_DIR",
     check: Check::Site,
+}];
+
+/// The prefill segment classing must mirror the emitter's (`DevProg::seg_classes_with`): a runtime
+/// value the packet was not emitted with sends segments to objects built without those arms. A
+/// co-served packet's `PLOW_PF_SEG_FA512=1` under one emitted `PLOW_SEG_FA512=all` put hd256 flash on
+/// its FATLITE flash-class object: a trap and a poisoned context on its first prefill.
+const C_PF_SEG_FA512: &[Constraint] = &[Constraint {
+    id: "pf_seg_fa512_matches_emit",
+    formula: F::And(&[
+            F::Implies(
+                &F::Atom("rt.pf_seg_fa512", Cmp::Eq, Val::Str("1")),
+                &F::Atom("emit.seg_fa512", Cmp::Eq, Val::Str("1")),
+            ),
+            F::Implies(
+                &F::Atom("rt.pf_seg_fa512", Cmp::Eq, Val::Str("all")),
+                &F::Atom("emit.seg_fa512", Cmp::Eq, Val::Str("all")),
+            ),
+            F::Implies(
+                &F::And(&[
+                    F::Atom("rt.pf_seg_fa512", Cmp::Ne, Val::Unset),
+                    F::Atom("rt.pf_seg_fa512", Cmp::Ne, Val::Str("1")),
+                    F::Atom("rt.pf_seg_fa512", Cmp::Ne, Val::Str("all")),
+                ]),
+                &F::Or(&[
+                    F::Atom("emit.seg_fa512", Cmp::Eq, Val::Unset),
+                    F::Atom("emit.seg_fa512", Cmp::Eq, Val::Str("0")),
+                ]),
+            ),
+    ]),
+    site: "crates/plowrt/src/asset/devblob.rs seg_classes_with: PLOW_PF_SEG_FA512 mirrors the emit-side PLOW_SEG_FA512",
+    check: Check::Load,
+}];
+
+/// Pure modes `1` and `fp8` class identically and load the same objects unless `PLOW_PF_SEG_V2`
+/// routes `QuantFp8` by mode, so either serves a packet emitted with the other.
+const C_PF_SEG_PURE: &[Constraint] = &[Constraint {
+    id: "pf_seg_pure_matches_emit",
+    formula: F::And(&[
+        F::Implies(
+            &F::Or(&[
+                F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("1")),
+                F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("fp8")),
+            ]),
+            &F::Or(&[
+                F::And(&[
+                    F::Atom("rt.pf_seg_v2", Cmp::Eq, Val::Unset),
+                    F::Or(&[
+                        F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("1")),
+                        F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("fp8")),
+                    ]),
+                ]),
+                F::And(&[
+                    F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("1")),
+                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("1")),
+                ]),
+                F::And(&[
+                    F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("fp8")),
+                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("fp8")),
+                ]),
+            ]),
+        ),
+        F::Implies(
+            &F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("w8a16")),
+            &F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("w8a16")),
+        ),
+        F::Implies(
+            &F::And(&[
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Unset),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("1")),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("fp8")),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("w8a16")),
+            ]),
+            &F::Or(&[
+                F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Unset),
+                F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("0")),
+            ]),
+        ),
+    ]),
+    site: "crates/plowrt/src/asset/devblob.rs seg_classes_with: PLOW_PF_SEG_PURE mirrors the emit-side PLOW_SEG_PURE_GEMM",
+    check: Check::Load,
 }];
 
 const C_CHANNEL_MLP_RUNTIME: &[Constraint] = &[Constraint {
@@ -289,6 +377,9 @@ type Reader = fn(&RuntimeConfig) -> Val<'_>;
 const READERS: &[(&str, Reader)] = &[
     ("rt.pf_seg_dir", |c| opt_str(&c.nv.pf_seg_dir)),
     ("rt.pf_seg_gemm_small", |c| opt_str(&c.nv.pf_seg_gemm_small)),
+    ("rt.pf_seg_pure", |c| opt_str(&c.nv.pf_seg_pure)),
+    ("rt.pf_seg_fa512", |c| opt_str(&c.nv.pf_seg_fa512)),
+    ("rt.pf_seg_v2", |c| opt_str(&c.nv.pf_seg_v2)),
     ("rt.mla_pf_v2", |c| Val::Bool(c.amd.mla_pf_v2)),
     ("rt.serial", |c| Val::Bool(c.apple.serial)),
     ("rt.ane_mlp", |c| Val::Bool(c.apple.ane_mlp)),
@@ -462,6 +553,13 @@ pub fn check_knobs(knobs: &Value, rt: &RuntimeConfig) -> std::result::Result<(),
     let c = &knob_gen::CONSTRAINTS[i];
     let mut vars = Vec::new();
     c.formula.vars(&mut vars);
+    let mut seen = Vec::new();
+    vars.retain(|v| {
+        !seen.contains(v) && {
+            seen.push(*v);
+            true
+        }
+    });
     let shown: Vec<String> = vars
         .iter()
         .filter_map(|v| {
@@ -492,6 +590,179 @@ pub fn warn_removed_env() {
                  (docs/flags-reference.md, \"Serving objective\")"
             );
         }
+    }
+}
+
+/// Where a runtime knob's value lives when one process serves several models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnobScope {
+    /// Configures one model's engine (routes, kernels, KV, its dispatcher): resolved per bundle,
+    /// explicit setting > the bundle's packet default > the built-in default
+    /// ([`crate::config::bundle_config`]).
+    Engine,
+    /// One value for the process (listeners, placement, admission across models, request-path
+    /// parsing, shared pools, diagnostics). Every raw environment read is process-wide.
+    Process,
+}
+
+/// Knob families (env-name prefixes) that configure a model's engine.
+const ENGINE_FAMILIES: &[&str] = &[
+    "PLOW_AMD_",
+    "PLOW_ATTNRES_",
+    "PLOW_CPU_",
+    "PLOW_DECODE_",
+    "PLOW_DSA_",
+    "PLOW_GEN_DECODE_",
+    "PLOW_GLM_",
+    "PLOW_HSACO",
+    "PLOW_KDA_",
+    "PLOW_KV_",
+    "PLOW_LT_",
+    "PLOW_MLA_",
+    "PLOW_MOE_",
+    "PLOW_NV_",
+    "PLOW_PF_",
+    "PLOW_PREFIX_",
+    "PLOW_QWEN_",
+    "PLOW_SEG_",
+    "PLOW_SPEC",
+    "PLOW_TB_",
+    "PLOW_TP_",
+    "PLOW_VMM_",
+];
+
+/// Single engine knobs outside those families.
+const ENGINE_KNOBS: &[&str] = &[
+    "PLOW_AFFINE_Q4_DIR",
+    "PLOW_CFG_DEVICE",
+    "PLOW_CTR_DBUF",
+    "PLOW_DSTEP_EVERY",
+    "PLOW_FP8_DIR",
+    "PLOW_FUSION",
+    "PLOW_GLOBAL_QUEUE",
+    "PLOW_HSA_DRAIN_BLOCKED",
+    "PLOW_L2_PLACE_DISPATCH",
+    "PLOW_LAUNCH_ROWS",
+    "PLOW_LIGHT_QUANT",
+    "PLOW_LIVE_CTX",
+    "PLOW_LIVE_CTX_MODELS",
+    "PLOW_LM_ROW0",
+    "PLOW_LOWRUNG_MAX",
+    "PLOW_MULTISTEP",
+    "PLOW_MXFP4_DIR",
+    "PLOW_OUT_RANGE",
+    "PLOW_OVERSUB",
+    "PLOW_PACKED_PREFILL_ROUTE",
+    "PLOW_PHASE_OBJECTS",
+    "PLOW_PREFILL_LIGHT",
+    "PLOW_RAGGED_CHUNK",
+    "PLOW_SHARE_CKPT",
+    "PLOW_STATE_CLEAR_DEVICE",
+    "PLOW_STATIC",
+    "PLOW_TERMINAL_LT",
+    "PLOW_TOKEN_BATCH_ROWS",
+    "PLOW_TOKEN_BATCH_WIDE",
+    "PLOW_UPLOAD_DIRECT",
+    "PLOW_UPLOAD_SLOTS",
+    "PLOW_WEIGHT_SLAB",
+    "PLOW_WEIGHT_VMM",
+    "PLOW_XR_TAG_SLOT",
+];
+
+/// Process-wide knob families.
+const PROCESS_FAMILIES: &[&str] = &[
+    "PLOW_ANE_",
+    "PLOW_API_",
+    "PLOW_ASR_",
+    "PLOW_CHAT_",
+    "PLOW_CO_SCHED",
+    "PLOW_COSCHED_",
+    "PLOW_DP",
+    "PLOW_DUMP_",
+    "PLOW_ENCODE_",
+    "PLOW_HET_",
+    "PLOW_HTTP_",
+    "PLOW_METAL_",
+    "PLOW_MM_",
+    "PLOW_OVERLOAD",
+    "PLOW_PFX_",
+    "PLOW_PIN",
+    "PLOW_PUBLISH_",
+    "PLOW_REASONING",
+    "PLOW_ROUTE_",
+    "PLOW_SESSION_",
+    "PLOW_SNAP_",
+    "PLOW_TEST_",
+    "PLOW_TICK_",
+    "PLOW_TRACE_",
+    "PLOW_TTS_",
+    "PLOW_TURN_",
+];
+
+/// Single process-wide knobs.
+const PROCESS_KNOBS: &[&str] = &[
+    "PLOW_ANE",
+    "PLOW_BACKEND",
+    "PLOW_CHECKPOINT",
+    "PLOW_CTR_SNAP",
+    "PLOW_DEFAULT_CHAT_TEMPLATE_KWARGS",
+    "PLOW_DEV_SAMPLE",
+    "PLOW_DEVICES",
+    "PLOW_DRAIN_TIMEOUT_MS",
+    "PLOW_DSTEP_LOG",
+    "PLOW_ENABLE_REASONING",
+    "PLOW_EXIT_ON_ENGINE_DEATH",
+    "PLOW_GENERATION_CONFIG",
+    "PLOW_HOME",
+    "PLOW_HOST_TIMING",
+    "PLOW_LADDER_DEBUG",
+    "PLOW_LEAN_QUALIFY",
+    "PLOW_LIBCUDA",
+    "PLOW_LOAD_PROFILE",
+    "PLOW_MAX_QUEUED_REQUESTS",
+    "PLOW_MAX_REPLY_TOKENS",
+    "PLOW_MODELS_ROOT",
+    "PLOW_NATIVE_LAUNCH_TIMING",
+    "PLOW_OBJECTIVE",
+    "PLOW_OVERRIDE_GENERATION_CONFIG",
+    "PLOW_PLACE",
+    "PLOW_PREFETCH",
+    "PLOW_PREFETCH_THREADS",
+    "PLOW_PREFILL_SEG_TIMING",
+    "PLOW_PRELOAD",
+    "PLOW_REGISTRY",
+    "PLOW_RENDER_YIELD_MARGIN_MS",
+    "PLOW_RT_MAX_CTX",
+    "PLOW_SHED_QUEUE_DEPTH",
+    "PLOW_SIGNING_KEY",
+    "PLOW_SLAB_KEEP",
+    "PLOW_STEP_TIME",
+    "PLOW_SWITCH_TIMEOUT_MS",
+    "PLOW_TBT_SLO_MS",
+    "PLOW_TENS_SNAP",
+    "PLOW_TRUSTED_KEYS",
+    "PLOW_TTFT_LOG",
+    "PLOW_TTFT_SLO_MS",
+    "PLOW_VRAM_BUDGET_MIB",
+];
+
+/// [`KnobScope`] of the knob `env` names; `None` for a name no table classifies (the
+/// `every_knob_has_a_scope` test keeps that set empty for registered knobs). A raw environment
+/// read cannot be scoped, so a knob only [`RAW_ENV`] registers is process-wide; one that is also
+/// a runtime arg is read raw only before the config exists (`config::env_fallback`).
+pub fn knob_scope(env: &str) -> Option<KnobScope> {
+    let runtime = RUNTIME.iter().any(|k| k.env == Some(env));
+    if PROCESS_KNOBS.contains(&env) || (!runtime && RAW_ENV.iter().any(|k| k.env == Some(env))) {
+        return Some(KnobScope::Process);
+    }
+    if ENGINE_KNOBS.contains(&env) {
+        return Some(KnobScope::Engine);
+    }
+    let family = |f: &[&str]| f.iter().any(|p| env.starts_with(p));
+    match (family(ENGINE_FAMILIES), family(PROCESS_FAMILIES)) {
+        (true, false) => Some(KnobScope::Engine),
+        (false, true) => Some(KnobScope::Process),
+        _ => None,
     }
 }
 
@@ -550,6 +821,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.asr_context_max_tokens", Some("PLOW_ASR_CONTEXT_MAX_TOKENS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_numerals", Some("PLOW_ASR_NUMERALS"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("rt.asr_stream_finals", Some("PLOW_ASR_STREAM_FINALS"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("rt.asr_auto_languages", Some("PLOW_ASR_AUTO_LANGUAGES"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_vad_packet", Some("PLOW_ASR_VAD_PACKET"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_packets", Some("PLOW_ASR_PACKETS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -613,6 +885,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.route_prefix_slack", Some("PLOW_ROUTE_PREFIX_SLACK"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), OPT_IN),
     KnobSpec::new("rt.co_sched", Some("PLOW_CO_SCHED"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.cosched_max_wait_ms", Some("PLOW_COSCHED_MAX_WAIT_MS"), Layer::Runtime, U32, UNSET, DIAG),
+    KnobSpec::new("rt.cosched_early_release", Some("PLOW_COSCHED_EARLY_RELEASE"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.serve_max_queued_requests", Some("PLOW_MAX_QUEUED_REQUESTS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.models_root", Some("PLOW_MODELS_ROOT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.preload", Some("PLOW_PRELOAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
@@ -690,6 +963,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.qwen_light_occ", Some("PLOW_QWEN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), QWEN_LIGHT_DEFAULT),
     KnobSpec::new("rt.qwen_light_decode", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::Runtime, Domain::Bool, ON, QWEN_LIGHT_DECODE),
+    KnobSpec::new("rt.light_quant", Some("PLOW_LIGHT_QUANT"), Layer::Runtime, Domain::Bool, ON, LIGHT_QUANT),
     KnobSpec::new("rt.qwen_pf_graph", Some("PLOW_QWEN_PF_GRAPH"), Layer::Runtime, Domain::Bool, ON, QWEN_PF_GRAPH),
     KnobSpec::new("rt.decode_lt_qkv", Some("PLOW_DECODE_LT_QKV"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
@@ -700,8 +974,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.l2_place_dispatch", Some("PLOW_L2_PLACE_DISPATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_dir", Some("PLOW_PF_SEG_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_seg_gemm_small", Some("PLOW_PF_SEG_GEMM_SMALL"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_GEMM_SMALL),
-    KnobSpec::new("rt.pf_seg_pure", Some("PLOW_PF_SEG_PURE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.pf_seg_fa512", Some("PLOW_PF_SEG_FA512"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.pf_seg_pure", Some("PLOW_PF_SEG_PURE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_PURE),
+    KnobSpec::new("rt.pf_seg_fa512", Some("PLOW_PF_SEG_FA512"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_FA512),
     KnobSpec::new("rt.pf_seg_fa256_gqa2", Some("PLOW_PF_SEG_FA256_GQA2"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_graph", Some("PLOW_PF_SEG_GRAPH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pf_shared_tail", Some("PLOW_PF_SHARED_TAIL"), Layer::Runtime, Domain::Bool, ON, DIAG),
@@ -952,6 +1226,59 @@ pub const RAW_ENV: &[KnobSpec] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every registered knob is classified engine or process-wide: a model co-served with
+    /// another resolves its own engine knobs and shares the rest. A new knob outside every
+    /// table fails here until it is placed.
+    #[test]
+    fn every_knob_has_a_scope() {
+        let unscoped: Vec<&str> = RUNTIME
+            .iter()
+            .chain(RAW_ENV)
+            .filter_map(|k| k.env)
+            .filter(|e| knob_scope(e).is_none())
+            .collect();
+        assert!(unscoped.is_empty(), "knobs without a scope: {unscoped:?}");
+        // The families and the single lists never overlap: a knob is one or the other.
+        for e in ENGINE_KNOBS {
+            assert!(!PROCESS_KNOBS.contains(e), "{e} in both lists");
+        }
+    }
+
+    /// What the production packets carry resolves where it acts: their engine knobs per bundle,
+    /// the mux queue bound and the speech front-end settings once per process.
+    #[test]
+    fn packet_serve_knobs_scope_as_they_act() {
+        for e in [
+            "PLOW_PF_SEG_PURE",
+            "PLOW_PF_SEG_FA512",
+            "PLOW_PF_INTERLEAVE",
+            "PLOW_PF_NORM_ROW_BLOCKS",
+            "PLOW_DECODE_MAX_RUNG",
+            "PLOW_MULTISTEP",
+            "PLOW_VMM_PREFIX",
+            "PLOW_VMM_LIVE_RINGS",
+            "PLOW_VMM_HOST_CACHE_MIB",
+            "PLOW_LT_RUNG_ALGOS",
+            "PLOW_PREFIX_CACHE",
+            "PLOW_KV_POOL_MIB",
+            "PLOW_TERMINAL_LT",
+            "PLOW_AMD_ROUTER_NATIVE",
+        ] {
+            assert_eq!(knob_scope(e), Some(KnobScope::Engine), "{e}");
+        }
+        for e in [
+            "PLOW_MAX_QUEUED_REQUESTS",
+            "PLOW_TTS_REALTIME",
+            "PLOW_ASR_ENCODE_HOLD_MS",
+            "PLOW_SLAB_KEEP",
+            "PLOW_THROUGHPUT_K",
+            "PLOW_DRAIN_TIMEOUT_MS",
+            "PLOW_COSCHED_EARLY_RELEASE",
+        ] {
+            assert_eq!(knob_scope(e), Some(KnobScope::Process), "{e}");
+        }
+    }
     use plow_asset::knob::test_util::{check_table, env_reads, files, plow_tokens, ArgFacts};
     use plow_asset::knob::{Formula, KnobSpec, TargetSpec};
     use std::path::PathBuf;
@@ -1700,6 +2027,43 @@ mod tests {
         k["values"]["emit.glm_xr_band"] = 2.into();
         let err = check_knobs(&k, &rt).unwrap_err();
         assert!(err.contains("seq_par_excludes_two_shot_seams"), "{err}");
+    }
+
+    /// gemma-4-e4b (emitted `PLOW_SEG_FA512=all`) under a co-tenant's `PLOW_PF_SEG_FA512=1` trapped
+    /// on its first prefill; the load check now refuses any runtime classing the packet lacks.
+    #[test]
+    fn load_check_refuses_a_segment_classing_the_packet_was_not_emitted_for() {
+        let mut k = production_knobs();
+        k["values"]["emit.seg_fa512"] = "all".into();
+        k["values"]["emit.seg_pure_gemm"] = "1".into();
+        let mut rt = runtime_config();
+        rt.amd.mla_pf_v2 = true;
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_fa512 = Some("all".into());
+        rt.nv.pf_seg_pure = Some("1".into());
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_fa512 = Some("1".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_fa512_matches_emit"), "{err}");
+        assert_eq!(err.matches("rt.pf_seg_fa512=").count(), 1, "{err}");
+        rt.nv.pf_seg_fa512 = None;
+        // `fp8` classes like the emitted `1` unless PLOW_PF_SEG_V2 routes by mode.
+        rt.nv.pf_seg_pure = Some("fp8".into());
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_v2 = Some("q8".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_pure_matches_emit"), "{err}");
+        rt.nv.pf_seg_v2 = None;
+        rt.nv.pf_seg_pure = Some("w8a16".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_pure_matches_emit"), "{err}");
+        // A packet emitted without the classing runs only without it.
+        k["values"]["emit.seg_fa512"] = Value::Null;
+        rt.nv.pf_seg_pure = None;
+        rt.nv.pf_seg_fa512 = Some("1".into());
+        assert!(check_knobs(&k, &rt).is_err());
+        rt.nv.pf_seg_fa512 = Some("0".into());
+        check_knobs(&k, &rt).unwrap();
     }
 
     #[test]

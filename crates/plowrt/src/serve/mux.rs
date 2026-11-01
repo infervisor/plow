@@ -873,7 +873,7 @@ impl ModelMux {
     /// prefill) are at the cap, so a new one would only queue into a long TTFT; a load balancer
     /// can spill it instead. A soft bound: the seated count refreshes once per dispatcher tick.
     fn shed_queue_depth(&self) -> bool {
-        let cap = crate::config::RuntimeConfig::get().shed_queue_depth;
+        let cap = crate::config::RuntimeConfig::process_get().shed_queue_depth;
         cap > 0 && {
             let waiting = self.metrics.queued_requests.load(Ordering::Relaxed)
                 + self.metrics.prefill_waiting.load(Ordering::Relaxed);
@@ -1141,6 +1141,20 @@ pub fn spawn(
     state: Arc<AppState>,
     cfg: MuxConfig,
 ) -> ModelMux {
+    // The model's own engine config for everything the dispatcher reads, here and in its task;
+    // a model loaded without one (portable, bucketed) runs the process config by design.
+    let engine_cfg = state
+        .engine_config(&slug)
+        .unwrap_or_else(crate::config::RuntimeConfig::process_get);
+    crate::config::scoped(Some(engine_cfg), || spawn_scoped(slug, bundle, state, cfg))
+}
+
+fn spawn_scoped(
+    slug: String,
+    bundle: Arc<ModelBundle>,
+    state: Arc<AppState>,
+    cfg: MuxConfig,
+) -> ModelMux {
     let preempt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let preempt_seen = Arc::clone(&preempt_flag);
     let preempt_notify = Arc::new(tokio::sync::Notify::new());
@@ -1346,6 +1360,7 @@ pub fn spawn(
         .filter(|cpus| !cpus.is_empty() && crate::config::RuntimeConfig::get().dp_numa_pin);
     let downstream = state.downstream(&slug);
 
+    let dispatcher_scope = crate::config::current_scope();
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
         let mut fair = Fair::default();
@@ -1395,6 +1410,8 @@ pub fn spawn(
         // model parks, so an idle model never sits on a device its co-tenant is
         // waiting for.
         let mut turn = crate::serve::cosched::Turn::default();
+        // Process-scoped: one co-scheduling policy for every tenant of the device.
+        let early_release = crate::config::RuntimeConfig::process_get().cosched_early_release;
         let cost_id = crate::sched::cost::id(&slug);
         #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         let has_gpu = false;
@@ -1492,8 +1509,11 @@ pub fn spawn(
                 // jobs never had their chance to be dequeued and admitted,
                 // and a stream that ends with no terminal chunk is
                 // indistinguishable from a crash (the shed path at the
-                // admission gate sets the precedent).
-                while let Ok(msg) = rx.try_recv() {
+                // admission gate sets the precedent). Closed first, then drained to the end: a
+                // job sent after a last `try_recv` (or on a permit taken before the close) was
+                // lost with no terminal at all. `recv` ends once the buffer and permits are spent.
+                rx.close();
+                while let Some(msg) = rx.recv().await {
                     note_dequeued(&msg, &metrics);
                     match msg {
                         MuxMsg::Drain(done) => {
@@ -2044,9 +2064,12 @@ pub fn spawn(
             let joined = match &engine_thread {
                 Some(t) => t.run(tick).await,
                 None if inline_tick => crate::exec::engine_thread::run_inline(tick),
-                None => tokio::task::spawn_blocking(tick)
-                    .await
-                    .map_err(|e| e.to_string()),
+                None => {
+                    let scope = crate::config::current_scope();
+                    tokio::task::spawn_blocking(move || crate::config::scoped(scope, tick))
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             };
 
             let t_returned = Instant::now();
@@ -2180,6 +2203,12 @@ pub fn spawn(
                     obs = None;
                 }
             }
+            // `due` again: a request that finished during the tick no longer sets the urgency.
+            if let Some(dt) = &device_turn {
+                turn.finish_if(dt, early_release, || {
+                    tick_due(&slots, &waiting, cost_id, Instant::now())
+                });
+            }
 
             // Post-tick: drain OOB events from the executor. Handles faults,
             // checkpoints, and speculative verdicts. The channel is lock-free
@@ -2207,6 +2236,7 @@ pub fn spawn(
         metrics.decode_rung_admission.store(0, Ordering::Relaxed);
         metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
     };
+    let dispatcher = crate::config::Scoped::new(dispatcher_scope, dispatcher);
     if inline_tick {
         std::thread::Builder::new()
             .name(dispatcher_name)

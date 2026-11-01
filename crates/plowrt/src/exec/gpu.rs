@@ -2800,6 +2800,9 @@ pub struct GpuEngine {
     /// A launch's host window is open ([`Self::token_batch_step_window`]): snapshot restores skip
     /// their stream drain and their holds wait in `deferred_attach` for the step's own drain.
     window_open: bool,
+    /// A step entry point returned an error since the stream was last drained: kernels it
+    /// enqueued may still be queued and write slots `retire_slot` is about to unmap.
+    drain_before_unmap: bool,
     deferred_attach: Vec<usize>,
     /// Recorded after a windowed launch's id read-back: [`Self::launch_in_flight`].
     window_event: Option<CudaEvent>,
@@ -4087,6 +4090,8 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
+        crate::asset::serve::check_packet_contract(&pkt, &blob, &raw)?;
+        let derived_weights = crate::asset::checkpoint::derived_weights(&blob, &raw)?;
         let missing = crate::asset::checkpoint::missing_weights(&blob, &raw, checkpoint_dir)?;
         if !missing.is_empty() {
             return Err(crate::asset::checkpoint::missing_weights_error(
@@ -4997,7 +5002,22 @@ impl GpuEngine {
                     && td.init.is_none()
                     && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
                 {
-                    if let Some(wide) = ckpt.widened_f32(&td.name, td.bytes) {
+                    let assembled = if td.name.starts_with(packet::names::CONCAT_PREFIX) {
+                        let spec = derived_weights
+                            .as_ref()
+                            .and_then(|d| d.get(&td.name))
+                            .ok_or_else(|| {
+                                RuntimeError::Rejected(format!(
+                                    "{}: no {} entry",
+                                    td.name,
+                                    plow_asset::derived_weights::SECTION
+                                ))
+                            })?;
+                        Some(ckpt.concatenated(spec, td.bytes))
+                    } else {
+                        ckpt.widened_f32(&td.name, td.bytes)
+                    };
+                    if let Some(wide) = assembled {
                         let wide = wide?;
                         for (o, chunk) in wide.chunks(STAGE).enumerate() {
                             let dst = mem.base + (o * STAGE) as u64;
@@ -5569,7 +5589,7 @@ impl GpuEngine {
             ))
         } else if cublaslt_enabled {
             Some(cublaslt::ProjectionBackend::Lt(
-                crate::device::cuda::lt::Lt::load(&be)?,
+                crate::device::cuda::lt::Lt::load(&be, Some(assets_dir))?,
             ))
         } else {
             None
@@ -5577,7 +5597,7 @@ impl GpuEngine {
         let cublaslt_prefill = if prefill_cublaslt_enabled {
             let lt = match &cublaslt {
                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                _ => crate::device::cuda::lt::Lt::load(&be)?,
+                _ => crate::device::cuda::lt::Lt::load(&be, Some(assets_dir))?,
             };
             Some(cublaslt::ProjectionBackend::Lt(lt))
         } else {
@@ -5588,7 +5608,7 @@ impl GpuEngine {
             Some(match (&cublaslt, &cublaslt_prefill) {
                 (Some(cublaslt::ProjectionBackend::Lt(lt)), _)
                 | (_, Some(cublaslt::ProjectionBackend::Lt(lt))) => Arc::clone(lt),
-                _ => crate::device::cuda::lt::Lt::load(&be)?,
+                _ => crate::device::cuda::lt::Lt::load(&be, Some(assets_dir))?,
             })
         } else {
             None
@@ -5787,15 +5807,21 @@ impl GpuEngine {
             });
         let qwen_light_conv = light_functions.as_ref().is_some_and(|f| f.prefill_conv);
         let qwen_light_norm = light_functions.as_ref().and_then(|f| f.qwen_norm);
+        let light_quant = light_functions.as_ref().and_then(|f| f.quant);
+        let light_quant_tensors = light_quant.map(|_| &devp[..]);
         let main_qwen_light = match qwen_light_pf {
-            Some(_) if !cublaslt_segments.is_empty() => {
-                cublaslt::qwen_decode_light_segments(g, &main_folds, qwen_light_conv, |seg| {
+            Some(_) if !cublaslt_segments.is_empty() => cublaslt::qwen_decode_light_segments(
+                g,
+                &main_folds,
+                qwen_light_conv,
+                light_quant_tensors,
+                |seg| {
                     cublaslt_segments.get(seg).is_some_and(Option::is_some)
                         || gen_segments.get(seg).is_some_and(Option::is_some)
                         || moe_lt_segments.get(seg).is_some_and(Option::is_some)
                         || main_light.iter().any(|(s, _)| *s == seg)
-                })
-            }
+                },
+            ),
             _ => Vec::new(),
         };
         let ordered_waits = if cublaslt_enabled {
@@ -5978,6 +6004,7 @@ impl GpuEngine {
                 &be,
                 function,
                 qwen_light_norm,
+                light_quant.map(|q| (q, &devp[..])),
                 kernarg,
                 g,
                 &main_qwen_light,
@@ -6120,7 +6147,7 @@ impl GpuEngine {
                         light.retain(|(seg, _)| gen_rung.get(*seg).is_none_or(Option::is_none));
                         let folds = cublaslt::argmax_folds(g, &segments, &devp, lt, head_kernel.as_ref());
                         let qwen_light = match qwen_light_pf {
-                            Some(_) => cublaslt::qwen_decode_light_segments(g, &folds, qwen_light_conv, |seg| {
+                            Some(_) => cublaslt::qwen_decode_light_segments(g, &folds, qwen_light_conv, light_quant_tensors, |seg| {
                                 segments.get(seg).is_some_and(Option::is_some)
                                     || gen_rung.get(seg).is_some_and(Option::is_some)
                                     || moe_segments.get(seg).is_some_and(Option::is_some)
@@ -6231,6 +6258,7 @@ impl GpuEngine {
                                 &be,
                                 function,
                                 qwen_light_norm,
+                                light_quant.map(|q| (q, &devp[..])),
                                 rung.kernarg,
                                 g,
                                 &qwen_light,
@@ -6758,7 +6786,7 @@ impl GpuEngine {
             } else {
                 let lt = match &cublaslt_prefill {
                     Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                    _ => crate::device::cuda::lt::Lt::load(&be)?,
+                    _ => crate::device::cuda::lt::Lt::load(&be, Some(assets_dir))?,
                 };
                 let object = attention_gemm::object(assets_dir).ok_or_else(|| {
                     RuntimeError::Rejected("PLOW_PF_ATTN_GEMM: softmax object vanished".into())
@@ -7691,6 +7719,7 @@ impl GpuEngine {
                 .and(serve.manifest.kv.clone()),
             kv_geo: serve.manifest.kv.clone(),
             window_open: false,
+            drain_before_unmap: false,
             deferred_attach: Vec::new(),
             window_event: None,
             step_events: None,
@@ -8220,6 +8249,11 @@ impl GpuEngine {
         Some(budget)
     }
 
+    /// Free device memory this engine's KV admission leaves unbudgeted (fixed at load).
+    pub fn kv_admit_reserve(&self) -> u64 {
+        self.kv_admit_reserve
+    }
+
     pub fn kv_pressure_events(&self) -> u64 {
         self.kv_pressure_events
     }
@@ -8448,6 +8482,11 @@ impl GpuEngine {
         }
     }
 
+    /// Step entry points report their outcome: a failed step may leave kernels queued.
+    fn note_step_result(&mut self, failed: bool) {
+        self.drain_before_unmap |= failed;
+    }
+
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
         self.staged_prefix[b] = None;
         self.prefix_attach_off[b] = false;
@@ -8459,10 +8498,14 @@ impl GpuEngine {
         }
         // The unmaps below are host-side, outside stream order. A step that returned an error
         // can leave kernels queued that still write this slot (an unfed row writes its KV at
-        // `pos`); a launch window's work never touches a slot it retires.
-        if !self.window_open {
-            if let Err(e) = self.be.stream_synchronize(&self.stream) {
-                tracing::warn!(slot = b, error = %e, "retire: stream drain failed");
+        // `pos`); a launch window's work never touches a slot it retires. A successful step has
+        // read its ids back and a pipelined one defers the retirement above, so only the error
+        // case drains: draining every retirement stalled the decode pipeline behind the next
+        // queued launch (26B BF16 at 2.7 sessions/s: +30 ms on 40% of prefill ticks).
+        if self.drain_before_unmap && !self.window_open {
+            match self.be.stream_synchronize(&self.stream) {
+                Ok(()) => self.drain_before_unmap = false,
+                Err(e) => tracing::warn!(slot = b, error = %e, "retire: stream drain failed"),
             }
         }
         if self.pos[b] > 0 {
@@ -8667,6 +8710,8 @@ impl GpuEngine {
                         return Err(drain);
                     }
                 }
+                // A failed admission may have queued restores into this slot before it failed.
+                self.drain_before_unmap = true;
                 self.retire_slot(b, false);
                 let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
                 // Parked live rings hold device memory no request owns; when
@@ -8823,6 +8868,17 @@ impl GpuEngine {
     /// rows keep the greedy `ARGMAX_FIN` token. `None`, an all-greedy `specs`,
     /// or no loaded sampler → the greedy path, byte-identical to before.
     pub fn step_slots_sampled(
+        &mut self,
+        feeds: &[(usize, u32)],
+        specs: Option<&[DevSample]>,
+        toks: &mut Vec<u32>,
+    ) -> Result<()> {
+        let r = self.step_slots_sampled_unchecked(feeds, specs, toks);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn step_slots_sampled_unchecked(
         &mut self,
         feeds: &[(usize, u32)],
         specs: Option<&[DevSample]>,
@@ -9438,6 +9494,19 @@ impl GpuEngine {
         cut: Option<&dyn Fn() -> bool>,
         out: &mut Vec<u32>,
     ) -> Result<usize> {
+        let r = self.multi_step_sampled_at_most_unchecked(feeds, requested, sample, cut, out);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn multi_step_sampled_at_most_unchecked(
+        &mut self,
+        feeds: &[(usize, u32)],
+        requested: usize,
+        sample: Option<(&[DevSample], &dyn Fn(usize, usize) -> f32)>,
+        cut: Option<&dyn Fn() -> bool>,
+        out: &mut Vec<u32>,
+    ) -> Result<usize> {
         out.clear();
         let cfg_steps = self.take_cfg_staged();
         let sample = sample.filter(|(specs, _)| specs.iter().any(|s| s.temp > 0.0));
@@ -9755,6 +9824,17 @@ impl GpuEngine {
         lookahead: bool,
         out: &mut Vec<(usize, u32)>,
     ) -> Result<()> {
+        let r = self.pipe_step_unchecked(feeds, lookahead, out);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn pipe_step_unchecked(
+        &mut self,
+        feeds: &[(usize, u32)],
+        lookahead: bool,
+        out: &mut Vec<(usize, u32)>,
+    ) -> Result<()> {
         out.clear();
         if feeds.is_empty() {
             return Ok(());
@@ -9798,6 +9878,12 @@ impl GpuEngine {
 
     /// Complete every queued pipelined step; `out` receives their `(slot, token)` in order.
     pub fn pipe_drain(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
+        let r = self.pipe_drain_unchecked(out);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn pipe_drain_unchecked(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
         out.clear();
         while self.pipe_busy() {
             self.pipe_complete(out)?;
@@ -10222,8 +10308,13 @@ impl GpuEngine {
             }
         }
         let base = self.cfg_slab()?.counts.base + (slot * vocab * 4) as u64;
-        self.be.memcpy_htod(base, bytemuck::cast_slice(&row))?;
-        self.be.synchronize()
+        // On the engine stream: a context-wide synchronize also waits for every co-tenant's work.
+        // SAFETY: `row` outlives the stream synchronize below; `base` spans `vocab` u32 counts.
+        unsafe {
+            self.be
+                .memcpy_htod_async(base, bytemuck::cast_slice(&row), &self.stream)?;
+        }
+        self.be.stream_synchronize(&self.stream)
     }
 
     /// Stage guided draws for the next [`Self::step_slots_sampled`] (`steps == 1`) or
@@ -10803,8 +10894,8 @@ impl GpuEngine {
                         return Err(RuntimeError::Device(format!(
                             "PLOW_PF_SEG_FA512=all classes hd256 flash onto {fa_file}, but that \
                              object was built without its hd256 arm (PLOW_BUILD_FA_HD256=1) — \
-                             it would trap on the first hd256 segment. Rebuild the object or set \
-                             PLOW_PF_SEG_FA512=1."
+                             it would trap on the first hd256 segment. Rebuild the object, or re-emit \
+                             the packet with PLOW_SEG_FA512=1 (the runtime value must match it)."
                         )));
                     }
                     Some((m3, f3, s3, g3))
@@ -11415,7 +11506,7 @@ impl GpuEngine {
                             .then_some(0)
                         })
                         .collect();
-                    cublaslt::qwen_light_segments(g, &library, false)
+                    cublaslt::qwen_light_segments(g, &library, false, None)
                 }
                 None => Vec::new(),
             };
@@ -11514,7 +11605,7 @@ impl GpuEngine {
                         if moe_lt.as_ref().is_none_or(|owner| !owner.fits(segment)) {
                             let lt = match cublaslt_backend {
                                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                                _ => crate::device::cuda::lt::Lt::load(be)?,
+                                _ => crate::device::cuda::lt::Lt::load(be, Some(assets_dir))?,
                             };
                             let directories: Vec<&Path> =
                                 seg_dir.as_deref().into_iter().chain([assets_dir]).collect();
@@ -11903,6 +11994,12 @@ impl GpuEngine {
     ///
     /// Requires `begin_slot()` to have validated the sequence budget first.
     pub fn prefill_slot(&mut self, b: usize, prompt: &[u32]) -> Result<u32> {
+        let r = self.prefill_slot_unchecked(b, prompt);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn prefill_slot_unchecked(&mut self, b: usize, prompt: &[u32]) -> Result<u32> {
         loop {
             match self.prefill_chunk(b, prompt, usize::MAX)? {
                 PrefillStep::Done(tok) => return Ok(tok),
@@ -11973,6 +12070,17 @@ impl GpuEngine {
     }
 
     pub fn prefill_chunk(&mut self, b: usize, prompt: &[u32], cap: usize) -> Result<PrefillStep> {
+        let r = self.prefill_chunk_unchecked(b, prompt, cap);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn prefill_chunk_unchecked(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        cap: usize,
+    ) -> Result<PrefillStep> {
         // Unpacked, a staged bucket writes every stage at once: hold the chunk to one stage.
         let cap = cap.min(
             self.packed_prefill
@@ -14133,6 +14241,12 @@ impl GpuEngine {
     /// decode step of the last prompt token (`step_slots`), so no lm_head
     /// readback happens here.
     pub fn prefill_batched(&mut self, reqs: &[PfBatchReq]) -> Result<()> {
+        let r = self.prefill_batched_unchecked(reqs);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn prefill_batched_unchecked(&mut self, reqs: &[PfBatchReq]) -> Result<()> {
         let chunks =
             reqs.iter()
                 .map(|r| {

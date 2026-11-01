@@ -32,6 +32,8 @@ use std::sync::Arc;
 
 const ROWS_PER_BLOCK: u32 = 32;
 const CHUNK_BYTES: u64 = 8 << 20;
+/// Least pause after each pinned host chunk the grower allocates (see the grower thread).
+const HOST_GROW_GAP: std::time::Duration = std::time::Duration::from_millis(1);
 /// Device headroom the spill-ahead thread keeps for publishes when a host tier is armed
 /// (`VmmKv::spawn_spill_ahead`): about a second of boundaries at the production rate.
 pub const SPILL_AHEAD_BYTES: u64 = 2 << 30;
@@ -249,6 +251,20 @@ pub struct BlockServe {
     held: Mutex<Vec<Vec<Hold>>>,
     stats: Mutex<BlockServeStats>,
     _grower_stop: WorkerStop,
+    /// `kernel`'s module: unloaded with the store server, or every reload pinned another.
+    _segcopy: Option<OwnedModule>,
+    /// This store's share of the process host-tier budget.
+    _host_grant: crate::memory::vmm::HostTierGrant,
+}
+
+struct OwnedModule(Arc<CudaBackend>, crate::device::Module);
+
+impl Drop for OwnedModule {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.module_unload(&self.1) {
+            tracing::warn!(error = %e, "kv store: segment-copy module unload");
+        }
+    }
 }
 
 /// Stops the store's worker threads when dropped: with the `BlockServe`, or on a failed
@@ -269,9 +285,10 @@ impl BlockServe {
         be: &Arc<CudaBackend>,
         v: &VmmServe,
         device_cap: u64,
-        host_cap: u64,
+        host_grant: crate::memory::vmm::HostTierGrant,
         state_tensors: &[(usize, u64)],
     ) -> Result<Arc<Self>> {
+        let host_cap = host_grant.bytes();
         let kv = v.kv.as_ref().expect("block store needs the prefix pool");
         let g = kv.geometry();
         let block_rows = kv.block_rows();
@@ -317,16 +334,16 @@ impl BlockServe {
         .iter()
         .chain(state_tensors.iter().map(|(_, bytes)| bytes))
         .all(|b| b % 16 == 0);
-        let kernel = if vector_ok {
+        let (kernel, segcopy) = if vector_ok {
             match Self::load_kernel(be) {
-                Ok(f) => Some(f),
+                Ok((f, m)) => (Some(f), Some(OwnedModule(Arc::clone(be), m))),
                 Err(e) => {
                     tracing::warn!(error = %e, "kv store: segment-copy kernel unavailable, memcpy loop");
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
         };
         let store = Arc::new(KvStore::new(
             Arc::clone(be) as Arc<dyn crate::memory::kv_store::StoreOps>,
@@ -347,13 +364,13 @@ impl BlockServe {
             let stop = Arc::clone(&grower_stop.0);
             std::thread::Builder::new()
                 .name("kv-store-free".into())
-                .spawn(move || {
+                .spawn(crate::config::inherit(move || {
                     while !stop.load(Ordering::Relaxed) {
                         if !store.free_step() {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         }
                     }
-                })
+                }))
                 .map_err(|e| RuntimeError::Rejected(format!("kv store: free worker: {e}")))?;
         }
         if host_cap > 0 {
@@ -361,13 +378,22 @@ impl BlockServe {
             let stop = Arc::clone(&grower_stop.0);
             std::thread::Builder::new()
                 .name("kv-store-host-grower".into())
-                .spawn(move || {
+                .spawn(crate::config::inherit(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        if !store.host_grow_step() {
-                            std::thread::sleep(std::time::Duration::from_millis(2));
-                        }
+                        let t = std::time::Instant::now();
+                        let grew = store.host_grow_step();
+                        // Pinning holds the driver's context lock. Back to back, the grower held
+                        // it nearly all the time while a cold tier filled (26B BF16, 8 MiB
+                        // chunks: 30 GiB in a minute) and the engine thread's CUDA calls waited
+                        // seconds behind it in admission, launch or readback. Leave the lock
+                        // free at least as long as each pin held it.
+                        std::thread::sleep(if grew {
+                            t.elapsed().max(HOST_GROW_GAP)
+                        } else {
+                            std::time::Duration::from_millis(2)
+                        });
                     }
-                })
+                }))
                 .map_err(|e| RuntimeError::Rejected(format!("kv store: host grower: {e}")))?;
         }
         tracing::info!(
@@ -406,14 +432,22 @@ impl BlockServe {
             held: Mutex::new((0..batch).map(|_| Vec::new()).collect()),
             _grower_stop: grower_stop,
             stats: Mutex::new(BlockServeStats::default()),
+            _segcopy: segcopy,
+            _host_grant: host_grant,
         }))
     }
 
-    fn load_kernel(be: &Arc<CudaBackend>) -> Result<KernelFn> {
+    fn load_kernel(be: &Arc<CudaBackend>) -> Result<(KernelFn, crate::device::Module)> {
         let mut image = SEGCOPY_PTX.as_bytes().to_vec();
         image.push(0);
         let module = crate::device::Backend::module_load(&**be, &image)?;
-        be.get_function(&module, SEGCOPY_ENTRY)
+        match be.get_function(&module, SEGCOPY_ENTRY) {
+            Ok(f) => Ok((f, module)),
+            Err(e) => {
+                let _ = be.module_unload(&module);
+                Err(e)
+            }
+        }
     }
 
     pub fn stats(&self) -> BlockServeStats {

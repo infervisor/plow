@@ -36,7 +36,6 @@ use crate::serve::stream::{self as stream_mod, StreamChunk};
 use crate::serve::AppState;
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SpeechRequest {
     pub model: String,
     /// At most [`super::MAX_INPUT_CHARS`] characters; a long input is spoken as sentence segments.
@@ -176,14 +175,7 @@ pub fn serves_speech(state: &AppState, slug: &str) -> bool {
     let Ok(bundle) = state.registry.get(slug) else {
         return false;
     };
-    guided_models()
-        .lock()
-        .iter()
-        .any(|((dir, _), g)| *dir == bundle.dir && g.is_some())
-        || speech_models()
-            .lock()
-            .iter()
-            .any(|((dir, _), m)| *dir == bundle.dir && m.is_some())
+    bundle.is_speech()
 }
 
 enum Pipeline {
@@ -225,11 +217,17 @@ fn bind_pipeline(
 /// `slug`'s [`SpeechSpec`] when it serves speech (its `/v1/models` card).
 pub fn speech_spec(state: &AppState, slug: &str) -> Option<SpeechSpec> {
     let bundle = state.registry.get(slug).ok()?;
-    match bound_pipeline(&bundle.dir, state.ordinal_of(slug))? {
-        Pipeline::Guided(g) => Some(g.spec.clone()),
-        Pipeline::Speech(m) => Some(m.spec(&**bundle.tokenizer()).clone()),
-        Pipeline::None => None,
+    if let Some(pipe) = bound_pipeline(&bundle.dir, state.ordinal_of(slug)) {
+        return match pipe {
+            Pipeline::Guided(g) => Some(g.spec.clone()),
+            Pipeline::Speech(m) => Some(m.spec(&**bundle.tokenizer()).clone()),
+            Pipeline::None => None,
+        };
     }
+    if let Ok(Some(s)) = SpeechContract::load(&bundle.dir) {
+        return Some(s.spec(&**bundle.tokenizer()));
+    }
+    None
 }
 
 /// Forget `dir`'s speech pipeline on `device`: its vocoder/codec threads exit, freeing their
@@ -829,7 +827,7 @@ pub async fn ws_speech(
         })
 }
 
-async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids: RequestIds) {
+async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, handshake_ids: RequestIds) {
     while let Some(msg) = socket.recv().await {
         let text = match msg {
             Ok(Message::Text(t)) => t,
@@ -869,6 +867,7 @@ async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids:
             .tts
             .websocket_sessions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut ids = handshake_ids.with_new_request();
         if let Err(e) = ids.apply_body(&req.route()) {
             let _ = socket
                 .send(Message::Text(
@@ -905,6 +904,8 @@ async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids:
 
         let mut stream = response.into_body().into_data_stream();
         let mut sent_any = false;
+        let mut stream_err: Option<String> = None;
+        let mut clean_eof = false;
         loop {
             tokio::select! {
                 chunk = stream.next() => {
@@ -916,7 +917,14 @@ async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids:
                             }
                         }
                         Some(Ok(_)) => {}
-                        _ => break,
+                        Some(Err(e)) => {
+                            stream_err = Some(e.to_string());
+                            break;
+                        }
+                        None => {
+                            clean_eof = true;
+                            break;
+                        }
                     }
                 }
                 msg = socket.recv() => {
@@ -930,7 +938,19 @@ async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, mut ids:
                 }
             }
         }
-        if sent_any {
+        if let Some(err_msg) = stream_err {
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "error": {
+                            "message": err_msg,
+                            "type": "server_error"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await;
+        } else if clean_eof && sent_any {
             let _ = socket
                 .send(Message::Text(serde_json::json!({"done": true}).to_string()))
                 .await;
@@ -963,13 +983,13 @@ async fn speech_with(
         let routed = match dp.as_deref() {
             Some(set) => {
                 if let Err(e) = state.dp_admit(set).await {
-                    return crate::serve::api_error(
+                    return e.with_retry_after(crate::serve::api_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         e.to_string(),
                         "server_error",
                         None,
                         None,
-                    );
+                    ));
                 }
                 state
                     .dp_route(set, ids.session.as_deref(), None, exclude)
@@ -983,13 +1003,13 @@ async fn speech_with(
                 if let Some(mgr) = state.manager_for(&req.model) {
                     if mgr.manages(&req.model) {
                         if let Err(e) = mgr.ensure_resident(&req.model).await {
-                            return crate::serve::api_error(
+                            return e.with_retry_after(crate::serve::api_error(
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 e.to_string(),
                                 "server_error",
                                 None,
                                 None,
-                            );
+                            ));
                         }
                     }
                 }
@@ -2634,5 +2654,49 @@ mod tests {
                 assert_eq!(seen, (0..total).collect::<Vec<_>>());
             }
         }
+    }
+
+    /// Request identity is reset per WebSocket message: turns and budgets do not leak across
+    /// requests, and each message obtains a fresh request id.
+    #[test]
+    fn websocket_request_ids_reset_per_message() {
+        use crate::serve::session::{RequestIds, RouteFields};
+        use axum::http::HeaderMap;
+
+        let handshake = RequestIds::from_headers(&HeaderMap::new()).unwrap();
+        let r1 = RouteFields {
+            metadata: Some(
+                serde_json::json!({
+                    "turn_id": "turn-1",
+                    "turn_budget_ms": 500,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ..Default::default()
+        };
+        let mut msg1_ids = handshake.with_new_request();
+        msg1_ids.apply_body(&r1).unwrap();
+        assert_eq!(msg1_ids.turn.as_deref(), Some("turn-1"));
+        assert_eq!(msg1_ids.budget_ms, Some(500));
+
+        let r2 = RouteFields {
+            metadata: Some(
+                serde_json::json!({
+                    "turn_id": "turn-2",
+                    "turn_budget_ms": 1000,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ..Default::default()
+        };
+        let mut msg2_ids = handshake.with_new_request();
+        msg2_ids.apply_body(&r2).unwrap();
+        assert_eq!(msg2_ids.turn.as_deref(), Some("turn-2"));
+        assert_eq!(msg2_ids.budget_ms, Some(1000));
+        assert_ne!(msg1_ids.request, msg2_ids.request);
     }
 }
