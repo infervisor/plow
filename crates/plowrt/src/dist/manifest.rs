@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use plow_asset::dist::{
     Bundle, BundleCheckpoint, BundleObjset, CheckpointFile, FileRef, LowRung, ObjSet, ObjSetObject,
-    Parallel, Provenance, Target, TokenizerRef, BUNDLE_SCHEMA, OBJSET_SCHEMA,
+    Parallel, Provenance, Target, TokenizerRef, OBJSET_SCHEMA,
 };
 
 use crate::{Result, RuntimeError};
@@ -768,7 +768,13 @@ pub fn discover_objects(dir: &Path, syms: &dyn SymbolReader) -> Result<Vec<ObjSe
 /// directory without library objects or segment objects keeps the objset id it always had; then
 /// `.aot`; then `objects/`, each sorted.
 pub fn served_objects(assets: &Path) -> Result<Vec<ObjSetObject>> {
-    let mut objects = discover_objects(assets, &Readelf)?;
+    // A packet that embeds its interpreters may have no object beside it but its library or
+    // segment objects; only an empty set as a whole is an error.
+    let mut objects = if sorted_files(assets, &[".elf", ".co", ".cubin"])?.is_empty() {
+        Vec::new()
+    } else {
+        discover_objects(assets, &Readelf)?
+    };
     for p in sorted_files(assets, &[LIBRARY_OBJECT_SUFFIX])? {
         objects.push(digest_object(&p, file_name(&p))?);
     }
@@ -795,6 +801,13 @@ pub fn served_objects(assets: &Path) -> Result<Vec<ObjSetObject>> {
                 stray.join(", ")
             );
         }
+    }
+    if objects.is_empty() {
+        return Err(bad(format!(
+            "{}: no *.cubin, *.aot or {}/ objects found",
+            assets.display(),
+            plow_asset::dist::SEGMENT_OBJECTS_DIR
+        )));
     }
     Ok(objects)
 }
@@ -1250,7 +1263,7 @@ pub fn build_bundle(
         .unwrap_or_else(|| default_label(&id.target, &id.parallel, id.max_ctx, &features));
 
     let mut bundle = Bundle {
-        schema: BUNDLE_SCHEMA.to_string(),
+        schema: plow_asset::dist::bundle_schema(&id.target.vendor).to_string(),
         namespace: id.namespace.clone(),
         name: id.name.clone(),
         label,
@@ -1487,8 +1500,12 @@ pub fn generate(
             if let Some(named) = named {
                 check_named_objects(assets, named, &objects)?;
             }
-            check_declared(&assets.join("model.pkt"), &objects)?;
-            let defines_dir = named.unwrap_or(assets);
+            for packet in sorted_files(assets, &[".pkt"])? {
+                check_declared(&packet, &objects)?;
+            }
+            let defines_dir = named
+                .filter(|d| d.join("build_defines.json").exists())
+                .unwrap_or(assets);
             Some((
                 build_objset(&id, defines_dir, objects)?,
                 assets.to_path_buf(),

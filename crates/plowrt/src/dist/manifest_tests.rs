@@ -1042,7 +1042,7 @@ fn a_target_that_ships_objects_needs_them_somewhere() {
     )
     .unwrap_err()
     .to_string();
-    assert!(e.contains("no *.elf, *.cubin or *.co found"), "{e}");
+    assert!(e.contains("no *.cubin, *.aot or objects/ objects found"), "{e}");
 }
 
 /// The GDN prefill library is loaded from beside the packet, so it travels
@@ -1544,4 +1544,128 @@ fn a_named_object_directory_must_be_the_segment_set_serving_reads() {
     .unwrap();
     let e = gen(&short).unwrap_err().to_string();
     assert!(e.contains("interp_sm90a_pfseg.cubin is served from"), "{e}");
+}
+
+#[test]
+fn a_gdn_prefill_program_needs_the_gdn_library_beside_it() {
+    let mut b = packet::devbuild::Builder::new(1);
+    b.emit(packet::dev::DevOp::QwenGdnPrefill, vec![0], &[], |_| {});
+    let p = b.finish();
+    let model = packet::devbuild::Model {
+        n_cu: 1,
+        target: 0,
+        tensors: p.tensors.clone(),
+        progs: vec![p],
+        kv_row_insts: Vec::new(),
+        prog_t: vec![1],
+        gen: Vec::new(),
+    };
+    let assets = tmp("gdn");
+    served_tree(&assets);
+    std::fs::write(assets.join("model.pkt"), model.to_blob_v6(&[])).unwrap();
+    assert_eq!(
+        declared_objects(&assets.join("model.pkt")).unwrap(),
+        [(GDN_PREFILL_OBJECT.to_string(), None)]
+    );
+    let r = write_recipe(&tmp("gdn-recipe"), MINIMAL);
+    let gen = || {
+        generate(
+            &r,
+            &assets,
+            None,
+            Overrides::default(),
+            &BundleArgs::default(),
+        )
+    };
+    let e = gen().unwrap_err().to_string();
+    assert!(
+        e.contains("plow_gdn_prefill.aot is not in the asset directory"),
+        "{e}"
+    );
+    std::fs::write(assets.join(GDN_PREFILL_OBJECT), b"PLOWAOT1-gdn").unwrap();
+    let g = gen().unwrap();
+    assert!(names(&g.objset.unwrap().0).contains(&GDN_PREFILL_OBJECT));
+}
+
+/// A packet that embeds its interpreters ships only its library and segment objects.
+#[test]
+fn an_embedded_interpreter_build_packs_its_other_objects() {
+    let assets = tmp("embedded");
+    served_tree(&assets);
+    for f in [
+        "interp_sm90a.cubin",
+        "interp_sm90a_pfseg.cubin",
+        "gen_sm90a_attn_pf_hd256_sliding.cubin",
+        "sample_sm120.cubin",
+    ] {
+        std::fs::remove_file(assets.join(f)).unwrap();
+    }
+    std::fs::write(
+        assets.join("model.pkt"),
+        declaring_packet(&sha256_bytes(AOT)).as_slice(),
+    )
+    .unwrap();
+    // The generated role the fixture packet declares is gone with it; declare the library only.
+    let only_aot = {
+        let roles = serde_json::json!({"version": 1, "objects": {"26": {"abi": "x",
+            "file": "plow_fa4_hd512.aot", "sha256": sha256_bytes(AOT)}}, "programs": []});
+        packet::devbuild::Model {
+            n_cu: 132,
+            target: 0,
+            tensors: Vec::new(),
+            progs: Vec::new(),
+            kv_row_insts: Vec::new(),
+            prog_t: Vec::new(),
+            gen: Vec::new(),
+        }
+        .to_blob_v6(&[packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::segment_roles::SECTION.into(),
+            data: serde_json::to_vec(&roles).unwrap(),
+        }])
+    };
+    std::fs::write(assets.join("model.pkt"), only_aot).unwrap();
+    let r = write_recipe(&tmp("embedded-recipe"), MINIMAL);
+    let g = generate(
+        &r,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        names(&g.objset.unwrap().0),
+        [
+            "plow_fa4_hd512.aot",
+            "objects/attn_softmax_sm90a.cubin",
+            "objects/interp_sm90a_pfseg.cubin",
+            "objects/plow_fa4_hd512.aot",
+        ]
+    );
+}
+
+/// A v1 reader lays objects under `hsaco/`, where NVIDIA serving never looks: an NVIDIA bundle
+/// is written as v2 so that reader refuses it, and a v1 NVIDIA bundle still reads.
+#[test]
+fn an_nvidia_bundle_is_one_a_hsaco_layout_reader_refuses() {
+    let assets = tmp("schema");
+    served_tree(&assets);
+    let r = write_recipe(&tmp("schema-recipe"), MINIMAL);
+    let g = generate(
+        &r,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
+    assert_eq!(g.bundle.schema, plow_asset::dist::BUNDLE_SCHEMA_NVIDIA_TREE);
+    g.bundle.validate().unwrap();
+    let mut v1 = g.bundle.clone();
+    v1.schema = plow_asset::dist::BUNDLE_SCHEMA.into();
+    v1.validate().unwrap();
+    let mut amd = g.bundle;
+    amd.target.vendor = "amd".into();
+    assert!(amd.validate().unwrap_err().contains("unsupported schema"));
 }

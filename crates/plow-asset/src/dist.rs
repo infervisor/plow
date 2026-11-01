@@ -21,6 +21,19 @@ use std::collections::BTreeMap;
 
 pub const INDEX_SCHEMA: &str = "plow.dist.model.v1";
 pub const BUNDLE_SCHEMA: &str = "plow.dist.bundle.v1";
+/// An NVIDIA bundle whose objset lays out as the asset tree it was served from
+/// ([`objset_root`]). A v1 reader would lay those objects under `hsaco/`, where NVIDIA serving
+/// never reads them, and serve without them; the schema makes it refuse instead.
+pub const BUNDLE_SCHEMA_NVIDIA_TREE: &str = "plow.dist.bundle.v2";
+
+/// The schema a bundle for `vendor` is written with.
+pub fn bundle_schema(vendor: &str) -> &'static str {
+    if vendor == "nvidia" {
+        BUNDLE_SCHEMA_NVIDIA_TREE
+    } else {
+        BUNDLE_SCHEMA
+    }
+}
 pub const OBJSET_SCHEMA: &str = "plow.dist.objset.v1";
 
 /// The name a bundle's manifest goes by beside its files: in a `plowc` assets
@@ -659,8 +672,10 @@ fn is_plain_name(s: &str) -> bool {
 /// An objset object name: one plain component, or one under [`SEGMENT_OBJECTS_DIR`].
 fn is_object_name(s: &str) -> bool {
     // `Path` drops a trailing separator, so `x/` would pass as a plain name and land as a
-    // directory.
+    // directory; `objects` itself is the directory; `\` is a separator elsewhere.
     !s.ends_with('/')
+        && !s.contains('\\')
+        && s != SEGMENT_OBJECTS_DIR
         && (is_plain_name(s)
             || s.strip_prefix(SEGMENT_OBJECTS_DIR)
                 .and_then(|rest| rest.strip_prefix('/'))
@@ -786,7 +801,8 @@ impl ObjSet {
 
 impl Bundle {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != BUNDLE_SCHEMA {
+        // A v1 NVIDIA bundle predates the tree layout; it is read, and laid out, as one.
+        if self.schema != BUNDLE_SCHEMA && self.schema != bundle_schema(&self.target.vendor) {
             return Err(format!("bundle: unsupported schema {}", self.schema));
         }
         if self.files.is_empty() {
