@@ -54,7 +54,7 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
    in place). Both engines preallocate weights + KV pools, so the number is the configured
    footprint plus transient workspace: compare it at equal `max_ctx` / slot count, and quote the
    KV budget beside it. Host resources are sampled too (`HOST_SAMPLE_MS`, default 2000,
-   `scripts/bench/host_res.py`): per cell host RSS/Pss, VmLck/VmPin, cores busy, threads,
+   `scripts/bench/host_res.py`): per cell host RSS (Pss opt-in, `PB_HOST_PSS`), VmLck/VmPin, cores busy, threads,
    processes and mapped libraries land in `run-record.json` under `host_resources`.
 9. **Quiet box for report-grade cells.** `bench --quiet-lock FILE` holds `FILE` exclusively for
    the whole session through `scripts/bench/quietx.sh`, taken INSIDE the GPU lease; builds and

@@ -97,6 +97,7 @@ class HostSamplerTests(unittest.TestCase):
                 summary = json.loads((Path(directory) / "host.json").read_text())
                 self.assertEqual(summary["procs"]["peak"], 1)
                 self.assertGreater(summary["rss_mib"]["peak"], 0)
+                self.assertNotIn("pss_mib", summary)
                 self.assertEqual(summary["processes"][0]["pid"], server.pid)
                 self.assertTrue((Path(directory) / "host.tsv").read_text().startswith("t\tprocs"))
         finally:

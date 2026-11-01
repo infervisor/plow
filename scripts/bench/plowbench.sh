@@ -491,12 +491,15 @@ pb_metrics_stop() {
 }
 
 # pb_host_start <resdir> <root-pid> [metrics-url] / pb_host_stop — sample the server's host process
-# tree (RSS, Pss, VmLck/VmPin, cores busy, threads, processes, MemAvailable, mapped libraries and,
-# with a plowrt /metrics URL, the pinned KV host tier) every PB_HOST_MS (2000) ms into
+# tree (RSS, VmLck/VmPin, cores busy, threads, processes, MemAvailable, mapped libraries and,
+# with a plowrt /metrics URL, the pinned KV host tier) every PB_HOST_MS (2000; 0 = off) ms into
 # <resdir>/host.tsv and, on stop, the session summary <resdir>/host.json (scripts/bench/host_res.py).
+# PB_HOST_PSS=1 adds Pss, which stalls a server with a large resident set (host_res.py docstring).
 pb_host_start() {
+    [ "${PB_HOST_MS:-2000}" != 0 ] || return 0
     python3 "$(dirname "${BASH_SOURCE[0]}")/host_res.py" sample --root-pid "$2" --json "$1/host.json" \
-        --tsv "$1/host.tsv" --interval-ms "${PB_HOST_MS:-2000}" ${3:+--metrics-url "$3"} 2> "$1/host.log" &
+        --tsv "$1/host.tsv" --interval-ms "${PB_HOST_MS:-2000}" ${3:+--metrics-url "$3"} \
+        ${PB_HOST_PSS:+--pss} 2> "$1/host.log" &
     PB_HOST_PID=$!
 }
 pb_host_stop() {

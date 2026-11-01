@@ -53,7 +53,7 @@ class SampleTests(unittest.TestCase):
                 time.sleep(0.5)
                 s = subprocess.Popen([sys.executable, str(TOOL), "sample", "--root-pid", str(server.pid),
                                       "--json", str(out), "--tsv", str(tsv), "--interval-ms", "200",
-                                      "--metrics-url", f"http://127.0.0.1:{srv.server_port}/metrics"])
+                                      "--metrics-url", f"http://127.0.0.1:{srv.server_port}/metrics", "--pss"])
                 time.sleep(2.0)
                 s.send_signal(signal.SIGTERM)
                 self.assertEqual(s.wait(timeout=10), 0)

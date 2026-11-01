@@ -8,10 +8,13 @@
 
 `sample` walks the root pid's live descendants every interval (vLLM's EngineCore and workers are
 children of the API server) until SIGTERM/SIGINT, writing one TSV row per sample and a summary
-JSON: RSS and Pss sums (smaps_rollup), VmLck/VmPin, threads, processes, cores busy (utime+stime
+JSON: RSS sum (and Pss with --pss), VmLck/VmPin, threads, processes, cores busy (utime+stime
 delta per pid), system MemAvailable, every mapped shared library (linked or dlopened) with its
 size, and, with --metrics-url, the plowrt KV store's pinned host tier bytes. Peak = max over
 samples; steady = median. CUDA pinned host memory (cuMemHostAlloc) counts in RSS, not VmPin.
+Pss is opt-in: smaps_rollup walks every page table entry under the target's mmap lock, 0.3 s per
+16 GiB resident (1.6 s on a plowrt holding an 80 GiB host tier), which stalls the server's own
+mmap/fault path and moved plowrt's TTFT P99 by seconds. /proc/<pid>/status and stat are O(1).
 `footprint` sizes what a deploy carries: the plowrt binary, the packet dir, and for vLLM the
 interpreter's site-packages (largest components) and the JIT/compile caches.
 """
@@ -116,7 +119,7 @@ def summarize(rows):
     """Summary of TSV rows (dicts of COLS); memory in MiB, CPU in cores."""
     if not rows:
         return None
-    mib = lambda k: stat([r[k] / 1024 for r in rows])  # noqa: E731
+    mib = lambda k: stat([r[k] / 1024 for r in rows if r[k] is not None])  # noqa: E731
     busy = [r["cpu_s"] / r["dt_s"] for r in rows if r["dt_s"] > 0]
     span = sum(r["dt_s"] for r in rows)
     tier = [r["tier_host_bytes"] / 2**20 for r in rows if r["tier_host_bytes"] is not None]
@@ -168,7 +171,8 @@ def sample(a):
             agg["anon_kib"] += st.get("RssAnon", 0)
             agg["lck_kib"] += st.get("VmLck", 0)
             agg["pin_kib"] += st.get("VmPin", 0)
-            agg["pss_kib"] += pss_kib(pid) or 0
+            if a.pss:
+                agg["pss_kib"] += pss_kib(pid) or 0
             tk = cpu_ticks(pid)
             if tk is not None:
                 ticks[pid] = tk
@@ -178,6 +182,8 @@ def sample(a):
         if agg["procs"]:
             # A pid new since the last sample started inside the interval: all its ticks count.
             cpu = sum(v - prev.get(p, 0) for p, v in ticks.items()) / TICK
+            if not a.pss:
+                agg["pss_kib"] = None
             r = dict(agg, t=t, cpu_s=cpu if prev_t else 0.0, dt_s=(t - prev_t) if prev_t else 0.0,
                      avail_kib=mem_available_kib(),
                      tier_host_bytes=tier_host_bytes(a.metrics_url) if a.metrics_url else None)
@@ -373,6 +379,7 @@ def main(argv=None):
     s.add_argument("--tsv")
     s.add_argument("--interval-ms", type=int, default=2000)
     s.add_argument("--metrics-url")
+    s.add_argument("--pss", action="store_true", help="also sum Pss (smaps_rollup; stalls large servers)")
     c = sub.add_parser("cells")
     c.add_argument("resdir")
     f = sub.add_parser("footprint")
