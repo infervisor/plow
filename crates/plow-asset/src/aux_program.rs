@@ -75,45 +75,51 @@ pub fn encode(
             })
             .collect(),
     };
-    owned.validate(tensor_count)?;
+    owned.encode(tensor_count)
+}
 
-    let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    put_u32(&mut out, n_cu);
-    put_u32(&mut out, u32_len(programs.len(), "program count")?);
-    for p in &owned.programs {
-        put_u32(&mut out, p.rows);
-        put_u32(&mut out, p.n_counter);
-        put_u32(&mut out, 0);
-        put_u32(&mut out, 0);
-        put_u32(&mut out, u32_len(p.insts.len(), "instruction count")?);
-        put_u32(&mut out, u32_len(p.stream.len(), "stream count")?);
-        put_u32(&mut out, u32_len(p.waits.len(), "wait count")?);
-        put_u32(&mut out, u32_len(p.succs.len(), "successor count")?);
-        put_u32(
-            &mut out,
-            u32_len(p.gq_seg_ofs.len() - 1, "queue window count")?,
-        );
-        put_u32(&mut out, 0);
-        for inst in &p.insts {
-            put_inst(&mut out, inst);
+impl Section {
+    /// The wire form [`parse`] reads, after validating every program against `tensor_count`.
+    pub fn encode(&self, tensor_count: usize) -> Result<Vec<u8>> {
+        self.validate(tensor_count)?;
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        put_u32(&mut out, self.n_cu);
+        put_u32(&mut out, u32_len(self.programs.len(), "program count")?);
+        for p in &self.programs {
+            put_u32(&mut out, p.rows);
+            put_u32(&mut out, p.n_counter);
+            put_u32(&mut out, 0);
+            put_u32(&mut out, 0);
+            put_u32(&mut out, u32_len(p.insts.len(), "instruction count")?);
+            put_u32(&mut out, u32_len(p.stream.len(), "stream count")?);
+            put_u32(&mut out, u32_len(p.waits.len(), "wait count")?);
+            put_u32(&mut out, u32_len(p.succs.len(), "successor count")?);
+            put_u32(
+                &mut out,
+                u32_len(p.gq_seg_ofs.len() - 1, "queue window count")?,
+            );
+            put_u32(&mut out, 0);
+            for inst in &p.insts {
+                put_inst(&mut out, inst);
+            }
+            for entry in &p.stream {
+                put_stream(&mut out, entry);
+            }
+            put_u32s(&mut out, &p.stream_ofs);
+            put_u32s(&mut out, &p.stream_len);
+            for wait in &p.waits {
+                put_u32(&mut out, wait.id);
+                put_u32(&mut out, wait.threshold);
+            }
+            put_u32s(&mut out, &p.succs);
+            for entry in &p.gq_stream {
+                put_stream(&mut out, entry);
+            }
+            put_u32s(&mut out, &p.gq_seg_ofs);
         }
-        for entry in &p.stream {
-            put_stream(&mut out, entry);
-        }
-        put_u32s(&mut out, &p.stream_ofs);
-        put_u32s(&mut out, &p.stream_len);
-        for wait in &p.waits {
-            put_u32(&mut out, wait.id);
-            put_u32(&mut out, wait.threshold);
-        }
-        put_u32s(&mut out, &p.succs);
-        for entry in &p.gq_stream {
-            put_stream(&mut out, entry);
-        }
-        put_u32s(&mut out, &p.gq_seg_ofs);
+        Ok(out)
     }
-    Ok(out)
 }
 
 pub fn parse(bytes: &[u8], expected_n_cu: u32, tensor_count: usize) -> Result<Section> {
@@ -320,37 +326,48 @@ impl Program {
     }
 }
 
-fn integer_tensor_handles_valid(op: DevOp, inst: &DevInst64, tensor_count: usize) -> bool {
-    let required =
-        |slot: usize| inst.i[slot] != TENSOR_NONE_I && (inst.i[slot] as usize) < tensor_count;
-    let optional =
-        |slot: usize| inst.i[slot] == TENSOR_NONE_I || (inst.i[slot] as usize) < tensor_count;
+/// A tensor handle an instruction carries in an integer field rather than in `t`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntHandle {
+    /// `i[slot]`, always a handle.
+    Required(usize),
+    /// `i[slot]`, [`TENSOR_NONE_I`] when absent.
+    Optional(usize),
+    /// `i[slot]`, `0` when absent.
+    ZeroNone(usize),
+    /// `fj[2]`, always a handle.
+    Fj2,
+}
+
+/// The integer-field tensor handles of `inst` (one table for validation and remapping).
+pub fn integer_tensor_handles(op: DevOp, inst: &DevInst64) -> Vec<IntHandle> {
+    use IntHandle::*;
     match op {
         // Folded residual + RMSNorm prologue (devgen `Fold::fields`): i[6] = 0 means no addend.
-        DevOp::Gemv if inst.i[3] == 4 => {
-            required(5) && required(7) && (inst.i[6] == 0 || required(6))
+        DevOp::Gemv if inst.i[3] == 4 => vec![Required(5), Required(7), ZeroNone(6)],
+        DevOp::GemvGlu if inst.i[3] == 4 => vec![Required(4), Required(7), ZeroNone(6)],
+        DevOp::GemvGluFp8 if inst.fj[2] != 0 => [3, 4, 6, 7].map(Required).to_vec(),
+        DevOp::FlashMlaDecode if inst.t[7] != TENSOR_NONE16 => vec![Required(6)],
+        DevOp::GemvQkvg => vec![Required(6)],
+        DevOp::KdaConv3 => [4, 5, 6, 7].map(Required).to_vec(),
+        DevOp::KdaStateStepG if inst.i[4] & 4 != 0 => vec![Required(5), Fj2],
+        DevOp::KdaStateStepG => vec![Required(5)],
+        DevOp::GemvQkvMxfp4 | DevOp::GemvQkvFp8 if inst.i[4] == 0 => {
+            vec![Required(5), Required(6), Optional(7)]
         }
-        DevOp::GemvGlu if inst.i[3] == 4 => {
-            required(4) && required(7) && (inst.i[6] == 0 || required(6))
-        }
-        DevOp::GemvGluFp8 if inst.fj[2] != 0 => [3, 4, 6, 7].into_iter().all(required),
-        DevOp::FlashMlaDecode if inst.t[7] != TENSOR_NONE16 => required(6),
-        DevOp::GemvQkvg => required(6),
-        DevOp::KdaConv3 => [4, 5, 6, 7].into_iter().all(required),
-        DevOp::KdaStateStepG => {
-            required(5) && (inst.i[4] & 4 == 0 || (inst.fj[2] as usize) < tensor_count)
-        }
-        DevOp::GemvQkvMxfp4 | DevOp::GemvQkvFp8 => {
-            required(5)
-                && required(6)
-                && if inst.i[4] == 0 {
-                    optional(7)
-                } else {
-                    required(7)
-                }
-        }
-        _ => true,
+        DevOp::GemvQkvMxfp4 | DevOp::GemvQkvFp8 => vec![Required(5), Required(6), Required(7)],
+        _ => Vec::new(),
     }
+}
+
+fn integer_tensor_handles_valid(op: DevOp, inst: &DevInst64, tensor_count: usize) -> bool {
+    let ok = |v: u32| v != TENSOR_NONE_I && (v as usize) < tensor_count;
+    integer_tensor_handles(op, inst).iter().all(|h| match *h {
+        IntHandle::Required(s) => ok(inst.i[s]),
+        IntHandle::Optional(s) => inst.i[s] == TENSOR_NONE_I || ok(inst.i[s]),
+        IntHandle::ZeroNone(s) => inst.i[s] == 0 || ok(inst.i[s]),
+        IntHandle::Fj2 => (inst.fj[2] as usize) < tensor_count,
+    })
 }
 
 fn validate_entry(

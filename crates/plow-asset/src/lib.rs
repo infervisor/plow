@@ -738,6 +738,8 @@ pub mod object_requirements;
 pub mod packed_prefill;
 pub mod spec_context;
 pub mod spec_draft;
+pub mod spec_drafter;
+pub mod spec_target;
 
 pub mod fish_depth;
 pub mod kv_ring;

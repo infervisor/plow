@@ -193,6 +193,23 @@ impl BlobPlan {
         }
     }
 
+    /// An attached external drafter's own device tensors (its imports alias the target's).
+    fn add_drafter(&mut self, dir: &Path) -> Result<()> {
+        use plow_asset::spec_drafter::{Manifest, Source, FILE};
+        let path = dir.join(FILE);
+        let bytes = std::fs::read(&path).map_err(|source| RuntimeError::Io { path, source })?;
+        let m = Manifest::parse(&bytes)
+            .map_err(|e| RuntimeError::Rejected(format!("drafter {}: {e}", dir.display())))?;
+        for t in &m.tensors {
+            match t.source {
+                Source::Import { .. } => {}
+                Source::Weight => self.weights_bytes += t.bytes,
+                Source::Init { .. } | Source::Scratch => self.other_bytes += t.bytes,
+            }
+        }
+        Ok(())
+    }
+
     /// Parse the plan from the assets dir's PLOWDEV blob. Reads the blob file
     /// once (header + tensor decls; the init section ride-along is the cost of
     /// the shared parser — startup-only, never on the request path).
@@ -238,6 +255,11 @@ impl BlobPlan {
         };
         for t in &blob.tensors {
             plan.add(&t.name, t.bytes);
+        }
+        if crate::config::RuntimeConfig::get().nv.spec {
+            if let Some(drafter) = crate::asset::serve::drafter_dir(dir) {
+                plan.add_drafter(&drafter)?;
+            }
         }
         #[cfg(feature = "cuda")]
         if let Some((granularity, capability)) = device_vmm {
@@ -685,13 +707,19 @@ impl ManagerDevice for CudaManagerDevice {
         let mut engine = self
             .be
             .unload_modules_on_err(|| crate::exec::gpu::GpuEngine::load(be, dir, ckpt))?;
+        let drafter = crate::asset::serve::drafter_dir(dir);
         if crate::config::RuntimeConfig::get().nv.spec {
             match engine.spec_serve_enable(dir) {
                 Ok(limits) => tracing::info!(?limits, "speculative decoding on"),
+                // An attached drafter that does not fit is a configuration error, not a
+                // silent fallback to plain decoding.
+                Err(e) if drafter.is_some() => return Err(e),
                 Err(e) => {
                     tracing::warn!(error = %e, "PLOW_SPEC set but speculative decoding unavailable")
                 }
             }
+        } else if let Some(d) = drafter {
+            tracing::warn!(drafter = %d.display(), "drafter attached but PLOW_SPEC is off for this model");
         }
         Ok(crate::serve::engine::ServeEngine::Cuda(engine))
     }
@@ -2204,6 +2232,103 @@ mod tests {
             "sibling packets are part of the footprint"
         );
         assert_eq!(p.slab_reusable(), 178, "but never ride the weight slab");
+    }
+
+    #[test]
+    fn the_plan_counts_an_attached_drafters_own_tensors_only() {
+        use plow_asset::spec_draft::{DraftProgram, DraftTensors};
+        use plow_asset::spec_drafter::{Access, Kind, Manifest, Requires, Source, Tensor};
+        let t = |name: &str, bytes, source| Tensor {
+            name: name.into(),
+            bytes,
+            source,
+        };
+        let m = Manifest {
+            contract: plow_asset::spec_drafter::CONTRACT.into(),
+            kind: Kind::ChainSharedKv,
+            family: "x".into(),
+            n_cu: 132,
+            requires: Requires {
+                target_packet_sha256: Some("0".repeat(64)),
+                tokenizer: Some(plow_asset::spec_drafter::TokenizerReq {
+                    vocab_sha256: "0".repeat(64),
+                    added_tokens: vec![],
+                }),
+                ..Default::default()
+            },
+            tensors: vec![
+                t("in.spec.tokens.0", 64, Source::Scratch),
+                t("in.spec.tokens.1", 64, Source::Scratch),
+                t("in.spec.hidden_row", 64, Source::Scratch),
+                t("in.spec.position", 64, Source::Scratch),
+                t("in.spec.kv_len", 64, Source::Scratch),
+                t("in.spec.slot", 64, Source::Scratch),
+                t(
+                    "act.hn",
+                    1 << 20,
+                    Source::Import {
+                        access: Access::ReadWrite,
+                    },
+                ),
+                t(
+                    "kv.28.k",
+                    1 << 30,
+                    Source::Import {
+                        access: Access::Read,
+                    },
+                ),
+                t("mtp.w", 1000, Source::Weight),
+                t("mtp.c", 16, Source::Init { offset: 0, len: 16 }),
+            ],
+            draft: plow_asset::spec_draft::Manifest {
+                version: plow_asset::spec_draft::VERSION,
+                family: "x".into(),
+                kmax: 1,
+                programs: vec![DraftProgram {
+                    rows: 1,
+                    k: 1,
+                    index: 0,
+                }],
+                tensors: DraftTensors {
+                    tokens: vec![0, 1],
+                    hidden_row: Some(2),
+                    position: 3,
+                    kv_len: 4,
+                    slot: 5,
+                    hidden: Some(6),
+                    hidden_rows: 16,
+                },
+                block: None,
+                shard: String::new(),
+                shard_sha256: String::new(),
+            },
+            weights: vec![],
+        };
+        let dir = std::env::temp_dir().join(format!("plowrt-plan-drafter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(plow_asset::spec_drafter::FILE),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+        let mut p = BlobPlan {
+            weights_bytes: 0,
+            kv_bytes: 0,
+            other_bytes: 0,
+            sidecar_bytes: 0,
+            overhead_bound: 0,
+            min_kv_bytes: 0,
+        };
+        p.add_drafter(&dir).unwrap();
+        assert_eq!(p.weights_bytes, 1000);
+        assert_eq!(p.other_bytes, 6 * 64 + 16, "imports alias target memory");
+        assert_eq!(p.kv_bytes, 0);
+        std::fs::write(dir.join(plow_asset::spec_drafter::FILE), b"{}").unwrap();
+        assert!(
+            p.add_drafter(&dir).is_err(),
+            "a malformed drafter fails the plan"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The VRAM plan must count as WEIGHTS exactly what the loaders will demand of the

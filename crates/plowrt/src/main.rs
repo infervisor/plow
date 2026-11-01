@@ -561,6 +561,21 @@ enum Cmd {
         format: String,
     },
 
+    /// Lift a packet's embedded chain drafter into an external drafter directory that attaches
+    /// to the same packet (`--assets DIR,drafter=OUT`). Links the drafter's weight shards. CPU
+    /// only.
+    DrafterExtract {
+        /// The packet's assets directory.
+        #[arg(long)]
+        assets: PathBuf,
+        /// Its checkpoint (default: `<assets>/checkpoint`, then `PLOW_CHECKPOINT`).
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
+        /// The drafter directory to write.
+        #[arg(long)]
+        out: PathBuf,
+    },
+
     /// Lean receipt qualification of every `*.pkt` in each directory: derives the required
     /// obligations from the packet, matches receipts, checks verifier approval and (unless
     /// `--no-replay`) replays them. CPU only. Exits non-zero when a packet does not qualify.
@@ -1112,6 +1127,7 @@ async fn async_main(
         | Cmd::OpAudit { .. }
         | Cmd::Inventory { .. }
         | Cmd::KnobScope { .. }
+        | Cmd::DrafterExtract { .. }
         | Cmd::Qualify { .. } => true,
         // A node's check-in parses this array; the banner must not precede it.
         Cmd::Ls { json: true, .. } => true,
@@ -1381,6 +1397,24 @@ async fn async_main(
             format,
         } => qualify_cmd(assets, !no_replay, &format),
         Cmd::Inventory { assets, format } => inventory_cmd(&assets, &format),
+        Cmd::DrafterExtract {
+            assets,
+            checkpoint,
+            out,
+        } => {
+            let checkpoint =
+                checkpoint.unwrap_or_else(|| plowrt::asset::serve::checkpoint_dir(&assets));
+            let x = plowrt::asset::drafter::extract(&assets, &checkpoint, &out)?;
+            println!(
+                "drafter {}: {} imports, {} weights, {} scratch; shards {:?}",
+                out.display(),
+                x.imports,
+                x.weights,
+                x.scratch,
+                x.shards
+            );
+            Ok(())
+        }
         Cmd::Devices {
             tp,
             hidden,

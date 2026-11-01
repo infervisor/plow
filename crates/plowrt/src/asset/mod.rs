@@ -31,6 +31,8 @@ pub mod serve;
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub use checkpoint::Checkpoint;
 pub mod devblob;
+/// Lifting an embedded drafter out of a packet (`plowrt drafter-extract`).
+pub mod drafter;
 /// The DSA lightning indexer's fp8 -> bf16 upcast. Gated with `checkpoint` for the same
 /// reason `shard` is: it is a rule about how a checkpoint tensor becomes a bound one.
 #[cfg(any(feature = "cuda", feature = "hsa"))]

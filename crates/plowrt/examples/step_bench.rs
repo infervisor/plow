@@ -152,6 +152,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 spec.sample = Some((temp, top_k as usize, top_p, min_p));
             }
             "--spec-host" => spec.host = true,
+            // `--drafter DIR`: speculate with an external drafter directory instead of the
+            // packet's own draft programs.
+            "--drafter" => plowrt::asset::serve::set_drafter(
+                &assets,
+                std::path::Path::new(&args.next().ok_or("--drafter DIR")?),
+            )?,
             // `--prompt-tokens FILE`: JSON array of token-id prompts; slot b takes prompt b mod n,
             // which must hold at least CTX tokens (truncated to CTX).
             "--prompt-tokens" => prompt_file = Some(args.next().ok_or("--prompt-tokens FILE")?),

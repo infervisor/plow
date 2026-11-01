@@ -226,26 +226,69 @@ pub fn take_asset_arg(arg: &Path) -> Result<PathBuf> {
 /// [`take_asset_arg`] plus the `slug=` the bundle is served under (default: the manifest's
 /// name), so one bundle can be served twice under two names.
 pub fn take_asset_spec(arg: &Path) -> Result<(PathBuf, Option<String>)> {
-    let (dir, checkpoint, slug) = split_asset_arg(arg)?;
+    let (dir, checkpoint, slug, drafter) = split_asset_arg(arg)?;
     if let Some(checkpoint) = checkpoint {
         set_checkpoint(&dir, &checkpoint)?;
+    }
+    if let Some(drafter) = drafter {
+        set_drafter(&dir, &drafter)?;
     }
     Ok((dir, slug))
 }
 
-type AssetArg = (PathBuf, Option<PathBuf>, Option<String>);
+fn explicit_drafters() -> &'static CheckpointMap {
+    static MAP: std::sync::OnceLock<CheckpointMap> = std::sync::OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+/// Attach the external drafter directory `drafter` to the bundle in `asset_dir` (`--assets
+/// <dir>,drafter=<path>`). A second, different attachment for the same bundle is refused.
+pub fn set_drafter(asset_dir: &Path, drafter: &Path) -> Result<()> {
+    let mut map = explicit_drafters().write();
+    let key = map_key(asset_dir);
+    match map.get(&key) {
+        Some(have) if map_key(have) != map_key(drafter) => Err(RuntimeError::Rejected(format!(
+            "{}: already attached to drafter {}, not {}",
+            asset_dir.display(),
+            have.display(),
+            drafter.display()
+        ))),
+        _ => {
+            map.insert(key, drafter.to_path_buf());
+            Ok(())
+        }
+    }
+}
+
+/// The external drafter a bundle speculates with: the explicit attachment, else a bundled
+/// `<assets>/drafter/` holding a `drafter.json`, else none (the packet's own draft programs).
+pub fn drafter_dir(asset_dir: &Path) -> Option<PathBuf> {
+    if let Some(dir) = explicit_drafters().read().get(&map_key(asset_dir)) {
+        return Some(dir.clone());
+    }
+    let bundled = asset_dir.join("drafter");
+    bundled
+        .join(plow_asset::spec_drafter::FILE)
+        .is_file()
+        .then_some(bundled)
+}
+
+type AssetArg = (PathBuf, Option<PathBuf>, Option<String>, Option<PathBuf>);
 
 fn split_asset_arg(arg: &Path) -> Result<AssetArg> {
     let Some(text) = arg.to_str().filter(|_| !arg.exists()) else {
-        return Ok((arg.to_path_buf(), None, None));
+        return Ok((arg.to_path_buf(), None, None, None));
     };
     let mut fields = text.split(',');
     let dir = PathBuf::from(fields.next().unwrap_or_default());
-    let (mut checkpoint, mut slug) = (None, None);
+    let (mut checkpoint, mut slug, mut drafter) = (None, None, None);
     for field in fields {
         match field.split_once('=') {
             Some(("checkpoint", path)) if !path.is_empty() && checkpoint.is_none() => {
                 checkpoint = Some(PathBuf::from(path))
+            }
+            Some(("drafter", path)) if !path.is_empty() && drafter.is_none() => {
+                drafter = Some(PathBuf::from(path))
             }
             // `#` is the DP rank separator of an instance key (`serve::dp::rank_key`).
             Some(("slug", name)) if !name.is_empty() && !name.contains('#') && slug.is_none() => {
@@ -253,12 +296,12 @@ fn split_asset_arg(arg: &Path) -> Result<AssetArg> {
             }
             _ => {
                 return Err(RuntimeError::Rejected(format!(
-                    "--assets {text:?}: expected DIR[,checkpoint=PATH][,slug=NAME]"
+                    "--assets {text:?}: expected DIR[,checkpoint=PATH][,slug=NAME][,drafter=PATH]"
                 )))
             }
         }
     }
-    Ok((dir, checkpoint, slug))
+    Ok((dir, checkpoint, slug, drafter))
 }
 
 /// The checkpoint a bundle serves against: the explicit per-bundle pairing
@@ -802,9 +845,17 @@ mod tests {
         let arg = format!("{},checkpoint=/hf/model@abc", dir.display());
         assert_eq!(
             split_asset_arg(Path::new(&arg)).unwrap(),
-            (dir.clone(), Some(PathBuf::from("/hf/model@abc")), None)
+            (
+                dir.clone(),
+                Some(PathBuf::from("/hf/model@abc")),
+                None,
+                None
+            )
         );
-        assert_eq!(split_asset_arg(&dir).unwrap(), (dir.clone(), None, None));
+        assert_eq!(
+            split_asset_arg(&dir).unwrap(),
+            (dir.clone(), None, None, None)
+        );
         assert_eq!(
             split_asset_arg(Path::new(&format!(
                 "{},slug=glm-b,checkpoint=/c",
@@ -814,8 +865,13 @@ mod tests {
             (
                 dir.clone(),
                 Some(PathBuf::from("/c")),
-                Some("glm-b".to_string())
+                Some("glm-b".to_string()),
+                None
             )
+        );
+        assert_eq!(
+            split_asset_arg(Path::new(&format!("{},drafter=/d", dir.display()))).unwrap(),
+            (dir.clone(), None, None, Some(PathBuf::from("/d")))
         );
         for bad in [
             ",checkpoint=",
@@ -825,6 +881,8 @@ mod tests {
             ",slug=",
             ",slug=a#1",
             ",slug=a,slug=b",
+            ",drafter=",
+            ",drafter=/a,drafter=/b",
         ] {
             assert!(
                 split_asset_arg(Path::new(&format!("{}{bad}", dir.display()))).is_err(),
@@ -836,7 +894,7 @@ mod tests {
         std::fs::create_dir_all(&comma).unwrap();
         assert_eq!(
             split_asset_arg(&comma).unwrap(),
-            (comma.clone(), None, None)
+            (comma.clone(), None, None, None)
         );
 
         assert_eq!(take_asset_arg(Path::new(&arg)).unwrap(), dir);
@@ -846,6 +904,30 @@ mod tests {
         );
         assert!(set_checkpoint(&dir, Path::new("/hf/model@abc")).is_ok());
         assert!(set_checkpoint(&dir, Path::new("/hf/other")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn drafter_is_explicit_then_bundled_and_attaches_once() {
+        let dir = std::env::temp_dir().join(format!("plowrt-drafter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("drafter")).unwrap();
+        assert_eq!(
+            drafter_dir(&dir),
+            None,
+            "a drafter/ without drafter.json is not one"
+        );
+        std::fs::write(
+            dir.join("drafter").join(plow_asset::spec_drafter::FILE),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(drafter_dir(&dir), Some(dir.join("drafter")));
+        set_drafter(&dir, Path::new("/d/a")).unwrap();
+        assert_eq!(drafter_dir(&dir), Some(PathBuf::from("/d/a")));
+        assert!(set_drafter(&dir, Path::new("/d/a")).is_ok());
+        assert!(set_drafter(&dir, Path::new("/d/b")).is_err());
+        explicit_drafters().write().remove(&map_key(&dir));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
