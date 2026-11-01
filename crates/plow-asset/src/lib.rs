@@ -93,6 +93,25 @@ pub struct Manifest {
     pub weight_tiling: Option<WeightTiling>,
 }
 
+impl Manifest {
+    /// The slug the bundle at `dir` is served under when none is given: `served_name`, else
+    /// `network`, else the bundle dir's name. A `network` that names an entry of the bundle was
+    /// taken from the checkpoint dir the emit read (`<assets>/checkpoint`), not the model.
+    pub fn default_slug(&self, dir: &std::path::Path) -> String {
+        if let Some(name) = &self.served_name {
+            return name.clone();
+        }
+        if self.network.is_empty() || std::fs::symlink_metadata(dir.join(&self.network)).is_ok() {
+            let named =
+                |d: &std::path::Path| d.file_name().map(|n| n.to_string_lossy().into_owned());
+            if let Some(name) = named(dir).or_else(|| named(&dir.canonicalize().ok()?)) {
+                return name;
+            }
+        }
+        self.network.clone()
+    }
+}
+
 /// Shared weight tiling `(bn, bk)` reported in the manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeightLayout {

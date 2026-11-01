@@ -783,3 +783,69 @@ async fn a_rollback_waits_for_a_pending_pairing() {
     assert_ne!(plowrt::asset::serve::checkpoint_dir(&dir), ckpt);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Load → deregister → register the same assets against another checkpoint: deregistration
+/// takes the dir's checkpoint pairing with it (kept, the re-registration was refused, 409).
+#[cfg(feature = "cpu")]
+#[tokio::test]
+async fn deregistration_clears_the_bundles_checkpoint_pairing() {
+    use plowrt::serve::admin::pair_and_publish;
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("plowrt_dereg_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = base.join("bundle");
+    common::write_bundle(&dir, "dereg");
+    // A device packet, so the manager can plan the bundle.
+    let model = packet::devbuild::Model {
+        n_cu: 1,
+        target: 0,
+        tensors: Vec::new(),
+        progs: Vec::new(),
+        kv_row_insts: Vec::new(),
+        prog_t: Vec::new(),
+        gen: Vec::new(),
+    };
+    std::fs::write(dir.join("model.pkt"), model.to_blob_v6(&[])).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let (first, second) = (base.join("ckpt-a"), base.join("ckpt-b"));
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(2));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let state = Arc::new(AppState::new(Registry::new(), execset));
+    let mgr = Arc::new(
+        plowrt::serve::manager::ModelManager::with_device(
+            Arc::new(plowrt::serve::manager::HostManagerDevice::new()),
+            &state,
+            MuxConfig::default(),
+            Vec::new(),
+            None,
+        )
+        .unwrap(),
+    );
+    state.install_manager(Arc::clone(&mgr));
+    pair_and_publish(&state, &dir, &first, "dereg")
+        .await
+        .unwrap();
+    mgr.register("dereg", dir.clone(), first.clone()).unwrap();
+    state.set_slug_group("dereg", 0);
+
+    let router = plowrt::serve::admin_app(Arc::clone(&state));
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/unload")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"dereg","deregister":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert_eq!(status, StatusCode::OK, "{}", body_string(resp).await);
+    assert!(!state.registry.contains("dereg"));
+    pair_and_publish(&state, &dir, &second, "dereg")
+        .await
+        .expect("the same assets register against another checkpoint");
+    assert_eq!(plowrt::asset::serve::checkpoint_dir(&dir), second);
+    let _ = std::fs::remove_dir_all(&base);
+}

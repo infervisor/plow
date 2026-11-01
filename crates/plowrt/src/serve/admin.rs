@@ -726,9 +726,23 @@ async fn unload_inner(state: Arc<AppState>, mut req: UnloadRequest) -> Response 
         };
     }
     let _control = state.control_lock(&req.model).await;
+    // A deregistered bundle's checkpoint pairing goes with it unless another slug still serves
+    // the dir: kept, re-registering the assets against another checkpoint was refused (409).
+    let deregistered_dir = req
+        .deregister
+        .then(|| state.registry.get(&req.model).ok().map(|b| b.dir.clone()))
+        .flatten();
+    let response = unload_locked(&state, req).await;
+    if let Some(dir) = deregistered_dir.filter(|_| response.status().is_success()) {
+        forget_checkpoint(&state, &dir).await;
+    }
+    response
+}
+
+async fn unload_locked(state: &Arc<AppState>, req: UnloadRequest) -> Response {
     #[cfg(feature = "cpu")]
     if let Some(manager) = state.portable_manager() {
-        return manager.unload(&state, req).await;
+        return manager.unload(state, req).await;
     }
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     {
@@ -1129,7 +1143,7 @@ fn store_of(root: &std::path::Path) -> Option<&std::path::Path> {
 /// readable `weights.json` and so could not be registered at all.
 fn served_slug(dir: &std::path::Path) -> Option<String> {
     let m: plow_asset::Manifest = crate::asset::read_json(&dir.join("weights.json")).ok()?;
-    Some(m.served_name.unwrap_or(m.network))
+    Some(m.default_slug(dir))
 }
 
 /// Bytes of the regular files under `dir`. Symlinks are not followed: an

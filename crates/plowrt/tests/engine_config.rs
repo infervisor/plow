@@ -220,3 +220,60 @@ fn an_unscoped_engine_read_is_caught_once_engines_diverge() {
     let helper = scoped(Some(cfg), || std::thread::spawn(inherit(plan)));
     assert_eq!(helper.join().unwrap().unwrap(), before);
 }
+
+/// A minimal device packet whose serve manifest carries `defaults`.
+fn packet_with_defaults(name: &str, defaults: &[(&str, &str)]) -> std::path::PathBuf {
+    use packet::devbuild::{Model, SectionData};
+    let dir = std::env::temp_dir().join(format!("plowrt-engcfg-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut m = plow_asset::serve_manifest::ServeManifest {
+        version: 1,
+        ..Default::default()
+    };
+    for (k, v) in defaults {
+        m.serve_defaults.insert(k.to_string(), v.to_string());
+    }
+    let sections = vec![SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: plow_asset::serve_manifest::SECTION.into(),
+        data: m.to_json(),
+    }];
+    let model = Model {
+        n_cu: 1,
+        target: 0,
+        tensors: Vec::new(),
+        progs: Vec::new(),
+        kv_row_insts: Vec::new(),
+        prog_t: Vec::new(),
+        gen: Vec::new(),
+    };
+    std::fs::write(dir.join("model.pkt"), model.to_blob_v6(&sections)).unwrap();
+    dir
+}
+
+/// Startup engines outside the CUDA manager (AMD, CPU) resolve and record their own bundle's
+/// engine config: two bundles asking different engine knobs no longer run the first one's.
+#[test]
+fn startup_engines_resolve_their_own_bundles_engine_config() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    plowrt::config::record_startup(Startup::new(Vec::new(), BTreeMap::new()));
+    let a = packet_with_defaults("a", &[("PLOW_DECODE_MAX_RUNG", "128")]);
+    let b = packet_with_defaults("b", &[("PLOW_DECODE_MAX_RUNG", "64")]);
+    let backend: std::sync::Arc<dyn plowrt::device::Backend> =
+        std::sync::Arc::new(plowrt::device::cpu::CpuBackend::new(1));
+    let execset = std::sync::Arc::new(plowrt::exec::ExecutorSet::bringup(backend).unwrap());
+    let state = plowrt::serve::AppState::new(plowrt::orch::Registry::new(), execset);
+    let ca = state.bundle_engine_config("a", &a).unwrap();
+    let cb = state.bundle_engine_config("b", &b).unwrap();
+    assert_eq!(
+        (ca.decode_max_rung, cb.decode_max_rung),
+        (Some(128), Some(64))
+    );
+    assert!(std::ptr::eq(state.engine_config("b").unwrap(), cb));
+    let under_b = plowrt::config::scoped(Some(cb), || RuntimeConfig::get().decode_max_rung);
+    assert_eq!(under_b, Some(64), "b's engine load reads b's knobs");
+    for d in [a, b] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

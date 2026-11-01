@@ -412,6 +412,17 @@ fn run_streams(
                 );
                 continue;
             }
+            // The stream push carries no prompt: refused here as the offline pass refuses it, or
+            // whether a prompt is accepted depends on how far the recording's stream got.
+            if !job.context.is_empty() && !engine.accepts_context() {
+                finish_job(
+                    job,
+                    Err(crate::RuntimeError::Rejected(
+                        crate::asr::CONTEXT_UNSUPPORTED.into(),
+                    )),
+                );
+                continue;
+            }
             let id = match streams.iter().position(|open| open.key.ptr_eq(&key)) {
                 // A final far ahead of its stream goes offline: one pass beats many steps.
                 Some(index)
@@ -3029,6 +3040,85 @@ mod tests {
         let log = log.lock();
         assert_eq!(log.pushed, [(1, 100), (1, 150), (2, 300)]);
         assert_eq!(log.closed, [1]);
+    }
+
+    /// An engine that cannot condition on a prompt refuses one on the stream path as offline: a
+    /// final continuing an open stream used to drop its context and answer.
+    #[tokio::test]
+    async fn a_streamed_final_refuses_a_prompt_the_engine_cannot_take() {
+        struct NoContext;
+        impl Transcriber for NoContext {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn accepts_context(&self) -> bool {
+                false
+            }
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                context: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                if !context.is_empty() {
+                    return Err(crate::RuntimeError::Rejected(
+                        crate::asr::CONTEXT_UNSUPPORTED.into(),
+                    ));
+                }
+                Ok(Transcript {
+                    text: "offline".into(),
+                    language: None,
+                })
+            }
+            fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+                Ok(Some(1))
+            }
+            fn stream_push(
+                &mut self,
+                _: u64,
+                _: &[f32],
+                _: &mut dyn FnMut(&str),
+            ) -> crate::Result<String> {
+                Ok("streamed".into())
+            }
+            fn stream_finals(&self) -> bool {
+                true
+            }
+        }
+        let (mux, _, _) = AsrMux::spawn(Box::new(NoContext));
+        let recording: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
+        let run = |samples: usize, context: &str, finish: bool, stream: bool| {
+            mux.submit_with(
+                vec![0.0; samples],
+                None,
+                context.to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                stream.then(|| Arc::downgrade(&recording)),
+                finish,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            run(100, "", false, true).await.unwrap().unwrap().text,
+            "streamed"
+        );
+        let unsupported = |r: crate::Result<Transcript>| {
+            r.is_err_and(|e| e.to_string().contains(crate::asr::CONTEXT_UNSUPPORTED))
+        };
+        assert!(
+            unsupported(run(150, "a prompt", true, true).await.unwrap()),
+            "streamed final"
+        );
+        assert!(
+            unsupported(run(150, "a prompt", true, false).await.unwrap()),
+            "offline final"
+        );
+        assert!(
+            unsupported(run(200, "a prompt", false, true).await.unwrap()),
+            "partial"
+        );
     }
 
     #[tokio::test]

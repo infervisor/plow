@@ -1139,6 +1139,18 @@ impl AppState {
         self.engine_cfg.write().insert(slug.to_string(), cfg);
     }
 
+    /// Resolve the engine config of the bundle in `dir` (its packet's engine defaults) and record
+    /// it for instance `key`: what its engine load runs under and its dispatcher inherits.
+    pub fn bundle_engine_config(
+        &self,
+        key: &str,
+        dir: &std::path::Path,
+    ) -> crate::Result<&'static crate::config::RuntimeConfig> {
+        let cfg = crate::config::bundle_config(dir)?;
+        self.set_engine_config(key, cfg);
+        Ok(cfg)
+    }
+
     /// The config `slug`'s engine runs under; `None` = the process config.
     pub fn engine_config(&self, slug: &str) -> Option<&'static crate::config::RuntimeConfig> {
         self.engine_cfg.read().get(slug).copied()
