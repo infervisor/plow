@@ -864,6 +864,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_strict_publish", Some("PLOW_VMM_STRICT_PUBLISH"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.vmm_ring_recycle", Some("PLOW_VMM_RING_RECYCLE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.pf_admit_overlap", Some("PLOW_PF_ADMIT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.vmm_admit_reserve", Some("PLOW_VMM_ADMIT_RESERVE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.shed_queue_depth", Some("PLOW_SHED_QUEUE_DEPTH"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),

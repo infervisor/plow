@@ -1174,6 +1174,13 @@ fn reclaim_turn() -> parking_lot::MutexGuard<'static, ()> {
 enum Job {
     /// Decode-growth hint: keep the next block mapped beyond `pos`.
     Premap { seq: u32, pos: u32, generation: u64 },
+    /// Admission reservation: map `seq`'s window up to `rows`, one block column per pool-lock
+    /// hold so the engine's own pool calls interleave.
+    Reserve {
+        seq: u32,
+        rows: u32,
+        generation: u64,
+    },
     /// Unmap and dereference every `Slot::Stale` block of `seq`.
     Retire(u32),
     /// Hand a zero-ref, unmapped handle back to the driver.
@@ -1975,6 +1982,25 @@ impl VmmKv {
                                 }
                             }
                         }
+                        Job::Reserve {
+                            seq,
+                            rows,
+                            generation,
+                        } => {
+                            let mut next = s.frontier[seq as usize].load(Ordering::Acquire);
+                            while next < rows
+                                && s.generation[seq as usize].load(Ordering::Acquire) == generation
+                            {
+                                next = (next / s.block_rows + 1).saturating_mul(s.block_rows).min(rows);
+                                if let Err(e) =
+                                    ensure_rows(s, seq as usize, next, Some(generation))
+                                {
+                                    // The admission's synchronous ensure surfaces the real error.
+                                    tracing::warn!(error = %e, seq, rows, "vmm admission reserve failed");
+                                    break;
+                                }
+                            }
+                        }
                         Job::Retire(seq) => reclaim_stale(s, seq as usize),
                         Job::CopyOut { seq, generation } => copy_out(s, seq as usize, generation),
                         Job::DropSpare { track, slot } => drop_spare(s, track as usize, slot),
@@ -2406,6 +2432,21 @@ impl VmmKv {
                 generation,
             });
         }
+    }
+
+    /// Map `seq`'s window up to `rows` on the pre-mapper thread, for the current sequence only.
+    /// `false` when there is no pre-mapper (the caller maps synchronously).
+    pub fn reserve_rows(&self, seq: usize, rows: u32) -> bool {
+        let Some(tx) = &self.premap_tx else {
+            return false;
+        };
+        let generation = self.shared.generation[seq].load(Ordering::Acquire);
+        tx.send(Job::Reserve {
+            seq: seq as u32,
+            rows: rows.min(self.shared.geo.max_ctx),
+            generation,
+        })
+        .is_ok()
     }
 
     /// Start a new sequence in `seq`: release the previous sequence's radix
@@ -11085,6 +11126,29 @@ mod tests {
         p.ensure_rows(1, 17).unwrap(); // grows by one column
         assert_eq!(ops.maps.load(Ordering::SeqCst), 16 + 8 + 4);
         assert_eq!(ops.accesses.load(Ordering::SeqCst), 12);
+    }
+
+    /// An admission reservation maps the window on the pre-mapper, block by block; one queued
+    /// before the slot's next sequence began maps nothing for it.
+    #[test]
+    fn reserve_rows_maps_the_current_sequence_only() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        assert!(p.reserve_rows(0, 20));
+        p.sync_reclaim();
+        assert_eq!(p.mapped_rows(0), 24);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 12);
+        let generation = p.shared.generation[1].load(Ordering::Acquire);
+        p.begin_seq(1);
+        let job = Job::Reserve {
+            seq: 1,
+            rows: 32,
+            generation,
+        };
+        p.premap_tx.as_ref().unwrap().send(job).unwrap();
+        p.sync_reclaim();
+        assert_eq!(p.mapped_rows(1), 0, "a stale reservation maps nothing");
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 12);
     }
 
     /// A failed grant on a later run unmaps that run and keeps the frontier where it was.

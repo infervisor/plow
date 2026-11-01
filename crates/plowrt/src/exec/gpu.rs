@@ -2499,8 +2499,14 @@ enum PackedAdmission {
     /// on the device, or after [`RESTORE_WAIT_LIMIT`] regardless (the gather then waits on the
     /// copy in the engine stream, stalling every other row).
     WaitingRestore(std::time::Instant),
+    /// `begin_slot` ran and the pre-mapper is mapping the window up to these rows: attach once
+    /// they are mapped, or after [`ADMIT_RESERVE_WAIT`] regardless (mapping the rest inline).
+    Mapping(std::time::Instant, u32),
     Ready,
 }
+
+/// Longest an admission waits on the pre-mapper before it maps the rest of its window itself.
+const ADMIT_RESERVE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 const RESTORE_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -8608,10 +8614,24 @@ impl GpuEngine {
             None => return Err(RuntimeError::Rejected(format!("slot {b} out of range"))),
             _ => {}
         }
+        // A reserved window: `begin_slot` already ran, so the waits below are behind it too.
+        let reserved = match self.packed_admission[b] {
+            PackedAdmission::Mapping(since, rows) => {
+                let mapped = self.vmm_prefix().map_or(rows, |(_, kv)| kv.mapped_rows(b));
+                if mapped < rows && since.elapsed() < ADMIT_RESERVE_WAIT {
+                    return Ok(None);
+                }
+                Some(since.elapsed())
+            }
+            _ => None,
+        };
         // In-flight sharing: another slot is prefilling this prompt's shared prefix. Wait
         // for its whole-block checkpoint (one attach + the tail) instead of recomputing the
         // shared rows beside it; bounded, and released when the owner publishes or retires.
-        if self.vmm_prefix_enabled() && crate::config::RuntimeConfig::get().prefix_inflight_wait() {
+        if reserved.is_none()
+            && self.vmm_prefix_enabled()
+            && crate::config::RuntimeConfig::get().prefix_inflight_wait()
+        {
             // One deadline for both waits: alternating them must not restart either.
             let since = match self.packed_admission[b] {
                 PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
@@ -8635,7 +8655,11 @@ impl GpuEngine {
                 }
             }
         }
-        if self.vmm_prefix_enabled() && self.pos[b] == 0 && !self.prefix_attach_off[b] {
+        if reserved.is_none()
+            && self.vmm_prefix_enabled()
+            && self.pos[b] == 0
+            && !self.prefix_attach_off[b]
+        {
             let since = match self.packed_admission[b] {
                 PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
                     since
@@ -8656,9 +8680,31 @@ impl GpuEngine {
         let mut marks = [0u64; 3];
         // `begin_slot` resets the slot's admission state, staged key included: carry the key
         // across it to the attach (a failed attempt drops it; the mux keeps its own copy).
-        let staged = self.staged_prefix[b].take();
+        let mut staged = self.staged_prefix[b].take();
         let started = (|| {
-            self.begin_slot(b, total)?;
+            if reserved.is_none() {
+                self.begin_slot(b, total)?;
+                // The window maps off the engine thread; a slot already mapped that far (its
+                // previous sequence's private blocks) attaches now.
+                let rows = self.admission_rows(total, prompt.len()) as u32;
+                let reserve = crate::config::RuntimeConfig::get().vmm_admit_reserve
+                    && self
+                        .vmm_prefix()
+                        .is_some_and(|(_, kv)| kv.mapped_rows(b) < rows);
+                if reserve {
+                    // Idle decode rows first: the speculative window must not take their pages.
+                    let v = self.vmm.as_ref().unwrap();
+                    for slot in 0..self.batch {
+                        v.ensure_rows(slot, 1)?;
+                    }
+                    if v.prefix_kv().is_some_and(|kv| kv.reserve_rows(b, rows)) {
+                        self.staged_prefix[b] = staged.take();
+                        self.packed_admission[b] =
+                            PackedAdmission::Mapping(std::time::Instant::now(), rows);
+                        return Ok(None);
+                    }
+                }
+            }
             if let Some(t) = host_t {
                 marks[0] = t.elapsed().as_nanos() as u64;
             }
@@ -8678,14 +8724,21 @@ impl GpuEngine {
                 let rows = self.admission_rows(total, prompt.len());
                 v.ensure_rows(b, rows as u32)?;
             }
-            Ok(frontier)
+            Ok(Some(frontier))
         })();
-        if let Some(t) = host_t {
+        if let (Some(t), Ok(None)) = (host_t, &started) {
+            eprintln!(
+                "PACKLOG RESERVE slot={} begin_us={:.0}",
+                b,
+                t.elapsed().as_secs_f64() * 1e6
+            );
+        } else if let Some(t) = host_t {
             let us = |ns: u64| ns as f64 / 1e3;
             let end = t.elapsed().as_nanos() as u64;
             eprintln!(
-                "PACKLOG ADMIT slot={} begin_us={:.0} attach_us={:.0} ensure_all_us={:.0} ensure_rows_us={:.0}",
+                "PACKLOG ADMIT slot={} reserve_wait_us={:.0} begin_us={:.0} attach_us={:.0} ensure_all_us={:.0} ensure_rows_us={:.0}",
                 b,
+                reserved.map_or(-1.0, |d| d.as_secs_f64() * 1e6),
                 us(marks[0]),
                 us(marks[1].saturating_sub(marks[0])),
                 us(marks[2].saturating_sub(marks[1])),
@@ -8693,7 +8746,8 @@ impl GpuEngine {
             );
         }
         match started {
-            Ok(frontier) => {
+            Ok(None) => Ok(None),
+            Ok(Some(frontier)) => {
                 self.packed_admission[b] = PackedAdmission::Ready;
                 Ok(Some(frontier))
             }

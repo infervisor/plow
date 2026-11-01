@@ -669,6 +669,11 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-admit-overlap", env = "PLOW_PF_ADMIT_OVERLAP", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_admit_overlap: bool,
 
+    /// CUDA VMM prefix cache: a packed admission maps its KV window on the pre-mapper thread
+    /// and attaches on a later pass, instead of mapping it inline on the engine thread.
+    #[arg(long = "vmm-admit-reserve", env = "PLOW_VMM_ADMIT_RESERVE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_admit_reserve: bool,
+
     /// Load shedding at the capacity knee: refuse a new request with 429 + `Retry-After` while
     /// this many requests already wait for their first token (queued plus seated in prefill),
     /// so a load balancer spills it to another backend instead of queueing it into a long
