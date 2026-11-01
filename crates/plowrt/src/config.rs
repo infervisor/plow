@@ -1466,6 +1466,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "spec", env = "PLOW_SPEC", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", default_value_t = false, global = true)]
     pub spec: bool,
 
+    /// Every narrow decode rung splits attention exactly as the narrowest one, so a row's output
+    /// does not depend on how many rows share its launch. Unset follows `PLOW_SPEC`: a verify
+    /// launch must reproduce the plain steps it replaces.
+    #[arg(long = "decode-batch-invariant", env = "PLOW_DECODE_BATCH_INVARIANT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_batch_invariant: Option<bool>,
+
     /// With `PLOW_SPEC`: sampled rows (temperature > 0, penalties, logit bias) draft too, and
     /// each verify row is sampled exactly as plain decode would sample it (lossless rejection
     /// sampling against the deterministic drafter). On by default: without it sampled traffic
@@ -2961,6 +2967,16 @@ impl RuntimeConfig {
         spec.is_some_and(|spec| {
             served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn decode_batch_invariant(&self) -> bool {
+        select_compat(
+            self.nv.decode_batch_invariant,
+            Self::env_bool("PLOW_DECODE_BATCH_INVARIANT").map(Some),
+            !Self::is_initialized(),
+        )
+        .unwrap_or(self.nv.spec)
     }
 
     #[cfg(feature = "cuda")]

@@ -777,6 +777,24 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
 }
 
 impl DecodeRung {
+    /// [`crate::exec::kvrow::pin_decode_splits`] on this rung, re-uploading its instructions.
+    pub(super) fn pin_splits(
+        &mut self,
+        be: &CudaBackend,
+        reference: &[DevInst64],
+        partial_bytes: impl Fn(u16) -> u64,
+    ) -> Result<usize> {
+        let changed =
+            crate::exec::kvrow::pin_decode_splits(reference, &mut self.host_insts, partial_bytes)
+                .map_err(|e| {
+                RuntimeError::Rejected(format!("batch-invariant decode: rung {}: {e}", self.rows))
+            })?;
+        if changed > 0 {
+            be.upload(&self._tables[0], 0, pod_bytes(&self.host_insts))?;
+        }
+        Ok(changed)
+    }
+
     pub(super) fn upload(
         be: &CudaBackend,
         g: &crate::asset::devblob::DevProg,

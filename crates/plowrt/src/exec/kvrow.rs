@@ -822,6 +822,84 @@ pub(crate) fn derive_nv_nsplit(
     (n_flash > 0 && (n_merge == 0 || n_flash == n_merge)).then_some((sites, baked?))
 }
 
+/// Every decode attention site in program order: a FlashDecode(Fp8) and the FlashMerge that
+/// reads its partials (`t1 == Opart`), if any.
+fn decode_attention_sites(insts: &[DevInst64]) -> Vec<(usize, Option<usize>)> {
+    let flash = [DevOp::FlashDecode as u16, DevOp::FlashDecodeFp8 as u16];
+    let mut sites: Vec<(usize, Option<usize>)> = Vec::new();
+    for (k, d) in insts.iter().enumerate() {
+        if flash.contains(&d.op) {
+            sites.push((k, None));
+        } else if d.op == DevOp::FlashMerge as u16 {
+            if let Some(site) = sites
+                .iter_mut()
+                .rev()
+                .find(|(f, m)| m.is_none() && insts[*f].t[0] == d.t[1])
+            {
+                site.1 = Some(k);
+            }
+        }
+    }
+    sites
+}
+
+/// Batch-invariant decode: give every attention site of `insts` the split count the same site
+/// has in `reference` (the narrowest rung). A split's KV range depends only on its row's own
+/// length and the split count, so a row then reduces in the same order at every rung.
+/// `partial_bytes(handle)` bounds the Opart / mlpart tensors. Returns the sites changed.
+pub(crate) fn pin_decode_splits(
+    reference: &[DevInst64],
+    insts: &mut [DevInst64],
+    partial_bytes: impl Fn(u16) -> u64,
+) -> Result<usize, String> {
+    let (want, have) = (
+        decode_attention_sites(reference),
+        decode_attention_sites(insts),
+    );
+    if want.len() != have.len() {
+        return Err(format!(
+            "{} attention sites vs {} in the narrowest rung",
+            have.len(),
+            want.len()
+        ));
+    }
+    let mut changed = 0;
+    for (n, (&(rf, rm), &(f, m))) in want.iter().zip(&have).enumerate() {
+        let (r, d) = (&reference[rf], &insts[f]);
+        // n_head, n_kv_head, kv_stride, window, head_dim
+        if r.op != d.op || r.i[1..5] != d.i[1..5] || r.i[6] != d.i[6] || rm.is_some() != m.is_some()
+        {
+            return Err(format!(
+                "attention site {n} differs from the narrowest rung's"
+            ));
+        }
+        let ns = r.i[5];
+        if let (Some(rm), Some(m)) = (rm, m) {
+            if reference[rm].i[2] != ns || insts[m].i[2] != d.i[5] {
+                return Err(format!(
+                    "attention site {n}: merge split count differs from its flash"
+                ));
+            }
+        }
+        let opart = u64::from(d.i[0]) * u64::from(d.i[1]) * u64::from(ns) * u64::from(d.i[6]) * 4;
+        let ml = u64::from(d.i[0]) * u64::from(d.i[1]) * u64::from(ns) * 8;
+        if partial_bytes(d.t[0]) < opart || partial_bytes(d.t[1]) < ml {
+            return Err(format!(
+                "attention site {n}: {} rows x {ns} splits overflow the partial buffers",
+                d.i[0]
+            ));
+        }
+        if d.i[5] != ns {
+            insts[f].i[5] = ns;
+            if let Some(m) = m {
+                insts[m].i[2] = ns;
+            }
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 pub(crate) fn nv_split_span(sites: &[NvSplitSite]) -> Option<(usize, usize)> {
     if sites.is_empty() {
         return None;
@@ -1075,5 +1153,47 @@ mod row_field_tests {
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].inst_idx, 1);
         assert!(!sites[0].is_merge);
+    }
+
+    fn attention(rows: u32, ns: u32, window: u32) -> [DevInst64; 2] {
+        let mut flash = DevInst64::default();
+        flash.op = DevOp::FlashDecodeFp8 as u16;
+        flash.t = [7, 8, 1, 2, 3, 4, 5, 6];
+        flash.i = [rows, 16, 8, 2048, window, ns, 256, 2047];
+        let mut merge = DevInst64::default();
+        merge.op = DevOp::FlashMerge as u16;
+        merge.t[1] = 7;
+        merge.t[2] = 8;
+        merge.i = [rows, 16, ns, 256, 0, 0, 0, 0];
+        [flash, merge]
+    }
+
+    #[test]
+    fn pinned_splits_copy_the_narrowest_rung() {
+        let big = |_| 1u64 << 30;
+        let reference = [attention(1, 16, 1024), attention(1, 33, 0)].concat();
+        let mut rung = [attention(4, 4, 1024), attention(4, 8, 0)].concat();
+        assert_eq!(pin_decode_splits(&reference, &mut rung, big), Ok(2));
+        assert_eq!(
+            (rung[0].i[5], rung[1].i[2], rung[2].i[5], rung[3].i[2]),
+            (16, 16, 33, 33)
+        );
+        assert_eq!(rung[0].i[0], 4);
+        assert_eq!(pin_decode_splits(&reference, &mut rung, big), Ok(0));
+
+        let tight = |h| {
+            if h == 7 {
+                4 * 16 * 16 * 256 * 4 - 1
+            } else {
+                1 << 30
+            }
+        };
+        let mut rung = [attention(4, 4, 1024), attention(4, 8, 0)].concat();
+        assert!(pin_decode_splits(&reference, &mut rung, tight).is_err());
+
+        let mut other_window = [attention(4, 4, 512), attention(4, 8, 0)].concat();
+        assert!(pin_decode_splits(&reference, &mut other_window, big).is_err());
+        let mut fewer = attention(4, 4, 1024).to_vec();
+        assert!(pin_decode_splits(&reference, &mut fewer, big).is_err());
     }
 }

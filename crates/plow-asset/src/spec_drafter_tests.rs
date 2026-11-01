@@ -170,6 +170,15 @@ fn identity_fields_need_a_target_that_proves_them() {
     m.requires.model = Some("google/gemma-4-26b-a4b-it".into());
     m.requires.revision = Some("a".repeat(40));
     m.requires.checkpoint_sha256 = Some("c".repeat(64));
+    assert!(
+        refusal(&m, &t).contains("whole geometry"),
+        "without the packet pin the geometry is the layout proof"
+    );
+    t.geometry.insert("rope_theta".into(), "1000000".into());
+    m.requires.geometry = t.geometry.clone();
+    m.requires.geometry.remove("rope_theta");
+    assert!(refusal(&m, &t).contains("whole geometry"));
+    m.requires.geometry = t.geometry.clone();
     assert!(refusal(&m, &t).contains("revision"));
     t.revision = Some("a".repeat(40));
     assert!(refusal(&m, &t).contains("checkpoint_sha256"));

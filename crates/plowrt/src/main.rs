@@ -574,6 +574,10 @@ enum Cmd {
         /// The drafter directory to write.
         #[arg(long)]
         out: PathBuf,
+        /// Pin this target packet instead of `--assets` (the same model emitted without the
+        /// embedded drafter); every import must exist there with the same bytes.
+        #[arg(long)]
+        target: Option<PathBuf>,
     },
 
     /// Lean receipt qualification of every `*.pkt` in each directory: derives the required
@@ -1401,10 +1405,11 @@ async fn async_main(
             assets,
             checkpoint,
             out,
+            target,
         } => {
             let checkpoint =
                 checkpoint.unwrap_or_else(|| plowrt::asset::serve::checkpoint_dir(&assets));
-            let x = plowrt::asset::drafter::extract(&assets, &checkpoint, &out)?;
+            let x = plowrt::asset::drafter::extract(&assets, &checkpoint, &out, target.as_deref())?;
             println!(
                 "drafter {}: {} imports, {} weights, {} scratch; shards {:?}",
                 out.display(),

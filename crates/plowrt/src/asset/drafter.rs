@@ -165,7 +165,14 @@ pub struct Extracted {
 }
 
 /// Write the drafter directory `out` for the packet in `assets` (weights from `checkpoint`).
-pub fn extract(assets: &Path, checkpoint: &Path, out: &Path) -> Result<Extracted> {
+/// `pin`: the target packet the drafter attaches to, when it is not `assets` itself (the same
+/// model emitted without the embedded drafter): every import must exist there with its bytes.
+pub fn extract(
+    assets: &Path,
+    checkpoint: &Path,
+    out: &Path,
+    pin: Option<&Path>,
+) -> Result<Extracted> {
     let pkt = DevBlob::find_in_dir(assets)?
         .ok_or_else(|| reject(format!("no packet in {}", assets.display())))?;
     let raw = std::fs::read(&pkt).map_err(io(&pkt))?;
@@ -194,6 +201,7 @@ pub fn extract(assets: &Path, checkpoint: &Path, out: &Path) -> Result<Extracted
             )));
         }
     }
+    std::fs::create_dir_all(out).map_err(io(out))?;
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if canon(out) == canon(checkpoint) || canon(out) == canon(assets) {
         return Err(reject(
@@ -250,30 +258,16 @@ pub fn extract(assets: &Path, checkpoint: &Path, out: &Path) -> Result<Extracted
         .map(|(new, &old)| (old, new as u32))
         .collect();
 
-    std::fs::create_dir_all(out).map_err(io(out))?;
     let shards = shard_index(checkpoint)?;
     let gen: BTreeMap<u32, &packet::rope::GenTensor> =
         blob.gen.iter().map(|g| (g.tensor, g)).collect();
-    // Shards holding a weight the target binds stay the target's: a draft weight found there is
-    // an import, never a reason to link the target's shard into the drafter.
-    let target_shards: BTreeSet<&PathBuf> = blob
-        .tensors
-        .iter()
-        .enumerate()
-        .filter(|(h, d)| {
-            target.contains(&(*h as u32)) && packet::names::is_checkpoint_weight(&d.name)
-        })
-        .filter_map(|(_, d)| shards.get(&d.name))
-        .collect();
     let (mut tensors, mut init, mut linked) = (Vec::new(), Vec::new(), BTreeSet::new());
     let (mut imports, mut weights, mut scratch) = (0, 0, 0);
     for &h in &used {
         let d = &blob.tensors[h as usize];
-        let in_target_shard = packet::names::is_checkpoint_weight(&d.name)
-            && shards
-                .get(&d.name)
-                .is_some_and(|f| target_shards.contains(f));
-        let source = if target.contains(&h) || d.name.starts_with("kv.") || in_target_shard {
+        // Only what the target binds is an import: a draft weight the target never loads is
+        // the drafter's own, even when it sits in one of the target's shards.
+        let source = if target.contains(&h) || d.name.starts_with("kv.") {
             imports += 1;
             // Target activations are rewritten by every launch; the draft may use them as
             // scratch (stream-ordered). Caches, weights and tables stay read-only.
@@ -355,6 +349,7 @@ pub fn extract(assets: &Path, checkpoint: &Path, out: &Path) -> Result<Extracted
     }
 
     let tokenizer = [
+        pin.unwrap_or(assets).join("tokenizer.json"),
         assets.join("tokenizer.json"),
         checkpoint.join("tokenizer.json"),
     ]
@@ -363,13 +358,48 @@ pub fn extract(assets: &Path, checkpoint: &Path, out: &Path) -> Result<Extracted
     .ok_or_else(|| reject("no tokenizer.json beside the packet or in its checkpoint"))?;
     let facts = TokenizerFacts::from_json(&std::fs::read(&tokenizer).map_err(io(&tokenizer))?)
         .map_err(reject)?;
+    let target_sha = match pin {
+        None => format!("{:x}", sha2::Sha256::digest(&raw)),
+        Some(dir) => {
+            let tp = DevBlob::find_in_dir(dir)?
+                .ok_or_else(|| reject(format!("no packet in {}", dir.display())))?;
+            let traw = std::fs::read(&tp).map_err(io(&tp))?;
+            let tblob = DevBlob::parse(&traw)?;
+            let have: BTreeMap<&str, u64> = tblob
+                .tensors
+                .iter()
+                .map(|t| (t.name.as_str(), t.bytes))
+                .collect();
+            for t in tensors
+                .iter()
+                .filter(|t| matches!(t.source, Source::Import { .. }))
+            {
+                match have.get(t.name.as_str()) {
+                    Some(&b) if b == t.bytes => {}
+                    Some(&b) => {
+                        return Err(reject(format!(
+                            "import {}: {} bytes here, {b} in the pinned target",
+                            t.name, t.bytes
+                        )))
+                    }
+                    None => {
+                        return Err(reject(format!(
+                            "import {} is not in the pinned target",
+                            t.name
+                        )))
+                    }
+                }
+            }
+            format!("{:x}", sha2::Sha256::digest(&traw))
+        }
+    };
     let manifest = sd::Manifest {
         contract: sd::CONTRACT.into(),
         kind: Kind::ChainSharedKv,
         family: draft.family.clone(),
         n_cu: blob.n_cu,
         requires: Requires {
-            target_packet_sha256: Some(format!("{:x}", sha2::Sha256::digest(&raw))),
+            target_packet_sha256: Some(target_sha),
             tokenizer: Some(TokenizerReq {
                 vocab_sha256: facts.vocab_sha256,
                 added_tokens: facts.added_tokens.into_iter().collect(),

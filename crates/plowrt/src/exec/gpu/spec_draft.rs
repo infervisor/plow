@@ -140,60 +140,74 @@ fn pinned_shards(
     crate::asset::drafter::Shards::open(dir, &pinned)
 }
 
-/// Every program instruction uses an audited opcode, writes no read-only import and no
-/// tensor the runtime stages from the host; the host-staged inputs are the drafter's own
-/// scratch, and the hidden it restores rows into is writable.
+/// Every program instruction uses an audited opcode and writes only the drafter's scratch or a
+/// target activation, within that tensor's `lens[h]` bytes, and never an input the runtime
+/// stages from the host (the draft tokens are outputs). The staged inputs are the drafter's own
+/// scratch; the hidden it snapshots and restores is the target activation the target writes.
 fn check_writes(
     m: &plow_asset::spec_drafter::Manifest,
     section: &plow_asset::aux_program::Section,
+    lens: &[u64],
 ) -> std::result::Result<(), String> {
-    use plow_asset::spec_drafter::{vetted_writes, Access, Source};
+    use plow_asset::spec_drafter::{vetted_writes, write_extent, Access, Source};
     let source = |h: u16| &m.tensors[usize::from(h)].source;
+    let name = |h: u16| &m.tensors[usize::from(h)].name;
     let t = &m.draft.tensors;
-    let staged = t
-        .tokens
-        .iter()
-        .chain([&t.position, &t.kv_len, &t.slot])
-        .chain(t.hidden_row.iter());
-    for &h in staged {
+    let inputs: Vec<u16> = [t.position, t.kv_len, t.slot]
+        .into_iter()
+        .chain(t.hidden_row)
+        .collect();
+    for &h in t.tokens.iter().chain(&inputs) {
         if *source(h) != Source::Scratch {
-            return Err(format!(
-                "staged input {} is not drafter scratch",
-                m.tensors[usize::from(h)].name
-            ));
+            return Err(format!("staged input {} is not drafter scratch", name(h)));
         }
     }
     if let Some(h) = t.hidden {
         if *source(h)
-            == (Source::Import {
-                access: Access::Read,
+            != (Source::Import {
+                access: Access::ReadWrite,
             })
         {
             return Err(format!(
-                "hidden {} is a read-only import",
-                m.tensors[usize::from(h)].name
+                "hidden {} is not a target activation import",
+                name(h)
             ));
         }
     }
     for (pi, p) in section.programs.iter().enumerate() {
         for (k, inst) in p.insts.iter().enumerate() {
+            let at = || format!("program {pi} instruction {k}");
             let op = packet::dev::DevOp::from_u16(inst.op)
-                .ok_or_else(|| format!("program {pi} instruction {k}: unknown opcode"))?;
-            let writes = vetted_writes(op, inst)
-                .ok_or_else(|| format!("program {pi} instruction {k}: opcode {op:?} is not allowed in an external drafter"))?;
+                .ok_or_else(|| format!("{}: unknown opcode", at()))?;
+            let writes = vetted_writes(op, inst).ok_or_else(|| {
+                format!(
+                    "{}: opcode {op:?} is not allowed in an external drafter",
+                    at()
+                )
+            })?;
             for &slot in writes {
                 let h = inst.t[slot];
                 if h == packet::dev::TENSOR_NONE16 {
                     continue;
                 }
-                if *source(h)
-                    == (Source::Import {
-                        access: Access::Read,
-                    })
-                {
+                let writable = matches!(
+                    source(h),
+                    Source::Scratch
+                        | Source::Import {
+                            access: Access::ReadWrite
+                        }
+                );
+                if !writable || inputs.contains(&h) {
+                    return Err(format!("{} ({op:?}) writes {}", at(), name(h)));
+                }
+                let extent = write_extent(op, inst, slot)
+                    .ok_or_else(|| format!("{} ({op:?}): no write extent for t{slot}", at()))?;
+                if extent > lens[usize::from(h)] {
                     return Err(format!(
-                        "program {pi} instruction {k} ({op:?}) writes read-only import {}",
-                        m.tensors[usize::from(h)].name
+                        "{} ({op:?}) writes {extent} bytes into {} ({} bytes)",
+                        at(),
+                        name(h),
+                        lens[usize::from(h)]
                     ));
                 }
             }
@@ -292,6 +306,23 @@ impl SpecDraft {
             .then(|| read(sd::INIT_FILE))
             .transpose()?;
         let (ceiling, live) = target.ctx;
+        // Byte length each handle will have: an import the engine's allocation, the rest their
+        // declared size. Checked before any weight is uploaded.
+        let lens = m
+            .tensors
+            .iter()
+            .map(|t| match t.source {
+                Source::Import { .. } => e
+                    .tensor_names
+                    .iter()
+                    .position(|n| *n == t.name)
+                    .map_or(0, |i| e.devp[i].len),
+                _ => t.bytes,
+            })
+            .collect::<Vec<_>>();
+        let section =
+            plow_asset::aux_program::parse(&programs_raw, e.grid, m.tensors.len()).map_err(at)?;
+        check_writes(&m, &section, &lens).map_err(at)?;
         let (mut own, mut addr, mut rewritten) = (Vec::new(), Vec::new(), Vec::new());
         for (h, t) in m.tensors.iter().enumerate() {
             let mem = match &t.source {
@@ -353,9 +384,6 @@ impl SpecDraft {
             addr.push((mem.base, mem.len));
             own.push(mem);
         }
-        let section =
-            plow_asset::aux_program::parse(&programs_raw, e.grid, addr.len()).map_err(at)?;
-        check_writes(&m, &section).map_err(at)?;
         let ptrs: Vec<u64> = addr.iter().map(|a| a.0).collect();
         let table = e.be.alloc(0, (ptrs.len() * 8) as u64)?;
         e.be.upload(&table, 0, super::pod_bytes(&ptrs))?;
@@ -1032,11 +1060,12 @@ impl GpuEngine {
         use plow_asset::spec_drafter::{TargetView, TokenizerFacts};
         use sha2::Digest;
         let (pkt, stamp) = &self.packet_file;
+        let before = FileStamp::of(pkt);
         let raw = std::fs::read(pkt).map_err(|source| RuntimeError::Io {
             path: pkt.clone(),
             source,
         })?;
-        if stamp.is_none() || FileStamp::of(pkt) != *stamp {
+        if stamp.is_none() || before != *stamp || FileStamp::of(pkt) != *stamp {
             return Err(reject(format!(
                 "{} changed since the engine loaded it",
                 pkt.display()
@@ -1246,33 +1275,75 @@ mod tests {
         }
     }
 
+    fn rows(op: DevOp, t0: u16, i: [u32; 8]) -> DevInst64 {
+        DevInst64 { i, ..inst(op, t0) }
+    }
+
     #[test]
-    fn writes_into_read_only_imports_are_refused() {
+    fn writes_are_scratch_or_activations_within_bounds() {
         let m = drafter(sources());
-        check_writes(&m, &section(vec![inst(DevOp::RmsNorm, 8)])).unwrap();
-        let e = check_writes(&m, &section(vec![inst(DevOp::RmsNorm, 7)])).unwrap_err();
-        assert!(e.contains("writes read-only import kv.28.k"), "{e}");
+        let lens = vec![64u64; 9];
+        let norm = |t0| rows(DevOp::RmsNorm, t0, [2, 16, 0, 0, 0, 0, 0, 0]);
+        check_writes(&m, &section(vec![norm(8)]), &lens).unwrap();
+        check_writes(&m, &section(vec![norm(6)]), &lens).unwrap();
+        let e = check_writes(&m, &section(vec![norm(7)]), &lens).unwrap_err();
+        assert!(e.contains("writes kv.28.k"), "{e}");
         // NormResidualNorm also writes its residual operand (t1 = kv.28.k here).
-        let e = check_writes(&m, &section(vec![inst(DevOp::NormResidualNorm, 8)])).unwrap_err();
+        let nrn = rows(DevOp::NormResidualNorm, 8, [2, 16, 0, 0, 0, 0, 0, 0]);
+        let e = check_writes(&m, &section(vec![nrn]), &lens).unwrap_err();
         assert!(e.contains("kv.28.k"), "{e}");
-        let e = check_writes(&m, &section(vec![inst(DevOp::HeadNormRopeFp8, 8)])).unwrap_err();
+        let e =
+            check_writes(&m, &section(vec![inst(DevOp::HeadNormRopeFp8, 8)]), &lens).unwrap_err();
+        assert!(e.contains("not allowed"), "{e}");
+        // 3 rows x 16 bf16 = 96 bytes into a 64-byte tensor.
+        let e = check_writes(
+            &m,
+            &section(vec![rows(DevOp::RmsNorm, 8, [3, 16, 0, 0, 0, 0, 0, 0])]),
+            &lens,
+        )
+        .unwrap_err();
+        assert!(e.contains("96 bytes into act.mtp.x"), "{e}");
+        // A host-staged input is never written; the draft tokens are outputs.
+        let e = check_writes(&m, &section(vec![norm(5)]), &lens).unwrap_err();
+        assert!(e.contains("writes in.spec.slot"), "{e}");
+        let argmax_fin = rows(DevOp::ArgmaxFin, 1, [64, 1, 0, 0, 0, 0, 0, 0]);
+        check_writes(&m, &section(vec![argmax_fin]), &lens).unwrap();
+        // The fused k+v HeadNormRope also writes t6.
+        let fused = rows(DevOp::HeadNormRope, 8, [1, 1, 16, 0, 0, 0, 0, 1]);
+        let e = check_writes(&m, &section(vec![fused]), &lens).unwrap_err();
         assert!(e.contains("not allowed"), "{e}");
     }
 
     #[test]
-    fn staged_inputs_must_be_scratch_and_the_hidden_writable() {
+    fn weights_and_init_are_never_written() {
+        let mut s = sources();
+        s[8] = Source::Weight;
+        let lens = vec![64u64; 9];
+        let norm = rows(DevOp::RmsNorm, 8, [2, 16, 0, 0, 0, 0, 0, 0]);
+        let e = check_writes(&drafter(s), &section(vec![norm]), &lens).unwrap_err();
+        assert!(e.contains("writes act.mtp.x"), "{e}");
+    }
+
+    #[test]
+    fn staged_inputs_must_be_scratch_and_the_hidden_an_activation() {
+        let lens = vec![64u64; 9];
         let mut s = sources();
         s[3] = Source::Import {
             access: Access::ReadWrite,
         };
-        let e = check_writes(&drafter(s), &section(vec![])).unwrap_err();
+        let e = check_writes(&drafter(s), &section(vec![]), &lens).unwrap_err();
         assert!(e.contains("in.spec.position"), "{e}");
-        let mut s = sources();
-        s[6] = Source::Import {
-            access: Access::Read,
-        };
-        let e = check_writes(&drafter(s), &section(vec![])).unwrap_err();
-        assert!(e.contains("hidden act.hn"), "{e}");
+        for bad in [
+            Source::Import {
+                access: Access::Read,
+            },
+            Source::Scratch,
+        ] {
+            let mut s = sources();
+            s[6] = bad;
+            let e = check_writes(&drafter(s), &section(vec![]), &lens).unwrap_err();
+            assert!(e.contains("hidden act.hn"), "{e}");
+        }
     }
 
     fn shard(path: &Path, names: &[&str]) {

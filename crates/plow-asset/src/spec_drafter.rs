@@ -137,16 +137,42 @@ pub fn vetted_writes(op: DevOp, inst: &DevInst64) -> Option<&'static [usize]> {
     Some(match op {
         DevOp::Embed
         | DevOp::RowGather
-        | DevOp::HeadNormRope
         | DevOp::Residual
         | DevOp::FlashMerge
         | DevOp::Argmax
         | DevOp::ArgmaxFin => &[0],
+        // The plain q form only: a KV row offset (i3), the dynamic row ladder (i6) or the fused
+        // k+v form (i7, which also writes t6) address a cache, not a row-major output.
+        DevOp::HeadNormRope if inst.i[3] == 0 && inst.i[6] == 0 && inst.i[7] == 0 => &[0],
         DevOp::RmsNorm => &[0, 3, 4],
         // Folded prologues (`i[3] != 0`) write their staging operands too: not vetted.
         DevOp::Gemv | DevOp::GemvGlu if inst.i[3] == 0 => &[0],
         DevOp::FlashDecodeFp8 => &[0, 1],
         DevOp::NormResidualNorm => &[0, 1],
+        _ => return None,
+    })
+}
+
+/// Bytes an allowed instruction writes from the start of write slot `slot` (see
+/// [`vetted_writes`]), from its own row and width fields; the runtime refuses an instruction
+/// whose extent passes the end of the tensor it names.
+pub fn write_extent(op: DevOp, inst: &DevInst64, slot: usize) -> Option<u64> {
+    let i = |k: usize| u64::from(inst.i[k]);
+    let rows = |k: usize| i(k).max(1);
+    Some(match (op, slot) {
+        (DevOp::Embed | DevOp::RowGather | DevOp::Gemv | DevOp::GemvGlu, 0) => i(0) * i(1) * 2,
+        (DevOp::RmsNorm | DevOp::NormResidualNorm, 0) => i(0) * i(1) * 2,
+        (DevOp::NormResidualNorm, 1) => i(0) * i(1) * 2,
+        (DevOp::RmsNorm, 3) => i(0) * i(1),
+        (DevOp::RmsNorm, 4) => i(0) * 4,
+        (DevOp::HeadNormRope, 0) => i(0) * i(1) * i(2) * 2,
+        (DevOp::Residual, 0) => i(0) * 2,
+        (DevOp::FlashDecodeFp8, 0) => i(0) * i(1) * i(5) * i(6) * 4,
+        (DevOp::FlashDecodeFp8, 1) => i(0) * i(1) * i(5) * 8,
+        (DevOp::FlashMerge, 0) => i(0) * i(1) * i(3) * 2,
+        // One (value, index) partial per block per row; the final pass one id per row.
+        (DevOp::Argmax, 0) => u64::from(inst.blocks) * rows(1) * 8,
+        (DevOp::ArgmaxFin, 0) => rows(1) * 4,
         _ => return None,
     })
 }
@@ -334,6 +360,14 @@ impl Manifest {
                 return Err(
                     "a drafter without requires.target_packet_sha256 must pin model, revision \
                      and checkpoint_sha256"
+                        .into(),
+                );
+            }
+            // Without the packet pin the emitted geometry is the only proof of layout.
+            if r.geometry.is_empty() || r.geometry != t.geometry {
+                return Err(
+                    "a drafter without requires.target_packet_sha256 must state the target's \
+                     whole geometry"
                         .into(),
                 );
             }

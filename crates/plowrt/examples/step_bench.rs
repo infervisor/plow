@@ -7,7 +7,7 @@
 //! Usage:
 //!   step_bench <assets_dir> [slots] [ctx] [steps] [--same | --spread] [--warmup N] [--multistep] [--packed-prefill]
 //!              [--dump-tensors name,name --dump-dir dir | --dump-prefill-logits dir]
-//!              [--max-inst N | --max-segments N]
+//!              [--max-inst N | --max-segments N] [--min-rung R]
 //! `--same` feeds every slot the SAME prompt and reports how many slots' greedy
 //! streams agree with slot 0 (a within-batch consistency check). `--spread` gives each slot a
 //! pseudo-random prompt over 64K ids, so a MoE model routes a decode batch the way served
@@ -120,6 +120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut warmup = 16usize;
     let mut sweep: Option<(u32, u32)> = None;
     let mut max_inst: Option<u32> = None;
+    let mut min_rung = 0usize;
+    let mut rung_diff: Option<(usize, usize)> = None;
     let mut max_segments: Option<usize> = None;
     let mut seg_sweep: Option<(usize, usize, usize)> = None;
     let mut prefill_logits_dir = None::<std::path::PathBuf>;
@@ -172,6 +174,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_segments = Some(args.next().ok_or("--max-segments N")?.parse()?)
             }
             "--max-inst" => max_inst = Some(args.next().ok_or("--max-inst N")?.parse()?),
+            // `--min-rung R`: plain decode launches at least rung R (padding rows stay inactive).
+            "--min-rung" => min_rung = args.next().ok_or("--min-rung R")?.parse()?,
+            // `--rung-diff A,B`: one decode step capped at every instruction, at rung A and at
+            // rung B from the same state; prints the first instructions whose output rows differ.
+            "--rung-diff" => {
+                let r = args.next().ok_or("--rung-diff A,B")?;
+                let (x, y) = r.split_once(',').ok_or("--rung-diff A,B")?;
+                rung_diff = Some((x.parse()?, y.parse()?));
+            }
             "--same" => same = true,
             "--spread" => spread = true,
             "--packed-prefill" => packed_prefill = true,
@@ -432,6 +443,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(segments) = max_segments {
         e.capture_debug_decode_prefix(segments)?;
     }
+    e.set_debug_min_rung(min_rung);
     if let Some(cap) = max_inst {
         if !e.set_debug_max_inst(cap, slots)? {
             return Err("decode object has no instruction-cap global".into());
@@ -504,6 +516,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{{\"seg\":{n},\"ms\":{:.4}}}", v[v.len() / 2]);
         }
         return Ok(());
+    }
+    if let Some((ra, rb)) = rung_diff {
+        return rung_diff_bench(
+            &mut e,
+            &assets,
+            (ra, rb),
+            slots,
+            ctx + warmup,
+            &last,
+            &feeds_of,
+        );
     }
     if let Some((lo, hi)) = sweep {
         let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
@@ -1445,4 +1468,94 @@ fn spec_bench(
     } else {
         Err("speculative verify diverged from the plain reference".into())
     }
+}
+
+/// `--rung-diff A,B`: the first instructions of rung A's program whose output rows `0..slots`
+/// differ when the same step runs at rung B (same instruction positions in both programs).
+#[cfg(feature = "cuda")]
+fn rung_diff_bench<F>(
+    e: &mut plowrt::exec::gpu::GpuEngine,
+    assets: &std::path::Path,
+    (ra, rb): (usize, usize),
+    slots: usize,
+    pos: usize,
+    last: &[u32],
+    feeds_of: &F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Fn(&[u32]) -> Vec<(usize, u32)>,
+{
+    use plowrt::asset::devblob::DevBlob;
+    let pkt = DevBlob::find_in_dir(assets)?.ok_or("no packet")?;
+    let raw = std::fs::read(pkt)?;
+    let blob = DevBlob::parse(&raw)?;
+    let progs = blob.decode_progs();
+    let rungs = blob.decode_rungs();
+    let prog = |r: usize| {
+        rungs
+            .iter()
+            .position(|&w| w as usize == r)
+            .map(|i| progs[i])
+            .ok_or(format!("no decode rung {r}"))
+    };
+    let (pa, pb) = (prog(ra)?, prog(rb)?);
+    if pa.insts.len() != pb.insts.len() {
+        return Err("rung programs differ in length".into());
+    }
+    for b in 0..slots {
+        e.snapshot_slot(b)?;
+    }
+    let mut toks = vec![0u32; slots];
+    let mut shown = 0;
+    for cap in 1..=pa.insts.len() {
+        let d = &pa.insts[cap - 1];
+        if pb.insts[cap - 1].op != d.op || pb.insts[cap - 1].t[0] != d.t[0] {
+            return Err(format!("instruction {} differs between the rungs", cap - 1).into());
+        }
+        let t = &blob.tensors[usize::from(d.t[0])];
+        // Split partials are laid out by the split count, not by row.
+        if !t.name.starts_with("act.") || matches!(t.name.as_str(), "act.opart" | "act.mlpart") {
+            continue;
+        }
+        // Tensors are sized for the widest program that touches them (a prefill bucket for the
+        // shared activations), row-major by row.
+        let widest = blob
+            .progs
+            .iter()
+            .filter(|p| p.insts.iter().any(|x| x.t.contains(&d.t[0])))
+            .map(|p| p.t as usize)
+            .max()
+            .unwrap_or(1);
+        let row = t.bytes as usize / widest;
+        let mut out = Vec::new();
+        for r in [ra, rb] {
+            e.set_debug_min_rung(r);
+            e.set_debug_max_inst(cap as u32, slots)?;
+            for b in 0..slots {
+                e.rewind_slot(b, pos)?;
+            }
+            e.step_slots(&feeds_of(last), &mut toks)?;
+            let mut v = vec![0u8; row * slots];
+            e.read_tensor_range(&t.name, 0, &mut v)?;
+            out.push(v);
+        }
+        if out[0] != out[1] {
+            let n = out[0].iter().zip(&out[1]).filter(|(x, y)| x != y).count();
+            println!(
+                "RUNG_DIFF inst={} op={:?} out={} i={:?} differing_bytes={n}/{}",
+                cap - 1,
+                packet::dev::DevOp::from_u16(d.op),
+                t.name,
+                d.i,
+                row * slots
+            );
+            shown += 1;
+            if shown == 8 {
+                break;
+            }
+        }
+    }
+    e.set_debug_max_inst(u32::MAX, slots)?;
+    println!("RUNG_DIFF_DONE rungs={ra},{rb} slots={slots} differing={shown}");
+    Ok(())
 }

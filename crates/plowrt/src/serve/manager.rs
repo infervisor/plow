@@ -196,17 +196,21 @@ impl BlobPlan {
     /// An attached external drafter's own device tensors (its imports alias the target's).
     /// They are separate allocations, never carved from the weight slab, so they count like a
     /// sidecar: in the footprint, not in [`Self::slab_reusable`].
-    fn add_drafter(&mut self, dir: &Path) -> Result<()> {
-        use plow_asset::spec_drafter::{Manifest, Source, FILE};
+    /// `slots`: the packet's decode batch (one hidden snapshot row each).
+    fn add_drafter(&mut self, dir: &Path, slots: u64) -> Result<()> {
+        use plow_asset::spec_drafter::{Manifest, Source, FILE, PROGRAMS_FILE};
         let path = dir.join(FILE);
         let bytes = std::fs::read(&path).map_err(|source| RuntimeError::Io { path, source })?;
         let m = Manifest::parse(&bytes)
             .map_err(|e| RuntimeError::Rejected(format!("drafter {}: {e}", dir.display())))?;
-        // The runtime's per-drafter buffers: the pointer table and the hidden snapshots (one row
-        // per slot, bounded by the hidden tensor's row capacity).
+        // The runtime's per-drafter buffers: the pointer table, the programs' device tables (no
+        // larger than the programs file) and one hidden snapshot row per slot.
         self.sidecar_bytes += 8 * m.tensors.len() as u64;
+        self.sidecar_bytes += std::fs::metadata(dir.join(PROGRAMS_FILE)).map_or(0, |f| f.len());
         if let Some(h) = m.draft.tensors.hidden {
-            self.sidecar_bytes += m.tensors.get(usize::from(h)).map_or(0, |t| t.bytes);
+            let rows = u64::from(m.draft.tensors.hidden_rows.max(1));
+            let row = m.tensors.get(usize::from(h)).map_or(0, |t| t.bytes / rows);
+            self.sidecar_bytes += row * slots;
         }
         for t in &m.tensors {
             match t.source {
@@ -267,7 +271,12 @@ impl BlobPlan {
         }
         if crate::config::RuntimeConfig::get().nv.spec {
             if let Some(drafter) = crate::asset::serve::drafter_dir(dir) {
-                plan.add_drafter(&drafter)?;
+                let slots = blob
+                    .tensors
+                    .iter()
+                    .find(|t| t.name == "in.kvlen")
+                    .map_or(1, |t| t.bytes / 4);
+                plan.add_drafter(&drafter, slots)?;
             }
         }
         #[cfg(feature = "cuda")]
@@ -785,6 +794,13 @@ impl ManagerDevice for HsaManagerDevice {
         VmmOps::pool_trim(&*self.be, keep_bytes)
     }
     fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
+        if let Some((d, true)) = crate::asset::serve::drafter_source(dir) {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: drafter {} attached, but this backend runs no external drafters",
+                dir.display(),
+                d.display()
+            )));
+        }
         let blob = crate::asset::devblob::DevBlob::find_in_dir(dir)?
             .ok_or_else(|| RuntimeError::Msg(format!("no blob in {}", dir.display())))?;
         let hsaco = crate::config::RuntimeConfig::get()
@@ -2336,11 +2352,17 @@ mod tests {
             overhead_bound: 0,
             min_kv_bytes: 0,
         };
-        p.add_drafter(&dir).unwrap();
+        std::fs::write(
+            dir.join(plow_asset::spec_drafter::PROGRAMS_FILE),
+            [0u8; 100],
+        )
+        .unwrap();
+        p.add_drafter(&dir, 32).unwrap();
         assert_eq!(
             p.sidecar_bytes,
-            1000 + 6 * 64 + 16 + 10 * 8 + (1 << 20),
-            "own tensors, the pointer table and the hidden snapshots; imports alias the target"
+            1000 + 6 * 64 + 16 + 10 * 8 + 100 + ((1 << 20) / 16) * 32,
+            "own tensors, the pointer table, the program tables and one hidden snapshot row per \
+             slot; imports alias the target"
         );
         assert_eq!(p.tensor_total(), p.sidecar_bytes);
         assert_eq!(
@@ -2350,7 +2372,7 @@ mod tests {
         );
         std::fs::write(dir.join(plow_asset::spec_drafter::FILE), b"{}").unwrap();
         assert!(
-            p.add_drafter(&dir).is_err(),
+            p.add_drafter(&dir, 32).is_err(),
             "a malformed drafter fails the plan"
         );
         std::fs::remove_dir_all(dir).unwrap();

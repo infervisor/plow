@@ -4035,15 +4035,19 @@ impl GpuEngine {
         );
 
         // ---- blob ----
+        // The stamp of the bytes actually read (unchanged across the read), for drafter checks.
+        let packet_stamp = std::cell::Cell::new(None);
         let (pkt, raw, mut blob) = {
             let run = || -> Result<_> {
                 let pkt = DevBlob::find_in_dir(assets_dir)?.ok_or_else(|| {
                     RuntimeError::Device(format!("no PLOWDEV blob in {}", assets_dir.display()))
                 })?;
+                let before = spec_draft::FileStamp::of(&pkt);
                 let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
                     path: pkt.clone(),
                     source,
                 })?;
+                packet_stamp.set(before.filter(|b| Some(*b) == spec_draft::FileStamp::of(&pkt)));
                 let blob = DevBlob::parse(&raw)?;
                 crate::certificate_checks::check_packet(&pkt, &raw, &blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
@@ -5930,6 +5934,27 @@ impl GpuEngine {
             .as_ref()
             .filter(|routed| moe_lt_routed && routed.serves(&insts))
             .cloned();
+        let invariant_splits = if config.decode_batch_invariant()
+            && select_decode_rungs
+            && blob.decode_progs().len() > 1
+        {
+            if gen_decode_launch.is_some() || prepared_contexts.is_some() {
+                return Err(RuntimeError::Rejected(
+                    "batch-invariant decode: generated decode attention and context-band \
+                     rungs size their split counts per launch"
+                        .into(),
+                ));
+            }
+            let reference = blob.decode_progs()[0].insts.clone();
+            let changed = crate::exec::kvrow::pin_decode_splits(&reference, &mut insts, |h| {
+                blob.tensors[usize::from(h)].bytes
+            })
+            .map_err(|e| RuntimeError::Rejected(format!("batch-invariant decode: {e}")))?;
+            tracing::info!(changed, "batch-invariant decode: widest program pinned");
+            Some(reference)
+        } else {
+            None
+        };
         let d_inst = upload_pod(pod_bytes(&insts))?;
         let d_stream = upload_pod(pod_bytes(&g.stream))?;
         let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
@@ -6101,7 +6126,7 @@ impl GpuEngine {
                     Arc::clone(if rows >= *min_rows { full } else { narrow })
                 })
         };
-        let decode_rungs = if select_decode_rungs {
+        let mut decode_rungs = if select_decode_rungs {
             blob.decode_progs()[..blob.decode_progs().len() - 1]
                 .iter()
                 .enumerate()
@@ -6460,6 +6485,11 @@ impl GpuEngine {
         } else {
             Vec::new()
         };
+        if let Some(reference) = &invariant_splits {
+            for rung in decode_rungs.iter_mut() {
+                rung.pin_splits(&be, reference, |h| blob.tensors[usize::from(h)].bytes)?;
+            }
+        }
         let decode_contexts = prepared_contexts
             .map(|contexts| contexts.materialize(&be, kernarg, assets_dir))
             .transpose()?;
@@ -6471,7 +6501,9 @@ impl GpuEngine {
         }
 
         let mut nv_nsplit = None;
-        if config.nv_ns_live() {
+        if config.nv_ns_live() && invariant_splits.is_some() {
+            tracing::warn!("PLOW_NV_NS_LIVE ignored: batch-invariant decode pins the split counts");
+        } else if config.nv_ns_live() {
             if decode_contexts.is_some() {
                 tracing::warn!(
                     "PLOW_NV_NS_LIVE ignored: this packet carries a decode context table, whose band programs keep their baked split count"
@@ -7698,7 +7730,7 @@ impl GpuEngine {
             t_logits,
             recurrent,
             tensor_names: blob.tensors.iter().map(|t| t.name.clone()).collect(),
-            packet_file: (pkt.clone(), spec_draft::FileStamp::of(&pkt)),
+            packet_file: (pkt.clone(), packet_stamp.get()),
             vocab,
             max_ctx,
             batch,
