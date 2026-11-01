@@ -1019,6 +1019,9 @@ def cmd_bench(a: argparse.Namespace) -> None:
         },
         "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co")},
         "rows": len(rows),
+        # Per cell, from the bench script's host_res.py sampler: host RSS/Pss, cores, threads, libs.
+        "host_resources": {f.name[: -len(".host.json")]: json.loads(f.read_text())
+                           for f in sorted((out / "client").glob("*.host.json"))},
         "bench_rc": rc,
         "execution_artifacts": before,
         "execution_artifacts_unchanged": before == after,
