@@ -385,7 +385,8 @@ pub fn asset_env_defaults(
 }
 
 /// The packet serve defaults of the bundle in `dir` (`None` without a device packet), every
-/// key a registered runtime knob; removed knobs are dropped with a warning.
+/// key a registered runtime knob; a renamed knob is carried over to its new name, other removed
+/// knobs are dropped with a warning.
 pub fn bundle_serve_defaults(dir: &Path) -> Result<Option<(PathBuf, Vec<(String, String)>)>> {
     let Some(pkt) = crate::asset::devblob::DevBlob::find_in_dir(dir)? else {
         return Ok(None);
@@ -396,6 +397,15 @@ pub fn bundle_serve_defaults(dir: &Path) -> Result<Option<(PathBuf, Vec<(String,
     let m = ServeManifest::parse(&bytes).map_err(RuntimeError::Device)?;
     let mut out = Vec::with_capacity(m.serve_defaults.len());
     for (key, value) in &m.serve_defaults {
+        if let Some(renamed) = crate::knob_spec::renamed_serve_default(key, value) {
+            let (key, value) =
+                renamed.map_err(|e| RuntimeError::Rejected(format!("{}: {e}", pkt.display())))?;
+            // A packet carrying both spellings keeps the new one.
+            if !m.serve_defaults.contains_key(&key) {
+                out.push((key, value));
+            }
+            continue;
+        }
         if crate::knob_spec::is_removed_env(key) {
             tracing::warn!(
                 knob = key.as_str(),

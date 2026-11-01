@@ -5499,7 +5499,7 @@ impl Drop for HostTierGrant {
 
 /// Grant an engine asking `requested` host-tier bytes its share. The tier pins host memory and
 /// never gives it back, so co-served engines draw from ONE budget — the largest any engine has
-/// asked (its packet's `PLOW_VMM_HOST_CACHE_MIB`, or the auto size) — never one each: the second
+/// asked (its packet's `PLOW_HOST_KVCACHE_SIZE`, or the auto size) — never one each: the second
 /// of two 64 GiB engines gets what the first left. A lone engine gets exactly what it asked.
 pub(crate) fn host_tier_grant(requested: u64) -> HostTierGrant {
     HOST_TIER_BUDGET.fetch_max(requested, Ordering::AcqRel);

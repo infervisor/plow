@@ -913,16 +913,18 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-publish-shared", env = "PLOW_VMM_PUBLISH_SHARED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_publish_shared: bool,
 
-    /// Pinned host memory (MiB) for the prefix cache's host tier (the second level of its
-    /// LRU: evicted boundaries spill there and attach from there). Unset = sized by
+    /// Pinned host memory for the KV cache's host tier (the second level of the prefix cache's
+    /// LRU: evicted boundaries spill there and attach from there), as `<n>MB` or `<n>GB`
+    /// (binary: MiB, GiB; case-insensitive). Unset or `auto` = sized by
     /// `memory::vmm::host_tier_default`: `MemAvailable` minus the host reserve (an eighth of RAM,
-    /// at least 16 GiB), capped at a quarter of RAM; `0` = no host tier.
+    /// at least 16 GiB), capped at a quarter of RAM (AMD: no host tier); `0` = no host tier.
     #[arg(
-        long = "vmm-host-cache-mib",
-        env = "PLOW_VMM_HOST_CACHE_MIB",
+        long = "host-kvcache-size",
+        env = "PLOW_HOST_KVCACHE_SIZE",
+        value_parser = parse_host_kvcache_size,
         global = true
     )]
-    pub vmm_host_cache_mib: Option<u64>,
+    pub host_kvcache_size: Option<HostKvcacheSize>,
 
     /// CUDA VMM prefix cache: seconds a request with
     /// `X-Session-Id` keeps its newest boundary protected from LRU after its last use; then the
@@ -3241,14 +3243,21 @@ impl RuntimeConfig {
         )
     }
 
-    /// `None` = unset (the store sizes its host tier by the host-reserve rule); `Some(0)` = off.
-    pub(crate) fn vmm_host_cache_bytes(&self) -> Option<u64> {
-        let mib = if Self::is_initialized() {
-            self.vmm_host_cache_mib
+    /// `None` = unset or `auto` (the store sizes its host tier by the host-reserve rule);
+    /// `Some(0)` = off.
+    pub(crate) fn host_kvcache_bytes(&self) -> Option<u64> {
+        let size = if Self::is_initialized() {
+            self.host_kvcache_size
         } else {
-            Self::env_parse("PLOW_VMM_HOST_CACHE_MIB").or(self.vmm_host_cache_mib)
+            std::env::var("PLOW_HOST_KVCACHE_SIZE")
+                .ok()
+                .and_then(|v| parse_host_kvcache_size(&v).ok())
+                .or(self.host_kvcache_size)
         };
-        mib.map(|m| m << 20)
+        match size? {
+            HostKvcacheSize::Auto => None,
+            HostKvcacheSize::Bytes(b) => Some(b),
+        }
     }
 
     pub(crate) fn prefix_session_ttl(&self) -> std::time::Duration {
@@ -3359,6 +3368,11 @@ impl RuntimeConfig {
         static FALLBACK: OnceLock<RuntimeConfig> = OnceLock::new();
         FALLBACK.get_or_init(|| {
             use clap::Parser;
+            // Fails like the parse below does on a bad value.
+            if let Err(e) = crate::knob_spec::refuse_renamed_env(|k| std::env::var(k).ok()) {
+                eprintln!("plowrt: {e}");
+                std::process::exit(2);
+            }
             #[derive(Parser)]
             struct EnvOnly {
                 #[command(flatten)]
@@ -3691,6 +3705,48 @@ pub fn is_secret_env(name: &str) -> bool {
         || ["_KEY", "_KEYS", "_TOKEN", "_TOKENS"]
             .iter()
             .any(|suffix| upper.ends_with(suffix))
+}
+
+/// `PLOW_HOST_KVCACHE_SIZE`: the host KV tier's size, or `auto` (the host-reserve rule).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostKvcacheSize {
+    Auto,
+    Bytes(u64),
+}
+
+/// `<n>MB` / `<n>GB` (binary units, any case, optional space), `0` (off) or `auto`. A bare
+/// number is refused: the old knob took MiB, so its meaning would be a guess.
+pub fn parse_host_kvcache_size(s: &str) -> std::result::Result<HostKvcacheSize, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Ok(HostKvcacheSize::Auto);
+    }
+    if t == "0" {
+        return Ok(HostKvcacheSize::Bytes(0));
+    }
+    let lower = t.to_ascii_lowercase();
+    let unit = |suffix: &str, shift: u32| {
+        lower
+            .strip_suffix(suffix)
+            .map(|n| (n.trim_end().to_owned(), shift))
+    };
+    let Some((num, shift)) = unit("gb", 30).or_else(|| unit("mb", 20)) else {
+        let hint = if t.bytes().all(|b| b.is_ascii_digit()) {
+            format!(" (did you mean {t}MB?)")
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "{s:?} needs a unit: <n>MB or <n>GB (MiB, GiB), 0 = off, auto = sized from free \
+             RAM{hint}"
+        ));
+    };
+    num.parse::<u64>()
+        .ok()
+        .filter(|_| num.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.checked_mul(1 << shift))
+        .map(HostKvcacheSize::Bytes)
+        .ok_or_else(|| format!("{s:?} is not a size: <n>MB or <n>GB (MiB, GiB), 0 or auto"))
 }
 
 fn parse_pf_hold(spec: &str) -> Option<(u32, f64, usize)> {
@@ -4614,5 +4670,34 @@ mod tests {
 
     fn walk(dir: &std::path::Path) -> String {
         files(dir).into_iter().map(|(_, t)| t).collect()
+    }
+}
+
+#[cfg(test)]
+mod host_kvcache_size_tests {
+    use super::{parse_host_kvcache_size as parse, HostKvcacheSize::*};
+
+    #[test]
+    fn parses_binary_mb_and_gb_in_any_case() {
+        assert_eq!(parse("65536MB"), Ok(Bytes(64 << 30)));
+        assert_eq!(parse("64GB"), Ok(Bytes(64 << 30)));
+        assert_eq!(parse("64 gb"), Ok(Bytes(64 << 30)));
+        assert_eq!(parse("512Mb"), Ok(Bytes(512 << 20)));
+        assert_eq!(parse("0"), Ok(Bytes(0)));
+        assert_eq!(parse("0GB"), Ok(Bytes(0)));
+        assert_eq!(parse("auto"), Ok(Auto));
+        assert_eq!(parse("AUTO"), Ok(Auto));
+    }
+
+    #[test]
+    fn refuses_a_bare_number_and_garbage() {
+        let bare = parse("65536").unwrap_err();
+        assert!(bare.contains("did you mean 65536MB"), "{bare}");
+        for bad in [
+            "", "MB", "64KB", "64 G", "1.5GB", "-1GB", "+64GB", "64GiB", "x64MB",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse("18446744073709551615GB").is_err());
     }
 }

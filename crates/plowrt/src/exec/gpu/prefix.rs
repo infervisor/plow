@@ -585,7 +585,7 @@ impl GpuEngine {
                     // a size (cut to the same rule by the store's growth check) or 0 (off).
                     let auto = crate::memory::vmm::host_tier_auto();
                     let host_cap =
-                        crate::memory::vmm::host_tier_grant(match rt.vmm_host_cache_bytes() {
+                        crate::memory::vmm::host_tier_grant(match rt.host_kvcache_bytes() {
                             None => auto.map_or(0, |(cap, _)| cap),
                             Some(cap) => cap,
                         });

@@ -575,6 +575,48 @@ pub fn check_knobs(knobs: &Value, rt: &RuntimeConfig) -> std::result::Result<(),
     ))
 }
 
+/// Removed knobs renamed with a unit change: the old name, and its value in the new knob's
+/// spelling (`None` = not a value the old knob took).
+const RENAMED: &[(&str, &str, fn(&str) -> Option<String>)] = &[(
+    "PLOW_VMM_HOST_CACHE_MIB",
+    "PLOW_HOST_KVCACHE_SIZE",
+    |mib| match mib.trim().parse::<u64>().ok()? {
+        0 => Some("0".into()),
+        n => Some(format!("{n}MB")),
+    },
+)];
+
+fn renamed_hint(old: &str, new: &str, value: Option<String>) -> String {
+    format!(
+        "{old} was renamed: use {new}={}",
+        value.as_deref().unwrap_or("<size>")
+    )
+}
+
+/// Refuse a renamed knob still set in the environment (`env`), naming the new spelling and
+/// value: the setting is never silently dropped.
+pub fn refuse_renamed_env(env: impl Fn(&str) -> Option<String>) -> std::result::Result<(), String> {
+    for (old, new, convert) in RENAMED {
+        if let Some(v) = env(old) {
+            return Err(renamed_hint(old, new, convert(&v)));
+        }
+    }
+    Ok(())
+}
+
+/// A packet serve default under a renamed knob, as the new knob and value. Packets emitted
+/// before the rename carry the old name; their qualified value carries over exactly.
+pub fn renamed_serve_default(
+    key: &str,
+    value: &str,
+) -> Option<std::result::Result<(String, String), String>> {
+    let (old, new, convert) = RENAMED.iter().find(|(old, _, _)| *old == key)?;
+    Some(match convert(value) {
+        Some(v) => Ok(((*new).to_owned(), v)),
+        None => Err(renamed_hint(old, new, None)),
+    })
+}
+
 /// Warn about each retired knob still set in the environment: it no longer does anything, and
 /// `--objective` decides what it used to.
 pub fn warn_removed_env() {
@@ -640,6 +682,7 @@ const ENGINE_KNOBS: &[&str] = &[
     "PLOW_FP8_DIR",
     "PLOW_FUSION",
     "PLOW_GLOBAL_QUEUE",
+    "PLOW_HOST_KVCACHE_SIZE",
     "PLOW_HSA_DRAIN_BLOCKED",
     "PLOW_L2_PLACE_DISPATCH",
     "PLOW_LAUNCH_ROWS",
@@ -841,7 +884,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
-    KnobSpec::new("rt.vmm_host_cache_mib", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::Runtime, USIZE, UNSET, OPT_IN),
+    KnobSpec::new("rt.host_kvcache_size", Some("PLOW_HOST_KVCACHE_SIZE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
     KnobSpec::new("rt.kv_mem_util", Some("PLOW_KV_MEM_UTIL"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
@@ -1168,6 +1211,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_VMM_RING_PARK", Some("PLOW_VMM_RING_PARK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_VMM_SNAP_PITCHED", Some("PLOW_VMM_SNAP_PITCHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_VMM_SNAP_POOL", Some("PLOW_VMM_SNAP_POOL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_VMM_HOST_CACHE_MIB", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_POLICY", Some("PLOW_PREFIX_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_RETIRE_ATTACHED", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_QUEUE_TTL_MS", Some("PLOW_QUEUE_TTL_MS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
@@ -1258,7 +1302,7 @@ mod tests {
             "PLOW_MULTISTEP",
             "PLOW_VMM_PREFIX",
             "PLOW_VMM_LIVE_RINGS",
-            "PLOW_VMM_HOST_CACHE_MIB",
+            "PLOW_HOST_KVCACHE_SIZE",
             "PLOW_LT_RUNG_ALGOS",
             "PLOW_PREFIX_CACHE",
             "PLOW_KV_POOL_MIB",
@@ -1279,6 +1323,39 @@ mod tests {
             assert_eq!(knob_scope(e), Some(KnobScope::Process), "{e}");
         }
     }
+    #[test]
+    fn renamed_host_cache_knob_is_refused_with_the_new_spelling() {
+        assert_eq!(
+            renamed_serve_default("PLOW_VMM_HOST_CACHE_MIB", "65536"),
+            Some(Ok(("PLOW_HOST_KVCACHE_SIZE".into(), "65536MB".into())))
+        );
+        assert_eq!(
+            renamed_serve_default("PLOW_VMM_HOST_CACHE_MIB", "0"),
+            Some(Ok(("PLOW_HOST_KVCACHE_SIZE".into(), "0".into())))
+        );
+        assert!(matches!(
+            renamed_serve_default("PLOW_VMM_HOST_CACHE_MIB", "lots"),
+            Some(Err(_))
+        ));
+        assert_eq!(
+            renamed_serve_default("PLOW_HOST_KVCACHE_SIZE", "64GB"),
+            None
+        );
+        assert!(is_removed_env("PLOW_VMM_HOST_CACHE_MIB"));
+        assert!(is_runtime_env("PLOW_HOST_KVCACHE_SIZE"));
+        assert_eq!(
+            knob_scope("PLOW_HOST_KVCACHE_SIZE"),
+            Some(KnobScope::Engine)
+        );
+        let env = |k: &str| (k == "PLOW_VMM_HOST_CACHE_MIB").then(|| "65536".to_string());
+        let err = refuse_renamed_env(env).unwrap_err();
+        assert_eq!(
+            err,
+            "PLOW_VMM_HOST_CACHE_MIB was renamed: use PLOW_HOST_KVCACHE_SIZE=65536MB"
+        );
+        assert_eq!(refuse_renamed_env(|_| None), Ok(()));
+    }
+
     use plow_asset::knob::test_util::{check_table, env_reads, files, plow_tokens, ArgFacts};
     use plow_asset::knob::{Formula, KnobSpec, TargetSpec};
     use std::path::PathBuf;

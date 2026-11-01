@@ -108,7 +108,7 @@
 # 0.95x, TTFT/TPOT P99 3.9x/1.8x, SLO met 63 vs 99 %; 0.7 overloads plowrt. Decode ~25 ms at 4 rows,
 # 1024-row prefill chunk 89 ms, and prefix hit 52 -> 13 % under load (vLLM 63-69 %). Serve tunes not run.
 # 2026-10-28 (branch qwen-prefix, plowrt 87e820a40, same packet cb2ea611523da092; serve env below
-# plus PLOW_VMM_HOST_CACHE_MIB=63488, the 62 GiB pinned host tier the planned MemTotal/4 default
+# plus PLOW_HOST_KVCACHE_SIZE=62GB, the 62 GiB pinned host tier the planned MemTotal/4 default
 # gives on this 249 GB box): prefix retention fixed in plowrt (GDN state captured at the shared
 # system-prompt end and at awaited checkpoints, no host-tier wipe under device pressure, spills paced
 # at 256 MiB in flight, failed refills keep their host bytes). Prod mix at 0.45 vs vLLM 0.29: tok/s

@@ -764,7 +764,7 @@ Each rule cost at least one campaign a day of misattributed results.
   lines before blaming a build.
 * A serving plowrt with the host tier on auto pins host RAM down to the reserve (default tier
   = `min(MemAvailable − max(total/8, 16 GiB), total/4)`, `memory::vmm::host_tier_default`; the 12B
-  recipe sets `PLOW_VMM_HOST_CACHE_MIB` 64 GiB). An `interp_sm90a` compile takes 22–38 GB per nvcc:
+  recipe sets `PLOW_HOST_KVCACHE_SIZE` 64 GiB). An `interp_sm90a` compile takes 22–38 GB per nvcc:
   never start an emit or a large cargo build beside a serving grid; chain it after.
 * The prefix cache is always on (`PLOW_PREFIX_CACHE`, `PLOW_VMM_PREFIX`); `=0` is an attribution
   A/B, never a recipe or release setting. A prefix-cache cost is a plowrt bug to fix.
