@@ -326,8 +326,27 @@ fn a_qwen2_checkpoint_without_tokenizer_json_links_vocab_and_merges() {
 /// reach real shard files.
 #[test]
 fn a_second_variant_on_the_farm_keeps_every_link_resolving() {
+    second_variant_on_the_farm(false);
+}
+
+/// The same with a hub-cache snapshot, whose shards are links into `blobs/`: the farm's source
+/// is the snapshot dir, not where its links resolve.
+#[test]
+fn a_second_variant_on_a_hub_snapshot_farm_keeps_every_link_resolving() {
+    second_variant_on_the_farm(true);
+}
+
+fn second_variant_on_the_farm(hub: bool) {
     let store = tmp("store");
     let snap = snapshot("snap", 2, &["tokenizer.json", "config.json"]);
+    let blobs = tmp("blobs");
+    if hub {
+        for (i, e) in std::fs::read_dir(&snap).unwrap().flatten().enumerate() {
+            let blob = blobs.join(format!("{i:064x}"));
+            std::fs::rename(e.path(), &blob).unwrap();
+            std::os::unix::fs::symlink(&blob, e.path()).unwrap();
+        }
+    }
     let (first, second) = (tmp("bundle-a"), tmp("bundle-b"));
     for d in [&first, &second] {
         std::fs::write(d.join("model.pkt"), b"pkt").unwrap();
@@ -359,7 +378,7 @@ fn a_second_variant_on_the_farm_keeps_every_link_resolving() {
             e.path().display()
         );
     }
-    for p in [store, snap, first, second] {
+    for p in [store, snap, blobs, first, second] {
         let _ = std::fs::remove_dir_all(p);
     }
 }

@@ -49,6 +49,10 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
+fn same_dir_prefix(path: &Path, dir: &Path) -> bool {
+    path.parent().is_some_and(|p| same_dir(p, dir))
+}
+
 /// The snapshot an existing farm's base shards link into (one directory for all of them).
 fn farm_snapshot(farm: &Path, bundles: &Path) -> Result<PathBuf> {
     let mut snapshot: Option<PathBuf> = None;
@@ -60,10 +64,13 @@ fn farm_snapshot(farm: &Path, bundles: &Path) -> Result<PathBuf> {
         if !e.file_name().to_string_lossy().ends_with(".safetensors") {
             continue;
         }
-        let Ok(target) = e.path().canonicalize() else {
+        // The link's own target, not its canonical file: a hub snapshot's shards are links
+        // into `blobs/`, which has neither the shard names nor the metadata.
+        let Ok(target) = std::fs::read_link(e.path()) else {
             continue;
         };
-        if target.starts_with(bundles) || target.starts_with(farm) {
+        let target = farm.join(target);
+        if !target.is_file() || target.starts_with(bundles) || same_dir_prefix(&target, farm) {
             continue;
         }
         let parent = target.parent().map(Path::to_path_buf);
