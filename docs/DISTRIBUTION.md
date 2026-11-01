@@ -263,6 +263,15 @@ plowrt push --recipe … --assets … --objects …           # same, for real
 plowrt show <name>                                       # from any machine: the generation is live
 ```
 
+An NVIDIA build serves from its asset directory, so that is what ships: the
+objset is `$OUT/assets`' own `*.cubin` and `*.aot` (interpreter, generated,
+sampler and library objects) plus its `objects/` (the segment objects) as
+`objects/<file>`, and `pull` lays them out the same way in the bundle
+directory. `pack` refuses a build missing an object the packet loads by name
+(or holding other bytes than it pins), and an `--objects` directory that is
+not that `objects/` set byte for byte. An AMD bundle's objects come from
+`--objects` and land under `hsaco/`.
+
 A measurement is not a condition of publishing: a build goes up as `emits`
 and is re-pushed as `validated` with `--tok-s` when it has been gated and
 measured. The registry carries what plow produced and nothing else; a
