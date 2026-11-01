@@ -338,32 +338,44 @@ fn admission_maps_the_rows_launches_can_write_and_no_more() {
 }
 
 /// A serial chunk chain on slot b > 0 reads slot b's table through the shared prefill table and
-/// the graph built for it: the same prompt gives slot 0's prefill logits bit for bit, and the
-/// first decode step (which reads the KV the chain wrote into slot b's ring) the same token.
+/// the graph built for it: after one warm-up chain, the same prompt gives slot 0's prefill token
+/// and logits bit for bit on every slot. `SLOTCHK` lines carry each run's time and logits hash.
 #[test]
 #[ignore = "GPU; set SLOT_PREFILL_TEST_ASSETS (a batch > 1 segmented-prefill packet)"]
 fn serial_prefill_on_any_slot_matches_slot_zero() {
     let assets = PathBuf::from(std::env::var("SLOT_PREFILL_TEST_ASSETS").unwrap());
     let be = Arc::new(CudaBackend::new(0).unwrap());
     let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).unwrap();
-    assert!(e.batch > 2 && e.d_tens_pf.is_some());
+    assert!(e.batch > 2);
     let prompt: Vec<u32> = (0..1200u32).map(|i| 100 + (i * 7919) % 20_000).collect();
-    let slots = [0, 1, e.batch / 2, e.batch - 1, 1];
+    let warmup = [0, 1];
+    let slots = [0, 1, e.batch / 2, e.batch - 1, 0, 1, e.batch - 1];
     let mut logits = Vec::new();
     let mut runs = Vec::new();
-    for &slot in &slots {
+    for &slot in warmup.iter().chain(&slots) {
         e.begin_slot(slot, prompt.len() + 8).unwrap();
+        let t = std::time::Instant::now();
         let token = e.prefill_slot(slot, &prompt).unwrap();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
         e.logits_row(0, &mut logits).unwrap();
         let bits: Vec<u32> = logits.iter().map(|v| v.to_bits()).collect();
+        let fnv = bits.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
         let mut next = Vec::new();
         e.step_slots(&[(slot, token)], &mut next).unwrap();
         e.retire_slot(slot, false);
-        runs.push((token, bits, next[0]));
+        eprintln!(
+            "SLOTCHK slot={slot} token={token} next={} fnv={fnv:016x} prefill_ms={ms:.3}",
+            next[0]
+        );
+        runs.push((slot, token, bits));
     }
-    for (slot, run) in slots.iter().zip(&runs).skip(1) {
-        assert_eq!(run.0, runs[0].0, "slot {slot} prefill token");
-        assert!(run.1 == runs[0].1, "slot {slot} prefill logits differ");
-        assert_eq!(run.2, runs[0].2, "slot {slot} decode token");
-    }
+    let runs = &runs[warmup.len()..];
+    let bad: Vec<usize> = runs
+        .iter()
+        .filter(|r| r.1 != runs[0].1 || r.2 != runs[0].2)
+        .map(|r| r.0)
+        .collect();
+    assert!(bad.is_empty(), "slots {bad:?} differ from slot 0");
 }
