@@ -48,6 +48,7 @@ nix develop --command env \
   PLOW_W8A8=1 \
   ./target/release/plowc \
   --hf-dir $CKPT \
+  --served-name qwen3.8-27b-fp8 \
   --out $ASSETS
 ```
 <!-- /plow:recipe:emit -->
