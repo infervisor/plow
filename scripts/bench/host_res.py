@@ -222,8 +222,9 @@ def cells(a):
                 (res / f"{f[1]}.host.json").write_text(json.dumps(s, indent=1) + "\n")
 
 
-def du(path):
-    """Bytes of regular files under path, symlinks not followed (a packet links its checkpoint)."""
+def du(path, follow=False):
+    """Bytes of regular files under path; symlinks are skipped (a packet links its checkpoint) unless
+    follow (an HF snapshot is all links into its blobs)."""
     p = Path(path)
     if p.is_file():
         return p.stat().st_size
@@ -231,11 +232,11 @@ def du(path):
     for root, _, files in os.walk(p):
         for f in files:
             try:
-                st = os.lstat(os.path.join(root, f))
+                f = os.path.join(root, f)
+                if follow or not os.path.islink(f):
+                    total += os.stat(f).st_size
             except OSError:
                 continue
-            if not os.path.islink(os.path.join(root, f)):
-                total += st.st_size
     return total
 
 
@@ -252,7 +253,7 @@ def footprint(a):
     res = Path(a.resdir)
     out = {"side": a.side}
     if a.hf:
-        out["checkpoint_bytes"] = du(Path(a.hf).resolve())
+        out["checkpoint_bytes"] = du(Path(a.hf).resolve(), follow=True)
     if a.side == "plow":
         binary = Path(a.plowrt or res / "plowrt")
         out["plowrt_bytes"] = binary.stat().st_size if binary.is_file() else None
