@@ -34,6 +34,8 @@ doc = "docs/runtime/tts.md"
 vendor = "nvidia"
 isa = "sm_90a"
 sku = "H100 SXM5"
+# CUDA 12.9 nvcc (g++-14 host), as the gemma-4-26b-a4b H100 recipes record.
+toolchain = "cuda-12.9"
 units = 132
 num_gpus = 1
 parallel = "tp"

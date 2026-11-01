@@ -816,11 +816,24 @@ fn objset_rejects_structural_damage() {
     o.objects.clear();
     assert!(o.validate().is_err());
 
-    for name in ["", "../x.elf", "/x.elf", "d/x.elf"] {
+    for name in [
+        "",
+        "../x.elf",
+        "/x.elf",
+        "d/x.elf",
+        "objects/",
+        "objects/../x.elf",
+        "objects/d/x.elf",
+        "objects//x.elf",
+    ] {
         let mut o = base.clone();
         o.objects[0].name = name.into();
         assert!(o.validate().is_err(), "accepted {name}");
     }
+    // NVIDIA's segment objects sit one level down, where serving reads them.
+    let mut o = base.clone();
+    o.objects[0].name = format!("{SEGMENT_OBJECTS_DIR}/interp_sm90a_pfseg.cubin");
+    assert!(o.validate().is_ok());
 
     let mut o = base.clone();
     let dup = o.objects[0].clone();
@@ -1100,4 +1113,10 @@ fn on_a_larger_chip_the_nearest_build_wins() {
     )
     .unwrap();
     assert_eq!(pick.label, "metal3-apple-m4-pro-tp1-2k");
+}
+
+#[test]
+fn objects_land_where_each_vendor_serves_them() {
+    assert_eq!(objset_root("nvidia"), "");
+    assert_eq!(objset_root("amd"), "hsaco");
 }

@@ -1335,3 +1335,213 @@ fn a_sidecar_packet_and_its_receipts_are_bundled_by_suffix() {
     assert_eq!(super::classify("lean-checks.json"), Some("packet_checks"));
     assert_eq!(super::classify("notes.txt"), None);
 }
+
+// --- NVIDIA: the served tree ---------------------------------------------------
+
+/// A FA4-style library object and its declaring packet: a v6 blob whose `segment_roles` names
+/// `plow_fa4_hd512.aot` (pinned by digest) and a generated cubin, the way an emit declares them.
+pub(crate) const AOT: &[u8] = b"PLOWAOT1-fa4-hd512";
+
+pub(crate) fn declaring_packet(aot_sha: &str) -> Vec<u8> {
+    let roles = serde_json::json!({
+        "version": 1,
+        "objects": {
+            "26": {"abi": "lib_flash_prefill_v2:fa4:hd=512", "file": "plow_fa4_hd512.aot",
+                   "sha256": aot_sha},
+            "40": {"abi": "gen", "file": "gen_sm90a_attn_pf_hd256_sliding.cubin"}
+        },
+        "programs": []
+    });
+    let sections = vec![packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: plow_asset::segment_roles::SECTION.into(),
+        data: serde_json::to_vec(&roles).unwrap(),
+    }];
+    packet::devbuild::Model {
+        n_cu: 132,
+        target: 0,
+        tensors: Vec::new(),
+        progs: Vec::new(),
+        kv_row_insts: Vec::new(),
+        prog_t: Vec::new(),
+        gen: Vec::new(),
+    }
+    .to_blob_v6(&sections)
+}
+
+/// An NVIDIA asset directory as a campaign build leaves it: the interpreter, generated and
+/// sampler cubins and the library object beside the packet, the segment objects under
+/// `objects/` — one of them under a name the top level also has, with other bytes.
+pub(crate) fn served_tree(dir: &Path) {
+    std::fs::create_dir_all(dir.join("objects")).unwrap();
+    let pkt = declaring_packet(&sha256_bytes(AOT));
+    for (file, body) in [
+        ("model.pkt", pkt.as_slice()),
+        ("plow_config.h", b"#define X 1".as_slice()),
+        ("weights.json", br#"{"network":"veena"}"#.as_slice()),
+        (
+            "build.json",
+            br#"{"pairing":{"hash":"0x541009da5f9890c1"},"features":{}}"#.as_slice(),
+        ),
+        ("interp_sm90a.cubin", b"ELF-decode"),
+        ("interp_sm90a_pfseg.cubin", b"ELF-role-emit-pfseg"),
+        ("gen_sm90a_attn_pf_hd256_sliding.cubin", b"ELF-gen"),
+        ("sample_sm120.cubin", b"ELF-sampler"),
+        ("plow_fa4_hd512.aot", AOT),
+        ("objects/interp_sm90a_pfseg.cubin", b"ELF-segment-pfseg"),
+        ("objects/attn_softmax_sm90a.cubin", b"ELF-softmax"),
+        ("objects/plow_fa4_hd512.aot", AOT),
+    ] {
+        std::fs::write(dir.join(file), body).unwrap();
+    }
+}
+
+fn names(o: &ObjSet) -> Vec<&str> {
+    o.objects.iter().map(|o| o.name.as_str()).collect()
+}
+
+#[test]
+fn nvidia_ships_the_tree_serving_reads() {
+    let assets = tmp("served");
+    served_tree(&assets);
+    let p = write_recipe(&tmp("served-recipe"), MINIMAL);
+    let g = generate(
+        &p,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
+    let (objset, _) = g.objset.as_ref().unwrap();
+    objset.validate().unwrap();
+    assert_eq!(
+        names(objset),
+        [
+            "gen_sm90a_attn_pf_hd256_sliding.cubin",
+            "interp_sm90a.cubin",
+            "interp_sm90a_pfseg.cubin",
+            "sample_sm120.cubin",
+            "plow_fa4_hd512.aot",
+            "objects/attn_softmax_sm90a.cubin",
+            "objects/interp_sm90a_pfseg.cubin",
+            "objects/plow_fa4_hd512.aot",
+        ]
+    );
+    // The two `interp_sm90a_pfseg.cubin` are two builds; each ships with its own bytes.
+    let digest = |n: &str| {
+        objset
+            .objects
+            .iter()
+            .find(|o| o.name == n)
+            .unwrap()
+            .sha256
+            .clone()
+    };
+    assert_eq!(
+        digest("interp_sm90a_pfseg.cubin"),
+        sha256_bytes(b"ELF-role-emit-pfseg")
+    );
+    assert_eq!(
+        digest("objects/interp_sm90a_pfseg.cubin"),
+        sha256_bytes(b"ELF-segment-pfseg")
+    );
+    assert_eq!(g.objects_root.as_deref(), Some(assets.as_path()));
+    // The library object is an object, not an unclaimed bundle file.
+    assert!(!g.bundle.files.iter().any(|f| f.name.ends_with(".aot")));
+}
+
+#[test]
+fn a_tree_without_library_or_segment_objects_keeps_its_objset_id() {
+    let assets = speech_assets("served-plain");
+    std::fs::write(assets.join("interp_sm90a.cubin"), b"ELF-cubin").unwrap();
+    assert_eq!(
+        served_objects(&assets).unwrap(),
+        discover_objects(&assets, &Refuse).unwrap()
+    );
+}
+
+#[test]
+fn an_object_the_packet_loads_by_name_must_ship_with_its_declared_bytes() {
+    let p = write_recipe(&tmp("declared-recipe"), MINIMAL);
+    let gen = |assets: &Path| {
+        generate(
+            &p,
+            assets,
+            None,
+            Overrides::default(),
+            &BundleArgs::default(),
+        )
+        .unwrap_err()
+        .to_string()
+    };
+
+    let missing = tmp("declared-missing");
+    served_tree(&missing);
+    std::fs::remove_file(missing.join("plow_fa4_hd512.aot")).unwrap();
+    let e = gen(&missing);
+    assert!(
+        e.contains("plow_fa4_hd512.aot is not in the asset directory"),
+        "{e}"
+    );
+
+    let other = tmp("declared-other");
+    served_tree(&other);
+    std::fs::write(other.join("plow_fa4_hd512.aot"), b"PLOWAOT1-rebuilt").unwrap();
+    let e = gen(&other);
+    assert!(e.contains("plow_fa4_hd512.aot hashes to"), "{e}");
+
+    let gen_gone = tmp("declared-gen");
+    served_tree(&gen_gone);
+    std::fs::remove_file(gen_gone.join("gen_sm90a_attn_pf_hd256_sliding.cubin")).unwrap();
+    let e = gen(&gen_gone);
+    assert!(
+        e.contains("gen_sm90a_attn_pf_hd256_sliding.cubin is not in"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_named_object_directory_must_be_the_segment_set_serving_reads() {
+    let assets = tmp("named");
+    served_tree(&assets);
+    let p = write_recipe(&tmp("named-recipe"), MINIMAL);
+    let gen = |named: &Path| {
+        generate(
+            &p,
+            &assets,
+            Some(named),
+            Overrides::default(),
+            &BundleArgs::default(),
+        )
+    };
+    let base = gen(&assets).unwrap().objset.unwrap().0;
+    // The asset directory itself, its `objects/`, or a byte-identical copy of it: one objset.
+    assert_eq!(
+        gen(&assets.join("objects")).unwrap().objset.unwrap().0,
+        base
+    );
+    let copy = tmp("named-copy");
+    for f in [
+        "interp_sm90a_pfseg.cubin",
+        "attn_softmax_sm90a.cubin",
+        "plow_fa4_hd512.aot",
+    ] {
+        std::fs::copy(assets.join("objects").join(f), copy.join(f)).unwrap();
+    }
+    std::fs::write(copy.join("build.log"), b"not an object").unwrap();
+    assert_eq!(gen(&copy).unwrap().objset.unwrap().0.objects, base.objects);
+
+    std::fs::write(copy.join("interp_sm90a_pfseg.cubin"), b"ELF-another-build").unwrap();
+    let e = gen(&copy).unwrap_err().to_string();
+    assert!(e.contains("interp_sm90a_pfseg.cubin differs from"), "{e}");
+
+    let short = tmp("named-short");
+    std::fs::copy(
+        assets.join("objects/attn_softmax_sm90a.cubin"),
+        short.join("attn_softmax_sm90a.cubin"),
+    )
+    .unwrap();
+    let e = gen(&short).unwrap_err().to_string();
+    assert!(e.contains("interp_sm90a_pfseg.cubin is served from"), "{e}");
+}

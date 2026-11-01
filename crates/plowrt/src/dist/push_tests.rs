@@ -216,10 +216,87 @@ fn a_push_writes_the_registry_a_pull_reads() {
     let (dir, t) = pull::pull(&store, &*fetch, &resolved).unwrap();
     assert_eq!(t.fetched_blobs, 5);
     assert_eq!(std::fs::read(dir.join("model.pkt")).unwrap(), b"PLOWDEV");
+    // NVIDIA serving reads its objects from the bundle directory itself.
     assert_eq!(
-        std::fs::read(dir.join("hsaco/interp_sm90a.cubin")).unwrap(),
+        std::fs::read(dir.join("interp_sm90a.cubin")).unwrap(),
         b"ELF-cubin-v1"
     );
+    assert!(!dir.join("hsaco").exists());
+}
+
+/// Every regular file under `dir`, relative, with its bytes.
+fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// pack -> push -> pull of an NVIDIA build: the pulled bundle is the asset directory serving
+/// was qualified on — library objects beside the packet, both builds of a name the top level
+/// and `objects/` share, each where serving reads it — and the packet's inventory of it is
+/// the inventory of the asset directory.
+#[test]
+fn a_pulled_nvidia_bundle_is_the_tree_it_was_built_and_served_from() {
+    let f = Fixture::new("served-tree");
+    std::fs::remove_dir_all(&f.assets).unwrap();
+    std::fs::create_dir_all(&f.assets).unwrap();
+    crate::dist::manifest::tests::served_tree(&f.assets);
+    let g = f.generated();
+    let src = Sources {
+        assets: &f.assets,
+        objects: g.objects_root.as_deref().unwrap(),
+        checkpoint: None,
+    };
+    push(
+        &f.sink(),
+        g.bundle,
+        g.objset,
+        &src,
+        None,
+        &Trust::none(),
+        &Options::default(),
+    )
+    .unwrap();
+
+    let resolved = f.resolve(&Trust::none()).unwrap();
+    let store = Store::open(&f.store_root).unwrap();
+    let fetch = transport(&format!("file://{}", f.registry.display())).unwrap();
+    let (dir, _) = pull::pull(&store, &*fetch, &resolved).unwrap();
+
+    let mut built = tree(&f.assets);
+    let mut pulled = tree(&dir);
+    // The manifests and the store's record are the pull's own; nothing else differs.
+    for name in ["bundle.json", ".plow-blobs"] {
+        pulled.remove(name);
+    }
+    assert_eq!(pulled, std::mem::take(&mut built));
+
+    let inv = |d: &std::path::Path| {
+        let buf = std::fs::read(d.join("model.pkt")).unwrap();
+        let blob = crate::asset::devblob::DevBlob::parse_l2(&buf, true).unwrap();
+        crate::inventory::text(&crate::inventory::inventory(&blob, &buf, Some(d)).unwrap())
+    };
+    let pulled_inv = inv(&dir);
+    assert_eq!(pulled_inv, inv(&f.assets));
+    for on in ["generated_kernels", "device_sampler"] {
+        let line = pulled_inv.lines().find(|l| l.starts_with(on)).unwrap();
+        assert!(line.split_whitespace().nth(1) == Some("on"), "{line}");
+    }
 }
 
 #[test]

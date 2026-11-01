@@ -68,6 +68,21 @@ pub fn runtime_compiled(vendor: &str) -> bool {
     vendor == "apple"
 }
 
+/// The subdirectory of an NVIDIA asset directory that serving resolves its segment objects from
+/// (`plowrt::asset::serve::objects_dir`): an objset object there is named `objects/<file>`.
+pub const SEGMENT_OBJECTS_DIR: &str = "objects";
+
+/// Where a pulled bundle puts its objset objects, relative to the bundle directory. NVIDIA
+/// serving reads them from the asset directory itself, exactly as the build left them; AMD reads
+/// `hsaco/`.
+pub fn objset_root(vendor: &str) -> &'static str {
+    if vendor == "nvidia" {
+        ""
+    } else {
+        "hsaco"
+    }
+}
+
 /// How work is spread across GPUs. An object, not a string, so a composite
 /// (`tp4pp2`) is expressible the day `plowc` stops refusing `--parallel pp`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -641,6 +656,17 @@ fn is_plain_name(s: &str) -> bool {
     matches!(c.next(), Some(std::path::Component::Normal(_))) && c.next().is_none()
 }
 
+/// An objset object name: one plain component, or one under [`SEGMENT_OBJECTS_DIR`].
+fn is_object_name(s: &str) -> bool {
+    // `Path` drops a trailing separator, so `x/` would pass as a plain name and land as a
+    // directory.
+    !s.ends_with('/')
+        && (is_plain_name(s)
+            || s.strip_prefix(SEGMENT_OBJECTS_DIR)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(is_plain_name))
+}
+
 /// A path that stays under the directory it is joined to: relative, `/`
 /// separated, no empty, `.` or `..` segment, no Windows separator. A
 /// checkpoint file nests (`onnx/model.onnx`); a bundle file may not.
@@ -724,7 +750,7 @@ impl ObjSet {
         }
         let mut seen = std::collections::BTreeSet::new();
         for o in &self.objects {
-            if !is_plain_name(&o.name) || !is_sha256(&o.sha256) || o.bytes == 0 {
+            if !is_object_name(&o.name) || !is_sha256(&o.sha256) || o.bytes == 0 {
                 return Err(format!("objset: bad object entry {}", o.name));
             }
             if !seen.insert(o.name.as_str()) {
