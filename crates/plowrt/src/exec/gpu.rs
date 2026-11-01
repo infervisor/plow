@@ -2736,6 +2736,9 @@ pub struct GpuEngine {
     /// Every decode row reduces in the same order at every launch width
     /// (`PLOW_DECODE_BATCH_INVARIANT`): a verify launch reproduces the plain steps it replaces.
     batch_invariant: bool,
+    /// With `batch_invariant`: the widest rung whose launches are bit-equal per row to the
+    /// narrowest (`usize::MAX`: every launch runs one program).
+    invariant_rows: usize,
     ctr_bytes: usize,
     /// Bytes of GQ cursor lines at the counter slab's tail — one PLOW_CTR line
     /// per gq segment (P lines for an L2-placed blob, 1 otherwise).
@@ -5940,7 +5943,6 @@ impl GpuEngine {
         // Batch-invariant decode: an explicit request fails the load when the packet cannot
         // honour it; one implied by PLOW_SPEC leaves the engine plain (spec then stays off).
         let invariant_explicit = config.decode_batch_invariant_explicit();
-        let mut unpinned_widest: Option<Vec<DevInst64>> = None;
         let invariant_refused = |why: String| -> Result<()> {
             if invariant_explicit {
                 return Err(RuntimeError::Rejected(format!(
@@ -5963,22 +5965,7 @@ impl GpuEngine {
             )?;
             None
         } else {
-            let reference = blob.decode_progs()[0].insts.clone();
-            let mut pinned = insts.clone();
-            unpinned_widest = Some(insts.clone());
-            match crate::exec::kvrow::pin_decode_splits(&reference, &mut pinned, |h| {
-                blob.tensors[usize::from(h)].bytes
-            }) {
-                Ok(changed) => {
-                    insts = pinned;
-                    tracing::info!(changed, "batch-invariant decode: widest program pinned");
-                    Some(reference)
-                }
-                Err(e) => {
-                    invariant_refused(e)?;
-                    None
-                }
-            }
+            Some(blob.decode_progs()[0].insts.clone())
         };
         let d_inst = upload_pod(pod_bytes(&insts))?;
         let d_stream = upload_pod(pod_bytes(&g.stream))?;
@@ -6511,32 +6498,35 @@ impl GpuEngine {
             Vec::new()
         };
         let mut invariant_baked_rungs: Vec<Vec<DevInst64>> = Vec::new();
+        // The rows up to which every launch is bit-equal per row; spec verify stays within it.
+        let mut invariant_rows = usize::MAX;
         let invariant_splits = match invariant_splits {
             Some(reference) if !reference.is_empty() => {
+                // Pin the narrow interpreter rungs, narrowest up. Library and sibling-object
+                // rungs, and rungs whose pinned splits overflow the partial buffers, keep their
+                // baked counts: they are never bit-equal to the narrow rungs.
                 let bytes = |h: u16| blob.tensors[usize::from(h)].bytes;
-                match decode_rungs
-                    .iter()
-                    .map(|r| r.pinned_splits(&reference, bytes))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                {
-                    Ok(all) => {
-                        let mut baked = Vec::with_capacity(all.len());
-                        for (rung, pinned) in decode_rungs.iter_mut().zip(all) {
-                            baked.push(rung.set_insts(&be, pinned)?);
-                        }
-                        invariant_baked_rungs = baked;
-                        Some(reference)
+                invariant_rows = 1;
+                for rung in decode_rungs.iter_mut() {
+                    if rung.library.is_some() || rung.object.is_some() {
+                        break;
                     }
-                    Err(e) => {
-                        invariant_refused(e)?;
-                        // The widest program was pinned already: restore its baked splits.
-                        if let Some(baked) = unpinned_widest.take() {
-                            be.upload(&d_inst, 0, pod_bytes(&baked))?;
-                            insts = baked;
+                    match rung.pinned_splits(&reference, bytes) {
+                        Ok(pinned) => {
+                            invariant_baked_rungs.push(rung.set_insts(&be, pinned)?);
+                            invariant_rows = rung.rows;
                         }
-                        None
+                        Err(e) => {
+                            tracing::info!(reason = %e, "batch-invariant decode: wider rungs keep their splits");
+                            break;
+                        }
                     }
                 }
+                tracing::info!(
+                    rows = invariant_rows,
+                    "batch-invariant decode: rungs pinned"
+                );
+                Some(reference)
             }
             other => other,
         };
@@ -7753,6 +7743,7 @@ impl GpuEngine {
             kvrow_hi: hi,
             nv_nsplit,
             batch_invariant: false,
+            invariant_rows: usize::MAX,
             ctr_bytes,
             cursor_bytes,
             devp,
@@ -7870,15 +7861,14 @@ impl GpuEngine {
         engine.spec_upload_identity()?;
         if invariant_splits.is_some() {
             match engine.arm_batch_invariant(&blob) {
-                Ok(()) => engine.batch_invariant = true,
+                Ok(()) => {
+                    engine.batch_invariant = true;
+                    engine.invariant_rows = invariant_rows;
+                }
                 Err(e) if invariant_explicit => return Err(e),
                 Err(e) => {
                     tracing::warn!(error = %e, "batch-invariant decode unavailable");
                     // Serve plain decode with the baked split counts, not a half-pinned engine.
-                    if let Some(widest) = unpinned_widest.take() {
-                        engine.be.upload(&engine.d_inst, 0, pod_bytes(&widest))?;
-                        engine.h_inst = widest;
-                    }
                     for (rung, baked) in engine.decode_rungs.iter_mut().zip(invariant_baked_rungs) {
                         rung.set_insts(&engine.be, baked)?;
                     }
@@ -9508,9 +9498,14 @@ impl GpuEngine {
     /// The widest verify launch a speculative tick may use: the interpreter-only rungs. Library
     /// routes (graph captures, light segments) and sibling objects run on the identity map only.
     pub fn spec_max_rows(&self) -> usize {
+        let invariant = if self.batch_invariant {
+            self.invariant_rows
+        } else {
+            usize::MAX
+        };
         self.decode_rungs
             .iter()
-            .take_while(|r| r.library.is_none() && r.object.is_none())
+            .take_while(|r| r.library.is_none() && r.object.is_none() && r.rows <= invariant)
             .map(|r| r.rows)
             .last()
             .unwrap_or(0)
