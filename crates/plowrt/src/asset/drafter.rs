@@ -42,6 +42,7 @@ fn handles(inst: &DevInst64) -> impl Iterator<Item = u32> + '_ {
             IntHandle::Optional(s) => (inst.i[s] != TENSOR_NONE_I).then_some(inst.i[s]),
             IntHandle::ZeroNone(s) => (inst.i[s] != 0).then_some(inst.i[s]),
             IntHandle::Fj2 => Some(inst.fj[2]),
+            IntHandle::Fj2ZeroNone => (inst.fj[2] != 0).then_some(inst.fj[2]),
         });
     inst.t
         .iter()
@@ -71,6 +72,12 @@ fn remap(inst: &mut DevInst64, map: &BTreeMap<u32, u32>) -> Result<()> {
                 }
             }
             IntHandle::Fj2 => inst.fj[2] = to(inst.fj[2])?,
+            IntHandle::Fj2ZeroNone if inst.fj[2] != 0 => {
+                inst.fj[2] = to(inst.fj[2])?;
+                if inst.fj[2] == 0 {
+                    return Err(reject("a row-slot map remapped to handle 0"));
+                }
+            }
             _ => {}
         }
     }
@@ -101,13 +108,53 @@ fn shard_index(checkpoint: &Path) -> Result<BTreeMap<String, PathBuf>> {
     Ok(out)
 }
 
-/// A tensor no launch reads before writing it: not a cache, weight, init or generated table.
-pub fn transient(blob: &DevBlob, h: usize) -> bool {
+/// A target activation (`act.*`, no init, no generated table, not a weight): every launch
+/// rewrites it before reading, so a draft may use it as stream-ordered scratch. Caches,
+/// recurrent state, pointer tables and inputs never qualify.
+pub fn activation(blob: &DevBlob, h: usize) -> bool {
     let d = &blob.tensors[h];
-    !d.name.starts_with("kv.")
+    d.name.starts_with("act.")
         && d.init.is_none()
         && !blob.gen.iter().any(|g| g.tensor as usize == h)
         && !packet::names::is_checkpoint_weight(&d.name)
+}
+
+/// A drafter's pinned weight shards, memory-mapped; every tensor name bound once.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", feature = "hub"))]
+pub struct Shards {
+    maps: Vec<memmap2::Mmap>,
+    index: BTreeMap<String, (usize, std::ops::Range<usize>)>,
+}
+
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", feature = "hub"))]
+impl Shards {
+    pub fn open(dir: &Path, files: &[String]) -> std::result::Result<Self, String> {
+        let (mut maps, mut index) = (Vec::new(), BTreeMap::new());
+        for (k, name) in files.iter().enumerate() {
+            let path = dir.join(name);
+            let file =
+                std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            // SAFETY: read-only mapping of a pinned shard, held as long as the drafter.
+            let map = unsafe { memmap2::Mmap::map(&file) }
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let (hlen, meta) = safetensors::SafeTensors::read_metadata(&map)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            for (tensor, info) in meta.tensors() {
+                let (a, b) = info.data_offsets;
+                let range = 8 + hlen + a..8 + hlen + b;
+                if index.insert(tensor.clone(), (k, range)).is_some() {
+                    return Err(format!("tensor {tensor} is in more than one shard"));
+                }
+            }
+            maps.push(map);
+        }
+        Ok(Self { maps, index })
+    }
+
+    pub fn tensor(&self, name: &str) -> Option<&[u8]> {
+        let (k, r) = self.index.get(name)?;
+        self.maps[*k].get(r.clone())
+    }
 }
 
 pub struct Extracted {
@@ -139,6 +186,20 @@ pub fn extract(assets: &Path, checkpoint: &Path, out: &Path) -> Result<Extracted
         .ok_or_else(|| reject("draft programs section missing"))?;
     let n = blob.tensors.len();
     let mut section = aux_program::parse(bytes, blob.n_cu, n).map_err(reject)?;
+    for inst in section.programs.iter().flat_map(|p| &p.insts) {
+        let op = DevOp::from_u16(inst.op).ok_or_else(|| reject("unknown opcode"))?;
+        if sd::vetted_writes(op, inst).is_none() {
+            return Err(reject(format!(
+                "opcode {op:?} is not allowed in an external drafter"
+            )));
+        }
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(out) == canon(checkpoint) || canon(out) == canon(assets) {
+        return Err(reject(
+            "--out must be a directory of its own, not the packet or checkpoint",
+        ));
+    }
 
     // Tensors any target program uses: the program table and every other aux-program section.
     let mut target: BTreeSet<u32> = blob
@@ -163,7 +224,11 @@ pub fn extract(assets: &Path, checkpoint: &Path, out: &Path) -> Result<Extracted
     }
 
     let t = &draft.tensors;
-    let mut used: Vec<u32> = vec![u32::from(t.tokens[0])];
+    let first = *t
+        .tokens
+        .first()
+        .ok_or_else(|| reject("spec.json has no token tensors"))?;
+    let mut used: Vec<u32> = vec![u32::from(first)];
     let named = t.tokens[1..]
         .iter()
         .chain([&t.position, &t.kv_len, &t.slot])
@@ -189,15 +254,30 @@ pub fn extract(assets: &Path, checkpoint: &Path, out: &Path) -> Result<Extracted
     let shards = shard_index(checkpoint)?;
     let gen: BTreeMap<u32, &packet::rope::GenTensor> =
         blob.gen.iter().map(|g| (g.tensor, g)).collect();
+    // Shards holding a weight the target binds stay the target's: a draft weight found there is
+    // an import, never a reason to link the target's shard into the drafter.
+    let target_shards: BTreeSet<&PathBuf> = blob
+        .tensors
+        .iter()
+        .enumerate()
+        .filter(|(h, d)| {
+            target.contains(&(*h as u32)) && packet::names::is_checkpoint_weight(&d.name)
+        })
+        .filter_map(|(_, d)| shards.get(&d.name))
+        .collect();
     let (mut tensors, mut init, mut linked) = (Vec::new(), Vec::new(), BTreeSet::new());
     let (mut imports, mut weights, mut scratch) = (0, 0, 0);
     for &h in &used {
         let d = &blob.tensors[h as usize];
-        let source = if target.contains(&h) || d.name.starts_with("kv.") {
+        let in_target_shard = packet::names::is_checkpoint_weight(&d.name)
+            && shards
+                .get(&d.name)
+                .is_some_and(|f| target_shards.contains(f));
+        let source = if target.contains(&h) || d.name.starts_with("kv.") || in_target_shard {
             imports += 1;
             // Target activations are rewritten by every launch; the draft may use them as
             // scratch (stream-ordered). Caches, weights and tables stay read-only.
-            let access = if transient(&blob, h as usize) {
+            let access = if activation(&blob, h as usize) {
                 Access::ReadWrite
             } else {
                 Access::Read
@@ -262,8 +342,11 @@ pub fn extract(assets: &Path, checkpoint: &Path, out: &Path) -> Result<Extracted
     for src in &linked {
         let name = src.file_name().expect("shard file").to_owned();
         let dst = out.join(&name);
-        let _ = std::fs::remove_file(&dst);
         let real = std::fs::canonicalize(src).map_err(io(src))?;
+        if canon(&dst) == real {
+            return Err(reject(format!("{} is its own source shard", dst.display())));
+        }
+        let _ = std::fs::remove_file(&dst);
         if std::fs::hard_link(&real, &dst).is_err() {
             std::fs::copy(&real, &dst).map_err(io(&dst))?;
         }

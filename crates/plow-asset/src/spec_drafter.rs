@@ -15,6 +15,7 @@
 //! `target_packet_sha256`.
 use std::collections::BTreeMap;
 
+use packet::dev::{DevInst64, DevOp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -125,6 +126,29 @@ pub struct Manifest {
     pub draft: spec_draft::Manifest,
     /// The drafter's weight shards, pinned like a packet's checkpoint.
     pub weights: Vec<WeightPin>,
+}
+
+/// The opcodes an external drafter's programs may use, with the `t` slots each one writes
+/// (`None`: not allowed). The runtime refuses a program that writes a read-only import, so
+/// every allowed opcode's writes must be listed here exactly; an opcode joins only after its
+/// interpreter body was audited (integer-field handles included, see
+/// [`crate::aux_program::integer_tensor_handles`]).
+pub fn vetted_writes(op: DevOp, inst: &DevInst64) -> Option<&'static [usize]> {
+    Some(match op {
+        DevOp::Embed
+        | DevOp::RowGather
+        | DevOp::HeadNormRope
+        | DevOp::Residual
+        | DevOp::FlashMerge
+        | DevOp::Argmax
+        | DevOp::ArgmaxFin => &[0],
+        DevOp::RmsNorm => &[0, 3, 4],
+        // Folded prologues (`i[3] != 0`) write their staging operands too: not vetted.
+        DevOp::Gemv | DevOp::GemvGlu if inst.i[3] == 0 => &[0],
+        DevOp::FlashDecodeFp8 => &[0, 1],
+        DevOp::NormResidualNorm => &[0, 1],
+        _ => return None,
+    })
 }
 
 /// What a target proves about itself. Built by the runtime from the loaded packet.
@@ -286,19 +310,33 @@ impl Manifest {
 
     /// Check the drafter against what the target proves. The error names the first mismatch.
     pub fn check(&self, t: &TargetView) -> Result<(), String> {
+        if self.kind != Kind::ChainSharedKv {
+            return Err(format!(
+                "kind {:?}: this runtime attaches only chain_shared_kv drafters externally",
+                self.kind
+            ));
+        }
         let r = &self.requires;
         let fail = |field: &str, want: &dyn std::fmt::Debug, have: &dyn std::fmt::Debug| {
             Err(format!(
                 "drafter requires {field} = {want:?}, the target has {have:?}"
             ))
         };
-        let identity = t.model.is_some();
-        if !identity && r.target_packet_sha256.is_none() {
-            return Err(
-                "the target packet has no spec.target.json, so the drafter must pin \
-                 requires.target_packet_sha256"
-                    .into(),
-            );
+        if r.target_packet_sha256.is_none() {
+            if t.model.is_none() {
+                return Err(
+                    "the target packet has no spec.target.json, so the drafter must pin \
+                     requires.target_packet_sha256"
+                        .into(),
+                );
+            }
+            if r.model.is_none() || r.revision.is_none() || r.checkpoint_sha256.is_none() {
+                return Err(
+                    "a drafter without requires.target_packet_sha256 must pin model, revision \
+                     and checkpoint_sha256"
+                        .into(),
+                );
+            }
         }
         if let Some(want) = &r.target_packet_sha256 {
             if *want != t.packet_sha256 {

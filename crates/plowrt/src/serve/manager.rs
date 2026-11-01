@@ -194,17 +194,26 @@ impl BlobPlan {
     }
 
     /// An attached external drafter's own device tensors (its imports alias the target's).
+    /// They are separate allocations, never carved from the weight slab, so they count like a
+    /// sidecar: in the footprint, not in [`Self::slab_reusable`].
     fn add_drafter(&mut self, dir: &Path) -> Result<()> {
         use plow_asset::spec_drafter::{Manifest, Source, FILE};
         let path = dir.join(FILE);
         let bytes = std::fs::read(&path).map_err(|source| RuntimeError::Io { path, source })?;
         let m = Manifest::parse(&bytes)
             .map_err(|e| RuntimeError::Rejected(format!("drafter {}: {e}", dir.display())))?;
+        // The runtime's per-drafter buffers: the pointer table and the hidden snapshots (one row
+        // per slot, bounded by the hidden tensor's row capacity).
+        self.sidecar_bytes += 8 * m.tensors.len() as u64;
+        if let Some(h) = m.draft.tensors.hidden {
+            self.sidecar_bytes += m.tensors.get(usize::from(h)).map_or(0, |t| t.bytes);
+        }
         for t in &m.tensors {
             match t.source {
                 Source::Import { .. } => {}
-                Source::Weight => self.weights_bytes += t.bytes,
-                Source::Init { .. } | Source::Scratch => self.other_bytes += t.bytes,
+                Source::Weight | Source::Init { .. } | Source::Scratch => {
+                    self.sidecar_bytes += t.bytes
+                }
             }
         }
         Ok(())
@@ -718,8 +727,16 @@ impl ManagerDevice for CudaManagerDevice {
                     tracing::warn!(error = %e, "PLOW_SPEC set but speculative decoding unavailable")
                 }
             }
-        } else if let Some(d) = drafter {
-            tracing::warn!(drafter = %d.display(), "drafter attached but PLOW_SPEC is off for this model");
+        } else if let Some((d, explicit)) = crate::asset::serve::drafter_source(dir) {
+            if explicit {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: drafter {} attached but speculative decoding is off for this model \
+                     (PLOW_SPEC)",
+                    dir.display(),
+                    d.display()
+                )));
+            }
+            tracing::info!(drafter = %d.display(), "bundled drafter unused: PLOW_SPEC is off");
         }
         Ok(crate::serve::engine::ServeEngine::Cuda(engine))
     }
@@ -2320,9 +2337,17 @@ mod tests {
             min_kv_bytes: 0,
         };
         p.add_drafter(&dir).unwrap();
-        assert_eq!(p.weights_bytes, 1000);
-        assert_eq!(p.other_bytes, 6 * 64 + 16, "imports alias target memory");
-        assert_eq!(p.kv_bytes, 0);
+        assert_eq!(
+            p.sidecar_bytes,
+            1000 + 6 * 64 + 16 + 10 * 8 + (1 << 20),
+            "own tensors, the pointer table and the hidden snapshots; imports alias the target"
+        );
+        assert_eq!(p.tensor_total(), p.sidecar_bytes);
+        assert_eq!(
+            p.slab_reusable(),
+            0,
+            "drafter allocations never ride the slab"
+        );
         std::fs::write(dir.join(plow_asset::spec_drafter::FILE), b"{}").unwrap();
         assert!(
             p.add_drafter(&dir).is_err(),

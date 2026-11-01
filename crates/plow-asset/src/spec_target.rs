@@ -44,7 +44,10 @@ impl TargetSpec {
             return Err(format!("{SECTION}: empty model or revision"));
         }
         if s.checkpoint_sha256.len() != 64
-            || !s.checkpoint_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            || !s
+                .checkpoint_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         {
             return Err(format!("{SECTION}: checkpoint_sha256 is not a sha256"));
         }

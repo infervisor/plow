@@ -337,6 +337,8 @@ pub enum IntHandle {
     ZeroNone(usize),
     /// `fj[2]`, always a handle.
     Fj2,
+    /// `fj[2]`, `0` when absent.
+    Fj2ZeroNone,
 }
 
 /// The integer-field tensor handles of `inst` (one table for validation and remapping).
@@ -348,7 +350,13 @@ pub fn integer_tensor_handles(op: DevOp, inst: &DevInst64) -> Vec<IntHandle> {
         DevOp::GemvGlu if inst.i[3] == 4 => vec![Required(4), Required(7), ZeroNone(6)],
         DevOp::GemvGluFp8 if inst.fj[2] != 0 => [3, 4, 6, 7].map(Required).to_vec(),
         DevOp::FlashMlaDecode if inst.t[7] != TENSOR_NONE16 => vec![Required(6)],
+        // Span-mode row -> KV slot map (`PLOW_FA_FP8_SLOT`).
+        DevOp::FlashDecodeFp8 => vec![Fj2ZeroNone],
         DevOp::GemvQkvg => vec![Required(6)],
+        // Linear-bias arm (`PLOW_PACKET_LINEAR_BIAS`): i[5..8] are the q/k/v biases when all set.
+        DevOp::GemvQkv if inst.i[5] != 0 && inst.i[6] != 0 && inst.i[7] != 0 => {
+            vec![Required(5), Required(6), Required(7)]
+        }
         DevOp::KdaConv3 => [4, 5, 6, 7].map(Required).to_vec(),
         DevOp::KdaStateStepG if inst.i[4] & 4 != 0 => vec![Required(5), Fj2],
         DevOp::KdaStateStepG => vec![Required(5)],
@@ -367,6 +375,7 @@ fn integer_tensor_handles_valid(op: DevOp, inst: &DevInst64, tensor_count: usize
         IntHandle::Optional(s) => inst.i[s] == TENSOR_NONE_I || ok(inst.i[s]),
         IntHandle::ZeroNone(s) => inst.i[s] == 0 || ok(inst.i[s]),
         IntHandle::Fj2 => (inst.fj[2] as usize) < tensor_count,
+        IntHandle::Fj2ZeroNone => inst.fj[2] == 0 || ok(inst.fj[2]),
     })
 }
 

@@ -263,14 +263,19 @@ pub fn set_drafter(asset_dir: &Path, drafter: &Path) -> Result<()> {
 /// The external drafter a bundle speculates with: the explicit attachment, else a bundled
 /// `<assets>/drafter/` holding a `drafter.json`, else none (the packet's own draft programs).
 pub fn drafter_dir(asset_dir: &Path) -> Option<PathBuf> {
+    drafter_source(asset_dir).map(|(dir, _)| dir)
+}
+
+/// [`drafter_dir`] and whether it was attached explicitly (`--assets ...,drafter=`).
+pub fn drafter_source(asset_dir: &Path) -> Option<(PathBuf, bool)> {
     if let Some(dir) = explicit_drafters().read().get(&map_key(asset_dir)) {
-        return Some(dir.clone());
+        return Some((dir.clone(), true));
     }
     let bundled = asset_dir.join("drafter");
     bundled
         .join(plow_asset::spec_drafter::FILE)
         .is_file()
-        .then_some(bundled)
+        .then_some((bundled, false))
 }
 
 type AssetArg = (PathBuf, Option<PathBuf>, Option<String>, Option<PathBuf>);

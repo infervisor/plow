@@ -161,12 +161,19 @@ fn identity_fields_need_a_target_that_proves_them() {
     let mut m = manifest();
     m.requires.target_packet_sha256 = None;
     assert!(refusal(&m, &target()).contains("spec.target.json"));
-    m.requires.model = Some("google/gemma-4-26b-a4b-it".into());
-    m.requires.revision = Some("a".repeat(40));
     let mut t = target();
     t.model = Some("google/gemma-4-26b-a4b-it".into());
+    assert!(
+        refusal(&m, &t).contains("must pin model"),
+        "an unpinned drafter never matches every declared target"
+    );
+    m.requires.model = Some("google/gemma-4-26b-a4b-it".into());
+    m.requires.revision = Some("a".repeat(40));
+    m.requires.checkpoint_sha256 = Some("c".repeat(64));
     assert!(refusal(&m, &t).contains("revision"));
     t.revision = Some("a".repeat(40));
+    assert!(refusal(&m, &t).contains("checkpoint_sha256"));
+    t.checkpoint_sha256 = Some("c".repeat(64));
     m.check(&t).unwrap();
 }
 
@@ -205,4 +212,38 @@ fn vocab_digest_ignores_key_order() {
     let c: Value =
         serde_json::from_str(r#"{"model":{"type":"BPE","vocab":{"a":1,"b":0}}}"#).unwrap();
     assert_ne!(vocab_digest(&a).unwrap(), vocab_digest(&c).unwrap());
+}
+
+#[test]
+fn only_shared_kv_chain_drafters_attach_externally() {
+    let mut m = manifest();
+    m.kind = Kind::ChainOwnKv;
+    assert!(refusal(&m, &target()).contains("chain_shared_kv"));
+}
+
+#[test]
+fn vetted_opcodes_list_their_writes() {
+    let mut i = DevInst64 {
+        op: DevOp::Gemv as u16,
+        blocks: 1,
+        fj: [0; 3],
+        t: [packet::dev::TENSOR_NONE16; 8],
+        i: [0; 8],
+    };
+    assert_eq!(vetted_writes(DevOp::Gemv, &i), Some(&[0usize][..]));
+    i.i[3] = 4;
+    assert_eq!(
+        vetted_writes(DevOp::Gemv, &i),
+        None,
+        "folded prologues are not vetted"
+    );
+    assert_eq!(
+        vetted_writes(DevOp::NormResidualNorm, &i),
+        Some(&[0usize, 1][..])
+    );
+    assert_eq!(
+        vetted_writes(DevOp::HeadNormRopeFp8, &i),
+        None,
+        "cache stores are not vetted"
+    );
 }

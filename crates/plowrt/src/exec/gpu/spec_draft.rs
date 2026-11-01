@@ -83,8 +83,123 @@ struct External {
     digest: String,
 }
 
+/// [`GpuEngine::spec_target_view`]: the view a drafter is checked against, the `(emitted, live)`
+/// cache context, and per packet tensor its live byte size and whether it is an activation.
+pub(super) struct TargetFacts {
+    view: plow_asset::spec_drafter::TargetView,
+    ctx: (u32, u32),
+    live_bytes: Vec<u64>,
+    activation: Vec<bool>,
+}
+
 fn reject(e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Rejected(format!("spec draft: {e}"))
+}
+
+/// The context the engine's caches were laid out for: `PLOW_LIVE_CTX` when it narrowed or
+/// widened them (`GpuEngine::load`), else the emitted bound. The request-length limit
+/// (`PLOW_RT_MAX_CTX`) never resizes a cache, so it is not the draft programs' stride.
+fn kv_ctx(assets: &Path, ceiling: u32) -> u32 {
+    crate::config::RuntimeConfig::get()
+        .live_ctx_for(assets)
+        .unwrap_or(ceiling)
+}
+
+/// `(len, mtime, inode)` of a file: a packet replaced after the engine loaded it differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileStamp(u64, Option<std::time::SystemTime>, u64);
+
+impl FileStamp {
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(Self(m.len(), m.modified().ok(), m.ino()))
+    }
+}
+
+/// The drafter's weight shards: exactly the pinned files (no other `*.safetensors` may sit in
+/// the directory), each tensor name bound once.
+fn pinned_shards(
+    dir: &Path,
+    pins: &[plow_asset::serve_manifest::WeightPin],
+) -> std::result::Result<crate::asset::drafter::Shards, String> {
+    plow_asset::serve_manifest::verify_pins(dir, pins)?;
+    let mut present: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".safetensors"))
+        .collect();
+    present.sort();
+    let mut pinned: Vec<String> = pins.iter().map(|p| p.file.clone()).collect();
+    pinned.sort();
+    if present != pinned {
+        return Err(format!(
+            "shards {present:?} are not exactly the pinned {pinned:?}"
+        ));
+    }
+    crate::asset::drafter::Shards::open(dir, &pinned)
+}
+
+/// Every program instruction uses an audited opcode, writes no read-only import and no
+/// tensor the runtime stages from the host; the host-staged inputs are the drafter's own
+/// scratch, and the hidden it restores rows into is writable.
+fn check_writes(
+    m: &plow_asset::spec_drafter::Manifest,
+    section: &plow_asset::aux_program::Section,
+) -> std::result::Result<(), String> {
+    use plow_asset::spec_drafter::{vetted_writes, Access, Source};
+    let source = |h: u16| &m.tensors[usize::from(h)].source;
+    let t = &m.draft.tensors;
+    let staged = t
+        .tokens
+        .iter()
+        .chain([&t.position, &t.kv_len, &t.slot])
+        .chain(t.hidden_row.iter());
+    for &h in staged {
+        if *source(h) != Source::Scratch {
+            return Err(format!(
+                "staged input {} is not drafter scratch",
+                m.tensors[usize::from(h)].name
+            ));
+        }
+    }
+    if let Some(h) = t.hidden {
+        if *source(h)
+            == (Source::Import {
+                access: Access::Read,
+            })
+        {
+            return Err(format!(
+                "hidden {} is a read-only import",
+                m.tensors[usize::from(h)].name
+            ));
+        }
+    }
+    for (pi, p) in section.programs.iter().enumerate() {
+        for (k, inst) in p.insts.iter().enumerate() {
+            let op = packet::dev::DevOp::from_u16(inst.op)
+                .ok_or_else(|| format!("program {pi} instruction {k}: unknown opcode"))?;
+            let writes = vetted_writes(op, inst)
+                .ok_or_else(|| format!("program {pi} instruction {k}: opcode {op:?} is not allowed in an external drafter"))?;
+            for &slot in writes {
+                let h = inst.t[slot];
+                if h == packet::dev::TENSOR_NONE16 {
+                    continue;
+                }
+                if *source(h)
+                    == (Source::Import {
+                        access: Access::Read,
+                    })
+                {
+                    return Err(format!(
+                        "program {pi} instruction {k} ({op:?}) writes read-only import {}",
+                        m.tensors[usize::from(h)].name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl SpecDraft {
@@ -107,7 +222,7 @@ impl SpecDraft {
         // Under PLOW_LIVE_CTX the engine re-declared the packet at its live bound; the draft
         // programs address the same full-attention caches and take the same restride.
         let ceiling = crate::exec::ctx_bound::declared_ctx(&blob).unwrap_or(0);
-        let live = e.max_ctx as u32;
+        let live = kv_ctx(assets, ceiling);
         let mut sized = None;
         if live != ceiling {
             if live > ceiling {
@@ -166,54 +281,49 @@ impl SpecDraft {
             )));
         }
         let programs_raw = read(sd::PROGRAMS_FILE)?;
-        let (view, ceiling, declared, transient) =
-            e.spec_target_view(assets, &m.requires.object_symbols)?;
-        m.check(&view)
+        let target = e.spec_target_view(&m.requires.object_symbols)?;
+        m.check(&target.view)
             .map_err(|x| at(format!("does not fit target {}: {x}", assets.display())))?;
-        plow_asset::serve_manifest::verify_pins(dir, &m.weights).map_err(at)?;
-        let ckpt = m
-            .tensors
-            .iter()
-            .any(|t| t.source == Source::Weight)
-            .then(|| crate::asset::checkpoint::Checkpoint::open(dir))
-            .transpose()?;
+        let shards = pinned_shards(dir, &m.weights).map_err(at)?;
         let init = m
             .tensors
             .iter()
             .any(|t| matches!(t.source, Source::Init { .. }))
             .then(|| read(sd::INIT_FILE))
             .transpose()?;
-        let live = e.max_ctx as u32;
+        let (ceiling, live) = target.ctx;
         let (mut own, mut addr, mut rewritten) = (Vec::new(), Vec::new(), Vec::new());
         for (h, t) in m.tensors.iter().enumerate() {
             let mem = match &t.source {
                 Source::Import { access } => {
+                    // `check` matched the name and declared bytes against the target table.
                     let i = e
                         .tensor_names
                         .iter()
                         .position(|n| *n == t.name)
                         .ok_or_else(|| at(format!("import {} not in the target", t.name)))?;
-                    if *access == Access::ReadWrite && !transient[i] {
+                    if *access == Access::ReadWrite && !target.activation[i] {
                         return Err(at(format!(
-                            "import {} writes a target cache, weight or table",
+                            "import {} is writable but not a target activation",
                             t.name
                         )));
                     }
-                    let target = &e.devp[i];
-                    if target.len != declared[i] {
-                        // The engine narrowed this cache to its live context.
-                        if !t.name.starts_with("kv.") {
-                            return Err(at(format!("import {} was resized", t.name)));
-                        }
+                    let mem = &e.devp[i];
+                    if mem.len < target.live_bytes[i] {
+                        return Err(at(format!(
+                            "import {} is smaller than its live size",
+                            t.name
+                        )));
+                    }
+                    if target.live_bytes[i] != t.bytes {
                         rewritten.push(h as u16);
                     }
-                    addr.push((target.base, target.len));
+                    addr.push((mem.base, mem.len));
                     continue;
                 }
                 Source::Weight => {
-                    let src = ckpt
-                        .as_ref()
-                        .and_then(|c| c.tensor(&t.name))
+                    let src = shards
+                        .tensor(&t.name)
                         .ok_or_else(|| at(format!("MISSING WEIGHT {}", t.name)))?;
                     if src.len() as u64 != t.bytes {
                         return Err(at(format!("weight {} is {} bytes", t.name, src.len())));
@@ -225,7 +335,10 @@ impl SpecDraft {
                 Source::Init { offset, len } => {
                     let src = init
                         .as_deref()
-                        .and_then(|b| b.get(*offset as usize..(*offset + *len) as usize))
+                        .and_then(|b| {
+                            let end = offset.checked_add(*len)?;
+                            b.get(usize::try_from(*offset).ok()?..usize::try_from(end).ok()?)
+                        })
                         .ok_or_else(|| at(format!("init of {} out of range", t.name)))?;
                     let mem = e.be.alloc(0, t.bytes)?;
                     e.be.upload(&mem, 0, src)?;
@@ -240,11 +353,12 @@ impl SpecDraft {
             addr.push((mem.base, mem.len));
             own.push(mem);
         }
+        let section =
+            plow_asset::aux_program::parse(&programs_raw, e.grid, addr.len()).map_err(at)?;
+        check_writes(&m, &section).map_err(at)?;
         let ptrs: Vec<u64> = addr.iter().map(|a| a.0).collect();
         let table = e.be.alloc(0, (ptrs.len() * 8) as u64)?;
         e.be.upload(&table, 0, super::pod_bytes(&ptrs))?;
-        let section =
-            plow_asset::aux_program::parse(&programs_raw, e.grid, addr.len()).map_err(at)?;
         let digest = m.digest(&format!(
             "{:x}",
             <sha2::Sha256 as sha2::Digest>::digest(&programs_raw)
@@ -908,28 +1022,38 @@ impl GpuEngine {
         )
     }
 
-    /// What this target proves to an external drafter, with the emitted context bound and, per
-    /// packet tensor, its declared (emitted) byte size and whether it is a transient activation. Only the object symbols in `symbols`
+    /// What this engine's packet proves to an external drafter, read from the file it was
+    /// loaded from (refused when that file changed since). Only the object symbols in `symbols`
     /// are read, from the object draft programs launch on.
     pub(super) fn spec_target_view(
         &self,
-        assets: &Path,
         symbols: &std::collections::BTreeMap<String, u32>,
-    ) -> Result<(
-        plow_asset::spec_drafter::TargetView,
-        u32,
-        Vec<u64>,
-        Vec<bool>,
-    )> {
+    ) -> Result<TargetFacts> {
         use plow_asset::spec_drafter::{TargetView, TokenizerFacts};
         use sha2::Digest;
-        let pkt = DevBlob::find_in_dir(assets)?
-            .ok_or_else(|| reject(format!("no packet in {}", assets.display())))?;
-        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
+        let (pkt, stamp) = &self.packet_file;
+        let raw = std::fs::read(pkt).map_err(|source| RuntimeError::Io {
             path: pkt.clone(),
             source,
         })?;
+        if stamp.is_none() || FileStamp::of(pkt) != *stamp {
+            return Err(reject(format!(
+                "{} changed since the engine loaded it",
+                pkt.display()
+            )));
+        }
         let blob = DevBlob::parse(&raw)?;
+        if blob.tensors.len() != self.tensor_names.len()
+            || blob
+                .tensors
+                .iter()
+                .zip(&self.tensor_names)
+                .any(|(t, n)| t.name != *n)
+        {
+            return Err(reject(
+                "the packet's tensor table differs from the loaded engine's",
+            ));
+        }
         let mut view = TargetView {
             packet_sha256: format!("{:x}", sha2::Sha256::digest(&raw)),
             tensors: blob
@@ -944,6 +1068,7 @@ impl GpuEngine {
                 .map_err(reject)?
                 .apply(&mut view);
         }
+        let assets = pkt.parent().unwrap_or(Path::new("."));
         let checkpoint = crate::asset::serve::checkpoint_dir(assets);
         if let Some(path) = [
             assets.join("tokenizer.json"),
@@ -965,11 +1090,23 @@ impl GpuEngine {
             }
         }
         let ceiling = crate::exec::ctx_bound::declared_ctx(&blob).unwrap_or(0);
-        let declared = blob.tensors.iter().map(|t| t.bytes).collect();
-        let transient = (0..blob.tensors.len())
-            .map(|h| crate::asset::drafter::transient(&blob, h))
+        let live = kv_ctx(assets, ceiling);
+        if live > ceiling {
+            return Err(reject(format!("widened live context {live} > {ceiling}")));
+        }
+        let mut sized = DevBlob::parse(&raw)?;
+        if live != ceiling {
+            crate::exec::ctx_bound::narrow(&mut sized, live)?;
+        }
+        let activation = (0..blob.tensors.len())
+            .map(|h| crate::asset::drafter::activation(&blob, h))
             .collect();
-        Ok((view, ceiling, declared, transient))
+        Ok(TargetFacts {
+            view,
+            ctx: (ceiling, live),
+            live_bytes: sized.tensors.iter().map(|t| t.bytes).collect(),
+            activation,
+        })
     }
 
     /// The attached drafter's identity: `None` for a packet's own draft programs.
@@ -1003,5 +1140,172 @@ impl GpuEngine {
 
     pub fn spec_draft_sync(&self) -> Result<()> {
         self.be.stream_synchronize(&self.stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
+    use plow_asset::spec_draft::{DraftProgram, DraftTensors};
+    use plow_asset::spec_drafter::{Access, Kind, Manifest as Drafter, Requires, Source, Tensor};
+
+    fn drafter(sources: Vec<Source>) -> Drafter {
+        let names = [
+            "in.spec.tokens.0",
+            "in.spec.tokens.1",
+            "in.spec.hidden_row",
+            "in.spec.position",
+            "in.spec.kv_len",
+            "in.spec.slot",
+            "act.hn",
+            "kv.28.k",
+            "act.mtp.x",
+        ];
+        Drafter {
+            contract: plow_asset::spec_drafter::CONTRACT.into(),
+            kind: Kind::ChainSharedKv,
+            family: "x".into(),
+            n_cu: 1,
+            requires: Requires::default(),
+            tensors: names
+                .iter()
+                .zip(sources)
+                .map(|(n, source)| Tensor {
+                    name: n.to_string(),
+                    bytes: 64,
+                    source,
+                })
+                .collect(),
+            draft: plow_asset::spec_draft::Manifest {
+                version: plow_asset::spec_draft::VERSION,
+                family: "x".into(),
+                kmax: 1,
+                programs: vec![DraftProgram {
+                    rows: 1,
+                    k: 1,
+                    index: 0,
+                }],
+                tensors: DraftTensors {
+                    tokens: vec![0, 1],
+                    hidden_row: Some(2),
+                    position: 3,
+                    kv_len: 4,
+                    slot: 5,
+                    hidden: Some(6),
+                    hidden_rows: 16,
+                },
+                block: None,
+                shard: String::new(),
+                shard_sha256: String::new(),
+            },
+            weights: vec![],
+        }
+    }
+
+    fn sources() -> Vec<Source> {
+        let mut v = vec![Source::Scratch; 6];
+        v.push(Source::Import {
+            access: Access::ReadWrite,
+        });
+        v.push(Source::Import {
+            access: Access::Read,
+        });
+        v.push(Source::Scratch);
+        v
+    }
+
+    fn section(insts: Vec<DevInst64>) -> plow_asset::aux_program::Section {
+        plow_asset::aux_program::Section {
+            n_cu: 1,
+            programs: vec![plow_asset::aux_program::Program {
+                rows: 1,
+                n_counter: 0,
+                insts,
+                stream: vec![],
+                stream_ofs: vec![],
+                stream_len: vec![],
+                waits: vec![],
+                succs: vec![],
+                gq_stream: vec![],
+                gq_seg_ofs: vec![],
+            }],
+        }
+    }
+
+    fn inst(op: DevOp, t0: u16) -> DevInst64 {
+        let mut t = [TENSOR_NONE16; 8];
+        t[0] = t0;
+        t[1] = 7;
+        DevInst64 {
+            op: op as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t,
+            i: [0; 8],
+        }
+    }
+
+    #[test]
+    fn writes_into_read_only_imports_are_refused() {
+        let m = drafter(sources());
+        check_writes(&m, &section(vec![inst(DevOp::RmsNorm, 8)])).unwrap();
+        let e = check_writes(&m, &section(vec![inst(DevOp::RmsNorm, 7)])).unwrap_err();
+        assert!(e.contains("writes read-only import kv.28.k"), "{e}");
+        // NormResidualNorm also writes its residual operand (t1 = kv.28.k here).
+        let e = check_writes(&m, &section(vec![inst(DevOp::NormResidualNorm, 8)])).unwrap_err();
+        assert!(e.contains("kv.28.k"), "{e}");
+        let e = check_writes(&m, &section(vec![inst(DevOp::HeadNormRopeFp8, 8)])).unwrap_err();
+        assert!(e.contains("not allowed"), "{e}");
+    }
+
+    #[test]
+    fn staged_inputs_must_be_scratch_and_the_hidden_writable() {
+        let mut s = sources();
+        s[3] = Source::Import {
+            access: Access::ReadWrite,
+        };
+        let e = check_writes(&drafter(s), &section(vec![])).unwrap_err();
+        assert!(e.contains("in.spec.position"), "{e}");
+        let mut s = sources();
+        s[6] = Source::Import {
+            access: Access::Read,
+        };
+        let e = check_writes(&drafter(s), &section(vec![])).unwrap_err();
+        assert!(e.contains("hidden act.hn"), "{e}");
+    }
+
+    fn shard(path: &Path, names: &[&str]) {
+        let mut header = serde_json::Map::new();
+        for (k, n) in names.iter().enumerate() {
+            header.insert(
+                n.to_string(),
+                serde_json::json!({"dtype": "U8", "shape": [4], "data_offsets": [4 * k, 4 * k + 4]}),
+            );
+        }
+        let h = serde_json::to_vec(&header).unwrap();
+        let mut b = (h.len() as u64).to_le_bytes().to_vec();
+        b.extend(&h);
+        b.extend(vec![7u8; 4 * names.len()]);
+        std::fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn only_pinned_shards_bind_and_each_name_once() {
+        let dir = std::env::temp_dir().join(format!("plowrt-shards-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        shard(&dir.join("a.safetensors"), &["w.a", "w.b"]);
+        let pin = |f: &str| plow_asset::serve_manifest::pin_shard(&dir.join(f)).unwrap();
+        let pins = vec![pin("a.safetensors")];
+        let s = pinned_shards(&dir, &pins).unwrap();
+        assert_eq!(s.tensor("w.b"), Some(&[7u8; 4][..]));
+        shard(&dir.join("b.safetensors"), &["w.a"]);
+        let e = pinned_shards(&dir, &pins).err().unwrap();
+        assert!(e.contains("not exactly the pinned"), "{e}");
+        let both = vec![pin("a.safetensors"), pin("b.safetensors")];
+        let e = pinned_shards(&dir, &both).err().unwrap();
+        assert!(e.contains("more than one shard"), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

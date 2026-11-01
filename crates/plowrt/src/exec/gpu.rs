@@ -2748,6 +2748,9 @@ pub struct GpuEngine {
     /// [`Self::handle_of`] / [`Self::download_activation`] /
     /// [`Self::upload_activation`]. Not on any hot path.
     tensor_names: Vec<String>,
+    /// The packet file this engine was loaded from and its stamp at load: an external drafter is
+    /// checked against these bytes, never a file swapped in afterwards.
+    packet_file: (std::path::PathBuf, Option<spec_draft::FileStamp>),
     vocab: usize,
     max_ctx: usize,
 
@@ -7695,6 +7698,7 @@ impl GpuEngine {
             t_logits,
             recurrent,
             tensor_names: blob.tensors.iter().map(|t| t.name.clone()).collect(),
+            packet_file: (pkt.clone(), spec_draft::FileStamp::of(&pkt)),
             vocab,
             max_ctx,
             batch,
