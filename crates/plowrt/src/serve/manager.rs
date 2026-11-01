@@ -1988,16 +1988,14 @@ impl ModelManager {
         // Sibling packets bind later, outside this measurement.
         let measured = used.saturating_sub(m.plan.tensor_total() - m.plan.sidecar_bytes);
         // Co-residents keep allocating KV and cache during the load and land in the same delta,
-        // so only a load alone on the device may raise an earlier measurement.
-        self.overhead
-            .lock()
-            .entry(m.dir.clone())
-            .and_modify(|o| {
-                if others == 0 {
-                    *o = (*o).max(measured)
-                }
-            })
-            .or_insert(measured);
+        // so only a load alone on the device calibrates (the plan's bound stands until one).
+        if others == 0 {
+            self.overhead
+                .lock()
+                .entry(m.dir.clone())
+                .and_modify(|o| *o = (*o).max(measured))
+                .or_insert(measured);
+        }
         tracing::info!(
             slug = %m.slug,
             used_gib = gib(used),
