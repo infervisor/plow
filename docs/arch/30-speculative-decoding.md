@@ -147,9 +147,10 @@ width. Two things on a stock Gemma-4 packet make the result depend on the width:
 `PLOW_DECODE_BATCH_INVARIANT` is unset by default and then follows `PLOW_SPEC`. When on:
 
 - every decode rung takes the narrowest rung's attention split counts, per attention site;
-- every decode object that exports `plow_batch_invariant` uses the row-count-independent MoE arms;
-- the narrowest rung's numerics are what every rung reproduces, so a lone request decodes as it
-  always did.
+- every decode object that exports `plow_batch_invariant` uses the row-count-independent MoE arms
+  (the grouped expert arm and a K split sized for one row at every width, the B=1 router
+  association). A lone request therefore decodes with different (equally valid) MoE rounding
+  than with the flag off; the reference for spec-on identity is the flag-on engine.
 
 Enabling it is all or nothing:
 
@@ -162,18 +163,25 @@ Scope:
 
 - Invariance holds across the narrow gemv rungs (≤ 16 rows on the Gemma-4 H100 packets), which are
   the rungs span verify uses. Wider rungs switch to W8A8 GEMM and are never bit-equal to them.
+- Objects export the flag only from the build configuration whose arms were audited (row-blocked
+  router, f32 router staging, one dense GEMV arm from B=1). Sibling objects built otherwise (the
+  wide-GEMV `_gw` object) lack it, and verify never launches on a sibling-object rung.
 - Rows that ride a prefill or mixed launch use prefill numerics.
 - The reference for the identity gate is the same engine with spec off and the invariant flag on.
 
-Cost on Gemma-4 26B FP8, plain decode at ctx 2048, from pinning the attention splits:
+Cost on Gemma-4 26B FP8, plain decode at ctx 2048 (step ms, flag off → on):
 
-| B | Cost |
-|---|---|
-| 1 | +0% |
-| 2 | +2% |
-| 4 | +3.4% |
-| 8 | +6.7% |
-| 16 | +11.8% |
+| B | Off | On | Cost |
+|---|---|---|---|
+| 1 | 4.594 | 4.870 | +6.0% |
+| 2 | 5.270 | 5.668 | +7.6% |
+| 4 | 6.288 | 6.511 | +3.5% |
+| 8 | 7.604 | 8.042 | +5.8% |
+| 16 | 9.426 | 10.712 | +13.6% |
+
+On that packet a rung-diff of every instruction (rungs 1 vs 4, 2 vs 4, 8 vs 16) finds no differing
+output byte, and spec-on greedy output equals the flag-on plain output at B=1/2/4/8, k=1/3/7, ctx
+2048 and 8191.
 
 This is why invariance is tied to spec, not on by default.
 
