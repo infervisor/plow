@@ -318,6 +318,8 @@ pub fn stage_packet(model_pkt: &Path, key: &str, legacy: &str) -> Result<std::pa
 pub const CLONE_ENCODER: &str = "clone.encoder";
 /// The pipeline string naming a speech pipeline's text-encoder sub-bundle.
 pub const TEXT_ENCODER: &str = "text.encoder";
+/// The voice-conditioning packet a speech bundle binds when its pipeline names none.
+pub const VOICE_COND_PACKET: &str = "voice_cond.pkt";
 
 fn beside_packet(key: &str, name: &str) -> Result<String> {
     if !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." {

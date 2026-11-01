@@ -320,3 +320,46 @@ fn a_qwen2_checkpoint_without_tokenizer_json_links_vocab_and_merges() {
         let _ = std::fs::remove_dir_all(p);
     }
 }
+
+/// Two variants on one checkpoint, prepared in sequence: the second finds the farm and passes it
+/// as its snapshot. Rebuilt from itself it linked every shard to itself; both bundles must still
+/// reach real shard files.
+#[test]
+fn a_second_variant_on_the_farm_keeps_every_link_resolving() {
+    let store = tmp("store");
+    let snap = snapshot("snap", 2, &["tokenizer.json", "config.json"]);
+    let (first, second) = (tmp("bundle-a"), tmp("bundle-b"));
+    for d in [&first, &second] {
+        std::fs::write(d.join("model.pkt"), b"pkt").unwrap();
+    }
+    let b = bundle(from_checkpoint(), vec![packet_file()]);
+    let farm = build(&store, &b, &first, &snap).unwrap();
+    let again = build(&store, &b, &second, &farm.dir).unwrap();
+    assert_eq!(again.dir, farm.dir);
+    for d in [&first, &second] {
+        for f in [
+            "checkpoint/model-00001-of-00002.safetensors",
+            "checkpoint/model-00002-of-00002.safetensors",
+            "checkpoint/config.json",
+            "tokenizer.json",
+        ] {
+            let p = d.join(f);
+            assert!(
+                std::fs::metadata(&p).is_ok_and(|m| m.is_file()),
+                "{} does not resolve to a file",
+                p.display()
+            );
+        }
+    }
+    for e in std::fs::read_dir(&farm.dir).unwrap().flatten() {
+        let target = std::fs::canonicalize(e.path()).unwrap();
+        assert!(
+            !target.starts_with(&farm.dir),
+            "{} links into the farm",
+            e.path().display()
+        );
+    }
+    for p in [store, snap, first, second] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}

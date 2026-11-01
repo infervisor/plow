@@ -110,7 +110,11 @@ impl PortableManager {
                     let blob = crate::asset::devblob::DevBlob::find_in_dir(&dir)
                         .map_err(|e| e.to_string())?
                         .ok_or("no compiled model packet")?;
-                    load_engine(&blob, &ckpt).map_err(|e| e.to_string())
+                    let cfg = st
+                        .bundle_engine_config(&slug, &dir)
+                        .map_err(|e| e.to_string())?;
+                    crate::config::scoped(Some(cfg), || load_engine(&blob, &ckpt))
+                        .map_err(|e| e.to_string())
                 })();
                 if result.is_err() && !known {
                     let _ = st.registry.unload(&slug);

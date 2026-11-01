@@ -4633,8 +4633,11 @@ async fn bringup_runtime(
                     let first = u8::try_from(first_of(&key))
                         .map_err(|_| format!("{key}: device ordinal out of range"))?;
                     let t0 = std::time::Instant::now();
-                    let eng =
-                        plowrt::serve::engine::AmdServe::load_on(blob, &hsaco, Some(&ckpt), first)?;
+                    // This bundle's engine defaults, not the first exported bundle's.
+                    let cfg = state.bundle_engine_config(&key, &bundle.dir)?;
+                    let eng = plowrt::config::scoped(Some(cfg), || {
+                        plowrt::serve::engine::AmdServe::load_on(blob, &hsaco, Some(&ckpt), first)
+                    })?;
                     tracing::info!(
                         %key, first_device = first, tp, secs = t0.elapsed().as_secs_f64(),
                         max_ctx = eng.max_ctx(), "AMD engine loaded"
@@ -4712,7 +4715,10 @@ async fn bringup_runtime(
                 .into());
             }
             let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
-            let eng = plowrt::serve::portable::load_engine(&blob, &ckpt)?;
+            let cfg = state.bundle_engine_config(&slug, &bundle.dir)?;
+            let eng = plowrt::config::scoped(Some(cfg), || {
+                plowrt::serve::portable::load_engine(&blob, &ckpt)
+            })?;
             portable.register(slug.clone(), ckpt);
             state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Cpu(eng));
         }

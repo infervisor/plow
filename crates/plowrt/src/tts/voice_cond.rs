@@ -13,7 +13,7 @@ use crate::exec::packet_runtime::{
     load_packet_runtime_on, PacketAsset, PacketRuntime, PacketTensor,
 };
 
-pub const PACKET: &str = "voice_cond.pkt";
+pub const PACKET: &str = crate::exec::packet_runtime::VOICE_COND_PACKET;
 const DRIVER: &str = "voice.encode.v1";
 
 /// Why a clip did not encode: the clip itself (a client error) or the device.

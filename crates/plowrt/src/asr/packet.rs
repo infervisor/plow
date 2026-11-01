@@ -165,6 +165,10 @@ impl Transcriber for PacketRnntTranscriber {
         Ok(detokenize(&self.output, &stream.tokens))
     }
 
+    fn accepts_context(&self) -> bool {
+        false
+    }
+
     fn stream_finals(&self) -> bool {
         self.execution.stream_slots().is_some()
     }
@@ -325,7 +329,7 @@ impl Transcriber for PacketRnntTranscriber {
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Transcript> {
         if !context.is_empty() {
-            return Err(rejected("speech context is not implemented"));
+            return Err(rejected(super::CONTEXT_UNSUPPORTED));
         }
         if cancel.load(Ordering::Relaxed) {
             return Err(rejected("ASR cancelled"));

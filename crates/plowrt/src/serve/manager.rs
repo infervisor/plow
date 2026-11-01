@@ -428,7 +428,10 @@ fn sidecar_files(asset: Option<&crate::exec::packet_runtime::PacketAsset>) -> Re
         ("encoder.packet", "encoder.pkt"),
         ("codec.packet", "codec.pkt"),
         ("vocoder.packet", "s3gen.pkt"),
-        ("voice_cond.packet", crate::tts::voice_cond::PACKET),
+        (
+            "voice_cond.packet",
+            crate::exec::packet_runtime::VOICE_COND_PACKET,
+        ),
     ];
     let mut stages = match asset {
         Some(asset) => asset.stage_files()?,
