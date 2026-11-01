@@ -777,22 +777,23 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
 }
 
 impl DecodeRung {
-    /// [`crate::exec::kvrow::pin_decode_splits`] on this rung, re-uploading its instructions.
-    pub(super) fn pin_splits(
-        &mut self,
-        be: &CudaBackend,
+    /// The rung's instructions with [`crate::exec::kvrow::pin_decode_splits`] applied.
+    pub(super) fn pinned_splits(
+        &self,
         reference: &[DevInst64],
         partial_bytes: impl Fn(u16) -> u64,
-    ) -> Result<usize> {
-        let changed =
-            crate::exec::kvrow::pin_decode_splits(reference, &mut self.host_insts, partial_bytes)
-                .map_err(|e| {
-                RuntimeError::Rejected(format!("batch-invariant decode: rung {}: {e}", self.rows))
-            })?;
-        if changed > 0 {
-            be.upload(&self._tables[0], 0, pod_bytes(&self.host_insts))?;
-        }
-        Ok(changed)
+    ) -> std::result::Result<Vec<DevInst64>, String> {
+        let mut insts = self.host_insts.clone();
+        crate::exec::kvrow::pin_decode_splits(reference, &mut insts, partial_bytes)
+            .map_err(|e| format!("rung {}: {e}", self.rows))?;
+        Ok(insts)
+    }
+
+    /// Replace the rung's instructions (same length) on the host and the device.
+    pub(super) fn set_insts(&mut self, be: &CudaBackend, insts: Vec<DevInst64>) -> Result<()> {
+        be.upload(&self._tables[0], 0, pod_bytes(&insts))?;
+        self.host_insts = insts;
+        Ok(())
     }
 
     pub(super) fn upload(

@@ -61,6 +61,13 @@ fn reject(m: impl std::fmt::Display) -> RuntimeError {
 impl GpuEngine {
     /// Arm verify and load the packet's drafter for serving.
     pub fn spec_serve_enable(&mut self, assets: &Path) -> Result<SpecLimits> {
+        // Verify rows run at other launch widths than the plain steps they replace.
+        if !self.batch_invariant {
+            return Err(reject(
+                "plain decode is not batch-invariant on this engine (PLOW_DECODE_BATCH_INVARIANT), \
+                 so a verify would not reproduce it token for token",
+            ));
+        }
         let ring_k = self.spec_enable(assets)?;
         self.spec_draft_enable(assets)?;
         if self.spec_draft_is_block() {

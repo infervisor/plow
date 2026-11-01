@@ -1986,6 +1986,9 @@ __device__ __forceinline__ bool plow_moe_tc_ok(unsigned N, unsigned K) {
 #ifndef PLOW_MOE_FP8_TC_DD
 #define PLOW_MOE_FP8_TC_DD 4
 #endif
+/* Batch-invariant decode (set by the runtime): every row count takes the grouped arm and the
+ * K split one row's share would pick, so a row's expert sums never depend on its launch width. */
+extern "C" __device__ unsigned plow_batch_invariant = 0;
 /* DOWN's K (I_moe = 704 on the 26B) is only 11 chunks: at the dense depth a warp pays three
  * exposed round trips per tile. */
 #ifndef PLOW_MOE_TC_UD
@@ -2021,7 +2024,10 @@ static __device__ void d_moe_fp8_tc(void* out, const bf16* x, const unsigned cha
     /* Dd: ngr follows every row's routing, idle rows included. A K split sized from this CTA's
      * share would change a live slot's reduction order with the rest of the batch; size it from
      * the routing-independent per-slot share instead. */
-    const unsigned ks = fp8tc_ksplit(Dd ? (nslot * tpn + nblk - 1u) / nblk : ntile, nw);
+    const unsigned ks = fp8tc_ksplit(
+        plow_batch_invariant ? (k * tpn + nblk - 1u) / nblk
+                             : Dd ? (nslot * tpn + nblk - 1u) / nblk : ntile,
+        nw);
     const unsigned tiles_per_round = nw / ks;
     const unsigned nchunk = K / 64u;
     const unsigned my_tile = warp / ks, my_k = warp % ks;
@@ -2104,7 +2110,8 @@ static __device__ void d_moe_fp8_tc_any(void* out, const bf16* x, const unsigned
                                         unsigned n_exp, unsigned slice, unsigned nblk, unsigned nrow,
                                         float* red) {
 #if PLOW_MOE_FP8_DEDUP && PLOW_MOE_FP8_TC_DD
-    if (nrow >= PLOW_MOE_FP8_TC_DD && n_exp <= PLOW_DD_MAXE && nrow * k <= PLOW_DD_MAXS) {
+    if ((nrow >= PLOW_MOE_FP8_TC_DD || plow_batch_invariant) && n_exp <= PLOW_DD_MAXE &&
+        nrow * k <= PLOW_DD_MAXS) {
         d_moe_fp8_tc<Glu, true>(out, x, table, ewt, est, k, N, K, I_moe, n_exp, slice, nblk, nrow, red);
         return;
     }

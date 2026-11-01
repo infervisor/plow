@@ -863,7 +863,8 @@ pub(crate) fn pin_decode_splits(
             want.len()
         ));
     }
-    let mut changed = 0;
+    // Validate every site before changing any, so a refusal leaves `insts` untouched.
+    let mut edits = Vec::with_capacity(have.len());
     for (n, (&(rf, rm), &(f, m))) in want.iter().zip(&have).enumerate() {
         let (r, d) = (&reference[rf], &insts[f]);
         // n_head, n_kv_head, kv_stride, window, head_dim
@@ -890,14 +891,16 @@ pub(crate) fn pin_decode_splits(
             ));
         }
         if d.i[5] != ns {
-            insts[f].i[5] = ns;
-            if let Some(m) = m {
-                insts[m].i[2] = ns;
-            }
-            changed += 1;
+            edits.push((f, m, ns));
         }
     }
-    Ok(changed)
+    for &(f, m, ns) in &edits {
+        insts[f].i[5] = ns;
+        if let Some(m) = m {
+            insts[m].i[2] = ns;
+        }
+    }
+    Ok(edits.len())
 }
 
 pub(crate) fn nv_split_span(sites: &[NvSplitSite]) -> Option<(usize, usize)> {

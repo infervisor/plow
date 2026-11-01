@@ -2733,6 +2733,9 @@ pub struct GpuEngine {
     kvrow_lo: usize,
     kvrow_hi: usize,
     nv_nsplit: Option<NvDenseNsplit>,
+    /// Every decode row reduces in the same order at every launch width
+    /// (`PLOW_DECODE_BATCH_INVARIANT`): a verify launch reproduces the plain steps it replaces.
+    batch_invariant: bool,
     ctr_bytes: usize,
     /// Bytes of GQ cursor lines at the counter slab's tail — one PLOW_CTR line
     /// per gq segment (P lines for an L2-placed blob, 1 otherwise).
@@ -5934,26 +5937,48 @@ impl GpuEngine {
             .as_ref()
             .filter(|routed| moe_lt_routed && routed.serves(&insts))
             .cloned();
-        let invariant_splits = if config.decode_batch_invariant()
-            && select_decode_rungs
-            && blob.decode_progs().len() > 1
-        {
-            if gen_decode_launch.is_some() || prepared_contexts.is_some() {
-                return Err(RuntimeError::Rejected(
-                    "batch-invariant decode: generated decode attention and context-band \
-                     rungs size their split counts per launch"
-                        .into(),
-                ));
+        // Batch-invariant decode: an explicit request fails the load when the packet cannot
+        // honour it; one implied by PLOW_SPEC leaves the engine plain (spec then stays off).
+        let invariant_explicit = config.decode_batch_invariant_explicit();
+        let mut unpinned_widest: Option<Vec<DevInst64>> = None;
+        let invariant_refused = |why: String| -> Result<()> {
+            if invariant_explicit {
+                return Err(RuntimeError::Rejected(format!(
+                    "batch-invariant decode: {why}"
+                )));
             }
-            let reference = blob.decode_progs()[0].insts.clone();
-            let changed = crate::exec::kvrow::pin_decode_splits(&reference, &mut insts, |h| {
-                blob.tensors[usize::from(h)].bytes
-            })
-            .map_err(|e| RuntimeError::Rejected(format!("batch-invariant decode: {e}")))?;
-            tracing::info!(changed, "batch-invariant decode: widest program pinned");
-            Some(reference)
-        } else {
+            tracing::warn!(reason = %why, "batch-invariant decode unavailable");
+            Ok(())
+        };
+        let invariant_splits = if !config.decode_batch_invariant() {
             None
+        } else if !select_decode_rungs || blob.decode_progs().len() <= 1 {
+            // One decode program: every launch already runs the same instructions.
+            Some(Vec::new())
+        } else if gen_decode_launch.is_some() || prepared_contexts.is_some() {
+            invariant_refused(
+                "generated decode attention and context-band rungs size their split counts \
+                 per launch"
+                    .into(),
+            )?;
+            None
+        } else {
+            let reference = blob.decode_progs()[0].insts.clone();
+            let mut pinned = insts.clone();
+            unpinned_widest = Some(insts.clone());
+            match crate::exec::kvrow::pin_decode_splits(&reference, &mut pinned, |h| {
+                blob.tensors[usize::from(h)].bytes
+            }) {
+                Ok(changed) => {
+                    insts = pinned;
+                    tracing::info!(changed, "batch-invariant decode: widest program pinned");
+                    Some(reference)
+                }
+                Err(e) => {
+                    invariant_refused(e)?;
+                    None
+                }
+            }
         };
         let d_inst = upload_pod(pod_bytes(&insts))?;
         let d_stream = upload_pod(pod_bytes(&g.stream))?;
@@ -6485,11 +6510,33 @@ impl GpuEngine {
         } else {
             Vec::new()
         };
-        if let Some(reference) = &invariant_splits {
-            for rung in decode_rungs.iter_mut() {
-                rung.pin_splits(&be, reference, |h| blob.tensors[usize::from(h)].bytes)?;
+        let invariant_splits = match invariant_splits {
+            Some(reference) if !reference.is_empty() => {
+                let bytes = |h: u16| blob.tensors[usize::from(h)].bytes;
+                match decode_rungs
+                    .iter()
+                    .map(|r| r.pinned_splits(&reference, bytes))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    Ok(all) => {
+                        for (rung, pinned) in decode_rungs.iter_mut().zip(all) {
+                            rung.set_insts(&be, pinned)?;
+                        }
+                        Some(reference)
+                    }
+                    Err(e) => {
+                        invariant_refused(e)?;
+                        // The widest program was pinned already: restore its baked splits.
+                        if let Some(baked) = unpinned_widest.take() {
+                            be.upload(&d_inst, 0, pod_bytes(&baked))?;
+                            insts = baked;
+                        }
+                        None
+                    }
+                }
             }
-        }
+            other => other,
+        };
         let decode_contexts = prepared_contexts
             .map(|contexts| contexts.materialize(&be, kernarg, assets_dir))
             .transpose()?;
@@ -7702,6 +7749,7 @@ impl GpuEngine {
             kvrow_lo: lo,
             kvrow_hi: hi,
             nv_nsplit,
+            batch_invariant: false,
             ctr_bytes,
             cursor_bytes,
             devp,
@@ -7817,6 +7865,13 @@ impl GpuEngine {
             debug_nsplit_kvlen: None,
         };
         engine.spec_upload_identity()?;
+        if invariant_splits.is_some() {
+            match engine.arm_batch_invariant(&blob) {
+                Ok(()) => engine.batch_invariant = true,
+                Err(e) if invariant_explicit => return Err(e),
+                Err(e) => tracing::warn!(error = %e, "batch-invariant decode unavailable"),
+            }
+        }
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
@@ -15325,6 +15380,44 @@ impl GpuEngine {
     }
 
     /// The main decode object, then the routed and wide-rung objects a rung may launch instead.
+    /// Batch-invariant decode inside the kernels: every decode object exporting
+    /// `plow_batch_invariant` takes its width-independent arms. A packet whose MoE expert sums
+    /// depend on the row count needs every decode object to export it.
+    fn arm_batch_invariant(&self, blob: &crate::asset::devblob::DevBlob) -> Result<()> {
+        let mut modules = self.decode_trace_modules();
+        if let Some((a, b)) = &self.row_slot_twin {
+            modules.extend([a.module(), b.module()]);
+        }
+        modules.extend(
+            self.decode_rungs
+                .iter()
+                .filter_map(|r| r.object.as_ref().map(|o| o.module())),
+        );
+        let moe = blob.decode_progs().iter().flat_map(|p| &p.insts).any(|d| {
+            matches!(
+                DevOp::from_u16(d.op),
+                Some(DevOp::MoeExpertGluGemmaFp8 | DevOp::MoeExpertDownGemmaFp8)
+            )
+        });
+        for m in modules {
+            if self
+                .be
+                .module_global_u32(m, "plow_batch_invariant")?
+                .is_some()
+            {
+                self.be
+                    .module_global_set_u32(m, "plow_batch_invariant", 1)?;
+            } else if moe {
+                return Err(RuntimeError::Rejected(
+                    "batch-invariant decode: a decode object predates plow_batch_invariant, \
+                     so its MoE expert sums depend on the launch width (rebuild the objects)"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn decode_trace_modules(&self) -> Vec<&Module> {
         let mut v: Vec<&Module> = vec![&self.module];
         if let Some(r) = &self._routed_object {

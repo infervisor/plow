@@ -2969,6 +2969,17 @@ impl RuntimeConfig {
         })
     }
 
+    /// Whether `PLOW_DECODE_BATCH_INVARIANT` was stated (not implied by `PLOW_SPEC`).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn decode_batch_invariant_explicit(&self) -> bool {
+        select_compat(
+            self.nv.decode_batch_invariant,
+            Self::env_bool("PLOW_DECODE_BATCH_INVARIANT").map(Some),
+            !Self::is_initialized(),
+        )
+        .is_some()
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn decode_batch_invariant(&self) -> bool {
         select_compat(
