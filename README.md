@@ -7,7 +7,7 @@
 
 # plow
 
-**An open-source inference engine for language and speech models.**
+**An open-source inference engine.**
 
 Plow compiles models ahead of time and runs them on your hardware. It includes
 an OpenAI-compatible API, streaming responses, and backends for NVIDIA GPUs,
