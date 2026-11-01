@@ -336,3 +336,34 @@ fn admission_maps_the_rows_launches_can_write_and_no_more() {
         16_384
     );
 }
+
+/// A serial chunk chain on slot b > 0 reads slot b's table through the shared prefill table and
+/// the graph built for it: the same prompt gives slot 0's prefill logits bit for bit, and the
+/// first decode step (which reads the KV the chain wrote into slot b's ring) the same token.
+#[test]
+#[ignore = "GPU; set SLOT_PREFILL_TEST_ASSETS (a batch > 1 segmented-prefill packet)"]
+fn serial_prefill_on_any_slot_matches_slot_zero() {
+    let assets = PathBuf::from(std::env::var("SLOT_PREFILL_TEST_ASSETS").unwrap());
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).unwrap();
+    assert!(e.batch > 2 && e.d_tens_pf.is_some());
+    let prompt: Vec<u32> = (0..1200u32).map(|i| 100 + (i * 7919) % 20_000).collect();
+    let slots = [0, 1, e.batch / 2, e.batch - 1, 1];
+    let mut logits = Vec::new();
+    let mut runs = Vec::new();
+    for &slot in &slots {
+        e.begin_slot(slot, prompt.len() + 8).unwrap();
+        let token = e.prefill_slot(slot, &prompt).unwrap();
+        e.logits_row(0, &mut logits).unwrap();
+        let bits: Vec<u32> = logits.iter().map(|v| v.to_bits()).collect();
+        let mut next = Vec::new();
+        e.step_slots(&[(slot, token)], &mut next).unwrap();
+        e.retire_slot(slot, false);
+        runs.push((token, bits, next[0]));
+    }
+    for (slot, run) in slots.iter().zip(&runs).skip(1) {
+        assert_eq!(run.0, runs[0].0, "slot {slot} prefill token");
+        assert!(run.1 == runs[0].1, "slot {slot} prefill logits differ");
+        assert_eq!(run.2, runs[0].2, "slot {slot} decode token");
+    }
+}
