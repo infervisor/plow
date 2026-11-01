@@ -1795,6 +1795,9 @@ impl ModelManager {
         })
         .await
         .map_err(EnsureError::Load)?;
+        if let Err(e) = self.share_kv(&state) {
+            tracing::warn!(%slug, error = ?e, "planner: co-resident KV shares after unload");
+        }
         let engine_ms = ms(t1);
         if let Ok(bundle) = state.registry.get(state.model_of(slug)) {
             let device = self.ordinal();
@@ -2069,8 +2072,80 @@ impl ModelManager {
         if let Some(claim) = claim {
             claims.insert(slug.to_string(), claim);
         }
+        drop(claims);
+        let shared = self.share_kv(state);
+        if shared.is_err() {
+            self.kv_claims.lock().remove(slug);
+        }
+        shared
+    }
+
+    /// Each engine admits from `free + its own held - its reserve`, so co-resident engines all
+    /// count the same free memory (2 x E4B: 38.3 + 5.7 GiB budgets over 6.4 GiB free, both
+    /// OOM). With two or more KV engines, each is capped at its share of `free + every engine's
+    /// live KV - the largest reserve`, split by one full-context sequence's bytes, and its
+    /// prefix caches keep free what the others' caps and that reserve need. Refuses when the
+    /// shares cannot each back one full-context sequence.
+    fn share_kv(&self, state: &AppState) -> std::result::Result<(), EnsureError> {
+        let slugs: Vec<String> = self.kv_claims.lock().keys().cloned().collect();
+        let engines: Vec<_> = slugs
+            .iter()
+            .filter_map(|s| state.gpu_engine(s).map(|e| (s.as_str(), e)))
+            .collect();
+        if engines.len() < 2 {
+            for (_, e) in &engines {
+                e.lock().set_co_tenant(None, 0);
+            }
+            return Ok(());
+        }
+        // Held is read before free: a block mapped between the reads counts in neither.
+        let mut held = 0u64;
+        let mut shares = Vec::with_capacity(engines.len());
+        for (slug, e) in &engines {
+            let e = e.lock();
+            if let Some(budget) = e.kv_admission_budget() {
+                held += e.kv_live_held();
+                shares.push((
+                    *slug,
+                    budget.bytes_for_rows(e.max_ctx() as u64),
+                    e.kv_admit_reserve(),
+                ));
+            }
+        }
+        let free = self.free_vram().map_err(EnsureError::Load)?;
+        let caps = kv_shares(free + held, &shares)?;
+        let total: u64 = caps.iter().sum();
+        let reserve = shares.iter().map(|s| s.2).max().unwrap_or(0);
+        for ((slug, _, _), &cap) in shares.iter().zip(&caps) {
+            if let Some(e) = state.gpu_engine(slug) {
+                e.lock().set_co_tenant(Some(cap), reserve + (total - cap));
+            }
+            tracing::info!(%slug, cap_mib = cap >> 20, reserve_mib = reserve >> 20, free_mib = free >> 20, "planner: co-resident KV budget capped");
+        }
         Ok(())
     }
+}
+
+/// Per-engine admission caps over `room` (free plus every engine's live KV), given each
+/// engine's `(slug, one full-context sequence bytes, reserve)`: the largest reserve stays
+/// unbudgeted and the rest splits in proportion to the sequence bytes.
+fn kv_shares(room: u64, shares: &[(&str, u64, u64)]) -> std::result::Result<Vec<u64>, EnsureError> {
+    let reserve = shares.iter().map(|s| s.2).max().unwrap_or(0);
+    let room = room.saturating_sub(reserve);
+    let need: u64 = shares.iter().map(|s| s.1).sum();
+    if need > room {
+        return Err(EnsureError::NoKvRoom(format!(
+            "co-resident models need {} MiB to admit one full-context sequence each and the \
+             device backs {} MiB beside a {} MiB reserve",
+            need >> 20,
+            room >> 20,
+            reserve >> 20
+        )));
+    }
+    Ok(shares
+        .iter()
+        .map(|s| (room as u128 * s.1 as u128 / need.max(1) as u128) as u64)
+        .collect())
 }
 
 /// `free` after `slug` loaded must still cover what co-resident models claim.
@@ -2470,6 +2545,19 @@ mod tests {
         let e = mgr.load("b", false).await.unwrap_err();
         assert!(matches!(e, EnsureError::WontFit { .. }), "{e}");
         assert_eq!(e.retry_after(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn co_resident_kv_caps_split_the_device_beside_the_largest_reserve() {
+        // 2 x E4B after the second load: 6.4 GiB free, reserves 4.25 / 0.64 GiB.
+        let shares = [("a", 128 << 20, 4352 << 20), ("b", 128 << 20, 651 << 20)];
+        let caps = kv_shares(6554 << 20, &shares).unwrap();
+        assert_eq!(caps, vec![1101 << 20, 1101 << 20]);
+        assert!(caps.iter().sum::<u64>() + (4352 << 20) <= 6554 << 20);
+        let uneven = kv_shares(4 * GIB, &[("a", 3 * GIB / 4, 0), ("b", GIB / 4, GIB)]).unwrap();
+        assert_eq!(uneven, vec![9 * GIB / 4, 3 * GIB / 4]);
+        let e = kv_shares(4400 << 20, &shares).unwrap_err();
+        assert!(matches!(e, EnsureError::NoKvRoom(_)), "{e}");
     }
 
     #[test]

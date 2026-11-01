@@ -2891,6 +2891,12 @@ pub struct GpuEngine {
     kv_admission: Option<crate::sched::admission::KvBudget>,
     /// Free-after-load bytes the admission budget never commits (`free - budget` at load).
     kv_admit_reserve: u64,
+    /// The manager's cap on the admission budget while co-resident engines share the device.
+    kv_budget_cap: Option<u64>,
+    /// Free bytes the prefix cache's pressure eviction keeps (0: not armed).
+    cache_floor: u64,
+    /// The block store's growth floor above `cache_floor` (`None`: the store keeps its floor).
+    store_floor_band: Option<u64>,
     /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
     kv_row_bytes: u64,
     slot_generations: Vec<u32>,
@@ -7530,6 +7536,8 @@ impl GpuEngine {
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
         let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
         let mut store_room = None;
+        let mut cache_floor = 0;
+        let mut store_floor_band = None;
         if let Some(kv) = vmm
             .as_mut()
             .and_then(|v| v.kv.as_mut())
@@ -7539,6 +7547,7 @@ impl GpuEngine {
                 let config = crate::config::RuntimeConfig::get();
                 if let Some(floor) = config.vmm_cache_min_free_bytes(total, Some(free)) {
                     kv.enable_pressure_eviction(floor);
+                    cache_floor = floor;
                     let cache_cap = config.prefix_cache_cap_bytes(total);
                     tracing::info!(
                         floor_mib = floor >> 20,
@@ -7555,6 +7564,7 @@ impl GpuEngine {
                         // the store stops a pool's worth above the floor so that does not
                         // trip the OOM path on every new slot.
                         bs.set_device_floor(floor + (config.kv_pool_mib() << 20));
+                        store_floor_band = Some(config.kv_pool_mib() << 20);
                     }
                 }
             }
@@ -7769,6 +7779,9 @@ impl GpuEngine {
             qwen_ride: 0,
             kv_admission,
             kv_admit_reserve,
+            kv_budget_cap: None,
+            cache_floor,
+            store_floor_band,
             kv_row_bytes: blob
                 .tensors
                 .iter()
@@ -8202,6 +8215,46 @@ impl GpuEngine {
     /// track `held`, and every block mapped past the commitments admitted another sequence
     /// (Qwen3.8-27B 4K c32 at PLOW_KV_MEM_UTIL 0.91: an 11.3 GiB budget ratcheted to 15.9 GiB).
     pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
+        let mut budget = self.kv_admission_uncapped()?;
+        if let Some(cap) = self.kv_budget_cap {
+            budget.budget_bytes = budget.budget_bytes.min(cap);
+        }
+        Some(budget)
+    }
+
+    /// Device bytes this engine's KV holds now: pool blocks and mapped or spare ring units, not
+    /// the block store (it shrinks only under this engine's own pressure).
+    pub fn kv_live_held(&self) -> u64 {
+        let Some(vmm) = self.vmm.as_ref() else {
+            return 0;
+        };
+        let rings = vmm.rings.as_ref().map_or(0, |rings| {
+            rings.stats().mapped_slots as u64 * rings.slot_charge() + rings.spare_bytes()
+        });
+        vmm.kv.as_ref().map_or(0, |kv| kv.mapped_bytes()) + rings
+    }
+
+    /// Co-residency: cap the admission budget at `cap` and keep `keep_free` bytes free of this
+    /// engine's prefix caches, the room the other engines' caps and the shared reserve need.
+    /// `(None, 0)` restores the solo budget and floors.
+    pub fn set_co_tenant(&mut self, cap: Option<u64>, keep_free: u64) {
+        self.kv_budget_cap = cap;
+        if self.cache_floor == 0 {
+            return;
+        }
+        let floor = self.cache_floor.max(keep_free);
+        let Some(vmm) = self.vmm.as_mut() else {
+            return;
+        };
+        if let Some(kv) = vmm.kv.as_mut() {
+            kv.enable_pressure_eviction(floor);
+        }
+        if let (Some(band), Some(bs)) = (self.store_floor_band, vmm.blocks.as_ref()) {
+            bs.set_device_floor(floor + band);
+        }
+    }
+
+    fn kv_admission_uncapped(&self) -> Option<crate::sched::admission::KvBudget> {
         let mut budget = self.kv_admission?;
         let Some(vmm) = self.vmm.as_ref() else {
             return Some(budget);
