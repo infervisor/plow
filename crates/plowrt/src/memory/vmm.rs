@@ -2491,9 +2491,20 @@ impl VmmKv {
 
     pub fn finish_attach(&self, seq: usize) {
         let s = &self.shared;
+        let t0 = std::time::Instant::now();
         let mut inner = s.inner.lock();
+        let t1 = std::time::Instant::now();
         release_snapshot_hold(s, &mut inner, seq);
+        let t2 = std::time::Instant::now();
         trim_cache(s, &mut inner);
+        if crate::config::RuntimeConfig::get().pf_packlog {
+            eprintln!(
+                "PACKLOG FINISH seq={seq} lock_us={} hold_us={} trim_us={}",
+                (t1 - t0).as_micros(),
+                (t2 - t1).as_micros(),
+                t2.elapsed().as_micros()
+            );
+        }
     }
 
     /// Try to attach a cached prefix of `prompt` into `seq`'s windows:
