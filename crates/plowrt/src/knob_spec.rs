@@ -593,12 +593,12 @@ fn renamed_hint(old: &str, new: &str, value: Option<String>) -> String {
     )
 }
 
-/// Refuse a renamed knob still set in the environment, naming the new spelling and value: the
-/// setting is never silently dropped.
-pub fn refuse_renamed_env() -> std::result::Result<(), String> {
+/// Refuse a renamed knob still set in the environment (`env`), naming the new spelling and
+/// value: the setting is never silently dropped.
+pub fn refuse_renamed_env(env: impl Fn(&str) -> Option<String>) -> std::result::Result<(), String> {
     for (old, new, convert) in RENAMED {
-        if let Some(v) = std::env::var_os(old) {
-            return Err(renamed_hint(old, new, convert(&v.to_string_lossy())));
+        if let Some(v) = env(old) {
+            return Err(renamed_hint(old, new, convert(&v)));
         }
     }
     Ok(())
@@ -1347,15 +1347,13 @@ mod tests {
             knob_scope("PLOW_HOST_KVCACHE_SIZE"),
             Some(KnobScope::Engine)
         );
-        // No other test reads the retired name.
-        std::env::set_var("PLOW_VMM_HOST_CACHE_MIB", "65536");
-        let err = refuse_renamed_env().unwrap_err();
-        std::env::remove_var("PLOW_VMM_HOST_CACHE_MIB");
+        let env = |k: &str| (k == "PLOW_VMM_HOST_CACHE_MIB").then(|| "65536".to_string());
+        let err = refuse_renamed_env(env).unwrap_err();
         assert_eq!(
             err,
             "PLOW_VMM_HOST_CACHE_MIB was renamed: use PLOW_HOST_KVCACHE_SIZE=65536MB"
         );
-        assert_eq!(refuse_renamed_env(), Ok(()));
+        assert_eq!(refuse_renamed_env(|_| None), Ok(()));
     }
 
     use plow_asset::knob::test_util::{check_table, env_reads, files, plow_tokens, ArgFacts};

@@ -299,6 +299,17 @@ fn packet_default_under_the_old_host_cache_name_carries_over() {
     );
     let bad = packet_with_defaults("renamed-bad", &[("PLOW_VMM_HOST_CACHE_MIB", "64GB")]);
     assert!(plowrt::asset::serve::asset_env_defaults(&[bad.clone()], |_| None).is_err());
+    let both = packet_with_defaults(
+        "renamed-both",
+        &[
+            ("PLOW_VMM_HOST_CACHE_MIB", "65536"),
+            ("PLOW_HOST_KVCACHE_SIZE", "0"),
+        ],
+    );
+    let got = plowrt::asset::serve::asset_env_defaults(&[both.clone()], |_| None).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].1, "0", "the new spelling wins");
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(bad);
+    let _ = std::fs::remove_dir_all(both);
 }

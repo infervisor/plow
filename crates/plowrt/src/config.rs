@@ -917,7 +917,7 @@ pub struct RuntimeConfig {
     /// LRU: evicted boundaries spill there and attach from there), as `<n>MB` or `<n>GB`
     /// (binary: MiB, GiB; case-insensitive). Unset or `auto` = sized by
     /// `memory::vmm::host_tier_default`: `MemAvailable` minus the host reserve (an eighth of RAM,
-    /// at least 16 GiB), capped at a quarter of RAM; `0` = no host tier.
+    /// at least 16 GiB), capped at a quarter of RAM (AMD: no host tier); `0` = no host tier.
     #[arg(
         long = "host-kvcache-size",
         env = "PLOW_HOST_KVCACHE_SIZE",
@@ -3368,6 +3368,11 @@ impl RuntimeConfig {
         static FALLBACK: OnceLock<RuntimeConfig> = OnceLock::new();
         FALLBACK.get_or_init(|| {
             use clap::Parser;
+            // Fails like the parse below does on a bad value.
+            if let Err(e) = crate::knob_spec::refuse_renamed_env(|k| std::env::var(k).ok()) {
+                eprintln!("plowrt: {e}");
+                std::process::exit(2);
+            }
             #[derive(Parser)]
             struct EnvOnly {
                 #[command(flatten)]

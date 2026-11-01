@@ -1046,7 +1046,7 @@ impl SelectArgs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(e) = plowrt::knob_spec::refuse_renamed_env() {
+    if let Err(e) = plowrt::knob_spec::refuse_renamed_env(|k| std::env::var(k).ok()) {
         eprintln!("plowrt: {e}");
         std::process::exit(2);
     }

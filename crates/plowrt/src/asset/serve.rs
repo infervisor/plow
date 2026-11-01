@@ -400,7 +400,10 @@ pub fn bundle_serve_defaults(dir: &Path) -> Result<Option<(PathBuf, Vec<(String,
         if let Some(renamed) = crate::knob_spec::renamed_serve_default(key, value) {
             let (key, value) =
                 renamed.map_err(|e| RuntimeError::Rejected(format!("{}: {e}", pkt.display())))?;
-            out.push((key, value));
+            // A packet carrying both spellings keeps the new one.
+            if !m.serve_defaults.contains_key(&key) {
+                out.push((key, value));
+            }
             continue;
         }
         if crate::knob_spec::is_removed_env(key) {
