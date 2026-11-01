@@ -1987,10 +1987,16 @@ impl ModelManager {
         let used = (free_before + pool_before).saturating_sub(free_after + pool_after);
         // Sibling packets bind later, outside this measurement.
         let measured = used.saturating_sub(m.plan.tensor_total() - m.plan.sidecar_bytes);
+        // Co-residents keep allocating KV and cache during the load and land in the same delta,
+        // so only a load alone on the device may raise an earlier measurement.
         self.overhead
             .lock()
             .entry(m.dir.clone())
-            .and_modify(|o| *o = (*o).max(measured))
+            .and_modify(|o| {
+                if others == 0 {
+                    *o = (*o).max(measured)
+                }
+            })
             .or_insert(measured);
         tracing::info!(
             slug = %m.slug,
@@ -2019,7 +2025,7 @@ impl ModelManager {
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(EnsureError::Load(e));
         }
-        if let Err(e) = self.claim_kv(&state, &m.slug) {
+        if let Err(e) = crate::config::scoped(Some(cfg), || self.claim_kv(&state, &m.slug)) {
             tracing::warn!(slug = %m.slug, error = %e, "planner: loaded model left without KV room — unloading");
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(e);
@@ -2033,24 +2039,26 @@ impl ModelManager {
     /// one sequence at its full context and the device still leaves every co-resident model
     /// its claim; otherwise record its own claim.
     fn claim_kv(&self, state: &AppState, slug: &str) -> std::result::Result<(), EnsureError> {
-        let Some(engine) = state.gpu_engine(slug) else {
-            return Ok(());
+        let own = match state.gpu_engine(slug) {
+            Some(engine) => {
+                let e = engine.lock();
+                e.kv_admission_budget()
+                    .map(|b| (b, e.kv_admit_reserve(), e.max_ctx()))
+            }
+            None => None,
         };
-        let (budget, reserve, ctx) = {
-            let e = engine.lock();
-            (e.kv_admission_budget(), e.kv_admit_reserve(), e.max_ctx())
-        };
-        let Some(budget) = budget else {
-            return Ok(());
-        };
-        let need = budget.bytes_for_rows(ctx as u64);
-        if need > budget.budget_bytes {
-            return Err(EnsureError::NoKvRoom(format!(
-                "{slug} loaded with a {} MiB KV admission budget and one {ctx}-token sequence \
-                 needs {} MiB",
-                budget.budget_bytes >> 20,
-                need >> 20
-            )));
+        let mut claim = None;
+        if let Some((budget, reserve, ctx)) = own {
+            let need = budget.bytes_for_rows(ctx as u64);
+            if need > budget.budget_bytes {
+                return Err(EnsureError::NoKvRoom(format!(
+                    "{slug} loaded with a {} MiB KV admission budget and one {ctx}-token \
+                     sequence needs {} MiB",
+                    budget.budget_bytes >> 20,
+                    need >> 20
+                )));
+            }
+            claim = Some(reserve + need);
         }
         let free = self.free_vram().map_err(EnsureError::Load)?;
         let mut claims = self.kv_claims.lock();
@@ -2060,7 +2068,9 @@ impl ModelManager {
             .map(|(_, &c)| c)
             .sum();
         check_co_tenant_claims(slug, free, others)?;
-        claims.insert(slug.to_string(), reserve + need);
+        if let Some(claim) = claim {
+            claims.insert(slug.to_string(), claim);
+        }
         Ok(())
     }
 }
