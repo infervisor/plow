@@ -6510,6 +6510,7 @@ impl GpuEngine {
         } else {
             Vec::new()
         };
+        let mut invariant_baked_rungs: Vec<Vec<DevInst64>> = Vec::new();
         let invariant_splits = match invariant_splits {
             Some(reference) if !reference.is_empty() => {
                 let bytes = |h: u16| blob.tensors[usize::from(h)].bytes;
@@ -6519,9 +6520,11 @@ impl GpuEngine {
                     .collect::<std::result::Result<Vec<_>, _>>()
                 {
                     Ok(all) => {
+                        let mut baked = Vec::with_capacity(all.len());
                         for (rung, pinned) in decode_rungs.iter_mut().zip(all) {
-                            rung.set_insts(&be, pinned)?;
+                            baked.push(rung.set_insts(&be, pinned)?);
                         }
+                        invariant_baked_rungs = baked;
                         Some(reference)
                     }
                     Err(e) => {
@@ -7869,7 +7872,17 @@ impl GpuEngine {
             match engine.arm_batch_invariant(&blob) {
                 Ok(()) => engine.batch_invariant = true,
                 Err(e) if invariant_explicit => return Err(e),
-                Err(e) => tracing::warn!(error = %e, "batch-invariant decode unavailable"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "batch-invariant decode unavailable");
+                    // Serve plain decode with the baked split counts, not a half-pinned engine.
+                    if let Some(widest) = unpinned_widest.take() {
+                        engine.be.upload(&engine.d_inst, 0, pod_bytes(&widest))?;
+                        engine.h_inst = widest;
+                    }
+                    for (rung, baked) in engine.decode_rungs.iter_mut().zip(invariant_baked_rungs) {
+                        rung.set_insts(&engine.be, baked)?;
+                    }
+                }
             }
         }
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
@@ -15343,7 +15356,7 @@ impl GpuEngine {
             ));
         }
         // External routes do not consult the interpreter's instruction-cap global.
-        let rung = self.decode_rung(active_slots - 1);
+        let rung = self.decode_rung(active_slots.max(self.debug_min_rows) - 1);
         if limit != u32::MAX
             && rung.map_or_else(
                 || {
@@ -15359,12 +15372,28 @@ impl GpuEngine {
                     .into(),
             ));
         }
-        for gw in self.gemv_wide_modules.iter().flatten() {
-            self.be
-                .module_global_set_u32(gw.module(), "plow_debug_max_inst_gw", limit)?;
+        let mut sibling = false;
+        for gw in self
+            .gemv_wide_modules
+            .iter()
+            .flatten()
+            .chain(&self.gemv_wide)
+            .chain(self.decode_rungs.iter().filter_map(|r| r.object.as_ref()))
+        {
+            sibling |=
+                self.be
+                    .module_global_set_u32(gw.module(), "plow_debug_max_inst_gw", limit)?;
         }
-        self.be
-            .module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
+        let own = self
+            .be
+            .module_global_set_u32(&self.module, "plow_debug_max_inst", limit)?;
+        // Whether the object the selected rung launches honours the cap.
+        Ok(
+            match rung.and_then(|i| self.decode_rungs[i].object.as_ref()) {
+                Some(_) => sibling,
+                None => own,
+            },
+        )
     }
 
     /// Reset the PLOW_NV_TRACE packet counter so [`Self::trace_summary`]
@@ -15384,36 +15413,48 @@ impl GpuEngine {
     /// `plow_batch_invariant` takes its width-independent arms. A packet whose MoE expert sums
     /// depend on the row count needs every decode object to export it.
     fn arm_batch_invariant(&self, blob: &crate::asset::devblob::DevBlob) -> Result<()> {
+        if let Some(op) = blob
+            .decode_progs()
+            .iter()
+            .flat_map(|p| &p.insts)
+            .filter_map(|d| DevOp::from_u16(d.op))
+            .find(|&op| !batch_invariant_op(op))
+        {
+            return Err(RuntimeError::Rejected(format!(
+                "batch-invariant decode: {op:?} has no audited width-independent arm"
+            )));
+        }
         let mut modules = self.decode_trace_modules();
         if let Some((a, b)) = &self.row_slot_twin {
             modules.extend([a.module(), b.module()]);
+        }
+        if let Some(gw) = &self.gemv_wide {
+            modules.push(gw.module());
         }
         modules.extend(
             self.decode_rungs
                 .iter()
                 .filter_map(|r| r.object.as_ref().map(|o| o.module())),
         );
-        let moe = blob.decode_progs().iter().flat_map(|p| &p.insts).any(|d| {
-            matches!(
-                DevOp::from_u16(d.op),
-                Some(DevOp::MoeExpertGluGemmaFp8 | DevOp::MoeExpertDownGemmaFp8)
-            )
-        });
-        for m in modules {
+        // Every object must be built in the audited configuration (it exports the flag only
+        // then); check all before setting any.
+        for m in &modules {
             if self
                 .be
                 .module_global_u32(m, "plow_batch_invariant")?
-                .is_some()
+                .is_none()
             {
-                self.be
-                    .module_global_set_u32(m, "plow_batch_invariant", 1)?;
-            } else if moe {
                 return Err(RuntimeError::Rejected(
-                    "batch-invariant decode: a decode object predates plow_batch_invariant, \
-                     so its MoE expert sums depend on the launch width (rebuild the objects)"
+                    "batch-invariant decode: a decode object does not export \
+                     plow_batch_invariant (built before it, or in a configuration whose \
+                     arms depend on the launch width)"
                         .into(),
                 ));
             }
+        }
+        for m in modules {
+            self.be
+                .module_global_set_u32(m, "plow_batch_invariant", 1)?;
         }
         Ok(())
     }
@@ -15818,6 +15859,28 @@ fn state_slot_views_select_exact_slots() {
 
 #[cfg(test)]
 mod decode_rung_tests;
+
+/// Decode opcodes whose arms are width-independent under `plow_batch_invariant` (rung-diff
+/// audited). Dense ops take one arm per object configuration; MoE ops join only once audited.
+fn batch_invariant_op(op: DevOp) -> bool {
+    !format!("{op:?}").starts_with("Moe")
+        || matches!(
+            op,
+            DevOp::MoeRouterGemmaScoreFast
+                | DevOp::MoeRouterGemmaTopk
+                | DevOp::MoeExpertGluGemmaFp8
+                | DevOp::MoeExpertDownGemmaFp8
+                | DevOp::MoeCombineNormGemma
+        )
+}
+
+#[test]
+fn only_audited_moe_ops_are_batch_invariant() {
+    assert!(batch_invariant_op(DevOp::Gemv));
+    assert!(batch_invariant_op(DevOp::MoeExpertGluGemmaFp8));
+    assert!(!batch_invariant_op(DevOp::MoeRouterGemmaScore));
+    assert!(!batch_invariant_op(DevOp::MoeExpertDownGemma));
+}
 
 #[cfg(test)]
 #[test]

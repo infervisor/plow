@@ -255,4 +255,35 @@ fn vetted_opcodes_list_their_writes() {
         None,
         "cache stores are not vetted"
     );
+    i.i[3] = 0;
+    assert_eq!(vetted_writes(DevOp::HeadNormRope, &i), Some(&[0usize][..]));
+    i.fj[1] = 1024;
+    assert_eq!(
+        vetted_writes(DevOp::HeadNormRope, &i),
+        None,
+        "a cache stride addresses a cache"
+    );
+    i.fj = [0, 0, 1];
+    assert_eq!(
+        vetted_writes(DevOp::GemvGlu, &i),
+        None,
+        "the norm-residual-norm GLU form is not vetted"
+    );
+}
+
+#[test]
+fn rmsnorm_extents_include_the_output_row_offset() {
+    let mut i = DevInst64 {
+        op: DevOp::RmsNorm as u16,
+        blocks: 1,
+        fj: [0; 3],
+        t: [packet::dev::TENSOR_NONE16; 8],
+        i: [0; 8],
+    };
+    i.i[0] = 1;
+    i.i[1] = 16;
+    i.i[2] = 1;
+    assert_eq!(write_extent(DevOp::RmsNorm, &i, 0), Some(64));
+    assert_eq!(write_extent(DevOp::RmsNorm, &i, 3), Some(32));
+    assert_eq!(write_extent(DevOp::RmsNorm, &i, 4), Some(8));
 }

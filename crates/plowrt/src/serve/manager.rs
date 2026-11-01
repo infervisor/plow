@@ -204,9 +204,19 @@ impl BlobPlan {
         let m = Manifest::parse(&bytes)
             .map_err(|e| RuntimeError::Rejected(format!("drafter {}: {e}", dir.display())))?;
         // The runtime's per-drafter buffers: the pointer table, the programs' device tables (no
-        // larger than the programs file) and one hidden snapshot row per slot.
+        // larger than the programs file) plus each program's counters and cursor, and one hidden
+        // snapshot row per slot.
         self.sidecar_bytes += 8 * m.tensors.len() as u64;
-        self.sidecar_bytes += std::fs::metadata(dir.join(PROGRAMS_FILE)).map_or(0, |f| f.len());
+        let pp = dir.join(PROGRAMS_FILE);
+        let programs =
+            std::fs::read(&pp).map_err(|source| RuntimeError::Io { path: pp, source })?;
+        self.sidecar_bytes += programs.len() as u64;
+        let section = plow_asset::aux_program::parse(&programs, m.n_cu, m.tensors.len())
+            .map_err(|e| RuntimeError::Rejected(format!("drafter {}: {e}", dir.display())))?;
+        let ctr = u64::from(packet::dev::CTR_STRIDE) * 4;
+        for p in &section.programs {
+            self.sidecar_bytes += (u64::from(p.n_counter) + 1) * ctr;
+        }
         if let Some(h) = m.draft.tensors.hidden {
             let rows = u64::from(m.draft.tensors.hidden_rows.max(1));
             let row = m.tensors.get(usize::from(h)).map_or(0, |t| t.bytes / rows);
@@ -2352,17 +2362,41 @@ mod tests {
             overhead_bound: 0,
             min_kv_bytes: 0,
         };
-        std::fs::write(
-            dir.join(plow_asset::spec_drafter::PROGRAMS_FILE),
-            [0u8; 100],
-        )
+        let residual = packet::dev::DevInst64 {
+            op: packet::dev::DevOp::Residual as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [8, 6, 0, 1, 2, 3, 4, 5],
+            i: [0; 8],
+        };
+        let entry = packet::dev::StreamEnt::default();
+        let mut stream_ofs = vec![1u32; 132];
+        let mut stream_len = vec![0u32; 132];
+        (stream_ofs[0], stream_len[0]) = (0, 1);
+        let programs = plow_asset::aux_program::Section {
+            n_cu: 132,
+            programs: vec![plow_asset::aux_program::Program {
+                rows: 1,
+                n_counter: 5,
+                insts: vec![residual],
+                stream: vec![entry],
+                stream_ofs,
+                stream_len,
+                waits: vec![],
+                succs: vec![],
+                gq_stream: vec![entry],
+                gq_seg_ofs: vec![0, 1],
+            }],
+        }
+        .encode(m.tensors.len())
         .unwrap();
+        std::fs::write(dir.join(plow_asset::spec_drafter::PROGRAMS_FILE), &programs).unwrap();
         p.add_drafter(&dir, 32).unwrap();
         assert_eq!(
             p.sidecar_bytes,
-            1000 + 6 * 64 + 16 + 10 * 8 + 100 + ((1 << 20) / 16) * 32,
-            "own tensors, the pointer table, the program tables and one hidden snapshot row per \
-             slot; imports alias the target"
+            1000 + 6 * 64 + 16 + 10 * 8 + programs.len() as u64 + 6 * 128 + ((1 << 20) / 16) * 32,
+            "own tensors, the pointer table, the program tables with their counters and cursor, \
+             and one hidden snapshot row per slot; imports alias the target"
         );
         assert_eq!(p.tensor_total(), p.sidecar_bytes);
         assert_eq!(

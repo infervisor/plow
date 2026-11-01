@@ -1499,6 +1499,9 @@ where
             .ok_or(format!("no decode rung {r}"))
     };
     let (pa, pb) = (prog(ra)?, prog(rb)?);
+    if slots > ra.min(rb) {
+        return Err(format!("{slots} slots select a rung above {}", ra.min(rb)).into());
+    }
     if pa.insts.len() != pb.insts.len() {
         return Err("rung programs differ in length".into());
     }
@@ -1539,7 +1542,9 @@ where
         let mut out = Vec::new();
         for r in [ra, rb] {
             e.set_debug_min_rung(r);
-            e.set_debug_max_inst(cap as u32, slots)?;
+            if !e.set_debug_max_inst(cap as u32, slots)? {
+                return Err(format!("rung {r}'s object has no instruction cap").into());
+            }
             for b in 0..slots {
                 e.rewind_slot(b, pos)?;
             }

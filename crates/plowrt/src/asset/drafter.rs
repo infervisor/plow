@@ -348,16 +348,35 @@ pub fn extract(
         shard_names.push(name.to_string_lossy().into_owned());
     }
 
-    let tokenizer = [
-        pin.unwrap_or(assets).join("tokenizer.json"),
+    let tokenizer_facts = |candidates: [PathBuf; 2]| -> Result<TokenizerFacts> {
+        let p = candidates
+            .into_iter()
+            .find(|p| p.is_file())
+            .ok_or_else(|| reject("no tokenizer.json beside the packet or in its checkpoint"))?;
+        TokenizerFacts::from_json(&std::fs::read(&p).map_err(io(&p))?).map_err(reject)
+    };
+    // The drafter's own vocabulary; a pinned target must carry it unchanged.
+    let facts = tokenizer_facts([
         assets.join("tokenizer.json"),
         checkpoint.join("tokenizer.json"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())
-    .ok_or_else(|| reject("no tokenizer.json beside the packet or in its checkpoint"))?;
-    let facts = TokenizerFacts::from_json(&std::fs::read(&tokenizer).map_err(io(&tokenizer))?)
-        .map_err(reject)?;
+    ])?;
+    if let Some(dir) = pin {
+        let t = tokenizer_facts([
+            dir.join("tokenizer.json"),
+            dir.join("checkpoint").join("tokenizer.json"),
+        ])?;
+        if t.vocab_sha256 != facts.vocab_sha256
+            || facts
+                .added_tokens
+                .iter()
+                .any(|(id, c)| t.added_tokens.get(id) != Some(c))
+        {
+            return Err(reject(format!(
+                "the target in {} has a different tokenizer than the drafter's source",
+                dir.display()
+            )));
+        }
+    }
     let target_sha = match pin {
         None => format!("{:x}", sha2::Sha256::digest(&raw)),
         Some(dir) => {

@@ -141,12 +141,19 @@ pub fn vetted_writes(op: DevOp, inst: &DevInst64) -> Option<&'static [usize]> {
         | DevOp::FlashMerge
         | DevOp::Argmax
         | DevOp::ArgmaxFin => &[0],
-        // The plain q form only: a KV row offset (i3), the dynamic row ladder (i6) or the fused
-        // k+v form (i7, which also writes t6) address a cache, not a row-major output.
-        DevOp::HeadNormRope if inst.i[3] == 0 && inst.i[6] == 0 && inst.i[7] == 0 => &[0],
+        // The plain q form only: a KV row offset (i3), a cache stride (fj1), the dynamic row
+        // ladder (i6) or the fused k+v form (i7, which also writes t6) address a cache, not a
+        // row-major output.
+        DevOp::HeadNormRope
+            if inst.i[3] == 0 && inst.fj[1] == 0 && inst.i[6] == 0 && inst.i[7] == 0 =>
+        {
+            &[0]
+        }
         DevOp::RmsNorm => &[0, 3, 4],
-        // Folded prologues (`i[3] != 0`) write their staging operands too: not vetted.
-        DevOp::Gemv | DevOp::GemvGlu if inst.i[3] == 0 => &[0],
+        // Folded prologues (`i[3] != 0`, or GemvGlu's norm-residual-norm form `fj[2] != 0`)
+        // write their staging operands too: not vetted.
+        DevOp::Gemv if inst.i[3] == 0 => &[0],
+        DevOp::GemvGlu if inst.i[3] == 0 && inst.fj[2] == 0 => &[0],
         DevOp::FlashDecodeFp8 => &[0, 1],
         DevOp::NormResidualNorm => &[0, 1],
         _ => return None,
@@ -161,10 +168,11 @@ pub fn write_extent(op: DevOp, inst: &DevInst64, slot: usize) -> Option<u64> {
     let rows = |k: usize| i(k).max(1);
     Some(match (op, slot) {
         (DevOp::Embed | DevOp::RowGather | DevOp::Gemv | DevOp::GemvGlu, 0) => i(0) * i(1) * 2,
-        (DevOp::RmsNorm | DevOp::NormResidualNorm, 0) => i(0) * i(1) * 2,
-        (DevOp::NormResidualNorm, 1) => i(0) * i(1) * 2,
-        (DevOp::RmsNorm, 3) => i(0) * i(1),
-        (DevOp::RmsNorm, 4) => i(0) * 4,
+        // RmsNorm's i2 offsets the output row of all three destinations.
+        (DevOp::RmsNorm, 0) => (i(2) + i(0)) * i(1) * 2,
+        (DevOp::RmsNorm, 3) => (i(2) + i(0)) * i(1),
+        (DevOp::RmsNorm, 4) => (i(2) + i(0)) * 4,
+        (DevOp::NormResidualNorm, 0 | 1) => i(0) * i(1) * 2,
         (DevOp::HeadNormRope, 0) => i(0) * i(1) * i(2) * 2,
         (DevOp::Residual, 0) => i(0) * 2,
         (DevOp::FlashDecodeFp8, 0) => i(0) * i(1) * i(5) * i(6) * 4,

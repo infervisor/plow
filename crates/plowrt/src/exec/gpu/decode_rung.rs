@@ -789,11 +789,15 @@ impl DecodeRung {
         Ok(insts)
     }
 
-    /// Replace the rung's instructions (same length) on the host and the device.
-    pub(super) fn set_insts(&mut self, be: &CudaBackend, insts: Vec<DevInst64>) -> Result<()> {
+    /// Replace the rung's instructions (same length) on the host and the device; returns the
+    /// previous ones.
+    pub(super) fn set_insts(
+        &mut self,
+        be: &CudaBackend,
+        insts: Vec<DevInst64>,
+    ) -> Result<Vec<DevInst64>> {
         be.upload(&self._tables[0], 0, pod_bytes(&insts))?;
-        self.host_insts = insts;
-        Ok(())
+        Ok(std::mem::replace(&mut self.host_insts, insts))
     }
 
     pub(super) fn upload(

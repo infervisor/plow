@@ -824,23 +824,30 @@ pub(crate) fn derive_nv_nsplit(
 
 /// Every decode attention site in program order: a FlashDecode(Fp8) and the FlashMerge that
 /// reads its partials (`t1 == Opart`), if any.
-fn decode_attention_sites(insts: &[DevInst64]) -> Vec<(usize, Option<usize>)> {
+fn decode_attention_sites(insts: &[DevInst64]) -> Result<Vec<(usize, Option<usize>)>, String> {
     let flash = [DevOp::FlashDecode as u16, DevOp::FlashDecodeFp8 as u16];
     let mut sites: Vec<(usize, Option<usize>)> = Vec::new();
     for (k, d) in insts.iter().enumerate() {
         if flash.contains(&d.op) {
             sites.push((k, None));
         } else if d.op == DevOp::FlashMerge as u16 {
+            // The latest producer of the partials is the one this merge reads.
             if let Some(site) = sites
                 .iter_mut()
                 .rev()
-                .find(|(f, m)| m.is_none() && insts[*f].t[0] == d.t[1])
+                .find(|(f, _)| insts[*f].t[0] == d.t[1])
             {
+                if site.1.is_some() {
+                    return Err(format!(
+                        "instruction {k}: a second merge of attention {}'s partials",
+                        site.0
+                    ));
+                }
                 site.1 = Some(k);
             }
         }
     }
-    sites
+    Ok(sites)
 }
 
 /// Batch-invariant decode: give every attention site of `insts` the split count the same site
@@ -853,8 +860,8 @@ pub(crate) fn pin_decode_splits(
     partial_bytes: impl Fn(u16) -> u64,
 ) -> Result<usize, String> {
     let (want, have) = (
-        decode_attention_sites(reference),
-        decode_attention_sites(insts),
+        decode_attention_sites(reference)?,
+        decode_attention_sites(insts)?,
     );
     if want.len() != have.len() {
         return Err(format!(
@@ -1198,5 +1205,13 @@ mod row_field_tests {
         assert!(pin_decode_splits(&reference, &mut other_window, big).is_err());
         let mut fewer = attention(4, 4, 1024).to_vec();
         assert!(pin_decode_splits(&reference, &mut fewer, big).is_err());
+
+        let mut two_merges = attention(4, 4, 1024).to_vec();
+        two_merges.push(two_merges[1]);
+        let mut reference2 = attention(1, 16, 1024).to_vec();
+        reference2.push(reference2[1]);
+        assert!(pin_decode_splits(&reference2, &mut two_merges, big)
+            .unwrap_err()
+            .contains("second merge"));
     }
 }

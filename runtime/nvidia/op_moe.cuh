@@ -215,11 +215,6 @@ __device__ __forceinline__ float plow_moe_act(float g, unsigned act) {
  * MoE ones; only the output map differs (direct weight+scale pointers, no routing table).
  * x is read straight from global (re-read per warp, resident in L1/L2) — matches AMD. */
 
-/* Batch-invariant decode (set by the runtime): every row count takes the B=1 router association,
- * the grouped expert arm and one row's K split, so a row's MoE output never depends on its
- * launch width. */
-extern "C" __device__ unsigned plow_batch_invariant = 0;
-
 /* DENSE_GLU_FP8_BLK (op 47): fu[n] = act(gate_n·x) * (up_n·x), n in [0,N). N=intermediate,
  * K=hidden. Wg/Wu = e4m3[N][K]; Sg/Su = block-scale grids [ceil(N/128)][ceil(K/128)] f32. */
 static __device__ void d_dense_glu_fp8_blk(bf16* __restrict__ fu, const bf16* __restrict__ x,
@@ -489,6 +484,19 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
                                * stage (expert GLU + router score); their STATIC smem adds to the
                                * kernel total, and the runtime only raises the DYNAMIC limit, so
                                * oversizing this drives cuOccupancyMaxActiveBlocks to 0. */
+#endif
+
+/* Batch-invariant decode (set by the runtime): every row count takes the B=1 router association,
+ * the grouped expert arm and one row's K split, so a row's MoE output never depends on its
+ * launch width. Exported only from the configuration those arms were audited in (row-blocked
+ * router, f32 h2 staging, one dense GEMV arm from B=1); any other build keeps the flag a constant
+ * 0 and the runtime refuses invariant decode on it. */
+#if PLOW_NV_GEMV_RB && !PLOW_MOE_ROUTER_WIDE && !PLOW_MOE_XN_BF16 && \
+    (!PLOW_NV_GEMV_MMA || PLOW_NV_GEMV_MMA_B1) && \
+    (!defined(PLOW_NV_FP8_DECODE_TC) || PLOW_NV_FP8_DECODE_TC <= 1)
+extern "C" __device__ unsigned plow_batch_invariant = 0;
+#else
+#define plow_batch_invariant 0u
 #endif
 
 #if PLOW_NV_GEMV_RB
@@ -1079,6 +1087,12 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
 #else
         for (unsigned h = tid; h < H; h += blockDim.x) sr[h] = __bfloat162float(scale[h]) * root;
 #endif
+        /* Invariant: stage the bare scale and apply root last, the B=1 arm's ((x*inv)*s)*root. */
+        const float rt = plow_batch_invariant ? root : 1.0f;
+        if (plow_batch_invariant) {
+            __syncthreads();
+            for (unsigned h = tid; h < H; h += blockDim.x) sr[h] = __bfloat162float(scale[h]);
+        }
         __syncthreads();
         PLOW_TL_PH(1);
         const unsigned nchunk = (H + GV_STEP - 1u) / GV_STEP;
@@ -1106,7 +1120,7 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
                     if (kk[u] >= H) continue;
 #pragma unroll
                     for (int j = 0; j < 8; j++)
-                        acc = fmaf(__bfloat162float(xv[u].x[j]) * invrms * sr[kk[u] + (unsigned)j],
+                        acc = fmaf(__bfloat162float(xv[u].x[j]) * invrms * sr[kk[u] + (unsigned)j] * rt,
                                    __bfloat162float(wv[u].x[j]), acc);
                 }
             }
