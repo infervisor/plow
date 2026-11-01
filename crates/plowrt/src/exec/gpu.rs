@@ -15663,6 +15663,9 @@ mod qwen_tests;
 mod logprob_rows_tests;
 
 #[cfg(test)]
+mod slot_reuse_tests;
+
+#[cfg(test)]
 mod pipe_tests;
 
 #[cfg(test)]
