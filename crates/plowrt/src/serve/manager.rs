@@ -211,7 +211,29 @@ impl BlobPlan {
         // made `serve` reject every placed blob before the engine ever saw it.
         let mut blob = std::borrow::Cow::Borrowed(&image.blob);
         // Plan the bound the engine will load at (`GpuEngine::load` narrows the same way).
-        let narrowed = match crate::config::RuntimeConfig::get().live_ctx_for(dir) {
+        let live_ctx = crate::config::RuntimeConfig::get().live_ctx_for(dir);
+        // The engine rounds the same way (`GpuEngine::load`).
+        #[cfg(feature = "cuda")]
+        let live_ctx = match (live_ctx, device_vmm) {
+            (Some(want), Some((granularity, _))) => {
+                let config = crate::config::RuntimeConfig::get();
+                Some(
+                    if config.nv_vmm_live() || config.nv_vmm_prefix() == Some(true) {
+                        crate::exec::ctx_bound::vmm_live_bound(
+                            &blob,
+                            crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?.as_ref(),
+                            want,
+                            granularity,
+                            u64::from(config.vmm_block_mib()) << 20,
+                        )
+                    } else {
+                        want
+                    },
+                )
+            }
+            (want, _) => want,
+        };
+        let narrowed = match live_ctx {
             Some(want) if crate::exec::ctx_bound::declared_ctx(&blob).is_some_and(|c| want < c) => {
                 crate::exec::ctx_bound::narrow(blob.to_mut(), want)?;
                 true

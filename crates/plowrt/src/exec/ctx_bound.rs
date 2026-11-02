@@ -372,6 +372,57 @@ pub fn rescale(
     Ok(want)
 }
 
+/// The narrowest bound at or above `want` that live KV maps the way it maps the packet's
+/// ceiling: head windows of whole VMM blocks (`VmmGeometry::block_bytes`), or for a cache too
+/// small for that, one slot's span of whole granules (`LiveKvLayout::slot_granular_full`). Any
+/// other bound loads a geometry neither path maps. The ceiling itself when nothing narrower
+/// maps, so a narrowing never turns into a widening; `want` unchanged when it is not a
+/// narrowing or the packet carries no live-KV metadata.
+pub fn vmm_live_bound(
+    blob: &DevBlob,
+    manifest: Option<&plow_asset::live_kv::Manifest>,
+    want: u32,
+    granularity: u64,
+    block_hint: u64,
+) -> u32 {
+    manifest
+        .and_then(|m| crate::memory::vmm::LiveKvLayout::from_manifest(blob, m).ok())
+        .map_or(want, |l| {
+            mappable_bound(&l.geometry, want, granularity, block_hint)
+        })
+}
+
+fn mappable_bound(
+    ceiling: &crate::memory::vmm::VmmGeometry,
+    want: u32,
+    granularity: u64,
+    block_hint: u64,
+) -> u32 {
+    let slot_row = ceiling.row_bytes() * u64::from(ceiling.kvh_full);
+    if want == 0 || want >= ceiling.max_ctx || granularity == 0 || slot_row == 0 {
+        return want;
+    }
+    let mut g = ceiling.clone();
+    let block_mapped = g.block_bytes(granularity, block_hint).is_ok();
+    let (mut a, mut b) = (granularity, slot_row);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    // Both paths need a slot's span in whole granules, so only multiples of `step` can map.
+    let step = u32::try_from(granularity / a).unwrap_or(u32::MAX).max(1);
+    let mut ctx = want.div_ceil(step).saturating_mul(step);
+    while ctx < ceiling.max_ctx {
+        g.max_ctx = ctx;
+        if g.block_bytes(granularity, block_hint).is_ok()
+            || (!block_mapped && (u64::from(ctx) * slot_row) % granularity == 0)
+        {
+            return ctx;
+        }
+        ctx = ctx.saturating_add(step);
+    }
+    ceiling.max_ctx
+}
+
 /// Re-declare `blob` at the live bound `want` (narrowing), returning the bound in force.
 pub fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
     let ceiling = declared_ctx(blob).ok_or_else(|| {
@@ -870,6 +921,45 @@ mod tests {
         m.caches[1].window = 4096;
         let e = widen(&mut b, 16384, Some(&m)).unwrap_err().to_string();
         assert!(e.contains("ring-unsafe"), "{e}");
+    }
+
+    #[test]
+    fn live_bound_keeps_the_vmm_mapping_mode() {
+        const G: u64 = 2 << 20;
+        let geom = |kvh: u32, hd: u32, ctx: u32| crate::memory::vmm::VmmGeometry {
+            full_layers: vec![0],
+            kvh_full: kvh,
+            hd_full: hd,
+            slide_layers: Vec::new(),
+            kvh_slide: 0,
+            hd_slide: 0,
+            window: 0,
+            elem: 2,
+            elem_slide: 2,
+            max_ctx: ctx,
+            batch: 128,
+        };
+        // Small heads (8 x 256 B rows, ceiling 2048): slot-granular; a slot's cache is whole
+        // granules from 1024 rows, so 768 maps nothing below it.
+        let asr = geom(8, 128, 2048);
+        assert_eq!(mappable_bound(&asr, 768, G, G), 1024);
+        assert_eq!(mappable_bound(&asr, 1024, G, G), 1024);
+        assert_eq!(mappable_bound(&asr, 1025, G, G), 2048);
+        assert_eq!(mappable_bound(&asr, 768, 0, G), 768);
+        assert_eq!(mappable_bound(&asr, 0, G, G), 0);
+        assert_eq!(mappable_bound(&asr, 4096, G, G), 4096);
+        // Block-mapped heads (8 x 512 B rows, ceiling 131072) stay block-mapped: 6144 would only
+        // map slot-granular. An 8 MiB hint clamps to the 4 MiB window at 8192.
+        let llm = geom(8, 256, 131_072);
+        assert_eq!(mappable_bound(&llm, 6000, G, G), 8192);
+        assert_eq!(mappable_bound(&llm, 6000, G, 8 << 20), 8192);
+        // A non-pow2 hint clamps to the granule where the window is one granule.
+        assert_eq!(
+            mappable_bound(&geom(1, 128, 24_576), 8192, G, 3 << 20),
+            8192
+        );
+        // Nothing narrower maps: serve the ceiling, never widen.
+        assert_eq!(mappable_bound(&geom(1, 128, 1024), 768, G, G), 1024);
     }
 
     #[test]
