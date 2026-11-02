@@ -218,7 +218,6 @@ impl GpuEngine {
             || (requested.is_none()
                 && (config.nv_vmm_live()
                     || config.nv_vmm_live_rings() == Some(true)
-                    || blob.tp.is_some()
                     || blob.sections.iter().any(|section| {
                         matches!(
                             section.name.as_str(),
@@ -231,7 +230,7 @@ impl GpuEngine {
             return declined(if requested == Some(false) {
                 "PLOW_VMM_PREFIX=0"
             } else {
-                "auto mode: live KV/rings, TP, or a mixed-step/decode-object packet"
+                "auto mode: live KV/rings or a mixed-step/decode-object packet"
             });
         }
         let Some(layout) = Self::vmm_prefix_layout(blob, kv, row_interleaved) else {
@@ -444,13 +443,17 @@ impl GpuEngine {
     }
 
     /// `state_tensors`: the engine's recurrent state tensors (`(devp index, per-slot bytes)`),
-    /// the block store's `State` class; empty for a model without one.
+    /// the block store's `State` class; empty for a model without one. `rank_group`: a
+    /// tensor-parallel rank, whose cache must decide every attach exactly as its peers do —
+    /// no host tier (sized from this process's view of free host RAM, and refilled by a
+    /// background thread).
     pub(super) fn vmm_bringup(
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
         layout: Option<VmmPrefixLayout>,
         live_rings: bool,
         state_tensors: &[(usize, u64)],
+        rank_group: bool,
     ) -> Result<Option<VmmServe>> {
         let Some(VmmPrefixLayout {
             geo,
@@ -567,6 +570,7 @@ impl GpuEngine {
                     let auto = crate::memory::vmm::host_tier_auto();
                     let host_cap =
                         crate::memory::vmm::host_tier_grant(match rt.vmm_host_cache_bytes() {
+                            _ if rank_group => 0,
                             None => auto.map_or(0, |(cap, _)| cap),
                             Some(cap) => cap,
                         });

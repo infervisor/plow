@@ -32,6 +32,8 @@ pub enum Arch {
     CdnaV3,
     /// AMD CDNA 4 (MI350 series). gfx950: 160 KiB LDS, double-K bf16 MFMA.
     CdnaV4,
+    /// AMD RDNA 4 (Radeon AI PRO R9700). gfx1201: WMMA, 64 KiB LDS per CU.
+    RdnaV4,
     /// Apple GPU family 9 (M3). 32 KiB threadgroup memory, `simdgroup_matrix`, no tensor units.
     AppleM3,
     /// Apple GPU family 9 (M4). Same ISA level as M3 (`metal3`); Dynamic Caching.

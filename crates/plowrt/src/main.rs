@@ -280,6 +280,27 @@ enum Cmd {
         xfer_iters: u32,
     },
 
+    /// One worker rank of a process rank group. Started by the serving process for each
+    /// `PLOW_GROUP_DEVICES` entry past the first; not for direct use.
+    #[cfg(feature = "cuda")]
+    #[command(hide = true)]
+    RankWorker {
+        #[arg(long)]
+        rank: u32,
+        #[arg(long)]
+        group_fd: i32,
+        #[arg(long)]
+        link_fd: i32,
+        #[arg(long)]
+        assets: PathBuf,
+        #[arg(long, id = "rank_worker_checkpoint")]
+        checkpoint: PathBuf,
+        /// The leader's command line (JSON list): every rank resolves the same runtime
+        /// configuration from it.
+        #[arg(long)]
+        leader_argv: String,
+    },
+
     /// Bring the AMD/gfx950 engine up on a compiled blob and time decode steps.
     ///
     /// Runs the schedule directly as a diagnostic. Production performance must
@@ -1056,12 +1077,48 @@ impl SelectArgs {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before the runtime starts threads and before the CLI reads the environment.
     let asset_defaults = apply_asset_env_defaults();
+    pin_group_rank0();
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(async_main(asset_defaults));
     plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
     result
+}
+
+/// A rank-group leader is rank 0: pin it to the first `PLOW_GROUP_DEVICES` entry before any
+/// driver initialization (workers get theirs from the leader).
+fn pin_group_rank0() {
+    let Ok(cli) = Cli::try_parse() else { return };
+    if let Some(first) = cli.rt_cfg.group_devices.first() {
+        if let Ok(prev) = std::env::var("CUDA_VISIBLE_DEVICES") {
+            eprintln!("plowrt: PLOW_GROUP_DEVICES overrides CUDA_VISIBLE_DEVICES={prev} with {first}");
+        }
+        std::env::set_var("CUDA_VISIBLE_DEVICES", first);
+    }
+}
+
+/// A rank worker's runtime configuration: the leader's, parsed from its command line in this
+/// process's environment (inherited from the leader, so packet-carried defaults match).
+fn rank_worker_config(cmd: &Cmd) -> Option<RuntimeConfig> {
+    #[cfg(feature = "cuda")]
+    if let Cmd::RankWorker { leader_argv, .. } = cmd {
+        let parsed = serde_json::from_str::<Vec<String>>(leader_argv)
+            .map_err(|e| e.to_string())
+            .and_then(|argv| Cli::try_parse_from(argv).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(mut leader) => {
+                leader.rt_cfg.group_devices.clear();
+                return Some(leader.rt_cfg);
+            }
+            Err(e) => {
+                eprintln!("plowrt rank-worker: unusable leader command line: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let _ = cmd;
+    None
 }
 
 /// How long an exit path waits for queued log lines to reach stdout.
@@ -1165,7 +1222,8 @@ async fn async_main(
     for (key, value, source) in &asset_defaults {
         tracing::info!(%key, %value, %source, "serve default from the assets");
     }
-    RuntimeConfig::init(cli.rt_cfg);
+    let rt_cfg = rank_worker_config(&cli.cmd).unwrap_or(cli.rt_cfg);
+    RuntimeConfig::init(rt_cfg);
     plowrt::config::record_startup(plowrt::config::Startup::from_matches(
         &matches,
         asset_defaults
@@ -1410,6 +1468,18 @@ async fn async_main(
             xfer_mib: None,
             ..
         } => devices(tp, hidden, max_tokens, layers, prefill),
+        #[cfg(feature = "cuda")]
+        Cmd::RankWorker {
+            rank,
+            group_fd,
+            link_fd,
+            assets,
+            checkpoint,
+            ..
+        } => {
+            plowrt::serve::cuda_group::rank_worker_main(rank, group_fd, link_fd, assets, checkpoint)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        }
         Cmd::Pull {
             model,
             pick,
@@ -4410,7 +4480,13 @@ async fn bringup_runtime(
                 specs.push(ModelSpec {
                     slug: slug.clone(),
                     model: slug.clone(),
-                    tp: plowrt::serve::manager::tp_degree(dir)?,
+                    // A process rank group (`PLOW_GROUP_DEVICES`) carries its other ranks'
+                    // devices itself: in this process the model takes one device.
+                    tp: if RuntimeConfig::get().group_devices.len() > 1 {
+                        1
+                    } else {
+                        plowrt::serve::manager::tp_degree(dir)?
+                    },
                     required: plan.required(plan.overhead_bound) + plowrt::serve::manager::RESERVE,
                     device: None,
                 });

@@ -190,10 +190,10 @@ const HSA_AMD_MEMORY_TYPE_PINNED: u32 = 1;
 // hsa_access_permission_t
 const HSA_ACCESS_PERMISSION_RW: u32 = 3;
 
-// hsa_amd_memory_pool_global_flag_t
-const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 1 << 1;
-const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED: u32 = 1 << 0;
-const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1 << 2;
+// hsa_amd_memory_pool_global_flag_t (hsa_ext_amd.h)
+const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1;
+const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED: u32 = 2;
+const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 4;
 
 // hsa_queue_type_t
 const HSA_QUEUE_TYPE_SINGLE: u32 = 1;
@@ -1054,6 +1054,10 @@ pub struct HsaBackend {
     /// copies name it.
     cpu_agent: HsaAgent,
     vram_pool: HsaMemoryPool,
+    /// Cross-rank TP buffers: the agent's fine-grained VRAM pool where it has one (CDNA), the
+    /// coarse pool otherwise (gfx12 exposes only coarse VRAM; its PCIe peer system-scope
+    /// atomics were measured correct on it).
+    peer_pool: HsaMemoryPool,
     fine_pool: HsaMemoryPool,
     kernarg_pool: HsaMemoryPool,
     queue: *mut HsaQueue,
@@ -1394,11 +1398,15 @@ impl HsaBackend {
         // *dynamic* budget opted into with `cuFuncSetAttribute` and has no
         // bearing here: the AMD interpreter's arena is `__shared__ plow_smem sm`,
         // static, and every dispatch passes `dynamic_lds = 0`.)
-        const CDNA_WORKGROUP_LDS_MAX: u32 = 160 * 1024;
+        // Only gfx950 (CDNA4) raised the per-workgroup ceiling; gfx942 and gfx12 cap at 64 KiB.
+        const CDNA4_WORKGROUP_LDS_MAX: u32 = 160 * 1024;
+        const WORKGROUP_LDS_MAX: u32 = 64 * 1024;
         let lds_bytes = if reg_acc.lds_bytes > 0 {
             reg_acc.lds_bytes
+        } else if device_name.starts_with("gfx950") {
+            CDNA4_WORKGROUP_LDS_MAX
         } else {
-            CDNA_WORKGROUP_LDS_MAX
+            WORKGROUP_LDS_MAX
         };
 
         // Find coarse-grained VRAM pool on this GPU.
@@ -1410,6 +1418,8 @@ impl HsaBackend {
             host_agent,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED,
         )?;
+        let peer_pool = Self::find_pool(&drv, agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED)
+            .unwrap_or(vram_pool);
         // Find kernarg pool on the host agent.
         let kernarg_pool = Self::find_pool(
             &drv,
@@ -1538,12 +1548,9 @@ impl HsaBackend {
         );
         let shared = Arc::new(SharedDriver { drv });
 
-        // CDNA (gfx8xx, gfx9xx) is wave64; RDNA (gfx10xx, gfx11xx) is wave32.
-        let wave_width = if device_name.starts_with("gfx9") || device_name.starts_with("gfx8") {
-            64
-        } else {
-            32
-        };
+        // Every plow AMD object is built wave64; RDNA (gfx10+) objects run in wave64 mode
+        // (-mwavefrontsize64), so the dispatch width is 64 lanes per wave on every arch.
+        let wave_width = 64;
 
         Ok(HsaBackend {
             shared,
@@ -1553,6 +1560,7 @@ impl HsaBackend {
             agents,
             cpu_agent: host_agent,
             vram_pool,
+            peer_pool,
             fine_pool,
             kernarg_pool,
             queue,
@@ -2286,14 +2294,12 @@ impl PeerMemory for HsaBackend {
             })?);
         }
 
-        // COARSE-grained VRAM, exactly as an ordinary weight/activation
-        // allocation: fine-grained would put the partials on the slow
-        // host-coherent path, and the whole point is that a peer store runs at
-        // the ~58 GB/s XGMI wire rate.
+        // `peer_pool`: the fine-grained VRAM every CDNA TP run has used (system-scope
+        // atomics on coarse memory carry no coherence guarantee there).
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_pool_allocate)(
-                self.vram_pool,
+                self.peer_pool,
                 bytes as usize,
                 0,
                 &mut ptr,

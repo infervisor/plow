@@ -934,8 +934,10 @@ fn glu_era_inventory() -> &'static kernelcaps::Inventory {
     const RUNGS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall];
     static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static RDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     let cell = match amd_target::active().1 {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
@@ -1059,8 +1061,10 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
     use std::sync::OnceLock;
     static CDNA3: OnceLock<GemmMeasurements> = OnceLock::new();
     static CDNA4: OnceLock<GemmMeasurements> = OnceLock::new();
+    static RDNA4: OnceLock<GemmMeasurements> = OnceLock::new();
     let slot = match amd_target::active().1 {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     slot.get_or_init(|| {
@@ -1295,7 +1299,7 @@ mod amd_target {
     pub fn set_for(arch: &str, gpu: &str) {
         if let Some(spec) = hwspec::registry::lookup(gpu) {
             if let Some(isa) = IsaLevel::from_spec(spec) {
-                if matches!(isa, IsaLevel::Gfx942 | IsaLevel::Gfx950) {
+                if matches!(isa, IsaLevel::Gfx942 | IsaLevel::Gfx950 | IsaLevel::Gfx1201) {
                     ACTIVE.with(|a| a.set(Some((spec, isa))));
                     return;
                 }
@@ -1306,12 +1310,13 @@ mod amd_target {
         } else if hwspec::registry::lookup(gpu).is_none() {
             format!("--gpu {gpu} is not in the hwspec registry")
         } else {
-            format!("--gpu {gpu} is not a CDNA part")
+            format!("--gpu {gpu} is not a CDNA/RDNA4 part")
         };
         // Fall back to the arch the caller DID state, rather than to a constant.
         let (sku, isa) = match arch {
             "gfx942" => ("MI300X", IsaLevel::Gfx942),
             "gfx950" => ("MI350X", IsaLevel::Gfx950),
+            "gfx1201" => ("R9700", IsaLevel::Gfx1201),
             _ => {
                 eprintln!(
                     "warning: {why} and --arch {arch:?} names no CDNA part; AMD tiles will be \
@@ -1689,8 +1694,10 @@ fn amd_gemm_inventory(isa: hwspec::IsaLevel) -> &'static kernelcaps::Inventory {
     use std::sync::OnceLock;
     static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static RDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     let cell = match isa {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
@@ -1879,8 +1886,10 @@ fn amd_gemm_inventory(isa: hwspec::IsaLevel) -> &'static kernelcaps::Inventory {
     use std::sync::OnceLock;
     static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static RDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     let cell = match isa {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
@@ -2015,6 +2024,9 @@ struct Tn {
     // and XReduce sums the N peers' slots into `og`/`dg`. TENSOR_NONE when tp==1.
     og_tp: u32,
     dg_tp: u32,
+    /// The third peer slot (`2 * slot_b`): the routed-expert partial of a tensor-parallel MoE
+    /// layer, reduced before its post-FFN norm. TENSOR_NONE unless tp > 1 and MoE.
+    mg_tp: u32,
     kc: Vec<u32>,
     vc: Vec<u32>,
     // fp8-KV: per-(token,kv_head) f32 dequant scales, one per KV row (TENSOR_NONE in bf16 mode).
@@ -2207,6 +2219,23 @@ fn declare(
         "--tp {tp} must divide intermediate {}",
         c.inter
     );
+    // Tensor-parallel MoE slices every expert's intermediate: each rank runs the same routed
+    // experts over moe_inter/tp channels, so the expert GEMMs keep their K%16 (fp8/W8A8 staging)
+    // contract on the local width. MXFP4 microscale blocks would split mid-block below 32.
+    if c.moe && tp > 1 {
+        assert_eq!(
+            c.moe_inter % (tp * 16),
+            0,
+            "--tp {tp}: MoE intermediate {} must split into 16-aligned rank slices",
+            c.moe_inter
+        );
+        // The routed prefill library route fuses the combine with the post-FFN norm, which
+        // under TP must wait for the cross-rank reduction.
+        assert!(
+            !emit_config::active().moe_pf_lt,
+            "PLOW_EMIT_MOE_PF_LT: the routed MoE library route is single-rank only"
+        );
+    }
     // GEMV 8-wide load contract (runtime/nvidia/op_gemm.cuh): the decode GEMV family loads the
     // contraction dim (K) in 8-element vectors guarded only by `k < K`, so a K that is not a
     // multiple of 8 over-reads the final vector past the row. Every dim that becomes a GEMV K —
@@ -2588,6 +2617,12 @@ fn declare(
         } else {
             TENSOR_NONE
         },
+        mg_tp: if tp > 1 && c.moe {
+            // Slot 2 keeps the loaders' existing name for it (`act.ug_tp`).
+            ac(b, "ug_tp", (rows * c.hidden) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
         // MoE decode scratch (B=1). Only for the 26B-A4B MoE path; TENSOR_NONE otherwise so the
         // dense 12B/31B blob stays byte-identical. Sized by ONE token (decode); mfu/part are [k,·].
         // moe_rows scales the per-token MoE scratch (1 for decode, chunk `rows` for grouped prefill).
@@ -2612,7 +2647,7 @@ fn declare(
             TENSOR_NONE
         },
         moe_mfu: if c.moe {
-            ac(b, "moe.mfu", (dbatch * c.top_k * c.moe_inter) as u64 * BF16)
+            ac(b, "moe.mfu", (dbatch * c.top_k * (c.moe_inter / c.tp)) as u64 * BF16)
         } else {
             TENSOR_NONE
         },
@@ -2622,7 +2657,9 @@ fn declare(
             TENSOR_NONE
         },
         moe_sum: if c.moe {
-            ac(b, "moe.sum", c.hidden as u64 * BF16)
+            // Under TP it holds the reduced routed sum of every row.
+            let r = if tp > 1 { moe_rows } else { 1 };
+            ac(b, "moe.sum", (r * c.hidden) as u64 * BF16)
         } else {
             TENSOR_NONE
         },
@@ -2659,12 +2696,18 @@ fn declare(
             TENSOR_NONE
         },
         moe_fug: if moe_pf_on {
-            ac(b, "moe.fug", (total_pad * c.moe_inter) as u64 * BF16)
+            ac(b, "moe.fug", (total_pad * (c.moe_inter / c.tp)) as u64 * BF16)
         } else {
             TENSOR_NONE
         },
         moe_fuq: if moe_pf_on && w8a8 {
-            ac(b, "moe.fuq", (total_pad * c.moe_inter) as u64) // e4m3, 1 byte/elt
+            // e4m3, 1 byte/elt; also stages the [rows, hidden] xn2 quant, which outgrows the
+            // gathered intermediate once TP narrows it.
+            ac(
+                b,
+                "moe.fuq",
+                ((total_pad * (c.moe_inter / c.tp)).max(moe_rows * c.hidden)) as u64,
+            )
         } else {
             TENSOR_NONE
         },
@@ -2852,11 +2895,15 @@ fn declare(
         // (the SM indexes them through the ewt pointer table), so the handles are discarded here.
         let mut ex4 = [TENSOR_NONE; 4];
         if c.moe && in_block {
-            let gu_n = (c.n_exp * 2 * c.moe_inter) as u64;
+            assert!(
+                !(mx4 && c.tp > 1),
+                "MXFP4 experts are not sliced for tensor parallelism"
+            );
+            let gu_n = (c.n_exp * 2 * (c.moe_inter / c.tp)) as u64;
             let dn_n = (c.n_exp * c.hidden) as u64;
             if mx4 {
                 let gu = gu_n * c.hidden as u64;
-                let dn = dn_n * c.moe_inter as u64;
+                let dn = dn_n * (c.moe_inter / c.tp) as u64;
                 ex4 = [
                     b.tensor(
                         &format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj"),
@@ -2886,7 +2933,7 @@ fn declare(
                 );
                 b.tensor(
                     &format!("fp8/{prefix}layers.{l}.experts.down_proj"),
-                    dn_n * c.moe_inter as u64,
+                    dn_n * (c.moe_inter / c.tp) as u64,
                 );
                 b.tensor(
                     &format!("fp8/{prefix}layers.{l}.experts.down_proj_scale"),
@@ -2894,7 +2941,7 @@ fn declare(
                 );
             } else {
                 w(b, "experts.gate_up_proj", gu_n * c.hidden as u64 * BF16);
-                w(b, "experts.down_proj", dn_n * c.moe_inter as u64 * BF16);
+                w(b, "experts.down_proj", dn_n * (c.moe_inter / c.tp) as u64 * BF16);
             }
         }
         // FP8 decode twin of a projection: the quantized weight (1 byte/elt) under an "fp8/" name
@@ -3837,6 +3884,48 @@ fn emit_xreduce(
     )
 }
 
+/// The routed-expert half of a tensor-parallel Gemma MoE layer after its down GEMM. Each rank
+/// holds `part[rows][k][H]` over its slice of the expert intermediate, so the sum over the k
+/// selected experts is a partial: sum it into the rank's third peer slot (bf16), all-reduce it
+/// into `moe_sum`, then `moe_comb = h1 + RMSNorm(moe_sum, g_pf2)` — the reduction must precede
+/// the norm, which is nonlinear. Replaces the fused combine+norm packet at tp == 1.
+#[allow(clippy::too_many_arguments)]
+fn emit_moe_tp_reduce(
+    b: &mut Builder,
+    xgate: &mut u32,
+    decode: bool,
+    xr_cus: &[u32],
+    deps: &[u32],
+    n: &Tn,
+    g_pf2: u32,
+    t: u32,
+    c: &Cfg,
+    tp: u32,
+    slot_b: u32,
+) -> u32 {
+    let elems = t * c.hidden;
+    let cus: Vec<u32> = (0..elems.div_ceil(4096).clamp(1, b.n_cu())).collect();
+    let c_sum = b.emit(DevOp::MoeCombinePf, cus, deps, |d| {
+        d.t[0] = n.mg_tp;
+        d.t[3] = n.moe_part;
+        d.i[0] = c.hidden;
+        d.i[1] = c.top_k;
+        d.i[2] = t;
+    });
+    let c_red = emit_xreduce(b, xgate, decode, xr_cus, c_sum, n.moe_sum, elems, tp, 2 * slot_b);
+    let rows: Vec<u32> = (0..t.min(b.n_cu()).max(1)).collect();
+    b.emit(DevOp::NormResidual, rows, &[c_red], |d| {
+        d.t[0] = n.moe_comb;
+        d.t[1] = n.moe_h1;
+        d.t[2] = n.moe_sum;
+        d.t[3] = g_pf2;
+        d.i[0] = t;
+        d.i[1] = c.hidden;
+        d.f[0] = c.eps;
+        d.f[1] = 1.0;
+    })
+}
+
 /// [`emit_xreduce`] for the decode one-shot with the K3 latent `MoeCombine` folded into the
 /// publish (lever L4, `PLOW_XR_COMBINE_FOLD`): the packet depends on the DOWN producers directly,
 /// carries the `[k, elems]` f32 slot partials in `t1` and `k` in `i7`, and the tagged publish
@@ -3920,7 +4009,7 @@ fn emit_xreduce_twoshot_band(
         d.i[0] = elems;
         d.i[1] = tp;
         d.i[2] = slot; // the REGION base (0 or slot_b) — never band-advanced: the loader
-                       // infers the blob's slot_bytes as max(i2) (asset/devblob.rs), so a
+                       // infers the blob's slot_bytes as the smallest nonzero i2 (asset/devblob.rs), so a
                        // band offset here would inflate it and shift the second partial's
                        // binding. The dispatch derives the band's window offset from e0.
         d.i[3] = gate_rs;
@@ -6948,7 +7037,7 @@ fn emit_phase(
                         d.t[3] = w.egu8;
                         d.t[4] = w.egus;
                         d.i[0] = c.top_k;
-                        d.i[1] = c.moe_inter;
+                        d.i[1] = c.moe_inter / c.tp;
                         d.i[2] = c.hidden;
                         d.i[3] = c.n_exp;
                         d.i[4] = 1;
@@ -6963,7 +7052,7 @@ fn emit_phase(
                         d.t[4] = w.edns;
                         d.i[0] = c.top_k;
                         d.i[1] = c.hidden;
-                        d.i[2] = c.moe_inter;
+                        d.i[2] = c.moe_inter / c.tp;
                         d.i[3] = c.n_exp;
                         d.i[6] = nb;
                     })]
@@ -6993,7 +7082,7 @@ fn emit_phase(
                                 d.t[3] = w.ewt;
                                 d.t[4] = w.est;
                                 d.i[0] = c.top_k;
-                                d.i[1] = c.moe_inter;
+                                d.i[1] = c.moe_inter / c.tp;
                                 d.i[2] = c.hidden;
                                 d.i[3] = c.n_exp;
                                 d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
@@ -7045,7 +7134,7 @@ fn emit_phase(
                             // operands across rungs, else it keeps widest-only execution.
                             d.t[5] = n.moe_xn2;
                             d.i[0] = c.top_k;
-                            d.i[1] = c.moe_inter;
+                            d.i[1] = c.moe_inter / c.tp;
                             d.i[2] = c.hidden;
                             d.i[3] = c.n_exp;
                             d.i[5] = nb; // BATCH B (0 at B=1)
@@ -7075,7 +7164,7 @@ fn emit_phase(
                         d.t[4] = w.est;
                         d.i[0] = c.top_k;
                         d.i[1] = c.hidden;
-                        d.i[2] = c.moe_inter;
+                        d.i[2] = c.moe_inter / c.tp;
                         d.i[3] = c.n_exp;
                         d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
                         if let Some(min) = moe_dec_group {
@@ -7096,12 +7185,14 @@ fn emit_phase(
                 // drift vs the pair). The NVIDIA body is now op70's body + NRN's body in one CTA
                 // (b staged in smem), bit-exact to the pair by construction. Opt in:
                 // PLOW_GEMMA_MOE_TAIL_FUSE=1.
-                let tail_fuse = emit_config::active().gemma_moe_tail_fuse;
+                let tail_fuse = emit_config::active().gemma_moe_tail_fuse && tp == 1;
                 // op72 IS batched now (op_moe.cuh: per-row block loop, `part` rows k*H apart),
                 // so the old B=1-only assert is gone. At B=1 it still emits one block and runs
                 // one row, so the B=1 program is unchanged and the fusion can be A/B'd at C1
                 // without the batching being a second variable.
-                let c_comb = if gfuse && tail_fuse {
+                let c_comb = if tp > 1 {
+                    emit_moe_tp_reduce(b, &mut xgate, decode, &xr_cus, &comb_deps, &n, w.g_pf2, t, c, tp, slot_b)
+                } else if gfuse && tail_fuse {
                     // op72: fused combine + post_ffn norm + sandwich residual + NEXT input norm.
                     // One 1-block packet replaces the (op70, NormResidualNorm) pair on the layer
                     // tail — the chain next-QKV gates on loses a packet boundary. Bit-exact.
@@ -7243,7 +7334,7 @@ fn emit_phase(
                     let xn2_bytes = t as u64 * c.hidden as u64;
                     assert!(
                         xn2_bytes <= fuq_bytes,
-                        "moe.fuq ({fuq_bytes} B = total_pad*moe_inter) cannot stage xn2 e4m3 ({t} rows x {} = {xn2_bytes} B)",
+                        "moe.fuq ({fuq_bytes} B = max(total_pad*moe_inter_local, rows*hidden)) cannot stage xn2 e4m3 ({t} rows x {} = {xn2_bytes} B)",
                         c.hidden
                     );
                     let c_xn2q = quant(b, n.moe_fuq, n.moe_xas, n.moe_xn2, c.hidden, c_xn2);
@@ -7259,7 +7350,7 @@ fn emit_phase(
                             d.t[4] = n.moe_rowtok;
                             d.t[5] = n.moe_xas; // per-token a_scale
                             d.t[6] = w.est; // per-channel weight scales
-                            d.i[0] = c.moe_inter;
+                            d.i[0] = c.moe_inter / c.tp;
                             d.i[1] = c.hidden;
                             d.i[2] = c.n_exp;
                             d.i[5] = c.mlp_act;
@@ -7271,7 +7362,7 @@ fn emit_phase(
                         d.t[1] = n.moe_fug;
                         d.t[2] = n.moe_fus;
                         d.i[0] = moe_total_pad;
-                        d.i[1] = c.moe_inter;
+                        d.i[1] = c.moe_inter / c.tp;
                     });
                     b.emit(
                         DevOp::MoeGroupDownGemmaPfW8a8,
@@ -7287,7 +7378,7 @@ fn emit_phase(
                             d.t[6] = w.est;
                             d.t[7] = n.moe_fus; // per-row fu scale
                             d.i[0] = c.hidden;
-                            d.i[1] = c.moe_inter;
+                            d.i[1] = c.moe_inter / c.tp;
                             d.i[2] = c.n_exp;
                         },
                     )
@@ -7301,7 +7392,7 @@ fn emit_phase(
                         d.t[3] = w.egus;
                         d.t[4] = n.moe_meta;
                         d.t[5] = n.moe_rowtok;
-                        d.i[0] = c.moe_inter;
+                        d.i[0] = c.moe_inter / c.tp;
                         d.i[1] = c.hidden;
                         d.i[2] = c.n_exp;
                         d.i[3] = 1;
@@ -7316,7 +7407,7 @@ fn emit_phase(
                         d.t[6] = n.moe_rowpart;
                         d.t[7] = n.moe_rowgate;
                         d.i[0] = c.hidden;
-                        d.i[1] = c.moe_inter;
+                        d.i[1] = c.moe_inter / c.tp;
                         d.i[2] = c.n_exp;
                     })
                 } else {
@@ -7330,7 +7421,7 @@ fn emit_phase(
                             d.t[2] = w.ewt;
                             d.t[3] = n.moe_meta;
                             d.t[4] = n.moe_rowtok;
-                            d.i[0] = c.moe_inter;
+                            d.i[0] = c.moe_inter / c.tp;
                             d.i[1] = c.hidden;
                             d.i[2] = c.n_exp;
                             d.i[5] = c.mlp_act; // 0 GeGLU (Gemma)
@@ -7349,13 +7440,16 @@ fn emit_phase(
                             d.t[4] = n.moe_rowpart;
                             d.t[5] = n.moe_rowgate;
                             d.i[0] = c.hidden;
-                            d.i[1] = c.moe_inter;
+                            d.i[1] = c.moe_inter / c.tp;
                             d.i[2] = c.n_exp;
                         },
                     )
                 };
                 // T-row combine + sandwich: out[t] = RMSNorm(Σ_slot part[t][slot], g_pf2) + h1[t].
-                let c_comb = b.emit(
+                let c_comb = if tp > 1 {
+                    emit_moe_tp_reduce(b, &mut xgate, decode, &xr_cus, &[c_dn, c_h1], &n, w.g_pf2, t, c, tp, slot_b)
+                } else {
+                    b.emit(
                     DevOp::MoeCombineNormGemmaPf,
                     all.clone(),
                     &[c_dn, c_h1],
@@ -7369,7 +7463,8 @@ fn emit_phase(
                         d.i[2] = t;
                         d.f[0] = c.eps;
                     },
-                );
+                    )
+                };
                 (n.moe_comb, c_comb)
             }
         } else {

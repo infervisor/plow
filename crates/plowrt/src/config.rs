@@ -799,6 +799,18 @@ pub struct RuntimeConfig {
     )]
     pub devices: Vec<(Option<hwspec::Vendor>, u32)>,
 
+    /// Devices of a process rank group, in rank order: one `CUDA_VISIBLE_DEVICES` value per rank
+    /// (a GPU index or UUID, or a MIG instance UUID), e.g. `MIG-a,MIG-b`. A tensor- or
+    /// pipeline-parallel packet is served by one process per device: this process takes the
+    /// first and starts a worker for each other one. Unset = no group (single-device packets).
+    #[arg(
+        long = "group-devices",
+        env = "PLOW_GROUP_DEVICES",
+        value_delimiter = ',',
+        global = true
+    )]
+    pub group_devices: Vec<String>,
+
     /// How models are laid out over the visible devices: `spread` (one model
     /// per GPU where possible), `pack` (fill a GPU while models fit), or
     /// `explicit` (every model must name its device).

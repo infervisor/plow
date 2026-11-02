@@ -12469,7 +12469,7 @@ impl AmdEngine {
                 (Some(t), "act.og_tp") => Some(t.scratch_base),
                 (Some(t), "act.dg_tp") => Some(t.scratch_base + t.slot_b),
                 // Slot 2, the GATHER slot: a column-parallel partial the reduce out of
-                // slot 0 folds in (`PARTIAL_SLOTS`). Only K3's LatentMoE declares it.
+                // slot 0 folds in (`PARTIAL_SLOTS`) for K3's LatentMoE; Gemma-4 MoE's routed partial.
                 (Some(t), "act.ug_tp") => Some(t.scratch_base + 2 * t.slot_b),
                 // Slots 3/4/5: the sequence-parallel seams' band results (normed hidden,
                 // latent xe, route table), all-gathered by op 26. K3 declares them only

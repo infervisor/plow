@@ -2976,6 +2976,45 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
 }
 
 impl CudaBackend {
+    /// Page-lock a caller-owned, page-aligned host mapping (shared between processes) and map
+    /// it for device access; returns its device address. Pair with [`Self::host_unregister`].
+    ///
+    /// # Safety
+    /// `p..p+len` must stay mapped until `host_unregister(p)`.
+    pub unsafe fn host_register_shared(&self, p: *mut u8, len: usize) -> Result<u64> {
+        self.bind()?;
+        self.check(
+            unsafe {
+                (self.api.cuMemHostRegister_v2)(
+                    p.cast(),
+                    len,
+                    MEMHOSTREGISTER_PORTABLE | MEMHOSTREGISTER_DEVICEMAP,
+                )
+            },
+            "cuMemHostRegister(rank group)",
+        )?;
+        let mut dp: CUdeviceptr = 0;
+        // SAFETY: `p` is registered above; out-pointer for its device address.
+        let rc = unsafe { (self.api.cuMemHostGetDevicePointer_v2)(&mut dp, p.cast(), 0) };
+        if let Err(e) = self.check(rc, "cuMemHostGetDevicePointer(rank group)") {
+            // SAFETY: registered above, released once.
+            unsafe { (self.api.cuMemHostUnregister)(p.cast()) };
+            return Err(e);
+        }
+        Ok(dp)
+    }
+
+    /// Undo [`Self::host_register_shared`].
+    ///
+    /// # Safety
+    /// `p` was registered by `host_register_shared` and no device work still uses it.
+    pub unsafe fn host_unregister(&self, p: *mut u8) {
+        if self.bind().is_ok() {
+            // SAFETY: per the contract.
+            unsafe { (self.api.cuMemHostUnregister)(p.cast()) };
+        }
+    }
+
     fn copy_tier_mut<'a>(&self, tier: &'a mut Option<CopyTier>) -> Result<&'a mut CopyTier> {
         if tier.is_none() {
             *tier = Some(CopyTier {

@@ -7,6 +7,8 @@ pub mod chat;
 pub mod completion;
 pub mod config;
 pub mod cosched;
+#[cfg(feature = "cuda")]
+pub mod cuda_group;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
 pub mod deadlines;
@@ -37,7 +39,7 @@ pub mod portable;
 pub mod reasoning;
 pub mod reply_guard;
 pub mod session;
-#[cfg(all(test, any(feature = "hsa", feature = "cpu")))]
+#[cfg(all(test, any(feature = "hsa", feature = "cpu", feature = "cuda")))]
 mod step_lowering_tests;
 pub mod stream;
 pub mod template;

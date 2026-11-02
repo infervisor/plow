@@ -199,10 +199,10 @@ fn take<T: Copy>(buf: &[u8], off: &mut usize, n: usize, what: &str) -> Result<Ve
 /// * `hidden` — `i[0] / program.t` for every collective. Both one-shot and
 ///   two-shot packets carry `t·width`; the maximum width is the model hidden
 ///   size when narrower latent collectives are also present.
-/// * `slot_bytes` — `max(i[2])`, because slot A carries 0 and slot B carries the
-///   offset. `devgen` derives it from the LARGEST prefill chunk and bakes the
-///   same value into every program, so the max over all of them is that one
-///   value and not a per-program quantity.
+/// * `slot_bytes` — the smallest nonzero `i[2]`: slot A carries 0, slot B the
+///   offset and slot C (a tensor-parallel MoE layer's routed partial) twice it.
+///   `devgen` derives it from the LARGEST prefill chunk and bakes the same value
+///   into every program, so it is one value and not a per-program quantity.
 fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
     let (mut n_gpu, mut hidden, mut slot_bytes) = (0u32, 0u32, 0u64);
     for p in progs {
@@ -212,7 +212,9 @@ fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
             }
             n_gpu = n_gpu.max(d.i[1]);
             hidden = hidden.max(d.i[0] / p.t.max(1));
-            slot_bytes = slot_bytes.max(d.i[2] as u64);
+            if d.i[2] != 0 && (slot_bytes == 0 || (d.i[2] as u64) < slot_bytes) {
+                slot_bytes = d.i[2] as u64;
+            }
         }
     }
     // A tp==1 blob emits no collective at all, so "no collective" and "not

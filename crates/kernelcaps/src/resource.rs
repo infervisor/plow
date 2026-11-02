@@ -101,7 +101,7 @@ impl ResourceGate {
 
     pub fn for_isa(isa: IsaLevel) -> Self {
         match isa {
-            IsaLevel::Gfx942 | IsaLevel::Gfx950 => ResourceGate::AMD_INTERP,
+            IsaLevel::Gfx942 | IsaLevel::Gfx950 | IsaLevel::Gfx1201 => ResourceGate::AMD_INTERP,
             _ => ResourceGate::NVIDIA,
         }
     }

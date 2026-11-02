@@ -668,6 +668,8 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as model_class
     elif cfg.model_type == "qwen3":  # dense Qwen3
         from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as model_class
+    elif cfg.model_type == "llama":  # dense Llama (small functional-gate models)
+        from transformers.models.llama.modeling_llama import LlamaForCausalLM as model_class
     else:
         from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedForCausalLM as model_class
     cfg._attn_implementation = "sdpa"
