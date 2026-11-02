@@ -982,12 +982,30 @@ impl AppState {
     /// shares nothing, so its turn stays free unless `--co-sched` says otherwise. The
     /// process-wide mode ([`policy::installed_co_sched`]) is the most-shared group's.
     pub fn install_group_turns(&self, tenants: &[usize], cuda: bool) {
+        let groups: Vec<(Option<usize>, bool)> = tenants.iter().map(|&t| (Some(t), cuda)).collect();
+        self.install_turns_per_group(&groups);
+    }
+
+    /// [`Self::install_group_turns`] for a node whose groups differ in vendor: per group, its
+    /// instance count (`None` = every registered model) and whether it is a CUDA group.
+    pub fn install_turns_per_group(&self, groups: &[(Option<usize>, bool)]) {
         self.turns.get_or_init(|| {
-            let busiest = tenants.iter().copied().max().unwrap_or(1);
-            policy::set_co_sched(policy::co_sched(busiest, !cuda));
-            let turns = tenants
+            let models = self.registry.slugs().len();
+            let groups: Vec<(usize, bool)> = groups
                 .iter()
-                .map(|&t| Arc::new(cosched::DeviceTurn::serving(policy::co_sched(t, !cuda))))
+                .map(|&(t, c)| (t.unwrap_or(models), c))
+                .collect();
+            let (busiest, cuda) = groups
+                .iter()
+                .copied()
+                .max_by_key(|g| g.0)
+                .unwrap_or((1, cfg!(feature = "cuda")));
+            policy::set_co_sched(policy::co_sched(busiest, !cuda));
+            let turns = groups
+                .iter()
+                .map(|&(t, cuda)| {
+                    Arc::new(cosched::DeviceTurn::serving(policy::co_sched(t, !cuda)))
+                })
                 .collect::<Vec<_>>();
             if let Some(first) = turns.first() {
                 tracing::info!(

@@ -185,7 +185,11 @@ pub struct XferResult {
 /// `iters` H2D + D2H round trips of `bytes` through it concurrently and its bytes are compared;
 /// then every ordered pair of devices relays a pattern device → region → device → region (the
 /// prefill-to-decode handoff path) and the result is compared byte for byte.
-pub fn xfer_check(devs: &[super::Device], bytes: usize, iters: u32) -> Result<(Vec<XferResult>, Vec<String>)> {
+pub fn xfer_check(
+    devs: &[super::Device],
+    bytes: usize,
+    iters: u32,
+) -> Result<(Vec<XferResult>, Vec<String>)> {
     use std::time::Instant;
     let n = devs.len();
     if n == 0 {
@@ -199,7 +203,9 @@ pub fn xfer_check(devs: &[super::Device], bytes: usize, iters: u32) -> Result<(V
     }
     for i in 0..n {
         // SAFETY: no copy is in flight yet.
-        pattern(i as u64 + 1, unsafe { region.slice_mut(2 * i * bytes, bytes) });
+        pattern(i as u64 + 1, unsafe {
+            region.slice_mut(2 * i * bytes, bytes)
+        });
     }
     let bufs: Vec<_> = devs
         .iter()
@@ -226,7 +232,8 @@ pub fn xfer_check(devs: &[super::Device], bytes: usize, iters: u32) -> Result<(V
                     }
                     // SAFETY: every copy of this device was waited on above.
                     let ok = unsafe {
-                        region.slice(2 * i * bytes, bytes) == region.slice((2 * i + 1) * bytes, bytes)
+                        region.slice(2 * i * bytes, bytes)
+                            == region.slice((2 * i + 1) * bytes, bytes)
                     };
                     if !ok {
                         return Err(RuntimeError::Device(format!(
@@ -234,11 +241,17 @@ pub fn xfer_check(devs: &[super::Device], bytes: usize, iters: u32) -> Result<(V
                         )));
                     }
                     let gb = bytes as f64 * iters.max(1) as f64 / 1e9;
-                    Ok(XferResult { device: name, h2d_gbs: gb / h2d, d2h_gbs: gb / d2h })
+                    Ok(XferResult {
+                        device: name,
+                        h2d_gbs: gb / h2d,
+                        d2h_gbs: gb / d2h,
+                    })
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().expect("xfer thread panicked")).collect()
+        hs.into_iter()
+            .map(|h| h.join().expect("xfer thread panicked"))
+            .collect()
     });
     let results = results.into_iter().collect::<Result<Vec<_>>>()?;
 
@@ -254,7 +267,11 @@ pub fn xfer_check(devs: &[super::Device], bytes: usize, iters: u32) -> Result<(V
             // SAFETY: every earlier copy was waited on; these are serial and waited on in turn.
             unsafe { region.slice_mut(out, bytes) }.fill(0);
             let t = std::time::Instant::now();
-            sa.stage_wait(sa.stage_h2d(bufs[a].base, aliases[a] + (2 * a * bytes) as u64, bytes as u64)?)?;
+            sa.stage_wait(sa.stage_h2d(
+                bufs[a].base,
+                aliases[a] + (2 * a * bytes) as u64,
+                bytes as u64,
+            )?)?;
             sa.stage_wait(sa.stage_d2h(aliases[a] + mid as u64, bufs[a].base, bytes as u64)?)?;
             sb.stage_wait(sb.stage_h2d(bufs[b].base, aliases[b] + mid as u64, bytes as u64)?)?;
             sb.stage_wait(sb.stage_d2h(aliases[b] + out as u64, bufs[b].base, bytes as u64)?)?;

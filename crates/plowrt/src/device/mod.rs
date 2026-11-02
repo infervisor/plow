@@ -15,9 +15,9 @@ use crate::Result;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod host_region;
 #[cfg(feature = "hsa")]
 pub mod hsa;
-pub mod host_region;
 pub(crate) mod kernarg_retirement;
 pub mod provenance;
 pub(crate) mod retirement;
@@ -225,13 +225,19 @@ pub fn inventory() -> Vec<Device> {
         Ok(first) => {
             let n = first.device_count().unwrap_or(1);
             out.push(Device {
-                id: DevId { vendor: Vendor::Nvidia, ordinal: 0 },
+                id: DevId {
+                    vendor: Vendor::Nvidia,
+                    ordinal: 0,
+                },
                 handle: DeviceHandle::Cuda(Arc::new(first)),
             });
             for dev in 1..n.min(u8::MAX as u32) as u8 {
                 match cuda::CudaBackend::new(dev) {
                     Ok(b) => out.push(Device {
-                        id: DevId { vendor: Vendor::Nvidia, ordinal: dev },
+                        id: DevId {
+                            vendor: Vendor::Nvidia,
+                            ordinal: dev,
+                        },
                         handle: DeviceHandle::Cuda(Arc::new(b)),
                     }),
                     Err(e) => tracing::error!(%e, dev, n, "CUDA device enumerated but not usable"),
@@ -245,13 +251,19 @@ pub fn inventory() -> Vec<Device> {
         Ok(first) => {
             let n = first.gpu_count();
             out.push(Device {
-                id: DevId { vendor: Vendor::Amd, ordinal: 0 },
+                id: DevId {
+                    vendor: Vendor::Amd,
+                    ordinal: 0,
+                },
                 handle: DeviceHandle::Hsa(Arc::new(first)),
             });
             for dev in 1..n.min(u8::MAX as u32) as u8 {
                 match hsa::HsaBackend::new(dev) {
                     Ok(b) => out.push(Device {
-                        id: DevId { vendor: Vendor::Amd, ordinal: dev },
+                        id: DevId {
+                            vendor: Vendor::Amd,
+                            ordinal: dev,
+                        },
                         handle: DeviceHandle::Hsa(Arc::new(b)),
                     }),
                     Err(e) => tracing::error!(%e, dev, n, "HSA agent enumerated but not usable"),
@@ -661,7 +673,10 @@ mod tests {
     fn dev_id_round_trips_and_refuses_junk() {
         let a: super::DevId = "amd:1".parse().unwrap();
         assert_eq!(a.to_string(), "amd:1");
-        assert_eq!("nvidia:0".parse::<super::DevId>().unwrap().to_string(), "nv:0");
+        assert_eq!(
+            "nvidia:0".parse::<super::DevId>().unwrap().to_string(),
+            "nv:0"
+        );
         assert!("gpu:0".parse::<super::DevId>().is_err());
         assert!("nv:x".parse::<super::DevId>().is_err());
         assert!("0".parse::<super::DevId>().is_err());
