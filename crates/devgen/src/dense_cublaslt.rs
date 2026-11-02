@@ -590,6 +590,79 @@ pub(crate) fn apply_native(
     Ok(section)
 }
 
+/// Declare the native block-scaled FP8 decode GEMM object (`gemm_fp8_block_sm90.cubin` beside
+/// `output`) over the decode rungs' cuBLASLt block-FP8 projections that have a measured plan
+/// ([`plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK_SHAPES`]); returns the routed segments.
+pub(crate) fn apply_fp8_block(
+    model: &Model,
+    sections: &mut [SectionData],
+    output: &std::path::Path,
+) -> Result<usize, String> {
+    use plow_asset::segment_roles::{
+        NATIVE_DECODE_FP8_BLOCK, NATIVE_DECODE_FP8_BLOCK_ABI, NATIVE_DECODE_FP8_BLOCK_SHAPES,
+    };
+    let file = "gemm_fp8_block_sm90.cubin";
+    let section = sections
+        .iter_mut()
+        .find(|section| section.kind == SECT_METADATA && section.name == SECTION)
+        .ok_or("native FP8 block decode requires cuBLASLt decode segments")?;
+    let mut roles = SegmentRoles::from_bytes(&section.data)?;
+    let decode_lo = packet::devbuild::decode_rung_lo(&model.prog_t);
+    let mut plan = std::collections::BTreeSet::new();
+    let mut routed = 0;
+    for p in roles.programs.iter().filter(|p| p.index >= decode_lo) {
+        let program = &model.progs[p.index];
+        for (segment, _) in p.roles.iter().enumerate().filter(|(_, &r)| r == CUBLASLT) {
+            let inst = program
+                .stream
+                .iter()
+                .find(|e| e.seg as usize == segment)
+                .map(|e| &program.insts[e.inst as usize])
+                .ok_or("missing cuBLASLt decode segment")?;
+            if inst.op != DevOp::GemmFp8 as u16 || inst.i[5] != packet::dev::FP8_BLOCK_GROUP {
+                continue;
+            }
+            if let Some(shape) = NATIVE_DECODE_FP8_BLOCK_SHAPES
+                .iter()
+                .find(|shape| shape[..3] == [inst.i[0], inst.i[1], inst.i[2]])
+            {
+                plan.insert(*shape);
+                routed += 1;
+            }
+        }
+    }
+    if routed == 0 {
+        return Err("native FP8 block decode has no measured block-FP8 decode shape".into());
+    }
+    let path = output
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(file);
+    let image = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if plow_asset::cubin::global_u32(&image, "plow_gemm_fp8_block_abi") != Some(1)
+        || plow_asset::cubin::global_u32(&image, "plow_gemm_fp8_block_max_rows")
+            != Some(plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK_MAX_ROWS)
+        || plow_asset::cubin::inspect(&image).is_none_or(|i| i.sm != 90)
+    {
+        return Err("native FP8 block decode object requires ABI1 sm_90a".into());
+    }
+    roles.objects.insert(
+        NATIVE_DECODE_FP8_BLOCK,
+        plow_asset::segment_roles::SegmentObject {
+            abi: NATIVE_DECODE_FP8_BLOCK_ABI.into(),
+            file: file.into(),
+            sha256: Some(plow_asset::decode_objects::image_sha256(&image)),
+            promote_k512: None,
+            attention: None,
+            gemm: None,
+            decode_plan: Some(plan.into_iter().collect()),
+        },
+    );
+    roles.validate_schema()?;
+    section.data = serde_json::to_vec(&roles).map_err(|e| e.to_string())?;
+    Ok(routed)
+}
+
 fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>, String> {
     let dependencies = plow_asset::program::with_model(model, |packet| {
         plow_asset::splitk::dependencies(&packet.programs[index])
@@ -796,8 +869,23 @@ pub(crate) fn runtime_requires(model: &Model, sections: &[SectionData]) -> serde
             d.op == DevOp::GluPitched as u16
                 || (d.op == DevOp::QwenQGateSplit as u16 && d.i[3] != 0)
                 || (d.op == DevOp::QwenHeadNormRope as u16 && d.j[1] != 0)
+                || ([
+                    DevOp::QwenGdnConv,
+                    DevOp::QwenGdnConvPrefill,
+                    DevOp::QwenGatedNorm,
+                ]
+                .iter()
+                .any(|&op| d.op == op as u16)
+                    && d.j[1] != 0)
         });
-    let contract = if concat {
+    let native_fp8 = final_roles(sections).is_some_and(|roles| {
+        roles
+            .objects
+            .contains_key(&plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK)
+    });
+    let contract = if native_fp8 {
+        plow_asset::RUNTIME_CONTRACT_FP8_BLOCK_NATIVE
+    } else if concat {
         plow_asset::RUNTIME_CONTRACT_CONCAT
     } else if block_fp8 {
         plow_asset::RUNTIME_CONTRACT_FP8_BLOCK
@@ -1133,6 +1221,63 @@ mod tests {
         );
         std::fs::write(directory.join("gemv_sm90_transposed.cubin"), &wide_image).unwrap();
         assert!(apply_native(&mut wide, &directory.join("model.pkt")).is_ok());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fp8_block_object_plans_measured_block_projections_only() {
+        use plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK;
+        let directory =
+            std::env::temp_dir().join(format!("plow-fp8-block-role-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("model.pkt");
+        let mut m = model();
+        let section = apply_projections(&mut m, false, 1).unwrap();
+        let block = |m: &mut Model, n: u32| {
+            let d = &mut m.progs[1].insts[1];
+            d.op = DevOp::GemmFp8 as u16;
+            d.i[..3].copy_from_slice(&[8, n, 5120]);
+            d.i[5] = packet::dev::FP8_BLOCK_GROUP;
+        };
+        block(&mut m, 16384);
+        let mut sections = vec![section];
+        assert!(apply_fp8_block(&m, &mut sections, &output)
+            .unwrap_err()
+            .contains("gemm_fp8_block_sm90.cubin"));
+        let image = |abi: u32| {
+            plow_asset::cubin::synthetic_elf(
+                "plow_gemm_fp8_block_reduce",
+                &[
+                    ("plow_gemm_fp8_block_abi", abi),
+                    ("plow_gemm_fp8_block_max_rows", 32),
+                ],
+                90,
+            )
+        };
+        let path = directory.join("gemm_fp8_block_sm90.cubin");
+        std::fs::write(&path, image(2)).unwrap();
+        assert!(apply_fp8_block(&m, &mut sections, &output)
+            .unwrap_err()
+            .contains("ABI1"));
+        std::fs::write(&path, image(1)).unwrap();
+        assert_eq!(apply_fp8_block(&m, &mut sections, &output), Ok(1));
+        let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+        let object = &roles.objects[&NATIVE_DECODE_FP8_BLOCK];
+        assert_eq!(object.decode_plan, Some(vec![[8, 16384, 5120, 73, 1]]));
+        assert_eq!(
+            object.sha256,
+            Some(plow_asset::decode_objects::image_sha256(&image(1)))
+        );
+        assert_eq!(
+            runtime_requires(&m, &sections)["plowrt_contract"],
+            plow_asset::RUNTIME_CONTRACT_FP8_BLOCK_NATIVE
+        );
+        let mut unmeasured = model();
+        let mut sections = vec![apply_projections(&mut unmeasured, false, 1).unwrap()];
+        block(&mut unmeasured, 4096);
+        assert!(apply_fp8_block(&unmeasured, &mut sections, &output)
+            .unwrap_err()
+            .contains("no measured"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

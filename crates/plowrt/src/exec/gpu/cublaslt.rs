@@ -894,6 +894,14 @@ fn light_quant_pair(
     // with the quant.
     let row = u64::from(m) * u64::from(k) * 2;
     let mask = u64::from(m) * 4;
+    // A gated norm's z may be a column of a row-pitched N-concatenated output (j1).
+    let zsrc = pd.fj[2];
+    let (zs, zc) = (u64::from(zsrc & 0xFFFF), u64::from(zsrc >> 16));
+    let z_bytes = if zsrc == 0 {
+        row
+    } else {
+        (u64::from(m - 1) * zs + zc + u64::from(k)) * 2
+    };
     let (shape, active, operands): (bool, usize, &[(usize, u64)]) = match DevOp::from_u16(pd.op)? {
         // The interpreter's block-per-row path (`batch <= nblk`), at most 32 elements per thread
         // in the kernel.
@@ -910,12 +918,15 @@ fn light_quant_pair(
         ),
         // One head = one 128-wide group.
         DevOp::QwenGatedNorm => (
-            pd.i[1] == 128 && pd.i[0].checked_mul(pd.i[1]) == Some(k) && pd.i[2] == m,
+            pd.i[1] == 128
+                && pd.i[0].checked_mul(pd.i[1]) == Some(k)
+                && pd.i[2] == m
+                && (zsrc == 0 || (zs % 8 == 0 && zc % 8 == 0 && zc + u64::from(k) <= zs)),
             4,
             &[
                 (0, row),
                 (1, row),
-                (2, row),
+                (2, z_bytes),
                 (3, u64::from(pd.i[1]) * 2),
                 (4, mask),
             ],
@@ -990,6 +1001,8 @@ fn light_quant_pair(
         present(&[active])
             .iter()
             .all(|&a| present(&[0]).iter().all(|&o| disjoint(a, o)))
+            // Rows of a pitched z are read while other rows' outputs are written.
+            && (zsrc == 0 || pd.op != DevOp::QwenGatedNorm as u16 || pairwise(&present(&[0, 2])))
     };
     (shape && fits && disjoint(xq, gs) && operands_ok && alias_ok).then_some((p, q))
 }
@@ -2007,6 +2020,7 @@ pub(super) enum ProjectionBackend {
 enum ProjectionPlan {
     Lt(Arc<crate::device::cuda::lt::Plan>),
     Native(native_decode::Plan),
+    Fp8Block(fp8_block::Plan),
     Folded,
 }
 
@@ -2015,6 +2029,7 @@ impl ProjectionPlan {
         match self {
             Self::Lt(p) => p.run(input, weight, output, stream),
             Self::Native(p) => p.run(input, weight, output, stream),
+            Self::Fp8Block(p) => p.run(input, weight, output, stream),
             Self::Folded => Ok(()),
         }
     }
@@ -2162,6 +2177,7 @@ pub(super) fn ordered_waits_for(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_routes(
     backend: &ProjectionBackend,
+    fp8_block: Option<&Arc<fp8_block::Fp8Block>>,
     segments: Vec<Option<DecodeSegment>>,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
@@ -2206,6 +2222,7 @@ pub(super) fn prepare_routes(
     let mut plans = std::collections::HashMap::new();
     let mut pair_plans = std::collections::HashMap::new();
     let mut fp8_plans = 0usize;
+    let mut fp8_native = 0usize;
     let mut pairs = 0usize;
     let mut index = 0;
     while index < segments.len() {
@@ -2288,15 +2305,27 @@ pub(super) fn prepare_routes(
                 .nv
                 .lt_fp8_fast_accum_max_k
                 .is_some_and(|max_k| segment.k <= max_k);
-            let plan = ProjectionPlan::Lt(lt.fp8_plan(
-                lt_m,
-                segment.n,
-                segment.k,
-                scales[1],
-                scales[0],
-                !decode && fast_k && !segment.block,
-                segment.block,
-            )?);
+            let native = match fp8_block.filter(|_| segment.block && decode) {
+                Some(owner) => owner.plan(
+                    segment.m, segment.n, segment.k, input, weight, scales[0], scales[1],
+                )?,
+                None => None,
+            };
+            let plan = match native {
+                Some(plan) => {
+                    fp8_native += 1;
+                    ProjectionPlan::Fp8Block(plan)
+                }
+                None => ProjectionPlan::Lt(lt.fp8_plan(
+                    lt_m,
+                    segment.n,
+                    segment.k,
+                    scales[1],
+                    scales[0],
+                    !decode && fast_k && !segment.block,
+                    segment.block,
+                )?),
+            };
             fp8_plans += 1;
             insts[segment.instruction].op = DevOp::Nop as u16;
             routes.push(Some(CublasLtDecodeRoute {
@@ -2484,6 +2513,7 @@ pub(super) fn prepare_routes(
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
         fp8_plans,
+        fp8_native,
         pairs,
         native = matches!(backend, ProjectionBackend::Native(_)),
         "projection routes prepared"
@@ -2911,6 +2941,96 @@ fn projection_segments(
 mod tests {
     use super::*;
     use packet::dev::{DevInst64, StreamEnt};
+
+    #[test]
+    fn light_quant_pair_takes_only_a_fitting_disjoint_pitched_gated_norm_z() {
+        let none = packet::dev::TENSOR_NONE16;
+        let (m, heads, dim, pitch, col) = (4u32, 48u32, 128u32, 16384u32, 10240u32);
+        let k = heads * dim;
+        let mut norm = DevInst64 {
+            op: DevOp::QwenGatedNorm as u16,
+            blocks: 2,
+            ..Default::default()
+        };
+        norm.t.fill(none);
+        norm.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        norm.i[..3].copy_from_slice(&[heads, dim, m]);
+        norm.fj[2] = pitch | col << 16;
+        let mut quant = DevInst64 {
+            op: DevOp::QuantFp8 as u16,
+            blocks: 2,
+            ..Default::default()
+        };
+        quant.t.fill(none);
+        quant.t[..3].copy_from_slice(&[4, 0, 5]);
+        quant.i[..5].copy_from_slice(&[m, k, 0, packet::dev::FP8_BLOCK_GROUP, m]);
+        let mut g = DevProg {
+            t: m,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: m },
+            n_counter: 0,
+            insts: vec![norm, quant],
+            stream: vec![],
+            stream_ofs: vec![0],
+            stream_len: vec![0],
+            waits: vec![],
+            succs: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![0],
+            l2_domains: 0,
+        };
+        let entries: Vec<_> = [(0, 0), (0, 1), (1, 0), (1, 1)]
+            .into_iter()
+            .map(|(inst, slice)| StreamEnt {
+                inst,
+                slice,
+                ..Default::default()
+            })
+            .collect();
+        let row = u64::from(m * k) * 2;
+        let qkvz = u64::from(m * pitch) * 2;
+        let sizes = [
+            row,
+            row,
+            qkvz,
+            256,
+            u64::from(m * k),
+            u64::from(k / 128 * m) * 4,
+        ];
+        // z at its own base, or at the output's base (an overlapping view).
+        let view = |z: u64, alias: bool| -> Vec<DeviceMem> {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| match i {
+                    2 => DeviceMem::view(if alias { 1 << 24 } else { 3 << 24 }, z),
+                    _ => DeviceMem::view((i as u64 + 1) << 24, len),
+                })
+                .collect()
+        };
+        let devp = |z: u64| view(z, false);
+        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), Some((0, 1)));
+        // The last row's z ends at (m - 1) * pitch + col + k.
+        let last = u64::from((m - 1) * pitch + col + k) * 2;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(last)), Some((0, 1)));
+        assert_eq!(light_quant_pair(&g, &entries, &devp(last - 2)), None);
+        // z lies inside the row, 8-element aligned; each case otherwise fits a wide buffer.
+        let wide = u64::from(m * (pitch + 64)) * 2;
+        g.insts[0].fj[2] = pitch | (col + 8) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 4) | col << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 8) | (col + 4) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 8) | (col + 8) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), Some((0, 1)));
+        // Other rows' outputs are written while a pitched z is read: a z overlapping the output
+        // is refused even when it is large enough.
+        g.insts[0].fj[2] = pitch | col << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &view(qkvz, true)), None);
+        // A dense z (no j1) needs only its rows.
+        g.insts[0].fj[2] = 0;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(row)), Some((0, 1)));
+    }
 
     #[test]
     fn block_fp8_row_padding_refuses_overflow() {

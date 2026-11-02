@@ -565,7 +565,10 @@ pub fn check_packet_contract(
     let concat = concat_feature(blob, raw)?;
     for d in blob.progs.iter().flat_map(|p| &p.insts) {
         if let Some((op, footprint)) = pitched_source(d) {
-            let slot = if op == packet::dev::DevOp::QwenQGateSplit {
+            let slot = if matches!(
+                op,
+                packet::dev::DevOp::QwenQGateSplit | packet::dev::DevOp::QwenGatedNorm
+            ) {
                 2
             } else {
                 1
@@ -581,10 +584,11 @@ pub fn check_packet_contract(
                 )));
             }
             // Outputs are written row by row while later rows of the source are still unread.
-            let outputs: &[usize] = if op == packet::dev::DevOp::QwenQGateSplit {
-                &[0, 1]
-            } else {
-                &[0]
+            let outputs: &[usize] = match op {
+                packet::dev::DevOp::QwenQGateSplit => &[0, 1],
+                // The conv also rewrites its history from the source rows.
+                packet::dev::DevOp::QwenGdnConv | packet::dev::DevOp::QwenGdnConvPrefill => &[0, 3],
+                _ => &[0],
             };
             if outputs.iter().any(|&o| d.t[o] == d.t[slot]) {
                 return Err(RuntimeError::Rejected(format!(
@@ -596,6 +600,20 @@ pub fn check_packet_contract(
             if op == packet::dev::DevOp::QwenQGateSplit && (d.i[1] % 8 != 0 || d.i[3] % 8 != 0) {
                 return Err(RuntimeError::Rejected(format!(
                     "{}: {op:?} pitch or head dim is not a multiple of 8 elements",
+                    packet.display()
+                )));
+            }
+            // The conv's and gated norm's vector loads (16 / 8 bytes) need an 8-element pitch and
+            // column.
+            let gdn = matches!(
+                op,
+                packet::dev::DevOp::QwenGdnConv
+                    | packet::dev::DevOp::QwenGdnConvPrefill
+                    | packet::dev::DevOp::QwenGatedNorm
+            );
+            if gdn && ((d.fj[2] & 0xFFFF) % 8 != 0 || (d.fj[2] >> 16) % 8 != 0) {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {op:?} pitch or column is not a multiple of 8 elements",
                     packet.display()
                 )));
             }
@@ -639,6 +657,12 @@ fn pitched_source(d: &packet::dev::DevInst64) -> Option<(packet::dev::DevOp, Opt
         DevOp::QwenHeadNormRope if w != 0 => {
             Some((op, span(i(3), w & 0xFFFF, w >> 16, i(0) * i(1))))
         }
+        // x[B or T rows][C]; the prefill conv's i2 is the bucket's rows (plowrt lowers it to the
+        // real rows per chunk).
+        DevOp::QwenGdnConv | DevOp::QwenGdnConvPrefill if w != 0 => {
+            Some((op, span(i(2), w & 0xFFFF, w >> 16, i(0))))
+        }
+        DevOp::QwenGatedNorm if w != 0 => Some((op, span(i(2), w & 0xFFFF, w >> 16, i(0) * i(1)))),
         _ => None,
     }
 }
@@ -700,6 +724,16 @@ mod tests {
                 if op == DevOp::QwenQGateSplit {
                     d.t[..3].copy_from_slice(&[out, out, src]);
                     d.i[..4].copy_from_slice(&[1, 8, 2, stride]);
+                } else if op == DevOp::QwenGatedNorm {
+                    // HV 1 x V 8, 2 rows: z read at column `col` of a `stride`-wide row.
+                    d.t[..3].copy_from_slice(&[out, out, src]);
+                    d.i[..3].copy_from_slice(&[1, 8, 2]);
+                    d.j[1] = stride | (col << 16);
+                } else if op == DevOp::QwenGdnConv {
+                    // C 8, W 4, 2 rows; history t3.
+                    d.t[..4].copy_from_slice(&[out, src, out, out]);
+                    d.i[..3].copy_from_slice(&[8, 4, 2]);
+                    d.j[1] = stride | (col << 16);
                 } else {
                     d.t[..2].copy_from_slice(&[out, src]);
                     d.i[..4].copy_from_slice(&[1, 2, 0, 2]);
@@ -742,6 +776,15 @@ mod tests {
         assert!(!ok(blob(DevOp::QwenHeadNormRope, 12, 10, 46, false)));
         assert!(!ok(blob(DevOp::QwenHeadNormRope, 12, 11, 400, false)));
         assert!(!ok(blob(DevOp::QwenHeadNormRope, 12, 10, 64, true)));
+        // z at column 8 of 16-wide rows: last row ends at 16 + 8 + 8 = 32 elements.
+        assert!(ok(blob(DevOp::QwenGatedNorm, 16, 8, 64, false)));
+        assert!(!ok(blob(DevOp::QwenGatedNorm, 16, 8, 62, false)));
+        assert!(!ok(blob(DevOp::QwenGatedNorm, 16, 4, 400, false)));
+        assert!(!ok(blob(DevOp::QwenGatedNorm, 16, 8, 64, true)));
+        assert!(ok(blob(DevOp::QwenGdnConv, 16, 0, 48, false)));
+        assert!(!ok(blob(DevOp::QwenGdnConv, 16, 0, 46, false)));
+        assert!(!ok(blob(DevOp::QwenGdnConv, 12, 0, 400, false)));
+        assert!(!ok(blob(DevOp::QwenGdnConv, 16, 0, 64, true)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
