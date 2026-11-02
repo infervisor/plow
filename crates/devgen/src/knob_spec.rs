@@ -325,7 +325,8 @@ const DECODE_LADDER_DEFAULT: Default = Default::Production {
                 F::Atom("emit.decode_batch", Cmp::Eq, Val::Nat(1)),
             ]),
             value: Val::Str("1,2,4,8,16"),
-        },        DefaultCase {
+        },
+        DefaultCase {
             when: F::And(&[
                 F::Target(T::Arch("sm_120a")),
                 F::Target(T::Cap("decode_ladder")),
@@ -540,6 +541,17 @@ const PACKED_PREFILL_DEFAULT: Default = Default::Production {
         },
         DefaultCase {
             when: F::And(&[F::Target(T::Cap("glm53")), F::Target(T::Arch("gfx950"))]),
+            value: TRUE,
+        },
+        // lib.rs apply_production_defaults: segmented FP8-KV prefill needs the packed contract.
+        DefaultCase {
+            when: F::And(&[
+                F::Or(&[F::Target(T::Arch("sm_90a")), F::Target(T::Arch("sm_120a"))]),
+                F::Target(T::Tp(1)),
+                F::Target(T::Cap("dense_packet_contracts")),
+                F::Atom("emit.fp8_kv", Cmp::Eq, TRUE),
+                F::Atom("emit.uniseg", Cmp::Eq, FALSE),
+            ]),
             value: TRUE,
         },
     ],

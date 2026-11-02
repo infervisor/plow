@@ -3458,7 +3458,9 @@ pub fn config_header(manifest: &Value) -> String {
         if t.get("gf_full").and_then(Value::as_u64) == Some(16)
             || t.get("gf_light512").and_then(Value::as_u64) == Some(16)
         {
-            out.push_str("#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n");
+            out.push_str(
+                "#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n",
+            );
         }
         // Measured on sm_90a only; every other target keeps the kernel's own default.
         if let Some(v) = t.get("moe_down_sg").and_then(Value::as_u64) {
