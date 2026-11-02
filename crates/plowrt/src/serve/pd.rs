@@ -130,10 +130,11 @@ pub fn kv_header(
         .ok_or_else(|| format!("no packet in {}", dir.display()))?;
     let raw = std::fs::read(&pkt).map_err(|e| format!("{}: {e}", pkt.display()))?;
     let blob = DevBlob::parse_l2(&raw, true).map_err(|e| e.to_string())?;
-    let manifest = match crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw) {
-        Ok(Some(m)) => m,
-        _ => blob.with_packet_view(plow_asset::live_kv::emit)?,
-    };
+    let manifest =
+        match crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw).map_err(|e| e.to_string())? {
+            Some(m) => m,
+            None => blob.with_packet_view(plow_asset::live_kv::emit)?,
+        };
     let ckpt = crate::asset::serve::checkpoint_dir(dir);
     let ckpt = ckpt.canonicalize().unwrap_or(ckpt);
     let weights = match digests.get(&ckpt) {

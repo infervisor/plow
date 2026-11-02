@@ -36,6 +36,16 @@ fn inst(op: DevOp) -> DevInst64 {
     }
 }
 
+/// Layer `l`'s query: an RMS-normed, rotated head written to `act.q` (handle 2).
+fn query(m: &mut Model, l: usize) {
+    m.names
+        .push(format!("model.layers.{l}.self_attn.q_norm.weight"));
+    let mut d = inst(DevOp::HeadNormRope);
+    d.t[0] = 2;
+    d.t[2] = (m.names.len() - 1) as u16;
+    m.insts.push(d);
+}
+
 fn build(layers: &[Layer], stride: u32, layout: u32) -> Model {
     let mut m = Model {
         names: vec!["in.pos".into(), "in.kvlen".into(), "act.q".into()],
@@ -53,11 +63,13 @@ fn build(layers: &[Layer], stride: u32, layout: u32) -> Model {
         if ly.src != l {
             handles.push(handles[ly.src]);
             let (k, v, scales): (u16, u16, Option<[u16; 2]>) = handles[ly.src];
+            query(&mut m, l);
             let mut d = inst(if ly.fp8 {
                 DevOp::FlashDecodeFp8
             } else {
                 DevOp::FlashDecode
             });
+            d.t[2] = 2;
             d.t[3] = k;
             d.t[4] = v;
             if let Some(s) = scales {
@@ -124,11 +136,13 @@ fn build(layers: &[Layer], stride: u32, layout: u32) -> Model {
             d.fj[0] = 1e-6f32.to_bits();
             m.insts.push(d);
         }
+        query(&mut m, l);
         let mut d = inst(if ly.fp8 {
             DevOp::FlashDecodeFp8
         } else {
             DevOp::FlashDecode
         });
+        d.t[2] = 2;
         d.t[3] = k;
         d.t[4] = v;
         if let Some(s) = scales {
@@ -254,7 +268,7 @@ fn qwen3_0_6b_golden_header() {
     assert_eq!(h.entries[0].rope.unwrap().pairing, Pairing::Half);
     assert_eq!(
         h.digest(),
-        "6a082552073f1b8912132bb036f1b0f34e14823fad14a4d0617b2e08d78dc5e2",
+        "b802815fe8e710891e176b9c827d29fd94c64ed65d13bcc9badf22f8f6666d4b",
         "a change here changes which images Qwen3-0.6B engines exchange"
     );
 }
@@ -264,8 +278,10 @@ fn gemma4_e4b_golden_header() {
     let h = header(&build(&gemma4_e4b(), 1024, LAYOUT_HEAD_MAJOR)).unwrap();
     assert_eq!(h.entries.len(), 48);
     let e = |id: &str| h.entries.iter().find(|e| e.id == id).unwrap();
-    assert_eq!(e("L22.k").readers, 16);
-    assert_eq!(e("L23.k").readers, 4);
+    let sliding_tail: Vec<u32> = (24..42).filter(|l| l % 6 != 5).collect();
+    assert_eq!(e("L22.k").readers, [&[22][..], &sliding_tail].concat());
+    assert_eq!(e("L23.k").readers, [23, 29, 35, 41]);
+    assert_eq!(e("L0.k").readers, [0]);
     assert_eq!(e("L0.k").class, Class::Window { rows: 512 });
     assert_eq!(e("L5.k").class, Class::Append);
     assert_eq!(e("L5.k").rope.unwrap().frac, 0.25);
@@ -278,7 +294,7 @@ fn gemma4_e4b_golden_header() {
     );
     assert_eq!(
         h.digest(),
-        "45b849e877ce270ffccb0c4c03cc14767aff62dc74376fca59cfe2f52b8499c1",
+        "ce5e7b9df3b8eb8e243c8138706adb91791193e42d7a9f74251d3e0c18a8efd9",
         "a change here changes which images Gemma-4 E4B engines exchange"
     );
 }
@@ -346,6 +362,17 @@ fn every_semantic_field_changes_the_key() {
         (inst_of(|m| m.insts[0].i[5] = 1), "L0.k.rope"),
         (
             inst_of(|m| {
+                let q = m
+                    .names
+                    .iter()
+                    .position(|n| n.contains("layers.5.self_attn.q_"))
+                    .unwrap();
+                m.names[q] = "model.layers.9.self_attn.q_norm.weight".into();
+            }),
+            "L5.k.readers",
+        ),
+        (
+            inst_of(|m| {
                 m.generated[0].scale = 4;
                 m.generated[1].scale = 4;
             }),
@@ -393,6 +420,24 @@ fn unrecognised_caches_are_refused() {
     assert!(refused(|m| m.caches[0].scales = Some([1, 1])).contains("FP8"));
     assert!(refused(|m| m.names[3] = "kv.k".into()).contains("kv.<layer>.k"));
     assert!(refused(|m| m.tp = true).contains("TP"));
+    // The decode attention writes the new rows itself (folded writer descriptor).
+    assert!(refused(|m| m.insts[3].t[7] = 1).contains("folded"));
+    assert!(refused(|m| m.generated[1].factor = 2.0).contains("disagree"));
+    assert!(refused(|m| {
+        m.generated[0].theta = f64::NAN;
+        m.generated[1].theta = f64::NAN;
+    })
+    .contains("finite"));
+    assert!(
+        refused(|m| m.names[5] = "model.layers.1.self_attn.k_norm.weight".into())
+            .contains("k_norm")
+    );
+    assert!(refused(|m| m.insts[1].t[2] = 5).contains("v_norm"));
+    assert!(refused(|m| {
+        let q = m.names.iter().position(|n| n.contains("q_norm")).unwrap();
+        m.names[q] = "act.qn".into();
+    })
+    .contains("query norm"));
 }
 
 #[test]
@@ -413,4 +458,44 @@ fn checkpoint_digest_covers_names_and_content() {
     std::fs::remove_file(dir.join("m.safetensors")).unwrap();
     assert!(checkpoint_digest(&dir).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn caches_pack_in_layer_order() {
+    let mut m = build(&qwen3_0_6b(), 4096, LAYOUT_HEAD_MAJOR);
+    let tensors: Vec<Tensor<'_>> = m
+        .names
+        .iter()
+        .map(|n| Tensor {
+            name: n,
+            bytes: 64,
+            initialized: false,
+        })
+        .collect();
+    m.caches.reverse();
+    let packet = Packet {
+        n_cu: 1,
+        tp: false,
+        prefill_count: 0,
+        tensors: &tensors,
+        programs: &[],
+        generated: &[],
+        kv_row_insts: &[],
+    };
+    let mut manifest = Manifest {
+        version: 1,
+        n_cu: 1,
+        batch: 4,
+        max_ctx: 4096,
+        position: 0,
+        kv_length: 1,
+        row_slot: None,
+        caches: m.caches.clone(),
+        maps: Vec::new(),
+        programs: Vec::new(),
+        splitk: Vec::new(),
+    };
+    canonical_order(&packet, &mut manifest).unwrap();
+    let first = &tensors[manifest.caches[0].pair[0] as usize];
+    assert_eq!(first.name, "kv.0.k");
 }

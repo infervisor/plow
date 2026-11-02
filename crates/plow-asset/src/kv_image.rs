@@ -49,8 +49,8 @@ pub struct Entry {
     pub norm: Norm,
     /// Applied after the norm; `None` stores unrotated rows.
     pub rope: Option<Rope>,
-    /// Attention layers reading this cache (more than one under KV sharing).
-    pub readers: u32,
+    /// Layers attending over this cache (more than one under KV sharing), ascending.
+    pub readers: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,42 +158,30 @@ pub fn derive(packet: &Packet<'_>, manifest: &Manifest, weights: String) -> Resu
     if packet.tp {
         return Err(refuse("a TP packet's caches hold a head slice".into()));
     }
-    let insts = || packet.programs.iter().flat_map(|p| p.insts.iter());
-    let widest = packet
-        .programs
-        .last()
-        .ok_or_else(|| refuse("no decode program".into()))?;
+    let name = |h: u16| packet.tensors.get(h as usize).map(|t| t.name);
     let mut entries = Vec::new();
     for c in &manifest.caches {
-        let readers = widest
-            .insts
-            .iter()
-            .filter(|d| {
-                matches!(
-                    DevOp::from_u16(d.op),
-                    Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
-                ) && d.t[3] == c.pair[0]
-            })
-            .count() as u32;
+        let layer = cache_layer(packet, c.pair[0]).map_err(&refuse)?;
+        if cache_layer_role(name(c.pair[1]), "v") != Some(layer) {
+            return Err(refuse(format!("L{layer}: V cache is not kv.{layer}.v")));
+        }
+        let readers = readers(packet, c.pair).map_err(|e| refuse(format!("L{layer}: {e}")))?;
         for (handle, role) in c.pair.into_iter().zip(["k", "v"]) {
-            let name = packet
-                .tensors
-                .get(handle as usize)
-                .map(|t| t.name)
-                .ok_or_else(|| refuse(format!("cache handle {handle} out of range")))?;
-            let layer = name
-                .strip_prefix("kv.")
-                .and_then(|s| s.strip_suffix(&format!(".{role}")))
-                .and_then(|l| l.parse::<u32>().ok())
-                .ok_or_else(|| refuse(format!("cache tensor {name:?} is not kv.<layer>.{role}")))?;
             let id = format!("L{layer}.{role}");
             let mut facts = None;
-            for d in insts().filter(|d| d.t[0] == handle && writes_cache(d)) {
-                let f = writer(packet, d, c.hd).map_err(|e| refuse(format!("{id}: {e}")))?;
-                match &facts {
-                    None => facts = Some(f),
-                    Some(seen) if *seen == f => {}
-                    Some(_) => return Err(refuse(format!("{id}: its writers disagree"))),
+            for p in packet.programs {
+                for d in p
+                    .insts
+                    .iter()
+                    .filter(|d| d.t[0] == handle && writes_cache(d))
+                {
+                    let f = writer(packet, d, c.hd, layer, role)
+                        .map_err(|e| refuse(format!("{id}: {e}")))?;
+                    match &facts {
+                        None => facts = Some(f),
+                        Some(seen) if *seen == f => {}
+                        Some(_) => return Err(refuse(format!("{id}: its writers disagree"))),
+                    }
                 }
             }
             let (dtype, norm, rope) = facts.ok_or_else(|| {
@@ -214,7 +202,7 @@ pub fn derive(packet: &Packet<'_>, manifest: &Manifest, weights: String) -> Resu
                 dtype,
                 norm,
                 rope,
-                readers,
+                readers: readers.clone(),
             });
         }
     }
@@ -229,6 +217,84 @@ pub fn derive(packet: &Packet<'_>, manifest: &Manifest, weights: String) -> Resu
     })
 }
 
+/// Put `manifest`'s caches in the header's order (by layer), the order a KV image packs them in:
+/// two packets declaring the same caches in different orders then exchange the same bytes.
+pub fn canonical_order(packet: &Packet<'_>, manifest: &mut Manifest) -> Result<()> {
+    let mut keyed = Vec::with_capacity(manifest.caches.len());
+    for c in manifest.caches.drain(..) {
+        keyed.push((cache_layer(packet, c.pair[0])?, c));
+    }
+    keyed.sort_by_key(|(l, _)| *l);
+    manifest.caches = keyed.into_iter().map(|(_, c)| c).collect();
+    Ok(())
+}
+
+fn cache_layer(packet: &Packet<'_>, k: u16) -> Result<u32> {
+    let name = packet.tensors.get(k as usize).map(|t| t.name);
+    cache_layer_role(name, "k").ok_or_else(|| format!("cache tensor {name:?} is not kv.<layer>.k"))
+}
+
+fn cache_layer_role(name: Option<&str>, role: &str) -> Option<u32> {
+    name?
+        .strip_prefix("kv.")?
+        .strip_suffix(&format!(".{role}"))?
+        .parse()
+        .ok()
+}
+
+/// The layer of a `{prefix}layers.{l}.self_attn.{norm}.weight` tensor.
+fn norm_layer(name: &str, norm: &str) -> Option<u32> {
+    let rest = name.strip_suffix(&format!(".self_attn.{norm}.weight"))?;
+    let (_, l) = rest.rsplit_once("layers.")?;
+    l.parse().ok()
+}
+
+/// The layers attending over cache `pair`: each reader's query comes from the nearest earlier
+/// `HeadNormRope` writing it, normed with its layer's `q_norm`. Every program reading the cache
+/// must name the same layers.
+fn readers(packet: &Packet<'_>, pair: [u16; 2]) -> Result<Vec<u32>> {
+    let mut seen: Option<Vec<u32>> = None;
+    for p in packet.programs {
+        let mut layers = Vec::new();
+        for (pc, d) in p.insts.iter().enumerate() {
+            let op = DevOp::from_u16(d.op);
+            if !matches!(
+                op,
+                Some(
+                    DevOp::FlashDecode
+                        | DevOp::FlashDecodeFp8
+                        | DevOp::FlashPrefill
+                        | DevOp::FlashPrefillFp8
+                )
+            ) || [d.t[3], d.t[4]] != pair
+            {
+                continue;
+            }
+            if op == Some(DevOp::FlashDecode) && d.t[7] != TENSOR_NONE16 {
+                return Err("its decode writes rows inside the attention (folded writer)".into());
+            }
+            let q = p.insts[..pc]
+                .iter()
+                .rev()
+                .find(|w| writes_cache(w) && w.t[0] == d.t[2])
+                .and_then(|w| packet.tensors.get(w.t[2] as usize))
+                .and_then(|g| norm_layer(g.name, "q_norm"))
+                .ok_or("a reader's layer is not identifiable from its query norm")?;
+            layers.push(q);
+        }
+        if layers.is_empty() {
+            continue;
+        }
+        layers.sort_unstable();
+        match &seen {
+            None => seen = Some(layers),
+            Some(s) if *s == layers => {}
+            Some(_) => return Err("programs disagree on the layers reading it".into()),
+        }
+    }
+    seen.ok_or_else(|| "no program reads it".into())
+}
+
 fn writes_cache(d: &DevInst64) -> bool {
     matches!(
         DevOp::from_u16(d.op),
@@ -236,9 +302,24 @@ fn writes_cache(d: &DevInst64) -> bool {
     )
 }
 
+/// A float the header can hold: finite, and `-0.0` as `0.0` (JSON writes them differently).
+fn finite(x: f64, what: &str) -> Result<f64> {
+    if x.is_finite() {
+        Ok(if x == 0.0 { 0.0 } else { x })
+    } else {
+        Err(format!("{what} is not finite"))
+    }
+}
+
 /// `HeadNormRope[Fp8]`: `t0=out t2=gamma? t3=cos? t4=sin?` · `i2=hd i4=skip_norm i5=pair_mode`
-/// · `f0=eps`.
-fn writer(packet: &Packet<'_>, d: &DevInst64, hd: u32) -> Result<(Dtype, Norm, Option<Rope>)> {
+/// · `f0=eps`. A gamma must be this layer's `{role}_norm`.
+fn writer(
+    packet: &Packet<'_>,
+    d: &DevInst64,
+    hd: u32,
+    layer: u32,
+    role: &str,
+) -> Result<(Dtype, Norm, Option<Rope>)> {
     let dtype = match DevOp::from_u16(d.op) {
         Some(DevOp::HeadNormRope) => Dtype::Bf16,
         Some(DevOp::HeadNormRopeFp8) => Dtype::E4m3RowHeadF32,
@@ -247,13 +328,22 @@ fn writer(packet: &Packet<'_>, d: &DevInst64, hd: u32) -> Result<(Dtype, Norm, O
     if d.i[2] != hd {
         return Err(format!("writer hd {} vs cache hd {hd}", d.i[2]));
     }
-    let norm = if d.i[4] != 0 {
-        Norm::None
-    } else {
-        Norm::Rms {
-            eps: f32::from_bits(d.fj[0]),
-            gamma: d.t[2] != TENSOR_NONE16,
+    let gamma = d.t[2] != TENSOR_NONE16;
+    if gamma {
+        let g = packet.tensors.get(d.t[2] as usize).map_or("", |t| t.name);
+        if norm_layer(g, &format!("{role}_norm")) != Some(layer) {
+            return Err(format!(
+                "writer gamma {g:?} is not layer {layer}'s {role}_norm"
+            ));
         }
+    }
+    let norm = match (d.i[4], gamma) {
+        (0, _) => Norm::Rms {
+            eps: finite(f32::from_bits(d.fj[0]).into(), "norm eps")? as f32,
+            gamma,
+        },
+        (_, false) => Norm::None,
+        (_, true) => return Err("a gamma with the norm skipped".into()),
     };
     let rope = if d.t[3] == TENSOR_NONE16 {
         None
@@ -265,21 +355,29 @@ fn writer(packet: &Packet<'_>, d: &DevInst64, hd: u32) -> Result<(Dtype, Norm, O
         };
         let cos = generated(packet, d.t[3], [GEN_ROPE_COS, GEN_AMD_ROPE_BF16_COS])?;
         let sin = generated(packet, d.t[4], [GEN_ROPE_SIN, GEN_AMD_ROPE_BF16_SIN])?;
-        if (cos.hd, cos.theta, cos.frac, cos.scale) != (sin.hd, sin.theta, sin.frac, sin.scale) {
+        let recipe = |g: &GenTensor| {
+            (
+                g.hd,
+                g.aux,
+                g.scale,
+                [g.theta, g.frac, g.factor, g.low, g.high, g.orig].map(f64::to_bits),
+            )
+        };
+        if recipe(cos) != recipe(sin) {
             return Err("cos and sin tables disagree".into());
         }
         if cos.hd != hd {
             return Err(format!("rotary table hd {} vs cache hd {hd}", cos.hd));
         }
         Some(Rope {
-            theta: cos.theta,
-            frac: cos.frac,
+            theta: finite(cos.theta, "rope theta")?,
+            frac: finite(cos.frac, "rope fraction")?,
             pairing,
             scaling: cos.scale,
-            factor: cos.factor,
-            low: cos.low,
-            high: cos.high,
-            orig: cos.orig,
+            factor: finite(cos.factor, "rope factor")?,
+            low: finite(cos.low, "rope low")?,
+            high: finite(cos.high, "rope high")?,
+            orig: finite(cos.orig, "rope orig")?,
             aux: cos.aux,
         })
     };
@@ -302,14 +400,14 @@ fn generated<'a>(packet: &'a Packet<'_>, handle: u16, kinds: [u32; 2]) -> Result
 pub fn checkpoint_digest(dir: &Path) -> Result<String> {
     use std::io::Read;
     let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
-    let mut files: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|e| err(dir, e))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name().is_some_and(|n| n == "config.json")
-                || p.extension().is_some_and(|x| x == "safetensors")
-        })
-        .collect();
+    let mut files = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(|e| err(dir, e))? {
+        files.push(e.map_err(|e| err(dir, e))?.path());
+    }
+    files.retain(|p| {
+        p.file_name().is_some_and(|n| n == "config.json")
+            || p.extension().is_some_and(|x| x == "safetensors")
+    });
     files.sort();
     if !files
         .iter()
