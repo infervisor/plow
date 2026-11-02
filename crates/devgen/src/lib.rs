@@ -2220,6 +2220,12 @@ fn declare(
             "--tp {tp}: MoE intermediate {} must split into 16-aligned rank slices",
             c.moe_inter
         );
+        // The routed prefill library route fuses the combine with the post-FFN norm, which
+        // under TP must wait for the cross-rank reduction.
+        assert!(
+            !emit_config::active().moe_pf_lt,
+            "PLOW_EMIT_MOE_PF_LT: the routed MoE library route is single-rank only"
+        );
     }
     // GEMV 8-wide load contract (runtime/nvidia/op_gemm.cuh): the decode GEMV family loads the
     // contraction dim (K) in 8-element vectors guarded only by `k < K`, so a K that is not a

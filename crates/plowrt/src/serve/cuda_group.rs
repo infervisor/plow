@@ -123,8 +123,8 @@ pub struct CudaGroupServe {
     live: Vec<bool>,
     pf_pos: Vec<usize>,
     attached: Vec<usize>,
-    /// The rank-0 logits row holding each slot's latest token: a decode launch compacts its
-    /// feeds into rows `0..n`, and a finished prefill leaves its row in row 0.
+    /// The rank-0 logits row holding each slot's latest token: a decode launch writes slot `b`
+    /// to row `b`, and a finished prefill leaves its row in row 0.
     logits_at: Vec<Option<usize>>,
     prefill_turn: usize,
 }
@@ -577,8 +577,8 @@ impl SeqEngine for CudaGroupServe {
         })? {
             Resp::Tokens(t) if t.len() == feeds.len() => {
                 self.logits_at.fill(None);
-                for (row, &(slot, _)) in feeds.iter().enumerate() {
-                    self.logits_at[slot] = Some(row);
+                for &(slot, _) in feeds {
+                    self.logits_at[slot] = Some(slot);
                 }
                 Ok(feeds.iter().map(|f| f.0).zip(t).collect())
             }

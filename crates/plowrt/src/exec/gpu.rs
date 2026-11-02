@@ -4117,7 +4117,16 @@ impl GpuEngine {
         let tp_kernarg = rank::TpKernarg::of(rank_bind.as_ref());
         if let (Some(tp), Some(r)) = (blob.tp, rank_bind.as_ref()) {
             let layout = r.group().layout().expect("checked at bind");
-            // Three partial slots, `slot_bytes` apart (devgen's slot_b).
+            // Three partial slots, `slot_bytes` apart (devgen's slot_b). The stride is recovered
+            // from the collectives' slot offsets; slot A's declared size must agree with it.
+            let slot_a = blob.tensors.iter().find(|t| t.name == "act.og_tp");
+            if slot_a.is_some_and(|t| t.bytes != tp.slot_bytes) {
+                return Err(RuntimeError::Rejected(format!(
+                    "TP partial slot stride {} B disagrees with act.og_tp's {} B",
+                    tp.slot_bytes,
+                    slot_a.map_or(0, |t| t.bytes)
+                )));
+            }
             if tp.slot_bytes == 0 || tp.slot_bytes > layout.partial_off(1)? {
                 return Err(RuntimeError::Rejected(format!(
                     "TP partial slot {} B exceeds the group's {} B",
