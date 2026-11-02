@@ -215,6 +215,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uninspectable_or_required_objects_without_marker_block_staging() {
+        let junk = b"not an ELF image";
+        assert!(super::super::blocks_xr_staging(junk, 120, false));
+        assert!(super::super::blocks_xr_staging(junk, 120, true));
+    }
+
+    #[test]
     fn staged_requires_every_interpreter() {
         assert!(!staged_supported(&[]));
         assert!(staged_supported(&[Some(1)]));

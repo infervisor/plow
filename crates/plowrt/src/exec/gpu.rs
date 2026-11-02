@@ -62,6 +62,16 @@ fn check_norm_weight_offset(be: &CudaBackend, module: &Module, blob: &DevBlob) -
     Ok(())
 }
 
+/// Whether `image` keeps the engine unstaged: a required object, an interpreter for this SM,
+/// or an object that cannot be inspected (fail closed) must carry the staged-collective marker.
+fn blocks_xr_staging(image: &[u8], want_sm: u32, required: bool) -> bool {
+    let interpreter = cubin::inspect(image).map_or(true, |info| {
+        info.sm == want_sm && info.entries.iter().any(|e| e.contains("PlowProgram"))
+    });
+    (required || interpreter)
+        && !rank::staged_supported(&[cubin::global_u32(image, rank::STAGED_MARKER)])
+}
+
 // Decide before any tensor view, TMA descriptor or library plan captures a partial address.
 // Include optional interpreter siblings and segment objects conservatively: a stale optional
 // object keeps the whole engine unstaged, even if its rung is not selected on this request.
@@ -79,16 +89,8 @@ fn xr_staging_unavailable(
         return Ok(Some("decode interpreter lacks plow_xr_staged_1=1".into()));
     }
     let check = |image: &[u8], source: String, required: bool| -> Option<String> {
-        let interpreter = cubin::inspect(image).is_some_and(|info| {
-            info.sm == want_sm && info.entries.iter().any(|e| e.contains("PlowProgram"))
-        });
-        if (required || interpreter)
-            && !rank::staged_supported(&[cubin::global_u32(image, rank::STAGED_MARKER)])
-        {
-            Some(format!("{source} lacks plow_xr_staged_1=1"))
-        } else {
-            None
-        }
+        blocks_xr_staging(image, want_sm, required)
+            .then(|| format!("{source} lacks plow_xr_staged_1=1"))
     };
     if let Some(pf) = prefill {
         if let Some(reason) = check(&pf.image, pf.source.clone(), true) {
