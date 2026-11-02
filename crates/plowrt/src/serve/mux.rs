@@ -46,7 +46,7 @@ use crate::exec::indirection::slots as ind_slots;
 use crate::exec::oob::{OobChannel, OobMsg};
 use crate::memory::streamer::{KvArena, SlotHandle};
 use crate::memory::AddressSpace;
-use crate::obs::serving::RequestMetrics;
+use crate::obs::serving::{Leg, RequestMetrics};
 use crate::obs::Metrics;
 use crate::sched::admission::LoadEstimator;
 use crate::sched::batching::{cold_start_hold_ms, select_bucket};
@@ -904,7 +904,10 @@ impl ModelMux {
         arrived: Instant,
         ingress: Option<IngressGuard<'_>>,
     ) -> std::result::Result<(), SubmitError> {
-        Metrics::inc(&self.metrics.requests);
+        // A P/D decode leg continues a request its prefill rank already counted.
+        if job.opts.import.is_none() {
+            Metrics::inc(&self.metrics.requests);
+        }
         if self.shed_queue_depth() {
             Metrics::inc(&self.metrics.rejected);
             Metrics::inc(&self.metrics.shed_queue);
@@ -2994,9 +2997,16 @@ fn admit_session(
         None
     };
 
-    let telemetry = Some(RequestMetrics::new(
+    // A P/D decode leg reaches this queue at the handoff; its request arrived at `job.arrived`.
+    let leg = match (&job.opts.export, &job.opts.import) {
+        (Some(_), _) => Leg::Prefill,
+        (_, Some(_)) => Leg::Decode,
+        _ => Leg::Whole,
+    };
+    let telemetry = Some(RequestMetrics::leg(
         Arc::clone(metrics),
-        arrived,
+        leg,
+        if leg == Leg::Decode { job.arrived } else { arrived },
         job.arrived,
         job.prompt_ids.len(),
         job.gen.max_tokens,
