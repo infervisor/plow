@@ -3446,7 +3446,12 @@ fn serve_plan_only(
             }
         }
         let tp = plowrt::serve::manager::tp_degree(dir);
-        let plan = plowrt::serve::manager::BlobPlan::from_dir_with_device(dir, vmm, Some(&ckpt));
+        // Under the bundle's own config, as the serve plans it.
+        let plan = plowrt::config::bundle_config(dir).and_then(|cfg| {
+            plowrt::config::scoped(Some(cfg), || {
+                plowrt::serve::manager::BlobPlan::from_dir_with_device(dir, vmm, Some(&ckpt))
+            })
+        });
         let refused = refused
             .or_else(|| tp.as_ref().err().map(|e| format!("packet header: {e}")))
             .or_else(|| plan.as_ref().err().map(|e| format!("memory plan: {e}")));
