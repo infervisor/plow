@@ -1301,7 +1301,10 @@ pub enum Leg {
     #[default]
     Whole,
     Prefill,
-    Decode,
+    /// `first`: when the prefill rank produced the first token (the request's TTFT for its SLO).
+    Decode {
+        first: Instant,
+    },
 }
 
 pub struct RequestMetrics {
@@ -1339,7 +1342,7 @@ impl RequestMetrics {
     ) -> Self {
         let admitted = Instant::now();
         metrics.serving.running.fetch_add(1, Relaxed);
-        if leg != Leg::Decode {
+        if !matches!(leg, Leg::Decode { .. }) {
             metrics
                 .serving
                 .queue
@@ -1368,7 +1371,7 @@ impl RequestMetrics {
         } else {
             self.first = Some(now);
             self.cached = cached.min(self.prompt);
-            if self.leg != Leg::Decode {
+            if !matches!(self.leg, Leg::Decode { .. }) {
                 m.ttft.duration(now.saturating_duration_since(self.arrived));
                 m.prefill
                     .duration(now.saturating_duration_since(self.admitted));
@@ -1420,6 +1423,10 @@ impl RequestMetrics {
             });
             let targets = crate::config::RuntimeConfig::get().slo_targets();
             if targets.active() {
+                let first = match self.leg {
+                    Leg::Decode { first } => first,
+                    _ => first,
+                };
                 let ttft_ms = first.saturating_duration_since(self.arrived).as_secs_f64() * 1e3;
                 let tpot_ms =
                     decode.as_secs_f64() * 1e3 / self.tokens.saturating_sub(1).max(1) as f64;
@@ -1526,7 +1533,8 @@ mod tests {
         prefill.token(40);
         prefill.finish(FinishReason::Length, 1);
         drop(prefill);
-        let mut decode = RequestMetrics::leg(d.clone(), Leg::Decode, now, now, 100, 8);
+        let mut decode =
+            RequestMetrics::leg(d.clone(), Leg::Decode { first: now }, now, now, 100, 8);
         for _ in 0..3 {
             decode.token(40);
         }
@@ -1543,7 +1551,12 @@ mod tests {
         assert!(set.rank_of.is_none());
         assert_eq!(snap.models[1].rank_of.as_deref(), Some("m"));
         assert_eq!(
-            (set.completed, set.running, set.generated_tokens, set.aborted),
+            (
+                set.completed,
+                set.running,
+                set.generated_tokens,
+                set.aborted
+            ),
             (1, 0, 3, 0)
         );
         assert_eq!((set.ttft.count, set.e2e.count, set.queue.count), (1, 1, 1));

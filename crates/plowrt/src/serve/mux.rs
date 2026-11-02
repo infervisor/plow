@@ -868,6 +868,10 @@ impl ModelMux {
     }
 
     /// Submit a job. Returns immediately; the caller awaits the stream.
+    pub(crate) fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
     pub fn submit(&self, job: Job) -> std::result::Result<(), SubmitError> {
         let arrived = job.arrived;
         self.submit_arrived(job, arrived, None)
@@ -2997,16 +3001,16 @@ fn admit_session(
         None
     };
 
-    // A P/D decode leg reaches this queue at the handoff; its request arrived at `job.arrived`.
-    let leg = match (&job.opts.export, &job.opts.import) {
-        (Some(_), _) => Leg::Prefill,
-        (_, Some(_)) => Leg::Decode,
-        _ => Leg::Whole,
+    // A P/D decode leg reaches this queue at the handoff; its request arrived with the prefill.
+    let (leg, arrived) = match (&job.opts.export, &job.opts.import) {
+        (Some(_), _) => (Leg::Prefill, arrived),
+        (_, Some(i)) => (Leg::Decode { first: i.first }, i.arrived),
+        _ => (Leg::Whole, arrived),
     };
     let telemetry = Some(RequestMetrics::leg(
         Arc::clone(metrics),
         leg,
-        if leg == Leg::Decode { job.arrived } else { arrived },
+        arrived,
         job.arrived,
         job.prompt_ids.len(),
         job.gen.max_tokens,
@@ -3694,7 +3698,6 @@ fn run_one_tick(
                     &arena,
                     bundle,
                     stop.as_slice(),
-                    &mut tokens_this_tick,
                     &mut disconnected,
                     &mut tick_fault,
                 );
@@ -7559,7 +7562,6 @@ fn gpu_seat_imports(
     arena: &Option<SharedKvState>,
     bundle: &ModelBundle,
     stop: &[u32],
-    tokens_this_tick: &mut usize,
     disconnected: &mut [bool],
     tick_fault: &mut Option<crate::DeviceErrorInfo>,
 ) {
@@ -7613,7 +7615,8 @@ fn gpu_seat_imports(
             bundle,
             import.token,
             1,
-            tokens_this_tick,
+            // The prefill rank produced (and counted) this token.
+            &mut 0,
             Some(stop),
         );
     }

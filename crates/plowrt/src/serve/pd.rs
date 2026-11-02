@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 
 use std::time::Instant;
 
+use crate::obs::Metrics;
 use crate::serve::dp::{DpSet, MAX_DP};
 use crate::serve::mux::{IngressGuard, Job, JobOpts, ModelMux, SubmitError};
 use crate::serve::stream::{self, StreamChunk};
@@ -60,6 +61,10 @@ impl KvExport {
 pub struct KvImport {
     pub image: KvImage,
     pub token: u32,
+    /// The request's arrival, and when the prefill rank streamed the first token: the decode
+    /// rank's e2e and SLO count from them.
+    pub arrived: Instant,
+    pub first: Instant,
     /// Prompt rows the prefill rank served from its prefix cache (`usage.cached_tokens`).
     pub cached_tokens: usize,
 }
@@ -180,27 +185,50 @@ pub(crate) fn submit(
         });
     }
     let set = state.dp_set(&set.model).map(Arc::clone);
+    let metrics = Arc::clone(mux.metrics());
     tokio::spawn(async move {
-        let fail = |job: &Job, msg: String| {
+        // Once the prefill leg finished, the request's outcome is this task's to count until the
+        // decode rank seats it: a failed handoff is a rejection, a client that left an abort.
+        let fail = |job: &Job, msg: String, done: bool| {
+            if done {
+                Metrics::inc(&metrics.rejected);
+            }
             let _ = job
                 .respond
                 .try_send(StreamChunk::Err(RuntimeError::Unavailable(msg)));
         };
+        let left = || {
+            Metrics::inc(&metrics.serving.aborted);
+            Metrics::inc(&metrics.serving.aborted_before_first);
+            metrics.serving.aborted_elapsed.duration(arrived.elapsed());
+        };
         // A client that leaves stops the handoff: dropping the prefill stream ends that job, and
         // its dispatcher skips an export nobody waits for.
-        let (mut first, mut cached_tokens) = (None, 0);
+        let (mut first, mut cached_tokens, mut done) = (None, 0, false);
         loop {
             let chunk = tokio::select! {
                 c = prx.recv() => c,
-                _ = job.respond.closed() => return,
+                _ = job.respond.closed() => {
+                    // A prefill leg that already finished counted no abort of its own.
+                    while let Ok(c) = prx.try_recv() {
+                        done |= matches!(c, StreamChunk::Done { .. });
+                    }
+                    if done {
+                        left();
+                    }
+                    return;
+                }
             };
             match chunk {
                 Some(StreamChunk::Token { id, .. })
                     if first.is_none() && id != stream::TEXT_ONLY =>
                 {
-                    first = Some(id)
+                    first = Some((id, Instant::now()))
                 }
-                Some(StreamChunk::Done { usage, .. }) => cached_tokens = usage.cached_tokens,
+                Some(StreamChunk::Done { usage, .. }) => {
+                    done = true;
+                    cached_tokens = usage.cached_tokens
+                }
                 Some(StreamChunk::Err(err)) => {
                     let _ = job.respond.try_send(StreamChunk::Err(err));
                     return;
@@ -211,37 +239,53 @@ pub(crate) fn submit(
         }
         let image = tokio::select! {
             i = image => i,
-            _ = job.respond.closed() => return,
+            _ = job.respond.closed() => return if done { left() },
         };
         let image = match (first, image) {
             (Some(_), Ok(Ok(image))) => image,
-            (None, _) => return fail(&job, "P/D: the prefill rank produced no token".into()),
-            (_, Ok(Err(err))) => return fail(&job, format!("P/D: KV export failed: {err}")),
-            (_, Err(_)) => return fail(&job, "P/D: the prefill rank dropped the KV image".into()),
+            (None, _) => return fail(&job, "P/D: the prefill rank produced no token".into(), done),
+            (_, Ok(Err(err))) => return fail(&job, format!("P/D: KV export failed: {err}"), done),
+            (_, Err(_)) => {
+                return fail(
+                    &job,
+                    "P/D: the prefill rank dropped the KV image".into(),
+                    done,
+                )
+            }
         };
         if job.respond.is_closed() {
-            return;
+            return if done {
+                left()
+            };
         }
         let Some(set) = set else {
-            return fail(&job, "P/D: the model's DP set is gone".into());
+            return fail(&job, "P/D: the model's DP set is gone".into(), done);
         };
         let sampled = job.gen.params.samples();
         let Some(routed) = set.route_decode(&cfg, sampled) else {
-            return fail(&job, "P/D: no decode rank is up".into());
+            return fail(&job, "P/D: no decode rank is up".into(), done);
         };
         let Some((_, mux)) = decoders.iter().find(|(r, _)| *r == routed.rank) else {
-            return fail(&job, "P/D: the decode rank has no dispatcher".into());
+            return fail(&job, "P/D: the decode rank has no dispatcher".into(), done);
         };
+        let (token, first) = first.expect("matched Some");
         job.opts.import = Some(Box::new(KvImport {
             image,
-            token: first.expect("matched Some"),
+            token,
+            arrived,
+            first,
             cached_tokens,
         }));
         // The decode queue's clock starts now; `job.arrived` keeps the request's own.
         if let Err(SubmitError::Full(job) | SubmitError::Closed(job)) =
             mux.submit_arrived(job, Instant::now(), None)
         {
-            fail(&job, "P/D: the decode rank refused the request".into());
+            // The decode rank counted its refusal.
+            let _ = job
+                .respond
+                .try_send(StreamChunk::Err(RuntimeError::Unavailable(
+                    "P/D: the decode rank refused the request".into(),
+                )));
         }
         drop(routed);
     });
