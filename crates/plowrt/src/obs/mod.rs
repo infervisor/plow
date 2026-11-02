@@ -72,6 +72,9 @@ pub struct Metrics {
     pub kv_used_milli: AtomicU64,
     /// KV bytes the admitted sequences reserve, refreshed with the KV budget (CUDA).
     pub kv_reserved_bytes: AtomicU64,
+    /// The engine's co-tenant cap generation the mux admits under, stored after
+    /// `kv_reserved_bytes` covers every sequence admitted on the previous budget.
+    pub kv_cap_gen: AtomicU64,
 }
 
 impl Metrics {

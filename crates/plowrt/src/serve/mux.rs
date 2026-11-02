@@ -1460,6 +1460,13 @@ fn spawn_scoped(
             #[cfg(feature = "cuda")]
             if kv_budget.is_some() && kv_refreshed.elapsed() >= KV_BUDGET_REFRESH {
                 kv_refreshed = Instant::now();
+                let refreshed = state.gpu_engine(&slug).map(|e| {
+                    let e = e.lock();
+                    kv_budget = e.kv_admission_budget().or(kv_budget);
+                    (e.kv_pressure_events(), e.kv_cap_gen())
+                });
+                // Every sequence admitted on the previous budget is seated: report what they
+                // reserve, then the cap generation from here on admitted under.
                 if let Some(budget) = kv_budget {
                     metrics.kv_reserved_bytes.store(
                         slots
@@ -1478,11 +1485,10 @@ fn spawn_scoped(
                         Ordering::Relaxed,
                     );
                 }
-                let pressure = state.gpu_engine(&slug).map(|e| {
-                    let e = e.lock();
-                    kv_budget = e.kv_admission_budget().or(kv_budget);
-                    e.kv_pressure_events()
-                });
+                if let Some((_, gen)) = refreshed {
+                    metrics.kv_cap_gen.store(gen, Ordering::Release);
+                }
+                let pressure = refreshed.map(|(events, _)| events);
                 let seen = (
                     metrics.kv_budget_denials.load(Ordering::Relaxed),
                     pressure.unwrap_or(0),
