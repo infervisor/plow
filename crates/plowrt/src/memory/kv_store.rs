@@ -558,8 +558,9 @@ pub struct KvStore {
     frees: parking_lot::Mutex<Vec<Chunk<Dev>>>,
     deferred: std::sync::atomic::AtomicBool,
     pending_free_bytes: std::sync::atomic::AtomicU64,
-    /// Device slots that could not grow (cap, floor or growth hold) and reclaimed a cached
-    /// block or were refused: the store wanted memory it did not get ([`Self::pressure`]).
+    /// Device slots whose growth was tried and failed (cap, floor or out of memory) and that
+    /// reclaimed a cached block or were refused: the store wanted memory it did not get
+    /// ([`Self::pressure`]).
     pressure: std::sync::atomic::AtomicU64,
 }
 
@@ -1252,7 +1253,8 @@ impl KvStore {
             .grow_hold_until
             .is_some_and(|t| std::time::Instant::now() < t);
         if hold {
-            self.note_pressure();
+            // Not pressure: the hold follows the store's own shrink, and counting it here let
+            // shrink -> yield -> grow -> shrink feed itself.
             if let Some(s) = self.reclaim_slot(inner, class) {
                 return Ok(s);
             }
@@ -2733,6 +2735,13 @@ mod tests {
         assert_eq!(s.pressure(), 1, "at the cap: reclaimed a cached block");
         assert!(s.acquire(0, key(3)).is_err(), "the only block is live");
         assert_eq!(s.pressure(), 2, "refused at the cap");
+        // A growth hold after the store's own shrink reclaims without counting pressure.
+        s.release(&[b.id]);
+        s.inner.lock().grow_hold_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let mut c = s.acquire(0, key(4)).unwrap();
+        seal(&mut c);
+        assert_eq!(s.pressure(), 2, "held growth is not pressure");
     }
 
     #[test]
