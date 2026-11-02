@@ -1263,19 +1263,21 @@ impl KvStore {
             .sum();
         let mut budget = inner.device_cap.saturating_sub(reserved);
         let mut floor_denied = false;
+        let chunk = inner.classes[class].device.chunk_bytes();
         if budget > 0
             && inner.device_floor > 0
             && inner.stats.device_grows % DEVICE_FLOOR_EVERY == 0
         {
-            let chunk = inner.classes[class].device.chunk_bytes();
             if let Some(free) = ops.free_bytes() {
                 if free
                     < chunk
                         .saturating_mul(DEVICE_FLOOR_EVERY)
                         .saturating_add(inner.device_floor)
                 {
+                    // Pressure only when the cap left a whole chunk: below that, memory given
+                    // back could not lift the limit either.
+                    floor_denied = budget >= chunk;
                     budget = 0;
-                    floor_denied = true;
                 }
             }
         }
@@ -2751,6 +2753,13 @@ mod tests {
             Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
         assert!(s2.acquire(0, key(6)).is_err());
         assert_eq!(s2.pressure(), 2, "floor denial under a hold");
+        // Less cap left than one chunk: the floor denial is no pressure either.
+        let chunk = s2.inner.lock().classes[0].device.chunk_bytes();
+        let (ops3, s3) = store(chunk / 2, 0);
+        *ops3.free.lock() = Some(0);
+        s3.set_device_floor(1);
+        assert!(s3.acquire(0, key(7)).is_err());
+        assert_eq!(s3.pressure(), 0, "cap-bound floor denial");
         drop(ops);
     }
 
