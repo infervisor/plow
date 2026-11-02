@@ -748,7 +748,14 @@ fn yield_park_keeps_the_recent_peak_and_bounds_driver_work() {
     rings.ensure_slot(0).unwrap();
     rings.ensure_slot(1).unwrap();
     assert_eq!(rings.yield_park(8), 0);
-    // The window restarts: the peak is what is live now, so the park yields at most two slots
+    // One window rollover keeps the previous window's peak.
+    rings.peak_at -= PARK_PEAK_WINDOW + std::time::Duration::from_millis(1);
+    assert_eq!(
+        rings.yield_park(8),
+        0,
+        "the previous window's peak still holds"
+    );
+    // A second rollover: the peak is what is live now, so the park yields at most two slots
     // per call, highest index first.
     rings.peak_at -= PARK_PEAK_WINDOW + std::time::Duration::from_millis(1);
     assert_eq!(rings.yield_park(2), 2 * charge);

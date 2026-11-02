@@ -558,9 +558,8 @@ pub struct KvStore {
     frees: parking_lot::Mutex<Vec<Chunk<Dev>>>,
     deferred: std::sync::atomic::AtomicBool,
     pending_free_bytes: std::sync::atomic::AtomicU64,
-    /// Device slots whose growth was tried and failed (cap, floor or out of memory) and that
-    /// reclaimed a cached block or were refused: the store wanted memory it did not get
-    /// ([`Self::pressure`]).
+    /// Device slots whose growth the free-memory floor or an out-of-memory allocation denied:
+    /// the store wanted device memory it did not get ([`Self::pressure`]).
     pressure: std::sync::atomic::AtomicU64,
 }
 
@@ -1253,8 +1252,6 @@ impl KvStore {
             .grow_hold_until
             .is_some_and(|t| std::time::Instant::now() < t);
         if hold {
-            // Not pressure: the hold follows the store's own shrink, and counting it here let
-            // shrink -> yield -> grow -> shrink feed itself.
             if let Some(s) = self.reclaim_slot(inner, class) {
                 return Ok(s);
             }
@@ -1265,6 +1262,7 @@ impl KvStore {
             .map(|c| c.device.reserved_bytes())
             .sum();
         let mut budget = inner.device_cap.saturating_sub(reserved);
+        let mut floor_denied = false;
         if budget > 0
             && inner.device_floor > 0
             && inner.stats.device_grows % DEVICE_FLOOR_EVERY == 0
@@ -1277,6 +1275,7 @@ impl KvStore {
                         .saturating_add(inner.device_floor)
                 {
                     budget = 0;
+                    floor_denied = true;
                 }
             }
         }
@@ -1291,14 +1290,14 @@ impl KvStore {
             inner.stats.device_grows += 1;
             inner.stats.device_grow_us += us;
         }
-        if taken.is_err() {
+        // Pressure is only free device memory the store wanted and did not get: the cap and a
+        // growth hold (which follows the store's own shrink) are limits memory given back cannot
+        // lift, and counting them let shrink -> ring park yield -> grow -> shrink feed itself.
+        if taken.is_err() || floor_denied {
             self.note_pressure();
         }
         if let Some(s) = taken? {
             return Ok(s);
-        }
-        if !hold {
-            self.note_pressure();
         }
         if let Some(s) = (!hold).then(|| self.reclaim_slot(inner, class)).flatten() {
             return Ok(s);
@@ -2143,6 +2142,8 @@ mod tests {
         on_dtod: parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>,
         /// Block contents per address, moved by the copies (the model test).
         mem: parking_lot::Mutex<std::collections::HashMap<u64, u64>>,
+        /// Free device bytes reported to the store (`None` = unknown).
+        free: parking_lot::Mutex<Option<u64>>,
     }
 
     impl MockOps {
@@ -2160,6 +2161,7 @@ mod tests {
                 consumed: parking_lot::Mutex::new(Default::default()),
                 on_dtod: parking_lot::Mutex::new(None),
                 mem: parking_lot::Mutex::new(Default::default()),
+                free: parking_lot::Mutex::new(None),
             })
         }
 
@@ -2220,7 +2222,7 @@ mod tests {
             Ok(())
         }
         fn free_bytes(&self) -> Option<u64> {
-            None
+            *self.free.lock()
         }
     }
 
@@ -2724,24 +2726,32 @@ mod tests {
     }
 
     #[test]
-    fn pressure_counts_slots_the_store_could_not_grow_for() {
-        let (_, s) = store(32, 0); // one block of room
+    fn pressure_counts_only_free_memory_the_store_was_denied() {
+        let (ops, s) = store(32, 0); // one block of room
         let mut a = s.acquire(0, key(1)).unwrap();
         seal(&mut a);
-        assert_eq!(s.pressure(), 0, "growth served it");
         s.release(&[a.id]);
         let mut b = s.acquire(0, key(2)).unwrap();
         seal(&mut b);
-        assert_eq!(s.pressure(), 1, "at the cap: reclaimed a cached block");
         assert!(s.acquire(0, key(3)).is_err(), "the only block is live");
-        assert_eq!(s.pressure(), 2, "refused at the cap");
-        // A growth hold after the store's own shrink reclaims without counting pressure.
+        assert_eq!(s.pressure(), 0, "the cap is no memory pressure");
         s.release(&[b.id]);
         s.inner.lock().grow_hold_until =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
         let mut c = s.acquire(0, key(4)).unwrap();
         seal(&mut c);
-        assert_eq!(s.pressure(), 2, "held growth is not pressure");
+        assert_eq!(s.pressure(), 0, "a held growth is no memory pressure");
+        // The free-memory floor denies growth: pressure, held or not.
+        let (ops2, s2) = store(1 << 20, 0);
+        *ops2.free.lock() = Some(0);
+        s2.set_device_floor(1);
+        assert!(s2.acquire(0, key(5)).is_err());
+        assert_eq!(s2.pressure(), 1, "floor denial");
+        s2.inner.lock().grow_hold_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert!(s2.acquire(0, key(6)).is_err());
+        assert_eq!(s2.pressure(), 2, "floor denial under a hold");
+        drop(ops);
     }
 
     #[test]

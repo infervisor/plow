@@ -344,9 +344,10 @@ pub struct VmmRings {
     /// Released slots whose units stay mapped in place (recycling): readmitting the slot costs no
     /// driver call, and another slot takes them over only when no spare unit is left.
     parked: Vec<bool>,
-    /// Most slots mapped at once since `peak_at`, restarted after [`PARK_PEAK_WINDOW`]
-    /// ([`Self::yield_park`]).
+    /// Most slots mapped at once since `peak_at`, restarted after [`PARK_PEAK_WINDOW`], and the
+    /// previous window's ([`Self::yield_park`]).
     peak: usize,
+    prev_peak: usize,
     peak_at: std::time::Instant,
 }
 
@@ -404,6 +405,7 @@ impl VmmRings {
             bounded: false,
             parked: vec![false; batch],
             peak: 0,
+            prev_peak: 0,
             peak_at: std::time::Instant::now(),
         };
         for t in tensors {
@@ -692,15 +694,17 @@ impl VmmRings {
         self.recent_peak(std::time::Instant::now());
     }
 
-    /// The most slots mapped at once within the current peak window.
+    /// The most slots mapped at once within the current and the previous peak window: a window
+    /// that rolls over between a retirement and the next admission keeps the peak it saw.
     fn recent_peak(&mut self, now: std::time::Instant) -> usize {
         if now.duration_since(self.peak_at) > PARK_PEAK_WINDOW {
+            self.prev_peak = self.peak;
             self.peak = self.stats.mapped_slots;
             self.peak_at = now;
         } else {
             self.peak = self.peak.max(self.stats.mapped_slots);
         }
-        self.peak
+        self.peak.max(self.prev_peak)
     }
 
     /// [`Self::enable_bounded_park`] under device pressure from the cache: return parked slots
