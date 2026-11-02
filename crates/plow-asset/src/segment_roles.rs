@@ -653,10 +653,10 @@ fn valid_attention_shape(role: u8, a: &AttentionCapability, s: &AttentionShape) 
 
 /// `cfg` of a native FP8 block plan entry `[m, n, k, cfg, splits]`: `stages << 4 | variant`,
 /// variant bit 0 = 64-row N tiles (one consumer warpgroup), bit 1 = pipelined promotion,
-/// bit 2 = in-kernel split reduce.
+/// bit 2 = in-kernel split reduce, bit 3 = per-tile rotated group order.
 pub fn fp8_block_cfg(cfg: u32) -> Option<(u32, u32)> {
     let (stages, variant) = (cfg >> 4, cfg & 15);
-    (matches!(stages, 4 | 6) && variant < 8).then_some((stages, variant))
+    matches!(stages, 4 | 6).then_some((stages, variant))
 }
 
 /// Measured Qwen3.8-27B block-FP8 decode plans `[m, n, k, cfg, splits]` (single-projection
@@ -1707,7 +1707,6 @@ mod tests {
             raw.replace("[1,16384,5120,64,2]", "[1,16320,5120,64,2]"),
             raw.replace("[1,16384,5120,64,2]", "[1,16384,5000,64,2]"),
             raw.replace("[1,16384,5120,64,2]", "[1,16384,5120,80,2]"),
-            raw.replace("[1,16384,5120,64,2]", "[1,16384,5120,72,2]"),
             raw.replace("[1,16384,5120,64,2]", "[1,16384,5120,64,9]"),
             raw.replace("[1,16384,5120,64,2]", "[1,16384,256,64,3]"),
             raw.replace("[1,16384,5120,64,2]", "[32,5120,6144,64,2]"),

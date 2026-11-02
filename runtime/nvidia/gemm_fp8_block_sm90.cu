@@ -41,14 +41,17 @@ plow_gemm_fp8_block_m##MT##_s##ST##_v##V(                                       
         return;                                                                                    \
     }                                                                                              \
     extern __shared__ __align__(1024) uint8_t arena[];                                             \
-    d_gemm_fp8_block<MT, ST, NC, (V & 2) != 0, (V & 4) != 0>(out, partial, count, &w_map, &x_map,  \
+    d_gemm_fp8_block<MT, ST, NC, (V & 2) != 0, (V & 4) != 0, (V & 8) != 0>(out, partial, count, &w_map, &x_map,  \
         a_scale, w_scale, M, M4, N, K, splits, arena);                                             \
 }
 
 #define PLOW_FP8B_VARIANTS(MT, ST) \
     PLOW_FP8B_ENTRY(MT, ST, 0) PLOW_FP8B_ENTRY(MT, ST, 1) PLOW_FP8B_ENTRY(MT, ST, 2) \
     PLOW_FP8B_ENTRY(MT, ST, 3) PLOW_FP8B_ENTRY(MT, ST, 4) PLOW_FP8B_ENTRY(MT, ST, 5) \
-    PLOW_FP8B_ENTRY(MT, ST, 6) PLOW_FP8B_ENTRY(MT, ST, 7)
+    PLOW_FP8B_ENTRY(MT, ST, 6) PLOW_FP8B_ENTRY(MT, ST, 7) PLOW_FP8B_ENTRY(MT, ST, 8) \
+    PLOW_FP8B_ENTRY(MT, ST, 9) PLOW_FP8B_ENTRY(MT, ST, 10) PLOW_FP8B_ENTRY(MT, ST, 11) \
+    PLOW_FP8B_ENTRY(MT, ST, 12) PLOW_FP8B_ENTRY(MT, ST, 13) PLOW_FP8B_ENTRY(MT, ST, 14) \
+    PLOW_FP8B_ENTRY(MT, ST, 15)
 
 PLOW_FP8B_VARIANTS(8, 4)
 PLOW_FP8B_VARIANTS(8, 6)

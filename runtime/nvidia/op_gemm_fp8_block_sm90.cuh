@@ -3,7 +3,8 @@
  * out[m][n] = bf16( sum_g  P_g[m][n] * a_scale[g][m] * w_scale[n/128][g] )
  * with x FP8 [M4][K] (1x128 groups, scales a_scale[K/128][M4]), W FP8 [N][K] (128x128 blocks,
  * scales w_scale[N/128][K/128]). P_g is a fresh FP32 WGMMA accumulator over exactly one 128-K
- * group (four k32 MMAs); groups are promoted in ascending order with one fma each (the
+ * group (four k32 MMAs); groups are promoted in a fixed order (ascending, or rotated per tile
+ * with ROT) with one fma each (the
  * DeepGEMM two-level accumulation). Split-K cuts at group boundaries (floor(s*G/S)); each split
  * writes FP32 partials [split][M][N] and fp8_block_reduce sums splits in ascending order.
  *
@@ -66,8 +67,11 @@ __device__ __forceinline__ unsigned fp8b_split_begin(unsigned s, unsigned S, uns
 /* NC consumer warpgroups each own 64 N rows of a 64*NC-row tile; PIPE overlaps a group's WGMMA
  * with the previous group's promotion (two accumulator sets); FUSED makes the last split CTA of
  * a tile sum the tile's partials in split order (self-resetting per-tile counters in `count`,
- * zero before the first launch) instead of a second reduce launch. */
-template <unsigned MT, unsigned STAGES, unsigned NC = 2, bool PIPE = false, bool FUSED = false>
+ * zero before the first launch) instead of a second reduce launch. ROT starts each tile's split at a
+ * different group (rotation 7*tile mod its group count) and promotes in that rotated order: CTAs
+ * then stream different x groups instead of all hitting the same L2 lines at once. */
+template <unsigned MT, unsigned STAGES, unsigned NC = 2, bool PIPE = false, bool FUSED = false,
+          bool ROT = false>
 __device__ __forceinline__ void d_gemm_fp8_block(
     __nv_bfloat16* __restrict__ out, float* __restrict__ partial, unsigned* __restrict__ count,
     const void* w_map, const void* x_map,
@@ -100,7 +104,9 @@ __device__ __forceinline__ void d_gemm_fp8_block(
         for (unsigned item = blockIdx.x; item < items; item += gridDim.x) {
             const unsigned tile = item / splits, split = item % splits;
             const unsigned g0 = fp8b_split_begin(split, splits, G), g1 = fp8b_split_begin(split + 1, splits, G);
-            for (unsigned g = g0; g < g1; ++g, ++iter) {
+            const unsigned rot = ROT ? (tile * 7u) % (g1 - g0) : 0u;
+            for (unsigned gi = g0; gi < g1; ++gi, ++iter) {
+                const unsigned g = ROT ? g0 + (gi - g0 + rot) % (g1 - g0) : gi;
                 const unsigned s = iter % STAGES, phase = (iter / STAGES) & 1;
                 if (iter >= STAGES) sm90_mbar_wait(&empty[s], phase ^ 1);
                 if (tid < MT) sscale[s * MT + tid] = tid < M ? __ldg(a_scale + (size_t)g * M4 + tid) : 0.f;
@@ -123,6 +129,8 @@ __device__ __forceinline__ void d_gemm_fp8_block(
     for (unsigned item = blockIdx.x; item < items; item += gridDim.x) {
         const unsigned tile = item / splits, split = item % splits;
         const unsigned g0 = fp8b_split_begin(split, splits, G), g1 = fp8b_split_begin(split + 1, splits, G);
+        const unsigned rot = ROT ? (tile * 7u) % (g1 - g0) : 0u;
+        auto gmap = [&](unsigned gi) { return ROT ? g0 + (gi - g0 + rot) % (g1 - g0) : gi; };
         float sum[ACC], pa[ACC], pb[ACC];
 #pragma unroll
         for (unsigned i = 0; i < ACC; ++i) sum[i] = 0.f;
@@ -148,7 +156,7 @@ __device__ __forceinline__ void d_gemm_fp8_block(
         if constexpr (!PIPE) {
             for (unsigned g = g0; g < g1; ++g, ++iter) {
                 const unsigned s = iter % STAGES, phase = (iter / STAGES) & 1;
-                const float ws = __ldg(w_scale + (size_t)(tile * BN / 128) * G + g);
+                const float ws = __ldg(w_scale + (size_t)(tile * BN / 128) * G + gmap(g));
                 sm90_mbar_wait(&full[s], phase);
                 issue(pa, s);
                 sm90_wg_wait<0>();
@@ -161,7 +169,7 @@ __device__ __forceinline__ void d_gemm_fp8_block(
                 s = iter % STAGES;
                 const unsigned phase = (iter / STAGES) & 1;
                 ++iter;
-                const float ws = __ldg(w_scale + (size_t)(tile * BN / 128) * G + g);
+                const float ws = __ldg(w_scale + (size_t)(tile * BN / 128) * G + gmap(g));
                 sm90_mbar_wait(&full[s], phase);
                 return ws;
             };
