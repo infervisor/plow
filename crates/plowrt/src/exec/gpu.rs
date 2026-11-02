@@ -2919,8 +2919,9 @@ pub struct GpuEngine {
     kv_admit_reserve: u64,
     /// The manager's cap on the admission budget while co-resident engines share the device.
     kv_budget_cap: Option<u64>,
-    /// The bounded ring park's solo cap (`None`: no bounded park), restored when co-residency ends.
-    ring_park_cap: Option<u64>,
+    /// The rings' solo retention ([`crate::memory::vmm::VmmRings::retention`]) while
+    /// co-resident engines keep none; restored when co-residency ends.
+    solo_ring_retention: Option<(bool, bool, u64)>,
     /// Pool bytes the row-zero block columns mapped at load hold (every slot keeps them).
     kv_row_zero_bytes: u64,
     /// Free bytes the prefix cache's pressure eviction keeps (0: not armed).
@@ -7573,7 +7574,6 @@ impl GpuEngine {
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
         let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
         let mut store_room = None;
-        let mut ring_park_cap = None;
         let mut cache_floor = 0;
         let mut store_floor_band = None;
         if let Some(kv) = vmm
@@ -7615,7 +7615,6 @@ impl GpuEngine {
             let charge = rings.slot_charge().max(1);
             let slots = (room / 2 / charge).min(rings.slots() as u64);
             rings.set_park_cap(slots * charge);
-            ring_park_cap = Some(slots * charge);
             tracing::info!(
                 park_slots = slots,
                 slots = rings.slots(),
@@ -7821,7 +7820,7 @@ impl GpuEngine {
             kv_admission,
             kv_admit_reserve,
             kv_budget_cap: None,
-            ring_park_cap,
+            solo_ring_retention: None,
             kv_row_zero_bytes: 0,
             cache_floor,
             store_floor_band,
@@ -8281,10 +8280,10 @@ impl GpuEngine {
         self.kv_admission_uncapped()
     }
 
-    /// Device bytes this engine's KV holds now that co-residency can share: pool blocks the prefix
-    /// cache does not reference, mapped ring slots, and parked or spare ring units (released when
-    /// co-resident), less the row-zero columns every slot keeps. Cache blocks, pool spares and the
-    /// block store are left out: they shrink only under this engine's own pressure.
+    /// Device bytes only this engine's admitted sequences hold now (pool blocks the prefix cache
+    /// does not reference, mapped ring slots), less the row-zero columns every slot keeps. Cache
+    /// blocks, pool spares and the block store are left out: they shrink only under this engine's
+    /// own pressure. Parked ring units are returned before shares are taken (`enter_co_tenancy`).
     pub fn kv_live_held(&self) -> u64 {
         self.kv_held_now().saturating_sub(self.kv_row_zero_bytes)
     }
@@ -8293,10 +8292,8 @@ impl GpuEngine {
         let Some(vmm) = self.vmm.as_ref() else {
             return 0;
         };
-        // Parked and spare ring units count: co-residency returns them to the driver
-        // (`set_co_tenant`), so they are room, not used memory.
         let rings = vmm.rings.as_ref().map_or(0, |rings| {
-            rings.stats().mapped_slots as u64 * rings.slot_charge() + rings.spare_bytes()
+            rings.stats().mapped_slots as u64 * rings.slot_charge()
         });
         let blocks = vmm.kv.as_ref().map_or(0, |kv| {
             let st = kv.stats();
@@ -8310,18 +8307,12 @@ impl GpuEngine {
     /// `(None, 0)` restores the solo budget and floors.
     pub fn set_co_tenant(&mut self, cap: Option<u64>, keep_free: u64) {
         self.kv_budget_cap = cap;
-        // Co-resident, released slots' rings go back to the driver instead of parking: parked
-        // units would hold the room the other engines' caps were given. Queued work may still
-        // write a parked slot's idle lane, so the stream drains first.
-        if let Some(solo) = self.ring_park_cap {
-            if cap.is_some() {
-                if let Err(e) = self.be.stream_synchronize(&self.stream) {
-                    tracing::warn!(error = %e, "co-tenant: stream drain failed, ring park kept");
-                } else if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
-                    rings.set_park_cap(0);
-                }
-            } else if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
-                rings.set_park_cap(solo);
+        if cap.is_none() {
+            if let (Some(solo), Some(rings)) = (
+                self.solo_ring_retention.take(),
+                self.vmm.as_mut().and_then(|v| v.rings.as_mut()),
+            ) {
+                rings.set_retention(solo);
             }
         }
         if self.cache_floor == 0 {
@@ -8340,6 +8331,26 @@ impl GpuEngine {
                 None => bs.set_device_floor(if keep_free > 0 { floor } else { 0 }),
             }
         }
+    }
+
+    /// Before co-resident shares are taken: released slots' rings go back to the driver instead
+    /// of parking or recycling, so every byte they held is free memory the shares can split and
+    /// none is retained outside a request while co-resident. Queued work may still write a
+    /// parked slot's idle lane, so the stream drains first. `set_co_tenant(None, _)` restores.
+    pub fn enter_co_tenancy(&mut self) -> Result<()> {
+        if self.solo_ring_retention.is_some() {
+            return Ok(());
+        }
+        let Some(rings) = self.vmm.as_ref().and_then(|v| v.rings.as_ref()) else {
+            return Ok(());
+        };
+        let solo = rings.retention();
+        self.be.stream_synchronize(&self.stream)?;
+        if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+            rings.set_retention((true, true, 0));
+        }
+        self.solo_ring_retention = Some(solo);
+        Ok(())
     }
 
     fn kv_admission_uncapped(&self) -> Option<crate::sched::admission::KvBudget> {

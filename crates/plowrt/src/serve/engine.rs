@@ -502,6 +502,16 @@ impl ServeEngine {
         }
     }
 
+    /// See [`crate::exec::gpu::GpuEngine::enter_co_tenancy`]; a no-op off CUDA.
+    pub fn enter_co_tenancy(&mut self) -> crate::Result<()> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.enter_co_tenancy(),
+            #[allow(unreachable_patterns)]
+            _ => Ok(()),
+        }
+    }
+
     /// Give `bytes` back from this engine's caches for another model's load; whether anything
     /// was released or queued.
     pub fn reclaim_device(&mut self, bytes: u64) -> crate::Result<bool> {

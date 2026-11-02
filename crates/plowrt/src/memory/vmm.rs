@@ -505,6 +505,20 @@ impl VmmRings {
         self.mapped.len()
     }
 
+    /// What released units the rings keep: `(recycle, bounded, cap)`.
+    pub fn retention(&self) -> (bool, bool, u64) {
+        (self.recycle, self.bounded, self.spare_cap)
+    }
+
+    /// Restore a [`Self::retention`]; `(true, true, 0)` returns every parked slot and spare unit
+    /// to the driver and keeps none released after.
+    pub fn set_retention(&mut self, (recycle, bounded, cap): (bool, bool, u64)) {
+        self.recycle = recycle;
+        self.bounded = bounded;
+        self.spare_cap = cap;
+        self.trim_spare();
+    }
+
     /// Set the bounded park's cap, releasing what it holds above it.
     pub fn set_park_cap(&mut self, cap_bytes: u64) {
         if self.bounded {

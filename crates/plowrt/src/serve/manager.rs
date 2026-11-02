@@ -2120,6 +2120,9 @@ impl ModelManager {
             }
             return Ok(());
         }
+        for (_, e) in &engines {
+            e.lock().enter_co_tenancy().map_err(EnsureError::Load)?;
+        }
         let metrics: Vec<_> = engines
             .iter()
             .map(|(s, _)| state.model_metrics(s))
