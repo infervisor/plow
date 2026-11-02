@@ -187,10 +187,11 @@ impl std::str::FromStr for DevId {
 #[allow(dead_code)]
 fn driver_absent(e: &str) -> bool {
     [
-        "dlopen",
+        "cannot open shared object file",
         "CUDA_ERROR_NO_DEVICE",
         "no GPU agents",
         ">= 0 GPU agents",
+        "selects no device",
     ]
     .iter()
     .any(|m| e.contains(m))

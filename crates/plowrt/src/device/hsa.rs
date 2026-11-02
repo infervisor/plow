@@ -4372,6 +4372,7 @@ impl HsaBackend {
 ///   ordinal, so the physical block lands in this agent's coarse-grained VRAM
 ///   by construction; the CUDA path encodes the same intent in
 ///   `CUmemAllocationProp::location`.
+#[cfg(target_os = "linux")]
 impl super::host_region::HostStaging for HsaBackend {
     fn staging_vendor(&self) -> hwspec::Vendor {
         hwspec::Vendor::Amd

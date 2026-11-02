@@ -2485,6 +2485,7 @@ impl CudaBackend {
 /// context already covers the range.
 const HOST_MEMORY_ALREADY_REGISTERED: CUresult = 712;
 
+#[cfg(target_os = "linux")]
 impl super::host_region::HostStaging for CudaBackend {
     fn staging_vendor(&self) -> hwspec::Vendor {
         hwspec::Vendor::Nvidia
