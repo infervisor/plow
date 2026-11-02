@@ -9539,7 +9539,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().decode_objects.is_some() {
         assert!(
-            matches!(arch.as_str(), "sm_90a" | "sm_120") && tp == 1,
+            matches!(arch.as_str(), "sm_90a" | "sm_120" | "sm_120a") && tp == 1,
             "decode objects require a supported single-GPU CUDA target"
         );
         assert!(
