@@ -1464,6 +1464,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.attn_library", Some("PLOW_EMIT_ATTN_LIBRARY"), Layer::Emit, Domain::Bool, OFF, OPT_IN).per_rung(PREFILL_RUNGS),
+    KnobSpec::new("emit.attn_library_unsplit", Some("PLOW_EMIT_ATTN_LIBRARY_UNSPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN).per_rung(PREFILL_RUNGS),
     KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED).per_rung(PREFILL_RUNGS),
     KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_gemm_glu_role", Some("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

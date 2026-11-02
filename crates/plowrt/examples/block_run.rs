@@ -620,8 +620,160 @@ mod cuda {
             )?;
             row0 = row1;
         }
+        if flag("--permute").is_some() {
+            permute_check(e, desc, hidden, out_name, &slots, &rows, &inputs, &packed, &|e| {
+                prepare(e)?;
+                Ok(requests_in(&slots, &prompts, &starts, &rows))
+            })?;
+        }
         println!("packed-check: requests={} query_rows={} kv_base={} serial_ms={serial_ms:.4} packed_ms={packed_ms:.4} parity=PASS",
             slots.len(), rows.iter().sum::<usize>(), starts[0] + rows[0]);
+        Ok(())
+    }
+
+    fn requests_in<'a>(
+        slots: &[usize],
+        prompts: &'a [Vec<u32>],
+        starts: &[usize],
+        rows: &[usize],
+    ) -> Vec<plowrt::exec::gpu::PfBatchReq<'a>> {
+        (0..slots.len())
+            .map(|request| plowrt::exec::gpu::PfBatchReq {
+                slot: slots[request],
+                prompt: &prompts[request],
+                c0: starts[request],
+                len: rows[request],
+            })
+            .collect()
+    }
+
+    /// Whole slot regions of every carried KV tensor (and its scale), one Vec per slot.
+    fn slot_kv(
+        e: &plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        slots: &[usize],
+    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+        let mut out = vec![Vec::new(); slots.len()];
+        for state in desc.carried_state.iter().filter(|s| s.role == "kv") {
+            for name in &state.tensors {
+                for tensor in [name.clone(), format!("{name}_scale")] {
+                    let Some(bytes) = e.tensor_bytes(&tensor) else {
+                        continue;
+                    };
+                    let slot_bytes = bytes / e.batch() as u64;
+                    for (i, &slot) in slots.iter().enumerate() {
+                        let mut data = vec![0u8; usize::try_from(slot_bytes)?];
+                        e.read_tensor_range(&tensor, slot as u64 * slot_bytes, &mut data)?;
+                        out[i].extend_from_slice(&data);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `packed-check --permute`: the same rung's launch, re-packed in reverse request order and
+    /// again with each half of the requests' inputs perturbed, must give every unperturbed
+    /// request the first packed run's exact activation bits and slot KV bytes (co-packed rows
+    /// and packing order do not reach a row).
+    #[allow(clippy::too_many_arguments)]
+    fn permute_check<'a>(
+        e: &mut plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        hidden: usize,
+        out_name: &str,
+        slots: &[usize],
+        rows: &[usize],
+        inputs: &[f32],
+        packed: &[f32],
+        prepare: &dyn Fn(
+            &mut plowrt::exec::gpu::GpuEngine,
+        )
+            -> Result<Vec<plowrt::exec::gpu::PfBatchReq<'a>>, plowrt::RuntimeError>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let offsets: Vec<usize> = rows
+            .iter()
+            .scan(0, |acc, &r| {
+                let at = *acc;
+                *acc += r;
+                Some(at)
+            })
+            .collect();
+        let span = |r: usize| offsets[r] * hidden..(offsets[r] + rows[r]) * hidden;
+        let served = |e: &plowrt::exec::gpu::GpuEngine| {
+            e.library_attention_launches().map_or(0, |(s, _)| s)
+        };
+        let reference_kv = {
+            // The first packed run's KV: re-run it so its slots are the last write.
+            let requests = prepare(e)?;
+            e.upload_activation("act.x", inputs)?;
+            e.prefill_batched(&requests)?;
+            let again = e.download_activation(out_name)?;
+            if (0..rows.len()).any(|r| {
+                again[span(r)]
+                    .iter()
+                    .zip(&packed[span(r)])
+                    .any(|(a, b)| a.to_bits() != b.to_bits())
+            }) {
+                return Err("permute-check: the packed launch is not reproducible".into());
+            }
+            slot_kv(e, desc, slots)?
+        };
+        let alt = synth(rows.iter().sum::<usize>() + 7, hidden);
+        let n = rows.len();
+        let variants: Vec<(&str, Vec<usize>, Vec<bool>)> = vec![
+            ("reversed", (0..n).rev().collect(), vec![false; n]),
+            ("even perturbed", (0..n).collect(), (0..n).map(|r| r % 2 == 0).collect()),
+            ("odd perturbed", (0..n).collect(), (0..n).map(|r| r % 2 == 1).collect()),
+        ];
+        for (label, order, perturbed) in variants {
+            let requests = prepare(e)?;
+            let mut x = Vec::with_capacity(inputs.len());
+            for &r in &order {
+                if perturbed[r] {
+                    x.extend_from_slice(&alt[7 * hidden + span(r).start..7 * hidden + span(r).end]);
+                } else {
+                    x.extend_from_slice(&inputs[span(r)]);
+                }
+            }
+            let reordered: Vec<_> = order
+                .iter()
+                .map(|&r| plowrt::exec::gpu::PfBatchReq {
+                    slot: requests[r].slot,
+                    prompt: requests[r].prompt,
+                    c0: requests[r].c0,
+                    len: requests[r].len,
+                })
+                .collect();
+            e.upload_activation("act.x", &x)?;
+            let before = served(e);
+            e.prefill_batched(&reordered)?;
+            let library = served(e) > before;
+            let out = e.download_activation(out_name)?;
+            let kv = slot_kv(e, desc, slots)?;
+            let mut at = 0;
+            for &r in &order {
+                let got = &out[at * hidden..(at + rows[r]) * hidden];
+                at += rows[r];
+                if perturbed[r] {
+                    continue;
+                }
+                let bits_differ = got
+                    .iter()
+                    .zip(&packed[span(r)])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                if bits_differ != 0 || kv[r] != reference_kv[r] {
+                    return Err(format!(
+                        "permute-check {label}: request {r} differs ({bits_differ} activation \
+                         values, KV equal {})",
+                        kv[r] == reference_kv[r]
+                    )
+                    .into());
+                }
+            }
+            println!("permute-check {label}: unperturbed requests bit-identical (library attention served: {library})");
+        }
         Ok(())
     }
 

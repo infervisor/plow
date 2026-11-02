@@ -312,6 +312,7 @@ fn bind_decode(
                 index,
                 roles,
                 library: Vec::new(),
+                library_unsplit: false,
             });
         }
     }

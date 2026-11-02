@@ -375,6 +375,7 @@ fn isolate_segments(
             index: update.index,
             roles: update.roles.clone(),
             library: Vec::new(),
+            library_unsplit: false,
         };
         if let Some(position) = update.prior_position {
             metadata.programs[position] = record;
@@ -1670,6 +1671,7 @@ mod tests {
             index: 1,
             roles: vec![plow_asset::segment_roles::PREFILL_ATTENTION],
             library: Vec::new(),
+            library_unsplit: false,
         };
         let mut sections = vec![SectionData {
             kind: SECT_METADATA,

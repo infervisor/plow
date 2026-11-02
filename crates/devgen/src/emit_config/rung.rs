@@ -100,6 +100,7 @@ macro_rules! rung_fields {
 rung_fields! {
     no_glu_fuse: bool,
     attn_library: bool,
+    attn_library_unsplit: bool,
 }
 
 /// `raw` through the field's own clap value parser, on an isolated copy of its arg: the same

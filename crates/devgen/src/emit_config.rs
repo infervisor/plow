@@ -1710,6 +1710,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_ATTN_LIBRARY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub attn_library: bool,
 
+    /// Run this rung's library attention launches unsplit and refuse a launch the library cannot
+    /// serve (no native fallback): a row's bits depend only on its own request. Per rung; needs
+    /// `PLOW_EMIT_ATTN_LIBRARY` on the same rung.
+    #[arg(long, env = "PLOW_EMIT_ATTN_LIBRARY_UNSPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub attn_library_unsplit: bool,
+
     /// Emit TMA descriptors for GEMM operands (sm_90a+).
     #[arg(long, env = "PLOW_TMA_GEMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub tma_gemm: bool,
@@ -2312,6 +2318,7 @@ impl EmitConfig {
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),
             attn_library: env_bool("PLOW_EMIT_ATTN_LIBRARY"),
+            attn_library_unsplit: env_bool("PLOW_EMIT_ATTN_LIBRARY_UNSPLIT"),
             tma_gemm: env_bool("PLOW_TMA_GEMM"),
             gemma4_sm90_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"),
             gemma4_sm90_w8a8_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"),
