@@ -660,9 +660,9 @@ pub fn fp8_block_cfg(cfg: u32) -> Option<(u32, u32)> {
 }
 
 /// Measured Qwen3.8-27B block-FP8 decode plans `[m, n, k, cfg, splits]` (single-projection
-/// screen, H100 SXM5, CUDA-graph timed, published checkpoint scales): devgen plans the routed
-/// shapes it finds here; others stay on cuBLASLt.
-pub const NATIVE_DECODE_FP8_BLOCK_SHAPES: [[u32; 5]; 42] = [
+/// screen, H100 SXM5, CUDA-graph timed, published checkpoint scales), only where faster than
+/// cuBLASLt: devgen plans the routed shapes it finds here; others stay on cuBLASLt.
+pub const NATIVE_DECODE_FP8_BLOCK_SHAPES: [[u32; 5]; 33] = [
     [1, 5120, 6144, 97, 4],
     [2, 5120, 6144, 97, 4],
     [4, 5120, 6144, 97, 4],
@@ -680,25 +680,16 @@ pub const NATIVE_DECODE_FP8_BLOCK_SHAPES: [[u32; 5]; 42] = [
     [4, 6144, 5120, 65, 3],
     [8, 6144, 5120, 97, 4],
     [16, 6144, 5120, 65, 4],
-    [32, 6144, 5120, 65, 3],
     [1, 10240, 5120, 97, 2],
     [2, 10240, 5120, 97, 2],
-    [4, 10240, 5120, 97, 2],
-    [8, 10240, 5120, 65, 2],
-    [16, 10240, 5120, 64, 4],
-    [32, 10240, 5120, 65, 2],
     [1, 14336, 5120, 67, 1],
     [2, 14336, 5120, 67, 1],
     [4, 14336, 5120, 67, 1],
     [8, 14336, 5120, 65, 2],
-    [16, 14336, 5120, 64, 2],
-    [32, 14336, 5120, 65, 2],
     [1, 16384, 5120, 67, 1],
     [2, 16384, 5120, 67, 1],
     [4, 16384, 5120, 67, 1],
     [8, 16384, 5120, 65, 2],
-    [16, 16384, 5120, 65, 2],
-    [32, 16384, 5120, 65, 1],
     [1, 34816, 5120, 65, 1],
     [2, 34816, 5120, 64, 1],
     [4, 34816, 5120, 65, 1],
