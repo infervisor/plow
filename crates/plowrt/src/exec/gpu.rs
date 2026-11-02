@@ -2893,6 +2893,8 @@ pub struct GpuEngine {
     kv_admit_reserve: u64,
     /// The manager's cap on the admission budget while co-resident engines share the device.
     kv_budget_cap: Option<u64>,
+    /// Pool bytes the row-zero block columns mapped at load hold (every slot keeps them).
+    kv_row_zero_bytes: u64,
     /// Free bytes the prefix cache's pressure eviction keeps (0: not armed).
     cache_floor: u64,
     /// The block store's growth floor above `cache_floor` (`None`: the store keeps its floor).
@@ -7780,6 +7782,7 @@ impl GpuEngine {
             kv_admission,
             kv_admit_reserve,
             kv_budget_cap: None,
+            kv_row_zero_bytes: 0,
             cache_floor,
             store_floor_band,
             kv_row_bytes: blob
@@ -7910,16 +7913,17 @@ impl GpuEngine {
                 Err(e) => tracing::warn!(error = %e, "qwen chain graph warmup failed"),
             }
         }
-        // A decode launch writes its idle lanes' garbage row at position 0, so the first wide
-        // launch maps every slot's first block column (decode's VMM backstop). Mapped here
-        // instead, after the admission budget and store cap are sized as before, the planner's
-        // load measurement includes it: 2 x Gemma-4-E4B (4 GiB each, 128 slots) was admitted
-        // on a measurement without it and both engines ran out of device memory on first use.
-        if let Some(v) = engine.vmm.as_ref() {
+        // Prefix-cache admission maps every slot's first block column on the first request
+        // (wider decode rungs write idle rows at position 0). Mapped here instead, after the
+        // admission budget and store cap are sized as before, the planner's load measurement
+        // includes it: 2 x Gemma-4-E4B (4 GiB each, 128 slots) was admitted on a measurement
+        // without it and both engines ran out of device memory on first use.
+        if let Some(v) = engine.vmm.as_ref().filter(|v| v.prefix_kv().is_some()) {
             for b in 0..engine.vmm_active.len() {
                 v.ensure_rows(b, 1)?;
             }
         }
+        engine.kv_row_zero_bytes = engine.kv_live_held();
         Ok(engine)
     }
 
@@ -8238,10 +8242,14 @@ impl GpuEngine {
     }
 
     /// Device bytes only this engine's admitted sequences hold now (pool blocks the prefix cache
-    /// does not reference, mapped ring slots). Cache blocks, pool spares, spare ring units and
-    /// the block store are left out: they shrink only under this engine's own pressure, so a
-    /// co-tenant cannot count on them.
+    /// does not reference, mapped ring slots), less the row-zero columns every slot keeps. Cache
+    /// blocks, pool spares, spare ring units and the block store are left out too: they shrink
+    /// only under this engine's own pressure, so a co-tenant cannot count on them.
     pub fn kv_live_held(&self) -> u64 {
+        self.kv_held_now().saturating_sub(self.kv_row_zero_bytes)
+    }
+
+    fn kv_held_now(&self) -> u64 {
         let Some(vmm) = self.vmm.as_ref() else {
             return 0;
         };
