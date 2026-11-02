@@ -50,9 +50,9 @@ fn plan(gen: &[GenTensor], tensors: &[DevTensor]) -> Result<Option<Vec<GenTensor
             .iter()
             .find(|g| g.kind == kind)
             .ok_or_else(|| invalid("missing recipe kind"))?;
-        if !g.amd_rope_bf16() || g.ctx != recipes[0].ctx {
+        if !g.amd_rope_bf16() || g.ctx != recipes[0].ctx || g.theta != recipes[0].theta {
             return Err(invalid(
-                "invalid plain GLM rotary64/head64-or-128/theta8e6 recipe",
+                "recipe outside the qualified BF16 rotary-64 cache domain",
             ));
         }
         if gen.iter().filter(|r| r.tensor == g.tensor).count() != 1
@@ -119,7 +119,7 @@ pub(super) fn bind(
     let args = [
         pointers[0],
         pointers[1],
-        u64::from(recipes[0].ctx) | (u64::from(8000000f32.to_bits()) << 32),
+        u64::from(recipes[0].ctx) | (u64::from((recipes[0].theta as f32).to_bits()) << 32),
     ];
     be.launch(kernel, 256, 256, 0, bytemuck::cast_slice(&args))?;
     be.synchronize()?;
