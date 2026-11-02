@@ -1519,7 +1519,7 @@ impl SparseMla {
     pub fn needs_prepare(&self, route: Route, rank: u32) -> Result<bool> {
         let clear = route.active
             && route.is_rowsplit()
-            && crate::config::RuntimeConfig::get().amd.glm_rowband_clear_ws;
+            && crate::config::RuntimeConfig::get().amd.rowband_clear_ws;
         let missing = match route.csr_key(rank)? {
             Some((prior, rows)) => !self
                 .lo
@@ -1536,7 +1536,7 @@ impl SparseMla {
         let key = route.csr_key(rank)?;
         if route.active
             && route.is_rowsplit()
-            && crate::config::RuntimeConfig::get().amd.glm_rowband_clear_ws
+            && crate::config::RuntimeConfig::get().amd.rowband_clear_ws
         {
             self.clear_workspace_quiescent(be)?;
         }
@@ -1666,7 +1666,7 @@ impl SparseMla {
         })
     }
 
-    /// DIAGNOSTIC (`PLOW_GLM_ROWBAND_CLEAR_WS`). Zero every byte of the sparse workspace and the
+    /// DIAGNOSTIC (`PLOW_ROWBAND_CLEAR_WS`). Zero every byte of the sparse workspace and the
     /// lower-half CSR, and forget the CSR's staged key, so a row-band dispatch sees exactly the
     /// device state a freshly loaded server would give it.
     ///

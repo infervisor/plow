@@ -400,10 +400,11 @@ pub fn sidecar_checks_file(packet: &std::path::Path) -> std::path::PathBuf {
 }
 
 impl SidecarCheckReceipts {
-    pub fn validate_packet(&self, packet: &[u8]) -> Result<(), String> {
+    /// `packet_sha256` is the loaded packet's [`crate::decode_objects::image_sha256`].
+    pub fn validate_packet(&self, packet_sha256: &str) -> Result<(), String> {
         if self.schema != 1
             || !is_sha256(&self.compiler_sha256)
-            || self.packet_sha256 != crate::decode_objects::image_sha256(packet)
+            || self.packet_sha256 != packet_sha256
         {
             return Err("sidecar check receipt does not match loaded packet".into());
         }
@@ -445,10 +446,11 @@ impl SidecarCheckReceipts {
 }
 
 impl PacketCheckReceipts {
-    pub fn validate_packet(&self, packet: &[u8]) -> Result<(), String> {
+    /// `packet_sha256` is the loaded packet's [`crate::decode_objects::image_sha256`].
+    pub fn validate_packet(&self, packet_sha256: &str) -> Result<(), String> {
         if self.schema != 1
             || !is_sha256(&self.compiler_sha256)
-            || self.packet_sha256 != crate::decode_objects::image_sha256(packet)
+            || self.packet_sha256 != packet_sha256
         {
             return Err("compiler check receipt does not match loaded packet".into());
         }
@@ -618,9 +620,9 @@ pub struct Qualification {
 }
 
 impl Qualification {
-    fn new(packet: &[u8], programs: usize, required: BTreeSet<Obligation>) -> Self {
+    fn new(packet_sha256: &str, programs: usize, required: BTreeSet<Obligation>) -> Self {
         Self {
-            packet_sha256: crate::decode_objects::image_sha256(packet),
+            packet_sha256: packet_sha256.to_string(),
             programs,
             required,
             satisfied: BTreeSet::new(),
@@ -810,11 +812,11 @@ pub fn bind_packet_receipt(
 /// legacy path reports them as rejections.
 pub fn qualify_packet(
     receipts: Option<&PacketCheckReceipts>,
-    raw: &[u8],
+    packet_sha256: &str,
     packet: &crate::program::Packet<'_>,
 ) -> Qualification {
     let mut q = Qualification::new(
-        raw,
+        packet_sha256,
         packet.programs.len(),
         required_packet_obligations(packet),
     );
@@ -823,7 +825,7 @@ pub fn qualify_packet(
         q.missing(packet);
         return q;
     };
-    if let Err(error) = receipts.validate_packet(raw) {
+    if let Err(error) = receipts.validate_packet(packet_sha256) {
         q.gaps.push(error);
         q.missing(packet);
         return q;
@@ -854,7 +856,7 @@ pub fn qualify_packet(
 /// that program's reconstructed logical-effects obligation.
 pub fn qualify_sidecar(
     receipts: Option<&SidecarCheckReceipts>,
-    raw: &[u8],
+    packet_sha256: &str,
     packet: &crate::program::Packet<'_>,
 ) -> Qualification {
     let required = (0..packet.programs.len())
@@ -865,13 +867,13 @@ pub fn qualify_sidecar(
             site: None,
         })
         .collect();
-    let mut q = Qualification::new(raw, packet.programs.len(), required);
+    let mut q = Qualification::new(packet_sha256, packet.programs.len(), required);
     let Some(receipts) = receipts else {
         q.gaps.push("no sidecar check receipts".into());
         q.missing(packet);
         return q;
     };
-    if let Err(error) = receipts.validate_packet(raw) {
+    if let Err(error) = receipts.validate_packet(packet_sha256) {
         q.gaps.push(error);
         q.missing(packet);
         return q;
@@ -1338,7 +1340,9 @@ mod tests {
         raw: &[u8],
         receipts: Option<&PacketCheckReceipts>,
     ) -> Qualification {
-        crate::program::with_model(model, |packet| qualify_packet(receipts, raw, packet))
+        crate::program::with_model(model, |packet| {
+            qualify_packet(receipts, &crate::decode_objects::image_sha256(raw), packet)
+        })
     }
 
     #[test]
@@ -1416,7 +1420,9 @@ mod tests {
             program_checks: vec![Some(0), Some(1)],
         };
         let q = |r: Option<&SidecarCheckReceipts>| {
-            crate::program::with_model(&model, |packet| qualify_sidecar(r, &raw, packet))
+            crate::program::with_model(&model, |packet| {
+                qualify_sidecar(r, &crate::decode_objects::image_sha256(&raw), packet)
+            })
         };
         assert!(
             q(Some(&receipts)).qualified(),

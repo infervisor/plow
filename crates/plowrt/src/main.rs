@@ -4222,7 +4222,13 @@ async fn bringup_runtime(
         } else {
             let policy: Place = RuntimeConfig::get().place;
 
-            // Per-model footprint and TP degree, both from the blob header.
+            // Per-model footprint and TP degree, both from the blob header. Holding each packet and
+            // build.json until the initial loads finish makes the plan, the TP probe and the engine
+            // load share one read and parse.
+            let _anchors: Vec<_> = models
+                .iter()
+                .map(|(_, dir, _)| plowrt::asset::packet_image::LoadAnchor::hold(dir))
+                .collect();
             let granularity = cuda.granularity()?;
             let mut specs: Vec<ModelSpec> = Vec::with_capacity(models.len());
             for (slug, dir, checkpoint) in &models {
