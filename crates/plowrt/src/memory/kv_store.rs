@@ -558,9 +558,6 @@ pub struct KvStore {
     frees: parking_lot::Mutex<Vec<Chunk<Dev>>>,
     deferred: std::sync::atomic::AtomicBool,
     pending_free_bytes: std::sync::atomic::AtomicU64,
-    /// Device slots that could not grow (cap, floor or growth hold) and reclaimed a cached
-    /// block or were refused: the store wanted memory it did not get ([`Self::pressure`]).
-    pressure: std::sync::atomic::AtomicU64,
 }
 
 /// What [`KvStore::acquire`] handed out.
@@ -720,7 +717,6 @@ impl KvStore {
             frees: parking_lot::Mutex::new(Vec::new()),
             deferred: std::sync::atomic::AtomicBool::new(false),
             pending_free_bytes: std::sync::atomic::AtomicU64::new(0),
-            pressure: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1252,7 +1248,6 @@ impl KvStore {
             .grow_hold_until
             .is_some_and(|t| std::time::Instant::now() < t);
         if hold {
-            self.note_pressure();
             if let Some(s) = self.reclaim_slot(inner, class) {
                 return Ok(s);
             }
@@ -1289,14 +1284,8 @@ impl KvStore {
             inner.stats.device_grows += 1;
             inner.stats.device_grow_us += us;
         }
-        if taken.is_err() {
-            self.note_pressure();
-        }
         if let Some(s) = taken? {
             return Ok(s);
-        }
-        if !hold {
-            self.note_pressure();
         }
         if let Some(s) = (!hold).then(|| self.reclaim_slot(inner, class)).flatten() {
             return Ok(s);
@@ -1885,17 +1874,6 @@ impl KvStore {
             released += c.device.release_empty_chunks(|c| frees.push(c));
         }
         released
-    }
-
-    fn note_pressure(&self) {
-        self.pressure
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Times a device slot could not grow the store (see the field). A caller holding device
-    /// memory the store could use (parked live rings) gives it back when this moves.
-    pub fn pressure(&self) -> u64 {
-        self.pressure.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The device bytes the store may reserve from now on (chunks already reserved stay until
@@ -2719,20 +2697,6 @@ mod tests {
             32,
             "no growth under the cap, one reclaimable"
         );
-    }
-
-    #[test]
-    fn pressure_counts_slots_the_store_could_not_grow_for() {
-        let (_, s) = store(32, 0); // one block of room
-        let mut a = s.acquire(0, key(1)).unwrap();
-        seal(&mut a);
-        assert_eq!(s.pressure(), 0, "growth served it");
-        s.release(&[a.id]);
-        let mut b = s.acquire(0, key(2)).unwrap();
-        seal(&mut b);
-        assert_eq!(s.pressure(), 1, "at the cap: reclaimed a cached block");
-        assert!(s.acquire(0, key(3)).is_err(), "the only block is live");
-        assert_eq!(s.pressure(), 2, "refused at the cap");
     }
 
     #[test]

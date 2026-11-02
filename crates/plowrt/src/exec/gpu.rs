@@ -135,14 +135,11 @@ pub(crate) fn live_kv_mappable(
     layout.is_ok_and(|layout| layout.geometry.block_bytes(granularity, hint).is_ok())
 }
 
-/// `(max_ctx, batch)` the ring capacity rule reads: the live-KV manifest's, else the VMM prefix
-/// layout's (a prefix packet without a LIVE manifest still has flat rings per slot).
-/// Parked ring slots one retirement returns to the driver under store pressure: bounds the
-/// driver work on the engine thread (an unmap, idle remap and release per unit).
-const PARK_YIELD_SLOTS: usize = 2;
 /// Parked ring slots one co-tenant reclaim step returns (under the engine mutex).
 const RECLAIM_PARK_SLOTS: usize = 4;
 
+/// `(max_ctx, batch)` the ring capacity rule reads: the live-KV manifest's, else the VMM prefix
+/// layout's (a prefix packet without a LIVE manifest still has flat rings per slot).
 pub(crate) fn ring_geometry(
     manifest: Option<&plow_asset::live_kv::Manifest>,
     prefix: Option<&crate::memory::vmm::VmmGeometry>,
@@ -2803,9 +2800,6 @@ pub struct GpuEngine {
     kv_admission_epoch: u64,
     /// Packed admissions that waited for device memory.
     kv_pressure_events: u64,
-    /// The block store's pressure count the ring park last answered ([`Self::yield_ring_park`]).
-    park_pressure_seen: u64,
-    park_yield_pending: bool,
     /// Per-slot token ids whose KV rows the slot currently holds (prompt,
     /// then every decode-fed token) — `seq_tokens[b].len() == pos[b]` when
     /// consistent. Lets `begin_slot` publish the finished sequence's
@@ -7793,8 +7787,6 @@ impl GpuEngine {
             packed_admission: vec![PackedAdmission::Pending; batch],
             kv_admission_epoch: 0,
             kv_pressure_events: 0,
-            park_pressure_seen: 0,
-            park_yield_pending: false,
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
@@ -8436,41 +8428,6 @@ impl GpuEngine {
         self.kv_admit_reserve
     }
 
-    /// Parked live rings are memory no request owns; once the block store could not grow since
-    /// the last retirement, the park keeps only what the recent concurrency peak needs and the
-    /// rest goes back to the driver for the store. Runs at retirement, after the store's copies
-    /// drained (the only point idle-slot units are unmapped).
-    fn yield_ring_park(&mut self) {
-        let Some(v) = self.vmm.as_mut() else {
-            return;
-        };
-        let (Some(rings), Some(blocks)) = (v.rings.as_mut(), v.blocks.as_ref()) else {
-            return;
-        };
-        // With the host tier the store spills under pressure instead of dropping boundaries;
-        // there the re-commits cost more than the device room buys (26B BF16 at 1.8/s: TTFT
-        // P99 633 -> 1161 ms, TPOT P99 62 -> 96 ms, hit rate unchanged).
-        if blocks.host_cap() > 0 {
-            return;
-        }
-        let pressure = blocks.store_pressure();
-        if pressure == self.park_pressure_seen && !self.park_yield_pending {
-            return;
-        }
-        self.park_pressure_seen = pressure;
-        let released = rings.yield_park(PARK_YIELD_SLOTS);
-        // A bounded yield may leave excess parked: the next retirement continues it.
-        self.park_yield_pending = released > 0;
-        if released > 0 {
-            tracing::debug!(
-                released_mib = released >> 20,
-                parked_mib = rings.spare_bytes() >> 20,
-                mapped = rings.stats().mapped_slots,
-                "vmm prefix: ring park yielded to the block store"
-            );
-        }
-    }
-
     /// Give `bytes` of device memory back from this engine's caches for another model's load:
     /// parked live rings, then the prefix cache above its floor. Waits for this engine's queued
     /// work first (an idle lane of a parked ring may still be written by it). Returns whether
@@ -8801,7 +8758,6 @@ impl GpuEngine {
         if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
             rings.release_slot(b);
         }
-        self.yield_ring_park();
         // Decode's backstop maps row zero before any inactive-row write.
         self.vmm.as_ref().unwrap().begin_seq(b);
         self.seq_tokens[b].clear();
