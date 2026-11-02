@@ -78,12 +78,23 @@ impl VmmServe {
 }
 
 impl VmmPrefixLayout {
-    /// Sliding K/V ring bytes over every slot (scales excluded).
-    pub(crate) fn slide_kv_bytes(&self, blob: &DevBlob) -> u64 {
-        self.slide
-            .iter()
-            .map(|&(k, v, _)| blob.tensors[k].bytes + blob.tensors[v].bytes)
-            .sum()
+    /// Live sliding rings (`VmmRings::new_idle_backed`): `(demand, idle)` = the K/V ring bytes
+    /// committed per admitted slot, and the shared idle units mapped under every free slot.
+    /// A ring whose per-slot stride is not a granule multiple is committed whole (resident, in
+    /// neither figure), as are the fp8 ring scales.
+    pub(crate) fn slide_ring_bytes(&self, blob: &DevBlob, granularity: u64) -> (u64, u64) {
+        let mut idle: Vec<u64> = Vec::new();
+        let mut demand = 0;
+        for &(k, v, stride) in &self.slide {
+            if granularity == 0 || stride % granularity != 0 {
+                continue;
+            }
+            demand += blob.tensors[k].bytes + blob.tensors[v].bytes;
+            if !idle.contains(&stride) {
+                idle.push(stride);
+            }
+        }
+        (demand, idle.iter().sum())
     }
 }
 

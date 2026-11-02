@@ -350,9 +350,19 @@ impl BlobPlan {
                 let geo = &layout.geo;
                 geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
                 let tracks = geo.full_layers.len() as u64 * 2;
-                let ring_bytes = match config.nv_vmm_live_rings_for(dir) {
-                    Some(true) => layout.slide_kv_bytes(&blob),
-                    _ => 0,
+                // The engine's decision (`GpuEngine::load`): per-slot rings are not resident.
+                let (max_ctx, batch) =
+                    crate::exec::gpu::ring_geometry(manifest.as_ref(), Some(geo));
+                let rings = crate::exec::gpu::live_rings_for_capacity(
+                    config.nv_vmm_live_rings_for(dir),
+                    true,
+                    max_ctx,
+                    batch,
+                );
+                let (ring_bytes, ring_idle) = if rings {
+                    layout.slide_ring_bytes(&blob, granularity)
+                } else {
+                    (0, 0)
                 };
                 let virtual_bytes = geo.full_tensor_bytes() * tracks + ring_bytes;
                 // Prefix slots start unmapped (`VmmKv::new`) and map on admission against the KV
@@ -361,7 +371,8 @@ impl BlobPlan {
                 // measures 3.6 GiB under that plan) kept E4B from fitting beside ASR and TTS.
                 plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
                     RuntimeError::Rejected("prefix KV plan tensor classification".into())
-                })? + crate::memory::vmm::kv_pool_cap();
+                })? + ring_idle
+                    + crate::memory::vmm::kv_pool_cap();
                 plan.min_kv_bytes = virtual_bytes / u64::from(geo.batch.max(1));
             }
         }
@@ -370,6 +381,13 @@ impl BlobPlan {
         Ok(plan)
     }
 }
+
+/// How long a load waits for one reclaim step's released chunks to reach free memory.
+const CACHE_RECLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Total time a load spends asking resident caches for memory before it evicts a model.
+const CACHE_RECLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Device bytes one reclaim step asks of a resident cache under its engine mutex.
+const CACHE_RECLAIM_STEP: u64 = 2 << 30;
 
 const GRAPH_BYTES_PER_PROGRAM: u64 = 320 << 10;
 
@@ -1432,9 +1450,12 @@ impl ModelManager {
                         "planner: released pooled chunks the target cannot reuse"
                     );
                 }
-                let avail = self
+                let mut avail = self
                     .fit_capacity(self.device.pool_bytes())
                     .map_err(EnsureError::Load)?;
+                if avail < need {
+                    avail = self.reclaim_caches(need, avail).await?;
+                }
                 if avail >= need {
                     break;
                 }
@@ -1660,9 +1681,12 @@ impl ModelManager {
         // Same accounting as the switch path: chunks the incoming slab cannot
         // consume have to be real free memory before the load.
         self.device.pool_trim(m.plan.slab_reusable());
-        let avail = self
+        let mut avail = self
             .fit_capacity(self.device.pool_bytes())
             .map_err(EnsureError::Load)?;
+        if avail < need {
+            avail = self.reclaim_caches(need, avail).await?;
+        }
         if avail < need {
             return Err(EnsureError::WontFit { need, free: avail });
         }
@@ -2164,6 +2188,76 @@ impl ModelManager {
         let free = self.free_vram().map_err(EnsureError::Load)?;
         drop(guards);
         Ok((free + held, shares))
+    }
+
+    /// A load that does not fit `avail`: resident engines give back cache (parked live rings,
+    /// prefix store chunks, LRU boundaries) one at a time, and the fit is re-read from the device
+    /// while the released memory lands (store chunks free on a worker thread). Returns the new
+    /// capacity; eviction stays the caller's next step when it is still short.
+    async fn reclaim_caches(
+        &self,
+        need: u64,
+        mut avail: u64,
+    ) -> std::result::Result<u64, EnsureError> {
+        // What the plan leaves bounds the fit whatever the caches free: then only eviction helps.
+        if self.planned_headroom().map_err(EnsureError::Load)? < need {
+            return Ok(avail);
+        }
+        let state = self.state()?;
+        let slugs: Vec<String> = self.models.read().iter().map(|m| m.slug.clone()).collect();
+        let t0 = Instant::now();
+        for slug in slugs {
+            if avail >= need || t0.elapsed() >= CACHE_RECLAIM_DEADLINE {
+                break;
+            }
+            let Some(engine) = state.gpu_engine(&slug) else {
+                continue;
+            };
+            let (start, mut steps) = (avail, 0u32);
+            // Bounded steps, the engine mutex released between them: the mux keeps ticking.
+            while avail < need && t0.elapsed() < CACHE_RECLAIM_DEADLINE {
+                let step = (need - avail).min(CACHE_RECLAIM_STEP);
+                let released = engine.lock().reclaim_device(step);
+                match released {
+                    Ok(true) => steps += 1,
+                    Ok(false) => break,
+                    Err(e) => {
+                        tracing::warn!(%slug, error = %e, "planner: cache reclaim failed");
+                        break;
+                    }
+                }
+                // Released chunks free on the store's worker: poll until free memory stops
+                // growing (or covers the step).
+                let (wait, before) = (Instant::now(), avail);
+                let mut last = avail;
+                let mut still = 0;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    avail = self
+                        .fit_capacity(self.device.pool_bytes())
+                        .map_err(EnsureError::Load)?;
+                    if avail >= need || avail >= before.saturating_add(step) {
+                        break;
+                    }
+                    still = if avail > last { 0 } else { still + 1 };
+                    last = avail;
+                    if still >= 5 || wait.elapsed() >= CACHE_RECLAIM_WAIT {
+                        break;
+                    }
+                }
+            }
+            if steps > 0 {
+                tracing::info!(
+                    %slug,
+                    steps,
+                    gained_gib = gib(avail.saturating_sub(start)),
+                    need_gib = gib(need),
+                    avail_gib = gib(avail),
+                    "planner: resident cache gave memory back for a load"
+                );
+            }
+        }
+        Ok(avail)
     }
 }
 

@@ -671,6 +671,11 @@ impl BlockServe {
         self.store.set_host_reserve(bytes);
     }
 
+    /// [`KvStore::pressure`].
+    pub fn store_pressure(&self) -> u64 {
+        self.store.pressure()
+    }
+
     pub fn store(&self) -> Arc<KvStore> {
         Arc::clone(&self.store)
     }

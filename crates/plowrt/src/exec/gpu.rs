@@ -135,16 +135,39 @@ pub(crate) fn live_kv_mappable(
     layout.is_ok_and(|layout| layout.geometry.block_bytes(granularity, hint).is_ok())
 }
 
+/// `(max_ctx, batch)` the ring capacity rule reads: the live-KV manifest's, else the VMM prefix
+/// layout's (a prefix packet without a LIVE manifest still has flat rings per slot).
+/// Parked ring slots one retirement returns to the driver under store pressure: bounds the
+/// driver work on the engine thread (an unmap, idle remap and release per unit).
+const PARK_YIELD_SLOTS: usize = 2;
+/// Parked ring slots one co-tenant reclaim step returns (under the engine mutex).
+const RECLAIM_PARK_SLOTS: usize = 4;
+
+pub(crate) fn ring_geometry(
+    manifest: Option<&plow_asset::live_kv::Manifest>,
+    prefix: Option<&crate::memory::vmm::VmmGeometry>,
+) -> (Option<u32>, Option<u32>) {
+    match (manifest, prefix) {
+        (Some(m), _) => (Some(m.max_ctx), Some(m.batch)),
+        (None, Some(g)) => (Some(g.max_ctx), Some(g.batch)),
+        (None, None) => (None, None),
+    }
+}
+
+/// Sliding rings committed per admitted slot instead of flat for every slot: explicit
+/// configuration wins; otherwise on for demand-mapped KV (live allocation or the VMM prefix
+/// store) once the flat rings would be a capacity tier of their own.
 pub(crate) fn live_rings_for_capacity(
     configured: Option<bool>,
-    live: bool,
+    demand_mapped: bool,
     max_ctx: Option<u32>,
     batch: Option<u32>,
 ) -> bool {
     // Gemma's flat sliding rings reach 40 GiB at B64; 128K B16 reaches 42 GiB total KV.
     configured.unwrap_or(
-        live && (max_ctx.is_some_and(|ctx| ctx >= 131_072)
-            || batch.is_some_and(|batch| batch >= 64)),
+        demand_mapped
+            && (max_ctx.is_some_and(|ctx| ctx >= 131_072)
+                || batch.is_some_and(|batch| batch >= 64)),
     )
 }
 
@@ -2780,6 +2803,9 @@ pub struct GpuEngine {
     kv_admission_epoch: u64,
     /// Packed admissions that waited for device memory.
     kv_pressure_events: u64,
+    /// The block store's pressure count the ring park last answered ([`Self::yield_ring_park`]).
+    park_pressure_seen: u64,
+    park_yield_pending: bool,
     /// Per-slot token ids whose KV rows the slot currently holds (prompt,
     /// then every decode-fed token) — `seq_tokens[b].len() == pos[b]` when
     /// consistent. Lets `begin_slot` publish the finished sequence's
@@ -4735,22 +4761,29 @@ impl GpuEngine {
                     }
                     false
                 } else {
+                    let (max_ctx, batch) = ring_geometry(
+                        live_kv_manifest.as_ref(),
+                        prefix_layout.as_ref().map(|layout| &layout.geo),
+                    );
                     live_rings_for_capacity(
                         configured_rings,
-                        live,
-                        live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
-                        live_kv_manifest.as_ref().map(|manifest| manifest.batch),
+                        live || prefix_layout.is_some(),
+                        max_ctx,
+                        batch,
                     )
                 };
                 if rings && configured_rings.is_none() {
+                    let (max_ctx, batch) = ring_geometry(
+                        live_kv_manifest.as_ref(),
+                        prefix_layout.as_ref().map(|layout| &layout.geo),
+                    );
                     tracing::info!(
-                        max_ctx = live_kv_manifest.as_ref().map(|manifest| manifest.max_ctx),
-                        batch = live_kv_manifest.as_ref().map(|manifest| manifest.batch),
+                        max_ctx,
+                        batch,
                         "live ring allocation enabled for capacity-tier KV"
                     );
                 }
-                let prefix_rings =
-                    !live && prefix_layout.is_some() && configured_rings == Some(true);
+                let prefix_rings = !live && prefix_layout.is_some() && rings;
                 if rings && !live && !prefix_rings {
                     return Err(RuntimeError::Rejected(
                         "live rings require PLOW_VMM_LIVE=1 or the VMM prefix layout".into(),
@@ -7729,6 +7762,8 @@ impl GpuEngine {
             packed_admission: vec![PackedAdmission::Pending; batch],
             kv_admission_epoch: 0,
             kv_pressure_events: 0,
+            park_pressure_seen: 0,
+            park_yield_pending: false,
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
@@ -8350,6 +8385,63 @@ impl GpuEngine {
         self.kv_admit_reserve
     }
 
+    /// Parked live rings are memory no request owns; once the block store could not grow since
+    /// the last retirement, the park keeps only what the recent concurrency peak needs and the
+    /// rest goes back to the driver for the store. Runs at retirement, after the store's copies
+    /// drained (the only point idle-slot units are unmapped).
+    fn yield_ring_park(&mut self) {
+        let Some(v) = self.vmm.as_mut() else {
+            return;
+        };
+        let (Some(rings), Some(blocks)) = (v.rings.as_mut(), v.blocks.as_ref()) else {
+            return;
+        };
+        // With the host tier the store spills under pressure instead of dropping boundaries;
+        // there the re-commits cost more than the device room buys (26B BF16 at 1.8/s: TTFT
+        // P99 633 -> 1161 ms, TPOT P99 62 -> 96 ms, hit rate unchanged).
+        if blocks.host_cap() > 0 {
+            return;
+        }
+        let pressure = blocks.store_pressure();
+        if pressure == self.park_pressure_seen && !self.park_yield_pending {
+            return;
+        }
+        self.park_pressure_seen = pressure;
+        let released = rings.yield_park(PARK_YIELD_SLOTS);
+        // A bounded yield may leave excess parked: the next retirement continues it.
+        self.park_yield_pending = released > 0;
+        if released > 0 {
+            tracing::debug!(
+                released_mib = released >> 20,
+                parked_mib = rings.spare_bytes() >> 20,
+                mapped = rings.stats().mapped_slots,
+                "vmm prefix: ring park yielded to the block store"
+            );
+        }
+    }
+
+    /// Give `bytes` of device memory back from this engine's caches for another model's load:
+    /// parked live rings, then the prefix cache above its floor. Waits for this engine's queued
+    /// work first (an idle lane of a parked ring may still be written by it). Returns whether
+    /// anything was released or queued for release.
+    pub fn reclaim_device(&mut self, bytes: u64) -> Result<bool> {
+        if self.vmm.is_none() {
+            return Ok(false);
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let mut released = false;
+        if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+            released = rings.release_parked_upto(RECLAIM_PARK_SLOTS);
+        }
+        // Parked rings first: the caller re-reads free memory and asks again if still short.
+        if !released {
+            if let Some((_, kv)) = self.vmm_prefix() {
+                released = kv.reclaim_above_floor(bytes);
+            }
+        }
+        Ok(released)
+    }
+
     pub fn kv_pressure_events(&self) -> u64 {
         self.kv_pressure_events
     }
@@ -8658,6 +8750,7 @@ impl GpuEngine {
         if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
             rings.release_slot(b);
         }
+        self.yield_ring_park();
         // Decode's backstop maps row zero before any inactive-row write.
         self.vmm.as_ref().unwrap().begin_seq(b);
         self.seq_tokens[b].clear();
@@ -8815,8 +8908,17 @@ impl GpuEngine {
                 // request live.
                 let mut reclaimed = false;
                 if oom {
+                    let mut need = 0;
                     if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
                         reclaimed = rings.release_parked();
+                        need = rings.slot_charge();
+                    }
+                    // The cache grew into the memory a new slot commits: give it back (store
+                    // chunks, then LRU boundaries) before the request waits for it.
+                    if !reclaimed {
+                        if let Some((_, kv)) = self.vmm_prefix() {
+                            reclaimed = kv.reclaim_above_floor(need.max(kv.block_bytes()));
+                        }
                     }
                 }
                 // Slot-granular KV waits even with no other request live: memory comes back

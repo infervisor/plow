@@ -196,6 +196,15 @@ The host tier is on by default and sized by the host-reserve rule: `MemAvailable
 eighth of RAM (at least 16 GiB), capped at a quarter of RAM, at start, and it stops growing for good if `MemAvailable` would
 fall under that reserve (`kv store: host tier frozen`); `PLOW_HOST_KVCACHE_SIZE` names a size
 instead, under the same rule.
+Device budget: the store grows into all free memory after load, down to the pressure floor
+(2 % of the card) plus the pool band (`PLOW_KV_POOL_MIB`), and gives memory back to live slots
+under pressure (store chunks first, then LRU boundaries). Sliding rings of idle slots are kept
+out of it: rings commit per admitted slot under the store whenever flat rings would be a capacity
+tier (B >= 64 or ctx >= 128K, `PLOW_VMM_LIVE_RINGS` overrides), and once the store could not grow
+since the last retirement the ring park keeps only what the recent 10 s concurrency peak needs.
+With other models resident, each engine's floor also keeps the other engines' KV caps and the
+shared reserve free, and a load that does not fit asks resident caches for memory before it
+evicts a model.
 `/metrics`: `plowrt_kv_store_*` (residency per tier, dedup hits, fills, reclaims, refusals,
 spills, restores, publishes, gathers, segments, launches). Recurrent models (Qwen3.8 GDN) get
 prefix caching only through the store: the prefill chunk is cut at the prompt-end boundary and

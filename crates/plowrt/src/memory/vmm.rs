@@ -344,7 +344,15 @@ pub struct VmmRings {
     /// Released slots whose units stay mapped in place (recycling): readmitting the slot costs no
     /// driver call, and another slot takes them over only when no spare unit is left.
     parked: Vec<bool>,
+    /// Most slots mapped at once since `peak_at`, restarted after [`PARK_PEAK_WINDOW`]
+    /// ([`Self::yield_park`]).
+    peak: usize,
+    peak_at: std::time::Instant,
 }
+
+/// How long a concurrency peak keeps its parked slots against store pressure: about one
+/// request lifetime, so a load that dips and comes back readmits without driver calls.
+const PARK_PEAK_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl VmmRings {
     pub fn new(ops: Arc<dyn VmmOps>, tensors: &[LiveRingTensor], batch: usize) -> Result<Self> {
@@ -395,6 +403,8 @@ impl VmmRings {
             recycle: false,
             bounded: false,
             parked: vec![false; batch],
+            peak: 0,
+            peak_at: std::time::Instant::now(),
         };
         for t in tensors {
             let logical_bytes = t.slot_bytes * batch as u64;
@@ -665,6 +675,50 @@ impl VmmRings {
         }
         self.stats.mapped_slots += 1;
         self.stats.mapped_prefix = self.prefix;
+        self.recent_peak(std::time::Instant::now());
+    }
+
+    /// The most slots mapped at once within the current peak window.
+    fn recent_peak(&mut self, now: std::time::Instant) -> usize {
+        if now.duration_since(self.peak_at) > PARK_PEAK_WINDOW {
+            self.peak = self.stats.mapped_slots;
+            self.peak_at = now;
+        } else {
+            self.peak = self.peak.max(self.stats.mapped_slots);
+        }
+        self.peak
+    }
+
+    /// [`Self::enable_bounded_park`] under device pressure from the cache: return parked slots
+    /// beyond what the recent concurrency peak needs to the driver, at most `max_slots` per call
+    /// (each is a driver unmap/map/release per unit), highest index first (the mux seats the
+    /// lowest free slot). Call only where unmapping an idle slot is safe (retirement, after the
+    /// store's copies drained). Returns the bytes released.
+    pub fn yield_park(&mut self, max_slots: usize) -> u64 {
+        if !self.bounded {
+            return 0;
+        }
+        let keep = self
+            .recent_peak(std::time::Instant::now())
+            .saturating_sub(self.stats.mapped_slots) as u64
+            * self.slot_charge();
+        let cap = keep.min(self.spare_cap);
+        let before = self.spare_bytes();
+        let mut slots = 0;
+        while self.spare_bytes() > cap {
+            if let Some((_, handle)) = self.spare.pop() {
+                self.ops.release(handle);
+            } else if slots < max_slots {
+                let Some(parked) = self.parked.iter().rposition(|&p| p) else {
+                    break;
+                };
+                self.unpark(parked);
+                slots += 1;
+            } else {
+                break;
+            }
+        }
+        before.saturating_sub(self.spare_bytes())
     }
 
     pub fn release_slot(&mut self, slot: usize) {
@@ -703,6 +757,21 @@ impl VmmRings {
         let cap = std::mem::replace(&mut self.spare_cap, 0);
         self.trim_spare();
         self.spare_cap = cap;
+        self.spare_bytes() < before
+    }
+
+    /// [`Self::release_parked`] for at most `max_slots` slots' worth of kept units (bounded
+    /// driver work per call). Returns whether any kept memory went back to the driver.
+    pub fn release_parked_upto(&mut self, max_slots: usize) -> bool {
+        if !self.bounded {
+            return false;
+        }
+        let before = self.spare_bytes();
+        let cap = before.saturating_sub(max_slots as u64 * self.slot_charge());
+        let cap = cap.min(self.spare_cap);
+        let saved = std::mem::replace(&mut self.spare_cap, cap);
+        self.trim_spare();
+        self.spare_cap = saved;
         self.spare_bytes() < before
     }
 
@@ -2482,6 +2551,34 @@ impl VmmKv {
 
     /// Release a finished request's cache holds while retaining its writable KV mappings.
     /// CUDA's inactive decode rows can still write at the saved frontier.
+    /// Free `bytes` more device memory than is free now (and at least `bytes` above the pressure
+    /// floor) for an allocation outside the pool (a live ring commit, a co-tenant load): the
+    /// store's reclaimable chunks first, then LRU boundaries, as the pressure trim does.
+    /// Releases already queued count as made (they land on the store's free thread). Returns
+    /// whether anything was released or queued; `false` without a pressure floor.
+    pub fn reclaim_above_floor(&self, bytes: u64) -> bool {
+        let s = &self.shared;
+        let floor = s.cache_min_free.load(Ordering::Relaxed);
+        if floor == 0 {
+            return false;
+        }
+        let mut inner = s.inner.lock();
+        let free = s.ops.free_bytes().unwrap_or(0);
+        let bytes = free.saturating_sub(floor).saturating_add(bytes);
+        let coming = |inner: &Inner| {
+            s.ops.free_bytes().unwrap_or(0)
+                + inner.release_queued
+                + pending_spill_bytes(inner)
+                + inner
+                    .block_store
+                    .as_ref()
+                    .map_or(0, |hook| hook.pending_spill_bytes())
+        };
+        let before = coming(&inner);
+        trim_cache_above(s, &mut inner, evict_one, bytes);
+        coming(&inner) > before
+    }
+
     pub fn release_prefix(&self, seq: usize) {
         let s = &self.shared;
         let mut inner = s.inner.lock();
@@ -5089,12 +5186,25 @@ fn trim_cache_by(
     inner: &mut Inner,
     evict_one: impl Fn(&Shared, &mut Inner, bool) -> bool,
 ) {
+    trim_cache_above(s, inner, evict_one, 0);
+}
+
+/// [`trim_cache_by`] holding `extra` bytes above the pressure floor (pressure mode only).
+fn trim_cache_above(
+    s: &Shared,
+    inner: &mut Inner,
+    evict_one: impl Fn(&Shared, &mut Inner, bool) -> bool,
+    extra: u64,
+) {
     reap_spills(s, inner);
     if let Some(hook) = &inner.block_store {
         hook.reap();
     }
     demote_expired(s, inner);
-    let min_free = s.cache_min_free.load(Ordering::Relaxed);
+    let min_free = match s.cache_min_free.load(Ordering::Relaxed) {
+        0 => 0,
+        floor => floor.saturating_add(extra),
+    };
     if min_free > 0 {
         if let Some(mut free) = s.ops.free_bytes() {
             if pfx_trace::on() {
@@ -9088,6 +9198,37 @@ mod tests {
         p.release_prefix(1); // a trim: one prefix's 4 blocks (256) queued for release + 200 free
         assert_eq!(p.stats().eviction_units, 1);
         assert_eq!(p.stats().cache_blocks, 4, "the other prefix stays cached");
+    }
+
+    /// A commit outside the pool (a live ring) asks for `bytes` more than is free: the same trim
+    /// evicts only until that is free or on its way, and reports whether it did.
+    #[test]
+    fn reclaim_above_floor_evicts_only_for_the_requested_bytes() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 1 << 20);
+        p.enable_deferred_reclaim();
+        let a = prompt(17);
+        let c: Vec<u32> = a.iter().map(|t| t + 1).collect();
+        for (seq, pr) in [(0, &a), (1, &c)] {
+            p.try_attach(seq, pr).unwrap();
+            p.ensure_rows(seq, 17).unwrap();
+            p.publish(seq, pr, 48, |_| Ok(())).unwrap();
+            p.begin_seq(seq);
+        }
+        p.sync_reclaim();
+        assert!(
+            !p.reclaim_above_floor(256),
+            "no pressure floor: nothing to do"
+        );
+        *ops.free_bytes.lock().unwrap() = Some(400);
+        p.enable_pressure_eviction(300);
+        assert!(p.reclaim_above_floor(100), "one prefix (256 B) queued");
+        assert_eq!(p.stats().eviction_units, 1);
+        assert_eq!(p.stats().cache_blocks, 4, "the other prefix stays cached");
+        // Each call asks beyond what is free now; the caller re-reads free memory in between.
+        assert!(p.reclaim_above_floor(100));
+        assert_eq!(p.stats().cache_blocks, 0);
+        assert!(!p.reclaim_above_floor(100), "nothing left to give");
     }
 
     #[test]
