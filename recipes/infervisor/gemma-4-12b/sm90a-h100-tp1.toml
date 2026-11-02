@@ -212,7 +212,9 @@ PLOW_VMM_PREFIX = "1"
 PLOW_PF_SEG_PURE = "fp8"
 PLOW_PF_SEG_FA512 = "1"
 PLOW_PF_INTERLEAVE = "2048"
-PLOW_VMM_LIVE_RINGS = "0"
+# Sliding rings mapped per admitted slot (device-prefix-pool): flat rings for 128 slots held
+# 40.6 GiB of the card; per slot they leave it to the block store (device cap 22 -> ~60 GiB).
+PLOW_VMM_LIVE_RINGS = "1"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
 PLOW_PF_NORM_ROW_BLOCKS = "1152"
