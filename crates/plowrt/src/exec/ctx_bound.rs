@@ -399,18 +399,11 @@ fn mappable_bound(
     block_hint: u64,
 ) -> u32 {
     let slot_row = ceiling.row_bytes() * u64::from(ceiling.kvh_full);
-    if want >= ceiling.max_ctx || granularity == 0 || slot_row == 0 {
+    if want == 0 || want >= ceiling.max_ctx || granularity == 0 || slot_row == 0 {
         return want;
     }
-    let at = |ctx: u32| {
-        let mut g = ceiling.clone();
-        g.max_ctx = ctx;
-        g
-    };
-    let blocks = |ctx: u32| at(ctx).block_bytes(granularity, block_hint).is_ok();
-    let block_mapped = blocks(ceiling.max_ctx);
-    let maps =
-        |ctx: u32| blocks(ctx) || (!block_mapped && (u64::from(ctx) * slot_row) % granularity == 0);
+    let mut g = ceiling.clone();
+    let block_mapped = g.block_bytes(granularity, block_hint).is_ok();
     let (mut a, mut b) = (granularity, slot_row);
     while b != 0 {
         (a, b) = (b, a % b);
@@ -419,7 +412,10 @@ fn mappable_bound(
     let step = u32::try_from(granularity / a).unwrap_or(u32::MAX).max(1);
     let mut ctx = want.div_ceil(step).saturating_mul(step);
     while ctx < ceiling.max_ctx {
-        if maps(ctx) {
+        g.max_ctx = ctx;
+        if g.block_bytes(granularity, block_hint).is_ok()
+            || (!block_mapped && (u64::from(ctx) * slot_row) % granularity == 0)
+        {
             return ctx;
         }
         ctx = ctx.saturating_add(step);
@@ -950,6 +946,7 @@ mod tests {
         assert_eq!(mappable_bound(&asr, 1024, G, G), 1024);
         assert_eq!(mappable_bound(&asr, 1025, G, G), 2048);
         assert_eq!(mappable_bound(&asr, 768, 0, G), 768);
+        assert_eq!(mappable_bound(&asr, 0, G, G), 0);
         assert_eq!(mappable_bound(&asr, 4096, G, G), 4096);
         // Block-mapped heads (8 x 512 B rows, ceiling 131072) stay block-mapped: 6144 would only
         // map slot-granular. An 8 MiB hint clamps to the 4 MiB window at 8192.

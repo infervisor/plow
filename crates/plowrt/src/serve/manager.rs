@@ -228,7 +228,7 @@ impl BlobPlan {
             (Some(want), Some((granularity, _))) => {
                 let config = crate::config::RuntimeConfig::get();
                 Some(
-                    if config.nv_vmm_live() || config.nv_vmm_prefix() != Some(false) {
+                    if config.nv_vmm_live() || config.nv_vmm_prefix() == Some(true) {
                         crate::exec::ctx_bound::vmm_live_bound(
                             &blob,
                             crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?.as_ref(),
