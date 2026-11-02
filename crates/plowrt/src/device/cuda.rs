@@ -722,6 +722,60 @@ pub struct CudaBackend {
 unsafe impl Send for CudaBackend {}
 unsafe impl Sync for CudaBackend {}
 
+/// libcuda dlopens its PTX JIT by SONAME, and a nix-glibc process does not consult the host ld
+/// cache, so on a non-NixOS host that lookup misses: every PTX load fails with
+/// CUDA_ERROR_JIT_COMPILER_NOT_FOUND and (measured, 2x RTX PRO 6000, driver 595.99) the next
+/// device's `cuDevicePrimaryCtxRetain` then returns CUDA_ERROR_UNKNOWN. Loading the JIT once from
+/// libcuda's own directory, before any context, makes the driver's SONAME lookup find it loaded.
+fn preload_ptx_jit(cuda: &libloading::Library) {
+    static JIT: std::sync::OnceLock<Option<libloading::Library>> = std::sync::OnceLock::new();
+    JIT.get_or_init(|| {
+        // SAFETY: only the symbol's address is used, for dladdr; the function is never called.
+        let Ok(addr) = (unsafe { cuda.get::<*const c_void>(b"cuInit\0") }) else {
+            tracing::warn!("no cuInit symbol: PTX JIT not preloaded");
+            return None;
+        };
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // SAFETY: dladdr writes `info` and returns 0 when the address is in no loaded object.
+        if unsafe { libc::dladdr(*addr, &mut info) } == 0 || info.dli_fname.is_null() {
+            tracing::warn!("dladdr(cuInit) failed: PTX JIT not preloaded");
+            return None;
+        }
+        // SAFETY: dli_fname is a NUL-terminated path owned by the loader.
+        let so = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+        let so = std::path::Path::new(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(so.to_bytes()),
+        );
+        let Some(dir) = so.parent().filter(|d| !d.as_os_str().is_empty()) else {
+            tracing::warn!(libcuda = %so.display(), "no libcuda directory: PTX JIT not preloaded");
+            return None;
+        };
+        const JIT_SO: &str = "libnvidia-ptxjitcompiler.so.1";
+        let mut jit = dir.join(JIT_SO);
+        // A libcuda symlink into another directory (alternatives, a vendor tree) keeps its
+        // companions beside the target.
+        if !jit.exists() {
+            if let Some(d) = std::fs::canonicalize(so)
+                .ok()
+                .and_then(|c| c.parent().map(|d| d.join(JIT_SO)))
+            {
+                jit = d;
+            }
+        }
+        // SAFETY: the driver's own companion library; its constructors are the driver's.
+        match unsafe { libloading::Library::new(&jit) } {
+            Ok(l) => {
+                tracing::debug!(path = %jit.display(), "preloaded PTX JIT");
+                Some(l)
+            }
+            Err(e) => {
+                tracing::warn!(path = %jit.display(), error = %e, "PTX JIT not preloaded");
+                None
+            }
+        }
+    });
+}
+
 impl CudaBackend {
     /// PCI address of this device, when the driver reports it.
     pub fn pci_bdf(&self) -> Option<&str> {
@@ -784,6 +838,7 @@ impl CudaBackend {
             }
         }
         let lib = lib.ok_or_else(|| RuntimeError::Device(format!("dlopen libcuda: {last_err}")))?;
+        preload_ptx_jit(&lib);
         tracing::debug!("resolving CUDA driver API symbols...");
         // Resolved OPTIONALLY, outside driver_api!: cuTensorMapEncodeTiled is CUDA 12.0+,
         // and an eager resolve would make plowrt refuse to open ANY device on an older

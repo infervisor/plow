@@ -5,6 +5,8 @@
 #   gpulease -n <k> <label> <command...>   lease k free GPUs, pin the child to them
 #   gpulease --max-hold <s> ...            hold limit for this run (0 = none)
 #   gpulease --status | status             holders, queue + VRAM
+#   gpulease --devices nvidia:0,amd:1 <label> <command...>
+#                                          exactly these cards, across vendors on a mixed box
 #   gpulease --audit | audit               list foreign GPU processes right now
 # Waiters are served FIFO (ticket queue): a later request may only take cards no older
 # waiter needs, so nobody starves behind newcomers. The command runs in its own process
@@ -33,7 +35,11 @@
 TIMEOUT=${GPU_LEASE_TIMEOUT:-10800}
 MAX_HOLD=${GPU_LEASE_MAX_HOLD:-7200}
 
-if [ "$1" = --vendor ]; then GPU_LEASE_VENDOR="${2:?--vendor needs nvidia|amd}"; shift 2; fi
+DEVICES=""
+case "$1" in
+  --vendor) GPU_LEASE_VENDOR="${2:?--vendor needs nvidia|amd}"; shift 2 ;;
+  --devices) DEVICES="${2:?--devices needs vendor:index[,vendor:index...]}"; shift 2 ;;
+esac
 # `gpulease status` used to lease the box under the label "status" and run nothing.
 if [ "$#" -eq 1 ]; then
   case "$1" in status|audit) set -- "--$1" ;; esac
@@ -78,7 +84,7 @@ ngpu() {
     *)      echo 0 ;;
   esac
 }
-if [ "$VENDOR" = mixed ]; then
+if [ "$VENDOR" = mixed ] && [ -z "$DEVICES" ]; then
   case "$1" in
     --status|--audit) GPU_LEASE_VENDOR=nvidia "$0" "$1"; GPU_LEASE_VENDOR=amd "$0" "$1"; exit 0 ;;
   esac
@@ -323,6 +329,71 @@ older_want() {
   echo "$sum"
 }
 
+# ---- explicit cards (--devices): one ticket per involved pool, so that pool's newcomers leave
+# cards for it; the named cards are taken all-or-nothing.
+dev_lock() { echo "$LEASE_DIR/${2:+$1.}gpu.$3.lease"; }   # <vendor> <mixed?> <index>
+devices_foreign() {
+  local spec v i
+  for spec in ${DEVICES//,/ }; do
+    v=${spec%%:*}; i=${spec#*:}
+    GPU_LEASE_VENDOR=$v "$0" --audit 2>/dev/null | grep "^gpu$i:" | sed "s/^/$v:/"
+  done
+}
+if [ -n "$DEVICES" ]; then
+  S=$(date +%s)
+  NV="" AMD=""; declare -A PER=()
+  for spec in ${DEVICES//,/ }; do
+    v=${spec%%:*}; i=${spec#*:}
+    case "$v" in nvidia|amd) ;; *) echo "gpulease: --devices entry '$spec' is not nvidia:<i> or amd:<i>" >&2; exit 2 ;; esac
+    [[ "$i" =~ ^[0-9]+$ ]] || { echo "gpulease: --devices entry '$spec' has no index" >&2; exit 2; }
+    [ "$MIXED" = 1 ] || [ "$v" = "$VENDOR" ] || { echo "gpulease: no $v cards on this box" >&2; exit 2; }
+    [ "$i" -lt "$(VENDOR=$v ngpu)" ] || { echo "gpulease: $v has no card $i (see gpulease status)" >&2; exit 2; }
+    [ "$v" = nvidia ] && NV="${NV:+$NV,}$i" || AMD="${AMD:+$AMD,}$i"
+    PER[$v]=$(( ${PER[$v]:-0} + 1 ))
+  done
+  TICKETS=""
+  : >>"$LEASE_DIR/queue.seq" 2>/dev/null; chmod 666 "$LEASE_DIR/queue.seq" 2>/dev/null
+  exec 199<"$LEASE_DIR/queue.seq" && flock 199
+  SEQ=$(( $(cat "$LEASE_DIR/queue.seq" 2>/dev/null || echo 0) + 1 ))
+  echo "$SEQ" >"$LEASE_DIR/queue.seq"
+  for v in "${!PER[@]}"; do
+    q="$LEASE_DIR/queue"; [ "$MIXED" = 1 ] && q="$LEASE_DIR/$v.queue"
+    mkdir -p "$q" 2>/dev/null && chmod 1777 "$q" 2>/dev/null
+    t="$q/$(printf %012d "$SEQ").$$"; echo "${PER[$v]} $S $(proc_start $$) $LABEL" >"$t"; TICKETS="$TICKETS $t"
+  done
+  exec 199<&-
+  trap 'rm -f $TICKETS' EXIT
+  mixed=""; [ "$MIXED" = 1 ] && mixed=1
+  try_devices() {
+    local spec f
+    for spec in ${DEVICES//,/ }; do
+      f=$(dev_lock "${spec%%:*}" "$mixed" "${spec#*:}"); [ -e "$f" ] || : >"$f" 2>/dev/null
+      eval "exec $FD<\"$f\"" 2>/dev/null || return 1
+      if flock -n "$FD" 2>/dev/null; then
+        GOT="${GOT:+$GOT }$spec"; NGOT=$((NGOT + 1)); FD=$((FD + 1))
+      else
+        eval "exec $FD>&-" 2>/dev/null; return 1
+      fi
+    done
+  }
+  until try_devices; do
+    release_all
+    if [ $(( $(date +%s) - S )) -ge "$TIMEOUT" ]; then
+      echo "[$(date -Is)] $LABEL TIMEOUT after ${TIMEOUT}s (wanted $DEVICES)" | tee -a "$LOG" >&2
+      exit 75
+    fi
+    sleep 1
+  done
+  rm -f $TICKETS
+  W=$(( $(date +%s) - S ))
+  # Each runtime sees only its leased cards, renumbered from 0 (HIP reads CUDA_VISIBLE_DEVICES too,
+  # so HIP gets its own ordinals).
+  export CUDA_VISIBLE_DEVICES="${NV:--1}"
+  export ROCR_VISIBLE_DEVICES="${AMD:--1}"
+  if [ -n "$AMD" ]; then HIP_VISIBLE_DEVICES=$(seq -s, 0 $(( ${PER[amd]} - 1 ))); export HIP_VISIBLE_DEVICES
+  else unset HIP_VISIBLE_DEVICES; fi
+  foreign() { devices_foreign; }
+else
 S=$(date +%s)
 : >>"$LEASE_DIR/queue.seq" 2>/dev/null; chmod 666 "$LEASE_DIR/queue.seq" 2>/dev/null
 exec 199<"$LEASE_DIR/queue.seq" && flock 199
@@ -363,6 +434,7 @@ if [ "$NGOT" -lt "$NGPU" ] || [ "$MIXED" = 1 ]; then
     export CUDA_VISIBLE_DEVICES="$VIS"
     [ "$MIXED" = 1 ] && export ROCR_VISIBLE_DEVICES=-1 && unset HIP_VISIBLE_DEVICES
   fi
+fi
 fi
 
 PRE=$(foreign "$GOT")
