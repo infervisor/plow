@@ -16,19 +16,44 @@
  */
 #include "amd_common.h"
 
+typedef unsigned u32v4 __attribute__((ext_vector_type(4)));
+
+/* Finite bf16 data, initialized outside the timed region. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void bw_probe_init(
+    bf16* dst, unsigned long long n8) {
+    auto* p = (PLOW_GLOB u32v4*)(PLOW_GLOB void*)as_glob(dst);
+    const unsigned long long stride = (unsigned long long)gridDim.x * PLOW_THREADS;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * PLOW_THREADS + threadIdx.x;
+         i < n8; i += stride) {
+        u32v4 v;
+#pragma unroll
+        for (unsigned u = 0; u < 4; u++) {
+            unsigned x = (unsigned)(i * 4 + u);
+            x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b; x ^= x >> 16;
+            v[u] = (x & 0x007f007f) | 0x3f003f00;
+        }
+        p[i] = v;
+    }
+}
+
 /* Fully coalesced streaming read: 16 B per lane, contiguous across the wave. */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void bw_probe_stream(
     float* out, const bf16* src, unsigned long long n8 /* number of bf16v8 chunks */) {
     const auto* p = as_glob(src);
     unsigned long long i = (unsigned long long)blockIdx.x * PLOW_THREADS + threadIdx.x;
     const unsigned long long stride = (unsigned long long)gridDim.x * PLOW_THREADS;
-    float acc = 0.0f;
-    for (; i < n8; i += stride) {
-        const bf16v8 v = ld_glob8(p + i * 8);
+    u32v4 acc[4] = {};
+    /* Four independent loads/checksums avoid serial bf16 conversions and adds. */
+    for (; i < n8; i += 4 * stride) {
 #pragma unroll
-        for (int u = 0; u < 8; u++) acc += bf2f(v[u]);
+        for (int u = 0; u < 4; u++) {
+            const unsigned long long j = i + u * stride;
+            if (j < n8) acc[u] += __builtin_bit_cast(u32v4, ld_glob8(p + j * 8));
+        }
     }
-    if (acc == 1.2345e-30f) out[0] = acc; /* never taken; keeps the loads live */
+    const u32v4 sum = acc[0] + acc[1] + acc[2] + acc[3];
+    const unsigned checksum = sum[0] + sum[1] + sum[2] + sum[3];
+    out[blockIdx.x * PLOW_THREADS + threadIdx.x] = __builtin_bit_cast(float, checksum);
 }
 
 /* ROW-PER-LANE read, the K phase's shape: lane L walks row (base + L) end to end. */
