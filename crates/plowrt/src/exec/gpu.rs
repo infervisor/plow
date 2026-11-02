@@ -81,6 +81,7 @@ fn check_dsa_decode_batch_arm(required: bool, arm: Option<u32>) -> Result<()> {
 
 mod kv_blocks;
 pub use kv_blocks::BlockServe as KvStoreHandle;
+mod kv_image;
 mod prefix;
 use prefix::VmmServe;
 
@@ -2765,6 +2766,8 @@ pub struct GpuEngine {
     vmm_attached: Vec<u32>,
     /// Cache rows the next `begin_slot` keeps (a retained session prefix); 0 = start cold.
     resume_rows: Vec<u32>,
+    /// The packet's declared caches: what a KV image of one slot carries (docs/arch/30 §5).
+    kv_image: Option<plow_asset::live_kv::Manifest>,
     /// Bench-only (`snapshot_slot`): a slot's recurrent state at one position, so `rewind_slot`
     /// back to it restores the GDN/conv state along with the KV length.
     rewind_snapshots: Vec<Option<(u32, Vec<DeviceMem>)>>,
@@ -2788,6 +2791,9 @@ pub struct GpuEngine {
     /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
     /// prefill chunk never attaches a cached prefix.
     prefix_attach_off: Vec<bool>,
+    /// The slot was seated from a KV image ([`Self::import_kv_image`]): its rings hold only the
+    /// image's window, so it publishes no boundary to the prefix cache until `begin_slot`.
+    publish_off: Vec<bool>,
     /// The slot's request is its session's last turn (`X-Session-End`): the prefix cache drops
     /// the session's boundary to the cold band at retire ([`Self::retire_slot`]).
     session_end: Vec<bool>,
@@ -7717,16 +7723,16 @@ impl GpuEngine {
             batch,
             &blob.decode_progs(),
         )?;
-        let resume_ring_slack = live_kv_manifest
+        let kv_image = live_kv_manifest
             .clone()
-            .or_else(|| blob.with_packet_view(plow_asset::live_kv::emit).ok())
-            .and_then(|m| {
-                m.caches
-                    .iter()
-                    .filter(|c| c.window > 0)
-                    .map(|c| c.stride.saturating_sub(c.window))
-                    .min()
-            });
+            .or_else(|| blob.with_packet_view(plow_asset::live_kv::emit).ok());
+        let resume_ring_slack = kv_image.clone().and_then(|m| {
+            m.caches
+                .iter()
+                .filter(|c| c.window > 0)
+                .map(|c| c.stride.saturating_sub(c.window))
+                .min()
+        });
         let mut engine = GpuEngine {
             be,
             f,
@@ -7805,6 +7811,7 @@ impl GpuEngine {
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
             resume_rows: vec![0; batch],
+            kv_image,
             rewind_snapshots: (0..batch).map(|_| None).collect(),
             resume_ring_slack,
             vmm_active: vec![false; batch],
@@ -7814,6 +7821,7 @@ impl GpuEngine {
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
+            publish_off: vec![false; batch],
             session_end: vec![false; batch],
             disconnected: vec![false; batch],
             dump_kv_geo: RuntimeConfig::get()
@@ -8445,6 +8453,7 @@ impl GpuEngine {
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
         self.vmm_publish(b, self.pos[b]);
+        self.publish_off[b] = false;
         self.blocks_quiesce()?;
         self.trace_finish(b);
         let t_publish = t0.map(|t| t.elapsed());

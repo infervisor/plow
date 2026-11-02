@@ -502,6 +502,8 @@ pub struct DpSet {
     /// Ranks whose engine ignores sampling parameters (device argmax).
     unsampled: AtomicU32,
     pub stats: DpStats,
+    /// `--pd`: the set's prefill and decode pools.
+    pub pd: Option<crate::serve::pd::PdSpec>,
 }
 
 impl DpSet {
@@ -534,6 +536,7 @@ impl DpSet {
             block_rows: AtomicU32::new(0),
             unsampled: AtomicU32::new(0),
             stats: DpStats::default(),
+            pd: None,
         }
     }
 
@@ -593,13 +596,49 @@ impl DpSet {
         exclude: u32,
         sampled: bool,
     ) -> Option<Routed<'_>> {
+        // A P/D set admits requests on its prefill pool; any rank can prefill, so with none of
+        // the pool up another takes it.
+        let avoid = self.pd.map_or(0, |p| !p.prefill);
+        self.route_in(cfg, session, prompt, exclude, sampled, avoid, true)
+    }
+
+    /// The decode rank a P/D request continues on, after its prefill: a decode-pool rank only.
+    pub fn route_decode(&self, cfg: &RouteCfg, sampled: bool) -> Option<Routed<'_>> {
+        let pd = self.pd?;
+        self.route_in(cfg, None, None, 0, sampled, !pd.decode, false)
+    }
+
+    /// `avoid`: ranks outside the wanted P/D pool; with `fallback`, used only while a rank of
+    /// the pool is up.
+    #[allow(clippy::too_many_arguments)]
+    fn route_in(
+        &self,
+        cfg: &RouteCfg,
+        session: Option<&str>,
+        prompt: Option<&[u32]>,
+        exclude: u32,
+        sampled: bool,
+        avoid: u32,
+        fallback: bool,
+    ) -> Option<Routed<'_>> {
         let t0 = Instant::now();
         let n = self.ranks.len();
-        let unfit = if sampled && self.any_samples() {
-            self.unsampled.load(Relaxed)
+        let avoid = if !fallback
+            || self
+                .ranks
+                .iter()
+                .any(|r| avoid >> r.rank & 1 == 0 && exclude >> r.rank & 1 == 0 && r.cand().up)
+        {
+            avoid
         } else {
             0
         };
+        let unfit = avoid
+            | if sampled && self.any_samples() {
+                self.unsampled.load(Relaxed)
+            } else {
+                0
+            };
         let mut cands = [Cand::default(); MAX_DP];
         for (i, r) in self.ranks.iter().enumerate() {
             cands[i] = r.cand();

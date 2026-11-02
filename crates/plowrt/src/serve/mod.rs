@@ -32,6 +32,7 @@ pub mod models;
 pub mod mux;
 pub mod openai;
 pub mod overload;
+pub mod pd;
 pub mod placement;
 pub mod policy;
 #[cfg(feature = "cpu")]
@@ -316,6 +317,9 @@ pub(crate) struct RunObserver {
     pub kv_writes: Vec<KvWrite>,
     /// SLO tick planner state (`PLOW_TBT_SLO_MS` / `PLOW_TTFT_SLO_MS`); untouched when unset.
     pub slo: crate::sched::slo::SloState,
+    /// Per engine slot, the P/D export of the prefill job seated there: it outlives the job's
+    /// `Slot`, which is gone by the time the tick retires the engine slot.
+    pub pd_exports: Vec<Option<Arc<pd::KvExport>>>,
 }
 
 /// One recorded consumption of `KV_PAGES` by a `FLASH`-family packet.
@@ -340,6 +344,7 @@ impl RunObserver {
             kv_pages_range: crate::exec::indirection::slots::kv_pages(0, 0),
             kv_writes: Vec::new(),
             slo: Default::default(),
+            pd_exports: Vec::new(),
         }
     }
 
@@ -758,6 +763,9 @@ impl AppState {
         let Some((set, mut rank)) = routed else {
             return mux.submit_arrived(job, arrived, ingress);
         };
+        if set.pd.is_some() && pd::eligible(&job) {
+            return pd::submit(self, set, mux, job, arrived, ingress);
+        }
         let mut exclude = 0u32;
         let mut next: Option<mux::ModelMux> = None;
         let mut held: Option<dp::Pick<'_>> = None;
