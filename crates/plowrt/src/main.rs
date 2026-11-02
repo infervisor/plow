@@ -3396,7 +3396,8 @@ fn serve_plan_only(
     slugs: &[Option<String>],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::serve::placement::{plan_table, PlanDevice, PlanModel};
-    let devices: Vec<PlanDevice> = device::inventory()?
+    let inventory = device::inventory()?;
+    let devices: Vec<PlanDevice> = inventory
         .iter()
         .map(|d| {
             let fp = d.handle.backend().fingerprint();
@@ -3430,20 +3431,35 @@ fn serve_plan_only(
         let gpu = plowrt::asset::ModelBundle::target_gpu(dir).unwrap_or_default();
         let spec = hwspec::registry::lookup(&gpu);
         let ckpt = plowrt::asset::serve::checkpoint_dir(dir);
+        let isa = spec.and_then(hwspec::isa::IsaLevel::from_spec);
+        // The footprint as the serve plans it: against the first matching CUDA device's VMM
+        // (live KV is not resident up front); without one, the device-free plan.
+        #[allow(unused_mut)]
+        let mut vmm = None;
+        #[cfg(feature = "cuda")]
+        for (d, pd) in inventory.iter().zip(&devices) {
+            if let (device::DeviceHandle::Cuda(b), true) = (&d.handle, pd.isa == isa) {
+                vmm = plowrt::memory::vmm::VmmOps::granularity(b.as_ref())
+                    .ok()
+                    .map(|g| (g, b.compute_capability()));
+                break;
+            }
+        }
+        let tp = plowrt::serve::manager::tp_degree(dir);
+        let plan = plowrt::serve::manager::BlobPlan::from_dir_with_device(dir, vmm, Some(&ckpt));
+        let refused = refused
+            .or_else(|| tp.as_ref().err().map(|e| format!("packet header: {e}")))
+            .or_else(|| plan.as_ref().err().map(|e| format!("memory plan: {e}")));
         models.push(PlanModel {
             slug,
             dir: dir.display().to_string(),
             vendor: spec.map(|s| s.vendor),
-            isa: spec.and_then(hwspec::isa::IsaLevel::from_spec),
+            isa,
             gpu,
-            tp: plowrt::serve::manager::tp_degree(dir).unwrap_or(1),
-            required: plowrt::serve::manager::BlobPlan::from_dir_with_device(
-                dir,
-                None,
-                Some(&ckpt),
-            )
-            .ok()
-            .map(|p| p.required(p.overhead_bound) + plowrt::serve::manager::RESERVE),
+            tp: tp.unwrap_or(1),
+            required: plan
+                .ok()
+                .map(|p| p.required(p.overhead_bound) + plowrt::serve::manager::RESERVE),
             refused,
         });
     }
@@ -4180,7 +4196,14 @@ async fn bringup_runtime(
         ),
     };
     #[cfg(not(feature = "cuda"))]
-    let backend: Arc<dyn Backend> = device::select(executors);
+    let backend: Arc<dyn Backend> = device::select_with(
+        executors,
+        false,
+        RuntimeConfig::get()
+            .amd_devices()
+            .first()
+            .map_or(0, |&o| u8::try_from(o).unwrap_or(u8::MAX)),
+    );
     let vendor = backend.vendor();
     // Mixed-vendor node: CUDA serves the NVIDIA bundles and HSA, opened beside it, the AMD ones
     // (docs/arch/30). Opened only when some asset targets AMD, so an NVIDIA-only serve on a

@@ -159,14 +159,21 @@ async fn chat_completions_with(
         use crate::serve::manager::EnsureError;
         let ensured = match state.dp_set(&req.model) {
             Some(set) => {
-                // The sampling the request resolves to below (logprobs aside): a sampled request
-                // needs a rank that applies it resident.
+                // The sampling the request resolves to below: a sampled request needs a rank that
+                // applies it resident.
                 let mut params = state
                     .registry
                     .get(&req.model)
                     .map(|b| crate::serve::config::base_sampling(&b))
                     .unwrap_or_default();
                 req.sampling.apply(&mut params);
+                params.logprobs = crate::serve::logprobs::parse_chat(
+                    req.logprobs.as_ref(),
+                    req.top_logprobs.as_ref(),
+                    req.logprobs_mode.as_deref(),
+                )
+                .ok()
+                .flatten();
                 Some(state.dp_admit(set, params.samples()).await)
             }
             None => match state.manager_for(&req.model) {
@@ -1158,10 +1165,15 @@ fn tokenizer_digest(b: &crate::asset::ModelBundle) -> Option<Vec<u8>> {
     use sha2::{Digest, Sha256};
     let ckpt = crate::asset::serve::checkpoint_dir(&b.dir);
     let bases = [b.dir.as_path(), ckpt.as_path()];
-    // tokenizer_config.json carries added tokens and processor settings the loader applies.
-    let finish = |mut h: Sha256, base: &std::path::Path| {
-        if let Ok(c) = std::fs::read(base.join("tokenizer_config.json")) {
-            h.update(&c);
+    // tokenizer_config.json carries added tokens and processor settings; the loader reads it
+    // beside the tokenizer or from the checkpoint, so both copies count.
+    let finish = |mut h: Sha256, _: &std::path::Path| {
+        for (tag, base) in [(b"d", bases[0]), (b"c", bases[1])] {
+            if let Ok(c) = std::fs::read(base.join("tokenizer_config.json")) {
+                h.update(tag);
+                h.update((c.len() as u64).to_le_bytes());
+                h.update(&c);
+            }
         }
         Some(h.finalize().to_vec())
     };

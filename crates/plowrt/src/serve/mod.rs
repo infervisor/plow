@@ -834,20 +834,22 @@ impl AppState {
         if let Some(h) = engine.kv_store_handle() {
             self.kv_store.write().insert(slug.clone(), h);
         }
-        self.max_ctx.write().insert(slug.clone(), engine.max_ctx());
+        let mut max_ctx = self.max_ctx.write();
+        max_ctx.insert(slug.clone(), engine.max_ctx());
         self.sampling_honoured
             .write()
             .insert(slug.clone(), engine.honours_sampling());
         if let Some((set, r)) = self.dp_rank(&slug) {
             // The model admits what every rank can hold: ranks of different vendors' bundles may
-            // compile different context lengths.
+            // compile different context lengths. One lock across, so concurrent installs agree.
             let ctx = set
                 .ranks
                 .iter()
-                .filter(|o| o.rank != r)
-                .filter_map(|o| self.max_ctx.read().get(&o.key).copied())
-                .fold(engine.max_ctx(), usize::min);
-            self.max_ctx.write().insert(set.model.clone(), ctx);
+                .filter_map(|o| max_ctx.get(&o.key).copied())
+                .min()
+                .unwrap_or(engine.max_ctx());
+            max_ctx.insert(set.model.clone(), ctx);
+            drop(max_ctx);
             set.set_samples(r, engine.honours_sampling());
             self.sampling_honoured
                 .write()
@@ -856,6 +858,8 @@ impl AppState {
             set.set_probe(r, engine.vmm_prefix_probe());
             #[cfg(not(any(feature = "cuda", feature = "hsa")))]
             let _ = r;
+        } else {
+            drop(max_ctx);
         }
         if let Ok(bundle) = self.registry.get(self.model_of(&slug)) {
             if let Some(c) = bundle.serve().multimodal.as_ref() {
