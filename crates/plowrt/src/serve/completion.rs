@@ -168,7 +168,18 @@ async fn completions_with(
     {
         use crate::serve::manager::EnsureError;
         let ensured = match state.dp_set(&req.model) {
-            Some(set) => Some(state.dp_admit(set).await),
+            Some(set) => {
+                // The sampling the request resolves to below: a sampled request needs a rank that
+                // applies it resident.
+                let mut params = state
+                    .registry
+                    .get(&req.model)
+                    .map(|b| crate::serve::config::base_sampling(&b))
+                    .unwrap_or_default();
+                req.sampling.apply(&mut params);
+                params.logprobs = logprobs.clone();
+                Some(state.dp_admit(set, params.samples()).await)
+            }
             None => match state.manager_for(&req.model) {
                 Some(mgr) if mgr.manages(&req.model) => Some(mgr.ensure_resident(&req.model).await),
                 _ => None,
@@ -371,7 +382,13 @@ async fn completions_with(
     let mux = match (&direct, dp) {
         (Some(m), _) => m,
         (None, Some(set)) => {
-            match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+            match state.dp_route(
+                set,
+                ids.session.as_deref(),
+                Some(&prompt_ids),
+                0,
+                gen.params.samples(),
+            ) {
                 Some((r, m, key, pick)) => {
                     (rank, prefix, _pick) = (r, key, Some(pick));
                     routed = m;

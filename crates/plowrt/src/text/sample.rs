@@ -38,6 +38,12 @@ impl SamplingParams {
         self.temperature <= f32::EPSILON || self.top_k == 1
     }
 
+    /// Whether the request depends on its sampling parameters being applied: not greedy, or
+    /// anything [`Self::needs_host_logits`] covers.
+    pub fn samples(&self) -> bool {
+        !self.is_greedy() || self.needs_host_logits()
+    }
+
     /// Whether this row must be sampled on the HOST.
     ///
     /// The device sampler covers temperature/top_k/top_p/min_p but owns no

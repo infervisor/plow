@@ -21,7 +21,7 @@ use crate::{Result, RuntimeError};
 pub trait HostStaging: Send + Sync {
     fn staging_vendor(&self) -> Vendor;
     /// Register `[ptr, ptr + len)` for DMA by every device of this driver in the process; returns
-    /// the address this driver's copies use for `ptr`.
+    /// the address this driver's kernels dereference and its staging copies take for `ptr`.
     ///
     /// # Safety
     /// `ptr..ptr + len` must stay mapped until [`Self::host_unregister`].

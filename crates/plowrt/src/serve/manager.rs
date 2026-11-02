@@ -1824,7 +1824,10 @@ impl ModelManager {
         .await
         .map_err(EnsureError::Load)?;
         let engine_ms = ms(t1);
-        if let Ok(bundle) = state.registry.get(state.model_of(slug)) {
+        if let Ok(bundle) = state
+            .registry
+            .bundle_for(state.model_of(slug), self.vendor())
+        {
             let device = self.ordinal();
             crate::asr::serving::release(&bundle.dir, device);
             crate::tts::serving::release(&bundle.dir, device);
@@ -1914,7 +1917,7 @@ impl ModelManager {
         let state = self.state()?;
         let bundle = state
             .registry
-            .get(state.model_of(&m.slug))
+            .bundle_for(state.model_of(&m.slug), self.vendor())
             .map_err(EnsureError::Load)?;
         if bundle.tokenizer().is_byte_fallback() {
             return Err(EnsureError::Load(RuntimeError::Msg(format!(
