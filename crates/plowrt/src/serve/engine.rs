@@ -64,10 +64,11 @@ impl ServeEngine {
 
     /// Whether this backend applies the request's sampling parameters.
     ///
-    /// ONLY THE CUDA ENGINE DOES. The gfx950 engine and the CPU/Metal engine
-    /// both sample on device and never hand the host a logit row, so every
-    /// token is the argmax whatever `temperature`, `top_p`, `top_k`, the
-    /// penalties or `seed` said. The host resample (`gpu_finish_token`) is
+    /// The CUDA engine does, and the AMD engine does when its packet leaves a
+    /// full-vocab logits row on device (`host_sampling`): the same host sampler
+    /// then replaces the device argmax. The CPU/Metal engine samples on device
+    /// and every token is the argmax whatever `temperature`, `top_p`, `top_k`,
+    /// the penalties or `seed` said. The host resample (`gpu_finish_token`) is
     /// reached only from `cfg(cuda)` call sites, and neither `serve::cpu_serve`
     /// nor the Apple engine contains a sampler at all.
     ///
@@ -82,7 +83,7 @@ impl ServeEngine {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(_) => true,
             #[cfg(feature = "hsa")]
-            ServeEngine::Amd(_) => false,
+            ServeEngine::Amd(e) => SeqEngine::host_sampling(e),
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => false,
         }
@@ -189,6 +190,11 @@ pub trait SeqEngine {
     /// The softcapped logits behind `slot`'s most recent token (host logprobs); `false` = the
     /// engine keeps them on device.
     fn logits_row(&self, _slot: usize, _out: &mut Vec<f32>) -> bool {
+        false
+    }
+    /// Whether every sampled token's [`Self::logits_row`] reaches the host, so the host sampler
+    /// (temperature/top-k/top-p/penalties/seed) replaces the device argmax.
+    fn host_sampling(&self) -> bool {
         false
     }
     fn prefill_chunked_at_most(
@@ -2313,6 +2319,10 @@ mod amd_serve {
         /// the same replicated row behind its device argmax; `in.ids` and `act.logits` are both
         /// slot-indexed), or concatenated over the ranks' vocab slices under a sharded head.
         /// `false` when the packet keeps no such row (see `logits_elem`).
+        pub fn host_sampling(&self) -> bool {
+            self.logits_elem.is_some()
+        }
+
         pub fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
             let Some(elem) = self.logits_elem else {
                 return false;
@@ -5626,6 +5636,9 @@ impl SeqEngine for AmdServe {
     }
     fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
         AmdServe::logits_row(self, slot, out)
+    }
+    fn host_sampling(&self) -> bool {
+        AmdServe::host_sampling(self)
     }
     fn prefill_chunked_at_most(
         &mut self,

@@ -4434,17 +4434,18 @@ fn run_one_tick(
             // the device argmax. Say so ONCE rather than let a `temperature`
             // the caller set be silently discarded: greedy output that claims to
             // be sampled is the failure mode worth being loud about.
-            if slots
-                .iter()
-                .flatten()
-                .any(|s| s.gen.params.temperature > 0.0)
+            if !e.host_sampling()
+                && slots
+                    .iter()
+                    .flatten()
+                    .any(|s| s.gen.params.temperature > 0.0)
             {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     tracing::warn!(
-                        "amd: temperature > 0 requested, but the gfx950 engine samples \
-                         greedily on device — serving the argmax. Penalties, top_p, \
-                         top_k and logit_bias are ignored on this backend."
+                        "amd: temperature > 0 requested, but this packet keeps no host logits \
+                         row and the engine samples greedily on device — serving the argmax. \
+                         Penalties, top_p, top_k and logit_bias are ignored."
                     );
                 });
             }
@@ -4598,6 +4599,7 @@ fn run_one_tick(
                                     slot.pf_pos = slot.prompt_ids.len();
                                 }
                             }
+                            let token = seq_finish_token(&*e, i, &mut slots[i], token);
                             handle_produced_token(
                                 &mut slots[i],
                                 &arena,
@@ -4641,8 +4643,9 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            // A live request asking for logprobs keeps the ordinary path on an engine whose token
-            // batch keeps no logits row for the tokens it samples.
+            // A live request that needs its logits row on the host (logprobs, host sampling)
+            // keeps the ordinary path on an engine whose token batch keeps no logits row for the
+            // tokens it samples.
             if !rt.pf_defer_decode
                 && !slo_on
                 && e.token_batch_rows(1, 0, 1).is_some()
@@ -4651,7 +4654,7 @@ fn run_one_tick(
                         .iter()
                         .take(b)
                         .flatten()
-                        .any(|s| s.gen.params.logprobs.is_some()))
+                        .any(|s| seq_needs_host_row(&*e, &s.gen.params)))
             {
                 let feeds: Vec<(usize, u32)> = slots
                     .iter()
@@ -4877,7 +4880,7 @@ fn run_one_tick(
                                         }
                                     }
                                 }
-                                seq_host_logprobs(&*e, slot, &mut slots[slot], token);
+                                let token = seq_finish_token(&*e, slot, &mut slots[slot], token);
                                 handle_produced_token(
                                     &mut slots[slot],
                                     &arena,
@@ -4925,10 +4928,16 @@ fn run_one_tick(
                     }
                 }
             }
+            // The mixed step leaves no per-slot logits row behind its decode rows.
             if has_decode
                 && !rt.pf_defer_decode
                 && !slo_on
                 && e.mixed_step_rows(decode_rows, 1).is_some()
+                && !slots
+                    .iter()
+                    .take(b)
+                    .flatten()
+                    .any(|s| seq_needs_host_row(&*e, &s.gen.params))
             {
                 let mut candidates: Vec<_> = slots
                     .iter()
@@ -5424,12 +5433,17 @@ fn run_one_tick(
                                 if rode_now {
                                     decoded_in_pack = true;
                                     for (row, &(i, _)) in feeds.iter().enumerate() {
-                                        seq_host_logprobs(&*e, i, &mut slots[i], ride_tokens[row]);
+                                        let token = seq_finish_token(
+                                            &*e,
+                                            i,
+                                            &mut slots[i],
+                                            ride_tokens[row],
+                                        );
                                         handle_produced_token(
                                             &mut slots[i],
                                             &arena,
                                             bundle,
-                                            ride_tokens[row],
+                                            token,
                                             1,
                                             &mut tokens_this_tick,
                                             Some(stop.as_slice()),
@@ -5450,7 +5464,7 @@ fn run_one_tick(
                                         s.pf_pos = s.prompt_ids.len();
                                     }
                                     let t_tok = std::time::Instant::now();
-                                    seq_host_logprobs(&*e, i, &mut slots[i], token);
+                                    let token = seq_finish_token(&*e, i, &mut slots[i], token);
                                     handle_produced_token(
                                         &mut slots[i],
                                         &arena,
@@ -5601,7 +5615,7 @@ fn run_one_tick(
                                 }
                                 tracing::debug!(token, slot = i, "amd: prefill token");
                                 let t_tok = std::time::Instant::now();
-                                seq_host_logprobs(&*e, i, &mut slots[i], token);
+                                let token = seq_finish_token(&*e, i, &mut slots[i], token);
                                 handle_produced_token(
                                     &mut slots[i],
                                     &arena,
@@ -5706,9 +5720,16 @@ fn run_one_tick(
                 })
                 .min()
                 .unwrap_or(1);
+            // A device quantum feeds its own argmax and keeps no per-token logits row, so a row
+            // that needs the host (sampling, penalties, logprobs) steps one token at a time.
+            let host_rows = feeds.iter().any(|&(i, _)| {
+                slots[i]
+                    .as_ref()
+                    .is_some_and(|s| seq_needs_host_row(&*e, &s.gen.params))
+            });
             let requested = amd_multistep_requested(
                 remaining,
-                multi_step,
+                multi_step && !host_rows,
                 crate::serve::policy::decode_k(true, 1) as usize,
             );
             let multi = e.multistep_quantum(&feeds, requested);
@@ -5754,7 +5775,7 @@ fn run_one_tick(
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
-                        seq_host_logprobs(&*e, i, &mut slots[i], token);
+                        let token = seq_finish_token(&*e, i, &mut slots[i], token);
                         handle_produced_token(
                             &mut slots[i],
                             &arena,
@@ -8177,24 +8198,72 @@ fn gpu_finish_token(
     Ok(argmax_tok)
 }
 
-/// OpenAI logprobs for a single-sequence engine that exposes its logits to the host (CPU): only
-/// rows that asked for them pay the vocab read. The served token stays the engine's argmax.
+/// The served token for a single-sequence engine (AMD, CPU) whose step returned `token` (the
+/// device argmax). Only rows that asked for logprobs or host sampling pay the vocab read. When
+/// the engine exposes every sampled row (`host_sampling`), a non-greedy or penalised request is
+/// drawn by the same host sampler the CUDA path uses; otherwise the argmax is served.
 #[cfg(any(feature = "hsa", feature = "cpu"))]
-fn seq_host_logprobs(
+fn seq_finish_token(
     e: &dyn super::engine::SeqEngine,
     i: usize,
     slot: &mut Option<Slot>,
     token: u32,
-) {
-    let Some(s) = slot.as_mut() else { return };
-    let Some(req) = s.gen.params.logprobs else {
-        return;
+) -> u32 {
+    let Some(s) = slot.as_mut() else {
+        return token;
     };
-    let mut logits = Vec::new();
-    if e.logits_row(i, &mut logits) && (token as usize) < logits.len() {
-        let stats = crate::text::logprobs::RowStats::of(&logits, req);
-        s.lp = Some(Box::new(stats.finish(logits[token as usize])));
+    if !seq_needs_host_row(e, &s.gen.params) {
+        return token;
     }
+    let p = &s.gen.params;
+    let adjusted = sampling_adjusted(p);
+    let sample = (!p.is_greedy() || adjusted) && e.host_sampling();
+    let mut logits = Vec::new();
+    if !e.logits_row(i, &mut logits) || (token as usize) >= logits.len() {
+        if sample {
+            tracing::warn!(
+                slot = i,
+                "host sampling: no logits row for this token; serving the device argmax"
+            );
+        }
+        return token;
+    }
+    let stats = p
+        .logprobs
+        .map(|r| crate::text::logprobs::RowStats::of(&logits, r));
+    let tok = if sample {
+        let raw = (stats.is_some() && adjusted).then(|| logits.clone());
+        crate::text::sample::apply_penalties(&mut logits, &s.out_ids, &s.gen.params);
+        let tok = crate::text::sample::sample(&logits, &s.gen.params, None, slot_rng01(s));
+        if let Some(raw) = raw {
+            logits = raw;
+        }
+        tok
+    } else {
+        token
+    };
+    if let Some(stats) = stats {
+        s.lp = Some(Box::new(stats.finish(logits[tok as usize])));
+    }
+    tok
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn sampling_adjusted(p: &crate::text::sample::SamplingParams) -> bool {
+    p.repetition_penalty != 1.0
+        || p.presence_penalty != 0.0
+        || p.frequency_penalty != 0.0
+        || !p.logit_bias.is_empty()
+}
+
+/// Whether a seq-engine row's token needs its logits row on the host: logprobs, or a
+/// non-greedy / penalised request on an engine that samples on the host.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn seq_needs_host_row(
+    e: &dyn super::engine::SeqEngine,
+    p: &crate::text::sample::SamplingParams,
+) -> bool {
+    p.logprobs.is_some() || ((!p.is_greedy() || sampling_adjusted(p)) && e.host_sampling())
 }
 
 /// The top-k a greedy, unadjusted logprobs row asks the device stats kernel for; `None` when the
