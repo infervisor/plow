@@ -2943,6 +2943,91 @@ mod tests {
     use packet::dev::{DevInst64, StreamEnt};
 
     #[test]
+    fn light_quant_pair_takes_only_a_fitting_disjoint_pitched_gated_norm_z() {
+        let none = packet::dev::TENSOR_NONE16;
+        let (m, heads, dim, pitch, col) = (4u32, 48u32, 128u32, 16384u32, 10240u32);
+        let k = heads * dim;
+        let mut norm = DevInst64 {
+            op: DevOp::QwenGatedNorm as u16,
+            blocks: 2,
+            ..Default::default()
+        };
+        norm.t.fill(none);
+        norm.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        norm.i[..3].copy_from_slice(&[heads, dim, m]);
+        norm.fj[2] = pitch | col << 16;
+        let mut quant = DevInst64 {
+            op: DevOp::QuantFp8 as u16,
+            blocks: 2,
+            ..Default::default()
+        };
+        quant.t.fill(none);
+        quant.t[..3].copy_from_slice(&[4, 0, 5]);
+        quant.i[..5].copy_from_slice(&[m, k, 0, packet::dev::FP8_BLOCK_GROUP, m]);
+        let mut g = DevProg {
+            t: m,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: m },
+            n_counter: 0,
+            insts: vec![norm, quant],
+            stream: vec![],
+            stream_ofs: vec![0],
+            stream_len: vec![0],
+            waits: vec![],
+            succs: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![0],
+            l2_domains: 0,
+        };
+        let entries: Vec<_> = [(0, 0), (0, 1), (1, 0), (1, 1)]
+            .into_iter()
+            .map(|(inst, slice)| StreamEnt {
+                inst,
+                slice,
+                ..Default::default()
+            })
+            .collect();
+        let row = u64::from(m * k) * 2;
+        let qkvz = u64::from(m * pitch) * 2;
+        let sizes = [
+            row,
+            row,
+            qkvz,
+            256,
+            u64::from(m * k),
+            u64::from(k / 128 * m) * 4,
+        ];
+        let devp = |z: u64| -> Vec<DeviceMem> {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| {
+                    DeviceMem::view((i as u64 + 1) << 24, if i == 2 { z } else { len })
+                })
+                .collect()
+        };
+        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), Some((0, 1)));
+        // The last row's z ends at (m - 1) * pitch + col + k.
+        let last = u64::from((m - 1) * pitch + col + k) * 2;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(last)), Some((0, 1)));
+        assert_eq!(light_quant_pair(&g, &entries, &devp(last - 2)), None);
+        // z lies inside the row, 8-element aligned.
+        g.insts[0].fj[2] = pitch | (pitch - k + 8) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), None);
+        g.insts[0].fj[2] = (pitch - 4) | col << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), None);
+        g.insts[0].fj[2] = pitch | (col + 4) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), None);
+        // Other rows' outputs are written while a pitched z is read: no aliasing.
+        g.insts[0].fj[2] = pitch | col << 16;
+        g.insts[0].t[2] = 0;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), None);
+        // A dense z (no j1) needs only its rows.
+        g.insts[0].t[2] = 2;
+        g.insts[0].fj[2] = 0;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(row)), Some((0, 1)));
+    }
+
+    #[test]
     fn block_fp8_row_padding_refuses_overflow() {
         assert_eq!(lt_rows(5, true), Some(8));
         assert_eq!(lt_rows(8, true), Some(8));

@@ -2832,6 +2832,13 @@ mod tests {
             crate::dense_cublaslt::runtime_requires(&m, &[])["plowrt_contract"],
             plow_asset::RUNTIME_CONTRACT_CONCAT
         );
+        // Objects that ignore j1 would misread the pitched sources: both modules must attest it.
+        let pitched = plow_asset::object_requirements::Requirement::new(
+            plow_asset::object_requirements::GDN_PITCHED_ABI,
+            1,
+        );
+        let reqs = crate::object_requirements::manifest(&m, None);
+        assert!(reqs.prefill.contains(&pitched) && reqs.decode.contains(&pitched));
     }
 
     fn fixture() -> Value {

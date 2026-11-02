@@ -90,6 +90,9 @@ pub const W8A8_VLLM_DECODE_ABI: &str = "plow_w8a8_vllm_decode_abi";
 pub const W8A8_VLLM_DECODE_ROWS: &str = "plow_w8a8_vllm_decode_rows";
 /// Prefill object: the gated-delta-net prefill opcode arms under the global-queue scheduler.
 pub const GDN_PREFILL_ABI: &str = "plow_gdn_prefill_abi";
+/// The gated-delta-net conv, conv-prefill and gated-norm arms read a row-pitched source column
+/// (`j1` = pitch | column << 16; an N-concatenated qkv|z projection).
+pub const GDN_PITCHED_ABI: &str = "plow_gdn_pitched_abi";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
