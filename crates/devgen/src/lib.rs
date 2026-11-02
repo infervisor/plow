@@ -5354,6 +5354,12 @@ fn emit_phase(
             .filter(|_| gemv_family && full)
             .map(|abs| (abs / t).max(1))
             .unwrap_or(ns);
+        // Per-row full-layer split, independent of the batch rung: a row's split boundaries (and so
+        // its merged bits) are the same at B1..B32. The CU-fill and ABS paths above divide by B.
+        let ns = emit_config::active()
+            .ns_full_row
+            .filter(|&n| gemv_family && full && n > 0)
+            .unwrap_or(ns);
         // Library-routed rungs run their hd512 attention as light launches at PLOW_FA_GF_LIGHT512
         // (manifest `gf_light512`): split as many more ways as the group is wider, so the layer
         // keeps its work-item count. The interpreter rungs keep `gf` and this split.

@@ -310,6 +310,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_NS_MUL` | `--ns-mul` | unset | Scale the CU-fill target for flash-decode nsplit. |
 | `PLOW_NS_ABS` | `--ns-abs` | unset | Pin nsplit absolutely. |
 | `PLOW_NS_FULL_ABS` | `--ns-full-abs` | unset | Pin nsplit for full-attention layers only. |
+| `PLOW_NS_FULL_ROW` | `--ns-full-row` | unset | Full-attention decode splits per row, the same at every batch rung. |
 | `PLOW_MLA_NS` | `--mla-ns` | unset | Pin the MLA flash-decode `nsplit` (K3 and GLM). Unset = the measured/ctx-adaptive default; this is the sweep handle for a re-measurement. |
 | `PLOW_PF_LADDER` | `--pf-ladder` | unset | Prefill bucket ladder derivation: "wave" for SM-count-derived rungs. NVIDIA-only. |
 | `PLOW_PF_LADDER_APPEND` | `--pf-ladder-append` | unset | Extra prefill ladder rungs, comma-separated (T32: e.g. "640,1152,2176,4224" swallows the chat template's +14-row overhang in one chunk instead of a second full-model pass). Rungs above the chunk cap are filtered. |

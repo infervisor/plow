@@ -1521,6 +1521,8 @@ pub struct NvidiaRuntimeConfig {
 
     /// Track NV dense decode KV-split count from the LIVE `kv_len` instead of
     /// the `max_ctx` the emitter baked it from (NVIDIA twin of `PLOW_MLA_NS_LIVE`).
+    /// Breaks per-rung determinism: the split follows the longest row fed in the step, so a
+    /// row's output bits depend on its companions.
     #[arg(long = "nv-ns-live", env = "PLOW_NV_NS_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub nv_ns_live: bool,
 

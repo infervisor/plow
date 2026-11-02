@@ -516,6 +516,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NS_FULL_ABS")]
     pub ns_full_abs: Option<u32>,
 
+    /// Full-attention decode splits per row, the same at every batch rung.
+    #[arg(long, env = "PLOW_NS_FULL_ROW")]
+    pub ns_full_row: Option<u32>,
+
     /// Prefill bucket ladder derivation: "wave" for SM-count-derived rungs.
     /// NVIDIA-only.
     #[arg(long = "pf-ladder", env = "PLOW_PF_LADDER")]
@@ -2067,6 +2071,7 @@ impl EmitConfig {
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),
             ns_full_abs: env_u32("PLOW_NS_FULL_ABS"),
+            ns_full_row: env_u32("PLOW_NS_FULL_ROW"),
             pf_ladder: env_str("PLOW_PF_LADDER"),
             pf_ladder_append: env_str("PLOW_PF_LADDER_APPEND"),
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
