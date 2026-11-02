@@ -19,9 +19,14 @@ rm -rf "$out"; mkdir -p "$out"
 source "$REPO/scripts/bench/plowbench.sh"
 PB_SERVER_PORT=$(pb_free_port); PB_SERVER_LOG=$out/server.log
 URL=http://127.0.0.1:$PB_SERVER_PORT
-echo "env -i PATH=/usr/bin:/bin HOME=$HOME ${SERVE_ENV:-} $plowrt serve $* --port $PB_SERVER_PORT" > "$out/cmd.txt"
+# The lease's device masks are the GPU assignment, not settings: keep them through env -i.
+MASKS=""
+for v in CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES; do
+  [ -n "${!v+x}" ] && MASKS="$MASKS $v=${!v}"
+done
+echo "env -i PATH=/usr/bin:/bin HOME=$HOME$MASKS ${SERVE_ENV:-} $plowrt serve $* --port $PB_SERVER_PORT" > "$out/cmd.txt"
 # shellcheck disable=SC2086
-env -i PATH=/usr/bin:/bin HOME="$HOME" ${SERVE_ENV:-} "$plowrt" serve "$@" --port "$PB_SERVER_PORT" > "$PB_SERVER_LOG" 2>&1 &
+env -i PATH=/usr/bin:/bin HOME="$HOME" $MASKS ${SERVE_ENV:-} "$plowrt" serve "$@" --port "$PB_SERVER_PORT" > "$PB_SERVER_LOG" 2>&1 &
 PB_SERVER_PID=$!
 trap pb_serve_stop EXIT
 if ! pb_serve_wait "${READY_S:-1200}"; then echo "SMOKE rc=3 (not ready)"; tail -30 "$PB_SERVER_LOG"; exit 3; fi
