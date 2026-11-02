@@ -38,8 +38,15 @@ pub mod visibility;
 /// driver therefore costs acceleration, not availability.
 /// Select a single backend (device 0 preferred). Legacy single-GPU path.
 pub fn select(executors: u32) -> Arc<dyn Backend> {
+    select_with(executors, true, 0)
+}
+
+/// [`select`], skipping CUDA when `cuda` is false (`--devices` named only AMD devices) and
+/// probing HSA at agent `hsa` (the first AMD device named).
+pub fn select_with(executors: u32, cuda: bool, hsa: u8) -> Arc<dyn Backend> {
+    let _ = (cuda, hsa);
     #[cfg(feature = "cuda")]
-    {
+    if cuda {
         tracing::debug!("probing CUDA backend (device 0)...");
         match cuda::CudaBackend::new(0) {
             Ok(b) => {
@@ -52,8 +59,8 @@ pub fn select(executors: u32) -> Arc<dyn Backend> {
 
     #[cfg(feature = "hsa")]
     {
-        tracing::debug!("probing HSA backend (device 0)...");
-        match hsa::HsaBackend::new(0) {
+        tracing::debug!(device = hsa, "probing HSA backend...");
+        match hsa::HsaBackend::new(hsa) {
             Ok(b) => {
                 tracing::info!(device = %b.device_name(), "HSA backend selected");
                 return Arc::new(b);
@@ -152,15 +159,19 @@ pub struct DevId {
     pub ordinal: u8,
 }
 
+/// The short vendor tag device names, labels and placement reports use.
+pub fn vendor_tag(v: Vendor) -> &'static str {
+    match v {
+        Vendor::Nvidia => "nv",
+        Vendor::Amd => "amd",
+        Vendor::Apple => "apple",
+        Vendor::Intel => "cpu",
+    }
+}
+
 impl std::fmt::Display for DevId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let v = match self.vendor {
-            Vendor::Nvidia => "nv",
-            Vendor::Amd => "amd",
-            Vendor::Apple => "apple",
-            Vendor::Intel => "cpu",
-        };
-        write!(f, "{v}:{}", self.ordinal)
+        write!(f, "{}:{}", vendor_tag(self.vendor), self.ordinal)
     }
 }
 
@@ -207,6 +218,17 @@ pub enum DeviceHandle {
 }
 
 impl DeviceHandle {
+    /// The device's name and the ISA key its engine selects code objects by.
+    pub fn name_and_arch(&self) -> (String, String) {
+        use crate::exec::device_api::EngineDevice as _;
+        match *self {
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(ref b) => (b.device_name().to_string(), b.arch()),
+            #[cfg(feature = "hsa")]
+            DeviceHandle::Hsa(ref b) => (b.device_name().to_string(), b.arch()),
+        }
+    }
+
     pub fn backend(&self) -> Arc<dyn Backend> {
         match *self {
             #[cfg(feature = "cuda")]

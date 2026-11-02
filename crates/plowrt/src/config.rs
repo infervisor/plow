@@ -786,13 +786,18 @@ pub struct RuntimeConfig {
     /// plowrt sees a device, so with `ROCR_VISIBLE_DEVICES=4,5` the two visible
     /// GPUs are `--devices 0,1`. Startup logs the mask in force and the visible
     /// count, and an out-of-range ordinal is refused by name.
+    ///
+    /// On a node with GPUs of two vendors, name them `nv:N` / `amd:N` (bare ordinals mean CUDA
+    /// devices): `--devices nv:0,amd:1` serves on exactly those two, and naming only `amd:`
+    /// devices leaves CUDA closed.
     #[arg(
         long = "devices",
         env = "PLOW_DEVICES",
         value_delimiter = ',',
+        value_parser = parse_device,
         global = true
     )]
-    pub devices: Vec<u32>,
+    pub devices: Vec<(Option<hwspec::Vendor>, u32)>,
 
     /// Devices of a process rank group, in rank order: one `CUDA_VISIBLE_DEVICES` value per rank
     /// (a GPU index or UUID, or a MIG instance UUID), e.g. `MIG-a,MIG-b`. A tensor- or
@@ -828,6 +833,12 @@ pub struct RuntimeConfig {
     /// own device group; requests route by session, prefix cache and load. Unset = 1.
     #[arg(long = "dp", env = "PLOW_DP", value_delimiter = ',', global = true)]
     pub dp: Vec<String>,
+
+    /// Prefill/decode disaggregation over a `--dp` model's ranks: `--pd gemma=0/1` prefills on
+    /// rank 0 and decodes on rank 1 (`0+1/2+3` for pools of several). The first token is
+    /// sampled on the prefill rank; the KV moves through host memory (docs/arch/30 §7).
+    #[arg(long = "pd", env = "PLOW_PD", value_delimiter = ',', global = true)]
+    pub pd: Vec<String>,
 
     /// DP routing: send a prompt to the rank whose prefix cache already holds it.
     #[arg(long = "route-prefix", env = "PLOW_ROUTE_PREFIX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -1951,7 +1962,40 @@ impl NvidiaRuntimeConfig {
     }
 }
 
+fn parse_device(s: &str) -> Result<(Option<hwspec::Vendor>, u32), String> {
+    crate::serve::placement::parse_dev(s)
+}
+
 impl RuntimeConfig {
+    /// CUDA ordinals `--devices` names (bare or `nv:`). Empty = every visible CUDA device, unless
+    /// only AMD devices were named ([`Self::cuda_closed`]).
+    pub fn cuda_devices(&self) -> Vec<u32> {
+        self.devices
+            .iter()
+            .filter(|(v, _)| *v != Some(hwspec::Vendor::Amd))
+            .map(|&(_, o)| o)
+            .collect()
+    }
+
+    /// AMD ordinals `--devices` names (`amd:`). Empty = every visible AMD agent.
+    pub fn amd_devices(&self) -> Vec<u32> {
+        self.devices
+            .iter()
+            .filter(|(v, _)| *v == Some(hwspec::Vendor::Amd))
+            .map(|&(_, o)| o)
+            .collect()
+    }
+
+    /// `--devices` names only AMD devices: CUDA is not opened.
+    pub fn cuda_closed(&self) -> bool {
+        !self.devices.is_empty() && self.cuda_devices().is_empty()
+    }
+
+    /// `--devices` names only CUDA devices: HSA is not opened beside CUDA.
+    pub fn amd_closed(&self) -> bool {
+        !self.devices.is_empty() && self.amd_devices().is_empty()
+    }
+
     /// CUDA prefill rows per tick: `usize::MAX` (the widest launch) unless `--pf-interleave` pins
     /// a nonzero cap.
     pub fn pf_interleave_rows(&self) -> usize {

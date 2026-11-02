@@ -322,7 +322,12 @@ impl CudaGroupServe {
                 attached,
                 token,
             } => {
-                tracing::debug!(slot, from = self.pf_pos[slot], frontier, "rank group prefill chunk");
+                tracing::debug!(
+                    slot,
+                    from = self.pf_pos[slot],
+                    frontier,
+                    "rank group prefill chunk"
+                );
                 self.pf_pos[slot] = frontier;
                 self.attached[slot] = attached as usize;
                 self.logits_at.fill(None);
