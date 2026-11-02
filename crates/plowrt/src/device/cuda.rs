@@ -122,6 +122,13 @@ const STREAM_NON_BLOCKING: u32 = 1;
 /// the cheaper record path).
 const EVENT_DEFAULT: u32 = 0;
 const EVENT_DISABLE_TIMING: u32 = 2;
+/// `CU_CTX_SCHED_SPIN` / `CU_CTX_SCHED_MASK`. Measured on H100 serving: a blocking-sync
+/// context adds 65-130 us to every same-step wait, and sleeping even only on pipelined decode
+/// waits (newer step queued) raised TPOT p99 under load; yield matches spin's latency while
+/// still burning the core. Spin is the default `SCHED_AUTO` choice on a many-core host; it is
+/// set explicitly so a host with fewer CPUs than contexts does not fall back to yield.
+const CTX_SCHED_SPIN: u32 = 1;
+const CTX_SCHED_MASK: u32 = 7;
 
 // CUdevice_attribute values used here (cuda.h).
 const ATTR_WARP_SIZE: i32 = 10;
@@ -244,6 +251,8 @@ driver_api! {
     cuDeviceGetAttribute: fn(*mut i32, i32, CUdevice) -> CUresult,
     cuDevicePrimaryCtxRetain: fn(*mut CUcontext, CUdevice) -> CUresult,
     cuDevicePrimaryCtxRelease_v2: fn(CUdevice) -> CUresult,
+    cuDevicePrimaryCtxGetState: fn(CUdevice, *mut u32, *mut i32) -> CUresult,
+    cuDevicePrimaryCtxSetFlags_v2: fn(CUdevice, u32) -> CUresult,
     cuCtxSetCurrent: fn(CUcontext) -> CUresult,
     cuCtxSynchronize: fn() -> CUresult,
     cuModuleLoadData: fn(*mut CUmodule, *const c_void) -> CUresult,
@@ -830,6 +839,25 @@ impl CudaBackend {
                 (api.cuDeviceGet)(&mut dev, device_ordinal as i32),
                 "cuDeviceGet",
             )?;
+            let (mut flags, mut active) = (0u32, 0i32);
+            check(
+                (api.cuDevicePrimaryCtxGetState)(dev, &mut flags, &mut active),
+                "cuDevicePrimaryCtxGetState",
+            )?;
+            if (flags & CTX_SCHED_MASK) != CTX_SCHED_SPIN {
+                // An active primary context's flags belong to whoever retained it first.
+                if active != 0 {
+                    tracing::warn!(flags, "primary context already active without SCHED_SPIN");
+                } else {
+                    let rc = (api.cuDevicePrimaryCtxSetFlags_v2)(
+                        dev,
+                        (flags & !CTX_SCHED_MASK) | CTX_SCHED_SPIN,
+                    );
+                    if rc != 0 {
+                        tracing::warn!(rc, flags, "cuDevicePrimaryCtxSetFlags(SCHED_SPIN)");
+                    }
+                }
+            }
             let mut ctx: CUcontext = std::ptr::null_mut();
             check(
                 (api.cuDevicePrimaryCtxRetain)(&mut ctx, dev),
