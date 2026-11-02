@@ -1144,6 +1144,61 @@ unsafe impl Send for HsaBackend {}
 unsafe impl Sync for HsaBackend {}
 
 impl HsaBackend {
+    /// Queue one SDMA copy on a pooled completion signal; the fence is consumed by
+    /// `VmmOps::fence_done` / `fence_wait`.
+    fn fenced_copy(
+        &self,
+        dst: u64,
+        dst_agent: HsaAgent,
+        src: u64,
+        src_agent: HsaAgent,
+        bytes: u64,
+        what: &str,
+    ) -> Result<u64> {
+        self.guard()?;
+        let mut tier_lock = self.copy_tier.lock();
+        let tier = match tier_lock.as_mut() {
+            Some(t) => t,
+            None => tier_lock.insert(HsaCopyTier {
+                signals: rustc_hash::FxHashMap::default(),
+                spare: Vec::new(),
+                failed: rustc_hash::FxHashSet::default(),
+            }),
+        };
+        let sig = match tier.spare.pop() {
+            Some(s) => {
+                unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
+                s
+            }
+            None => {
+                let mut s = HsaSignal { handle: 0 };
+                let rc =
+                    unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s) };
+                self.check(rc, "hsa_signal_create (vmm spill)")?;
+                s
+            }
+        };
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                dst as *mut c_void,
+                dst_agent,
+                src as *const c_void,
+                src_agent,
+                bytes as usize,
+                0,
+                std::ptr::null(),
+                sig,
+            )
+        };
+        let fence = sig.handle as u64;
+        if rc != HSA_STATUS_SUCCESS {
+            tier.spare.push(sig);
+            return Err(self.fault(rc, what));
+        }
+        tier.signals.insert(fence, sig);
+        Ok(fence)
+    }
+
     /// Probe and initialise the HSA backend for `device_ordinal`-th GPU agent.
     pub fn new(device_ordinal: u8) -> Result<Self> {
         let drv = HsaDriver::open()?;
@@ -4317,6 +4372,51 @@ impl HsaBackend {
 ///   ordinal, so the physical block lands in this agent's coarse-grained VRAM
 ///   by construction; the CUDA path encodes the same intent in
 ///   `CUmemAllocationProp::location`.
+#[cfg(target_os = "linux")]
+impl super::host_region::HostStaging for HsaBackend {
+    fn staging_vendor(&self) -> hwspec::Vendor {
+        hwspec::Vendor::Amd
+    }
+
+    unsafe fn host_register(&self, ptr: *mut u8, len: usize) -> Result<u64> {
+        self.guard()?;
+        let mut agent_ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the caller keeps the range mapped until `host_unregister`. Every GPU agent is
+        // named in the one call, so every AMD device of the process can copy through it.
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_lock)(
+                ptr as *mut c_void,
+                len,
+                self.agents.as_ptr(),
+                self.agents.len() as u32,
+                &mut agent_ptr,
+            )
+        };
+        self.check(rc, "hsa_amd_memory_lock (host region)")?;
+        Ok(agent_ptr as u64)
+    }
+
+    unsafe fn host_unregister(&self, ptr: *mut u8) {
+        // SAFETY: the caller's contract: locked here, no copy in flight.
+        let rc = unsafe { (self.shared.drv.hsa_amd_memory_unlock)(ptr as *mut c_void) };
+        if rc != HSA_STATUS_SUCCESS {
+            tracing::warn!(rc, "hsa_amd_memory_unlock (host region) failed");
+        }
+    }
+
+    fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64> {
+        crate::memory::vmm::VmmOps::copy_dtoh_async(self, host, src, bytes)
+    }
+
+    fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64> {
+        crate::memory::vmm::VmmOps::copy_htod_async(self, dst, host, bytes)
+    }
+
+    fn stage_wait(&self, fence: u64) -> Result<()> {
+        crate::memory::vmm::VmmOps::fence_wait(self, fence)
+    }
+}
+
 impl crate::memory::vmm::VmmOps for HsaBackend {
     fn allocation_provenance(
         &self,
@@ -4581,48 +4681,25 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
     }
 
     fn copy_dtoh_async(&self, host_ptr: u64, va: u64, bytes: u64) -> Result<u64> {
-        self.guard()?;
-        let mut tier_lock = self.copy_tier.lock();
-        let tier = match tier_lock.as_mut() {
-            Some(t) => t,
-            None => tier_lock.insert(HsaCopyTier {
-                signals: rustc_hash::FxHashMap::default(),
-                spare: Vec::new(),
-                failed: rustc_hash::FxHashSet::default(),
-            }),
-        };
-        let sig = match tier.spare.pop() {
-            Some(s) => {
-                unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
-                s
-            }
-            None => {
-                let mut s = HsaSignal { handle: 0 };
-                let rc =
-                    unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s) };
-                self.check(rc, "hsa_signal_create (vmm spill)")?;
-                s
-            }
-        };
-        let rc = unsafe {
-            (self.shared.drv.hsa_amd_memory_async_copy)(
-                host_ptr as *mut c_void,
-                self.cpu_agent,
-                va as *const c_void,
-                self.agent,
-                bytes as usize,
-                0,
-                std::ptr::null(),
-                sig,
-            )
-        };
-        let fence = sig.handle as u64;
-        if rc != HSA_STATUS_SUCCESS {
-            tier.spare.push(sig);
-            return Err(self.fault(rc, "hsa_amd_memory_async_copy (vmm spill D2H)"));
-        }
-        tier.signals.insert(fence, sig);
-        Ok(fence)
+        self.fenced_copy(
+            host_ptr,
+            self.cpu_agent,
+            va,
+            self.agent,
+            bytes,
+            "hsa_amd_memory_async_copy (vmm spill D2H)",
+        )
+    }
+
+    fn copy_htod_async(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<u64> {
+        self.fenced_copy(
+            va,
+            self.agent,
+            host_ptr,
+            self.cpu_agent,
+            bytes,
+            "hsa_amd_memory_async_copy (H2D async)",
+        )
     }
 
     fn fence_done(&self, fence: u64) -> Result<bool> {
@@ -4639,6 +4716,12 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         let val = unsafe { (self.shared.drv.hsa_signal_load_scacquire)(sig) };
         if val >= 1 {
             return Ok(false);
+        }
+        if val < 0 {
+            tier.signals.remove(&fence);
+            return Err(RuntimeError::Device(format!(
+                "async copy failed (signal {val})"
+            )));
         }
         let sig = tier.signals.remove(&fence).expect("checked above");
         tier.spare.push(sig);
@@ -4657,14 +4740,26 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             tier.spare.push(sig);
             return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
         }
-        unsafe {
-            (self.shared.drv.hsa_signal_wait_scacquire)(
-                sig,
-                HSA_SIGNAL_CONDITION_LT,
-                1,
-                u64::MAX,
-                HSA_WAIT_STATE_BLOCKED,
-            );
+        // A wait may return early (spurious wake); a copy that failed leaves the signal negative.
+        let val = loop {
+            let v = unsafe {
+                (self.shared.drv.hsa_signal_wait_scacquire)(
+                    sig,
+                    HSA_SIGNAL_CONDITION_LT,
+                    1,
+                    u64::MAX,
+                    HSA_WAIT_STATE_BLOCKED,
+                )
+            };
+            if v < 1 {
+                break v;
+            }
+        };
+        if val < 0 {
+            // The signal's state is the copy's error; it is not reused.
+            return Err(RuntimeError::Device(format!(
+                "async copy failed (signal {val})"
+            )));
         }
         tier.spare.push(sig);
         Ok(())
