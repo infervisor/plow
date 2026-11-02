@@ -69,6 +69,10 @@ extern "C" __global__ void plow_probe_wg_threads(unsigned* out) {
     if (threadIdx.x == 0) *out = PLOW_THREADS;
 }
 
+extern "C" __global__ void plow_probe_host_roundtrip(unsigned* value) {
+    if (threadIdx.x == 0) *value += 1;
+}
+
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_rmsnorm_bf16(
     bf16* out, const bf16* x, const bf16* gamma, unsigned rows, unsigned feat, float eps) {
     __shared__ float part[PLOW_WAVES];

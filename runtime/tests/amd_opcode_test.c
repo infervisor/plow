@@ -239,16 +239,20 @@ static void per_layer(plow_hsa* h, unsigned rows, unsigned H, unsigned P, int ne
     launch(h, "per_layer_input_test", 3, &args, sizeof(args));
     check("per-layer x", x, ref, rows * H, 0.025f);
     if (next) check("per-layer next", hn, nr, rows * H, 0.025f);
-    memcpy(x, initial, capacity * H * 2);
-    memset(hn, 0xa5, capacity * H * 2);
     void* tensors[8] = {x, wg, wp, args.gamma, ple, args.hn, args.gnext};
     PlowDevInst in = instruction(PLOW_DOP_PER_LAYER_INPUT, tensors);
     in.i[0] = token_batch ? capacity : rows; in.i[1] = H; in.i[2] = P;
     in.i[3] = col0; in.i[4] = stride; in.fj[0].f = eps; in.fj[1].f = scalar;
-    packet(h, in, tensors, 3, rows);
-    check("packet per-layer x", x, ref, rows * H, 0.025f);
-    if (next) check("packet per-layer next", hn, nr, rows * H, 0.025f);
-    exact("per-layer padding", x + rows * H, initial + rows * H, 2 * H * 2);
+    const unsigned block_counts[] = {1, 3, rows + 2};
+    for (unsigned b = 0; b < sizeof(block_counts) / sizeof(block_counts[0]); b++) {
+        /* Reuse GPU-written host memory: dispatch must acquire the CPU reset. */
+        memcpy(x, initial, capacity * H * 2);
+        memset(hn, 0xa5, capacity * H * 2);
+        packet(h, in, tensors, block_counts[b], rows);
+        check("packet per-layer x", x, ref, rows * H, 0.025f);
+        if (next) check("packet per-layer next", hn, nr, rows * H, 0.025f);
+        exact("per-layer padding", x + rows * H, initial + rows * H, 2 * H * 2);
+    }
     memset(initial, 0xa5, 2 * H * 2);
     exact("per-layer next padding", hn + rows * H, initial, 2 * H * 2);
     free(initial); free(ref); free(nr); free(a); free(y);
@@ -376,6 +380,15 @@ int main(int argc, char** argv) {
     struct { unsigned* out; } probe = {threads};
     launch(h, "plow_probe_wg_threads", 1, &probe, sizeof(probe));
     if (*threads != PLOW_WG_THREADS) { fprintf(stderr, "workgroup width mismatch\n"); return 1; }
+    for (unsigned i = 0; i < 8; i++) {
+        const unsigned value = 0x12340000u + i * 257u;
+        *threads = value;
+        launch(h, "plow_probe_host_roundtrip", 1, &probe, sizeof(probe));
+        if (*threads != value + 1u) {
+            fprintf(stderr, "host-memory roundtrip: %u vs %u\n", *threads, value + 1u);
+            return 1;
+        }
+    }
     plow_hsa_free(h, threads);
     gemv(h, 1, 259, 512, 3, 0, 0); gemv(h, 3, 259, 520, 5, 30, 0);
     gemv(h, 2, 7, 67, 11, 0, 0); gemv(h, 1, 259, 3840, 3, 30, 0);
