@@ -346,28 +346,27 @@ impl PacketAsset {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let image = std::fs::read(path).map_err(|source| RuntimeError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        Self::from_bytes(&image)
+        let image = crate::asset::packet_image::PacketImage::open(path)?;
+        Self::from_parsed(&image.raw, &image.blob)
     }
 
     /// `None` for a packet without a pipeline section (a plain language-model packet).
     pub fn load_if_present(path: &Path) -> Result<Option<Self>> {
-        let image = std::fs::read(path).map_err(|source| RuntimeError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        let blob = crate::asset::devblob::DevBlob::parse_l2(&image, true)?;
-        if blob.reserved_metadata(&image, SECTION)?.is_none() {
+        let image = crate::asset::packet_image::PacketImage::open(path)?;
+        if image.blob.reserved_metadata(&image.raw, SECTION)?.is_none() {
             return Ok(None);
         }
-        Self::from_bytes(&image).map(Some)
+        Self::from_parsed(&image.raw, &image.blob).map(Some)
     }
 
     pub fn from_bytes(image: &[u8]) -> Result<Self> {
-        let blob = crate::asset::devblob::DevBlob::parse_l2(image, true)?;
+        Self::from_parsed(
+            image,
+            &crate::asset::devblob::DevBlob::parse_l2(image, true)?,
+        )
+    }
+
+    fn from_parsed(image: &[u8], blob: &crate::asset::devblob::DevBlob) -> Result<Self> {
         let raw = blob
             .reserved_metadata(image, SECTION)?
             .ok_or_else(|| RuntimeError::Rejected(format!("packet is missing {SECTION}")))?;

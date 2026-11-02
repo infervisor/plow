@@ -6500,7 +6500,7 @@ fn column_shards_bind_as_views_of_their_full_twin() {
     assert_eq!(rowband_replicated_bytes(&tensors[..4], 8), 0);
 }
 
-/// The property `--glm-rowband=false` rests on: the packet may declare the full-width twins, but
+/// The property `--rowband=false` rests on: the packet may declare the full-width twins, but
 /// with the arm off they must be identifiable so the loader can skip carving and uploading them.
 /// Only the FULL-width declaration is a twin — the shard it shadows still needs its own storage.
 #[test]

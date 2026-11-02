@@ -439,6 +439,28 @@ fn a_different_sku_at_the_same_isa_and_units_warns_rather_than_refuses() {
 }
 
 #[test]
+fn an_h100_sxm_build_is_selected_on_h200_sxm() {
+    let gib = 1u64 << 30;
+    let vs = vec![variant(
+        "sm90a-h100-tp1",
+        1,
+        target("sm_90a", "H100 SXM", 132, 80 * gib),
+        "tp",
+        1,
+    )];
+    let h200 = live("sm_90a", "H200 SXM", 132, 141 * gib, 1);
+    let picked = select(&vs, &h200, &Constraints::default()).unwrap();
+    assert_eq!(picked.label, "sm90a-h100-tp1");
+    let table = assess(&vs, &h200, &Constraints::default());
+    assert!(table[0].ok(), "{:?}", table[0].reject);
+    assert!(
+        table[0].warns.iter().any(|w| w.contains("SKU")),
+        "{:?}",
+        table[0].warns
+    );
+}
+
+#[test]
 fn the_refusal_table_names_every_candidate() {
     let vs = vec![
         variant(

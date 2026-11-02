@@ -4072,18 +4072,20 @@ impl GpuEngine {
             "loading model onto GPU..."
         );
 
+        // Every object's pairing check reads this one parse.
+        let _build = crate::asset::packet_image::BuildInfo::in_dir(assets_dir)
+            .ok()
+            .flatten();
         // ---- blob ----
-        let (pkt, raw, mut blob) = {
+        let (pkt, image, mut blob) = {
             let run = || -> Result<_> {
                 let pkt = DevBlob::find_in_dir(assets_dir)?.ok_or_else(|| {
                     RuntimeError::Device(format!("no PLOWDEV blob in {}", assets_dir.display()))
                 })?;
-                let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-                    path: pkt.clone(),
-                    source,
-                })?;
-                let blob = DevBlob::parse(&raw)?;
-                crate::certificate_checks::check_packet(&pkt, &raw, &blob)?;
+                let image = crate::asset::packet_image::PacketImage::open(&pkt)?;
+                image.blob.check_l2_dispatch(false)?;
+                crate::certificate_checks::check_packet(&image)?;
+                let blob = image.blob.clone();
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {
@@ -4114,7 +4116,7 @@ impl GpuEngine {
                             .into(),
                     ));
                 }
-                Ok((pkt, raw, blob))
+                Ok((pkt, image, blob))
             };
             if let Some(tm) = load_tim.as_mut() {
                 let (r, ms) = tm.phase("blob_find_read_parse", run);
@@ -4124,6 +4126,7 @@ impl GpuEngine {
                 run()?
             }
         };
+        let raw = &image.raw;
         tracing::info!(
             blob = %pkt.display(),
             tensors = blob.tensors.len(),
@@ -4564,6 +4567,13 @@ impl GpuEngine {
             ));
         }
         let cc = be.compute_capability();
+        if let Some(target) = blob.abi(&image.raw)?.and_then(|a| a.target) {
+            match target.check_cuda(cc, be.device_name()) {
+                Err(e) => return Err(RuntimeError::Rejected(format!("{}: {e}", pkt.display()))),
+                Ok(Some(note)) => tracing::info!("{note}"),
+                Ok(None) => {}
+            }
+        }
         let profile = interpreter_profile(cc).ok_or_else(|| {
             RuntimeError::Device(format!(
                 "{} compute capability {}.{} has no persistent interpreter",
@@ -5859,16 +5869,16 @@ impl GpuEngine {
         let gen_routed_widest =
             gen_decode_launch.is_some() && !gen_segments.is_empty() && g.t >= gen_decode_step;
         // The Qwen chain's pointwise windows of a cuBLASLt-routed rung as `light_pf` launches
-        // (`PLOW_QWEN_LIGHT_DECODE`): the light grid must reach the rows (block-per-row bodies).
+        // (`PLOW_GDN_LIGHT_DECODE`): the light grid must reach the rows (block-per-row bodies).
         let qwen_light_grid = crate::config::RuntimeConfig::get()
             .nv
-            .qwen_light_occ
+            .gdn_light_occ
             .saturating_mul(blob.n_cu);
         let qwen_light_pf = light_functions
             .as_ref()
             .and_then(|f| f.prefill)
             .filter(|_| {
-                crate::config::RuntimeConfig::get().nv.qwen_light_decode
+                crate::config::RuntimeConfig::get().nv.gdn_light_decode
                     && qwen_light_grid >= blob.decode_progs().iter().map(|g| g.t).max().unwrap_or(0)
             });
         let qwen_light_conv = light_functions.as_ref().is_some_and(|f| f.prefill_conv);
@@ -7958,7 +7968,7 @@ impl GpuEngine {
                 "prefill seg graphs warmed up"
             );
         }
-        if config.nv.pf_seg_graph && config.nv.qwen_pf_graph && !config.nv.pf_seg_time {
+        if config.nv.pf_seg_graph && config.nv.gdn_pf_graph && !config.nv.pf_seg_time {
             let t_warmup = std::time::Instant::now();
             match engine.warm_qwen_seg_graphs() {
                 Ok(0) => {}
@@ -8025,36 +8035,26 @@ impl GpuEngine {
         };
         let stamped = ((hi as u64) << 32) | lo as u64;
 
-        let mpath = assets_dir.join("build.json");
-        let manifest = std::fs::read(&mpath).map_err(|source| RuntimeError::Io {
-            path: mpath.clone(),
-            source,
+        let mpath = assets_dir.join(crate::asset::packet_image::BUILD_FILE);
+        let manifest = crate::asset::packet_image::BuildInfo::read(&mpath)?.ok_or_else(|| {
+            RuntimeError::Io {
+                path: mpath.clone(),
+                source: std::io::ErrorKind::NotFound.into(),
+            }
         })?;
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest).map_err(|e| {
-            RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display()))
-        })?;
-        let want = manifest
-            .get("pairing")
-            .and_then(|p| p.get("hash"))
-            .and_then(|h| h.as_str())
-            .and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
-            .ok_or_else(|| {
-                RuntimeError::Device(format!(
-                    "the interpreter object is SPECIALISED (packet hash \
+        let want = manifest.pairing_hash().ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "the interpreter object is SPECIALISED (packet hash \
                      0x{stamped:016x}) but {} has no `pairing.hash` — it was written \
                      by an older plowc. Rebuild the packet, or serve a general \
                      interpreter object (one built without -DPLOW_CONFIG).",
-                    mpath.display()
-                ))
-            })?;
+                mpath.display()
+            ))
+        })?;
         if want != stamped {
             // Name what differs, not just that something does: the arm set and the
             // rule-derived constants are the two things the hash covers.
-            let arms = manifest
-                .get("union")
-                .and_then(|u| u.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
+            let arms = manifest.union_len();
             return Err(RuntimeError::Device(format!(
                 "packet/interpreter MISMATCH: the loaded cubin was specialised for \
                  packet 0x{stamped:016x}, but the packet in {} is 0x{want:016x} \
@@ -8065,7 +8065,8 @@ impl GpuEngine {
                  general object built without -DPLOW_CONFIG.",
                 assets_dir.display(),
                 manifest
-                    .get("tuning")
+                    .tuning
+                    .as_ref()
                     .map(|t| t.to_string())
                     .unwrap_or_default(),
             ))
@@ -11727,7 +11728,7 @@ impl GpuEngine {
                 } else {
                     Vec::new()
                 };
-            // The Qwen3.5 chain's pointwise segments as light launches (`PLOW_QWEN_LIGHT_OCC`
+            // The Qwen3.5 chain's pointwise segments as light launches (`PLOW_GDN_LIGHT_OCC`
             // blocks per SM each) of `plow_<arch>_light_pf`, which lives in the DECODE object
             // (`light_pf`) and instantiates the prefill fast paths. Buckets below 1024 rows, and
             // a grid reaching the rows, keep the windows: QwenRmsNorm picks its reduction by rows
@@ -11736,7 +11737,7 @@ impl GpuEngine {
             // gates must drop to stream order or the next window spins forever.
             let qwen_light_grid = crate::config::RuntimeConfig::get()
                 .nv
-                .qwen_light_occ
+                .gdn_light_occ
                 .saturating_mul(blob.n_cu);
             let qwen_light_pf = light_pf.filter(|_| {
                 !qwen_segments.is_empty()
@@ -13790,13 +13791,13 @@ impl GpuEngine {
             }
             let lib_routed = self.lib_attention_routed;
             // Packed chunks replay the chain as graph pieces between the per-tick launches
-            // (`PLOW_QWEN_PF_GRAPH`); the per-segment loop below serves the unpacked chunks and
+            // (`PLOW_GDN_PF_GRAPH`); the per-segment loop below serves the unpacked chunks and
             // the timing / synchronizing diagnostics.
             if !qwen_pack.is_empty()
                 && !seg_time
                 && !synchronize
                 && rt.nv.pf_seg_graph
-                && rt.nv.qwen_pf_graph
+                && rt.nv.gdn_pf_graph
             {
                 for (start, end) in self.qwen_chain_pieces(bi) {
                     if riding {

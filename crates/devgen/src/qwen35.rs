@@ -1938,6 +1938,7 @@ pub(super) fn run(
     sections.push(recurrent_state_section(&m, batch));
     if c.block.is_none() {
         sections.push(crate::serve_section::section_for(dir));
+        crate::abi_section::append(&m, &mut sections, arch, gpu);
     }
     let bytes = if let Some(range) = c.block.clone() {
         use plow_asset::*;

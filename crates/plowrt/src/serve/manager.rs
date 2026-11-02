@@ -59,6 +59,7 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
 use crate::asset::devblob::DevBlob;
+use crate::asset::packet_image::PacketImage;
 #[cfg(feature = "cuda")]
 use crate::device::cuda::CudaBackend;
 use crate::memory::vmm::VmmOps;
@@ -117,21 +118,13 @@ pub const DEFAULT_OVERHEAD: u64 = 512 << 20;
 /// Tensor-parallel fan-out declared by a bundle's blob, or 1 when it declares
 /// none. Read before any device is opened, so placement can size groups.
 pub fn tp_degree(dir: &Path) -> Result<u32> {
-    let Some(pkt) = DevBlob::find_in_dir(dir)? else {
+    let Some(image) = PacketImage::open_in_dir(dir)? else {
         return Ok(1);
     };
-    let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-        path: pkt.clone(),
-        source,
-    })?;
     // METADATA ONLY, as in `BlobPlan::from_dir_with_granularity` — this reads
     // the TP header and never dispatches, so the L2-placement guard (which is
     // the engine's job, against the code object) must not reject it here.
-    Ok(DevBlob::parse_l2(&raw, true)?
-        .tp
-        .map(|t| t.n_gpu)
-        .unwrap_or(1)
-        .max(1))
+    Ok(image.blob.tp.map(|t| t.n_gpu).unwrap_or(1).max(1))
 }
 
 /// Per-model VRAM plan, derived from the blob header (sizes only — the blob
@@ -209,17 +202,14 @@ impl BlobPlan {
         device_vmm: Option<(u64, (u32, u32))>,
         checkpoint: Option<&Path>,
     ) -> Result<BlobPlan> {
-        let pkt = DevBlob::find_in_dir(dir)?
+        let image = PacketImage::open_in_dir(dir)?
             .ok_or_else(|| RuntimeError::Device(format!("no PLOWDEV blob in {}", dir.display())))?;
-        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-            path: pkt.clone(),
-            source,
-        })?;
+        let (pkt, raw) = (&image.path, &image.raw);
         // METADATA ONLY -- this sums tensor bytes for the memory plan and never dispatches a
         // packet, so L2-domain placement is irrelevant here. The real guard is in the engine,
         // which checks the CODE OBJECT for `plow_l2_place_dispatch_1`. Using the strict parse
         // made `serve` reject every placed blob before the engine ever saw it.
-        let mut blob = DevBlob::parse_l2(&raw, true)?;
+        let mut blob = std::borrow::Cow::Borrowed(&image.blob);
         // Plan the bound the engine will load at (`GpuEngine::load` narrows the same way).
         let live_ctx = crate::config::RuntimeConfig::get().live_ctx_for(dir);
         // The engine rounds the same way (`GpuEngine::load`).
@@ -245,7 +235,7 @@ impl BlobPlan {
         };
         let narrowed = match live_ctx {
             Some(want) if crate::exec::ctx_bound::declared_ctx(&blob).is_some_and(|c| want < c) => {
-                crate::exec::ctx_bound::narrow(&mut blob, want)?;
+                crate::exec::ctx_bound::narrow(blob.to_mut(), want)?;
                 true
             }
             _ => false,
@@ -465,11 +455,8 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
         if !path.is_file() {
             continue;
         }
-        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let blob = DevBlob::parse_l2(&raw, true)?;
+        let image = PacketImage::open(&path)?;
+        let blob = &image.blob;
         let ctr = u64::from(packet::dev::CTR_STRIDE) * 4;
         let mut counters = 0u64;
         for p in &blob.progs {
@@ -1932,6 +1919,7 @@ impl ModelManager {
     }
 
     async fn load_model_once(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
+        let _anchor = crate::asset::packet_image::LoadAnchor::hold(&m.dir);
         let state = self.state()?;
         let bundle = state
             .registry

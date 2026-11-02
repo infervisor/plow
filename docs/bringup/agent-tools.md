@@ -653,7 +653,7 @@ generated-kernel digests in `segment_roles.json` are not reproducible across nvc
 These change what is measured and are easy to leave set from a previous probe. `pb_hazard_env`
 **warns** on each one it finds inherited (it does not refuse) and bumps the warning count, so
 `plowbench-doctor.sh` exits 2. Declare an intentional one to silence it:
-`PB_ALLOW_HAZARD="PLOW_TICK_LOG PLOW_GLM_ROWBAND"`.
+`PB_ALLOW_HAZARD="PLOW_TICK_LOG PLOW_ROWBAND"`.
 
 | env var | what it silently does |
 |---|---|
@@ -662,7 +662,7 @@ These change what is measured and are easy to leave set from a previous probe. `
 | `PLOW_DECODE_MIN_RUNG` | picks the narrowest decode program. TP engines default to 8 (GLM-5.3 TP8 41.4 vs 51.9 ms at rung 1); single-GPU engines leave it unset. |
 | `PLOW_OBJECTIVE` | pins `latency` or `throughput` scheduling (decode quantum, prefill packing, queue TTL, rung fast probe). Recipes and production leave it at the default `auto`, which switches per tick. |
 | `PLOW_HSACO_LOWRUNG` | swaps a different object tier for narrow rungs. |
-| `PLOW_GLM_ROWBAND`, `PLOW_TICK_LOG` | fine, but both arms of an A/B must agree on them. |
+| `PLOW_ROWBAND`, `PLOW_TICK_LOG` | fine, but both arms of an A/B must agree on them. |
 
 Two more that are not env vars:
 
