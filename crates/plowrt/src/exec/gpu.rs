@@ -2768,6 +2768,9 @@ pub struct GpuEngine {
     resume_rows: Vec<u32>,
     /// The packet's declared caches: what a KV image of one slot carries (docs/arch/30 §5).
     kv_image: Option<plow_asset::live_kv::Manifest>,
+    /// Digest of the caches' semantic header without the checkpoint (`plow_asset::kv_image`):
+    /// what an imported image must carry. Serve startup checks the checkpoints of `--pd` ranks.
+    kv_image_key: Option<String>,
     /// Bench-only (`snapshot_slot`): a slot's recurrent state at one position, so `rewind_slot`
     /// back to it restores the GDN/conv state along with the KV length.
     rewind_snapshots: Vec<Option<(u32, Vec<DeviceMem>)>>,
@@ -7726,6 +7729,11 @@ impl GpuEngine {
         let kv_image = live_kv_manifest
             .clone()
             .or_else(|| blob.with_packet_view(plow_asset::live_kv::emit).ok());
+        let kv_image_key = kv_image.as_ref().and_then(|m| {
+            blob.with_packet_view(|p| plow_asset::kv_image::derive(p, m, String::new()))
+                .ok()
+                .map(|h| h.digest())
+        });
         let resume_ring_slack = kv_image.clone().and_then(|m| {
             m.caches
                 .iter()
@@ -7812,6 +7820,7 @@ impl GpuEngine {
             vmm_attached: vec![0; batch],
             resume_rows: vec![0; batch],
             kv_image,
+            kv_image_key,
             rewind_snapshots: (0..batch).map(|_| None).collect(),
             resume_ring_slack,
             vmm_active: vec![false; batch],

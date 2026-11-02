@@ -5245,6 +5245,26 @@ async fn bringup_runtime(
     if let Some((m, _)) = pd_specs.iter().find(|(m, _)| state.dp_set(m).is_none()) {
         return Err(format!("--pd {m}=…: the model is not served data-parallel (--dp)").into());
     }
+    // Every rank's caches must mean what the prefill rank's do (the import re-checks per image).
+    let mut digests = std::collections::HashMap::new();
+    for (m, spec) in &pd_specs {
+        let Some(set) = state.dp_set(m) else { continue };
+        let headers: Vec<_> = set
+            .ranks
+            .iter()
+            .map(|r| {
+                let b = state
+                    .registry
+                    .bundle_for(m, r.vendor)
+                    .map_err(|e| e.to_string())?;
+                plowrt::serve::pd::kv_header(&b.dir, &mut digests)
+            })
+            .collect();
+        plowrt::serve::pd::check_headers(m, *spec, &headers)?;
+        if let Some(Ok(h)) = headers.first() {
+            tracing::info!(model = %m, header = %h.digest(), weights = %h.weights, "pd: KV image headers agree");
+        }
+    }
     #[cfg(feature = "cuda")]
     {
         let managers = cuda_loads;

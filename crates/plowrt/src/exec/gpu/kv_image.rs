@@ -2,14 +2,15 @@
 
 use super::GpuEngine;
 use crate::exec::device_api::EngineDevice;
-use crate::exec::kv_image::{compat_key, plan};
+use crate::exec::kv_image::plan;
 use crate::{Result, RuntimeError};
 
 impl GpuEngine {
-    /// The key an importing engine's image must match; `None` when the packet declares no caches
-    /// an image can carry (a TP packet, or one without a live-KV manifest).
+    /// The key an imported image must carry: the digest of the caches' semantic header
+    /// (`plow_asset::kv_image`). `None` when the packet's caches have no header (a TP packet, no
+    /// live-KV manifest, or a cache the header does not recognise).
     pub fn kv_image_key(&self) -> Option<String> {
-        self.kv_image.as_ref().map(compat_key)
+        self.kv_image_key.clone()
     }
 
     fn kv_image_manifest(&self) -> Result<&plow_asset::live_kv::Manifest> {

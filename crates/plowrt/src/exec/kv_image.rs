@@ -1,20 +1,17 @@
-//! A request's KV cache as an image another engine of the same variant can import
-//! (docs/arch/30 §5): the byte copies between one sequence slot of a packet's declared caches
-//! and a flat host image.
+//! A request's KV cache as an image another engine can import (docs/arch/30 §5): the byte copies
+//! between one sequence slot of a packet's declared caches and a flat host image.
 //!
 //! Pure functions over the packet's `live_kv` manifest, so the addressing is tested without a
 //! device. The image holds, per declared cache (KV-shared readers are declared once), per tensor
 //! (K, V, then the FP8 row scales), per head, the live rows `lo..n` in position order:
-//! `lo = 0` for a full cache, `n - window` for a sliding one. A ring is unwrapped, so the image
-//! does not depend on where the ring stood. Rows at or past `n` are never addressed: under live KV
-//! they may be unmapped.
+//! `lo = 0` for a full cache, `n - window` for a sliding one. A ring is unwrapped and every native
+//! layout packs to this one order, so the image depends on neither. Rows at or past `n` are never
+//! addressed: under live KV they may be unmapped.
 //!
-//! Two engines exchange images only when [`compat_key`] matches. It covers the cache geometry and
-//! the program identities, which pins the same packet; a cross-vendor image needs the semantic
-//! `kv_image` section instead.
+//! Two engines, of either vendor, exchange images only when their `plow_asset::kv_image` headers
+//! are equal.
 
 use plow_asset::live_kv::{Manifest, LAYOUT_HEAD_MAJOR, LAYOUT_ROW_INTERLEAVED};
-use sha2::{Digest, Sha256};
 
 use crate::{Result, RuntimeError};
 
@@ -28,24 +25,6 @@ pub(crate) struct ImageSpan {
     /// Byte offset in the image.
     pub image_off: u64,
     pub bytes: u64,
-}
-
-/// The compatibility key two engines' images must share.
-pub(crate) fn compat_key(m: &Manifest) -> String {
-    let mut h = Sha256::new();
-    h.update(b"plow-kv-image-v1");
-    h.update(m.max_ctx.to_le_bytes());
-    for c in &m.caches {
-        for v in [c.heads, c.hd, c.stride, c.window, c.mask, c.layout] {
-            h.update(v.to_le_bytes());
-        }
-        h.update([u8::from(c.scales.is_some())]);
-    }
-    for p in &m.programs {
-        h.update((p.len() as u64).to_le_bytes());
-        h.update(p.as_bytes());
-    }
-    format!("{:x}", h.finalize())
 }
 
 /// The spans moving slot `slot`'s rows `[.., n)` and the image size.
@@ -87,15 +66,18 @@ pub(crate) fn plan(m: &Manifest, slot: u32, n: u32) -> Result<(Vec<ImageSpan>, u
             let base = slot as u64 * slot_bytes;
             match c.layout {
                 LAYOUT_ROW_INTERLEAVED => {
-                    // `[slot][stride][head][hd]`, full caches only: one run.
-                    let bytes = (n - lo) as u64 * c.heads as u64 * row;
-                    spans.push(ImageSpan {
-                        handle: handle as usize,
-                        native_off: base + lo as u64 * c.heads as u64 * row,
-                        image_off: image,
-                        bytes,
-                    });
-                    image += bytes;
+                    // `[slot][stride][head][hd]`, full caches only: one span per (head, row).
+                    for head in 0..c.heads as u64 {
+                        for p in lo as u64..n as u64 {
+                            spans.push(ImageSpan {
+                                handle: handle as usize,
+                                native_off: base + (p * c.heads as u64 + head) * row,
+                                image_off: image,
+                                bytes: row,
+                            });
+                            image += row;
+                        }
+                    }
                 }
                 LAYOUT_HEAD_MAJOR => {
                     for head in 0..c.heads as u64 {
@@ -223,14 +205,18 @@ mod tests {
     }
 
     #[test]
-    fn row_interleaved_is_one_prefix() {
+    fn row_interleaved_packs_to_the_head_major_order() {
         let mut c = cache([2, 3], 4, 64, 0);
+        let (head_major, total) = plan(&manifest(vec![c.clone()]), 2, 7).unwrap();
         c.layout = LAYOUT_ROW_INTERLEAVED;
-        let m = manifest(vec![c]);
-        let (spans, _) = plan(&m, 2, 7).unwrap();
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].native_off, 2 * 4 * 64 * 128);
-        assert_eq!(spans[0].bytes, 7 * 4 * 128);
+        let (spans, same) = plan(&manifest(vec![c]), 2, 7).unwrap();
+        assert_eq!(same, total);
+        assert_eq!(spans.len(), 2 * 4 * 7);
+        let row = 128;
+        // Head 1, row 3 of slot 2.
+        assert_eq!(spans[10].native_off, 2 * 4 * 64 * row + (3 * 4 + 1) * row);
+        assert_eq!(spans[10].image_off, (7 + 3) * row);
+        assert_eq!(head_major[1].image_off, 7 * row);
     }
 
     #[test]
@@ -239,9 +225,5 @@ mod tests {
         assert!(plan(&m, 4, 1).is_err());
         assert!(plan(&m, 0, 0).is_err());
         assert!(plan(&m, 0, 65).is_err());
-        assert_ne!(
-            compat_key(&m),
-            compat_key(&manifest(vec![cache([2, 3], 1, 64, 8)]))
-        );
     }
 }

@@ -23,7 +23,7 @@ use crate::RuntimeError;
 
 /// One slot's KV, as `GpuEngine::export_kv_image` wrote it.
 pub struct KvImage {
-    /// `exec::kv_image::compat_key` of the exporting packet.
+    /// The exporting engine's key (`GpuEngine::kv_image_key`): its caches' semantic header.
     pub key: String,
     pub rows: u32,
     pub bytes: Vec<u8>,
@@ -116,6 +116,60 @@ pub(crate) fn settle_refused(job: &Job) {
     if let Some(i) = &job.opts.import {
         i.outcome.settle();
     }
+}
+
+/// The KV image header of the bundle in `dir`, its checkpoint hashed once per checkpoint
+/// directory (`digests`).
+pub fn kv_header(
+    dir: &std::path::Path,
+    digests: &mut std::collections::HashMap<std::path::PathBuf, String>,
+) -> Result<plow_asset::kv_image::Header, String> {
+    use crate::asset::devblob::DevBlob;
+    let pkt = DevBlob::find_in_dir(dir)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no packet in {}", dir.display()))?;
+    let raw = std::fs::read(&pkt).map_err(|e| format!("{}: {e}", pkt.display()))?;
+    let blob = DevBlob::parse_l2(&raw, true).map_err(|e| e.to_string())?;
+    let manifest = match crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw) {
+        Ok(Some(m)) => m,
+        _ => blob.with_packet_view(plow_asset::live_kv::emit)?,
+    };
+    let ckpt = crate::asset::serve::checkpoint_dir(dir);
+    let ckpt = ckpt.canonicalize().unwrap_or(ckpt);
+    let weights = match digests.get(&ckpt) {
+        Some(d) => d.clone(),
+        None => {
+            let d = plow_asset::kv_image::checkpoint_digest(&ckpt)?;
+            digests.insert(ckpt, d.clone());
+            d
+        }
+    };
+    blob.with_packet_view(|p| plow_asset::kv_image::derive(p, &manifest, weights))
+}
+
+/// `--pd` startup check: every rank's KV image header (`headers[r]`, rank `r`'s bundle) equals
+/// the first prefill rank's, or the model is refused naming the first difference.
+pub fn check_headers(
+    model: &str,
+    spec: PdSpec,
+    headers: &[Result<plow_asset::kv_image::Header, String>],
+) -> Result<(), String> {
+    let in_pd = |r: usize| (spec.prefill | spec.decode) >> r & 1 != 0;
+    let first = spec.prefill.trailing_zeros() as usize;
+    let base = headers[first]
+        .as_ref()
+        .map_err(|e| format!("--pd {model}: rank {first}: {e}"))?;
+    for (r, h) in headers.iter().enumerate().filter(|(r, _)| in_pd(*r)) {
+        let h = h
+            .as_ref()
+            .map_err(|e| format!("--pd {model}: rank {r}: {e}"))?;
+        if let Some(diff) = base.first_difference(h) {
+            return Err(format!(
+                "--pd {model}: rank {r}'s KV cache differs from rank {first}'s at {diff}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `--pd model=P/D`: the DP ranks of each pool, as bit masks over the model's ranks.
