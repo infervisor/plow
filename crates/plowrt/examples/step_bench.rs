@@ -5,11 +5,12 @@
 //! (`prefill_slot` to build ctx, then one `step_slots` per token).
 //!
 //! Usage:
-//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same | --spread] [--warmup N] [--multistep] [--packed-prefill]
+//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same [--kv-image] | --spread] [--warmup N] [--multistep] [--packed-prefill]
 //!              [--dump-tensors name,name --dump-dir dir | --dump-prefill-logits dir]
 //!              [--max-inst N | --max-segments N]
 //! `--same` feeds every slot the SAME prompt and reports how many slots' greedy
-//! streams agree with slot 0 (a within-batch consistency check). `--spread` gives each slot a
+//! streams agree with slot 0 (a within-batch consistency check); with `--kv-image` slots 1..
+//! take slot 0's KV through an exported image instead of prefilling (`KV_IMAGE` line). `--spread` gives each slot a
 //! pseudo-random prompt over 64K ids, so a MoE model routes a decode batch the way served
 //! traffic does (the default prompts share one 1000-id cycle). `--packed-prefill`
 //! initializes prompts through packed request chunks and the compact terminal, printing each
@@ -112,6 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(4137);
     let steps: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
     let mut same = false;
+    let mut kv_image = false;
     let mut spread = false;
     let mut multistep = false;
     let mut packed_prefill = false;
@@ -167,6 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--max-inst" => max_inst = Some(args.next().ok_or("--max-inst N")?.parse()?),
             "--same" => same = true,
+            "--kv-image" => kv_image = true,
             "--spread" => spread = true,
             "--packed-prefill" => packed_prefill = true,
             "--pf-chunk" => pf_chunk = args.next().ok_or("--pf-chunk N")?.parse()?,
@@ -397,6 +400,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t0.elapsed().as_secs_f64()
             );
         }
+    }
+    if kv_image {
+        // Slots 1.. take slot 0's KV through an exported image instead of their own prefill:
+        // re-exporting each must give the same bytes, and SLOTS_AGREE then compares the decodes.
+        if !same || packed_prefill || slots < 2 {
+            return Err("--kv-image needs --same, the serial prefill and at least 2 slots".into());
+        }
+        let n = prompt_for(0).len() as u32;
+        let (mut image, mut again) = (Vec::new(), Vec::new());
+        let t0 = Instant::now();
+        e.export_kv_image(0, n, &mut image)?;
+        let export_s = t0.elapsed().as_secs_f64();
+        let mut exact = 0;
+        for b in 1..slots {
+            e.begin_slot(b, ctx + steps + 1)?;
+            e.import_kv_image(b, &prompt_for(b), &image)?;
+            last[b] = last[0];
+            e.export_kv_image(b, n, &mut again)?;
+            exact += usize::from(again == image);
+        }
+        println!(
+            "KV_IMAGE rows={n} bytes={} export_s={export_s:.4} roundtrip_exact={exact}/{} key={}",
+            image.len(),
+            slots - 1,
+            e.kv_image_key().unwrap_or_default()
+        );
     }
     if let Some(dir) = &prefill_logits_dir {
         std::fs::write(
