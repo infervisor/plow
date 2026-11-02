@@ -320,6 +320,7 @@ pub(crate) fn apply_output_object(
             index: update.index,
             roles: update.roles.clone(),
             library: Vec::new(),
+            library_unsplit: false,
         };
         if let Some(position) = update.prior_position {
             metadata.programs[position] = record;

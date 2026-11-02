@@ -186,6 +186,7 @@ pub(crate) fn apply_output_object(
                 index,
                 roles,
                 library: Vec::new(),
+                library_unsplit: false,
             };
             if let Some(position) = prior {
                 metadata.programs[position] = record;

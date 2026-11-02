@@ -774,6 +774,11 @@ pub struct ProgramRoles {
     /// fallback for launches outside the library's envelope.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub library: Vec<u32>,
+    /// The library launches of this program run unsplit (one KV split): a row's bits then depend
+    /// only on its own request, whatever is packed beside it. A launch the library cannot serve
+    /// is refused, never run on the native fallback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub library_unsplit: bool,
 }
 
 fn validate_generated(object: &SegmentObject) -> Result<(), String> {
@@ -1041,6 +1046,7 @@ impl SegmentRoles {
                 || program.roles.iter().any(|&r| r > MAX_ROLE)
                 || (program.roles.contains(&CUBLASLT) && program.roles.contains(&NATIVE_DECODE_TC))
                 || !program.library.windows(2).all(|w| w[0] < w[1])
+                || (program.library_unsplit && program.library.is_empty())
                 || program.library.iter().any(|&seg| {
                     program.roles.get(seg as usize).is_none_or(|&role| {
                         !(matches!(
@@ -1105,6 +1111,14 @@ mod tests {
             "lib_flash_prefill_v2:fa4:hd=512:heads=16:kv_heads=1,2:layout=head_major:dtype=f16";
         assert!(parse(hd512, r#","library":[1]"#).is_ok());
         assert!(parse(hd512_f16, r#","library":[0,2]"#).is_ok());
+        let unsplit = parse(hd512, r#","library":[1],"library_unsplit":true"#).unwrap();
+        assert!(unsplit.programs[0].library_unsplit);
+        assert!(!serde_json::to_string(&unsplit).unwrap().contains("library_unsplit\":false"));
+        let plain = parse(hd512, r#","library":[1]"#).unwrap();
+        assert!(!plain.programs[0].library_unsplit);
+        assert!(!serde_json::to_string(&plain).unwrap().contains("library_unsplit"));
+        // An unsplit pin with nothing to pin.
+        assert!(parse(hd512, r#","library_unsplit":true"#).is_err());
         // Declared but unused, out of range, unordered, unknown ABI, the retired host library.
         assert!(parse(hd512, "").is_err());
         assert!(parse(hd512, r#","library":[3]"#).is_err());
