@@ -3994,7 +3994,7 @@ fn emit_xreduce_twoshot_band(
         d.i[0] = elems;
         d.i[1] = tp;
         d.i[2] = slot; // the REGION base (0 or slot_b) — never band-advanced: the loader
-                       // infers the blob's slot_bytes as max(i2) (asset/devblob.rs), so a
+                       // infers the blob's slot_bytes as the smallest nonzero i2 (asset/devblob.rs), so a
                        // band offset here would inflate it and shift the second partial's
                        // binding. The dispatch derives the band's window offset from e0.
         d.i[3] = gate_rs;
@@ -7022,7 +7022,7 @@ fn emit_phase(
                         d.t[3] = w.egu8;
                         d.t[4] = w.egus;
                         d.i[0] = c.top_k;
-                        d.i[1] = (c.moe_inter / c.tp);
+                        d.i[1] = c.moe_inter / c.tp;
                         d.i[2] = c.hidden;
                         d.i[3] = c.n_exp;
                         d.i[4] = 1;
@@ -7037,7 +7037,7 @@ fn emit_phase(
                         d.t[4] = w.edns;
                         d.i[0] = c.top_k;
                         d.i[1] = c.hidden;
-                        d.i[2] = (c.moe_inter / c.tp);
+                        d.i[2] = c.moe_inter / c.tp;
                         d.i[3] = c.n_exp;
                         d.i[6] = nb;
                     })]
@@ -7067,7 +7067,7 @@ fn emit_phase(
                                 d.t[3] = w.ewt;
                                 d.t[4] = w.est;
                                 d.i[0] = c.top_k;
-                                d.i[1] = (c.moe_inter / c.tp);
+                                d.i[1] = c.moe_inter / c.tp;
                                 d.i[2] = c.hidden;
                                 d.i[3] = c.n_exp;
                                 d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
@@ -7119,7 +7119,7 @@ fn emit_phase(
                             // operands across rungs, else it keeps widest-only execution.
                             d.t[5] = n.moe_xn2;
                             d.i[0] = c.top_k;
-                            d.i[1] = (c.moe_inter / c.tp);
+                            d.i[1] = c.moe_inter / c.tp;
                             d.i[2] = c.hidden;
                             d.i[3] = c.n_exp;
                             d.i[5] = nb; // BATCH B (0 at B=1)
@@ -7149,7 +7149,7 @@ fn emit_phase(
                         d.t[4] = w.est;
                         d.i[0] = c.top_k;
                         d.i[1] = c.hidden;
-                        d.i[2] = (c.moe_inter / c.tp);
+                        d.i[2] = c.moe_inter / c.tp;
                         d.i[3] = c.n_exp;
                         d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
                         if let Some(min) = moe_dec_group {
@@ -7319,7 +7319,7 @@ fn emit_phase(
                     let xn2_bytes = t as u64 * c.hidden as u64;
                     assert!(
                         xn2_bytes <= fuq_bytes,
-                        "moe.fuq ({fuq_bytes} B = total_pad*moe_inter) cannot stage xn2 e4m3 ({t} rows x {} = {xn2_bytes} B)",
+                        "moe.fuq ({fuq_bytes} B = max(total_pad*moe_inter_local, rows*hidden)) cannot stage xn2 e4m3 ({t} rows x {} = {xn2_bytes} B)",
                         c.hidden
                     );
                     let c_xn2q = quant(b, n.moe_fuq, n.moe_xas, n.moe_xn2, c.hidden, c_xn2);
@@ -7335,7 +7335,7 @@ fn emit_phase(
                             d.t[4] = n.moe_rowtok;
                             d.t[5] = n.moe_xas; // per-token a_scale
                             d.t[6] = w.est; // per-channel weight scales
-                            d.i[0] = (c.moe_inter / c.tp);
+                            d.i[0] = c.moe_inter / c.tp;
                             d.i[1] = c.hidden;
                             d.i[2] = c.n_exp;
                             d.i[5] = c.mlp_act;
@@ -7347,7 +7347,7 @@ fn emit_phase(
                         d.t[1] = n.moe_fug;
                         d.t[2] = n.moe_fus;
                         d.i[0] = moe_total_pad;
-                        d.i[1] = (c.moe_inter / c.tp);
+                        d.i[1] = c.moe_inter / c.tp;
                     });
                     b.emit(
                         DevOp::MoeGroupDownGemmaPfW8a8,
@@ -7363,7 +7363,7 @@ fn emit_phase(
                             d.t[6] = w.est;
                             d.t[7] = n.moe_fus; // per-row fu scale
                             d.i[0] = c.hidden;
-                            d.i[1] = (c.moe_inter / c.tp);
+                            d.i[1] = c.moe_inter / c.tp;
                             d.i[2] = c.n_exp;
                         },
                     )
@@ -7377,7 +7377,7 @@ fn emit_phase(
                         d.t[3] = w.egus;
                         d.t[4] = n.moe_meta;
                         d.t[5] = n.moe_rowtok;
-                        d.i[0] = (c.moe_inter / c.tp);
+                        d.i[0] = c.moe_inter / c.tp;
                         d.i[1] = c.hidden;
                         d.i[2] = c.n_exp;
                         d.i[3] = 1;
@@ -7392,7 +7392,7 @@ fn emit_phase(
                         d.t[6] = n.moe_rowpart;
                         d.t[7] = n.moe_rowgate;
                         d.i[0] = c.hidden;
-                        d.i[1] = (c.moe_inter / c.tp);
+                        d.i[1] = c.moe_inter / c.tp;
                         d.i[2] = c.n_exp;
                     })
                 } else {
@@ -7406,7 +7406,7 @@ fn emit_phase(
                             d.t[2] = w.ewt;
                             d.t[3] = n.moe_meta;
                             d.t[4] = n.moe_rowtok;
-                            d.i[0] = (c.moe_inter / c.tp);
+                            d.i[0] = c.moe_inter / c.tp;
                             d.i[1] = c.hidden;
                             d.i[2] = c.n_exp;
                             d.i[5] = c.mlp_act; // 0 GeGLU (Gemma)
@@ -7425,7 +7425,7 @@ fn emit_phase(
                             d.t[4] = n.moe_rowpart;
                             d.t[5] = n.moe_rowgate;
                             d.i[0] = c.hidden;
-                            d.i[1] = (c.moe_inter / c.tp);
+                            d.i[1] = c.moe_inter / c.tp;
                             d.i[2] = c.n_exp;
                         },
                     )

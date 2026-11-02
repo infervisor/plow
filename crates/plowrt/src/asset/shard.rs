@@ -509,7 +509,7 @@ pub fn slice_for_as<'a>(
                 [e, two_i, ..] => (*e as u64, *two_i as u64),
                 _ => return Err(bad(format!("fused gate/up with shape {shape:?}"))),
             };
-            if e == 0 || two_i % (2 * tp as u64) != 0 || full % (e * two_i) != 0 {
+            if e == 0 || two_i == 0 || two_i % (2 * tp as u64) != 0 || full % (e * two_i) != 0 {
                 return Err(bad(format!(
                     "fused gate/up {shape:?} does not split into {tp} intermediate slices"
                 )));
@@ -538,7 +538,12 @@ pub fn slice_for_as<'a>(
                 .iter()
                 .map(|&d| d as u64)
                 .product();
-            if shape.len() < 2 || in_full % tp as u64 != 0 || full % (rows * in_full) != 0 {
+            if shape.len() < 2
+                || rows == 0
+                || in_full == 0
+                || in_full % tp as u64 != 0
+                || full % (rows * in_full) != 0
+            {
                 return Err(bad(format!(
                     "fused down {shape:?} does not split into {tp} intermediate slices"
                 )));

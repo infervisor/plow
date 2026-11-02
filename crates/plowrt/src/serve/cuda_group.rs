@@ -112,6 +112,9 @@ pub struct CudaGroupServe {
     live: Vec<bool>,
     pf_pos: Vec<usize>,
     attached: Vec<usize>,
+    /// The rank-0 logits row holding each slot's latest token: a decode launch compacts its
+    /// feeds into rows `0..n`, and a finished prefill leaves its row in row 0.
+    logits_at: Vec<Option<usize>>,
     prefill_turn: usize,
 }
 
@@ -219,6 +222,7 @@ impl CudaGroupServe {
             live: vec![false; batch],
             pf_pos: vec![0; batch],
             attached: vec![0; batch],
+            logits_at: vec![None; batch],
             prefill_turn: 0,
         })
     }
@@ -301,6 +305,10 @@ impl CudaGroupServe {
             } => {
                 self.pf_pos[slot] = frontier;
                 self.attached[slot] = attached as usize;
+                self.logits_at.fill(None);
+                if token.is_some() {
+                    self.logits_at[slot] = Some(0);
+                }
                 Ok(token)
             }
             other => Err(RuntimeError::Device(format!(
@@ -509,7 +517,10 @@ impl SeqEngine for CudaGroupServe {
         self.attached.get(slot).copied().unwrap_or(0)
     }
     fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
-        self.eng.lock().logits_row(slot, out).is_ok()
+        match self.logits_at.get(slot).copied().flatten() {
+            Some(row) => self.eng.lock().logits_row(row, out).is_ok(),
+            None => false,
+        }
     }
     fn prefill_chunked_at_most(
         &mut self,
@@ -545,6 +556,10 @@ impl SeqEngine for CudaGroupServe {
             feeds: feeds.to_vec(),
         })? {
             Resp::Tokens(t) if t.len() == feeds.len() => {
+                self.logits_at.fill(None);
+                for (row, &(slot, _)) in feeds.iter().enumerate() {
+                    self.logits_at[slot] = Some(row);
+                }
                 Ok(feeds.iter().map(|f| f.0).zip(t).collect())
             }
             other => Err(RuntimeError::Device(format!(

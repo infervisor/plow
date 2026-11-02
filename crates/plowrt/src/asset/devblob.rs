@@ -217,6 +217,17 @@ fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
             }
         }
     }
+    // Every slot base is a whole slot: a blob with slot 0 and 2 but no slot 1 would otherwise
+    // recover twice the stride and bind slot 2 past its partial. Such a blob keeps its TP
+    // degree with no usable stride (`slot_bytes` 0), which every loader refuses.
+    let whole = progs.iter().flat_map(|p| &p.insts).all(|d| {
+        (d.op != DevOp::XReduce as u16 && d.op != DevOp::XReduceTwoShot as u16)
+            || slot_bytes == 0
+            || (d.i[2] as u64 % slot_bytes == 0 && d.i[2] as u64 <= 2 * slot_bytes)
+    });
+    if !whole {
+        slot_bytes = 0;
+    }
     // A tp==1 blob emits no collective at all, so "no collective" and "not
     // sharded" are the same fact and `None` says it once.
     (n_gpu > 1).then_some(DevTp {
