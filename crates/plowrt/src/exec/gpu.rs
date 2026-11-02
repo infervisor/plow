@@ -4117,6 +4117,7 @@ impl GpuEngine {
         let tp_kernarg = rank::TpKernarg::of(rank_bind.as_ref());
         if let (Some(tp), Some(r)) = (blob.tp, rank_bind.as_ref()) {
             let layout = r.group().layout().expect("checked at bind");
+            // Three partial slots, `slot_bytes` apart (devgen's slot_b).
             if tp.slot_bytes == 0 || tp.slot_bytes > layout.partial_off(1)? {
                 return Err(RuntimeError::Rejected(format!(
                     "TP partial slot {} B exceeds the group's {} B",
@@ -5037,6 +5038,9 @@ impl GpuEngine {
                 let mem = match (&tp_shards, td.name.as_str()) {
                     (Some((.., own, _)), "act.og_tp") => DeviceMem::view(*own, td.bytes),
                     (Some((.., own, slot_b)), "act.dg_tp") => DeviceMem::view(own + slot_b, td.bytes),
+                    (Some((.., own, slot_b)), "act.ug_tp") => {
+                        DeviceMem::view(own + 2 * slot_b, td.bytes)
+                    }
                     (Some(_), n) if n.ends_with("_tp") => {
                         return Err(RuntimeError::Rejected(format!(
                             "TP tensor `{n}` has no NVIDIA binding"
