@@ -68,6 +68,17 @@ enum Resp {
     Err(String),
 }
 
+impl Req {
+    fn kind(&self) -> &'static str {
+        match self {
+            Req::Begin { .. } => "begin",
+            Req::Prefill { .. } => "prefill",
+            Req::Step { .. } => "step",
+            Req::Retire { .. } => "retire",
+        }
+    }
+}
+
 /// One request on one rank's engine; a rank's audit runs after every launching request.
 fn execute(e: &mut GpuEngine, req: &Req) -> Result<Resp> {
     let resp = match req {
@@ -250,7 +261,9 @@ impl CudaGroupServe {
         for w in &mut self.workers {
             sent = sent.and_then(|()| w.link.send(&req));
         }
+        let t0 = std::time::Instant::now();
         let local = sent.and_then(|()| execute(&mut self.eng.lock(), &req));
+        let local_us = t0.elapsed().as_micros() as u64;
         if local.is_err() {
             // Release workers waiting for rank 0 at a launch barrier before collecting replies.
             self.group.abort();
@@ -275,6 +288,12 @@ impl CudaGroupServe {
                 )),
             };
         }
+        tracing::debug!(
+            req = req.kind(),
+            local_us,
+            total_us = t0.elapsed().as_micros() as u64,
+            "rank group request"
+        );
         out.map_err(|(rank, e)| {
             self.group.abort();
             tracing::error!(rank, error = %e, "rank group request failed; group is down");
@@ -303,6 +322,7 @@ impl CudaGroupServe {
                 attached,
                 token,
             } => {
+                tracing::debug!(slot, from = self.pf_pos[slot], frontier, "rank group prefill chunk");
                 self.pf_pos[slot] = frontier;
                 self.attached[slot] = attached as usize;
                 self.logits_at.fill(None);

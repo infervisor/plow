@@ -9460,11 +9460,20 @@ impl GpuEngine {
     /// Start a tensor-parallel launch unit: the previous unit has retired (stream drained),
     /// then every rank of the subgroup zeroes its gates and agrees on `plan`.
     fn rank_arm(&mut self, plan: &[u64]) -> Result<()> {
+        let t0 = std::time::Instant::now();
         self.be.stream_synchronize(&self.stream)?;
-        match self.rank_bind.as_mut() {
+        let t1 = std::time::Instant::now();
+        let r = match self.rank_bind.as_mut() {
             Some(r) => r.arm(plan),
             None => Ok(()),
-        }
+        };
+        tracing::trace!(
+            kind = plan.first().copied().unwrap_or(0),
+            drain_us = (t1 - t0).as_micros() as u64,
+            barrier_us = t1.elapsed().as_micros() as u64,
+            "rank arm"
+        );
+        r
     }
 
     /// Fail the last launch unit if one of its collectives bailed. Drains the stream first.
