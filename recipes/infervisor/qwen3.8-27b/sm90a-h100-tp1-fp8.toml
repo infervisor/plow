@@ -146,6 +146,10 @@ PLOW_PREFIX_CACHE = "1"
 PLOW_VMM_PREFIX = "1"
 PLOW_PF_INTERLEAVE = "0"
 PLOW_MAX_QUEUED_REQUESTS = "128"
+# Generated flash decode from one row: the segmented FP8 rungs already split around attention, so
+# the object beats the interpreter pair at B1/B2 too (step_bench 4K 14.05/14.69 -> 13.56/13.70 ms;
+# q450 T K K T, mean of the two runs' TPOT P50 16.78 -> 15.90 ms; FP32 gate c1/c8/c32 PASS).
+PLOW_GEN_DECODE_STEP = "1"
 
 [bench]
 backend = "openai"
