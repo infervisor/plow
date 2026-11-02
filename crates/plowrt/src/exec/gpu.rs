@@ -7910,6 +7910,16 @@ impl GpuEngine {
                 Err(e) => tracing::warn!(error = %e, "qwen chain graph warmup failed"),
             }
         }
+        // A decode launch writes its idle lanes' garbage row at position 0, so the first wide
+        // launch maps every slot's first block column (decode's VMM backstop). Mapped here
+        // instead, after the admission budget and store cap are sized as before, the planner's
+        // load measurement includes it: 2 x Gemma-4-E4B (4 GiB each, 128 slots) was admitted
+        // on a measurement without it and both engines ran out of device memory on first use.
+        if let Some(v) = engine.vmm.as_ref() {
+            for b in 0..engine.vmm_active.len() {
+                v.ensure_rows(b, 1)?;
+            }
+        }
         Ok(engine)
     }
 
