@@ -570,6 +570,7 @@ hsa_fns! {
     hsa_amd_queue_cu_set_mask: unsafe extern "C" fn(*const HsaQueue, u32, *const u32) -> HsaStatus,
     hsa_queue_add_write_index_screlease: unsafe extern "C" fn(*mut HsaQueue, u64) -> u64,
     hsa_queue_load_read_index_scacquire: unsafe extern "C" fn(*const HsaQueue) -> u64,
+    hsa_queue_load_write_index_scacquire: unsafe extern "C" fn(*const HsaQueue) -> u64,
     hsa_signal_create: unsafe extern "C" fn(i64, u32, *const HsaAgent, *mut HsaSignal) -> HsaStatus,
     hsa_signal_destroy: unsafe extern "C" fn(HsaSignal) -> HsaStatus,
     hsa_signal_store_screlease: unsafe extern "C" fn(HsaSignal, i64),
@@ -639,6 +640,10 @@ impl HsaDriver {
             hsa_queue_load_read_index_scacquire: resolve!(
                 lib,
                 b"hsa_queue_load_read_index_scacquire\0"
+            ),
+            hsa_queue_load_write_index_scacquire: resolve!(
+                lib,
+                b"hsa_queue_load_write_index_scacquire\0"
             ),
             hsa_signal_create: resolve!(lib, b"hsa_signal_create\0"),
             hsa_signal_destroy: resolve!(lib, b"hsa_signal_destroy\0"),
@@ -3353,17 +3358,45 @@ impl HsaBackend {
             self.guard()?;
             return Ok(value);
         }
-        let value = unsafe {
-            (self.shared.drv.hsa_signal_wait_scacquire)(
-                self.done_signal,
-                HSA_SIGNAL_CONDITION_LT,
-                1,
-                u64::MAX,
-                state,
-            )
-        };
-        self.guard()?;
-        Ok(value)
+        static HANG_S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let hang_s = *HANG_S.get_or_init(|| crate::config::RuntimeConfig::get().amd.hang_timeout_s);
+        let t0 = std::time::Instant::now();
+        loop {
+            let value = unsafe {
+                (self.shared.drv.hsa_signal_wait_scacquire)(
+                    self.done_signal,
+                    HSA_SIGNAL_CONDITION_LT,
+                    1,
+                    if hang_s == 0 { u64::MAX } else { 1_000_000_000 },
+                    state,
+                )
+            };
+            self.guard()?;
+            if value < 1 {
+                return Ok(value);
+            }
+            if hang_s != 0 && t0.elapsed().as_secs() >= hang_s {
+                let (rd, wr) = unsafe {
+                    (
+                        (self.shared.drv.hsa_queue_load_read_index_scacquire)(self.queue),
+                        (self.shared.drv.hsa_queue_load_write_index_scacquire)(self.queue),
+                    )
+                };
+                tracing::error!(
+                    device = self.device_ordinal,
+                    in_flight = value,
+                    read_index = rd,
+                    write_index = wr,
+                    secs = hang_s,
+                    "HSA queue drain timed out: a dispatch never completed"
+                );
+                return Err(RuntimeError::Device(format!(
+                    "HSA queue drain timed out after {hang_s} s on device {}: {value} dispatch(es) \
+                     in flight, AQL read index {rd}, write index {wr} (PLOW_AMD_HANG_TIMEOUT_S)",
+                    self.device_ordinal
+                )));
+            }
+        }
     }
 
     /// Create an event. `timing` selects whether the event carries a clock.

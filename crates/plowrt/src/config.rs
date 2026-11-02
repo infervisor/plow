@@ -2270,6 +2270,16 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-hsa-drain-blocked", env = "PLOW_HSA_DRAIN_BLOCKED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub hsa_drain_blocked: bool,
 
+    /// Seconds a queue drain may wait before it fails with the queue indices and the counting
+    /// signal named, instead of hanging the engine thread on a wedged dispatch. `0` waits forever.
+    #[arg(
+        long = "amd-hang-timeout-s",
+        env = "PLOW_AMD_HANG_TIMEOUT_S",
+        default_value_t = 300,
+        global = true
+    )]
+    pub hang_timeout_s: u64,
+
     /// Where the AMD engine thread runs: `auto` pins it to the CPU socket holding rank 0's GPU
     /// (from the device's sysfs NUMA node), `off` leaves it to the scheduler, or a CPU list
     /// such as `72-95,264-287`.
