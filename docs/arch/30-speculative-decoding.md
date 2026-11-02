@@ -146,7 +146,10 @@ width. Two things on a stock Gemma-4 packet make the result depend on the width:
 
 `PLOW_DECODE_BATCH_INVARIANT` is unset by default and then follows `PLOW_SPEC`. When on:
 
-- every decode rung takes the narrowest rung's attention split counts, per attention site;
+- the narrow interpreter rungs take the narrowest rung's attention split counts, per attention
+  site, from the narrowest up; pinning stops at the first library or sibling-object rung, or the
+  first whose pinned splits overflow the partial buffers (the 12B FP8 128-row program at rung 1's
+  132 splits). Spec verify never launches wider than the pinned rungs;
 - every decode object that exports `plow_batch_invariant` uses the row-count-independent MoE arms
   (the grouped expert arm and a K split sized for one row at every width, the B=1 router
   association). A lone request therefore decodes with different (equally valid) MoE rounding
@@ -183,6 +186,10 @@ On that packet a rung-diff of every instruction (rungs 1 vs 4, 2 vs 4, 8 vs 16) 
 output byte, and spec-on greedy output equals the flag-on plain output at B=1/2/4/8, k=1/3/7, ctx
 2048 and 8191.
 
+Gemma-4 12B FP8 (dense; B=1 digest unchanged): B=1/2/4/8/16 +0 / +2.6 / +6.3 / +13.3 / +23.4%,
+from rung 1's 132 attention splits on the wider rungs. The same rung-diff and identity matrix
+passes.
+
 This is why invariance is tied to spec, not on by default.
 
 `step_bench --rung-diff A,B` runs one decode step at two rungs from the same state. It prints the
@@ -218,8 +225,8 @@ The embedded DSpark path (context tail baked into every target program) is descr
 
 | Target | Drafter | State |
 |---|---|---|
-| Gemma-4 26B-A4B FP8 | MTP assistant, embedded or external | External attach equals embedded (identity, drafts, costs). Serving needs objects that export `plow_batch_invariant`. |
-| Gemma-4 12B FP8 | MTP assistant, external | Target re-emitted with span verify (programs identical to the qualified packet). Drafter extracted against it. |
+| Gemma-4 26B-A4B FP8 | MTP assistant, embedded or external | Re-emitted with invariant objects (programs identical to the qualified packet); greedy identity passes. |
+| Gemma-4 12B FP8 | MTP assistant, external | Target re-emitted with span verify and invariant objects: no-drafter digests and step cost equal to the qualified packet. Drafter extracted against it; greedy identity passes. |
 | Gemma-4 26B-A4B BF16 | MTP assistant | Blocked: span verify needs FP8 KV. |
 | Gemma-4 12B FP8 | DSpark (official) | Embedded emit only. Pluggable form per §5 not built. |
 | Qwen3.8-27B | MTP (1 layer) | Needs GDN recurrent-state rollback. |
