@@ -762,7 +762,7 @@ impl MoeLt {
         let abi = plow_asset::cubin::global_u32(&image, "plow_moe_lt_abi");
         if profile != "sm90a"
             || plow_asset::cubin::inspect(&image).is_none_or(|i| i.sm != 90)
-            || !matches!(abi, Some(1..=7))
+            || !matches!(abi, Some(1..=8))
             || (shape.fp8.is_some() && abi < Some(6))
             || (shape.prologue.is_some() && abi < Some(7))
             || (shape.prologue.is_some() && shape.fp8.is_none() && abi < Some(8))
