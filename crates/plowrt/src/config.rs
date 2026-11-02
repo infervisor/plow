@@ -1833,9 +1833,11 @@ pub struct NvidiaRuntimeConfig {
     /// Decode rungs of at least this many rows run each attention pair the packet declares
     /// with the generated decode role (an isolated FlashDecode + FlashMerge) as one launch of
     /// the generated flash-decode object between interpreter windows; narrower rungs, and 0,
-    /// run the untouched interpreter pair in one launch. 4: the object wins from four rows
-    /// (Qwen3.8-27B H100, knob_spec evidence); at one or two rows the interpreter's single
-    /// launch is as fast or faster.
+    /// run the untouched interpreter pair in one launch. 4: the object wins from four rows on a
+    /// packet whose decode rungs are one interpreter launch (Qwen3.8-27B BF16 H100, knob_spec
+    /// evidence; 1 measured slower there at one and two rows). A packet whose projections
+    /// already split the rung into windows (cuBLASLt / native FP8 segments) wins from one row:
+    /// its recipe sets 1.
     #[arg(
         long = "gen-decode-step",
         env = "PLOW_GEN_DECODE_STEP",
