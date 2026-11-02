@@ -27,6 +27,11 @@ int cuModuleUnload(void) { return 0; }
 int cuModuleGetFunction(void) { return 0; }
 int cuModuleGetGlobal_v2(void) { return 0; }
 int cuFuncSetAttribute(void) { return 0; }
+int cuFuncGetAttribute(void) { return 0; }
+int cuMemHostRegister_v2(void) { return 0; }
+int cuMemHostUnregister(void) { return 0; }
+int cuMemHostGetDevicePointer_v2(void) { return 0; }
+int cuStreamWaitEvent(void) { return 0; }
 int cuOccupancyMaxActiveBlocksPerMultiprocessor(void) { return 0; }
 int cuMemAlloc_v2(uint64_t *p, size_t n) { if (!valid_context()) return 201; uint64_t *mem=calloc(1,n+8); if (!mem) return 2; *mem=ctx; *p=(uintptr_t)(mem+1); return 0; }
 int cuMemFree_v2(uint64_t p) { free((uint64_t *)(uintptr_t)p-1); return 0; }
