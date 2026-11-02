@@ -982,7 +982,7 @@ async fn speech_with(
     let (mux, bundle, pipeline) = loop {
         let routed = match dp.as_deref() {
             Some(set) => {
-                if let Err(e) = state.dp_admit(set).await {
+                if let Err(e) = state.dp_admit(set, false).await {
                     return e.with_retry_after(crate::serve::api_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         e.to_string(),

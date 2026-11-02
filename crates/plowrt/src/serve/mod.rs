@@ -7,10 +7,10 @@ pub mod chat;
 pub mod completion;
 pub mod config;
 pub mod cosched;
-#[cfg(feature = "cuda")]
-pub mod cuda_group;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
+#[cfg(feature = "cuda")]
+pub mod cuda_group;
 pub mod deadlines;
 pub mod dp;
 /// The loaded device engine behind a slug, as one type over both backends —
@@ -796,12 +796,22 @@ impl AppState {
     /// Make some rank of `set` serve: a no-op while one does; otherwise load one whose residency
     /// admits (S1 switch on its group).
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    pub async fn dp_admit(&self, set: &dp::DpSet) -> std::result::Result<(), manager::EnsureError> {
-        if set.ranks.iter().any(|r| r.is_up()) {
+    /// `sampled`: the request needs a rank that applies sampling parameters, when the set has one.
+    pub async fn dp_admit(
+        &self,
+        set: &dp::DpSet,
+        sampled: bool,
+    ) -> std::result::Result<(), manager::EnsureError> {
+        let fit = |r: &dp::DpRank| !sampled || !set.any_samples() || set.rank_samples(r.rank);
+        if set.ranks.iter().any(|r| r.is_up() && fit(r)) {
             return Ok(());
         }
         let mut last = manager::EnsureError::Unloaded;
-        for r in set.ranks.iter().filter(|r| self.residency(&r.key).admits()) {
+        for r in set
+            .ranks
+            .iter()
+            .filter(|r| fit(r) && self.residency(&r.key).admits())
+        {
             let Some(mgr) = self.manager_for(&r.key) else {
                 continue;
             };
@@ -829,9 +839,15 @@ impl AppState {
             .write()
             .insert(slug.clone(), engine.honours_sampling());
         if let Some((set, r)) = self.dp_rank(&slug) {
-            self.max_ctx
-                .write()
-                .insert(set.model.clone(), engine.max_ctx());
+            // The model admits what every rank can hold: ranks of different vendors' bundles may
+            // compile different context lengths.
+            let ctx = set
+                .ranks
+                .iter()
+                .filter(|o| o.rank != r)
+                .filter_map(|o| self.max_ctx.read().get(&o.key).copied())
+                .fold(engine.max_ctx(), usize::min);
+            self.max_ctx.write().insert(set.model.clone(), ctx);
             set.set_samples(r, engine.honours_sampling());
             self.sampling_honoured
                 .write()
@@ -1486,6 +1502,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/metrics", get(metrics_snapshot_handler))
         .route("/trace", get(trace_handler))
         .route("/v1/turns/:session", get(turns::session_turns))
+        .route("/v1/placement", get(placement_handler))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::clone(&state));
     #[cfg(feature = "cuda")]
@@ -1562,6 +1579,71 @@ pub fn dead_engines(state: &AppState) -> (Vec<String>, Vec<String>) {
     (dead, degraded)
 }
 
+/// `GET /v1/placement`: device groups, the instances placed on each, and every DP model's
+/// ranks with their vendor (docs/arch/30 §2.4).
+async fn placement_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::Json<serde_json::Value> {
+    use serde_json::json;
+    let tag = |v: Option<hwspec::Vendor>| v.map_or("host", crate::device::vendor_tag);
+    let mut instances: Vec<(String, usize)> = state
+        .slug_group
+        .read()
+        .iter()
+        .map(|(k, g)| (k.clone(), *g))
+        .collect();
+    instances.sort_unstable();
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    let groups: Vec<_> = state
+        .managers()
+        .iter()
+        .enumerate()
+        .map(|(g, m)| {
+            json!({
+                "group": g,
+                "vendor": tag(m.vendor()),
+                "devices": m.ordinals().iter().map(|o| format!("{}:{o}", tag(m.vendor()))).collect::<Vec<_>>(),
+                "instances": instances.iter().filter(|i| i.1 == g).map(|i| i.0.as_str()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    let groups: Vec<serde_json::Value> = Vec::new();
+    let models: Vec<_> = state
+        .registry
+        .slugs()
+        .into_iter()
+        .map(|slug| {
+            let ranks: Vec<_> = state
+                .dp_set(&slug)
+                .map(|set| {
+                    set.ranks
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "rank": r.rank,
+                                "key": r.key,
+                                "vendor": tag(r.vendor),
+                                "device": format!("{}:{}", tag(r.vendor), r.ordinal),
+                                "group": r.group,
+                                "up": r.cand().up,
+                                "samples": set.rank_samples(r.rank),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            json!({
+                "model": slug,
+                "vendors": state.registry.vendors(&slug).into_iter().map(crate::device::vendor_tag).collect::<Vec<_>>(),
+                "group": state.slug_group(&slug),
+                "dp": ranks,
+            })
+        })
+        .collect();
+    axum::Json(json!({ "groups": groups, "models": models }))
+}
+
 fn dp_metrics(out: &mut String, router: &dp::DpRouter, state: &AppState) {
     use crate::obs::serving::{escape_label, family};
     use std::fmt::Write;
@@ -1582,11 +1664,7 @@ fn dp_metrics(out: &mut String, router: &dp::DpRouter, state: &AppState) {
                 "plowrt_dp_rank_info{{model_name=\"{m}\",engine=\"{}\",device=\"{}\",vendor=\"{}\"}} 1",
                 r.rank,
                 r.ordinal,
-                match r.vendor {
-                    Some(hwspec::Vendor::Nvidia) => "nv",
-                    Some(hwspec::Vendor::Amd) => "amd",
-                    _ => "",
-                }
+                r.vendor.map_or("", crate::device::vendor_tag)
             );
         }
     }

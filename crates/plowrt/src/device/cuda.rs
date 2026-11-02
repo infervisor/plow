@@ -2502,7 +2502,8 @@ impl super::host_region::HostStaging for CudaBackend {
                 MEMHOSTREGISTER_PORTABLE | MEMHOSTREGISTER_DEVICEMAP,
             )
         };
-        if rc != HOST_MEMORY_ALREADY_REGISTERED {
+        let ours = rc != HOST_MEMORY_ALREADY_REGISTERED;
+        if ours {
             self.check(rc, "cuMemHostRegister(host region)")?;
         }
         // The alias is the address kernels dereference. The staging copies take the same value
@@ -2510,14 +2511,24 @@ impl super::host_region::HostStaging for CudaBackend {
         let mut dp: CUdeviceptr = 0;
         // SAFETY: `ptr` is registered above (or by an earlier portable registration).
         let rc = unsafe { (self.api.cuMemHostGetDevicePointer_v2)(&mut dp, ptr as *mut c_void, 0) };
-        self.check(rc, "cuMemHostGetDevicePointer(host region)")?;
-        if dp != ptr as u64 {
-            return Err(RuntimeError::Device(
-                "host region: registered memory is not device-addressable at its host address"
-                    .into(),
-            ));
+        let alias = self
+            .check(rc, "cuMemHostGetDevicePointer(host region)")
+            .and_then(|()| {
+                if dp == ptr as u64 {
+                    Ok(dp)
+                } else {
+                    Err(RuntimeError::Device(
+                        "host region: registered memory is not device-addressable at its host \
+                         address"
+                            .into(),
+                    ))
+                }
+            });
+        if alias.is_err() && ours {
+            // SAFETY: registered by this call; nothing has used it.
+            unsafe { self.host_unregister(ptr) };
         }
-        Ok(dp)
+        alias
     }
 
     unsafe fn host_unregister(&self, ptr: *mut u8) {

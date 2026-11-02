@@ -445,6 +445,168 @@ pub fn mix_split(
     Ok(k)
 }
 
+/// A device as `serve --plan-only` sees it.
+#[derive(Clone, Debug)]
+pub struct PlanDevice {
+    pub id: String,
+    pub vendor: hwspec::Vendor,
+    pub isa: Option<hwspec::isa::IsaLevel>,
+    pub name: String,
+    /// 0 = unknown.
+    pub mem_bytes: u64,
+}
+
+/// A bundle as `serve --plan-only` sees it: `slug` is the served name (variants share one).
+#[derive(Clone, Debug)]
+pub struct PlanModel {
+    pub slug: String,
+    pub dir: String,
+    pub gpu: String,
+    pub vendor: Option<hwspec::Vendor>,
+    pub isa: Option<hwspec::isa::IsaLevel>,
+    pub tp: u32,
+    /// Bytes resident on each rank device, when the blob header gave a plan.
+    pub required: Option<u64>,
+    /// Why this bundle cannot serve beside the slug's first bundle (variant check).
+    pub refused: Option<String>,
+}
+
+/// Why `m` cannot run on `d`, or `None` when it can (TP group size is checked per model).
+pub fn plan_verdict(m: &PlanModel, d: &PlanDevice) -> Option<String> {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    if let Some(why) = &m.refused {
+        return Some(format!("variant refused: {why}"));
+    }
+    let Some(isa) = m.isa else {
+        return Some(format!("packet target {:?} is not a known GPU", m.gpu));
+    };
+    if m.vendor != Some(d.vendor) {
+        return Some(format!(
+            "packet is for {}, device is {}",
+            isa.arch_flag(),
+            d.isa.map_or("an unknown ISA", |i| i.arch_flag())
+        ));
+    }
+    if d.isa != Some(isa) {
+        return Some(format!(
+            "packet ISA {} != device ISA {}",
+            isa.arch_flag(),
+            d.isa.map_or("unknown", |i| i.arch_flag())
+        ));
+    }
+    match m.required {
+        Some(r) if d.mem_bytes > 0 && r > d.mem_bytes => Some(format!(
+            "needs {:.1} GiB per device, {} has {:.1} GiB",
+            gib(r),
+            d.id,
+            gib(d.mem_bytes)
+        )),
+        _ => None,
+    }
+}
+
+/// The device x model support table `serve --plan-only` prints: one row per bundle, one column
+/// per device, every refusal with its reason, and per served model the data-parallel reach over
+/// all of its variants.
+pub fn plan_table(devices: &[PlanDevice], models: &[PlanModel]) -> String {
+    use std::fmt::Write;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let mut out = String::new();
+    let _ = writeln!(out, "devices:");
+    for d in devices {
+        let _ = writeln!(
+            out,
+            "  {:<7} {:<8} {:>6.1} GiB  {}",
+            d.id,
+            d.isa.map_or("?", |i| i.arch_flag()),
+            gib(d.mem_bytes),
+            d.name
+        );
+    }
+    let row = |m: &PlanModel| {
+        format!(
+            "{} [{}]",
+            m.slug,
+            m.isa.map_or(m.gpu.as_str(), |i| i.arch_flag())
+        )
+    };
+    let width = models
+        .iter()
+        .map(|m| row(m).len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let _ = writeln!(out, "matrix (ok / - refused, reasons below):");
+    let _ = write!(out, "  {:<width$}", "model");
+    for d in devices {
+        let _ = write!(out, " {:>6}", d.id);
+    }
+    let _ = writeln!(out);
+    let mut reasons = Vec::new();
+    for m in models {
+        let _ = write!(out, "  {:<width$}", row(m));
+        for d in devices {
+            let cell = match plan_verdict(m, d) {
+                None => "ok",
+                Some(why) => {
+                    reasons.push(format!("{} @ {}: {why}", row(m), d.id));
+                    "-"
+                }
+            };
+            let _ = write!(out, " {cell:>6}");
+        }
+        let _ = writeln!(out);
+    }
+    if !reasons.is_empty() {
+        let _ = writeln!(out, "refusals:");
+        for r in &reasons {
+            let _ = writeln!(out, "  {r}");
+        }
+    }
+    let _ = writeln!(out, "models:");
+    let mut seen: Vec<&str> = Vec::new();
+    for m in models {
+        if seen.contains(&m.slug.as_str()) {
+            continue;
+        }
+        seen.push(&m.slug);
+        let mut reach = Vec::new();
+        let mut ranks = 0usize;
+        for v in models
+            .iter()
+            .filter(|v| v.slug == m.slug && v.refused.is_none())
+        {
+            let ok = devices
+                .iter()
+                .filter(|d| plan_verdict(v, d).is_none())
+                .count();
+            let n = ok / v.tp.max(1) as usize;
+            ranks += n;
+            reach.push(format!(
+                "{} TP{} x{n}",
+                v.isa.map_or(v.gpu.as_str(), |i| i.arch_flag()),
+                v.tp
+            ));
+        }
+        let _ = writeln!(
+            out,
+            "  {}: {}; DP up to {ranks}{}",
+            m.slug,
+            if reach.is_empty() {
+                "no servable bundle".to_string()
+            } else {
+                reach.join(" + ")
+            },
+            if reach.len() > 1 {
+                " across vendors"
+            } else {
+                ""
+            }
+        );
+    }
+    out
+}
+
 /// Parse `--dp 8`, `--dp all`, `--dp gemma=4,asr=all`.
 pub fn parse_dp(entries: &[String]) -> Result<DpSpec, String> {
     let value = |v: &str, entry: &str| match v {
@@ -847,6 +1009,50 @@ mod tests {
         assert!(l.assignment[4] < 4);
         let l = assign(&m, &groups(5, 48 * GIB), Place::Spread).unwrap();
         assert_eq!(l.assignment[4], 4, "a free group goes to the plain model");
+    }
+
+    #[test]
+    fn plan_table_marks_each_refusal() {
+        use hwspec::isa::IsaLevel;
+        let dev = |id: &str, vendor, isa, gib: u64| PlanDevice {
+            id: id.into(),
+            vendor,
+            isa: Some(isa),
+            name: String::new(),
+            mem_bytes: gib << 30,
+        };
+        let devices = [
+            dev("nv:0", hwspec::Vendor::Nvidia, IsaLevel::Sm120a, 96),
+            dev("amd:0", hwspec::Vendor::Amd, IsaLevel::Gfx1201, 32),
+        ];
+        let model = |gpu: &str, vendor, isa, gib: u64| PlanModel {
+            slug: "m".into(),
+            dir: String::new(),
+            gpu: gpu.into(),
+            vendor: Some(vendor),
+            isa: Some(isa),
+            tp: 1,
+            required: Some(gib << 30),
+            refused: None,
+        };
+        let nv = model("rtxpro6000", hwspec::Vendor::Nvidia, IsaLevel::Sm120a, 40);
+        let amd = model("r9700", hwspec::Vendor::Amd, IsaLevel::Gfx1201, 40);
+        assert_eq!(plan_verdict(&nv, &devices[0]), None);
+        assert!(plan_verdict(&nv, &devices[1])
+            .unwrap()
+            .contains("packet is for"));
+        assert!(plan_verdict(&amd, &devices[1])
+            .unwrap()
+            .contains("needs 40.0 GiB"));
+        let small = PlanModel {
+            required: Some(8 << 30),
+            ..amd
+        };
+        let t = plan_table(&devices, &[nv, small]);
+        assert!(
+            t.contains("m: sm_120a TP1 x1 + gfx1201 TP1 x1; DP up to 2 across vendors"),
+            "{t}"
+        );
     }
 
     #[test]

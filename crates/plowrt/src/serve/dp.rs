@@ -557,6 +557,11 @@ impl DpSet {
         }
     }
 
+    /// Whether rank `rank`'s engine applies sampling parameters (as last installed).
+    pub fn rank_samples(&self, rank: usize) -> bool {
+        self.unsampled.load(Relaxed) >> rank & 1 == 0
+    }
+
     /// Some rank applies sampling parameters: sampled requests route only to those.
     pub fn any_samples(&self) -> bool {
         self.unsampled.load(Relaxed).count_ones() < self.ranks.len() as u32

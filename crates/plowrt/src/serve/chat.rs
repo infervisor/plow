@@ -158,7 +158,17 @@ async fn chat_completions_with(
     {
         use crate::serve::manager::EnsureError;
         let ensured = match state.dp_set(&req.model) {
-            Some(set) => Some(state.dp_admit(set).await),
+            Some(set) => {
+                // The sampling the request resolves to below (logprobs aside): a sampled request
+                // needs a rank that applies it resident.
+                let mut params = state
+                    .registry
+                    .get(&req.model)
+                    .map(|b| crate::serve::config::base_sampling(&b))
+                    .unwrap_or_default();
+                req.sampling.apply(&mut params);
+                Some(state.dp_admit(set, params.samples()).await)
+            }
             None => match state.manager_for(&req.model) {
                 Some(mgr) if mgr.manages(&req.model) => Some(mgr.ensure_resident(&req.model).await),
                 _ => None,
@@ -1147,12 +1157,22 @@ pub(crate) fn variant_mismatch(
 fn tokenizer_digest(b: &crate::asset::ModelBundle) -> Option<Vec<u8>> {
     use sha2::{Digest, Sha256};
     let ckpt = crate::asset::serve::checkpoint_dir(&b.dir);
-    for base in [b.dir.as_path(), ckpt.as_path()] {
+    let bases = [b.dir.as_path(), ckpt.as_path()];
+    // tokenizer_config.json carries added tokens and processor settings the loader applies.
+    let finish = |mut h: Sha256, base: &std::path::Path| {
+        if let Ok(c) = std::fs::read(base.join("tokenizer_config.json")) {
+            h.update(&c);
+        }
+        Some(h.finalize().to_vec())
+    };
+    for base in bases {
         if let Ok(bytes) = std::fs::read(base.join("tokenizer.json")) {
-            return Some(Sha256::digest(&bytes).to_vec());
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            return finish(h, base);
         }
     }
-    for base in [b.dir.as_path(), ckpt.as_path()] {
+    for base in bases {
         if let (Ok(v), Ok(m)) = (
             std::fs::read(base.join("vocab.json")),
             std::fs::read(base.join("merges.txt")),
@@ -1160,7 +1180,7 @@ fn tokenizer_digest(b: &crate::asset::ModelBundle) -> Option<Vec<u8>> {
             let mut h = Sha256::new();
             h.update(&v);
             h.update(&m);
-            return Some(h.finalize().to_vec());
+            return finish(h, base);
         }
     }
     None

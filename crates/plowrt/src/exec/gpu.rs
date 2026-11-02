@@ -5045,7 +5045,9 @@ impl GpuEngine {
                 // TP partials live in this rank's collective region, where peers read them.
                 let mem = match (&tp_shards, td.name.as_str()) {
                     (Some((.., own, _)), "act.og_tp") => DeviceMem::view(*own, td.bytes),
-                    (Some((.., own, slot_b)), "act.dg_tp") => DeviceMem::view(own + slot_b, td.bytes),
+                    (Some((.., own, slot_b)), "act.dg_tp") => {
+                        DeviceMem::view(own + slot_b, td.bytes)
+                    }
                     (Some((.., own, slot_b)), "act.ug_tp") => {
                         DeviceMem::view(own + 2 * slot_b, td.bytes)
                     }
@@ -5133,7 +5135,9 @@ impl GpuEngine {
                                 *n,
                             )?
                         }
-                        None => std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?),
+                        None => {
+                            std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?)
+                        }
                     };
                     if src.len() as u64 != td.bytes {
                         return Err(RuntimeError::Device(format!(

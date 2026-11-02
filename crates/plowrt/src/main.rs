@@ -149,6 +149,10 @@ enum Cmd {
         /// Requests allowed to wait outside engine slots. `0` = four batches.
         #[arg(long, default_value_t = 0)]
         max_queued_requests: usize,
+        /// Print the device x model support table (every refusal with its reason) and exit
+        /// without loading a model.
+        #[arg(long)]
+        plan_only: bool,
     },
 
     /// Benchmark one model through the production serving scheduler without HTTP.
@@ -1092,7 +1096,9 @@ fn pin_group_rank0() {
     let Ok(cli) = Cli::try_parse() else { return };
     if let Some(first) = cli.rt_cfg.group_devices.first() {
         if let Ok(prev) = std::env::var("CUDA_VISIBLE_DEVICES") {
-            eprintln!("plowrt: PLOW_GROUP_DEVICES overrides CUDA_VISIBLE_DEVICES={prev} with {first}");
+            eprintln!(
+                "plowrt: PLOW_GROUP_DEVICES overrides CUDA_VISIBLE_DEVICES={prev} with {first}"
+            );
         }
         std::env::set_var("CUDA_VISIBLE_DEVICES", first);
     }
@@ -1287,6 +1293,7 @@ async fn async_main(
             max_hold_ms,
             slo_ms,
             max_queued_requests,
+            plan_only,
         } => {
             let (mut assets, asset_slugs): (Vec<PathBuf>, Vec<Option<String>>) = assets
                 .iter()
@@ -1296,6 +1303,9 @@ async fn async_main(
                 .unzip();
             for m in &model {
                 assets.push(dist_cmd::resolve_local(m)?);
+            }
+            if plan_only {
+                return serve_plan_only(&assets, &asset_slugs);
             }
             plowrt::asset::serve::log_checkpoints(&assets);
             tracing::info!(
@@ -3379,6 +3389,76 @@ fn devices_xfer(mib: u32, iters: u32) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// `serve --plan-only`: every device of every vendor against every bundle, without loading.
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+fn serve_plan_only(
+    assets: &[PathBuf],
+    slugs: &[Option<String>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::serve::placement::{plan_table, PlanDevice, PlanModel};
+    let devices: Vec<PlanDevice> = device::inventory()?
+        .iter()
+        .map(|d| {
+            let fp = d.handle.backend().fingerprint();
+            let (name, arch) = d.handle.name_and_arch();
+            PlanDevice {
+                id: d.id.to_string(),
+                vendor: d.id.vendor,
+                isa: fp
+                    .as_ref()
+                    .map(|f| f.isa)
+                    .or_else(|| hwspec::isa::IsaLevel::from_arch_flag(&arch)),
+                name,
+                mem_bytes: fp.map_or(0, |f| f.mem_bytes),
+            }
+        })
+        .collect();
+    let registry = Registry::new();
+    let mut models = Vec::new();
+    for (i, dir) in assets.iter().enumerate() {
+        let (slug, refused) = match registry.load(dir, slugs.get(i).cloned().flatten()) {
+            Ok(slug) => (slug, None),
+            Err(e) => (
+                slugs
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| dir.display().to_string()),
+                Some(e.to_string()),
+            ),
+        };
+        let gpu = plowrt::asset::ModelBundle::target_gpu(dir).unwrap_or_default();
+        let spec = hwspec::registry::lookup(&gpu);
+        let ckpt = plowrt::asset::serve::checkpoint_dir(dir);
+        models.push(PlanModel {
+            slug,
+            dir: dir.display().to_string(),
+            vendor: spec.map(|s| s.vendor),
+            isa: spec.and_then(hwspec::isa::IsaLevel::from_spec),
+            gpu,
+            tp: plowrt::serve::manager::tp_degree(dir).unwrap_or(1),
+            required: plowrt::serve::manager::BlobPlan::from_dir_with_device(
+                dir,
+                None,
+                Some(&ckpt),
+            )
+            .ok()
+            .map(|p| p.required(p.overhead_bound) + plowrt::serve::manager::RESERVE),
+            refused,
+        });
+    }
+    print!("{}", plan_table(&devices, &models));
+    Ok(())
+}
+
+#[cfg(not(any(feature = "cuda", feature = "hsa")))]
+fn serve_plan_only(
+    _assets: &[PathBuf],
+    _slugs: &[Option<String>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("--plan-only needs a GPU build (cuda or hsa)".into())
+}
+
 fn devices(
     tp: Option<u32>,
     hidden: u32,
@@ -4090,7 +4170,14 @@ async fn bringup_runtime(
     #[cfg(feature = "cuda")]
     let backend: Arc<dyn Backend> = match &cuda {
         Some(c) => Arc::clone(c) as Arc<dyn Backend>,
-        None => device::select_with(executors, !RuntimeConfig::get().cuda_closed()),
+        None => device::select_with(
+            executors,
+            !RuntimeConfig::get().cuda_closed(),
+            RuntimeConfig::get()
+                .amd_devices()
+                .first()
+                .map_or(0, |&o| u8::try_from(o).unwrap_or(u8::MAX)),
+        ),
     };
     #[cfg(not(feature = "cuda"))]
     let backend: Arc<dyn Backend> = device::select(executors);
@@ -4132,7 +4219,11 @@ async fn bringup_runtime(
     #[cfg(feature = "hsa")]
     let amd_ords: Vec<u32> = match RuntimeConfig::get().amd_devices() {
         named if named.is_empty() => (0..visible as u32).collect(),
-        named => named,
+        mut named => {
+            named.sort_unstable();
+            named.dedup();
+            named
+        }
     };
     // Groups a mixed-vendor DP model may put ranks on, beside the CUDA groups.
     #[cfg(feature = "hsa")]
@@ -4568,6 +4659,8 @@ async fn bringup_runtime(
                     n
                 };
                 if k == 0 {
+                    // Every rank is AMD's: its dispatchers are spawned with the AMD engines.
+                    managed_slugs.remove(&spec.slug);
                     continue;
                 }
                 if n == 1 {
@@ -4900,6 +4993,17 @@ async fn bringup_runtime(
             let width = placement::grouping_width(&specs, visible).map_err(|e| e.to_string())?;
             let groups =
                 placement::plan_groups(&ordinals, width, u64::MAX).map_err(|e| e.to_string())?;
+            // An AMD engine opens the `tp` agents from its first one on.
+            if let Some(g) = groups
+                .iter()
+                .find(|g| g.ordinals.windows(2).any(|w| w[1] != w[0] + 1))
+            {
+                return Err(format!(
+                    "--devices: AMD TP group {:?} is not a run of consecutive agents",
+                    g.ordinals
+                )
+                .into());
+            }
             let layout =
                 placement::assign(&specs, &groups, cfg.place).map_err(|e| e.to_string())?;
             let tenants: Vec<usize> = (0..layout.groups.len())

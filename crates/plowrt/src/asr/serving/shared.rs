@@ -770,7 +770,7 @@ pub(super) async fn route(
         attempts += 1;
         let (key, mux) = match dp.as_deref() {
             Some(set) => {
-                if let Err(e) = state.dp_admit(set).await {
+                if let Err(e) = state.dp_admit(set, false).await {
                     return Err(e.with_retry_after(failure(StatusCode::SERVICE_UNAVAILABLE, &e)));
                 }
                 match state.dp_route(set, session, None, exclude, false) {
