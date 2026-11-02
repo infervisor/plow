@@ -2893,8 +2893,6 @@ pub struct GpuEngine {
     kv_admit_reserve: u64,
     /// The manager's cap on the admission budget while co-resident engines share the device.
     kv_budget_cap: Option<u64>,
-    /// Bumped by every `set_co_tenant`; the mux reports the one whose cap it admits under.
-    kv_cap_gen: u64,
     /// Free bytes the prefix cache's pressure eviction keeps (0: not armed).
     cache_floor: u64,
     /// The block store's growth floor above `cache_floor` (`None`: the store keeps its floor).
@@ -7782,7 +7780,6 @@ impl GpuEngine {
             kv_admission,
             kv_admit_reserve,
             kv_budget_cap: None,
-            kv_cap_gen: 0,
             cache_floor,
             store_floor_band,
             kv_row_bytes: blob
@@ -8253,7 +8250,6 @@ impl GpuEngine {
     /// `(None, 0)` restores the solo budget and floors.
     pub fn set_co_tenant(&mut self, cap: Option<u64>, keep_free: u64) {
         self.kv_budget_cap = cap;
-        self.kv_cap_gen += 1;
         if self.cache_floor == 0 {
             return;
         }
@@ -8270,10 +8266,6 @@ impl GpuEngine {
                 None => bs.set_device_floor(if keep_free > 0 { floor } else { 0 }),
             }
         }
-    }
-
-    pub fn kv_cap_gen(&self) -> u64 {
-        self.kv_cap_gen
     }
 
     fn kv_admission_uncapped(&self) -> Option<crate::sched::admission::KvBudget> {

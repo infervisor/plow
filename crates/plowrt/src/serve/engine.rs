@@ -490,16 +490,6 @@ impl ServeEngine {
         }
     }
 
-    /// Generation of the last `set_co_tenant` (0 off CUDA).
-    pub fn kv_cap_gen(&self) -> u64 {
-        match self {
-            #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(e) => e.kv_cap_gen(),
-            #[allow(unreachable_patterns)]
-            _ => 0,
-        }
-    }
-
     /// See [`crate::exec::gpu::GpuEngine::set_co_tenant`]; a no-op off CUDA.
     pub fn set_co_tenant(&mut self, cap: Option<u64>, keep_free: u64) {
         match self {

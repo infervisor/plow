@@ -2073,105 +2073,51 @@ impl ModelManager {
             claims.insert(slug.to_string(), claim);
         }
         drop(claims);
-        // A resident mux admits on its old budget until its next refresh: share, wait until every
-        // mux reports the cap it now admits under and what it admitted before, then refuse the
-        // load if those admissions no longer fit beside the caps.
-        let shared = self.share_kv(state).and_then(|caps| {
-            if caps.len() > 1 {
-                self.await_kv_caps(state, &caps);
-                self.verify_kv_caps(state, &caps)?;
-            }
-            Ok(())
-        });
+        let shared = self.share_kv(state);
         if shared.is_err() {
             self.kv_claims.lock().remove(slug);
         }
         shared
     }
 
-    /// Waits (bounded) until each mux in `caps` reports the cap generation installed for it. A
-    /// mux that does not report in time is idle: it admitted nothing since its last report.
-    fn await_kv_caps(&self, state: &AppState, caps: &[(String, u64, u64)]) {
-        let deadline = Instant::now() + KV_SHARE_ACK_WAIT;
-        for (slug, _, gen) in caps {
-            let metrics = state.model_metrics(slug);
-            while metrics
-                .kv_cap_gen
-                .load(std::sync::atomic::Ordering::Acquire)
-                < *gen
-            {
-                if Instant::now() > deadline {
-                    tracing::info!(%slug, "planner: co-resident mux idle — its last KV report stands");
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-    }
-
-    /// The installed caps, or what each engine already admitted where that is larger, must fit
-    /// the device beside the reserve.
-    fn verify_kv_caps(
-        &self,
-        state: &AppState,
-        caps: &[(String, u64, u64)],
-    ) -> std::result::Result<(), EnsureError> {
-        let engines = self.kv_engines(state);
-        let (room, shares) = self.kv_snapshot(state, &engines)?;
-        let reserve = shares.iter().map(|s| s.reserve).max().unwrap_or(0);
-        let need: u64 = caps
-            .iter()
-            .map(|(slug, cap, _)| {
-                let committed = shares
-                    .iter()
-                    .find(|s| &s.slug == slug)
-                    .map_or(0, |s| s.committed);
-                (*cap).max(committed)
-            })
-            .sum();
-        if need + reserve > room {
-            return Err(EnsureError::NoKvRoom(format!(
-                "co-resident models admitted {} MiB of KV against {} MiB the device backs beside \
-                 a {} MiB reserve",
-                need >> 20,
-                room.saturating_sub(reserve) >> 20,
-                reserve >> 20
-            )));
-        }
-        Ok(())
-    }
-
     /// Each engine admits from `free + its own held - its reserve`, so co-resident engines all
     /// count the same free memory (2 x E4B: 38.3 + 5.7 GiB budgets over 6.4 GiB free, both
     /// OOM). With two or more KV engines, each is capped at its share of `free + every engine's
-    /// live KV - the largest reserve`, split by one full-context sequence's bytes, and its
-    /// prefix caches keep free what the others' caps and that reserve need. Refuses when the
-    /// shares cannot each back one full-context sequence.
-    fn share_kv(
-        &self,
-        state: &AppState,
-    ) -> std::result::Result<Vec<(String, u64, u64)>, EnsureError> {
+    /// live KV - the largest reserve`: first what its seated sequences reserve or one
+    /// full-context sequence, whichever is larger, then the rest split by one sequence's bytes.
+    /// Its prefix caches keep free what the others' caps and that reserve need. Refuses when the
+    /// shares cannot cover that. Admission is held while reservations are read and caps set.
+    fn share_kv(&self, state: &AppState) -> std::result::Result<(), EnsureError> {
         let engines = self.kv_engines(state);
         if engines.len() < 2 {
-            for (_, e) in &engines {
+            for (slug, e) in &engines {
+                state.model_metrics(slug).kv_share.lock().cap = None;
                 e.lock().set_co_tenant(None, 0);
             }
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let (room, shares) = self.kv_snapshot(state, &engines)?;
+        let metrics: Vec<_> = engines
+            .iter()
+            .map(|(s, _)| state.model_metrics(s))
+            .collect();
+        let (room, mut shares) = self.kv_snapshot(&engines)?;
+        // Engine locks are not taken while these are held (a mux may seat under its engine lock).
+        let mut cells: Vec<_> = metrics.iter().map(|m| m.kv_share.lock()).collect();
+        for (share, cell) in shares.iter_mut().zip(&cells) {
+            share.committed = cell.reserved;
+        }
         let caps = kv_shares(room, &shares)?;
+        for (cell, &cap) in cells.iter_mut().zip(&caps) {
+            cell.cap = Some(cap);
+        }
+        drop(cells);
         let total: u64 = caps.iter().sum();
         let reserve = shares.iter().map(|s| s.reserve).max().unwrap_or(0);
-        let mut installed = Vec::with_capacity(caps.len());
-        for (KvShare { slug, .. }, &cap) in shares.iter().zip(&caps) {
-            if let Some(e) = state.gpu_engine(slug) {
-                let mut e = e.lock();
-                e.set_co_tenant(Some(cap), reserve + (total - cap));
-                installed.push((slug.clone(), cap, e.kv_cap_gen()));
-            }
+        for ((slug, e), &cap) in engines.iter().zip(&caps) {
+            e.lock().set_co_tenant(Some(cap), reserve + (total - cap));
             tracing::info!(%slug, cap_mib = cap >> 20, reserve_mib = reserve >> 20, room_mib = room >> 20, "planner: co-resident KV budget capped");
         }
-        Ok(installed)
+        Ok(())
     }
 
     /// The resident engines whose KV budget the device shares.
@@ -2183,7 +2129,10 @@ impl ModelManager {
         slugs
             .into_iter()
             .filter_map(|s| state.gpu_engine(&s).map(|e| (s, e)))
-            .filter(|(_, e)| e.lock().shares_device_kv())
+            .filter(|(_, e)| {
+                let e = e.lock();
+                e.shares_device_kv() && e.kv_admission_budget().is_some()
+            })
             .collect()
     }
 
@@ -2192,7 +2141,6 @@ impl ModelManager {
     /// released between the reads then count once at most.
     fn kv_snapshot(
         &self,
-        state: &AppState,
         engines: &[(String, Arc<Mutex<crate::serve::engine::ServeEngine>>)],
     ) -> std::result::Result<(u64, Vec<KvShare>), EnsureError> {
         let held_before: Vec<u64> = engines
@@ -2204,30 +2152,21 @@ impl ModelManager {
         let mut shares = Vec::with_capacity(engines.len());
         for ((slug, e), before) in engines.iter().zip(held_before) {
             let e = e.lock();
-            if let Some(budget) = e.kv_admission_budget() {
-                held += before.min(e.kv_live_held());
-                // Admitted sequences map their reserved rows as they decode: the share must
-                // cover them, not only what is mapped now.
-                let committed = state
-                    .model_metrics(slug)
-                    .kv_reserved_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                shares.push(KvShare {
-                    slug: slug.clone(),
-                    seq: budget.bytes_for_rows(e.max_ctx() as u64),
-                    committed,
-                    reserve: e.kv_admit_reserve(),
-                });
-            }
+            held += before.min(e.kv_live_held());
+            let seq = e
+                .kv_admission_budget()
+                .map_or(0, |b| b.bytes_for_rows(e.max_ctx() as u64));
+            shares.push(KvShare {
+                slug: slug.clone(),
+                seq,
+                committed: 0,
+                reserve: e.kv_admit_reserve(),
+            });
         }
         let free = free_before.min(self.free_vram().map_err(EnsureError::Load)?);
         Ok((free + held, shares))
     }
 }
-
-/// How long a load waits for resident muxes to report a new KV cap (they refresh every 50 ms
-/// while serving; a long prefill tick delays one).
-const KV_SHARE_ACK_WAIT: Duration = Duration::from_secs(2);
 
 /// One co-resident engine's inputs to [`kv_shares`].
 struct KvShare {
