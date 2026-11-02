@@ -425,11 +425,14 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
     };
 
     // A runtime-compiled target (Apple) ships no objset, so nothing records a
-    // compiler: the shaders are built on the serving machine.
+    // compiler: the shaders are built on the serving machine. NVIDIA cubins are
+    // pinned by their bytes in the objset content digest and run on any driver
+    // new enough for them, so a CUDA toolchain is recorded when the recipe names
+    // one but never required.
     let toolchain =
         match over.toolchain.map(str::to_string).or(t.toolchain) {
             Some(v) => v,
-            None if runtime_compiled(&vendor) => String::new(),
+            None if runtime_compiled(&vendor) || vendor == "nvidia" => String::new(),
             None => return Err(bad(at(
                 "[target] has no `toolchain`: the objset records the compiler its objects were \
                  built with, and the recipe checker verifies it",
