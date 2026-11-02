@@ -314,7 +314,7 @@ fn validate_programs(progs: &[DevProg], kvrow: &[u32], n_tensor: Option<usize>) 
         .enumerate()
         .filter(|(_, p)| p.role.is_decode_rung() && !p.role.is_dense_exact_rung())
         .max_by_key(|(i, p)| (p.t, *i));
-    for (p, prog) in patched {
+    if let Some((p, prog)) = patched {
         if let Some(&k) = kvrow.iter().find(|&&k| k as usize >= prog.insts.len()) {
             return Err(malformed(format!(
                 "kv-row site {k} is past decode program {p}'s {} instructions",

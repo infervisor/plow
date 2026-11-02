@@ -1873,8 +1873,7 @@ impl ModelManager {
     }
 
     async fn load_model_once(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
-        // One read and parse of the packet for every step of this load.
-        let _packet = PacketImage::open_in_dir(&m.dir).ok().flatten();
+        let _anchor = crate::asset::packet_image::LoadAnchor::hold(&m.dir);
         let state = self.state()?;
         let bundle = state
             .registry

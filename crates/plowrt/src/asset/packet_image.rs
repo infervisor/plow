@@ -44,7 +44,9 @@ fn identity(meta: &std::fs::Metadata) -> (FileId, Stamp) {
     )
 }
 
-type Memo<T> = Mutex<HashMap<FileId, (Stamp, Weak<T>)>>;
+/// Per file: the version last loaded and a slot that loads of that version share. The slot's
+/// lock serialises concurrent opens of one file so it is read and parsed once.
+type Memo<T> = Mutex<HashMap<FileId, (Stamp, Arc<Mutex<Weak<T>>>)>>;
 
 /// `Ok(None)` when `path` does not exist. Otherwise the value cached for the file `path` opens,
 /// or `load` of its bytes when the cache has none (or a different version of the file).
@@ -63,13 +65,22 @@ fn memoized<T>(
         Err(e) => return Err(io(e)),
     };
     let (id, stamp) = identity(&file.metadata().map_err(io)?);
-    if let Some(hit) = memo
-        .lock()
-        .unwrap()
-        .get(&id)
-        .filter(|(s, _)| *s == stamp)
-        .and_then(|(_, w)| w.upgrade())
-    {
+    let slot = {
+        let mut memo = memo.lock().unwrap();
+        memo.retain(|_, (_, slot)| {
+            Arc::strong_count(slot) > 1 || slot.lock().unwrap().strong_count() > 0
+        });
+        match memo.get(&id) {
+            Some((s, slot)) if *s == stamp => slot.clone(),
+            _ => {
+                let slot = Arc::new(Mutex::new(Weak::new()));
+                memo.insert(id, (stamp, slot.clone()));
+                slot
+            }
+        }
+    };
+    let mut cached = slot.lock().unwrap();
+    if let Some(hit) = cached.upgrade() {
         return Ok(Some(hit));
     }
     let mut raw = Vec::with_capacity(stamp.len as usize);
@@ -77,30 +88,40 @@ fn memoized<T>(
     let value = Arc::new(load(raw)?);
     // A file rewritten in place while it was read is served once but never cached.
     if identity(&file.metadata().map_err(io)?).1 == stamp {
-        let mut memo = memo.lock().unwrap();
-        memo.retain(|_, (_, w)| w.strong_count() > 0);
-        memo.insert(id, (stamp, Arc::downgrade(&value)));
+        *cached = Arc::downgrade(&value);
     }
     Ok(Some(value))
 }
 
 /// A packet file's bytes and its parse. The parse carries no L2-placement verdict: every
 /// executing consumer applies [`DevBlob::check_l2_dispatch`] with its own answer.
-pub struct PacketImage {
-    pub path: PathBuf,
+pub struct PacketBody {
     pub raw: Vec<u8>,
     pub blob: DevBlob,
     sha256: OnceLock<[u8; 32]>,
 }
 
+/// A packet opened at `path`. The body is shared with every other open of the same file; the
+/// path stays the caller's, so sidecars (`build.json`, receipts) resolve beside the path opened.
+pub struct PacketImage {
+    pub path: PathBuf,
+    body: Arc<PacketBody>,
+}
+
+impl std::ops::Deref for PacketImage {
+    type Target = PacketBody;
+    fn deref(&self) -> &PacketBody {
+        &self.body
+    }
+}
+
 impl PacketImage {
     pub fn open(path: &Path) -> Result<Arc<PacketImage>> {
-        static PACKETS: OnceLock<Memo<PacketImage>> = OnceLock::new();
+        static PACKETS: OnceLock<Memo<PacketBody>> = OnceLock::new();
         let memo = PACKETS.get_or_init(Default::default);
-        memoized(memo, path, |raw| {
+        let body = memoized(memo, path, |raw| {
             let blob = DevBlob::parse_unguarded(&raw)?;
-            Ok(PacketImage {
-                path: path.to_path_buf(),
+            Ok(PacketBody {
                 raw,
                 blob,
                 sha256: OnceLock::new(),
@@ -109,7 +130,11 @@ impl PacketImage {
         .ok_or_else(|| RuntimeError::Io {
             path: path.to_path_buf(),
             source: std::io::ErrorKind::NotFound.into(),
-        })
+        })?;
+        Ok(Arc::new(PacketImage {
+            path: path.to_path_buf(),
+            body,
+        }))
     }
 
     /// The packet in an assets directory (see [`DevBlob::find_in_dir`]), if it has one.
@@ -119,6 +144,13 @@ impl PacketImage {
             .transpose()
     }
 
+    /// The `build.json` beside this packet; see [`BuildInfo::read`].
+    pub fn build_info(&self) -> Result<Option<Arc<BuildInfo>>> {
+        BuildInfo::read(&self.path.with_file_name(BUILD_FILE))
+    }
+}
+
+impl PacketBody {
     /// SHA-256 of the packet bytes, computed once per image.
     pub fn sha256(&self) -> &[u8; 32] {
         self.sha256.get_or_init(|| {
@@ -134,10 +166,29 @@ impl PacketImage {
     pub(crate) fn digest_cell(&self) -> &OnceLock<[u8; 32]> {
         &self.sha256
     }
+}
 
-    /// The `build.json` beside this packet; see [`BuildInfo::read`].
-    pub fn build_info(&self) -> Result<Option<Arc<BuildInfo>>> {
-        BuildInfo::read(&self.path.with_file_name(BUILD_FILE))
+/// Holds an assets directory's packets (main and sidecars) and `build.json` so the steps of one
+/// load share a single read and parse of each. Errors are left to the steps themselves.
+pub struct LoadAnchor {
+    _packets: Vec<Arc<PacketImage>>,
+    _build: Option<Arc<BuildInfo>>,
+}
+
+impl LoadAnchor {
+    pub fn hold(dir: &Path) -> Self {
+        let _packets = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "pkt") && p.is_file())
+            .filter_map(|p| PacketImage::open(&p).ok())
+            .collect();
+        LoadAnchor {
+            _packets,
+            _build: BuildInfo::in_dir(dir).ok().flatten(),
+        }
     }
 }
 
@@ -217,6 +268,36 @@ mod tests {
         assert_eq!(c.pairing_hash(), Some(17));
         std::fs::write(&path, "{").unwrap();
         assert!(BuildInfo::read(&path).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn one_body_per_file_with_the_callers_path() {
+        let d = dir("alias");
+        let real = d.join("a");
+        std::fs::create_dir_all(&real).unwrap();
+        let mut b = packet::devbuild::Builder::new(1);
+        b.emit(packet::dev::DevOp::Nop, vec![0], &[], |_| {});
+        let p = b.finish();
+        let model = packet::devbuild::Model {
+            n_cu: 1,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            prog_t: vec![1],
+            gen: vec![],
+            kv_row_insts: vec![],
+        };
+        std::fs::write(real.join("model.pkt"), model.to_blob()).unwrap();
+        let alias = d.join("b");
+        std::fs::create_dir_all(&alias).unwrap();
+        std::os::unix::fs::symlink(real.join("model.pkt"), alias.join("model.pkt")).unwrap();
+        std::fs::write(alias.join(BUILD_FILE), r#"{"pairing":{"hash":"0x7"}}"#).unwrap();
+        let a = PacketImage::open(&real.join("model.pkt")).unwrap();
+        let b = PacketImage::open(&alias.join("model.pkt")).unwrap();
+        assert!(Arc::ptr_eq(&a.body, &b.body));
+        assert!(a.build_info().unwrap().is_none());
+        assert_eq!(b.build_info().unwrap().unwrap().pairing_hash(), Some(7));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

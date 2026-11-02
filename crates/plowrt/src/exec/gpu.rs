@@ -4043,6 +4043,10 @@ impl GpuEngine {
             "loading model onto GPU..."
         );
 
+        // Every object's pairing check reads this one parse.
+        let _build = crate::asset::packet_image::BuildInfo::in_dir(assets_dir)
+            .ok()
+            .flatten();
         // ---- blob ----
         let (pkt, image, mut blob) = {
             let run = || -> Result<_> {

@@ -879,6 +879,7 @@ pub(super) fn check_decode_object(
 /// before and stay valid. A manifest that exists and cannot be parsed IS an
 /// error — it is the only statement of what the packet needs, and guessing past
 /// a broken one is how the check would silently stop checking.
+#[cfg(test)]
 pub(super) fn manifest_pairing_hash(raw: &[u8], path: &Path) -> Result<u64> {
     let manifest: serde_json::Value = serde_json::from_slice(raw)
         .map_err(|e| RuntimeError::Device(format!("{}: not valid JSON: {e}", path.display())))?;
@@ -936,12 +937,16 @@ pub(super) fn validate_packet_pairing_stamp(
 }
 
 pub(super) fn build_pairing_hash(blob_path: &Path) -> Result<Option<u64>> {
-    let path = blob_path.with_file_name("build.json");
-    match std::fs::read(&path) {
-        Ok(raw) => manifest_pairing_hash(&raw, &path).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(RuntimeError::Io { path, source }),
-    }
+    let path = blob_path.with_file_name(crate::asset::packet_image::BUILD_FILE);
+    let Some(build) = crate::asset::packet_image::BuildInfo::read(&path)? else {
+        return Ok(None);
+    };
+    build.pairing_hash().map(Some).ok_or_else(|| {
+        RuntimeError::Device(format!(
+            "specialised AMD object requires {} to contain a valid pairing.hash",
+            path.display()
+        ))
+    })
 }
 
 pub(super) fn check_packet_pairing_stamp(

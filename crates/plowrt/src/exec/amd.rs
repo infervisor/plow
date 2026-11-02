@@ -8790,6 +8790,7 @@ impl AmdEngine {
         let t_rank = Instant::now();
         crate::knob_spec::check_assets(blob_path)?;
         let image = crate::asset::packet_image::PacketImage::open(blob_path)?;
+        let _build = image.build_info().ok().flatten();
         let raw = &image.raw;
         let arch = EngineDevice::arch(&*be);
         let n_cu_dev = EngineDevice::sm_count(&*be);

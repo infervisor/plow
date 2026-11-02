@@ -165,10 +165,11 @@ typedef struct {
 PLOW_SASSERT(sizeof(PlowGenTensor) == 72, "PlowGenTensor size");
 
 #define PLOW_SECT_NAME_LEN 24
+#define PLOW_SECT_F_MUST_UNDERSTAND 1u
 
 typedef struct {
     uint32_t kind;
-    uint32_t _pad;
+    uint32_t flags; /* PLOW_SECT_F_MUST_UNDERSTAND; other bits reserved 0 */
     uint64_t offset;
     uint64_t size;
     char     name[PLOW_SECT_NAME_LEN];
