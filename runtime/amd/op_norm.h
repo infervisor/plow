@@ -434,7 +434,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
  * QuantFp8Block128 over `out` produces (same amax floor, scale, and PLOW_GM_FP8_PACK2 on the
  * ROUNDED outputs), so the pair becomes one packet. A 128-group is 16 consecutive lanes' 8-element
  * chunks of rn_index. Requires the register-resident row (`fits`) and feat % 128 == 0. */
-#ifdef PLOW_GM_FP8_PACK2
+#if defined(PLOW_GM_FP8_PACK2) && PLOW_CDNA4 /* its only dispatch sites are PLOW_CDNA4 */
 __device__ void d_rmsnorm_q128(bf16* __restrict__ out, const bf16* __restrict__ x,
                                const bf16* __restrict__ gamma, unsigned rows, unsigned feat,
                                float eps, unsigned slice, unsigned nblk, float* part,
