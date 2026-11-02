@@ -18,12 +18,14 @@ impl GpuEngine {
         })
     }
 
-    /// Slot `b`'s rows `[.., n)` into `out`. The slot must have consumed at least `n` rows.
+    /// Slot `b`'s rows `[.., n)` into `out`. `n` is the slot's frontier and nothing was written
+    /// past it: a sliding ring then still holds every row the image carries.
     pub fn export_kv_image(&mut self, b: usize, n: u32, out: &mut Vec<u8>) -> Result<()> {
-        if b >= self.batch || self.pos[b] < n {
+        if b >= self.batch || self.pos[b] != n || self.kv_hw[b] > n {
             return Err(RuntimeError::Rejected(format!(
-                "KV image export: slot {b} holds {} rows, {n} asked",
-                self.pos.get(b).copied().unwrap_or(0)
+                "KV image export: slot {b} stands at {} (written to {}), {n} asked",
+                self.pos.get(b).copied().unwrap_or(0),
+                self.kv_hw.get(b).copied().unwrap_or(0)
             )));
         }
         let (spans, total) = plan(self.kv_image_manifest()?, b as u32, n)?;
@@ -49,9 +51,21 @@ impl GpuEngine {
                 "KV image import: slot {b} is not freshly begun"
             )));
         }
-        if self.kv_blocks().is_some_and(|bs| bs.captures_state()) || self.recurrent.is_some() {
+        if prompt.len() >= self.max_ctx {
+            return Err(RuntimeError::ContextLength(format!(
+                "KV image import: {} rows leave no room under the context {}",
+                prompt.len(),
+                self.max_ctx
+            )));
+        }
+        // State the image does not carry: recurrent layers and a block drafter's context caches.
+        if self.kv_blocks().is_some_and(|bs| bs.captures_state())
+            || self.recurrent.is_some()
+            || self.spec_draft.is_some()
+        {
             return Err(RuntimeError::Rejected(
-                "KV image import: recurrent-state packets are not supported".into(),
+                "KV image import: packets with recurrent state or a drafter are not supported"
+                    .into(),
             ));
         }
         let (spans, total) = plan(self.kv_image_manifest()?, b as u32, n)?;
@@ -71,13 +85,11 @@ impl GpuEngine {
         self.be.synchronize()?;
         self.pos[b] = n;
         self.kv_hw[b] = n;
-        if self.vmm_prefix_enabled() {
-            // As a finished prefill: the prompt's blocks publish to this engine's prefix cache.
-            self.seq_tokens[b].clear();
-            self.seq_tokens[b].extend_from_slice(prompt);
-            self.vmm_publish(b, n.saturating_sub(1));
-            self.vmm_prefill_done(b);
-        }
+        // An imported slot publishes nothing to this engine's prefix cache: its rings hold only
+        // the image's window, not the rows an earlier boundary would copy, and the exporting
+        // engine already holds the prompt's blocks. `seq_tokens` shorter than the frontier is
+        // what every publish path refuses on.
+        self.seq_tokens[b].clear();
         Ok(())
     }
 }

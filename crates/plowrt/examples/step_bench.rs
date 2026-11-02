@@ -376,7 +376,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     } else {
-        for b in 0..slots {
+        // `--kv-image`: only slot 0 prefills; the others are seated from its image below.
+        for b in 0..if kv_image { 1 } else { slots } {
             let prompt = prompt_for(b);
             if let Some(histories) = &mut histories {
                 histories[b] = prompt.clone();
@@ -426,6 +427,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             slots - 1,
             e.kv_image_key().unwrap_or_default()
         );
+        if exact != slots - 1 {
+            return Err("KV image re-export differs from the exported image".into());
+        }
     }
     if let Some(dir) = &prefill_logits_dir {
         std::fs::write(
@@ -617,6 +621,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if same && !partial {
         let agree = streams.iter().filter(|s| **s == streams[0]).count();
         println!("SLOTS_AGREE {agree}/{slots} (identical prompts on every slot)");
+        if kv_image && agree != slots {
+            return Err("slots seated from a KV image decode differently".into());
+        }
         for (b, s) in streams.iter().enumerate().skip(1) {
             if *s != streams[0] {
                 println!("  slot{b}={s:?}");
