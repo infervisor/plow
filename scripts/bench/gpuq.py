@@ -73,7 +73,9 @@ def work(root):
             path, job = pending[0]
             # Mixed NVIDIA+AMD box: gpulease keeps one pool per vendor and refuses a lease without one.
             vendor = ["--vendor", job["vendor"]] if job.get("vendor") else []
-            audit = None if metal else subprocess.run([str(LEASE), *vendor, "--audit"], capture_output=True, text=True)
+            # Named cards (possibly both vendors): gpulease waits for exactly those and audits them.
+            devices = job.get("devices")
+            audit = None if metal or devices else subprocess.run([str(LEASE), *vendor, "--audit"], capture_output=True, text=True)
             if audit is not None and (audit.returncode or tenant_blocks(audit.stdout, job["ngpu"], job.get("vendor"))):
                 time.sleep(5)
                 continue
@@ -89,7 +91,8 @@ def work(root):
                 if metal:
                     metal_lock = open("/tmp/plow-metal-gpu.lock", "a")
                     fcntl.flock(metal_lock, fcntl.LOCK_EX)
-                command = job["command"] if metal else [str(LEASE), *vendor, "-n", str(job["ngpu"]), job["label"], *job["command"]]
+                lease = ["--devices", devices] if devices else [*vendor, "-n", str(job["ngpu"])]
+                command = job["command"] if metal else [str(LEASE), *lease, job["label"], *job["command"]]
                 child = subprocess.Popen(command,
                                          cwd=job["cwd"], env=child_env, stdout=log, stderr=subprocess.STDOUT)
                 job["pid"] = child.pid
@@ -107,6 +110,8 @@ def main():
     parser.add_argument("--root", type=Path)
     parser.add_argument("--vendor", choices=["nvidia", "amd"], default=os.environ.get("GPU_LEASE_VENDOR") or None,
                         help="lease pool on a mixed NVIDIA+AMD box; default queue root /tmp/plow-gpuq.<vendor>")
+    parser.add_argument("--devices", help="exact cards, e.g. nvidia:0,amd:1 (either vendor or both); "
+                        "the ngpu argument must equal their count; default queue root /tmp/plow-gpuq.devices")
     sub = parser.add_subparsers(dest="action", required=True)
     submit = sub.add_parser("submit")
     submit.add_argument("label")
@@ -115,7 +120,8 @@ def main():
     sub.add_parser("run")
     sub.add_parser("status")
     args = parser.parse_args()
-    root = (args.root or Path("/tmp/plow-gpuq" + (f".{args.vendor}" if args.vendor else ""))).resolve()
+    pool = "devices" if args.devices else args.vendor
+    root = (args.root or Path("/tmp/plow-gpuq" + (f".{pool}" if pool else ""))).resolve()
     root.mkdir(parents=True, exist_ok=True)
     if args.action == "run":
         work(root)
@@ -130,6 +136,8 @@ def main():
             parser.error("Metal uses one shared device")
         if args.ngpu < 1 or not args.command:
             parser.error("submit needs a positive GPU count and a command")
+        if args.devices and len(args.devices.split(",")) != args.ngpu:
+            parser.error("--devices names a different number of cards than ngpu")
         try:
             lease_timeout = int(os.environ.get("GPU_LEASE_TIMEOUT", LEASE_TIMEOUT))
         except ValueError:
@@ -137,7 +145,7 @@ def main():
         job_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         save(root / (job_id + ".json"), dict(state="queued", label=args.label, ngpu=args.ngpu,
              command=args.command, cwd=os.getcwd(), submitted=time.time(), lease_timeout=lease_timeout,
-             vendor=args.vendor))
+             vendor=args.vendor, devices=args.devices))
         with (root / "runner.log").open("ab") as log:
             subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--root", str(root), "run"],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

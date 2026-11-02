@@ -62,6 +62,21 @@ class QueueTests(unittest.TestCase):
                 self.assertEqual(audit.call_args.args[0][1:], ["--vendor", "amd", "--audit"])
                 self.assertEqual(launch.call_args.args[0][1:5], ["--vendor", "amd", "-n", "1"])
 
+    def test_device_job_leases_named_cards_without_pool_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gpuq.save(root / "1.json", dict(state="queued", ngpu=2, label="x", command=["true"], cwd=directory,
+                                            devices="nvidia:0,amd:1"))
+            with patch.object(gpuq.os, "access", return_value=True), \
+                 patch.object(gpuq.time, "monotonic", side_effect=[0, 1, 1, 2, 2002]), \
+                 patch.object(gpuq.subprocess, "run") as audit, \
+                 patch.object(gpuq.subprocess, "Popen") as launch:
+                launch.return_value.pid = 123
+                launch.return_value.wait.return_value = 0
+                gpuq.work(root)
+                audit.assert_not_called()
+                self.assertEqual(launch.call_args.args[0][1:4], ["--devices", "nvidia:0,amd:1", "x"])
+
 
 if __name__ == "__main__":
     unittest.main()
