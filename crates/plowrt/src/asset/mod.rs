@@ -40,6 +40,8 @@ pub mod dsa_indexer;
 pub mod extension;
 #[cfg(feature = "gguf")]
 pub mod gguf;
+/// One read, parse and hash of a packet (and its `build.json`) per load.
+pub mod packet_image;
 /// Megatron weight sharding. Gated with `checkpoint` — it is the rule for which
 /// slice of a checkpoint tensor a rank binds, and useless without one.
 #[cfg(any(feature = "cuda", feature = "hsa"))]

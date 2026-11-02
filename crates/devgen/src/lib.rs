@@ -8281,7 +8281,7 @@ pub(crate) fn write_lean_receipts(packet: &std::path::Path, lean: &LeanReport) {
         checks: lean.compile_checks.clone(),
     };
     receipts
-        .validate_packet(&bytes)
+        .validate_packet(&plow_asset::decode_objects::image_sha256(&bytes))
         .expect("compiler check receipt binding");
     let path = packet.with_file_name(PACKET_CHECKS_FILE);
     std::fs::write(
@@ -8411,7 +8411,7 @@ pub fn write_sidecar_packet(
         program_checks,
     };
     receipts
-        .validate_packet(&blob)
+        .validate_packet(&plow_asset::decode_objects::image_sha256(&blob))
         .expect("sidecar check receipt binding");
     std::fs::write(
         &checks_path,

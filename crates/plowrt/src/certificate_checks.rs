@@ -17,7 +17,36 @@ use plow_asset::certificates::{
 use plow_asset::decode_objects::image_sha256;
 
 use crate::asset::devblob::DevBlob;
+use crate::asset::packet_image::PacketImage;
 use crate::{Result, RuntimeError};
+
+/// A packet as the checks read it. The digest is computed at most once, and not at all when no
+/// receipt needs it.
+struct Pkt<'a> {
+    path: &'a Path,
+    raw: &'a [u8],
+    blob: &'a DevBlob,
+    digest: &'a std::sync::OnceLock<[u8; 32]>,
+}
+
+impl<'a> Pkt<'a> {
+    fn of(image: &'a PacketImage) -> Self {
+        Pkt {
+            path: &image.path,
+            raw: &image.raw,
+            blob: &image.blob,
+            digest: image.digest_cell(),
+        }
+    }
+
+    fn sha256(&self) -> String {
+        use sha2::Digest;
+        let d = self
+            .digest
+            .get_or_init(|| sha2::Sha256::digest(self.raw).into());
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
 
 pub(crate) fn load_policy() -> Result<VerificationPolicy> {
     VerificationPolicy::parse(&crate::config::RuntimeConfig::get().lean_qualify)
@@ -39,33 +68,43 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 /// the only packet with `in.ids`), or any packet whose `lean-checks.json` binds its bytes,
 /// carries compiler receipts; every other packet (`encoder.pkt`, `codec.pkt`, ...) is a sidecar
 /// with its own file.
-fn is_compiler_packet(
-    blob_path: &Path,
-    raw: &[u8],
-    blob: &DevBlob,
-    receipts: Option<&[u8]>,
-) -> bool {
-    blob_path.file_stem().is_some_and(|stem| stem == "model")
-        || blob.tensors.iter().any(|t| t.name == "in.ids")
+fn is_compiler_packet(pkt: &Pkt, receipts: Option<&[u8]>) -> bool {
+    pkt.path.file_stem().is_some_and(|stem| stem == "model")
+        || pkt.blob.tensors.iter().any(|t| t.name == "in.ids")
         || receipts
             .and_then(|bytes| serde_json::from_slice::<PacketCheckReceipts>(bytes).ok())
-            .is_some_and(|r| r.packet_sha256 == image_sha256(raw))
+            .is_some_and(|r| r.packet_sha256 == pkt.sha256())
 }
 
-pub(crate) fn check_packet(blob_path: &Path, raw: &[u8], blob: &DevBlob) -> Result<()> {
-    check_packet_with(blob_path, raw, blob, load_policy()?)
+pub(crate) fn check_packet(image: &PacketImage) -> Result<()> {
+    check_pkt(&Pkt::of(image), load_policy()?)
 }
 
+#[cfg(test)]
 fn check_packet_with(
     blob_path: &Path,
     raw: &[u8],
     blob: &DevBlob,
     policy: VerificationPolicy,
 ) -> Result<()> {
+    let digest = std::sync::OnceLock::new();
+    check_pkt(
+        &Pkt {
+            path: blob_path,
+            raw,
+            blob,
+            digest: &digest,
+        },
+        policy,
+    )
+}
+
+fn check_pkt(pkt: &Pkt, policy: VerificationPolicy) -> Result<()> {
+    let (blob_path, blob) = (pkt.path, pkt.blob);
     let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
     let bytes = read_optional(&path)?;
-    if !is_compiler_packet(blob_path, raw, blob, bytes.as_deref()) {
-        return check_sidecar_with(blob_path, raw, blob, policy);
+    if !is_compiler_packet(pkt, bytes.as_deref()) {
+        return check_sidecar_pkt(pkt, policy);
     }
     let rejected = |reason: String| RuntimeError::Rejected(format!("{}: {reason}", path.display()));
     let receipts: Option<PacketCheckReceipts> = bytes
@@ -74,16 +113,16 @@ fn check_packet_with(
         .transpose()
         .map_err(|error| rejected(error.to_string()))?;
     match policy {
-        VerificationPolicy::Off => {
-            legacy_check(&path, bytes.as_deref(), receipts.as_ref(), raw, blob)
-        }
+        VerificationPolicy::Off => legacy_check(&path, bytes.as_deref(), receipts.as_ref(), pkt),
         VerificationPolicy::Report => {
-            let q = blob.with_packet_view(|packet| qualify_packet(receipts.as_ref(), raw, packet));
+            let q = blob.with_packet_view(|packet| {
+                qualify_packet(receipts.as_ref(), &pkt.sha256(), packet)
+            });
             report(blob_path, &q);
-            legacy_check(&path, bytes.as_deref(), receipts.as_ref(), raw, blob)
+            legacy_check(&path, bytes.as_deref(), receipts.as_ref(), pkt)
         }
         VerificationPolicy::Strict => {
-            let q = qualify_compiler(receipts.as_ref(), bytes.as_deref(), raw, blob, true);
+            let q = qualify_compiler(receipts.as_ref(), bytes.as_deref(), pkt, true);
             enforce(blob_path, &q)
         }
     }
@@ -91,30 +130,40 @@ fn check_packet_with(
 
 /// Sidecar packets loaded by the packet runtimes (`encoder.pkt`, `codec.pkt`, `s3gen.pkt`,
 /// `mm_*.pkt`) and any non-compiler packet. `off` does not read their receipts.
-pub(crate) fn check_sidecar(blob_path: &Path, raw: &[u8], blob: &DevBlob) -> Result<()> {
-    check_sidecar_with(blob_path, raw, blob, load_policy()?)
+pub(crate) fn check_sidecar(image: &PacketImage) -> Result<()> {
+    check_sidecar_pkt(&Pkt::of(image), load_policy()?)
 }
 
+#[cfg(test)]
 fn check_sidecar_with(
     blob_path: &Path,
     raw: &[u8],
     blob: &DevBlob,
     policy: VerificationPolicy,
 ) -> Result<()> {
+    let digest = std::sync::OnceLock::new();
+    check_sidecar_pkt(
+        &Pkt {
+            path: blob_path,
+            raw,
+            blob,
+            digest: &digest,
+        },
+        policy,
+    )
+}
+
+fn check_sidecar_pkt(pkt: &Pkt, policy: VerificationPolicy) -> Result<()> {
     if policy == VerificationPolicy::Off {
         return Ok(());
     }
+    let blob_path = pkt.path;
     let path = sidecar_checks_file(blob_path);
     let receipts: Option<SidecarCheckReceipts> = read_optional(&path)?
         .map(|bytes| serde_json::from_slice(&bytes))
         .transpose()
         .map_err(|error| RuntimeError::Rejected(format!("{}: {error}", path.display())))?;
-    let q = qualify_sidecar_blob(
-        receipts.as_ref(),
-        raw,
-        blob,
-        policy == VerificationPolicy::Strict,
-    );
+    let q = qualify_sidecar_blob(receipts.as_ref(), pkt, policy == VerificationPolicy::Strict);
     match policy {
         VerificationPolicy::Strict => enforce(blob_path, &q),
         _ => {
@@ -148,14 +197,16 @@ fn enforce(packet: &Path, q: &Qualification) -> Result<()> {
     )))
 }
 
-pub(crate) fn qualify_compiler(
+fn qualify_compiler(
     receipts: Option<&PacketCheckReceipts>,
     bytes: Option<&[u8]>,
-    raw: &[u8],
-    blob: &DevBlob,
+    pkt: &Pkt,
     replay_checks: bool,
 ) -> Qualification {
-    let mut q = blob.with_packet_view(|packet| qualify_packet(receipts, raw, packet));
+    let sha = pkt.sha256();
+    let mut q = pkt
+        .blob
+        .with_packet_view(|packet| qualify_packet(receipts, &sha, packet));
     if let (true, Some(receipts), Some(bytes)) = (replay_checks, receipts, bytes) {
         if let Err(gap) = replay(&receipts.checks, bytes, &q.scope_set_sha256()) {
             q.gaps.push(gap);
@@ -164,13 +215,15 @@ pub(crate) fn qualify_compiler(
     q
 }
 
-pub(crate) fn qualify_sidecar_blob(
+fn qualify_sidecar_blob(
     receipts: Option<&SidecarCheckReceipts>,
-    raw: &[u8],
-    blob: &DevBlob,
+    pkt: &Pkt,
     replay_checks: bool,
 ) -> Qualification {
-    let mut q = blob.with_packet_view(|packet| qualify_sidecar(receipts, raw, packet));
+    let sha = pkt.sha256();
+    let mut q = pkt
+        .blob
+        .with_packet_view(|packet| qualify_sidecar(receipts, &sha, packet));
     if let (true, Some(receipts)) = (replay_checks, receipts) {
         let key = serde_json::to_vec(receipts).unwrap_or_default();
         if let Err(gap) = replay(&receipts.checks, &key, &q.scope_set_sha256()) {
@@ -237,14 +290,14 @@ fn legacy_check(
     path: &Path,
     bytes: Option<&[u8]>,
     receipts: Option<&PacketCheckReceipts>,
-    raw: &[u8],
-    blob: &DevBlob,
+    pkt: &Pkt,
 ) -> Result<()> {
     let (Some(bytes), Some(receipts)) = (bytes, receipts) else {
         return Ok(());
     };
+    let blob = pkt.blob;
     let rejected = |reason: String| RuntimeError::Rejected(format!("{}: {reason}", path.display()));
-    receipts.validate_packet(raw).map_err(rejected)?;
+    receipts.validate_packet(&pkt.sha256()).map_err(rejected)?;
     for check in &receipts.checks {
         blob.with_packet_view(|packet| bind_packet_receipt(packet, check))
             .map_err(rejected)?;
@@ -337,15 +390,13 @@ pub fn qualify_dir(
     let mut out = Vec::new();
     let mut media = Vec::new();
     for path in packets {
-        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let blob = DevBlob::parse(&raw)?;
-        let mut q = qualify_loaded(&path, &raw, &blob, replay_checks)?;
-        kv_ring_obligation(&raw, &blob, replay_checks, &mut q);
-        speech_fusion_obligation(&blob, replay_checks, &mut q);
-        media.push(MediaInfo::read(&path, &raw, &blob));
+        let image = PacketImage::open(&path)?;
+        image.blob.check_l2_dispatch(false)?;
+        let (raw, blob) = (&image.raw, &image.blob);
+        let mut q = qualify_loaded(&Pkt::of(&image), replay_checks)?;
+        kv_ring_obligation(raw, blob, replay_checks, &mut q);
+        speech_fusion_obligation(blob, replay_checks, &mut q);
+        media.push(MediaInfo::read(&path, raw, blob));
         out.push((path, q));
     }
     let packets: Vec<_> = media
@@ -579,15 +630,11 @@ impl MediaInfo {
 }
 
 /// One loaded packet's receipt qualification for `plowrt qualify`.
-fn qualify_loaded(
-    blob_path: &Path,
-    raw: &[u8],
-    blob: &DevBlob,
-    replay_checks: bool,
-) -> Result<Qualification> {
+fn qualify_loaded(pkt: &Pkt, replay_checks: bool) -> Result<Qualification> {
+    let blob_path = pkt.path;
     let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
     let bytes = read_optional(&path)?;
-    if is_compiler_packet(blob_path, raw, blob, bytes.as_deref()) {
+    if is_compiler_packet(pkt, bytes.as_deref()) {
         let receipts = bytes
             .as_deref()
             .map(serde_json::from_slice::<PacketCheckReceipts>)
@@ -596,8 +643,7 @@ fn qualify_loaded(
         return Ok(qualify_compiler(
             receipts.as_ref(),
             bytes.as_deref(),
-            raw,
-            blob,
+            pkt,
             replay_checks,
         ));
     }
@@ -606,12 +652,7 @@ fn qualify_loaded(
         .map(|bytes| serde_json::from_slice::<SidecarCheckReceipts>(&bytes))
         .transpose()
         .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
-    Ok(qualify_sidecar_blob(
-        receipts.as_ref(),
-        raw,
-        blob,
-        replay_checks,
-    ))
+    Ok(qualify_sidecar_blob(receipts.as_ref(), pkt, replay_checks))
 }
 
 #[cfg(test)]
@@ -684,8 +725,8 @@ mod tests {
         };
         write(&receipts);
         let blob = DevBlob::parse(&raw).unwrap();
-        check_packet(&path, &raw, &blob).unwrap();
-        check_packet(&path, &raw, &blob).unwrap();
+        check_packet_with(&path, &raw, &blob, load_policy().unwrap()).unwrap();
+        check_packet_with(&path, &raw, &blob, load_policy().unwrap()).unwrap();
         for change in 0..5 {
             let original = model.progs[0].insts[0].clone();
             match change {
@@ -700,7 +741,7 @@ mod tests {
             write(&receipts);
             let blob = DevBlob::parse(&raw).unwrap();
             assert!(
-                check_packet(&path, &raw, &blob).is_err(),
+                check_packet_with(&path, &raw, &blob, load_policy().unwrap()).is_err(),
                 "wire mutation {change}"
             );
             model.progs[0].insts[0] = original;
@@ -761,7 +802,13 @@ mod tests {
         let packet_path = directory.join("model.pkt");
         let sidecar = directory.join(PACKET_CHECKS_FILE);
         std::fs::write(&sidecar, serde_json::to_vec(&receipts).unwrap()).unwrap();
-        check_packet(&packet_path, &raw, &DevBlob::parse(&raw).unwrap()).unwrap();
+        check_packet_with(
+            &packet_path,
+            &raw,
+            &DevBlob::parse(&raw).unwrap(),
+            load_policy().unwrap(),
+        )
+        .unwrap();
         for mutation in 0..3 {
             match mutation {
                 0 => model.progs[0].insts[1].t[0] = y,
@@ -772,7 +819,13 @@ mod tests {
             receipts.packet_sha256 = image_sha256(&raw);
             std::fs::write(&sidecar, serde_json::to_vec(&receipts).unwrap()).unwrap();
             assert!(
-                check_packet(&packet_path, &raw, &DevBlob::parse(&raw).unwrap()).is_err(),
+                check_packet_with(
+                    &packet_path,
+                    &raw,
+                    &DevBlob::parse(&raw).unwrap(),
+                    load_policy().unwrap()
+                )
+                .is_err(),
                 "mutation {mutation}: even a matching new packet hash cannot reuse effects"
             );
         }
@@ -868,10 +921,10 @@ mod tests {
             std::fs::write(&sidecar, serde_json::to_vec(value).unwrap()).unwrap()
         };
         // Missing receipts retain legacy unverified bringup.
-        check_packet(&packet_path, &raw, &blob).unwrap();
+        check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).unwrap();
         write(&receipts);
-        check_packet(&packet_path, &raw, &blob).unwrap();
-        check_packet(&packet_path, &raw, &blob).unwrap(); // cached, still packet-bound
+        check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).unwrap();
+        check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).unwrap(); // cached, still packet-bound
         for mutation in 0..7 {
             let mut bad = receipts.clone();
             match mutation {
@@ -897,7 +950,7 @@ mod tests {
             }
             write(&bad);
             assert!(
-                check_packet(&packet_path, &raw, &blob).is_err(),
+                check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).is_err(),
                 "mutation {mutation}"
             );
         }
@@ -913,7 +966,13 @@ mod tests {
         receipts.packet_sha256 = image_sha256(&altered);
         write(&receipts);
         assert!(
-            check_packet(&packet_path, &altered, &DevBlob::parse(&altered).unwrap()).is_err(),
+            check_packet_with(
+                &packet_path,
+                &altered,
+                &DevBlob::parse(&altered).unwrap(),
+                load_policy().unwrap()
+            )
+            .is_err(),
             "updating the packet hash cannot reuse a receipt for removed wire waits"
         );
         std::fs::remove_dir_all(directory).unwrap();
@@ -974,7 +1033,7 @@ mod tests {
         let packet_path = directory.join("model.pkt");
         let sidecar = directory.join(PACKET_CHECKS_FILE);
         std::fs::write(&sidecar, serde_json::to_vec(&receipts).unwrap()).unwrap();
-        check_packet(&packet_path, &raw, &blob).unwrap();
+        check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).unwrap();
         for mutation in 0..4 {
             model.progs[0].insts[1].i[5] = 1024;
             model.progs[0].insts[0].i[4] = 1024;
@@ -992,7 +1051,7 @@ mod tests {
             changed_receipts.packet_sha256 = image_sha256(&raw);
             std::fs::write(&sidecar, serde_json::to_vec(&changed_receipts).unwrap()).unwrap();
             assert!(
-                check_packet(&packet_path, &raw, &blob).is_err(),
+                check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).is_err(),
                 "mutation {mutation}"
             );
         }
