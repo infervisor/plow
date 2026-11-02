@@ -340,6 +340,62 @@ fn check_handles(p: usize, prog: &DevProg, n: usize) -> Result<()> {
 }
 
 /// Sections may not overlap, and a (kind, name) pair names at most one of them.
+/// The packet's `abi.json` against this runtime and against the names its bindings restate.
+fn check_abi(
+    buf: &[u8],
+    sects: &[DevSection],
+    n_cu: u32,
+    tensors: &[DevTensor],
+    progs: &[DevProg],
+) -> Result<()> {
+    let Some(abi) = read_abi(buf, sects)? else {
+        return Ok(());
+    };
+    let meta: Vec<&str> = sects
+        .iter()
+        .filter(|s| s.kind == packet::devbuild::SECT_METADATA)
+        .map(|s| s.name.as_str())
+        .collect();
+    abi.validate(n_cu, &meta)
+        .map_err(|e| RuntimeError::Device(format!("devblob: {}: {e}", plow_asset::abi::SECTION)))?;
+    if let Some(declared) = &abi.bindings {
+        let names: Vec<String> = tensors.iter().map(|t| t.name.clone()).collect();
+        let derived = plow_asset::abi::Bindings::derive(
+            &names,
+            progs
+                .iter()
+                .map(|p| p.insts.iter().map(|d| (d.op, u32::from(d.t[0])))),
+        );
+        if *declared != derived {
+            return Err(malformed(format!(
+                "{} bindings disagree with the tensor names (roles {:?} vs {:?}, {} vs {} KV \
+                 write sites)",
+                plow_asset::abi::SECTION,
+                declared.roles,
+                derived.roles,
+                declared.kv_writes.len(),
+                derived.kv_writes.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_abi(buf: &[u8], sects: &[DevSection]) -> Result<Option<plow_asset::abi::Abi>> {
+    let Some(s) = sects
+        .iter()
+        .find(|s| s.kind == packet::devbuild::SECT_METADATA && s.name == plow_asset::abi::SECTION)
+    else {
+        return Ok(None);
+    };
+    let data = buf
+        .get(s.offset..s.offset + s.size)
+        .ok_or_else(|| malformed(format!("{} outside the packet", plow_asset::abi::SECTION)))?;
+    serde_json::from_slice(data)
+        .map(Some)
+        .map_err(|e| malformed(format!("{}: {e}", plow_asset::abi::SECTION)))
+}
+
 fn check_sections(sects: &[DevSection]) -> Result<()> {
     let mut by_start: Vec<&DevSection> = sects.iter().collect();
     by_start.sort_by_key(|s| (s.offset, s.size));
@@ -773,6 +829,9 @@ impl DevBlob {
             None
         };
 
+        if parent.is_none() {
+            check_abi(buf, &sections, hdr.n_cu, &tensors, &progs)?;
+        }
         if hdr.target != 0 {
             tracing::info!(
                 target_fp = format_args!("{:#010x}", hdr.target),
@@ -904,6 +963,11 @@ impl DevBlob {
         buf.get(section.offset..end)
             .map(Some)
             .ok_or_else(|| RuntimeError::Rejected(format!("{name} section range outside packet")))
+    }
+
+    /// The packet's `abi.json` (checked at parse), if it carries one.
+    pub fn abi(&self, buf: &[u8]) -> Result<Option<plow_asset::abi::Abi>> {
+        read_abi(buf, &self.sections)
     }
 
     pub fn section_data<'a>(&self, buf: &'a [u8], kind: u32) -> Option<&'a [u8]> {
@@ -1757,6 +1821,64 @@ mod tests {
             panic!("unknown opcode accepted")
         };
         assert!(err.to_string().contains("opcode 65534"), "{err}");
+    }
+
+    #[test]
+    fn abi_section_is_checked_at_parse() {
+        use plow_asset::abi::{Abi, Bindings, Target};
+        let m = tiny_model();
+        let names: Vec<String> = m.tensors.iter().map(|t| t.name.clone()).collect();
+        let derived = Bindings::derive(
+            &names,
+            m.progs
+                .iter()
+                .map(|p| p.insts.iter().map(|d| (d.op, d.t[0]))),
+        );
+        assert_eq!(derived.roles.get("ids"), Some(&0));
+        let good = Abi {
+            version: plow_asset::abi::VERSION,
+            contract: plow_asset::RUNTIME_CONTRACT_BASE,
+            must_understand: vec![],
+            target: Some(Target {
+                isa: "sm_90a".into(),
+                n_cu: m.n_cu,
+                tuned_on: Some("H100 SXM5".into()),
+            }),
+            bindings: Some(derived),
+        };
+        let blob = |abi: &Abi| {
+            m.to_blob_v6(&[packet::devbuild::SectionData {
+                kind: packet::devbuild::SECT_METADATA,
+                name: plow_asset::abi::SECTION.into(),
+                data: serde_json::to_vec(abi).unwrap(),
+            }])
+        };
+        let raw = blob(&good);
+        let parsed = DevBlob::parse(&raw).unwrap();
+        assert_eq!(parsed.abi(&raw).unwrap(), Some(good.clone()));
+        let refuse = |abi: Abi, want: &str| {
+            let err = DevBlob::parse(&blob(&abi)).err().expect(want).to_string();
+            assert!(err.contains(want), "{want}: {err}");
+        };
+        let mut bad = good.clone();
+        bad.bindings.as_mut().unwrap().roles.insert("ids".into(), 1);
+        refuse(bad, "bindings disagree");
+        let mut bad = good.clone();
+        bad.bindings.as_mut().unwrap().roles.clear();
+        refuse(bad, "bindings disagree");
+        let mut bad = good.clone();
+        bad.contract = plow_asset::RUNTIME_CONTRACT + 1;
+        refuse(bad, "runtime contract");
+        let mut bad = good.clone();
+        bad.must_understand = vec!["future.json".into()];
+        refuse(bad, "does not implement");
+        let mut bad = good.clone();
+        bad.target.as_mut().unwrap().n_cu += 1;
+        refuse(bad, "n_cu");
+        let mut raw = blob(&good);
+        let at = raw.windows(9).position(|w| w == b"\"version\"").unwrap();
+        raw[at] = b'x';
+        assert!(DevBlob::parse(&raw).is_err());
     }
 
     #[test]

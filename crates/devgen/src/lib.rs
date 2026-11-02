@@ -75,6 +75,7 @@ mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
+mod abi_section;
 pub mod asr;
 pub mod asr_subsampling;
 pub mod codec;
@@ -8394,7 +8395,9 @@ pub fn write_sidecar_packet(
             Some((checks, program_checks))
         }
     };
-    let blob = model.to_blob_v6(sections);
+    let mut sections = sections.to_vec();
+    abi_section::append(model, &mut sections, "", "");
+    let blob = model.to_blob_v6(&sections);
     std::fs::write(path, &blob).unwrap_or_else(|error| panic!("{name}: {error}"));
     let Some((checks, program_checks)) = receipts else {
         // A stale file would describe an older blob.
@@ -11826,6 +11829,7 @@ fn emit_dense_gqa(
     modular::update_section_with_lean(&mut sections, &lean);
     object_requirements::append(&m, &mut sections)
         .unwrap_or_else(|error| panic!("object requirements: {error}"));
+    abi_section::append(&m, &mut sections, &arch, &gpu);
     let blob = m.to_blob_v6(&sections);
     // Coverage gate BEFORE the blob lands on disk: a wrong .pkt that exists will be
     // benchmarked by someone. PLOW_SKIP_COVERAGE=1 is the deliberate escape hatch for

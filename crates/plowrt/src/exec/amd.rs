@@ -8793,6 +8793,18 @@ impl AmdEngine {
         let _build = image.build_info().ok().flatten();
         let raw = &image.raw;
         let arch = EngineDevice::arch(&*be);
+        if let Some(target) = image.blob.abi(raw)?.and_then(|a| a.target) {
+            match target.check_hsa(&arch, &arch) {
+                Err(e) => {
+                    return Err(RuntimeError::Rejected(format!(
+                        "{}: {e}",
+                        blob_path.display()
+                    )))
+                }
+                Ok(Some(note)) => tracing::info!("{note}"),
+                Ok(None) => {}
+            }
+        }
         let n_cu_dev = EngineDevice::sm_count(&*be);
         // ACCEPT L2-DOMAIN PLACEMENT AND CHECK IT AT OBJECT LOAD, rather than making the operator
         // assert it by env. scripts/build_gfx942.sh now ships -DPLOW_L2_PLACE_DISPATCH by default

@@ -81,6 +81,18 @@ records, for example: `live_kv` (KV cache layout), `packed_prefill`, `token_batc
 (chat, tool and serving defaults), `spec.json`, `spec.context.json` and `spec.draft.programs`
 (speculative drafting). Each is defined and validated by its `plow-asset` module.
 
+`abi.json` (`plow_asset::abi`, appended after every other section) states what the packet needs
+from the runtime, so a missing `build.json` cannot drop it:
+
+| Block | Reader |
+|-------|--------|
+| `contract` | refuses a contract above its own. |
+| `must_understand` | metadata sections the packet carries whose semantics a runtime must implement (`plow_asset::abi::MUST_UNDERSTAND` at the writer's commit); refuses a name it does not know or one the packet lacks. |
+| `target` | the instruction set (`sm_90a`, `gfx942`, ...) and `n_cu`; refuses only an instruction-set mismatch (an `a` target needs its exact compute capability, a plain or `f` one the same major and an equal or higher minor). The product it was tuned on is logged, never refused. |
+| `bindings` | the tensor of each fixed runtime role and every KV-cache write site; must equal what the tensor names imply, or the packet is refused. |
+
+A packet without `abi.json` loads as before.
+
 ### Generated tensors
 
 Tables that are a pure function of a few scalars (RoPE cos/sin, tensor-map descriptors) are carried
@@ -103,7 +115,8 @@ runtime cannot produce refuses the packet.
 - sections lie between the program area and the directory, do not overlap, and a (kind, name) pair
   appears once;
 - each generated-tensor recipe targets a distinct, runtime-filled tensor of exactly its size;
-- header flag bits and section flags are known.
+- header flag bits and section flags are known;
+- `abi.json`, when present, as described above.
 
 A packet is read, parsed and hashed once per load (`plowrt::asset::packet_image`); every consumer of
 that load shares the result.
@@ -118,5 +131,5 @@ pairing hash (`pairing.hash`, matched against specialised interpreter objects), 
 nothing; an unreadable or malformed one refuses the load.
 
 Packets cross machines through the distribution store (`docs/DISTRIBUTION.md`). A packet compiled
-for one GPU loads on any GPU of the same ISA whose CU count matches the packet's `n_cu`; memory
-size, L2 size and product name never refuse it.
+for one GPU loads on any GPU of a compatible instruction set whose CU count matches the packet's
+`n_cu` (an H100 SXM packet runs on H200 SXM); memory size, L2 size and product name never refuse it.

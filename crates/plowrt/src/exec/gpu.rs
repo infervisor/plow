@@ -4520,6 +4520,13 @@ impl GpuEngine {
             ));
         }
         let cc = be.compute_capability();
+        if let Some(target) = blob.abi(&image.raw)?.and_then(|a| a.target) {
+            match target.check_cuda(cc, be.device_name()) {
+                Err(e) => return Err(RuntimeError::Rejected(format!("{}: {e}", pkt.display()))),
+                Ok(Some(note)) => tracing::info!("{note}"),
+                Ok(None) => {}
+            }
+        }
         let profile = interpreter_profile(cc).ok_or_else(|| {
             RuntimeError::Device(format!(
                 "{} compute capability {}.{} has no persistent interpreter",
