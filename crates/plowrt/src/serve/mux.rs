@@ -6229,8 +6229,9 @@ fn trim_for_riders(
 /// Prompt rows to cut from a planned pack of `rows` so its `decode_rows` riders fit the rung
 /// that covers `rows` (0 to keep it): `trim_for_riders` on the pack the planner actually made.
 /// The tick's trim judges the rows before planning, and a request's remainder planned to fill a
-/// narrower rung exactly still spilled: Qwen3.8-27B FP8 ran 128 prompt rows + 1 rider in the
-/// 1024 rung (79 ms against 31 ms) 50 times in a 300 s prod-mix cell.
+/// narrower rung exactly still spilled: a 128/1024 ladder ran 128 prompt rows + 1 rider in the
+/// 1024 rung (79 ms against 31 ms) 50 times in a 300 s prod-mix cell. Only a pack below
+/// `PF_CHUNK_COST_ROWS` is cut, where measured rung costs decide; wider packs launch as planned.
 #[cfg(feature = "cuda")]
 fn rider_cut(
     rows: usize,
@@ -6240,6 +6241,9 @@ fn rider_cut(
     rung_ms: impl Fn(usize) -> Option<f64>,
 ) -> usize {
     let fit = cover(rows);
+    if fit >= pf_chunk_cost_rows() {
+        return 0;
+    }
     let cut = (rows + decode_rows).saturating_sub(fit);
     let trim = cut > 0
         && cut < rows
@@ -10064,6 +10068,23 @@ mod tests {
             }
         }
         assert!(checked > 10_000);
+        // A planned pack is never cut on these ladders.
+        for (ladder, decode_max) in ladders {
+            let cover = |rows| crate::exec::gpu::cover_rung(ladder.iter().copied(), rows);
+            for rows in 1..=8192 {
+                for decode in 1..=decode_max {
+                    for beyond in [0, 512, 4096] {
+                        for cost in costs {
+                            assert_eq!(
+                                super::rider_cut(rows, decode, beyond, cover, |r| cost(cover(r))),
+                                0,
+                                "rows {rows} decode {decode} beyond {beyond}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(feature = "cuda")]
