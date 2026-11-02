@@ -216,8 +216,9 @@ pub struct Device {
 }
 
 /// Every visible GPU of every vendor driver this binary can load, CUDA devices first, each in
-/// its vendor's ordinal order. Unlike [`select_all`], one vendor does not hide the other.
-pub fn inventory() -> Vec<Device> {
+/// its vendor's ordinal order. Unlike [`select_all`], one vendor does not hide the other. A
+/// device its driver enumerates but cannot open is an error, never a shorter list.
+pub fn inventory() -> Result<Vec<Device>> {
     #[allow(unused_mut)]
     let mut out: Vec<Device> = Vec::new();
     #[cfg(feature = "cuda")]
@@ -240,7 +241,11 @@ pub fn inventory() -> Vec<Device> {
                         },
                         handle: DeviceHandle::Cuda(Arc::new(b)),
                     }),
-                    Err(e) => tracing::error!(%e, dev, n, "CUDA device enumerated but not usable"),
+                    Err(e) => {
+                        return Err(crate::RuntimeError::Device(format!(
+                            "nv:{dev} of {n} enumerated but not usable: {e}"
+                        )))
+                    }
                 }
             }
         }
@@ -266,13 +271,17 @@ pub fn inventory() -> Vec<Device> {
                         },
                         handle: DeviceHandle::Hsa(Arc::new(b)),
                     }),
-                    Err(e) => tracing::error!(%e, dev, n, "HSA agent enumerated but not usable"),
+                    Err(e) => {
+                        return Err(crate::RuntimeError::Device(format!(
+                            "amd:{dev} of {n} enumerated but not usable: {e}"
+                        )))
+                    }
                 }
             }
         }
         Err(e) => tracing::info!(%e, "no HSA devices"),
     }
-    out
+    Ok(out)
 }
 
 /// Executor substrate class (the doc's `executor_class_t`).

@@ -3268,7 +3268,7 @@ fn amd_block(
 /// bound device 0 and nothing else. The enumeration is carved into the node's
 /// TP replicas, and a backend's position within its replica is its rank.
 fn devices_xfer(mib: u32, iters: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let devs = device::inventory();
+    let devs = device::inventory()?;
     println!("devices: {}", devs.len());
     for d in &devs {
         let be = d.handle.backend();
@@ -4262,6 +4262,16 @@ async fn bringup_runtime(
         models.sort_by_key(|(_, dir, _)| assets.iter().position(|a| a == dir));
 
         let budget = RuntimeConfig::get().nv.vram_budget_mib.map(|mib| mib << 20);
+        // A CUDA group's co-tenants are the models CUDA can switch onto it: every registered model
+        // on a single-vendor serve, the NVIDIA ones on a mixed serve.
+        let cuda_tenants = mixed.then(|| {
+            state
+                .registry
+                .slugs()
+                .iter()
+                .filter(|s| !is_amd_slug(s))
+                .count()
+        });
 
         // Visible ordinals.
         //
@@ -4338,7 +4348,7 @@ async fn bringup_runtime(
             }
             pending
                 .turns
-                .extend(std::iter::repeat((None, true)).take(managers.len().max(1)));
+                .extend(std::iter::repeat((cuda_tenants, true)).take(managers.len()));
             pending.managers.extend(managers);
         } else {
             let policy: Place = RuntimeConfig::get().place;
@@ -4391,7 +4401,10 @@ async fn bringup_runtime(
             // anti-affinity sees every rank. Rank r of `slug` is the instance `slug#r`.
             let dp = placement::parse_dp(&RuntimeConfig::get().dp)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            if let Some(m) = dp.named().find(|m| !specs.iter().any(|s| s.slug == *m)) {
+            if let Some(m) = dp
+                .named()
+                .find(|m| !(mixed && is_amd_slug(m)) && !specs.iter().any(|s| s.slug == *m))
+            {
                 return Err(format!(
                     "--dp {m}=… names a model this server does not serve on the GPU"
                 )
@@ -4550,7 +4563,7 @@ async fn bringup_runtime(
             // `load_initial` spawns the first dispatcher — a mux resolves its turn at spawn.
             pending
                 .turns
-                .extend(std::iter::repeat((None, true)).take(layout.groups.len()));
+                .extend(std::iter::repeat((cuda_tenants, true)).take(layout.groups.len()));
             pending.managers.extend(managers.iter().cloned());
             cuda_loads = managers;
         }
@@ -4620,7 +4633,10 @@ async fn bringup_runtime(
             }
             plan.push((slug.clone(), blob, tp, n));
         }
-        if let Some(m) = dp_spec.named().find(|m| !plan.iter().any(|p| p.0 == *m)) {
+        if let Some(m) = dp_spec
+            .named()
+            .find(|m| !(mixed && !is_amd_slug(m)) && !plan.iter().any(|p| p.0 == *m))
+        {
             return Err(
                 format!("--dp {m}=… names a model this server does not serve on the GPU").into(),
             );
@@ -4704,7 +4720,15 @@ async fn bringup_runtime(
                 let ranks = (0..*n)
                     .map(|r| {
                         let key = rank_key(slug, r);
-                        (first_of(&key), r, state.model_metrics(&key))
+                        let i = specs
+                            .iter()
+                            .position(|s| s.slug == key)
+                            .expect("planned instance");
+                        (
+                            first_of(&key),
+                            base + layout.assignment[i],
+                            state.model_metrics(&key),
+                        )
                     })
                     .collect();
                 tracing::info!(%slug, dp = n, tp, cfg = ?router.cfg, "dp: AMD ranks planned");
@@ -4715,6 +4739,12 @@ async fn bringup_runtime(
             pending
                 .turns
                 .extend(tenants.iter().map(|&t| (Some(t), false)));
+            // The router and every group's turn exist before an AMD engine loads (an engine
+            // registers its DP prefix probe at install); CUDA has planned, so both are complete.
+            if let Some(dp) = pending.dp.take().filter(|d| !d.is_empty()) {
+                state.install_dp(dp);
+            }
+            state.install_turns_per_group(&pending.turns);
             for (slug, blob, tp, n) in &plan {
                 let bundle = state.registry.get(slug)?;
                 // Same refusal the CUDA path makes (`serve::manager::load_model`):

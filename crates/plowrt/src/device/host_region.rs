@@ -212,6 +212,8 @@ pub fn xfer_check(
         .map(|d| d.handle.backend().alloc(0, bytes as u64))
         .collect::<Result<_>>()?;
     let region = &region;
+    let start = std::sync::Barrier::new(n);
+    let start = &start;
     let results: Vec<Result<XferResult>> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..n)
             .map(|i| {
@@ -221,6 +223,8 @@ pub fn xfer_check(
                 let dst = aliases[i] + ((2 * i + 1) * bytes) as u64;
                 let name = devs[i].id.to_string();
                 s.spawn(move || -> Result<XferResult> {
+                    // Every device's copies overlap: no thread starts before all are up.
+                    start.wait();
                     let (mut h2d, mut d2h) = (0f64, 0f64);
                     for _ in 0..iters.max(1) {
                         let t = Instant::now();
