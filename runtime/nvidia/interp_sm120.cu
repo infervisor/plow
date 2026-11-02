@@ -1374,7 +1374,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_QWEN_GDN_CONV:
         d_qwen_gdn_conv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), (const int*)TEN(4),
-            in->i[0], in->i[1], in->i[2], slice, nblk);
+            in->i[0], in->i[1], in->i[2], slice, nblk, in->fj[2].u);
         break;
     case PLOW_DOP_QWEN_GDN_STEP:
         d_qwen_gdn_step((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
@@ -1386,7 +1386,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_QWEN_GATED_NORM:
         d_qwen_gated_norm<PLOW_NV_PREFILL != 0>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), (const int*)TEN(4),
-            in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk);
+            in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, in->fj[2].u);
         break;
     case PLOW_DOP_QWEN_Q_GATE_SPLIT:
         d_qwen_q_gate_split((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
@@ -1412,7 +1412,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
         d_qwen_gdn_conv_prefill<PLOW_NV_PREFILL != 0>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), in->i[0], in->i[1],
-            in->i[2], in->i[3], slice, nblk, (const int*)TEN(5));
+            in->i[2], in->i[3], slice, nblk, (const int*)TEN(5), in->fj[2].u);
         break;
     case PLOW_DOP_QWEN_GDN_QKV_PREP:
         d_qwen_gdn_qkv_prep<PLOW_NV_PREFILL != 0>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
@@ -4475,7 +4475,7 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
     case PLOW_DOP_QWEN_GATED_NORM:
         d_qwen_gated_norm<true>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
             (const __nv_bfloat16*)LIGHT_TEN(2), (const __nv_bfloat16*)LIGHT_TEN(3), (const int*)LIGHT_TEN(4),
-            in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk);
+            in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, in->fj[2].u);
         break;
     case PLOW_DOP_QWEN_Q_GATE_SPLIT:
         d_qwen_q_gate_split((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1),
@@ -4501,7 +4501,7 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
         d_qwen_gdn_conv_prefill<true, 2, PLOW_LIGHT_PF_MINBLOCKS>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
             (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), in->i[0], in->i[1],
-            in->i[2], in->i[3], slice, nblk, (const int*)LIGHT_TEN(5));
+            in->i[2], in->i[3], slice, nblk, (const int*)LIGHT_TEN(5), in->fj[2].u);
         break;
     case PLOW_DOP_QWEN_GDN_QKV_PREP:
         d_qwen_gdn_qkv_prep<true>((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1),
@@ -4518,7 +4518,7 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
     case PLOW_DOP_QWEN_GDN_CONV:
         d_qwen_gdn_conv((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
             (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), (const int*)LIGHT_TEN(4),
-            in->i[0], in->i[1], in->i[2], slice, nblk);
+            in->i[0], in->i[1], in->i[2], slice, nblk, in->fj[2].u);
         break;
 #endif
     default:
@@ -4753,9 +4753,16 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
         break;
     }
     case PLOW_DOP_QWEN_GATED_NORM: {
-        /* d_qwen_gated_norm<false>, dim 128: lane holds elements lane + 32 j. */
+        /* d_qwen_gated_norm<false>, dim 128: lane holds elements lane + 32 j; z row-pitched
+         * when j1 (z_stride | z_col << 16) is set. */
         const int* active = (const int*)LIGHT_TEN(4);
         const size_t off = (size_t)row * K + g * 128u;
+#if PLOW_NV_QWEN_GDN
+        const unsigned zsrc = in->fj[2].u;
+        const size_t zoff = zsrc ? (size_t)row * (zsrc & 0xFFFFu) + (zsrc >> 16) + g * 128u : off;
+#else
+        const size_t zoff = off; /* a packet without GDN never routes this arm */
+#endif
         float v[4];
         if (active && active[row] <= 0) {
 #pragma unroll
@@ -4771,7 +4778,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
 #pragma unroll
             for (int j = 0; j < 4; j++) {
                 const unsigned d = lane + 32 * j;
-                const float gz = __bfloat162float(z[off + d]);
+                const float gz = __bfloat162float(z[zoff + d]);
                 const __nv_bfloat16 b = __float2bfloat16(c[j] * inv * __bfloat162float(gamma[d]) * qwen_silu(gz));
                 out[off + d] = b;
                 v[j] = __bfloat162float(b);

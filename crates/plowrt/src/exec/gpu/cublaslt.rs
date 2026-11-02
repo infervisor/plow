@@ -894,6 +894,14 @@ fn light_quant_pair(
     // with the quant.
     let row = u64::from(m) * u64::from(k) * 2;
     let mask = u64::from(m) * 4;
+    // A gated norm's z may be a column of a row-pitched N-concatenated output (j1).
+    let zsrc = pd.fj[2];
+    let (zs, zc) = (u64::from(zsrc & 0xFFFF), u64::from(zsrc >> 16));
+    let z_bytes = if zsrc == 0 {
+        row
+    } else {
+        (u64::from(m - 1) * zs + zc + u64::from(k)) * 2
+    };
     let (shape, active, operands): (bool, usize, &[(usize, u64)]) = match DevOp::from_u16(pd.op)? {
         // The interpreter's block-per-row path (`batch <= nblk`), at most 32 elements per thread
         // in the kernel.
@@ -910,12 +918,15 @@ fn light_quant_pair(
         ),
         // One head = one 128-wide group.
         DevOp::QwenGatedNorm => (
-            pd.i[1] == 128 && pd.i[0].checked_mul(pd.i[1]) == Some(k) && pd.i[2] == m,
+            pd.i[1] == 128
+                && pd.i[0].checked_mul(pd.i[1]) == Some(k)
+                && pd.i[2] == m
+                && (zsrc == 0 || (zs % 8 == 0 && zc % 8 == 0 && zc + u64::from(k) <= zs)),
             4,
             &[
                 (0, row),
                 (1, row),
-                (2, row),
+                (2, z_bytes),
                 (3, u64::from(pd.i[1]) * 2),
                 (4, mask),
             ],
@@ -990,6 +1001,8 @@ fn light_quant_pair(
         present(&[active])
             .iter()
             .all(|&a| present(&[0]).iter().all(|&o| disjoint(a, o)))
+            // Rows of a pitched z are read while other rows' outputs are written.
+            && (zsrc == 0 || pd.op != DevOp::QwenGatedNorm as u16 || pairwise(&present(&[0, 2])))
     };
     (shape && fits && disjoint(xq, gs) && operands_ok && alias_ok).then_some((p, q))
 }

@@ -869,6 +869,14 @@ pub(crate) fn runtime_requires(model: &Model, sections: &[SectionData]) -> serde
             d.op == DevOp::GluPitched as u16
                 || (d.op == DevOp::QwenQGateSplit as u16 && d.i[3] != 0)
                 || (d.op == DevOp::QwenHeadNormRope as u16 && d.j[1] != 0)
+                || ([
+                    DevOp::QwenGdnConv,
+                    DevOp::QwenGdnConvPrefill,
+                    DevOp::QwenGatedNorm,
+                ]
+                .iter()
+                .any(|&op| d.op == op as u16)
+                    && d.j[1] != 0)
         });
     let native_fp8 = final_roles(sections).is_some_and(|roles| {
         roles
@@ -1255,7 +1263,7 @@ mod tests {
         assert_eq!(apply_fp8_block(&m, &mut sections, &output), Ok(1));
         let roles = SegmentRoles::from_bytes(&sections[0].data).unwrap();
         let object = &roles.objects[&NATIVE_DECODE_FP8_BLOCK];
-        assert_eq!(object.decode_plan, Some(vec![[8, 16384, 5120, 64, 2]]));
+        assert_eq!(object.decode_plan, Some(vec![[8, 16384, 5120, 73, 1]]));
         assert_eq!(
             object.sha256,
             Some(plow_asset::decode_objects::image_sha256(&image(1)))

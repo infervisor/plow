@@ -821,13 +821,15 @@ Status: CUDA only.
 
 ### N-concatenated projections (derived weights)
 
-What it computes: projections that read the same activation (gate|up, q|gate|k|v) as one GEMM
+What it computes: projections that read the same activation (gate|up, q|gate|k|v, the
+linear-attention in_proj qkv|z) as one GEMM
 over their weights concatenated along N, block-scale grids concatenated the same way; consumers
 read their columns of the one row-pitched output.
-Examples: the block-scaled FP8 Qwen3.5-style dense MLP and full-attention projections.
+Examples: the block-scaled FP8 Qwen3.5-style dense MLP, full-attention and GDN input projections.
 Packet ABI: `derived_weights.json` (`crates/plow-asset/src/derived_weights.rs`) lists each `cat/`
 tensor's checkpoint sources (axis 0, optional BF16 -> F32 widen); `GluPitched` (230); the row
-pitch of `QwenQGateSplit` (`i3`) and `QwenHeadNormRope` (`j1` = pitch | column << 16). Emit:
+pitch of `QwenQGateSplit` (`i3`), `QwenHeadNormRope`, `QwenGdnConv`, `QwenGdnConvPrefill` and
+`QwenGatedNorm` (`j1` = pitch | column << 16; the conv reads columns from 0, the gated norm its z). Emit:
 `PLOW_FP8_BLOCK_CONCAT`. Runtime contract 4: a packet using any of these declares it and a
 runtime that cannot serve them refuses the packet at load.
 Kernels and objects: the loader assembles `cat/` tensors (`asset/checkpoint.rs`), the cuBLASLt

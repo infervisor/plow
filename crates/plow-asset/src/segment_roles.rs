@@ -373,7 +373,7 @@ pub const CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES: [(u32, u32); 5] = [
 /// 128-wide tensor-core tiles ran them as eight CTAs per 1024 rows: 17.9 ms of a 122 ms prefill
 /// with their preps, floor 0.9), and gate|up and q|gate|k|v concatenated along N
 /// (`PLOW_FP8_BLOCK_CONCAT`).
-pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 10] = [
+pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 11] = [
     (12288, 5120),
     (1024, 5120),
     (5120, 6144),
@@ -384,6 +384,8 @@ pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 10] = [
     (10240, 5120),
     (6144, 5120),
     (48, 5120),
+    // GDN in_proj qkv|z, N-concatenated (PLOW_FP8_BLOCK_CONCAT).
+    (16384, 5120),
 ];
 
 pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
