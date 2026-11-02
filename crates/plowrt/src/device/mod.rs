@@ -15,6 +15,8 @@ use crate::Result;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(target_os = "linux")]
+pub mod host_region;
 #[cfg(feature = "hsa")]
 pub mod hsa;
 pub(crate) mod kernarg_retirement;
@@ -140,6 +142,173 @@ pub fn select_all(executors_per_device: u32) -> Vec<Arc<dyn Backend>> {
     }
 
     backends
+}
+
+/// A device named across vendors: `nv:<ordinal>` or `amd:<ordinal>`, the ordinal being the
+/// vendor's own enumeration after its visibility mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevId {
+    pub vendor: Vendor,
+    pub ordinal: u8,
+}
+
+impl std::fmt::Display for DevId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = match self.vendor {
+            Vendor::Nvidia => "nv",
+            Vendor::Amd => "amd",
+            Vendor::Apple => "apple",
+            Vendor::Intel => "cpu",
+        };
+        write!(f, "{v}:{}", self.ordinal)
+    }
+}
+
+impl std::str::FromStr for DevId {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        let (v, n) = s
+            .split_once(':')
+            .ok_or_else(|| format!("device {s:?}: expected nv:<n> or amd:<n>"))?;
+        let vendor = match v {
+            "nv" | "nvidia" | "cuda" => Vendor::Nvidia,
+            "amd" | "hsa" => Vendor::Amd,
+            _ => return Err(format!("device {s:?}: unknown vendor {v:?}")),
+        };
+        let ordinal = n
+            .parse()
+            .map_err(|_| format!("device {s:?}: bad ordinal {n:?}"))?;
+        Ok(DevId { vendor, ordinal })
+    }
+}
+
+/// A device-0 open error that means "this vendor has no device here" (no driver library, no
+/// visible device), as opposed to a device that exists and fails.
+#[allow(dead_code)]
+fn driver_absent(e: &str) -> bool {
+    [
+        "cannot open shared object file",
+        "CUDA_ERROR_NO_DEVICE",
+        "no GPU agents",
+        ">= 0 GPU agents",
+        "selects no device",
+    ]
+    .iter()
+    .any(|m| e.contains(m))
+}
+
+/// One device of the inventory, with its typed backend.
+#[derive(Clone)]
+pub enum DeviceHandle {
+    #[cfg(feature = "cuda")]
+    Cuda(Arc<cuda::CudaBackend>),
+    #[cfg(feature = "hsa")]
+    Hsa(Arc<hsa::HsaBackend>),
+}
+
+impl DeviceHandle {
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        match *self {
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(ref b) => Arc::clone(b) as Arc<dyn Backend>,
+            #[cfg(feature = "hsa")]
+            DeviceHandle::Hsa(ref b) => Arc::clone(b) as Arc<dyn Backend>,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn staging(&self) -> Arc<dyn host_region::HostStaging> {
+        match *self {
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(ref b) => Arc::clone(b) as Arc<dyn host_region::HostStaging>,
+            #[cfg(feature = "hsa")]
+            DeviceHandle::Hsa(ref b) => Arc::clone(b) as Arc<dyn host_region::HostStaging>,
+        }
+    }
+}
+
+pub struct Device {
+    pub id: DevId,
+    pub handle: DeviceHandle,
+}
+
+/// Every visible GPU of every vendor driver this binary can load, CUDA devices first, each in
+/// its vendor's ordinal order. Unlike [`select_all`], one vendor does not hide the other. A
+/// device its driver enumerates but cannot open is an error, never a shorter list.
+pub fn inventory() -> Result<Vec<Device>> {
+    #[allow(unused_mut)]
+    let mut out: Vec<Device> = Vec::new();
+    #[cfg(feature = "cuda")]
+    match cuda::CudaBackend::new(0) {
+        Ok(first) => {
+            let n = first.device_count()?;
+            out.push(Device {
+                id: DevId {
+                    vendor: Vendor::Nvidia,
+                    ordinal: 0,
+                },
+                handle: DeviceHandle::Cuda(Arc::new(first)),
+            });
+            for dev in 1..n.min(u8::MAX as u32) as u8 {
+                match cuda::CudaBackend::new(dev) {
+                    Ok(b) => out.push(Device {
+                        id: DevId {
+                            vendor: Vendor::Nvidia,
+                            ordinal: dev,
+                        },
+                        handle: DeviceHandle::Cuda(Arc::new(b)),
+                    }),
+                    Err(e) => {
+                        return Err(crate::RuntimeError::Device(format!(
+                            "nv:{dev} of {n} enumerated but not usable: {e}"
+                        )))
+                    }
+                }
+            }
+        }
+        Err(e) if driver_absent(&e.to_string()) => tracing::info!(%e, "no CUDA devices"),
+        Err(e) => {
+            return Err(crate::RuntimeError::Device(format!(
+                "nv:0 will not open: {e}"
+            )))
+        }
+    }
+    #[cfg(feature = "hsa")]
+    match hsa::HsaBackend::new(0) {
+        Ok(first) => {
+            let n = first.gpu_count();
+            out.push(Device {
+                id: DevId {
+                    vendor: Vendor::Amd,
+                    ordinal: 0,
+                },
+                handle: DeviceHandle::Hsa(Arc::new(first)),
+            });
+            for dev in 1..n.min(u8::MAX as u32) as u8 {
+                match hsa::HsaBackend::new(dev) {
+                    Ok(b) => out.push(Device {
+                        id: DevId {
+                            vendor: Vendor::Amd,
+                            ordinal: dev,
+                        },
+                        handle: DeviceHandle::Hsa(Arc::new(b)),
+                    }),
+                    Err(e) => {
+                        return Err(crate::RuntimeError::Device(format!(
+                            "amd:{dev} of {n} enumerated but not usable: {e}"
+                        )))
+                    }
+                }
+            }
+        }
+        Err(e) if driver_absent(&e.to_string()) => tracing::info!(%e, "no HSA devices"),
+        Err(e) => {
+            return Err(crate::RuntimeError::Device(format!(
+                "amd:0 will not open: {e}"
+            )))
+        }
+    }
+    Ok(out)
 }
 
 /// Executor substrate class (the doc's `executor_class_t`).
@@ -536,6 +705,19 @@ pub trait Backend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dev_id_round_trips_and_refuses_junk() {
+        let a: super::DevId = "amd:1".parse().unwrap();
+        assert_eq!(a.to_string(), "amd:1");
+        assert_eq!(
+            "nvidia:0".parse::<super::DevId>().unwrap().to_string(),
+            "nv:0"
+        );
+        assert!("gpu:0".parse::<super::DevId>().is_err());
+        assert!("nv:x".parse::<super::DevId>().is_err());
+        assert!("0".parse::<super::DevId>().is_err());
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
