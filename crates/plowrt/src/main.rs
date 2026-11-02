@@ -4430,7 +4430,7 @@ async fn bringup_runtime(
     let pd_of = |model: &str, n: usize| -> Result<Option<plowrt::serve::pd::PdSpec>, String> {
         match pd_specs.iter().find(|(m, _)| m == model) {
             None => Ok(None),
-            Some((_, p)) if (p.prefill | p.decode) >> n != 0 => {
+            Some((_, p)) if u64::from(p.prefill | p.decode) >> n != 0 => {
                 Err(format!("--pd {model}: names a rank past its {n} DP ranks"))
             }
             Some((_, p)) => Ok(Some(*p)),
@@ -5107,7 +5107,10 @@ async fn bringup_runtime(
                 }));
                 tracing::info!(%slug, dp = n, nv_ranks = lo, tp, cfg = ?router.cfg, "dp: AMD ranks planned");
                 let mut set = DpSet::new(slug, ranks);
-                set.pd = pd_of(slug, set.ranks.len())?;
+                // KV images move between CUDA engines only (H3); AMD export/import is H4.
+                if pd_of(slug, set.ranks.len())?.is_some() {
+                    return Err(format!("--pd {slug}: P/D needs every rank on NVIDIA").into());
+                }
                 for (r, rank) in set.ranks.iter_mut().enumerate() {
                     match nv.get(r) {
                         Some((_, _, _, cpus)) => {

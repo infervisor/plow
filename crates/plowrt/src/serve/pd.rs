@@ -60,6 +60,8 @@ impl KvExport {
 pub struct KvImport {
     pub image: KvImage,
     pub token: u32,
+    /// Prompt rows the prefill rank served from its prefix cache (`usage.cached_tokens`).
+    pub cached_tokens: usize,
 }
 
 /// `--pd model=P/D`: the DP ranks of each pool, as bit masks over the model's ranks.
@@ -111,7 +113,7 @@ pub fn parse_pd(entries: &[String]) -> Result<Vec<(String, PdSpec)>, String> {
 
 /// Whether `job` can run disaggregated: plain text, no host-side per-token state the decode rank
 /// would lose (logprobs, a retained session, media rows).
-fn eligible(job: &Job) -> bool {
+pub(crate) fn eligible(job: &Job) -> bool {
     let o = &job.opts;
     o.speech.is_none()
         && o.mm.is_none()
@@ -142,7 +144,7 @@ pub(crate) fn submit(
         .filter(|r| pd.decode >> r.rank & 1 != 0)
         .filter_map(|r| Some((r.rank, state.mux(&r.key)?)))
         .collect();
-    if decoders.is_empty() || !eligible(&job) {
+    if decoders.is_empty() {
         return mux.submit_arrived(job, arrived, ingress);
     }
     // The prefill rank samples the first token and nothing else: no stop handling, no thinking
@@ -184,20 +186,34 @@ pub(crate) fn submit(
                 .respond
                 .try_send(StreamChunk::Err(RuntimeError::Unavailable(msg)));
         };
-        let mut first = None;
-        while let Some(chunk) = prx.recv().await {
+        // A client that leaves stops the handoff: dropping the prefill stream ends that job, and
+        // its dispatcher skips an export nobody waits for.
+        let (mut first, mut cached_tokens) = (None, 0);
+        loop {
+            let chunk = tokio::select! {
+                c = prx.recv() => c,
+                _ = job.respond.closed() => return,
+            };
             match chunk {
-                StreamChunk::Token { id, .. } if first.is_none() && id != stream::TEXT_ONLY => {
+                Some(StreamChunk::Token { id, .. })
+                    if first.is_none() && id != stream::TEXT_ONLY =>
+                {
                     first = Some(id)
                 }
-                StreamChunk::Err(err) => {
+                Some(StreamChunk::Done { usage, .. }) => cached_tokens = usage.cached_tokens,
+                Some(StreamChunk::Err(err)) => {
                     let _ = job.respond.try_send(StreamChunk::Err(err));
                     return;
                 }
-                _ => {}
+                Some(_) => {}
+                None => break,
             }
         }
-        let image = match (first, image.await) {
+        let image = tokio::select! {
+            i = image => i,
+            _ = job.respond.closed() => return,
+        };
+        let image = match (first, image) {
             (Some(_), Ok(Ok(image))) => image,
             (None, _) => return fail(&job, "P/D: the prefill rank produced no token".into()),
             (_, Ok(Err(err))) => return fail(&job, format!("P/D: KV export failed: {err}")),
@@ -219,10 +235,11 @@ pub(crate) fn submit(
         job.opts.import = Some(Box::new(KvImport {
             image,
             token: first.expect("matched Some"),
+            cached_tokens,
         }));
-        let arrived = job.arrived;
+        // The decode queue's clock starts now; `job.arrived` keeps the request's own.
         if let Err(SubmitError::Full(job) | SubmitError::Closed(job)) =
-            mux.submit_arrived(job, arrived, None)
+            mux.submit_arrived(job, Instant::now(), None)
         {
             fail(&job, "P/D: the decode rank refused the request".into());
         }

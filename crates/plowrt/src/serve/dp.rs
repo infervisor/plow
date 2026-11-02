@@ -596,18 +596,21 @@ impl DpSet {
         exclude: u32,
         sampled: bool,
     ) -> Option<Routed<'_>> {
-        // A P/D set admits requests on its prefill pool.
-        let avoid = self.pd.map_or(0, |p| p.decode);
-        self.route_in(cfg, session, prompt, exclude, sampled, avoid)
+        // A P/D set admits requests on its prefill pool; any rank can prefill, so with none of
+        // the pool up another takes it.
+        let avoid = self.pd.map_or(0, |p| !p.prefill);
+        self.route_in(cfg, session, prompt, exclude, sampled, avoid, true)
     }
 
-    /// The decode rank a P/D request continues on, after its prefill.
+    /// The decode rank a P/D request continues on, after its prefill: a decode-pool rank only.
     pub fn route_decode(&self, cfg: &RouteCfg, sampled: bool) -> Option<Routed<'_>> {
         let pd = self.pd?;
-        self.route_in(cfg, None, None, 0, sampled, pd.prefill)
+        self.route_in(cfg, None, None, 0, sampled, !pd.decode, false)
     }
 
-    /// `avoid`: ranks of the other P/D pool, used only while no other rank is up.
+    /// `avoid`: ranks outside the wanted P/D pool; with `fallback`, used only while a rank of
+    /// the pool is up.
+    #[allow(clippy::too_many_arguments)]
     fn route_in(
         &self,
         cfg: &RouteCfg,
@@ -616,13 +619,15 @@ impl DpSet {
         exclude: u32,
         sampled: bool,
         avoid: u32,
+        fallback: bool,
     ) -> Option<Routed<'_>> {
         let t0 = Instant::now();
         let n = self.ranks.len();
-        let avoid = if self
-            .ranks
-            .iter()
-            .any(|r| avoid >> r.rank & 1 == 0 && exclude >> r.rank & 1 == 0 && r.cand().up)
+        let avoid = if !fallback
+            || self
+                .ranks
+                .iter()
+                .any(|r| avoid >> r.rank & 1 == 0 && exclude >> r.rank & 1 == 0 && r.cand().up)
         {
             avoid
         } else {

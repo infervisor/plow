@@ -763,7 +763,7 @@ impl AppState {
         let Some((set, mut rank)) = routed else {
             return mux.submit_arrived(job, arrived, ingress);
         };
-        if set.pd.is_some() {
+        if set.pd.is_some() && pd::eligible(&job) {
             return pd::submit(self, set, mux, job, arrived, ingress);
         }
         let mut exclude = 0u32;

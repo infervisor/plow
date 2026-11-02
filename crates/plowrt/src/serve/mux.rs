@@ -7596,6 +7596,7 @@ fn gpu_seat_imports(
             continue;
         }
         s.pf_pos = s.prompt_ids.len();
+        s.cached_tokens = import.cached_tokens;
         disconnected[i] |= handle_produced_token(
             &mut slots[i],
             arena,
