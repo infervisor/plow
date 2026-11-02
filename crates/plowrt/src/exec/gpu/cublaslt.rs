@@ -2996,33 +2996,38 @@ mod tests {
             u64::from(m * k),
             u64::from(k / 128 * m) * 4,
         ];
-        let devp = |z: u64| -> Vec<DeviceMem> {
+        // z at its own base, or at the output's base (an overlapping view).
+        let view = |z: u64, alias: bool| -> Vec<DeviceMem> {
             sizes
                 .iter()
                 .enumerate()
-                .map(|(i, &len)| {
-                    DeviceMem::view((i as u64 + 1) << 24, if i == 2 { z } else { len })
+                .map(|(i, &len)| match i {
+                    2 => DeviceMem::view(if alias { 1 << 24 } else { 3 << 24 }, z),
+                    _ => DeviceMem::view((i as u64 + 1) << 24, len),
                 })
                 .collect()
         };
+        let devp = |z: u64| view(z, false);
         assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), Some((0, 1)));
         // The last row's z ends at (m - 1) * pitch + col + k.
         let last = u64::from((m - 1) * pitch + col + k) * 2;
         assert_eq!(light_quant_pair(&g, &entries, &devp(last)), Some((0, 1)));
         assert_eq!(light_quant_pair(&g, &entries, &devp(last - 2)), None);
-        // z lies inside the row, 8-element aligned.
-        g.insts[0].fj[2] = pitch | (pitch - k + 8) << 16;
-        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), None);
-        g.insts[0].fj[2] = (pitch - 4) | col << 16;
-        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), None);
-        g.insts[0].fj[2] = pitch | (col + 4) << 16;
-        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), None);
-        // Other rows' outputs are written while a pitched z is read: no aliasing.
+        // z lies inside the row, 8-element aligned; each case otherwise fits a wide buffer.
+        let wide = u64::from(m * (pitch + 64)) * 2;
+        g.insts[0].fj[2] = pitch | (col + 8) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 4) | col << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 8) | (col + 4) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 8) | (col + 8) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), Some((0, 1)));
+        // Other rows' outputs are written while a pitched z is read: a z overlapping the output
+        // is refused even when it is large enough.
         g.insts[0].fj[2] = pitch | col << 16;
-        g.insts[0].t[2] = 0;
-        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), None);
+        assert_eq!(light_quant_pair(&g, &entries, &view(qkvz, true)), None);
         // A dense z (no j1) needs only its rows.
-        g.insts[0].t[2] = 2;
         g.insts[0].fj[2] = 0;
         assert_eq!(light_quant_pair(&g, &entries, &devp(row)), Some((0, 1)));
     }
