@@ -270,6 +270,14 @@ enum Cmd {
         /// xctr gates per collective) rather than decode (one-shot, one gate).
         #[arg(long, default_value_t = false)]
         prefill: bool,
+        /// Cross-vendor staging gate: list every device of every vendor (`nv:N`, `amd:N`), then
+        /// copy this many MiB per device through one host region registered with every driver
+        /// (all devices concurrently), and relay a pattern between every ordered device pair.
+        #[arg(long)]
+        xfer_mib: Option<u32>,
+        /// Round trips per device for `--xfer-mib`.
+        #[arg(long, default_value_t = 8)]
+        xfer_iters: u32,
     },
 
     /// Bring the AMD/gfx950 engine up on a compiled blob and time decode steps.
@@ -1387,6 +1395,20 @@ async fn async_main(
             max_tokens,
             layers,
             prefill,
+            xfer_mib: Some(mib),
+            xfer_iters,
+        } => {
+            let _ = (tp, hidden, max_tokens, layers, prefill);
+            devices_xfer(mib, xfer_iters)
+        }
+        Cmd::Devices {
+            tp,
+            hidden,
+            max_tokens,
+            layers,
+            prefill,
+            xfer_mib: None,
+            ..
         } => devices(tp, hidden, max_tokens, layers, prefill),
         Cmd::Pull {
             model,
@@ -3245,6 +3267,41 @@ fn amd_block(
 /// The first real caller of [`device::select_all`], which had none: plowrt
 /// bound device 0 and nothing else. The enumeration is carved into the node's
 /// TP replicas, and a backend's position within its replica is its rank.
+fn devices_xfer(mib: u32, iters: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let devs = device::inventory();
+    println!("devices: {}", devs.len());
+    for d in &devs {
+        let be = d.handle.backend();
+        match be.fingerprint() {
+            Some(fp) => println!(
+                "  {:<6} isa={} sku={} units={} mem={:.1} GiB driver={}",
+                d.id.to_string(),
+                fp.isa.arch_flag(),
+                fp.sku,
+                fp.units,
+                fp.mem_bytes as f64 / (1u64 << 30) as f64,
+                fp.driver.as_deref().unwrap_or("-"),
+            ),
+            None => println!("  {:<6} (not in the hwspec registry)", d.id.to_string()),
+        }
+    }
+    let (per_dev, relays) =
+        device::host_region::xfer_check(&devs, (mib as usize) << 20, iters)?;
+    println!("concurrent round trips, {mib} MiB x {iters}, one region registered with every driver:");
+    for r in &per_dev {
+        println!(
+            "  {:<6} exact  H2D {:.1} GB/s  D2H {:.1} GB/s",
+            r.device, r.h2d_gbs, r.d2h_gbs
+        );
+    }
+    println!("relays (device -> region -> device -> region):");
+    for r in &relays {
+        println!("  {r}");
+    }
+    println!("XFER_CHECK PASS");
+    Ok(())
+}
+
 fn devices(
     tp: Option<u32>,
     hidden: u32,

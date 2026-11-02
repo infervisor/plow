@@ -2481,6 +2481,56 @@ impl CudaBackend {
 /// The VMM driver surface as `crate::memory::vmm` consumes it. Thin, checked
 /// pass-throughs; every entry re-binds the primary context (threads vary —
 /// the pool's pre-mapper thread calls in from its own thread).
+/// `CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED`: a portable registration from another device's
+/// context already covers the range.
+const HOST_MEMORY_ALREADY_REGISTERED: CUresult = 712;
+
+impl super::host_region::HostStaging for CudaBackend {
+    fn staging_vendor(&self) -> hwspec::Vendor {
+        hwspec::Vendor::Nvidia
+    }
+
+    unsafe fn host_register(&self, ptr: *mut u8, len: usize) -> Result<u64> {
+        self.bind()?;
+        // SAFETY: the caller keeps the range mapped until `host_unregister`. PORTABLE makes the
+        // registration valid in every context of the process, so one call covers every device.
+        let rc = unsafe {
+            (self.api.cuMemHostRegister_v2)(
+                ptr as *mut c_void,
+                len,
+                MEMHOSTREGISTER_PORTABLE | MEMHOSTREGISTER_DEVICEMAP,
+            )
+        };
+        if rc != HOST_MEMORY_ALREADY_REGISTERED {
+            self.check(rc, "cuMemHostRegister(host region)")?;
+        }
+        Ok(ptr as u64)
+    }
+
+    unsafe fn host_unregister(&self, ptr: *mut u8) {
+        // SAFETY: the caller's contract: registered here, no copy in flight.
+        let rc = unsafe {
+            let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
+            (self.api.cuMemHostUnregister)(ptr as *mut c_void)
+        };
+        if rc != 0 {
+            tracing::warn!(rc, "cuMemHostUnregister(host region) failed");
+        }
+    }
+
+    fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64> {
+        crate::memory::vmm::VmmOps::copy_dtoh_async(self, host, src, bytes)
+    }
+
+    fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64> {
+        crate::memory::vmm::VmmOps::copy_htod_async(self, dst, host, bytes)
+    }
+
+    fn stage_wait(&self, fence: u64) -> Result<()> {
+        crate::memory::vmm::VmmOps::fence_wait(self, fence)
+    }
+}
+
 impl crate::memory::vmm::VmmOps for CudaBackend {
     fn allocation_provenance(
         &self,
