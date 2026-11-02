@@ -225,8 +225,8 @@ The embedded DSpark path (context tail baked into every target program) is descr
 
 | Target | Drafter | State |
 |---|---|---|
-| Gemma-4 26B-A4B FP8 | MTP assistant, embedded or external | Re-emitted with invariant objects (programs identical to the qualified packet); greedy identity passes. |
-| Gemma-4 12B FP8 | MTP assistant, external | Target re-emitted with span verify and invariant objects: no-drafter digests and step cost equal to the qualified packet. Drafter extracted against it; greedy identity passes. |
+| Gemma-4 26B-A4B FP8 | MTP assistant, embedded or external | Re-emitted with invariant objects (programs identical to the qualified packet); greedy identity passes. Production mix (H100 screen): TPOT p50 −41% at 0.5 sessions/s and −43% at 1.8. |
+| Gemma-4 12B FP8 | MTP assistant, external | Target re-emitted with span verify and invariant objects: no-drafter digests and step cost equal to the qualified packet. Drafter extracted against it; greedy identity passes. Serving screen: c1 TPOT 7.41 → 2.35 ms, production mix at 1.0 sessions/s −41% p50; c32 +22% (invariant splits on the 32-row rung). |
 | Gemma-4 26B-A4B BF16 | MTP assistant | Blocked: span verify needs FP8 KV. |
 | Gemma-4 12B FP8 | DSpark (official) | Embedded emit only. Pluggable form per §5 not built. |
 | Qwen3.8-27B | MTP (1 layer) | Needs GDN recurrent-state rollback. |
