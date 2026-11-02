@@ -330,6 +330,14 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #include "quant_group.cuh"
 #include "op_moe.cuh"        /* Gemma-4 26B-A4B bf16 MoE decode bodies (router/glu/down/combine) */
 #include "op_mamba.cuh"      /* Nemotron-3 Mamba-2 SSD mixer (UNVERIFIED on GPU; nvcc-compile only) */
+/* Cross-rank all-reduce bodies, compiled only into objects of a packet that emits them. */
+#if (defined(PLOW_PACKET_HAS_XREDUCE) && PLOW_PACKET_HAS_XREDUCE) || \
+    (defined(PLOW_PACKET_HAS_XREDUCE2) && PLOW_PACKET_HAS_XREDUCE2)
+#define NV_XR_ON 1
+#include "op_collective.cuh"
+#else
+#define NV_XR_ON 0
+#endif
 
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -4070,6 +4078,15 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         (void)nblk_grid;
 #else
         if (e.inst < PLOW_SYM(plow_debug_max_inst)) {
+#if NV_XR_ON
+            /* Collectives need the program's peer fields, which plow_exec does not see. */
+            if (in->op == PLOW_DOP_XREDUCE)
+                d_xreduce_nv(prog, in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
+            else if (in->op == PLOW_DOP_XREDUCE2)
+                d_xreduce_twoshot_nv(prog, in, prog.tensors, e.slice,
+                                     in->blocks ? in->blocks : nblk_grid);
+            else
+#endif
 #if PLOW_NV_INST_PRELOAD
             plow_exec(&plow_s_in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena
 #else

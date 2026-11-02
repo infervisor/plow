@@ -269,6 +269,10 @@ pub struct JobOpts {
     pub prefix: Option<crate::memory::vmm::PrefixKey>,
     /// Multimodal soft-token rows the prompt's bit-31 ids name (`serve::mm`).
     pub mm: Option<Box<crate::serve::mm::MmJob>>,
+    /// P/D prefill job: export the slot's KV image here when it finishes (`serve::pd`).
+    pub export: Option<Arc<crate::serve::pd::KvExport>>,
+    /// P/D decode job: seat the slot from this image instead of prefilling (`serve::pd`).
+    pub import: Option<Box<crate::serve::pd::KvImport>>,
 }
 
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
@@ -1077,13 +1081,19 @@ struct Slot {
     /// are released when the slot is dropped.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     mm: Option<Box<crate::serve::mm::MmJob>>,
+    /// [`JobOpts::export`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    export: Option<Arc<crate::serve::pd::KvExport>>,
+    /// [`JobOpts::import`], until the slot is seated.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    import: Option<Box<crate::serve::pd::KvImport>>,
 }
 
 impl Slot {
     /// Rows the mixed-step program cannot carry: it does not stage overlays (see [`SpeechJob`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn serial_prefill(&self) -> bool {
-        self.speech.is_some()
+        self.speech.is_some() || self.import.is_some()
     }
 
     /// Rows that take the plain one-step decode launch: `EmbedPosBf16` reads the position base by
@@ -3048,6 +3058,8 @@ fn admit_session(
         frame: None,
         prefix: job.opts.prefix,
         mm: job.opts.mm,
+        export: job.opts.export,
+        import: job.opts.import,
     });
     None
 }
@@ -3240,7 +3252,10 @@ fn run_one_tick(
     steps: u32,
     // `--multi-step` itself, kept apart from `steps` because `steps == 1` is ambiguous: it is
     // both "multi-step is off" and "`MultiStep::for_batch` collapsed at this batch size".
-    #[cfg_attr(not(any(feature = "hsa", feature = "cpu")), allow(unused_variables))]
+    #[cfg_attr(
+        not(any(feature = "hsa", feature = "cpu", feature = "cuda")),
+        allow(unused_variables)
+    )]
     multi_step: bool,
     #[cfg_attr(
         not(any(feature = "cuda", feature = "hsa", feature = "cpu")),
@@ -3298,6 +3313,12 @@ fn run_one_tick(
         if let crate::serve::engine::ServeEngine::Cuda(e) = &mut *guard {
             let mut disconnected = smallvec::SmallVec::<[bool; 128]>::new();
             disconnected.resize(e.batch(), false);
+            obs.pd_exports.resize(e.batch(), None);
+            for (i, s) in slots.iter().enumerate().take(e.batch()) {
+                if let Some(x) = s.as_ref().and_then(|s| s.export.as_ref()) {
+                    obs.pd_exports[i] = Some(Arc::clone(x));
+                }
+            }
             let result = (|| {
                 let stop = Arc::clone(e.stop_ids());
                 let cap = e.batch();
@@ -3656,6 +3677,17 @@ fn run_one_tick(
                     }
                 }
 
+                gpu_seat_imports(
+                    &mut *e,
+                    &mut slots,
+                    cap,
+                    &arena,
+                    bundle,
+                    stop.as_slice(),
+                    &mut tokens_this_tick,
+                    &mut disconnected,
+                    &mut tick_fault,
+                );
                 let pack_t = packlog::on().then(Instant::now);
                 let (pack_live, pack_prefilling) = if pack_t.is_some() {
                     let live = slots.iter().take(cap).flatten();
@@ -3864,7 +3896,11 @@ fn run_one_tick(
                     let mut serial_rows = 0usize;
                     loop {
                         let Some(i) = (0..slots.len().min(cap))
-                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
+                            .filter(|&i| {
+                                slots[i]
+                                    .as_ref()
+                                    .is_some_and(|s| s.step == 0 && s.import.is_none())
+                            })
                             .min_by_key(|&i| slots[i].as_ref().map(|s| (s.class, s.arrived)))
                         else {
                             break;
@@ -4369,10 +4405,17 @@ fn run_one_tick(
                     decode_progress,
                 );
             })();
+            let mut result = result;
             for (slot, request) in result.0.iter().enumerate().take(e.batch()) {
                 if request.is_none() && slot_free(&result.0, slot) {
                     if disconnected[slot] {
                         e.note_disconnect(slot);
+                    }
+                    // A P/D prefill job just finished: its KV leaves before the slot retires.
+                    if let Some(sink) = result.2.pd_exports.get_mut(slot).and_then(Option::take) {
+                        if result.5.is_none() && sink.wanted() {
+                            sink.deliver(gpu_export_slot(&mut *e, slot));
+                        }
                     }
                     e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
                 }
@@ -4393,7 +4436,7 @@ fn run_one_tick(
         // Single-sequence engines (gfx950, CPU) share one tick body through
         // `SeqEngine`; the packed/multistep branches are AMD-only and the CPU
         // engine declines them (`None`), falling to whole-prompt prefill + step.
-        #[cfg(any(feature = "hsa", feature = "cpu"))]
+        #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
         if let Some(e) = guard.seq_engine_mut() {
             e.bind_engine_thread();
             let stop = Arc::clone(e.stop_ids());
@@ -4599,7 +4642,7 @@ fn run_one_tick(
                                     slot.pf_pos = slot.prompt_ids.len();
                                 }
                             }
-                            let token = seq_finish_token(&*e, i, &mut slots[i], token);
+                            let token = seq_host_token(&*e, i, &mut slots[i], token);
                             handle_produced_token(
                                 &mut slots[i],
                                 &arena,
@@ -4880,7 +4923,7 @@ fn run_one_tick(
                                         }
                                     }
                                 }
-                                let token = seq_finish_token(&*e, slot, &mut slots[slot], token);
+                                let token = seq_host_token(&*e, slot, &mut slots[slot], token);
                                 handle_produced_token(
                                     &mut slots[slot],
                                     &arena,
@@ -5433,12 +5476,8 @@ fn run_one_tick(
                                 if rode_now {
                                     decoded_in_pack = true;
                                     for (row, &(i, _)) in feeds.iter().enumerate() {
-                                        let token = seq_finish_token(
-                                            &*e,
-                                            i,
-                                            &mut slots[i],
-                                            ride_tokens[row],
-                                        );
+                                        let token =
+                                            seq_host_token(&*e, i, &mut slots[i], ride_tokens[row]);
                                         handle_produced_token(
                                             &mut slots[i],
                                             &arena,
@@ -5464,7 +5503,7 @@ fn run_one_tick(
                                         s.pf_pos = s.prompt_ids.len();
                                     }
                                     let t_tok = std::time::Instant::now();
-                                    let token = seq_finish_token(&*e, i, &mut slots[i], token);
+                                    let token = seq_host_token(&*e, i, &mut slots[i], token);
                                     handle_produced_token(
                                         &mut slots[i],
                                         &arena,
@@ -5615,7 +5654,7 @@ fn run_one_tick(
                                 }
                                 tracing::debug!(token, slot = i, "amd: prefill token");
                                 let t_tok = std::time::Instant::now();
-                                let token = seq_finish_token(&*e, i, &mut slots[i], token);
+                                let token = seq_host_token(&*e, i, &mut slots[i], token);
                                 handle_produced_token(
                                     &mut slots[i],
                                     &arena,
@@ -5775,7 +5814,7 @@ fn run_one_tick(
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
-                        let token = seq_finish_token(&*e, i, &mut slots[i], token);
+                        let token = seq_host_token(&*e, i, &mut slots[i], token);
                         handle_produced_token(
                             &mut slots[i],
                             &arena,
@@ -6248,7 +6287,7 @@ fn gpu_prefill_should_yield(has_feeds: bool, defer_decode: bool, slot: Option<&S
     has_feeds || (!defer_decode && slot.is_some_and(|s| s.step > 0 && !s.respond.is_closed()))
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -> u32 {
     if !has_decode || defer_decode || interleave == 0 {
         u32::MAX
@@ -6257,7 +6296,7 @@ fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -
     }
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PfHold {
     Off,
@@ -6272,7 +6311,7 @@ enum PfHold {
 /// quarters of `rows` are pending (a pack that fills most of a `rows`-wide rung, with room left
 /// for the decode riders) or the oldest has waited `ms`; the release tick may then pack `rows`.
 /// A prompt already started (chunks run or prefix rows resumed) is never held.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_pf_hold(
     spec: Option<(u32, f64, usize)>,
     decode_rows: usize,
@@ -6294,7 +6333,7 @@ fn amd_pf_hold(
     }
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
     enabled && prefill_remains
 }
@@ -6332,7 +6371,7 @@ fn multistep_requested(remaining: usize, scheduler_steps: usize, configured: usi
 ///
 /// What remains are the bounds that mean something: the client's own remaining output, the
 /// configured knob, and (applied downstream by `decode_quantum`) `DEFERRED_TOKEN_MAX_STEPS`.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_multistep_requested(remaining: usize, enabled: bool, configured: usize) -> usize {
     if !enabled {
         return 1;
@@ -6340,7 +6379,7 @@ fn amd_multistep_requested(remaining: usize, enabled: bool, configured: usize) -
     remaining.min(configured.max(1))
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_prefill_pick(
     candidates: impl IntoIterator<Item = (usize, Instant)>,
     fair: bool,
@@ -6363,7 +6402,7 @@ fn amd_prefill_pick(
 
 /// The step plan under `PLOW_TBT_SLO_MS` / `PLOW_TTFT_SLO_MS` (`crate::sched::slo`): isolated
 /// launches only, each chunk sized in milliseconds against the online tick cost model.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_slo_plan(
     e: &dyn crate::serve::engine::SeqEngine,
     slots: &[Option<Slot>],
@@ -6461,7 +6500,7 @@ fn amd_slo_plan(
 /// Members of one token-batch body from an ordered candidate pool: every candidate whose whole
 /// next chunk fits what is left of `capacity`, in pool order, none of them cut. A chunk that
 /// does not fit is skipped, not sliced — the planner's whole-span rule.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_token_batch_pack(candidates: &[(usize, Instant, u32)], capacity: u32) -> Vec<(usize, u32)> {
     let mut budget = capacity;
     let mut selected = Vec::new();
@@ -6474,7 +6513,7 @@ fn amd_token_batch_pack(candidates: &[(usize, Instant, u32)], capacity: u32) -> 
     selected
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_mixed_prefill_pack(
     mut candidates: Vec<(usize, Instant, u32)>,
     mut budget: u32,
@@ -6512,7 +6551,7 @@ fn amd_mixed_prefill_pack(
 /// All members use the first selected span's compiled program. Rows are packed
 /// densely under `row_budget`; KV and recurrent coordinates remain request-local.
 /// Invalid descriptors are excluded so the caller can retain the isolated path.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_prefill_pack(
     candidates: impl IntoIterator<Item = packet::dev::PrefillSpan>,
     row_budget: u32,
@@ -6538,7 +6577,7 @@ fn amd_prefill_pack(
     pack.spans().to_vec()
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_packed_frontier_updates(
     members: impl IntoIterator<Item = usize>,
     mut frontier: impl FnMut(usize) -> Option<usize>,
@@ -6552,7 +6591,7 @@ fn amd_packed_frontier_updates(
 /// Slots a failed packed launch terminates: its prefill members and every decode feed offered
 /// to ride it, since the launch may have advanced a rider's KV and recurrent state before its
 /// position or sampled token reached the host.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_failed_pack_slots(
     members: impl IntoIterator<Item = usize>,
     feeds: &[(usize, u32)],
@@ -6563,7 +6602,7 @@ fn amd_failed_pack_slots(
         .collect()
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn rejected_pack_slot(reason: &str) -> Option<usize> {
     let (_, after) = reason.split_once("slot ")?;
     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -6935,7 +6974,8 @@ fn gpu_prefill_batched_pass(
             AdmitRoom::new(ready, admit_launch_rows(launch_cap, rung), decode_rows)
         });
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
-            let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
+            // A P/D decode job is seated from its image (`gpu_seat_imports`), never prefilled.
+            let Some(request) = slot.as_mut().filter(|s| s.step == 0 && s.import.is_none()) else {
                 continue;
             };
             if request.respond.is_closed() {
@@ -7512,6 +7552,92 @@ fn fit_speech_budget(slot: &mut Slot, max_ctx: usize) {
         let room = max_ctx.saturating_sub(slot.prompt_ids.len()).max(1);
         slot.gen.max_tokens = slot.gen.max_tokens.min(room);
     }
+}
+
+/// Seat every waiting P/D decode job from its KV image: the slot then stands where its own
+/// prefill would leave it, and the prefill rank's first token is produced here.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_seat_imports(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    cap: usize,
+    arena: &Option<SharedKvState>,
+    bundle: &ModelBundle,
+    stop: &[u32],
+    tokens_this_tick: &mut usize,
+    disconnected: &mut [bool],
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+) {
+    for i in 0..slots.len().min(cap) {
+        let Some(s) = slots[i]
+            .as_mut()
+            .filter(|s| s.step == 0 && s.import.is_some())
+        else {
+            continue;
+        };
+        if s.respond.is_closed() {
+            disconnected[i] = true;
+            if let Some(taken) = slots[i].take() {
+                release_kv(arena, taken.kv);
+            }
+            continue;
+        }
+        let total = s.prompt_ids.len() + s.gen.max_tokens.max(1);
+        if let Err(err) = e.begin_slot(i, total) {
+            // Out of device memory for live KV: wait, as a prefill would.
+            let short = matches!(err, crate::RuntimeError::Oom(_)) || err.device_code() == Some(2);
+            if short && !err.is_fatal() {
+                e.retire_slot(i, false);
+                e.note_kv_pressure();
+            } else {
+                note_fault(tick_fault, &err);
+                fail_slot(&mut slots[i], arena, err);
+            }
+            continue;
+        }
+        let import = s.import.take().expect("filtered on import");
+        let seated = match e.kv_image_key() {
+            Some(key) if key == import.image.key => {
+                e.import_kv_image(i, &s.prompt_ids, &import.image.bytes)
+            }
+            _ => Err(crate::RuntimeError::Rejected(
+                "P/D: the prefill rank's KV image does not fit this packet".into(),
+            )),
+        };
+        if let Err(err) = seated {
+            e.retire_slot(i, false);
+            note_fault(tick_fault, &err);
+            fail_slot(&mut slots[i], arena, err);
+            continue;
+        }
+        s.pf_pos = s.prompt_ids.len();
+        s.cached_tokens = import.cached_tokens;
+        disconnected[i] |= handle_produced_token(
+            &mut slots[i],
+            arena,
+            bundle,
+            import.token,
+            1,
+            tokens_this_tick,
+            Some(stop),
+        );
+    }
+}
+
+/// The KV image of engine slot `slot`, whose P/D prefill job has produced its first token.
+#[cfg(feature = "cuda")]
+fn gpu_export_slot(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slot: usize,
+) -> Result<crate::serve::pd::KvImage> {
+    let key = e
+        .kv_image_key()
+        .ok_or_else(|| crate::RuntimeError::Rejected("P/D: this packet has no KV image".into()))?;
+    let rows = e.slot_pos(slot) as u32;
+    let mut bytes = Vec::new();
+    e.export_kv_image(slot, rows, &mut bytes)?;
+    Ok(crate::serve::pd::KvImage { key, rows, bytes })
 }
 
 /// Advance a prefilling slot: one prompt chunk through the prefill bucket
@@ -8198,12 +8324,12 @@ fn gpu_finish_token(
     Ok(argmax_tok)
 }
 
-/// The served token for a single-sequence engine (AMD, CPU) whose step returned `token` (the
+/// The served token for a single-sequence engine (AMD, CPU, CUDA rank group) whose step returned `token` (the
 /// device argmax). Only rows that asked for logprobs or host sampling pay the vocab read. When
 /// the engine exposes every sampled row (`host_sampling`), a non-greedy or penalised request is
 /// drawn by the same host sampler the CUDA path uses; otherwise the argmax is served.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
-fn seq_finish_token(
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+fn seq_host_token(
     e: &dyn super::engine::SeqEngine,
     i: usize,
     slot: &mut Option<Slot>,
@@ -8248,7 +8374,7 @@ fn seq_finish_token(
     tok
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn sampling_adjusted(p: &crate::text::sample::SamplingParams) -> bool {
     p.repetition_penalty != 1.0
         || p.presence_penalty != 0.0
@@ -8258,7 +8384,7 @@ fn sampling_adjusted(p: &crate::text::sample::SamplingParams) -> bool {
 
 /// Whether a seq-engine row's token needs its logits row on the host: logprobs, or a
 /// non-greedy / penalised request on an engine that samples on the host.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn seq_needs_host_row(
     e: &dyn super::engine::SeqEngine,
     p: &crate::text::sample::SamplingParams,
@@ -9239,7 +9365,7 @@ fn incremental_delta(
     })
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn set_cached(slot: &mut Slot, rows: usize) {
     crate::obs::tick::trace_hit(rows.saturating_sub(slot.cached_tokens));
     slot.cached_tokens = rows;
@@ -10405,7 +10531,9 @@ mod tests {
         let set = Arc::clone(state.dp_set("m").unwrap());
         let mut seen = [0usize; 2];
         for _ in 0..6 {
-            let (rank, mux, _, _pick) = state.dp_route(&set, None, Some(&[1, 2, 3]), 0).unwrap();
+            let (rank, mux, _, _pick) = state
+                .dp_route(&set, None, Some(&[1, 2, 3]), 0, false)
+                .unwrap();
             seen[rank] += 1;
             assert!(state
                 .submit_routed(
@@ -10428,7 +10556,7 @@ mod tests {
         removed.drain().await;
         assert!(stale.is_closed());
         for _ in 0..16 {
-            let (rank, _, _, _) = state.dp_route(&set, Some("s"), None, 0).unwrap();
+            let (rank, _, _, _) = state.dp_route(&set, Some("s"), None, 0, false).unwrap();
             assert_eq!(rank, 1, "a removed rank is never routed to");
         }
         assert!(state
@@ -10443,7 +10571,7 @@ mod tests {
             .is_ok());
         assert_eq!(set.stats.retries.load(Ordering::Relaxed), 1);
         state.remove_mux("m#1");
-        assert!(state.dp_route(&set, None, None, 0).is_none());
+        assert!(state.dp_route(&set, None, None, 0, false).is_none());
         assert!(matches!(
             state.submit_routed(
                 Some((&set, 0)),
@@ -11726,6 +11854,8 @@ mod tests {
                 turn_key: None,
                 speech: None,
                 mm: None,
+                export: None,
+                import: None,
                 cfg: None,
                 held: Vec::new(),
                 held_finish: None,
@@ -12030,7 +12160,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn amd_mixed_admission_obeys_rotation_age_and_total_prefill_budget() {
         let now = Instant::now();
@@ -12050,7 +12180,7 @@ mod tests {
         assert!(amd_mixed_prefill_pack(candidates, 0, true, 0, 4).is_empty());
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn amd_token_batch_pack_takes_whole_chunks_in_pool_order_and_never_cuts() {
         let now = Instant::now();
@@ -12075,7 +12205,7 @@ mod tests {
         assert!(amd_token_batch_pack(&[], 4096).is_empty());
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn pf_hold_waits_for_rows_or_age_and_only_under_decode() {
         use super::{amd_pf_hold, PfHold};
@@ -12115,7 +12245,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn amd_prefill_scheduler_controls_are_bounded() {
         assert_eq!(amd_prefill_tick_cap(false, false, 2048), u32::MAX);

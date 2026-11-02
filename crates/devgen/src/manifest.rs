@@ -3454,6 +3454,13 @@ pub fn config_header(manifest: &Value) -> String {
                  #ifndef PLOW_FA_GF_FULL\n#define PLOW_FA_GF_FULL {v}\n#endif\n"
             ));
         }
+        // A 16-head full-attention group needs the wide softmax reductions on every NVIDIA
+        // arch (op_attention.cuh), not only where the light hd512 object is tuned.
+        if t.get("gf_full").and_then(Value::as_u64) == Some(16)
+            || t.get("gf_light512").and_then(Value::as_u64) == Some(16)
+        {
+            out.push_str("#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n");
+        }
         // Measured on sm_90a only; every other target keeps the kernel's own default.
         if let Some(v) = t.get("moe_down_sg").and_then(Value::as_u64) {
             if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
@@ -3638,13 +3645,6 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_FA_GF_LIGHT512\n#define PLOW_NV_FA_GF_LIGHT512 {v}\n#endif\n"
                 ));
-            }
-            if t.get("gf_full").and_then(Value::as_u64) == Some(16)
-                || t.get("gf_light512").and_then(Value::as_u64) == Some(16)
-            {
-                out.push_str(
-                    "#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n",
-                );
             }
         }
     }

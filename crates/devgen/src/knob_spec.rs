@@ -325,6 +325,14 @@ const DECODE_LADDER_DEFAULT: Default = Default::Production {
                 F::Atom("emit.decode_batch", Cmp::Eq, Val::Nat(1)),
             ]),
             value: Val::Str("1,2,4,8,16"),
+        },        DefaultCase {
+            when: F::And(&[
+                F::Target(T::Arch("sm_120a")),
+                F::Target(T::Cap("decode_ladder")),
+                F::Target(T::Tp(1)),
+                F::Atom("emit.decode_batch", Cmp::Eq, Val::Nat(1)),
+            ]),
+            value: Val::Str("1,2,4,8,16"),
         },
         DefaultCase {
             when: F::And(&[
@@ -2443,6 +2451,8 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_FP8TC_ARENA_BYTES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HASH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_GEMM_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_PACKET_HAS_XREDUCE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_PACKET_HAS_XREDUCE2", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_MOE_ROUTER_GEMMA_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_GLU_PITCHED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

@@ -81,6 +81,7 @@ fn check_dsa_decode_batch_arm(required: bool, arm: Option<u32>) -> Result<()> {
 
 mod kv_blocks;
 pub use kv_blocks::BlockServe as KvStoreHandle;
+mod kv_image;
 mod prefix;
 use prefix::VmmServe;
 
@@ -96,6 +97,7 @@ mod moe_lt;
 mod native_decode;
 mod packed_terminal;
 pub mod packet_exec;
+pub mod rank;
 mod riders;
 mod segment_gates;
 mod shared_tail;
@@ -2764,6 +2766,8 @@ pub struct GpuEngine {
     vmm_attached: Vec<u32>,
     /// Cache rows the next `begin_slot` keeps (a retained session prefix); 0 = start cold.
     resume_rows: Vec<u32>,
+    /// The packet's declared caches: what a KV image of one slot carries (docs/arch/30 §5).
+    kv_image: Option<plow_asset::live_kv::Manifest>,
     /// Bench-only (`snapshot_slot`): a slot's recurrent state at one position, so `rewind_slot`
     /// back to it restores the GDN/conv state along with the KV length.
     rewind_snapshots: Vec<Option<(u32, Vec<DeviceMem>)>>,
@@ -2787,6 +2791,9 @@ pub struct GpuEngine {
     /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
     /// prefill chunk never attaches a cached prefix.
     prefix_attach_off: Vec<bool>,
+    /// The slot was seated from a KV image ([`Self::import_kv_image`]): its rings hold only the
+    /// image's window, so it publishes no boundary to the prefix cache until `begin_slot`.
+    publish_off: Vec<bool>,
     /// The slot's request is its session's last turn (`X-Session-End`): the prefix cache drops
     /// the session's boundary to the cold band at retire ([`Self::retire_slot`]).
     session_end: Vec<bool>,
@@ -2911,6 +2918,8 @@ pub struct GpuEngine {
     /// Bench-only launch overrides ([`Self::set_debug_min_rung`], [`Self::set_debug_nsplit_kvlen`]).
     debug_min_rows: usize,
     debug_nsplit_kvlen: Option<u32>,
+    /// This engine's rank in a process rank group (tensor or pipeline parallel), if any.
+    rank_bind: Option<rank::RankBind>,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -4013,6 +4022,18 @@ impl GpuEngine {
     /// tables. Slow (a 12B checkpoint is ~22 GiB of H2D) — called once at
     /// server startup, never on the request path.
     pub fn load(be: Arc<CudaBackend>, assets_dir: &Path, checkpoint_dir: &Path) -> Result<Self> {
+        Self::load_rank(be, assets_dir, checkpoint_dir, None)
+    }
+
+    /// [`Self::load`] as one rank of a process rank group: a tensor-parallel packet binds this
+    /// rank's weight shards and peer regions; any packet arms and audits each launch unit
+    /// against the group.
+    pub fn load_rank(
+        be: Arc<CudaBackend>,
+        assets_dir: &Path,
+        checkpoint_dir: &Path,
+        rank_bind: Option<rank::RankBind>,
+    ) -> Result<Self> {
         let t0 = std::time::Instant::now();
         crate::knob_spec::check_assets(&assets_dir.join("model.pkt"))?;
         let serve = crate::asset::serve::resolve(assets_dir, checkpoint_dir)?;
@@ -4091,6 +4112,57 @@ impl GpuEngine {
             "parsed PLOWDEV blob"
         );
         crate::asset::serve::check_packet_contract(&pkt, &blob, &raw)?;
+        let tp_n = blob.tp.map_or(1, |t| t.n_gpu);
+        let bind_tp = rank_bind.as_ref().map_or(1, |r| r.tp);
+        if tp_n != bind_tp {
+            return Err(RuntimeError::Rejected(format!(
+                "packet is tensor-parallel degree {tp_n}, this engine's rank group is {bind_tp} \
+                 wide (a TP packet is served by a rank group: PLOW_GROUP_DEVICES)"
+            )));
+        }
+        let tp_kernarg = rank::TpKernarg::of(rank_bind.as_ref());
+        if let (Some(tp), Some(r)) = (blob.tp, rank_bind.as_ref()) {
+            let layout = r.group().layout().expect("checked at bind");
+            // Three partial slots, `slot_bytes` apart (devgen's slot_b). The stride is recovered
+            // from the collectives' slot offsets; slot A's declared size must agree with it.
+            let slot_a = blob.tensors.iter().find(|t| t.name == "act.og_tp");
+            if slot_a.is_some_and(|t| t.bytes != tp.slot_bytes) {
+                return Err(RuntimeError::Rejected(format!(
+                    "TP partial slot stride {} B disagrees with act.og_tp's {} B",
+                    tp.slot_bytes,
+                    slot_a.map_or(0, |t| t.bytes)
+                )));
+            }
+            if tp.slot_bytes == 0 || tp.slot_bytes > layout.partial_off(1)? {
+                return Err(RuntimeError::Rejected(format!(
+                    "TP partial slot {} B exceeds the group's {} B",
+                    tp.slot_bytes,
+                    layout.partial_off(1)?
+                )));
+            }
+            let status = r.status_id() + 1;
+            for d in blob.progs.iter_mut().flat_map(|p| p.insts.iter_mut()) {
+                match DevOp::from_u16(d.op) {
+                    Some(DevOp::XReduce | DevOp::XReduceTwoShot) => d.fj[2] = status,
+                    Some(op) if packet::opclass::op_classes(op).contains(&"collective") => {
+                        return Err(RuntimeError::Rejected(format!(
+                            "collective {op:?} has no NVIDIA implementation"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let tp_shards = match (blob.tp, rank_bind.as_ref()) {
+            (Some(_), Some(r)) => Some((
+                r.tp_rank,
+                r.tp,
+                crate::asset::shard::DeclaredShards::from_blob(&blob, &raw)?,
+                r.own_region,
+                blob.tp.map_or(0, |t| t.slot_bytes),
+            )),
+            _ => None,
+        };
         let derived_weights = crate::asset::checkpoint::derived_weights(&blob, &raw)?;
         let missing = crate::asset::checkpoint::missing_weights(&blob, &raw, checkpoint_dir)?;
         if !missing.is_empty() {
@@ -4280,7 +4352,6 @@ impl GpuEngine {
                     &blob,
                     serve.manifest.kv.as_ref(),
                     config,
-                    be.compute_capability(),
                     granularity,
                     live_kv_manifest
                         .as_ref()
@@ -4765,6 +4836,7 @@ impl GpuEngine {
                         prefix_layout,
                         prefix_rings,
                         recurrent.as_ref().map_or(&[][..], |r| r.tensors.as_slice()),
+                        rank_bind.as_ref().is_some_and(|r| r.tp > 1),
                     )
                 }
             };
@@ -4976,6 +5048,22 @@ impl GpuEngine {
                     }
                     (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                 };
+                // TP partials live in this rank's collective region, where peers read them.
+                let mem = match (&tp_shards, td.name.as_str()) {
+                    (Some((.., own, _)), "act.og_tp") => DeviceMem::view(*own, td.bytes),
+                    (Some((.., own, slot_b)), "act.dg_tp") => {
+                        DeviceMem::view(own + slot_b, td.bytes)
+                    }
+                    (Some((.., own, slot_b)), "act.ug_tp") => {
+                        DeviceMem::view(own + 2 * slot_b, td.bytes)
+                    }
+                    (Some(_), n) if n.ends_with("_tp") => {
+                        return Err(RuntimeError::Rejected(format!(
+                            "TP tensor `{n}` has no NVIDIA binding"
+                        )));
+                    }
+                    _ => mem,
+                };
                 if let (Some(t), Some(tm)) = (t_alloc, load_tim.as_mut()) {
                     tm.note_alloc(td.bytes, t.elapsed().as_secs_f64() * 1e3, true);
                 }
@@ -5018,6 +5106,12 @@ impl GpuEngine {
                         ckpt.widened_f32(&td.name, td.bytes)
                     };
                     if let Some(wide) = assembled {
+                        if tp_shards.is_some() {
+                            return Err(RuntimeError::Rejected(format!(
+                                "{}: assembled weights are not sharded for tensor parallelism",
+                                td.name
+                            )));
+                        }
                         let wide = wide?;
                         for (o, chunk) in wide.chunks(STAGE).enumerate() {
                             let dst = mem.base + (o * STAGE) as u64;
@@ -5033,9 +5127,24 @@ impl GpuEngine {
                         devp.push(mem);
                         continue;
                     }
-                    let src = ckpt.tensor(&td.name).ok_or_else(|| {
-                        RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name))
-                    })?;
+                    let missing = || RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name));
+                    let src: std::borrow::Cow<[u8]> = match &tp_shards {
+                        Some((r, n, decl, ..)) => {
+                            let (bytes, shape) = ckpt.tensor_ex(&td.name).ok_or_else(missing)?;
+                            crate::asset::shard::slice_for_as(
+                                &td.name,
+                                decl.axis(&td.name),
+                                bytes,
+                                shape,
+                                td.bytes,
+                                *r,
+                                *n,
+                            )?
+                        }
+                        None => {
+                            std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?)
+                        }
+                    };
                     if src.len() as u64 != td.bytes {
                         return Err(RuntimeError::Device(format!(
                             "SIZE MISMATCH {} (want {} got {})",
@@ -5058,7 +5167,7 @@ impl GpuEngine {
                             dst + chunk.len() as u64,
                             &mut slab_wait_ms,
                         )?;
-                        if pipe.is_direct() {
+                        if pipe.is_direct() && matches!(src, std::borrow::Cow::Borrowed(_)) {
                             // SAFETY: `chunk` borrows the checkpoint mmap
                             // (`ckpt`, whose Arc outlives pipe.finish()).
                             unsafe { pipe.push_direct(dst, chunk)? }
@@ -5973,10 +6082,10 @@ impl GpuEngine {
             gq_stream: d_gq_stream.base,
             gq_seg_ofs: d_gq_seg.base,
             gq_cursor: d_gq_cursor.base,
-            xctr: 0,
-            peer_scratch: 0,
-            rank: 0,
-            n_gpu: 1,
+            xctr: tp_kernarg.xctr,
+            peer_scratch: tp_kernarg.peer_scratch,
+            rank: tp_kernarg.rank,
+            n_gpu: tp_kernarg.n_gpu,
             seg_ofs: 0,
             prefill_spans: 0,
             prefill_parked: 0,
@@ -6707,6 +6816,7 @@ impl GpuEngine {
                             .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light)
                     }),
                 object_requirements_metadata.as_ref(),
+                tp_kernarg,
             ) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf, grid_pf)) => {
                     tracing::info!(
@@ -7613,16 +7723,16 @@ impl GpuEngine {
             batch,
             &blob.decode_progs(),
         )?;
-        let resume_ring_slack = live_kv_manifest
+        let kv_image = live_kv_manifest
             .clone()
-            .or_else(|| blob.with_packet_view(plow_asset::live_kv::emit).ok())
-            .and_then(|m| {
-                m.caches
-                    .iter()
-                    .filter(|c| c.window > 0)
-                    .map(|c| c.stride.saturating_sub(c.window))
-                    .min()
-            });
+            .or_else(|| blob.with_packet_view(plow_asset::live_kv::emit).ok());
+        let resume_ring_slack = kv_image.clone().and_then(|m| {
+            m.caches
+                .iter()
+                .filter(|c| c.window > 0)
+                .map(|c| c.stride.saturating_sub(c.window))
+                .min()
+        });
         let mut engine = GpuEngine {
             be,
             f,
@@ -7701,6 +7811,7 @@ impl GpuEngine {
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
             resume_rows: vec![0; batch],
+            kv_image,
             rewind_snapshots: (0..batch).map(|_| None).collect(),
             resume_ring_slack,
             vmm_active: vec![false; batch],
@@ -7710,6 +7821,7 @@ impl GpuEngine {
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
+            publish_off: vec![false; batch],
             session_end: vec![false; batch],
             disconnected: vec![false; batch],
             dump_kv_geo: RuntimeConfig::get()
@@ -7779,6 +7891,7 @@ impl GpuEngine {
             kv_hw: vec![0; batch],
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,
+            rank_bind,
         };
         engine.spec_upload_identity()?;
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
@@ -8340,6 +8453,7 @@ impl GpuEngine {
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
         self.vmm_publish(b, self.pos[b]);
+        self.publish_off[b] = false;
         self.blocks_quiesce()?;
         self.trace_finish(b);
         let t_publish = t0.map(|t| t.elapsed());
@@ -9352,7 +9466,51 @@ impl GpuEngine {
         if let Some(s) = &mut self.spec {
             s.end_pending()?;
         }
+        if self.rank_bind.as_ref().is_some_and(|r| r.tp > 1) {
+            let sel = match selection {
+                DecodeSelection::Base(r) => r.map_or(0, |r| r as u64 + 1),
+                DecodeSelection::Context(i) => (1 << 32) | i as u64,
+            };
+            let mut plan = vec![1, sel];
+            plan.extend(self.pos.iter().map(|&p| u64::from(p)));
+            self.rank_arm(&plan)?;
+        }
         self.launch_decode_program(selection)
+    }
+
+    /// Start a tensor-parallel launch unit: the previous unit has retired (stream drained),
+    /// then every rank of the subgroup zeroes its gates and agrees on `plan`.
+    fn rank_arm(&mut self, plan: &[u64]) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        self.be.stream_synchronize(&self.stream)?;
+        let t1 = std::time::Instant::now();
+        let r = match self.rank_bind.as_mut() {
+            Some(r) => r.arm(plan),
+            None => Ok(()),
+        };
+        tracing::trace!(
+            kind = plan.first().copied().unwrap_or(0),
+            drain_us = (t1 - t0).as_micros() as u64,
+            barrier_us = t1.elapsed().as_micros() as u64,
+            "rank arm"
+        );
+        r
+    }
+
+    /// Fail the last launch unit if one of its collectives bailed. Drains the stream first.
+    pub fn rank_audit(&self) -> Result<()> {
+        match self.rank_bind.as_ref().filter(|r| r.tp > 1) {
+            Some(r) => {
+                self.be.stream_synchronize(&self.stream)?;
+                r.audit()
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// This engine's rank binding, when it is one rank of a process group.
+    pub fn rank_bind(&self) -> Option<&rank::RankBind> {
+        self.rank_bind.as_ref()
     }
 
     fn launch_decode_program(&mut self, selection: DecodeSelection) -> Result<()> {
@@ -10635,6 +10793,7 @@ impl GpuEngine {
         moe_lt_shared: Option<Arc<moe_lt::MoeLt>>,
         light_pf: Option<KernelFn>,
         requirements: Option<&plow_asset::object_requirements::Manifest>,
+        tp: rank::TpKernarg,
     ) -> Result<(
         KernelFn,
         u32,
@@ -11690,10 +11849,10 @@ impl GpuEngine {
                 gq_stream: d_gq_stream.base,
                 gq_seg_ofs: d_gq_seg.base,
                 gq_cursor: cursor_view.base,
-                xctr: 0,
-                peer_scratch: 0,
-                rank: 0,
-                n_gpu: 1,
+                xctr: tp.xctr,
+                peer_scratch: tp.peer_scratch,
+                rank: tp.rank,
+                n_gpu: tp.n_gpu,
                 seg_ofs: 0,
                 prefill_spans: 0,
                 prefill_parked: 0,
@@ -13488,6 +13647,9 @@ impl GpuEngine {
         tc: usize,
         synchronize: bool,
     ) -> Result<()> {
+        if self.rank_bind.as_ref().is_some_and(|r| r.tp > 1) {
+            self.rank_arm(&[2, bi as u64, b as u64, c0 as u64, n as u64, tc as u64])?;
+        }
         let synchronize = synchronize || crate::config::RuntimeConfig::get().nv.pf_trace_log;
         let qwen_pack = std::mem::take(&mut self.qwen_pack);
         let qwen_ride = std::mem::take(&mut self.qwen_ride);

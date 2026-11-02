@@ -211,6 +211,54 @@ The scheduler calls `ResourceState::link_ok` — which delegates to `BandwidthSe
 
 **Deviation from implementation:** The model tracks a single aggregate interconnect budget, not a `Vec` of per-link (NVLink 0, NVLink 1, …) budgets.
 
+### Process Rank Groups (CUDA baseline transport)
+
+The generic NVIDIA tensor-parallel transport runs one rank per process, each pinned to one
+device (a whole GPU or a MIG instance). It assumes nothing from the fabric beyond mapped,
+page-locked host memory, so it works wherever peer access does not:
+
+- **Shared region.** The leader creates one anonymous shared mapping: a control page (abort
+  flag, per-rank pids, barrier words, plan fingerprints) and one collective region per rank,
+  each laid out exactly as the single-process peer layout (`[3 partial slots][gate lines]
+  [status line][tag slots]`). Every process registers the mapping with its own device and
+  uploads the table of its subgroup's region addresses as `peer_scratch`.
+- **Single-writer gates.** A gate line holds one arrival word per source rank. Rank `s`
+  announces itself with a system-scope release store of 1 into word `s` of every rank's line;
+  a rank's gate clears when words `0..n` of its own line are set. No word has writers on two
+  devices. The two-shot collective's second rendezvous counts its own blocks on a word of the
+  rank's own line (one device), and the block that completes the count stores the flags.
+- **Deadline.** A gate that does not clear within 10 s writes `0xDEAD0000 | rank` to the
+  packet's status line; every later collective of the launch skips, the program runs to
+  completion, and the host fails the step on its status audit. A failed group stays failed.
+- **Launch-unit arm.** Before each launch unit a rank drains its stream, zeroes its own gate
+  lines, and meets its subgroup at a host barrier carrying a fingerprint of the unit's plan
+  (kind, slot, chunk start, rows, unit sequence number). Ranks that would pair collectives of
+  different units (a diverged prefix attach, a skipped step) fail at the barrier instead.
+- **Supervision.** Workers exit when the leader does (they watch for reparenting); the leader aborts the
+  group when a worker exits, and the group answers every later request with a clean error.
+
+Every rank runs the same packet and makes the same decisions from the same inputs: the
+prefix cache runs on every rank (no host tier, whose size depends on a process's view of free
+host RAM), each prefill reply carries the rows the cache attached, and the leader fails the
+group when ranks disagree. Every rank computes the device argmax on bit-identical logits; a
+sampled or penalized row is drawn by rank 0 from its logits with the request's seeded draw,
+and the token reaches every rank as the next step's input.
+
+**Hardware notes (H100, MIG, R595 driver).**
+
+| Fact | Measured |
+|------|----------|
+| One process sees several MIG instances; peer access reports available | yes |
+| Cross-instance IPC handles and exported VMM allocations map and accept writes | yes |
+| Host-memory ping-pong across instances (round trip) | 9.5 µs at 5 KiB, 195 µs at 128 KiB |
+| Mapped host memory bandwidth from one instance | write 4.3 GB/s, read 13.4 GB/s |
+| Cross-instance system-scope atomic add on mapped host memory | **loses updates** (1 133 888 of 1 351 680 landed) |
+| Same-instance or whole-GPU system-scope atomics on mapped host memory | exact |
+
+The lost atomics are why every cross-rank word has a single writer. Peer VRAM between MIG
+instances is usable but not relied on: the host-memory transport is the generic baseline,
+and a fabric transport (peer VRAM at fixed addresses) is an optimization over it.
+
 ---
 
 ## Static Layout Across Phases

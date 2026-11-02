@@ -30,6 +30,9 @@ pub enum ServeEngine {
     /// The sm_120 persistent-interpreter engine (slotted, continuous batching).
     #[cfg(feature = "cuda")]
     Cuda(crate::exec::gpu::GpuEngine),
+    /// A tensor-parallel CUDA packet over a process rank group (rank 0 local, slotted).
+    #[cfg(feature = "cuda")]
+    CudaGroup(super::cuda_group::CudaGroupServe),
     /// The gfx950 engine (single sequence, optionally tensor-parallel).
     #[cfg(feature = "hsa")]
     Amd(AmdServe),
@@ -82,6 +85,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(_) => true,
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(_) => true,
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => SeqEngine::host_sampling(e),
             #[cfg(feature = "cpu")]
@@ -95,6 +100,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.max_ctx(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => e.max_ctx(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.max_ctx(),
             #[cfg(feature = "cpu")]
@@ -110,7 +117,7 @@ pub use super::cpu_serve::CpuServe;
 /// whole-or-chunked prefill, one decode step per live slot, plus the AMD-only
 /// packed-prefill / deferred multistep extensions, which other engines decline
 /// by returning `None`/`Err` (the tick already handles both).
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 pub trait SeqEngine {
     fn stop_ids(&self) -> &Arc<Vec<u32>>;
     fn batch(&self) -> usize;
@@ -187,14 +194,14 @@ pub trait SeqEngine {
     fn cached_rows(&self, _slot: usize) -> usize {
         0
     }
+    /// Whether the serving loop draws sampled and logit-edited rows from [`Self::logits_row`]
+    /// (the engine's own token is its argmax). `false` = rows are served by device argmax.
+    fn host_sampling(&self) -> bool {
+        false
+    }
     /// The softcapped logits behind `slot`'s most recent token (host logprobs); `false` = the
     /// engine keeps them on device.
     fn logits_row(&self, _slot: usize, _out: &mut Vec<f32>) -> bool {
-        false
-    }
-    /// Whether every sampled token's [`Self::logits_row`] reaches the host, so the host sampler
-    /// (temperature/top-k/top-p/penalties/seed) replaces the device argmax.
-    fn host_sampling(&self) -> bool {
         false
     }
     fn prefill_chunked_at_most(
@@ -340,6 +347,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.step_backend(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => SeqEngine::step_backend(e),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.step_backend(),
             #[cfg(feature = "cpu")]
@@ -347,11 +356,13 @@ impl ServeEngine {
         }
     }
     /// The single-sequence tick surface, for the gfx950 and CPU engines.
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     pub fn seq_engine_mut(&mut self) -> Option<&mut dyn SeqEngine> {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(_) => None,
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => Some(e),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => Some(e),
             #[cfg(feature = "cpu")]
@@ -363,7 +374,7 @@ impl ServeEngine {
     pub fn amd_overlap_capability(&self) -> Option<crate::exec::amd::AmdOverlapCapability> {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => None,
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => None,
             ServeEngine::Amd(e) => Some(e.overlap_capability()),
@@ -374,7 +385,7 @@ impl ServeEngine {
     pub fn amd_overlap_evidence(&self) -> Option<Vec<crate::exec::amd::AmdOverlapRankEvidence>> {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => None,
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => None,
             ServeEngine::Amd(e) => Some(e.overlap_evidence()),
@@ -384,7 +395,7 @@ impl ServeEngine {
     pub fn begin_diagnostics(&mut self) {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => {}
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => {}
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.begin_diagnostics(),
             #[cfg(feature = "cpu")]
@@ -395,7 +406,7 @@ impl ServeEngine {
     pub fn finish_diagnostics(&mut self) -> EngineDiagnostics {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => EngineDiagnostics::unsupported(),
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => EngineDiagnostics::unsupported(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.finish_diagnostics(),
             #[cfg(feature = "cpu")]
@@ -409,6 +420,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.batch(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => SeqEngine::batch(e),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.batch(),
             #[cfg(feature = "cpu")]
@@ -421,6 +434,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.effective_decode_rungs(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => vec![SeqEngine::batch(e) as u32].into(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.decode_rungs().into(),
             #[cfg(feature = "cpu")]
@@ -457,6 +472,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.kv_admission(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.kv_admission_budget(),
             #[cfg(feature = "cpu")]
@@ -503,6 +520,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.vmm_prefix_enabled(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(g) => g.prefix_cache_enabled(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.prefix_cache_enabled(),
             #[cfg(feature = "cpu")]
@@ -515,6 +534,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.stop_ids(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => SeqEngine::stop_ids(e),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.stop_ids(),
             #[cfg(feature = "cpu")]
@@ -533,7 +554,7 @@ impl ServeEngine {
         match self {
             ServeEngine::Amd(e) => e.write_packet_trace(path),
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => Err(crate::RuntimeError::Device(
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => Err(crate::RuntimeError::Device(
                 "raw AMD packet traces require an AMD serving engine".into(),
             )),
             #[cfg(feature = "cpu")]
@@ -549,6 +570,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.vmm_stats_handle(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.vmm_stats_handle(),
             #[cfg(feature = "cpu")]
@@ -572,6 +595,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.vmm_prefix_probe(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.vmm_prefix_probe(),
             #[cfg(feature = "cpu")]
