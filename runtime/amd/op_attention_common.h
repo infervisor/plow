@@ -5082,9 +5082,9 @@ __device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restr
 template <int NS>
 __device__ __forceinline__ void fa_hp8a_wait_tiles(unsigned after) {
     /* vmcnt counts this wave's loads; 4 per tile. */
-    if (NS >= 4 && after >= 2) asm volatile("s_waitcnt vmcnt(8)" ::: "memory");
-    else if (NS >= 3 && after >= 1) asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
-    else asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (NS >= 4 && after >= 2) asm volatile(PLOW_ASM_WAIT_VM(8) ::: "memory");
+    else if (NS >= 3 && after >= 1) asm volatile(PLOW_ASM_WAIT_VM(4) ::: "memory");
+    else asm volatile(PLOW_ASM_WAIT_VM(0) ::: "memory");
 }
 
 template <int DK, int NS>

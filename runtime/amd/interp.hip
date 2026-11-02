@@ -580,9 +580,9 @@ __device__ __forceinline__ void d_xreduce_add_norm_mega(
             xctr_signal(PLOW_CTR(base, gate_id));
         }
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(lg) < nranks) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 xrn_bailed = 1;
                 break;
@@ -687,9 +687,9 @@ __device__ __forceinline__ void d_xreduce_hcpost_mega(
             xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_id));
     if (threadIdx.x == 0) {
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(lg) < nranks) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 xhp_bailed = 1;
                 break;
@@ -3421,13 +3421,13 @@ __device__ __forceinline__ void exec_hc_pre_tail(CInst in, CTens T, unsigned nbl
     }
     __syncthreads();
     if (!hct_last) return;
-    asm volatile("buffer_inv" ::: "memory");
+    plow_cache_inv();
     __syncthreads();
     if (in->i[4] == 2u) {
         hc_mix_split_reduce((float*)T[in->t[0]], (const float*)T[desc[PLOW_HCT_GPART]],
                             in->i[0] * in->i[1], in->i[2]);
         __syncthreads();
-        asm volatile("buffer_inv" ::: "memory");
+        plow_cache_inv();
         __syncthreads();
     }
     float* post = (float*)T[desc[PLOW_HCT_POST]];
@@ -3446,7 +3446,7 @@ __device__ __forceinline__ void exec_hc_pre_tail(CInst in, CTens T, unsigned nbl
                              0u, 1u);
         if (desc[PLOW_HCT_NORM] == 1u) {
             __syncthreads();
-            asm volatile("buffer_inv" ::: "memory");
+            plow_cache_inv();
             __syncthreads();
             d_rmsnorm((bf16*)T[desc[PLOW_HCT_NOUT]], lin, (const bf16*)T[desc[PLOW_HCT_GAMMA]],
                       1u, hidden, eps, 0u, 0u, 1u, sm->part, nullptr, nullptr
@@ -3487,7 +3487,7 @@ __device__ __forceinline__ void hc_fuse_tail(CInst in, CTens T, unsigned group, 
     }
     __syncthreads();
     if (!hcf_last) return;
-    asm volatile("buffer_inv" ::: "memory");
+    plow_cache_inv();
     __syncthreads();
     const unsigned hidden = desc[PLOW_HCT_HIDDEN], sink = desc[PLOW_HCT_SINK];
     const float eps = __uint_as_float(desc[PLOW_HCT_EPS]);
@@ -3520,7 +3520,7 @@ __device__ __forceinline__ void hc_fuse_tail(CInst in, CTens T, unsigned group, 
                              0u, 1u);
         if (desc[PLOW_HCT_NORM] == 1u) {
             __syncthreads();
-            asm volatile("buffer_inv" ::: "memory");
+            plow_cache_inv();
             __syncthreads();
             d_rmsnorm((bf16*)T[desc[PLOW_HCT_NOUT]] + (size_t)m * hidden,
                       (const bf16*)T[desc[PLOW_HCT_LIN]] + (size_t)m * hidden,
@@ -4618,7 +4618,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (const float*)TEN(5), (const float*)TEN(6), in->i[0],
                                      in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk);
                 __syncthreads();
-                asm volatile("buffer_inv" ::: "memory");
+                plow_cache_inv();
                 __syncthreads();
                 d_rmsnorm((bf16*)T[in->i[5]], (const bf16*)TEN(2), (const bf16*)TEN(7),
                           PLOW_RUNTIME_ROWS(in->i[0]), in->i[2], in->fj[0].f, 0u, slice, nblk,
@@ -4684,7 +4684,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                          (const bf16*)TEN(6), (const bf16*)TEN(7),
                                          (const int*)TEN(5), in->i[1], in->i[2], r);
                         __syncthreads();
-                        asm volatile("buffer_inv" ::: "memory");
+                        plow_cache_inv();
                         __syncthreads();
                     }
                     d_dsa_pool_compress((uint8_t*)TEN(0) + (size_t)r * in->i[5] * in->i[2],
@@ -6046,7 +6046,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     /* i6 = 1 (PLOW_GLM_DSA_FUSE): this row's compact expand into t5. */
                     if (in->i[6] == 1u) {
                         __syncthreads();
-                        asm volatile("buffer_inv" ::: "memory");
+                        plow_cache_inv();
                         __syncthreads();
                         dsa_pool_expand_row((int*)TEN(5) + (size_t)r * (in->i[1] * pool_size + pool_size - 1u),
                                             (const int*)TEN(0) + (size_t)r * in->i[1],
@@ -6937,7 +6937,7 @@ __device__ __forceinline__ uint32_t ctr_poll(const uint32_t* p) {
  * The "memory" clobber is load-bearing: it stops the compiler hoisting the consumer's loads
  * above the invalidate. */
 __device__ __forceinline__ void ctr_acquire_l1(void) {
-    asm volatile("buffer_inv" ::: "memory");
+    plow_cache_inv();
 }
 __device__ __forceinline__ void ctr_acquire(void) {
 #if PLOW_GATE_NOINV
@@ -7122,7 +7122,8 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
      * leaving it unconditional put one extra instruction into every object, including gfx950's,
      * and cost the byte-identity that makes "this change did not touch CDNA4" checkable rather
      * than merely asserted. */
-#if PLOW_GATE_HIER || PLOW_GATE_HIER_CEIL || defined(PLOW_L2_PLACE_DISPATCH)
+#if (PLOW_GATE_HIER || PLOW_GATE_HIER_CEIL || defined(PLOW_L2_PLACE_DISPATCH)) && !PLOW_GFX12
+    /* gfx12 has one L2 domain; its hwreg 20 is not XCC_ID. */
     const unsigned plow_xcd =
         __builtin_amdgcn_s_getreg((20 /*HW_REG_XCC_ID*/) | (0 << 6) | ((32 - 1) << 11)) & 0xf;
 #else
@@ -7202,7 +7203,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
 #if PLOW_TRACE_PHASE
         /* T0: BEFORE the claim barrier, so the claim's dependent atomic round trip is inside the
          * measured window rather than in front of it. */
-        const uint64_t t_p0 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_p0 = prog.trace ? plow_realtime() : 0;
 #endif
         /* REQUIRED barrier: the whole workgroup must finish the previous packet — including its
          * designated successor signals — before any thread claims the next. The static loop needs no such barrier
@@ -7242,7 +7243,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         {
 #if PLOW_TRACE_PHASE
             /* Same probe on the static path, so an object built with the knob compiles on both. */
-            const uint64_t t_p0 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+            const uint64_t t_p0 = prog.trace ? plow_realtime() : 0;
 #endif
             const PlowStreamEnt e = my[ix];
             /* Segmented dispatch. With a window, [lo, hi) ALREADY bounds this launch's segment
@@ -7255,7 +7256,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             const CInst in = insts + e.inst;
 #endif
 
-        const uint64_t t_arrive = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_arrive = prog.trace ? plow_realtime() : 0;
 
         /* This packet's gates live on THIS STREAM ENTRY, always — the 64-byte PlowDevInst
          * carries no wait/succ metadata. A coarse entry points at the op's coarse lists
@@ -7363,7 +7364,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         __syncthreads(); /* every counter in the list is now satisfied */
 #if PLOW_TRACE_PHASE
         /* T1: the dependency is met; nothing below here is waiting for a producer. */
-        const uint64_t t_p1 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_p1 = prog.trace ? plow_realtime() : 0;
 #endif
 
         /* ONE acquire for the whole workgroup, and only after the gate clears.
@@ -7418,7 +7419,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         }
 #endif
 
-        const uint64_t t_ready = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_ready = prog.trace ? plow_realtime() : 0;
 
 #if defined(PLOW_BUCKET_XREDUCE)
         if (in->op != PLOW_DOP_XREDUCE2) __builtin_trap();
@@ -7763,7 +7764,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         __syncthreads();
 #if PLOW_TRACE_PHASE
         /* T3: the op body is retired and its stores are in this XCD's L2. */
-        const uint64_t t_p3 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_p3 = prog.trace ? plow_realtime() : 0;
 #endif
 
         /* Publish this workgroup's writes, then signal.
@@ -7861,7 +7862,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                 r.t_arrive = t_arrive;
 #endif
                 r.t_ready = t_ready;
-                r.t_end = __builtin_amdgcn_s_memrealtime();
+                r.t_end = plow_realtime();
                 prog.trace[base + ix] = r;
             }
         }

@@ -51,12 +51,24 @@
 # scripts/obj_baseline_gfx942.json, is DERIVED from each object's own ELF, is asserted on every
 # build by `asm_audit.py --contract` at the bottom of this script, and is re-blessed explicitly
 # (--bless) so a change to it lands in a commit.
+#
+# PLOW_HIP_ARCH=gfx1201 -- RDNA4 (Radeon AI PRO R9700). Same sources, same rows, same 64 KiB
+# CDNA3 tile arm, compiled wave64 + CU mode (-mwavefrontsize64 -mcumode; RDNA native wave is 32,
+# CU mode keeps one persistent workgroup per CU) and suffixed
+# gfx1201. Output defaults to build-amd/hsaco/gfx1201. The gfx942 instruction-selection and
+# object-contract files do not apply to WMMA code, so the audit is skipped for an arch with no
+# asm_expect_<arch>.json. gfx942 (the default) compiles with exactly the same command lines.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 R="$REPO/runtime"
-OUT="${1:-${PLOW_BUILD_DIR:-$REPO/build-amd/hsaco/gfx942}}"
-ARCH=gfx942
+ARCH="${PLOW_HIP_ARCH:-gfx942}"
+case "$ARCH" in
+  gfx942) ARCH_FLAGS="" ;;
+  gfx1201) ARCH_FLAGS="-mwavefrontsize64 -mcumode" ;;
+  *) echo "FAIL: PLOW_HIP_ARCH=$ARCH: this script builds gfx942 or gfx1201" >&2; exit 2 ;;
+esac
+OUT="${1:-${PLOW_BUILD_DIR:-$REPO/build-amd/hsaco/$ARCH}}"
 [ -n "${IN_NIX_SHELL:-}" ] || { echo "FAIL: run this script through nix develop" >&2; exit 2; }
 : "${PLOW_HIPCC:?nix develop did not set PLOW_HIPCC}"
 : "${PLOW_BUNDLER:?nix develop did not set PLOW_BUNDLER}"
@@ -1528,7 +1540,7 @@ rm -f gemma4_gemm_glu_gfx942.elf gemma4_glu.co
 
 one() {  # <stem> <axes...>
   local stem="$1"; shift
-  if ! "$HIPCC" --offload-arch="$ARCH" -O3 -w -DPLOW_ARCH_SUFFIX="$ARCH" \
+  if ! "$HIPCC" --offload-arch="$ARCH" $ARCH_FLAGS -O3 -w -DPLOW_ARCH_SUFFIX="$ARCH" \
         $* $AX_CONFIG $AX_EXTRA --genco "$R/amd/interp.hip" -o "$stem.co" $INC > "$stem.log" 2>&1; then
     echo "FAIL  $stem"; tail -20 "$stem.log"; return 1
   fi
@@ -1537,7 +1549,7 @@ one() {  # <stem> <axes...>
   rm -f "$stem.co" "$stem.log"
   echo "ok    $stem"
 }
-export -f one; export HIPCC ARCH R INC BUN AX_CONFIG AX_EXTRA
+export -f one; export HIPCC ARCH ARCH_FLAGS R INC BUN AX_CONFIG AX_EXTRA
 
 # The harness and the isolated Gemma-4 GLU object are started alongside the row batch.
 # It shares no input with the rows and nothing between here and the wait consumes it, so
@@ -1546,7 +1558,7 @@ export -f one; export HIPCC ARCH R INC BUN AX_CONFIG AX_EXTRA
 # body below the wait for what it is and why it must be rebuilt with the interpreter.
 if [ -z "${PLOW_ROWS_ONLY:-}" ]; then
   (
-    if "$HIPCC" --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" \
+    if "$HIPCC" --offload-arch="$ARCH" $ARCH_FLAGS -O3 -w --genco "$R/amd/test_kernels.hip" \
           -o tk.co $INC > test_kernels.log 2>&1; then
       "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
           --input=tk.co --output=test_kernels.elf
@@ -1557,7 +1569,7 @@ if [ -z "${PLOW_ROWS_ONLY:-}" ]; then
   ) &
   TK_PID=$!
   (
-    if "$HIPCC" --offload-arch="$ARCH" -O3 -w --genco \
+    if "$HIPCC" --offload-arch="$ARCH" $ARCH_FLAGS -O3 -w --genco \
           "$R/amd/gemma4_gemm_glu_gfx942.hip" -o gemma4_glu.co $INC \
           > gemma4_gemm_glu_gfx942.log 2>&1; then
       "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
@@ -1898,8 +1910,8 @@ done
 # stale comment at the top of this file. PLOW_AUDIT_STRICT=1 promotes the two reports to
 # refusals, as it does on the emit side. NOT skipped under PLOW_ROWS_ONLY: the rules that need
 # no baseline still apply to a partial build.
-EXPECT="$REPO/scripts/asm_expect_gfx942.json"
-BASELINE="$REPO/scripts/obj_baseline_gfx942.json"
+EXPECT="$REPO/scripts/asm_expect_$ARCH.json"
+BASELINE="$REPO/scripts/obj_baseline_$ARCH.json"
 if [ "${PLOW_SKIP_ASM_AUDIT:-0}" != 1 ] && [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
   echo ""
   echo "   --- instruction-selection audit + static performance contract ---"
@@ -1915,7 +1927,7 @@ fi
 # capability marker before the body: the generic grouped arm also contains
 # bf16 MFMA, so disassembly alone cannot prove that the enc=2 arm exists.
 if { [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ]; } && command -v python3 >/dev/null; then
-  K3_BATCH_EXPECT="$REPO/scripts/asm_expect_gfx942_k3_batched.json"
+  K3_BATCH_EXPECT="$REPO/scripts/asm_expect_${ARCH}_k3_batched.json"
   k3_batch_objects=()
   for object in \
       interp_decode_k3.elf interp_decode_k3_gq.elf \
