@@ -90,6 +90,7 @@ use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
 mod fish_depth;
 pub use fish_depth::{FishInfo, FishRow};
+mod fp8_block;
 mod gen_decode;
 mod mixed_step;
 mod moe_lt;
@@ -952,6 +953,13 @@ impl SegmentRoleValidation for SegmentRoles {
                     .copied()
                     .filter(|&role| plow_asset::segment_roles::requires_object(role)),
             );
+            // The native block-FP8 object serves cuBLASLt projection segments: it rides that role.
+            let native = plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK;
+            if p.roles.contains(&plow_asset::segment_roles::CUBLASLT)
+                && self.objects.contains_key(&native)
+            {
+                used.insert(native);
+            }
             if !p.library.is_empty() {
                 if decode {
                     return Err(RuntimeError::Rejected(
@@ -5635,6 +5643,23 @@ impl GpuEngine {
         } else {
             None
         };
+        let fp8_block = match (
+            &cublaslt,
+            segment_roles.as_ref().and_then(|r| {
+                r.objects
+                    .get(&plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK)
+            }),
+        ) {
+            (Some(cublaslt::ProjectionBackend::Lt(_)), Some(object)) => {
+                fp8_block::Fp8Block::load(&be, assets_dir, object, profile.tag)?
+            }
+            (_, Some(_)) => {
+                return Err(RuntimeError::Rejected(
+                    "native FP8 block object requires cuBLASLt decode projections".into(),
+                ))
+            }
+            _ => None,
+        };
         let cublaslt_prefill = if prefill_cublaslt_enabled {
             let lt = match &cublaslt {
                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
@@ -5902,6 +5927,7 @@ impl GpuEngine {
         let projection_decode = if let Some(lt) = &cublaslt {
             cublaslt::library_routes(cublaslt::prepare_routes(
                 lt,
+                fp8_block.as_ref(),
                 cublaslt_segments,
                 &mut insts,
                 &devp,
@@ -6220,6 +6246,7 @@ impl GpuEngine {
                         };
                         let routes = cublaslt::prepare_routes(
                             lt,
+                            fp8_block.as_ref(),
                             segments,
                             &mut insts,
                             &devp,
@@ -6922,11 +6949,12 @@ impl GpuEngine {
         let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =
             std::array::from_fn(|_| None);
         for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
-            // The library route loads its own object (`lib_attention`).
+            // The library routes load their own objects (`lib_attention`, `fp8_block`).
             if matches!(
                 id,
                 plow_asset::segment_roles::NATIVE_DECODE_TC
                     | plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION
+                    | plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK
             ) {
                 continue;
             }
@@ -11700,6 +11728,7 @@ impl GpuEngine {
                             "cuBLASLt prefill roles require the BF16 library backend".into(),
                         )
                     })?,
+                    None,
                     projection_segments,
                     &mut h_inst,
                     devp,
