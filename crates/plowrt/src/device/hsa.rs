@@ -1437,7 +1437,10 @@ impl HsaBackend {
         // kernarg pool.
         let ring_bytes = QUEUE_SIZE as usize * KARG_SLOT;
         let mut karg_ring: *mut c_void = std::ptr::null_mut();
+        // The BAR-write readback publish is CLR's gfx94x protocol; a PCIe dGPU (gfx10+) also needs
+        // an HDP flush that this path does not issue, so those use the host kernarg pool.
         let karg_vram = crate::config::RuntimeConfig::get().amd_kernarg_vram()
+            && device_name.starts_with("gfx9")
             && unsafe {
                 vram_kernarg_ring(
                     &drv,
