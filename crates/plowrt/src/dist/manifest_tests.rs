@@ -868,10 +868,6 @@ fn an_override_reproduces_a_manifest_whose_recipe_moved() {
 fn a_recipe_missing_an_identity_field_is_refused_by_name() {
     let dir = tmp("missing");
     for (drop, want) in [
-        (
-            "toolchain = \"cuda-13.4+gcc-13\"\n",
-            "[target] has no `toolchain`",
-        ),
         ("max_ctx = 2048\n", "declares `max_ctx`"),
         (
             "source = \"hf:maya-research/Veena\"\n",
@@ -1056,9 +1052,37 @@ fn the_gdn_prefill_library_has_a_role_and_other_shared_objects_do_not() {
     assert_eq!(classify("libsomething.so"), None);
 }
 
+/// A CUDA recipe may omit `toolchain`: the cubins are pinned by content, and
+/// the recipe's toolchain is recorded only when it names one.
+#[test]
+fn a_cuda_recipe_needs_no_toolchain() {
+    let p = write_recipe(
+        &tmp("cuda-no-toolchain"),
+        &MINIMAL.replace("toolchain = \"cuda-13.4+gcc-13\"\n", ""),
+    );
+    let id = read_recipe(&p, Overrides::default()).unwrap();
+    assert_eq!(id.toolchain, "");
+}
+
+/// An AMD code object is tied to the ROCm toolchain that built it, so an AMD
+/// recipe without `toolchain` is still refused.
+#[test]
+fn an_amd_recipe_without_a_toolchain_is_refused() {
+    let p = write_recipe(
+        &tmp("amd-no-toolchain"),
+        &MINIMAL
+            .replace("vendor = \"nvidia\"", "vendor = \"amd\"")
+            .replace("isa = \"sm_90a\"", "isa = \"gfx942\"")
+            .replace("toolchain = \"cuda-13.4+gcc-13\"\n", ""),
+    );
+    let e = read_recipe(&p, Overrides::default())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("[target] has no `toolchain`"), "{e}");
+}
+
 /// Nothing records a compiler for a runtime-compiled target, so its recipe
-/// may omit `toolchain`; a CUDA recipe without one is still refused (see
-/// `a_recipe_missing_an_identity_field_is_refused_by_name`).
+/// may omit `toolchain`.
 #[test]
 fn a_runtime_compiled_recipe_needs_no_toolchain() {
     let assets = speech_assets("apple-no-toolchain");

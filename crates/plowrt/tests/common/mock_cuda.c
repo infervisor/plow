@@ -17,6 +17,9 @@ int cuDeviceGetName(char *p, int n, int d) { snprintf(p,n,"Mock GPU %d",d); retu
 int cuDeviceGetAttribute(int *p, int a, int d) { *p=1; return 0; }
 int cuDevicePrimaryCtxRetain(void **p, int d) { atomic_fetch_add(&refs[d],1); *p=(void *)(uintptr_t)(d+1); return 0; }
 int cuDevicePrimaryCtxRelease_v2(int d) { if (atomic_fetch_sub(&refs[d],1)==1) atomic_fetch_add(&generation[d],1); return 0; }
+static atomic_uint ctx_flags[2];
+int cuDevicePrimaryCtxGetState(int d, unsigned *f, int *a) { *f=atomic_load(&ctx_flags[d]); *a=atomic_load(&refs[d])>0; return 0; }
+int cuDevicePrimaryCtxSetFlags_v2(int d, unsigned f) { atomic_store(&ctx_flags[d],f); return 0; }
 int cuCtxSetCurrent(void *p) { ctx=(uintptr_t)p; bound_generation=ctx ? atomic_load(&generation[ctx-1]) : 0; return 0; }
 int cuCtxSynchronize(void) { return 0; }
 int cuModuleLoadData(void) { return 0; }
