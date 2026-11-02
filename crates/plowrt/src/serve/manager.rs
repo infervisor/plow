@@ -2073,7 +2073,13 @@ impl ModelManager {
             claims.insert(slug.to_string(), claim);
         }
         drop(claims);
-        let shared = self.share_kv(state);
+        // A resident mux admits on its old budget until its next refresh and publishes what it
+        // admitted with it: share, let every mux adopt its cap and report, then share again.
+        let mut shared = self.share_kv(state);
+        if shared.is_ok() && self.kv_claims.lock().len() > 1 {
+            std::thread::sleep(KV_SHARE_SETTLE);
+            shared = self.share_kv(state);
+        }
         if shared.is_err() {
             self.kv_claims.lock().remove(slug);
         }
@@ -2099,30 +2105,33 @@ impl ModelManager {
             }
             return Ok(());
         }
-        // Free is read on both sides of held and the smaller kept: bytes mapped or released
-        // between the reads then count once at most.
-        let free_before = self.free_vram().map_err(EnsureError::Load)?;
+        // Held is read on both sides of free and the smaller kept per engine: bytes mapped or
+        // released between the reads then count once at most.
+        let held_before: Vec<u64> = engines
+            .iter()
+            .map(|(_, e)| e.lock().kv_live_held())
+            .collect();
+        let free = self.free_vram().map_err(EnsureError::Load)?;
         let mut held = 0u64;
         let mut shares = Vec::with_capacity(engines.len());
-        for (slug, e) in &engines {
+        for ((slug, e), before) in engines.iter().zip(held_before) {
             let e = e.lock();
             if let Some(budget) = e.kv_admission_budget() {
-                held += e.kv_live_held();
+                held += before.min(e.kv_live_held());
                 // Admitted sequences map their reserved rows as they decode: the share must
                 // cover them, not only what is mapped now.
-                let reserved = state
+                let committed = state
                     .model_metrics(slug)
-                    .kv_reserved_rows
+                    .kv_reserved_bytes
                     .load(std::sync::atomic::Ordering::Relaxed);
                 shares.push(KvShare {
                     slug,
                     seq: budget.bytes_for_rows(e.max_ctx() as u64),
-                    committed: budget.bytes_for_rows(reserved),
+                    committed,
                     reserve: e.kv_admit_reserve(),
                 });
             }
         }
-        let free = free_before.min(self.free_vram().map_err(EnsureError::Load)?);
         let caps = kv_shares(free + held, &shares)?;
         let total: u64 = caps.iter().sum();
         let reserve = shares.iter().map(|s| s.reserve).max().unwrap_or(0);
@@ -2135,6 +2144,10 @@ impl ModelManager {
         Ok(())
     }
 }
+
+/// Two of the mux's 50 ms KV budget refreshes: every resident mux has adopted a new cap and
+/// published the KV its admitted sequences reserve.
+const KV_SHARE_SETTLE: Duration = Duration::from_millis(120);
 
 /// One co-resident engine's inputs to [`kv_shares`].
 struct KvShare<'a> {
