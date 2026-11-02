@@ -1662,6 +1662,36 @@ __device__ __forceinline__ float block_sum(float v, float* part) {
     return t;
 }
 
+__device__ __forceinline__ void stage_x_lds(bf16* __restrict__ lds, const bf16* __restrict__ x_,
+                                            size_t n) {
+    const auto* const x = as_glob(x_);
+    size_t i0 = 0;
+    if (((((uintptr_t)x_) | ((uintptr_t)lds)) & 15u) == 0u) {
+        const size_t nv = n >> 3;
+        for (size_t i = threadIdx.x; i < nv; i += PLOW_THREADS)
+            *(bf16v8*)(lds + i * 8) = ld_glob8(x + i * 8);
+        i0 = nv << 3;
+    }
+    for (size_t i = i0 + threadIdx.x; i < n; i += PLOW_THREADS) lds[i] = x[i];
+}
+
+__device__ __forceinline__ bf16v8 gemv_load8(const bf16* w, __amdgpu_buffer_rsrc_t rsrc,
+                                            unsigned k, unsigned K) {
+    if (k + 8u <= K) return buf_ld8(rsrc, k * 2u);
+    bf16v8 v = {};
+#pragma unroll
+    for (unsigned j = 0; j < 8; j++) if (k + j < K) v[j] = w[k + j];
+    return v;
+}
+
+__device__ __forceinline__ bf16v8 gemv_lds8(const bf16* x, unsigned k, unsigned K) {
+    if (k + 8u <= K) return ld_lds8(x + k);
+    bf16v8 v = {};
+#pragma unroll
+    for (unsigned j = 0; j < 8; j++) if (k + j < K) v[j] = x[k + j];
+    return v;
+}
+
 /* ---------------------------------------------------------------------------
  * v_mfma_f32_32x32x16_bf16 register layout.
  *
