@@ -405,8 +405,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if kv_image {
         // Slots 1.. take slot 0's KV through an exported image instead of their own prefill:
         // re-exporting each must give the same bytes, and SLOTS_AGREE then compares the decodes.
-        if !same || packed_prefill || slots < 2 {
-            return Err("--kv-image needs --same, the serial prefill and at least 2 slots".into());
+        if !same || packed_prefill || slots < 2 || warmup != 0 || steps == 0 {
+            return Err(
+                "--kv-image needs --same, the serial prefill, 2+ slots, --warmup 0 and steps"
+                    .into(),
+            );
         }
         let n = prompt_for(0).len() as u32;
         let (mut image, mut again) = (Vec::new(), Vec::new());

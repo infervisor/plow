@@ -834,6 +834,12 @@ pub struct RuntimeConfig {
     #[arg(long = "dp", env = "PLOW_DP", value_delimiter = ',', global = true)]
     pub dp: Vec<String>,
 
+    /// Prefill/decode disaggregation over a `--dp` model's ranks: `--pd gemma=0/1` prefills on
+    /// rank 0 and decodes on rank 1 (`0+1/2+3` for pools of several). The first token is
+    /// sampled on the prefill rank; the KV moves through host memory (docs/arch/30 §7).
+    #[arg(long = "pd", env = "PLOW_PD", value_delimiter = ',', global = true)]
+    pub pd: Vec<String>,
+
     /// DP routing: send a prompt to the rank whose prefix cache already holds it.
     #[arg(long = "route-prefix", env = "PLOW_ROUTE_PREFIX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub route_prefix: bool,

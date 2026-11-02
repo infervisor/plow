@@ -4425,8 +4425,26 @@ async fn bringup_runtime(
     let untagged_mix_pin = |slug: &str, ordinal: u32| -> Box<dyn std::error::Error> {
         format!("--pin {slug}@{ordinal}: {slug} is served on NVIDIA and AMD; name the device as nv:{ordinal} or amd:{ordinal}").into()
     };
+    // `--pd`: a DP model's prefill and decode pools, checked against its rank count.
+    let pd_specs = plowrt::serve::pd::parse_pd(&RuntimeConfig::get().pd)?;
+    let pd_of = |model: &str, n: usize| -> Result<Option<plowrt::serve::pd::PdSpec>, String> {
+        match pd_specs.iter().find(|(m, _)| m == model) {
+            None => Ok(None),
+            Some((_, p)) if (p.prefill | p.decode) >> n != 0 => {
+                Err(format!("--pd {model}: names a rank past its {n} DP ranks"))
+            }
+            Some((_, p)) => Ok(Some(*p)),
+        }
+    };
     // Each vendor path uses its half of these.
-    let _ = (&amd_only, &nv_only, &is_mix, &untagged_mix_pin, amd_groups);
+    let _ = (
+        &amd_only,
+        &nv_only,
+        &is_mix,
+        &untagged_mix_pin,
+        amd_groups,
+        &pd_of,
+    );
     #[cfg(feature = "cuda")]
     let mut managed_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     #[cfg(feature = "cuda")]
@@ -4779,6 +4797,7 @@ async fn bringup_runtime(
                         })
                         .collect();
                     let mut set = DpSet::new(model, ranks);
+                    set.pd = pd_of(model, set.ranks.len())?;
                     for r in &mut set.ranks {
                         let be = backends
                             .iter()
@@ -5088,6 +5107,7 @@ async fn bringup_runtime(
                 }));
                 tracing::info!(%slug, dp = n, nv_ranks = lo, tp, cfg = ?router.cfg, "dp: AMD ranks planned");
                 let mut set = DpSet::new(slug, ranks);
+                set.pd = pd_of(slug, set.ranks.len())?;
                 for (r, rank) in set.ranks.iter_mut().enumerate() {
                     match nv.get(r) {
                         Some((_, _, _, cpus)) => {
@@ -5218,6 +5238,9 @@ async fn bringup_runtime(
         }
         state.install_turns_per_group(&pending.turns);
         state.install_managers(pending.managers);
+    }
+    if let Some((m, _)) = pd_specs.iter().find(|(m, _)| state.dp_set(m).is_none()) {
+        return Err(format!("--pd {m}=…: the model is not served data-parallel (--dp)").into());
     }
     #[cfg(feature = "cuda")]
     {

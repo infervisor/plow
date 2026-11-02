@@ -2791,6 +2791,9 @@ pub struct GpuEngine {
     /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
     /// prefill chunk never attaches a cached prefix.
     prefix_attach_off: Vec<bool>,
+    /// The slot was seated from a KV image ([`Self::import_kv_image`]): its rings hold only the
+    /// image's window, so it publishes no boundary to the prefix cache until `begin_slot`.
+    publish_off: Vec<bool>,
     /// The slot's request is its session's last turn (`X-Session-End`): the prefix cache drops
     /// the session's boundary to the cold band at retire ([`Self::retire_slot`]).
     session_end: Vec<bool>,
@@ -7818,6 +7821,7 @@ impl GpuEngine {
             seq_tokens: vec![Vec::new(); batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
+            publish_off: vec![false; batch],
             session_end: vec![false; batch],
             disconnected: vec![false; batch],
             dump_kv_geo: RuntimeConfig::get()
@@ -8449,6 +8453,7 @@ impl GpuEngine {
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
         self.vmm_publish(b, self.pos[b]);
+        self.publish_off[b] = false;
         self.blocks_quiesce()?;
         self.trace_finish(b);
         let t_publish = t0.map(|t| t.elapsed());

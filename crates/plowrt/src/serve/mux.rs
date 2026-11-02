@@ -269,6 +269,10 @@ pub struct JobOpts {
     pub prefix: Option<crate::memory::vmm::PrefixKey>,
     /// Multimodal soft-token rows the prompt's bit-31 ids name (`serve::mm`).
     pub mm: Option<Box<crate::serve::mm::MmJob>>,
+    /// P/D prefill job: export the slot's KV image here when it finishes (`serve::pd`).
+    pub export: Option<Arc<crate::serve::pd::KvExport>>,
+    /// P/D decode job: seat the slot from this image instead of prefilling (`serve::pd`).
+    pub import: Option<Box<crate::serve::pd::KvImport>>,
 }
 
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
@@ -1077,13 +1081,19 @@ struct Slot {
     /// are released when the slot is dropped.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     mm: Option<Box<crate::serve::mm::MmJob>>,
+    /// [`JobOpts::export`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    export: Option<Arc<crate::serve::pd::KvExport>>,
+    /// [`JobOpts::import`], until the slot is seated.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    import: Option<Box<crate::serve::pd::KvImport>>,
 }
 
 impl Slot {
     /// Rows the mixed-step program cannot carry: it does not stage overlays (see [`SpeechJob`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn serial_prefill(&self) -> bool {
-        self.speech.is_some()
+        self.speech.is_some() || self.import.is_some()
     }
 
     /// Rows that take the plain one-step decode launch: `EmbedPosBf16` reads the position base by
@@ -3048,6 +3058,8 @@ fn admit_session(
         frame: None,
         prefix: job.opts.prefix,
         mm: job.opts.mm,
+        export: job.opts.export,
+        import: job.opts.import,
     });
     None
 }
@@ -3301,6 +3313,12 @@ fn run_one_tick(
         if let crate::serve::engine::ServeEngine::Cuda(e) = &mut *guard {
             let mut disconnected = smallvec::SmallVec::<[bool; 128]>::new();
             disconnected.resize(e.batch(), false);
+            obs.pd_exports.resize(e.batch(), None);
+            for (i, s) in slots.iter().enumerate().take(e.batch()) {
+                if let Some(x) = s.as_ref().and_then(|s| s.export.as_ref()) {
+                    obs.pd_exports[i] = Some(Arc::clone(x));
+                }
+            }
             let result = (|| {
                 let stop = Arc::clone(e.stop_ids());
                 let cap = e.batch();
@@ -3659,6 +3677,17 @@ fn run_one_tick(
                     }
                 }
 
+                gpu_seat_imports(
+                    &mut *e,
+                    &mut slots,
+                    cap,
+                    &arena,
+                    bundle,
+                    stop.as_slice(),
+                    &mut tokens_this_tick,
+                    &mut disconnected,
+                    &mut tick_fault,
+                );
                 let pack_t = packlog::on().then(Instant::now);
                 let (pack_live, pack_prefilling) = if pack_t.is_some() {
                     let live = slots.iter().take(cap).flatten();
@@ -3867,7 +3896,11 @@ fn run_one_tick(
                     let mut serial_rows = 0usize;
                     loop {
                         let Some(i) = (0..slots.len().min(cap))
-                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
+                            .filter(|&i| {
+                                slots[i]
+                                    .as_ref()
+                                    .is_some_and(|s| s.step == 0 && s.import.is_none())
+                            })
                             .min_by_key(|&i| slots[i].as_ref().map(|s| (s.class, s.arrived)))
                         else {
                             break;
@@ -4372,10 +4405,17 @@ fn run_one_tick(
                     decode_progress,
                 );
             })();
+            let mut result = result;
             for (slot, request) in result.0.iter().enumerate().take(e.batch()) {
                 if request.is_none() && slot_free(&result.0, slot) {
                     if disconnected[slot] {
                         e.note_disconnect(slot);
+                    }
+                    // A P/D prefill job just finished: its KV leaves before the slot retires.
+                    if let Some(sink) = result.2.pd_exports.get_mut(slot).and_then(Option::take) {
+                        if result.5.is_none() && sink.wanted() {
+                            sink.deliver(gpu_export_slot(&mut *e, slot));
+                        }
                     }
                     e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
                 }
@@ -6918,7 +6958,8 @@ fn gpu_prefill_batched_pass(
             AdmitRoom::new(ready, admit_launch_rows(launch_cap, rung), decode_rows)
         });
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
-            let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
+            // A P/D decode job is seated from its image (`gpu_seat_imports`), never prefilled.
+            let Some(request) = slot.as_mut().filter(|s| s.step == 0 && s.import.is_none()) else {
                 continue;
             };
             if request.respond.is_closed() {
@@ -7495,6 +7536,91 @@ fn fit_speech_budget(slot: &mut Slot, max_ctx: usize) {
         let room = max_ctx.saturating_sub(slot.prompt_ids.len()).max(1);
         slot.gen.max_tokens = slot.gen.max_tokens.min(room);
     }
+}
+
+/// Seat every waiting P/D decode job from its KV image: the slot then stands where its own
+/// prefill would leave it, and the prefill rank's first token is produced here.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_seat_imports(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    cap: usize,
+    arena: &Option<SharedKvState>,
+    bundle: &ModelBundle,
+    stop: &[u32],
+    tokens_this_tick: &mut usize,
+    disconnected: &mut [bool],
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+) {
+    for i in 0..slots.len().min(cap) {
+        let Some(s) = slots[i]
+            .as_mut()
+            .filter(|s| s.step == 0 && s.import.is_some())
+        else {
+            continue;
+        };
+        if s.respond.is_closed() {
+            disconnected[i] = true;
+            if let Some(taken) = slots[i].take() {
+                release_kv(arena, taken.kv);
+            }
+            continue;
+        }
+        let total = s.prompt_ids.len() + s.gen.max_tokens.max(1);
+        if let Err(err) = e.begin_slot(i, total) {
+            // Out of device memory for live KV: wait, as a prefill would.
+            let short = matches!(err, crate::RuntimeError::Oom(_)) || err.device_code() == Some(2);
+            if short && !err.is_fatal() {
+                e.retire_slot(i, false);
+                e.note_kv_pressure();
+            } else {
+                note_fault(tick_fault, &err);
+                fail_slot(&mut slots[i], arena, err);
+            }
+            continue;
+        }
+        let import = s.import.take().expect("filtered on import");
+        let seated = match e.kv_image_key() {
+            Some(key) if key == import.image.key => {
+                e.import_kv_image(i, &s.prompt_ids, &import.image.bytes)
+            }
+            _ => Err(crate::RuntimeError::Rejected(
+                "P/D: the prefill rank's KV image does not fit this packet".into(),
+            )),
+        };
+        if let Err(err) = seated {
+            e.retire_slot(i, false);
+            note_fault(tick_fault, &err);
+            fail_slot(&mut slots[i], arena, err);
+            continue;
+        }
+        s.pf_pos = s.prompt_ids.len();
+        disconnected[i] |= handle_produced_token(
+            &mut slots[i],
+            arena,
+            bundle,
+            import.token,
+            1,
+            tokens_this_tick,
+            Some(stop),
+        );
+    }
+}
+
+/// The KV image of engine slot `slot`, whose P/D prefill job has produced its first token.
+#[cfg(feature = "cuda")]
+fn gpu_export_slot(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slot: usize,
+) -> Result<crate::serve::pd::KvImage> {
+    let key = e
+        .kv_image_key()
+        .ok_or_else(|| crate::RuntimeError::Rejected("P/D: this packet has no KV image".into()))?;
+    let rows = e.slot_pos(slot) as u32;
+    let mut bytes = Vec::new();
+    e.export_kv_image(slot, rows, &mut bytes)?;
+    Ok(crate::serve::pd::KvImage { key, rows, bytes })
 }
 
 /// Advance a prefilling slot: one prompt chunk through the prefill bucket
@@ -11684,6 +11810,8 @@ mod tests {
                 turn_key: None,
                 speech: None,
                 mm: None,
+                export: None,
+                import: None,
                 cfg: None,
                 held: Vec::new(),
                 held_finish: None,

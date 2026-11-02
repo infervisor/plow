@@ -778,6 +778,9 @@ impl GpuEngine {
         p_a: u32,
         kind: crate::memory::vmm::Kind,
     ) -> bool {
+        if self.publish_off[b] {
+            return false;
+        }
         let Some((v, kv)) = self.vmm_prefix() else {
             return false;
         };

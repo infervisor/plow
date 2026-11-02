@@ -18,8 +18,9 @@ impl GpuEngine {
         })
     }
 
-    /// Slot `b`'s rows `[.., n)` into `out`. `n` is the slot's frontier and nothing was written
-    /// past it: a sliding ring then still holds every row the image carries.
+    /// Slot `b`'s rows `[.., n)` into `out`. `n` is the slot's frontier and the slot has not
+    /// decoded (a P/D prefill job's slot, right after its first token): a sliding ring then still
+    /// holds every row the image carries.
     pub fn export_kv_image(&mut self, b: usize, n: u32, out: &mut Vec<u8>) -> Result<()> {
         if b >= self.batch || self.pos[b] != n || self.kv_hw[b] > n {
             return Err(RuntimeError::Rejected(format!(
@@ -85,11 +86,12 @@ impl GpuEngine {
         self.be.synchronize()?;
         self.pos[b] = n;
         self.kv_hw[b] = n;
-        // An imported slot publishes nothing to this engine's prefix cache: its rings hold only
-        // the image's window, not the rows an earlier boundary would copy, and the exporting
-        // engine already holds the prompt's blocks. `seq_tokens` shorter than the frontier is
-        // what every publish path refuses on.
+        // The history stays complete (decode consumers check it against the frontier), but the
+        // slot publishes nothing to this engine's prefix cache: its rings hold only the image's
+        // window, and the exporting engine already holds the prompt's blocks.
         self.seq_tokens[b].clear();
+        self.seq_tokens[b].extend_from_slice(prompt);
+        self.publish_off[b] = true;
         Ok(())
     }
 }
