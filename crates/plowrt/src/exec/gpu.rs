@@ -6903,11 +6903,12 @@ impl GpuEngine {
         let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =
             std::array::from_fn(|_| None);
         for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
-            // The library route loads its own object (`lib_attention`).
+            // The library routes load their own objects (`lib_attention`, `fp8_block`).
             if matches!(
                 id,
                 plow_asset::segment_roles::NATIVE_DECODE_TC
                     | plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION
+                    | plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK
             ) {
                 continue;
             }
