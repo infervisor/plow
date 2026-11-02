@@ -286,4 +286,37 @@ fn rmsnorm_extents_include_the_output_row_offset() {
     assert_eq!(write_extent(DevOp::RmsNorm, &i, 0), Some(64));
     assert_eq!(write_extent(DevOp::RmsNorm, &i, 3), Some(32));
     assert_eq!(write_extent(DevOp::RmsNorm, &i, 4), Some(8));
+    i.i[1] = 0x8000_0000;
+    i.i[2] = u32::MAX;
+    assert_eq!(
+        write_extent(DevOp::RmsNorm, &i, 0),
+        None,
+        "2^64 bytes overflow"
+    );
+    i.i[0] = u32::MAX;
+    i.i[1] = u32::MAX;
+    assert_eq!(
+        write_extent(
+            DevOp::HeadNormRope,
+            &DevInst64 {
+                i: [u32::MAX; 8],
+                ..i
+            },
+            0
+        ),
+        None,
+        "an overflowing extent is refused"
+    );
+    i.i = [0, 16, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
+        write_extent(DevOp::Gemv, &i, 0),
+        Some(32),
+        "zero rows run as one"
+    );
+    i.t[3] = 5;
+    assert_eq!(
+        vetted_writes(DevOp::RmsNorm, &i),
+        None,
+        "the quant output needs its scale"
+    );
 }

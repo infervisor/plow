@@ -7860,14 +7860,13 @@ impl GpuEngine {
         };
         engine.spec_upload_identity()?;
         if invariant_splits.is_some() {
+            engine.invariant_rows = invariant_rows;
             match engine.arm_batch_invariant(&blob) {
-                Ok(()) => {
-                    engine.batch_invariant = true;
-                    engine.invariant_rows = invariant_rows;
-                }
+                Ok(()) => engine.batch_invariant = true,
                 Err(e) if invariant_explicit => return Err(e),
                 Err(e) => {
                     tracing::warn!(error = %e, "batch-invariant decode unavailable");
+                    engine.invariant_rows = usize::MAX;
                     // Serve plain decode with the baked split counts, not a half-pinned engine.
                     for (rung, baked) in engine.decode_rungs.iter_mut().zip(invariant_baked_rungs) {
                         rung.set_insts(&engine.be, baked)?;
@@ -9493,6 +9492,25 @@ impl GpuEngine {
         } else {
             self.launch_decode()
         }
+    }
+
+    /// The row counts of the engine's selectable decode rungs (the widest program excluded), and
+    /// whether context bands override them.
+    pub fn decode_rung_rows(&self) -> (Vec<usize>, bool) {
+        (
+            self.decode_rungs.iter().map(|r| r.rows).collect(),
+            self.decode_contexts.is_some(),
+        )
+    }
+
+    /// Whether a plain launch whose highest occupied slot is `highest_slot` runs a rung that is
+    /// bit-equal per row to the narrowest (batch-invariant decode only).
+    pub fn spec_plain_invariant(&self, highest_slot: usize) -> bool {
+        self.batch_invariant
+            && match self.decode_rung(highest_slot) {
+                Some(i) => self.decode_rungs[i].rows <= self.invariant_rows,
+                None => self.invariant_rows == usize::MAX,
+            }
     }
 
     /// The widest verify launch a speculative tick may use: the interpreter-only rungs. Library
@@ -15411,6 +15429,7 @@ impl GpuEngine {
         if let Some(op) = blob
             .decode_progs()
             .iter()
+            .filter(|p| p.t as usize <= self.invariant_rows)
             .flat_map(|p| &p.insts)
             .filter_map(|d| DevOp::from_u16(d.op))
             .find(|&op| !batch_invariant_op(op))
@@ -15419,21 +15438,20 @@ impl GpuEngine {
                 "batch-invariant decode: {op:?} has no audited width-independent arm"
             )));
         }
-        let mut modules = self.decode_trace_modules();
+        // The objects the pinned rungs and span verify launch must export the flag (it exists
+        // only in the audited build configuration); the wider rungs' sibling objects set it
+        // where they have it. Check all before setting any.
+        let mut required: Vec<&Module> = vec![&self.module];
         if let Some((a, b)) = &self.row_slot_twin {
-            modules.extend([a.module(), b.module()]);
+            required.extend([a.module(), b.module()]);
         }
-        if let Some(gw) = &self.gemv_wide {
-            modules.push(gw.module());
-        }
-        modules.extend(
+        required.extend(
             self.decode_rungs
                 .iter()
+                .filter(|r| r.rows <= self.invariant_rows)
                 .filter_map(|r| r.object.as_ref().map(|o| o.module())),
         );
-        // Every object must be built in the audited configuration (it exports the flag only
-        // then); check all before setting any.
-        for m in &modules {
+        for m in &required {
             if self
                 .be
                 .module_global_u32(m, "plow_batch_invariant")?
@@ -15447,9 +15465,37 @@ impl GpuEngine {
                 ));
             }
         }
+        let mut modules = required;
+        modules.extend(self.decode_trace_modules());
+        modules.extend(
+            self.decode_rungs
+                .iter()
+                .filter_map(|r| r.object.as_ref().map(|o| o.module())),
+        );
+        if let Some(gw) = &self.gemv_wide {
+            modules.push(gw.module());
+        }
+        if let Err(e) = self.set_batch_invariant(&modules, 1) {
+            let _ = self.set_batch_invariant(&modules, 0);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn set_batch_invariant(&self, modules: &[&Module], on: u32) -> Result<()> {
         for m in modules {
-            self.be
-                .module_global_set_u32(m, "plow_batch_invariant", 1)?;
+            if self
+                .be
+                .module_global_u32(m, "plow_batch_invariant")?
+                .is_some()
+                && !self
+                    .be
+                    .module_global_set_u32(m, "plow_batch_invariant", on)?
+            {
+                return Err(RuntimeError::Rejected(
+                    "batch-invariant decode: setting plow_batch_invariant failed".into(),
+                ));
+            }
         }
         Ok(())
     }

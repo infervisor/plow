@@ -837,13 +837,17 @@ fn decode_attention_sites(insts: &[DevInst64]) -> Result<Vec<(usize, Option<usiz
                 .rev()
                 .find(|(f, _)| insts[*f].t[0] == d.t[1])
             {
-                if site.1.is_some() {
+                if site.1.is_some() || insts[site.0].t[1] != d.t[2] {
                     return Err(format!(
-                        "instruction {k}: a second merge of attention {}'s partials",
+                        "instruction {k}: not the one merge of attention {}'s partials",
                         site.0
                     ));
                 }
                 site.1 = Some(k);
+            } else {
+                return Err(format!(
+                    "instruction {k}: a merge with no attention producer"
+                ));
             }
         }
     }
@@ -1212,6 +1216,6 @@ mod row_field_tests {
         reference2.push(reference2[1]);
         assert!(pin_decode_splits(&reference2, &mut two_merges, big)
             .unwrap_err()
-            .contains("second merge"));
+            .contains("not the one merge"));
     }
 }

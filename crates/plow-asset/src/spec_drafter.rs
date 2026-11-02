@@ -15,7 +15,7 @@
 //! `target_packet_sha256`.
 use std::collections::BTreeMap;
 
-use packet::dev::{DevInst64, DevOp};
+use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -149,7 +149,10 @@ pub fn vetted_writes(op: DevOp, inst: &DevInst64) -> Option<&'static [usize]> {
         {
             &[0]
         }
-        DevOp::RmsNorm => &[0, 3, 4],
+        // The fused quant writes xq (t3) and its scale (t4) together.
+        DevOp::RmsNorm if (inst.t[3] == TENSOR_NONE16) == (inst.t[4] == TENSOR_NONE16) => {
+            &[0, 3, 4]
+        }
         // Folded prologues (`i[3] != 0`, or GemvGlu's norm-residual-norm form `fj[2] != 0`)
         // write their staging operands too: not vetted.
         DevOp::Gemv if inst.i[3] == 0 => &[0],
@@ -164,25 +167,30 @@ pub fn vetted_writes(op: DevOp, inst: &DevInst64) -> Option<&'static [usize]> {
 /// [`vetted_writes`]), from its own row and width fields; the runtime refuses an instruction
 /// whose extent passes the end of the tensor it names.
 pub fn write_extent(op: DevOp, inst: &DevInst64, slot: usize) -> Option<u64> {
+    // Every row count at least one (the kernels run a zero-row instruction as one row);
+    // `None` on overflow as for an unlisted slot.
     let i = |k: usize| u64::from(inst.i[k]);
     let rows = |k: usize| i(k).max(1);
-    Some(match (op, slot) {
-        (DevOp::Embed | DevOp::RowGather | DevOp::Gemv | DevOp::GemvGlu, 0) => i(0) * i(1) * 2,
+    let prod = |f: &[u64]| f.iter().try_fold(1u64, |a, &b| a.checked_mul(b));
+    match (op, slot) {
+        (DevOp::Embed | DevOp::RowGather | DevOp::Gemv | DevOp::GemvGlu, 0) => {
+            prod(&[rows(0), i(1), 2])
+        }
         // RmsNorm's i2 offsets the output row of all three destinations.
-        (DevOp::RmsNorm, 0) => (i(2) + i(0)) * i(1) * 2,
-        (DevOp::RmsNorm, 3) => (i(2) + i(0)) * i(1),
-        (DevOp::RmsNorm, 4) => (i(2) + i(0)) * 4,
-        (DevOp::NormResidualNorm, 0 | 1) => i(0) * i(1) * 2,
-        (DevOp::HeadNormRope, 0) => i(0) * i(1) * i(2) * 2,
-        (DevOp::Residual, 0) => i(0) * 2,
-        (DevOp::FlashDecodeFp8, 0) => i(0) * i(1) * i(5) * i(6) * 4,
-        (DevOp::FlashDecodeFp8, 1) => i(0) * i(1) * i(5) * 8,
-        (DevOp::FlashMerge, 0) => i(0) * i(1) * i(3) * 2,
+        (DevOp::RmsNorm, 0) => prod(&[i(2) + rows(0), i(1), 2]),
+        (DevOp::RmsNorm, 3) => prod(&[i(2) + rows(0), i(1)]),
+        (DevOp::RmsNorm, 4) => prod(&[i(2) + rows(0), 4]),
+        (DevOp::NormResidualNorm, 0 | 1) => prod(&[rows(0), i(1), 2]),
+        (DevOp::HeadNormRope, 0) => prod(&[rows(0), i(1), i(2), 2]),
+        (DevOp::Residual, 0) => prod(&[rows(0), 2]),
+        (DevOp::FlashDecodeFp8, 0) => prod(&[rows(0), i(1), i(5), i(6), 4]),
+        (DevOp::FlashDecodeFp8, 1) => prod(&[rows(0), i(1), i(5), 8]),
+        (DevOp::FlashMerge, 0) => prod(&[rows(0), i(1), i(3), 2]),
         // One (value, index) partial per block per row; the final pass one id per row.
-        (DevOp::Argmax, 0) => u64::from(inst.blocks) * rows(1) * 8,
-        (DevOp::ArgmaxFin, 0) => rows(1) * 4,
-        _ => return None,
-    })
+        (DevOp::Argmax, 0) => prod(&[u64::from(inst.blocks), rows(1), 8]),
+        (DevOp::ArgmaxFin, 0) => prod(&[rows(1), 4]),
+        _ => None,
+    }
 }
 
 /// What a target proves about itself. Built by the runtime from the loaded packet.

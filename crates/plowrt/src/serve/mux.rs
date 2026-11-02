@@ -8748,7 +8748,10 @@ fn gpu_spec_gate(
 ) -> std::result::Result<(), crate::obs::serving::SpecSkip> {
     use crate::obs::serving::SpecSkip;
     gpu_spec_caps(e, feeds, slots, limits.kmax, false, caps)?;
-    if feeds.len() >= limits.max_rows {
+    // A verify replaces the plain launch these slots would take; it is bit-equal only when that
+    // launch is one of the pinned rungs too.
+    let highest = feeds.iter().map(|f| f.0).max().unwrap_or(0);
+    if feeds.len() >= limits.max_rows || !e.spec_plain_invariant(highest) {
         return Err(SpecSkip::RowsOverLimit);
     }
     if caps.iter().all(|&c| c == 0) {

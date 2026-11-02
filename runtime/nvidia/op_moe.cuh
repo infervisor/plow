@@ -492,8 +492,9 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
  * router, f32 h2 staging, one dense GEMV arm from B=1); any other build keeps the flag a constant
  * 0 and the runtime refuses invariant decode on it. */
 #if PLOW_NV_GEMV_RB && !PLOW_MOE_ROUTER_WIDE && !PLOW_MOE_XN_BF16 && \
-    (!PLOW_NV_GEMV_MMA || PLOW_NV_GEMV_MMA_B1) && \
-    (!defined(PLOW_NV_FP8_DECODE_TC) || PLOW_NV_FP8_DECODE_TC <= 1)
+    (!PLOW_NV_GEMV_MMA || PLOW_NV_GEMV_MMA_B1) && !PLOW_NV_FP8_DECODE_MMA && \
+    !PLOW_NV_GEMV_M16_MMA && !PLOW_NV_GEMV_K8 && \
+    (!defined(PLOW_NV_FP8_DECODE_TC) || PLOW_NV_FP8_DECODE_TC == 1)
 extern "C" __device__ unsigned plow_batch_invariant = 0;
 #else
 #define plow_batch_invariant 0u

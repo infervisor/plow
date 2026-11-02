@@ -1502,6 +1502,10 @@ where
     if slots > ra.min(rb) {
         return Err(format!("{slots} slots select a rung above {}", ra.min(rb)).into());
     }
+    let (selectable, banded) = e.decode_rung_rows();
+    if banded || !(selectable.contains(&ra) && selectable.contains(&rb)) {
+        return Err(format!("the engine does not launch rungs {ra} and {rb} as rungs").into());
+    }
     if pa.insts.len() != pb.insts.len() {
         return Err("rung programs differ in length".into());
     }
@@ -1514,6 +1518,9 @@ where
         let d = &pa.insts[cap - 1];
         if pb.insts[cap - 1].op != d.op || pb.insts[cap - 1].t[0] != d.t[0] {
             return Err(format!("instruction {} differs between the rungs", cap - 1).into());
+        }
+        if d.t[0] == packet::dev::TENSOR_NONE16 {
+            continue;
         }
         let t = &blob.tensors[usize::from(d.t[0])];
         // Split partials are laid out by the split count, not by row.
