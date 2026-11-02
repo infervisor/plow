@@ -651,6 +651,21 @@ impl GpuEngine {
         let Some(a) = att else {
             return Ok(());
         };
+        // Every prefill bucket writes all its rows: a tail left fewer rows of context than the
+        // narrowest bucket cannot run after the prefix, while the cold prompt (chunked from 0)
+        // can. Serve such a prompt cold.
+        let room = self.max_ctx.saturating_sub(a.rows as usize);
+        let narrowest = self.prefill.iter().map(|p| p.t as usize).min();
+        if prompt.len() > a.rows as usize && narrowest.is_some_and(|t| t > room) {
+            kv.begin_seq(b);
+            tracing::debug!(
+                slot = b,
+                rows = a.rows,
+                room,
+                "vmm: prefix attach declined, tail too near the context limit"
+            );
+            return Ok(());
+        }
         let restored = (|| {
             // The slot's own blocks hold the prefix: map them, then gather every row.
             kv.ensure_rows(b, a.rows + 1)?;
