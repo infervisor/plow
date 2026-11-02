@@ -41,7 +41,10 @@
 #ifndef GM_NATIVE_OCP_QUANT
 #define GM_NATIVE_OCP_QUANT 1
 #endif
-#if GM_NATIVE_OCP_QUANT
+#if GM_NATIVE_OCP_QUANT && PLOW_GFX12
+/* gfx12 encodes OCP e4m3 natively (the gfx950 form). */
+#define PLOW_GM_FP8_PACK2(a, b) (__builtin_amdgcn_cvt_pk_fp8_f32((a), (b), 0u, false) & 0xffffu)
+#elif GM_NATIVE_OCP_QUANT
 #define PLOW_GM_FP8_PACK2(a, b)                                                             \
     (plow_fp8_mask_neg0(__builtin_amdgcn_cvt_pk_fp8_f32((a) * 0.5f, (b) * 0.5f, 0u, false)) \
      & 0xffffu)

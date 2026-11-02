@@ -124,6 +124,13 @@ const CDNA4: [MmaShape; 2] = [
     },
 ];
 
+/// RDNA4 (gfx1201) WMMA shape (bf16): `v_wmma_f32_16x16x16_bf16`.
+const RDNA4: [MmaShape; 1] = [MmaShape {
+    m: 16,
+    n: 16,
+    k: 16,
+}];
+
 /// Apple `simdgroup_matrix`: one cooperative 8x8x8 fp16/bf16 tile per simdgroup; the only
 /// matrix shape the ISA offers, so every tile is a multiple of 8 on each axis.
 const APPLE: &[MmaShape] = &[MmaShape { m: 8, n: 8, k: 8 }];
@@ -144,6 +151,7 @@ pub fn shapes_for(arch: Arch) -> &'static [MmaShape] {
         Arch::Blackwell => &BLACKWELL,
         Arch::CdnaV3 => &CDNA3,
         Arch::CdnaV4 => &CDNA4,
+        Arch::RdnaV4 => &RDNA4,
     }
 }
 

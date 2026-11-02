@@ -1122,10 +1122,14 @@ pub(super) fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
     // without its arms sailed through and completed with garbage (measured: a
     // PLOW_MOE_PF_PART16 blob ran on a pre-arm object with no complaint — the exact
     // silent-heap-overrun the check exists to refuse). A blob carries exactly one AMD key, so
-    // probing both is unambiguous.
-    Ok(["/backends/gfx942/requires", "/backends/gfx950/requires"]
-        .iter()
-        .find_map(|k| man.pointer(k))
+    // taking the one `gfx*` backend is unambiguous.
+    Ok(man
+        .get("backends")
+        .and_then(|b| b.as_object())
+        .and_then(|b| {
+            b.iter()
+                .find_map(|(k, v)| k.starts_with("gfx").then(|| v.get("requires")).flatten())
+        })
         .and_then(|r| r.as_array())
         .map(|a| {
             a.iter()

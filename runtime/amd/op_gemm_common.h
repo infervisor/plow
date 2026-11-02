@@ -1379,7 +1379,7 @@ __device__ void d_gemm_small_splitk(bf16* C, const bf16* A, const bf16* B, unsig
         }
         __syncthreads();
         if (!sk_last) continue;
-        asm volatile("buffer_inv" ::: "memory");
+        plow_cache_inv();
         __syncthreads();
         const unsigned tile = gm_remap<GM_SWZ, GM_WGM>(t, nt, tm, tn);
         const unsigned m0 = (tile / tn) * BM, n0 = (tile % tn) * BN;
@@ -3585,6 +3585,9 @@ __device__ __forceinline__ void gemv_rows_mfma(bf16* __restrict__ C_, const bf16
  * dependency map is unaffected, exactly as for `gemv_rows_rs`. ------------------------------- */
 #ifndef GV_MFMA4
 #define GV_MFMA4 0
+#endif
+#if GV_MFMA4 && PLOW_GFX12
+#error "GV_MFMA4 uses the 4x4 MFMA and ROW_BCAST DPP; gfx12 has neither"
 #endif
 /* Zero leaves the MFMA probe unrestricted. */
 #ifndef GV_MFMA4_MAXK

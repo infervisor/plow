@@ -5,7 +5,7 @@
 //! canonical name (e.g. `--gpu rtx6000pro` instead of
 //! `--gpu "RTX 6000 Pro Blackwell"`). Lookup is always case-insensitive.
 
-use crate::amd::{mi300, mi350};
+use crate::amd::{mi300, mi350, r9700};
 use crate::apple::m4;
 use crate::intel::xeon6;
 use crate::nvidia::{ada, blackwell, h100};
@@ -27,6 +27,7 @@ pub const ALL: &[&GpuSpec] = &[
     &mi300::MI325X,
     &mi350::MI350X,
     &mi350::MI355X,
+    &r9700::R9700,
     &m4::APPLE_M4,
     &m4::APPLE_M4_PRO,
     &m4::APPLE_M4_MAX,
@@ -67,6 +68,9 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("mi350x", "MI350X"),
     ("mi355", "MI355X"),
     ("mi355x", "MI355X"),
+    // AMD RDNA 4
+    ("r9700", "R9700"),
+    ("radeon-ai-pro-r9700", "R9700"),
     // Apple M4 family (canonical names match `MTLDevice.name`, so the runtime can look itself up)
     ("m4", "Apple M4"),
     ("m4pro", "Apple M4 Pro"),
@@ -327,5 +331,14 @@ mod tests {
         use crate::isa::IsaLevel;
         assert!(from_probe(IsaLevel::Gfx942, 303, Bytes::gib(192).0).is_none());
         assert!(from_probe(IsaLevel::Gfx950, 304, Bytes::gib(192).0).is_none());
+    }
+
+    // ROCr's HSA pool on an R9700 reports 33406976 KiB (31.86 GiB).
+    #[test]
+    fn a_probed_r9700_resolves() {
+        use crate::isa::IsaLevel;
+        let s = from_probe(IsaLevel::Gfx1201, 64, 33_406_976 * 1024).unwrap();
+        assert_eq!(s.name, "R9700");
+        assert_eq!(lookup("radeon-ai-pro-r9700").unwrap().name, "R9700");
     }
 }
