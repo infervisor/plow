@@ -6222,6 +6222,53 @@ fn trim_for_riders(
     measured.unwrap_or(wide || (bucket >= cost && joins))
 }
 
+/// Prompt rows to cut from a planned pack of `rows` so its `decode_rows` riders fit the rung
+/// that covers `rows` (0 to keep it): `trim_for_riders` on the pack the planner actually made.
+/// The tick's trim judges the rows before planning, and a request's remainder planned to fill a
+/// narrower rung exactly still spilled: Qwen3.8-27B FP8 ran 128 prompt rows + 1 rider in the
+/// 1024 rung (79 ms against 31 ms) 50 times in a 300 s prod-mix cell.
+#[cfg(feature = "cuda")]
+fn rider_cut(
+    rows: usize,
+    decode_rows: usize,
+    beyond: usize,
+    cover: impl Fn(usize) -> usize,
+    rung_ms: impl Fn(usize) -> Option<f64>,
+) -> usize {
+    let fit = cover(rows);
+    let cut = (rows + decode_rows).saturating_sub(fit);
+    let trim = cut > 0
+        && cut < rows
+        && trim_for_riders(
+            fit,
+            cover(rows + decode_rows),
+            decode_rows,
+            rows,
+            beyond,
+            rung_ms,
+        );
+    if trim {
+        cut
+    } else {
+        0
+    }
+}
+
+/// Cuts `rows` prompt rows off the back of a planned pack of `(slot, kv_row0, rows)` spans: a
+/// span cut to nothing leaves the launch. `rows` is below the pack's rows (`rider_cut`).
+#[cfg(feature = "cuda")]
+fn cut_pack_tail(pack: &mut Vec<(usize, usize, usize)>, mut rows: usize) {
+    while rows > 0 {
+        let Some(last) = pack.last_mut() else { return };
+        if last.2 > rows {
+            last.2 -= rows;
+            return;
+        }
+        rows -= last.2;
+        pack.pop();
+    }
+}
+
 /// Prompt rows one model may consume while holding its device turn, when there
 /// is no prefill object and the prompt is fed token by token. A bound on
 /// launches per turn rather than on a bucket's rows: ~256 decode-shaped
@@ -7229,7 +7276,7 @@ fn gpu_prefill_batched_pass(
             |_| u32::try_from(per_launch).ok(),
             |_| u32::MAX,
         );
-        let pack: Vec<_> = step
+        let mut pack: Vec<_> = step
             .launches
             .first()
             .map(|launch| launch.spans.as_slice())
@@ -7252,6 +7299,17 @@ fn gpu_prefill_batched_pass(
                 (len > 0).then_some((i, c0, len))
             })
             .collect();
+        if unified && decode_rows > 0 && !media_spans {
+            let rows: usize = pack.iter().map(|p| p.2).sum();
+            let cut = rider_cut(
+                rows,
+                decode_rows,
+                avail.saturating_sub(rows),
+                |r| e.pf_cover_rows(r),
+                |r| ride.rung_ms(e.pf_cover_rows(r)),
+            );
+            cut_pack_tail(&mut pack, cut);
+        }
         if pack.is_empty() {
             if !window.is_empty() {
                 admit_window(e, &mut window, false);
@@ -9943,6 +10001,44 @@ mod tests {
         assert!(super::trim_for_riders(128, 1024, 3, 128, 0, |r| (r
             >= 1024)
             .then_some(80.0)));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_planned_pack_leaves_its_riders_room_when_the_spill_costs_more() {
+        let ladder = [128, 1024, 4096, 8192];
+        let cover = |rows| crate::exec::gpu::cover_rung(ladder.iter().copied(), rows);
+        let ms = |r| match cover(r) {
+            128 => Some(31.0),
+            1024 => Some(80.0),
+            _ => None,
+        };
+        // 128 planned rows + 1 rider: one row waits for the next launch.
+        assert_eq!(super::rider_cut(128, 1, 0, cover, ms), 1);
+        assert_eq!(super::rider_cut(126, 3, 900, cover, ms), 1);
+        assert_eq!(super::rider_cut(100, 3, 0, cover, ms), 0, "the riders fit");
+        assert_eq!(
+            super::rider_cut(10, 200, 0, cover, ms),
+            0,
+            "a cut would empty the pack"
+        );
+        // A cheap spill rung keeps the pack whole.
+        let dense = [128, 256, 1024, 1088];
+        let dcover = |rows| crate::exec::gpu::cover_rung(dense.iter().copied(), rows);
+        let dms = |r| match dcover(r) {
+            128 => Some(16.0),
+            1024 => Some(31.1),
+            1088 => Some(32.6),
+            _ => None,
+        };
+        assert_eq!(super::rider_cut(1024, 3, 0, dcover, dms), 0);
+        // The cut walks back across spans.
+        let mut pack = vec![(0, 0, 126), (1, 0, 2)];
+        super::cut_pack_tail(&mut pack, 3);
+        assert_eq!(pack, vec![(0, 0, 125)]);
+        let mut pack = vec![(0, 0, 120), (1, 64, 8)];
+        super::cut_pack_tail(&mut pack, 1);
+        assert_eq!(pack, vec![(0, 0, 120), (1, 64, 7)]);
     }
 
     #[cfg(feature = "cuda")]
