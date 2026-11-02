@@ -117,9 +117,37 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "16"
 PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+# BF16 MoE prefill router prologue (norm, router logits, top-k, align) as MoE cuBLASLt glue
+# launches instead of one interpreter segment: block 4..5 per-layer prologue 95 -> 39 us at 128
+# rows, 108 -> 47 us at 512.
+PLOW_EMIT_MOE_PF_LT_ROUTE = "1"
 # Interpreter object flags the FP8 recipe already carries (packed narrow bodies, instruction
 # preload, router V8/V9, top-k V4): token digests unchanged, step -0.1..-0.27 ms at B1..32.
 NVCC_APPEND_FLAGS = "-DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1"
+
+[emit.rung_env.prefill.128]
+PLOW_EMIT_ATTN_LIBRARY = "0"
+PLOW_EMIT_ATTN_LIBRARY_UNSPLIT = "0"
+
+[emit.rung_env.prefill.256]
+PLOW_EMIT_ATTN_LIBRARY = "0"
+PLOW_EMIT_ATTN_LIBRARY_UNSPLIT = "0"
+
+[emit.rung_env.prefill.512]
+PLOW_EMIT_ATTN_LIBRARY = "0"
+PLOW_EMIT_ATTN_LIBRARY_UNSPLIT = "0"
+
+[emit.rung_env.prefill.1024]
+PLOW_EMIT_ATTN_LIBRARY = "0"
+PLOW_EMIT_ATTN_LIBRARY_UNSPLIT = "0"
+
+[emit.rung_env.prefill.1088]
+PLOW_EMIT_ATTN_LIBRARY = "0"
+PLOW_EMIT_ATTN_LIBRARY_UNSPLIT = "0"
+
+[emit.rung_env.prefill.1152]
+PLOW_EMIT_ATTN_LIBRARY = "0"
+PLOW_EMIT_ATTN_LIBRARY_UNSPLIT = "0"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -128,14 +156,20 @@ role_files = [
   "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
   "gen_sm90a_attn_pf_hd256_sliding.cubin",
+  "plow_fa4_hd512.aot",
 ]
 [objects.env]
+# Global (hd512) prefill attention on the >= 2048-row rungs through the library route (FA4 SM90
+# forward exported AOT, bf16 head-major pool read in place; docs/arch/28), pinned unsplit.
+PLOW_BUILD_FA4_HD512 = "1"
 PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding"
 PLOW_BUILD_FA_GQA2_PAIR = "1"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 
 [emit_roles.env]
+PLOW_EMIT_ATTN_LIBRARY = "1"
+PLOW_EMIT_ATTN_LIBRARY_UNSPLIT = "1"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
@@ -197,3 +231,13 @@ reference = "{env:G26_BF16_FP32_REF}"
 vllm_capture = "{env:G26_BF16_FP32_VLLM}"
 concurrency = 16
 timeout_s = 2400
+
+[rung_choices.PLOW_EMIT_ATTN_LIBRARY]
+# Library (FA4 hd512, unsplit) on the >= 2048-row prefill rungs; native role below 2048.
+label = "qualified"
+evidence = ["block 4..5 nv-block-ab 2026-11-02 (g26bf16-l2-attn 7d9aeff9f, binL2c): 2048 rows prior 0/4096/8192 2.947/3.773/4.718 -> 2.770/3.424/4.178 ms (-6.0/-9.3/-11.3%); 512 rows prior 0 +2.8% (stays native)"]
+
+[rung_choices.PLOW_EMIT_ATTN_LIBRARY_UNSPLIT]
+# Every library rung pinned unsplit: a row's bits depend only on its own request.
+label = "qualified"
+evidence = ["block 4..5 nv-block-ab 2026-11-02: forced splits=1 equals the vLLM split rule at 512/2048 rows (2.777 vs 2.778 ms at 2048 prior 0, 4.168 vs 4.171 at prior 8192)"]
