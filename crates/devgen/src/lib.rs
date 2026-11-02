@@ -10194,6 +10194,9 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_DSA_POOL_STASH",
     "PLOW_DOP_DSA_Q_QUANT",
     "PLOW_DOP_EMBED",
+    "PLOW_DOP_EMBED_FRAME_BF16",
+    "PLOW_DOP_EMBED_OVERLAY_BF16",
+    "PLOW_DOP_EMBED_POS_BF16",
     "PLOW_DOP_FLASH_DECODE",
     "PLOW_DOP_FLASH_DECODE_FP8",
     "PLOW_DOP_FLASH_GATHER_DECODE",
@@ -10229,6 +10232,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_WIDE_FP8",
     "PLOW_DOP_GEMM_WIDE_MXFP4",
     "PLOW_DOP_GEMV",
+    "PLOW_DOP_GEMV_ARGMAX",
     "PLOW_DOP_GEMV_F32",
     "PLOW_DOP_GEMV_FP8",
     "PLOW_DOP_GEMV_FP8_BLK",
@@ -10309,6 +10313,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_NORM_RESIDUAL",
     "PLOW_DOP_NORM_RESIDUAL_NORM",
     "PLOW_DOP_O_UV_FOLD",
+    "PLOW_DOP_PER_LAYER_INPUT",
     "PLOW_DOP_QUANT_FP8",
     "PLOW_DOP_QUANT_FP8_BLOCK128",
     "PLOW_DOP_QWEN_GATED_NORM",
@@ -11880,6 +11885,7 @@ fn emit_dense_gqa(
         &m,
         arch == "metal3" || target_is_cpu(&arch, &gpu) || (arch.is_empty() && gpu.is_empty()),
         arch.starts_with("sm_"),
+        amd,
     );
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
@@ -12250,15 +12256,17 @@ mod xalltoall_heads_tests;
 
 pub mod fp8_m1_role;
 
-/// Opcodes only the Metal interpreter (and the CPU golden tier) implement. Refused at emit for
-/// any other GPU target, so an E-series blob cannot reach a CUDA/HIP interpreter's
-/// `default: __trap()`.
-fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
+/// Refuse operations outside each backend's implemented subset.
+fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool, amd: bool) {
     if supported {
         return;
     }
     // The CUDA interpreter carries the embedding-overlay handoff (op 179) too.
-    let cuda_ok = |op: DevOp| cuda && matches!(op, DevOp::EmbedOverlayBf16 | DevOp::GluStrided);
+    // The AMD interpreter carries PerLayerInput and EmbedOverlayBf16.
+    let target_ok = |op: DevOp| {
+        (cuda && matches!(op, DevOp::EmbedOverlayBf16 | DevOp::GluStrided))
+            || (amd && matches!(op, DevOp::PerLayerInput | DevOp::EmbedOverlayBf16))
+    };
     const CPU_OR_METAL_ONLY: [DevOp; 5] = [
         DevOp::PerLayerInput,
         DevOp::GluStrided,
@@ -12268,7 +12276,7 @@ fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
     ];
     let bad: Vec<&'static str> = CPU_OR_METAL_ONLY
         .iter()
-        .filter(|op| !cuda_ok(**op))
+        .filter(|op| !target_ok(**op))
         .filter(|op| {
             m.progs
                 .iter()

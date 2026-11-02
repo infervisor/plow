@@ -155,18 +155,17 @@ fn gemm_f32_standard_decode_ladder_uses_one_numeric_path() {
     assert!(src.contains("PLOW_RUNTIME_ROWS(in->i[0]) > PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS"));
 }
 
-/// The gate refuses an opcode with no AMD arm. `GemvArgmax` is the real instance: it has no
-/// `case` in interp.hip, and `PLOW_FUSE_ARGMAX=1` emits it — a decode would have argmaxed over
-/// an untouched buffer and returned token 0 every step, with no fault anywhere.
+/// The gate refuses an opcode with no AMD arm. `SampleFishBf16` has no
+/// `case` in interp.hip.
 #[test]
 #[should_panic(expected = "gfx950_opcode_arm")]
 fn opcode_with_no_amd_arm_is_refused() {
     assert!(
-        !GFX950_DISPATCHED.contains(&DevOp::GemvArgmax.c_name()),
-        "if AMD ever gains a GEMV_ARGMAX arm this test should be re-pointed, not deleted"
+        !GFX950_DISPATCHED.contains(&DevOp::SampleFishBf16.c_name()),
+        "this test asserts refusal of an opcode without an AMD arm"
     );
     let i = packet::dev::DevInst {
-        op: DevOp::GemvArgmax as u16,
+        op: DevOp::SampleFishBf16 as u16,
         blocks: 1,
         ..Default::default()
     };
@@ -207,6 +206,31 @@ fn covered_opcodes_pass_and_nvidia_is_never_checked() {
         n_cu: 4,
         n_counter: 0,
         insts: vec![
+            packet::dev::DevInst {
+                op: DevOp::GemvArgmax as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            packet::dev::DevInst {
+                op: DevOp::PerLayerInput as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            packet::dev::DevInst {
+                op: DevOp::EmbedOverlayBf16 as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            packet::dev::DevInst {
+                op: DevOp::EmbedPosBf16 as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            packet::dev::DevInst {
+                op: DevOp::EmbedFrameBf16 as u16,
+                blocks: 1,
+                ..Default::default()
+            },
             packet::dev::DevInst {
                 op: DevOp::Gemv as u16,
                 blocks: 1,
@@ -255,6 +279,7 @@ fn covered_opcodes_pass_and_nvidia_is_never_checked() {
         gen: vec![],
     };
     check_gfx950_opcode_coverage(&m, true);
+    check_cpu_or_metal_opcode_coverage(&m, false, false, true);
     // The Gemma-MoE family has no AMD arm at all; on an NVIDIA target that must not be checked.
     let p2 = packet::devbuild::Program {
         hier_base: 0,

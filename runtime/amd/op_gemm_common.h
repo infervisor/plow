@@ -2844,23 +2844,8 @@ __device__ __forceinline__ void gemv_norm_lds(bf16* __restrict__ lds, const bf16
  *     the wide shapes (gv_per >= 14)  1.02-1.04x     lm_head 1.00x
  *
  * The tail loop keeps the half-at-a-time form for a ragged `n`; every K3 and Gemma projection has
- * K % 8 == 0 so it runs zero times there. */
-__device__ __forceinline__ void stage_x_lds(bf16* __restrict__ lds, const bf16* __restrict__ x_,
-                                            size_t n) {
-    const auto* const x = as_glob(x_);
-    size_t i0 = 0;
-    /* Wave-uniform, so one scalar branch per packet. The alignment holds for every projection this
-     * tree ships (K is a multiple of 64 and the tensor table is page-aligned), but `gemv_walk`
-     * offsets x by `m0 * K`, so a future K with K % 8 != 0 would silently fault a 16-B load. Fall
-     * back rather than fault. */
-    if (((((uintptr_t)x_) | ((uintptr_t)lds)) & 15u) == 0u) {
-        const size_t nv = n >> 3;
-        for (size_t i = threadIdx.x; i < nv; i += PLOW_THREADS)
-            *(bf16v8*)(lds + i * 8) = ld_glob8(x + i * 8);
-        i0 = nv << 3;
-    }
-    for (size_t i = i0 + threadIdx.x; i < n; i += PLOW_THREADS) lds[i] = x[i];
-}
+ * K % 8 == 0 so it runs zero times there.
+ * (stage_x_lds lives in amd_common.h) */
 
 
 /* XLDS selects where x lives, at COMPILE time, and that is the whole point of the split.
@@ -5735,6 +5720,64 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
 #endif
     if (PLOW_GEMV_WALK) __syncthreads();
   });
+}
+
+/* LM head GEMV with fused greedy-argmax epilogue (PLOW_DOP_GEMV_ARGMAX).
+ * M sequences: x is offset by a_row0, part is [M][nblk]; f0=cap. */
+__device__ __attribute__((noinline)) void d_gemv_argmax(
+    bf16* __restrict__ C_base, const bf16* __restrict__ x_base,
+    const bf16* __restrict__ W, unsigned long long* __restrict__ part_base,
+    unsigned M, unsigned N, unsigned K, float cap, unsigned slice, unsigned nblk,
+    bf16* __restrict__ lds) {
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned step = PLOW_WAVE * 8; /* 512 halves */
+    const unsigned nchunk = (K + step - 1) / step;
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned gv_n0 = slice * gv_per;
+    const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+    const float inv = cap > 0.0f ? 1.0f / cap : 0.0f;
+    constexpr int UN = 6;
+
+    for (unsigned m = 0; m < M; m++) {
+        const bf16* x_m = x_base + (size_t)m * K;
+        bf16* C_m = C_base + (size_t)m * N;
+        stage_x_lds(lds, x_m, K);
+        __syncthreads();
+
+        unsigned long long best = 0;
+        for (unsigned n = gv_n0 + wave; n < gv_n1; n += PLOW_WAVES) {
+            const __amdgpu_buffer_rsrc_t wr = PLOW_GV_RSRC(W + (size_t)n * K, K);
+            float acc = 0.0f;
+            for (unsigned c = 0; c < nchunk; c += UN) {
+                bf16v8 wv[UN];
+#pragma unroll
+                for (int u = 0; u < UN; u++) {
+                    wv[u] = gemv_load8(W + (size_t)n * K, wr, (c + (unsigned)u) * step + lane * 8, K);
+                }
+#pragma unroll
+                for (int u = 0; u < UN; u++) {
+                    const unsigned k = (c + (unsigned)u) * step + lane * 8;
+                    const bf16v8 xv = gemv_lds8(lds, k, K);
+                    acc = dot8(wv[u], xv, acc);
+                }
+            }
+            const float t = wave_sum(acc);
+            const bf16 lg = f2bf(t);
+            const bf16 sc = cap > 0.0f ? f2bf(cap * tanhf(bf2f(lg) * inv)) : lg;
+            if (lane == 0) {
+                st_act1(&C_m[n], sc);
+                const unsigned long long key = amax_pack(sc, n);
+                best = key > best ? key : best;
+            }
+        }
+        __syncthreads();
+        best = block_max_u64(best, (unsigned long long*)lds);
+        if (threadIdx.x == 0) {
+            st_act<unsigned long long>(&part_base[(size_t)m * nblk + slice], best);
+        }
+        __syncthreads();
+    }
 }
 
 /* fp32-OUTPUT GEMV — a small, separate, correctness-first op. NOT a variant of `d_gemv`/

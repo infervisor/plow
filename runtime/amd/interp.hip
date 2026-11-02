@@ -392,6 +392,13 @@ extern "C" __device__ unsigned plow_packed_prefill_abi_1 = 1;
  * packet-scalar kernel is exactly the silent wrong answer the contract exists to prevent. */
 extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
 extern "C" __device__ unsigned plow_row_gather_1 = 1;
+extern "C" __device__ unsigned plow_gemv_argmax_1 = 1;
+extern "C" __device__ unsigned plow_per_layer_input_1 = 1;
+extern "C" __device__ unsigned plow_embed_overlay_bf16_1 = 1;
+extern "C" __device__ unsigned plow_embed_pos_bf16_1 = 1;
+#if !defined(PLOW_HAS_EMBED_FRAME_BF16) || PLOW_HAS_EMBED_FRAME_BF16
+extern "C" __device__ unsigned plow_embed_frame_bf16_1 = 1;
+#endif
 #if PLOW_PACKED_PREFILL_DENSE_CONSUMERS
 extern "C" __device__ unsigned plow_packed_prefill_dense_consumers_1 = 1;
 #endif
@@ -2897,6 +2904,31 @@ __device__ __forceinline__ void exec_gemv(CInst in, CTens T,
            (int)in->i[3], in->i[3] >= 3u ? in->fj[1].f : in->fj[0].f, slice, nblk, lds);
 #undef TEN
 }
+__device__ __forceinline__ void exec_gemv_argmax(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                 bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    const unsigned M = in->i[0] ? in->i[0] : 1u;
+    const unsigned N = in->i[1];
+    const unsigned K = in->i[2];
+    if (K > PLOW_GM_ARENA) { __builtin_trap(); return; }
+    const float cap = in->fj[0].f;
+    const bf16* x_base = (const bf16*)TEN(1) + (size_t)in->i[4] * K;
+    bf16* C_base = (bf16*)TEN(0);
+    const bf16* W = (const bf16*)TEN(2);
+    unsigned long long* part_base = (unsigned long long*)TEN(3);
+    d_gemv_argmax(C_base, x_base, W, part_base, M, N, K, cap, slice, nblk, lds);
+#undef TEN
+}
+__device__ __forceinline__ void exec_per_layer_input(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                     unsigned rows, bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    d_per_layer_input((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                      (const bf16*)TEN(3), (const bf16*)TEN(4),
+                      (bf16*)TEN(5), (const bf16*)TEN(6),
+                      rows, in->i[1], in->i[2], in->i[3], in->i[4],
+                      in->fj[0].f, in->fj[1].f, slice, nblk, lds, PLOW_GM_ARENA);
+#undef TEN
+}
 #if PLOW_FP8
 /* t0=C t1=x t2=W(fp8) t5=w_scale(f32[N])   i0=M i1=N i2=K i4=a_row0
  *
@@ -4427,12 +4459,40 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     in->fj[0].f, slice, nblk);
             break;
 #endif
+        case PLOW_DOP_EMBED_OVERLAY_BF16:
+            d_embed_overlay((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
+                            (const float*)TEN(3), (const unsigned*)TEN(4),
+                            PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3],
+                            slice, nblk);
+            break;
+        case PLOW_DOP_EMBED_POS_BF16:
+            d_embed_pos((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
+                        (const bf16*)TEN(3), (const unsigned*)TEN(4), (const unsigned*)TEN(5),
+                        PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3],
+                        slice, nblk);
+            break;
+#if !defined(PLOW_HAS_EMBED_FRAME_BF16) || PLOW_HAS_EMBED_FRAME_BF16
+        case PLOW_DOP_EMBED_FRAME_BF16:
+            d_embed_frame((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
+                          (const bf16*)TEN(3), (const unsigned*)TEN(4),
+                          (in->i[7] & 2u) ? (const float*)TEN(5) : nullptr,
+                          PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3],
+                          in->i[4], in->i[5], in->i[6], in->i[7],
+                          in->fj[0].f, in->fj[1].f, slice, nblk, sm->part);
+            break;
+#endif
         /* Terminal row selection for the unified token batch. Always dispatched: the arm is
          * a bounds-checked copy with no resource cost worth pruning, and a pruned arm here is
          * indistinguishable at runtime from a gather that silently wrote nothing. */
         case PLOW_DOP_ROW_GATHER:
             d_row_gather((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
                          PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
+            break;
+        case PLOW_DOP_GEMV_ARGMAX:
+            exec_gemv_argmax(in, T, slice, nblk, sm->gm);
+            break;
+        case PLOW_DOP_PER_LAYER_INPUT:
+            exec_per_layer_input(in, T, slice, nblk, PLOW_RUNTIME_ROWS(in->i[0]), sm->gm);
             break;
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_SOFTCAP
         case PLOW_DOP_SOFTCAP:
