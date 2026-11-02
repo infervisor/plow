@@ -16,7 +16,7 @@ use std::time::Instant;
 use crate::obs::Metrics;
 use crate::serve::dp::{DpSet, MAX_DP};
 use crate::serve::mux::{IngressGuard, Job, JobOpts, ModelMux, SubmitError};
-use crate::serve::stream::{self, StreamChunk};
+use crate::serve::stream::{self, FinishReason, StreamChunk};
 use crate::serve::AppState;
 use crate::RuntimeError;
 
@@ -65,8 +65,42 @@ pub struct KvImport {
     /// rank's e2e and SLO count from them.
     pub arrived: Instant,
     pub first: Instant,
+    pub outcome: Outcome,
     /// Prompt rows the prefill rank served from its prefix cache (`usage.cached_tokens`).
     pub cached_tokens: usize,
+}
+
+/// A P/D request's terminal outcome until its decode leg owns it (that leg's telemetry, or the
+/// decode rank's refusal, settles it). The prefill leg counts none of its own; dropped unsettled —
+/// a cancellation, a failed prefill, a job never seated — it counts an abort on the prefill rank.
+pub struct Outcome {
+    metrics: Arc<Metrics>,
+    arrived: Instant,
+    open: bool,
+}
+
+impl Outcome {
+    pub fn settle(&mut self) {
+        self.open = false;
+    }
+}
+
+impl Drop for Outcome {
+    fn drop(&mut self) {
+        if self.open {
+            let m = &self.metrics.serving;
+            Metrics::inc(&m.aborted);
+            Metrics::inc(&m.aborted_before_first);
+            m.aborted_elapsed.duration(self.arrived.elapsed());
+        }
+    }
+}
+
+/// The decode leg of `job` (if it is one) has met its outcome on the decode rank.
+pub(crate) fn settle_import(job: &mut Job) {
+    if let Some(i) = job.opts.import.as_mut() {
+        i.outcome.settle();
+    }
 }
 
 /// `--pd model=P/D`: the DP ranks of each pool, as bit masks over the model's ranks.
@@ -185,39 +219,26 @@ pub(crate) fn submit(
         });
     }
     let set = state.dp_set(&set.model).map(Arc::clone);
-    let metrics = Arc::clone(mux.metrics());
+    let mut outcome = Outcome {
+        metrics: Arc::clone(mux.metrics()),
+        arrived,
+        open: true,
+    };
     tokio::spawn(async move {
-        // Once the prefill leg finished, the request's outcome is this task's to count until the
-        // decode rank seats it: a failed handoff is a rejection, a client that left an abort.
-        let fail = |job: &Job, msg: String, done: bool| {
-            if done {
-                Metrics::inc(&metrics.rejected);
-            }
+        let fail = |job: &Job, outcome: &mut Outcome, msg: String| {
+            outcome.settle();
+            Metrics::inc(&outcome.metrics.rejected);
             let _ = job
                 .respond
                 .try_send(StreamChunk::Err(RuntimeError::Unavailable(msg)));
         };
-        let left = || {
-            Metrics::inc(&metrics.serving.aborted);
-            Metrics::inc(&metrics.serving.aborted_before_first);
-            metrics.serving.aborted_elapsed.duration(arrived.elapsed());
-        };
         // A client that leaves stops the handoff: dropping the prefill stream ends that job, and
-        // its dispatcher skips an export nobody waits for.
-        let (mut first, mut cached_tokens, mut done) = (None, 0, false);
+        // its dispatcher skips an export nobody waits for. `outcome` counts the abort.
+        let (mut first, mut cached_tokens) = (None, 0);
         loop {
             let chunk = tokio::select! {
                 c = prx.recv() => c,
-                _ = job.respond.closed() => {
-                    // A prefill leg that already finished counted no abort of its own.
-                    while let Ok(c) = prx.try_recv() {
-                        done |= matches!(c, StreamChunk::Done { .. });
-                    }
-                    if done {
-                        left();
-                    }
-                    return;
-                }
+                _ = job.respond.closed() => return,
             };
             match chunk {
                 Some(StreamChunk::Token { id, .. })
@@ -225,10 +246,21 @@ pub(crate) fn submit(
                 {
                     first = Some((id, Instant::now()))
                 }
-                Some(StreamChunk::Done { usage, .. }) => {
-                    done = true;
-                    cached_tokens = usage.cached_tokens
+                Some(StreamChunk::Done {
+                    reason: FinishReason::Preempted,
+                    executed,
+                    usage,
+                }) => {
+                    outcome.settle();
+                    Metrics::inc(&outcome.metrics.serving.preempted);
+                    let _ = job.respond.try_send(StreamChunk::Done {
+                        executed,
+                        reason: FinishReason::Preempted,
+                        usage,
+                    });
+                    return;
                 }
+                Some(StreamChunk::Done { usage, .. }) => cached_tokens = usage.cached_tokens,
                 Some(StreamChunk::Err(err)) => {
                     let _ = job.respond.try_send(StreamChunk::Err(err));
                     return;
@@ -239,34 +271,35 @@ pub(crate) fn submit(
         }
         let image = tokio::select! {
             i = image => i,
-            _ = job.respond.closed() => return if done { left() },
+            _ = job.respond.closed() => return,
         };
         let image = match (first, image) {
             (Some(_), Ok(Ok(image))) => image,
-            (None, _) => return fail(&job, "P/D: the prefill rank produced no token".into(), done),
-            (_, Ok(Err(err))) => return fail(&job, format!("P/D: KV export failed: {err}"), done),
+            (None, _) => {
+                let msg = "P/D: the prefill rank produced no token".into();
+                return fail(&job, &mut outcome, msg);
+            }
+            (_, Ok(Err(err))) => {
+                return fail(&job, &mut outcome, format!("P/D: KV export failed: {err}"))
+            }
             (_, Err(_)) => {
-                return fail(
-                    &job,
-                    "P/D: the prefill rank dropped the KV image".into(),
-                    done,
-                )
+                let msg = "P/D: the prefill rank dropped the KV image".into();
+                return fail(&job, &mut outcome, msg);
             }
         };
         if job.respond.is_closed() {
-            return if done {
-                left()
-            };
+            return;
         }
         let Some(set) = set else {
-            return fail(&job, "P/D: the model's DP set is gone".into(), done);
+            return fail(&job, &mut outcome, "P/D: the model's DP set is gone".into());
         };
         let sampled = job.gen.params.samples();
         let Some(routed) = set.route_decode(&cfg, sampled) else {
-            return fail(&job, "P/D: no decode rank is up".into(), done);
+            return fail(&job, &mut outcome, "P/D: no decode rank is up".into());
         };
         let Some((_, mux)) = decoders.iter().find(|(r, _)| *r == routed.rank) else {
-            return fail(&job, "P/D: the decode rank has no dispatcher".into(), done);
+            let msg = "P/D: the decode rank has no dispatcher".into();
+            return fail(&job, &mut outcome, msg);
         };
         let (token, first) = first.expect("matched Some");
         job.opts.import = Some(Box::new(KvImport {
@@ -275,12 +308,14 @@ pub(crate) fn submit(
             arrived,
             first,
             cached_tokens,
+            outcome,
         }));
         // The decode queue's clock starts now; `job.arrived` keeps the request's own.
-        if let Err(SubmitError::Full(job) | SubmitError::Closed(job)) =
+        if let Err(SubmitError::Full(mut job) | SubmitError::Closed(mut job)) =
             mux.submit_arrived(job, Instant::now(), None)
         {
             // The decode rank counted its refusal.
+            settle_import(&mut job);
             let _ = job
                 .respond
                 .try_send(StreamChunk::Err(RuntimeError::Unavailable(
@@ -321,6 +356,24 @@ mod tests {
             assert!(parse_pd(&[bad.into()]).is_err(), "{bad}");
         }
         assert!(parse_pd(&["m=0/1".into(), "m=1/0".into()]).is_err());
+    }
+
+    #[test]
+    fn an_unsettled_outcome_is_one_abort() {
+        let m = Arc::new(Metrics::default());
+        let open = |m: &Arc<Metrics>| Outcome {
+            metrics: Arc::clone(m),
+            arrived: Instant::now(),
+            open: true,
+        };
+        drop(open(&m));
+        let mut settled = open(&m);
+        settled.settle();
+        drop(settled);
+        assert_eq!(
+            m.serving.aborted.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

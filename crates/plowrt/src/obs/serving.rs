@@ -1295,7 +1295,7 @@ impl ServingMetrics {
 
 /// A request's part in a prefill/decode split (`serve::pd`). The request counts once: its prefill
 /// rank records the time to first token and the prompt, its decode rank the generated tokens and
-/// the completion. Neither leg runs while the other does, so each counts as running in turn.
+/// the completion, and `serve::pd::Outcome` any end before the decode leg is seated. Neither leg runs while the other does, so each counts as running in turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Leg {
     #[default]
@@ -1394,11 +1394,12 @@ impl RequestMetrics {
         self.finished = true;
         let m = &self.metrics.serving;
         use crate::serve::stream::FinishReason;
-        if matches!(reason, FinishReason::Preempted) {
-            m.preempted.fetch_add(1, Relaxed);
+        // A prefill leg's outcome is its request's (`serve::pd::Outcome`).
+        if self.leg == Leg::Prefill {
             return;
         }
-        if self.leg == Leg::Prefill {
+        if matches!(reason, FinishReason::Preempted) {
+            m.preempted.fetch_add(1, Relaxed);
             return;
         }
         if matches!(reason, FinishReason::ReplyCap) {
@@ -1450,7 +1451,7 @@ impl RequestMetrics {
 impl Drop for RequestMetrics {
     fn drop(&mut self) {
         self.metrics.serving.running.fetch_sub(1, Relaxed);
-        if !self.finished {
+        if !self.finished && self.leg != Leg::Prefill {
             let m = &self.metrics.serving;
             m.aborted.fetch_add(1, Relaxed);
             if self.first.is_none() {

@@ -1454,9 +1454,10 @@ fn spawn_scoped(
                 turn.release();
                 preempt_slots(&mut slots, &arena).await;
                 retention.table.clear();
-                while let Some((job, _)) = waiting.pop_front() {
+                while let Some((mut job, _)) = waiting.pop_front() {
                     metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
                     Metrics::inc(&metrics.rejected);
+                    crate::serve::pd::settle_import(&mut job);
                     let _ = job
                         .respond
                         .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
@@ -1536,8 +1537,9 @@ fn spawn_scoped(
                         MuxMsg::Drain(done) => {
                             let _ = done.send(());
                         }
-                        MuxMsg::Job(job, _) => {
+                        MuxMsg::Job(mut job, _) => {
                             Metrics::inc(&metrics.rejected);
+                            crate::serve::pd::settle_import(&mut job);
                             let _ = job.respond.try_send(StreamChunk::Err(
                                 crate::RuntimeError::Rejected(
                                     "model preempted for an S1 switch — retry".into(),
@@ -2837,7 +2839,7 @@ fn admit_into(
 fn admit_session(
     slots: &mut [Option<Slot>],
     limit: usize,
-    job: Job,
+    mut job: Job,
     arrived: Instant,
     arena: Option<&SharedKvState>,
     metrics: &Arc<Metrics>,
@@ -2978,6 +2980,7 @@ fn admit_session(
             // both end as a 429, but shedding is the controller dropping live work because
             // predicted wait passed the SLO, while these are arrival meeting a hard limit.
             Metrics::inc(&metrics.rejected);
+            crate::serve::pd::settle_import(&mut job);
             let _ = job.respond.try_send(StreamChunk::Err(err));
             return None;
         }
@@ -2988,6 +2991,7 @@ fn admit_session(
             Ok(h) => Some(h),
             Err(e) => {
                 Metrics::inc(&metrics.rejected);
+                crate::serve::pd::settle_import(&mut job);
                 tracing::warn!(error = %e, seq_upper, "mux: kv arena OOM — request shed");
                 let _ = job
                     .respond
@@ -3002,9 +3006,12 @@ fn admit_session(
     };
 
     // A P/D decode leg reaches this queue at the handoff; its request arrived with the prefill.
-    let (leg, arrived) = match (&job.opts.export, &job.opts.import) {
+    let (leg, arrived) = match (&job.opts.export, &mut job.opts.import) {
         (Some(_), _) => (Leg::Prefill, arrived),
-        (_, Some(i)) => (Leg::Decode { first: i.first }, i.arrived),
+        (_, Some(i)) => {
+            i.outcome.settle();
+            (Leg::Decode { first: i.first }, i.arrived)
+        }
         _ => (Leg::Whole, arrived),
     };
     let telemetry = Some(RequestMetrics::leg(
