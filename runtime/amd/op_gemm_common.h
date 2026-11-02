@@ -3184,7 +3184,7 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
 #ifndef GV_RS_WIDE_UN
 #define GV_RS_WIDE_UN 6
 #endif
-template <int MM, bool XLDS, int UN, int R>
+template <int MM, bool XLDS, int UN, int R, bool TAIL = false>
 __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* __restrict__ x_,
                                             const bf16* __restrict__ W_, unsigned M, unsigned N,
                                             unsigned K, unsigned n, unsigned lane,
@@ -3197,7 +3197,7 @@ __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* _
     auto xv8 = [&](unsigned m, unsigned kk) -> bf16v8 {
         const size_t xo = (size_t)m * K + kk;
         if constexpr (XLDS)
-            return ld_lds8(lds + xo);
+            return TAIL ? gemv_lds8(lds + (size_t)m * K, kk, K) : ld_lds8(lds + xo);
         else
             return ld_glob8(x + xo);
     };
@@ -3217,8 +3217,14 @@ __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* _
 #pragma unroll
         for (int r = 0; r < R; r++)
 #pragma unroll
-            for (int u = 0; u < UN; u++)
-                wv[r][u] = buf_ld8(wr[r], ((c + (unsigned)u) * step + lane * 8) * 2u);
+            for (int u = 0; u < UN; u++) {
+                const unsigned k = (c + (unsigned)u) * step + lane * 8;
+                if constexpr (TAIL)
+                    wv[r][u] = gemv_load8(W_ + (size_t)(n + (unsigned)r * PLOW_WAVES) * K,
+                                        wr[r], k, K);
+                else
+                    wv[r][u] = buf_ld8(wr[r], k * 2u);
+            }
 #pragma unroll
         for (int u = 0; u < UN; u++) {
             const unsigned k = (c + (unsigned)u) * step + lane * 8;
@@ -5731,8 +5737,6 @@ __device__ __attribute__((noinline)) void d_gemv_argmax(
     bf16* __restrict__ lds) {
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave = threadIdx.x >> 6;
-    const unsigned step = PLOW_WAVE * 8; /* 512 halves */
-    const unsigned nchunk = (K + step - 1) / step;
     const unsigned gv_per = (N + nblk - 1) / nblk;
     const unsigned gv_n0 = slice * gv_per;
     const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
@@ -5747,25 +5751,12 @@ __device__ __attribute__((noinline)) void d_gemv_argmax(
 
         unsigned long long best = 0;
         for (unsigned n = gv_n0 + wave; n < gv_n1; n += PLOW_WAVES) {
-            const __amdgpu_buffer_rsrc_t wr = PLOW_GV_RSRC(W + (size_t)n * K, K);
-            float acc = 0.0f;
-            for (unsigned c = 0; c < nchunk; c += UN) {
-                bf16v8 wv[UN];
-#pragma unroll
-                for (int u = 0; u < UN; u++) {
-                    wv[u] = gemv_load8(W + (size_t)n * K, wr, (c + (unsigned)u) * step + lane * 8, K);
-                }
-#pragma unroll
-                for (int u = 0; u < UN; u++) {
-                    const unsigned k = (c + (unsigned)u) * step + lane * 8;
-                    const bf16v8 xv = gemv_lds8(lds, k, K);
-                    acc = dot8(wv[u], xv, acc);
-                }
-            }
-            const float t = wave_sum(acc);
-            const bf16 lg = f2bf(t);
-            const bf16 sc = cap > 0.0f ? f2bf(cap * tanhf(bf2f(lg) * inv)) : lg;
+            /* Share GEMV's chunk sums, wave reduction and bf16 store rounding.
+             * TAIL only guards ragged-K loads; it does not change the arithmetic. */
+            gemv_rows_r<1, true, UN, 1, true>(C_m, x_m, W, 1u, N, K, n, lane, lds);
             if (lane == 0) {
+                const bf16 lg = C_m[n];
+                const bf16 sc = cap > 0.0f ? f2bf(cap * tanhf(bf2f(lg) * inv)) : lg;
                 st_act1(&C_m[n], sc);
                 const unsigned long long key = amax_pack(sc, n);
                 best = key > best ? key : best;

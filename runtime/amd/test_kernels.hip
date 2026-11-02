@@ -750,6 +750,27 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemv_
     d_gemv_argmax(C, x, W, part, M, N, K, cap, blockIdx.x, gridDim.x, lds);
 }
 
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemv_unfused_test(
+    bf16* C, const bf16* x, const bf16* W, unsigned M, unsigned N, unsigned K) {
+    __shared__ __align__(16) bf16 lds[GM_LDS_HALVES];
+    for (unsigned m = 0; m < M; m++) {
+        d_gemv(C + (size_t)m * N, x + (size_t)m * K, W, nullptr, nullptr,
+               1u, N, K, 0, 0.0f, blockIdx.x, gridDim.x, lds);
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void argmax_test(
+    unsigned long long* part, const bf16* x, unsigned N, unsigned M) {
+    __shared__ unsigned long long lds[PLOW_WAVES];
+    d_argmax(part, x, N, M, blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void argmax_fin_test(
+    int* ids, const unsigned long long* part, unsigned nparts, unsigned M) {
+    d_argmax_fin(ids, part, nparts, M, blockIdx.x);
+}
+
 /* ACTIVATION QUANT — the w8a8 prefill's activation half, and the piece the GEMM_FP8_VARIANT
  * kernels above cannot test: they take a ready-made ascale, so nothing exercised the per-row
  * absmax/round path that produces it. (The GEMM itself is already covered by gemm_fp8_c0, whose
