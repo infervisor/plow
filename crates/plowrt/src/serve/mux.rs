@@ -3240,7 +3240,10 @@ fn run_one_tick(
     steps: u32,
     // `--multi-step` itself, kept apart from `steps` because `steps == 1` is ambiguous: it is
     // both "multi-step is off" and "`MultiStep::for_batch` collapsed at this batch size".
-    #[cfg_attr(not(any(feature = "hsa", feature = "cpu")), allow(unused_variables))]
+    #[cfg_attr(
+        not(any(feature = "hsa", feature = "cpu", feature = "cuda")),
+        allow(unused_variables)
+    )]
     multi_step: bool,
     #[cfg_attr(
         not(any(feature = "cuda", feature = "hsa", feature = "cpu")),
@@ -4393,7 +4396,7 @@ fn run_one_tick(
         // Single-sequence engines (gfx950, CPU) share one tick body through
         // `SeqEngine`; the packed/multistep branches are AMD-only and the CPU
         // engine declines them (`None`), falling to whole-prompt prefill + step.
-        #[cfg(any(feature = "hsa", feature = "cpu"))]
+        #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
         if let Some(e) = guard.seq_engine_mut() {
             e.bind_engine_thread();
             let stop = Arc::clone(e.stop_ids());
@@ -6227,7 +6230,7 @@ fn gpu_prefill_should_yield(has_feeds: bool, defer_decode: bool, slot: Option<&S
     has_feeds || (!defer_decode && slot.is_some_and(|s| s.step > 0 && !s.respond.is_closed()))
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -> u32 {
     if !has_decode || defer_decode || interleave == 0 {
         u32::MAX
@@ -6236,7 +6239,7 @@ fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -
     }
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PfHold {
     Off,
@@ -6251,7 +6254,7 @@ enum PfHold {
 /// quarters of `rows` are pending (a pack that fills most of a `rows`-wide rung, with room left
 /// for the decode riders) or the oldest has waited `ms`; the release tick may then pack `rows`.
 /// A prompt already started (chunks run or prefix rows resumed) is never held.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_pf_hold(
     spec: Option<(u32, f64, usize)>,
     decode_rows: usize,
@@ -6273,7 +6276,7 @@ fn amd_pf_hold(
     }
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
     enabled && prefill_remains
 }
@@ -6311,7 +6314,7 @@ fn multistep_requested(remaining: usize, scheduler_steps: usize, configured: usi
 ///
 /// What remains are the bounds that mean something: the client's own remaining output, the
 /// configured knob, and (applied downstream by `decode_quantum`) `DEFERRED_TOKEN_MAX_STEPS`.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_multistep_requested(remaining: usize, enabled: bool, configured: usize) -> usize {
     if !enabled {
         return 1;
@@ -6319,7 +6322,7 @@ fn amd_multistep_requested(remaining: usize, enabled: bool, configured: usize) -
     remaining.min(configured.max(1))
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_prefill_pick(
     candidates: impl IntoIterator<Item = (usize, Instant)>,
     fair: bool,
@@ -6342,7 +6345,7 @@ fn amd_prefill_pick(
 
 /// The step plan under `PLOW_TBT_SLO_MS` / `PLOW_TTFT_SLO_MS` (`crate::sched::slo`): isolated
 /// launches only, each chunk sized in milliseconds against the online tick cost model.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_slo_plan(
     e: &dyn crate::serve::engine::SeqEngine,
     slots: &[Option<Slot>],
@@ -6440,7 +6443,7 @@ fn amd_slo_plan(
 /// Members of one token-batch body from an ordered candidate pool: every candidate whose whole
 /// next chunk fits what is left of `capacity`, in pool order, none of them cut. A chunk that
 /// does not fit is skipped, not sliced — the planner's whole-span rule.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_token_batch_pack(candidates: &[(usize, Instant, u32)], capacity: u32) -> Vec<(usize, u32)> {
     let mut budget = capacity;
     let mut selected = Vec::new();
@@ -6453,7 +6456,7 @@ fn amd_token_batch_pack(candidates: &[(usize, Instant, u32)], capacity: u32) -> 
     selected
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_mixed_prefill_pack(
     mut candidates: Vec<(usize, Instant, u32)>,
     mut budget: u32,
@@ -6491,7 +6494,7 @@ fn amd_mixed_prefill_pack(
 /// All members use the first selected span's compiled program. Rows are packed
 /// densely under `row_budget`; KV and recurrent coordinates remain request-local.
 /// Invalid descriptors are excluded so the caller can retain the isolated path.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_prefill_pack(
     candidates: impl IntoIterator<Item = packet::dev::PrefillSpan>,
     row_budget: u32,
@@ -6517,7 +6520,7 @@ fn amd_prefill_pack(
     pack.spans().to_vec()
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_packed_frontier_updates(
     members: impl IntoIterator<Item = usize>,
     mut frontier: impl FnMut(usize) -> Option<usize>,
@@ -6531,7 +6534,7 @@ fn amd_packed_frontier_updates(
 /// Slots a failed packed launch terminates: its prefill members and every decode feed offered
 /// to ride it, since the launch may have advanced a rider's KV and recurrent state before its
 /// position or sampled token reached the host.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_failed_pack_slots(
     members: impl IntoIterator<Item = usize>,
     feeds: &[(usize, u32)],
@@ -6542,7 +6545,7 @@ fn amd_failed_pack_slots(
         .collect()
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn rejected_pack_slot(reason: &str) -> Option<usize> {
     let (_, after) = reason.split_once("slot ")?;
     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -8179,7 +8182,7 @@ fn gpu_finish_token(
 
 /// OpenAI logprobs for a single-sequence engine that exposes its logits to the host (CPU): only
 /// rows that asked for them pay the vocab read. The served token stays the engine's argmax.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn seq_host_logprobs(
     e: &dyn super::engine::SeqEngine,
     i: usize,
@@ -9170,7 +9173,7 @@ fn incremental_delta(
     })
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn set_cached(slot: &mut Slot, rows: usize) {
     crate::obs::tick::trace_hit(rows.saturating_sub(slot.cached_tokens));
     slot.cached_tokens = rows;
@@ -11961,7 +11964,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn amd_mixed_admission_obeys_rotation_age_and_total_prefill_budget() {
         let now = Instant::now();
@@ -11981,7 +11984,7 @@ mod tests {
         assert!(amd_mixed_prefill_pack(candidates, 0, true, 0, 4).is_empty());
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn amd_token_batch_pack_takes_whole_chunks_in_pool_order_and_never_cuts() {
         let now = Instant::now();
@@ -12006,7 +12009,7 @@ mod tests {
         assert!(amd_token_batch_pack(&[], 4096).is_empty());
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn pf_hold_waits_for_rows_or_age_and_only_under_decode() {
         use super::{amd_pf_hold, PfHold};
@@ -12046,7 +12049,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn amd_prefill_scheduler_controls_are_bounded() {
         assert_eq!(amd_prefill_tick_cap(false, false, 2048), u32::MAX);

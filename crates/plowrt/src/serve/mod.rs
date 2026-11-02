@@ -7,6 +7,8 @@ pub mod chat;
 pub mod completion;
 pub mod config;
 pub mod cosched;
+#[cfg(feature = "cuda")]
+pub mod cuda_group;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
 pub mod deadlines;
@@ -37,7 +39,7 @@ pub mod portable;
 pub mod reasoning;
 pub mod reply_guard;
 pub mod session;
-#[cfg(all(test, any(feature = "hsa", feature = "cpu")))]
+#[cfg(all(test, any(feature = "hsa", feature = "cpu", feature = "cuda")))]
 mod step_lowering_tests;
 pub mod stream;
 pub mod template;
@@ -579,6 +581,8 @@ pub struct AppState {
     /// slug -> whether its backend applies the request's sampling parameters.
     /// Captured at install for the same reason as `max_ctx`.
     sampling_honoured: RwLock<FxHashMap<String, bool>>,
+    /// Slugs whose engine refuses non-greedy requests ([`engine::ServeEngine::greedy_only`]).
+    greedy_only: RwLock<rustc_hash::FxHashSet<String>>,
     /// When set, each run records a timeline dumpable at `GET /trace`.
     record_trace: bool,
     trace: Mutex<Timeline>,
@@ -662,6 +666,7 @@ impl AppState {
             started: openai::now_secs(),
             max_ctx: RwLock::new(FxHashMap::default()),
             sampling_honoured: RwLock::new(FxHashMap::default()),
+            greedy_only: RwLock::new(Default::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
             shutdown: tokio::sync::watch::channel(false).0,
@@ -824,7 +829,13 @@ impl AppState {
         self.sampling_honoured
             .write()
             .insert(slug.clone(), engine.honours_sampling());
+        if engine.greedy_only() {
+            self.greedy_only.write().insert(slug.clone());
+        }
         if let Some((set, r)) = self.dp_rank(&slug) {
+            if engine.greedy_only() {
+                self.greedy_only.write().insert(set.model.clone());
+            }
             self.max_ctx
                 .write()
                 .insert(set.model.clone(), engine.max_ctx());
@@ -892,6 +903,30 @@ impl AppState {
             .get(slug)
             .copied()
             .unwrap_or(true)
+    }
+
+    /// A 400 for a sampled or logit-edited request to a greedy-only engine (`None` = serve it).
+    pub fn refuse_sampling(
+        &self,
+        slug: &str,
+        p: &crate::text::sample::SamplingParams,
+    ) -> Option<axum::response::Response> {
+        let edits = p.repetition_penalty != 1.0
+            || p.presence_penalty != 0.0
+            || p.frequency_penalty != 0.0
+            || !p.logit_bias.is_empty();
+        (self.greedy_only.read().contains(slug) && (!p.is_greedy() || edits)).then(|| {
+            api_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "{slug} is served by a tensor-parallel rank group, which decodes greedily: \
+                     send temperature 0 (or top_k 1) and no penalties or logit_bias"
+                ),
+                "invalid_request_error",
+                None,
+                Some("temperature".into()),
+            )
+        })
     }
 
     /// The GPU engine serving `slug`, when one was installed.

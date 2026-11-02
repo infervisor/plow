@@ -682,6 +682,13 @@ impl ManagerDevice for CudaManagerDevice {
     }
     fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
         let be = Arc::clone(&self.be);
+        if tp_degree(dir)? > 1 {
+            let devices = &crate::config::RuntimeConfig::get().group_devices;
+            let group = self.be.unload_modules_on_err(|| {
+                crate::serve::cuda_group::CudaGroupServe::load(be, dir, ckpt, devices)
+            })?;
+            return Ok(crate::serve::engine::ServeEngine::CudaGroup(group));
+        }
         let mut engine = self
             .be
             .unload_modules_on_err(|| crate::exec::gpu::GpuEngine::load(be, dir, ckpt))?;
@@ -700,6 +707,14 @@ impl ManagerDevice for CudaManagerDevice {
     }
     fn live_modules(&self) -> Option<usize> {
         Some(self.be.live_modules())
+    }
+    /// A process rank group (`PLOW_GROUP_DEVICES`) serves tensor-parallel packets: this
+    /// device is rank 0, each other group device runs a worker process.
+    fn supports_tp(&self) -> bool {
+        crate::config::RuntimeConfig::get().group_devices.len() > 1
+    }
+    fn group_width(&self) -> u32 {
+        (crate::config::RuntimeConfig::get().group_devices.len() as u32).max(1)
     }
 }
 
@@ -2110,7 +2125,7 @@ fn check_tp(device: &dyn ManagerDevice, slug: &str, tp: u32) -> Result<()> {
         return Err(RuntimeError::Rejected(format!(
             "{slug} declares tensor-parallel degree {tp}, and this model manager device is \
              single-device (one backend per engine). Serving it here would load one shard \
-             and answer with it. Compile a TP1 bundle, or serve it on a backend supporting TP (e.g. AMD HSA)."
+             and answer with it. Compile a TP1 bundle, or serve it on AMD HSA, or on CUDA with one PLOW_GROUP_DEVICES entry per rank."
         )));
     }
     // The engine spans `tp` devices from the group's first: past the group they belong to other
