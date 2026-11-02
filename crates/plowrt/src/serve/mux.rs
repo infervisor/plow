@@ -6192,13 +6192,14 @@ fn queue_pack_rows(rows: &[usize], chunk_cost: usize, bound: usize) -> usize {
 /// launch a trim leaves: 26B at C4 trimmed 1024 + 3 riders to 1021 rows (31.1 ms) and paid a lone
 /// 3-row tail launch (16 ms), where 1088 holds all of it in 32.6 ms.
 ///
-/// `rung_ms(rows)` is the measured launch time of the rung covering `rows` (`RideCost`). With the
-/// bucket, the spill and (for a lone tail) the tail's rung measured, the launch trims when the
-/// spill costs more than the tail launch; a tail that joins waiting rows is taken as free. A
-/// ladder without a near rung spills far: Qwen3.8-27B FP8 ran 128 prompt rows + 3 riders in the
-/// 1024 rung (80 ms against 31 ms), which also priced riding the 128 bucket at 16 ms a row.
-/// Unmeasured, a spill of `pf_chunk_cost_rows()` rows or more trims, as does a spill from a bucket
-/// that wide whose tail joins waiting rows.
+/// Below `pf_chunk_cost_rows()` the row rule never trims, but a ladder without a near rung spills
+/// far: Qwen3.8-27B FP8 ran 128 prompt rows + 3 riders in the 1024 rung (80 ms against 31 ms),
+/// which also priced riding the 128 bucket at 16 ms a row. So a bucket that narrow whose spill
+/// is `pf_chunk_cost_rows()` rows or more is judged on `rung_ms(rows)`, the measured launch time of
+/// the rung covering `rows` (`RideCost`): it trims when the spill costs more than the lone tail
+/// launch, or than nothing when the tail joins waiting rows; unmeasured, it trims. Every other
+/// launch keeps the row rule (measured verdicts on Gemma-4-12B FP8's dense ladder cost 2-3% TPOT
+/// P50 on the prod mix).
 #[cfg(feature = "cuda")]
 fn trim_for_riders(
     bucket: usize,
@@ -6214,12 +6215,15 @@ fn trim_for_riders(
     let cost = pf_chunk_cost_rows();
     let tail = (rows + decode_rows).saturating_sub(bucket);
     let joins = tail + beyond >= cost;
+    let wide = spilled - bucket >= cost;
+    if bucket >= cost || !wide {
+        return bucket >= cost && (joins || wide);
+    }
     let measured = rung_ms(spilled).zip(rung_ms(bucket)).and_then(|(s, b)| {
         let tail_ms = if joins { Some(0.0) } else { rung_ms(tail) };
         tail_ms.map(|t| s - b > t)
     });
-    let wide = spilled - bucket >= cost;
-    measured.unwrap_or(wide || (bucket >= cost && joins))
+    measured.unwrap_or(true)
 }
 
 /// Prompt rows to cut from a planned pack of `rows` so its `decode_rows` riders fit the rung
@@ -9964,24 +9968,21 @@ mod tests {
             0,
             g26_ms
         ));
-        // The tail joins waiting rows: any dearer spill trims.
-        // A dense ladder, measured: 128 + 3 riders in 256 trims once the tail joins waiting rows.
-        assert!(super::trim_for_riders(
+        // Narrow spills keep the row rule whatever was measured.
+        let g26_cheap_dense = |r| match g26(r) {
+            128 => Some(16.0),
+            256 => Some(18.0),
+            _ => None,
+        };
+        assert!(!super::trim_for_riders(
             128,
             g26(128 + 3),
             3,
             128,
             600,
-            |r| match g26(r) {
-                128 => Some(16.0),
-                256 => Some(18.0),
-                _ => None,
-            }
+            g26_cheap_dense
         ));
-        assert!(
-            !unmeasured_trim(128, g26(128 + 3), 3, 128, 600),
-            "unmeasured: below the cost rows"
-        );
+        assert!(!unmeasured_trim(128, g26(128 + 3), 3, 128, 600));
         assert!(super::trim_for_riders(
             4096,
             g26(4096 + 63),
@@ -9990,14 +9991,19 @@ mod tests {
             4096,
             g26_ms
         ));
-        // Equal cost keeps the spill.
-        assert!(!super::trim_for_riders(1024, 1088, 3, 1024, 600, |r| (r
+        assert!(super::trim_for_riders(1024, 1088, 3, 1024, 600, |r| (r
             >= 1024)
             .then_some(31.1)));
-        // An unmeasured tail rung falls back to the row rule: 1088 - 1024 is narrow, no rows wait.
-        assert!(!super::trim_for_riders(1024, 1088, 3, 1024, 0, |r| (r
-            >= 1024)
-            .then_some(40.0)));
+        // A bucket of the cost rows or more keeps the row rule whatever was measured: Gemma-4-12B's
+        // 512 + riders in 1024 trims (a wide spill) even when 1024 measured as cheap as 512.
+        assert!(super::trim_for_riders(512, 1024, 3, 512, 0, |r| Some(
+            if r > 512 { 20.0 } else { 19.9 }
+        )));
+        // A wide spill of equal cost to its lone tail keeps the spill.
+        assert!(!super::trim_for_riders(128, 1024, 3, 128, 0, |r| Some(
+            if r > 128 { 62.0 } else { 31.0 }
+        )));
+        // A wide spill with an unmeasured rung trims.
         assert!(super::trim_for_riders(128, 1024, 3, 128, 0, |r| (r
             >= 1024)
             .then_some(80.0)));
