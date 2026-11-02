@@ -10009,6 +10009,63 @@ mod tests {
             .then_some(80.0)));
     }
 
+    /// Every Gemma packet's ladder (E4B, 12B, 26B) decides every bucket / spill pair exactly as the
+    /// row rule did before measured rung costs, whatever the measurements say.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gemma_ladders_keep_the_row_rule_for_every_bucket_and_spill() {
+        fn row_rule(
+            bucket: usize,
+            spilled: usize,
+            decode: usize,
+            rows: usize,
+            beyond: usize,
+        ) -> bool {
+            let cost = super::pf_chunk_cost_rows();
+            let tail = (rows + decode).saturating_sub(bucket);
+            let lone_tail = tail + beyond < cost && spilled.saturating_sub(bucket) < cost;
+            decode > 0 && spilled > bucket && bucket >= cost && !lone_tail
+        }
+        let ladders: [(&[usize], usize); 2] = [
+            (&[64, 128, 256, 512, 1024, 2048, 4096, 8192], 128),
+            (
+                &[
+                    128, 256, 512, 1024, 1088, 1152, 2048, 2112, 4096, 4160, 4224, 8192,
+                ],
+                128,
+            ),
+        ];
+        let costs: [&dyn Fn(usize) -> Option<f64>; 4] =
+            [&|_| None, &|_| Some(10.0), &|r| Some(r as f64), &|r| {
+                Some(1e6 / r as f64)
+            }];
+        let mut checked = 0usize;
+        for (ladder, decode_max) in ladders {
+            let cover = |rows| crate::exec::gpu::cover_rung(ladder.iter().copied(), rows);
+            for &bucket in ladder {
+                for decode in 1..=decode_max {
+                    for rows in [1, bucket / 2, bucket - decode.min(bucket - 1), bucket] {
+                        let spilled = cover(rows.min(bucket) + decode);
+                        for beyond in [0, 1, 100, 511, 512, 4096] {
+                            let want = row_rule(bucket, spilled, decode, rows, beyond);
+                            for cost in costs {
+                                assert_eq!(
+                                    super::trim_for_riders(bucket, spilled, decode, rows, beyond, |r| {
+                                        cost(cover(r))
+                                    }),
+                                    want,
+                                    "bucket {bucket} spilled {spilled} decode {decode} rows {rows} beyond {beyond}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000);
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn a_planned_pack_leaves_its_riders_room_when_the_spill_costs_more() {
