@@ -9157,7 +9157,7 @@ fn apply_production_defaults(
     // `PLOW_DECODE_TIERS` (a per-rung object) is what makes the 16 rung payable; until a
     // tiered gfx942 recipe ships and is measured, the ladder stops at 8.
     let ladder = match arch {
-        "sm_90a" => Some("1,2,4,8,16"),
+        "sm_90a" | "sm_120a" => Some("1,2,4,8,16"),
         "gfx942" => Some("1,2,4,8"),
         _ => None,
     };
@@ -9342,6 +9342,12 @@ fn apply_production_defaults(
     }
 }
 
+/// CUDA targets whose prefill objects carry the packed-request ABI (`PLOW_NV_PACKED_REQUEST`):
+/// the interpreter's non-wgmma packed arms compile for GB202 as well as Hopper.
+fn nv_packed_request_arch(arch: &str) -> bool {
+    matches!(arch, "sm_90a" | "sm_120a")
+}
+
 fn cublaslt_emit_supported(
     capabilities: EmitCapabilities,
     arch: &str,
@@ -9462,12 +9468,12 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     if emit_config::active().max_request_chunk.is_some() {
         assert!(
             model_type.starts_with("gemma4")
-                && arch == "sm_90a"
+                && nv_packed_request_arch(&arch)
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights() || emit_config::active().w8a8)
                 && !emit_config::active().mxfp4
                 && emit_config::active().packed_prefill_metadata_on(),
-            "request chunk limits require packed Gemma 4 BF16 or W8A8 weights on SM90 TP1"
+            "request chunk limits require packed Gemma 4 BF16 or W8A8 weights on a packed-request CUDA target (sm_90a, sm_120a) at TP1"
         );
     }
 
@@ -9569,8 +9575,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // `mla/kimi_k3.rs` has asked for the sibling topology since it was written and this
         // assertion is why it could never be given one; a GLM-5.3 gfx942 TP4 emit died here.
         assert!(
-            emit_is_amd() || (arch == "sm_90a" && tp == 1),
-            "packed request emission requires Hopper single-GPU direct KV"
+            emit_is_amd() || (nv_packed_request_arch(&arch) && tp == 1),
+            "packed request emission requires a packed-request CUDA target (sm_90a, sm_120a), single-GPU direct KV"
         );
         assert!(
             emit_is_amd() || capabilities.dense_packet_contracts,

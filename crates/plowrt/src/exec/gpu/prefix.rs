@@ -87,6 +87,10 @@ impl VmmPrefixLayout {
     }
 }
 
+/// GPUs the auto-selected VMM prefix cache was qualified on (FP32-reference gates with prefix
+/// hits): Hopper and consumer Blackwell (sm_120).
+const VMM_PREFIX_AUTO_CC: [(u32, u32); 2] = [(9, 0), (12, 0)];
+
 impl GpuEngine {
     pub(super) fn vmm_live_bringup(
         be: &Arc<CudaBackend>,
@@ -217,7 +221,7 @@ impl GpuEngine {
         let requested = config.nv_vmm_prefix();
         if requested == Some(false)
             || (requested.is_none()
-                && (capability != (9, 0)
+                && (!VMM_PREFIX_AUTO_CC.contains(&capability)
                     || config.nv_vmm_live()
                     || config.nv_vmm_live_rings() == Some(true)
                     || blob.sections.iter().any(|section| {
@@ -232,7 +236,7 @@ impl GpuEngine {
             return declined(if requested == Some(false) {
                 "PLOW_VMM_PREFIX=0"
             } else {
-                "auto mode: not Hopper, live KV/rings, or a mixed-step/decode-object packet"
+                "auto mode: unqualified GPU, live KV/rings, or a mixed-step/decode-object packet"
             });
         }
         let Some(layout) = Self::vmm_prefix_layout(blob, kv, row_interleaved) else {
@@ -268,7 +272,7 @@ impl GpuEngine {
                 window = g.window,
                 kv_elem = g.elem,
                 kv_elem_slide = g.elem_slide,
-                "vmm prefix auto-selection (qualified Hopper hybrid BF16/FP8-KV geometry; \
+                "vmm prefix auto-selection (qualified hybrid BF16/FP8-KV geometry; \
                  PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables, =1 forces)"
             );
             if !qualified {

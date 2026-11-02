@@ -325,6 +325,14 @@ const DECODE_LADDER_DEFAULT: Default = Default::Production {
                 F::Atom("emit.decode_batch", Cmp::Eq, Val::Nat(1)),
             ]),
             value: Val::Str("1,2,4,8,16"),
+        },        DefaultCase {
+            when: F::And(&[
+                F::Target(T::Arch("sm_120a")),
+                F::Target(T::Cap("decode_ladder")),
+                F::Target(T::Tp(1)),
+                F::Atom("emit.decode_batch", Cmp::Eq, Val::Nat(1)),
+            ]),
+            value: Val::Str("1,2,4,8,16"),
         },
         DefaultCase {
             when: F::And(&[
