@@ -344,7 +344,15 @@ pub struct VmmRings {
     /// Released slots whose units stay mapped in place (recycling): readmitting the slot costs no
     /// driver call, and another slot takes them over only when no spare unit is left.
     parked: Vec<bool>,
+    /// Most slots mapped at once since `peak_at`, restarted after [`PARK_PEAK_WINDOW`]
+    /// ([`Self::yield_park`]).
+    peak: usize,
+    peak_at: std::time::Instant,
 }
+
+/// How long a concurrency peak keeps its parked slots against store pressure: about one
+/// request lifetime, so a load that dips and comes back readmits without driver calls.
+const PARK_PEAK_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl VmmRings {
     pub fn new(ops: Arc<dyn VmmOps>, tensors: &[LiveRingTensor], batch: usize) -> Result<Self> {
@@ -395,6 +403,8 @@ impl VmmRings {
             recycle: false,
             bounded: false,
             parked: vec![false; batch],
+            peak: 0,
+            peak_at: std::time::Instant::now(),
         };
         for t in tensors {
             let logical_bytes = t.slot_bytes * batch as u64;
@@ -679,6 +689,50 @@ impl VmmRings {
         }
         self.stats.mapped_slots += 1;
         self.stats.mapped_prefix = self.prefix;
+        self.recent_peak(std::time::Instant::now());
+    }
+
+    /// The most slots mapped at once within the current peak window.
+    fn recent_peak(&mut self, now: std::time::Instant) -> usize {
+        if now.duration_since(self.peak_at) > PARK_PEAK_WINDOW {
+            self.peak = self.stats.mapped_slots;
+            self.peak_at = now;
+        } else {
+            self.peak = self.peak.max(self.stats.mapped_slots);
+        }
+        self.peak
+    }
+
+    /// [`Self::enable_bounded_park`] under device pressure from the cache: return parked slots
+    /// beyond what the recent concurrency peak needs to the driver, at most `max_slots` per call
+    /// (each is a driver unmap/map/release per unit), highest index first (the mux seats the
+    /// lowest free slot). Call only where unmapping an idle slot is safe (retirement, after the
+    /// store's copies drained). Returns the bytes released.
+    pub fn yield_park(&mut self, max_slots: usize) -> u64 {
+        if !self.bounded {
+            return 0;
+        }
+        let keep = self
+            .recent_peak(std::time::Instant::now())
+            .saturating_sub(self.stats.mapped_slots) as u64
+            * self.slot_charge();
+        let cap = keep.min(self.spare_cap);
+        let before = self.spare_bytes();
+        let mut slots = 0;
+        while self.spare_bytes() > cap {
+            if let Some((_, handle)) = self.spare.pop() {
+                self.ops.release(handle);
+            } else if slots < max_slots {
+                let Some(parked) = self.parked.iter().rposition(|&p| p) else {
+                    break;
+                };
+                self.unpark(parked);
+                slots += 1;
+            } else {
+                break;
+            }
+        }
+        before.saturating_sub(self.spare_bytes())
     }
 
     pub fn release_slot(&mut self, slot: usize) {

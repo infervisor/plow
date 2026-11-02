@@ -200,7 +200,8 @@ Device budget: the store grows into all free memory after load, down to the pres
 (2 % of the card) plus the pool band (`PLOW_KV_POOL_MIB`), and gives memory back to live slots
 under pressure (store chunks first, then LRU boundaries). Sliding rings of idle slots are kept
 out of it: rings commit per admitted slot under the store whenever flat rings would be a capacity
-tier (B >= 64 or ctx >= 128K, `PLOW_VMM_LIVE_RINGS` overrides).
+tier (B >= 64 or ctx >= 128K, `PLOW_VMM_LIVE_RINGS` overrides), and once the store could not grow
+since the last retirement the ring park keeps only what the recent 10 s concurrency peak needs.
 With other models resident, each engine's floor also keeps the other engines' KV caps and the
 shared reserve free, and a load that does not fit asks resident caches for memory before it
 evicts a model or refuses for KV room.

@@ -720,6 +720,61 @@ fn bounded_park_readmits_without_driver_calls_and_holds_its_cap_while_busy() {
 }
 
 #[test]
+fn yield_park_keeps_the_recent_peak_and_bounds_driver_work() {
+    let ops = Arc::new(Mock::with_granularity(64));
+    ops.0.lock().unwrap().multi_map = true;
+    let committed = |ops: &Mock| ops.0.lock().unwrap().handles.values().sum::<u64>();
+    let tensors: Vec<_> = (0..4)
+        .map(|tensor| LiveRingTensor {
+            tensor,
+            slot_bytes: 128,
+        })
+        .collect();
+    let mut rings = VmmRings::new_idle_backed(ops.clone(), &tensors, 8).unwrap();
+    let startup = committed(&ops);
+    let charge = rings.slot_charge();
+    assert_eq!(rings.yield_park(8), 0, "parking off: nothing to yield");
+    rings.enable_bounded_park(8 * charge);
+    for slot in 0..6 {
+        rings.ensure_slot(slot).unwrap();
+    }
+    for slot in 0..6 {
+        rings.release_slot(slot);
+    }
+    // Every slot parked: the recent peak (6) minus none live keeps all six.
+    assert_eq!(rings.spare_bytes(), 6 * charge);
+    assert_eq!(rings.yield_park(8), 0, "the peak still needs them");
+    // Back to two live: still within the peak window, the park covers the way back to six.
+    rings.ensure_slot(0).unwrap();
+    rings.ensure_slot(1).unwrap();
+    assert_eq!(rings.yield_park(8), 0);
+    // The window restarts: the peak is what is live now, so the park yields at most two slots
+    // per call, highest index first.
+    rings.peak_at -= PARK_PEAK_WINDOW + std::time::Duration::from_millis(1);
+    assert_eq!(rings.yield_park(2), 2 * charge);
+    assert_eq!(rings.spare_bytes(), 2 * charge);
+    assert_eq!(rings.yield_park(2), 2 * charge);
+    assert_eq!(rings.spare_bytes(), 0);
+    assert_eq!(
+        committed(&ops),
+        startup + 2 * charge,
+        "only the live slots stay"
+    );
+    let before = ops.calls();
+    rings.release_slot(1);
+    rings.ensure_slot(1).unwrap();
+    assert_eq!(
+        ops.calls(),
+        before,
+        "a slot parked since still readmits in place"
+    );
+    rings.release_slot(0);
+    rings.release_slot(1);
+    drop(rings);
+    ops.empty();
+}
+
+#[test]
 fn release_parked_upto_bounds_the_slots_per_call() {
     let ops = Arc::new(Mock::with_granularity(64));
     ops.0.lock().unwrap().multi_map = true;
