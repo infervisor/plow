@@ -16,6 +16,10 @@ use rustc_hash::FxHashMap;
 use crate::asset::ModelBundle;
 use crate::{Result, RuntimeError};
 
+fn vendor_of(b: &ModelBundle) -> Option<hwspec::Vendor> {
+    hwspec::registry::lookup(&b.manifest.gpu).map(|s| s.vendor)
+}
+
 /// The set of loaded models, keyed by API slug.
 #[derive(Default)]
 pub struct Registry {
@@ -25,6 +29,9 @@ pub struct Registry {
     /// cannot change; without this the only way to serve them was to rename the
     /// bundle, which changes every metric label and dashboard along with it.
     aliases: RwLock<FxHashMap<String, String>>,
+    /// Other vendors' bundles of a registered model (docs/arch/30 §3.1): slug -> bundles whose
+    /// packets target another vendor than the registered one, checked to answer identically.
+    variants: RwLock<FxHashMap<String, Vec<Arc<ModelBundle>>>>,
 }
 
 impl Registry {
@@ -43,6 +50,29 @@ impl Registry {
         let bundle = ModelBundle::load(dir)?;
         let slug = slug.unwrap_or_else(|| bundle.manifest.default_slug(&bundle.dir));
         let mut models = self.models.write();
+        if let Some(first) = models.get(&slug) {
+            // A bundle for ANOTHER vendor under a registered name is that model's variant, when
+            // it answers identically; anything else is the duplicate refused below.
+            let (va, vb) = (vendor_of(first), vendor_of(&bundle));
+            if va.is_some() && vb.is_some() && va != vb {
+                if let Some(why) = crate::serve::chat::variant_mismatch(first, &bundle) {
+                    return Err(RuntimeError::Msg(format!(
+                        "{}: cannot serve as a {vb:?} variant of {slug:?} ({}): {why}",
+                        bundle.dir.display(),
+                        first.dir.display()
+                    )));
+                }
+                let mut variants = self.variants.write();
+                let list = variants.entry(slug.clone()).or_default();
+                if list.iter().any(|b| vendor_of(b) == vb) {
+                    return Err(RuntimeError::Msg(format!(
+                        "model {slug:?} already has a {vb:?} variant"
+                    )));
+                }
+                list.push(Arc::new(bundle));
+                return Ok(slug);
+            }
+        }
         if models.contains_key(&slug) {
             return Err(RuntimeError::Msg(format!(
                 "model slug {slug:?} is already registered — pass a distinct \
@@ -108,6 +138,45 @@ impl Registry {
             .ok_or_else(|| RuntimeError::UnknownModel(slug.to_string()))
     }
 
+    /// `slug`'s bundle for `vendor`: the registered one when it targets `vendor`, else a variant.
+    pub fn variant(&self, slug: &str, vendor: hwspec::Vendor) -> Option<Arc<ModelBundle>> {
+        let primary = self.models.read().get(slug).cloned()?;
+        if vendor_of(&primary) == Some(vendor) {
+            return Some(primary);
+        }
+        self.variants
+            .read()
+            .get(slug)?
+            .iter()
+            .find(|b| vendor_of(b) == Some(vendor))
+            .cloned()
+    }
+
+    /// `slug`'s bundle for a device of `vendor`: its variant there when it has one, else the
+    /// registered bundle.
+    pub fn bundle_for(
+        &self,
+        slug: &str,
+        vendor: Option<hwspec::Vendor>,
+    ) -> Result<Arc<ModelBundle>> {
+        match vendor.and_then(|v| self.variant(slug, v)) {
+            Some(b) => Ok(b),
+            None => self.get(slug),
+        }
+    }
+
+    /// The vendors `slug` has a bundle for, the registered one first.
+    pub fn vendors(&self, slug: &str) -> Vec<hwspec::Vendor> {
+        let Some(primary) = self.models.read().get(slug).cloned() else {
+            return Vec::new();
+        };
+        let mut out: Vec<_> = vendor_of(&primary).into_iter().collect();
+        if let Some(list) = self.variants.read().get(slug) {
+            out.extend(list.iter().filter_map(|b| vendor_of(b)));
+        }
+        out
+    }
+
     /// Whether `slug` is registered.
     pub fn contains(&self, slug: &str) -> bool {
         self.models.read().contains_key(slug)
@@ -129,6 +198,7 @@ impl Registry {
         self.aliases
             .write()
             .retain(|_, canonical| canonical != slug);
+        self.variants.write().remove(slug);
         Ok(bundle)
     }
 

@@ -38,8 +38,14 @@ pub mod visibility;
 /// driver therefore costs acceleration, not availability.
 /// Select a single backend (device 0 preferred). Legacy single-GPU path.
 pub fn select(executors: u32) -> Arc<dyn Backend> {
+    select_with(executors, true)
+}
+
+/// [`select`], skipping CUDA when `cuda` is false (`--devices` named only AMD devices).
+pub fn select_with(executors: u32, cuda: bool) -> Arc<dyn Backend> {
+    let _ = cuda;
     #[cfg(feature = "cuda")]
-    {
+    if cuda {
         tracing::debug!("probing CUDA backend (device 0)...");
         match cuda::CudaBackend::new(0) {
             Ok(b) => {

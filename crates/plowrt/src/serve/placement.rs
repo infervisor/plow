@@ -346,18 +346,41 @@ pub fn requested_ordinals(configured: &[u32], visible_count: u32) -> Vec<u32> {
 /// saying where a model goes, and silently placing it somewhere else is the
 /// one outcome that must not happen.
 pub fn parse_pins(pins: &[String]) -> Result<Vec<(String, u32)>, String> {
+    Ok(parse_dev_pins(pins)?
+        .into_iter()
+        .map(|(slug, _, ord)| (slug, ord))
+        .collect())
+}
+
+/// A device as `--devices` / `--pin` name it: a bare ordinal (`2`, the single-vendor meaning) or
+/// a vendor-qualified one (`nv:2`, `amd:1`; docs/arch/30 §2.1).
+pub fn parse_dev(s: &str) -> Result<(Option<hwspec::Vendor>, u32), String> {
+    let (vendor, n) = match s.split_once(':') {
+        None => (None, s),
+        Some(("nv" | "nvidia" | "cuda", n)) => (Some(hwspec::Vendor::Nvidia), n),
+        Some(("amd" | "hsa", n)) => (Some(hwspec::Vendor::Amd), n),
+        Some((v, _)) => return Err(format!("device {s:?}: unknown vendor {v:?} (nv or amd)")),
+    };
+    let n = n
+        .parse()
+        .map_err(|_| format!("device {s:?}: {n:?} is not a device ordinal"))?;
+    Ok((vendor, n))
+}
+
+/// `--pin slug@ordinal` or `slug@nv:N` / `slug@amd:N`.
+pub fn parse_dev_pins(
+    pins: &[String],
+) -> Result<Vec<(String, Option<hwspec::Vendor>, u32)>, String> {
     let mut out = Vec::with_capacity(pins.len());
     for pin in pins {
-        let (slug, ord) = pin
+        let (slug, dev) = pin
             .rsplit_once('@')
             .ok_or_else(|| format!("--pin {pin:?} is not slug@ordinal"))?;
         if slug.is_empty() {
             return Err(format!("--pin {pin:?} names no model"));
         }
-        let ord: u32 = ord
-            .parse()
-            .map_err(|_| format!("--pin {pin:?}: {ord:?} is not a device ordinal"))?;
-        out.push((slug.to_string(), ord));
+        let (vendor, ord) = parse_dev(dev).map_err(|e| format!("--pin {pin:?}: {e}"))?;
+        out.push((slug.to_string(), vendor, ord));
     }
     Ok(out)
 }
@@ -396,6 +419,30 @@ impl DpSpec {
     pub fn named(&self) -> impl Iterator<Item = &str> {
         self.per_model.iter().map(|(m, _)| m.as_str())
     }
+}
+
+/// CUDA ranks `0..k` of a model served data-parallel over both vendors (docs/arch/30 §4): as many
+/// as the NVIDIA groups take, leaving room for its AMD pins and honouring its NVIDIA ones; the
+/// remaining `n - k` go to AMD groups.
+pub fn mix_split(
+    n: usize,
+    nv_groups: usize,
+    amd_groups: usize,
+    nv_pins: usize,
+    amd_pins: usize,
+) -> Result<usize, String> {
+    if nv_pins + amd_pins > n {
+        return Err(format!(
+            "--dp {n}: {nv_pins} NVIDIA and {amd_pins} AMD pins name more ranks than it has"
+        ));
+    }
+    let k = n.saturating_sub(amd_pins).min(nv_groups).max(nv_pins);
+    if n - k > amd_groups {
+        return Err(format!(
+            "--dp {n} needs {n} device groups; {nv_groups} NVIDIA and {amd_groups} AMD are free"
+        ));
+    }
+    Ok(k)
 }
 
 /// Parse `--dp 8`, `--dp all`, `--dp gemma=4,asr=all`.
@@ -714,7 +761,15 @@ mod tests {
             parse_pins(&["org@v1/model@2".to_string()]).unwrap(),
             vec![("org@v1/model".to_string(), 2)]
         );
-        for bad in ["a", "a@", "@2", "a@x", ""] {
+        assert_eq!(
+            parse_dev_pins(&["m@amd:1".to_string(), "m@nv:0".to_string()]).unwrap(),
+            vec![
+                ("m".to_string(), Some(hwspec::Vendor::Amd), 1),
+                ("m".to_string(), Some(hwspec::Vendor::Nvidia), 0)
+            ]
+        );
+        assert_eq!(parse_dev("3").unwrap(), (None, 3));
+        for bad in ["a", "a@", "@2", "a@x", "", "a@gpu:1", "a@amd:"] {
             assert!(
                 parse_pins(&[bad.to_string()]).is_err(),
                 "{bad:?} should be refused"
@@ -792,6 +847,17 @@ mod tests {
         assert!(l.assignment[4] < 4);
         let l = assign(&m, &groups(5, 48 * GIB), Place::Spread).unwrap();
         assert_eq!(l.assignment[4], 4, "a free group goes to the plain model");
+    }
+
+    #[test]
+    fn mix_split_fills_nvidia_then_amd() {
+        assert_eq!(mix_split(4, 2, 2, 0, 0), Ok(2));
+        assert_eq!(mix_split(3, 2, 2, 0, 0), Ok(2));
+        assert_eq!(mix_split(3, 2, 2, 0, 2), Ok(1));
+        assert_eq!(mix_split(2, 2, 2, 0, 2), Ok(0));
+        assert_eq!(mix_split(1, 2, 2, 0, 0), Ok(1));
+        assert!(mix_split(5, 2, 2, 0, 0).is_err());
+        assert!(mix_split(2, 2, 2, 2, 1).is_err());
     }
 
     #[test]

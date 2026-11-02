@@ -10336,7 +10336,9 @@ mod tests {
         let set = Arc::clone(state.dp_set("m").unwrap());
         let mut seen = [0usize; 2];
         for _ in 0..6 {
-            let (rank, mux, _, _pick) = state.dp_route(&set, None, Some(&[1, 2, 3]), 0).unwrap();
+            let (rank, mux, _, _pick) = state
+                .dp_route(&set, None, Some(&[1, 2, 3]), 0, false)
+                .unwrap();
             seen[rank] += 1;
             assert!(state
                 .submit_routed(
@@ -10359,7 +10361,7 @@ mod tests {
         removed.drain().await;
         assert!(stale.is_closed());
         for _ in 0..16 {
-            let (rank, _, _, _) = state.dp_route(&set, Some("s"), None, 0).unwrap();
+            let (rank, _, _, _) = state.dp_route(&set, Some("s"), None, 0, false).unwrap();
             assert_eq!(rank, 1, "a removed rank is never routed to");
         }
         assert!(state
@@ -10374,7 +10376,7 @@ mod tests {
             .is_ok());
         assert_eq!(set.stats.retries.load(Ordering::Relaxed), 1);
         state.remove_mux("m#1");
-        assert!(state.dp_route(&set, None, None, 0).is_none());
+        assert!(state.dp_route(&set, None, None, 0, false).is_none());
         assert!(matches!(
             state.submit_routed(
                 Some((&set, 0)),

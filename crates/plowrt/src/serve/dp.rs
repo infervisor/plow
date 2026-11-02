@@ -404,6 +404,8 @@ pub struct DpRank {
     probe: RwLock<Option<PrefixProbe>>,
     /// Host CPUs on its GPU's socket: the rank's dispatcher thread runs there (empty: unpinned).
     pub cpus: Vec<usize>,
+    /// Vendor of its device group (a mixed-vendor set's ranks differ; docs/arch/30 §4).
+    pub vendor: Option<hwspec::Vendor>,
 }
 
 impl DpRank {
@@ -497,6 +499,8 @@ pub struct DpSet {
     tails: Sessions,
     /// Block rows of the ranks' prefix caches (0 until one is resident).
     block_rows: AtomicU32,
+    /// Ranks whose engine ignores sampling parameters (device argmax).
+    unsampled: AtomicU32,
     pub stats: DpStats,
 }
 
@@ -522,20 +526,40 @@ impl DpSet {
                     metrics,
                     probe: RwLock::new(None),
                     cpus: Vec::new(),
+                    vendor: None,
                 })
                 .collect(),
             sessions: Sessions::new(),
             tails: Sessions::new(),
             block_rows: AtomicU32::new(0),
+            unsampled: AtomicU32::new(0),
             stats: DpStats::default(),
         }
     }
 
+    /// The first resident cache's block size keys the probe; a rank whose cache uses another
+    /// (a variant on another vendor) is not probed.
     pub fn set_probe(&self, rank: usize, probe: Option<PrefixProbe>) {
         if let Some(p) = &probe {
-            self.block_rows.store(p.block_rows(), Relaxed);
+            let _ = self
+                .block_rows
+                .compare_exchange(0, p.block_rows(), Relaxed, Relaxed);
         }
         *self.ranks[rank].probe.write() = probe;
+    }
+
+    /// Record whether rank `rank`'s engine applies a request's sampling parameters.
+    pub fn set_samples(&self, rank: usize, samples: bool) {
+        if samples {
+            self.unsampled.fetch_and(!(1 << rank), Relaxed);
+        } else {
+            self.unsampled.fetch_or(1 << rank, Relaxed);
+        }
+    }
+
+    /// Some rank applies sampling parameters: sampled requests route only to those.
+    pub fn any_samples(&self) -> bool {
+        self.unsampled.load(Relaxed).count_ones() < self.ranks.len() as u32
     }
 
     pub fn sessions(&self) -> usize {
@@ -551,12 +575,30 @@ impl DpSet {
         prompt: Option<&[u32]>,
         exclude: u32,
     ) -> Option<Routed<'_>> {
+        self.route_sampled(cfg, session, prompt, exclude, false)
+    }
+
+    /// [`Self::route`] for a request that samples: ranks ignoring sampling parameters are
+    /// skipped while some rank applies them.
+    pub fn route_sampled(
+        &self,
+        cfg: &RouteCfg,
+        session: Option<&str>,
+        prompt: Option<&[u32]>,
+        exclude: u32,
+        sampled: bool,
+    ) -> Option<Routed<'_>> {
         let t0 = Instant::now();
         let n = self.ranks.len();
+        let unfit = if sampled && self.any_samples() {
+            self.unsampled.load(Relaxed)
+        } else {
+            0
+        };
         let mut cands = [Cand::default(); MAX_DP];
         for (i, r) in self.ranks.iter().enumerate() {
             cands[i] = r.cand();
-            if exclude >> i & 1 != 0 {
+            if (exclude | unfit) >> i & 1 != 0 {
                 cands[i].up = false;
             }
         }
@@ -614,7 +656,7 @@ impl DpSet {
                         self.stats.probe_contended.fetch_add(1, Relaxed);
                         continue;
                     };
-                    let Some(probe) = guard.as_ref() else {
+                    let Some(probe) = guard.as_ref().filter(|p| p.block_rows() == br) else {
                         continue;
                     };
                     self.stats.probes.fetch_add(1, Relaxed);
@@ -933,6 +975,27 @@ mod tests {
             before - 1,
             "expiry uncounts"
         );
+    }
+
+    /// A sampled request skips ranks that ignore sampling while one applies it; greedy ones and
+    /// a set where no rank samples route anywhere.
+    #[test]
+    fn sampled_requests_avoid_ranks_that_do_not_sample() {
+        let s = set(3);
+        up(&s);
+        let cfg = RouteCfg::default();
+        s.set_samples(0, false);
+        s.set_samples(2, false);
+        assert!(s.any_samples());
+        for _ in 0..8 {
+            assert_eq!(s.route_sampled(&cfg, None, None, 0, true).unwrap().rank, 1);
+        }
+        assert!(s.route_sampled(&cfg, None, None, 0b010, true).is_none());
+        s.set_samples(1, false);
+        assert!(!s.any_samples());
+        assert!(s.route_sampled(&cfg, None, None, 0, true).is_some());
+        s.set_samples(1, true);
+        assert!(s.any_samples());
     }
 
     /// First turns placing concurrently each claim a distinct share: no rank ends more than one

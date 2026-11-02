@@ -2505,7 +2505,19 @@ impl super::host_region::HostStaging for CudaBackend {
         if rc != HOST_MEMORY_ALREADY_REGISTERED {
             self.check(rc, "cuMemHostRegister(host region)")?;
         }
-        Ok(ptr as u64)
+        // The alias is the address kernels dereference. The staging copies take the same value
+        // as their host pointer, so it must equal the host address (unified addressing).
+        let mut dp: CUdeviceptr = 0;
+        // SAFETY: `ptr` is registered above (or by an earlier portable registration).
+        let rc = unsafe { (self.api.cuMemHostGetDevicePointer_v2)(&mut dp, ptr as *mut c_void, 0) };
+        self.check(rc, "cuMemHostGetDevicePointer(host region)")?;
+        if dp != ptr as u64 {
+            return Err(RuntimeError::Device(
+                "host region: registered memory is not device-addressable at its host address"
+                    .into(),
+            ));
+        }
+        Ok(dp)
     }
 
     unsafe fn host_unregister(&self, ptr: *mut u8) {

@@ -371,7 +371,13 @@ async fn completions_with(
     let mux = match (&direct, dp) {
         (Some(m), _) => m,
         (None, Some(set)) => {
-            match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+            match state.dp_route(
+                set,
+                ids.session.as_deref(),
+                Some(&prompt_ids),
+                0,
+                gen.params.samples(),
+            ) {
                 Some((r, m, key, pick)) => {
                     (rank, prefix, _pick) = (r, key, Some(pick));
                     routed = m;

@@ -773,7 +773,7 @@ pub(super) async fn route(
                 if let Err(e) = state.dp_admit(set).await {
                     return Err(e.with_retry_after(failure(StatusCode::SERVICE_UNAVAILABLE, &e)));
                 }
-                match state.dp_route(set, session, None, exclude) {
+                match state.dp_route(set, session, None, exclude, false) {
                     Some((rank, mux, _, _)) => {
                         exclude |= 1 << rank;
                         (set.ranks[rank].key.clone(), Some(mux))

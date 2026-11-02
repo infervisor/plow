@@ -992,7 +992,7 @@ async fn speech_with(
                     ));
                 }
                 state
-                    .dp_route(set, ids.session.as_deref(), None, exclude)
+                    .dp_route(set, ids.session.as_deref(), None, exclude, false)
                     .map(|(rank, mux, _, _)| {
                         exclude |= 1 << rank;
                         key.clone_from(&set.ranks[rank].key);

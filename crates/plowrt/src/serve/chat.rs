@@ -747,7 +747,13 @@ async fn chat_completions_with(
     let mux = match (&direct, dp) {
         (Some(m), _) => m,
         (None, Some(set)) => {
-            match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+            match state.dp_route(
+                set,
+                ids.session.as_deref(),
+                Some(&prompt_ids),
+                0,
+                gen.params.samples(),
+            ) {
                 Some((r, m, key, pick)) => {
                     (rank, prefix, _pick) = (r, key, Some(pick));
                     routed = m;
@@ -1084,6 +1090,80 @@ pub(crate) enum PromptError {
     Request(crate::serve::tools::request::Refusal),
     /// The packet names a built-in builder this server does not have.
     NoTemplate(String),
+}
+
+/// Why bundle `b` cannot serve as another vendor's variant of the model `a` serves, if it
+/// cannot: every rank of a model must answer a prompt with the same text (docs/arch/30 §3.1).
+/// Compared: the checkpoint pins, stop ids, sampling defaults and chat declarations of
+/// `serve.json`, the tokenizer files, and a probe conversation rendered by each bundle's own
+/// prompt path and tokenized by its own tokenizer. A packet's KV geometry and serve knobs are
+/// per-target and may differ.
+pub(crate) fn variant_mismatch(
+    a: &crate::asset::ModelBundle,
+    b: &crate::asset::ModelBundle,
+) -> Option<String> {
+    let (ma, mb) = (&a.serve().manifest, &b.serve().manifest);
+    if ma.weights != mb.weights {
+        return Some("different checkpoint pins".into());
+    }
+    if ma.stop_token_ids != mb.stop_token_ids {
+        return Some("different stop token ids".into());
+    }
+    if ma.sampling != mb.sampling {
+        return Some("different sampling defaults".into());
+    }
+    if ma.chat != mb.chat || a.serve().from_packet != b.serve().from_packet {
+        return Some("different chat declarations in serve.json".into());
+    }
+    if tokenizer_digest(a) != tokenizer_digest(b) {
+        return Some("different tokenizer files".into());
+    }
+    let probe: Vec<Message> = serde_json::from_value(serde_json::json!([
+        {"role": "system", "content": "You are a careful assistant."},
+        {"role": "user", "content": "Hello <b>wörld</b> 123 \u{1F600}?"},
+        {"role": "assistant", "content": "Hi."},
+        {"role": "user", "content": "Bye"}
+    ]))
+    .expect("probe conversation");
+    let opts = crate::serve::template::RenderOpts::default();
+    let (pa, pb) = (
+        chat_prompt(Some(a), &probe, &opts),
+        chat_prompt(Some(b), &probe, &opts),
+    );
+    match (pa, pb) {
+        (Ok(pa), Ok(pb)) if pa == pb => {
+            if a.tokenizer().encode(&pa) != b.tokenizer().encode(&pb) {
+                return Some("the probe prompt tokenizes differently".into());
+            }
+        }
+        (Err(_), Err(_)) => {}
+        _ => return Some("the probe conversation renders a different prompt".into()),
+    }
+    None
+}
+
+/// Digest of the tokenizer files the bundle loaded from (`tokenizer.json`, or the Qwen2
+/// `vocab.json` + `merges.txt` pair), `None` when it has none.
+fn tokenizer_digest(b: &crate::asset::ModelBundle) -> Option<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    let ckpt = crate::asset::serve::checkpoint_dir(&b.dir);
+    for base in [b.dir.as_path(), ckpt.as_path()] {
+        if let Ok(bytes) = std::fs::read(base.join("tokenizer.json")) {
+            return Some(Sha256::digest(&bytes).to_vec());
+        }
+    }
+    for base in [b.dir.as_path(), ckpt.as_path()] {
+        if let (Ok(v), Ok(m)) = (
+            std::fs::read(base.join("vocab.json")),
+            std::fs::read(base.join("merges.txt")),
+        ) {
+            let mut h = Sha256::new();
+            h.update(&v);
+            h.update(&m);
+            return Some(h.finalize().to_vec());
+        }
+    }
+    None
 }
 
 /// The prompt a templated (GPU-served) model gets for `messages`: THE CHECKPOINT'S OWN TEMPLATE

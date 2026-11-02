@@ -722,6 +722,7 @@ impl AppState {
         session: Option<&str>,
         prompt: Option<&[u32]>,
         mut exclude: u32,
+        sampled: bool,
     ) -> Option<(
         usize,
         mux::ModelMux,
@@ -730,7 +731,7 @@ impl AppState {
     )> {
         let cfg = self.dp.get()?.cfg;
         loop {
-            let routed = set.route(&cfg, session, prompt, exclude)?;
+            let routed = set.route_sampled(&cfg, session, prompt, exclude, sampled)?;
             match self.mux(&set.ranks[routed.rank].key) {
                 Some(m) if !m.preempted() => {
                     return Some((routed.rank, m, routed.key, routed.pick))
@@ -758,6 +759,7 @@ impl AppState {
         let mut exclude = 0u32;
         let mut next: Option<mux::ModelMux> = None;
         let mut held: Option<dp::Pick<'_>> = None;
+        let sampled = job.gen.params.samples();
         let mut job = job;
         let mut ingress = ingress;
         loop {
@@ -768,7 +770,7 @@ impl AppState {
             };
             drop(held.take());
             exclude |= 1 << rank;
-            let Some((r, m, _, pick)) = self.dp_route(set, session, None, exclude) else {
+            let Some((r, m, _, pick)) = self.dp_route(set, session, None, exclude, sampled) else {
                 return Err(refused);
             };
             job = match refused {
@@ -828,9 +830,10 @@ impl AppState {
             self.max_ctx
                 .write()
                 .insert(set.model.clone(), engine.max_ctx());
+            set.set_samples(r, engine.honours_sampling());
             self.sampling_honoured
                 .write()
-                .insert(set.model.clone(), engine.honours_sampling());
+                .insert(set.model.clone(), set.any_samples());
             #[cfg(any(feature = "cuda", feature = "hsa"))]
             set.set_probe(r, engine.vmm_prefix_probe());
             #[cfg(not(any(feature = "cuda", feature = "hsa")))]
@@ -1574,8 +1577,14 @@ fn dp_metrics(out: &mut String, router: &dp::DpRouter, state: &AppState) {
             let m = escape_label(&set.model);
             let _ = writeln!(
                 out,
-                "plowrt_dp_rank_info{{model_name=\"{m}\",engine=\"{}\",device=\"{}\"}} 1",
-                r.rank, r.ordinal
+                "plowrt_dp_rank_info{{model_name=\"{m}\",engine=\"{}\",device=\"{}\",vendor=\"{}\"}} 1",
+                r.rank,
+                r.ordinal,
+                match r.vendor {
+                    Some(hwspec::Vendor::Nvidia) => "nv",
+                    Some(hwspec::Vendor::Amd) => "amd",
+                    _ => "",
+                }
             );
         }
     }
