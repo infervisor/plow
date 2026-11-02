@@ -1448,9 +1448,15 @@ impl MoeLtRoute {
             arg32(&mut hidden),
         ];
         let warps = GLUE_THREADS / 32;
+        // BF16: one row per block; W8A8 keeps the warp-per-row h2 loop's geometry.
+        let pre_blocks = if p.plan.is_some() {
+            rows.div_ceil(warps).clamp(1, o.blocks)
+        } else {
+            rows
+        };
         o.be.launch_kernel(
             pre,
-            rows.div_ceil(warps).clamp(1, o.blocks),
+            pre_blocks,
             GLUE_THREADS,
             0,
             &mut params,
@@ -1514,7 +1520,7 @@ impl MoeLtRoute {
             arg32(&mut bm),
         ];
         // Every block histograms all T * k slots and scatters its own range of them.
-        let blocks = (rows * top_k).div_ceil(2048).clamp(1, 32);
+        let blocks = (rows * top_k).div_ceil(64).clamp(1, 32);
         o.be.launch_kernel(align, blocks, GLUE_THREADS, 0, &mut params, Some(stream))
     }
 

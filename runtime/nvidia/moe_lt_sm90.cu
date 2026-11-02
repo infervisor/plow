@@ -615,40 +615,71 @@ extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_pre(
     const __nv_bfloat16* gamma, float norm_eps, __nv_bfloat16* h2, const __nv_bfloat16* rscale,
     float root, float rt_eps, unsigned rows, unsigned H) {
     __shared__ float part[32];
+    if (xq) {
 #if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
-    /* d_rmsnorm's fused quant is the reciprocal form; the separate QuantFp8 the interpreter runs
-     * divides. Each block quantizes the rows it normalized. */
+        /* d_rmsnorm's fused quant is the reciprocal form; the separate QuantFp8 the interpreter runs
+         * divides. Each block quantizes the rows it normalized. */
+        d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part);
+        __syncthreads();
+        for (unsigned row = blockIdx.x; xq && row < rows; row += gridDim.x) {
+            const __nv_bfloat16* v = xn2 + (size_t)row * H;
+            float am = 0.0f;
+            for (unsigned h = threadIdx.x; h < H; h += PLOW_NV_THREADS) am = fmaxf(am, fabsf(__bfloat162float(v[h])));
+            const float as = moe_lt_quant_scale(block_max(am, part));
+            if (threadIdx.x == 0) ascale[row] = as;
+            for (unsigned h = threadIdx.x * 2u; h < H; h += PLOW_NV_THREADS * 2u)
+                *(unsigned short*)(xq + (size_t)row * H + h) =
+                    moe_lt_quant_pair(__bfloat162float(v[h]), __bfloat162float(v[h + 1]), as, 0.0f);
+            __syncthreads();
+        }
+#else
+        d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part, xq, ascale);
+#endif
+        const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+        for (unsigned row = blockIdx.x * (PLOW_NV_THREADS / 32u) + warp; row < rows;
+             row += gridDim.x * (PLOW_NV_THREADS / 32u)) {
+            const __nv_bfloat16* r = x + (size_t)row * H;
+            float ss = 0.0f;
+            for (unsigned h = lane; h < H; h += 32u) {
+                const float v = __bfloat162float(r[h]);
+                ss += v * v;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+            const float iv = rsqrtf(ss / (float)H + rt_eps);
+            __nv_bfloat16* o = h2 + (size_t)row * H;
+            for (unsigned h = lane; h < H; h += 32u)
+                o[h] = __float2bfloat16(__bfloat162float(r[h]) * iv * __bfloat162float(rscale[h]) * root);
+        }
+        return;
+    }
+    /* Default T17 threshold: the interpreter's RmsNorm reduction order, so xn2 keeps its bits. */
     d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part);
     __syncthreads();
-    for (unsigned row = blockIdx.x; xq && row < rows; row += gridDim.x) {
-        const __nv_bfloat16* v = xn2 + (size_t)row * H;
-        float am = 0.0f;
-        for (unsigned h = threadIdx.x; h < H; h += PLOW_NV_THREADS) am = fmaxf(am, fabsf(__bfloat162float(v[h])));
-        const float as = moe_lt_quant_scale(block_max(am, part));
-        if (threadIdx.x == 0) ascale[row] = as;
-        for (unsigned h = threadIdx.x * 2u; h < H; h += PLOW_NV_THREADS * 2u)
-            *(unsigned short*)(xq + (size_t)row * H + h) =
-                moe_lt_quant_pair(__bfloat162float(v[h]), __bfloat162float(v[h + 1]), as, 0.0f);
-        __syncthreads();
-    }
-#else
-    d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part, xq, ascale);
-#endif
-    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    for (unsigned row = blockIdx.x * (PLOW_NV_THREADS / 32u) + warp; row < rows;
-         row += gridDim.x * (PLOW_NV_THREADS / 32u)) {
+    const unsigned nvec = H / 8u;
+    for (unsigned row = blockIdx.x; row < rows; row += gridDim.x) {
         const __nv_bfloat16* r = x + (size_t)row * H;
-        float ss = 0.0f;
-        for (unsigned h = lane; h < H; h += 32u) {
-            const float v = __bfloat162float(r[h]);
-            ss += v * v;
-        }
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-        const float iv = rsqrtf(ss / (float)H + rt_eps);
         __nv_bfloat16* o = h2 + (size_t)row * H;
-        for (unsigned h = lane; h < H; h += 32u)
-            o[h] = __float2bfloat16(__bfloat162float(r[h]) * iv * __bfloat162float(rscale[h]) * root);
+        float ss = 0.0f;
+        for (unsigned c = threadIdx.x; c < nvec; c += PLOW_NV_THREADS) {
+            const bf16v8 v = ld_glob8(r + c * 8u);
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float f = __bfloat162float(v.x[j]);
+                ss += f * f;
+            }
+        }
+        const float iv = rsqrtf(block_sum(ss, part) / (float)H + rt_eps);
+        for (unsigned c = threadIdx.x; c < nvec; c += PLOW_NV_THREADS) {
+            const unsigned h = c * 8u;
+            const bf16v8 v = ld_glob8(r + h);
+            const bf16v8 rs = ld_glob8(rscale + h);
+            bf16v8 ov;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                ov.x[j] = __float2bfloat16(__bfloat162float(v.x[j]) * iv * __bfloat162float(rs.x[j]) * root);
+            st_glob8(o + h, ov);
+        }
     }
 }
 
@@ -828,52 +859,73 @@ extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_topk_split(
 /* op_moe.cuh d_moe_align_gemma_pf_multi with slice = blockIdx.x, nblk = gridDim.x and the tile
  * height `bm` (the interpreter's PGM_BM: 128 on the W8A8 twins). meta = [rowoff | cnt | tile
  * prefix] (i32), pad rows PLOW_EXPERT_UNUSED / gate 0. n_exp <= 256. */
+static_assert(MOE_LT_MAX_EXP <= PLOW_NV_THREADS, "route_align scans one expert per thread");
 extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_align(
     int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
     float* row_gate, unsigned T, unsigned n_exp, unsigned k, unsigned bm) {
-    constexpr unsigned U = 8u;
     const unsigned tid = threadIdx.x, nth = blockDim.x, slice = blockIdx.x, nblk = gridDim.x;
     __shared__ unsigned cnt[MOE_LT_MAX_EXP];
     __shared__ unsigned cur[MOE_LT_MAX_EXP];
     __shared__ unsigned start[MOE_LT_MAX_EXP];
+    __shared__ unsigned wsum[PLOW_NV_THREADS / 32u];
     __shared__ unsigned s_tiles;
     const unsigned nslot = T * k;
     const unsigned span = (nslot + nblk - 1u) / nblk;
     const unsigned lo = min(nslot, slice * span), hi = min(nslot, lo + span);
     for (unsigned e = tid; e < n_exp; e += nth) cnt[e] = cur[e] = 0u;
     __syncthreads();
-    for (unsigned base = 0; base < nslot; base += nth * U) {
-        unsigned eid[U];
-#pragma unroll
-        for (unsigned j = 0; j < U; j++) {
-            const unsigned idx = base + j * nth + tid;
-            eid[j] = idx < nslot ? *(const unsigned*)(table + (size_t)idx * 8) : ~0u;
+    const unsigned npairs = nslot / 2u;
+    for (unsigned p = tid; p < npairs; p += nth) {
+        const uint4 raw = *(const uint4*)(table + (size_t)p * 16u);
+        const unsigned idx0 = p * 2u;
+        const unsigned idx1 = idx0 + 1u;
+        if (raw.x < n_exp) {
+            atomicAdd(&cnt[raw.x], 1u);
+            if (idx0 < lo) atomicAdd(&cur[raw.x], 1u);
         }
-#pragma unroll
-        for (unsigned j = 0; j < U; j++)
-            if (eid[j] < n_exp) {
-                atomicAdd(&cnt[eid[j]], 1u);
-                if (base + j * nth + tid < lo) atomicAdd(&cur[eid[j]], 1u);
-            }
+        if (raw.z < n_exp) {
+            atomicAdd(&cnt[raw.z], 1u);
+            if (idx1 < lo) atomicAdd(&cur[raw.z], 1u);
+        }
+    }
+    if ((nslot & 1u) && tid == 0) {
+        const unsigned idx = nslot - 1u;
+        const uint2 slot = *(const uint2*)(table + (size_t)idx * 8u);
+        if (slot.x < n_exp) {
+            atomicAdd(&cnt[slot.x], 1u);
+            if (idx < lo) atomicAdd(&cur[slot.x], 1u);
+        }
     }
     __syncthreads();
-    if (tid == 0) {
-        int* rowoff = meta;
-        int* mcnt = meta + n_exp;
-        int* tilep = meta + 2u * n_exp;
-        unsigned tp = 0u;
-        for (unsigned e = 0; e < n_exp; e++) {
-            if (slice == 0) {
-                tilep[e] = (int)tp;
-                rowoff[e] = (int)(tp * bm);
-                mcnt[e] = (int)cnt[e];
-            }
-            start[e] = tp * bm;
-            cur[e] += tp * bm;
-            tp += (cnt[e] + bm - 1u) / bm;
+    const unsigned c = (tid < n_exp) ? cnt[tid] : 0u;
+    const unsigned tiles = (tid < n_exp) ? ((c + bm - 1u) / bm) : 0u;
+    const unsigned lane = tid & 31u, warp = tid >> 5;
+    unsigned v = tiles;
+#pragma unroll
+    for (unsigned o = 1u; o < 32u; o <<= 1) {
+        const unsigned t = __shfl_up_sync(0xffffffffu, v, o);
+        if (lane >= o) v += t;
+    }
+    if (lane == 31u) wsum[warp] = v;
+    __syncthreads();
+    unsigned warp_prefix = 0u;
+    for (unsigned w = 0; w < warp; w++) warp_prefix += wsum[w];
+    v += warp_prefix;
+    const unsigned tp = v - tiles;
+    if (tid < n_exp) {
+        start[tid] = tp * bm;
+        cur[tid] += tp * bm;
+        if (slice == 0) {
+            meta[tid] = (int)(tp * bm);
+            meta[n_exp + tid] = (int)c;
+            meta[2u * n_exp + tid] = (int)tp;
         }
-        if (slice == 0) tilep[n_exp] = (int)tp;
-        s_tiles = tp;
+    }
+    if (tid == 0) {
+        unsigned total_tiles = 0u;
+        for (unsigned w = 0; w < (PLOW_NV_THREADS / 32u); w++) total_tiles += wsum[w];
+        s_tiles = total_tiles;
+        if (slice == 0) meta[2u * n_exp + n_exp] = (int)total_tiles;
     }
     __syncthreads();
     for (unsigned e = slice; e < n_exp; e += nblk) {
@@ -896,10 +948,10 @@ extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_align(
     }
     __syncthreads();
     for (unsigned idx = lo + tid; idx < hi; idx += nth) {
-        const uint2 slot = *(const uint2*)(table + (size_t)idx * 8);
+        const uint2 slot = *(const uint2*)(table + (size_t)idx * 8u);
         if (slot.x >= n_exp) continue;
         const unsigned pos = atomicAdd(&cur[slot.x], 1u);
-        row_token[pos] = idx / k;
+        row_token[pos] = (k == 8u) ? (idx >> 3u) : (idx / k);
         row_partidx[pos] = idx;
         row_gate[pos] = __uint_as_float(slot.y);
     }
