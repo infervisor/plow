@@ -4716,6 +4716,12 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         if val >= 1 {
             return Ok(false);
         }
+        if val < 0 {
+            tier.signals.remove(&fence);
+            return Err(RuntimeError::Device(format!(
+                "async copy failed (signal {val})"
+            )));
+        }
         let sig = tier.signals.remove(&fence).expect("checked above");
         tier.spare.push(sig);
         Ok(true)
@@ -4733,14 +4739,26 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             tier.spare.push(sig);
             return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
         }
-        unsafe {
-            (self.shared.drv.hsa_signal_wait_scacquire)(
-                sig,
-                HSA_SIGNAL_CONDITION_LT,
-                1,
-                u64::MAX,
-                HSA_WAIT_STATE_BLOCKED,
-            );
+        // A wait may return early (spurious wake); a copy that failed leaves the signal negative.
+        let val = loop {
+            let v = unsafe {
+                (self.shared.drv.hsa_signal_wait_scacquire)(
+                    sig,
+                    HSA_SIGNAL_CONDITION_LT,
+                    1,
+                    u64::MAX,
+                    HSA_WAIT_STATE_BLOCKED,
+                )
+            };
+            if v < 1 {
+                break v;
+            }
+        };
+        if val < 0 {
+            // The signal's state is the copy's error; it is not reused.
+            return Err(RuntimeError::Device(format!(
+                "async copy failed (signal {val})"
+            )));
         }
         tier.spare.push(sig);
         Ok(())

@@ -3267,6 +3267,12 @@ fn amd_block(
 /// The first real caller of [`device::select_all`], which had none: plowrt
 /// bound device 0 and nothing else. The enumeration is carved into the node's
 /// TP replicas, and a backend's position within its replica is its rank.
+#[cfg(not(target_os = "linux"))]
+fn devices_xfer(_mib: u32, _iters: u32) -> Result<(), Box<dyn std::error::Error>> {
+    Err("--xfer-mib: host staging regions are Linux-only".into())
+}
+
+#[cfg(target_os = "linux")]
 fn devices_xfer(mib: u32, iters: u32) -> Result<(), Box<dyn std::error::Error>> {
     let devs = device::inventory()?;
     println!("devices: {}", devs.len());
@@ -3946,17 +3952,6 @@ fn simulate(
     Ok(())
 }
 
-/// The vendor an asset directory's packet targets, from its `weights.json` alone (no device).
-fn asset_target_vendor(dir: &std::path::Path) -> Option<hwspec::Vendor> {
-    #[derive(serde::Deserialize)]
-    struct Target {
-        gpu: String,
-    }
-    let raw = std::fs::read(dir.join("weights.json")).ok()?;
-    let t: Target = serde_json::from_slice(&raw).ok()?;
-    hwspec::registry::lookup(&t.gpu).map(|s| s.vendor)
-}
-
 /// Device groups both vendor paths plan before anything is installed (docs/arch/30 §2).
 #[cfg(any(feature = "cuda", feature = "hsa"))]
 #[derive(Default)]
@@ -4027,7 +4022,7 @@ async fn bringup_runtime(
     let mixed_hsa: Option<Arc<device::hsa::HsaBackend>> = if vendor == Some(hwspec::Vendor::Nvidia)
         && assets
             .iter()
-            .any(|d| asset_target_vendor(d) == Some(hwspec::Vendor::Amd))
+            .any(|d| plowrt::asset::target_vendor(d) == Some(hwspec::Vendor::Amd))
     {
         let b = device::hsa::HsaBackend::new(0)
             .map_err(|e| format!("an asset targets AMD, but no HSA device opens: {e}"))?;
@@ -4186,15 +4181,18 @@ async fn bringup_runtime(
     #[cfg(feature = "cuda")]
     let mut cuda_loads: Vec<Arc<plowrt::serve::manager::ModelManager>> = Vec::new();
     // Under a mixed serve, which vendor a slug (or `slug#r` instance) is served by.
-    let is_amd_slug = |slug: &str| -> bool {
+    let slug_vendor = |slug: &str| -> Option<hwspec::Vendor> {
         let model = plowrt::serve::dp::split_key(slug).map_or(slug, |(m, _)| m);
         state
             .registry
             .get(model)
             .ok()
             .and_then(|b| hwspec::registry::lookup(&b.manifest.gpu).map(|s| s.vendor))
-            == Some(hwspec::Vendor::Amd)
     };
+    let is_amd_slug = |slug: &str| slug_vendor(slug) == Some(hwspec::Vendor::Amd);
+    // A name the other vendor's path serves; an unknown name is never skipped, so a typo in
+    // `--pin` / `--dp` is still refused.
+    let is_nv_slug = |slug: &str| slug_vendor(slug) == Some(hwspec::Vendor::Nvidia);
     #[cfg(feature = "cuda")]
     let mut managed_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     #[cfg(feature = "cuda")]
@@ -4209,7 +4207,7 @@ async fn bringup_runtime(
         }
         for dir in assets
             .iter()
-            .filter(|d| asset_target_vendor(d) != Some(hwspec::Vendor::Amd))
+            .filter(|d| plowrt::asset::target_vendor(d) != Some(hwspec::Vendor::Amd))
         {
             plowrt::asset::serve::check_runtime(
                 dir,
@@ -4635,7 +4633,7 @@ async fn bringup_runtime(
         }
         if let Some(m) = dp_spec
             .named()
-            .find(|m| !(mixed && !is_amd_slug(m)) && !plan.iter().any(|p| p.0 == *m))
+            .find(|m| !(mixed && is_nv_slug(m)) && !plan.iter().any(|p| p.0 == *m))
         {
             return Err(
                 format!("--dp {m}=… names a model this server does not serve on the GPU").into(),
@@ -4664,7 +4662,7 @@ async fn bringup_runtime(
         }
         // As on CUDA: `--pin slug@o` goes to the model's next unpinned rank, `slug#r@o` to that rank.
         for (slug, ordinal) in placement::parse_pins(&cfg.pin)? {
-            if mixed && !is_amd_slug(&slug) {
+            if mixed && is_nv_slug(&slug) {
                 continue;
             }
             let unpinned = specs

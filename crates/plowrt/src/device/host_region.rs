@@ -190,7 +190,6 @@ pub fn xfer_check(
     bytes: usize,
     iters: u32,
 ) -> Result<(Vec<XferResult>, Vec<String>)> {
-    use std::time::Instant;
     let n = devs.len();
     if n == 0 {
         return Err(RuntimeError::Rejected("xfer check: no devices".into()));
@@ -211,7 +210,26 @@ pub fn xfer_check(
         .iter()
         .map(|d| d.handle.backend().alloc(0, bytes as u64))
         .collect::<Result<_>>()?;
-    let region = &region;
+    let out = transfers(devs, bytes, iters, &region, &aliases, &bufs);
+    if out.is_err() {
+        // A failed fence does not prove the copy stopped: the region and the device buffers
+        // stay mapped and allocated for the life of the process rather than be reused under DMA.
+        std::mem::forget(region);
+        std::mem::forget(bufs);
+    }
+    out
+}
+
+fn transfers(
+    devs: &[super::Device],
+    bytes: usize,
+    iters: u32,
+    region: &HostRegion,
+    aliases: &[u64],
+    bufs: &[super::DeviceMem],
+) -> Result<(Vec<XferResult>, Vec<String>)> {
+    use std::time::Instant;
+    let n = devs.len();
     let start = std::sync::Barrier::new(n);
     let start = &start;
     let results: Vec<Result<XferResult>> = std::thread::scope(|s| {

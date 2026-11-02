@@ -625,6 +625,10 @@ pub trait ManagerDevice: Send + Sync {
     fn pool_bytes(&self) -> u64;
     /// Trim chunk pool to `keep_bytes`.
     fn pool_trim(&self, keep_bytes: u64) -> u64;
+    /// The vendor whose packets this device runs; `None` for the host device.
+    fn vendor(&self) -> Option<hwspec::Vendor> {
+        None
+    }
     /// Load an engine for `dir` and `ckpt`.
     fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine>;
     /// Check whether sibling packets are resident.
@@ -664,6 +668,9 @@ impl CudaManagerDevice {
 impl ManagerDevice for CudaManagerDevice {
     fn device_ordinal(&self) -> u8 {
         self.be.device_ordinal
+    }
+    fn vendor(&self) -> Option<hwspec::Vendor> {
+        Some(hwspec::Vendor::Nvidia)
     }
     fn mem_info(&self) -> Result<(u64, u64)> {
         self.be.mem_info()
@@ -721,6 +728,9 @@ impl HsaManagerDevice {
 impl ManagerDevice for HsaManagerDevice {
     fn device_ordinal(&self) -> u8 {
         self.be.device_ordinal
+    }
+    fn vendor(&self) -> Option<hwspec::Vendor> {
+        Some(hwspec::Vendor::Amd)
     }
     fn mem_info(&self) -> Result<(u64, u64)> {
         let free = self.be.free_bytes().unwrap_or(0);
@@ -1117,6 +1127,10 @@ impl ModelManager {
 
     /// The device ordinals this manager's group covers. One today (a manager
     /// owns one backend); a tensor-parallel group would report its whole run.
+    pub fn vendor(&self) -> Option<hwspec::Vendor> {
+        self.device.vendor()
+    }
+
     pub fn ordinals(&self) -> Vec<u32> {
         vec![u32::from(self.device.device_ordinal())]
     }

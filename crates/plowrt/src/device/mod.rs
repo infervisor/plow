@@ -15,6 +15,7 @@ use crate::Result;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(target_os = "linux")]
 pub mod host_region;
 #[cfg(feature = "hsa")]
 pub mod hsa;
@@ -181,6 +182,20 @@ impl std::str::FromStr for DevId {
     }
 }
 
+/// A device-0 open error that means "this vendor has no device here" (no driver library, no
+/// visible device), as opposed to a device that exists and fails.
+#[allow(dead_code)]
+fn driver_absent(e: &str) -> bool {
+    [
+        "dlopen",
+        "CUDA_ERROR_NO_DEVICE",
+        "no GPU agents",
+        ">= 0 GPU agents",
+    ]
+    .iter()
+    .any(|m| e.contains(m))
+}
+
 /// One device of the inventory, with its typed backend.
 #[derive(Clone)]
 pub enum DeviceHandle {
@@ -200,6 +215,7 @@ impl DeviceHandle {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn staging(&self) -> Arc<dyn host_region::HostStaging> {
         match *self {
             #[cfg(feature = "cuda")]
@@ -224,7 +240,7 @@ pub fn inventory() -> Result<Vec<Device>> {
     #[cfg(feature = "cuda")]
     match cuda::CudaBackend::new(0) {
         Ok(first) => {
-            let n = first.device_count().unwrap_or(1);
+            let n = first.device_count()?;
             out.push(Device {
                 id: DevId {
                     vendor: Vendor::Nvidia,
@@ -249,7 +265,12 @@ pub fn inventory() -> Result<Vec<Device>> {
                 }
             }
         }
-        Err(e) => tracing::info!(%e, "no CUDA devices"),
+        Err(e) if driver_absent(&e.to_string()) => tracing::info!(%e, "no CUDA devices"),
+        Err(e) => {
+            return Err(crate::RuntimeError::Device(format!(
+                "nv:0 will not open: {e}"
+            )))
+        }
     }
     #[cfg(feature = "hsa")]
     match hsa::HsaBackend::new(0) {
@@ -279,7 +300,12 @@ pub fn inventory() -> Result<Vec<Device>> {
                 }
             }
         }
-        Err(e) => tracing::info!(%e, "no HSA devices"),
+        Err(e) if driver_absent(&e.to_string()) => tracing::info!(%e, "no HSA devices"),
+        Err(e) => {
+            return Err(crate::RuntimeError::Device(format!(
+                "amd:0 will not open: {e}"
+            )))
+        }
     }
     Ok(out)
 }
