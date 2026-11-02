@@ -2050,16 +2050,7 @@ impl ModelManager {
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(EnsureError::Load(e));
         }
-        let mut claimed = crate::config::scoped(Some(cfg), || self.claim_kv(&state, &m.slug));
-        if let Err((_, short)) = claimed {
-            if short > 0 {
-                let free = self.free_vram().map_err(EnsureError::Load)?;
-                self.reclaim_from(free.saturating_add(short), free, || self.free_vram())
-                    .await?;
-                claimed = crate::config::scoped(Some(cfg), || self.claim_kv(&state, &m.slug));
-            }
-        }
-        if let Err((e, _)) = claimed {
+        if let Err(e) = self.claim_kv_reclaiming(&state, &m.slug, cfg).await {
             tracing::warn!(slug = %m.slug, error = %e, "planner: loaded model left without KV room — unloading");
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(e);
@@ -2067,6 +2058,33 @@ impl ModelManager {
         let mux = mux::spawn(m.slug.clone(), bundle, Arc::clone(&state), self.mux_cfg);
         state.install_mux(m.slug.clone(), mux);
         Ok(())
+    }
+
+    /// [`Self::claim_kv`], and while it is refused for device bytes resident caches can free,
+    /// reclaim that shortfall and claim again (each claim can surface the next check's shortfall).
+    async fn claim_kv_reclaiming(
+        &self,
+        state: &AppState,
+        slug: &str,
+        cfg: &'static crate::config::RuntimeConfig,
+    ) -> std::result::Result<(), EnsureError> {
+        let until = Instant::now() + CACHE_RECLAIM_DEADLINE;
+        loop {
+            let (e, short) = match crate::config::scoped(Some(cfg), || self.claim_kv(state, slug)) {
+                Ok(()) => return Ok(()),
+                Err(refused) => refused,
+            };
+            if short == 0 || Instant::now() >= until {
+                return Err(e);
+            }
+            let free = self.free_vram().map_err(EnsureError::Load)?;
+            let after = self
+                .reclaim_from(free.saturating_add(short), free, until, || self.free_vram())
+                .await?;
+            if after <= free {
+                return Err(e);
+            }
+        }
     }
 
     /// After `slug`'s load and before its mux: refuse it unless its KV admission budget backs
@@ -2214,24 +2232,28 @@ impl ModelManager {
         if self.planned_headroom().map_err(EnsureError::Load)? < need {
             return Ok(avail);
         }
-        self.reclaim_from(need, avail, || self.fit_capacity(self.device.pool_bytes()))
-            .await
+        let until = Instant::now() + CACHE_RECLAIM_DEADLINE;
+        self.reclaim_from(need, avail, until, || {
+            self.fit_capacity(self.device.pool_bytes())
+        })
+        .await
     }
 
     /// Resident engines give back cache (parked live rings, prefix store chunks, LRU boundaries)
-    /// one bounded step at a time until `measure` reaches `need`, re-reading it while the
-    /// released memory lands (store chunks free on a worker thread). Returns the last measure.
+    /// one bounded step at a time until `measure` reaches `need` or `until` passes, re-reading it
+    /// while the released memory lands (store chunks free on a worker thread). Returns the last
+    /// measure.
     async fn reclaim_from(
         &self,
         need: u64,
         mut avail: u64,
+        until: Instant,
         measure: impl Fn() -> Result<u64>,
     ) -> std::result::Result<u64, EnsureError> {
         let state = self.state()?;
         let slugs: Vec<String> = self.models.read().iter().map(|m| m.slug.clone()).collect();
-        let t0 = Instant::now();
         for slug in slugs {
-            if avail >= need || t0.elapsed() >= CACHE_RECLAIM_DEADLINE {
+            if avail >= need || Instant::now() >= until {
                 break;
             }
             let Some(engine) = state.gpu_engine(&slug) else {
@@ -2239,7 +2261,7 @@ impl ModelManager {
             };
             let (start, mut steps) = (avail, 0u32);
             // Bounded steps, the engine mutex released between them: the mux keeps ticking.
-            while avail < need && t0.elapsed() < CACHE_RECLAIM_DEADLINE {
+            while avail < need && Instant::now() < until {
                 let step = (need - avail).min(CACHE_RECLAIM_STEP);
                 let released = engine.lock().reclaim_device(step);
                 match released {
@@ -2302,10 +2324,11 @@ struct KvShare {
 /// has admitted, and the rest splits in proportion to the sequence bytes.
 fn kv_shares(room: u64, shares: &[KvShare]) -> std::result::Result<Vec<u64>, KvRefusal> {
     let reserve = shares.iter().map(|s| s.reserve).max().unwrap_or(0);
-    let room = room.saturating_sub(reserve);
     let floor = |s: &KvShare| s.seq.max(s.committed);
     let need: u64 = shares.iter().map(floor).sum();
-    if need > room {
+    let short = (need + reserve).saturating_sub(room);
+    let room = room.saturating_sub(reserve);
+    if short > 0 {
         let e = EnsureError::NoKvRoom(format!(
             "co-resident models need {} MiB to keep their admitted sequences and one \
              full-context sequence each, and the device backs {} MiB beside a {} MiB reserve",
@@ -2313,7 +2336,7 @@ fn kv_shares(room: u64, shares: &[KvShare]) -> std::result::Result<Vec<u64>, KvR
             room >> 20,
             reserve >> 20
         ));
-        return Err((e, need - room));
+        return Err((e, short));
     }
     let spare = (room - need) as u128;
     let seqs: u128 = shares.iter().map(|s| s.seq as u128).sum::<u128>().max(1);
@@ -2752,6 +2775,9 @@ mod tests {
         let (e, short) = kv_shares(4400 << 20, &shares).unwrap_err();
         assert!(matches!(e, EnsureError::NoKvRoom(_)), "{e}");
         assert_eq!(short, (4352 + 256 - 4400) << 20);
+        // Room below the reserve: the shortfall covers the reserve and both floors.
+        let (_, short) = kv_shares(64 << 20, &shares).unwrap_err();
+        assert_eq!(short, (4352 + 256 - 64) << 20);
         let e = kv_shares(
             4 * GIB,
             &[share(GIB / 4, 3 * GIB, 0), share(GIB / 4, 0, GIB)],
