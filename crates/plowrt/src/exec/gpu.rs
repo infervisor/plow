@@ -953,6 +953,13 @@ impl SegmentRoleValidation for SegmentRoles {
                     .copied()
                     .filter(|&role| plow_asset::segment_roles::requires_object(role)),
             );
+            // The native block-FP8 object serves cuBLASLt projection segments: it rides that role.
+            let native = plow_asset::segment_roles::NATIVE_DECODE_FP8_BLOCK;
+            if p.roles.contains(&plow_asset::segment_roles::CUBLASLT)
+                && self.objects.contains_key(&native)
+            {
+                used.insert(native);
+            }
             if !p.library.is_empty() {
                 if decode {
                     return Err(RuntimeError::Rejected(
