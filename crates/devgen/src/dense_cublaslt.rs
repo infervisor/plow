@@ -29,8 +29,10 @@ pub(crate) fn apply_prefill(
 }
 
 /// One `MOE_PREFILL_CUBLASLT` segment per layer: the grouped expert GLU and DOWN GEMMs, which
-/// the CUDA runtime can serve with cuBLASLt grouped matmuls. Align, router and combine stay in
-/// their interpreter segment, so a runtime without the route runs the packet unchanged.
+/// the CUDA runtime can serve with cuBLASLt grouped matmuls, with the combine that follows them.
+/// With `PLOW_EMIT_MOE_PF_LT_ROUTE` the expert-input norm, router and align join the segment
+/// too. The segment's instructions stay interpreter ops, so a runtime without the route runs the
+/// packet unchanged.
 pub(crate) fn apply_moe_prefill(
     model: &mut Model,
     sections: &mut Vec<SectionData>,
@@ -62,9 +64,23 @@ pub(crate) fn apply_moe_prefill(
                 {
                     groups[head] = Some(head);
                     groups[head + 1] = Some(head);
+                    let mut end = head + 2;
                     if let Some(comb) = insts.get(head + 2) {
                         if is_prefill_tail(glu, down, comb) {
                             groups[head + 2] = Some(head);
+                            end = head + 3;
+                        }
+                    }
+                    if route && head >= 3 && is_bf16_route_prologue(&insts[head - 3..=head]) {
+                        let program = &model.progs[index];
+                        if queue_contiguous(program, head - 3..end) {
+                            groups[head - 3..head].fill(Some(head));
+                        } else {
+                            eprintln!(
+                                "  cuBLASLt MoE prefill: T={} layer at inst {head}: router \
+                                 prologue not contiguous in the queue, left in the interpreter",
+                                model.prog_t[index]
+                            );
                         }
                     }
                 }
@@ -143,6 +159,34 @@ fn is_w8a8_route_prologue(insts: &[DevInst]) -> bool {
         && [quant.i[0], quant.i[1]] == [rows, glu.i[1]]
         && quant.t[3] == packet::dev::TENSOR_NONE
         && quant.t[4] == packet::dev::TENSOR_NONE
+}
+
+/// `[RmsNorm (expert input), MoeRouterGemmaPf, MoeAlignGemmaPf, glu]`: the BF16 chain's inputs,
+/// which `PLOW_EMIT_MOE_PF_LT_ROUTE` moves into the library segment. The route's logits kernel
+/// covers at most 128 experts and `hidden` a multiple of 128 (8 K slices of 16-column steps).
+/// plowrt's `moe_lt::route_prologue` checks the same operands.
+fn is_bf16_route_prologue(insts: &[DevInst]) -> bool {
+    let [norm, router, align, glu] = insts else {
+        return false;
+    };
+    let rows = align.i[0];
+    norm.op == DevOp::RmsNorm as u16
+        && router.op == DevOp::MoeRouterGemmaPf as u16
+        && align.op == DevOp::MoeAlignGemmaPf as u16
+        && glu.op == DevOp::MoeGroupGluGemmaPf as u16
+        && [norm.i[0], norm.i[1]] == [rows, glu.i[1]]
+        && norm.i[7] == 0
+        && norm.t[3] == packet::dev::TENSOR_NONE
+        && norm.t[4] == packet::dev::TENSOR_NONE
+        && norm.t[0] == glu.t[1]
+        && norm.t[1] == router.t[1]
+        && [router.i[0], router.i[1], router.i[2], router.i[3]]
+            == [glu.i[1], glu.i[2], align.i[2], rows]
+        && align.i[1] == glu.i[2]
+        && align.t[1] == router.t[0]
+        && [align.t[0], align.t[2]] == [glu.t[3], glu.t[4]]
+        && glu.i[2] <= 128
+        && glu.i[1] % 128 == 0
 }
 
 /// Every queue entry of `insts` forms one contiguous run of the program's global queue.
@@ -994,6 +1038,42 @@ mod tests {
         assert!(is_w8a8_route_prologue(&insts));
         insts[0].i[7] = 1;
         assert!(!is_w8a8_route_prologue(&insts));
+    }
+
+    #[test]
+    fn bf16_route_prologue_feeds_the_glu_from_the_router_residual() {
+        let none = packet::dev::TENSOR_NONE;
+        let mut insts = [
+            DevOp::RmsNorm,
+            DevOp::MoeRouterGemmaPf,
+            DevOp::MoeAlignGemmaPf,
+            DevOp::MoeGroupGluGemmaPf,
+        ]
+        .map(|op| DevInst {
+            op: op as u16,
+            t: [none; 8],
+            ..Default::default()
+        });
+        let [norm, router, align, glu] = &mut insts;
+        glu.t[..5].copy_from_slice(&[0, 1, 2, 3, 4]);
+        glu.i[..3].copy_from_slice(&[704, 2816, 128]);
+        norm.t[..3].copy_from_slice(&[1, 17, 18]);
+        norm.i[..2].copy_from_slice(&[1024, 2816]);
+        router.t[..2].copy_from_slice(&[8, 17]);
+        router.i[..4].copy_from_slice(&[2816, 128, 8, 1024]);
+        align.t[..3].copy_from_slice(&[3, 8, 4]);
+        align.i[..3].copy_from_slice(&[1024, 128, 8]);
+        assert!(is_bf16_route_prologue(&insts));
+        for edit in [
+            |i: &mut [DevInst; 4]| i[0].i[7] = 1,
+            |i: &mut [DevInst; 4]| i[0].t[0] = 9,
+            |i: &mut [DevInst; 4]| i[1].t[1] = 9,
+            |i: &mut [DevInst; 4]| i[3].i[2] = 256,
+        ] {
+            let mut bad = insts;
+            edit(&mut bad);
+            assert!(!is_bf16_route_prologue(&bad));
+        }
     }
 
     #[test]

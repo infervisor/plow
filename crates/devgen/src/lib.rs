@@ -7182,10 +7182,10 @@ fn emit_phase(
                     d.i[1] = c.hidden;
                     d.f[0] = c.eps;
                 });
-                // PLOW_EMIT_MOE_PF_LT_ROUTE: order the expert-input norm and the router after
+                // PLOW_EMIT_MOE_PF_LT_ROUTE (W8A8 and BF16): order the expert-input norm and the router after
                 // the dense branch's post-norm, so they sit next to the grouped GEMMs in the queue
                 // and `dense_cublaslt::apply_moe_prefill` can put them in the library segment.
-                let route_deps = if w8a8 && emit_config::active().moe_pf_lt_route {
+                let route_deps = if emit_config::active().moe_pf_lt_route {
                     vec![c_pf, c_h1]
                 } else {
                     vec![c_pf]
