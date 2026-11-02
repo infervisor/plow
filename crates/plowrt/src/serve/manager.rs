@@ -2136,23 +2136,21 @@ impl ModelManager {
             .collect()
     }
 
-    /// Free plus every engine's live KV, and each engine's share inputs. Free and held are each
-    /// read twice, interleaved, and the smaller kept (per engine for held): bytes mapped or
-    /// released between the reads then count once at most.
+    /// Free plus every engine's live KV, and each engine's share inputs. Every engine lock is
+    /// held across the reads (slug order; nothing else takes two), so no tick maps or retires
+    /// KV between the held samples and the free sample.
     fn kv_snapshot(
         &self,
         engines: &[(String, Arc<Mutex<crate::serve::engine::ServeEngine>>)],
     ) -> std::result::Result<(u64, Vec<KvShare>), EnsureError> {
-        let held_before: Vec<u64> = engines
-            .iter()
-            .map(|(_, e)| e.lock().kv_live_held())
-            .collect();
-        let free_before = self.free_vram().map_err(EnsureError::Load)?;
+        let mut order: Vec<usize> = (0..engines.len()).collect();
+        order.sort_by(|&a, &b| engines[a].0.cmp(&engines[b].0));
+        let mut guards: Vec<_> = order.iter().map(|&i| (i, engines[i].1.lock())).collect();
+        guards.sort_by_key(|(i, _)| *i);
         let mut held = 0u64;
         let mut shares = Vec::with_capacity(engines.len());
-        for ((slug, e), before) in engines.iter().zip(held_before) {
-            let e = e.lock();
-            held += before.min(e.kv_live_held());
+        for ((slug, _), (_, e)) in engines.iter().zip(&guards) {
+            held += e.kv_live_held();
             let seq = e
                 .kv_admission_budget()
                 .map_or(0, |b| b.bytes_for_rows(e.max_ctx() as u64));
@@ -2163,7 +2161,8 @@ impl ModelManager {
                 reserve: e.kv_admit_reserve(),
             });
         }
-        let free = free_before.min(self.free_vram().map_err(EnsureError::Load)?);
+        let free = self.free_vram().map_err(EnsureError::Load)?;
+        drop(guards);
         Ok((free + held, shares))
     }
 }
