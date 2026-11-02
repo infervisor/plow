@@ -1834,7 +1834,7 @@ impl ModelManager {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
-        if let Err(e) = self.share_kv(&state) {
+        if let Err((e, _)) = self.share_kv(&state) {
             tracing::warn!(%slug, error = ?e, "planner: co-resident KV shares after unload");
         }
         let unload_ms = ms(t1);
@@ -2050,7 +2050,16 @@ impl ModelManager {
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(EnsureError::Load(e));
         }
-        if let Err(e) = crate::config::scoped(Some(cfg), || self.claim_kv(&state, &m.slug)) {
+        let mut claimed = crate::config::scoped(Some(cfg), || self.claim_kv(&state, &m.slug));
+        if let Err((_, short)) = claimed {
+            if short > 0 {
+                let free = self.free_vram().map_err(EnsureError::Load)?;
+                self.reclaim_from(free.saturating_add(short), free, || self.free_vram())
+                    .await?;
+                claimed = crate::config::scoped(Some(cfg), || self.claim_kv(&state, &m.slug));
+            }
+        }
+        if let Err((e, _)) = claimed {
             tracing::warn!(slug = %m.slug, error = %e, "planner: loaded model left without KV room — unloading");
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(e);
@@ -2062,8 +2071,9 @@ impl ModelManager {
 
     /// After `slug`'s load and before its mux: refuse it unless its KV admission budget backs
     /// one sequence at its full context and the device still leaves every co-resident model
-    /// its claim; otherwise record its own claim.
-    fn claim_kv(&self, state: &AppState, slug: &str) -> std::result::Result<(), EnsureError> {
+    /// its claim; otherwise record its own claim. A refusal carries the device bytes short,
+    /// 0 when freeing resident caches cannot help.
+    fn claim_kv(&self, state: &AppState, slug: &str) -> std::result::Result<(), KvRefusal> {
         let own = match state.gpu_engine(slug) {
             Some(engine) => {
                 let e = engine.lock();
@@ -2076,16 +2086,17 @@ impl ModelManager {
         if let Some((budget, reserve, ctx)) = own {
             let need = budget.bytes_for_rows(ctx as u64);
             if need > budget.budget_bytes {
-                return Err(EnsureError::NoKvRoom(format!(
+                let e = EnsureError::NoKvRoom(format!(
                     "{slug} loaded with a {} MiB KV admission budget and one {ctx}-token \
                      sequence needs {} MiB",
                     budget.budget_bytes >> 20,
                     need >> 20
-                )));
+                ));
+                return Err((e, 0));
             }
             claim = Some(reserve + need);
         }
-        let free = self.free_vram().map_err(EnsureError::Load)?;
+        let free = self.free_vram().map_err(|e| (EnsureError::Load(e), 0))?;
         let mut claims = self.kv_claims.lock();
         let others: u64 = claims
             .iter()
@@ -2111,7 +2122,7 @@ impl ModelManager {
     /// full-context sequence, whichever is larger, then the rest split by one sequence's bytes.
     /// Its prefix caches keep free what the others' caps and that reserve need. Refuses when the
     /// shares cannot cover that. Admission is held while reservations are read and caps set.
-    fn share_kv(&self, state: &AppState) -> std::result::Result<(), EnsureError> {
+    fn share_kv(&self, state: &AppState) -> std::result::Result<(), KvRefusal> {
         let engines = self.kv_engines(state);
         if engines.len() < 2 {
             for (slug, e) in &engines {
@@ -2121,13 +2132,15 @@ impl ModelManager {
             return Ok(());
         }
         for (_, e) in &engines {
-            e.lock().enter_co_tenancy().map_err(EnsureError::Load)?;
+            e.lock()
+                .enter_co_tenancy()
+                .map_err(|e| (EnsureError::Load(e), 0))?;
         }
         let metrics: Vec<_> = engines
             .iter()
             .map(|(s, _)| state.model_metrics(s))
             .collect();
-        let (room, mut shares) = self.kv_snapshot(&engines)?;
+        let (room, mut shares) = self.kv_snapshot(&engines).map_err(|e| (e, 0))?;
         // Engine locks are not taken while these are held (a mux may seat under its engine lock).
         let mut cells: Vec<_> = metrics.iter().map(|m| m.kv_share.lock()).collect();
         for (share, cell) in shares.iter_mut().zip(&cells) {
@@ -2193,19 +2206,27 @@ impl ModelManager {
         Ok((free + held, shares))
     }
 
-    /// A load that does not fit `avail`: resident engines give back cache (parked live rings,
-    /// prefix store chunks, LRU boundaries) one at a time, and the fit is re-read from the device
-    /// while the released memory lands (store chunks free on a worker thread). Returns the new
-    /// capacity; eviction stays the caller's next step when it is still short.
-    async fn reclaim_caches(
-        &self,
-        need: u64,
-        mut avail: u64,
-    ) -> std::result::Result<u64, EnsureError> {
+    /// A load that does not fit `avail`: resident caches give memory back ([`Self::reclaim_from`])
+    /// and the fit is re-read. Returns the new capacity; eviction stays the caller's next step
+    /// when it is still short.
+    async fn reclaim_caches(&self, need: u64, avail: u64) -> std::result::Result<u64, EnsureError> {
         // What the plan leaves bounds the fit whatever the caches free: then only eviction helps.
         if self.planned_headroom().map_err(EnsureError::Load)? < need {
             return Ok(avail);
         }
+        self.reclaim_from(need, avail, || self.fit_capacity(self.device.pool_bytes()))
+            .await
+    }
+
+    /// Resident engines give back cache (parked live rings, prefix store chunks, LRU boundaries)
+    /// one bounded step at a time until `measure` reaches `need`, re-reading it while the
+    /// released memory lands (store chunks free on a worker thread). Returns the last measure.
+    async fn reclaim_from(
+        &self,
+        need: u64,
+        mut avail: u64,
+        measure: impl Fn() -> Result<u64>,
+    ) -> std::result::Result<u64, EnsureError> {
         let state = self.state()?;
         let slugs: Vec<String> = self.models.read().iter().map(|m| m.slug.clone()).collect();
         let t0 = Instant::now();
@@ -2236,9 +2257,7 @@ impl ModelManager {
                 let mut still = 0;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    avail = self
-                        .fit_capacity(self.device.pool_bytes())
-                        .map_err(EnsureError::Load)?;
+                    avail = measure().map_err(EnsureError::Load)?;
                     if avail >= need || avail >= before.saturating_add(step) {
                         break;
                     }
@@ -2256,13 +2275,16 @@ impl ModelManager {
                     gained_gib = gib(avail.saturating_sub(start)),
                     need_gib = gib(need),
                     avail_gib = gib(avail),
-                    "planner: resident cache gave memory back for a load"
+                    "planner: resident cache gave memory back"
                 );
             }
         }
         Ok(avail)
     }
 }
+
+/// A co-resident KV refusal and the device bytes that would have covered it.
+type KvRefusal = (EnsureError, u64);
 
 /// One co-resident engine's inputs to [`kv_shares`].
 struct KvShare {
@@ -2278,19 +2300,20 @@ struct KvShare {
 /// Per-engine admission caps over `room` (free plus every engine's live KV): the largest reserve
 /// stays unbudgeted, each engine first gets the larger of one full-context sequence and what it
 /// has admitted, and the rest splits in proportion to the sequence bytes.
-fn kv_shares(room: u64, shares: &[KvShare]) -> std::result::Result<Vec<u64>, EnsureError> {
+fn kv_shares(room: u64, shares: &[KvShare]) -> std::result::Result<Vec<u64>, KvRefusal> {
     let reserve = shares.iter().map(|s| s.reserve).max().unwrap_or(0);
     let room = room.saturating_sub(reserve);
     let floor = |s: &KvShare| s.seq.max(s.committed);
     let need: u64 = shares.iter().map(floor).sum();
     if need > room {
-        return Err(EnsureError::NoKvRoom(format!(
+        let e = EnsureError::NoKvRoom(format!(
             "co-resident models need {} MiB to keep their admitted sequences and one \
              full-context sequence each, and the device backs {} MiB beside a {} MiB reserve",
             need >> 20,
             room >> 20,
             reserve >> 20
-        )));
+        ));
+        return Err((e, need - room));
     }
     let spare = (room - need) as u128;
     let seqs: u128 = shares.iter().map(|s| s.seq as u128).sum::<u128>().max(1);
@@ -2305,14 +2328,15 @@ fn check_co_tenant_claims(
     slug: &str,
     free: u64,
     claimed: u64,
-) -> std::result::Result<(), EnsureError> {
+) -> std::result::Result<(), KvRefusal> {
     if free < claimed {
-        return Err(EnsureError::NoKvRoom(format!(
+        let e = EnsureError::NoKvRoom(format!(
             "loading {slug} leaves {} MiB free and the co-resident models need {} MiB to keep \
              admitting one full-context sequence each",
             free >> 20,
             claimed >> 20
-        )));
+        ));
+        return Err((e, claimed - free));
     }
     Ok(())
 }
@@ -2725,21 +2749,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(busy, vec![2 * GIB + 3 * GIB / 8, GIB / 4 + 3 * GIB / 8]);
-        let e = kv_shares(4400 << 20, &shares).unwrap_err();
+        let (e, short) = kv_shares(4400 << 20, &shares).unwrap_err();
         assert!(matches!(e, EnsureError::NoKvRoom(_)), "{e}");
+        assert_eq!(short, (4352 + 256 - 4400) << 20);
         let e = kv_shares(
             4 * GIB,
             &[share(GIB / 4, 3 * GIB, 0), share(GIB / 4, 0, GIB)],
         )
-        .unwrap_err();
+        .unwrap_err()
+        .0;
         assert!(matches!(e, EnsureError::NoKvRoom(_)), "{e}");
     }
 
     #[test]
     fn a_load_must_leave_co_residents_their_kv_claims() {
         assert!(check_co_tenant_claims("b", 5 * GIB, 4 * GIB).is_ok());
-        let e = check_co_tenant_claims("b", 2 * GIB, 4 * GIB).unwrap_err();
+        let (e, short) = check_co_tenant_claims("b", 2 * GIB, 4 * GIB).unwrap_err();
         assert!(matches!(e, EnsureError::NoKvRoom(_)), "{e}");
+        assert_eq!(short, 2 * GIB);
         let msg = e.to_string();
         assert!(
             msg.contains("2048 MiB free") && msg.contains("4096 MiB"),

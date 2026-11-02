@@ -204,7 +204,7 @@ tier (B >= 64 or ctx >= 128K, `PLOW_VMM_LIVE_RINGS` overrides), and once the sto
 since the last retirement the ring park keeps only what the recent 10 s concurrency peak needs.
 With other models resident, each engine's floor also keeps the other engines' KV caps and the
 shared reserve free, and a load that does not fit asks resident caches for memory before it
-evicts a model.
+evicts a model or refuses for KV room.
 `/metrics`: `plowrt_kv_store_*` (residency per tier, dedup hits, fills, reclaims, refusals,
 spills, restores, publishes, gathers, segments, launches). Recurrent models (Qwen3.8 GDN) get
 prefix caching only through the store: the prefill chunk is cut at the prompt-end boundary and
