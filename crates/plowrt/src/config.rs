@@ -1835,8 +1835,8 @@ pub struct NvidiaRuntimeConfig {
     /// the generated flash-decode object between interpreter windows; narrower rungs, and 0,
     /// run the untouched interpreter pair in one launch. 4: the object wins from four rows on a
     /// packet whose decode rungs are one interpreter launch (Qwen3.8-27B BF16 H100, knob_spec
-    /// evidence; 1 measured slower there at one and two rows). A packet whose projections
-    /// already split the rung into windows (cuBLASLt / native FP8 segments) wins from one row:
+    /// evidence; 1 measured slower there at one and two rows). The Qwen3.8-27B FP8 H100 packet,
+    /// whose projections already split each rung into windows, wins from one row (ctx 4096):
     /// its recipe sets 1.
     #[arg(
         long = "gen-decode-step",
