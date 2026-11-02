@@ -110,6 +110,11 @@ typedef bf16_t bf16x2 __attribute__((ext_vector_type(2)));
 typedef float f32x2 __attribute__((ext_vector_type(2)));
 
 #if PLOW_GFX12
+#define PLOW_MMA_FN __device__ __attribute__((noinline))
+#else
+#define PLOW_MMA_FN __device__ __forceinline__
+#endif
+#if PLOW_GFX12
 /* Exact-semantics MFMA emulation for wave64 gfx12. Fragment maps (wrapper level, K split across
  * lane halves/quarters exactly as the CDNA4 instruction): 32x32: lane l holds A[l%32][8*(l/32)+i]
  * and B[8*(l/32)+i][l%32]; D register j is row 8*(j/4)+4*(l/32)+j%4, column l%32. 16x16: lane l
@@ -123,7 +128,7 @@ __device__ __forceinline__ float plow_bf_lo(int w) { return __builtin_bit_cast(f
 __device__ __forceinline__ float plow_bf_hi(int w) { return __builtin_bit_cast(float, (unsigned)w & 0xffff0000u); }
 #endif
 
-__device__ __forceinline__ f32x16 plow_mfma_bf16_32x32(bf16x8 a, bf16x8 b, f32x16 acc) {
+PLOW_MMA_FN f32x16 plow_mfma_bf16_32x32(bf16x8 a, bf16x8 b, f32x16 acc) {
 #if PLOW_CDNA4
     return __builtin_amdgcn_mfma_f32_32x32x16_bf16(a, b, acc, 0, 0, 0);
 #elif PLOW_GFX12
@@ -162,7 +167,7 @@ __device__ __forceinline__ f32x16 plow_mfma_bf16_32x32(bf16x8 a, bf16x8 b, f32x1
 #endif
 }
 
-__device__ __forceinline__ f32x4 plow_mfma_bf16_16x16(bf16x8 a, bf16x8 b, f32x4 acc) {
+PLOW_MMA_FN f32x4 plow_mfma_bf16_16x16(bf16x8 a, bf16x8 b, f32x4 acc) {
 #if PLOW_CDNA4
     return __builtin_amdgcn_mfma_f32_16x16x32_bf16(a, b, acc, 0, 0, 0);
 #elif PLOW_GFX12
@@ -239,7 +244,7 @@ __device__ __forceinline__ f32x4 plow_mfma_bf16_16x16(bf16x8 a, bf16x8 b, f32x4 
  * include, and the wrapper needs the type here. */
 typedef int mfma_f8f6f4_operand __attribute__((ext_vector_type(8)));
 
-__device__ __forceinline__ f32x16 plow_mfma_fp8_32x32(mfma_f8f6f4_operand a,
+PLOW_MMA_FN f32x16 plow_mfma_fp8_32x32(mfma_f8f6f4_operand a,
                                                       mfma_f8f6f4_operand b, f32x16 acc) {
 #if PLOW_CDNA4
     return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(a, b, acc, 0, 0, 0, 0, 0, 0);
