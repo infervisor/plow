@@ -8215,23 +8215,34 @@ impl GpuEngine {
     /// track `held`, and every block mapped past the commitments admitted another sequence
     /// (Qwen3.8-27B 4K c32 at PLOW_KV_MEM_UTIL 0.91: an 11.3 GiB budget ratcheted to 15.9 GiB).
     pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
-        let mut budget = self.kv_admission_uncapped()?;
+        // A co-resident cap is the budget itself, not a bound on `free + held - reserve`: that
+        // reserve was sized while this engine was alone, and the other engines' own allocations
+        // take free memory the manager already split, so the dynamic budget would fall under
+        // the cap (and under one request) while the device still holds this engine's share.
         if let Some(cap) = self.kv_budget_cap {
-            budget.budget_bytes = budget.budget_bytes.min(cap);
+            let mut budget = self.kv_admission?;
+            budget.budget_bytes = cap;
+            return Some(budget);
         }
-        Some(budget)
+        self.kv_admission_uncapped()
     }
 
-    /// Device bytes this engine's KV holds now: pool blocks and mapped or spare ring units, not
-    /// the block store (it shrinks only under this engine's own pressure).
+    /// Device bytes only this engine's admitted sequences hold now (pool blocks the prefix cache
+    /// does not reference, mapped ring slots). Cache blocks, pool spares, spare ring units and
+    /// the block store are left out: they shrink only under this engine's own pressure, so a
+    /// co-tenant cannot count on them.
     pub fn kv_live_held(&self) -> u64 {
         let Some(vmm) = self.vmm.as_ref() else {
             return 0;
         };
         let rings = vmm.rings.as_ref().map_or(0, |rings| {
-            rings.stats().mapped_slots as u64 * rings.slot_charge() + rings.spare_bytes()
+            rings.stats().mapped_slots as u64 * rings.slot_charge()
         });
-        vmm.kv.as_ref().map_or(0, |kv| kv.mapped_bytes()) + rings
+        let blocks = vmm.kv.as_ref().map_or(0, |kv| {
+            let st = kv.stats();
+            st.blocks_live.saturating_sub(st.cache_blocks) * kv.block_bytes()
+        });
+        blocks + rings
     }
 
     /// Co-residency: cap the admission budget at `cap` and keep `keep_free` bytes free of this
@@ -8249,8 +8260,11 @@ impl GpuEngine {
         if let Some(kv) = vmm.kv.as_mut() {
             kv.enable_pressure_eviction(floor);
         }
-        if let (Some(band), Some(bs)) = (self.store_floor_band, vmm.blocks.as_ref()) {
-            bs.set_device_floor(floor + band);
+        if let Some(bs) = vmm.blocks.as_ref() {
+            match self.store_floor_band {
+                Some(band) => bs.set_device_floor(floor + band),
+                None => bs.set_device_floor(if keep_free > 0 { floor } else { 0 }),
+            }
         }
     }
 

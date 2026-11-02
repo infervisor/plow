@@ -1460,6 +1460,16 @@ fn spawn_scoped(
             #[cfg(feature = "cuda")]
             if kv_budget.is_some() && kv_refreshed.elapsed() >= KV_BUDGET_REFRESH {
                 kv_refreshed = Instant::now();
+                metrics.kv_reserved_rows.store(
+                    slots
+                        .iter()
+                        .flatten()
+                        .map(|s| {
+                            reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
+                        })
+                        .sum(),
+                    Ordering::Relaxed,
+                );
                 let pressure = state.gpu_engine(&slug).map(|e| {
                     let e = e.lock();
                     kv_budget = e.kv_admission_budget().or(kv_budget);

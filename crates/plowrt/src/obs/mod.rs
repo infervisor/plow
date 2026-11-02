@@ -70,6 +70,8 @@ pub struct Metrics {
     pub slots_capacity: AtomicU64,
     /// Admitted sequences' reserved KV rows over the KV budget, ×1000 (0 without a budget).
     pub kv_used_milli: AtomicU64,
+    /// KV rows the admitted sequences reserve, refreshed with the KV budget (CUDA).
+    pub kv_reserved_rows: AtomicU64,
 }
 
 impl Metrics {

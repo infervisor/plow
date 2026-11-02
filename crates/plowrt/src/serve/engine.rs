@@ -479,6 +479,17 @@ impl ServeEngine {
         }
     }
 
+    /// Whether the manager splits the device's KV budget across this engine and its co-tenants
+    /// (CUDA only; other backends keep their own admission).
+    pub fn shares_device_kv(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
     /// See [`crate::exec::gpu::GpuEngine::set_co_tenant`]; a no-op off CUDA.
     pub fn set_co_tenant(&mut self, cap: Option<u64>, keep_free: u64) {
         match self {
