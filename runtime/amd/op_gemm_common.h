@@ -1379,7 +1379,7 @@ __device__ void d_gemm_small_splitk(bf16* C, const bf16* A, const bf16* B, unsig
         }
         __syncthreads();
         if (!sk_last) continue;
-        asm volatile("buffer_inv" ::: "memory");
+        plow_cache_inv();
         __syncthreads();
         const unsigned tile = gm_remap<GM_SWZ, GM_WGM>(t, nt, tm, tn);
         const unsigned m0 = (tile / tn) * BM, n0 = (tile % tn) * BN;

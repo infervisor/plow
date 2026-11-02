@@ -190,10 +190,10 @@ const HSA_AMD_MEMORY_TYPE_PINNED: u32 = 1;
 // hsa_access_permission_t
 const HSA_ACCESS_PERMISSION_RW: u32 = 3;
 
-// hsa_amd_memory_pool_global_flag_t
-const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 1 << 1;
-const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED: u32 = 1 << 0;
-const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1 << 2;
+// hsa_amd_memory_pool_global_flag_t (hsa_ext_amd.h)
+const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1;
+const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED: u32 = 2;
+const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 4;
 
 // hsa_queue_type_t
 const HSA_QUEUE_TYPE_SINGLE: u32 = 1;
@@ -1339,11 +1339,15 @@ impl HsaBackend {
         // *dynamic* budget opted into with `cuFuncSetAttribute` and has no
         // bearing here: the AMD interpreter's arena is `__shared__ plow_smem sm`,
         // static, and every dispatch passes `dynamic_lds = 0`.)
-        const CDNA_WORKGROUP_LDS_MAX: u32 = 160 * 1024;
+        // Only gfx950 (CDNA4) raised the per-workgroup ceiling; gfx942 and gfx12 cap at 64 KiB.
+        const CDNA4_WORKGROUP_LDS_MAX: u32 = 160 * 1024;
+        const WORKGROUP_LDS_MAX: u32 = 64 * 1024;
         let lds_bytes = if reg_acc.lds_bytes > 0 {
             reg_acc.lds_bytes
+        } else if device_name.starts_with("gfx950") {
+            CDNA4_WORKGROUP_LDS_MAX
         } else {
-            CDNA_WORKGROUP_LDS_MAX
+            WORKGROUP_LDS_MAX
         };
 
         // Find coarse-grained VRAM pool on this GPU.
@@ -1483,12 +1487,9 @@ impl HsaBackend {
         );
         let shared = Arc::new(SharedDriver { drv });
 
-        // CDNA (gfx8xx, gfx9xx) is wave64; RDNA (gfx10xx, gfx11xx) is wave32.
-        let wave_width = if device_name.starts_with("gfx9") || device_name.starts_with("gfx8") {
-            64
-        } else {
-            32
-        };
+        // Every plow AMD object is built wave64; RDNA (gfx10+) objects run in wave64 mode
+        // (-mwavefrontsize64), so the dispatch width is 64 lanes per wave on every arch.
+        let wave_width = 64;
 
         Ok(HsaBackend {
             shared,

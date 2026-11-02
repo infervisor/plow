@@ -189,7 +189,7 @@ void plow_hc_mix_decode_r1(float* mixes, bf16* new_residual, const float* W, con
     }
     __syncthreads();
     if (!last) return;
-    asm volatile("buffer_inv" ::: "memory");
+    plow_cache_inv();
     __syncthreads();
 #if HC_MIX_UNROLL
     hc_mix_tail_rv(xs, post_mix, comb_mix, lin, norm ? nout : nullptr, norm ? gamma : nullptr,

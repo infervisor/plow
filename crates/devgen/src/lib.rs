@@ -934,8 +934,10 @@ fn glu_era_inventory() -> &'static kernelcaps::Inventory {
     const RUNGS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall];
     static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static RDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     let cell = match amd_target::active().1 {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
@@ -1059,8 +1061,10 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
     use std::sync::OnceLock;
     static CDNA3: OnceLock<GemmMeasurements> = OnceLock::new();
     static CDNA4: OnceLock<GemmMeasurements> = OnceLock::new();
+    static RDNA4: OnceLock<GemmMeasurements> = OnceLock::new();
     let slot = match amd_target::active().1 {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     slot.get_or_init(|| {
@@ -1295,7 +1299,7 @@ mod amd_target {
     pub fn set_for(arch: &str, gpu: &str) {
         if let Some(spec) = hwspec::registry::lookup(gpu) {
             if let Some(isa) = IsaLevel::from_spec(spec) {
-                if matches!(isa, IsaLevel::Gfx942 | IsaLevel::Gfx950) {
+                if matches!(isa, IsaLevel::Gfx942 | IsaLevel::Gfx950 | IsaLevel::Gfx1201) {
                     ACTIVE.with(|a| a.set(Some((spec, isa))));
                     return;
                 }
@@ -1306,12 +1310,13 @@ mod amd_target {
         } else if hwspec::registry::lookup(gpu).is_none() {
             format!("--gpu {gpu} is not in the hwspec registry")
         } else {
-            format!("--gpu {gpu} is not a CDNA part")
+            format!("--gpu {gpu} is not a CDNA/RDNA4 part")
         };
         // Fall back to the arch the caller DID state, rather than to a constant.
         let (sku, isa) = match arch {
             "gfx942" => ("MI300X", IsaLevel::Gfx942),
             "gfx950" => ("MI350X", IsaLevel::Gfx950),
+            "gfx1201" => ("R9700", IsaLevel::Gfx1201),
             _ => {
                 eprintln!(
                     "warning: {why} and --arch {arch:?} names no CDNA part; AMD tiles will be \
@@ -1689,8 +1694,10 @@ fn amd_gemm_inventory(isa: hwspec::IsaLevel) -> &'static kernelcaps::Inventory {
     use std::sync::OnceLock;
     static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static RDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     let cell = match isa {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
@@ -1879,8 +1886,10 @@ fn amd_gemm_inventory(isa: hwspec::IsaLevel) -> &'static kernelcaps::Inventory {
     use std::sync::OnceLock;
     static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static RDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     let cell = match isa {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     cell.get_or_init(|| {

@@ -202,6 +202,9 @@ __device__ __forceinline__ bf16v8 ld_glob8_nt(const PLOW_GLOB bf16* p) {
  * Splitting them is a measurable optimisation, not a correctness requirement, and it needs the
  * emitter to mark peer-visible outputs in the instruction. Correct first.
  */
+#if PLOW_GFX12 && PLOW_GATE_SC1
+#error "PLOW_GATE_SC1 emits gfx9 sc0/sc1 stores"
+#endif
 #ifndef PLOW_GATE_SC1
 #define PLOW_GATE_SC1 0
 #endif
@@ -388,7 +391,11 @@ __device__ __forceinline__ void cp_async16(const PLOW_GLOB bf16* src,
  * Tracked on vmcnt like every other global load, so `cp_async_wait()` drains it. */
 __device__ __forceinline__ void cp_async4(const PLOW_GLOB bf16* src, bf16* dst_wave_contiguous) {
 #ifdef __HIP_DEVICE_COMPILE__
-#if defined(__clang_major__) && __clang_major__ >= 23
+#if PLOW_GFX12
+    /* No LDS-DMA on gfx12: VGPR-staged, same lane*4-byte layout. */
+    const unsigned lane = __builtin_amdgcn_workitem_id_x() & 63u;
+    ((unsigned*)dst_wave_contiguous)[lane] = *(const PLOW_GLOB unsigned*)(const PLOW_GLOB void*)src;
+#elif defined(__clang_major__) && __clang_major__ >= 23
     __builtin_amdgcn_global_load_lds(
         (PLOW_GLOB void*)(const PLOW_GLOB void*)src,
         (__attribute__((address_space(3))) void*)dst_wave_contiguous,
@@ -409,7 +416,7 @@ __device__ __forceinline__ void cp_async4(const PLOW_GLOB bf16* src, bf16* dst_w
 #define CP_ASYNC4_BF16 (PLOW_WAVE * 2)
 
 __device__ __forceinline__ void cp_async_wait(void) {
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    asm volatile(PLOW_ASM_WAIT_VM(0) ::: "memory");
 }
 
 /* ---------------------------------------------------------------------------
@@ -441,13 +448,22 @@ __device__ __forceinline__ void cp_async_wait(void) {
  * THE DESCRIPTOR'S WORD 3 IS NOT OPTIONAL. On gfx9/CDNA it must be 0x00020000 (this is
  * CK's CK_BUFFER_RESOURCE_3RD_DWORD). Passing 0 compiles, runs, faults nothing — and returns
  * ZERO FOR EVERY LANE, in range or not. It fails as silently as anything in this codebase. */
+#if PLOW_GFX12
+/* gfx11/gfx12 word 3 (32-bit float format, raw buffer, OOB check on num_records), as CK's
+ * CK_BUFFER_RESOURCE_3RD_DWORD for gfx11/gfx12. The gfx9 value returns zeros there. */
+#define PLOW_BUF_RSRC3 0x31004000u
+/* gfx12 cache policy is TH[2:0]|SCOPE[4:3], not glc|slc (3 would be CU-scope last-use). */
+#define PLOW_BUF_AUX_NT 0x11 /* TH_NT | SCOPE_DEV */
+#else
 #define PLOW_BUF_RSRC3 0x00020000u
+#define PLOW_BUF_AUX_NT 3
+#endif
 
 /* `aux` = 3 is glc|slc: slc is the streaming / non-temporal hint. The weight stream has zero
  * reuse, so it must not allocate in L2 — the same reason GV_LDW uses ld_glob8_nt. */
 __device__ __forceinline__ bf16v8 buf_ld8(__amdgpu_buffer_rsrc_t r, unsigned byte_off) {
     return __builtin_bit_cast(bf16v8,
-                              __builtin_amdgcn_raw_buffer_load_b128(r, byte_off, 0, /*nt*/ 3));
+                              __builtin_amdgcn_raw_buffer_load_b128(r, byte_off, 0, PLOW_BUF_AUX_NT));
 }
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc(const bf16* base, unsigned n_halves) {
     return __builtin_amdgcn_make_buffer_rsrc((void*)base, /*stride*/ (short)0,
@@ -525,7 +541,7 @@ __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_u(const bf16* base, u
 /* `aux` = 3 (glc|slc): streaming/non-temporal, exactly as the bf16 weight stream — zero reuse. */
 __device__ __forceinline__ fp8v16 buf_ld_fp8(__amdgpu_buffer_rsrc_t r, unsigned byte_off) {
     return __builtin_bit_cast(fp8v16,
-                              __builtin_amdgcn_raw_buffer_load_b128(r, byte_off, 0, /*nt*/ 3));
+                              __builtin_amdgcn_raw_buffer_load_b128(r, byte_off, 0, PLOW_BUF_AUX_NT));
 }
 
 /* Wait until at most D vector-memory ops are still outstanding.
@@ -542,7 +558,7 @@ __device__ __forceinline__ fp8v16 buf_ld_fp8(__amdgpu_buffer_rsrc_t r, unsigned 
  * 64 KB across a 6 us window. */
 template <int D>
 __device__ __forceinline__ void cp_async_depth(void) {
-    asm volatile("s_waitcnt vmcnt(%0)" ::"i"(D) : "memory");
+    asm volatile(PLOW_ASM_WAIT_VM_OP ::"i"(D) : "memory");
 }
 
 /* An 8-wide bf16 dot product in FOUR instructions.
@@ -1224,7 +1240,7 @@ __device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w, float scale = 1.0f) {
 /* f32 -> one e4m3 byte. gfx950 native: cvt_pk_fp8_f32 packs (a,b) into two bytes of `old`; we use
  * one and keep byte 0. RNE + saturation are in hardware. */
 __device__ __forceinline__ unsigned char quant_fp8(float v) {
-#if !PLOW_CDNA4
+#if !PLOW_CDNA4 && !PLOW_GFX12
     /* CDNA3's encoder emits e4m3FNUZ, a different format -- see amd_arch.h. */
     return plow_f32_to_fp8_ocp(v);
 #else

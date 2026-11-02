@@ -45,11 +45,11 @@ static_assert(NBH <= REGW && REGW % 4u == 0u && CAPW % 64u == 0u, "wave region l
 
 /* LDS ordering within one wave: its LDS operations execute in order, so waiting for this lane's
  * own makes every lane's earlier writes visible to the reads that follow. */
-__device__ __forceinline__ void isel3_wsync() { __asm__ volatile("s_waitcnt lgkmcnt(0)" ::: "memory"); }
+__device__ __forceinline__ void isel3_wsync() { __asm__ volatile(PLOW_ASM_WAIT_LGKM0 ::: "memory"); }
 
 /* Workgroup barrier for LDS traffic only (no drain of outstanding global loads). */
 __device__ __forceinline__ void isel3_sync() {
-    __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+    __asm__ volatile(PLOW_ASM_WAIT_LGKM0 "\n\t" PLOW_ASM_BARRIER ::: "memory");
 }
 
 __device__ __forceinline__ unsigned isel3_mbcnt(unsigned long long m) {

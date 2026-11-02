@@ -55,7 +55,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void plow_router_decode(Ro
     }
     __syncthreads();
     if (!last) return;
-    asm volatile("buffer_inv" ::: "memory");
+    plow_cache_inv();
     __syncthreads();
     router_topk_row(a, row, lds);
     if (a.signal_add && threadIdx.x == 0)

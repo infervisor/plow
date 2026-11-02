@@ -719,14 +719,14 @@ __device__ __forceinline__ void mfp_body(void* __restrict__ Cout, const void* __
 #endif
 
 __device__ __forceinline__ void mfp_bar() {
-    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    asm volatile(PLOW_ASM_WAIT_LGKM0 ::: "memory");
     __builtin_amdgcn_s_barrier();
     asm volatile("" ::: "memory");
 }
 
 template <int N>
 __device__ __forceinline__ void mfp_vmwait() {
-    asm volatile("s_waitcnt vmcnt(%0)" ::"i"(N) : "memory");
+    asm volatile(PLOW_ASM_WAIT_VM_OP ::"i"(N) : "memory");
 }
 
 /* LDS DMA hidden from the compiler (inline asm): its LDS-DMA alias tracking otherwise makes the

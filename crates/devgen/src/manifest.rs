@@ -1802,7 +1802,8 @@ fn backend_amd(
     // Spelled from `hwspec`'s per-arch geometry rather than as literals: this manifest is what a
     // consumer CHECKS an object against, so a stale copy here reports a mismatch on a correctly
     // built object (or, worse, passes a wrongly built one).
-    if arch == "gfx942" && !s.prefill_buckets.is_empty() {
+    // gfx1201 builds wave64 on the same 64 KiB tile arm, so it takes the same set.
+    if matches!(arch, "gfx942" | "gfx1201") && !s.prefill_buckets.is_empty() {
         let g = hwspec::IsaLevel::Gfx942
             .geometry()
             .expect("gfx942 geometry");
@@ -5423,6 +5424,15 @@ mod tests {
         let other = build(&model(), "gfx942");
         assert_eq!(man["pairing"]["hash"], other["pairing"]["hash"]);
         assert!(config_header(&other).contains("#define PLOW_PACKET_DECODE_LADDER \"1,2\"\n"));
+    }
+
+    /// gfx1201 objects are built on gfx942's 64 KiB tile arm, so they owe the same defines.
+    #[test]
+    fn gfx1201_requires_the_gfx942_object_defines() {
+        assert_eq!(
+            build(&model(), "gfx1201")["backends"]["gfx1201"]["requires"],
+            build(&model(), "gfx942")["backends"]["gfx942"]["requires"]
+        );
     }
 
     #[test]
