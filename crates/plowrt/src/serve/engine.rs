@@ -85,23 +85,12 @@ impl ServeEngine {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(_) => true,
             #[cfg(feature = "cuda")]
-            ServeEngine::CudaGroup(_) => false,
+            ServeEngine::CudaGroup(_) => true,
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(_) => false,
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => false,
         }
-    }
-
-    /// Whether requests must be greedy without logit edits: a rank group's ranks sample on
-    /// device by argmax only, and a sampled or penalized request is refused rather than
-    /// silently served greedily.
-    pub fn greedy_only(&self) -> bool {
-        #[cfg(feature = "cuda")]
-        if matches!(self, ServeEngine::CudaGroup(_)) {
-            return true;
-        }
-        false
     }
 
     /// The compiled context length, for the model card's `max_model_len`.
@@ -203,6 +192,11 @@ pub trait SeqEngine {
     }
     fn cached_rows(&self, _slot: usize) -> usize {
         0
+    }
+    /// Whether the serving loop draws sampled and logit-edited rows from [`Self::logits_row`]
+    /// (the engine's own token is its argmax). `false` = rows are served by device argmax.
+    fn host_sampling(&self) -> bool {
+        false
     }
     /// The softcapped logits behind `slot`'s most recent token (host logprobs); `false` = the
     /// engine keeps them on device.

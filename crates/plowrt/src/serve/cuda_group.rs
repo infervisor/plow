@@ -500,6 +500,11 @@ impl SeqEngine for CudaGroupServe {
     fn prefill_frontier(&self, slot: usize) -> Option<usize> {
         self.pf_pos.get(slot).copied()
     }
+    fn host_sampling(&self) -> bool {
+        // Rank 0 draws sampled rows from its logits; the token reaches every rank as the
+        // next step's feed.
+        true
+    }
     fn cached_rows(&self, slot: usize) -> usize {
         self.attached.get(slot).copied().unwrap_or(0)
     }

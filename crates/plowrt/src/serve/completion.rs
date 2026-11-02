@@ -246,9 +246,6 @@ async fn completions_with(
         gen.max_tokens = m as usize;
     }
     req.sampling.apply(&mut gen.params);
-    if let Some(r) = state.refuse_sampling(&req.model, &gen.params) {
-        return r;
-    }
     if let Some(ignore) = req.ignore_eos {
         gen.ignore_eos = ignore;
     }

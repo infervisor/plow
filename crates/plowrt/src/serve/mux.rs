@@ -4880,7 +4880,7 @@ fn run_one_tick(
                                         }
                                     }
                                 }
-                                seq_host_logprobs(&*e, slot, &mut slots[slot], token);
+                                let token = seq_host_token(&*e, slot, &mut slots[slot], token);
                                 handle_produced_token(
                                     &mut slots[slot],
                                     &arena,
@@ -5427,12 +5427,13 @@ fn run_one_tick(
                                 if rode_now {
                                     decoded_in_pack = true;
                                     for (row, &(i, _)) in feeds.iter().enumerate() {
-                                        seq_host_logprobs(&*e, i, &mut slots[i], ride_tokens[row]);
+                                        let token =
+                                            seq_host_token(&*e, i, &mut slots[i], ride_tokens[row]);
                                         handle_produced_token(
                                             &mut slots[i],
                                             &arena,
                                             bundle,
-                                            ride_tokens[row],
+                                            token,
                                             1,
                                             &mut tokens_this_tick,
                                             Some(stop.as_slice()),
@@ -5453,7 +5454,7 @@ fn run_one_tick(
                                         s.pf_pos = s.prompt_ids.len();
                                     }
                                     let t_tok = std::time::Instant::now();
-                                    seq_host_logprobs(&*e, i, &mut slots[i], token);
+                                    let token = seq_host_token(&*e, i, &mut slots[i], token);
                                     handle_produced_token(
                                         &mut slots[i],
                                         &arena,
@@ -5604,7 +5605,7 @@ fn run_one_tick(
                                 }
                                 tracing::debug!(token, slot = i, "amd: prefill token");
                                 let t_tok = std::time::Instant::now();
-                                seq_host_logprobs(&*e, i, &mut slots[i], token);
+                                let token = seq_host_token(&*e, i, &mut slots[i], token);
                                 handle_produced_token(
                                     &mut slots[i],
                                     &arena,
@@ -5757,7 +5758,7 @@ fn run_one_tick(
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
-                        seq_host_logprobs(&*e, i, &mut slots[i], token);
+                        let token = seq_host_token(&*e, i, &mut slots[i], token);
                         handle_produced_token(
                             &mut slots[i],
                             &arena,
@@ -8180,24 +8181,45 @@ fn gpu_finish_token(
     Ok(argmax_tok)
 }
 
-/// OpenAI logprobs for a single-sequence engine that exposes its logits to the host (CPU): only
-/// rows that asked for them pay the vocab read. The served token stays the engine's argmax.
+/// The token a single-sequence engine serves for row `i` and its OpenAI logprobs, from the
+/// logits it exposes to the host: only rows that asked pay the vocab read. The engine's argmax
+/// stands unless the engine samples on the host ([`super::engine::SeqEngine::host_sampling`])
+/// and the request samples or edits logits; then the row is penalized and drawn with the
+/// slot's seeded draw, as the single-GPU host path does.
 #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
-fn seq_host_logprobs(
+fn seq_host_token(
     e: &dyn super::engine::SeqEngine,
     i: usize,
     slot: &mut Option<Slot>,
     token: u32,
-) {
-    let Some(s) = slot.as_mut() else { return };
-    let Some(req) = s.gen.params.logprobs else {
-        return;
-    };
-    let mut logits = Vec::new();
-    if e.logits_row(i, &mut logits) && (token as usize) < logits.len() {
-        let stats = crate::text::logprobs::RowStats::of(&logits, req);
-        s.lp = Some(Box::new(stats.finish(logits[token as usize])));
+) -> u32 {
+    let Some(s) = slot.as_mut() else { return token };
+    let p = &s.gen.params;
+    let adjusted = p.repetition_penalty != 1.0
+        || p.presence_penalty != 0.0
+        || p.frequency_penalty != 0.0
+        || !p.logit_bias.is_empty();
+    let sample = e.host_sampling() && (!p.is_greedy() || adjusted);
+    if p.logprobs.is_none() && !sample {
+        return token;
     }
+    let mut logits = Vec::new();
+    if !e.logits_row(i, &mut logits) || (token as usize) >= logits.len() {
+        return token;
+    }
+    let raw = (sample && p.logprobs.is_some()).then(|| logits.clone());
+    let token = if sample {
+        crate::text::sample::apply_penalties(&mut logits, &s.out_ids, &s.gen.params);
+        crate::text::sample::sample(&logits, &s.gen.params, None, slot_rng01(s))
+    } else {
+        token
+    };
+    if let Some(req) = s.gen.params.logprobs {
+        let row = raw.as_deref().unwrap_or(&logits);
+        let stats = crate::text::logprobs::RowStats::of(row, req);
+        s.lp = Some(Box::new(stats.finish(row[token as usize])));
+    }
+    token
 }
 
 /// The top-k a greedy, unadjusted logprobs row asks the device stats kernel for; `None` when the

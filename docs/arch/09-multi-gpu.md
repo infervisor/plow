@@ -240,8 +240,9 @@ page-locked host memory, so it works wherever peer access does not:
 Every rank runs the same packet and makes the same decisions from the same inputs: the
 prefix cache runs on every rank (no host tier, whose size depends on a process's view of free
 host RAM), each prefill reply carries the rows the cache attached, and the leader fails the
-group when ranks disagree. Decoding is greedy (device argmax on bit-identical logits); a
-sampled or penalized request is refused with a 400.
+group when ranks disagree. Every rank computes the device argmax on bit-identical logits; a
+sampled or penalized row is drawn by rank 0 from its logits with the request's seeded draw,
+and the token reaches every rank as the next step's input.
 
 **Hardware notes (H100, MIG, R595 driver).**
 
