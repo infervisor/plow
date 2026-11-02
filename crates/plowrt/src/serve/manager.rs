@@ -59,6 +59,7 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
 use crate::asset::devblob::DevBlob;
+use crate::asset::packet_image::PacketImage;
 #[cfg(feature = "cuda")]
 use crate::device::cuda::CudaBackend;
 use crate::memory::vmm::VmmOps;
@@ -117,21 +118,13 @@ pub const DEFAULT_OVERHEAD: u64 = 512 << 20;
 /// Tensor-parallel fan-out declared by a bundle's blob, or 1 when it declares
 /// none. Read before any device is opened, so placement can size groups.
 pub fn tp_degree(dir: &Path) -> Result<u32> {
-    let Some(pkt) = DevBlob::find_in_dir(dir)? else {
+    let Some(image) = PacketImage::open_in_dir(dir)? else {
         return Ok(1);
     };
-    let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-        path: pkt.clone(),
-        source,
-    })?;
     // METADATA ONLY, as in `BlobPlan::from_dir_with_granularity` — this reads
     // the TP header and never dispatches, so the L2-placement guard (which is
     // the engine's job, against the code object) must not reject it here.
-    Ok(DevBlob::parse_l2(&raw, true)?
-        .tp
-        .map(|t| t.n_gpu)
-        .unwrap_or(1)
-        .max(1))
+    Ok(image.blob.tp.map(|t| t.n_gpu).unwrap_or(1).max(1))
 }
 
 /// Per-model VRAM plan, derived from the blob header (sizes only — the blob
@@ -209,21 +202,40 @@ impl BlobPlan {
         device_vmm: Option<(u64, (u32, u32))>,
         checkpoint: Option<&Path>,
     ) -> Result<BlobPlan> {
-        let pkt = DevBlob::find_in_dir(dir)?
+        let image = PacketImage::open_in_dir(dir)?
             .ok_or_else(|| RuntimeError::Device(format!("no PLOWDEV blob in {}", dir.display())))?;
-        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-            path: pkt.clone(),
-            source,
-        })?;
+        let (pkt, raw) = (&image.path, &image.raw);
         // METADATA ONLY -- this sums tensor bytes for the memory plan and never dispatches a
         // packet, so L2-domain placement is irrelevant here. The real guard is in the engine,
         // which checks the CODE OBJECT for `plow_l2_place_dispatch_1`. Using the strict parse
         // made `serve` reject every placed blob before the engine ever saw it.
-        let mut blob = DevBlob::parse_l2(&raw, true)?;
+        let mut blob = std::borrow::Cow::Borrowed(&image.blob);
         // Plan the bound the engine will load at (`GpuEngine::load` narrows the same way).
-        let narrowed = match crate::config::RuntimeConfig::get().live_ctx_for(dir) {
+        let live_ctx = crate::config::RuntimeConfig::get().live_ctx_for(dir);
+        // The engine rounds the same way (`GpuEngine::load`).
+        #[cfg(feature = "cuda")]
+        let live_ctx = match (live_ctx, device_vmm) {
+            (Some(want), Some((granularity, _))) => {
+                let config = crate::config::RuntimeConfig::get();
+                Some(
+                    if config.nv_vmm_live() || config.nv_vmm_prefix() == Some(true) {
+                        crate::exec::ctx_bound::vmm_live_bound(
+                            &blob,
+                            crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?.as_ref(),
+                            want,
+                            granularity,
+                            u64::from(config.vmm_block_mib()) << 20,
+                        )
+                    } else {
+                        want
+                    },
+                )
+            }
+            (want, _) => want,
+        };
+        let narrowed = match live_ctx {
             Some(want) if crate::exec::ctx_bound::declared_ctx(&blob).is_some_and(|c| want < c) => {
-                crate::exec::ctx_bound::narrow(&mut blob, want)?;
+                crate::exec::ctx_bound::narrow(blob.to_mut(), want)?;
                 true
             }
             _ => false,
@@ -425,11 +437,8 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
         if !path.is_file() {
             continue;
         }
-        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let blob = DevBlob::parse_l2(&raw, true)?;
+        let image = PacketImage::open(&path)?;
+        let blob = &image.blob;
         let ctr = u64::from(packet::dev::CTR_STRIDE) * 4;
         let mut counters = 0u64;
         for p in &blob.progs {
@@ -1810,6 +1819,9 @@ impl ModelManager {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
+        if let Err(e) = self.share_kv(&state) {
+            tracing::warn!(%slug, error = ?e, "planner: co-resident KV shares after unload");
+        }
         let unload_ms = ms(t1);
         let (free, _) = self.device.mem_info().map_err(EnsureError::Load)?;
         let modules = self.device.live_modules();
@@ -1883,6 +1895,7 @@ impl ModelManager {
     }
 
     async fn load_model_once(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
+        let _anchor = crate::asset::packet_image::LoadAnchor::hold(&m.dir);
         let state = self.state()?;
         let bundle = state
             .registry
@@ -2069,8 +2082,135 @@ impl ModelManager {
         if let Some(claim) = claim {
             claims.insert(slug.to_string(), claim);
         }
+        drop(claims);
+        let shared = self.share_kv(state);
+        if shared.is_err() {
+            self.kv_claims.lock().remove(slug);
+        }
+        shared
+    }
+
+    /// Each engine admits from `free + its own held - its reserve`, so co-resident engines all
+    /// count the same free memory (2 x E4B: 38.3 + 5.7 GiB budgets over 6.4 GiB free, both
+    /// OOM). With two or more KV engines, each is capped at its share of `free + every engine's
+    /// live KV - the largest reserve`: first what its seated sequences reserve or one
+    /// full-context sequence, whichever is larger, then the rest split by one sequence's bytes.
+    /// Its prefix caches keep free what the others' caps and that reserve need. Refuses when the
+    /// shares cannot cover that. Admission is held while reservations are read and caps set.
+    fn share_kv(&self, state: &AppState) -> std::result::Result<(), EnsureError> {
+        let engines = self.kv_engines(state);
+        if engines.len() < 2 {
+            for (slug, e) in &engines {
+                state.model_metrics(slug).kv_share.lock().cap = None;
+                e.lock().set_co_tenant(None, 0);
+            }
+            return Ok(());
+        }
+        let metrics: Vec<_> = engines
+            .iter()
+            .map(|(s, _)| state.model_metrics(s))
+            .collect();
+        let (room, mut shares) = self.kv_snapshot(&engines)?;
+        // Engine locks are not taken while these are held (a mux may seat under its engine lock).
+        let mut cells: Vec<_> = metrics.iter().map(|m| m.kv_share.lock()).collect();
+        for (share, cell) in shares.iter_mut().zip(&cells) {
+            share.committed = cell.reserved;
+        }
+        let caps = kv_shares(room, &shares)?;
+        for (cell, &cap) in cells.iter_mut().zip(&caps) {
+            cell.cap = Some(cap);
+        }
+        drop(cells);
+        let total: u64 = caps.iter().sum();
+        let reserve = shares.iter().map(|s| s.reserve).max().unwrap_or(0);
+        for ((slug, e), &cap) in engines.iter().zip(&caps) {
+            e.lock().set_co_tenant(Some(cap), reserve + (total - cap));
+            tracing::info!(%slug, cap_mib = cap >> 20, reserve_mib = reserve >> 20, room_mib = room >> 20, "planner: co-resident KV budget capped");
+        }
         Ok(())
     }
+
+    /// The resident engines whose KV budget the device shares.
+    fn kv_engines(
+        &self,
+        state: &AppState,
+    ) -> Vec<(String, Arc<Mutex<crate::serve::engine::ServeEngine>>)> {
+        let slugs: Vec<String> = self.kv_claims.lock().keys().cloned().collect();
+        slugs
+            .into_iter()
+            .filter_map(|s| state.gpu_engine(&s).map(|e| (s, e)))
+            .filter(|(_, e)| {
+                let e = e.lock();
+                e.shares_device_kv() && e.kv_admission_budget().is_some()
+            })
+            .collect()
+    }
+
+    /// Free plus every engine's live KV, and each engine's share inputs. Every engine lock is
+    /// held across the reads (slug order; nothing else takes two), so no tick maps or retires
+    /// KV between the held samples and the free sample.
+    fn kv_snapshot(
+        &self,
+        engines: &[(String, Arc<Mutex<crate::serve::engine::ServeEngine>>)],
+    ) -> std::result::Result<(u64, Vec<KvShare>), EnsureError> {
+        let mut order: Vec<usize> = (0..engines.len()).collect();
+        order.sort_by(|&a, &b| engines[a].0.cmp(&engines[b].0));
+        let mut guards: Vec<_> = order.iter().map(|&i| (i, engines[i].1.lock())).collect();
+        guards.sort_by_key(|(i, _)| *i);
+        let mut held = 0u64;
+        let mut shares = Vec::with_capacity(engines.len());
+        for ((slug, _), (_, e)) in engines.iter().zip(&guards) {
+            held += e.kv_live_held();
+            let seq = e
+                .kv_admission_budget()
+                .map_or(0, |b| b.bytes_for_rows(e.max_ctx() as u64));
+            shares.push(KvShare {
+                slug: slug.clone(),
+                seq,
+                committed: 0,
+                reserve: e.kv_admit_reserve(),
+            });
+        }
+        let free = self.free_vram().map_err(EnsureError::Load)?;
+        drop(guards);
+        Ok((free + held, shares))
+    }
+}
+
+/// One co-resident engine's inputs to [`kv_shares`].
+struct KvShare {
+    slug: String,
+    /// One full-context sequence.
+    seq: u64,
+    /// What its admitted sequences reserve now.
+    committed: u64,
+    /// Free memory its solo budget left unbudgeted.
+    reserve: u64,
+}
+
+/// Per-engine admission caps over `room` (free plus every engine's live KV): the largest reserve
+/// stays unbudgeted, each engine first gets the larger of one full-context sequence and what it
+/// has admitted, and the rest splits in proportion to the sequence bytes.
+fn kv_shares(room: u64, shares: &[KvShare]) -> std::result::Result<Vec<u64>, EnsureError> {
+    let reserve = shares.iter().map(|s| s.reserve).max().unwrap_or(0);
+    let room = room.saturating_sub(reserve);
+    let floor = |s: &KvShare| s.seq.max(s.committed);
+    let need: u64 = shares.iter().map(floor).sum();
+    if need > room {
+        return Err(EnsureError::NoKvRoom(format!(
+            "co-resident models need {} MiB to keep their admitted sequences and one \
+             full-context sequence each, and the device backs {} MiB beside a {} MiB reserve",
+            need >> 20,
+            room >> 20,
+            reserve >> 20
+        )));
+    }
+    let spare = (room - need) as u128;
+    let seqs: u128 = shares.iter().map(|s| s.seq as u128).sum::<u128>().max(1);
+    Ok(shares
+        .iter()
+        .map(|s| floor(s) + (spare * s.seq as u128 / seqs) as u64)
+        .collect())
 }
 
 /// `free` after `slug` loaded must still cover what co-resident models claim.
@@ -2470,6 +2610,42 @@ mod tests {
         let e = mgr.load("b", false).await.unwrap_err();
         assert!(matches!(e, EnsureError::WontFit { .. }), "{e}");
         assert_eq!(e.retry_after(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn co_resident_kv_caps_split_the_device_beside_the_largest_reserve() {
+        let share = |seq: u64, committed: u64, reserve: u64| KvShare {
+            slug: "m".into(),
+            seq,
+            committed,
+            reserve,
+        };
+        // 2 x E4B after the second load: 6.4 GiB free, reserves 4.25 / 0.64 GiB.
+        let shares = [
+            share(128 << 20, 0, 4352 << 20),
+            share(128 << 20, 0, 651 << 20),
+        ];
+        let caps = kv_shares(6554 << 20, &shares).unwrap();
+        assert_eq!(caps, vec![1101 << 20, 1101 << 20]);
+        assert!(caps.iter().sum::<u64>() + (4352 << 20) <= 6554 << 20);
+        let uneven =
+            kv_shares(4 * GIB, &[share(3 * GIB / 4, 0, 0), share(GIB / 4, 0, GIB)]).unwrap();
+        assert_eq!(uneven, vec![9 * GIB / 4, 3 * GIB / 4]);
+        // Admitted sequences are kept first; only the rest splits.
+        let busy = kv_shares(
+            4 * GIB,
+            &[share(GIB / 4, 2 * GIB, 0), share(GIB / 4, 0, GIB)],
+        )
+        .unwrap();
+        assert_eq!(busy, vec![2 * GIB + 3 * GIB / 8, GIB / 4 + 3 * GIB / 8]);
+        let e = kv_shares(4400 << 20, &shares).unwrap_err();
+        assert!(matches!(e, EnsureError::NoKvRoom(_)), "{e}");
+        let e = kv_shares(
+            4 * GIB,
+            &[share(GIB / 4, 3 * GIB, 0), share(GIB / 4, 0, GIB)],
+        )
+        .unwrap_err();
+        assert!(matches!(e, EnsureError::NoKvRoom(_)), "{e}");
     }
 
     #[test]

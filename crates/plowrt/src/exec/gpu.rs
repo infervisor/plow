@@ -2649,7 +2649,7 @@ pub struct GpuEngine {
     gemv_wide: Option<Arc<decode_object::BoundDecodeObject>>,
     gemv_wide_modules: [Option<Arc<decode_object::BoundDecodeObject>>; 2],
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
-    /// (bucket, slot-tensor-base, segment range) — one cuGraphLaunch replaces ~480 kernel
+    /// (bucket, tensor-table base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
     seg_graphs:
         std::collections::HashMap<(usize, u64, usize, usize), crate::device::cuda::GraphExec>,
@@ -2723,6 +2723,10 @@ pub struct GpuEngine {
     /// launch selects its table through the kernarg (`tens_slot_base`) —
     /// nothing is rewritten or restored. Empty at B == 1.
     d_tens_slots: Vec<DeviceMem>,
+    /// The table a slot > 0 chunk chain reads: slot b's table is copied in, in stream order,
+    /// before the chain. One seg graph per bucket/range then serves every slot; per-slot graphs
+    /// held ~10 KiB of driver host memory per node (12B FP8, B=128: 15k graphs, 22 GiB).
+    d_tens_pf: Option<DeviceMem>,
     _tensor_bindings: Vec<TensorBindings>,
     /// Rank-3 KV descriptors bind slot-specific addresses and outlive every slot table use.
     _kv_tmap_slots: Vec<DeviceMem>,
@@ -2895,6 +2899,14 @@ pub struct GpuEngine {
     kv_admission: Option<crate::sched::admission::KvBudget>,
     /// Free-after-load bytes the admission budget never commits (`free - budget` at load).
     kv_admit_reserve: u64,
+    /// The manager's cap on the admission budget while co-resident engines share the device.
+    kv_budget_cap: Option<u64>,
+    /// Pool bytes the row-zero block columns mapped at load hold (every slot keeps them).
+    kv_row_zero_bytes: u64,
+    /// Free bytes the prefix cache's pressure eviction keeps (0: not armed).
+    cache_floor: u64,
+    /// The block store's growth floor above `cache_floor` (`None`: the store keeps its floor).
+    store_floor_band: Option<u64>,
     /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
     kv_row_bytes: u64,
     slot_generations: Vec<u32>,
@@ -4039,18 +4051,20 @@ impl GpuEngine {
             "loading model onto GPU..."
         );
 
+        // Every object's pairing check reads this one parse.
+        let _build = crate::asset::packet_image::BuildInfo::in_dir(assets_dir)
+            .ok()
+            .flatten();
         // ---- blob ----
-        let (pkt, raw, mut blob) = {
+        let (pkt, image, mut blob) = {
             let run = || -> Result<_> {
                 let pkt = DevBlob::find_in_dir(assets_dir)?.ok_or_else(|| {
                     RuntimeError::Device(format!("no PLOWDEV blob in {}", assets_dir.display()))
                 })?;
-                let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-                    path: pkt.clone(),
-                    source,
-                })?;
-                let blob = DevBlob::parse(&raw)?;
-                crate::certificate_checks::check_packet(&pkt, &raw, &blob)?;
+                let image = crate::asset::packet_image::PacketImage::open(&pkt)?;
+                image.blob.check_l2_dispatch(false)?;
+                crate::certificate_checks::check_packet(&image)?;
+                let blob = image.blob.clone();
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {
@@ -4081,7 +4095,7 @@ impl GpuEngine {
                             .into(),
                     ));
                 }
-                Ok((pkt, raw, blob))
+                Ok((pkt, image, blob))
             };
             if let Some(tm) = load_tim.as_mut() {
                 let (r, ms) = tm.phase("blob_find_read_parse", run);
@@ -4091,6 +4105,7 @@ impl GpuEngine {
                 run()?
             }
         };
+        let raw = &image.raw;
         tracing::info!(
             blob = %pkt.display(),
             tensors = blob.tensors.len(),
@@ -4182,7 +4197,25 @@ impl GpuEngine {
             .find(|t| t.name == "in.pos")
             .map(|t| (t.bytes / 4) as usize)
             .unwrap_or(0);
-        if let Some(want) = config.live_ctx_for(assets_dir) {
+        if let Some(requested) = config.live_ctx_for(assets_dir) {
+            let vmm_kv = config.nv_vmm_live() || config.nv_vmm_prefix() == Some(true);
+            let gran = crate::memory::vmm::VmmOps::granularity(be.as_ref());
+            let want = gran.ok().filter(|_| vmm_kv).map_or(requested, |gran| {
+                crate::exec::ctx_bound::vmm_live_bound(
+                    &blob,
+                    live_kv_manifest.as_ref(),
+                    requested,
+                    gran,
+                    u64::from(config.vmm_block_mib()) << 20,
+                )
+            });
+            if want != requested {
+                tracing::info!(
+                    requested,
+                    bound = want,
+                    "PLOW_LIVE_CTX rounded up so live KV maps whole VMM granules"
+                );
+            }
             if want as usize > packet_max_ctx {
                 if !config.nv_vmm_live() && config.nv_vmm_prefix() != Some(true) {
                     return Err(RuntimeError::Rejected(
@@ -4513,6 +4546,13 @@ impl GpuEngine {
             ));
         }
         let cc = be.compute_capability();
+        if let Some(target) = blob.abi(&image.raw)?.and_then(|a| a.target) {
+            match target.check_cuda(cc, be.device_name()) {
+                Err(e) => return Err(RuntimeError::Rejected(format!("{}: {e}", pkt.display()))),
+                Ok(Some(note)) => tracing::info!("{note}"),
+                Ok(None) => {}
+            }
+        }
         let profile = interpreter_profile(cc).ok_or_else(|| {
             RuntimeError::Device(format!(
                 "{} compute capability {}.{} has no persistent interpreter",
@@ -5818,16 +5858,16 @@ impl GpuEngine {
         let gen_routed_widest =
             gen_decode_launch.is_some() && !gen_segments.is_empty() && g.t >= gen_decode_step;
         // The Qwen chain's pointwise windows of a cuBLASLt-routed rung as `light_pf` launches
-        // (`PLOW_QWEN_LIGHT_DECODE`): the light grid must reach the rows (block-per-row bodies).
+        // (`PLOW_GDN_LIGHT_DECODE`): the light grid must reach the rows (block-per-row bodies).
         let qwen_light_grid = crate::config::RuntimeConfig::get()
             .nv
-            .qwen_light_occ
+            .gdn_light_occ
             .saturating_mul(blob.n_cu);
         let qwen_light_pf = light_functions
             .as_ref()
             .and_then(|f| f.prefill)
             .filter(|_| {
-                crate::config::RuntimeConfig::get().nv.qwen_light_decode
+                crate::config::RuntimeConfig::get().nv.gdn_light_decode
                     && qwen_light_grid >= blob.decode_progs().iter().map(|g| g.t).max().unwrap_or(0)
             });
         let qwen_light_conv = light_functions.as_ref().is_some_and(|f| f.prefill_conv);
@@ -6659,6 +6699,11 @@ impl GpuEngine {
                 d_tens_slots.push(mem);
             }
         }
+        let d_tens_pf = if d_tens_slots.is_empty() {
+            None
+        } else {
+            Some(be.alloc(0, (ptrs.len() * 8) as u64)?)
+        };
 
         if let Some(pack) = &packed_prefill {
             for (m, table) in pack.maps.iter().zip(&packed_map_ptrs) {
@@ -7549,6 +7594,8 @@ impl GpuEngine {
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
         let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
         let mut store_room = None;
+        let mut cache_floor = 0;
+        let mut store_floor_band = None;
         if let Some(kv) = vmm
             .as_mut()
             .and_then(|v| v.kv.as_mut())
@@ -7558,6 +7605,7 @@ impl GpuEngine {
                 let config = crate::config::RuntimeConfig::get();
                 if let Some(floor) = config.vmm_cache_min_free_bytes(total, Some(free)) {
                     kv.enable_pressure_eviction(floor);
+                    cache_floor = floor;
                     let cache_cap = config.prefix_cache_cap_bytes(total);
                     tracing::info!(
                         floor_mib = floor >> 20,
@@ -7574,6 +7622,7 @@ impl GpuEngine {
                         // the store stops a pool's worth above the floor so that does not
                         // trip the OOM path on every new slot.
                         bs.set_device_floor(floor + (config.kv_pool_mib() << 20));
+                        store_floor_band = Some(config.kv_pool_mib() << 20);
                     }
                 }
             }
@@ -7705,6 +7754,7 @@ impl GpuEngine {
             _d_gq_cursor: d_gq_cursor,
             d_tens,
             d_tens_slots,
+            d_tens_pf,
             _tensor_bindings: tensor_bindings,
             _kv_tmap_slots: kv_tmap_slots,
             _tables: vec![
@@ -7787,6 +7837,10 @@ impl GpuEngine {
             qwen_ride: 0,
             kv_admission,
             kv_admit_reserve,
+            kv_budget_cap: None,
+            kv_row_zero_bytes: 0,
+            cache_floor,
+            store_floor_band,
             kv_row_bytes: blob
                 .tensors
                 .iter()
@@ -7866,7 +7920,9 @@ impl GpuEngine {
             && !config.nv.pf_seg_time
             && !config.nv.pf_seg_fatonly
         {
-            let warmup_slots = engine.batch;
+            let tables: Vec<u64> = std::iter::once(engine.d_tens.base)
+                .chain(engine.d_tens_pf.as_ref().map(|m| m.base))
+                .collect();
             let t_warmup = std::time::Instant::now();
             // Routed buckets (attention-GEMM segments) are warmed too: the route only fires
             // for a slice >= pf_attn_gemm_min_rows, so a pack of short slices in a >= 1024-row
@@ -7879,14 +7935,13 @@ impl GpuEngine {
                     engine.prefill[bi].seg_class.len(),
                     &engine.prefill[bi].packet_segment_roles,
                 ) {
-                    for b in 0..warmup_slots {
+                    for &tensors in &tables {
                         let mut arg = engine.prefill[bi].kernarg;
-                        arg.tensors = engine.tens_slot_base(b);
+                        arg.tensors = tensors;
                         if let Err(e) = engine.warm_seg_graphs(bi, &arg) {
                             tracing::warn!(
                                 error = %e,
                                 bucket = bi,
-                                slot = b,
                                 "prefill seg graph warmup failed"
                             );
                             break;
@@ -7896,13 +7951,13 @@ impl GpuEngine {
             }
             tracing::info!(
                 buckets = engine.prefill.len(),
-                slots = warmup_slots,
+                tables = tables.len(),
                 graphs = engine.seg_graphs.len(),
                 elapsed_ms = t_warmup.elapsed().as_millis(),
                 "prefill seg graphs warmed up"
             );
         }
-        if config.nv.pf_seg_graph && config.nv.qwen_pf_graph && !config.nv.pf_seg_time {
+        if config.nv.pf_seg_graph && config.nv.gdn_pf_graph && !config.nv.pf_seg_time {
             let t_warmup = std::time::Instant::now();
             match engine.warm_qwen_seg_graphs() {
                 Ok(0) => {}
@@ -7914,6 +7969,17 @@ impl GpuEngine {
                 Err(e) => tracing::warn!(error = %e, "qwen chain graph warmup failed"),
             }
         }
+        // Prefix-cache admission maps every slot's first block column on the first request
+        // (wider decode rungs write idle rows at position 0). Mapped here instead, after the
+        // admission budget and store cap are sized as before, the planner's load measurement
+        // includes it: 2 x Gemma-4-E4B (4 GiB each, 128 slots) was admitted on a measurement
+        // without it and both engines ran out of device memory on first use.
+        if let Some(v) = engine.vmm.as_ref().filter(|v| v.prefix_kv().is_some()) {
+            for b in 0..engine.vmm_active.len() {
+                v.ensure_rows(b, 1)?;
+            }
+        }
+        engine.kv_row_zero_bytes = engine.kv_live_held();
         Ok(engine)
     }
 
@@ -7958,36 +8024,26 @@ impl GpuEngine {
         };
         let stamped = ((hi as u64) << 32) | lo as u64;
 
-        let mpath = assets_dir.join("build.json");
-        let manifest = std::fs::read(&mpath).map_err(|source| RuntimeError::Io {
-            path: mpath.clone(),
-            source,
+        let mpath = assets_dir.join(crate::asset::packet_image::BUILD_FILE);
+        let manifest = crate::asset::packet_image::BuildInfo::read(&mpath)?.ok_or_else(|| {
+            RuntimeError::Io {
+                path: mpath.clone(),
+                source: std::io::ErrorKind::NotFound.into(),
+            }
         })?;
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest).map_err(|e| {
-            RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display()))
-        })?;
-        let want = manifest
-            .get("pairing")
-            .and_then(|p| p.get("hash"))
-            .and_then(|h| h.as_str())
-            .and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
-            .ok_or_else(|| {
-                RuntimeError::Device(format!(
-                    "the interpreter object is SPECIALISED (packet hash \
+        let want = manifest.pairing_hash().ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "the interpreter object is SPECIALISED (packet hash \
                      0x{stamped:016x}) but {} has no `pairing.hash` — it was written \
                      by an older plowc. Rebuild the packet, or serve a general \
                      interpreter object (one built without -DPLOW_CONFIG).",
-                    mpath.display()
-                ))
-            })?;
+                mpath.display()
+            ))
+        })?;
         if want != stamped {
             // Name what differs, not just that something does: the arm set and the
             // rule-derived constants are the two things the hash covers.
-            let arms = manifest
-                .get("union")
-                .and_then(|u| u.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
+            let arms = manifest.union_len();
             return Err(RuntimeError::Device(format!(
                 "packet/interpreter MISMATCH: the loaded cubin was specialised for \
                  packet 0x{stamped:016x}, but the packet in {} is 0x{want:016x} \
@@ -7998,7 +8054,8 @@ impl GpuEngine {
                  general object built without -DPLOW_CONFIG.",
                 assets_dir.display(),
                 manifest
-                    .get("tuning")
+                    .tuning
+                    .as_ref()
                     .map(|t| t.to_string())
                     .unwrap_or_default(),
             ))
@@ -8219,6 +8276,64 @@ impl GpuEngine {
     /// track `held`, and every block mapped past the commitments admitted another sequence
     /// (Qwen3.8-27B 4K c32 at PLOW_KV_MEM_UTIL 0.91: an 11.3 GiB budget ratcheted to 15.9 GiB).
     pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
+        // A co-resident cap is the budget itself, not a bound on `free + held - reserve`: that
+        // reserve was sized while this engine was alone, and the other engines' own allocations
+        // take free memory the manager already split, so the dynamic budget would fall under
+        // the cap (and under one request) while the device still holds this engine's share.
+        if let Some(cap) = self.kv_budget_cap {
+            let mut budget = self.kv_admission?;
+            budget.budget_bytes = cap;
+            return Some(budget);
+        }
+        self.kv_admission_uncapped()
+    }
+
+    /// Device bytes only this engine's admitted sequences hold now (pool blocks the prefix cache
+    /// does not reference, mapped ring slots), less the row-zero columns every slot keeps. Cache
+    /// blocks, pool spares, spare ring units and the block store are left out too: they shrink
+    /// only under this engine's own pressure, so a co-tenant cannot count on them.
+    pub fn kv_live_held(&self) -> u64 {
+        self.kv_held_now().saturating_sub(self.kv_row_zero_bytes)
+    }
+
+    fn kv_held_now(&self) -> u64 {
+        let Some(vmm) = self.vmm.as_ref() else {
+            return 0;
+        };
+        let rings = vmm.rings.as_ref().map_or(0, |rings| {
+            rings.stats().mapped_slots as u64 * rings.slot_charge()
+        });
+        let blocks = vmm.kv.as_ref().map_or(0, |kv| {
+            let st = kv.stats();
+            st.blocks_live.saturating_sub(st.cache_blocks) * kv.block_bytes()
+        });
+        blocks + rings
+    }
+
+    /// Co-residency: cap the admission budget at `cap` and keep `keep_free` bytes free of this
+    /// engine's prefix caches, the room the other engines' caps and the shared reserve need.
+    /// `(None, 0)` restores the solo budget and floors.
+    pub fn set_co_tenant(&mut self, cap: Option<u64>, keep_free: u64) {
+        self.kv_budget_cap = cap;
+        if self.cache_floor == 0 {
+            return;
+        }
+        let floor = self.cache_floor.max(keep_free);
+        let Some(vmm) = self.vmm.as_mut() else {
+            return;
+        };
+        if let Some(kv) = vmm.kv.as_mut() {
+            kv.enable_pressure_eviction(floor);
+        }
+        if let Some(bs) = vmm.blocks.as_ref() {
+            match self.store_floor_band {
+                Some(band) => bs.set_device_floor(floor + band),
+                None => bs.set_device_floor(if keep_free > 0 { floor } else { 0 }),
+            }
+        }
+    }
+
+    fn kv_admission_uncapped(&self) -> Option<crate::sched::admission::KvBudget> {
         let mut budget = self.kv_admission?;
         let Some(vmm) = self.vmm.as_ref() else {
             return Some(budget);
@@ -11507,7 +11622,7 @@ impl GpuEngine {
                 } else {
                     Vec::new()
                 };
-            // The Qwen3.5 chain's pointwise segments as light launches (`PLOW_QWEN_LIGHT_OCC`
+            // The Qwen3.5 chain's pointwise segments as light launches (`PLOW_GDN_LIGHT_OCC`
             // blocks per SM each) of `plow_<arch>_light_pf`, which lives in the DECODE object
             // (`light_pf`) and instantiates the prefill fast paths. Buckets below 1024 rows, and
             // a grid reaching the rows, keep the windows: QwenRmsNorm picks its reduction by rows
@@ -11516,7 +11631,7 @@ impl GpuEngine {
             // gates must drop to stream order or the next window spins forever.
             let qwen_light_grid = crate::config::RuntimeConfig::get()
                 .nv
-                .qwen_light_occ
+                .gdn_light_occ
                 .saturating_mul(blob.n_cu);
             let qwen_light_pf = light_pf.filter(|_| {
                 !qwen_segments.is_empty()
@@ -12432,8 +12547,16 @@ impl GpuEngine {
             (bkt.d_ctr.base, bkt.ctr_bytes, bkt.kernarg)
         };
         // Slot selection is a kernarg field: the launch reads slot b's
-        // prebuilt tensor table (kv.* shifted to its ring); nothing uploads.
-        arg.tensors = self.tens_slot_base(b);
+        // prebuilt tensor table (kv.* shifted to its ring), through the shared
+        // prefill table for b > 0.
+        arg.tensors = match (&self.d_tens_pf, b) {
+            (Some(pf), 1..) => {
+                self.be
+                    .memcpy_dtod_async(pf.base, self.tens_slot_base(b), pf.len, &self.stream)?;
+                pf.base
+            }
+            _ => self.tens_slot_base(b),
+        };
         // One async fill re-arms the bucket's counters AND its tail GQ cursor.
         self.be
             .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
@@ -13563,13 +13686,13 @@ impl GpuEngine {
             }
             let lib_routed = self.lib_attention_routed;
             // Packed chunks replay the chain as graph pieces between the per-tick launches
-            // (`PLOW_QWEN_PF_GRAPH`); the per-segment loop below serves the unpacked chunks and
+            // (`PLOW_GDN_PF_GRAPH`); the per-segment loop below serves the unpacked chunks and
             // the timing / synchronizing diagnostics.
             if !qwen_pack.is_empty()
                 && !seg_time
                 && !synchronize
                 && rt.nv.pf_seg_graph
-                && rt.nv.qwen_pf_graph
+                && rt.nv.gdn_pf_graph
             {
                 for (start, end) in self.qwen_chain_pieces(bi) {
                     if riding {
@@ -15690,6 +15813,9 @@ mod qwen_tests;
 
 #[cfg(test)]
 mod logprob_rows_tests;
+
+#[cfg(test)]
+mod slot_reuse_tests;
 
 #[cfg(test)]
 mod pipe_tests;

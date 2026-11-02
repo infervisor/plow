@@ -369,7 +369,35 @@ impl GenTensor {
         if self.kind == GEN_TMAP_KV_PAIR {
             return Some(vec![0u8; 256]);
         }
-        let scale = match self.scale {
+        let scale = self.rope_scale()?;
+        let (cos, sin) = match self.kind {
+            GEN_ROPE_COS | GEN_ROPE_SIN => {
+                rope_tables(self.ctx, self.hd, self.theta, self.frac, scale)
+            }
+            GEN_ROPE_IDX_COS | GEN_ROPE_IDX_SIN => {
+                rope_tables_idx(self.ctx, self.aux, self.hd, self.theta)
+            }
+            _ => return None,
+        };
+        Some(match self.kind {
+            GEN_ROPE_COS | GEN_ROPE_IDX_COS => cos,
+            _ => sin,
+        })
+    }
+
+    /// `generate().is_some()`, without materialising the table.
+    pub fn is_readable(&self) -> bool {
+        match self.kind {
+            GEN_TMAP_BF16 | GEN_TMAP_E4M3 | GEN_TMAP_KV_PAIR => true,
+            GEN_ROPE_COS | GEN_ROPE_SIN | GEN_ROPE_IDX_COS | GEN_ROPE_IDX_SIN => {
+                self.rope_scale().is_some()
+            }
+            _ => false,
+        }
+    }
+
+    fn rope_scale(&self) -> Option<RopeScale> {
+        Some(match self.scale {
             ROPE_SCALE_LINEAR if self.factor.is_finite() && self.factor > 0.0 => {
                 RopeScale::Linear {
                     factor: self.factor,
@@ -398,19 +426,6 @@ impl GenTensor {
             ROPE_SCALE_NONE => RopeScale::None,
             // A scale kind from a newer compiler: refuse, never serve an unscaled table.
             _ => return None,
-        };
-        let (cos, sin) = match self.kind {
-            GEN_ROPE_COS | GEN_ROPE_SIN => {
-                rope_tables(self.ctx, self.hd, self.theta, self.frac, scale)
-            }
-            GEN_ROPE_IDX_COS | GEN_ROPE_IDX_SIN => {
-                rope_tables_idx(self.ctx, self.aux, self.hd, self.theta)
-            }
-            _ => return None,
-        };
-        Some(match self.kind {
-            GEN_ROPE_COS | GEN_ROPE_IDX_COS => cos,
-            _ => sin,
         })
     }
 
@@ -577,6 +592,28 @@ impl GenTensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_readable_matches_generate() {
+        for kind in 0..=12 {
+            for scale in 0..=6 {
+                for factor in [f64::NAN, f64::INFINITY, -1.0, 0.0, 2.0] {
+                    let g = GenTensor {
+                        kind,
+                        scale,
+                        factor,
+                        ctx: 3,
+                        hd: 8,
+                        aux: 4,
+                        theta: 10000.0,
+                        frac: 1.0,
+                        ..GenTensor::default()
+                    };
+                    assert_eq!(g.is_readable(), g.generate().is_some(), "{g:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn amd_rope_recipe_is_device_only_and_shape_bounded() {

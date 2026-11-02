@@ -444,15 +444,22 @@ pub struct RuntimeRequires {
 /// `build.json` `runtime_requires` (`{"cublaslt": "13.4", "plowrt_contract": 1}`) when the
 /// bundle declares it; otherwise derived from the emit knobs the packet was built with: a grouped
 /// cuBLASLt MoE route (`emit.moe_pf_lt` / `emit.moe_dec_lt`) needs cuBLASLt 13.4. A bundle without
-/// `build.json` requires nothing.
+/// `build.json` requires nothing; one whose `build.json` cannot be read or parsed is refused.
 pub fn runtime_requires(asset_dir: &Path) -> Result<RuntimeRequires> {
-    let path = asset_dir.join("build.json");
-    let Ok(bytes) = std::fs::read(&path) else {
+    let path = asset_dir.join(crate::asset::packet_image::BUILD_FILE);
+    let Some(build) = crate::asset::packet_image::BuildInfo::read(&path)? else {
         return Ok(RuntimeRequires::default());
     };
-    let build: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
-    runtime_requires_from(&build)
+    let mut doc = serde_json::Map::new();
+    for (key, value) in [
+        ("runtime_requires", &build.runtime_requires),
+        ("knobs", &build.knobs),
+    ] {
+        if let Some(v) = value {
+            doc.insert(key.into(), v.clone());
+        }
+    }
+    runtime_requires_from(&serde_json::Value::Object(doc))
         .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))
 }
 
@@ -615,8 +622,10 @@ pub fn check_packet_contract(
     let Some(feature) = concat else {
         return Ok(());
     };
-    let dir = packet.parent().unwrap_or(Path::new("."));
-    let declared = runtime_requires(dir)?.plowrt_contract;
+    let declared = match blob.abi(raw)? {
+        Some(abi) => abi.contract,
+        None => runtime_requires(packet.parent().unwrap_or(Path::new(".")))?.plowrt_contract,
+    };
     if declared < plow_asset::RUNTIME_CONTRACT_CONCAT {
         return Err(RuntimeError::Rejected(format!(
             "{}: uses {feature} but declares plowrt contract {declared} (needs {})",

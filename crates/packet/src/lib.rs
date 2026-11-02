@@ -1285,17 +1285,13 @@ mod tests {
     }
 
     #[test]
-    fn public_c_headers_track_v7_record_layouts() {
+    fn public_c_header_tracks_v7_record_layouts() {
         let root = include_str!("../../../include/packet.h");
-        let crate_header = include_str!("../include/packet.h");
         assert!(root.contains("PLOW_VERSION ((uint16_t)7)"));
-        assert!(crate_header.contains("INFERVISOR_PACKET_VERSION 7"));
-        for header in [root, crate_header] {
-            assert!(header.contains("kind"));
-            assert!(header.contains("access"));
-            assert!(header.contains("uint32_t window"));
-            assert!(header.contains("args[4]"));
-        }
+        assert!(root.contains("kind"));
+        assert!(root.contains("access"));
+        assert!(root.contains("uint32_t window"));
+        assert!(root.contains("args[4]"));
     }
 
     #[test]

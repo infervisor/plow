@@ -964,8 +964,8 @@ pub struct RuntimeConfig {
     /// the cost is the full-width `q_absorb`/`q_rope`/`o_proj` twins resident on every rank, so
     /// turning it off has to skip BINDING them, not just dispatching to them. Off, a packet that
     /// carries the siblings costs only their program records.
-    #[arg(long = "glm-rowband", env = "PLOW_GLM_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub glm_rowband: bool,
+    #[arg(long = "rowband", env = "PLOW_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub rowband: bool,
     /// Expert: widest decode rung a serving engine admits; unset = no ceiling.
     #[arg(
         long = "decode-max-rung",
@@ -1876,18 +1876,18 @@ pub struct NvidiaRuntimeConfig {
     /// of the prefill object's `plow_<arch>_light_pf` kernel on this many blocks per SM instead
     /// of interpreter windows. 0 = windows.
     #[arg(
-        long = "qwen-light-occ",
-        env = "PLOW_QWEN_LIGHT_OCC",
+        long = "gdn-light-occ",
+        env = "PLOW_GDN_LIGHT_OCC",
         default_value_t = 4,
         global = true
     )]
-    pub qwen_light_occ: u32,
+    pub gdn_light_occ: u32,
 
     /// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows (norms, gates, rope) run as
-    /// `plow_<arch>_light_pf` launches on the `--qwen-light-occ` grid instead of interpreter
+    /// `plow_<arch>_light_pf` launches on the `--gdn-light-occ` grid instead of interpreter
     /// windows (the same block-per-row bodies: the outputs are the window's).
-    #[arg(long = "qwen-light-decode", env = "PLOW_QWEN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub qwen_light_decode: bool,
+    #[arg(long = "gdn-light-decode", env = "PLOW_GDN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gdn_light_decode: bool,
 
     /// A routed decode segment [producer -> QuantFp8 in 1x128 groups] (RMSNorm, gated norm,
     /// SiLU Glu, sigmoid gate) runs as one `plow_<arch>_light_quant[_norm]` launch instead of an
@@ -1898,8 +1898,8 @@ pub struct NvidiaRuntimeConfig {
     /// A packed Qwen3.5 prefill chunk's segments between its per-tick launches (the external GDN
     /// segments, the rider attention) replay as CUDA graph pieces captured once per bucket
     /// (needs `--pf-seg-graph`).
-    #[arg(long = "qwen-pf-graph", env = "PLOW_QWEN_PF_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub qwen_pf_graph: bool,
+    #[arg(long = "gdn-pf-graph", env = "PLOW_GDN_PF_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gdn_pf_graph: bool,
 
     /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
     /// weights are contiguous and a light attention launch reads the three outputs.
@@ -2399,11 +2399,7 @@ pub struct AmdRuntimeConfig {
     /// DSA sparse prefill chunk floor: a chunk on the sparse prefill rung whose context end
     /// (`c0 + clen`) is at most this many tokens skips the indexer selection and runs the dense
     /// flash. Unset = every chunk of the sparse rung is sparse.
-    #[arg(
-        long = "glm-dsa-pf-min-ctx",
-        env = "PLOW_GLM_DSA_PF_MIN_CTX",
-        global = true
-    )]
+    #[arg(long = "dsa-pf-min-ctx", env = "PLOW_DSA_PF_MIN_CTX", global = true)]
     pub dsa_pf_min_ctx: Option<u32>,
 
     /// With the tail-sparse floor: the dense final chunk moves only when `prior x tail rows` (the
@@ -2661,8 +2657,8 @@ pub struct AmdRuntimeConfig {
     /// row-band wrong-answer defect: that defect is armed by any ordinary program-3 execution in
     /// the 8192 bucket, and this workspace is the only device memory both paths share that no
     /// per-sequence clear covers. Hundreds of MB of H2D per dispatch — never leave it on.
-    #[arg(long = "amd-glm-rowband-clear-ws", env = "PLOW_GLM_ROWBAND_CLEAR_WS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub glm_rowband_clear_ws: bool,
+    #[arg(long = "amd-rowband-clear-ws", env = "PLOW_ROWBAND_CLEAR_WS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub rowband_clear_ws: bool,
 
     /// Run native GLM MoE prefill rows >= 1024 on AITER's 64-row persistent tile
     /// (`..._psx_64x256.co`), the object its GLM-5 gfx942 tuning selects there.
@@ -3298,10 +3294,10 @@ impl RuntimeConfig {
         )
     }
 
-    pub(crate) fn glm_rowband(&self) -> bool {
+    pub(crate) fn rowband(&self) -> bool {
         select_compat(
-            self.glm_rowband,
-            Self::env_bool("PLOW_GLM_ROWBAND"),
+            self.rowband,
+            Self::env_bool("PLOW_ROWBAND"),
             !Self::is_initialized(),
         )
     }
