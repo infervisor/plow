@@ -60,8 +60,9 @@ fi
 
 # ---- vendor detect
 MIXED=0
-[ -e /dev/nvidiactl ] && [ -e /dev/kfd ] && command -v nvidia-smi >/dev/null 2>&1 &&
-  command -v amd-smi >/dev/null 2>&1 && MIXED=1
+# Device nodes, not SMI tools: outside the nix shell amd-smi is missing, and a lease taken
+# there must still land in the right pool's lock files.
+[ -e /dev/nvidiactl ] && [ -e /dev/kfd ] && MIXED=1
 if [ -n "$GPU_LEASE_VENDOR" ]; then VENDOR=$GPU_LEASE_VENDOR
 elif [ "$MIXED" = 1 ]; then VENDOR=mixed
 elif command -v nvidia-smi >/dev/null 2>&1; then VENDOR=nvidia
@@ -352,7 +353,12 @@ if [ "$NGOT" -lt "$NGPU" ] || [ "$MIXED" = 1 ]; then
     # device when a partial lease starts above gpu0.
     export ROCR_VISIBLE_DEVICES="$VIS"
     unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
-    [ "$MIXED" = 1 ] && export CUDA_VISIBLE_DEVICES=-1    # no NVIDIA card for an AMD lease
+    if [ "$MIXED" = 1 ]; then
+      # No NVIDIA card for an AMD lease. The HIP runtime also reads CUDA_VISIBLE_DEVICES, so
+      # give HIP its own (already renumbered) ordinals, which it prefers; ROCr ignores both.
+      export CUDA_VISIBLE_DEVICES=-1
+      HIP_VISIBLE_DEVICES=$(seq -s, 0 $((NGOT - 1))); export HIP_VISIBLE_DEVICES
+    fi
   else
     export CUDA_VISIBLE_DEVICES="$VIS"
     [ "$MIXED" = 1 ] && export ROCR_VISIBLE_DEVICES=-1 && unset HIP_VISIBLE_DEVICES
