@@ -604,8 +604,10 @@ pub fn check_packet_contract(
     let Some(feature) = concat else {
         return Ok(());
     };
-    let dir = packet.parent().unwrap_or(Path::new("."));
-    let declared = runtime_requires(dir)?.plowrt_contract;
+    let declared = match blob.abi(raw)? {
+        Some(abi) => abi.contract,
+        None => runtime_requires(packet.parent().unwrap_or(Path::new(".")))?.plowrt_contract,
+    };
     if declared < plow_asset::RUNTIME_CONTRACT_CONCAT {
         return Err(RuntimeError::Rejected(format!(
             "{}: uses {feature} but declares plowrt contract {declared} (needs {})",

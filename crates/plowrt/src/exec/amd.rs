@@ -8794,16 +8794,9 @@ impl AmdEngine {
         let raw = &image.raw;
         let arch = EngineDevice::arch(&*be);
         if let Some(target) = image.blob.abi(raw)?.and_then(|a| a.target) {
-            match target.check_hsa(&arch, &arch) {
-                Err(e) => {
-                    return Err(RuntimeError::Rejected(format!(
-                        "{}: {e}",
-                        blob_path.display()
-                    )))
-                }
-                Ok(Some(note)) => tracing::info!("{note}"),
-                Ok(None) => {}
-            }
+            target
+                .check_hsa(&arch)
+                .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", blob_path.display())))?;
         }
         let n_cu_dev = EngineDevice::sm_count(&*be);
         // ACCEPT L2-DOMAIN PLACEMENT AND CHECK IT AT OBJECT LOAD, rather than making the operator

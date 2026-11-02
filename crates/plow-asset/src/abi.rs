@@ -9,7 +9,8 @@
 //! * `target` — the instruction set the programs were compiled for. A reader refuses only a real
 //!   instruction-set mismatch; the product the packet was tuned on, its memory and its L2 size
 //!   never refuse it (the CU count is checked by each engine against the packet header).
-//! * `bindings` — the runtime role of each fixed binding tensor and every KV-cache write site.
+//! * `bindings` — the runtime role of each fixed binding tensor and every KV-cache write site the
+//!   write-row rule ([`kv_write_row_field`]) finds.
 //!   A reader checks them against the tensor names they are derived from today.
 use std::collections::BTreeMap;
 
@@ -76,7 +77,8 @@ pub struct Target {
 pub struct Bindings {
     /// Role ([`ROLES`]) -> tensor handle, for every role the packet declares.
     pub roles: BTreeMap<String, u16>,
-    /// Every KV-cache write site: `[program, instruction, i-field holding the write row]`.
+    /// Every KV-cache write site [`kv_write_row_field`] finds: `[program, instruction, i-field
+    /// holding the write row]`.
     pub kv_writes: Vec<[u32; 3]>,
 }
 
@@ -155,9 +157,8 @@ impl Target {
         Ok(self.tuned_note(device))
     }
 
-    pub fn check_hsa(&self, arch: &str, device: &str) -> Result<Option<String>, String> {
-        hsa_isa_runs_on(&self.isa, arch)?;
-        Ok(self.tuned_note(device))
+    pub fn check_hsa(&self, arch: &str) -> Result<(), String> {
+        hsa_isa_runs_on(&self.isa, arch)
     }
 
     fn tuned_note(&self, device: &str) -> Option<String> {
@@ -193,11 +194,22 @@ pub fn cuda_isa_runs_on(isa: &str, cc: (u32, u32)) -> Result<(), String> {
     ok.then_some(()).ok_or_else(refuse)
 }
 
-/// Whether objects compiled for `isa` run on an HSA agent named `arch` (`gfx942`, possibly with
-/// `:feature` suffixes on either side).
+/// Whether objects compiled for `isa` run on an HSA agent named `arch` (`gfx942`, with optional
+/// `:feature+`/`:feature-` suffixes): same processor, and no feature set one way on one side and
+/// the other way on the other.
 pub fn hsa_isa_runs_on(isa: &str, arch: &str) -> Result<(), String> {
-    let base = |s: &str| s.split(':').next().unwrap_or("").to_string();
-    (base(isa) == base(arch))
+    let features = |s: &'_ str| -> Vec<(String, bool)> {
+        s.split(':')
+            .skip(1)
+            .map(|f| (f.trim_end_matches(['+', '-']).to_string(), f.ends_with('+')))
+            .collect()
+    };
+    let (fa, fb) = (features(isa), features(arch));
+    let conflict = fa
+        .iter()
+        .any(|(n, on)| fb.iter().any(|(m, other)| n == m && on != other));
+    let same = isa.split(':').next() == arch.split(':').next();
+    (same && !conflict)
         .then_some(())
         .ok_or_else(|| format!("the packet was compiled for {isa}, which does not run on {arch}"))
 }
@@ -286,6 +298,8 @@ mod tests {
         assert!(cuda_isa_runs_on("sm_", (9, 0)).is_err());
         assert!(hsa_isa_runs_on("gfx942", "gfx942:sramecc+:xnack-").is_ok());
         assert!(hsa_isa_runs_on("gfx942", "gfx950").is_err());
+        assert!(hsa_isa_runs_on("gfx90a:xnack+", "gfx90a:xnack-").is_err());
+        assert!(hsa_isa_runs_on("gfx90a:xnack+", "gfx90a").is_ok());
     }
 
     #[test]

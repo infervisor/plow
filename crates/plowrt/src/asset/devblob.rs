@@ -339,14 +339,15 @@ fn check_handles(p: usize, prog: &DevProg, n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Sections may not overlap, and a (kind, name) pair names at most one of them.
-/// The packet's `abi.json` against this runtime and against the names its bindings restate.
+/// The packet's `abi.json` against this runtime and against the names its bindings restate. An
+/// extension declares no tensors, so its bindings are not checked here.
 fn check_abi(
     buf: &[u8],
     sects: &[DevSection],
     n_cu: u32,
     tensors: &[DevTensor],
     progs: &[DevProg],
+    is_ext: bool,
 ) -> Result<()> {
     let Some(abi) = read_abi(buf, sects)? else {
         return Ok(());
@@ -358,7 +359,7 @@ fn check_abi(
         .collect();
     abi.validate(n_cu, &meta)
         .map_err(|e| RuntimeError::Device(format!("devblob: {}: {e}", plow_asset::abi::SECTION)))?;
-    if let Some(declared) = &abi.bindings {
+    if let Some(declared) = abi.bindings.as_ref().filter(|_| !is_ext) {
         let names: Vec<String> = tensors.iter().map(|t| t.name.clone()).collect();
         let derived = plow_asset::abi::Bindings::derive(
             &names,
@@ -396,6 +397,7 @@ fn read_abi(buf: &[u8], sects: &[DevSection]) -> Result<Option<plow_asset::abi::
         .map_err(|e| malformed(format!("{}: {e}", plow_asset::abi::SECTION)))
 }
 
+/// Sections may not overlap, and a (kind, name) pair names at most one of them.
 fn check_sections(sects: &[DevSection]) -> Result<()> {
     let mut by_start: Vec<&DevSection> = sects.iter().collect();
     by_start.sort_by_key(|s| (s.offset, s.size));
@@ -829,9 +831,7 @@ impl DevBlob {
             None
         };
 
-        if parent.is_none() {
-            check_abi(buf, &sections, hdr.n_cu, &tensors, &progs)?;
-        }
+        check_abi(buf, &sections, hdr.n_cu, &tensors, &progs, parent.is_some())?;
         if hdr.target != 0 {
             tracing::info!(
                 target_fp = format_args!("{:#010x}", hdr.target),
