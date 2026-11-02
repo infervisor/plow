@@ -4441,6 +4441,8 @@ fn run_one_tick(
                     e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
                 }
             }
+            // Slots own their sinks between ticks: one a fault drops then ends its handoff.
+            result.2.pd_exports.clear();
             return result;
         }
 
