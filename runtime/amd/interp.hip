@@ -392,12 +392,16 @@ extern "C" __device__ unsigned plow_packed_prefill_abi_1 = 1;
  * packet-scalar kernel is exactly the silent wrong answer the contract exists to prevent. */
 extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
 extern "C" __device__ unsigned plow_row_gather_1 = 1;
+/* GEMV_ARGMAX, PER_LAYER_INPUT and the EMBED_{OVERLAY,POS,FRAME}_BF16 arms are gfx12-only until
+ * a CDNA object is gated with them: CDNA objects stay as shipped (devgen GFX12_DISPATCHED). */
+#if PLOW_GFX12
 extern "C" __device__ unsigned plow_gemv_argmax_1 = 1;
 extern "C" __device__ unsigned plow_per_layer_input_1 = 1;
 extern "C" __device__ unsigned plow_embed_overlay_bf16_1 = 1;
 extern "C" __device__ unsigned plow_embed_pos_bf16_1 = 1;
 #if !defined(PLOW_HAS_EMBED_FRAME_BF16) || PLOW_HAS_EMBED_FRAME_BF16
 extern "C" __device__ unsigned plow_embed_frame_bf16_1 = 1;
+#endif
 #endif
 #if PLOW_PACKED_PREFILL_DENSE_CONSUMERS
 extern "C" __device__ unsigned plow_packed_prefill_dense_consumers_1 = 1;
@@ -4459,6 +4463,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     in->fj[0].f, slice, nblk);
             break;
 #endif
+#if PLOW_GFX12
         case PLOW_DOP_EMBED_OVERLAY_BF16:
             d_embed_overlay((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
                             (const float*)TEN(3), (const unsigned*)TEN(4),
@@ -4481,6 +4486,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                           in->fj[0].f, in->fj[1].f, slice, nblk, sm->part);
             break;
 #endif
+#endif
         /* Terminal row selection for the unified token batch. Always dispatched: the arm is
          * a bounds-checked copy with no resource cost worth pruning, and a pruned arm here is
          * indistinguishable at runtime from a gather that silently wrote nothing. */
@@ -4488,12 +4494,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_row_gather((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
                          PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
             break;
+#if PLOW_GFX12
         case PLOW_DOP_GEMV_ARGMAX:
             exec_gemv_argmax(in, T, slice, nblk, sm->gm);
             break;
         case PLOW_DOP_PER_LAYER_INPUT:
             exec_per_layer_input(in, T, slice, nblk, PLOW_RUNTIME_ROWS(in->i[0]), sm->gm);
             break;
+#endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_SOFTCAP
         case PLOW_DOP_SOFTCAP:
 #if PLOW_MIXED_STEP

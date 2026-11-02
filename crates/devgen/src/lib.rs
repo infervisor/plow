@@ -10194,9 +10194,6 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_DSA_POOL_STASH",
     "PLOW_DOP_DSA_Q_QUANT",
     "PLOW_DOP_EMBED",
-    "PLOW_DOP_EMBED_FRAME_BF16",
-    "PLOW_DOP_EMBED_OVERLAY_BF16",
-    "PLOW_DOP_EMBED_POS_BF16",
     "PLOW_DOP_FLASH_DECODE",
     "PLOW_DOP_FLASH_DECODE_FP8",
     "PLOW_DOP_FLASH_GATHER_DECODE",
@@ -10232,7 +10229,6 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_WIDE_FP8",
     "PLOW_DOP_GEMM_WIDE_MXFP4",
     "PLOW_DOP_GEMV",
-    "PLOW_DOP_GEMV_ARGMAX",
     "PLOW_DOP_GEMV_F32",
     "PLOW_DOP_GEMV_FP8",
     "PLOW_DOP_GEMV_FP8_BLK",
@@ -10313,7 +10309,6 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_NORM_RESIDUAL",
     "PLOW_DOP_NORM_RESIDUAL_NORM",
     "PLOW_DOP_O_UV_FOLD",
-    "PLOW_DOP_PER_LAYER_INPUT",
     "PLOW_DOP_QUANT_FP8",
     "PLOW_DOP_QUANT_FP8_BLOCK128",
     "PLOW_DOP_QWEN_GATED_NORM",
@@ -10347,6 +10342,16 @@ const GFX950_DISPATCHED: &[&str] = &[
 ];
 
 /// Opcodes executed by isolated `AmdEngine` segments instead of `interp.hip`.
+/// Opcodes whose interp.hip arms compile only into gfx12 objects (`#if PLOW_GFX12`): no CDNA
+/// object has been gated with them, so a CDNA packet carrying one is refused.
+const GFX12_DISPATCHED: &[&str] = &[
+    "PLOW_DOP_EMBED_FRAME_BF16",
+    "PLOW_DOP_EMBED_OVERLAY_BF16",
+    "PLOW_DOP_EMBED_POS_BF16",
+    "PLOW_DOP_GEMV_ARGMAX",
+    "PLOW_DOP_PER_LAYER_INPUT",
+];
+
 const AMD_HOST_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_BLK_PF",
     "PLOW_DOP_GEMM_LT_PF",
@@ -10412,6 +10417,12 @@ fn check_group_routing_supported(m: &Model, amd: bool, arch: &str) {
 }
 
 fn check_gfx950_opcode_coverage(m: &Model, amd: bool) {
+    check_amd_opcode_coverage(m, amd, false);
+}
+
+/// [`check_gfx950_opcode_coverage`] for a known AMD arch: a gfx12 target also has the
+/// [`GFX12_DISPATCHED`] arms.
+fn check_amd_opcode_coverage(m: &Model, amd: bool, gfx12: bool) {
     if !amd {
         return;
     }
@@ -10423,6 +10434,7 @@ fn check_gfx950_opcode_coverage(m: &Model, amd: bool) {
             };
             let c = op.c_name();
             if !GFX950_DISPATCHED.contains(&c)
+                && !(gfx12 && GFX12_DISPATCHED.contains(&c))
                 && !AMD_HOST_DISPATCHED.contains(&c)
                 && !missing.contains(&c)
             {
@@ -11879,13 +11891,13 @@ fn emit_dense_gqa(
     // GATE: an fp8 GEMM whose a_scale operand is unbound is a NULL DEREFERENCE on gfx950. Checked
     // against the emitted stream and BEFORE the blob is written, so the bad packet never exists.
     check_fp8_a_scale_bound(&m, &arch, &gpu);
-    check_gfx950_opcode_coverage(&m, amd);
+    check_amd_opcode_coverage(&m, amd, arch == "gfx1201");
     check_nvidia_opcode_coverage(&m, amd);
     check_cpu_or_metal_opcode_coverage(
         &m,
         arch == "metal3" || target_is_cpu(&arch, &gpu) || (arch.is_empty() && gpu.is_empty()),
         arch.starts_with("sm_"),
-        amd,
+        amd && arch == "gfx1201",
     );
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
@@ -12257,15 +12269,15 @@ mod xalltoall_heads_tests;
 pub mod fp8_m1_role;
 
 /// Refuse operations outside each backend's implemented subset.
-fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool, amd: bool) {
+fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool, gfx12: bool) {
     if supported {
         return;
     }
     // The CUDA interpreter carries the embedding-overlay handoff (op 179) too.
-    // The AMD interpreter carries PerLayerInput and EmbedOverlayBf16.
+    // The gfx12 AMD interpreter carries PerLayerInput and EmbedOverlayBf16.
     let target_ok = |op: DevOp| {
         (cuda && matches!(op, DevOp::EmbedOverlayBf16 | DevOp::GluStrided))
-            || (amd && matches!(op, DevOp::PerLayerInput | DevOp::EmbedOverlayBf16))
+            || (gfx12 && matches!(op, DevOp::PerLayerInput | DevOp::EmbedOverlayBf16))
     };
     const CPU_OR_METAL_ONLY: [DevOp; 5] = [
         DevOp::PerLayerInput,

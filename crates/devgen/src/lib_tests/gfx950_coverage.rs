@@ -125,7 +125,11 @@ fn dispatched_list_matches_the_amd_interpreter() {
     }
     found.sort();
     found.dedup();
-    let mut want: Vec<String> = GFX950_DISPATCHED.iter().map(|s| s.to_string()).collect();
+    let mut want: Vec<String> = GFX950_DISPATCHED
+        .iter()
+        .chain(GFX12_DISPATCHED)
+        .map(|s| s.to_string())
+        .collect();
     want.sort();
     let missing_here: Vec<&String> = found.iter().filter(|n| !want.contains(n)).collect();
     let stale: Vec<&String> = want.iter().filter(|n| !found.contains(n)).collect();
@@ -278,7 +282,7 @@ fn covered_opcodes_pass_and_nvidia_is_never_checked() {
         prog_t: vec![1],
         gen: vec![],
     };
-    check_gfx950_opcode_coverage(&m, true);
+    check_amd_opcode_coverage(&m, true, true);
     check_cpu_or_metal_opcode_coverage(&m, false, false, true);
     // The Gemma-MoE family has no AMD arm at all; on an NVIDIA target that must not be checked.
     let p2 = packet::devbuild::Program {
@@ -676,4 +680,42 @@ fn dense_mxfp4_is_not_silently_bf16() {
         "PLOW_MXFP4=1 emitted a packet with no MXFP4 opcode. It is byte-identical to the bf16 one \
          and would be benchmarked as mxfp4."
     );
+}
+
+/// The gfx12-only arms are refused for a CDNA target: its objects have no `case` for them.
+#[test]
+#[should_panic(expected = "gfx950_opcode_arm")]
+fn gfx12_only_opcode_is_refused_for_cdna() {
+    let i = packet::dev::DevInst {
+        op: DevOp::GemvArgmax as u16,
+        blocks: 1,
+        ..Default::default()
+    };
+    let p = packet::devbuild::Program {
+        hier_base: 0,
+        n_cu: 4,
+        n_counter: 0,
+        insts: vec![i],
+        stream: vec![],
+        stream_ofs: vec![],
+        stream_len: vec![],
+        waits: vec![],
+        succs: vec![],
+        tensors: vec![],
+        gq_stream: vec![],
+        gq_seg_ofs: vec![],
+        reduction_witness: None,
+        l2_sms: 0,
+        l2_domains: 0,
+    };
+    let m = Model {
+        n_cu: 4,
+        target: 0,
+        tensors: vec![],
+        progs: vec![p],
+        kv_row_insts: vec![],
+        prog_t: vec![1],
+        gen: vec![],
+    };
+    check_gfx950_opcode_coverage(&m, true);
 }
