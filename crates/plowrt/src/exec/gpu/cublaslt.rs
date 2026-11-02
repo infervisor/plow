@@ -427,7 +427,7 @@ pub(super) struct LightFunctions {
     pub(super) prefill_conv: bool,
     /// `plow_<arch>_light_qnorm`: a routed decode rung's QwenRmsNorm, register-resident rows.
     pub(super) qwen_norm: Option<KernelFn>,
-    /// `plow_<arch>_light_quant` (`plow_light_quant_abi` 1, `PLOW_LIGHT_QUANT`): a decode segment
+    /// `plow_<arch>_light_quant` (`plow_light_quant_abi` 1 or 2, `PLOW_LIGHT_QUANT`): a decode segment
     /// [producer -> QuantFp8 1x128 groups] as one launch (`light_quant_pair`), and
     /// `plow_<arch>_light_quant_norm` for the RMSNorm producer.
     pub(super) quant: Option<LightQuant>,
@@ -438,6 +438,18 @@ pub(super) struct LightFunctions {
 pub(super) struct LightQuant {
     pointwise: KernelFn,
     norm: KernelFn,
+    norm_threads: u32,
+}
+
+/// Block size of `light_quant_norm` for an object's `plow_light_quant_abi` and
+/// `plow_light_quant_norm_threads`: ABI 1 = 256 threads, ABI 2 = the declared 1024; anything else
+/// keeps the interpreter window.
+fn light_quant_norm_threads(abi: Option<u32>, threads: Option<u32>) -> Option<u32> {
+    match (abi, threads) {
+        (Some(1), _) => Some(256),
+        (Some(2), Some(1024)) => Some(1024),
+        _ => None,
+    }
 }
 
 /// `FA_ST_THREADS`: eight row-group warps and the producer warp.
@@ -505,11 +517,15 @@ pub(super) fn light_functions(
         be.get_function(module, &format!("plow_{arch}_light_qnorm"))
             .ok()
     });
-    let quant = match be.module_global_u32(module, "plow_light_quant_abi")? {
-        Some(LIGHT_QUANT_ABI) if crate::config::RuntimeConfig::get().nv.light_quant => {
+    let quant = match light_quant_norm_threads(
+        be.module_global_u32(module, "plow_light_quant_abi")?,
+        be.module_global_u32(module, "plow_light_quant_norm_threads")?,
+    ) {
+        Some(norm_threads) if crate::config::RuntimeConfig::get().nv.light_quant => {
             Some(LightQuant {
                 pointwise: be.get_function(module, &format!("plow_{arch}_light_quant"))?,
                 norm: be.get_function(module, &format!("plow_{arch}_light_quant_norm"))?,
+                norm_threads,
             })
         }
         _ => None,
@@ -845,9 +861,6 @@ pub(super) fn qwen_light_segments(
     light
 }
 
-/// `plow_light_quant_abi` this runtime launches.
-const LIGHT_QUANT_ABI: u32 = 1;
-
 /// A segment that is exactly [producer, QuantFp8 of the producer's bf16 output in 1x128 groups],
 /// both instructions whole, which `light_quant` runs as one launch of one block per padded row:
 /// `(producer, quant)`. The producer must be one whose per-row body the kernel reproduces bit for
@@ -906,7 +919,7 @@ fn light_quant_pair(
         // The interpreter's block-per-row path (`batch <= nblk`), at most 32 elements per thread
         // in the kernel.
         DevOp::QwenRmsNorm => (
-            pd.i[0] == k && pd.i[1] == m && pb >= m as usize && k <= 32 * BLOCK,
+            pd.i[0] == k && pd.i[1] == m && pb >= m as usize && k <= 8192 && k % 8 == 0,
             3,
             &[
                 (0, row),
@@ -1004,7 +1017,15 @@ fn light_quant_pair(
             // Rows of a pitched z are read while other rows' outputs are written.
             && (zsrc == 0 || pd.op != DevOp::QwenGatedNorm as u16 || pairwise(&present(&[0, 2])))
     };
-    (shape && fits && disjoint(xq, gs) && operands_ok && alias_ok).then_some((p, q))
+    // light_quant_norm: 16-byte row/gamma/add accesses, 8-byte xq stores, scalar active and scales.
+    let aligned =
+        |h: u16, a: u64| h == none || devp.get(usize::from(h)).is_some_and(|t| t.base % a == 0);
+    let align_ok = pd.op != DevOp::QwenRmsNorm as u16
+        || ([0, 1, 2, 4].iter().all(|&i| aligned(pd.t[i], 16))
+            && aligned(pd.t[3], 4)
+            && aligned(qd.t[0], 8)
+            && aligned(qd.t[2], 4));
+    (shape && fits && disjoint(xq, gs) && operands_ok && alias_ok && align_ok).then_some((p, q))
 }
 
 /// Segments of 1..=`max` whole instructions (every slice, ascending, in program order) that
@@ -1191,7 +1212,7 @@ pub(super) fn add_qwen_light_routes(
                         } else {
                             (qd.i[4] * (qd.i[1] / 128)).div_ceil(BLOCK / 32)
                         },
-                        block: BLOCK,
+                        block: if norm { quant.norm_threads } else { BLOCK },
                         smem: 0,
                     }],
                     _scratch: None,
@@ -3030,6 +3051,17 @@ mod tests {
         // A dense z (no j1) needs only its rows.
         g.insts[0].fj[2] = 0;
         assert_eq!(light_quant_pair(&g, &entries, &devp(row)), Some((0, 1)));
+    }
+
+    #[test]
+    fn light_quant_norm_threads_abi() {
+        assert_eq!(light_quant_norm_threads(Some(1), None), Some(256));
+        assert_eq!(light_quant_norm_threads(Some(2), Some(1024)), Some(1024));
+        assert_eq!(light_quant_norm_threads(Some(2), None), None);
+        assert_eq!(light_quant_norm_threads(Some(2), Some(256)), None);
+        assert_eq!(light_quant_norm_threads(Some(2), Some(512)), None);
+        assert_eq!(light_quant_norm_threads(Some(3), Some(1024)), None);
+        assert_eq!(light_quant_norm_threads(None, Some(1024)), None);
     }
 
     #[test]
