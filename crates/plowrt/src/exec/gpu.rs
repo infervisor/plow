@@ -62,6 +62,97 @@ fn check_norm_weight_offset(be: &CudaBackend, module: &Module, blob: &DevBlob) -
     Ok(())
 }
 
+// Decide before any tensor view, TMA descriptor or library plan captures a partial address.
+// Include optional interpreter siblings and segment objects conservatively: a stale optional
+// object keeps the whole engine unstaged, even if its rung is not selected on this request.
+fn xr_staging_unavailable(
+    be: &CudaBackend,
+    decode: &Module,
+    prefill: Option<&InterpImage>,
+    assets: &Path,
+    blob: &DevBlob,
+    raw: &[u8],
+    want_sm: u32,
+    roles: Option<&SegmentRoles>,
+) -> Result<Option<String>> {
+    if !rank::staged_supported(&[be.module_global_u32(decode, rank::STAGED_MARKER)?]) {
+        return Ok(Some("decode interpreter lacks plow_xr_staged_1=1".into()));
+    }
+    let check = |image: &[u8], source: String, required: bool| -> Option<String> {
+        let interpreter = cubin::inspect(image).is_some_and(|info| {
+            info.sm == want_sm && info.entries.iter().any(|e| e.contains("PlowProgram"))
+        });
+        if (required || interpreter)
+            && !rank::staged_supported(&[cubin::global_u32(image, rank::STAGED_MARKER)])
+        {
+            Some(format!("{source} lacks plow_xr_staged_1=1"))
+        } else {
+            None
+        }
+    };
+    if let Some(pf) = prefill {
+        if let Some(reason) = check(&pf.image, pf.source.clone(), true) {
+            return Ok(Some(reason));
+        }
+    }
+    for section in blob
+        .sections
+        .iter()
+        .filter(|s| s.kind == packet::devbuild::SECT_CUBIN)
+    {
+        if let Some(image) = raw.get(section.offset..section.offset + section.size) {
+            if let Some(reason) = check(image, section.name.clone(), false) {
+                return Ok(Some(reason));
+            }
+        }
+    }
+    let config = &RuntimeConfig::get().nv;
+    let mut paths = vec![(assets.to_path_buf(), false)];
+    if let Some(dir) = crate::asset::serve::objects_dir(assets) {
+        paths.push((dir, false));
+    }
+    if let Some(path) = config.pf_seg_gemm_small.as_deref() {
+        paths.push((path.into(), true));
+    }
+    for object in roles.into_iter().flat_map(|r| r.objects.values()) {
+        paths.push((assets.join(&object.file), false));
+    }
+    let mut visited = std::collections::HashSet::new();
+    while let Some((path, required)) = paths.pop() {
+        let key = std::fs::canonicalize(&path).map_err(|source| RuntimeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if !visited.insert((key, required)) {
+            continue;
+        }
+        if path.is_dir() {
+            for entry in std::fs::read_dir(&path).map_err(|source| RuntimeError::Io {
+                path: path.clone(),
+                source,
+            })? {
+                let entry = entry.map_err(|source| RuntimeError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "cubin") {
+                    paths.push((p, false));
+                }
+            }
+        } else {
+            let image = std::fs::read(&path).map_err(|source| RuntimeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if let Some(reason) = check(&image, path.display().to_string(), required) {
+                return Ok(Some(reason));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn dsa_decode_batch_required<'a>(progs: impl IntoIterator<Item = &'a DevProg>) -> bool {
     progs
         .into_iter()
@@ -4026,7 +4117,7 @@ impl GpuEngine {
         be: Arc<CudaBackend>,
         assets_dir: &Path,
         checkpoint_dir: &Path,
-        rank_bind: Option<rank::RankBind>,
+        mut rank_bind: Option<rank::RankBind>,
     ) -> Result<Self> {
         let t0 = std::time::Instant::now();
         crate::knob_spec::check_assets(&assets_dir.join("model.pkt"))?;
@@ -4152,7 +4243,6 @@ impl GpuEngine {
                 r.tp_rank,
                 r.tp,
                 crate::asset::shard::DeclaredShards::from_blob(&blob, &raw)?,
-                r.own_region,
                 blob.tp.map_or(0, |t| t.slot_bytes),
             )),
             _ => None,
@@ -4757,6 +4847,28 @@ impl GpuEngine {
             );
         }
 
+        let prefill_image =
+            resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
+        if let Some(bind) = rank_bind.as_mut().filter(|b| b.tp > 1) {
+            match xr_staging_unavailable(
+                &be,
+                &module,
+                prefill_image.as_ref(),
+                assets_dir,
+                &blob,
+                &raw,
+                want_sm,
+                segment_roles.as_ref(),
+            ) {
+                Ok(None) => bind.enable_staging()?,
+                reason => tracing::info!(
+                    reason = ?reason,
+                    "staged host collectives unavailable; using unstaged host bindings"
+                ),
+            }
+        }
+        let tp_partial_region = rank_bind.as_ref().map(rank::RankBind::partial_region);
+
         // ---- VMM allocation and prefix sharing ----
         let mut vmm = {
             let run = || {
@@ -5042,12 +5154,14 @@ impl GpuEngine {
                     }
                     (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                 };
-                // TP partials live in this rank's collective region, where peers read them.
+                // Producers use the mirror only after every interpreter candidate passed the guard.
                 let mem = match (&tp_shards, td.name.as_str()) {
-                    (Some((.., own, _)), "act.og_tp") => DeviceMem::view(*own, td.bytes),
-                    (Some((.., own, slot_b)), "act.dg_tp") => DeviceMem::view(own + slot_b, td.bytes),
-                    (Some((.., own, slot_b)), "act.ug_tp") => {
-                        DeviceMem::view(own + 2 * slot_b, td.bytes)
+                    (Some(_), "act.og_tp") => DeviceMem::view(tp_partial_region.unwrap(), td.bytes),
+                    (Some((.., slot_b)), "act.dg_tp") => {
+                        DeviceMem::view(tp_partial_region.unwrap() + slot_b, td.bytes)
+                    }
+                    (Some((.., slot_b)), "act.ug_tp") => {
+                        DeviceMem::view(tp_partial_region.unwrap() + 2 * slot_b, td.bytes)
                     }
                     (Some(_), n) if n.ends_with("_tp") => {
                         return Err(RuntimeError::Rejected(format!(
@@ -5133,7 +5247,9 @@ impl GpuEngine {
                                 *n,
                             )?
                         }
-                        None => std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?),
+                        None => {
+                            std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?)
+                        }
                     };
                     if src.len() as u64 != td.bytes {
                         return Err(RuntimeError::Device(format!(
@@ -6779,65 +6895,65 @@ impl GpuEngine {
         // identified by the prefill entry in its symbol table, so the pair being
         // swapped on disk no longer costs the prefill path (it used to load the
         // DECODE image here and fail on the missing `_pf` symbol).
-        let pf = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
-        let (f_pf, smem_pf, module_pf, mut prefill, seg_pf, grid_pf) = if let Some(pf) = pf {
-            let pf_src = pf.source.clone();
-            match Self::load_prefill(
-                &be,
-                pf,
-                &blob,
-                assets_dir,
-                d_tens.base,
-                &devp,
-                grid,
-                profile.tag,
-                segment_roles.as_ref(),
-                packed_prefill.as_ref(),
-                cublaslt_prefill.as_ref(),
-                moe_lt_decode.clone(),
-                light_functions
-                    .as_ref()
-                    .and_then(|f| f.prefill)
-                    .or_else(|| {
-                        // The light kit loads only for routed decode (cuBLASLt projection
-                        // roles); the Qwen chain's prefill light launches need light_pf alone.
-                        be.get_function(&module, &format!("plow_{}_light_pf", profile.tag))
-                            .ok()
-                            .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light)
-                    }),
-                object_requirements_metadata.as_ref(),
-                tp_kernarg,
-            ) {
-                Ok((f_pf, smem_pf, module_pf, buckets, seg_pf, grid_pf)) => {
-                    tracing::info!(
-                        pf_cubin = %pf_src,
-                        buckets = buckets.len(),
-                        smem_pf,
-                        grid_pf,
-                        segmented = seg_pf.is_some(),
-                        "prefill object loaded"
-                    );
-                    (
-                        Some(f_pf),
-                        smem_pf,
-                        Some(module_pf),
-                        buckets,
-                        seg_pf,
-                        grid_pf,
-                    )
-                }
-                // HARD ERROR, not a fallback. The cubin is PRESENT and failed to
-                // load — a broken deployment, not a configuration. Falling back
-                // to decode-only means consuming the prompt ONE TOKEN AT A TIME:
-                // measured >=707 s on a 127k prompt (PX-13) against ~32 s with
-                // the buckets, and the only symptom is that it is slow. The
-                // usual cause is an arena over the 101376 B opt-in cap
-                // (`PGM_STAGES=5`, `PGM_BN=256`), which is a build mistake the
-                // operator must see. A genuinely absent cubin still falls back,
-                // below — that path is documented and intentional.
-                Err(e) => {
-                    return Err(RuntimeError::Device(format!(
-                        "prefill object {} failed to load: {e}\n\
+        let (f_pf, smem_pf, module_pf, mut prefill, seg_pf, grid_pf) =
+            if let Some(pf) = prefill_image {
+                let pf_src = pf.source.clone();
+                match Self::load_prefill(
+                    &be,
+                    pf,
+                    &blob,
+                    assets_dir,
+                    d_tens.base,
+                    &devp,
+                    grid,
+                    profile.tag,
+                    segment_roles.as_ref(),
+                    packed_prefill.as_ref(),
+                    cublaslt_prefill.as_ref(),
+                    moe_lt_decode.clone(),
+                    light_functions
+                        .as_ref()
+                        .and_then(|f| f.prefill)
+                        .or_else(|| {
+                            // The light kit loads only for routed decode (cuBLASLt projection
+                            // roles); the Qwen chain's prefill light launches need light_pf alone.
+                            be.get_function(&module, &format!("plow_{}_light_pf", profile.tag))
+                                .ok()
+                                .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light)
+                        }),
+                    object_requirements_metadata.as_ref(),
+                    tp_kernarg,
+                ) {
+                    Ok((f_pf, smem_pf, module_pf, buckets, seg_pf, grid_pf)) => {
+                        tracing::info!(
+                            pf_cubin = %pf_src,
+                            buckets = buckets.len(),
+                            smem_pf,
+                            grid_pf,
+                            segmented = seg_pf.is_some(),
+                            "prefill object loaded"
+                        );
+                        (
+                            Some(f_pf),
+                            smem_pf,
+                            Some(module_pf),
+                            buckets,
+                            seg_pf,
+                            grid_pf,
+                        )
+                    }
+                    // HARD ERROR, not a fallback. The cubin is PRESENT and failed to
+                    // load — a broken deployment, not a configuration. Falling back
+                    // to decode-only means consuming the prompt ONE TOKEN AT A TIME:
+                    // measured >=707 s on a 127k prompt (PX-13) against ~32 s with
+                    // the buckets, and the only symptom is that it is slow. The
+                    // usual cause is an arena over the 101376 B opt-in cap
+                    // (`PGM_STAGES=5`, `PGM_BN=256`), which is a build mistake the
+                    // operator must see. A genuinely absent cubin still falls back,
+                    // below — that path is documented and intentional.
+                    Err(e) => {
+                        return Err(RuntimeError::Device(format!(
+                            "prefill object {} failed to load: {e}\n\
                          Refusing to start: falling back to decode-only prompt consumption \
                          would prefill one token at a time (measured >=707 s vs ~32 s on a \
                          127k prompt) with no symptom but slowness.\n\
@@ -6845,19 +6961,19 @@ impl GpuEngine {
                          opt-in cap — check `-Xptxas -v` against the 101376 B limit (e.g. \
                          PGM_STAGES=5 or PGM_BN=256 overflow it). Remove the prefill cubin \
                          to serve decode-only deliberately.",
-                        pf_src
-                    )));
+                            pf_src
+                        )));
+                    }
                 }
-            }
-        } else {
-            // Deliberate for decode-only bundles, but for a release asset it means prompts run one
-            // token per launch (~20x slower) with no other symptom.
-            tracing::warn!(
-                expected = profile.prefill_file,
-                "no prefill object for sm_{want_sm} — decode-only prompt consumption"
-            );
-            (None, SMEM_PF, None, Vec::new(), None, grid)
-        };
+            } else {
+                // Deliberate for decode-only bundles, but for a release asset it means prompts run one
+                // token per launch (~20x slower) with no other symptom.
+                tracing::warn!(
+                    expected = profile.prefill_file,
+                    "no prefill object for sm_{want_sm} — decode-only prompt consumption"
+                );
+                (None, SMEM_PF, None, Vec::new(), None, grid)
+            };
 
         let routed = |b: &PrefillBucket| b.attention_gemm_segments.iter().any(Option::is_some);
         let attention_gemm = if prefill.iter().any(routed) {
@@ -9472,7 +9588,7 @@ impl GpuEngine {
         self.be.stream_synchronize(&self.stream)?;
         let t1 = std::time::Instant::now();
         let r = match self.rank_bind.as_mut() {
-            Some(r) => r.arm(plan),
+            Some(r) => r.arm(plan, &self.stream),
             None => Ok(()),
         };
         tracing::trace!(

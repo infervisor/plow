@@ -1,7 +1,7 @@
 /* op_collective.cuh — cross-rank all-reduce bodies for the NVIDIA interpreter.
  *
- * Same packet contract and arithmetic as runtime/amd/op_collective.h (d_xreduce_mega,
- * d_xreduce_twoshot_mega): each rank's producing GEMV has already written its bf16 partial
+ * Unstaged transport: same packet contract and arithmetic as runtime/amd/op_collective.h
+ * (d_xreduce_mega, d_xreduce_twoshot_mega): each rank's producing GEMV has already written its bf16 partial
  * into its own region `peer_scratch[rank] + slot`, the local interpreter gate ordered that
  * write before this packet, and every rank's xctr was zeroed before the launch.
  *
@@ -19,6 +19,15 @@
  * moves with ld/st.relaxed.sys. Accumulation is f32 in strict rank order 0..N-1, so every
  * rank produces bit-identical bf16.
  *
+ * NVIDIA peer tables have n_gpu + 1 entries: peer_scratch[n_gpu] is this rank's
+ * VRAM mirror (same region layout), or NULL for the unstaged transport. Only objects
+ * exporting plow_xr_staged_1 may receive a non-NULL mirror. Producers write the mirror;
+ * collectives publish raw bf16 bits to host and aggregate/poll in local VRAM.
+ *
+ * Slot reuse requires an intervening dependent collective: publishing new host contents
+ * happens only after every remote reader of the previous contents retired through it.
+ * Local overwrite follows retirement of local readers through the interpreter's gates.
+ *
  * A gate that does not clear within kXctrDeadlineNs (%globaltimer) writes 0xDEAD0000|rank to
  * the packet's status line (fj[2] = status id + 1, patched by the host) and skips the reduce.
  * Once the status line is set every later collective of the launch skips at once, so the
@@ -28,6 +37,7 @@
 
 constexpr unsigned long long kXctrDeadlineNs = 10000000000ull;
 constexpr uint32_t kXrAggWord = 31u;
+constexpr uint32_t kXrRelayWord = 30u;
 
 __device__ __forceinline__ unsigned long long xr_gtime() {
     unsigned long long t;
@@ -233,9 +243,155 @@ __device__ __forceinline__ uint32_t* xr_status(const PlowProgram& prog, const Pl
     return in->fj[2].u ? PLOW_CTR(prog.xctr, in->fj[2].u - 1u) : nullptr;
 }
 
+/* Copy bits, including unaligned heads/tails, without a floating-point conversion. */
+__device__ __forceinline__ void xr_publish_range(const PlowProgram& prog, uint32_t slot,
+                                                 uint32_t lo, uint32_t hi,
+                                                 unsigned tid, unsigned stride) {
+    const auto* src = (const __nv_bfloat16*)((const char*)prog.peer_scratch[prog.n_gpu] + slot);
+    auto* dst = (__nv_bfloat16*)((char*)prog.peer_scratch[prog.rank] + slot);
+    const uint32_t begin = xr_vec_begin(slot, lo, hi);
+    const uint32_t count = (hi - begin) / 8u, end = begin + count * 8u;
+    for (uint32_t t = tid; t < begin - lo + hi - end; t += stride) {
+        const uint32_t e = t < begin - lo ? lo + t : end + t - (begin - lo);
+        const unsigned short bits = __bfloat16_as_ushort(src[e]);
+        asm volatile("st.relaxed.sys.global.u16 [%0], %1;"
+                     :: "l"(dst + e), "h"(bits) : "memory");
+    }
+    for (uint32_t q = tid; q < count; q += stride)
+        xr_st8(dst + begin + q * 8u, xr_local_ld8(src + begin + q * 8u));
+}
+
+/* CTA stores -> CTA barrier -> acq_rel GPU RMW chain -> elected system release.
+ * The elected system acquire -> GPU release/acquire relay carries peer visibility to
+ * followers. Their system fence also orders subsequent relaxed system-scope peer loads.
+ * Followers never read host flags/status; only a local deadline writes host status. */
+__device__ __forceinline__ bool xr_staged_barrier(const PlowProgram& prog, size_t xoff,
+                                                  uint32_t gate, uint32_t* status,
+                                                  unsigned nblk) {
+    __shared__ int bailed;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        auto* line = PLOW_CTR((uint32_t*)((char*)prog.peer_scratch[prog.n_gpu] + xoff), gate);
+        uint32_t prev;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"
+                     : "=r"(prev) : "l"(line + kXrAggWord) : "memory");
+        if (prev + 1u == nblk) {
+            xr_arrive(prog, xoff, gate);
+            const uint32_t outcome = xr_wait(prog, xoff, gate, status) ? 1u : 2u;
+            asm volatile("st.release.gpu.global.u32 [%0], %1;"
+                         :: "l"(line + kXrRelayWord), "r"(outcome) : "memory");
+            bailed = outcome == 2u;
+        } else {
+            const unsigned long long t0 = xr_gtime();
+            uint32_t outcome;
+            for (;;) {
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+                             : "=r"(outcome) : "l"(line + kXrRelayWord) : "memory");
+                if (outcome) break;
+                if (xr_gtime() - t0 > kXctrDeadlineNs) {
+                    if (status) xr_store(status, 0xDEAD0000u | prog.rank);
+                    outcome = 2u;
+                    break;
+                }
+                __nanosleep(64);
+            }
+            xr_fence_sys();
+            bailed = outcome == 2u;
+        }
+    }
+    __syncthreads();
+    return !bailed;
+}
+
+template <bool Scatter>
+__device__ __forceinline__ void xr_staged_reduce_range(const PlowProgram& prog, uint32_t slot,
+                                                uint32_t lo, uint32_t hi, __nv_bfloat16* out,
+                                                const __nv_bfloat16* resid, __nv_bfloat16* out2,
+                                                unsigned tid, unsigned stride) {
+    const uint32_t begin = xr_vec_begin(slot, lo, hi);
+    const uint32_t count = (hi - begin) / 8u, end = begin + count * 8u;
+    for (uint32_t t = tid; t < begin - lo + hi - end; t += stride) {
+        const uint32_t e = t < begin - lo ? lo + t : end + t - (begin - lo);
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < prog.n_gpu; r++) {
+            const void* region = prog.peer_scratch[r == prog.rank ? prog.n_gpu : r];
+            acc += xr_ld((const __nv_bfloat16*)((const char*)region + slot) + e);
+        }
+        const __nv_bfloat16 v = __float2bfloat16_rn(acc);
+        if constexpr (Scatter) {
+            auto* dst = (__nv_bfloat16*)((char*)prog.peer_scratch[prog.rank] + slot) + e;
+            const unsigned short bits = __bfloat16_as_ushort(v);
+            asm volatile("st.relaxed.sys.global.u16 [%0], %1;"
+                         :: "l"(dst), "h"(bits) : "memory");
+        }
+        if (out2)
+            out2[e] = __float2bfloat16_rn((resid ? __bfloat162float(resid[e]) : 0.0f) +
+                                        __bfloat162float(v));
+        else out[e] = v;
+    }
+    for (uint32_t q = tid; q < count; q += 2u * stride) {
+        float acc[2][8] = {};
+        for (uint32_t r = 0; r < prog.n_gpu; r += 2u) {
+            uint4 v[2][2];
+            /* Issue independent peer loads before consuming either rank or vector. */
+#pragma unroll
+            for (unsigned rr = 0; rr < 2; rr++) {
+                if (r + rr < prog.n_gpu) {
+                    const void* region = prog.peer_scratch[r + rr == prog.rank ? prog.n_gpu : r + rr];
+                    const auto* src = (const __nv_bfloat16*)((const char*)region + slot);
+#pragma unroll
+                    for (unsigned j = 0; j < 2; j++)
+                        if (q + j * stride < count)
+                            v[rr][j] = xr_ld8(src + begin + (q + j * stride) * 8u);
+                }
+            }
+#pragma unroll
+            for (unsigned rr = 0; rr < 2; rr++)
+                if (r + rr < prog.n_gpu) {
+#pragma unroll
+                    for (unsigned j = 0; j < 2; j++)
+                        if (q + j * stride < count) {
+#pragma unroll
+                            for (unsigned k = 0; k < 8; k++)
+                                acc[j][k] += xr_vec_at(v[rr][j], k);
+                        }
+                }
+        }
+#pragma unroll
+        for (unsigned j = 0; j < 2; j++)
+            if (q + j * stride < count) {
+                XrVec v;
+#pragma unroll
+                for (unsigned k = 0; k < 8; k++) v.v[k] = __float2bfloat16_rn(acc[j][k]);
+                const uint32_t e = begin + (q + j * stride) * 8u;
+                if constexpr (Scatter)
+                    xr_st8((__nv_bfloat16*)((char*)prog.peer_scratch[prog.rank] + slot) + e, v);
+                if (out2) {
+                    const XrVec res = resid ? xr_local_ld8(resid + e) : XrVec{};
+#pragma unroll
+                    for (unsigned k = 0; k < 8; k++)
+                        v.v[k] = __float2bfloat16_rn(__bfloat162float(res.v[k]) +
+                                                   __bfloat162float(v.v[k]));
+                    xr_local_st8(out2 + e, v);
+                } else xr_local_st8(out + e, v);
+            }
+    }
+}
+
 /* XREDUCE (one-shot): t0=out i0=n i1=n_gpu i2=slot_bytes i3=gate. */
 __device__ __forceinline__ void d_xreduce_nv(const PlowProgram& prog, const PlowDevInst* in,
                                              void* const* T, unsigned slice, unsigned nblk) {
+    if (prog.peer_scratch[prog.n_gpu]) {
+        const size_t xoff = (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+        const uint32_t n = in->i[0], slot = in->i[2];
+        if (in->i[1] != prog.n_gpu || in->i[5] != 0u || in->t[2] != PLOW_TENSOR_NONE) __trap();
+        const unsigned tid = slice * blockDim.x + threadIdx.x, stride = nblk * blockDim.x;
+        xr_publish_range(prog, slot, 0, n, tid, stride);
+        if (!xr_staged_barrier(prog, xoff, in->i[3], xr_status(prog, in), nblk)) return;
+        xr_staged_reduce_range<false>(prog, slot, 0, n, (__nv_bfloat16*)T[in->t[0]],
+                                      nullptr, nullptr, tid, stride);
+        return;
+    }
     __shared__ int bailed;
     const size_t xoff = (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
     const uint32_t n = in->i[0], nr = prog.n_gpu, slot = in->i[2], gate = in->i[3];
@@ -257,6 +413,34 @@ __device__ __forceinline__ void d_xreduce_nv(const PlowProgram& prog, const Plow
 __device__ __forceinline__ void d_xreduce_twoshot_nv(const PlowProgram& prog,
                                                      const PlowDevInst* in, void* const* T,
                                                      unsigned slice, unsigned nblk) {
+    if (prog.peer_scratch[prog.n_gpu]) {
+        const size_t xoff = (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+        const uint32_t nr = prog.n_gpu, n = in->i[0], e0 = in->i[5];
+        const uint32_t slot = in->i[2] + e0 * 2u;
+        if (in->i[1] != nr || in->i[7] != 0u || in->t[3] != PLOW_TENSOR_NONE) __trap();
+        const unsigned tid = slice * blockDim.x + threadIdx.x, stride = nblk * blockDim.x;
+        const uint32_t lo = (uint32_t)(((uint64_t)n * prog.rank) / nr);
+        const uint32_t hi = (uint32_t)(((uint64_t)n * (prog.rank + 1)) / nr);
+        xr_publish_range(prog, slot, 0, lo, tid, stride);
+        xr_publish_range(prog, slot, hi, n, tid, stride);
+        uint32_t* status = xr_status(prog, in);
+        if (!xr_staged_barrier(prog, xoff, in->i[3], status, nblk)) return;
+        auto* out = (__nv_bfloat16*)T[in->t[0]] + e0;
+        const auto* resid = in->t[1] == PLOW_TENSOR_NONE ? nullptr
+            : (const __nv_bfloat16*)T[in->t[1]] + e0;
+        auto* out2 = in->t[2] == PLOW_TENSOR_NONE ? nullptr : (__nv_bfloat16*)T[in->t[2]] + e0;
+        xr_staged_reduce_range<true>(prog, slot, lo, hi, out, resid, out2, tid, stride);
+        if (!xr_staged_barrier(prog, xoff, in->i[4], status, nblk)) return;
+        for (uint32_t i = 0; i < nr; i++) {
+            const uint32_t r = (slice + prog.rank + i) % nr;
+            if (r == prog.rank) continue;
+            const uint32_t rlo = (uint32_t)(((uint64_t)n * r) / nr);
+            const uint32_t rhi = (uint32_t)(((uint64_t)n * (r + 1)) / nr);
+            const auto* src = (const __nv_bfloat16*)((const char*)prog.peer_scratch[r] + slot);
+            xr_gather_range(src, slot, rlo, rhi, out, resid, out2, tid, stride);
+        }
+        return;
+    }
     __shared__ int bailed;
     const size_t xoff = (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
     const uint32_t nr = prog.n_gpu, n = in->i[0], e0 = in->i[5];

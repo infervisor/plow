@@ -1,6 +1,6 @@
 /* xreduce_pcie_bench.cu — two-GPU all-reduce bodies (op_collective.cuh) against PCIe copy
  * ceilings. One process drives both devices; regions are either page-locked host memory mapped
- * into both (the process rank-group transport) or each rank's VRAM reached by peer access.
+ * into both (host), host plus a rank-local VRAM mirror (staged), or peer-accessible VRAM.
  *
  * Build (nix shell, clean compiler env as runtime/cmake/nvcc_cubin.sh):
  *   nix develop --command bash -c 'env -i PATH="$PLOW_NVCC_PATH" ROCM_PATH="$ROCM_PATH" \
@@ -26,20 +26,61 @@
 
 constexpr int kIters = 40;
 
-/* `iters` back-to-back collectives in one cooperative launch, each on fresh gate lines (2 per
- * iteration + the status line 0). The grid sync stands in for the interpreter's local gate
- * between packets: a rank arrives at the next collective only after all its blocks finished
- * reading the previous one, so the in-place two-shot slot is never overwritten under a reader. */
+__host__ __device__ static float partial_value(unsigned rank, unsigned iteration, uint32_t e) {
+    const uint32_t h = e * 37u + rank * 101u + iteration * 179u;
+    return (int(h % 1021u) - 510) * (1.0f / 512.0f);
+}
+
+/* Fresh inputs expose publish/arrival races. A zero-length dependent collective after
+ * each result retires all remote readers before the next publication reuses its host slot.
+ * The grid barriers also retire local readers before the producer overwrites the mirror. */
 __global__ void __launch_bounds__(256, 1)
 k_loop(PlowProgram prog, PlowDevInst in, void* out, void* resid, void* out2, bool twoshot,
-       int iters) {
+       int iters, uint16_t* history, unsigned long long* times) {
     void* tensors[] = {out, resid, out2};
+    const auto grid = cooperative_groups::this_grid();
+    const unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned stride = gridDim.x * blockDim.x;
+    const uint32_t n = in.i[0], e0 = in.i[5];
+    const bool save_all = n < 4096u * 2560u;
+    void* local = prog.peer_scratch[prog.n_gpu];
+    auto* partial = (__nv_bfloat16*)((char*)(local ? local : prog.peer_scratch[prog.rank]) + in.i[2]);
     for (int it = 0; it < iters; it++) {
-        in.i[3] = 1u + 2u * it;
-        in.i[4] = 2u + 2u * it;
+        unsigned long long start = 0, collective_start = 0;
+        if (tid == 0) start = xr_gtime();
+        if (prog.rank == 1 && (it & 1) && tid == 0) {
+            const auto delay = xr_gtime();
+            while (xr_gtime() - delay < 5000ull) {}
+        }
+        for (uint32_t e = tid; e < n; e += stride) {
+            const float v = partial_value(prog.rank, it, e0 + e);
+            if (local) partial[e0 + e] = __float2bfloat16_rn(v);
+            else xr_st(partial + e0 + e, v);
+        }
+        grid.sync();
+        if (tid == 0) collective_start = xr_gtime();
+        in.i[3] = 1u + 3u * it;
+        in.i[4] = 2u + 3u * it;
         if (twoshot) d_xreduce_twoshot_nv(prog, &in, tensors, blockIdx.x, gridDim.x);
         else d_xreduce_nv(prog, &in, tensors, blockIdx.x, gridDim.x);
-        cooperative_groups::this_grid().sync();
+        grid.sync();
+        if (tid == 0) {
+            const auto end = xr_gtime();
+            times[2 * it] = end - start;
+            times[2 * it + 1] = end - collective_start;
+        }
+        if (save_all || it == 0 || it == iters - 1) {
+            const unsigned snapshot = save_all ? it : (it == 0 ? 0 : 1);
+            for (uint32_t e = tid; e < n; e += stride)
+                history[(size_t)snapshot * n + e] = ((const uint16_t*)out)[e0 + e];
+        }
+        grid.sync();
+        PlowDevInst retire = in;
+        retire.i[0] = 0;
+        retire.i[3] = 3u + 3u * it;
+        retire.i[5] = 0;
+        d_xreduce_nv(prog, &retire, tensors, blockIdx.x, gridDim.x);
+        grid.sync();
     }
 }
 
@@ -196,13 +237,16 @@ static bool ping(bool p2p) {
     return ok;
 }
 
-/* One shape: a single concurrent collective on both ranks checked byte for byte against the
- * host f32-in-rank-order reference (with status), then kIters timed back to back from fresh
- * inputs and gates. Reports per-collective time and algorithm bandwidth (n*2 bytes / time). */
-static void collective(bool p2p, bool twoshot, uint32_t n, unsigned nblk) {
+/* Verify every decode iteration and the first/last prefill iterations, on both ranks.
+ * Device timers exclude snapshot copies and the slot-retirement collective. */
+static void collective(const char* transport, bool twoshot, uint32_t n, unsigned nblk,
+                       uint32_t e0 = 0) {
+    const bool p2p = std::strcmp(transport, "p2p") == 0;
+    const bool staged = std::strcmp(transport, "staged") == 0;
     const uint32_t slot = 0;
-    const size_t bytes = (size_t)n * 2, xoff = (bytes + 4095) & ~size_t(4095);
-    const size_t region = xoff + (size_t)(2 * kIters + 2) * PLOW_CTR_STRIDE * 4;
+    const size_t bytes = (size_t)n * 2, span_bytes = ((size_t)e0 + n) * 2;
+    const size_t xoff = (span_bytes + 4095) & ~size_t(4095);
+    const size_t region = xoff + (size_t)(3 * kIters + 2) * PLOW_CTR_STRIDE * 4;
     char* host = nullptr;
     char* base[2];
     if (p2p) {
@@ -212,27 +256,32 @@ static void collective(bool p2p, bool twoshot, uint32_t n, unsigned nblk) {
         base[0] = host;
         base[1] = host + region;
     }
-    std::vector<uint16_t> part[2], ref(n), got(n);
-    for (int r = 0; r < 2; r++) {
-        part[r].resize(n);
-        for (uint32_t e = 0; e < n; e++) part[r][e] = to_bf16(((e * 37u + r * 101u) % 997u) / 499.0f - 1.0f);
-    }
-    for (uint32_t e = 0; e < n; e++) ref[e] = to_bf16(0.0f + from_bf16(part[0][e]) + from_bf16(part[1][e]));
+    const bool save_all = n < 4096u * 2560u;
+    const size_t snapshots = save_all ? kIters : 2;
+    std::vector<uint16_t> ref(n), got(n);
     void* outp[2];
     void** peers[2];
+    char* local[2] = {};
+    uint16_t* history[2];
+    unsigned long long* times[2];
     for (int d = 0; d < 2; d++) {
         CK(cudaSetDevice(d));
-        CK(cudaMalloc(&outp[d], bytes));
-        CK(cudaMalloc(&peers[d], 2 * sizeof(void*)));
-        CK(cudaMemcpy(peers[d], base, 2 * sizeof(void*), cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&outp[d], span_bytes));
+        CK(cudaMalloc(&history[d], snapshots * bytes));
+        CK(cudaMalloc(&times[d], 2 * kIters * sizeof(unsigned long long)));
+        if (staged) CK(cudaMalloc(&local[d], region));
+        void* table[] = {base[0], base[1], local[d]};
+        CK(cudaMalloc(&peers[d], sizeof(table)));
+        CK(cudaMemcpy(peers[d], table, sizeof(table), cudaMemcpyHostToDevice));
     }
     auto reset = [&] {
         for (int d = 0; d < 2; d++) {
             CK(cudaSetDevice(d));
-            CK(cudaMemcpy(base[d] + slot, part[d].data(), bytes, cudaMemcpyDefault));
-            CK(cudaMemset(base[d] + xoff, 0, region - xoff));
-            CK(cudaMemset(outp[d], 0xff, bytes));
-            CK(cudaDeviceSynchronize());
+            CK(cudaMemsetAsync(base[d], 0, region, dev[d].s));
+            if (staged) CK(cudaMemsetAsync(local[d] + xoff, 0, region - xoff, dev[d].s));
+            CK(cudaMemsetAsync(outp[d], 0xff, span_bytes, dev[d].s));
+            CK(cudaMemsetAsync(history[d], 0xff, snapshots * bytes, dev[d].s));
+            CK(cudaStreamSynchronize(dev[d].s));
         }
     };
     PlowDevInst in{};
@@ -241,6 +290,7 @@ static void collective(bool p2p, bool twoshot, uint32_t n, unsigned nblk) {
     in.i[0] = n;
     in.i[1] = 2;
     in.i[2] = slot;
+    in.i[5] = e0;
     in.fj[2].u = 1;
     auto launch = [&](int d, int iters) {
         PlowProgram prog{};
@@ -250,7 +300,7 @@ static void collective(bool p2p, bool twoshot, uint32_t n, unsigned nblk) {
         prog.xctr = (uint32_t*)(base[d] + xoff);
         void* o = outp[d];
         void* none = nullptr;
-        void* args[] = {&prog, &in, &o, &none, &none, &twoshot, &iters};
+        void* args[] = {&prog, &in, &o, &none, &none, &twoshot, &iters, &history[d], &times[d]};
         CK(cudaLaunchCooperativeKernel((void*)k_loop, nblk, 256, args, 0, dev[d].s));
     };
     auto status_ok = [&](const char* what) {
@@ -262,29 +312,63 @@ static void collective(bool p2p, bool twoshot, uint32_t n, unsigned nblk) {
         }
         return true;
     };
+    auto check = [&](int iters) {
+        bool ok = status_ok("collective");
+        for (int it = 0; it < iters; it++) {
+            if (!save_all && it != 0 && it != iters - 1) continue;
+            for (uint32_t e = 0; e < n; e++) {
+                float sum = 0.0f;
+                for (unsigned r = 0; r < 2; r++)
+                    sum += from_bf16(to_bf16(partial_value(r, it, e0 + e)));
+                ref[e] = to_bf16(sum);
+            }
+            const unsigned snapshot = save_all ? it : (it == 0 ? 0 : 1);
+            for (int d = 0; d < 2; d++) {
+                CK(cudaSetDevice(d));
+                CK(cudaMemcpy(got.data(), history[d] + (size_t)snapshot * n, bytes, cudaMemcpyDeviceToHost));
+                if (std::memcmp(got.data(), ref.data(), bytes) != 0) {
+                    std::printf("FAIL bytes %s rank=%d it=%d n=%u e0=%u %s\n",
+                                transport, d, it, n, e0, twoshot ? "twoshot" : "oneshot");
+                    ok = false;
+                    g_fail = true;
+                }
+            }
+        }
+        return ok;
+    };
     reset();
     time_both([&](int d) { launch(d, 1); });
-    bool ok = status_ok("check");
-    for (int d = 0; d < 2 && ok; d++) {
-        CK(cudaSetDevice(d));
-        CK(cudaMemcpy(got.data(), outp[d], bytes, cudaMemcpyDeviceToHost));
-        if (std::memcmp(got.data(), ref.data(), bytes) != 0) {
-            std::printf("FAIL bytes rank %d n=%u %s\n", d, n, twoshot ? "twoshot" : "oneshot");
-            ok = false;
-            g_fail = true;
-        }
-    }
+    bool ok = check(1);
     reset();
     const double ms = time_both([&](int d) { launch(d, kIters); });
-    ok &= status_ok("timed");
-    const double per = ms / kIters;
-    std::printf("XR %-5s %-7s n=%-9u nblk=%-3u %9.2f us/coll  %7.2f GB/s alg  %s\n",
-                p2p ? "p2p" : "host", twoshot ? "twoshot" : "oneshot", n, nblk, per * 1e3,
-                bytes / (per * 1e6), ok ? "bytes=ok" : "INVALID");
+    ok &= check(kIters);
+    double inclusive = 0, collective_us = 0;
+    for (int d = 0; d < 2; d++) {
+        unsigned long long elapsed[2 * kIters];
+        CK(cudaSetDevice(d));
+        CK(cudaMemcpy(elapsed, times[d], sizeof(elapsed), cudaMemcpyDeviceToHost));
+        unsigned long long with_producer = 0, without_producer = 0;
+        for (int it = 0; it < kIters; it++) {
+            with_producer += elapsed[2 * it];
+            without_producer += elapsed[2 * it + 1];
+        }
+        const double inc = with_producer / (1000.0 * kIters);
+        const double coll = without_producer / (1000.0 * kIters);
+        inclusive = inc > inclusive ? inc : inclusive;
+        collective_us = coll > collective_us ? coll : collective_us;
+    }
+    std::printf("XR %-6s %-7s n=%-9u e0=%u nblk=%-3u %9.2f us/coll %9.2f us/produce+coll "
+                "%9.2f us/loop %7.2f GB/s alg %s\n",
+                transport, twoshot ? "twoshot" : "oneshot", n, e0, nblk, collective_us,
+                inclusive, ms * 1e3 / kIters, bytes / (collective_us * 1e3),
+                ok ? "bytes=ok" : "INVALID");
     for (int d = 0; d < 2; d++) {
         CK(cudaSetDevice(d));
         CK(cudaFree(outp[d]));
         CK(cudaFree(peers[d]));
+        CK(cudaFree(history[d]));
+        CK(cudaFree(times[d]));
+        if (staged) CK(cudaFree(local[d]));
         if (p2p) CK(cudaFree(base[d]));
     }
     if (host) CK(cudaFreeHost(host));
@@ -315,13 +399,16 @@ int main(int argc, char** argv) {
     std::vector<unsigned> nblks;
     for (int a = 1; a < argc; a++) nblks.push_back((unsigned)atoi(argv[a]));
     if (nblks.empty()) nblks = {(unsigned)sms, 32u, 16u, 8u, 4u, 2u, 1u};
-    for (bool p2p : {false, true}) {
-        if (p2p && !p2p_ok) continue;
+    for (const char* transport : {"host", "staged", "p2p"}) {
+        if (std::strcmp(transport, "p2p") == 0 && !p2p_ok) continue;
         for (unsigned nblk : nblks) {
-            collective(p2p, false, 2560, nblk);
-            collective(p2p, false, 3840, nblk);
-            collective(p2p, true, 4096u * 2560u, nblk);
-            collective(p2p, true, 4096u * 3840u, nblk);
+            collective(transport, false, 2560, nblk);
+            collective(transport, false, 3840, nblk);
+            collective(transport, true, 4096u * 2560u, nblk);
+            collective(transport, true, 4096u * 3840u, nblk);
+            collective(transport, false, 2561, nblk);
+            collective(transport, true, 2561, nblk, 5);
+            collective(transport, true, 4096u * 2560u + 3u, nblk, 5);
         }
     }
     return g_fail ? 1 : 0;
