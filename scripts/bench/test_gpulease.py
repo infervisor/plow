@@ -113,6 +113,8 @@ def test_status_word_is_not_a_label_and_a_label_needs_a_command(env):
     out = subprocess.run([str(LEASE), "status"], env=env, capture_output=True, text=True, timeout=30)
     assert out.returncode == 0 and "queue" in out.stdout
     assert not (Path(env["GPU_LEASE_DIR"]) / "lease.log").exists()
+    pooled = subprocess.run([str(LEASE), "--vendor", "none", "status"], env=env, capture_output=True, text=True, timeout=30)
+    assert pooled.returncode == 0 and "vendor=none" in pooled.stdout
     bare = subprocess.run([str(LEASE), "-n", "1", "job"], env=env, capture_output=True, text=True, timeout=30)
     assert bare.returncode == 2 and "no command" in bare.stderr
 
