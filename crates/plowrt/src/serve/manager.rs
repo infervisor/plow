@@ -221,7 +221,18 @@ impl BlobPlan {
         // made `serve` reject every placed blob before the engine ever saw it.
         let mut blob = DevBlob::parse_l2(&raw, true)?;
         // Plan the bound the engine will load at (`GpuEngine::load` narrows the same way).
-        let narrowed = match crate::config::RuntimeConfig::get().live_ctx_for(dir) {
+        let config = crate::config::RuntimeConfig::get();
+        let live_ctx = match (config.live_ctx_for(dir), device_vmm) {
+            (Some(want), Some((granularity, _))) => Some(crate::exec::ctx_bound::vmm_live_bound(
+                &blob,
+                crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?.as_ref(),
+                want,
+                granularity,
+                u64::from(config.vmm_block_mib()) << 20,
+            )),
+            (want, _) => want,
+        };
+        let narrowed = match live_ctx {
             Some(want) if crate::exec::ctx_bound::declared_ctx(&blob).is_some_and(|c| want < c) => {
                 crate::exec::ctx_bound::narrow(&mut blob, want)?;
                 true

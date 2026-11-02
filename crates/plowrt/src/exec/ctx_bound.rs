@@ -372,6 +372,57 @@ pub fn rescale(
     Ok(want)
 }
 
+/// The bound live KV can map for a requested `want`: rounded up so each full cache keeps the
+/// mapping mode it has at the packet's ceiling — a head window of whole VMM blocks, else one
+/// slot's span of whole granules (`LiveKvLayout::slot_granular_full`). Any other bound loads a
+/// geometry neither path maps. `want` unchanged without live-KV metadata.
+pub fn vmm_live_bound(
+    blob: &DevBlob,
+    manifest: Option<&plow_asset::live_kv::Manifest>,
+    want: u32,
+    granularity: u64,
+    block_hint: u64,
+) -> u32 {
+    manifest
+        .and_then(|m| crate::memory::vmm::LiveKvLayout::from_manifest(blob, m).ok())
+        .map_or(want, |l| {
+            let g = l.geometry;
+            aligned_bound(
+                want,
+                g.max_ctx,
+                g.kvh_full,
+                g.row_bytes(),
+                granularity,
+                block_hint,
+            )
+        })
+}
+
+fn aligned_bound(
+    want: u32,
+    ceiling: u32,
+    kv_heads: u32,
+    row_bytes: u64,
+    granularity: u64,
+    block_hint: u64,
+) -> u32 {
+    if granularity == 0 || row_bytes == 0 || kv_heads == 0 {
+        return want;
+    }
+    let block = block_hint.max(granularity);
+    let head_span = u64::from(ceiling) * row_bytes;
+    let (row_unit, quantum) = if head_span >= block && head_span % block == 0 {
+        (row_bytes, block)
+    } else {
+        (row_bytes * u64::from(kv_heads), granularity)
+    };
+    let (mut a, mut b) = (quantum, row_unit);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    u32::try_from(u64::from(want).next_multiple_of(quantum / a)).unwrap_or(want)
+}
+
 /// Re-declare `blob` at the live bound `want` (narrowing), returning the bound in force.
 pub fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
     let ceiling = declared_ctx(blob).ok_or_else(|| {
@@ -870,6 +921,20 @@ mod tests {
         m.caches[1].window = 4096;
         let e = widen(&mut b, 16384, Some(&m)).unwrap_err().to_string();
         assert!(e.contains("ring-unsafe"), "{e}");
+    }
+
+    #[test]
+    fn live_bound_keeps_the_vmm_mapping_mode() {
+        const G: u64 = 2 << 20;
+        // Small heads (8 x 256 B rows, ceiling 2048): slot-granular, a slot's cache is whole
+        // granules from 1024 rows; 768 maps nothing.
+        assert_eq!(aligned_bound(768, 2048, 8, 256, G, G), 1024);
+        assert_eq!(aligned_bound(1024, 2048, 8, 256, G, G), 1024);
+        assert_eq!(aligned_bound(1025, 2048, 8, 256, G, G), 2048);
+        // Block-mapped heads (512 B rows, ceiling 131072): head windows of whole blocks.
+        assert_eq!(aligned_bound(6000, 131_072, 8, 512, G, G), 8192);
+        assert_eq!(aligned_bound(6000, 131_072, 8, 512, G, 8 << 20), 16_384);
+        assert_eq!(aligned_bound(768, 2048, 8, 256, 0, G), 768);
     }
 
     #[test]
