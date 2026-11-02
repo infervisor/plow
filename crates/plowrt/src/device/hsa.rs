@@ -1054,6 +1054,10 @@ pub struct HsaBackend {
     /// copies name it.
     cpu_agent: HsaAgent,
     vram_pool: HsaMemoryPool,
+    /// Cross-rank TP buffers: the agent's fine-grained VRAM pool where it has one (CDNA), the
+    /// coarse pool otherwise (gfx12 exposes only coarse VRAM; its PCIe peer system-scope
+    /// atomics were measured correct on it).
+    peer_pool: HsaMemoryPool,
     fine_pool: HsaMemoryPool,
     kernarg_pool: HsaMemoryPool,
     queue: *mut HsaQueue,
@@ -1359,6 +1363,8 @@ impl HsaBackend {
             host_agent,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED,
         )?;
+        let peer_pool = Self::find_pool(&drv, agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED)
+            .unwrap_or(vram_pool);
         // Find kernarg pool on the host agent.
         let kernarg_pool = Self::find_pool(
             &drv,
@@ -1499,6 +1505,7 @@ impl HsaBackend {
             agents,
             cpu_agent: host_agent,
             vram_pool,
+            peer_pool,
             fine_pool,
             kernarg_pool,
             queue,
@@ -2232,14 +2239,12 @@ impl PeerMemory for HsaBackend {
             })?);
         }
 
-        // COARSE-grained VRAM, exactly as an ordinary weight/activation
-        // allocation: fine-grained would put the partials on the slow
-        // host-coherent path, and the whole point is that a peer store runs at
-        // the ~58 GB/s XGMI wire rate.
+        // `peer_pool`: the fine-grained VRAM every CDNA TP run has used (system-scope
+        // atomics on coarse memory carry no coherence guarantee there).
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_pool_allocate)(
-                self.vram_pool,
+                self.peer_pool,
                 bytes as usize,
                 0,
                 &mut ptr,

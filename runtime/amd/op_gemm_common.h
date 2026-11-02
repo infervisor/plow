@@ -3586,6 +3586,9 @@ __device__ __forceinline__ void gemv_rows_mfma(bf16* __restrict__ C_, const bf16
 #ifndef GV_MFMA4
 #define GV_MFMA4 0
 #endif
+#if GV_MFMA4 && PLOW_GFX12
+#error "GV_MFMA4 uses the 4x4 MFMA and ROW_BCAST DPP; gfx12 has neither"
+#endif
 /* Zero leaves the MFMA probe unrestricted. */
 #ifndef GV_MFMA4_MAXK
 #define GV_MFMA4_MAXK 0

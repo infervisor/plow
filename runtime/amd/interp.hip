@@ -7122,7 +7122,8 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
      * leaving it unconditional put one extra instruction into every object, including gfx950's,
      * and cost the byte-identity that makes "this change did not touch CDNA4" checkable rather
      * than merely asserted. */
-#if PLOW_GATE_HIER || PLOW_GATE_HIER_CEIL || defined(PLOW_L2_PLACE_DISPATCH)
+#if (PLOW_GATE_HIER || PLOW_GATE_HIER_CEIL || defined(PLOW_L2_PLACE_DISPATCH)) && !PLOW_GFX12
+    /* gfx12 has one L2 domain; its hwreg 20 is not XCC_ID. */
     const unsigned plow_xcd =
         __builtin_amdgcn_s_getreg((20 /*HW_REG_XCC_ID*/) | (0 << 6) | ((32 - 1) << 11)) & 0xf;
 #else

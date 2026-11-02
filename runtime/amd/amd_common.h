@@ -416,7 +416,12 @@ __device__ __forceinline__ void cp_async4(const PLOW_GLOB bf16* src, bf16* dst_w
 #define CP_ASYNC4_BF16 (PLOW_WAVE * 2)
 
 __device__ __forceinline__ void cp_async_wait(void) {
+#if PLOW_GFX12
+    /* The gfx12 copies are VGPR-staged: drain the LDS writes too before the caller's barrier. */
+    asm volatile(PLOW_ASM_WAIT_VM(0) "\n\ts_wait_dscnt 0" ::: "memory");
+#else
     asm volatile(PLOW_ASM_WAIT_VM(0) ::: "memory");
+#endif
 }
 
 /* ---------------------------------------------------------------------------
