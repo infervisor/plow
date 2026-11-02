@@ -4187,16 +4187,17 @@ impl GpuEngine {
             .map(|t| (t.bytes / 4) as usize)
             .unwrap_or(0);
         if let Some(requested) = config.live_ctx_for(assets_dir) {
-            let want =
-                crate::memory::vmm::VmmOps::granularity(be.as_ref()).map_or(requested, |gran| {
-                    crate::exec::ctx_bound::vmm_live_bound(
-                        &blob,
-                        live_kv_manifest.as_ref(),
-                        requested,
-                        gran,
-                        u64::from(config.vmm_block_mib()) << 20,
-                    )
-                });
+            let vmm_kv = config.nv_vmm_live() || config.nv_vmm_prefix() != Some(false);
+            let gran = crate::memory::vmm::VmmOps::granularity(be.as_ref());
+            let want = gran.ok().filter(|_| vmm_kv).map_or(requested, |gran| {
+                crate::exec::ctx_bound::vmm_live_bound(
+                    &blob,
+                    live_kv_manifest.as_ref(),
+                    requested,
+                    gran,
+                    u64::from(config.vmm_block_mib()) << 20,
+                )
+            });
             if want != requested {
                 tracing::info!(
                     requested,

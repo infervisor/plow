@@ -372,10 +372,12 @@ pub fn rescale(
     Ok(want)
 }
 
-/// The bound live KV can map for a requested `want`: rounded up so each full cache keeps the
-/// mapping mode it has at the packet's ceiling — a head window of whole VMM blocks, else one
-/// slot's span of whole granules (`LiveKvLayout::slot_granular_full`). Any other bound loads a
-/// geometry neither path maps. `want` unchanged without live-KV metadata.
+/// The narrowest bound at or above `want` that live KV maps the way it maps the packet's
+/// ceiling: head windows of whole VMM blocks (`VmmGeometry::block_bytes`), or for a cache too
+/// small for that, one slot's span of whole granules (`LiveKvLayout::slot_granular_full`). Any
+/// other bound loads a geometry neither path maps. The ceiling itself when nothing narrower
+/// maps, so a narrowing never turns into a widening; `want` unchanged when it is not a
+/// narrowing or the packet carries no live-KV metadata.
 pub fn vmm_live_bound(
     blob: &DevBlob,
     manifest: Option<&plow_asset::live_kv::Manifest>,
@@ -386,41 +388,43 @@ pub fn vmm_live_bound(
     manifest
         .and_then(|m| crate::memory::vmm::LiveKvLayout::from_manifest(blob, m).ok())
         .map_or(want, |l| {
-            let g = l.geometry;
-            aligned_bound(
-                want,
-                g.max_ctx,
-                g.kvh_full,
-                g.row_bytes(),
-                granularity,
-                block_hint,
-            )
+            mappable_bound(&l.geometry, want, granularity, block_hint)
         })
 }
 
-fn aligned_bound(
+fn mappable_bound(
+    ceiling: &crate::memory::vmm::VmmGeometry,
     want: u32,
-    ceiling: u32,
-    kv_heads: u32,
-    row_bytes: u64,
     granularity: u64,
     block_hint: u64,
 ) -> u32 {
-    if granularity == 0 || row_bytes == 0 || kv_heads == 0 {
+    let slot_row = ceiling.row_bytes() * u64::from(ceiling.kvh_full);
+    if want >= ceiling.max_ctx || granularity == 0 || slot_row == 0 {
         return want;
     }
-    let block = block_hint.max(granularity);
-    let head_span = u64::from(ceiling) * row_bytes;
-    let (row_unit, quantum) = if head_span >= block && head_span % block == 0 {
-        (row_bytes, block)
-    } else {
-        (row_bytes * u64::from(kv_heads), granularity)
+    let at = |ctx: u32| {
+        let mut g = ceiling.clone();
+        g.max_ctx = ctx;
+        g
     };
-    let (mut a, mut b) = (quantum, row_unit);
+    let blocks = |ctx: u32| at(ctx).block_bytes(granularity, block_hint).is_ok();
+    let block_mapped = blocks(ceiling.max_ctx);
+    let maps =
+        |ctx: u32| blocks(ctx) || (!block_mapped && (u64::from(ctx) * slot_row) % granularity == 0);
+    let (mut a, mut b) = (granularity, slot_row);
     while b != 0 {
         (a, b) = (b, a % b);
     }
-    u32::try_from(u64::from(want).next_multiple_of(quantum / a)).unwrap_or(want)
+    // Both paths need a slot's span in whole granules, so only multiples of `step` can map.
+    let step = u32::try_from(granularity / a).unwrap_or(u32::MAX).max(1);
+    let mut ctx = want.div_ceil(step).saturating_mul(step);
+    while ctx < ceiling.max_ctx {
+        if maps(ctx) {
+            return ctx;
+        }
+        ctx = ctx.saturating_add(step);
+    }
+    ceiling.max_ctx
 }
 
 /// Re-declare `blob` at the live bound `want` (narrowing), returning the bound in force.
@@ -926,15 +930,39 @@ mod tests {
     #[test]
     fn live_bound_keeps_the_vmm_mapping_mode() {
         const G: u64 = 2 << 20;
-        // Small heads (8 x 256 B rows, ceiling 2048): slot-granular, a slot's cache is whole
-        // granules from 1024 rows; 768 maps nothing.
-        assert_eq!(aligned_bound(768, 2048, 8, 256, G, G), 1024);
-        assert_eq!(aligned_bound(1024, 2048, 8, 256, G, G), 1024);
-        assert_eq!(aligned_bound(1025, 2048, 8, 256, G, G), 2048);
-        // Block-mapped heads (512 B rows, ceiling 131072): head windows of whole blocks.
-        assert_eq!(aligned_bound(6000, 131_072, 8, 512, G, G), 8192);
-        assert_eq!(aligned_bound(6000, 131_072, 8, 512, G, 8 << 20), 16_384);
-        assert_eq!(aligned_bound(768, 2048, 8, 256, 0, G), 768);
+        let geom = |kvh: u32, hd: u32, ctx: u32| crate::memory::vmm::VmmGeometry {
+            full_layers: vec![0],
+            kvh_full: kvh,
+            hd_full: hd,
+            slide_layers: Vec::new(),
+            kvh_slide: 0,
+            hd_slide: 0,
+            window: 0,
+            elem: 2,
+            elem_slide: 2,
+            max_ctx: ctx,
+            batch: 128,
+        };
+        // Small heads (8 x 256 B rows, ceiling 2048): slot-granular; a slot's cache is whole
+        // granules from 1024 rows, so 768 maps nothing below it.
+        let asr = geom(8, 128, 2048);
+        assert_eq!(mappable_bound(&asr, 768, G, G), 1024);
+        assert_eq!(mappable_bound(&asr, 1024, G, G), 1024);
+        assert_eq!(mappable_bound(&asr, 1025, G, G), 2048);
+        assert_eq!(mappable_bound(&asr, 768, 0, G), 768);
+        assert_eq!(mappable_bound(&asr, 4096, G, G), 4096);
+        // Block-mapped heads (8 x 512 B rows, ceiling 131072) stay block-mapped: 6144 would only
+        // map slot-granular. An 8 MiB hint clamps to the 4 MiB window at 8192.
+        let llm = geom(8, 256, 131_072);
+        assert_eq!(mappable_bound(&llm, 6000, G, G), 8192);
+        assert_eq!(mappable_bound(&llm, 6000, G, 8 << 20), 8192);
+        // A non-pow2 hint clamps to the granule where the window is one granule.
+        assert_eq!(
+            mappable_bound(&geom(1, 128, 24_576), 8192, G, 3 << 20),
+            8192
+        );
+        // Nothing narrower maps: serve the ceiling, never widen.
+        assert_eq!(mappable_bound(&geom(1, 128, 1024), 768, G, G), 1024);
     }
 
     #[test]
