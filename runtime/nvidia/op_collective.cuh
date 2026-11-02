@@ -53,6 +53,148 @@ __device__ __forceinline__ void xr_st(__nv_bfloat16* p, float f) {
     asm volatile("st.relaxed.sys.global.u16 [%0], %1;" :: "l"(p), "h"(v) : "memory");
 }
 
+struct alignas(16) XrVec {
+    __nv_bfloat16 v[8];
+};
+
+__device__ __forceinline__ uint4 xr_ld8(const __nv_bfloat16* p) {
+    uint4 v;
+    asm volatile("ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ float xr_vec_at(const uint4& v, unsigned k) {
+    const uint32_t w = k < 2 ? v.x : k < 4 ? v.y : k < 6 ? v.z : v.w;
+    return __bfloat162float(__ushort_as_bfloat16((unsigned short)(w >> ((k & 1u) * 16u))));
+}
+
+__device__ __forceinline__ void xr_st8(__nv_bfloat16* p, const XrVec& v) {
+    const uint4 u = *(const uint4*)&v;
+    asm volatile("st.relaxed.sys.global.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :: "l"(p), "r"(u.x), "r"(u.y), "r"(u.z), "r"(u.w) : "memory");
+}
+
+__device__ __forceinline__ XrVec xr_local_ld8(const __nv_bfloat16* p) {
+    XrVec v;
+    if (((uintptr_t)p & 15u) == 0)
+        *(uint4*)&v = *(const uint4*)p;
+    else {
+#pragma unroll
+        for (unsigned k = 0; k < 8; k++) v.v[k] = p[k];
+    }
+    return v;
+}
+
+__device__ __forceinline__ void xr_local_st8(__nv_bfloat16* p, const XrVec& v) {
+    if (((uintptr_t)p & 15u) == 0)
+        *(uint4*)p = *(const uint4*)&v;
+    else {
+#pragma unroll
+        for (unsigned k = 0; k < 8; k++) p[k] = v.v[k];
+    }
+}
+
+__device__ __forceinline__ uint32_t xr_vec_begin(uint32_t slot, uint32_t lo, uint32_t hi) {
+    const uint32_t head = (0u - (slot / 2u + lo)) & 7u;
+    return lo + (head < hi - lo ? head : hi - lo);
+}
+
+template <bool PeerOut>
+__device__ __forceinline__ void xr_reduce_range(const PlowProgram& prog, uint32_t slot,
+                                                uint32_t lo, uint32_t hi, __nv_bfloat16* out,
+                                                unsigned tid, unsigned stride) {
+    const uint32_t begin = xr_vec_begin(slot, lo, hi);
+    const uint32_t count = (hi - begin) / 8u, end = begin + count * 8u;
+    for (uint32_t t = tid; t < begin - lo + hi - end; t += stride) {
+        const uint32_t e = t < begin - lo ? lo + t : end + t - (begin - lo);
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < prog.n_gpu; r++)
+            acc += xr_ld((const __nv_bfloat16*)((const char*)prog.peer_scratch[r] + slot) + e);
+        if constexpr (PeerOut) xr_st(out + e, acc);
+        else out[e] = __float2bfloat16_rn(acc);
+    }
+    for (uint32_t q = tid; q < count; q += 2u * stride) {
+        float acc[2][8] = {};
+        for (uint32_t r = 0; r < prog.n_gpu; r += 2u) {
+            uint4 v[2][2];
+            /* Issue independent peer loads before consuming either rank or vector. */
+#pragma unroll
+            for (unsigned rr = 0; rr < 2; rr++) {
+                if (r + rr < prog.n_gpu) {
+                    const __nv_bfloat16* src =
+                        (const __nv_bfloat16*)((const char*)prog.peer_scratch[r + rr] + slot);
+#pragma unroll
+                    for (unsigned j = 0; j < 2; j++)
+                        if (q + j * stride < count)
+                            v[rr][j] = xr_ld8(src + begin + (q + j * stride) * 8u);
+                }
+            }
+#pragma unroll
+            for (unsigned rr = 0; rr < 2; rr++)
+                if (r + rr < prog.n_gpu) {
+#pragma unroll
+                    for (unsigned j = 0; j < 2; j++)
+                        if (q + j * stride < count) {
+#pragma unroll
+                            for (unsigned k = 0; k < 8; k++)
+                                acc[j][k] += xr_vec_at(v[rr][j], k);
+                        }
+                }
+        }
+#pragma unroll
+        for (unsigned j = 0; j < 2; j++)
+            if (q + j * stride < count) {
+                XrVec v;
+#pragma unroll
+                for (unsigned k = 0; k < 8; k++) v.v[k] = __float2bfloat16_rn(acc[j][k]);
+                __nv_bfloat16* dst = out + begin + (q + j * stride) * 8u;
+                if constexpr (PeerOut) xr_st8(dst, v);
+                else xr_local_st8(dst, v);
+            }
+    }
+}
+
+__device__ __forceinline__ void xr_gather_range(const __nv_bfloat16* src, uint32_t slot,
+                                                uint32_t lo, uint32_t hi, __nv_bfloat16* out,
+                                                const __nv_bfloat16* resid, __nv_bfloat16* out2,
+                                                unsigned tid, unsigned stride) {
+    const uint32_t begin = xr_vec_begin(slot, lo, hi);
+    const uint32_t count = (hi - begin) / 8u, end = begin + count * 8u;
+    for (uint32_t t = tid; t < begin - lo + hi - end; t += stride) {
+        const uint32_t e = t < begin - lo ? lo + t : end + t - (begin - lo);
+        const float v = xr_ld(src + e);
+        if (out2)
+            out2[e] = __float2bfloat16_rn((resid ? __bfloat162float(resid[e]) : 0.0f) + v);
+        else
+            out[e] = __float2bfloat16_rn(v);
+    }
+    for (uint32_t q = tid; q < count; q += 2u * stride) {
+        uint4 v[2];
+#pragma unroll
+        for (unsigned j = 0; j < 2; j++)
+            if (q + j * stride < count)
+                v[j] = xr_ld8(src + begin + (q + j * stride) * 8u);
+#pragma unroll
+        for (unsigned j = 0; j < 2; j++)
+            if (q + j * stride < count) {
+                const uint32_t e = begin + (q + j * stride) * 8u;
+                XrVec value;
+                *(uint4*)&value = v[j];
+                if (out2) {
+                    const XrVec res = resid ? xr_local_ld8(resid + e) : XrVec{};
+#pragma unroll
+                    for (unsigned k = 0; k < 8; k++)
+                        value.v[k] = __float2bfloat16_rn(__bfloat162float(res.v[k]) +
+                                                        xr_vec_at(v[j], k));
+                    xr_local_st8(out2 + e, value);
+                } else {
+                    xr_local_st8(out + e, value);
+                }
+            }
+    }
+}
+
 __device__ __forceinline__ uint32_t* xr_line(const PlowProgram& prog, uint32_t r, size_t xoff,
                                              uint32_t id) {
     return PLOW_CTR((uint32_t*)((char*)prog.peer_scratch[r] + xoff), id);
@@ -106,12 +248,8 @@ __device__ __forceinline__ void d_xreduce_nv(const PlowProgram& prog, const Plow
     __syncthreads();
     if (bailed) return;
     __nv_bfloat16* out = (__nv_bfloat16*)T[in->t[0]];
-    for (uint32_t e = slice * blockDim.x + threadIdx.x; e < n; e += nblk * blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t r = 0; r < nr; r++)
-            acc += xr_ld((const __nv_bfloat16*)((const char*)prog.peer_scratch[r] + slot) + e);
-        out[e] = __float2bfloat16_rn(acc);
-    }
+    xr_reduce_range<false>(prog, slot, 0, n, out, slice * blockDim.x + threadIdx.x,
+                           nblk * blockDim.x);
 }
 
 /* XREDUCE2 (two-shot): t0=out t1=resid t2=out2 i0=n i1=n_gpu i2=slot_bytes i3=gate_rs
@@ -137,12 +275,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_nv(const PlowProgram& prog,
     const uint32_t lo = (uint32_t)(((uint64_t)n * prog.rank) / nr);
     const uint32_t hi = (uint32_t)(((uint64_t)n * (prog.rank + 1)) / nr);
     __nv_bfloat16* mine = (__nv_bfloat16*)((char*)prog.peer_scratch[prog.rank] + slot);
-    for (uint32_t e = lo + tid; e < hi; e += stride) {
-        float acc = 0.0f;
-        for (uint32_t r = 0; r < nr; r++)
-            acc += xr_ld((const __nv_bfloat16*)((const char*)prog.peer_scratch[r] + slot) + e);
-        xr_st(mine + e, acc);
-    }
+    xr_reduce_range<true>(prog, slot, lo, hi, mine, tid, stride);
     /* Second rendezvous: the reduced slice is written by ALL blocks of this rank. Each block
      * releases its own stores into the device-local count; the block that completes it
      * acquires them all and announces the rank. */
@@ -168,12 +301,6 @@ __device__ __forceinline__ void d_xreduce_twoshot_nv(const PlowProgram& prog,
         const uint32_t shi = (uint32_t)(((uint64_t)n * (s + 1)) / nr);
         const __nv_bfloat16* src =
             (const __nv_bfloat16*)((const char*)prog.peer_scratch[s] + slot);
-        for (uint32_t e = slo + tid; e < shi; e += stride) {
-            const float v = xr_ld(src + e);
-            if (out2)
-                out2[e] = __float2bfloat16_rn((resid ? __bfloat162float(resid[e]) : 0.0f) + v);
-            else
-                out[e] = __float2bfloat16_rn(v);
-        }
+        xr_gather_range(src, slot, slo, shi, out, resid, out2, tid, stride);
     }
 }
