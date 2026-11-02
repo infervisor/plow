@@ -1741,9 +1741,9 @@ pub(super) fn run(
     verify: Option<&VerifyHook>,
 ) {
     refuse_unimplemented_target(arch, gpu);
-    assert_eq!(
-        arch, "sm_90a",
-        "qwen3_5 native CUDA path currently requires sm_90a"
+    assert!(
+        matches!(arch, "sm_90a" | "sm_120a"),
+        "qwen3_5 native CUDA path requires sm_90a or sm_120a (a GDN prefill object), got {arch}"
     );
     assert_eq!(tp, 1, "qwen3_5 tensor parallelism is not implemented");
     let fp8 = emit_config::active().fp8;

@@ -551,7 +551,7 @@ mod tests {
     /// initial state after the launch) under `GDN_AOT_DIR` for a byte comparison against another
     /// route, and prints the mean launch time over 20 back-to-back launches.
     #[test]
-    #[ignore = "requires a leased SM90 GPU; GDN_AOT_DIR=<dir holding plow_gdn_prefill.aot>"]
+    #[ignore = "requires a leased GPU; GDN_AOT_DIR=<dir holding plow_gdn_prefill.aot (sm_90) or gdn_prefill_sm120.cubin>"]
     fn layer_dump() -> Result<()> {
         let dir = std::path::PathBuf::from(std::env::var("GDN_AOT_DIR").expect("GDN_AOT_DIR"));
         let be = Arc::new(CudaBackend::new(0)?);
