@@ -21,6 +21,33 @@ fn wide_live_kv_uses_reserved_ring_windows_without_changing_b32() {
 }
 
 #[test]
+fn prefix_store_rings_follow_the_capacity_rule_from_the_prefix_geometry() {
+    // A prefix packet without a LIVE manifest: the rule reads the prefix layout's geometry, so a
+    // B128 packet commits rings per admitted slot and its idle slots stay free for the store.
+    let geo = crate::memory::vmm::VmmGeometry {
+        full_layers: vec![5],
+        kvh_full: 1,
+        hd_full: 512,
+        slide_layers: vec![0, 1, 2, 3, 4],
+        kvh_slide: 8,
+        hd_slide: 256,
+        window: 1024,
+        elem: 1,
+        elem_slide: 1,
+        max_ctx: 16_384,
+        batch: 128,
+    };
+    let (ctx, batch) = ring_geometry(None, Some(&geo));
+    assert_eq!((ctx, batch), (Some(16_384), Some(128)));
+    assert!(live_rings_for_capacity(None, true, ctx, batch));
+    assert!(!live_rings_for_capacity(Some(false), true, ctx, batch));
+    let b32 = crate::memory::vmm::VmmGeometry { batch: 32, ..geo };
+    let (ctx, batch) = ring_geometry(None, Some(&b32));
+    assert!(!live_rings_for_capacity(None, true, ctx, batch));
+    assert_eq!(ring_geometry(None, None), (None, None));
+}
+
+#[test]
 fn explicit_flat_rings_override_capacity_defaults() {
     for (ctx, batch) in [(8192, 64), (131_072, 16), (131_072, 64)] {
         assert!(live_rings_for_capacity(None, true, Some(ctx), Some(batch)));
