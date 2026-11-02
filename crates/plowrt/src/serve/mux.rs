@@ -1465,6 +1465,9 @@ fn spawn_scoped(
                     kv_budget = e.kv_admission_budget().or(kv_budget);
                     e.kv_pressure_events()
                 });
+                if let Some(budget) = kv_budget {
+                    metrics.kv_share.lock().reserved = reserved_kv_bytes(budget, &slots);
+                }
                 let seen = (
                     metrics.kv_budget_denials.load(Ordering::Relaxed),
                     pressure.unwrap_or(0),
@@ -2886,6 +2889,15 @@ fn admit_session(
     {
         return Some((job, arrived));
     }
+    // Held through the seat: the manager reads `reserved` and installs a co-tenant cap between
+    // admissions, never inside one.
+    let mut share = metrics.kv_share.lock();
+    let kv_budget = kv_budget.map(|mut b| {
+        if let Some(cap) = share.cap {
+            b.budget_bytes = b.budget_bytes.min(cap);
+        }
+        b
+    });
     let seated = loop {
         let committed = slots
             .iter()
@@ -2909,8 +2921,15 @@ fn admit_session(
         }
     };
     let idx = match seated {
-        Ok(idx) => idx,
+        Ok(idx) => {
+            if let Some(budget) = kv_budget {
+                share.reserved = reserved_kv_bytes(budget, slots) + budget.bytes_for_rows(want);
+            }
+            drop(share);
+            idx
+        }
         Err(denied) => {
+            drop(share);
             // Retryable: stays queued, says nothing, costs no slot. This is the whole
             // backpressure mechanism.
             if denied.is_retryable() {
@@ -6101,6 +6120,20 @@ fn pf_launch_rows(request: usize, top: usize) -> (usize, usize) {
 }
 
 /// Share of the KV-capacity budget the live sequences reserve (0 without a budget).
+/// KV bytes the seated sequences reserve, each charged as admission charges it.
+fn reserved_kv_bytes(budget: crate::sched::admission::KvBudget, slots: &[Option<Slot>]) -> u64 {
+    slots
+        .iter()
+        .flatten()
+        .map(|s| {
+            budget.bytes_for_rows(
+                reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
+                    * (1 + s.cfg.is_some() as u64),
+            )
+        })
+        .sum()
+}
+
 fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option<Slot>]) -> f64 {
     kv_budget.filter(|b| b.max_rows() > 0).map_or(0.0, |b| {
         let rows: u64 = slots
