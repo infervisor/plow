@@ -13901,8 +13901,7 @@ impl GpuEngine {
                     .iter()
                     .any(Option::is_some)
                 && self.attention_requests.iter().any(|r| r[1] >= min_rows);
-            let windowed = self.pf_seg_window.is_some();
-            self.lib_attention_routed = self.begin_lib_attention(bi, tc, windowed)?;
+            self.lib_attention_routed = self.begin_lib_attention(bi, tc, true)?;
             let lib_routed = self.lib_attention_routed;
             let routed = gemm_routed || lib_routed;
             // One table upload per launch serves every routed segment; `false` = shapes the
@@ -15415,21 +15414,24 @@ impl GpuEngine {
             .module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
     }
 
-    /// Reset the PLOW_NV_TRACE packet counter so [`Self::trace_summary`]
-    /// reports only launches after this call (drop prefill/warmup). No-op on
-    /// a normal cubin.
     /// Plans this launch's library attention; `false` = the segments run their native role.
-    /// `windowed` (a pf_seg_window body) keeps the native role. A program the packet pins unsplit
-    /// never falls back: native and library arithmetic differ, so a row's bits would depend on
-    /// the launch.
-    fn begin_lib_attention(&mut self, bi: usize, tc: usize, windowed: bool) -> Result<bool> {
+    /// `native_when_windowed`: a pf_seg_window body keeps the native role on this path. A program
+    /// the packet pins unsplit never falls back (it is refused instead): native and library
+    /// arithmetic differ, so a row's bits would depend on the launch.
+    fn begin_lib_attention(
+        &mut self,
+        bi: usize,
+        tc: usize,
+        native_when_windowed: bool,
+    ) -> Result<bool> {
         let sites = &self.prefill[bi].lib_attention_segments;
         if !sites.iter().any(Option::is_some) {
             return Ok(false);
         }
         let pinned = sites.iter().flatten().any(|site| site.unsplit);
+        let windowed = self.pf_seg_window.is_some();
         let routed = match self.lib_attention.as_mut() {
-            Some(lib) if !windowed => {
+            Some(lib) if !(windowed && native_when_windowed) => {
                 lib.begin_launch(&self.attention_requests, tc as u32, &self.stream)?
             }
             _ => false,
@@ -15443,6 +15445,9 @@ impl GpuEngine {
         Ok(routed)
     }
 
+    /// Reset the PLOW_NV_TRACE packet counter so [`Self::trace_summary`]
+    /// reports only launches after this call (drop prefill/warmup). No-op on
+    /// a normal cubin.
     pub fn trace_reset(&self) -> Result<()> {
         for m in self.decode_trace_modules() {
             self.be.module_global_zero(m, "g_tr_n", 4)?;
