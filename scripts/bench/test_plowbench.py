@@ -69,6 +69,57 @@ class ResultTests(unittest.TestCase):
                 self.assertEqual(check.returncode, rc, check.stderr)
 
 
+class ObjectTests(unittest.TestCase):
+    native = ("interp_decode.elf", "interp_prefill.elf", "interp_flash.elf")
+
+    def check_objects(self, objects, arch, assets):
+        return subprocess.run([
+            "bash", "-c", 'source "$1"; pb_check_objects "$2" "$3" "$4"',
+            "test", str(HELPERS), str(objects), arch, str(assets),
+        ], capture_output=True, text=True)
+
+    def test_native_architectures_require_their_interpreters_not_cdna_vendor_kernels(self):
+        for arch in ("gfx950", "gfx1201"):
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in self.native:
+                    (root / name).touch()
+                self.assertEqual(self.check_objects(root, arch, root).returncode, 0)
+                for name in self.native:
+                    (root / name).unlink()
+                    result = self.check_objects(root, arch, root)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(name, result.stdout)
+                    (root / name).touch()
+
+    def test_gfx942_still_requires_pinned_vendor_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in self.native:
+                (root / name).touch()
+            result = self.check_objects(root, "gfx942", root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("pinned vendor kernel", result.stdout)
+
+    def test_gfx950_mixed_precision_still_requires_specialized_interpreters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in self.native:
+                (root / name).touch()
+            (root / "build.json").write_text(json.dumps({
+                "features": {k: True for k in ("fp8_kv", "a4w4", "mla", "moe")},
+            }))
+            result = self.check_objects(root, "gfx950", root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("mixed FP8-KV/MXFP4", result.stdout)
+            for name in ("interp_decode_fp8kv.elf", "interp_decode_fp8kv_gq.elf",
+                         "interp_flash_fp8kv.elf", "interp_flash_fp8kv_gq.elf",
+                         "interp_prefill_fp8kv_mla_moe_a4w4_full.elf",
+                         "interp_prefill_fp8kv_mla_moe_a4w4_full_gq.elf"):
+                (root / name).touch()
+            self.assertEqual(self.check_objects(root, "gfx950", root).returncode, 0)
+
+
 class BenchClientTests(unittest.TestCase):
     def test_console_script_and_python_launcher(self):
         for name, prefix in (("vllm", ["bench", "serve"]),
