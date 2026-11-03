@@ -2497,10 +2497,11 @@ pub enum DevOp {
     /// value other than `u32::MAX` replaces the draw (teacher forcing). The class sets its bitmap
     /// bit, lands in `out[r*i2 + i3]`, and `eidx[r] = class + j0` (an embedding row). `ctl[r][0]
     /// == 0` skips the row.
+    /// HF `min_new_tokens`: while `ctl[r][1] < i6` the last class (the stop) is `-inf` first.
     /// `t0=out(u32) t1=logits(f32[rows][i7 or vocab]) t2=params(f32[rows][4]: T, top_p, penalty, -)
     /// t3=ctl(u32[rows][2]: top_k, step) t4=seed(u64[rows]) t5=bitmap(u32[rows][i5])?
     /// t6=force(u32, out's layout)? t7=eidx(u32[rows])?` · `i0=rows i1=vocab i2=out_stride
-    /// i3=out_col0 i4=coord i5=bitmap_words i7=logit_stride` · `j0=eidx_offset`.
+    /// i3=out_col0 i4=coord i5=bitmap_words i6=min_step i7=logit_stride` · `j0=eidx_offset`.
     SampleSmallF32 = 221,
     /// FP32 stream tail: the last `L` rows a streaming stage carries between chunks, per slot.
     /// Gather (mode 0) builds `z(f32[B][L+N][Cz])`: rows `[0, L)` hold `state[slot[b]]` in

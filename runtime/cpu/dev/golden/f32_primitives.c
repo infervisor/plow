@@ -663,6 +663,7 @@ G_K(g_sample_small_f32) {
         const uint32_t* bm = bitmap ? bitmap + (size_t)r * words : NULL;
         float L[4096], sv[64];
         uint32_t sel[64];
+        const uint32_t masked = ctl[2u * r + 1u] < in->i[6] ? vocab - 1u : vocab;
         for (uint32_t i = 0; i < vocab; i++) {
             float v = logits[(size_t)r * ls + i];
             if (guide) {
@@ -670,6 +671,7 @@ G_K(g_sample_small_f32) {
                 const volatile float d = v - u, m = p[3] * d;
                 v = u + m;
             }
+            if (i == masked) v = -INFINITY;
             if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? v / p[2] : v * p[2];
             L[i] = p[0] > 0.f ? v / p[0] : v;
         }

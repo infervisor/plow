@@ -53,6 +53,9 @@ pub struct SpeechProfile {
     pub text_encoder: Option<&'static str>,
     /// Voice cloning through the reference encoder packet.
     pub clone: Option<CloneLayout>,
+    /// Every row is a text token plus a codec frame (`plow_asset::dual_stream`, read from
+    /// [`DUAL_STREAM`] beside the checkpoint): its voices and languages replace the profile's.
+    pub dual_stream: bool,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -95,6 +98,7 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     clone: None,
     languages: &[],
     segment_frames: 0,
+    dual_stream: false,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -128,6 +132,7 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     clone: None,
     languages: &[],
     segment_frames: 0,
+    dual_stream: false,
 };
 
 /// fishaudio/s2-pro (fish-speech `inference.py`, no reference): system "convert the provided text
@@ -173,6 +178,7 @@ pub const FISH: SpeechProfile = SpeechProfile {
     }),
     languages: &[],
     segment_frames: 0,
+    dual_stream: false,
 };
 
 /// BreezeBlue/Breeze-TTS-2 (`breeze_infer/templates.py`): each text segment `<bos>[S0]text` (voice
@@ -214,6 +220,7 @@ pub const BREEZE: SpeechProfile = SpeechProfile {
     }),
     languages: &[],
     segment_frames: 0,
+    dual_stream: false,
 };
 
 /// maya-research/maya2-native (`maya3` prompt.py, engine.py): `<|lang:xx|>`, `{Name}: ` (the plain
@@ -278,7 +285,44 @@ pub const MAYA2: SpeechProfile = SpeechProfile {
         "en", "as", "bn", "gu", "hi", "kn", "ml", "mr", "or", "pa", "ta", "te",
     ],
     segment_frames: 250,
+    dual_stream: false,
 };
+
+/// Qwen/Qwen3-TTS-12Hz-*-CustomVoice (`qwen_tts` `generate`, `scripts/tts/qwen3_tts_prep.py`): a
+/// Qwen3 talker whose rows are text plus codec frames; cb0 class 2048 = codec EOS 2150 (the other
+/// control rows suppressed), at least 2 frames; a 5-layer code predictor samples codebooks 1..15.
+/// Talker and predictor: T 0.9, top-k 50, top-p 1; repetition penalty 1.05 on cb0.
+pub const QWEN3_TTS: SpeechProfile = SpeechProfile {
+    prompt_template: "{input}",
+    voice_token: "{voice}",
+    voices: &[],
+    prefix: &[],
+    suffix: &[],
+    stops: &[2048],
+    sample_rate: 24000,
+    frame_codes: 16,
+    codebook: 2048,
+    frame_samples: 1920,
+    audio_token_base: 0,
+    // As Breeze: ~2.8 frames per Mandarin character, ~0.8 per English one.
+    per_char_frames: 3.2,
+    max_new_tokens_cap: 1500,
+    temperature: 0.9,
+    top_p: 1.0,
+    repetition_penalty: 1.05,
+    top_k: 50,
+    depth: true,
+    depth_sampler: 1,
+    instructions: None,
+    text_encoder: None,
+    clone: None,
+    languages: &[],
+    segment_frames: 0,
+    dual_stream: true,
+};
+
+/// `dual_stream.json` beside a dual-stream checkpoint (`plow_asset::dual_stream::DualStream`).
+pub const DUAL_STREAM: &str = "dual_stream.json";
 
 /// `maya2_controller.json` beside a Maya 2 checkpoint (`scripts/tts/maya2_prep.py`): the cb0
 /// controller, guard constants and per-language frame / duration priors.
@@ -390,8 +434,9 @@ pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
         "fish" => Ok(&FISH),
         "breeze" => Ok(&BREEZE),
         "maya2" => Ok(&MAYA2),
+        "qwen3_tts" => Ok(&QWEN3_TTS),
         other => Err(format!(
-            "unknown tts profile {other:?} (known: veena, orpheus, fish, breeze, maya2)"
+            "unknown tts profile {other:?} (known: veena, orpheus, fish, breeze, maya2, qwen3_tts)"
         )),
     }
 }
@@ -440,6 +485,26 @@ pub fn speech_pipeline_section(
         serde_json::from_str::<serde_json::Value>(&text)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         pipe.strings.insert("maya2.controller".into(), text);
+    }
+    if p.dual_stream {
+        use plow_asset::dual_stream::{DualStream, KEY};
+        let path = dir.join(DUAL_STREAM);
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let d = DualStream::parse(&text)?;
+        if d.frame_codes as u64 != p.frame_codes {
+            return Err(format!("{}: frame_codes != the profile's", path.display()));
+        }
+        let voices: Vec<&str> = d.voices.keys().map(String::as_str).collect();
+        pipe.strings
+            .insert("prompt.voices".into(), voices.join("\n"));
+        let languages: Vec<&str> = std::iter::once("auto")
+            .chain(d.languages.keys().map(String::as_str))
+            .collect();
+        pipe.strings
+            .insert("prompt.languages".into(), languages.join(" "));
+        let json = serde_json::to_string(&d).map_err(|e| e.to_string())?;
+        pipe.strings.insert(KEY.into(), json);
     }
     if let Some(t) = p.text_encoder {
         pipe.strings.insert("text.encoder".into(), t.into());

@@ -658,7 +658,7 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
                                       const unsigned* __restrict__ force, unsigned* __restrict__ eidx,
                                       unsigned rows, unsigned vocab, unsigned out_stride, unsigned out_col0,
                                       unsigned coord, unsigned words, unsigned lstride, unsigned eoff,
-                                      unsigned slice, unsigned nblk, float* arena) {
+                                      unsigned min_step, unsigned slice, unsigned nblk, float* arena) {
     unsigned long long* part = (unsigned long long*)arena;
     float* fpart = (float*)(part + PLOW_NV_WARPS);
     unsigned* sel = (unsigned*)(fpart + PLOW_NV_WARPS);
@@ -678,9 +678,12 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
         const unsigned* bm = bitmap ? bitmap + (size_t)r * words : nullptr;
         const float* lg = logits + (size_t)r * ls;
         const float* lu = guide ? lg + ls : nullptr;
+        /* HF min_new_tokens: the last class (the stop) is masked before step min_step. */
+        const unsigned masked = ctl[2u * r + 1u] < min_step ? vocab - 1u : vocab;
         for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
             float v = lg[i];
             if (lu) v = __fadd_rn(lu[i], __fmul_rn(cs, __fsub_rn(v, lu[i])));
+            if (i == masked) v = -INFINITY;
             if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? __fdiv_rn(v, pen) : v * pen;
             L[i] = t > 0.f ? __fdiv_rn(v, t) : v;
         }

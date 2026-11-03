@@ -765,7 +765,8 @@ impl GpuEngine {
     }
 
     /// Whether slot `b`'s next sequence may attach a cached prefix: `false` for prompts whose rows
-    /// are not keyed by their ids alone (speech frame codes staged per chunk).
+    /// are not keyed by their ids alone (speech frame codes staged per chunk), which then publish
+    /// none either until retired.
     pub fn set_prefix_attach(&mut self, b: usize, on: bool) {
         self.prefix_attach_off[b] = !on;
     }
@@ -789,7 +790,7 @@ impl GpuEngine {
         p_a: u32,
         kind: crate::memory::vmm::Kind,
     ) -> bool {
-        let Some((v, kv)) = self.vmm_prefix() else {
+        let Some((v, kv)) = self.vmm_prefix().filter(|_| !self.prefix_attach_off[b]) else {
             return false;
         };
         let rows = self.pos[b];

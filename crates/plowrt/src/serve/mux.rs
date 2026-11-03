@@ -566,6 +566,9 @@ pub struct SpeechJob {
     /// members; empty = no frame rows. Past its end every row's codes are zero.
     pub frame_codes: Vec<u32>,
     pub frame_codes_per_row: usize,
+    /// Dual-stream rows: decode step `s` feeds text token `.0[s]` (then `.1`) instead of its last
+    /// output; the frame's codes come from the depth stage.
+    pub feed: Option<(Vec<u32>, u32)>,
     /// Maya 2: a cloned speaker's depth memory, `[layers][hidden]` (`None`: the null speaker's).
     pub maya2_memory: Option<std::sync::Arc<[f32]>>,
 }
@@ -1093,6 +1096,16 @@ impl Slot {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn plain_decode(&self) -> bool {
         self.speech.is_some()
+    }
+
+    /// The token the next decode step feeds: the last output, or a dual-stream speech job's text
+    /// for that step (its codes ride beside it).
+    fn feed(&self) -> Option<u32> {
+        let last = *self.out_ids.last()?;
+        Some(match self.speech.as_deref().and_then(|sp| sp.feed.as_ref()) {
+            Some((text, tail)) => text.get(self.out_ids.len() - 1).copied().unwrap_or(*tail),
+            None => last,
+        })
     }
 
     /// Tokens a chained decode path may produce for this row before the host must see one
@@ -2851,7 +2864,9 @@ fn admit_session(
                 .table
                 .lookup(&t.session, &t.keys, pair, lim, Instant::now())
         })
-        .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()));
+        .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()))
+        // Frame rows are not keyed by their ids: a retained sequence cannot vouch for them.
+        .filter(|_| job.opts.speech.as_ref().is_none_or(|s| s.frame_codes.is_empty()));
     let find_free = |slots: &[Option<Slot>], table: &crate::serve::session::RetainTable| {
         if pair {
             (0..lim.saturating_sub(1)).step_by(2).find(|&i| {
@@ -4584,7 +4599,7 @@ fn run_one_tick(
                             return None;
                         }
                         let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                        slot.out_ids.last().map(|&token| (i, token))
+                        slot.feed().map(|token| (i, token))
                     })
                     .collect();
                 let result = {
@@ -4678,7 +4693,7 @@ fn run_one_tick(
                     .take(b)
                     .filter_map(|(i, slot)| {
                         let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                        (slot.step > 0).then(|| (i, *slot.out_ids.last().expect("decode output")))
+                        (slot.step > 0).then(|| (i, slot.feed().expect("decode output")))
                     })
                     .collect();
                 // A body can only pack a slot that already has a cursor, and a fresh request
@@ -4984,8 +4999,7 @@ fn run_one_tick(
                             .take(b)
                             .filter_map(|(i, slot)| {
                                 let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                                (slot.step > 0)
-                                    .then(|| (i, *slot.out_ids.last().expect("decode output")))
+                                (slot.step > 0).then(|| (i, slot.feed().expect("decode output")))
                             })
                             .collect();
                         let mut tokens = std::mem::take(&mut obs.host.slot_tokens);
@@ -5342,7 +5356,7 @@ fn run_one_tick(
                                 .enumerate()
                                 .filter_map(|(i, slot)| {
                                     let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                                    Some((i, *slot.out_ids.last()?))
+                                    Some((i, slot.feed()?))
                                 })
                                 .collect()
                         } else {
@@ -5693,7 +5707,7 @@ fn run_one_tick(
             let feeds: Vec<(usize, u32)> = (0..b.min(slots.len()))
                 .filter_map(|i| {
                     let s = slots[i].as_ref().filter(|s| s.parked_at.is_none())?;
-                    Some((i, *s.out_ids.last()?))
+                    Some((i, s.feed()?))
                 })
                 .collect();
             let mut decode_progress = None;
@@ -6046,7 +6060,7 @@ fn gpu_decode_feeds(slots: &[Option<Slot>], cap: usize) -> Vec<(usize, u32)> {
         if s.step == 0 || s.parked_at.is_some() {
             continue;
         }
-        let last = *s.out_ids.last().expect("step > 0 implies output");
+        let last = s.feed().expect("step > 0 implies output");
         feeds.push((i, last));
         // The CFG partner steps on the same token.
         if s.cfg.is_some() && i + 1 < cap {

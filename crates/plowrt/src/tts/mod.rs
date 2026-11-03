@@ -106,6 +106,9 @@ pub struct SpeechContract {
     pub text_encoder: Option<String>,
     /// Voice cloning through a reference encoder packet beside the LM.
     pub clone: Option<CloneContract>,
+    /// Text-plus-codec rows ([`plow_asset::dual_stream`]); its voices, languages and
+    /// instructions are the model's.
+    pub dual_stream: Option<plow_asset::dual_stream::DualStream>,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -207,6 +210,12 @@ impl SpeechContract {
                 .get(crate::exec::packet_runtime::TEXT_ENCODER)
                 .cloned(),
             clone: None,
+            dual_stream: p
+                .strings
+                .get(plow_asset::dual_stream::KEY)
+                .map(|j| plow_asset::dual_stream::DualStream::parse(j))
+                .transpose()
+                .map_err(RuntimeError::Rejected)?,
         };
         if let Some(encoder) = p.strings.get(crate::exec::packet_runtime::CLONE_ENCODER) {
             let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {
@@ -355,7 +364,11 @@ impl SpeechContract {
             },
             // Breeze guides against the uninstructed prompt: w = s - 1, off by default.
             cfg_weight: self.depth_cfg().then_some(0.0),
-            instructions: self.instructions.is_some(),
+            instructions: self.instructions.is_some()
+                || self
+                    .dual_stream
+                    .as_ref()
+                    .is_some_and(|d| d.instructions_template.is_some()),
             voice_cloning: self.clone.is_some(),
             clone_transcript: true,
             clone_audio_only: self.maya2.is_some(),
@@ -368,7 +381,7 @@ impl SpeechContract {
     /// Classifier-free guidance in the depth stage, contrasting with the prompt without its
     /// instructions.
     pub fn depth_cfg(&self) -> bool {
-        self.breeze_sampler && self.instructions.is_some()
+        self.breeze_sampler && self.instructions.is_some() && self.dual_stream.is_none()
     }
 
     /// LM tokens per audio frame.

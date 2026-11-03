@@ -91,6 +91,9 @@ pub struct SpeechRequest {
     /// (default `default_language`). Models without languages reject it.
     #[serde(default)]
     pub language: Option<String>,
+    /// Dual-stream models: the whole text in the prompt instead of one token per frame.
+    #[serde(default)]
+    pub non_streaming_mode: bool,
     /// Routing (OpenRouter-compatible): see [`crate::serve::session::RequestIds::apply_body`].
     #[serde(default)]
     pub session_id: Option<String>,
@@ -1229,6 +1232,7 @@ async fn speech_with(
         repetition_penalty: checked.sampling.repetition_penalty,
         top_k: checked.sampling.top_k.unwrap_or(0),
         seed: checked.seed,
+        streaming: !req.non_streaming_mode,
     };
     let mut segs: Vec<Segment> = Vec::new();
     for t in super::segments(&input, c.segment_chars()) {
@@ -1530,6 +1534,8 @@ struct Segment {
     chars: usize,
     /// Index of the segment in its request.
     k: usize,
+    /// A dual-stream prompt's frames and text feed (`Err`: the text has no rows).
+    dual: Option<Result<plow_asset::dual_stream::Layout, String>>,
 }
 
 /// The voice a Maya 2 clone renders as: the plain prompt (`icl` names no speaker).
@@ -1599,6 +1605,8 @@ struct SegmentMaker {
     top_k: usize,
     /// The request's seed; segment `k` samples with `seed + k`.
     seed: u64,
+    /// Dual-stream: the text rides the decode steps.
+    streaming: bool,
 }
 
 impl SegmentMaker {
@@ -1631,7 +1639,23 @@ impl SegmentMaker {
             ids.extend_from_slice(&c.suffix);
             ids
         };
-        let mut prompt_ids = ids(self.instructions.as_deref());
+        let dual = c.dual_stream.as_ref().map(|d| {
+            let text_ids =
+                tok.encode_with_special_tokens(&d.text_template.replace("{input}", text), false);
+            let ins_ids = match (&d.instructions_template, self.instructions.as_deref()) {
+                (Some(t), Some(i)) => {
+                    tok.encode_with_special_tokens(&t.replace("{instructions}", i), false)
+                }
+                _ => Vec::new(),
+            };
+            let language = self.language.as_deref().unwrap_or("auto");
+            d.layout(&text_ids, &ins_ids, &self.voice, language, self.streaming)
+        });
+        let mut prompt_ids = match &dual {
+            Some(Ok(l)) => l.ids.clone(),
+            Some(Err(_)) => Vec::new(),
+            None => ids(self.instructions.as_deref()),
+        };
         let uncond_ids = (self.cfg_weight > 0.0 && self.encoder.is_some()).then(|| ids(None));
         let enc_ids = self.encoder.is_some().then(|| {
             let ids = prompt_ids.clone();
@@ -1678,6 +1702,7 @@ impl SegmentMaker {
             gen,
             chars: text.chars().count(),
             k,
+            dual,
         }
     }
 }
@@ -1741,6 +1766,7 @@ impl SegmentMaker {
         if !c.depth {
             return Ok(None);
         }
+        let dual = s.dual.clone().transpose()?;
         // With a reference, the text's segment follows its rows; with a text encoder, the
         // transcript's rows are overlay rows too.
         let (head, ref_ids) = match (&s.reference, &self.encoder) {
@@ -1844,8 +1870,9 @@ impl SegmentMaker {
                 overlay,
                 overlay_pos,
                 encode,
-                frame_codes: Vec::new(),
+                frame_codes: dual.as_ref().map_or(Vec::new(), |l| l.codes.clone()),
                 frame_codes_per_row: c.frame_codes,
+                feed: dual.as_ref().map(|l| (l.feed.clone(), l.tail)),
                 depth: Some(crate::serve::mux::DepthJob {
                     seed: s.gen.seed.unwrap_or(self.seed),
                     temperature: if greedy { 1.0 } else { param(self.temperature) },
