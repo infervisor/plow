@@ -1940,6 +1940,8 @@ async fn metrics_handler(
         aggregate.accumulate(metrics);
     }
     let mut out = aggregate.to_prometheus();
+    #[cfg(feature = "cuda")]
+    cuda_group::write_transport_metrics(&mut out);
     for (index, (slug, metrics, _)) in models.iter().enumerate() {
         let label = crate::obs::serving::model_labels(slug);
         for line in metrics

@@ -2,9 +2,11 @@
 //! ([`crate::exec::proc_group`]): its tensor-parallel coordinates, the device addresses of its
 //! peers' collective regions in THIS process, and the per-launch-unit arm/audit protocol.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::device::cuda::ipc::IpcRegion;
 use crate::device::cuda::{CudaBackend, CudaStream};
 use crate::device::{Backend, DeviceMem};
 use crate::exec::proc_group::ProcGroup;
@@ -31,10 +33,12 @@ pub struct RankBind {
     pub tp: u32,
     pub tp_rank: u32,
     host_base: *mut u8,
-    /// NVIDIA `PlowProgram::peer_scratch`: `[tp]` host regions followed by this rank's
-    /// VRAM mirror, or NULL for unstaged objects. This does not change the program ABI.
+    /// NVIDIA `PlowProgram::peer_scratch`: `[tp]` regions followed by this rank's
+    /// host-route VRAM mirror, or NULL for P2P and unstaged host objects.
     peer_table: DeviceMem,
     local_mirror: Option<DeviceMem>,
+    p2p_regions: Vec<IpcRegion>,
+    unsafe_to_free: AtomicBool,
     /// Device address of this rank's own region.
     pub own_region: u64,
     /// Units armed so far: part of every plan fingerprint, so a rank that skipped or repeated
@@ -92,11 +96,69 @@ impl RankBind {
             host_base,
             peer_table,
             local_mirror: None,
+            p2p_regions: Vec::new(),
+            unsafe_to_free: AtomicBool::new(false),
             seq: 0,
         })
     }
 
+    pub(crate) fn new_p2p(
+        be: Arc<CudaBackend>,
+        group: Arc<ProcGroup>,
+        mut regions: Vec<IpcRegion>,
+    ) -> Result<Self> {
+        let tp = group.tp();
+        let tp_rank = group.rank() % tp;
+        if group.layout().is_none() || tp > MAX_TP || regions.len() != tp as usize {
+            return Err(RuntimeError::Rejected("invalid P2P rank geometry".into()));
+        }
+        let own_region = regions[tp_rank as usize].base;
+        let mut addresses: Vec<_> = regions.iter().map(|r| r.base).collect();
+        addresses.push(0);
+        let bytes: Vec<_> = addresses.iter().flat_map(|a| a.to_le_bytes()).collect();
+        let peer_table = be.alloc(0, bytes.len() as u64)?;
+        be.upload(&peer_table, 0, &bytes)?;
+        // Drop imported mappings before the local allocation.
+        let own = regions.remove(tp_rank as usize);
+        regions.push(own);
+        Ok(Self {
+            be,
+            group,
+            tp,
+            tp_rank,
+            host_base: std::ptr::null_mut(),
+            peer_table,
+            local_mirror: None,
+            p2p_regions: regions,
+            own_region,
+            seq: 0,
+            unsafe_to_free: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn is_p2p(&self) -> bool {
+        !self.p2p_regions.is_empty()
+    }
+
+    pub(super) fn failed_drain(&self) {
+        self.unsafe_to_free.store(true, Ordering::Relaxed);
+        self.group.abort();
+    }
+
+    pub(crate) fn transport_tier(&self) -> &'static str {
+        if self.is_p2p() {
+            "p2p"
+        } else if self.local_mirror.is_some() {
+            "staged"
+        } else {
+            "unstaged"
+        }
+    }
+
     pub(super) fn enable_staging(&mut self) -> Result<()> {
+        if self.is_p2p() {
+            return Ok(());
+        }
         let mirror = self.be.alloc(0, self.layout().bytes())?;
         self.be.upload(
             &self.peer_table,
@@ -135,19 +197,22 @@ impl RankBind {
         self.layout().n_xctr
     }
 
-    /// Start a launch unit described by `plan` (every rank must pass the same words). The
-    /// device must be idle: callers synchronize the engine stream first.
-    pub fn arm(&mut self, plan: &[u64], stream: &CudaStream) -> Result<()> {
-        if let Some(mirror) = &self.local_mirror {
-            let layout = self.layout();
-            self.be.memset_d8_async(
-                mirror.base + layout.xctr_off(),
-                0,
-                (layout.xctr_bytes() + XCTR_STRIDE as u64) as usize,
-                stream,
-            )?;
-            self.be.stream_synchronize(stream)?;
-        }
+    /// Queue the reset before the engine's existing pre-barrier stream drain.
+    pub(super) fn reset(&self, stream: &CudaStream) -> Result<()> {
+        let layout = self.layout();
+        let (region, bytes) = if self.is_p2p() {
+            (self.own_region, layout.xstate_bytes())
+        } else if let Some(mirror) = &self.local_mirror {
+            (mirror.base, layout.xctr_bytes() + XCTR_STRIDE as u64)
+        } else {
+            return Ok(());
+        };
+        self.be
+            .memset_d8_async(region + layout.xctr_off(), 0, bytes as usize, stream)
+    }
+
+    /// The engine has drained the queued reset before entering this group barrier.
+    pub fn arm(&mut self, plan: &[u64]) -> Result<()> {
         self.seq += 1;
         let mut h = 0xcbf2_9ce4_8422_2325u64 ^ self.seq;
         for w in plan {
@@ -159,7 +224,14 @@ impl RankBind {
     /// After a launch unit retired: fail it if a collective gave up (deadline or a peer that
     /// never arrived).
     pub fn audit(&self) -> Result<()> {
-        let status = self.group.own_xline(self.status_id());
+        let status = if self.is_p2p() {
+            let mut bytes = [0u8; 4];
+            self.be
+                .memcpy_dtoh(&mut bytes, self.own_region + self.layout().xstatus_off())?;
+            u32::from_le_bytes(bytes)
+        } else {
+            self.group.own_xline(self.status_id())
+        };
         if status != 0 {
             self.group.abort();
             return Err(RuntimeError::CollectiveBail(format!(
@@ -178,8 +250,21 @@ impl RankBind {
 
 impl Drop for RankBind {
     fn drop(&mut self) {
+        if self.unsafe_to_free.load(Ordering::Relaxed) || self.be.ipc_must_retain() {
+            let table = std::mem::replace(&mut self.peer_table, DeviceMem::view(0, 0));
+            std::mem::forget(table);
+            std::mem::forget(self.local_mirror.take());
+            for region in &mut self.p2p_regions {
+                region.leak_on_drop();
+            }
+            // Preserve a registered host mapping too; a kernel may still hold its address.
+            std::mem::forget(self.group.clone());
+            return;
+        }
         // SAFETY: registered in `new`; the engine that launched against it is torn down first.
-        unsafe { self.be.host_unregister(self.host_base) };
+        if !self.host_base.is_null() {
+            unsafe { self.be.host_unregister(self.host_base) };
+        }
     }
 }
 

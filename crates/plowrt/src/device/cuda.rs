@@ -30,7 +30,7 @@
 //! a few tens of nanoseconds, nothing against a multi-millisecond token step.
 
 use std::ffi::{c_char, c_void};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -40,6 +40,7 @@ use crate::device::{Backend, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg
 use crate::{DeviceErrorInfo, Result, RuntimeError};
 
 pub(crate) mod aot;
+pub(crate) mod ipc;
 pub(crate) mod lt;
 pub use lt::library as cublaslt_library;
 pub(crate) mod qwen_gdn;
@@ -279,6 +280,8 @@ driver_api! {
     cuMemAddressReserve: fn(*mut CUdeviceptr, usize, usize, CUdeviceptr, u64) -> CUresult,
     cuMemAddressFree: fn(CUdeviceptr, usize) -> CUresult,
     cuMemCreate: fn(*mut u64, usize, *const CUmemAllocationProp, u64) -> CUresult,
+    cuMemExportToShareableHandle: fn(*mut c_void, u64, i32, u64) -> CUresult,
+    cuMemImportFromShareableHandle: fn(*mut u64, *mut c_void, i32) -> CUresult,
     cuMemRelease: fn(u64) -> CUresult,
     cuMemMap: fn(CUdeviceptr, usize, usize, u64, u64) -> CUresult,
     cuMemUnmap: fn(CUdeviceptr, usize) -> CUresult,
@@ -290,6 +293,7 @@ driver_api! {
     cuStreamCreate: fn(*mut CUstream, u32) -> CUresult,
     cuStreamDestroy_v2: fn(CUstream) -> CUresult,
     cuStreamSynchronize: fn(CUstream) -> CUresult,
+    cuStreamWriteValue32: fn(CUstream, CUdeviceptr, u32, u32) -> CUresult,
     cuMemcpyHtoDAsync_v2: fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
     cuMemcpyDtoHAsync_v2: fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
     cuMemcpyDtoDAsync_v2: fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
@@ -667,6 +671,7 @@ type ParamInfoFn = unsafe extern "C" fn(CUfunction, usize, *mut usize, *mut usiz
 
 pub struct CudaBackend {
     api: Arc<Api>,
+    ipc_failed_drain: AtomicBool,
     /// See the resolve site in [`CudaBackend::open`] — `None` on pre-12.0 drivers.
     tmap_encode: Option<TmapEncodeFn>,
     param_info: Option<ParamInfoFn>,
@@ -962,6 +967,7 @@ impl CudaBackend {
             });
             let mut be = CudaBackend {
                 api,
+                ipc_failed_drain: AtomicBool::new(false),
                 tmap_encode,
                 param_info,
                 ctx: ctx as usize,
@@ -2080,6 +2086,7 @@ impl CudaBackend {
         let _shared = (CAPTURING.get() != Arc::as_ptr(lock) as usize).then(|| lock.read());
         // SAFETY: no arguments.
         self.check(unsafe { (self.api.cuCtxSynchronize)() }, "cuCtxSynchronize")
+            .inspect_err(|_| self.ipc_failed_drain.store(true, Ordering::Relaxed))
     }
 
     /// One ordered execution stream (`CU_STREAM_NON_BLOCKING`) — the engine's
@@ -2107,6 +2114,7 @@ impl CudaBackend {
             unsafe { (self.api.cuStreamSynchronize)(stream.raw as CUstream) },
             "cuStreamSynchronize",
         )
+        .inspect_err(|_| self.ipc_failed_drain.store(true, Ordering::Relaxed))
     }
 
     /// Async H2D on `stream`.

@@ -188,6 +188,7 @@ mod gen_decode;
 mod mixed_step;
 mod moe_lt;
 mod native_decode;
+pub(crate) mod p2p;
 mod packed_terminal;
 pub mod packet_exec;
 pub mod rank;
@@ -4857,7 +4858,7 @@ impl GpuEngine {
 
         let prefill_image =
             resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
-        if let Some(bind) = rank_bind.as_mut().filter(|b| b.tp > 1) {
+        if let Some(bind) = rank_bind.as_mut().filter(|b| b.tp > 1 && !b.is_p2p()) {
             match xr_staging_unavailable(
                 &be,
                 &module,
@@ -9601,10 +9602,17 @@ impl GpuEngine {
     /// then every rank of the subgroup zeroes its gates and agrees on `plan`.
     fn rank_arm(&mut self, plan: &[u64]) -> Result<()> {
         let t0 = std::time::Instant::now();
-        self.be.stream_synchronize(&self.stream)?;
+        if let Some(r) = &self.rank_bind {
+            r.reset(&self.stream)?;
+        }
+        self.be.stream_synchronize(&self.stream).inspect_err(|_| {
+            if let Some(r) = &self.rank_bind {
+                r.failed_drain();
+            }
+        })?;
         let t1 = std::time::Instant::now();
         let r = match self.rank_bind.as_mut() {
-            Some(r) => r.arm(plan, &self.stream),
+            Some(r) => r.arm(plan),
             None => Ok(()),
         };
         tracing::trace!(
@@ -9620,7 +9628,9 @@ impl GpuEngine {
     pub fn rank_audit(&self) -> Result<()> {
         match self.rank_bind.as_ref().filter(|r| r.tp > 1) {
             Some(r) => {
-                self.be.stream_synchronize(&self.stream)?;
+                self.be
+                    .stream_synchronize(&self.stream)
+                    .inspect_err(|_| r.failed_drain())?;
                 r.audit()
             }
             None => Ok(()),
@@ -15848,6 +15858,10 @@ impl Drop for GpuEngine {
         // cooperative kernel.
         if let Err(e) = self.be.synchronize() {
             report(&e, "synchronize at engine unload");
+            if let Some(bind) = self.rank_bind.take() {
+                // A failed drain cannot authorize unmapping addresses held by a kernel.
+                std::mem::forget(bind);
+            }
         }
         drop(self.decode_contexts.take());
         self.decode_rungs.clear();

@@ -1152,6 +1152,7 @@ pub const RUNTIME: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
+    KnobSpec::new("env.PLOW_TP_TRANSPORT", Some("PLOW_TP_TRANSPORT"), Layer::RawEnv, Domain::Enum(&["auto", "host", "p2p"]), Default::Static(Val::Str("auto")), OPT_IN),
     KnobSpec::new("env.PLOW_AMD_DECODE_MIN_RUNG", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_CFG_MULTISTEP", Some("PLOW_CFG_MULTISTEP"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_CO_SCHED_QUANTUM", Some("PLOW_CO_SCHED_QUANTUM"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
