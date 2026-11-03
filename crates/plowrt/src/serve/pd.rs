@@ -21,12 +21,28 @@ use crate::serve::stream::{self, FinishReason, StreamChunk};
 use crate::serve::AppState;
 use crate::RuntimeError;
 
-/// One slot's KV, as `GpuEngine::export_kv_image` wrote it.
+pub use crate::exec::kv_image::KvBytes;
+
+/// One slot's canonical KV image.
 pub struct KvImage {
-    /// `exec::kv_image::compat_key` of the exporting packet.
+    /// The exporting engine's key: its caches' semantic header.
     pub key: String,
     pub rows: u32,
-    pub bytes: Vec<u8>,
+    pub bytes: KvBytes,
+    pub handoff_started: Instant,
+}
+
+impl KvImage {
+    pub(crate) fn handoff_ms(&self) -> f64 {
+        let pd_handoff_ms = self.handoff_started.elapsed().as_secs_f64() * 1e3;
+        tracing::debug!(
+            pd_handoff_ms,
+            rows = self.rows,
+            bytes = self.bytes.len(),
+            "pd: handoff complete"
+        );
+        pd_handoff_ms
+    }
 }
 
 /// Where a prefill job's image goes when its slot finishes.
@@ -64,6 +80,7 @@ impl KvExport {
 pub struct KvImport {
     pub image: KvImage,
     pub token: u32,
+    pub logprobs: Option<Box<crate::text::logprobs::TokenLogprobs>>,
     /// The request's arrival, and when the prefill rank streamed the first token: the decode
     /// rank's e2e and SLO count from them.
     pub arrived: Instant,
@@ -118,6 +135,117 @@ pub(crate) fn settle_refused(job: &Job) {
     }
 }
 
+/// The KV image header of the bundle in `dir`, its checkpoint hashed once per checkpoint
+/// directory (`digests`).
+pub fn kv_header(
+    dir: &std::path::Path,
+    digests: &mut std::collections::HashMap<std::path::PathBuf, String>,
+) -> Result<plow_asset::kv_image::Header, String> {
+    let (blob, manifest) = kv_packet(dir)?;
+    let ckpt = crate::asset::serve::checkpoint_dir(dir);
+    let ckpt = ckpt.canonicalize().unwrap_or(ckpt);
+    let weights = match digests.get(&ckpt) {
+        Some(d) => d.clone(),
+        None => {
+            let d = plow_asset::kv_image::checkpoint_digest(&ckpt)?;
+            digests.insert(ckpt, d.clone());
+            d
+        }
+    };
+    blob.with_packet_view(|p| plow_asset::kv_image::derive(p, &manifest, weights))
+}
+
+fn kv_packet(
+    dir: &std::path::Path,
+) -> Result<
+    (
+        crate::asset::devblob::DevBlob,
+        plow_asset::live_kv::Manifest,
+    ),
+    String,
+> {
+    use crate::asset::devblob::DevBlob;
+    let pkt = DevBlob::find_in_dir(dir)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no packet in {}", dir.display()))?;
+    let raw = std::fs::read(&pkt).map_err(|e| format!("{}: {e}", pkt.display()))?;
+    let blob = DevBlob::parse_l2(&raw, true).map_err(|e| e.to_string())?;
+    let manifest =
+        match crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw).map_err(|e| e.to_string())? {
+            Some(m) => m,
+            None => blob.with_packet_view(plow_asset::live_kv::emit)?,
+        };
+    Ok((blob, manifest))
+}
+
+pub fn kv_image_capacity(dir: &std::path::Path, rows: Option<u32>) -> Result<usize, String> {
+    let (_, manifest) = kv_packet(dir)?;
+    let (_, bytes) = crate::exec::kv_image::plan(&manifest, 0, rows.unwrap_or(manifest.max_ctx))
+        .map_err(|e| e.to_string())?;
+    usize::try_from(bytes).map_err(|e| e.to_string())
+}
+
+/// `--pd` startup check: every rank's KV image header (`headers[r]`, rank `r`'s bundle) equals
+/// the first prefill rank's, or the model is refused naming the first difference.
+pub fn check_headers(
+    model: &str,
+    spec: PdSpec,
+    headers: &[Result<plow_asset::kv_image::Header, String>],
+) -> Result<(), String> {
+    let in_pd = |r: usize| (spec.prefill | spec.decode) >> r & 1 != 0;
+    let first = spec.prefill.trailing_zeros() as usize;
+    let base = headers[first]
+        .as_ref()
+        .map_err(|e| format!("--pd {model}: rank {first}: {e}"))?;
+    for (r, h) in headers.iter().enumerate().filter(|(r, _)| in_pd(*r)) {
+        let h = h
+            .as_ref()
+            .map_err(|e| format!("--pd {model}: rank {r}: {e}"))?;
+        if let Some(diff) = base.first_difference(h) {
+            return Err(format!(
+                "--pd {model}: rank {r}'s KV cache differs from rank {first}'s at {diff}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+pub fn check_engines(state: &AppState, model: &str, spec: PdSpec) -> Result<(), String> {
+    let set = state
+        .dp_set(model)
+        .ok_or_else(|| format!("--pd {model}: no DP set"))?;
+    let keys: Vec<_> = set
+        .ranks
+        .iter()
+        .map(|r| {
+            state
+                .gpu_engine(&r.key)
+                .and_then(|e| e.lock().kv_image_key())
+        })
+        .collect();
+    check_engine_keys(model, spec, &keys)
+}
+
+fn check_engine_keys(model: &str, spec: PdSpec, keys: &[Option<String>]) -> Result<(), String> {
+    let first = spec.prefill.trailing_zeros() as usize;
+    let key =
+        |rank: usize| {
+            keys.get(rank).and_then(Option::as_ref).ok_or_else(|| {
+        format!("--pd {model}: rank {rank}'s engine has no KV image (unsupported cache storage)")
+    })
+        };
+    let base = key(first)?;
+    for rank in 0..MAX_DP {
+        if (spec.prefill | spec.decode) >> rank & 1 != 0 && key(rank)? != base {
+            return Err(format!(
+                "--pd {model}: rank {rank}'s engine KV image key differs from rank {first}'s"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `--pd model=P/D`: the DP ranks of each pool, as bit masks over the model's ranks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PdSpec {
@@ -166,7 +294,7 @@ pub fn parse_pd(entries: &[String]) -> Result<Vec<(String, PdSpec)>, String> {
 }
 
 /// Whether `job` can run disaggregated: plain text, no host-side per-token state the decode rank
-/// would lose (logprobs, a retained session, media rows).
+/// would lose (prompt logprobs, a retained session, media rows).
 pub(crate) fn eligible(job: &Job) -> bool {
     let o = &job.opts;
     o.speech.is_none()
@@ -175,13 +303,13 @@ pub(crate) fn eligible(job: &Job) -> bool {
         && o.turn.is_none()
         && o.export.is_none()
         && o.import.is_none()
-        && job.gen.params.logprobs.is_none()
+        && !o.prompt_logprobs
 }
 
 /// Submit `job`, routed to `set`'s prefill rank `mux`, through the P/D flow when the set has
 /// one and the job is eligible; otherwise as a whole request. A refusal hands the original job
 /// back, as [`ModelMux::submit_arrived`] does.
-pub(crate) fn submit(
+pub(crate) async fn submit(
     state: &AppState,
     set: &DpSet,
     mux: &ModelMux,
@@ -226,7 +354,7 @@ pub(crate) fn submit(
             ..Default::default()
         },
     };
-    if let Err(e) = mux.submit_arrived(prefill, arrived, ingress) {
+    if let Err(e) = mux.submit_wait_arrived(prefill, arrived, ingress).await {
         // The refusal is the caller's to retry or report, as for a whole request.
         outcome.settle();
         let (SubmitError::Full(p) | SubmitError::Closed(p)) = &e;
@@ -254,10 +382,10 @@ pub(crate) fn submit(
                 _ = job.respond.closed() => return,
             };
             match chunk {
-                Some(StreamChunk::Token { id, .. })
+                Some(StreamChunk::Token { id, logprobs, .. })
                     if first.is_none() && id != stream::TEXT_ONLY =>
                 {
-                    first = Some((id, Instant::now()))
+                    first = Some((id, Instant::now(), logprobs))
                 }
                 Some(StreamChunk::Done {
                     reason: FinishReason::Preempted,
@@ -286,7 +414,7 @@ pub(crate) fn submit(
             i = image => i,
             _ = job.respond.closed() => return,
         };
-        let image = match (first, image) {
+        let image = match (&first, image) {
             (Some(_), Ok(Ok(image))) => image,
             (None, _) => {
                 let msg = "P/D: the prefill rank produced no token".into();
@@ -314,18 +442,19 @@ pub(crate) fn submit(
             let msg = "P/D: the decode rank has no dispatcher".into();
             return fail(&job, &outcome, msg);
         };
-        let (token, first) = first.expect("matched Some");
+        let (token, first, logprobs) = first.expect("matched Some");
         job.opts.import = Some(Box::new(KvImport {
             image,
             token,
+            logprobs,
             arrived,
             first,
             cached_tokens,
             outcome,
         }));
         // The decode queue's clock starts now; `job.arrived` keeps the request's own.
-        if let Err(SubmitError::Full(job) | SubmitError::Closed(job)) =
-            mux.submit_arrived(job, Instant::now(), None)
+        if let Some(Err(SubmitError::Full(job) | SubmitError::Closed(job))) =
+            submit_decode(mux, job, Instant::now()).await
         {
             // The decode rank counted its refusal.
             settle_refused(&job);
@@ -340,9 +469,57 @@ pub(crate) fn submit(
     Ok(())
 }
 
+pub(crate) async fn submit_decode(
+    mux: &ModelMux,
+    job: Job,
+    arrived: Instant,
+) -> Option<Result<(), SubmitError>> {
+    let respond = job.respond.clone();
+    tokio::select! {
+        biased;
+        _ = respond.closed() => None,
+        result = mux.submit_wait_arrived(job, arrived, None) => Some(result),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_keys_refuse_missing_storage_and_mismatch_only_selected_ranks() {
+        let spec = PdSpec {
+            prefill: 1,
+            decode: 2,
+        };
+        assert!(check_engine_keys("m", spec, &[Some("a".into()), Some("a".into()), None]).is_ok());
+        for keys in [
+            vec![Some("a".into()), None],
+            vec![None, Some("a".into())],
+            vec![Some("a".into()), Some("b".into())],
+            vec![Some("a".into())],
+        ] {
+            assert!(check_engine_keys("m", spec, &keys).is_err());
+        }
+    }
+
+    #[test]
+    fn generated_logprobs_are_eligible_but_prompt_logprobs_are_not() {
+        let mut job = Job {
+            prompt_ids: vec![1, 2, 3],
+            gen: crate::serve::GenParams::default(),
+            arrived: Instant::now(),
+            respond: stream::channel().0,
+            opts: JobOpts::default(),
+        };
+        job.gen.params.logprobs = Some(crate::text::logprobs::LogprobRequest {
+            top: 20,
+            raw_logits: false,
+        });
+        assert!(eligible(&job));
+        job.opts.prompt_logprobs = true;
+        assert!(!eligible(&job));
+    }
 
     #[test]
     fn pd_specs_parse_and_refuse_overlap() {
@@ -394,7 +571,8 @@ mod tests {
         sink.deliver(Ok(KvImage {
             key: "k".into(),
             rows: 3,
-            bytes: vec![1, 2],
+            bytes: vec![1, 2].into(),
+            handoff_started: Instant::now(),
         }));
         assert!(!sink.wanted());
         sink.deliver(Err(crate::RuntimeError::Msg("late".into())));

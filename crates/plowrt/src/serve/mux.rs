@@ -244,6 +244,7 @@ pub struct Job {
 #[derive(Default)]
 pub struct JobOpts {
     pub class: JobClass,
+    pub prompt_logprobs: bool,
     /// Stream token ids only: no detokenization, and a consumer that falls behind is parked
     /// (not fed) instead of cut, up to [`PARK_TIMEOUT`].
     pub raw_tokens: bool,
@@ -954,8 +955,57 @@ impl ModelMux {
     /// As [`Self::submit`], but a full ingress queue waits for room instead of failing: for a front
     /// that bounds its own requests in flight.
     pub async fn submit_wait(&self, job: Job) -> std::result::Result<(), SubmitError> {
-        Metrics::inc(&self.metrics.requests);
-        while !self.reserve_queue() {
+        let arrived = job.arrived;
+        self.submit_wait_arrived(job, arrived, None).await
+    }
+
+    pub(crate) async fn submit_wait_arrived(
+        &self,
+        job: Job,
+        arrived: Instant,
+        ingress: Option<IngressGuard<'_>>,
+    ) -> std::result::Result<(), SubmitError> {
+        if job.opts.import.is_none() {
+            Metrics::inc(&self.metrics.requests);
+        }
+        if self.preempted() || self.tx.is_closed() {
+            Metrics::inc(&self.metrics.rejected);
+            return Err(SubmitError::Closed(job));
+        }
+        if (job.opts.export.is_some() || job.opts.import.is_some()) && self.shed_queue_depth() {
+            Metrics::inc(&self.metrics.rejected);
+            Metrics::inc(&self.metrics.shed_queue);
+            return Err(SubmitError::Full(job));
+        }
+        let mut job = job;
+        loop {
+            if self.preempted() || self.tx.is_closed() {
+                Metrics::inc(&self.metrics.rejected);
+                return Err(SubmitError::Closed(job));
+            }
+            if self.reserve_queue() {
+                let urgent = job.opts.class != JobClass::Bulk;
+                trace_arrival(&job, arrived);
+                match self.tx.try_send(MuxMsg::Job(job, arrived)) {
+                    Ok(()) => {
+                        drop(ingress);
+                        if urgent {
+                            self.arrival_notify.notify_one();
+                        }
+                        return Ok(());
+                    }
+                    Err(mpsc::error::TrySendError::Full(MuxMsg::Job(returned, _))) => {
+                        self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                        job = returned;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(MuxMsg::Job(returned, _))) => {
+                        self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                        Metrics::inc(&self.metrics.rejected);
+                        return Err(SubmitError::Closed(returned));
+                    }
+                    Err(_) => unreachable!(),
+                }
+            }
             tokio::select! {
                 _ = self.tx.closed() => {
                     Metrics::inc(&self.metrics.rejected);
@@ -964,24 +1014,6 @@ impl ModelMux {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {}
             }
         }
-        let arrived = job.arrived;
-        let urgent = job.opts.class != JobClass::Bulk;
-        trace_arrival(&job, arrived);
-        self.tx
-            .send(MuxMsg::Job(job, arrived))
-            .await
-            .map_err(|mpsc::error::SendError(msg)| {
-                self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-                Metrics::inc(&self.metrics.rejected);
-                match msg {
-                    MuxMsg::Job(job, _) => SubmitError::Closed(job),
-                    MuxMsg::Drain(_) => unreachable!("sent a job"),
-                }
-            })?;
-        if urgent {
-            self.arrival_notify.notify_one();
-        }
-        Ok(())
     }
 
     /// Initiate graceful drain: no new requests accepted, all live slots run to
@@ -4464,6 +4496,19 @@ fn run_one_tick(
             e.bind_engine_thread();
             let stop = Arc::clone(e.stop_ids());
             let b = e.batch();
+            let mut pd_exports = if slots.iter().flatten().any(|s| s.export.is_some()) {
+                slots
+                    .iter()
+                    .take(b)
+                    .map(|s| {
+                        let s = s.as_ref()?;
+                        Some((Arc::clone(s.export.as_ref()?), s.prompt_ids.len() as u32))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            seq_seat_imports(e, &mut slots, &arena, bundle, &stop, &mut tick_fault);
 
             // `capacity` is `batch()`, so this is only reachable on a mismatch;
             // a loud rejection beats a hang.
@@ -4491,7 +4536,7 @@ fn run_one_tick(
                     if let Some(taken) = slots[i].take() {
                         release_kv(&arena, taken.kv);
                     }
-                    e.release(i);
+                    seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                 }
             }
 
@@ -4609,7 +4654,7 @@ fn run_one_tick(
                             release_kv(&arena, taken.kv);
                             let _ = taken.respond.try_send(StreamChunk::Err(err));
                         }
-                        e.release(i);
+                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                     }
                 }
             }
@@ -4676,7 +4721,7 @@ fn run_one_tick(
                                 Some(stop.as_slice()),
                             );
                             if slots[i].is_none() {
-                                e.release(i);
+                                seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                             }
                         }
                     }
@@ -4690,7 +4735,7 @@ fn run_one_tick(
                                     .respond
                                     .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                             }
-                            e.release(i);
+                            seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                         }
                     }
                 }
@@ -4765,7 +4810,7 @@ fn run_one_tick(
                             release_kv(&arena, taken.kv);
                             let _ = taken.respond.try_send(StreamChunk::Err(err));
                         }
-                        e.release(i);
+                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                     }
                 }
                 // WHOLE CHUNKS ONLY, oldest first. A member's next chunk is taken as planned or
@@ -4957,7 +5002,7 @@ fn run_one_tick(
                                     Some(stop.as_slice()),
                                 );
                                 if slots[slot].is_none() {
-                                    e.release(slot);
+                                    seq_release_slot(e, slot, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                         }
@@ -4984,7 +5029,7 @@ fn run_one_tick(
                                         .respond
                                         .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                                 }
-                                e.release(i);
+                                seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                             }
                         }
                     }
@@ -5103,7 +5148,7 @@ fn run_one_tick(
                                         Some(stop.as_slice()),
                                     );
                                     if slots[slot].is_none() {
-                                        e.release(slot);
+                                        seq_release_slot(e, slot, &mut pd_exports, &mut tick_fault);
                                     }
                                 }
                             }
@@ -5122,7 +5167,7 @@ fn run_one_tick(
                                             .respond
                                             .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                                     }
-                                    e.release(slot);
+                                    seq_release_slot(e, slot, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                         }
@@ -5229,7 +5274,7 @@ fn run_one_tick(
                             release_kv(&arena, taken.kv);
                             let _ = taken.respond.try_send(StreamChunk::Err(err));
                         }
-                        e.release(i);
+                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                         prep_failed = true;
                         break;
                     }
@@ -5511,7 +5556,12 @@ fn run_one_tick(
                                             Some(stop.as_slice()),
                                         );
                                         if slots[i].is_none() {
-                                            e.release(i);
+                                            seq_release_slot(
+                                                e,
+                                                i,
+                                                &mut pd_exports,
+                                                &mut tick_fault,
+                                            );
                                         }
                                     }
                                 }
@@ -5539,7 +5589,7 @@ fn run_one_tick(
                                     crate::obs::ttft::FIRST_TOK
                                         .add(t_tok.elapsed().as_nanos() as u64);
                                     if slots[i].is_none() {
-                                        e.release(i);
+                                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                                     }
                                 }
                             }
@@ -5569,7 +5619,7 @@ fn run_one_tick(
                                             .respond
                                             .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                                     }
-                                    e.release(i);
+                                    seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                             Err(err) => {
@@ -5594,7 +5644,7 @@ fn run_one_tick(
                                             .respond
                                             .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                                     }
-                                    e.release(i);
+                                    seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                         }
@@ -5689,7 +5739,7 @@ fn run_one_tick(
                                 );
                                 crate::obs::ttft::FIRST_TOK.add(t_tok.elapsed().as_nanos() as u64);
                                 if slots[i].is_none() {
-                                    e.release(i);
+                                    seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                             Err(err) => {
@@ -5707,7 +5757,7 @@ fn run_one_tick(
                                     release_kv(&arena, taken.kv);
                                     let _ = taken.respond.try_send(StreamChunk::Err(err));
                                 }
-                                e.release(i);
+                                seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                             }
                         }
                         if let Some(t) = pk_t {
@@ -5822,7 +5872,7 @@ fn run_one_tick(
                             );
                         }
                         if slots[i].is_none() {
-                            e.release(i);
+                            seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                         }
                     }
                     Ok(quantum)
@@ -5851,7 +5901,7 @@ fn run_one_tick(
                             crate::obs::dstep::STREAM.add(t.elapsed().as_nanos() as u64);
                         }
                         if slots[i].is_none() {
-                            e.release(i);
+                            seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                         }
                     }
                     1
@@ -5899,7 +5949,7 @@ fn run_one_tick(
                                 .respond
                                 .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                         }
-                        e.release(i);
+                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                     }
                 }
             }
@@ -7635,6 +7685,9 @@ fn gpu_seat_imports(
         }
         s.pf_pos = s.prompt_ids.len();
         s.cached_tokens = import.cached_tokens;
+        s.lp = import.logprobs;
+        let pd_handoff_ms = import.image.handoff_ms();
+        tracing::debug!(slot = i, pd_handoff_ms, "cuda: P/D image seated");
         disconnected[i] |= handle_produced_token(
             &mut slots[i],
             arena,
@@ -7654,13 +7707,110 @@ fn gpu_export_slot(
     e: &mut crate::exec::gpu::GpuEngine,
     slot: usize,
 ) -> Result<crate::serve::pd::KvImage> {
+    let handoff_started = Instant::now();
     let key = e
         .kv_image_key()
         .ok_or_else(|| crate::RuntimeError::Rejected("P/D: this packet has no KV image".into()))?;
     let rows = e.slot_pos(slot) as u32;
-    let mut bytes = Vec::new();
+    let mut bytes = crate::serve::pd::KvBytes::default();
     e.export_kv_image(slot, rows, &mut bytes)?;
-    Ok(crate::serve::pd::KvImage { key, rows, bytes })
+    Ok(crate::serve::pd::KvImage {
+        key,
+        rows,
+        bytes,
+        handoff_started,
+    })
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+fn seq_release_slot(
+    e: &mut dyn crate::serve::engine::SeqEngine,
+    slot: usize,
+    exports: &mut [Option<(Arc<crate::serve::pd::KvExport>, u32)>],
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+) {
+    if let Some((sink, rows)) = exports.get_mut(slot).and_then(Option::take) {
+        if sink.wanted() {
+            let image = (|| {
+                let handoff_started = Instant::now();
+                let key = e.kv_image_key().ok_or_else(|| {
+                    crate::RuntimeError::Rejected("P/D: this packet has no KV image".into())
+                })?;
+                let mut bytes = crate::serve::pd::KvBytes::default();
+                e.export_kv_image(slot, rows, &mut bytes)?;
+                Ok(crate::serve::pd::KvImage {
+                    key,
+                    rows,
+                    bytes,
+                    handoff_started,
+                })
+            })();
+            if let Err(error) = &image {
+                note_fault(tick_fault, error);
+            }
+            e.release(slot);
+            sink.deliver(image);
+            return;
+        }
+    }
+    e.release(slot);
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+fn seq_seat_imports(
+    e: &mut dyn crate::serve::engine::SeqEngine,
+    slots: &mut [Option<Slot>],
+    arena: &Option<SharedKvState>,
+    bundle: &ModelBundle,
+    stop: &[u32],
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+) {
+    for i in 0..slots.len().min(e.batch()) {
+        let Some(s) = slots[i]
+            .as_mut()
+            .filter(|s| s.step == 0 && s.import.is_some())
+        else {
+            continue;
+        };
+        if s.respond.is_closed() {
+            // The tick's disconnect pass releases this slot.
+            continue;
+        }
+        let import = s.import.take().expect("filtered on import");
+        let seated = match e.kv_image_key() {
+            Some(key)
+                if key == import.image.key && s.prompt_ids.len() == import.image.rows as usize =>
+            {
+                e.import_kv_image(i, &s.prompt_ids, &import.image.bytes, import.token)
+            }
+            _ => Err(crate::RuntimeError::Rejected(
+                "P/D: the prefill rank's KV image does not fit this packet".into(),
+            )),
+        };
+        if let Err(err) = seated {
+            e.release(i);
+            note_fault(tick_fault, &err);
+            fail_slot(&mut slots[i], arena, err);
+            continue;
+        }
+        s.pf_pos = s.prompt_ids.len();
+        s.cached_tokens = import.cached_tokens;
+        s.lp = import.logprobs;
+        let pd_handoff_ms = import.image.handoff_ms();
+        tracing::debug!(slot = i, pd_handoff_ms, "seq: P/D image seated");
+        handle_produced_token(
+            &mut slots[i],
+            arena,
+            bundle,
+            import.token,
+            1,
+            &mut 0,
+            Some(stop),
+        );
+        if slots[i].is_none() {
+            e.release(i);
+        }
+    }
 }
 
 /// Advance a prefilling slot: one prompt chunk through the prefill bucket
@@ -10363,8 +10513,8 @@ mod tests {
         assert_eq!(multistep_requested(0, 8, 4), 0);
     }
 
-    #[test]
-    fn bounded_ingress_reports_full_closed_and_depth() {
+    #[tokio::test]
+    async fn bounded_ingress_reports_full_closed_and_depth() {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = mpsc::channel(1 + CONTROL_SLACK);
         let mux = ModelMux {
@@ -10391,9 +10541,91 @@ mod tests {
         assert!(matches!(mux.submit(test_job()), Err(SubmitError::Full(_))));
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
 
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            mux.submit_wait_arrived(test_job(), Instant::now(), Some(mux.ingress())),
+        )
+        .await
+        .is_err());
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(mux.ingress.pending(), 0);
+        let submissions: Vec<_> = (0..16)
+            .map(|_| {
+                let mux = mux.clone();
+                tokio::spawn(async move { mux.submit_wait(test_job()).await })
+            })
+            .collect();
         let msg = rx.try_recv().unwrap();
         note_dequeued(&msg, &metrics);
+        for _ in 0..16 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
+            note_dequeued(&msg, &metrics);
+        }
+        for task in submissions {
+            assert!(task.await.unwrap().is_ok());
+        }
+        assert_eq!(metrics.requests.load(Ordering::Relaxed), 19);
+        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+
+        let now = Instant::now();
+        let import_job = |prefill, respond| {
+            let mut job = test_job();
+            job.respond = respond;
+            job.opts.import = Some(Box::new(crate::serve::pd::KvImport {
+                image: crate::serve::pd::KvImage {
+                    key: "key".into(),
+                    rows: 1,
+                    bytes: vec![0].into(),
+                    handoff_started: now,
+                },
+                token: 1,
+                logprobs: None,
+                arrived: now,
+                first: now,
+                outcome: crate::serve::pd::Outcome::new(prefill, now),
+                cached_tokens: 0,
+            }));
+            job
+        };
+        let imported = import_job(metrics.clone(), crate::serve::stream::channel().0);
+        imported.opts.import.as_ref().unwrap().outcome.settle();
+        assert!(mux.submit_wait_arrived(imported, now, None).await.is_ok());
+        assert_eq!(metrics.requests.load(Ordering::Relaxed), 19);
+        note_dequeued(&rx.try_recv().unwrap(), &metrics);
+
+        assert!(mux.submit(test_job()).is_ok());
+        let prefill = Arc::new(Metrics::default());
+        let (respond, receiver) = crate::serve::stream::channel();
+        let imported = import_job(prefill.clone(), respond);
+        let outcome = Arc::downgrade(&imported.opts.import.as_ref().unwrap().outcome);
+        let mut waiting = Box::pin(crate::serve::pd::submit_decode(&mux, imported, now));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), waiting.as_mut())
+                .await
+                .is_err()
+        );
+        drop(receiver);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(outcome.upgrade().is_none());
+        assert_eq!(prefill.serving.aborted.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            prefill.serving.aborted_before_first.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.requests.load(Ordering::Relaxed), 20);
+        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 1);
+        note_dequeued(&rx.try_recv().unwrap(), &metrics);
         drop(rx);
         assert!(matches!(
             mux.submit(test_job()),
@@ -10567,6 +10799,7 @@ mod tests {
                     Instant::now(),
                     None
                 )
+                .await
                 .is_ok());
         }
         assert!(
@@ -10591,19 +10824,22 @@ mod tests {
                 Instant::now(),
                 None
             )
+            .await
             .is_ok());
         assert_eq!(set.stats.retries.load(Ordering::Relaxed), 1);
         state.remove_mux("m#1");
         assert!(state.dp_route(&set, None, None, 0, false).is_none());
         assert!(matches!(
-            state.submit_routed(
-                Some((&set, 0)),
-                None,
-                &stale,
-                test_job(),
-                Instant::now(),
-                None
-            ),
+            state
+                .submit_routed(
+                    Some((&set, 0)),
+                    None,
+                    &stale,
+                    test_job(),
+                    Instant::now(),
+                    None
+                )
+                .await,
             Err(SubmitError::Closed(_))
         ));
     }
@@ -11632,6 +11868,328 @@ mod tests {
         let bundle = ModelBundle::load(&dir).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         bundle
+    }
+
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+    mod seq_pd {
+        use super::*;
+        use crate::serve::engine::SeqEngine;
+        use crate::serve::pd::{KvExport, KvImage, KvImport, Outcome};
+
+        #[derive(Default)]
+        struct Engine {
+            stop: Arc<Vec<u32>>,
+            live: bool,
+            exports: usize,
+            seed: Option<u32>,
+            logits: Vec<f32>,
+            export_fault: bool,
+        }
+
+        impl SeqEngine for Engine {
+            fn logits_row(&self, _: usize, out: &mut Vec<f32>) -> bool {
+                out.extend_from_slice(&self.logits);
+                !self.logits.is_empty()
+            }
+            fn stop_ids(&self) -> &Arc<Vec<u32>> {
+                &self.stop
+            }
+            fn batch(&self) -> usize {
+                1
+            }
+            fn release(&mut self, _: usize) {
+                self.live = false;
+            }
+            fn kv_image_key(&self) -> Option<String> {
+                Some("key".into())
+            }
+            fn export_kv_image(
+                &mut self,
+                _: usize,
+                n: u32,
+                out: &mut crate::serve::pd::KvBytes,
+            ) -> Result<()> {
+                assert!(self.live, "export must precede release");
+                assert_eq!(n, 3);
+                if self.export_fault {
+                    return Err(crate::RuntimeError::DeviceFault { info: fault(true) });
+                }
+                self.exports += 1;
+                *out = vec![42].into();
+                Ok(())
+            }
+            fn import_kv_image(
+                &mut self,
+                _: usize,
+                prompt: &[u32],
+                image: &crate::serve::pd::KvBytes,
+                first: u32,
+            ) -> Result<()> {
+                assert_eq!(prompt, [1, 2, 3]);
+                assert_eq!(&**image, [42]);
+                self.live = true;
+                self.seed = Some(first);
+                Ok(())
+            }
+            fn prefill_turn(&self) -> usize {
+                0
+            }
+            fn advance_prefill_turn(&mut self, _: usize) {
+                unreachable!()
+            }
+            fn prefill_prog_t(&self, _: usize) -> Option<u32> {
+                None
+            }
+            fn packable_prefill_span(&self, _: usize, _: u32) -> Option<packet::dev::PrefillSpan> {
+                None
+            }
+            fn advance_packed_prefill(&mut self, _: &[(usize, &[u32])]) -> Result<()> {
+                unreachable!()
+            }
+            fn prefill_frontier(&self, _: usize) -> Option<usize> {
+                None
+            }
+            fn prefill_chunked_at_most(
+                &mut self,
+                _: usize,
+                _: &[u32],
+                _: u32,
+            ) -> Result<Option<u32>> {
+                unreachable!("import must skip prefill")
+            }
+            fn multistep_quantum(&self, _: &[(usize, u32)], _: usize) -> Option<usize> {
+                None
+            }
+            fn multi_step(
+                &mut self,
+                _: &[(usize, u32)],
+                _: usize,
+                _: &mut Vec<u32>,
+            ) -> Result<usize> {
+                unreachable!()
+            }
+            fn step_batch(&mut self, _: &[(usize, u32)]) -> Result<Vec<(usize, u32)>> {
+                unreachable!()
+            }
+        }
+
+        #[test]
+        fn fatal_export_fault_reaches_tick_and_handoff() {
+            let outcome = Outcome::new(Arc::default(), Instant::now());
+            let (sink, mut image) = KvExport::new(outcome);
+            let mut e = Engine {
+                live: true,
+                export_fault: true,
+                ..Default::default()
+            };
+            let mut tick_fault = None;
+            seq_release_slot(&mut e, 0, &mut [Some((sink, 3))], &mut tick_fault);
+            assert!(tick_fault.unwrap().fatal);
+            assert!(matches!(image.try_recv().unwrap(), Err(error) if error.is_fatal()));
+            assert!(!e.live);
+        }
+
+        #[test]
+        fn handoff_preserves_prefill_logprobs_then_uses_decode_rows() {
+            use crate::text::logprobs::{LogprobRequest, RowStats};
+
+            let bundle = prefill_test_bundle("seq-pd-logprobs");
+            let now = Instant::now();
+            let outcome = Outcome::new(Arc::default(), now);
+            let (sink, mut image) = KvExport::new(outcome.clone());
+            let request = LogprobRequest {
+                top: 20,
+                raw_logits: false,
+            };
+            let mut e = Engine {
+                live: true,
+                logits: vec![0.0; 128],
+                ..Default::default()
+            };
+            e.logits[120] = 3.0;
+            let expected_first = RowStats::of(&e.logits, request).finish(e.logits[120]);
+            let (mut prefill, mut prx) = prefill_test_slot();
+            let s = prefill.as_mut().unwrap();
+            s.gen.max_tokens = 1;
+            s.gen.params.logprobs = Some(request);
+            s.raw_tokens = true;
+            s.export = Some(sink.clone());
+            let token = seq_host_token(&e, 0, &mut prefill, 120);
+            handle_produced_token(&mut prefill, &None, &bundle, token, 1, &mut 0, Some(&[]));
+            seq_release_slot(&mut e, 0, &mut [Some((sink, 3))], &mut None);
+            let StreamChunk::Token { id, logprobs, .. } = prx.try_recv().unwrap() else {
+                panic!("prefill token missing");
+            };
+            assert_eq!(logprobs.as_deref(), Some(&expected_first));
+
+            let (decode, mut drx) = prefill_test_slot();
+            let mut slots = vec![decode];
+            let s = slots[0].as_mut().unwrap();
+            s.gen.max_tokens = 3;
+            s.gen.params.logprobs = Some(request);
+            s.raw_tokens = true;
+            s.import = Some(Box::new(KvImport {
+                image: image.try_recv().unwrap().unwrap(),
+                token: id,
+                logprobs,
+                arrived: now,
+                first: now,
+                outcome,
+                cached_tokens: 0,
+            }));
+            // The importing rank has no logits for token 1.
+            e.logits.clear();
+            seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
+            let StreamChunk::Token { id, logprobs, .. } = drx.try_recv().unwrap() else {
+                panic!("imported token missing");
+            };
+            assert_eq!(id, 120);
+            assert_eq!(logprobs.as_deref(), Some(&expected_first));
+            assert!(slots[0].as_ref().unwrap().lp.is_none());
+            for id in [121, 122] {
+                e.logits = vec![0.0; 128];
+                e.logits[id as usize] = 5.0;
+                let expected = RowStats::of(&e.logits, request).finish(e.logits[id as usize]);
+                let token = seq_host_token(&e, 0, &mut slots[0], id);
+                handle_produced_token(&mut slots[0], &None, &bundle, token, 1, &mut 0, Some(&[]));
+                let StreamChunk::Token {
+                    id: got, logprobs, ..
+                } = drx.try_recv().unwrap()
+                else {
+                    panic!("decode token missing");
+                };
+                assert_eq!(got, id);
+                assert_eq!(logprobs.as_deref(), Some(&expected));
+                assert_ne!(logprobs.as_deref(), Some(&expected_first));
+            }
+            assert!(slots[0].is_none());
+        }
+
+        #[test]
+        fn handoff_streams_the_prefill_token_and_counts_one_request() {
+            let bundle = prefill_test_bundle("seq-pd");
+            let (p, d) = (Arc::new(Metrics::default()), Arc::new(Metrics::default()));
+            let now = Instant::now();
+            let outcome = Outcome::new(p.clone(), now);
+            let (sink, mut image) = KvExport::new(outcome.clone());
+            let mut exports = vec![Some((sink.clone(), 3))];
+            let (mut prefill, mut prx) = prefill_test_slot();
+            let s = prefill.as_mut().unwrap();
+            s.gen.max_tokens = 1;
+            s.raw_tokens = true;
+            s.export = Some(sink);
+            s.telemetry = Some(RequestMetrics::leg(p.clone(), Leg::Prefill, now, now, 3, 1));
+            let mut e = Engine {
+                live: true,
+                ..Default::default()
+            };
+            let mut tokens = 0;
+            handle_produced_token(&mut prefill, &None, &bundle, 120, 1, &mut tokens, Some(&[]));
+            assert!(prefill.is_none());
+            seq_release_slot(&mut e, 0, &mut exports, &mut None);
+            assert_eq!(e.exports, 1);
+            assert!(!e.live);
+            assert!(matches!(
+                prx.try_recv().unwrap(),
+                StreamChunk::Token { id: 120, .. }
+            ));
+            let image = image.try_recv().unwrap().unwrap();
+
+            let (decode, mut drx) = prefill_test_slot();
+            let mut slots = vec![decode];
+            let s = slots[0].as_mut().unwrap();
+            s.gen.max_tokens = 2;
+            s.raw_tokens = true;
+            outcome.settle();
+            s.telemetry = Some(RequestMetrics::leg(
+                d.clone(),
+                Leg::Decode { first: now },
+                now,
+                now,
+                3,
+                2,
+            ));
+            s.import = Some(Box::new(KvImport {
+                image,
+                token: 120,
+                logprobs: None,
+                arrived: now,
+                first: now,
+                outcome,
+                cached_tokens: 2,
+            }));
+            let mut fault = None;
+            seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut fault);
+            let s = slots[0].as_ref().unwrap();
+            assert_eq!((s.step, s.pf_pos, s.cached_tokens), (1, 3, 2));
+            assert_eq!(s.out_ids, [120]);
+            assert!(s.import.is_none());
+            assert_eq!(e.seed, Some(120));
+            assert!(fault.is_none());
+            assert!(matches!(
+                drx.try_recv().unwrap(),
+                StreamChunk::Token { id: 120, .. }
+            ));
+            handle_produced_token(
+                &mut slots[0],
+                &None,
+                &bundle,
+                121,
+                1,
+                &mut tokens,
+                Some(&[]),
+            );
+            assert!(slots[0].is_none());
+            seq_release_slot(&mut e, 0, &mut exports, &mut None);
+            assert_eq!(e.exports, 1);
+            assert_eq!(tokens, 2);
+            let snap =
+                crate::obs::serving::snapshot(&[("m#0".into(), p, true), ("m#1".into(), d, true)]);
+            let m = &snap.models[0];
+            assert_eq!(
+                (m.completed, m.running, m.ttft.count, m.e2e.count),
+                (1, 0, 1, 1)
+            );
+        }
+
+        #[test]
+        fn incompatible_images_fail_without_seeding_and_cancelled_exports_are_skipped() {
+            let bundle = prefill_test_bundle("seq-pd-refuse");
+            for (key, rows) in [("wrong", 3), ("key", 2)] {
+                let (slot, mut rx) = prefill_test_slot();
+                let mut slots = vec![slot];
+                let now = Instant::now();
+                slots[0].as_mut().unwrap().import = Some(Box::new(KvImport {
+                    image: KvImage {
+                        key: key.into(),
+                        rows,
+                        bytes: vec![42].into(),
+                        handoff_started: now,
+                    },
+                    token: 120,
+                    logprobs: None,
+                    arrived: now,
+                    first: now,
+                    outcome: Outcome::new(Arc::default(), now),
+                    cached_tokens: 0,
+                }));
+                let mut e = Engine::default();
+                seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
+                assert!(slots[0].is_none());
+                assert!(e.seed.is_none());
+                assert!(!e.live);
+                assert!(matches!(rx.try_recv().unwrap(), StreamChunk::Err(_)));
+            }
+            let (sink, rx) = KvExport::new(Outcome::new(Arc::default(), Instant::now()));
+            drop(rx);
+            let mut e = Engine {
+                live: true,
+                ..Default::default()
+            };
+            seq_release_slot(&mut e, 0, &mut [Some((sink, 3))], &mut None);
+            assert_eq!(e.exports, 0);
+            assert!(!e.live);
+        }
     }
 
     /// Thinking control on committed ids: a spent budget commits the forced end in place of the

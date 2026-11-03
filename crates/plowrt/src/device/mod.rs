@@ -490,6 +490,11 @@ enum Backing {
 }
 
 impl DeviceMem {
+    pub(crate) fn quarantine(&mut self) {
+        // Unretired DMA may still address this allocation after its engine is dropped.
+        std::mem::forget(std::mem::replace(&mut self.backing, Backing::View));
+    }
+
     /// An owning device-allocation handle (GPU backends): `base` is the device
     /// virtual address returned by the driver allocator; `free` reclaims it on
     /// Drop.
@@ -781,6 +786,22 @@ mod tests {
             "owner frees exactly once"
         );
         assert_eq!(f.last_base.load(Ordering::SeqCst), 0x1000);
+    }
+
+    #[test]
+    fn quarantined_allocation_keeps_storage_and_address_live() {
+        let f = Arc::new(CountingFree {
+            count: AtomicUsize::new(0),
+            last_base: AtomicUsize::new(0),
+        });
+        let mut owner = DeviceMem::owned(0x1000, 256, f.clone());
+        let evidence = owner.subview(0, 64).unwrap();
+        owner.quarantine();
+        assert_eq!(owner.base, 0x1000);
+        assert_eq!(owner.len, 256);
+        drop(owner);
+        assert_eq!(f.count.load(Ordering::SeqCst), 0);
+        assert!(evidence.allocation_evidence().is_some());
     }
 
     #[test]

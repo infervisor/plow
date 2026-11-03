@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SamplingFields {
     #[serde(default)]
+    pub prompt_logprobs: Option<serde_json::Value>,
+    #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
@@ -74,6 +76,12 @@ impl SamplingFields {
     /// falls through the greedy branch into a scaled softmax with an inverted
     /// sign.
     pub fn validate(&self) -> Result<(), ParamError> {
+        if self.prompt_logprobs.is_some() {
+            return Err(ParamError {
+                field: "prompt_logprobs",
+                message: "prompt logprobs are not supported".into(),
+            });
+        }
         range(self.temperature, "temperature", 0.0, 2.0, false)?;
         let top_p_lo_open = self.temperature != Some(0.0);
         range(self.top_p, "top_p", 0.0, 1.0, top_p_lo_open)?;
@@ -727,6 +735,16 @@ mod tests {
         assert_eq!(
             req.sampling.stop_token_ids.as_deref(),
             Some(&[11u32, 22][..])
+        );
+    }
+
+    #[test]
+    fn prompt_logprobs_are_refused_instead_of_silently_omitted() {
+        let req: CompletionRequest =
+            serde_json::from_str(r#"{"model":"m","prompt":"hello","prompt_logprobs":20}"#).unwrap();
+        assert_eq!(
+            req.sampling.validate().err().unwrap().field,
+            "prompt_logprobs"
         );
     }
 

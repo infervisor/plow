@@ -751,7 +751,7 @@ impl AppState {
     /// Submit `job` to `mux`, the dispatcher of `set`'s rank `rank` when routed data-parallel. A
     /// rank that has closed or is full hands the same job (tokens and prefix key included) to
     /// another rank.
-    pub(crate) fn submit_routed(
+    pub(crate) async fn submit_routed(
         &self,
         routed: Option<(&dp::DpSet, usize)>,
         session: Option<&str>,
@@ -764,7 +764,7 @@ impl AppState {
             return mux.submit_arrived(job, arrived, ingress);
         };
         if set.pd.is_some() && pd::eligible(&job) {
-            return pd::submit(self, set, mux, job, arrived, ingress);
+            return pd::submit(self, set, mux, job, arrived, ingress).await;
         }
         let mut exclude = 0u32;
         let mut next: Option<mux::ModelMux> = None;

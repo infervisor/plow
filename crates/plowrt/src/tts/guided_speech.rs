@@ -1111,6 +1111,7 @@ impl GuidedSpeech {
                 mm: None,
                 export: None,
                 import: None,
+                prompt_logprobs: false,
             },
         })
     }

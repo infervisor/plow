@@ -442,6 +442,7 @@ async fn completions_with(
         arrived: std::time::Instant::now(),
         respond: tx,
         opts: crate::serve::mux::JobOpts {
+            prompt_logprobs: req.sampling.prompt_logprobs.is_some(),
             session,
             turn: run.key(),
             continuing: run.continuing(),
@@ -454,14 +455,17 @@ async fn completions_with(
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
     }
-    if let Err(err) = state.submit_routed(
-        dp.map(|s| (&**s, rank)),
-        ids.session.as_deref(),
-        mux,
-        job,
-        t_arrive,
-        ingress,
-    ) {
+    if let Err(err) = state
+        .submit_routed(
+            dp.map(|s| (&**s, rank)),
+            ids.session.as_deref(),
+            mux,
+            job,
+            t_arrive,
+            ingress,
+        )
+        .await
+    {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 let mut r = crate::serve::api_error(

@@ -707,6 +707,8 @@ pub struct CudaBackend {
     slab_pool: Mutex<Vec<(u64, u64)>>,
     /// Snapshot spill copies ([`CopyTier`]); `None` until the first spill.
     copy_tier: Mutex<Option<CopyTier>>,
+    #[cfg(target_os = "linux")]
+    stage_fences: super::host_region::StageFences,
     /// `plow_small_copy`: engine copies up to [`SMALL_COPY_MAX`] bytes between device and pinned
     /// host memory run on the SMs, never queued behind bulk copies on a copy engine.
     small_copy: Option<KernelFn>,
@@ -987,6 +989,8 @@ impl CudaBackend {
                 next_module: AtomicU64::new(1),
                 slab_pool: Mutex::new(Vec::new()),
                 copy_tier: Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                stage_fences: Default::default(),
                 vmm_provenance: Mutex::new(super::provenance::VmmProvenance::default()),
                 poisoned,
                 small_copy: None,
@@ -1386,6 +1390,13 @@ impl CudaBackend {
     /// Has a fatal driver status permanently poisoned this context?
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.get().is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn quarantine_staging(&self, error: &RuntimeError) -> RuntimeError {
+        let info = super::host_region::unretired_copy(error);
+        self.mark_poisoned(&info);
+        RuntimeError::DeviceFault { info }
     }
 
     /// Record the fault that killed the context. Logs `error!` exactly once —
@@ -2551,15 +2562,33 @@ impl super::host_region::HostStaging for CudaBackend {
     }
 
     fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64> {
-        crate::memory::vmm::VmmOps::copy_dtoh_async(self, host, src, bytes)
+        self.stage_fences
+            .submit(|_| crate::memory::vmm::VmmOps::copy_dtoh_async(self, host, src, bytes))
     }
 
     fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64> {
-        crate::memory::vmm::VmmOps::copy_htod_async(self, dst, host, bytes)
+        self.stage_fences.submit(|_| {
+            self.bind()?;
+            let mut tier = self.copy_tier.lock();
+            let tier = self.copy_tier_mut(&mut tier)?;
+            // Staging uses one ordered stream in both directions.
+            self.copy_fenced(
+                tier,
+                CopyDir::Spill,
+                "cuMemcpyHtoDAsync(staging)",
+                |s| unsafe {
+                    (self.api.cuMemcpyHtoDAsync_v2)(dst, host as *const c_void, bytes as usize, s)
+                },
+            )
+        })
     }
 
     fn stage_wait(&self, fence: u64) -> Result<()> {
-        crate::memory::vmm::VmmOps::fence_wait(self, fence)
+        self.stage_fences.wait(
+            fence,
+            |f| crate::memory::vmm::VmmOps::fence_wait(self, f),
+            |f| crate::memory::vmm::VmmOps::fence_done(self, f),
+        )
     }
 }
 
