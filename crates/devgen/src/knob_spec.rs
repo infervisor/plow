@@ -1679,6 +1679,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     // plowc `--emit devblob+cubin`: the toolkit nvcc (the dev shell exports it); toolchain, not a
     // numerics knob.
     KnobSpec::new("env.PLOW_NVCC", Some("PLOW_NVCC"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_HIPCC", Some("PLOW_HIPCC"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_NVCC_PATH", Some("PLOW_NVCC_PATH"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_PACKED_PREFILL_CONSUMERS", Some("PLOW_PACKED_PREFILL_CONSUMERS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY", Some("PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
