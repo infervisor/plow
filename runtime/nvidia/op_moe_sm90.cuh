@@ -295,6 +295,8 @@ MOE90_FN void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
             if (fetch < ksteps) stage(fetch, fetch % MOE90_GLU_STAGES);
             sm90_cp_commit();
             sm90_cp_wait<MOE90_GLU_STAGES - 1>();
+            /* cp.async writes through the generic proxy; wgmma reads through the async proxy. */
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             const int cb = ks % MOE90_GLU_STAGES;
             moe90_wgmma_k(accg, As + cb * MOE90_ABUF, Bgs0 + bsel * bset + cb * MOE90_BBUF, wg,
@@ -403,6 +405,7 @@ MOE90_FN void d_moe_group_down_gemma_pf(float* __restrict__ part,
             if (ks + 1 < ksteps) stage(ks + 1, (ks + 1) % MOE90_STAGES);
             sm90_cp_commit();
             sm90_cp_wait<1>();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             const int cb = ks % MOE90_STAGES;
             moe90_wgmma_k(acc, As + cb * MOE90_ABUF,
@@ -425,6 +428,7 @@ MOE90_FN void d_moe_group_down_gemma_pf(float* __restrict__ part,
             if (fetch < ksteps) stage(fetch, fetch % MOE90_DN_STAGES);
             sm90_cp_commit();
             sm90_cp_wait<MOE90_DN_STAGES - 1>();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             const int cb = ks % MOE90_DN_STAGES;
 #if MOE90_DOWN_N256
@@ -569,6 +573,7 @@ static __device__ void moe90_router_gemma_pf(unsigned char* __restrict__ table,
             if (fetch < ksteps) stage(fetch, fetch % MOE90_STAGES);
             sm90_cp_commit();
             sm90_cp_wait<MOE90_STAGES - 1>();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             const int cb = ks % MOE90_STAGES;
             moe90_wgmma_k(acc, As + cb * MOE90_ABUF, Bs + cb * MOE90_BBUF, wg);
@@ -704,6 +709,7 @@ static __device__ void d_moe_group_glu_gemma_pf_w8a8(
             if (fetch < ksteps) stage(fetch, fetch % MOE90_GLU_STAGES);
             sm90_cp_commit();
             sm90_cp_wait<MOE90_GLU_STAGES - 1>();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             const int cb = ks % MOE90_GLU_STAGES;
             moe90_wgmma8_k(accg, As + cb * MOE90_A8BUF, Bg + cb * MOE90_B8BUF, wg);
@@ -785,6 +791,7 @@ static __device__ void d_moe_group_down_gemma_pf_w8a8(
             if (fetch < ksteps) stage(fetch, fetch % MOE90_STAGES);
             sm90_cp_commit();
             sm90_cp_wait<MOE90_STAGES - 1>();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             const int cb = ks % MOE90_STAGES;
             moe90_wgmma8_k(acc, As + cb * MOE90_A8BUF, Bs + cb * MOE90_B8BUF, wg);

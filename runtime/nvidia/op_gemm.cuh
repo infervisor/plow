@@ -2068,6 +2068,8 @@ static __device__ void d_gemm_w8a8_m1_pipe_sm90(__nv_bfloat16* C, const uint8_t*
             }
             sm90_cp_commit();
             sm90_cp_wait<1>();
+            /* cp.async writes through the generic proxy; wgmma reads through the async proxy. */
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             if (tid < 128) {
                 uint8_t* current = base + (step & 1) * 4608;
@@ -2153,6 +2155,7 @@ static __device__ void d_gemm_w8a8_m1_sm90(__nv_bfloat16* C, const uint8_t* A,
             sm90_cp_commit();
             sm90_cp_wait<0>();
         }
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncthreads();
     }
 #endif
@@ -2167,6 +2170,7 @@ static __device__ void d_gemm_w8a8_m1_sm90(__nv_bfloat16* C, const uint8_t* A,
             }
             sm90_cp_commit();
             sm90_cp_wait<0>();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             if (tid < 128) {
                 sm90_wg_fence();
@@ -2281,6 +2285,7 @@ static __device__ void d_gemm_w8a8_m1_tma_sm90(__nv_bfloat16* C, const uint8_t* 
             sm90_cp_commit();
             sm90_cp_wait<0>();
         }
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncthreads();
     }
     for (unsigned row0 = first; row0 < end; row0 += stride) {
