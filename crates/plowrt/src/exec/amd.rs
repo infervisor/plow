@@ -20431,6 +20431,10 @@ impl AmdEngine {
         self.progs[p].seg_class.len()
     }
 
+    pub fn prefill_launches(&self, p: usize) -> usize {
+        self.prog_dispatch(p).launches()
+    }
+
     /// Ordered host launches and their device-side XCD queue layout.
     pub(crate) fn segment_ops(&self, p: usize, seg: usize) -> &str {
         self.progs[p].seg_ops.get(seg).map_or("", String::as_str)

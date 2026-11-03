@@ -475,6 +475,9 @@ enum Cmd {
         /// two precisions.
         #[arg(long)]
         dump: Option<PathBuf>,
+        /// Save bounded tensor prefixes after each ordered prefill launch.
+        #[arg(long, requires = "dump", conflicts_with_all = ["input_dir", "list_tensors"])]
+        dump_segments: bool,
         /// Raw BF16 act.x.bin and carried-state tensor files for an act.x-only block.
         #[arg(long)]
         input_dir: Option<PathBuf>,
@@ -1759,6 +1762,7 @@ async fn async_main(
             inspect,
             list_tensors,
             dump,
+            dump_segments,
             input_dir,
             ctx,
             repeat,
@@ -1776,7 +1780,16 @@ async fn async_main(
                         "block timing requires --input-dir with captured block operands".into(),
                     );
                 }
-                amd_block(blob, hsaco, checkpoint, prompt, inspect, list_tensors, dump)
+                amd_block(
+                    blob,
+                    hsaco,
+                    checkpoint,
+                    prompt,
+                    inspect,
+                    list_tensors,
+                    dump,
+                    dump_segments,
+                )
             }
         }
         #[cfg(not(feature = "hsa"))]
@@ -1993,6 +2006,35 @@ mod amd_bench_cli_tests {
                 "0",
             ])
             .is_err());
+        }
+    }
+
+    #[test]
+    fn amd_segment_dump_requires_destination_and_rejects_other_modes() {
+        let base = [
+            "plowrt",
+            "amd-block",
+            "--blob",
+            "model.pkt",
+            "--hsaco",
+            "hsaco",
+        ];
+        for (extra, valid) in [
+            (vec!["--dump-segments"], false),
+            (vec!["--dump-segments", "--dump", "out"], true),
+            (
+                vec!["--dump-segments", "--dump", "out", "--list-tensors"],
+                false,
+            ),
+            (
+                vec!["--dump-segments", "--dump", "out", "--input-dir", "in"],
+                false,
+            ),
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(base.into_iter().chain(extra)).is_ok(),
+                valid
+            );
         }
     }
 
@@ -3237,6 +3279,7 @@ fn amd_block(
     inspect: String,
     list_tensors: bool,
     dump: Option<PathBuf>,
+    dump_segments: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd::AmdEngine;
 
@@ -3293,7 +3336,16 @@ fn amd_block(
         .split(',')
         .map(|s| s.trim().parse::<u32>())
         .collect::<std::result::Result<_, _>>()?;
-    let tok = eng.prefill(&ids)?;
+    let tok = if dump_segments {
+        amd_block_cmd::dump_prefill_segments(
+            &mut eng,
+            &ids,
+            &inspect,
+            dump.as_deref().expect("clap requires --dump"),
+        )?
+    } else {
+        eng.prefill(&ids)?
+    };
     println!("prefill {} tokens -> sampled id {tok}", ids.len());
 
     // ZERO vs WRONG is the whole question and the two are different hunts. A
