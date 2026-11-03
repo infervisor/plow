@@ -244,6 +244,7 @@ pub struct Job {
 #[derive(Default)]
 pub struct JobOpts {
     pub class: JobClass,
+    pub prompt_logprobs: bool,
     /// Stream token ids only: no detokenization, and a consumer that falls behind is parked
     /// (not fed) instead of cut, up to [`PARK_TIMEOUT`].
     pub raw_tokens: bool,
@@ -7648,6 +7649,7 @@ fn gpu_seat_imports(
         }
         s.pf_pos = s.prompt_ids.len();
         s.cached_tokens = import.cached_tokens;
+        s.lp = import.logprobs;
         let pd_handoff_ms = import.image.handoff_ms();
         tracing::debug!(slot = i, pd_handoff_ms, "cuda: P/D image seated");
         disconnected[i] |= handle_produced_token(
@@ -7674,7 +7676,7 @@ fn gpu_export_slot(
         .kv_image_key()
         .ok_or_else(|| crate::RuntimeError::Rejected("P/D: this packet has no KV image".into()))?;
     let rows = e.slot_pos(slot) as u32;
-    let mut bytes = Vec::new();
+    let mut bytes = crate::serve::pd::KvBytes::default();
     e.export_kv_image(slot, rows, &mut bytes)?;
     Ok(crate::serve::pd::KvImage {
         key,
@@ -7697,7 +7699,7 @@ fn seq_release_slot(
                 let key = e.kv_image_key().ok_or_else(|| {
                     crate::RuntimeError::Rejected("P/D: this packet has no KV image".into())
                 })?;
-                let mut bytes = Vec::new();
+                let mut bytes = crate::serve::pd::KvBytes::default();
                 e.export_kv_image(slot, rows, &mut bytes)?;
                 Ok(crate::serve::pd::KvImage {
                     key,
@@ -7753,6 +7755,7 @@ fn seq_seat_imports(
         }
         s.pf_pos = s.prompt_ids.len();
         s.cached_tokens = import.cached_tokens;
+        s.lp = import.logprobs;
         let pd_handoff_ms = import.image.handoff_ms();
         tracing::debug!(slot = i, pd_handoff_ms, "seq: P/D image seated");
         handle_produced_token(
@@ -11753,9 +11756,14 @@ mod tests {
             live: bool,
             exports: usize,
             seed: Option<u32>,
+            logits: Vec<f32>,
         }
 
         impl SeqEngine for Engine {
+            fn logits_row(&self, _: usize, out: &mut Vec<f32>) -> bool {
+                out.extend_from_slice(&self.logits);
+                !self.logits.is_empty()
+            }
             fn stop_ids(&self) -> &Arc<Vec<u32>> {
                 &self.stop
             }
@@ -11768,22 +11776,27 @@ mod tests {
             fn kv_image_key(&self) -> Option<String> {
                 Some("key".into())
             }
-            fn export_kv_image(&mut self, _: usize, n: u32, out: &mut Vec<u8>) -> Result<()> {
+            fn export_kv_image(
+                &mut self,
+                _: usize,
+                n: u32,
+                out: &mut crate::serve::pd::KvBytes,
+            ) -> Result<()> {
                 assert!(self.live, "export must precede release");
                 assert_eq!(n, 3);
                 self.exports += 1;
-                *out = vec![42];
+                *out = vec![42].into();
                 Ok(())
             }
             fn import_kv_image(
                 &mut self,
                 _: usize,
                 prompt: &[u32],
-                image: &[u8],
+                image: &crate::serve::pd::KvBytes,
                 first: u32,
             ) -> Result<()> {
                 assert_eq!(prompt, [1, 2, 3]);
-                assert_eq!(image, [42]);
+                assert_eq!(&**image, [42]);
                 self.live = true;
                 self.seed = Some(first);
                 Ok(())
@@ -11828,6 +11841,85 @@ mod tests {
             fn step_batch(&mut self, _: &[(usize, u32)]) -> Result<Vec<(usize, u32)>> {
                 unreachable!()
             }
+        }
+
+        #[test]
+        fn handoff_preserves_prefill_logprobs_then_uses_decode_rows() {
+            use crate::text::logprobs::{LogprobRequest, RowStats};
+
+            let bundle = prefill_test_bundle("seq-pd-logprobs");
+            let now = Instant::now();
+            let outcome = Outcome::new(Arc::default(), now);
+            let (sink, mut image) = KvExport::new(outcome.clone());
+            let request = LogprobRequest {
+                top: 20,
+                raw_logits: false,
+            };
+            let mut e = Engine {
+                live: true,
+                logits: vec![0.0; 128],
+                ..Default::default()
+            };
+            e.logits[120] = 3.0;
+            let expected_first = RowStats::of(&e.logits, request).finish(e.logits[120]);
+            let (mut prefill, mut prx) = prefill_test_slot();
+            let s = prefill.as_mut().unwrap();
+            s.gen.max_tokens = 1;
+            s.gen.params.logprobs = Some(request);
+            s.raw_tokens = true;
+            s.export = Some(sink.clone());
+            let token = seq_host_token(&e, 0, &mut prefill, 120);
+            handle_produced_token(
+                &mut prefill, &None, &bundle, token, 1, &mut 0, Some(&[]),
+            );
+            seq_release_slot(&mut e, 0, &mut [Some((sink, 3))]);
+            let StreamChunk::Token { id, logprobs, .. } = prx.try_recv().unwrap() else {
+                panic!("prefill token missing");
+            };
+            assert_eq!(logprobs.as_deref(), Some(&expected_first));
+
+            let (decode, mut drx) = prefill_test_slot();
+            let mut slots = vec![decode];
+            let s = slots[0].as_mut().unwrap();
+            s.gen.max_tokens = 3;
+            s.gen.params.logprobs = Some(request);
+            s.raw_tokens = true;
+            s.import = Some(Box::new(KvImport {
+                image: image.try_recv().unwrap().unwrap(),
+                token: id,
+                logprobs,
+                arrived: now,
+                first: now,
+                outcome,
+                cached_tokens: 0,
+            }));
+            // The importing rank has no logits for token 1.
+            e.logits.clear();
+            seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
+            let StreamChunk::Token { id, logprobs, .. } = drx.try_recv().unwrap() else {
+                panic!("imported token missing");
+            };
+            assert_eq!(id, 120);
+            assert_eq!(logprobs.as_deref(), Some(&expected_first));
+            assert!(slots[0].as_ref().unwrap().lp.is_none());
+            for id in [121, 122] {
+                e.logits = vec![0.0; 128];
+                e.logits[id as usize] = 5.0;
+                let expected = RowStats::of(&e.logits, request).finish(e.logits[id as usize]);
+                let token = seq_host_token(&e, 0, &mut slots[0], id);
+                handle_produced_token(
+                    &mut slots[0], &None, &bundle, token, 1, &mut 0, Some(&[]),
+                );
+                let StreamChunk::Token {
+                    id: got, logprobs, ..
+                } = drx.try_recv().unwrap() else {
+                    panic!("decode token missing");
+                };
+                assert_eq!(got, id);
+                assert_eq!(logprobs.as_deref(), Some(&expected));
+                assert_ne!(logprobs.as_deref(), Some(&expected_first));
+            }
+            assert!(slots[0].is_none());
         }
 
         #[test]
@@ -11877,6 +11969,7 @@ mod tests {
             s.import = Some(Box::new(KvImport {
                 image,
                 token: 120,
+                logprobs: None,
                 arrived: now,
                 first: now,
                 outcome,
@@ -11927,10 +12020,11 @@ mod tests {
                     image: KvImage {
                         key: key.into(),
                         rows,
-                        bytes: vec![42],
+                        bytes: vec![42].into(),
                         handoff_started: now,
                     },
                     token: 120,
+                    logprobs: None,
                     arrived: now,
                     first: now,
                     outcome: Outcome::new(Arc::default(), now),

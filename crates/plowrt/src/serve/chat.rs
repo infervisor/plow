@@ -856,6 +856,7 @@ async fn chat_completions_with(
         arrived: std::time::Instant::now(),
         respond: tx,
         opts: crate::serve::mux::JobOpts {
+            prompt_logprobs: req.sampling.prompt_logprobs.is_some(),
             session,
             turn: run.key(),
             continuing: run.continuing(),

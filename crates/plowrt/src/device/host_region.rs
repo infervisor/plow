@@ -34,7 +34,115 @@ pub trait HostStaging: Send + Sync {
     fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64>;
     /// Queue `bytes` from registered host address `host` into device address `dst`.
     fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64>;
+    /// Wait for and retire all copies queued by this thread through `fence` (the last fence).
+    /// A batch must be submitted and waited on by the same thread.
     fn stage_wait(&self, fence: u64) -> Result<()>;
+}
+
+#[derive(Default)]
+pub(crate) struct StageFences {
+    pending: parking_lot::Mutex<std::collections::HashMap<std::thread::ThreadId, Vec<u64>>>,
+}
+
+impl StageFences {
+    pub(crate) fn submit(&self, copy: impl FnOnce(Option<u64>) -> Result<u64>) -> Result<u64> {
+        let mut pending = self.pending.lock();
+        let fences = pending.entry(std::thread::current().id()).or_default();
+        let fence = copy(fences.last().copied())?;
+        fences.push(fence);
+        Ok(fence)
+    }
+
+    pub(crate) fn wait(
+        &self,
+        fence: u64,
+        wait: impl FnOnce(u64) -> Result<()>,
+        mut retire: impl FnMut(u64) -> Result<bool>,
+    ) -> Result<()> {
+        let mut pending = self.pending.lock();
+        let id = std::thread::current().id();
+        if pending.get(&id).and_then(|f| f.last()) != Some(&fence) {
+            return Err(RuntimeError::Device(
+                "staging: not this thread's last fence".into(),
+            ));
+        }
+        let mut fences = pending.remove(&id).expect("checked above");
+        drop(pending);
+        fences.pop();
+        wait(fence)?;
+        for earlier in fences {
+            if !retire(earlier)? {
+                return Err(RuntimeError::Device(
+                    "staging: unordered copy completion".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+static IMAGE_REGIONS: parking_lot::Mutex<Vec<HostRegion>> = parking_lot::Mutex::new(Vec::new());
+
+/// Pre-register two slabs before serving or timing a handoff. Registrations cover all devices
+/// of each supplied driver. An unavailable slab never prevents a pageable image export.
+pub fn prepare_image_pool(bytes: usize, drivers: &[Arc<dyn HostStaging>]) -> Result<()> {
+    let mut regions = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let mut region = HostRegion::new(bytes)?;
+        for driver in drivers {
+            region.register(Arc::clone(driver))?;
+        }
+        regions.push(region);
+    }
+    *IMAGE_REGIONS.lock() = regions;
+    Ok(())
+}
+
+pub struct RegionLease {
+    region: Option<HostRegion>,
+    len: usize,
+    ready: std::sync::atomic::AtomicBool,
+}
+
+impl RegionLease {
+    pub(crate) fn take(len: usize, vendor: Vendor) -> Option<Self> {
+        let mut pool = IMAGE_REGIONS.try_lock()?;
+        let i = pool
+            .iter()
+            .position(|r| r.len() >= len && r.alias(vendor).is_some())?;
+        Some(Self {
+            region: Some(pool.swap_remove(i)),
+            len,
+            ready: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    pub(crate) fn alias(&self, vendor: Vendor) -> Option<u64> {
+        self.region.as_ref()?.alias(vendor)
+    }
+
+    pub(crate) fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        assert!(self.ready.load(std::sync::atomic::Ordering::Acquire));
+        // SAFETY: the exclusive lease is readable only after all DMA has completed.
+        unsafe { self.region.as_ref().expect("live lease").slice(0, self.len) }
+    }
+}
+
+impl Drop for RegionLease {
+    fn drop(&mut self) {
+        if let Some(region) = self.region.take() {
+            if *self.ready.get_mut() {
+                IMAGE_REGIONS.lock().push(region);
+            } else {
+                // A failed fence cannot prove DMA stopped. Never reuse or unmap these pages.
+                std::mem::forget(region);
+            }
+        }
+    }
 }
 
 const ALIGN: usize = 2 << 20;
@@ -321,6 +429,138 @@ fn transfers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_chains_copies_and_retires_only_after_the_last_wait() {
+        let batch = StageFences::default();
+        batch.submit(|prev| {
+            assert_eq!(prev, None);
+            Ok(1)
+        }).unwrap();
+        batch.submit(|prev| {
+            assert_eq!(prev, Some(1));
+            Ok(2)
+        }).unwrap();
+        let waited = std::cell::Cell::new(false);
+        batch.wait(
+            2,
+            |last| {
+                assert_eq!(last, 2);
+                waited.set(true);
+                Ok(())
+            },
+            |earlier| {
+                assert!(waited.get());
+                assert_eq!(earlier, 1);
+                Ok(true)
+            },
+        ).unwrap();
+        batch.submit(|prev| {
+            assert_eq!(prev, None);
+            Ok(3)
+        }).unwrap();
+        // A rejected enqueue leaves the earlier work available to drain.
+        assert!(batch
+            .submit(|_| Err(RuntimeError::Device("copy refused".into())))
+            .is_err());
+        batch.wait(3, |_| Ok(()), |_| unreachable!()).unwrap();
+    }
+
+    #[test]
+    fn staged_images_use_driver_aliases_wait_once_and_reuse_leases() {
+        use crate::exec::kv_image::{ImageSpan, KvBytes};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Driver {
+            vendor: hwspec::Vendor,
+            bias: u64,
+            registrations: AtomicUsize,
+            waits: AtomicUsize,
+            copies: parking_lot::Mutex<Vec<(u64, u64, u64)>>,
+        }
+        impl HostStaging for Driver {
+            fn staging_vendor(&self) -> hwspec::Vendor {
+                self.vendor
+            }
+            unsafe fn host_register(&self, ptr: *mut u8, _: usize) -> Result<u64> {
+                self.registrations.fetch_add(1, Ordering::Relaxed);
+                Ok(ptr as u64 + self.bias)
+            }
+            unsafe fn host_unregister(&self, _: *mut u8) {}
+            fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64> {
+                let mut copies = self.copies.lock();
+                copies.push((host - self.bias, src, bytes));
+                Ok(copies.len() as u64)
+            }
+            fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64> {
+                let mut copies = self.copies.lock();
+                copies.push((dst, host - self.bias, bytes));
+                Ok(copies.len() as u64)
+            }
+            fn stage_wait(&self, last: u64) -> Result<()> {
+                let mut copies = self.copies.lock();
+                assert_eq!(last, copies.len() as u64);
+                self.waits.fetch_add(1, Ordering::Relaxed);
+                for (dst, src, bytes) in copies.drain(..) {
+                    // SAFETY: the test keeps both disjoint buffers alive until this wait.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src as *const u8,
+                            dst as *mut u8,
+                            bytes as usize,
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+        let driver = |vendor, bias| {
+            Arc::new(Driver {
+                vendor,
+                bias,
+                registrations: AtomicUsize::new(0),
+                waits: AtomicUsize::new(0),
+                copies: Default::default(),
+            })
+        };
+        let nv = driver(hwspec::Vendor::Nvidia, 0);
+        let amd = driver(hwspec::Vendor::Amd, 4096);
+        prepare_image_pool(16, &[nv.clone(), amd.clone()]).unwrap();
+        let mut image = KvBytes::default();
+        image.prepare(16, hwspec::Vendor::Nvidia);
+        let mut held = KvBytes::default();
+        held.prepare(16, hwspec::Vendor::Amd);
+        let mut fallback = KvBytes::default();
+        fallback.prepare(16, hwspec::Vendor::Nvidia);
+        assert!(image.is_staged() && held.is_staged());
+        assert!(!fallback.is_staged());
+        let source: Vec<u8> = (0..16).collect();
+        let mut dest = vec![0u8; 16];
+        let spans: Vec<_> = [0, 8]
+            .into_iter()
+            .map(|off| ImageSpan {
+                handle: 0,
+                native_off: off,
+                image_off: off,
+                bytes: 8,
+            })
+            .collect();
+        let src = [crate::device::DeviceMem::view(source.as_ptr() as u64, 16)];
+        let dst = [crate::device::DeviceMem::view(dest.as_mut_ptr() as u64, 16)];
+        assert!(image.transfer(&*nv, &spans, &src, true).unwrap());
+        assert_eq!(&*image, source.as_slice());
+        assert!(image.transfer(&*amd, &spans, &dst, false).unwrap());
+        assert_eq!(dest, source);
+        assert_eq!(nv.waits.load(Ordering::Relaxed), 1);
+        assert_eq!(amd.waits.load(Ordering::Relaxed), 1);
+        drop(image);
+        fallback.prepare(16, hwspec::Vendor::Nvidia);
+        assert!(fallback.is_staged());
+        assert_eq!(nv.registrations.load(Ordering::Relaxed), 2);
+        assert_eq!(amd.registrations.load(Ordering::Relaxed), 2);
+        drop((fallback, held));
+        IMAGE_REGIONS.lock().clear();
+    }
 
     #[test]
     fn region_is_aligned_rounded_and_zeroed() {

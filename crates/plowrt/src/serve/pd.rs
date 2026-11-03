@@ -21,12 +21,14 @@ use crate::serve::stream::{self, FinishReason, StreamChunk};
 use crate::serve::AppState;
 use crate::RuntimeError;
 
+pub use crate::exec::kv_image::KvBytes;
+
 /// One slot's canonical KV image.
 pub struct KvImage {
     /// The exporting engine's key: its caches' semantic header.
     pub key: String,
     pub rows: u32,
-    pub bytes: Vec<u8>,
+    pub bytes: KvBytes,
     pub handoff_started: Instant,
 }
 
@@ -78,6 +80,7 @@ impl KvExport {
 pub struct KvImport {
     pub image: KvImage,
     pub token: u32,
+    pub logprobs: Option<Box<crate::text::logprobs::TokenLogprobs>>,
     /// The request's arrival, and when the prefill rank streamed the first token: the decode
     /// rank's e2e and SLO count from them.
     pub arrived: Instant,
@@ -138,17 +141,7 @@ pub fn kv_header(
     dir: &std::path::Path,
     digests: &mut std::collections::HashMap<std::path::PathBuf, String>,
 ) -> Result<plow_asset::kv_image::Header, String> {
-    use crate::asset::devblob::DevBlob;
-    let pkt = DevBlob::find_in_dir(dir)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no packet in {}", dir.display()))?;
-    let raw = std::fs::read(&pkt).map_err(|e| format!("{}: {e}", pkt.display()))?;
-    let blob = DevBlob::parse_l2(&raw, true).map_err(|e| e.to_string())?;
-    let manifest =
-        match crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw).map_err(|e| e.to_string())? {
-            Some(m) => m,
-            None => blob.with_packet_view(plow_asset::live_kv::emit)?,
-        };
+    let (blob, manifest) = kv_packet(dir)?;
     let ckpt = crate::asset::serve::checkpoint_dir(dir);
     let ckpt = ckpt.canonicalize().unwrap_or(ckpt);
     let weights = match digests.get(&ckpt) {
@@ -160,6 +153,30 @@ pub fn kv_header(
         }
     };
     blob.with_packet_view(|p| plow_asset::kv_image::derive(p, &manifest, weights))
+}
+
+fn kv_packet(
+    dir: &std::path::Path,
+) -> Result<(crate::asset::devblob::DevBlob, plow_asset::live_kv::Manifest), String> {
+    use crate::asset::devblob::DevBlob;
+    let pkt = DevBlob::find_in_dir(dir)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no packet in {}", dir.display()))?;
+    let raw = std::fs::read(&pkt).map_err(|e| format!("{}: {e}", pkt.display()))?;
+    let blob = DevBlob::parse_l2(&raw, true).map_err(|e| e.to_string())?;
+    let manifest =
+        match crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw).map_err(|e| e.to_string())? {
+            Some(m) => m,
+            None => blob.with_packet_view(plow_asset::live_kv::emit)?,
+        };
+    Ok((blob, manifest))
+}
+
+pub fn kv_image_capacity(dir: &std::path::Path, rows: Option<u32>) -> Result<usize, String> {
+    let (_, manifest) = kv_packet(dir)?;
+    let (_, bytes) = crate::exec::kv_image::plan(&manifest, 0, rows.unwrap_or(manifest.max_ctx))
+        .map_err(|e| e.to_string())?;
+    usize::try_from(bytes).map_err(|e| e.to_string())
 }
 
 /// `--pd` startup check: every rank's KV image header (`headers[r]`, rank `r`'s bundle) equals
@@ -235,7 +252,7 @@ pub fn parse_pd(entries: &[String]) -> Result<Vec<(String, PdSpec)>, String> {
 }
 
 /// Whether `job` can run disaggregated: plain text, no host-side per-token state the decode rank
-/// would lose (logprobs, a retained session, media rows).
+/// would lose (prompt logprobs, a retained session, media rows).
 pub(crate) fn eligible(job: &Job) -> bool {
     let o = &job.opts;
     o.speech.is_none()
@@ -244,7 +261,7 @@ pub(crate) fn eligible(job: &Job) -> bool {
         && o.turn.is_none()
         && o.export.is_none()
         && o.import.is_none()
-        && job.gen.params.logprobs.is_none()
+        && !o.prompt_logprobs
 }
 
 /// Submit `job`, routed to `set`'s prefill rank `mux`, through the P/D flow when the set has
@@ -323,10 +340,10 @@ pub(crate) fn submit(
                 _ = job.respond.closed() => return,
             };
             match chunk {
-                Some(StreamChunk::Token { id, .. })
+                Some(StreamChunk::Token { id, logprobs, .. })
                     if first.is_none() && id != stream::TEXT_ONLY =>
                 {
-                    first = Some((id, Instant::now()))
+                    first = Some((id, Instant::now(), logprobs))
                 }
                 Some(StreamChunk::Done {
                     reason: FinishReason::Preempted,
@@ -355,7 +372,7 @@ pub(crate) fn submit(
             i = image => i,
             _ = job.respond.closed() => return,
         };
-        let image = match (first, image) {
+        let image = match (&first, image) {
             (Some(_), Ok(Ok(image))) => image,
             (None, _) => {
                 let msg = "P/D: the prefill rank produced no token".into();
@@ -383,10 +400,11 @@ pub(crate) fn submit(
             let msg = "P/D: the decode rank has no dispatcher".into();
             return fail(&job, &outcome, msg);
         };
-        let (token, first) = first.expect("matched Some");
+        let (token, first, logprobs) = first.expect("matched Some");
         job.opts.import = Some(Box::new(KvImport {
             image,
             token,
+            logprobs,
             arrived,
             first,
             cached_tokens,
@@ -412,6 +430,24 @@ pub(crate) fn submit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_logprobs_are_eligible_but_prompt_logprobs_are_not() {
+        let mut job = Job {
+            prompt_ids: vec![1, 2, 3],
+            gen: crate::serve::GenParams::default(),
+            arrived: Instant::now(),
+            respond: stream::channel().0,
+            opts: JobOpts::default(),
+        };
+        job.gen.params.logprobs = Some(crate::text::logprobs::LogprobRequest {
+            top: 20,
+            raw_logits: false,
+        });
+        assert!(eligible(&job));
+        job.opts.prompt_logprobs = true;
+        assert!(!eligible(&job));
+    }
 
     #[test]
     fn pd_specs_parse_and_refuse_overlap() {
@@ -463,7 +499,7 @@ mod tests {
         sink.deliver(Ok(KvImage {
             key: "k".into(),
             rows: 3,
-            bytes: vec![1, 2],
+            bytes: vec![1, 2].into(),
             handoff_started: Instant::now(),
         }));
         assert!(!sink.wanted());

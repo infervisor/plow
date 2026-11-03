@@ -1288,6 +1288,7 @@ async fn speech_with(
         mm: None,
         export: None,
         import: None,
+        prompt_logprobs: false,
     };
     let job = crate::serve::mux::Job {
         prompt_ids: first.prompt_ids,
@@ -1948,6 +1949,7 @@ impl Later {
             mm: None,
             export: None,
             import: None,
+            prompt_logprobs: false,
         };
         let job = crate::serve::mux::Job {
             prompt_ids: s.prompt_ids,

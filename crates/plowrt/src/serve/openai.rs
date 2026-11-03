@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SamplingFields {
     #[serde(default)]
+    pub prompt_logprobs: Option<serde_json::Value>,
+    #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
