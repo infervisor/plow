@@ -162,6 +162,7 @@ fn cublaslt_fixture() -> (DevBlob, SegmentRoles) {
                     plow_asset::segment_roles::INTERPRETER,
                     plow_asset::segment_roles::CUBLASLT,
                 ],
+                library: Vec::new(),
             })
             .collect(),
     };
@@ -187,6 +188,65 @@ fn fp8_cublaslt_ladder_normalizes_rows_and_rejects_wrong_extent() {
         blob.progs[1].insts[4].i[0] += 1;
         assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
     }
+}
+
+#[test]
+fn block_fp8_quant_ladder_pins_group_scale_rows_to_the_padded_rung() {
+    // The cuBLASLt fixture with a QuantFp8 (1x128 groups) in the interpreter segment ahead of
+    // the routed projection.
+    let quant = |blob: &mut DevBlob, i3: u32, rows4: &dyn Fn(u32) -> u32| {
+        for g in &mut blob.progs {
+            let d = &mut g.insts[4];
+            d.i = [g.t, 16, 0, i3, rows4(g.t), 0, 0, 0];
+        }
+    };
+    let (mut blob, metadata) = cublaslt_fixture();
+    blob.tensors.push(DevTensor {
+        name: "activation.scale".into(),
+        bytes: 16 * 4,
+        init: None,
+    });
+    for g in &mut blob.progs {
+        let mut q = DevInst64 {
+            op: DevOp::QuantFp8 as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        q.t[..3].copy_from_slice(&[9, 8, 11]);
+        g.insts.insert(4, q);
+        g.n_counter = 6;
+        g.succs = (0..6).collect();
+        g.waits = (0..5)
+            .map(|id| packet::dev::Wait { id, threshold: 1 })
+            .collect();
+        g.stream = (0..6)
+            .map(|pc| StreamEnt {
+                inst: pc,
+                seg: u16::from(pc == 5),
+                succ_ofs: pc,
+                succ_len: 1,
+                wait_ofs: pc.saturating_sub(1),
+                wait_len: u16::from(pc != 0),
+                ..Default::default()
+            })
+            .collect();
+        g.gq_stream = g.stream.clone();
+        g.stream_len = vec![6];
+        g.gq_seg_ofs = vec![0, 5, 6];
+    }
+    let group = packet::dev::FP8_BLOCK_GROUP;
+    quant(&mut blob, group, &|t| t.next_multiple_of(4));
+    assert!(validate_cublaslt_ladder(&blob, &metadata).unwrap());
+    // One rung off, or every rung at the widest rung's padding: the scale stride a narrow
+    // rung's GEMM reads would disagree with what its quant wrote.
+    blob.progs[1].insts[4].i[4] += 4;
+    assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
+    quant(&mut blob, group, &|_| 16);
+    assert!(validate_cublaslt_ladder(&blob, &metadata).is_err());
+    // Per-token quant (no group) keeps its own contract: i4 is not a row extent.
+    quant(&mut blob, 0, &|_| 0);
+    assert!(validate_cublaslt_ladder(&blob, &metadata).unwrap());
 }
 
 #[test]
@@ -273,6 +333,47 @@ fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
         mutate(&mut blob);
         assert!(validate_decode_ladder(&blob).is_err(), "case={case}");
     }
+}
+
+/// devgen PLOW_DECODE_HNR_FOLD=<rows>: the widest rung's FlashDecode writes the caches itself
+/// (t7 = the fold descriptor, no HeadNormRope), the narrower rungs keep their writers.
+#[test]
+fn validates_hnr_folded_widest_rung() {
+    let folded = |pos_word: u32| {
+        let mut blob = fixture();
+        for p in &mut blob.progs {
+            for d in &mut p.insts {
+                match DevOp::from_u16(d.op) {
+                    Some(DevOp::HeadNormRope) => d.i[2] = 128,
+                    Some(DevOp::FlashDecode) => d.i[6] = 128,
+                    Some(DevOp::FlashMerge) => d.i[3] = 128,
+                    _ => {}
+                }
+            }
+        }
+        for kv in &mut blob.tensors[3..5] {
+            kv.bytes = 16 * 1024 * 128 * 2;
+        }
+        let words = [7, 8, 8, 9, 9, 9, 9, pos_word, 0, 0, 1];
+        let init: Vec<u8> = words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
+        blob.tensors.push(DevTensor {
+            name: "in.hnr_fold.desc.0".into(),
+            bytes: init.len() as u64,
+            init: Some(blob.init.len()..blob.init.len() + init.len()),
+        });
+        blob.init.extend(init);
+        let desc = (blob.tensors.len() - 1) as u16;
+        let widest = blob.progs.last_mut().unwrap();
+        widest.insts.drain(..2);
+        widest.insts[0].t[7] = desc;
+        widest.stream.truncate(2);
+        widest.gq_stream.truncate(2);
+        widest.stream_len = vec![2];
+        widest.gq_seg_ofs = vec![0, 2];
+        blob
+    };
+    assert!(validate_decode_ladder(&folded(0)).unwrap());
+    assert!(!validate_decode_ladder(&folded(1)).unwrap_or(false));
 }
 
 #[test]
@@ -1734,5 +1835,26 @@ fn rung_patch_images_preserve_uploaded_mutated_insts() {
     assert_ne!(
         image[1].i[0], g_insts[1].i[0],
         "does not revert to raw blob insts"
+    );
+}
+
+#[test]
+#[ignore = "CPU-only actual packet check; set TEST_LADDER_ASSETS (and PLOW_LADDER_DEBUG=1 for the reason)"]
+fn actual_packet_ladder_qualification() {
+    let assets = std::path::PathBuf::from(std::env::var("TEST_LADDER_ASSETS").unwrap());
+    let raw = std::fs::read(DevBlob::find_in_dir(&assets).unwrap().unwrap()).unwrap();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let roles = segment_role_metadata(&blob, &raw).unwrap();
+    let qualified = match &roles {
+        Some(roles) => validate_cublaslt_ladder(&blob, roles),
+        None => validate_decode_ladder(&blob),
+    };
+    eprintln!(
+        "decode rungs {:?}: narrow addressing qualified = {qualified:?}",
+        blob.decode_rungs()
+    );
+    assert!(
+        matches!(qualified, Ok(true)),
+        "narrow rungs not qualified: {qualified:?}"
     );
 }

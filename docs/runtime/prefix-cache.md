@@ -7,15 +7,13 @@ path. Check startup selection messages and actual token-batch dispatch logs.
 | Control | Default | Effect |
 |---|---|---|
 | `--prefix-cache` / `PLOW_PREFIX_CACHE` | `true` | Permit prefix reuse on either backend. |
-| `--token-batch` / `PLOW_TOKEN_BATCH` | `true` | Permit unified prefill/decode dispatch. |
-| `--vmm-cache-memory-utilization` / `PLOW_VMM_CACHE_MEMORY_UTILIZATION` | `0.05` | Prefix block/snapshot budget per engine as a fraction of device memory, in the unit of vLLM's `--gpu-memory-utilization` (4 GiB on an 80 GiB H100); zero allows OOM-driven eviction only. |
+| `--vmm-cache-memory-utilization` / `PLOW_VMM_CACHE_MEMORY_UTILIZATION` | `0` | Static prefix block/snapshot budget per engine as a fraction of device memory, in the unit of vLLM's `--gpu-memory-utilization`. Default `0` = no static cap: the cache grows into free memory and pressure eviction (`--vmm-cache-min-free-mib`) or allocation OOM evicts it. |
 | `--vmm-cache-mib` / `PLOW_VMM_CACHE_MIB` | unset | Explicit budget in MiB, overriding the fraction; zero allows OOM-driven eviction only. |
 
-Use `--prefix-cache=false` or `PLOW_PREFIX_CACHE=0` to disable reuse. On NVIDIA,
-this also overrides `PLOW_VMM_PREFIX=1`. `PLOW_VMM_PREFIX=0` remains a
-backend-specific opt-out. Disable unified dispatch separately with
-`--token-batch=false` or `PLOW_TOKEN_BATCH=0`. Explicit fusion takes precedence
-over unified batching.
+`--prefix-cache=false` / `PLOW_PREFIX_CACHE=0` (and the CUDA-only `PLOW_VMM_PREFIX=0`) exist for
+attribution A/Bs only: the prefix cache ships on in every recipe and release, and a throughput
+cost of the cache is a runtime bug to fix, never a recipe flip. Unified prefill/decode dispatch is always selected
+where supported; explicit fusion takes precedence over it.
 
 NVIDIA uses the shared VMM prefix cache on compatible assets. AMD currently
 reuses a prefix within the same physical sequence slot, retaining flat KV and
@@ -141,7 +139,8 @@ evicted and re-render ~900 rows from a block-aligned ancestor. The device cannot
 host memory can. With the tier armed the device LRU's victim blocks are *spilled*, not freed:
 
 * Size: unset = the host-reserve rule, `MemAvailable` minus an eighth of `MemTotal` (at least
-  16 GiB) at bring-up; growth re-reads `MemAvailable` every 16 chunks and stops for good once the
+  16 GiB), capped at a quarter of `MemTotal` (`host_tier_default`; a recipe names a larger size
+  explicitly, the 12B H100 recipe 64 GiB) at bring-up; growth re-reads `MemAvailable` every 16 chunks and stops for good once the
   reserve would be touched (`kv store: host tier frozen at the host reserve`). `0` = device only.
   Pinned pages cannot be reclaimed, and a 120 GB tier beside two co-tenant compiler builds was
   OOM-killed on the 249 GB lab box (2026-10-22); the reserve is not a tuning parameter.
@@ -194,7 +193,7 @@ rows nothing else uses. The boundary tree above is unchanged: it still decides w
 lives, spills (the store's pinned host tier) or dies; the
 store owns the bytes. Copies run as one `plow_kv_segcopy` launch per publish or attach.
 The host tier is on by default and sized by the host-reserve rule: `MemAvailable` minus an
-eighth of RAM (at least 16 GiB) at start, and it stops growing for good if `MemAvailable` would
+eighth of RAM (at least 16 GiB), capped at a quarter of RAM, at start, and it stops growing for good if `MemAvailable` would
 fall under that reserve (`kv store: host tier frozen`); `PLOW_VMM_HOST_CACHE_MIB` names a size
 instead, under the same rule.
 `/metrics`: `plowrt_kv_store_*` (residency per tier, dedup hits, fills, reclaims, refusals,

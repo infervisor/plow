@@ -96,7 +96,6 @@ nix develop --command env \
   PLOW_PF_SEG_FA512=1 \
   PLOW_PF_SEG_PURE=fp8 \
   PLOW_PREFIX_CACHE=1 \
-  PLOW_TOKEN_BATCH=1 \
   PLOW_VMM_LIVE_RINGS=0 \
   PLOW_VMM_PREFIX=1 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080

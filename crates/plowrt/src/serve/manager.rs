@@ -59,6 +59,7 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
 use crate::asset::devblob::DevBlob;
+#[cfg(feature = "cuda")]
 use crate::device::cuda::CudaBackend;
 use crate::memory::vmm::VmmOps;
 use crate::serve::mux::{self, MuxConfig};
@@ -145,12 +146,24 @@ pub struct BlobPlan {
     pub other_bytes: u64,
     /// Speech pipeline sibling packets, allocated when the pipeline binds after the engine load.
     pub sidecar_bytes: u64,
+    /// Non-tensor load overhead charged until a load of this bundle measures it:
+    /// [`DEFAULT_OVERHEAD`] plus the prefill graphs a CUDA load warms ([`seg_graph_bound`]).
+    pub overhead_bound: u64,
+    /// KV one sequence at the planned context maps on admission, beyond the planned tensors.
+    /// A resident model keeps at least this much admission budget.
+    pub min_kv_bytes: u64,
 }
 
 impl BlobPlan {
     /// Sum of the planned tensor bytes.
     pub fn tensor_total(&self) -> u64 {
         self.weights_bytes + self.kv_bytes + self.other_bytes + self.sidecar_bytes
+    }
+
+    /// What a resident engine of this plan holds: its tensors, `overhead` and one full-context
+    /// sequence's KV.
+    pub fn required(&self, overhead: u64) -> u64 {
+        self.tensor_total() + overhead + self.min_kv_bytes
     }
 
     /// Bytes of this model's load the weight slab can satisfy from pooled
@@ -220,12 +233,16 @@ impl BlobPlan {
             kv_bytes: 0,
             other_bytes: 0,
             sidecar_bytes: sidecar_bytes(&pkt)?,
+            overhead_bound: DEFAULT_OVERHEAD,
+            min_kv_bytes: 0,
         };
         for t in &blob.tensors {
             plan.add(&t.name, t.bytes);
         }
+        #[cfg(feature = "cuda")]
         if let Some((granularity, capability)) = device_vmm {
             let config = crate::config::RuntimeConfig::get();
+            plan.overhead_bound += seg_graph_bound(&blob);
             let manifest = match narrowed {
                 true => blob.with_packet_view(plow_asset::live_kv::emit).ok(),
                 false => crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?,
@@ -328,6 +345,7 @@ impl BlobPlan {
                         })?
                         + resident
                         + crate::memory::vmm::kv_pool_cap();
+                plan.min_kv_bytes = demand_virtual_bytes / u64::from(geo.batch.max(1));
             } else if let Some(layout) = prefix_layout {
                 let geo = &layout.geo;
                 geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
@@ -344,16 +362,42 @@ impl BlobPlan {
                 plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
                     RuntimeError::Rejected("prefix KV plan tensor classification".into())
                 })? + crate::memory::vmm::kv_pool_cap();
+                plan.min_kv_bytes = virtual_bytes / u64::from(geo.batch.max(1));
             }
         }
+        #[cfg(not(feature = "cuda"))]
+        let _ = (device_vmm, checkpoint, narrowed);
         Ok(plan)
     }
 }
 
 const GRAPH_BYTES_PER_PROGRAM: u64 = 320 << 10;
 
-/// Device bytes of the speech pipeline's sibling packets beside `pkt` (Qwen3-ASR `encoder.pkt`,
-/// codec `codec.pkt`, Chatterbox `s3gen.pkt`), bound after the engine load. Each binds a CUDA
+/// Device bytes a CUDA load's prefill graph warmup takes per prefill segment and decode slot,
+/// across the whole-chain and routed-piece graphs it captures. Measured on H100: 6.1 KiB
+/// (Gemma-4 E4B BF16), 8.1 KiB (12B FP8), 9.3 KiB (26B FP8).
+const SEG_GRAPH_BYTES_PER_SEGMENT_SLOT: u64 = 12 << 10;
+
+/// Bound on the device memory `GpuEngine::load` takes warming prefill segment graphs: every
+/// segmented prefill program is captured for every decode slot. Up to 8.9 GiB on an H100, the
+/// bulk of a CUDA engine's non-tensor overhead.
+fn seg_graph_bound(blob: &DevBlob) -> u64 {
+    let nv = &crate::config::RuntimeConfig::get().nv;
+    if !nv.pf_seg_graph || nv.pf_seg_time || nv.pf_seg_fatonly {
+        return 0;
+    }
+    let slots = blob.decode_prog().map_or(0, |g| u64::from(g.t));
+    let segments: u64 = blob
+        .prefill_progs()
+        .iter()
+        .map(|p| p.stream.iter().map(|e| e.seg as u64 + 1).max().unwrap_or(1))
+        .filter(|&n| n > 1)
+        .sum();
+    segments * slots * SEG_GRAPH_BYTES_PER_SEGMENT_SLOT
+}
+
+/// Device bytes of the speech pipeline's sibling packets beside `pkt` ([`sidecar_files`]),
+/// bound after the engine load. Each binds a CUDA
 /// packet runtime (`CudaPacketRuntime::load_on`) that `cuMemAlloc`s every packet tensor
 /// (activation and batch buffers at their compiled capacity), one counter slab and eight
 /// uploads per program, then captures every program sequence as a CUDA graph.
@@ -365,15 +409,18 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
     };
     let asset = crate::exec::packet_runtime::PacketAsset::load_if_present(pkt)?;
     let mut total = 0u64;
-    for (key, legacy) in [
-        ("encoder.packet", "encoder.pkt"),
-        ("codec.packet", crate::tts::codec::PACKET),
-        ("vocoder.packet", crate::tts::guided_speech::VOCODER),
-    ] {
-        let name = match &asset {
-            Some(asset) => asset.stage_file(key, legacy)?,
-            None => legacy.to_string(),
-        };
+    // A text-encoder sub-bundle loads as an engine of its own.
+    if let Some(sub) = asset
+        .as_ref()
+        .map(|a| a.text_encoder())
+        .transpose()?
+        .flatten()
+    {
+        // Plus an engine's non-tensor overhead: the parent's calibration runs before sidecars
+        // bind and never sees it.
+        total += BlobPlan::from_dir(&pkt.with_file_name(sub))?.tensor_total() + DEFAULT_OVERHEAD;
+    }
+    for name in sidecar_files(asset.as_ref())? {
         let path = pkt.with_file_name(name);
         if !path.is_file() {
             continue;
@@ -411,6 +458,31 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
             + alloc(counters);
     }
     Ok(total)
+}
+
+/// The sibling packets the speech pipeline binds, one per stage (each binds its own runtime):
+/// every stage its pipelines declare (the clone stage's reference encoder included), plus the
+/// file names packets emitted before stage names were carried bind by default.
+fn sidecar_files(asset: Option<&crate::exec::packet_runtime::PacketAsset>) -> Result<Vec<String>> {
+    let unnamed = [
+        ("encoder.packet", "encoder.pkt"),
+        ("codec.packet", "codec.pkt"),
+        ("vocoder.packet", "s3gen.pkt"),
+        (
+            "voice_cond.packet",
+            crate::exec::packet_runtime::VOICE_COND_PACKET,
+        ),
+    ];
+    let mut stages = match asset {
+        Some(asset) => asset.stage_files()?,
+        None => Default::default(),
+    };
+    for (key, file) in unnamed {
+        stages
+            .entry(key.to_string())
+            .or_insert_with(|| file.to_string());
+    }
+    Ok(stages.into_values().collect())
 }
 
 /// One registered (not necessarily resident) model.
@@ -469,6 +541,9 @@ pub enum EnsureError {
     /// Even after evicting every other resident model the target cannot fit.
     /// Shed with 503 + Retry-After.
     WontFit { need: u64, free: u64 },
+    /// The model loaded, but left it (or a co-resident model) less KV admission budget than
+    /// one sequence at its full context commits, so the load was rolled back. Says why.
+    NoKvRoom(String),
     /// The operator unloaded this model (or is unloading it). Demand loading is
     /// deliberately NOT attempted — otherwise the next request would silently
     /// undo the unload. Cleared by an explicit load.
@@ -478,6 +553,33 @@ pub enum EnsureError {
     /// Another switch held the switch lock past `PLOW_SWITCH_TIMEOUT_MS`. Shed with 503 +
     /// Retry-After.
     SwitchTimeout(Duration),
+    /// The model's last load failed and its retry backoff has not expired (its bundle files are
+    /// unchanged). Shed with 503 + Retry-After `retry_after`.
+    Backoff { why: String, retry_after: Duration },
+}
+
+impl EnsureError {
+    /// `r` with this refusal's Retry-After header, when it has one.
+    pub fn with_retry_after(&self, mut r: axum::response::Response) -> axum::response::Response {
+        if let Some(d) = self.retry_after() {
+            r.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(d.as_secs().max(1)),
+            );
+        }
+        r
+    }
+
+    /// Retry-After for a shed request, `None` when retrying unchanged cannot help.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            EnsureError::WontFit { .. }
+            | EnsureError::NoKvRoom(_)
+            | EnsureError::SwitchTimeout(_) => Some(Duration::from_secs(30)),
+            EnsureError::Backoff { retry_after, .. } => Some(*retry_after),
+            EnsureError::Unloaded | EnsureError::Load(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for EnsureError {
@@ -489,6 +591,7 @@ impl std::fmt::Display for EnsureError {
                 need >> 20,
                 free >> 20
             ),
+            EnsureError::NoKvRoom(why) => write!(f, "model does not fit: {why}"),
             EnsureError::Unloaded => write!(
                 f,
                 "model was unloaded by the operator — load it again to serve it"
@@ -499,7 +602,223 @@ impl std::fmt::Display for EnsureError {
                 "another model switch is still in progress after {} s; retry later",
                 d.as_secs()
             ),
+            EnsureError::Backoff { why, retry_after } => write!(
+                f,
+                "model load failed: {why}; next attempt in {} s",
+                retry_after.as_secs().max(1)
+            ),
         }
+    }
+}
+
+/// The device abstraction required by [`ModelManager`].
+pub trait ManagerDevice: Send + Sync {
+    /// Device ordinal (GPU index).
+    fn device_ordinal(&self) -> u8;
+    /// Available and total device memory in bytes.
+    fn mem_info(&self) -> Result<(u64, u64)>;
+    /// Allocation granularity in bytes.
+    fn granularity(&self) -> Result<u64>;
+    /// Compute capability `(major, minor)`, or `None` if non-CUDA.
+    fn compute_capability(&self) -> Option<(u32, u32)>;
+    /// Bytes in physical chunk pool.
+    fn pool_bytes(&self) -> u64;
+    /// Trim chunk pool to `keep_bytes`.
+    fn pool_trim(&self, keep_bytes: u64) -> u64;
+    /// Load an engine for `dir` and `ckpt`.
+    fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine>;
+    /// Check whether sibling packets are resident.
+    fn is_sibling_resident(&self, dir: &Path) -> bool;
+    /// Whether this device backend supports tensor parallelism.
+    fn supports_tp(&self) -> bool {
+        false
+    }
+    /// Modules loaded on the device, when the backend counts them (lifecycle accounting).
+    fn live_modules(&self) -> Option<usize> {
+        None
+    }
+    /// Devices in this manager's group, from its first ordinal: the widest TP it can host.
+    fn group_width(&self) -> u32 {
+        1
+    }
+    /// Co-resident engines here are safe only under round-robin turns (HSA: separate queues
+    /// give no whole-grid residency, and no cooperative-launch refusal turns that into an error).
+    fn co_tenants_need_rr(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct CudaManagerDevice {
+    be: Arc<CudaBackend>,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaManagerDevice {
+    pub fn new(be: Arc<CudaBackend>) -> Self {
+        Self { be }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ManagerDevice for CudaManagerDevice {
+    fn device_ordinal(&self) -> u8 {
+        self.be.device_ordinal
+    }
+    fn mem_info(&self) -> Result<(u64, u64)> {
+        self.be.mem_info()
+    }
+    fn granularity(&self) -> Result<u64> {
+        self.be.granularity()
+    }
+    fn compute_capability(&self) -> Option<(u32, u32)> {
+        Some(self.be.compute_capability())
+    }
+    fn pool_bytes(&self) -> u64 {
+        VmmOps::pool_bytes(&*self.be)
+    }
+    fn pool_trim(&self, keep_bytes: u64) -> u64 {
+        VmmOps::pool_trim(&*self.be, keep_bytes)
+    }
+    fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
+        let be = Arc::clone(&self.be);
+        let mut engine = self
+            .be
+            .unload_modules_on_err(|| crate::exec::gpu::GpuEngine::load(be, dir, ckpt))?;
+        if crate::config::RuntimeConfig::get().nv.spec {
+            match engine.spec_serve_enable(dir) {
+                Ok(limits) => tracing::info!(?limits, "speculative decoding on"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "PLOW_SPEC set but speculative decoding unavailable")
+                }
+            }
+        }
+        Ok(crate::serve::engine::ServeEngine::Cuda(engine))
+    }
+    fn is_sibling_resident(&self, dir: &Path) -> bool {
+        crate::exec::gpu::packet_exec::resident_in(dir, self.be.device_ordinal)
+    }
+    fn live_modules(&self) -> Option<usize> {
+        Some(self.be.live_modules())
+    }
+}
+
+#[cfg(feature = "hsa")]
+pub struct HsaManagerDevice {
+    be: Arc<crate::device::hsa::HsaBackend>,
+    width: u32,
+}
+
+#[cfg(feature = "hsa")]
+impl HsaManagerDevice {
+    /// `width`: devices in the group starting at `be`'s ordinal.
+    pub fn new(be: Arc<crate::device::hsa::HsaBackend>, width: u32) -> Self {
+        Self { be, width }
+    }
+}
+
+#[cfg(feature = "hsa")]
+impl ManagerDevice for HsaManagerDevice {
+    fn device_ordinal(&self) -> u8 {
+        self.be.device_ordinal
+    }
+    fn mem_info(&self) -> Result<(u64, u64)> {
+        let free = self.be.free_bytes().unwrap_or(0);
+        let total = self.be.vram_bytes();
+        Ok((free, total))
+    }
+    fn granularity(&self) -> Result<u64> {
+        self.be.granularity()
+    }
+    fn compute_capability(&self) -> Option<(u32, u32)> {
+        None
+    }
+    fn pool_bytes(&self) -> u64 {
+        VmmOps::pool_bytes(&*self.be)
+    }
+    fn pool_trim(&self, keep_bytes: u64) -> u64 {
+        VmmOps::pool_trim(&*self.be, keep_bytes)
+    }
+    fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
+        let blob = crate::asset::devblob::DevBlob::find_in_dir(dir)?
+            .ok_or_else(|| RuntimeError::Msg(format!("no blob in {}", dir.display())))?;
+        let hsaco = crate::config::RuntimeConfig::get()
+            .amd
+            .hsaco
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let own = dir.join("hsaco");
+                if own.is_dir() {
+                    own
+                } else {
+                    dir.to_path_buf()
+                }
+            });
+        let first = self.be.device_ordinal;
+        let engine = crate::serve::engine::AmdServe::load_on(&blob, &hsaco, Some(ckpt), first)?;
+        Ok(crate::serve::engine::ServeEngine::Amd(engine))
+    }
+    fn is_sibling_resident(&self, _dir: &Path) -> bool {
+        false
+    }
+    fn supports_tp(&self) -> bool {
+        true
+    }
+    fn group_width(&self) -> u32 {
+        self.width
+    }
+    fn co_tenants_need_rr(&self) -> bool {
+        true
+    }
+}
+
+pub struct HostManagerDevice {
+    ordinal: u8,
+}
+
+impl HostManagerDevice {
+    pub fn new() -> Self {
+        Self { ordinal: 0 }
+    }
+
+    pub fn with_ordinal(ordinal: u8) -> Self {
+        Self { ordinal }
+    }
+}
+
+impl Default for HostManagerDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagerDevice for HostManagerDevice {
+    fn device_ordinal(&self) -> u8 {
+        self.ordinal
+    }
+    fn mem_info(&self) -> Result<(u64, u64)> {
+        Ok((32 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
+    }
+    fn granularity(&self) -> Result<u64> {
+        Ok(4096)
+    }
+    fn compute_capability(&self) -> Option<(u32, u32)> {
+        None
+    }
+    fn pool_bytes(&self) -> u64 {
+        0
+    }
+    fn pool_trim(&self, _keep_bytes: u64) -> u64 {
+        0
+    }
+    fn load_engine(&self, _dir: &Path, _ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
+        Err(RuntimeError::Rejected(
+            "Host/CPU dynamic engine loading not yet supported".into(),
+        ))
+    }
+    fn is_sibling_resident(&self, _dir: &Path) -> bool {
+        false
     }
 }
 
@@ -508,7 +827,7 @@ pub struct ModelManager {
     /// `Weak` breaks the `AppState ↔ manager` cycle; the state outlives every
     /// request, so upgrades only fail during process teardown.
     state: Weak<AppState>,
-    be: Arc<CudaBackend>,
+    device: Arc<dyn ManagerDevice>,
     mux_cfg: MuxConfig,
     /// Registered models. Behind a lock because the control plane registers
     /// new assets dirs while the server is live; cloned out of the lock at every
@@ -518,8 +837,13 @@ pub struct ModelManager {
     switch: tokio::sync::Mutex<()>,
     /// slug → last request time (LRU eviction order).
     last_use: Mutex<FxHashMap<String, Instant>>,
-    /// slug → measured non-tensor overhead (first-load calibration).
-    overhead: Mutex<FxHashMap<String, u64>>,
+    /// Assets dir → the largest non-tensor overhead a load of it measured. Keyed by bundle, not
+    /// slug: every slug serving one bundle loads the same engine, and a reload measures less
+    /// (the driver keeps freed graph memory for reuse), so the largest measurement stands.
+    overhead: Mutex<FxHashMap<PathBuf, u64>>,
+    /// Resident slug → free memory it needs to keep admitting one full-context sequence: its KV
+    /// admission reserve plus that sequence's KV. A co-resident load must leave it free.
+    kv_claims: Mutex<FxHashMap<String, u64>>,
     /// Optional VRAM budget cap (bytes): the planner pretends the card has
     /// only this much. Forces switching on hardware where models co-fit
     /// (tests, A/B) — `PLOW_VRAM_BUDGET_MIB` in `main`.
@@ -531,12 +855,80 @@ pub struct ModelManager {
     /// The server runtime. A dispatcher asking for growth runs its own executor on a busy
     /// thread, where a task spawned locally would wait for the load to stop.
     runtime: Option<tokio::runtime::Handle>,
+    /// slug → its last failed load (other than out of memory). Demand loads back off before
+    /// evicting anyone: a deterministic failure otherwise took a healthy co-tenant down on every
+    /// request. A success, an explicit load or deregistration clears it.
+    failed: Failures,
+}
+
+type Failures = Arc<Mutex<FxHashMap<String, LoadFailure>>>;
+
+/// A failed load and when the next demand load may retry it.
+#[derive(Clone, Debug)]
+struct LoadFailure {
+    why: String,
+    at: Instant,
+    delay: Duration,
+    /// [`bundle_stamp`] at the failure: a changed bundle retries.
+    stamp: u64,
+    /// Identifies this failure: a background stamp re-read applies only to the failure it was
+    /// taken for, never to a newer one recorded meanwhile.
+    gen: u64,
+    /// When the last background re-read of the stamp started (at most every [`STAMP_EVERY`]).
+    checked: Instant,
+    /// A re-read is in flight (one per model).
+    refreshing: bool,
+}
+
+/// How often a refused request starts a background re-read of the bundle's files.
+const STAMP_EVERY: Duration = Duration::from_secs(5);
+
+static FAILURE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Apply a re-read `stamp` of `slug`'s bundle files taken for failure `gen`: a changed bundle
+/// forgets that failure, so the next demand load retries it. A newer failure is left alone.
+fn apply_stamp(failed: &Mutex<FxHashMap<String, LoadFailure>>, slug: &str, gen: u64, stamp: u64) {
+    let mut failed = failed.lock();
+    let Some(f) = failed.get_mut(slug).filter(|f| f.gen == gen) else {
+        return;
+    };
+    if f.stamp == stamp {
+        f.refreshing = false;
+    } else {
+        failed.remove(slug);
+    }
+}
+
+const LOAD_BACKOFF_MIN: Duration = Duration::from_secs(30);
+const LOAD_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+/// Name, size and mtime of every file directly in the bundle and checkpoint dirs, hashed: a
+/// bundle being copied or replaced changes it.
+fn bundle_stamp(dir: &Path, ckpt: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for dir in [dir, ckpt] {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut files: Vec<_> = rd
+            .flatten()
+            .filter_map(|e| {
+                let md = e.metadata().ok()?;
+                Some((e.file_name(), md.len(), md.modified().ok()))
+            })
+            .collect();
+        files.sort();
+        files.hash(&mut h);
+    }
+    h.finish()
 }
 
 impl ModelManager {
     /// Build the manager for `(slug, assets dir, checkpoint dir)` triples —
     /// every registered bundle that ships a PLOWDEV blob. Parses each blob's
     /// plan up front (startup-only file reads).
+    #[cfg(feature = "cuda")]
     pub fn new(
         be: Arc<CudaBackend>,
         state: &Arc<AppState>,
@@ -544,14 +936,51 @@ impl ModelManager {
         models: Vec<(String, PathBuf, PathBuf)>,
         budget: Option<u64>,
     ) -> Result<ModelManager> {
+        Self::with_device(
+            Arc::new(CudaManagerDevice::new(be)),
+            state,
+            mux_cfg,
+            models,
+            budget,
+        )
+    }
+
+    #[cfg(feature = "hsa")]
+    pub fn from_hsa(
+        be: Arc<crate::device::hsa::HsaBackend>,
+        width: u32,
+        state: &Arc<AppState>,
+        mux_cfg: MuxConfig,
+        models: Vec<(String, PathBuf, PathBuf)>,
+        budget: Option<u64>,
+    ) -> Result<ModelManager> {
+        Self::with_device(
+            Arc::new(HsaManagerDevice::new(be, width)),
+            state,
+            mux_cfg,
+            models,
+            budget,
+        )
+    }
+
+    /// Build the manager over any device implementing [`ManagerDevice`].
+    pub fn with_device(
+        device: Arc<dyn ManagerDevice>,
+        state: &Arc<AppState>,
+        mux_cfg: MuxConfig,
+        models: Vec<(String, PathBuf, PathBuf)>,
+        budget: Option<u64>,
+    ) -> Result<ModelManager> {
         let mut managed = Vec::with_capacity(models.len());
         for (slug, dir, ckpt) in models {
-            check_single_device(&slug, &dir)?;
-            let plan = BlobPlan::from_dir_with_device(
-                &dir,
-                Some((be.granularity()?, be.compute_capability())),
-                Some(&ckpt),
-            )?;
+            check_device_tp(&*device, &slug, &dir)?;
+            let vmm = device
+                .compute_capability()
+                .and_then(|cap| device.granularity().ok().map(|g| (g, cap)));
+            let cfg = crate::config::bundle_config(&dir)?;
+            let plan = crate::config::scoped(Some(cfg), || {
+                BlobPlan::from_dir_with_device(&dir, vmm, Some(&ckpt))
+            })?;
             tracing::info!(
                 %slug,
                 weights_gib = gib(plan.weights_bytes),
@@ -580,15 +1009,17 @@ impl ModelManager {
         }
         Ok(ModelManager {
             state: Arc::downgrade(state),
-            be,
+            device,
             mux_cfg,
             models: RwLock::new(managed),
             switch: tokio::sync::Mutex::new(()),
             last_use: Mutex::new(FxHashMap::default()),
             overhead: Mutex::new(FxHashMap::default()),
+            kv_claims: Mutex::new(FxHashMap::default()),
             budget,
             last_switch: Mutex::new(None),
             growing: std::sync::atomic::AtomicBool::new(false),
+            failed: Failures::default(),
             runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
@@ -626,12 +1057,15 @@ impl ModelManager {
                 dir.display()
             )));
         }
-        check_single_device(slug, &dir)?;
-        let plan = BlobPlan::from_dir_with_device(
-            &dir,
-            Some((self.be.granularity()?, self.be.compute_capability())),
-            Some(&ckpt),
-        )?;
+        check_device_tp(&*self.device, slug, &dir)?;
+        let vmm = self
+            .device
+            .compute_capability()
+            .and_then(|cap| self.device.granularity().ok().map(|g| (g, cap)));
+        let cfg = crate::config::bundle_config(&dir)?;
+        let plan = crate::config::scoped(Some(cfg), || {
+            BlobPlan::from_dir_with_device(&dir, vmm, Some(&ckpt))
+        })?;
         tracing::info!(
             %slug,
             dir = %dir.display(),
@@ -659,10 +1093,14 @@ impl ModelManager {
         let Some(i) = models.iter().position(|m| m.slug == slug) else {
             return false;
         };
-        models.remove(i);
+        let dir = models.remove(i).dir;
+        let shared = models.iter().any(|m| m.dir == dir);
         drop(models);
-        self.overhead.lock().remove(slug);
+        if !shared {
+            self.overhead.lock().remove(&dir);
+        }
         self.last_use.lock().remove(slug);
+        self.failed.lock().remove(slug);
         tracing::info!(%slug, "planner: model deregistered");
         true
     }
@@ -674,18 +1112,18 @@ impl ModelManager {
 
     /// The device this manager's engines and their sibling packets run on.
     pub fn ordinal(&self) -> u8 {
-        self.be.device_ordinal
+        self.device.device_ordinal()
     }
 
     /// The device ordinals this manager's group covers. One today (a manager
     /// owns one backend); a tensor-parallel group would report its whole run.
     pub fn ordinals(&self) -> Vec<u32> {
-        vec![u32::from(self.be.device_ordinal)]
+        vec![u32::from(self.device.device_ordinal())]
     }
 
     /// Device free/total bytes, for capacity reporting on the control plane.
     pub fn device_mem_info(&self) -> Result<(u64, u64)> {
-        self.be.mem_info()
+        self.device.mem_info()
     }
 
     /// The parsed plan for `slug` (tests / capacity reporting).
@@ -697,17 +1135,21 @@ impl ModelManager {
             .map(|m| m.plan)
     }
 
-    /// Planner requirement for `slug`: tensor total + (measured|default)
-    /// overhead. `None` for unmanaged slugs.
+    /// Planner requirement for `slug`: [`BlobPlan::required`] at its bundle's measured overhead,
+    /// or the plan's bound before any load of the bundle measured one. First loads, reloads and
+    /// residents are all charged this. `None` for unmanaged slugs.
     pub fn required(&self, slug: &str) -> Option<u64> {
         let m = self.managed(slug)?;
-        let ovh = self
-            .overhead
-            .lock()
-            .get(slug)
-            .copied()
-            .unwrap_or(DEFAULT_OVERHEAD);
-        Some(m.plan.tensor_total() + ovh)
+        Some(Self::charge(&m, &self.overhead.lock()))
+    }
+
+    fn charge(m: &Managed, overhead: &FxHashMap<PathBuf, u64>) -> u64 {
+        m.plan.required(
+            overhead
+                .get(&m.dir)
+                .copied()
+                .unwrap_or(m.plan.overhead_bound),
+        )
     }
 
     /// Least-recently-used resident model other than `target`, idle ones first.
@@ -800,22 +1242,29 @@ impl ModelManager {
     /// Effective free VRAM under the optional budget cap: with a budget B on a
     /// card of total T, pretend the card has only B — free' = free − (T − B).
     fn free_vram(&self) -> Result<u64> {
-        let (free, total) = self.be.mem_info()?;
+        let (free, total) = self.device.mem_info()?;
         Ok(match self.budget {
             Some(b) if b < total => free.saturating_sub(total - b),
             _ => free,
         })
     }
 
-    /// Bytes a load may plan on: free VRAM plus `credit` (reusable pooled chunks), but never
-    /// what resident models are planned to still commit (live KV slots, KV pools).
+    /// Bytes a load may plan on: free VRAM plus `credit` (reusable pooled chunks) less what
+    /// residents need free to keep admitting ([`Self::kv_claims`]), but never what resident
+    /// models are planned to still commit (live KV slots, KV pools).
     fn fit_capacity(&self, credit: u64) -> Result<u64> {
-        Ok((self.free_vram()? + credit).min(self.planned_headroom()?))
+        Ok((self.free_vram()? + credit)
+            .saturating_sub(self.kv_claimed())
+            .min(self.planned_headroom()?))
+    }
+
+    fn kv_claimed(&self) -> u64 {
+        self.kv_claims.lock().values().sum()
     }
 
     /// The device (or budget) less every resident model's planned requirement.
     fn planned_headroom(&self) -> Result<u64> {
-        let (_, total) = self.be.mem_info()?;
+        let (_, total) = self.device.mem_info()?;
         let cap = self.budget.map_or(total, |b| b.min(total));
         let overhead = self.overhead.lock();
         let planned: u64 = self
@@ -823,9 +1272,7 @@ impl ModelManager {
             .read()
             .iter()
             .filter(|m| self.is_resident(&m.slug))
-            .map(|m| {
-                m.plan.tensor_total() + overhead.get(&m.slug).copied().unwrap_or(DEFAULT_OVERHEAD)
-            })
+            .map(|m| Self::charge(m, &overhead))
             .sum();
         Ok(cap.saturating_sub(planned))
     }
@@ -905,13 +1352,36 @@ impl ModelManager {
             return Ok(());
         }
 
-        let _g = match switch_timeout() {
-            Some(d) => tokio::time::timeout(d, self.switch.lock())
-                .await
-                .map_err(|_| EnsureError::SwitchTimeout(d))?,
-            None => self.switch.lock().await,
-        };
-        self.ensure_resident_locked(slug).await
+        // A model in load backoff is shed here, not queued behind the switch lock.
+        if let Some(m) = self.managed(slug) {
+            self.load_backoff(&m)?;
+        }
+        // The switch runs on a task of its own: a request future dropped mid-switch (client gone)
+        // released the lock between installing the engine and its dispatcher, and the model then
+        // read as resident with nothing serving it.
+        let mgr = Arc::clone(self);
+        let slug = slug.to_string();
+        tokio::spawn(async move {
+            let _g = match switch_timeout() {
+                Some(d) => tokio::time::timeout(d, mgr.switch.lock())
+                    .await
+                    .map_err(|_| EnsureError::SwitchTimeout(d))?,
+                None => mgr.switch.lock().await,
+            };
+            mgr.ensure_resident_locked(&slug).await
+        })
+        .await
+        .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("model switch task: {e}"))))?
+    }
+
+    /// An engine with no dispatcher (a load cut off between the two) serves nothing and is not
+    /// resident for any caller: take it down so the load runs again.
+    async fn clear_partial(&self, slug: &str) -> std::result::Result<(), EnsureError> {
+        if self.is_resident(slug) && !self.is_serving(slug) {
+            tracing::warn!(%slug, "planner: engine installed without a dispatcher — reloading");
+            self.evict(slug, Stop::Now).await?;
+        }
+        Ok(())
     }
 
     async fn ensure_resident_locked(
@@ -927,6 +1397,7 @@ impl ModelManager {
         if !state.residency(slug).admits() {
             return Err(EnsureError::Unloaded);
         }
+        self.clear_partial(slug).await?;
         if self.is_resident(slug) {
             self.touch(slug);
             return Ok(());
@@ -934,6 +1405,7 @@ impl ModelManager {
         let m = self
             .managed(slug)
             .ok_or_else(|| EnsureError::Load(RuntimeError::UnknownModel(slug.into())))?;
+        self.load_backoff(&m)?;
         let need = self.required(slug).expect("managed") + RESERVE;
         let mut report = SwitchReport {
             target: slug.to_string(),
@@ -953,7 +1425,7 @@ impl ModelManager {
         let reusable_cap = m.plan.slab_reusable();
         loop {
             loop {
-                let trimmed = VmmOps::pool_trim(&*self.be, reusable_cap);
+                let trimmed = self.device.pool_trim(reusable_cap);
                 if trimmed > 0 {
                     tracing::info!(
                         trimmed_mib = trimmed >> 20,
@@ -961,7 +1433,7 @@ impl ModelManager {
                     );
                 }
                 let avail = self
-                    .fit_capacity(VmmOps::pool_bytes(&*self.be))
+                    .fit_capacity(self.device.pool_bytes())
                     .map_err(EnsureError::Load)?;
                 if avail >= need {
                     break;
@@ -997,10 +1469,18 @@ impl ModelManager {
                     let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
                     report.evicted.push((victim, drain_ms, unload_ms));
                 }
+                Err(e @ EnsureError::NoKvRoom(_)) => {
+                    let Some(victim) = self.lru_victim(slug) else {
+                        return Err(e);
+                    };
+                    tracing::warn!(%slug, %victim, error = %e, "planner: switch left no KV room — evicting");
+                    let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
+                    report.evicted.push((victim, drain_ms, unload_ms));
+                }
                 Err(e) => return Err(e),
             }
         }
-        let (free, total) = self.be.mem_info().map_err(EnsureError::Load)?;
+        let (free, total) = self.device.mem_info().map_err(EnsureError::Load)?;
         report.vram_used = total - free;
         tracing::info!(
             %slug,
@@ -1052,13 +1532,28 @@ impl ModelManager {
         slug: &str,
         deregister: bool,
     ) -> std::result::Result<UnloadReport, EnsureError> {
+        self.unload_with_drain(slug, deregister, None).await
+    }
+
+    /// Unload this model with an optional graceful drain bound. `None` stops in-flight work
+    /// immediately; `Some(bound)` lets in-flight generations drain up to `bound`.
+    pub async fn unload_with_drain(
+        &self,
+        slug: &str,
+        deregister: bool,
+        drain: Option<Duration>,
+    ) -> std::result::Result<UnloadReport, EnsureError> {
         if deregister && self.state()?.dp_rank(slug).is_some() {
             return Err(EnsureError::Load(RuntimeError::Rejected(format!(
                 "{slug} is a DP rank; deregister its model instead"
             ))));
         }
+        let stop = match drain {
+            Some(bound) => Stop::Bounded(bound),
+            None => Stop::Now,
+        };
         let _g = self.switch.lock().await;
-        let report = self.unload_locked(slug, Stop::Now).await?;
+        let report = self.unload_locked(slug, stop).await?;
         if deregister {
             let state = self.state()?;
             let _ = state.registry.unload(slug);
@@ -1083,12 +1578,15 @@ impl ModelManager {
         // window rather than merely narrowing it.
         state.set_residency(slug, crate::serve::Residency::Unloading);
 
-        let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
-        let (stop_ms, unload_ms) = self.evict(slug, stop).await?;
-        let pool_trimmed = VmmOps::pool_trim(&*self.be, 0);
-        let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
-
+        let free_before = self.device.mem_info().map_or(0, |(free, _)| free);
+        // Unloaded on failure too: the dispatcher is already gone, and only an explicit load
+        // (which this state asks for) brings the model back — `Unloading` stuck it refusing.
+        let evicted = self.evict(slug, stop).await;
         state.set_residency(slug, crate::serve::Residency::Unloaded);
+        let (stop_ms, unload_ms) = evicted?;
+        let pool_trimmed = self.device.pool_trim(0);
+        let free_after = self.device.mem_info().map_or(0, |(free, _)| free);
+
         self.last_use.lock().remove(slug);
 
         let report = UnloadReport {
@@ -1125,6 +1623,7 @@ impl ModelManager {
         }
         let _g = self.switch.lock().await;
         let state = self.state()?;
+        self.failed.lock().remove(slug);
         let was = state.residency(slug);
         // `ensure_resident` and the fit path below both refuse a pinned slug,
         // so the pin has to come off first — and go back on if the load fails,
@@ -1143,6 +1642,7 @@ impl ModelManager {
         slug: &str,
         evict_lru: bool,
     ) -> std::result::Result<f64, EnsureError> {
+        self.clear_partial(slug).await?;
         if self.is_resident(slug) {
             self.touch(slug);
             return Ok(0.0);
@@ -1159,9 +1659,9 @@ impl ModelManager {
         let need = self.required(slug).expect("managed") + RESERVE;
         // Same accounting as the switch path: chunks the incoming slab cannot
         // consume have to be real free memory before the load.
-        VmmOps::pool_trim(&*self.be, m.plan.slab_reusable());
+        self.device.pool_trim(m.plan.slab_reusable());
         let avail = self
-            .fit_capacity(VmmOps::pool_bytes(&*self.be))
+            .fit_capacity(self.device.pool_bytes())
             .map_err(EnsureError::Load)?;
         if avail < need {
             return Err(EnsureError::WontFit { need, free: avail });
@@ -1195,7 +1695,7 @@ impl ModelManager {
                 return;
             };
             let m = mgr.managed(&slug).expect("candidate is managed");
-            VmmOps::pool_trim(&*mgr.be, m.plan.slab_reusable());
+            mgr.device.pool_trim(m.plan.slab_reusable());
             let t0 = Instant::now();
             match mgr.load_model(&m).await {
                 Ok(()) => {
@@ -1209,22 +1709,29 @@ impl ModelManager {
     /// Hottest (most-recently-requested) non-resident model whose requirement
     /// fits free VRAM plus usable pooled chunks — no eviction considered.
     fn preload_candidate(&self) -> Option<String> {
-        let pool = VmmOps::pool_bytes(&*self.be);
+        let pool = self.device.pool_bytes();
         let (free, headroom) = (self.free_vram().ok()?, self.planned_headroom().ok()?);
+        let claimed = self.kv_claimed();
         let state = self.state.upgrade()?;
-        let last_use = self.last_use.lock();
-        self.models
-            .read()
+        // Cloned out first: `required` takes the models lock again, and a recursive read behind
+        // a queued registration's write deadlocks.
+        let models = self.models.read().clone();
+        let fits: Vec<String> = models
             .iter()
             .filter(|m| !self.is_resident(&m.slug))
             // Never speculatively reload what an operator unloaded.
             .filter(|m| state.residency(&m.slug).admits())
+            .filter(|m| self.load_backoff(m).is_ok())
             .filter(|m| {
                 let credit = pool.min(m.plan.slab_reusable());
-                self.required(&m.slug).expect("managed") + RESERVE <= (free + credit).min(headroom)
+                self.required(&m.slug).is_some_and(|need| {
+                    need + RESERVE <= (free + credit).saturating_sub(claimed).min(headroom)
+                })
             })
-            .max_by_key(|m| last_use.get(&m.slug).copied())
             .map(|m| m.slug.clone())
+            .collect();
+        let last_use = self.last_use.lock();
+        fits.into_iter().max_by_key(|s| last_use.get(s).copied())
     }
 
     /// Tear one resident model down: remove the mux (new submits fail fast),
@@ -1272,6 +1779,7 @@ impl ModelManager {
 
         let t1 = Instant::now();
         let engine = state.remove_gpu_engine(slug);
+        self.kv_claims.lock().remove(slug);
         if let Some(e) = &engine {
             let holders = Arc::strong_count(e);
             if holders > 1 {
@@ -1281,9 +1789,12 @@ impl ModelManager {
                 tracing::error!(%slug, holders, "engine still referenced at evict — VRAM leak");
             }
         }
-        on_own_thread("plow-unload", move || drop(engine))
-            .await
-            .map_err(EnsureError::Load)?;
+        let cfg = state.engine_config(slug);
+        on_own_thread("plow-unload", move || {
+            crate::config::scoped(cfg, || drop(engine))
+        })
+        .await
+        .map_err(EnsureError::Load)?;
         let engine_ms = ms(t1);
         if let Ok(bundle) = state.registry.get(state.model_of(slug)) {
             let device = self.ordinal();
@@ -1291,7 +1802,7 @@ impl ModelManager {
             crate::tts::serving::release(&bundle.dir, device);
             // Their worker threads drop the packet runtimes once the last request lets go.
             let deadline = Instant::now() + SIDECAR_RELEASE_WAIT;
-            while crate::exec::gpu::packet_exec::resident_in(&bundle.dir, device) {
+            while self.device.is_sibling_resident(&bundle.dir) {
                 if Instant::now() > deadline {
                     tracing::error!(%slug, "sibling packets still resident after evict — VRAM leak");
                     break;
@@ -1300,14 +1811,78 @@ impl ModelManager {
             }
         }
         let unload_ms = ms(t1);
-        let (free, _) = self.be.mem_info().map_err(EnsureError::Load)?;
-        tracing::info!(%slug, drain_ms, unload_ms, engine_ms, free_gib = gib(free), "model evicted");
+        let (free, _) = self.device.mem_info().map_err(EnsureError::Load)?;
+        let modules = self.device.live_modules();
+        tracing::info!(%slug, drain_ms, unload_ms, engine_ms, free_gib = gib(free), ?modules, "model evicted");
         Ok((drain_ms, unload_ms))
     }
 
     /// Load `m`'s engine (blocking H2D on the blocking pool), install it, and
     /// spawn its dispatcher. Calibrates the overhead cache on first load.
     async fn load_model(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
+        let r = self.load_model_once(m).await;
+        match &r {
+            Err(EnsureError::Load(e)) if !is_oom(e) => {
+                let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
+                let stamp = tokio::task::spawn_blocking(move || bundle_stamp(&dir, &ckpt))
+                    .await
+                    .unwrap_or_default();
+                let mut failed = self.failed.lock();
+                // Doubles per failure of the same bundle files; a changed bundle starts over.
+                let delay = match failed.get(&m.slug) {
+                    Some(f) if f.stamp == stamp => (f.delay * 2).min(LOAD_BACKOFF_MAX),
+                    _ => LOAD_BACKOFF_MIN,
+                };
+                tracing::warn!(slug = %m.slug, error = %e, retry_s = delay.as_secs(), "planner: load failed — demand loads back off");
+                failed.insert(
+                    m.slug.clone(),
+                    LoadFailure {
+                        why: e.to_string(),
+                        at: Instant::now(),
+                        delay,
+                        stamp,
+                        gen: FAILURE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                        checked: Instant::now(),
+                        refreshing: false,
+                    },
+                );
+            }
+            Ok(()) => {
+                self.failed.lock().remove(&m.slug);
+            }
+            Err(_) => {}
+        }
+        r
+    }
+
+    /// `Err(Backoff)` while `m`'s last failed load is inside its backoff; a demand load may try
+    /// it otherwise. Never touches the filesystem: every [`STAMP_EVERY`] it starts one background
+    /// re-read of the bundle's files, and a changed bundle is retried once that lands.
+    fn load_backoff(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
+        let mut failed = self.failed.lock();
+        let Some(f) = failed.get_mut(&m.slug) else {
+            return Ok(());
+        };
+        let left = f.delay.saturating_sub(f.at.elapsed());
+        if left.is_zero() {
+            return Ok(());
+        }
+        if !f.refreshing && f.checked.elapsed() >= STAMP_EVERY {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                f.refreshing = true;
+                f.checked = Instant::now();
+                let (map, slug, gen) = (Arc::clone(&self.failed), m.slug.clone(), f.gen);
+                let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
+                rt.spawn_blocking(move || apply_stamp(&map, &slug, gen, bundle_stamp(&dir, &ckpt)));
+            }
+        }
+        Err(EnsureError::Backoff {
+            why: f.why.clone(),
+            retry_after: left,
+        })
+    }
+
+    async fn load_model_once(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
         let state = self.state()?;
         let bundle = state
             .registry
@@ -1331,7 +1906,12 @@ impl ModelManager {
         //
         // So this is a refusal, not a warning: a diagnostic knob must not be
         // able to deadlock a device by being left set.
-        if crate::config::RuntimeConfig::get().nv.pf_seg_noncoop {
+        // This bundle's own knobs: every step of its load below runs under them.
+        let cfg = crate::config::bundle_config(&m.dir).map_err(EnsureError::Load)?;
+        state.set_engine_config(&m.slug, cfg);
+        // Either side running non-cooperative launches is the hazard: per-engine configs let
+        // one model set it and its co-tenant not.
+        {
             let co_tenants: Vec<String> = self
                 .models
                 .read()
@@ -1340,7 +1920,15 @@ impl ModelManager {
                 .map(|o| o.slug.clone())
                 .filter(|slug| self.is_resident(slug))
                 .collect();
-            if !co_tenants.is_empty() {
+            let noncoop = |c: Option<&crate::config::RuntimeConfig>| {
+                c.unwrap_or_else(|| crate::config::RuntimeConfig::get())
+                    .nv
+                    .pf_seg_noncoop
+            };
+            if !co_tenants.is_empty()
+                && (cfg.nv.pf_seg_noncoop
+                    || co_tenants.iter().any(|s| noncoop(state.engine_config(s))))
+            {
                 return Err(EnsureError::Load(RuntimeError::Rejected(format!(
                     "refusing to make {} co-resident with {:?} while PLOW_PF_SEG_NONCOOP is set: \
                      non-cooperative launch assumes the device is otherwise idle, and a co-tenant \
@@ -1350,26 +1938,46 @@ impl ModelManager {
             }
         }
 
-        let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
-        let pool_before = VmmOps::pool_bytes(&*self.be);
-        let be = Arc::clone(&self.be);
+        // Turns are installed from the startup tenant count: a model loaded later beside another
+        // raises its group's turn from `Free` (CUDA); an HSA group not started round-robin is
+        // refused (`AppState::upgrade_turn`).
+        let others = self
+            .models
+            .read()
+            .iter()
+            .filter(|o| o.slug != m.slug && self.is_resident(&o.slug))
+            .count();
+        state.upgrade_turn(&m.slug, others, self.device.co_tenants_need_rr());
+        if unturned_co_tenancy(
+            self.device.co_tenants_need_rr(),
+            state.device_turn(&m.slug).map(|t| t.mode()),
+            others > 0,
+        ) {
+            return Err(EnsureError::Load(RuntimeError::Rejected(format!(
+                "refusing to make {} co-resident on a device group whose co-tenant turns are not \
+                 round-robin: HSA queues give no whole-grid residency, so two engines can wait on \
+                 each other's blocks forever. Start the server with --co-sched rr to share a group.",
+                m.slug
+            ))));
+        }
+
+        let (free_before, _) = self.device.mem_info().map_err(EnsureError::Load)?;
+        let pool_before = self.device.pool_bytes();
+        let device = Arc::clone(&self.device);
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
         let engine = on_own_thread("plow-load", move || {
-            let mut engine = crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt)?;
-            if crate::config::RuntimeConfig::get().nv.spec {
-                match engine.spec_serve_enable(&dir) {
-                    Ok(limits) => tracing::info!(?limits, "speculative decoding on"),
-                    Err(e) => tracing::warn!(error = %e, "PLOW_SPEC set but speculative decoding unavailable"),
-                }
-            }
-            Ok(engine)
+            crate::config::scoped(Some(cfg), || device.load_engine(&dir, &ckpt))
         })
         .await
         .and_then(|engine| engine)
         .map_err(EnsureError::Load)?;
-        mux::check_speech_packet(&engine).map_err(EnsureError::Load)?;
-        let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
-        let pool_after = VmmOps::pool_bytes(&*self.be);
+        #[cfg(feature = "cuda")]
+        if let crate::serve::engine::ServeEngine::Cuda(ref gpu) = engine {
+            crate::config::scoped(Some(cfg), || mux::check_speech_packet(gpu))
+                .map_err(EnsureError::Load)?;
+        }
+        let (free_after, _) = self.device.mem_info().map_err(EnsureError::Load)?;
+        let pool_after = self.device.pool_bytes();
 
         // First-load calibration: measured footprint minus the planned tensor
         // bytes = module/table/allocator overhead for this assets dir. Pool
@@ -1379,10 +1987,15 @@ impl ModelManager {
         let used = (free_before + pool_before).saturating_sub(free_after + pool_after);
         // Sibling packets bind later, outside this measurement.
         let measured = used.saturating_sub(m.plan.tensor_total() - m.plan.sidecar_bytes);
-        self.overhead
-            .lock()
-            .entry(m.slug.clone())
-            .or_insert(measured);
+        // Co-residents keep allocating KV and cache during the load and land in the same delta,
+        // so only a load alone on the device calibrates (the plan's bound stands until one).
+        if others == 0 {
+            self.overhead
+                .lock()
+                .entry(m.dir.clone())
+                .and_modify(|o| *o = (*o).max(measured))
+                .or_insert(measured);
+        }
         tracing::info!(
             slug = %m.slug,
             used_gib = gib(used),
@@ -1392,18 +2005,17 @@ impl ModelManager {
             "planner: load measured"
         );
 
-        state.install_gpu_engine(
-            m.slug.clone(),
-            crate::serve::engine::ServeEngine::Cuda(engine),
-        );
+        state.install_gpu_engine(m.slug.clone(), engine);
         // Sibling packets (ASR encoder, codec, vocoder) bind with the engine and before its mux,
         // so residency and the planner's charge cover them, a request never binds them itself,
         // and an eviction frees them.
         let bind_state = Arc::clone(&state);
         let slug = m.slug.clone();
         let bound = on_own_thread("plow-bind", move || -> Result<()> {
-            crate::asr::serving::bind(&bind_state, &slug)?;
-            crate::tts::serving::bind(&bind_state, &slug).map_err(RuntimeError::Msg)
+            crate::config::scoped(Some(cfg), || {
+                crate::asr::serving::bind(&bind_state, &slug)?;
+                crate::tts::serving::bind(&bind_state, &slug).map_err(RuntimeError::Msg)
+            })
         })
         .await
         .and_then(|bound| bound);
@@ -1411,31 +2023,104 @@ impl ModelManager {
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(EnsureError::Load(e));
         }
+        if let Err(e) = crate::config::scoped(Some(cfg), || self.claim_kv(&state, &m.slug)) {
+            tracing::warn!(slug = %m.slug, error = %e, "planner: loaded model left without KV room — unloading");
+            let _ = self.evict(&m.slug, Stop::Now).await;
+            return Err(e);
+        }
         let mux = mux::spawn(m.slug.clone(), bundle, Arc::clone(&state), self.mux_cfg);
         state.install_mux(m.slug.clone(), mux);
         Ok(())
     }
+
+    /// After `slug`'s load and before its mux: refuse it unless its KV admission budget backs
+    /// one sequence at its full context and the device still leaves every co-resident model
+    /// its claim; otherwise record its own claim.
+    fn claim_kv(&self, state: &AppState, slug: &str) -> std::result::Result<(), EnsureError> {
+        let own = match state.gpu_engine(slug) {
+            Some(engine) => {
+                let e = engine.lock();
+                e.kv_admission_budget()
+                    .map(|b| (b, e.kv_admit_reserve(), e.max_ctx()))
+            }
+            None => None,
+        };
+        let mut claim = None;
+        if let Some((budget, reserve, ctx)) = own {
+            let need = budget.bytes_for_rows(ctx as u64);
+            if need > budget.budget_bytes {
+                return Err(EnsureError::NoKvRoom(format!(
+                    "{slug} loaded with a {} MiB KV admission budget and one {ctx}-token \
+                     sequence needs {} MiB",
+                    budget.budget_bytes >> 20,
+                    need >> 20
+                )));
+            }
+            claim = Some(reserve + need);
+        }
+        let free = self.free_vram().map_err(EnsureError::Load)?;
+        let mut claims = self.kv_claims.lock();
+        let others: u64 = claims
+            .iter()
+            .filter(|(s, _)| s.as_str() != slug)
+            .map(|(_, &c)| c)
+            .sum();
+        check_co_tenant_claims(slug, free, others)?;
+        if let Some(claim) = claim {
+            claims.insert(slug.to_string(), claim);
+        }
+        Ok(())
+    }
 }
 
-/// Refuse a bundle compiled for tensor parallelism.
-///
-/// A `ModelManager` owns exactly ONE backend and `GpuEngine::load` takes one
-/// backend, so the CUDA serving engine is single-device. Placement can form a
-/// group several ordinals wide (`--place` sizes groups by the widest declared
-/// TP degree), but only the group's first device would ever be handed to the
-/// engine — so a TP4 bundle would load as if it were TP1: no peer buffers, no
-/// rank wiring, one quarter of the weights, and confident wrong output rather
-/// than an error.
-///
-/// AMD serves TP through `AmdServe`, which is deliberately not under this
-/// manager. Until a CUDA TP engine exists, refusing is the honest answer.
-fn check_single_device(slug: &str, dir: &Path) -> Result<()> {
-    let tp = tp_degree(dir)?;
-    if tp > 1 {
+/// `free` after `slug` loaded must still cover what co-resident models claim.
+fn check_co_tenant_claims(
+    slug: &str,
+    free: u64,
+    claimed: u64,
+) -> std::result::Result<(), EnsureError> {
+    if free < claimed {
+        return Err(EnsureError::NoKvRoom(format!(
+            "loading {slug} leaves {} MiB free and the co-resident models need {} MiB to keep \
+             admitting one full-context sequence each",
+            free >> 20,
+            claimed >> 20
+        )));
+    }
+    Ok(())
+}
+
+/// A load that would put a second engine on a device needing round-robin turns while its
+/// turn is not round-robin.
+fn unturned_co_tenancy(
+    needs_rr: bool,
+    turn: Option<crate::serve::cosched::CoSched>,
+    co_resident: bool,
+) -> bool {
+    needs_rr && co_resident && turn != Some(crate::serve::cosched::CoSched::Rr)
+}
+
+/// Refuse a bundle compiled for tensor parallelism when the device does not support TP.
+fn check_device_tp(device: &dyn ManagerDevice, slug: &str, dir: &Path) -> Result<()> {
+    check_tp(device, slug, tp_degree(dir)?)
+}
+
+fn check_tp(device: &dyn ManagerDevice, slug: &str, tp: u32) -> Result<()> {
+    if tp > 1 && !device.supports_tp() {
         return Err(RuntimeError::Rejected(format!(
-            "{slug} declares tensor-parallel degree {tp}, and the CUDA serving engine is \
+            "{slug} declares tensor-parallel degree {tp}, and this model manager device is \
              single-device (one backend per engine). Serving it here would load one shard \
-             and answer with it. Compile a TP1 bundle, or serve it on the AMD engine."
+             and answer with it. Compile a TP1 bundle, or serve it on a backend supporting TP (e.g. AMD HSA)."
+        )));
+    }
+    // The engine spans `tp` devices from the group's first: past the group they belong to other
+    // managers, whose planners never see this load.
+    if tp > device.group_width() {
+        return Err(RuntimeError::Rejected(format!(
+            "{slug} declares tensor-parallel degree {tp}, and its device group starting at {} \
+             has {} device(s); start the server with a placement whose groups are {tp} wide",
+            device.device_ordinal(),
+            device.group_width()
         )));
     }
     Ok(())
@@ -1498,6 +2183,8 @@ mod tests {
             kv_bytes: 0,
             other_bytes: 0,
             sidecar_bytes: 0,
+            overhead_bound: 0,
+            min_kv_bytes: 0,
         };
         p.add("model.layers.0.self_attn.q_proj.weight", 100);
         p.add("fp8/model.layers.0.mlp.down_proj", 50);
@@ -1538,6 +2225,8 @@ mod tests {
             kv_bytes: 0,
             other_bytes: 0,
             sidecar_bytes: 0,
+            overhead_bound: 0,
+            min_kv_bytes: 0,
         };
         let weights = [
             "lm_head.weight",
@@ -1565,6 +2254,472 @@ mod tests {
         assert_eq!(p.weights_bytes, 10 * weights.len() as u64);
         assert_eq!(p.kv_bytes, 5);
         assert_eq!(p.other_bytes, 7 * 2 + 3);
+    }
+
+    struct Group(u32);
+
+    impl ManagerDevice for Group {
+        fn device_ordinal(&self) -> u8 {
+            2
+        }
+        fn mem_info(&self) -> Result<(u64, u64)> {
+            Ok((0, 0))
+        }
+        fn granularity(&self) -> Result<u64> {
+            Ok(4096)
+        }
+        fn compute_capability(&self) -> Option<(u32, u32)> {
+            None
+        }
+        fn pool_bytes(&self) -> u64 {
+            0
+        }
+        fn pool_trim(&self, _: u64) -> u64 {
+            0
+        }
+        fn load_engine(&self, _: &Path, _: &Path) -> Result<crate::serve::engine::ServeEngine> {
+            unreachable!()
+        }
+        fn is_sibling_resident(&self, _: &Path) -> bool {
+            false
+        }
+        fn supports_tp(&self) -> bool {
+            true
+        }
+        fn group_width(&self) -> u32 {
+            self.0
+        }
+    }
+
+    /// A manager over one model, `m` in `dir`, whose every load fails (no registry entry).
+    fn failing_manager(dir: &Path) -> (Arc<AppState>, Arc<ModelManager>) {
+        let plan = BlobPlan {
+            weights_bytes: 1 << 20,
+            kv_bytes: 0,
+            other_bytes: 0,
+            sidecar_bytes: 0,
+            overhead_bound: DEFAULT_OVERHEAD,
+            min_kv_bytes: 0,
+        };
+        manager_over(Arc::new(HostManagerDevice::new()), &[("m", dir, plan)])
+    }
+
+    /// A manager over `models` on `device`, none of them loadable (no registry entry).
+    fn manager_over(
+        device: Arc<dyn ManagerDevice>,
+        models: &[(&str, &Path, BlobPlan)],
+    ) -> (Arc<AppState>, Arc<ModelManager>) {
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        let mgr = Arc::new(ModelManager {
+            state: Arc::downgrade(&state),
+            device,
+            mux_cfg: MuxConfig::default(),
+            models: RwLock::new(
+                models
+                    .iter()
+                    .map(|&(slug, dir, plan)| Managed {
+                        slug: slug.into(),
+                        dir: dir.into(),
+                        ckpt: dir.into(),
+                        plan,
+                    })
+                    .collect(),
+            ),
+            switch: tokio::sync::Mutex::new(()),
+            last_use: Mutex::default(),
+            overhead: Mutex::default(),
+            kv_claims: Mutex::default(),
+            budget: None,
+            last_switch: Mutex::new(None),
+            growing: std::sync::atomic::AtomicBool::new(false),
+            failed: Failures::default(),
+            runtime: None,
+        });
+        (state, mgr)
+    }
+
+    struct Mem {
+        free: u64,
+        total: u64,
+    }
+
+    impl ManagerDevice for Mem {
+        fn device_ordinal(&self) -> u8 {
+            0
+        }
+        fn mem_info(&self) -> Result<(u64, u64)> {
+            Ok((self.free, self.total))
+        }
+        fn granularity(&self) -> Result<u64> {
+            Ok(2 << 20)
+        }
+        fn compute_capability(&self) -> Option<(u32, u32)> {
+            None
+        }
+        fn pool_bytes(&self) -> u64 {
+            0
+        }
+        fn pool_trim(&self, _: u64) -> u64 {
+            0
+        }
+        fn load_engine(&self, _: &Path, _: &Path) -> Result<crate::serve::engine::ServeEngine> {
+            unreachable!("admission refuses before loading")
+        }
+        fn is_sibling_resident(&self, _: &Path) -> bool {
+            false
+        }
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    /// The RC5 two-slug Gemma-4 E4B case: 36 GiB of tensors, 128 MiB of KV per full-context
+    /// sequence, a 7.5 GiB packet bound on the graph warmup.
+    fn e4b_plan() -> BlobPlan {
+        BlobPlan {
+            weights_bytes: 14 * GIB,
+            kv_bytes: 20 * GIB,
+            other_bytes: 2 * GIB,
+            sidecar_bytes: 0,
+            overhead_bound: DEFAULT_OVERHEAD + 7 * GIB + GIB / 2,
+            min_kv_bytes: 128 << 20,
+        }
+    }
+
+    /// Before any load of a bundle the planner charges the packet's overhead bound; after one,
+    /// every slug of that bundle is charged the largest overhead a load of it measured, with
+    /// the one-sequence KV floor on top either way.
+    #[test]
+    fn overhead_is_charged_per_bundle_and_bounded_before_a_load() {
+        let dir = Path::new("/bundle/e4b");
+        let plan = e4b_plan();
+        let (_state, mgr) = manager_over(
+            Arc::new(Mem {
+                free: 80 * GIB,
+                total: 80 * GIB,
+            }),
+            &[("a", dir, plan), ("b", dir, plan)],
+        );
+        let tensors = plan.tensor_total();
+        assert_eq!(
+            mgr.required("b"),
+            Some(tensors + plan.overhead_bound + plan.min_kv_bytes),
+            "a first load is charged the packet bound, never DEFAULT_OVERHEAD alone"
+        );
+        mgr.overhead.lock().insert(dir.into(), 3905 << 20);
+        assert_eq!(
+            mgr.required("b"),
+            Some(tensors + (3905 << 20) + plan.min_kv_bytes),
+            "a slug of a measured bundle is charged what its sibling measured"
+        );
+        assert_eq!(mgr.required("a"), mgr.required("b"));
+        // A reload measures less (the driver kept the freed graph memory); the largest stands.
+        mgr.overhead
+            .lock()
+            .entry(dir.into())
+            .and_modify(|o| *o = (*o).max(381 << 20));
+        assert_eq!(mgr.overhead.lock()[dir], 3905 << 20);
+        assert!(mgr.deregister("a"));
+        assert!(
+            mgr.overhead.lock().contains_key(dir),
+            "the bundle still serves b"
+        );
+        assert!(mgr.deregister("b"));
+        assert!(mgr.overhead.lock().is_empty());
+    }
+
+    /// A second slug that would starve the first one's KV admission is refused before it loads:
+    /// the free memory a resident needs to admit one full-context sequence is not capacity.
+    #[tokio::test]
+    async fn a_load_that_starves_a_resident_of_kv_is_refused_before_loading() {
+        let dir = Path::new("/bundle/e4b");
+        let plan = e4b_plan();
+        // e4b-a resident: 39.8 GiB used of 79 GiB, 4.3 GiB reserve + 128 MiB claimed.
+        let free = 79 * GIB - (39 * GIB + 870 * (1 << 20));
+        let (_state, mgr) = manager_over(
+            Arc::new(Mem {
+                free,
+                total: 79 * GIB,
+            }),
+            &[("b", dir, plan)],
+        );
+        mgr.overhead.lock().insert(dir.into(), 3905 << 20);
+        let need = mgr.required("b").unwrap() + RESERVE;
+        assert!(need > free, "the RC5 smoke admitted this on 36 GiB planned");
+        let e = mgr.load("b", false).await.unwrap_err();
+        assert!(
+            matches!(e, EnsureError::WontFit { need: n, .. } if n == need),
+            "{e}"
+        );
+        // Room for the tensors and overhead alone is not enough while a resident claims KV.
+        let (_state, mgr) = manager_over(
+            Arc::new(Mem {
+                free: need + GIB,
+                total: 160 * GIB,
+            }),
+            &[("b", dir, plan)],
+        );
+        mgr.overhead.lock().insert(dir.into(), 3905 << 20);
+        assert!(mgr.fit_capacity(0).unwrap() >= need);
+        mgr.kv_claims
+            .lock()
+            .insert("a".into(), 4358 * (1 << 20) + plan.min_kv_bytes);
+        assert!(mgr.fit_capacity(0).unwrap() < need);
+        let e = mgr.load("b", false).await.unwrap_err();
+        assert!(matches!(e, EnsureError::WontFit { .. }), "{e}");
+        assert_eq!(e.retry_after(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn a_load_must_leave_co_residents_their_kv_claims() {
+        assert!(check_co_tenant_claims("b", 5 * GIB, 4 * GIB).is_ok());
+        let e = check_co_tenant_claims("b", 2 * GIB, 4 * GIB).unwrap_err();
+        assert!(matches!(e, EnsureError::NoKvRoom(_)), "{e}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("2048 MiB free") && msg.contains("4096 MiB"),
+            "{msg}"
+        );
+        assert!(e.retry_after().is_some());
+    }
+
+    /// A model whose load failed (other than out of memory) is shed by later demand loads with
+    /// the recorded error and a Retry-After, before the planner evicts anyone; an explicit load
+    /// retries it, and deregistration forgets it.
+    #[tokio::test]
+    async fn a_failed_load_backs_off_demand_loads() {
+        let (_state, mgr) = failing_manager(Path::new("/nonexistent"));
+        let first = mgr.ensure_resident("m").await.unwrap_err();
+        assert!(matches!(first, EnsureError::Load(_)), "{first}");
+        let again = mgr.ensure_resident("m").await.unwrap_err();
+        let EnsureError::Backoff { why, retry_after } = &again else {
+            panic!("{again}");
+        };
+        assert!(first.to_string().contains(why.as_str()), "{again}");
+        assert!(*retry_after <= LOAD_BACKOFF_MIN && again.retry_after() == Some(*retry_after));
+        assert!(mgr.preload_candidate().is_none());
+        let explicit = mgr.load("m", false).await.unwrap_err();
+        assert!(
+            matches!(explicit, EnsureError::Load(_)),
+            "an explicit load retries: {explicit}"
+        );
+        assert!(mgr.deregister("m"));
+        assert!(mgr.failed.lock().is_empty());
+    }
+
+    /// The backoff expires: the next demand load retries, and a repeat failure of the same
+    /// bundle doubles the wait up to the cap. Changed bundle files retry at once and start over.
+    #[tokio::test]
+    async fn a_load_backoff_expires_doubles_and_resets_on_a_changed_bundle() {
+        let dir = std::env::temp_dir().join(format!("plowrt_backoff_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.pkt"), b"partial").unwrap();
+        let (_state, mgr) = failing_manager(&dir);
+        let delay = |mgr: &ModelManager| mgr.failed.lock()["m"].delay;
+        let expire = |mgr: &ModelManager| {
+            let mut f = mgr.failed.lock();
+            let f = f.get_mut("m").unwrap();
+            f.at = Instant::now().checked_sub(f.delay).unwrap();
+        };
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Load(_))
+        ));
+        assert_eq!(delay(&mgr), LOAD_BACKOFF_MIN);
+        let mut want = LOAD_BACKOFF_MIN;
+        for _ in 0..6 {
+            assert!(matches!(
+                mgr.ensure_resident("m").await,
+                Err(EnsureError::Backoff { .. })
+            ));
+            expire(&mgr);
+            assert!(
+                mgr.preload_candidate().is_some(),
+                "expired: the preloader may try it"
+            );
+            assert!(matches!(
+                mgr.ensure_resident("m").await,
+                Err(EnsureError::Load(_))
+            ));
+            want = (want * 2).min(LOAD_BACKOFF_MAX);
+            assert_eq!(delay(&mgr), want);
+        }
+        assert_eq!(want, LOAD_BACKOFF_MAX);
+        // The copy finishes: the file grew. Inside the re-read interval nothing reads it.
+        std::fs::write(dir.join("model.pkt"), b"partial, now complete").unwrap();
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Backoff { .. })
+        ));
+        assert!(!mgr.failed.lock()["m"].refreshing);
+        // Past it, the request still sheds at once and starts the one background re-read.
+        mgr.failed.lock().get_mut("m").unwrap().checked =
+            Instant::now().checked_sub(STAMP_EVERY).unwrap();
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Backoff { .. })
+        ));
+        // The re-read lands: the changed bundle's failure is forgotten, the next request retries
+        // and a new failure starts over.
+        for _ in 0..500 {
+            if !mgr.failed.lock().contains_key("m") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!mgr.failed.lock().contains_key("m"));
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Load(_))
+        ));
+        assert_eq!(
+            delay(&mgr),
+            LOAD_BACKOFF_MIN,
+            "a changed bundle starts over"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stamp re-read applies only to the failure it was taken for: one landing after a newer
+    /// failure was recorded (the old one expired and the retry failed again) leaves it alone.
+    #[test]
+    fn a_stale_stamp_reread_never_clears_a_newer_failure() {
+        let failed = Failures::default();
+        let record = |gen, stamp| LoadFailure {
+            why: "bad".into(),
+            at: Instant::now(),
+            delay: LOAD_BACKOFF_MIN,
+            stamp,
+            gen,
+            checked: Instant::now(),
+            refreshing: true,
+        };
+        failed.lock().insert("m".into(), record(2, 7));
+        apply_stamp(&failed, "m", 1, 8);
+        let f = failed.lock()["m"].clone();
+        assert!((f.gen, f.stamp, f.refreshing) == (2, 7, true), "{f:?}");
+        apply_stamp(&failed, "m", 2, 7);
+        assert!(
+            !failed.lock()["m"].refreshing,
+            "unchanged: the next re-read may run"
+        );
+        apply_stamp(&failed, "m", 2, 8);
+        assert!(
+            failed.lock().is_empty(),
+            "changed: the failure is forgotten"
+        );
+        apply_stamp(&failed, "m", 2, 8);
+        assert!(failed.lock().is_empty());
+    }
+
+    /// While a re-read is in flight no request starts another, and none waits for it.
+    #[tokio::test]
+    async fn one_stamp_reread_per_model_is_in_flight() {
+        let (_state, mgr) = failing_manager(Path::new("/nonexistent"));
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Load(_))
+        ));
+        let past = Instant::now().checked_sub(STAMP_EVERY).unwrap();
+        {
+            let mut f = mgr.failed.lock();
+            let f = f.get_mut("m").unwrap();
+            (f.refreshing, f.checked) = (true, past);
+        }
+        assert!(matches!(
+            mgr.ensure_resident("m").await,
+            Err(EnsureError::Backoff { .. })
+        ));
+        let f = mgr.failed.lock()["m"].clone();
+        assert!(
+            f.refreshing && f.checked == past,
+            "no second re-read started: {f:?}"
+        );
+    }
+
+    /// The planner counts every sibling packet the speech pipeline binds, from the stages the
+    /// packet declares: a clone stage's reference encoder too (it was missing, and KV sized to
+    /// fill the device left its bind out of memory).
+    #[test]
+    fn sidecar_set_is_the_declared_speech_stages() {
+        use crate::exec::packet_runtime::PacketAsset;
+        let pipeline = |strings: &[(&str, &str)]| plow_asset::packet_pipeline::PacketPipeline {
+            name: "speech".into(),
+            driver: crate::tts::DRIVER.into(),
+            programs: Default::default(),
+            tensors: Default::default(),
+            parameters: Default::default(),
+            strings: strings
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        let clone = PacketAsset::from_pipelines(vec![pipeline(&[
+            ("prompt.template", "{voice}{input}"),
+            ("codec.packet", "codec_dac.pkt"),
+            ("clone.encoder", "ref_encoder.pkt"),
+            ("voice_cond.packet", "cond.pkt"),
+        ])]);
+        let mut files = sidecar_files(Some(&clone)).unwrap();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                "codec_dac.pkt",
+                "cond.pkt",
+                "encoder.pkt",
+                "ref_encoder.pkt",
+                "s3gen.pkt"
+            ],
+            "declared stages, plus the default names of the stages it does not name"
+        );
+        let mut unnamed = sidecar_files(None).unwrap();
+        unnamed.sort();
+        assert_eq!(
+            unnamed,
+            ["codec.pkt", "encoder.pkt", "s3gen.pkt", "voice_cond.pkt"]
+        );
+        // Two stages binding one file bind two runtimes: counted twice.
+        let shared = PacketAsset::from_pipelines(vec![pipeline(&[
+            ("codec.packet", "codec.pkt"),
+            ("clone.encoder", "codec.pkt"),
+        ])]);
+        let files = sidecar_files(Some(&shared)).unwrap();
+        assert_eq!(files.iter().filter(|f| *f == "codec.pkt").count(), 2);
+        let escaping = PacketAsset::from_pipelines(vec![pipeline(&[(
+            "clone.encoder",
+            "../other/ref_encoder.pkt",
+        )])]);
+        assert!(sidecar_files(Some(&escaping)).is_err());
+    }
+
+    /// A TP engine spans `tp` devices from its group's first; past the group they belong to
+    /// other managers, which never planned for it.
+    #[test]
+    fn a_tp_bundle_must_fit_its_device_group() {
+        assert!(check_tp(&Group(4), "m", 4).is_ok());
+        assert!(check_tp(&Group(4), "m", 2).is_ok());
+        let e = check_tp(&Group(1), "m", 4).unwrap_err().to_string();
+        assert!(e.contains("starting at 2 has 1 device"), "{e}");
+        assert!(check_tp(&HostManagerDevice::new(), "m", 2).is_err());
+        assert!(check_tp(&HostManagerDevice::new(), "m", 1).is_ok());
+    }
+
+    /// A device group installed with one tenant (or none: a zero-asset start) runs free turns,
+    /// and the mode is fixed at install. On HSA a second engine loaded there later is refused.
+    #[test]
+    fn hsa_co_tenancy_needs_round_robin_turns() {
+        use crate::serve::cosched::CoSched;
+        assert!(unturned_co_tenancy(true, Some(CoSched::Free), true));
+        assert!(unturned_co_tenancy(true, None, true));
+        assert!(!unturned_co_tenancy(true, Some(CoSched::Rr), true));
+        assert!(!unturned_co_tenancy(true, Some(CoSched::Free), false));
+        assert!(!unturned_co_tenancy(false, Some(CoSched::Free), true));
+        assert!(HostManagerDevice::new().group_width() == 1);
+        assert!(!HostManagerDevice::new().co_tenants_need_rr());
     }
 
     #[test]

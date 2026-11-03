@@ -1,10 +1,11 @@
 # 26 — Prefix cache retention and the KV block store
 
 **Status: design (2026-10-23), reviewed, retention simulated; Part A implemented (A1, A2); B1 and B3 implemented and on by default (exactness gate passed 2026-10-23, replay and Qwen gates below); B2 parked (no AMD box); B4 on CUDA: the snapshot copy path, its pool and pitched knobs and the store switch are gone and `Prefix` blocks hold every full-layer row, so nothing is multi-mapped (replay 7, 2026-10-23: without a host tier the store is above the snapshot path and vLLM 0.29 on hit rate, TTFT and TPOT at 10 s think and 2.3 points under vLLM's hit rate at 45 s think, capacity-bound; with the host tier (replay 15, 2026-10-24) 71.7 % at 45 s think and 78.4 % at 20 s think with lower TTFT and TPOT than vLLM and than the store without the tier at 45 s; at 10 s think the tier still costs TPOT and tails, attributed to a per-tick cost under heavy spilling amplified by the speculation policy, B.6a); the AMD snapshot path remains (§5). Merge prep 2026-10-25: fourth review round without a blocking finding; every H100 recipe with a usable packet passes its own gate on the branch binary (Gemma-4 E4B and 12B with the store and host tier armed, Veena, Orpheus, Chatterbox, Chatterbox-MTL, both Qwen3-ASR sizes re-emitted), the Qwen3.8 production path is numerically unchanged, and the main-vs-branch benches lose nothing (`docs/bringup/results/gemma26b-h100-20261023/comparison.md`). Production pass 2026-10-25 (same doc, "Production pass"): every BF16/FP8 recipe re-emitted from the final source and gated with the store armed; Qwen3.8 BF16 now serves with the prefix cache on (B3 exact attach, c1/c8/c32 gate PASS, agentic c8 TTFT 3.6x better; c32 retention is store-capacity-bound beside 48 live slots); Qwen3.8 FP8 gained a 1..48 decode ladder (the ladder validator had silently kept native FP8 rungs on the widest launch) and scores against a same-precision vLLM peer, but stays uncompetitive on throughput; the 12B strict report is MATCHED and a loss; the E4B recipe's packet exposed a kv-shared tail bug (the prefill-bucket tail path uploaded the chain's request table but not the attention's, so the first generated token attended over the first prompt token alone; latent on main since the attention table arrived with the Qwen3.8 chain), fixed on the branch and the packet passes its gate with the tail route on. Packet-ABI slice 1 (2026-10-25): the NVIDIA engine no longer decides from model knowledge which interpreter objects may run a W8A8 program or where a recurrent model's state lives; the packet declares both (`object_requirements` per module, `recurrent_state` slot-major buffers) under runtime contract 2, an undeclared W8A8 or gated-delta-net packet is refused with a re-emit message, and the four affected packets (Qwen3.8 BF16/FP8, Gemma-4 12B and 26B FP8) were re-emitted with unchanged pairing hashes and re-gated; E4B and 26B BF16 load unchanged. Packet-ABI slice 2 (2026-10-26): serving choices come from the packet too; `serve.json` version 2 declares the tool-call syntax, the reasoning-trace markers and, for a checkpoint without a chat template, the built-in prompt builder, the runtime compiles the template with those declarations and probes nothing from its text or the vocabulary (version-1 and legacy packets keep their probes), every full-model emitter writes the section, and the production packets' prompt bytes and token ids are frozen as goldens (`crates/plowrt/tests/fixtures/serve_golden/`).**
-Part A says what actually moves the production hit rate and is implementable on today's
-snapshot cache. Part B is the content-addressed block store that replaces the boundary
-snapshots of `docs/arch/22-kv-cache.md` §7–§9 and the AMD `SharedPrefix` with one substrate,
-justified by extensibility and publish cost — not by hit rate. Model kernels are unchanged in
+Part A says what actually moves the production hit rate; it was written against the snapshot
+cache that was live then (§1 and Part A describe that path; it is retired on CUDA). Part B is the
+content-addressed block store that replaced the CUDA boundary snapshots (B4; `docs/arch/22-kv-cache.md`
+§8 is the live view) and is to replace the AMD `SharedPrefix` (B2), justified by extensibility and
+publish cost — not by hit rate. Model kernels are unchanged in
 both parts.
 
 ## 1. The problem
@@ -42,7 +43,7 @@ lead at high rate is therefore TTFT always, TPOT only with MTP on. Hit rates are
 traffic. The 45 s-think long arms are queued (`/home/lava/scratch/g26-vs-vllm/ab-long.sh`). What
 production exposes is retention at 10 req/s.
 
-### 1.1 Where the bytes go today (26B FP8, `exec/gpu/prefix.rs:682-751`)
+### 1.1 Where the bytes went on the snapshot path (26B FP8, 2026-10-22)
 
 Per token: 25 sliding layers × 2 × 8 heads × 256 B = 100 KiB, +1.6 KiB FP8 ring scales; 5 full
 layers × 2 × 2 heads × 512 B = 10 KiB, +80 B scales. A boundary snapshot at prompt end `p` is
@@ -104,7 +105,7 @@ Three conclusions, each contrary to a claim an earlier draft of this document ma
    order is not where the points are.
 3. **The levers the simulation supports are capacity and knowing which sessions ended.** A
    session-end signal is worth up to +20 pt at 20 s think (to the ceiling) and +12 pt at 45 s;
-   host capacity is worth +20 to +44 pt at 45 s. Both apply to today's snapshot cache unchanged.
+   host capacity is worth +20 to +44 pt at 45 s. Both applied to the snapshot cache unchanged.
    The simulation's limits: whole-session recency (no block-level eviction or partial-prefix
    hits), one seed, and no production think distribution — P0 validates it against
    hand-checkable traces, more seeds and the measured gaps before any column is quoted as a
@@ -155,8 +156,9 @@ and 191 GB columns). Allocation after model load in bounded chunks with partial-
 fallback and transfer backpressure, after the 120 GB bring-up crash is root-caused (P0).
 Root cause (kernel log, 2026-10-22 06:44 UTC): the host OOM killer took plowrt (123 GB pinned
 RSS) beside two co-tenant compiler builds of ~27 GB each; nothing in the tier itself failed.
-Implemented: the cap is cut to `MemAvailable` minus an eighth of `MemTotal` (floor 16 GiB) at
-bring-up, with a warning. The reserve is derived, not a knob.
+Implemented: the cap is cut to `MemAvailable` minus a reserve of `max(MemTotal / 8, 16 GiB)` at
+bring-up, with a warning, and since 2026-10-28 (`84312065d`) never above `MemTotal / 4`
+(`memory/vmm.rs` `host_tier_default`; the 12B recipe names 64 GiB). The reserve is derived, not a knob.
 Restore cost per host hit: 121 MB over PCIe Gen5 at the measured ~25 GB/s ≈ 4.8 ms on the
 attach path, against a 40–70 ms TTFT; spill is async off the engine thread. Host-hit latency,
 queue delay, spill/restore bytes, pinned RSS and p99 interference are reported separately from
@@ -291,15 +293,15 @@ checkpoint, awaited checkpoint). At boundary `p`:
    bounded pointer-table slot) from the slab; if eviction cannot free it without touching held
    or `Filling` blocks, the publish is refused (counter), never partially written.
 6. **Source lifetimes**: a slot is not retired or re-admitted until every scatter reading it
-   has fired its event (today's `vmm_snap_copy` drain, kept); pointer tables are a per-stream
+   has fired its event (`blocks_quiesce` on the newest seal event at slot end, since F1, doc 27
+   §6.6); pointer tables are a per-stream
    ring reused only behind the launch event that consumed them.
 
 Per-turn copy becomes the new rows only: ~100–300 rows → 10–35 MB scattered, against 106–121 MB
 today; a cold session still copies its full state (~165 MB), and the gate measures the mix. This
 is a bandwidth and engine-thread saving, not a retention gain (§1.2). Blocks are owned by the
-store, never by a slot, so the store has no orphaned-block hazard; while whole-block VMM
-multi-mapping is retained (B.7) the existing strict-publish check stays in force for the mapped
-blocks.
+store, never by a slot, so the store has no orphaned-block hazard; since B4 nothing is
+multi-mapped on CUDA, so the strict-publish check is moot there (B.7).
 
 ### B.4 Attach
 
@@ -338,8 +340,8 @@ left, in the device LRU, the host LRU and the spill victim choice alike.
 
 Per class, a pinned host slab allocated in bounded chunks with a bounded number of transfers
 in flight; both classes tier (a session is 165 MB wherever it lives). The tier is on by
-default and sized by the A1 rule (`MemAvailable` minus an eighth of RAM, at least 16 GiB, at
-start); growth re-reads `MemAvailable` every 16 chunks and stops for good once the reserve
+default and sized by the A1 rule (`MemAvailable` minus `max(MemTotal / 8, 16 GiB)`, at most
+`MemTotal / 4`, at start); growth re-reads `MemAvailable` every 16 chunks and stops for good once the reserve
 would be touched. `PLOW_VMM_HOST_CACHE_MIB` names a size instead, under the same rule. Migration protocol: a block being spilled stays `Device` until its D2H
 event fires, then flips to `Host`; a restore pins the host source until the H2D event fires; a
 concurrent attach on a `Migrating` block waits on the event rather than racing it. A host
@@ -406,8 +408,8 @@ attach needs it back (`restore`). `VmmKv::publish_blocks` runs the engine's acqu
 with the pool lock released; a store that is full refuses the acquire, the engine evicts one pool
 boundary (`reclaim_one`) and retries. The pool charges each publish the bytes its new blocks
 added, so a turn costs its new rows, not a whole window. The pool's own host tier is not armed
-under the store; `PLOW_VMM_HOST_CACHE_MIB` caps the store's pinned slabs instead. Multi-mapping of
-whole full-layer blocks is unchanged (B.7).
+under the store; `PLOW_VMM_HOST_CACHE_MIB` caps the store's pinned slabs instead. Since B4 the
+store holds every full-layer row and nothing is multi-mapped on CUDA (B.7).
 
 Replay 7 (2026-10-23, `Prefix` blocks, no host tier, gpu03, 10-minute production-fidelity replay):
 at 10 s think and rate 2.7 the store hits 78.6 % with TTFT 53/358 ms and TPOT 10.1/37.7 ms
@@ -522,7 +524,7 @@ it) and the boundary is published at that chunk end, while the state tensors hol
 after its rows (`state_capture_publish`); the later prompt-end publish finds it and touches it.
 A boundary the slot has moved past is not publishable for such a model (no state to capture),
 so a prompt end evicted during decode is not restored at the turn end. Prefix caching for a
-model with recurrent state is accepted only with the store on.
+model with recurrent state is accepted on the store (the only boundary storage on CUDA).
 
 Copy backend, measured (gpu03 H100, `kvstore-probe/segcopy`, random 8 KiB segments over a 2 GB
 arena, second repetition):
@@ -569,7 +571,7 @@ slots, ~1.5 GB at 27). The whole-block multi-map code remains for the AMD shared
 
 ### B.8 Hardware and model coverage
 
-| | today | store |
+| | before the store | store |
 |---|---|---|
 | NVIDIA H100, TP=1, one packet per process (Gemma-4 12B/26B) | VMM multi-map + snapshot copy | `Prefix` + `Window` + scales — **B1 acceptance scope**; multi-packet namespaces, TP and CPU/NUMA below are extensions outside it |
 | NVIDIA TP>1 | none | future; the key carries a rank/shard id so a later TP attach can require a boundary `Ready` on every rank before any rank proceeds |
@@ -589,8 +591,8 @@ counts, state machine, eviction and host tier are shared.
 - **Paged slots (vLLM block tables).** Every sliding read/write site (`op_attention.cuh` decode
   bodies and prefill stager, `op_norm.cuh` writers, TMA maps, FP8 scale indexing) would take a
   `(slot, logical block) → physical` lookup; `live_kv::validate` and the `kv_ring` proof assume
-  `mask == stride − 1`; `crates/devgen/src/lib.rs:2378` records paging as a measured null on
-  these kernels. The store keeps the flat slot and copies instead.
+  `mask == stride − 1`; a page table in the persistent decode body measured 2–3.7 % slower per
+  step (doc 27 §6.5, P0, reverted). The store keeps the flat slot and copies instead.
 - **512-row blocked full-layer layout** for zero-copy `Prefix` mapping: a kernel addressing
   change for ≤ 3% of cache bytes. Not part of this proposal.
 - **Recomputing the window on attach**: not exact (§1.1); exact recompute is the full re-prefill

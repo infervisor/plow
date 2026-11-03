@@ -1,7 +1,8 @@
 //! A self-contained packet (weights embedded, no language-model step protocol) on the CUDA
 //! interpreter: the `PacketRuntime` for forward pipelines such as the Qwen3-ASR audio encoder.
 //! Every program runs as one cooperative launch per global-queue segment of the speech object
-//! (`interp_sm90a_speech.cubin` or `interp_sm89_speech.cubin`, the interpreter with the FP32 speech arms).
+//! (`interp_sm90a_speech.cubin`, `interp_sm120_speech.cubin` or `interp_sm89_speech.cubin`, the
+//! interpreter with the FP32 speech arms).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,11 +17,15 @@ use crate::exec::packet_runtime::{check_copy, check_transfer, PacketRuntime, Pac
 use crate::{Result, RuntimeError};
 
 /// The speech object and its entry symbol for a compute capability.
-fn speech_object(cc: (u32, u32)) -> (&'static str, &'static str) {
+pub(super) fn speech_object(cc: (u32, u32)) -> (&'static str, &'static str) {
     match cc {
         (8, 9) => (
             "interp_sm89_speech.cubin",
             "_Z18interp_sm89_speech11PlowProgram",
+        ),
+        (10, _) | (12, _) => (
+            "interp_sm120_speech.cubin",
+            "_Z19interp_sm120_speech11PlowProgram",
         ),
         _ => (
             "interp_sm90a_speech.cubin",
@@ -50,7 +55,7 @@ fn speech_ops(blob: &DevBlob) -> u64 {
         .fold(0, |mask, op| mask | 1 << (op - SPEECH_OP0))
 }
 
-fn missing_speech_ops(required: u64, compiled: u64) -> Vec<u32> {
+pub(super) fn missing_speech_ops(required: u64, compiled: u64) -> Vec<u32> {
     let missing = required & !compiled;
     (0..64)
         .filter(|b| missing >> b & 1 != 0)
@@ -64,6 +69,25 @@ fn a_specialized_speech_object_must_cover_the_packet_ops() {
     assert!(missing_speech_ops(0b1011, 0b1111).is_empty());
     assert_eq!(missing_speech_ops(0b1011, 0b0011), vec![SPEECH_OP0 + 3]);
     assert_eq!(missing_speech_ops(1 << 41, 0), vec![204]);
+}
+
+#[cfg(test)]
+#[test]
+fn test_speech_object_resolution() {
+    assert_eq!(speech_object((8, 9)).0, "interp_sm89_speech.cubin");
+    assert_eq!(speech_object((9, 0)).0, "interp_sm90a_speech.cubin");
+    assert_eq!(speech_object((10, 0)).0, "interp_sm120_speech.cubin");
+    assert_eq!(speech_object((12, 0)).0, "interp_sm120_speech.cubin");
+}
+
+#[cfg(test)]
+#[test]
+fn speech_object_symbols_follow_the_cmake_mangling() {
+    for cc in [(8, 9), (9, 0), (10, 0), (12, 0)] {
+        let (file, symbol) = speech_object(cc);
+        let stem = file.strip_suffix(".cubin").unwrap();
+        assert_eq!(symbol, format!("_Z{}{stem}11PlowProgram", stem.len()));
+    }
 }
 
 struct Program {

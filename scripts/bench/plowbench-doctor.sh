@@ -47,6 +47,47 @@ pb_hazard_env
 echo
 echo "[3] binaries"
 pb_check_plowrt "$PLOWRT" "$ARCH"
+# plowrt binds the first loadable cuBLASLt: beside the binary (<exe>/../lib, <exe>), then the
+# loader's libcublasLt.so.13/.12/.so (crates/plowrt/src/device/cuda/lt.rs). A packet whose
+# build.json declares runtime_requires.cublaslt refuses an older one at load, inside the lease.
+# Run the doctor with the serve environment: LD_LIBRARY_PATH decides the loader's pick.
+if pb_is_nvidia "$ARCH" && [ -x "$PLOWRT" ]; then
+    lt=$(python3 -I - "$PLOWRT" "${ASSETS:-}" <<'PYEOF'
+import ctypes, json, os, sys
+d = os.path.dirname(os.path.realpath(sys.argv[1]))
+names = ["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"]
+cands = [p for x in (os.path.join(d, "..", "lib"), d) for p in (os.path.join(x, n) for n in names)
+         if os.path.isfile(p)] + names
+got = None
+for c in cands:
+    try:
+        got = (c, ctypes.CDLL(c).cublasLtGetVersion())
+        break
+    except (OSError, AttributeError):
+        continue
+bj = os.path.join(sys.argv[2], "build.json") if sys.argv[2] else ""
+need = (json.load(open(bj)).get("runtime_requires") or {}).get("cublaslt") if os.path.isfile(bj) else None
+if got is None:
+    print("FAIL\tno loadable libcublasLt beside plowrt or on the loader path")
+    sys.exit()
+v = got[1]
+have = f"{v // 10000}.{v // 100 % 100}.{v % 100}"
+if need:
+    maj, mnr = (int(x) for x in str(need).split(".")[:2])
+    if v < maj * 10000 + mnr * 100:
+        print(f"FAIL\tplowrt binds cuBLASLt {have} ({got[0]}); the packet needs >= {need}: "
+              f"put that libcublasLt.so.13 in {os.path.normpath(os.path.join(d, '..', 'lib'))} "
+              "or first on LD_LIBRARY_PATH")
+        sys.exit()
+print(f"ok\tcuBLASLt {have} ({got[0]})" + (f", packet needs >= {need}" if need else ""))
+PYEOF
+)
+    case "$lt" in
+        ok*) pb_ok "${lt#ok	}" ;;
+        FAIL*) pb_bad "${lt#FAIL	}" ;;
+        *) pb_warn "cuBLASLt check: $lt" ;;
+    esac
+fi
 if [ "${5:-serve}" != block ]; then
     pb_check_vllm "$ARCH"
 fi

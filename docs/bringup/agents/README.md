@@ -37,6 +37,15 @@ defect, and a row that cannot be filled is a blocker, not a default.
 
 ## Ground rules for agents (enforced by every prompt)
 
+- **HARD RULE: perf work iterates on a single block.** Every candidate is
+  screened on one block at its real shape, precision, flags and context against
+  a calibrated roofline for that block; whole-network `step_bench`, FP32 gates and
+  prod-mix grids run only for a block-level winner, and every campaign report
+  starts with the block-vs-roofline table. Harness and known gaps:
+  [`agent-tools.md`](../agent-tools.md) "HARD RULE"; the team's other standing
+  rules (prefix cache on, one binary, packet contract, static runtime, vLLM peer
+  judging, GPU budget, `prod-next` consolidation, kernel design/diff reviews)
+  are in its "Working rules".
 - **Gates are blocking.** An agent that cannot pass its gate stops and reports;
   it does not proceed or weaken the gate.
 - **The target is never hardcoded.** Stages 4–8 write `--gpu $GPU --arch $ISA`;

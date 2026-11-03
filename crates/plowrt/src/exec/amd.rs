@@ -8801,6 +8801,7 @@ impl AmdEngine {
         // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
         let mut blob = DevBlob::parse_l2(&raw, true)?;
+        crate::asset::serve::refuse_concat_features(&blob, &raw)?;
         crate::certificate_checks::check_packet(blob_path, &raw, &blob)?;
         let shards = crate::asset::shard::DeclaredShards::from_blob(&blob, &raw)?;
         // BEFORE anything reads the blob's geometry: `max_ctx`, the KV slot
@@ -14251,9 +14252,7 @@ impl AmdEngine {
         // packet on an object without the arms, because AMD's dispatch `default:` writes
         // nothing and does not trap.
         let cfg = crate::config::RuntimeConfig::get();
-        let mut token_batch_refusal = if !cfg.token_batch {
-            Some(token_batch::TokenBatchRefusal::NotRequested.to_string())
-        } else if cfg.fusion {
+        let mut token_batch_refusal = if cfg.fusion {
             Some("explicit fusion takes precedence".to_owned())
         } else if tp.is_some() {
             Some("token batching does not support tensor parallelism".to_owned())

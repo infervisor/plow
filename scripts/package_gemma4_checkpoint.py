@@ -87,7 +87,6 @@ export PLOW_VMM_LIVE=0
 export PLOW_VMM_LIVE_RINGS=0
 export PLOW_VMM_CACHE_MIB=4096
 export PLOW_MULTISTEP=0
-export PLOW_TOKEN_BATCH=1
 exec "$checkpoint_root/lib/ld-linux-x86-64.so.2" \\
   --library-path "$checkpoint_root/lib:/usr/local/cuda/lib64" \\
   "$checkpoint_root/bin/plowrt" serve --assets "$checkpoint_root/assets" \\
@@ -101,11 +100,6 @@ exec "$checkpoint_root/lib/ld-linux-x86-64.so.2" \\
             'unset PLOW_NV_CUBIN PLOW_NV_CUBIN_PF')
     (args.out / "serve.sh").write_text(launcher)
     (args.out / "serve.sh").chmod(0o755)
-    (args.out / "serve-ordinary.sh").write_text('''#!/usr/bin/env bash
-set -euo pipefail
-exec "$(cd -- "$(dirname -- "$0")" && pwd)/serve.sh" --token-batch=false "$@"
-''')
-    (args.out / "serve-ordinary.sh").chmod(0o755)
     (args.out / "verify.py").write_text('''#!/usr/bin/env python3
 import hashlib, json
 from pathlib import Path
@@ -169,8 +163,7 @@ it is not an off-instance backup. Preserve the whole directory when copying.
         start = readme.index("Prefix reuse is explicitly enabled.")
         end = readme.index("Weights, tokenizer, compiled assets", start)
         readme = readme[:start] + """Prefix caching and unified token batching are enabled with the validated packed
-packet and objects. Multi-step decode is disabled. Use `./serve-ordinary.sh` to
-disable unified dispatch while retaining prefix caching. This profile has host,
+packet and objects. Multi-step decode is disabled. This profile has host,
 H100 matching-computation logits and functional serving qualification. Sustained
 production SLO/performance and application-quality qualification remain open.
 No vLLM performance win is claimed. See `evidence/` for the exact test scope.

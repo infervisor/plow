@@ -28,7 +28,7 @@ you cannot fill is a blocker, not a default.
 | `$FEATURES` | `plowrt` cargo feature | `--features hsa` (AMD) or `--features cuda` (NVIDIA) |
 | `$BW_BOUND` | the **measured** HBM bandwidth denominator | `MemorySpec::bandwidth_for_bound()` — read the warning below |
 | `$COMPUTE_CEIL` | the **measured sustained** matrix-core ceiling | measured on this part, not the datasheet peak — read the warning below |
-| `$RESULTS` | external scratch directory for raw campaign output | campaign NVMe, or `/dev/shm` for disposable screens; the repository retains only `perf-data/SUMMARY.md` and decision-critical CSVs |
+| `$RESULTS` | external scratch directory for raw campaign output | campaign NVMe, or `/dev/shm` for disposable screens; the repository retains only each campaign's `docs/bringup/results/<campaign>/comparison.md` and its one `comparison.csv` |
 
 ## Per-ISA specifics — point at the authority, do not restate it
 

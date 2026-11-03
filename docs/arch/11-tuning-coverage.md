@@ -226,3 +226,24 @@ it has only been compiled, never executed — and there is no GPU oracle. It nee
 implementation before it needs a tuner. Note it is included **unconditionally**
 in every sm_120 object (`interp_sm120.cu:53`), so it costs registers in builds
 that never run it; that cost is worth measuring even though the op is not.
+
+**MoE grouped expert GEMMs, sm_90a (2026-10-28) — cuBLASLt grouped stays.** Measured against
+the Gemma-4 26B-A4B route (H 2816, I 704, 128 experts, top-8): the DeepGEMM SM90 M-grouped
+kernels (BF16 and FP8 1D2D, contiguous psum and masked layouts, every layout candidate its
+heuristic enumerates, 390 ahead-of-time cubins, none spilling) vs the cuBLASLt 13.4 grouped plan
+the route builds and its load-time pick, both in CUDA graphs over rotating weight copies, on
+routing histograms captured from real text (decode rungs 4-32 rows, prefill 128-4096 rows).
+DeepGEMM's GEMMs are slower at every rung through 2048 rows: 2-18% BF16 and 5-21% FP8, with
+the gap largest on the bandwidth-bound decode rungs. cuBLASLt's swapped narrow-M tiles
+(64x16) suit 1-4 rows per expert, and DeepGEMM has no BF16 swap-AB on SM90, so its 128-row
+psum tile is mostly padding. At 4096 rows the GEMMs tie (BF16 908 vs 918 us per layer). The
+whole chain is 3-9% faster there only because two cuBLASLt workspace memsets and their launch
+gaps go away. That is under the 10% bar, so no route was built. PDL adds nothing: the kernels take
+one CTA per SM with full shared memory, so a dependent cannot co-reside early. Numerics:
+DeepGEMM BF16 is bit-identical to cuBLASLt. With unit block scales, the FP8 1D2D path matches
+plowrt's per-channel W8A8 contract, where the glue applies the scales, and is slightly more
+accurate because it promotes every 128 K: rel-L2 vs FP32 1.67e-3 vs 1.90e-3. Side finding: real
+prefill routing is heavily skewed. In a 4096-row window the hottest expert takes ~3,700-4,060 of
+32,768 slots, so prefill grouped GEMMs reach only ~430 TFLOPS. A load-balanced split of the hot
+expert, not a different GEMM library, is the remaining prefill lever. Harness, cubins, histograms
+and CSVs: /opt/dlami/nvme/lava-tts/dg-moe.

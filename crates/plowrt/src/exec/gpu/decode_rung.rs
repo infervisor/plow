@@ -229,24 +229,32 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         g.l2_domains != 0
             || (!segmented && (g.gq_seg_ofs.len() != 2 || g.check_coarse_single_segment().is_err()))
     }) {
+        if crate::config::RuntimeConfig::get().nv.ladder_debug {
+            eprintln!("ladder: placed, segmented or opaque program keeps the widest rung");
+        }
         return Ok(false);
     }
     let widest = programs.last().expect("multiple programs");
     let widest_rows = widest.t;
     let mut compatible = true;
     let mut same_shape = true;
-    let mut normalized = [Vec::new(), Vec::new(), Vec::new()];
+    let mut normalized: [Vec<_>; 6] = Default::default();
     for (index, g) in programs.iter().enumerate() {
         let folded = g.insts.iter().any(|d| {
             matches!(DevOp::from_u16(d.op), Some(DevOp::Gemv | DevOp::GemvGlu)) && d.i[3] == 4
         });
+        // devgen PLOW_DECODE_HNR_FOLD=<rows>: the rungs from `rows` up carry no HeadNormRope.
+        let hnr_folded = g
+            .insts
+            .iter()
+            .any(|d| d.op == DevOp::FlashDecode as u16 && d.t[7] != TENSOR_NONE16);
         let class = if routed.get(index).copied().unwrap_or(false) {
             1
         } else if folded {
             2
         } else {
             0
-        };
+        } + if hnr_folded { 3 } else { 0 };
         let normalized = &mut normalized[class];
         let logical = splitk.as_ref().map(|proof| &proof.canonical[index]);
         if let Some(proof) = &splitk {
@@ -272,6 +280,14 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                         return Err(reject("FP8 instruction rows disagree with rung width"));
                     }
                     d.i[0] = 1;
+                    // Block-scaled QuantFp8 (i3 = the 1x128 group): i4 = the rung's rows padded to
+                    // the activation-scale layout's multiple of 4.
+                    if op == DevOp::QuantFp8 && d.i[3] == packet::dev::FP8_BLOCK_GROUP {
+                        if d.i[4] != g.t.next_multiple_of(4) {
+                            return Err(reject("FP8 group-scale rows disagree with rung width"));
+                        }
+                        d.i[4] = 1;
+                    }
                     // Native W8A8 rungs (devgen qwen35.rs `proj`): only the single-row rung binds
                     // its weight TMA map in i[7] (i[6] is the prefill input map); the per-rung
                     // maps are a rung-local choice, not program shape.
@@ -280,7 +296,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                         d.i[7] = 0;
                     }
                 }
-                Some(DevOp::Residual | DevOp::Glu | DevOp::SoftCap) => {
+                Some(DevOp::Residual | DevOp::Glu | DevOp::GluPitched | DevOp::SoftCap) => {
                     if d.i[0] == 0 || d.i[0] % g.t != 0 {
                         return Err(reject("invalid elementwise row extent"));
                     }
@@ -463,6 +479,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         }
     }
     if !compatible {
+        if crate::config::RuntimeConfig::get().nv.ladder_debug {
+            eprintln!("ladder: an instruction has no row normalization arm");
+        }
         return Ok(false);
     }
     let tensor_id = |name: &str| blob.tensors.iter().position(|t| t.name == name);
@@ -477,6 +496,19 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
     {
         return Err(reject("runtime inputs do not cover physical slots"));
     }
+    // devgen PLOW_DECODE_HNR_FOLD: t7 names the fold descriptor (11 u32 words, word 7 = the
+    // position tensor) and the FlashDecode packet writes both caches' new rows at pos[b].
+    let hnr_fold = |d: &DevInst64| {
+        d.op == DevOp::FlashDecode as u16
+            && d.t[6] == TENSOR_NONE16
+            && d.i[6] == 128
+            && blob
+                .tensors
+                .get(d.t[7] as usize)
+                .and_then(|t| t.init.clone())
+                .and_then(|r| blob.init.get(r))
+                .is_some_and(|w| w.len() == 44 && w[28..32] == (pos as u32).to_le_bytes())
+    };
     let mut caches = std::collections::BTreeMap::new();
     let mut scales = std::collections::BTreeMap::new();
     for d in &widest.insts {
@@ -489,8 +521,11 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
         if !matches!(d.i[6], 64 | 128 | 256 | 512)
             || (fp8 && d.i[6] == 64)
-            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16))
+            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) && !hnr_fold(d))
         {
+            if crate::config::RuntimeConfig::get().nv.ladder_debug {
+                eprintln!("ladder: unsupported FlashDecode geometry or bound slot/fold operands");
+            }
             return Ok(false);
         }
         let (heads, hd, stride, window, mask) = (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7]);
@@ -548,6 +583,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         return Err(reject("FP8 KV scale aliases cache data"));
     }
     if caches.is_empty() {
+        if crate::config::RuntimeConfig::get().nv.ladder_debug {
+            eprintln!("ladder: no KV cache read by the widest rung");
+        }
         return Ok(false);
     }
     for g in programs {
@@ -654,6 +692,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                         }
                         if (d.i[2], d.i[6], d.i[3], d.i[7]) != (heads, hd, stride, mask) {
                             return Err(reject("KV reader addressing changes across rungs"));
+                        }
+                        if hnr_fold(d) && !writes.insert(id) {
+                            return Err(reject("duplicate KV writer"));
                         }
                     }
                     Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8) if operand == 0 => {

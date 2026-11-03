@@ -83,31 +83,33 @@ page size), not in bare `pages` / `available_pages` fields.
 
 ```rust
 pub struct TileShape {
-    pub bm: u32,    // tile rows (M-dimension block)
-    pub bn: u32,    // tile cols (N-dimension block)
-    pub bk: u32,    // reduction block (K-dimension)
-    pub splits: u32, // split-K factor
+    pub bm: i64,    // tile rows (M-dimension block)
+    pub bn: i64,    // tile cols (N-dimension block)
+    pub bk: i64,    // reduction block (K-dimension)
+    pub split_k: i64, // split-K factor
 }
 ```
 
 A GEMM `[M, K] × [K, N] → [M, N]` is decomposed into tiles of size `[bm, bk] × [bk, bn] → [bm, bn]`:
-- **Passes** = `ceil(M/bm) × ceil(N/bn) × ceil(K/bk)` ÷ splits
+- **Passes** = `ceil(M/bm) × ceil(N/bn) × ceil(K/bk)` ÷ split_k
 - **SRAM pages** = pages needed to hold A-tile (`bm×bk`) + B-tile (`bk×bn`) + C-accumulator (`bm×bn`)
 
 ### Flash Tiles
 
 ```rust
+// crates/costmodel/src/optile.rs
 pub struct FlashTile {
-    pub bq: u32,    // query block size
-    pub bkv: u32,   // key/value block size
+    pub bq: i64,    // query block size
+    pub bkv: i64,   // key/value block size
 }
 ```
 
 ### Row Tiles
 
 ```rust
+// crates/costmodel/src/optile.rs
 pub struct RowTile {
-    pub rows_per_tile: u32,
+    pub br: i64,    // rows per tile
 }
 ```
 
@@ -140,13 +142,12 @@ A tile shape is legal iff:
 ### SramPolicy
 
 ```rust
+// crates/costmodel/src/sram.rs
 pub enum SramPolicy {
-    Streaming,   // minimal SRAM: just enough for one tile-step
-    Resident,    // hold output in SRAM for consumer
+    Filter,   // drop a candidate that does not fit (hard fit constraint)
+    Stream,   // keep it; it streams over `loop_passes` passes (kernel self-coordinates)
 }
 ```
-
-`Streaming` allows smaller tiles (more parallelism); `Resident` demands larger budgets but avoids HBM round-trips for handoffs.
 
 ---
 
@@ -216,6 +217,7 @@ pub struct GpuSpec {
     pub chiplet: Option<ChipletGrouping>,
     pub l2_partitioning: Option<L2Partitioning>,
     pub clock_boost: Hertz,
+    pub soc: Option<SocSpec>,
 }
 ```
 
@@ -226,21 +228,23 @@ Per-SM shared memory and TMEM live inside `SmSpec` (`spec.sm.shared_mem`,
 
 ```rust
 // Const hardware descriptors
-pub const H100_SXM5: GpuSpec = GpuSpec { ... };
-pub const B200: GpuSpec = GpuSpec { ... };
-pub const RTX_5090: GpuSpec = GpuSpec { ... };
-pub const RTX_6000_PRO: GpuSpec = GpuSpec { ... };
-pub const RTX_4090: GpuSpec = GpuSpec { ... };
-pub const MI300X: GpuSpec = GpuSpec { ... };
-pub const MI350X: GpuSpec = GpuSpec { ... };
+pub const H100_SXM5: GpuSpec = GpuSpec { ... };  // also H200_SXM, H100_PCIE, H100_NVL
+pub const B200: GpuSpec = GpuSpec { ... };       // also RTX_5090, RTX_6000_PRO
+pub const RTX_4090: GpuSpec = GpuSpec { ... };   // also L4, L40S
+pub const MI300X: GpuSpec = GpuSpec { ... };     // also MI325X
+pub const MI350X: GpuSpec = GpuSpec { ... };     // also MI355X
+pub const XEON_6975P_C: GpuSpec = GpuSpec { ... };
+pub const APPLE_M4: GpuSpec = GpuSpec { ... };   // also APPLE_M4_PRO, APPLE_M4_MAX
 ```
 
 All descriptors are collected in `hwspec::registry::ALL`.
 
 **Files:**
-- [`crates/hwspec/src/nvidia/h100.rs`](../../crates/hwspec/src/nvidia/h100.rs) — H100 SXM5
+- [`crates/hwspec/src/nvidia/h100.rs`](../../crates/hwspec/src/nvidia/h100.rs) — H100 SXM5/PCIe/NVL, H200 SXM
 - [`crates/hwspec/src/nvidia/blackwell.rs`](../../crates/hwspec/src/nvidia/blackwell.rs) — B200, RTX 5090, RTX 6000 Pro
-- [`crates/hwspec/src/nvidia/ada.rs`](../../crates/hwspec/src/nvidia/ada.rs) — RTX 4090
+- [`crates/hwspec/src/nvidia/ada.rs`](../../crates/hwspec/src/nvidia/ada.rs) — RTX 4090, L4, L40S
+- [`crates/hwspec/src/intel/xeon6.rs`](../../crates/hwspec/src/intel/xeon6.rs) — Xeon 6975P-C (CPU)
+- [`crates/hwspec/src/apple/m4.rs`](../../crates/hwspec/src/apple/m4.rs) — Apple M4 / Pro / Max
 - [`crates/hwspec/src/amd/mi300.rs`](../../crates/hwspec/src/amd/mi300.rs) — MI300X, MI325X
 - [`crates/hwspec/src/amd/mi350.rs`](../../crates/hwspec/src/amd/mi350.rs) — MI350X, MI355X
 - [`crates/hwspec/src/registry.rs`](../../crates/hwspec/src/registry.rs) — `ALL` descriptor list
@@ -336,6 +340,10 @@ pub fn kernel_reservation_bytes(arch: Arch) -> u64 {
         Arch::CdnaV3 => 4 * 1024,
         // CDNA4 (MI350): same fixed per-workgroup LDS cost as CDNA3.
         Arch::CdnaV4 => 4 * 1024,
+        // Apple GPU: one 2 KiB slice of the 32 KiB threadgroup memory.
+        Arch::AppleM3 | Arch::AppleM4 => 2 * 1024,
+        // CPU core: L2 holds operand tiles only.
+        Arch::GraniteRapids => 0,
     }
 }
 ```
@@ -344,7 +352,7 @@ pub fn kernel_reservation_bytes(arch: Arch) -> u64 {
 
 ### Decision: Split-K for Small Batches
 
-**Chosen:** `TileShape.splits > 1` decomposes the K-reduction across multiple thread blocks.
+**Chosen:** `TileShape.split_k > 1` decomposes the K-reduction across multiple thread blocks.
 
 **Rationale:** Batch-1 decode produces tiny GEMMs (M=1, N=large, K=large). Without split-K, a single SM does all the K-reduction sequentially — wasting 131 other SMs. Split-K = 4..16 parallelizes the reduction, trading one extra reduction kernel for 4-16× more SM utilization.
 

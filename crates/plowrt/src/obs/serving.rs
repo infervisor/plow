@@ -75,9 +75,26 @@ pub struct AsrMetrics {
     pub errors: AtomicU64,
     pub cancelled: AtomicU64,
     pub rejected: AtomicU64,
+    pub audio_duration_ms: AtomicU64,
     pub first_transcript: Histogram,
     pub e2e: Histogram,
     pub queue: Histogram,
+}
+
+#[derive(Default)]
+pub struct TtsMetrics {
+    pub active: AtomicBool,
+    pub http_requests: AtomicU64,
+    pub websocket_sessions: AtomicU64,
+    pub active_streams: AtomicU64,
+    pub completed: AtomicU64,
+    pub errors: AtomicU64,
+    pub cancelled: AtomicU64,
+    pub playback_stalls: AtomicU64,
+    pub watchdog_recovers: AtomicU64,
+    pub audio_duration_ms: AtomicU64,
+    pub first_audio: Histogram,
+    pub e2e: Histogram,
 }
 
 #[derive(serde::Serialize)]
@@ -131,9 +148,25 @@ pub struct AsrSnapshot {
     pub errors: u64,
     pub cancelled: u64,
     pub rejected: u64,
+    pub audio_duration_seconds: f64,
     pub first_transcript: LatencySnapshot,
     pub e2e: LatencySnapshot,
     pub queue: LatencySnapshot,
+}
+
+#[derive(serde::Serialize)]
+pub struct TtsSnapshot {
+    pub http_requests: u64,
+    pub websocket_sessions: u64,
+    pub active_streams: u64,
+    pub completed: u64,
+    pub errors: u64,
+    pub cancelled: u64,
+    pub playback_stalls: u64,
+    pub watchdog_recovers: u64,
+    pub audio_duration_seconds: f64,
+    pub first_audio: LatencySnapshot,
+    pub e2e: LatencySnapshot,
 }
 
 impl AsrMetrics {
@@ -156,9 +189,34 @@ impl AsrMetrics {
             errors: self.errors.load(Relaxed),
             cancelled: self.cancelled.load(Relaxed),
             rejected: self.rejected.load(Relaxed),
+            audio_duration_seconds: self.audio_duration_ms.load(Relaxed) as f64 / 1000.0,
             first_transcript: self.first_transcript.snapshot(),
             e2e: self.e2e.snapshot(),
             queue: self.queue.snapshot(),
+        })
+    }
+}
+
+impl TtsMetrics {
+    pub fn snapshot(&self) -> Option<TtsSnapshot> {
+        let http_requests = self.http_requests.load(Relaxed);
+        let websocket_sessions = self.websocket_sessions.load(Relaxed);
+        let active = self.active.load(Relaxed);
+        if !active && http_requests == 0 && websocket_sessions == 0 {
+            return None;
+        }
+        Some(TtsSnapshot {
+            http_requests,
+            websocket_sessions,
+            active_streams: self.active_streams.load(Relaxed),
+            completed: self.completed.load(Relaxed),
+            errors: self.errors.load(Relaxed),
+            cancelled: self.cancelled.load(Relaxed),
+            playback_stalls: self.playback_stalls.load(Relaxed),
+            watchdog_recovers: self.watchdog_recovers.load(Relaxed),
+            audio_duration_seconds: self.audio_duration_ms.load(Relaxed) as f64 / 1000.0,
+            first_audio: self.first_audio.snapshot(),
+            e2e: self.e2e.snapshot(),
         })
     }
 }
@@ -182,6 +240,7 @@ pub struct ModelSnapshot {
     pub e2e: LatencySnapshot,
     pub queue: LatencySnapshot,
     pub asr: Option<AsrSnapshot>,
+    pub tts: Option<TtsSnapshot>,
 }
 
 #[derive(serde::Serialize)]
@@ -215,6 +274,7 @@ pub fn snapshot(models: &[(String, Arc<Metrics>, bool)]) -> RuntimeSnapshot {
             .map(|(id, m, ready)| {
                 let s = &m.serving;
                 let asr = s.asr.snapshot();
+                let tts = s.tts.snapshot();
                 let cohort = s.asr.cohort.load(Relaxed);
                 ModelSnapshot {
                     id: id.clone(),
@@ -266,6 +326,7 @@ pub fn snapshot(models: &[(String, Arc<Metrics>, bool)]) -> RuntimeSnapshot {
                         s.queue.snapshot()
                     },
                     asr,
+                    tts,
                 }
             })
             .collect(),
@@ -275,6 +336,7 @@ pub fn snapshot(models: &[(String, Arc<Metrics>, bool)]) -> RuntimeSnapshot {
 #[derive(Default)]
 pub struct ServingMetrics {
     pub asr: AsrMetrics,
+    pub tts: TtsMetrics,
     pub running: AtomicU64,
     pub prompt_computed: AtomicU64,
     pub prompt_cached: AtomicU64,
@@ -1090,6 +1152,88 @@ impl ServingMetrics {
                 if m.serving.asr.cohort.load(Relaxed) { select(&m.serving.asr).write_seconds(out, name, labels); }
             }
         }
+        scalar!(
+            "plowrt_asr_audio_duration_seconds_total",
+            "counter",
+            "Cumulative duration of processed input audio in seconds.",
+            |m: &Metrics, _| m.serving.asr.audio_duration_ms.load(Relaxed) as f64 / 1000.0
+        );
+        scalar!(
+            "plowrt_tts_http_requests_total",
+            "counter",
+            "HTTP speech synthesis requests routed to this model.",
+            |m: &Metrics, _| m.serving.tts.http_requests.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_tts_websocket_sessions_total",
+            "counter",
+            "WebSocket TTS streaming sessions routed to this model.",
+            |m: &Metrics, _| m.serving.tts.websocket_sessions.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_tts_active_streams",
+            "gauge",
+            "Active concurrent TTS streams currently generating or streaming audio.",
+            |m: &Metrics, _| m.serving.tts.active_streams.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_tts_completed_total",
+            "counter",
+            "TTS generation/streaming requests completed successfully.",
+            |m: &Metrics, _| m.serving.tts.completed.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_tts_errors_total",
+            "counter",
+            "TTS synthesis requests ending in an error.",
+            |m: &Metrics, _| m.serving.tts.errors.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_tts_cancelled_total",
+            "counter",
+            "TTS requests or streaming sessions cancelled or aborted by client disconnect.",
+            |m: &Metrics, _| m.serving.tts.cancelled.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_tts_playback_stalls_total",
+            "counter",
+            "Observed audio buffer underruns or playback stalls across streaming sessions.",
+            |m: &Metrics, _| m.serving.tts.playback_stalls.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_tts_watchdog_recovers_total",
+            "counter",
+            "Mute or drone anomalies detected and recovered by audio watchdog.",
+            |m: &Metrics, _| m.serving.tts.watchdog_recovers.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_tts_audio_duration_seconds_total",
+            "counter",
+            "Cumulative duration of synthesized audio output in seconds.",
+            |m: &Metrics, _| m.serving.tts.audio_duration_ms.load(Relaxed) as f64 / 1000.0
+        );
+        for (name, help, select) in [
+            (
+                "plowrt_tts_first_audio_seconds",
+                "Time from speech request arrival to first playable audio frame (TTFA).",
+                (|m: &TtsMetrics| &m.first_audio) as fn(&TtsMetrics) -> &Histogram,
+            ),
+            (
+                "plowrt_tts_e2e_duration_seconds",
+                "Time from speech request arrival to full utterance completion.",
+                (|m: &TtsMetrics| &m.e2e) as fn(&TtsMetrics) -> &Histogram,
+            ),
+        ] {
+            family(out, name, "histogram", help);
+            for ((_, m, _), labels) in models.iter().zip(&labels) {
+                if m.serving.tts.active.load(Relaxed)
+                    || m.serving.tts.http_requests.load(Relaxed) > 0
+                    || m.serving.tts.websocket_sessions.load(Relaxed) > 0
+                {
+                    select(&m.serving.tts).write_seconds(out, name, labels);
+                }
+            }
+        }
         crate::serve::turns::write_metrics(out);
         family(out, "plowrt_overload_level", "gauge", "Overload level: 0 normal, 1 ASR partials stretched, 2 TTS render-ahead capped, 3 new sessions shed.");
         let _ = writeln!(
@@ -1424,5 +1568,56 @@ mod tests {
         ));
         assert!(out.contains("vllm:generation_tokens_total{model_name=\"b\",engine=\"0\"} 23\n"));
         assert!(!out.contains("vllm:kv_cache_usage_perc"));
+    }
+
+    #[test]
+    fn tts_and_asr_metrics_exposition_and_snapshots() {
+        let m = Arc::new(Metrics::default());
+        m.serving.tts.active.store(true, Relaxed);
+        m.serving.tts.http_requests.store(5, Relaxed);
+        m.serving.tts.websocket_sessions.store(10, Relaxed);
+        m.serving.tts.active_streams.store(3, Relaxed);
+        m.serving.tts.completed.store(14, Relaxed);
+        m.serving.tts.errors.store(1, Relaxed);
+        m.serving.tts.cancelled.store(2, Relaxed);
+        m.serving.tts.playback_stalls.store(0, Relaxed);
+        m.serving.tts.watchdog_recovers.store(1, Relaxed);
+        m.serving.tts.audio_duration_ms.store(150_000, Relaxed);
+        m.serving
+            .tts
+            .first_audio
+            .duration(Duration::from_millis(115));
+        m.serving.tts.e2e.duration(Duration::from_millis(500));
+
+        m.serving.asr.cohort.store(true, Relaxed);
+        m.serving.asr.audio_duration_ms.store(200_000, Relaxed);
+
+        let snap = m.serving.tts.snapshot().expect("tts snapshot");
+        assert_eq!(snap.http_requests, 5);
+        assert_eq!(snap.websocket_sessions, 10);
+        assert_eq!(snap.active_streams, 3);
+        assert_eq!(snap.completed, 14);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(snap.cancelled, 2);
+        assert_eq!(snap.playback_stalls, 0);
+        assert_eq!(snap.watchdog_recovers, 1);
+        assert_eq!(snap.audio_duration_seconds, 150.0);
+        assert_eq!(snap.first_audio.count, 1);
+
+        let mut out = String::new();
+        ServingMetrics::write(&mut out, &[("maya2".into(), m, true)]);
+        let l = "{model_name=\"maya2\",engine=\"0\"}";
+        assert!(out.contains(&format!("plowrt_tts_http_requests_total{l} 5\n")));
+        assert!(out.contains(&format!("plowrt_tts_websocket_sessions_total{l} 10\n")));
+        assert!(out.contains(&format!("plowrt_tts_active_streams{l} 3\n")));
+        assert!(out.contains(&format!("plowrt_tts_completed_total{l} 14\n")));
+        assert!(out.contains(&format!("plowrt_tts_errors_total{l} 1\n")));
+        assert!(out.contains(&format!("plowrt_tts_cancelled_total{l} 2\n")));
+        assert!(out.contains(&format!("plowrt_tts_playback_stalls_total{l} 0\n")));
+        assert!(out.contains(&format!("plowrt_tts_watchdog_recovers_total{l} 1\n")));
+        assert!(out.contains(&format!("plowrt_tts_audio_duration_seconds_total{l} 150\n")));
+        assert!(out.contains(&format!("plowrt_asr_audio_duration_seconds_total{l} 200\n")));
+        assert!(out.contains("plowrt_tts_first_audio_seconds_count"));
+        assert!(out.contains("plowrt_tts_e2e_duration_seconds_count"));
     }
 }

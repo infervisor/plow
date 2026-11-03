@@ -107,7 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
             let longest = group.iter().map(|c| c.1.len()).max().unwrap_or(0);
-            let piece = if uploads { longest.max(1) } else { 16 * chunk_ms };
+            let piece = if uploads {
+                longest.max(1)
+            } else {
+                16 * chunk_ms
+            };
             let mut texts: Vec<Option<String>> = vec![None; group.len()];
             for offset in (0..=longest.div_ceil(piece) * piece).step_by(piece) {
                 let pushes: Vec<_> = group

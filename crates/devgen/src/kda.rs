@@ -2272,6 +2272,9 @@ mod tests {
     /// The op graph: and every new opcode reachable.
     #[test]
     fn one_layer_emits_the_expected_graph() {
+        // The GEMV count depends on `kda_fb_fold`, which `k3.rs`'s fold test turns on
+        // process-wide while it holds this guard.
+        let _env = crate::test_env::env_guard();
         let c = k3();
         let mut b = Builder::new(256);
         let all: Vec<u32> = (0..256).collect();
@@ -2353,7 +2356,7 @@ mod tests {
             assert!(
                 ops.contains(&(*op as u16)),
                 "{op:?} is not emitted — an opcode nothing \
-                    reaches is how Mamba2Scan became dead code"
+                    reaches is how Mamba2Scan stayed block-only"
             );
         }
         // ...and NOTHING from the other spelling, or the layer would run the chain twice.
@@ -2406,6 +2409,8 @@ mod tests {
     /// up to `H*D`), the same shape as the forget gate's own `f_a_proj`/`f_b_proj` pair.
     #[test]
     fn low_rank_gate_emits_gemv_qkv_and_mirrors_the_forget_gate_shape() {
+        // Same as `one_layer_emits_the_expected_graph`: the GEMV count depends on a live knob.
+        let _env = crate::test_env::env_guard();
         let c = glm53();
         let mut b = Builder::new(256);
         let all: Vec<u32> = (0..256).collect();

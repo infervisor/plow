@@ -37,7 +37,7 @@ PLOW_MOE_PREFILL = "1"
 [serve.env]
 PLOW_TP_NO_AUDIT = "0"
 PLOW_TP_AGREE_EVERY = "1"
-PLOW_PREFIX_CACHE = "0"
+# Prefix cache stays on (policy: never disabled in a recipe; match the vLLM peer with its prefix caching on).
 PLOW_MLA_PF_V2 = "1"
 
 [bench]

@@ -29,15 +29,19 @@ impl EngineThread {
     /// cores for the head pool while the thread being protected floats reserves
     /// nothing. With the feature off the reservation is empty and no affinity
     /// call is made, so the default build places this thread exactly as before.
+    /// The thread runs under the caller's engine config scope (`config::scoped`), set once.
     pub fn spawn(name: String) -> EngineThread {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let scope = crate::config::current_scope();
         std::thread::Builder::new()
             .name(name)
             .spawn(move || {
                 pin_serving();
-                while let Ok(job) = rx.recv() {
-                    job();
-                }
+                crate::config::scoped(scope, || {
+                    while let Ok(job) = rx.recv() {
+                        job();
+                    }
+                })
             })
             .expect("spawn engine thread");
         EngineThread { tx }

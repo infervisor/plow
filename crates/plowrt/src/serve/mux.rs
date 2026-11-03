@@ -566,6 +566,8 @@ pub struct SpeechJob {
     /// members; empty = no frame rows. Past its end every row's codes are zero.
     pub frame_codes: Vec<u32>,
     pub frame_codes_per_row: usize,
+    /// Maya 2: a cloned speaker's depth memory, `[layers][hidden]` (`None`: the null speaker's).
+    pub maya2_memory: Option<std::sync::Arc<[f32]>>,
 }
 
 pub type SpeechEncode =
@@ -589,6 +591,9 @@ pub struct DepthJob {
     pub semantic_base: u32,
     pub stop_class: u32,
     pub stop_token: u32,
+    /// Maya 2: the host cb0 controller's plan for this piece (the backbone class is drawn on the
+    /// host; the fields above sample nothing).
+    pub maya2: Option<crate::tts::maya2::Plan>,
 }
 
 impl DepthJob {
@@ -868,7 +873,7 @@ impl ModelMux {
     /// prefill) are at the cap, so a new one would only queue into a long TTFT; a load balancer
     /// can spill it instead. A soft bound: the seated count refreshes once per dispatcher tick.
     fn shed_queue_depth(&self) -> bool {
-        let cap = crate::config::RuntimeConfig::get().shed_queue_depth;
+        let cap = crate::config::RuntimeConfig::process_get().shed_queue_depth;
         cap > 0 && {
             let waiting = self.metrics.queued_requests.load(Ordering::Relaxed)
                 + self.metrics.prefill_waiting.load(Ordering::Relaxed);
@@ -1136,6 +1141,20 @@ pub fn spawn(
     state: Arc<AppState>,
     cfg: MuxConfig,
 ) -> ModelMux {
+    // The model's own engine config for everything the dispatcher reads, here and in its task;
+    // a model loaded without one (portable, bucketed) runs the process config by design.
+    let engine_cfg = state
+        .engine_config(&slug)
+        .unwrap_or_else(crate::config::RuntimeConfig::process_get);
+    crate::config::scoped(Some(engine_cfg), || spawn_scoped(slug, bundle, state, cfg))
+}
+
+fn spawn_scoped(
+    slug: String,
+    bundle: Arc<ModelBundle>,
+    state: Arc<AppState>,
+    cfg: MuxConfig,
+) -> ModelMux {
     let preempt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let preempt_seen = Arc::clone(&preempt_flag);
     let preempt_notify = Arc::new(tokio::sync::Notify::new());
@@ -1341,6 +1360,7 @@ pub fn spawn(
         .filter(|cpus| !cpus.is_empty() && crate::config::RuntimeConfig::get().dp_numa_pin);
     let downstream = state.downstream(&slug);
 
+    let dispatcher_scope = crate::config::current_scope();
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
         let mut fair = Fair::default();
@@ -1390,6 +1410,8 @@ pub fn spawn(
         // model parks, so an idle model never sits on a device its co-tenant is
         // waiting for.
         let mut turn = crate::serve::cosched::Turn::default();
+        // Process-scoped: one co-scheduling policy for every tenant of the device.
+        let early_release = crate::config::RuntimeConfig::process_get().cosched_early_release;
         let cost_id = crate::sched::cost::id(&slug);
         #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         let has_gpu = false;
@@ -1487,8 +1509,11 @@ pub fn spawn(
                 // jobs never had their chance to be dequeued and admitted,
                 // and a stream that ends with no terminal chunk is
                 // indistinguishable from a crash (the shed path at the
-                // admission gate sets the precedent).
-                while let Ok(msg) = rx.try_recv() {
+                // admission gate sets the precedent). Closed first, then drained to the end: a
+                // job sent after a last `try_recv` (or on a permit taken before the close) was
+                // lost with no terminal at all. `recv` ends once the buffer and permits are spent.
+                rx.close();
+                while let Some(msg) = rx.recv().await {
                     note_dequeued(&msg, &metrics);
                     match msg {
                         MuxMsg::Drain(done) => {
@@ -2039,9 +2064,12 @@ pub fn spawn(
             let joined = match &engine_thread {
                 Some(t) => t.run(tick).await,
                 None if inline_tick => crate::exec::engine_thread::run_inline(tick),
-                None => tokio::task::spawn_blocking(tick)
-                    .await
-                    .map_err(|e| e.to_string()),
+                None => {
+                    let scope = crate::config::current_scope();
+                    tokio::task::spawn_blocking(move || crate::config::scoped(scope, tick))
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             };
 
             let t_returned = Instant::now();
@@ -2175,6 +2203,12 @@ pub fn spawn(
                     obs = None;
                 }
             }
+            // `due` again: a request that finished during the tick no longer sets the urgency.
+            if let Some(dt) = &device_turn {
+                turn.finish_if(dt, early_release, || {
+                    tick_due(&slots, &waiting, cost_id, Instant::now())
+                });
+            }
 
             // Post-tick: drain OOB events from the executor. Handles faults,
             // checkpoints, and speculative verdicts. The channel is lock-free
@@ -2202,6 +2236,7 @@ pub fn spawn(
         metrics.decode_rung_admission.store(0, Ordering::Relaxed);
         metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
     };
+    let dispatcher = crate::config::Scoped::new(dispatcher_scope, dispatcher);
     if inline_tick {
         std::thread::Builder::new()
             .name(dispatcher_name)
@@ -3499,7 +3534,7 @@ fn run_one_tick(
                                 .min(remaining)
                                 .min(pf_chunk_rows())
                                 .min(e.pf_request_max_rows())
-                                .min(e.state_capture_cut(i, request.prompt_ids.len(), start));
+                                .min(e.state_capture_cut(i, &request.prompt_ids, start));
                             if request.mm.as_deref().is_some_and(|j| j.spans()) {
                                 take = plow_asset::multimodal::span_safe_rows(
                                     &request.prompt_ids,
@@ -3700,8 +3735,9 @@ fn run_one_tick(
                             Ok(Some((_, false))) => {}
                             Err(err) => {
                                 note_fault(&mut tick_fault, &err);
-                                let owner = if slots[i].is_some() { i } else { i - 1 };
-                                fail_slot(&mut slots[owner], &arena, err);
+                                if let Some(owner) = pack_owner(&slots, i) {
+                                    fail_slot(&mut slots[owner], &arena, err);
+                                }
                                 continue;
                             }
                         }
@@ -4605,7 +4641,18 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            if !rt.pf_defer_decode && !slo_on && e.token_batch_rows(1, 0, 1).is_some() {
+            // A live request asking for logprobs keeps the ordinary path on an engine whose token
+            // batch keeps no logits row for the tokens it samples.
+            if !rt.pf_defer_decode
+                && !slo_on
+                && e.token_batch_rows(1, 0, 1).is_some()
+                && (e.token_batch_logprobs()
+                    || !slots
+                        .iter()
+                        .take(b)
+                        .flatten()
+                        .any(|s| s.gen.params.logprobs.is_some()))
+            {
                 let feeds: Vec<(usize, u32)> = slots
                     .iter()
                     .enumerate()
@@ -6802,7 +6849,10 @@ fn gpu_prefill_batched_pass(
     completed.clear();
     *dev_sampled = false;
     let compact = e.has_packed_terminal();
-    let mut unified = e.token_batch_enabled();
+    // A CFG pair's partner row has no slot entry of its own, and its uncond logits are read at
+    // the owner's row + 1: the unified batch carries neither, so pairs take the ordinary path.
+    let mut unified =
+        e.token_batch_enabled() && !slots.iter().take(cap).flatten().any(|s| s.cfg.is_some());
     // Whether this tick's decode rows may still leave the launch for their own step
     // (`sched::ride`): decided once, when the launch's bucket is known.
     let mut ride_open = unified && !feeds.is_empty();
@@ -6991,9 +7041,9 @@ fn gpu_prefill_batched_pass(
                 if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
                     return None;
                 }
-                let publish = e
-                    .pf_publish_cap(i, pf_pos)
-                    .min(e.state_capture_cut(i, n, pf_pos));
+                let publish =
+                    e.pf_publish_cap(i, pf_pos)
+                        .min(e.state_capture_cut(i, &s.prompt_ids, pf_pos));
                 let mut remaining = e
                     .pf_plan_slice(n - withheld - pf_pos, chunk_cap)
                     .min(publish);
@@ -7192,6 +7242,9 @@ fn gpu_prefill_batched_pass(
                 .map(|p| p.0)
                 .chain(feeds.iter().map(|f| f.0).filter(|_| unified)),
         );
+        // A token batch refused before its first launch left every slot as it was: its prompts
+        // run without riders and the riders take their own decode step, instead of failing.
+        let mut refused = false;
         let res = if unified {
             use plow_asset::token_batch::{Phase, Request, Selection};
             // A feed or pack entry whose slot vanished mid-tick is skipped, not a panic:
@@ -7229,6 +7282,7 @@ fn gpu_prefill_batched_pass(
                 })
             });
             let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
+            let stepped = pen_synced.is_ok();
             let result = if let Err(err) = pen_synced {
                 Err(err)
             } else if !window.is_empty() {
@@ -7258,6 +7312,11 @@ fn gpu_prefill_batched_pass(
                         .iter()
                         .map(|&(slot, token)| (slot as usize, token)),
                 );
+            } else if stepped
+                && e.token_batch_refused_before_launch()
+                && matches!(result, Err(crate::RuntimeError::Rejected(_)))
+            {
+                refused = true;
             }
             result
         } else {
@@ -7363,6 +7422,19 @@ fn gpu_prefill_batched_pass(
                     e.advance_prefill_turn(last_slot);
                 }
             }
+            Err(err) if refused => {
+                tracing::warn!(
+                    error = %err,
+                    riders = feeds.len(),
+                    packed = pack.len(),
+                    "gpu: token batch refused before launch; prefill runs without riders"
+                );
+                unified = false;
+                decode_rows = 0;
+                spans.clear();
+                *dev_sampled = false;
+                continue;
+            }
             Err(err) => {
                 // The shared launch failed — every packed request loses.
                 tracing::warn!(
@@ -7381,8 +7453,9 @@ fn gpu_prefill_batched_pass(
                     }
                 }
                 for &(i, _, _) in &pack {
-                    let owner = if slots[i].is_some() { i } else { i - 1 };
-                    fail_slot(&mut slots[owner], arena, fanout_err(&err, &msg));
+                    if let Some(owner) = pack_owner(slots, i) {
+                        fail_slot(&mut slots[owner], arena, fanout_err(&err, &msg));
+                    }
                     if unified {
                         e.retire_slot(i, false);
                     }
@@ -7595,6 +7668,10 @@ fn gpu_prefill_advance(
     }
     if let Some(job) = slot.speech.as_ref().and_then(|s| s.depth) {
         e.fish_reset_slot(slot_idx)?;
+        if let Some(plan) = job.maya2 {
+            let memory = slot.speech.as_ref().and_then(|s| s.maya2_memory.clone());
+            e.maya2_bind(slot_idx, plan, memory.as_deref())?;
+        }
         e.fish_logits_to_slot(slot_idx)?;
         let cond_row = e.prefill_terminal_row();
         // The pair's unconditional hidden goes back into `act.hn` beside the owner's.
@@ -7695,7 +7772,20 @@ fn gpu_speech_prefill_inputs(
         }
         e.write_tensor("in.frame_codes", 0, bytemuck::cast_slice(&codes))?;
     }
+    // A frame-code prompt's other rows keep what `EmbedFrameBf16` wrote (reference frames).
+    let rest = if sp.frame_codes.is_empty() {
+        u32::MAX
+    } else {
+        OVERLAY_KEEP
+    };
     if overlay_pos.is_empty() {
+        // Overlays are optional on some packets (Maya 2's cloned anchors): the index is shared,
+        // so a job without one clears what the last overlay job left.
+        if let Some(bytes) = e.tensor_bytes("in.encoder_overlay_index") {
+            let window = (bytes as usize / 4).min(e.pf_max_rows().max(1));
+            let index = vec![rest; window];
+            e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))?;
+        }
         return Ok(());
     }
     if !e.has_prefill() {
@@ -7711,12 +7801,6 @@ fn gpu_speech_prefill_inputs(
     // Every row a prefill launch may read, padded bucket rows included.
     let window = index_rows.min(e.pf_max_rows().max(1));
     let mut index = Vec::new();
-    // A frame-code prompt's other rows keep what `EmbedFrameBf16` wrote (reference frames).
-    let rest = if sp.frame_codes.is_empty() {
-        u32::MAX
-    } else {
-        OVERLAY_KEEP
-    };
     let (lo, hi) = speech_overlay_index(overlay_pos, c0, window, rest, &mut index);
     if hi > lo {
         e.write_tensor(
@@ -7764,6 +7848,19 @@ fn pack_row(slots: &[Option<Slot>], i: usize) -> Option<(&Slot, usize)> {
             Some((owner, owner.cfg.as_ref()?.partner_pf))
         }
     }
+}
+
+/// The request owning engine row `i`: its own slot, or the CFG owner of a pair's partner row.
+#[cfg(any(feature = "cuda", test))]
+fn pack_owner(slots: &[Option<Slot>], i: usize) -> Option<usize> {
+    if slots.get(i)?.is_some() {
+        return Some(i);
+    }
+    let owner = i.checked_sub(1)?;
+    slots[owner]
+        .as_ref()
+        .is_some_and(|s| s.cfg.is_some())
+        .then_some(owner)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -10914,6 +11011,30 @@ mod tests {
         }
         let slots = vec![owner, None];
         assert_eq!(gpu_decode_feeds(&slots, 2), [(0, 7), (1, 7)]);
+    }
+
+    /// A failed launch fans out to each row's owner: a CFG partner row to its owner, an empty
+    /// row (slot 0 included) to nobody, never to an unrelated neighbour.
+    #[test]
+    fn pack_owner_names_the_cfg_owner_and_nobody_else() {
+        let (mut owner, _rx) = prefill_test_slot();
+        owner.as_mut().unwrap().cfg = Some(Box::new(CfgRun {
+            rng: None,
+            partner_pf: 0,
+            cond: Vec::new(),
+            uncond: Vec::new(),
+            scratch: Vec::new(),
+            dev_seeded: false,
+            uncond_hidden: Vec::new(),
+        }));
+        let (plain, _rx2) = prefill_test_slot();
+        let slots = vec![None, owner, None, plain, None];
+        assert_eq!(pack_owner(&slots, 0), None);
+        assert_eq!(pack_owner(&slots, 1), Some(1));
+        assert_eq!(pack_owner(&slots, 2), Some(1));
+        assert_eq!(pack_owner(&slots, 3), Some(3));
+        assert_eq!(pack_owner(&slots, 4), None);
+        assert_eq!(pack_owner(&slots, 9), None);
     }
 
     /// A packed launch stages each member's overlay rows at its launch offset, in pack order: a

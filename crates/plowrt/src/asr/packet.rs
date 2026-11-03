@@ -99,7 +99,7 @@ impl PacketRnntTranscriber {
         &self,
         stream: &TranscriberStream,
         finish: bool,
-    ) -> Result<Vec<(Vec<f32>, usize)>> {
+    ) -> Result<Option<Vec<(Vec<f32>, usize)>>> {
         let w = self.geometry(stream)?;
         let frames = self
             .frontend
@@ -111,32 +111,23 @@ impl PacketRnntTranscriber {
     /// frames from window `steps` on and how many leading frames (counted from 0) are final.
     /// `finish`: the recording ended, so the windows run to the last row its offline transcription
     /// decodes, zeros past its mel frames (partial streaming stepped complete windows, so they
-    /// start inside the recording; they equal the whole recording's).
+    /// start inside the recording; they equal the whole recording's); `None` when the stream's
+    /// steps cannot reproduce that transcription.
     fn windows(
         &self,
         w: &StreamWindows,
         mut steps: usize,
         (features, complete): (LogMelFeatures, usize),
         finish: bool,
-    ) -> Result<Vec<(Vec<f32>, usize)>> {
+    ) -> Result<Option<Vec<(Vec<f32>, usize)>>> {
         let first = window_start(w, steps);
-        let mut windows = Vec::new();
         if finish {
-            let rows = self.execution.final_rows(first + features.frames)?;
-            while steps * w.rows < rows {
-                let (from, to) = (
-                    (window_start(w, steps) - first) * w.bins,
-                    (window_end(w, steps) - first) * w.bins,
-                );
-                let mut window = vec![0.0; to - from];
-                let len = features.values.len();
-                let values = &features.values[from.min(len)..to.min(len)];
-                window[..values.len()].copy_from_slice(values);
-                windows.push((window, w.rows.min(rows - steps * w.rows)));
-                steps += 1;
-            }
-            return Ok(windows);
+            return Ok(self
+                .execution
+                .final_rows(first + features.frames)?
+                .map(|rows| final_windows(&features.values, *w, steps, rows)));
         }
+        let mut windows = Vec::new();
         while complete >= window_end(w, steps) {
             let window = features
                 .values
@@ -148,7 +139,7 @@ impl PacketRnntTranscriber {
             windows.push((window.to_vec(), w.rows));
             steps += 1;
         }
-        Ok(windows)
+        Ok(Some(windows))
     }
 
     /// Each stream's mel frames from its next window on (`extract_partial`), the streams spread
@@ -165,7 +156,9 @@ impl PacketRnntTranscriber {
             .collect();
         let frontend = &self.frontend;
         let extract = |input: &Result<(&[f32], usize)>| {
-            let &(samples, from) = input.as_ref().map_err(|error| rejected(error.to_string()))?;
+            let &(samples, from) = input
+                .as_ref()
+                .map_err(|error| rejected(error.to_string()))?;
             frontend.extract_partial(samples, from)
         };
         #[cfg(feature = "hf-tokenizer")]
@@ -178,6 +171,31 @@ impl PacketRnntTranscriber {
             inputs.iter().map(extract).collect()
         }
     }
+}
+
+/// A finished stream's windows past its first `steps`, up to encoder row `rows`: cut from its mel
+/// frames `values` (from window `steps` on), zeros past them.
+fn final_windows(
+    values: &[f32],
+    w: StreamWindows,
+    mut steps: usize,
+    rows: usize,
+) -> Vec<(Vec<f32>, usize)> {
+    let first = window_start(&w, steps);
+    let mut windows = Vec::new();
+    while steps * w.rows < rows {
+        let (from, to) = (
+            (window_start(&w, steps) - first) * w.bins,
+            (window_end(&w, steps) - first) * w.bins,
+        );
+        let mut window = vec![0.0; to - from];
+        let len = values.len();
+        let have = &values[from.min(len)..to.min(len)];
+        window[..have.len()].copy_from_slice(have);
+        windows.push((window, w.rows.min(rows - steps * w.rows)));
+        steps += 1;
+    }
+    windows
 }
 
 /// The mel frames `window_start(steps)..window_end(steps)` a stream's window `steps` reads.
@@ -230,7 +248,9 @@ impl Transcriber for PacketRnntTranscriber {
             .get_mut(&id)
             .ok_or_else(|| rejected("unknown ASR stream"))?;
         stream.samples.extend_from_slice(samples);
-        let windows = self.pending_windows(&self.streams[&id], false)?;
+        let windows = self
+            .pending_windows(&self.streams[&id], false)?
+            .unwrap_or_default();
         let stream = self.streams.get_mut(&id).expect("present");
         stream.cut.clear();
         for (window, _) in windows {
@@ -245,6 +265,10 @@ impl Transcriber for PacketRnntTranscriber {
             stream.steps += 1;
         }
         Ok(detokenize(&self.output, &stream.tokens))
+    }
+
+    fn accepts_context(&self) -> bool {
+        false
     }
 
     fn stream_finals(&self) -> bool {
@@ -294,7 +318,16 @@ impl Transcriber for PacketRnntTranscriber {
                     self.windows(&self.geometry(&stream)?, stream.steps, frames, finish)
                 });
                 match windows {
-                    Ok(windows) => (stream.cut, stream.cut_finish) = (windows.into(), finish),
+                    Ok(Some(windows)) => (stream.cut, stream.cut_finish) = (windows.into(), finish),
+                    Ok(None) => {
+                        self.execution.stream_close(stream.rnnt);
+                        let cancel = AtomicBool::new(false);
+                        results[index] = Some(
+                            self.transcribe(&stream.samples, None, "", &cancel)
+                                .map(|transcript| Some(transcript.text)),
+                        );
+                        continue;
+                    }
                     Err(error) => {
                         stream.cut.clear();
                         results[index] = Some(Err(error));
@@ -314,9 +347,8 @@ impl Transcriber for PacketRnntTranscriber {
         let mel_us = started.elapsed().as_micros() as u64;
         // One launch a round per geometry, live streams first and finals first: a second launch
         // would hold every final in the round for both. The rest step next round, in push order.
-        stepping.sort_by_key(|(index, stream, ..)| {
-            (stream.rnnt.is_upload(), !pushes[*index].finish)
-        });
+        stepping
+            .sort_by_key(|(index, stream, ..)| (stream.rnnt.is_upload(), !pushes[*index].finish));
         let live = stepping
             .iter()
             .take_while(|(_, stream, ..)| !stream.rnnt.is_upload())
@@ -384,7 +416,8 @@ impl Transcriber for PacketRnntTranscriber {
             let result = results[index]
                 .take()
                 .unwrap_or_else(|| Ok(last.then(|| detokenize(&self.output, &stream.tokens))));
-            if pushes[index].finish && (last || result.is_err()) {
+            // A failed launch may have advanced the stream's caches and predictor slot: retire it.
+            if result.is_err() || (pushes[index].finish && last) {
                 self.execution.stream_close(stream.rnnt);
             } else {
                 self.streams.insert(pushes[index].id, stream);
@@ -445,7 +478,7 @@ impl Transcriber for PacketRnntTranscriber {
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Transcript> {
         if !context.is_empty() {
-            return Err(rejected("speech context is not implemented"));
+            return Err(rejected(super::CONTEXT_UNSUPPORTED));
         }
         if cancel.load(Ordering::Relaxed) {
             return Err(rejected("ASR cancelled"));
@@ -480,4 +513,34 @@ impl Transcriber for PacketRnntTranscriber {
 
 fn rejected(message: impl Into<String>) -> RuntimeError {
     RuntimeError::Rejected(format!("invalid packet RNNT: {}", message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nemotron's stream: 4 rows from 32 new mel frames, 16 repeated.
+    const W: StreamWindows = StreamWindows {
+        first: 32,
+        step: 48,
+        history: 16,
+        bins: 2,
+        rows: 4,
+    };
+
+    #[test]
+    fn final_windows_past_the_mel_frames_are_zeros() {
+        let values: Vec<f32> = (1..=20).map(|v| v as f32).collect();
+        let windows = final_windows(&values, W, 0, 10);
+        let rows: Vec<_> = windows.iter().map(|w| w.1).collect();
+        assert_eq!(rows, [4, 4, 2]);
+        assert_eq!(windows[0].0[..20], values[..]);
+        assert!(windows[0].0[20..].iter().all(|&v| v == 0.0));
+        // The later windows start past the 10 frames.
+        for (window, _) in &windows[1..] {
+            assert_eq!(window.len(), W.step * W.bins);
+            assert!(window.iter().all(|&v| v == 0.0));
+        }
+        assert_eq!(final_windows(&values, W, 3, 12), []);
+    }
 }

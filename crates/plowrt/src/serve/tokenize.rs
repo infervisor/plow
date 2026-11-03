@@ -67,11 +67,13 @@ pub async fn tokenize(
             })
             .into_response()
         }
-        Err(_) => (
+        Err(_) => crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("no model registered for '{}'.", req.model)})),
-        )
-            .into_response(),
+            format!("The model '{}' does not exist", req.model),
+            "invalid_request_error",
+            Some("model_not_found"),
+            Some("model".into()),
+        ),
     }
 }
 
@@ -84,10 +86,12 @@ pub async fn detokenize(
             prompt: bundle.tokenizer().decode(&req.tokens),
         })
         .into_response(),
-        Err(_) => (
+        Err(_) => crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("no model registered for '{}'.", req.model)})),
-        )
-            .into_response(),
+            format!("The model '{}' does not exist", req.model),
+            "invalid_request_error",
+            Some("model_not_found"),
+            Some("model".into()),
+        ),
     }
 }

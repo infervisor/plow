@@ -320,3 +320,65 @@ fn a_qwen2_checkpoint_without_tokenizer_json_links_vocab_and_merges() {
         let _ = std::fs::remove_dir_all(p);
     }
 }
+
+/// Two variants on one checkpoint, prepared in sequence: the second finds the farm and passes it
+/// as its snapshot. Rebuilt from itself it linked every shard to itself; both bundles must still
+/// reach real shard files.
+#[test]
+fn a_second_variant_on_the_farm_keeps_every_link_resolving() {
+    second_variant_on_the_farm(false);
+}
+
+/// The same with a hub-cache snapshot, whose shards are links into `blobs/`: the farm's source
+/// is the snapshot dir, not where its links resolve.
+#[test]
+fn a_second_variant_on_a_hub_snapshot_farm_keeps_every_link_resolving() {
+    second_variant_on_the_farm(true);
+}
+
+fn second_variant_on_the_farm(hub: bool) {
+    let store = tmp("store");
+    let snap = snapshot("snap", 2, &["tokenizer.json", "config.json"]);
+    let blobs = tmp("blobs");
+    if hub {
+        for (i, e) in std::fs::read_dir(&snap).unwrap().flatten().enumerate() {
+            let blob = blobs.join(format!("{i:064x}"));
+            std::fs::rename(e.path(), &blob).unwrap();
+            std::os::unix::fs::symlink(&blob, e.path()).unwrap();
+        }
+    }
+    let (first, second) = (tmp("bundle-a"), tmp("bundle-b"));
+    for d in [&first, &second] {
+        std::fs::write(d.join("model.pkt"), b"pkt").unwrap();
+    }
+    let b = bundle(from_checkpoint(), vec![packet_file()]);
+    let farm = build(&store, &b, &first, &snap).unwrap();
+    let again = build(&store, &b, &second, &farm.dir).unwrap();
+    assert_eq!(again.dir, farm.dir);
+    for d in [&first, &second] {
+        for f in [
+            "checkpoint/model-00001-of-00002.safetensors",
+            "checkpoint/model-00002-of-00002.safetensors",
+            "checkpoint/config.json",
+            "tokenizer.json",
+        ] {
+            let p = d.join(f);
+            assert!(
+                std::fs::metadata(&p).is_ok_and(|m| m.is_file()),
+                "{} does not resolve to a file",
+                p.display()
+            );
+        }
+    }
+    for e in std::fs::read_dir(&farm.dir).unwrap().flatten() {
+        let target = std::fs::canonicalize(e.path()).unwrap();
+        assert!(
+            !target.starts_with(&farm.dir),
+            "{} links into the farm",
+            e.path().display()
+        );
+    }
+    for p in [store, snap, blobs, first, second] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}

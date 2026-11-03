@@ -55,8 +55,16 @@ pub struct StreamPush<'a> {
     pub finish: bool,
 }
 
+/// The refusal of a non-empty prompt by an engine that cannot condition on one.
+pub const CONTEXT_UNSUPPORTED: &str = "speech context is not implemented";
+
 pub trait Transcriber: Send {
     fn language(&self, requested: Option<&str>) -> crate::Result<Option<String>>;
+    /// Whether a request's prompt (`context`) conditions the transcript. An engine that cannot
+    /// refuses a non-empty one ([`CONTEXT_UNSUPPORTED`]) on every path, streamed or offline.
+    fn accepts_context(&self) -> bool {
+        true
+    }
     fn finalization_policy(&self) -> FinalizationPolicy {
         FinalizationPolicy::default()
     }
@@ -206,6 +214,7 @@ fn push_alone<T: Transcriber + ?Sized>(
         .iter()
         .map(|push| {
             if push.finish {
+                engine.stream_close(push.id);
                 return Err(crate::RuntimeError::Rejected(
                     "this ASR engine answers no finals from its stream".into(),
                 ));
@@ -220,6 +229,10 @@ fn push_alone<T: Transcriber + ?Sized>(
 impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
     fn language(&self, requested: Option<&str>) -> crate::Result<Option<String>> {
         (**self).language(requested)
+    }
+
+    fn accepts_context(&self) -> bool {
+        (**self).accepts_context()
     }
 
     fn batch_capacity(&self) -> usize {

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Export Breeze TTS 2's reference-audio encoder (Qwen3-TTS-Tokenizer-12Hz `encoder.*` = HF Mimi) for
-plowc (crates/devgen/src/mimi_encoder.rs).
+"""Export an HF Mimi encoder for plowc (crates/devgen/src/mimi_encoder.rs): Breeze TTS 2's reference-audio
+encoder (Qwen3-TTS-Tokenizer-12Hz `encoder.*`), or kyutai/mimi itself (Maya 2 Native's voice cloning,
+all 32 quantizers).
 
 Writes OUT_DIR/model.safetensors (fp32, torch layouts, folds in fp64) and OUT_DIR/config.json,
 model_type mimi_encoder:
@@ -15,7 +16,7 @@ model_type mimi_encoder:
   {sem,ac}.E{k} / .nb{k}       centroids embed_sum / clamp(cluster_usage, 1e-5) and -|e|^2 / 2: the
                                nearest centroid is the argmax of x . e - |e|^2 / 2
 
-  HF_HOME=... python scripts/tts/mimi_encoder_export.py OUT_DIR REVISION
+  HF_HOME=... python scripts/tts/mimi_encoder_export.py OUT_DIR REVISION [REPO]   (REPO kyutai/mimi)
 """
 import json
 import os
@@ -28,16 +29,24 @@ REPO = "models--BreezeBlue--Breeze-TTS-2"
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         sys.exit(__doc__)
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
     hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
         os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
-    src = os.path.join(hub, REPO, "snapshots", sys.argv[2], "audio_tokenizer")
-    sd = {k[len("encoder."):]: v for k, v in load_file(f"{src}/model.safetensors").items() if k.startswith("encoder.")}
-    top = json.load(open(f"{src}/config.json"))
-    ec = top["encoder_config"]
+    if len(sys.argv) == 4:
+        src = os.path.join(hub, "models--" + sys.argv[3].replace("/", "--"), "snapshots", sys.argv[2])
+        sd = load_file(f"{src}/model.safetensors")
+        ec = json.load(open(f"{src}/config.json"))
+        top = dict(encoder_config=ec, encoder_valid_num_quantizers=ec.get("num_quantizers", 32),
+                   encode_downsample_rate=int(ec["sampling_rate"] / ec["frame_rate"]))
+    else:
+        src = os.path.join(hub, REPO, "snapshots", sys.argv[2], "audio_tokenizer")
+        sd = {k[len("encoder."):]: v for k, v in load_file(f"{src}/model.safetensors").items()
+              if k.startswith("encoder.")}
+        top = json.load(open(f"{src}/config.json"))
+        ec = top["encoder_config"]
     T = {}
 
     def put(name, t):

@@ -256,7 +256,9 @@ def rekey(plan, mode, scales, weight_map, shards, src_dir, out_dir, sources):
     with open(os.path.join(out_dir, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": {"total_size": total}, "weight_map": out_map}, f, indent=2)
     for fname in os.listdir(src_dir):
-        if fname.endswith((".json", ".jinja", ".txt", ".model")) and not fname.endswith(".safetensors.index.json"):
+        # Subdirectories are side tables the runtime reads beside the checkpoint (Maya 2's speaker/, ecapa/).
+        side = os.path.isdir(os.path.join(src_dir, fname))
+        if side or fname.endswith((".json", ".jinja", ".txt", ".model")) and not fname.endswith(".safetensors.index.json"):
             dst = os.path.join(out_dir, fname)
             if not os.path.lexists(dst):
                 os.symlink(os.path.join(os.path.realpath(src_dir), fname), dst)

@@ -208,7 +208,8 @@ fn activation_fp8_packing_still_requires_explicit_selection() {
 fn cublaslt_emission_rejects_unloadable_combinations() {
     let qwen = emit_capabilities("qwen3_5");
     assert!(cublaslt_emit_supported(qwen, "sm_90a", 1, false));
-    assert!(!cublaslt_emit_supported(qwen, "sm_120", 1, false));
+    assert!(cublaslt_emit_supported(qwen, "sm_120a", 1, false));
+    assert!(!cublaslt_emit_supported(qwen, "sm_100a", 1, false));
     assert!(!cublaslt_emit_supported(qwen, "gfx950", 1, false));
     assert!(!cublaslt_emit_supported(qwen, "sm_90a", 2, false));
     assert!(!cublaslt_emit_supported(qwen, "sm_90a", 1, true));

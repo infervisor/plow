@@ -180,7 +180,8 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
                                           const __nv_bfloat16* __restrict__ x,
                                           const __nv_bfloat16* __restrict__ W, unsigned M,
                                           unsigned N, unsigned K, unsigned slice, unsigned nblk,
-                                          const __nv_bfloat16* __restrict__ bias = nullptr) {
+                                          const __nv_bfloat16* __restrict__ bias = nullptr,
+                                          bool single_tile = true) {
 #if PLOW_NV_GEMV_MMA
     /* BATCH>=2 decode rungs walk the weights on the tensor cores (op_gemv_mma.cuh);
      * the dot8 walk is compute-bound above MM=1 — 100–366 GB/s at M=16 vs 1.4–2.6 TB/s
@@ -190,7 +191,8 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
      * the 1 KiB device stack (ILLEGAL_ADDRESS) as soon as the entry frame grew past ~670 B. */
     if constexpr (TC && (MM >= 2 || PLOW_NV_GEMV_MMA_B1)) {
         if ((K & 31u) == 0u) {
-            gemv_rows_mma<BIAS, (MM + 15) / 16, (MM <= 8)>(C, x, W, M, N, K, slice, nblk, bias);
+            gemv_rows_mma<BIAS, (MM + 15) / 16, (MM <= 8)>(C, x, W, M, N, K, slice, nblk, bias,
+                                                           nullptr, single_tile);
 #if PLOW_NV_GEMV_MMA_PAIR
             if (N & 7u) gemv_rows_ragged_tail<BIAS>(C, x, W, M, N, K, slice, nblk, bias);
 #endif
@@ -296,14 +298,15 @@ template <int MM>
 __device__ __forceinline__ void gemv_block(__nv_bfloat16* C, const __nv_bfloat16* x,
                                            const __nv_bfloat16* W, unsigned M, unsigned N,
                                            unsigned K, unsigned slice, unsigned nblk) {
-    gemv_rows<MM>(C, x, W, M, N, K, slice, nblk);
+    gemv_rows<MM>(C, x, W, M, N, K, slice, nblk, nullptr, M <= GV_MM_MAX);
 }
 static __device__ void d_gemv(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                        const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N, unsigned K,
                        unsigned slice, unsigned nblk) {
+    const bool single_tile = (M <= GV_MM_MAX);
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_rows<decltype(mm)::v>(C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows, N, K,
-                                   slice, nblk);
+                                   slice, nblk, nullptr, single_tile);
     });
 }
 
@@ -313,9 +316,10 @@ static __device__ void d_gemv_bias(__nv_bfloat16* __restrict__ C,
                                    const __nv_bfloat16* __restrict__ W,
                                    const __nv_bfloat16* __restrict__ bias, unsigned M,
                                    unsigned N, unsigned K, unsigned slice, unsigned nblk) {
+    const bool single_tile = (M <= GV_MM_MAX);
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_rows<decltype(mm)::v, gv_un<decltype(mm)::v>::v, true>(
-            C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows, N, K, slice, nblk, bias);
+            C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows, N, K, slice, nblk, bias, single_tile);
     });
 }
 #endif
@@ -912,11 +916,12 @@ __device__ __forceinline__ void gemv_qkv_rows(__nv_bfloat16* Cq, __nv_bfloat16* 
                            unsigned Nk, unsigned Nv, unsigned K, unsigned slice, unsigned nblk,
                            const __nv_bfloat16* bq = nullptr,
                            const __nv_bfloat16* bk = nullptr,
-                           const __nv_bfloat16* bv = nullptr) {
+                           const __nv_bfloat16* bv = nullptr,
+                           bool single_tile = true) {
 #if PLOW_NV_GEMV_MMA
     if constexpr (TC && (MM >= 2 || PLOW_NV_GEMV_MMA_B1)) {
         if ((K & 31u) == 0u && ((Nq | Nk) & 7u) == 0u) {
-            gemv_qkv_rows_mma<BIAS, (MM + 15) / 16, (MM <= 8)>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv);
+            gemv_qkv_rows_mma<BIAS, (MM + 15) / 16, (MM <= 8)>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv, nullptr, single_tile);
         } else {
             gemv_qkv_rows_dot4<BIAS>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk,
                                      bq, bk, bv);
@@ -1006,11 +1011,12 @@ static __device__ void d_gemv_qkv_bias(
     const __nv_bfloat16* __restrict__ bk, const __nv_bfloat16* __restrict__ bv,
     unsigned M, unsigned Nq, unsigned Nk, unsigned Nv, unsigned K, unsigned slice,
     unsigned nblk) {
+    const bool single_tile = (M <= GV_MM_MAX);
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_qkv_rows<decltype(mm)::v, gv_un<decltype(mm)::v>::v, true>(
             Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk, Cv + (size_t)m0 * Nv,
             x + (size_t)m0 * K, Wq, Wk, Wv, rows, Nq, Nk, Nv, K, slice, nblk, bq,
-            bk, bv);
+            bk, bv, single_tile);
     });
 }
 #endif
@@ -1022,12 +1028,59 @@ static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16*
                            unsigned Nk, unsigned Nv, unsigned K, unsigned slice, unsigned nblk) {
     /* Before the walk this was a bare ladder topping out at MM=8: feeding M=32 straight to
      * gemv_qkv_rows<8> left rows 8..31 UNWRITTEN — fluent wrong text, no crash. */
+    const bool single_tile = (M <= GV_MM_MAX);
     gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
         gemv_qkv_rows<decltype(mm)::v>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,
                                        Cv + (size_t)m0 * Nv, x + (size_t)m0 * K, Wq, Wk, Wv,
-                                       rows, Nq, Nk, Nv, K, slice, nblk);
+                                       rows, Nq, Nk, Nv, K, slice, nblk, nullptr, nullptr, nullptr,
+                                       single_tile);
     });
 }
+
+#if PLOW_NV_NORM_FOLD && PLOW_NV_GEMV_MMA
+/* AddNorm fold walks (op_gemv_mma.cuh GvFoldOut / GvFoldIn): one tensor-core pass over all M <= 32
+ * rows, so a partial's row index is the activation row. */
+template <class F> __device__ __forceinline__ void gv_fold_walk(unsigned M, F f) {
+    if (M <= 8u) f(gv_mm<8>{});
+    else if (M <= 16u) f(gv_mm<16>{});
+    else f(gv_mm<32>{});
+}
+static __device__ void d_gemv_fold(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                                   const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N,
+                                   unsigned K, unsigned slice, unsigned nblk, const GvFoldOut& fo) {
+    if (M > 32u || (K & 31u) || (N & 7u)) __trap();
+    gv_fold_walk(M, [&](auto mm) {
+        constexpr int MM = decltype(mm)::v;
+        gemv_rows_mma<false, (MM + 15) / 16, (MM <= 8), true>(C, x, W, M, N, K, slice, nblk, nullptr, &fo);
+    });
+}
+static __device__ void d_gemv_glu_fold(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                                       const __nv_bfloat16* __restrict__ Wg,
+                                       const __nv_bfloat16* __restrict__ Wu, unsigned M, unsigned N,
+                                       unsigned K, unsigned act, unsigned slice, unsigned nblk,
+                                       const GvFoldIn& fi) {
+    if (M > 32u || (K & 31u) || K > 2048u) __trap();
+    gv_fold_walk(M, [&](auto mm) {
+        constexpr int MM = decltype(mm)::v;
+        gemv_glu_rows_mma<(MM + 15) / 16, (MM <= 8), true>(C, x, Wg, Wu, M, N, K, act, slice, nblk, &fi);
+    });
+}
+static __device__ void d_gemv_qkv_fold(__nv_bfloat16* Cq, __nv_bfloat16* Ck, __nv_bfloat16* Cv,
+                                       const __nv_bfloat16* __restrict__ x,
+                                       const __nv_bfloat16* __restrict__ Wq,
+                                       const __nv_bfloat16* __restrict__ Wk,
+                                       const __nv_bfloat16* __restrict__ Wv, unsigned M, unsigned Nq,
+                                       unsigned Nk, unsigned Nv, unsigned K, unsigned slice,
+                                       unsigned nblk, const GvFoldIn& fi) {
+    if (M > 32u || (K & 31u) || K > 2048u || ((Nq | Nk) & 7u)) __trap();
+    gv_fold_walk(M, [&](auto mm) {
+        constexpr int MM = decltype(mm)::v;
+        gemv_qkv_rows_mma<false, (MM + 15) / 16, (MM <= 8), true>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv,
+                                                                   K, slice, nblk, nullptr, nullptr,
+                                                                   nullptr, &fi);
+    });
+}
+#endif
 
 /* Arena-aware M=1 decode QKV GEMV: x staged into smem. */
 static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16* __restrict__ Ck,
@@ -2710,6 +2763,43 @@ static __device__ __forceinline__ void d_quant_fp8_cached(uint8_t* quantized, fl
 }
 
 #endif
+
+/* Block-scaled FP8 activation quant (QuantFp8 i3 = 128): one warp per (row, 128-wide K group),
+ * f32 scale at gs[group * Rp + row] (the cuBLASLt VEC128_32F layout), Rp = rows padded to 4.
+ * Pad rows get zero bytes and scale so the padded GEMM rows stay finite. Scale and rounding
+ * follow vLLM per_token_group_quant_fp8: max(amax, 1e-10) / 448 and a true divide. */
+static __device__ void d_quant_fp8_group(uint8_t* __restrict__ xq, const __nv_bfloat16* __restrict__ x,
+                                         float* __restrict__ gs, unsigned M, unsigned K, unsigned Rp,
+                                         unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned groups = K >> 7;
+    for (unsigned w = slice * PLOW_NV_WARPS + warp; w < Rp * groups; w += nblk * PLOW_NV_WARPS) {
+        const unsigned row = w / groups, g = w - row * groups;
+        const size_t at = (size_t)row * K + g * 128u + lane * 4u;
+        if (row >= M) {
+            *reinterpret_cast<unsigned*>(xq + at) = 0u;
+            if (lane == 0) gs[g * Rp + row] = 0.0f;
+            continue;
+        }
+        const uint2 raw = *reinterpret_cast<const uint2*>(x + at);
+        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw);
+        float v[4], amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            v[j] = __bfloat162float(b[j]);
+            amax = fmaxf(amax, fabsf(v[j]));
+        }
+        amax = warp_max32(amax);
+        const float s = __fdiv_rn(fmaxf(amax, 1e-10f), 448.0f);
+        float q[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) q[j] = fminf(fmaxf(__fdiv_rn(v[j], s), -448.0f), 448.0f);
+        *reinterpret_cast<unsigned*>(xq + at) =
+            (unsigned)pack_fp8_e4m3(q[0], q[1]) | ((unsigned)pack_fp8_e4m3(q[2], q[3]) << 16);
+        if (lane == 0) gs[g * Rp + row] = s;
+    }
+}
 
 static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __restrict__ x,
                             float* __restrict__ ascale, unsigned M, unsigned K, unsigned slice,

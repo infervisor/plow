@@ -110,11 +110,10 @@ def main():
         row_file.write_text("".join(",".join(map(str, row)) + "\n" for row in rows))
         env = os.environ.copy()
         # This is the production-default gate. Remove inherited overrides so the run proves
-        # prefix reuse, prefill packing, interleaving, and token batching are selected by the
+        # prefix reuse, prefill packing and interleaving are selected by the
         # default objective rather than by the campaign shell.
         for name in (
             "PLOW_PREFIX_CACHE",
-            "PLOW_TOKEN_BATCH",
             "PLOW_OBJECTIVE",
             "PLOW_PF_INTERLEAVE",
             "PLOW_PF_DEFER_DECODE",

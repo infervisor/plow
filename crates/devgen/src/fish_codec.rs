@@ -12,6 +12,12 @@
 //! width `vq_dim`, a causal pre-conv to `latent`, the transformer between an input and an output
 //! projection (`dim` residual, `heads * head_dim` attention width), SnakeBeta activations as their
 //! own passes (`.sb` = `[exp(alpha) | 1 / (exp(beta) + 1e-9)]`), and a final clamp.
+//!
+//! Kyutai Mimi's decoder (`model_type` `mimi_dac`, `scripts/tts/mimi_decoder_export.py`; Maya 2
+//! Native) is [`mimi_program_for`]: projection-folded tables -> causal ConvTranspose k4 s2 (the
+//! depthwise upsample, exported block-diagonal) -> 8-layer causal transformer at 2 rows per frame
+//! (LayerNorm, GELU MLP, LayerScale folded, window 250) -> causal conv k7 -> 4 ELU blocks
+//! (ConvTranspose k=2s cropped right, one residual unit k3 -> k1 at half width) -> ELU, conv k3.
 
 use std::collections::BTreeMap;
 
@@ -46,15 +52,23 @@ pub const CAPACITIES: &[(u32, u32)] = &[
 /// streams, shared by all step programs).
 pub const STEP_CAPACITIES: &[(u32, u32)] = &[
     (1, 1),
+    (4, 1),
+    (16, 1),
+    (64, 1),
+    (128, 1),
+    (256, 1),
     (1, 4),
     (1, 17),
     (4, 17),
     (8, 17),
     (16, 17),
     (32, 17),
+    (64, 17),
+    (128, 17),
+    (256, 17),
 ];
 
-pub const STREAM_SLOTS: u32 = 32;
+pub const STREAM_SLOTS: u32 = 256;
 
 struct Block {
     cin: u32,
@@ -66,6 +80,12 @@ struct Block {
 
 struct Cfg {
     breeze: bool,
+    mimi: bool,
+    /// Mimi: stride of the causal ConvTranspose (k = 2 * stride) before the transformer; 0 = none.
+    pre_up: u32,
+    /// Residual-unit first conv kernel and the output conv kernel (Fish / Breeze: 7, 7).
+    res_kernel: u32,
+    out_kernel: u32,
     sampling_rate: u32,
     frame_samples: u32,
     sizes: Vec<u32>,
@@ -110,9 +130,23 @@ impl Cfg {
                 .unwrap_or_default()
         };
         let breeze = v["model_type"] == "qwen3_tts_12hz";
+        let mimi = v["model_type"] == "mimi_dac";
         let dim = u(t, "dim")?;
+        let pre_up = if mimi {
+            let p = &v["pre_upsample"];
+            if u(p, "kernel")? != 2 * u(p, "stride")? {
+                return Err("mimi decoder: pre_upsample kernel must be 2 * stride".into());
+            }
+            u(p, "stride")?
+        } else {
+            0
+        };
         let cfg = Cfg {
             breeze,
+            mimi,
+            pre_up,
+            res_kernel: if mimi { u(d, "residual_kernel")? } else { 7 },
+            out_kernel: if mimi { u(d, "out_kernel")? } else { 7 },
             vq_dim: if breeze { u(v, "vq_dim")? } else { dim },
             latent: if breeze { u(v, "latent_dim")? } else { dim },
             pre_kernel: if breeze { u(v, "pre_kernel")? } else { 0 },
@@ -150,9 +184,11 @@ impl Cfg {
                 .collect::<Result<_, String>>()?,
         };
         let up: u32 = cfg.ups.iter().map(|u| u.0).product::<u32>()
-            * cfg.blocks.iter().map(|b| b.stride).product::<u32>();
-        if (v["model_type"] != "fish_dac" && !breeze)
+            * cfg.blocks.iter().map(|b| b.stride).product::<u32>()
+            * cfg.xf_rows_per_frame();
+        if (v["model_type"] != "fish_dac" && !breeze && !mimi)
             || cfg.sizes.is_empty()
+            || (mimi && (!cfg.ups.is_empty() || cfg.blocks.iter().any(|b| b.cin != 2 * b.cout)))
             || (!breeze && cfg.heads * cfg.head_dim != cfg.dim)
             || up != cfg.frame_samples
             || cfg.blocks.first().map(|b| b.cin) != Some(cfg.channels)
@@ -168,9 +204,18 @@ impl Cfg {
         self.heads * self.head_dim
     }
 
-    /// Rows per frame after each resolution change: frames, each upsample, each decoder block.
+    /// Transformer rows per frame: Mimi's pre-transformer upsample stride, else 1.
+    fn xf_rows_per_frame(&self) -> u32 {
+        self.pre_up.max(1)
+    }
+
+    /// Rows per frame after each resolution change: frames, the pre-transformer upsample (Mimi),
+    /// each upsample, each decoder block.
     fn scales(&self) -> Vec<u32> {
         let mut s = vec![1u32];
+        if self.pre_up > 0 {
+            s.push(self.pre_up);
+        }
         for &(stride, _) in &self.ups {
             s.push(s.last().unwrap() * stride);
         }
@@ -210,8 +255,9 @@ pub fn lower_fish_dac(
     let reader = crate::checkpoint::TensorReader::open(dir)?;
     for (h, tensor) in prefix.model.tensors.iter_mut().enumerate() {
         if let Some(&(_, batch, frames)) = positions.iter().find(|(p, _, _)| *p as usize == h) {
-            let pos: Vec<u8> = (0..batch * frames)
-                .flat_map(|r| (r % frames).to_le_bytes())
+            let rows = frames * cfg.xf_rows_per_frame();
+            let pos: Vec<u8> = (0..batch * rows)
+                .flat_map(|r| (r % rows).to_le_bytes())
                 .collect();
             tensor.init = Some(pos);
             continue;
@@ -242,6 +288,9 @@ pub fn lower_fish_dac(
                     .enumerate()
                     .find(|(u, _)| name == format!("up{u}.convt.w"))
                     .map(|(_, &(stride, _))| (cfg.latent, cfg.latent, stride, stride))
+            })
+            .or_else(|| {
+                (name == "pre_up.w").then_some((cfg.dim, cfg.dim, 2 * cfg.pre_up, cfg.pre_up))
             });
         if let Some((cin, cout, kernel, stride)) = convt {
             if cin % 4 == 0 && cout >= 16 {
@@ -312,8 +361,18 @@ fn lower_programs(
 ) -> Result<Lowered, String> {
     let fc = cfg.sizes.len() as u32;
     let scales = cfg.scales();
-    let bmax = decode.iter().map(|&(b, _)| b).max().unwrap_or(1);
-    let max_rows = decode.iter().map(|&(b, f)| b * f).max().unwrap_or(1);
+    let bmax = decode
+        .iter()
+        .chain(steps)
+        .map(|&(b, _)| b)
+        .max()
+        .unwrap_or(1);
+    let max_rows = decode
+        .iter()
+        .chain(steps)
+        .map(|&(b, f)| b * f)
+        .max()
+        .unwrap_or(1);
     let mut builder = packet::devbuild::Builder::new(n_cu);
     builder.set_tensor_dedup(true);
     let codes = builder.tensor("in.codec.codes", u64::from(max_rows * fc) * 4);
@@ -329,7 +388,9 @@ fn lower_programs(
                 .max(cfg.latent)
                 .max(cfg.vq_dim),
         );
-    let mut rows = max_rows;
+    // Mimi's transformer runs at xf_rows_per_frame rows per frame.
+    let mut rows = max_rows * cfg.xf_rows_per_frame();
+    widest = widest.max(u64::from(rows) * u64::from(cfg.dim.max(cfg.inter).max(3 * cfg.attn())));
     for &(stride, _) in &cfg.ups {
         rows *= stride;
         widest = widest.max(u64::from(rows) * u64::from(4 * cfg.latent));
@@ -565,15 +626,20 @@ struct StreamIo {
 
 /// The step programs' input tensors (role, name, elements); `stream.n.{k}` = new frames times
 /// `lengths.{k}.rows_per_frame`.
-fn step_inputs(scales: usize, steps: &[(u32, u32)]) -> Vec<(String, String, u32)> {
+/// With `xf_rpf` > 1 (Mimi) `rope_pos` covers the transformer rows and `stream.row_pos` is each
+/// item's stream position in transformer rows (`pos * xf_rpf`).
+fn step_inputs(scales: usize, steps: &[(u32, u32)], xf_rpf: u32) -> Vec<(String, String, u32)> {
     let b = steps.iter().map(|&(b, _)| b).max().unwrap_or(1);
-    let rows = steps.iter().map(|&(b, n)| b * n).max().unwrap_or(1);
+    let rows = steps.iter().map(|&(b, n)| b * n).max().unwrap_or(1) * xf_rpf;
     let mut v: Vec<(String, String, u32)> = [("slot", b), ("pos", b), ("rope_pos", rows)]
         .into_iter()
         .map(|(r, e)| (format!("stream.{r}"), format!("in.codec.stream.{r}"), e))
         .collect();
     for k in 0..scales {
         v.push((format!("stream.n.{k}"), format!("in.codec.stream.n.{k}"), b));
+    }
+    if xf_rpf > 1 {
+        v.push(("stream.row_pos".into(), "in.codec.stream.row_pos".into(), b));
     }
     v
 }
@@ -637,13 +703,16 @@ fn program_for(
     steps: Option<&[(u32, u32)]>,
     splits: Splits<'_>,
 ) -> Result<(PacketPrefix, u32), String> {
+    if cfg.mimi {
+        return mimi_program_for(prefix, cfg, batch, frames, codes, lengths, steps, splits);
+    }
     let fc = cfg.sizes.len() as u32;
     let n = batch * frames;
     let dim = cfg.dim;
     let mut p = prefix.program();
     let step = steps.is_some();
     let io = steps.map(|steps| {
-        let h: Vec<u32> = step_inputs(lengths.len(), steps)
+        let h: Vec<u32> = step_inputs(lengths.len(), steps, cfg.xf_rows_per_frame())
             .iter()
             .map(|(_, name, e)| p.declare(name, u64::from(*e) * 4))
             .collect();
@@ -1193,6 +1262,427 @@ fn program_for(
     Ok((p.finish(n), pos))
 }
 
+/// [`program_for`] for Kyutai Mimi (`cfg.mimi`, see the module doc). Scale 0 is the frames, scale 1
+/// the transformer rows (`xf_rows_per_frame` per frame), then one per decoder block. In stream mode
+/// the attention's history is counted in transformer rows (`stream.row_pos`).
+#[allow(clippy::too_many_arguments)]
+fn mimi_program_for(
+    prefix: PacketPrefix,
+    cfg: &Cfg,
+    batch: u32,
+    frames: u32,
+    codes: u32,
+    lengths: &[u32],
+    steps: Option<&[(u32, u32)]>,
+    splits: Splits<'_>,
+) -> Result<(PacketPrefix, u32), String> {
+    let fc = cfg.sizes.len() as u32;
+    let n = batch * frames;
+    let rpf = cfg.xf_rows_per_frame();
+    let t = frames * rpf;
+    let nt = batch * t;
+    let dim = cfg.dim;
+    let scales = lengths.len();
+    let mut p = prefix.program();
+    let step = steps.is_some();
+    let io = steps.map(|steps| {
+        let h: Vec<u32> = step_inputs(scales, steps, rpf)
+            .iter()
+            .map(|(_, name, e)| p.declare(name, u64::from(*e) * 4))
+            .collect();
+        let io = StreamIo {
+            slot: h[0],
+            pos: h[1],
+            rope_pos: h[2],
+            n: h[3..3 + scales].to_vec(),
+        };
+        (io, h[3 + scales])
+    });
+    let pos = match &io {
+        Some((io, _)) => io.rope_pos,
+        None => p.declare(
+            &format!("c.codec.pos.b{batch}.f{frames}"),
+            u64::from(nt) * 4,
+        ),
+    };
+    let len = |k: usize| {
+        if step {
+            packet::dev::TENSOR_NONE
+        } else {
+            lengths[k]
+        }
+    };
+    let fuse = ConvFusions(None);
+    let stateful = |p: &mut StageProgram,
+                    x: u32,
+                    dep: u32,
+                    mut c: Conv,
+                    state: String,
+                    k: usize|
+     -> Result<Emitted, String> {
+        let Some((io, _)) = &io else {
+            return fused_conv(p, fuse, splits, x, dep, c);
+        };
+        let tail = if c.transpose {
+            1
+        } else {
+            (c.kernel - 1) * c.dilation
+        };
+        let z = carry(
+            p,
+            io,
+            k,
+            x,
+            dep,
+            &state,
+            batch,
+            c.in_rows,
+            tail,
+            c.cin,
+            (c.cin, 0),
+        )?;
+        c.in_rows += tail;
+        (c.pad, c.pad_after) = if c.transpose {
+            (c.stride, Some(c.kernel - c.stride))
+        } else {
+            (0, Some(0))
+        };
+        c.len = packet::dev::TENSOR_NONE;
+        c.input_is_temp = true;
+        fused_conv(p, fuse, splits, z.output, z.done, c)
+    };
+    let conv = |output: &'static str,
+                weight: &str,
+                bias: Option<&str>,
+                in_rows: u32,
+                cin: u32,
+                cout: u32,
+                kernel: u32| Conv {
+        output,
+        weight: weight.to_string(),
+        bias: bias.map(str::to_string),
+        alpha: None,
+        batch,
+        in_rows,
+        cin,
+        cout,
+        kernel,
+        stride: 1,
+        dilation: 1,
+        groups: 1,
+        pad: kernel - 1,
+        pad_after: Some(0),
+        len: len(0),
+        act_in: Activation::None,
+        act_out: Activation::None,
+        residual: None,
+        transpose: false,
+        input_is_temp: false,
+        row_scale: None,
+        alpha_out: None,
+        taps_wgmma: false,
+    };
+    // A causal ConvTranspose k = 2s: (rows - 1) * s + k outputs, the last k - s cropped.
+    let convt = |mut c: Conv, stride: u32| {
+        c.transpose = true;
+        c.stride = stride;
+        c.dilation = 0;
+        c.pad = 0;
+        c.pad_after = Some(c.kernel - stride);
+        c.input_is_temp = true;
+        c
+    };
+
+    // Codebook k's codes -> level k, then the folded tables summed into act.codec.c.
+    let mut deps = Vec::new();
+    for k in 0..fc {
+        deps.push(
+            p.copy_cols_f32(
+                codes,
+                &[],
+                CopyColsF32Stage {
+                    output: TensorRef::Named(&format!("act.codec.level{k}")),
+                    items: batch,
+                    rows: frames,
+                    cols: 1,
+                    in_item_stride: frames * fc,
+                    in_stride: fc,
+                    in_offset: k,
+                    out_item_stride: frames,
+                    out_stride: 1,
+                    out_offset: 0,
+                },
+                None,
+            )?
+            .done,
+        );
+    }
+    let mut last = None;
+    for k in 0..fc {
+        let level = p_handle(&p, &format!("act.codec.level{k}"));
+        let e = p.gather_rows_f32(
+            &last.map_or(deps.clone(), |d| vec![d]),
+            GatherRowsF32Stage {
+                output: TensorRef::Named("act.codec.c"),
+                table: TensorRef::Named(&format!("w.vq.T{k}")),
+                table_rows: cfg.sizes[k as usize],
+                index: Some(level),
+                rows: n,
+                width: dim,
+                vocab: cfg.sizes[k as usize],
+                rows_per_item: frames,
+                repeat: 1,
+                index_item_stride: frames,
+                table_item_stride: 0,
+                table_f16: false,
+                accumulate: k > 0,
+                out_stride: 0,
+                out_col0: 0,
+            },
+        )?;
+        last = Some(e.done);
+    }
+    let embed = p_handle(&p, "act.codec.c");
+    let mut c = convt(
+        conv("act.codec.a", "w.pre_up.w", None, frames, dim, dim, 2 * rpf),
+        rpf,
+    );
+    c.len = len(0);
+    let up = stateful(
+        &mut p,
+        embed,
+        last.unwrap(),
+        c,
+        "state.codec.pre_up".into(),
+        0,
+    )?;
+
+    let mut s = Seq {
+        p: Some(p),
+        last: up.done,
+    };
+    let x = up.output;
+    let h = p_handle(s.p(), "act.codec.b");
+    let (hd, heads, aw) = (cfg.head_dim, cfg.heads, cfg.attn());
+    let history = cfg.window.saturating_sub(1);
+    if step && history == 0 {
+        return Err("mimi codec step: needs a bounded attention window".into());
+    }
+    let ln = |s: &mut Seq, w: String| -> Result<(), String> {
+        let dep = s.last;
+        let e = s.p().layer_norm_f32(
+            x,
+            &[dep],
+            LayerNormRowsF32Stage {
+                output: TensorRef::Handle(h),
+                gamma: Some(TensorRef::Named(&format!("{w}.w"))),
+                beta: Some(TensorRef::Named(&format!("{w}.b"))),
+                rows: nt,
+                width: dim,
+                epsilon: cfg.eps,
+                activation: Activation::None,
+                add_row: None,
+            },
+        )?;
+        s.done(e);
+        Ok(())
+    };
+    for l in 0..cfg.layers {
+        let w = |s: &str| format!("w.post.layers.{l}.{s}");
+        ln(&mut s, w("ln1"))?;
+        let qkv = s.dense(splits, h, "act.codec.c", nt, dim, 3 * aw, &w("wqkv"), None)?;
+        s.raw(
+            DevOp::RopeAxialF32,
+            u64::from(nt * 2 * heads * hd / 2).div_ceil(2048),
+            qkv,
+            |d| {
+                d.t[..2].copy_from_slice(&[qkv, pos]);
+                d.i[..7].copy_from_slice(&[nt, 2 * heads, hd, 3 * aw, 1, 0, 2]);
+                d.f[0] = cfg.theta;
+            },
+        )?;
+        let (qkv, kv_rows, stream) = match &io {
+            Some((io, row_pos)) => {
+                let dep = s.last;
+                let z = carry(
+                    s.p(),
+                    io,
+                    1,
+                    qkv,
+                    dep,
+                    &format!("state.codec.kv{l}"),
+                    batch,
+                    t,
+                    history,
+                    3 * aw,
+                    (2 * aw, aw),
+                )?;
+                s.last = z.done;
+                (
+                    z.output,
+                    history + t,
+                    Some(AttentionStream {
+                        pos: *row_pos,
+                        history,
+                    }),
+                )
+            }
+            None => (qkv, t, None),
+        };
+        let dep = s.last;
+        let e = s.p().attention_f32(
+            qkv,
+            qkv,
+            qkv,
+            &[dep],
+            AttentionF32Stage {
+                output: TensorRef::Named("act.codec.s"),
+                key_lengths: (!step).then(|| lengths[1]),
+                bias: None,
+                batch,
+                q_rows: t,
+                kv_rows,
+                heads,
+                head_width: hd,
+                in_stride: 3 * aw,
+                k_col0: aw,
+                v_col0: 2 * aw,
+                causal: true,
+                scale: 1.0 / (hd as f32).sqrt(),
+                bias_head_stride: 0,
+                relative: false,
+                key_length_heads: 0,
+                prefix: None,
+                window: cfg.window,
+                stream,
+            },
+        )?;
+        let at = s.done(e);
+        s.dense(splits, at, "act.codec.b", nt, aw, dim, &w("wo_s"), None)?;
+        s.binary(x, h, BinaryOp::Add, nt, dim)?;
+        ln(&mut s, w("ln2"))?;
+        let g = s.dense(
+            splits,
+            h,
+            "act.codec.c",
+            nt,
+            dim,
+            cfg.inter,
+            &w("fc1"),
+            None,
+        )?;
+        s.unary(g, Activation::GeluErf, nt, cfg.inter)?;
+        s.dense(
+            splits,
+            g,
+            "act.codec.b",
+            nt,
+            cfg.inter,
+            dim,
+            &w("fc2_s"),
+            None,
+        )?;
+        s.binary(x, h, BinaryOp::Add, nt, dim)?;
+    }
+
+    let mut p = s.p.take().unwrap();
+    let other = |e: u32| if e == x { "act.codec.b" } else { "act.codec.a" };
+    let mut c = conv(
+        other(x),
+        "w.dec.in.w",
+        Some("w.dec.in.b"),
+        t,
+        dim,
+        cfg.channels,
+        7,
+    );
+    c.len = len(1);
+    let mut cur = stateful(&mut p, x, s.last, c, "state.codec.dec.in".into(), 1)?;
+    let mut rows = t;
+    for (i, b) in cfg.blocks.iter().enumerate() {
+        let w = |s: &str| format!("w.dec.blk{i}.{s}");
+        let (k_in, k_out) = (1 + i, 2 + i);
+        let mut c = convt(
+            conv(
+                other(cur.output),
+                &w("up.w"),
+                Some(&w("up.b")),
+                rows,
+                b.cin,
+                b.cout,
+                b.kernel,
+            ),
+            b.stride,
+        );
+        c.act_in = Activation::Elu;
+        c.len = len(k_in);
+        cur = stateful(
+            &mut p,
+            cur.output,
+            cur.done,
+            c,
+            format!("state.codec.blk{i}.up"),
+            k_in,
+        )?;
+        rows *= b.stride;
+        let half = b.cout / 2;
+        let mut c = conv(
+            "act.codec.c",
+            &w("ru0.c1.w"),
+            Some(&w("ru0.c1.b")),
+            rows,
+            b.cout,
+            half,
+            cfg.res_kernel,
+        );
+        c.act_in = Activation::Elu;
+        c.len = len(k_out);
+        let r = stateful(
+            &mut p,
+            cur.output,
+            cur.done,
+            c,
+            format!("state.codec.blk{i}.ru0"),
+            k_out,
+        )?;
+        let mut c = conv(
+            other(cur.output),
+            &w("ru0.c2.w"),
+            Some(&w("ru0.c2.b")),
+            rows,
+            half,
+            b.cout,
+            1,
+        );
+        c.act_in = Activation::Elu;
+        c.residual = Some(cur.output);
+        c.len = len(k_out);
+        c.input_is_temp = true;
+        cur = fused_conv(&mut p, fuse, splits, r.output, r.done, c)?;
+    }
+    let last_c = cfg.blocks.last().map_or(cfg.channels, |b| b.cout);
+    let mut c = conv(
+        "act.codec.pcm",
+        "w.dec.out.w",
+        Some("w.dec.out.b"),
+        rows,
+        last_c,
+        1,
+        cfg.out_kernel,
+    );
+    c.act_in = Activation::Elu;
+    c.len = len(scales - 1);
+    stateful(
+        &mut p,
+        cur.output,
+        cur.done,
+        c,
+        "state.codec.dec.out".into(),
+        scales - 1,
+    )?;
+    Ok((p.finish(n), pos))
+}
+
 /// In-place SnakeBeta over `rows x width` of `x` (parameter `[a | r]`).
 fn snake_beta(
     p: &mut StageProgram,
@@ -1279,7 +1769,13 @@ fn section(
             steps.iter().map(|&(_, n)| u64::from(n)).max().unwrap_or(1),
         ),
     ]);
-    for (role, name, elements) in step_inputs(lengths.len(), steps) {
+    if cfg.xf_rows_per_frame() > 1 {
+        parameters.insert(
+            "stream.transformer_rows_per_frame".into(),
+            u64::from(cfg.xf_rows_per_frame()),
+        );
+    }
+    for (role, name, elements) in step_inputs(lengths.len(), steps, cfg.xf_rows_per_frame()) {
         tensors.insert(
             role,
             PipelineTensor {
@@ -1367,6 +1863,73 @@ mod tests {
             "decoder": {"channels": 1536, "blocks": blocks([16, 10, 8, 6])}
         }))
         .unwrap()
+    }
+
+    /// kyutai/mimi as `scripts/tts/mimi_decoder_export.py` writes it.
+    fn mimi() -> Cfg {
+        let ch = [1024, 512, 256, 128, 64];
+        let blocks: Vec<_> = [8, 6, 5, 4]
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| {
+                serde_json::json!({"cin": ch[i], "cout": ch[i + 1], "kernel": 2 * r,
+                    "stride": r, "dilations": [1]})
+            })
+            .collect();
+        Cfg::parse(&serde_json::json!({
+            "model_type": "mimi_dac", "sampling_rate": 24000, "frame_samples": 1920,
+            "codebook_sizes": vec![2048; 32],
+            "transformer": {"layers": 8, "dim": 512, "heads": 8, "head_dim": 64,
+                "intermediate": 2048, "eps": 1e-5, "window": 250, "rope_theta": 10000.0},
+            "pre_upsample": {"stride": 2, "kernel": 4}, "upsample": [],
+            "decoder": {"channels": 1024, "blocks": blocks, "residual_kernel": 3, "out_kernel": 3}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn mimi_lowers_decode_and_steps_at_two_rows_per_frame() {
+        let cfg = mimi();
+        assert_eq!(cfg.scales(), [1, 2, 16, 96, 480, 1920]);
+        let (decode, steps) = capped(Some(256)).unwrap();
+        let low = lower_programs(&cfg, 58, 0, None, &decode, &steps).unwrap();
+        for &(b, f) in &decode {
+            assert!(low.roles.contains_key(&format!("decode.b{b}.f{f}")));
+        }
+        for &(b, n) in &steps {
+            assert!(low.roles.contains_key(&format!("step.b{b}.f{n}")));
+        }
+        let model = &low.prefix.model;
+        let named = |n: &str| model.tensors.iter().find(|t| t.name == n).unwrap().bytes;
+        // Steps carry the transformer at 2 rows per frame: rope over rows, history per row.
+        let rows = steps.iter().map(|&(b, n)| b * n).max().unwrap();
+        assert_eq!(named("in.codec.stream.rope_pos"), u64::from(2 * rows) * 4);
+        assert!(model
+            .tensors
+            .iter()
+            .any(|t| t.name == "in.codec.stream.row_pos"));
+        // Each layer carries window - 1 rows of K | V.
+        assert_eq!(
+            named("state.codec.kv0"),
+            u64::from(STREAM_SLOTS * (cfg.window - 1) * 2 * cfg.attn()) * 4
+        );
+        let meta = section(
+            &low.prefix,
+            &cfg,
+            low.roles.clone(),
+            low.bmax,
+            low.max_rows,
+            &low.lengths,
+            &cfg.scales(),
+            low.seed,
+            &steps,
+        )
+        .unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta.data).unwrap();
+        let pipe = &meta["pipelines"][0];
+        assert_eq!(pipe["parameters"]["stream.transformer_rows_per_frame"], 2);
+        assert_eq!(pipe["parameters"]["lengths.1.rows_per_frame"], 2);
+        assert!(pipe["tensors"]["stream.row_pos"].is_object());
     }
 
     /// `state.codec.*` name -> bytes the step programs need: (tail rows, channels) per carry.
@@ -1544,10 +2107,24 @@ mod tests {
         );
         let (decode, steps) = capped(Some(256)).unwrap();
         assert_eq!(decode, [(1, 64), (2, 64), (4, 64), (1, 256)]);
-        assert_eq!(steps, [(1, 1), (1, 4), (1, 17), (4, 17), (8, 17)]);
+        assert_eq!(
+            steps,
+            [
+                (1, 1),
+                (4, 1),
+                (16, 1),
+                (64, 1),
+                (128, 1),
+                (256, 1),
+                (1, 4),
+                (1, 17),
+                (4, 17),
+                (8, 17)
+            ]
+        );
         assert!(capped(Some(32)).is_err());
         let low = lower_programs(&fish(), 58, 89, None, &decode, &steps).unwrap();
-        assert_eq!((low.bmax, low.max_rows), (4, 256));
+        assert_eq!((low.bmax, low.max_rows), (256, 256));
         assert!(!low.roles.contains_key("decode.b16.f64"));
         assert!(!low.roles.contains_key("step.b16.f17"));
     }
@@ -1570,7 +2147,8 @@ mod tests {
                     assert_eq!(pa.succs, pb.succs);
                 }
                 for (ta, tb) in ma.tensors.iter().zip(&mb.tensors) {
-                    assert_eq!((&ta.name, ta.bytes), (&tb.name, tb.bytes));
+                    assert_eq!(&ta.name, &tb.name);
+                    assert!(tb.bytes >= ta.bytes);
                 }
                 assert_eq!(a.positions, b.positions);
                 assert!(mb.tensors[ma.tensors.len()..].iter().all(|t| t

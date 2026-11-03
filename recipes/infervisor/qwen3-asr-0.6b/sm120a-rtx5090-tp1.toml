@@ -1,0 +1,105 @@
+# Qwen3-ASR-0.6B on RTX 5090 (GB202 sm_120a, 170 SMs, 32 GB GDDR7): the L40S recipe's contract
+# (sm89-l40s-tp1.toml) on the sm_120a objects, 128 slots, the speech encoder as a packed sidecar.
+#
+#   nix develop --command python3 scripts/campaign/campaign.py build \
+#     recipes/infervisor/qwen3-asr-0.6b/sm120a-rtx5090-tp1.toml --out <fresh dir>
+#
+# Gate: WER on the 73-clip LibriSpeech dummy set = 4.261% (c1, c16, c64). Decode ctx 1024
+# B=1/16/32 = 63/87/87% of the 1672 GB/s roofline (B=1: interpreter per-op latency). Served vs
+# vLLM 0.31.0 on the same box and client (73 clips at c1/c16, the 292-clip x4 set at c64/c128;
+# driver 595.91), mean of 2 interleaved reps: c1 p50 34 vs 70 ms; RTFx c16 975 vs 547, c64 1675
+# vs 743, c128 1719 vs 787 (c128 p90 601 vs 1282 ms).
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3-asr-0.6b"
+label = "sm120a-rtx5090-tp1"
+plow_git = "e40bb100606fc93e3d47a31e00d6c29dfa911c85"
+network = "qwen3"
+doc = "docs/runtime/asr.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_120a"
+sku = "RTX 5090"
+units = 170
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3-ASR-0.6B"
+revision = "5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
+
+[cell]
+name = "qwen3-asr-0.6b-rtx5090"
+hf_dir = "{hf:Qwen/Qwen3-ASR-0.6B@5eb144179a02acc5e5ba31e748d22b0cf3e303b0}"
+gpu = "5090"
+arch = "sm_120a"
+n_cu = 170
+n_gpu = 1
+# 128 slots x 2048 ctx = 28 GiB of KV does not fit 32 GB. The audio_lm geometry needs a 30 s clip
+# (391 rows) + output.max_tokens 1024 <= max_ctx, so 1536 (21 GiB of KV).
+max_ctx = 1536
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "qwen3-asr-0.6b"]
+[emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# sm_120a defaults to single-segment prefill (plowc effective_uniseg); cuBLASLt prefill and the
+# packed-request objects need segmented prefill programs, as on sm_89.
+PLOW_UNISEG = "0"
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64,128"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_NV_FA_FOLD = "1"
+# Claim-ahead L2 weight prefetch: step_bench ctx 512 B=1/8/16/32 1.601/1.760/2.082/2.906 ->
+# 1.433/1.662/2.038/2.917 ms (+ devgen's B=1 MMA walk: 1.301/1.660/2.033/2.907), digests unchanged.
+PLOW_GEMV_PREFETCH = "1"
+# The claim-ahead prefetch also takes the AddNorm (8) / HeadNormRope (16) rows, the hd128
+# FlashDecode KV head (32) and, from the 4 GEMVs before each FlashDecode, 128 more rows of its KV
+# each (64); AddNorm folds into the GEMVs around it; HeadNormRope folds into FlashDecode from the
+# B=16 rung; the o_proj / down / GemvQkv walks split K over blocks from B=16 (64-row units, the
+# last block sums in a fixed order). step_bench ctx 1024 B=1/4/16/32: 1.330/1.558/2.618/4.016
+# (none) -> 1.231/1.367/2.470/3.783 (63, norm fold, HeadNormRope fold at 32) -> 1.222/1.360/
+# 2.165/3.445 ms (per-process medians: single 5-8 ms outlier steps move 48-step means).
+PLOW_NV_GEMV_PF_OPS = "127"
+PLOW_DECODE_NORM_FOLD = "1"
+PLOW_DECODE_HNR_FOLD = "16"
+PLOW_DECODE_GEMV_XK = "16"
+PLOW_DECODE_GEMV_XK_QKV = "1"
+# The GEMV walks load weights evict-first (a consumed weight line is dead until the next token),
+# so L2 keeps the claim-ahead prefetches; the GemvGlu prefetch then takes 96 KiB. B=1/4/16/32
+# (3 reps): 1.227/1.368/2.167/3.444 -> 1.235/1.343/2.109/3.383 ms, token digests unchanged.
+PLOW_DECODE_GEMV_W_CS = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+# 192-chunk packed encoder buckets (~5.7 GB of FP32 activations) + 21 GiB of KV exceed 32 GB;
+# 64 chunks (64 s of audio) as on the L4.
+PLOW_ASR_PACKED_MAX_CHUNKS = "64"
+
+[bench]
+kind = "asr"
+client = "crates/plowrt/examples/asr/packet_dataset.rs"
+manifest = "scripts/asr/nvidia/get_audio.py"
+reference = "scripts/asr/nvidia/ref_bench.py"
+
+[gates]
+python = "{env:PYREF}"
+[gates.asr_wer]
+manifest = "{env:ASR_MANIFEST}"
+conc = "1,16,64"
+wer_max = 0.045
+
+[serve.env]
+# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
+PLOW_VMM_PREFIX = "1"
+# With 32+ requests in flight, a packed encode short of 64 chunks waits up to 50 ms for more
+# audio: fewer, fuller launches. RTFx c1/c16/c64/c128 159/857/1370/1475 -> 159/924/1677/1745,
+# WER unchanged (2 interleaved reps).
+PLOW_ASR_ENCODE_HOLD_MS = "50"

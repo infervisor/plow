@@ -123,11 +123,32 @@ pub fn inventory(blob: &DevBlob, raw: &[u8], assets: Option<&Path>) -> crate::Re
             State::On,
             format!("{} per-layer state tensors", recurrent.len()),
         ));
-        out.push(item(
-            "prefix_cache",
-            State::NotApplicable,
-            "recurrent state: plowrt refuses prefix reuse without a state snapshot at the boundary",
-        ));
+        // The block store's State class captures every declared buffer at a boundary
+        // (`exec/gpu/kv_blocks.rs`); a `state.` tensor the section does not declare is refused at
+        // load (`plow_asset::recurrent_state`).
+        let declared = blob
+            .reserved_metadata(raw, plow_asset::recurrent_state::SECTION)?
+            .map(|bytes| {
+                serde_json::from_slice::<plow_asset::recurrent_state::Manifest>(bytes)
+                    .map(|m| m.buffers.len())
+            })
+            .transpose()
+            .map_err(|e| crate::RuntimeError::Rejected(format!("recurrent_state: {e}")))?;
+        out.push(match declared {
+            Some(n) if n > 0 => item(
+                "prefix_cache",
+                State::On,
+                format!(
+                    "recurrent state captured at boundaries ({n} declared buffers); CUDA does not \
+                     auto-select it: serve with PLOW_VMM_PREFIX=1"
+                ),
+            ),
+            _ => item(
+                "prefix_cache",
+                State::Off,
+                "state.* tensors without declared recurrent_state buffers: the packet is refused",
+            ),
+        });
     }
 
     let live = blob.reserved_metadata(raw, plow_asset::live_kv::SECTION)?;
@@ -285,6 +306,49 @@ pub fn inventory(blob: &DevBlob, raw: &[u8], assets: Option<&Path>) -> crate::Re
         },
     );
 
+    // Library prefill attention: the packet declares it (object 26 + per-program segments); the
+    // doctor fails a recipe that requests it (PLOW_EMIT_ATTN_LIBRARY) on a packet without it.
+    let candidates = blob
+        .progs
+        .iter()
+        .filter(|p| matches!(p.role, ProgramRole::PrefillBucket { .. }))
+        .flat_map(|p| p.insts.iter())
+        .filter(|d| {
+            (d.op == DevOp::FlashPrefill as u16
+                || (d.op == DevOp::FlashPrefillFp8 as u16 && d.i[6] == 512))
+                && matches!(d.i[6], 256 | 512)
+                && d.i[5] == 0
+                && d.fj[2] == u32::MAX
+        })
+        .count();
+    let declared = blob
+        .reserved_metadata(raw, plow_asset::segment_roles::SECTION)?
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .and_then(|v| {
+            let abi = v["objects"]
+                .get(plow_asset::segment_roles::LIBRARY_PREFILL_ATTENTION.to_string())?["abi"]
+                .as_str()?
+                .to_string();
+            let segments: usize = v["programs"]
+                .as_array()?
+                .iter()
+                .map(|p| p["library"].as_array().map_or(0, Vec::len))
+                .sum();
+            Some((abi, segments))
+        });
+    out.push(match declared {
+        Some((abi, segments)) if segments > 0 => item(
+            "library_prefill_attention",
+            State::On,
+            format!("{segments} segments declared ({abi}); {candidates} candidate sites"),
+        ),
+        _ => item(
+            "library_prefill_attention",
+            State::NotApplicable,
+            format!("not declared; {candidates} candidate sites (PLOW_EMIT_ATTN_LIBRARY)"),
+        ),
+    });
+
     // CUDA arms the unified token batch from the packed-prefill contract and the compact terminal
     // (`exec/gpu/token_batch.rs`); a recurrent chain needs its packed scan's init-state scratch.
     let token_batch = blob.reserved_metadata(raw, plow_asset::token_batch::SECTION)?;
@@ -331,21 +395,37 @@ pub fn inventory(blob: &DevBlob, raw: &[u8], assets: Option<&Path>) -> crate::Re
             item("device_sampler", State::On, sampler.join(", "))
         });
         let build = std::fs::read_to_string(assets.join("build.json")).ok();
-        out.push(match &build {
-            Some(text) if text.contains("\"PLOW_EMIT_PREFILL_CUBLASLT\": \"1\"") => item(
-                "cublaslt_prefill",
-                State::On,
-                "PLOW_EMIT_PREFILL_CUBLASLT=1 in the emit replay",
-            ),
-            Some(_) => item(
+        out.push(match build.as_deref().map(prefill_cublaslt_emitted) {
+            Some(Some(source)) => item("cublaslt_prefill", State::On, source),
+            Some(None) => item(
                 "cublaslt_prefill",
                 State::Off,
-                "emit replay has no PLOW_EMIT_PREFILL_CUBLASLT=1: projections on the interpreter GEMM",
+                "emit.prefill_cublaslt resolved off: projections on the interpreter GEMM",
             ),
-            None => item("cublaslt_prefill", State::NotApplicable, "no build.json next to the packet"),
+            None => item(
+                "cublaslt_prefill",
+                State::NotApplicable,
+                "no build.json next to the packet",
+            ),
         });
     }
     Ok(out)
+}
+
+/// Whether the emit routed the dense prefill projections to cuBLASLt, and from where: the resolved
+/// knob table records a production default (Gemma-4 BF16 on sm_90a TP1 turns it on without an env
+/// var), the replay only what the environment set.
+fn prefill_cublaslt_emitted(build: &str) -> Option<&'static str> {
+    let v: serde_json::Value = serde_json::from_str(build).ok()?;
+    match v.pointer("/knobs/values/emit.prefill_cublaslt") {
+        Some(serde_json::Value::Bool(true)) => {
+            Some("emit.prefill_cublaslt resolved on in build.json")
+        }
+        Some(_) => None,
+        None => build
+            .contains("\"PLOW_EMIT_PREFILL_CUBLASLT\": \"1\"")
+            .then_some("PLOW_EMIT_PREFILL_CUBLASLT=1 in the emit replay"),
+    }
 }
 
 pub fn text(items: &[Item]) -> String {
@@ -365,4 +445,31 @@ pub fn text(items: &[Item]) -> String {
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod prefill_cublaslt_tests {
+    use super::prefill_cublaslt_emitted;
+
+    #[test]
+    fn resolved_production_default_counts_as_on() {
+        let build =
+            r#"{"knobs":{"values":{"emit.prefill_cublaslt":true}},"emit_config":{"replay":{}}}"#;
+        assert!(prefill_cublaslt_emitted(build).is_some());
+    }
+
+    #[test]
+    fn resolved_off_wins_over_the_replay() {
+        let build = r#"{"knobs":{"values":{"emit.prefill_cublaslt":false}},"emit_config":{"replay":{"PLOW_EMIT_PREFILL_CUBLASLT": "1"}}}"#;
+        assert!(prefill_cublaslt_emitted(build).is_none());
+    }
+
+    #[test]
+    fn an_old_build_without_the_knob_table_reads_the_replay() {
+        assert!(prefill_cublaslt_emitted(
+            r#"{"emit_config":{"replay":{"PLOW_EMIT_PREFILL_CUBLASLT": "1"}}}"#
+        )
+        .is_some());
+        assert!(prefill_cublaslt_emitted(r#"{"emit_config":{"replay":{}}}"#).is_none());
+    }
 }

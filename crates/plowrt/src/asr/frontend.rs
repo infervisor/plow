@@ -157,10 +157,18 @@ impl Resampler {
     const ROLLOFF: f64 = 0.94;
 
     pub fn new(rate: u32) -> std::result::Result<Self, String> {
-        if !(MIN_INPUT_RATE..=MAX_INPUT_RATE).contains(&rate) {
-            return Err(format!(
-                "sample rate {rate} is outside {MIN_INPUT_RATE}..={MAX_INPUT_RATE} Hz"
-            ));
+        Self::to(rate, SAMPLE_RATE)
+    }
+
+    /// From `rate` to `out`, for a path whose target is not [`SAMPLE_RATE`]: speech output is
+    /// resampled from the model's rate to the reply's.
+    pub fn to(rate: u32, out: u32) -> std::result::Result<Self, String> {
+        for r in [rate, out] {
+            if !(MIN_INPUT_RATE..=MAX_INPUT_RATE).contains(&r) {
+                return Err(format!(
+                    "sample rate {r} is outside {MIN_INPUT_RATE}..={MAX_INPUT_RATE} Hz"
+                ));
+            }
         }
         let gcd = |mut a: u64, mut b: u64| {
             while b != 0 {
@@ -168,8 +176,8 @@ impl Resampler {
             }
             a
         };
-        let g = gcd(u64::from(rate), u64::from(SAMPLE_RATE));
-        let (up, down) = (u64::from(SAMPLE_RATE) / g, u64::from(rate) / g);
+        let g = gcd(u64::from(rate), u64::from(out));
+        let (up, down) = (u64::from(out) / g, u64::from(rate) / g);
         if up == down {
             return Ok(Self {
                 up,

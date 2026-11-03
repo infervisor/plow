@@ -8,7 +8,7 @@
 
 **Module:** [`crates/packet/src/lib.rs`](../../crates/packet/src/lib.rs)  
 **Header:** [`include/packet.h`](../../include/packet.h)  
-**Version:** v5
+**Version:** v7
 
 The packet format is the **contract** between the Rust compiler and the C/CUDA/HIP runtime. Both sides must agree on layout, endianness, and semantics. The format is defined once in Rust and verified by Lean checkpoint E (wire round-trip).
 
@@ -40,7 +40,7 @@ flowchart TD
 | Field | Type | Value |
 |-------|------|-------|
 | `magic` | `u32` | `0x494E5650` — `"INVP"`, so the bytes on disk read `50 56 4E 49` little-endian |
-| `version` | `u16` | 5 (current); `MIN_VERSION` 2 is still decodable |
+| `version` | `u16` | 7 (current); `MIN_VERSION` 2 is still decodable |
 | `bucket_id` | `u16` | Shape bucket index |
 | `n_inst` | `u32` | Number of instructions in stream |
 | `n_counter` | `u32` | Number of counters in table |
@@ -140,7 +140,7 @@ constants (`Opcode::GEMM = 0x0300`, `Opcode::FLASH = 0x0400`,
 - The backend nibble lets the same variant byte name a CUDA, ROCm, or CPU kernel, so one flat namespace unifies all three without opcode exhaustion
 - The GPU interpreter hot loop needs O(1) decode — no string hashing, no secondary lookups
 
-**Counter-claim:** Fixed bit layout limits extensibility. Response: 4 bits of backend × 4 bits of family (16 families) × 8 bits of variant (256 per family) = 65536 possible opcodes. Growth headroom is large; families 7..15 are reserved for future ops.
+**Counter-claim:** Fixed bit layout limits extensibility. Response: 4 bits of backend × 4 bits of family (16 families) × 8 bits of variant (256 per family) = 65536 possible opcodes. Growth headroom is large; families 8..15 are reserved for future ops.
 
 ---
 
@@ -193,7 +193,7 @@ pub struct GemmBody {
 The kernel variant (dtype/epilogue) lives in the `Header` opcode byte, not the
 body payload.
 
-### FlashBody — 28 bytes
+### FlashBody (v7+) — 36 bytes
 
 ```rust
 pub struct FlashBody {
@@ -204,16 +204,22 @@ pub struct FlashBody {
     pub heads: u16,
     pub out: u16,
     pub tmem: u16,
+    pub window: u32,    // sliding window
+    pub kv_heads: u16,
+    pub _pad: u16,
 }
 ```
 
-### RowBody — 20 bytes
+Streams below v7 carry the 28-byte form without `window`/`kv_heads` (`FlashBodyLegacy`), still decodable.
+
+### RowBody (v6+) — 36 bytes
 
 ```rust
 pub struct RowBody {
     pub coord: u32,
     pub rows: u32,
     pub feat: u32,
+    pub args: [u32; 4], // variant-specific metadata; zero for generic row kernels
     pub br: u16,        // row-block size
     pub out: u16,
     pub operands: u8,   // operand count (e.g. residual-add = 2)
@@ -223,7 +229,7 @@ pub struct RowBody {
 
 Reduce (RMSNorm/softmax) vs pointwise/fused is a property of the opcode variant
 (`Opcode::variant_is_reduce`), not a body field; `RowBody` is identical either
-way.
+way. Streams below v6 carry the 20-byte form without `args` (`RowBodyLegacy`).
 
 ### TokenBody — 16 bytes
 
@@ -232,7 +238,8 @@ pub struct TokenBody {
     pub in_slot: u16,   // e.g. logits slot
     pub out_slot: u16,  // e.g. tokens slot
     pub kind: u8,       // TOKEN_* (sample greedy/stochastic, tokenize, ...)
-    pub _pad: u8,
+    pub _pad0: u8,
+    pub _pad1: u16,     // explicit: implicit padding would serialise uninitialised bytes
     pub vocab: u32,     // logit width
     pub arg: u32,       // op-specific (e.g. batch width for SAMPLE_BATCH)
 }
@@ -310,7 +317,7 @@ impl Program {
 reads out of bounds on a malformed stream:
 
 - Magic mismatch → reject (`"bad magic"`)
-- Version outside `MIN_VERSION..=VERSION` (2..=5) → reject (`"bad version"`)
+- Version outside `MIN_VERSION..=VERSION` (2..=7) → reject (`"bad version"`)
 - `n_inst` / `n_counter` are bounded by the remaining buffer length rather than pre-reserved, so an oversized count over-reads nothing
 - Truncated header / body / counter-id array / counter table → reject
 - A wait/succ id outside the counter table's id range → reject (`"counter id out of range"`)
@@ -329,7 +336,7 @@ zero-length body rather than being rejected.
 **Alternative:** Fixed-size records for O(1) random access.
 
 **Rationale:**
-- Body sizes range widely: `RdmaBody` is 8 B, `DmaBody` 12 B, `RowBody` 20 B, `FlashBody` 28 B, `GemmBody` 32 B, `LayoutBody` 88 B. A fixed record sized for the largest wastes most of it on the common small ops
+- Body sizes range widely: `RdmaBody` is 8 B, `DmaBody` 12 B, `GemmBody` 32 B, `RowBody` 36 B, `FlashBody` 36 B, `LayoutBody` 88 B. A fixed record sized for the largest wastes most of it on the common small ops
 - The interpreter processes sequentially (no random access needed)
 - Smaller streams → better cache behavior on the GPU
 

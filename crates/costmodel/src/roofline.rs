@@ -395,7 +395,8 @@ pub fn peak_compute_tflops(gpu: &GpuSpec, dtype: MmaDtype) -> f64 {
         }
     } else if name.contains("5090") {
         match dtype {
-            MmaDtype::Fp16 | MmaDtype::Bf16 => 835.0,
+            // Measured, fp32 accumulate (GeForce runs it at half the fp16-accumulate rate).
+            MmaDtype::Fp16 | MmaDtype::Bf16 => 235.0,
             MmaDtype::Fp8 | MmaDtype::Int8 => 1670.0,
             MmaDtype::Fp4 => 3340.0,
         }

@@ -18,7 +18,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::gpu::packet_exec::CudaPacketRuntime;
     use plowrt::exec::packet_runtime::{PacketAsset, PacketRuntime};
     let args: Vec<String> = std::env::args().collect();
-    let sweep = args.iter().any(|a| a == "--sweep" || a.starts_with("--sweep="));
+    let sweep = args
+        .iter()
+        .any(|a| a == "--sweep" || a.starts_with("--sweep="));
     let caps: Option<usize> = args
         .iter()
         .find_map(|a| a.strip_prefix("--sweep="))
@@ -95,9 +97,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if sweep {
         let raw = std::fs::read(path)?;
-        let insts = std::mem::take(
-            &mut plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program].insts,
-        );
+        let insts =
+            std::mem::take(&mut plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program].insts);
         for cap in 0..=caps.map_or(insts.len(), |c| c.min(insts.len())) {
             rt.set_debug_max_inst(cap as u32)?;
             let (op, blocks) = cap.checked_sub(1).map_or((String::new(), 0), |i| {

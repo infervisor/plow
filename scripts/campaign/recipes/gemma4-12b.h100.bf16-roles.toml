@@ -42,9 +42,7 @@ PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
 
 [serve.env]
-# vLLM 0.28 reference ran with prefix caching disabled; match it. A realtime-chat profile may
-# turn it on, but then the reference must too.
-PLOW_PREFIX_CACHE = "0"
+# Prefix cache stays on (policy: never disabled in a recipe; match the vLLM peer with its prefix caching on).
 # plowrt dlopens libcublasLt by soname; the host toolkit is not on the nix loader path.
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 # PLOW_PF_SEG_DIR is the build's objects/ dir; set it at bench time:

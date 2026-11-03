@@ -556,8 +556,8 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
              magnitude check would have caught a transpose. REGISTER COST ZERO: decode stayed \
              248 VGPR / occ 2 / spill 0 (the predicted 32 VGPR/lane was the cost of one workgroup \
              per head, not of KDA — one WAVE owns one column, so the state is 2 f32/lane). \
-             `Mamba2Scan(90)`, the dead-opcode cautionary tale this was written against, is still \
-             dead and still has no AMD arm.",
+             `Mamba2Scan(90)`, the cautionary tale this was written against, is still emitted only \
+             by the Nemotron-H block extraction, dispatched only on sm_120, and has no AMD arm.",
         ),
     });
     if c.hidden_act != "silu" && c.hidden_act != "gelu_pytorch_tanh" && c.hidden_act != "gelu_tanh"

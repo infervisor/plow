@@ -1830,7 +1830,10 @@ pub(crate) fn glm53_emit_full(
     // handles point past the end of the serialized tensor table -> a null device address at load.
     let gfx950 = crate::emit_is_amd() && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950;
     let ec = emit_config::active();
-    let l2_pf = l2_layout.filter(|_| std::env::var("PLOW_L2_PLACE_PREFILL").as_deref() == Ok("1"));
+    // Prefill placement stays opt-in here (`PLOW_L2_PLACE_PREFILL` set explicitly), like
+    // the dense-GQA AMD path in `lib.rs`; the value comes from EmitConfig.
+    let l2_pf = l2_layout
+        .filter(|_| ec.l2_place_prefill && std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     for &rows in &pf {
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);

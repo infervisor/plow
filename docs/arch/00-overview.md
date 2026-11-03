@@ -24,7 +24,7 @@
 | [13](13-prefill-chunking.md) | **Prefill Chunking** | Bucket ladder, the ragged tail, ragged-M |
 | [14](14-amd-arch-divergence.md) | **AMD Arch Divergence** | gfx942 vs gfx950: one tree, what forks, the tripwire |
 | [20](20-asr-pipelines.md) | **ASR Packet Pipelines** | Qwen causal and Nemotron RNNT compilation, runtime, batching and serving |
-| [architecture.md](architecture.md) | **Index / landing page** | Intro + linked table of contents for these chapters |
+| [architecture.md](architecture.md) | **Index / landing page** | Intro + linked table of contents, including chapters 15–28 |
 
 ---
 
@@ -169,7 +169,7 @@ graph LR
     M --> N --> O
 ```
 
-**Compile-time crates** (Rust): `nn-graph` (frontend/graph IR), `rewrite`, `costmodel`, `schedule`, `packet`, `lean_verify`; plus `hwspec`, `kernelcaps`, and `tunedb` (hardware/kernel/tuning registries)  
+**Compile-time crates** (Rust): `nn-graph` (frontend/graph IR), `rewrite`, `costmodel`, `schedule`, `packet`, `devgen` (the device-blob emitter every shipping GPU packet goes through), `lean_verify`; plus `hwspec`, `kernelcaps`, and `tunedb` (hardware/kernel/tuning registries)  
 **Shared schema** (Rust): `plow-asset` — single source of truth for compiler↔runtime types  
 **Runtime host** (Rust): `plowrt` — HTTP server, mux, executor management  
 **Runtime device** (C/CUDA/HIP): `runtime/` — interpreter, dispatch table, vendor kernels
@@ -185,8 +185,12 @@ graph LR
 5. **Assemble:** Lowers `LayerPlan` × `Soc` → `TileGraph` + `ConstraintSet`
 6. **Schedule:** List-schedules the TileGraph, allocates counters, plans memory
 7. **Emit:** Encodes as binary `.pkt` stream + JSON sidecars
-8. **Verify:** Lean checks all six correctness properties (opt-in)
+8. **Verify:** Lean checkpoints A–G on the schedule (opt-in); checkpoint K (knob consistency) on every emit
 9. **Serve:** Runtime loads artifacts, allocates arena, dispatches per-request
+
+As built, shipping GPU packets take the `devgen` path (`plowc --emit devblob`): steps 3–6 do not run,
+except that the rewrite's extracted fused sites decide which hand-written devgen fusions are
+emitted (`PLOW_EMIT_REWRITE`, default on; see [01](01-compiler-pipeline.md)).
 
 ---
 
@@ -198,7 +202,7 @@ graph LR
 | Rewrite engine | Egglog (equality saturation) | Ordered passes (MLIR-style) | Global optimality |
 | Coordination | Atomic counters | CUDA streams / events | Vendor-neutral, no CPU gating |
 | Packet format | Variable-length `repr(C)` POD | Fixed 128-byte | Space efficiency for small ops |
-| IR between halves | TileGraph (petgraph DAG) | MLIR dialect | Simpler, domain-specific |
+| IR between halves | TileGraph (`Vec` nodes + edge pairs) | MLIR dialect | Simpler, domain-specific |
 | Kernel selection | Offline calibrated AOT selection | Production runtime autotuning | Reproducible packets with hardware-specific evidence |
 | Formal verification | Lean 4 decidable checks | Fuzzing / property tests | Proves legality/correctness, not measured speed |
 | Multi-GPU | TP as outer wrapper | Interleaved TP+PP | Keeps single-GPU path clean |

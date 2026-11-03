@@ -270,10 +270,12 @@ fn decode_tails(
                     }
                     d.t[6] = slot_handle;
                 }
+                // The FP8 twin takes its slot map from `in.rowslot` (fj[2]), not t6: left as
+                // is, tail row r would attend slot r's cache instead of its own.
+                Some(DevOp::FlashDecodeFp8) => ok = false,
                 Some(
                     DevOp::HeadNormRope
                     | DevOp::HeadNormRopeFp8
-                    | DevOp::FlashDecodeFp8
                     | DevOp::FlashPrefill
                     | DevOp::FlashPrefillFp8,
                 ) if insts_writes_kv(d, e) => ok = false,

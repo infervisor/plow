@@ -1,6 +1,8 @@
 #include "golden.h"
 #include <stdint.h>
+#include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 static float f16_to_f32(uint16_t h) {
     const uint32_t sign = (uint32_t)(h >> 15) << 31;
@@ -401,11 +403,43 @@ G_K(g_embed_frame_bf16) {
     const plow_bf16* cb = PLOW_CPU_TEN(in, T, 3);
     const uint32_t* codes = PLOW_CPU_TEN(in, T, 4);
     const uint32_t rows = in->i[0], width = in->i[1], vocab = in->i[2], K = in->i[3];
-    const uint32_t cb_size = in->i[4], frame_lo = in->i[5], frame_rows = in->i[6];
+    const uint32_t cb_size = in->i[4], frame_lo = in->i[5], frame_rows = in->i[6], mode = in->i[7];
     const float div = in->fj[0].f;
     const uint64_t count64 = (uint64_t)rows * width;
     if (!rows || !width || !vocab || count64 > UINT32_MAX) return;
     uint32_t lo, hi;
+    if (mode & 2u) {
+        /* RMS-normalised frame rows (Maya 2): one row per slice unit, the row's mean square first. */
+        const float* nw = PLOW_CPU_TEN(in, T, 5);
+        const float eps = in->fj[1].f;
+        g_range(rows, slice, nblk, &lo, &hi);
+        for (uint32_t row = lo; row < hi; row++) {
+            const uint32_t tok = tokens[row];
+            if (tok >= vocab) return;
+            plow_bf16* o = out + (size_t)row * width;
+            if (tok - frame_lo >= frame_rows) {
+                for (uint32_t i = 0; i < width; i++) o[i] = table[(size_t)tok * width + i];
+                continue;
+            }
+            float ss = 0.f;
+            for (uint32_t i = 0; i < width; i++) {
+                float s = 0.f;
+                for (uint32_t k = 0; k < K; k++) {
+                    const uint32_t code = codes[(size_t)row * K + k];
+                    if (code >= cb_size) return;
+                    s += plow_bf2f(cb[((size_t)k * cb_size + code) * width + i]);
+                }
+                const float sb = plow_bf2f(plow_f2bf(s));
+                const float t = (mode & 1u) ? sb : plow_bf2f(plow_f2bf(plow_bf2f(table[(size_t)tok * width + i]) + sb));
+                o[i] = plow_f2bf(t / div);
+                const float y = plow_bf2f(o[i]);
+                ss += y * y;
+            }
+            const float inv = 1.0f / sqrtf(ss / (float)width + eps);
+            for (uint32_t i = 0; i < width; i++) o[i] = plow_f2bf(plow_bf2f(o[i]) * inv * nw[i]);
+        }
+        return;
+    }
     g_range((uint32_t)count64, slice, nblk, &lo, &hi);
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t row = index / width, column = index % width, tok = tokens[row];
@@ -421,7 +455,8 @@ G_K(g_embed_frame_bf16) {
             if (code >= cb_size) return;
             s += plow_bf2f(cb[((size_t)k * cb_size + code) * width + column]);
         }
-        const float t = plow_bf2f(plow_f2bf(plow_bf2f(a) + plow_bf2f(plow_f2bf(s))));
+        const float sb = plow_bf2f(plow_f2bf(s));
+        const float t = (mode & 1u) ? sb : plow_bf2f(plow_f2bf(plow_bf2f(a) + sb));
         out[index] = plow_f2bf(t / div);
     }
 }
@@ -505,14 +540,96 @@ G_K(g_sample_fish_bf16) {
 
 /* GemvF32Out (220): fp32 rows, sequential fma over k (the device sums lane partials, so results
  * agree to fp32 rounding, not bit for bit). */
+/* IEEE binary16 -> f32, exact (subnormals and specials included). */
+static float g_h2f(uint16_t h) {
+    const uint32_t s = (uint32_t)(h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    uint32_t bits;
+    if (e == 0x1fu) {
+        bits = s | 0x7f800000u | (m << 13);
+    } else if (e) {
+        bits = s | ((e + 112u) << 23) | (m << 13);
+    } else if (m) {
+        float v = (float)m * (1.0f / 16777216.0f); /* m * 2^-24 */
+        return (h & 0x8000u) ? -v : v;
+    } else {
+        bits = s;
+    }
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+/* f32 -> IEEE binary16, round to nearest even (subnormals, overflow to inf; NaN kept quiet). */
+static uint16_t g_f2h(float f) {
+    uint32_t x;
+    memcpy(&x, &f, sizeof x);
+    const uint32_t sign = (x >> 16) & 0x8000u, abs = x & 0x7fffffffu;
+    if (abs >= 0x7f800000u) return (uint16_t)(sign | 0x7c00u | (abs > 0x7f800000u ? 0x200u : 0u));
+    if (abs >= 0x477ff000u) return (uint16_t)(sign | 0x7c00u); /* rounds past 65504 */
+    if (abs < 0x38800000u) { /* f16 subnormal (or zero): value / 2^-24, rounded */
+        if (abs < 0x33000000u) return (uint16_t)sign;
+        const uint32_t m = (abs & 0x7fffffu) | 0x800000u, shift = 126u - (abs >> 23);
+        uint32_t h = m >> shift;
+        const uint32_t rem = m & ((1u << shift) - 1u), half = 1u << (shift - 1u);
+        if (rem > half || (rem == half && (h & 1u))) h++;
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = ((abs - 0x38000000u) >> 13);
+    const uint32_t rem = abs & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+    return (uint16_t)(sign | h);
+}
+
 G_K(g_gemv_f32_out) {
     (void)ctx;
     float* c = PLOW_CPU_TEN(in, T, 0);
     const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
     const plow_bf16* w = PLOW_CPU_TEN(in, T, 2);
-    const uint32_t m_rows = in->i[0], n_out = in->i[1], k_in = in->i[2];
+    const uint32_t m_rows = in->i[0], n_out = in->i[1], k_in = in->i[2], flags = in->i[7];
     uint32_t lo, hi;
     g_range(n_out, slice, nblk, &lo, &hi);
+    if (flags) {
+        /* Modes (dev.rs): f32 x, f16 W, bias, residual (may alias c), activation. */
+        const float* xf = (const float*)x;
+        const uint16_t* wh = (const uint16_t*)w;
+        const float* bias = (flags & 4u) ? (const float*)PLOW_CPU_TEN(in, T, 3) : NULL;
+        const float* res = (flags & 8u) ? (const float*)PLOW_CPU_TEN(in, T, 4) : NULL;
+        const float* gamma = (flags & 256u) ? (const float*)PLOW_CPU_TEN(in, T, 5) : NULL;
+        const float* beta = (flags & 256u) ? (const float*)PLOW_CPU_TEN(in, T, 6) : NULL;
+        const uint32_t act = (flags >> 4) & 15u;
+        const uint32_t bgroup = (flags & 512u) ? in->i[3] : 0u;
+        for (uint32_t m = 0; m < m_rows; m++) {
+            /* LayerNorm prologue (f32 x): the row's two-pass mean / variance. */
+            float mean = 0.f, rstd = 1.f;
+            if (gamma) {
+                float s = 0.f, v = 0.f;
+                for (uint32_t k = 0; k < k_in; k++) s += xf[(size_t)m * k_in + k];
+                mean = s / (float)k_in;
+                for (uint32_t k = 0; k < k_in; k++) {
+                    const float d = xf[(size_t)m * k_in + k] - mean;
+                    v = fmaf(d, d, v);
+                }
+                rstd = 1.0f / sqrtf(v / (float)k_in + in->fj[0].f);
+            }
+            for (uint32_t n = lo; n < hi; n++) {
+                float acc = 0.f;
+                for (uint32_t k = 0; k < k_in; k++) {
+                    const size_t xi = (size_t)m * k_in + k, wi = (size_t)n * k_in + k;
+                    float a = (flags & 1u) ? xf[xi] : plow_bf2f(x[xi]);
+                    if (gamma) a = fmaf((a - mean) * rstd, gamma[k], beta[k]);
+                    if (flags & 1024u) a = g_h2f(g_f2h(a));
+                    const float b = (flags & 2u) ? g_h2f(wh[wi]) : plow_bf2f(w[wi]);
+                    acc = fmaf(a, b, acc);
+                }
+                const size_t o = (size_t)m * n_out + n;
+                if (bias) acc += bias[(bgroup ? m / bgroup * n_out : 0u) + n];
+                if (res) acc += res[o];
+                if (act == 1u) acc = 0.5f * acc * (1.f + erff(acc * 0.70710678118654752f));
+                c[o] = acc;
+            }
+        }
+        return;
+    }
     for (uint32_t m = 0; m < m_rows; m++)
         for (uint32_t n = lo; n < hi; n++) {
             float acc = 0.f;

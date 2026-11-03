@@ -328,8 +328,9 @@ emits a `PlowMemMap` of slot→offset entries and the runtime resolves each to
 the compiler-computed static layout resolved by `memmap.c`. The Rust host
 (`crates/plowrt/src/memory/`) does not manage KV/prefix as a slice of that one
 arena — it adds dedicated allocators on top: the CUDA VMM allocator for
-global-layer KV (`vmm.rs`), flat device rings for sliding layers, and the radix
-`PrefixCache` over published boundary snapshots. The static regions (counters,
+global-layer KV (`vmm.rs`), flat device rings for sliding layers, the boundary tree
+over published prefixes (`vmm.rs`) and the content-addressed KV block store that holds
+their rows (`kv_store.rs`, [26](26-kv-block-store.md)). The static regions (counters,
 packet stream, weights, activation scratch) follow the arena/offset model;
 dynamic KV does not.
 
@@ -338,9 +339,14 @@ dynamic KV does not.
 KV is **not paged**. Each layer holds a head-major ring —
 `[slot][kv_head][ring_row][head_dim]`, indexed `row & kv_mask` — written in
 place by the per-head norm op and sized by the prefill chunk rather than by the
-context. Global layers are backed by CUDA virtual memory so a shared prefix's
-physical blocks can be mapped into several sequences at once; sliding layers
-stay on flat allocations and are shared by copying a boundary snapshot.
+context. Global layers are backed by CUDA virtual memory with per-slot commit in
+whole KV blocks (live KV; 4096 rows on the H100 packets), so a kernel must never load
+rows past `kv_len`. On CUDA a
+published prefix boundary is held by the KV block store (device slab plus an optional
+pinned host tier): its blocks are gathered into the slot's flat rings and tracks before
+the slot runs and scattered out at a boundary; the earlier VMM snapshot path and its
+knobs (`PLOW_KV_STORE`, `PLOW_VMM_SNAP_POOL`, `PLOW_VMM_SNAP_PITCHED`) are retired. AMD
+keeps its `SharedPrefix` snapshot. The prefix cache is always on.
 
 See **[22 — KV Cache](22-kv-cache.md)** for the layout and its rationale, the
 ring invariant, the write and read paths, fp8 KV, the verified memory model, the
@@ -349,9 +355,12 @@ slot and VMM allocator, and the prefix cache.
 > [!NOTE]
 > `crates/plowrt/src/memory/kv.rs` still contains a `BlockAllocator` /
 > `PageTable` pair implementing vLLM-style paged KV. It is **retained but
-> unused** (`memory/streamer.rs:212`); no shipping GPU packet reaches it, and a
-> paged repack of the head-major cache measured as a null
-> (`crates/devgen/src/lib.rs:2377`).
+> unused** (`memory/streamer.rs`); no shipping GPU packet reaches it, and a
+> paged repack of the head-major cache measured as a null (`crates/devgen/src/lib.rs`).
+> The 2026-10-28 paged-decode gate also failed and its code was reverted
+> ([27 §6.5](27-kv-zero-copy.md)). Library prefill attention ([28](28-library-attention.md))
+> reads a launch-local page pool that it gathers from the head-major cache; the cache
+> itself stays unpaged.
 
 ### Design Decision: Arena (not per-tensor malloc)
 
@@ -375,7 +384,10 @@ slot and VMM allocator, and the prefix cache.
 
 ### Subcommands
 
-The `Cmd` enum in `main.rs` defines these subcommands:
+The `Cmd` enum in `main.rs` defines these subcommands, among others (`asr`,
+`amd-probe`, `op-audit`, `inventory`, `qualify`, `knob-scope`, and the asset
+distribution commands `pull`, `load`, `show`, `ls`, `target`, `upgrade`, `prepare`,
+`rm`, `pack`, `publish`; `plowrt --help` is the full list):
 
 ```
 plowrt serve    --assets <dir>... [--port 8080] [--socket <path>]

@@ -206,9 +206,13 @@ impl GpuEngine {
         granularity: u64,
         row_interleaved: Option<bool>,
     ) -> Option<VmmPrefixLayout> {
+        let declined = |reason: &str| {
+            tracing::info!(reason, "VMM prefix cache declined");
+            None
+        };
         // Overlay rows (audio, voice conditioning) are not keyed by the prompt ids.
         if blob.tensors.iter().any(|t| t.name == "in.encoder_overlay") {
-            return None;
+            return declined("encoder overlay rows are not keyed by the prompt ids");
         }
         let requested = config.nv_vmm_prefix();
         if requested == Some(false)
@@ -226,9 +230,15 @@ impl GpuEngine {
                         )
                     })))
         {
-            return None;
+            return declined(if requested == Some(false) {
+                "PLOW_VMM_PREFIX=0"
+            } else {
+                "auto mode: not Hopper, live KV/rings, TP, or a mixed-step/decode-object packet"
+            });
         }
-        let layout = Self::vmm_prefix_layout(blob, kv, row_interleaved)?;
+        let Some(layout) = Self::vmm_prefix_layout(blob, kv, row_interleaved) else {
+            return declined("no VMM prefix KV layout for this packet");
+        };
         if requested.is_none() {
             // Auto-selection is an allowlist of the geometry the sliding-ring
             // snapshot path was qualified on (Gemma 4 hybrid KV), not a
@@ -263,13 +273,15 @@ impl GpuEngine {
                  PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables, =1 forces)"
             );
             if !qualified {
-                return None;
+                return declined("auto mode: geometry outside the qualified allowlist");
             }
         }
-        layout
+        if let Err(e) = layout
             .geo
             .block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)
-            .ok()?;
+        {
+            return declined(&e.to_string());
+        }
         Some(layout)
     }
 
@@ -492,10 +504,14 @@ impl GpuEngine {
                 &tensors,
                 geo.batch as usize,
             )?;
-            let park = crate::config::RuntimeConfig::get().vmm_ring_park;
+            // Every released slot parks its ring units in place (bounded against the block store at
+            // arm time, `bound_ring_park`): remapping a slot's ring on readmission (unmap +
+            // cuMemCreate + map + set_access per unit, serial on the mux tick) cost 26B BF16 at
+            // 1.8 sessions/s TTFT P99 1688 ms against 680 ms with every slot parked.
+            let park = geo.batch;
             if crate::config::RuntimeConfig::get().vmm_ring_recycle {
                 rings.enable_handle_recycling(crate::memory::vmm::kv_pool_cap());
-            } else if park > 0 {
+            } else {
                 rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
             }
             tracing::info!(
@@ -568,10 +584,12 @@ impl GpuEngine {
                     // Host tier: what the host-reserve rule allows now, unless the knob names
                     // a size (cut to the same rule by the store's growth check) or 0 (off).
                     let auto = crate::memory::vmm::host_tier_auto();
-                    let host_cap = match rt.vmm_host_cache_bytes() {
-                        None => auto.map_or(0, |(cap, _)| cap),
-                        Some(cap) => cap,
-                    };
+                    let host_cap =
+                        crate::memory::vmm::host_tier_grant(match rt.vmm_host_cache_bytes() {
+                            None => auto.map_or(0, |(cap, _)| cap),
+                            Some(cap) => cap,
+                        });
+                    let host_on = host_cap.bytes() > 0;
                     match super::kv_blocks::BlockServe::new(
                         be,
                         &serve,
@@ -593,7 +611,7 @@ impl GpuEngine {
                                     as std::sync::Arc<dyn crate::memory::vmm::SnapBlocks>,
                                 true,
                             );
-                            if host_cap > 0 {
+                            if host_on {
                                 kv.spawn_spill_ahead(
                                     blocks.store(),
                                     super::kv_blocks::SPILL_AHEAD_BYTES,

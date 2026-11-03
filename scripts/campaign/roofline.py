@@ -114,10 +114,10 @@ HARDWARE_REGISTRY: Dict[str, HardwareSpec] = {
         sm_or_cu_count=170,
         clock_boost_mhz=2407.0,
         bandwidth_datasheet_gbps=1792.0,
-        bandwidth_measured_gbps=None,
-        bf16_tflops_dense=835.0,
+        bandwidth_measured_gbps=1672.0,  # hbm_bw.py read-reduce
+        bf16_tflops_dense=235.0,  # measured cuBLAS bf16 GEMM, fp32 accumulate (GeForce: half rate)
         fp8_tflops_dense=1670.0,
-        fp16_tflops_dense=835.0,
+        fp16_tflops_dense=235.0,
     ),
     "rtx 4090": HardwareSpec(
         name="RTX 4090",

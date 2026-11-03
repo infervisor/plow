@@ -495,3 +495,19 @@ native prefill -0.2..+26%, native MoE prefill +13..+42%. The cuBLASLt prefill at
 | decode | B16 x 16000 | 13.61 | 13.58 | -0.3% | n/a (MoE) | equal |
 | decode | B32 x 1024 | 13.68 | 13.72 | +0.2% | n/a (MoE) | equal |
 | decode | B32 x 16000 | 18.79 | 18.75 | -0.2% | n/a (MoE) | equal |
+
+## 2026-10-29: global (hd512) prefill attention through the FA4 library route (FP8)
+
+lib-attn bin3 4b261f8a (prod-next ba3337a21 base), packet caf6c4a47ba6 with `objects/libplow_fa4_hd512.so`
+(bf16 pool, `PLOW_BUILD_FA4_HD512=1`) and `objects/kv_dequant_sm90.cubin`; docs/arch/28. Recipe serve
+env, `--prod-fidelity`, 1.8 sessions/s, 2 reps, strict `campaign.py report` against
+`strict-g26-tier23/vllm`: TTFT P99 260.7 ms (0.71x vLLM), TPOT P99 22.34 ms (0.69x), throughput 1.00x,
+SLO 100%.
+
+- Prefill, one 16000-token prompt: chunk 2048/1024/512/128 0.419/0.505/0.739/2.325 ->
+  0.373/0.463/0.678/1.995 s (-11/-8/-8/-14%), bit-deterministic.
+- FP32 gate vs same-concurrency vLLM 0.28 peers, thresholds unchanged: c1 PASS kl_trim 0.1214 (peer
+  0.1337); c8 PASS 0.1453 (0.1284); c16 PASS 0.1381; c32 2 of 3 PASS (kl_p95 1.216 / 0.972 / 0.939,
+  limit 1.12) against native on the same binary 3 of 3 (kl_p95 1.051 / 0.985 / 0.981).
+
+Evidence: `/opt/dlami/nvme/lava-tts/lib-attn/promo` (`prod-g26-lib/report`, `gate-g26`, `ctl/`).

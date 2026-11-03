@@ -264,8 +264,14 @@ impl ChunkBinding {
                 .iter()
                 .any(|t| t.bytes != max_items * 4)
             || binding.next_row0 < max_items * rows
-            || binding.encoder_row0 + max_items * rows > batch.encoder_rows as usize
-            || binding.predictor_slot0 + streams >= batch.slots
+            || binding
+                .encoder_row0
+                .checked_add(max_items * rows)
+                .is_none_or(|end| end > batch.encoder_rows as usize)
+            || binding
+                .predictor_slot0
+                .checked_add(streams)
+                .is_none_or(|end| end >= batch.slots)
             || batch
                 .predict
                 .last()
@@ -612,14 +618,21 @@ impl PacketRnnt {
     }
 
     /// Encoder rows the offline transcription of `valid_input_frames` mel frames decodes: a
-    /// stream's final steps decode up to the same row.
-    pub fn final_rows(&self, valid_input_frames: usize) -> Result<usize> {
+    /// stream's final steps decode up to the same row. `None` when they cannot reproduce it.
+    pub fn final_rows(&self, valid_input_frames: usize) -> Result<Option<usize>> {
         match self.encoder_for(valid_input_frames) {
-            Ok((_, frames)) => Ok(frames),
-            Err(_) => Ok(
+            Ok((encoder, frames)) => {
+                let bucket = transformed_frame_count(
+                    self.encoder_programs[encoder].0,
+                    &self.frame_transform,
+                )?;
+                let step = self.stream_windows().map_or(1, |w| w.rows);
+                Ok(steps_stay_in_bucket(frames, step, bucket).then_some(frames))
+            }
+            Err(_) => Ok(Some(
                 transformed_frame_count(valid_input_frames, &self.frame_transform)?
                     + self.trailing_frames,
-            ),
+            )),
         }
     }
 
@@ -637,9 +650,10 @@ impl PacketRnnt {
         };
         if self.chunk.is_some() {
             // Caches read as zeros at a stream's first step, so a reused row needs no reset.
-            stream.slot = Some(self.free.pop().ok_or_else(|| {
-                RuntimeError::Overloaded("every ASR stream slot is open".into())
-            })?);
+            stream.slot =
+                Some(self.free.pop().ok_or_else(|| {
+                    RuntimeError::Overloaded("every ASR stream slot is open".into())
+                })?);
             return Ok(stream);
         }
         let binding = self
@@ -695,7 +709,11 @@ impl PacketRnnt {
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         if stream.slot.is_some() {
-            let chunk = if stream.upload { &self.upload } else { &self.chunk };
+            let chunk = if stream.upload {
+                &self.upload
+            } else {
+                &self.chunk
+            };
             let rows = chunk.as_ref().map_or(0, |c| c.rows);
             let tokens = self
                 .stream_step_batch(&mut [(stream, window, rows)])?
@@ -1576,6 +1594,13 @@ fn transformed_frame_count(mut frames: usize, stages: &[[usize; 4]]) -> Result<u
     Ok(frames)
 }
 
+/// Whether stream steps of `step` encoder rows decoding `rows` stay within an offline encoder
+/// bucket of `bucket` rows. The steps encode whole attention chunks; offline, a chunk the bucket
+/// cuts short has fewer keys, so its rows differ from the stream's.
+fn steps_stay_in_bucket(rows: usize, step: usize, bucket: usize) -> bool {
+    rows.div_ceil(step).saturating_mul(step) <= bucket
+}
+
 fn bounded_transformed_frame_count(
     valid_frames: usize,
     capacity: usize,
@@ -1818,6 +1843,15 @@ mod tests {
         fn commit_prediction(&mut self) {
             self.commits += 1;
         }
+    }
+
+    #[test]
+    fn stream_finals_stay_in_the_offline_bucket() {
+        // Nemotron's 200-frame bucket: 25 rows, attention chunks of 4.
+        assert!(steps_stay_in_bucket(24, 4, 25));
+        assert!(!steps_stay_in_bucket(25, 4, 25));
+        assert!(steps_stay_in_bucket(100, 4, 100));
+        assert!(steps_stay_in_bucket(1, 1, 1));
     }
 
     #[test]

@@ -78,6 +78,11 @@ PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "256,384"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
+# Decode rungs of 32+ rows run on cuBLASLt; lm_head runs on cuBLASLt too.
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_NV_FA_FOLD = "1"
 PLOW_NO_GLU_FUSE = "1"
 PLOW_FUSE_KV_HNR = "1"
 # Opt-ins measured on this model: packed prefill at hd64/hd128, and the dense hd <= 128 decode
@@ -90,7 +95,7 @@ PLOW_EMIT_S3GEN_ATTN_H16 = "1"
 [bench]
 kind = "speech"
 client = "scripts/tts/tts_bench.py"
-arms = ["--conc 1 --stream --wav --n 24 --prompt-set chatterbox-mtl --voice default", "--conc 1 --n 24 --prompt-set chatterbox-mtl --voice default --tag full_c1", "--conc 16 --stream --n 48 --prompt-set chatterbox-mtl --voice default", "--conc 16 --n 48 --prompt-set chatterbox-mtl --voice default --tag full_c16"]
+arms = ["--conc 1 --stream --wav --n 24 --prompt-set chatterbox-mtl --voice default", "--conc 1 --n 24 --prompt-set chatterbox-mtl --voice default --tag full_c1", "--conc 16 --stream --n 48 --prompt-set chatterbox-mtl --voice default", "--conc 16 --n 48 --prompt-set chatterbox-mtl --voice default --tag full_c16", "--conc 64 --stream --n 128 --prompt-set chatterbox-mtl --voice default", "--conc 128 --stream --n 256 --prompt-set chatterbox-mtl --voice default", "--conc 200 --stream --n 400 --prompt-set chatterbox-mtl --voice default"]
 reference = "scripts/tts/chatterbox_mtl_ref.py"
 
 # `campaign.py gate <recipe> --assets <dir> --out <dir>`. Whisper CER per language: median 0.000
@@ -108,6 +113,7 @@ args = ["--s3gen-weights", "s3gen_v3.safetensors"]
 rel_l2_max = 1e-3
 timeout_s = 1800
 
-# VMM-backed KV prefix cache on every request path (sessions, shared system prompts, replays).
-[serve.env]
-PLOW_VMM_PREFIX = "1"
+# Served flags: lookahead-1 decode pipeline, pinned cuBLASLt algorithms, VMM prefix cache.
+[serve]
+extra_args = "--decode-pipeline"
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1" }

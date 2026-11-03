@@ -182,7 +182,11 @@ pub(crate) fn apply_output_object(
             }
         }
         if roles.iter().any(|&role| role == W8A16_PREFILL_M1) {
-            let record = ProgramRoles { index, roles };
+            let record = ProgramRoles {
+                index,
+                roles,
+                library: Vec::new(),
+            };
             if let Some(position) = prior {
                 metadata.programs[position] = record;
             } else {

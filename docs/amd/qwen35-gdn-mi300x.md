@@ -25,7 +25,7 @@ state this work started from: **zero** cases in `runtime/amd/interp.hip` for the
 | 143 | `QWEN_GDN_CONV_PREFILL`    | `QwenGdnConvPrefill`| `op_qwen_gdn.cuh:213`               | —          | arm     |
 | 144 | `QWEN_GDN_QKV_PREP`        | `QwenGdnQkvPrep`    | `op_qwen_gdn.cuh:238`               | —          | arm     |
 | 145 | `QWEN_GDN_GATE_PREP`       | `QwenGdnGatePrep`   | `op_qwen_gdn.cuh:264`               | —          | arm     |
-| 146 | `QWEN_GDN_PREFILL`         | `QwenGdnPrefill`    | **host-side**, `gdn_prefill.cpp`    | —          | **still refused** |
+| 146 | `QWEN_GDN_PREFILL`         | `QwenGdnPrefill`    | **host-side**, `qwen_gdn.rs`        | —          | **still refused** |
 
 The rest of a Qwen3.5 program (`Gemm*`, `Gemv*`, `Glu`, `Embed`, `Residual`, `QuantFp8`,
 `FlashPrefill`/`FlashDecode`/`FlashMerge` at HD256, `Argmax`/`ArgmaxFin`) is already dispatched on
@@ -35,8 +35,9 @@ was the whole gap.
 ### Why op 146 is different in kind
 
 It is not an interpreter arm on *either* backend. sm_90a dispatches it host-side into a generated
-CuTe DSL kernel: `runtime/nvidia/gdn_prefill.cpp` (`plow_gdn_create` / `plow_gdn_run`), driven from
-`crates/plowrt/src/exec/gpu.rs` (the `QwenGdnPrefill` adapter around line 6207). That kernel is
+CuTe DSL kernel shipped as a packet cubin (`plow_gdn_prefill.aot`) and launched by plowrt's host
+stub (`crates/plowrt/src/device/cuda/qwen_gdn.rs`, driven from the `QwenGdnPrefill` adapter in
+`crates/plowrt/src/exec/gpu.rs`). That kernel is
 hard-wired to 48 heads and a 128x128 state and to sm_90a. An AMD prefill therefore needs a HIP
 chunked body **and** a `plowrt` adapter, not a `case` label — clearing the ten interpreter arms does
 not clear this one, which is why the refusal keeps naming it separately.
@@ -226,7 +227,7 @@ refusal exists to prevent.
    stages it already has — the maths is identical once the gate's rank is fixed. The alternative is
    a port of AITER's `chunk_gated_delta_rule_fwd_h.cu`, which is already gfx942-native but is a
    state-carry kernel only and would still need the other four stages.
-2. A `plowrt` adapter. The sm_90a path is a host-side `plow_gdn_run` call, so the AMD side either
+2. A `plowrt` adapter. The sm_90a path is a host-side launch (`NativeGdn::launch`), so the AMD side either
    grows the same shape of adapter or the emit is restructured to lower op 146 into the four
    KDA-shaped packets. The second is more in this tree's idiom but is a devgen change, not a kernel
    one.

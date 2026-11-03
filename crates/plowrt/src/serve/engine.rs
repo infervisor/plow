@@ -306,6 +306,10 @@ pub trait SeqEngine {
     fn token_batch_member_fits_body(&self, _slot: usize, _rows: u32) -> bool {
         true
     }
+    /// Whether [`Self::logits_row`] serves the tokens a token batch sampled (OpenAI logprobs).
+    fn token_batch_logprobs(&self) -> bool {
+        false
+    }
     /// Run one token batch. `output` receives `(slot, id)` per leading row — the `feeds` in
     /// order, then the members whose prompt completes in this step — the same delivery shape
     /// the CUDA route's `token_batch_step` produces, so one mux arm reads both.
@@ -451,6 +455,17 @@ impl ServeEngine {
             ServeEngine::Amd(e) => e.kv_admission_budget(),
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => None,
+        }
+    }
+
+    /// Free device memory the KV admission budget leaves unbudgeted. A co-resident load that
+    /// takes it starves this engine's admission.
+    pub fn kv_admit_reserve(&self) -> u64 {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.kv_admit_reserve(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
         }
     }
 
@@ -1853,7 +1868,7 @@ mod amd_serve {
                 "AMD prefix cache selection"
             );
             let token_batch_tp = match &ranks {
-                Ranks::Tp(g) if crate::config::RuntimeConfig::get().token_batch && has_prefill => {
+                Ranks::Tp(g) if has_prefill => {
                     let bodies = g.token_batch_bodies();
                     let any_body = g.rank(0).has_token_batch_bodies();
                     let band = bodies.first().map(|b| b.2);

@@ -83,7 +83,9 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_W8A16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub w8a16: bool,
 
-    /// MXFP4 (A4W4) encoding — both operands are 4-bit with E8M0 microscales.
+    /// MXFP4 weights with E8M0 microscales. Dense projections (ops 91-93) keep bf16 activations
+    /// (w4a16); only the grouped MoE A4W4 kernels (gfx950, `moe_glu_a4w4_kw.h`) also take fp4
+    /// activations.
     #[arg(long, env = "PLOW_MXFP4", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub mxfp4: bool,
 
@@ -429,6 +431,29 @@ pub struct EmitConfig {
     /// own KV layers; `model-dspark.safetensors`).
     #[arg(long, env = "PLOW_SPEC_KIND", value_parser = clap::builder::PossibleValuesParser::new(["gemma4_assistant", "gemma4_dspark"]))]
     pub spec_kind: Option<String>,
+
+    /// sm_120a decode: the Qwen / Llama AddNorm packets fold into the GEMVs around them (o_proj /
+    /// down add into the residual stream and write x * gamma with row-block sums of squares; the
+    /// GemvGlu / GemvQkv after them scale by 1/rms). Changes the rounding point of the normed input.
+    #[arg(long, env = "PLOW_DECODE_NORM_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_norm_fold: bool,
+    /// sm_120a decode: the q / k / v HeadNormRope packets fold into FlashDecode (each item norms
+    /// and ropes its own query heads, and the split holding the new row writes its k / v) on the
+    /// decode rungs of at least this many rows (1 = every rung). Unset / 0 = off.
+    #[arg(long, env = "PLOW_DECODE_HNR_FOLD")]
+    pub decode_hnr_fold: Option<u32>,
+    /// sm_120a decode: the Gemv walk (o_proj / down) splits K over blocks on the rungs of at least
+    /// this many rows (64-row units, the group's last block sums the partials in a fixed order).
+    /// Changes the f32 summation order. Unset / 0 = off.
+    #[arg(long, env = "PLOW_DECODE_GEMV_XK")]
+    pub decode_gemv_xk: Option<u32>,
+    /// sm_120a decode, with PLOW_DECODE_GEMV_XK: the GemvQkv walk splits K over blocks too.
+    #[arg(long, env = "PLOW_DECODE_GEMV_XK_QKV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_gemv_xk_qkv: bool,
+    /// sm_120a decode: the GEMV walks load weights evict-first (dead until the next token), so
+    /// L2 keeps the claim-ahead prefetches; the GemvGlu prefetch budget grows to 96 KiB.
+    #[arg(long, env = "PLOW_DECODE_GEMV_W_CS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_gemv_w_cs: bool,
 
     /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
     #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
@@ -1528,6 +1553,17 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMV_PREFETCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemv_prefetch: bool,
 
+    /// The NVIDIA pre-gate prefetch's op set (`gemv_pf_ops`, with PLOW_GEMV_PREFETCH): Gemv 1,
+    /// GemvGlu 2, GemvQkv 4, AddNorm 8, HeadNormRope 16, hd128 FlashDecode 32, the next hd128
+    /// FlashDecode's KV from the GEMV / norm entries before it 64. Unset = 7.
+    #[arg(long, env = "PLOW_NV_GEMV_PF_OPS")]
+    pub nv_gemv_pf_ops: Option<u32>,
+
+    /// sm_120a decode: the walks that take the K-split GEMV (`gemv_k8_ops`) at rungs 2..16: Gemv
+    /// 1, GemvGlu 2, GemvQkv 4. Unset = the mma walks only.
+    #[arg(long, env = "PLOW_NV_GEMV_K8_OPS")]
+    pub nv_gemv_k8_ops: Option<u32>,
+
     /// Isolate compatible MXFP4 grouped-MoE Down+Combine prefill boundaries for the standalone
     /// deterministic stage-2 object. Default on; `=0` is the rollback to the interpreter route.
     #[arg(long, env = "PLOW_MOE_STAGE2_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1668,6 +1704,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NO_GLU_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub no_glu_fuse: bool,
 
+    /// Serve this rung's lone causal global `FlashPrefill(Fp8)` segments with the library route
+    /// (`plow_fa4_hd512.aot` or `plow_fa4_hd256.aot` in the out dir; `library_attention.rs`).
+    /// Per rung.
+    #[arg(long, env = "PLOW_EMIT_ATTN_LIBRARY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub attn_library: bool,
+
     /// Emit TMA descriptors for GEMM operands (sm_90a+).
     #[arg(long, env = "PLOW_TMA_GEMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub tma_gemm: bool,
@@ -1727,6 +1769,11 @@ pub struct EmitConfig {
     /// Select the isolated BF16 M1 GEMV decode role with 512 threads.
     #[arg(long, env = "PLOW_GEMV_DECODE_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemv_decode_role: bool,
+
+    /// Concatenate same-input block-scaled FP8 projections along N at load (`cat/` weights, one
+    /// cuBLASLt GEMM; gate|up feeds `GluPitched`). Packets need runtime contract 4.
+    #[arg(long, env = "PLOW_FP8_BLOCK_CONCAT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fp8_block_concat: bool,
 
     #[arg(long, env = "PLOW_QWEN_FP8_M1_TMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_fp8_m1_tma: bool,
@@ -1991,6 +2038,11 @@ impl EmitConfig {
             spec_rows: env_str("PLOW_SPEC_ROWS"),
             spec_shard_sha256: env_str("PLOW_SPEC_SHARD_SHA256"),
             spec_kind: env_str("PLOW_SPEC_KIND"),
+            decode_norm_fold: env_bool("PLOW_DECODE_NORM_FOLD"),
+            decode_hnr_fold: env_u32("PLOW_DECODE_HNR_FOLD"),
+            decode_gemv_xk: env_u32("PLOW_DECODE_GEMV_XK"),
+            decode_gemv_xk_qkv: env_bool("PLOW_DECODE_GEMV_XK_QKV"),
+            decode_gemv_w_cs: env_bool("PLOW_DECODE_GEMV_W_CS"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             fa_gf_64: env_u32("PLOW_FA_GF_64"),
@@ -2227,6 +2279,8 @@ impl EmitConfig {
             kda_fb_fold: env_bool("PLOW_KDA_FB_FOLD"),
             kda_decode_fused_arm: env_bool("PLOW_KDA_DECODE_FUSED_ARM"),
             gemv_prefetch: env_bool("PLOW_GEMV_PREFETCH"),
+            nv_gemv_pf_ops: env_u32("PLOW_NV_GEMV_PF_OPS"),
+            nv_gemv_k8_ops: env_u32("PLOW_NV_GEMV_K8_OPS"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
             dsv41_ops: std::env::var("PLOW_DSV41_OPS")
@@ -2252,6 +2306,7 @@ impl EmitConfig {
             moe_stage1_body: env_bool("PLOW_MOE_STAGE1_BODY"),
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),
+            attn_library: env_bool("PLOW_EMIT_ATTN_LIBRARY"),
             tma_gemm: env_bool("PLOW_TMA_GEMM"),
             gemma4_sm90_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"),
             gemma4_sm90_w8a8_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"),
@@ -2268,6 +2323,7 @@ impl EmitConfig {
             gemv_decode_role: env_bool("PLOW_GEMV_DECODE_ROLE"),
             decode_objects: None,
             decode_projection_tuning: false,
+            fp8_block_concat: env_bool("PLOW_FP8_BLOCK_CONCAT"),
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),

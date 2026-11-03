@@ -101,7 +101,6 @@ PLOW_VMM_LIVE_RINGS = "1"
 PLOW_KV_MEM_UTIL = "0.9"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
-PLOW_TOKEN_BATCH = "1"
 
 [bench]
 backend = "openai"

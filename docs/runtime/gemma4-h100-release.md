@@ -32,9 +32,6 @@ PLOW_PROFILE=bf16-fp8kv PORT=8080 ./serve.sh
 # Run workloads from another terminal.
 python3 bf16-unified/workloads.py --concurrency 8 --max-tokens 128
 
-# Disable unified dispatch while retaining prefix caching.
-./serve.sh --token-batch=false
-
 # Direct CLI access using the bundled ELF loader and libraries.
 ./plowrt.sh --help
 ```

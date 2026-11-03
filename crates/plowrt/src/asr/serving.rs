@@ -32,7 +32,25 @@ mod realtime;
 #[cfg(feature = "cuda")]
 mod shared;
 #[cfg(feature = "cuda")]
+pub(crate) use shared::is_audio_lm;
+#[cfg(feature = "cuda")]
 pub use shared::{bind, preload, release};
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn is_audio_lm(_dir: &std::path::Path) -> crate::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn bind(_state: &crate::serve::AppState, _slug: &str) -> crate::Result<()> {
+    Ok(())
+}
+#[cfg(not(feature = "cuda"))]
+pub fn preload(_state: &crate::serve::AppState, _slug: &str) -> crate::Result<()> {
+    Ok(())
+}
+#[cfg(not(feature = "cuda"))]
+pub fn release(_dir: &std::path::Path, _device: u8) {}
 
 const BATCH_FORMATION_WINDOW: Duration = Duration::from_millis(5);
 
@@ -497,6 +515,17 @@ fn step_streams(
             finish_job(job, cancelled());
             continue;
         }
+        // The stream push carries no prompt: refused here as the offline pass refuses it, or
+        // whether a prompt is accepted depends on how far the recording's stream got.
+        if !job.context.is_empty() && !engine.accepts_context() {
+            finish_job(
+                job,
+                Err(crate::RuntimeError::Rejected(
+                    crate::asr::CONTEXT_UNSUPPORTED.into(),
+                )),
+            );
+            continue;
+        }
         let id = match streams.iter().position(|open| open.key.ptr_eq(&key)) {
             // A final far ahead of its stream goes offline: one pass beats many steps.
             Some(index)
@@ -571,8 +600,13 @@ fn step_streams(
             Ok(Some(text)) => Ok(text),
             Err(error) => Err(error),
         };
-        if let (true, Some(index)) = (job.finish, index) {
-            streams.swap_remove(index);
+        if let Some(index) = index {
+            if job.finish {
+                streams.swap_remove(index);
+            } else if text.is_err() {
+                // The stream's state is unknown: the next partial reopens it from the start.
+                engine.stream_close(streams.swap_remove(index).id);
+            }
         }
         let result = text.and_then(|text| {
             Ok(Transcript {
@@ -847,6 +881,10 @@ fn finish_job(job: AsrJob, result: crate::Result<Transcript>) {
     } else if result.is_ok() {
         metrics.completed.fetch_add(1, Ordering::Relaxed);
         metrics.first_transcript.duration(elapsed);
+        metrics.audio_duration_ms.fetch_add(
+            (job.samples.len() as u64 * 1000) / SAMPLE_RATE as u64,
+            Ordering::Relaxed,
+        );
     } else {
         metrics.errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -1216,6 +1254,11 @@ pub fn packet_model_names() -> Vec<String> {
     names
 }
 
+#[cfg(not(feature = "cuda"))]
+pub fn packet_model_names() -> Vec<String> {
+    Vec::new()
+}
+
 /// No packet-model transcription queued or running (the serve drain condition).
 #[cfg(feature = "cuda")]
 pub fn packet_models_idle() -> bool {
@@ -1225,10 +1268,17 @@ pub fn packet_models_idle() -> bool {
     })
 }
 
+#[cfg(not(feature = "cuda"))]
+pub fn packet_models_idle() -> bool {
+    true
+}
+
 /// Whether `slug` serves `/v1/audio/transcriptions` on `plowrt serve`.
-#[cfg(feature = "cuda")]
 pub fn serves_audio(state: &crate::serve::AppState, slug: &str) -> bool {
-    shared::serves_audio(state, slug)
+    let Ok(bundle) = state.registry.get(slug) else {
+        return false;
+    };
+    bundle.is_audio()
 }
 
 fn configured_vad() -> Option<Arc<crate::asr::vad::Vad>> {
@@ -1408,10 +1458,10 @@ async fn transcribe_upload(
     let format = fields
         .remove("response_format")
         .unwrap_or_else(|| "json".into());
-    if !matches!(format.as_str(), "json" | "text") {
+    if !matches!(format.as_str(), "json" | "text" | "verbose_json") {
         return failure(
             StatusCode::BAD_REQUEST,
-            "response_format must be json or text",
+            "response_format must be json, text or verbose_json",
         );
     }
     if fields
@@ -1507,6 +1557,16 @@ async fn transcribe_upload(
             )])
         } else if format == "text" {
             String::new().into_response()
+        } else if format == "verbose_json" {
+            let dur = samples.len() as f64 / SAMPLE_RATE as f64;
+            let lang = language.as_deref().unwrap_or("english");
+            Json(json!({
+                "task": "transcribe",
+                "language": lang,
+                "duration": dur,
+                "text": "",
+            }))
+            .into_response()
         } else {
             Json(json!({"text": ""})).into_response()
         };
@@ -1599,6 +1659,8 @@ async fn transcribe_upload(
     if stream {
         opts.deltas = Some(delta_tx);
     }
+    let samples_len = samples.len();
+    let reply_lang = language.clone();
     let work = match route.submit(samples, language, context, cancel.0.clone(), opts) {
         Ok(work) => work,
         Err(SubmitError::Full) => return busy("ASR queue full"),
@@ -1664,6 +1726,21 @@ async fn transcribe_upload(
     }
     let mut response = match result {
         Ok(Ok(result)) if format == "text" => result.text.into_response(),
+        Ok(Ok(result)) if format == "verbose_json" => {
+            let dur = samples_len as f64 / SAMPLE_RATE as f64;
+            let lang = result
+                .language
+                .as_deref()
+                .or(reply_lang.as_deref())
+                .unwrap_or("english");
+            Json(json!({
+                "task": "transcribe",
+                "language": lang,
+                "duration": dur,
+                "text": result.text,
+            }))
+            .into_response()
+        }
         Ok(Ok(result)) if recorded => {
             Json(json!({"text":result.text,"final":finals,"offset":recorded_samples}))
                 .into_response()
@@ -3254,6 +3331,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cohort_reopens_a_stream_whose_push_failed() {
+        #[derive(Default)]
+        struct Log {
+            opened: u64,
+            pushed: Vec<(u64, usize)>,
+            closed: Vec<u64>,
+        }
+        struct Failing(Arc<parking_lot::Mutex<Log>>);
+        impl Transcriber for Failing {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                unreachable!("partials stream")
+            }
+            fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+                let mut log = self.0.lock();
+                log.opened += 1;
+                Ok(Some(log.opened))
+            }
+            fn stream_push(
+                &mut self,
+                id: u64,
+                samples: &[f32],
+                _: &mut dyn FnMut(&str),
+            ) -> crate::Result<String> {
+                let mut log = self.0.lock();
+                log.pushed.push((id, samples.len()));
+                if log.pushed.len() == 2 {
+                    return Err(crate::RuntimeError::Msg("step failed".into()));
+                }
+                Ok(format!("stream {id}"))
+            }
+            fn stream_close(&mut self, id: u64) {
+                self.0.lock().closed.push(id);
+            }
+        }
+        let log = Arc::new(parking_lot::Mutex::new(Log::default()));
+        let (mux, _, _) = AsrMux::spawn(Box::new(Failing(log.clone())));
+        let recording: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
+        let run = |samples: usize| {
+            mux.submit_with(
+                vec![0.0; samples],
+                None,
+                String::new(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Some(Arc::downgrade(&recording)),
+                false,
+            )
+            .unwrap()
+        };
+        assert_eq!(run(100).await.unwrap().unwrap().text, "stream 1");
+        assert!(run(250).await.unwrap().is_err());
+        assert_eq!(run(300).await.unwrap().unwrap().text, "stream 2");
+        let log = log.lock();
+        assert_eq!(log.pushed, [(1, 100), (1, 150), (2, 300)]);
+        assert_eq!(log.closed, [1]);
+    }
+
+    /// An engine that cannot condition on a prompt refuses one on the stream path as offline: a
+    /// final continuing an open stream used to drop its context and answer.
+    #[tokio::test]
+    async fn a_streamed_final_refuses_a_prompt_the_engine_cannot_take() {
+        struct NoContext;
+        impl Transcriber for NoContext {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn accepts_context(&self) -> bool {
+                false
+            }
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                context: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                if !context.is_empty() {
+                    return Err(crate::RuntimeError::Rejected(
+                        crate::asr::CONTEXT_UNSUPPORTED.into(),
+                    ));
+                }
+                Ok(Transcript {
+                    text: "offline".into(),
+                    language: None,
+                })
+            }
+            fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+                Ok(Some(1))
+            }
+            fn stream_push(
+                &mut self,
+                _: u64,
+                _: &[f32],
+                _: &mut dyn FnMut(&str),
+            ) -> crate::Result<String> {
+                Ok("streamed".into())
+            }
+            fn stream_finals(&self) -> bool {
+                true
+            }
+        }
+        let (mux, _, _) = AsrMux::spawn(Box::new(NoContext));
+        let recording: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
+        let run = |samples: usize, context: &str, finish: bool, stream: bool| {
+            mux.submit_with(
+                vec![0.0; samples],
+                None,
+                context.to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                stream.then(|| Arc::downgrade(&recording)),
+                finish,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            run(100, "", false, true).await.unwrap().unwrap().text,
+            "streamed"
+        );
+        let unsupported = |r: crate::Result<Transcript>| {
+            r.is_err_and(|e| e.to_string().contains(crate::asr::CONTEXT_UNSUPPORTED))
+        };
+        assert!(
+            unsupported(run(150, "a prompt", true, true).await.unwrap()),
+            "streamed final"
+        );
+        assert!(
+            unsupported(run(150, "a prompt", true, false).await.unwrap()),
+            "offline final"
+        );
+        assert!(
+            unsupported(run(200, "a prompt", false, true).await.unwrap()),
+            "partial"
+        );
+    }
+
+    #[tokio::test]
     async fn cohort_streams_growing_text_as_deltas() {
         struct Growing;
         impl Transcriber for Growing {
@@ -3508,6 +3731,20 @@ mod tests {
             &response.into_body().collect().await.unwrap().to_bytes()[..],
             br#"{"text":""}"#
         );
+        let verbose_silent = upload(
+            "/v1/audio/transcriptions",
+            &[("model", "test"), ("response_format", "verbose_json")],
+            &[0.0; 16_000],
+        );
+        let response = app.clone().oneshot(verbose_silent).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let val: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(val["task"], "transcribe");
+        assert_eq!(val["text"], "");
+        assert_eq!(val["duration"], 1.0);
+        assert_eq!(val["language"], "english");
         let response = app.clone().oneshot(text(&signal)).await.unwrap();
         assert_eq!(
             &response.into_body().collect().await.unwrap().to_bytes()[..],
@@ -3795,6 +4032,71 @@ mod tests {
                 expected
             );
         }
+        let response = app
+            .clone()
+            .oneshot(request("test", "verbose_json"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let val: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(val["task"], "transcribe");
+        assert_eq!(val["text"], "hello");
+        assert_eq!(val["duration"], 0.5);
+
+        struct MultilingualFake;
+        impl Transcriber for MultilingualFake {
+            fn language(&self, language: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(match language {
+                    Some("zh") | Some("chinese") => Some("chinese".into()),
+                    Some(other) => Some(other.into()),
+                    None => Some("french".into()),
+                })
+            }
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                language: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                Ok(Transcript {
+                    text: "bonjour".into(),
+                    language: self.language(language)?,
+                })
+            }
+        }
+        let multi_app = AsrServer::new("multi".into(), MultilingualFake).router(false);
+        // Language omitted -> detected "french" reported
+        let req = upload(
+            "/v1/audio/transcriptions",
+            &[("model", "multi"), ("response_format", "verbose_json")],
+            &[0.1; 8000],
+        );
+        let resp = multi_app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let val: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["language"], "french");
+        assert_eq!(val["text"], "bonjour");
+
+        // Language supplied as "zh" -> normalized "chinese" reported
+        let req = upload(
+            "/v1/audio/transcriptions",
+            &[
+                ("model", "multi"),
+                ("language", "zh"),
+                ("response_format", "verbose_json"),
+            ],
+            &[0.1; 8000],
+        );
+        let resp = multi_app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let val: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["language"], "chinese");
+
         assert_eq!(
             app.clone()
                 .oneshot(request("missing", "json"))

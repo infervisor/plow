@@ -1852,9 +1852,6 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         .clone()
         .ok_or("--emit devblob requires --hf-dir <checkpoint>")?;
 
-    let config_json = std::fs::read_to_string(dir.join("config.json"))?;
-    ensure_devblob_arch_supported(&config_json)?;
-
     let slug = plowc::hf_config::dir_slug(&dir);
 
     // Two output shapes:
@@ -2200,18 +2197,6 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(pkt)
 }
 
-fn ensure_devblob_arch_supported(config_json: &str) -> Result<(), String> {
-    let v: serde_json::Value =
-        serde_json::from_str(config_json).map_err(|e| format!("invalid config.json: {e}"))?;
-    if v["model_type"].as_str() == Some("qwen3_5")
-        && (v.get("quantization_config").is_some()
-            || v["text_config"].get("quantization_config").is_some())
-    {
-        return Err("qwen3_5 native checkpoint FP8 lowering is not implemented yet".into());
-    }
-    Ok(())
-}
-
 /// `--emit devblob+cubin`: drive the Phase-A CMake target with the defines the
 /// manifest asked for.
 ///
@@ -2293,6 +2278,9 @@ fn build_cubin_from_manifest(
     }
     if req.iter().any(|d| d.starts_with("PLOW_NV_W8A8")) {
         args.push("-DPLOW_NV_W8A8=ON".into());
+    }
+    if req.iter().any(|d| d.starts_with("PLOW_NV_W8A16")) {
+        args.push("-DPLOW_NV_W8A16=ON".into());
     }
     if req.iter().any(|d| d.starts_with("PLOW_FP8_KV")) {
         args.push("-DPLOW_FP8_KV=ON".into());
@@ -3480,17 +3468,6 @@ mod cli_tests {
         let mut argv = vec!["plowc", "--hf-dir", "/tmp/x", "--emit", "devblob"];
         argv.extend_from_slice(extra);
         Box::new(try_parse(&argv).expect("parse"))
-    }
-
-    #[test]
-    fn qwen35_devblob_routes_bf16_and_rejects_unimplemented_fp8() {
-        ensure_devblob_arch_supported(r#"{"model_type":"qwen3_5"}"#).unwrap();
-        ensure_devblob_arch_supported(r#"{"model_type":"qwen3"}"#).unwrap();
-        let err = ensure_devblob_arch_supported(
-            r#"{"model_type":"qwen3_5","quantization_config":{"quant_method":"fp8"}}"#,
-        )
-        .unwrap_err();
-        assert!(err.contains("FP8 lowering"));
     }
 
     #[test]

@@ -235,7 +235,7 @@ These did not reproduce the in-model loss in the standalone bench:
 * in-model KV strides (ring stride 2048);
 * a 99-200 KB dynamic smem carveout.
 
-With every layer's flash run 3× (`PLOW_NV_FA_DUP`), the repeat passes cost 97 µs (RGM) and 110 µs
+With every layer's flash run 3× (a measurement-only define, `PLOW_NV_FA_DUP`, since removed), the repeat passes cost 97 µs (RGM) and 110 µs
 (row-group body). Those repeats re-read KV partly from L2, so they do not show the cold in-model
 cost.
 

@@ -28,6 +28,16 @@ model is ready for Stage 6 (runtime optimization). Read
 `docs/bringup/05-single-block-sweep.md` first — it has the full methodology,
 commands, and pitfalls. This prompt is the executable checklist.
 
+**HARD RULE.** In a perf campaign this stage is where candidates are screened:
+one block at the served shape, precision, flags, rung width and context, against
+a calibrated bandwidth/compute roofline for that block. Nothing goes to
+whole-network `step_bench`, FP32 gates or serving grids before it wins here. Your
+report starts with the block-vs-roofline table (block time, roofline floor, % of
+floor, delta vs current). If the harness cannot express the block (FP8 floors,
+GDN/MLA kinds, MoE router inputs, packed prefill with riders, library attention
+routes; see `docs/bringup/agent-tools.md` "HARD RULE"), name the gap in the
+report instead of writing a new runner.
+
 ## Preconditions (from Stages 1–4)
 
 * Every hot production kernel has a recorded exact-shape same-session comparison

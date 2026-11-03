@@ -308,7 +308,11 @@ fn bind_decode(
             bound = true;
         }
         if bound {
-            uses.push(ProgramRoles { index, roles });
+            uses.push(ProgramRoles {
+                index,
+                roles,
+                library: Vec::new(),
+            });
         }
     }
     if !matched {

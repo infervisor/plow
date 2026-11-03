@@ -13,6 +13,8 @@ import uuid
 
 REPO = Path(__file__).resolve().parents[2]
 LEASE = REPO / "perf-data/tools/gpulease"
+# Seconds gpulease waits for the cards; a job queued behind a serving lease outlasts gpulease's own 1800 s default.
+LEASE_TIMEOUT = 14400
 
 
 def save(path, value):
@@ -78,6 +80,7 @@ def work(root):
             with (root / (path.stem + ".log")).open("ab") as log:
                 # The runner outlives submitters; a later job must not inherit the first job's Plow knobs.
                 child_env = {key: value for key, value in os.environ.items() if not key.startswith("PLOW_")}
+                child_env["GPU_LEASE_TIMEOUT"] = str(job.get("lease_timeout", LEASE_TIMEOUT))
                 # Metal has no SMI process audit or gpulease/flock utility.
                 # Share an advisory lock across queue roots on this Mac.
                 metal_lock = None
@@ -123,9 +126,13 @@ def main():
             parser.error("Metal uses one shared device")
         if args.ngpu < 1 or not args.command:
             parser.error("submit needs a positive GPU count and a command")
+        try:
+            lease_timeout = int(os.environ.get("GPU_LEASE_TIMEOUT", LEASE_TIMEOUT))
+        except ValueError:
+            parser.error("GPU_LEASE_TIMEOUT must be whole seconds")
         job_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         save(root / (job_id + ".json"), dict(state="queued", label=args.label, ngpu=args.ngpu,
-             command=args.command, cwd=os.getcwd(), submitted=time.time()))
+             command=args.command, cwd=os.getcwd(), submitted=time.time(), lease_timeout=lease_timeout))
         with (root / "runner.log").open("ab") as log:
             subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--root", str(root), "run"],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

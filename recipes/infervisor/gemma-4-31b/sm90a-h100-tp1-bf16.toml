@@ -15,7 +15,7 @@
 # report vs vLLM 0.28 BF16 (0.97 memory, --max-model-len 16384) is therefore NOT EQUIVALENT; total tok/s:
 # latency c1/c4 0.97x / 0.99x, 4K c32/c128 0.81x / 0.81x (8 slots vs vLLM's ~13 windowed requests),
 # 15K c32/c128 1.06x / 1.05x. docs/bringup/results/gemma31b-h100-20261010/comparison.md.
-# Not run: agentic, the open-loop production mix. PLOW_TOKEN_BATCH=0 is numerically broken on this
+# Not run: agentic, the open-loop production mix. Token batch off is numerically broken on this
 # packet (keep 1).
 #
 # Memory: BF16 weights 57.2 GiB. A staged slot keeps a 2048-row BF16 sliding ring = 1.6 GiB (50 layers x
@@ -105,7 +105,6 @@ PLOW_PREFIX_CACHE = "1"
 PLOW_VMM_LIVE_RINGS = "0"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "8"
-PLOW_TOKEN_BATCH = "1"
 # The default queue is four batches (32 here): c128 clients got 351/384 requests refused with 429.
 PLOW_MAX_QUEUED_REQUESTS = "512"
 

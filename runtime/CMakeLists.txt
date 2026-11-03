@@ -18,6 +18,8 @@ option(PLOW_CUDA "Build the CUDA (Hopper/Blackwell) kernel backend" OFF)
 # objects, so a w8a8 pkt traces/runs consistently. OFF keeps the w8a16 dequant
 # path.
 option(PLOW_NV_W8A8 "Build the gemma interp objects with the true w8a8 fp8 mma path" OFF)
+# Weight-only fp8 decode GEMV/GLU arms in an hd<=128 (non-Gemma) object: a W8A16 Qwen-shaped packet.
+option(PLOW_NV_W8A16 "Build the w8a16 fp8 decode GEMV arms into non-Gemma interp objects" OFF)
 # rtx-19 E3: fp8 (e4m3) KV cache. Compiles the HEADNORM_ROPE_FP8 /
 # FLASH_DECODE_FP8 arms into every gemma object so the shared dispatch is
 # consistent decode/prefill/seg. OFF => bf16 KV, byte-identical to HEAD.
@@ -111,7 +113,9 @@ target_include_directories(plow_cpu_dev PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev)
 target_compile_options(plow_cpu_dev PRIVATE -Wall -Wextra -Werror -O2)
-set_target_properties(plow_cpu_dev PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# ISO C11 as plowrt/build.rs compiles it: CMake's default gnu11 lets gcc contract a*b+c into FMA
+# in the AVX-512/AMX tiers, so the tests would check different rounding than plowrt ships.
+set_target_properties(plow_cpu_dev PROPERTIES POSITION_INDEPENDENT_CODE ON C_EXTENSIONS OFF)
 if(NOT WIN32)
     target_link_libraries(plow_cpu_dev PUBLIC m)
 endif()
@@ -593,6 +597,9 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     if(PLOW_NV_W8A8)
         list(APPEND _cubin_base -DPLOW_NV_W8A8=1)
     endif()
+    if(PLOW_NV_W8A16)
+        list(APPEND _cubin_base -DPLOW_NV_W8A16=1)
+    endif()
     # The generated header rides the BASE, so a specialised build cannot reach one
     # object and miss its sibling — the same property the axes below give the flags.
     file(GLOB_RECURSE _cubin_headers CONFIGURE_DEPENDS
@@ -625,7 +632,10 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     set(_ax_packed_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPLOW_NV_PACKED_REQUEST=1)
     # Second axis of the routed decode object: the decode axis minus the expert GEMV arms.
     set(_ax_routed -DPLOW_NV_DECODE_ROUTED=1)
-    set(_ax_speech -DPLOW_NV_SPEECH=1)
+    # A speech encoder never emits the Mamba scan, whose per-thread state array owns 1024 B of
+    # the frame: sm_120a speech stack 2112 -> 1080 B, encoder digests unchanged, rtx-5090 packed
+    # encoder launch at 10/20 chunks 0.3-0.4% faster.
+    set(_ax_speech -DPLOW_NV_SPEECH=1 -DPLOW_NV_MAMBA=0)
     set(_ax_gw -DPLOW_NV_GW_OBJECT=1)
     set(_ax_rs -DPLOW_NV_ROW_SLOT=1)
     set(_ax_gw_rs ${_ax_gw} ${_ax_rs})

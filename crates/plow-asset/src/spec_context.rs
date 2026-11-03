@@ -4,7 +4,8 @@
 //! with a context tail that projects the post-layer residuals of the `taps` layers into the
 //! drafter's `kv_layers`, at each row's own position and slot, in the same launch that writes the
 //! target KV. The drafter layers are ordinary full-attention layers of the packet's KV layout
-//! (`kv.{l}.k`, listed in `serve.json`'s full layers), so paging and prefix snapshots carry them;
+//! (`kv.{l}.k`, listed in `serve.json`'s full layers), so live KV and the prefix cache's block store
+//! carry them;
 //! `layout_sha256` names what wrote them, so a prefix is only ever restored into a packet whose
 //! tail would have written the same rows.
 use serde::{Deserialize, Serialize};
