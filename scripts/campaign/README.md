@@ -21,7 +21,8 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
    block-level winner, and the campaign report starts with the block-vs-roofline table (block
    time, roofline floor, % of floor, delta vs current). Harness gaps:
    `docs/bringup/agent-tools.md` "HARD RULE". The baseline of every comparison is the
-   same-concurrency vLLM peer, never plowrt's own production packet.
+   same-concurrency vLLM peer, never plowrt's own production packet. Before changing a
+   kernel for the target, read its ISA reference (`docs/bringup/isa/README.md`).
 1. **Fix the cell first.** A cell is `(model revision, weight/KV dtype, GPU SKU,
    TP, prompt/output shape, concurrency, cache policy, client protocol)`. The
    reference engine runs the same client binary with the same flags on the same

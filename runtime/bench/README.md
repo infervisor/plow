@@ -3,6 +3,8 @@
 Benchmarks that exercise **multi-CU / whole-GPU / interpreter-level** paths.
 For single-CU/SM micro-benchmarks (gridDim=1, roofline analysis), see
 [`../ubench/`](../ubench/README.md).
+Per-ISA instruction, memory, sync and ceiling reference for the kernels these probes time:
+[`docs/bringup/isa/README.md`](../../docs/bringup/isa/README.md).
 
 ## Directory Layout
 

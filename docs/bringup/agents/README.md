@@ -46,6 +46,9 @@ defect, and a row that cannot be filled is a blocker, not a default.
   rules (prefix cache on, one binary, packet contract, static runtime, vLLM peer
   judging, GPU budget, `prod-next` consolidation, kernel design/diff reviews)
   are in its "Working rules".
+- **Read the ISA reference before touching a kernel.** Any kernel, inline asm or
+  intrinsic change for `$ISA` starts from [`../isa/README.md`](../isa/README.md) → that
+  target's file (instructions, layouts, sync, build flags, measured pitfalls, ceilings).
 - **Gates are blocking.** An agent that cannot pass its gate stops and reports;
   it does not proceed or weaken the gate.
 - **The target is never hardcoded.** Stages 4–8 write `--gpu $GPU --arch $ISA`;
