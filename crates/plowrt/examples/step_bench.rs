@@ -139,7 +139,13 @@ fn kv_image_peer_bench(
     if nv.kv_image_key().is_none() || nv.kv_image_key() != amd.kv_image_key() {
         return Err("engines do not expose matching KV image keys".into());
     }
-    let (nv_slot, amd_slot) = if main_nv { (0, 1) } else { (1, 0) };
+    // The peer imports into its last slot: a different slot index where it has one, so the
+    // image cannot depend on the slot.
+    let (nv_slot, amd_slot) = if main_nv {
+        (0, amd.batch().saturating_sub(1))
+    } else {
+        (nv.batch().saturating_sub(1), 0)
+    };
     if nv.batch() <= nv_slot
         || amd.batch() <= amd_slot
         || ctx == 0
@@ -147,7 +153,7 @@ fn kv_image_peer_bench(
         || ctx >= amd.max_ctx()
     {
         return Err(
-            "KV image check needs peer slot 1 and room for the prompt plus one decode row".into(),
+            "KV image check needs room for the prompt plus one decode row".into(),
         );
     }
     let prompt: Vec<u32> = if let Some(file) = prompt_file {
