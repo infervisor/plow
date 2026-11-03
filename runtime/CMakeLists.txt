@@ -240,6 +240,16 @@ if(PLOW_CUDA)
     set_tests_properties(sm120_unknown_case_fails PROPERTIES WILL_FAIL TRUE)
     endif()
 
+    if(PLOW_SM120_CUBIN)
+        add_executable(gdn_prefill_sm120_test
+            tests/gdn_prefill_sm120_test.cu nvidia/gdn_prefill_sm120.cu)
+        set_target_properties(gdn_prefill_sm120_test PROPERTIES
+            CUDA_ARCHITECTURES "120a" CUDA_STANDARD 17)
+        target_include_directories(gdn_prefill_sm120_test PRIVATE nvidia)
+        target_compile_options(gdn_prefill_sm120_test PRIVATE -O3 -Xptxas=-v -Xcompiler=-ffp-contract=off)
+        add_test(NAME gdn_prefill_sm120 COMMAND gdn_prefill_sm120_test)
+    endif()
+
     # ---- the persistent packet interpreter -------------------------------------------
     # Built as its own object library rather than folded into plow_runtime_cuda: it is a
     # COOPERATIVE-launch megakernel with a 154-register footprint, and it must be compiled
@@ -825,6 +835,20 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
             COMMENT "nvcc sample_sm120.cubin"
             VERBATIM)
         list(APPEND _cubin_outs "${_smp_out}")
+    endif()
+
+    if(PLOW_SM120_CUBIN)
+        set(_gdn_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/gdn_prefill_sm120.cu")
+        set(_gdn_out "${PLOW_CUBIN_DIR}/gdn_prefill_sm120.cubin")
+        add_custom_command(OUTPUT "${_gdn_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_gdn_out}"
+                    gdn_prefill_sm120 required
+                    -arch=${PLOW_CUBIN_ARCH} -O3 -std=c++17 -cubin -Xptxas -v "${_gdn_src}"
+            DEPENDS "${_gdn_src}" "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/gdn_prefill_sm120.h" "${_cubin_run}"
+            COMMENT "nvcc gdn_prefill_sm120.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_gdn_out}")
+        add_custom_target(gdn_prefill_sm120_cubin DEPENDS "${_gdn_out}")
     endif()
 
     # Speech packets (`tts.codec_lm.v1`, codec.kind 1): the native SNAC-24k decoder the speech

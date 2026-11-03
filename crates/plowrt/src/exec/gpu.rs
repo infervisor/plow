@@ -7580,7 +7580,7 @@ impl GpuEngine {
         {
             Some(crate::device::cuda::qwen_gdn::NativeGdn::load(
                 be.clone(),
-                &assets_dir.join(crate::device::cuda::qwen_gdn::OBJECT),
+                assets_dir,
             )?)
         } else {
             None
