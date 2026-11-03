@@ -46,7 +46,7 @@ use crate::exec::indirection::slots as ind_slots;
 use crate::exec::oob::{OobChannel, OobMsg};
 use crate::memory::streamer::{KvArena, SlotHandle};
 use crate::memory::AddressSpace;
-use crate::obs::serving::RequestMetrics;
+use crate::obs::serving::{Leg, RequestMetrics};
 use crate::obs::Metrics;
 use crate::sched::admission::LoadEstimator;
 use crate::sched::batching::{cold_start_hold_ms, select_bucket};
@@ -868,6 +868,10 @@ impl ModelMux {
     }
 
     /// Submit a job. Returns immediately; the caller awaits the stream.
+    pub(crate) fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
     pub fn submit(&self, job: Job) -> std::result::Result<(), SubmitError> {
         let arrived = job.arrived;
         self.submit_arrived(job, arrived, None)
@@ -904,7 +908,10 @@ impl ModelMux {
         arrived: Instant,
         ingress: Option<IngressGuard<'_>>,
     ) -> std::result::Result<(), SubmitError> {
-        Metrics::inc(&self.metrics.requests);
+        // A P/D decode leg continues a request its prefill rank already counted.
+        if job.opts.import.is_none() {
+            Metrics::inc(&self.metrics.requests);
+        }
         if self.shed_queue_depth() {
             Metrics::inc(&self.metrics.rejected);
             Metrics::inc(&self.metrics.shed_queue);
@@ -1450,6 +1457,7 @@ fn spawn_scoped(
                 while let Some((job, _)) = waiting.pop_front() {
                     metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
                     Metrics::inc(&metrics.rejected);
+                    crate::serve::pd::settle_refused(&job);
                     let _ = job
                         .respond
                         .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
@@ -1531,6 +1539,7 @@ fn spawn_scoped(
                         }
                         MuxMsg::Job(job, _) => {
                             Metrics::inc(&metrics.rejected);
+                            crate::serve::pd::settle_refused(&job);
                             let _ = job.respond.try_send(StreamChunk::Err(
                                 crate::RuntimeError::Rejected(
                                     "model preempted for an S1 switch — retry".into(),
@@ -2661,6 +2670,7 @@ fn drain_waiting_session(
             }
             Queued::Expired => {
                 Metrics::inc(&metrics.admit_shed);
+                crate::serve::pd::settle_refused(job);
                 metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
                 let _ = job
                     .respond
@@ -2971,6 +2981,7 @@ fn admit_session(
             // both end as a 429, but shedding is the controller dropping live work because
             // predicted wait passed the SLO, while these are arrival meeting a hard limit.
             Metrics::inc(&metrics.rejected);
+            crate::serve::pd::settle_refused(&job);
             let _ = job.respond.try_send(StreamChunk::Err(err));
             return None;
         }
@@ -2981,6 +2992,7 @@ fn admit_session(
             Ok(h) => Some(h),
             Err(e) => {
                 Metrics::inc(&metrics.rejected);
+                crate::serve::pd::settle_refused(&job);
                 tracing::warn!(error = %e, seq_upper, "mux: kv arena OOM — request shed");
                 let _ = job
                     .respond
@@ -2994,8 +3006,18 @@ fn admit_session(
         None
     };
 
-    let telemetry = Some(RequestMetrics::new(
+    // A P/D decode leg reaches this queue at the handoff; its request arrived with the prefill.
+    let (leg, arrived) = match (&job.opts.export, &job.opts.import) {
+        (Some(_), _) => (Leg::Prefill, arrived),
+        (_, Some(i)) => {
+            i.outcome.settle();
+            (Leg::Decode { first: i.first }, i.arrived)
+        }
+        _ => (Leg::Whole, arrived),
+    };
+    let telemetry = Some(RequestMetrics::leg(
         Arc::clone(metrics),
+        leg,
         arrived,
         job.arrived,
         job.prompt_ids.len(),
@@ -3684,7 +3706,6 @@ fn run_one_tick(
                     &arena,
                     bundle,
                     stop.as_slice(),
-                    &mut tokens_this_tick,
                     &mut disconnected,
                     &mut tick_fault,
                 );
@@ -4420,6 +4441,8 @@ fn run_one_tick(
                     e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
                 }
             }
+            // Drop the observer clones so a fault that drops a slot also ends its handoff.
+            result.2.pd_exports.clear();
             return result;
         }
 
@@ -7565,7 +7588,6 @@ fn gpu_seat_imports(
     arena: &Option<SharedKvState>,
     bundle: &ModelBundle,
     stop: &[u32],
-    tokens_this_tick: &mut usize,
     disconnected: &mut [bool],
     tick_fault: &mut Option<crate::DeviceErrorInfo>,
 ) {
@@ -7619,7 +7641,8 @@ fn gpu_seat_imports(
             bundle,
             import.token,
             1,
-            tokens_this_tick,
+            // The prefill rank produced (and counted) this token.
+            &mut 0,
             Some(stop),
         );
     }

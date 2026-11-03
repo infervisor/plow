@@ -432,6 +432,22 @@ The cache stays on in every engine. In v1, nothing is shared between devices.
 
 ### 7.4 Metrics
 
+A P/D request counts once, in both the aggregate and the per-model view:
+
+* The prefill rank records the arrival, queue time, time to first token and the prompt.
+* The decode rank records the generated tokens, the completion and the end-to-end time. It
+  measures them from the request's arrival, which the import carries.
+* The two legs never run at the same time, so each counts as running in turn.
+* One shared outcome token owns the request's terminal count (completed, aborted, preempted or
+  rejected) until the decode leg is seated. A rank that refuses either leg settles it. If it is
+  dropped without being settled, it counts one abort.
+* The JSON runtime metrics give a data-parallel set one aggregated row. Each rank's row names its
+  set (`rank_of`).
+
+Untested path: a fatal device fault while a prefill slot holds an export sink. The dispatcher
+releases the sink with the slot, so the handoff ends with an error. No backend mock can run the
+GPU tick to cover this, so the path is checked only by inspection.
+
 Existing per-model metrics gain `device`, `vendor` and `role` labels. New metrics:
 
 - `plowrt_placement_info`
