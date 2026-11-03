@@ -239,6 +239,8 @@ pub(crate) struct FishDepth {
     pub(crate) proj_bias: bool,
     /// Frames before which the backbone's stop class is masked (HF `min_new_tokens`).
     pub(crate) min_frames: u32,
+    /// fp32 heads' logits rounded to bf16 (a reference whose head linear outputs bf16).
+    pub(crate) bf16_logits: bool,
 }
 
 pub(crate) struct Cfg {
@@ -459,6 +461,7 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
                     qk_norm: flag("qk_norm"),
                     proj_bias: flag("proj_bias"),
                     min_frames: d["min_frames"].as_u64().unwrap_or(0) as u32,
+                    bf16_logits: flag("bf16_logits"),
                 }
             }),
             decode_only: false,
@@ -829,6 +832,7 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
                             qk_norm: false,
                             proj_bias: false,
                             min_frames: 0,
+                            bf16_logits: false,
                         }
                     }),
                     decode_only: false,
@@ -886,6 +890,7 @@ fn maya2_frame(f: &Value) -> FrameEmbed {
             qk_norm: false,
             proj_bias: false,
             min_frames: 0,
+            bf16_logits: false,
             maya2: Some(Maya2Depth {
                 levels,
                 groups: u("groups"),

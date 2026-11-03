@@ -254,10 +254,10 @@ static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bflo
 
 /* GemvF32Out (op 220): C[m][n] = sum_k x[m][k] * W[n][k] in fp32 (exact bf16 products, fp32 fma), stored
  * fp32 — a reference that casts both operands to f32 before its matmul. A warp per output row, rows
- * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. */
+ * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. `round_bf16` (flag bit 11): C rounded to bf16. */
 static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N, unsigned K,
-                                     unsigned slice, unsigned nblk) {
+                                     bool round_bf16, unsigned slice, unsigned nblk) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned per = (N + nblk - 1) / nblk;
@@ -278,7 +278,8 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
 #pragma unroll
             for (int m = 0; m < 8; m++) {
                 const float t = warp_sum32(acc[m]);
-                if (lane == 0 && m0 + m < M) C[(size_t)(m0 + m) * N + n] = t;
+                if (lane == 0 && m0 + m < M)
+                    C[(size_t)(m0 + m) * N + n] = round_bf16 ? __bfloat162float(__float2bfloat16_rn(t)) : t;
             }
         }
     }

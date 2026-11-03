@@ -735,8 +735,12 @@ impl Joins {
 pub(crate) fn pcm16(samples: &[f32], out: &mut Vec<u8>) {
     out.reserve(samples.len() * 2);
     for &s in samples {
-        out.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
+        out.extend_from_slice(&s16(s).to_le_bytes());
     }
+}
+
+fn s16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * 32767.0).round() as i16
 }
 
 /// RIFF/WAVE header for mono s16; `data_bytes = u32::MAX` for an open-ended stream.
@@ -816,7 +820,7 @@ impl OnsetTrim {
     }
 
     fn audible(&self, s: usize) -> bool {
-        let q = |x: f32| (x * 32767.0).round().clamp(-32768.0, 32767.0) as f64 / 32768.0;
+        let q = |x: f32| f64::from(s16(x)) / 32768.0;
         let w = &self.held[s..s + self.frame];
         let mean = w.iter().map(|&x| q(x)).sum::<f64>() / w.len() as f64;
         let ms = w.iter().map(|&x| (q(x) - mean).powi(2)).sum::<f64>() / w.len() as f64;

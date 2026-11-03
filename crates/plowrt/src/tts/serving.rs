@@ -2306,6 +2306,7 @@ async fn stream_task(
         (0usize, 0usize, 0usize, Vec::new(), false);
     // Samples sent and when the first went out (the client's playback clock).
     let (mut sent, mut playing): (usize, Option<Instant>) = (0, None);
+    let mut reported = 0usize;
     let mut joiner = super::Joins::new(model.contract.sample_rate);
     // Dropping the rest of the current attempt (cut short).
     let mut skipping = false;
@@ -2500,7 +2501,8 @@ async fn stream_task(
                         first.get_or_insert_with(|| t_arrive.elapsed());
                         playing.get_or_insert_with(Instant::now);
                         ticket.sent(sent as f64 / sr);
-                        run.audio(fresh.len(), sr);
+                        run.audio(sent - reported, sr);
+                        reported = sent;
                         if let Some(h) = head.take() {
                             let _ = h.send(run.headers());
                         }
@@ -2545,8 +2547,19 @@ async fn stream_task(
     }
     let mut tail = Vec::new();
     out_pcm.finish(&mut tail);
-    if !tail.is_empty() && out.send(Ok(tail)).await.is_err() {
-        return;
+    if !tail.is_empty() {
+        // A reply shorter than the onset trim's window: its held samples are its first audio.
+        if first.is_none() {
+            ticket.first_audio();
+            first = Some(t_arrive.elapsed());
+        }
+        run.audio(sent - reported, sr);
+        if let Some(h) = head.take() {
+            let _ = h.send(run.headers());
+        }
+        if out.send(Ok(tail)).await.is_err() {
+            return;
+        }
     }
     run.done();
     tracing::info!(

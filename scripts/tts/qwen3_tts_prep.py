@@ -105,7 +105,7 @@ def main():
                        kv_heads=cc["num_key_value_heads"], head_dim=cc["head_dim"],
                        intermediate=cc["intermediate_size"], eps=cc["rms_norm_eps"], rope_theta=cc["rope_theta"],
                        rope_scaling=None, positions=groups, qk_norm=True, proj_bias=True,
-                       min_frames=2)),
+                       min_frames=2, bf16_logits=True)),
     )
     json.dump(qwen, open(f"{a.out}/config.json", "w"), indent=1)
     json.dump({"eos_token_id": [CODES]}, open(f"{a.out}/generation_config.json", "w"))

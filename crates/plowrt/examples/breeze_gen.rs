@@ -21,7 +21,8 @@
 //! Dual-stream packets (Qwen3-TTS: every row a token plus a frame): TEXT_ENC.f32 = `-`, every
 //! PROMPT_CODES row's first word is its token, and `GEN_FEED=FEED.u32` (`[tail, text...]`) feeds
 //! decode step `s` text token `s` (then `tail`) beside the frame. `BREEZE_REP` sets the cb0
-//! repetition penalty (default 1.1).
+//! repetition penalty (default 1.1). `GEN_TIME=1` prints the median wall time of the depth stage
+//! and of the backbone step per frame (both synchronous: each reads its result back).
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -186,10 +187,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg: cfg.as_ref().map(|(s, _)| (*s, uncond_row)),
     };
     let (mut toks, mut codes, mut sampled) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut t_depth, mut t_step) = (Vec::new(), Vec::new());
     for f in frames.chunks_exact(CODEBOOKS) {
         e.write_tensor_ordered("in.breeze.force", 0, bytemuck::cast_slice(f))?;
         codes.clear();
+        let t = std::time::Instant::now();
         e.fish_depth_step(&[row], &mut codes)?;
+        t_depth.push(t.elapsed().as_secs_f64() * 1e3);
         if free.is_none() {
             assert_eq!(&codes[..], f, "forced frame codes");
         }
@@ -211,7 +215,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => codes[0],
         };
         let feeds: Vec<(usize, u32)> = (0..rows).map(|s| (s, token)).collect();
+        let t = std::time::Instant::now();
         e.step_slots(&feeds, &mut toks)?;
+        t_step.push(t.elapsed().as_secs_f64() * 1e3);
         hidden_row(&e, 0, &mut out)?;
         row.hidden_row = 0;
         row.cfg = row.cfg.map(|(s, _)| (s, 1));
@@ -227,6 +233,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("{}.frames.u32", a[5]),
         bytemuck::cast_slice(&sampled),
     )?;
+    if std::env::var("GEN_TIME").is_ok_and(|v| v == "1") {
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        println!(
+            "time depth_ms_median={:.3} step_ms_median={:.3} frames={}",
+            med(&mut t_depth),
+            med(&mut t_step),
+            t_depth.len()
+        );
+    }
     println!("prompt rows {n} frames {nf} -> {}", a[5]);
     Ok(())
 }

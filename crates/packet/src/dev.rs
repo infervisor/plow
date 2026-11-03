@@ -2483,7 +2483,8 @@ pub enum DevOp {
     /// x, f16 W, K <= 1024) LayerNorms each x row first, `(x - mean) * rsqrt(var + eps) * gamma +
     /// beta`, fp32 two-pass statistics; bit 9 reads `bias(f32[M / i3, N])`, one row per `i3` rows;
     /// bit 10 (f32 x, f16 W, K % 64 == 0) rounds x to f16 and multiplies on tensor cores (fp32
-    /// accumulation, any summation order), streaming W once per 64 rows.
+    /// accumulation, any summation order), streaming W once per 64 rows. Bit 11 alone (no other
+    /// bit) rounds each `C` to bf16 (a reference whose linear outputs bf16).
     /// `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K]) t3=bias? t4=residual? t5=gamma? t6=beta?` ·
     /// `i0=M i1=N i2=K i3=bias_group i7=flags` · `f0=eps` (K % 8 == 0).
     GemvF32Out = 220,

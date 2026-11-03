@@ -373,6 +373,7 @@ fn program(
             i.i[0] = rows;
             i.i[1] = nout;
             i.i[2] = kin;
+            i.i[7] = if d.bf16_logits { 2048 } else { 0 };
         })
     };
     let gemv8 = |b: &mut Builder,
