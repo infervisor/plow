@@ -124,7 +124,7 @@ pub(super) fn decode_segments(
 
 /// Marks every lone `QwenGdnStep` segment at the rung's rows (row b steps slot b, gated by
 /// `in.active`) for the GDN step kernel.
-pub(super) fn mark_gdn_steps(g: &DevProg, segments: &mut [Option<GenSeg>]) {
+fn mark_gdn_steps(g: &DevProg, segments: &mut [Option<GenSeg>]) {
     for (seg, site) in segments.iter_mut().enumerate() {
         if site.is_some() {
             continue;
@@ -138,6 +138,98 @@ pub(super) fn mark_gdn_steps(g: &DevProg, segments: &mut [Option<GenSeg>]) {
             *site = Some(GenSeg::Gdn(inst));
         }
     }
+}
+
+pub(super) fn select_segments(
+    g: &DevProg,
+    mut segments: Vec<Option<GenSeg>>,
+    attention: bool,
+    gdn: bool,
+) -> Vec<Option<GenSeg>> {
+    if !attention {
+        segments.fill(None);
+    }
+    if gdn {
+        mark_gdn_steps(g, &mut segments);
+    }
+    segments
+}
+
+pub(super) fn needs_direct(segments: &[Option<GenSeg>], pinned: bool) -> bool {
+    !pinned
+        && segments
+            .iter()
+            .any(|site| matches!(site, Some(GenSeg::Decode { .. })))
+}
+
+pub(super) fn qualify_segments(
+    g: &DevProg,
+    segments: &mut [Option<GenSeg>],
+    projections: &[Option<cublaslt::DecodeSegment>],
+    extra: &[(usize, usize)],
+    paired_gq_abi: impl FnOnce() -> Result<Option<u32>>,
+) -> Result<()> {
+    if !segments.iter().any(Option::is_some) {
+        return Ok(());
+    }
+    let qualification = (|| {
+        if paired_gq_abi()? != Some(1) {
+            return Err(RuntimeError::Rejected(
+                "generated decode segments require a paired GQ interpreter".into(),
+            ));
+        }
+        let library: Vec<_> = (0..segments.len())
+            .map(|seg| {
+                projections
+                    .get(seg)
+                    .copied()
+                    .flatten()
+                    .map(|s| s.instruction)
+            })
+            .collect();
+        let mut replaced = instructions(segments);
+        replaced.extend_from_slice(extra);
+        cublaslt::ordered_waits_for(g, &library, &replaced).map(|_| ())
+    })();
+    if let Err(error) = qualification {
+        if segments
+            .iter()
+            .any(|site| matches!(site, Some(GenSeg::Decode { .. } | GenSeg::Merge(_))))
+        {
+            return Err(error);
+        }
+        tracing::warn!(rows = g.t, %error, "GDN step routing not qualified; keeping interpreter");
+        segments.fill(None);
+    }
+    Ok(())
+}
+
+pub(super) fn retain_compatible_routes(
+    segments: &mut [Option<GenSeg>],
+    other_decode_routes: bool,
+) -> Result<()> {
+    if other_decode_routes {
+        for site in segments {
+            match site {
+                Some(GenSeg::Gdn(_)) => *site = None,
+                Some(GenSeg::Decode { .. } | GenSeg::Merge(_)) => {
+                    return Err(RuntimeError::Rejected(
+                        "generated decode segments cannot mix with other decode routes".into(),
+                    ));
+                }
+                None => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn excludes_light(
+    declared: &[Option<GenSeg>],
+    selected: &[Option<GenSeg>],
+    seg: usize,
+) -> bool {
+    declared.get(seg).is_some_and(Option::is_some) || selected.get(seg).is_some_and(Option::is_some)
 }
 
 /// Mirrors `PlowGdnRide` (interp_sm120.cu).
@@ -329,7 +421,7 @@ impl GenDecodeRoute {
 /// merge's output), a skip on each FlashMerge segment.
 pub(super) fn routes(
     be: &Arc<CudaBackend>,
-    launch: &Arc<GenDecodeLaunch>,
+    launch: Option<&Arc<GenDecodeLaunch>>,
     g: &DevProg,
     segments: &[Option<GenSeg>],
     devp: &[DeviceMem],
@@ -373,6 +465,9 @@ pub(super) fn routes(
                 })))
             }
             Some(GenSeg::Decode { inst, merge }) => {
+                let launch = launch.ok_or_else(|| {
+                    RuntimeError::Rejected("generated decode segment without the launch".into())
+                })?;
                 let d = &g.insts[inst];
                 if d.i[6] != launch.head_dim || d.i[1] != d.i[2] * launch.gqa {
                     return Err(RuntimeError::Rejected(
@@ -415,4 +510,242 @@ pub(super) fn routes(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use packet::dev::{StreamEnt, Wait};
+
+    fn fixture(rows: u32) -> DevProg {
+        let mut insts: Vec<_> = [
+            DevOp::FlashDecode,
+            DevOp::FlashMerge,
+            DevOp::QwenGdnStep,
+            DevOp::Nop,
+        ]
+        .into_iter()
+        .map(|op| DevInst64 {
+            op: op as u16,
+            blocks: 1,
+            ..Default::default()
+        })
+        .collect();
+        insts[2].i[4] = rows;
+        let stream: Vec<_> = (0..4u32)
+            .map(|inst| StreamEnt {
+                inst,
+                seg: inst as u16,
+                succ_ofs: inst,
+                succ_len: 1,
+                wait_ofs: inst.saturating_sub(1),
+                wait_len: u16::from(inst != 0),
+                ..Default::default()
+            })
+            .collect();
+        DevProg {
+            t: rows,
+            role: packet::devbuild::ProgramRole::DecodeRung { rows },
+            n_counter: 4,
+            insts,
+            stream: stream.clone(),
+            stream_ofs: vec![0],
+            stream_len: vec![4],
+            waits: (0..3).map(|id| Wait { id, threshold: 1 }).collect(),
+            succs: (0..4).collect(),
+            gq_stream: stream,
+            gq_seg_ofs: (0..5).collect(),
+            l2_domains: 0,
+        }
+    }
+
+    #[test]
+    fn selects_attention_and_gdn_independently() {
+        for rows in [1, 2, 8, 32] {
+            let g = fixture(rows);
+            for declared in [false, true] {
+                for attention in [false, true] {
+                    for gdn in [false, true] {
+                        let decode = GenSeg::Decode { inst: 0, merge: 1 };
+                        let segments = vec![
+                            declared.then_some(decode),
+                            declared.then_some(GenSeg::Merge(1)),
+                            None,
+                            None,
+                        ];
+                        let selected = select_segments(&g, segments.clone(), attention, gdn);
+                        let attention = declared && attention;
+                        assert_eq!(
+                            selected,
+                            vec![
+                                attention.then_some(decode),
+                                attention.then_some(GenSeg::Merge(1)),
+                                gdn.then_some(GenSeg::Gdn(2)),
+                                None,
+                            ]
+                        );
+                        assert_eq!(selected.iter().any(Option::is_some), attention || gdn);
+                        for (seg, excluded) in [declared, declared, gdn, false, false]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            assert_eq!(excludes_light(&segments, &selected, seg), excluded);
+                        }
+                        for pinned in [false, true] {
+                            assert_eq!(needs_direct(&selected, pinned), attention && !pinned);
+                        }
+                        let waits =
+                            cublaslt::ordered_waits_for(&g, &[None; 4], &instructions(&selected))
+                                .unwrap();
+                        assert_eq!(waits[0].threshold, u32::from(!attention));
+                        assert_eq!(waits[1].threshold, u32::from(!attention));
+                        assert_eq!(waits[2].threshold, u32::from(!gdn));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gdn_qualification_preserves_coarse_interpreter_fallback() {
+        for rows in [1, 2, 8, 32] {
+            let mut g = fixture(rows);
+            g.insts = vec![g.insts[2]];
+            g.n_counter = 0;
+            g.waits.clear();
+            g.succs.clear();
+            g.stream = vec![StreamEnt::default()];
+            g.stream_len = vec![1];
+            g.gq_stream = g.stream.clone();
+            g.gq_seg_ofs = vec![0, 1];
+            g.check_coarse_single_segment().unwrap();
+            for abi in [None, Some(0), Some(1)] {
+                let mut selected = select_segments(&g, vec![None], false, true);
+                assert_eq!(selected, vec![Some(GenSeg::Gdn(0))]);
+                qualify_segments(&g, &mut selected, &[], &[], || Ok(abi)).unwrap();
+                assert_eq!(selected, vec![None]);
+                assert!(instructions(&selected).is_empty());
+                assert!(!needs_direct(&selected, false));
+                assert!(!excludes_light(&[None], &selected, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn qualification_checks_abi_and_other_replacements_and_keeps_attention_errors() {
+        for rows in [1, 2, 8, 32] {
+            for attention in [false, true] {
+                for case in 0..5 {
+                    let g = fixture(rows);
+                    let declared = vec![
+                        Some(GenSeg::Decode { inst: 0, merge: 1 }),
+                        Some(GenSeg::Merge(1)),
+                        None,
+                        None,
+                    ];
+                    let mut selected = select_segments(&g, declared, attention, true);
+                    let original = selected.clone();
+                    let abi = match case {
+                        0 => None,
+                        1 => Some(0),
+                        _ => Some(1),
+                    };
+                    let projection = cublaslt::DecodeSegment {
+                        instruction: if case == 2 { 0 } else { 3 },
+                        m: rows,
+                        n: 1,
+                        k: 1,
+                        output_bytes: 2,
+                        input_bytes: 2,
+                        weight_bytes: 2,
+                        block: false,
+                    };
+                    let projections = [None, None, None, Some(projection)];
+                    let extra = if case == 3 { (0, 1) } else { (3, 3) };
+                    let result =
+                        qualify_segments(&g, &mut selected, &projections, &[extra], || Ok(abi));
+                    if case == 4 {
+                        result.unwrap();
+                        assert_eq!(selected, original);
+                    } else if attention {
+                        assert!(matches!(result, Err(RuntimeError::Rejected(_))));
+                        assert_eq!(selected, original);
+                    } else {
+                        result.unwrap();
+                        assert!(selected.iter().all(Option::is_none));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn other_decode_routes_keep_gdn_interpreted() {
+        for rows in [1, 2, 8, 32] {
+            let g = fixture(rows);
+            let declared = vec![
+                Some(GenSeg::Decode { inst: 0, merge: 1 }),
+                Some(GenSeg::Merge(1)),
+                None,
+                None,
+            ];
+            for attention in [false, true] {
+                for other_decode_routes in [false, true] {
+                    let mut selected = select_segments(&g, declared.clone(), attention, true);
+                    let result = retain_compatible_routes(&mut selected, other_decode_routes);
+                    if attention && other_decode_routes {
+                        assert!(matches!(result, Err(RuntimeError::Rejected(_))));
+                        continue;
+                    }
+                    result.unwrap();
+                    assert_eq!(
+                        selected,
+                        vec![
+                            attention.then_some(GenSeg::Decode { inst: 0, merge: 1 }),
+                            attention.then_some(GenSeg::Merge(1)),
+                            (!other_decode_routes).then_some(GenSeg::Gdn(2)),
+                            None,
+                        ]
+                    );
+                    assert_eq!(
+                        excludes_light(&declared, &selected, 2),
+                        !other_decode_routes
+                    );
+                    if other_decode_routes {
+                        assert!(instructions(&selected).is_empty());
+                        assert!(!needs_direct(&selected, false));
+                        let waits =
+                            cublaslt::ordered_waits_for(&g, &[None; 4], &instructions(&selected))
+                                .unwrap();
+                        for (actual, original) in waits.iter().zip(&g.waits) {
+                            assert_eq!(
+                                (actual.id, actual.threshold),
+                                (original.id, original.threshold)
+                            );
+                        }
+                    }
+                }
+            }
+            let mut selected = select_segments(&g, vec![None; 4], false, true);
+            retain_compatible_routes(&mut selected, true).unwrap();
+            assert!(selected.iter().all(Option::is_none));
+        }
+        let mut merge = [Some(GenSeg::Merge(1))];
+        assert!(retain_compatible_routes(&mut merge, true).is_err());
+    }
+
+    #[test]
+    fn gdn_selection_requires_a_lone_step_at_the_rung_rows_with_active_mask() {
+        for case in 0..4 {
+            let mut g = fixture(2);
+            match case {
+                0 => g.insts[2].i[4] = 1,
+                1 => g.insts[2].t[7] = TENSOR_NONE16,
+                2 => g.gq_stream[3].seg = 2,
+                _ => g.gq_stream[3].inst = 2,
+            }
+            let selected = select_segments(&g, vec![None; 4], false, true);
+            assert!(selected.iter().all(Option::is_none), "case={case}");
+        }
+    }
 }
