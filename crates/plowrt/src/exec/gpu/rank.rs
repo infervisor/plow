@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::device::cuda::CudaBackend;
+use crate::device::cuda::{CudaBackend, CudaStream};
 use crate::device::{Backend, DeviceMem};
 use crate::exec::proc_group::ProcGroup;
 use crate::exec::tp::XCTR_STRIDE;
@@ -15,8 +15,14 @@ use crate::{Result, RuntimeError};
 const ARM_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Ranks per subgroup: a 128 B gate line holds one arrival word per source rank, and its last
-/// word is the two-shot collective's block count (`kXrAggWord` in the NVIDIA collectives).
+/// word is the unstaged block count. Staged relay/count words live only in the local mirror.
 const MAX_TP: u32 = 31;
+
+pub(super) const STAGED_MARKER: &str = "plow_xr_staged_1";
+
+pub(super) fn staged_supported(markers: &[Option<u32>]) -> bool {
+    !markers.is_empty() && markers.iter().all(|m| *m == Some(1))
+}
 
 pub struct RankBind {
     be: Arc<CudaBackend>,
@@ -25,8 +31,10 @@ pub struct RankBind {
     pub tp: u32,
     pub tp_rank: u32,
     host_base: *mut u8,
-    /// `[tp]` device table of the subgroup's regions — `PlowProgram::peer_scratch`.
+    /// NVIDIA `PlowProgram::peer_scratch`: `[tp]` host regions followed by this rank's
+    /// VRAM mirror, or NULL for unstaged objects. This does not change the program ABI.
     peer_table: DeviceMem,
+    local_mirror: Option<DeviceMem>,
     /// Device address of this rank's own region.
     pub own_region: u64,
     /// Units armed so far: part of every plan fingerprint, so a rank that skipped or repeated
@@ -58,9 +66,10 @@ impl RankBind {
         // SAFETY: the mapping lives as long as `group`, which this value holds.
         let dev_base = unsafe { be.host_register_shared(host_base, len)? };
         let first = rank / tp * tp;
-        let regions: Vec<u64> = (first..first + tp)
+        let mut regions: Vec<u64> = (first..first + tp)
             .map(|r| dev_base + group.region_offset(r))
             .collect();
+        regions.push(0);
         let bytes: Vec<u8> = regions.iter().flat_map(|a| a.to_le_bytes()).collect();
         let peer_table = be.alloc(0, bytes.len() as u64).and_then(|t| {
             be.upload(&t, 0, &bytes)?;
@@ -82,8 +91,26 @@ impl RankBind {
             tp_rank: rank - first,
             host_base,
             peer_table,
+            local_mirror: None,
             seq: 0,
         })
+    }
+
+    pub(super) fn enable_staging(&mut self) -> Result<()> {
+        let mirror = self.be.alloc(0, self.layout().bytes())?;
+        self.be.upload(
+            &self.peer_table,
+            u64::from(self.tp) * 8,
+            &mirror.base.to_le_bytes(),
+        )?;
+        self.local_mirror = Some(mirror);
+        Ok(())
+    }
+
+    pub(super) fn partial_region(&self) -> u64 {
+        self.local_mirror
+            .as_ref()
+            .map_or(self.own_region, |m| m.base)
     }
 
     pub fn peer_table(&self) -> u64 {
@@ -110,7 +137,17 @@ impl RankBind {
 
     /// Start a launch unit described by `plan` (every rank must pass the same words). The
     /// device must be idle: callers synchronize the engine stream first.
-    pub fn arm(&mut self, plan: &[u64]) -> Result<()> {
+    pub fn arm(&mut self, plan: &[u64], stream: &CudaStream) -> Result<()> {
+        if let Some(mirror) = &self.local_mirror {
+            let layout = self.layout();
+            self.be.memset_d8_async(
+                mirror.base + layout.xctr_off(),
+                0,
+                (layout.xctr_bytes() + XCTR_STRIDE as u64) as usize,
+                stream,
+            )?;
+            self.be.stream_synchronize(stream)?;
+        }
         self.seq += 1;
         let mut h = 0xcbf2_9ce4_8422_2325u64 ^ self.seq;
         for w in plan {
@@ -170,5 +207,32 @@ impl TpKernarg {
             rank: b.tp_rank,
             n_gpu: b.tp,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uninspectable_or_required_objects_without_marker_block_staging() {
+        let junk = b"not an ELF image";
+        assert!(super::super::blocks_xr_staging(junk, 120, false));
+        assert!(super::super::blocks_xr_staging(junk, 120, true));
+    }
+
+    #[test]
+    fn staged_requires_every_interpreter() {
+        assert!(!staged_supported(&[]));
+        assert!(staged_supported(&[Some(1)]));
+        let all = [Some(1); 6]; // decode, wide decode, prefill, flash, GEMM, optional segment
+        assert!(staged_supported(&all));
+        for i in 0..all.len() {
+            for stale in [None, Some(0), Some(2)] {
+                let mut mixed = all;
+                mixed[i] = stale;
+                assert!(!staged_supported(&mixed));
+            }
+        }
     }
 }

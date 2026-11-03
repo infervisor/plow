@@ -1744,8 +1744,8 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-noncoop", env = "PLOW_PF_SEG_NONCOOP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_noncoop: bool,
 
-    /// Per-op prefill attribution: dump block 0's gate/body/signal per opcode
-    /// after each chunk (needs a `-DPLOW_NV_TRACE=1` prefill cubin).
+    /// Per-op attribution: dump block 0's gate/body/signal per opcode after each prefill
+    /// chunk and, at slot retire, the decode objects' (needs `-DPLOW_NV_TRACE=1` cubins).
     #[arg(long = "pf-trace-log", env = "PLOW_PF_TRACE_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_trace_log: bool,
 

@@ -60,7 +60,7 @@ static void mismatch(const char* what, unsigned nr, unsigned rank, uint32_t n, u
     std::exit(1);
 }
 
-static void run_case(unsigned nr, uint32_t n, uint32_t e0) {
+static void run_case(unsigned nr, uint32_t n, uint32_t e0, bool staged) {
     constexpr uint32_t slot = 128;
     constexpr uint16_t guard = 0x5a5a;
     const uint32_t span = e0 + n + 8u;
@@ -70,11 +70,14 @@ static void run_case(unsigned nr, uint32_t n, uint32_t e0) {
     char *host, *mapped;
     CK(cudaHostAlloc(&host, nr * region, cudaHostAllocMapped));
     CK(cudaHostGetDevicePointer(&mapped, host, 0));
-    std::vector<void*> peers(nr);
+    std::vector<void*> peers(nr + 1, nullptr);
+    std::vector<char*> local(nr, nullptr);
+    if (staged)
+        for (auto& p : local) CK(cudaMalloc(&p, region));
     for (unsigned r = 0; r < nr; r++) peers[r] = mapped + r * region;
     void** device_peers;
-    CK(cudaMalloc(&device_peers, nr * sizeof(void*)));
-    CK(cudaMemcpy(device_peers, peers.data(), nr * sizeof(void*), cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&device_peers, (nr + 1) * sizeof(void*)));
+    CK(cudaMemcpy(device_peers, peers.data(), (nr + 1) * sizeof(void*), cudaMemcpyHostToDevice));
 
     std::vector<uint16_t> partials((size_t)nr * span), reduced(span), residual(span), fused(span);
     for (uint32_t e = 0; e < span; e++) {
@@ -95,8 +98,8 @@ static void run_case(unsigned nr, uint32_t n, uint32_t e0) {
     CK(cudaMemcpy(resid, residual.data(), bytes, cudaMemcpyHostToDevice));
     std::vector<uint16_t> initial(span, guard), got(span), untouched(span);
 
-    // Preset gates cannot order concurrent RS writers. Run one rank/CTA at a time,
-    // seeding other owners' completed slices while retaining every partial in this rank's slice.
+    // Preset gates cannot order concurrent RS writers. Run one rank at a time, with one
+    // unstaged RS CTA; the staged relay orders multiple CTAs. Seed peers' completed bands.
     for (unsigned mode = 0; mode < 4; mode++) {
         const bool twoshot = mode != 0, use_out2 = mode >= 2;
         for (unsigned rank = 0; rank < nr; rank++) {
@@ -112,6 +115,17 @@ static void run_case(unsigned nr, uint32_t n, uint32_t e0) {
                 auto* gates = (uint32_t*)(host + r * region + xoff);
                 for (unsigned g = 0; g < 2; g++)
                     for (unsigned s = 0; s < nr; s++) PLOW_CTR(gates, g)[s] = 1u;
+            }
+            if (staged) {
+                CK(cudaMemset(local[rank], 0, region));
+                CK(cudaMemcpy(local[rank] + slot, partials.data() + (size_t)rank * span,
+                              bytes, cudaMemcpyHostToDevice));
+                peers[nr] = local[rank];
+                CK(cudaMemcpy(device_peers, peers.data(), (nr + 1) * sizeof(void*),
+                              cudaMemcpyHostToDevice));
+                auto* own = (uint16_t*)(host + rank * region + slot);
+                const uint32_t begin = twoshot ? e0 : 0;
+                for (uint32_t e = begin; e < begin + n; e++) own[e] = guard;
             }
             CK(cudaMemcpy(out, initial.data(), bytes, cudaMemcpyHostToDevice));
             CK(cudaMemcpy(out2, initial.data(), bytes, cudaMemcpyHostToDevice));
@@ -134,7 +148,7 @@ static void run_case(unsigned nr, uint32_t n, uint32_t e0) {
             in.i[5] = twoshot ? e0 : 0;
             in.fj[2].u = 3;
             // One-shot has no band operand; e0 instead exercises an unaligned local output.
-            const unsigned nblk = twoshot ? 1u : 3u;
+            const unsigned nblk = twoshot && !staged ? 1u : 3u;
             k_xreduce<<<nblk, 256>>>(prog, in, twoshot ? out : out + e0, resid, out2, twoshot);
             CK(cudaGetLastError());
             CK(cudaDeviceSynchronize());
@@ -161,19 +175,32 @@ static void run_case(unsigned nr, uint32_t n, uint32_t e0) {
                 }
                 const auto* gates = (const uint32_t*)(host + r * region + xoff);
                 if (*PLOW_CTR(gates, 2) != 0 ||
-                    PLOW_CTR(gates, 1)[kXrAggWord] != unsigned(twoshot && r == rank)) {
+                    PLOW_CTR(gates, 1)[kXrAggWord] != unsigned(twoshot && r == rank && !staged)) {
                     std::fprintf(stderr, "unexpected status/aggregation word\n");
+                    std::exit(1);
+                }
+            }
+            if (staged) {
+                uint32_t lines[3 * PLOW_CTR_STRIDE];
+                CK(cudaMemcpy(lines, local[rank] + xoff, sizeof(lines), cudaMemcpyDeviceToHost));
+                if (lines[kXrAggWord] != nblk || lines[kXrRelayWord] != 1u ||
+                    PLOW_CTR(lines, 1)[kXrAggWord] != (twoshot ? nblk : 0u) ||
+                    PLOW_CTR(lines, 1)[kXrRelayWord] != unsigned(twoshot) ||
+                    *PLOW_CTR(lines, 2) != 0u) {
+                    std::fprintf(stderr, "unexpected local status/aggregation/relay word\n");
                     std::exit(1);
                 }
             }
         }
     }
+    for (auto* p : local) if (p) CK(cudaFree(p));
     CK(cudaFree(out));
     CK(cudaFree(resid));
     CK(cudaFree(out2));
     CK(cudaFree(device_peers));
     CK(cudaFreeHost(host));
-    std::printf("PASS N=%u n=%u e0=%u (one-shot, two-shot, residual, absent residual)\n", nr, n, e0);
+    std::printf("PASS %s N=%u n=%u e0=%u (one-shot, two-shot, residual, absent residual)\n",
+                staged ? "staged" : "host", nr, n, e0);
 }
 
 int main() {
@@ -181,6 +208,7 @@ int main() {
     const uint32_t lengths[] = {1, 7, 8, 9, 2560, 2561, 4096 * 2560 + 3};
     for (unsigned nr : {2u, 4u})
         for (uint32_t n : lengths)
-            for (uint32_t e0 : {0u, 5u}) run_case(nr, n, e0);
+            for (uint32_t e0 : {0u, 5u})
+                for (bool staged : {false, true}) run_case(nr, n, e0, staged);
     return 0;
 }

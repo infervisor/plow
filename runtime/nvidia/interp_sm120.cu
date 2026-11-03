@@ -335,6 +335,7 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
     (defined(PLOW_PACKET_HAS_XREDUCE2) && PLOW_PACKET_HAS_XREDUCE2)
 #define NV_XR_ON 1
 #include "op_collective.cuh"
+extern "C" __device__ unsigned plow_xr_staged_1 = 1;
 #else
 #define NV_XR_ON 0
 #endif
