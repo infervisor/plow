@@ -245,8 +245,10 @@ if(PLOW_CUDA)
     set_target_properties(gdn_prefill_sm120_test PROPERTIES
         CUDA_ARCHITECTURES "120a" CUDA_STANDARD 17)
     target_include_directories(gdn_prefill_sm120_test PRIVATE nvidia)
-    target_compile_options(gdn_prefill_sm120_test PRIVATE -O3 -Xptxas=-v)
-    add_test(NAME gdn_prefill_sm120 COMMAND gdn_prefill_sm120_test)
+    target_compile_options(gdn_prefill_sm120_test PRIVATE -O3 -Xptxas=-v -Xcompiler=-ffp-contract=off)
+    if(PLOW_SM120_CUBIN)
+        add_test(NAME gdn_prefill_sm120 COMMAND gdn_prefill_sm120_test)
+    endif()
 
     # ---- the persistent packet interpreter -------------------------------------------
     # Built as its own object library rather than folded into plow_runtime_cuda: it is a

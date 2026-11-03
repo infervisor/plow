@@ -11,6 +11,15 @@
 
 #include "gdn_prefill_sm120.h"
 
+// Keep standalone nvcc builds from contracting host arithmetic implicitly.
+#if !defined(__CUDA_ARCH__)
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#elif defined(__GNUC__)
+#pragma GCC optimize ("fp-contract=off")
+#endif
+#endif
+
 static_assert(std::is_trivial<GdnPrefillArgs>::value && std::is_standard_layout<GdnPrefillArgs>::value);
 
 #define CUDA_CHECK(call) do { \
@@ -46,6 +55,37 @@ static uint16_t to_bf16(float x) {
     uint32_t bits;
     std::memcpy(&bits, &x, sizeof(bits));
     return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
+static float warp_sum(float (&x)[32]) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        // Ascending lanes read the previous stage; out-of-range shuffles return self.
+        for (int lane = 0; lane < 32; ++lane)
+            x[lane] += x[lane + offset < 32 ? lane + offset : lane];
+    }
+    return x[0];
+}
+
+static uint16_t reference_row(float* state, const float* q, const float* k,
+                              float v, float decay, float beta) {
+    float proj[32] = {}, result[32] = {};
+    for (int j = 0; j < 4; ++j) {
+        for (int lane = 0; lane < 32; ++lane) {
+            const int d = lane + 32 * j;
+            state[d] *= decay;
+            // nvcc contracts the kernel's += state*k and += state*q.
+            proj[lane] = std::fma(state[d], k[d], proj[lane]);
+        }
+    }
+    const float delta = (v - warp_sum(proj)) * beta;
+    for (int j = 0; j < 4; ++j) {
+        for (int lane = 0; lane < 32; ++lane) {
+            const int d = lane + 32 * j;
+            state[d] = std::fma(delta, k[d], state[d]);
+            result[lane] = std::fma(state[d], q[d], result[lane]);
+        }
+    }
+    return to_bf16(warp_sum(result));
 }
 
 struct Error {
@@ -116,13 +156,15 @@ static bool run_case(const char* name, const std::vector<int>& lengths, bool tim
 
     Error rounded, unrounded, state_error;
     bool empty_exact = true;
+    size_t output_mismatches = 0, state_mismatches = 0;
     // FP64 recurrence on the actual BF16 inputs, with FP32 q*scale as in decode.
     for (int seq = 0; seq < nseq; ++seq) {
         for (int head = 0; head < 48; ++head) {
             const size_t state0 = (size_t(seq) * 48 + head) * 128 * 128;
             std::vector<double> state(initial.begin() + state0, initial.begin() + state0 + 128 * 128);
+            std::vector<float> state_fp32(initial.begin() + state0, initial.begin() + state0 + 128 * 128);
             for (int64_t t = offsets[seq]; t < offsets[seq + 1]; ++t) {
-                double qt[128], kt[128];
+                float qt[128], kt[128];
                 const size_t qk0 = (size_t(t) * 16 + head / 3) * 128;
                 for (int d = 0; d < 128; ++d) {
                     qt[d] = from_bf16(q[qk0 + d]) * scale;
@@ -132,6 +174,9 @@ static bool run_case(const char* name, const std::vector<int>& lengths, bool tim
                 const double b = beta[size_t(t) * 48 + head];
                 const size_t out0 = (size_t(t) * 48 + head) * 128;
                 for (int row = 0; row < 128; ++row) {
+                    const uint16_t expected = reference_row(state_fp32.data() + row * 128, qt, kt,
+                        from_bf16(v[out0 + row]), float(decay), float(b));
+                    output_mismatches += output[out0 + row] != expected;
                     double* s = state.data() + row * 128;
                     double proj = 0;
                     for (int d = 0; d < 128; ++d) {
@@ -149,19 +194,22 @@ static bool run_case(const char* name, const std::vector<int>& lengths, bool tim
                     unrounded.add(actual, result);
                 }
             }
-            for (int i = 0; i < 128 * 128; ++i)
+            for (int i = 0; i < 128 * 128; ++i) {
                 state_error.add(final[state0 + i], state[i]);
+                state_mismatches += std::memcmp(&final[state0 + i], &state_fp32[i], sizeof(float)) != 0;
+            }
             if (lengths[seq] == 0)
                 empty_exact &= std::memcmp(final.data() + state0, initial.data() + state0,
                                            128 * 128 * sizeof(float)) == 0;
         }
     }
-    rounded.print("o vs BF16-rounded reference");
-    unrounded.print("o vs unrounded reference");
-    state_error.print("final state");
+    std::printf("  FP32 bitwise mismatches: o=%zu final state=%zu\n", output_mismatches, state_mismatches);
+    rounded.print("o vs BF16-rounded FP64 reference (informational)");
+    unrounded.print("o vs unrounded FP64 reference (informational)");
+    state_error.print("final state vs FP64 reference (informational)");
     di.read(final);
     const bool initial_unchanged = std::memcmp(initial.data(), final.data(), nstate * sizeof(float)) == 0;
-    const bool pass = rounded.rel_l2() < 2e-3 && state_error.rel_l2() < 1e-4 &&
+    const bool pass = output_mismatches == 0 && state_mismatches == 0 &&
                       empty_exact && initial_unchanged;
     std::printf("  %s (empty copy exact=%d, initial unchanged=%d)\n",
                 pass ? "PASS" : "FAIL", int(empty_exact), int(initial_unchanged));
