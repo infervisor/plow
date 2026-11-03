@@ -243,6 +243,8 @@ __device__ void gemv_wide_sm90(const GwArgs& a, unsigned slice, unsigned nblk, v
         const bool seg_last = (i + 1u == nu) || kb + 1u == KB;
         const unsigned cur = i % S;
         sm90_cp_wait<S - 2>();
+        /* cp.async writes through the generic proxy; wgmma reads through the async proxy. */
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncthreads();
         const __nv_bfloat16* Wc = Ws + cur * WBUF + (SB ? 0u : wg * 64u * GW_BK);
         const __nv_bfloat16* Xc = Xs + cur * XBUF + (SB ? wg * 64u * GW_BK : 0u);
