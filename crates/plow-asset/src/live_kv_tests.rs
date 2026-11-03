@@ -263,6 +263,7 @@ fn validate_generated(
     };
     emit(&Packet {
         n_cu: 1,
+        target: 0,
         tp: false,
         prefill_count: 0,
         tensors: &tensors,
@@ -328,6 +329,7 @@ fn validate_prefill_with(
     use packet::devbuild::ProgramRole::{DecodeRung, PrefillBucket};
     emit(&Packet {
         n_cu: 1,
+        target: 0,
         tp: false,
         prefill_count: 1,
         tensors: &tensors,

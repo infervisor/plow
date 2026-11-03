@@ -561,19 +561,6 @@ enum Cmd {
         format: String,
     },
 
-    /// Lean receipt qualification of every `*.pkt` in each directory: derives the required
-    /// obligations from the packet, matches receipts, checks verifier approval and (unless
-    /// `--no-replay`) replays them. CPU only. Exits non-zero when a packet does not qualify.
-    Qualify {
-        #[arg(long = "assets", required = true)]
-        assets: Vec<PathBuf>,
-        #[arg(long)]
-        no_replay: bool,
-        /// `text` (default) or `json`.
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-
     /// Checkpoint S: compare a base and a variant packet (and, for a runtime knob, the route a
     /// workload takes) against the knob's declared scope. CPU only.
     ///
@@ -1112,11 +1099,9 @@ async fn async_main(
     // `op-audit --format json` writes a document to stdout; the startup banner
     // would land inside it. Same reason `bench` logs to stderr.
     let structured_output = match &cli.cmd {
-        Cmd::Bench { .. }
-        | Cmd::OpAudit { .. }
-        | Cmd::Inventory { .. }
-        | Cmd::KnobScope { .. }
-        | Cmd::Qualify { .. } => true,
+        Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::Inventory { .. } | Cmd::KnobScope { .. } => {
+            true
+        }
         // A node's check-in parses this array; the banner must not precede it.
         Cmd::Ls { json: true, .. } => true,
         #[cfg(any(
@@ -1379,11 +1364,6 @@ async fn async_main(
         } => knob_scope_cmd(
             base, variant, knob, values, workload, model, out, scope_json,
         ),
-        Cmd::Qualify {
-            assets,
-            no_replay,
-            format,
-        } => qualify_cmd(assets, !no_replay, &format),
         Cmd::Inventory { assets, format } => inventory_cmd(&assets, &format),
         Cmd::Devices {
             tp,
@@ -3419,50 +3399,6 @@ fn knob_routes(
     _: &plowrt::knob_scope::Workload,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     Err("the route trace plans the AMD serve: build plowrt with --features hsa".into())
-}
-
-fn qualify_cmd(
-    dirs: Vec<PathBuf>,
-    replay: bool,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut report = Vec::new();
-    let mut failed = 0;
-    for dir in &dirs {
-        for (packet, q) in plowrt::certificate_checks::qualify_dir(dir, replay)? {
-            failed += usize::from(!q.qualified());
-            if format == "json" {
-                report.push(
-                    serde_json::json!({"packet": packet, "qualified": q.qualified(),
-                    "replayed": replay, "qualification": q}),
-                );
-            } else {
-                println!(
-                    "{} {}: {}/{} obligations, {} policy receipts, verifiers {:?}",
-                    if q.qualified() {
-                        "QUALIFIED  "
-                    } else {
-                        "UNQUALIFIED"
-                    },
-                    packet.display(),
-                    q.satisfied.len(),
-                    q.required.len(),
-                    q.policy_receipts,
-                    q.receipt_verifiers
-                );
-                for gap in &q.gaps {
-                    println!("    gap: {gap}");
-                }
-            }
-        }
-    }
-    if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    }
-    if failed > 0 {
-        return Err(format!("{failed} packet(s) do not qualify under the strict policy").into());
-    }
-    Ok(())
 }
 
 fn knob_scope_cmd(

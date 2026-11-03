@@ -828,7 +828,6 @@ impl CpuModel {
         // domain window itself (`exec::cpu::interp`), so the mis-dispatch the
         // flag guards against cannot happen here.
         let image = crate::asset::packet_image::PacketImage::open(blob_path)?;
-        crate::certificate_checks::check_packet(&image)?;
         let (raw, blob) = (&image.raw, image.blob.clone());
         let language_model = blob.tensors.iter().any(|tensor| tensor.name == "in.ids");
         validate_cpu_blob(&blob, language_model)?;

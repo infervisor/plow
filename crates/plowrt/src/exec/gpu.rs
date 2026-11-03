@@ -4086,7 +4086,6 @@ impl GpuEngine {
                 })?;
                 let image = crate::asset::packet_image::PacketImage::open(&pkt)?;
                 image.blob.check_l2_dispatch(false)?;
-                crate::certificate_checks::check_packet(&image)?;
                 let blob = image.blob.clone();
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16

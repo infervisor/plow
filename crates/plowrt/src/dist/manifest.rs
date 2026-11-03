@@ -56,10 +56,9 @@ const ROLES: &[(&str, &str)] = &[
     // gone — so they are roles, not sidecars.
     ("codec.pkt", "codec_packet"),
     ("cublaslt_algos.jsonl", "algo_table"),
-    // Lean compile receipts, read from beside the packet they bind. Optional
-    // at load (`--lean-qualify` defaults to `off`), but `strict` REFUSES a
-    // packet whose receipts are absent, so a bundle that drops them can never
-    // be verified strictly for as long as it exists.
+    // Lean compile receipts, read from beside the packet they bind by
+    // `plowc qualify`. A bundle that drops them can never be qualified for as
+    // long as it exists.
     ("lean-checks.json", "packet_checks"),
     // The host-side GDN prefill library a Qwen3.5-family packet's prefill
     // loads from beside it (`exec/gpu.rs`, `NativeGdn::load`): built per
