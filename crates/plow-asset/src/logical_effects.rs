@@ -380,6 +380,35 @@ fn is_tmap(packet: &Packet<'_>, handle: u32) -> bool {
     })
 }
 
+/// The tensors a `moe.ewt.{l}` / `moe.est.{l}` pointer table points into, resolved as the
+/// runtime fills it at load (last tensor named `layers.{l}.experts.{gate_up,down}_proj[_scale]`).
+fn expert_table_targets(packet: &Packet<'_>, handle: u16) -> Result<Option<Vec<u16>>, String> {
+    let Some(tensor) = packet.tensors.get(handle as usize) else {
+        return Ok(None);
+    };
+    let (layer, scale) = match (
+        tensor.name.strip_prefix("moe.ewt."),
+        tensor.name.strip_prefix("moe.est."),
+    ) {
+        (Some(l), _) => (l, ""),
+        (_, Some(l)) => (l, "_scale"),
+        _ => return Ok(None),
+    };
+    ["gate_up_proj", "down_proj"]
+        .map(|w| format!("layers.{layer}.experts.{w}{scale}"))
+        .iter()
+        .map(|suffix| {
+            packet
+                .tensors
+                .iter()
+                .rposition(|t| t.name.ends_with(suffix.as_str()))
+                .map(|i| i as u16)
+                .ok_or_else(|| format!("expert pointer table {} has no target", tensor.name))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 /// Residue band of a strided f32 access: every element index `e` it touches has
 /// `e % stride` in `[lo, hi)` (Plow.Speech.band_elem_residue). `None` = whole tensor.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -554,7 +583,18 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
         let handles = handle_accesses(inst)?
             .into_iter()
             .map(|(handle, write)| (handle as u16, write, None));
-        for (handle, write, band) in slots.chain(handles) {
+        let mut direct: Vec<_> = slots.chain(handles).collect();
+        let mut indirect = Vec::new();
+        for &(handle, write, _) in &direct {
+            if let Some(targets) = expert_table_targets(packet, handle)? {
+                if write {
+                    return Err("instruction writes an expert pointer table".into());
+                }
+                indirect.extend(targets.into_iter().map(|t| (t, false, None)));
+            }
+        }
+        direct.extend(indirect);
+        for (handle, write, band) in direct {
             if handle == TENSOR_NONE16 {
                 continue;
             }
@@ -1089,6 +1129,67 @@ mod tests {
         crate::program::with_model(&model, |packet| assert!(obligation(packet, 0).is_err()));
         model.gen.pop();
         crate::program::with_model(&model, |packet| assert!(obligation(packet, 0).is_err()));
+    }
+
+    #[test]
+    fn expert_pointer_tables_read_their_targets() {
+        let build = |write_table: bool| {
+            let mut b = Builder::new(1);
+            let [o, x, r, ewt, gu, dn] = [
+                "o",
+                "x",
+                "r",
+                "moe.ewt.0",
+                "fp8/model.layers.0.experts.gate_up_proj",
+                "fp8/model.layers.0.experts.down_proj",
+            ]
+            .map(|n| b.tensor(n, 128));
+            b.emit(DevOp::MoeExpertGluGemmaFp8, vec![0], &[], |d| {
+                d.t[..5].copy_from_slice(&[o, x, r, ewt, r]);
+            });
+            if write_table {
+                b.emit(DevOp::Residual, vec![0], &[], |d| {
+                    d.t[..3].copy_from_slice(&[ewt, x, x]);
+                    d.i[0] = 1;
+                });
+            }
+            let p = b.finish();
+            (
+                Model {
+                    n_cu: 1,
+                    target: 0,
+                    tensors: p.tensors.clone(),
+                    progs: vec![p],
+                    kv_row_insts: vec![],
+                    prog_t: vec![1],
+                    gen: vec![],
+                },
+                [gu, dn],
+            )
+        };
+        let (mut model, targets) = build(false);
+        crate::program::with_model(&model, |packet| {
+            let value = obligation(packet, 0).unwrap();
+            for h in targets {
+                let entry = value["address_map"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["name"] == format!("tensor:{h}"))
+                    .unwrap()
+                    .clone();
+                assert_eq!(entry["readers"], json!([1]));
+            }
+        });
+        model.tensors[targets[1] as usize].name = "unrelated".into();
+        crate::program::with_model(&model, |packet| assert!(obligation(packet, 0).is_err()));
+        let (model, _) = build(true);
+        crate::program::with_model(&model, |packet| {
+            assert_eq!(
+                obligation(packet, 0).unwrap_err(),
+                "instruction writes an expert pointer table"
+            )
+        });
     }
 
     #[test]
