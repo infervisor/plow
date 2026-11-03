@@ -5702,6 +5702,10 @@ __device__ void d_gemv_qkv(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x, const bf
 #ifndef GV_UN_K8192
 #define GV_UN_K8192 16
 #endif
+#if PLOW_GFX12
+#include "op_gemv_gfx12.h"
+#define d_gemv d_gemv_legacy
+#endif
 __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
                        const bf16* gamma, unsigned M, unsigned N, unsigned K, int norm,
                        float eps, unsigned slice, unsigned nblk, bf16* lds) {
@@ -5728,6 +5732,22 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
   });
 }
 
+#if PLOW_GFX12
+#undef d_gemv
+__device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
+                       const bf16* gamma, unsigned M, unsigned N, unsigned K, int norm,
+                       float eps, unsigned slice, unsigned nblk, bf16* lds) {
+    const unsigned rows = PLOW_GEMV_WALK ? min(M, (unsigned)PLOW_GEMV_MM) : M;
+    if (gv12_fits(rows, K, norm)) {
+        gemv_walk(M, [&](unsigned m0, unsigned count) {
+            d_gemv_gfx12(C + (size_t)m0 * N, x + (size_t)m0 * K, W,
+                        count, N, K, slice, nblk, lds);
+        });
+    } else
+        d_gemv_legacy(C, x, W, rms, gamma, M, N, K, norm, eps, slice, nblk, lds);
+}
+#endif
+
 /* LM head GEMV with fused greedy-argmax epilogue (PLOW_DOP_GEMV_ARGMAX).
  * M sequences: x is offset by a_row0, part is [M][nblk]; f0=cap. */
 __device__ __attribute__((noinline)) void d_gemv_argmax(
@@ -5746,6 +5766,24 @@ __device__ __attribute__((noinline)) void d_gemv_argmax(
     for (unsigned m = 0; m < M; m++) {
         const bf16* x_m = x_base + (size_t)m * K;
         bf16* C_m = C_base + (size_t)m * N;
+#if PLOW_GFX12
+        if (gv12_fits(1, K, 0)) {
+            d_gemv_gfx12(C_m, x_m, W, 1, N, K, slice, nblk, lds);
+            unsigned long long best = 0;
+            for (unsigned n = gv_n0 + threadIdx.x; n < gv_n1; n += PLOW_THREADS) {
+                const bf16 lg = C_m[n];
+                const bf16 sc = cap > 0.0f ? f2bf(cap * tanhf(bf2f(lg) * inv)) : lg;
+                st_act1(&C_m[n], sc);
+                const unsigned long long key = amax_pack(sc, n);
+                best = key > best ? key : best;
+            }
+            best = block_max_u64(best, (unsigned long long*)lds);
+            if (threadIdx.x == 0)
+                st_act<unsigned long long>(&part_base[(size_t)m * nblk + slice], best);
+            __syncthreads();
+            continue;
+        }
+#endif
         stage_x_lds(lds, x_m, K);
         __syncthreads();
 
