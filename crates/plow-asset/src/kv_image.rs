@@ -17,6 +17,7 @@ use crate::program::Packet;
 use packet::dev::{DevInst64, DevOp, ROPE_PAIR_HALF, TENSOR_NONE16};
 use packet::rope::{
     GenTensor, GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN, GEN_ROPE_COS, GEN_ROPE_SIN,
+    ROPE_SCALE_NONE,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -170,13 +171,15 @@ pub fn derive(packet: &Packet<'_>, manifest: &Manifest, weights: String) -> Resu
             let id = format!("L{layer}.{role}");
             let mut facts = None;
             for p in packet.programs {
-                for d in p
-                    .insts
-                    .iter()
-                    .filter(|d| d.t[0] == handle && writes_cache(d))
-                {
-                    let f = writer(packet, d, c.hd, layer, role)
-                        .map_err(|e| refuse(format!("{id}: {e}")))?;
+                for d in p.insts.iter().filter(|d| writes_cache(d)) {
+                    let f = if d.t[0] == handle {
+                        writer(packet, d, c.hd, layer, role)
+                    } else if fused_v(d) && d.t[6] == handle && role == "v" {
+                        writer_fused_v(d, c.hd)
+                    } else {
+                        continue;
+                    }
+                    .map_err(|e| refuse(format!("{id}: {e}")))?;
                     match &facts {
                         None => facts = Some(f),
                         Some(seen) if *seen == f => {}
@@ -285,7 +288,9 @@ fn readers(packet: &Packet<'_>, pair: [u16; 2]) -> Result<Vec<u32>> {
         if layers.is_empty() {
             continue;
         }
+        // A staged prefill repeats a layer's attention.
         layers.sort_unstable();
+        layers.dedup();
         match &seen {
             None => seen = Some(layers),
             Some(s) if *s == layers => {}
@@ -300,6 +305,27 @@ fn writes_cache(d: &DevInst64) -> bool {
         DevOp::from_u16(d.op),
         Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8 | DevOp::QwenHeadNormRope)
     )
+}
+
+/// `HeadNormRope` `i7=1`: the instruction also stores V, from `t7` into `t6`, with the same norm
+/// skip, no gamma and no rotation (devgen's K/V pair fusion).
+fn fused_v(d: &DevInst64) -> bool {
+    d.op == DevOp::HeadNormRope as u16 && d.i[7] == 1
+}
+
+fn writer_fused_v(d: &DevInst64, hd: u32) -> Result<(Dtype, Norm, Option<Rope>)> {
+    if d.i[2] != hd {
+        return Err(format!("fused V writer hd {} vs cache hd {hd}", d.i[2]));
+    }
+    let norm = if d.i[4] == 0 {
+        Norm::Rms {
+            eps: finite(f32::from_bits(d.fj[0]).into(), "norm eps")? as f32,
+            gamma: false,
+        }
+    } else {
+        Norm::None
+    };
+    Ok((Dtype::Bf16, norm, None))
 }
 
 /// A float the header can hold: finite, and `-0.0` as `0.0` (JSON writes them differently).
@@ -355,33 +381,33 @@ fn writer(
         };
         let cos = generated(packet, d.t[3], [GEN_ROPE_COS, GEN_AMD_ROPE_BF16_COS])?;
         let sin = generated(packet, d.t[4], [GEN_ROPE_SIN, GEN_AMD_ROPE_BF16_SIN])?;
-        let recipe = |g: &GenTensor| {
-            (
-                g.hd,
-                g.aux,
-                g.scale,
-                [g.theta, g.frac, g.factor, g.low, g.high, g.orig].map(f64::to_bits),
-            )
-        };
-        if recipe(cos) != recipe(sin) {
-            return Err("cos and sin tables disagree".into());
-        }
-        if cos.hd != hd {
+        if cos.hd != hd || sin.hd != hd {
             return Err(format!("rotary table hd {} vs cache hd {hd}", cos.hd));
         }
-        Some(Rope {
-            theta: finite(cos.theta, "rope theta")?,
-            frac: finite(cos.frac, "rope fraction")?,
-            pairing,
-            scaling: cos.scale,
-            factor: finite(cos.factor, "rope factor")?,
-            low: finite(cos.low, "rope low")?,
-            high: finite(cos.high, "rope high")?,
-            orig: finite(cos.orig, "rope orig")?,
-            aux: cos.aux,
-        })
+        let rope = recipe(cos, pairing)?;
+        if recipe(sin, pairing)? != rope {
+            return Err("cos and sin tables disagree".into());
+        }
+        Some(rope)
     };
     Ok((dtype, norm, rope))
+}
+
+/// A rotary table's recipe with its unused scaling parameters zeroed.
+fn recipe(g: &GenTensor, pairing: Pairing) -> Result<Rope> {
+    let scaled = g.scale != ROPE_SCALE_NONE;
+    let used = |x: f64, what: &str| if scaled { finite(x, what) } else { Ok(0.0) };
+    Ok(Rope {
+        theta: finite(g.theta, "rope theta")?,
+        frac: finite(g.frac, "rope fraction")?,
+        pairing,
+        scaling: g.scale,
+        factor: used(g.factor, "rope factor")?,
+        low: used(g.low, "rope low")?,
+        high: used(g.high, "rope high")?,
+        orig: used(g.orig, "rope orig")?,
+        aux: if scaled { g.aux } else { 0 },
+    })
 }
 
 /// The generation recipe of tensor `handle`, of one of `kinds` (the f32 or the BF16 table: the

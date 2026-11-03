@@ -422,7 +422,8 @@ fn unrecognised_caches_are_refused() {
     assert!(refused(|m| m.tp = true).contains("TP"));
     // The decode attention writes the new rows itself (folded writer descriptor).
     assert!(refused(|m| m.insts[3].t[7] = 1).contains("folded"));
-    assert!(refused(|m| m.generated[1].factor = 2.0).contains("disagree"));
+    assert!(refused(|m| m.generated[1].scale = 4).contains("disagree"));
+    assert!(refused(|m| m.insts[0].op = DevOp::QwenHeadNormRope as u16).contains("not supported"));
     assert!(refused(|m| {
         m.generated[0].theta = f64::NAN;
         m.generated[1].theta = f64::NAN;
@@ -498,4 +499,31 @@ fn caches_pack_in_layer_order() {
     canonical_order(&packet, &mut manifest).unwrap();
     let first = &tensors[manifest.caches[0].pair[0] as usize];
     assert_eq!(first.name, "kv.0.k");
+}
+
+#[test]
+fn a_fused_kv_writer_states_the_same_v() {
+    let base = header(&build(&gemma4_e4b(), 1024, LAYOUT_HEAD_MAJOR)).unwrap();
+    let mut m = build(&gemma4_e4b(), 1024, LAYOUT_HEAD_MAJOR);
+    // Layer 0: K writer at 0, V writer at 1. Fold V into K's instruction (devgen's pair fusion).
+    let v = m.insts[1];
+    m.insts[0].i[7] = 1;
+    m.insts[0].t[6] = v.t[0];
+    m.insts[0].t[7] = v.t[1];
+    m.insts.remove(1);
+    assert_eq!(header(&m).unwrap(), base);
+    // The fused V then normalizes as K does: a V stored unnormed elsewhere disagrees.
+    let mut prefill_v = v;
+    prefill_v.i[4] = 1;
+    m.insts.push(prefill_v);
+    assert!(header(&m).unwrap_err().contains("disagree"));
+}
+
+#[test]
+fn unused_rope_parameters_and_signed_zero_do_not_split_keys() {
+    let base = header(&build(&qwen3_0_6b(), 4096, LAYOUT_HEAD_MAJOR)).unwrap();
+    let mut m = build(&qwen3_0_6b(), 4096, LAYOUT_HEAD_MAJOR);
+    m.generated[0].factor = 3.0;
+    m.generated[1].low = -0.0;
+    assert_eq!(header(&m).unwrap(), base);
 }
