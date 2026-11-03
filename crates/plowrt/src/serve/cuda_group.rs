@@ -30,6 +30,13 @@ use crate::{Result, RuntimeError};
 /// A worker answers each request within this, or the group is failed.
 const RPC_TIMEOUT: Duration = Duration::from_secs(600);
 
+#[path = "cuda_p2p.rs"]
+mod p2p;
+
+pub(super) fn write_transport_metrics(out: &mut String) {
+    p2p::write_metrics(out);
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 enum Req {
     Begin {
@@ -127,6 +134,7 @@ pub struct CudaGroupServe {
     /// to row `b`, and a finished prefill leaves its row in row 0.
     logits_at: Vec<Option<usize>>,
     prefill_turn: usize,
+    _transport_metrics: p2p::Metrics,
 }
 
 /// The rank-group geometry a packet directory needs: its tensor-parallel degree and the
@@ -183,7 +191,8 @@ impl CudaGroupServe {
                 checkpoint_dir,
             )?);
         }
-        let bind = RankBind::new(be.clone(), group.clone())?;
+        let (bind, transport) = p2p::leader(be.clone(), group.clone(), assets_dir, &mut workers)
+            .inspect_err(|_| group.abort())?;
         let local = GpuEngine::load_rank(be, assets_dir, checkpoint_dir, Some(bind));
         let local = match local {
             Ok(e) => e,
@@ -223,6 +232,10 @@ impl CudaGroupServe {
             ?devices,
             "tensor-parallel rank group up"
         );
+        let transport_metrics = p2p::Metrics::new(
+            transport,
+            local.rank_bind().expect("rank binding").transport_tier(),
+        );
         Ok(Self {
             stop_ids: local.stop_ids().clone(),
             eng: Mutex::new(local),
@@ -235,6 +248,7 @@ impl CudaGroupServe {
             attached: vec![0; batch],
             logits_at: vec![None; batch],
             prefill_turn: 0,
+            _transport_metrics: transport_metrics,
         })
     }
 
@@ -383,6 +397,8 @@ fn spawn_worker(
     drop(theirs);
     ours.set_read_timeout(Some(RPC_TIMEOUT))
         .map_err(|e| RuntimeError::Device(e.to_string()))?;
+    ours.set_write_timeout(Some(RPC_TIMEOUT))
+        .map_err(|e| RuntimeError::Device(e.to_string()))?;
     let child = Arc::new(Mutex::new(child));
     // A worker that exits for any reason fails the group at once: a dead child stays a zombie
     // until reaped, so the barrier's pid probe alone would not see it.
@@ -443,6 +459,9 @@ pub fn rank_worker_main(
             UnixStream::from_raw_fd(link_fd),
         )
     };
+    sock.set_read_timeout(Some(RPC_TIMEOUT))
+        .and_then(|()| sock.set_write_timeout(Some(RPC_TIMEOUT)))
+        .map_err(|e| RuntimeError::Device(e.to_string()))?;
     let mut link = Link::new(sock);
     // Die with the leader: a parent-death signal tracks the spawning THREAD (the leader loads
     // on a short-lived thread), so watch for reparenting instead.
@@ -461,7 +480,8 @@ pub fn rank_worker_main(
         let layout = group_layout(&assets_dir)?.map(|(_, l)| l);
         let group = Arc::new(ProcGroup::attach(gfd, rank, layout)?);
         let be = Arc::new(CudaBackend::new(0)?);
-        let bind = RankBind::new(be.clone(), group)?;
+        let (bind, _) = p2p::worker(be.clone(), group.clone(), &assets_dir, &mut link)
+            .inspect_err(|_| group.abort())?;
         GpuEngine::load_rank(be, &assets_dir, &checkpoint_dir, Some(bind))
     })();
     let mut eng = match loaded {

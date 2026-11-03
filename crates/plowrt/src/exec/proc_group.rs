@@ -24,7 +24,7 @@
 //! boundary.
 
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -356,6 +356,102 @@ impl Link {
     pub fn close(&self) {
         let _ = self.s.shutdown(std::net::Shutdown::Both);
     }
+    /// The ancillary marker is a separate frame, always consumed by recvmsg, never read().
+    pub fn send_fd<T: serde::Serialize>(
+        &mut self,
+        v: &T,
+        fd: Option<BorrowedFd<'_>>,
+    ) -> Result<()> {
+        let mut marker = [u8::from(fd.is_some())];
+        let mut iov = libc::iovec {
+            iov_base: marker.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        // usize storage keeps cmsghdr aligned.
+        let mut control = [0usize; 8];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if let Some(fd) = fd {
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen =
+                unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+            unsafe {
+                let h = libc::CMSG_FIRSTHDR(&msg);
+                (*h).cmsg_level = libc::SOL_SOCKET;
+                (*h).cmsg_type = libc::SCM_RIGHTS;
+                (*h).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+                std::ptr::write_unaligned(libc::CMSG_DATA(h).cast::<RawFd>(), fd.as_raw_fd());
+            }
+        }
+        loop {
+            let n = unsafe { libc::sendmsg(self.s.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+            if n == 1 {
+                break;
+            }
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(os_err("rank link sendmsg"));
+        }
+        self.send(v)
+    }
+
+    pub fn recv_fd<T: serde::de::DeserializeOwned>(&mut self) -> Result<(T, Option<OwnedFd>)> {
+        let mut marker = [0u8];
+        let mut iov = libc::iovec {
+            iov_base: marker.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        let mut control = [0usize; 8];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        let n = loop {
+            msg.msg_controllen = std::mem::size_of_val(&control);
+            msg.msg_flags = 0;
+            let n = unsafe { libc::recvmsg(self.s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break n;
+        };
+        if n != 1 {
+            return Err(os_err("rank link recvmsg closed"));
+        }
+        let mut fds = Vec::new();
+        let mut invalid = msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0;
+        unsafe {
+            let mut h = libc::CMSG_FIRSTHDR(&msg);
+            while !h.is_null() {
+                let header = libc::CMSG_LEN(0) as usize;
+                if (*h).cmsg_len < header {
+                    invalid = true;
+                    break;
+                }
+                if (*h).cmsg_level == libc::SOL_SOCKET && (*h).cmsg_type == libc::SCM_RIGHTS {
+                    let bytes = (*h).cmsg_len - header;
+                    invalid |= bytes % std::mem::size_of::<RawFd>() != 0;
+                    for i in 0..bytes / std::mem::size_of::<RawFd>() {
+                        let fd =
+                            std::ptr::read_unaligned(libc::CMSG_DATA(h).cast::<RawFd>().add(i));
+                        fds.push(OwnedFd::from_raw_fd(fd));
+                    }
+                } else {
+                    invalid = true;
+                }
+                h = libc::CMSG_NXTHDR(&msg, h);
+            }
+        }
+        if invalid || marker[0] > 1 || fds.len() != marker[0] as usize {
+            return Err(RuntimeError::Device(
+                "rank link invalid/truncated fd frame".into(),
+            ));
+        }
+        let v = self.recv()?;
+        Ok((v, fds.pop()))
+    }
     pub fn send<T: serde::Serialize>(&mut self, v: &T) -> Result<()> {
         let b = serde_json::to_vec(v).map_err(|e| RuntimeError::Device(e.to_string()))?;
         self.s
@@ -389,6 +485,86 @@ pub fn inheritable(fd: RawFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
+
+    #[test]
+    fn fd_frames_preserve_json_boundaries_and_cloexec() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (mut a, mut b) = (Link::new(a), Link::new(b));
+        let file = std::fs::File::open("/dev/null").unwrap();
+        a.send(&"before").unwrap();
+        a.send_fd(&(7u32, 4096u64), Some(file.as_fd())).unwrap();
+        a.send_fd(&"unavailable", None).unwrap();
+        a.send(&"after").unwrap();
+        assert_eq!(b.recv::<String>().unwrap(), "before");
+        let (metadata, fd) = b.recv_fd::<(u32, u64)>().unwrap();
+        assert_eq!(metadata, (7, 4096));
+        let fd = fd.unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_eq!(std::fs::File::from(fd).read(&mut [0u8; 1]).unwrap(), 0);
+        let (metadata, fd) = b.recv_fd::<String>().unwrap();
+        assert_eq!(metadata, "unavailable");
+        assert!(fd.is_none());
+        assert_eq!(b.recv::<String>().unwrap(), "after");
+    }
+
+    #[test]
+    fn invalid_fd_counts_and_truncation_close_received_descriptors() {
+        for count in [2usize, 32] {
+            let (a, b) = UnixStream::pair().unwrap();
+            let mut b = Link::new(b);
+            let mut pipe = [-1; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
+                0
+            );
+            let (reader, writer) =
+                unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
+            let mut marker = [1u8];
+            let mut iov = libc::iovec {
+                iov_base: marker.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut control = [0usize; 32];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = unsafe { libc::CMSG_SPACE((count * 4) as u32) } as usize;
+            unsafe {
+                let h = libc::CMSG_FIRSTHDR(&msg);
+                (*h).cmsg_level = libc::SOL_SOCKET;
+                (*h).cmsg_type = libc::SCM_RIGHTS;
+                (*h).cmsg_len = libc::CMSG_LEN((count * 4) as u32) as usize;
+                for i in 0..count {
+                    std::ptr::write_unaligned(
+                        libc::CMSG_DATA(h).cast::<RawFd>().add(i),
+                        writer.as_raw_fd(),
+                    );
+                }
+                assert_eq!(libc::sendmsg(a.as_raw_fd(), &msg, libc::MSG_NOSIGNAL), 1);
+            }
+            drop(writer);
+            assert!(b.recv_fd::<u32>().is_err());
+            // A concurrent spawn can retain CLOEXEC writers briefly before its exec.
+            let mut poll = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
+            assert_ne!(poll.revents & libc::POLLHUP, 0);
+            // EOF proves that neither the received rights nor truncated rights leaked.
+            let mut byte = [0u8];
+            assert_eq!(
+                unsafe { libc::read(reader.as_raw_fd(), byte.as_mut_ptr().cast(), 1) },
+                0
+            );
+        }
+    }
 
     fn dup(fd: RawFd) -> OwnedFd {
         // SAFETY: duplicating a live descriptor.
