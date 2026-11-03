@@ -95,7 +95,8 @@ handles. Known limits of that audit:
 - Runtime launch fusions are outside the program and not covered.
 - Instructions that write a generated tensor map are rejected; maps are load-time descriptors.
 - A read of a `moe.ewt.{l}`/`moe.est.{l}` expert pointer table also reads the expert weight/scale
-  tensors the runtime points it at; writing a table is rejected.
+  tensors the runtime points it at; writing a table is rejected, and an MoE expert kernel's
+  table operand must be a `moe.ewt.`/`moe.est.` table.
 
 The table below is the coverage before that change. It rejects a whole program at the first unaudited op. It also rejects TP, packed/token-batch
 siblings, `l2_domains`, fine counters and `@` aliases. Unaudited opcodes in production main packets

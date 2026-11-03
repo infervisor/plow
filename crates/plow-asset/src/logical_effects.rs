@@ -380,6 +380,23 @@ fn is_tmap(packet: &Packet<'_>, handle: u32) -> bool {
     })
 }
 
+/// Operand slots the MoE expert kernels dereference as pointer tables (devgen MoE emit).
+fn expert_table_slots(d: &DevInst64) -> &'static [(usize, &'static str)] {
+    const EWT: &str = "moe.ewt.";
+    const EST: &str = "moe.est.";
+    match DevOp::from_u16(d.op) {
+        Some(
+            DevOp::MoeExpertGluGemmaFp8 | DevOp::MoeExpertDownGemmaFp8 | DevOp::MoeExpertDownGemma,
+        ) => &[(3, EWT), (4, EST)],
+        Some(DevOp::MoeExpertGluNormGemma) => &[(3, EWT)],
+        Some(DevOp::MoeGroupGluGemmaPf | DevOp::MoeGroupDownGemmaPf) => &[(2, EWT)],
+        Some(DevOp::MoeGroupGluGemmaPfW8a8 | DevOp::MoeGroupDownGemmaPfW8a8) => {
+            &[(2, EWT), (6, EST)]
+        }
+        _ => &[],
+    }
+}
+
 /// The tensors a `moe.ewt.{l}` / `moe.est.{l}` pointer table points into, resolved as the
 /// runtime fills it at load (last tensor named `layers.{l}.experts.{gate_up,down}_proj[_scale]`).
 fn expert_table_targets(packet: &Packet<'_>, handle: u16) -> Result<Option<Vec<u16>>, String> {
@@ -583,6 +600,17 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
         let handles = handle_accesses(inst)?
             .into_iter()
             .map(|(handle, write)| (handle as u16, write, None));
+        for &(slot, prefix) in expert_table_slots(inst) {
+            let handle = inst.t[slot];
+            if handle != TENSOR_NONE16
+                && !packet
+                    .tensors
+                    .get(handle as usize)
+                    .is_some_and(|t| t.name.starts_with(prefix))
+            {
+                return Err("expert pointer-table operand is not a pointer table".into());
+            }
+        }
         let mut direct: Vec<_> = slots.chain(handles).collect();
         let mut indirect = Vec::new();
         for &(handle, write, _) in &direct {
@@ -1135,17 +1163,20 @@ mod tests {
     fn expert_pointer_tables_read_their_targets() {
         let build = |write_table: bool| {
             let mut b = Builder::new(1);
-            let [o, x, r, ewt, gu, dn] = [
+            let [o, x, r, ewt, est, gu, dn, gus, dns] = [
                 "o",
                 "x",
                 "r",
                 "moe.ewt.0",
+                "moe.est.0",
                 "fp8/model.layers.0.experts.gate_up_proj",
                 "fp8/model.layers.0.experts.down_proj",
+                "fp8/model.layers.0.experts.gate_up_proj_scale",
+                "fp8/model.layers.0.experts.down_proj_scale",
             ]
             .map(|n| b.tensor(n, 128));
             b.emit(DevOp::MoeExpertGluGemmaFp8, vec![0], &[], |d| {
-                d.t[..5].copy_from_slice(&[o, x, r, ewt, r]);
+                d.t[..5].copy_from_slice(&[o, x, r, ewt, est]);
             });
             if write_table {
                 b.emit(DevOp::Residual, vec![0], &[], |d| {
@@ -1164,7 +1195,7 @@ mod tests {
                     prog_t: vec![1],
                     gen: vec![],
                 },
-                [gu, dn],
+                [gu, dn, gus, dns],
             )
         };
         let (mut model, targets) = build(false);
@@ -1181,6 +1212,14 @@ mod tests {
                 assert_eq!(entry["readers"], json!([1]));
             }
         });
+        model.tensors[model.progs[0].insts[0].t[3] as usize].name = "scratch".into();
+        crate::program::with_model(&model, |packet| {
+            assert_eq!(
+                obligation(packet, 0).unwrap_err(),
+                "expert pointer-table operand is not a pointer table"
+            )
+        });
+        model.tensors[model.progs[0].insts[0].t[3] as usize].name = "moe.ewt.0".into();
         model.tensors[targets[1] as usize].name = "unrelated".into();
         crate::program::with_model(&model, |packet| assert!(obligation(packet, 0).is_err()));
         let (model, _) = build(true);
