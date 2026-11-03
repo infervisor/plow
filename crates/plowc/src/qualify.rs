@@ -579,8 +579,7 @@ mod tests {
             assert!(bound(&path, &raw).is_err(), "wire mutation {change}");
             model.progs[0].insts[0] = original;
         }
-        std::fs::remove_file(sidecar).unwrap();
-        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
