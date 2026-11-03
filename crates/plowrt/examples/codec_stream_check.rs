@@ -199,23 +199,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Phase 1: stream 0 alone on slot 0.
     let (mut got, mut t) = (Vec::new(), 0);
+    let mut ms = Vec::new();
     while t < frames {
         let k = size(frames - t);
+        let t0 = std::time::Instant::now();
         got.extend(launch(&[(0, 0, t, k)])?.remove(0));
+        ms.push(t0.elapsed().as_secs_f64() * 1e3);
         t += k;
     }
     report("single", 0, &got);
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let first = ms[0];
+    println!("time single first_ms {first:.3} median_ms {:.3}", med(&mut ms));
 
     // Phase 2: every stream on its own slot, joining one launch apart.
     let slot_of = |s: usize| (slots - 1 - 5 * s % slots) % slots;
     let (mut got, mut at) = (vec![Vec::new(); streams], vec![0usize; streams]);
     let mut round = 0;
+    let mut full = Vec::new();
     while at.iter().any(|&t| t < frames) {
         let items: Vec<_> = (0..streams.min(round + 1))
             .filter(|&s| at[s] < frames)
             .map(|s| (s, slot_of(s), at[s], size(frames - at[s])))
             .collect();
-        for (i, out) in items.iter().zip(launch(&items)?) {
+        let t0 = std::time::Instant::now();
+        let outs = launch(&items)?;
+        if items.len() == streams {
+            full.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        for (i, out) in items.iter().zip(outs) {
             got[i.0].extend(out);
             at[i.0] += i.3;
         }
@@ -224,5 +239,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (s, g) in got.iter().enumerate() {
         report("mixed", s, g);
     }
+    println!("time mixed streams {streams} median_ms {:.3}", med(&mut full));
     Ok(())
 }

@@ -1861,6 +1861,9 @@ pub struct EmitConfig {
 
     #[arg(long, env = "PLOW_QWEN_AB_BLOCKS")]
     pub qwen_ab_blocks: Option<u32>,
+    /// Blocks of the frame-depth programs' grid-wide ops (default all).
+    #[arg(long, env = "PLOW_EMIT_DEPTH_UNITS")]
+    pub depth_units: Option<u32>,
 
     #[arg(long, env = "PLOW_QWEN_GDN_ISOLATE")]
     pub qwen_gdn_isolate: Option<u32>,
@@ -2353,6 +2356,9 @@ impl EmitConfig {
             qwen_ab_blocks: std::env::var("PLOW_QWEN_AB_BLOCKS")
                 .ok()
                 .map(|v| v.parse().expect("Qwen a/b block count")),
+            depth_units: std::env::var("PLOW_EMIT_DEPTH_UNITS")
+                .ok()
+                .map(|v| v.parse().expect("depth unit count")),
             qwen_gdn_isolate: env_u32("PLOW_QWEN_GDN_ISOLATE"),
             qwen_kv_interleave: env_bool("PLOW_QWEN_KV_INTERLEAVE"),
             qwen_prefill: std::env::var("PLOW_QWEN_PREFILL").ok(),

@@ -1502,6 +1502,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.qwen_projection_dag", Some("PLOW_QWEN_PROJECTION_DAG"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_share_quant", Some("PLOW_QWEN_SHARE_QUANT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_ab_blocks", Some("PLOW_QWEN_AB_BLOCKS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.depth_units", Some("PLOW_EMIT_DEPTH_UNITS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.qwen_prefill", Some("PLOW_QWEN_PREFILL"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.pf_gfuse", Some("PLOW_PF_GFUSE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.uniseg_max_t", Some("PLOW_UNISEG_MAX_T"), Layer::Emit, U32, UNSET, OPT_IN),

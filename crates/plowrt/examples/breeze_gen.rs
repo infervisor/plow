@@ -245,6 +245,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             t_depth.len()
         );
     }
+    // `GEN_DEPTH_SWEEP=N,S`: median depth-program time with the interpreter capped at every S-th
+    // instruction up to N (per-instruction attribution, as step_bench's sweep for decode).
+    if let Ok(v) = std::env::var("GEN_DEPTH_SWEEP") {
+        let (n, s) = v.split_once(',').unwrap_or((&v, "1"));
+        let (n, s): (u32, usize) = (n.parse()?, s.parse()?);
+        for cap in (0..=n).step_by(s) {
+            if !e.set_debug_max_inst(cap, 1)? {
+                return Err("decode object has no instruction cap".into());
+            }
+            let mut t = Vec::new();
+            for _ in 0..7 {
+                codes.clear();
+                let t0 = std::time::Instant::now();
+                e.fish_depth_step(&[row], &mut codes)?;
+                t.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            t.sort_by(f64::total_cmp);
+            println!("{{\"cap\":{cap},\"ms\":{:.4}}}", t[3]);
+        }
+        e.set_debug_max_inst(u32::MAX, 1)?;
+    }
     println!("prompt rows {n} frames {nf} -> {}", a[5]);
     Ok(())
 }

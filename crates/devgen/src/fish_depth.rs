@@ -338,7 +338,10 @@ fn program(
     let mut b = Builder::new(n_cu);
     b.adopt_tensors(tensors.to_vec());
     b.force_uniseg();
-    let all: Vec<u32> = (0..n_cu).collect();
+    let units = crate::emit_config::active()
+        .depth_units
+        .map_or(n_cu, |u| u.clamp(1, n_cu));
+    let all: Vec<u32> = (0..units).collect();
     let span = |units: u32| -> Vec<u32> { (0..units.clamp(1, n_cu)).collect() };
     let rset = span(rows);
     let (qd, kd) = (d.heads * d.head_dim, d.kv_heads * d.head_dim);
