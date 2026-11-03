@@ -655,6 +655,53 @@ fn rounded_silu_requires_its_object_marker() {
 }
 
 #[test]
+fn residual_f32_requires_its_object_marker() {
+    let path = Path::new("interp_prefill.elf");
+    for op in [
+        DevOp::Embed,
+        DevOp::RmsNorm,
+        DevOp::NormResidual,
+        DevOp::NormResidualNorm,
+    ] {
+        let mut p = segmented_prog(&[op], &[0]);
+        assert!(check_compiled_opcode_markers(&[], path, [&p]).is_ok());
+        p.insts[0].i[6] = packet::dev::RESIDUAL_F32_FLAG;
+        assert!(check_compiled_opcode_markers(&[], path, [&p])
+            .unwrap_err()
+            .to_string()
+            .contains("plow_residual_f32_1"));
+        assert!(check_compiled_opcode_markers(&["plow_residual_f32_1"], path, [&p]).is_ok());
+        for role in [
+            packet::devbuild::ProgramRole::PackedSibling { of_rows: 128 },
+            packet::devbuild::ProgramRole::TokenBatchBody { band: 0, rows: 128 },
+        ] {
+            p.role = role;
+            assert!(
+                check_compiled_opcode_markers(&["plow_residual_f32_1"], path, [&p])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("packed/token-batch")
+            );
+        }
+    }
+    let mut p = segmented_prog(&[DevOp::EmbedPosBf16], &[0]);
+    p.insts[0].i[7] = 2;
+    assert!(check_compiled_opcode_markers(&[], path, [&p]).is_ok());
+}
+
+#[test]
+fn residual_f32_preserves_existing_norm_stride_and_gemma3_flags() {
+    let path = Path::new("interp_prefill.elf");
+    for op in [DevOp::RmsNorm, DevOp::NormResidual, DevOp::NormResidualNorm] {
+        for flags in [1, 2, 8194, 131074] {
+            let mut p = segmented_prog(&[op], &[0]);
+            p.insts[0].i[7] = flags;
+            assert!(check_compiled_opcode_markers(&[], path, [&p]).is_ok());
+        }
+    }
+}
+
+#[test]
 fn block_fp8_split3_requires_marker_and_geometry() {
     let path = Path::new("interp_decode_gq.elf");
     let syms = [

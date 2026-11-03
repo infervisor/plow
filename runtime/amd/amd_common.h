@@ -22,6 +22,10 @@ typedef float f32x16 __attribute__((ext_vector_type(16)));
  * types it needs, so every primitive below can use the arch wrappers. */
 #include "amd_arch.h"
 
+#ifndef PLOW_PACKET_REQUIRES_RESIDUAL_F32
+#define PLOW_PACKET_REQUIRES_RESIDUAL_F32 0
+#endif
+
 /* ---------------------------------------------------------------------------
  * GLOBAL, AND SAY SO.
  *

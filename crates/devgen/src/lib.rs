@@ -98,6 +98,7 @@ mod mxfp4_moe_role;
 mod object_requirements;
 pub mod pipeline;
 mod projection_rewrite;
+mod residual_precision;
 mod rewrite_lower;
 pub mod rnnt;
 pub mod s3gen;
@@ -11380,6 +11381,8 @@ fn emit_dense_gqa(
         }
     }
 
+    residual_precision::apply(&mut m, ecfg.residual_f32, &arch)
+        .unwrap_or_else(|error| panic!("residual precision: {error}"));
     let projection_bindings =
         projection_rewrite::apply(&mut m, &ecfg, &gpu, &arch, std::path::Path::new(&out))
             .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));
