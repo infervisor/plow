@@ -1505,6 +1505,25 @@ if [ "${PLOW_TOKEN_BATCH_TP_OBJECTS:-0}" = 1 ]; then
   )
 fi
 
+# A gfx1201 config build drops the `_k3` rows for a packet with none of the opcodes that select
+# them (object.rs PrefillArm::detect: AttnRes, SituGlu, MlaOutGate, Kda*): the loader never opens
+# a `_k3` object for such a packet, and at decode batch 1 the k3 decode rows overflow the 64 KiB
+# arena by 8 B (gfx942 too). CDNA object sets are left as shipped.
+if [ -n "$CFG" ] && [ "$ARCH" = gfx1201 ]; then
+  k3=0
+  for op in ATTN_RES SITU_GLU MLA_OUT_GATE KDA_STATE_STEP KDA_STATE_STEP_G KDA_CONV KDA_CONV3 \
+            KDA_GATED_NORM; do
+    [ "$(cfg_get "PLOW_PACKET_HAS_$op")" = 1 ] && k3=1
+  done
+  if [ "$k3" = 0 ]; then
+    KEPT=()
+    for row in "${ROWS[@]}"; do
+      case "${row%%|*}" in *_k3|*_k3_*) ;; *) KEPT+=("$row") ;; esac
+    done
+    ROWS=("${KEPT[@]}")
+  fi
+fi
+
 # PLOW_ROWS_ONLY=<substring> (or =<exact-stem>): build only matching rows — for iterating on
 # ONE object family (e.g. interp_flash) without paying the full 28-object build. The
 # resulting dir is PARTIAL; copy it over a full set before serving from it.

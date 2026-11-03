@@ -1037,6 +1037,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.kv_map_next_chunk", Some("PLOW_KV_MAP_NEXT_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.publish_defer", Some("PLOW_AMD_PUBLISH_DEFER"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.hsa_drain_blocked", Some("PLOW_HSA_DRAIN_BLOCKED"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.hang_timeout_s", Some("PLOW_AMD_HANG_TIMEOUT_S"), Layer::Runtime, USIZE, Default::Static(Val::Nat(300)), PROMOTED),
     KnobSpec::new("rt.engine_affinity", Some("PLOW_AMD_ENGINE_AFFINITY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("auto")), OPT_IN),
     KnobSpec::new("rt.shared_prefix", Some("PLOW_AMD_SHARED_PREFIX"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.upload_slots", Some("PLOW_UPLOAD_SLOTS"), Layer::Runtime, U32, Default::Static(Val::Nat(1)), OPT_IN),

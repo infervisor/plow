@@ -1,0 +1,406 @@
+/* Build from the repo root inside nix develop:
+ * cc -O2 -std=gnu11 -Wall -Wextra -Werror runtime/tests/amd_opcode_test.c \
+ *   runtime/amd/hsa_backend.c -I"$ROCM_PATH/include" -L"$ROCM_PATH/lib" \
+ *   -Wl,-rpath,"$ROCM_PATH/lib" -lhsa-runtime64 -lm -o /tmp/amd_opcode_test
+ * Run beside test_kernels.elf, through gpuq:
+ *   amd_opcode_test interp_prefill.elf
+ *   amd_opcode_test interp_tokbatch.elf token-batch
+ * The second run uses the build script's four-wave interp_tokbatch object
+ * (PLOW_TOKEN_BATCH=1, PLOW_TOKEN_BATCH_DESC=1, PLOW_MIXED_STEP=1). It checks live
+ * rows below capacity with untouched padding for PER_LAYER_INPUT and embeddings.
+ * test_kernels.elf and this host must have matching PLOW_WG_WAVES (default 8).
+ * The current interp_tokbatch build is blocked by op_norm.h's unrelated
+ * d_rmsnorm_q128 static_assert(rn_groups == 1); the live-row cases await that fix.
+ * GEMV_ARGMAX has fixed sample rows; its packet case checks i4 and operand slots.
+ * Trap cases are intentionally omitted: this HSA harness has no recoverable
+ * device-trap isolation, so a trap may hang the queue/device.
+ * Ragged-K GEMV is compared to zero-padded, eight-aligned ordinary GEMV.
+ */
+#include "../amd/hsa_backend.h"
+#include "../common/dev_isa.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef uint16_t bf16;
+static unsigned rng = 12345;
+static int fails;
+static int token_batch;
+static plow_hsa_kernel interp;
+static float bf2f(bf16 b) { unsigned u = (unsigned)b << 16; float f; memcpy(&f, &u, 4); return f; }
+static bf16 f2bf(float f) {
+    unsigned u; memcpy(&u, &f, 4);
+    return (bf16)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+static float roundbf(float f) { return bf2f(f2bf(f)); }
+static float random_value(void) {
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return ((int)(rng % 257) - 128) / 256.0f;
+}
+static void* alloc(plow_hsa* h, size_t bytes) {
+    void* p = plow_hsa_alloc_host(h, bytes);
+    if (!p) { fprintf(stderr, "%s\n", plow_hsa_last_error()); exit(1); }
+    memset(p, 0, bytes);
+    return p;
+}
+static bf16* random_bf(plow_hsa* h, size_t n) {
+    bf16* p = alloc(h, n * sizeof(*p));
+    for (size_t i = 0; i < n; i++) p[i] = f2bf(random_value());
+    return p;
+}
+static void launch(plow_hsa* h, const char* name, unsigned blocks, void* args, size_t size) {
+    plow_hsa_kernel k;
+    if (plow_hsa_get_kernel(h, 0, name, &k) ||
+        plow_hsa_launch(h, 0, &k, blocks * PLOW_WG_THREADS, 1, 1,
+                        PLOW_WG_THREADS, 1, 1, 0, args, size) || plow_hsa_wait(h, 0)) {
+        fprintf(stderr, "%s: %s\n", name, plow_hsa_last_error()); exit(1);
+    }
+}
+static void check(const char* name, const bf16* got, const bf16* ref, size_t n, float tol) {
+    for (size_t i = 0; i < n; i++) {
+        float a = bf2f(got[i]), b = bf2f(ref[i]);
+        if (!isfinite(a) || fabsf(a - b) > tol * (1.0f + fabsf(b))) {
+            fprintf(stderr, "%s[%zu]: %.8g vs %.8g\n", name, i, a, b);
+            fails++; return;
+        }
+    }
+}
+static uint64_t pack(bf16 b, unsigned i) {
+    unsigned u = (b & 0x8000u) ? (unsigned)(bf16)~b : (unsigned)(b | 0x8000u);
+    return ((uint64_t)u << 32) | (uint32_t)~i;
+}
+
+static void exact(const char* name, const void* got, const void* ref, size_t bytes) {
+    if (memcmp(got, ref, bytes)) { fprintf(stderr, "%s: byte mismatch\n", name); fails++; }
+}
+
+static PlowDevInst instruction(unsigned op, void* tensors[8]) {
+    PlowDevInst in = {0};
+    in.op = op;
+    for (unsigned i = 0; i < 8; i++) in.t[i] = tensors[i] ? i : PLOW_TENSOR_NONE;
+    return in;
+}
+
+static void packet(plow_hsa* h, PlowDevInst in, void* tensors[8], unsigned blocks,
+                   unsigned live_rows) {
+    PlowDevInst* inst = alloc(h, sizeof(*inst));
+    PlowStreamEnt* stream = alloc(h, blocks * sizeof(*stream));
+    uint32_t *ofs = alloc(h, blocks * 4), *len = alloc(h, blocks * 4);
+    void** table = alloc(h, 8 * sizeof(*table));
+    PlowTokenBatch* tb = alloc(h, sizeof(*tb));
+    PlowPrefillSpan* span = alloc(h, sizeof(*span));
+    *inst = in;
+    inst->blocks = blocks;
+    /* Reverse handles so dispatch must resolve the operand table, not slot indices. */
+    for (unsigned i = 0; i < 8; i++) {
+        table[7 - i] = tensors[i];
+        if (inst->t[i] != PLOW_TENSOR_NONE) inst->t[i] = 7 - i;
+    }
+    for (unsigned b = 0; b < blocks; b++) {
+        ofs[b] = b; len[b] = 1; stream[b].slice = b;
+    }
+    tb->version = PLOW_TOKEN_BATCH_VERSION;
+    tb->row_capacity = in.i[0]; tb->real_rows = live_rows;
+    tb->n_spans = 1; tb->spans = span; span->n_rows = live_rows;
+    span->kv_len = live_rows; span->flags = PLOW_PREFILL_SPAN_RESET_STATE;
+    PlowProgram prog = {0};
+    prog.insts = inst; prog.stream = stream; prog.stream_ofs = ofs; prog.stream_len = len;
+    prog.tensors = table; prog.token_batch = token_batch ? tb : NULL;
+    const unsigned threads = token_batch ? 256u : PLOW_WG_THREADS;
+    if (plow_hsa_launch(h, 0, &interp, blocks * threads, 1, 1,
+                        threads, 1, 1, 0, &prog, sizeof(prog)) || plow_hsa_wait(h, 0)) {
+        fprintf(stderr, "packet op %u: %s\n", in.op, plow_hsa_last_error()); exit(1);
+    }
+    plow_hsa_free(h, inst); plow_hsa_free(h, stream); plow_hsa_free(h, ofs);
+    plow_hsa_free(h, len); plow_hsa_free(h, table); plow_hsa_free(h, tb); plow_hsa_free(h, span);
+}
+
+static void finish_argmax(plow_hsa* h, int* ids, uint64_t* part, unsigned blocks, unsigned M) {
+    struct { int* ids; uint64_t* part; unsigned blocks, M; } args = {ids, part, blocks, M};
+    launch(h, "argmax_fin_test", 1, &args, sizeof(args));
+}
+
+/* pattern 0: random/tied maxima; 1: rounding boundary; 2: negative last winner;
+ * 3: nonzero interior winner; 4: last winner; 5/6: at/below the rounding tie. */
+static void gemv(plow_hsa* h, unsigned M, unsigned N, unsigned K, unsigned blocks,
+                 float cap, unsigned pattern) {
+    bf16* x = random_bf(h, (M + 1) * K);
+    bf16* w = random_bf(h, N * K);
+    bf16* out = random_bf(h, M * N);
+    bf16* raw = alloc(h, M * N * 2);
+    bf16* ref = alloc(h, M * N * 2);
+    uint64_t *part = alloc(h, M * blocks * 8), *refpart = alloc(h, M * blocks * 8);
+    int *ids = alloc(h, M * 4), *refids = alloc(h, M * 4);
+    unsigned winner = pattern >= 5 ? 0u : pattern == 1 ? 1u : pattern == 3 ? N / 2 : pattern ? N - 1 : 0;
+    if (!pattern) {
+        for (unsigned k = 0; k < K; k++) w[k] = w[(N - 1) * K + k] = f2bf(1.0f);
+        for (unsigned m = 1; m <= M; m++)
+            for (unsigned k = 0; k < K; k++) x[m * K + k] = f2bf(fabsf(bf2f(x[m * K + k])));
+    } else {
+        memset(w, 0, N * K * 2);
+        for (unsigned m = 1; m <= M; m++)
+            for (unsigned k = 0; k < K; k++) x[m * K + k] = f2bf(1.0f);
+        if (pattern == 1 || pattern >= 5) {
+            w[0] = w[K] = f2bf(1.0f); w[K + 1] = f2bf(0x1p-8f);
+            const float tail = pattern == 1 ? 0x1p-25f : pattern == 5 ? 0.0f : -0x1p-25f;
+            for (unsigned k = 512; k < 520; k++) w[K + k] = f2bf(tail);
+        } else {
+            for (unsigned n = 0; n < N; n++) w[n * K] = f2bf(-2.0f);
+            w[winner * K] = f2bf(pattern == 2 ? -1.0f : 1.0f);
+        }
+    }
+    const unsigned refK = (K + 7u) & ~7u;
+    bf16 *refx = alloc(h, M * refK * 2), *refw = alloc(h, N * refK * 2);
+    for (unsigned m = 0; m < M; m++) memcpy(refx + m * refK, x + (m + 1) * K, K * 2);
+    for (unsigned n = 0; n < N; n++) memcpy(refw + n * refK, w + n * K, K * 2);
+    struct { bf16 *out, *x, *w; unsigned M, N, K; } ga = {raw, refx, refw, M, N, refK};
+    launch(h, "gemv_unfused_test", blocks, &ga, sizeof(ga));
+    if (cap > 0) {
+        struct { bf16 *out, *x; unsigned n; float cap; } sa = {ref, raw, M * N, cap};
+        launch(h, "gemma_logit_softcap_bf16", blocks, &sa, sizeof(sa));
+    } else memcpy(ref, raw, M * N * 2);
+    struct { uint64_t* part; bf16* x; unsigned N, M; } aa = {refpart, ref, N, M};
+    launch(h, "argmax_test", blocks, &aa, sizeof(aa));
+    finish_argmax(h, refids, refpart, blocks, M);
+    for (unsigned m = 0; m < M; m++) {
+        if ((unsigned)refids[m] != winner) {
+            fprintf(stderr, "unfused pattern %u cap %g: token %d vs %u\n", pattern, cap, refids[m], winner);
+            fails++;
+        }
+    }
+    struct { bf16 *out, *x, *w; uint64_t* part; unsigned M, N, K; float cap; }
+        args = {out, x + K, w, part, M, N, K, cap};
+    launch(h, "gemv_argmax_test", blocks, &args, sizeof(args));
+    exact("gemv logits", out, ref, M * N * 2);
+    finish_argmax(h, ids, part, blocks, M);
+    exact("gemv token", ids, refids, M * 4);
+    for (unsigned m = 0; m < M; m++) for (unsigned b = 0; b < blocks; b++) {
+        unsigned per = (N + blocks - 1) / blocks;
+        uint64_t best = 0;
+        for (unsigned n = b * per; n < N && n < (b + 1) * per; n++) {
+            uint64_t key = pack(ref[m * N + n], n);
+            if (key > best) best = key;
+        }
+        exact("argmax partial", part + m * blocks + b, &best, sizeof(best));
+    }
+    memset(out, 0xa5, M * N * 2); memset(part, 0xa5, M * blocks * 8);
+    void* tensors[8] = {out, x, w, part};
+    PlowDevInst in = instruction(PLOW_DOP_GEMV_ARGMAX, tensors);
+    in.i[0] = M; in.i[1] = N; in.i[2] = K; in.i[4] = 1; in.fj[0].f = cap;
+    packet(h, in, tensors, blocks, M);
+    exact("packet gemv logits", out, ref, M * N * 2);
+    finish_argmax(h, ids, part, blocks, M);
+    exact("packet gemv token", ids, refids, M * 4);
+    plow_hsa_free(h, x); plow_hsa_free(h, w); plow_hsa_free(h, out); plow_hsa_free(h, raw);
+    plow_hsa_free(h, ref); plow_hsa_free(h, part); plow_hsa_free(h, refpart);
+    plow_hsa_free(h, ids); plow_hsa_free(h, refids);
+    plow_hsa_free(h, refx); plow_hsa_free(h, refw);
+}
+
+static void per_layer(plow_hsa* h, unsigned rows, unsigned H, unsigned P, int next) {
+    const unsigned col0 = 7, stride = P + 19, capacity = rows + 2;
+    const float eps = 1e-6f, scalar = 0.75f;
+    bf16 *x = random_bf(h, capacity * H), *wg = random_bf(h, P * H), *wp = random_bf(h, H * P);
+    bf16 *gamma = random_bf(h, H), *ple = random_bf(h, capacity * stride), *gnext = random_bf(h, H);
+    bf16* hn = random_bf(h, capacity * H);
+    bf16* initial = malloc(capacity * H * 2);
+    memcpy(initial, x, capacity * H * 2);
+    bf16* ref = malloc(rows * H * 2), *nr = malloc(rows * H * 2);
+    float* a = malloc(P * sizeof(float)), *y = malloc(H * sizeof(float));
+    memcpy(ref, x, rows * H * 2);
+    for (unsigned t = 0; t < rows; t++) {
+        for (unsigned p = 0; p < P; p++) {
+            double sum = 0;
+            for (unsigned j = 0; j < H; j++) sum += (double)bf2f(wg[p * H + j]) * bf2f(ref[t * H + j]);
+            float v = roundbf((float)sum);
+            float g = roundbf(0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v))));
+            a[p] = roundbf(g * bf2f(ple[t * stride + col0 + p]));
+        }
+        double ss = 0;
+        for (unsigned j = 0; j < H; j++) {
+            double sum = 0;
+            for (unsigned p = 0; p < P; p++) sum += (double)bf2f(wp[j * P + p]) * a[p];
+            y[j] = roundbf((float)sum); ss += (double)y[j] * y[j];
+        }
+        float inv = 1.0f / sqrtf((float)ss / H + eps);
+        ss = 0;
+        for (unsigned j = 0; j < H; j++) {
+            float n = roundbf(y[j] * inv * (next == 2 ? 1.0f : bf2f(gamma[j])));
+            ref[t * H + j] = f2bf(roundbf(bf2f(ref[t * H + j]) + n) * scalar);
+            float v = bf2f(ref[t * H + j]); ss += (double)v * v;
+        }
+        inv = 1.0f / sqrtf((float)ss / H + eps);
+        for (unsigned j = 0; j < H; j++) nr[t * H + j] = f2bf(bf2f(ref[t * H + j]) * inv * (next == 2 ? 1.0f : bf2f(gnext[j])));
+    }
+    struct { bf16 *x, *wg, *wp, *gamma, *ple, *hn, *gnext; unsigned rows, H, P, col0, stride; float eps, scalar; }
+        args = {x, wg, wp, next == 2 ? NULL : gamma, ple, next ? hn : NULL,
+                next == 2 ? NULL : gnext, rows, H, P, col0, stride, eps, scalar};
+    launch(h, "per_layer_input_test", 3, &args, sizeof(args));
+    check("per-layer x", x, ref, rows * H, 0.025f);
+    if (next) check("per-layer next", hn, nr, rows * H, 0.025f);
+    void* tensors[8] = {x, wg, wp, args.gamma, ple, args.hn, args.gnext};
+    PlowDevInst in = instruction(PLOW_DOP_PER_LAYER_INPUT, tensors);
+    in.i[0] = token_batch ? capacity : rows; in.i[1] = H; in.i[2] = P;
+    in.i[3] = col0; in.i[4] = stride; in.fj[0].f = eps; in.fj[1].f = scalar;
+    const unsigned block_counts[] = {1, 3, rows + 2};
+    for (unsigned b = 0; b < sizeof(block_counts) / sizeof(block_counts[0]); b++) {
+        /* Reuse GPU-written host memory: dispatch must acquire the CPU reset. */
+        memcpy(x, initial, capacity * H * 2);
+        memset(hn, 0xa5, capacity * H * 2);
+        packet(h, in, tensors, block_counts[b], rows);
+        check("packet per-layer x", x, ref, rows * H, 0.025f);
+        if (next) check("packet per-layer next", hn, nr, rows * H, 0.025f);
+        exact("per-layer padding", x + rows * H, initial + rows * H, 2 * H * 2);
+    }
+    memset(initial, 0xa5, 2 * H * 2);
+    exact("per-layer next padding", hn + rows * H, initial, 2 * H * 2);
+    free(initial); free(ref); free(nr); free(a); free(y);
+    plow_hsa_free(h, x); plow_hsa_free(h, wg); plow_hsa_free(h, wp); plow_hsa_free(h, gamma);
+    plow_hsa_free(h, ple); plow_hsa_free(h, gnext); plow_hsa_free(h, hn);
+}
+
+static void embeds(plow_hsa* h, unsigned width) {
+    const unsigned rows = 7, capacity = 9, vocab = 13, overlays = 3, positions = 9, K = 3, cb_size = 5;
+    bf16 *table = random_bf(h, vocab * width), *pt = random_bf(h, positions * width);
+    bf16 *cb = random_bf(h, K * cb_size * width), *out = random_bf(h, capacity * width);
+    bf16* ref = malloc(capacity * width * 2);
+    bf16* initial = malloc(capacity * width * 2);
+    memcpy(initial, out, capacity * width * 2);
+    float *ov = alloc(h, overlays * width * 4), *nw = alloc(h, width * 4);
+    unsigned *tok = alloc(h, capacity * 4), *sel = alloc(h, capacity * 4), *pos = alloc(h, capacity * 4);
+    unsigned *base = alloc(h, capacity * 4), *codes = alloc(h, capacity * K * 4);
+    for (unsigned i = 0; i < overlays * width; i++) ov[i] = random_value() * 1.003f;
+    for (unsigned i = 0; i < width; i++) nw[i] = 1.0f + random_value();
+    for (unsigned r = 0; r < rows; r++) {
+        tok[r] = r + 1; base[r] = 100 + r * 3; pos[r] = base[r] + r;
+        sel[r] = r % 3 == 0 ? UINT32_MAX : (r % 3 == 1 ? UINT32_MAX - 1 : r % overlays);
+        for (unsigned k = 0; k < K; k++) codes[r * K + k] = (r + k) % cb_size;
+    }
+    memcpy(ref, out, capacity * width * 2);
+    for (unsigned r = 0; r < rows; r++) for (unsigned i = 0; i < width; i++) {
+        if (sel[r] == UINT32_MAX) ref[r * width + i] = table[tok[r] * width + i];
+        else if (sel[r] != UINT32_MAX - 1) ref[r * width + i] = f2bf(ov[sel[r] * width + i]);
+    }
+    struct { bf16 *out, *table; unsigned* tok; float* ov; unsigned* sel; unsigned rows, width, vocab, overlays; }
+        oa = {out, table, tok, ov, sel, rows, width, vocab, overlays};
+    launch(h, "embed_overlay_bf16_test", 3, &oa, sizeof(oa));
+    check("overlay", out, ref, rows * width, 0);
+    memcpy(out, initial, capacity * width * 2);
+    void* tensors[8] = {out, table, tok, ov, sel};
+    PlowDevInst in = instruction(PLOW_DOP_EMBED_OVERLAY_BF16, tensors);
+    in.i[0] = token_batch ? capacity : rows; in.i[1] = width;
+    in.i[2] = vocab; in.i[3] = overlays;
+    packet(h, in, tensors, 3, rows);
+    exact("packet overlay", out, ref, capacity * width * 2);
+    for (unsigned r = 0; r < rows; r++) for (unsigned i = 0; i < width; i++)
+        ref[r * width + i] = f2bf(bf2f(table[tok[r] * width + i]) + bf2f(pt[(pos[r] - base[r]) * width + i]));
+    struct { bf16 *out, *table; unsigned* tok; bf16* pt; unsigned *pos, *base; unsigned rows, width, vocab, positions; }
+        pa = {out, table, tok, pt, pos, base, rows, width, vocab, positions};
+    launch(h, "embed_pos_bf16_test", 3, &pa, sizeof(pa));
+    check("position", out, ref, rows * width, 0);
+    memcpy(out, initial, capacity * width * 2);
+    tensors[3] = pt; tensors[4] = pos; tensors[5] = base;
+    in = instruction(PLOW_DOP_EMBED_POS_BF16, tensors);
+    in.i[0] = token_batch ? capacity : rows; in.i[1] = width;
+    in.i[2] = vocab; in.i[3] = positions;
+    packet(h, in, tensors, 3, rows);
+    exact("packet position", out, ref, capacity * width * 2);
+    for (unsigned mode = 0; mode < 4; mode++) {
+        for (unsigned r = 0; r < rows; r++) {
+            double ss = 0;
+            for (unsigned i = 0; i < width; i++) {
+                if (tok[r] - 3u >= 3u) { ref[r * width + i] = table[tok[r] * width + i]; continue; }
+                float sum = 0;
+                for (unsigned k = 0; k < K; k++) sum += bf2f(cb[(k * cb_size + codes[r * K + k]) * width + i]);
+                float v = roundbf(sum);
+                if (!(mode & 1)) v = roundbf(bf2f(table[tok[r] * width + i]) + v);
+                ref[r * width + i] = f2bf(v / 1.75f);
+                v = bf2f(ref[r * width + i]); ss += (double)v * v;
+            }
+            if ((mode & 2) && tok[r] - 3u < 3u) {
+                float inv = 1.0f / sqrtf((float)ss / width + 1e-5f);
+                for (unsigned i = 0; i < width; i++) ref[r * width + i] = f2bf(bf2f(ref[r * width + i]) * inv * nw[i]);
+            }
+        }
+        struct { bf16 *out, *table; unsigned* tok; bf16* cb; unsigned* codes; float* nw;
+                 unsigned rows, width, vocab, K, cb_size, frame_lo, frame_rows, mode; float div, eps; }
+            fa = {out, table, tok, cb, codes, (mode & 2) ? nw : NULL,
+                  rows, width, vocab, K, cb_size, 3, 3, mode, 1.75f, 1e-5f};
+        launch(h, "embed_frame_bf16_test", 3, &fa, sizeof(fa));
+        check("frame", out, ref, rows * width, (mode & 2) ? 0.01f : 0);
+        memcpy(out, initial, capacity * width * 2);
+        tensors[3] = cb; tensors[4] = codes; tensors[5] = fa.nw;
+        in = instruction(PLOW_DOP_EMBED_FRAME_BF16, tensors);
+        in.i[0] = token_batch ? capacity : rows; in.i[1] = width;
+        in.i[2] = vocab; in.i[3] = K; in.i[4] = cb_size;
+        in.i[5] = 3; in.i[6] = 3; in.i[7] = mode;
+        in.fj[0].f = 1.75f; in.fj[1].f = 1e-5f;
+        packet(h, in, tensors, 3, rows);
+        check("packet frame", out, ref, rows * width, (mode & 2) ? 0.01f : 0);
+        exact("frame padding", out + rows * width, initial + rows * width, 2 * width * 2);
+    }
+    free(initial); free(ref); plow_hsa_free(h, table); plow_hsa_free(h, pt); plow_hsa_free(h, cb); plow_hsa_free(h, out);
+    plow_hsa_free(h, ov); plow_hsa_free(h, nw); plow_hsa_free(h, tok); plow_hsa_free(h, sel);
+    plow_hsa_free(h, pos); plow_hsa_free(h, base); plow_hsa_free(h, codes);
+}
+
+static void load_object(plow_hsa* h, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { perror(path); exit(1); }
+    fseek(f, 0, SEEK_END); long bytes = ftell(f); rewind(f);
+    if (bytes <= 0) exit(1);
+    void* elf = malloc((size_t)bytes);
+    if (!elf || fread(elf, 1, (size_t)bytes, f) != (size_t)bytes) exit(1);
+    fclose(f);
+    if (plow_hsa_load_code_object(h, 0, elf, (size_t)bytes)) {
+        fprintf(stderr, "%s: %s\n", path, plow_hsa_last_error()); exit(1);
+    }
+    free(elf);
+}
+
+int main(int argc, char** argv) {
+    if (argc > 3 || (argc == 3 && strcmp(argv[2], "token-batch"))) {
+        fprintf(stderr, "usage: %s [interp_prefill.elf | interp_tokbatch.elf token-batch]\n", argv[0]);
+        return 1;
+    }
+    token_batch = argc == 3;
+    plow_hsa* h = plow_hsa_init();
+    if (!h) { fprintf(stderr, "%s\n", plow_hsa_last_error()); return 1; }
+    load_object(h, argc > 1 ? argv[1] : "interp_prefill.elf");
+    char arch[64], symbol[96];
+    uint32_t cus, lds_bytes;
+    if (plow_hsa_device_info(h, 0, arch, &cus, &lds_bytes)) return 1;
+    snprintf(symbol, sizeof(symbol), token_batch ? "plow_interp_tokbatch_%s" : "plow_interp_%s", arch);
+    if (plow_hsa_get_kernel(h, 0, symbol, &interp)) {
+        fprintf(stderr, "%s: %s\n", symbol, plow_hsa_last_error()); return 1;
+    }
+    load_object(h, "test_kernels.elf");
+    unsigned* threads = alloc(h, sizeof(*threads));
+    struct { unsigned* out; } probe = {threads};
+    launch(h, "plow_probe_wg_threads", 1, &probe, sizeof(probe));
+    if (*threads != PLOW_WG_THREADS) { fprintf(stderr, "workgroup width mismatch\n"); return 1; }
+    for (unsigned i = 0; i < 8; i++) {
+        const unsigned value = 0x12340000u + i * 257u;
+        *threads = value;
+        launch(h, "plow_probe_host_roundtrip", 1, &probe, sizeof(probe));
+        if (*threads != value + 1u) {
+            fprintf(stderr, "host-memory roundtrip: %u vs %u\n", *threads, value + 1u);
+            return 1;
+        }
+    }
+    plow_hsa_free(h, threads);
+    gemv(h, 1, 259, 512, 3, 0, 0); gemv(h, 3, 259, 520, 5, 30, 0);
+    gemv(h, 2, 7, 67, 11, 0, 0); gemv(h, 1, 259, 3840, 3, 30, 0);
+    gemv(h, 1, 259, 8192, 3, 0, 0);
+    for (unsigned pattern = 1; pattern <= 6; pattern++) {
+        gemv(h, 2, 19, 1024, 3, 0, pattern);
+        gemv(h, 2, 19, 1024, 3, 30, pattern);
+    }
+    per_layer(h, 1, 1536, 256, 0); per_layer(h, 7, 64, 32, 1);
+    per_layer(h, 3, 67, 35, 2); per_layer(h, 1, 2560, 256, 1);
+    embeds(h, 64); embeds(h, 67); embeds(h, 1024);
+    plow_hsa_shutdown(h);
+    printf("amd_opcode_test: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
+    return fails != 0;
+}
