@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 
 #include "sm120_common.cuh"
 #include "op_norm.cuh"
@@ -158,8 +159,8 @@ int main(int argc, char** argv) {
         bf16* d_s = nullptr; CK(cudaMalloc(&d_s, H * sizeof(bf16)));
         CK(cudaMemcpy(d_s, hs.data(), H * sizeof(bf16), cudaMemcpyHostToDevice));
         const unsigned BMAX = 32;
-        std::vector<bf16> hx((size_t)BMAX * H);
-        for (auto& v : hx) v = __float2bfloat16(rnd() * 2.0f);
+        std::vector<bf16> hx((size_t)BMAX * H), hx0(H);
+        for (auto& v : hx0) v = __float2bfloat16(rnd() * 2.0f);
         bf16* d_x = nullptr; CK(cudaMalloc(&d_x, hx.size() * sizeof(bf16)));
         float* d_sc = nullptr; CK(cudaMalloc(&d_sc, (size_t)BMAX * n_exp * sizeof(float)));
         unsigned char* d_tb = nullptr; CK(cudaMalloc(&d_tb, (size_t)BMAX * k * 8));
@@ -167,24 +168,32 @@ int main(int argc, char** argv) {
         std::vector<float> s1(n_exp), sb(n_exp);
         std::vector<unsigned char> t1(k * 8), tb(k * 8);
         bool ok = true;
-        for (unsigned B : {1u, 2u, 4u, 8u, 16u, 32u}) {
-            for (unsigned r = 1; r < B; r++)  /* fresh companions per rung */
-                for (unsigned h = 0; h < H; h++) hx[(size_t)r * H + h] = __float2bfloat16(rnd() * 2.0f);
-            CK(cudaMemcpy(d_x, hx.data(), (size_t)B * H * sizeof(bf16), cudaMemcpyHostToDevice));
-            k_score_fast<<<(B * n_exp + 7u) / 8u, 256, arena_bytes>>>(d_sc, d_x, d_proj, d_s, H, n_exp, root, 1e-6f, B);
-            k_topk<<<B, 256, arena_bytes>>>(d_tb, d_sc, d_pes, n_exp, k, B);
-            CK(cudaDeviceSynchronize());
-            CK(cudaMemcpy(sb.data(), d_sc, n_exp * sizeof(float), cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(tb.data(), d_tb, k * 8, cudaMemcpyDeviceToHost));
-            if (B == 1) { s1 = sb; t1 = tb; continue; }
-            const bool same_s = memcmp(s1.data(), sb.data(), n_exp * sizeof(float)) == 0;
-            const bool same_t = memcmp(t1.data(), tb.data(), k * 8) == 0;
-            printf("ROW_INVARIANT B=%u scores %s table %s\n", B, same_s ? "same" : "DIFF", same_t ? "same" : "DIFF");
-            ok = ok && same_s && same_t;
+        /* The reference row sits first, then last: placement must not matter either. */
+        for (unsigned at_end = 0; at_end < 2; at_end++) {
+            for (unsigned B : {1u, 2u, 4u, 8u, 16u, 32u}) {
+                const unsigned ref = at_end ? B - 1 : 0;
+                for (unsigned r = 0; r < B; r++)  /* fresh companions per rung */
+                    for (unsigned h = 0; h < H; h++)
+                        hx[(size_t)r * H + h] = r == ref ? hx0[h] : __float2bfloat16(rnd() * 2.0f);
+                CK(cudaMemcpy(d_x, hx.data(), (size_t)B * H * sizeof(bf16), cudaMemcpyHostToDevice));
+                /* the packet's score grid: 8 pairs per CTA, at most one CTA per SM */
+                const unsigned gs = std::min((B * n_exp + 7u) / 8u, grid);
+                k_score_fast<<<gs, 256, arena_bytes>>>(d_sc, d_x, d_proj, d_s, H, n_exp, root, 1e-6f, B);
+                k_topk<<<B, 256, arena_bytes>>>(d_tb, d_sc, d_pes, n_exp, k, B);
+                CK(cudaDeviceSynchronize());
+                CK(cudaMemcpy(sb.data(), d_sc + (size_t)ref * n_exp, n_exp * sizeof(float), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(tb.data(), d_tb + (size_t)ref * k * 8, k * 8, cudaMemcpyDeviceToHost));
+                if (B == 1 && !at_end) { s1 = sb; t1 = tb; continue; }
+                const bool same_s = memcmp(s1.data(), sb.data(), n_exp * sizeof(float)) == 0;
+                const bool same_t = memcmp(t1.data(), tb.data(), k * 8) == 0;
+                printf("ROW_INVARIANT B=%u row=%u scores %s table %s\n", B, ref, same_s ? "same" : "DIFF",
+                       same_t ? "same" : "DIFF");
+                ok = ok && same_s && same_t;
+            }
         }
         printf("ROW_INVARIANT %s\n", ok ? "PASS" : "FAIL");
         cudaFree(d_s); cudaFree(d_x); cudaFree(d_sc); cudaFree(d_tb);
-        if (!ok || getenv("MOE_CHECK_ONLY")) return ok ? 0 : 1;
+        if (getenv("MOE_CHECK_ONLY")) return ok ? 0 : 1;
     }
 
     printf("\n%6s | %10s %10s %10s %10s | %9s %9s\n",
