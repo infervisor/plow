@@ -1609,6 +1609,18 @@ impl HsaBackend {
         Err(self.fault(rc, what))
     }
 
+    fn check_vram_allocation(&self, rc: i32, bytes: u64, what: &str) -> Result<()> {
+        if rc == 0x1008 && self.device_name == "gfx1201" {
+            let available = crate::memory::vmm::VmmOps::free_bytes(self)
+                .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());
+            return Err(RuntimeError::Rejected(format!(
+                "AMD VRAM capacity exhausted: allocation requested {bytes} bytes, available {available} bytes, device capacity {} bytes; use fewer decode slots or a lower max_ctx",
+                self.vram_bytes()
+            )));
+        }
+        self.check(rc, what)
+    }
+
     /// [`HsaBackend::check`]'s error-building half, for sites that must run
     /// cleanup between the failing call and the `return Err`.
     fn fault(&self, rc: i32, what: &str) -> RuntimeError {
@@ -1787,7 +1799,11 @@ impl Backend for HsaBackend {
                 &mut ptr,
             )
         };
-        self.check(rc, &format!("hsa_amd_memory_pool_allocate({bytes} bytes)"))?;
+        self.check_vram_allocation(
+            rc,
+            bytes,
+            &format!("hsa_amd_memory_pool_allocate({bytes} bytes)"),
+        )?;
         let free = Arc::new(HsaFree {
             shared: self.shared.clone(),
         });
@@ -4551,7 +4567,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
                 &mut h,
             )
         };
-        self.check(rc, &format!("hsa_amd_vmem_handle_create({bytes} B)"))?;
+        self.check_vram_allocation(rc, bytes, &format!("hsa_amd_vmem_handle_create({bytes} B)"))?;
         provenance.created(h.handle, bytes);
         Ok(h.handle)
     }
@@ -4629,8 +4645,9 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
                 &mut ptr,
             )
         };
-        self.check(
+        self.check_vram_allocation(
             rc,
+            bytes,
             &format!("hsa_amd_memory_pool_allocate(vmm snapshot, {bytes} B)"),
         )?;
         self.vmm_provenance.lock().allocated(ptr as u64, bytes);

@@ -12,6 +12,68 @@ fn vmm_kv_is_automatic_only_for_an_impossible_flat_slab() {
 }
 
 #[test]
+fn slab_layout_keeps_legacy_arena_and_excludes_external_views() {
+    let tensors = [
+        ("act.x", 1),
+        ("model.layer.weight", 4097),
+        ("kv.0.k", 1 << 20),
+        ("act.og_tp", 1 << 20),
+        ("model.layer.weight@band1", 4096),
+        ("model.empty.weight", 0),
+    ]
+    .map(|(name, bytes)| DevTensor {
+        name: name.into(),
+        bytes,
+        init: None,
+    });
+    let owned = |id, _: &str| !matches!(id, 2 | 3 | 4);
+    let legacy = tensor_slab_layout(&tensors, owned, false);
+    assert_eq!(
+        legacy.offsets,
+        [Some(0), Some(4096), None, None, None, Some(12288)]
+    );
+    assert_eq!(legacy.bytes, 16384);
+    assert_eq!(legacy.resident_bytes, 16384);
+    let weights = tensor_slab_layout(&tensors, owned, true);
+    assert_eq!(
+        weights.offsets,
+        [None, Some(0), None, None, None, Some(8192)]
+    );
+    assert_eq!(weights.bytes, 12288);
+    assert_eq!(weights.resident_bytes, legacy.resident_bytes);
+}
+
+#[test]
+fn slab_capacity_counts_flat_kv_and_scratch_outside_the_weight_slab() {
+    let tensors = [
+        ("model.layer.weight", 22 << 30),
+        ("act.x", 2 << 30),
+        ("kv.0.k", 20 << 30),
+    ]
+    .map(|(name, bytes)| DevTensor {
+        name: name.into(),
+        bytes,
+        init: None,
+    });
+    let flat = tensor_slab_layout(&tensors, |_, _| true, true);
+    assert_eq!(flat.bytes, 22 << 30);
+    assert_eq!(flat.resident_bytes, 44 << 30);
+    assert!(flat.check_capacity(32 << 30, 0).is_err());
+    let vmm = tensor_slab_layout(&tensors, |id, _| id != 2, true);
+    assert_eq!(vmm.bytes, flat.bytes);
+    assert_eq!(vmm.resident_bytes, 24 << 30);
+    assert!(vmm.check_capacity(vmm.resident_bytes, 0).is_ok());
+    assert!(vmm.check_capacity(vmm.resident_bytes - 1, 0).is_err());
+    assert!(vmm.check_capacity(32 << 30, 9 << 30).is_err());
+    assert!(vmm.check_capacity(25 << 30, 1 << 30).is_ok());
+    assert!(vmm.check_capacity((25 << 30) - 1, 1 << 30).is_err());
+    assert!(vmm.check_capacity(0, 9 << 30).is_ok());
+    assert!(vmm.check_available(vmm.resident_bytes).is_ok());
+    assert!(vmm.check_available(vmm.resident_bytes - 1).is_err());
+    assert!(vmm.check_available(0).is_err());
+}
+
+#[test]
 fn map_ahead_rows_covers_the_decode_row_and_the_next_chunk() {
     let max = 202_752;
     assert_eq!(map_ahead_rows(8192, true, None, max), Some(8193));
