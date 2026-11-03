@@ -1431,6 +1431,48 @@ static void t_q8_path(unsigned path, unsigned m_small, unsigned m_big, unsigned 
                 std::equal(own_last.begin(), own_last.end(), batched.end() - own_last.size()));
 }
 
+/* Q8GemmF32's GEMV walk (path 1) bit for bit against its order on the host: lane l's fma over blocks
+ * of x[r][32b + l] * (scale_b * q_b[l]) from 0, the butterfly over lanes (offsets 16..1), the bias. */
+static void t_q8_gemv_order(unsigned m, unsigned n, unsigned k) {
+    char name[64];
+    snprintf(name, sizeof name, "Q8GemmF32 gemv order %ux%ux%u", m, n, k);
+    Case c;
+    unsigned o = c.out((size_t)m * n), x = c.f32((size_t)m * k, 1.f), w = q8_weights(c, n, k), b = c.f32(n, 0.3f);
+    c.in.op = PLOW_DOP_Q8_GEMM_F32;
+    c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
+    c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[7] = 1;
+    run(name, c, g_q8_gemm_f32, {o}, FP32);
+    const std::vector<uint32_t> got = fetch(c, o);
+    const float* X = (const float*)c.host[x].data();
+    const float* B = (const float*)c.host[b].data();
+    size_t bad = 0;
+    for (unsigned col = 0; col < n; col++) {
+        const uint8_t* wc = c.host[w].data() + (size_t)col * (k / 32) * 34;
+        for (unsigned r = 0; r < m; r++) {
+            float p[32], q[32];
+            for (unsigned l = 0; l < 32; l++) {
+                float acc = 0.f;
+                for (unsigned blk = 0; blk < k / 32; blk++) {
+                    uint16_t hs;
+                    memcpy(&hs, wc + blk * 34, 2);
+                    const float wv = __half2float(__ushort_as_half(hs)) * (float)(int8_t)wc[blk * 34 + 2 + l];
+                    acc = fmaf(X[(size_t)r * k + 32 * blk + l], wv, acc);
+                }
+                p[l] = acc;
+            }
+            for (unsigned off = 16; off > 0; off >>= 1) {
+                for (unsigned l = 0; l < 32; l++) q[l] = p[l] + p[l ^ off];
+                memcpy(p, q, sizeof p);
+            }
+            const float want = p[0] + B[col];
+            uint32_t bits;
+            memcpy(&bits, &want, 4);
+            bad += got[(size_t)r * n + col] != bits;
+        }
+    }
+    verdict(name, "== its order on the host", bad == 0);
+}
+
 /* Q8GemmF32 tiles (path 2): 128x128 tiles (as many slices as tiles) give the 64x64 tiles' bits. */
 static void t_q8_tiles(unsigned m, unsigned n, unsigned k) {
     char name[64];
@@ -1528,7 +1570,7 @@ static void bench_q8_paths() {
         const unsigned n = shape[0], k = shape[1];
         for (unsigned m : {1u, 4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u, 1024u, 2048u}) {
             for (unsigned path : {1u, 2u}) {
-                if (path == 1u && m > 256u) continue;
+                if (path == 1u && m > 1024u) continue;
                 Case c;
                 unsigned o = c.out((size_t)m * n), x = c.f32((size_t)m * k, 1.f), w = q8_weights(c, n, k);
                 c.in.op = PLOW_DOP_Q8_GEMM_F32;
@@ -1916,6 +1958,16 @@ int main(int argc, char** argv) {
     t_q8_path(1, 5, 37, 130, 512);
     /* A batched joint's rows: GEMV passes of 32 rows (32, 32, 6) against an 8-row launch. */
     t_q8_path(1, 8, 70, 640, 640);
+    /* Passes of 8 (odd n), 16, 32 + 8 rows (several columns per warp), 16 + 8 at k 1024, 8 filling
+     * the arena; then the untransposed walk, staged and from global. */
+    t_q8_gemv_order(1, 300, 640);
+    t_q8_gemv_order(8, 301, 640);
+    t_q8_gemv_order(16, 300, 640);
+    t_q8_gemv_order(37, 2701, 640);
+    t_q8_gemv_order(20, 150, 1024);
+    t_q8_gemv_order(8, 100, 2048);
+    t_q8_gemv_order(4, 200, 4096);
+    t_q8_gemv_order(5, 96, 8192);
     t_q8_tiles(200, 300, 256);
     t_q8_tiles(150, 260, 1024);
     t_q8_path(2, 4, 70, 130, 512);
