@@ -15,6 +15,8 @@
  * Trap cases are intentionally omitted: this HSA harness has no recoverable
  * device-trap isolation, so a trap may hang the queue/device.
  * Ragged-K GEMV is compared to zero-padded, eight-aligned ordinary GEMV.
+ * `dense` selects only the K64 GEMM geometry cases for packet-specific objects;
+ * the full opcode suite needs an unconfigured object with every tested arm.
  */
 #include "../amd/hsa_backend.h"
 #include "../common/dev_isa.h"
@@ -119,6 +121,34 @@ static void packet(plow_hsa* h, PlowDevInst in, void* tensors[8], unsigned block
 static void finish_argmax(plow_hsa* h, int* ids, uint64_t* part, unsigned blocks, unsigned M) {
     struct { int* ids; uint64_t* part; unsigned blocks, M; } args = {ids, part, blocks, M};
     launch(h, "argmax_fin_test", 1, &args, sizeof(args));
+}
+
+static void dense_gemm(plow_hsa* h, unsigned M, unsigned N, unsigned K) {
+    bf16* x = alloc(h, (size_t)M * K * 2);
+    bf16* w = alloc(h, (size_t)N * K * 2);
+    bf16* out = alloc(h, (size_t)M * N * 2);
+    bf16* ref = alloc(h, (size_t)M * N * 2);
+    /* Small dyadic products and sums are exact in FP32, including cancellation. */
+    for (size_t i = 0; i < (size_t)M * K; i++) x[i] = f2bf(roundf(random_value() * 16) / 16);
+    for (size_t i = 0; i < (size_t)N * K; i++) w[i] = f2bf(roundf(random_value() * 16) / 16);
+    for (unsigned m = 0; m < M; m++) for (unsigned n = 0; n < N; n++) {
+        double sum = 0;
+        for (unsigned k = 0; k < K; k++) sum += bf2f(x[(size_t)m * K + k]) * bf2f(w[(size_t)n * K + k]);
+        ref[(size_t)m * N + n] = f2bf((float)sum);
+        out[(size_t)m * N + n] = f2bf(NAN);
+    }
+    void* tensors[8] = {out, x, w};
+    PlowDevInst in = instruction(PLOW_DOP_GEMM_SMALL, tensors);
+    in.i[0] = M; in.i[1] = N; in.i[2] = K;
+    struct { bf16 *out, *x, *w; unsigned M, N, K; } args = {out, x, w, M, N, K};
+    printf("direct GEMM M=%u N=%u K=%u\n", M, N, K);
+    launch(h, "gemm_c4", 64, &args, sizeof(args));
+    check("direct dense GEMM", out, ref, (size_t)M * N, 0);
+    for (size_t i = 0; i < (size_t)M * N; i++) out[i] = f2bf(NAN);
+    printf("dense GEMM M=%u N=%u K=%u\n", M, N, K);
+    packet(h, in, tensors, 64, M);
+    check("packet dense GEMM", out, ref, (size_t)M * N, 0);
+    plow_hsa_free(h, x); plow_hsa_free(h, w); plow_hsa_free(h, out); plow_hsa_free(h, ref);
 }
 
 /* pattern 0: random/tied maxima; 1: rounding boundary; 2: negative last winner;
@@ -360,11 +390,13 @@ static void load_object(plow_hsa* h, const char* path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc > 3 || (argc == 3 && strcmp(argv[2], "token-batch"))) {
-        fprintf(stderr, "usage: %s [interp_prefill.elf | interp_tokbatch.elf token-batch]\n", argv[0]);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc > 3 || (argc == 3 && strcmp(argv[2], "token-batch") && strcmp(argv[2], "dense"))) {
+        fprintf(stderr, "usage: %s [interp_prefill.elf [dense] | interp_tokbatch.elf token-batch]\n", argv[0]);
         return 1;
     }
-    token_batch = argc == 3;
+    const int dense_only = argc == 3 && !strcmp(argv[2], "dense");
+    token_batch = argc == 3 && !dense_only;
     plow_hsa* h = plow_hsa_init();
     if (!h) { fprintf(stderr, "%s\n", plow_hsa_last_error()); return 1; }
     load_object(h, argc > 1 ? argv[1] : "interp_prefill.elf");
@@ -390,16 +422,27 @@ int main(int argc, char** argv) {
         }
     }
     plow_hsa_free(h, threads);
-    gemv(h, 1, 259, 512, 3, 0, 0); gemv(h, 3, 259, 520, 5, 30, 0);
-    gemv(h, 2, 7, 67, 11, 0, 0); gemv(h, 1, 259, 3840, 3, 30, 0);
-    gemv(h, 1, 259, 8192, 3, 0, 0);
-    for (unsigned pattern = 1; pattern <= 6; pattern++) {
-        gemv(h, 2, 19, 1024, 3, 0, pattern);
-        gemv(h, 2, 19, 1024, 3, 30, pattern);
+    if (!token_batch && (dense_only || !strcmp(arch, "gfx1201"))) {
+        const unsigned saved_rng = rng;
+        dense_gemm(h, 128, 1024, 1024);
+        dense_gemm(h, 128, 960, 1024); dense_gemm(h, 128, 1024, 960);
+        dense_gemm(h, 128, 960, 960); dense_gemm(h, 128, 320, 960);
+        dense_gemm(h, 128, 2560, 960); dense_gemm(h, 128, 960, 2560);
+        dense_gemm(h, 1, 960, 960); dense_gemm(h, 1, 320, 960);
+        rng = saved_rng;
     }
-    per_layer(h, 1, 1536, 256, 0); per_layer(h, 7, 64, 32, 1);
-    per_layer(h, 3, 67, 35, 2); per_layer(h, 1, 2560, 256, 1);
-    embeds(h, 64); embeds(h, 67); embeds(h, 1024);
+    if (!dense_only) {
+        gemv(h, 1, 259, 512, 3, 0, 0); gemv(h, 3, 259, 520, 5, 30, 0);
+        gemv(h, 2, 7, 67, 11, 0, 0); gemv(h, 1, 259, 3840, 3, 30, 0);
+        gemv(h, 1, 259, 8192, 3, 0, 0);
+        for (unsigned pattern = 1; pattern <= 6; pattern++) {
+            gemv(h, 2, 19, 1024, 3, 0, pattern);
+            gemv(h, 2, 19, 1024, 3, 30, pattern);
+        }
+        per_layer(h, 1, 1536, 256, 0); per_layer(h, 7, 64, 32, 1);
+        per_layer(h, 3, 67, 35, 2); per_layer(h, 1, 2560, 256, 1);
+        embeds(h, 64); embeds(h, 67); embeds(h, 1024);
+    }
     plow_hsa_shutdown(h);
     printf("amd_opcode_test: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;
