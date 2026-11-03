@@ -2575,7 +2575,7 @@ impl VmmKv {
     }
 
     pub fn try_attach(&self, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
-        self.try_attach_keyed(seq, prompt, None)
+        self.try_attach_keyed(seq, prompt, None, false)
     }
 
     /// The block-store handle `prompt` would attach, when its boundary lives in the store.
@@ -2591,11 +2591,13 @@ impl VmmKv {
 
     /// [`Self::try_attach`] with the prompt's block hashes already computed (by the DP router);
     /// a key for another block size or prompt is ignored and the prompt hashed here.
+    /// `cold`: register the prompt as a miss without attaching (the caller cannot run a tail).
     pub fn try_attach_keyed(
         &self,
         seq: usize,
         prompt: &[u32],
         key: Option<PrefixKey>,
+        cold: bool,
     ) -> Result<Option<Attach>> {
         if !self.prefix_reuse {
             return Ok(None);
@@ -2608,7 +2610,7 @@ impl VmmKv {
         inner.prefilling[seq] = true;
         inner.awaited[seq] = None;
         if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
-            return try_attach_fine(&mut inner, seq, prompt);
+            return try_attach_fine(&mut inner, seq, prompt, cold);
         }
         note_lead(&mut inner, seq, prompt);
         let hashes = match key {
@@ -2624,7 +2626,8 @@ impl VmmKv {
             if let Some(snapshots) = inner.published.get(&node) {
                 let start = blocks * s.block_rows as usize;
                 for snap in snapshots {
-                    if (snap.rows as usize) < prompt.len()
+                    if !cold
+                        && (snap.rows as usize) < prompt.len()
                         && prompt.get(start..snap.rows as usize) == Some(snap.tail.as_slice())
                         && chosen.is_none_or(|(_, _, rows)| snap.rows > rows)
                     {
@@ -4659,7 +4662,12 @@ fn publish_locked(
 /// fine snapshots are never evicted in this version (a documented limitation, not a
 /// correctness gap — nothing frees them out from under a concurrent reader), so there is
 /// nothing to pin.
-fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
+fn try_attach_fine(
+    inner: &mut Inner,
+    seq: usize,
+    prompt: &[u32],
+    cold: bool,
+) -> Result<Option<Attach>> {
     let fine_rows = inner.fine_rows;
     let miss = |inner: &mut Inner| {
         inner.stats.attach_misses += 1;
@@ -4677,7 +4685,7 @@ fn try_attach_fine(inner: &mut Inner, seq: usize, prompt: &[u32]) -> Result<Opti
             fine_held: 0,
         };
     };
-    let Some(cache) = inner.fine_cache.as_mut() else {
+    let Some(cache) = inner.fine_cache.as_mut().filter(|_| !cold) else {
         miss(inner);
         return Ok(None);
     };
@@ -7927,6 +7935,14 @@ mod tests {
         p.ensure_rows(0, 24).unwrap();
         p.publish_at(0, &tokens, 16, 16, |_| Ok(())).unwrap();
         assert_eq!(ops.creates.load(Ordering::SeqCst), 9);
+        let misses = p.stats().attach_misses;
+        assert!(p
+            .try_attach_keyed(1, &tokens, None, true)
+            .unwrap()
+            .is_none());
+        assert_eq!(p.stats().attach_misses, misses + 1);
+        assert_eq!(p.shared.inner.lock().seqs[1].prompt_rows, tokens.len());
+        p.begin_seq(1);
         assert_eq!(p.try_attach(1, &tokens).unwrap().unwrap().rows, 16);
         assert_eq!(p.stats().blocks_shared_mapped, 6);
         assert_eq!(ops.creates.load(Ordering::SeqCst), 9);
@@ -8122,7 +8138,7 @@ mod tests {
         }
         p.ensure_rows(1, 1).unwrap();
         let a = p
-            .try_attach_keyed(1, &pr, Some(key))
+            .try_attach_keyed(1, &pr, Some(key), false)
             .unwrap()
             .expect("keyed attach");
         assert_eq!(a.rows, 16);

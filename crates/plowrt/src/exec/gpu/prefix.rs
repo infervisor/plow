@@ -638,7 +638,18 @@ impl GpuEngine {
         let Some((_, kv)) = self.vmm_prefix() else {
             return Ok(());
         };
-        let att = kv.try_attach_keyed(b, prompt, key.or(staged))?;
+        // Every prefill bucket writes all its rows, so a chunk starting at c0 needs
+        // `max_ctx - c0 >= narrowest bucket`. Any chunk of this prompt starts at or before
+        // len - 1; a prompt ending closer than that to the compiled context is served cold, the
+        // way it would run without the cache, whatever chunk boundaries an attach would create.
+        let cold = !self.encoder
+            && self
+                .prefill
+                .iter()
+                .map(|p| p.t as usize)
+                .min()
+                .is_some_and(|t| prompt.len() + t > self.max_ctx + 1);
+        let att = kv.try_attach_keyed(b, prompt, key.or(staged), cold)?;
         let attached = att.is_some();
         let att_rows = att.as_ref().map(|a| a.rows).unwrap_or(0);
         tracing::debug!(
@@ -646,26 +657,12 @@ impl GpuEngine {
             prompt = prompt.len(),
             attached,
             att_rows,
+            cold,
             "vmm_attach query"
         );
         let Some(a) = att else {
             return Ok(());
         };
-        // Every prefill bucket writes all its rows: a tail left fewer rows of context than the
-        // narrowest bucket cannot run after the prefix, while the cold prompt (chunked from 0)
-        // can. Serve such a prompt cold.
-        let room = self.max_ctx.saturating_sub(a.rows as usize);
-        let narrowest = self.prefill.iter().map(|p| p.t as usize).min();
-        if prompt.len() > a.rows as usize && narrowest.is_some_and(|t| t > room) {
-            kv.begin_seq(b);
-            tracing::debug!(
-                slot = b,
-                rows = a.rows,
-                room,
-                "vmm: prefix attach declined, tail too near the context limit"
-            );
-            return Ok(());
-        }
         let restored = (|| {
             // The slot's own blocks hold the prefix: map them, then gather every row.
             kv.ensure_rows(b, a.rows + 1)?;
