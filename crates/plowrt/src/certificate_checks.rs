@@ -1469,9 +1469,15 @@ mod tests {
                 mutate(&conv_req, "residual_bytes", json!(0)),
                 false,
             ),
+            // Tensors only need to cover the footprint (slab-backed sites), so a mutation that
+            // shrinks out_rows (stride 2) still verifies; one that grows it past the tensors must not.
             (
-                "stride changes out_rows",
-                mutate(&conv_req, "stride", json!(2)),
+                "in_rows grows out_rows past the footprint",
+                mutate(
+                    &conv_req,
+                    "in_rows",
+                    json!(conv0["in_rows"].as_u64().unwrap() * 2),
+                ),
                 false,
             ),
             (
