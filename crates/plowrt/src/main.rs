@@ -5107,10 +5107,7 @@ async fn bringup_runtime(
                 }));
                 tracing::info!(%slug, dp = n, nv_ranks = lo, tp, cfg = ?router.cfg, "dp: AMD ranks planned");
                 let mut set = DpSet::new(slug, ranks);
-                // KV images move between CUDA engines only (H3); AMD export/import is H4.
-                if pd_of(slug, set.ranks.len())?.is_some() {
-                    return Err(format!("--pd {slug}: P/D needs every rank on NVIDIA").into());
-                }
+                set.pd = pd_of(slug, set.ranks.len())?;
                 for (r, rank) in set.ranks.iter_mut().enumerate() {
                     match nv.get(r) {
                         Some((_, _, _, cpus)) => {
