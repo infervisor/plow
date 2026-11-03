@@ -109,6 +109,8 @@ pub struct SpeechContract {
     /// Text-plus-codec rows ([`plow_asset::dual_stream`]); its voices, languages and
     /// instructions are the model's.
     pub dual_stream: Option<plow_asset::dual_stream::DualStream>,
+    /// Streaming-output leading-silence trim (`stream.onset_trim_*`).
+    pub onset_trim: Option<OnsetTrimPolicy>,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -216,6 +218,10 @@ impl SpeechContract {
                 .map(|j| plow_asset::dual_stream::DualStream::parse(j))
                 .transpose()
                 .map_err(RuntimeError::Rejected)?,
+            onset_trim: p.parameters.get(ONSET_TRIM_DBFS).map(|&v| OnsetTrimPolicy {
+                dbfs: f32::from_bits(v as u32),
+                max_ms: p.parameters.get(ONSET_TRIM_MAX_MS).map_or(0, |&m| m as u32),
+            }),
         };
         if let Some(encoder) = p.strings.get(crate::exec::packet_runtime::CLONE_ENCODER) {
             let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {
@@ -762,6 +768,93 @@ pub(crate) struct OutPcm {
     stretch: Option<stretch::Stretch>,
     /// `None` when the reply is served at the model's own rate.
     resampler: Option<crate::asr::frontend::Resampler>,
+    /// The packet's leading-silence trim, at the model's rate before any stretch.
+    trim: Option<OnsetTrim>,
+}
+
+/// A speech packet's streaming-output policy (`stream.onset_trim_*`): leading samples before the
+/// first audible frame are not sent. Audible = the DC-removed RMS of a 20 ms frame (10 ms hop) of
+/// the s16 samples at or above `dbfs`, two frames running; the output starts at the first such
+/// frame. At most `max_ms` is trimmed, so a silent reply still plays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OnsetTrimPolicy {
+    pub dbfs: f32,
+    pub max_ms: u32,
+}
+
+pub const ONSET_TRIM_DBFS: &str = "stream.onset_trim_dbfs_f32";
+pub const ONSET_TRIM_MAX_MS: &str = "stream.onset_trim_max_ms";
+
+/// [`OnsetTrimPolicy`] over a reply's first samples.
+#[derive(Debug)]
+pub(crate) struct OnsetTrim {
+    held: Vec<f32>,
+    /// Next frame start to test, and the first frame of the current audible run.
+    scan: usize,
+    run: Option<usize>,
+    frame: usize,
+    hop: usize,
+    /// Mean square at the threshold, in s16 full-scale units.
+    floor: f64,
+    max: usize,
+    trimmed: usize,
+}
+
+impl OnsetTrim {
+    pub fn new(p: OnsetTrimPolicy, rate: u32) -> Self {
+        let r = 10f64.powf(f64::from(p.dbfs) / 20.0);
+        Self {
+            held: Vec::new(),
+            scan: 0,
+            run: None,
+            frame: rate as usize / 50,
+            hop: rate as usize / 100,
+            floor: r * r,
+            max: (rate as u64 * u64::from(p.max_ms) / 1000) as usize,
+            trimmed: 0,
+        }
+    }
+
+    fn audible(&self, s: usize) -> bool {
+        let q = |x: f32| (x * 32767.0).round().clamp(-32768.0, 32767.0) as f64 / 32768.0;
+        let w = &self.held[s..s + self.frame];
+        let mean = w.iter().map(|&x| q(x)).sum::<f64>() / w.len() as f64;
+        let ms = w.iter().map(|&x| (q(x) - mean).powi(2)).sum::<f64>() / w.len() as f64;
+        ms >= self.floor
+    }
+
+    /// Samples to send now; `None` once the onset is past (send `pcm` itself from then on).
+    fn push(&mut self, pcm: &[f32]) -> Option<Vec<f32>> {
+        self.held.extend_from_slice(pcm);
+        while self.scan + self.frame <= self.held.len() {
+            if !self.audible(self.scan) {
+                self.run = None;
+            } else if let Some(start) = self.run {
+                return Some(self.cut(start));
+            } else {
+                self.run = Some(self.scan);
+            }
+            self.scan += self.hop;
+            if self.scan > self.max {
+                let at = self.run.map_or(self.max, |r| r.min(self.max));
+                return Some(self.cut(at));
+            }
+        }
+        Some(Vec::new())
+    }
+
+    fn cut(&mut self, at: usize) -> Vec<f32> {
+        self.trimmed = at;
+        self.max = 0;
+        let mut v = std::mem::take(&mut self.held);
+        v.drain(..at);
+        v
+    }
+
+    /// Samples still held at the end: a reply that never became audible is sent whole.
+    fn finish(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.held)
+    }
 }
 
 impl OutPcm {
@@ -778,7 +871,18 @@ impl OutPcm {
             speed,
             stretch,
             resampler,
+            trim: None,
         })
+    }
+
+    /// Trim the reply's leading silence (`policy`, `rate` = the model's).
+    pub fn trim_onset(&mut self, policy: Option<OnsetTrimPolicy>, rate: u32) {
+        self.trim = policy.map(|p| OnsetTrim::new(p, rate));
+    }
+
+    /// Model-rate samples the onset trim dropped so far.
+    pub fn trimmed(&self) -> usize {
+        self.trim.as_ref().map_or(0, |t| t.trimmed)
     }
 
     pub fn rate(&self) -> u32 {
@@ -805,6 +909,14 @@ impl OutPcm {
     }
 
     pub fn push(&mut self, pcm: &[f32], out: &mut Vec<u8>) {
+        let held = match self.trim.as_mut() {
+            Some(t) if t.max > 0 => t.push(pcm),
+            _ => None,
+        };
+        let pcm = held.as_deref().unwrap_or(pcm);
+        if pcm.is_empty() {
+            return;
+        }
         let stretched = self.stretch.as_mut().map(|s| s.push(pcm));
         let pcm = stretched.as_deref().unwrap_or(pcm);
         match &mut self.resampler {
@@ -816,6 +928,14 @@ impl OutPcm {
     /// The stretch's last frame and the resampler's tail, neither of which a `push` could
     /// complete: dropping them would clip the end of every stretched or resampled reply.
     pub fn finish(&mut self, out: &mut Vec<u8>) {
+        if let Some(held) = self.trim.as_mut().filter(|t| t.max > 0).map(|t| t.finish()) {
+            if let Some(t) = self.trim.as_mut() {
+                t.max = 0;
+            }
+            if !held.is_empty() {
+                self.push(&held, out);
+            }
+        }
         let tail = self
             .stretch
             .as_mut()
@@ -836,6 +956,50 @@ impl OutPcm {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// Leading silence goes, the audible run starts the reply, nothing after it changes; a
+    /// silent reply is trimmed at most `max_ms` and still plays.
+    #[test]
+    fn onset_trim_drops_only_leading_silence() {
+        let policy = OnsetTrimPolicy {
+            dbfs: -45.0,
+            max_ms: 500,
+        };
+        let tone =
+            |n: usize| -> Vec<f32> { (0..n).map(|i| 0.1 * (i as f32 * 0.3).sin()).collect() };
+        let mut pcm = vec![0.0f32; 1700];
+        pcm.extend(tone(4000));
+        pcm.extend(vec![0.0; 300]);
+        let mut out = OutPcm::new(24000, 24000, 1.0, false).unwrap();
+        out.trim_onset(Some(policy), 24000);
+        let mut bytes = Vec::new();
+        for c in pcm.chunks(1920) {
+            out.push(c, &mut bytes);
+        }
+        out.finish(&mut bytes);
+        // The run starts at the first 10 ms-hop frame holding tone samples (1440..1920).
+        assert_eq!(out.trimmed(), 1440);
+        assert_eq!(bytes.len(), (pcm.len() - 1440) * 2);
+        let mut want = Vec::new();
+        pcm16(&pcm[1440..], &mut want);
+        assert_eq!(bytes, want);
+
+        let mut silent = OutPcm::new(24000, 24000, 1.0, false).unwrap();
+        silent.trim_onset(Some(policy), 24000);
+        let mut bytes = Vec::new();
+        silent.push(&vec![0.0; 24000], &mut bytes);
+        silent.finish(&mut bytes);
+        assert_eq!(silent.trimmed(), 12000);
+        assert_eq!(bytes.len(), 12000 * 2);
+
+        let mut short = OutPcm::new(24000, 24000, 1.0, false).unwrap();
+        short.trim_onset(Some(policy), 24000);
+        let mut bytes = Vec::new();
+        short.push(&[0.0; 100], &mut bytes);
+        assert!(bytes.is_empty());
+        short.finish(&mut bytes);
+        assert_eq!(bytes.len(), 200);
+    }
 
     fn pipeline() -> PacketPipeline {
         let mut p: BTreeMap<String, u64> = BTreeMap::new();

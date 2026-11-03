@@ -1166,6 +1166,9 @@ async fn speech_with(
         Ok(o) => o,
         Err(e) => return server_error(e),
     };
+    if req.stream && crate::config::RuntimeConfig::get().tts_onset_trim {
+        out_pcm.trim_onset(c.onset_trim, c.sample_rate);
+    }
     let reference = match (&req.ref_audio, &req.ref_text, &model.ref_encoder) {
         (Some(audio), Some(text), Some(enc)) => {
             match ref_clip(&model, tok, &voice, enc, audio, text) {
@@ -2481,15 +2484,21 @@ async fn stream_task(
                         &joined[..]
                     };
                     emitted = upto;
+                    let mut bytes = Vec::new();
                     if !fresh.is_empty() {
-                        let mut bytes = Vec::new();
+                        let trimmed = out_pcm.trimmed();
                         out_pcm.push(fresh, &mut bytes);
+                        // Trimmed leading silence is never played: it neither starts playback
+                        // nor counts as audio ahead of it (held samples count once sent).
+                        sent += fresh.len();
+                        sent -= out_pcm.trimmed() - trimmed;
+                    }
+                    if !bytes.is_empty() {
                         if first.is_none() {
                             ticket.first_audio();
                         }
                         first.get_or_insert_with(|| t_arrive.elapsed());
                         playing.get_or_insert_with(Instant::now);
-                        sent += fresh.len();
                         ticket.sent(sent as f64 / sr);
                         run.audio(fresh.len(), sr);
                         if let Some(h) = head.take() {

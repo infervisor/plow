@@ -5,12 +5,16 @@ the talker / code-predictor logits and the decoded PCM that the plow packet is g
 
   python scripts/tts/qwen3_tts_ref.py MODEL_DIR TEXTS.jsonl OUT_DIR [--voice ryan] [--language english]
       [--dtype bf16|fp32] [--device cuda] [--seed S | greedy] [--logits] [--official] [--limit N]
+      [--force CODES_DIR]
 
 TEXTS.jsonl rows: {"id": ..., "text": ...}. Per row OUT_DIR gets `<id>.codes.npy` (int32 [frames][16],
 EOS frame excluded), `<id>.wav` (24 kHz), with --logits `<id>.logits.npz` (cb0 [frames+1][3072] after
 the reference's suppression, cp [frames][15][2048], prefill [rows][2048] input embeddings), and one
 line of OUT_DIR/meta.jsonl (frames, audible onset ms, seconds, wall ms). --official also runs the
 package's own `generate` with the same settings and records whether its codes equal the loop's.
+--force teacher-forces every frame to CODES_DIR/<id>.codes.npy (then EOS), so logits of two runs
+(dtypes, or plow) compare position by position; the logits then also hold `cb0_raw`, the head's
+3072 logits before suppression and penalty.
 """
 import argparse
 import json
@@ -79,7 +83,7 @@ class Loop:
         return int(i[torch.multinomial(p, 1, generator=gen)].item())
 
     @torch.inference_mode()
-    def run(self, text, greedy, seed, max_frames, dump):
+    def run(self, text, greedy, seed, max_frames, dump, force=None):
         from transformers import DynamicCache
         gen = torch.Generator(device=self.dev)
         gen.manual_seed(seed)
@@ -90,9 +94,10 @@ class Loop:
         out = self.t.model(inputs_embeds=rows, position_ids=pos, past_key_values=cache, use_cache=True)
         h = out.last_hidden_state[:, -1:]
         cp = self.t.code_predictor
-        frames, l0s, lcps, hist = [], [], [], []
-        for step in range(max_frames):
+        frames, l0s, lcps, hist, raws = [], [], [], [], []
+        for step in range(max_frames if force is None else len(force) + 1):
             logits = self.t.codec_head(h)[0, -1].float()
+            raws.append(logits.clone().cpu())
             logits[CODES:] = -float("inf")
             if step >= 2:
                 logits[EOS] = self.t.codec_head(h)[0, -1, EOS].float()
@@ -100,6 +105,8 @@ class Loop:
                 logits[t_] = logits[t_] * 1.05 if logits[t_] < 0 else logits[t_] / 1.05
             l0s.append(logits.cpu())
             c0 = self.sample(logits, greedy, gen)
+            if force is not None:
+                c0 = int(force[step][0]) if step < len(force) else EOS
             if c0 == EOS:
                 break
             hist.append(c0)
@@ -112,6 +119,8 @@ class Loop:
                 lg = cp.lm_head[j](o.last_hidden_state[:, -1]).float()[0]
                 lcp.append(lg.cpu())
                 c = self.sample(lg, greedy, gen)
+                if force is not None:
+                    c = int(force[step][j + 1])
                 codes.append(c)
                 x = cp.small_to_mtp_projection(cp.model.get_input_embeddings()[j](
                     torch.tensor([[c]], device=self.dev)))
@@ -126,7 +135,7 @@ class Loop:
                              use_cache=True).last_hidden_state
         res = dict(ids=ids, codes=np.array(frames, dtype=np.int32).reshape(-1, 16))
         if dump:
-            res["logits"] = dict(cb0=torch.stack(l0s).numpy(),
+            res["logits"] = dict(cb0=torch.stack(l0s).numpy(), cb0_raw=torch.stack(raws).numpy(),
                                  cp=(torch.stack(lcps).numpy() if lcps else np.zeros((0, 15, CODES), np.float32)),
                                  prefill=rows[0].float().cpu().numpy())
         return res
@@ -146,6 +155,7 @@ def main():
     ap.add_argument("--logits", action="store_true")
     ap.add_argument("--official", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--force", default=None)
     a = ap.parse_args()
     from qwen_tts import Qwen3TTSModel
     dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
@@ -162,7 +172,8 @@ def main():
         if a.device.startswith("cuda"):
             torch.cuda.synchronize()
         t0 = time.time()
-        res = loop.run(r["text"], greedy, a.seed or 0, a.max_frames, a.logits)
+        force = np.load(os.path.join(a.force, f"{r['id']}.codes.npy")) if a.force else None
+        res = loop.run(r["text"], greedy, a.seed or 0, a.max_frames, a.logits, force)
         codes = res["codes"]
         if a.device.startswith("cuda"):
             torch.cuda.synchronize()

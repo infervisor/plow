@@ -464,7 +464,8 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
             decode_only: false,
             norm: None,
         });
-        c.encoder_overlay_rows = g("overlay_rows");
+        // Breeze's prompt rows are encoder overlay rows; Qwen3-TTS's embed from their codes (none).
+        c.encoder_overlay_rows = f["overlay_rows"].as_u64().unwrap_or(0) as u32;
     }
     if let Some(t3) = v.get("chatterbox_t3") {
         c.encoder_overlay_rows = t3["overlay_rows"]
