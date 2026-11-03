@@ -10,8 +10,10 @@
 //!              [--max-inst N | --max-segments N]
 //! `--same` feeds every slot the SAME prompt and reports how many slots' greedy
 //! streams agree with slot 0 (a within-batch consistency check); with `--kv-image` slots 1..
-//! take slot 0's KV through an exported image instead of prefilling (`KV_IMAGE` line). `--spread` gives each slot a
-//! pseudo-random prompt over 64K ids, so a MoE model routes a decode batch the way served
+//! take slot 0's KV through an exported image instead of prefilling (`KV_IMAGE` line).
+//! `--kv-image-peer DIR --kv-image-peer-device amd:N|nv:N` instead checks a cross-vendor
+//! roundtrip into peer slot 1; the main engine is the other vendor on device 0.
+//! `--spread` gives each slot a pseudo-random prompt over 64K ids, so a MoE model routes a decode batch the way served
 //! traffic does (the default prompts share one 1000-id cycle). `--packed-prefill`
 //! initializes prompts through packed request chunks and the compact terminal, printing each
 //! launch's wall ms; `--pf-chunk N` caps the per-request slice below the packet's request chunk and
@@ -87,6 +89,135 @@ fn dump_range<'a>(
     Ok((name, offset, bytes))
 }
 
+#[cfg(all(feature = "cuda", feature = "hsa"))]
+fn kv_image_peer_bench(
+    assets: &std::path::Path,
+    peer: &std::path::Path,
+    device: &str,
+    ctx: usize,
+    prompt_file: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::asset::serve::checkpoint_dir;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let (vendor, ordinal) = device
+        .split_once(':')
+        .ok_or("peer device must be amd:N or nv:N")?;
+    let ordinal: u8 = ordinal.parse()?;
+    let (nv_dir, amd_dir, nv_device, amd_device, main_nv) = match vendor {
+        "amd" => (assets, peer, 0, ordinal, true),
+        "nv" => (peer, assets, ordinal, 0, false),
+        _ => return Err("peer device must be amd:N or nv:N".into()),
+    };
+    let mut digests = std::collections::HashMap::new();
+    let headers = [assets, peer].map(|dir| plowrt::serve::pd::kv_header(dir, &mut digests));
+    plowrt::serve::pd::check_headers(
+        "step_bench",
+        plowrt::serve::pd::PdSpec {
+            prefill: 1,
+            decode: 2,
+        },
+        &headers,
+    )?;
+    let be = Arc::new(plowrt::device::cuda::CudaBackend::new(nv_device)?);
+    let mut nv = plowrt::exec::gpu::GpuEngine::load(be, nv_dir, &checkpoint_dir(nv_dir))?;
+    let blob =
+        plowrt::asset::devblob::DevBlob::find_in_dir(amd_dir)?.ok_or("AMD peer has no packet")?;
+    let hsaco = amd_dir.join("hsaco");
+    let hsaco = if hsaco.is_dir() {
+        hsaco.as_path()
+    } else {
+        amd_dir
+    };
+    let mut amd = plowrt::serve::engine::AmdServe::load_on(
+        &blob,
+        hsaco,
+        Some(&checkpoint_dir(amd_dir)),
+        amd_device,
+    )?;
+    if nv.kv_image_key().is_none() || nv.kv_image_key() != amd.kv_image_key() {
+        return Err("engines do not expose matching KV image keys".into());
+    }
+    // The peer imports into its last slot: a different slot index where it has one, so the
+    // image cannot depend on the slot.
+    let (nv_slot, amd_slot) = if main_nv {
+        (0, amd.batch().saturating_sub(1))
+    } else {
+        (nv.batch().saturating_sub(1), 0)
+    };
+    if nv.batch() <= nv_slot
+        || amd.batch() <= amd_slot
+        || ctx == 0
+        || ctx >= nv.max_ctx()
+        || ctx >= amd.max_ctx()
+    {
+        return Err(
+            "KV image check needs room for the prompt plus one decode row".into(),
+        );
+    }
+    let prompt: Vec<u32> = if let Some(file) = prompt_file {
+        let prompts: Vec<Vec<u32>> = serde_json::from_slice(&std::fs::read(file)?)?;
+        prompts
+            .first()
+            .filter(|p| p.len() >= ctx)
+            .ok_or("prompt file has no ctx-row prompt")?[..ctx]
+            .to_vec()
+    } else {
+        (0..ctx).map(|i| 100 + (i % 1000) as u32).collect()
+    };
+    let n = u32::try_from(ctx)?;
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let first = if main_nv {
+        nv.begin_slot(nv_slot, ctx + 1)?;
+        if nv.has_prefill() {
+            nv.prefill_slot(nv_slot, &prompt)?
+        } else {
+            nv.consume_prompt(nv_slot, &prompt, &mut Vec::new())?
+        }
+    } else {
+        amd.prefill(amd_slot, &prompt)?
+    };
+    let t = Instant::now();
+    if main_nv {
+        nv.export_kv_image(nv_slot, n, &mut a)?;
+    } else {
+        amd.export_kv_image(amd_slot, n, &mut a)?;
+    }
+    let export_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t = Instant::now();
+    if main_nv {
+        amd.import_kv_image(amd_slot, &prompt, &a, first)?;
+    } else {
+        nv.begin_slot(nv_slot, ctx + 1)?;
+        nv.import_kv_image(nv_slot, &prompt, &a)?;
+    }
+    let import_ms = t.elapsed().as_secs_f64() * 1e3;
+    if main_nv {
+        amd.export_kv_image(amd_slot, n, &mut b)?;
+    } else {
+        nv.export_kv_image(nv_slot, n, &mut b)?;
+    }
+    println!(
+        "KV_IMAGE_XV bytes={} exact={} export_ms={export_ms:.4} import_ms={import_ms:.4}",
+        a.len(),
+        u8::from(a == b)
+    );
+    if a != b {
+        return Err("cross-vendor KV image re-export differs".into());
+    }
+    let mut tokens = Vec::new();
+    nv.step_slots(&[(nv_slot, first)], &mut tokens)?;
+    let amd_token = amd.step(amd_slot, first)?;
+    let (main_token, peer_token) = if main_nv {
+        (tokens[0], amd_token)
+    } else {
+        (amd_token, tokens[0])
+    };
+    println!("KV_IMAGE_XV_TOKENS prefill={first} main={main_token} peer={peer_token}");
+    Ok(())
+}
+
 #[cfg(not(feature = "cuda"))]
 fn main() {
     eprintln!("step_bench requires --features cuda");
@@ -114,6 +245,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let steps: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
     let mut same = false;
     let mut kv_image = false;
+    let mut kv_image_peer = None::<std::path::PathBuf>;
+    let mut kv_image_peer_device = None::<String>;
     let mut spread = false;
     let mut multistep = false;
     let mut packed_prefill = false;
@@ -170,6 +303,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--max-inst" => max_inst = Some(args.next().ok_or("--max-inst N")?.parse()?),
             "--same" => same = true,
             "--kv-image" => kv_image = true,
+            "--kv-image-peer" => {
+                kv_image_peer = Some(args.next().ok_or("--kv-image-peer DIR")?.into())
+            }
+            "--kv-image-peer-device" => {
+                kv_image_peer_device = Some(args.next().ok_or("--kv-image-peer-device amd:N|nv:N")?)
+            }
             "--spread" => spread = true,
             "--packed-prefill" => packed_prefill = true,
             "--pf-chunk" => pf_chunk = args.next().ok_or("--pf-chunk N")?.parse()?,
@@ -230,6 +369,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "partial capture requires one step, --warmup 0, tensor dumps, and no sweep/multistep"
                 .into(),
         );
+    }
+
+    if kv_image_peer.is_some() || kv_image_peer_device.is_some() {
+        let (Some(peer), Some(device)) = (kv_image_peer, kv_image_peer_device) else {
+            return Err("--kv-image-peer and --kv-image-peer-device are required together".into());
+        };
+        if !kv_image || !same || packed_prefill || warmup != 0 || steps == 0 || want_slots < 2 {
+            return Err("cross-vendor KV image check needs --same --kv-image, 2+ slots, --warmup 0 and steps".into());
+        }
+        if spread
+            || multistep
+            || partial
+            || dumps.is_some()
+            || prefill_logits_dir.is_some()
+            || sweep.is_some()
+            || seg_sweep.is_some()
+            || ride.is_some()
+            || spec.mode.is_some()
+            || spec.draft_iters > 0
+        {
+            return Err(
+                "cross-vendor KV image check runs only the roundtrip and one decode step".into(),
+            );
+        }
+        #[cfg(feature = "hsa")]
+        return kv_image_peer_bench(&assets, &peer, &device, ctx, prompt_file.as_deref());
+        #[cfg(not(feature = "hsa"))]
+        return Err("--kv-image-peer requires --features cuda,hsa".into());
     }
 
     let ckpt = std::env::var("PLOW_CHECKPOINT")

@@ -21,12 +21,26 @@ use crate::serve::stream::{self, FinishReason, StreamChunk};
 use crate::serve::AppState;
 use crate::RuntimeError;
 
-/// One slot's KV, as `GpuEngine::export_kv_image` wrote it.
+/// One slot's canonical KV image.
 pub struct KvImage {
-    /// The exporting engine's key (`GpuEngine::kv_image_key`): its caches' semantic header.
+    /// The exporting engine's key: its caches' semantic header.
     pub key: String,
     pub rows: u32,
     pub bytes: Vec<u8>,
+    pub handoff_started: Instant,
+}
+
+impl KvImage {
+    pub(crate) fn handoff_ms(&self) -> f64 {
+        let pd_handoff_ms = self.handoff_started.elapsed().as_secs_f64() * 1e3;
+        tracing::debug!(
+            pd_handoff_ms,
+            rows = self.rows,
+            bytes = self.bytes.len(),
+            "pd: handoff complete"
+        );
+        pd_handoff_ms
+    }
 }
 
 /// Where a prefill job's image goes when its slot finishes.
@@ -450,6 +464,7 @@ mod tests {
             key: "k".into(),
             rows: 3,
             bytes: vec![1, 2],
+            handoff_started: Instant::now(),
         }));
         assert!(!sink.wanted());
         sink.deliver(Err(crate::RuntimeError::Msg("late".into())));

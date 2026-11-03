@@ -8501,6 +8501,9 @@ pub struct AmdEngine {
     /// frontier. No block table, no per-block indirection, no kernel change.
     vmm: Option<VmmKv>,
     shared_prefix: Option<shared_prefix::SharedPrefix>,
+    kv_image: Option<plow_asset::live_kv::Manifest>,
+    kv_image_key: Option<String>,
+    kv_image_has_drafter: bool,
     /// `(blocks, i[8])` of the last lm_head found — the fields that differ
     /// between two packets whose op and operands are identical.
     lm_detail: std::cell::RefCell<Option<(u16, [u32; 8], usize, Vec<u16>)>>,
@@ -14164,6 +14167,33 @@ impl AmdEngine {
         // Flat KV (no pool, no shared prefix: e.g. a DCP packet) is fully backed at load and
         // already absent from `free`, so charging it again would halve the seats for nothing.
         let flat_kv = vmm.is_none() && shared_prefix.is_none();
+        let (kv_image, kv_image_key) = if flat_kv && tp.is_none() {
+            let derived = (|| -> std::result::Result<_, String> {
+                let mut m = match crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(m) => m,
+                    None => blob.with_packet_view(plow_asset::live_kv::emit)?,
+                };
+                blob.with_packet_view(|p| plow_asset::kv_image::canonical_order(p, &mut m))?;
+                let key = blob
+                    .with_packet_view(|p| plow_asset::kv_image::derive(p, &m, String::new()))?
+                    .digest();
+                Ok((m, key))
+            })();
+            match derived {
+                Ok((m, key)) => (Some(m), Some(key)),
+                Err(error) => {
+                    tracing::debug!(%error, "amd: KV image unavailable");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let kv_image_has_drafter = blob
+            .reserved_metadata(&raw, plow_asset::spec_draft::SECTION)?
+            .is_some();
         let kv_admission = free.filter(|_| !flat_kv).and_then(|free| {
             let kv_bytes: u64 = blob
                 .tensors
@@ -14461,6 +14491,9 @@ impl AmdEngine {
             kda_conv_alt_stale: vec![false; batch],
             vmm,
             shared_prefix,
+            kv_image,
+            kv_image_key,
+            kv_image_has_drafter,
             lm_detail: std::cell::RefCell::new(None),
             pf_stream: blob.progs.iter().map(|g| g.stream.clone()).collect(),
             tp,
@@ -15171,6 +15204,67 @@ impl AmdEngine {
             .position(|x| x == name)
             .ok_or_else(|| RuntimeError::Device(format!("no tensor {name:?}")))?;
         EngineDevice::download(&*self.be, &self.devp[i], 0, dst)
+    }
+
+    pub fn kv_image_key(&self) -> Option<String> {
+        self.kv_image_key.clone()
+    }
+
+    fn kv_image_manifest(&self) -> Result<&plow_asset::live_kv::Manifest> {
+        self.kv_image.as_ref().ok_or_else(|| {
+            RuntimeError::Rejected("AMD KV image requires supported flat, single-rank KV".into())
+        })
+    }
+
+    pub fn export_kv_image(&mut self, slot: usize, n: u32, out: &mut Vec<u8>) -> Result<()> {
+        let slot = u32::try_from(slot)
+            .map_err(|_| RuntimeError::Rejected("KV image: slot out of range".into()))?;
+        let (spans, total) = crate::exec::kv_image::plan(self.kv_image_manifest()?, slot, n)?;
+        self.drain()?;
+        out.clear();
+        out.resize(total as usize, 0);
+        for s in spans {
+            EngineDevice::download(
+                &*self.be,
+                &self.devp[s.handle],
+                s.native_off,
+                &mut out[s.image_off as usize..(s.image_off + s.bytes) as usize],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn import_kv_image(&mut self, slot: usize, n: u32, image: &[u8]) -> Result<()> {
+        if !self.carried_slot.is_empty() || self.kv_image_has_drafter {
+            return Err(RuntimeError::Rejected(
+                "KV image import: packets with recurrent state or a drafter are not supported"
+                    .into(),
+            ));
+        }
+        if n as usize >= self.max_ctx {
+            return Err(RuntimeError::ContextLength(
+                "KV image import leaves no room for decode".into(),
+            ));
+        }
+        let slot = u32::try_from(slot)
+            .map_err(|_| RuntimeError::Rejected("KV image: slot out of range".into()))?;
+        let (spans, total) = crate::exec::kv_image::plan(self.kv_image_manifest()?, slot, n)?;
+        if total != image.len() as u64 {
+            return Err(RuntimeError::Rejected(format!(
+                "KV image import: image is {} bytes, this packet's is {total}",
+                image.len()
+            )));
+        }
+        self.drain()?;
+        for s in spans {
+            EngineDevice::upload(
+                &*self.be,
+                &self.devp[s.handle],
+                s.native_off,
+                &image[s.image_off as usize..(s.image_off + s.bytes) as usize],
+            )?;
+        }
+        self.drain()
     }
 
     /// Read `dst.len()` bytes of a named tensor from byte `offset`.

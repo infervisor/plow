@@ -125,6 +125,25 @@ pub trait SeqEngine {
     /// its submission thread runs binds it here, once per thread.
     fn bind_engine_thread(&self) {}
     fn release(&mut self, slot: usize);
+    fn kv_image_key(&self) -> Option<String> {
+        None
+    }
+    fn export_kv_image(&mut self, _slot: usize, _n: u32, _out: &mut Vec<u8>) -> crate::Result<()> {
+        Err(crate::RuntimeError::Rejected(
+            "KV image export unavailable".into(),
+        ))
+    }
+    fn import_kv_image(
+        &mut self,
+        _slot: usize,
+        _prompt: &[u32],
+        _image: &[u8],
+        _first_token: u32,
+    ) -> crate::Result<()> {
+        Err(crate::RuntimeError::Rejected(
+            "KV image import unavailable".into(),
+        ))
+    }
     fn prefill_turn(&self) -> usize;
     fn advance_prefill_turn(&mut self, slot: usize);
     fn prefill_prog_t(&self, prog: usize) -> Option<u32>;
@@ -4236,6 +4255,61 @@ mod amd_serve {
             }
         }
 
+        pub fn kv_image_key(&self) -> Option<String> {
+            match &self.ranks {
+                Ranks::One(e) => e.kv_image_key(),
+                Ranks::Tp(_) => None,
+            }
+        }
+
+        pub fn export_kv_image(&mut self, slot: usize, n: u32, out: &mut Vec<u8>) -> Result<()> {
+            self.check_slot(slot)?;
+            if !self.live[slot] || self.pf[slot].is_some() || self.pos[slot] != n {
+                return Err(RuntimeError::Rejected(format!(
+                    "KV image export: slot {slot} is not at the completed {n}-row frontier"
+                )));
+            }
+            match &mut self.ranks {
+                Ranks::One(e) => e.export_kv_image(slot, n, out),
+                Ranks::Tp(_) => Err(RuntimeError::Rejected("KV image: TP unsupported".into())),
+            }
+        }
+
+        pub fn import_kv_image(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            image: &[u8],
+            first_token: u32,
+        ) -> Result<()> {
+            self.check_slot(slot)?;
+            let n = u32::try_from(prompt.len())
+                .map_err(|_| RuntimeError::Rejected("KV image: prompt too long".into()))?;
+            self.invalidate_prefix(slot);
+            self.cached_prompt[slot].clear();
+            self.snap_at[slot] = 0;
+            self.end_logits[slot].clear();
+            self.lp_row[slot] = usize::MAX;
+            self.head_rows[slot] = 0;
+            self.pf[slot] = None;
+            self.live[slot] = false;
+            self.pos[slot] = 0;
+            self.cached_rows[slot] = 0;
+            match &mut self.ranks {
+                Ranks::One(e) => {
+                    e.begin_slot(slot)?;
+                    e.import_kv_image(slot, n, image)?;
+                }
+                Ranks::Tp(_) => {
+                    return Err(RuntimeError::Rejected("KV image: TP unsupported".into()))
+                }
+            }
+            self.pos[slot] = n;
+            self.live[slot] = true;
+            self.next_id[slot] = first_token;
+            Ok(())
+        }
+
         pub fn release(&mut self, slot: usize) {
             if slot < self.batch {
                 self.ranks.release_shared_prefix(slot);
@@ -5590,6 +5664,21 @@ mod amd_serve {
 
 #[cfg(feature = "hsa")]
 impl SeqEngine for AmdServe {
+    fn kv_image_key(&self) -> Option<String> {
+        AmdServe::kv_image_key(self)
+    }
+    fn export_kv_image(&mut self, slot: usize, n: u32, out: &mut Vec<u8>) -> crate::Result<()> {
+        AmdServe::export_kv_image(self, slot, n, out)
+    }
+    fn import_kv_image(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        image: &[u8],
+        first_token: u32,
+    ) -> crate::Result<()> {
+        AmdServe::import_kv_image(self, slot, prompt, image, first_token)
+    }
     fn stop_ids(&self) -> &Arc<Vec<u32>> {
         AmdServe::stop_ids(self)
     }
