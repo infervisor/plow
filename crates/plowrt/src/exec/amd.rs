@@ -15206,6 +15206,11 @@ impl AmdEngine {
         EngineDevice::download(&*self.be, &self.devp[i], 0, dst)
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn kv_image_staging(&self) -> Arc<dyn crate::device::host_region::HostStaging> {
+        self.be.clone()
+    }
+
     pub fn kv_image_key(&self) -> Option<String> {
         self.kv_image_key.clone()
     }
@@ -15216,13 +15221,24 @@ impl AmdEngine {
         })
     }
 
-    pub fn export_kv_image(&mut self, slot: usize, n: u32, out: &mut Vec<u8>) -> Result<()> {
+    pub fn export_kv_image(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+    ) -> Result<()> {
         let slot = u32::try_from(slot)
             .map_err(|_| RuntimeError::Rejected("KV image: slot out of range".into()))?;
         let (spans, total) = crate::exec::kv_image::plan(self.kv_image_manifest()?, slot, n)?;
         self.drain()?;
-        out.clear();
-        out.resize(total as usize, 0);
+        out.prepare(total as usize, hwspec::Vendor::Amd);
+        #[cfg(target_os = "linux")]
+        if out.transfer(&*self.be, &spans, &self.devp, true)? {
+            return Ok(());
+        }
+        let crate::serve::pd::KvBytes::Pageable(out) = out else {
+            return Err(RuntimeError::Device("KV image: unregistered export slab".into()));
+        };
         for s in spans {
             EngineDevice::download(
                 &*self.be,
@@ -15234,7 +15250,12 @@ impl AmdEngine {
         Ok(())
     }
 
-    pub fn import_kv_image(&mut self, slot: usize, n: u32, image: &[u8]) -> Result<()> {
+    pub fn import_kv_image(
+        &mut self,
+        slot: usize,
+        n: u32,
+        image: &crate::serve::pd::KvBytes,
+    ) -> Result<()> {
         if !self.carried_slot.is_empty() || self.kv_image_has_drafter {
             return Err(RuntimeError::Rejected(
                 "KV image import: packets with recurrent state or a drafter are not supported"
@@ -15256,6 +15277,10 @@ impl AmdEngine {
             )));
         }
         self.drain()?;
+        #[cfg(target_os = "linux")]
+        if image.transfer(&*self.be, &spans, &self.devp, false)? {
+            return Ok(());
+        }
         for s in spans {
             EngineDevice::upload(
                 &*self.be,

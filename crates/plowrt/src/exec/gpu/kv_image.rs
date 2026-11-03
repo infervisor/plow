@@ -22,7 +22,12 @@ impl GpuEngine {
     /// Slot `b`'s rows `[.., n)` into `out`. `n` is the slot's frontier and the slot has not
     /// decoded (a P/D prefill job's slot, right after its first token): a sliding ring then still
     /// holds every row the image carries.
-    pub fn export_kv_image(&mut self, b: usize, n: u32, out: &mut Vec<u8>) -> Result<()> {
+    pub fn export_kv_image(
+        &mut self,
+        b: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+    ) -> Result<()> {
         if b >= self.batch || self.pos[b] != n || self.kv_hw[b] > n {
             return Err(RuntimeError::Rejected(format!(
                 "KV image export: slot {b} stands at {} (written to {}), {n} asked",
@@ -33,8 +38,14 @@ impl GpuEngine {
         let (spans, total) = plan(self.kv_image_manifest()?, b as u32, n)?;
         // The rows were written by launches on the engine stream.
         self.be.synchronize()?;
-        out.clear();
-        out.resize(total as usize, 0);
+        out.prepare(total as usize, hwspec::Vendor::Nvidia);
+        #[cfg(target_os = "linux")]
+        if out.transfer(&*self.be, &spans, &self.devp, true)? {
+            return Ok(());
+        }
+        let crate::serve::pd::KvBytes::Pageable(out) = out else {
+            return Err(RuntimeError::Device("KV image: unregistered export slab".into()));
+        };
         for s in &spans {
             let dst = &mut out[s.image_off as usize..(s.image_off + s.bytes) as usize];
             EngineDevice::download(&*self.be, &self.devp[s.handle], s.native_off, dst)?;
@@ -45,7 +56,12 @@ impl GpuEngine {
     /// Seat slot `b`, fresh from [`Self::begin_slot`], with `prompt`'s KV from an image another
     /// engine exported. The slot then stands where its own prefill of `prompt` would leave it:
     /// the first generated token is the caller's to feed at position `prompt.len()`.
-    pub fn import_kv_image(&mut self, b: usize, prompt: &[u32], image: &[u8]) -> Result<()> {
+    pub fn import_kv_image(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        image: &crate::serve::pd::KvBytes,
+    ) -> Result<()> {
         let n = u32::try_from(prompt.len())
             .map_err(|_| RuntimeError::Rejected("KV image: prompt too long".into()))?;
         if b >= self.batch || self.pos[b] != 0 {
@@ -80,11 +96,19 @@ impl GpuEngine {
         if let Some(v) = &self.vmm {
             v.ensure_rows(b, n)?;
         }
-        for s in &spans {
-            let src = &image[s.image_off as usize..(s.image_off + s.bytes) as usize];
-            EngineDevice::upload(&*self.be, &self.devp[s.handle], s.native_off, src)?;
-        }
+        // The staging stream must not race earlier writes to this slot.
         self.be.synchronize()?;
+        #[cfg(target_os = "linux")]
+        let staged = image.transfer(&*self.be, &spans, &self.devp, false)?;
+        #[cfg(not(target_os = "linux"))]
+        let staged = false;
+        if !staged {
+            for s in &spans {
+                let src = &image[s.image_off as usize..(s.image_off + s.bytes) as usize];
+                EngineDevice::upload(&*self.be, &self.devp[s.handle], s.native_off, src)?;
+            }
+            self.be.synchronize()?;
+        }
         self.pos[b] = n;
         self.kv_hw[b] = n;
         // The history stays complete (decode consumers check it against the frontier), but the

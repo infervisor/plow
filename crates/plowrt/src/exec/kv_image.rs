@@ -15,6 +15,100 @@ use plow_asset::live_kv::{Manifest, LAYOUT_HEAD_MAJOR, LAYOUT_ROW_INTERLEAVED};
 
 use crate::{Result, RuntimeError};
 
+pub enum KvBytes {
+    #[cfg(target_os = "linux")]
+    Pooled(crate::device::host_region::RegionLease),
+    Pageable(Vec<u8>),
+}
+
+impl Default for KvBytes {
+    fn default() -> Self {
+        Self::Pageable(Vec::new())
+    }
+}
+
+impl From<Vec<u8>> for KvBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Pageable(bytes)
+    }
+}
+
+impl std::ops::Deref for KvBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Pooled(lease) => lease.bytes(),
+            Self::Pageable(bytes) => bytes,
+        }
+    }
+}
+
+impl KvBytes {
+    pub fn is_staged(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Pooled(_) => true,
+            Self::Pageable(_) => false,
+        }
+    }
+
+    pub(crate) fn prepare(&mut self, bytes: usize, vendor: hwspec::Vendor) {
+        #[cfg(target_os = "linux")]
+        if self.is_staged() {
+            *self = Self::default();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(lease) = crate::device::host_region::RegionLease::take(bytes, vendor) {
+            *self = Self::Pooled(lease);
+            return;
+        }
+        let _ = vendor;
+        if let Self::Pageable(out) = self {
+            out.clear();
+            out.resize(bytes, 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn transfer(
+        &self,
+        driver: &dyn crate::device::host_region::HostStaging,
+        spans: &[ImageSpan],
+        devp: &[crate::device::DeviceMem],
+        export: bool,
+    ) -> Result<bool> {
+        let Self::Pooled(lease) = self else {
+            return Ok(false);
+        };
+        let Some(alias) = lease.alias(driver.staging_vendor()) else {
+            return Ok(false);
+        };
+        lease.set_ready(false);
+        let mut last = None;
+        let queued: Result<()> = (|| {
+            for s in spans {
+                let host = alias + s.image_off;
+                let dev = devp[s.handle].base + s.native_off;
+                last = Some(if export {
+                    driver.stage_d2h(host, dev, s.bytes)?
+                } else {
+                    driver.stage_h2d(dev, host, s.bytes)?
+                });
+            }
+            Ok(())
+        })();
+        // Drain already submitted copies even if submitting a later span failed.
+        if let Some(fence) = last {
+            driver.stage_wait(fence)?;
+        }
+        lease.set_ready(true);
+        queued?;
+        Ok(true)
+    }
+}
+
 /// One contiguous copy between a cache tensor and the image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ImageSpan {
@@ -113,6 +207,7 @@ pub(crate) fn plan(m: &Manifest, slot: u32, n: u32) -> Result<(Vec<ImageSpan>, u
 mod tests {
     use super::*;
     use plow_asset::live_kv::Cache;
+
 
     fn manifest(caches: Vec<Cache>) -> Manifest {
         Manifest {

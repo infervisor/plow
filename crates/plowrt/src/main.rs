@@ -4427,6 +4427,8 @@ async fn bringup_runtime(
     };
     // `--pd`: a DP model's prefill and decode pools, checked against its rank count.
     let pd_specs = plowrt::serve::pd::parse_pd(&RuntimeConfig::get().pd)?;
+    #[cfg(target_os = "linux")]
+    let mut pd_drivers: Vec<Arc<dyn plowrt::device::host_region::HostStaging>> = Vec::new();
     let pd_of = |model: &str, n: usize| -> Result<Option<plowrt::serve::pd::PdSpec>, String> {
         match pd_specs.iter().find(|(m, _)| m == model) {
             None => Ok(None),
@@ -4582,6 +4584,12 @@ async fn bringup_runtime(
                         format!("device {d} of {visible_count} visible will not open: {e}").into(),
                     )
                 }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !pd_specs.is_empty() {
+            for (_, be) in &backends {
+                pd_drivers.push(be.clone());
             }
         }
         let visible: Vec<u32> = backends.iter().map(|(d, _)| *d).collect();
@@ -4797,7 +4805,6 @@ async fn bringup_runtime(
                         })
                         .collect();
                     let mut set = DpSet::new(model, ranks);
-                    set.pd = pd_of(model, set.ranks.len())?;
                     for r in &mut set.ranks {
                         let be = backends
                             .iter()
@@ -4829,6 +4836,8 @@ async fn bringup_runtime(
                         );
                         continue;
                     }
+                    // A mixed-vendor set takes its pools once its AMD ranks join it.
+                    set.pd = pd_of(model, set.ranks.len())?;
                     tracing::info!(
                         %model,
                         dp = n,
@@ -5183,6 +5192,10 @@ async fn bringup_runtime(
                 let first = u8::try_from(group.first())
                     .map_err(|_| "device ordinal out of range".to_string())?;
                 let be = Arc::new(plowrt::device::hsa::HsaBackend::new(first)?);
+                #[cfg(target_os = "linux")]
+                if !pd_specs.is_empty() {
+                    pd_drivers.push(be.clone());
+                }
                 let group_models: Vec<(String, PathBuf, PathBuf)> = specs
                     .iter()
                     .enumerate()
@@ -5244,6 +5257,7 @@ async fn bringup_runtime(
     }
     // Every rank's caches must mean what the prefill rank's do (the import re-checks per image).
     let mut digests = std::collections::HashMap::new();
+    let mut pd_image_bytes = 0;
     for (m, spec) in &pd_specs {
         let Some(set) = state.dp_set(m) else { continue };
         let headers: Vec<_> = set
@@ -5258,8 +5272,20 @@ async fn bringup_runtime(
             })
             .collect();
         plowrt::serve::pd::check_headers(m, *spec, &headers)?;
+        for r in &set.ranks {
+            if (spec.prefill | spec.decode) >> r.rank & 1 != 0 {
+                let b = state.registry.bundle_for(m, r.vendor)?;
+                pd_image_bytes = pd_image_bytes.max(plowrt::serve::pd::kv_image_capacity(&b.dir, None)?);
+            }
+        }
         if let Some(Ok(h)) = headers.first() {
             tracing::info!(model = %m, header = %h.digest(), weights = %h.weights, "pd: KV image headers agree");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if pd_image_bytes > 0 {
+        if let Err(err) = plowrt::device::host_region::prepare_image_pool(pd_image_bytes, &pd_drivers) {
+            tracing::warn!(error = %err, "pd: host staging unavailable; using pageable images");
         }
     }
     #[cfg(feature = "cuda")]

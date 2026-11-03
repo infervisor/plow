@@ -121,7 +121,7 @@ fn kv_image_peer_bench(
         &headers,
     )?;
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(nv_device)?);
-    let mut nv = plowrt::exec::gpu::GpuEngine::load(be, nv_dir, &checkpoint_dir(nv_dir))?;
+    let mut nv = plowrt::exec::gpu::GpuEngine::load(be.clone(), nv_dir, &checkpoint_dir(nv_dir))?;
     let blob =
         plowrt::asset::devblob::DevBlob::find_in_dir(amd_dir)?.ok_or("AMD peer has no packet")?;
     let hsaco = amd_dir.join("hsaco");
@@ -167,7 +167,24 @@ fn kv_image_peer_bench(
         (0..ctx).map(|i| 100 + (i % 1000) as u32).collect()
     };
     let n = u32::try_from(ctx)?;
-    let (mut a, mut b) = (Vec::new(), Vec::new());
+    #[cfg(target_os = "linux")]
+    {
+        let bytes = [nv_dir, amd_dir]
+            .into_iter()
+            .map(|dir| plowrt::serve::pd::kv_image_capacity(dir, Some(n)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .unwrap();
+        plowrt::device::host_region::prepare_image_pool(
+            bytes,
+            &[be, amd.kv_image_staging().ok_or("AMD staging unavailable")?],
+        )?;
+    }
+    let (mut a, mut b) = (
+        plowrt::serve::pd::KvBytes::default(),
+        plowrt::serve::pd::KvBytes::default(),
+    );
     let first = if main_nv {
         nv.begin_slot(nv_slot, ctx + 1)?;
         if nv.has_prefill() {
@@ -185,6 +202,9 @@ fn kv_image_peer_bench(
         amd.export_kv_image(amd_slot, n, &mut a)?;
     }
     let export_ms = t.elapsed().as_secs_f64() * 1e3;
+    if !a.is_staged() {
+        return Err("KV image peer benchmark requires a staging lease".into());
+    }
     let t = Instant::now();
     if main_nv {
         amd.import_kv_image(amd_slot, &prompt, &a, first)?;
@@ -199,11 +219,12 @@ fn kv_image_peer_bench(
         nv.export_kv_image(nv_slot, n, &mut b)?;
     }
     println!(
-        "KV_IMAGE_XV bytes={} exact={} export_ms={export_ms:.4} import_ms={import_ms:.4}",
+        "KV_IMAGE_XV bytes={} exact={} staged={} export_ms={export_ms:.4} import_ms={import_ms:.4}",
         a.len(),
-        u8::from(a == b)
+        u8::from(*a == *b),
+        u8::from(a.is_staged())
     );
-    if a != b {
+    if *a != *b {
         return Err("cross-vendor KV image re-export differs".into());
     }
     let mut tokens = Vec::new();
@@ -579,7 +600,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         let n = prompt_for(0).len() as u32;
-        let (mut image, mut again) = (Vec::new(), Vec::new());
+        let (mut image, mut again) = (
+            plowrt::serve::pd::KvBytes::default(),
+            plowrt::serve::pd::KvBytes::default(),
+        );
         let t0 = Instant::now();
         e.export_kv_image(0, n, &mut image)?;
         let export_s = t0.elapsed().as_secs_f64();
@@ -589,7 +613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             e.import_kv_image(b, &prompt_for(b), &image)?;
             last[b] = last[0];
             e.export_kv_image(b, n, &mut again)?;
-            exact += usize::from(again == image);
+            exact += usize::from(*again == *image);
         }
         println!(
             "KV_IMAGE rows={n} bytes={} export_s={export_s:.4} roundtrip_exact={exact}/{} key={}",

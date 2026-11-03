@@ -128,7 +128,12 @@ pub trait SeqEngine {
     fn kv_image_key(&self) -> Option<String> {
         None
     }
-    fn export_kv_image(&mut self, _slot: usize, _n: u32, _out: &mut Vec<u8>) -> crate::Result<()> {
+    fn export_kv_image(
+        &mut self,
+        _slot: usize,
+        _n: u32,
+        _out: &mut crate::serve::pd::KvBytes,
+    ) -> crate::Result<()> {
         Err(crate::RuntimeError::Rejected(
             "KV image export unavailable".into(),
         ))
@@ -137,7 +142,7 @@ pub trait SeqEngine {
         &mut self,
         _slot: usize,
         _prompt: &[u32],
-        _image: &[u8],
+        _image: &crate::serve::pd::KvBytes,
         _first_token: u32,
     ) -> crate::Result<()> {
         Err(crate::RuntimeError::Rejected(
@@ -4255,6 +4260,14 @@ mod amd_serve {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        pub fn kv_image_staging(&self) -> Option<Arc<dyn crate::device::host_region::HostStaging>> {
+            match &self.ranks {
+                Ranks::One(e) => Some(e.kv_image_staging()),
+                Ranks::Tp(_) => None,
+            }
+        }
+
         pub fn kv_image_key(&self) -> Option<String> {
             match &self.ranks {
                 Ranks::One(e) => e.kv_image_key(),
@@ -4262,7 +4275,12 @@ mod amd_serve {
             }
         }
 
-        pub fn export_kv_image(&mut self, slot: usize, n: u32, out: &mut Vec<u8>) -> Result<()> {
+        pub fn export_kv_image(
+            &mut self,
+            slot: usize,
+            n: u32,
+            out: &mut crate::serve::pd::KvBytes,
+        ) -> Result<()> {
             self.check_slot(slot)?;
             if !self.live[slot] || self.pf[slot].is_some() || self.pos[slot] != n {
                 return Err(RuntimeError::Rejected(format!(
@@ -4279,7 +4297,7 @@ mod amd_serve {
             &mut self,
             slot: usize,
             prompt: &[u32],
-            image: &[u8],
+            image: &crate::serve::pd::KvBytes,
             first_token: u32,
         ) -> Result<()> {
             self.check_slot(slot)?;
@@ -5667,14 +5685,19 @@ impl SeqEngine for AmdServe {
     fn kv_image_key(&self) -> Option<String> {
         AmdServe::kv_image_key(self)
     }
-    fn export_kv_image(&mut self, slot: usize, n: u32, out: &mut Vec<u8>) -> crate::Result<()> {
+    fn export_kv_image(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+    ) -> crate::Result<()> {
         AmdServe::export_kv_image(self, slot, n, out)
     }
     fn import_kv_image(
         &mut self,
         slot: usize,
         prompt: &[u32],
-        image: &[u8],
+        image: &crate::serve::pd::KvBytes,
         first_token: u32,
     ) -> crate::Result<()> {
         AmdServe::import_kv_image(self, slot, prompt, image, first_token)

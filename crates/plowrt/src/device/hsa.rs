@@ -1119,6 +1119,8 @@ pub struct HsaBackend {
     /// `DeviceFree`) don't guard and still attempt their calls.
     poisoned: std::sync::OnceLock<DeviceErrorInfo>,
     copy_tier: parking_lot::Mutex<Option<HsaCopyTier>>,
+    #[cfg(target_os = "linux")]
+    stage_fences: super::host_region::StageFences,
 }
 
 struct HsaCopyTier {
@@ -1163,6 +1165,7 @@ impl HsaBackend {
         src_agent: HsaAgent,
         bytes: u64,
         what: &str,
+        dependency: Option<u64>,
     ) -> Result<u64> {
         self.guard()?;
         let mut tier_lock = self.copy_tier.lock();
@@ -1174,6 +1177,13 @@ impl HsaBackend {
                 failed: rustc_hash::FxHashSet::default(),
             }),
         };
+        let dependency = dependency
+            .map(|f| {
+                tier.signals.get(&f).copied().ok_or_else(|| {
+                    RuntimeError::Device("staging: unknown dependency".into())
+                })
+            })
+            .transpose()?;
         let sig = match tier.spare.pop() {
             Some(s) => {
                 unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
@@ -1194,8 +1204,10 @@ impl HsaBackend {
                 src as *const c_void,
                 src_agent,
                 bytes as usize,
-                0,
-                std::ptr::null(),
+                u32::from(dependency.is_some()),
+                dependency
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const HsaSignal),
                 sig,
             )
         };
@@ -1596,6 +1608,8 @@ impl HsaBackend {
             vmm_provenance: parking_lot::Mutex::new(super::provenance::VmmProvenance::default()),
             poisoned: std::sync::OnceLock::new(),
             copy_tier: parking_lot::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            stage_fences: Default::default(),
         })
     }
 
@@ -4447,15 +4461,39 @@ impl super::host_region::HostStaging for HsaBackend {
     }
 
     fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64> {
-        crate::memory::vmm::VmmOps::copy_dtoh_async(self, host, src, bytes)
+        self.stage_fences.submit(|dependency| {
+            self.fenced_copy(
+                host,
+                self.cpu_agent,
+                src,
+                self.agent,
+                bytes,
+                "hsa_amd_memory_async_copy (staging D2H)",
+                dependency,
+            )
+        })
     }
 
     fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64> {
-        crate::memory::vmm::VmmOps::copy_htod_async(self, dst, host, bytes)
+        self.stage_fences.submit(|dependency| {
+            self.fenced_copy(
+                dst,
+                self.agent,
+                host,
+                self.cpu_agent,
+                bytes,
+                "hsa_amd_memory_async_copy (staging H2D)",
+                dependency,
+            )
+        })
     }
 
     fn stage_wait(&self, fence: u64) -> Result<()> {
-        crate::memory::vmm::VmmOps::fence_wait(self, fence)
+        self.stage_fences.wait(
+            fence,
+            |f| crate::memory::vmm::VmmOps::fence_wait(self, f),
+            |f| crate::memory::vmm::VmmOps::fence_done(self, f),
+        )
     }
 }
 
@@ -4730,6 +4768,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             self.agent,
             bytes,
             "hsa_amd_memory_async_copy (vmm spill D2H)",
+            None,
         )
     }
 
@@ -4741,6 +4780,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             self.cpu_agent,
             bytes,
             "hsa_amd_memory_async_copy (H2D async)",
+            None,
         )
     }
 

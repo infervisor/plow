@@ -538,6 +538,7 @@ impl SharedAsr {
                 mm: None,
                 export: None,
                 import: None,
+                prompt_logprobs: false,
             },
         };
         // Released once the job is on the channel: the dispatcher drains it, not closes on it.
