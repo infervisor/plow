@@ -11654,6 +11654,16 @@ mod tests {
         p.shared.inner.lock().spares
     }
 
+    /// Bounded [`VmmKv::sync_reclaim`], twice: the jobs queued so far, then the refill a
+    /// copy-out queues behind them. True once both ran within `limit` each.
+    fn reclaim_settled_within(p: &VmmKv, limit: std::time::Duration) -> bool {
+        let Some(tx) = &p.premap_tx else { return true };
+        (0..2).all(|_| {
+            let (reply, done) = std::sync::mpsc::channel();
+            tx.send(Job::Sync(reply)).is_ok() && done.recv_timeout(limit).is_ok()
+        })
+    }
+
     /// The copy-out gives the cache copies of the released slot's shared row 0 without a single
     /// unmap: the next occupant keeps row 0 in place, and another slot attaches the copies.
     #[test]
@@ -11854,7 +11864,15 @@ mod tests {
                 p.release_prefix(0);
                 p.retire_released(0);
             }
+            // The think time, then the reclaimer's turn: a loaded host can starve its thread
+            // past 25 ms, which is scheduling, not the admission path under test.
             std::thread::sleep(std::time::Duration::from_millis(25));
+            for (rank, (_, p)) in ranks.iter().enumerate() {
+                assert!(
+                    reclaim_settled_within(p, std::time::Duration::from_secs(5)),
+                    "request {request} rank {rank}: reclaim not settled (5 s per round)"
+                );
+            }
         }
         println!("C1 model: worst begin_seq across ranks {worst:?}");
         for (ops, p) in ranks {

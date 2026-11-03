@@ -156,6 +156,7 @@ const GEN_DECODE_STEP_DEFAULT: Status = Status::Candidate {
     evidence: &[
         "scripts/gen_kernels/bench_decode.py (k1tune2, H100): the generated hd256 GQA6 flash decode 59 / 200 / 356 / 288 us at B8x4K / B16x8K / B16x15K / B48x4K; the interpreter FlashDecode runs 3.8x the HBM floor at B16x8K",
         "plans/qwen38-27b-h100.md (ab71/ab72, build71/72, step_bench ms, interpreter pair vs object, 4K / 15K): B1 23.85 vs 24.18 / 24.30 vs 25.20; B2 25.08 vs 25.10 / 26.01 vs 26.02; B4 26.90 vs 26.49 / 28.74 vs 27.40; B8 28.21 vs 27.39 / 31.82 vs 29.44; B16 33.46 vs 31.56 / 40.71 vs 35.56; B32 42.78 vs 38.32 (4K): the object from 4 rows",
+        "Qwen3.8-27B FP8 H100 (segmented cuBLASLt / native FP8 rungs, step_bench ctx 4096, interpreter pair vs object at 1 / 2 rows): 14.05 vs 13.56 / 14.69 vs 13.70 ms; BF16 (one-launch rungs) 22.19 vs 22.56 / 23.27 vs 23.38: the FP8 recipe sets 1, the default stays 4",
         "`=0` is the rollback to the interpreter pair",
     ],
 };
