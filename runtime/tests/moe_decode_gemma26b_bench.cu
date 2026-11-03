@@ -17,6 +17,9 @@
  * Build: nvcc -gencode arch=compute_90a,code=sm_90a -O3 -DPLOW_NV_GEMMA=1 \
  *        -DPLOW_NV_HOPPER=1 -DPLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 \
  *        -I runtime/common -I runtime/nvidia runtime/tests/moe_decode_gemma26b_bench.cu
+ * Row-invariance check of the served router: add the recipe's -DPLOW_NV_ROUTER_V8=1
+ * -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1 (and -DPLOW_NV_ROUTER_ROW_INVARIANT=1), run with
+ * MOE_CHECK_ONLY=1.
  */
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -144,6 +147,45 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(k_down, cudaFuncAttributeMaxDynamicSharedMemorySize,(int)arena_bytes));
     CK(cudaFuncSetAttribute(k_score,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)arena_bytes));
     CK(cudaFuncSetAttribute(k_topk, cudaFuncAttributeMaxDynamicSharedMemorySize,(int)arena_bytes));
+
+    /* Row invariance of the served router (ScoreFast + top-k at the emitter's CTA counts): row 0
+     * must score and route to the same bits at every decode rung whatever its companions are.
+     * Non-unit scale so the h2 association is visible. Exit 1 on any difference. */
+    {
+        CK(cudaFuncSetAttribute(k_score_fast,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)arena_bytes));
+        std::vector<bf16> hs(H);
+        for (auto& v : hs) v = __float2bfloat16(1.0f + rnd() * 0.5f);
+        bf16* d_s = nullptr; CK(cudaMalloc(&d_s, H * sizeof(bf16)));
+        CK(cudaMemcpy(d_s, hs.data(), H * sizeof(bf16), cudaMemcpyHostToDevice));
+        const unsigned BMAX = 32;
+        std::vector<bf16> hx((size_t)BMAX * H);
+        for (auto& v : hx) v = __float2bfloat16(rnd() * 2.0f);
+        bf16* d_x = nullptr; CK(cudaMalloc(&d_x, hx.size() * sizeof(bf16)));
+        float* d_sc = nullptr; CK(cudaMalloc(&d_sc, (size_t)BMAX * n_exp * sizeof(float)));
+        unsigned char* d_tb = nullptr; CK(cudaMalloc(&d_tb, (size_t)BMAX * k * 8));
+        const float root = 1.0f / sqrtf((float)H);
+        std::vector<float> s1(n_exp), sb(n_exp);
+        std::vector<unsigned char> t1(k * 8), tb(k * 8);
+        bool ok = true;
+        for (unsigned B : {1u, 2u, 4u, 8u, 16u, 32u}) {
+            for (unsigned r = 1; r < B; r++)  /* fresh companions per rung */
+                for (unsigned h = 0; h < H; h++) hx[(size_t)r * H + h] = __float2bfloat16(rnd() * 2.0f);
+            CK(cudaMemcpy(d_x, hx.data(), (size_t)B * H * sizeof(bf16), cudaMemcpyHostToDevice));
+            k_score_fast<<<(B * n_exp + 7u) / 8u, 256, arena_bytes>>>(d_sc, d_x, d_proj, d_s, H, n_exp, root, 1e-6f, B);
+            k_topk<<<B, 256, arena_bytes>>>(d_tb, d_sc, d_pes, n_exp, k, B);
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(sb.data(), d_sc, n_exp * sizeof(float), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(tb.data(), d_tb, k * 8, cudaMemcpyDeviceToHost));
+            if (B == 1) { s1 = sb; t1 = tb; continue; }
+            const bool same_s = memcmp(s1.data(), sb.data(), n_exp * sizeof(float)) == 0;
+            const bool same_t = memcmp(t1.data(), tb.data(), k * 8) == 0;
+            printf("ROW_INVARIANT B=%u scores %s table %s\n", B, same_s ? "same" : "DIFF", same_t ? "same" : "DIFF");
+            ok = ok && same_s && same_t;
+        }
+        printf("ROW_INVARIANT %s\n", ok ? "PASS" : "FAIL");
+        cudaFree(d_s); cudaFree(d_x); cudaFree(d_sc); cudaFree(d_tb);
+        if (!ok || getenv("MOE_CHECK_ONLY")) return ok ? 0 : 1;
+    }
 
     printf("\n%6s | %10s %10s %10s %10s | %9s %9s\n",
            "B","score ms","topk ms","glu ms","down ms","MoE/tok","GB/s glu");

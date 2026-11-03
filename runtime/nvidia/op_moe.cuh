@@ -443,6 +443,11 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #ifndef PLOW_NV_ROUTER_V9
 #define PLOW_NV_ROUTER_V9 0
 #endif
+/* 1: the B=1 router h2 uses the B>1 association x*inv*(s*root), so a row scores the same bits at
+ * every decode rung. */
+#ifndef PLOW_NV_ROUTER_ROW_INVARIANT
+#define PLOW_NV_ROUTER_ROW_INVARIANT 0
+#endif
 #ifndef PLOW_MOE_ROUTER_WIDE
 #define PLOW_MOE_ROUTER_WIDE 0
 #endif
@@ -881,7 +886,8 @@ static __device__ __noinline__ void plow_moe_router_score_v9(
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const float x = __bfloat162float(xv[q].x[j]), s = __bfloat162float(sv[q].x[j]);
-                h2[v * 8u + j] = nrow == 1u ? x * invrms * s * root : x * invrms * (s * root);
+                h2[v * 8u + j] = nrow == 1u && !PLOW_NV_ROUTER_ROW_INVARIANT ? x * invrms * s * root
+                                                                        : x * invrms * (s * root);
             }
         }
         __syncthreads();
@@ -966,7 +972,9 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
             const bf16v8 rv = ld_glob8(resid + v8 * 8u), sv = ld_glob8(scale + v8 * 8u);
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                const float v = __bfloat162float(rv.x[j]) * invrms * __bfloat162float(sv.x[j]) * root;
+                const float v = PLOW_NV_ROUTER_ROW_INVARIANT
+                                    ? __bfloat162float(rv.x[j]) * invrms * (__bfloat162float(sv.x[j]) * root)
+                                    : __bfloat162float(rv.x[j]) * invrms * __bfloat162float(sv.x[j]) * root;
 #if PLOW_MOE_XN_BF16
                 h2s[v8 * 8u + j] = __float2bfloat16(v);
 #else
@@ -978,7 +986,9 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
 #else
         for (unsigned h = tid; h < H; h += blockDim.x) {
 #endif
-            const float v = __bfloat162float(resid[h]) * invrms * __bfloat162float(scale[h]) * root;
+            const float v = PLOW_NV_ROUTER_ROW_INVARIANT
+                                ? __bfloat162float(resid[h]) * invrms * (__bfloat162float(scale[h]) * root)
+                                : __bfloat162float(resid[h]) * invrms * __bfloat162float(scale[h]) * root;
 #if PLOW_MOE_XN_BF16
             h2s[h] = __float2bfloat16(v);
 #else

@@ -620,8 +620,142 @@ mod cuda {
             )?;
             row0 = row1;
         }
+        if let Some(route) = flag("--permute") {
+            let library = match route.as_str() {
+                "library" => true,
+                "native" => false,
+                _ => return Err("--permute takes the expected attention route: library|native".into()),
+            };
+            permute_check(e, hidden, out_name, &rows, &inputs, library, &|e| {
+                prepare(e)?;
+                Ok(requests_in(&slots, &prompts, &starts, &rows))
+            })?;
+        }
         println!("packed-check: requests={} query_rows={} kv_base={} serial_ms={serial_ms:.4} packed_ms={packed_ms:.4} parity=PASS",
             slots.len(), rows.iter().sum::<usize>(), starts[0] + rows[0]);
+        Ok(())
+    }
+
+    fn requests_in<'a>(
+        slots: &[usize],
+        prompts: &'a [Vec<u32>],
+        starts: &[usize],
+        rows: &[usize],
+    ) -> Vec<plowrt::exec::gpu::PfBatchReq<'a>> {
+        (0..slots.len())
+            .map(|request| plowrt::exec::gpu::PfBatchReq {
+                slot: slots[request],
+                prompt: &prompts[request],
+                c0: starts[request],
+                len: rows[request],
+            })
+            .collect()
+    }
+
+    /// `packed-check --permute library|native`: the same rung's launch re-packed in reverse
+    /// request order, with each half of the requests' inputs perturbed, and without its last
+    /// request (when the rest still lands on the same rung) must give every unperturbed request
+    /// the first packed run's exact activation bits: co-packed rows and packing order do not
+    /// reach a row. Every run must take the expected attention route.
+    #[allow(clippy::too_many_arguments)]
+    fn permute_check<'a>(
+        e: &mut plowrt::exec::gpu::GpuEngine,
+        hidden: usize,
+        out_name: &str,
+        rows: &[usize],
+        inputs: &[f32],
+        library: bool,
+        prepare: &dyn Fn(
+            &mut plowrt::exec::gpu::GpuEngine,
+        )
+            -> Result<Vec<plowrt::exec::gpu::PfBatchReq<'a>>, plowrt::RuntimeError>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let offsets: Vec<usize> = rows
+            .iter()
+            .scan(0, |acc, &r| {
+                let at = *acc;
+                *acc += r;
+                Some(at)
+            })
+            .collect();
+        let span = |r: usize| offsets[r] * hidden..(offsets[r] + rows[r]) * hidden;
+        let n = rows.len();
+        let alt = synth(rows.iter().sum::<usize>() + 7, hidden);
+        let total: usize = rows.iter().sum();
+        let mut variants: Vec<(&str, Vec<usize>, Vec<bool>)> = vec![
+            ("as packed", (0..n).collect(), vec![false; n]),
+            ("reversed", (0..n).rev().collect(), vec![false; n]),
+            ("even perturbed", (0..n).collect(), (0..n).map(|r| r % 2 == 0).collect()),
+            ("odd perturbed", (0..n).collect(), (0..n).map(|r| r % 2 == 1).collect()),
+        ];
+        if n > 1 && e.pf_cover_rows(total - rows[n - 1]) == e.pf_cover_rows(total) {
+            variants.push(("last dropped", (0..n - 1).collect(), vec![false; n]));
+        }
+        let mut reference: Option<Vec<Vec<u32>>> = None;
+        for (label, order, perturbed) in variants {
+            let requests = prepare(e)?;
+            let mut x = Vec::with_capacity(inputs.len());
+            for &r in &order {
+                if perturbed[r] {
+                    x.extend_from_slice(&alt[7 * hidden + span(r).start..7 * hidden + span(r).end]);
+                } else {
+                    x.extend_from_slice(&inputs[span(r)]);
+                }
+            }
+            let packed: Vec<_> = order
+                .iter()
+                .map(|&r| plowrt::exec::gpu::PfBatchReq {
+                    slot: requests[r].slot,
+                    prompt: requests[r].prompt,
+                    c0: requests[r].c0,
+                    len: requests[r].len,
+                })
+                .collect();
+            e.upload_activation("act.x", &x)?;
+            let served = |e: &plowrt::exec::gpu::GpuEngine| {
+                e.library_attention_launches().map_or(0, |(s, _)| s)
+            };
+            let before = served(e);
+            e.prefill_batched(&packed)?;
+            if (served(e) > before) != library {
+                return Err(format!(
+                    "permute-check {label}: expected the {} attention route",
+                    if library { "library" } else { "native" }
+                )
+                .into());
+            }
+            let out = e.download_activation(out_name)?;
+            let mut bits: Vec<Vec<u32>> = vec![Vec::new(); n];
+            let mut at = 0;
+            for &r in &order {
+                bits[r] = out[at * hidden..(at + rows[r]) * hidden]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                at += rows[r];
+            }
+            let Some(reference) = &reference else {
+                reference = Some(bits);
+                continue;
+            };
+            for &r in &order {
+                if perturbed[r] {
+                    continue;
+                }
+                let differ = bits[r]
+                    .iter()
+                    .zip(&reference[r])
+                    .filter(|(a, b)| a != b)
+                    .count();
+                if differ != 0 {
+                    return Err(format!(
+                        "permute-check {label}: request {r} differs in {differ} activation values"
+                    )
+                    .into());
+                }
+            }
+            println!("permute-check {label}: unperturbed requests bit-identical");
+        }
         Ok(())
     }
 

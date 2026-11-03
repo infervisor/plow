@@ -79,6 +79,8 @@ pub(super) struct Site {
     kv_heads: u32,
     kv_stride: u32,
     scale: f32,
+    /// The declaring program pins the launch unsplit (`ProgramRoles::library_unsplit`).
+    pub(super) unsplit: bool,
 }
 
 impl Site {
@@ -176,6 +178,7 @@ pub(super) fn sites(
             kv_heads,
             kv_stride,
             scale: f32::from_bits(op.fj[0]),
+            unsplit: false,
         });
     }
     out
@@ -271,6 +274,15 @@ impl Launch {
             splits -= 1;
         }
         splits
+    }
+
+    /// The split count `site` runs at: 1 when its program pins it unsplit, else the rule.
+    fn site_splits(&self, abi: &LibraryAbi, site: &Site, workspace: u64) -> u32 {
+        if site.unsplit {
+            1
+        } else {
+            self.splits(abi, site.kv_heads, workspace)
+        }
     }
 }
 
@@ -873,7 +885,7 @@ impl LibAttention {
                 "library attention: site geometry differs from the object's".into(),
             ));
         }
-        let splits = l.splits(&self.abi, site.kv_heads, self.workspace.len);
+        let splits = l.site_splits(&self.abi, site, self.workspace.len);
         let rows_q = (site.q + l.head * row_bytes, (t0 - l.head) * row_bytes);
         let rows_o = (site.output + l.head * row_bytes, (t0 - l.head) * row_bytes);
         if self.abi.f16 {
@@ -1069,6 +1081,45 @@ mod tests {
         );
         let stale = container(ABI, "adapters", &stale);
         assert!(check(stale.clone(), &declare(&stale, ABI)).contains("ABI"));
+    }
+
+    /// A site its program pins unsplit runs one split whatever the launch carries; an unpinned
+    /// one keeps the split rule.
+    #[test]
+    fn a_pinned_site_runs_unsplit_for_every_launch() {
+        let abi = LibraryAbi::parse(
+            "lib_flash_prefill_v2:fa4:hd=512:heads=16:kv_heads=1,2:layout=head_major:dtype=bf16",
+        )
+        .unwrap();
+        let site = |unsplit| Site {
+            instruction: 0,
+            q: 0,
+            k: 0,
+            v: 0,
+            scales: None,
+            output: 0,
+            heads: 16,
+            kv_heads: 2,
+            kv_stride: 16384,
+            scale: 1.0,
+            unsplit,
+        };
+        let mut split_somewhere = false;
+        for (requests, max_q, max_kv) in [(1, 1, 16384), (1, 64, 8192), (4, 128, 8192), (32, 64, 16384)] {
+            let launch = Launch {
+                rows: requests * max_q,
+                requests,
+                width: 0,
+                pages: 0,
+                max_q,
+                max_kv,
+                tail: (0, 0),
+                head: 0,
+            };
+            assert_eq!(launch.site_splits(&abi, &site(true), u64::MAX), 1);
+            split_somewhere |= launch.site_splits(&abi, &site(false), u64::MAX) > 1;
+        }
+        assert!(split_somewhere, "the rule splits some of these launches");
     }
 
     /// The TMA paged entries (KV tile = page) and the table pad `plan` writes satisfy

@@ -66,6 +66,15 @@ pub(crate) fn apply_output_object(
     let rung = |index: usize| {
         crate::emit_config::rung::at(crate::emit_config::rung::Rung::prefill(model.prog_t[index]))
     };
+    if let Some(index) =
+        (0..prefill_count).find(|&i| rung(i).attn_library_unsplit && !rung(i).attn_library)
+    {
+        return Err(format!(
+            "prefill program {index} (rows {}): PLOW_EMIT_ATTN_LIBRARY_UNSPLIT without \
+             PLOW_EMIT_ATTN_LIBRARY on the same rung",
+            model.prog_t[index]
+        ));
+    }
     let requested: Vec<usize> = (0..prefill_count)
         .filter(|&index| rung(index).attn_library)
         .collect();
@@ -139,6 +148,7 @@ pub(crate) fn apply_output_object(
                     index,
                     roles: vec![0; program.gq_seg_ofs.len() - 1],
                     library: Vec::new(),
+                    library_unsplit: false,
                 });
                 metadata.programs.last_mut().expect("pushed")
             }
@@ -148,6 +158,7 @@ pub(crate) fn apply_output_object(
         }
         total += library.len();
         record.library = library;
+        record.library_unsplit = rung(index).attn_library_unsplit;
     }
     if total == 0 {
         return Err(format!(

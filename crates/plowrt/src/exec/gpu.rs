@@ -1739,8 +1739,9 @@ fn packet_role_segments_with(
                     | plow_asset::segment_roles::MOE_DECODE_CUBLASLT
             ) {
                 // A library segment of two complete instructions (grouped GLU + DOWN), on
-                // prefill three (+ the combine), four (W8A8: + the fu quant) or eight (W8A8 with
-                // the router prologue: + RmsNorm, router, align, activation quant), on decode four
+                // prefill three (+ the combine), four (W8A8: + the fu quant), five or six (BF16 with
+                // the router prologue: + RmsNorm, router, align) or eight (W8A8 with the router
+                // prologue: + RmsNorm, router, align, activation quant), on decode four
                 // (+ the combine/NRN layer tail);
                 // the route itself (`moe_lt::segments`, `moe_lt::decode_segments`) checks them
                 // when switched on.
@@ -1762,7 +1763,7 @@ fn packet_role_segments_with(
                 let tails: &[usize] = if role == plow_asset::segment_roles::MOE_DECODE_CUBLASLT {
                     &[4]
                 } else {
-                    &[3, 4, 8]
+                    &[3, 4, 5, 6, 8]
                 };
                 if !(pcs.len() == 2 || tails.contains(&pcs.len())) || !complete {
                     return Err(RuntimeError::Rejected(
@@ -11578,6 +11579,7 @@ impl GpuEngine {
             };
             // The packet's declared library segments; their native role stays the fallback.
             let declared_library = declared_roles.map_or(&[][..], |(p, _)| &p.library[..]);
+            let library_unsplit = declared_roles.is_some_and(|(p, _)| p.library_unsplit);
             // The declaration is validated whether or not the route runs.
             let lib_attention_segments = if declared_library.is_empty() {
                 Vec::new()
@@ -11617,6 +11619,8 @@ impl GpuEngine {
                 for (seg, site) in sites.iter_mut().enumerate() {
                     if !declared_library.contains(&(seg as u32)) {
                         *site = None;
+                    } else if let Some(site) = site {
+                        site.unsplit = library_unsplit;
                     }
                 }
                 if let Some(seg) = declared_library
@@ -11628,7 +11632,12 @@ impl GpuEngine {
                          not a library site"
                     )));
                 }
-                if !config.nv.pf_attn_library {
+                if !config.nv.pf_attn_library && library_unsplit {
+                    return Err(RuntimeError::Rejected(format!(
+                        "program {program_index}: the packet pins library attention unsplit; \
+                         PLOW_PF_ATTN_LIBRARY=0 cannot run its native roles"
+                    )));
+                } else if !config.nv.pf_attn_library {
                     tracing::info!(
                         program_index,
                         "PLOW_PF_ATTN_LIBRARY=0: declared native roles run"
@@ -13763,17 +13772,7 @@ impl GpuEngine {
             // 5 = host GDN kernel + its (Nop) interpreter segment, 4 = fat interpreter segment.
             let rt = crate::config::RuntimeConfig::get();
             let seg_time = rt.nv.pf_seg_time;
-            self.lib_attention_routed = false;
-            if self.prefill[bi]
-                .lib_attention_segments
-                .iter()
-                .any(Option::is_some)
-            {
-                if let Some(lib) = self.lib_attention.as_mut() {
-                    self.lib_attention_routed =
-                        lib.begin_launch(&self.attention_requests, tc as u32, &self.stream)?;
-                }
-            }
+            self.lib_attention_routed = self.begin_lib_attention(bi, tc, false)?;
             let lib_routed = self.lib_attention_routed;
             // Packed chunks replay the chain as graph pieces between the per-tick launches
             // (`PLOW_GDN_PF_GRAPH`); the per-segment loop below serves the unpacked chunks and
@@ -13993,19 +13992,7 @@ impl GpuEngine {
                     .iter()
                     .any(Option::is_some)
                 && self.attention_requests.iter().any(|r| r[1] >= min_rows);
-            self.lib_attention_routed = false;
-            // A windowed body (pf_seg_window) keeps the native role.
-            if self.pf_seg_window.is_none()
-                && self.prefill[bi]
-                    .lib_attention_segments
-                    .iter()
-                    .any(Option::is_some)
-            {
-                if let Some(lib) = self.lib_attention.as_mut() {
-                    self.lib_attention_routed =
-                        lib.begin_launch(&self.attention_requests, tc as u32, &self.stream)?;
-                }
-            }
+            self.lib_attention_routed = self.begin_lib_attention(bi, tc, true)?;
             let lib_routed = self.lib_attention_routed;
             let routed = gemm_routed || lib_routed;
             // One table upload per launch serves every routed segment; `false` = shapes the
@@ -15518,6 +15505,37 @@ impl GpuEngine {
             .module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
     }
 
+    /// Plans this launch's library attention; `false` = the segments run their native role.
+    /// `native_when_windowed`: a pf_seg_window body keeps the native role on this path. A program
+    /// the packet pins unsplit never falls back (it is refused instead): native and library
+    /// arithmetic differ, so a row's bits would depend on the launch.
+    fn begin_lib_attention(
+        &mut self,
+        bi: usize,
+        tc: usize,
+        native_when_windowed: bool,
+    ) -> Result<bool> {
+        let sites = &self.prefill[bi].lib_attention_segments;
+        if !sites.iter().any(Option::is_some) {
+            return Ok(false);
+        }
+        let pinned = sites.iter().flatten().any(|site| site.unsplit);
+        let windowed = self.pf_seg_window.is_some();
+        let routed = match self.lib_attention.as_mut() {
+            Some(lib) if !(windowed && native_when_windowed) => {
+                lib.begin_launch(&self.attention_requests, tc as u32, &self.stream)?
+            }
+            _ => false,
+        };
+        if pinned && !routed {
+            return Err(RuntimeError::Rejected(format!(
+                "prefill bucket {bi}: the packet pins library attention unsplit and this launch \
+                 is outside the library's envelope"
+            )));
+        }
+        Ok(routed)
+    }
+
     /// Reset the PLOW_NV_TRACE packet counter so [`Self::trace_summary`]
     /// reports only launches after this call (drop prefill/warmup). No-op on
     /// a normal cubin.
@@ -15959,6 +15977,7 @@ fn partial_prefill_roles_keep_bundled_segment_pair_eligible() {
                     plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32,
                 ],
                 library: Vec::new(),
+                library_unsplit: false,
             })
             .collect(),
     };

@@ -32,8 +32,9 @@ extern "C" {
  * ABI 6 adds the W8A8 prefill chain: plow_moe_lt_gather8_inv, plow_moe_lt_glu8,
  * plow_moe_lt_combine_pf8.
  * ABI 7 adds the router prologue of a PLOW_EMIT_MOE_PF_LT_ROUTE segment: plow_moe_lt_route_pre,
- * plow_moe_lt_route_topk, plow_moe_lt_route_align. */
-__device__ unsigned plow_moe_lt_abi = 7;
+ * plow_moe_lt_route_topk, plow_moe_lt_route_align.
+ * ABI 8 adds the BF16 prologue's logits: plow_moe_lt_route_logits, plow_moe_lt_route_topk_split. */
+__device__ unsigned plow_moe_lt_abi = 8;
 }
 
 /* pre[0..n_exp] = exclusive prefix of cnt; returns the live row count. n_exp <= 256 (align's
@@ -594,6 +595,8 @@ extern "C" __global__ void plow_moe_lt_combine_pf8(
 }
 
 /* ---- ABI 7: the router prologue (RmsNorm, MoeRouterGemmaPf, MoeAlignGemmaPf, QuantFp8) ---------
+ * (A BF16 prologue has no QuantFp8: xq and ascale are null and the logits come from ABI 8's
+ * plow_moe_lt_route_logits + plow_moe_lt_route_topk_split instead of the cuBLASLt matmul.)
  * The interpreter runs these four ops inside the cooperative segment; the route runs them as
  * plain launches around one cuBLASLt bf16 x bf16 -> f32 matmul of the router logits:
  *   route_pre:   xn2 = RmsNorm(x) with its e4m3 quant (d_rmsnorm's fused QuantFp8, token-identical
@@ -612,56 +615,173 @@ extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_pre(
     const __nv_bfloat16* gamma, float norm_eps, __nv_bfloat16* h2, const __nv_bfloat16* rscale,
     float root, float rt_eps, unsigned rows, unsigned H) {
     __shared__ float part[32];
+    if (xq) {
 #if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
-    /* d_rmsnorm's fused quant is the reciprocal form; the separate QuantFp8 the interpreter runs
-     * divides. Each block quantizes the rows it normalized. */
+        /* d_rmsnorm's fused quant is the reciprocal form; the separate QuantFp8 the interpreter runs
+         * divides. Each block quantizes the rows it normalized. */
+        d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part);
+        __syncthreads();
+        for (unsigned row = blockIdx.x; xq && row < rows; row += gridDim.x) {
+            const __nv_bfloat16* v = xn2 + (size_t)row * H;
+            float am = 0.0f;
+            for (unsigned h = threadIdx.x; h < H; h += PLOW_NV_THREADS) am = fmaxf(am, fabsf(__bfloat162float(v[h])));
+            const float as = moe_lt_quant_scale(block_max(am, part));
+            if (threadIdx.x == 0) ascale[row] = as;
+            for (unsigned h = threadIdx.x * 2u; h < H; h += PLOW_NV_THREADS * 2u)
+                *(unsigned short*)(xq + (size_t)row * H + h) =
+                    moe_lt_quant_pair(__bfloat162float(v[h]), __bfloat162float(v[h + 1]), as, 0.0f);
+            __syncthreads();
+        }
+#else
+        d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part, xq, ascale);
+#endif
+        const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+        for (unsigned row = blockIdx.x * (PLOW_NV_THREADS / 32u) + warp; row < rows;
+             row += gridDim.x * (PLOW_NV_THREADS / 32u)) {
+            const __nv_bfloat16* r = x + (size_t)row * H;
+            float ss = 0.0f;
+            for (unsigned h = lane; h < H; h += 32u) {
+                const float v = __bfloat162float(r[h]);
+                ss += v * v;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+            const float iv = rsqrtf(ss / (float)H + rt_eps);
+            __nv_bfloat16* o = h2 + (size_t)row * H;
+            for (unsigned h = lane; h < H; h += 32u)
+                o[h] = __float2bfloat16(__bfloat162float(r[h]) * iv * __bfloat162float(rscale[h]) * root);
+        }
+        return;
+    }
+    /* Default T17 threshold: the interpreter's RmsNorm reduction order, so xn2 keeps its bits. */
     d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part);
     __syncthreads();
+    const unsigned nvec = H / 8u;
     for (unsigned row = blockIdx.x; row < rows; row += gridDim.x) {
-        const __nv_bfloat16* v = xn2 + (size_t)row * H;
-        float am = 0.0f;
-        for (unsigned h = threadIdx.x; h < H; h += PLOW_NV_THREADS) am = fmaxf(am, fabsf(__bfloat162float(v[h])));
-        const float as = moe_lt_quant_scale(block_max(am, part));
-        if (threadIdx.x == 0) ascale[row] = as;
-        for (unsigned h = threadIdx.x * 2u; h < H; h += PLOW_NV_THREADS * 2u)
-            *(unsigned short*)(xq + (size_t)row * H + h) =
-                moe_lt_quant_pair(__bfloat162float(v[h]), __bfloat162float(v[h + 1]), as, 0.0f);
-        __syncthreads();
-    }
-#else
-    d_rmsnorm(xn2, x, gamma, rows, H, norm_eps, 0u, blockIdx.x, gridDim.x, part, xq, ascale);
-#endif
-    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    for (unsigned row = blockIdx.x * (PLOW_NV_THREADS / 32u) + warp; row < rows;
-         row += gridDim.x * (PLOW_NV_THREADS / 32u)) {
         const __nv_bfloat16* r = x + (size_t)row * H;
-        float ss = 0.0f;
-        for (unsigned h = lane; h < H; h += 32u) {
-            const float v = __bfloat162float(r[h]);
-            ss += v * v;
-        }
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-        const float iv = rsqrtf(ss / (float)H + rt_eps);
         __nv_bfloat16* o = h2 + (size_t)row * H;
-        for (unsigned h = lane; h < H; h += 32u)
-            o[h] = __float2bfloat16(__bfloat162float(r[h]) * iv * __bfloat162float(rscale[h]) * root);
+        float ss = 0.0f;
+        for (unsigned c = threadIdx.x; c < nvec; c += PLOW_NV_THREADS) {
+            const bf16v8 v = ld_glob8(r + c * 8u);
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float f = __bfloat162float(v.x[j]);
+                ss += f * f;
+            }
+        }
+        const float iv = rsqrtf(block_sum(ss, part) / (float)H + rt_eps);
+        for (unsigned c = threadIdx.x; c < nvec; c += PLOW_NV_THREADS) {
+            const unsigned h = c * 8u;
+            const bf16v8 v = ld_glob8(r + h);
+            const bf16v8 rs = ld_glob8(rscale + h);
+            bf16v8 ov;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                ov.x[j] = __float2bfloat16(__bfloat162float(v.x[j]) * iv * __bfloat162float(rs.x[j]) * root);
+            st_glob8(o + h, ov);
+        }
     }
 }
 
 #define MOE_LT_MAX_EXP 256u
-/* Warp per row. table[row][slot] = {u32 expert, f32 gate}. n_exp <= 256, k <= 32. */
-extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_topk(
-    unsigned char* table, const float* logits, const __nv_bfloat16* pes, unsigned rows,
-    unsigned n_exp, unsigned k) {
-    __shared__ float sc_all[PLOW_NV_THREADS / 32u][MOE_LT_MAX_EXP];
+/* ---- ABI 8: the BF16 router prologue's logits without cuBLASLt -------------------------------
+ * logits[T][E] = h2[T][H] . proj[E][H]^T as MOE_LT_RL_SPLIT fixed K slices of H / SPLIT columns:
+ * part[s][row][e] holds slice s, summed in s order by plow_moe_lt_route_topk_split. A row's
+ * logits depend only on its own h2 row: the K slices, each slice's mma.sync k16 sequence and the
+ * slice sum order are fixed, whatever T, the row's tile or its neighbours (batch-invariant).
+ * Grid (ceil(T / 32), SPLIT), 256 threads: warp w owns experts [16w, 16w + 16) of a 32-row tile
+ * (two m16 x two n8 bf16 mma.sync tiles), operands straight from global/L1 (the tile's 32 h2 rows
+ * and the 128 proj rows of the slice are ~110 KB, shared by the block's warps through L1).
+ * Needs n_exp <= 128 and (H / SPLIT) % 16 == 0. */
+#define MOE_LT_RL_SPLIT 8u
+#define MOE_LT_RL_ROWS 32u
+extern "C" __device__ unsigned plow_moe_lt_route_split = MOE_LT_RL_SPLIT;
+__device__ __forceinline__ unsigned moe_lt_ld32(const __nv_bfloat16* p) {
+    return __ldg(reinterpret_cast<const unsigned*>(p));
+}
+extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_logits(
+    float* part, const __nv_bfloat16* h2, const __nv_bfloat16* proj, unsigned rows,
+    unsigned n_exp, unsigned H) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    float* sc = sc_all[warp];
-    const unsigned row = blockIdx.x * (PLOW_NV_THREADS / 32u) + warp;
-    if (row >= rows) return;
-    for (unsigned e = lane; e < n_exp; e += 32u) sc[e] = logits[(size_t)row * n_exp + e];
-    __syncwarp();
-    unsigned char* tab = table + (size_t)row * k * 8u;
+    const unsigned g = lane >> 2, q = lane & 3u;
+    const unsigned row0 = blockIdx.x * MOE_LT_RL_ROWS, s = blockIdx.y;
+    const unsigned kc = H / MOE_LT_RL_SPLIT, k0 = s * kc;
+    const unsigned e0 = warp * 16u;
+    if (e0 >= n_exp) return;
+    /* A rows: tile t (0/1) rows row0 + 16t + g and + 8; B experts: n-tile u (0/1) expert e0 + 8u + g. */
+    const __nv_bfloat16* a[2][2];
+    bool av[2][2];
+#pragma unroll
+    for (int t = 0; t < 2; t++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const unsigned r = row0 + 16u * t + 8u * h + g;
+            av[t][h] = r < rows;
+            a[t][h] = h2 + (size_t)(av[t][h] ? r : 0u) * H + k0 + 2u * q;
+        }
+    const __nv_bfloat16* b[2];
+    bool bv[2];
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+        const unsigned e = e0 + 8u * u + g;
+        bv[u] = e < n_exp;
+        b[u] = proj + (size_t)(bv[u] ? e : 0u) * H + k0 + 2u * q;
+    }
+    float c[2][2][4];
+#pragma unroll
+    for (int t = 0; t < 2; t++)
+#pragma unroll
+        for (int u = 0; u < 2; u++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) c[t][u][i] = 0.0f;
+#pragma unroll 2
+    for (unsigned k = 0; k < kc; k += 16u) {
+        unsigned af[2][4], bf[2][2];
+#pragma unroll
+        for (int t = 0; t < 2; t++) {
+            af[t][0] = av[t][0] ? moe_lt_ld32(a[t][0] + k) : 0u;
+            af[t][1] = av[t][1] ? moe_lt_ld32(a[t][1] + k) : 0u;
+            af[t][2] = av[t][0] ? moe_lt_ld32(a[t][0] + k + 8u) : 0u;
+            af[t][3] = av[t][1] ? moe_lt_ld32(a[t][1] + k + 8u) : 0u;
+        }
+#pragma unroll
+        for (int u = 0; u < 2; u++) {
+            bf[u][0] = bv[u] ? moe_lt_ld32(b[u] + k) : 0u;
+            bf[u][1] = bv[u] ? moe_lt_ld32(b[u] + k + 8u) : 0u;
+        }
+#pragma unroll
+        for (int t = 0; t < 2; t++)
+#pragma unroll
+            for (int u = 0; u < 2; u++)
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+f"(c[t][u][0]), "+f"(c[t][u][1]), "+f"(c[t][u][2]), "+f"(c[t][u][3])
+                    : "r"(af[t][0]), "r"(af[t][1]), "r"(af[t][2]), "r"(af[t][3]),
+                      "r"(bf[u][0]), "r"(bf[u][1]));
+    }
+    float* out = part + (size_t)s * rows * n_exp;
+#pragma unroll
+    for (int t = 0; t < 2; t++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const unsigned r = row0 + 16u * t + 8u * h + g;
+            if (r >= rows) continue;
+#pragma unroll
+            for (int u = 0; u < 2; u++)
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const unsigned e = e0 + 8u * u + 2u * q + j;
+                    if (e < n_exp) out[(size_t)r * n_exp + e] = c[t][u][2 * h + j];
+                }
+        }
+}
+
+/* Warp per row. table[row][slot] = {u32 expert, f32 gate}. n_exp <= 256, k <= 32. */
+/* Warp per row: softmax / top-k / norm_topk / per-expert scale of the row's logits in `sc`. */
+__device__ __forceinline__ void moe_lt_topk_row(unsigned char* tab, float* sc,
+                                                const __nv_bfloat16* pes, unsigned n_exp,
+                                                unsigned k, unsigned lane) {
     /* op_moe.cuh plow_moe_gemma_topk_warp, verbatim. */
     float m = -1e30f;
     for (unsigned e = lane; e < n_exp; e += 32u) m = fmaxf(m, sc[e]);
@@ -703,55 +823,109 @@ extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_topk(
     }
 }
 
+extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_topk(
+    unsigned char* table, const float* logits, const __nv_bfloat16* pes, unsigned rows,
+    unsigned n_exp, unsigned k) {
+    __shared__ float sc_all[PLOW_NV_THREADS / 32u][MOE_LT_MAX_EXP];
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    float* sc = sc_all[warp];
+    const unsigned row = blockIdx.x * (PLOW_NV_THREADS / 32u) + warp;
+    if (row >= rows) return;
+    for (unsigned e = lane; e < n_exp; e += 32u) sc[e] = logits[(size_t)row * n_exp + e];
+    __syncwarp();
+    moe_lt_topk_row(table + (size_t)row * k * 8u, sc, pes, n_exp, k, lane);
+}
+
+/* Warp per row: the sum of the plow_moe_lt_route_logits slices in slice order, then the top-k. */
+extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_topk_split(
+    unsigned char* table, const float* part, const __nv_bfloat16* pes, unsigned rows,
+    unsigned n_exp, unsigned k) {
+    __shared__ float sc_all[PLOW_NV_THREADS / 32u][MOE_LT_MAX_EXP];
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    float* sc = sc_all[warp];
+    const unsigned row = blockIdx.x * (PLOW_NV_THREADS / 32u) + warp;
+    if (row >= rows) return;
+    for (unsigned e = lane; e < n_exp; e += 32u) {
+        float v = 0.0f;
+#pragma unroll
+        for (unsigned s = 0; s < MOE_LT_RL_SPLIT; s++)
+            v += part[((size_t)s * rows + row) * n_exp + e];
+        sc[e] = v;
+    }
+    __syncwarp();
+    moe_lt_topk_row(table + (size_t)row * k * 8u, sc, pes, n_exp, k, lane);
+}
+
 /* op_moe.cuh d_moe_align_gemma_pf_multi with slice = blockIdx.x, nblk = gridDim.x and the tile
  * height `bm` (the interpreter's PGM_BM: 128 on the W8A8 twins). meta = [rowoff | cnt | tile
  * prefix] (i32), pad rows PLOW_EXPERT_UNUSED / gate 0. n_exp <= 256. */
+static_assert(MOE_LT_MAX_EXP <= PLOW_NV_THREADS, "route_align scans one expert per thread");
 extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_align(
     int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
     float* row_gate, unsigned T, unsigned n_exp, unsigned k, unsigned bm) {
-    constexpr unsigned U = 8u;
     const unsigned tid = threadIdx.x, nth = blockDim.x, slice = blockIdx.x, nblk = gridDim.x;
     __shared__ unsigned cnt[MOE_LT_MAX_EXP];
     __shared__ unsigned cur[MOE_LT_MAX_EXP];
     __shared__ unsigned start[MOE_LT_MAX_EXP];
+    __shared__ unsigned wsum[PLOW_NV_THREADS / 32u];
     __shared__ unsigned s_tiles;
     const unsigned nslot = T * k;
     const unsigned span = (nslot + nblk - 1u) / nblk;
     const unsigned lo = min(nslot, slice * span), hi = min(nslot, lo + span);
     for (unsigned e = tid; e < n_exp; e += nth) cnt[e] = cur[e] = 0u;
     __syncthreads();
-    for (unsigned base = 0; base < nslot; base += nth * U) {
-        unsigned eid[U];
-#pragma unroll
-        for (unsigned j = 0; j < U; j++) {
-            const unsigned idx = base + j * nth + tid;
-            eid[j] = idx < nslot ? *(const unsigned*)(table + (size_t)idx * 8) : ~0u;
+    const unsigned npairs = nslot / 2u;
+    for (unsigned p = tid; p < npairs; p += nth) {
+        const uint4 raw = *(const uint4*)(table + (size_t)p * 16u);
+        const unsigned idx0 = p * 2u;
+        const unsigned idx1 = idx0 + 1u;
+        if (raw.x < n_exp) {
+            atomicAdd(&cnt[raw.x], 1u);
+            if (idx0 < lo) atomicAdd(&cur[raw.x], 1u);
         }
-#pragma unroll
-        for (unsigned j = 0; j < U; j++)
-            if (eid[j] < n_exp) {
-                atomicAdd(&cnt[eid[j]], 1u);
-                if (base + j * nth + tid < lo) atomicAdd(&cur[eid[j]], 1u);
-            }
+        if (raw.z < n_exp) {
+            atomicAdd(&cnt[raw.z], 1u);
+            if (idx1 < lo) atomicAdd(&cur[raw.z], 1u);
+        }
+    }
+    if ((nslot & 1u) && tid == 0) {
+        const unsigned idx = nslot - 1u;
+        const uint2 slot = *(const uint2*)(table + (size_t)idx * 8u);
+        if (slot.x < n_exp) {
+            atomicAdd(&cnt[slot.x], 1u);
+            if (idx < lo) atomicAdd(&cur[slot.x], 1u);
+        }
     }
     __syncthreads();
-    if (tid == 0) {
-        int* rowoff = meta;
-        int* mcnt = meta + n_exp;
-        int* tilep = meta + 2u * n_exp;
-        unsigned tp = 0u;
-        for (unsigned e = 0; e < n_exp; e++) {
-            if (slice == 0) {
-                tilep[e] = (int)tp;
-                rowoff[e] = (int)(tp * bm);
-                mcnt[e] = (int)cnt[e];
-            }
-            start[e] = tp * bm;
-            cur[e] += tp * bm;
-            tp += (cnt[e] + bm - 1u) / bm;
+    const unsigned c = (tid < n_exp) ? cnt[tid] : 0u;
+    const unsigned tiles = (tid < n_exp) ? ((c + bm - 1u) / bm) : 0u;
+    const unsigned lane = tid & 31u, warp = tid >> 5;
+    unsigned v = tiles;
+#pragma unroll
+    for (unsigned o = 1u; o < 32u; o <<= 1) {
+        const unsigned t = __shfl_up_sync(0xffffffffu, v, o);
+        if (lane >= o) v += t;
+    }
+    if (lane == 31u) wsum[warp] = v;
+    __syncthreads();
+    unsigned warp_prefix = 0u;
+    for (unsigned w = 0; w < warp; w++) warp_prefix += wsum[w];
+    v += warp_prefix;
+    const unsigned tp = v - tiles;
+    if (tid < n_exp) {
+        start[tid] = tp * bm;
+        cur[tid] += tp * bm;
+        if (slice == 0) {
+            meta[tid] = (int)(tp * bm);
+            meta[n_exp + tid] = (int)c;
+            meta[2u * n_exp + tid] = (int)tp;
         }
-        if (slice == 0) tilep[n_exp] = (int)tp;
-        s_tiles = tp;
+    }
+    if (tid == 0) {
+        unsigned total_tiles = 0u;
+        for (unsigned w = 0; w < (PLOW_NV_THREADS / 32u); w++) total_tiles += wsum[w];
+        s_tiles = total_tiles;
+        if (slice == 0) meta[2u * n_exp + n_exp] = (int)total_tiles;
     }
     __syncthreads();
     for (unsigned e = slice; e < n_exp; e += nblk) {
@@ -774,10 +948,10 @@ extern "C" __global__ void __launch_bounds__(256) plow_moe_lt_route_align(
     }
     __syncthreads();
     for (unsigned idx = lo + tid; idx < hi; idx += nth) {
-        const uint2 slot = *(const uint2*)(table + (size_t)idx * 8);
+        const uint2 slot = *(const uint2*)(table + (size_t)idx * 8u);
         if (slot.x >= n_exp) continue;
         const unsigned pos = atomicAdd(&cur[slot.x], 1u);
-        row_token[pos] = idx / k;
+        row_token[pos] = (k == 8u) ? (idx >> 3u) : (idx / k);
         row_partidx[pos] = idx;
         row_gate[pos] = __uint_as_float(slot.y);
     }

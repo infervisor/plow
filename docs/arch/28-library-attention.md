@@ -189,6 +189,11 @@ the packet declares and nothing else.
   (`devgen/src/library_attention.rs`) runs last in both the Gemma and the Qwen pipelines and claims
   every causal global flash-prefill site of the library's head dim on the selected rungs (all or an
   error per program).
+* Unsplit pin: `PLOW_EMIT_ATTN_LIBRARY_UNSPLIT` (per rung, `emit.attn_library_unsplit`) sets
+  `library_unsplit` on the program. Its launches run one KV split, so a row's bits depend only on
+  its own request, not on what is packed beside it (the split rule reads the launch's request
+  count and extents). A pinned launch outside the envelope, a windowed body or
+  `PLOW_PF_ATTN_LIBRARY=0` is refused rather than run on the native role.
 * Runtime: `PLOW_PF_ATTN_LIBRARY=0` runs the declared native roles (A/B, rollback). A launch outside
   the library envelope runs the native role, decided before anything is enqueued; fallbacks are
   counted.

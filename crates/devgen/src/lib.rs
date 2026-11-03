@@ -5354,9 +5354,20 @@ fn emit_phase(
             .filter(|_| gemv_family && full)
             .map(|abs| (abs / t).max(1))
             .unwrap_or(ns);
+        // Per-row full-layer split, independent of the batch rung: a row's split boundaries (and so
+        // its merged bits) are the same at B1..B32. The CU-fill and ABS paths above divide by B.
+        let ns = emit_config::active()
+            .ns_full_row
+            .filter(|&n| gemv_family && full && n > 0)
+            .unwrap_or(ns);
         // Library-routed rungs run their hd512 attention as light launches at PLOW_FA_GF_LIGHT512
         // (manifest `gf_light512`): split as many more ways as the group is wider, so the layer
         // keeps its work-item count. The interpreter rungs keep `gf` and this split.
+        assert!(
+            emit_config::active().ns_full_row.is_none()
+                || emit_config::active().fa_gf_light512.is_none(),
+            "PLOW_NS_FULL_ROW with PLOW_FA_GF_LIGHT512: the light rungs would re-split the pinned row"
+        );
         let ns = match emit_config::active().fa_gf_light512 {
             Some(light)
                 if gemv_family
@@ -7182,10 +7193,10 @@ fn emit_phase(
                     d.i[1] = c.hidden;
                     d.f[0] = c.eps;
                 });
-                // PLOW_EMIT_MOE_PF_LT_ROUTE: order the expert-input norm and the router after
+                // PLOW_EMIT_MOE_PF_LT_ROUTE (W8A8 and BF16): order the expert-input norm and the router after
                 // the dense branch's post-norm, so they sit next to the grouped GEMMs in the queue
                 // and `dense_cublaslt::apply_moe_prefill` can put them in the library segment.
-                let route_deps = if w8a8 && emit_config::active().moe_pf_lt_route {
+                let route_deps = if emit_config::active().moe_pf_lt_route {
                     vec![c_pf, c_h1]
                 } else {
                     vec![c_pf]
