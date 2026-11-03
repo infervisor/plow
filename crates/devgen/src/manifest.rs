@@ -3091,6 +3091,47 @@ pub fn speech_ops(model: &packet::devbuild::Model) -> u64 {
         .fold(0, |mask, i| mask | 1 << (i.op - 163))
 }
 
+/// The post activations (flags bits 8..11) of convs that can reach the wide-tile or wgmma
+/// epilogues, bit `post`: `PLOW_SPEECH_CONV_POSTS`.
+pub fn speech_conv_posts(model: &packet::devbuild::Model) -> u64 {
+    model
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|i| {
+            let flags = i.j[1]; // Packed as fj[2], as read by sp_w_conv_width / sp_wg_conv1d.
+            if i.op == DevOp::Conv1dF32 as u16 {
+                flags & ((1 << 14) | (1 << 17)) != 0
+            } else {
+                // ConvT only reaches wgmma with both flags and post 0 (spg_ct_eligible).
+                i.op == DevOp::ConvTranspose1dF32 as u16
+                    && (flags >> 17) & 3 == 3
+                    && (flags >> 8) & 15 == 0
+            }
+        })
+        .fold(0, |mask, i| mask | 1 << ((i.j[1] >> 8) & 15))
+}
+
+/// The speech object's arm masks, accumulated together so every sidecar path feeds both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeechMasks {
+    pub ops: u64,
+    pub conv_posts: u64,
+}
+
+impl SpeechMasks {
+    pub fn of(model: &packet::devbuild::Model) -> Self {
+        Self {
+            ops: speech_ops(model),
+            conv_posts: speech_conv_posts(model),
+        }
+    }
+    pub fn add(&mut self, other: Self) {
+        self.ops |= other.ops;
+        self.conv_posts |= other.conv_posts;
+    }
+}
+
 /// Generate the header a specialised object compiles against.
 ///
 /// Two halves, and both matter:
@@ -3136,6 +3177,11 @@ pub fn config_header(manifest: &Value) -> String {
         out.push_str(&format!(
             "/* FP32 speech ops of the sidecar packets: the speech object's arm set. */\n\
              #ifndef PLOW_SPEECH_OPS\n#define PLOW_SPEECH_OPS 0x{mask:x}ull\n#endif\n\n"
+        ));
+    }
+    if let Some(mask) = manifest.get("speech_conv_posts").and_then(Value::as_u64) {
+        out.push_str(&format!(
+            "#ifndef PLOW_SPEECH_CONV_POSTS\n#define PLOW_SPEECH_CONV_POSTS 0x{mask:x}ull\n#endif\n\n"
         ));
     }
 
@@ -3962,6 +4008,59 @@ mod tests {
             "#ifndef PLOW_SPEECH_OPS\n#define PLOW_SPEECH_OPS 0x{mask:x}ull\n#endif\n"
         )));
         assert!(!config_header(&plain).contains("PLOW_SPEECH_OPS"));
+    }
+
+    #[test]
+    fn speech_conv_posts_select_epilogues_without_moving_the_pairing_hash() {
+        let conv = |op, post: u32, flags: u32| {
+            let mut i = inst(op, [0; 8]);
+            i.j = [u32::MAX, flags | (post << 8)];
+            assert_eq!(i.pack().fj[2], i.j[1]);
+            assert_eq!((i.pack().fj[2] >> 8) & 15, post);
+            i
+        };
+        let mut sidecar = model();
+        assert_eq!(speech_conv_posts(&sidecar), 0);
+        for (op, post, flags, expected) in [
+            (DevOp::Conv1dF32, 9, 0, 0),
+            (DevOp::Conv1dF32, 9, 1 << 13, 0),
+            (DevOp::Conv1dF32, 9, 1 << 14, 1 << 9),
+            (DevOp::Conv1dF32, 11, 1 << 17, 1 << 11),
+            (DevOp::ConvTranspose1dF32, 0, 0, 0),
+            (DevOp::ConvTranspose1dF32, 0, 1 << 14, 0),
+            (DevOp::ConvTranspose1dF32, 0, 1 << 17, 0),
+            (DevOp::ConvTranspose1dF32, 0, 1 << 18, 0),
+            (DevOp::ConvTranspose1dF32, 0, 3 << 17, 1),
+            (DevOp::ConvTranspose1dF32, 11, 3 << 17, 0),
+            (DevOp::UnaryF32, 5, (1 << 14) | (1 << 17), 0),
+        ] {
+            sidecar.progs = vec![prog(vec![conv(op, post, flags)])];
+            assert_eq!(speech_conv_posts(&sidecar), expected);
+        }
+        sidecar.progs = vec![
+            prog(vec![
+                conv(DevOp::Conv1dF32, 9, 1 << 14),
+                conv(DevOp::Conv1dF32, 9, 1 << 17),
+                conv(DevOp::Conv1dF32, 11, 1 << 17),
+                conv(DevOp::Conv1dF32, 15, 0),
+            ]),
+            prog(vec![
+                conv(DevOp::ConvTranspose1dF32, 0, 3 << 17),
+                conv(DevOp::ConvTranspose1dF32, 15, 3 << 17),
+            ]),
+        ];
+        let mask = speech_conv_posts(&sidecar);
+        assert_eq!(mask, 1 | 1 << 9 | 1 << 11);
+        let plain = build(&model(), "sm_90a");
+        let mut man = plain.clone();
+        man["speech_conv_posts"] = mask.into();
+        assert_eq!(pairing_hash(&man), pairing_hash(&plain));
+        assert!(config_header(&man).contains(&format!(
+            "#ifndef PLOW_SPEECH_CONV_POSTS\n#define PLOW_SPEECH_CONV_POSTS 0x{mask:x}ull\n#endif\n"
+        )));
+        assert!(!config_header(&plain).contains("PLOW_SPEECH_CONV_POSTS"));
+        man["speech_conv_posts"] = 0.into();
+        assert!(config_header(&man).contains("#define PLOW_SPEECH_CONV_POSTS 0x0ull\n"));
     }
 
     /// The opt-in lean MoE body variants are object requests carried by the config header;

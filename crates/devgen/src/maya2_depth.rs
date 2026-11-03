@@ -905,7 +905,10 @@ pub(crate) fn lm_sections(
     codes: u32,
     prompt_codes: u32,
     rungs: &[u32],
-) -> (Vec<packet::devbuild::SectionData>, u64) {
+) -> (
+    Vec<packet::devbuild::SectionData>,
+    crate::manifest::SpeechMasks,
+) {
     use plow_asset::fish_depth as manifest;
     let geo = Geo::of(c);
     let d = c
@@ -989,6 +992,6 @@ pub(crate) fn lm_sections(
     eprintln!("  maya2 depth: {} programs (rows {rungs:?})", rungs.len());
     (
         crate::fish_depth::manifest_sections(&man, rungs.len(), m.tensors.len(), bytes),
-        crate::manifest::speech_ops(&prefix.model),
+        crate::manifest::SpeechMasks::of(&prefix.model),
     )
 }
