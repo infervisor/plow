@@ -5363,6 +5363,11 @@ fn emit_phase(
         // Library-routed rungs run their hd512 attention as light launches at PLOW_FA_GF_LIGHT512
         // (manifest `gf_light512`): split as many more ways as the group is wider, so the layer
         // keeps its work-item count. The interpreter rungs keep `gf` and this split.
+        assert!(
+            emit_config::active().ns_full_row.is_none()
+                || emit_config::active().fa_gf_light512.is_none(),
+            "PLOW_NS_FULL_ROW with PLOW_FA_GF_LIGHT512: the light rungs would re-split the pinned row"
+        );
         let ns = match emit_config::active().fa_gf_light512 {
             Some(light)
                 if gemv_family

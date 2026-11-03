@@ -1822,7 +1822,8 @@ pub struct NvidiaRuntimeConfig {
     /// Unified token batch (sm_90a): decode rows riding a packed prefill launch attend through
     /// split-KV flash decode (`plow_<arch>_rider_*` in the decode object) instead of as one-row
     /// requests of the prefill FlashAttention. Arms only when the decode object carries the
-    /// rider kernels; `=false` is the rollback.
+    /// rider kernels; `=false` is the rollback. Decode rows riding packed prefill use the rider
+    /// attention route; bits can differ from FlashDecode (deterministic per rung and rider count).
     #[arg(long = "tb-split-attn", env = "PLOW_TB_SPLIT_ATTN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tb_split_attn: bool,
 
