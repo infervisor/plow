@@ -35,6 +35,59 @@ constexpr unsigned rn_groups = 1;
 constexpr unsigned rn_threads = PLOW_THREADS * rn_groups;
 constexpr unsigned rn_vecs = RN_VEC * rn_groups;
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+__device__ void d_rmsnorm_residual_f32(bf16* out, const float* x, const bf16* gamma,
+                                      unsigned rows, unsigned feat, float eps,
+                                      unsigned slice, unsigned nblk, float* part) {
+    const auto* src = as_glob(x);
+    auto* dst = as_glob(out);
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * feat;
+        float ss = 0.0f;
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
+            const float v = src[base + i];
+            ss += v * v;
+        }
+        const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS)
+            dst[base + i] = f2bf(src[base + i] * inv * (gamma ? bf2f(gamma[i]) : 1.0f));
+        __syncthreads();
+    }
+}
+
+__device__ void d_norm_residual_f32(float* out, const float* a, const bf16* b,
+                                    const bf16* gamma, unsigned rows, unsigned feat,
+                                    float eps, float scale, unsigned slice,
+                                    unsigned nblk, float* part) {
+    const auto* src = as_glob(b);
+    const auto* residual = as_glob(a);
+    auto* dst = as_glob(out);
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * feat;
+        float ss = 0.0f;
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
+            const float v = bf2f(src[base + i]);
+            ss += v * v;
+        }
+        const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
+            const float normalized = bf2f(src[base + i]) * inv * (gamma ? bf2f(gamma[i]) : 1.0f);
+            dst[base + i] = (residual[base + i] + normalized) * scale;
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void d_norm_residual_norm_f32(bf16* out, float* resid, const float* a,
+                                         const bf16* b, const bf16* gb, const bf16* gn,
+                                         unsigned rows, unsigned feat, float eps,
+                                         float scale, unsigned slice, unsigned nblk, float* part) {
+    // Both passes assign every row to the same workgroup; no inter-group dependency.
+    d_norm_residual_f32(resid, a, b, gb, rows, feat, eps, scale, slice, nblk, part);
+    d_rmsnorm_residual_f32(out, resid, gn, rows, feat, eps, slice, nblk, part);
+}
+#endif
+
 /* THE INPUT-RANGE CONTRACT OF EVERY REDUCTION IN THIS FILE, and the debug build that asserts it.
  *                                             [F5, plans/gpu-kernel-static-audit-20260908.md]
  * Every norm here reduces sum(x_i^2) in FP32 over bf16 inputs. bf16 carries FP32's exponent

@@ -17,6 +17,9 @@
  * Ragged-K GEMV is compared to zero-padded, eight-aligned ordinary GEMV.
  * `dense` selects only the K64 GEMM geometry cases for packet-specific objects;
  * the full opcode suite needs an unconfigured object with every tested arm.
+ * `residual-f32` needs typed interpreter objects and test wrappers compiled with
+ * PLOW_PACKET_REQUIRES_RESIDUAL_F32=1. It checks four ops against independent CPU
+ * math at rows1/134 and hidden960/3840/4096, including aliasing and optional gamma.
  */
 #include "../amd/hsa_backend.h"
 #include "../common/dev_isa.h"
@@ -116,6 +119,108 @@ static void packet(plow_hsa* h, PlowDevInst in, void* tensors[8], unsigned block
     }
     plow_hsa_free(h, inst); plow_hsa_free(h, stream); plow_hsa_free(h, ofs);
     plow_hsa_free(h, len); plow_hsa_free(h, table); plow_hsa_free(h, tb); plow_hsa_free(h, span);
+}
+
+static void residual_f32(plow_hsa* h, unsigned rows, unsigned feat, int weighted,
+                         int alias, float scale) {
+    const size_t n = (size_t)rows * feat;
+    const float eps = 1e-6f;
+    float* a = alloc(h, (n + 16) * 4);
+    float* original = alloc(h, n * 4);
+    float* residual = alias ? a : alloc(h, (n + 16) * 4);
+    float* expected = alloc(h, n * 4);
+    bf16 *b = random_bf(h, n), *gamma = random_bf(h, feat);
+    bf16* out = alloc(h, (n + 16) * 2);
+    float* norm = alloc(h, n * 4);
+    int* ids = alloc(h, rows * 4);
+    for (size_t i = 0; i < n; i++) original[i] = random_value() + 0.000173f;
+    for (unsigned i = 0; i < feat; i++) gamma[i] = f2bf(1.0f + bf2f(gamma[i]));
+    for (unsigned r = 0; r < rows; r++) ids[r] = (int)(rows - 1 - r);
+    const bf16* g = weighted ? gamma : NULL;
+    for (unsigned op = 0; op < 4; op++) {
+        for (unsigned row = 0; row < rows; row++) {
+            const size_t base = (size_t)row * feat;
+            double sum = 0;
+            for (unsigned i = 0; i < feat; i++) {
+                const double v = op == 1 ? original[base + i] : bf2f(b[base + i]);
+                sum += v * v;
+            }
+            const float inv = (float)(1.0 / sqrt(sum / feat + eps));
+            double ss = 0;
+            for (unsigned i = 0; i < feat; i++) {
+                const size_t j = base + i;
+                const float weight = g ? bf2f(g[i]) : 1.0f;
+                if (op == 0) expected[j] = bf2f(b[(size_t)ids[row] * feat + i]) * scale;
+                else if (op == 1) norm[j] = original[j] * inv * weight;
+                else expected[j] = (original[j] + bf2f(b[j]) * inv * weight) * scale;
+                if (op == 3) ss += (double)expected[j] * expected[j];
+            }
+            if (op == 3) {
+                const float rinv = (float)(1.0 / sqrt(ss / feat + eps));
+                for (unsigned i = 0; i < feat; i++)
+                    norm[base + i] = expected[base + i] * rinv * (g ? bf2f(g[i]) : 1.0f);
+            }
+        }
+        for (unsigned direct = 0; direct < 2; direct++) {
+            memcpy(a, original, n * 4);
+            if (!alias) for (size_t i = 0; i < n + 16; i++) residual[i] = NAN;
+            for (size_t i = n; i < n + 16; i++) residual[i] = 912.25f;
+            for (size_t i = 0; i < n + 16; i++) out[i] = f2bf(i < n ? NAN : 912.0f);
+            void* output = op == 0 || op == 2 ? (void*)residual : (void*)out;
+            if (direct) {
+                struct { unsigned op; void* out; float* resid; const float* a;
+                    const bf16 *b, *gb, *gn; const int* ids; unsigned rows, feat;
+                    float eps, scale; } args = {op, output, residual, a, b, g, g, ids,
+                                               rows, feat, eps, scale};
+                launch(h, "residual_f32_test", 7, &args, sizeof(args));
+            } else {
+                void* tensors[8] = {0};
+                const unsigned codes[] = {PLOW_DOP_EMBED, PLOW_DOP_RMSNORM,
+                    PLOW_DOP_NORM_RESIDUAL, PLOW_DOP_NORM_RESIDUAL_NORM};
+                tensors[0] = output;
+                if (op == 0) { tensors[1] = b; tensors[2] = ids; }
+                if (op == 1) { tensors[1] = a; tensors[2] = (void*)g; }
+                if (op == 2) { tensors[1] = a; tensors[2] = b; tensors[3] = (void*)g; }
+                if (op == 3) { tensors[1] = residual; tensors[2] = a; tensors[3] = b;
+                    tensors[4] = (void*)g; tensors[5] = (void*)g; }
+                PlowDevInst in = instruction(codes[op], tensors);
+                in.i[0] = rows; in.i[1] = feat; in.i[6] = PLOW_RESIDUAL_F32_FLAG;
+                in.fj[0].f = op == 0 ? scale : eps; in.fj[1].f = scale;
+                packet(h, in, tensors, 7, rows);
+            }
+            double diff = 0, denominator = 0, rounding_diff = 0, rounding_den = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (op != 1) {
+                    if (!isfinite(residual[i])) { fails++; break; }
+                    const double d = residual[i] - expected[i];
+                    diff += d * d; denominator += (double)expected[i] * expected[i];
+                    if (op == 0 && residual[i] != expected[i]) { fails++; break; }
+                }
+                if (op == 1 || op == 3) {
+                    const float value = bf2f(out[i]), rounded = roundbf(norm[i]);
+                    if (!isfinite(value)) { fails++; break; }
+                    const double d = value - rounded;
+                    rounding_diff += d * d; rounding_den += (double)rounded * rounded;
+                    if (op == 1) { const double e = value - norm[i];
+                        diff += e * e; denominator += (double)norm[i] * norm[i]; }
+                }
+            }
+            const double rel = sqrt(diff / fmax(denominator, 1e-30));
+            const double rne = sqrt(rounding_diff / fmax(rounding_den, 1e-30));
+            if (rel > (op == 1 ? 1.0 / 256 : 1e-5) || rne > 1e-4) {
+                fprintf(stderr, "residual-f32 op=%u direct=%u rows=%u feat=%u weighted=%d alias=%d scale=%g rel=%g rne=%g\n",
+                    op, direct, rows, feat, weighted, alias, scale, rel, rne); fails++;
+            }
+            for (size_t i = n; i < n + 16; i++)
+                if (residual[i] != 912.25f || out[i] != f2bf(912.0f)) { fails++; break; }
+        }
+    }
+    printf("residual-f32 rows=%u feat=%u gamma=%d alias=%d scale=%g failures=%d\n",
+           rows, feat, weighted, alias, scale, fails);
+    plow_hsa_free(h, a); plow_hsa_free(h, original);
+    if (!alias) plow_hsa_free(h, residual);
+    plow_hsa_free(h, expected); plow_hsa_free(h, b); plow_hsa_free(h, gamma);
+    plow_hsa_free(h, out); plow_hsa_free(h, norm); plow_hsa_free(h, ids);
 }
 
 static void finish_argmax(plow_hsa* h, int* ids, uint64_t* part, unsigned blocks, unsigned M) {
@@ -391,12 +496,13 @@ static void load_object(plow_hsa* h, const char* path) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (argc > 3 || (argc == 3 && strcmp(argv[2], "token-batch") && strcmp(argv[2], "dense"))) {
-        fprintf(stderr, "usage: %s [interp_prefill.elf [dense] | interp_tokbatch.elf token-batch]\n", argv[0]);
+    if (argc > 3 || (argc == 3 && strcmp(argv[2], "token-batch") && strcmp(argv[2], "dense") && strcmp(argv[2], "residual-f32"))) {
+        fprintf(stderr, "usage: %s [interp_prefill.elf [dense | residual-f32] | interp_tokbatch.elf token-batch]\n", argv[0]);
         return 1;
     }
+    const int residual_only = argc == 3 && !strcmp(argv[2], "residual-f32");
     const int dense_only = argc == 3 && !strcmp(argv[2], "dense");
-    token_batch = argc == 3 && !dense_only;
+    token_batch = argc == 3 && !dense_only && !residual_only;
     plow_hsa* h = plow_hsa_init();
     if (!h) { fprintf(stderr, "%s\n", plow_hsa_last_error()); return 1; }
     load_object(h, argc > 1 ? argv[1] : "interp_prefill.elf");
@@ -422,7 +528,7 @@ int main(int argc, char** argv) {
         }
     }
     plow_hsa_free(h, threads);
-    if (!token_batch && (dense_only || !strcmp(arch, "gfx1201"))) {
+    if (!residual_only && !token_batch && (dense_only || !strcmp(arch, "gfx1201"))) {
         const unsigned saved_rng = rng;
         dense_gemm(h, 128, 1024, 1024);
         dense_gemm(h, 128, 960, 1024); dense_gemm(h, 128, 1024, 960);
@@ -431,7 +537,15 @@ int main(int argc, char** argv) {
         dense_gemm(h, 1, 960, 960); dense_gemm(h, 1, 320, 960);
         rng = saved_rng;
     }
-    if (!dense_only) {
+    if (residual_only) {
+        const unsigned widths[] = {960, 3840, 4096};
+        for (unsigned w = 0; w < 3; w++) for (unsigned rows = 1; rows <= 134; rows += 133)
+            for (int g = 0; g < 2; g++) for (int alias = 0; alias < 2; alias++) {
+                residual_f32(h, rows, widths[w], g, alias, 1.0f);
+                residual_f32(h, rows, widths[w], g, alias, 0.052978515625f);
+            }
+    }
+    if (!dense_only && !residual_only) {
         gemv(h, 1, 259, 512, 3, 0, 0); gemv(h, 3, 259, 520, 5, 30, 0);
         gemv(h, 2, 7, 67, 11, 0, 0); gemv(h, 1, 259, 3840, 3, 30, 0);
         gemv(h, 1, 259, 8192, 3, 0, 0);

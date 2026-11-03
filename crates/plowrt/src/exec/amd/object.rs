@@ -556,6 +556,16 @@ pub(super) fn check_compiled_opcode_markers<'a>(
     progs: impl IntoIterator<Item = &'a DevProg>,
 ) -> Result<()> {
     for prog in progs {
+        if (prog.role.is_packed_sibling() || prog.role.is_token_batch_body())
+            && prog
+                .insts
+                .iter()
+                .any(|inst| packet::dev::uses_residual_f32(inst.op, inst.i[6]))
+        {
+            return Err(RuntimeError::Rejected(
+                "FP32 residual state is unsupported by packed/token-batch objects".into(),
+            ));
+        }
         for inst in &prog.insts {
             if inst.op == DevOp::MlaBmmFp8 as u16 && inst.i[5] != 0 {
                 if !(1..32).contains(&inst.i[0])
@@ -687,6 +697,17 @@ pub(super) fn check_compiled_opcode_markers<'a>(
         {
             return Err(RuntimeError::Device(format!(
                 "packet/object MISMATCH: BF16-rounded SiLU requires `plow_glu_silu_bf16_1` in {}",
+                path.display()
+            )));
+        }
+        if prog
+            .insts
+            .iter()
+            .any(|inst| packet::dev::uses_residual_f32(inst.op, inst.i[6]))
+            && !syms.contains(&"plow_residual_f32_1")
+        {
+            return Err(RuntimeError::Device(format!(
+                "packet/object MISMATCH: FP32 residual state requires `plow_residual_f32_1` in {}",
                 path.display()
             )));
         }
