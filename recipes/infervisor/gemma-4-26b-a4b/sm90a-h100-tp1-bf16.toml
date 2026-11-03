@@ -123,7 +123,9 @@ PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_MOE_PF_LT_ROUTE = "1"
 # Interpreter object flags the FP8 recipe already carries (packed narrow bodies, instruction
 # preload, router V8/V9, top-k V4): token digests unchanged, step -0.1..-0.27 ms at B1..32.
-NVCC_APPEND_FLAGS = "-DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1"
+# Router row invariance: the B=1 router h2 uses the B>1 association, so a row routes to the same
+# bits at every decode rung (row-invariance check: scores and gate tables identical B1..B32).
+NVCC_APPEND_FLAGS = "-DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1 -DPLOW_NV_ROUTER_ROW_INVARIANT=1"
 
 [emit.rung_env.prefill.128]
 PLOW_EMIT_ATTN_LIBRARY = "0"
