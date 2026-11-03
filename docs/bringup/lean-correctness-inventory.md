@@ -74,12 +74,28 @@ what it wrote (`--lean-qualify report|strict`, recorded in `build.json` `lean.bu
 and `plowc qualify <dir|packet>` runs the same checks offline. Packet integrity at load is the dist
 signatures and digests. Nemotron, Parakeet and Silero packets bypass every gate, including K.
 
+The load-time receipt binding (malformed receipts, `packet_sha256` mismatch, a receipt that does
+not rebind, a changed envelope on replay) was removed with the plowrt qualify path. These are
+evidence-integrity checks, not execution guards: a dist pull already verifies signatures and
+digests, and a local non-dist load is a development path. `check_l2_dispatch` and
+`refuse_concat_features` stay in plowrt.
+
 ### Logical-effects coverage of the main packets
 
 `logical_effects::obligation` covers the FP32 speech set, Gemm/Gemv/norm/residual basics and,
 since lean-llm-effects, every opcode of the 7 H100 RC8 LLM packets (attention, RoPE/KV writes,
 GEMV/GEMM, quantization, MoE, Qwen GDN, sampling), including operands reached through `i`/`fj`
-handles. The table below is the coverage before that change. It rejects a whole program at the first unaudited op. It also rejects TP, packed/token-batch
+handles. Known limits of that audit:
+
+- Write sets are cited from the NVIDIA kernels (`runtime/nvidia`). The same table serves AMD
+  packets; only the decode `MoeAlignGemmaPf` no-op (i0 < i3) is target-gated. AMD write sets are
+  not separately audited.
+- `QwenGdnPrefill`'s packed path writes runtime scratch `act.gdn.initstate`; the obligation does
+  not model it. It is a runtime obligation.
+- Runtime launch fusions are outside the program and not covered.
+- Instructions that write a generated tensor map are rejected; maps are load-time descriptors.
+
+The table below is the coverage before that change. It rejects a whole program at the first unaudited op. It also rejects TP, packed/token-batch
 siblings, `l2_domains`, fine counters and `@` aliases. Unaudited opcodes in production main packets
 (from each `build.json` `opcodes`):
 

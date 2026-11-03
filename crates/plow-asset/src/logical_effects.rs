@@ -371,6 +371,15 @@ fn tmaps_bound(packet: &Packet<'_>, d: &DevInst64) -> Result<(), String> {
         .ok_or_else(|| "tensor map not bound to its instruction operand".into())
 }
 
+/// A generated tensor map is a load-time descriptor whose target `tmaps_bound` checks; a write
+/// would let a reader reach a target outside its declared effects.
+fn is_tmap(packet: &Packet<'_>, handle: u32) -> bool {
+    use packet::rope::{GEN_TMAP_BF16, GEN_TMAP_E4M3, GEN_TMAP_KV_PAIR};
+    packet.generated.iter().any(|g| {
+        g.tensor == handle && matches!(g.kind, GEN_TMAP_BF16 | GEN_TMAP_E4M3 | GEN_TMAP_KV_PAIR)
+    })
+}
+
 /// Residue band of a strided f32 access: every element index `e` it touches has
 /// `e % stride` in `[lo, hi)` (Plow.Speech.band_elem_residue). `None` = whole tensor.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -555,6 +564,9 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
                 .ok_or("effect tensor out of range")?;
             if tensor.bytes == 0 || tensor.name.contains("@") {
                 return Err("empty or aliased effect tensor".into());
+            }
+            if write && is_tmap(packet, u32::from(handle)) {
+                return Err("instruction writes a tensor map".into());
             }
             users
                 .entry(handle)
@@ -1053,6 +1065,26 @@ mod tests {
             };
             assert_eq!(readers(map_a), json!([1]));
         });
+        let mut b = Builder::new(1);
+        let [c, a, w, map_a, map_w] = ["c", "a", "w", "map_a", "map_w"].map(|n| b.tensor(n, 128));
+        let copy = b.emit(DevOp::CopyColsF32, vec![0], &[], |d| {
+            d.t[..3].copy_from_slice(&[map_a, map_w, packet::dev::TENSOR_NONE]);
+            d.i = [1, 1, 4, 4, 0, 4, 0, 0];
+        });
+        b.emit(DevOp::Gemm, vec![0], &[copy], |d| {
+            d.t[..3].copy_from_slice(&[c, a, w]);
+            d.i[6] = map_a;
+            d.i[7] = map_w;
+        });
+        let replaced = b.finish();
+        let bound = std::mem::replace(&mut model.progs[0], replaced);
+        crate::program::with_model(&model, |packet| {
+            assert_eq!(
+                obligation(packet, 0).unwrap_err(),
+                "instruction writes a tensor map"
+            )
+        });
+        model.progs[0] = bound;
         model.gen[1].aux = c;
         crate::program::with_model(&model, |packet| assert!(obligation(packet, 0).is_err()));
         model.gen.pop();
