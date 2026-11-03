@@ -344,6 +344,33 @@ fn handle_accesses(d: &DevInst64) -> Result<Vec<(u32, bool)>, String> {
     Ok(accesses)
 }
 
+/// Tensor-map operands read their target through the map: each must be a generated map over the
+/// instruction's own operand (GEMM i6 = A t1, i7 = B t2; flash-prefill t7 = K t3 / V t4).
+fn tmaps_bound(packet: &Packet<'_>, d: &DevInst64) -> Result<(), String> {
+    use packet::rope::{GEN_TMAP_BF16, GEN_TMAP_E4M3, GEN_TMAP_KV_PAIR};
+    let gen = |h: u32| packet.generated.iter().find(|g| g.tensor == h);
+    let ok = match DevOp::from_u16(d.op) {
+        Some(DevOp::Gemm | DevOp::GemmFp8) => [(d.i[6], d.t[1]), (d.i[7], d.t[2])]
+            .into_iter()
+            .filter(|&(h, _)| h != 0)
+            .all(|(h, target)| {
+                gen(h).is_some_and(|g| {
+                    matches!(g.kind, GEN_TMAP_BF16 | GEN_TMAP_E4M3) && g.aux == u32::from(target)
+                })
+            }),
+        Some(DevOp::FlashPrefill) if d.t[7] != TENSOR_NONE16 => {
+            gen(u32::from(d.t[7])).is_some_and(|g| {
+                g.kind == GEN_TMAP_KV_PAIR
+                    && g.aux == u32::from(d.t[3])
+                    && g.scale == u32::from(d.t[4])
+            })
+        }
+        _ => true,
+    };
+    ok.then_some(())
+        .ok_or_else(|| "tensor map not bound to its instruction operand".into())
+}
+
 /// Residue band of a strided f32 access: every element index `e` it touches has
 /// `e % stride` in `[lo, hi)` (Plow.Speech.band_elem_residue). `None` = whole tensor.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -505,6 +532,7 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
             continue;
         }
         let writes = outputs(inst)?;
+        tmaps_bound(packet, inst)?;
         for &slot in writes {
             if inst.t[slot] == TENSOR_NONE16 {
                 return Err("missing effect output".into());
@@ -985,6 +1013,50 @@ mod tests {
             align.i[0] = 4;
             assert!(!inert(&align, true));
         });
+    }
+
+    #[test]
+    fn tensor_maps_must_be_bound_to_their_own_operands() {
+        let mut b = Builder::new(1);
+        let [c, a, w, map_a, map_w] = ["c", "a", "w", "map_a", "map_w"].map(|n| b.tensor(n, 128));
+        b.emit(DevOp::Gemm, vec![0], &[], |d| {
+            d.t[..3].copy_from_slice(&[c, a, w]);
+            d.i[6] = map_a;
+            d.i[7] = map_w;
+        });
+        let p = b.finish();
+        let map = |tensor: u32, aux: u32| packet::rope::GenTensor {
+            tensor,
+            kind: packet::rope::GEN_TMAP_BF16,
+            aux,
+            ..Default::default()
+        };
+        let mut model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![map(map_a, a), map(map_w, w)],
+        };
+        crate::program::with_model(&model, |packet| {
+            let value = obligation(packet, 0).unwrap();
+            let readers = |h: u32| {
+                value["address_map"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["name"] == format!("tensor:{h}"))
+                    .unwrap()["readers"]
+                    .clone()
+            };
+            assert_eq!(readers(map_a), json!([1]));
+        });
+        model.gen[1].aux = c;
+        crate::program::with_model(&model, |packet| assert!(obligation(packet, 0).is_err()));
+        model.gen.pop();
+        crate::program::with_model(&model, |packet| assert!(obligation(packet, 0).is_err()));
     }
 
     #[test]
