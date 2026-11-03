@@ -1519,8 +1519,10 @@ impl MoeLtRoute {
             arg32(&mut top_k),
             arg32(&mut bm),
         ];
-        // Every block histograms all T * k slots and scatters its own range of them.
-        let blocks = (rows * top_k).div_ceil(64).clamp(1, 32);
+        // Every block histograms all T * k slots and scatters its own range of them. BF16 spreads
+        // the scatter over more blocks; W8A8 keeps its qualified geometry.
+        let per_block = if p.plan.is_some() { 2048 } else { 64 };
+        let blocks = (rows * top_k).div_ceil(per_block).clamp(1, 32);
         o.be.launch_kernel(align, blocks, GLUE_THREADS, 0, &mut params, Some(stream))
     }
 
