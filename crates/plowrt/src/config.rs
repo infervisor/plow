@@ -1462,6 +1462,10 @@ pub struct CpuRuntimeConfig {
 #[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Scheduling and NVIDIA runtime")]
 pub struct NvidiaRuntimeConfig {
+    /// Tensor-parallel transport: host, or experimental auto / p2p probe selection.
+    #[arg(long = "tp-transport", env = "PLOW_TP_TRANSPORT", default_value = "host", value_parser = ["host", "auto", "p2p"], global = true)]
+    pub tp_transport: String,
+
     /// Expert: decode steps per host sync (2..64; 0/1 = single-step). Unset = derived from the
     /// objective (`serve::policy::decode_k`).
     #[arg(long = "multistep", env = "PLOW_MULTISTEP", hide = true, global = true)]

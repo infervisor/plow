@@ -742,6 +742,7 @@ const PROCESS_KNOBS: &[&str] = &[
     "PLOW_SWITCH_TIMEOUT_MS",
     "PLOW_TBT_SLO_MS",
     "PLOW_TENS_SNAP",
+    "PLOW_TP_TRANSPORT",
     "PLOW_TRUSTED_KEYS",
     "PLOW_TTFT_LOG",
     "PLOW_TTFT_SLO_MS",
@@ -997,6 +998,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_seg_fatonly", Some("PLOW_PF_SEG_FATONLY"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_noncoop", Some("PLOW_PF_SEG_NONCOOP"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_trace_log", Some("PLOW_PF_TRACE_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.tp_transport", Some("PLOW_TP_TRANSPORT"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("host")), OPT_IN),
     KnobSpec::new("rt.ladder_debug", Some("PLOW_LADDER_DEBUG"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.pf_seg_eqsmem", Some("PLOW_PF_SEG_EQSMEM"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.ctr_dbuf", Some("PLOW_CTR_DBUF"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
@@ -1153,7 +1155,6 @@ pub const RUNTIME: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
-    KnobSpec::new("env.PLOW_TP_TRANSPORT", Some("PLOW_TP_TRANSPORT"), Layer::RawEnv, Domain::Enum(&["auto", "host", "p2p"]), Default::Static(Val::Str("host")), OPT_IN),
     KnobSpec::new("env.PLOW_AMD_DECODE_MIN_RUNG", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_CFG_MULTISTEP", Some("PLOW_CFG_MULTISTEP"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_CO_SCHED_QUANTUM", Some("PLOW_CO_SCHED_QUANTUM"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),

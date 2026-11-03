@@ -155,7 +155,7 @@ pub(super) fn leader(
     assets: &Path,
     workers: &mut [Worker],
 ) -> Result<(RankBind, Decision)> {
-    let mode = Mode::parse(&std::env::var("PLOW_TP_TRANSPORT").unwrap_or_else(|_| "host".into()))?;
+    let mode = Mode::parse(&crate::config::RuntimeConfig::process_get().nv.tp_transport)?;
     for w in workers.iter_mut() {
         w.link.send(&mode)?;
     }
