@@ -8716,6 +8716,11 @@ impl GpuEngine {
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
+        if RuntimeConfig::get().nv.pf_trace_log {
+            if let Ok(Some(s)) = self.trace_summary() {
+                tracing::info!("decode {s}");
+            }
+        }
         self.staged_prefix[b] = None;
         self.prefix_attach_off[b] = false;
         if let Some(p) = self.pipe.as_mut() {
