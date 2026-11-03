@@ -1,24 +1,21 @@
-//! Load-time replay of compiler obligations and the qualification policy. This is not
+//! `plowc qualify` and the emit-time qualification: derives every required Lean obligation from
+//! the packets, matches the receipts, checks verifier approval and replays them. This is not
 //! execution-identity, floating-point implementation, runtime-rewrite, or empirical qualification.
-//!
-//! `PLOW_LEAN_QUALIFY` selects the [`VerificationPolicy`]: `off` (default) keeps the pre-policy
-//! behavior, `report` also derives every required obligation and logs the gaps, `strict` rejects
-//! a packet with any gap. `plowrt qualify` runs the same checks offline.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
 use plow_asset::certificates::{
-    bind_packet_receipt, is_approved_verifier, qualify_packet, qualify_sidecar,
-    sidecar_checks_file, CompileCheckReceipt, PacketCheckReceipts, Qualification, SemanticScope,
-    SidecarCheckReceipts, VerificationPolicy, PACKET_CHECKS_FILE,
+    is_approved_verifier, qualify_packet, qualify_sidecar, sidecar_checks_file,
+    CompileCheckReceipt, PacketCheckReceipts, Qualification, SemanticScope, SidecarCheckReceipts,
+    PACKET_CHECKS_FILE,
 };
 use plow_asset::decode_objects::image_sha256;
+use plowrt::asset::devblob::DevBlob;
+use plowrt::asset::packet_image::PacketImage;
 
-use crate::asset::devblob::DevBlob;
-use crate::asset::packet_image::PacketImage;
-use crate::{Result, RuntimeError};
+type Result<T> = std::result::Result<T, String>;
 
 /// A packet as the checks read it. The digest is computed at most once, and not at all when no
 /// receipt needs it.
@@ -26,7 +23,7 @@ struct Pkt<'a> {
     path: &'a Path,
     raw: &'a [u8],
     blob: &'a DevBlob,
-    digest: &'a std::sync::OnceLock<[u8; 32]>,
+    digest: std::sync::OnceLock<String>,
 }
 
 impl<'a> Pkt<'a> {
@@ -35,32 +32,20 @@ impl<'a> Pkt<'a> {
             path: &image.path,
             raw: &image.raw,
             blob: &image.blob,
-            digest: image.digest_cell(),
+            digest: std::sync::OnceLock::new(),
         }
     }
 
     fn sha256(&self) -> String {
-        use sha2::Digest;
-        let d = self
-            .digest
-            .get_or_init(|| sha2::Sha256::digest(self.raw).into());
-        d.iter().map(|b| format!("{b:02x}")).collect()
+        self.digest.get_or_init(|| image_sha256(self.raw)).clone()
     }
-}
-
-pub(crate) fn load_policy() -> Result<VerificationPolicy> {
-    VerificationPolicy::parse(&crate::config::RuntimeConfig::get().lean_qualify)
-        .map_err(RuntimeError::Rejected)
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(RuntimeError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
+        Err(error) => Err(format!("{}: {error}", path.display())),
     }
 }
 
@@ -74,127 +59,6 @@ fn is_compiler_packet(pkt: &Pkt, receipts: Option<&[u8]>) -> bool {
         || receipts
             .and_then(|bytes| serde_json::from_slice::<PacketCheckReceipts>(bytes).ok())
             .is_some_and(|r| r.packet_sha256 == pkt.sha256())
-}
-
-pub(crate) fn check_packet(image: &PacketImage) -> Result<()> {
-    check_pkt(&Pkt::of(image), load_policy()?)
-}
-
-#[cfg(test)]
-fn check_packet_with(
-    blob_path: &Path,
-    raw: &[u8],
-    blob: &DevBlob,
-    policy: VerificationPolicy,
-) -> Result<()> {
-    let digest = std::sync::OnceLock::new();
-    check_pkt(
-        &Pkt {
-            path: blob_path,
-            raw,
-            blob,
-            digest: &digest,
-        },
-        policy,
-    )
-}
-
-fn check_pkt(pkt: &Pkt, policy: VerificationPolicy) -> Result<()> {
-    let (blob_path, blob) = (pkt.path, pkt.blob);
-    let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
-    let bytes = read_optional(&path)?;
-    if !is_compiler_packet(pkt, bytes.as_deref()) {
-        return check_sidecar_pkt(pkt, policy);
-    }
-    let rejected = |reason: String| RuntimeError::Rejected(format!("{}: {reason}", path.display()));
-    let receipts: Option<PacketCheckReceipts> = bytes
-        .as_deref()
-        .map(serde_json::from_slice)
-        .transpose()
-        .map_err(|error| rejected(error.to_string()))?;
-    match policy {
-        VerificationPolicy::Off => legacy_check(&path, bytes.as_deref(), receipts.as_ref(), pkt),
-        VerificationPolicy::Report => {
-            let q = blob.with_packet_view(|packet| {
-                qualify_packet(receipts.as_ref(), &pkt.sha256(), packet)
-            });
-            report(blob_path, &q);
-            legacy_check(&path, bytes.as_deref(), receipts.as_ref(), pkt)
-        }
-        VerificationPolicy::Strict => {
-            let q = qualify_compiler(receipts.as_ref(), bytes.as_deref(), pkt, true);
-            enforce(blob_path, &q)
-        }
-    }
-}
-
-/// Sidecar packets loaded by the packet runtimes (`encoder.pkt`, `codec.pkt`, `s3gen.pkt`,
-/// `mm_*.pkt`) and any non-compiler packet. `off` does not read their receipts.
-pub(crate) fn check_sidecar(image: &PacketImage) -> Result<()> {
-    check_sidecar_pkt(&Pkt::of(image), load_policy()?)
-}
-
-#[cfg(test)]
-fn check_sidecar_with(
-    blob_path: &Path,
-    raw: &[u8],
-    blob: &DevBlob,
-    policy: VerificationPolicy,
-) -> Result<()> {
-    let digest = std::sync::OnceLock::new();
-    check_sidecar_pkt(
-        &Pkt {
-            path: blob_path,
-            raw,
-            blob,
-            digest: &digest,
-        },
-        policy,
-    )
-}
-
-fn check_sidecar_pkt(pkt: &Pkt, policy: VerificationPolicy) -> Result<()> {
-    if policy == VerificationPolicy::Off {
-        return Ok(());
-    }
-    let blob_path = pkt.path;
-    let path = sidecar_checks_file(blob_path);
-    let receipts: Option<SidecarCheckReceipts> = read_optional(&path)?
-        .map(|bytes| serde_json::from_slice(&bytes))
-        .transpose()
-        .map_err(|error| RuntimeError::Rejected(format!("{}: {error}", path.display())))?;
-    let q = qualify_sidecar_blob(receipts.as_ref(), pkt, policy == VerificationPolicy::Strict);
-    match policy {
-        VerificationPolicy::Strict => enforce(blob_path, &q),
-        _ => {
-            report(blob_path, &q);
-            Ok(())
-        }
-    }
-}
-
-fn report(packet: &Path, q: &Qualification) {
-    if q.qualified() {
-        tracing::info!(packet = %packet.display(), obligations = q.required.len(),
-            "lean qualification complete (structural scopes only)");
-    } else {
-        tracing::warn!(packet = %packet.display(), satisfied = q.satisfied.len(),
-            required = q.required.len(), gaps = ?q.gaps, "lean qualification incomplete");
-    }
-}
-
-fn enforce(packet: &Path, q: &Qualification) -> Result<()> {
-    if q.qualified() {
-        report(packet, q);
-        return Ok(());
-    }
-    Err(RuntimeError::Rejected(format!(
-        "{}: strict lean qualification failed ({} of {} obligations): {}",
-        packet.display(),
-        q.satisfied.len(),
-        q.required.len(),
-        q.gaps.join("; ")
-    )))
 }
 
 fn qualify_compiler(
@@ -284,87 +148,7 @@ fn replay_approved(
     Ok(())
 }
 
-/// The pre-policy load check (`PLOW_LEAN_QUALIFY=off`): binding is fatal; absent receipts and
-/// an unavailable or changed verifier load unverified.
-fn legacy_check(
-    path: &Path,
-    bytes: Option<&[u8]>,
-    receipts: Option<&PacketCheckReceipts>,
-    pkt: &Pkt,
-) -> Result<()> {
-    let (Some(bytes), Some(receipts)) = (bytes, receipts) else {
-        return Ok(());
-    };
-    let blob = pkt.blob;
-    let rejected = |reason: String| RuntimeError::Rejected(format!("{}: {reason}", path.display()));
-    receipts.validate_packet(&pkt.sha256()).map_err(rejected)?;
-    for check in &receipts.checks {
-        blob.with_packet_view(|packet| bind_packet_receipt(packet, check))
-            .map_err(rejected)?;
-    }
-    if receipts.checks.is_empty() {
-        return Ok(());
-    }
-    let verifier = match lean_verify::verifier_sha256() {
-        Ok(digest) => digest,
-        Err(error) => {
-            tracing::warn!(%error, "compiler check receipts not rechecked: no verifier identity; loading unverified");
-            return Ok(());
-        }
-    };
-    if receipts
-        .checks
-        .iter()
-        .any(|check| check.verifier_sha256 != verifier)
-    {
-        tracing::warn!(
-            "compiler check receipts not rechecked: verifier identity changed; loading unverified"
-        );
-        return Ok(());
-    }
-    // Shared TP ranks validate identical obligations once at load; no token-loop work.
-    static CHECKED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
-    let key = (image_sha256(bytes), verifier.clone());
-    let mut checked = CHECKED.lock().unwrap();
-    if checked.contains(&key) {
-        return Ok(());
-    }
-    let requests: Vec<_> = receipts
-        .checks
-        .iter()
-        .map(|check| (check.checkpoint.as_str(), check.request.clone()))
-        .collect();
-    let (certs, executed_verifier) = match lean_verify::call_batch_bound(&requests) {
-        Ok(certs) => certs,
-        Err(error) if error.is_binary_unusable() => {
-            tracing::warn!(%error, "compiler check receipts not rechecked: verifier unusable; loading unverified");
-            return Ok(());
-        }
-        Err(error) => return Err(rejected(error.to_string())),
-    };
-    if executed_verifier != verifier {
-        return Err(rejected(
-            "verifier changed before replaying compiler obligations".into(),
-        ));
-    }
-    for (receipt, cert) in receipts.checks.iter().zip(certs) {
-        if !cert.ok
-            || serde_json::to_value(&cert).map_err(|error| rejected(error.to_string()))?
-                != receipt.response
-        {
-            return Err(rejected(format!(
-                "program {:?}: compiler obligation rejected or envelope changed: {:?}",
-                receipt.program, cert.reason
-            )));
-        }
-    }
-    checked.insert(key);
-    tracing::info!(checks = receipts.checks.len(),
-        "packet-bound compiler obligations rechecked; supplied coarse-graph/measured-policy scope only, no performance qualification");
-    Ok(())
-}
-
-/// `plowrt qualify`: every `*.pkt` in `dir`, in name order, with its qualification. A packet
+/// `plowc qualify`: every `*.pkt` in `dir`, in name order, with its qualification. A packet
 /// with a speech or multimodal pipeline also owes the bundle's `media_geometry.v1` obligation, and one
 /// with packed prefill over a sliding ring owes `kv_ring.v1`, and one with fused speech sites
 /// owes `speech_fusion.v1`.
@@ -372,26 +156,23 @@ pub fn qualify_dir(
     dir: &Path,
     replay_checks: bool,
 ) -> Result<Vec<(std::path::PathBuf, Qualification)>> {
-    let entries = std::fs::read_dir(dir).map_err(|source| RuntimeError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut packets: Vec<_> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "pkt"))
         .collect();
     packets.sort();
     if packets.is_empty() {
-        return Err(RuntimeError::Rejected(format!(
-            "{}: no packets",
-            dir.display()
-        )));
+        return Err(format!("{}: no packets", dir.display()));
     }
     let mut out = Vec::new();
     let mut media = Vec::new();
     for path in packets {
-        let image = PacketImage::open(&path)?;
-        image.blob.check_l2_dispatch(false)?;
+        let image = PacketImage::open(&path).map_err(|e| e.to_string())?;
+        image
+            .blob
+            .check_l2_dispatch(false)
+            .map_err(|e| e.to_string())?;
         let (raw, blob) = (&image.raw, &image.blob);
         let mut q = qualify_loaded(&Pkt::of(&image), replay_checks)?;
         kv_ring_obligation(raw, blob, replay_checks, &mut q);
@@ -435,6 +216,30 @@ pub fn qualify_dir(
     Ok(out)
 }
 
+/// [`qualify_dir`] over a bundle directory, or over a packet file's directory keeping only that
+/// packet (the media obligation still reads its siblings).
+pub fn qualify_path(
+    path: &Path,
+    replay_checks: bool,
+) -> Result<Vec<(std::path::PathBuf, Qualification)>> {
+    if path.is_dir() {
+        return qualify_dir(path, replay_checks);
+    }
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path.file_name();
+    let found: Vec<_> = qualify_dir(dir, replay_checks)?
+        .into_iter()
+        .filter(|(p, _)| p.file_name() == name)
+        .collect();
+    if found.is_empty() {
+        return Err(format!("{}: not a packet", path.display()));
+    }
+    Ok(found)
+}
+
 fn media_obligation() -> plow_asset::certificates::Obligation {
     plow_asset::certificates::Obligation {
         scope: plow_asset::certificates::SemanticScope::MediaGeometry,
@@ -455,7 +260,7 @@ fn kv_ring_obligation(raw: &[u8], blob: &DevBlob, replay_checks: bool, q: &mut Q
         };
         let pf: plow_asset::packed_prefill::Manifest =
             serde_json::from_slice(pf).map_err(|e| format!("packed prefill metadata: {e}"))?;
-        let live = crate::memory::vmm::LiveKvLayout::manifest(blob, raw)
+        let live = plowrt::memory::vmm::LiveKvLayout::manifest(blob, raw)
             .map_err(|e| e.to_string())?
             .ok_or("packed prefill without a live KV manifest")?;
         blob.with_packet_view(|p| {
@@ -588,7 +393,7 @@ impl MediaInfo {
             return Ok(None);
         }
         let (pipelines, vocabulary) = if has_pipelines {
-            let asset = crate::exec::packet_runtime::PacketAsset::from_bytes(raw)
+            let asset = plowrt::exec::packet_runtime::PacketAsset::from_bytes(raw)
                 .map_err(|e| e.to_string())?;
             let vocabulary = asset
                 .metadata(plow_asset::speech_contract::VOCABULARY_SECTION)
@@ -629,7 +434,7 @@ impl MediaInfo {
     }
 }
 
-/// One loaded packet's receipt qualification for `plowrt qualify`.
+/// One loaded packet's receipt qualification.
 fn qualify_loaded(pkt: &Pkt, replay_checks: bool) -> Result<Qualification> {
     let blob_path = pkt.path;
     let path = blob_path.with_file_name(PACKET_CHECKS_FILE);
@@ -639,7 +444,7 @@ fn qualify_loaded(pkt: &Pkt, replay_checks: bool) -> Result<Qualification> {
             .as_deref()
             .map(serde_json::from_slice::<PacketCheckReceipts>)
             .transpose()
-            .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         return Ok(qualify_compiler(
             receipts.as_ref(),
             bytes.as_deref(),
@@ -651,7 +456,7 @@ fn qualify_loaded(pkt: &Pkt, replay_checks: bool) -> Result<Qualification> {
     let receipts = read_optional(&path)?
         .map(|bytes| serde_json::from_slice::<SidecarCheckReceipts>(&bytes))
         .transpose()
-        .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(qualify_sidecar_blob(receipts.as_ref(), pkt, replay_checks))
 }
 
@@ -663,8 +468,41 @@ mod tests {
     use plow_asset::certificates::{CompileCheckReceipt, SemanticScope};
     use serde_json::json;
 
+    fn qualification(path: &Path, raw: &[u8]) -> Qualification {
+        std::fs::write(path, raw).unwrap();
+        qualify_path(path, true).unwrap().remove(0).1
+    }
+
+    /// Receipts present bind the packet and replay; only absent obligations are gaps.
+    fn bound(path: &Path, raw: &[u8]) -> std::result::Result<(), String> {
+        let q = qualification(path, raw);
+        let unbound: Vec<_> = q
+            .gaps
+            .iter()
+            .filter(|g| {
+                !g.contains(" missing for ")
+                    && !matches!(
+                        g.as_str(),
+                        "no compiler check receipts" | "no sidecar check receipts"
+                    )
+            })
+            .collect();
+        match unbound.is_empty() {
+            true => Ok(()),
+            false => Err(format!("{unbound:?}")),
+        }
+    }
+
+    fn strict(path: &Path, raw: &[u8]) -> std::result::Result<(), String> {
+        let q = qualification(path, raw);
+        match q.qualified() {
+            true => Ok(()),
+            false => Err(q.gaps.join("; ")),
+        }
+    }
+
     #[test]
-    #[ignore = "requires built plow_verify; CPU-only"]
+    #[ignore = "requires built plow_verify listed in lean-plow/approved-verifiers.json; CPU-only"]
     fn selected_gemm_receipt_reconstructs_wire_after_packet_hash_changes() {
         let mut b = Builder::new(2);
         let out = b.tensor("output", 128 * 256 * 2);
@@ -724,9 +562,8 @@ mod tests {
             std::fs::write(&sidecar, serde_json::to_vec(value).unwrap()).unwrap()
         };
         write(&receipts);
-        let blob = DevBlob::parse(&raw).unwrap();
-        check_packet_with(&path, &raw, &blob, load_policy().unwrap()).unwrap();
-        check_packet_with(&path, &raw, &blob, load_policy().unwrap()).unwrap();
+        bound(&path, &raw).unwrap();
+        bound(&path, &raw).unwrap();
         for change in 0..5 {
             let original = model.progs[0].insts[0].clone();
             match change {
@@ -739,19 +576,14 @@ mod tests {
             let raw = model.to_blob();
             receipts.packet_sha256 = image_sha256(&raw);
             write(&receipts);
-            let blob = DevBlob::parse(&raw).unwrap();
-            assert!(
-                check_packet_with(&path, &raw, &blob, load_policy().unwrap()).is_err(),
-                "wire mutation {change}"
-            );
+            assert!(bound(&path, &raw).is_err(), "wire mutation {change}");
             model.progs[0].insts[0] = original;
         }
-        std::fs::remove_file(sidecar).unwrap();
-        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    #[ignore = "requires built plow_verify; CPU-only"]
+    #[ignore = "requires built plow_verify listed in lean-plow/approved-verifiers.json; CPU-only"]
     fn logical_effect_receipt_is_reconstructed_from_loaded_packet() {
         let mut b = Builder::new(1);
         let x = b.tensor("x", 16);
@@ -802,13 +634,7 @@ mod tests {
         let packet_path = directory.join("model.pkt");
         let sidecar = directory.join(PACKET_CHECKS_FILE);
         std::fs::write(&sidecar, serde_json::to_vec(&receipts).unwrap()).unwrap();
-        check_packet_with(
-            &packet_path,
-            &raw,
-            &DevBlob::parse(&raw).unwrap(),
-            load_policy().unwrap(),
-        )
-        .unwrap();
+        bound(&packet_path, &raw).unwrap();
         for mutation in 0..3 {
             match mutation {
                 0 => model.progs[0].insts[1].t[0] = y,
@@ -819,13 +645,7 @@ mod tests {
             receipts.packet_sha256 = image_sha256(&raw);
             std::fs::write(&sidecar, serde_json::to_vec(&receipts).unwrap()).unwrap();
             assert!(
-                check_packet_with(
-                    &packet_path,
-                    &raw,
-                    &DevBlob::parse(&raw).unwrap(),
-                    load_policy().unwrap()
-                )
-                .is_err(),
+                bound(&packet_path, &raw).is_err(),
                 "mutation {mutation}: even a matching new packet hash cannot reuse effects"
             );
         }
@@ -833,8 +653,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires built plow_verify; CPU-only"]
-    fn packet_receipts_replay_at_load_and_reject_tampering() {
+    #[ignore = "requires built plow_verify listed in lean-plow/approved-verifiers.json; CPU-only"]
+    fn packet_receipts_replay_and_reject_tampering() {
         let mut builder = Builder::new(1);
         let first = builder.emit(DevOp::Residual, vec![0], &[], |_| {});
         builder.emit(DevOp::Residual, vec![0], &[first], |_| {});
@@ -849,7 +669,6 @@ mod tests {
             gen: vec![],
         };
         let raw = model.to_blob();
-        let blob = DevBlob::parse(&raw).unwrap();
         let request = json!({"task_graph":{"n":2,"edges":[[0,1]]},
             "protocol":{"waits":[[],[0]],"succs":[[0],[1]],"resource":[0,1],
                 "stream_idx":[0,0],"threshold":{}},
@@ -920,11 +739,11 @@ mod tests {
         let write = |value: &PacketCheckReceipts| {
             std::fs::write(&sidecar, serde_json::to_vec(value).unwrap()).unwrap()
         };
-        // Missing receipts retain legacy unverified bringup.
-        check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).unwrap();
+        // Missing receipts are gaps, not binding failures.
+        bound(&packet_path, &raw).unwrap();
         write(&receipts);
-        check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).unwrap();
-        check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).unwrap(); // cached, still packet-bound
+        bound(&packet_path, &raw).unwrap();
+        bound(&packet_path, &raw).unwrap();
         for mutation in 0..7 {
             let mut bad = receipts.clone();
             match mutation {
@@ -949,10 +768,7 @@ mod tests {
                 }
             }
             write(&bad);
-            assert!(
-                check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).is_err(),
-                "mutation {mutation}"
-            );
+            assert!(bound(&packet_path, &raw).is_err(), "mutation {mutation}");
         }
         let program = &mut model.progs[0];
         for entry in program
@@ -966,20 +782,14 @@ mod tests {
         receipts.packet_sha256 = image_sha256(&altered);
         write(&receipts);
         assert!(
-            check_packet_with(
-                &packet_path,
-                &altered,
-                &DevBlob::parse(&altered).unwrap(),
-                load_policy().unwrap()
-            )
-            .is_err(),
+            bound(&packet_path, &altered).is_err(),
             "updating the packet hash cannot reuse a receipt for removed wire waits"
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    #[ignore = "requires built plow_verify; CPU-only"]
+    #[ignore = "requires built plow_verify listed in lean-plow/approved-verifiers.json; CPU-only"]
     fn layout_receipt_is_reconstructed_from_loaded_packet() {
         let mut builder = Builder::new(1);
         let padded = builder.tensor("padded", 16 * 8192 * 2);
@@ -1033,7 +843,7 @@ mod tests {
         let packet_path = directory.join("model.pkt");
         let sidecar = directory.join(PACKET_CHECKS_FILE);
         std::fs::write(&sidecar, serde_json::to_vec(&receipts).unwrap()).unwrap();
-        check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).unwrap();
+        bound(&packet_path, &raw).unwrap();
         for mutation in 0..4 {
             model.progs[0].insts[1].i[5] = 1024;
             model.progs[0].insts[0].i[4] = 1024;
@@ -1046,14 +856,10 @@ mod tests {
                 _ => model.progs[0].insts[1].t[1] = output,
             }
             let raw = model.to_blob();
-            let blob = DevBlob::parse(&raw).unwrap();
             let mut changed_receipts = receipts.clone();
             changed_receipts.packet_sha256 = image_sha256(&raw);
             std::fs::write(&sidecar, serde_json::to_vec(&changed_receipts).unwrap()).unwrap();
-            assert!(
-                check_packet_with(&packet_path, &raw, &blob, load_policy().unwrap()).is_err(),
-                "mutation {mutation}"
-            );
+            assert!(bound(&packet_path, &raw).is_err(), "mutation {mutation}");
         }
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1095,23 +901,21 @@ mod tests {
     }
 
     #[test]
-    fn strict_policy_rejects_absent_receipts_that_off_and_report_load() {
+    fn absent_receipts_are_gaps_and_fail_only_strict() {
         let raw = residual_model(false).to_blob();
-        let blob = DevBlob::parse(&raw).unwrap();
         let dir = scratch("strict-absent");
         let packet = dir.join("model.pkt");
-        check_packet_with(&packet, &raw, &blob, VerificationPolicy::Off).unwrap();
-        check_packet_with(&packet, &raw, &blob, VerificationPolicy::Report).unwrap();
-        let error =
-            check_packet_with(&packet, &raw, &blob, VerificationPolicy::Strict).unwrap_err();
+        bound(&packet, &raw).unwrap();
+        bound(&packet, &raw).unwrap();
+        let error = strict(&packet, &raw).unwrap_err();
         assert!(
             error.to_string().contains("no compiler check receipts"),
             "{error}"
         );
         let sidecar = dir.join("codec.pkt");
-        check_sidecar_with(&sidecar, &raw, &blob, VerificationPolicy::Off).unwrap();
-        check_sidecar_with(&sidecar, &raw, &blob, VerificationPolicy::Report).unwrap();
-        assert!(check_sidecar_with(&sidecar, &raw, &blob, VerificationPolicy::Strict).is_err());
+        bound(&sidecar, &raw).unwrap();
+        bound(&sidecar, &raw).unwrap();
+        assert!(strict(&sidecar, &raw).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1134,22 +938,13 @@ mod tests {
         )
         .unwrap();
         let path = dir.join("encoder.pkt");
-        let blob = DevBlob::parse(&encoder).unwrap();
-        check_packet_with(&path, &encoder, &blob, VerificationPolicy::Off).unwrap();
-        let error =
-            check_packet_with(&path, &encoder, &blob, VerificationPolicy::Strict).unwrap_err();
+        bound(&path, &encoder).unwrap();
+        let error = strict(&path, &encoder).unwrap_err();
         assert!(
             error.to_string().contains("no sidecar check receipts"),
             "{error}"
         );
-        let blob = DevBlob::parse(&model).unwrap();
-        check_packet_with(
-            &dir.join("model.pkt"),
-            &model,
-            &blob,
-            VerificationPolicy::Off,
-        )
-        .unwrap();
+        bound(&dir.join("model.pkt"), &model).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1164,7 +959,6 @@ mod tests {
             init: None,
         });
         let raw = model.to_blob();
-        let blob = DevBlob::parse(&raw).unwrap();
         let dir = scratch("renamed-main");
         let receipts = PacketCheckReceipts {
             schema: 1,
@@ -1178,12 +972,12 @@ mod tests {
         )
         .unwrap();
         let path = dir.join("gemma.pkt");
-        let error = check_packet_with(&path, &raw, &blob, VerificationPolicy::Off).unwrap_err();
+        let error = bound(&path, &raw).unwrap_err();
         assert!(
             error.to_string().contains("does not match loaded packet"),
             "{error}"
         );
-        assert!(check_packet_with(&path, &raw, &blob, VerificationPolicy::Strict).is_err());
+        assert!(strict(&path, &raw).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1258,10 +1052,9 @@ mod tests {
 
     #[test]
     #[ignore = "requires built plow_verify listed in lean-plow/approved-verifiers.json; CPU-only"]
-    fn strict_policy_replays_complete_receipts_and_rejects_substituted_evidence() {
+    fn complete_receipts_qualify_and_substituted_evidence_does_not() {
         let model = residual_model(false);
         let raw = model.to_blob();
-        let blob = DevBlob::parse(&raw).unwrap();
         let receipts = lean_receipts(&raw, &model);
         let dir = scratch("strict-replay");
         let packet = dir.join("model.pkt");
@@ -1269,7 +1062,7 @@ mod tests {
             std::fs::write(dir.join(PACKET_CHECKS_FILE), serde_json::to_vec(r).unwrap()).unwrap()
         };
         write(&receipts);
-        check_packet_with(&packet, &raw, &blob, VerificationPolicy::Strict).unwrap();
+        strict(&packet, &raw).unwrap();
         let bytes = serde_json::to_vec(&receipts).unwrap();
         let denied =
             replay_approved(&receipts.checks, &bytes, "fresh-scope-set", |_| false).unwrap_err();
@@ -1289,10 +1082,7 @@ mod tests {
                 _ => bad.checks[0].verifier_sha256 = "b".repeat(64),
             }
             write(&bad);
-            assert!(
-                check_packet_with(&packet, &raw, &blob, VerificationPolicy::Strict).is_err(),
-                "mutation {mutation}"
-            );
+            assert!(strict(&packet, &raw).is_err(), "mutation {mutation}");
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1326,7 +1116,7 @@ mod tests {
     /// prologue (two layers) and a row-scaled Conv1dF32 epilogue are accepted; mutating any bound
     /// precondition rejects, and a GEMM whose stats tensor has no earlier writer cannot be derived.
     #[test]
-    #[ignore = "requires built plow_verify; CPU-only"]
+    #[ignore = "requires built plow_verify listed in lean-plow/approved-verifiers.json; CPU-only"]
     fn emitted_speech_fusion_sites_meet_the_lean_preconditions() {
         use devgen::asr::qwen::{append_audio_transformer_layers, AudioTransformerSpec};
         use devgen::pipeline::{Activation, Conv1dF32Stage, DenseSplit, PadMode, TensorRef};

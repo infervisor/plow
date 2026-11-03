@@ -231,7 +231,7 @@ pub enum SemanticScope {
     LayoutMapping,
     LogicalTensorEffects,
     /// `media_geometry.v1`: speech/multimodal contract geometry of a bundle, checked at
-    /// qualification (`plowrt qualify`), not carried as a compiler receipt.
+    /// qualification (`plowc qualify`), not carried as a compiler receipt.
     MediaGeometry,
     /// `kv_ring.v1`: packed prefill writes never overwrite a ring row their own queries read,
     /// checked at qualification from the packet's `live_kv`/`packed_prefill` sections.
@@ -521,33 +521,6 @@ impl PacketCheckReceipts {
             }
         }
         Ok(())
-    }
-}
-
-/// How load and artifact qualification treat compiler receipts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VerificationPolicy {
-    /// Pre-policy behavior: absent receipts or an unavailable/changed verifier load unverified.
-    Off,
-    /// Derive the full obligation set and report every gap; reject only what `Off` rejects.
-    Report,
-    /// Any gap rejects: missing/unrunnable/unapproved verifier, absent, unused, duplicated or
-    /// wrong-program receipts, and uncovered required obligations.
-    Strict,
-}
-
-impl VerificationPolicy {
-    pub const VALUES: &'static [&'static str] = &["off", "report", "strict"];
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "off" => Ok(Self::Off),
-            "report" => Ok(Self::Report),
-            "strict" => Ok(Self::Strict),
-            other => Err(format!(
-                "unknown verification policy {other:?} (off, report, strict)"
-            )),
-        }
     }
 }
 
@@ -1464,11 +1437,6 @@ mod tests {
             .iter()
             .all(|v| is_approved_verifier(&v.sha256)));
         assert!(!is_approved_verifier(&"0".repeat(64)));
-        assert_eq!(
-            VerificationPolicy::parse("strict"),
-            Ok(VerificationPolicy::Strict)
-        );
-        assert!(VerificationPolicy::parse("on").is_err());
     }
 
     #[test]

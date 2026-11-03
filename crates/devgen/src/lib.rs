@@ -4518,7 +4518,7 @@ fn emit_phase(
             );
         }
     }
-    let c_ple = if c.ple > 0 && !block_mode {
+    let (c_ple, c_pp) = if c.ple > 0 && !block_mode {
         let lp = c.layers * c.ple;
         let c_pe = b.emit(DevOp::Embed, rows.clone(), &[], |d| {
             d.t[0] = n.ple_raw;
@@ -4558,15 +4558,16 @@ fn emit_phase(
                 d.f[0] = c.eps;
             },
         );
-        b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
+        let c_ple = b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
             d.t[0] = n.ple;
             d.t[1] = n.ple;
             d.t[2] = n.ple_raw;
             d.i[0] = t * lp;
             d.f[0] = std::f32::consts::FRAC_1_SQRT_2;
-        })
+        });
+        (c_ple, Some(c_pp))
     } else {
-        0
+        (0, None)
     };
     if hj {
         b.host_join();
@@ -5388,8 +5389,12 @@ fn emit_phase(
             // The block's FIRST layer reads the uploaded `act.x` with no producer
             // (Embed was skipped), so its RmsNorm depends on `&[]`. Full model =>
             // block.start==0 and this only affects l==0, whose dep IS the Embed.
+            // Layer 0 overwrites `act.x` after the per-layer projection read it.
+            let first_x = [dep, c_pp.unwrap_or(dep)];
             let nd: &[u32] = if block_mode && l == block.start {
                 &[]
+            } else if l == 0 && c_pp.is_some() {
+                &first_x
             } else {
                 &[dep]
             };

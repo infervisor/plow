@@ -29,6 +29,8 @@ pub struct Program<'a> {
 
 pub struct Packet<'a> {
     pub n_cu: u32,
+    /// The blob header's target-GPU fingerprint (`gpu_fingerprint` of the emit's `--gpu`); 0 = unknown.
+    pub target: u32,
     pub tp: bool,
     pub prefill_count: usize,
     pub tensors: &'a [Tensor<'a>],
@@ -81,6 +83,7 @@ pub fn with_model<T>(model: &packet::devbuild::Model, f: impl FnOnce(&Packet<'_>
         .collect();
     f(&Packet {
         n_cu: model.n_cu,
+        target: model.target,
         tp: model.progs.iter().any(|p| {
             p.hier_base != 0
                 || p.insts.iter().any(|d| {

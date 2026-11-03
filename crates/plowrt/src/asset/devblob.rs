@@ -1008,6 +1008,7 @@ impl DevBlob {
             .collect();
         f(&Packet {
             n_cu: self.n_cu,
+            target: self.target,
             tp: self.tp.is_some(),
             prefill_count: self.decode_rung_lo(),
             tensors: &tensors,

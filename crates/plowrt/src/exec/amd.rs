@@ -8808,7 +8808,6 @@ impl AmdEngine {
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
         let mut blob = image.blob.clone();
         crate::asset::serve::refuse_concat_features(&blob, raw)?;
-        crate::certificate_checks::check_packet(&image)?;
         let shards = crate::asset::shard::DeclaredShards::from_blob(&blob, &raw)?;
         // BEFORE anything reads the blob's geometry: `max_ctx`, the KV slot
         // stride, the VMM geometry and the prefill planner all derive from the

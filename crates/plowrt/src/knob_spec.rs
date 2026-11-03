@@ -788,7 +788,6 @@ const PROCESS_KNOBS: &[&str] = &[
     "PLOW_HOME",
     "PLOW_HOST_TIMING",
     "PLOW_LADDER_DEBUG",
-    "PLOW_LEAN_QUALIFY",
     "PLOW_LIBCUDA",
     "PLOW_LOAD_PROFILE",
     "PLOW_MAX_QUEUED_REQUESTS",
@@ -887,9 +886,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.asr_request_timeout_ms", Some("PLOW_ASR_REQUEST_TIMEOUT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(120_000)), OPT_IN),
     KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.asr_encode_hold_inflight", Some("PLOW_ASR_ENCODE_HOLD_INFLIGHT"), Layer::Runtime, USIZE, Default::Static(Val::Nat(32)), DIAG),
-    // `strict` refuses every current production bundle until its listed gaps close
-    // (docs/bringup/lean-correctness-inventory.md §9), so it stays opt-in.
-    KnobSpec::new("rt.lean_qualify", Some("PLOW_LEAN_QUALIFY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("off")), OPT_IN),
     KnobSpec::new("rt.asr_context_max_tokens", Some("PLOW_ASR_CONTEXT_MAX_TOKENS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_numerals", Some("PLOW_ASR_NUMERALS"), Layer::Runtime, Domain::Bool, ON, OPT_IN),

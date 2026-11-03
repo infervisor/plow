@@ -643,6 +643,9 @@ def cmd_build(a: argparse.Namespace) -> None:
     ]
     if "max_ctx" in cell and cell["max_ctx"]:
         base_args.extend(["--max-ctx", str(cell["max_ctx"])])
+    # plowc qualifies what it emits; a production recipe's emit fails on any Lean gap.
+    production = Path(a.recipe).resolve().is_relative_to((REPO / "recipes" / "infervisor").resolve())
+    base_args.extend(["--lean-qualify", "strict" if production and not block else "report"])
     if block:
         # A single-block packet with the recipe's own emit env, objects and routes.
         base_args.extend(["--block", block])
@@ -729,6 +732,7 @@ def cmd_build(a: argparse.Namespace) -> None:
         ]
         if sub.get("max_ctx"):
             sargs.extend(["--max-ctx", str(sub["max_ctx"])])
+        sargs.extend(["--lean-qualify", "strict" if production else "report"])
         sub_env[sub["name"]] = {k: expand(v, out) for k, v in sub.get("env", {}).items()}
         if run(nix([*sargs, "--out", str(assets / sub["name"])]), env_with(os.environ, sub_env[sub["name"]]), log):
             die(f"sub emit {sub['name']} failed; see build.log")
@@ -854,15 +858,15 @@ def store_cell(r: dict) -> str:
 
 
 def lean_qualify(assets: Path, report: Path, strict: bool) -> bool:
-    """`plowrt qualify` over a bundle's packets (receipts, approved verifier, replay, media
+    """`plowc qualify` over a bundle's packets (receipts, approved verifier, replay, media
     geometry; docs/bringup/lean-correctness-inventory.md §9-10), written to `report`. Recorded,
-    not fatal, unless `strict`; a missing plowrt or verifier is recorded as not checked."""
-    plowrt = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowrt"
-    if not plowrt.exists():
-        report.write_text(json.dumps({"checked": False, "reason": f"{plowrt} missing"}, indent=1))
-        print(f"lean qualify: not checked ({plowrt} missing)", file=sys.stderr)
+    not fatal, unless `strict`; a missing plowc or verifier is recorded as not checked."""
+    plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
+    if not plowc.exists():
+        report.write_text(json.dumps({"checked": False, "reason": f"{plowc} missing"}, indent=1))
+        print(f"lean qualify: not checked ({plowc} missing)", file=sys.stderr)
         return not strict
-    p = subprocess.run([str(plowrt), "qualify", "--assets", str(assets), "--format", "json"],
+    p = subprocess.run([str(plowc), "qualify", str(assets), "--format", "json"],
                        capture_output=True, text=True, env=env_with(os.environ, {"RUST_LOG": "warn"}))
     try:
         packets = json.loads(p.stdout)
@@ -2205,7 +2209,7 @@ def main() -> None:
     nb.add_argument("--quiet-lock", default="/tmp/plow-campaign-quiet.lock")
     nb.add_argument("--dry-run", action="store_true", help="freeze and write run.sh, do not submit")
     nb.set_defaults(f=cmd_nv_block_ab)
-    q = sp.add_parser("qualify", help="Lean receipt/media qualification of a bundle (plowrt qualify)")
+    q = sp.add_parser("qualify", help="Lean receipt/media qualification of a bundle (plowc qualify)")
     q.add_argument("--assets", required=True); q.add_argument("--out", help="report (default <assets>/../lean-qualification.json)")
     q.add_argument("--strict", action="store_true", help="exit non-zero unless every packet qualifies")
     q.set_defaults(f=cmd_qualify)

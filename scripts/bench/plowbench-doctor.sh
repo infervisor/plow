@@ -110,7 +110,7 @@ p=d["packets"]; bad=[e for e in p if not e["qualified"]]
 print("ok" if not bad else "gaps", f"{len(p)-len(bad)}/{len(p)} packets qualify;", "; ".join(e["packet"].rsplit("/",1)[-1]+": "+e["qualification"]["gaps"][0][:100] for e in bad[:3]))' "$LQ")
         case "$lq" in
             ok*) pb_ok "lean qualification: ${lq#ok }" ;;
-            *) pb_warn "lean qualification: $lq (structural evidence only; PLOW_LEAN_QUALIFY=strict would refuse)" ;;
+            *) pb_warn "lean qualification: $lq (structural evidence only; a strict plowc emit would refuse)" ;;
         esac
     else
         pb_warn "no lean-qualification.json beside $ASSETS — run campaign.py qualify --assets $ASSETS"
