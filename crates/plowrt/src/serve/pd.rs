@@ -385,7 +385,28 @@ pub(crate) async fn submit(
                 Some(StreamChunk::Token { id, logprobs, .. })
                     if first.is_none() && id != stream::TEXT_ONLY =>
                 {
-                    first = Some((id, Instant::now(), logprobs))
+                    let first_at = Instant::now();
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        if let Some(lp) = &logprobs {
+                            use sha2::{Digest, Sha256};
+                            let mut hash = Sha256::new();
+                            for token in &job.prompt_ids {
+                                hash.update(token.to_le_bytes());
+                            }
+                            let top_bits: Vec<_> = lp
+                                .top
+                                .iter()
+                                .map(|&(token, value)| (token, value.to_bits()))
+                                .collect();
+                            tracing::debug!(
+                                prompt_sha256 = %format_args!("{:x}", hash.finalize()),
+                                rows = job.prompt_ids.len(), token = id,
+                                logprob_bits = lp.logprob.to_bits(), ?top_bits,
+                                "pd: source first logprobs"
+                            );
+                        }
+                    }
+                    first = Some((id, first_at, logprobs))
                 }
                 Some(StreamChunk::Done {
                     reason: FinishReason::Preempted,
