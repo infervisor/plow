@@ -74,7 +74,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-bf16"
 status = "validated"
-plow_git = "b3a2168bda58119c2c28a83183165728bae0a6d5"
+plow_git = "3b7a995f58b86871ef77db2bd98da491663ecfbb"
 network = "gemma4"
 
 [target]
@@ -138,7 +138,10 @@ PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
-PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding"
+# Generated sliding prefill attention from rung 128 (was 1024): full-model packed chunk 256 / 512
+# 19.69 / 24.72 -> 17.45 / 22.51 ms; rungs >= 1024 digest-identical, ctx 4094/4095/8191 clean;
+# FP32 gate PASS c1/c8/c32 (kl_mean 0.1147 / 0.0984 / 0.0899, vLLM 0.1098 / 0.1145 / 0.1104).
+PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding@128"
 
 [serve.env]
 PLOW_PREFIX_CACHE = "1"
