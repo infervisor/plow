@@ -92,7 +92,7 @@ pub(crate) fn apply(
                         inst.op, inst.t, inst.i
                     ));
                 }
-                if nvidia && si == fp32_slot {
+                if nvidia && (si == fp32_slot || pi < decode) {
                     let (m, n, k) = (inst.i[0], inst.i[1], inst.i[2]);
                     if k % 8 != 0
                         || [
@@ -150,7 +150,7 @@ pub(crate) fn apply(
             {
                 return Err("unsupported peer collective geometry or fusion".into());
             }
-            if si == fp32_slot {
+            if si == fp32_slot || (nvidia && pi < decode) {
                 marked += 1;
             }
         }
@@ -192,12 +192,14 @@ pub(crate) fn apply(
             ) {
                 let slot = if inst.i[2] == 0 { 0 } else { 1 };
                 inst.i[2] *= 2;
-                if slot == fp32_slot {
+                if slot == fp32_slot || (nvidia && pi < decode) {
                     inst.op = DevOp::XReduce as u16;
                     inst.i[4] = 0;
                     inst.f[0] = f32::from_bits(XREDUCE_PARTIAL_F32_MARK);
                 }
-            } else if slots[fp32_slot].0 == inst.t[0] {
+            } else if slots[fp32_slot].0 == inst.t[0]
+                || (nvidia && pi < decode && slots.iter().any(|&(partial, _)| partial == inst.t[0]))
+            {
                 inst.op = if nvidia && pi >= decode {
                     DevOp::GemvF32Out
                 } else {
@@ -301,7 +303,8 @@ mod tests {
         let mut m = model();
         apply(&mut m, true, "sm_120a", [(0, 1), (2, 3)]).unwrap();
         assert_eq!(m.progs[0].insts[0].op, DevOp::GemmF32 as u16);
-        assert_eq!(m.progs[0].insts[2].op, DevOp::Gemv as u16);
+        assert_eq!(m.progs[0].insts[2].op, DevOp::GemmF32 as u16);
+        assert_eq!(m.progs[0].insts[3].f[0].to_bits(), XREDUCE_PARTIAL_F32_MARK);
         assert_eq!(m.progs[1].insts[0].op, DevOp::Gemv as u16);
         assert_eq!(m.progs[1].insts[2].op, DevOp::GemvF32Out as u16);
         for p in &m.progs {
@@ -310,13 +313,15 @@ mod tests {
     }
     #[test]
     fn nv_tp_partial_f32_rejects_bad_operand_extents_and_rank_count_atomically() {
-        for case in 0..5 {
+        for case in 0..7 {
             let mut m = model();
             match case {
                 0 => m.progs[0].insts[0].i[2] = 7,
                 1 => m.progs[0].tensors[4].bytes = 1,
                 2 => m.progs[1].tensors[5].bytes = 1,
                 3 => m.progs[0].insts[1].i[1] = 4,
+                5 => m.progs[0].insts[2].i[2] = 7,
+                6 => m.progs[0].insts[2].i[2] = 32,
                 _ => {}
             }
             let before = snapshot(&m);

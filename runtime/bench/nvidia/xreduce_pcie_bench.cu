@@ -723,6 +723,7 @@ static void projection_cases(unsigned blocks, bool peer) {
     };
     run(3840, 2048, true, {128, 512, 1024, 2048, 4096, 8192});
     run(3840, 4096, true, {128, 512, 1024, 2048, 4096, 8192});
+    run(3840, 7680, true, {128, 512, 1024, 2048, 4096, 8192});
     run(3840, 7680, false, {1, 2, 4, 8, 16, 32});
     run(70, 40, true, {33});
     run(70, 40, false, {5});
@@ -740,7 +741,7 @@ static void real_projection(const char* path, unsigned blocks, bool peer) {
     read(h, sizeof(h));
     if (h[0] != 0x58524631u || h[1] != 1 || !h[2] || h[2] > 128
         || h[3] != 3840 || h[5] > 1 || h[6] || h[7]
-        || (h[5] ? h[4] != 4096 : (h[4] != 7680 || h[2] > 32))) {
+        || (h[5] ? (h[4] != 4096 && h[4] != 7680) : (h[4] != 7680 || h[2] > 32))) {
         std::fprintf(stderr, "unsupported real projection fixture\n"); std::exit(2);
     }
     Projection p{};
