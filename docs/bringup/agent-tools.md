@@ -847,9 +847,12 @@ Each rule cost at least one campaign a day of misattributed results.
   Python, so prep never runs at load.
 * The dist gate for every asset is: `push` to a `file://` registry, `load` into a clean
   `PLOW_HOME`, `plowrt serve --model <name>` (never `--assets`), then the asset's digest or
-  CER/WER gate. RC8 found three failure classes only at this step: a missing HF sidecar, a
-  prepared checkpoint the bundle did not carry, and build-script packets with no `max_ctx`. Run a
-  CPU push/load of every recipe at the start of a release candidate, before any GPU gate.
+  CER/WER gate. `campaign.py dist-gate <recipe> --assets DIR --out DIR [--gate]` runs it: push,
+  clean load, bundle == push input (bytes + `inventory`) on CPU, then a gpuq job serving
+  `--model` (smoke, or the recipe's `[gates]` with `--gate`); record `dist-gate.json`. RC8 found
+  three failure classes only at this step: a missing HF sidecar, a prepared checkpoint the bundle
+  did not carry, and build-script packets with no `max_ctx`. Run it on every recipe at the start
+  of a release candidate, before any other GPU gate.
 * The release tip is frozen from the first emit to the PR. Later changes reach it only as
   recipe-only commits on the release branch (pins, measured margins, known issues), merged by
   the coordinator with a path guard (`recipes/infervisor/` only) and `check_recipe` +
