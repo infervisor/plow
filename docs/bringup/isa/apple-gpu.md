@@ -156,8 +156,8 @@ Vendor rules [vendor documented: MSL 4.1 §6.10.1, §6.16]:
   `atomic_ulong` with `atomic_min/max_explicit` only; no 64-bit fetch-add or CAS [vendor
   documented: MSL 4.1 §6.16.4, Tables 6.27–6.28].
 * SIMD-group functions (`simd_shuffle*`, `simd_broadcast`, `simd_sum/max/min/prefix_*`,
-  `simd_ballot/all/any`) need no barrier and take no `bfloat`/`bool`/`long`: widen to float
-  [vendor documented: MSL 4.1 §6.10.2].
+  `simd_ballot/all/any`) need no barrier; data operands take no `bfloat`/`bool`/`long` (widen to float);
+  `simd_all/any/ballot` take a `bool` predicate [vendor documented: MSL 4.1 §6.10.2, Table 6.14].
 
 Plow's cross-threadgroup protocol inside one dispatch (`plow_interp`):
 
@@ -171,10 +171,10 @@ atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_de
 if (lid == 0) atomic_fetch_add_explicit(ctr + succ, 1u, memory_order_relaxed);
 ```
 
-Plow's payload pointers are unqualified `device T*`; that the fences make them visible across
-threadgroups is measured (pitfall 1), not spec-guaranteed: MSL 4.1 §4.8 gives plain `device`
-memory threadgroup coherence and offers `coherent(device)` (UNVERIFIED which is required; settle
-with probe (f) on a Metal toolchain).
+Plow's payload pointers are unqualified `device T*`, which MSL 4.1 §4.8 gives only threadgroup
+coherence. Portable cross-threadgroup visibility needs `coherent(device)` accesses plus the fences;
+plow's unqualified form works by measurement only (pitfall 1), and probe (f) tests behaviour, not
+the guarantee.
 
 Host side: one command buffer per GPU-only program run (CPU/ANE offload submits one per GPU
 range, `mod.rs` `dispatch_range`), host sync with `waitUntilCompleted` (Event mode);
@@ -318,8 +318,8 @@ Repo-vs-repo/vendor disagreements (flagged, not edited):
   threadgroup memory on the pipeline before admitting it.
 * Matrix work at M ≥ 8 → `simdgroup_bfloat8x8` operands, `simdgroup_float8x8` accumulators,
   RB x CB accumulators per simdgroup (2x4 at 128 rows), K chunk 32, register double-buffering.
-* Decode GEMV (M ≤ 8) → no matrix ops; lane-strided `ushort4` loads, four weight rows per
-  simdgroup, `simd_sum`; for batched decode reuse each weight load across rows
+* Decode GEMV (M ≤ 8) → no matrix ops; lane-strided `ushort4` loads, `simd_sum`; the generic
+  unnormalized path takes four weight rows per simdgroup (normalized rows go singly); for batched decode reuse each weight load across rows
   (`PLOW_METAL_BF16_M2/M4/M8`). Quote % of the measured 255 GB/s.
 * Sizing threadgroup memory → reuse the interpreter's 32 KiB `tile`; keep staging off the live
   `red`/`gate`/`keys` aliases (pitfall 12). If a tile needs more, shrink it; never add a second array.

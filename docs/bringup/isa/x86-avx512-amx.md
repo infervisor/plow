@@ -93,10 +93,10 @@ AVX10: GNR enumerates AVX10.1, a re-enumeration of its AVX-512 set. The AVX10 bi
 * **Alignment for AMX operands**: align tile bases to 64 B. Avoid row strides that are multiples of 4 KiB (bf16 K = 2048): all 16 rows of a TILELOADD then map to one 12-way L1 set (64 sets). Not measured in plow (UNVERIFIED for plow shapes); the ORM §20.4 128/256 B advice was not re-checked.
 * **TILELOADD cannot forward from the store buffer**: it waits until the store reaches L1. TILESTORED-to-vector forwarding only works for full 64 B lines and has outliers. Keep tens of cycles between them [vendor documented: ORM §20.15]. plow's `stage_a` and the pack loops write kb-outer so the first chunk a TILELOADD reads is the oldest, and fp32 partials go TILESTORED-to-TILELOADD, never through AVX stores.
 * **Temporal vs T1 loads**: the streamed operand should use TILELOADDT1 so it does not evict the reused one from L1 ("priority inversion") [vendor documented: ORM §20.8.1]. `gemm_amx.c` has three bf16 drivers (`gemm_amx.c:1033`):
-  * `wp_run` (M ≥ 64 and GLU, K ≤ 2048 or N ≤ 2048): packs weights as VNNI B, panels sized by `WP_WBUDGET` = 1280 KiB.
+  * `wp_run` (M ≥ 64 and (GLU or K ≤ 2048 or N ≤ 2048)): packs weights as VNNI B, both operands plain TILELOADD, panels sized by `WP_WBUDGET` = 1280 KiB.
   * `wm_run` (default otherwise): weights are tile A loaded in place; activations are packed B (`WM_KP` = 1024), x tiles streamed with T1; token chunk capped by `WM_L2_BUDGET` = 1.5 MiB.
   * strip driver (fp8 weights, oversized slices, `PLOW_AMX_DEBUG=pack`): packed 32 KiB B strip (`KP` = 512) L1-resident, A streamed with T1.
-* **Prefetch** per streamed weight row: GEMM packing uses T1, 512 B ahead (`PACK_PF_B`); AMX GEMV and streamed MoE weights use T0, 1024 B ahead (`XGV_PF` `gemv_amx.c:70`, `XM_PF` `moe_amx.c:73,484`). Results:
+* **Prefetch** per streamed weight row: GEMM packing uses T1, 512 B ahead for bf16 (`PACK_PF_B`), 256 B for fp8; AMX GEMV and streamed MoE weights use T0, 1024 B ahead (`XGV_PF` `gemv_amx.c:70`, `XM_PF` `moe_amx.c:73,484`). Results:
   * T0 prefetch two K steps ahead in `wm_block` measured −13 to −18% single-core and is not used there [measured in plow: a25488237].
   * NTA prefetch is worse than none: the line still allocates in L2 and only gets a shorter life [measured in plow: docs/bringup/results/xeon6-l2r-bf16-20261008/p4_kv_policy.md].
   * Prefetching KV d rows ahead hides DRAM latency (257 to 193 µs per step). A bulk early prefetch burst stalls the GEMVs behind it [measured in plow: p4_kv_policy.md].
@@ -214,7 +214,7 @@ _tile_dpbf16ps(1, 4, 7);                     /* tmm2/3 likewise with A rows 16-3
 
 * If you are about to write a batched decode GEMV: AMX (TDPBF16PS, 2x2 block: tmm0-3 C, 4/5 A, 6/7 B) from M ≥ 5 (`XGV_MIN_M`, subject to K/max-M/scratch guards), AVX-512 VDPBF16PS row dots below. Measure GEMM crossovers separately.
 * If you are about to choose which operand is the tile A: follow the driver selection in `gemm_amx.c:1033` (`wp_run` packs weights as B; `wm_run`, `gemv_amx.c`, `moe_amx.c` load weights as A and pack activations as B).
-* If you are about to size a K panel or token chunk: use the driver's budget (`KP` 512 strip in L1, `WM_KP` 1024 with chunk ≤ 1.5 MiB L2, `WP_WBUDGET` 1280 KiB). Stream the other operand with TILELOADDT1.
+* If you are about to size a K panel or token chunk: use the driver's budget (`KP` 512 strip in L1, `WM_KP` 1024 with chunk ≤ 1.5 MiB L2, `WP_WBUDGET` 1280 KiB). TILELOADDT1 streams A in the strip driver and packed activations in `wm_run`; `wp_run` uses none.
 * If you are about to read weights from DRAM inside the tile loop: add a T1 software prefetch per streamed row (about 512 B-1 KiB ahead) and A/B it at 96 threads, not on one core.
 * If you are about to store and then TILELOADD the same lines: put tens of cycles between them, or march stores so the first-loaded chunk is the oldest. Never feed TILELOADD from fresh AVX stores in the next instruction.
 * If you are about to add a new rung, shape or op: check `plow_cpu_tier_of(op)` and the wrapper's shape guards at that M. A fall to golden scalar costs 10-50x.
@@ -235,7 +235,7 @@ _tile_dpbf16ps(1, 4, 7);                     /* tmm2/3 likewise with A rows 16-3
 | TDPBF16PS semantics | Intel SDM Vol. 2 (mirror https://www.felixcloutier.com/x86/tdpbf16ps) | instruction page | fetched 2026-11-03 |
 | TILELOADD/TILELOADDT1 | Intel SDM Vol. 2 (https://www.felixcloutier.com/x86/tileloadd:tileloaddt1) | instruction page | fetched 2026-11-03 |
 | VDPBF16PS, VCVTNE2PS2BF16 | Intel SDM Vol. 2 (https://www.felixcloutier.com/x86/vdpbf16ps, .../vcvtne2ps2bf16) | instruction pages | fetched 2026-11-03 |
-| Tile architecture, CPUID leaves, XCR0 components | Intel SDM Vol. 1 ch. 18 (AMX) and Vol. 2 CPUID; https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html | ch. 18; CPUID leaf 7 | current SDM |
+| Tile architecture, CPUID leaves, XCR0 components | Intel SDM Vol. 1 ch. 19 (AMX) and Vol. 2 CPUID; https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html | ch. 19; CPUID leaf 7 | SDM rev. 086 (Dec 2024) |
 | AMX permission on Linux | https://docs.kernel.org/arch/x86/xstate.html | "Using dynamically enabled XSTATE features" | fetched 2026-11-03 |
 | Intrinsic signatures | Intel Intrinsics Guide, https://www.intel.com/content/www/us/en/docs/intrinsics-guide/ | AMX-TILE/BF16/INT8/FP16, AVX512_BF16 | current |
 | Xeon 6 platform (cores, cache, memory types, FMA units) | https://www.intel.com/content/www/us/en/products/sku/240785/intel-xeon-6972p-processor-480m-cache-2-40-ghz/specifications.html | specifications | fetched 2026-11-03 (6975P-C itself not published) |

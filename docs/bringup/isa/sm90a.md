@@ -11,8 +11,8 @@
 Verified against: PTX ISA 9.4 (docs.nvidia.com, last updated 2026-10-12), Hopper Tuning Guide v13.4,
 CUDA Driver API 13.4 (Tensor Map Object Management), NVIDIA H100 and H200 product pages; fetched 2026-11-03.
 
-Code paths are on `prod-next`. Numbers tagged `experiments/README.md` were measured on an H100 NVL
-capped at 310 W, not the 700 W SXM: use them as ratios only.
+Code paths are on `prod-next`. `experiments/README.md` Hopper rows: H100 NVL capped at 310 W, use
+as ratios only; its `t3_pipe_probe.cu` and `gemv_transport.cu` rows are sm_120a.
 
 ## 1. Execution model
 
@@ -142,7 +142,7 @@ rows, SBO = offset between 8-column groups (PTX §9.7.17.5.1.2.1.1-2).
 | TMA tile | `cp.async.bulk.tensor.{2d,3d}.shared::cluster.global.mbarrier::complete_tx::bytes [dst],[map,{c0,c1(,c2)}],[mbar]` (`sm90_tma2d/3d`) | one elected thread issues; c0 = innermost coordinate; OOB elements zero-filled (TMA zero-fills ragged M and the K tail, relL2 unchanged [measured in plow: op_gemm_sm90.cuh TMA note]) |
 | TMA multicast | `.multicast::cluster` + 16-bit ctaMask | works on H100 (SASS `UTMALDG.2D.MULTICAST`); no production win (see pitfalls) |
 | bulk store | `cp.async.bulk` smem → global (speech wgmma epilogue, `op_speech_f32.cuh`) | 16 B multiple |
-| `ldmatrix` | `.m8n8.x1/.x2/.x4{.trans}.b16` in mma.sync bodies (`op_gemm.cuh`, `op_attention.cuh`, `op_gemv_*`) | B operand can be read from a natural `[n][k]` tile with non-trans `.x2`, bit-identical [measured in plow: experiments `t3_pipe_probe.cu`] |
+| `ldmatrix` | `.m8n8.x1/.x2/.x4{.trans}.b16` in mma.sync bodies (`op_gemm.cuh`, `op_attention.cuh`, `op_gemv_*`) | B operand can be read from a natural `[n][k]` tile with non-trans `.x2`, bit-identical on sm_120a [measured in plow: experiments `t3_pipe_probe.cu`] |
 | `stmatrix` | sm_90+: `.m8n8.x1/x2/x4{.trans}.b16` [vendor documented: PTX stmatrix] | **unused in plow** (epilogues store from fragments or stage through smem) |
 
 Tensor maps (`cuTensorMapEncodeTiled`, host side `crates/plowrt/src/device/cuda.rs`,
@@ -343,9 +343,9 @@ sm90_wg_commit(); sm90_wg_wait<0>();
   stale-hash cubins, so use a fresh out dir [measured in plow: docs/bringup/agent-tools.md §9].
 * One `interp_sm90a` nvcc takes 22-38 GB RAM, so never compile beside a serving grid
   [measured in plow: docs/bringup/agent-tools.md §9].
-* A standalone CUDA-runtime probe compiled inside `nix develop` aborts ("stack smashing detected").
-  nvcc + `cuda_fp16.hpp` inside the shell fails because ROCm's `nv/target` shadows CUDA's. Use
-  `env -i` + `NVCC_PREPEND_FLAGS` or the plain shell [measured in plow: docs/bringup/agent-tools.md §9].
+* Build, emit and test inside `nix develop`; `nvcc_cubin.sh` runs nvcc under `env -i` itself. Only
+  standalone CUDA-runtime probes are compiled in the plain shell: built in nix they abort at runtime
+  init ("stack smashing detected") [measured in plow: docs/bringup/agent-tools.md §9].
 * Role objects are hash-pinned to the packet, and the live copy is in `assets/`. A cubin swap in an
   objects dir is silent and inert. A/B a role by re-emitting, with a positive control
   [measured in plow: 9d89adfad].
@@ -471,12 +471,12 @@ Repo-vs-vendor notes, flagged and not edited:
   (`cuobjdump --dump-resource-usage`), time step_bench on all packets, and gate it out of objects
   that never emit it.
 * **New KV-reading arm:** clamp every row to `< kv_len`, then run `step_boundary.sh`.
-* **Vendor library (cuBLASLt/FA4):** pin algorithms (`cublaslt_algos.jsonl`), check cuBLASLt
-  >= 13.4 binding, and ship as a packet cubin + host stub, never a `.so`.
+* **Vendor routes:** pin cuBLASLt algorithms (`cublaslt_algos.jsonl`), ship `libcublasLt.so` >= 13.4
+  beside plowrt; ship FA4 as packet cubin + host stub.
 * **Flash-decode split count:** align work items to 132 SMs (nsplit 33 at 4 groups); scale by
   1/n_batch.
-* **Probe executables:** `-gencode arch=compute_90a,code=sm_90a`, compiled as agent-tools.md §9
-  says (plain shell or `env -i`), run via `gpuq.py`, with the DVFS-safe harness.
+* **Probe executables:** `-gencode arch=compute_90a,code=sm_90a`, compiled in the plain shell
+  (CUDA-runtime probes only), run via `gpuq.py`, with the DVFS-safe harness.
 * **Before claiming a perf number:** compare against calibrated ceilings (3094 GB/s, 771 / 1407 TF),
   not datasheet peaks.
 
