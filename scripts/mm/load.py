@@ -192,6 +192,7 @@ def perf(args, cl):
                         return audio(clips[i % len(clips)]["path"], s, "Listen to the caller and reply helpfully.")
                     return [{"role": "user", "content": f"Ticket {s}: {TEXTS[i % len(TEXTS)]}"}]
                 msgs = [msg(i) for i in range(n)]
+                before = cl.metrics()
                 t0 = time.perf_counter()
                 with ThreadPoolExecutor(conc) as ex:
                     rs = list(ex.map(lambda m: cl.chat(m, args.max_tokens, stream=True, extra={"ignore_eos": True}), msgs))
@@ -207,6 +208,11 @@ def perf(args, cl):
                         "total_tok_s": round((outn + sum(r.get("prompt_tokens") or 0 for r in ok)) / wall, 1),
                         "ttft_ms": {"p50": pct(ttft, 0.5), "p99": pct(ttft, 0.99), "mean": statistics.mean(ttft) if ttft else None},
                         "tpot_ms": {"p50": pct(tpot, 0.5), "p99": pct(tpot, 0.99), "mean": statistics.mean(tpot) if tpot else None}}
+                after = cl.metrics()
+                calls = after.get("plowrt_mm_encode_total:audio", 0) - before.get("plowrt_mm_encode_total:audio", 0)
+                if calls:
+                    secs = after.get("plowrt_mm_encode_seconds_total:audio", 0) - before.get("plowrt_mm_encode_seconds_total:audio", 0)
+                    cell["encode_ms_mean"] = round(secs / calls * 1e3, 2)
                 report["cells"].append(cell)
                 print(json.dumps(cell), flush=True)
     json.dump(report, open(f"{args.out}/perf.json", "w"), indent=1)
