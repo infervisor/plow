@@ -7843,21 +7843,47 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
  * (PLOW_DECODE_TIER, scripts/build_gfx942.sh) the wide object only ever sees the T=4 program,
  * whose gate/up and q/k/v are PLAIN Gemvs -- `plowrt disasm --program 4` emits no GemvGlu and no
  * GemvQkv at all. */
-#if defined(__gfx942__) && PLOW_GLOBAL_QUEUE && !PLOW_BUCKET_PREFILL && \
+#if (defined(__gfx942__) || (PLOW_GFX12 && PLOW_GFX12_WMMA_GEMV && PLOW_GEMV_MM == 1)) && \
+    PLOW_GLOBAL_QUEUE && !PLOW_BUCKET_PREFILL && \
     !PLOW_BUCKET_FLASH && !PLOW_MIXED_STEP && \
     (PLOW_GEMV_MM == 1 || PLOW_GEMV_MM == 4) && \
     !PLOW_FP8 && !PLOW_FP8_KV && !PLOW_MXFP4 && \
     !PLOW_MLA_PREFILL && !PLOW_K3
+#if PLOW_GFX12
+        {
+        const CInst native_in = plow_scalar_ptr(in);
+#endif
 #define PLOW_DIRECT_TEN(k) (di->t[k] == PLOW_TENSOR_NONE ? nullptr : dt[di->t[k]])
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV
-        if (in->op == PLOW_DOP_GEMV) {
+        if (in->op == PLOW_DOP_GEMV
+#if PLOW_GFX12
+            && gv12_fits(native_in->i[0], native_in->i[2], (int)native_in->i[3])
+#endif
+        ) {
+#if PLOW_GFX12
+            const CInst di = native_in;
+            const CTens dt = plow_scalar_ptr(tens);
+            d_gemv_gfx12((bf16*)PLOW_DIRECT_TEN(0),
+                         (const bf16*)PLOW_DIRECT_TEN(1) + (size_t)di->i[4] * di->i[2],
+                         (const bf16*)PLOW_DIRECT_TEN(2), di->i[0], di->i[1], di->i[2],
+                         e.slice, di->blocks, sm.gm);
+#else
             const CInst gemv_in = plow_scalar_ptr(in);
             exec_gemv(gemv_in, plow_scalar_ptr(tens), e.slice, gemv_in->blocks, sm.gm);
+#endif
         } else
 #endif
 #if PLOW_GEMV_MM == 1 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_GLU)
-            if (in->op == PLOW_DOP_GEMV_GLU) {
+            if (in->op == PLOW_DOP_GEMV_GLU
+#if PLOW_GFX12
+                && gv12_fits(native_in->i[0], native_in->i[2], 0)
+#endif
+            ) {
+#if PLOW_GFX12
+            const CInst di = native_in;
+#else
             const CInst di = plow_scalar_ptr(in);
+#endif
             const CTens dt = plow_scalar_ptr(tens);
             d_gemv_glu((bf16*)PLOW_DIRECT_TEN(0), (const bf16*)PLOW_DIRECT_TEN(1),
                        (const bf16*)PLOW_DIRECT_TEN(2), (const bf16*)PLOW_DIRECT_TEN(5), di->i[0],
@@ -7866,8 +7892,17 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         } else
 #endif
 #if PLOW_GEMV_MM == 1 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_QKV)
-            if (in->op == PLOW_DOP_GEMV_QKV) {
+            if (in->op == PLOW_DOP_GEMV_QKV
+#if PLOW_GFX12
+                && native_in->t[7] == PLOW_TENSOR_NONE
+                && gv12_fits(native_in->i[0], native_in->i[2], 0)
+#endif
+            ) {
+#if PLOW_GFX12
+            const CInst di = native_in;
+#else
             const CInst di = plow_scalar_ptr(in);
+#endif
             const CTens dt = plow_scalar_ptr(tens);
             d_gemv_qkv((bf16*)PLOW_DIRECT_TEN(0), (bf16*)PLOW_DIRECT_TEN(3),
                        (bf16*)PLOW_DIRECT_TEN(5), (const bf16*)PLOW_DIRECT_TEN(1),
@@ -7878,8 +7913,13 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         } else
 #endif
 #undef PLOW_DIRECT_TEN
-#endif
         plow_exec(in, e.slice, tens, &sm, &prog);
+#if PLOW_GFX12
+        }
+#endif
+#else
+        plow_exec(in, e.slice, tens, &sm, &prog);
+#endif
 #endif
 
         __syncthreads();

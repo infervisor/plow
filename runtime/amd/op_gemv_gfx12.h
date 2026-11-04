@@ -28,17 +28,18 @@ __device__ __forceinline__ bool gv12_fits(unsigned M, unsigned K, int norm) {
 /* Every wave visits the same N tile and a disjoint, increasing sequence of K
  * chunks. The reduction order is independent of M and the object's GEMV bucket,
  * including the M=1 calls made by GEMV_ARGMAX. Scratch aliases the dead GEMM arena. */
+typedef bf16 __attribute__((address_space(3))) *gv12_lds_ptr;
 template <bool GLU>
-__device__ void gemv_gfx12_range(bf16* C, const bf16* x, const bf16* W, const bf16* Wu,
+__device__ __attribute__((noinline)) void gemv_gfx12_range_lds(bf16* C, const bf16* x, const bf16* W, const bf16* Wu,
                                 unsigned M, unsigned N, unsigned K,
-                                unsigned n0, unsigned n1, bf16* lds,
+                                unsigned n0, unsigned n1, gv12_lds_ptr lds,
                                 unsigned act = 0, float beta = 0, float lbeta = 0) {
     static_assert(PLOW_WAVE == 64, "gfx12 GEMV requires wave64");
     static_assert((GLU ? 2 : 1) * PLOW_WAVES * 256 * sizeof(float) <= GM_LDS_HALVES * sizeof(bf16),
                   "gfx12 GEMV reduction must fit the interpreter arena");
     const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
     const unsigned col = lane & 15u, kg = lane >> 4;
-    float* part = (float*)lds;
+    float __attribute__((address_space(3))) *part = (float __attribute__((address_space(3)))*)lds;
     const auto xr = buf_rsrc(x, M * K);
     for (unsigned n = n0; n < n1; n += 16) {
         const unsigned cols = min(16u, n1 - n);
@@ -97,6 +98,15 @@ __device__ void gemv_gfx12_range(bf16* C, const bf16* x, const bf16* W, const bf
         }
         __syncthreads();
     }
+}
+/* Keep the reduction arena in LDS across the real call boundary. */
+template <bool GLU>
+__device__ __forceinline__ void gemv_gfx12_range(bf16* C, const bf16* x, const bf16* W, const bf16* Wu,
+                                unsigned M, unsigned N, unsigned K,
+                                unsigned n0, unsigned n1, bf16* lds,
+                                unsigned act = 0, float beta = 0, float lbeta = 0) {
+    gemv_gfx12_range_lds<GLU>(C, x, W, Wu, M, N, K, n0, n1, (gv12_lds_ptr)lds,
+                            act, beta, lbeta);
 }
 __device__ void d_gemv_gfx12(bf16* C, const bf16* x, const bf16* W,
                             unsigned M, unsigned N, unsigned K,
