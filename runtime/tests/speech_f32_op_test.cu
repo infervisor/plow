@@ -10,7 +10,7 @@
  * Build (standalone):
  *   gcc -O2 -ffp-contract=off -c -I runtime/common -I runtime/cpu/dev \
  *       runtime/cpu/dev/golden/f32_primitives.c
- *   nvcc -arch=sm_90a -O3 -I runtime/common -I runtime/nvidia -I runtime/cpu/dev \
+ *   nvcc -arch=sm_90a -O3 -DPLOW_NV_HOPPER=1 -I runtime/common -I runtime/nvidia -I runtime/cpu/dev \
  *        runtime/tests/speech_f32_op_test.cu f32_primitives.o -o speech_f32_op_test
  *   speech_f32_op_test [--bench | --bench-only]
  */
@@ -662,6 +662,8 @@ struct ConvSpec {
     bool tapmajor = false; /* flags bit 15: weights [cout][kernel][cin/groups] */
     bool wg = false; /* flags bit 17: the wgmma arm of the pointwise wide tile (sm_90a) */
     bool dual = false; /* flags bit 19: alpha [cin | cout], an input then an output snake */
+    bool rows = false; /* flags bit 16: the small-M rows arm (else the warp arm at cout <= 4) */
+    bool splitk = false; /* flags bit 20: t7 is the wgmma tile's split-K scratch */
 };
 
 static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
@@ -730,6 +732,7 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
     unsigned l = s.lengths.empty() ? PLOW_TENSOR_NONE : c.u32(s.lengths);
     if (s.row_scale) c.in.t[7] = c.f32((size_t)s.batch * out_rows, 1.f);
+    if (s.splitk) c.in.t[7] = splitk_scratch(c);
     c.in.op = transpose ? PLOW_DOP_CONV_TRANSPOSE1D_F32 : PLOW_DOP_CONV1D_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b; c.in.t[4] = a; c.in.t[5] = r; c.in.t[6] = l;
     c.in.i[0] = s.batch; c.in.i[1] = s.in_rows; c.in.i[2] = s.cin; c.in.i[3] = s.cout;
@@ -737,13 +740,21 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
                    (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u) |
-                   (s.dual ? 1u << 19 : 0u);
+                   (s.dual ? 1u << 19 : 0u) | (s.rows ? 1u << 16 : 0u) | (s.splitk ? 1u << 20 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
     Case c; unsigned o;
     build_conv(c, s, false, o);
     run(name, c, g_conv1d_f32, {o}, FP32, tol);
+    if (!s.splitk) return;
+    /* The reducers re-arm every ticket. */
+    std::vector<uint32_t> tk(SPT_TICKETS);
+    CK(cudaMemcpy(tk.data(), c.dev[c.in.t[7]], SPT_TICKETS * 4, cudaMemcpyDeviceToHost));
+    bool zero = true;
+    for (uint32_t t : tk) zero &= t == 0u;
+    printf("  %-34s tickets re-armed -> %s\n", name, zero ? "PASS" : "FAIL");
+    if (!zero) g_fail = 1;
 }
 
 static void t_convt1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -2127,6 +2138,19 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < 64; i += 3) g6.lengths[i] = 40 + i;
         g6.wide = g6.tapmajor = g6.wg = true;
         t_conv1d("Conv1dF32 wide wgmma k3 causal 320->256 len (CFM c1)", g6, 1e-4);
+        /* Split-K (tiles * 2 <= blocks, post 0): S parts per tile folded in part order, one-k-tile
+         * parts, odd chunks, a K tail, short lengths. */
+        struct SK { const char* name; ConvSpec s; };
+        SK sks[] = {
+            {"Conv1dF32 wgmma split-K k7 768 M=1", {1, 1, 768, 768, 7, 1, 1, 1, 6, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true}},
+            {"Conv1dF32 wgmma split-K k7 d3 +res len M=34", {2, 17, 384, 384, 7, 1, 3, 1, 18, 0, 0, 0, 0, false, true, false, true, {17, 9}, 0.f, true}},
+            {"Conv1dF32 wgmma split-K pointwise K tail M=32", {4, 8, 1000, 512, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true}},
+            {"Conv1dF32 wgmma split-K k3 704->768 leaky-in chunk 3", {1, 5, 704, 768, 3, 1, 1, 1, 2, 0, 0, 9, 0, false, true, false, true, {5}, 0.1f, true}},
+        };
+        for (SK& t : sks) {
+            t.s.wide = t.s.tapmajor = t.s.wg = t.s.splitk = true;
+            t_conv1d(t.name, t.s, 1e-4);
+        }
         ConvSpec g7{1, 1000, 512, 8 * 380, 1, 1, 1, 8, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
         g7.wide = g7.wg = true;
         t_conv1d("Conv1dF32 wgmma grouped pointwise g8 64->380 (relpos)", g7, 1e-4);
@@ -2160,6 +2184,19 @@ int main(int argc, char** argv) {
             run(t.name, c, g_conv_transpose1d_f32, {o}, FP32, 1e-4, 0, nullptr, &ref);
         }
 #endif
+        /* Rows arm (bit 16, M <= 32): M=17 and 32, partial 8-channel blocks, K tails past a 512
+         * chunk, short lengths, M=1; M=33 and cout <= 4 fall back to the warp arm. */
+        struct RA { const char* name; ConvSpec s; };
+        RA ras[] = {
+            {"Conv1dF32 rows k7 snake-in 256->203 +res M=17", {1, 17, 256, 203, 7, 1, 1, 1, 6, 0, 0, 12, 0, false, true, true, true, {}, 0.f}},
+            {"Conv1dF32 rows k7 d3 100->50 leaky len M=32", {2, 16, 100, 50, 7, 1, 3, 1, 18, 0, 0, 0, 9, false, true, false, true, {16, 5}, 0.1f}},
+            {"Conv1dF32 rows k7 1024->1536 M=1", {1, 1, 1024, 1536, 7, 1, 1, 1, 6, 0, 0, 0, 0, false, true, false, false, {}, 0.f}},
+            {"Conv1dF32 rows M=33 cout 3 -> warp", {1, 33, 64, 3, 7, 1, 1, 1, 6, 0, 0, 0, 1, false, true, false, false, {}, 0.f}},
+        };
+        for (RA& t : ras) {
+            t.s.rows = t.s.tapmajor = true;
+            t_conv1d(t.name, t.s);
+        }
         ConvSpec w7{2, 300, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, true, {300, 170}, 0.f, true};
         t_conv1d("Conv1dF32 k7 snake-out +res (64x64 tiles)", w7);
         ConvSpec w5{2, 1000, 64, 1, 7, 1, 1, 1, 3, 3, 0, 9, 1, false, true, false, false, {1000, 500}, 0.01f, true};
