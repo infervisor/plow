@@ -25,33 +25,41 @@ use crate::spec::{GpuSpec, MmaDtype, Vendor};
 /// This is the `-arch=` / `--offload-arch=` the build actually passes, not a
 /// marketing generation. Two SKUs share a level only if a cubin/hsaco built for
 /// one runs on the other with the same instruction availability.
+///
+/// Kernel-author reference per level: `docs/bringup/isa/README.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IsaLevel {
     /// NVIDIA Ada. `mma.sync m16n8k16`, `cp.async`. No TMA, no wgmma.
+    /// Reference: `docs/bringup/isa/sm89.md`.
     Sm89,
     /// NVIDIA Hopper. `wgmma`, TMA (`cp.async.bulk` + mbarrier), DSM clusters.
+    /// Reference: `docs/bringup/isa/sm90a.md`.
     Sm90a,
     /// NVIDIA Blackwell datacenter (B200). `tcgen05`, TMEM, block-scaled MMA.
     Sm100a,
     /// NVIDIA Blackwell consumer (RTX 5090, RTX PRO 6000). 5th-gen tensor cores
     /// via `mma.sync`; **no** `tcgen05`, **no** TMEM. Sharing the "Blackwell"
     /// name with [`Self::Sm100a`] does not share its instructions.
+    /// Reference: `docs/bringup/isa/sm120.md`.
     Sm120a,
     /// AMD CDNA 3 (MI300X/MI325X). 64 KiB LDS, `v_mfma_f32_32x32x8_bf16`.
     /// See [`IsaLevel::geometry`] for the tile and stage-buffer policy that
-    /// budget forces.
+    /// budget forces. Reference: `docs/bringup/isa/gfx942.md`.
     Gfx942,
     /// AMD CDNA 4 (MI350X/MI355X). 160 KiB LDS, double-K bf16 MFMA.
+    /// Reference: `docs/bringup/isa/gfx950.md`.
     Gfx950,
     /// Apple GPU family 9 (M3/M4): Metal 3 shading language, `simdgroup_matrix`, 32-lane
     /// simdgroups, 32 KiB threadgroup memory, no tensor units. One level for both chips because
     /// a `.metallib` (or MSL source compiled at load) built for one runs on the other.
+    /// Reference: `docs/bringup/isa/apple-gpu.md`.
     Metal3,
     /// x86-64 with AVX-512 BF16 (no AMX): the plowrt CPU engine's avx512 tier. The packet is
     /// the same NVIDIA-format devblob as `sm_120a`; the level names the host ISA it runs on.
+    /// Reference: `docs/bringup/isa/x86-avx512-amx.md`.
     Avx512,
     /// x86-64 with AMX-BF16 tiles plus AVX-512 (Sapphire Rapids and later): the CPU engine's
-    /// amx tier.
+    /// amx tier. Reference: `docs/bringup/isa/x86-avx512-amx.md`.
     Amx,
     /// Portable scalar reference. Always available; never fast.
     CpuRef,
@@ -182,7 +190,7 @@ impl IsaLevel {
             },
             IsaLevel::Sm100a => IsaCaps {
                 mma_sync: true,
-                wgmma: true,
+                wgmma: false,
                 tcgen05: true,
                 tmem: true,
                 tma: true,
@@ -465,7 +473,8 @@ impl ArchGeometry {
 pub struct IsaCaps {
     /// Warp-synchronous MMA (`mma.sync.*`).
     pub mma_sync: bool,
-    /// Warpgroup MMA (`wgmma.*`) — Hopper and datacenter Blackwell.
+    /// Warpgroup MMA (`wgmma.*`): `sm_90a` only. ptxas rejects it for `sm_100a` (`tcgen05`
+    /// replaces it) and `sm_120a`.
     pub wgmma: bool,
     /// 5th-gen tensor-core MMA (`tcgen05.*`) — datacenter Blackwell only.
     pub tcgen05: bool,
@@ -765,6 +774,7 @@ mod tests {
     fn capability_is_not_monotonic_in_release_order() {
         assert!(IsaLevel::Sm90a.caps().wgmma);
         assert!(!IsaLevel::Sm120a.caps().wgmma);
+        assert!(!IsaLevel::Sm100a.caps().wgmma);
         assert!(IsaLevel::Sm90a.caps().tma);
         assert!(!IsaLevel::Sm120a.caps().tma);
     }

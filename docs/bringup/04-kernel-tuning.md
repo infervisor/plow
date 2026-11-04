@@ -17,7 +17,8 @@ $TOOLCHAIN $BUILD $FEATURES $BW_BOUND $COMPUTE_CEIL $RESULTS` — before running
 anything below, and write every command with `--gpu $GPU --arch $ISA` rather
 than a literal part. You also need `$TOOLCHAIN` for probing, `$GPU` itself plus
 `perf-data/tools/gpulease` for measuring, and `nix develop` for all cargo
-builds.
+builds. Read the ISA reference for `$ISA` ([`isa/README.md`](isa/README.md)) before
+changing any kernel.
 
 **Gate out (into Stage 5, single-block sweep):** every demanded hot-kernel
 shape has a measurement census entry (HIT or an explicit, explained MISS), the

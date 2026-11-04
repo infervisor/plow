@@ -45,6 +45,11 @@ Harness (read [05-single-block-sweep.md](05-single-block-sweep.md) and the scrip
 | reference block | `scripts/block_layer_bench.py` (vLLM's own decoder layer; joined with `--vllm`) + `scripts/block_compare.py` | `runtime/tests/*_block_*_test.c` oracles |
 | block parity | `block_run packed-check` / `mixed-check` (packed / mixed vs serial on the block) | `amd-block --dump`, C oracle harnesses |
 
+**ISA reference.** Before writing or changing a kernel, inline asm, intrinsics or low-level
+C/CUDA/HIP/Metal for target `$ISA`, read `docs/bringup/isa/<target>.md` (index:
+[isa/README.md](isa/README.md)): matrix instructions, memory movement, sync rules, the flags our
+build passes, pitfalls already measured in plow, and datasheet vs calibrated ceilings for the floor.
+
 Remaining gaps. List the ones a candidate hits in its report; do not write new harness code inside
 a perf campaign (extend the harness as its own change):
 
@@ -234,6 +239,10 @@ repeated, uncontended timings;
 use a measured bandwidth/compute ceiling when available. A datasheet floor or unmeasured
 `op_roof.py` row is a hypothesis, not roofline attainment. Record achieved fraction and investigate
 material unexplained gaps before promotion; do not invent a universal percent threshold.
+
+Before changing a kernel for a rung, read the target's ISA reference
+([isa/README.md](isa/README.md)) for instruction, layout and sync constraints and its measured
+pitfalls.
 
 Check kernel outputs against the appropriate reference on representative and boundary inputs,
 including quantization scales where used. Inspect registers, spills/local memory, stack and shared
