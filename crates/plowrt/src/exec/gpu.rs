@@ -6876,6 +6876,12 @@ impl GpuEngine {
                     max_heads,
                     max_head_dim,
                     max_ctx,
+                    prefill
+                        .iter()
+                        .map(|b| b.attention_gemm_segments.iter().flatten().count())
+                        .max()
+                        .unwrap_or(0),
+                    batch,
                     max_rows,
                 )?)
             }
@@ -12727,12 +12733,14 @@ impl GpuEngine {
         pieces
     }
 
-    /// The routed attention segments in `range`.
+    /// The routed attention segments in `range`, on the staged grouped launch or per request.
     fn run_routed_segments(
         &mut self,
         bi: usize,
         range: std::ops::Range<usize>,
+        grouped: bool,
         rows: u32,
+        index: &mut usize,
         gemm: bool,
     ) -> Result<()> {
         for seg in range {
@@ -12752,7 +12760,12 @@ impl GpuEngine {
                 self.prefill[bi].attention_gemm_segments.get(seg),
                 self.attention_gemm.as_mut(),
             ) {
-                route.run(site, &self.attention_requests, rows, &self.stream)?;
+                if grouped {
+                    route.run_site(*index, &self.stream)?;
+                } else {
+                    route.run(site, &self.attention_requests, rows, &self.stream)?;
+                }
+                *index += 1;
                 if let Some(riders) = self.riders.as_ref().filter(|r| r.rows() > 0) {
                     riders.launch_after(&self.be, bi, seg + 1, &self.stream)?;
                 }
@@ -13679,6 +13692,21 @@ impl GpuEngine {
             }
             let lib_routed = self.lib_attention_routed;
             let routed = gemm_routed || lib_routed;
+            // One table upload per launch serves every routed segment; `false` = shapes the
+            // grouped path cannot take, served per request instead.
+            let grouped = if gemm_routed {
+                let sites: Vec<attention_gemm::Site> = self.prefill[bi]
+                    .attention_gemm_segments
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let route = self.attention_gemm.as_mut().expect("routed");
+                route.begin_launch(&sites, &self.attention_requests, tc as u32, &self.stream)?
+            } else {
+                false
+            };
+            let mut routed_index = 0;
             if !seg_time_probe && rt.nv.pf_seg_graph {
                 let tensors = arg.tensors as u64;
                 if riding && !routed && self.pf_seg_window.is_none() {
@@ -13713,7 +13741,14 @@ impl GpuEngine {
                 let mut next = 0;
                 let rows = tc as u32;
                 for (start, end) in pieces {
-                    self.run_routed_segments(bi, next..start, rows, gemm_routed)?;
+                    self.run_routed_segments(
+                        bi,
+                        next..start,
+                        grouped,
+                        rows,
+                        &mut routed_index,
+                        gemm_routed,
+                    )?;
                     self.ensure_seg_graph(bi, &arg, start..end)?;
                     let graph = self
                         .seg_graphs
@@ -13727,7 +13762,7 @@ impl GpuEngine {
                     next = end;
                 }
                 let rest = next..seg_class.len();
-                self.run_routed_segments(bi, rest, rows, gemm_routed)?;
+                self.run_routed_segments(bi, rest, grouped, rows, &mut routed_index, gemm_routed)?;
                 if synchronize {
                     if let Err(e) = self.be.stream_synchronize(&self.stream) {
                         tracing::warn!(
@@ -13784,7 +13819,12 @@ impl GpuEngine {
                     } else {
                         None
                     };
-                    route.run(site, &self.attention_requests, tc as u32, &self.stream)?;
+                    if grouped {
+                        route.run_site(routed_index, &self.stream)?;
+                    } else {
+                        route.run(site, &self.attention_requests, tc as u32, &self.stream)?;
+                    }
+                    routed_index += 1;
                     if let Some(e0) = timed {
                         let e1 = self.be.event_create(true)?;
                         self.be.event_record(&e1, &self.stream)?;

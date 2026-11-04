@@ -1635,6 +1635,13 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub pf_attn_gemm_grid: u32,
 
+    /// `--pf-attn-gemm` serves every request of a launch with one grouped cuBLASLt call per
+    /// GEMM (device-side shapes, one table upload per launch, each shape bucket's algorithm
+    /// timed on first use) instead of per-request launches. Served C16 4096-15000 within 1% of
+    /// the per-request form, C4 identical: opt-in.
+    #[arg(long = "pf-attn-gemm-grouped", env = "PLOW_PF_ATTN_GEMM_GROUPED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_attn_gemm_grouped: bool,
+
     /// Run the packet-declared library prefill attention segments (`segment_roles.json`
     /// `library`). `=0` runs their declared native roles instead (A/B and rollback).
     #[arg(long = "pf-attn-library", env = "PLOW_PF_ATTN_LIBRARY", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -2396,6 +2403,11 @@ pub struct AmdRuntimeConfig {
     )]
     pub amd_decode_dense_max_ctx: Option<u32>,
 
+    /// Diagnostic: restrict every rank's AQL queue to a CU subset (`N` = N CUs strided evenly,
+    /// `^N` = the complement). Grids sized to the full chip deadlock persistent objects.
+    #[arg(long = "amd-cu-mask", env = "PLOW_AMD_CU_MASK", global = true)]
+    pub cu_mask: Option<String>,
+
     /// hsaco directory override. Default: <assets>/hsaco.
     ///
     /// The clap **id** and **long** are both `rt-hsaco`, not `hsaco`. A
@@ -2585,6 +2597,17 @@ pub struct AmdRuntimeConfig {
     /// Diagnostic: tile_m (16 or 32; unset = AITER's picker) of the PLOW_GLM_HC_AITER post kernel.
     #[arg(long = "amd-hc-tile-m", env = "PLOW_AMD_HC_TILE_M", global = true)]
     pub hc_tile_m: Option<u32>,
+    /// Diagnostic: `<acquire>,<release>` HSA fence scopes (0 none, 1 agent, 2 system) on every
+    /// dispatch packet. Unset = agent,agent. Not ordering-safe below agent.
+    #[arg(long = "amd-pkt-fence", env = "PLOW_AMD_PKT_FENCE", global = true)]
+    pub pkt_fence: Option<String>,
+    /// Diagnostic: `<prefix>` — per-dispatch GPU start/end to `<prefix>.dev<N>.csv`.
+    #[arg(
+        long = "amd-dispatch-times",
+        env = "PLOW_AMD_DISPATCH_TIMES",
+        global = true
+    )]
+    pub dispatch_times: Option<String>,
     /// TP decode: per-rank synchronous host copies (staging, token readback, id seeding) run
     /// on one thread per rank so their SDMA round trips overlap.
     #[arg(long = "amd-tp-par-host", env = "PLOW_TP_PAR_HOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
