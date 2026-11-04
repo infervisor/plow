@@ -119,7 +119,9 @@ fn sm120a_defaults_ladder_and_packed_fp8_kv_segments() {
         seg.fp8_kv = true;
         seg.uniseg = false;
         apply_production_defaults(&mut seg, emit_capabilities("gemma4"), arch, 1, 188);
-        assert_eq!(seg.emit_packed_prefill, Some(true), "{arch}");
+        // sm_90a recipes set the contract explicitly; the default is sm_120a's.
+        let want = (arch == "sm_120a").then_some(true);
+        assert_eq!(seg.emit_packed_prefill, want, "{arch}");
 
         let mut uniseg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
         uniseg.fp8_kv = true;

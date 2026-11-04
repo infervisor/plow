@@ -9238,13 +9238,14 @@ fn apply_production_defaults(
         && !cfg.fp8_kv
         && (arch == "sm_90a" || (arch == "gfx942" && !cfg.any_fp8_weights()));
     // FP8-KV segmented prefill runs only through the packed request contract (plowrt refuses the
-    // packet otherwise), W8A8 included, so a segmented FP8-KV emit on a packed-request CUDA
-    // target carries it unless the recipe says otherwise.
+    // packet otherwise), W8A8 included, so a segmented FP8-KV emit on sm_120a carries it unless
+    // the recipe says otherwise. sm_90a recipes set it explicitly; there an unset knob keeps the
+    // contract optional (declined when it does not fit).
     if cfg.fp8_kv
         && !cfg.uniseg
         && tp == 1
         && capabilities.dense_packet_contracts
-        && nv_packed_request_arch(arch)
+        && arch == "sm_120a"
         && cfg.emit_packed_prefill.is_none()
     {
         cfg.emit_packed_prefill = Some(true);
