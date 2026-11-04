@@ -2621,14 +2621,16 @@ fn tensor_bytes(rows: u32, columns: u32, element_bytes: u32) -> Result<u64, Stri
         .ok_or_else(|| "tensor size overflows".into())
 }
 
-/// SP_ARENA_FLOATS of the sm_90a speech object and its per-warp weight slots (op_speech_f32.cuh).
+/// SP_ARENA_FLOATS of the sm_90a speech object; SPV_ROWS and SPV_KC of `sp_conv1d_rows`
+/// (op_speech_f32.cuh).
 const SPV_ARENA_FLOATS: u64 = 25856;
-const SPV_SLOT_FLOATS: u64 = 8 * 512;
+const SPV_ROWS: u64 = 32;
+const SPV_KC: u64 = 512;
 
 /// Conv1dF32 flag bit 16 arms (wgmma convs, one group), chosen per conv shape by measurement
-/// (`PLOW_EMIT_CODEC_CONV_ARMS`): `Rows` = at most 16 output rows of a zero-padded conv in
-/// `sp_conv1d_rows` (padded input staged in smem, one warp per output channel sharing each weight
-/// across the rows); `Warp` = at most 4 output channels, one warp per output element
+/// (`PLOW_EMIT_CODEC_CONV_ARMS`): `Rows` = at most 32 output rows of a zero-padded conv in
+/// `sp_conv1d_rows` (im2col K-chunks staged in smem, one warp per output channel sharing each
+/// weight across the rows); `Warp` = at most 4 output channels, one warp per output element
 /// (`sp_conv1d_warp`). Unlisted shapes keep the GEMM tiles.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ConvWarp {
@@ -2686,21 +2688,17 @@ fn conv1d_warp(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32) -> Op
     }
     let arm = *conv_arms().get(&conv_shape(stage))?;
     let k = u64::from(stage.in_channels) * u64::from(stage.kernel);
-    let batch = u64::from(stage.batch);
-    let staged = batch
-        * u64::from(stage.in_rows + stage.pad_before + stage.pad_after)
-        * u64::from(stage.in_channels);
-    let fits = match arm {
-        ConvWarp::Rows => {
-            batch * u64::from(out_rows) <= 16
-                && stage.pad_mode == PadMode::Zero
-                && k % 4 == 0
-                && !stage.weight_f16
-                && staged + SPV_SLOT_FLOATS <= SPV_ARENA_FLOATS
-        }
-        ConvWarp::Warp => stage.out_channels <= 4,
-    };
-    fits.then_some(arm)
+    let rows = u64::from(stage.batch) * u64::from(out_rows);
+    // The runtime tries Rows first under bit 16, so a Warp choice that also fits Rows runs Rows.
+    if rows <= SPV_ROWS
+        && stage.pad_mode == PadMode::Zero
+        && k % 4 == 0
+        && !stage.weight_f16
+        && rows * SPV_KC <= SPV_ARENA_FLOATS
+    {
+        return Some(ConvWarp::Rows);
+    }
+    (arm == ConvWarp::Warp && stage.out_channels <= 4).then_some(ConvWarp::Warp)
 }
 
 /// Conv1dF32 / ConvTranspose1dF32 slices, mirroring the interpreter's paths (op_speech_f32.cuh

@@ -4800,74 +4800,80 @@ static __device__ __noinline__ void sp_conv1d_warp(const SpConvArgs& a, unsigned
     }
 }
 
-/* Flag bit 16, at most SPV_ROWS output rows of a zero-padded conv: every block stages the padded
- * input (input activation applied) in smem; each warp takes one output channel at a time and
- * streams its weight row ([o][K] in either layout), each lane 4 x 16 B in flight per step parked
- * in a per-warp [16][32] smem slot, every output row sharing each weight. Activations use plain
- * loads (earlier ops of the launch write them); only the weights take __ldg. False when the shape does not fit
- * (uniform across the block). Devgen's conv1d_rows mirrors the fit. */
-#define SPV_ROWS 16u
-#define SPV_SLOT 512u
+/* Flag bit 16, at most SPV_ROWS output rows of a zero-padded conv. Each block takes 8 output
+ * channels (one per warp) and walks K in SPV_KC chunks: the block stages the chunk's im2col tile
+ * X[m][j] (input activation applied, padding zero) in smem, laid out [m][(4q + c) * 32 + lane] so
+ * every lane reads its own 16 columns conflict-free; each lane holds its 16 weights of the chunk in
+ * registers and prefetches the next chunk's (two chunks of 4 x 16 B __ldg in flight per lane while
+ * the block stages and computes). Every output row shares each weight; lanes reduce by shuffle at
+ * the end. Weights are read once from DRAM; X comes from L2. False when the shape does not fit
+ * (uniform across the block). Devgen's conv1d_warp mirrors the fit. */
+#define SPV_ROWS 32u
+#define SPV_KC 512u
 static __device__ __noinline__ bool sp_conv1d_rows(const SpConvArgs& a, unsigned slice, unsigned nblk, float* arena) {
-    const unsigned M = a.batch * a.out_rows, K = a.kernel * a.cg, R = a.in_rows + a.before + a.after;
+    const unsigned M = a.batch * a.out_rows, K = a.kernel * a.cg;
     const unsigned wpb = PLOW_NV_THREADS / 32u, warp = threadIdx.x / 32u, lane = threadIdx.x & 31u;
-    const unsigned xs_n = a.batch * R * a.cin;
     if (M > SPV_ROWS || a.mode != 0u || K % 4u || a.wf16 || !sp_aligned(a.w, 16) ||
-        xs_n + wpb * SPV_SLOT > (unsigned)SP_ARENA_FLOATS)
+        M * SPV_KC > (unsigned)SP_ARENA_FLOATS)
         return false;
+    const unsigned K4 = K / 4u, nc = (K + SPV_KC - 1u) / SPV_KC;
     float* xs = arena;
-    float* ws = arena + xs_n + warp * SPV_SLOT + lane;
-    __syncthreads();
-    for (unsigned i = threadIdx.x; i < xs_n; i += PLOW_NV_THREADS) {
-        const unsigned c = i % a.cin, r = (i / a.cin) % R, b = i / (a.cin * R);
-        const int u = (int)r - (int)a.before;
-        xs[i] = u >= 0 && u < (int)a.length(b) ? a.pre_at(a.x[((size_t)b * a.in_rows + u) * a.cin + c], c) : 0.f;
-    }
-    __syncthreads();
-    unsigned off[SPV_ROWS];
-#pragma unroll
-    for (unsigned m = 0; m < SPV_ROWS; m++) {
-        const unsigned b = m / a.out_rows, t = m - b * a.out_rows;
-        off[m] = m < M ? (b * R + t * a.stride) * a.cin : 0u;
-    }
-    const unsigned K4 = K / 4u;
-    for (unsigned o = slice * wpb + warp; o < a.cout; o += nblk * wpb) {
+    for (unsigned o0 = slice * wpb; o0 < a.cout; o0 += nblk * wpb) {
+        const unsigned o = o0 + warp;
+        const bool live = o < a.cout;
+        const float4* wr = (const float4*)((const float*)a.w + (size_t)(live ? o : 0u) * K);
         float acc[SPV_ROWS];
 #pragma unroll
         for (unsigned m = 0; m < SPV_ROWS; m++) acc[m] = 0.f;
-        const float4* wr = (const float4*)((const float*)a.w + (size_t)o * K);
-        for (unsigned k4 = 0; k4 < K4; k4 += 128u) {
+        float4 wn[4];
+#pragma unroll
+        for (unsigned q = 0; q < 4; q++) {
+            const unsigned i = lane + 32u * q;
+            wn[q] = live && i < K4 ? __ldg(wr + i) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+#pragma unroll 1
+        for (unsigned c = 0; c < nc; c++) {
             float4 w[4];
 #pragma unroll
             for (unsigned q = 0; q < 4; q++) {
-                const unsigned i = k4 + lane + 32u * q;
-                w[q] = i < K4 ? __ldg(wr + i) : make_float4(0.f, 0.f, 0.f, 0.f);
+                w[q] = wn[q];
+                const unsigned i = (c + 1u) * (SPV_KC / 4u) + lane + 32u * q;
+                wn[q] = live && c + 1u < nc && i < K4 ? __ldg(wr + i) : make_float4(0.f, 0.f, 0.f, 0.f);
             }
-            __syncwarp();
-            /* [j][lane]: conflict-free scalar stores and reads (j = 4q + component). */
-#pragma unroll
-            for (unsigned q = 0; q < 4; q++) {
-                ws[32u * (4u * q)] = w[q].x; ws[32u * (4u * q + 1u)] = w[q].y;
-                ws[32u * (4u * q + 2u)] = w[q].z; ws[32u * (4u * q + 3u)] = w[q].w;
+            const unsigned k0 = c * SPV_KC;
+            __syncthreads();
+            for (unsigned e = threadIdx.x; e < M * SPV_KC; e += PLOW_NV_THREADS) {
+                const unsigned m = e / SPV_KC, jp = e - m * SPV_KC, jj = jp >> 5, ln = jp & 31u;
+                const unsigned kk = k0 + 4u * (ln + 32u * (jj >> 2)) + (jj & 3u);
+                float v = 0.f;
+                if (kk < K) {
+                    unsigned tap, ci;
+                    if (a.tapmajor) { tap = a.div_cg(kk); ci = kk - tap * a.cg; }
+                    else { ci = kk / a.kernel; tap = kk - ci * a.kernel; }
+                    const unsigned b = m / a.out_rows, t = m - b * a.out_rows;
+                    const int u = (int)(t * a.stride + tap * a.dil) - (int)a.before;
+                    if (u >= 0 && u < (int)a.length(b))
+                        v = a.pre_at(a.x[((size_t)b * a.in_rows + u) * a.cin + ci], ci);
+                }
+                xs[e] = v;
             }
-            __syncwarp();
-#pragma unroll 1
-            for (unsigned j = 0; j < 16u; j++) {
-                const unsigned kk = 4u * (k4 + lane + 32u * (j >> 2)) + (j & 3u);
-                if (kk >= K) break;
-                unsigned tap, ci;
-                if (a.tapmajor) { tap = a.div_cg(kk); ci = kk - tap * a.cg; }
-                else { ci = kk / a.kernel; tap = kk - ci * a.kernel; }
-                const float wv = ws[32u * j];
-                const float* xp = xs + tap * a.dil * a.cin + ci;
+            __syncthreads();
+            if (!live) continue;
+            const float wv[16] = {w[0].x, w[0].y, w[0].z, w[0].w, w[1].x, w[1].y, w[1].z, w[1].w,
+                                  w[2].x, w[2].y, w[2].z, w[2].w, w[3].x, w[3].y, w[3].z, w[3].w};
 #pragma unroll
-                for (unsigned m = 0; m < SPV_ROWS; m++)
-                    if (m < M) acc[m] = fmaf(xp[off[m]], wv, acc[m]);
+            for (unsigned m = 0; m < SPV_ROWS; m++) {
+                if (m >= M) break;
+                const float* xm = xs + m * SPV_KC + lane;
+#pragma unroll
+                for (unsigned j = 0; j < 16u; j++) acc[m] = fmaf(xm[32u * j], wv[j], acc[m]);
             }
         }
+        if (!live) continue;
         float mine = 0.f;
 #pragma unroll
         for (unsigned m = 0; m < SPV_ROWS; m++) {
+            if (m >= M) break;
             float v = acc[m];
 #pragma unroll
             for (unsigned d = 16; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
