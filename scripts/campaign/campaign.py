@@ -2227,7 +2227,7 @@ def cmd_dist_gate(a: argparse.Namespace) -> None:
     if not why:
         if a.gate:
             gate = argparse.Namespace(recipe=str(recipe), assets=str(bundle), out=str(out / "gate"), only=a.only,
-                                      plowrt=str(plowrt), env=[f"PLOW_HOME={home}"], label=f"dist-{name}",
+                                      plowrt=str(plowrt), env=[f"PLOW_HOME={home}", f"PLOW_REGISTRY=file://{reg}"], label=f"dist-{name}",
                                       timeout=None, dry_run=False, score_only=False, model=name, queue=a.queue)
             cmd_gate(gate)
             rec["gate"] = json.loads((out / "gate" / "gates.json").read_text()).get("pass")
@@ -2238,7 +2238,7 @@ def cmd_dist_gate(a: argparse.Namespace) -> None:
             serve = r.get("serve", {})
             penv = {k: str(v) for k, v in serve.get("env", {}).items()}
             penv.update({k: v for k, v in os.environ.items() if k.startswith("PLOW_")})
-            penv["PLOW_HOME"] = str(home)
+            penv.update(PLOW_HOME=str(home), PLOW_REGISTRY=f"file://{reg}")  # --model resolves against the registry
             lines = ["#!/usr/bin/env bash", "set -u", "source " + shlex.quote(str(REPO / "scripts/bench/plowbench.sh"))]
             lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(penv.items())]
             lines += ["PB_SERVER_PORT=$(pb_free_port)", "PB_SERVER_LOG=" + shlex.quote(str(served)),
