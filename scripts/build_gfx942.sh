@@ -192,6 +192,15 @@ case " $AX_EXTRA " in
     echo "FAIL: PLOW_HSACO_EXTRA_DEFINES must not set tile/wave/decode-batch axes; use their own variables" >&2
     exit 2 ;;
 esac
+AX_TEST_ROUTE=""
+for extra_define in $AX_EXTRA; do
+  case "$extra_define" in
+    -DPLOW_GFX12_WMMA_GEMV|-DPLOW_GFX12_WMMA_GEMV=0|-DPLOW_GFX12_WMMA_GEMV=1)
+      AX_TEST_ROUTE="$extra_define" ;;
+    -DPLOW_GFX12_WMMA_GEMV=*)
+      echo "FAIL: PLOW_GFX12_WMMA_GEMV must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
 if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   CFG="$PLOW_HSACO_CONFIG"
   [ -d "$CFG" ] && CFG="$CFG/plow_config.h"
@@ -1577,7 +1586,7 @@ export -f one; export HIPCC ARCH ARCH_FLAGS R INC BUN AX_CONFIG AX_EXTRA
 # body below the wait for what it is and why it must be rebuilt with the interpreter.
 if [ -z "${PLOW_ROWS_ONLY:-}" ]; then
   (
-    if "$HIPCC" --offload-arch="$ARCH" $ARCH_FLAGS -O3 -w --genco "$R/amd/test_kernels.hip" \
+    if "$HIPCC" --offload-arch="$ARCH" $ARCH_FLAGS -O3 -w $AX_TEST_ROUTE --genco "$R/amd/test_kernels.hip" \
           -o tk.co $INC > test_kernels.log 2>&1; then
       "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
           --input=tk.co --output=test_kernels.elf
@@ -1663,9 +1672,8 @@ fi
       sep=$',\n'
     done
   done
-  # test_kernels.elf takes no axes at all; it is listed so the contract audits it as an
-  # object rather than skipping it for want of a defines entry.
-  printf '%s "test_kernels": "-DPLOW_ARCH_SUFFIX=%s"' "$sep" "$ARCH"
+  # Golden wrappers share the explicit native route, without geometry or packet axes.
+  printf '%s "test_kernels": "-DPLOW_ARCH_SUFFIX=%s%s"' "$sep" "$ARCH" "${AX_TEST_ROUTE:+ $AX_TEST_ROUTE}"
   printf ',\n "gemma4_gemm_glu_gfx942": "-DPLOW_ARCH_SUFFIX=%s"' "$ARCH"
   printf '\n}\n'
 } > build_defines.json
