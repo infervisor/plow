@@ -49,6 +49,9 @@ pub enum IsaLevel {
     /// AMD CDNA 4 (MI350X/MI355X). 160 KiB LDS, double-K bf16 MFMA.
     /// Reference: `docs/bringup/isa/gfx950.md`.
     Gfx950,
+    /// AMD RDNA 4 (Radeon AI PRO R9700). WMMA, no MFMA. Plow builds these objects
+    /// wave64 from the CDNA sources on the gfx942 tile arm (64 KiB LDS).
+    Gfx1201,
     /// Apple GPU family 9 (M3/M4): Metal 3 shading language, `simdgroup_matrix`, 32-lane
     /// simdgroups, 32 KiB threadgroup memory, no tensor units. One level for both chips because
     /// a `.metallib` (or MSL source compiled at load) built for one runs on the other.
@@ -75,6 +78,7 @@ impl IsaLevel {
             IsaLevel::Sm120a => "sm_120a",
             IsaLevel::Gfx942 => "gfx942",
             IsaLevel::Gfx950 => "gfx950",
+            IsaLevel::Gfx1201 => "gfx1201",
             IsaLevel::Metal3 => "metal3",
             IsaLevel::Avx512 => "avx512",
             IsaLevel::Amx => "amx",
@@ -100,6 +104,7 @@ impl IsaLevel {
             IsaLevel::Sm120a,
             IsaLevel::Gfx942,
             IsaLevel::Gfx950,
+            IsaLevel::Gfx1201,
             IsaLevel::Metal3,
             IsaLevel::Avx512,
             IsaLevel::Amx,
@@ -119,7 +124,7 @@ impl IsaLevel {
             IsaLevel::Sm89 | IsaLevel::Sm90a | IsaLevel::Sm100a | IsaLevel::Sm120a => {
                 Vendor::Nvidia
             }
-            IsaLevel::Gfx942 | IsaLevel::Gfx950 => Vendor::Amd,
+            IsaLevel::Gfx942 | IsaLevel::Gfx950 | IsaLevel::Gfx1201 => Vendor::Amd,
             IsaLevel::Metal3 => Vendor::Apple,
             IsaLevel::Avx512 | IsaLevel::Amx => Vendor::Intel,
             // The CPU reference has no vendor in the GPU sense; it is reported as
@@ -140,6 +145,7 @@ impl IsaLevel {
             (Vendor::Nvidia, (12, 0)) => IsaLevel::Sm120a,
             (Vendor::Amd, (9, 4)) => IsaLevel::Gfx942,
             (Vendor::Amd, (9, 5)) => IsaLevel::Gfx950,
+            (Vendor::Amd, (12, 0)) => IsaLevel::Gfx1201,
             (Vendor::Apple, (3, _) | (4, _)) => IsaLevel::Metal3,
             (Vendor::Intel, (major, _)) if major >= 4 => IsaLevel::Amx,
             (Vendor::Intel, _) => IsaLevel::Avx512,
@@ -269,6 +275,26 @@ impl IsaLevel {
                     MmaDtype::Int8,
                 ],
             },
+            // WMMA (16x16x16, fp8 on gfx12), not MFMA. Native wave is 32; plow's
+            // objects are built `-mwavefrontsize64`, so 64 is what they run at.
+            IsaLevel::Gfx1201 => IsaCaps {
+                mma_sync: false,
+                wgmma: false,
+                tcgen05: false,
+                tmem: false,
+                tma: false,
+                dsm_cluster: false,
+                mfma: false,
+                block_scale_mma: false,
+                mx_scale_cvt: false,
+                warp_lanes: 64,
+                mma_dtypes: &[
+                    MmaDtype::Fp16,
+                    MmaDtype::Bf16,
+                    MmaDtype::Fp8,
+                    MmaDtype::Int8,
+                ],
+            },
             // `simdgroup_matrix` is a cooperative 8x8 fp16/bf16 matmul on the SIMD ALUs — not
             // a tensor core, and not `mma.sync` in the PTX sense; the flags below are all
             // NVIDIA/AMD instruction families this ISA does not have.
@@ -345,7 +371,8 @@ impl IsaLevel {
             // SINGLE-buffered 192x256x64 (64,512 B, fits). Decode re-cuts again
             // under `PLOW_OCC4=1` to 128x256x32 (30,720 B), the smallest arena
             // the fused-GLU epilogue's `SN == 2` assert allows.
-            IsaLevel::Gfx942 => ArchGeometry {
+            // RDNA 4 objects take the gfx942 tile arm: same 64 KiB budget.
+            IsaLevel::Gfx942 | IsaLevel::Gfx1201 => ArchGeometry {
                 lds_bytes: 64 * 1024,
                 gemm_stage_buffers: 1,
                 gemm_tile: GemmTile {
@@ -840,6 +867,7 @@ mod tests {
             IsaLevel::Sm120a,
             IsaLevel::Gfx942,
             IsaLevel::Gfx950,
+            IsaLevel::Gfx1201,
             IsaLevel::Metal3,
             IsaLevel::Avx512,
             IsaLevel::Amx,
@@ -920,6 +948,7 @@ mod tests {
             IsaLevel::Sm120a,
             IsaLevel::Gfx942,
             IsaLevel::Gfx950,
+            IsaLevel::Gfx1201,
             IsaLevel::Metal3,
             IsaLevel::Avx512,
             IsaLevel::Amx,

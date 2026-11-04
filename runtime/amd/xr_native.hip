@@ -39,9 +39,9 @@ static_assert(sizeof(XrNativeArgs) == 64);
  * per rank) and the same r = 0..N-1 f32 order with one bf16 rounding. */
 __device__ __forceinline__ bool xrn_wait(const uint32_t* g, uint32_t want, uint32_t* status,
                                          uint32_t rank) {
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t0 = plow_realtime();
     while (xctr_poll(g) < want) {
-        if (__builtin_amdgcn_s_memrealtime() - t0 > PLOW_XCTR_DEADLINE_TICKS) {
+        if (plow_realtime() - t0 > PLOW_XCTR_DEADLINE_TICKS) {
             if (status) *status = 0xDEAD0000u | rank;
             return false;
         }

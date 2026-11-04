@@ -15,6 +15,8 @@ use crate::Result;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(target_os = "linux")]
+pub mod host_region;
 #[cfg(feature = "hsa")]
 pub mod hsa;
 pub(crate) mod kernarg_retirement;
@@ -26,6 +28,88 @@ pub(crate) fn retirement_error(error: retirement::RetirementError) -> crate::Run
 }
 pub mod visibility;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImageCopy {
+    pub(crate) host: u64,
+    pub(crate) device: u64,
+    pub(crate) bytes: u64,
+    pub(crate) pitch: usize,
+    pub(crate) rows: u32,
+}
+
+impl ImageCopy {
+    pub(crate) fn linear((host, device, bytes): (u64, u64, u64)) -> Self {
+        Self {
+            host,
+            device,
+            bytes,
+            pitch: 0,
+            rows: 1,
+        }
+    }
+
+    pub(crate) fn slices(self) -> Option<(usize, usize)> {
+        let host = usize::try_from(self.bytes)
+            .ok()?
+            .checked_mul(self.rows as usize)?;
+        let device = self.pitch.checked_mul(self.rows as usize)?;
+        self.host.checked_add(host as u64)?;
+        self.device.checked_add(device as u64)?;
+        Some((host, device))
+    }
+}
+
+pub(crate) fn image_copy_rects(spans: &[(u64, u64, u64)]) -> smallvec::SmallVec<[ImageCopy; 64]> {
+    let mut copies = smallvec::SmallVec::new();
+    let mut i = 0;
+    while i < spans.len() {
+        let mut copy = ImageCopy::linear(spans[i]);
+        if copy.bytes > 0
+            && copy.bytes <= u32::MAX as u64
+            && (copy.host | copy.device | copy.bytes) % 4 == 0
+        {
+            if let Some(pitch) = spans
+                .get(i + 1)
+                .and_then(|next| next.1.checked_sub(copy.device))
+                .filter(|&pitch| pitch >= copy.bytes && pitch % 4 == 0)
+                .and_then(|pitch| usize::try_from(pitch).ok())
+            {
+                copy.pitch = pitch;
+                while copy.rows < u32::MAX {
+                    let Some(&(host, device, bytes)) = spans.get(i + copy.rows as usize) else {
+                        break;
+                    };
+                    let row = u64::from(copy.rows);
+                    if bytes != copy.bytes
+                        || copy
+                            .bytes
+                            .checked_mul(row)
+                            .and_then(|n| copy.host.checked_add(n))
+                            != Some(host)
+                        || (pitch as u64)
+                            .checked_mul(row)
+                            .and_then(|n| copy.device.checked_add(n))
+                            != Some(device)
+                    {
+                        break;
+                    }
+                    let next = ImageCopy {
+                        rows: copy.rows + 1,
+                        ..copy
+                    };
+                    if next.slices().is_none() {
+                        break;
+                    }
+                    copy = next;
+                }
+            }
+        }
+        i += copy.rows as usize;
+        copies.push(copy);
+    }
+    copies
+}
+
 /// Bring up the best backend this host can actually offer.
 ///
 /// One binary serves both CPU and GPU: the vendor drivers are `dlopen`ed, never
@@ -36,8 +120,15 @@ pub mod visibility;
 /// driver therefore costs acceleration, not availability.
 /// Select a single backend (device 0 preferred). Legacy single-GPU path.
 pub fn select(executors: u32) -> Arc<dyn Backend> {
+    select_with(executors, true, 0)
+}
+
+/// [`select`], skipping CUDA when `cuda` is false (`--devices` named only AMD devices) and
+/// probing HSA at agent `hsa` (the first AMD device named).
+pub fn select_with(executors: u32, cuda: bool, hsa: u8) -> Arc<dyn Backend> {
+    let _ = (cuda, hsa);
     #[cfg(feature = "cuda")]
-    {
+    if cuda {
         tracing::debug!("probing CUDA backend (device 0)...");
         match cuda::CudaBackend::new(0) {
             Ok(b) => {
@@ -50,8 +141,8 @@ pub fn select(executors: u32) -> Arc<dyn Backend> {
 
     #[cfg(feature = "hsa")]
     {
-        tracing::debug!("probing HSA backend (device 0)...");
-        match hsa::HsaBackend::new(0) {
+        tracing::debug!(device = hsa, "probing HSA backend...");
+        match hsa::HsaBackend::new(hsa) {
             Ok(b) => {
                 tracing::info!(device = %b.device_name(), "HSA backend selected");
                 return Arc::new(b);
@@ -140,6 +231,188 @@ pub fn select_all(executors_per_device: u32) -> Vec<Arc<dyn Backend>> {
     }
 
     backends
+}
+
+/// A device named across vendors: `nv:<ordinal>` or `amd:<ordinal>`, the ordinal being the
+/// vendor's own enumeration after its visibility mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevId {
+    pub vendor: Vendor,
+    pub ordinal: u8,
+}
+
+/// The short vendor tag device names, labels and placement reports use.
+pub fn vendor_tag(v: Vendor) -> &'static str {
+    match v {
+        Vendor::Nvidia => "nv",
+        Vendor::Amd => "amd",
+        Vendor::Apple => "apple",
+        Vendor::Intel => "cpu",
+    }
+}
+
+impl std::fmt::Display for DevId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", vendor_tag(self.vendor), self.ordinal)
+    }
+}
+
+impl std::str::FromStr for DevId {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        let (v, n) = s
+            .split_once(':')
+            .ok_or_else(|| format!("device {s:?}: expected nv:<n> or amd:<n>"))?;
+        let vendor = match v {
+            "nv" | "nvidia" | "cuda" => Vendor::Nvidia,
+            "amd" | "hsa" => Vendor::Amd,
+            _ => return Err(format!("device {s:?}: unknown vendor {v:?}")),
+        };
+        let ordinal = n
+            .parse()
+            .map_err(|_| format!("device {s:?}: bad ordinal {n:?}"))?;
+        Ok(DevId { vendor, ordinal })
+    }
+}
+
+/// A device-0 open error that means "this vendor has no device here" (no driver library, no
+/// visible device), as opposed to a device that exists and fails.
+#[allow(dead_code)]
+fn driver_absent(e: &str) -> bool {
+    [
+        "cannot open shared object file",
+        "CUDA_ERROR_NO_DEVICE",
+        "no GPU agents",
+        ">= 0 GPU agents",
+        "selects no device",
+    ]
+    .iter()
+    .any(|m| e.contains(m))
+}
+
+/// One device of the inventory, with its typed backend.
+#[derive(Clone)]
+pub enum DeviceHandle {
+    #[cfg(feature = "cuda")]
+    Cuda(Arc<cuda::CudaBackend>),
+    #[cfg(feature = "hsa")]
+    Hsa(Arc<hsa::HsaBackend>),
+}
+
+impl DeviceHandle {
+    /// The device's name and the ISA key its engine selects code objects by.
+    pub fn name_and_arch(&self) -> (String, String) {
+        use crate::exec::device_api::EngineDevice as _;
+        match *self {
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(ref b) => (b.device_name().to_string(), b.arch()),
+            #[cfg(feature = "hsa")]
+            DeviceHandle::Hsa(ref b) => (b.device_name().to_string(), b.arch()),
+        }
+    }
+
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        match *self {
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(ref b) => Arc::clone(b) as Arc<dyn Backend>,
+            #[cfg(feature = "hsa")]
+            DeviceHandle::Hsa(ref b) => Arc::clone(b) as Arc<dyn Backend>,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn staging(&self) -> Arc<dyn host_region::HostStaging> {
+        match *self {
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(ref b) => Arc::clone(b) as Arc<dyn host_region::HostStaging>,
+            #[cfg(feature = "hsa")]
+            DeviceHandle::Hsa(ref b) => Arc::clone(b) as Arc<dyn host_region::HostStaging>,
+        }
+    }
+}
+
+pub struct Device {
+    pub id: DevId,
+    pub handle: DeviceHandle,
+}
+
+/// Every visible GPU of every vendor driver this binary can load, CUDA devices first, each in
+/// its vendor's ordinal order. Unlike [`select_all`], one vendor does not hide the other. A
+/// device its driver enumerates but cannot open is an error, never a shorter list.
+pub fn inventory() -> Result<Vec<Device>> {
+    #[allow(unused_mut)]
+    let mut out: Vec<Device> = Vec::new();
+    #[cfg(feature = "cuda")]
+    match cuda::CudaBackend::new(0) {
+        Ok(first) => {
+            let n = first.device_count()?;
+            out.push(Device {
+                id: DevId {
+                    vendor: Vendor::Nvidia,
+                    ordinal: 0,
+                },
+                handle: DeviceHandle::Cuda(Arc::new(first)),
+            });
+            for dev in 1..n.min(u8::MAX as u32) as u8 {
+                match cuda::CudaBackend::new(dev) {
+                    Ok(b) => out.push(Device {
+                        id: DevId {
+                            vendor: Vendor::Nvidia,
+                            ordinal: dev,
+                        },
+                        handle: DeviceHandle::Cuda(Arc::new(b)),
+                    }),
+                    Err(e) => {
+                        return Err(crate::RuntimeError::Device(format!(
+                            "nv:{dev} of {n} enumerated but not usable: {e}"
+                        )))
+                    }
+                }
+            }
+        }
+        Err(e) if driver_absent(&e.to_string()) => tracing::info!(%e, "no CUDA devices"),
+        Err(e) => {
+            return Err(crate::RuntimeError::Device(format!(
+                "nv:0 will not open: {e}"
+            )))
+        }
+    }
+    #[cfg(feature = "hsa")]
+    match hsa::HsaBackend::new(0) {
+        Ok(first) => {
+            let n = first.gpu_count();
+            out.push(Device {
+                id: DevId {
+                    vendor: Vendor::Amd,
+                    ordinal: 0,
+                },
+                handle: DeviceHandle::Hsa(Arc::new(first)),
+            });
+            for dev in 1..n.min(u8::MAX as u32) as u8 {
+                match hsa::HsaBackend::new(dev) {
+                    Ok(b) => out.push(Device {
+                        id: DevId {
+                            vendor: Vendor::Amd,
+                            ordinal: dev,
+                        },
+                        handle: DeviceHandle::Hsa(Arc::new(b)),
+                    }),
+                    Err(e) => {
+                        return Err(crate::RuntimeError::Device(format!(
+                            "amd:{dev} of {n} enumerated but not usable: {e}"
+                        )))
+                    }
+                }
+            }
+        }
+        Err(e) if driver_absent(&e.to_string()) => tracing::info!(%e, "no HSA devices"),
+        Err(e) => {
+            return Err(crate::RuntimeError::Device(format!(
+                "amd:0 will not open: {e}"
+            )))
+        }
+    }
+    Ok(out)
 }
 
 /// Executor substrate class (the doc's `executor_class_t`).
@@ -299,6 +572,11 @@ enum Backing {
 }
 
 impl DeviceMem {
+    pub(crate) fn quarantine(&mut self) {
+        // Unretired DMA may still address this allocation after its engine is dropped.
+        std::mem::forget(std::mem::replace(&mut self.backing, Backing::View));
+    }
+
     /// An owning device-allocation handle (GPU backends): `base` is the device
     /// virtual address returned by the driver allocator; `free` reclaims it on
     /// Drop.
@@ -536,6 +814,19 @@ pub trait Backend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dev_id_round_trips_and_refuses_junk() {
+        let a: super::DevId = "amd:1".parse().unwrap();
+        assert_eq!(a.to_string(), "amd:1");
+        assert_eq!(
+            "nvidia:0".parse::<super::DevId>().unwrap().to_string(),
+            "nv:0"
+        );
+        assert!("gpu:0".parse::<super::DevId>().is_err());
+        assert!("nv:x".parse::<super::DevId>().is_err());
+        assert!("0".parse::<super::DevId>().is_err());
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -577,6 +868,22 @@ mod tests {
             "owner frees exactly once"
         );
         assert_eq!(f.last_base.load(Ordering::SeqCst), 0x1000);
+    }
+
+    #[test]
+    fn quarantined_allocation_keeps_storage_and_address_live() {
+        let f = Arc::new(CountingFree {
+            count: AtomicUsize::new(0),
+            last_base: AtomicUsize::new(0),
+        });
+        let mut owner = DeviceMem::owned(0x1000, 256, f.clone());
+        let evidence = owner.subview(0, 64).unwrap();
+        owner.quarantine();
+        assert_eq!(owner.base, 0x1000);
+        assert_eq!(owner.len, 256);
+        drop(owner);
+        assert_eq!(f.count.load(Ordering::SeqCst), 0);
+        assert!(evidence.allocation_evidence().is_some());
     }
 
     #[test]

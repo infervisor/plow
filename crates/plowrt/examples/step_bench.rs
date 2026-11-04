@@ -5,12 +5,15 @@
 //! (`prefill_slot` to build ctx, then one `step_slots` per token).
 //!
 //! Usage:
-//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same | --spread] [--warmup N] [--multistep] [--packed-prefill]
+//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same [--kv-image] | --spread] [--warmup N] [--multistep] [--packed-prefill]
 //!              [--dump-tensors name,name --dump-dir dir | --dump-prefill-logits dir]
 //!              [--max-inst N | --max-segments N]
 //! `--same` feeds every slot the SAME prompt and reports how many slots' greedy
-//! streams agree with slot 0 (a within-batch consistency check). `--spread` gives each slot a
-//! pseudo-random prompt over 64K ids, so a MoE model routes a decode batch the way served
+//! streams agree with slot 0 (a within-batch consistency check); with `--kv-image` slots 1..
+//! take slot 0's KV through an exported image instead of prefilling (`KV_IMAGE` line).
+//! `--kv-image-peer DIR --kv-image-peer-device amd:N|nv:N` instead checks a cross-vendor
+//! roundtrip into peer slot 1; the main engine is the other vendor on device 0.
+//! `--spread` gives each slot a pseudo-random prompt over 64K ids, so a MoE model routes a decode batch the way served
 //! traffic does (the default prompts share one 1000-id cycle). `--packed-prefill`
 //! initializes prompts through packed request chunks and the compact terminal, printing each
 //! launch's wall ms; `--pf-chunk N` caps the per-request slice below the packet's request chunk and
@@ -86,6 +89,326 @@ fn dump_range<'a>(
     Ok((name, offset, bytes))
 }
 
+#[cfg(all(feature = "cuda", feature = "hsa"))]
+struct StreamingImage {
+    image: plowrt::serve::pd::KvBytes,
+    first: u32,
+    prefill_ms: f64,
+    export_ms: f64,
+    import_ms: f64,
+    handoff_ms: f64,
+    lease_start_ms: Option<f64>,
+    intervals: [f64; 4],
+}
+
+#[cfg(all(feature = "cuda", feature = "hsa"))]
+struct ExportedImage {
+    first: u32,
+    handoff_started: std::time::Instant,
+    image: plowrt::serve::pd::KvBytes,
+}
+
+#[cfg(all(feature = "cuda", feature = "hsa"))]
+fn produce_image<S>(
+    source: &mut S,
+    prefill: impl FnOnce(&mut S) -> plowrt::Result<u32>,
+    export: impl FnOnce(
+        &mut S,
+        &mut plowrt::serve::pd::KvBytes,
+        &mut dyn FnMut(plowrt::serve::pd::KvBytes),
+    ) -> plowrt::Result<()>,
+    streaming: bool,
+    tx: std::sync::mpsc::SyncSender<ExportedImage>,
+) -> plowrt::Result<(std::time::Instant, std::time::Instant, std::time::Instant)> {
+    let first = prefill(source)?;
+    let prefill_end = std::time::Instant::now();
+    let handoff_started = std::time::Instant::now();
+    let mut image = plowrt::serve::pd::KvBytes::default();
+    export(source, &mut image, &mut |image| {
+        let _ = tx.send(ExportedImage {
+            first,
+            handoff_started,
+            image,
+        });
+    })?;
+    let export_end = std::time::Instant::now();
+    if !streaming {
+        let _ = tx.send(ExportedImage {
+            first,
+            handoff_started,
+            image,
+        });
+    }
+    Ok((prefill_end, handoff_started, export_end))
+}
+
+#[cfg(all(feature = "cuda", feature = "hsa"))]
+fn finish_image(
+    producer: std::thread::ScopedJoinHandle<
+        '_,
+        plowrt::Result<(std::time::Instant, std::time::Instant, std::time::Instant)>,
+    >,
+    rx: std::sync::mpsc::Receiver<ExportedImage>,
+    request_started: std::time::Instant,
+    import: impl FnOnce(&plowrt::serve::pd::KvBytes, u32) -> plowrt::Result<()>,
+) -> Result<StreamingImage, Box<dyn std::error::Error>> {
+    let frame = rx.recv();
+    let imported = match &frame {
+        Ok(frame) => {
+            let start = std::time::Instant::now();
+            import(&frame.image, frame.first).map(|()| (start, std::time::Instant::now()))
+        }
+        Err(_) => Err(plowrt::RuntimeError::Unavailable(
+            "source produced no staged image".into(),
+        )),
+    };
+    let (prefill_end, export_start, export_end) =
+        producer.join().map_err(|_| "KV source actor panicked")??;
+    let (import_start, import_end) = imported?;
+    let frame = frame?;
+    let handoff_started = frame.handoff_started;
+    let lease_start_ms = frame
+        .image
+        .stream_started()
+        .map(|epoch| epoch.duration_since(handoff_started).as_secs_f64() * 1e3);
+    Ok(StreamingImage {
+        image: frame.image,
+        first: frame.first,
+        prefill_ms: prefill_end.duration_since(request_started).as_secs_f64() * 1e3,
+        export_ms: export_end.duration_since(export_start).as_secs_f64() * 1e3,
+        import_ms: import_end.duration_since(import_start).as_secs_f64() * 1e3,
+        handoff_ms: handoff_started.elapsed().as_secs_f64() * 1e3,
+        lease_start_ms,
+        intervals: [
+            export_start.duration_since(handoff_started).as_secs_f64() * 1e3,
+            export_end.duration_since(handoff_started).as_secs_f64() * 1e3,
+            import_start.duration_since(handoff_started).as_secs_f64() * 1e3,
+            import_end.duration_since(handoff_started).as_secs_f64() * 1e3,
+        ],
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "hsa"))]
+fn kv_image_peer_bench(
+    assets: &std::path::Path,
+    peer: &std::path::Path,
+    device: &str,
+    ctx: usize,
+    prompt_file: Option<&str>,
+    early_import: bool,
+    stream_import: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::asset::serve::checkpoint_dir;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let (vendor, ordinal) = device
+        .split_once(':')
+        .ok_or("peer device must be amd:N or nv:N")?;
+    let ordinal: u8 = ordinal.parse()?;
+    let (nv_dir, amd_dir, nv_device, amd_device, main_nv) = match vendor {
+        "amd" => (assets, peer, 0, ordinal, true),
+        "nv" => (peer, assets, ordinal, 0, false),
+        _ => return Err("peer device must be amd:N or nv:N".into()),
+    };
+    let mut digests = std::collections::HashMap::new();
+    let headers = [assets, peer].map(|dir| plowrt::serve::pd::kv_header(dir, &mut digests));
+    plowrt::serve::pd::check_headers(
+        "step_bench",
+        plowrt::serve::pd::PdSpec {
+            prefill: 1,
+            decode: 2,
+        },
+        &headers,
+    )?;
+    let be = Arc::new(plowrt::device::cuda::CudaBackend::new(nv_device)?);
+    let mut nv = plowrt::exec::gpu::GpuEngine::load(be.clone(), nv_dir, &checkpoint_dir(nv_dir))?;
+    let blob =
+        plowrt::asset::devblob::DevBlob::find_in_dir(amd_dir)?.ok_or("AMD peer has no packet")?;
+    let hsaco = amd_dir.join("hsaco");
+    let hsaco = if hsaco.is_dir() {
+        hsaco.as_path()
+    } else {
+        amd_dir
+    };
+    let mut amd = plowrt::serve::engine::AmdServe::load_on(
+        &blob,
+        hsaco,
+        Some(&checkpoint_dir(amd_dir)),
+        amd_device,
+    )?;
+    if nv.kv_image_key().is_none() || nv.kv_image_key() != amd.kv_image_key() {
+        return Err("engines do not expose matching KV image keys".into());
+    }
+    // The peer imports into its last slot: a different slot index where it has one, so the
+    // image cannot depend on the slot.
+    let (nv_slot, amd_slot) = if main_nv {
+        (0, amd.batch().saturating_sub(1))
+    } else {
+        (nv.batch().saturating_sub(1), 0)
+    };
+    if nv.batch() <= nv_slot
+        || amd.batch() <= amd_slot
+        || ctx == 0
+        || ctx >= nv.max_ctx()
+        || ctx >= amd.max_ctx()
+    {
+        return Err("KV image check needs room for the prompt plus one decode row".into());
+    }
+    let prompt: Vec<u32> = if let Some(file) = prompt_file {
+        let prompts: Vec<Vec<u32>> = serde_json::from_slice(&std::fs::read(file)?)?;
+        prompts
+            .first()
+            .filter(|p| p.len() >= ctx)
+            .ok_or("prompt file has no ctx-row prompt")?[..ctx]
+            .to_vec()
+    } else {
+        (0..ctx).map(|i| 100 + (i % 1000) as u32).collect()
+    };
+    let n = u32::try_from(ctx)?;
+    #[cfg(target_os = "linux")]
+    {
+        let bytes = [nv_dir, amd_dir]
+            .into_iter()
+            .map(|dir| plowrt::serve::pd::kv_image_capacity(dir, Some(n)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .unwrap();
+        plowrt::device::host_region::prepare_image_pool(
+            bytes,
+            &[be, amd.kv_image_staging().ok_or("AMD staging unavailable")?],
+        )?;
+    }
+    let request_started = Instant::now();
+    let mut preparation = (0., 0.);
+    let transferred = if main_nv {
+        std::thread::scope(
+            |scope| -> Result<StreamingImage, Box<dyn std::error::Error>> {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let producer = scope.spawn(|| {
+                    produce_image(
+                        &mut nv,
+                        |source| {
+                            source.begin_slot(nv_slot, ctx + 1)?;
+                            if source.has_prefill() {
+                                source.prefill_slot(nv_slot, &prompt)
+                            } else {
+                                source.consume_prompt(nv_slot, &prompt, &mut Vec::new())
+                            }
+                        },
+                        |source, out, publish| {
+                            if stream_import {
+                                source.export_kv_image_stream(nv_slot, n, out, publish)
+                            } else {
+                                source.export_kv_image(nv_slot, n, out)
+                            }
+                        },
+                        stream_import,
+                        tx,
+                    )
+                });
+                finish_image(producer, rx, request_started, |image, first| {
+                    amd.import_kv_image(amd_slot, &prompt, image, first)
+                })
+            },
+        )?
+    } else {
+        std::thread::scope(
+            |scope| -> Result<StreamingImage, Box<dyn std::error::Error>> {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let producer = scope.spawn(|| {
+                    produce_image(
+                        &mut amd,
+                        |source| source.prefill(amd_slot, &prompt),
+                        |source, out, publish| {
+                            if stream_import {
+                                source.export_kv_image_stream(amd_slot, n, out, publish)
+                            } else {
+                                source.export_kv_image(amd_slot, n, out)
+                            }
+                        },
+                        stream_import,
+                        tx,
+                    )
+                });
+                if early_import {
+                    let start = request_started.elapsed().as_secs_f64() * 1e3;
+                    if let Err(error) = nv.prepare_kv_import(nv_slot, ctx, ctx + 1) {
+                        producer.join().map_err(|_| "KV source actor panicked")??;
+                        return Err(error.into());
+                    }
+                    preparation = (start, request_started.elapsed().as_secs_f64() * 1e3);
+                }
+                finish_image(producer, rx, request_started, |image, _| {
+                    if !early_import {
+                        nv.begin_slot(nv_slot, ctx + 1)?;
+                    }
+                    nv.import_kv_image(nv_slot, &prompt, image)
+                })
+            },
+        )?
+    };
+    let first = transferred.first;
+    let prefill_finished = transferred.prefill_ms;
+    let export_ms = transferred.export_ms;
+    let import_ms = transferred.import_ms;
+    let pipeline = if stream_import {
+        Some((
+            transferred.handoff_ms,
+            transferred
+                .lease_start_ms
+                .ok_or("stream image has no source epoch")?,
+            transferred.intervals,
+        ))
+    } else {
+        None
+    };
+    let a = transferred.image;
+    let mut b = plowrt::serve::pd::KvBytes::default();
+    let import_ready = request_started.elapsed().as_secs_f64() * 1e3;
+    if !a.is_staged() {
+        return Err("KV image peer benchmark requires a staging lease".into());
+    }
+    if main_nv {
+        amd.export_kv_image(amd_slot, n, &mut b)?;
+    } else {
+        nv.export_kv_image(nv_slot, n, &mut b)?;
+    }
+    println!(
+        "KV_IMAGE_XV bytes={} exact={} staged={} export_ms={export_ms:.4} import_ms={import_ms:.4}",
+        a.len(),
+        u8::from(*a == *b),
+        u8::from(a.is_staged())
+    );
+    if *a != *b {
+        return Err("cross-vendor KV image re-export differs".into());
+    }
+    let mut tokens = Vec::new();
+    nv.step_slots(&[(nv_slot, first)], &mut tokens)?;
+    let amd_token = amd.step(amd_slot, first)?;
+    let (main_token, peer_token) = if main_nv {
+        (tokens[0], amd_token)
+    } else {
+        (amd_token, tokens[0])
+    };
+    println!("KV_IMAGE_XV_TOKENS prefill={first} main={main_token} peer={peer_token}");
+    println!("KV_IMAGE_XV_PHASES early={} prefill_ms={prefill_finished:.4} prepare_start_ms={:.4} prepare_end_ms={:.4} import_ready_ms={import_ready:.4} verified_decode_ms={:.4}",
+        u8::from(early_import), preparation.0, preparation.1, request_started.elapsed().as_secs_f64() * 1e3);
+    if let Some((
+        handoff_ms,
+        lease_start_ms,
+        [export_start, export_end, import_start, import_end],
+    )) = pipeline
+    {
+        println!("KV_IMAGE_XV_PIPE stream=1 handoff_ms={handoff_ms:.4} lease_start_ms={lease_start_ms:.4} export_start_ms={export_start:.4} export_end_ms={export_end:.4} import_start_ms={import_start:.4} import_end_ms={import_end:.4}");
+    }
+    if main_token != peer_token {
+        return Err(format!("KV image peer decode differs: {main_token} vs {peer_token}").into());
+    }
+    Ok(())
+}
+
 #[cfg(not(feature = "cuda"))]
 fn main() {
     eprintln!("step_bench requires --features cuda");
@@ -112,6 +435,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(4137);
     let steps: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
     let mut same = false;
+    let mut kv_image = false;
+    let mut kv_image_prepare = false;
+    let mut kv_image_stream = false;
+    let mut kv_image_peer = None::<std::path::PathBuf>;
+    let mut kv_image_peer_device = None::<String>;
     let mut spread = false;
     let mut multistep = false;
     let mut packed_prefill = false;
@@ -167,6 +495,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--max-inst" => max_inst = Some(args.next().ok_or("--max-inst N")?.parse()?),
             "--same" => same = true,
+            "--kv-image" => kv_image = true,
+            "--kv-image-prepare" => kv_image_prepare = true,
+            "--kv-image-stream" => kv_image_stream = true,
+            "--kv-image-peer" => {
+                kv_image_peer = Some(args.next().ok_or("--kv-image-peer DIR")?.into())
+            }
+            "--kv-image-peer-device" => {
+                kv_image_peer_device = Some(args.next().ok_or("--kv-image-peer-device amd:N|nv:N")?)
+            }
             "--spread" => spread = true,
             "--packed-prefill" => packed_prefill = true,
             "--pf-chunk" => pf_chunk = args.next().ok_or("--pf-chunk N")?.parse()?,
@@ -227,6 +564,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "partial capture requires one step, --warmup 0, tensor dumps, and no sweep/multistep"
                 .into(),
         );
+    }
+
+    if kv_image_peer.is_some() || kv_image_peer_device.is_some() {
+        if kv_image_stream && !kv_image_prepare {
+            return Err("--kv-image-stream requires --kv-image-prepare".into());
+        }
+        let (Some(peer), Some(device)) = (kv_image_peer, kv_image_peer_device) else {
+            return Err("--kv-image-peer and --kv-image-peer-device are required together".into());
+        };
+        if !kv_image || !same || packed_prefill || warmup != 0 || steps == 0 || want_slots < 2 {
+            return Err("cross-vendor KV image check needs --same --kv-image, 2+ slots, --warmup 0 and steps".into());
+        }
+        if spread
+            || multistep
+            || partial
+            || dumps.is_some()
+            || prefill_logits_dir.is_some()
+            || sweep.is_some()
+            || seg_sweep.is_some()
+            || ride.is_some()
+            || spec.mode.is_some()
+            || spec.draft_iters > 0
+        {
+            return Err(
+                "cross-vendor KV image check runs only the roundtrip and one decode step".into(),
+            );
+        }
+        #[cfg(feature = "hsa")]
+        return kv_image_peer_bench(
+            &assets,
+            &peer,
+            &device,
+            ctx,
+            prompt_file.as_deref(),
+            kv_image_prepare,
+            kv_image_stream,
+        );
+        #[cfg(not(feature = "hsa"))]
+        return Err("--kv-image-peer requires --features cuda,hsa".into());
+    }
+
+    if kv_image_prepare || kv_image_stream {
+        return Err("--kv-image-prepare requires the cross-vendor KV image check".into());
     }
 
     let ckpt = std::env::var("PLOW_CHECKPOINT")
@@ -373,7 +753,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     } else {
-        for b in 0..slots {
+        // `--kv-image`: only slot 0 prefills; the others are seated from its image below.
+        for b in 0..if kv_image { 1 } else { slots } {
             let prompt = prompt_for(b);
             if let Some(histories) = &mut histories {
                 histories[b] = prompt.clone();
@@ -396,6 +777,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "slot {b}: prompt consumed in {:.4} s",
                 t0.elapsed().as_secs_f64()
             );
+        }
+    }
+    if kv_image {
+        // Slots 1.. take slot 0's KV through an exported image instead of their own prefill:
+        // re-exporting each must give the same bytes, and SLOTS_AGREE then compares the decodes.
+        if !same || packed_prefill || slots < 2 || warmup != 0 || steps == 0 {
+            return Err(
+                "--kv-image needs --same, the serial prefill, 2+ slots, --warmup 0 and steps"
+                    .into(),
+            );
+        }
+        let n = prompt_for(0).len() as u32;
+        let (mut image, mut again) = (
+            plowrt::serve::pd::KvBytes::default(),
+            plowrt::serve::pd::KvBytes::default(),
+        );
+        let t0 = Instant::now();
+        e.export_kv_image(0, n, &mut image)?;
+        let export_s = t0.elapsed().as_secs_f64();
+        let mut exact = 0;
+        for b in 1..slots {
+            e.begin_slot(b, ctx + steps + 1)?;
+            e.import_kv_image(b, &prompt_for(b), &image)?;
+            last[b] = last[0];
+            e.export_kv_image(b, n, &mut again)?;
+            exact += usize::from(*again == *image);
+        }
+        println!(
+            "KV_IMAGE rows={n} bytes={} export_s={export_s:.4} roundtrip_exact={exact}/{} key={}",
+            image.len(),
+            slots - 1,
+            e.kv_image_key().unwrap_or_default()
+        );
+        if exact != slots - 1 {
+            return Err("KV image re-export differs from the exported image".into());
         }
     }
     if let Some(dir) = &prefill_logits_dir {
@@ -588,6 +1004,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if same && !partial {
         let agree = streams.iter().filter(|s| **s == streams[0]).count();
         println!("SLOTS_AGREE {agree}/{slots} (identical prompts on every slot)");
+        if kv_image && agree != slots {
+            return Err("slots seated from a KV image decode differently".into());
+        }
         for (b, s) in streams.iter().enumerate().skip(1) {
             if *s != streams[0] {
                 println!("  slot{b}={s:?}");

@@ -1802,7 +1802,8 @@ fn backend_amd(
     // Spelled from `hwspec`'s per-arch geometry rather than as literals: this manifest is what a
     // consumer CHECKS an object against, so a stale copy here reports a mismatch on a correctly
     // built object (or, worse, passes a wrongly built one).
-    if arch == "gfx942" && !s.prefill_buckets.is_empty() {
+    // gfx1201 builds wave64 on the same 64 KiB tile arm, so it takes the same set.
+    if matches!(arch, "gfx942" | "gfx1201") && !s.prefill_buckets.is_empty() {
         let g = hwspec::IsaLevel::Gfx942
             .geometry()
             .expect("gfx942 geometry");
@@ -2705,6 +2706,20 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
          PLOW_PACKET_HAS_* define would compile the case out"
     );
     let mut objects = object_inventory(&progs, arch, packed_prefill);
+    if m.progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|d| packet::dev::uses_residual_f32(d.op, d.i[6]))
+    {
+        objects["residual_f32"] = json!({ "required": true });
+    }
+    if m.progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|d| packet::dev::xreduce_partial_f32(d.op, d.f[0].to_bits()))
+    {
+        objects["xr_partial_f32"] = json!({ "required": true });
+    }
     let kda_intra_wave_items_required = m.progs.iter().any(|p| {
         p.stream.iter().any(|e| {
             e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0
@@ -3251,7 +3266,25 @@ pub fn config_header(manifest: &Value) -> String {
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
     out.push_str("/* --- packet and per-object opcode inventory --- */\n");
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_RESIDUAL_F32 {}\n",
+        u8::from(
+            manifest
+                .pointer("/objects/residual_f32/required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        )
+    ));
     out.push_str("#define PLOW_PACKET_HAS_TOKEN_BATCH_INVENTORY 1\n");
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 {}\n",
+        u8::from(
+            manifest
+                .pointer("/objects/xr_partial_f32/required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        )
+    ));
     if manifest
         .pointer("/objects/packed_prefill/max_request_rows")
         .is_some()
@@ -3499,6 +3532,15 @@ pub fn config_header(manifest: &Value) -> String {
                  #ifndef PLOW_FA_GF_FULL\n#define PLOW_FA_GF_FULL {v}\n#endif\n"
             ));
         }
+        // A 16-head full-attention group needs the wide softmax reductions on every NVIDIA
+        // arch (op_attention.cuh), not only where the light hd512 object is tuned.
+        if t.get("gf_full").and_then(Value::as_u64) == Some(16)
+            || t.get("gf_light512").and_then(Value::as_u64) == Some(16)
+        {
+            out.push_str(
+                "#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n",
+            );
+        }
         // Measured on sm_90a only; every other target keeps the kernel's own default.
         if let Some(v) = t.get("moe_down_sg").and_then(Value::as_u64) {
             if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
@@ -3683,13 +3725,6 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_FA_GF_LIGHT512\n#define PLOW_NV_FA_GF_LIGHT512 {v}\n#endif\n"
                 ));
-            }
-            if t.get("gf_full").and_then(Value::as_u64) == Some(16)
-                || t.get("gf_light512").and_then(Value::as_u64) == Some(16)
-            {
-                out.push_str(
-                    "#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n",
-                );
             }
         }
     }
@@ -4448,6 +4483,42 @@ mod tests {
         assert_eq!(pairing_hash(&a), pairing_hash(&b));
         b["union"] = json!(["Gemv"]);
         assert_ne!(pairing_hash(&a), pairing_hash(&b));
+    }
+
+    #[test]
+    fn residual_f32_requirement_preserves_default_pairing() {
+        for arch in ["gfx1201", "gfx942", "gfx950"] {
+            let mut m = model();
+            let mut norm = inst(DevOp::RmsNorm, [0; 8]);
+            norm.i[7] = 8194;
+            m.progs[0].insts.push(norm);
+            let plain = build(&m, arch);
+            assert!(plain["objects"].get("residual_f32").is_none());
+            assert!(config_header(&plain).contains("#define PLOW_PACKET_REQUIRES_RESIDUAL_F32 0\n"));
+            m.progs[0].insts.last_mut().unwrap().i[6] = packet::dev::RESIDUAL_F32_FLAG;
+            let required = build(&m, arch);
+            assert_eq!(required["objects"]["residual_f32"]["required"], true);
+            assert_ne!(pairing_hash(&plain), pairing_hash(&required));
+            assert!(
+                config_header(&required).contains("#define PLOW_PACKET_REQUIRES_RESIDUAL_F32 1\n")
+            );
+        }
+    }
+
+    #[test]
+    fn tp_partial_f32_requirement_preserves_default_pairing() {
+        let mut m = model();
+        m.progs[0].insts.push(inst(DevOp::XReduce, [0; 8]));
+        let plain = build(&m, "gfx1201");
+        assert!(plain["objects"].get("xr_partial_f32").is_none());
+        m.progs[0].insts.last_mut().unwrap().f[0] =
+            f32::from_bits(packet::dev::XREDUCE_PARTIAL_F32_MARK);
+        let required = build(&m, "gfx1201");
+        assert_eq!(required["objects"]["xr_partial_f32"]["required"], true);
+        assert_ne!(pairing_hash(&plain), pairing_hash(&required));
+        assert!(
+            config_header(&required).contains("#define PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 1\n")
+        );
     }
 
     /// A packet whose object requirements changed must not keep its stamp: a same-recipe
@@ -5522,6 +5593,15 @@ mod tests {
         let other = build(&model(), "gfx942");
         assert_eq!(man["pairing"]["hash"], other["pairing"]["hash"]);
         assert!(config_header(&other).contains("#define PLOW_PACKET_DECODE_LADDER \"1,2\"\n"));
+    }
+
+    /// gfx1201 objects are built on gfx942's 64 KiB tile arm, so they owe the same defines.
+    #[test]
+    fn gfx1201_requires_the_gfx942_object_defines() {
+        assert_eq!(
+            build(&model(), "gfx1201")["backends"]["gfx1201"]["requires"],
+            build(&model(), "gfx942")["backends"]["gfx942"]["requires"]
+        );
     }
 
     #[test]

@@ -321,7 +321,7 @@ impl PeerLayout {
     /// Bytes zeroed per token from `xctr`: counters, status line and the tagged region,
     /// which are contiguous. Tags are unique per (collective, token) only because every
     /// token starts from zeroed slots.
-    fn xstate_bytes(&self) -> u64 {
+    pub(crate) fn xstate_bytes(&self) -> u64 {
         self.xctr_bytes() + XCTR_STRIDE as u64 + 4 * self.xr_tag_slot
     }
 }
@@ -962,6 +962,38 @@ pub enum XctrReset {
     /// the per-token host work is exactly `n_gpu` dispatches and nothing else.
     /// [`TpGroup::zero_xctr`] is still called ONCE at bring-up.
     Program,
+}
+
+/// Cross-rank gate lines a blob's collectives use: the largest gate id over every program,
+/// plus one. Gate ids are allocated per program from 0, so this sizes every program's region.
+pub fn count_xgates(blob: &crate::asset::devblob::DevBlob) -> u32 {
+    use packet::dev::DevOp;
+    let mut top = 0u32;
+    for p in &blob.progs {
+        for d in &p.insts {
+            if d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceAddNorm as u16 {
+                top = top.max(d.i[3] + 1); // one-shot: one gate, i3 (fused AddNorm form included)
+            } else if d.op == DevOp::XReduceTwoShot as u16 {
+                // two-shot: reduce-scatter (i3) and all-gather (i4)
+                top = top.max(d.i[3] + 1).max(d.i[4] + 1);
+            } else if d.op == DevOp::IndexTpPf as u16 {
+                top = top.max(d.i[5] + 1).max(d.i[6] + 1);
+            } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
+                // split seams: one gate each (i3)
+                top = top.max(d.i[3] + 1);
+            } else if d.op == DevOp::XDcpGather as u16 {
+                top = top.max(d.i[6] + 1);
+            } else if d.op == DevOp::XArgmaxFin as u16 {
+                // sharded-head fold: arrival gate (i3), then consecutive value lines at i4
+                top = top.max(d.i[3] + 1).max(
+                    d.i[4]
+                        + packet::devbuild::xargmax_value_lines(d.i[1])
+                            .expect("engines reject XArgmaxFin batches above the packet limit"),
+                );
+            }
+        }
+    }
+    top
 }
 
 #[cfg(test)]

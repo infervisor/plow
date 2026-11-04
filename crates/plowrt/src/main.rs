@@ -149,6 +149,10 @@ enum Cmd {
         /// Requests allowed to wait outside engine slots. `0` = four batches.
         #[arg(long, default_value_t = 0)]
         max_queued_requests: usize,
+        /// Print the device x model support table (every refusal with its reason) and exit
+        /// without loading a model.
+        #[arg(long)]
+        plan_only: bool,
     },
 
     /// Benchmark one model through the production serving scheduler without HTTP.
@@ -270,6 +274,35 @@ enum Cmd {
         /// xctr gates per collective) rather than decode (one-shot, one gate).
         #[arg(long, default_value_t = false)]
         prefill: bool,
+        /// Cross-vendor staging gate: list every device of every vendor (`nv:N`, `amd:N`), then
+        /// copy this many MiB per device through one host region registered with every driver
+        /// (all devices concurrently), and relay a pattern between every ordered device pair.
+        #[arg(long)]
+        xfer_mib: Option<u32>,
+        /// Round trips per device for `--xfer-mib`.
+        #[arg(long, default_value_t = 8)]
+        xfer_iters: u32,
+    },
+
+    /// One worker rank of a process rank group. Started by the serving process for each
+    /// `PLOW_GROUP_DEVICES` entry past the first; not for direct use.
+    #[cfg(feature = "cuda")]
+    #[command(hide = true)]
+    RankWorker {
+        #[arg(long)]
+        rank: u32,
+        #[arg(long)]
+        group_fd: i32,
+        #[arg(long)]
+        link_fd: i32,
+        #[arg(long)]
+        assets: PathBuf,
+        #[arg(long, id = "rank_worker_checkpoint")]
+        checkpoint: PathBuf,
+        /// The leader's command line (JSON list): every rank resolves the same runtime
+        /// configuration from it.
+        #[arg(long)]
+        leader_argv: String,
     },
 
     /// Bring the AMD/gfx950 engine up on a compiled blob and time decode steps.
@@ -442,6 +475,9 @@ enum Cmd {
         /// two precisions.
         #[arg(long)]
         dump: Option<PathBuf>,
+        /// Save bounded tensor prefixes after each ordered prefill launch.
+        #[arg(long, requires = "dump", conflicts_with_all = ["input_dir", "list_tensors"])]
+        dump_segments: bool,
         /// Raw BF16 act.x.bin and carried-state tensor files for an act.x-only block.
         #[arg(long)]
         input_dir: Option<PathBuf>,
@@ -1039,12 +1075,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Before the runtime starts threads and before the CLI reads the environment.
     let asset_defaults = apply_asset_env_defaults();
+    pin_group_rank0();
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(async_main(asset_defaults));
     plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
     result
+}
+
+/// A rank-group leader is rank 0: pin it to the first `PLOW_GROUP_DEVICES` entry before any
+/// driver initialization (workers get theirs from the leader).
+fn pin_group_rank0() {
+    let Ok(cli) = Cli::try_parse() else { return };
+    if let Some(first) = cli.rt_cfg.group_devices.first() {
+        if let Ok(prev) = std::env::var("CUDA_VISIBLE_DEVICES") {
+            eprintln!(
+                "plowrt: PLOW_GROUP_DEVICES overrides CUDA_VISIBLE_DEVICES={prev} with {first}"
+            );
+        }
+        std::env::set_var("CUDA_VISIBLE_DEVICES", first);
+    }
+}
+
+/// A rank worker's runtime configuration: the leader's, parsed from its command line in this
+/// process's environment (inherited from the leader, so packet-carried defaults match).
+fn rank_worker_config(cmd: &Cmd) -> Option<RuntimeConfig> {
+    #[cfg(feature = "cuda")]
+    if let Cmd::RankWorker { leader_argv, .. } = cmd {
+        let parsed = serde_json::from_str::<Vec<String>>(leader_argv)
+            .map_err(|e| e.to_string())
+            .and_then(|argv| Cli::try_parse_from(argv).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(mut leader) => {
+                if let Cmd::Serve { model, .. } = &mut leader.cmd {
+                    if let Err(e) = dist_cmd::route_packet_models(model, &mut leader.rt_cfg) {
+                        eprintln!("plowrt rank-worker: leader models: {e}");
+                        std::process::exit(2);
+                    }
+                }
+                leader.rt_cfg.group_devices.clear();
+                return Some(leader.rt_cfg);
+            }
+            Err(e) => {
+                eprintln!("plowrt rank-worker: unusable leader command line: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let _ = cmd;
+    None
 }
 
 /// How long an exit path waits for queued log lines to reach stdout.
@@ -1150,7 +1230,8 @@ async fn async_main(
     if let Cmd::Serve { model, .. } = &mut cli.cmd {
         dist_cmd::route_packet_models(model, &mut cli.rt_cfg)?;
     }
-    RuntimeConfig::init(cli.rt_cfg);
+    let rt_cfg = rank_worker_config(&cli.cmd).unwrap_or(cli.rt_cfg);
+    RuntimeConfig::init(rt_cfg);
     plowrt::config::record_startup(plowrt::config::Startup::from_matches(
         &matches,
         asset_defaults
@@ -1214,6 +1295,7 @@ async fn async_main(
             max_hold_ms,
             slo_ms,
             max_queued_requests,
+            plan_only,
         } => {
             let (mut assets, asset_slugs): (Vec<PathBuf>, Vec<Option<String>>) = assets
                 .iter()
@@ -1223,6 +1305,9 @@ async fn async_main(
                 .unzip();
             for m in &model {
                 assets.push(dist_cmd::resolve_local(m)?);
+            }
+            if plan_only {
+                return serve_plan_only(&assets, &asset_slugs);
             }
             plowrt::asset::serve::log_checkpoints(&assets);
             tracing::info!(
@@ -1375,7 +1460,33 @@ async fn async_main(
             max_tokens,
             layers,
             prefill,
+            xfer_mib: Some(mib),
+            xfer_iters,
+        } => {
+            let _ = (tp, hidden, max_tokens, layers, prefill);
+            devices_xfer(mib, xfer_iters)
+        }
+        Cmd::Devices {
+            tp,
+            hidden,
+            max_tokens,
+            layers,
+            prefill,
+            xfer_mib: None,
+            ..
         } => devices(tp, hidden, max_tokens, layers, prefill),
+        #[cfg(feature = "cuda")]
+        Cmd::RankWorker {
+            rank,
+            group_fd,
+            link_fd,
+            assets,
+            checkpoint,
+            ..
+        } => {
+            plowrt::serve::cuda_group::rank_worker_main(rank, group_fd, link_fd, assets, checkpoint)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        }
         Cmd::Pull {
             model,
             pick,
@@ -1645,6 +1756,7 @@ async fn async_main(
             inspect,
             list_tensors,
             dump,
+            dump_segments,
             input_dir,
             ctx,
             repeat,
@@ -1662,7 +1774,16 @@ async fn async_main(
                         "block timing requires --input-dir with captured block operands".into(),
                     );
                 }
-                amd_block(blob, hsaco, checkpoint, prompt, inspect, list_tensors, dump)
+                amd_block(
+                    blob,
+                    hsaco,
+                    checkpoint,
+                    prompt,
+                    inspect,
+                    list_tensors,
+                    dump,
+                    dump_segments,
+                )
             }
         }
         #[cfg(not(feature = "hsa"))]
@@ -1879,6 +2000,35 @@ mod amd_bench_cli_tests {
                 "0",
             ])
             .is_err());
+        }
+    }
+
+    #[test]
+    fn amd_segment_dump_requires_destination_and_rejects_other_modes() {
+        let base = [
+            "plowrt",
+            "amd-block",
+            "--blob",
+            "model.pkt",
+            "--hsaco",
+            "hsaco",
+        ];
+        for (extra, valid) in [
+            (vec!["--dump-segments"], false),
+            (vec!["--dump-segments", "--dump", "out"], true),
+            (
+                vec!["--dump-segments", "--dump", "out", "--list-tensors"],
+                false,
+            ),
+            (
+                vec!["--dump-segments", "--dump", "out", "--input-dir", "in"],
+                false,
+            ),
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(base.into_iter().chain(extra)).is_ok(),
+                valid
+            );
         }
     }
 
@@ -3123,6 +3273,7 @@ fn amd_block(
     inspect: String,
     list_tensors: bool,
     dump: Option<PathBuf>,
+    dump_segments: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd::AmdEngine;
 
@@ -3179,7 +3330,16 @@ fn amd_block(
         .split(',')
         .map(|s| s.trim().parse::<u32>())
         .collect::<std::result::Result<_, _>>()?;
-    let tok = eng.prefill(&ids)?;
+    let tok = if dump_segments {
+        amd_block_cmd::dump_prefill_segments(
+            &mut eng,
+            &ids,
+            &inspect,
+            dump.as_deref().expect("clap requires --dump"),
+        )?
+    } else {
+        eng.prefill(&ids)?
+    };
     println!("prefill {} tokens -> sampled id {tok}", ids.len());
 
     // ZERO vs WRONG is the whole question and the two are different hunts. A
@@ -3233,6 +3393,139 @@ fn amd_block(
 /// The first real caller of [`device::select_all`], which had none: plowrt
 /// bound device 0 and nothing else. The enumeration is carved into the node's
 /// TP replicas, and a backend's position within its replica is its rank.
+#[cfg(not(target_os = "linux"))]
+fn devices_xfer(_mib: u32, _iters: u32) -> Result<(), Box<dyn std::error::Error>> {
+    Err("--xfer-mib: host staging regions are Linux-only".into())
+}
+
+#[cfg(target_os = "linux")]
+fn devices_xfer(mib: u32, iters: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let devs = device::inventory()?;
+    println!("devices: {}", devs.len());
+    for d in &devs {
+        let be = d.handle.backend();
+        match be.fingerprint() {
+            Some(fp) => println!(
+                "  {:<6} isa={} sku={} units={} mem={:.1} GiB driver={}",
+                d.id.to_string(),
+                fp.isa.arch_flag(),
+                fp.sku,
+                fp.units,
+                fp.mem_bytes as f64 / (1u64 << 30) as f64,
+                fp.driver.as_deref().unwrap_or("-"),
+            ),
+            None => println!("  {:<6} (not in the hwspec registry)", d.id.to_string()),
+        }
+    }
+    let (per_dev, relays) = device::host_region::xfer_check(&devs, (mib as usize) << 20, iters)?;
+    println!(
+        "concurrent round trips, {mib} MiB x {iters}, one region registered with every driver:"
+    );
+    for r in &per_dev {
+        println!(
+            "  {:<6} exact  H2D {:.1} GB/s  D2H {:.1} GB/s",
+            r.device, r.h2d_gbs, r.d2h_gbs
+        );
+    }
+    println!("relays (device -> region -> device -> region):");
+    for r in &relays {
+        println!("  {r}");
+    }
+    println!("XFER_CHECK PASS");
+    Ok(())
+}
+
+/// `serve --plan-only`: every device of every vendor against every bundle, without loading.
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+fn serve_plan_only(
+    assets: &[PathBuf],
+    slugs: &[Option<String>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::serve::placement::{plan_table, PlanDevice, PlanModel};
+    let inventory = device::inventory()?;
+    let devices: Vec<PlanDevice> = inventory
+        .iter()
+        .map(|d| {
+            let fp = d.handle.backend().fingerprint();
+            let (name, arch) = d.handle.name_and_arch();
+            PlanDevice {
+                id: d.id.to_string(),
+                vendor: d.id.vendor,
+                isa: fp
+                    .as_ref()
+                    .map(|f| f.isa)
+                    .or_else(|| hwspec::isa::IsaLevel::from_arch_flag(&arch)),
+                name,
+                mem_bytes: fp.map_or(0, |f| f.mem_bytes),
+            }
+        })
+        .collect();
+    let registry = Registry::new();
+    let mut models = Vec::new();
+    for (i, dir) in assets.iter().enumerate() {
+        let (slug, refused) = match registry.load(dir, slugs.get(i).cloned().flatten()) {
+            Ok(slug) => (slug, None),
+            Err(e) => (
+                slugs
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| dir.display().to_string()),
+                Some(e.to_string()),
+            ),
+        };
+        let gpu = plowrt::asset::ModelBundle::target_gpu(dir).unwrap_or_default();
+        let spec = hwspec::registry::lookup(&gpu);
+        let ckpt = plowrt::asset::serve::checkpoint_dir(dir);
+        let isa = spec.and_then(hwspec::isa::IsaLevel::from_spec);
+        // The footprint as the serve plans it: against the first matching CUDA device's VMM
+        // (live KV is not resident up front); without one, the device-free plan.
+        #[allow(unused_mut)]
+        let mut vmm = None;
+        #[cfg(feature = "cuda")]
+        for (d, pd) in inventory.iter().zip(&devices) {
+            if let (device::DeviceHandle::Cuda(b), true) = (&d.handle, pd.isa == isa) {
+                vmm = plowrt::memory::vmm::VmmOps::granularity(b.as_ref())
+                    .ok()
+                    .map(|g| (g, b.compute_capability()));
+                break;
+            }
+        }
+        let tp = plowrt::serve::manager::tp_degree(dir);
+        // Under the bundle's own config, as the serve plans it.
+        let plan = plowrt::config::bundle_config(dir).and_then(|cfg| {
+            plowrt::config::scoped(Some(cfg), || {
+                plowrt::serve::manager::BlobPlan::from_dir_with_device(dir, vmm, Some(&ckpt))
+            })
+        });
+        let refused = refused
+            .or_else(|| tp.as_ref().err().map(|e| format!("packet header: {e}")))
+            .or_else(|| plan.as_ref().err().map(|e| format!("memory plan: {e}")));
+        models.push(PlanModel {
+            slug,
+            dir: dir.display().to_string(),
+            vendor: spec.map(|s| s.vendor),
+            isa,
+            gpu,
+            tp: tp.unwrap_or(1),
+            required: plan
+                .ok()
+                .map(|p| p.required(p.overhead_bound) + plowrt::serve::manager::RESERVE),
+            refused,
+        });
+    }
+    print!("{}", plan_table(&devices, &models));
+    Ok(())
+}
+
+#[cfg(not(any(feature = "cuda", feature = "hsa")))]
+fn serve_plan_only(
+    _assets: &[PathBuf],
+    _slugs: &[Option<String>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("--plan-only needs a GPU build (cuda or hsa)".into())
+}
+
 fn devices(
     tp: Option<u32>,
     hidden: u32,
@@ -3832,6 +4125,23 @@ fn simulate(
     Ok(())
 }
 
+/// Device groups both vendor paths plan before anything is installed (docs/arch/30 §2).
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+#[derive(Default)]
+struct PendingGroups {
+    managers: Vec<Arc<plowrt::serve::manager::ModelManager>>,
+    /// Per group: instances sharing it (`None` = every registered model), and whether it is CUDA.
+    turns: Vec<(Option<usize>, bool)>,
+    dp: Option<plowrt::serve::dp::DpRouter>,
+    /// Models with a bundle for each vendor (docs/arch/30 §4): model -> (CUDA ranks `0..k`, ranks).
+    mix: std::collections::HashMap<String, (usize, usize)>,
+    /// Their CUDA ranks `(ordinal, group, metrics, cpus)`, joined with the AMD ones in one set.
+    mix_ranks: std::collections::HashMap<String, Vec<MixRank>>,
+}
+
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+type MixRank = (u32, usize, Arc<plowrt::obs::Metrics>, Vec<usize>);
+
 async fn bringup_runtime(
     assets: Vec<PathBuf>,
     asset_slugs: Vec<Option<String>>,
@@ -3853,22 +4163,24 @@ async fn bringup_runtime(
     // model. The device this opens is a device we intend to use.
     #[cfg(feature = "cuda")]
     let cuda_probe: u8 = RuntimeConfig::get()
-        .devices
+        .cuda_devices()
         .first()
         .copied()
         .unwrap_or(0)
         .min(u32::from(u8::MAX)) as u8;
     #[cfg(feature = "cuda")]
-    let cuda: Option<Arc<device::cuda::CudaBackend>> =
+    let cuda: Option<Arc<device::cuda::CudaBackend>> = if RuntimeConfig::get().cuda_closed() {
+        None
+    } else {
         match device::cuda::CudaBackend::new(cuda_probe) {
             Ok(b) => Some(Arc::new(b)),
             // A device the operator NAMED must not degrade to a CPU fallback:
             // that answers requests with reference-interpreter output at
             // fictional speed, which is the failure mode this file already
             // refuses elsewhere.
-            Err(e) if !RuntimeConfig::get().devices.is_empty() => {
+            Err(e) if !RuntimeConfig::get().cuda_devices().is_empty() => {
                 return Err(format!(
-                    "--devices names device {cuda_probe}, which will not open: {e}"
+                    "--devices names device nv:{cuda_probe}, which will not open: {e}"
                 )
                 .into())
             }
@@ -3876,23 +4188,84 @@ async fn bringup_runtime(
                 tracing::warn!(%e, "no CUDA backend");
                 None
             }
-        };
+        }
+    };
     #[cfg(feature = "cuda")]
     let backend: Arc<dyn Backend> = match &cuda {
         Some(c) => Arc::clone(c) as Arc<dyn Backend>,
-        None => device::select(executors),
+        None => device::select_with(
+            executors,
+            !RuntimeConfig::get().cuda_closed(),
+            RuntimeConfig::get()
+                .amd_devices()
+                .first()
+                .map_or(0, |&o| u8::try_from(o).unwrap_or(u8::MAX)),
+        ),
     };
     #[cfg(not(feature = "cuda"))]
-    let backend: Arc<dyn Backend> = device::select(executors);
+    let backend: Arc<dyn Backend> = device::select_with(
+        executors,
+        false,
+        RuntimeConfig::get()
+            .amd_devices()
+            .first()
+            .map_or(0, |&o| u8::try_from(o).unwrap_or(u8::MAX)),
+    );
     let vendor = backend.vendor();
+    // Mixed-vendor node: CUDA serves the NVIDIA bundles and HSA, opened beside it, the AMD ones
+    // (docs/arch/30). Opened only when some asset targets AMD, so an NVIDIA-only serve on a
+    // mixed node never initialises the second driver.
     #[cfg(feature = "hsa")]
-    let visible = backend.peer().map_or(1, |p| p.peer_agent_count()) as usize;
+    let mixed_hsa: Option<Arc<device::hsa::HsaBackend>> = if vendor == Some(hwspec::Vendor::Nvidia)
+        && !RuntimeConfig::get().amd_closed()
+        && assets
+            .iter()
+            .any(|d| plowrt::asset::target_vendor(d) == Some(hwspec::Vendor::Amd))
+    {
+        let first = RuntimeConfig::get()
+            .amd_devices()
+            .first()
+            .copied()
+            .unwrap_or(0);
+        let b =
+            device::hsa::HsaBackend::new(u8::try_from(first).unwrap_or(u8::MAX)).map_err(|e| {
+                format!("an asset targets AMD, but HSA device amd:{first} will not open: {e}")
+            })?;
+        tracing::info!(device = %b.device_name(), "HSA opened beside CUDA (mixed-vendor serve)");
+        Some(Arc::new(b))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "hsa"))]
+    let mixed_hsa: Option<()> = None;
+    let mixed = mixed_hsa.is_some();
+    #[cfg(feature = "hsa")]
+    let visible = match &mixed_hsa {
+        Some(h) => device::Backend::peer(h.as_ref()).map_or(1, |p| p.peer_agent_count()) as usize,
+        None => backend.peer().map_or(1, |p| p.peer_agent_count()) as usize,
+    };
+    // AMD agents this serve uses: `--devices amd:N…`, else every visible one (validated where
+    // the AMD path plans).
+    #[cfg(feature = "hsa")]
+    let amd_ords: Vec<u32> = match RuntimeConfig::get().amd_devices() {
+        named if named.is_empty() => (0..visible as u32).collect(),
+        mut named => {
+            named.sort_unstable();
+            named.dedup();
+            named
+        }
+    };
+    // Groups a mixed-vendor DP model may put ranks on, beside the CUDA groups.
+    #[cfg(feature = "hsa")]
+    let amd_groups = if mixed { amd_ords.len() } else { 0 };
+    #[cfg(not(feature = "hsa"))]
+    let amd_groups = 0usize;
     let cfg = RuntimeConfig::get();
     // AMD takes `--pin` / `--place` (groups over every visible agent, all models resident);
     // the device subset and the VRAM residency budget stay CUDA's.
     let placed_here = cfg!(feature = "hsa") && vendor == Some(hwspec::Vendor::Amd);
     if vendor != Some(hwspec::Vendor::Nvidia)
-        && (!cfg.devices.is_empty()
+        && (!cfg.cuda_devices().is_empty()
             || cfg.nv.vram_budget_mib.is_some()
             || (!placed_here
                 && (!cfg.pin.is_empty() || cfg.place != plowrt::serve::placement::Place::Spread)))
@@ -3919,10 +4292,22 @@ async fn bringup_runtime(
     let mut registered: Vec<String> = Vec::with_capacity(assets.len());
     for (i, dir) in assets.iter().enumerate() {
         let slug = registry.load(dir, asset_slugs.get(i).cloned().flatten())?;
-        registered.push(slug.clone());
-        let target = registry.get(&slug)?.manifest.gpu.clone();
+        if registered.contains(&slug) {
+            // Another vendor's bundle of a registered model (Registry::load checked it answers
+            // identically); its target is checked below like any other bundle's.
+            tracing::info!(dir = %dir.display(), model = %slug, "variant of a registered model");
+        } else {
+            registered.push(slug.clone());
+        }
+        let target = registry
+            .bundle_for(&slug, plowrt::asset::target_vendor(dir))?
+            .manifest
+            .gpu
+            .clone();
         let target_vendor = hwspec::registry::lookup(&target).map(|s| s.vendor);
-        if target_vendor.is_some() && target_vendor == vendor {
+        if target_vendor.is_some()
+            && (target_vendor == vendor || (mixed && target_vendor == Some(hwspec::Vendor::Amd)))
+        {
             tracing::info!(dir = %dir.display(), %target, "loaded model bundle");
         } else if cfg!(feature = "cpu")
             && vendor.is_none()
@@ -4020,6 +4405,50 @@ async fn bringup_runtime(
     // `--devices` picks the visible ordinals (default: probe upward until one
     // fails to open), `--place` picks the policy, and one manager is built per
     // group that actually receives a model.
+    // The CUDA and AMD paths plan into one list of device groups (CUDA's first), installed once
+    // both have planned; CUDA's initial loads run after that install.
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    let mut pending = PendingGroups::default();
+    #[cfg(feature = "cuda")]
+    let mut cuda_loads: Vec<Arc<plowrt::serve::manager::ModelManager>> = Vec::new();
+    // Under a mixed serve, which vendors a slug (or `slug#r` instance) has a bundle for.
+    let serves_on = |slug: &str, v: hwspec::Vendor| {
+        let model = plowrt::serve::dp::split_key(slug).map_or(slug, |(m, _)| m);
+        state.registry.vendors(model).contains(&v)
+    };
+    let is_amd_slug = |slug: &str| serves_on(slug, hwspec::Vendor::Amd);
+    let is_nv_slug = |slug: &str| serves_on(slug, hwspec::Vendor::Nvidia);
+    // A name only the other vendor's path serves; an unknown name is never skipped, so a typo in
+    // `--pin` / `--dp` is still refused.
+    let amd_only = |slug: &str| is_amd_slug(slug) && !is_nv_slug(slug);
+    let nv_only = |slug: &str| is_nv_slug(slug) && !is_amd_slug(slug);
+    // Served on both vendors: its `--dp` ranks span them, and its pins name the vendor.
+    let is_mix = |slug: &str| mixed && is_nv_slug(slug) && is_amd_slug(slug);
+    let untagged_mix_pin = |slug: &str, ordinal: u32| -> Box<dyn std::error::Error> {
+        format!("--pin {slug}@{ordinal}: {slug} is served on NVIDIA and AMD; name the device as nv:{ordinal} or amd:{ordinal}").into()
+    };
+    // `--pd`: a DP model's prefill and decode pools, checked against its rank count.
+    let pd_specs = plowrt::serve::pd::parse_pd(&RuntimeConfig::get().pd)?;
+    #[cfg(target_os = "linux")]
+    let mut pd_drivers: Vec<Arc<dyn plowrt::device::host_region::HostStaging>> = Vec::new();
+    let pd_of = |model: &str, n: usize| -> Result<Option<plowrt::serve::pd::PdSpec>, String> {
+        match pd_specs.iter().find(|(m, _)| m == model) {
+            None => Ok(None),
+            Some((_, p)) if u64::from(p.prefill | p.decode) >> n != 0 => {
+                Err(format!("--pd {model}: names a rank past its {n} DP ranks"))
+            }
+            Some((_, p)) => Ok(Some(*p)),
+        }
+    };
+    // Each vendor path uses its half of these.
+    let _ = (
+        &amd_only,
+        &nv_only,
+        &is_mix,
+        &untagged_mix_pin,
+        amd_groups,
+        &pd_of,
+    );
     #[cfg(feature = "cuda")]
     let mut managed_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     #[cfg(feature = "cuda")]
@@ -4032,7 +4461,10 @@ async fn bringup_runtime(
             Ok((path, version)) => tracing::info!(path = %path.display(), version, "cuBLASLt"),
             Err(e) => tracing::warn!(%e, "cuBLASLt not loadable"),
         }
-        for dir in &assets {
+        for dir in assets
+            .iter()
+            .filter(|d| plowrt::asset::target_vendor(d) != Some(hwspec::Vendor::Amd))
+        {
             plowrt::asset::serve::check_runtime(
                 dir,
                 &plowrt::asset::serve::runtime_requires(dir)?,
@@ -4070,8 +4502,12 @@ async fn bringup_runtime(
         let mut models: Vec<(String, PathBuf, PathBuf)> = Vec::new();
         let slugs: Vec<String> = state.registry.slugs();
         for slug in slugs {
-            let bundle = state.registry.get(&slug)?;
-            if plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)?.is_none() {
+            let bundle = state
+                .registry
+                .bundle_for(&slug, Some(hwspec::Vendor::Nvidia))?;
+            if plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)?.is_none()
+                || (mixed && amd_only(&slug))
+            {
                 continue;
             }
             let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
@@ -4082,6 +4518,16 @@ async fn bringup_runtime(
         models.sort_by_key(|(_, dir, _)| assets.iter().position(|a| a == dir));
 
         let budget = RuntimeConfig::get().nv.vram_budget_mib.map(|mib| mib << 20);
+        // A CUDA group's co-tenants are the models CUDA can switch onto it: every registered model
+        // on a single-vendor serve, the NVIDIA ones on a mixed serve.
+        let cuda_tenants = mixed.then(|| {
+            state
+                .registry
+                .slugs()
+                .iter()
+                .filter(|s| !amd_only(s))
+                .count()
+        });
 
         // Visible ordinals.
         //
@@ -4101,7 +4547,7 @@ async fn bringup_runtime(
             );
         }
 
-        let configured = RuntimeConfig::get().devices.clone();
+        let configured = RuntimeConfig::get().cuda_devices();
         // Validate against the visible set BEFORE opening anything, so an
         // out-of-range ordinal reads as what it is rather than as a device
         // that would not initialise.
@@ -4142,6 +4588,12 @@ async fn bringup_runtime(
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        if !pd_specs.is_empty() {
+            for (_, be) in &backends {
+                pd_drivers.push(be.clone());
+            }
+        }
         let visible: Vec<u32> = backends.iter().map(|(d, _)| *d).collect();
 
         if models.is_empty() {
@@ -4156,9 +4608,10 @@ async fn bringup_runtime(
                 )?);
                 managers.push(mgr);
             }
-            let n_groups = managers.len().max(1);
-            state.install_managers(managers);
-            state.install_device_turns(n_groups, true);
+            pending
+                .turns
+                .extend(std::iter::repeat((cuda_tenants, true)).take(managers.len()));
+            pending.managers.extend(managers);
         } else {
             let policy: Place = RuntimeConfig::get().place;
 
@@ -4180,7 +4633,13 @@ async fn bringup_runtime(
                 specs.push(ModelSpec {
                     slug: slug.clone(),
                     model: slug.clone(),
-                    tp: plowrt::serve::manager::tp_degree(dir)?,
+                    // A process rank group (`PLOW_GROUP_DEVICES`) carries its other ranks'
+                    // devices itself: in this process the model takes one device.
+                    tp: if RuntimeConfig::get().group_devices.len() > 1 {
+                        1
+                    } else {
+                        plowrt::serve::manager::tp_degree(dir)?
+                    },
                     required: plan
                         .required(plan.overhead_bound)
                         .saturating_add(plowrt::serve::manager::RESERVE),
@@ -4218,7 +4677,10 @@ async fn bringup_runtime(
             // anti-affinity sees every rank. Rank r of `slug` is the instance `slug#r`.
             let dp = placement::parse_dp(&RuntimeConfig::get().dp)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            if let Some(m) = dp.named().find(|m| !specs.iter().any(|s| s.slug == *m)) {
+            if let Some(m) = dp
+                .named()
+                .find(|m| !(mixed && amd_only(m)) && !specs.iter().any(|s| s.slug == *m))
+            {
                 return Err(format!(
                     "--dp {m}=… names a model this server does not serve on the GPU"
                 )
@@ -4227,8 +4689,44 @@ async fn bringup_runtime(
             let mut dp_models: Vec<(String, usize)> = Vec::new();
             let mut ranked_specs = Vec::with_capacity(specs.len());
             let mut ranked_models = Vec::with_capacity(models.len());
+            let dev_pins = placement::parse_dev_pins(&RuntimeConfig::get().pin)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             for (spec, (_, dir, ckpt)) in specs.into_iter().zip(models) {
-                let n = dp.ranks(&spec.slug, groups.len());
+                let mix = is_mix(&spec.slug);
+                let n = dp.ranks(&spec.slug, groups.len() + if mix { amd_groups } else { 0 });
+                // A model served on both vendors puts ranks `0..k` on CUDA, the rest on AMD.
+                let k = if mix {
+                    let pins = |v| {
+                        dev_pins
+                            .iter()
+                            .filter(|(s, pv, _)| {
+                                *pv == Some(v)
+                                    && plowrt::serve::dp::split_key(s)
+                                        .map_or(s.as_str(), |(m, _)| m)
+                                        == spec.slug
+                            })
+                            .count()
+                    };
+                    let k = placement::mix_split(
+                        n,
+                        groups.len(),
+                        amd_groups,
+                        pins(hwspec::Vendor::Nvidia),
+                        pins(hwspec::Vendor::Amd),
+                    )
+                    .map_err(|e| -> Box<dyn std::error::Error> {
+                        format!("{}: {e}", spec.slug).into()
+                    })?;
+                    pending.mix.insert(spec.slug.clone(), (k, n));
+                    k
+                } else {
+                    n
+                };
+                if k == 0 {
+                    // Every rank is AMD's: its dispatchers are spawned with the AMD engines.
+                    managed_slugs.remove(&spec.slug);
+                    continue;
+                }
                 if n == 1 {
                     ranked_models.push((spec.slug.clone(), dir, ckpt));
                     ranked_specs.push(spec);
@@ -4249,7 +4747,7 @@ async fn bringup_runtime(
                     )
                     .into());
                 }
-                for r in 0..n {
+                for r in 0..k {
                     let key = plowrt::serve::dp::rank_key(&spec.slug, r);
                     ranked_models.push((key.clone(), dir.clone(), ckpt.clone()));
                     ranked_specs.push(ModelSpec {
@@ -4257,7 +4755,7 @@ async fn bringup_runtime(
                         ..spec.clone()
                     });
                 }
-                dp_models.push((spec.slug, n));
+                dp_models.push((spec.slug, k));
             }
             let (mut specs, models) = (ranked_specs, ranked_models);
 
@@ -4266,9 +4764,24 @@ async fn bringup_runtime(
             // rest of the pins while dropping that one places a model somewhere
             // the operator did not ask for. A DP model's pins go to its ranks
             // in order (`--pin m@2,m@5` places rank 0 on 2 and rank 1 on 5).
-            for (slug, ordinal) in placement::parse_pins(&RuntimeConfig::get().pin)
+            for (slug, pin_vendor, ordinal) in placement::parse_dev_pins(&RuntimeConfig::get().pin)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             {
+                if pin_vendor == Some(hwspec::Vendor::Amd) {
+                    if !is_amd_slug(&slug) {
+                        return Err(format!(
+                            "--pin {slug}@amd:{ordinal}: {slug} is not served on AMD"
+                        )
+                        .into());
+                    }
+                    continue;
+                }
+                if pin_vendor.is_none() && is_mix(&slug) {
+                    return Err(untagged_mix_pin(&slug, ordinal));
+                }
+                if mixed && pin_vendor.is_none() && amd_only(&slug) {
+                    continue;
+                }
                 let unpinned = specs
                     .iter()
                     .position(|s| (s.slug == slug || s.model == slug) && s.device.is_none());
@@ -4318,7 +4831,23 @@ async fn bringup_runtime(
                             tracing::info!(key = %r.key, device = r.ordinal, numa_node = node, cpus = cpus.len(), "dp: rank dispatcher placed on its GPU's socket");
                             r.cpus = cpus;
                         }
+                        r.vendor = Some(hwspec::Vendor::Nvidia);
                     }
+                    if pending.mix.get(model).is_some_and(|&(k, n)| k < n) {
+                        // The AMD path adds this model's set, CUDA ranks first.
+                        pending.mix_ranks.insert(
+                            model.clone(),
+                            set.ranks
+                                .iter()
+                                .map(|r| {
+                                    (r.ordinal, r.group, Arc::clone(&r.metrics), r.cpus.clone())
+                                })
+                                .collect(),
+                        );
+                        continue;
+                    }
+                    // A mixed-vendor set takes its pools once its AMD ranks join it.
+                    set.pd = pd_of(model, set.ranks.len())?;
                     tracing::info!(
                         %model,
                         dp = n,
@@ -4328,7 +4857,7 @@ async fn bringup_runtime(
                     );
                     router.add(set);
                 }
-                state.install_dp(router);
+                pending.dp = Some(router);
             }
 
             // One manager per group that received a model. A group's manager
@@ -4364,42 +4893,25 @@ async fn bringup_runtime(
                 let mgr = Arc::new(plowrt::serve::manager::ModelManager::new(
                     be, &state, mux_cfg, mine, budget,
                 )?);
-                let index = managers.len();
+                let index = pending.managers.len() + managers.len();
                 for slug in members {
                     state.set_slug_group(slug, index);
                 }
                 managers.push(mgr);
             }
-            state.install_managers(managers.clone());
-            // One co-tenant turn per group, installed before `load_initial`
-            // spawns the first dispatcher — a mux resolves its turn at spawn.
-            state.install_device_turns(layout.groups.len(), true);
-            // Load each group's initial residents. Sequential: the loads are
-            // H2D-bound and share host bandwidth, so overlapping them buys
-            // little while making a failure harder to attribute. DP ranks are
-            // N copies of one checkpoint on N cards: those overlap, a few at a time.
-            if state.dp().is_some() {
-                use futures::{StreamExt, TryStreamExt};
-                // The first group alone: its load-time GEMM selections are then reused by every
-                // later rank (`device::cuda::lt`), so ranks run identical kernels.
-                if let Some(first) = managers.first() {
-                    first.load_initial().await?;
-                }
-                futures::stream::iter(managers.iter().skip(1).map(|m| m.load_initial()))
-                    .buffer_unordered(DP_PARALLEL_LOADS)
-                    .try_collect::<Vec<()>>()
-                    .await?;
-            } else {
-                for mgr in &managers {
-                    mgr.load_initial().await?;
-                }
-            }
+            // One co-tenant turn per group, installed (with the AMD groups) before
+            // `load_initial` spawns the first dispatcher — a mux resolves its turn at spawn.
+            pending
+                .turns
+                .extend(std::iter::repeat((cuda_tenants, true)).take(layout.groups.len()));
+            pending.managers.extend(managers.iter().cloned());
+            cuda_loads = managers;
         }
     }
     #[cfg(not(feature = "cuda"))]
     let managed_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let dp_spec = plowrt::serve::placement::parse_dp(&RuntimeConfig::get().dp)?;
-    let amd_serve = cfg!(feature = "hsa") && vendor == Some(hwspec::Vendor::Amd);
+    let amd_serve = cfg!(feature = "hsa") && (vendor == Some(hwspec::Vendor::Amd) || mixed);
     if managed_slugs.is_empty()
         && !amd_serve
         && (dp_spec.ranks("", 2) > 1 || dp_spec.named().next().is_some())
@@ -4411,7 +4923,7 @@ async fn bringup_runtime(
     }
     // AMD models served data-parallel, `(slug, ranks)`: their dispatchers are per rank.
     #[allow(unused_mut)]
-    let mut amd_dp: Vec<(String, usize)> = Vec::new();
+    let mut amd_dp: Vec<(String, std::ops::Range<usize>)> = Vec::new();
 
     // AMD/gfx950 engines. Not under the S1 `ModelManager` (CUDA VMM residency: VRAM planning,
     // switching, evict-LRU): every bundle loads once and stays resident. Placement is the
@@ -4428,22 +4940,45 @@ async fn bringup_runtime(
     // gfx950 code objects come from `--rt-hsaco` / `PLOW_HSACO` (every bundle), else
     // `<assets>/hsaco`, else the assets dir itself; the TP degree is read off the packet.
     #[cfg(feature = "hsa")]
-    if vendor == Some(hwspec::Vendor::Amd) {
+    if vendor == Some(hwspec::Vendor::Amd) || mixed {
         use plowrt::serve::dp::{rank_key, DpRouter, DpSet, RouteCfg};
+        // AMD groups follow the CUDA ones in the node's group list.
+        let base = pending.managers.len();
         use plowrt::serve::placement::{self, ModelSpec};
+        if let Some(bad) = amd_ords.iter().find(|&&o| o as usize >= visible) {
+            return Err(format!(
+                "--devices names amd:{bad}, but only {visible} AMD agent(s) are visible"
+            )
+            .into());
+        }
+        let visible = amd_ords.len();
         let slugs = registered.as_slice();
-        let mut plan: Vec<(String, PathBuf, u32, usize)> = Vec::new();
+        // `(slug, blob, tp, ranks, first AMD rank)`: a mixed-vendor model's CUDA ranks come first.
+        let mut plan: Vec<(String, PathBuf, u32, usize, usize)> = Vec::new();
         for slug in slugs {
-            let bundle = state.registry.get(slug)?;
+            if mixed && !is_amd_slug(slug) {
+                continue;
+            }
+            let mix = pending.mix.get(slug.as_str()).copied();
+            if mix.is_some_and(|(k, n)| k == n) {
+                continue;
+            }
+            let bundle = state.registry.bundle_for(slug, Some(hwspec::Vendor::Amd))?;
             let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
                 continue;
             };
             let tp = plowrt::serve::engine::AmdServe::packet_tp(&blob)?;
-            let n = dp_spec.ranks(slug, visible / tp as usize);
-            if n > 1 && n * tp as usize > visible {
+            if mix.is_some() && tp > 1 {
                 return Err(format!(
-                    "{slug}: --dp {n} of a TP{tp} packet needs {} GPUs, {visible} visible",
-                    n * tp as usize
+                    "{slug}: DP across vendors needs TP1 bundles; the AMD one is TP{tp}"
+                )
+                .into());
+            }
+            let (lo, n) = mix.unwrap_or_else(|| (0, dp_spec.ranks(slug, visible / tp as usize)));
+            if n > 1 && (n - lo) * tp as usize > visible {
+                return Err(format!(
+                    "{slug}: --dp {n} of a TP{tp} packet needs {} AMD GPUs, {visible} visible",
+                    (n - lo) * tp as usize
                 )
                 .into());
             }
@@ -4454,9 +4989,13 @@ async fn bringup_runtime(
                 )
                 .into());
             }
-            plan.push((slug.clone(), blob, tp, n));
+            plan.push((slug.clone(), blob, tp, n, lo));
         }
-        if let Some(m) = dp_spec.named().find(|m| !plan.iter().any(|p| p.0 == *m)) {
+        if let Some(m) = dp_spec.named().find(|m| {
+            !(mixed && nv_only(m))
+                && !pending.mix.contains_key(*m)
+                && !plan.iter().any(|p| p.0 == *m)
+        }) {
             return Err(
                 format!("--dp {m}=… names a model this server does not serve on the GPU").into(),
             );
@@ -4469,8 +5008,8 @@ async fn bringup_runtime(
             }
         };
         let mut specs: Vec<ModelSpec> = Vec::new();
-        for (slug, _, tp, n) in &plan {
-            for r in 0..*n {
+        for (slug, _, tp, n, lo) in &plan {
+            for r in *lo..*n {
                 specs.push(ModelSpec {
                     slug: instance(slug, *n, r),
                     model: slug.clone(),
@@ -4483,7 +5022,25 @@ async fn bringup_runtime(
             }
         }
         // As on CUDA: `--pin slug@o` goes to the model's next unpinned rank, `slug#r@o` to that rank.
-        for (slug, ordinal) in placement::parse_pins(&cfg.pin)? {
+        for (slug, pin_vendor, ordinal) in placement::parse_dev_pins(&cfg.pin)? {
+            if pin_vendor == Some(hwspec::Vendor::Nvidia) {
+                if !is_nv_slug(&slug) {
+                    return Err(format!(
+                        "--pin {slug}@nv:{ordinal}: {slug} is not served on NVIDIA"
+                    )
+                    .into());
+                }
+                continue;
+            }
+            if pin_vendor.is_none() && is_mix(&slug) {
+                return Err(untagged_mix_pin(&slug, ordinal));
+            }
+            if mixed && pin_vendor.is_none() && nv_only(&slug) {
+                continue;
+            }
+            if !amd_ords.contains(&ordinal) {
+                return Err(format!("--pin {slug}@amd:{ordinal}: AMD agent {ordinal} is not among the served devices {amd_ords:?}").into());
+            }
             let unpinned = specs
                 .iter()
                 .position(|s| (s.slug == slug || s.model == slug) && s.device.is_none());
@@ -4498,10 +5055,21 @@ async fn bringup_runtime(
             }
         }
         if !specs.is_empty() {
-            let ordinals: Vec<u32> = (0..visible as u32).collect();
+            let ordinals = amd_ords.clone();
             let width = placement::grouping_width(&specs, visible).map_err(|e| e.to_string())?;
             let groups =
                 placement::plan_groups(&ordinals, width, u64::MAX).map_err(|e| e.to_string())?;
+            // An AMD engine opens the `tp` agents from its first one on.
+            if let Some(g) = groups
+                .iter()
+                .find(|g| g.ordinals.windows(2).any(|w| w[1] != w[0] + 1))
+            {
+                return Err(format!(
+                    "--devices: AMD TP group {:?} is not a run of consecutive agents",
+                    g.ordinals
+                )
+                .into());
+            }
             let layout =
                 placement::assign(&specs, &groups, cfg.place).map_err(|e| e.to_string())?;
             let tenants: Vec<usize> = (0..layout.groups.len())
@@ -4523,32 +5091,66 @@ async fn bringup_runtime(
             };
             for (i, s) in specs.iter().enumerate() {
                 let g = layout.assignment[i];
-                state.set_slug_group(&s.slug, g);
+                state.set_slug_group(&s.slug, base + g);
                 tracing::info!(
                     instance = %s.slug, tp = s.tp, group = g,
                     ordinals = ?layout.groups[g].ordinals.iter().take(s.tp as usize).collect::<Vec<_>>(),
                     "placement: AMD instance"
                 );
             }
-            let mut router = DpRouter::new(RouteCfg::from_config());
-            for (slug, _, tp, n) in plan.iter().filter(|p| p.3 > 1) {
-                let ranks = (0..*n)
-                    .map(|r| {
-                        let key = rank_key(slug, r);
-                        (first_of(&key), r, state.model_metrics(&key))
-                    })
+            let router = pending
+                .dp
+                .get_or_insert_with(|| DpRouter::new(RouteCfg::from_config()));
+            for (slug, _, tp, n, lo) in plan.iter().filter(|p| p.3 > 1) {
+                let nv = pending.mix_ranks.remove(slug.as_str()).unwrap_or_default();
+                if nv.len() != *lo {
+                    return Err(
+                        format!("{slug}: {} CUDA DP ranks placed, {lo} planned", nv.len()).into(),
+                    );
+                }
+                let mut ranks: Vec<_> = nv
+                    .iter()
+                    .map(|(o, g, m, _)| (*o, *g, Arc::clone(m)))
                     .collect();
-                tracing::info!(%slug, dp = n, tp, cfg = ?router.cfg, "dp: AMD ranks planned");
-                router.add(DpSet::new(slug, ranks));
-                amd_dp.push((slug.clone(), *n));
-            }
-            if !router.is_empty() {
-                state.install_dp(router);
+                ranks.extend((*lo..*n).map(|r| {
+                    let key = rank_key(slug, r);
+                    let i = specs
+                        .iter()
+                        .position(|s| s.slug == key)
+                        .expect("planned instance");
+                    (
+                        first_of(&key),
+                        base + layout.assignment[i],
+                        state.model_metrics(&key),
+                    )
+                }));
+                tracing::info!(%slug, dp = n, nv_ranks = lo, tp, cfg = ?router.cfg, "dp: AMD ranks planned");
+                let mut set = DpSet::new(slug, ranks);
+                set.pd = pd_of(slug, set.ranks.len())?;
+                for (r, rank) in set.ranks.iter_mut().enumerate() {
+                    match nv.get(r) {
+                        Some((_, _, _, cpus)) => {
+                            rank.cpus = cpus.clone();
+                            rank.vendor = Some(hwspec::Vendor::Nvidia);
+                        }
+                        None => rank.vendor = Some(hwspec::Vendor::Amd),
+                    }
+                }
+                router.add(set);
+                amd_dp.push((slug.clone(), *lo..*n));
             }
             // One co-tenant turn per group, before any dispatcher resolves its turn at spawn.
-            state.install_group_turns(&tenants, false);
-            for (slug, blob, tp, n) in &plan {
-                let bundle = state.registry.get(slug)?;
+            pending
+                .turns
+                .extend(tenants.iter().map(|&t| (Some(t), false)));
+            // The router and every group's turn exist before an AMD engine loads (an engine
+            // registers its DP prefix probe at install); CUDA has planned, so both are complete.
+            if let Some(dp) = pending.dp.take().filter(|d| !d.is_empty()) {
+                state.install_dp(dp);
+            }
+            state.install_turns_per_group(&pending.turns);
+            for (slug, blob, tp, n, lo) in &plan {
+                let bundle = state.registry.bundle_for(slug, Some(hwspec::Vendor::Amd))?;
                 // Same refusal the CUDA path makes (`serve::manager::load_model`):
                 // a real model driven through the byte-fallback tokenizer produces
                 // fluent-looking GARBAGE, not an error, because the ids bear no
@@ -4578,7 +5180,7 @@ async fn bringup_runtime(
                     %slug, blob = %blob.display(), hsaco = %hsaco.display(),
                     checkpoint = %ckpt.display(), "loading AMD engine"
                 );
-                for r in 0..*n {
+                for r in *lo..*n {
                     let key = instance(slug, *n, r);
                     let first = u8::try_from(first_of(&key))
                         .map_err(|_| format!("{key}: device ordinal out of range"))?;
@@ -4600,12 +5202,19 @@ async fn bringup_runtime(
                 let first = u8::try_from(group.first())
                     .map_err(|_| "device ordinal out of range".to_string())?;
                 let be = Arc::new(plowrt::device::hsa::HsaBackend::new(first)?);
+                #[cfg(target_os = "linux")]
+                if !pd_specs.is_empty() {
+                    pd_drivers.push(be.clone());
+                }
                 let group_models: Vec<(String, PathBuf, PathBuf)> = specs
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| layout.assignment[*i] == g)
                     .filter_map(|(_, s)| {
-                        let bundle = state.registry.get(&s.model).ok()?;
+                        let bundle = state
+                            .registry
+                            .bundle_for(&s.model, Some(hwspec::Vendor::Amd))
+                            .ok()?;
                         let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
                         Some((s.slug.clone(), bundle.dir.clone(), ckpt))
                     })
@@ -4621,11 +5230,11 @@ async fn bringup_runtime(
                 )?);
                 managers.push(mgr);
             }
-            state.install_managers(managers);
+            pending.managers.extend(managers);
         } else {
             let mut managers = Vec::new();
-            for d in 0..visible as u8 {
-                if let Ok(be) = plowrt::device::hsa::HsaBackend::new(d) {
+            for &d in &amd_ords {
+                if let Ok(be) = plowrt::device::hsa::HsaBackend::new(d as u8) {
                     if let Ok(mgr) = plowrt::serve::manager::ModelManager::from_hsa(
                         Arc::new(be),
                         1,
@@ -4638,9 +5247,81 @@ async fn bringup_runtime(
                     }
                 }
             }
-            if !managers.is_empty() {
-                state.install_managers(managers);
-                state.install_device_turns(1, false);
+            pending
+                .turns
+                .extend(std::iter::repeat((None, false)).take(managers.len()));
+            pending.managers.extend(managers);
+        }
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    if !pending.managers.is_empty() {
+        if let Some(dp) = pending.dp.take().filter(|d| !d.is_empty()) {
+            state.install_dp(dp);
+        }
+        state.install_turns_per_group(&pending.turns);
+        state.install_managers(pending.managers);
+    }
+    if let Some((m, _)) = pd_specs.iter().find(|(m, _)| state.dp_set(m).is_none()) {
+        return Err(format!("--pd {m}=…: the model is not served data-parallel (--dp)").into());
+    }
+    // Every rank's caches must mean what the prefill rank's do (the import re-checks per image).
+    let mut digests = std::collections::HashMap::new();
+    let mut pd_image_bytes = 0;
+    for (m, spec) in &pd_specs {
+        let Some(set) = state.dp_set(m) else { continue };
+        let headers: Vec<_> = set
+            .ranks
+            .iter()
+            .map(|r| {
+                let b = state
+                    .registry
+                    .bundle_for(m, r.vendor)
+                    .map_err(|e| e.to_string())?;
+                plowrt::serve::pd::kv_header(&b.dir, &mut digests)
+            })
+            .collect();
+        plowrt::serve::pd::check_headers(m, *spec, &headers)?;
+        for r in &set.ranks {
+            if (spec.prefill | spec.decode) >> r.rank & 1 != 0 {
+                let b = state.registry.bundle_for(m, r.vendor)?;
+                pd_image_bytes =
+                    pd_image_bytes.max(plowrt::serve::pd::kv_image_capacity(&b.dir, None)?);
+            }
+        }
+        if let Some(Ok(h)) = headers.first() {
+            tracing::info!(model = %m, header = %h.digest(), weights = %h.weights, "pd: KV image headers agree");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if pd_image_bytes > 0 {
+        if let Err(err) =
+            plowrt::device::host_region::prepare_image_pool(pd_image_bytes, &pd_drivers)
+        {
+            tracing::warn!(error = %err, "pd: host staging unavailable; using pageable images");
+        }
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let managers = cuda_loads;
+        // Load each group's initial residents. Sequential: the loads are
+        // H2D-bound and share host bandwidth, so overlapping them buys
+        // little while making a failure harder to attribute. DP ranks are
+        // N copies of one checkpoint on N cards: those overlap, a few at a time.
+        if state.dp().is_some() {
+            use futures::{StreamExt, TryStreamExt};
+            // The first group alone: its load-time GEMM selections are then reused by every
+            // later rank (`device::cuda::lt`), so ranks run identical kernels.
+            if let Some(first) = managers.first() {
+                first.load_initial().await?;
+            }
+            futures::stream::iter(managers.iter().skip(1).map(|m| m.load_initial()))
+                .buffer_unordered(DP_PARALLEL_LOADS)
+                .try_collect::<Vec<()>>()
+                .await?;
+        } else {
+            for mgr in &managers {
+                mgr.load_initial().await?;
             }
         }
     }
@@ -4701,22 +5382,30 @@ async fn bringup_runtime(
     // manager (spawned on load, drained+removed on evict).
     let slugs: Vec<String> = state.registry.slugs();
     for slug in slugs {
-        if managed_slugs.contains(&slug) {
-            continue;
-        }
-        let bundle = state.registry.get(&slug)?;
-        if let Some((_, n)) = amd_dp.iter().find(|d| d.0 == slug) {
-            for r in 0..*n {
+        // A mixed-vendor DP model's AMD ranks are spawned here, its CUDA ones by their manager.
+        if let Some((_, ranks)) = amd_dp.iter().find(|d| d.0 == slug) {
+            let bundle = state
+                .registry
+                .bundle_for(&slug, Some(hwspec::Vendor::Amd))?;
+            for r in ranks.clone() {
                 let key = plowrt::serve::dp::rank_key(&slug, r);
                 let m = mux::spawn(key.clone(), bundle.clone(), Arc::clone(&state), mux_cfg);
                 state.install_mux(key, m);
             }
             continue;
         }
+        if managed_slugs.contains(&slug) {
+            continue;
+        }
+        let bundle = state.registry.get(&slug)?;
         let m = mux::spawn(slug.clone(), bundle, Arc::clone(&state), mux_cfg);
         state.install_mux(slug, m);
     }
 
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    for (model, spec) in &pd_specs {
+        plowrt::serve::pd::check_engines(&state, model, *spec)?;
+    }
     Ok(state)
 }
 

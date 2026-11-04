@@ -61,6 +61,8 @@ pub fn kernel_reservation_bytes(arch: Arch) -> u64 {
         // reservation does not scale with the larger 160 KiB LDS — it is a fixed
         // per-workgroup cost, so it is a much smaller fraction here.
         Arch::CdnaV4 => 4 * 1024,
+        // RDNA4 runs the CDNA interpreter objects: same fixed carve-out.
+        Arch::RdnaV4 => 4 * 1024,
         // Apple GPU: 32 KiB threadgroup memory total; the interpreter's reductions and
         // counters take one 2 KiB slice (runtime/apple/interp.metal: red/keys/gate).
         Arch::AppleM3 | Arch::AppleM4 => 2 * 1024,

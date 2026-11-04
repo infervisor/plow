@@ -15,7 +15,7 @@ use packet::devbuild::{lean_attn_res_f32mix_inst64, static_seg_ofs, ProgramRole}
 use serde::Serialize;
 
 use super::kv_layout::kv_tensor_name;
-use crate::asset::devblob::{DevBlob, DevProg};
+use crate::asset::devblob::{DevBlob, DevProg, DevTensor};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
 use crate::exec::amd::packed::validate_rows as validate_amd_packed_rows;
@@ -8501,6 +8501,9 @@ pub struct AmdEngine {
     /// frontier. No block table, no per-block indirection, no kernel change.
     vmm: Option<VmmKv>,
     shared_prefix: Option<shared_prefix::SharedPrefix>,
+    kv_image: Option<plow_asset::live_kv::Manifest>,
+    kv_image_key: Option<String>,
+    kv_image_has_drafter: bool,
     /// `(blocks, i[8])` of the last lm_head found — the fields that differ
     /// between two packets whose op and operands are identical.
     lm_detail: std::cell::RefCell<Option<(u16, [u32; 8], usize, Vec<u16>)>>,
@@ -8571,6 +8574,68 @@ fn discover_lowrung_tiers(hsaco_dir: &Path, object: &str) -> Option<String> {
 
 fn select_vmm_kv(configured: Option<bool>, required: bool) -> bool {
     configured.unwrap_or(required)
+}
+
+struct TensorSlabLayout {
+    offsets: Vec<Option<u64>>,
+    bytes: u64,
+    resident_bytes: u64,
+}
+
+fn tensor_slab_layout(
+    tensors: &[DevTensor],
+    owned: impl Fn(usize, &str) -> bool,
+    weights_only: bool,
+) -> TensorSlabLayout {
+    let mut layout = TensorSlabLayout {
+        offsets: vec![None; tensors.len()],
+        bytes: 0,
+        resident_bytes: 0,
+    };
+    for (id, tensor) in tensors.iter().enumerate() {
+        if !owned(id, &tensor.name) {
+            continue;
+        }
+        let bytes = slab_carve(tensor.bytes);
+        layout.resident_bytes += bytes;
+        if !weights_only || packet::names::is_checkpoint_weight(&tensor.name) {
+            layout.offsets[id] = Some(layout.bytes);
+            layout.bytes += bytes;
+        }
+    }
+    layout
+}
+
+impl TensorSlabLayout {
+    fn check_available(&self, available: u64) -> Result<()> {
+        if self.resident_bytes > available {
+            return Err(RuntimeError::Rejected(format!(
+                "AMD unallocated tensor storage requires {} bytes, but only {available} bytes are available after KV mapping; re-emit with fewer decode slots or a lower max_ctx",
+                self.resident_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_capacity(&self, capacity: u64, committed_kv: u64) -> Result<()> {
+        if capacity == 0 {
+            return Ok(());
+        }
+        let required = self
+            .resident_bytes
+            .checked_add(committed_kv)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(
+                    "AMD resident tensor storage exceeds the address space".into(),
+                )
+            })?;
+        if required > capacity {
+            return Err(RuntimeError::Rejected(format!(
+                "AMD tensor storage requires at least {required} bytes after KV mapping, but device capacity is {capacity} bytes; re-emit with fewer decode slots or a lower max_ctx"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl AmdEngine {
@@ -12323,7 +12388,7 @@ impl AmdEngine {
         };
         prefetch_ahead(&mut pf, depth);
 
-        // ---- one allocation for every tensor that would otherwise get its own
+        // RDNA carves checkpoint weights only; other architectures keep the mixed arena.
         //
         // Both passes below must agree, tensor for tensor, on which tensors are
         // carved and how much each consumes: the sizing pass decides how big the
@@ -12366,22 +12431,23 @@ impl AmdEngine {
         } else {
             vec![None; blob.tensors.len()]
         };
-        let carved = |id: usize, name: &str| {
+        let owned = |id: usize, name: &str| {
             !is_peer_slot(name)
                 && !is_band_view(name)
                 && cache_va[id].is_none()
                 && twins[id].is_none()
                 && (rowband_on || !rb_twin[id])
         };
-        // Slab offset of every carved tensor, so a column shard can view a full twin declared after it.
-        let mut carve_at = vec![None; blob.tensors.len()];
-        let mut slab_bytes: u64 = 0;
-        for (id, td) in blob.tensors.iter().enumerate() {
-            if carved(id, &td.name) {
-                carve_at[id] = Some(slab_bytes);
-                slab_bytes += slab_carve(td.bytes);
+        let weights_only = arch == "gfx1201";
+        let layout = tensor_slab_layout(&blob.tensors, owned, weights_only);
+        if weights_only {
+            layout.check_capacity(be.vram_bytes(), vmm.as_ref().map_or(0, VmmKv::mapped_bytes))?;
+            if let Some(available) = crate::memory::vmm::VmmOps::free_bytes(&*be) {
+                layout.check_available(available)?;
             }
         }
+        let slab_bytes = layout.bytes;
+        let carve_at = layout.offsets;
 
         // ---- EVERY checkpoint weight is RESOLVED before a byte is uploaded
         //
@@ -12474,7 +12540,7 @@ impl AmdEngine {
                 (Some(t), "act.og_tp") => Some(t.scratch_base),
                 (Some(t), "act.dg_tp") => Some(t.scratch_base + t.slot_b),
                 // Slot 2, the GATHER slot: a column-parallel partial the reduce out of
-                // slot 0 folds in (`PARTIAL_SLOTS`). Only K3's LatentMoE declares it.
+                // slot 0 folds in (`PARTIAL_SLOTS`) for K3's LatentMoE; Gemma-4 MoE's routed partial.
                 (Some(t), "act.ug_tp") => Some(t.scratch_base + 2 * t.slot_b),
                 // Slots 3/4/5: the sequence-parallel seams' band results (normed hidden,
                 // latent xe, route table), all-gathered by op 26. K3 declares them only
@@ -12568,7 +12634,7 @@ impl AmdEngine {
                 // gather, memset tail) starts after the carve, so this one
                 // wait point covers them all. The mapper outruns the upload,
                 // so the wait is ~0 after the first chunk.
-                (None, WeightSlab::Vmm(slab)) => {
+                (None, WeightSlab::Vmm(slab)) if carve_at[i].is_some() => {
                     let off = slab_off;
                     slab_off += slab_carve(td.bytes);
                     slab.wait_mapped(slab_off)?;
@@ -12577,12 +12643,12 @@ impl AmdEngine {
                 // Carve from the one allocation, in blob order. The sizing pass
                 // walked this same list with the same filter and the same
                 // `slab_carve`, so the cursor cannot run past the end.
-                (None, WeightSlab::Flat(slab)) => {
+                (None, WeightSlab::Flat(slab)) if carve_at[i].is_some() => {
                     let m = slab.subview(slab_off, td.bytes.max(1))?;
                     slab_off += slab_carve(td.bytes);
                     m
                 }
-                (None, WeightSlab::PerTensor) => {
+                (None, _) => {
                     let t = Instant::now();
                     let m = EngineDevice::alloc(&*be, td.bytes.max(1))?;
                     LoadProf::add(&prof.alloc_ns, t);
@@ -12855,7 +12921,7 @@ impl AmdEngine {
             // saving is read off `MEMORY_AVAIL` by whoever is measuring.
             tracing::info!(
                 slab_mib = slab_bytes / (1 << 20),
-                carved = devp.len() - n_view,
+                carved = carve_at.iter().filter(|offset| offset.is_some()).count(),
                 views = n_view,
                 "weights carved from one allocation"
             );
@@ -14169,6 +14235,33 @@ impl AmdEngine {
         // Flat KV (no pool, no shared prefix: e.g. a DCP packet) is fully backed at load and
         // already absent from `free`, so charging it again would halve the seats for nothing.
         let flat_kv = vmm.is_none() && shared_prefix.is_none();
+        let (kv_image, kv_image_key) = if flat_kv && tp.is_none() {
+            let derived = (|| -> std::result::Result<_, String> {
+                let mut m = match crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(m) => m,
+                    None => blob.with_packet_view(plow_asset::live_kv::emit)?,
+                };
+                blob.with_packet_view(|p| plow_asset::kv_image::canonical_order(p, &mut m))?;
+                let key = blob
+                    .with_packet_view(|p| plow_asset::kv_image::derive(p, &m, String::new()))?
+                    .digest();
+                Ok((m, key))
+            })();
+            match derived {
+                Ok((m, key)) => (Some(m), Some(key)),
+                Err(error) => {
+                    tracing::debug!(%error, "amd: KV image unavailable");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let kv_image_has_drafter = blob
+            .reserved_metadata(&raw, plow_asset::spec_draft::SECTION)?
+            .is_some();
         let kv_admission = free.filter(|_| !flat_kv).and_then(|free| {
             let kv_bytes: u64 = blob
                 .tensors
@@ -14466,6 +14559,9 @@ impl AmdEngine {
             kda_conv_alt_stale: vec![false; batch],
             vmm,
             shared_prefix,
+            kv_image,
+            kv_image_key,
+            kv_image_has_drafter,
             lm_detail: std::cell::RefCell::new(None),
             pf_stream: blob.progs.iter().map(|g| g.stream.clone()).collect(),
             tp,
@@ -15176,6 +15272,139 @@ impl AmdEngine {
             .position(|x| x == name)
             .ok_or_else(|| RuntimeError::Device(format!("no tensor {name:?}")))?;
         EngineDevice::download(&*self.be, &self.devp[i], 0, dst)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn kv_image_staging(&self) -> Arc<dyn crate::device::host_region::HostStaging> {
+        self.be.clone()
+    }
+
+    pub fn kv_image_key(&self) -> Option<String> {
+        self.kv_image_key.clone()
+    }
+
+    fn kv_image_manifest(&self) -> Result<&plow_asset::live_kv::Manifest> {
+        self.kv_image.as_ref().ok_or_else(|| {
+            RuntimeError::Rejected("AMD KV image requires supported flat, single-rank KV".into())
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn transfer_kv_image(
+        &mut self,
+        image: &crate::exec::kv_image::KvBytes,
+        spans: &[crate::exec::kv_image::ImageSpan],
+        export: bool,
+    ) -> Result<bool> {
+        match image.transfer(&*self.be, spans, &self.devp, export) {
+            Ok(staged) => Ok(staged),
+            Err(failure) if failure.unretired => {
+                image.quarantine(
+                    &mut self.devp,
+                    &mut self._weight_slab,
+                    &mut self.vmm,
+                    self.be.clone(),
+                );
+                self.kv_image_key = None;
+                Err(self.be.quarantine_staging(&failure.error))
+            }
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    pub fn export_kv_image(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+    ) -> Result<()> {
+        self.export_kv_image_with(slot, n, out, None)
+    }
+
+    pub fn export_kv_image_stream(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+    ) -> Result<()> {
+        self.export_kv_image_with(slot, n, out, Some(publish))
+    }
+
+    fn export_kv_image_with(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        publish: Option<&mut dyn FnMut(crate::serve::pd::KvBytes)>,
+    ) -> Result<()> {
+        let slot = u32::try_from(slot)
+            .map_err(|_| RuntimeError::Rejected("KV image: slot out of range".into()))?;
+        let (spans, total) = crate::exec::kv_image::plan(self.kv_image_manifest()?, slot, n)?;
+        self.drain()?;
+        out.prepare(total as usize, hwspec::Vendor::Amd);
+        out.export_with(publish, |out| {
+            #[cfg(target_os = "linux")]
+            if self.transfer_kv_image(out, &spans, true)? {
+                return Ok(());
+            }
+            let crate::serve::pd::KvBytes::Pageable(out) = out else {
+                return Err(RuntimeError::Device(
+                    "KV image: unregistered export slab".into(),
+                ));
+            };
+            for s in spans {
+                EngineDevice::download(
+                    &*self.be,
+                    &self.devp[s.handle],
+                    s.native_off,
+                    &mut out[s.image_off as usize..(s.image_off + s.bytes) as usize],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn import_kv_image(
+        &mut self,
+        slot: usize,
+        n: u32,
+        image: &crate::serve::pd::KvBytes,
+    ) -> Result<()> {
+        if !self.carried_slot.is_empty() || self.kv_image_has_drafter {
+            return Err(RuntimeError::Rejected(
+                "KV image import: packets with recurrent state or a drafter are not supported"
+                    .into(),
+            ));
+        }
+        if n as usize >= self.max_ctx {
+            return Err(RuntimeError::ContextLength(
+                "KV image import leaves no room for decode".into(),
+            ));
+        }
+        let slot = u32::try_from(slot)
+            .map_err(|_| RuntimeError::Rejected("KV image: slot out of range".into()))?;
+        let (spans, total) = crate::exec::kv_image::plan(self.kv_image_manifest()?, slot, n)?;
+        if total != image.len() as u64 {
+            return Err(RuntimeError::Rejected(format!(
+                "KV image import: image is {} bytes, this packet's is {total}",
+                image.len()
+            )));
+        }
+        self.drain()?;
+        #[cfg(target_os = "linux")]
+        if self.transfer_kv_image(image, &spans, false)? {
+            return Ok(());
+        }
+        for s in spans {
+            EngineDevice::upload(
+                &*self.be,
+                &self.devp[s.handle],
+                s.native_off,
+                &image[s.image_off as usize..(s.image_off + s.bytes) as usize],
+            )?;
+        }
+        self.drain()
     }
 
     /// Read `dst.len()` bytes of a named tensor from byte `offset`.
@@ -20371,6 +20600,10 @@ impl AmdEngine {
     /// Segment count for program `p`.
     pub fn prog_segments(&self, p: usize) -> usize {
         self.progs[p].seg_class.len()
+    }
+
+    pub fn prefill_launches(&self, p: usize) -> usize {
+        self.prog_dispatch(p).launches()
     }
 
     /// Ordered host launches and their device-side XCD queue layout.

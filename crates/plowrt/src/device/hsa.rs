@@ -38,6 +38,8 @@
 //! device-visible memory, and the `Send`/`Sync` impls — because those carry an
 //! argument that is not shared with the rest of the file.
 
+use super::{image_copy_rects, ImageCopy};
+
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -190,10 +192,10 @@ const HSA_AMD_MEMORY_TYPE_PINNED: u32 = 1;
 // hsa_access_permission_t
 const HSA_ACCESS_PERMISSION_RW: u32 = 3;
 
-// hsa_amd_memory_pool_global_flag_t
-const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 1 << 1;
-const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED: u32 = 1 << 0;
-const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1 << 2;
+// hsa_amd_memory_pool_global_flag_t (hsa_ext_amd.h)
+const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1;
+const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED: u32 = 2;
+const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 4;
 
 // hsa_queue_type_t
 const HSA_QUEUE_TYPE_SINGLE: u32 = 1;
@@ -444,6 +446,179 @@ pub struct HsaSignal {
 }
 
 #[repr(C)]
+struct HsaPitchedPtr {
+    base: *mut c_void,
+    pitch: usize,
+    slice: usize,
+}
+
+#[repr(C)]
+struct HsaDim3 {
+    x: u32,
+    y: u32,
+    z: u32,
+}
+
+type HsaCopyRect = unsafe extern "C" fn(
+    *const HsaPitchedPtr,
+    *const HsaDim3,
+    *const HsaPitchedPtr,
+    *const HsaDim3,
+    *const HsaDim3,
+    HsaAgent,
+    u32,
+    u32,
+    *const HsaSignal,
+    HsaSignal,
+) -> HsaStatus;
+
+#[repr(C)]
+union HsaCopyAgents {
+    agent: HsaAgent,
+    list: *mut HsaAgent,
+}
+
+#[repr(C)]
+struct HsaCopyWait {
+    function: u16,
+    scope: u16,
+    reserved: u32,
+    addr: *mut c_void,
+    value: u64,
+    mask: u64,
+}
+
+#[repr(C)]
+struct HsaCopyAfter {
+    operation: u16,
+    scope: u16,
+    reserved: u32,
+    addr: *mut c_void,
+    data: u64,
+}
+
+#[repr(C)]
+struct HsaCopyOp {
+    version: u16,
+    type_: u16,
+    num_entries: u16,
+    traffic_class: u16,
+    completion: HsaSignal,
+    src_list: *mut *mut c_void,
+    src_agent: HsaAgent,
+    dst_agents: HsaCopyAgents,
+    dst_list: *mut *mut c_void,
+    size_list: *mut usize,
+    reserved_size: usize,
+    wait: HsaCopyWait,
+    signal: HsaCopyAfter,
+    reserved: [u64; 1],
+}
+
+type HsaBatchCopy = unsafe extern "C" fn(*const HsaCopyOp, u32, u32, *const HsaSignal) -> HsaStatus;
+
+struct BatchCopies {
+    op: HsaCopyOp,
+    dependency: Option<HsaSignal>,
+    src: Vec<*mut c_void>,
+    dst: Vec<*mut c_void>,
+    agents: Vec<HsaAgent>,
+    sizes: Vec<usize>,
+}
+
+impl BatchCopies {
+    fn new(
+        spans: &[(u64, u64, u64)],
+        export: bool,
+        src_agent: HsaAgent,
+        dst_agent: HsaAgent,
+    ) -> Result<Box<Self>> {
+        if spans.is_empty() {
+            return Err(RuntimeError::Rejected(
+                "image multi-copy: empty operation".into(),
+            ));
+        }
+        let count = u16::try_from(spans.len())
+            .map_err(|_| RuntimeError::Rejected("image multi-copy: too many entries".into()))?;
+        // All-zero pointers and wait/signal fields describe inactive optional operations.
+        let mut copy = Box::new(Self {
+            op: unsafe { std::mem::zeroed() },
+            dependency: None,
+            src: Vec::with_capacity(spans.len()),
+            dst: Vec::with_capacity(spans.len()),
+            agents: vec![dst_agent; spans.len()],
+            sizes: Vec::with_capacity(spans.len()),
+        });
+        for &(host, device, bytes) in spans {
+            let (src, dst) = if export {
+                (device, host)
+            } else {
+                (host, device)
+            };
+            copy.src.push(src as *mut c_void);
+            copy.dst.push(dst as *mut c_void);
+            copy.sizes.push(
+                usize::try_from(bytes).map_err(|_| {
+                    RuntimeError::Rejected("image multi-copy: size overflow".into())
+                })?,
+            );
+        }
+        copy.op.version = 1;
+        copy.op.num_entries = count;
+        copy.op.src_agent = src_agent;
+        copy.op.src_list = copy.src.as_mut_ptr();
+        copy.op.dst_list = copy.dst.as_mut_ptr();
+        copy.op.dst_agents = HsaCopyAgents {
+            list: copy.agents.as_mut_ptr(),
+        };
+        copy.op.size_list = copy.sizes.as_mut_ptr();
+        Ok(copy)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyIssue {
+    Rejected(HsaStatus),
+    Unretired(HsaStatus),
+}
+
+fn submit_counted(
+    count: usize,
+    mut submit: impl FnMut(usize) -> std::result::Result<(), CopyIssue>,
+    cancel_unissued: impl FnOnce(usize),
+) -> std::result::Result<(), (usize, CopyIssue)> {
+    for issued in 0..count {
+        if let Err(error) = submit(issued) {
+            if matches!(error, CopyIssue::Rejected(_)) {
+                cancel_unissued(count - issued);
+            }
+            return Err((issued, error));
+        }
+    }
+    Ok(())
+}
+
+fn retry_image_batch(
+    result: (Option<u64>, Result<()>),
+    wait: impl FnOnce(u64) -> Result<()>,
+    linear: impl FnOnce() -> (Option<u64>, Result<()>),
+) -> (Option<u64>, Result<()>) {
+    if let Err(error) = &result.1 {
+        if error.is_fatal() || error.device_fault().is_none() {
+            return result;
+        }
+        if let Some(fence) = result.0 {
+            if let Err(error) = wait(fence) {
+                return (Some(fence), Err(error));
+            }
+        }
+        tracing::debug!(%error, "HSA image rectangles unavailable; retrying linear copies");
+        return linear();
+    }
+    result
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct HsaRegion {
     handle: u64,
@@ -565,11 +740,14 @@ hsa_fns! {
     hsa_amd_memory_lock: unsafe extern "C" fn(*mut c_void, usize, *const HsaAgent, u32, *mut *mut c_void) -> HsaStatus,
     hsa_amd_memory_unlock: unsafe extern "C" fn(*mut c_void) -> HsaStatus,
     hsa_amd_memory_async_copy: unsafe extern "C" fn(*mut c_void, HsaAgent, *const c_void, HsaAgent, usize, u32, *const HsaSignal, HsaSignal) -> HsaStatus,
+    hsa_amd_memory_async_copy_rect: Option<HsaCopyRect>,
+    hsa_amd_memory_async_batch_copy: Option<HsaBatchCopy>,
     hsa_queue_create: unsafe extern "C" fn(HsaAgent, u32, u32, *const c_void, *const c_void, u32, u32, *mut *mut HsaQueue) -> HsaStatus,
     hsa_queue_destroy: unsafe extern "C" fn(*mut HsaQueue) -> HsaStatus,
     hsa_amd_queue_cu_set_mask: unsafe extern "C" fn(*const HsaQueue, u32, *const u32) -> HsaStatus,
     hsa_queue_add_write_index_screlease: unsafe extern "C" fn(*mut HsaQueue, u64) -> u64,
     hsa_queue_load_read_index_scacquire: unsafe extern "C" fn(*const HsaQueue) -> u64,
+    hsa_queue_load_write_index_scacquire: unsafe extern "C" fn(*const HsaQueue) -> u64,
     hsa_signal_create: unsafe extern "C" fn(i64, u32, *const HsaAgent, *mut HsaSignal) -> HsaStatus,
     hsa_signal_destroy: unsafe extern "C" fn(HsaSignal) -> HsaStatus,
     hsa_signal_store_screlease: unsafe extern "C" fn(HsaSignal, i64),
@@ -629,6 +807,16 @@ impl HsaDriver {
             hsa_amd_memory_lock: resolve!(lib, b"hsa_amd_memory_lock\0"),
             hsa_amd_memory_unlock: resolve!(lib, b"hsa_amd_memory_unlock\0"),
             hsa_amd_memory_async_copy: resolve!(lib, b"hsa_amd_memory_async_copy\0"),
+            hsa_amd_memory_async_copy_rect: unsafe {
+                lib.get::<HsaCopyRect>(b"hsa_amd_memory_async_copy_rect\0")
+            }
+            .ok()
+            .map(|f| *f),
+            hsa_amd_memory_async_batch_copy: unsafe {
+                lib.get::<HsaBatchCopy>(b"hsa_amd_memory_async_batch_copy\0")
+            }
+            .ok()
+            .map(|f| *f),
             hsa_queue_create: resolve!(lib, b"hsa_queue_create\0"),
             hsa_queue_destroy: resolve!(lib, b"hsa_queue_destroy\0"),
             hsa_amd_queue_cu_set_mask: resolve!(lib, b"hsa_amd_queue_cu_set_mask\0"),
@@ -639,6 +827,10 @@ impl HsaDriver {
             hsa_queue_load_read_index_scacquire: resolve!(
                 lib,
                 b"hsa_queue_load_read_index_scacquire\0"
+            ),
+            hsa_queue_load_write_index_scacquire: resolve!(
+                lib,
+                b"hsa_queue_load_write_index_scacquire\0"
             ),
             hsa_signal_create: resolve!(lib, b"hsa_signal_create\0"),
             hsa_signal_destroy: resolve!(lib, b"hsa_signal_destroy\0"),
@@ -1054,6 +1246,10 @@ pub struct HsaBackend {
     /// copies name it.
     cpu_agent: HsaAgent,
     vram_pool: HsaMemoryPool,
+    /// Cross-rank TP buffers: the agent's fine-grained VRAM pool where it has one (CDNA), the
+    /// coarse pool otherwise (gfx12 exposes only coarse VRAM; its PCIe peer system-scope
+    /// atomics were measured correct on it).
+    peer_pool: HsaMemoryPool,
     fine_pool: HsaMemoryPool,
     kernarg_pool: HsaMemoryPool,
     queue: *mut HsaQueue,
@@ -1110,12 +1306,44 @@ pub struct HsaBackend {
     /// `DeviceFree`) don't guard and still attempt their calls.
     poisoned: std::sync::OnceLock<DeviceErrorInfo>,
     copy_tier: parking_lot::Mutex<Option<HsaCopyTier>>,
+    #[cfg(target_os = "linux")]
+    stage_fences: super::host_region::StageFences,
 }
 
 struct HsaCopyTier {
     signals: rustc_hash::FxHashMap<u64, HsaSignal>,
     spare: Vec<HsaSignal>,
     failed: rustc_hash::FxHashSet<u64>,
+    // Descriptors and pointer arrays may remain driver-readable until the fence retires.
+    image_lists: rustc_hash::FxHashMap<u64, Box<BatchCopies>>,
+}
+
+impl HsaCopyTier {
+    fn wait_copy(&mut self, fence: u64, mut wait: impl FnMut(HsaSignal) -> i64) -> Result<()> {
+        let Some(sig) = self.signals.remove(&fence) else {
+            return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
+        };
+        if self.failed.remove(&fence) {
+            // Admission was unproven: the driver may still reference the signal.
+            return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
+        }
+        // A wait may return early (spurious wake); a copy that failed leaves the signal negative.
+        let val = loop {
+            let value = wait(sig);
+            if value < 1 {
+                break value;
+            }
+        };
+        if val < 0 {
+            // The signal's state is the copy's error; it is not reused.
+            return Err(RuntimeError::Device(format!(
+                "async copy failed (signal {val})"
+            )));
+        }
+        self.image_lists.remove(&fence);
+        self.spare.push(sig);
+        Ok(())
+    }
 }
 
 /// Preallocated fill source: `len` bytes of fine-grained memory already set to
@@ -1144,6 +1372,295 @@ unsafe impl Send for HsaBackend {}
 unsafe impl Sync for HsaBackend {}
 
 impl HsaBackend {
+    /// Queue one SDMA copy on a pooled completion signal; the fence is consumed by
+    /// `VmmOps::fence_done` / `fence_wait`.
+    fn fenced_copy(
+        &self,
+        dst: u64,
+        dst_agent: HsaAgent,
+        src: u64,
+        src_agent: HsaAgent,
+        bytes: u64,
+        what: &str,
+        dependency: Option<u64>,
+    ) -> Result<u64> {
+        self.guard()?;
+        let mut tier_lock = self.copy_tier.lock();
+        let tier = match tier_lock.as_mut() {
+            Some(t) => t,
+            None => tier_lock.insert(HsaCopyTier {
+                signals: rustc_hash::FxHashMap::default(),
+                spare: Vec::new(),
+                failed: rustc_hash::FxHashSet::default(),
+                image_lists: Default::default(),
+            }),
+        };
+        let dependency = dependency
+            .map(|f| {
+                tier.signals
+                    .get(&f)
+                    .copied()
+                    .ok_or_else(|| RuntimeError::Device("staging: unknown dependency".into()))
+            })
+            .transpose()?;
+        let sig = match tier.spare.pop() {
+            Some(s) => {
+                unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
+                s
+            }
+            None => {
+                let mut s = HsaSignal { handle: 0 };
+                let rc =
+                    unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s) };
+                self.check(rc, "hsa_signal_create (vmm spill)")?;
+                s
+            }
+        };
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                dst as *mut c_void,
+                dst_agent,
+                src as *const c_void,
+                src_agent,
+                bytes as usize,
+                u32::from(dependency.is_some()),
+                dependency
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const HsaSignal),
+                sig,
+            )
+        };
+        let fence = sig.handle as u64;
+        if rc != HSA_STATUS_SUCCESS {
+            tier.spare.push(sig);
+            return Err(self.fault(rc, what));
+        }
+        tier.signals.insert(fence, sig);
+        Ok(fence)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn issue_image_copy(
+        &self,
+        copy: ImageCopy,
+        export: bool,
+        dependency: Option<HsaSignal>,
+        signal: HsaSignal,
+    ) -> std::result::Result<(), CopyIssue> {
+        let deps = dependency
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s as *const HsaSignal);
+        let dep_count = u32::from(dependency.is_some());
+        if copy.rows == 1 {
+            let (dst, dst_agent, src, src_agent) = if export {
+                (copy.host, self.cpu_agent, copy.device, self.agent)
+            } else {
+                (copy.device, self.agent, copy.host, self.cpu_agent)
+            };
+            let rc = unsafe {
+                (self.shared.drv.hsa_amd_memory_async_copy)(
+                    dst as *mut c_void,
+                    dst_agent,
+                    src as *const c_void,
+                    src_agent,
+                    copy.bytes as usize,
+                    dep_count,
+                    deps,
+                    signal,
+                )
+            };
+            return if rc == HSA_STATUS_SUCCESS {
+                Ok(())
+            } else {
+                Err(CopyIssue::Unretired(rc))
+            };
+        }
+        let rect = self
+            .shared
+            .drv
+            .hsa_amd_memory_async_copy_rect
+            .expect("rectangles planned only when the optional symbol is present");
+        let (host_slice, device_slice) = copy.slices().expect("validated rectangle geometry");
+        let host = HsaPitchedPtr {
+            base: copy.host as *mut c_void,
+            pitch: copy.bytes as usize,
+            slice: host_slice,
+        };
+        let device = HsaPitchedPtr {
+            base: copy.device as *mut c_void,
+            pitch: copy.pitch,
+            slice: device_slice,
+        };
+        let zero = HsaDim3 { x: 0, y: 0, z: 0 };
+        let range = HsaDim3 {
+            x: copy.bytes as u32,
+            y: copy.rows,
+            z: 1,
+        };
+        let (dst, src, direction) = if export {
+            (&host, &device, 2)
+        } else {
+            (&device, &host, 1)
+        };
+        let rc = unsafe {
+            rect(
+                dst, &zero, src, &zero, &range, self.agent, direction, dep_count, deps, signal,
+            )
+        };
+        if rc == HSA_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(CopyIssue::Rejected(rc))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn queue_image_batch(
+        &self,
+        spans: usize,
+        commands: usize,
+        export: bool,
+        mut image: Option<Box<BatchCopies>>,
+        mut submit: impl FnMut(
+            usize,
+            Option<HsaSignal>,
+            HsaSignal,
+            Option<&mut BatchCopies>,
+        ) -> std::result::Result<(), CopyIssue>,
+    ) -> (Option<u64>, Result<()>) {
+        if commands == 0 {
+            return (None, Ok(()));
+        }
+        let mut queued = Ok(());
+        let mut drain = None;
+        let fence = self.stage_fences.submit(|dependency| {
+            drain = dependency;
+            self.guard()?;
+            let count = i64::try_from(commands)
+                .map_err(|_| RuntimeError::Rejected("staging: too many spans".into()))?;
+            let mut tier_lock = self.copy_tier.lock();
+            self.guard()?;
+            let tier = tier_lock.get_or_insert_with(|| HsaCopyTier {
+                signals: Default::default(),
+                spare: Vec::new(),
+                failed: Default::default(),
+                image_lists: Default::default(),
+            });
+            let dependency = dependency
+                .map(|f| {
+                    tier.signals
+                        .get(&f)
+                        .copied()
+                        .ok_or_else(|| RuntimeError::Device("staging: unknown dependency".into()))
+                })
+                .transpose()?;
+            let sig = match tier.spare.pop() {
+                Some(sig) => {
+                    unsafe { (self.shared.drv.hsa_signal_store_screlease)(sig, count) };
+                    sig
+                }
+                None => {
+                    let mut sig = HsaSignal { handle: 0 };
+                    let rc = unsafe {
+                        (self.shared.drv.hsa_signal_create)(count, 0, std::ptr::null(), &mut sig)
+                    };
+                    self.check(rc, "hsa_signal_create (image batch)")?;
+                    sig
+                }
+            };
+            if let Err((issued, error)) = submit_counted(
+                commands,
+                |i| submit(i, dependency, sig, image.as_deref_mut()),
+                |unissued| unsafe {
+                    (self.shared.drv.hsa_signal_add_screlease)(sig, -(unissued as i64));
+                },
+            ) {
+                match error {
+                    CopyIssue::Rejected(rc) => {
+                        let error = self.fault(rc, "HSA image batch submission");
+                        if issued == 0 {
+                            tier.spare.push(sig);
+                            return Err(error);
+                        }
+                        queued = Err(error);
+                    }
+                    CopyIssue::Unretired(rc) => {
+                        tier.failed.insert(sig.handle);
+                        queued = Err(self
+                            .quarantine_staging(&self.fault(rc, "HSA image admission unproven")));
+                    }
+                }
+            }
+            if let Some(image) = image.take() {
+                tier.image_lists.insert(sig.handle, image);
+            }
+            tier.signals.insert(sig.handle, sig);
+            tracing::debug!(
+                spans,
+                commands,
+                signals = 1,
+                export,
+                "HSA image batch queued"
+            );
+            Ok(sig.handle)
+        });
+        match fence {
+            Ok(fence) => (Some(fence), queued),
+            Err(error) => (drain, Err(error)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn queue_vendor_image_batch(
+        &self,
+        spans: &[(u64, u64, u64)],
+        export: bool,
+        copy: HsaBatchCopy,
+    ) -> (Option<u64>, Result<()>) {
+        let (src, dst) = if export {
+            (self.agent, self.cpu_agent)
+        } else {
+            (self.cpu_agent, self.agent)
+        };
+        let lists = match BatchCopies::new(spans, export, src, dst) {
+            Ok(lists) => lists,
+            Err(error) => return (None, Err(error)),
+        };
+        self.queue_image_op(lists, spans.len(), export, copy)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn queue_image_op(
+        &self,
+        lists: Box<BatchCopies>,
+        spans: usize,
+        export: bool,
+        copy: HsaBatchCopy,
+    ) -> (Option<u64>, Result<()>) {
+        self.queue_image_batch(
+            spans,
+            1,
+            export,
+            Some(lists),
+            |_, dependency, signal, lists| {
+                let lists = lists.expect("image operation retains its metadata");
+                lists.op.completion = signal;
+                lists.dependency = dependency;
+                let deps = lists
+                    .dependency
+                    .as_ref()
+                    .map_or(std::ptr::null(), |s| s as *const HsaSignal);
+                let dep_count = u32::from(lists.dependency.is_some());
+                let rc = unsafe { copy(&lists.op, 1, dep_count, deps) };
+                if rc == HSA_STATUS_SUCCESS {
+                    Ok(())
+                } else {
+                    Err(CopyIssue::Unretired(rc))
+                }
+            },
+        )
+    }
+
     /// Probe and initialise the HSA backend for `device_ordinal`-th GPU agent.
     pub fn new(device_ordinal: u8) -> Result<Self> {
         let drv = HsaDriver::open()?;
@@ -1339,11 +1856,15 @@ impl HsaBackend {
         // *dynamic* budget opted into with `cuFuncSetAttribute` and has no
         // bearing here: the AMD interpreter's arena is `__shared__ plow_smem sm`,
         // static, and every dispatch passes `dynamic_lds = 0`.)
-        const CDNA_WORKGROUP_LDS_MAX: u32 = 160 * 1024;
+        // Only gfx950 (CDNA4) raised the per-workgroup ceiling; gfx942 and gfx12 cap at 64 KiB.
+        const CDNA4_WORKGROUP_LDS_MAX: u32 = 160 * 1024;
+        const WORKGROUP_LDS_MAX: u32 = 64 * 1024;
         let lds_bytes = if reg_acc.lds_bytes > 0 {
             reg_acc.lds_bytes
+        } else if device_name.starts_with("gfx950") {
+            CDNA4_WORKGROUP_LDS_MAX
         } else {
-            CDNA_WORKGROUP_LDS_MAX
+            WORKGROUP_LDS_MAX
         };
 
         // Find coarse-grained VRAM pool on this GPU.
@@ -1355,6 +1876,8 @@ impl HsaBackend {
             host_agent,
             HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED,
         )?;
+        let peer_pool = Self::find_pool(&drv, agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED)
+            .unwrap_or(vram_pool);
         // Find kernarg pool on the host agent.
         let kernarg_pool = Self::find_pool(
             &drv,
@@ -1422,7 +1945,10 @@ impl HsaBackend {
         // kernarg pool.
         let ring_bytes = QUEUE_SIZE as usize * KARG_SLOT;
         let mut karg_ring: *mut c_void = std::ptr::null_mut();
+        // The BAR-write readback publish is CLR's gfx94x protocol; a PCIe dGPU (gfx10+) also needs
+        // an HDP flush that this path does not issue, so those use the host kernarg pool.
         let karg_vram = crate::config::RuntimeConfig::get().amd_kernarg_vram()
+            && device_name.starts_with("gfx9")
             && unsafe {
                 vram_kernarg_ring(
                     &drv,
@@ -1483,12 +2009,9 @@ impl HsaBackend {
         );
         let shared = Arc::new(SharedDriver { drv });
 
-        // CDNA (gfx8xx, gfx9xx) is wave64; RDNA (gfx10xx, gfx11xx) is wave32.
-        let wave_width = if device_name.starts_with("gfx9") || device_name.starts_with("gfx8") {
-            64
-        } else {
-            32
-        };
+        // Every plow AMD object is built wave64; RDNA (gfx10+) objects run in wave64 mode
+        // (-mwavefrontsize64), so the dispatch width is 64 lanes per wave on every arch.
+        let wave_width = 64;
 
         Ok(HsaBackend {
             shared,
@@ -1498,6 +2021,7 @@ impl HsaBackend {
             agents,
             cpu_agent: host_agent,
             vram_pool,
+            peer_pool,
             fine_pool,
             kernarg_pool,
             queue,
@@ -1525,6 +2049,8 @@ impl HsaBackend {
             vmm_provenance: parking_lot::Mutex::new(super::provenance::VmmProvenance::default()),
             poisoned: std::sync::OnceLock::new(),
             copy_tier: parking_lot::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            stage_fences: Default::default(),
         })
     }
 
@@ -1536,6 +2062,18 @@ impl HsaBackend {
             return Ok(());
         }
         Err(self.fault(rc, what))
+    }
+
+    fn check_vram_allocation(&self, rc: i32, bytes: u64, what: &str) -> Result<()> {
+        if rc == 0x1008 && self.device_name == "gfx1201" {
+            let available = crate::memory::vmm::VmmOps::free_bytes(self)
+                .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());
+            return Err(RuntimeError::Rejected(format!(
+                "AMD VRAM capacity exhausted: allocation requested {bytes} bytes, available {available} bytes, device capacity {} bytes; use fewer decode slots or a lower max_ctx",
+                self.vram_bytes()
+            )));
+        }
+        self.check(rc, what)
     }
 
     /// [`HsaBackend::check`]'s error-building half, for sites that must run
@@ -1553,6 +2091,13 @@ impl HsaBackend {
     /// Has a fatal ROCr status permanently poisoned this agent?
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.get().is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn quarantine_staging(&self, error: &RuntimeError) -> RuntimeError {
+        let info = super::host_region::unretired_copy(error);
+        self.mark_poisoned(&info);
+        RuntimeError::DeviceFault { info }
     }
 
     /// Record the fault that killed the agent. Logs `error!` exactly once —
@@ -1716,7 +2261,11 @@ impl Backend for HsaBackend {
                 &mut ptr,
             )
         };
-        self.check(rc, &format!("hsa_amd_memory_pool_allocate({bytes} bytes)"))?;
+        self.check_vram_allocation(
+            rc,
+            bytes,
+            &format!("hsa_amd_memory_pool_allocate({bytes} bytes)"),
+        )?;
         let free = Arc::new(HsaFree {
             shared: self.shared.clone(),
         });
@@ -2231,14 +2780,12 @@ impl PeerMemory for HsaBackend {
             })?);
         }
 
-        // COARSE-grained VRAM, exactly as an ordinary weight/activation
-        // allocation: fine-grained would put the partials on the slow
-        // host-coherent path, and the whole point is that a peer store runs at
-        // the ~58 GB/s XGMI wire rate.
+        // `peer_pool`: the fine-grained VRAM every CDNA TP run has used (system-scope
+        // atomics on coarse memory carry no coherence guarantee there).
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_pool_allocate)(
-                self.vram_pool,
+                self.peer_pool,
                 bytes as usize,
                 0,
                 &mut ptr,
@@ -3347,17 +3894,45 @@ impl HsaBackend {
             self.guard()?;
             return Ok(value);
         }
-        let value = unsafe {
-            (self.shared.drv.hsa_signal_wait_scacquire)(
-                self.done_signal,
-                HSA_SIGNAL_CONDITION_LT,
-                1,
-                u64::MAX,
-                state,
-            )
-        };
-        self.guard()?;
-        Ok(value)
+        static HANG_S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let hang_s = *HANG_S.get_or_init(|| crate::config::RuntimeConfig::get().amd.hang_timeout_s);
+        let t0 = std::time::Instant::now();
+        loop {
+            let value = unsafe {
+                (self.shared.drv.hsa_signal_wait_scacquire)(
+                    self.done_signal,
+                    HSA_SIGNAL_CONDITION_LT,
+                    1,
+                    if hang_s == 0 { u64::MAX } else { 1_000_000_000 },
+                    state,
+                )
+            };
+            self.guard()?;
+            if value < 1 {
+                return Ok(value);
+            }
+            if hang_s != 0 && t0.elapsed().as_secs() >= hang_s {
+                let (rd, wr) = unsafe {
+                    (
+                        (self.shared.drv.hsa_queue_load_read_index_scacquire)(self.queue),
+                        (self.shared.drv.hsa_queue_load_write_index_scacquire)(self.queue),
+                    )
+                };
+                tracing::error!(
+                    device = self.device_ordinal,
+                    in_flight = value,
+                    read_index = rd,
+                    write_index = wr,
+                    secs = hang_s,
+                    "HSA queue drain timed out: a dispatch never completed"
+                );
+                return Err(RuntimeError::Device(format!(
+                    "HSA queue drain timed out after {hang_s} s on device {}: {value} dispatch(es) \
+                     in flight, AQL read index {rd}, write index {wr} (PLOW_AMD_HANG_TIMEOUT_S)",
+                    self.device_ordinal
+                )));
+            }
+        }
     }
 
     /// Create an event. `timing` selects whether the event carries a clock.
@@ -4317,6 +4892,100 @@ impl HsaBackend {
 ///   ordinal, so the physical block lands in this agent's coarse-grained VRAM
 ///   by construction; the CUDA path encodes the same intent in
 ///   `CUmemAllocationProp::location`.
+#[cfg(target_os = "linux")]
+impl super::host_region::HostStaging for HsaBackend {
+    fn staging_vendor(&self) -> hwspec::Vendor {
+        hwspec::Vendor::Amd
+    }
+
+    unsafe fn host_register(&self, ptr: *mut u8, len: usize) -> Result<u64> {
+        self.guard()?;
+        let mut agent_ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the caller keeps the range mapped until `host_unregister`. Every GPU agent is
+        // named in the one call, so every AMD device of the process can copy through it.
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_lock)(
+                ptr as *mut c_void,
+                len,
+                self.agents.as_ptr(),
+                self.agents.len() as u32,
+                &mut agent_ptr,
+            )
+        };
+        self.check(rc, "hsa_amd_memory_lock (host region)")?;
+        Ok(agent_ptr as u64)
+    }
+
+    unsafe fn host_unregister(&self, ptr: *mut u8) {
+        // SAFETY: the caller's contract: locked here, no copy in flight.
+        let rc = unsafe { (self.shared.drv.hsa_amd_memory_unlock)(ptr as *mut c_void) };
+        if rc != HSA_STATUS_SUCCESS {
+            tracing::warn!(rc, "hsa_amd_memory_unlock (host region) failed");
+        }
+    }
+
+    fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64> {
+        self.stage_fences.submit(|dependency| {
+            self.fenced_copy(
+                host,
+                self.cpu_agent,
+                src,
+                self.agent,
+                bytes,
+                "hsa_amd_memory_async_copy (staging D2H)",
+                dependency,
+            )
+        })
+    }
+
+    fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64> {
+        self.stage_fences.submit(|dependency| {
+            self.fenced_copy(
+                dst,
+                self.agent,
+                host,
+                self.cpu_agent,
+                bytes,
+                "hsa_amd_memory_async_copy (staging H2D)",
+                dependency,
+            )
+        })
+    }
+
+    fn stage_batch(&self, spans: &[(u64, u64, u64)], export: bool) -> (Option<u64>, Result<()>) {
+        if !spans.is_empty() && spans.len() <= u16::MAX as usize {
+            if let Some(copy) = self.shared.drv.hsa_amd_memory_async_batch_copy {
+                return self.queue_vendor_image_batch(spans, export, copy);
+            }
+        }
+        let linear = || {
+            self.queue_image_batch(spans.len(), spans.len(), export, None, |i, dep, sig, _| {
+                self.issue_image_copy(ImageCopy::linear(spans[i]), export, dep, sig)
+            })
+        };
+        if self.shared.drv.hsa_amd_memory_async_copy_rect.is_none() {
+            return linear();
+        }
+        let copies = image_copy_rects(spans);
+        if copies.len() == spans.len() {
+            return linear();
+        }
+        let result =
+            self.queue_image_batch(spans.len(), copies.len(), export, None, |i, dep, sig, _| {
+                self.issue_image_copy(copies[i], export, dep, sig)
+            });
+        retry_image_batch(result, |fence| self.stage_wait(fence), linear)
+    }
+
+    fn stage_wait(&self, fence: u64) -> Result<()> {
+        self.stage_fences.wait(
+            fence,
+            |f| crate::memory::vmm::VmmOps::fence_wait(self, f),
+            |f| crate::memory::vmm::VmmOps::fence_done(self, f),
+        )
+    }
+}
+
 impl crate::memory::vmm::VmmOps for HsaBackend {
     fn allocation_provenance(
         &self,
@@ -4409,7 +5078,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
                 &mut h,
             )
         };
-        self.check(rc, &format!("hsa_amd_vmem_handle_create({bytes} B)"))?;
+        self.check_vram_allocation(rc, bytes, &format!("hsa_amd_vmem_handle_create({bytes} B)"))?;
         provenance.created(h.handle, bytes);
         Ok(h.handle)
     }
@@ -4487,8 +5156,9 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
                 &mut ptr,
             )
         };
-        self.check(
+        self.check_vram_allocation(
             rc,
+            bytes,
             &format!("hsa_amd_memory_pool_allocate(vmm snapshot, {bytes} B)"),
         )?;
         self.vmm_provenance.lock().allocated(ptr as u64, bytes);
@@ -4581,48 +5251,27 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
     }
 
     fn copy_dtoh_async(&self, host_ptr: u64, va: u64, bytes: u64) -> Result<u64> {
-        self.guard()?;
-        let mut tier_lock = self.copy_tier.lock();
-        let tier = match tier_lock.as_mut() {
-            Some(t) => t,
-            None => tier_lock.insert(HsaCopyTier {
-                signals: rustc_hash::FxHashMap::default(),
-                spare: Vec::new(),
-                failed: rustc_hash::FxHashSet::default(),
-            }),
-        };
-        let sig = match tier.spare.pop() {
-            Some(s) => {
-                unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
-                s
-            }
-            None => {
-                let mut s = HsaSignal { handle: 0 };
-                let rc =
-                    unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s) };
-                self.check(rc, "hsa_signal_create (vmm spill)")?;
-                s
-            }
-        };
-        let rc = unsafe {
-            (self.shared.drv.hsa_amd_memory_async_copy)(
-                host_ptr as *mut c_void,
-                self.cpu_agent,
-                va as *const c_void,
-                self.agent,
-                bytes as usize,
-                0,
-                std::ptr::null(),
-                sig,
-            )
-        };
-        let fence = sig.handle as u64;
-        if rc != HSA_STATUS_SUCCESS {
-            tier.spare.push(sig);
-            return Err(self.fault(rc, "hsa_amd_memory_async_copy (vmm spill D2H)"));
-        }
-        tier.signals.insert(fence, sig);
-        Ok(fence)
+        self.fenced_copy(
+            host_ptr,
+            self.cpu_agent,
+            va,
+            self.agent,
+            bytes,
+            "hsa_amd_memory_async_copy (vmm spill D2H)",
+            None,
+        )
+    }
+
+    fn copy_htod_async(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<u64> {
+        self.fenced_copy(
+            va,
+            self.agent,
+            host_ptr,
+            self.cpu_agent,
+            bytes,
+            "hsa_amd_memory_async_copy (H2D async)",
+            None,
+        )
     }
 
     fn fence_done(&self, fence: u64) -> Result<bool> {
@@ -4640,7 +5289,14 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         if val >= 1 {
             return Ok(false);
         }
+        if val < 0 {
+            tier.signals.remove(&fence);
+            return Err(RuntimeError::Device(format!(
+                "async copy failed (signal {val})"
+            )));
+        }
         let sig = tier.signals.remove(&fence).expect("checked above");
+        tier.image_lists.remove(&fence);
         tier.spare.push(sig);
         Ok(true)
     }
@@ -4650,24 +5306,15 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         let Some(tier) = tier_lock.as_mut() else {
             return Err(RuntimeError::Rejected("vmm spill: no copy tier".into()));
         };
-        let Some(sig) = tier.signals.remove(&fence) else {
-            return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
-        };
-        if tier.failed.remove(&fence) {
-            tier.spare.push(sig);
-            return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
-        }
-        unsafe {
+        tier.wait_copy(fence, |sig| unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
                 sig,
                 HSA_SIGNAL_CONDITION_LT,
                 1,
                 u64::MAX,
                 HSA_WAIT_STATE_BLOCKED,
-            );
-        }
-        tier.spare.push(sig);
-        Ok(())
+            )
+        })
     }
 
     fn copy_htod(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<()> {
@@ -4679,6 +5326,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
                 signals: rustc_hash::FxHashMap::default(),
                 spare: Vec::new(),
                 failed: rustc_hash::FxHashSet::default(),
+                image_lists: Default::default(),
             }),
         };
         let sig = match tier.spare.pop() {
@@ -4757,6 +5405,369 @@ mod scrub_tests {
 #[cfg(test)]
 mod tests {
     use super::{host_agent_for, page_node, publish_device_kernarg, write_kernarg, HsaAgent};
+
+    #[test]
+    fn image_rect_abi_matches_hsa_headers() {
+        use super::{HsaDim3, HsaPitchedPtr};
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<HsaPitchedPtr>(), 3 * size_of::<usize>());
+        assert_eq!(align_of::<HsaPitchedPtr>(), align_of::<usize>());
+        assert_eq!(offset_of!(HsaPitchedPtr, pitch), size_of::<usize>());
+        assert_eq!(offset_of!(HsaPitchedPtr, slice), 2 * size_of::<usize>());
+        assert_eq!(size_of::<HsaDim3>(), 12);
+        assert_eq!(align_of::<HsaDim3>(), 4);
+        assert_eq!(offset_of!(HsaDim3, y), 4);
+        assert_eq!(offset_of!(HsaDim3, z), 8);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn multi_copy_abi_matches_pinned_header() {
+        use super::{HsaCopyAfter, HsaCopyOp, HsaCopyWait};
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<HsaCopyOp>(), 128);
+        assert_eq!(align_of::<HsaCopyOp>(), 8);
+        assert_eq!(offset_of!(HsaCopyOp, src_list), 16);
+        assert_eq!(offset_of!(HsaCopyOp, src_agent), 24);
+        assert_eq!(offset_of!(HsaCopyOp, dst_agents), 32);
+        assert_eq!(offset_of!(HsaCopyOp, dst_list), 40);
+        assert_eq!(offset_of!(HsaCopyOp, size_list), 48);
+        assert_eq!(offset_of!(HsaCopyOp, wait), 64);
+        assert_eq!(offset_of!(HsaCopyOp, signal), 96);
+        assert_eq!(offset_of!(HsaCopyOp, reserved), 120);
+        assert_eq!(size_of::<HsaCopyWait>(), 32);
+        assert_eq!(size_of::<HsaCopyAfter>(), 24);
+    }
+
+    #[test]
+    fn multi_copy_metadata_survives_moving_its_owner() {
+        let spans = [
+            (0x1000, 0x1000_0000, 4),
+            (0x2000, 0x2000_0000, 1024),
+            (0x10000, 0x3000_0000, 256_000),
+        ];
+        for export in [false, true] {
+            let mut copy = super::BatchCopies::new(
+                &spans,
+                export,
+                HsaAgent { handle: 17 },
+                HsaAgent { handle: 19 },
+            )
+            .unwrap();
+            copy.op.completion = super::HsaSignal { handle: 71 };
+            copy.dependency = Some(super::HsaSignal { handle: 37 });
+            let addr = &copy.op as *const _ as usize;
+            let mut pending = rustc_hash::FxHashMap::default();
+            pending.insert(71, copy);
+            let copy = pending.get(&71).unwrap();
+            assert_eq!(&copy.op as *const _ as usize, addr);
+            assert_eq!(copy.op.version, 1);
+            assert_eq!(copy.op.type_, 0);
+            assert_eq!(copy.op.num_entries, 3);
+            assert_eq!(copy.op.completion.handle, 71);
+            assert_eq!(copy.dependency.as_ref().unwrap().handle, 37);
+            assert_eq!(copy.op.src_agent.handle, 17);
+            // The driver reads these caller-owned arrays through the retained descriptor.
+            let src = unsafe { std::slice::from_raw_parts(copy.op.src_list, spans.len()) };
+            let dst = unsafe { std::slice::from_raw_parts(copy.op.dst_list, spans.len()) };
+            let sizes = unsafe { std::slice::from_raw_parts(copy.op.size_list, spans.len()) };
+            let agents =
+                unsafe { std::slice::from_raw_parts(copy.op.dst_agents.list, spans.len()) };
+            for (i, &(host, device, bytes)) in spans.iter().enumerate() {
+                assert_eq!(
+                    (src[i] as u64, dst[i] as u64),
+                    if export {
+                        (device, host)
+                    } else {
+                        (host, device)
+                    }
+                );
+                assert_eq!(sizes[i] as u64, bytes);
+                assert_eq!(agents[i].handle, 19);
+            }
+            assert_eq!(copy.op.traffic_class, 0);
+            assert_eq!(copy.op.reserved_size, 0);
+            assert_eq!(copy.op.wait.function, 0);
+            assert_eq!(copy.op.signal.operation, 0);
+            assert_eq!(copy.op.reserved, [0]);
+        }
+        assert!(super::BatchCopies::new(
+            &[],
+            false,
+            HsaAgent { handle: 17 },
+            HsaAgent { handle: 19 }
+        )
+        .is_err());
+        assert!(super::BatchCopies::new(
+            &vec![(0, 0, 4); u16::MAX as usize + 1],
+            false,
+            HsaAgent { handle: 17 },
+            HsaAgent { handle: 19 }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn image_metadata_retires_only_after_proven_copy_completion() {
+        use super::{BatchCopies, HsaCopyTier, HsaSignal};
+        let pending = |failed: bool| {
+            let mut copies = BatchCopies::new(
+                &[(0x1000, 0x10000, 4)],
+                false,
+                HsaAgent { handle: 17 },
+                HsaAgent { handle: 19 },
+            )
+            .unwrap();
+            copies.op.completion = HsaSignal { handle: 41 };
+            copies.dependency = Some(HsaSignal { handle: 37 });
+            HsaCopyTier {
+                signals: [(41, HsaSignal { handle: 41 })].into_iter().collect(),
+                spare: Vec::new(),
+                failed: if failed {
+                    [41].into_iter().collect()
+                } else {
+                    Default::default()
+                },
+                image_lists: [(41, copies)].into_iter().collect(),
+            }
+        };
+        for failed in [true, false] {
+            let mut tier = pending(failed);
+            let ptr = &tier.image_lists[&41].op as *const _;
+            let mut waits = 0;
+            assert!(tier
+                .wait_copy(41, |sig| {
+                    assert!(!failed, "unproven admission must not enter the vendor wait");
+                    assert_eq!(sig.handle, 41);
+                    waits += 1;
+                    -1
+                })
+                .is_err());
+            assert_eq!(waits, usize::from(!failed));
+            assert!(tier.signals.is_empty());
+            assert!(tier.spare.is_empty());
+            assert_eq!(&tier.image_lists[&41].op as *const _, ptr);
+            assert_eq!(tier.image_lists[&41].dependency.unwrap().handle, 37);
+            assert!(tier
+                .wait_copy(41, |_| panic!("failed fence cannot be retried"))
+                .is_err());
+            assert_eq!(tier.image_lists.len(), 1);
+            assert!(tier.spare.is_empty());
+        }
+        let mut tier = pending(false);
+        assert!(tier.wait_copy(99, |_| panic!("unknown fence")).is_err());
+        assert_eq!(tier.image_lists.len(), 1);
+        let mut waits = 0;
+        tier.wait_copy(41, |sig| {
+            assert_eq!(sig.handle, 41);
+            waits += 1;
+            if waits == 1 {
+                1
+            } else {
+                0
+            }
+        })
+        .unwrap();
+        assert_eq!(waits, 2);
+        assert!(tier.signals.is_empty());
+        assert!(tier.image_lists.is_empty());
+        assert_eq!(tier.spare.len(), 1);
+        assert_eq!(tier.spare[0].handle, 41);
+        assert!(tier.wait_copy(41, |_| panic!("retired fence")).is_err());
+        assert_eq!(tier.spare.len(), 1);
+    }
+
+    #[test]
+    fn unproven_submission_never_cancels_unknown_completions() {
+        use std::cell::Cell;
+        for rejected in [0, 4, 7] {
+            let signal = Cell::new(8);
+            let result = super::submit_counted(
+                8,
+                |i| {
+                    if i == rejected {
+                        return Err(super::CopyIssue::Unretired(0x1008));
+                    }
+                    signal.set(signal.get() - 1);
+                    Ok(())
+                },
+                |_| panic!("cannot adjust a potentially submitted operation"),
+            );
+            assert_eq!(result, Err((rejected, super::CopyIssue::Unretired(0x1008))));
+            assert_eq!(signal.get(), 8 - rejected);
+        }
+    }
+
+    fn expanded_image_copies(spans: &[(u64, u64, u64)]) -> Vec<(u64, u64, u64)> {
+        super::image_copy_rects(spans)
+            .iter()
+            .flat_map(|c| {
+                (0..c.rows).map(|r| {
+                    (
+                        c.host + c.bytes * u64::from(r),
+                        c.device + c.pitch as u64 * u64::from(r),
+                        c.bytes,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn image_rects_expand_regular_heads_and_irregular_spans_exactly() {
+        let width = 256_000u64;
+        let spans: Vec<_> = (0..56u64)
+            .flat_map(|group| {
+                (0..8u64).map(move |head| {
+                    (
+                        0x1000_0000 + (group * 8 + head) * width,
+                        0x1_0000_0000 + group * (64 << 20) + head * (2 << 20),
+                        width,
+                    )
+                })
+            })
+            .collect();
+        let copies = super::image_copy_rects(&spans);
+        assert_eq!(copies.len(), 56);
+        assert!(copies.iter().all(|c| c.rows == 8 && c.pitch == 2 << 20));
+        assert_eq!(expanded_image_copies(&spans), spans);
+        let mut irregular = spans;
+        irregular[4].1 += 4;
+        irregular[16].0 += 8;
+        irregular[30].1 = irregular[29].1 - 4;
+        irregular[44].2 -= 4;
+        assert_eq!(expanded_image_copies(&irregular), irregular);
+        assert!(super::image_copy_rects(&[]).is_empty());
+    }
+
+    #[test]
+    fn image_rects_keep_invalid_geometry_linear() {
+        for spans in [
+            [(0x1002, 0x2000, 4), (0x1006, 0x3000, 4)],
+            [(0x1000, 0x2002, 4), (0x1004, 0x3002, 4)],
+            [(0x1000, 0x2000, 3), (0x1003, 0x3000, 3)],
+            [
+                (0x1000, 0x2000, 1 << 32),
+                (0x1_0000_1000, 0x2_0000_2000, 1 << 32),
+            ],
+            [(u64::MAX - 3, 0x2000, 4), (0, 0x3000, 4)],
+            [(0x1000, 0x2000, 4), (0x1004, 0x8000_0000_0000_2000, 4)],
+            [(0x1000, 0x3000, 4), (0x1004, 0x2000, 4)],
+            [(0x1000, 0x2000, 8), (0x1008, 0x2004, 8)],
+            [(0x1000, 0x2000, 4), (0x1008, 0x3000, 4)],
+            [(0x1000, 0x2000, 4), (0x1004, 0x3000, 8)],
+        ] {
+            assert!(
+                super::image_copy_rects(&spans).iter().all(|c| c.rows == 1),
+                "{spans:?}"
+            );
+            assert_eq!(expanded_image_copies(&spans), spans);
+        }
+    }
+
+    #[test]
+    fn counted_submission_handles_rejection_and_racing_completion() {
+        use std::cell::Cell;
+        for rejected in [None, Some(0), Some(4), Some(7)] {
+            for early in [0, 1, 2] {
+                let signal = Cell::new(8i64);
+                let pending = Cell::new(0);
+                let accepted = Cell::new(0);
+                let canceled = Cell::new(0);
+                let result = super::submit_counted(
+                    8,
+                    |i| {
+                        if rejected == Some(i) {
+                            return Err(super::CopyIssue::Rejected(0x1001));
+                        }
+                        accepted.set(accepted.get() + 1);
+                        if early == 2 || (early == 1 && i % 2 == 0) {
+                            signal.set(signal.get() - 1);
+                        } else {
+                            pending.set(pending.get() + 1);
+                        }
+                        Ok(())
+                    },
+                    |n| {
+                        canceled.set(n);
+                        signal.set(signal.get() - n as i64);
+                    },
+                );
+                assert_eq!(accepted.get(), rejected.unwrap_or(8));
+                assert_eq!(canceled.get(), rejected.map_or(0, |i| 8 - i));
+                assert_eq!(
+                    result,
+                    rejected.map_or(Ok(()), |i| Err((i, super::CopyIssue::Rejected(0x1001))))
+                );
+                assert_eq!(signal.get(), pending.get());
+                signal.set(signal.get() - pending.get());
+                assert_eq!(signal.get(), 0);
+            }
+        }
+        assert!(super::submit_counted(
+            0,
+            |_| panic!("empty submission"),
+            |_| panic!("empty cancellation")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn image_rect_retry_drains_prior_or_partial_fence_and_preserves_failure() {
+        use std::cell::RefCell;
+        let result = super::retry_image_batch(
+            (Some(90), Ok(())),
+            |_| panic!("the caller owns successful completion"),
+            || panic!("successful rectangles need no retry"),
+        );
+        assert_eq!(result.0, Some(90));
+        assert!(result.1.is_ok());
+        for fence in [None, Some(91)] {
+            let events = RefCell::new(Vec::new());
+            let result = super::retry_image_batch(
+                (fence, Err(super::hsa_fault(0x1001, "rect"))),
+                |f| {
+                    assert_eq!(Some(f), fence);
+                    events.borrow_mut().push("drain");
+                    Ok(())
+                },
+                || {
+                    events.borrow_mut().push("linear");
+                    (Some(92), Ok(()))
+                },
+            );
+            assert_eq!(result.0, Some(92));
+            assert!(result.1.is_ok());
+            assert_eq!(
+                *events.borrow(),
+                if fence.is_some() {
+                    vec!["drain", "linear"]
+                } else {
+                    vec!["linear"]
+                }
+            );
+        }
+        let failed = || crate::RuntimeError::Device("negative completion".into());
+        let result = super::retry_image_batch(
+            (Some(91), Err(super::hsa_fault(0x1001, "rect"))),
+            |_| Err(failed()),
+            || panic!("cannot retry with unretired DMA"),
+        );
+        assert_eq!(result.0, Some(91));
+        assert!(result.1.is_err());
+        let mut info = super::hsa_fault(0x1001, "rect")
+            .device_fault()
+            .unwrap()
+            .clone();
+        info.fatal = true;
+        let result = super::retry_image_batch(
+            (Some(91), Err(crate::RuntimeError::DeviceFault { info })),
+            |_| panic!("caller must handle fatal drain"),
+            || panic!("cannot retry a poisoned backend"),
+        );
+        assert_eq!(result.0, Some(91));
+        assert!(result.1.unwrap_err().is_fatal());
+    }
 
     #[test]
     #[ignore = "requires queued gfx950 and PLOW_TEST_AITER_DIR with frozen retirement test object"]

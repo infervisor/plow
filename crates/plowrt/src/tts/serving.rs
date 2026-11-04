@@ -982,7 +982,7 @@ async fn speech_with(
     let (mux, bundle, pipeline) = loop {
         let routed = match dp.as_deref() {
             Some(set) => {
-                if let Err(e) = state.dp_admit(set).await {
+                if let Err(e) = state.dp_admit(set, false).await {
                     return e.with_retry_after(crate::serve::api_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         e.to_string(),
@@ -992,7 +992,7 @@ async fn speech_with(
                     ));
                 }
                 state
-                    .dp_route(set, ids.session.as_deref(), None, exclude)
+                    .dp_route(set, ids.session.as_deref(), None, exclude, false)
                     .map(|(rank, mux, _, _)| {
                         exclude |= 1 << rank;
                         key.clone_from(&set.ranks[rank].key);
@@ -1286,6 +1286,9 @@ async fn speech_with(
         round: 0,
         cached: None,
         mm: None,
+        export: None,
+        import: None,
+        prompt_logprobs: false,
     };
     let job = crate::serve::mux::Job {
         prompt_ids: first.prompt_ids,
@@ -1944,6 +1947,9 @@ impl Later {
             round: 0,
             cached: None,
             mm: None,
+            export: None,
+            import: None,
+            prompt_logprobs: false,
         };
         let job = crate::serve::mux::Job {
             prompt_ids: s.prompt_ids,

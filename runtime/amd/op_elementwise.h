@@ -288,6 +288,18 @@ __device__ void d_embed(bf16* __restrict__ out, const bf16* __restrict__ table,
     }
 }
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+__device__ void d_embed_residual_f32(float* out, const bf16* table, const int* ids,
+                                    unsigned rows, unsigned feat, float scale,
+                                    unsigned slice, unsigned nblk) {
+    auto* dst = as_glob(out);
+    const auto* src = as_glob(table);
+    for (unsigned row = slice; row < rows; row += nblk)
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS)
+            dst[(size_t)row * feat + i] = bf2f(src[(size_t)ids[row] * feat + i]) * scale;
+}
+#endif
+
 /* Compact hidden-row gather — the unified token batch's terminal row selection.
  *
  * out[s][h] = x[rows[s]][h], for s in [0, S), over H features.
@@ -327,6 +339,126 @@ __device__ __attribute__((noinline)) void d_row_gather(bf16* __restrict__ out,
             for (unsigned i = threadIdx.x; i < hidden; i += PLOW_THREADS)
                 st_act1(&out[dst + i], x[src + i]);
         }
+    }
+}
+
+/* EmbedOverlayBf16 (op 179): overlay row substitution by index. */
+__device__ __attribute__((noinline)) void d_embed_overlay(
+    bf16* __restrict__ out, const bf16* __restrict__ table,
+    const unsigned* __restrict__ tokens, const float* __restrict__ overlay,
+    const unsigned* __restrict__ overlay_index, unsigned rows, unsigned width,
+    unsigned vocab, unsigned overlay_rows, unsigned slice, unsigned nblk) {
+    const auto* tg = as_glob(table);
+    auto* og = as_glob(out);
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned sel = overlay_index[r];
+        if (sel == 0xFFFFFFFEu) continue;
+        if (sel == 0xFFFFFFFFu) {
+            if (tokens[r] >= vocab) { __builtin_trap(); return; }
+            const size_t src = (size_t)tokens[r] * width, dst = (size_t)r * width;
+            if ((width & 7u) == 0) {
+                for (unsigned i = threadIdx.x * 8; i < width; i += PLOW_THREADS * 8)
+                    st_glob8(og + dst + i, ld_glob8(tg + src + i));
+            } else {
+                for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS)
+                    st_act1(&out[dst + i], table[src + i]);
+            }
+        } else {
+            if (sel >= overlay_rows) { __builtin_trap(); return; }
+            const float* src = overlay + (size_t)sel * width;
+            const size_t dst = (size_t)r * width;
+            if ((width & 7u) == 0) {
+                for (unsigned i = threadIdx.x * 8; i < width; i += PLOW_THREADS * 8) {
+                    bf16v8 o;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) o[j] = f2bf(src[i + j]);
+                    st_glob8(og + dst + i, o);
+                }
+            } else {
+                for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS)
+                    st_act1(&out[dst + i], f2bf(src[i]));
+            }
+        }
+    }
+}
+
+/* EmbedPosBf16 (op 194): out[r] = bf16(table[tokens[r]] + pos_table[pos[r] - base[r]]). */
+__device__ __attribute__((noinline)) void d_embed_pos(
+    bf16* __restrict__ out, const bf16* __restrict__ table,
+    const unsigned* __restrict__ tokens, const bf16* __restrict__ pos_table,
+    const unsigned* __restrict__ pos, const unsigned* __restrict__ base,
+    unsigned rows, unsigned width, unsigned vocab, unsigned pos_rows,
+    unsigned slice, unsigned nblk) {
+    const auto* tg = as_glob(table);
+    const auto* ptg = as_glob(pos_table);
+    auto* og = as_glob(out);
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned p = pos[r] - base[r];
+        if (tokens[r] >= vocab || pos[r] < base[r] || p >= pos_rows) { __builtin_trap(); return; }
+        const size_t src_t = (size_t)tokens[r] * width;
+        const size_t src_p = (size_t)p * width;
+        const size_t dst = (size_t)r * width;
+        if ((width & 7u) == 0) {
+            for (unsigned i = threadIdx.x * 8; i < width; i += PLOW_THREADS * 8) {
+                const bf16v8 a = ld_glob8(tg + src_t + i);
+                const bf16v8 b = ld_glob8(ptg + src_p + i);
+                bf16v8 o;
+#pragma unroll
+                for (int j = 0; j < 8; j++) o[j] = f2bf(bf2f(a[j]) + bf2f(b[j]));
+                st_glob8(og + dst + i, o);
+            }
+        } else {
+            for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS)
+                st_act1(&out[dst + i], f2bf(bf2f(table[src_t + i]) + bf2f(pos_table[src_p + i])));
+        }
+    }
+}
+
+/* EmbedFrameBf16 (op 218): frame token adds K codebook rows, / div, optional RMSNorm. */
+__device__ __attribute__((noinline)) void d_embed_frame(
+    bf16* __restrict__ out, const bf16* __restrict__ table,
+    const unsigned* __restrict__ tokens, const bf16* __restrict__ cb,
+    const unsigned* __restrict__ codes, const float* __restrict__ nw,
+    unsigned rows, unsigned width, unsigned vocab, unsigned K,
+    unsigned cb_size, unsigned frame_lo, unsigned frame_rows, unsigned mode,
+    float div, float eps, unsigned slice, unsigned nblk, float* arena) {
+    const auto* tg = as_glob(table);
+    auto* og = as_glob(out);
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned tok = tokens[r];
+        if (tok >= vocab) { __builtin_trap(); return; }
+        const size_t src_tok = (size_t)tok * width;
+        const size_t dst = (size_t)r * width;
+        if (tok - frame_lo >= frame_rows) {
+            if ((width & 7u) == 0) {
+                for (unsigned i = threadIdx.x * 8; i < width; i += PLOW_THREADS * 8)
+                    st_glob8(og + dst + i, ld_glob8(tg + src_tok + i));
+            } else {
+                for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS)
+                    st_act1(&out[dst + i], table[src_tok + i]);
+            }
+            continue;
+        }
+        const unsigned* c = codes + (size_t)r * K;
+        for (unsigned k = 0; k < K; k++)
+            if (c[k] >= cb_size) { __builtin_trap(); return; }
+        float ss = 0.0f;
+        for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS) {
+            float s = 0.0f;
+            for (unsigned k = 0; k < K; k++)
+                s += bf2f(cb[((size_t)k * cb_size + c[k]) * width + i]);
+            const float sb = bf2f(f2bf(s));
+            const float t = (mode & 1u) ? sb : bf2f(f2bf(bf2f(table[src_tok + i]) + sb));
+            const bf16 val = f2bf(t / div);
+            st_act1(&out[dst + i], val);
+            const float y = bf2f(val);
+            ss += y * y;
+        }
+        if (!(mode & 2u)) continue;
+        const float inv = rsqrtf(rn_ss(block_sum(ss, arena)) / (float)width + eps);
+        for (unsigned i = threadIdx.x; i < width; i += PLOW_THREADS)
+            st_act1(&out[dst + i], f2bf(bf2f(out[dst + i]) * inv * nw[i]));
+        __syncthreads();
     }
 }
 

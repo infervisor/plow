@@ -567,11 +567,31 @@ __device__ __forceinline__ void d_xreduce(bf16* out, const void* const* peer_scr
  *   deadline_ticks : s_memrealtime budget; if the fabric does not propagate the
  *                    system atomic the kernel bails (status |= 0xDEAD0000) instead of
  *                    hanging the queue. status may be NULL. */
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+__device__ __forceinline__ void d_xreduce_f32_parts(
+    bf16* out, const void* const* peer_scratch, uint32_t slot_bytes,
+    uint32_t nranks, uint32_t n, unsigned slice, unsigned nblk) {
+    for (uint32_t e = slice * PLOW_THREADS + threadIdx.x; e < n;
+         e += nblk * PLOW_THREADS) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < nranks; r++) {
+            const float* p = (const float*)((const char*)peer_scratch[r] + slot_bytes);
+            acc += as_glob(p)[e];
+        }
+        st_act1(&as_glob(out)[e], f2bf(acc));
+    }
+}
+#endif
+
 __device__ __forceinline__ void d_xreduce_oneshot(
     bf16* out, const void* const* peer_scratch, uint32_t* const* peer_gate,
     uint32_t nranks, uint32_t rank, uint32_t n, uint32_t slot_bytes,
     uint32_t gate_target, bool do_signal, uint64_t deadline_ticks, uint32_t* status,
-    unsigned slice, unsigned nblk) {
+    unsigned slice, unsigned nblk
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    , bool partial_f32 = false
+#endif
+    ) {
     __shared__ int bailed;
     if (threadIdx.x == 0) bailed = 0;
     __syncthreads();
@@ -580,9 +600,9 @@ __device__ __forceinline__ void d_xreduce_oneshot(
         for (uint32_t r = 0; r < nranks; r++) xctr_signal(peer_gate[r]);
 
     if (threadIdx.x == 0) {
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(peer_gate[rank]) < gate_target) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 bailed = 1;
                 break;
@@ -594,6 +614,10 @@ __device__ __forceinline__ void d_xreduce_oneshot(
     __syncthreads();
     if (bailed) return;
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    if (partial_f32) d_xreduce_f32_parts(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+    else
+#endif
     d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
 }
 
@@ -621,6 +645,9 @@ __device__ __forceinline__ void d_xreduce_mega(
 #if PLOW_XR_TRACE_PHASES
     , PlowTraceRec* xr_trace = nullptr
 #endif
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    , bool partial_f32 = false
+#endif
     ) {
     __shared__ int bailed;
 #if PLOW_XR_TRACE_PHASES
@@ -631,7 +658,7 @@ __device__ __forceinline__ void d_xreduce_mega(
      * for this opcode under the schema; scripts/k3_xr_decode_report.py reads it. */
     __shared__ uint64_t xr_entry;
     if (threadIdx.x == 0) {
-        xr_entry = __builtin_amdgcn_s_memrealtime();
+        xr_entry = plow_realtime();
         if (xr_trace) { xr_trace->t_arrive = xr_entry; xr_trace->cu = 0u; }
     }
 #endif
@@ -647,7 +674,7 @@ __device__ __forceinline__ void d_xreduce_mega(
             xctr_signal(PLOW_CTR(base, gate_id));
         }
 #if PLOW_XR_TRACE_PHASES
-        if (xr_trace) xr_trace->cu = xr_sat32(__builtin_amdgcn_s_memrealtime() - xr_entry);
+        if (xr_trace) xr_trace->cu = xr_sat32(plow_realtime() - xr_entry);
 #endif
     }
 #endif
@@ -662,14 +689,18 @@ __device__ __forceinline__ void d_xreduce_mega(
      * PLOW_CHAIN_BYPASS (knob-contract §7a-CHAIN): implementation cost zero, ceiling real. */
     if (threadIdx.x == 0) xctr_acquire();
     __syncthreads();
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    if (partial_f32) d_xreduce_f32_parts(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+    else
+#endif
     d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk, gslot_bytes, gcols, row_w);
     return;
 #endif
     if (threadIdx.x == 0) {
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(lg) < nranks) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 bailed = 1;
                 break;
@@ -677,7 +708,7 @@ __device__ __forceinline__ void d_xreduce_mega(
             __builtin_amdgcn_s_sleep(2);
         }
 #if PLOW_XR_TRACE_PHASES
-        if (xr_trace) xr_trace->pc = xr_sat32(__builtin_amdgcn_s_memrealtime() - xr_entry);
+        if (xr_trace) xr_trace->pc = xr_sat32(plow_realtime() - xr_entry);
 #endif
         if (!bailed) xctr_acquire();
 #if PLOW_XR_ACQ_N > 1
@@ -686,14 +717,18 @@ __device__ __forceinline__ void d_xreduce_mega(
     }
     __syncthreads();
 #if PLOW_XR_TRACE_PHASES
-    if (threadIdx.x == 0 && xr_trace) xr_trace->t_ready = __builtin_amdgcn_s_memrealtime();
+    if (threadIdx.x == 0 && xr_trace) xr_trace->t_ready = plow_realtime();
 #endif
     if (bailed) return;
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    if (partial_f32) d_xreduce_f32_parts(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+    else
+#endif
     d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk, gslot_bytes, gcols, row_w);
 #if PLOW_XR_TRACE_PHASES
     __syncthreads();
-    if (threadIdx.x == 0 && xr_trace) xr_trace->t_end = __builtin_amdgcn_s_memrealtime();
+    if (threadIdx.x == 0 && xr_trace) xr_trace->t_end = plow_realtime();
 #endif
 }
 
@@ -864,7 +899,7 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
      * workgroup waited for observed, t_ready = pc, t_end = reduce done. */
     __shared__ uint64_t xr_entry;
     if (threadIdx.x == 0) {
-        xr_entry = __builtin_amdgcn_s_memrealtime();
+        xr_entry = plow_realtime();
         if (xr_trace) { xr_trace->t_arrive = xr_entry; xr_trace->cu = 0u; }
     }
     __syncthreads();
@@ -890,14 +925,14 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
                               (char*)peer_scratch[rank] + tg_off, gcols, want, slice, nblk);
 #if PLOW_XR_TRACE_PHASES
     if (threadIdx.x == 0 && xr_trace)
-        xr_trace->cu = xr_sat32(__builtin_amdgcn_s_memrealtime() - xr_entry);
+        xr_trace->cu = xr_sat32(plow_realtime() - xr_entry);
 #endif
     const uint32_t nw = xrt_words(n);
     const uint64_t* p[PLOW_XRT_MAXR];
 #pragma unroll
     for (uint32_t r = 0; r < PLOW_XRT_MAXR; r++)
         p[r] = (const uint64_t*)((const char*)peer_scratch[r < nranks ? r : 0u] + tp_off);
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t0 = plow_realtime();
     /* Slots r >= nranks alias peer 0, so every load is unconditional (eight in flight, no
      * per-peer exec masks) and only the accumulate is predicated. At TP8 nothing aliases. */
     for (uint32_t w = slice * PLOW_THREADS + threadIdx.x; w < nw; w += nblk * PLOW_THREADS) {
@@ -939,7 +974,7 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
                     }
             }
             if (!pending) break;
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 return;
             }
@@ -959,7 +994,7 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
 #if PLOW_XR_TRACE_PHASES
     __syncthreads();
     if (threadIdx.x == 0 && xr_trace) {
-        const uint64_t now = __builtin_amdgcn_s_memrealtime();
+        const uint64_t now = plow_realtime();
         xr_trace->pc = xr_sat32(now - xr_entry);
         xr_trace->t_ready = now;
     }
@@ -972,7 +1007,7 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 #if PLOW_XR_TRACE_PHASES
     __syncthreads();
-    if (threadIdx.x == 0 && xr_trace) xr_trace->t_end = __builtin_amdgcn_s_memrealtime();
+    if (threadIdx.x == 0 && xr_trace) xr_trace->t_end = plow_realtime();
 #endif
 }
 
@@ -1055,9 +1090,9 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
         for (uint32_t r = 0; r < nranks; r++)
             xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_id));
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(lg) < nranks) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 lds[0] = 1;
                 break;
@@ -1329,7 +1364,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
 #if PLOW_XR_TRACE_PHASES
     __shared__ uint64_t xr_entry;
     if (threadIdx.x == 0) {
-        xr_entry = __builtin_amdgcn_s_memrealtime();
+        xr_entry = plow_realtime();
         if (xr_trace) xr_trace->t_arrive = xr_entry;
     }
 #endif
@@ -1345,7 +1380,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
             if (xr_trace) {
                 xr_trace->cu = 0u;
                 xr_trace->pc = 0u;
-                xr_trace->t_ready = xr_trace->t_end = __builtin_amdgcn_s_memrealtime();
+                xr_trace->t_ready = xr_trace->t_end = plow_realtime();
             }
 #endif
         }
@@ -1373,16 +1408,16 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
 #endif
 #if PLOW_XR_TRACE_PHASES
     if (threadIdx.x == 0 && xr_trace) {
-        const uint64_t d = __builtin_amdgcn_s_memrealtime() - xr_entry;
+        const uint64_t d = plow_realtime() - xr_entry;
         xr_trace->pc = (uint32_t)(d > 0xffffffffull ? 0xffffffffull : d);
     }
 #endif
     if (threadIdx.x == 0 && xr_rs_on) {
 #if !PLOW_XR2_SKIP_RS
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_rs);
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(lg) < nranks) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 bailed = 1; break;
             }
@@ -1400,7 +1435,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     if (bailed) return;
 #if PLOW_XR_TRACE_PHASES
     if (threadIdx.x == 0 && xr_trace)
-        xr_trace->t_ready = __builtin_amdgcn_s_memrealtime();
+        xr_trace->t_ready = plow_realtime();
 #endif
 
     /* ---- PHASE 1 reduce-scatter: reduce this rank's OWNED slice, write it in-place into
@@ -1512,7 +1547,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     __syncthreads();
 #if PLOW_XR_TRACE_PHASES
     if (threadIdx.x == 0 && xr_trace) {
-        const uint64_t d = __builtin_amdgcn_s_memrealtime() - xr_entry;
+        const uint64_t d = plow_realtime() - xr_entry;
         xr_trace->cu = (uint32_t)(d > 0xffffffffull ? 0xffffffffull : d);
     }
 #endif
@@ -1545,9 +1580,9 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
 #if !PLOW_XR2_SKIP_AG
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_ag);
         const uint32_t target = nranks * nblk;
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(lg) < target) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 bailed = 1; break;
             }
@@ -1563,7 +1598,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     if (bailed) return;
 #if PLOW_XR_TRACE_PHASES
     if (threadIdx.x == 0 && xr_trace) {
-        const uint64_t d = __builtin_amdgcn_s_memrealtime() - xr_entry;
+        const uint64_t d = plow_realtime() - xr_entry;
         xr_trace->pc = (uint32_t)(d > 0xffffffffull ? 0xffffffffull : d);
     }
 #endif
@@ -1594,7 +1629,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         __syncthreads();
 #if PLOW_XR_TRACE_PHASES
         if (threadIdx.x == 0 && xr_trace)
-            xr_trace->t_end = __builtin_amdgcn_s_memrealtime();
+            xr_trace->t_end = plow_realtime();
 #endif
         return;
     }
@@ -1681,7 +1716,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
 #if PLOW_XR_TRACE_PHASES
     __syncthreads();
     if (threadIdx.x == 0 && xr_trace)
-        xr_trace->t_end = __builtin_amdgcn_s_memrealtime();
+        xr_trace->t_end = plow_realtime();
 #endif
 }
 
@@ -1718,9 +1753,9 @@ __device__ __forceinline__ bool xr_rendezvous_one_wg(const void* const* peer_scr
             xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate));
     if (threadIdx.x == 0) {
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate);
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(lg) < nranks) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 *bailed = 1;
                 break;

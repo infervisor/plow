@@ -15,8 +15,9 @@ class QueueTests(unittest.TestCase):
     def test_waits_on_foreign_process_without_starting_job(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            gpuq.save(root / "1.json", dict(state="queued"))
+            gpuq.save(root / "1.json", dict(state="queued", ngpu=1))
             with patch.object(gpuq.os, "access", return_value=True), \
+                 patch.object(gpuq, "gpu_count", return_value=1), \
                  patch.object(gpuq.time, "monotonic", side_effect=[0, 1, 1, 2000]), \
                  patch.object(gpuq.time, "sleep"), \
                  patch.object(gpuq.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "FOREIGN GPU PROCS:\ngpu0:123")), \
@@ -46,6 +47,35 @@ class QueueTests(unittest.TestCase):
                 self.assertEqual([call.kwargs["env"]["GPU_LEASE_TIMEOUT"] for call in launch.call_args_list], ["600", "14400"])
             self.assertEqual(json.loads((root / "1.json").read_text())["state"], "failed")
             self.assertEqual(json.loads((root / "2.json").read_text())["state"], "done")
+
+    def test_vendor_job_leases_and_audits_its_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gpuq.save(root / "1.json", dict(state="queued", ngpu=1, label="a", command=["true"], cwd=directory, vendor="amd"))
+            with patch.object(gpuq.os, "access", return_value=True), \
+                 patch.object(gpuq.time, "monotonic", side_effect=[0, 1, 1, 2, 2002]), \
+                 patch.object(gpuq.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "GPU: no foreign compute procs\n")) as audit, \
+                 patch.object(gpuq.subprocess, "Popen") as launch:
+                launch.return_value.pid = 123
+                launch.return_value.wait.return_value = 0
+                gpuq.work(root)
+                self.assertEqual(audit.call_args.args[0][1:], ["--vendor", "amd", "--audit"])
+                self.assertEqual(launch.call_args.args[0][1:5], ["--vendor", "amd", "-n", "1"])
+
+    def test_device_job_leases_named_cards_without_pool_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gpuq.save(root / "1.json", dict(state="queued", ngpu=2, label="x", command=["true"], cwd=directory,
+                                            devices="nvidia:0,amd:1"))
+            with patch.object(gpuq.os, "access", return_value=True), \
+                 patch.object(gpuq.time, "monotonic", side_effect=[0, 1, 1, 2, 2002]), \
+                 patch.object(gpuq.subprocess, "run") as audit, \
+                 patch.object(gpuq.subprocess, "Popen") as launch:
+                launch.return_value.pid = 123
+                launch.return_value.wait.return_value = 0
+                gpuq.work(root)
+                audit.assert_not_called()
+                self.assertEqual(launch.call_args.args[0][1:4], ["--devices", "nvidia:0,amd:1", "x"])
 
 
 if __name__ == "__main__":

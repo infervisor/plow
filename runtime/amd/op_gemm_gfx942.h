@@ -41,7 +41,10 @@
 #ifndef GM_NATIVE_OCP_QUANT
 #define GM_NATIVE_OCP_QUANT 1
 #endif
-#if GM_NATIVE_OCP_QUANT
+#if GM_NATIVE_OCP_QUANT && PLOW_GFX12
+/* gfx12 encodes OCP e4m3 natively (the gfx950 form). */
+#define PLOW_GM_FP8_PACK2(a, b) (__builtin_amdgcn_cvt_pk_fp8_f32((a), (b), 0u, false) & 0xffffu)
+#elif GM_NATIVE_OCP_QUANT
 #define PLOW_GM_FP8_PACK2(a, b)                                                             \
     (plow_fp8_mask_neg0(__builtin_amdgcn_cvt_pk_fp8_f32((a) * 0.5f, (b) * 0.5f, 0u, false)) \
      & 0xffffu)
@@ -104,7 +107,11 @@
 /* The SMALL rung's BK. 128 is the CDNA3 re-cut measured in op_gemm_common.h above GM_SM_BM: 1.10x to
  * 1.56x on every Gemma-4 31B prefill shape, arithmetic-preserving, single-buffered. */
 #ifndef GM_SM_BK
+#if PLOW_GFX12
+#define GM_SM_BK 64
+#else
 #define GM_SM_BK 128
+#endif
 #endif
 /* Scalar (SGPR) GEMV row descriptors: -0.55% ms/token, ranges disjoint, token-identical on the
  * Gemma-4 12B asset (op_gemm_common.h, above PLOW_GV_RSRC). CDNA3 only because it changes codegen

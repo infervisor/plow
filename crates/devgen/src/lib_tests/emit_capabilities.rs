@@ -108,6 +108,41 @@ fn production_defaults_are_capability_and_target_driven() {
 }
 
 #[test]
+fn sm120a_defaults_ladder_and_packed_fp8_kv_segments() {
+    let mut bf16 = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+    apply_production_defaults(&mut bf16, emit_capabilities("gemma4"), "sm_120a", 1, 188);
+    assert_eq!(bf16.decode_rungs(), [1, 2, 4, 8, 16]);
+    assert!(!bf16.packed_prefill_on());
+
+    for arch in ["sm_90a", "sm_120a"] {
+        let mut seg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+        seg.fp8_kv = true;
+        seg.uniseg = false;
+        apply_production_defaults(&mut seg, emit_capabilities("gemma4"), arch, 1, 188);
+        assert_eq!(seg.emit_packed_prefill, Some(true), "{arch}");
+
+        let mut uniseg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+        uniseg.fp8_kv = true;
+        uniseg.uniseg = true;
+        apply_production_defaults(&mut uniseg, emit_capabilities("gemma4"), arch, 1, 188);
+        assert_eq!(uniseg.emit_packed_prefill, None, "{arch}");
+
+        let mut off = EmitArgsForTest::try_parse_from(["test", "--emit-packed-prefill=false"])
+            .unwrap()
+            .emit;
+        off.fp8_kv = true;
+        off.uniseg = false;
+        apply_production_defaults(&mut off, emit_capabilities("gemma4"), arch, 1, 188);
+        assert_eq!(off.emit_packed_prefill, Some(false), "{arch}");
+    }
+    let mut tp2 = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+    tp2.fp8_kv = true;
+    tp2.uniseg = false;
+    apply_production_defaults(&mut tp2, emit_capabilities("gemma4"), "sm_120a", 2, 188);
+    assert_eq!(tp2.emit_packed_prefill, None);
+}
+
+#[test]
 fn pure_gemm_default_is_scoped_to_sm90a_gemma_native_dtypes() {
     let _guard = crate::test_env::env_guard();
     let mut qualified = EmitArgsForTest::try_parse_from(["test", "--w8a8"])

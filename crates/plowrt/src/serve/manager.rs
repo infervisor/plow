@@ -263,7 +263,7 @@ impl BlobPlan {
             ));
         }
         #[cfg(feature = "cuda")]
-        if let Some((granularity, capability)) = device_vmm {
+        if let Some((granularity, _capability)) = device_vmm {
             let config = crate::config::RuntimeConfig::get();
             plan.overhead_bound = plan.overhead_bound.saturating_add(seg_graph_bound(&blob));
             let manifest = match narrowed {
@@ -285,7 +285,6 @@ impl BlobPlan {
                     &blob,
                     kv.as_ref(),
                     config,
-                    capability,
                     granularity,
                     manifest
                         .as_ref()
@@ -688,6 +687,10 @@ pub trait ManagerDevice: Send + Sync {
     fn pool_bytes(&self) -> u64;
     /// Trim chunk pool to `keep_bytes`.
     fn pool_trim(&self, keep_bytes: u64) -> u64;
+    /// The vendor whose packets this device runs; `None` for the host device.
+    fn vendor(&self) -> Option<hwspec::Vendor> {
+        None
+    }
     /// Load an engine for `dir` and `ckpt`.
     fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine>;
     /// Check whether sibling packets are resident.
@@ -728,6 +731,9 @@ impl ManagerDevice for CudaManagerDevice {
     fn device_ordinal(&self) -> u8 {
         self.be.device_ordinal
     }
+    fn vendor(&self) -> Option<hwspec::Vendor> {
+        Some(hwspec::Vendor::Nvidia)
+    }
     fn mem_info(&self) -> Result<(u64, u64)> {
         self.be.mem_info()
     }
@@ -745,6 +751,13 @@ impl ManagerDevice for CudaManagerDevice {
     }
     fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
         let be = Arc::clone(&self.be);
+        if tp_degree(dir)? > 1 {
+            let devices = &crate::config::RuntimeConfig::get().group_devices;
+            let group = self.be.unload_modules_on_err(|| {
+                crate::serve::cuda_group::CudaGroupServe::load(be, dir, ckpt, devices)
+            })?;
+            return Ok(crate::serve::engine::ServeEngine::CudaGroup(group));
+        }
         let mut engine = self
             .be
             .unload_modules_on_err(|| crate::exec::gpu::GpuEngine::load(be, dir, ckpt))?;
@@ -763,6 +776,14 @@ impl ManagerDevice for CudaManagerDevice {
     }
     fn live_modules(&self) -> Option<usize> {
         Some(self.be.live_modules())
+    }
+    /// A process rank group (`PLOW_GROUP_DEVICES`) serves tensor-parallel packets: this
+    /// device is rank 0, each other group device runs a worker process.
+    fn supports_tp(&self) -> bool {
+        crate::config::RuntimeConfig::get().group_devices.len() > 1
+    }
+    fn group_width(&self) -> u32 {
+        (crate::config::RuntimeConfig::get().group_devices.len() as u32).max(1)
     }
 }
 
@@ -784,6 +805,9 @@ impl HsaManagerDevice {
 impl ManagerDevice for HsaManagerDevice {
     fn device_ordinal(&self) -> u8 {
         self.be.device_ordinal
+    }
+    fn vendor(&self) -> Option<hwspec::Vendor> {
+        Some(hwspec::Vendor::Amd)
     }
     fn mem_info(&self) -> Result<(u64, u64)> {
         let free = self.be.free_bytes().unwrap_or(0);
@@ -1180,6 +1204,10 @@ impl ModelManager {
 
     /// The device ordinals this manager's group covers. One today (a manager
     /// owns one backend); a tensor-parallel group would report its whole run.
+    pub fn vendor(&self) -> Option<hwspec::Vendor> {
+        self.device.vendor()
+    }
+
     pub fn ordinals(&self) -> Vec<u32> {
         vec![u32::from(self.device.device_ordinal())]
     }
@@ -1880,7 +1908,10 @@ impl ModelManager {
         .await
         .map_err(EnsureError::Load)?;
         let engine_ms = ms(t1);
-        if let Ok(bundle) = state.registry.get(state.model_of(slug)) {
+        if let Ok(bundle) = state
+            .registry
+            .bundle_for(state.model_of(slug), self.vendor())
+        {
             let device = self.ordinal();
             crate::asr::serving::release(&bundle.dir, device);
             crate::tts::serving::release(&bundle.dir, device);
@@ -1974,7 +2005,7 @@ impl ModelManager {
         let state = self.state()?;
         let bundle = state
             .registry
-            .get(state.model_of(&m.slug))
+            .bundle_for(state.model_of(&m.slug), self.vendor())
             .map_err(EnsureError::Load)?;
         if bundle.tokenizer().is_byte_fallback() {
             return Err(EnsureError::Load(RuntimeError::Msg(format!(
@@ -2467,7 +2498,7 @@ fn check_tp(device: &dyn ManagerDevice, slug: &str, tp: u32) -> Result<()> {
         return Err(RuntimeError::Rejected(format!(
             "{slug} declares tensor-parallel degree {tp}, and this model manager device is \
              single-device (one backend per engine). Serving it here would load one shard \
-             and answer with it. Compile a TP1 bundle, or serve it on a backend supporting TP (e.g. AMD HSA)."
+             and answer with it. Compile a TP1 bundle, or serve it on AMD HSA, or on CUDA with one PLOW_GROUP_DEVICES entry per rank."
         )));
     }
     // The engine spans `tp` devices from the group's first: past the group they belong to other

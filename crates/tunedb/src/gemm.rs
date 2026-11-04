@@ -64,9 +64,12 @@ pub const GFX950_CELL: &str = "amd/gfx950/mi350x";
 /// gfx950 keeps the ONE checked-in cell regardless of SKU: the repo's CDNA4 records live in
 /// `amd/gfx950/mi350x`, and keying MI355X by fingerprint would send it to an empty
 /// `amd/gfx950/mi355x` and the analytical fallback — a silent regression for the part the repo's
-/// AMD numbers were measured on. Per-SKU cells start with gfx942.
+/// AMD numbers were measured on. Per-SKU cells start with gfx942 (and gfx1201).
 pub fn amd_tuning_cell(spec: &hwspec::GpuSpec) -> String {
-    if hwspec::IsaLevel::from_spec(spec) != Some(hwspec::IsaLevel::Gfx942) {
+    if !matches!(
+        hwspec::IsaLevel::from_spec(spec),
+        Some(hwspec::IsaLevel::Gfx942 | hwspec::IsaLevel::Gfx1201)
+    ) {
         return GFX950_CELL.to_string();
     }
     hwspec::HardwareFingerprint::from_spec(spec)
@@ -211,6 +214,9 @@ mod tests {
             let spec = hwspec::registry::lookup(sku).expect("in registry");
             assert_eq!(amd_tuning_cell(spec), GFX950_CELL, "{sku}");
         }
+
+        let r9700 = hwspec::registry::lookup("R9700").expect("R9700 in registry");
+        assert_eq!(amd_tuning_cell(r9700), "amd/gfx1201/r9700");
     }
 
     /// The key must round-trip the precision, because that is the field whose omission would

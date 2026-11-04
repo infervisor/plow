@@ -309,6 +309,14 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NO_FUSE_NRN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub no_fuse_nrn: bool,
 
+    /// Keep residual state in FP32 while projections and KV remain BF16.
+    #[arg(long, env = "PLOW_RESIDUAL_F32", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub residual_f32: bool,
+
+    /// Keep prefill O and decode down-projection partials in FP32 until one-shot all-reduce.
+    #[arg(long, env = "PLOW_TP_PARTIAL_F32", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub tp_partial_f32: bool,
+
     /// Fuse head-norm + reduce.
     #[arg(long, env = "PLOW_FUSE_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_hnr: bool,
@@ -2018,6 +2026,8 @@ impl EmitConfig {
             no_fuse_qkv: env_bool("PLOW_NO_FUSE_QKV"),
             fuse_qkv_fp8: env_bool("PLOW_FUSE_QKV_FP8"),
             no_fuse_nrn: env_bool("PLOW_NO_FUSE_NRN"),
+            residual_f32: env_bool("PLOW_RESIDUAL_F32"),
+            tp_partial_f32: env_bool("PLOW_TP_PARTIAL_F32"),
             fuse_hnr: env_bool("PLOW_FUSE_HNR"),
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),

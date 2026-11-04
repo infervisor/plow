@@ -92,7 +92,8 @@ impl From<std::io::Error> for ProbeError {
 pub struct ProbeTarget {
     /// Compiler driver, e.g. `/usr/local/cuda/bin/nvcc` or `hipcc`.
     pub compiler: String,
-    /// Arch flag, e.g. `-arch=sm_90a` or `--offload-arch=gfx950`.
+    /// Arch flag(s), whitespace-separated, e.g. `-arch=sm_90a` or
+    /// `--offload-arch=gfx1201 -mwavefrontsize64`.
     pub arch_flag: String,
     /// Include directories.
     pub includes: Vec<String>,
@@ -133,7 +134,7 @@ impl ProbeTarget {
         cmd.env_clear()
             .env("PATH", "/usr/local/cuda/bin:/opt/rocm/bin:/usr/bin:/bin")
             .arg("-E")
-            .arg(&self.arch_flag);
+            .args(self.arch_flag.split_whitespace());
         // The flake's hipcc finds its bitcode through this and nothing else.
         if let Some(v) = std::env::var_os("HIP_DEVICE_LIB_PATH") {
             cmd.env("HIP_DEVICE_LIB_PATH", v);

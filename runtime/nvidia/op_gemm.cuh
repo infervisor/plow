@@ -175,8 +175,15 @@ __device__ __noinline__ void gemv_glu_rows_dot4(__nv_bfloat16* C, const __nv_bfl
                                                 unsigned slice, unsigned nblk);
 #endif
 
-template <int MM, int UN = gv_un<MM>::v, bool BIAS = false, bool TC = true>
-__device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
+__device__ __forceinline__ void pgm_store(__nv_bfloat16* out, float value) {
+    *out = __float2bfloat16(value);
+}
+__device__ __forceinline__ void pgm_store(float* out, float value) {
+    *out = value;
+}
+
+template <int MM, int UN = gv_un<MM>::v, bool BIAS = false, bool TC = true, typename Output = __nv_bfloat16>
+__device__ __forceinline__ void gemv_rows(Output* __restrict__ C,
                                           const __nv_bfloat16* __restrict__ x,
                                           const __nv_bfloat16* __restrict__ W, unsigned M,
                                           unsigned N, unsigned K, unsigned slice, unsigned nblk,
@@ -245,7 +252,7 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
         for (int m = 0; m < MM; m++) {
             float t = warp_sum32(acc[m]);
             if constexpr (BIAS) t += __bfloat162float(bias[n]);
-            if (lane == 0 && (unsigned)m < M) C[(size_t)m * N + n] = __float2bfloat16(t);
+            if (lane == 0 && (unsigned)m < M) pgm_store(C + (size_t)m * N + n, t);
         }
     }
 }
@@ -309,6 +316,28 @@ static __device__ void d_gemv(__nv_bfloat16* __restrict__ C, const __nv_bfloat16
                                    slice, nblk, nullptr, single_tile);
     });
 }
+
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+static __device__ void d_gemv_tp_f32(float* C, const __nv_bfloat16* x, const __nv_bfloat16* W,
+                                     unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk) {
+    const bool single_tile = M <= GV_MM_MAX;
+    gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
+        constexpr int MM = decltype(mm)::v;
+#if PLOW_NV_GEMV_MMA
+        if constexpr (MM >= 2 || PLOW_NV_GEMV_MMA_B1) {
+            if ((K & 31u) == 0u && (N & 7u) == 0u) {
+                gemv_rows_mma<false, (MM + 15) / 16, (MM <= 8)>(
+                    C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows, N, K,
+                    slice, nblk, nullptr, nullptr, single_tile);
+                return;
+            }
+        }
+#endif
+        gemv_rows<MM, gv_un<MM>::v, false, false>(
+            C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows, N, K, slice, nblk);
+    });
+}
+#endif
 
 #if PLOW_PACKET_LINEAR_BIAS
 static __device__ void d_gemv_bias(__nv_bfloat16* __restrict__ C,
@@ -1397,7 +1426,8 @@ __device__ __forceinline__ void pgm_load_afrags(unsigned (&af)[PGM_MFRAG][4], __
 /* C[M,N] = A[M,K] . B[N,K]^T, bf16, NO epilogue activation (every plain Gemma projection —
  * q/k/v/o/down/lm_head — is unactivated; the only activated prefill matmul is GEMM_GLU below).
  * a_row0 skips a_row0 rows of A (C row r reads A row a_row0+r). One body for GEMM/GEMM_MED/GEMM_SMALL. */
-static __device__ void d_gemm(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ A,
+template <typename Output>
+static __device__ void d_gemm(Output* __restrict__ C, const __nv_bfloat16* __restrict__ A,
                        const __nv_bfloat16* __restrict__ B, unsigned m, unsigned n, unsigned k,
                        unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
 #if defined(PLOW_NV_HOPPER)
@@ -1469,7 +1499,7 @@ static __device__ void d_gemm(__nv_bfloat16* __restrict__ C, const __nv_bfloat16
                     int rr = tm + gr + (e / 2) * 8;
                     int cc = tn + gc + (e % 2);
                     if (rr < (int)m && cc < (int)n)
-                        C[(size_t)rr * n + cc] = __float2bfloat16(acc[mi][nj][e]);
+                        pgm_store(C + (size_t)rr * n + cc, acc[mi][nj][e]);
                 }
             }
         __syncthreads();

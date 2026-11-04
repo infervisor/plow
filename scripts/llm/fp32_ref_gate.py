@@ -33,6 +33,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 TOP = 20
 # Stop ids of a reference whose meta carries none (Gemma's, before `reference` read them from the
@@ -668,6 +669,8 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as model_class
     elif cfg.model_type == "qwen3":  # dense Qwen3
         from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as model_class
+    elif cfg.model_type == "llama":  # dense Llama (small functional-gate models)
+        from transformers.models.llama.modeling_llama import LlamaForCausalLM as model_class
     else:
         from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedForCausalLM as model_class
     cfg._attn_implementation = "sdpa"
@@ -869,9 +872,14 @@ def warm_prefix(ids, turn=105):
 def cmd_capture(a):
     ref = load_ref(a.ref)
     url = a.url.rstrip("/")
+    trace_out = getattr(a, "requests_out", None)
+    if trace_out and (Path(trace_out).resolve() == Path(a.out).resolve()
+                      or (Path(trace_out).exists() and Path(a.out).exists() and Path(trace_out).samefile(a.out))):
+        raise ValueError("--requests-out and --out must name different files")
+    request_rows, request_lock = [], Lock() if trace_out else None
     model = json.load(urllib.request.urlopen(url + "/v1/models"))["data"][0]["id"]
 
-    def complete(ids, n):
+    def complete(ids, n, case_id, warm=False):
         r = post(url + "/v1/completions", {"model": model, "prompt": ids, "max_tokens": n, "temperature": 0,
                                            "logprobs": TOP, "return_tokens_as_token_ids": True,
                                            # plowrt omits a stop token from logprobs; the EOS position must be scored.
@@ -880,14 +888,21 @@ def cmd_capture(a):
         if r["usage"]["prompt_tokens"] != len(ids):
             raise RuntimeError(f"server re-tokenized the prompt: {r['usage']['prompt_tokens']} != {len(ids)}")
         toks, tops = parse_choice(c)
+        if trace_out:
+            first = dict(token=toks[0], logprob=c["logprobs"]["token_logprobs"][0], top=tops[0]) if toks else None
+            record = dict(case_id=case_id, warm=warm, prompt_sha256=ids_sha(ids), prompt_tokens=len(ids), requested_tokens=n,
+                          concurrency=a.concurrency, ref_sha256=ref["sha256"], model=model, first=first)
+            with request_lock:
+                request_rows.append(record)
         return toks, tops, c["text"]
 
     def one(case):
         t = time.time()
         try:
             if a.warm_turn:
-                complete(warm_prefix(case["prompt_ids"]), 1)
-            free, text, pos, n, empty = teacher_force(complete, case["prompt_ids"], case["cont"])
+                complete(warm_prefix(case["prompt_ids"]), 1, case["id"], warm=True)
+            free, text, pos, n, empty = teacher_force(lambda ids, n: complete(ids, n, case["id"]),
+                                                    case["prompt_ids"], case["cont"])
             row = dict(free=free, free_text=text, pos={str(k): v for k, v in pos.items()}, requests=n, empty_replies=empty)
         except Exception as e:  # noqa: BLE001 - a failed case is scored as missing, not a crash
             row = dict(error=repr(e))
@@ -902,6 +917,8 @@ def cmd_capture(a):
                ref_sha256=ref["sha256"], concurrency=a.concurrency, elapsed_s=time.time() - t0,
                utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), cases=rows)
     Path(a.out).write_text(json.dumps(cap))
+    if trace_out:
+        Path(trace_out).write_text("".join(json.dumps(row) + "\n" for row in request_rows))
     print(f"capture {a.arm}: {len(rows)} cases, {sum(r.get('requests', 0) for r in rows.values())} requests, "
           f"{sum('error' in r for r in rows.values())} errors -> {a.out}")
 
@@ -1007,6 +1024,7 @@ def main():
     cp.add_argument("--arm", required=True)
     cp.add_argument("--concurrency", type=int, default=16)
     cp.add_argument("--out", required=True)
+    cp.add_argument("--requests-out", help="JSONL records of each completion's first token and logprobs")
     cp.add_argument("--warm-turn", action="store_true",
                     help="first send each case's prompt up to its last turn start (multi-turn prefix-cache form)")
     cp.set_defaults(f=cmd_capture)
