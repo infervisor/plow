@@ -336,6 +336,9 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #define NV_XR_ON 1
 #include "op_collective.cuh"
 extern "C" __device__ unsigned plow_xr_staged_1 = 1;
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+extern "C" __device__ unsigned plow_xr_partial_f32_1 = 1;
+#endif
 #else
 #define NV_XR_ON 0
 #endif
@@ -2084,6 +2087,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                         (const float*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
                         in->i[3], slice, nblk);
         break;
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && PLOW_NV_PREFILL
+    case PLOW_DOP_GEMM_F32:
+        d_gemm((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+               in->i[0], in->i[1], in->i[2], 0, slice, nblk, (__nv_bfloat16*)arena);
+        break;
+#endif
 #if PLOW_NV_SPEECH
     case PLOW_DOP_Q8_GEMM_F32:
     case PLOW_DOP_LAYERNORM_F32:
@@ -2101,7 +2110,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_CONV2D_F32:
     case PLOW_DOP_PACK_NCFW_ROWS_F32:
     case PLOW_DOP_GROUPED_ATTENTION_F32:
+#if !(PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && PLOW_NV_PREFILL)
     case PLOW_DOP_GEMM_F32:
+#endif
     case PLOW_DOP_GATHER_ROWS_F32:
     case PLOW_DOP_COPY_COLS_F32:
     case PLOW_DOP_CONV1D_F32:
@@ -2150,8 +2161,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             __trap();
 #endif
         else
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && !PLOW_NV_SPEECH && !PLOW_NV_PREFILL
+            d_gemv_tp_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
+                         in->i[1], in->i[2], slice, nblk);
+#else
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
                           in->i[1], in->i[2], slice, nblk);
+#endif
         break;
     case PLOW_DOP_SAMPLE_SMALL_F32:
         d_sample_small((unsigned*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const unsigned*)TEN(3),

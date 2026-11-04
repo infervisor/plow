@@ -10,8 +10,11 @@ pub(crate) fn apply(
     if !enabled {
         return Ok(());
     }
-    if arch != "gfx1201" || slots[0].0 == slots[1].0 {
-        return Err("FP32 TP partials require gfx1201 and two distinct peer slots".into());
+    let nvidia = arch == "sm_120a";
+    if (arch != "gfx1201" && !nvidia) || slots[0].0 == slots[1].0 {
+        return Err(
+            "FP32 TP partials require gfx1201 or sm_120a and two distinct peer slots".into(),
+        );
     }
     let mut old_bytes = None;
     for &(partial, output) in &slots {
@@ -51,7 +54,7 @@ pub(crate) fn apply(
             return Err("FP32 peer partials do not support wave-RS objects".into());
         }
         let mut produced = [None; 2];
-        for &(partial, _) in &slots {
+        for (si, &(partial, _)) in slots.iter().enumerate() {
             let tensor = &model.tensors[partial as usize];
             let declared = prog
                 .tensors
@@ -89,6 +92,25 @@ pub(crate) fn apply(
                         inst.op, inst.t, inst.i
                     ));
                 }
+                if nvidia && si == fp32_slot {
+                    let (m, n, k) = (inst.i[0], inst.i[1], inst.i[2]);
+                    if k % 8 != 0
+                        || [
+                            (inst.t[1], u64::from(m) * u64::from(k)),
+                            (inst.t[2], u64::from(n) * u64::from(k)),
+                        ]
+                        .into_iter()
+                        .any(|(id, elements)| {
+                            prog.tensors
+                                .get(id as usize)
+                                .is_none_or(|t| t.bytes < elements * 2)
+                        })
+                    {
+                        return Err(
+                            "NVIDIA FP32 peer producer needs aligned BF16 operand extents".into(),
+                        );
+                    }
+                }
             }
         }
         for inst in &prog.insts {
@@ -120,6 +142,7 @@ pub(crate) fn apply(
                 || inst.i[0] == 0
                 || u64::from(inst.i[0]) * 2 > old_bytes
                 || inst.i[1] < 2
+                || (nvidia && inst.i[1] != 2)
                 || ranks.replace(inst.i[1]).is_some_and(|n| n != inst.i[1])
                 || inst.i[if plain { 4 } else { 5 }..].iter().any(|&v| v != 0)
                 || inst.f.iter().any(|v| v.to_bits() != 0)
@@ -175,7 +198,11 @@ pub(crate) fn apply(
                     inst.f[0] = f32::from_bits(XREDUCE_PARTIAL_F32_MARK);
                 }
             } else if slots[fp32_slot].0 == inst.t[0] {
-                inst.op = DevOp::GemmF32 as u16;
+                inst.op = if nvidia && pi >= decode {
+                    DevOp::GemvF32Out
+                } else {
+                    DevOp::GemmF32
+                } as u16;
             }
         }
     }
@@ -267,6 +294,40 @@ mod tests {
                 if i == 0 { 0 } else { XREDUCE_PARTIAL_F32_MARK }
             );
             assert_eq!(p.insts[3].i[2], 256);
+        }
+    }
+    #[test]
+    fn nv_tp_partial_f32_uses_native_phase_producers() {
+        let mut m = model();
+        apply(&mut m, true, "sm_120a", [(0, 1), (2, 3)]).unwrap();
+        assert_eq!(m.progs[0].insts[0].op, DevOp::GemmF32 as u16);
+        assert_eq!(m.progs[0].insts[2].op, DevOp::Gemv as u16);
+        assert_eq!(m.progs[1].insts[0].op, DevOp::Gemv as u16);
+        assert_eq!(m.progs[1].insts[2].op, DevOp::GemvF32Out as u16);
+        for p in &m.progs {
+            assert_eq!(p.insts[3].i[2], 256);
+        }
+    }
+    #[test]
+    fn nv_tp_partial_f32_rejects_bad_operand_extents_and_rank_count_atomically() {
+        for case in 0..5 {
+            let mut m = model();
+            match case {
+                0 => m.progs[0].insts[0].i[2] = 7,
+                1 => m.progs[0].tensors[4].bytes = 1,
+                2 => m.progs[1].tensors[5].bytes = 1,
+                3 => m.progs[0].insts[1].i[1] = 4,
+                _ => {}
+            }
+            let before = snapshot(&m);
+            assert!(apply(
+                &mut m,
+                true,
+                if case == 4 { "sm_90a" } else { "sm_120a" },
+                [(0, 1), (2, 3)]
+            )
+            .is_err());
+            assert_eq!(before, snapshot(&m));
         }
     }
 

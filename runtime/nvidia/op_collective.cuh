@@ -303,6 +303,34 @@ __device__ __forceinline__ bool xr_staged_barrier(const PlowProgram& prog, size_
     return !bailed;
 }
 
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+__device__ __forceinline__ void xr_publish_f32(const PlowProgram& prog, uint32_t slot,
+                                               uint32_t n, unsigned tid, unsigned stride) {
+    const auto* src = (const uint32_t*)((const char*)prog.peer_scratch[prog.n_gpu] + slot);
+    auto* dst = (uint32_t*)((char*)prog.peer_scratch[prog.rank] + slot);
+    for (uint32_t e = tid; e < n; e += stride) {
+        const uint32_t bits = xr_ld32(src + e);
+        asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
+                     :: "l"(dst + e), "r"(bits) : "memory");
+    }
+}
+
+__device__ __forceinline__ void xr_reduce_f32(const PlowProgram& prog, uint32_t slot,
+                                              uint32_t n, __nv_bfloat16* out,
+                                              unsigned tid, unsigned stride) {
+    for (uint32_t e = tid; e < n; e += stride) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < prog.n_gpu; r++) {
+            const void* region = r == prog.rank && prog.peer_scratch[prog.n_gpu]
+                                     ? prog.peer_scratch[prog.n_gpu] : prog.peer_scratch[r];
+            const auto* src = (const uint32_t*)((const char*)region + slot);
+            acc = __fadd_rn(acc, __uint_as_float(xr_ld32(src + e)));
+        }
+        out[e] = __float2bfloat16_rn(acc);
+    }
+}
+#endif
+
 template <bool Scatter>
 __device__ __forceinline__ void xr_staged_reduce_range(const PlowProgram& prog, uint32_t slot,
                                                 uint32_t lo, uint32_t hi, __nv_bfloat16* out,
@@ -381,6 +409,31 @@ __device__ __forceinline__ void xr_staged_reduce_range(const PlowProgram& prog, 
 /* XREDUCE (one-shot): t0=out i0=n i1=n_gpu i2=slot_bytes i3=gate. */
 __device__ __forceinline__ void d_xreduce_nv(const PlowProgram& prog, const PlowDevInst* in,
                                              void* const* T, unsigned slice, unsigned nblk) {
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+    if (in->fj[0].u == PLOW_XREDUCE_PARTIAL_F32_MARK) {
+        const uint32_t n = in->i[0], slot = in->i[2];
+        if (prog.n_gpu != 2 || in->i[1] != prog.n_gpu || (slot & 3u)
+            || in->i[4] || in->i[5] || in->i[6] || in->i[7] || in->fj[1].u)
+            __trap();
+        const size_t xoff = (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+        const unsigned tid = slice * blockDim.x + threadIdx.x, stride = nblk * blockDim.x;
+        uint32_t* status = xr_status(prog, in);
+        if (prog.peer_scratch[prog.n_gpu]) {
+            xr_publish_f32(prog, slot, n, tid, stride);
+            if (!xr_staged_barrier(prog, xoff, in->i[3], status, nblk)) return;
+        } else {
+            __shared__ int bailed_f32;
+            if (threadIdx.x == 0) {
+                if (slice == 0) xr_arrive(prog, xoff, in->i[3]);
+                bailed_f32 = !xr_wait(prog, xoff, in->i[3], status);
+            }
+            __syncthreads();
+            if (bailed_f32) return;
+        }
+        xr_reduce_f32(prog, slot, n, (__nv_bfloat16*)T[in->t[0]], tid, stride);
+        return;
+    }
+#endif
     if (prog.peer_scratch[prog.n_gpu]) {
         const size_t xoff = (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
         const uint32_t n = in->i[0], slot = in->i[2];

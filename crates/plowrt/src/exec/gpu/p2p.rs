@@ -73,17 +73,44 @@ impl Probe {
         let cc = be.compute_capability();
         let profile = interpreter_profile(cc)
             .ok_or_else(|| RuntimeError::Rejected("P2P probe: unsupported interpreter".into()))?;
+        let partial_f32 = rank::validate_partial_f32(&blob)?;
+        if partial_f32 && cc != (12, 0) {
+            return Err(RuntimeError::Rejected(
+                "FP32 peer partials require sm_120a".into(),
+            ));
+        }
+        let resolve = |role| {
+            resolve_interp_image(assets, &blob, &raw, &profile, cc.0 * 10 + cc.1, role)?.ok_or_else(
+                || RuntimeError::Rejected("P2P probe needs decode and prefill interpreters".into()),
+            )
+        };
+        let decode = resolve(Role::Decode)?;
+        let prefill = resolve(Role::Prefill)?;
+        let roles = if partial_f32 {
+            segment_role_metadata(&blob, &raw)?
+        } else {
+            None
+        };
         let mut objects = Vec::new();
-        for role in [Role::Decode, Role::Prefill] {
-            let image =
-                resolve_interp_image(assets, &blob, &raw, &profile, cc.0 * 10 + cc.1, role)?
-                    .ok_or_else(|| {
-                        RuntimeError::Rejected(
-                            "P2P probe needs decode and prefill interpreters".into(),
-                        )
-                    })?;
+        for (pf, image) in [(false, &decode), (true, &prefill)] {
             let module = be.module_load(&image.image)?;
-            let pf = matches!(role, Role::Prefill);
+            if partial_f32 && !pf {
+                if let Some(reason) = xr_capability_unavailable(
+                    &be,
+                    &module,
+                    Some(&prefill),
+                    assets,
+                    &blob,
+                    &raw,
+                    cc.0 * 10 + cc.1,
+                    roles.as_ref(),
+                    rank::PARTIAL_F32_MARKER,
+                )? {
+                    return Err(RuntimeError::Rejected(format!(
+                        "FP32 peer partials: {reason}"
+                    )));
+                }
+            }
             let cfg = &RuntimeConfig::get().nv;
             let name = if pf {
                 cfg.kernel_pf.as_deref()

@@ -146,7 +146,15 @@ pub fn group_layout(assets_dir: &Path) -> Result<Option<(u32, PeerLayout)>> {
     let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io { path: pkt, source })?;
     let blob = DevBlob::parse(&raw)?;
     let Some(tp) = blob.tp else { return Ok(None) };
-    let max_tokens = (tp.slot_bytes / (u64::from(tp.hidden) * 2)) as u32;
+    let row_bytes = u64::from(tp.hidden) * 2;
+    let max_tokens = tp
+        .slot_bytes
+        .checked_div(row_bytes)
+        .filter(|_| tp.slot_bytes % row_bytes == 0)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            RuntimeError::Rejected("TP partial slot is not a whole row extent".into())
+        })?;
     let layout = PeerLayout::new(tp.hidden, max_tokens, count_xgates(&blob)).ok_or_else(|| {
         RuntimeError::Rejected(format!(
             "TP packet partial slot {} B is not a whole aligned [{max_tokens}, {}] bf16 tensor",

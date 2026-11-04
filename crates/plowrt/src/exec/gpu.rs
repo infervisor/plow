@@ -64,18 +64,17 @@ fn check_norm_weight_offset(be: &CudaBackend, module: &Module, blob: &DevBlob) -
 
 /// Whether `image` keeps the engine unstaged: a required object, an interpreter for this SM,
 /// or an object that cannot be inspected (fail closed) must carry the staged-collective marker.
-fn blocks_xr_staging(image: &[u8], want_sm: u32, required: bool) -> bool {
+fn blocks_xr_capability(image: &[u8], want_sm: u32, required: bool, marker: &str) -> bool {
     let interpreter = cubin::inspect(image).map_or(true, |info| {
         info.sm == want_sm && info.entries.iter().any(|e| e.contains("PlowProgram"))
     });
-    (required || interpreter)
-        && !rank::staged_supported(&[cubin::global_u32(image, rank::STAGED_MARKER)])
+    (required || interpreter) && cubin::global_u32(image, marker) != Some(1)
 }
 
 // Decide before any tensor view, TMA descriptor or library plan captures a partial address.
 // Include optional interpreter siblings and segment objects conservatively: a stale optional
 // object keeps the whole engine unstaged, even if its rung is not selected on this request.
-fn xr_staging_unavailable(
+fn xr_capability_unavailable(
     be: &CudaBackend,
     decode: &Module,
     prefill: Option<&InterpImage>,
@@ -84,13 +83,14 @@ fn xr_staging_unavailable(
     raw: &[u8],
     want_sm: u32,
     roles: Option<&SegmentRoles>,
+    marker: &str,
 ) -> Result<Option<String>> {
-    if !rank::staged_supported(&[be.module_global_u32(decode, rank::STAGED_MARKER)?]) {
-        return Ok(Some("decode interpreter lacks plow_xr_staged_1=1".into()));
+    if be.module_global_u32(decode, marker)? != Some(1) {
+        return Ok(Some(format!("decode interpreter lacks {marker}=1")));
     }
     let check = |image: &[u8], source: String, required: bool| -> Option<String> {
-        blocks_xr_staging(image, want_sm, required)
-            .then(|| format!("{source} lacks plow_xr_staged_1=1"))
+        blocks_xr_capability(image, want_sm, required, marker)
+            .then(|| format!("{source} lacks {marker}=1"))
     };
     if let Some(pf) = prefill {
         if let Some(reason) = check(&pf.image, pf.source.clone(), true) {
@@ -4218,6 +4218,7 @@ impl GpuEngine {
             )));
         }
         let tp_kernarg = rank::TpKernarg::of(rank_bind.as_ref());
+        let xr_partial_f32 = rank::validate_partial_f32(&blob)?;
         if let (Some(tp), Some(r)) = (blob.tp, rank_bind.as_ref()) {
             let layout = r.group().layout().expect("checked at bind");
             // Three partial slots, `slot_bytes` apart (devgen's slot_b). The stride is recovered
@@ -4861,8 +4862,13 @@ impl GpuEngine {
 
         let prefill_image =
             resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
-        if let Some(bind) = rank_bind.as_mut().filter(|b| b.tp > 1 && !b.is_p2p()) {
-            match xr_staging_unavailable(
+        if xr_partial_f32 {
+            if want_sm != 120 {
+                return Err(RuntimeError::Rejected(
+                    "FP32 peer partials require sm_120a".into(),
+                ));
+            }
+            if let Some(reason) = xr_capability_unavailable(
                 &be,
                 &module,
                 prefill_image.as_ref(),
@@ -4871,6 +4877,24 @@ impl GpuEngine {
                 &raw,
                 want_sm,
                 segment_roles.as_ref(),
+                rank::PARTIAL_F32_MARKER,
+            )? {
+                return Err(RuntimeError::Rejected(format!(
+                    "FP32 peer partials: {reason}"
+                )));
+            }
+        }
+        if let Some(bind) = rank_bind.as_mut().filter(|b| b.tp > 1 && !b.is_p2p()) {
+            match xr_capability_unavailable(
+                &be,
+                &module,
+                prefill_image.as_ref(),
+                assets_dir,
+                &blob,
+                &raw,
+                want_sm,
+                segment_roles.as_ref(),
+                rank::STAGED_MARKER,
             ) {
                 Ok(None) => bind.enable_staging()?,
                 reason => tracing::info!(

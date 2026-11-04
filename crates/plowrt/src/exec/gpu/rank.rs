@@ -21,6 +21,65 @@ const ARM_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_TP: u32 = 31;
 
 pub(super) const STAGED_MARKER: &str = "plow_xr_staged_1";
+pub(super) const PARTIAL_F32_MARKER: &str = "plow_xr_partial_f32_1";
+
+fn partial_f32_bounds(d: &packet::dev::DevInst64, slot_bytes: u64, output_bytes: u64) -> bool {
+    use packet::dev::{DevOp, TENSOR_NONE16, XREDUCE_PARTIAL_F32_MARK};
+    d.op == DevOp::XReduce as u16
+        && d.fj[0] == XREDUCE_PARTIAL_F32_MARK
+        && d.fj[1] == 0
+        && d.t[1..].iter().all(|&t| t == TENSOR_NONE16)
+        && d.i[0] > 0
+        && d.i[1] == 2
+        && [0, slot_bytes].contains(&u64::from(d.i[2]))
+        && slot_bytes > 0
+        && slot_bytes % 128 == 0
+        && slot_bytes <= u64::from(u32::MAX)
+        && u64::from(d.i[0]) * 4 <= slot_bytes
+        && u64::from(d.i[0]) * 2 <= output_bytes
+        && d.i[4..].iter().all(|&v| v == 0)
+}
+
+pub(super) fn validate_partial_f32(blob: &crate::asset::devblob::DevBlob) -> Result<bool> {
+    use packet::dev::XREDUCE_PARTIAL_F32_MARK;
+    let mut marked = blob
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|d| {
+            d.fj[0] == XREDUCE_PARTIAL_F32_MARK
+                && matches!(
+                    packet::dev::DevOp::from_u16(d.op),
+                    Some(packet::dev::DevOp::XReduce | packet::dev::DevOp::XReduceTwoShot)
+                )
+        })
+        .peekable();
+    if marked.peek().is_none() {
+        return Ok(false);
+    }
+    let invalid = || RuntimeError::Rejected("invalid NVIDIA FP32 peer partial layout".into());
+    let tp = blob.tp.filter(|tp| tp.n_gpu == 2).ok_or_else(invalid)?;
+    for name in ["act.og_tp", "act.dg_tp"] {
+        if !blob
+            .tensors
+            .iter()
+            .any(|t| t.name == name && t.bytes == tp.slot_bytes && t.init.is_none())
+            || blob
+                .tensors
+                .iter()
+                .any(|t| t.name.starts_with(&format!("{name}@")))
+        {
+            return Err(invalid());
+        }
+    }
+    for d in marked {
+        let output = blob.tensors.get(d.t[0] as usize).ok_or_else(invalid)?;
+        if !partial_f32_bounds(d, tp.slot_bytes, output.bytes) {
+            return Err(invalid());
+        }
+    }
+    Ok(true)
+}
 
 pub(super) fn staged_supported(markers: &[Option<u32>]) -> bool {
     !markers.is_empty() && markers.iter().all(|m| *m == Some(1))
@@ -300,10 +359,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn partial_f32_rejects_overlapping_slots_and_unsupported_operands() {
+        use packet::dev::{DevInst64, DevOp, TENSOR_NONE16, XREDUCE_PARTIAL_F32_MARK};
+        let d = DevInst64 {
+            op: DevOp::XReduce as u16,
+            blocks: 1,
+            fj: [XREDUCE_PARTIAL_F32_MARK, 0, 0],
+            t: [
+                0,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+            ],
+            i: [32, 2, 0, 1, 0, 0, 0, 0],
+        };
+        assert!(partial_f32_bounds(&d, 128, 64));
+        let mut second = d;
+        second.i[2] = 128;
+        assert!(partial_f32_bounds(&second, 128, 64));
+        for case in 0..8 {
+            let mut bad = d;
+            match case {
+                0 => bad.i[0] = 33,
+                1 => bad.i[1] = 4,
+                2 => bad.i[2] = 64,
+                3 => bad.i[4] = 2,
+                4 => bad.fj[1] = 1,
+                5 => bad.t[1] = 1,
+                6 => bad.op = DevOp::XReduceTwoShot as u16,
+                _ => bad.i[0] = 0,
+            }
+            assert!(!partial_f32_bounds(&bad, 128, 64));
+        }
+        assert!(!partial_f32_bounds(&d, 128, 63));
+        assert!(!partial_f32_bounds(&d, 127, 64));
+    }
+
+    #[test]
     fn uninspectable_or_required_objects_without_marker_block_staging() {
         let junk = b"not an ELF image";
-        assert!(super::super::blocks_xr_staging(junk, 120, false));
-        assert!(super::super::blocks_xr_staging(junk, 120, true));
+        for marker in [STAGED_MARKER, PARTIAL_F32_MARKER] {
+            assert!(super::super::blocks_xr_capability(junk, 120, false, marker));
+            assert!(super::super::blocks_xr_capability(junk, 120, true, marker));
+        }
     }
 
     #[test]
