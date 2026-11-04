@@ -11544,17 +11544,17 @@ fn emit_dense_gqa(
         sections.extend(fish_depth::sections(&c, &emitter.tn, t, &m, &rungs));
     }
     // Speech ops of auxiliary programs (not in `m.progs`), for the speech object's arm mask.
-    let mut aux_speech_ops = 0u64;
+    let mut aux_speech = manifest::SpeechMasks::default();
     if c.frame
         .as_ref()
         .and_then(|f| f.depth.as_ref())
         .is_some_and(|d| d.maya2.is_some())
     {
         let n = &emitter.tn;
-        let (depth, ops) =
+        let (depth, speech) =
             maya2_depth::lm_sections(&mut m, &c, n.hn, n.frame_dcodes, n.frame_codes, &rungs);
         sections.extend(depth);
-        aux_speech_ops |= ops;
+        aux_speech.add(speech);
     }
     if let Some(t) = &emitter.tn.mtp {
         sections.extend(mtp::sections(&dir, &c, &emitter.tn, t, &m, &rung_progs));
@@ -11933,7 +11933,7 @@ fn emit_dense_gqa(
                 (encoder.prefix.model, section)
             });
     std::fs::write(&out, blob).unwrap();
-    let mut speech_ops = aux_speech_ops;
+    let mut speech = aux_speech;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
         let fish = std::fs::read(dir.join("config.json"))
@@ -11958,7 +11958,7 @@ fn emit_dense_gqa(
         }
         .unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(tts::CODEC_PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
         let enc = dir.join("encoder");
@@ -11974,7 +11974,7 @@ fn emit_dense_gqa(
             }
             .unwrap_or_else(|error| panic!("reference encoder packet: {error}"));
             let path = std::path::Path::new(&out).with_file_name(mimi_encoder::PACKET);
-            speech_ops |= manifest::speech_ops(&model);
+            speech.add(manifest::SpeechMasks::of(&model));
             write_sidecar_packet(&path, &model, &[section]);
             eprintln!("  reference encoder packet -> {}", path.display());
         }
@@ -11984,7 +11984,7 @@ fn emit_dense_gqa(
         let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16)
             .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
         let voice = dir.join("voice");
@@ -11992,7 +11992,7 @@ fn emit_dense_gqa(
             let (model, section) = voice_cond::lower_voice_cond(&voice, n_cu, m.target)
                 .unwrap_or_else(|error| panic!("voice conditioning packet: {error}"));
             let path = std::path::Path::new(&out).with_file_name(voice_cond::PACKET);
-            speech_ops |= manifest::speech_ops(&model);
+            speech.add(manifest::SpeechMasks::of(&model));
             write_sidecar_packet(&path, &model, &[section]);
             eprintln!("  voice conditioning packet -> {}", path.display());
         }
@@ -12016,14 +12016,14 @@ fn emit_dense_gqa(
         for (file, sidecar) in lowered.into_iter().flatten() {
             let sidecar = sidecar.unwrap_or_else(|e| panic!("multimodal {file}: {e}"));
             let path = std::path::Path::new(&out).with_file_name(file);
-            speech_ops |= manifest::speech_ops(&sidecar.model);
+            speech.add(manifest::SpeechMasks::of(&sidecar.model));
             write_sidecar_packet(&path, &sidecar.model, &[sidecar.section]);
             eprintln!("  multimodal encoder packet -> {}", path.display());
         }
     }
     if let Some((model, section)) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name(asr::qwen::ENCODER_PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  audio encoder packet -> {}", path.display());
     }
@@ -12046,8 +12046,9 @@ fn emit_dense_gqa(
     if !arch.is_empty() {
         write_lean_receipts(std::path::Path::new(&out), &lean);
         let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
-        if speech_ops != 0 {
-            man["speech_ops"] = speech_ops.into();
+        if speech.ops != 0 {
+            man["speech_ops"] = speech.ops.into();
+            man["speech_conv_posts"] = speech.conv_posts.into();
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes
