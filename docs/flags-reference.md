@@ -1,111 +1,124 @@
-# plow — full flag & knob reference
+# Configuration
 
-Exhaustive reference for every emit-time (`plowc` env), build-time (`nvcc`/CMake
-`-D…`), and runtime (`plowrt` env) flag. The README keeps only the load-bearing
-traps and the four configurations anyone actually builds; everything here is for
-kernel/perf work. Measured results live in `perf-data/` (one JSON + MD per
-campaign).
+Start with the defaults and a matching [model recipe](../recipes/infervisor/).
+Most deployments only need a model, a checkpoint, and a listening address.
 
-Perf features from the rtx-11/12/13 campaigns are gated so the **default build is
-a fixed, validated configuration**; every flag is an A/B control with a
-correctness gate (token-identity or a bit-exact vs-f32 oracle). **Unset = shipped
-default**, and most flags are byte-identical when unset.
+[Serving](#serving) · [Loading models](#loading-models) ·
+[Compiling models](#compiling-models) · [Advanced reference](#advanced-reference)
 
----
+## Find an option
 
-## Unified CLI args (new)
-
-Both `plowc` and `plowrt` now support structured **clap CLI args with
-environment-variable fallback**. Every knob formerly set via `PLOW_*` env can now
-be passed as a `--long-flag`, and the old env var still works transparently
-(clap's `env` attribute reads it). **CLI takes precedence over env.** Library
-benches that do not initialize CLI configuration may change cold-path resource
-options before constructing the next engine.
+Use your installed binary's help for available flags, defaults, and environment
+variables. Options can vary with the version and enabled backends.
 
 ```bash
-# These are equivalent:
-PLOW_PF_INTERLEAVE=4096 plowrt serve …
-plowrt serve --pf-interleave 4096 …
-
-# CLI overrides env:
-PLOW_PF_INTERLEAVE=2048 plowrt serve --pf-interleave 4096 …   # uses 4096
+plowrt serve --help
+plowrt load --help
+plowc --help
+plowc --list-gpus
 ```
 
-### Config structs
-
-| binary | struct | file | scope |
-|--------|--------|------|-------|
-| `plowc` | `EmitConfig` | `crates/devgen/src/emit_config.rs` | Emit-time knobs (211 fields, 14 hidden diagnostics) |
-| `plowrt` | `RuntimeConfig` | `crates/plowrt/src/config.rs` | Shared runtime knobs |
-| `plowrt` | `NvidiaRuntimeConfig` | (nested in RuntimeConfig) | NVIDIA/sm_120 serving |
-| `plowrt` | `AmdRuntimeConfig` | (nested in RuntimeConfig) | AMD/gfx950 serving |
-
-### Hot-path access pattern
-
-Both structs use a **process-global `OnceLock`** initialized once after CLI
-parse, so deep call sites pay a single atomic load (identical cost to the old
-`env_flag!` macro):
-
-```rust
-// devgen (emit time)
-emit_config::active().k3_full
-
-// plowrt (runtime)
-RuntimeConfig::get().nv.pf_interleave_rows()
-RuntimeConfig::get().pf_packlog
-```
-
-Use `get()`, never `global()`: `global()` panics when the config was never
-installed, which is the normal state for every library embedder — GPU tests,
-examples and benches build engines directly and never run `main()`'s CLI
-parse. `get()` falls back to an env-only parse there.
-
-### Discovering all flags
+For options with an environment-variable equivalent, precedence is:
+**CLI flag → environment variable → default**. Not every `PLOW_*` variable has
+a CLI equivalent.
 
 ```bash
-plowc --help          # shows all emit-time flags with env fallback
-plowrt serve --help   # shows all runtime flags with env fallback
+plowrt serve --model kimi-k3 --objective throughput
+
+# Equivalent environment setting:
+PLOW_OBJECTIVE=throughput plowrt serve --model kimi-k3
 ```
 
-### The knob registries are the authoritative list
+## Serving
 
-`crates/devgen/src/knob_spec.rs` (emit: `EMIT`, `RAW_ENV`, `OBJECT_DEFINES`) and
-`crates/plowrt/src/knob_spec.rs` (runtime) declare **every** knob, its default,
-its status and the constraints over it; checkpoint K verifies an emit against
-them and `build.json` records the verdict. Their evidence strings cite *this*
-file, so a default or rollback direction changed in one must be changed in both.
-A new `PLOW_*` knob, env read or `#if PLOW_*` define has to be registered there
-(`cargo test -p devgen --lib knob`, `cargo test -p plowrt --features cuda,hsa
---lib knob`).
+```bash
+plowrt serve --model kimi-k3 --bind 127.0.0.1 --port 8080
+```
 
-**This file is not exhaustive against those registries.** Roughly 130 registered
-env knobs — test fixtures (`PLOW_TEST_*`), dumps and snapshots
-(`PLOW_SEG_DUMP`, `PLOW_TENS_SNAP`, `PLOW_DUMP_ACT`), and per-family experiment
-arms — are deliberately not tabulated here. Grep the registries before concluding
-a knob does not exist.
+| Flag | Purpose |
+| --- | --- |
+| `--model NAME` | Serve a model already loaded into the local store. Repeat for more models. |
+| `--assets DIR` | Serve a local compiled asset directory instead. Repeat for more models. |
+| `--rt-checkpoint DIR` | Set the checkpoint location (`PLOW_CHECKPOINT`). |
+| `--served-model-name NAME` | Add an API model alias. Use `ALIAS=SLUG` with multiple models. |
+| `--bind ADDRESS` | Listening address. Default: `0.0.0.0`; use `127.0.0.1` for local access. |
+| `--port PORT` | HTTP port. Default: `8080`. |
+| `--objective MODE` | Scheduling policy: `auto` (default), `latency`, or `throughput`. |
+| `--max-queued-requests N` | Limit waiting requests. Default: `0`, meaning four batches. |
+| `--slo-ms MS` | Scheduler latency target in milliseconds. Default: `250`. |
+| `--fp8-dir DIR` | Location of prepared FP8 weights when required by the packet. |
 
-### Environment compatibility
+`auto` adapts scheduling to demand. `latency` favors response time;
+`throughput` favors batching. A policy only enables features supported by the
+packet and backend.
 
-Environment variables declared by the current config structs continue to work.
-Three compiler/runtime ambiguities have explicit replacements:
+For CPU execution, start with `--cpu-threads`, `--cpu-numa`, and `--cpu-isa`.
+See the [CPU guide](runtime/cpu.md) for their behavior. Speech commands have
+their own guides: [ASR](runtime/asr.md) and [TTS](runtime/tts.md).
 
-| removed spelling | replacement |
-|---|---|
-| `PLOW_QWEN_DECODE_LT` | compiler option `PLOW_EMIT_DECODE_CUBLASLT` |
-| `PLOW_SEG_PACKED_PREFILL` | compiler option `PLOW_EMIT_PACKED_PREFILL` |
-| `PLOW_NV_PLACE_DISPATCH` | runtime option `PLOW_L2_PLACE_DISPATCH` |
+## Loading models
 
-PlowRT reads runtime configuration through `RuntimeConfig`; the retired
-`env_flag!` and `env_usize!` macros are no longer part of the runtime API.
+```bash
+plowrt show kimi-k3
+plowrt load kimi-k3 --checkpoint "$HOME/models/Kimi-K3"
+```
 
-**Why there are so many.** The interpreter is one persistent megakernel that
-inlines every op arm, so its **register and shared-memory footprint is the WORST
-CASE over everything compiled in**, and smem is the *union* over all ops in the
-object. A knob therefore usually does one of two things: compile an arm *out* to
-buy back registers/occupancy for everything else, or A/B a body against the
-shipped one.
+`show` lists published variants and compatibility. `load` selects and downloads
+compiled assets. `serve --model` reads the local store; it does not download.
 
----
+| Setting | Purpose |
+| --- | --- |
+| `load --checkpoint DIR` | Use a local model checkpoint. |
+| `--plow-home DIR` / `PLOW_HOME` | Local asset store. Default: `~/.plow`. |
+| `--registry URL` / `PLOW_REGISTRY` | Registry or local mirror. Default: `pdist.infervisor.ai`. |
+
+See [distribution](DISTRIBUTION.md) for model references, variant selection,
+upgrades, and offline use.
+
+## Compiling models
+
+Compiler settings define the packet. Runtime flags cannot change its hardware
+target, precision, or compiled context limit. Use the settings and GPU objects
+from a matching [recipe](../recipes/infervisor/).
+
+| Flag | Purpose |
+| --- | --- |
+| `--hf-dir DIR` | Read a local Hugging Face checkpoint. |
+| `--out DIR` | Write compiled assets here. |
+| `--gpu NAME` | Select the hardware specification; list names with `--list-gpus`. |
+| `--arch ISA` | Set the target ISA metadata and object build target. |
+| `--n-cu N` | Override the packet executor count. Default: the selected hardware's count. |
+| `--max-ctx N` | Set the compiled context limit in tokens. |
+| `--batch LIST` | Compile comma-separated batch sizes. |
+| `--seq LIST` | Compile comma-separated sequence lengths. |
+| `--preset NAME` | Use a bucket preset instead of `--batch` and `--seq`. |
+| `--num-gpus N` | Set the number of devices. Default: `1`. |
+| `--served-name NAME` | Set the model ID written into the asset manifest. |
+| `--replay-knobs FILE` | Replay explicitly recorded emit settings from a `build.json`. |
+
+GPU packets and interpreter objects must match the target and configuration.
+Changing compiler settings requires re-emitting the packet; changing build
+defines requires rebuilding the objects. Run source builds and compilation
+inside `nix develop`; see [building](BUILD.md).
+
+## Advanced reference
+
+Expand a section for backend-specific controls, compatibility notes, and tuning
+evidence. These settings are model- and hardware-specific.
+
+The authoritative configuration lives in:
+
+- [Compiler options](../crates/devgen/src/emit_config.rs) and
+  [compiler knob registry](../crates/devgen/src/knob_spec.rs).
+- [Runtime options](../crates/plowrt/src/config.rs) and
+  [runtime knob registry](../crates/plowrt/src/knob_spec.rs).
+
+The registries include diagnostics and experiments not listed here. They also
+cite the evidence below; keep defaults and rollback directions consistent when
+changing them.
+
+<details>
+<summary>Compiler options and model-specific tuning</summary>
 
 ## `plowc` emit-time knobs
 
@@ -587,6 +600,11 @@ Raw `std::env::var` reads owned by `packet::devbuild` / `plowc` (see the module 
 
 ---
 
+</details>
+
+<details>
+<summary>FP8 precision</summary>
+
 ## fp8 precision — full detail
 
 fp8 is **not** a runtime toggle — it is baked when the model is compiled and the
@@ -663,6 +681,11 @@ closes the short-ctx gap to ~1.1–1.3× (still trails vLLM-fp8, which uses
 cudagraphs + FA-class flash). `PLOW_FP8_KV` doubles the 31B concurrency ceiling.
 
 ---
+
+</details>
+
+<details>
+<summary>GPU interpreter build settings</summary>
 
 ## Interpreter compilation knobs (`nvcc -D…`)
 
@@ -974,6 +997,11 @@ values cost.
 
 ---
 
+</details>
+
+<details>
+<summary>CPU runtime settings</summary>
+
 ## CPU runtime knobs (`plowrt --cpu-*`)
 
 Only present in a build carrying the `cpu` feature. Every one is a CLI flag with an
@@ -1014,10 +1042,15 @@ The global-queue and L2-place knobs are off because they were *measured* worse, 
 unfinished — neither changes what is computed, so both are safe to flip for an A/B
 on another host.
 
-Compile-side, there is no CPU emit target: `plowc` emits for a device target and the
-CPU interprets that packet. Use an **NVIDIA** `--gpu` (a gfx942/gfx950 packet is
-rejected at load), and set `--n-cu` explicitly — it is the virtual executor count,
-capped at 256, and need not match any thread count.
+Compile with a CPU target such as `--gpu xeon6975p --arch amx`; see
+[CPU bundle compilation](runtime/cpu.md#compiling-a-bundle). Set `--n-cu` for
+the virtual executor count, capped at 256. It need not match the worker thread
+count. AMD gfx942/gfx950 packets are rejected by the CPU backend.
+
+</details>
+
+<details>
+<summary>Asset store and registry settings</summary>
 
 ## Asset distribution (`plowrt pull` / `load` / `serve --model`)
 
@@ -1033,6 +1066,11 @@ subcommands. `serve` reads the local store and never the network; see
 `PLOW_CHECKPOINT` / `--rt-checkpoint` (below) doubles as `load`'s default
 checkpoint location, because the weights a bundle needs are the same weights
 `serve` binds.
+
+</details>
+
+<details>
+<summary>Scheduling and backend runtime settings</summary>
 
 ## Serving / runtime knobs (`plowrt` env)
 
@@ -1213,6 +1251,11 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_AMD_UNION_SKIP=0` | on | GLM sparse prefill (AMD): the host skips the `IndexUnionPf` segments while the native sparse attention route is active (prior ≥ 2047), because that route gathers `iidx_pf` and nothing reads the union table. Load logs `index union segments unread … skippable=N`. Runtime only: the packet and objects are unchanged. T3 on P8192-S: 667.2 / 648.3 / 666.8 ms (ctrl / on / ctrl2), −18.7 against a 3.7 ms noise floor; P4096-S −11.1; P8192-0 unchanged (`glue2-t3-g1-rung`). Default on since review log #92: served T4 (`glue2-t4`, off/on/off2/on2, bundled with `PLOW_GLM_MOE_SHARED_SEED`) not worse beyond the checkpoint P floor in any cell, C16 TTFT −39.0 / −23.1 ms and TPOT −2.66 / −1.92 ms beyond it; retrieval 18/18 + 21/21; certificate `perf-certs/rt.union_skip.json`. `=0` is the rollback. |
 | `PLOW_DSA_SELECT_THRESHOLD=1` | off | GLM sparse prefill (AMD): the TP indexer launches `plow_dsa_tp_select_thr` instead of `plow_dsa_tp_select` — the same top-2048 set per row (same key, row-set identical in `runtime/tests/dsa_select_thr_gfx942_test.hip`) in two row scans instead of five. Needs the adapter built with `-DPLOW_DSA_TP_SELECT_THR=1`; the load fails by name otherwise. Runtime only: the packet is unchanged. T2 (`idxtier-t2-thr`, one rank band, device events): slowest-rank select 566 → 372 µs at 8192 rows / prior 65536, 318 → 197 at 4096 rows. Opt-in; T3 pending. |
 
+</details>
+
+<details>
+<summary>Device selection and execution details</summary>
+
 ## Visible devices: `CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`
 
 The three are not equivalent, and one of them used to do nothing at all.
@@ -1381,3 +1424,16 @@ decode pass costs ~95 ms per prefill tick, so decode rows riding inside every ch
 **Measured, that estimate does not hold:** it assumed the decode pass disappears when its rows ride, but
 inside the body the band's decode attention chain costs about as much per layer as the pass, so riding
 middle chunks measures −14 ms per chunk at 78 layers (see the review log's decode-rows negative).
+
+</details>
+
+<details>
+<summary>Renamed environment variables</summary>
+
+| Old name | Replacement |
+| --- | --- |
+| `PLOW_QWEN_DECODE_LT` | Compiler: `PLOW_EMIT_DECODE_CUBLASLT` |
+| `PLOW_SEG_PACKED_PREFILL` | Compiler: `PLOW_EMIT_PACKED_PREFILL` |
+| `PLOW_NV_PLACE_DISPATCH` | Runtime: `PLOW_L2_PLACE_DISPATCH` |
+
+</details>
