@@ -1104,8 +1104,8 @@ impl PacketRnnt {
         Ok(items.into_iter().map(|item| item.tokens).collect())
     }
 
-    /// The smallest encoder capacity holding `valid_input_frames` (with a stream, its decoded rows
-    /// in whole stream steps), and its valid encoder frames.
+    /// The smallest encoder capacity holding `valid_input_frames` (with batched streams, whose
+    /// finals reproduce it, its decoded rows in whole stream steps), and its valid encoder frames.
     fn encoder_for(&self, valid_input_frames: usize) -> Result<(usize, usize)> {
         let capacities: Vec<usize> = self.encoder_programs.iter().map(|e| e.0).collect();
         let encoder = encoder_index(
@@ -1113,7 +1113,7 @@ impl PacketRnnt {
             valid_input_frames,
             &self.frame_transform,
             self.trailing_frames,
-            self.stream_windows().map(|w| w.rows),
+            self.chunk.as_ref().map(|c| c.windows().rows),
         )?
         .ok_or_else(|| {
             RuntimeError::Rejected(format!(

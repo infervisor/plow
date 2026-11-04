@@ -408,6 +408,16 @@ fn open_uploads(
         let Some(job) = offline.pop_front() else {
             break;
         };
+        // An upload stream's push carries no prompt: refused as the offline pass refuses it.
+        if !job.context.is_empty() && !engine.accepts_context() {
+            finish_job(
+                job,
+                Err(crate::RuntimeError::Rejected(
+                    crate::asr::CONTEXT_UNSUPPORTED.into(),
+                )),
+            );
+            continue;
+        }
         match engine.upload_open() {
             Ok(Some(id)) => uploading.push(Upload {
                 job,
@@ -3255,6 +3265,9 @@ mod tests {
                     language: None,
                 })
             }
+            fn accepts_context(&self) -> bool {
+                false
+            }
             fn stream_slots(&self) -> Option<usize> {
                 Some(4)
             }
@@ -3295,11 +3308,11 @@ mod tests {
         };
         let (mux, uploads, _) = AsrMux::spawn(Box::new(engine));
         assert_eq!((uploads, mux.stream_slots), (8, Some(2)));
-        let submit = |samples: usize| {
+        let submit_with = |samples: usize, context: &str| {
             mux.submit_with(
                 vec![0.0; samples],
                 None,
-                String::new(),
+                context.to_owned(),
                 Arc::new(AtomicBool::new(false)),
                 None,
                 None,
@@ -3307,6 +3320,7 @@ mod tests {
             )
             .unwrap()
         };
+        let submit = |samples: usize| submit_with(samples, "");
         let round = |expected: Round| {
             let pushes = observed.recv_timeout(Duration::from_secs(5)).unwrap();
             assert_eq!(pushes, expected);
@@ -3327,6 +3341,19 @@ mod tests {
         round(vec![(1, 0), (3, 0)]);
         assert_eq!(text(b.await.unwrap()), "upload 3");
         assert_eq!(text(d.await.unwrap()), "upload 2");
+        // A prompt the engine cannot take is refused in a burst as it is offline.
+        let e = submit(100);
+        let observed_round = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(observed_round, vec![(0, 100)]);
+        let (prompted, f) = (submit_with(100, "a prompt"), submit(100));
+        go.send(()).unwrap();
+        assert_eq!(text(e.await.unwrap()), "offline 100");
+        assert!(prompted
+            .await
+            .unwrap()
+            .is_err_and(|e| e.to_string().contains(crate::asr::CONTEXT_UNSUPPORTED)));
+        round(vec![(4, 100)]);
+        assert_eq!(text(f.await.unwrap()), "upload 1");
         assert!(observed.try_recv().is_err());
     }
 
