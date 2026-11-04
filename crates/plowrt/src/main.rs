@@ -4181,7 +4181,9 @@ async fn bringup_runtime(
                     slug: slug.clone(),
                     model: slug.clone(),
                     tp: plowrt::serve::manager::tp_degree(dir)?,
-                    required: plan.required(plan.overhead_bound) + plowrt::serve::manager::RESERVE,
+                    required: plan
+                        .required(plan.overhead_bound)
+                        .saturating_add(plowrt::serve::manager::RESERVE),
                     device: None,
                 });
             }

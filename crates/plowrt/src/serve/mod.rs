@@ -36,6 +36,7 @@ pub mod policy;
 pub mod portable;
 pub mod reasoning;
 pub mod reply_guard;
+pub mod residency_contract;
 pub mod session;
 #[cfg(all(test, any(feature = "hsa", feature = "cpu")))]
 mod step_lowering_tests;
@@ -707,8 +708,10 @@ impl AppState {
 
     fn refresh_up(&self, key: &str) {
         if let Some((set, r)) = self.dp_rank(key) {
-            set.ranks[r]
-                .set_up(self.muxes.read().contains_key(key) && self.residency(key).admits());
+            set.ranks[r].set_up(
+                self.muxes.read().get(key).is_some_and(|m| !m.retiring())
+                    && self.residency(key).admits(),
+            );
         }
     }
 
@@ -1223,7 +1226,20 @@ impl AppState {
 
     /// Look up the dispatcher for a slug (clones the underlying Sender).
     pub fn mux(&self, slug: &str) -> Option<mux::ModelMux> {
-        self.muxes.read().get(slug).cloned()
+        self.muxes
+            .read()
+            .get(slug)
+            .filter(|m| !m.retiring())
+            .cloned()
+    }
+
+    /// Retain the retiring dispatcher until its completion fence is observed.
+    /// Keeping this handle survives cancellation of an eviction future.
+    pub(crate) fn mux_for_retirement(&self, slug: &str) -> Option<mux::ModelMux> {
+        let mux = self.muxes.read().get(slug).cloned()?;
+        mux.retire();
+        self.refresh_up(slug);
+        Some(mux)
     }
 
     /// Run one request end-to-end: tokenize the prompt, then autoregressively
