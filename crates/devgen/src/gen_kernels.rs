@@ -587,7 +587,11 @@ pub(crate) fn apply_output_objects(
     }
     // gen_flash_prefill.cu serves an unpacked chunk as one request; only the FP8-KV and
     // media-span objects read the packed request table.
-    if !packed && entries.iter().any(|(e, _)| e.kv == KvDtype::Fp8 || e.media_span) {
+    if !packed
+        && entries
+            .iter()
+            .any(|(e, _)| e.kv == KvDtype::Fp8 || e.media_span)
+    {
         return Err("FP8-KV / media-span generated roles require packed prefill metadata".into());
     }
     if hd512_px4_role && entries.iter().any(|(e, _)| e.head_dim == 512) {
@@ -636,9 +640,18 @@ mod tests {
         assert_eq!(parse("attn_pf_hd512, attn_pf_hd512,").unwrap().len(), 1);
         assert!(parse("").unwrap().is_empty());
         assert!(matches!(parse("attn_pf_hd999"), Err(e) if e.contains("attn_pf_hd512")));
-        let rows = |list| parse(list).unwrap().iter().map(|(_, r)| *r).collect::<Vec<_>>();
+        let rows = |list| {
+            parse(list)
+                .unwrap()
+                .iter()
+                .map(|(_, r)| *r)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(rows("attn_pf_hd256_sliding"), [1024]);
-        assert_eq!(rows("attn_pf_hd256_sliding@128, attn_pf_hd512"), [128, 1024]);
+        assert_eq!(
+            rows("attn_pf_hd256_sliding@128, attn_pf_hd512"),
+            [128, 1024]
+        );
         assert!(parse("attn_pf_hd256_sliding@x").is_err());
         assert!(parse("attn_dec_hd256_gqa6@128").is_err());
     }
