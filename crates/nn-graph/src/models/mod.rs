@@ -19,6 +19,7 @@ mod llama;
 mod muse_spark;
 mod qwen3;
 mod qwen3_5;
+mod qwen3_asr;
 mod qwen_image_dit;
 mod qwen_image_vae;
 mod qwen_vl;
@@ -26,7 +27,8 @@ mod s3gen;
 mod siglip;
 mod snac;
 
-pub use config::{ConfigError, ModelConfig};
+pub use config::{ConfigError, ModelConfig, Qwen3AsrConfig};
+pub use qwen3_asr::{build_audio_encoder, build_composite, build_text_decoder};
 
 use crate::{infer_shapes, Graph, InferError};
 
@@ -77,6 +79,7 @@ pub fn build_graph(cfg: &ModelConfig, bucket: &ShapeBucket) -> Result<Graph, Bui
         ModelConfig::Llama(c) => llama::build(c),
         ModelConfig::MuseSpark(c) => muse_spark::build(c),
         ModelConfig::Qwen3(c) => qwen3::build(c),
+        ModelConfig::Qwen3Asr(c) => qwen3_asr::build(c),
         ModelConfig::Qwen35(c) => qwen3_5::build(c),
         ModelConfig::DeepSeek(c) => deepseek::build(c),
         // V4 parses and validates (see `config::DeepSeekV4Config`) so the gap is
@@ -119,6 +122,7 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
     let mut graph = match cfg {
         ModelConfig::Llama(c) => llama::build_encoder(c, taps),
         ModelConfig::Qwen3(c) => qwen3::build_encoder(c, taps),
+        ModelConfig::Qwen3Asr(c) => qwen3_asr::build_audio_encoder(c),
         other => {
             return Err(BuildError::EncoderUnsupported(match other {
                 ModelConfig::Gemma(_) => "gemma",
@@ -138,7 +142,7 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
                 ModelConfig::Snac(_) => "snac",
                 ModelConfig::S3Gen(_) => "chatterbox_s3gen",
                 ModelConfig::Qwen35(_) => "qwen3_5",
-                ModelConfig::Llama(_) | ModelConfig::Qwen3(_) => unreachable!(),
+                ModelConfig::Llama(_) | ModelConfig::Qwen3(_) | ModelConfig::Qwen3Asr(_) => unreachable!(),
             }))
         }
     };

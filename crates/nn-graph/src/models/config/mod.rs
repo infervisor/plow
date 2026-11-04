@@ -19,6 +19,7 @@ mod llama;
 mod muse_spark;
 mod qwen3;
 mod qwen3_5;
+mod qwen3_asr;
 mod qwen_image_dit;
 mod qwen_image_vae;
 mod qwen_vl;
@@ -50,6 +51,7 @@ pub use muse_spark::{
 };
 pub use qwen3::Qwen3Config;
 pub use qwen3_5::Qwen35Config;
+pub use qwen3_asr::{Qwen3AsrConfig, Qwen3AudioConfig};
 pub use qwen_image_dit::QwenImageDitConfig;
 pub use qwen_image_vae::QwenImageVaeConfig;
 pub use qwen_vl::QwenVlVisionConfig;
@@ -88,6 +90,8 @@ pub enum ModelConfig {
     MuseSpark(MuseSparkConfig),
     /// Qwen3 / Qwen2.5: GQA + SwiGLU (dense).
     Qwen3(Qwen3Config),
+    /// Qwen3-ASR: Audio encoder (2D conv + transformer) + Qwen3 thinker text decoder.
+    Qwen3Asr(Qwen3AsrConfig),
     /// Qwen3.5/Qwen3.8 hybrid full-attention + gated-delta text decoder.
     Qwen35(Qwen35Config),
     DeepSeek(DeepSeekConfig),
@@ -126,6 +130,30 @@ impl ModelConfig {
                     return Ok(ModelConfig::QwenImageVae(serde_json::from_value(v)?))
                 }
                 _ => {}
+            }
+        }
+
+        // Qwen3-ASR / Audio-LM nested under thinker_config.
+        if let Some(thinker) = v.get("thinker_config") {
+            let acfg = thinker.get("audio_config").cloned().unwrap_or_default();
+            let tcfg = thinker.get("text_config").cloned().unwrap_or_default();
+            let asr_cfg = Qwen3AsrConfig {
+                audio_config: serde_json::from_value(acfg)?,
+                text_config: serde_json::from_value(tcfg)?,
+            };
+            return Ok(ModelConfig::Qwen3Asr(asr_cfg));
+        }
+
+        // Speech LM with frame embeddings (Fish / Breeze / Maya2).
+        if v.get("plow_frame_embed").is_some()
+            || v.get("fish_s2").is_some()
+            || v.get("maya2").is_some()
+        {
+            let arch = model_type(&v).unwrap_or_default();
+            if arch == "llama" {
+                return Ok(ModelConfig::Llama(serde_json::from_value(v)?));
+            } else {
+                return Ok(ModelConfig::Qwen3(serde_json::from_value(v)?));
             }
         }
 
@@ -185,6 +213,16 @@ impl ModelConfig {
                 vision_config: None,
             })),
             "qwen3" | "qwen2_5" => Ok(ModelConfig::Qwen3(serde_json::from_value(v)?)),
+            "qwen3_asr" => {
+                let thinker = v.get("thinker_config").unwrap_or(&v);
+                let acfg = thinker.get("audio_config").cloned().unwrap_or_default();
+                let tcfg = thinker.get("text_config").cloned().unwrap_or_default();
+                let asr_cfg = Qwen3AsrConfig {
+                    audio_config: serde_json::from_value(acfg)?,
+                    text_config: serde_json::from_value(tcfg)?,
+                };
+                Ok(ModelConfig::Qwen3Asr(asr_cfg))
+            }
             "qwen2" => {
                 if v.get("use_sliding_window")
                     .and_then(serde_json::Value::as_bool)
@@ -258,7 +296,12 @@ impl ModelConfig {
                  the devblob backend currently supports only explicit single-block emission)"
             ))),
             "snac" => Ok(ModelConfig::Snac(serde_json::from_value(v)?)),
-            "chatterbox_s3gen" => Ok(ModelConfig::S3Gen(serde_json::from_value(v)?)),
+            "fish_codec" | "qwen3_tts_12hz" | "mimi_dac" | "mimi" => {
+                let snac_cfg: SnacConfig = serde_json::from_value(v.clone())
+                    .unwrap_or_else(|_| SnacConfig::default());
+                Ok(ModelConfig::Snac(snac_cfg))
+            }
+            "chatterbox_s3gen" | "s3gen" => Ok(ModelConfig::S3Gen(serde_json::from_value(v)?)),
             "siglip" | "siglip_vision_model" => {
                 let sub = sub_config(&v, "vision_config");
                 Ok(ModelConfig::Siglip(serde_json::from_value(sub)?))

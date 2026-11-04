@@ -766,6 +766,22 @@ struct VizCli {
     /// Open the browser automatically after starting the server.
     #[arg(long, default_value_t = true)]
     open: bool,
+
+    /// Render or serve an embeddable HTML widget (compact layout, no reload bar, postMessage support).
+    #[arg(long, default_value_t = false)]
+    embed: bool,
+
+    /// Dump all visualization assets (`index.html`, `embed.html`, `model.json`, `pipeline.json`, `pipeline.svg`) to directory.
+    #[arg(long)]
+    dump_assets: Option<PathBuf>,
+
+    /// Export high-level vector SVG diagram of the pipeline/graph.
+    #[arg(long)]
+    export_svg: Option<PathBuf>,
+
+    /// Preselected sub-network (e.g. `composite`, `audio_encoder`, `thinker_decoder`).
+    #[arg(long)]
+    network: Option<String>,
 }
 
 /// `gpu:0.7,cpu:0.3,ane:0` -> unit weights; unknown unit names and non-numbers are errors.
@@ -2971,10 +2987,84 @@ fn viz_strip_vision(json: &str) -> String {
     json.to_string()
 }
 
+/// Build a complete `VizModelBundle` for visualization from a model source:
+/// a checkpoint directory, a config JSON, or an HF model id.
+fn viz_build_bundle(
+    src: &str,
+    batch: Option<i64>,
+    seq: Option<i64>,
+    network_override: Option<&str>,
+) -> Result<nn_graph::viz::VizModelBundle, String> {
+    let p = std::path::Path::new(src);
+    let (json, title) = if p.is_dir() {
+        let json = std::fs::read_to_string(p.join("config.json"))
+            .map_err(|e| format!("cannot read config.json in {src:?}: {e}"))?;
+        (json, plowc::hf_config::dir_slug(p))
+    } else if p.is_file() {
+        let json = std::fs::read_to_string(p).map_err(|e| format!("cannot read {src:?}: {e}"))?;
+        let title = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "network".into());
+        (json, title)
+    } else {
+        info!(model = %src, "resolving model config from HuggingFace hub");
+        let json = nn_graph::hub::fetch_config(src)
+            .map_err(|e| format!("hub fetch failed for {src:?}: {e}"))?;
+        (json, src.rsplit('/').next().unwrap_or(src).to_string())
+    };
+
+    let json = viz_strip_vision(&json);
+
+    let mut bundle = if let Ok(cfg) = nn_graph::models::ModelConfig::from_json(&json) {
+        nn_graph::viz::bundle_from_model_config(&cfg, &title, src)
+            .map_err(|e| format!("viz bundle build failed for {src:?}: {e}"))?
+    } else {
+        let g = nn_graph::models::build_from_config_json_at(
+            &json,
+            &nn_graph::models::ShapeBucket::default(),
+        )
+        .map_err(|e| format!("graph build failed for {src:?}: {e}"))?;
+        nn_graph::viz::bundle_from_graph(
+            &g,
+            &title,
+            src,
+            "custom",
+            nn_graph::viz::ModelModality::Llm,
+        )
+    };
+
+    if let Some(net) = network_override {
+        if bundle.networks.contains_key(net) {
+            bundle.default_network = net.to_string();
+        }
+    }
+
+    if batch.is_some() || seq.is_some() {
+        for sub in bundle.networks.values_mut() {
+            for t in &mut sub.graph.tensors {
+                if let Some(b_val) = batch {
+                    if t.shape.contains('B') {
+                        t.shape = t.shape.replace('B', &b_val.to_string());
+                    }
+                }
+                if let Some(s_val) = seq {
+                    if t.shape.contains('S') {
+                        t.shape = t.shape.replace('S', &s_val.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(bundle)
+}
+
 /// Build a graph for viz from a single source string: a checkpoint directory
 /// (containing `config.json`), a config/net JSON file, or an HF model id.
 /// `batch`/`seq` bind the symbolic B/S so every inferred shape comes out
 /// concrete; absent, shapes stay symbolic.
+#[allow(dead_code)]
 fn viz_build(
     src: &str,
     batch: Option<i64>,
@@ -3132,33 +3222,55 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     };
 
-    let (graph, title) = viz_build(&source, None, None)?;
+    let bundle = viz_build_bundle(
+        &source,
+        cli.batch.first().copied(),
+        cli.seq.first().copied(),
+        v.network.as_deref(),
+    )?;
     info!(
-        title = %title,
-        tensors = graph.tensors.len(),
-        nodes = graph.nodes.len(),
-        blocks = graph.blocks.len(),
-        "graph built for visualization"
+        title = %bundle.title,
+        modality = ?bundle.modality,
+        stages = bundle.stages.len(),
+        networks = bundle.networks.len(),
+        params = bundle.summary.total_params,
+        "model visualization bundle constructed"
     );
 
-    let html = nn_graph::viz::graph_to_html(&graph, &title, &source);
+    // 1. Asset dump mode: write all visualization assets to directory
+    if let Some(ref dir) = v.dump_assets {
+        nn_graph::viz::dump_assets(&bundle, dir)?;
+        info!(dir = %dir.display(), "dumped all visualizer assets");
+    }
 
+    // 2. Export vector SVG diagram
+    if let Some(ref svg_path) = v.export_svg {
+        let svg = nn_graph::viz::bundle_to_svg(&bundle);
+        std::fs::write(svg_path, &svg)?;
+        info!(path = %svg_path.display(), "wrote pipeline SVG diagram");
+    }
+
+    // 3. Port 0: file-dump mode (standalone or embed HTML)
     if v.port == 0 {
-        // File-dump mode
+        let html = nn_graph::viz::render_html(&bundle, v.embed);
         std::fs::write(&v.out, &html)?;
-        info!(path = %v.out.display(), "wrote graph visualization HTML");
+        info!(path = %v.out.display(), embed = v.embed, "wrote graph visualization HTML");
         return Ok(());
     }
 
-    // Serve mode: tiny stdlib HTTP server
+    // 4. Serve mode: HTTP server supporting interactive exploration, embed mode, and API endpoints
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
     let addr = format!("127.0.0.1:{}", v.port);
     let listener = TcpListener::bind(&addr).map_err(|e| format!("cannot bind {addr}: {e}"))?;
     let url = format!("http://{addr}");
-    info!(url = %url, "serving nn-graph visualizer (Ctrl-C to stop)");
-    eprintln!("\n  🌐 Graph viewer: {url}\n");
+    info!(url = %url, embed = v.embed, "serving nn-graph visualizer (Ctrl-C to stop)");
+    eprintln!("\n  🌐 Graph viewer: {url}");
+    if v.embed {
+        eprintln!("  📦 Embed view:   {url}/embed");
+    }
+    eprintln!();
 
     if v.open {
         // Best-effort open in browser
@@ -3172,7 +3284,6 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let html_bytes = html.into_bytes();
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -3187,11 +3298,43 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|l| l.split_whitespace().nth(1))
             .unwrap_or("/");
 
-        let (content_type, body): (&str, Vec<u8>) = if let Some(query) = path
+        let (content_type, body): (&str, Vec<u8>) = if path == "/embed" {
+            let html = nn_graph::viz::render_html(&bundle, true);
+            ("text/html; charset=utf-8", html.into_bytes())
+        } else if path == "/svg" {
+            let svg = nn_graph::viz::bundle_to_svg(&bundle);
+            ("image/svg+xml", svg.into_bytes())
+        } else if let Some(query) = path
+            .strip_prefix("/bundle")
+            .and_then(|r| r.strip_prefix('?').or(Some("")))
+        {
+            let mut model = String::new();
+            let (mut batch, mut seq, mut net) = (None, None, None);
+            for kv in query.split('&') {
+                let mut it = kv.splitn(2, '=');
+                match (it.next(), it.next()) {
+                    (Some("model"), Some(val)) => model = urldecode(val),
+                    (Some("batch"), Some(val)) => batch = urldecode(val).parse().ok(),
+                    (Some("seq"), Some(val)) => seq = urldecode(val).parse().ok(),
+                    (Some("network"), Some(val)) => net = Some(urldecode(val)),
+                    _ => {}
+                }
+            }
+            let src = if model.is_empty() {
+                source.clone()
+            } else {
+                model
+            };
+            let json = match viz_build_bundle(&src, batch, seq, net.as_deref()) {
+                Ok(b) => serde_json::to_value(&b).unwrap_or_default(),
+                Err(e) => serde_json::json!({ "error": e }),
+            };
+            ("application/json", json.to_string().into_bytes())
+        } else if let Some(query) = path
             .strip_prefix("/graph")
             .and_then(|r| r.strip_prefix('?'))
         {
-            // /graph?model=…&batch=…&seq=… → rebuild and return JSON.
+            // /graph?model=…&batch=…&seq=… → legacy compatibility
             let mut model = String::new();
             let (mut batch, mut seq) = (None, None);
             for kv in query.split('&') {
@@ -3208,10 +3351,10 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 model
             };
-            let json = match viz_build(&src, batch, seq) {
-                Ok((g, t)) => {
+            let json = match viz_build_bundle(&src, batch, seq, None) {
+                Ok(b) => {
                     info!(source = %src, ?batch, ?seq, "rebuilt graph for viz request");
-                    serde_json::json!({ "title": t, "graph": nn_graph::viz::graph_to_value(&g) })
+                    serde_json::json!({ "title": b.title, "graph": serde_json::to_value(b.default_graph()).unwrap_or_default() })
                 }
                 Err(e) => {
                     error!(source = %src, error = %e, "viz rebuild failed");
@@ -3220,7 +3363,8 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             ("application/json", json.to_string().into_bytes())
         } else {
-            ("text/html; charset=utf-8", html_bytes.clone())
+            let html = nn_graph::viz::render_html(&bundle, v.embed);
+            ("text/html; charset=utf-8", html.into_bytes())
         };
 
         let response = format!(
