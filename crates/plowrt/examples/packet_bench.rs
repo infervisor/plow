@@ -6,6 +6,8 @@
 //! with `--seq` the whole sequence is timed as one CUDA graph.
 //! `PB_PRE=ROLE,..` runs those programs once first (e.g. the encoder, so a CFM program sees real
 //! key lengths instead of zeroed inputs).
+//! `PB_STEP_FRAMES=N` fills every `stream.n.K` with N * `lengths.K.rows_per_frame` (a stateful
+//! codec step of N frames per item instead of zero-length items). `--sweep` lines carry the op.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -68,6 +70,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let program = pipeline.program(pos[2])?;
+    if let Ok(n) = std::env::var("PB_STEP_FRAMES") {
+        let n: u32 = n.parse()?;
+        for k in 0..pipeline.parameter("lengths.count")? {
+            let rpf = pipeline.parameter(&format!("lengths.{k}.rows_per_frame"))? as u32;
+            let t = pipeline.tensor(&format!("stream.n.{k}"))?;
+            rt.write_tensor(t, bytemuck::cast_slice(&vec![n * rpf; t.bytes / 4]))?;
+        }
+    }
     if let Ok(pre) = std::env::var("PB_PRE") {
         for role in pre.split(',') {
             rt.run(pipeline.program(role)?)?;
@@ -87,12 +97,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if sweep {
         let raw = std::fs::read(path)?;
-        let n_inst = plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program]
-            .insts
-            .len();
-        for cap in 0..=n_inst {
+        let blob = plowrt::asset::devblob::DevBlob::parse(&raw)?;
+        let insts = &blob.progs[program].insts;
+        for cap in 0..=insts.len() {
             rt.set_debug_max_inst(cap as u32)?;
-            println!("{{\"cap\":{cap},\"us\":{:.2}}}", time(&mut rt)?);
+            let op = cap.checked_sub(1).map_or(-1, |i| i64::from(insts[i].op));
+            println!("{{\"cap\":{cap},\"op\":{op},\"us\":{:.2}}}", time(&mut rt)?);
         }
         rt.set_debug_max_inst(u32::MAX)?;
     }

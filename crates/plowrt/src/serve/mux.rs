@@ -1102,10 +1102,12 @@ impl Slot {
     /// for that step (its codes ride beside it).
     fn feed(&self) -> Option<u32> {
         let last = *self.out_ids.last()?;
-        Some(match self.speech.as_deref().and_then(|sp| sp.feed.as_ref()) {
-            Some((text, tail)) => text.get(self.out_ids.len() - 1).copied().unwrap_or(*tail),
-            None => last,
-        })
+        Some(
+            match self.speech.as_deref().and_then(|sp| sp.feed.as_ref()) {
+                Some((text, tail)) => text.get(self.out_ids.len() - 1).copied().unwrap_or(*tail),
+                None => last,
+            },
+        )
     }
 
     /// Tokens a chained decode path may produce for this row before the host must see one
@@ -2866,7 +2868,12 @@ fn admit_session(
         })
         .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()))
         // Frame rows are not keyed by their ids: a retained sequence cannot vouch for them.
-        .filter(|_| job.opts.speech.as_ref().is_none_or(|s| s.frame_codes.is_empty()));
+        .filter(|_| {
+            job.opts
+                .speech
+                .as_ref()
+                .is_none_or(|s| s.frame_codes.is_empty())
+        });
     let find_free = |slots: &[Option<Slot>], table: &crate::serve::session::RetainTable| {
         if pair {
             (0..lim.saturating_sub(1)).step_by(2).find(|&i| {

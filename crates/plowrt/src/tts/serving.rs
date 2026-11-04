@@ -2434,6 +2434,7 @@ async fn stream_task(
             } else {
                 Urgency::Stream
             };
+            let due = playing.map(|t| t + std::time::Duration::from_secs_f64(sent as f64 / sr));
             // (PCM, its first fresh frame, frames emitted after it, frames decoded)
             let decoded = if let Some(slot) = slot.as_mut() {
                 let Some(k) = step_plan(n, emitted, done, first_frames, model.codec.step_frames)
@@ -2443,7 +2444,7 @@ async fn stream_task(
                 let codes = frames[emitted * fc..(emitted + k) * fc].to_vec();
                 model
                     .codec
-                    .step(slot, codes, k, urgency)
+                    .step(slot, codes, k, urgency, due)
                     .await
                     .map(|pcm| (pcm, 0, emitted + k, k))
             } else {

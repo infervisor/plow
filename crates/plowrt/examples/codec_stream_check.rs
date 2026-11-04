@@ -213,7 +213,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         v.get(v.len() / 2).copied().unwrap_or(0.0)
     };
     let first = ms[0];
-    println!("time single first_ms {first:.3} median_ms {:.3}", med(&mut ms));
+    println!(
+        "time single first_ms {first:.3} median_ms {:.3}",
+        med(&mut ms)
+    );
 
     // Phase 2: every stream on its own slot, joining one launch apart.
     let slot_of = |s: usize| (slots - 1 - 5 * s % slots) % slots;
@@ -239,6 +242,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (s, g) in got.iter().enumerate() {
         report("mixed", s, g);
     }
-    println!("time mixed streams {streams} median_ms {:.3}", med(&mut full));
+    println!(
+        "time mixed streams {streams} median_ms {:.3}",
+        med(&mut full)
+    );
     Ok(())
 }

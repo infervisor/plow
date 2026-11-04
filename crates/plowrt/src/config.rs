@@ -215,6 +215,17 @@ pub struct RuntimeConfig {
     )]
     pub tts_stream_first_frames: usize,
 
+    /// A later stateful codec step of a stream waits up to this long before its playback
+    /// would reach the end of the audio already sent, so steps of several streams share one
+    /// launch (0: every step launches at once).
+    #[arg(
+        long = "tts-codec-hold-ms",
+        env = "PLOW_TTS_CODEC_HOLD_MS",
+        default_value_t = 0,
+        global = true
+    )]
+    pub tts_codec_hold_ms: usize,
+
     /// Apply a speech packet's declared leading-silence trim to streamed replies
     /// (`stream.onset_trim_*`); `false` streams every sample (first-byte latency runs).
     #[arg(long = "tts-onset-trim", env = "PLOW_TTS_ONSET_TRIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
