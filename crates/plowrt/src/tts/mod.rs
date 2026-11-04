@@ -111,6 +111,8 @@ pub struct SpeechContract {
     pub dual_stream: Option<plow_asset::dual_stream::DualStream>,
     /// Streaming-output leading-silence trim (`stream.onset_trim_*`).
     pub onset_trim: Option<OnsetTrimPolicy>,
+    /// New frames a stream's first stateful codec step waits for (`stream.first_frames`).
+    pub stream_first_frames: Option<usize>,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -126,6 +128,15 @@ pub struct CloneContract {
 }
 
 impl SpeechContract {
+    /// New frames a stream's first stateful codec step decodes.
+    pub fn first_frames(&self) -> usize {
+        crate::config::RuntimeConfig::get()
+            .tts_stream_first_frames
+            .or(self.stream_first_frames)
+            .unwrap_or(1)
+            .max(1)
+    }
+
     pub fn from_pipeline(p: &PacketPipeline) -> Result<Self> {
         if p.driver != DRIVER {
             return Err(RuntimeError::Rejected(format!(
@@ -222,6 +233,7 @@ impl SpeechContract {
                 dbfs: f32::from_bits(v as u32),
                 max_ms: p.parameters.get(ONSET_TRIM_MAX_MS).map_or(0, |&m| m as u32),
             }),
+            stream_first_frames: p.parameters.get("stream.first_frames").map(|&n| n as usize),
         };
         if let Some(encoder) = p.strings.get(crate::exec::packet_runtime::CLONE_ENCODER) {
             let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {

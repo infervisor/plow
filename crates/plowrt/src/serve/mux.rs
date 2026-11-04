@@ -327,6 +327,10 @@ const CRITICAL_SPAN: std::time::Duration = std::time::Duration::from_millis(1000
 /// first chunks. Past both this and [`CRITICAL_SPAN`] it is throughput.
 const CRITICAL_TOKENS: usize = 48;
 
+/// How long a tick waits for a downstream stage to take a stream's just-produced first-output
+/// tokens (stream task, then stage worker: ~0.1-0.3 ms measured) before it goes anyway.
+const FIRST_HANDOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// The class of one job's work, for [`crate::serve::cosched::CoSched::Deadline`] outside a voice
 /// turn: an ASR final first; then a prompt still owed its first token, or a speech stream's start,
 /// is a deadline; decode is throughput; bulk work (partial transcripts) waits.
@@ -1050,6 +1054,9 @@ struct Slot {
     turn: Option<crate::serve::turns::TurnTimes>,
     turn_key: Option<crate::serve::turns::TurnKey>,
     speech: Option<Box<SpeechJob>>,
+    /// Its downstream first output has not been handed off yet: set while `speech.first_tokens`
+    /// tokens are still to come.
+    first_out: bool,
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
     cfg: Option<Box<CfgRun>>,
@@ -1386,6 +1393,11 @@ fn spawn_scoped(
             rung_widths.as_deref().unwrap_or(&[]),
         );
         let mut freed_last_tick = false;
+        // Downstream engagements the next tick waits for: the count read before a tick plus the
+        // streams whose first-output tokens it produced (the stage takes them first).
+        let mut await_first: Option<u64> = None;
+        let mut engaged_before = 0u64;
+        let mut first_before = 0usize;
         let mut load = LoadEstimator::default();
         let mut host_window = crate::obs::host::Window::default();
         let mut host_last_return: Option<Instant> = None;
@@ -2001,6 +2013,15 @@ fn spawn_scoped(
                 Vec::new()
             };
 
+            // A stream's first-output tokens just came out: its downstream launch, a few hundred
+            // microseconds of host handoff away, goes ahead of this tick (both take the device).
+            if let Some(want) = await_first.take() {
+                // A render takes this turn before it engages.
+                if turn.held() {
+                    turn.release();
+                }
+                downstream.engaged_to(want, FIRST_HANDOFF).await;
+            }
             // A downstream stage rendering a first chunk has the device to itself.
             while downstream.urgent() && !preempt_seen.load(Ordering::Acquire) {
                 tokio::select! {
@@ -2026,6 +2047,8 @@ fn spawn_scoped(
                 .filter(|s| s.step == 0)
                 .map(|s| s.prompt_ids.len().saturating_sub(s.pf_pos))
                 .sum();
+            engaged_before = downstream.engaged();
+            first_before = slots.iter().flatten().filter(|s| s.first_out).count();
             let taken_slots = std::mem::take(&mut slots);
             #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
             let mut taken_obs = obs.take().unwrap_or_else(|| {
@@ -2172,6 +2195,20 @@ fn spawn_scoped(
                     }
                     freed_last_tick = returned_slots.iter().flatten().count() < live;
                     slots = returned_slots;
+                    // Crossed or retired this tick (a retired one may have ended on its first
+                    // output).
+                    let mut first_after = 0;
+                    for s in slots.iter_mut().flatten().filter(|s| s.first_out) {
+                        s.first_out = s
+                            .speech
+                            .as_ref()
+                            .is_some_and(|sp| s.out_ids.len() < sp.first_tokens);
+                        first_after += s.first_out as usize;
+                    }
+                    let crossed = first_before.saturating_sub(first_after) as u64;
+                    if crossed > 0 {
+                        await_first = Some(engaged_before.wrapping_add(crossed));
+                    }
                     if let Some(b) = returned_bufs {
                         bufs_cache.insert(b.key, b);
                     }
@@ -3081,6 +3118,7 @@ fn admit_session(
                 uncond_hidden: Vec::new(),
             })
         }),
+        first_out: job.opts.speech.as_ref().is_some_and(|s| s.first_tokens > 0),
         speech: job.opts.speech,
         held: Vec::new(),
         held_finish: None,
@@ -11996,6 +12034,7 @@ mod tests {
                 turn: None,
                 turn_key: None,
                 speech: None,
+                first_out: false,
                 mm: None,
                 cfg: None,
                 held: Vec::new(),

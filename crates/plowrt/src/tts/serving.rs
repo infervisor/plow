@@ -1266,10 +1266,16 @@ async fn speech_with(
         crate::serve::mux::JobClass::Normal
     };
     let first = segs[0].clone();
-    let speech = match maker.speech(&first) {
+    let mut speech = match maker.speech(&first) {
         Ok(s) => s,
         Err(e) => return server_error(e),
     };
+    if let Some(sp) = speech
+        .as_mut()
+        .filter(|_| req.stream && model.codec.step_frames > 0)
+    {
+        sp.first_tokens = model.contract.first_frames();
+    }
     let (tx, rx) = stream_mod::channel();
     let opts = crate::serve::mux::JobOpts {
         session_end: false,
@@ -2316,9 +2322,7 @@ async fn stream_task(
     // the stream decodes windows.
     let mut slot: Option<super::codec::StreamSlot> = None;
     let mut windowed = model.codec.step_frames == 0;
-    let first_frames = crate::config::RuntimeConfig::get()
-        .tts_stream_first_frames
-        .max(1);
+    let first_frames = model.contract.first_frames();
     loop {
         let mut done = false;
         let msg = frx.recv().await;
@@ -2430,7 +2434,9 @@ async fn stream_task(
         }
         // Windowed: one window per message. Stateful: steps until every committed frame is out.
         while !skipping {
-            let urgency = if first.is_none() && emitted == 0 {
+            // Until audio is heard: a step whose output the onset trim drops leaves the next one
+            // the stream's first audio.
+            let urgency = if first.is_none() {
                 Urgency::First
             } else {
                 Urgency::Stream

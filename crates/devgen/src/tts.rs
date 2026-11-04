@@ -59,6 +59,9 @@ pub struct SpeechProfile {
     /// Streaming-output policy: leading samples quieter than `.0` dBFS before the first audible
     /// frame are not streamed, at most `.1` ms (`stream.onset_trim_*`).
     pub onset_trim: Option<(f32, u64)>,
+    /// New frames a stream's first stateful codec step waits for (`stream.first_frames`; 0:
+    /// undeclared, one frame).
+    pub stream_first_frames: u64,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -103,6 +106,7 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     segment_frames: 0,
     dual_stream: false,
     onset_trim: None,
+    stream_first_frames: 0,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -138,6 +142,7 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     segment_frames: 0,
     dual_stream: false,
     onset_trim: None,
+    stream_first_frames: 0,
 };
 
 /// fishaudio/s2-pro (fish-speech `inference.py`, no reference): system "convert the provided text
@@ -185,6 +190,7 @@ pub const FISH: SpeechProfile = SpeechProfile {
     segment_frames: 0,
     dual_stream: false,
     onset_trim: None,
+    stream_first_frames: 0,
 };
 
 /// BreezeBlue/Breeze-TTS-2 (`breeze_infer/templates.py`): each text segment `<bos>[S0]text` (voice
@@ -228,6 +234,7 @@ pub const BREEZE: SpeechProfile = SpeechProfile {
     segment_frames: 0,
     dual_stream: false,
     onset_trim: None,
+    stream_first_frames: 0,
 };
 
 /// maya-research/maya2-native (`maya3` prompt.py, engine.py): `<|lang:xx|>`, `{Name}: ` (the plain
@@ -294,6 +301,7 @@ pub const MAYA2: SpeechProfile = SpeechProfile {
     segment_frames: 250,
     dual_stream: false,
     onset_trim: None,
+    stream_first_frames: 0,
 };
 
 /// Qwen/Qwen3-TTS-12Hz-*-CustomVoice (`qwen_tts` `generate`, `scripts/tts/qwen3_tts_prep.py`): a
@@ -329,6 +337,8 @@ pub const QWEN3_TTS: SpeechProfile = SpeechProfile {
     dual_stream: true,
     // The model opens every reply with ~70 ms below -45 dBFS (the tts-bench onset level).
     onset_trim: Some((-45.0, 500)),
+    // That trim drops the first frame, so the first audible chunk needs two.
+    stream_first_frames: 2,
 };
 
 /// `dual_stream.json` beside a dual-stream checkpoint (`plow_asset::dual_stream::DualStream`).
@@ -576,6 +586,9 @@ pub fn speech_pipeline_section(
             u64::from(dbfs.to_bits()),
         );
         put("stream.onset_trim_max_ms".into(), max_ms);
+    }
+    if p.stream_first_frames > 0 {
+        put("stream.first_frames".into(), p.stream_first_frames);
     }
     put("frames.depth_sampler".into(), p.depth_sampler);
     put(

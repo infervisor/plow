@@ -206,14 +206,13 @@ pub struct RuntimeConfig {
 
     /// New frames a speech stream's FIRST stateful codec step waits for (stateful `codec.pkt`
     /// only); each later step waits for as many new frames as were already emitted, up to
-    /// `stream.step_frames`.
+    /// `stream.step_frames`. Unset: the packet's `stream.first_frames`, else 1.
     #[arg(
         long = "tts-stream-first-frames",
         env = "PLOW_TTS_STREAM_FIRST_FRAMES",
-        default_value_t = 1,
         global = true
     )]
-    pub tts_stream_first_frames: usize,
+    pub tts_stream_first_frames: Option<usize>,
 
     /// A later stateful codec step of a stream waits up to this long before its playback
     /// would reach the end of the audio already sent, so steps of several streams share one

@@ -266,6 +266,9 @@ struct Job {
     reply: tokio::sync::oneshot::Sender<Result<Decoded, String>>,
     /// Backlog charged to the feeding model's mux until this job is answered.
     _work: Option<crate::sched::admission::DownstreamWork>,
+    /// A first audio holds the feeding model's next tick until it is answered: both stages'
+    /// kernels take the whole device, so a tick launched ahead of it delays the first audio.
+    _urgent: Option<crate::sched::admission::DownstreamUrgent>,
 }
 
 impl Job {
@@ -724,6 +727,11 @@ impl Codec {
     ) -> Result<Decoded, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _work = self.credit.as_ref().map(|c| c.work());
+        let _urgent = self
+            .credit
+            .as_ref()
+            .filter(|_| urgency == Urgency::First)
+            .map(|c| c.urgent_work());
         self.tx
             .lock()
             .send(Msg::Job(Job {
@@ -739,6 +747,7 @@ impl Codec {
                 cached: false,
                 reply,
                 _work,
+                _urgent,
             }))
             .map_err(|_| "codec worker stopped".to_string())?;
         rx.await
@@ -1650,6 +1659,7 @@ mod tests {
             cached: false,
             reply: tokio::sync::oneshot::channel().0,
             _work: None,
+            _urgent: None,
         }
     }
 
