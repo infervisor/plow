@@ -207,13 +207,22 @@ nix develop --command bash -c '
 ```bash
 # Local: you already have config.json.
 # Hub (needs the `hub` feature; downloads config.json via hf-hub 0.4):
-nix develop --command bash -c 'cargo run -q -p plowc -- viz --model <hf-id> --port 0 --out /tmp/graph.html'
+nix develop --command bash -c 'cargo run -q -p plowc -- --model <hf-id> viz --port 0 --out /tmp/graph.html'
 ```
 
 `plowc viz` is the end-to-end Stage-1 driver: it resolves the source
-(`--hf-dir <dir>`, `--model <hf-id>`, or `--net <file.json>`), builds the graph,
-runs inference, and writes a self-contained HTML DAG viewer (or serves it with
-`--port <n>`). Use it to eyeball op order and per-tensor shapes.
+(`--hf-dir <dir>`, `--model <hf-id>`, `--net <file.json>`, or a diffusers repo with
+`model_index.json`), builds every network, runs shape inference (`--batch`/`--seq` bind
+`B`, `S`, `L`), and writes a self-contained viewer (or serves it with `--port <n>`).
+*Overview* shows stages with exact param shares and collapses identical consecutive
+blocks; *Detail* shows one block's ops with checkpoint weight names. Stage
+classification lives in `viz::bundle_from_model_config`; add an arm there when a new
+multi-stage model needs named stages (others get Input / Blocks / Output).
+`--dump-assets <dir>` writes `index.html`, `embed.html` (iframe build: `?theme=light|dark`,
+`plow-viz:theme` message in, `plow-viz:select` message out), `model.json`,
+`pipeline.json` and `pipeline.svg`. The graph libraries load from jsdelivr unless
+`--script-base <prefix>` points at self-hosted `cytoscape.min.js`, `dagre.min.js` and
+`cytoscape-dagre.js`.
 
 **2. Add the config struct + detection + builder** as in the recipe above.
 
@@ -329,7 +338,7 @@ just dim values) — use `build_from_config_json_at(json, &ShapeBucket::square(N
 | `models::config::ModelConfig::from_json` — `src/models/config/mod.rs` | Config parse + arch detection |
 | `models::config::parse_dtype` — `src/models/config/mod.rs` | torch dtype string → `DType`         |
 | `hub::build_from_pretrained` / `fetch_config` — `src/hub.rs` | Resolve hf-id → config → graph      |
-| `viz::graph_to_html` — `src/viz.rs`; `plowc viz` — `crates/plowc/src/main.rs` | DAG viewer            |
+| `viz::bundle_from_config_json`, `render_html` — `src/viz/`; `plowc viz` — `crates/plowc/src/main.rs` | Network viewer |
 | `tests/build_graphs.rs`, `tests/bind_and_weights.rs`    | Verification patterns to copy           |
 | `models/llama.rs`, `models/qwen3.rs`, `models/deepseek.rs`, `models/gemma.rs`, `models/kimi_k3.rs`, `models/siglip.rs`, `models/qwen_image_*.rs` | Builder templates |
 

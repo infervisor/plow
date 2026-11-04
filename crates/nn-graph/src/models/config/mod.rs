@@ -9,6 +9,7 @@
 mod deepseek;
 mod deepseek_v4;
 mod deepseek_v41;
+mod flux;
 mod gemma;
 mod gemma4_multimodal;
 mod glm;
@@ -35,6 +36,7 @@ pub use deepseek_v41::{
     DeepSeekV41Config, DeepSeekV41QuantizationConfig, DeepSeekV41RopeScaling, V41Attn,
     V41_MXFP4_GROUP,
 };
+pub use flux::FluxConfig;
 pub use gemma::{GemmaConfig, RopeParameters, RopeSpec};
 pub use gemma4_multimodal::{Gemma4MultimodalConfig, MmProjectorConfig};
 pub use glm::GlmConfig;
@@ -108,6 +110,8 @@ pub enum ModelConfig {
     Siglip(SiglipConfig),
     QwenVl(QwenVlVisionConfig),
     QwenImageDit(QwenImageDitConfig),
+    /// FLUX.1 DiT (`FluxTransformer2DModel`).
+    Flux(FluxConfig),
     QwenImageVae(QwenImageVaeConfig),
     /// SNAC audio-codec decoder (`scripts/tts/snac_export.py`).
     Snac(SnacConfig),
@@ -125,6 +129,9 @@ impl ModelConfig {
             match cls {
                 "QwenImageTransformer2DModel" => {
                     return Ok(ModelConfig::QwenImageDit(serde_json::from_value(v)?))
+                }
+                "FluxTransformer2DModel" => {
+                    return Ok(ModelConfig::Flux(serde_json::from_value(v)?))
                 }
                 "AutoencoderKLQwenImage" => {
                     return Ok(ModelConfig::QwenImageVae(serde_json::from_value(v)?))
@@ -296,11 +303,6 @@ impl ModelConfig {
                  the devblob backend currently supports only explicit single-block emission)"
             ))),
             "snac" => Ok(ModelConfig::Snac(serde_json::from_value(v)?)),
-            "fish_codec" | "qwen3_tts_12hz" | "mimi_dac" | "mimi" => {
-                let snac_cfg: SnacConfig = serde_json::from_value(v.clone())
-                    .unwrap_or_else(|_| SnacConfig::default());
-                Ok(ModelConfig::Snac(snac_cfg))
-            }
             "chatterbox_s3gen" | "s3gen" => Ok(ModelConfig::S3Gen(serde_json::from_value(v)?)),
             "siglip" | "siglip_vision_model" => {
                 let sub = sub_config(&v, "vision_config");

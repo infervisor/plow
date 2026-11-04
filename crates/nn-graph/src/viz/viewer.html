@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ · network · infervisor</title>
+<style>
+:root {
+  color-scheme: dark;
+  --paper: oklch(15.5% 0.008 250); --paper-2: oklch(18.5% 0.01 250); --paper-3: oklch(22% 0.012 250);
+  --ink: oklch(93% 0.006 250); --ink-2: oklch(82% 0.01 250); --muted: oklch(68% 0.014 250);
+  --rule: oklch(29% 0.012 250); --rule-2: oklch(36% 0.012 250);
+  --accent: oklch(69% 0.12 245); --accent-ink: oklch(17% 0.03 245); --focus: oklch(72% 0.18 245);
+  --accent-soft: color-mix(in oklab, var(--accent) 16%, transparent);
+  --error: oklch(72% 0.15 27);
+  --font: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --radius: 6px; --ease: cubic-bezier(0.16, 1, 0.3, 1); --dur: 160ms;
+}
+[data-theme="light"] {
+  color-scheme: light;
+  --paper: oklch(98.5% 0.004 250); --paper-2: oklch(96% 0.007 250); --paper-3: oklch(92.5% 0.01 250);
+  --ink: oklch(20% 0.012 250); --ink-2: oklch(34% 0.012 250); --muted: oklch(47% 0.014 250);
+  --rule: oklch(88% 0.01 250); --rule-2: oklch(80% 0.012 250);
+  --accent: oklch(52% 0.13 247); --accent-ink: oklch(98.5% 0.005 245); --focus: oklch(54% 0.19 247);
+  --error: oklch(52% 0.19 27);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { font: 14px/1.45 var(--font); background: var(--paper); color: var(--ink); display: flex; flex-direction: column; overflow: hidden; -webkit-font-smoothing: antialiased; }
+button, select, input { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); }
+
+/* Header */
+header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+.id { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.back { color: var(--muted); text-decoration: none; font-size: 13px; white-space: nowrap; }
+.back:hover { color: var(--accent); }
+.id h1 { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pill { font: 500 11px/1 var(--mono); padding: 4px 7px; border-radius: 999px; border: 1px solid var(--rule-2); color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.04em; }
+.facts { font: 12px var(--mono); color: var(--muted); white-space: nowrap; }
+.facts b { color: var(--ink); font-weight: 500; }
+.spacer { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--rule-2); border-radius: var(--radius); overflow: hidden; }
+.seg button { background: none; border: 0; padding: 6px 12px; cursor: pointer; color: var(--muted); font-size: 13px; transition: background var(--dur) var(--ease), color var(--dur) var(--ease); }
+.seg button + button { border-left: 1px solid var(--rule-2); }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+.seg button:not([aria-pressed="true"]):hover { color: var(--ink); }
+.ctl { background: var(--paper-2); border: 1px solid var(--rule-2); border-radius: var(--radius); padding: 6px 10px; font-size: 13px; cursor: pointer; }
+.ctl:hover { border-color: var(--accent); }
+select.ctl { padding-right: 24px; max-width: 280px; }
+.icon { width: 32px; height: 32px; display: inline-grid; place-items: center; padding: 0; }
+.mode-embed .standalone { display: none !important; }
+
+.notes { padding: 8px 16px; font-size: 13px; color: var(--ink-2); background: var(--paper-2); border-bottom: 1px solid var(--rule); }
+.notes p + p { margin-top: 2px; }
+
+/* Stage rail */
+.rail { display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--rule); overflow-x: auto; scrollbar-width: thin; }
+.stage { flex: 1 0 180px; max-width: 320px; text-align: left; background: var(--paper-2); border: 1px solid var(--rule); border-radius: var(--radius); padding: 10px 12px; cursor: pointer; transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
+.stage:hover { border-color: var(--rule-2); }
+.stage[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.stage .top { display: flex; align-items: baseline; gap: 8px; }
+.stage .n { font: 500 11px var(--mono); color: var(--accent); }
+.stage .name { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stage .p { font: 12px var(--mono); color: var(--muted); margin-top: 6px; display: flex; justify-content: space-between; gap: 8px; }
+.stage .p b { color: var(--ink); font-weight: 500; }
+.bar { height: 3px; background: var(--rule); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+.mode-embed .rail { padding: 10px 12px; }
+
+/* Main */
+main { flex: 1; min-height: 0; display: flex; }
+.canvas { flex: 1; min-width: 0; position: relative; }
+#cy { position: absolute; inset: 0; }
+.toolbar { position: absolute; top: 12px; left: 12px; right: 12px; display: flex; gap: 8px; align-items: center; z-index: 5; pointer-events: none; flex-wrap: wrap; }
+.toolbar > * { pointer-events: auto; }
+.toolbar .ctl { background: var(--paper); }
+.search { position: relative; }
+.search input { width: 220px; }
+.results { position: absolute; top: calc(100% + 4px); left: 0; width: 360px; max-height: 300px; overflow: auto; background: var(--paper); border: 1px solid var(--rule-2); border-radius: var(--radius); display: none; }
+.results.open { display: block; }
+.results button { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 7px 10px; cursor: pointer; font-size: 12px; }
+.results button:hover, .results button.on { background: var(--accent-soft); }
+.results .w { font-family: var(--mono); }
+.results .s { color: var(--muted); font-size: 11px; }
+.toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); background: var(--paper); border: 1px solid var(--rule-2); border-radius: var(--radius); padding: 5px 10px; cursor: pointer; user-select: none; }
+.toggle input { accent-color: var(--accent); }
+.zoom { position: absolute; right: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 4px; z-index: 5; }
+.zoom .ctl { background: var(--paper); }
+.legend { position: absolute; left: 12px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); z-index: 5; max-width: 60%; background: color-mix(in oklab, var(--paper) 85%, transparent); padding: 6px 8px; border-radius: var(--radius); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 10px; height: 10px; border-radius: 2px; border: 2px solid; }
+.status { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: var(--muted); font-size: 13px; pointer-events: none; }
+.hint { position: absolute; right: 56px; bottom: 14px; font-size: 12px; color: var(--muted); z-index: 4; }
+
+/* Panel */
+aside { width: 340px; flex: 0 0 340px; border-left: 1px solid var(--rule); overflow-y: auto; padding: 16px; }
+aside h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.005em; overflow-wrap: anywhere; }
+aside h3 { font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 18px 0 8px; }
+aside p { color: var(--ink-2); font-size: 13px; }
+.kicker { font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); margin-bottom: 4px; }
+dl.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { font-family: var(--mono); font-size: 12px; text-align: right; overflow-wrap: anywhere; }
+ul.list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+ul.list li { font: 12px var(--mono); display: flex; justify-content: space-between; gap: 8px; overflow-wrap: anywhere; }
+ul.list li span:last-child { color: var(--muted); white-space: nowrap; }
+a.link, button.link { color: var(--accent); background: none; border: 0; cursor: pointer; text-decoration: none; font: inherit; padding: 0; text-align: left; }
+a.link:hover, button.link:hover { text-decoration: underline; }
+.stack { display: flex; height: 8px; border-radius: 2px; overflow: hidden; gap: 1px; margin-bottom: 8px; }
+.actions { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+.primary { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: var(--radius); padding: 7px 12px; font-size: 13px; font-weight: 500; cursor: pointer; }
+
+@media (max-width: 1180px) { .legend { display: none; } }
+@media (max-width: 900px) {
+  main { flex-direction: column; }
+  aside { width: auto; flex: 0 0 40%; border-left: 0; border-top: 1px solid var(--rule); }
+  .facts { display: none; }
+  .search input { width: 160px; }
+}
+</style>
+</head>
+<body class="__MODE__">
+<header>
+  <a class="back standalone" id="back" hidden>← Model page</a>
+  <div class="id">
+    <h1 id="title"></h1>
+    <span class="pill" id="modality"></span>
+  </div>
+  <div class="facts" id="facts"></div>
+  <div class="spacer"></div>
+  <select class="ctl" id="network" aria-label="Network" hidden></select>
+  <div class="seg" role="group" aria-label="View">
+    <button id="v-overview" aria-pressed="true">Overview</button>
+    <button id="v-detail" aria-pressed="false">Detail</button>
+  </div>
+  <button class="ctl icon standalone" id="theme" aria-label="Toggle light/dark" title="Toggle light/dark">◐</button>
+</header>
+<div class="notes" id="notes" hidden></div>
+<nav class="rail" id="rail" aria-label="Stages"></nav>
+<main>
+  <div class="canvas">
+    <div id="cy" role="img" aria-label="Network graph"></div>
+    <div class="toolbar" id="toolbar" hidden>
+      <button class="ctl icon" id="prev" title="Previous section (←)" aria-label="Previous section">‹</button>
+      <select class="ctl" id="section" aria-label="Section"></select>
+      <button class="ctl icon" id="next" title="Next section (→)" aria-label="Next section">›</button>
+      <div class="search">
+        <input class="ctl" id="q" placeholder="Search ops and weights  /" autocomplete="off" aria-label="Search ops and weights">
+        <div class="results" id="results" role="listbox"></div>
+      </div>
+      <label class="toggle"><input type="checkbox" id="t-weights"> Weights</label>
+      <label class="toggle"><input type="checkbox" id="t-tensors"> Tensors</label>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="zoom">
+      <button class="ctl icon" id="z-in" aria-label="Zoom in">+</button>
+      <button class="ctl icon" id="z-out" aria-label="Zoom out">−</button>
+      <button class="ctl icon" id="z-fit" aria-label="Fit (F)" title="Fit (F)">⤢</button>
+    </div>
+    <div class="status" id="status"></div>
+  </div>
+  <aside id="panel" aria-live="polite"></aside>
+</main>
+
+__SCRIPTS__
+<script>
+"use strict";
+const BUNDLE = __BUNDLE__;
+const CATEGORIES = __CATEGORIES__;
+const EMBED = document.body.classList.contains('mode-embed');
+
+// ---------- formatting ----------
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmtParams = p => !p ? '0' : p >= 1e9 ? (p / 1e9).toFixed(2) + 'B' : p >= 1e6 ? (p / 1e6).toFixed(1) + 'M' : p >= 1e3 ? (p / 1e3).toFixed(1) + 'K' : String(p);
+const fmtBytes = b => b == null ? '?' : b >= 2 ** 30 ? (b / 2 ** 30).toFixed(2) + ' GiB' : b >= 2 ** 20 ? (b / 2 ** 20).toFixed(1) + ' MiB' : b >= 1024 ? (b / 1024).toFixed(1) + ' KiB' : b + ' B';
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const leaf = name => name.replace(/\.(weight|bias)$/, '');
+// `act` -> `silu`, `elementwise` -> `add`, `reduce` -> `reduce_mean`: the op the model actually runs.
+const snake = k => k.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+function opName(n) {
+  const d = n.detail;
+  if (d && typeof d === 'object') {
+    const v = Object.values(d)[0];
+    if (typeof v === 'string') return snake(v);
+    if (n.op === 'reduce' && v && v.kind) return 'reduce_' + snake(v.kind);
+  }
+  return n.op;
+}
+
+// ---------- theme ----------
+function setTheme(t) {
+  document.documentElement.dataset.theme = t === 'light' ? 'light' : 'dark';
+  if (!EMBED) try { localStorage.setItem('plow-viz-theme', document.documentElement.dataset.theme); } catch (e) {}
+  colors = null;
+  if (cy) { cy.style(styleSheet()); }
+}
+{
+  const q = new URLSearchParams(location.search).get('theme');
+  let saved = null;
+  if (!EMBED) try { saved = localStorage.getItem('plow-viz-theme'); } catch (e) {}
+  document.documentElement.dataset.theme = q || saved || 'dark';
+}
+window.addEventListener('message', e => {
+  const d = e.data || {};
+  if (d.type === 'plow-viz:theme') setTheme(d.theme);
+});
+function post(msg) { if (window.parent !== window) window.parent.postMessage(msg, '*'); }
+
+// Cytoscape needs sRGB; resolve CSS (oklch) colours through a canvas.
+let colors = null;
+const probe = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+function rgb(css) {
+  const el = document.createElement('i'); el.style.color = css; document.body.appendChild(el);
+  const c = getComputedStyle(el).color; el.remove();
+  probe.clearRect(0, 0, 1, 1); probe.fillStyle = c; probe.fillRect(0, 0, 1, 1);
+  const [r, g, b] = probe.getImageData(0, 0, 1, 1).data;
+  return `rgb(${r},${g},${b})`;
+}
+function palette() {
+  if (colors) return colors;
+  const light = document.documentElement.dataset.theme === 'light';
+  const v = n => rgb(`var(--${n})`);
+  colors = { paper: v('paper'), paper2: v('paper-2'), paper3: v('paper-3'), ink: v('ink'), ink2: v('ink-2'), muted: v('muted'), rule: v('rule'), rule2: v('rule-2'), accent: v('accent'), cat: {} };
+  for (const [k, c] of Object.entries(CATEGORIES)) colors.cat[k] = rgb(light ? c.light : c.dark);
+  return colors;
+}
+
+// ---------- model preparation ----------
+const prepared = new Map();
+function prepare(net) {
+  if (prepared.has(net.id)) return prepared.get(net.id);
+  const g = net.graph;
+  const isWeight = t => g.tensors[t].origin === 'weight';
+  const producer = t => { const o = g.tensors[t].origin; return o && o.node !== undefined ? o.node : null; };
+  const consumers = g.tensors.map(() => []);
+  g.nodes.forEach(n => n.inputs.forEach(t => consumers[t].push(n.id)));
+  const blockIdx = new Map(g.blocks.map((b, i) => [b.id, i]));
+  // A tied weight (one checkpoint name used twice) belongs to its first user, as in stage totals.
+  const owner = new Map(), ownParams = new Array(g.nodes.length).fill(0);
+  for (const n of g.nodes) for (const t of n.inputs) {
+    const w = g.tensors[t];
+    if (w.origin !== 'weight' || owner.has(w.name || t)) continue;
+    owner.set(w.name || t, n.id);
+    ownParams[n.id] += w.elements || 0;
+  }
+  const shared = t => { const w = g.tensors[t]; return owner.get(w.name || t); };
+  const stageIdx = new Map(net.stages.map((s, i) => [s.id, i]));
+
+  // Weight module of an op, relative to its block: `self_attn.q_proj`.
+  const moduleOf = n => {
+    const w = n.inputs.find(isWeight);
+    if (w === undefined) return '';
+    let name = leaf(g.tensors[w].name);
+    if (n.block && name.startsWith(n.block + '.')) name = name.slice(n.block.length + 1);
+    return name;
+  };
+
+  // Overview units: runs of structurally identical consecutive blocks, and runs of loose ops.
+  // Blocks repeat only if ops *and* attributes match (Gemma 4 local vs global layers differ).
+  // Slice offsets are positional (layer i reads row i), not structure.
+  const sig = g.blocks.map(b => JSON.stringify(b.node_ids.map(id => { const d = g.nodes[id].detail; return d && d.Slice ? 'slice' : d; })));
+  const units = [];
+  const unitOf = new Array(g.nodes.length);
+  let run = null, lastGroup = null;
+  for (const n of g.nodes) {
+    if (n.block) {
+      run = null;
+      const bi = blockIdx.get(n.block);
+      if (unitOf[n.id]) continue;
+      const prevBi = lastGroup ? lastGroup.blocks[lastGroup.blocks.length - 1] : -1;
+      if (lastGroup && prevBi === bi) { unitOf[n.id] = lastGroup; continue; }
+      if (lastGroup && prevBi === bi - 1 && sig[prevBi] === sig[bi] && g.blocks[prevBi].stage === g.blocks[bi].stage) {
+        lastGroup.blocks.push(bi);
+      } else {
+        lastGroup = { kind: 'group', key: 'g' + units.length, blocks: [bi], stage: g.blocks[bi].stage, sig: sig[bi] };
+        units.push(lastGroup);
+      }
+      g.blocks[bi].node_ids.forEach(id => unitOf[id] = lastGroup);
+    } else {
+      lastGroup = null;
+      if (!run || run.stage !== n.stage) {
+        run = { kind: 'run', key: 'r' + units.length, nodes: [], stage: n.stage };
+        units.push(run);
+      }
+      run.nodes.push(n.id);
+      unitOf[n.id] = run;
+    }
+  }
+
+  // Detail sections: every block, and every loose-op run.
+  const sections = [];
+  for (const u of units) {
+    if (u.kind === 'group') u.blocks.forEach(bi => sections.push({ key: 'b:' + g.blocks[bi].id, label: g.blocks[bi].id, stage: u.stage, nodes: g.blocks[bi].node_ids, unit: u }));
+    else sections.push({ key: 'r:' + u.key, label: runLabel(u), stage: u.stage, nodes: u.nodes, unit: u });
+  }
+  const sectionOf = new Array(g.nodes.length);
+  sections.forEach(s => s.nodes.forEach(id => sectionOf[id] = s));
+
+  function runLabel(u) {
+    const mods = [...new Set(u.nodes.map(id => moduleOf(g.nodes[id])).filter(Boolean))];
+    if (u.nodes.length === 1) return mods[0] || opName(g.nodes[u.nodes[0]]);
+    if (!mods.length) return `${[...new Set(u.nodes.map(id => opName(g.nodes[id])))].slice(0, 3).join(', ')} (${u.nodes.length} ops)`;
+    return `${modules(mods)} (${u.nodes.length} ops)`;
+  }
+  // Overview: a run of groups that repeats with a short period (hybrid models: 3 linear-attention
+  // blocks then 1 global) becomes one pattern unit.
+  const ov = [];
+  const key = u => u.kind === 'group' ? u.sig + '#' + u.blocks.length : null;
+  for (let i = 0; i < units.length;) {
+    let best = null;
+    for (let p = 2; p <= 4; p++) {
+      let r = 1;
+      for (;;) {
+        let ok = true;
+        for (let k = 0; k < p && ok; k++) {
+          const a = units[i + k], b = units[i + r * p + k];
+          ok = !!(a && b && key(a) !== null && key(a) === key(b) && a.stage === b.stage);
+        }
+        if (!ok) break;
+        r++;
+      }
+      if (r >= 2 && (!best || r * p > best.r * best.p)) best = { p, r };
+    }
+    if (!best) { ov.push(units[i]); i++; continue; }
+    const parts = units.slice(i, i + best.p * best.r);
+    ov.push({ kind: 'pattern', key: 'p' + parts[0].key, parts, period: parts.slice(0, best.p), reps: best.r, stage: parts[0].stage, blocks: parts.flatMap(u => u.blocks) });
+    i += best.p * best.r;
+  }
+  const ovOf = new Array(g.nodes.length);
+  for (const u of ov) for (const part of (u.parts || [u])) (part.kind === 'group' ? part.blocks.flatMap(bi => g.blocks[bi].node_ids) : part.nodes).forEach(id => ovOf[id] = u);
+
+  // What kind of block this is, from its ops: `local attn`, `linear attn + MoE`, ...
+  const blockKind = bi => {
+    const ops = g.blocks[bi].node_ids.map(id => g.nodes[id]);
+    const has = op => ops.some(n => n.op === op);
+    const attn = ops.find(n => n.op === 'attention');
+    let k = has('linear_attention') ? 'linear attn' : has('dsa_attention') ? 'sparse attn'
+      : attn ? (attn.detail.Attention && attn.detail.Attention.sliding_window ? 'local attn' : 'global attn') : null;
+    if (has('moe_experts') || has('moe_router')) k = (k ? k + ' + ' : '') + 'MoE';
+    return k || 'block';
+  };
+  const kinds = new Set(g.blocks.map((_, i) => blockKind(i)));
+
+  const P = { net, g, isWeight, producer, consumers, ownParams, shared, blockIdx, stageIdx, moduleOf, units, unitOf, ov, ovOf, blockKind, mixedKinds: kinds.size > 1, sections, sectionOf, runLabel };
+  prepared.set(net.id, P);
+  return P;
+}
+
+// Checkpoint module names, compactly: `a.b.x`, `a.b.y` -> `a.b.{x, y}`; without a shared prefix,
+// top-level modules: `time_text_embed.*, x_embedder`. At most three items.
+function modules(mods) {
+  if (mods.length === 1) return mods[0];
+  const parts = mods.map(m => m.split('.'));
+  let k = 0;
+  while (parts.every(p => p.length > k + 1 && p[k] === parts[0][k])) k++;
+  const list = items => items.slice(0, 3).join(', ') + (items.length > 3 ? ', …' : '');
+  if (k) return `${parts[0].slice(0, k).join('.')}.{${list(parts.map(p => p.slice(k).join('.')))}}`;
+  if (mods.length <= 3) return list(parts.map(p => p.slice(-2).join('.')));
+  return list([...new Set(parts.map(p => p[0] + (p.length > 1 ? '.*' : '')))]);
+}
+function blockRange(P, u) {
+  const ids = u.blocks.map(bi => P.g.blocks[bi].id);
+  if (ids.length === 1) return ids[0];
+  const m0 = ids[0].match(/^(.*?)(\d+)$/), m1 = ids[ids.length - 1].match(/^(.*?)(\d+)$/);
+  if (m0 && m1 && m0[1] === m1[1]) return `${m0[1]}${m0[2]}–${m1[2]}`;
+  return `${ids[0]} … ${ids[ids.length - 1]}`;
+}
+const unitParams = (P, u) => u.kind !== 'run' ? u.blocks.reduce((s, bi) => s + P.g.blocks[bi].param_count, 0) : u.nodes.reduce((s, id) => s + P.ownParams[id], 0);
+
+// ---------- state ----------
+const S = { net: BUNDLE.default_network, view: 'overview', stage: null, section: null, sel: null, weights: false, tensors: false };
+let cy = null;
+const $ = id => document.getElementById(id);
+const net = () => BUNDLE.networks.find(n => n.id === S.net) || BUNDLE.networks[0];
+
+function readHash() {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get('network') && BUNDLE.networks.some(n => n.id === h.get('network'))) S.net = h.get('network');
+  if (h.get('view') === 'detail') S.view = 'detail';
+  S.stage = h.get('stage');
+  S.section = h.get('section');
+}
+function writeHash() {
+  const h = new URLSearchParams();
+  if (S.net !== BUNDLE.default_network) h.set('network', S.net);
+  if (S.view === 'detail') { h.set('view', 'detail'); if (S.section) h.set('section', S.section); }
+  if (S.stage) h.set('stage', S.stage);
+  const s = h.toString();
+  history.replaceState(null, '', s ? '#' + s : location.pathname + location.search);
+}
+
+// ---------- chrome ----------
+function renderChrome() {
+  const n = net(), s = n.graph.summary;
+  $('title').textContent = BUNDLE.title;
+  $('modality').textContent = ({ llm: 'LLM', asr: 'ASR', tts: 'TTS', multimodal: 'Multimodal', vision: 'Vision', audio_codec: 'Codec', image: 'Image' })[BUNDLE.modality] || BUNDLE.modality;
+  $('facts').innerHTML = `<b>${fmtParams(s.total_params)}</b> params · <b>${fmtBytes(s.total_weight_bytes)}</b> · <b>${s.num_blocks}</b> blocks · <b>${s.total_nodes}</b> ops`;
+  const sel = $('network');
+  sel.hidden = BUNDLE.networks.length < 2;
+  sel.innerHTML = BUNDLE.networks.map(x => `<option value="${esc(x.id)}"${x.id === S.net ? ' selected' : ''}>${esc(x.title)}</option>`).join('');
+  $('notes').hidden = !BUNDLE.notes.length;
+  $('notes').innerHTML = BUNDLE.notes.map(t => `<p>${esc(t)}</p>`).join('');
+  $('v-overview').setAttribute('aria-pressed', S.view === 'overview');
+  $('v-detail').setAttribute('aria-pressed', S.view === 'detail');
+  $('toolbar').hidden = S.view !== 'detail';
+  renderRail();
+  renderLegend();
+}
+
+function renderRail() {
+  const n = net(), total = n.graph.summary.total_params || 1;
+  $('rail').hidden = n.stages.length < 2;
+  $('rail').innerHTML = n.stages.map((st, i) => `
+    <button class="stage" data-stage="${esc(st.id)}" aria-pressed="${S.stage === st.id}" title="${esc(st.description)}">
+      <div class="top"><span class="n">${i + 1}</span><span class="name">${esc(st.name)}</span></div>
+      <div class="p"><span><b>${fmtParams(st.param_count)}</b> params</span><span>${(100 * st.param_count / total).toFixed(1)}%</span></div>
+      <div class="bar"><i style="width:${Math.max(0.5, 100 * st.param_count / total)}%"></i></div>
+    </button>`).join('');
+  $('rail').querySelectorAll('.stage').forEach(b => b.onclick = () => selectStage(b.dataset.stage));
+}
+
+function renderLegend() {
+  const counts = net().graph.summary.category_counts;
+  $('legend').innerHTML = Object.entries(CATEGORIES).filter(([k]) => counts[k]).map(([k, c]) =>
+    `<span><i class="sw" style="border-color:${palette().cat[k]}"></i>${esc(c.label)}</span>`).join('');
+}
+
+// ---------- graph styles ----------
+function styleSheet() {
+  const c = palette();
+  return [
+    { selector: 'node', style: {
+      'shape': 'round-rectangle', 'background-color': c.paper2, 'border-width': 1, 'border-color': c.rule2,
+      'label': 'data(label)', 'text-wrap': 'wrap', 'text-valign': 'center', 'text-halign': 'center',
+      'color': c.ink, 'font-family': 'IBM Plex Sans, system-ui, sans-serif', 'font-size': 12, 'line-height': 1.35,
+      'width': 'label', 'height': 'label', 'padding': 10, 'text-max-width': 260,
+    } },
+    { selector: 'node.op', style: { 'border-width': 2, 'border-color': 'data(color)' } },
+    { selector: 'node.group', style: { 'border-width': 2, 'border-color': c.accent, 'font-size': 14, 'font-weight': 500, 'padding': 16, 'background-color': c.paper3 } },
+    { selector: 'node.stagebox', style: { 'text-max-width': 320, 'padding': 18 } },
+    { selector: 'node.run', style: { 'border-color': c.rule2, 'border-style': 'solid' } },
+    { selector: 'node.io', style: { 'shape': 'round-rectangle', 'background-opacity': 0, 'border-style': 'dashed', 'border-color': c.muted, 'color': c.ink2, 'font-family': 'JetBrains Mono, ui-monospace, monospace', 'font-size': 11, 'padding': 6 } },
+    { selector: 'node.tensor', style: { 'background-opacity': 0, 'border-width': 0, 'color': c.muted, 'font-family': 'JetBrains Mono, ui-monospace, monospace', 'font-size': 10, 'padding': 2 } },
+    { selector: 'node.weight', style: { 'background-color': c.paper, 'border-color': c.rule2, 'border-style': 'dotted', 'color': c.muted, 'font-family': 'JetBrains Mono, ui-monospace, monospace', 'font-size': 10, 'padding': 5 } },
+    { selector: 'edge', style: { 'width': 1.25, 'line-color': c.rule2, 'target-arrow-color': c.rule2, 'target-arrow-shape': 'triangle', 'arrow-scale': 0.8, 'curve-style': 'bezier' } },
+    { selector: 'edge.wedge', style: { 'line-style': 'dotted', 'target-arrow-shape': 'none' } },
+    { selector: '.dim', style: { 'opacity': 0.18 } },
+    { selector: '.hl', style: { 'opacity': 1 } },
+    { selector: 'edge.hl', style: { 'line-color': c.accent, 'target-arrow-color': c.accent, 'width': 2 } },
+    { selector: 'node:selected', style: { 'border-width': 3, 'border-color': c.accent, 'background-color': c.paper3 } },
+  ];
+}
+
+// ---------- overview ----------
+// Large networks open on one node per stage; selecting a stage shows that stage's blocks.
+const LOD_UNITS = 24;
+const GENERIC_STAGES = new Set(['input', 'blocks', 'output', 'network']);
+// Stage-first only pays off when stages are real pipeline parts (encoder, decoder, vocoder).
+const isLarge = P => P.ov.length > LOD_UNITS && P.net.stages.some(s => !GENERIC_STAGES.has(s.id));
+
+function stageElements(P) {
+  const { g } = P, els = [], edges = new Set(), total = g.summary.total_params || 1;
+  for (const st of P.net.stages) {
+    const groups = P.ov.filter(u => u.kind !== 'run' && u.stage === st.id);
+    const lines = groups.slice(0, 3).map(u => blockRange(P, u) + (u.kind === 'pattern' ? ` ×${u.reps} [${u.period.map(x => x.blocks.length).join('+')}]` : u.blocks.length > 1 ? ` ×${u.blocks.length}` : ''));
+    if (groups.length > 3) lines.push(`+${groups.length - 3} more`);
+    els.push({ data: { id: 's:' + st.id, stage: st.id, label: `${st.name}\n${fmtParams(st.param_count)} params · ${(100 * st.param_count / total).toFixed(1)}%${lines.length ? '\n' + lines.join('\n') : ''}` }, classes: 'group stagebox' });
+  }
+  const link = (a, b) => { const k = a + '>' + b; if (a !== b && !edges.has(k)) { edges.add(k); els.push({ data: { id: k, source: a, target: b } }); } };
+  const ins = g.inputs.length, outs = g.outputs.length;
+  els.push({ data: { id: 'in', label: ins === 1 ? `${g.tensors[g.inputs[0]].name}\n${g.tensors[g.inputs[0]].shape}` : `${ins} inputs` }, classes: 'io' });
+  els.push({ data: { id: 'out', label: outs === 1 ? `output\n${g.tensors[g.outputs[0]].shape}` : `${outs} outputs` }, classes: 'io' });
+  for (const n of g.nodes) for (const t of n.inputs) {
+    if (P.isWeight(t)) continue;
+    const p = P.producer(t);
+    link(p === null ? 'in' : 's:' + g.nodes[p].stage, 's:' + n.stage);
+  }
+  for (const t of g.outputs) { const p = P.producer(t); if (p !== null) link('s:' + g.nodes[p].stage, 'out'); }
+  return els;
+}
+
+function overviewElements(P) {
+  if (isLarge(P) && !S.stage) return stageElements(P);
+  const keep = isLarge(P) ? u => u.stage === S.stage : () => true;
+  const stageName = id => (P.net.stages.find(s => s.id === id) || { name: id }).name;
+  const { g } = P, els = [], edges = new Set();
+  for (const u of P.ov) {
+    if (!keep(u)) continue;
+    let label, cls;
+    if (u.kind === 'pattern') {
+      label = `${blockRange(P, u)}\n×${u.reps}  [ ${u.period.map(x => `${x.blocks.length}× ${P.blockKind(x.blocks[0])}`).join(' + ')} ]\n${fmtParams(unitParams(P, u))} params`;
+      cls = 'group';
+    } else if (u.kind === 'group') {
+      const each = P.g.blocks[u.blocks[0]].param_count;
+      const kind = P.mixedKinds ? ` · ${P.blockKind(u.blocks[0])}` : '';
+      label = `${blockRange(P, u)}\n${u.blocks.length > 1 ? `×${u.blocks.length}${kind} · ${fmtParams(each)} params each` : `${fmtParams(each)} params${kind}`}`;
+      cls = 'group';
+    } else {
+      const p = unitParams(P, u);
+      label = P.runLabel(u) + (p ? `\n${fmtParams(p)} params` : '');
+      cls = u.nodes.length === 1 ? 'op' : 'run';
+    }
+    const color = u.kind === 'run' && u.nodes.length === 1 ? palette().cat[g.nodes[u.nodes[0]].category] : undefined;
+    els.push({ data: { id: u.key, label, color, stage: u.stage }, classes: cls });
+  }
+  const link = (a, b) => { const k = a + '>' + b; if (a !== b && !edges.has(k)) { edges.add(k); els.push({ data: { id: k, source: a, target: b } }); } };
+  const ghost = (id, label) => { if (!els.some(e => e.data.id === id)) els.push({ data: { id, label }, classes: 'io' }); };
+  for (const n of g.nodes) {
+    const u = P.ovOf[n.id];
+    for (const t of n.inputs) {
+      if (P.isWeight(t)) continue;
+      const p = P.producer(t);
+      const from = p === null ? null : P.ovOf[p];
+      if (!keep(u)) {
+        if (from && keep(from)) { ghost('to:' + u.stage, `to ${stageName(u.stage)}`); link(from.key, 'to:' + u.stage); }
+        continue;
+      }
+      if (p === null) { ensureIO(els, 'in' + t, g.tensors[t]); link('in' + t, u.key); }
+      else if (keep(from)) link(from.key, u.key);
+      else { ghost('from:' + from.stage, `from ${stageName(from.stage)}`); link('from:' + from.stage, u.key); }
+    }
+  }
+  for (const t of g.outputs) {
+    const p = P.producer(t);
+    if (p === null || !keep(P.ovOf[p])) continue;
+    ensureIO(els, 'out' + t, g.tensors[t], true);
+    link(P.ovOf[p].key, 'out' + t);
+  }
+  const order = new Map(P.ov.map((u, i) => [u.key, i]));
+  // Many network inputs into one unit (per-resnet timestep embeddings) read as one input node.
+  const fanIn = new Map();
+  for (const e of els) if (e.data.source && e.data.source.startsWith('in') && order.has(e.data.target)) (fanIn.get(e.data.target) || fanIn.set(e.data.target, []).get(e.data.target)).push(e);
+  for (const [target, es] of fanIn) {
+    if (es.length <= 3) continue;
+    const tensors = es.map(e => g.tensors[+e.data.source.slice(2)]);
+    const shapes = [...new Set(tensors.map(t => t.shape))];
+    const id = 'ins:' + target;
+    els.push({ data: { id, label: `${modules(tensors.map(t => t.name))}\n${es.length} inputs${shapes.length === 1 ? ' · ' + shapes[0] : ''}` }, classes: 'io' });
+    els.push({ data: { id: id + '>' + target, source: id, target } });
+    for (const e of es) { e.data.merged = true; const src = e.data.source; if (!els.some(x => x.data.source === src && !x.data.merged)) els.find(x => x.data.id === src).data.merged = true; }
+  }
+  // A unit feeding many later units (per-layer inputs, position tables) keeps one edge and says
+  // how many it feeds, instead of fanning a line into every block.
+  const out = new Map();
+  for (const e of els) if (e.data.source && order.has(e.data.target)) (out.get(e.data.source) || out.set(e.data.source, []).get(e.data.source)).push(e);
+  const drop = new Set();
+  for (const [src, es] of out) {
+    if (es.length <= 3) continue;
+    es.sort((a, b) => order.get(a.data.target) - order.get(b.data.target));
+    es.slice(1).forEach(e => drop.add(e));
+    const node = els.find(e => e.data.id === src);
+    if (node) node.data.label += `\n→ feeds ${es.length} units`;
+  }
+  return els.filter(e => !drop.has(e) && !e.data.merged);
+}
+function ensureIO(els, id, t, out) {
+  if (els.some(e => e.data.id === id)) return;
+  els.push({ data: { id, label: `${out ? 'output' : t.name || 'input'}\n${t.shape}` }, classes: 'io' });
+}
+
+// ---------- detail ----------
+function detailElements(P, sec) {
+  const { g } = P, els = [], inSec = new Set(sec.nodes), added = new Set();
+  const add = (id, data, cls) => { if (!added.has(id)) { added.add(id); els.push({ data: { id, ...data }, classes: cls }); } };
+  const edge = (s, t, cls) => els.push({ data: { id: `${s}>${t}#${els.length}`, source: s, target: t }, classes: cls });
+  for (const id of sec.nodes) {
+    const n = g.nodes[id], mod = P.moduleOf(n);
+    const out = g.tensors[n.output].shape;
+    add('n' + id, { label: `${opName(n)}${mod ? '\n' + mod : ''}${S.tensors ? '' : '\n' + out}`, color: palette().cat[n.category], nid: id }, 'op');
+  }
+  for (const id of sec.nodes) {
+    const n = g.nodes[id];
+    for (const t of new Set(n.inputs)) {
+      const tt = g.tensors[t];
+      if (P.isWeight(t)) {
+        if (!S.weights) continue;
+        add('w' + t, { label: `${leaf(tt.name).split('.').slice(-2).join('.')}\n${tt.shape}`, tid: t }, 'weight');
+        edge('w' + t, 'n' + id, 'wedge');
+        continue;
+      }
+      const p = P.producer(t);
+      const inside = p !== null && inSec.has(p);
+      if (S.tensors) {
+        add('t' + t, { label: tt.shape, tid: t }, inside ? 'tensor' : 'io');
+        edge('t' + t, 'n' + id);
+        if (inside) edge('n' + p, 't' + t);
+      } else if (inside) {
+        edge('n' + p, 'n' + id);
+      } else {
+        add('x' + t, { label: `${tt.name || (p !== null ? 'from ' + (P.sectionOf[p] ? P.sectionOf[p].label : g.nodes[p].op) : 'input')}\n${tt.shape}`, tid: t }, 'io');
+        edge('x' + t, 'n' + id);
+      }
+    }
+  }
+  for (const id of sec.nodes) {
+    const t = g.nodes[id].output;
+    const leaves = P.consumers[t].some(c => !inSec.has(c)) || g.outputs.includes(t);
+    if (!leaves) continue;
+    if (S.tensors) { add('t' + t, { label: g.tensors[t].shape, tid: t }, 'io'); edge('n' + id, 't' + t); }
+    else { add('y' + t, { label: `${g.outputs.includes(t) ? 'output' : 'out'}\n${g.tensors[t].shape}`, tid: t }, 'io'); edge('n' + id, 'y' + t); }
+  }
+  return els;
+}
+
+// ---------- rendering ----------
+let renderToken = 0;
+function render() {
+  const P = prepare(net());
+  writeHash();
+  renderChrome();
+  if (S.view === 'detail') {
+    if (!S.section || !P.sections.some(s => s.key === S.section)) {
+      const first = S.stage ? P.sections.find(s => s.stage === S.stage) : P.sections.find(s => s.key.startsWith('b:')) || P.sections[0];
+      S.section = first ? first.key : null;
+      writeHash();
+    }
+    renderSectionSelect(P);
+  }
+  const els = S.view === 'overview' ? overviewElements(P) : detailElements(P, P.sections.find(s => s.key === S.section));
+  const token = ++renderToken;
+  $('status').textContent = 'Laying out…';
+  setTimeout(() => {
+    if (token !== renderToken) return;
+    if (cy) cy.destroy();
+    cy = cytoscape({ container: $('cy'), elements: els, style: styleSheet(), layout: { name: 'preset' }, minZoom: 0.05, maxZoom: 3, wheelSensitivity: 0.25, boxSelectionEnabled: false });
+    const flow = S.weights && S.view === 'detail' ? cy.elements().not('.weight').not('.wedge') : cy.elements();
+    const lay = flow.layout({ name: 'dagre', rankDir: 'TB', rankSep: S.view === 'overview' ? 36 : 28, nodeSep: 28, edgeSep: 8 });
+    lay.one('layoutstop', () => {
+      placeWeights();
+      $('status').textContent = '';
+      fit();
+      applyStage();
+      if (S.sel) { const e = cy.getElementById(S.sel); if (e.length) { e.select(); } }
+    });
+    lay.run();
+    cy.on('tap', 'node.stagebox', e => selectStage(e.target.data('stage')));
+    cy.on('tap', 'node:not(.stagebox)', e => onTap(e.target));
+    cy.on('tap', e => { if (e.target === cy) { S.sel = null; cy.elements().removeClass('dim hl'); renderPanel(); } });
+    cy.on('dbltap', 'node.group:not(.stagebox), node.run', e => openUnit(e.target.id()));
+    renderPanel();
+  }, 16);
+}
+
+function placeWeights() {
+  if (!S.weights || S.view !== 'detail') return;
+  const stack = {};
+  cy.nodes('.weight').forEach(w => {
+    const op = w.outgoers('node').first();
+    if (!op.length) return;
+    const i = stack[op.id()] = (stack[op.id()] || 0) + 1;
+    w.position({ x: op.position('x') + op.width() / 2 + w.width() / 2 + 16, y: op.position('y') + (i - 1) * (w.height() + 6) });
+  });
+}
+
+function fit() {
+  if (!cy || !cy.elements().length) return;
+  const pad = 40, bottom = 56, bb = cy.elements().boundingBox(), w = cy.width(), h = cy.height() - bottom + pad;
+  const z = Math.min((w - 2 * pad) / bb.w, (h - 2 * pad) / bb.h);
+  if (z >= 0.6) {
+    const zz = Math.min(z, S.view === 'overview' ? 1 : 1.2);
+    cy.zoom(zz);
+    cy.pan({ x: w / 2 - zz * (bb.x1 + bb.x2) / 2, y: (S.view === 'detail' ? 56 : 0) / 2 + h / 2 - zz * (bb.y1 + bb.y2) / 2 });
+    return;
+  }
+  // Too tall to read when fitted: keep text legible and start at the top.
+  const zz = Math.max(Math.min((w - 2 * pad) / bb.w, 1), 0.6);
+  cy.zoom(zz);
+  cy.pan({ x: w / 2 - zz * (bb.x1 + bb.x2) / 2, y: pad + 48 - zz * bb.y1 });
+}
+
+function applyStage() {
+  if (!cy) return;
+  cy.elements().removeClass('dim hl');
+  if (!S.stage || S.view !== 'overview' || isLarge(prepare(net()))) return;
+  const inStage = cy.nodes().filter(n => n.data('stage') === S.stage);
+  if (!inStage.length) return;
+  cy.elements().addClass('dim');
+  inStage.union(inStage.connectedEdges()).removeClass('dim').addClass('hl');
+  cy.animate({ fit: { eles: inStage, padding: 60 }, duration: 260, easing: 'ease-out-cubic' });
+}
+
+function renderSectionSelect(P) {
+  const sel = $('section');
+  let html = '', group = null;
+  for (const s of P.sections) {
+    if (s.stage !== group) {
+      if (group !== null) html += '</optgroup>';
+      group = s.stage;
+      const st = P.net.stages.find(x => x.id === s.stage);
+      html += `<optgroup label="${esc(st ? st.name : s.stage)}">`;
+    }
+    html += `<option value="${esc(s.key)}"${s.key === S.section ? ' selected' : ''}>${esc(s.label)}</option>`;
+  }
+  sel.innerHTML = html + (group !== null ? '</optgroup>' : '');
+}
+
+// ---------- interaction ----------
+function selectStage(id) {
+  S.stage = S.stage === id ? null : id;
+  S.sel = null;
+  if (S.view === 'detail' && S.stage) {
+    const P = prepare(net());
+    const sec = P.sections.find(s => s.stage === S.stage && s.key.startsWith('b:')) || P.sections.find(s => s.stage === S.stage);
+    if (sec) { S.section = sec.key; render(); return; }
+  }
+  if (S.view === 'overview' && isLarge(prepare(net()))) { render(); return; }
+  writeHash(); renderRail(); applyStage(); renderPanel();
+}
+function setView(v) { if (S.view === v) return; S.view = v; S.sel = null; render(); }
+function openSection(key, sel) { S.view = 'detail'; S.section = key; S.sel = sel || null; const P = prepare(net()); const s = P.sections.find(x => x.key === key); if (s) S.stage = s.stage; render(); }
+function openUnit(key) {
+  const P = prepare(net()), u = P.ov.find(x => x.key === key) || P.units.find(x => x.key === key);
+  if (!u) return;
+  openSection(u.kind === 'run' ? 'r:' + u.key : 'b:' + P.g.blocks[u.blocks[0]].id);
+}
+function step(d) {
+  const P = prepare(net()), i = P.sections.findIndex(s => s.key === S.section) + d;
+  if (i >= 0 && i < P.sections.length) { S.section = P.sections[i].key; S.stage = P.sections[i].stage; S.sel = null; render(); }
+}
+function onTap(node) {
+  S.sel = node.id();
+  cy.elements().removeClass('dim hl');
+  const hood = node.closedNeighborhood();
+  cy.elements().addClass('dim'); hood.removeClass('dim').addClass('hl');
+  renderPanel();
+  const d = node.data();
+  post({ type: 'plow-viz:select', network: S.net, view: S.view, id: d.nid !== undefined ? d.nid : d.id, kind: d.nid !== undefined ? 'op' : node.hasClass('group') ? 'block' : 'unit' });
+}
+window.trace = dir => {
+  if (!cy || !S.sel) return;
+  const n = cy.getElementById(S.sel);
+  const set = (dir === 'up' ? n.predecessors() : n.successors()).union(n);
+  cy.elements().addClass('dim').removeClass('hl');
+  set.removeClass('dim').addClass('hl');
+};
+
+// ---------- side panel ----------
+function renderPanel() {
+  const P = prepare(net()), g = P.g, panel = $('panel');
+  const el = S.sel && cy ? cy.getElementById(S.sel) : null;
+  const d = el && el.length ? el.data() : null;
+  if (d && d.nid !== undefined) return panel.innerHTML = opPanel(P, g.nodes[d.nid]);
+  if (d && d.tid !== undefined) return panel.innerHTML = tensorPanel(P, d.tid);
+  if (d && S.view === 'overview') { const u = P.ov.find(x => x.key === d.id); if (u) return panel.innerHTML = unitPanel(P, u); }
+  if (S.view === 'detail') { const sec = P.sections.find(s => s.key === S.section); if (sec) return panel.innerHTML = sectionPanel(P, sec); }
+  if (S.stage) { const st = P.net.stages.find(s => s.id === S.stage); if (st) return panel.innerHTML = stagePanel(P, st); }
+  panel.innerHTML = networkPanel(P);
+}
+
+function composition(P, nodeIds) {
+  const counts = {};
+  for (const id of nodeIds) { const c = P.g.nodes[id].category; counts[c] = (counts[c] || 0) + 1; }
+  const total = nodeIds.length || 1, cat = palette().cat;
+  const entries = Object.entries(CATEGORIES).filter(([k]) => counts[k]);
+  return `<div class="stack">${entries.map(([k]) => `<i style="flex:${counts[k]};background:${cat[k]}"></i>`).join('')}</div>
+    <ul class="list">${entries.map(([k, c]) => `<li><span><i class="sw" style="border-color:${cat[k]};display:inline-block;margin-right:6px;vertical-align:-1px"></i>${esc(c.label)}</span><span>${counts[k]} · ${Math.round(100 * counts[k] / total)}%</span></li>`).join('')}</ul>`;
+}
+const shapes = list => list.length ? `<ul class="list">${list.slice(0, 6).map(s => `<li><span>${esc(s)}</span></li>`).join('')}${list.length > 6 ? `<li><span class="muted">+${list.length - 6} more</span></li>` : ''}</ul>` : '<p class="muted">—</p>';
+
+function tensorList(g, ids, fallback) {
+  const row = t => `<li><span>${esc(g.tensors[t].name || fallback)}</span><span>${esc(g.tensors[t].shape)}</span></li>`;
+  return `<ul class="list">${ids.slice(0, 8).map(row).join('')}${ids.length > 8 ? `<li><span class="muted">+${ids.length - 8} more</span></li>` : ''}</ul>`;
+}
+function networkPanel(P) {
+  const n = P.net, s = n.graph.summary, g = P.g;
+  const hf = /^[\w.-]+\/[\w.-]+$/.test(BUNDLE.source) ? `https://huggingface.co/${BUNDLE.source}` : null;
+  return `<div class="kicker">Network</div><h2>${esc(n.title)}</h2><p>${esc(n.description)}</p>
+    ${hf ? `<p style="margin-top:6px"><a class="link mono" href="${hf}" target="_blank" rel="noopener">${esc(BUNDLE.source)}</a></p>` : ''}
+    <h3>Totals</h3><dl class="kv"><dt>Params</dt><dd>${fmtParams(s.total_params)}</dd><dt>Weight size</dt><dd>${fmtBytes(s.total_weight_bytes)}</dd><dt>Blocks</dt><dd>${s.num_blocks}</dd><dt>Ops</dt><dd>${s.total_nodes}</dd><dt>Tensors</dt><dd>${s.total_tensors}</dd></dl>
+    <h3>Inputs</h3>${tensorList(g, g.inputs, 'input')}
+    <h3>Outputs</h3>${tensorList(g, g.outputs, 'output')}
+    <h3>Ops by category</h3>${composition(P, g.nodes.map(x => x.id))}
+    <p class="muted" style="margin-top:16px">${S.view !== 'overview' ? '' : isLarge(P) ? 'Select a stage to see its blocks.' : 'Select a stage or a node. Double-click a block to open it in Detail.'}</p>`;
+}
+function stagePanel(P, st) {
+  const ids = P.g.nodes.filter(n => n.stage === st.id).map(n => n.id);
+  return `<div class="kicker">Stage ${P.stageIdx.get(st.id) + 1}</div><h2>${esc(st.name)}</h2><p>${esc(st.description)}</p>
+    <h3>Totals</h3><dl class="kv"><dt>Params</dt><dd>${fmtParams(st.param_count)}</dd><dt>Blocks</dt><dd>${st.block_count}</dd><dt>Ops</dt><dd>${ids.length}</dd></dl>
+    <h3>Checkpoint modules</h3>${shapes(st.modules)}
+    <h3>Inputs</h3>${shapes(st.input_shapes)}<h3>Outputs</h3>${shapes(st.output_shapes)}
+    <h3>Ops by category</h3>${composition(P, ids)}
+    <div class="actions"><button class="primary" onclick="openStageDetail()">Open in Detail</button>${isLarge(P) && S.view === 'overview' ? '<button class="ctl" onclick="selectStage(S.stage)">All stages</button>' : ''}</div>`;
+}
+window.openStageDetail = () => { S.view = 'detail'; S.section = null; S.sel = null; render(); };
+function unitPanel(P, u) {
+  const stage = P.net.stages.find(s => s.id === u.stage);
+  if (u.kind === 'pattern') {
+    return `<div class="kicker">Repeating pattern · ${u.blocks.length} blocks</div><h2 class="mono">${esc(blockRange(P, u))}</h2>
+      <p>${esc(stage ? stage.name : '')}: ${u.reps} repetitions of</p>
+      <ul class="list" style="margin-top:8px">${u.period.map(x => `<li><span><button class="link" onclick="openSection('b:${esc(P.g.blocks[x.blocks[0]].id)}')">${x.blocks.length}× ${esc(P.blockKind(x.blocks[0]))}</button></span><span>${fmtParams(P.g.blocks[x.blocks[0]].param_count)} each</span></li>`).join('')}</ul>
+      <h3>Totals</h3><dl class="kv"><dt>Params</dt><dd>${fmtParams(unitParams(P, u))}</dd><dt>Blocks</dt><dd>${u.blocks.length}</dd></dl>
+      <div class="actions"><button class="primary" onclick="openUnit('${u.key}')">Open in Detail</button></div>`;
+  }
+  if (u.kind === 'group') {
+    const b = P.g.blocks[u.blocks[0]];
+    return `<div class="kicker">${u.blocks.length > 1 ? `${u.blocks.length} identical blocks` : 'Block'} · ${esc(P.blockKind(u.blocks[0]))}</div><h2 class="mono">${esc(blockRange(P, u))}</h2>
+      <p>${esc(stage ? stage.name : '')}</p>
+      <h3>Per block</h3><dl class="kv"><dt>Params</dt><dd>${fmtParams(b.param_count)}</dd><dt>Weight size</dt><dd>${fmtBytes(b.weight_bytes)}</dd><dt>Ops</dt><dd>${b.node_ids.length}</dd></dl>
+      ${u.blocks.length > 1 ? `<h3>All ${u.blocks.length}</h3><dl class="kv"><dt>Params</dt><dd>${fmtParams(unitParams(P, u))}</dd></dl>` : ''}
+      <h3>Ops by category</h3>${composition(P, b.node_ids)}
+      <div class="actions"><button class="primary" onclick="openUnit('${u.key}')">Open in Detail</button></div>`;
+  }
+  return `<div class="kicker">${plural(u.nodes.length, 'op')}</div><h2 class="mono">${esc(P.runLabel(u))}</h2><p>${esc(stage ? stage.name : '')}</p>
+    <h3>Ops</h3><ul class="list">${u.nodes.slice(0, 12).map(id => `<li><span>${esc(opName(P.g.nodes[id]))}</span><span>${esc(P.moduleOf(P.g.nodes[id]))}</span></li>`).join('')}${u.nodes.length > 12 ? `<li><span class="muted">+${u.nodes.length - 12} more</span></li>` : ''}</ul>
+    <div class="actions"><button class="primary" onclick="openUnit('${u.key}')">Open in Detail</button></div>`;
+}
+function sectionPanel(P, sec) {
+  const params = sec.nodes.reduce((s, id) => s + P.ownParams[id], 0);
+  const st = P.net.stages.find(s => s.id === sec.stage);
+  return `<div class="kicker">${sec.key.startsWith('b:') ? 'Block' : 'Ops outside blocks'}</div><h2 class="mono">${esc(sec.label)}</h2><p>${esc(st ? st.name : '')}</p>
+    <h3>Totals</h3><dl class="kv"><dt>Params</dt><dd>${fmtParams(params)}</dd><dt>Ops</dt><dd>${sec.nodes.length}</dd></dl>
+    <h3>Ops by category</h3>${composition(P, sec.nodes)}
+    <p class="muted" style="margin-top:16px">Select an op to inspect it. ← → steps through sections.</p>`;
+}
+function opPanel(P, n) {
+  const g = P.g, out = g.tensors[n.output];
+  const weights = n.inputs.filter(P.isWeight);
+  const acts = n.inputs.filter(t => !P.isWeight(t));
+  let params = '';
+  const det = n.detail;
+  const kv = typeof det === 'string' ? {} : Object.values(det)[0];
+  if (kv !== null && typeof kv === 'object') params = Object.entries(kv).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v === null ? '—' : typeof v === 'object' ? JSON.stringify(v) : v)}</dd>`).join('');
+  else if (kv !== undefined && kv !== null) params = `<dt>kind</dt><dd>${esc(kv)}</dd>`;
+  const ref = t => { const p = P.producer(t); return p === null ? '<span class="muted">graph input</span>' : `<button class="link" onclick="jumpOp(${p})">${esc(g.nodes[p].op)} #${p}</button>`; };
+  return `<div class="kicker" style="color:${palette().cat[n.category]}">${esc(CATEGORIES[n.category].label)}</div><h2>${esc(opName(n))}</h2>
+    <p class="mono">${esc(P.moduleOf(n) || (n.block || 'outside blocks'))}</p>
+    ${params ? `<h3>Attributes</h3><dl class="kv">${params}</dl>` : ''}
+    ${weights.length ? `<h3>Weights · ${fmtParams(P.ownParams[n.id])} params</h3><ul class="list">${weights.map(t => { const w = g.tensors[t], o = P.shared(t); return `<li><span>${esc(leaf(w.name))}</span><span>${esc(w.shape)} ${esc(w.dtype)}${w.copies ? ` ×${w.copies}` : ''}</span></li>${w.copies ? `<li><span class="muted">one representative expert drawn for ${w.copies} routed experts</span></li>` : ''}${o !== n.id ? `<li><span class="muted">tied: counted at <button class="link" onclick="jumpOp(${o})">${esc(g.nodes[o].op)} #${o}</button></span></li>` : ''}`; }).join('')}</ul>` : ''}
+    <h3>Inputs</h3><ul class="list">${acts.map(t => `<li><span>${ref(t)}</span><span>${esc(g.tensors[t].shape)}</span></li>`).join('') || '<li><span class="muted">—</span></li>'}</ul>
+    <h3>Output</h3><dl class="kv"><dt>Shape</dt><dd>${esc(out.shape)}</dd><dt>Dtype</dt><dd>${esc(out.dtype)}</dd><dt>Size</dt><dd>${fmtBytes(out.bytes)}</dd></dl>
+    <h3>Used by</h3><ul class="list">${P.consumers[n.output].slice(0, 8).map(c => `<li><span><button class="link" onclick="jumpOp(${c})">${esc(g.nodes[c].op)} #${c}</button></span><span>${esc(P.moduleOf(g.nodes[c]))}</span></li>`).join('') || '<li><span class="muted">network output</span></li>'}</ul>
+    <div class="actions"><button class="ctl" onclick="trace('up')">Trace inputs</button><button class="ctl" onclick="trace('down')">Trace outputs</button></div>`;
+}
+function tensorPanel(P, t) {
+  const tt = P.g.tensors[t], p = P.producer(t);
+  return `<div class="kicker">${tt.origin === 'weight' ? 'Weight' : tt.origin === 'input' ? 'Network input' : 'Tensor'}</div><h2 class="mono">${esc(tt.name || (p !== null ? P.g.nodes[p].op + ' output' : 'tensor'))}</h2>
+    <h3>Value</h3><dl class="kv"><dt>Shape</dt><dd>${esc(tt.shape)}</dd><dt>Dtype</dt><dd>${esc(tt.dtype)}</dd><dt>Size</dt><dd>${fmtBytes(tt.bytes)}</dd>${p !== null ? `<dt>From</dt><dd><button class="link" onclick="jumpOp(${p})">${esc(P.g.nodes[p].op)} #${p}</button></dd>` : ''}</dl>`;
+}
+window.jumpOp = id => {
+  const P = prepare(net()), sec = P.sectionOf[id];
+  if (!sec) return;
+  if (S.view === 'detail' && sec.key === S.section && cy) { cy.$(':selected').unselect(); const e = cy.getElementById('n' + id); e.select(); onTap(e); cy.animate({ center: { eles: e }, duration: 200 }); return; }
+  openSection(sec.key, 'n' + id);
+};
+window.openUnit = openUnit;
+
+// ---------- search ----------
+let hits = [], hitOn = 0;
+function search(q) {
+  const P = prepare(net()), box = $('results');
+  q = q.trim().toLowerCase();
+  if (!q) { box.classList.remove('open'); return; }
+  hits = [];
+  for (const n of P.g.nodes) {
+    const w = n.inputs.filter(P.isWeight).map(t => P.g.tensors[t].name).join(' ');
+    const hay = `${n.op} ${w} ${n.block || ''}`.toLowerCase();
+    if (hay.includes(q)) hits.push(n);
+    if (hits.length >= 40) break;
+  }
+  hitOn = 0;
+  box.innerHTML = hits.length ? hits.map((n, i) => `<button role="option" data-i="${i}" class="${i === 0 ? 'on' : ''}"><span class="w">${esc(opName(n))}</span> <span class="w muted">${esc(P.moduleOf(n))}</span><div class="s">${esc(P.sectionOf[n.id] ? P.sectionOf[n.id].label : '')}</div></button>`).join('') : '<div class="s" style="padding:8px 10px">No matching ops</div>';
+  box.classList.add('open');
+  box.querySelectorAll('button').forEach(b => b.onmousedown = e => { e.preventDefault(); pick(+b.dataset.i); });
+}
+function pick(i) { const n = hits[i]; if (!n) return; $('results').classList.remove('open'); $('q').blur(); jumpOp(n.id); }
+
+// ---------- wiring ----------
+$('v-overview').onclick = () => setView('overview');
+$('v-detail').onclick = () => setView('detail');
+$('network').onchange = e => { S.net = e.target.value; S.stage = null; S.section = null; S.sel = null; render(); };
+$('section').onchange = e => { const P = prepare(net()); S.section = e.target.value; const s = P.sections.find(x => x.key === S.section); S.stage = s ? s.stage : null; S.sel = null; render(); };
+$('prev').onclick = () => step(-1);
+$('next').onclick = () => step(1);
+$('t-weights').onchange = e => { S.weights = e.target.checked; render(); };
+$('t-tensors').onchange = e => { S.tensors = e.target.checked; render(); };
+$('z-in').onclick = () => cy && cy.animate({ zoom: { level: cy.zoom() * 1.3, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } }, duration: 120 });
+$('z-out').onclick = () => cy && cy.animate({ zoom: { level: cy.zoom() / 1.3, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } }, duration: 120 });
+$('z-fit').onclick = fit;
+$('theme').onclick = () => setTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+$('q').oninput = e => search(e.target.value);
+$('q').onblur = () => setTimeout(() => $('results').classList.remove('open'), 100);
+$('q').onkeydown = e => {
+  const btns = $('results').querySelectorAll('button');
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); if (!btns.length) return; btns[hitOn].classList.remove('on'); hitOn = (hitOn + (e.key === 'ArrowDown' ? 1 : btns.length - 1)) % btns.length; btns[hitOn].classList.add('on'); btns[hitOn].scrollIntoView({ block: 'nearest' }); }
+  else if (e.key === 'Enter') { e.preventDefault(); pick(hitOn); }
+  else if (e.key === 'Escape') { e.target.value = ''; $('results').classList.remove('open'); e.target.blur(); }
+  e.stopPropagation();
+};
+document.addEventListener('keydown', e => {
+  if (e.target.matches('input, select')) return;
+  if (e.key === '/') { e.preventDefault(); if (S.view !== 'detail') setView('detail'); setTimeout(() => $('q').focus(), 30); }
+  else if (e.key === 'ArrowLeft' && S.view === 'detail') step(-1);
+  else if (e.key === 'ArrowRight' && S.view === 'detail') step(1);
+  else if (e.key === 'f' || e.key === 'F') fit();
+  else if (e.key === '1') setView('overview');
+  else if (e.key === '2') setView('detail');
+  else if (e.key === 'Escape') { S.sel = null; if (cy) { cy.$(':selected').unselect(); cy.elements().removeClass('dim hl'); } applyStage(); renderPanel(); }
+});
+window.addEventListener('resize', () => cy && cy.resize());
+
+// `?back=/models/<name>`: same-site paths only, so the link cannot point off-site.
+{
+  const back = new URLSearchParams(location.search).get('back');
+  if (back && /^\/(?!\/)[\w\-./]*$/.test(back)) { $('back').href = back; $('back').hidden = false; }
+}
+readHash();
+if (typeof cytoscape === 'undefined') {
+  $('status').textContent = 'The graph library could not load (offline?).';
+  renderChrome();
+} else {
+  render();
+}
+</script>
+</body>
+</html>

@@ -352,3 +352,10 @@ mod tests {
         assert_eq!(DType::F4.tile_bytes(1024), 544);
     }
 }
+
+#[cfg(feature = "models")]
+impl serde::Serialize for DType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}

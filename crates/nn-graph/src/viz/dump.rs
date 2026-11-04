@@ -7,7 +7,12 @@ use std::fs;
 use std::path::Path;
 
 /// Dump visualization assets into a target directory.
-pub fn dump_assets(bundle: &VizModelBundle, dir: &Path) -> Result<(), String> {
+/// `script_base`: see [`render_html`].
+pub fn dump_assets(
+    bundle: &VizModelBundle,
+    dir: &Path,
+    script_base: Option<&str>,
+) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("cannot create dir {}: {e}", dir.display()))?;
 
     // 1. Model data JSON
@@ -21,8 +26,12 @@ pub fn dump_assets(bundle: &VizModelBundle, dir: &Path) -> Result<(), String> {
         "title": bundle.title,
         "source": bundle.source,
         "modality": bundle.modality,
-        "stages": bundle.stages,
-        "summary": bundle.summary,
+        "networks": bundle.networks.iter().map(|n| serde_json::json!({
+            "id": n.id,
+            "title": n.title,
+            "stages": n.stages,
+            "summary": n.graph.summary,
+        })).collect::<Vec<_>>(),
     }))
     .map_err(|e| format!("cannot serialize pipeline summary: {e}"))?;
     fs::write(dir.join("pipeline.json"), &pipeline_json)
@@ -34,12 +43,12 @@ pub fn dump_assets(bundle: &VizModelBundle, dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot write pipeline.svg: {e}"))?;
 
     // 4. Standalone HTML
-    let index_html = render_html(bundle, false);
+    let index_html = render_html(bundle, false, script_base);
     fs::write(dir.join("index.html"), &index_html)
         .map_err(|e| format!("cannot write index.html: {e}"))?;
 
     // 5. Embeddable HTML
-    let embed_html = render_html(bundle, true);
+    let embed_html = render_html(bundle, true, script_base);
     fs::write(dir.join("embed.html"), &embed_html)
         .map_err(|e| format!("cannot write embed.html: {e}"))?;
 

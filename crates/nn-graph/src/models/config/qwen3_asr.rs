@@ -11,21 +11,19 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Qwen3AudioConfig {
     /// Hidden dimension of the audio encoder transformer.
-    #[serde(alias = "hidden_size")]
     pub d_model: i64,
     /// Number of transformer encoder layers.
-    #[serde(alias = "num_hidden_layers")]
     pub encoder_layers: u32,
     /// Number of attention heads in the audio encoder.
-    #[serde(alias = "num_attention_heads")]
     pub encoder_attention_heads: u32,
     /// Intermediate dimension of the audio encoder feed-forward network.
-    #[serde(alias = "intermediate_size")]
     pub encoder_ffn_dim: i64,
     /// Output dimension of the audio-to-text projection, matching text hidden size.
     pub output_dim: i64,
     /// Input mel-spectrogram filterbank dimension.
     pub num_mel_bins: i64,
+    /// Channel count of the 2D-conv front-end.
+    pub downsample_hidden_size: i64,
     /// Temporal downsampling factor of the 2D conv front-end.
     pub downsample_rate: u32,
     /// Maximum source positions / frames accepted by the encoder.
@@ -44,6 +42,7 @@ impl Default for Qwen3AudioConfig {
             encoder_ffn_dim: 4096,
             output_dim: 2048,
             num_mel_bins: 128,
+            downsample_hidden_size: 480,
             downsample_rate: 4,
             max_source_positions: 1500,
             torch_dtype: None,

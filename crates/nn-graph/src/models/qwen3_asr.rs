@@ -140,13 +140,14 @@ fn audio_encoder_core(
     let head_dim = cfg.head_dim();
     let ffn_dim = cfg.encoder_ffn_dim;
     let eps = 1e-5f32;
+    let ch = cfg.downsample_hidden_size;
 
     // Conv2d front-end: 2x downsampling stage 1
     let conv1 = nn.conv2d(
         "thinker.audio_tower.conv1",
         mel,
         1,
-        480,
+        ch,
         (3, 3),
         (2, 2),
         (1, 1),
@@ -158,8 +159,8 @@ fn audio_encoder_core(
     let conv2 = nn.conv2d(
         "thinker.audio_tower.conv2",
         conv1,
-        480,
-        480,
+        ch,
+        ch,
         (3, 3),
         (2, 2),
         (1, 1),
@@ -167,17 +168,9 @@ fn audio_encoder_core(
     );
     let conv2 = nn.act(ActKind::Gelu, conv2);
 
-    // Flatten 480 channels x reduced mel freq into features, then linear project to d_model
-    // 128 mel bins -> 64 -> 32; 480 * 32 / 2 = 7680
-    let flat_dim = 480 * (cfg.num_mel_bins / 4);
+    let flat_dim = ch * (cfg.num_mel_bins / 4);
     let reshaped = nn.reshape(conv2, [b.clone(), t_sub.clone(), Dim::stat(flat_dim)]);
-    let mut x = nn.linear(
-        "thinker.audio_tower.conv_out",
-        reshaped,
-        flat_dim,
-        d,
-        false,
-    );
+    let mut x = nn.linear("thinker.audio_tower.conv_out", reshaped, flat_dim, d, false);
 
     // Positional embedding addition
     let pos = nn.param(
@@ -308,12 +301,22 @@ fn text_attention(
     );
 
     let q = if cfg.use_qk_norm {
-        nn.rmsnorm(&format!("{p}.self_attn.q_norm"), q, head_dim, cfg.rms_norm_eps)
+        nn.rmsnorm(
+            &format!("{p}.self_attn.q_norm"),
+            q,
+            head_dim,
+            cfg.rms_norm_eps,
+        )
     } else {
         q
     };
     let k = if cfg.use_qk_norm {
-        nn.rmsnorm(&format!("{p}.self_attn.k_norm"), k, head_dim, cfg.rms_norm_eps)
+        nn.rmsnorm(
+            &format!("{p}.self_attn.k_norm"),
+            k,
+            head_dim,
+            cfg.rms_norm_eps,
+        )
     } else {
         k
     };
@@ -322,18 +325,36 @@ fn text_attention(
     let k = nn.rope(k, head_dim as u32, cfg.rope_theta);
 
     let attn = nn.attention(q, k, v, nh, nkv, head_dim as u32, true, None, None);
-    let merged = nn.reshape(attn, [b.clone(), s.clone(), Dim::stat(h)]);
-    nn.linear(&format!("{p}.self_attn.o_proj"), merged, h, h, false)
+    let width = i64::from(nh) * head_dim;
+    let merged = nn.reshape(attn, [b.clone(), s.clone(), Dim::stat(width)]);
+    nn.linear(&format!("{p}.self_attn.o_proj"), merged, width, h, false)
 }
 
 fn swiglu_mlp(nn: &mut Nn, cfg: &Qwen3Config, p: &str, x: TensorId, h: i64) -> TensorId {
-    let gate = nn.linear(&format!("{p}.mlp.gate_proj"), x, h, cfg.intermediate_size, false);
-    let up = nn.linear(&format!("{p}.mlp.up_proj"), x, h, cfg.intermediate_size, false);
+    let gate = nn.linear(
+        &format!("{p}.mlp.gate_proj"),
+        x,
+        h,
+        cfg.intermediate_size,
+        false,
+    );
+    let up = nn.linear(
+        &format!("{p}.mlp.up_proj"),
+        x,
+        h,
+        cfg.intermediate_size,
+        false,
+    );
     let gate = nn.act(ActKind::Silu, gate);
     let hidden = nn.mul(gate, up);
-    nn.linear(&format!("{p}.mlp.down_proj"), hidden, cfg.intermediate_size, h, false)
+    nn.linear(
+        &format!("{p}.mlp.down_proj"),
+        hidden,
+        cfg.intermediate_size,
+        h,
+        false,
+    )
 }
-
 
 #[cfg(test)]
 mod tests {

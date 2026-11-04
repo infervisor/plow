@@ -10,6 +10,7 @@
 pub mod config;
 
 mod deepseek;
+mod flux;
 mod gemma;
 mod gemma4_multimodal;
 mod glm;
@@ -106,6 +107,7 @@ pub fn build_graph(cfg: &ModelConfig, bucket: &ShapeBucket) -> Result<Graph, Bui
         ModelConfig::Siglip(c) => siglip::build(c),
         ModelConfig::QwenVl(c) => qwen_vl::build(c),
         ModelConfig::QwenImageDit(c) => qwen_image_dit::build(c, bucket),
+        ModelConfig::Flux(c) => flux::build(c, bucket),
         ModelConfig::QwenImageVae(c) => qwen_image_vae::build(c, bucket),
         ModelConfig::Snac(c) => snac::build(c),
         ModelConfig::S3Gen(c) => s3gen::build(c),
@@ -138,11 +140,14 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
                 ModelConfig::Siglip(_) => "siglip",
                 ModelConfig::QwenVl(_) => "qwen_vl",
                 ModelConfig::QwenImageDit(_) => "qwen_image_dit",
+                ModelConfig::Flux(_) => "flux",
                 ModelConfig::QwenImageVae(_) => "qwen_image_vae",
                 ModelConfig::Snac(_) => "snac",
                 ModelConfig::S3Gen(_) => "chatterbox_s3gen",
                 ModelConfig::Qwen35(_) => "qwen3_5",
-                ModelConfig::Llama(_) | ModelConfig::Qwen3(_) | ModelConfig::Qwen3Asr(_) => unreachable!(),
+                ModelConfig::Llama(_) | ModelConfig::Qwen3(_) | ModelConfig::Qwen3Asr(_) => {
+                    unreachable!()
+                }
             }))
         }
     };

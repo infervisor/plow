@@ -763,8 +763,8 @@ struct VizCli {
     #[arg(long, default_value = "graph.html")]
     out: PathBuf,
 
-    /// Open the browser automatically after starting the server.
-    #[arg(long, default_value_t = true)]
+    /// Open the browser automatically after starting the server (`--open false` to disable).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     open: bool,
 
     /// Render or serve an embeddable HTML widget (compact layout, no reload bar, postMessage support).
@@ -779,7 +779,16 @@ struct VizCli {
     #[arg(long)]
     export_svg: Option<PathBuf>,
 
-    /// Preselected sub-network (e.g. `composite`, `audio_encoder`, `thinker_decoder`).
+    /// Load the graph libraries from this URL prefix instead of the jsdelivr CDN
+    /// (`cytoscape.min.js`, `dagre.min.js`, `cytoscape-dagre.js`), e.g. `/viz/lib`.
+    #[arg(long)]
+    script_base: Option<String>,
+
+    /// Title shown by the viewer (default: the checkpoint/repo name), e.g. `"Gemma 4 E2B"`.
+    #[arg(long)]
+    title: Option<String>,
+
+    /// Network to open first (`full` by default; Qwen3-ASR also has `audio_tower`, `thinker`; diffusers repos use component names).
     #[arg(long)]
     network: Option<String>,
 }
@@ -2995,116 +3004,80 @@ fn viz_build_bundle(
     seq: Option<i64>,
     network_override: Option<&str>,
 ) -> Result<nn_graph::viz::VizModelBundle, String> {
-    let p = std::path::Path::new(src);
-    let (json, title) = if p.is_dir() {
-        let json = std::fs::read_to_string(p.join("config.json"))
-            .map_err(|e| format!("cannot read config.json in {src:?}: {e}"))?;
-        (json, plowc::hf_config::dir_slug(p))
-    } else if p.is_file() {
-        let json = std::fs::read_to_string(p).map_err(|e| format!("cannot read {src:?}: {e}"))?;
-        let title = p
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "network".into());
-        (json, title)
-    } else {
-        info!(model = %src, "resolving model config from HuggingFace hub");
-        let json = nn_graph::hub::fetch_config(src)
-            .map_err(|e| format!("hub fetch failed for {src:?}: {e}"))?;
-        (json, src.rsplit('/').next().unwrap_or(src).to_string())
-    };
-
-    let json = viz_strip_vision(&json);
-
-    let mut bundle = if let Ok(cfg) = nn_graph::models::ModelConfig::from_json(&json) {
-        nn_graph::viz::bundle_from_model_config(&cfg, &title, src)
-            .map_err(|e| format!("viz bundle build failed for {src:?}: {e}"))?
-    } else {
-        let g = nn_graph::models::build_from_config_json_at(
-            &json,
-            &nn_graph::models::ShapeBucket::default(),
-        )
-        .map_err(|e| format!("graph build failed for {src:?}: {e}"))?;
-        nn_graph::viz::bundle_from_graph(
-            &g,
-            &title,
-            src,
-            "custom",
-            nn_graph::viz::ModelModality::Llm,
-        )
-    };
-
-    if let Some(net) = network_override {
-        if bundle.networks.contains_key(net) {
-            bundle.default_network = net.to_string();
-        }
-    }
-
-    if batch.is_some() || seq.is_some() {
-        for sub in bundle.networks.values_mut() {
-            for t in &mut sub.graph.tensors {
-                if let Some(b_val) = batch {
-                    if t.shape.contains('B') {
-                        t.shape = t.shape.replace('B', &b_val.to_string());
-                    }
-                }
-                if let Some(s_val) = seq {
-                    if t.shape.contains('S') {
-                        t.shape = t.shape.replace('S', &s_val.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(bundle)
-}
-
-/// Build a graph for viz from a single source string: a checkpoint directory
-/// (containing `config.json`), a config/net JSON file, or an HF model id.
-/// `batch`/`seq` bind the symbolic B/S so every inferred shape comes out
-/// concrete; absent, shapes stay symbolic.
-#[allow(dead_code)]
-fn viz_build(
-    src: &str,
-    batch: Option<i64>,
-    seq: Option<i64>,
-) -> Result<(nn_graph::Graph, String), String> {
-    let p = std::path::Path::new(src);
-    let (json, title) = if p.is_dir() {
-        let json = std::fs::read_to_string(p.join("config.json"))
-            .map_err(|e| format!("cannot read config.json in {src:?}: {e}"))?;
-        (json, plowc::hf_config::dir_slug(p))
-    } else if p.is_file() {
-        let json = std::fs::read_to_string(p).map_err(|e| format!("cannot read {src:?}: {e}"))?;
-        let title = p
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "network".into());
-        (json, title)
-    } else {
-        info!(model = %src, "resolving model config from HuggingFace hub");
-        let json = nn_graph::hub::fetch_config(src)
-            .map_err(|e| format!("hub fetch failed for {src:?}: {e}"))?;
-        (json, src.rsplit('/').next().unwrap_or(src).to_string())
-    };
-
-    let json = viz_strip_vision(&json);
-    let mut g = nn_graph::models::build_from_config_json_at(
-        &json,
-        &nn_graph::models::ShapeBucket::default(),
-    )
-    .map_err(|e| format!("graph build failed for {src:?}: {e}"))?;
-
-    let mut b = nn_graph::Bindings::new();
+    let mut bind = nn_graph::Bindings::new();
     if let Some(v) = batch {
-        b.insert("B", v);
+        bind.insert("B", v);
     }
     if let Some(v) = seq {
-        b.insert("S", v);
+        bind.insert("S", v);
+        bind.insert("L", v);
     }
-    g.bind(&b);
-    Ok((g, title))
+
+    let p = std::path::Path::new(src);
+    // `…/models--org--name/snapshots/<sha>` (the HF cache) is titled `name`.
+    let name = |p: &std::path::Path| {
+        let file = |p: &std::path::Path| p.file_name().map(|s| s.to_string_lossy().into_owned());
+        let repo = p
+            .parent()
+            .filter(|s| file(s).as_deref() == Some("snapshots"))
+            .and_then(|s| s.parent())
+            .and_then(file)
+            .and_then(|r| r.rsplit("--").next().map(String::from));
+        repo.or_else(|| file(p)).unwrap_or_else(|| src.to_string())
+    };
+    let (json, title) = if p.is_dir() {
+        if p.join("model_index.json").is_file() && !p.join("config.json").is_file() {
+            let index = std::fs::read_to_string(p.join("model_index.json"))
+                .map_err(|e| format!("cannot read model_index.json in {src:?}: {e}"))?;
+            let read = |f: &str| std::fs::read_to_string(p.join(f)).map_err(|e| e.to_string());
+            let bundle = nn_graph::viz::bundle_from_diffusers(&index, read, &name(p), src, &bind)?;
+            return viz_pick_network(bundle, network_override);
+        }
+        let json = std::fs::read_to_string(p.join("config.json"))
+            .map_err(|e| format!("cannot read config.json in {src:?}: {e}"))?;
+        (json, name(p))
+    } else if p.is_file() {
+        let json = std::fs::read_to_string(p).map_err(|e| format!("cannot read {src:?}: {e}"))?;
+        let title = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "network".into());
+        (json, title)
+    } else {
+        info!(model = %src, "resolving model config from HuggingFace hub");
+        let title = src.rsplit('/').next().unwrap_or(src).to_string();
+        match nn_graph::hub::fetch_config(src) {
+            Ok(json) => (json, title),
+            Err(config_err) => {
+                let Ok(index) = nn_graph::hub::fetch_file(src, "model_index.json") else {
+                    return Err(format!("hub fetch failed for {src:?}: {config_err}"));
+                };
+                let read = |f: &str| nn_graph::hub::fetch_file(src, f).map_err(|e| e.to_string());
+                let bundle =
+                    nn_graph::viz::bundle_from_diffusers(&index, read, &title, src, &bind)?;
+                return viz_pick_network(bundle, network_override);
+            }
+        }
+    };
+
+    let json = viz_strip_vision(&json);
+    let bundle = nn_graph::viz::bundle_from_config_json(&json, &title, src, &bind)
+        .map_err(|e| format!("viz build failed for {src:?}: {e}"))?;
+    viz_pick_network(bundle, network_override)
+}
+
+fn viz_pick_network(
+    mut bundle: nn_graph::viz::VizModelBundle,
+    network: Option<&str>,
+) -> Result<nn_graph::viz::VizModelBundle, String> {
+    if let Some(net) = network {
+        if !bundle.networks.iter().any(|n| n.id == net) {
+            let ids: Vec<&str> = bundle.networks.iter().map(|n| n.id.as_str()).collect();
+            return Err(format!("unknown network {net:?}; this model has {ids:?}"));
+        }
+        bundle.default_network = net.to_string();
+    }
+    Ok(bundle)
 }
 
 /// Percent-decode a URL query value (enough for model ids and paths).
@@ -3222,24 +3195,27 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     };
 
-    let bundle = viz_build_bundle(
+    let mut bundle = viz_build_bundle(
         &source,
         cli.batch.first().copied(),
         cli.seq.first().copied(),
         v.network.as_deref(),
     )?;
+    if let Some(title) = &v.title {
+        bundle.title = title.clone();
+    }
     info!(
         title = %bundle.title,
         modality = ?bundle.modality,
-        stages = bundle.stages.len(),
+        stages = bundle.default_network().stages.len(),
         networks = bundle.networks.len(),
-        params = bundle.summary.total_params,
+        params = bundle.default_graph().summary.total_params,
         "model visualization bundle constructed"
     );
 
     // 1. Asset dump mode: write all visualization assets to directory
     if let Some(ref dir) = v.dump_assets {
-        nn_graph::viz::dump_assets(&bundle, dir)?;
+        nn_graph::viz::dump_assets(&bundle, dir, v.script_base.as_deref())?;
         info!(dir = %dir.display(), "dumped all visualizer assets");
     }
 
@@ -3252,7 +3228,7 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Port 0: file-dump mode (standalone or embed HTML)
     if v.port == 0 {
-        let html = nn_graph::viz::render_html(&bundle, v.embed);
+        let html = nn_graph::viz::render_html(&bundle, v.embed, v.script_base.as_deref());
         std::fs::write(&v.out, &html)?;
         info!(path = %v.out.display(), embed = v.embed, "wrote graph visualization HTML");
         return Ok(());
@@ -3299,7 +3275,7 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or("/");
 
         let (content_type, body): (&str, Vec<u8>) = if path == "/embed" {
-            let html = nn_graph::viz::render_html(&bundle, true);
+            let html = nn_graph::viz::render_html(&bundle, true, v.script_base.as_deref());
             ("text/html; charset=utf-8", html.into_bytes())
         } else if path == "/svg" {
             let svg = nn_graph::viz::bundle_to_svg(&bundle);
@@ -3330,40 +3306,8 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => serde_json::json!({ "error": e }),
             };
             ("application/json", json.to_string().into_bytes())
-        } else if let Some(query) = path
-            .strip_prefix("/graph")
-            .and_then(|r| r.strip_prefix('?'))
-        {
-            // /graph?model=…&batch=…&seq=… → legacy compatibility
-            let mut model = String::new();
-            let (mut batch, mut seq) = (None, None);
-            for kv in query.split('&') {
-                let mut it = kv.splitn(2, '=');
-                match (it.next(), it.next()) {
-                    (Some("model"), Some(val)) => model = urldecode(val),
-                    (Some("batch"), Some(val)) => batch = urldecode(val).parse().ok(),
-                    (Some("seq"), Some(val)) => seq = urldecode(val).parse().ok(),
-                    _ => {}
-                }
-            }
-            let src = if model.is_empty() {
-                source.clone()
-            } else {
-                model
-            };
-            let json = match viz_build_bundle(&src, batch, seq, None) {
-                Ok(b) => {
-                    info!(source = %src, ?batch, ?seq, "rebuilt graph for viz request");
-                    serde_json::json!({ "title": b.title, "graph": serde_json::to_value(b.default_graph()).unwrap_or_default() })
-                }
-                Err(e) => {
-                    error!(source = %src, error = %e, "viz rebuild failed");
-                    serde_json::json!({ "error": e })
-                }
-            };
-            ("application/json", json.to_string().into_bytes())
         } else {
-            let html = nn_graph::viz::render_html(&bundle, v.embed);
+            let html = nn_graph::viz::render_html(&bundle, v.embed, v.script_base.as_deref());
             ("text/html; charset=utf-8", html.into_bytes())
         };
 

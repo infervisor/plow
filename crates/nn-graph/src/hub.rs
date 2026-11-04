@@ -971,22 +971,28 @@ pub fn build_from_metadata(
 /// Visualization and architecture inspection do not require a safetensors
 /// index or tokenizer assets. Compilation uses [`resolve_model_metadata`].
 pub fn fetch_config(model_id: &str) -> Result<String, HubError> {
+    fetch_file(model_id, "config.json")
+}
+
+/// Download one repo file (e.g. `model_index.json`, `transformer/config.json`) and return its
+/// contents. `model_id` may also be a local directory.
+pub fn fetch_file(model_id: &str, file: &str) -> Result<String, HubError> {
     let local = Path::new(model_id);
     if local.is_dir() {
-        return read_config(model_id, local.join("config.json"));
+        return read_config(model_id, local.join(file));
     }
 
     use hf_hub::{api::sync::ApiBuilder, Cache};
 
     let cache = Cache::from_env().model(model_id.to_string());
-    let cached = cache.get("config.json");
+    let cached = cache.get(file);
     let offline = std::env::var("HF_HUB_OFFLINE").is_ok_and(|value| {
         !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
     });
     if offline {
         let path = cached.ok_or_else(|| {
             HubError::Hub(format!(
-                "{model_id}: config.json is not available in the Hugging Face cache \
+                "{model_id}: {file} is not available in the Hugging Face cache \
                  (HF_HUB_OFFLINE is set)"
             ))
         })?;
@@ -997,7 +1003,7 @@ pub fn fetch_config(model_id: &str) -> Result<String, HubError> {
         .with_progress(false)
         .build()
         .map_err(|e| HubError::Hub(e.to_string()))?;
-    let path = match api.model(model_id.to_string()).get("config.json") {
+    let path = match api.model(model_id.to_string()).get(file) {
         Ok(path) => path,
         Err(_) if cached.is_some() => cached.expect("checked above"),
         Err(error) => return Err(HubError::Hub(error.to_string())),

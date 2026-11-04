@@ -238,12 +238,7 @@ impl Ctx<'_> {
                         .map(|d| d.add(&Dim::stat(1)))
                         .unwrap_or_else(|| x.dim(3).clone())
                 };
-                Ok(Shape::new([
-                    x.dim(0).clone(),
-                    out_c,
-                    oh,
-                    ow,
-                ]))
+                Ok(Shape::new([x.dim(0).clone(), out_c, oh, ow]))
             }
 
             Op::Conv3d { stride, padding } => {
