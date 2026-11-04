@@ -3,7 +3,7 @@
 # prefill (concurrent prompts share one launch), prefix cache on (the KV block store captures the
 # GDN state at the prompt-end boundary). Production recipe for this model/GPU/precision.
 #
-#   PYREF=/opt/pytorch/bin/python3 PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
+#   PYREF=<python with torch> PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3.8-27b/sm90a-h100-tp1.toml --out <fresh dir>
 #
 # Qualified (2026-10-11, plowrt 8d25a203, packet a6d706647465f718, pairing 0xc3f74a8e97e4d467): FP32-reference gate PASS at c1,
@@ -91,7 +91,7 @@
 #                         interpreter pair is as fast or faster (build72 ab72_mid2, ab71)
 #   prefill interleave    1024-row chunks with the decode rows riding each (gdn_ride + rider attention;
 #                         PLOW_PF_INTERLEAVE = 1024 below); the chain's pointwise segments of a chunk run
-#                         as light launches on the decode object (PLOW_QWEN_LIGHT_OCC 4; branch-free
+#                         as light launches on the decode object (PLOW_GDN_LIGHT_OCC 4; branch-free
 #                         sigmoid/SiLU, rolled conv tile: light table 11.6 -> 9.9 ms per chunk, prefill
 #                         digest unchanged); 4K c16/c32/c64 tok/s 7032 / 8536 / 8841 (build77)
 #   step ms B1/8/16/32/48 23.8/27.2/31.0/38.8/48.0 (ctx 1K, build48; build32 23.75/27.46/31.43/
@@ -108,7 +108,7 @@
 # 0.95x, TTFT/TPOT P99 3.9x/1.8x, SLO met 63 vs 99 %; 0.7 overloads plowrt. Decode ~25 ms at 4 rows,
 # 1024-row prefill chunk 89 ms, and prefix hit 52 -> 13 % under load (vLLM 63-69 %). Serve tunes not run.
 # 2026-10-28 (branch qwen-prefix, plowrt 87e820a40, same packet cb2ea611523da092; serve env below
-# plus PLOW_VMM_HOST_CACHE_MIB=63488, the 62 GiB pinned host tier the planned MemTotal/4 default
+# plus PLOW_HOST_KVCACHE_SIZE=62GB, the 62 GiB pinned host tier the planned MemTotal/4 default
 # gives on this 249 GB box): prefix retention fixed in plowrt (GDN state captured at the shared
 # system-prompt end and at awaited checkpoints, no host-tier wipe under device pressure, spills paced
 # at 256 MiB in flight, failed refills keep their host bytes). Prod mix at 0.45 vs vLLM 0.29: tok/s
@@ -122,7 +122,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "ecb90f0d1c999c2d6838eb58d84c5e52ff1c5098"
+plow_git = "b3a2168bda58119c2c28a83183165728bae0a6d5"
 network = "qwen3.5"
 
 [target]
@@ -232,7 +232,7 @@ PLOW_NV_FA_RG_U = "8"
 PLOW_QWEN_GDN_ISOLATE = "4"
 # Decode projections on rungs >= 16 as cuBLASLt segments (496 per rung; fuse_ab / fuse_mlp / fold
 # off there, the generated attention and GDN step routes beside them; plowrt merges the route
-# tables, runs the rung's pointwise windows as light launches (PLOW_QWEN_LIGHT_DECODE) and
+# tables, runs the rung's pointwise windows as light launches (PLOW_GDN_LIGHT_DECODE) and
 # graph-captures the rung with the generated attention's split count pinned to the SM cover
 # (PLOW_GEN_DECODE_PIN_NSPLIT)). Rung 8 keeps the native walks (its roles differ under
 # GDN_ISOLATE=16). build105: B1-8 bit-identical, B16/32/48 29.77/36.13/41.00 -> 29.51/33.09/34.78
@@ -247,7 +247,7 @@ PLOW_QWEN_GDN_ISOLATE = "4"
 # with identical digests; from 1 row B1/B2 22.19/23.16 -> 22.94/23.47 ms (not taken). --same 8 x 4K
 # 8/8. FP32 gate c1/c8/c32 PASS: kl_trim 0.000461/0.000450/0.000415 vs vLLM 0.000338/0.000346/
 # 0.000356, top1_decisive 0.9988/0.9988/1, cont_frac 0.862/0.874/0.883 vs 0.861/0.866/0.870, needle 1.
-# Evidence: /opt/dlami/nvme/lava-tts/route-sweep (C/qwen, gates/qwenbf16-lt4i).
+# Evidence: <lab scratch>/route-sweep (C/qwen, gates/qwenbf16-lt4i).
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "4"
 # Remainder split-K in the mma row-block walks; rungs 1..4 take the K8 tensor-core walk too
@@ -281,10 +281,10 @@ PLOW_PREFIX_CACHE = "1"
 PLOW_VMM_PREFIX = "1"
 # Prefill in 1024-row chunks with the decode rows riding each chunk (gdn_ride + rider attention):
 # the 4K / 15K serving grids (lc43 plow4k_k1 / plow15k_k1, build64) ran here; the chain's
-# pointwise segments of a chunk are light launches (PLOW_QWEN_LIGHT_OCC default 4) and the decode
+# pointwise segments of a chunk are light launches (PLOW_GDN_LIGHT_OCC default 4) and the decode
 # attention from four rows the generated flash-decode object (PLOW_GEN_DECODE_STEP default 4).
 # A packed chunk's chain replays as CUDA graph pieces between its per-tick launches
-# (PLOW_QWEN_PF_GRAPH default on; grid110 on the build106 packet: 4K tok/s 241.0/293.7/305.1,
+# (PLOW_GDN_PF_GRAPH default on; grid110 on the build106 packet: 4K tok/s 241.0/293.7/305.1,
 # TTFT p99 5865/11929/24524, TPOT p99 59.7/96.8/98.0; 15K 82.1/83.9/84.8, 22946/46136/92517,
 # 101.1/101.3/101.5; digests unchanged; gate110/110b/110c c1/c8/c32 PASS, c32 on the third serve
 # with a graphs-off control serve at 0.8572 cont_frac beside the 0.8402 pass). The packed compact

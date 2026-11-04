@@ -10,6 +10,7 @@
 //! ladder — so a packet that ships today behaves exactly as it does today.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use plow_asset::extension::{
     self, Arenas, Budget, ConfigAxes, ExtensionFacts, KvRing, ParentFacts, Refusal, Requires,
@@ -18,6 +19,7 @@ use plow_asset::extension::{
 };
 
 use crate::asset::devblob::DevBlob;
+use crate::asset::packet_image::BuildInfo;
 use crate::{Result, RuntimeError};
 
 /// Extension directories are searched for as `<assets>.ext/*`, a SIBLING of the serving
@@ -128,20 +130,13 @@ fn blob_axes(blob: &DevBlob, axes: &mut ConfigAxes) {
 /// manifest existed have none, and the loader has always accepted them. It IS an error the
 /// moment an extension is present, because `build.json` is where the parent states the facts
 /// rules 4 and 6 need, and guessing past a missing one is how a check stops checking.
-fn parent_manifest(assets: &Path) -> Result<Option<serde_json::Value>> {
-    let path = assets.join("build.json");
-    match std::fs::read(&path) {
-        Ok(raw) => serde_json::from_slice(&raw)
-            .map(Some)
-            .map_err(|source| RuntimeError::Json { path, source }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(RuntimeError::Io { path, source }),
-    }
+fn parent_manifest(assets: &Path) -> Result<Option<Arc<BuildInfo>>> {
+    BuildInfo::in_dir(assets)
 }
 
-fn pairing_hash(manifest: Option<&serde_json::Value>) -> Option<u64> {
+fn pairing_hash(manifest: Option<&BuildInfo>) -> Option<u64> {
     manifest
-        .and_then(|m| m.pointer("/pairing/hash"))
+        .and_then(|m| m.pairing.as_ref()?.get("hash"))
         .and_then(|v| v.as_str())
         .and_then(extension::parse_pairing_hash)
 }
@@ -151,10 +146,10 @@ fn pairing_hash(manifest: Option<&serde_json::Value>) -> Option<u64> {
 /// `shapes.kv_window` / `shapes.kv_ring_rows` are what phase 4 must make `plowc` record.
 /// `shapes.kv_window == 0` is an all-global model and therefore full-causal; a packet whose
 /// manifest states neither is [`KvRing::Unstated`], which refuses only a WIDER bucket.
-fn kv_ring(manifest: Option<&serde_json::Value>) -> KvRing {
+fn kv_ring(manifest: Option<&BuildInfo>) -> KvRing {
     let get = |k: &str| {
         manifest
-            .and_then(|m| m.pointer(&format!("/shapes/{k}")))
+            .and_then(|m| m.shapes.as_ref()?.get(k))
             .and_then(serde_json::Value::as_u64)
     };
     match (get("kv_window"), get("kv_ring_rows")) {
@@ -194,7 +189,7 @@ pub fn parent_facts(assets: &Path, image: &[u8], blob: &DevBlob) -> Result<Paren
         tensor_count: blob.tensors.len() as u32,
         tensor_digest: blob.tensor_table_digest(),
         config,
-        kv: kv_ring(manifest.as_ref()),
+        kv: kv_ring(manifest.as_deref()),
         programs: blob.program_roles(),
         decode_batch,
         arenas: Arenas {
@@ -206,7 +201,7 @@ pub fn parent_facts(assets: &Path, image: &[u8], blob: &DevBlob) -> Result<Paren
             // engine allocates per program at load, so a wider program simply allocates more.
             growable: true,
         },
-        pairing_hash: pairing_hash(manifest.as_ref()),
+        pairing_hash: pairing_hash(manifest.as_deref()),
     })
 }
 
@@ -314,6 +309,11 @@ pub fn load(
         .iter()
         .map(|d| load_one(d, l2_dispatch_ok))
         .collect::<Result<_>>()?;
+    for l in &loaded {
+        l.blob
+            .check_tensor_handles(blob.tensors.len())
+            .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", l.dir.display())))?;
+    }
     let facts: Vec<ExtensionFacts> = loaded.iter().map(|l| l.facts.clone()).collect();
     let merged =
         extension::merge(&parent, &facts).map_err(|r| RuntimeError::Rejected(r.to_string()))?;

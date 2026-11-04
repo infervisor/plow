@@ -145,7 +145,7 @@ is worth ~14 pt and the first-turn loss ~6.5 pt; either closes the gap, both pas
 
 ### A.1 Host tier for boundary snapshots
 
-Today's snapshot host tier (`PLOW_VMM_HOST_CACHE_MIB`, pinned 1 GiB chunks, 4 spills in flight,
+Today's snapshot host tier (`PLOW_HOST_KVCACHE_SIZE`, pinned 1 GiB chunks, 4 spills in flight,
 `vmm.rs:1933-2010`) is the right mechanism and was tested at the wrong rate. gpu03 and gpu04
 have 249 GB RAM (238 GB available on gpu04). A spilled snapshot keeps its whole-block `Prefix`
 handles **on device** (the radix blocks it alone keeps alive, `evict_unit`), ≈ 35 MB per session
@@ -342,7 +342,7 @@ Per class, a pinned host slab allocated in bounded chunks with a bounded number 
 in flight; both classes tier (a session is 165 MB wherever it lives). The tier is on by
 default and sized by the A1 rule (`MemAvailable` minus `max(MemTotal / 8, 16 GiB)`, at most
 `MemTotal / 4`, at start); growth re-reads `MemAvailable` every 16 chunks and stops for good once the reserve
-would be touched. `PLOW_VMM_HOST_CACHE_MIB` names a size instead, under the same rule. Migration protocol: a block being spilled stays `Device` until its D2H
+would be touched. `PLOW_HOST_KVCACHE_SIZE` names a size instead, under the same rule. Migration protocol: a block being spilled stays `Device` until its D2H
 event fires, then flips to `Host`; a restore pins the host source until the H2D event fires; a
 concurrent attach on a `Migrating` block waits on the event rather than racing it. A host
 allocation or D2H failure leaves the block `Device` and the eviction falls through to reclaim;
@@ -408,7 +408,7 @@ attach needs it back (`restore`). `VmmKv::publish_blocks` runs the engine's acqu
 with the pool lock released; a store that is full refuses the acquire, the engine evicts one pool
 boundary (`reclaim_one`) and retries. The pool charges each publish the bytes its new blocks
 added, so a turn costs its new rows, not a whole window. The pool's own host tier is not armed
-under the store; `PLOW_VMM_HOST_CACHE_MIB` caps the store's pinned slabs instead. Since B4 the
+under the store; `PLOW_HOST_KVCACHE_SIZE` caps the store's pinned slabs instead. Since B4 the
 store holds every full-layer row and nothing is multi-mapped on CUDA (B.7).
 
 Replay 7 (2026-10-23, `Prefix` blocks, no host tier, gpu03, 10-minute production-fidelity replay):
@@ -508,7 +508,7 @@ tails remain (TTFT p99 757 against 360 ms, TPOT p99 94 against 42 ms), so a per-
 heavy spilling is still there; what it is needs a profiler trace of the engine thread under
 spilling (candidates: the spill-ahead thread's driver calls and 2 ms polling, copy-engine
 contention with the tick's own transfers, the remaining fence-ordered gathers). The strict
-comparison keeps `PLOW_VMM_HOST_CACHE_MIB=0` at its 10 s think; the tier is the right setting
+comparison keeps `PLOW_HOST_KVCACHE_SIZE=0` at its 10 s think; the tier is the right setting
 where the think time is long enough for the device alone to lose boundaries (production's is
 about 45 s). Known teardown message since the prefetch: `cuMemGetInfo` after the context is
 torn down logs "CUDA context poisoned" once at exit.

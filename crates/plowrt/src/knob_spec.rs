@@ -156,6 +156,7 @@ const GEN_DECODE_STEP_DEFAULT: Status = Status::Candidate {
     evidence: &[
         "scripts/gen_kernels/bench_decode.py (k1tune2, H100): the generated hd256 GQA6 flash decode 59 / 200 / 356 / 288 us at B8x4K / B16x8K / B16x15K / B48x4K; the interpreter FlashDecode runs 3.8x the HBM floor at B16x8K",
         "plans/qwen38-27b-h100.md (ab71/ab72, build71/72, step_bench ms, interpreter pair vs object, 4K / 15K): B1 23.85 vs 24.18 / 24.30 vs 25.20; B2 25.08 vs 25.10 / 26.01 vs 26.02; B4 26.90 vs 26.49 / 28.74 vs 27.40; B8 28.21 vs 27.39 / 31.82 vs 29.44; B16 33.46 vs 31.56 / 40.71 vs 35.56; B32 42.78 vs 38.32 (4K): the object from 4 rows",
+        "Qwen3.8-27B FP8 H100 (segmented cuBLASLt / native FP8 rungs, step_bench ctx 4096, interpreter pair vs object at 1 / 2 rows): 14.05 vs 13.56 / 14.69 vs 13.70 ms; BF16 (one-launch rungs) 22.19 vs 22.56 / 23.27 vs 23.38: the FP8 recipe sets 1, the default stays 4",
         "`=0` is the rollback to the interpreter pair",
     ],
 };
@@ -171,7 +172,7 @@ const GEN_DECODE_PIN_NSPLIT: Status = Status::Candidate {
 /// The Qwen3.5 chain's pointwise prefill segments as light launches of the prefill object, four
 /// blocks per SM. The interpreter window runs one 256-thread block per SM (its entry is at the
 /// register cap), which left the issue-bound pointwise arms at 10-30% of their byte floors.
-const QWEN_LIGHT_DEFAULT: Status = Status::Candidate {
+const GDN_LIGHT_DEFAULT: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (segtime62, build59): the chain's pointwise class 24.4 / 74.2 ms per 1024 / 4096 rows as interpreter windows, 16.7 / 52.0 as light launches at occ 2 or 4 (two blocks per SM, the chunk's own tensor table); digests B1 / B8 = build50",
         "`=0` is the rollback to interpreter windows",
@@ -181,7 +182,7 @@ const QWEN_LIGHT_DEFAULT: Status = Status::Candidate {
 /// idle between them (3 ms of a 99 ms tick); its cuBLASLt, light and window launches take only
 /// per-bucket arguments (per-tick data goes through the instruction patch and device tables),
 /// so the runs between the external GDN segments and the rider attention replay as graphs.
-const QWEN_PF_GRAPH: Status = Status::Candidate {
+const GDN_PF_GRAPH: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (srvprof_conv102, segtime108): 1122 launches and 3.0 ms of gaps per 4K c32 tick; the chain still returns to the host at every external GDN segment, so a chunk replays ~50 pieces",
         "ab110 (build106): packed 2x512 / 8x512 digests and RIDE_VS_STEP identical graph on/off; twin110 4K c32 two reps: tok/s 292.1/291.8 vs 290.3/291.1, TPOT p99 96.9/97.3 vs 97.9/97.9, TTFT p99 within 50 ms",
@@ -191,6 +192,12 @@ const QWEN_PF_GRAPH: Status = Status::Candidate {
 /// The packed compact terminal ran its lm_head on the prefill object's tiled MMA arm: one
 /// 1.8-2.0 ms window per tick (seg960 at 4K) for 2.5 GB of weights, ~40% of the byte floor;
 /// the routed decode rungs read the same weights through cuBLASLt at ~2.6 TB/s.
+const FP8_BLOCK_NATIVE: Status = Status::Candidate {
+    evidence: &[
+        "packet-declared native block-FP8 decode object (segment_roles NATIVE_DECODE_FP8_BLOCK); single-projection screen in the qwen FP8 decode campaign",
+        "`=0` serves the declared projections on cuBLASLt (same packet A/B)",
+    ],
+};
 const TERMINAL_LT: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (srvprof_clk15k, segtime108): one interp_pf window of 1.8-2.0 ms per mixed tick = the compact terminal (gather, norm, head, argmax, fin) at 4K and 15K",
@@ -199,7 +206,7 @@ const TERMINAL_LT: Status = Status::Candidate {
 };
 /// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows as light launches of the same
 /// `light_pf` kernel (block-per-row bodies: the window's outputs).
-const QWEN_LIGHT_DECODE: Status = Status::Candidate {
+const GDN_LIGHT_DECODE: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (decprof105, build105): 289 interpreter windows per B16 step at 19.4 us each (5.6 ms of 29.4) beside the cuBLASLt projections; the light launch of the same body costs ~4 us; ab106/ab107 (build106) B16/32/48 29.51/33.09/34.78 -> 27.56/31.00/32.88 ms with 287 windows routed, digests unchanged",
         "`=0` is the rollback to interpreter windows",
@@ -575,6 +582,68 @@ pub fn check_knobs(knobs: &Value, rt: &RuntimeConfig) -> std::result::Result<(),
     ))
 }
 
+/// Removed knobs renamed with a unit change: the old name, and its value in the new knob's
+/// spelling (`None` = not a value the old knob took).
+const RENAMED: &[(&str, &str, fn(&str) -> Option<String>)] = &[
+    (
+        "PLOW_VMM_HOST_CACHE_MIB",
+        "PLOW_HOST_KVCACHE_SIZE",
+        |mib| match mib.trim().parse::<u64>().ok()? {
+            0 => Some("0".into()),
+            n => Some(format!("{n}MB")),
+        },
+    ),
+    ("PLOW_QWEN_LIGHT_OCC", "PLOW_GDN_LIGHT_OCC", same_value),
+    (
+        "PLOW_QWEN_LIGHT_DECODE",
+        "PLOW_GDN_LIGHT_DECODE",
+        same_value,
+    ),
+    ("PLOW_QWEN_PF_GRAPH", "PLOW_GDN_PF_GRAPH", same_value),
+    ("PLOW_GLM_ROWBAND", "PLOW_ROWBAND", same_value),
+    (
+        "PLOW_GLM_ROWBAND_CLEAR_WS",
+        "PLOW_ROWBAND_CLEAR_WS",
+        same_value,
+    ),
+    ("PLOW_GLM_DSA_PF_MIN_CTX", "PLOW_DSA_PF_MIN_CTX", same_value),
+];
+
+fn same_value(v: &str) -> Option<String> {
+    Some(v.to_string())
+}
+
+fn renamed_hint(old: &str, new: &str, value: Option<String>) -> String {
+    format!(
+        "{old} was renamed: use {new}={}",
+        value.as_deref().unwrap_or("<size>")
+    )
+}
+
+/// Refuse a renamed knob still set in the environment (`env`), naming the new spelling and
+/// value: the setting is never silently dropped.
+pub fn refuse_renamed_env(env: impl Fn(&str) -> Option<String>) -> std::result::Result<(), String> {
+    for (old, new, convert) in RENAMED {
+        if let Some(v) = env(old) {
+            return Err(renamed_hint(old, new, convert(&v)));
+        }
+    }
+    Ok(())
+}
+
+/// A packet serve default under a renamed knob, as the new knob and value. Packets emitted
+/// before the rename carry the old name; their qualified value carries over exactly.
+pub fn renamed_serve_default(
+    key: &str,
+    value: &str,
+) -> Option<std::result::Result<(String, String), String>> {
+    let (old, new, convert) = RENAMED.iter().find(|(old, _, _)| *old == key)?;
+    Some(match convert(value) {
+        Some(v) => Ok(((*new).to_owned(), v)),
+        None => Err(renamed_hint(old, new, None)),
+    })
+}
+
 /// Warn about each retired knob still set in the environment: it no longer does anything, and
 /// `--objective` decides what it used to.
 pub fn warn_removed_env() {
@@ -612,6 +681,7 @@ const ENGINE_FAMILIES: &[&str] = &[
     "PLOW_CPU_",
     "PLOW_DECODE_",
     "PLOW_DSA_",
+    "PLOW_GDN_",
     "PLOW_GEN_DECODE_",
     "PLOW_GLM_",
     "PLOW_HSACO",
@@ -624,6 +694,7 @@ const ENGINE_FAMILIES: &[&str] = &[
     "PLOW_PF_",
     "PLOW_PREFIX_",
     "PLOW_QWEN_",
+    "PLOW_ROWBAND",
     "PLOW_SEG_",
     "PLOW_SPEC",
     "PLOW_TB_",
@@ -640,6 +711,7 @@ const ENGINE_KNOBS: &[&str] = &[
     "PLOW_FP8_DIR",
     "PLOW_FUSION",
     "PLOW_GLOBAL_QUEUE",
+    "PLOW_HOST_KVCACHE_SIZE",
     "PLOW_HSA_DRAIN_BLOCKED",
     "PLOW_L2_PLACE_DISPATCH",
     "PLOW_LAUNCH_ROWS",
@@ -716,7 +788,6 @@ const PROCESS_KNOBS: &[&str] = &[
     "PLOW_HOME",
     "PLOW_HOST_TIMING",
     "PLOW_LADDER_DEBUG",
-    "PLOW_LEAN_QUALIFY",
     "PLOW_LIBCUDA",
     "PLOW_LOAD_PROFILE",
     "PLOW_MAX_QUEUED_REQUESTS",
@@ -815,9 +886,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.asr_request_timeout_ms", Some("PLOW_ASR_REQUEST_TIMEOUT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(120_000)), OPT_IN),
     KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.asr_encode_hold_inflight", Some("PLOW_ASR_ENCODE_HOLD_INFLIGHT"), Layer::Runtime, USIZE, Default::Static(Val::Nat(32)), DIAG),
-    // `strict` refuses every current production bundle until its listed gaps close
-    // (docs/bringup/lean-correctness-inventory.md §9), so it stays opt-in.
-    KnobSpec::new("rt.lean_qualify", Some("PLOW_LEAN_QUALIFY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("off")), OPT_IN),
     KnobSpec::new("rt.asr_context_max_tokens", Some("PLOW_ASR_CONTEXT_MAX_TOKENS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_numerals", Some("PLOW_ASR_NUMERALS"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
@@ -841,14 +909,14 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
-    KnobSpec::new("rt.vmm_host_cache_mib", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::Runtime, USIZE, UNSET, OPT_IN),
+    KnobSpec::new("rt.host_kvcache_size", Some("PLOW_HOST_KVCACHE_SIZE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
     KnobSpec::new("rt.kv_mem_util", Some("PLOW_KV_MEM_UTIL"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.mla_pf_row_split", Some("PLOW_MLA_PF_ROW_SPLIT"), Layer::Runtime, Domain::Bool, ON, ROW_SPLIT_QUALIFIED),
     KnobSpec::new("rt.gemm_group_lt", Some("PLOW_AMD_GEMM_GROUP_LT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.mla_pf_row_split_native_lo", Some("PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO"), Layer::Runtime, Domain::Bool, ON, NATIVE_LO_QUALIFIED),
-    KnobSpec::new("rt.glm_rowband_clear_ws", Some("PLOW_GLM_ROWBAND_CLEAR_WS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.rowband_clear_ws", Some("PLOW_ROWBAND_CLEAR_WS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_cache_mib", Some("PLOW_VMM_CACHE_MIB"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_block_mib", Some("PLOW_VMM_BLOCK_MIB"), Layer::Runtime, U32, Default::Static(Val::Nat(2)), OPT_IN),
     KnobSpec::new("rt.weight_vmm", Some("PLOW_WEIGHT_VMM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
@@ -949,6 +1017,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lt_algos_write", Some("PLOW_LT_ALGOS_WRITE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.lt_pair", Some("PLOW_LT_PAIR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.lt_rung_algos", Some("PLOW_LT_RUNG_ALGOS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.fp8_block_native", Some("PLOW_NV_FP8_BLOCK_NATIVE"), Layer::Runtime, Domain::Bool, ON, FP8_BLOCK_NATIVE),
     KnobSpec::new("rt.lt_fp8_fast_accum_max_k", Some("PLOW_LT_FP8_FAST_ACCUM_MAX_K"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_norm_row_blocks", Some("PLOW_PF_NORM_ROW_BLOCKS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
@@ -961,10 +1030,10 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.decode_head_argmax", Some("PLOW_DECODE_HEAD_ARGMAX"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.terminal_lt", Some("PLOW_TERMINAL_LT"), Layer::Runtime, Domain::Bool, ON, TERMINAL_LT),
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.qwen_light_occ", Some("PLOW_QWEN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), QWEN_LIGHT_DEFAULT),
-    KnobSpec::new("rt.qwen_light_decode", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::Runtime, Domain::Bool, ON, QWEN_LIGHT_DECODE),
+    KnobSpec::new("rt.gdn_light_occ", Some("PLOW_GDN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), GDN_LIGHT_DEFAULT),
+    KnobSpec::new("rt.gdn_light_decode", Some("PLOW_GDN_LIGHT_DECODE"), Layer::Runtime, Domain::Bool, ON, GDN_LIGHT_DECODE),
     KnobSpec::new("rt.light_quant", Some("PLOW_LIGHT_QUANT"), Layer::Runtime, Domain::Bool, ON, LIGHT_QUANT),
-    KnobSpec::new("rt.qwen_pf_graph", Some("PLOW_QWEN_PF_GRAPH"), Layer::Runtime, Domain::Bool, ON, QWEN_PF_GRAPH),
+    KnobSpec::new("rt.gdn_pf_graph", Some("PLOW_GDN_PF_GRAPH"), Layer::Runtime, Domain::Bool, ON, GDN_PF_GRAPH),
     KnobSpec::new("rt.decode_lt_qkv", Some("PLOW_DECODE_LT_QKV"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
     KnobSpec::new("rt.moe_dec_lt", Some("PLOW_MOE_DEC_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
@@ -1050,7 +1119,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.token_batch_rows", Some("PLOW_TOKEN_BATCH_ROWS"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.decode_min_rung", Some("PLOW_DECODE_MIN_RUNG"), Layer::Runtime, U32, UNSET, DIAG).scoped(DECODE_MIN_RUNG_SCOPE),
     KnobSpec::new("rt.tail_sparse_ctx", Some("PLOW_AMD_TAIL_SPARSE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(TAIL_SPARSE_SCOPE),
-    KnobSpec::new("rt.dsa_pf_min_ctx", Some("PLOW_GLM_DSA_PF_MIN_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.dsa_pf_min_ctx", Some("PLOW_DSA_PF_MIN_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.tail_sparse_min_pairs", Some("PLOW_AMD_TAIL_SPARSE_MIN_PAIRS"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(TAIL_SPARSE_SCOPE),
     KnobSpec::new("rt.token_batch_wide_tiles", Some("PLOW_TOKEN_BATCH_WIDE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, DIAG),
@@ -1061,7 +1130,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.amd_decode_dense_exact", Some("PLOW_AMD_DECODE_DENSE_EXACT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN).scoped(DECODE_DENSE_EXACT_SCOPE),
     KnobSpec::new("rt.amd_decode_dense_max_ctx", Some("PLOW_AMD_DECODE_DENSE_MAX_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.cu_mask", Some("PLOW_AMD_CU_MASK"), Layer::Runtime, Domain::Str, UNSET, DIAG),
-    KnobSpec::new("rt.glm_rowband", Some("PLOW_GLM_ROWBAND"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.rowband", Some("PLOW_ROWBAND"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.decode_max_rung", Some("PLOW_DECODE_MAX_RUNG"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.rt_hsaco", Some("PLOW_HSACO"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.fp8_dir", Some("PLOW_FP8_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -1168,6 +1237,13 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_VMM_RING_PARK", Some("PLOW_VMM_RING_PARK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_VMM_SNAP_PITCHED", Some("PLOW_VMM_SNAP_PITCHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_VMM_SNAP_POOL", Some("PLOW_VMM_SNAP_POOL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_VMM_HOST_CACHE_MIB", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_QWEN_LIGHT_OCC", Some("PLOW_QWEN_LIGHT_OCC"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_QWEN_LIGHT_DECODE", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_QWEN_PF_GRAPH", Some("PLOW_QWEN_PF_GRAPH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_GLM_ROWBAND", Some("PLOW_GLM_ROWBAND"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_GLM_ROWBAND_CLEAR_WS", Some("PLOW_GLM_ROWBAND_CLEAR_WS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_GLM_DSA_PF_MIN_CTX", Some("PLOW_GLM_DSA_PF_MIN_CTX"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_POLICY", Some("PLOW_PREFIX_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_RETIRE_ATTACHED", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_QUEUE_TTL_MS", Some("PLOW_QUEUE_TTL_MS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
@@ -1258,7 +1334,7 @@ mod tests {
             "PLOW_MULTISTEP",
             "PLOW_VMM_PREFIX",
             "PLOW_VMM_LIVE_RINGS",
-            "PLOW_VMM_HOST_CACHE_MIB",
+            "PLOW_HOST_KVCACHE_SIZE",
             "PLOW_LT_RUNG_ALGOS",
             "PLOW_PREFIX_CACHE",
             "PLOW_KV_POOL_MIB",
@@ -1279,6 +1355,59 @@ mod tests {
             assert_eq!(knob_scope(e), Some(KnobScope::Process), "{e}");
         }
     }
+    #[test]
+    fn renamed_host_cache_knob_is_refused_with_the_new_spelling() {
+        assert_eq!(
+            renamed_serve_default("PLOW_VMM_HOST_CACHE_MIB", "65536"),
+            Some(Ok(("PLOW_HOST_KVCACHE_SIZE".into(), "65536MB".into())))
+        );
+        assert_eq!(
+            renamed_serve_default("PLOW_VMM_HOST_CACHE_MIB", "0"),
+            Some(Ok(("PLOW_HOST_KVCACHE_SIZE".into(), "0".into())))
+        );
+        assert!(matches!(
+            renamed_serve_default("PLOW_VMM_HOST_CACHE_MIB", "lots"),
+            Some(Err(_))
+        ));
+        assert_eq!(
+            renamed_serve_default("PLOW_HOST_KVCACHE_SIZE", "64GB"),
+            None
+        );
+        assert!(is_removed_env("PLOW_VMM_HOST_CACHE_MIB"));
+        assert!(is_runtime_env("PLOW_HOST_KVCACHE_SIZE"));
+        assert_eq!(
+            knob_scope("PLOW_HOST_KVCACHE_SIZE"),
+            Some(KnobScope::Engine)
+        );
+        let env = |k: &str| (k == "PLOW_VMM_HOST_CACHE_MIB").then(|| "65536".to_string());
+        let err = refuse_renamed_env(env).unwrap_err();
+        assert_eq!(
+            err,
+            "PLOW_VMM_HOST_CACHE_MIB was renamed: use PLOW_HOST_KVCACHE_SIZE=65536MB"
+        );
+        assert_eq!(refuse_renamed_env(|_| None), Ok(()));
+    }
+
+    #[test]
+    fn model_named_knobs_are_refused_with_the_technique_name() {
+        for (old, new) in [
+            ("PLOW_QWEN_LIGHT_OCC", "PLOW_GDN_LIGHT_OCC"),
+            ("PLOW_QWEN_LIGHT_DECODE", "PLOW_GDN_LIGHT_DECODE"),
+            ("PLOW_QWEN_PF_GRAPH", "PLOW_GDN_PF_GRAPH"),
+            ("PLOW_GLM_ROWBAND", "PLOW_ROWBAND"),
+            ("PLOW_GLM_ROWBAND_CLEAR_WS", "PLOW_ROWBAND_CLEAR_WS"),
+            ("PLOW_GLM_DSA_PF_MIN_CTX", "PLOW_DSA_PF_MIN_CTX"),
+        ] {
+            assert!(is_removed_env(old) && is_runtime_env(new), "{old}");
+            assert_eq!(
+                renamed_serve_default(old, "4"),
+                Some(Ok((new.into(), "4".into())))
+            );
+            let err = refuse_renamed_env(|k| (k == old).then(|| "1".to_string())).unwrap_err();
+            assert_eq!(err, format!("{old} was renamed: use {new}=1"));
+        }
+    }
+
     use plow_asset::knob::test_util::{check_table, env_reads, files, plow_tokens, ArgFacts};
     use plow_asset::knob::{Formula, KnobSpec, TargetSpec};
     use std::path::PathBuf;

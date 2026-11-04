@@ -32,7 +32,7 @@
 # TPOT P99 55.97 -> 92.41 ms (1.65x); 2.7 sessions/s 0.95x / 1126 -> 2957 ms (2.62x) / 136.8 ->
 # 164.2 ms (1.20x), SLO met 54.3% vs 95.7% (TPOT P50 97.8 vs 32.0 ms, mean in-flight 51.6 vs 21.9).
 # The dense decode step at that in-flight count is the bottleneck; this packet is not competitive
-# with vLLM 0.29 on the production mix. Evidence: /opt/dlami/nvme/lava-tts/kvstore-scratch/strict-g12-23.
+# with vLLM 0.29 on the production mix. Evidence: <lab scratch>/kvstore-scratch/strict-g12-23.
 # 2026-10-26 (plowrt 2dabbe2b, same packet, kvstore-scratch/fix-g12-*, steps-g12-lt2, prof-g12):
 # the loss is the decode step, not scheduling or the KV store. Four serve-env variants (no
 # interleave + ITL budget 60 / 120 ms, no live rings, widest launches) all collapse at 2.7/s
@@ -61,7 +61,7 @@
 # Production mix vs vLLM 0.29 (campaign.py report MATCHED + EQUIVALENT, 2 reps): 1.8/s tok/s
 # 0.99x, TTFT P99 1.21x, TPOT P99 1.21x; 2.7/s 0.99x / 2.02x / 1.01x, SLO met 87.7% vs 95.7%
 # (was 54.3%). Still behind vLLM: mixed prefill+rider ticks are 60-67% of the 2.7/s wall and small
-# prefill buckets run at 22-30 ms (128-512 rows). Evidence: /opt/dlami/nvme/lava-tts/g12-decode.
+# prefill buckets run at 22-30 ms (128-512 rows). Evidence: <lab scratch>/g12-decode.
 # 2026-10-27 (plow_git 843300f8, packet a0464475f8ab, decode objects unchanged): packed prefill.
 # A 128-row launch was 13.1 ms against a 3.9 ms weight floor, 3.0 ms of it the interpreter's
 # norm/quant segments (31 us each, one CTA per SM). Now the light norm pair carries the FP8 quant
@@ -97,7 +97,7 @@ namespace = "infervisor"
 name = "gemma-4-12b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "843300f8624cde2d253bdbb7872b34fbe5d818de"
+plow_git = "b3a2168bda58119c2c28a83183165728bae0a6d5"
 network = "gemma4"
 
 [target]
@@ -212,7 +212,9 @@ PLOW_VMM_PREFIX = "1"
 PLOW_PF_SEG_PURE = "fp8"
 PLOW_PF_SEG_FA512 = "1"
 PLOW_PF_INTERLEAVE = "2048"
-PLOW_VMM_LIVE_RINGS = "0"
+# Sliding rings mapped per admitted slot (device-prefix-pool): flat rings for 128 slots held
+# 40.6 GiB of the card; per slot they leave it to the block store (device cap 22 -> ~60 GiB).
+PLOW_VMM_LIVE_RINGS = "1"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
 PLOW_PF_NORM_ROW_BLOCKS = "1152"
@@ -222,11 +224,11 @@ PLOW_PF_NORM_ROW_BLOCKS = "1152"
 # 1.8 r2 / 2.7 r2): uncapped 78.3 / 76.8 / 79.6 / 77.6, 128 GiB 78.3 / 76.8 / 79.6 / 77.6,
 # 64 GiB 78.3 / 76.8 / 79.6 / 77.6, 32 GiB 78.0 / 75.8 / 79.3 / 74.1 (-3.5 pt). 2.7/s TTFT P99
 # vs vLLM: uncapped 3.00x (5.3 s in the tier-growth rep), 128 GiB 1.93x, 64 GiB 1.34x.
-PLOW_VMM_HOST_CACHE_MIB = "65536"
+PLOW_HOST_KVCACHE_SIZE = "64GB"
 # Not set: PLOW_LT_FP8_FAST_ACCUM_MAX_K=8192 (packed prefill 512..4096 rows -4..-8%). Under the
 # perf-for-accuracy rule ([gates]) it fails: c16 cont_decisive 42 / 38 / 39 of 46 vs floor 40 (1 of
 # 3; kl_trim 0.0526 / 0.0586 / 0.0587, top1_decisive 0.9852 / 0.9793 / 0.9803 within bounds),
-# 2026-10-28, /opt/dlami/nvme/lava-tts/{g12-decode/gates/fa-c16,fa-c16b,gate-policy/gates/g12-fa-c16c}.
+# 2026-10-28, <lab scratch>/{g12-decode/gates/fa-c16,fa-c16b,gate-policy/gates/g12-fa-c16c}.
 
 [bench]
 backend = "openai"
@@ -253,7 +255,7 @@ nprompt = 384
 serve_env = { PLOW_DECODE_MAX_RUNG = "128" }
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py): GEMMA12B_FP32_REF = the cached FP32 ref.json,
-# GEMMA12B_FP32_VLLM = the vLLM 0.28 capture against it (this box: /opt/dlami/nvme/lava-tts/fp32gate/).
+# GEMMA12B_FP32_VLLM = the vLLM 0.28 capture against it (this box: <lab scratch>/fp32gate/).
 [rung_choices.PLOW_EMIT_ATTN_LIBRARY]
 # Library vs declared native role, every prefill rung (see the PLOW_BUILD_FA4_* comment above).
 label = "qualified"
@@ -284,7 +286,7 @@ vllm_capture = "{env:GEMMA12B_FP32_VLLM}"
 # 0.315 / 0.287 / 0.317 / 0.292 / 0.315, top1_decisive 0.9843 / 0.9852 / 0.9872 / 0.9852 / 0.9843,
 # cont_decisive 40 / 41 / 43 / 41 / 40, needle 1: 5 of 5 within the rule (vLLM 0.0653 / 0.367 /
 # 0.9823 / 42 / 1; its second capture 0.0573 / 0.298 / 0.9882 / 42 / 1). The peer is vLLM 0.28;
-# no 0.29 FP32 capture exists for this model. Evidence: /opt/dlami/nvme/lava-tts/g12-decode/gates
+# no 0.29 FP32 capture exists for this model. Evidence: <lab scratch>/g12-decode/gates
 # (pf2-c16, pf2-c16b..d, d5-c16).
 cont_decisive_drop_max = 0.044
 

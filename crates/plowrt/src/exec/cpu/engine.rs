@@ -824,13 +824,11 @@ impl CpuModel {
     ) -> Result<CpuModel> {
         let t0 = Instant::now();
         crate::knob_spec::check_assets(blob_path)?;
-        let raw = std::fs::read(blob_path)
-            .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
         // L2-domain placement is accepted: the CPU interpreter dispatches per
         // domain window itself (`exec::cpu::interp`), so the mis-dispatch the
         // flag guards against cannot happen here.
-        let blob = DevBlob::parse_l2(&raw, true)?;
-        crate::certificate_checks::check_packet(blob_path, &raw, &blob)?;
+        let image = crate::asset::packet_image::PacketImage::open(blob_path)?;
+        let (raw, blob) = (&image.raw, image.blob.clone());
         let language_model = blob.tensors.iter().any(|tensor| tensor.name == "in.ids");
         validate_cpu_blob(&blob, language_model)?;
         // PLOW_FP8_DIR (the `--fp8-dir` runtime flag) names the fp8 weight-twin directory.

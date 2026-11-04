@@ -1465,6 +1465,9 @@ fn spawn_scoped(
                     kv_budget = e.kv_admission_budget().or(kv_budget);
                     e.kv_pressure_events()
                 });
+                if let Some(budget) = kv_budget {
+                    metrics.kv_share.lock().reserved = reserved_kv_bytes(budget, &slots);
+                }
                 let seen = (
                     metrics.kv_budget_denials.load(Ordering::Relaxed),
                     pressure.unwrap_or(0),
@@ -2886,6 +2889,15 @@ fn admit_session(
     {
         return Some((job, arrived));
     }
+    // Held through the seat: the manager reads `reserved` and installs a co-tenant cap between
+    // admissions, never inside one.
+    let mut share = metrics.kv_share.lock();
+    let kv_budget = kv_budget.map(|mut b| {
+        if let Some(cap) = share.cap {
+            b.budget_bytes = b.budget_bytes.min(cap);
+        }
+        b
+    });
     let seated = loop {
         let committed = slots
             .iter()
@@ -2909,8 +2921,15 @@ fn admit_session(
         }
     };
     let idx = match seated {
-        Ok(idx) => idx,
+        Ok(idx) => {
+            if let Some(budget) = kv_budget {
+                share.reserved = reserved_kv_bytes(budget, slots) + budget.bytes_for_rows(want);
+            }
+            drop(share);
+            idx
+        }
         Err(denied) => {
+            drop(share);
             // Retryable: stays queued, says nothing, costs no slot. This is the whole
             // backpressure mechanism.
             if denied.is_retryable() {
@@ -6101,6 +6120,20 @@ fn pf_launch_rows(request: usize, top: usize) -> (usize, usize) {
 }
 
 /// Share of the KV-capacity budget the live sequences reserve (0 without a budget).
+/// KV bytes the seated sequences reserve, each charged as admission charges it.
+fn reserved_kv_bytes(budget: crate::sched::admission::KvBudget, slots: &[Option<Slot>]) -> u64 {
+    slots
+        .iter()
+        .flatten()
+        .map(|s| {
+            budget.bytes_for_rows(
+                reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
+                    * (1 + s.cfg.is_some() as u64),
+            )
+        })
+        .sum()
+}
+
 fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option<Slot>]) -> f64 {
     kv_budget.filter(|b| b.max_rows() > 0).map_or(0.0, |b| {
         let rows: u64 = slots
@@ -6154,11 +6187,19 @@ fn queue_pack_rows(rows: &[usize], chunk_cost: usize, bound: usize) -> usize {
 /// Whether a launch of `bucket` prefill rows trims its prefill so `decode_rows` riders fit, rather
 /// than running in the `spilled` bucket that holds both. A wide spill is a padded rung, not padded
 /// rows: 12B on H100 ran 1024 + riders in 1088 at 42.9 ms against 32.4 ms for 1024, and 4096 + 63
-/// in 4160 at 127.0 against 117.1 ms; the trimmed rows join the next launch. Below
-/// `pf_chunk_cost_rows()` a spill costs less than the tail launch a trim can leave. So does a
-/// narrow spill whose trimmed `rows` tail no other waiting row (`beyond`) would join: 26B at C4
-/// trimmed 1024 + 3 riders to 1021 rows (31.1 ms) and paid a lone 3-row tail launch (16 ms), where
-/// 1088 holds all of it in 32.6 ms.
+/// in 4160 at 127.0 against 117.1 ms; the trimmed rows join the next launch. A narrow spill whose
+/// trimmed `rows` tail no other waiting row (`beyond`) would join costs less than the lone tail
+/// launch a trim leaves: 26B at C4 trimmed 1024 + 3 riders to 1021 rows (31.1 ms) and paid a lone
+/// 3-row tail launch (16 ms), where 1088 holds all of it in 32.6 ms.
+///
+/// Below `pf_chunk_cost_rows()` the row rule never trims, but a ladder without a near rung spills
+/// far: Qwen3.8-27B FP8 ran 128 prompt rows + 3 riders in the 1024 rung (80 ms against 31 ms),
+/// which also priced riding the 128 bucket at 16 ms a row. So a bucket that narrow whose spill
+/// is `pf_chunk_cost_rows()` rows or more is judged on `rung_ms(rows)`, the measured launch time of
+/// the rung covering `rows` (`RideCost`): it trims when the spill costs more than the lone tail
+/// launch, or than nothing when the tail joins waiting rows; unmeasured, it trims. Every other
+/// launch keeps the row rule (measured verdicts on Gemma-4-12B FP8's dense ladder cost 2-3% TPOT
+/// P50 on the prod mix).
 #[cfg(feature = "cuda")]
 fn trim_for_riders(
     bucket: usize,
@@ -6166,11 +6207,74 @@ fn trim_for_riders(
     decode_rows: usize,
     rows: usize,
     beyond: usize,
+    rung_ms: impl Fn(usize) -> Option<f64>,
 ) -> bool {
+    if decode_rows == 0 || spilled <= bucket {
+        return false;
+    }
     let cost = pf_chunk_cost_rows();
     let tail = (rows + decode_rows).saturating_sub(bucket);
-    let lone_tail = tail + beyond < cost && spilled.saturating_sub(bucket) < cost;
-    decode_rows > 0 && spilled > bucket && bucket >= cost && !lone_tail
+    let joins = tail + beyond >= cost;
+    let wide = spilled - bucket >= cost;
+    if bucket >= cost || !wide {
+        return bucket >= cost && (joins || wide);
+    }
+    let measured = rung_ms(spilled).zip(rung_ms(bucket)).and_then(|(s, b)| {
+        let tail_ms = if joins { Some(0.0) } else { rung_ms(tail) };
+        tail_ms.map(|t| s - b > t)
+    });
+    measured.unwrap_or(true)
+}
+
+/// Prompt rows to cut from a planned pack of `rows` so its `decode_rows` riders fit the rung
+/// that covers `rows` (0 to keep it): `trim_for_riders` on the pack the planner actually made.
+/// The tick's trim judges the rows before planning, and a request's remainder planned to fill a
+/// narrower rung exactly still spilled: a 128/1024 ladder ran 128 prompt rows + 1 rider in the
+/// 1024 rung (79 ms against 31 ms) 50 times in a 300 s prod-mix cell. Only a pack below
+/// `PF_CHUNK_COST_ROWS` is cut, where measured rung costs decide; wider packs launch as planned.
+#[cfg(feature = "cuda")]
+fn rider_cut(
+    rows: usize,
+    decode_rows: usize,
+    beyond: usize,
+    cover: impl Fn(usize) -> usize,
+    rung_ms: impl Fn(usize) -> Option<f64>,
+) -> usize {
+    let fit = cover(rows);
+    if fit >= pf_chunk_cost_rows() {
+        return 0;
+    }
+    let cut = (rows + decode_rows).saturating_sub(fit);
+    let trim = cut > 0
+        && cut < rows
+        && trim_for_riders(
+            fit,
+            cover(rows + decode_rows),
+            decode_rows,
+            rows,
+            beyond,
+            rung_ms,
+        );
+    if trim {
+        cut
+    } else {
+        0
+    }
+}
+
+/// Cuts `rows` prompt rows off the back of a planned pack of `(slot, kv_row0, rows)` spans: a
+/// span cut to nothing leaves the launch. `rows` is below the pack's rows (`rider_cut`).
+#[cfg(feature = "cuda")]
+fn cut_pack_tail(pack: &mut Vec<(usize, usize, usize)>, mut rows: usize) {
+    while rows > 0 {
+        let Some(last) = pack.last_mut() else { return };
+        if last.2 > rows {
+            last.2 -= rows;
+            return;
+        }
+        rows -= last.2;
+        pack.pop();
+    }
 }
 
 /// Prompt rows one model may consume while holding its device turn, when there
@@ -7154,6 +7258,7 @@ fn gpu_prefill_batched_pass(
                 decode_rows,
                 rows,
                 avail - rows,
+                |r| ride.rung_ms(e.pf_cover_rows(r)),
             );
         let per_launch = if trim {
             bucket.saturating_sub(decode_rows).max(1)
@@ -7179,7 +7284,7 @@ fn gpu_prefill_batched_pass(
             |_| u32::try_from(per_launch).ok(),
             |_| u32::MAX,
         );
-        let pack: Vec<_> = step
+        let mut pack: Vec<_> = step
             .launches
             .first()
             .map(|launch| launch.spans.as_slice())
@@ -7202,6 +7307,17 @@ fn gpu_prefill_batched_pass(
                 (len > 0).then_some((i, c0, len))
             })
             .collect();
+        if unified && decode_rows > 0 && !media_spans {
+            let rows: usize = pack.iter().map(|p| p.2).sum();
+            let cut = rider_cut(
+                rows,
+                decode_rows,
+                avail.saturating_sub(rows),
+                |r| e.pf_cover_rows(r),
+                |r| ride.rung_ms(e.pf_cover_rows(r)),
+            );
+            cut_pack_tail(&mut pack, cut);
+        }
         if pack.is_empty() {
             if !window.is_empty() {
                 admit_window(e, &mut window, false);
@@ -7384,11 +7500,9 @@ fn gpu_prefill_batched_pass(
         if let (true, Some(ms)) = (res.is_ok(), observed) {
             ride.observe_launch(ride_key, riders, ms);
             // The rung actually launched: the smallest bucket holding the packed rows and riders.
-            // Only `rows_within` (the ITL budget) reads it.
+            // `rows_within` (the ITL budget) and `trim_for_riders` read it.
             let rung = e.pf_cover_rows(pack.iter().map(|p| p.2).sum::<usize>() + riders);
-            if pf_itl_budget_ms() > 0 {
-                ride.observe_rung(rung, ms);
-            }
+            ride.observe_rung(rung, ms);
             if packlog::on() {
                 eprintln!(
                     "PACKLOG RIDE rung={rung} riders={riders} ms={ms:.2} window={}",
@@ -9738,41 +9852,53 @@ mod tests {
         assert_eq!(super::co_sched_prefill_rows(0, 0), 1);
     }
 
+    /// `trim_for_riders` before any rung is measured.
+    #[cfg(feature = "cuda")]
+    fn unmeasured_trim(
+        bucket: usize,
+        spilled: usize,
+        decode: usize,
+        rows: usize,
+        beyond: usize,
+    ) -> bool {
+        super::trim_for_riders(bucket, spilled, decode, rows, beyond, |_| None)
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn riders_trim_wide_launches_that_spill_a_rung() {
-        assert!(super::trim_for_riders(4096, 4160, 63, 4096, 4096));
-        assert!(super::trim_for_riders(1024, 1088, 1, 1024, 1024));
+        assert!(unmeasured_trim(4096, 4160, 63, 4096, 4096));
+        assert!(unmeasured_trim(1024, 1088, 1, 1024, 1024));
         assert!(
-            super::trim_for_riders(4224, 8192, 3, 4224, 0),
+            unmeasured_trim(4224, 8192, 3, 4224, 0),
             "a wide spill costs more than a tail"
         );
         assert!(
-            !super::trim_for_riders(4096, 4096, 63, 4000, 0),
+            !unmeasured_trim(4096, 4096, 63, 4000, 0),
             "riders fit the bucket"
         );
-        assert!(!super::trim_for_riders(4096, 4160, 0, 4096, 0));
+        assert!(!unmeasured_trim(4096, 4160, 0, 4096, 0));
         assert!(
-            !super::trim_for_riders(128, 256, 63, 128, 0),
+            !unmeasured_trim(128, 256, 63, 128, 0),
             "a narrow spill beats a tail launch"
         );
         assert!(
-            !super::trim_for_riders(1024, 1088, 3, 1024, 0),
+            !unmeasured_trim(1024, 1088, 3, 1024, 0),
             "no waiting row would join the tail"
         );
         assert!(
-            super::trim_for_riders(1024, 1088, 3, 1024, 600),
+            unmeasured_trim(1024, 1088, 3, 1024, 600),
             "the tail joins waiting rows"
         );
         // The 128/1024/4096 ladder: 16 riders on a full 1024 launch spill into 4096 (the
         // pack budget would have planned [1024, 128] and reported no spill).
-        assert!(super::trim_for_riders(1024, 4096, 16, 1024, 3072));
+        assert!(unmeasured_trim(1024, 4096, 16, 1024, 3072));
         assert!(
-            super::trim_for_riders(1024, 4096, 16, 1024, 0),
+            unmeasured_trim(1024, 4096, 16, 1024, 0),
             "a 3072-row spill beats a tail launch"
         );
         assert!(
-            super::trim_for_riders(1024, usize::MAX, 16, 1024, 0),
+            unmeasured_trim(1024, usize::MAX, 16, 1024, 0),
             "no bucket holds the riders"
         );
     }
@@ -9787,23 +9913,216 @@ mod tests {
         // 4224 prompt rows + 60 riders run the 8192 rung (the cheapest cover's first launch,
         // 4160, is narrower than the rows): the riders are trimmed into the next launch.
         assert_eq!(cover(4224 + 60), 8192);
-        assert!(super::trim_for_riders(4224, cover(4224 + 60), 60, 4224, 0));
+        assert!(unmeasured_trim(4224, cover(4224 + 60), 60, 4224, 0));
         // 2112 + 20 riders spill to 4096, 1152 + 10 to 2048.
-        assert!(super::trim_for_riders(2112, cover(2112 + 20), 20, 2112, 0));
-        assert!(super::trim_for_riders(
-            1152,
-            cover(1152 + 10),
-            10,
-            1152,
-            600
-        ));
+        assert!(unmeasured_trim(2112, cover(2112 + 20), 20, 2112, 0));
+        assert!(unmeasured_trim(1152, cover(1152 + 10), 10, 1152, 600));
         // Riders that fit the bucket keep it.
         assert_eq!(cover(1100 + 10), 1152);
-        assert!(!super::trim_for_riders(1152, cover(1100 + 10), 10, 1100, 0));
+        assert!(!unmeasured_trim(1152, cover(1100 + 10), 10, 1100, 0));
         assert_eq!(cover(9000), 8192);
         assert_eq!(crate::exec::gpu::cover_rung(std::iter::empty(), 10), 0);
         // A spilled rung below the bucket is not an underflow.
-        assert!(!super::trim_for_riders(1152, 128, 10, 1152, 0));
+        assert!(!unmeasured_trim(1152, 128, 10, 1152, 0));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_measured_spill_trims_only_when_it_costs_more_than_the_tail() {
+        let cover = |ladder: &'static [usize]| {
+            move |rows| crate::exec::gpu::cover_rung(ladder.iter().copied(), rows)
+        };
+        // Qwen3.8-27B FP8 on H100 (prod mix): 128 / 1024 rungs at 31 / 80 ms. 128 prompt rows + 3
+        // riders spill to 1024: 49 ms more than a lone 3-row tail launch of 31 ms.
+        let qwen = cover(&[128, 1024, 4096, 8192]);
+        let qwen_ms = |r| match qwen(r) {
+            128 => Some(31.0),
+            1024 => Some(80.0),
+            _ => None,
+        };
+        assert!(super::trim_for_riders(
+            128,
+            qwen(128 + 3),
+            3,
+            128,
+            0,
+            qwen_ms
+        ));
+        assert!(
+            unmeasured_trim(128, qwen(128 + 3), 3, 128, 0),
+            "an 896-row spill"
+        );
+        // 26B at C4: 1024 + 3 riders in 1088 (32.6 ms) beats 1021 rows (31.1 ms) + a lone tail (16 ms).
+        let g26 = cover(&[
+            128, 256, 512, 1024, 1088, 1152, 2048, 2112, 4096, 4160, 4224, 8192,
+        ]);
+        let g26_ms = |r| match g26(r) {
+            128 => Some(16.0),
+            1024 => Some(31.1),
+            1088 => Some(32.6),
+            4096 => Some(117.1),
+            4160 => Some(127.0),
+            _ => None,
+        };
+        assert!(!super::trim_for_riders(
+            1024,
+            g26(1024 + 3),
+            3,
+            1024,
+            0,
+            g26_ms
+        ));
+        // Narrow spills keep the row rule whatever was measured.
+        let g26_cheap_dense = |r| match g26(r) {
+            128 => Some(16.0),
+            256 => Some(18.0),
+            _ => None,
+        };
+        assert!(!super::trim_for_riders(
+            128,
+            g26(128 + 3),
+            3,
+            128,
+            600,
+            g26_cheap_dense
+        ));
+        assert!(!unmeasured_trim(128, g26(128 + 3), 3, 128, 600));
+        assert!(super::trim_for_riders(
+            4096,
+            g26(4096 + 63),
+            63,
+            4096,
+            4096,
+            g26_ms
+        ));
+        assert!(super::trim_for_riders(1024, 1088, 3, 1024, 600, |r| (r
+            >= 1024)
+            .then_some(31.1)));
+        // A bucket of the cost rows or more keeps the row rule whatever was measured: Gemma-4-12B's
+        // 512 + riders in 1024 trims (a wide spill) even when 1024 measured as cheap as 512.
+        assert!(super::trim_for_riders(512, 1024, 3, 512, 0, |r| Some(
+            if r > 512 { 20.0 } else { 19.9 }
+        )));
+        // A wide spill of equal cost to its lone tail keeps the spill.
+        assert!(!super::trim_for_riders(128, 1024, 3, 128, 0, |r| Some(
+            if r > 128 { 62.0 } else { 31.0 }
+        )));
+        // A wide spill with an unmeasured rung trims.
+        assert!(super::trim_for_riders(128, 1024, 3, 128, 0, |r| (r
+            >= 1024)
+            .then_some(80.0)));
+    }
+
+    /// Every Gemma packet's ladder (E4B, 12B, 26B) decides every bucket / spill pair exactly as the
+    /// row rule did before measured rung costs, whatever the measurements say.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gemma_ladders_keep_the_row_rule_for_every_bucket_and_spill() {
+        fn row_rule(
+            bucket: usize,
+            spilled: usize,
+            decode: usize,
+            rows: usize,
+            beyond: usize,
+        ) -> bool {
+            let cost = super::pf_chunk_cost_rows();
+            let tail = (rows + decode).saturating_sub(bucket);
+            let lone_tail = tail + beyond < cost && spilled.saturating_sub(bucket) < cost;
+            decode > 0 && spilled > bucket && bucket >= cost && !lone_tail
+        }
+        let ladders: [(&[usize], usize); 2] = [
+            (&[64, 128, 256, 512, 1024, 2048, 4096, 8192], 128),
+            (
+                &[
+                    128, 256, 512, 1024, 1088, 1152, 2048, 2112, 4096, 4160, 4224, 8192,
+                ],
+                128,
+            ),
+        ];
+        let costs: [&dyn Fn(usize) -> Option<f64>; 4] =
+            [&|_| None, &|_| Some(10.0), &|r| Some(r as f64), &|r| {
+                Some(1e6 / r as f64)
+            }];
+        let mut checked = 0usize;
+        for (ladder, decode_max) in ladders {
+            let cover = |rows| crate::exec::gpu::cover_rung(ladder.iter().copied(), rows);
+            for &bucket in ladder {
+                for decode in 1..=decode_max {
+                    for rows in [1, bucket / 2, bucket - decode.min(bucket - 1), bucket] {
+                        let spilled = cover(rows.min(bucket) + decode);
+                        for beyond in [0, 1, 100, 511, 512, 4096] {
+                            let want = row_rule(bucket, spilled, decode, rows, beyond);
+                            for cost in costs {
+                                assert_eq!(
+                                    super::trim_for_riders(bucket, spilled, decode, rows, beyond, |r| {
+                                        cost(cover(r))
+                                    }),
+                                    want,
+                                    "bucket {bucket} spilled {spilled} decode {decode} rows {rows} beyond {beyond}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000);
+        // A planned pack is never cut on these ladders.
+        for (ladder, decode_max) in ladders {
+            let cover = |rows| crate::exec::gpu::cover_rung(ladder.iter().copied(), rows);
+            for rows in 1..=8192 {
+                for decode in 1..=decode_max {
+                    for beyond in [0, 512, 4096] {
+                        for cost in costs {
+                            assert_eq!(
+                                super::rider_cut(rows, decode, beyond, cover, |r| cost(cover(r))),
+                                0,
+                                "rows {rows} decode {decode} beyond {beyond}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_planned_pack_leaves_its_riders_room_when_the_spill_costs_more() {
+        let ladder = [128, 1024, 4096, 8192];
+        let cover = |rows| crate::exec::gpu::cover_rung(ladder.iter().copied(), rows);
+        let ms = |r| match cover(r) {
+            128 => Some(31.0),
+            1024 => Some(80.0),
+            _ => None,
+        };
+        // 128 planned rows + 1 rider: one row waits for the next launch.
+        assert_eq!(super::rider_cut(128, 1, 0, cover, ms), 1);
+        assert_eq!(super::rider_cut(126, 3, 900, cover, ms), 1);
+        assert_eq!(super::rider_cut(100, 3, 0, cover, ms), 0, "the riders fit");
+        assert_eq!(
+            super::rider_cut(10, 200, 0, cover, ms),
+            0,
+            "a cut would empty the pack"
+        );
+        // A cheap spill rung keeps the pack whole.
+        let dense = [128, 256, 1024, 1088];
+        let dcover = |rows| crate::exec::gpu::cover_rung(dense.iter().copied(), rows);
+        let dms = |r| match dcover(r) {
+            128 => Some(16.0),
+            1024 => Some(31.1),
+            1088 => Some(32.6),
+            _ => None,
+        };
+        assert_eq!(super::rider_cut(1024, 3, 0, dcover, dms), 0);
+        // The cut walks back across spans.
+        let mut pack = vec![(0, 0, 126), (1, 0, 2)];
+        super::cut_pack_tail(&mut pack, 3);
+        assert_eq!(pack, vec![(0, 0, 125)]);
+        let mut pack = vec![(0, 0, 120), (1, 64, 8)];
+        super::cut_pack_tail(&mut pack, 1);
+        assert_eq!(pack, vec![(0, 0, 120), (1, 64, 7)]);
     }
 
     #[cfg(feature = "cuda")]

@@ -4176,12 +4176,17 @@ pub const SECT_GEN_TENSORS: u32 = 6;
 
 pub const SECT_NAME_LEN: usize = 24;
 
+/// [`BlobSectionEntry::flags`]: a reader that does not know this section's kind must refuse the
+/// packet rather than skip the section.
+pub const SECT_F_MUST_UNDERSTAND: u32 = 1;
+
 /// One entry in the v6 section directory. Mirrors `PlowSectionEntry` in `dev_blob.h`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BlobSectionEntry {
     pub kind: u32,
-    pub _pad: u32,
+    /// [`SECT_F_MUST_UNDERSTAND`]; every other bit is reserved and written 0.
+    pub flags: u32,
     pub offset: u64,
     pub size: u64,
     pub name: [u8; SECT_NAME_LEN],
@@ -4190,6 +4195,7 @@ pub struct BlobSectionEntry {
 const _: () = assert!(size_of::<BlobSectionEntry>() == 48);
 
 /// A section to embed in a v6 blob (compiler-side, not serialized directly).
+#[derive(Clone)]
 pub struct SectionData {
     pub kind: u32,
     pub name: String,
@@ -4695,7 +4701,7 @@ impl Model {
             name[..copy_len].copy_from_slice(&src[..copy_len]);
             sect_entries.push(BlobSectionEntry {
                 kind: s.kind,
-                _pad: 0,
+                flags: 0,
                 offset,
                 size: s.data.len() as u64,
                 name,
@@ -4764,11 +4770,12 @@ pub fn replace_metadata_sections(blob: &[u8], set: &[SectionData]) -> Result<Vec
     {
         return Err("only named metadata sections can be replaced".into());
     }
-    let mut sections: Vec<(u32, String, &[u8])> = entries
+    let mut sections: Vec<(u32, u32, String, &[u8])> = entries
         .iter()
         .map(|e| {
             (
                 e.kind,
+                e.flags,
                 name_of(e),
                 &blob[e.offset as usize..(e.offset + e.size) as usize],
             )
@@ -4777,20 +4784,20 @@ pub fn replace_metadata_sections(blob: &[u8], set: &[SectionData]) -> Result<Vec
     for s in set {
         match sections
             .iter_mut()
-            .find(|(kind, name, _)| *kind == SECT_METADATA && *name == s.name)
+            .find(|(kind, _, name, _)| *kind == SECT_METADATA && *name == s.name)
         {
-            Some(slot) => slot.2 = &s.data,
-            None => sections.push((SECT_METADATA, s.name.clone(), &s.data)),
+            Some(slot) => slot.3 = &s.data,
+            None => sections.push((SECT_METADATA, 0, s.name.clone(), &s.data)),
         }
     }
     let mut out = blob[..start].to_vec();
     let mut dir_entries = Vec::with_capacity(sections.len());
-    for (kind, name, data) in &sections {
+    for (kind, flags, name, data) in &sections {
         let mut fixed = [0u8; SECT_NAME_LEN];
         fixed[..name.len()].copy_from_slice(name.as_bytes());
         dir_entries.push(BlobSectionEntry {
             kind: *kind,
-            _pad: 0,
+            flags: *flags,
             offset: out.len() as u64,
             size: data.len() as u64,
             name: fixed,

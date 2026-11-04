@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use packet::dev::{DevInst64, DevOp, StreamEnt, Wait, SE_DOMAIN_MASK};
 use packet::devbuild::{
     is_blob_magic, BlobHeader, BlobProgHeader, BlobSectionEntry, BlobTensor, BLOB_MAGIC_V7,
-    BLOB_MAGIC_V7_L2SEG, INIT_NONE, NAME_LEN, SECT_GEN_TENSORS, SECT_MAGIC, SECT_NAME_LEN,
+    BLOB_MAGIC_V7_L2SEG, INIT_NONE, NAME_LEN, SECT_F_MUST_UNDERSTAND, SECT_GEN_TENSORS, SECT_MAGIC,
+    SECT_NAME_LEN,
 };
 use packet::rope::GenTensor;
 
@@ -22,6 +23,7 @@ use crate::{Result, RuntimeError};
 /// One tensor the programs address by handle: its name, byte size, and (for
 /// compiler-computed data such as the RoPE tables) its slice of the init
 /// section.
+#[derive(Clone)]
 pub struct DevTensor {
     pub name: String,
     pub bytes: u64,
@@ -37,6 +39,7 @@ type PhaseFilter = for<'a, 'b> fn(&'a &'b DevProg) -> bool;
 pub type PhaseProgs<'a> = std::iter::Filter<std::slice::Iter<'a, DevProg>, PhaseFilter>;
 
 /// One compiled program (a prefill bucket, or the T=1 decode program last).
+#[derive(Clone)]
 pub struct DevProg {
     /// The T this program was compiled for (decode = 1).
     pub t: u32,
@@ -103,6 +106,7 @@ pub struct DevTp {
 }
 
 /// A section embedded in a v6 blob (cubin, hsaco, weight map, etc.).
+#[derive(Clone)]
 pub struct DevSection {
     pub kind: u32,
     pub name: String,
@@ -111,6 +115,7 @@ pub struct DevSection {
 }
 
 /// A parsed device blob.
+#[derive(Clone)]
 pub struct DevBlob {
     pub n_cu: u32,
     pub flags: u32,
@@ -224,6 +229,197 @@ fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
     })
 }
 
+const KNOWN_SECTION_KINDS: [u32; 8] = [
+    packet::devbuild::SECT_PROGRAMS,
+    packet::devbuild::SECT_CUBIN,
+    packet::devbuild::SECT_HSACO,
+    packet::devbuild::SECT_WEIGHT_MAP,
+    packet::devbuild::SECT_METADATA,
+    packet::devbuild::SECT_STATIC_TENSORS,
+    SECT_GEN_TENSORS,
+    packet::ext::SECT_PARENT_REF,
+];
+
+const KNOWN_HEADER_FLAGS: u32 = packet::devbuild::PLOW_BLOB_F_GQ
+    | packet::devbuild::PLOW_BLOB_F_L2DOM
+    | packet::devbuild::PLOW_BLOB_F_L2SEG;
+
+fn malformed(what: String) -> RuntimeError {
+    RuntimeError::Device(format!("devblob: malformed packet: {what}"))
+}
+
+fn span_ok(ofs: u32, len: u32, n: usize) -> bool {
+    (ofs as usize)
+        .checked_add(len as usize)
+        .is_some_and(|e| e <= n)
+}
+
+/// Every index the interpreters follow must land inside its table: a corrupt packet is refused
+/// here instead of reading out of bounds on the device. `n_tensor` is `None` for an extension,
+/// whose handles address the parent's table and are checked at merge.
+fn validate_programs(progs: &[DevProg], kvrow: &[u32], n_tensor: Option<usize>) -> Result<()> {
+    for (p, prog) in progs.iter().enumerate() {
+        let (n_inst, n_stream) = (prog.insts.len(), prog.stream.len());
+        for (cu, (&o, &l)) in prog.stream_ofs.iter().zip(&prog.stream_len).enumerate() {
+            if !span_ok(o, l, n_stream) {
+                return Err(malformed(format!(
+                    "program {p} CU {cu} stream window {o}+{l} exceeds {n_stream} entries"
+                )));
+            }
+        }
+        let entries = prog.stream.iter().chain(&prog.gq_stream);
+        for (e, ent) in entries.enumerate() {
+            if ent.inst as usize >= n_inst {
+                return Err(malformed(format!(
+                    "program {p} stream entry {e} names instruction {} of {n_inst}",
+                    ent.inst
+                )));
+            }
+            if !span_ok(ent.wait_ofs, ent.wait_len.into(), prog.waits.len())
+                || !span_ok(ent.succ_ofs, ent.succ_len.into(), prog.succs.len())
+            {
+                return Err(malformed(format!(
+                    "program {p} stream entry {e} wait/succ list outside the program's tables"
+                )));
+            }
+            if ent.flags & packet::dev::SE_XCTR == 0 {
+                let waits = &prog.waits[ent.wait_ofs as usize..][..ent.wait_len as usize];
+                let succs = &prog.succs[ent.succ_ofs as usize..][..ent.succ_len as usize];
+                if waits
+                    .iter()
+                    .map(|w| w.id)
+                    .chain(succs.iter().copied())
+                    .any(|c| c >= prog.n_counter)
+                {
+                    return Err(malformed(format!(
+                        "program {p} stream entry {e} names a counter outside its {}",
+                        prog.n_counter
+                    )));
+                }
+            }
+        }
+        if !prog.gq_seg_ofs.is_empty()
+            && (prog.gq_seg_ofs.windows(2).any(|w| w[0] > w[1])
+                || *prog.gq_seg_ofs.last().unwrap() as usize > prog.gq_stream.len())
+        {
+            return Err(malformed(format!("program {p} GQ segment windows")));
+        }
+        if let Some(n) = n_tensor {
+            check_handles(p, prog, n)?;
+        }
+    }
+    // The kv-row table addresses the widest decode rung (`DevBlob::decode_prog`).
+    let patched = progs
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.role.is_decode_rung() && !p.role.is_dense_exact_rung())
+        .max_by_key(|(i, p)| (p.t, *i));
+    if let Some((p, prog)) = patched {
+        if let Some(&k) = kvrow.iter().find(|&&k| k as usize >= prog.insts.len()) {
+            return Err(malformed(format!(
+                "kv-row site {k} is past decode program {p}'s {} instructions",
+                prog.insts.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_handles(p: usize, prog: &DevProg, n: usize) -> Result<()> {
+    for (i, d) in prog.insts.iter().enumerate() {
+        if let Some(&t) =
+            d.t.iter()
+                .find(|&&t| t != packet::dev::TENSOR_NONE16 && t as usize >= n)
+        {
+            return Err(malformed(format!(
+                "program {p} instruction {i} names tensor {t} of {n}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The packet's `abi.json` against this runtime and against the names its bindings restate. An
+/// extension declares no tensors, so its bindings are not checked here.
+fn check_abi(
+    buf: &[u8],
+    sects: &[DevSection],
+    n_cu: u32,
+    tensors: &[DevTensor],
+    progs: &[DevProg],
+    is_ext: bool,
+) -> Result<()> {
+    let Some(abi) = read_abi(buf, sects)? else {
+        return Ok(());
+    };
+    let meta: Vec<&str> = sects
+        .iter()
+        .filter(|s| s.kind == packet::devbuild::SECT_METADATA)
+        .map(|s| s.name.as_str())
+        .collect();
+    abi.validate(n_cu, &meta)
+        .map_err(|e| RuntimeError::Device(format!("devblob: {}: {e}", plow_asset::abi::SECTION)))?;
+    if let Some(declared) = abi.bindings.as_ref().filter(|_| !is_ext) {
+        let names: Vec<String> = tensors.iter().map(|t| t.name.clone()).collect();
+        let derived = plow_asset::abi::Bindings::derive(
+            &names,
+            progs
+                .iter()
+                .map(|p| p.insts.iter().map(|d| (d.op, u32::from(d.t[0])))),
+        );
+        if *declared != derived {
+            return Err(malformed(format!(
+                "{} bindings disagree with the tensor names (roles {:?} vs {:?}, {} vs {} KV \
+                 write sites)",
+                plow_asset::abi::SECTION,
+                declared.roles,
+                derived.roles,
+                declared.kv_writes.len(),
+                derived.kv_writes.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_abi(buf: &[u8], sects: &[DevSection]) -> Result<Option<plow_asset::abi::Abi>> {
+    let Some(s) = sects
+        .iter()
+        .find(|s| s.kind == packet::devbuild::SECT_METADATA && s.name == plow_asset::abi::SECTION)
+    else {
+        return Ok(None);
+    };
+    let data = buf
+        .get(s.offset..s.offset + s.size)
+        .ok_or_else(|| malformed(format!("{} outside the packet", plow_asset::abi::SECTION)))?;
+    serde_json::from_slice(data)
+        .map(Some)
+        .map_err(|e| malformed(format!("{}: {e}", plow_asset::abi::SECTION)))
+}
+
+/// Sections may not overlap, and a (kind, name) pair names at most one of them.
+fn check_sections(sects: &[DevSection]) -> Result<()> {
+    let mut by_start: Vec<&DevSection> = sects.iter().collect();
+    by_start.sort_by_key(|s| (s.offset, s.size));
+    for w in by_start.windows(2) {
+        if w[0].size != 0 && w[0].offset + w[0].size > w[1].offset {
+            return Err(malformed(format!(
+                "sections `{}` and `{}` overlap",
+                w[0].name, w[1].name
+            )));
+        }
+    }
+    let mut keys: Vec<(u32, &str)> = sects.iter().map(|s| (s.kind, s.name.as_str())).collect();
+    keys.sort_unstable();
+    if let Some(w) = keys.windows(2).find(|w| w[0] == w[1]) {
+        return Err(malformed(format!(
+            "two kind-{} sections are named `{}`",
+            w[0].0, w[0].1
+        )));
+    }
+    Ok(())
+}
+
 impl DevBlob {
     /// Parse a blob image. Fails loudly on a bad magic or a truncated section,
     /// never mid-serve.
@@ -234,11 +430,19 @@ impl DevBlob {
     /// Backends that cannot check keep the old behaviour through [`DevBlob::parse`], which is
     /// this with `false` -- placement is then refused unless runtime configuration opts in.
     pub fn parse_l2(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
-        Self::parse_inner(buf, l2_dispatch_ok, Container::Model)
+        let blob = Self::parse_unguarded(buf)?;
+        blob.check_l2_dispatch(l2_dispatch_ok)?;
+        Ok(blob)
     }
 
     pub fn parse(buf: &[u8]) -> Result<DevBlob> {
-        Self::parse_inner(buf, false, Container::Model)
+        Self::parse_l2(buf, false)
+    }
+
+    /// [`DevBlob::parse_l2`] without the L2-placement guard, for a parse shared by callers that
+    /// each apply [`DevBlob::check_l2_dispatch`] with their own answer.
+    pub(crate) fn parse_unguarded(buf: &[u8]) -> Result<DevBlob> {
+        Self::parse_inner(buf, Container::Model)
     }
 
     /// Parse an `extension.pkt` (docs/arch/19, phase 2): the same container with the tensor
@@ -247,10 +451,29 @@ impl DevBlob {
     /// This only decodes the container. Whether the extension may be MERGED is the six-rule
     /// contract in `plow_asset::extension`, applied by [`crate::asset::extension`].
     pub fn parse_extension(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
-        Self::parse_inner(buf, l2_dispatch_ok, Container::Extension)
+        let blob = Self::parse_inner(buf, Container::Extension)?;
+        blob.check_l2_dispatch(l2_dispatch_ok)?;
+        Ok(blob)
     }
 
-    fn parse_inner(buf: &[u8], l2_dispatch_ok: bool, want: Container) -> Result<DevBlob> {
+    /// PLOW_L2_PLACE guard: a placed blob requires physical-domain queue dispatch.
+    pub fn check_l2_dispatch(&self, l2_dispatch_ok: bool) -> Result<()> {
+        if self.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
+            && !l2_dispatch_ok
+            && !crate::config::RuntimeConfig::get().nv.l2_place_dispatch
+        {
+            return Err(RuntimeError::Device(
+                "devblob: blob uses L2-domain packet placement (PLOW_L2_PLACE), so a standard \
+                 interpreter would mis-dispatch its per-domain queues. Build the objects with \
+                 -DPLOW_L2_PLACE_DISPATCH and set \
+                 PLOW_L2_PLACE_DISPATCH=1, or recompile the model without PLOW_L2_PLACE."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_inner(buf: &[u8], want: Container) -> Result<DevBlob> {
         let mut off = 0usize;
         let hdr: BlobHeader = take::<BlobHeader>(buf, &mut off, 1, "header")?[0];
         let is_ext = packet::ext::is_ext_magic(&hdr.magic);
@@ -279,6 +502,13 @@ impl DevBlob {
             }
         }
         let is_v7 = &hdr.magic == BLOB_MAGIC_V7 || &hdr.magic == BLOB_MAGIC_V7_L2SEG;
+        let unknown_flags = hdr.flags & !KNOWN_HEADER_FLAGS;
+        if unknown_flags != 0 {
+            return Err(RuntimeError::Device(format!(
+                "devblob: header flags {unknown_flags:#x} are not ones this plowrt knows; the \
+                 packet needs a newer plowrt"
+            )));
+        }
 
         let decls = take::<BlobTensor>(buf, &mut off, hdr.n_tensor as usize, "tensor decls")?;
         let init = take::<u8>(buf, &mut off, hdr.init_bytes as usize, "init section")?;
@@ -404,13 +634,20 @@ impl DevBlob {
         // v6 section directory: if reserved[0] (sect_dir_offset) is non-zero,
         // parse the directory. Section DATA stays in the original buffer — we
         // only store the metadata here; callers use `section_data()` to slice it.
+        validate_programs(&progs, &kvrow, (!is_ext).then_some(tensors.len()))?;
+
+        let body_end = off;
         let sections = if hdr.reserved[0] != 0 {
-            let dir_off = hdr.reserved[0] as usize;
-            if dir_off + 8 > buf.len() {
-                return Err(RuntimeError::Device(
-                    "devblob: sect_dir_offset past end of buffer".into(),
-                ));
-            }
+            let dir_off = usize::try_from(hdr.reserved[0])
+                .ok()
+                .filter(|&d| d >= body_end && d.checked_add(8).is_some_and(|e| e <= buf.len()))
+                .ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "devblob: sect_dir_offset {} outside [{body_end}, {})",
+                        hdr.reserved[0],
+                        buf.len()
+                    ))
+                })?;
             if &buf[dir_off..dir_off + 4] != SECT_MAGIC {
                 return Err(RuntimeError::Device(
                     "devblob: bad section directory magic".into(),
@@ -419,7 +656,10 @@ impl DevBlob {
             let n = u32::from_le_bytes(buf[dir_off + 4..dir_off + 8].try_into().unwrap()) as usize;
             let ent_start = dir_off + 8;
             let ent_size = std::mem::size_of::<BlobSectionEntry>();
-            if ent_start + n * ent_size > buf.len() {
+            if n.checked_mul(ent_size)
+                .and_then(|b| b.checked_add(ent_start))
+                .is_none_or(|e| e > buf.len())
+            {
                 return Err(RuntimeError::Device(
                     "devblob: section directory truncated".into(),
                 ));
@@ -441,13 +681,37 @@ impl DevBlob {
                     .position(|&b| b == 0)
                     .unwrap_or(SECT_NAME_LEN);
                 let name = String::from_utf8_lossy(&ent.name[..name_len]).into_owned();
+                let unknown = ent.flags & !SECT_F_MUST_UNDERSTAND;
+                if unknown != 0
+                    || (ent.flags & SECT_F_MUST_UNDERSTAND != 0
+                        && !KNOWN_SECTION_KINDS.contains(&ent.kind))
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "devblob: section `{name}` (kind {}, flags {:#x}) must be understood and \
+                         this plowrt does not; the packet needs a newer plowrt",
+                        ent.kind, ent.flags
+                    )));
+                }
+                let range = usize::try_from(ent.offset)
+                    .ok()
+                    .zip(usize::try_from(ent.size).ok())
+                    .and_then(|(o, n)| Some(o..o.checked_add(n)?))
+                    .filter(|r| r.start >= body_end && r.end <= dir_off)
+                    .ok_or_else(|| {
+                        RuntimeError::Device(format!(
+                            "devblob: section {i} `{name}` (kind {}) at {} + {} B lies outside \
+                             the section area [{body_end}, {dir_off})",
+                            ent.kind, ent.offset, ent.size
+                        ))
+                    })?;
                 sects.push(DevSection {
                     kind: ent.kind,
                     name,
-                    offset: ent.offset as usize,
-                    size: ent.size as usize,
+                    offset: range.start,
+                    size: range.len(),
                 });
             }
+            check_sections(&sects)?;
             sects
         } else {
             Vec::new()
@@ -462,7 +726,7 @@ impl DevBlob {
             let raw = sections
                 .iter()
                 .find(|s| s.kind == SECT_GEN_TENSORS)
-                .and_then(|s| buf.get(s.offset..s.offset + s.size))
+                .and_then(|s| buf.get(s.offset..s.offset.checked_add(s.size)?))
                 .ok_or_else(|| {
                     RuntimeError::Device("devblob: v7 blob has no SECT_GEN_TENSORS section".into())
                 })?;
@@ -475,6 +739,7 @@ impl DevBlob {
             }
             let mut off = 0usize;
             let g = take::<GenTensor>(raw, &mut off, raw.len() / sz, "gen tensors")?;
+            let mut targeted = vec![false; tensors.len()];
             for r in &g {
                 if r.tensor as usize >= tensors.len() {
                     return Err(RuntimeError::Device(format!(
@@ -483,10 +748,30 @@ impl DevBlob {
                         tensors.len()
                     )));
                 }
-                if !r.amd_rope_bf16() && r.generate().is_none() {
+                let t = &tensors[r.tensor as usize];
+                if std::mem::replace(&mut targeted[r.tensor as usize], true) {
+                    return Err(RuntimeError::Device(format!(
+                        "devblob: two gen recipes target `{}`",
+                        t.name
+                    )));
+                }
+                if t.init.is_some() || t.bytes != r.byte_len() {
+                    return Err(RuntimeError::Device(format!(
+                        "devblob: gen recipe for `{}` makes {} B into a {} B {} tensor",
+                        t.name,
+                        r.byte_len(),
+                        t.bytes,
+                        if t.init.is_some() {
+                            "initialized"
+                        } else {
+                            "runtime"
+                        }
+                    )));
+                }
+                if !r.amd_rope_bf16() && !r.is_readable() {
                     return Err(RuntimeError::Device(format!(
                         "devblob: gen recipe for `{}` is unreadable — kind {}, scale {} \
-                         — this blob needs a newer plowrt. `generate()` refuses on an unknown \
+                         — this blob needs a newer plowrt. A recipe is unreadable on an unknown \
                          KIND or an unknown SCALE; both are printed because naming only the \
                          kind sent a reader looking at the wrong field when it was the scale \
                          (a DeepSeek-family YaRN blob read by a pre-ROPE_SCALE_YARN_DS runtime).",
@@ -546,21 +831,7 @@ impl DevBlob {
             None
         };
 
-        // PLOW_L2_PLACE guard: a placed blob requires physical-domain queue dispatch.
-        //
-        if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
-            && !l2_dispatch_ok
-            && !crate::config::RuntimeConfig::get().nv.l2_place_dispatch
-        {
-            return Err(RuntimeError::Device(
-                "devblob: blob uses L2-domain packet placement (PLOW_L2_PLACE), so a standard \
-                 interpreter would mis-dispatch its per-domain queues. Build the objects with \
-                 -DPLOW_L2_PLACE_DISPATCH and set \
-                 PLOW_L2_PLACE_DISPATCH=1, or recompile the model without PLOW_L2_PLACE."
-                    .to_string(),
-            ));
-        }
-
+        check_abi(buf, &sections, hdr.n_cu, &tensors, &progs, parent.is_some())?;
         if hdr.target != 0 {
             tracing::info!(
                 target_fp = format_args!("{:#010x}", hdr.target),
@@ -592,6 +863,15 @@ impl DevBlob {
             tp,
             parent,
         })
+    }
+
+    /// Every instruction's tensor handles against a table of `n_tensor` entries: an extension's
+    /// handles address its parent's table, so they are checked when the parent is known.
+    pub fn check_tensor_handles(&self, n_tensor: usize) -> Result<()> {
+        for (p, prog) in self.progs.iter().enumerate() {
+            check_handles(p, prog, n_tensor)?;
+        }
+        Ok(())
     }
 
     /// The tensor table as the extension contract digests it — see
@@ -663,7 +943,7 @@ impl DevBlob {
         self.sections
             .iter()
             .find(|s| s.kind == kind && s.name == name)
-            .and_then(|s| buf.get(s.offset..s.offset + s.size))
+            .and_then(|s| buf.get(s.offset..s.offset.checked_add(s.size)?))
     }
 
     pub fn reserved_metadata<'a>(&self, buf: &'a [u8], name: &str) -> Result<Option<&'a [u8]>> {
@@ -685,11 +965,16 @@ impl DevBlob {
             .ok_or_else(|| RuntimeError::Rejected(format!("{name} section range outside packet")))
     }
 
+    /// The packet's `abi.json` (checked at parse), if it carries one.
+    pub fn abi(&self, buf: &[u8]) -> Result<Option<plow_asset::abi::Abi>> {
+        read_abi(buf, &self.sections)
+    }
+
     pub fn section_data<'a>(&self, buf: &'a [u8], kind: u32) -> Option<&'a [u8]> {
         self.sections
             .iter()
             .find(|s| s.kind == kind)
-            .and_then(|s| buf.get(s.offset..s.offset + s.size))
+            .and_then(|s| buf.get(s.offset..s.offset.checked_add(s.size)?))
     }
 
     pub fn with_packet_view<T>(&self, f: impl FnOnce(&plow_asset::program::Packet<'_>) -> T) -> T {
@@ -723,6 +1008,7 @@ impl DevBlob {
             .collect();
         f(&Packet {
             n_cu: self.n_cu,
+            target: self.target,
             tp: self.tp.is_some(),
             prefill_count: self.decode_rung_lo(),
             tensors: &tensors,
@@ -1536,6 +1822,133 @@ mod tests {
             panic!("unknown opcode accepted")
         };
         assert!(err.to_string().contains("opcode 65534"), "{err}");
+    }
+
+    #[test]
+    fn abi_section_is_checked_at_parse() {
+        use plow_asset::abi::{Abi, Bindings, Target};
+        let m = tiny_model();
+        let names: Vec<String> = m.tensors.iter().map(|t| t.name.clone()).collect();
+        let derived = Bindings::derive(
+            &names,
+            m.progs
+                .iter()
+                .map(|p| p.insts.iter().map(|d| (d.op, d.t[0]))),
+        );
+        assert_eq!(derived.roles.get("ids"), Some(&0));
+        let good = Abi {
+            version: plow_asset::abi::VERSION,
+            contract: plow_asset::RUNTIME_CONTRACT_BASE,
+            must_understand: vec![],
+            target: Some(Target {
+                isa: "sm_90a".into(),
+                n_cu: m.n_cu,
+                tuned_on: Some("H100 SXM5".into()),
+            }),
+            bindings: Some(derived),
+        };
+        let blob = |abi: &Abi| {
+            m.to_blob_v6(&[packet::devbuild::SectionData {
+                kind: packet::devbuild::SECT_METADATA,
+                name: plow_asset::abi::SECTION.into(),
+                data: serde_json::to_vec(abi).unwrap(),
+            }])
+        };
+        let raw = blob(&good);
+        let parsed = DevBlob::parse(&raw).unwrap();
+        assert_eq!(parsed.abi(&raw).unwrap(), Some(good.clone()));
+        let refuse = |abi: Abi, want: &str| {
+            let err = DevBlob::parse(&blob(&abi)).err().expect(want).to_string();
+            assert!(err.contains(want), "{want}: {err}");
+        };
+        let mut bad = good.clone();
+        bad.bindings.as_mut().unwrap().roles.insert("ids".into(), 1);
+        refuse(bad, "bindings disagree");
+        let mut bad = good.clone();
+        bad.bindings.as_mut().unwrap().roles.clear();
+        refuse(bad, "bindings disagree");
+        let mut bad = good.clone();
+        bad.contract = plow_asset::RUNTIME_CONTRACT + 1;
+        refuse(bad, "runtime contract");
+        let mut bad = good.clone();
+        bad.must_understand = vec!["future.json".into()];
+        refuse(bad, "does not implement");
+        let mut bad = good.clone();
+        bad.target.as_mut().unwrap().n_cu += 1;
+        refuse(bad, "n_cu");
+        let mut raw = blob(&good);
+        let at = raw.windows(9).position(|w| w == b"\"version\"").unwrap();
+        raw[at] = b'x';
+        assert!(DevBlob::parse(&raw).is_err());
+    }
+
+    #[test]
+    fn structurally_broken_packets_are_refused_at_parse() {
+        let refuse = |m: Model, want: &str| {
+            let err = DevBlob::parse(&m.to_blob()).err().expect(want).to_string();
+            assert!(err.contains(want), "{want}: {err}");
+        };
+        let mut m = tiny_model();
+        m.progs[0].stream[1].inst = 9;
+        refuse(m, "names instruction 9 of 2");
+        let mut m = tiny_model();
+        m.progs[1].insts[0].t[3] = 7;
+        refuse(m, "names tensor 7 of 2");
+        let mut m = tiny_model();
+        m.progs[0].waits[0].id = 5;
+        m.progs[0].stream[1].wait_len = 1;
+        refuse(m, "names a counter");
+        let mut m = tiny_model();
+        m.progs[0].stream[0].wait_len = 3;
+        refuse(m, "wait/succ list outside");
+        let mut m = tiny_model();
+        m.progs[1].gq_seg_ofs = vec![0, 5];
+        refuse(m, "GQ segment windows");
+        let mut m = tiny_model();
+        m.kv_row_insts = vec![2];
+        refuse(m, "kv-row site 2");
+
+        let [cos, _] = GenTensor::rope_pair(4, 8, 10000.0, 1.0, packet::rope::RopeScale::None);
+        let gen_model = |bytes: u64, n: usize| {
+            let mut m = tiny_model();
+            m.tensors.push(TensorDecl {
+                name: "in.cos_full".into(),
+                bytes,
+                init: None,
+            });
+            m.gen = vec![GenTensor { tensor: 2, ..cos }; n];
+            m
+        };
+        assert!(DevBlob::parse(&gen_model(cos.byte_len(), 1).to_blob()).is_ok());
+        refuse(gen_model(cos.byte_len(), 2), "two gen recipes");
+        let mut resized = gen_model(cos.byte_len(), 1).to_blob();
+        let decl = 64 + 2 * std::mem::size_of::<BlobTensor>() + NAME_LEN;
+        resized[decl..decl + 8].copy_from_slice(&(cos.byte_len() + 4).to_le_bytes());
+        let err = DevBlob::parse(&resized).err().unwrap().to_string();
+        assert!(err.contains("makes 64 B into a 68 B"), "{err}");
+
+        let image = tiny_model().to_blob();
+        let mut flagged = image.clone();
+        flagged[24] |= 8;
+        assert!(DevBlob::parse(&flagged).is_err());
+        let dir = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        if dir != 0 && u32::from_le_bytes(image[dir + 4..dir + 8].try_into().unwrap()) > 0 {
+            let ent = dir + 8;
+            let mut must = image.clone();
+            must[ent..ent + 4].copy_from_slice(&99u32.to_le_bytes());
+            must[ent + 4..ent + 8]
+                .copy_from_slice(&packet::devbuild::SECT_F_MUST_UNDERSTAND.to_le_bytes());
+            assert!(DevBlob::parse(&must).is_err());
+            let mut skip = image.clone();
+            skip[ent..ent + 4].copy_from_slice(&99u32.to_le_bytes());
+            assert!(
+                DevBlob::parse(&skip).is_ok(),
+                "an unknown optional section is skipped"
+            );
+            let mut past = image.clone();
+            past[ent + 16..ent + 24].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(DevBlob::parse(&past).is_err());
+        }
     }
 
     /// Give program `p` the two collectives `devgen` emits per layer at tp=N:

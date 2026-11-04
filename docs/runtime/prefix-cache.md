@@ -131,7 +131,7 @@ snapshot is never freed on any path (LRU, retire, radix leaf eviction, strict pu
 eviction; a node's snapshots are freed one by one so each unlinks while the rest are indexed); `parent.rows < rows` and the parent lies on the chain; children sets hold
 retained ids only; a retire needs exactly one retained continuation.
 
-### Host tier: level 2 of the LRU (`PLOW_VMM_HOST_CACHE_MIB`)
+### Host tier: level 2 of the LRU (`PLOW_HOST_KVCACHE_SIZE`)
 
 Production's loss is retention: at 300-370 requests/min the device holds a prompt end for 47-57 s
 against a median think time of 45 s, so a quarter of the turns come back after their end was
@@ -194,8 +194,16 @@ lives, spills (the store's pinned host tier) or dies; the
 store owns the bytes. Copies run as one `plow_kv_segcopy` launch per publish or attach.
 The host tier is on by default and sized by the host-reserve rule: `MemAvailable` minus an
 eighth of RAM (at least 16 GiB), capped at a quarter of RAM, at start, and it stops growing for good if `MemAvailable` would
-fall under that reserve (`kv store: host tier frozen`); `PLOW_VMM_HOST_CACHE_MIB` names a size
+fall under that reserve (`kv store: host tier frozen`); `PLOW_HOST_KVCACHE_SIZE` names a size
 instead, under the same rule.
+Device budget: the store grows into all free memory after load, down to the pressure floor
+(2 % of the card) plus the pool band (`PLOW_KV_POOL_MIB`), and gives memory back to live slots
+under pressure (store chunks first, then LRU boundaries). Sliding rings of idle slots are kept
+out of it: rings commit per admitted slot under the store whenever flat rings would be a capacity
+tier (B >= 64 or ctx >= 128K, `PLOW_VMM_LIVE_RINGS` overrides).
+With other models resident, each engine's floor also keeps the other engines' KV caps and the
+shared reserve free, and a load that does not fit asks resident caches for memory before it
+evicts a model or refuses for KV room.
 `/metrics`: `plowrt_kv_store_*` (residency per tier, dedup hits, fills, reclaims, refusals,
 spills, restores, publishes, gathers, segments, launches). Recurrent models (Qwen3.8 GDN) get
 prefix caching only through the store: the prefill chunk is cut at the prompt-end boundary and

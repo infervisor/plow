@@ -15,7 +15,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "nemotron-3.5-asr"
 label = "sm90a-h100-tp1"
-plow_git = "3e2fb6efc3f3d67f5b11649a5bdc057e5ab489da"
+plow_git = "b3a2168bda58119c2c28a83183165728bae0a6d5"
 network = "fastconformer-rnnt"
 doc = "docs/runtime/asr.md"
 

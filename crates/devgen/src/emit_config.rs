@@ -1793,6 +1793,11 @@ pub struct EmitConfig {
     )]
     pub decode_cublaslt_min_rows: Option<u32>,
 
+    /// With `decode_cublaslt`: the packet carries the native block-scaled FP8 decode GEMM object,
+    /// which serves the routed block-FP8 projections whose shapes it has a measured plan for.
+    #[arg(long = "emit-decode-fp8-block", env = "PLOW_EMIT_DECODE_FP8_BLOCK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_fp8_block: bool,
+
     /// With `decode_cublaslt`: the routed rungs' lm_head is a library segment too.
     #[arg(long = "emit-decode-cublaslt-head", env = "PLOW_EMIT_DECODE_CUBLASLT_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_cublaslt_head: bool,
@@ -2329,6 +2334,7 @@ impl EmitConfig {
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
             decode_cublaslt_min_rows: env_u32("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"),
             decode_cublaslt_head: env_bool("PLOW_EMIT_DECODE_CUBLASLT_HEAD"),
+            decode_fp8_block: env_bool("PLOW_EMIT_DECODE_FP8_BLOCK"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
             fp8_decode_tc64: env_bool("PLOW_FP8_DECODE_TC64"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),

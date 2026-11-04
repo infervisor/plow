@@ -2,17 +2,35 @@
 # 16K context, decode ladder 1..48 slots, live-KV allocation, packed prefill, recurrent GDN state.
 #
 # NOT production (status "emits"): FP32 gate PASS c1/c8/c32 (beats vLLM), prod mix LOSES vs vLLM 0.29
-# hub FP8 (TPOT ~2x, TTFT P99 ~1.8x; [measured] below). The canonical recipe for this
-# model/GPU/precision; the decode campaign continues.
+# hub FP8 (TPOT P50 18.5 vs 15.95 ms, TTFT P99 1.82x, TPOT P99 1.67x; below). The canonical recipe for
+# this model/GPU/precision; the decode campaign continues.
+#
+# Native block-scaled FP8 decode GEMM (prep "fp8-block-decode", PLOW_EMIT_DECODE_FP8_BLOCK; plowrt
+# contract 5): a swap-AB WGMMA kernel the packet carries as a cubin serves the routed decode projections
+# at rungs <= 32 rows wherever its measured plan beats cuBLASLt (segment_roles
+# NATIVE_DECODE_FP8_BLOCK_SHAPES); the GDN in_proj qkv|z runs as one N-concatenated projection
+# (PLOW_FP8_BLOCK_CONCAT). Qualified 2026-11-02 on fp8-block-gemm 4e152f9cb (packet 8c5b4492f309) vs
+# the RC packet b1362356a090 + RC7.1 plowrt, H100:
+#   single block (layers 2..4, ctx 1K, nv-block-ab) decode B1/2/4/8/16/32/48 0.469/0.478/0.448/0.472/
+#   0.519/0.592/0.692 ms = -9.0/-8.6/-10.0/-9.8/-6.9/-5.9/-1.5 %, every point PASS on spread; the qkv|z
+#   concat alone is bit-identical (prefill T 128/512/1000 and decode B48 rel 0.0)
+#   step_bench B1 ctx 8191 16.07 -> 14.27 ms (-11.2 %), B8 spread 16.70 -> 14.84 ms (-11.1 %), packed
+#   prefill 16000 tokens 1.335 -> 1.342 s (flat); prefill logits and the B1 token stream identical
+#   FP32 gate PASS vs the same-concurrency vLLM peers, kl_trim / p95 / top1_decisive / over-0.1:
+#   c1 0.00884/0.0616/0.9976/27 (vLLM 0.01466/0.1022/0.9939/55), c8 0.00920/0.0616/0.9963/33
+#   (0.01529/0.1124/0.9915/63), c32 0.00959/0.0660/0.9988/40 (0.01791/0.1302/0.9902/69), needle 1
+#   prod mix q450.g (0.45 sessions/s, 2 reps; strict report MATCHED, EQUIVALENT): TPOT P50 20.69 ->
+#   18.53 ms (-10.4 %), SLO met 99.4 -> 99.7 %, throughput 9905 -> 9908 tok/s; TTFT P99 1498 -> 1537 ms
+#   and TPOT P99 72.2 -> 73.3 ms within the repeat spread (12-42 %).
 #
 # Every quantized projection runs as one cuBLASLt block-scaled FP8 matmul (BLK128x128_32F weight
 # scales x VEC128_32F activation scales, tokens padded to 4) at every prefill bucket and decode rung
 # from 1 row; QuantFp8 writes the 1x128-group activation scales (vLLM per_token_group_quant_fp8
-# rounding). The packet declares plowrt contract 3. GDN step isolated from 1 row (one role layout
-# across the routed rungs).
+# rounding). The packet declares plowrt contract 5 (native FP8 object, below). GDN step isolated
+# from 1 row (one role layout across the routed rungs).
 #
 # Single block (layers 2..4, GDN + full attention, ctx 1K, H100 2026-10-30, nv-block-ab four frozen
-# arms, ceilings 3094 GB/s / 1407 FP8 TFLOP/s; evidence /opt/dlami/nvme/lava-tts/docs-review/fp8hub)
+# arms, ceilings 3094 GB/s / 1407 FP8 TFLOP/s; evidence <lab scratch>/docs-review/fp8hub)
 # vs the previous canonical packet (plow per-row re-quantization of the BF16 checkpoint, OUTER_VEC
 # Lt from 2 rows, M1 TMA GEMV at 1 row): decode B1/2/4/8/16/32/48 0.722/0.720/0.724/0.735/0.751/0.798/
 # 0.872 ms = -10.5/-25.5/-22.7/-21.9/-23.2/-22.8/-20.2 % (34-49 % of the block floor); prefill
@@ -20,7 +38,7 @@
 # output vs the BF16 block on one synthetic input: rel 0.033 (re-quantized 0.037).
 #
 # FP32-reference gate peers: vLLM 0.29.0 serving this checkpoint (captures 2026-10-25,
-# /opt/dlami/nvme/lava-tts/qwen38/fp32gate/vllm029-fp8-c{1,8,32}.json; server log
+# <lab scratch>/qwen38/fp32gate/vllm029-fp8-c{1,8,32}.json; server log
 # vllm029-fp8-server.log): Fp8LinearMethod = FlashInferFp8DeepGEMMDynamicBlockScaledKernel with
 # DeepGEMM E8M0 scales (vLLM rounds the published scales to powers of two on Hopper), FLASH_ATTN v3,
 # --max-model-len 16384, gdn_prefill_backend triton.
@@ -30,7 +48,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1-fp8"
 status = "emits"
-plow_git = "188168c912c83966fa8ffe8226d4a3e224454001"
+plow_git = "b3a2168bda58119c2c28a83183165728bae0a6d5"
 network = "qwen3.5"
 
 [target]
@@ -87,6 +105,14 @@ TVM_FFI_DISABLE_TORCH_C_DLPACK = "1"
 CXX = "/usr/bin/g++-14"
 CC = "/usr/bin/gcc-14"
 
+# The native block-scaled FP8 decode GEMM object (runtime/nvidia/gemm_fp8_block_sm90.cu), built
+# before the emit so the emit can hash and declare it.
+[[prep]]
+name = "fp8-block-decode"
+script = "scripts/build_sm90a_fp8_block.py"
+python = "python3"
+args = ["{out}/assets"]
+
 [emit]
 emit = "devblob+cubin"
 args = ["--served-name", "qwen3.8-27b-fp8"]
@@ -104,6 +130,7 @@ PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "1"
 PLOW_FP8_BLOCK_CONCAT = "1"
+PLOW_EMIT_DECODE_FP8_BLOCK = "1"
 PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal_ilv,attn_dec_hd256_gqa6_ilv"
 PLOW_QWEN_KV_INTERLEAVE = "1"
 PLOW_EMIT_PACKED_PREFILL = "1"
@@ -119,6 +146,10 @@ PLOW_PREFIX_CACHE = "1"
 PLOW_VMM_PREFIX = "1"
 PLOW_PF_INTERLEAVE = "0"
 PLOW_MAX_QUEUED_REQUESTS = "128"
+# Generated flash decode from one row: the segmented FP8 rungs already split around attention, so
+# the object beats the interpreter pair at B1/B2 too (step_bench 4K 14.05/14.69 -> 13.56/13.70 ms;
+# q450 T K K T, mean of the two runs' TPOT P50 16.78 -> 15.90 ms; FP32 gate c1/c8/c32 PASS).
+PLOW_GEN_DECODE_STEP = "1"
 
 [bench]
 backend = "openai"
@@ -134,7 +165,7 @@ gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one sh
 
 # Production mix (2026-10-30, plowrt fb618c6c6 on branch qwen-fp8-hub, packet 7af35fe6fee0, [serve.env]
 # below, cuBLASLt 13.4; llm_grid.sh --prod, 0.45 sessions/s, 2 repeats, --prod-fidelity; evidence
-# /opt/dlami/nvme/lava-tts/docs-review/fp8hub/qual/run/qwenfp8). FP32 gate PASS at c1/c8/c32 at the
+# <lab scratch>/docs-review/fp8hub/qual/run/qwenfp8). FP32 gate PASS at c1/c8/c32 at the
 # default thresholds, every criterion ahead of the vLLM 0.29 hub-FP8 peer. campaign.py report against
 # vLLM 0.29 serving the same checkpoint (MATCHED, EQUIVALENT; report/comparison.md): total tok/s 9812 vs
 # 9920 (0.99x), TTFT P99 1556 vs 846 ms (1.84x), TPOT P99 88.1 vs 44.0 ms (2.00x; all P99s spread-
@@ -154,7 +185,7 @@ nprompt = 32
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py): QWEN38_FP32_REF = the BF16 recipe's
 # reference; QWEN38_FP8_FP32_VLLM{,_C8,_C32} = vLLM 0.29 serving the hub FP8 checkpoint
 # (Qwen/Qwen3.8-27B-FP8, --max-model-len 16384, gdn_prefill_backend triton) captured at c1, c8
-# and c32 (this box: /opt/dlami/nvme/lava-tts/qwen38/fp32gate/vllm029-fp8-c*.json). Each plow
+# and c32 (this box: <lab scratch>/qwen38/fp32gate/vllm029-fp8-c*.json). Each plow
 # concurrency scores against the peer at the same concurrency; thresholds are the gate's
 # defaults (the slack the BF16 peers needed is gone with them).
 [gates]

@@ -1,8 +1,14 @@
 # Host resources: plowrt vs vLLM 0.29, H100 RC5 (2026-11-01)
 
 The host-side cost of serving the same production mix with the qualified RC5 plowrt and with
-vLLM 0.29. Both arms ran on one box with the same client, prompts and seeds. The data is in
-`host-resources.h100.rc5.csv`, one row per model per arm. It was recorded by `llm_grid.sh --prod`
+vLLM 0.29, in two configurations:
+
+1. **Host tier on.** This is plowrt's production setting: a pinned prefix-cache host tier
+   beside the GPU prefix cache.
+2. **Host tier off** (`PLOW_VMM_HOST_CACHE_MIB=0`). This is the apples-to-apples case: GPU
+   prefix cache only, as in vLLM 0.29 with these flags. See "Apples to apples" below. Both arms ran on one box with the same client, prompts and seeds. The data is in
+`host-resources.h100.rc5.csv`, one row per model per arm per lease. The `lease` column is
+`run2-tier-on`, `ctl-tier-on-sampler-off` or `run3-tier-off`. It was recorded by `llm_grid.sh --prod`
 with `scripts/bench/host_res.py`, which samples the server's whole process tree every 2 s.
 
 ## Setup
@@ -10,7 +16,7 @@ with `scripts/bench/host_res.py`, which samples the server's whole process tree 
 | | |
 |---|---|
 | Box | gpu03 (lab): 1x NVIDIA H100 80GB HBM3, AMD EPYC 7R13 16 vCPU, 249 GiB RAM, Linux 7.0 |
-| Date | 2026-11-01, 14:04-14:37 UTC (all four arms in one GPU lease, sequential) |
+| Date | 2026-11-01. Tier-on: 14:04-14:37 UTC, four arms in one GPU lease. Tier-off: 16:45-17:56 UTC, six arms in one lease (plowrt tier-off, a fresh vLLM, plowrt tier-off with the sampler off, per model) |
 | plowrt | RC5g build, commit `2ee27f888`, binary sha256 `b29db01f163d...`; cuBLASLt 13.4 |
 | Packets | 26B BF16 `model.pkt` sha256 `7ce782987bc0...`; 12B FP8 `159093417a1a...` (recipe env from `recipes/infervisor/gemma-4-{26b-a4b,12b}/sm90a-h100-tp1*.toml`) |
 | vLLM | 0.29.0, `--gpu-memory-utilization 0.93 --max-num-seqs 256 --max-model-len 16384 --tensor-parallel-size 1`; 12B also `--kv-cache-dtype fp8` and the BF16 tokenizer copy; `VLLM_USE_FLASHINFER_SAMPLER=0`; cutlass DSL on `PYTHONPATH` |
@@ -19,6 +25,75 @@ with `scripts/bench/host_res.py`, which samples the server's whole process tree 
 
 "Cell" values cover the measured cell, from `CELL_BEGIN` to `CELL_END`. "Session" values cover
 everything from server start to exit, model load included. Steady is the median over the cell.
+
+## Apples to apples: plowrt host tier off vs vLLM 0.29 (GPU prefix cache only)
+
+plowrt runs with `PLOW_VMM_HOST_CACHE_MIB=0`, appended after the recipe env, so it overrides
+the 12B recipe's 65536 and the 26B auto sizing. The serve log shows `kv store: armed ...
+device_cap_mib=20270 host_cap_mib=0`. `plowrt_kv_store_host_bytes` read 0 in every sample of
+both cells. The GPU prefix cache and the device KV block store stay on (`PLOW_PREFIX_CACHE=1`,
+`PLOW_VMM_PREFIX=1`). The vLLM arms are fresh, measured in the same lease right after plowrt.
+Latency rows come from the sampler-off plowrt arm (`PB_HOST_MS=0`) of the same lease; resource
+rows come from the sampled arm.
+
+| metric | 26B plowrt | 26B vLLM | ratio | 12B plowrt | 12B vLLM | ratio |
+|---|---|---|---|---|---|---|
+| Host RSS peak (cell) | 2,906 MiB | 6,925 MiB | 0.42x | 23,929 MiB | 5,680 MiB | 4.21x |
+| Host RSS steady (cell median) | 2,886 MiB | 6,918 MiB | 0.42x | 23,908 MiB | 5,663 MiB | 4.22x |
+| Pinned KV host tier | 0 | - | | 0 | - | |
+| Host RSS peak (whole session, load included) | 49,594 MiB | 51,228 MiB | 0.97x | 35,638 MiB | 6,457 MiB | 5.52x |
+| Anon RSS peak (session) | 2,723 MiB | 6,113 MiB | 0.45x | 23,691 MiB | 4,641 MiB | 5.11x |
+| VmLck / VmPin peak | 0 / 0 | 0 / 0 | | 0 / 0 | 0 / 0 | |
+| System MemAvailable min | 226,303 MiB | 224,223 MiB | 1.01x | 206,716 MiB | 230,323 MiB | 0.90x |
+| CPU cores busy avg / peak (cell) | 0.84 / 1.19 | 0.57 / 1.00 | 1.47x | 0.78 / 1.19 | 0.44 / 1.02 | 1.79x |
+| Client CPU cores avg | 0.06 | 0.06 | | 0.07 | 0.07 | |
+| Threads / processes (cell peak) | 40 / 1 | 193 / 3 | | 40 / 1 | 188 / 3 | |
+| Binary vs site-packages | 0.02 GiB | 11.11 GiB | | 0.02 GiB | 11.11 GiB | |
+| Mapped shared libraries | 0.56 GiB | 4.98 GiB | 0.11x | 0.56 GiB | 4.94 GiB | 0.11x |
+| GPU memory peak (cell) | 79,828 MiB | 76,322 MiB | 1.05x | 79,504 MiB | 76,800 MiB | 1.04x |
+| GPU prefix/KV capacity | device store 19.8 GiB | KV cache 22.9 GiB (109k tokens) | 0.86x | device store 19.8 GiB | KV cache 58.9 GiB (367k tokens) | 0.34x |
+| Prefix token hit (`/metrics`) | 31.5% | 56.2% | | 32.6% | 75.7% | |
+| Server ready time | 25.6 s | 190.6 s | 0.13x | 56.9 s | 102.3 s | 0.56x |
+| Total throughput (sampler off) | 40,167 tok/s | 40,551 tok/s | 0.99x | 44,865 tok/s | 52,107 tok/s | 0.86x |
+| TTFT P99 (sampler off) | 2,392.5 ms | 399.9 ms | 5.98x | 15,380.0 ms | 956.7 ms | 16.1x |
+| TPOT P99 (sampler off) | 84.38 ms | 39.56 ms | 2.13x | 73.75 ms | 117.99 ms | 0.63x |
+| SLO attainment (sampler off) | 98.13% | 100.0% | | 26.2% | 97.75% | |
+
+The sampled tier-off arm is within run-to-run noise of the sampler-off arm:
+- 26B: 40,073 tok/s, TTFT P99 2,238 ms, TPOT P99 85.9 ms, 30.3% hit.
+- 12B: 44,350 tok/s, TTFT P99 17,373 ms, TPOT P99 75.3 ms, 32.6% hit.
+
+**What the host tier buys.** The comparison is plowrt tier-on (sampler-off control, same
+binary, packets and mix, earlier lease) vs plowrt tier-off (sampler-off):
+
+| | 26B tier on | 26B tier off | 12B tier on | 12B tier off |
+|---|---|---|---|---|
+| Prefix token hit | 77.0% | 31.5% | 76.6% | 32.6% |
+| Host RSS (cell median, sampled arm) | 65.2 GiB | 2.8 GiB | 87.4 GiB | 23.3 GiB |
+| Throughput | 40,409 tok/s | 40,167 tok/s | 52,179 tok/s | 44,865 tok/s |
+| TTFT P99 | 616 ms | 2,393 ms | 706 ms | 15,380 ms |
+| TPOT P99 | 55.4 ms | 84.4 ms | 52.2 ms | 73.8 ms |
+| SLO attainment | 99.9% | 98.1% | 98.9% | 26.2% |
+
+What this shows:
+
+* The tier costs about 64 GiB of pinned host RAM. For that it more than doubles plowrt's prefix
+  hit rate on this agentic mix. It is what keeps plowrt ahead of vLLM on 12B (TTFT P99 706 vs
+  944 ms) and within 1.5x on 26B (616 vs 411 ms).
+* Without the tier, plowrt's GPU-only prefix cache hits far less than vLLM's GPU-only cache:
+  31% vs 56% on 26B, and 33% vs 76% on 12B. Two causes:
+  * plowrt's device block store is capped at 19.8 GiB (`device_cap_mib=20270`).
+  * vLLM gives every byte left after weights at 0.93 utilization to one paged KV pool that is
+    both working set and prefix cache: 22.9 GiB on 26B and 58.9 GiB on 12B.
+* On 12B, plowrt therefore re-prefills most context. Prefill then saturates, and the open loop
+  backs up: TTFT P50 8.8 s, SLO 26%.
+* As a GPU-only server, plowrt would need a device prefix capacity comparable to vLLM's KV pool
+  to match it. The host tier currently makes up for the smaller device store.
+
+## Host tier on (production setting): per-model detail
+
+The two tables below are the tier-on lease. plowrt's host RSS there is mostly the pinned
+prefix-cache host tier.
 
 ## Gemma-4 26B-A4B BF16, q1800 (1.8 sessions/s)
 
@@ -102,6 +177,10 @@ everything from server start to exit, model load included. Steady is the median 
   | 26B vLLM | 6,846 MiB | 6,846 MiB | 193 / 193 | API server, resource tracker, `VLLM::EngineCore` |
   | 12B plowrt | 89,466 MiB | 89,407 MiB | 43 / 43 | plowrt |
   | 12B vLLM | 5,665 MiB | 5,665 MiB | 188 / 188 | API server, resource tracker, `VLLM::EngineCore` |
+  | 26B plowrt tier-off | 2,877 MiB | 2,877 MiB | 40 / 40 | plowrt |
+  | 26B vLLM (tier-off lease) | 6,914 MiB | 6,914 MiB | 193 / 193 | API server, resource tracker, `VLLM::EngineCore` |
+  | 12B plowrt tier-off | 23,889 MiB | 23,889 MiB | 40 / 40 | plowrt |
+  | 12B vLLM (tier-off lease) | 5,656 MiB | 5,656 MiB | 188 / 188 | API server, resource tracker, `VLLM::EngineCore` |
 
   The vLLM tree includes EngineCore (3.5-3.8 GiB RSS, about 115-120 threads in the cell). Its
   load-time peak was 44.6 GiB RSS on 26B while loading weights. During load the session sampler
@@ -136,10 +215,11 @@ everything from server start to exit, model load included. Steady is the median 
   12B, at the recipe default, prefix cache on. It is a deliberate cache sized to free RAM, not
   a working set, and it fills to its cap within about 3 minutes of the mix. vLLM keeps no host
   KV tier with these flags. Compare plowrt RSS excluding the tier: 26B ~2.9 GiB vs vLLM 6.7 GiB.
-* Odd: 12B FP8 plowrt holds about 23.4 GiB of anonymous RSS beyond the tier. It is already
-  ~25 GiB before the tier starts growing, so it is load-time host memory that is never
-  released. 26B BF16 holds only ~2.9 GiB beyond the tier. This looks like host copies kept by
-  the FP8 checkpoint load path and is worth a look in plowrt.
+* Odd: 12B FP8 plowrt holds about 23.4 GiB of anonymous RSS beyond the tier. The tier-off run
+  confirms it: 23.3 GiB with the tier at 0. It is already ~25 GiB before the tier starts
+  growing, so it is load-time host memory that is never released. 26B BF16 holds only
+  ~2.8 GiB. This looks like host copies kept by the FP8 checkpoint load path and is worth a
+  look in plowrt.
 * vLLM's session RSS peak (46.5 GiB on 26B, 16.2 GiB on 12B) is EngineCore while it loads
   weights. Its file-backed pages come from the safetensors mmap. The tree's steady state is
   5.7-6.9 GiB.
@@ -151,4 +231,5 @@ everything from server start to exit, model load included. Steady is the median 
   * `run2/<model>/<arm>/`: `host.tsv`, `host.json`, `<cell>.host.json`, `footprint.json`, `server.log`, client JSON;
   * `run2/handcheck.log`: the ps cross-checks;
   * `ctl/`: the sampler-off control;
+  * `run3/`: the tier-off lease (`plow-tieroff`, `vllm`, `plow-nosampler` per model, plus `handcheck.log`);
   * the discarded Pss run sits at the top level.
