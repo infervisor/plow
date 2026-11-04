@@ -11961,7 +11961,7 @@ fn emit_dense_gqa(
     }
     if !block_mode {
         sections.push(
-            serve_section::section(
+            serve_section::section_with_tp(
                 &dir,
                 ecfg.serve_defaults.as_deref(),
                 &emitter
@@ -11969,6 +11969,7 @@ fn emit_dense_gqa(
                     .dspark
                     .as_ref()
                     .map_or_else(Vec::new, |d| d.kv_layers(&c)),
+                c.tp,
             )
             .unwrap_or_else(|error| panic!("serve manifest: {error}")),
         );
