@@ -79,8 +79,6 @@ mod packlog {
     static DECODE_ROWS: AtomicU64 = AtomicU64::new(0);
     static TICKS: AtomicU64 = AtomicU64::new(0);
 
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
     /// One line per mux tick: when it ended, what its prefill pass and decode launch cost, and
     /// how many rows decoded. The cumulative summary below hides WHICH ticks carried prefill.
     /// `steps` is the decode quantum the launch ran, `tokens` the tokens the tick emitted, and
@@ -95,7 +93,7 @@ mod packlog {
         live: usize,
         prefilling: usize,
     ) {
-        let t = START.get_or_init(std::time::Instant::now).elapsed();
+        let t = crate::obs::serving::packlog_epoch().elapsed();
         eprintln!(
             "PACKLOG TICK t_ms={:.1} prefill_ms={:.2} decode_ms={:.2} did_prefill={} decode_rows={} \
              steps={} tokens={} live={} prefilling={}",
@@ -129,7 +127,7 @@ mod packlog {
         rows: usize,
     ) {
         if on() {
-            let t = START.get_or_init(std::time::Instant::now).elapsed();
+            let t = crate::obs::serving::packlog_epoch().elapsed();
             eprintln!(
                 "PACKLOG PHASE t_ms={:.1} prefill_ms={:.2} decode_ms={:.2} did_prefill={} did_decode={} decode_rows={}",
                 t.as_secs_f64() * 1e3,
