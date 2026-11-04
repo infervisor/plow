@@ -107,13 +107,20 @@ impl Resolved {
     /// bytes)`. Empty for an `hf:` checkpoint, which the distribution does not
     /// carry. These are fetched with the bundle but linked into the snapshot,
     /// not the bundle directory.
+    /// The checkpoint's blobs: a `dist` checkpoint's files, and every view's derived bytes.
     pub fn checkpoint_files(&self) -> Result<Vec<(String, Digest, u64)>> {
-        self.bundle
-            .checkpoint
+        let c = &self.bundle.checkpoint;
+        let mut out: Vec<(String, Digest, u64)> = c
             .files
             .iter()
             .map(|f| Ok((f.name.clone(), Digest::parse(&f.sha256)?, f.bytes)))
-            .collect()
+            .collect::<Result<_>>()?;
+        for v in &c.views {
+            for (d, bytes) in super::view::blobs(v) {
+                out.push((format!("{}/{d}", v.dir), Digest::parse(&d)?, bytes));
+            }
+        }
+        Ok(out)
     }
 
     /// Split the file list by what the store already has. No network.
@@ -286,7 +293,9 @@ pub fn pull(
     if !checkpoint.is_empty() {
         let digests: Vec<Digest> = checkpoint.into_iter().map(|(_, d, _)| d).collect();
         store.keep(&dir, &digests)?;
-        super::weights::link_dist(store, &resolved.bundle)?;
+        if resolved.bundle.checkpoint.source == plow_asset::dist::DIST_SOURCE {
+            super::weights::link_dist(store, &resolved.bundle)?;
+        }
     }
     Ok((dir, t))
 }

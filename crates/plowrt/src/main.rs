@@ -1146,6 +1146,10 @@ async fn async_main(
     for (key, value, source) in &asset_defaults {
         tracing::info!(%key, %value, %source, "serve default from the assets");
     }
+    let mut cli = cli;
+    if let Cmd::Serve { model, .. } = &mut cli.cmd {
+        dist_cmd::route_packet_models(model, &mut cli.rt_cfg)?;
+    }
     RuntimeConfig::init(cli.rt_cfg);
     plowrt::config::record_startup(plowrt::config::Startup::from_matches(
         &matches,
