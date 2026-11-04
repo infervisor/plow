@@ -26,6 +26,7 @@ vendor = "nvidia"
 isa = "sm_90a"
 sku = "H100 SXM5"
 units = 132
+toolchain = "cuda-12.9-nix"
 num_gpus = 1
 parallel = "tp"
 
@@ -127,6 +128,15 @@ python = "{env:PYREF}"
 hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
 top1_min = 0.98
 kl_mean_max = 2e-3
+# Same FP32-reference gate as the production recipe (the sidecar emit must not move text quality).
+[gates.llm_fp32_ref]
+reference = "{env:E4B_FP32_REF}"
+concurrency = [1, 8, 32]
+vllm_hf = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
+vllm_python = "{env:VLLM_PYTHON}"
+vllm_args = "--served-model-name gemma-4-e4b --max-model-len 8192 --gpu-memory-utilization 0.85 --max-num-seqs 256 --limit-mm-per-prompt '{\"image\":0,\"audio\":0}'"
+timeout_s = 3600
+needle_min = 0.0
 
 # 2026-10-10 (mm-harden a00d40f2, packet built from this recipe): mm_parity PASS 10/10 cases,
 # refusals 11/11, encoders 22/22 (cos >= 0.9996); llm_logit_parity PASS top1 0.9948, KL 7.5e-4.
