@@ -454,12 +454,14 @@ Repo-vs-vendor notes, flagged and not edited:
 * **Choosing staging:** inside the 256-thread megakernel, use uniform TMA (one elected issuer,
   mbarrier ring NS = 3-4). Producer/consumer + `setmaxnreg` only in lean objects (256-thread entry
   split at occ 2, or WS384), split once per launch.
-* **Tile and smem:** stage = (BM + BN) x BK x elem bytes (128x128: 32 KiB; BN256: 48 KiB) plus
-  barriers. Keep the arena <= ~113 KiB if you
+* **Tile and smem:** budget the staged TMA boxes, not BM x BK: stage = A box + B box (+ padding,
+  barriers, alignment). The fp8 BM64/BN256 path stages a full 128-row A box: 16 + 32 = 48 KiB
+  (`op_gemm_sm90.cuh:2145`). Keep the arena <= ~113 KiB if you
   need 2 blocks/SM. Keep the decode object's dynamic smem low enough that L1 stays above 28 KiB.
   `static_assert` the claim.
-* **Accumulators:** m64n256 = 128 f32/thread; plow's WS384 consumer needs >= 154 regs. That does
-  not fit a 128-reg occ-2 object. Decide occupancy first, then N.
+* **Accumulators:** m64n256 = 128 f32/thread; plow's WS384 consumer needs >= 154 regs. A uniform
+  128-reg cap cannot hold it; a 256-thread occ-2 object can, by `setmaxnreg` donation (producer
+  dec 32, consumer inc 224; `op_gemm_sm90.cuh:1984-2020`). Decide occupancy first, then N.
 * **fp8 accuracy:** promote into an f32 shadow every 128 K if regs allow. Otherwise check the
   op-test relL2 at the largest K.
 * **Writing smem from registers or with plain cp.async, then wgmma:**

@@ -156,7 +156,7 @@ Vendor rules [vendor documented: MSL 4.1 §6.10.1, §6.16]:
   `atomic_ulong` with `atomic_min/max_explicit` only; no 64-bit fetch-add or CAS [vendor
   documented: MSL 4.1 §6.16.4, Tables 6.27–6.28].
 * SIMD-group functions (`simd_shuffle*`, `simd_broadcast`, `simd_sum/max/min/prefix_*`,
-  `simd_ballot/all/any`) need no barrier; data operands take no `bfloat`/`bool`/`long` (widen to float);
+  `simd_ballot/all/any`) need no barrier; data operands take no `bfloat`/`bool`/`long`: convert `bfloat` to `float`; split 64-bit integers into two 32-bit ops (never through `float`, which loses integers above 2^24);
   `simd_all/any/ballot` take a `bool` predicate [vendor documented: MSL 4.1 §6.10.2, Table 6.14].
 
 Plow's cross-threadgroup protocol inside one dispatch (`plow_interp`):
