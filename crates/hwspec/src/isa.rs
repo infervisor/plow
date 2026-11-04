@@ -190,7 +190,7 @@ impl IsaLevel {
             },
             IsaLevel::Sm100a => IsaCaps {
                 mma_sync: true,
-                wgmma: true,
+                wgmma: false,
                 tcgen05: true,
                 tmem: true,
                 tma: true,
@@ -473,7 +473,8 @@ impl ArchGeometry {
 pub struct IsaCaps {
     /// Warp-synchronous MMA (`mma.sync.*`).
     pub mma_sync: bool,
-    /// Warpgroup MMA (`wgmma.*`) — Hopper and datacenter Blackwell.
+    /// Warpgroup MMA (`wgmma.*`): `sm_90a` only. ptxas rejects it for `sm_100a` (`tcgen05`
+    /// replaces it) and `sm_120a`.
     pub wgmma: bool,
     /// 5th-gen tensor-core MMA (`tcgen05.*`) — datacenter Blackwell only.
     pub tcgen05: bool,
@@ -773,6 +774,7 @@ mod tests {
     fn capability_is_not_monotonic_in_release_order() {
         assert!(IsaLevel::Sm90a.caps().wgmma);
         assert!(!IsaLevel::Sm120a.caps().wgmma);
+        assert!(!IsaLevel::Sm100a.caps().wgmma);
         assert!(IsaLevel::Sm90a.caps().tma);
         assert!(!IsaLevel::Sm120a.caps().tma);
     }

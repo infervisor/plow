@@ -4,19 +4,14 @@
 |---|---|
 | Target | Apple silicon GPU, Metal GPU family **Apple9** (M3, M4 series; also A17 Pro, A18) |
 | Arch strings | `--arch metal3` (`IsaLevel::Metal3.arch_flag() == "metal3"`); `plowc --gpu m4pro` resolves it (`crates/hwspec/src/registry.rs` `("m4pro", "Apple M4 Pro")`) |
-| SKUs plow ships | Apple M4 Pro, 16 GPU cores: `recipes/infervisor/qwen3-0.6b/metal3-apple-m4-pro-tp1-2k.toml`, `recipes/infervisor/smollm2-360m/metal3-apple-m4-pro-tp1-2k.toml` (status `emits`, `mem_bytes = 19069665280`) |
-| hwspec | `IsaLevel::Metal3` (`crates/hwspec/src/isa.rs`, `from_spec`: `(Vendor::Apple, (3,_)|(4,_))`); `GpuSpec` `APPLE_M4`, `APPLE_M4_PRO`, `APPLE_M4_MAX` in `crates/hwspec/src/apple/m4.rs`; core `SmSpec` `APPLE_M4_CORE` |
+| SKUs plow ships | Apple M4 Pro, 16 GPU cores: `recipes/infervisor/qwen3-0.6b/metal3-apple-m4-pro-tp1-2k.toml`, `recipes/infervisor/smollm2-360m/metal3-apple-m4-pro-tp1-2k.toml` (`[target] units = 16, mem_bytes = 19069665280`; status `emits` in the recipe `.md`) |
+| hwspec | `IsaLevel::Metal3` (`isa.rs`); `APPLE_M4{,_PRO,_MAX}` in `crates/hwspec/src/apple/m4.rs` |
 | Kernels | `runtime/apple/*.metal` (`interp.metal` = device-ISA interpreter; `q8.metal`, `asr*.metal`, `mlp_channel.metal`); probes `runtime/apple/probe/*.m` |
 | Host engine | `crates/plowrt/src/exec/apple/` (feature `metal`; `ane` adds CoreML), via `objc2-metal 0.3` |
 | Shipping form | MSL **source** inside `plowrt` (`include_str!`), compiled on the serving Mac at load. Apple bundles ship no objset (`docs/DISTRIBUTION.md` "Runtime-compiled targets") |
 
-There is no public Apple GPU machine ISA. This file documents the level kernel authors actually
+Apple publishes no GPU machine ISA. This file documents the level kernel authors actually
 program: the Metal Shading Language (MSL) and the Metal feature-set limits for Apple9.
-
-Verified against: Apple *Metal Feature Set Tables* (PDF dated October 23, 2026), *Metal Shading
-Language Specification* Version 4.1 (dated 2026-06-04), Apple Newsroom M4 (2024-05), M4 Pro/Max
-(2024-10) and M5 (2025-10) releases, Apple tech talk "Explore GPU advancements in M3 and A17 Pro";
-fetched 2026-11-03.
 
 ## 1. Execution model
 
@@ -35,7 +30,7 @@ fetched 2026-11-03.
 | Occupancy query | None exposed. The runtime launches the **packet's `n_cu`** threadgroups and compares it with the name-based registry core count (`hwspec::registry::lookup(device.name())`); no co-residency or core-count probe runs at load. The `m4.rs` comment saying the grid is "sized by the co-residency probe at load" does not match the code; `probe.m` (b) `coresident` is a bring-up tool | `crates/plowrt/src/exec/apple/mod.rs` `matching_geometry`, dispatch `width: n_cu`; `m4.rs` |
 | L1 / shared total | hwspec `l1_shared_total = 64 KiB` (UNVERIFIED) | `m4.rs` |
 | Last-level (SLC) | hwspec `l2`: M4 8 MiB, M4 Pro 24 MiB, M4 Max 32 MiB (UNVERIFIED: Apple publishes no SLC size) | `m4.rs` |
-| Memory | Unified LPDDR5X; M4 120 GB/s, M4 Pro 273 GB/s (256-bit), M4 Max 410 GB/s (32-core) / 546 GB/s (40-core) | 273/546 [vendor documented: Newsroom M4 Pro-Max]; 120, LPDDR5X and bus widths (UNVERIFIED: not in the fetched Apple pages) |
+| Memory | Unified LPDDR5X; M4 120 GB/s, M4 Pro 273 GB/s (256-bit), M4 Max 410 GB/s (32-core) / 546 GB/s (40-core) | 120/273/546 [vendor documented: Newsroom M4 Pro-Max]; LPDDR5X and bus widths (UNVERIFIED) |
 | GPU clock | hwspec `clock_boost` M4 1470 MHz, M4 Pro/Max 1578 MHz (UNVERIFIED) | `m4.rs` |
 | Neural Engine | 16 cores, 38 TOPS (int8 per hwspec) per M4 chip | [vendor documented: Newsroom M4 "38 trillion operations per second"]; fp16 measured 4.05 TFLOPS [measured in plow: 8682fc356] |
 | Forward progress | **Not guaranteed** for compute on Apple9; "Compute shader forward progress guarantees" starts at Apple11 | [vendor documented: Feature Set Tables, feature availability] |
@@ -65,7 +60,7 @@ per-core resources of the nearest listed Apple part.
 | Element-to-lane map | Unspecified by Apple. Never index fragment registers; go through `simdgroup_store` to threadgroup scratch. [vendor documented: MSL 4.1 §2.4] |
 | Control flow | All 32 lanes must execute each op under uniform control flow, else undefined [vendor documented: MSL 4.1 §2.4] |
 | Availability | "SIMD-scoped matrix multiply operations" from Apple7 [vendor documented: Feature Set Tables] |
-| Hardware | No dedicated matrix unit on M1–M4: the op runs on the FP32 ALUs, matrix rate = FMA rate; hwspec `APPLE_G16_MMA` fp16 = bf16 = 128, fp8/fp4/int8 = `None` (`m4.rs`). Cost model shape 8x8x8 only (`crates/costmodel/src/mma.rs` `APPLE`). Latency/throughput per op: not published (UNVERIFIED) |
+| Hardware | No dedicated matrix unit on M1–M4. hwspec assumes matrix rate = FP32 FMA rate (`APPLE_G16_MMA` fp16 = bf16 = 128 MAC/core/clk, fp8/fp4/int8 = `None`, `m4.rs`); uncalibrated (UNVERIFIED: measure fp16 and bf16 ceilings separately). Cost model shape 8x8x8 only (`crates/costmodel/src/mma.rs` `APPLE`). Latency/throughput per op: not published (UNVERIFIED) |
 | Mixed precision | Plow multiplies `simdgroup_bfloat8x8` operands into a `simdgroup_float8x8` accumulator. MSL Table 6.10 writes one `T` for all operands; mixed bf16→f32 compiles and is lockstep-exact in plow [measured in plow: 56ec6e6e9]. Spec coverage of the mixed form (UNVERIFIED) |
 
 Plow call sites (`runtime/apple/interp.metal`):
@@ -92,25 +87,13 @@ simdgroup_multiply_accumulate(acc, a, b, acc);
 
 ### 2.2 Metal 4 tensors and `tensor_ops::matmul2d` (not used by plow)
 
-* MSL 4.0+ adds `tensor<>`, `cooperative_tensor<ElementType, Extents, Layout>` (elements
-  partitioned across lanes of one or more consecutive SIMD-groups; layout is device-chosen,
-  obtain it from the op) and Metal Performance Primitives `mpp::tensor_ops::matmul2d` /
-  `convolution2d`, with execution scopes `execution_thread`, `execution_simdgroup`,
-  `execution_simdgroups<N>` [vendor documented: MSL 4.1 §2.22, §7.1, §7.2].
-* `matmul2d_descriptor(M, N, K, transpose_left, transpose_right, relaxed_precision, mode)`;
-  dtype pairs: half/float/char from Metal 4; bfloat pairs from OS 26.1; uchar and int4 from OS 26.4;
-  fp8 e4m3/e5m2, fp4 e2m1 and int2 B operands from Metal 4.1 [vendor documented: MSL 4.1 Table 7.3].
-* Writes to a `device`/`threadgroup` tensor need a barrier at the op's scope before reading;
-  cooperative/thread tensors do not [vendor documented: MSL 4.1 §7.2].
-* **M4 has the API, not the hardware.** "Tensors" and "Machine learning encoding" are Metal 4
-  features from Apple7, so M4 (Apple9) runs them on macOS 26+ [vendor documented: Feature Set
-  Tables]. The per-core Neural Accelerators that make them fast are an M5 (Apple10) feature,
-  programmed through the Metal 4 Tensor APIs [vendor documented: Apple Newsroom M5, 2025-10].
-  On M4 a TensorOp lowers to the same SIMD ALUs as `simdgroup_matrix` (UNVERIFIED: Apple does not
-  state the lowering). fp8/fp4 TensorOp inputs on M4 are a format, not a faster path (UNVERIFIED).
-* Plow requests `MTLLanguageVersion::Version3_2`, so `<metal_tensor>`/MPP do not compile in the
-  current engine. Using them needs Version4_0 (macOS 26) and an `objc2-metal` that exposes it
-  (UNVERIFIED for `objc2-metal 0.3`).
+* MSL 4.0+ `mpp::tensor_ops::matmul2d` / `cooperative_tensor` [vendor documented: MSL 4.1 §2.22,
+  §7]. The engine pins `Version3_2`, so they do not compile today. Using them needs `Version4_0`
+  and macOS 26; the locked `objc2-metal 0.3.2` already exposes `Version4_0`.
+* Available from Apple7 [vendor documented: Feature Set Tables]; the per-core Neural Accelerators
+  are M5 (Apple10) [vendor documented: Newsroom M5]. Performance on M4 vs `simdgroup_matrix` is
+  (UNVERIFIED): needs a matched M4 benchmark.
+* dtype support per OS: MSL 4.1 Table 7.3.
 
 ### 2.3 Precision support
 
@@ -131,20 +114,23 @@ simdgroup_multiply_accumulate(acc, a, b, acc);
   [measured in plow: interp.metal GEMM comment, 56ec6e6e9].
 * Vector width: plow streams weights as `ushort4` (8 B) / `uchar4` / `float4` per lane; GEMV
   lanes take 8 bf16 per step with a 256-element simdgroup stride (`dot_glu_bf16_pair`,
-  `k = lane * 8; k += 256`). Four weight rows per simdgroup in every GEMV [measured in plow:
-  8682fc356]. Widest efficient load width: not published (UNVERIFIED).
+  `k = lane * 8; k += 256`). The unnormalized bf16 GEMV main loop takes four weight rows per
+  simdgroup; tails and normed paths go one row at a time (`interp.metal` `dot4_bf16`, `norm == 0`)
+  [measured in plow: 8682fc356]. Widest efficient load width: not published (UNVERIFIED).
 * Alignment: the compiler assumes pointer arguments are aligned to their type
   [vendor documented: MSL 4.1 §2.5] — casting `ushort*` to `ushort4*` requires 8 B alignment
   and `K % 4 == 0`; plow guards with `(K & 3u) == 0u` and a scalar tail.
-* `simdgroup_load/store` take `elements_per_row` (stride) and `transpose_matrix`; plow stages
-  8x8 blocks contiguously (64 elements) so loads are stride-8.
+* `simdgroup_load/store` take `elements_per_row` (stride) and `transpose_matrix`. GEMM staging
+  stores 8x8 blocks contiguously (stride 8); flash prefill and `op_q8_gemm_f32` load with stride 32/64. Pass
+  the real row stride.
 * Threadgroup-memory banking: not documented by Apple (UNVERIFIED). Plow avoids relying on a bank
   model: stage in 8x8 blocks and keep per-simdgroup scratch disjoint.
 * Unified memory, zero copy: model tensors are host allocations wrapped with
   `newBufferWithBytesNoCopy` (`StorageModeShared`) when the pointer is 16 KiB page-aligned and the
   length is rounded to a page (`PAGE = 16384`); otherwise a shared copy [measured in plow:
-  `crates/plowrt/src/exec/apple/mod.rs`]. All buffers go into one `MTLResidencySet` added to the
-  queue, fallback per-encoder `useResource` (residency sets: Apple6+ [vendor documented: Feature
+  `crates/plowrt/src/exec/apple/mod.rs`]. Tensor buffers (reached indirectly) go into one
+  `MTLResidencySet` on the queue, fallback per-encoder `useResource`; directly bound buffers are
+  tracked by the encoder (residency sets: Apple6+ [vendor documented: Feature
   Set Tables]).
 * Kernels reach tensors through a `device const ulong* tab` of GPU addresses indexed by handle
   (`ten<T>()`), not bound buffers.
@@ -162,25 +148,16 @@ simdgroup_multiply_accumulate(acc, a, b, acc);
 
 Vendor rules [vendor documented: MSL 4.1 §6.10.1, §6.16]:
 
-* Every thread of the threadgroup (SIMD-group) must reach a barrier; in a conditional or loop all
-  threads must take the same path each iteration. On Apple silicon an exited thread no longer
-  blocks a barrier.
-* `mem_flags`: `mem_none`, `mem_device`, `mem_threadgroup`, `mem_texture`,
-  `mem_threadgroup_imageblock`, `mem_object_data`.
-* Before MSL 4.1 atomics accept only `memory_order_relaxed`; `atomic_thread_fence` accepts
-  `memory_order_seq_cst` from MSL 3.2. Acquire/release/acq_rel orders on atomics and barriers,
-  and a `memory_order`/`thread_scope` argument on `threadgroup_barrier`/`simdgroup_barrier`, are
-  MSL 4.1. "Acquire and release memory ordering atomics" from Apple7.
-* `thread_scope`: `thread`, `simdgroup`, `threadgroup`, `device` (MSL 3.2+); fence default scope
-  is device.
-* Atomics: 32-bit int on device/threadgroup; `atomic_float` on device memory (Apple7+); full
-  64-bit atomics from Apple9 [vendor documented: Feature Set Tables, footnote 7].
-* SIMD-group functions need no barrier (`simd_shuffle`, `simd_shuffle_xor/up/down`,
-  `simd_broadcast`, `simd_sum/max/min/prefix_*`, `simd_ballot`, `simd_all/any`); reductions
-  Apple7+, permutes Apple6+, `simd_shuffle_and_fill_*` Apple8+. Quad-scoped equivalents
-  (`quad_shuffle*`, `quad_sum`, ...) exist; plow does not use them. The generic `T` of the
-  shuffle/broadcast/reduction functions excludes `bfloat`, `bool`, `long`/`ulong`;
-  `simd_all`, `simd_any` and `simd_ballot` take a `bool` predicate [vendor documented: MSL 4.1 §6.10.2; Feature Set Tables].
+* Every thread of the threadgroup (SIMD-group) reaches every barrier; keep barriers on uniform
+  control flow.
+* Atomics take only `memory_order_relaxed` before MSL 4.1; device-scope
+  `atomic_thread_fence(..., seq_cst, thread_scope_device)` needs MSL 3.2.
+* Atomics: 32-bit int on device/threadgroup; `atomic_float` on device (Apple7+). 64-bit: device
+  `atomic_ulong` with `atomic_min/max_explicit` only; no 64-bit fetch-add or CAS [vendor
+  documented: MSL 4.1 §6.16.4, Tables 6.27–6.28].
+* SIMD-group functions (`simd_shuffle*`, `simd_broadcast`, `simd_sum/max/min/prefix_*`,
+  `simd_ballot/all/any`) need no barrier and take no `bfloat`/`bool`/`long`: widen to float
+  [vendor documented: MSL 4.1 §6.10.2].
 
 Plow's cross-threadgroup protocol inside one dispatch (`plow_interp`):
 
@@ -194,7 +171,13 @@ atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_de
 if (lid == 0) atomic_fetch_add_explicit(ctr + succ, 1u, memory_order_relaxed);
 ```
 
-Host side: one command buffer per program run, host sync with `waitUntilCompleted` (Event mode);
+Plow's payload pointers are unqualified `device T*`; that the fences make them visible across
+threadgroups is measured (pitfall 1), not spec-guaranteed: MSL 4.1 §4.8 gives plain `device`
+memory threadgroup coherence and offers `coherent(device)` (UNVERIFIED which is required; settle
+with probe (f) on a Metal toolchain).
+
+Host side: one command buffer per GPU-only program run (CPU/ANE offload submits one per GPU
+range, `mod.rs` `dispatch_range`), host sync with `waitUntilCompleted` (Event mode);
 the host never spins on GPU state mid-kernel (`exec/apple/mod.rs` header). Kernel boundaries make
 all stores visible (`plow_single` diagnostic relies on it).
 
@@ -230,12 +213,15 @@ all stores visible (`plow_single` diagnostic relies on it).
     modes `coresident` (b), `counters` (c), `live` (a), `events` (d), `gemv` (e), visibility (f).
   * `runtime/apple/probe/mslcheck.m` — compile a `.metal` with the system compiler and print
     `maxThreads` and static threadgroup memory: `./mslcheck runtime/apple/interp.metal plow_interp`.
+    It sets `MTLMathModeSafe` but no language version (SDK default, not the engine's `Version3_2`),
+    so its verdict does not transfer to the engine compile.
   * `dtypecheck.m`, `fp8castcheck.m`, `qkvcheck.m`, `mx4*check.m`, `glucheck.m` — per-kernel
     numerics checks against the CPU golden C (`-I../../cpu/dev -I../../common`).
 * Correctness/perf harnesses: `crates/plowrt/examples/apple_lockstep.rs` (per-op vs CPU kernels,
   `--time` per-op GPU profile), `apple_diff.rs`, `metal_gemm_bench.rs` (real-weight GEMM/GEMV
   cells vs CPU tier), `apple_prefill_calibrate.rs`, `apple_split_bench.rs`.
-* Inspecting the object: no public disassembler for the GPU binary. Use pipeline reflection
+* Inspecting the object: Apple ships no disassembler; a community reverse-engineered one
+  (dougallj/applegpu, G13 = M1) exists, Apple9 coverage (UNVERIFIED). Use pipeline reflection
   (above) for resources, Xcode GPU frame capture / Metal System Trace for timing and occupancy
   (UNVERIFIED as plow workflow: not referenced in the repo).
 
@@ -273,16 +259,16 @@ all stores visible (`plow_single` diagnostic relies on it).
 11. `simdgroup_matrix` ops under divergent control flow are undefined; tail handling must be by
     zero-fill in staging (`load_b16` returns zeros past K/N), not by skipping the op per lane.
     [vendor documented: MSL 4.1 §2.4]
-12. 32 KiB of threadgroup memory is the whole budget and plow's walk takes all of it
-    (`TILE_FLOATS = 8192`); `red`, `keys` and `gate` alias into `tile`. A new op must not use the
-    last 33 floats or the first 8 KiB together with a reduction/argmax. Cost model reserves 2 KiB.
-    [measured in plow: 56ec6e6e9, `crates/costmodel/src/lib.rs`]
-13. With one threadgroup per core there is nothing else to hide memory latency: prefill GEMM rate
-    comes from register double-buffering (128-row prefill 608 → 286 ms, then GEMM v3 512x3072x3072
-    1.79 → 0.94 ms). [measured in plow: 1bff9a4e5, 56ec6e6e9]
+12. Threadgroup memory is one 32 KiB `tile` (`TILE_FLOATS = 8192`). Aliases: `red` = last 32
+    floats, `gate` = the float below it, `keys` (argmax) = first 8 KiB. An op that reduces must not
+    touch the last 33 floats; an op that does argmax must not touch the first 8 KiB. The cost model
+    reserves 2 KiB. [measured in plow: 56ec6e6e9; `interp.metal` `plow_interp`; `crates/costmodel/src/lib.rs`]
+13. GEMM rate came from `simdgroup_matrix` 64x64 sub-tiles with vectorized K staging (128-row
+    prefill 608 → 286 ms, 1bff9a4e5), then GEMM v3: bf16 8x8-block staging, K=32 chunks, 2x4
+    accumulators, pipelined fragment loads (512x3072x3072 1.79 → 0.94 ms, 56ec6e6e9).
 14. 128-wide output tiles leave cores idle on narrow projections: E4B 128x512x2560 1.02 → 0.53 ms
-    with 64-wide sub-tiles; the emitter picks 256/128/64-row tiles so all 16 cores get work.
-    [measured in plow: 9264aeed3, 031338ca1]
+    with 64-wide sub-tiles. The emitter picks 128x128 (`GemmMed`) when that grid fills `n_cu`,
+    else the small tile; never 256x256 (`devgen` `apple_prefill_tile`). [measured in plow: 9264aeed3, 031338ca1]
 15. Flash decode on a single simdgroup cost 0.18 ms per key; spreading over all 32 simdgroups
     → 0.005 ms. [measured in plow: 48bd43c52]
 16. bf16/fp8 GEMV K tails were wrong for `K % 256 >= 8` (the 256-element simdgroup stride).
@@ -309,7 +295,7 @@ all stores visible (`plow_single` diagnostic relies on it).
 | bf16/fp16 matrix | not published by Apple | hwspec-derived 16 x 128 MAC x 2 x 1.578 GHz = 6.46 TFLOPS (UNVERIFIED clock and ALU count); `roofline.py` 7.0 TFLOPS | `m4.rs`, `scripts/campaign/roofline.py` |
 | bf16 GEMM measured | — | 2.5 TFLOPS (M=128), 3.8 (M=512), 4.1 (GLU), Llama-3.2-3B w8a16 shapes | [measured in plow: 56ec6e6e9] |
 | fp8 / int8 / fp4 | no hardware | `roofline.py` sets fp8 = bf16 = 7.0 (decode is bandwidth-bound; FP8 only halves bytes) | `roofline.py` |
-| ANE | 38 TOPS (int8) | 4.05 TFLOPS fp16 measured (CoreML GEMM 128x3072x8192) | `m4.rs` `ane_fp16_tflops_measured` |
+| ANE | 38 TOPS (precision unstated; hwspec models int8) | 4.05 TFLOPS fp16 measured (CoreML GEMM 128x3072x8192) | `m4.rs` `ane_fp16_tflops_measured` |
 | Decode reference | — | Llama-3.2-3B w8a16 19.4 ms/tok; Gemma-4-12B w8a16 68 ms/tok | [measured in plow: eae8964d8] |
 
 No recipe carries a `[roofline]` table for `metal3`; `tuning/` has no Apple records (dropped as
@@ -334,18 +320,19 @@ Repo-vs-repo/vendor disagreements (flagged, not edited):
   RB x CB accumulators per simdgroup (2x4 at 128 rows), K chunk 32, register double-buffering.
 * Decode GEMV (M ≤ 8) → no matrix ops; lane-strided `ushort4` loads, four weight rows per
   simdgroup, `simd_sum`; for batched decode reuse each weight load across rows
-  (`PLOW_METAL_BF16_M2/M4/M8`). Target ≥ 90% of 255 GB/s.
-* Sizing threadgroup memory → budget ≤ 32 KiB minus the interpreter's aliased scratch; if a tile
-  needs more, shrink the tile, do not add a second threadgroup array.
+  (`PLOW_METAL_BF16_M2/M4/M8`). Quote % of the measured 255 GB/s.
+* Sizing threadgroup memory → reuse the interpreter's 32 KiB `tile`; keep staging off the live
+  `red`/`gate`/`keys` aliases (pitfall 12). If a tile needs more, shrink it; never add a second array.
 * Cross-threadgroup handoff inside a dispatch → relaxed counter + device-scope seq_cst fence on
-  both sides, exactly as `plow_interp`; otherwise split into separate dispatches.
+  both sides, exactly as `plow_interp` (measured, see §4); otherwise split into separate dispatches.
 * Anything that spins → bound it by `spin_max` and write a fault code; never an unbounded loop.
 * Need FP8/FP4 math → decode to bf16/f32 in staging (`e4m3bf4`, E2M1 LUT); expect bandwidth win only.
 * Need bf16 in a SIMD reduction or shuffle → widen to float first.
-* Considering Metal 4 TensorOps → only worthwhile as an M5 (Apple10) route; on M4 measure against
-  the `simdgroup_matrix` GEMM first, and it requires a language-version bump plus macOS 26.
-* Packet built for another core count → expect serial dispatch; ship a build per core count when
-  throughput matters (`docs/DISTRIBUTION.md`).
+* Considering Metal 4 TensorOps → benchmark against the `simdgroup_matrix` GEMM on M4, target M5
+  separately; needs `Version4_0` plus macOS 26.
+* Packet built for another core count → expect serial dispatch. Persistent dispatch needs the
+  registry core count for the device name to equal packet `n_cu` (`mod.rs` `matching_geometry`);
+  a 20-core M4 Pro resolves to 16, so a 20-core packet alone stays serial.
 * Verifying a change → `apple_lockstep` (0 mismatches vs CPU golden), then `metal_gemm_bench` on
   the model's real shapes, then end-to-end ms/tok.
 * Offloading to CPU or ANE → assume no gain for decode (shared bus); re-measure with

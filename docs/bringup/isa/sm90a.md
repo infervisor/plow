@@ -4,46 +4,46 @@
 |---|---|
 | `IsaLevel` | `IsaLevel::Sm90a` (`crates/hwspec/src/isa.rs`), arch flag `sm_90a`, `compute_cap (9, 0)`; caps: `mma_sync`, `wgmma`, `tma`, `dsm_cluster`; no `tcgen05`/TMEM/block-scale MMA/E8M0 convert; dtypes fp16/bf16/fp8/int8 |
 | `GpuSpec` | `H100_SXM5` (shipped), `H200_SXM`, `H100_PCIE`, `H100_NVL` in `crates/hwspec/src/nvidia/h100.rs`; script mirror `scripts/campaign/roofline.py` `HARDWARE_REGISTRY["h100 sxm5"]` |
-| SKUs plow ships | H100 SXM 80 GB only: every `recipes/infervisor/*/sm90a-h100-tp1*.toml` (Gemma-4 12B/26B-A4B/31B/E4B, Qwen3.8-27B, Qwen3-ASR, Nemotron 3.5 ASR, Silero VAD, Orpheus, Veena, Chatterbox(+MTL), Fish S2 Pro, Breeze TTS 2, Maya2). H200 has no recipe; it is named only in hwspec, `interp_sm90a.cu`'s header and `runtime/CMakeLists.txt` ("H100 and H200 are both sm_90a"). |
+| SKUs plow ships | H100 SXM 80 GB only: every `recipes/infervisor/*/sm90a-h100-tp1*.toml` (Gemma-4 12B/26B-A4B/31B/E4B, Qwen3.8-27B, Qwen3-ASR, Nemotron 3.5 ASR, Silero VAD, Orpheus, Veena, Chatterbox(+MTL), Fish S2 Pro, Breeze TTS 2, Maya2). H200 has no recipe; hwspec, `costmodel` and `roofline.py` model it and it reuses the sm_90a objects. |
 | Kernels | `runtime/nvidia/`: `interp_sm90a*.cu` (interpreter + segment objects; `interp_sm90a.cu` is an alias wrapper around `interp_sm120.cu` with `PLOW_NV_HOPPER=1`), `sm90_wgmma.cuh` (primitives), `op_gemm_sm90.cuh`, `op_attention_sm90*.cuh`, `gen_attn_pf_hd256_*`, `op_moe_sm90.cuh`, `op_gemv_*_sm90.cuh`/`op_gemv_fp8_wgmma.cuh`, `gemm_fp8_block_sm90.cu`, `register_hopper.cu` (golden dispatch table only); probes in `runtime/nvidia/experiments/` (not built) |
 | Tuning records | `tuning/nvidia/sm_90a/h100-sxm5/` (`cublaslt_algos.jsonl`, `attention_role_measurement.jsonl`, `gen_kernels.json`), `tuning/nvidia/sm_90a/h100-nvl/` |
 
 Verified against: PTX ISA 9.4 (docs.nvidia.com, last updated 2026-10-12), Hopper Tuning Guide v13.4,
 CUDA Driver API 13.4 (Tensor Map Object Management), NVIDIA H100 and H200 product pages; fetched 2026-11-03.
 
-Most "measured in plow" probe numbers below come from `runtime/nvidia/experiments/README.md`.
-Those probes ran on an **H100 NVL** that was power-capped at 310 W. The serving box is an H100 SXM
-at 700 W (`ceilings.json` below). Compare ratios between the two cards, not absolute numbers.
+Code paths are on `prod-next`. Numbers tagged `experiments/README.md` were measured on an H100 NVL
+capped at 310 W, not the 700 W SXM: use them as ratios only.
 
 ## 1. Execution model
 
 | quantity | H100 SXM | source |
 |---|---|---|
 | warp / warpgroup | 32 lanes / 4 contiguous warps = 128 threads (first warp index % 4 == 0) | [vendor documented: PTX ISA §9.7.17 "warpgroup"] |
-| SMs | 132 (8 GPCs; hwspec models 18 SMs/GPC as the DSM domain) | `h100.rs`; [measured in plow: docs/runtime/attention-roofline.md "All 132 blocks"] |
+| SMs | 132 in 8 GPCs (16.5/GPC average, so some GPCs have < 18; hwspec models a full 18-SM GPC). Query `cudaOccupancyMaxActiveClusters` before relying on cluster size 16 | `h100.rs`; [measured in plow: docs/runtime/attention-roofline.md "All 132 blocks"] |
 | tensor cores | 4 per SM, 4th gen | `HOPPER_SM.tensor_cores` |
 | register file | 64 K x 32-bit per SM; max 255 regs/thread | [vendor documented: Hopper Tuning Guide §1.4.1.1] |
-| reg alloc granularity | 8 regs/thread (256/warp) (UNVERIFIED) | — |
-| threads / warps / blocks per SM | 2048 / 64 / 32 | [vendor documented: Tuning Guide §1.4.1.1] |
+| reg alloc granularity | 8 regs/thread (256/warp) | `cuda_occupancy.h` `cudaOccRegAllocationGranularity` |
+| threads / warps / blocks per SM | 2048 / 64 / 32 | [vendor documented: CUDA PG compute-capability table; Tuning Guide §1.4.1.1 (warps, blocks)] |
 | shared memory | 228 KB/SM; 227 KB max per block (CUDA reserves 1 KB per block); carve-outs 0/8/16/32/64/100/132/164/196/228 KB; static smem is capped at 48 KB, more needs dynamic opt-in | [vendor documented: Tuning Guide §1.4.1.1, §1.4.2.4] |
 | L1 + smem | 256 KB unified per SM | [vendor documented: Tuning Guide §1.4.2.4] |
 | smem banks | 32 x 4 B | [vendor documented: CUDA C++ Programming Guide, shared memory] |
-| smem bandwidth | ~128 B/clk/SM, as the wgmma GEMM design assumes (UNVERIFIED vendor figure) | `op_gemm_sm90.cuh` T15 note |
+| smem bandwidth | ~128 B/clk/SM (32 banks x 4 B/clk), as the wgmma GEMM design assumes (UNVERIFIED for CC 9.0) | `op_gemm_sm90.cuh` T15 note |
 | L2 | 50 MB (hwspec: 8 x 6.25 MiB partitions, ~1.5 TB/s each, modelled) | [vendor documented: Tuning Guide §1.4.2.2]; partitioning (UNVERIFIED) |
 | HBM | 80 GB HBM3, 5120-bit, 3.35 TB/s | [vendor documented: H100 product page] |
-| clocks | max SM 1980 MHz; sustained 1830 MHz under the calibration GEMM at 700 W | [measured in plow: `calibrate_ceilings.py` output, 2026-10-29] |
+| clocks | max SM 1980 MHz; 1830 MHz read once before the calibration runs, not a sustained GEMM clock (not measured) | [measured in plow: `calibrate_ceilings.py:67` output, 2026-10-29] |
 | clusters | 8 CTAs portable, 16 non-portable (`cudaFuncAttributeNonPortableClusterSizeAllowed`) | [vendor documented: Tuning Guide §1.4.1.3] |
-| H200 | same SM/L2; 141 GB HBM3e, 4.8 TB/s | [vendor documented: H200 product page] |
+| H200 | same SM; 141 GB HBM3e, 4.8 TB/s; L2 not in the vendor spec (hwspec 50 MiB, UNVERIFIED: query `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`) | [vendor documented: H200 product page] |
 
 Occupancy facts plow lives with:
 * The interpreter objects are persistent kernels at **256 threads = 2 warpgroups** by default
   (`PLOW_NV_THREADS`). Exceptions: the WS384 segment objects launch 384 threads (exported as
   `plow_block`, `interp_sm120.cu`) and the GEMV512 role launches 512 (`interp_sm90a_gemv512.cu`). Its register count is the maximum over **all inlined arms**
-  (`crates/kernelcaps/src/resource.rs`). On CUDA 13.0 the decode object is 208 regs (1 block/SM)
-  and the prefill object is 255 regs with 180 B spill stores
-  [measured in plow: crates/kernelcaps/src/resource.rs tests].
-* Two blocks/SM means at most ~113 KiB dynamic smem per block. The per-block cap is 232448 B
-  (227 KiB) [measured in plow: 6284c800e]. The lean SEG_GEMM object uses `__maxnreg__(128)` to get
+  (`crates/kernelcaps/src/resource.rs`). CUDA 13.0: decode 208 regs before dead-arm gating, 177
+  after; prefill 255 regs, 180 B spill stores, 644 B spill loads; 1 block/SM either way. Re-read
+  `cuobjdump --dump-resource-usage` before relying on these
+  [measured in plow: resource.rs header; build_sm90a_cubin.sh dead-arm comment].
+* Two blocks/SM means at most ~113 KiB dynamic smem per block (228 KiB/SM, 1 KiB reserved per
+  block); the per-block cap is 232448 B (227 KiB) [vendor documented: Tuning Guide §1.4.1.1]. The lean SEG_GEMM object uses `__maxnreg__(128)` to get
   2 blocks/SM.
 * A larger dynamic-smem claim steps the L1 carve-out down. Once L1 drops to 28 KiB, flash-decode
   slows ~1.7x [measured in plow: runtime/nvidia/op_gemv_wide_sm90.cuh header].
@@ -57,7 +57,7 @@ Occupancy facts plow lives with:
 | `.f16` / `.bf16` | `m64nNk16` | 8..256 step 8 | f32 (f16 also for `.f16`) | yes (4 x b32/thread) | `imm-trans-b` in SS and RS; `imm-trans-a` SS only (register A cannot transpose) |
 | `.tf32` | `m64nNk8` | 8..256 step 8 | f32 | yes | no (K-major) |
 | `.e4m3` / `.e5m2` (mixable) | `m64nNk32` | 8..256 step 8 | f32, f16 | yes | **no (K-major only)** |
-| `.s8` / `.u8` | `m64nNk32` | 8,16,24,32,48,64,80,...,224 (step 16 above 32; **no 240/256**) | s32 (`.satfinite` optional) | yes | no |
+| `.s8` / `.u8` | `m64nNk32` | 8,16,24,32,48,64,80,...,256 (step 16 above 32) | s32 (`.satfinite` optional) | yes | no |
 | `.b1` (`.and.popc`) | `m64nNk256` | 8,16,24,32,48,64,...,256 (step 16 above 32) | s32 | yes | no |
 
 [vendor documented: PTX ISA 9.4 §9.7.17.5.2]
@@ -72,11 +72,11 @@ Occupancy facts plow lives with:
   warp w of the warpgroup owns rows `[16w,16w+16)`. For n-block g: reg `4g+2hi+lo`,
   row `16w + lane/4 + 8hi`, col `8g + 2(lane%4) + lo`. Per 8 columns this is the same pattern as an
   `mma.m16n8k16` C fragment, so mma.sync epilogues port unchanged.
-* The **S accumulator of a k16 column slice is exactly the RS A fragment**, so P·V can run in RS
-  form with no smem round trip (`op_attention_sm90_v3.cuh`,
+* After softmax, pack each 16-column f32 S slice into 4 bf16x2 registers (`fa3_pack_bf16`): that is
+  the RS A fragment, so P·V runs in RS form with no smem round trip (`op_attention_sm90_v3.cuh`,
   `gen_attn_pf_hd256_wgmma.inc:hd256_pv_bn32`).
 * FP8 precision: with f32 D, accumulation is "higher than half, lower than single precision"
-  [vendor documented: PTX ISA wgmma.mma_async note]. Plow measured relL2 3.9e-5 at K=32 and
+  [vendor documented: PTX §9.7.17.5.2 wgmma.mma_async Note]. Plow measured relL2 3.9e-5 at K=32 and
   1.14e-3 at K=3840. Promoting into an f32 shadow every 128 K cuts this ~10.9x for 8-16%
   throughput [measured in plow: sm90_wgmma.cuh header, `PGM90_FP8_PROMOTE`].
 * Throughput: dense fp8/int8 = 2x bf16 [vendor documented: H100 page, "with sparsity" figures / 2].
@@ -92,13 +92,13 @@ Occupancy facts plow lives with:
 | 51:49 | base offset: 0 if the swizzle pattern starts on its natural boundary (1024/512/256 B for 128/64/32 B swizzle), else `(pattern_start >> 7) & 7` |
 | 63:62 | swizzle: 0 none, 1 = 128 B, 2 = 64 B, 3 = 32 B |
 
-[vendor documented: PTX ISA §9.7.17.5.1.2 "Matrix Descriptor Format"]. smem operand start must be
+[vendor documented: PTX ISA §9.7.17.5.1.2.2 "Matrix Descriptor Format"]. smem operand start must be
 16 B aligned. For K-major swizzled layouts LBO is unused (assumed 1). SBO = stride between 8-row
-groups. For MN-major swizzled layouts the fields mean something else, not a plain swap: LBO = offset
-between groups of (swizzle bytes / 16) rows, SBO = offset between 8-column groups (see the
-"Leading/Stride Dimension Byte Offset" tables).
+groups. For MN-major swizzled layouts the fields mean something else, not a plain swap, and rows and
+columns count 128-bit-normalized elements: LBO = offset between groups of (swizzle bytes / 16)
+rows, SBO = offset between 8-column groups (PTX §9.7.17.5.1.2.1.1-2).
 
-**Plow's one recipe** (`sm90_wgmma.cuh`, the only place to get descriptors):
+**Plow's 128 B recipe** (`sm90_wgmma.cuh`; other encoders: `fa90_desc_ns` swizzle 0, `snac.cu:wg_desc` tf32):
 * 128 B swizzle, K-major (`trans_a = trans_b = 0`), LBO = 16 B, SBO = 1024 B, swizzle = 1,
   base offset 0.
 * One logical row = 128 B = 64 bf16 or 128 e4m3. That fixes BK = 64 (bf16) / 128 (fp8).
@@ -124,7 +124,8 @@ between groups of (swizzle bytes / 16) rows, SBO = offset between 8-column group
 
 ### mma.sync fallback
 
-* `mma.sync.m16n8k16` bf16/f16 → `HMMA.16816` on sm_90a. Ampere rate; used by decode GEMV walks
+* `mma.sync.m16n8k16` bf16/f16 → `HMMA.16816` on sm_90a, below the wgmma rate (no vendor figure;
+  measure before sizing a compute-bound kernel on it). Used by decode GEMV walks
   (`op_gemv_mma.cuh`, `op_gemv_fp8_tc.cuh`, `op_gemv_k8_sm90.cuh`) and the shared `op_gemm.cuh`
   bodies.
 * **There is no native fp8 mma.sync on Hopper.** `mma.sync.m16n8k32.e4m3` lowers to
@@ -139,7 +140,7 @@ between groups of (swizzle bytes / 16) rows, SBO = offset between 8-column group
 | vector LD/ST | 16 B (`uint4`/`float4`, LDG.128 / LDS.128) | natural alignment |
 | `cp.async` | `cp.async.cg.shared.global [s],[g],16,src_size` (`sm90_cp16`), `commit_group` / `wait_group N` | sizes 4/8/16; `.cg` = 16 only; `src_size < 16` zero-fills (plow's M/K tail) [vendor documented: PTX cp.async]. cp.async is a weak operation **in the generic proxy** [vendor documented: PTX cp.async, Memory Consistency Model], so a wgmma read of a cp.async stage needs `fence.proxy.async.shared::cta` after the wait. Several plow bodies omit it (see pitfalls) |
 | TMA tile | `cp.async.bulk.tensor.{2d,3d}.shared::cluster.global.mbarrier::complete_tx::bytes [dst],[map,{c0,c1(,c2)}],[mbar]` (`sm90_tma2d/3d`) | one elected thread issues; c0 = innermost coordinate; OOB elements zero-filled (TMA zero-fills ragged M and the K tail, relL2 unchanged [measured in plow: op_gemm_sm90.cuh TMA note]) |
-| TMA multicast | `.multicast::cluster` + 16-bit ctaMask | works on H100 (SASS `UTMALDG.2D.MULTICAST`), **never won** for plow shapes (see pitfalls) |
+| TMA multicast | `.multicast::cluster` + 16-bit ctaMask | works on H100 (SASS `UTMALDG.2D.MULTICAST`); no production win (see pitfalls) |
 | bulk store | `cp.async.bulk` smem → global (speech wgmma epilogue, `op_speech_f32.cuh`) | 16 B multiple |
 | `ldmatrix` | `.m8n8.x1/.x2/.x4{.trans}.b16` in mma.sync bodies (`op_gemm.cuh`, `op_attention.cuh`, `op_gemv_*`) | B operand can be read from a natural `[n][k]` tile with non-trans `.x2`, bit-identical [measured in plow: experiments `t3_pipe_probe.cu`] |
 | `stmatrix` | sm_90+: `.m8n8.x1/x2/x4{.trans}.b16` [vendor documented: PTX stmatrix] | **unused in plow** (epilogues store from fragments or stage through smem) |
@@ -154,9 +155,11 @@ Tensor maps (`cuTensorMapEncodeTiled`, host side `crates/plowrt/src/device/cuda.
 * Plow interpreter maps: bf16 (9) or uint8 (0) for e4m3, rank 2, `SWIZZLE_128B` (3),
   `L2_PROMOTION_128B`, `OOB_FILL_NONE`, box `{64 | 128, rows}` (`cuda.rs` GEN_TMAP). The fp8 block
   decode object uses `L2_PROMOTION_256B`.
-* Two ways to deliver a map: (a) a generic pointer to a host-written map in global memory, with
-  `fence.proxy.tensormap::generic.acquire.gpu [map],128` + `prefetch.tensormap` (`sm90_tmap_acquire`,
-  interpreter path); (b) a `const __grid_constant__` kernel parameter (`gemm_fp8_block_sm90.cu`).
+* Two ways to deliver a map: (a) a pointer to a map in global memory, acquired per CTA with
+  `fence.proxy.tensormap::generic.acquire` + `prefetch.tensormap` (`sm90_tmap_acquire`, interpreter
+  path). The CUDA PG uses `.sys` scope for a map written by `cudaMemcpy`; plow uploads the map
+  (`exec/gpu.rs` GEN_TMAP) and uses `.gpu`. New code: `.sys`. (b) a `const __grid_constant__`
+  kernel parameter (`gemm_fp8_block_sm90.cu`).
 * `CU_TENSOR_MAP_SWIZZLE_128B` with a 128 B inner box writes exactly the layout the plow descriptor
   describes, so moving staging from cp.async to TMA leaves the wgmma side unchanged
   (`sm90_wgmma.cuh` TMA note).
@@ -177,7 +180,7 @@ row on one bank: 8-way conflicts on both the cp.async store and the wgmma read, 
   a `__syncthreads()` between the wait and the refill [measured in plow: op_gemm_sm90.cuh
   "cross-warpgroup smem hazard"].
 * `.sync.aligned`: every warp of the warpgroup must execute the same wgmma/fence/commit/wait, so no
-  divergent guards. `sm90_bad_k` traps uniformly.
+  divergent guards. `sm90_bad_k` returns true block-uniformly (thread 0 traps), so callers bail.
 * **Async proxy:** wgmma operands and TMA run in the async proxy. Generic `st.shared` (register →
   smem: Ps tiles, dequantized fp8 → bf16 stages, `op_gemv_fp8_wgmma.cuh` staging) needs
   `fence.proxy.async.shared::cta` and then a barrier before wgmma reads it
@@ -189,8 +192,7 @@ row on one bank: 8-way conflicts on both the cp.async store and the wgmma read, 
     `bytes`.
   * Consumer: spin on `mbarrier.try_wait.parity.shared::cta.b64 p, [b], phase` and flip the parity
     each ring wrap.
-  * tx-count range is ±(2^20−1); arrival count is 1..2^20−1 [vendor documented: PTX mbarrier,
-    Table 43].
+  * tx-count range is ±(2^20−1); arrival count is 1..2^20−1 [vendor documented: PTX §9.7.15.16].
   * `mbarrier.inval` before reusing the arena as data. PTX requires it; plow does it per op.
   * Ring pattern: full + empty barrier per stage. The last warpgroup to release a stage refills it
     (`op_attention_sm90_v3.cuh`).
@@ -225,8 +227,8 @@ row on one bank: 8-way conflicts on both the cp.async store and the wgmma read, 
   * Per-arch `_nv_var_sm90a`: `-DPLOW_NV_MLA=0 -DPLOW_NV_MAMBA=0 -DPLOW_NV_DSA=0 -DPLOW_NV_GEMV_RB=1
     -DPLOW_NV_RB_GEMV=1 -DPLOW_NV_RB_QKV=1 -DPLOW_NV_RB_LMHEAD=1 -DPLOW_NV_GEMV_XREG=1
     -DPLOW_NV_GEMV_KPANEL=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4`.
-  * Axes: decode `-DPLOW_BUCKET_DECODE=1 -DPLOW_NV_FA_GF_FULL=4`; prefill `-DPLOW_NV_PREFILL=1`;
-    segment objects `-DPLOW_NV_SEGMENTS=1 [-DPLOW_NV_SEG_GEMM=1]`.
+  * Axes: decode `-DPLOW_BUCKET_DECODE=1 -DPLOW_NV_FA_GF_FULL=4`; prefill `-DPLOW_BUCKET_DECODE=0
+    -DPLOW_NV_PREFILL=1`; segments add `-DPLOW_NV_SEGMENTS=1 [-DPLOW_NV_SEG_GEMM=1] [-DPLOW_NV_PACKED_REQUEST=1]`.
   * Symbols: `_Z12interp_sm90a11PlowProgram` / `_Z15interp_sm90a_pf11PlowProgram`.
   * Standalone path: `scripts/build_sm90a_cubin.sh`. kernelcaps mirror:
     `crates/kernelcaps/src/targets.rs` (`IsaLevel::Sm90a`).
@@ -262,33 +264,30 @@ sm90_wg_commit(); sm90_wg_wait<0>();
 ## 6. Pitfalls
 
 **wgmma / smem layout**
-* **cp.async → wgmma without a proxy fence is undocumented behaviour.** PTX classes `cp.async` as a
-  generic-proxy operation and requires an async-proxy fence before wgmma reads generic writes
-  [vendor documented: PTX cp.async "performed in the generic proxy"; §9.7.17.4, wgmma.fence].
-  Several plow bodies wait (`sm90_cp_wait`) + barrier + `wgmma.fence` and go straight to wgmma with
-  no `fence.proxy.async`: `op_gemm_sm90.cuh:d_gemm_sm90` cp.async mainloop, the `op_moe_sm90.cuh`
-  cp.async rings, `op_gemv_wide_sm90.cuh`. The comment in `op_attention_sm90.cuh` ("cp.async lands
-  in the async proxy already") contradicts the PTX ISA. These bodies pass their oracles today, but
-  that is not a guarantee. In new code, fence after every cp.async stage wgmma reads, or stage
-  with TMA [measured in plow: code read of the cited files; not a measured failure].
+* **cp.async → wgmma needs `fence.proxy.async.shared::cta`; without it the read is undefined.**
+  cp.async writes are generic-proxy, wgmma reads async-proxy [vendor documented: PTX §9.7.10.28.3,
+  §9.7.17.4]. `d_gemm_sm90` (cp.async path), the `op_moe_sm90.cuh` rings and `op_gemv_wide_sm90.cuh`
+  omit the fence and pass oracles today, which proves nothing; the `op_attention_sm90.cuh:fa90_async_proxy_fence`
+  comment claiming otherwise is wrong. New code: wait → fence → barrier → wgmma, or stage with TMA
+  [measured in plow: code read; not a measured failure].
 * LBO/SBO are already encoded `>>4` inside `sm90_make_desc`. Shifting them again gives silent
   garbage [measured in plow: runtime/nvidia/sm90_wgmma.cuh].
 * A 128 B-swizzle tile base that is not 1024 B aligned gives silently **wrong** results, not a fault
   [measured in plow: sm90_wgmma.cuh]. Vendor rule: base offset 0 only on the pattern boundary
-  [vendor documented: PTX §9.7.17.5.1.2].
+  [vendor documented: PTX §9.7.17.5.1.2.2].
 * Mixing the no-swizzle recipe (+256 B K-core stride per k16) with the 128 B recipe (+32 B start
   advance) is wrong [measured in plow: sm90_wgmma.cuh].
 * Swizzle-free layouts pass the oracle but run 2.2x slower (8-way bank conflicts)
   [measured in plow: sm90_wgmma.cuh, experiments `wgmma_bf16_probe.cu`].
 * The fp8 wgmma has no transpose: operands must be K-major (plow's TN contract)
   [vendor documented: PTX wgmma.mma_async "transpose only for .f16/.bf16"].
-* The int8 wgmma has no N = 240/256 [vendor documented: PTX §9.7.17.5.2 shape list].
+* int8 wgmma N above 32 must be a multiple of 16 (no 40, 56, ..., 248) [ptxas 12.9 probe].
 * The 128 B-swizzle stagers need K to be a multiple of 8 (bf16) / 16 (e4m3). Otherwise the cp.async
   source misaligns (UB). `sm90_bad_k` traps [measured in plow: sm90_wgmma.cuh]. TMA maps also
   need `K*elem % 16 == 0` (`cuda.rs` GEN_TMAP assert) [vendor documented: Driver API globalStrides].
 * Flash attention:
-  * Routing S through smem cost 0.785x; keep softmax in-fragment.
-  * Transposing V in smem cost 46%; consume V MN-major with trans-b = 1.
+  * S through smem ran at 0.785x the mma.sync baseline; keep softmax in-fragment.
+  * Transposing V in smem took 46% of the probe's runtime; consume V MN-major with trans-b = 1.
   * [measured in plow: op_attention_sm90.cuh header]
 * A V tail tile past `hi` must be zeroed in smem: P = 0 there, but 0 * NaN = NaN
   [measured in plow: op_attention_sm90_v3.cuh].
@@ -320,28 +319,25 @@ sm90_wg_commit(); sm90_wg_wait<0>();
   * Cycling dec/inc per op deadlocked in-model.
   * Split once per launch and run per-role loops with aligned `__syncthreads` counts.
   * [measured in plow: interp_sm120.cu `plow_ws_role_loop`, op_gemm_sm90.cuh T11]
-* `setmaxnreg` needs an explicit max-register bound at the kernel entry. Otherwise it "may have no
-  effect" [vendor documented: PTX setmaxnreg]. The bound can come from a compile option
-  (`-maxrregcount`) or a tuning directive. Plow uses `__maxnreg__`. The sm_120a probe found that
-  `__launch_bounds__` alone made ptxas drop it [measured in plow: experiments/README.md
-  `setmaxnreg_*`]. A `__launch_bounds__` that also gives min blocks reportedly works
-  (NVIDIA forum, UNVERIFIED).
-* A cp.async producer warpgroup cannot donate registers: below ~88 producer regs throughput drops
-  20-45% with no spills. Register donation pays only with a TMA producer
+* `setmaxnreg` needs an entry register bound: `__maxnreg__(N)` (plow) or `__launch_bounds__(T, minBlocks)`.
+  `__launch_bounds__(T)` alone or no bound drops it with ptxas C7508 [nvcc 12.9 sm_90a probe;
+  vendor documented: PTX §9.7.21.5].
+* A cp.async producer warpgroup has little to donate: donation works, but below ~88 producer regs
+  throughput drops 20-45% with no spills. Deep donation (dec to 24-40) needs a TMA producer
   [measured in plow: experiments `hopper_warpspec_prefill.cu`].
 * A 256-thread megakernel with a dedicated producer warpgroup halves the math warpgroups: 1368 vs
   750 ms at T = 4096. In-megakernel TMA is therefore "uniform" (an elected thread issues while both
   warpgroups compute). Producer/consumer (ws384, `__maxnreg__(160)`) lives only in lean role
   objects [measured in plow: op_gemm_sm90.cuh].
-* An oversized smem arena claim is not a compile error; it fails as a refused module load at serve
-  time. Keep `static_assert`s on arena sizes [measured in plow: runtime/nvidia/op_attention.cuh:5047].
+* An oversized smem arena claim is not a compile error: plowrt rejects static + dynamic > opt-in at
+  serve time (`device/cuda.rs` `set_max_dynamic_smem`). Keep `static_assert`s on arena sizes.
 * An arena claim leaking into other packets halved occupancy: 2 x 164864 B > 232448 B silently
-  dropped the 12B to 1 block/SM [measured in plow: 6284c800e].
+  dropped the 12B to 1 block/SM: 2 x (164864 + 1024 reserved) B > 233472 B (228 KiB/SM)
+  [measured in plow: 6284c800e].
 
 **Builds and reproducibility**
-* `interp_sm90a.cubin` is not byte/SASS-reproducible for some configs (nvcc 12.9, Qwen BF16: ~11k
-  of ~197k SASS lines differ). Prove "no-op for other packets" with resource usage, a re-gate and
-  step_bench digests [measured in plow: docs/bringup/agent-tools.md §9].
+* `interp_sm90a.cubin` is not byte/SASS-reproducible for some configs. Prove "no-op for other
+  packets" with resource usage, a re-gate and step_bench digests [measured in plow: docs/bringup/agent-tools.md §9].
 * `PLOW_EXTRA_DEFINES` in the env is ignored by emits; variants must be manifest tuning keys.
   `campaign.py build` never rebuilds plowc. A killed build leaves `make`/`ptxas` writing
   stale-hash cubins, so use a fresh out dir [measured in plow: docs/bringup/agent-tools.md §9].
@@ -361,10 +357,10 @@ sm90_wg_commit(); sm90_wg_wait<0>();
 * The FA4 SM90 producer reads up to `n + splits - 2` page-table entries (and entry -1). Pad the
   table and verify with a poison table [measured in plow: docs/bringup/agent-tools.md §9].
 * TMA for 1-D weight streaming was the slowest of 37 configs; `cp.async.cg` won (measured on
-  sm_120a, where the SASS `UTMALDG` is identical to sm_90a). Do not use TMA for decode GEMV streams
-  [measured in plow: experiments/README.md `gemv_transport.cu`].
-* Clusters / DSMEM / multicast: all work on H100, none pays for plow.
-  * Multicast 0.78-0.98x: duplicate reads are L2 hits, not DRAM.
+  sm_120a) [measured in plow: experiments/README.md `gemv_transport.cu`]. This covers plain GEMV
+  streams only; the swap-AB fp8 block decode object uses TMA + a producer warp.
+* Clusters / DSMEM / multicast work on H100; no route qualified.
+  * Multicast 0.78-0.98x off-L2 (duplicate reads are L2 hits); compute-bound BM64 +1-4%, BM128 0.97-0.99x.
   * Cluster-cooperative claiming costs 4.6x and faults under sustained load.
   * DSM split-K/flash merges are 1.15-3.35x slower.
   * `cuLaunchCooperativeKernel` cannot carry a cluster dim.
@@ -372,9 +368,10 @@ sm90_wg_commit(); sm90_wg_wait<0>();
 * Flash-decode split count is a grid-alignment cliff: nsplit = 132/gcd(n_grp,132) = 33.
   34 costs +67% at 128k [measured in plow: experiments `fa_gf_full_h100_ab.cu`,
   build_sm90a_cubin.sh].
-* SplitZip (exponent compression) loses 0.72-0.85x on H100. H100 has ~0.53 scalar warp-instr per
-  bf16 weight element (~0.27 per byte) vs 2.4 per element on RTX PRO 6000 [measured in plow: experiments `splitzip_h100_ab.cu`].
-* GEMM epilogues: uncoalesced C stores cost ~27%; stage through a dead ring slot
+* SplitZip (exponent compression) loses 0.72-0.85x on H100: at HBM rate the H100 NVL has ~0.53
+  warp-instruction issue slots per bf16 weight element (RTX PRO 6000 ~2.4), so CUDA-core decode
+  cannot hide behind the load [measured in plow: experiments `splitzip_h100_ab.cu`].
+* GEMM epilogues: ncu estimates ~27% loss from uncoalesced C stores; stage through a dead ring slot
   [measured in plow: op_gemm_sm90.cuh T38]. L2 tile rasterization (bands) lifts a 450 TF/s
   B-reload ceiling [measured in plow: op_gemm_sm90.cuh T13].
 
@@ -424,7 +421,7 @@ sm90_wg_commit(); sm90_wg_wait<0>();
 | H200 | 4800 GB/s; same TF | not measured | `h100.rs` `H200_SXM` |
 
 Calibration conditions: `NVIDIA H100 80GB HBM3`, torch 2.13+cu130, driver 595.91.07, 700 W,
-SM 1830 / max 1980 MHz, medians of 30; bf16 spread 7.2%.
+SM 1830 (read before the runs) / max 1980 MHz, medians of 30; bf16 spread 7.2%.
 
 Re-measure with `scripts/bench/calibrate_ceilings.py --out ceilings.json` (one short lease via
 `gpuq.py submit`). Feed it to `scripts/campaign/block_roofline.py --ceilings` or `op_roof.py`.
@@ -437,10 +434,10 @@ Repo-vs-vendor notes, flagged and not edited:
   only because `peak_compute_tflops` hardcodes names containing "H100"/"H200". That also gives
   **H100 PCIe** 989 TF, although PCIe is a lower-clocked 114-SM part (its datasheet dense bf16 is
   lower; exact value UNVERIFIED here).
-* H200 boost clock: `h100.rs` 1830 MHz vs `scripts/campaign/roofline.py` 1980 MHz (vendor value
-  UNVERIFIED).
-* L2: the vendor says 50 MB. The experiments README reports "L2 measures 60 MB" on the H100 NVL
-  probe card (UNVERIFIED which query produced it). hwspec uses 50 MiB for all SKUs.
+* H200 boost clock: `h100.rs` 1830 MHz vs `roofline.py` 1980 MHz (UNVERIFIED: settle with
+  `nvidia-smi --query-gpu=clocks.max.sm` on an H200).
+* L2: vendor 50 MB; experiments README "L2 measures 60 MB" on the H100 NVL (UNVERIFIED: settle with
+  `cudaDevAttrL2CacheSize` on that card). hwspec uses 50 MiB for all SKUs.
 * `H100_NVL` is `MemKind::Hbm3e` in hwspec, but NVIDIA's H100 NVL product brief (PB-11773-001
   v01) says **HBM3**, 94 GB, 3938 GB/s. The bandwidth matches hwspec; the memory kind does not.
 
@@ -449,20 +446,20 @@ Repo-vs-vendor notes, flagged and not edited:
 * **About to write a GEMM/attention MMA for M >= 64:** use `wgmma` through `sm90_wgmma.cuh`
   descriptors (128 B swizzle, 1024 B aligned, +32 B k-substeps). Never fp8 `mma.sync`, which is
   emulated.
-* **Decode GEMV (M = 1..8):** stay bandwidth-first. Use FFMA/`cp.async.cg` or the mma.sync /
-  swap-AB wgmma walks (`op_gemv_*`). Do not add TMA or warp specialization: both are refuted for
-  1-D streaming.
+* **Decode GEMV (M = 1..8):** stay bandwidth-first: FFMA/`cp.async.cg` or the mma.sync / swap-AB
+  wgmma walks (`op_gemv_*`). TMA and warp specialization lost on plain 1-D streams (sm_120a).
 * **Narrow M with block-scaled fp8:** swap-AB (weights = A m64, tokens = n8/16/32), as in
   `op_gemm_fp8_block_sm90.cuh`. cuBLASLt block-scaled is the baseline route. The native object is
   declared per planned decode segment (<= 32 rows) and must beat Lt per rung.
 * **Choosing staging:** inside the 256-thread megakernel, use uniform TMA (one elected issuer,
-  mbarrier ring NS = 3-4). Producer/consumer + `setmaxnreg` only in a lean role object at 384
-  threads, split once per launch.
-* **Tile and smem:** one stage = 32 KiB (128x128 bf16 or fp8). Keep the arena <= ~113 KiB if you
+  mbarrier ring NS = 3-4). Producer/consumer + `setmaxnreg` only in lean objects (256-thread entry
+  split at occ 2, or WS384), split once per launch.
+* **Tile and smem:** stage = (BM + BN) x BK x elem bytes (128x128: 32 KiB; BN256: 48 KiB) plus
+  barriers. Keep the arena <= ~113 KiB if you
   need 2 blocks/SM. Keep the decode object's dynamic smem low enough that L1 stays above 28 KiB.
   `static_assert` the claim.
-* **Accumulators:** m64n256 = 128 f32/thread, which needs ~154+ regs. That does not fit a
-  128-reg occ-2 object. Decide occupancy first, then N.
+* **Accumulators:** m64n256 = 128 f32/thread; plow's WS384 consumer needs >= 154 regs. That does
+  not fit a 128-reg occ-2 object. Decide occupancy first, then N.
 * **fp8 accuracy:** promote into an f32 shadow every 128 K if regs allow. Otherwise check the
   op-test relL2 at the largest K.
 * **Writing smem from registers or with plain cp.async, then wgmma:**
@@ -478,8 +475,8 @@ Repo-vs-vendor notes, flagged and not edited:
   >= 13.4 binding, and ship as a packet cubin + host stub, never a `.so`.
 * **Flash-decode split count:** align work items to 132 SMs (nsplit 33 at 4 groups); scale by
   1/n_batch.
-* **Probe executables:** `-gencode arch=compute_90a,code=sm_90a`, compiled outside nix, run via
-  `gpuq.py`, with the DVFS-safe harness.
+* **Probe executables:** `-gencode arch=compute_90a,code=sm_90a`, compiled as agent-tools.md §9
+  says (plain shell or `env -i`), run via `gpuq.py`, with the DVFS-safe harness.
 * **Before claiming a perf number:** compare against calibrated ceilings (3094 GB/s, 771 / 1407 TF),
   not datasheet peaks.
 
@@ -487,8 +484,8 @@ Repo-vs-vendor notes, flagged and not edited:
 
 | topic | document | section | version/date |
 |---|---|---|---|
-| wgmma shapes, descriptor, swizzle, fragments, fence/commit/wait, async proxy | PTX ISA — https://docs.nvidia.com/cuda/parallel-thread-execution/index.html | §9.7.17 (Warpgroup MMA), §9.7.17.4, §9.7.17.5.1.2, §9.7.17.7 | 9.4, updated 2026-10-12 |
-| cp.async, cp.async.bulk(.tensor), multicast, mbarrier, setmaxnreg, stmatrix/ldmatrix, griddepcontrol, fence.proxy | same | §9.7.9.25 data movement (cp.async*, ldmatrix, stmatrix), §9.7.15.16 mbarrier, setmaxnreg, griddepcontrol | 9.4 |
+| wgmma shapes, descriptor, swizzle, fragments, fence/commit/wait, async proxy | PTX ISA — https://docs.nvidia.com/cuda/parallel-thread-execution/index.html | §9.7.17 (Warpgroup MMA), §9.7.17.4, §9.7.17.5.1.2.2, §9.7.17.5.2, §9.7.17.7 | 9.4, updated 2026-10-12 |
+| cp.async, bulk, TMA, ldmatrix/stmatrix, mbarrier, griddepcontrol, fences, setmaxnreg | same | cp.async §9.7.10.28.3.1, bulk §9.7.10.28.4.1, tensor §9.7.10.28.5.3; ldmatrix/stmatrix §9.7.16.5.15-16; mbarrier §9.7.15.16; griddepcontrol §9.7.15.14; fence §9.7.15.4; setmaxnreg §9.7.21.5 | 9.4 |
 | SM limits, smem carve-outs, L1, L2, clusters, TMA overview | Hopper Tuning Guide — https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html | §1.4.1.1-1.4.1.3, §1.4.2.2, §1.4.2.4 | v13.4 |
 | Tensor maps | CUDA Driver API — https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html | `cuTensorMapEncodeTiled` | 13.4 |
 | smem banking, cluster launch, `__grid_constant__` | CUDA Programming Guide — https://docs.nvidia.com/cuda/cuda-programming-guide/ | shared memory, thread block clusters | v13.4.2 |
