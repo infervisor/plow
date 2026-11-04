@@ -67,8 +67,11 @@ __device__ void d_gemv_gfx12(bf16* C, const bf16* x, const bf16* W,
             }
         }
 #pragma unroll
-        for (unsigned e = 0; e < 4; e++)
-            part[wave * 256 + (kg * 4 + e) * 16 + col] = acc[e];
+        for (unsigned e = 0; e < 4; e++) {
+            // Native wave64 accumulator groups order the lane bits as 0, 8, 4, 12.
+            const unsigned row = (kg & 1u) * 8 + (kg >> 1) * 4 + e;
+            part[wave * 256 + row * 16 + col] = acc[e];
+        }
         __syncthreads();
         for (unsigned i = threadIdx.x; i < M * 16; i += PLOW_THREADS) {
             float sum = part[i];

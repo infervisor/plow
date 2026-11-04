@@ -262,7 +262,18 @@ int main(int argc, char** argv) {
             }
             for (unsigned a = first; a < first + count; a++) {
                 Error e = error(got[a], ref, no);
-                if (e.over) failures++;
+                if (e.over) {
+                    failures++;
+                    for (unsigned m = 0; m < M; m++) {
+                        Error row = error(got[a] + (size_t)m * sh.N, ref + (size_t)m * sh.N, sh.N);
+                        fprintf(stderr, "row-error %s body=%s M=%u row=%u over=%zu max_rel=%.9g samples=",
+                                sh.name, a ? "new" : "old", M, m, row.over, row.rel);
+                        for (unsigned n = 0; n < 4 && n < sh.N; n++)
+                            fprintf(stderr, " %.9g/%.9g", bf2f(got[a][(size_t)m * sh.N + n]),
+                                    ref[(size_t)m * sh.N + n]);
+                        fputc('\n', stderr);
+                    }
+                }
                 qsort(times[a], reps, sizeof(double), cmpd);
                 double us = times[a][reps / 2], bw = nw * 2 / us / 1e3;
                 printf("%s,%u,%u,%u,%s,%zu,%.3f,%.3f,%.3f,%.3f,%.9g,%.9g,%zu,",
