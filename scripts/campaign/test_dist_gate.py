@@ -46,6 +46,7 @@ class DistGateTests(unittest.TestCase):
             script = Path(cmd[-1]).read_text()
             self.assertIn("serve --model model-a", script)
             self.assertIn("export PLOW_HOME=", script)
+            self.assertIn("export PLOW_REGISTRY=file://", script)
             Path(log).write_text("SMOKE\n")
             (Path(cmd[-1]).parent / "serve.log").write_text(served)
             return rc
