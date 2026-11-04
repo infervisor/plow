@@ -588,7 +588,7 @@ G_K(g_gemv_f32_out) {
     const uint32_t m_rows = in->i[0], n_out = in->i[1], k_in = in->i[2], flags = in->i[7];
     uint32_t lo, hi;
     g_range(n_out, slice, nblk, &lo, &hi);
-    if (flags) {
+    if (flags & ~2048u) {
         /* Modes (dev.rs): f32 x, f16 W, bias, residual (may alias c), activation. */
         const float* xf = (const float*)x;
         const uint16_t* wh = (const uint16_t*)w;
@@ -635,7 +635,7 @@ G_K(g_gemv_f32_out) {
             float acc = 0.f;
             for (uint32_t k = 0; k < k_in; k++)
                 acc = fmaf(plow_bf2f(x[(size_t)m * k_in + k]), plow_bf2f(w[(size_t)n * k_in + k]), acc);
-            c[(size_t)m * n_out + n] = acc;
+            c[(size_t)m * n_out + n] = flags ? plow_bf2f(plow_f2bf(acc)) : acc;
         }
 }
 
@@ -663,6 +663,7 @@ G_K(g_sample_small_f32) {
         const uint32_t* bm = bitmap ? bitmap + (size_t)r * words : NULL;
         float L[4096], sv[64];
         uint32_t sel[64];
+        const uint32_t masked = ctl[2u * r + 1u] < in->i[6] ? vocab - 1u : vocab;
         for (uint32_t i = 0; i < vocab; i++) {
             float v = logits[(size_t)r * ls + i];
             if (guide) {
@@ -670,6 +671,7 @@ G_K(g_sample_small_f32) {
                 const volatile float d = v - u, m = p[3] * d;
                 v = u + m;
             }
+            if (i == masked) v = -INFINITY;
             if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? v / p[2] : v * p[2];
             L[i] = p[0] > 0.f ? v / p[0] : v;
         }

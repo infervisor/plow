@@ -1794,7 +1794,10 @@ pub enum DevOp {
     GemvF32 = 135,
     /// Packed causal convolution plus SiLU. BF16 x/out[B,C], weight[C,W], and mutable history[B,C,W-1] (oldest first); optional I32 active[B] masks writes.
     ///
-    /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B`.
+    /// `source` (j1, 0 = contiguous x) is `in_stride | in_col << 16` in elements: x's row pitch and
+    /// column inside an N-concatenated projection's output (runtime contract 4).
+    ///
+    /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B` · `j1=source?`.
     QwenGdnConv = 136,
     /// Recurrent GDN with K=128 and HV divisible by HK. BF16 out[B,HV,V], packed qkv[B,2*HK*K+HV*V], a/b[B,HV], and dt_bias[HV]. A_log[HV] is BF16 unless alog_f32 is nonzero. Mutable FP32 state[B,HV,V,K]; optional I32 active[B] masks writes. Beta rounds to BF16 before recurrence.
     ///
@@ -1802,7 +1805,10 @@ pub enum DevOp {
     QwenGdnStep = 137,
     /// Ordinary per-head RMSNorm(core) times SiLU(z). BF16 core/z/out[B,HV,V] and gamma[V]; optional I32 active[B].
     ///
-    /// `t0=out t1=core t2=z t3=gamma t4=active?` · `i0=HV i1=V i2=B` · `f0=eps`.
+    /// `source` (j1, 0 = contiguous z) is `z_stride | z_col << 16` in elements: z's row pitch and
+    /// column inside an N-concatenated projection's output (runtime contract 4).
+    ///
+    /// `t0=out t1=core t2=z t3=gamma t4=active?` · `i0=HV i1=V i2=B` · `f0=eps` · `j1=source?`.
     QwenGatedNorm = 138,
     /// Deinterleave each head of BF16 packed[B,H,2*D] into Q/gate[B,H,D]; optional I32 active[B].
     /// `in_stride` (elements, 0 = 2*H*D) is packed's row pitch when it is the q|gate block at
@@ -1827,7 +1833,9 @@ pub enum DevOp {
     QwenHeadNormRope = 142,
     /// BF16 causal convolution plus SiLU for exactly T valid tokens: x/out[T,C], weight[C,W], mutable oldest-first history[1,C,W-1]. Updates history after the chunk.
     ///
-    /// `t0=out t1=x t2=weight t3=history` · `i0=C i1=W i2=T`.
+    /// `source` (j1) as [`DevOp::QwenGdnConv`].
+    ///
+    /// `t0=out t1=x t2=weight t3=history` · `i0=C i1=W i2=T` · `j1=source?`.
     QwenGdnConvPrefill = 143,
     /// Unpack BF16 packed[T,2*HK*K+HV*V]; normalize Q/K[T,HK,K] and round to BF16, copy V[T,HV,V]. No Q scaling.
     ///
@@ -2475,7 +2483,8 @@ pub enum DevOp {
     /// x, f16 W, K <= 1024) LayerNorms each x row first, `(x - mean) * rsqrt(var + eps) * gamma +
     /// beta`, fp32 two-pass statistics; bit 9 reads `bias(f32[M / i3, N])`, one row per `i3` rows;
     /// bit 10 (f32 x, f16 W, K % 64 == 0) rounds x to f16 and multiplies on tensor cores (fp32
-    /// accumulation, any summation order), streaming W once per 64 rows.
+    /// accumulation, any summation order), streaming W once per 64 rows. Bit 11 alone (no other
+    /// bit) rounds each `C` to bf16 (a reference whose linear outputs bf16).
     /// `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K]) t3=bias? t4=residual? t5=gamma? t6=beta?` ·
     /// `i0=M i1=N i2=K i3=bias_group i7=flags` · `f0=eps` (K % 8 == 0).
     GemvF32Out = 220,
@@ -2489,10 +2498,11 @@ pub enum DevOp {
     /// value other than `u32::MAX` replaces the draw (teacher forcing). The class sets its bitmap
     /// bit, lands in `out[r*i2 + i3]`, and `eidx[r] = class + j0` (an embedding row). `ctl[r][0]
     /// == 0` skips the row.
+    /// HF `min_new_tokens`: while `ctl[r][1] < i6` the last class (the stop) is `-inf` first.
     /// `t0=out(u32) t1=logits(f32[rows][i7 or vocab]) t2=params(f32[rows][4]: T, top_p, penalty, -)
     /// t3=ctl(u32[rows][2]: top_k, step) t4=seed(u64[rows]) t5=bitmap(u32[rows][i5])?
     /// t6=force(u32, out's layout)? t7=eidx(u32[rows])?` · `i0=rows i1=vocab i2=out_stride
-    /// i3=out_col0 i4=coord i5=bitmap_words i7=logit_stride` · `j0=eidx_offset`.
+    /// i3=out_col0 i4=coord i5=bitmap_words i6=min_step i7=logit_stride` · `j0=eidx_offset`.
     SampleSmallF32 = 221,
     /// FP32 stream tail: the last `L` rows a streaming stage carries between chunks, per slot.
     /// Gather (mode 0) builds `z(f32[B][L+N][Cz])`: rows `[0, L)` hold `state[slot[b]]` in

@@ -368,7 +368,7 @@ pub fn cmd_pack<'a>(
         }
     }
     match out {
-        Some(out) => write_zip(&args, assets, objects, out),
+        Some(out) => write_zip(&args, assets, out),
         None => Ok(()),
     }
 }
@@ -380,20 +380,20 @@ pub fn cmd_pack<'a>(
 fn write_zip(
     args: &PackArgs<'_>,
     assets: &std::path::Path,
-    objects: Option<&std::path::Path>,
     out: &std::path::Path,
 ) -> Result<(), Err> {
     let PackArgs {
         bundle_bytes,
         bundle,
         objset,
+        objects_root,
         checkpoint_in,
     } = args;
-    let objects_in = match (&objset, objects) {
-        (Some((objset, _)), Some(dir)) => objset.objects.iter().map(|o| (o, dir)).collect(),
-        // A recipe's objects live in the asset directory unless the recipe's
-        // build script put them elsewhere, exactly as `generate` reads them.
-        (Some((objset, _)), None) => objset.objects.iter().map(|o| (o, assets)).collect(),
+    // Exactly where `generate` read the objects from.
+    let objects_in: Vec<_> = match (&objset, objects_root) {
+        (Some((objset, _)), Some(dir)) => {
+            objset.objects.iter().map(|o| (o, dir.as_path())).collect()
+        }
         _ => Vec::new(),
     };
 
@@ -509,6 +509,8 @@ struct PackArgs<'a> {
     bundle_bytes: Vec<u8>,
     bundle: plow_asset::dist::Bundle,
     objset: Option<(plow_asset::dist::ObjSet, Vec<u8>)>,
+    /// The directory the objset's object names are relative to, as `generate` resolved it.
+    objects_root: Option<std::path::PathBuf>,
     checkpoint_in: Option<&'a std::path::Path>,
 }
 
@@ -533,7 +535,8 @@ fn pack_args<'a>(
     // came out with an empty `files[]` and the refusal blamed the caller.
     args.checkpoint_dir = checkpoint_dir;
     let g = plowrt::dist::manifest::generate(path, assets, objects, over, &args)?;
-    let (bundle_bytes, bundle, objset) = (g.bundle_bytes, g.bundle, g.objset);
+    let (bundle_bytes, bundle, objset, objects_root) =
+        (g.bundle_bytes, g.bundle, g.objset, g.objects_root);
     let where_ = path.display();
     // Generated, but gated exactly as a hand-written manifest was: the
     // generator is not trusted to have produced a publishable manifest.
@@ -549,6 +552,7 @@ fn pack_args<'a>(
         bundle_bytes,
         bundle,
         objset,
+        objects_root,
         checkpoint_in,
     })
 }
@@ -613,7 +617,7 @@ pub fn cmd_publish<'a>(
         args.bundle_bytes = serde_json::to_vec_pretty(&bundle)?;
         args.bundle = bundle;
         let zip_path = dir.join("bundle.zip");
-        write_zip(&args, assets, objects, &zip_path)?;
+        write_zip(&args, assets, &zip_path)?;
         upload(&zip_path, to, &args.bundle)
     })();
     let _ = std::fs::remove_dir_all(&dir);
@@ -845,10 +849,9 @@ pub fn cmd_push<'a>(
              unsigned, and a client with PLOW_TRUSTED_KEYS set will refuse it"
         );
     }
-    let objects_dir = objects.unwrap_or(assets);
     let src = dist::push::Sources {
         assets,
-        objects: objects_dir,
+        objects: args.objects_root.as_deref().unwrap_or(assets),
         checkpoint: checkpoint_dir,
     };
     let trust = trust_for(to)?;

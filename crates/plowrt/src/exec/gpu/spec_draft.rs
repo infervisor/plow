@@ -80,11 +80,9 @@ impl SpecDraft {
     fn load(e: &GpuEngine, assets: &Path) -> Result<Self> {
         let pkt = DevBlob::find_in_dir(assets)?
             .ok_or_else(|| reject(format!("no packet in {}", assets.display())))?;
-        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-            path: pkt.clone(),
-            source,
-        })?;
-        let blob = DevBlob::parse(&raw)?;
+        let image = crate::asset::packet_image::PacketImage::open(&pkt)?;
+        image.blob.check_l2_dispatch(false)?;
+        let (raw, blob) = (&image.raw, &image.blob);
         let meta = blob
             .reserved_metadata(&raw, plow_asset::spec_draft::SECTION)?
             .ok_or_else(|| reject("packet was not emitted with PLOW_EMIT_SPEC"))?;
@@ -101,7 +99,7 @@ impl SpecDraft {
             if live > ceiling {
                 return Err(reject(format!("widened live context {live} > {ceiling}")));
             }
-            let mut narrowed = DevBlob::parse(&raw)?;
+            let mut narrowed = blob.clone();
             crate::exec::ctx_bound::narrow(&mut narrowed, live)?;
             sized = Some(narrowed);
         }

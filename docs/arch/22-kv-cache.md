@@ -497,7 +497,7 @@ armed — on by default, sized by what the host can spare: `MemAvailable` minus 
 reserve of `max(MemTotal / 8, 16 GiB)`, capped at `MemTotal / 4`
 (`memory/vmm.rs` `host_tier_default`, cap since 2026-10-28; a serving plowrt
 pins that much host RAM, so nothing memory-hungry runs beside it);
-`PLOW_VMM_HOST_CACHE_MIB` names a size (the 12B recipe: 64 GiB), `0` turns it
+`PLOW_HOST_KVCACHE_SIZE` names a size (the 12B recipe: 64 GiB), `0` turns it
 off — and is reclaimed otherwise. A session's prompt-end boundary
 stops 8 rows short of the prompt end: the next turn re-renders the last prompt
 rows (Gemma 4 drops the generation prompt's empty thought channel, 4 tokens), so
@@ -631,7 +631,7 @@ latent cache, not to this dense head-major cache.
 | `PLOW_VMM_CACHE_MEMORY_UTILIZATION` | 0 (no static cap) | Optional prefix cache soft cap as a fraction of device memory; by default the cache grows into free memory down to the pressure floor |
 | `PLOW_VMM_CACHE_MIB` | unset | Explicit soft cap in MiB; overrides the fraction above. `0` = OOM-driven eviction only |
 | `PLOW_VMM_CACHE_MIN_FREE_MIB` | unset = 4% of device | Keep cached prefixes until free device memory would drop below this; `0` rolls back to the byte budget as the only trim trigger |
-| `PLOW_VMM_HOST_CACHE_MIB` | unset = `min(MemAvailable − max(MemTotal/8, 16 GiB), MemTotal/4)` | Pinned host tier of the block store; `0` = device only |
+| `PLOW_HOST_KVCACHE_SIZE` | unset = `min(MemAvailable − max(MemTotal/8, 16 GiB), MemTotal/4)` | Pinned host tier of the block store; `0` = device only |
 | `PLOW_PREFIX_SESSION_TTL_S` | 150 | Idle time after which a session's boundary is demoted |
 | `PLOW_VMM_LIVE_RINGS` | off | Grow packet KV with the live frontier; disables prefix auto-selection |
 

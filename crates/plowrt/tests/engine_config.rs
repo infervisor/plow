@@ -99,7 +99,7 @@ fn every_production_engine_default_resolves_as_the_legacy_export() {
         ("PLOW_MULTISTEP", "0"),
         ("PLOW_DECODE_MAX_RUNG", "128"),
         ("PLOW_PF_NORM_ROW_BLOCKS", "1152"),
-        ("PLOW_VMM_HOST_CACHE_MIB", "65536"),
+        ("PLOW_HOST_KVCACHE_SIZE", "64GB"),
     ];
     for set in [&e4b[..], &g12[..]] {
         let want = format!("{:?}", legacy(set, &["plowrt"]));
@@ -276,4 +276,40 @@ fn startup_engines_resolve_their_own_bundles_engine_config() {
     for d in [a, b] {
         let _ = std::fs::remove_dir_all(d);
     }
+}
+
+/// A packet emitted before the host KV tier knob's rename carries its qualified MiB value over
+/// to `PLOW_HOST_KVCACHE_SIZE`, exactly.
+#[test]
+fn packet_default_under_the_old_host_cache_name_carries_over() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = packet_with_defaults("renamed", &[("PLOW_VMM_HOST_CACHE_MIB", "65536")]);
+    let got =
+        plowrt::asset::serve::asset_env_defaults(std::slice::from_ref(&dir), |_| None).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        (got[0].0.as_str(), got[0].1.as_str()),
+        ("PLOW_HOST_KVCACHE_SIZE", "65536MB")
+    );
+    let st = Startup::new(Vec::new(), BTreeMap::new());
+    let cfg = resolve_engine(&st, &[(got[0].0.clone(), got[0].1.clone())]).unwrap();
+    assert_eq!(
+        cfg.host_kvcache_size,
+        Some(plowrt::config::HostKvcacheSize::Bytes(64 << 30))
+    );
+    let bad = packet_with_defaults("renamed-bad", &[("PLOW_VMM_HOST_CACHE_MIB", "64GB")]);
+    assert!(plowrt::asset::serve::asset_env_defaults(&[bad.clone()], |_| None).is_err());
+    let both = packet_with_defaults(
+        "renamed-both",
+        &[
+            ("PLOW_VMM_HOST_CACHE_MIB", "65536"),
+            ("PLOW_HOST_KVCACHE_SIZE", "0"),
+        ],
+    );
+    let got = plowrt::asset::serve::asset_env_defaults(&[both.clone()], |_| None).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].1, "0", "the new spelling wins");
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(bad);
+    let _ = std::fs::remove_dir_all(both);
 }

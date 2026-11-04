@@ -40,6 +40,13 @@ pub const LIBRARY_PREFILL_ATTENTION: u8 = 26;
 /// Prefix of a library attention object's ABI: v2 = a cubin container (`PLOWAOT1`) plowrt
 /// launches itself; v1 (a host library) is retired and refused.
 const LIBRARY_ABI_PREFIX: &str = "lib_flash_prefill_v2:fa4:";
+/// Object ID (not a segment role) of the native block-scaled FP8 decode GEMM: a program's
+/// [`CUBLASLT`] decode segments whose `GemmFp8` shape is in the object's `decode_plan` run on it
+/// instead of cuBLASLt; every other segment keeps cuBLASLt.
+pub const NATIVE_DECODE_FP8_BLOCK: u8 = 27;
+pub const NATIVE_DECODE_FP8_BLOCK_ABI: &str = "gemm_fp8_block_sm90_v1";
+/// Rows one native FP8 block launch serves (the widest WGMMA N tile).
+pub const NATIVE_DECODE_FP8_BLOCK_MAX_ROWS: u32 = 32;
 
 /// KV cache layout a library reads in place or through its gather pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -366,7 +373,7 @@ pub const CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES: [(u32, u32); 5] = [
 /// 128-wide tensor-core tiles ran them as eight CTAs per 1024 rows: 17.9 ms of a 122 ms prefill
 /// with their preps, floor 0.9), and gate|up and q|gate|k|v concatenated along N
 /// (`PLOW_FP8_BLOCK_CONCAT`).
-pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 10] = [
+pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 11] = [
     (12288, 5120),
     (1024, 5120),
     (5120, 6144),
@@ -377,6 +384,8 @@ pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 10] = [
     (10240, 5120),
     (6144, 5120),
     (48, 5120),
+    // GDN in_proj qkv|z, N-concatenated (PLOW_FP8_BLOCK_CONCAT).
+    (16384, 5120),
 ];
 
 pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
@@ -644,6 +653,102 @@ fn valid_attention_shape(role: u8, a: &AttentionCapability, s: &AttentionShape) 
         }
 }
 
+/// `cfg` of a native FP8 block plan entry `[m, n, k, cfg, splits]`: `stages << 4 | variant`,
+/// variant bit 0 = 64-row N tiles (one consumer warpgroup), bit 1 = pipelined promotion,
+/// bit 2 = in-kernel split reduce, bit 3 = per-tile rotated group order.
+pub fn fp8_block_cfg(cfg: u32) -> Option<(u32, u32)> {
+    let (stages, variant) = (cfg >> 4, cfg & 15);
+    matches!(stages, 4 | 6).then_some((stages, variant))
+}
+
+/// Measured Qwen3.8-27B block-FP8 decode plans `[m, n, k, cfg, splits]` (single-projection
+/// screen, H100 SXM5, CUDA-graph timed, published checkpoint scales), only where faster than
+/// cuBLASLt: devgen plans the routed shapes it finds here; others stay on cuBLASLt.
+pub const NATIVE_DECODE_FP8_BLOCK_SHAPES: [[u32; 5]; 39] = [
+    [1, 5120, 6144, 65, 4],
+    [2, 5120, 6144, 97, 4],
+    [4, 5120, 6144, 67, 3],
+    [8, 5120, 6144, 65, 4],
+    [16, 5120, 6144, 65, 3],
+    [32, 5120, 6144, 107, 2],
+    [1, 5120, 17408, 65, 4],
+    [2, 5120, 17408, 97, 4],
+    [4, 5120, 17408, 65, 4],
+    [8, 5120, 17408, 65, 4],
+    [16, 5120, 17408, 72, 4],
+    [32, 5120, 17408, 104, 2],
+    [1, 6144, 5120, 65, 3],
+    [2, 6144, 5120, 75, 4],
+    [4, 6144, 5120, 65, 3],
+    [8, 6144, 5120, 65, 4],
+    [16, 6144, 5120, 107, 2],
+    [32, 6144, 5120, 73, 2],
+    [1, 10240, 5120, 105, 1],
+    [2, 10240, 5120, 105, 1],
+    [4, 10240, 5120, 107, 1],
+    [1, 14336, 5120, 73, 1],
+    [2, 14336, 5120, 73, 1],
+    [4, 14336, 5120, 67, 1],
+    [8, 14336, 5120, 72, 1],
+    [16, 14336, 5120, 73, 1],
+    [32, 14336, 5120, 73, 1],
+    [1, 16384, 5120, 75, 1],
+    [2, 16384, 5120, 67, 1],
+    [4, 16384, 5120, 67, 1],
+    [8, 16384, 5120, 73, 1],
+    [16, 16384, 5120, 73, 1],
+    [32, 16384, 5120, 73, 1],
+    [1, 34816, 5120, 65, 1],
+    [2, 34816, 5120, 65, 1],
+    [4, 34816, 5120, 65, 1],
+    [8, 34816, 5120, 65, 1],
+    [16, 34816, 5120, 73, 1],
+    [32, 34816, 5120, 99, 1],
+];
+
+fn valid_fp8_block_plan(plan: &[[u32; 5]]) -> bool {
+    let mut shapes = BTreeSet::new();
+    !plan.is_empty()
+        && plan.iter().all(|&[m, n, k, cfg, splits]| {
+            (1..=NATIVE_DECODE_FP8_BLOCK_MAX_ROWS).contains(&m)
+                && n > 0
+                && k > 0
+                && n % 128 == 0
+                && k % 128 == 0
+                && n <= i32::MAX as u32
+                && k <= i32::MAX as u32
+                && fp8_block_cfg(cfg).is_some()
+                && (1..=8).contains(&splits)
+                && splits <= k / 128
+                && shapes.insert((m, n, k))
+        })
+}
+
+fn validate_fp8_block(object: &SegmentObject) -> Result<(), String> {
+    let valid_hash = object.sha256.as_deref().is_some_and(|s| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
+    if !valid_hash
+        || object.abi != NATIVE_DECODE_FP8_BLOCK_ABI
+        || object.file.is_empty()
+        || std::path::Path::new(&object.file)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || object.promote_k512.is_some()
+        || object.attention.is_some()
+        || object.gemm.is_some()
+        || object
+            .decode_plan
+            .as_deref()
+            .is_none_or(|plan| !valid_fp8_block_plan(plan))
+    {
+        return Err("invalid native FP8 block packet object".into());
+    }
+    Ok(())
+}
+
 fn valid_decode_plan(plan: &[[u32; 5]]) -> bool {
     let mut shapes = BTreeSet::new();
     !plan.is_empty()
@@ -761,16 +866,21 @@ impl SegmentRoles {
     pub fn validate_schema(&self) -> Result<(), String> {
         if self.version != 1
             || self.programs.is_empty()
-            || self
-                .objects
-                .keys()
-                .any(|&id| !requires_object(id) && id != LIBRARY_PREFILL_ATTENTION)
+            || self.objects.keys().any(|&id| {
+                !requires_object(id)
+                    && id != LIBRARY_PREFILL_ATTENTION
+                    && id != NATIVE_DECODE_FP8_BLOCK
+            })
         {
             return Err("unsupported packet segment roles".into());
         }
         for (&id, object) in &self.objects {
             if id == LIBRARY_PREFILL_ATTENTION {
                 validate_library(object)?;
+                continue;
+            }
+            if id == NATIVE_DECODE_FP8_BLOCK {
+                validate_fp8_block(object)?;
                 continue;
             }
             if is_generated(id) {
@@ -955,13 +1065,19 @@ impl SegmentRoles {
                     .copied()
                     .filter(|&role| requires_object(role)),
             );
+            if program.roles.contains(&CUBLASLT) {
+                used.insert(NATIVE_DECODE_FP8_BLOCK);
+            }
         }
         // A generated decode object may be launched by the runtime alone (riders, decode steps),
         // so it is declared with or without a program use; every other object needs one.
         let required = self.objects.iter().filter(|(_, object)| {
             !GeneratedAbi::parse(&object.abi).is_some_and(|abi| abi.decode())
         });
-        if !used.iter().all(|role| self.objects.contains_key(role))
+        if !used
+            .iter()
+            .filter(|&&role| role != NATIVE_DECODE_FP8_BLOCK)
+            .all(|role| self.objects.contains_key(role))
             || !required.into_iter().all(|(id, _)| used.contains(id))
         {
             return Err("packet segment declarations do not match use".into());
@@ -1578,6 +1694,37 @@ mod tests {
             ),
         );
         assert!(SegmentRoles::from_bytes(misplaced.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn native_fp8_block_object_rides_cublaslt_programs() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"27":{{"abi":"{NATIVE_DECODE_FP8_BLOCK_ABI}","file":"f.cubin","sha256":"{}","decode_plan":[[1,16384,5120,64,2],[32,5120,6144,103,3]]}}}},"programs":[{{"index":0,"roles":[0,5,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        let parsed = SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), raw);
+        assert_eq!(fp8_block_cfg(103), Some((6, 7)));
+        assert!(valid_fp8_block_plan(&NATIVE_DECODE_FP8_BLOCK_SHAPES));
+        for bad in [
+            raw.replace("[0,5,0]", "[0,0,0]"),
+            raw.replace(NATIVE_DECODE_FP8_BLOCK_ABI, "gemm_fp8_block_sm90_v0"),
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("f.cubin", "../f.cubin"),
+            raw.replace("[1,16384,5120,64,2]", "[33,16384,5120,64,2]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16320,5120,64,2]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16384,5000,64,2]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16384,5120,80,2]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16384,5120,64,9]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16384,256,64,3]"),
+            raw.replace("[1,16384,5120,64,2]", "[32,5120,6144,64,2]"),
+            raw.replace(
+                r#","decode_plan":[[1,16384,5120,64,2],[32,5120,6144,103,3]]"#,
+                "",
+            ),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[test]

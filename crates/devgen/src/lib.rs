@@ -75,6 +75,7 @@ mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
+mod abi_section;
 pub mod asr;
 pub mod asr_subsampling;
 pub mod codec;
@@ -8281,7 +8282,7 @@ pub(crate) fn write_lean_receipts(packet: &std::path::Path, lean: &LeanReport) {
         checks: lean.compile_checks.clone(),
     };
     receipts
-        .validate_packet(&bytes)
+        .validate_packet(&plow_asset::decode_objects::image_sha256(&bytes))
         .expect("compiler check receipt binding");
     let path = packet.with_file_name(PACKET_CHECKS_FILE);
     std::fs::write(
@@ -8394,7 +8395,9 @@ pub fn write_sidecar_packet(
             Some((checks, program_checks))
         }
     };
-    let blob = model.to_blob_v6(sections);
+    let mut sections = sections.to_vec();
+    abi_section::append(model, &mut sections, "", "");
+    let blob = model.to_blob_v6(&sections);
     std::fs::write(path, &blob).unwrap_or_else(|error| panic!("{name}: {error}"));
     let Some((checks, program_checks)) = receipts else {
         // A stale file would describe an older blob.
@@ -8411,7 +8414,7 @@ pub fn write_sidecar_packet(
         program_checks,
     };
     receipts
-        .validate_packet(&blob)
+        .validate_packet(&plow_asset::decode_objects::image_sha256(&blob))
         .expect("sidecar check receipt binding");
     std::fs::write(
         &checks_path,
@@ -11826,6 +11829,7 @@ fn emit_dense_gqa(
     modular::update_section_with_lean(&mut sections, &lean);
     object_requirements::append(&m, &mut sections)
         .unwrap_or_else(|error| panic!("object requirements: {error}"));
+    abi_section::append(&m, &mut sections, &arch, &gpu);
     let blob = m.to_blob_v6(&sections);
     // Coverage gate BEFORE the blob lands on disk: a wrong .pkt that exists will be
     // benchmarked by someone. PLOW_SKIP_COVERAGE=1 is the deliberate escape hatch for
@@ -12037,6 +12041,15 @@ fn emit_dense_gqa(
     if !arch.is_empty() {
         write_lean_receipts(std::path::Path::new(&out), &lean);
         let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
+        // A depth stage's projection bias rides a plain Gemv's t7 in auxiliary programs, which
+        // `m` (the manifest's source) does not hold.
+        if c.frame
+            .as_ref()
+            .and_then(|f| f.depth.as_ref())
+            .is_some_and(|d| d.proj_bias)
+        {
+            man["features"]["linear_bias"] = true.into();
+        }
         if speech_ops != 0 {
             man["speech_ops"] = speech_ops.into();
         }

@@ -469,6 +469,63 @@ impl ServeEngine {
         }
     }
 
+    /// Device bytes this engine's live KV holds (0: no device KV pool).
+    pub fn kv_live_held(&self) -> u64 {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.kv_live_held(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
+    /// Whether the manager splits the device's KV budget across this engine and its co-tenants
+    /// (CUDA only; other backends keep their own admission).
+    pub fn shares_device_kv(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
+    /// See [`crate::exec::gpu::GpuEngine::set_co_tenant`]; a no-op off CUDA.
+    pub fn set_co_tenant(&mut self, cap: Option<u64>, keep_free: u64) {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.set_co_tenant(cap, keep_free),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = (cap, keep_free);
+            }
+        }
+    }
+
+    /// See [`crate::exec::gpu::GpuEngine::enter_co_tenancy`]; a no-op off CUDA.
+    pub fn enter_co_tenancy(&mut self) -> crate::Result<()> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.enter_co_tenancy(),
+            #[allow(unreachable_patterns)]
+            _ => Ok(()),
+        }
+    }
+
+    /// Give `bytes` back from this engine's caches for another model's load; whether anything
+    /// was released or queued.
+    pub fn reclaim_device(&mut self, bytes: u64) -> crate::Result<bool> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.reclaim_device(bytes),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = bytes;
+                Ok(false)
+            }
+        }
+    }
+
     /// KV bytes one cache row takes (0: unknown).
     pub fn kv_row_bytes(&self) -> u64 {
         match self {

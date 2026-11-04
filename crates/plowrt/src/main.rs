@@ -1046,6 +1046,10 @@ impl SelectArgs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = plowrt::knob_spec::refuse_renamed_env(|k| std::env::var(k).ok()) {
+        eprintln!("plowrt: {e}");
+        std::process::exit(2);
+    }
     // Before the runtime starts threads and before the CLI reads the environment.
     let asset_defaults = apply_asset_env_defaults();
     let result = tokio::runtime::Builder::new_multi_thread()
@@ -4218,7 +4222,13 @@ async fn bringup_runtime(
         } else {
             let policy: Place = RuntimeConfig::get().place;
 
-            // Per-model footprint and TP degree, both from the blob header.
+            // Per-model footprint and TP degree, both from the blob header. Holding each packet and
+            // build.json until the initial loads finish makes the plan, the TP probe and the engine
+            // load share one read and parse.
+            let _anchors: Vec<_> = models
+                .iter()
+                .map(|(_, dir, _)| plowrt::asset::packet_image::LoadAnchor::hold(dir))
+                .collect();
             let granularity = cuda.granularity()?;
             let mut specs: Vec<ModelSpec> = Vec::with_capacity(models.len());
             for (slug, dir, checkpoint) in &models {

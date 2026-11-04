@@ -187,6 +187,9 @@ pub(crate) struct FrameEmbed {
     pub(crate) cb_size: u32,
     pub(crate) lo: u32,
     pub(crate) rows: u32,
+    /// Classes of the depth stage's per-codebook heads (Breeze: `rows`; Qwen3-TTS, whose every
+    /// token row is a frame row, the 2048 codes).
+    pub(crate) classes: u32,
     pub(crate) div: f32,
     pub(crate) depth: Option<FishDepth>,
     /// Maya 2: every decode row is a frame row with no token row (`EmbedFrameBf16` mode bit 0), as
@@ -228,6 +231,16 @@ pub(crate) struct FishDepth {
     pub(crate) breeze: bool,
     pub(crate) rope_scale: RopeScale,
     pub(crate) maya2: Option<Maya2Depth>,
+    /// Projected-input depth (Breeze path) weight prefix (`breeze.depth`).
+    pub(crate) prefix: String,
+    /// Per-head q/k RMS norms with weights (`layers.N.self_attn.{q,k}_norm.weight`).
+    pub(crate) qk_norm: bool,
+    /// The input projection carries a bias (`proj.bias`).
+    pub(crate) proj_bias: bool,
+    /// Frames before which the backbone's stop class is masked (HF `min_new_tokens`).
+    pub(crate) min_frames: u32,
+    /// fp32 heads' logits rounded to bf16 (a reference whose head linear outputs bf16).
+    pub(crate) bf16_logits: bool,
 }
 
 pub(crate) struct Cfg {
@@ -399,6 +412,7 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
             cb_size: g("codebook_size"),
             lo: g("lo"),
             rows: g("rows"),
+            classes: f["classes"].as_u64().map_or(g("rows"), |c| c as u32),
             div: f["div"].as_f64().map_or(1.0, |d| d as f32),
             depth: f.get("depth").map(|d| {
                 let u = |k: &str| {
@@ -411,13 +425,24 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
                         .unwrap_or_else(|| panic!("plow_frame_embed.depth.{k}"))
                 };
                 let s = &d["rope_scaling"];
-                assert_eq!(
-                    s["rope_type"], "llama3",
-                    "plow_frame_embed.depth.rope_scaling"
-                );
                 let sx = |k: &str| {
                     s[k].as_f64()
                         .unwrap_or_else(|| panic!("depth.rope_scaling.{k}"))
+                };
+                let flag = |k: &str| d[k].as_bool().unwrap_or(false);
+                let rope_scale = if s.is_null() {
+                    RopeScale::None
+                } else {
+                    assert_eq!(
+                        s["rope_type"], "llama3",
+                        "plow_frame_embed.depth.rope_scaling"
+                    );
+                    RopeScale::Llama3 {
+                        factor: sx("factor"),
+                        low: sx("low_freq_factor"),
+                        high: sx("high_freq_factor"),
+                        orig: sx("original_max_position_embeddings"),
+                    }
                 };
                 FishDepth {
                     layers: u("layers"),
@@ -430,19 +455,20 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
                     theta: x("rope_theta") as f32,
                     positions: u("positions"),
                     breeze: true,
-                    rope_scale: RopeScale::Llama3 {
-                        factor: sx("factor"),
-                        low: sx("low_freq_factor"),
-                        high: sx("high_freq_factor"),
-                        orig: sx("original_max_position_embeddings"),
-                    },
+                    rope_scale,
                     maya2: None,
+                    prefix: f["prefix"].as_str().unwrap_or("breeze.depth").into(),
+                    qk_norm: flag("qk_norm"),
+                    proj_bias: flag("proj_bias"),
+                    min_frames: d["min_frames"].as_u64().unwrap_or(0) as u32,
+                    bf16_logits: flag("bf16_logits"),
                 }
             }),
             decode_only: false,
             norm: None,
         });
-        c.encoder_overlay_rows = g("overlay_rows");
+        // Breeze's prompt rows are encoder overlay rows; Qwen3-TTS's embed from their codes (none).
+        c.encoder_overlay_rows = f["overlay_rows"].as_u64().unwrap_or(0) as u32;
     }
     if let Some(t3) = v.get("chatterbox_t3") {
         c.encoder_overlay_rows = t3["overlay_rows"]
@@ -778,6 +804,7 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
                     cb_size: g("codebook_size"),
                     lo: g("semantic_base"),
                     rows: g("semantic_tokens"),
+                    classes: g("semantic_tokens"),
                     div: (1.0 / f["frame_scale"].as_f64().expect("fish_s2.frame_scale")) as f32,
                     depth: Some({
                         let d = &f["depth"];
@@ -801,6 +828,11 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
                             breeze: false,
                             rope_scale: RopeScale::None,
                             maya2: None,
+                            prefix: "fish.depth".into(),
+                            qk_norm: false,
+                            proj_bias: false,
+                            min_frames: 0,
+                            bf16_logits: false,
                         }
                     }),
                     decode_only: false,
@@ -840,6 +872,7 @@ fn maya2_frame(f: &Value) -> FrameEmbed {
         cb_size: g("codebook_size"),
         lo: g("frame_token_lo"),
         rows: g("codebook_size"),
+        classes: g("codebook_size"),
         div: (1.0 / f["frame_scale"].as_f64().expect("maya2.frame_scale")) as f32,
         depth: Some(FishDepth {
             layers: u("layers"),
@@ -853,6 +886,11 @@ fn maya2_frame(f: &Value) -> FrameEmbed {
             positions: levels + 1,
             breeze: false,
             rope_scale: RopeScale::None,
+            prefix: "maya2.depth".into(),
+            qk_norm: false,
+            proj_bias: false,
+            min_frames: 0,
+            bf16_logits: false,
             maya2: Some(Maya2Depth {
                 levels,
                 groups: u("groups"),

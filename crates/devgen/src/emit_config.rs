@@ -346,6 +346,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_SNAC_SPLIT_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub snac_split_bf16: bool,
 
+    /// Measured Conv1dF32 arms per codec conv shape (tuning `codec_conv_arms.jsonl`): a shape
+    /// listed with arm `rows` or `warp` takes flag bit 16 (sm_90 speech object); every other
+    /// conv keeps the GEMM paths.
+    #[arg(long, env = "PLOW_EMIT_CODEC_CONV_ARMS")]
+    pub codec_conv_arms: Option<std::path::PathBuf>,
+
     /// Fish/Breeze codec: skip decode and stream-step capacities over this many rows (batch x
     /// frames); the largest sets the activation arena (PLOW_EMIT_FISH_CODEC_MAX_ROWS).
     #[arg(long, env = "PLOW_EMIT_FISH_CODEC_MAX_ROWS")]
@@ -1793,6 +1799,11 @@ pub struct EmitConfig {
     )]
     pub decode_cublaslt_min_rows: Option<u32>,
 
+    /// With `decode_cublaslt`: the packet carries the native block-scaled FP8 decode GEMM object,
+    /// which serves the routed block-FP8 projections whose shapes it has a measured plan for.
+    #[arg(long = "emit-decode-fp8-block", env = "PLOW_EMIT_DECODE_FP8_BLOCK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_fp8_block: bool,
+
     /// With `decode_cublaslt`: the routed rungs' lm_head is a library segment too.
     #[arg(long = "emit-decode-cublaslt-head", env = "PLOW_EMIT_DECODE_CUBLASLT_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_cublaslt_head: bool,
@@ -1856,6 +1867,9 @@ pub struct EmitConfig {
 
     #[arg(long, env = "PLOW_QWEN_AB_BLOCKS")]
     pub qwen_ab_blocks: Option<u32>,
+    /// Blocks of the frame-depth programs' grid-wide ops (default all).
+    #[arg(long, env = "PLOW_EMIT_DEPTH_UNITS")]
+    pub depth_units: Option<u32>,
 
     #[arg(long, env = "PLOW_QWEN_GDN_ISOLATE")]
     pub qwen_gdn_isolate: Option<u32>,
@@ -2021,6 +2035,7 @@ impl EmitConfig {
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
             s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
             snac_split_bf16: env_bool("PLOW_EMIT_SNAC_SPLIT_BF16"),
+            codec_conv_arms: env_str("PLOW_EMIT_CODEC_CONV_ARMS").map(std::path::PathBuf::from),
             fish_codec_max_rows: env_u32("PLOW_EMIT_FISH_CODEC_MAX_ROWS"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
@@ -2329,6 +2344,7 @@ impl EmitConfig {
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
             decode_cublaslt_min_rows: env_u32("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"),
             decode_cublaslt_head: env_bool("PLOW_EMIT_DECODE_CUBLASLT_HEAD"),
+            decode_fp8_block: env_bool("PLOW_EMIT_DECODE_FP8_BLOCK"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
             fp8_decode_tc64: env_bool("PLOW_FP8_DECODE_TC64"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
@@ -2347,6 +2363,9 @@ impl EmitConfig {
             qwen_ab_blocks: std::env::var("PLOW_QWEN_AB_BLOCKS")
                 .ok()
                 .map(|v| v.parse().expect("Qwen a/b block count")),
+            depth_units: std::env::var("PLOW_EMIT_DEPTH_UNITS")
+                .ok()
+                .map(|v| v.parse().expect("depth unit count")),
             qwen_gdn_isolate: env_u32("PLOW_QWEN_GDN_ISOLATE"),
             qwen_kv_interleave: env_bool("PLOW_QWEN_KV_INTERLEAVE"),
             qwen_prefill: std::env::var("PLOW_QWEN_PREFILL").ok(),

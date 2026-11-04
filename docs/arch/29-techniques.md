@@ -821,13 +821,15 @@ Status: CUDA only.
 
 ### N-concatenated projections (derived weights)
 
-What it computes: projections that read the same activation (gate|up, q|gate|k|v) as one GEMM
+What it computes: projections that read the same activation (gate|up, q|gate|k|v, the
+linear-attention in_proj qkv|z) as one GEMM
 over their weights concatenated along N, block-scale grids concatenated the same way; consumers
 read their columns of the one row-pitched output.
-Examples: the block-scaled FP8 Qwen3.5-style dense MLP and full-attention projections.
+Examples: the block-scaled FP8 Qwen3.5-style dense MLP, full-attention and GDN input projections.
 Packet ABI: `derived_weights.json` (`crates/plow-asset/src/derived_weights.rs`) lists each `cat/`
 tensor's checkpoint sources (axis 0, optional BF16 -> F32 widen); `GluPitched` (230); the row
-pitch of `QwenQGateSplit` (`i3`) and `QwenHeadNormRope` (`j1` = pitch | column << 16). Emit:
+pitch of `QwenQGateSplit` (`i3`), `QwenHeadNormRope`, `QwenGdnConv`, `QwenGdnConvPrefill` and
+`QwenGatedNorm` (`j1` = pitch | column << 16; the conv reads columns from 0, the gated norm its z). Emit:
 `PLOW_FP8_BLOCK_CONCAT`. Runtime contract 4: a packet using any of these declares it and a
 runtime that cannot serve them refuses the packet at load.
 Kernels and objects: the loader assembles `cat/` tensors (`asset/checkpoint.rs`), the cuBLASLt
@@ -1141,5 +1143,5 @@ Runtime features that exist on CUDA and are absent or partial on AMD (`exec/amd*
 | Spec ride (`PLOW_SPEC_RIDE`, drafts riding the prefill launch) | `exec/gpu/spec*.rs` | none (no spec decode on AMD) | spec decode on AMD first |
 | Packed admission, in-flight prefix wait (`PLOW_PREFIX_INFLIGHT_WAIT`), chunk publish | `exec/gpu/prefix.rs`, CUDA packed prefill | none found in `exec/amd*` | the block store's in-flight publish; AMD packed admission in `exec/amd/packed.rs` |
 | Stage fusion: decode router windows as light launches (`plow_<arch>_light_router`) | `exec/gpu/cublaslt.rs` (light router), `interp_sm120.cu:4119`; merge 1a1f1e06f | none (`light_router` absent from `runtime/amd`, `exec/amd*`) | an AMD light-launch kernel for the router window opcodes (`plow_light_router_ops` set) and host launch between hipBLASLt GEMMs in `amd_gemm_lt.rs` |
-| Prefix-cache host tier | block store host slab, `host_tier_default` | present: `shared_prefix.rs:464-494` arms an AMD host tier from `vmm_host_cache_bytes()` (snapshot host tier, `0`/unset = off) | align the default (CUDA auto-sizes; AMD off unless set) after the block store lands |
+| Prefix-cache host tier | block store host slab, `host_tier_default` | present: `shared_prefix.rs:464-494` arms an AMD host tier from `host_kvcache_bytes()` (snapshot host tier, `0`/unset = off) | align the default (CUDA auto-sizes; AMD off unless set) after the block store lands |
 | Live KV (frontier-committed KV, `PLOW_VMM_LIVE`) | `live_kv` section, 4096-row commit blocks | present: `SharedPrefix::ensure_rows` (`shared_prefix.rs:528`) and `PLOW_VMM_KV` (VMM KV on ROCr) | parity exists in substance; the packet `live_kv` section is CUDA-read (not verified on AMD) |

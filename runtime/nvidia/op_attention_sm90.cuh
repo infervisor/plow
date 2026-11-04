@@ -207,7 +207,8 @@ __device__ __forceinline__ void fa90_wgmma_m64n64k16_tb1(float* d, uint64_t da, 
 }
 
 /* Generic (STS) writes into smem must be published to the ASYNC proxy before wgmma reads them.
- * cp.async lands in the async proxy already, but Ps is stored from registers. */
+ * Plain cp.async is generic proxy too (only TMA lands in the async proxy): the fence after
+ * barrier (A) covers the cp.async Q/K/V stages, the one after barrier (B) the stored Ps. */
 __device__ __forceinline__ void fa90_async_proxy_fence() {
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }

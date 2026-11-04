@@ -653,7 +653,7 @@ generated-kernel digests in `segment_roles.json` are not reproducible across nvc
 These change what is measured and are easy to leave set from a previous probe. `pb_hazard_env`
 **warns** on each one it finds inherited (it does not refuse) and bumps the warning count, so
 `plowbench-doctor.sh` exits 2. Declare an intentional one to silence it:
-`PB_ALLOW_HAZARD="PLOW_TICK_LOG PLOW_GLM_ROWBAND"`.
+`PB_ALLOW_HAZARD="PLOW_TICK_LOG PLOW_ROWBAND"`.
 
 | env var | what it silently does |
 |---|---|
@@ -662,7 +662,7 @@ These change what is measured and are easy to leave set from a previous probe. `
 | `PLOW_DECODE_MIN_RUNG` | picks the narrowest decode program. TP engines default to 8 (GLM-5.3 TP8 41.4 vs 51.9 ms at rung 1); single-GPU engines leave it unset. |
 | `PLOW_OBJECTIVE` | pins `latency` or `throughput` scheduling (decode quantum, prefill packing, queue TTL, rung fast probe). Recipes and production leave it at the default `auto`, which switches per tick. |
 | `PLOW_HSACO_LOWRUNG` | swaps a different object tier for narrow rungs. |
-| `PLOW_GLM_ROWBAND`, `PLOW_TICK_LOG` | fine, but both arms of an A/B must agree on them. |
+| `PLOW_ROWBAND`, `PLOW_TICK_LOG` | fine, but both arms of an A/B must agree on them. |
 
 Two more that are not env vars:
 
@@ -764,7 +764,7 @@ Each rule cost at least one campaign a day of misattributed results.
   lines before blaming a build.
 * A serving plowrt with the host tier on auto pins host RAM down to the reserve (default tier
   = `min(MemAvailable − max(total/8, 16 GiB), total/4)`, `memory::vmm::host_tier_default`; the 12B
-  recipe sets `PLOW_VMM_HOST_CACHE_MIB` 64 GiB). An `interp_sm90a` compile takes 22–38 GB per nvcc:
+  recipe sets `PLOW_HOST_KVCACHE_SIZE` 64 GiB). An `interp_sm90a` compile takes 22–38 GB per nvcc:
   never start an emit or a large cargo build beside a serving grid; chain it after.
 * The prefix cache is always on (`PLOW_PREFIX_CACHE`, `PLOW_VMM_PREFIX`); `=0` is an attribution
   A/B, never a recipe or release setting. A prefix-cache cost is a plowrt bug to fix.

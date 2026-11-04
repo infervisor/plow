@@ -1879,7 +1879,8 @@ impl StageProgram {
             | (u32::from(stage.weight_tap_major) << 15)
             | (u32::from(stage.wgmma && stage.split_bf16) << 17)
             | (u32::from(stage.weight_split) << 18)
-            | (u32::from(stage.dual_alpha) << 19);
+            | (u32::from(stage.dual_alpha) << 19)
+            | (u32::from(conv1d_warp(&stage, transpose, out_rows).is_some()) << 16);
         let op = if transpose {
             DevOp::ConvTranspose1dF32
         } else {
@@ -2620,11 +2621,100 @@ fn tensor_bytes(rows: u32, columns: u32, element_bytes: u32) -> Result<u64, Stri
         .ok_or_else(|| "tensor size overflows".into())
 }
 
+/// SP_ARENA_FLOATS of the sm_90a speech object; SPV_ROWS and SPV_KC of `sp_conv1d_rows`
+/// (op_speech_f32.cuh).
+const SPV_ARENA_FLOATS: u64 = 25856;
+const SPV_ROWS: u64 = 32;
+const SPV_KC: u64 = 512;
+
+/// Conv1dF32 flag bit 16 arms (wgmma convs, one group), chosen per conv shape by measurement
+/// (`PLOW_EMIT_CODEC_CONV_ARMS`): `Rows` = at most 32 output rows of a zero-padded conv in
+/// `sp_conv1d_rows` (im2col K-chunks staged in smem, one warp per output channel sharing each
+/// weight across the rows); `Warp` = at most 4 output channels, one warp per output element
+/// (`sp_conv1d_warp`). Unlisted shapes keep the GEMM tiles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConvWarp {
+    Rows,
+    Warp,
+}
+
+/// (batch, in_rows, in_channels, out_channels, kernel, stride, dilation, pad_before, pad_after)
+type ConvShape = [u32; 9];
+
+fn conv_shape(stage: &Conv1dF32Stage<'_>) -> ConvShape {
+    [
+        stage.batch,
+        stage.in_rows,
+        stage.in_channels,
+        stage.out_channels,
+        stage.kernel,
+        stage.stride,
+        stage.dilation_or_output_padding,
+        stage.pad_before,
+        stage.pad_after,
+    ]
+}
+
+/// The measured arm table: one JSON object per line with `shape` (a [`ConvShape`]) and `arm`
+/// (`rows`, `warp` or `tile`); a later line for the same shape wins.
+fn conv_arms() -> &'static std::collections::HashMap<ConvShape, ConvWarp> {
+    static ARMS: std::sync::OnceLock<std::collections::HashMap<ConvShape, ConvWarp>> =
+        std::sync::OnceLock::new();
+    ARMS.get_or_init(|| {
+        let mut arms = std::collections::HashMap::new();
+        let Some(path) = crate::emit_config::active().codec_conv_arms.clone() else {
+            return arms;
+        };
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("codec conv arms {}: {e}", path.display()));
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("codec conv arms {}: {e}", path.display()));
+            let shape: ConvShape = serde_json::from_value(v["shape"].clone())
+                .unwrap_or_else(|e| panic!("codec conv arms shape: {e}"));
+            match v["arm"].as_str() {
+                Some("rows") => arms.insert(shape, ConvWarp::Rows),
+                Some("warp") => arms.insert(shape, ConvWarp::Warp),
+                _ => arms.remove(&shape),
+            };
+        }
+        arms
+    })
+}
+
+fn conv1d_warp(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32) -> Option<ConvWarp> {
+    if !stage.wgmma || transpose || stage.groups != 1 {
+        return None;
+    }
+    let arm = *conv_arms().get(&conv_shape(stage))?;
+    let k = u64::from(stage.in_channels) * u64::from(stage.kernel);
+    let rows = u64::from(stage.batch) * u64::from(out_rows);
+    // The runtime tries Rows first under bit 16, so a Warp choice that also fits Rows runs Rows.
+    if rows <= SPV_ROWS
+        && stage.pad_mode == PadMode::Zero
+        && k % 4 == 0
+        && !stage.weight_f16
+        && rows * SPV_KC <= SPV_ARENA_FLOATS
+    {
+        return Some(ConvWarp::Rows);
+    }
+    (arm == ConvWarp::Warp && stage.out_channels <= 4).then_some(ConvWarp::Warp)
+}
+
 /// Conv1dF32 / ConvTranspose1dF32 slices, mirroring the interpreter's paths (op_speech_f32.cuh
-/// d_conv1d_f32): depthwise 64-row x 64-channel tiles; the direct form per 256 outputs; the GEMM
-/// form 64x64 tiles per (group, phase). `slices` caps the result at the machine.
+/// d_conv1d_f32): bit 16 one warp per output; depthwise 64-row x 64-channel tiles; the direct
+/// form per 256 outputs; the GEMM form 64x64 tiles per (group, phase). `slices` caps the result at the machine.
 fn conv1d_units(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32, n_cu: u32) -> u64 {
     let (batch, cout) = (u64::from(stage.batch), u64::from(stage.out_channels));
+    match conv1d_warp(stage, transpose, out_rows) {
+        Some(ConvWarp::Rows) => return cout.div_ceil(8).min(u64::from(n_cu)),
+        Some(ConvWarp::Warp) => {
+            return (batch * u64::from(out_rows) * cout)
+                .div_ceil(8)
+                .min(u64::from(n_cu))
+        }
+        None => {}
+    }
     let cg = stage.in_channels / stage.groups;
     let ng = stage.out_channels / stage.groups;
     if !transpose && cg == 1 && ng == 1 {

@@ -70,6 +70,18 @@ pub struct Metrics {
     pub slots_capacity: AtomicU64,
     /// Admitted sequences' reserved KV rows over the KV budget, ×1000 (0 without a budget).
     pub kv_used_milli: AtomicU64,
+    /// The co-tenant KV cap admission applies and what the seated sequences reserve, under one
+    /// lock: the manager reads reservations and installs caps between two admissions.
+    pub kv_share: parking_lot::Mutex<KvShareCell>,
+}
+
+/// See [`Metrics::kv_share`].
+#[derive(Default, Debug)]
+pub struct KvShareCell {
+    /// Admission budget cap while co-resident (`None`: the engine's own budget).
+    pub cap: Option<u64>,
+    /// KV bytes the seated sequences reserve, as of the last admission or budget refresh.
+    pub reserved: u64,
 }
 
 impl Metrics {
