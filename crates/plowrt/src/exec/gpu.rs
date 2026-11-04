@@ -4512,6 +4512,7 @@ impl GpuEngine {
                     &blob,
                     serve.manifest.kv.as_ref(),
                     config,
+                    be.compute_capability(),
                     granularity,
                     live_kv_manifest
                         .as_ref()

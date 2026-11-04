@@ -263,7 +263,7 @@ impl BlobPlan {
             ));
         }
         #[cfg(feature = "cuda")]
-        if let Some((granularity, _capability)) = device_vmm {
+        if let Some((granularity, capability)) = device_vmm {
             let config = crate::config::RuntimeConfig::get();
             plan.overhead_bound = plan.overhead_bound.saturating_add(seg_graph_bound(&blob));
             let manifest = match narrowed {
@@ -285,6 +285,7 @@ impl BlobPlan {
                     &blob,
                     kv.as_ref(),
                     config,
+                    capability,
                     granularity,
                     manifest
                         .as_ref()

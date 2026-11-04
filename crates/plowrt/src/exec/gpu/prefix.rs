@@ -213,6 +213,7 @@ impl GpuEngine {
         blob: &DevBlob,
         kv: Option<&plow_asset::serve_manifest::KvGeometry>,
         config: &RuntimeConfig,
+        capability: (u32, u32),
         granularity: u64,
         row_interleaved: Option<bool>,
     ) -> Option<VmmPrefixLayout> {
@@ -225,10 +226,16 @@ impl GpuEngine {
             return declined("encoder overlay rows are not keyed by the prompt ids");
         }
         let requested = config.nv_vmm_prefix();
+        // GB202 (sm_120) auto-selects the cache for every packet with a layout, rank groups
+        // included. Hopper keeps the geometry allowlist it was qualified on; other targets
+        // need an explicit PLOW_VMM_PREFIX=1.
+        let gb202 = capability == (12, 0);
         if requested == Some(false)
             || (requested.is_none()
-                && (config.nv_vmm_live()
+                && ((capability != (9, 0) && !gb202)
+                    || config.nv_vmm_live()
                     || config.nv_vmm_live_rings() == Some(true)
+                    || (blob.tp.is_some() && !gb202)
                     || blob.sections.iter().any(|section| {
                         matches!(
                             section.name.as_str(),
@@ -241,32 +248,69 @@ impl GpuEngine {
             return declined(if requested == Some(false) {
                 "PLOW_VMM_PREFIX=0"
             } else {
-                "auto mode: live KV/rings or a mixed-step/decode-object packet"
+                "auto mode: not Hopper/GB202, live KV/rings, TP off GB202, or a mixed-step/decode-object packet"
             });
         }
         let Some(layout) = Self::vmm_prefix_layout(blob, kv, row_interleaved) else {
             return declined("no VMM prefix KV layout for this packet");
         };
-        // KV element widths the snapshot path stores (BF16 rows, FP8 rows with per-token-head
-        // scales). Auto and explicit selection share this validity check; there is no
-        // per-geometry allowlist: the prefix cache is on for every packet with a layout.
-        let g = &layout.geo;
-        if !matches!(g.elem, 1 | 2) || !matches!(g.elem_slide, 1 | 2) {
-            return declined("KV element width outside the snapshot path (1 or 2 bytes)");
+        if gb202 {
+            // KV element widths the snapshot path stores (BF16 rows, FP8 rows with
+            // per-token-head scales); no per-geometry allowlist on this target.
+            let g = &layout.geo;
+            if !matches!(g.elem, 1 | 2) || !matches!(g.elem_slide, 1 | 2) {
+                return declined("KV element width outside the snapshot path (1 or 2 bytes)");
+            }
+            tracing::info!(
+                hd_full = g.hd_full,
+                hd_slide = g.hd_slide,
+                window = g.window,
+                kv_elem = g.elem,
+                kv_elem_slide = g.elem_slide,
+                mode = if requested.is_none() {
+                    "auto"
+                } else {
+                    "explicit"
+                },
+                "vmm prefix layout accepted (PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables)"
+            );
+        } else if requested.is_none() {
+            // Auto-selection is an allowlist of the geometry the sliding-ring
+            // snapshot path was qualified on (Gemma 4 hybrid KV), not a
+            // capability probe; other layouts need an explicit PLOW_VMM_PREFIX=1.
+            // FP8 KV (elem 1, per-token-head scales in the snapshot): Gemma-4 12B,
+            // cached and cold multi-turn sessions give the same greedy tokens.
+            let g = &layout.geo;
+            let qualified = matches!(g.elem, 1 | 2)
+                && matches!(g.elem_slide, 1 | 2)
+                && g.hd_full == 512
+                && g.hd_slide == 256
+                // 512: Gemma-4 E4B (KV-shared layers read their source's rings); cached and
+                // cold prompts give identical logprobs (docs/runtime/gemma4-e4b-h100.md).
+                && matches!(g.window, 512 | 1024)
+                && !layout.slide.is_empty()
+                && !blob
+                    .sections
+                    .iter()
+                    .any(|s| s.name == plow_asset::recurrent_state::SECTION)
+                && !blob
+                    .tensors
+                    .iter()
+                    .any(|t| t.name.starts_with("state.") || t.name == "in.active");
+            tracing::info!(
+                selected = qualified,
+                hd_full = g.hd_full,
+                hd_slide = g.hd_slide,
+                window = g.window,
+                kv_elem = g.elem,
+                kv_elem_slide = g.elem_slide,
+                "vmm prefix auto-selection (qualified Hopper hybrid BF16/FP8-KV geometry; \
+                 PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables, =1 forces)"
+            );
+            if !qualified {
+                return declined("auto mode: geometry outside the qualified allowlist");
+            }
         }
-        tracing::info!(
-            hd_full = g.hd_full,
-            hd_slide = g.hd_slide,
-            window = g.window,
-            kv_elem = g.elem,
-            kv_elem_slide = g.elem_slide,
-            mode = if requested.is_none() {
-                "auto"
-            } else {
-                "explicit"
-            },
-            "vmm prefix layout accepted (PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables)"
-        );
         if let Err(e) = layout
             .geo
             .block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)

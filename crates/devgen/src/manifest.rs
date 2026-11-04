@@ -3266,25 +3266,23 @@ pub fn config_header(manifest: &Value) -> String {
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
     out.push_str("/* --- packet and per-object opcode inventory --- */\n");
-    out.push_str(&format!(
-        "#define PLOW_PACKET_REQUIRES_RESIDUAL_F32 {}\n",
-        u8::from(
-            manifest
-                .pointer("/objects/residual_f32/required")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        )
-    ));
+    // Written only when required: an unset define reads as 0 in `#if`, and a packet without the
+    // requirement keeps its pre-existing header bytes.
+    if manifest
+        .pointer("/objects/residual_f32/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("#define PLOW_PACKET_REQUIRES_RESIDUAL_F32 1\n");
+    }
     out.push_str("#define PLOW_PACKET_HAS_TOKEN_BATCH_INVENTORY 1\n");
-    out.push_str(&format!(
-        "#define PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 {}\n",
-        u8::from(
-            manifest
-                .pointer("/objects/xr_partial_f32/required")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        )
-    ));
+    if manifest
+        .pointer("/objects/xr_partial_f32/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("#define PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 1\n");
+    }
     if manifest
         .pointer("/objects/packed_prefill/max_request_rows")
         .is_some()
@@ -3532,10 +3530,11 @@ pub fn config_header(manifest: &Value) -> String {
                  #ifndef PLOW_FA_GF_FULL\n#define PLOW_FA_GF_FULL {v}\n#endif\n"
             ));
         }
-        // A 16-head full-attention group needs the wide softmax reductions on every NVIDIA
-        // arch (op_attention.cuh), not only where the light hd512 object is tuned.
-        if t.get("gf_full").and_then(Value::as_u64) == Some(16)
-            || t.get("gf_light512").and_then(Value::as_u64) == Some(16)
+        // A 16-head full-attention group needs the wide softmax reductions (op_attention.cuh);
+        // sm_90a writes it in its own block below, other qualified targets keep their headers.
+        if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a")
+            && (t.get("gf_full").and_then(Value::as_u64) == Some(16)
+                || t.get("gf_light512").and_then(Value::as_u64) == Some(16))
         {
             out.push_str(
                 "#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n",
@@ -3725,6 +3724,13 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_FA_GF_LIGHT512\n#define PLOW_NV_FA_GF_LIGHT512 {v}\n#endif\n"
                 ));
+            }
+            if t.get("gf_full").and_then(Value::as_u64) == Some(16)
+                || t.get("gf_light512").and_then(Value::as_u64) == Some(16)
+            {
+                out.push_str(
+                    "#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n",
+                );
             }
         }
     }
@@ -4494,7 +4500,7 @@ mod tests {
             m.progs[0].insts.push(norm);
             let plain = build(&m, arch);
             assert!(plain["objects"].get("residual_f32").is_none());
-            assert!(config_header(&plain).contains("#define PLOW_PACKET_REQUIRES_RESIDUAL_F32 0\n"));
+            assert!(!config_header(&plain).contains("PLOW_PACKET_REQUIRES_RESIDUAL_F32"));
             m.progs[0].insts.last_mut().unwrap().i[6] = packet::dev::RESIDUAL_F32_FLAG;
             let required = build(&m, arch);
             assert_eq!(required["objects"]["residual_f32"]["required"], true);

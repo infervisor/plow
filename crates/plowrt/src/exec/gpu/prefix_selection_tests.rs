@@ -116,14 +116,13 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     cfg.nv.vmm_live = false;
     cfg.nv.vmm_live_rings = None;
     cfg.prefix_cache = true;
-    // `_cc`: the decision no longer depends on the GPU; the calls keep naming one.
-    let selected = |blob: &DevBlob, cfg: &RuntimeConfig, _cc: (u32, u32), gran| {
+    let selected = |blob: &DevBlob, cfg: &RuntimeConfig, cc, gran| {
         let kv = plow_asset::serve_manifest::KvGeometry::from_config(&dir);
-        GpuEngine::select_vmm_prefix_layout(blob, kv.as_ref(), cfg, gran, Some(false)).is_some()
+        GpuEngine::select_vmm_prefix_layout(blob, kv.as_ref(), cfg, cc, gran, Some(false)).is_some()
     };
     assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
     assert!(selected(&blob, &cfg, (12, 0), 2 << 20));
-    assert!(selected(&blob, &cfg, (8, 9), 2 << 20));
+    assert!(!selected(&blob, &cfg, (8, 9), 2 << 20));
     assert!(!selected(&blob, &cfg, (9, 0), 16 << 20));
     cfg.nv.vmm_live = true;
     assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
@@ -167,9 +166,10 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
         blob.sections.pop();
     }
     blob.tensors.push(tensor("state.qwen.0.gdn", 64));
+    assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
     assert!(
-        selected(&blob, &cfg, (9, 0), 2 << 20),
-        "recurrent-state packets take the cache in auto mode as they do when forced"
+        selected(&blob, &cfg, (12, 0), 2 << 20),
+        "recurrent-state packets take the cache in GB202 auto mode as they do when forced"
     );
     blob.tensors.pop();
     blob.tensors[3].bytes /= 2;
@@ -201,8 +201,8 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Auto mode takes the prefix cache for a dense hd128 packet (Qwen3 / SmolLM / ASR decoders),
-/// not only for the hybrid sliding + full geometry.
+/// GB202 auto mode takes the prefix cache for a dense hd128 packet (Qwen3 / SmolLM / ASR
+/// decoders), not only for the hybrid sliding + full geometry.
 #[test]
 fn automatic_prefix_selection_covers_dense_hd128() {
     let dir = std::env::temp_dir().join(format!("plow-prefix-dense-{}", std::process::id()));
@@ -258,12 +258,15 @@ fn automatic_prefix_selection_covers_dense_hd128() {
     cfg.nv.vmm_live_rings = None;
     cfg.prefix_cache = true;
     let kv = plow_asset::serve_manifest::KvGeometry::from_config(&dir);
-    let selected = |cfg: &RuntimeConfig| {
-        GpuEngine::select_vmm_prefix_layout(&blob, kv.as_ref(), cfg, 2 << 20, Some(false)).is_some()
+    let selected = |cfg: &RuntimeConfig, cc| {
+        GpuEngine::select_vmm_prefix_layout(&blob, kv.as_ref(), cfg, cc, 2 << 20, Some(false))
+            .is_some()
     };
     // One head window (8192 rows x 256 B) is one 2 MiB granule.
-    assert!(selected(&cfg));
+    assert!(selected(&cfg, (12, 0)));
+    // Hopper keeps its qualified hybrid-geometry allowlist.
+    assert!(!selected(&cfg, (9, 0)));
     cfg.prefix_cache = false;
-    assert!(!selected(&cfg));
+    assert!(!selected(&cfg, (12, 0)));
     std::fs::remove_dir_all(dir).unwrap();
 }
