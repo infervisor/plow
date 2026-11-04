@@ -15,7 +15,7 @@ use packet::devbuild::{lean_attn_res_f32mix_inst64, static_seg_ofs, ProgramRole}
 use serde::Serialize;
 
 use super::kv_layout::kv_tensor_name;
-use crate::asset::devblob::{DevBlob, DevProg};
+use crate::asset::devblob::{DevBlob, DevProg, DevTensor};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
 use crate::exec::amd::packed::validate_rows as validate_amd_packed_rows;
@@ -8573,6 +8573,68 @@ fn select_vmm_kv(configured: Option<bool>, required: bool) -> bool {
     configured.unwrap_or(required)
 }
 
+struct TensorSlabLayout {
+    offsets: Vec<Option<u64>>,
+    bytes: u64,
+    resident_bytes: u64,
+}
+
+fn tensor_slab_layout(
+    tensors: &[DevTensor],
+    owned: impl Fn(usize, &str) -> bool,
+    weights_only: bool,
+) -> TensorSlabLayout {
+    let mut layout = TensorSlabLayout {
+        offsets: vec![None; tensors.len()],
+        bytes: 0,
+        resident_bytes: 0,
+    };
+    for (id, tensor) in tensors.iter().enumerate() {
+        if !owned(id, &tensor.name) {
+            continue;
+        }
+        let bytes = slab_carve(tensor.bytes);
+        layout.resident_bytes += bytes;
+        if !weights_only || packet::names::is_checkpoint_weight(&tensor.name) {
+            layout.offsets[id] = Some(layout.bytes);
+            layout.bytes += bytes;
+        }
+    }
+    layout
+}
+
+impl TensorSlabLayout {
+    fn check_available(&self, available: u64) -> Result<()> {
+        if self.resident_bytes > available {
+            return Err(RuntimeError::Rejected(format!(
+                "AMD unallocated tensor storage requires {} bytes, but only {available} bytes are available after KV mapping; re-emit with fewer decode slots or a lower max_ctx",
+                self.resident_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_capacity(&self, capacity: u64, committed_kv: u64) -> Result<()> {
+        if capacity == 0 {
+            return Ok(());
+        }
+        let required = self
+            .resident_bytes
+            .checked_add(committed_kv)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(
+                    "AMD resident tensor storage exceeds the address space".into(),
+                )
+            })?;
+        if required > capacity {
+            return Err(RuntimeError::Rejected(format!(
+                "AMD tensor storage requires at least {required} bytes after KV mapping, but device capacity is {capacity} bytes; re-emit with fewer decode slots or a lower max_ctx"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl AmdEngine {
     pub fn overlap_evidence(&self, rank: usize) -> AmdOverlapRankEvidence {
         let range = |name: String, address_space, start, len: u64| AmdOwnedRange {
@@ -12318,7 +12380,7 @@ impl AmdEngine {
         };
         prefetch_ahead(&mut pf, depth);
 
-        // ---- one allocation for every tensor that would otherwise get its own
+        // RDNA carves checkpoint weights only; other architectures keep the mixed arena.
         //
         // Both passes below must agree, tensor for tensor, on which tensors are
         // carved and how much each consumes: the sizing pass decides how big the
@@ -12361,22 +12423,23 @@ impl AmdEngine {
         } else {
             vec![None; blob.tensors.len()]
         };
-        let carved = |id: usize, name: &str| {
+        let owned = |id: usize, name: &str| {
             !is_peer_slot(name)
                 && !is_band_view(name)
                 && cache_va[id].is_none()
                 && twins[id].is_none()
                 && (rowband_on || !rb_twin[id])
         };
-        // Slab offset of every carved tensor, so a column shard can view a full twin declared after it.
-        let mut carve_at = vec![None; blob.tensors.len()];
-        let mut slab_bytes: u64 = 0;
-        for (id, td) in blob.tensors.iter().enumerate() {
-            if carved(id, &td.name) {
-                carve_at[id] = Some(slab_bytes);
-                slab_bytes += slab_carve(td.bytes);
+        let weights_only = arch == "gfx1201";
+        let layout = tensor_slab_layout(&blob.tensors, owned, weights_only);
+        if weights_only {
+            layout.check_capacity(be.vram_bytes(), vmm.as_ref().map_or(0, VmmKv::mapped_bytes))?;
+            if let Some(available) = crate::memory::vmm::VmmOps::free_bytes(&*be) {
+                layout.check_available(available)?;
             }
         }
+        let slab_bytes = layout.bytes;
+        let carve_at = layout.offsets;
 
         // ---- EVERY checkpoint weight is RESOLVED before a byte is uploaded
         //
@@ -12563,7 +12626,7 @@ impl AmdEngine {
                 // gather, memset tail) starts after the carve, so this one
                 // wait point covers them all. The mapper outruns the upload,
                 // so the wait is ~0 after the first chunk.
-                (None, WeightSlab::Vmm(slab)) => {
+                (None, WeightSlab::Vmm(slab)) if carve_at[i].is_some() => {
                     let off = slab_off;
                     slab_off += slab_carve(td.bytes);
                     slab.wait_mapped(slab_off)?;
@@ -12572,12 +12635,12 @@ impl AmdEngine {
                 // Carve from the one allocation, in blob order. The sizing pass
                 // walked this same list with the same filter and the same
                 // `slab_carve`, so the cursor cannot run past the end.
-                (None, WeightSlab::Flat(slab)) => {
+                (None, WeightSlab::Flat(slab)) if carve_at[i].is_some() => {
                     let m = slab.subview(slab_off, td.bytes.max(1))?;
                     slab_off += slab_carve(td.bytes);
                     m
                 }
-                (None, WeightSlab::PerTensor) => {
+                (None, _) => {
                     let t = Instant::now();
                     let m = EngineDevice::alloc(&*be, td.bytes.max(1))?;
                     LoadProf::add(&prof.alloc_ns, t);
@@ -12850,7 +12913,7 @@ impl AmdEngine {
             // saving is read off `MEMORY_AVAIL` by whoever is measuring.
             tracing::info!(
                 slab_mib = slab_bytes / (1 << 20),
-                carved = devp.len() - n_view,
+                carved = carve_at.iter().filter(|offset| offset.is_some()).count(),
                 views = n_view,
                 "weights carved from one allocation"
             );
@@ -20366,6 +20429,10 @@ impl AmdEngine {
     /// Segment count for program `p`.
     pub fn prog_segments(&self, p: usize) -> usize {
         self.progs[p].seg_class.len()
+    }
+
+    pub fn prefill_launches(&self, p: usize) -> usize {
+        self.prog_dispatch(p).launches()
     }
 
     /// Ordered host launches and their device-side XCD queue layout.

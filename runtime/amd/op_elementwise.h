@@ -288,6 +288,18 @@ __device__ void d_embed(bf16* __restrict__ out, const bf16* __restrict__ table,
     }
 }
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+__device__ void d_embed_residual_f32(float* out, const bf16* table, const int* ids,
+                                    unsigned rows, unsigned feat, float scale,
+                                    unsigned slice, unsigned nblk) {
+    auto* dst = as_glob(out);
+    const auto* src = as_glob(table);
+    for (unsigned row = slice; row < rows; row += nblk)
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS)
+            dst[(size_t)row * feat + i] = bf2f(src[(size_t)ids[row] * feat + i]) * scale;
+}
+#endif
+
 /* Compact hidden-row gather — the unified token batch's terminal row selection.
  *
  * out[s][h] = x[rows[s]][h], for s in [0, S), over H features.

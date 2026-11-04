@@ -798,6 +798,15 @@ extern "C" __device__ unsigned plow_mla_bmm_head_stride_1 = 1;
 extern "C" __device__ unsigned plow_opcode_sum4_bf16_1 = 1;
 #endif
 extern "C" __device__ unsigned plow_glu_silu_bf16_1 = 1;
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+extern "C" __device__ unsigned plow_residual_f32_1 = 1;
+#endif
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+#if PLOW_XR_TAGGED
+#error "FP32 peer partials require the gate one-shot collective"
+#endif
+extern "C" __device__ unsigned plow_xr_partial_f32_1 = 1;
+#endif
 extern "C" __device__ unsigned plow_opcode_zero_f32_1 = 1;
 #if PLOW_CDNA4 && PLOW_HAS_MOE_GLU_FP8_BLOCK128
 extern "C" __device__ unsigned plow_opcode_moe_glu_fp8_block128_1 = 1;
@@ -4197,6 +4206,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_RMSNORM
         case PLOW_DOP_RMSNORM:
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+            if (in->i[6] & PLOW_RESIDUAL_F32_FLAG) {
+                d_rmsnorm_residual_f32((bf16*)TEN(0), (const float*)TEN(1), (const bf16*)TEN(2),
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, slice, nblk, sm->part);
+                break;
+            }
+#endif
             if (in->i[3] == 1) {
 #if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
                 if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
@@ -4409,6 +4425,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_NORM_RESIDUAL
         case PLOW_DOP_NORM_RESIDUAL:
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+            if (in->i[6] & PLOW_RESIDUAL_F32_FLAG) {
+                d_norm_residual_f32((float*)TEN(0), (const float*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), PLOW_RUNTIME_ROWS(in->i[0]), in->i[1],
+                    in->fj[0].f, in->fj[1].f, slice, nblk, sm->part);
+                break;
+            }
+#endif
             d_norm_residual((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                             (const bf16*)TEN(3), PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, in->fj[1].f, slice,
                             nblk, sm->part);
@@ -4444,6 +4468,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_NORM_RESIDUAL_NORM
         case PLOW_DOP_NORM_RESIDUAL_NORM:
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+            if (in->i[6] & PLOW_RESIDUAL_F32_FLAG) {
+                d_norm_residual_norm_f32((bf16*)TEN(0), (float*)TEN(1), (const float*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, in->fj[1].f,
+                    slice, nblk, sm->part);
+                break;
+            }
+#endif
             d_norm_residual_norm((bf16*)TEN(0), (bf16*)TEN(1), (const bf16*)TEN(2),
                                  (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
                                  in->i[0], in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, sm->part);
@@ -4459,6 +4492,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_EMBED
         case PLOW_DOP_EMBED:
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+            if (in->i[6] & PLOW_RESIDUAL_F32_FLAG) {
+                d_embed_residual_f32((float*)TEN(0), (const bf16*)TEN(1), (const int*)TEN(2),
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, slice, nblk);
+                break;
+            }
+#endif
             d_embed((bf16*)TEN(0), (const bf16*)TEN(1), (const int*)TEN(2), PLOW_RUNTIME_ROWS(in->i[0]), in->i[1],
                     in->fj[0].f, slice, nblk);
             break;
@@ -7545,6 +7585,18 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             } else
 #endif
             { /* the else-arm is this whole block: the tagged arm opens with its own `if` */
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+            if (in->fj[0].u == PLOW_XREDUCE_PARTIAL_F32_MARK)
+                d_xreduce_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu, prog.rank,
+                               in->i[0], in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS,
+                               xaudit, e.slice, in->blocks, 0u, 0u, 0u
+#if PLOW_XR_TRACE_PHASES
+                               , prog.trace ? &prog.trace[base + ix] : nullptr
+#endif
+                               , true);
+            else
+#endif
+            {
 #if PLOW_XR_TAGGED
             /* Tagged one-shot (op_collective.h): the arrival signal rides in the data. The
              * region sits right after the compact-audit status line, whose id the TP loader
@@ -7593,6 +7645,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
 #endif
                            );
 #endif
+            }
             }
         } else if (in->op == PLOW_DOP_XREDUCE_ADD_NORM) {
             /* Fused all-reduce + residual + RMSNorm (op 116, one workgroup):

@@ -6,6 +6,7 @@
 //! seated from the image with the first token already sampled: that rank streams it, then
 //! decodes as if it had prefilled the prompt itself.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -13,9 +14,10 @@ use tokio::sync::oneshot;
 
 use std::time::Instant;
 
+use crate::obs::Metrics;
 use crate::serve::dp::{DpSet, MAX_DP};
 use crate::serve::mux::{IngressGuard, Job, JobOpts, ModelMux, SubmitError};
-use crate::serve::stream::{self, StreamChunk};
+use crate::serve::stream::{self, FinishReason, StreamChunk};
 use crate::serve::AppState;
 use crate::RuntimeError;
 
@@ -30,14 +32,16 @@ pub struct KvImage {
 /// Where a prefill job's image goes when its slot finishes.
 pub struct KvExport {
     tx: Mutex<Option<oneshot::Sender<crate::Result<KvImage>>>>,
+    outcome: Arc<Outcome>,
 }
 
 impl KvExport {
-    pub fn new() -> (Arc<Self>, oneshot::Receiver<crate::Result<KvImage>>) {
+    pub fn new(outcome: Arc<Outcome>) -> (Arc<Self>, oneshot::Receiver<crate::Result<KvImage>>) {
         let (tx, rx) = oneshot::channel();
         (
             Arc::new(Self {
                 tx: Mutex::new(Some(tx)),
+                outcome,
             }),
             rx,
         )
@@ -60,8 +64,58 @@ impl KvExport {
 pub struct KvImport {
     pub image: KvImage,
     pub token: u32,
+    /// The request's arrival, and when the prefill rank streamed the first token: the decode
+    /// rank's e2e and SLO count from them.
+    pub arrived: Instant,
+    pub first: Instant,
+    pub outcome: Arc<Outcome>,
     /// Prompt rows the prefill rank served from its prefix cache (`usage.cached_tokens`).
     pub cached_tokens: usize,
+}
+
+/// A P/D request's terminal outcome until its decode leg owns it. Settled by whoever counts it:
+/// the decode leg's telemetry, a rank's refusal of either leg, a failed handoff, a preempted
+/// prefill. The prefill leg's telemetry counts none; dropped unsettled (a cancellation, a failed
+/// prefill, a job never seated) it counts one abort on the prefill rank.
+pub struct Outcome {
+    metrics: Arc<Metrics>,
+    arrived: Instant,
+    open: AtomicBool,
+}
+
+impl Outcome {
+    pub fn new(metrics: Arc<Metrics>, arrived: Instant) -> Arc<Self> {
+        Arc::new(Self {
+            metrics,
+            arrived,
+            open: AtomicBool::new(true),
+        })
+    }
+
+    pub fn settle(&self) {
+        self.open.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Outcome {
+    fn drop(&mut self) {
+        if *self.open.get_mut() {
+            let m = &self.metrics.serving;
+            Metrics::inc(&m.aborted);
+            Metrics::inc(&m.aborted_before_first);
+            m.aborted_elapsed.duration(self.arrived.elapsed());
+        }
+    }
+}
+
+/// A rank counted `job`'s end (a refusal or a queue expiry): a P/D leg's request is settled.
+pub(crate) fn settle_refused(job: &Job) {
+    if let Some(x) = &job.opts.export {
+        x.outcome.settle();
+    }
+    if let Some(i) = &job.opts.import {
+        i.outcome.settle();
+    }
 }
 
 /// `--pd model=P/D`: the DP ranks of each pool, as bit masks over the model's ranks.
@@ -149,7 +203,8 @@ pub(crate) fn submit(
     }
     // The prefill rank samples the first token and nothing else: no stop handling, no thinking
     // control (the decode rank commits the token through both), its id streamed raw.
-    let (sink, image) = KvExport::new();
+    let outcome = Outcome::new(Arc::clone(mux.metrics()), arrived);
+    let (sink, image) = KvExport::new(Arc::clone(&outcome));
     let (ptx, mut prx) = stream::channel();
     let mut gen = job.gen.clone();
     gen.max_tokens = 1;
@@ -172,6 +227,8 @@ pub(crate) fn submit(
         },
     };
     if let Err(e) = mux.submit_arrived(prefill, arrived, ingress) {
+        // The refusal is the caller's to retry or report, as for a whole request.
+        outcome.settle();
         let (SubmitError::Full(p) | SubmitError::Closed(p)) = &e;
         job.opts.prefix = p.opts.prefix.clone();
         return Err(match e {
@@ -181,13 +238,15 @@ pub(crate) fn submit(
     }
     let set = state.dp_set(&set.model).map(Arc::clone);
     tokio::spawn(async move {
-        let fail = |job: &Job, msg: String| {
+        let fail = |job: &Job, outcome: &Outcome, msg: String| {
+            outcome.settle();
+            Metrics::inc(&outcome.metrics.rejected);
             let _ = job
                 .respond
                 .try_send(StreamChunk::Err(RuntimeError::Unavailable(msg)));
         };
         // A client that leaves stops the handoff: dropping the prefill stream ends that job, and
-        // its dispatcher skips an export nobody waits for.
+        // its dispatcher skips an export nobody waits for. `outcome` counts the abort.
         let (mut first, mut cached_tokens) = (None, 0);
         loop {
             let chunk = tokio::select! {
@@ -198,7 +257,21 @@ pub(crate) fn submit(
                 Some(StreamChunk::Token { id, .. })
                     if first.is_none() && id != stream::TEXT_ONLY =>
                 {
-                    first = Some(id)
+                    first = Some((id, Instant::now()))
+                }
+                Some(StreamChunk::Done {
+                    reason: FinishReason::Preempted,
+                    executed,
+                    usage,
+                }) => {
+                    outcome.settle();
+                    Metrics::inc(&outcome.metrics.serving.preempted);
+                    let _ = job.respond.try_send(StreamChunk::Done {
+                        executed,
+                        reason: FinishReason::Preempted,
+                        usage,
+                    });
+                    return;
                 }
                 Some(StreamChunk::Done { usage, .. }) => cached_tokens = usage.cached_tokens,
                 Some(StreamChunk::Err(err)) => {
@@ -215,33 +288,52 @@ pub(crate) fn submit(
         };
         let image = match (first, image) {
             (Some(_), Ok(Ok(image))) => image,
-            (None, _) => return fail(&job, "P/D: the prefill rank produced no token".into()),
-            (_, Ok(Err(err))) => return fail(&job, format!("P/D: KV export failed: {err}")),
-            (_, Err(_)) => return fail(&job, "P/D: the prefill rank dropped the KV image".into()),
+            (None, _) => {
+                let msg = "P/D: the prefill rank produced no token".into();
+                return fail(&job, &outcome, msg);
+            }
+            (_, Ok(Err(err))) => {
+                return fail(&job, &outcome, format!("P/D: KV export failed: {err}"))
+            }
+            (_, Err(_)) => {
+                let msg = "P/D: the prefill rank dropped the KV image".into();
+                return fail(&job, &outcome, msg);
+            }
         };
         if job.respond.is_closed() {
             return;
         }
         let Some(set) = set else {
-            return fail(&job, "P/D: the model's DP set is gone".into());
+            return fail(&job, &outcome, "P/D: the model's DP set is gone".into());
         };
         let sampled = job.gen.params.samples();
         let Some(routed) = set.route_decode(&cfg, sampled) else {
-            return fail(&job, "P/D: no decode rank is up".into());
+            return fail(&job, &outcome, "P/D: no decode rank is up".into());
         };
         let Some((_, mux)) = decoders.iter().find(|(r, _)| *r == routed.rank) else {
-            return fail(&job, "P/D: the decode rank has no dispatcher".into());
+            let msg = "P/D: the decode rank has no dispatcher".into();
+            return fail(&job, &outcome, msg);
         };
+        let (token, first) = first.expect("matched Some");
         job.opts.import = Some(Box::new(KvImport {
             image,
-            token: first.expect("matched Some"),
+            token,
+            arrived,
+            first,
             cached_tokens,
+            outcome,
         }));
         // The decode queue's clock starts now; `job.arrived` keeps the request's own.
         if let Err(SubmitError::Full(job) | SubmitError::Closed(job)) =
             mux.submit_arrived(job, Instant::now(), None)
         {
-            fail(&job, "P/D: the decode rank refused the request".into());
+            // The decode rank counted its refusal.
+            settle_refused(&job);
+            let _ = job
+                .respond
+                .try_send(StreamChunk::Err(RuntimeError::Unavailable(
+                    "P/D: the decode rank refused the request".into(),
+                )));
         }
         drop(routed);
     });
@@ -280,8 +372,24 @@ mod tests {
     }
 
     #[test]
+    fn an_unsettled_outcome_is_one_abort() {
+        let m = Arc::new(Metrics::default());
+        let open = || Outcome::new(Arc::clone(&m), Instant::now());
+        let (sink, _rx) = KvExport::new(open());
+        drop(sink);
+        let shared = open();
+        let (sink, _rx) = KvExport::new(Arc::clone(&shared));
+        sink.outcome.settle();
+        drop((sink, shared));
+        assert_eq!(
+            m.serving.aborted.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
     fn an_export_reaches_its_receiver_once() {
-        let (sink, mut rx) = KvExport::new();
+        let (sink, mut rx) = KvExport::new(Outcome::new(Arc::default(), Instant::now()));
         assert!(sink.wanted());
         sink.deliver(Ok(KvImage {
             key: "k".into(),

@@ -38,6 +38,10 @@
 
 #include <stdint.h>
 
+/* i[6] on Embed, RmsNorm, NormResidual and NormResidualNorm. */
+enum { PLOW_RESIDUAL_F32_FLAG = 2u };
+enum { PLOW_XREDUCE_PARTIAL_F32_MARK = 0x46333250u };
+
 #ifdef __cplusplus
 #define PLOW_SASSERT(c, m) static_assert(c, m)
 #else

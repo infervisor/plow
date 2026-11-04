@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build recipes/infervisor/nemotron-3.5-asr/{sm89-l4,sm89-l40s,sm90a-h100}-tp1.toml: the RNNT packet
 # pipeline (offline buckets + cache-aware stream programs) and the speech object beside it. Run inside
-# `nix develop`. <n_cu>: 58 (L4, default), 142 (L40S) or 132 (H100); <arch>: sm_89 (default) or sm_90a.
+# `nix develop`. <n_cu>: 58 (L4, default), 142 (L40S), 132 (H100) or 188 (RTX PRO 6000); <arch>: sm_89 (default),
+# sm_90a or sm_120a.
 #
 #   scripts/asr/nvidia/nemotron_l4_build.sh <nemotron-3.5-asr-streaming-0.6b.q8_0.gguf> <fresh dir> [n_cu] [arch]
 set -euo pipefail
@@ -12,7 +13,8 @@ arch=${4:-sm_89}
 case $arch in
   sm_89) obj=PLOW_SM89_CUBIN stem=interp_sm89 ;;
   sm_90a) obj=PLOW_SM90A_CUBIN stem=interp_sm90a ;;
-  *) echo "arch $arch: sm_89 or sm_90a" >&2; exit 2 ;;
+  sm_120a) obj=PLOW_SM120_CUBIN stem=interp_sm120 ;;
+  *) echo "arch $arch: sm_89, sm_90a or sm_120a" >&2; exit 2 ;;
 esac
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 buckets=200,400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800,3000

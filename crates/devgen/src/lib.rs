@@ -98,10 +98,12 @@ mod mxfp4_moe_role;
 mod object_requirements;
 pub mod pipeline;
 mod projection_rewrite;
+mod residual_precision;
 mod rewrite_lower;
 pub mod rnnt;
 pub mod s3gen;
 pub mod segment_resource;
+mod tp_precision;
 pub mod tts;
 pub mod tune_demand;
 pub mod vad;
@@ -9191,6 +9193,19 @@ fn apply_production_defaults(
         && tp == 1
         && !cfg.fp8_kv
         && (arch == "sm_90a" || (arch == "gfx942" && !cfg.any_fp8_weights()));
+    // FP8-KV segmented prefill runs only through the packed request contract (plowrt refuses the
+    // packet otherwise), W8A8 included, so a segmented FP8-KV emit on a packed-request CUDA
+    // target carries it unless the recipe says otherwise.
+    if cfg.fp8_kv
+        && !cfg.uniseg
+        && tp == 1
+        && capabilities.dense_packet_contracts
+        && nv_packed_request_arch(arch)
+        && cfg.emit_packed_prefill.is_none()
+    {
+        cfg.emit_packed_prefill = Some(true);
+        emit_config::note_production_default("emit_packed_prefill", "true".into());
+    }
     // GLM on gfx942: the packed siblings are a SECOND copy of the dense prefill buckets, and the
     // ordinary programs are byte-identical with or without them (`glm_tests`), so the packet
     // can carry them by default. The serve side arms its packed route from their presence.
@@ -9355,6 +9370,11 @@ fn apply_production_defaults(
             }
         }
     }
+}
+
+/// CUDA targets where cuBLASLt has OUTER_VEC (per-row/per-column) FP8 scaling algorithms.
+fn cublaslt_fp8_vector_scale_arch(arch: &str) -> bool {
+    arch == "sm_90a"
 }
 
 /// CUDA targets whose prefill objects carry the packed-request ABI (`PLOW_NV_PACKED_REQUEST`):
@@ -9534,6 +9554,13 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             ),
             "cuBLASLt decode emission requires a supported single-GPU CUDA emitter without decode objects"
         );
+        assert!(
+            !emit_config::active().decode_cublaslt
+                || !emit_config::active().any_fp8_weights()
+                || cublaslt_fp8_vector_scale_arch(&arch),
+            "FP8 cuBLASLt decode needs vector-scale FP8 cuBLASLt algorithms, which only sm_90a has \
+             (cuBLASLt 12.9 returns NOT_SUPPORTED on sm_120a); use the native FP8 decode routes"
+        );
     }
     if emit_config::active().prefill_cublaslt {
         assert!(
@@ -9609,7 +9636,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().decode_objects.is_some() {
         assert!(
-            matches!(arch.as_str(), "sm_90a" | "sm_120") && tp == 1,
+            matches!(arch.as_str(), "sm_90a" | "sm_120" | "sm_120a") && tp == 1,
             "decode objects require a supported single-GPU CUDA target"
         );
         assert!(
@@ -11355,6 +11382,18 @@ fn emit_dense_gqa(
         }
     }
 
+    residual_precision::apply(&mut m, ecfg.residual_f32, &arch)
+        .unwrap_or_else(|error| panic!("residual precision: {error}"));
+    tp_precision::apply(
+        &mut m,
+        ecfg.tp_partial_f32,
+        &arch,
+        [
+            (emitter.tn.og_tp, emitter.tn.og),
+            (emitter.tn.dg_tp, emitter.tn.dg),
+        ],
+    )
+    .unwrap_or_else(|error| panic!("TP partial precision: {error}"));
     let projection_bindings =
         projection_rewrite::apply(&mut m, &ecfg, &gpu, &arch, std::path::Path::new(&out))
             .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));

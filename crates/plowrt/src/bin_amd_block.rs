@@ -11,6 +11,69 @@ use plowrt::{
 
 type Error = Box<dyn std::error::Error>;
 
+pub fn dump_prefill_segments(
+    engine: &mut AmdEngine,
+    prompt: &[u32],
+    inspect: &str,
+    output: &std::path::Path,
+) -> Result<u32, Error> {
+    if prompt.is_empty() || prompt.len() > engine.max_ctx() {
+        return Err("segment dump needs a nonempty prompt within max_ctx".into());
+    }
+    let names = inspect
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let bytes = engine
+                .tensor_bytes(name)
+                .ok_or_else(|| format!("unknown dump tensor {name}"))?;
+            Ok((name, bytes))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    if names.is_empty() {
+        return Err("segment dump needs at least one tensor".into());
+    }
+    let chunks = engine.plan_for(prompt.len() as u32)?;
+    let steps = engine.chunk_steps(&chunks, prompt.len() as u32)?;
+    std::fs::create_dir(output)?;
+    let mut index = Vec::new();
+    for (chunk, step) in steps.into_iter().enumerate() {
+        let step = engine.chunk_program(step);
+        engine.prefill_prepare(prompt, step)?;
+        engine.rearm_prog(step.prog)?;
+        for segment in 0..engine.prefill_launches(step.prog) {
+            engine.enqueue_segment(step.prog, segment)?;
+            engine.drain()?;
+            let dir = output.join(format!("chunk{chunk:03}-segment{segment:03}"));
+            std::fs::create_dir(&dir)?;
+            let mut tensors = Vec::new();
+            for (tensor, &(name, capacity)) in names.iter().enumerate() {
+                let dumped = capacity.min(8 << 20) as usize;
+                let mut bytes = vec![0; dumped];
+                engine.read_tensor(name, &mut bytes)?;
+                let file = format!("tensor{tensor:04}.bin");
+                std::fs::write(dir.join(&file), bytes)?;
+                tensors.push(serde_json::json!({
+                    "name": name, "file": file, "capacity_bytes": capacity, "dumped_bytes": dumped,
+                    "truncated": dumped as u64 != capacity,
+                }));
+            }
+            index.push(serde_json::json!({
+                "chunk": chunk, "program": step.prog, "row0": step.c0,
+                "rows": step.clen, "segment": segment, "tensors": tensors,
+            }));
+        }
+    }
+    let mut id = [0; 4];
+    engine.read_tensor("in.ids", &mut id)?;
+    std::fs::write(
+        output.join("segments.json"),
+        serde_json::to_vec_pretty(&index)?,
+    )?;
+    Ok(u32::from_le_bytes(id))
+}
+
 fn activation_prefix_bytes(
     capacity: u64,
     allocated_rows: usize,

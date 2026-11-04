@@ -107,7 +107,11 @@
 /* The SMALL rung's BK. 128 is the CDNA3 re-cut measured in op_gemm_common.h above GM_SM_BM: 1.10x to
  * 1.56x on every Gemma-4 31B prefill shape, arithmetic-preserving, single-buffered. */
 #ifndef GM_SM_BK
+#if PLOW_GFX12
+#define GM_SM_BK 64
+#else
 #define GM_SM_BK 128
+#endif
 #endif
 /* Scalar (SGPR) GEMV row descriptors: -0.55% ms/token, ranges disjoint, token-identical on the
  * Gemma-4 12B asset (op_gemm_common.h, above PLOW_GV_RSRC). CDNA3 only because it changes codegen

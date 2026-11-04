@@ -44,6 +44,25 @@ pub const WG_THREADS: u32 = WG_WAVES * 64;
 
 pub const TENSOR_NONE: u32 = 0xFFFF_FFFF;
 
+/// i6 bit selecting FP32 residual storage on Embed/RmsNorm/NormResidual/NormResidualNorm.
+/// Normalized operands, branch inputs and norm weights remain BF16. i7 retains existing opcode-specific semantics.
+pub const RESIDUAL_F32_FLAG: u32 = 2;
+
+/// XReduce f0 bit-pattern: FP32 peer partials, one BF16 output store.
+pub const XREDUCE_PARTIAL_F32_MARK: u32 = 0x4633_3250;
+
+pub fn xreduce_partial_f32(op: u16, f0: u32) -> bool {
+    op == DevOp::XReduce as u16 && f0 == XREDUCE_PARTIAL_F32_MARK
+}
+
+pub fn uses_residual_f32(op: u16, flags: u32) -> bool {
+    flags & RESIDUAL_F32_FLAG != 0
+        && matches!(
+            DevOp::from_u16(op),
+            Some(DevOp::Embed | DevOp::RmsNorm | DevOp::NormResidual | DevOp::NormResidualNorm)
+        )
+}
+
 /// `GemmWide.i[7]` tag selecting the gfx950 128x384x64 implementation.
 /// Zero remains the 128x256x64 body, preserving existing packet bytes.
 pub const GEMM_WIDE_C8_TAG: u32 = (128 << 16) | 384;

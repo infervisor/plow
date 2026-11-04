@@ -174,6 +174,16 @@ pub(crate) fn synthesize(
     wide_tiles: bool,
     terminal_gather: bool,
 ) -> Result<SynthesizedMixed> {
+    if blob
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|inst| packet::dev::uses_residual_f32(inst.op, inst.i[6]))
+    {
+        return Err(reject(
+            "FP32 residual state is unsupported by mixed-program synthesis",
+        ));
+    }
     if blob.tp.is_some()
         || physical_batch < 2
         || physical_batch > u32::MAX as usize

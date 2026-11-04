@@ -12,6 +12,68 @@ fn vmm_kv_is_automatic_only_for_an_impossible_flat_slab() {
 }
 
 #[test]
+fn slab_layout_keeps_legacy_arena_and_excludes_external_views() {
+    let tensors = [
+        ("act.x", 1),
+        ("model.layer.weight", 4097),
+        ("kv.0.k", 1 << 20),
+        ("act.og_tp", 1 << 20),
+        ("model.layer.weight@band1", 4096),
+        ("model.empty.weight", 0),
+    ]
+    .map(|(name, bytes)| DevTensor {
+        name: name.into(),
+        bytes,
+        init: None,
+    });
+    let owned = |id, _: &str| !matches!(id, 2 | 3 | 4);
+    let legacy = tensor_slab_layout(&tensors, owned, false);
+    assert_eq!(
+        legacy.offsets,
+        [Some(0), Some(4096), None, None, None, Some(12288)]
+    );
+    assert_eq!(legacy.bytes, 16384);
+    assert_eq!(legacy.resident_bytes, 16384);
+    let weights = tensor_slab_layout(&tensors, owned, true);
+    assert_eq!(
+        weights.offsets,
+        [None, Some(0), None, None, None, Some(8192)]
+    );
+    assert_eq!(weights.bytes, 12288);
+    assert_eq!(weights.resident_bytes, legacy.resident_bytes);
+}
+
+#[test]
+fn slab_capacity_counts_flat_kv_and_scratch_outside_the_weight_slab() {
+    let tensors = [
+        ("model.layer.weight", 22 << 30),
+        ("act.x", 2 << 30),
+        ("kv.0.k", 20 << 30),
+    ]
+    .map(|(name, bytes)| DevTensor {
+        name: name.into(),
+        bytes,
+        init: None,
+    });
+    let flat = tensor_slab_layout(&tensors, |_, _| true, true);
+    assert_eq!(flat.bytes, 22 << 30);
+    assert_eq!(flat.resident_bytes, 44 << 30);
+    assert!(flat.check_capacity(32 << 30, 0).is_err());
+    let vmm = tensor_slab_layout(&tensors, |id, _| id != 2, true);
+    assert_eq!(vmm.bytes, flat.bytes);
+    assert_eq!(vmm.resident_bytes, 24 << 30);
+    assert!(vmm.check_capacity(vmm.resident_bytes, 0).is_ok());
+    assert!(vmm.check_capacity(vmm.resident_bytes - 1, 0).is_err());
+    assert!(vmm.check_capacity(32 << 30, 9 << 30).is_err());
+    assert!(vmm.check_capacity(25 << 30, 1 << 30).is_ok());
+    assert!(vmm.check_capacity((25 << 30) - 1, 1 << 30).is_err());
+    assert!(vmm.check_capacity(0, 9 << 30).is_ok());
+    assert!(vmm.check_available(vmm.resident_bytes).is_ok());
+    assert!(vmm.check_available(vmm.resident_bytes - 1).is_err());
+    assert!(vmm.check_available(0).is_err());
+}
+
+#[test]
 fn map_ahead_rows_covers_the_decode_row_and_the_next_chunk() {
     let max = 202_752;
     assert_eq!(map_ahead_rows(8192, true, None, max), Some(8193));
@@ -590,6 +652,74 @@ fn rounded_silu_requires_its_object_marker() {
         .to_string()
         .contains("plow_glu_silu_bf16_1"));
     assert!(check_compiled_opcode_markers(&["plow_glu_silu_bf16_1"], path, [&p]).is_ok());
+}
+
+#[test]
+fn residual_f32_requires_its_object_marker() {
+    let path = Path::new("interp_prefill.elf");
+    for op in [
+        DevOp::Embed,
+        DevOp::RmsNorm,
+        DevOp::NormResidual,
+        DevOp::NormResidualNorm,
+    ] {
+        let mut p = segmented_prog(&[op], &[0]);
+        assert!(check_compiled_opcode_markers(&[], path, [&p]).is_ok());
+        p.insts[0].i[6] = packet::dev::RESIDUAL_F32_FLAG;
+        assert!(check_compiled_opcode_markers(&[], path, [&p])
+            .unwrap_err()
+            .to_string()
+            .contains("plow_residual_f32_1"));
+        assert!(check_compiled_opcode_markers(&["plow_residual_f32_1"], path, [&p]).is_ok());
+        for role in [
+            packet::devbuild::ProgramRole::PackedSibling { of_rows: 128 },
+            packet::devbuild::ProgramRole::TokenBatchBody { band: 0, rows: 128 },
+        ] {
+            p.role = role;
+            assert!(
+                check_compiled_opcode_markers(&["plow_residual_f32_1"], path, [&p])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("packed/token-batch")
+            );
+        }
+    }
+    let mut p = segmented_prog(&[DevOp::EmbedPosBf16], &[0]);
+    p.insts[0].i[7] = 2;
+    assert!(check_compiled_opcode_markers(&[], path, [&p]).is_ok());
+}
+
+#[test]
+fn residual_f32_preserves_existing_norm_stride_and_gemma3_flags() {
+    let path = Path::new("interp_prefill.elf");
+    for op in [DevOp::RmsNorm, DevOp::NormResidual, DevOp::NormResidualNorm] {
+        for flags in [1, 2, 8194, 131074] {
+            let mut p = segmented_prog(&[op], &[0]);
+            p.insts[0].i[7] = flags;
+            assert!(check_compiled_opcode_markers(&[], path, [&p]).is_ok());
+        }
+    }
+}
+
+#[test]
+fn tp_partial_f32_requires_object_marker_and_plain_geometry() {
+    let path = Path::new("interp_decode.elf");
+    let mut p = segmented_prog(&[DevOp::XReduce], &[0]);
+    p.insts[0].t = [packet::dev::TENSOR_NONE16; 8];
+    p.insts[0].t[0] = 0;
+    p.insts[0].i = [3840, 2, 0, 0, 0, 0, 0, 0];
+    p.insts[0].fj[0] = packet::dev::XREDUCE_PARTIAL_F32_MARK;
+    assert!(check_compiled_opcode_markers(&[], path, [&p])
+        .unwrap_err()
+        .to_string()
+        .contains("plow_xr_partial_f32_1"));
+    let syms = ["plow_xr_partial_f32_1"];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    p.insts[0].i[5] = 8;
+    assert!(check_compiled_opcode_markers(&syms, path, [&p])
+        .unwrap_err()
+        .to_string()
+        .contains("invalid FP32 peer"));
 }
 
 #[test]
