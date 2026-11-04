@@ -572,6 +572,58 @@ pub fn slice_for_as<'a>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn fused_channel_scales_follow_each_rank_weight_rows() {
+        let (experts, intermediate, hidden) = (3usize, 8usize, 2usize);
+        let rows = experts * 2 * intermediate;
+        let weights: Vec<u8> = (0..rows).flat_map(|row| [row as u8; 2]).collect();
+        let scales: Vec<u8> = (0..rows)
+            .flat_map(|row| (row as f32).to_le_bytes())
+            .collect();
+        let scale_name = "fp8/m.experts.gate_up_proj_scale";
+        for tp in [1u32, 2, 4] {
+            for rank in 0..tp {
+                let weight = slice_for(
+                    "fp8/m.experts.gate_up_proj",
+                    &weights,
+                    &[experts, 2 * intermediate, hidden],
+                    (weights.len() / tp as usize) as u64,
+                    rank,
+                    tp,
+                )
+                .unwrap();
+                let scale = slice_for(
+                    scale_name,
+                    &scales,
+                    &[experts, 2 * intermediate],
+                    (scales.len() / tp as usize) as u64,
+                    rank,
+                    tp,
+                )
+                .unwrap();
+                for (row, channel) in weight.chunks_exact(hidden).zip(scale.chunks_exact(4)) {
+                    assert_eq!(
+                        f32::from_le_bytes(channel.try_into().unwrap()),
+                        row[0] as f32
+                    );
+                }
+            }
+        }
+        assert!(slice_for(
+            scale_name,
+            &scales,
+            &[rows],
+            (scales.len() / 2) as u64,
+            0,
+            2
+        )
+        .is_err());
+        assert_eq!(
+            &*slice_for(scale_name, &scales, &[rows], scales.len() as u64, 0, 1).unwrap(),
+            &scales
+        );
+    }
+
     /// Rank r of a fused `[E, 2I, H]` gate/up keeps, per expert, gate rows then up rows of its
     /// intermediate range; the fused down `[E, H, I]` keeps that range of every row.
     #[test]
