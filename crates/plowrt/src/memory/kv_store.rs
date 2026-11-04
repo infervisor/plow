@@ -1186,6 +1186,32 @@ impl KvStore {
         })
     }
 
+    /// Restores not yet retired (copies in flight, or landed under a gather's hold).
+    pub fn restores_pending(&self) -> bool {
+        !self.inner.lock().restoring.is_empty()
+    }
+
+    /// Diagnostics: `[host-resident, restoring, restoring under a hold]` among `ids`.
+    pub fn off_device_detail(&self, ids: &[BlockId]) -> [usize; 3] {
+        let inner = self.inner.lock();
+        let mut out = [0; 3];
+        for &id in ids {
+            match inner.block(id) {
+                Some(Block {
+                    place: Where::Host(_),
+                    ..
+                }) => out[0] += 1,
+                Some(Block {
+                    place: Where::Restoring { .. },
+                    holds,
+                    ..
+                }) => out[if *holds > 0 { 2 } else { 1 }] += 1,
+                _ => {}
+            }
+        }
+        out
+    }
+
     pub fn ensure_device(&self, id: BlockId) -> Result<u64> {
         let mut inner = self.inner.lock();
         inner.tick += 1;
@@ -3014,7 +3040,9 @@ mod tests {
         s.reap();
         assert_eq!(s.location(a.id), Some(Location::Host));
         ops.pending.store(true, Ordering::SeqCst);
+        assert!(!s.restores_pending());
         assert!(s.restore_async(a.id).unwrap(), "queued");
+        assert!(s.restores_pending());
         assert_eq!(
             (
                 ops.htod_async.load(Ordering::SeqCst),
@@ -3056,8 +3084,10 @@ mod tests {
             s.restoring_any(&[a.id]),
             "held: still in flight for admission"
         );
+        assert!(s.restores_pending(), "landed under a hold: not retired");
         drop(hold);
         assert!(!s.restoring_any(&[a.id]), "retired by the query itself");
+        assert!(!s.restores_pending());
         s.reap();
         let st = s.stats();
         assert_eq!(

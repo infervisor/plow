@@ -261,7 +261,7 @@ class RouterTable:
     def union(self, experts, topk, rows):
         if topk != self.topk or any(e >= experts for r in self.rows for e in r):
             raise ValueError("router table does not match the packet's expert count / top-k")
-        n = len(self.rows)
+        n, rows = len(self.rows), int(rows)
         if rows >= n:
             return float(len(frozenset().union(*self.rows)))
         stride = n // rows

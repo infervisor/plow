@@ -375,9 +375,22 @@ fn bind_decode(
     Ok(())
 }
 
-pub(crate) fn parse(list: &str) -> Result<Vec<&'static Entry>, String> {
-    let mut out: Vec<&'static Entry> = Vec::new();
-    for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+/// Entries named in `list` with the smallest prefill rung each binds: `name` takes the policy's,
+/// `name@rows` a recipe's measured one.
+pub(crate) fn parse(list: &str) -> Result<Vec<(&'static Entry, u32)>, String> {
+    let mut out: Vec<(&'static Entry, u32)> = Vec::new();
+    for item in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, rows) = match item.split_once('@') {
+            Some((name, rows)) => (
+                name.trim(),
+                Some(
+                    rows.trim()
+                        .parse::<u32>()
+                        .map_err(|_| format!("generated-kernel entry {item:?}: bad min rows"))?,
+                ),
+            ),
+            None => (item, None),
+        };
         let entry = CATALOG.iter().find(|e| e.name == name).ok_or_else(|| {
             let known: Vec<_> = CATALOG.iter().map(|e| e.name.as_str()).collect();
             format!(
@@ -385,8 +398,11 @@ pub(crate) fn parse(list: &str) -> Result<Vec<&'static Entry>, String> {
                 known.join(", ")
             )
         })?;
-        if !out.iter().any(|e| e.name == name) {
-            out.push(entry);
+        if entry.decode && rows.is_some() {
+            return Err(format!("decode entry {name} binds no prefill rung"));
+        }
+        if !out.iter().any(|(e, _)| e.name == name) {
+            out.push((entry, rows.unwrap_or(entry.min_rows)));
         }
     }
     Ok(out)
@@ -571,15 +587,15 @@ pub(crate) fn apply_output_objects(
     }
     // gen_flash_prefill.cu serves an unpacked chunk as one request; only the FP8-KV and
     // media-span objects read the packed request table.
-    if !packed && entries.iter().any(|e| e.kv == KvDtype::Fp8 || e.media_span) {
+    if !packed && entries.iter().any(|(e, _)| e.kv == KvDtype::Fp8 || e.media_span) {
         return Err("FP8-KV / media-span generated roles require packed prefill metadata".into());
     }
-    if hd512_px4_role && entries.iter().any(|e| e.head_dim == 512) {
+    if hd512_px4_role && entries.iter().any(|(e, _)| e.head_dim == 512) {
         return Err("PLOW_EMIT_GEN_KERNELS hd512 and the px4 BQ64 role both claim HD512".into());
     }
     let directory = output.parent().unwrap_or_else(|| Path::new("."));
     let prefill_count = packet::devbuild::decode_rung_lo(&model.prog_t);
-    for entry in entries {
+    for (entry, min_rows) in entries {
         if entry.decode {
             let bound = (prefill_count..model.progs.len())
                 .any(|index| model.progs[index].insts.iter().any(|op| entry.matches(op)));
@@ -596,7 +612,7 @@ pub(crate) fn apply_output_objects(
         let selection = entry.object(directory, profile, gpu)?;
         let programs: BTreeSet<usize> = (0..prefill_count)
             .filter(|&index| {
-                model.prog_t[index] >= entry.min_rows
+                model.prog_t[index] >= min_rows
                     && model.progs[index].insts.iter().any(|op| entry.matches(op))
             })
             .collect();
@@ -620,6 +636,11 @@ mod tests {
         assert_eq!(parse("attn_pf_hd512, attn_pf_hd512,").unwrap().len(), 1);
         assert!(parse("").unwrap().is_empty());
         assert!(matches!(parse("attn_pf_hd999"), Err(e) if e.contains("attn_pf_hd512")));
+        let rows = |list| parse(list).unwrap().iter().map(|(_, r)| *r).collect::<Vec<_>>();
+        assert_eq!(rows("attn_pf_hd256_sliding"), [1024]);
+        assert_eq!(rows("attn_pf_hd256_sliding@128, attn_pf_hd512"), [128, 1024]);
+        assert!(parse("attn_pf_hd256_sliding@x").is_err());
+        assert!(parse("attn_dec_hd256_gqa6@128").is_err());
     }
 
     #[test]

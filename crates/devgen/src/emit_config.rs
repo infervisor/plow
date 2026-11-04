@@ -1737,6 +1737,7 @@ pub struct EmitConfig {
 
     /// Generated-kernel catalog entries to emit as role objects, comma-separated (e.g.
     /// "attn_pf_hd512"); each binds the packet ops matching its signature (`gen_kernels.rs`).
+    /// `name@rows` overrides the smallest prefill rung the entry binds.
     #[arg(long = "emit-gen-kernels", env = "PLOW_EMIT_GEN_KERNELS")]
     pub gen_kernels: Option<String>,
 

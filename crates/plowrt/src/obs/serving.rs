@@ -1255,6 +1255,21 @@ pub struct RequestMetrics {
     cached: usize,
     max_tokens: usize,
     finished: bool,
+    max_itl: Duration,
+}
+
+/// The `PLOW_PF_PACKLOG` clock: every pack-log line's `t_ms` counts from this one instant.
+pub fn packlog_epoch() -> Instant {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+fn packlog_on() -> bool {
+    crate::config::RuntimeConfig::get().pf_packlog
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
 }
 
 impl RequestMetrics {
@@ -1282,6 +1297,7 @@ impl RequestMetrics {
             cached: 0,
             max_tokens,
             finished: false,
+            max_itl: Duration::ZERO,
         }
     }
 
@@ -1289,9 +1305,22 @@ impl RequestMetrics {
         let now = Instant::now();
         let m = &self.metrics.serving;
         if let Some(last) = self.last {
-            m.itl.duration(now.saturating_duration_since(last));
+            let itl = now.saturating_duration_since(last);
+            m.itl.duration(itl);
+            self.max_itl = self.max_itl.max(itl);
         } else {
             self.first = Some(now);
+            if packlog_on() {
+                eprintln!(
+                    "PACKLOG REQ first t_ms={:.1} queue_ms={:.1} pf_ms={:.1} ttft_ms={:.1} prompt={} cached={}",
+                    ms(now.saturating_duration_since(packlog_epoch())),
+                    ms(self.admitted.saturating_duration_since(self.arrived)),
+                    ms(now.saturating_duration_since(self.admitted)),
+                    ms(now.saturating_duration_since(self.arrived)),
+                    self.prompt,
+                    cached.min(self.prompt),
+                );
+            }
             self.cached = cached.min(self.prompt);
             m.ttft.duration(now.saturating_duration_since(self.arrived));
             m.prefill
@@ -1327,6 +1356,18 @@ impl RequestMetrics {
         ))]
         .fetch_add(1, Relaxed);
         let now = Instant::now();
+        if packlog_on() {
+            if let (Some(first), Some(last)) = (self.first, self.last) {
+                eprintln!(
+                    "PACKLOG REQ done t_ms={:.1} prompt={} tokens={} decode_ms={:.1} max_itl_ms={:.1}",
+                    ms(now.saturating_duration_since(packlog_epoch())),
+                    self.prompt,
+                    self.tokens,
+                    ms(last.saturating_duration_since(first)),
+                    ms(self.max_itl),
+                );
+            }
+        }
         m.e2e.duration(now.saturating_duration_since(self.arrived));
         m.inference
             .duration(now.saturating_duration_since(self.admitted));
