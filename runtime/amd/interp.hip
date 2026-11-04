@@ -801,6 +801,12 @@ extern "C" __device__ unsigned plow_glu_silu_bf16_1 = 1;
 #if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
 extern "C" __device__ unsigned plow_residual_f32_1 = 1;
 #endif
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+#if PLOW_XR_TAGGED
+#error "FP32 peer partials require the gate one-shot collective"
+#endif
+extern "C" __device__ unsigned plow_xr_partial_f32_1 = 1;
+#endif
 extern "C" __device__ unsigned plow_opcode_zero_f32_1 = 1;
 #if PLOW_CDNA4 && PLOW_HAS_MOE_GLU_FP8_BLOCK128
 extern "C" __device__ unsigned plow_opcode_moe_glu_fp8_block128_1 = 1;
@@ -7579,6 +7585,18 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             } else
 #endif
             { /* the else-arm is this whole block: the tagged arm opens with its own `if` */
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+            if (in->fj[0].u == PLOW_XREDUCE_PARTIAL_F32_MARK)
+                d_xreduce_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu, prog.rank,
+                               in->i[0], in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS,
+                               xaudit, e.slice, in->blocks, 0u, 0u, 0u
+#if PLOW_XR_TRACE_PHASES
+                               , prog.trace ? &prog.trace[base + ix] : nullptr
+#endif
+                               , true);
+            else
+#endif
+            {
 #if PLOW_XR_TAGGED
             /* Tagged one-shot (op_collective.h): the arrival signal rides in the data. The
              * region sits right after the compact-audit status line, whose id the TP loader
@@ -7627,6 +7645,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
 #endif
                            );
 #endif
+            }
             }
         } else if (in->op == PLOW_DOP_XREDUCE_ADD_NORM) {
             /* Fused all-reduce + residual + RMSNorm (op 116, one workgroup):

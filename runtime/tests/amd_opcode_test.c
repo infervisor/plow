@@ -95,6 +95,9 @@ static void packet(plow_hsa* h, PlowDevInst in, void* tensors[8], unsigned block
     void** table = alloc(h, 8 * sizeof(*table));
     PlowTokenBatch* tb = alloc(h, sizeof(*tb));
     PlowPrefillSpan* span = alloc(h, sizeof(*span));
+    uint32_t* gq_cursor=alloc(h,128);
+    uint32_t* gq_bounds=alloc(h,8);
+    gq_bounds[1]=blocks;
     *inst = in;
     inst->blocks = blocks;
     /* Reverse handles so dispatch must resolve the operand table, not slot indices. */
@@ -112,6 +115,7 @@ static void packet(plow_hsa* h, PlowDevInst in, void* tensors[8], unsigned block
     PlowProgram prog = {0};
     prog.insts = inst; prog.stream = stream; prog.stream_ofs = ofs; prog.stream_len = len;
     prog.tensors = table; prog.token_batch = token_batch ? tb : NULL;
+    prog.gq_stream=stream;prog.gq_seg_ofs=gq_bounds;prog.gq_cursor=gq_cursor;
     const unsigned threads = token_batch ? 256u : PLOW_WG_THREADS;
     if (plow_hsa_launch(h, 0, &interp, blocks * threads, 1, 1,
                         threads, 1, 1, 0, &prog, sizeof(prog)) || plow_hsa_wait(h, 0)) {
@@ -119,6 +123,70 @@ static void packet(plow_hsa* h, PlowDevInst in, void* tensors[8], unsigned block
     }
     plow_hsa_free(h, inst); plow_hsa_free(h, stream); plow_hsa_free(h, ofs);
     plow_hsa_free(h, len); plow_hsa_free(h, table); plow_hsa_free(h, tb); plow_hsa_free(h, span);
+    plow_hsa_free(h,gq_cursor);plow_hsa_free(h,gq_bounds);
+}
+
+static bf16* partial_input(plow_hsa* h,unsigned rows,unsigned k,int structured,int weight) {
+    if(!structured)return random_bf(h,(size_t)rows*k);
+    bf16* a=alloc(h,(size_t)rows*k*2);
+    for(unsigned r=0;r<rows;r++)for(unsigned j=0;j<k;j++)
+        a[(size_t)r*k+j]=f2bf(weight?((int)(r%17)-8-(int)(j%8))*0x1p-7f:((int)(r%13)-6+(int)(j%8))*0x1p-6f);
+    return a;
+}
+static void partial_f32(plow_hsa* h, unsigned rows, unsigned n, unsigned k,int structured) {
+    bf16* a = partial_input(h,rows,k,structured,0);
+    bf16* w = partial_input(h,n,k,structured,1);
+    float* out = alloc(h, ((size_t)rows*n+16)*4);
+    float* expected = alloc(h, (size_t)rows*n*4);
+    for (unsigned m=0; m<rows; m++) for (unsigned c=0; c<n; c++) {
+        double sum=0;
+        for (unsigned j=0; j<(structured?8:k); j++) sum += (double)bf2f(a[(size_t)m*k+j])*bf2f(w[(size_t)c*k+j]);
+        if(structured)sum*=k/8;
+        expected[(size_t)m*n+c]=(float)sum;
+    }
+    for (int direct=0; direct<2; direct++) {
+        for (size_t i=0; i<(size_t)rows*n+16; i++) out[i]=12345.0f;
+        if (direct) {
+            struct {float* out; const bf16* a; const bf16* w; unsigned m,n,k;} args={out,a,w,rows,n,k};
+            launch(h,"gemm_f32_parts_test",64,&args,sizeof(args));
+        } else {
+            void* tensors[8]={out,a,w,NULL,NULL,NULL,NULL,NULL};
+            PlowDevInst in=instruction(PLOW_DOP_GEMM_F32,tensors);
+            in.i[0]=rows; in.i[1]=n; in.i[2]=k;
+            packet(h,in,tensors,64,rows);
+        }
+        double err=0,den=0;
+        for (size_t i=0;i<(size_t)rows*n;i++) {
+            double d=(double)out[i]-expected[i]; err+=d*d;den+=(double)expected[i]*expected[i];
+        }
+        double rel=sqrt(err/fmax(den,1e-30));
+        if (!isfinite(rel)||rel>1e-5) fails++;
+        for(size_t i=(size_t)rows*n;i<(size_t)rows*n+16;i++) if(out[i]!=12345.0f)fails++;
+        printf("partial-f32 rows=%u n=%u k=%u direct=%d rel=%g failures=%d\n",rows,n,k,direct,rel,fails);
+    }
+    bf16* a2=partial_input(h,rows,k,structured,0);
+    bf16* w2=partial_input(h,n,k,structured,1);
+    float* part2=alloc(h,((size_t)rows*n+16)*4);
+    bf16* reduced=alloc(h,((size_t)rows*n+16)*2);
+    struct {float* out;const bf16* a;const bf16* w;unsigned m,n,k;} args={part2,a2,w2,rows,n,k};
+    launch(h,"gemm_f32_parts_test",64,&args,sizeof(args));
+    for(size_t i=0;i<(size_t)rows*n+16;i++)reduced[i]=0x42f6u;
+    struct {bf16* out;const float* a;const float* b;unsigned n;} ar={reduced,out,part2,rows*n};
+    launch(h,"reduce_f32_parts_test",8,&ar,sizeof(ar));
+    double err=0,den=0,rne_err=0,rne_den=0;
+    for(unsigned m=0;m<rows;m++)for(unsigned c=0;c<n;c++){
+        double sum=0;
+        for(unsigned j=0;j<(structured?8:k);j++)sum+=(double)bf2f(a[(size_t)m*k+j])*bf2f(w[(size_t)c*k+j])+(double)bf2f(a2[(size_t)m*k+j])*bf2f(w2[(size_t)c*k+j]);
+        if(structured)sum*=k/8;
+        float got=bf2f(reduced[(size_t)m*n+c]),rne=roundbf((float)sum);
+        double d=got-sum,rd=(double)got-rne;err+=d*d;den+=sum*sum;rne_err+=rd*rd;rne_den+=(double)rne*rne;
+    }
+    double rel=sqrt(err/fmax(den,1e-30)),rne=sqrt(rne_err/fmax(rne_den,1e-30));
+    if(!isfinite(rel)||!isfinite(rne)||rel>0x1p-8||rne>1e-4)fails++;
+    for(size_t i=(size_t)rows*n;i<(size_t)rows*n+16;i++)if(reduced[i]!=0x42f6u)fails++;
+    printf("projection-collective rows=%u n=%u k=%u rel=%g rne=%g failures=%d\n",rows,n,k,rel,rne,fails);
+    plow_hsa_free(h,a2);plow_hsa_free(h,w2);plow_hsa_free(h,part2);plow_hsa_free(h,reduced);
+    plow_hsa_free(h,a);plow_hsa_free(h,w);plow_hsa_free(h,out);plow_hsa_free(h,expected);
 }
 
 static void residual_f32(plow_hsa* h, unsigned rows, unsigned feat, int weighted,
@@ -496,20 +564,22 @@ static void load_object(plow_hsa* h, const char* path) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (argc > 3 || (argc == 3 && strcmp(argv[2], "token-batch") && strcmp(argv[2], "dense") && strcmp(argv[2], "residual-f32"))) {
-        fprintf(stderr, "usage: %s [interp_prefill.elf [dense | residual-f32] | interp_tokbatch.elf token-batch]\n", argv[0]);
+    if (argc > 3 || (argc == 3 && strcmp(argv[2], "token-batch") && strcmp(argv[2], "dense") && strcmp(argv[2], "residual-f32") && strcmp(argv[2], "partial-f32") && strcmp(argv[2],"partial-prefill-f32"))) {
+        fprintf(stderr, "usage: %s [interp_prefill.elf [dense | residual-f32] | interp_decode_gq.elf partial-f32 | interp_tokbatch.elf token-batch]\n", argv[0]);
         return 1;
     }
     const int residual_only = argc == 3 && !strcmp(argv[2], "residual-f32");
+    const int partial_prefill=argc==3&&!strcmp(argv[2],"partial-prefill-f32");
+    const int partial_only = partial_prefill || (argc == 3 && !strcmp(argv[2], "partial-f32"));
     const int dense_only = argc == 3 && !strcmp(argv[2], "dense");
-    token_batch = argc == 3 && !dense_only && !residual_only;
+    token_batch = argc == 3 && !dense_only && !residual_only && !partial_only;
     plow_hsa* h = plow_hsa_init();
     if (!h) { fprintf(stderr, "%s\n", plow_hsa_last_error()); return 1; }
     load_object(h, argc > 1 ? argv[1] : "interp_prefill.elf");
     char arch[64], symbol[96];
     uint32_t cus, lds_bytes;
     if (plow_hsa_device_info(h, 0, arch, &cus, &lds_bytes)) return 1;
-    snprintf(symbol, sizeof(symbol), token_batch ? "plow_interp_tokbatch_%s" : "plow_interp_%s", arch);
+    snprintf(symbol, sizeof(symbol), partial_prefill?"plow_interp_%s_gq":partial_only ? "plow_interp_dec_%s_gq" : token_batch ? "plow_interp_tokbatch_%s" : "plow_interp_%s", arch);
     if (plow_hsa_get_kernel(h, 0, symbol, &interp)) {
         fprintf(stderr, "%s: %s\n", symbol, plow_hsa_last_error()); return 1;
     }
@@ -528,7 +598,7 @@ int main(int argc, char** argv) {
         }
     }
     plow_hsa_free(h, threads);
-    if (!residual_only && !token_batch && (dense_only || !strcmp(arch, "gfx1201"))) {
+    if (!partial_only && !residual_only && !token_batch && (dense_only || !strcmp(arch, "gfx1201"))) {
         const unsigned saved_rng = rng;
         dense_gemm(h, 128, 1024, 1024);
         dense_gemm(h, 128, 960, 1024); dense_gemm(h, 128, 1024, 960);
@@ -545,7 +615,13 @@ int main(int argc, char** argv) {
                 residual_f32(h, rows, widths[w], g, alias, 0.052978515625f);
             }
     }
-    if (!dense_only && !residual_only) {
+    if (partial_only) {
+        const unsigned ks[]={2048,4096,7680};
+        const unsigned ms[]={1,8,128,512,1024,2048,4096,8192};
+        for (unsigned i=partial_prefill?2:0;i<(partial_prefill?8:3);i++)
+            for(unsigned j=0;j<3;j++)partial_f32(h,ms[i],3840,ks[j],partial_prefill);
+    }
+    if (!dense_only && !residual_only && !partial_only) {
         gemv(h, 1, 259, 512, 3, 0, 0); gemv(h, 3, 259, 520, 5, 30, 0);
         gemv(h, 2, 7, 67, 11, 0, 0); gemv(h, 1, 259, 3840, 3, 30, 0);
         gemv(h, 1, 259, 8192, 3, 0, 0);

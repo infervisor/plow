@@ -48,6 +48,13 @@ pub const TENSOR_NONE: u32 = 0xFFFF_FFFF;
 /// Normalized operands, branch inputs and norm weights remain BF16. i7 retains existing opcode-specific semantics.
 pub const RESIDUAL_F32_FLAG: u32 = 2;
 
+/// XReduce f0 bit-pattern: FP32 peer partials, one BF16 output store.
+pub const XREDUCE_PARTIAL_F32_MARK: u32 = 0x4633_3250;
+
+pub fn xreduce_partial_f32(op: u16, f0: u32) -> bool {
+    op == DevOp::XReduce as u16 && f0 == XREDUCE_PARTIAL_F32_MARK
+}
+
 pub fn uses_residual_f32(op: u16, flags: u32) -> bool {
     flags & RESIDUAL_F32_FLAG != 0
         && matches!(

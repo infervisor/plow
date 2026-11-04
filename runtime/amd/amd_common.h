@@ -25,6 +25,9 @@ typedef float f32x16 __attribute__((ext_vector_type(16)));
 #ifndef PLOW_PACKET_REQUIRES_RESIDUAL_F32
 #define PLOW_PACKET_REQUIRES_RESIDUAL_F32 0
 #endif
+#ifndef PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+#define PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 0
+#endif
 
 /* ---------------------------------------------------------------------------
  * GLOBAL, AND SAY SO.
