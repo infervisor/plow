@@ -2740,6 +2740,13 @@ fn drain_waiting_session(
             if waited_ms(now, arrived) < RESTORE_HOLD_MS
                 && p.restore_pending(&job.prompt_ids, job.opts.prefix.as_ref())
             {
+                if packlog::on() {
+                    eprintln!(
+                        "PACKLOG HELD kind=restore waited_ms={:.1} prompt={}",
+                        waited_ms(now, arrived),
+                        job.prompt_ids.len()
+                    );
+                }
                 still.push_back((job, arrived));
                 continue;
             }
@@ -2758,6 +2765,13 @@ fn drain_waiting_session(
             retention,
         ) {
             Some(held) => {
+                if packlog::on() {
+                    eprintln!(
+                        "PACKLOG HELD kind=admit waited_ms={:.1} prompt={}",
+                        waited_ms(now, held.1),
+                        held.0.prompt_ids.len()
+                    );
+                }
                 let blocks = waited_ms(now, held.1) >= aging;
                 still.push_back(held);
                 if blocks {
