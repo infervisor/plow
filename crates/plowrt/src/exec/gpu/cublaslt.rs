@@ -427,7 +427,7 @@ pub(super) struct LightFunctions {
     pub(super) prefill_conv: bool,
     /// `plow_<arch>_light_qnorm`: a routed decode rung's QwenRmsNorm, register-resident rows.
     pub(super) qwen_norm: Option<KernelFn>,
-    /// `plow_<arch>_light_quant` (`plow_light_quant_abi` 1, `PLOW_LIGHT_QUANT`): a decode segment
+    /// `plow_<arch>_light_quant` (`plow_light_quant_abi` 1 or 2, `PLOW_LIGHT_QUANT`): a decode segment
     /// [producer -> QuantFp8 1x128 groups] as one launch (`light_quant_pair`), and
     /// `plow_<arch>_light_quant_norm` for the RMSNorm producer.
     pub(super) quant: Option<LightQuant>,
@@ -438,6 +438,18 @@ pub(super) struct LightFunctions {
 pub(super) struct LightQuant {
     pointwise: KernelFn,
     norm: KernelFn,
+    norm_threads: u32,
+}
+
+/// Block size of `light_quant_norm` for an object's `plow_light_quant_abi` and
+/// `plow_light_quant_norm_threads`: ABI 1 = 256 threads, ABI 2 = the declared 1024; anything else
+/// keeps the interpreter window.
+fn light_quant_norm_threads(abi: Option<u32>, threads: Option<u32>) -> Option<u32> {
+    match (abi, threads) {
+        (Some(1), _) => Some(256),
+        (Some(2), Some(1024)) => Some(1024),
+        _ => None,
+    }
 }
 
 /// `FA_ST_THREADS`: eight row-group warps and the producer warp.
@@ -505,11 +517,15 @@ pub(super) fn light_functions(
         be.get_function(module, &format!("plow_{arch}_light_qnorm"))
             .ok()
     });
-    let quant = match be.module_global_u32(module, "plow_light_quant_abi")? {
-        Some(LIGHT_QUANT_ABI) if crate::config::RuntimeConfig::get().nv.light_quant => {
+    let quant = match light_quant_norm_threads(
+        be.module_global_u32(module, "plow_light_quant_abi")?,
+        be.module_global_u32(module, "plow_light_quant_norm_threads")?,
+    ) {
+        Some(norm_threads) if crate::config::RuntimeConfig::get().nv.light_quant => {
             Some(LightQuant {
                 pointwise: be.get_function(module, &format!("plow_{arch}_light_quant"))?,
                 norm: be.get_function(module, &format!("plow_{arch}_light_quant_norm"))?,
+                norm_threads,
             })
         }
         _ => None,
@@ -845,9 +861,6 @@ pub(super) fn qwen_light_segments(
     light
 }
 
-/// `plow_light_quant_abi` this runtime launches.
-const LIGHT_QUANT_ABI: u32 = 1;
-
 /// A segment that is exactly [producer, QuantFp8 of the producer's bf16 output in 1x128 groups],
 /// both instructions whole, which `light_quant` runs as one launch of one block per padded row:
 /// `(producer, quant)`. The producer must be one whose per-row body the kernel reproduces bit for
@@ -894,11 +907,19 @@ fn light_quant_pair(
     // with the quant.
     let row = u64::from(m) * u64::from(k) * 2;
     let mask = u64::from(m) * 4;
+    // A gated norm's z may be a column of a row-pitched N-concatenated output (j1).
+    let zsrc = pd.fj[2];
+    let (zs, zc) = (u64::from(zsrc & 0xFFFF), u64::from(zsrc >> 16));
+    let z_bytes = if zsrc == 0 {
+        row
+    } else {
+        (u64::from(m - 1) * zs + zc + u64::from(k)) * 2
+    };
     let (shape, active, operands): (bool, usize, &[(usize, u64)]) = match DevOp::from_u16(pd.op)? {
         // The interpreter's block-per-row path (`batch <= nblk`), at most 32 elements per thread
         // in the kernel.
         DevOp::QwenRmsNorm => (
-            pd.i[0] == k && pd.i[1] == m && pb >= m as usize && k <= 32 * BLOCK,
+            pd.i[0] == k && pd.i[1] == m && pb >= m as usize && k <= 8192 && k % 8 == 0,
             3,
             &[
                 (0, row),
@@ -910,12 +931,15 @@ fn light_quant_pair(
         ),
         // One head = one 128-wide group.
         DevOp::QwenGatedNorm => (
-            pd.i[1] == 128 && pd.i[0].checked_mul(pd.i[1]) == Some(k) && pd.i[2] == m,
+            pd.i[1] == 128
+                && pd.i[0].checked_mul(pd.i[1]) == Some(k)
+                && pd.i[2] == m
+                && (zsrc == 0 || (zs % 8 == 0 && zc % 8 == 0 && zc + u64::from(k) <= zs)),
             4,
             &[
                 (0, row),
                 (1, row),
-                (2, row),
+                (2, z_bytes),
                 (3, u64::from(pd.i[1]) * 2),
                 (4, mask),
             ],
@@ -990,8 +1014,18 @@ fn light_quant_pair(
         present(&[active])
             .iter()
             .all(|&a| present(&[0]).iter().all(|&o| disjoint(a, o)))
+            // Rows of a pitched z are read while other rows' outputs are written.
+            && (zsrc == 0 || pd.op != DevOp::QwenGatedNorm as u16 || pairwise(&present(&[0, 2])))
     };
-    (shape && fits && disjoint(xq, gs) && operands_ok && alias_ok).then_some((p, q))
+    // light_quant_norm: 16-byte row/gamma/add accesses, 8-byte xq stores, scalar active and scales.
+    let aligned =
+        |h: u16, a: u64| h == none || devp.get(usize::from(h)).is_some_and(|t| t.base % a == 0);
+    let align_ok = pd.op != DevOp::QwenRmsNorm as u16
+        || ([0, 1, 2, 4].iter().all(|&i| aligned(pd.t[i], 16))
+            && aligned(pd.t[3], 4)
+            && aligned(qd.t[0], 8)
+            && aligned(qd.t[2], 4));
+    (shape && fits && disjoint(xq, gs) && operands_ok && alias_ok && align_ok).then_some((p, q))
 }
 
 /// Segments of 1..=`max` whole instructions (every slice, ascending, in program order) that
@@ -1178,7 +1212,7 @@ pub(super) fn add_qwen_light_routes(
                         } else {
                             (qd.i[4] * (qd.i[1] / 128)).div_ceil(BLOCK / 32)
                         },
-                        block: BLOCK,
+                        block: if norm { quant.norm_threads } else { BLOCK },
                         smem: 0,
                     }],
                     _scratch: None,
@@ -2007,6 +2041,7 @@ pub(super) enum ProjectionBackend {
 enum ProjectionPlan {
     Lt(Arc<crate::device::cuda::lt::Plan>),
     Native(native_decode::Plan),
+    Fp8Block(fp8_block::Plan),
     Folded,
 }
 
@@ -2015,6 +2050,7 @@ impl ProjectionPlan {
         match self {
             Self::Lt(p) => p.run(input, weight, output, stream),
             Self::Native(p) => p.run(input, weight, output, stream),
+            Self::Fp8Block(p) => p.run(input, weight, output, stream),
             Self::Folded => Ok(()),
         }
     }
@@ -2162,6 +2198,7 @@ pub(super) fn ordered_waits_for(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_routes(
     backend: &ProjectionBackend,
+    fp8_block: Option<&Arc<fp8_block::Fp8Block>>,
     segments: Vec<Option<DecodeSegment>>,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
@@ -2206,6 +2243,7 @@ pub(super) fn prepare_routes(
     let mut plans = std::collections::HashMap::new();
     let mut pair_plans = std::collections::HashMap::new();
     let mut fp8_plans = 0usize;
+    let mut fp8_native = 0usize;
     let mut pairs = 0usize;
     let mut index = 0;
     while index < segments.len() {
@@ -2288,15 +2326,27 @@ pub(super) fn prepare_routes(
                 .nv
                 .lt_fp8_fast_accum_max_k
                 .is_some_and(|max_k| segment.k <= max_k);
-            let plan = ProjectionPlan::Lt(lt.fp8_plan(
-                lt_m,
-                segment.n,
-                segment.k,
-                scales[1],
-                scales[0],
-                !decode && fast_k && !segment.block,
-                segment.block,
-            )?);
+            let native = match fp8_block.filter(|_| segment.block && decode) {
+                Some(owner) => owner.plan(
+                    segment.m, segment.n, segment.k, input, weight, scales[0], scales[1],
+                )?,
+                None => None,
+            };
+            let plan = match native {
+                Some(plan) => {
+                    fp8_native += 1;
+                    ProjectionPlan::Fp8Block(plan)
+                }
+                None => ProjectionPlan::Lt(lt.fp8_plan(
+                    lt_m,
+                    segment.n,
+                    segment.k,
+                    scales[1],
+                    scales[0],
+                    !decode && fast_k && !segment.block,
+                    segment.block,
+                )?),
+            };
             fp8_plans += 1;
             insts[segment.instruction].op = DevOp::Nop as u16;
             routes.push(Some(CublasLtDecodeRoute {
@@ -2484,6 +2534,7 @@ pub(super) fn prepare_routes(
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
         fp8_plans,
+        fp8_native,
         pairs,
         native = matches!(backend, ProjectionBackend::Native(_)),
         "projection routes prepared"
@@ -2911,6 +2962,107 @@ fn projection_segments(
 mod tests {
     use super::*;
     use packet::dev::{DevInst64, StreamEnt};
+
+    #[test]
+    fn light_quant_pair_takes_only_a_fitting_disjoint_pitched_gated_norm_z() {
+        let none = packet::dev::TENSOR_NONE16;
+        let (m, heads, dim, pitch, col) = (4u32, 48u32, 128u32, 16384u32, 10240u32);
+        let k = heads * dim;
+        let mut norm = DevInst64 {
+            op: DevOp::QwenGatedNorm as u16,
+            blocks: 2,
+            ..Default::default()
+        };
+        norm.t.fill(none);
+        norm.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        norm.i[..3].copy_from_slice(&[heads, dim, m]);
+        norm.fj[2] = pitch | col << 16;
+        let mut quant = DevInst64 {
+            op: DevOp::QuantFp8 as u16,
+            blocks: 2,
+            ..Default::default()
+        };
+        quant.t.fill(none);
+        quant.t[..3].copy_from_slice(&[4, 0, 5]);
+        quant.i[..5].copy_from_slice(&[m, k, 0, packet::dev::FP8_BLOCK_GROUP, m]);
+        let mut g = DevProg {
+            t: m,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: m },
+            n_counter: 0,
+            insts: vec![norm, quant],
+            stream: vec![],
+            stream_ofs: vec![0],
+            stream_len: vec![0],
+            waits: vec![],
+            succs: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![0],
+            l2_domains: 0,
+        };
+        let entries: Vec<_> = [(0, 0), (0, 1), (1, 0), (1, 1)]
+            .into_iter()
+            .map(|(inst, slice)| StreamEnt {
+                inst,
+                slice,
+                ..Default::default()
+            })
+            .collect();
+        let row = u64::from(m * k) * 2;
+        let qkvz = u64::from(m * pitch) * 2;
+        let sizes = [
+            row,
+            row,
+            qkvz,
+            256,
+            u64::from(m * k),
+            u64::from(k / 128 * m) * 4,
+        ];
+        // z at its own base, or at the output's base (an overlapping view).
+        let view = |z: u64, alias: bool| -> Vec<DeviceMem> {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| match i {
+                    2 => DeviceMem::view(if alias { 1 << 24 } else { 3 << 24 }, z),
+                    _ => DeviceMem::view((i as u64 + 1) << 24, len),
+                })
+                .collect()
+        };
+        let devp = |z: u64| view(z, false);
+        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), Some((0, 1)));
+        // The last row's z ends at (m - 1) * pitch + col + k.
+        let last = u64::from((m - 1) * pitch + col + k) * 2;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(last)), Some((0, 1)));
+        assert_eq!(light_quant_pair(&g, &entries, &devp(last - 2)), None);
+        // z lies inside the row, 8-element aligned; each case otherwise fits a wide buffer.
+        let wide = u64::from(m * (pitch + 64)) * 2;
+        g.insts[0].fj[2] = pitch | (col + 8) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 4) | col << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 8) | (col + 4) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 8) | (col + 8) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), Some((0, 1)));
+        // Other rows' outputs are written while a pitched z is read: a z overlapping the output
+        // is refused even when it is large enough.
+        g.insts[0].fj[2] = pitch | col << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &view(qkvz, true)), None);
+        // A dense z (no j1) needs only its rows.
+        g.insts[0].fj[2] = 0;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(row)), Some((0, 1)));
+    }
+
+    #[test]
+    fn light_quant_norm_threads_abi() {
+        assert_eq!(light_quant_norm_threads(Some(1), None), Some(256));
+        assert_eq!(light_quant_norm_threads(Some(2), Some(1024)), Some(1024));
+        assert_eq!(light_quant_norm_threads(Some(2), None), None);
+        assert_eq!(light_quant_norm_threads(Some(2), Some(256)), None);
+        assert_eq!(light_quant_norm_threads(Some(2), Some(512)), None);
+        assert_eq!(light_quant_norm_threads(Some(3), Some(1024)), None);
+        assert_eq!(light_quant_norm_threads(None, Some(1024)), None);
+    }
 
     #[test]
     fn block_fp8_row_padding_refuses_overflow() {

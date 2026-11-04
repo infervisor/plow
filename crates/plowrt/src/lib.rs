@@ -22,7 +22,6 @@
 pub mod analysis;
 pub mod asr;
 pub mod asset;
-pub mod certificate_checks;
 pub mod config;
 pub mod device;
 pub mod disasm;

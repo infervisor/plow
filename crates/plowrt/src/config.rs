@@ -287,11 +287,6 @@ pub struct RuntimeConfig {
     )]
     pub asr_encode_hold_inflight: usize,
 
-    /// Lean receipt qualification at packet load (`certificate_checks`): `off` keeps the
-    /// pre-policy behavior, `report` logs every gap, `strict` refuses a packet with any gap.
-    #[arg(long = "lean-qualify", env = "PLOW_LEAN_QUALIFY", default_value = "off", value_parser = ["off", "report", "strict"], global = true)]
-    pub lean_qualify: String,
-
     /// Upper bound (tokens) on an audio-LM request's context (`prompt`). The context is otherwise
     /// sized per request to what the window leaves after the template, the audio and the output
     /// reserve, trimmed from its oldest words. 0 = no bound beyond the window.
@@ -913,16 +908,18 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-publish-shared", env = "PLOW_VMM_PUBLISH_SHARED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_publish_shared: bool,
 
-    /// Pinned host memory (MiB) for the prefix cache's host tier (the second level of its
-    /// LRU: evicted boundaries spill there and attach from there). Unset = sized by
+    /// Pinned host memory for the KV cache's host tier (the second level of the prefix cache's
+    /// LRU: evicted boundaries spill there and attach from there), as `<n>MB` or `<n>GB`
+    /// (binary: MiB, GiB; case-insensitive). Unset or `auto` = sized by
     /// `memory::vmm::host_tier_default`: `MemAvailable` minus the host reserve (an eighth of RAM,
-    /// at least 16 GiB), capped at a quarter of RAM; `0` = no host tier.
+    /// at least 16 GiB), capped at a quarter of RAM (AMD: no host tier); `0` = no host tier.
     #[arg(
-        long = "vmm-host-cache-mib",
-        env = "PLOW_VMM_HOST_CACHE_MIB",
+        long = "host-kvcache-size",
+        env = "PLOW_HOST_KVCACHE_SIZE",
+        value_parser = parse_host_kvcache_size,
         global = true
     )]
-    pub vmm_host_cache_mib: Option<u64>,
+    pub host_kvcache_size: Option<HostKvcacheSize>,
 
     /// CUDA VMM prefix cache: seconds a request with
     /// `X-Session-Id` keeps its newest boundary protected from LRU after its last use; then the
@@ -962,8 +959,8 @@ pub struct RuntimeConfig {
     /// the cost is the full-width `q_absorb`/`q_rope`/`o_proj` twins resident on every rank, so
     /// turning it off has to skip BINDING them, not just dispatching to them. Off, a packet that
     /// carries the siblings costs only their program records.
-    #[arg(long = "glm-rowband", env = "PLOW_GLM_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub glm_rowband: bool,
+    #[arg(long = "rowband", env = "PLOW_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub rowband: bool,
     /// Expert: widest decode rung a serving engine admits; unset = no ceiling.
     #[arg(
         long = "decode-max-rung",
@@ -1776,6 +1773,11 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "lt-rung-algos", env = "PLOW_LT_RUNG_ALGOS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lt_rung_algos: bool,
 
+    /// A packet's native block-scaled FP8 decode object serves its declared projections; `=0`
+    /// keeps them on cuBLASLt (same-packet A/B).
+    #[arg(long = "nv-fp8-block-native", env = "PLOW_NV_FP8_BLOCK_NATIVE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub fp8_block_native: bool,
+
     /// Prefill FP8 (W8A8 vector-scale) cuBLASLt projections with K at most this run with
     /// `CUBLASLT_MATMUL_DESC_FAST_ACCUM` (wgmma accumulation without periodic FP32 promotion, as
     /// vLLM's CUTLASS FP8 kernels). Unset = off. H100 standalone at M=4096: q 102 -> 88 us,
@@ -1826,9 +1828,11 @@ pub struct NvidiaRuntimeConfig {
     /// Decode rungs of at least this many rows run each attention pair the packet declares
     /// with the generated decode role (an isolated FlashDecode + FlashMerge) as one launch of
     /// the generated flash-decode object between interpreter windows; narrower rungs, and 0,
-    /// run the untouched interpreter pair in one launch. 4: the object wins from four rows
-    /// (Qwen3.8-27B H100, knob_spec evidence); at one or two rows the interpreter's single
-    /// launch is as fast or faster.
+    /// run the untouched interpreter pair in one launch. 4: the object wins from four rows on a
+    /// packet whose decode rungs are one interpreter launch (Qwen3.8-27B BF16 H100, knob_spec
+    /// evidence; 1 measured slower there at one and two rows). The Qwen3.8-27B FP8 H100 packet,
+    /// whose projections already split each rung into windows, wins from one row (ctx 4096):
+    /// its recipe sets 1.
     #[arg(
         long = "gen-decode-step",
         env = "PLOW_GEN_DECODE_STEP",
@@ -1869,30 +1873,30 @@ pub struct NvidiaRuntimeConfig {
     /// of the prefill object's `plow_<arch>_light_pf` kernel on this many blocks per SM instead
     /// of interpreter windows. 0 = windows.
     #[arg(
-        long = "qwen-light-occ",
-        env = "PLOW_QWEN_LIGHT_OCC",
+        long = "gdn-light-occ",
+        env = "PLOW_GDN_LIGHT_OCC",
         default_value_t = 4,
         global = true
     )]
-    pub qwen_light_occ: u32,
+    pub gdn_light_occ: u32,
 
     /// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows (norms, gates, rope) run as
-    /// `plow_<arch>_light_pf` launches on the `--qwen-light-occ` grid instead of interpreter
+    /// `plow_<arch>_light_pf` launches on the `--gdn-light-occ` grid instead of interpreter
     /// windows (the same block-per-row bodies: the outputs are the window's).
-    #[arg(long = "qwen-light-decode", env = "PLOW_QWEN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub qwen_light_decode: bool,
+    #[arg(long = "gdn-light-decode", env = "PLOW_GDN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gdn_light_decode: bool,
 
     /// A routed decode segment [producer -> QuantFp8 in 1x128 groups] (RMSNorm, gated norm,
     /// SiLU Glu, sigmoid gate) runs as one `plow_<arch>_light_quant[_norm]` launch instead of an
-    /// interpreter window; needs the object's `plow_light_quant_abi` 1.
+    /// interpreter window; needs the object's `plow_light_quant_abi` 1 or 2.
     #[arg(long = "light-quant", env = "PLOW_LIGHT_QUANT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub light_quant: bool,
 
     /// A packed Qwen3.5 prefill chunk's segments between its per-tick launches (the external GDN
     /// segments, the rider attention) replay as CUDA graph pieces captured once per bucket
     /// (needs `--pf-seg-graph`).
-    #[arg(long = "qwen-pf-graph", env = "PLOW_QWEN_PF_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub qwen_pf_graph: bool,
+    #[arg(long = "gdn-pf-graph", env = "PLOW_GDN_PF_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gdn_pf_graph: bool,
 
     /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
     /// weights are contiguous and a light attention launch reads the three outputs.
@@ -2392,11 +2396,7 @@ pub struct AmdRuntimeConfig {
     /// DSA sparse prefill chunk floor: a chunk on the sparse prefill rung whose context end
     /// (`c0 + clen`) is at most this many tokens skips the indexer selection and runs the dense
     /// flash. Unset = every chunk of the sparse rung is sparse.
-    #[arg(
-        long = "glm-dsa-pf-min-ctx",
-        env = "PLOW_GLM_DSA_PF_MIN_CTX",
-        global = true
-    )]
+    #[arg(long = "dsa-pf-min-ctx", env = "PLOW_DSA_PF_MIN_CTX", global = true)]
     pub dsa_pf_min_ctx: Option<u32>,
 
     /// With the tail-sparse floor: the dense final chunk moves only when `prior x tail rows` (the
@@ -2654,8 +2654,8 @@ pub struct AmdRuntimeConfig {
     /// row-band wrong-answer defect: that defect is armed by any ordinary program-3 execution in
     /// the 8192 bucket, and this workspace is the only device memory both paths share that no
     /// per-sequence clear covers. Hundreds of MB of H2D per dispatch — never leave it on.
-    #[arg(long = "amd-glm-rowband-clear-ws", env = "PLOW_GLM_ROWBAND_CLEAR_WS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub glm_rowband_clear_ws: bool,
+    #[arg(long = "amd-rowband-clear-ws", env = "PLOW_ROWBAND_CLEAR_WS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub rowband_clear_ws: bool,
 
     /// Run native GLM MoE prefill rows >= 1024 on AITER's 64-row persistent tile
     /// (`..._psx_64x256.co`), the object its GLM-5 gfx942 tuning selects there.
@@ -3241,14 +3241,21 @@ impl RuntimeConfig {
         )
     }
 
-    /// `None` = unset (the store sizes its host tier by the host-reserve rule); `Some(0)` = off.
-    pub(crate) fn vmm_host_cache_bytes(&self) -> Option<u64> {
-        let mib = if Self::is_initialized() {
-            self.vmm_host_cache_mib
+    /// `None` = unset or `auto` (the store sizes its host tier by the host-reserve rule);
+    /// `Some(0)` = off.
+    pub(crate) fn host_kvcache_bytes(&self) -> Option<u64> {
+        let size = if Self::is_initialized() {
+            self.host_kvcache_size
         } else {
-            Self::env_parse("PLOW_VMM_HOST_CACHE_MIB").or(self.vmm_host_cache_mib)
+            std::env::var("PLOW_HOST_KVCACHE_SIZE")
+                .ok()
+                .and_then(|v| parse_host_kvcache_size(&v).ok())
+                .or(self.host_kvcache_size)
         };
-        mib.map(|m| m << 20)
+        match size? {
+            HostKvcacheSize::Auto => None,
+            HostKvcacheSize::Bytes(b) => Some(b),
+        }
     }
 
     pub(crate) fn prefix_session_ttl(&self) -> std::time::Duration {
@@ -3284,10 +3291,10 @@ impl RuntimeConfig {
         )
     }
 
-    pub(crate) fn glm_rowband(&self) -> bool {
+    pub(crate) fn rowband(&self) -> bool {
         select_compat(
-            self.glm_rowband,
-            Self::env_bool("PLOW_GLM_ROWBAND"),
+            self.rowband,
+            Self::env_bool("PLOW_ROWBAND"),
             !Self::is_initialized(),
         )
     }
@@ -3359,6 +3366,11 @@ impl RuntimeConfig {
         static FALLBACK: OnceLock<RuntimeConfig> = OnceLock::new();
         FALLBACK.get_or_init(|| {
             use clap::Parser;
+            // Fails like the parse below does on a bad value.
+            if let Err(e) = crate::knob_spec::refuse_renamed_env(|k| std::env::var(k).ok()) {
+                eprintln!("plowrt: {e}");
+                std::process::exit(2);
+            }
             #[derive(Parser)]
             struct EnvOnly {
                 #[command(flatten)]
@@ -3691,6 +3703,48 @@ pub fn is_secret_env(name: &str) -> bool {
         || ["_KEY", "_KEYS", "_TOKEN", "_TOKENS"]
             .iter()
             .any(|suffix| upper.ends_with(suffix))
+}
+
+/// `PLOW_HOST_KVCACHE_SIZE`: the host KV tier's size, or `auto` (the host-reserve rule).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostKvcacheSize {
+    Auto,
+    Bytes(u64),
+}
+
+/// `<n>MB` / `<n>GB` (binary units, any case, optional space), `0` (off) or `auto`. A bare
+/// number is refused: the old knob took MiB, so its meaning would be a guess.
+pub fn parse_host_kvcache_size(s: &str) -> std::result::Result<HostKvcacheSize, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Ok(HostKvcacheSize::Auto);
+    }
+    if t == "0" {
+        return Ok(HostKvcacheSize::Bytes(0));
+    }
+    let lower = t.to_ascii_lowercase();
+    let unit = |suffix: &str, shift: u32| {
+        lower
+            .strip_suffix(suffix)
+            .map(|n| (n.trim_end().to_owned(), shift))
+    };
+    let Some((num, shift)) = unit("gb", 30).or_else(|| unit("mb", 20)) else {
+        let hint = if t.bytes().all(|b| b.is_ascii_digit()) {
+            format!(" (did you mean {t}MB?)")
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "{s:?} needs a unit: <n>MB or <n>GB (MiB, GiB), 0 = off, auto = sized from free \
+             RAM{hint}"
+        ));
+    };
+    num.parse::<u64>()
+        .ok()
+        .filter(|_| num.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.checked_mul(1 << shift))
+        .map(HostKvcacheSize::Bytes)
+        .ok_or_else(|| format!("{s:?} is not a size: <n>MB or <n>GB (MiB, GiB), 0 or auto"))
 }
 
 fn parse_pf_hold(spec: &str) -> Option<(u32, f64, usize)> {
@@ -4614,5 +4668,34 @@ mod tests {
 
     fn walk(dir: &std::path::Path) -> String {
         files(dir).into_iter().map(|(_, t)| t).collect()
+    }
+}
+
+#[cfg(test)]
+mod host_kvcache_size_tests {
+    use super::{parse_host_kvcache_size as parse, HostKvcacheSize::*};
+
+    #[test]
+    fn parses_binary_mb_and_gb_in_any_case() {
+        assert_eq!(parse("65536MB"), Ok(Bytes(64 << 30)));
+        assert_eq!(parse("64GB"), Ok(Bytes(64 << 30)));
+        assert_eq!(parse("64 gb"), Ok(Bytes(64 << 30)));
+        assert_eq!(parse("512Mb"), Ok(Bytes(512 << 20)));
+        assert_eq!(parse("0"), Ok(Bytes(0)));
+        assert_eq!(parse("0GB"), Ok(Bytes(0)));
+        assert_eq!(parse("auto"), Ok(Auto));
+        assert_eq!(parse("AUTO"), Ok(Auto));
+    }
+
+    #[test]
+    fn refuses_a_bare_number_and_garbage() {
+        let bare = parse("65536").unwrap_err();
+        assert!(bare.contains("did you mean 65536MB"), "{bare}");
+        for bad in [
+            "", "MB", "64KB", "64 G", "1.5GB", "-1GB", "+64GB", "64GiB", "x64MB",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse("18446744073709551615GB").is_err());
     }
 }

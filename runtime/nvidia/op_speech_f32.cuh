@@ -28,6 +28,14 @@ __device__ __forceinline__ constexpr bool sp_op_on(unsigned op) {
     return op < 163u || op > 204u || ((PLOW_SPEECH_OPS >> (op - 163u)) & 1ull);
 }
 
+/* Unused conv post epilogues cost 60-120 min/object in CUDA 12.9 ptxas -O3 (sm_120a). */
+#ifndef PLOW_SPEECH_CONV_POSTS
+#define PLOW_SPEECH_CONV_POSTS (~0ull)
+#endif
+__device__ __forceinline__ constexpr bool sp_post_on(unsigned p) {
+    return (PLOW_SPEECH_CONV_POSTS >> p) & 1ull;
+}
+
 #define SPG_TM 8
 #define SPG_TN 8
 #define SPG_BK 16
@@ -4415,17 +4423,35 @@ static __device__ __forceinline__ void sp_w_conv_store(unsigned m0, unsigned n0,
                                                        const SpConvEpi1& ep, const float (&acc)[SpB<BN>::MI][4][4]) {
     const unsigned post = ep.a.post;
     switch (post) {
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 0))
     case 0: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float) { return x; }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 9))
     case 9: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return x >= 0.0f ? x : __fmul_rn(x, p); }); break;
+#endif
     /* The output activations the speech lowerings use are inlined: a call keeps every live
      * accumulator on the stack around it. */
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 1))
     case 1: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(1u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 5))
     case 5: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(5u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 7))
     case 7: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(7u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 8))
     case 8: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(8u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 10))
     case 10: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(10u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 11))
     case 11: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(11u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 12))
     case 12: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_snake(x, p); }); break;
+#endif
     default: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [post](float x, float p) { return sp_act_call(post, x, p); }); break;
     }
 }
@@ -4519,17 +4545,31 @@ __device__ __forceinline__ void spwg_m64n64k16(float* d, uint64_t da, uint64_t d
  * own instantiation (P: 0 none, 1 GELU, 2 snake), the rest one uniform switch (P = 3). */
 template <unsigned P>
 __device__ __forceinline__ float spg_post(unsigned post, float x, float p) {
-    if constexpr (P == 0u) return x;
-    if constexpr (P == 1u) return sp_act(11u, x, p, 0.f);
-    if constexpr (P == 2u) return sp_snake(x, p);
+    if constexpr (P == 0u && sp_post_on(0u)) return x;
+    if constexpr (P == 1u && sp_post_on(11u)) return sp_act(11u, x, p, 0.f);
+    if constexpr (P == 2u && sp_post_on(12u)) return sp_snake(x, p);
     switch (post) {
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 1))
     case 1: return sp_act(1u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 7))
     case 7: return sp_act(7u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 8))
     case 8: return sp_act(8u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 9))
     case 9: return x >= 0.0f ? x : __fmul_rn(x, p);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 10))
     case 10: return sp_act(10u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 11))
     case 11: return sp_act(11u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 12))
     case 12: return sp_snake(x, p);
+#endif
     default: return x;
     }
 }
@@ -4779,7 +4819,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     __syncthreads();
 }
 __device__ __forceinline__ bool spg_post_ok(unsigned post) {
-    return post == 0u || post == 1u || post == 7u || post == 8u || post == 9u || post == 10u || post == 11u || post == 12u;
+    return sp_post_on(post) && (post == 0u || post == 1u || post == 7u || post == 8u || post == 9u || post == 10u || post == 11u || post == 12u);
 }
 __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a) {
     const bool pw = a.kernel == 1u && a.stride == 1u && a.before == 0u && a.in_rows == a.out_rows && a.cg % 4u == 0 && a.pre == 0u;
@@ -4793,7 +4833,7 @@ __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a) {
  * weights with the pre-split image, no activations, residual or output padding. */
 __device__ __forceinline__ bool spg_ct_eligible(const SpConvArgs& a) {
     return a.phasemajor && a.kernel == 2u * a.stride && a.groups == 1u && a.opad == 0u && a.pre == 0u &&
-           a.post == 0u && !a.alpha && !a.residual && !a.wf16 && a.cin % 64u == 0 && a.cout % 64u == 0 &&
+           sp_post_on(0u) && a.post == 0u && !a.alpha && !a.residual && !a.wf16 && a.cin % 64u == 0 && a.cout % 64u == 0 &&
            sp_aligned(a.out, 16) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) && sp_aligned(a.x, 16);
 }
 __device__ __forceinline__ void sp_wg_run_ct(const SpConvArgs& a, unsigned slice, unsigned nblk) {
@@ -4817,15 +4857,15 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
     const bool wide = 20u * r128 <= 13u * r64;
     /* The combinations the speech lowerings use: pointwise with none / GELU / other, taps with
      * none / snake / other, grouped pointwise with none. */
-    if (a.groups > 1u) {
+    if (sp_post_on(0u) && a.groups > 1u) {
         sp_wg_gemm<128, false, 0, true>(M, a.ng, K, a.x, w, ep, slice, nblk);
     } else if (a.kernel == 1u) {
-        if (a.post == 0u) wide ? sp_wg_gemm<128, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk);
-        else if (a.post == 11u) wide ? sp_wg_gemm<128, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk);
+        if (sp_post_on(0u) && a.post == 0u) wide ? sp_wg_gemm<128, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk);
+        else if (sp_post_on(11u) && a.post == 11u) wide ? sp_wg_gemm<128, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk);
         else wide ? sp_wg_gemm<128, false, 3>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 3>(M, a.ng, K, a.x, w, ep, slice, nblk);
     } else {
-        if (a.post == 0u) wide ? sp_wg_gemm<128, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk);
-        else if (a.post == 12u) wide ? sp_wg_gemm<128, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk);
+        if (sp_post_on(0u) && a.post == 0u) wide ? sp_wg_gemm<128, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk);
+        else if (sp_post_on(12u) && a.post == 12u) wide ? sp_wg_gemm<128, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk);
         else wide ? sp_wg_gemm<128, true, 3>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 3>(M, a.cout, K, a.x, w, ep, slice, nblk);
     }
 }

@@ -36,8 +36,10 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
    runtime binary so a concurrent `cargo build` cannot swap it mid-run, runs the
    coherence gate before the first timed request, and exits non-zero if the gate
    fails. A model that answers the gate wrong has no numbers.
-4. **Every GPU stage is leased.** `perf-data/tools/gpulease -n <k>` wraps the
-   server and client together. If the audit sees a foreign process the run is
+4. **Every GPU stage is a gpuq job.** `probe`, `bench`, `gate` and `dist-gate`
+   submit to `scripts/bench/gpuq.py` (`--queue`, default `/tmp/plow-gpuq`) and wait;
+   the job's lease wraps server and client together, and its wrapper exports every
+   `PLOW_*` knob because the runner strips them. If the audit sees a foreign process the run is
    recorded `contended`; `ledger` refuses it unless `--provisional`.
 5. **One variable per experiment.** `ledger --note` is mandatory and names the
    single change. Rejected candidates stay in the ledger so they are not re-run.

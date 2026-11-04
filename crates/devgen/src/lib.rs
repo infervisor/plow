@@ -75,6 +75,7 @@ mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
+mod abi_section;
 pub mod asr;
 pub mod asr_subsampling;
 pub mod codec;
@@ -4517,7 +4518,7 @@ fn emit_phase(
             );
         }
     }
-    let c_ple = if c.ple > 0 && !block_mode {
+    let (c_ple, c_pp) = if c.ple > 0 && !block_mode {
         let lp = c.layers * c.ple;
         let c_pe = b.emit(DevOp::Embed, rows.clone(), &[], |d| {
             d.t[0] = n.ple_raw;
@@ -4557,15 +4558,16 @@ fn emit_phase(
                 d.f[0] = c.eps;
             },
         );
-        b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
+        let c_ple = b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
             d.t[0] = n.ple;
             d.t[1] = n.ple;
             d.t[2] = n.ple_raw;
             d.i[0] = t * lp;
             d.f[0] = std::f32::consts::FRAC_1_SQRT_2;
-        })
+        });
+        (c_ple, Some(c_pp))
     } else {
-        0
+        (0, None)
     };
     if hj {
         b.host_join();
@@ -5387,8 +5389,12 @@ fn emit_phase(
             // The block's FIRST layer reads the uploaded `act.x` with no producer
             // (Embed was skipped), so its RmsNorm depends on `&[]`. Full model =>
             // block.start==0 and this only affects l==0, whose dep IS the Embed.
+            // Layer 0 overwrites `act.x` after the per-layer projection read it.
+            let first_x = [dep, c_pp.unwrap_or(dep)];
             let nd: &[u32] = if block_mode && l == block.start {
                 &[]
+            } else if l == 0 && c_pp.is_some() {
+                &first_x
             } else {
                 &[dep]
             };
@@ -8281,7 +8287,7 @@ pub(crate) fn write_lean_receipts(packet: &std::path::Path, lean: &LeanReport) {
         checks: lean.compile_checks.clone(),
     };
     receipts
-        .validate_packet(&bytes)
+        .validate_packet(&plow_asset::decode_objects::image_sha256(&bytes))
         .expect("compiler check receipt binding");
     let path = packet.with_file_name(PACKET_CHECKS_FILE);
     std::fs::write(
@@ -8394,7 +8400,9 @@ pub fn write_sidecar_packet(
             Some((checks, program_checks))
         }
     };
-    let blob = model.to_blob_v6(sections);
+    let mut sections = sections.to_vec();
+    abi_section::append(model, &mut sections, "", "");
+    let blob = model.to_blob_v6(&sections);
     std::fs::write(path, &blob).unwrap_or_else(|error| panic!("{name}: {error}"));
     let Some((checks, program_checks)) = receipts else {
         // A stale file would describe an older blob.
@@ -8411,7 +8419,7 @@ pub fn write_sidecar_packet(
         program_checks,
     };
     receipts
-        .validate_packet(&blob)
+        .validate_packet(&plow_asset::decode_objects::image_sha256(&blob))
         .expect("sidecar check receipt binding");
     std::fs::write(
         &checks_path,
@@ -11536,17 +11544,17 @@ fn emit_dense_gqa(
         sections.extend(fish_depth::sections(&c, &emitter.tn, t, &m, &rungs));
     }
     // Speech ops of auxiliary programs (not in `m.progs`), for the speech object's arm mask.
-    let mut aux_speech_ops = 0u64;
+    let mut aux_speech = manifest::SpeechMasks::default();
     if c.frame
         .as_ref()
         .and_then(|f| f.depth.as_ref())
         .is_some_and(|d| d.maya2.is_some())
     {
         let n = &emitter.tn;
-        let (depth, ops) =
+        let (depth, speech) =
             maya2_depth::lm_sections(&mut m, &c, n.hn, n.frame_dcodes, n.frame_codes, &rungs);
         sections.extend(depth);
-        aux_speech_ops |= ops;
+        aux_speech.add(speech);
     }
     if let Some(t) = &emitter.tn.mtp {
         sections.extend(mtp::sections(&dir, &c, &emitter.tn, t, &m, &rung_progs));
@@ -11826,6 +11834,7 @@ fn emit_dense_gqa(
     modular::update_section_with_lean(&mut sections, &lean);
     object_requirements::append(&m, &mut sections)
         .unwrap_or_else(|error| panic!("object requirements: {error}"));
+    abi_section::append(&m, &mut sections, &arch, &gpu);
     let blob = m.to_blob_v6(&sections);
     // Coverage gate BEFORE the blob lands on disk: a wrong .pkt that exists will be
     // benchmarked by someone. PLOW_SKIP_COVERAGE=1 is the deliberate escape hatch for
@@ -11924,7 +11933,7 @@ fn emit_dense_gqa(
                 (encoder.prefix.model, section)
             });
     std::fs::write(&out, blob).unwrap();
-    let mut speech_ops = aux_speech_ops;
+    let mut speech = aux_speech;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
         let fish = std::fs::read(dir.join("config.json"))
@@ -11949,7 +11958,7 @@ fn emit_dense_gqa(
         }
         .unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(tts::CODEC_PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
         let enc = dir.join("encoder");
@@ -11965,7 +11974,7 @@ fn emit_dense_gqa(
             }
             .unwrap_or_else(|error| panic!("reference encoder packet: {error}"));
             let path = std::path::Path::new(&out).with_file_name(mimi_encoder::PACKET);
-            speech_ops |= manifest::speech_ops(&model);
+            speech.add(manifest::SpeechMasks::of(&model));
             write_sidecar_packet(&path, &model, &[section]);
             eprintln!("  reference encoder packet -> {}", path.display());
         }
@@ -11975,7 +11984,7 @@ fn emit_dense_gqa(
         let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16)
             .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
         let voice = dir.join("voice");
@@ -11983,7 +11992,7 @@ fn emit_dense_gqa(
             let (model, section) = voice_cond::lower_voice_cond(&voice, n_cu, m.target)
                 .unwrap_or_else(|error| panic!("voice conditioning packet: {error}"));
             let path = std::path::Path::new(&out).with_file_name(voice_cond::PACKET);
-            speech_ops |= manifest::speech_ops(&model);
+            speech.add(manifest::SpeechMasks::of(&model));
             write_sidecar_packet(&path, &model, &[section]);
             eprintln!("  voice conditioning packet -> {}", path.display());
         }
@@ -12007,14 +12016,14 @@ fn emit_dense_gqa(
         for (file, sidecar) in lowered.into_iter().flatten() {
             let sidecar = sidecar.unwrap_or_else(|e| panic!("multimodal {file}: {e}"));
             let path = std::path::Path::new(&out).with_file_name(file);
-            speech_ops |= manifest::speech_ops(&sidecar.model);
+            speech.add(manifest::SpeechMasks::of(&sidecar.model));
             write_sidecar_packet(&path, &sidecar.model, &[sidecar.section]);
             eprintln!("  multimodal encoder packet -> {}", path.display());
         }
     }
     if let Some((model, section)) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name(asr::qwen::ENCODER_PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  audio encoder packet -> {}", path.display());
     }
@@ -12037,8 +12046,9 @@ fn emit_dense_gqa(
     if !arch.is_empty() {
         write_lean_receipts(std::path::Path::new(&out), &lean);
         let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
-        if speech_ops != 0 {
-            man["speech_ops"] = speech_ops.into();
+        if speech.ops != 0 {
+            man["speech_ops"] = speech.ops.into();
+            man["speech_conv_posts"] = speech.conv_posts.into();
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes

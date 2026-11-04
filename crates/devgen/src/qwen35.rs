@@ -656,9 +656,32 @@ impl Emitter<'_> {
         let dt = self.weight(&format!("{p}.dt_bias"), c.hv as u64);
         let gamma = self.weight(&format!("{p}.norm.weight"), c.dv as u64);
         let qkv_name = format!("{p}.in_proj_qkv.weight");
-        let dq = match fold {
-            Some(f) => self.proj_fold(raw, hn, &qkv_name, channels, c.hidden, f, dep),
-            None => self.proj(raw, hn, &qkv_name, channels, c.hidden, dep),
+        let z_name = format!("{p}.in_proj_z.weight");
+        // qkv|z as one N-concatenated projection: the conv reads its columns [0, channels) and
+        // the gated norm z at column `channels` of one row-pitched output (j1 = pitch | col << 16).
+        let qkvz = (self.concat
+            && fold.is_none()
+            && !self.fuse
+            && self.quantized(&qkv_name)
+            && self.quantized(&z_name))
+        .then(|| {
+            let width = channels + value;
+            assert!(
+                width < 1 << 16 && channels < 1 << 16 && width % 8 == 0 && channels % 8 == 0,
+                "{p}: qkv|z row pitch and column must fit 16 bits, 8-element aligned"
+            );
+            (self.act("gdn.qkvz", width), width)
+        });
+        let (raw, raw_source) = match qkvz {
+            Some((t, width)) => (t, width),
+            None => (raw, 0),
+        };
+        let dq = match (fold, qkvz) {
+            (_, Some((t, width))) => {
+                self.proj_leaves(t, hn, &[&qkv_name, &z_name], width, c.hidden, dep)
+            }
+            (Some(f), None) => self.proj_fold(raw, hn, &qkv_name, channels, c.hidden, f, dep),
+            (None, None) => self.proj(raw, hn, &qkv_name, channels, c.hidden, dep),
         };
         let conv_op = if self.prefill {
             DevOp::QwenGdnConvPrefill
@@ -668,8 +691,53 @@ impl Emitter<'_> {
         let dc = self.b.emit(conv_op, self.b.all(), &[dq], |d| {
             d.t[..5].copy_from_slice(&[conv, raw, cw, history, self.active]);
             d.i[..3].copy_from_slice(&[channels, c.conv, self.batch]);
+            d.j[1] = raw_source;
         });
-        let (db, dz) = if self.fuse && self.fuse_ab {
+        let (z, z_source) = match qkvz {
+            Some((t, width)) => (t, width | (channels << 16)),
+            None => (z, 0),
+        };
+        let (db, dz) = if qkvz.is_some() {
+            // z came with qkv; a and b keep their own walks.
+            let ab_dep = if self.projection_dag { dep } else { dc };
+            let db = if self.fuse_ab {
+                let wa = self.weight(
+                    &format!("{p}.in_proj_a.weight"),
+                    c.hv as u64 * c.hidden as u64,
+                );
+                let wb = self.weight(
+                    &format!("{p}.in_proj_b.weight"),
+                    c.hv as u64 * c.hidden as u64,
+                );
+                self.b.emit(
+                    DevOp::GemvQkv,
+                    (0..self.ab_blocks).collect(),
+                    &[ab_dep],
+                    |d| {
+                        d.t[..7].copy_from_slice(&[a, hn, wa, beta, wb, TENSOR_NONE, TENSOR_NONE]);
+                        d.i[..5].copy_from_slice(&[self.batch, c.hv, c.hidden, c.hv, 0]);
+                    },
+                )
+            } else {
+                let da = self.proj(
+                    a,
+                    hn,
+                    &format!("{p}.in_proj_a.weight"),
+                    c.hv,
+                    c.hidden,
+                    ab_dep,
+                );
+                self.proj(
+                    beta,
+                    hn,
+                    &format!("{p}.in_proj_b.weight"),
+                    c.hv,
+                    c.hidden,
+                    da,
+                )
+            };
+            (db, dq)
+        } else if self.fuse && self.fuse_ab {
             // z, a and b share the normalized input: one three-output walk (N = value + 2 hv).
             let wz = self.weight(
                 &format!("{p}.in_proj_z.weight"),
@@ -813,6 +881,7 @@ impl Emitter<'_> {
             d.t[..5].copy_from_slice(&[gated, core, z, gamma, self.active]);
             d.i[..3].copy_from_slice(&[c.hv, c.dv, self.batch]);
             d.f[0] = c.eps;
+            d.j[1] = z_source;
         });
         self.proj(
             mixed,
@@ -1842,6 +1911,12 @@ pub(super) fn run(
         )
         .unwrap_or_else(|error| panic!("generated kernels: {error}"));
     }
+    // PLOW_EMIT_DECODE_FP8_BLOCK: the measured decode block-FP8 projections on the native object.
+    if emit_config::active().decode_fp8_block {
+        let routed = crate::dense_cublaslt::apply_fp8_block(&m, &mut sections, Path::new(out))
+            .unwrap_or_else(|error| panic!("native FP8 block decode: {error}"));
+        eprintln!("  native FP8 block decode: {routed} projection segments");
+    }
     // PLOW_EMIT_ATTN_LIBRARY: the declared library segments keep the roles chosen above.
     let selected = crate::library_attention::apply_output_object(&m, &mut sections, Path::new(out))
         .unwrap_or_else(|error| panic!("library attention: {error}"));
@@ -1938,6 +2013,7 @@ pub(super) fn run(
     sections.push(recurrent_state_section(&m, batch));
     if c.block.is_none() {
         sections.push(crate::serve_section::section_for(dir));
+        crate::abi_section::append(&m, &mut sections, arch, gpu);
     }
     let bytes = if let Some(range) = c.block.clone() {
         use plow_asset::*;
@@ -2719,11 +2795,51 @@ mod tests {
                 .map(|d| d.j[1])
                 .collect();
             assert_eq!(writers, [width | (12288 << 16), width | (13312 << 16)]);
+            // GDN qkv|z: one projection; the conv reads columns [0, 10240), the gated norm z
+            // at column 10240, both at row pitch 16384.
+            let (channels, qkvz) = (10240u32, 16384u32);
+            let convs: Vec<_> = insts
+                .iter()
+                .filter(|d| {
+                    d.op == DevOp::QwenGdnConv as u16 || d.op == DevOp::QwenGdnConvPrefill as u16
+                })
+                .collect();
+            assert_eq!(convs.len(), 3);
+            for conv in convs {
+                assert_eq!((conv.i[0], conv.j[1]), (channels, qkvz));
+                let gemm = insts
+                    .iter()
+                    .find(|d| d.op == DevOp::GemmFp8 as u16 && d.t[0] == conv.t[1])
+                    .expect("qkv|z GEMM");
+                assert_eq!(&gemm.i[..3], &[batch, qkvz, hidden]);
+                let sources = &derived
+                    .get(&m.tensors[gemm.t[2] as usize].name)
+                    .unwrap()
+                    .sources;
+                assert!(sources[0].ends_with("linear_attn.in_proj_qkv.weight"));
+                assert!(sources[1].ends_with("linear_attn.in_proj_z.weight"));
+                let norm = insts
+                    .iter()
+                    .find(|d| d.op == DevOp::QwenGatedNorm as u16 && d.t[2] == conv.t[1])
+                    .expect("gated norm reads z from qkv|z");
+                assert_eq!(norm.j[1], qkvz | (channels << 16));
+            }
+            assert!(!insts.iter().any(|d| d.op == DevOp::GemmFp8 as u16
+                && m.tensors[d.t[2] as usize]
+                    .name
+                    .ends_with("in_proj_z.weight")));
         }
         assert_eq!(
             crate::dense_cublaslt::runtime_requires(&m, &[])["plowrt_contract"],
             plow_asset::RUNTIME_CONTRACT_CONCAT
         );
+        // Objects that ignore j1 would misread the pitched sources: both modules must attest it.
+        let pitched = plow_asset::object_requirements::Requirement::new(
+            plow_asset::object_requirements::GDN_PITCHED_ABI,
+            1,
+        );
+        let reqs = crate::object_requirements::manifest(&m, None);
+        assert!(reqs.prefill.contains(&pitched) && reqs.decode.contains(&pitched));
     }
 
     fn fixture() -> Value {

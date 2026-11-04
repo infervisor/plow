@@ -340,6 +340,8 @@ static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
         for (int ks = 0; ks < ksteps; ks++) {
             const int cur = ks % PGM90_STAGES;
             sm90_cp_wait<PGM90_STAGES - 2>();
+            /* cp.async writes through the generic proxy; wgmma reads through the async proxy. */
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
 #if PLOW_NV_W8A16_ASYNC && defined(PLOW_NV_W8A16_WGMMA) && PLOW_NV_W8A16_WGMMA
             if constexpr (std::is_same_v<Weight, uint8_t>)
@@ -2447,6 +2449,7 @@ static __device__ void d_gemm_glu_sm90(__nv_bfloat16* __restrict__ C,
         for (int ks = 0; ks < ksteps; ks++) {
             const int cur = ks % PGM90_GLU_STAGES;
             sm90_cp_wait<PGM90_GLU_STAGES - 2>();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             const __nv_bfloat16* Ac = As + cur * PGM90_ABUF + wg * PGM90_MSLAB * PGM90_BK;
             const __nv_bfloat16* Bg = Bgs + cur * PGM90_BBUF;
@@ -2562,6 +2565,7 @@ static __device__ void d_gemm_w8a8_sm90(__nv_bfloat16* __restrict__ C,
         for (int ks = 0; ks < ksteps; ks++) {
             const int cur = ks % PGM90_STAGES;
             sm90_cp_wait<PGM90_STAGES - 2>();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             const uint8_t* Ac = As + cur * PGM90_A8BUF + wg * PGM90_MSLAB * PGM90_BK8;
             const uint8_t* Bc = Bs + cur * PGM90_B8BUF;
@@ -2669,6 +2673,7 @@ static __device__ void d_gemm_glu_w8a8_sm90(__nv_bfloat16* __restrict__ C,
         for (int ks = 0; ks < ksteps; ks++) {
             const int cur = ks % PGM90_GLU_STAGES;
             sm90_cp_wait<PGM90_GLU_STAGES - 2>();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             const uint8_t* Ac = As + cur * PGM90_A8BUF + wg * PGM90_MSLAB * PGM90_BK8;
             const uint8_t* Bg = Bgs + cur * PGM90_B8BUF;

@@ -439,6 +439,28 @@ fn a_different_sku_at_the_same_isa_and_units_warns_rather_than_refuses() {
 }
 
 #[test]
+fn an_h100_sxm_build_is_selected_on_h200_sxm() {
+    let gib = 1u64 << 30;
+    let vs = vec![variant(
+        "sm90a-h100-tp1",
+        1,
+        target("sm_90a", "H100 SXM", 132, 80 * gib),
+        "tp",
+        1,
+    )];
+    let h200 = live("sm_90a", "H200 SXM", 132, 141 * gib, 1);
+    let picked = select(&vs, &h200, &Constraints::default()).unwrap();
+    assert_eq!(picked.label, "sm90a-h100-tp1");
+    let table = assess(&vs, &h200, &Constraints::default());
+    assert!(table[0].ok(), "{:?}", table[0].reject);
+    assert!(
+        table[0].warns.iter().any(|w| w.contains("SKU")),
+        "{:?}",
+        table[0].warns
+    );
+}
+
+#[test]
 fn the_refusal_table_names_every_candidate() {
     let vs = vec![
         variant(
@@ -816,11 +838,28 @@ fn objset_rejects_structural_damage() {
     o.objects.clear();
     assert!(o.validate().is_err());
 
-    for name in ["", "../x.elf", "/x.elf", "d/x.elf"] {
+    for name in [
+        "",
+        "../x.elf",
+        "/x.elf",
+        "d/x.elf",
+        "objects/",
+        "objects/../x.elf",
+        "objects/d/x.elf",
+        "objects//x.elf",
+        "objects",
+        "objects/x.cubin/.",
+        "x.elf/.",
+        "objects/..\\x.elf",
+    ] {
         let mut o = base.clone();
         o.objects[0].name = name.into();
         assert!(o.validate().is_err(), "accepted {name}");
     }
+    // NVIDIA's segment objects sit one level down, where serving reads them.
+    let mut o = base.clone();
+    o.objects[0].name = format!("{SEGMENT_OBJECTS_DIR}/interp_sm90a_pfseg.cubin");
+    assert!(o.validate().is_ok());
 
     let mut o = base.clone();
     let dup = o.objects[0].clone();
@@ -1100,4 +1139,10 @@ fn on_a_larger_chip_the_nearest_build_wins() {
     )
     .unwrap();
     assert_eq!(pick.label, "metal3-apple-m4-pro-tp1-2k");
+}
+
+#[test]
+fn objects_land_where_each_vendor_serves_them() {
+    assert_eq!(objset_root("nvidia"), "");
+    assert_eq!(objset_root("amd"), "hsaco");
 }

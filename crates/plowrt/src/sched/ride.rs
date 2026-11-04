@@ -133,7 +133,7 @@ impl RideCost {
         (any, cap)
     }
 
-    fn rung_ms(&self, rows: usize) -> Option<f64> {
+    pub fn rung_ms(&self, rows: usize) -> Option<f64> {
         self.buckets
             .iter()
             .find(|b| b.rows == rows)

@@ -495,6 +495,20 @@ impl VmmRings {
         self.mapped.len()
     }
 
+    /// What released units the rings keep: `(recycle, bounded, cap)`.
+    pub fn retention(&self) -> (bool, bool, u64) {
+        (self.recycle, self.bounded, self.spare_cap)
+    }
+
+    /// Restore a [`Self::retention`]; `(true, true, 0)` returns every parked slot and spare unit
+    /// to the driver and keeps none released after.
+    pub fn set_retention(&mut self, (recycle, bounded, cap): (bool, bool, u64)) {
+        self.recycle = recycle;
+        self.bounded = bounded;
+        self.spare_cap = cap;
+        self.trim_spare();
+    }
+
     /// Set the bounded park's cap, releasing what it holds above it.
     pub fn set_park_cap(&mut self, cap_bytes: u64) {
         if self.bounded {
@@ -703,6 +717,21 @@ impl VmmRings {
         let cap = std::mem::replace(&mut self.spare_cap, 0);
         self.trim_spare();
         self.spare_cap = cap;
+        self.spare_bytes() < before
+    }
+
+    /// [`Self::release_parked`] for at most `max_slots` slots' worth of kept units (bounded
+    /// driver work per call). Returns whether any kept memory went back to the driver.
+    pub fn release_parked_upto(&mut self, max_slots: usize) -> bool {
+        if !self.bounded {
+            return false;
+        }
+        let before = self.spare_bytes();
+        let cap = before.saturating_sub(max_slots as u64 * self.slot_charge());
+        let cap = cap.min(self.spare_cap);
+        let saved = std::mem::replace(&mut self.spare_cap, cap);
+        self.trim_spare();
+        self.spare_cap = saved;
         self.spare_bytes() < before
     }
 
@@ -2482,6 +2511,34 @@ impl VmmKv {
 
     /// Release a finished request's cache holds while retaining its writable KV mappings.
     /// CUDA's inactive decode rows can still write at the saved frontier.
+    /// Free `bytes` more device memory than is free now (and at least `bytes` above the pressure
+    /// floor) for an allocation outside the pool (a live ring commit, a co-tenant load): the
+    /// store's reclaimable chunks first, then LRU boundaries, as the pressure trim does.
+    /// Releases already queued count as made (they land on the store's free thread). Returns
+    /// whether anything was released or queued; `false` without a pressure floor.
+    pub fn reclaim_above_floor(&self, bytes: u64) -> bool {
+        let s = &self.shared;
+        let floor = s.cache_min_free.load(Ordering::Relaxed);
+        if floor == 0 {
+            return false;
+        }
+        let mut inner = s.inner.lock();
+        let free = s.ops.free_bytes().unwrap_or(0);
+        let bytes = free.saturating_sub(floor).saturating_add(bytes);
+        let coming = |inner: &Inner| {
+            s.ops.free_bytes().unwrap_or(0)
+                + inner.release_queued
+                + pending_spill_bytes(inner)
+                + inner
+                    .block_store
+                    .as_ref()
+                    .map_or(0, |hook| hook.pending_spill_bytes())
+        };
+        let before = coming(&inner);
+        trim_cache_above(s, &mut inner, evict_one, bytes);
+        coming(&inner) > before
+    }
+
     pub fn release_prefix(&self, seq: usize) {
         let s = &self.shared;
         let mut inner = s.inner.lock();
@@ -5089,12 +5146,25 @@ fn trim_cache_by(
     inner: &mut Inner,
     evict_one: impl Fn(&Shared, &mut Inner, bool) -> bool,
 ) {
+    trim_cache_above(s, inner, evict_one, 0);
+}
+
+/// [`trim_cache_by`] holding `extra` bytes above the pressure floor (pressure mode only).
+fn trim_cache_above(
+    s: &Shared,
+    inner: &mut Inner,
+    evict_one: impl Fn(&Shared, &mut Inner, bool) -> bool,
+    extra: u64,
+) {
     reap_spills(s, inner);
     if let Some(hook) = &inner.block_store {
         hook.reap();
     }
     demote_expired(s, inner);
-    let min_free = s.cache_min_free.load(Ordering::Relaxed);
+    let min_free = match s.cache_min_free.load(Ordering::Relaxed) {
+        0 => 0,
+        floor => floor.saturating_add(extra),
+    };
     if min_free > 0 {
         if let Some(mut free) = s.ops.free_bytes() {
             if pfx_trace::on() {
@@ -5499,7 +5569,7 @@ impl Drop for HostTierGrant {
 
 /// Grant an engine asking `requested` host-tier bytes its share. The tier pins host memory and
 /// never gives it back, so co-served engines draw from ONE budget — the largest any engine has
-/// asked (its packet's `PLOW_VMM_HOST_CACHE_MIB`, or the auto size) — never one each: the second
+/// asked (its packet's `PLOW_HOST_KVCACHE_SIZE`, or the auto size) — never one each: the second
 /// of two 64 GiB engines gets what the first left. A lone engine gets exactly what it asked.
 pub(crate) fn host_tier_grant(requested: u64) -> HostTierGrant {
     HOST_TIER_BUDGET.fetch_max(requested, Ordering::AcqRel);
@@ -9090,6 +9160,37 @@ mod tests {
         assert_eq!(p.stats().cache_blocks, 4, "the other prefix stays cached");
     }
 
+    /// A commit outside the pool (a live ring) asks for `bytes` more than is free: the same trim
+    /// evicts only until that is free or on its way, and reports whether it did.
+    #[test]
+    fn reclaim_above_floor_evicts_only_for_the_requested_bytes() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 1 << 20);
+        p.enable_deferred_reclaim();
+        let a = prompt(17);
+        let c: Vec<u32> = a.iter().map(|t| t + 1).collect();
+        for (seq, pr) in [(0, &a), (1, &c)] {
+            p.try_attach(seq, pr).unwrap();
+            p.ensure_rows(seq, 17).unwrap();
+            p.publish(seq, pr, 48, |_| Ok(())).unwrap();
+            p.begin_seq(seq);
+        }
+        p.sync_reclaim();
+        assert!(
+            !p.reclaim_above_floor(256),
+            "no pressure floor: nothing to do"
+        );
+        *ops.free_bytes.lock().unwrap() = Some(400);
+        p.enable_pressure_eviction(300);
+        assert!(p.reclaim_above_floor(100), "one prefix (256 B) queued");
+        assert_eq!(p.stats().eviction_units, 1);
+        assert_eq!(p.stats().cache_blocks, 4, "the other prefix stays cached");
+        // Each call asks beyond what is free now; the caller re-reads free memory in between.
+        assert!(p.reclaim_above_floor(100));
+        assert_eq!(p.stats().cache_blocks, 0);
+        assert!(!p.reclaim_above_floor(100), "nothing left to give");
+    }
+
     #[test]
     fn from_config_uniform_layers_fallback() {
         // No layer_types (Qwen/Llama-family config): every layer is full
@@ -11495,6 +11596,16 @@ mod tests {
         p.shared.inner.lock().spares
     }
 
+    /// Bounded [`VmmKv::sync_reclaim`], twice: the jobs queued so far, then the refill a
+    /// copy-out queues behind them. True once both ran within `limit` each.
+    fn reclaim_settled_within(p: &VmmKv, limit: std::time::Duration) -> bool {
+        let Some(tx) = &p.premap_tx else { return true };
+        (0..2).all(|_| {
+            let (reply, done) = std::sync::mpsc::channel();
+            tx.send(Job::Sync(reply)).is_ok() && done.recv_timeout(limit).is_ok()
+        })
+    }
+
     /// The copy-out gives the cache copies of the released slot's shared row 0 without a single
     /// unmap: the next occupant keeps row 0 in place, and another slot attaches the copies.
     #[test]
@@ -11695,7 +11806,15 @@ mod tests {
                 p.release_prefix(0);
                 p.retire_released(0);
             }
+            // The think time, then the reclaimer's turn: a loaded host can starve its thread
+            // past 25 ms, which is scheduling, not the admission path under test.
             std::thread::sleep(std::time::Duration::from_millis(25));
+            for (rank, (_, p)) in ranks.iter().enumerate() {
+                assert!(
+                    reclaim_settled_within(p, std::time::Duration::from_secs(5)),
+                    "request {request} rank {rank}: reclaim not settled (5 s per round)"
+                );
+            }
         }
         println!("C1 model: worst begin_seq across ranks {worst:?}");
         for (ops, p) in ranks {

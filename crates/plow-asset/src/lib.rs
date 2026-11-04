@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod abi;
 pub mod certificates;
 pub mod chat;
 pub mod gemm_policy;
@@ -22,7 +23,7 @@ pub mod logical_effects;
 
 /// The plowrt runtime contract this tree implements; plowrt refuses a bundle whose `build.json`
 /// `runtime_requires.plowrt_contract` is higher.
-pub const RUNTIME_CONTRACT: u32 = RUNTIME_CONTRACT_CONCAT;
+pub const RUNTIME_CONTRACT: u32 = RUNTIME_CONTRACT_FP8_BLOCK_NATIVE;
 /// The contract a bundle declares unless it uses a later feature.
 pub const RUNTIME_CONTRACT_BASE: u32 = 2;
 /// Block-scaled FP8 projections (`packet::dev::FP8_BLOCK_GROUP`) on cuBLASLt.
@@ -30,6 +31,9 @@ pub const RUNTIME_CONTRACT_FP8_BLOCK: u32 = 3;
 /// Load-time concatenated weights (`packet::names::CONCAT_PREFIX`) and the row-pitched GLU
 /// (`packet::dev::DevOp::GluPitched`) that reads their projection's output.
 pub const RUNTIME_CONTRACT_CONCAT: u32 = 4;
+/// The native block-scaled FP8 decode GEMM object
+/// (`segment_roles::NATIVE_DECODE_FP8_BLOCK`) beside cuBLASLt projections.
+pub const RUNTIME_CONTRACT_FP8_BLOCK_NATIVE: u32 = 5;
 
 // --- Shared domain enums -----------------------------------------------------
 

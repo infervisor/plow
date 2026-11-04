@@ -1794,7 +1794,10 @@ pub enum DevOp {
     GemvF32 = 135,
     /// Packed causal convolution plus SiLU. BF16 x/out[B,C], weight[C,W], and mutable history[B,C,W-1] (oldest first); optional I32 active[B] masks writes.
     ///
-    /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B`.
+    /// `source` (j1, 0 = contiguous x) is `in_stride | in_col << 16` in elements: x's row pitch and
+    /// column inside an N-concatenated projection's output (runtime contract 4).
+    ///
+    /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B` · `j1=source?`.
     QwenGdnConv = 136,
     /// Recurrent GDN with K=128 and HV divisible by HK. BF16 out[B,HV,V], packed qkv[B,2*HK*K+HV*V], a/b[B,HV], and dt_bias[HV]. A_log[HV] is BF16 unless alog_f32 is nonzero. Mutable FP32 state[B,HV,V,K]; optional I32 active[B] masks writes. Beta rounds to BF16 before recurrence.
     ///
@@ -1802,7 +1805,10 @@ pub enum DevOp {
     QwenGdnStep = 137,
     /// Ordinary per-head RMSNorm(core) times SiLU(z). BF16 core/z/out[B,HV,V] and gamma[V]; optional I32 active[B].
     ///
-    /// `t0=out t1=core t2=z t3=gamma t4=active?` · `i0=HV i1=V i2=B` · `f0=eps`.
+    /// `source` (j1, 0 = contiguous z) is `z_stride | z_col << 16` in elements: z's row pitch and
+    /// column inside an N-concatenated projection's output (runtime contract 4).
+    ///
+    /// `t0=out t1=core t2=z t3=gamma t4=active?` · `i0=HV i1=V i2=B` · `f0=eps` · `j1=source?`.
     QwenGatedNorm = 138,
     /// Deinterleave each head of BF16 packed[B,H,2*D] into Q/gate[B,H,D]; optional I32 active[B].
     /// `in_stride` (elements, 0 = 2*H*D) is packed's row pitch when it is the q|gate block at
@@ -1827,7 +1833,9 @@ pub enum DevOp {
     QwenHeadNormRope = 142,
     /// BF16 causal convolution plus SiLU for exactly T valid tokens: x/out[T,C], weight[C,W], mutable oldest-first history[1,C,W-1]. Updates history after the chunk.
     ///
-    /// `t0=out t1=x t2=weight t3=history` · `i0=C i1=W i2=T`.
+    /// `source` (j1) as [`DevOp::QwenGdnConv`].
+    ///
+    /// `t0=out t1=x t2=weight t3=history` · `i0=C i1=W i2=T` · `j1=source?`.
     QwenGdnConvPrefill = 143,
     /// Unpack BF16 packed[T,2*HK*K+HV*V]; normalize Q/K[T,HK,K] and round to BF16, copy V[T,HV,V]. No Q scaling.
     ///

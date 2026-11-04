@@ -31,6 +31,7 @@ nix develop --command env \
   PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32,48 \
   PLOW_EMIT_DECODE_CUBLASLT=1 \
   PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS=1 \
+  PLOW_EMIT_DECODE_FP8_BLOCK=1 \
   PLOW_EMIT_GEN_KERNELS=attn_pf_hd256_causal_ilv,attn_dec_hd256_gqa6_ilv \
   PLOW_EMIT_PACKED_PREFILL=1 \
   PLOW_EMIT_PREFILL_CUBLASLT=1 \
@@ -76,6 +77,7 @@ plowrt serve --model infervisor/qwen3.8-27b:sm90a-h100-tp1-fp8 --port 8080
 
 # Equivalently, from a locally built asset directory:
 nix develop --command env \
+  PLOW_GEN_DECODE_STEP=1 \
   PLOW_MAX_QUEUED_REQUESTS=128 \
   PLOW_PF_INTERLEAVE=0 \
   PLOW_PREFIX_CACHE=1 \

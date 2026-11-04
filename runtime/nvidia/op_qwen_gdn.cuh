@@ -110,10 +110,15 @@ static __device__ __forceinline__ float qwen_sigmoid(float x) {
     return qwen_div_pos(1.f, 1.f + expf(-x));
 }
 
+/* source (j1, 0 = contiguous in[B][C]): in_stride | in_col << 16 (elements), the row pitch and
+ * column of x inside an N-concatenated projection's output (runtime contract 4). */
 static __device__ void d_qwen_gdn_conv(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* weight, __nv_bfloat16* history, const int* active,
-    unsigned channels, unsigned width, unsigned batch, unsigned slice, unsigned nblk) {
+    unsigned channels, unsigned width, unsigned batch, unsigned slice, unsigned nblk,
+    unsigned source = 0) {
     if (width < 2) { if (threadIdx.x == 0) __trap(); return; }
+    const unsigned is = source ? (source & 0xFFFFu) : channels;
+    in += source >> 16;
     for (unsigned row = slice * blockDim.x + threadIdx.x; row < batch * channels;
          row += nblk * blockDim.x) {
         if (active && active[row / channels] <= 0) continue;
@@ -123,7 +128,7 @@ static __device__ void d_qwen_gdn_conv(__nv_bfloat16* out, const __nv_bfloat16* 
         float sum = 0.f;
         for (unsigned j = 0; j + 1 < width; j++)
             sum = fmaf(__bfloat162float(h[j]), __bfloat162float(w[j]), sum);
-        const __nv_bfloat16 x = in[row];
+        const __nv_bfloat16 x = in[(size_t)(row / channels) * is + c];
         sum = fmaf(__bfloat162float(x), __bfloat162float(w[width - 1]), sum);
         for (unsigned j = 0; j + 2 < width; j++) h[j] = h[j + 1];
         h[width - 2] = x;
@@ -359,8 +364,14 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
 template <bool PF>
 static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16* core,
     const __nv_bfloat16* z, const __nv_bfloat16* gamma, const int* active,
-    unsigned heads, unsigned dim, unsigned batch, float eps, unsigned slice, unsigned nblk) {
+    unsigned heads, unsigned dim, unsigned batch, float eps, unsigned slice, unsigned nblk,
+    unsigned source = 0) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    /* source (j1, 0 = contiguous z[B][H][D]): z_stride | z_col << 16 (elements) inside an
+     * N-concatenated projection's output (runtime contract 4); `zrow` is z's (row, head) base. */
+    const unsigned zs = source ? (source & 0xFFFFu) : heads * dim;
+    z += source >> 16;
+    auto zrow = [&](unsigned row) { return z + (size_t)(row / heads) * zs + (size_t)(row % heads) * dim; };
     if constexpr (PF) {
     if (dim == 128) {
         // Prefill objects only (the decode rows are few and its entry is at the register cap):
@@ -381,7 +392,7 @@ static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16
                 on[r] = row < total && (!active || active[row / heads] > 0);
                 const size_t off = (size_t)row * dim + lane * 4u;
                 c2[r] = on[r] ? *(const uint2*)(core + off) : make_uint2(0u, 0u);
-                z2[r] = on[r] ? *(const uint2*)(z + off) : make_uint2(0u, 0u);
+                z2[r] = on[r] ? *(const uint2*)(zrow(row) + lane * 4u) : make_uint2(0u, 0u);
             }
 #pragma unroll
             for (unsigned r = 0; r < R; r++) {
@@ -411,7 +422,7 @@ static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16
 #pragma unroll
             for (int j = 0; j < 4; j++) {
                 const unsigned d = lane + 32 * j;
-                const float g = __bfloat162float(z[off + d]);
+                const float g = __bfloat162float(zrow(row)[d]);
                 out[off + d] = __float2bfloat16(v[j] * inv * __bfloat162float(gamma[d]) * qwen_silu(g));
             }
         }
@@ -428,7 +439,7 @@ static __device__ void d_qwen_gated_norm(__nv_bfloat16* out, const __nv_bfloat16
         const float inv = rsqrtf(qwen_warp_sum(sum) / dim + eps);
         for (unsigned d = lane; d < dim; d += 32) {
             float v = __bfloat162float(core[off + d]) * inv * __bfloat162float(gamma[d]);
-            float gate = __bfloat162float(z[off + d]);
+            float gate = __bfloat162float(zrow(row)[d]);
             out[off + d] = __float2bfloat16(v * qwen_silu(gate));
         }
     }
@@ -833,7 +844,7 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
 // Channel `c` of a sequence shorter than width-1 rows, walked serially.
 static __device__ __forceinline__ void d_qwen_gdn_conv_serial_channel(__nv_bfloat16* out,
     const __nv_bfloat16* in, const __nv_bfloat16* weight, __nv_bfloat16* history,
-    unsigned channels, unsigned width, unsigned tokens, unsigned c) {
+    unsigned channels, unsigned width, unsigned tokens, unsigned c, unsigned is) {
     const __nv_bfloat16* w = weight + (size_t)c * width;
     __nv_bfloat16* h = history + (size_t)c * (width - 1);
     for (unsigned t = 0; t < tokens; t++) {
@@ -841,14 +852,14 @@ static __device__ __forceinline__ void d_qwen_gdn_conv_serial_channel(__nv_bfloa
         for (unsigned j = 0; j < width; j++) {
             int source = (int)t + (int)j - (int)(width - 1);
             float x = source < 0 ? __bfloat162float(h[t + j])
-                : __bfloat162float(in[(size_t)source * channels + c]);
+                : __bfloat162float(in[(size_t)source * is + c]);
             sum = fmaf(x, __bfloat162float(w[j]), sum);
         }
         out[(size_t)t * channels + c] = __float2bfloat16(qwen_silu(sum));
     }
     for (unsigned j = 0; j + 1 < width; j++) {
         int source = (int)tokens + (int)j - (int)(width - 1);
-        h[j] = source < 0 ? h[tokens + j] : in[(size_t)source * channels + c];
+        h[j] = source < 0 ? h[tokens + j] : in[(size_t)source * is + c];
     }
 }
 
@@ -890,7 +901,7 @@ static __device__ __forceinline__ unsigned qwen_conv4_tile_rows(unsigned rows, u
 template <unsigned DEPTH>
 static __device__ __forceinline__ void d_qwen_gdn_conv4_tile(__nv_bfloat16* out,
     const __nv_bfloat16* in, const __nv_bfloat16* weight, __nv_bfloat16* history,
-    unsigned channels, unsigned tokens, unsigned c0, unsigned tile, unsigned vt) {
+    unsigned channels, unsigned tokens, unsigned c0, unsigned tile, unsigned vt, unsigned is) {
     constexpr unsigned PD = DEPTH;
     const unsigned t0 = tile * vt, t1 = min(t0 + vt, tokens), nt = t1 - t0;
     float wf[4][8];
@@ -910,21 +921,21 @@ static __device__ __forceinline__ void d_qwen_gdn_conv4_tile(__nv_bfloat16* out,
             r2[ch] = __bfloat162float(h[2]);
         }
     } else {
-        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 3) * channels + c0), r0);
-        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 2) * channels + c0), r1);
-        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 1) * channels + c0), r2);
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 3) * is + c0), r0);
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 2) * is + c0), r1);
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)(t0 - 1) * is + c0), r2);
     }
     uint4 nx[PD];
 #pragma unroll
     for (unsigned u = 0; u < PD; u++)
-        nx[u] = u < nt ? *(const uint4*)(in + (size_t)(t0 + u) * channels + c0)
+        nx[u] = u < nt ? *(const uint4*)(in + (size_t)(t0 + u) * is + c0)
                        : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll 1
     for (unsigned t = 0; t < nt; t += PD) {
         uint4 nn[PD];
 #pragma unroll
         for (unsigned u = 0; u < PD; u++)
-            nn[u] = t + PD + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + PD + u) * channels + c0)
+            nn[u] = t + PD + u < nt ? *(const uint4*)(in + (size_t)(t0 + t + PD + u) * is + c0)
                                     : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
         for (unsigned u = 0; u < PD; u++) {
@@ -948,7 +959,7 @@ static __device__ __forceinline__ void d_qwen_gdn_conv4_tile(__nv_bfloat16* out,
 #pragma unroll
         for (int j = 0; j < 3; j++)
             for (int ch = 0; ch < 8; ch++)
-                history[(size_t)(c0 + ch) * 3u + j] = in[(size_t)(tokens + j - 3) * channels + c0 + ch];
+                history[(size_t)(c0 + ch) * 3u + j] = in[(size_t)(tokens + j - 3) * is + c0 + ch];
     }
 }
 
@@ -961,7 +972,7 @@ static __device__ __forceinline__ void d_qwen_gdn_conv4_tile(__nv_bfloat16* out,
 template <bool PF, unsigned DEPTH = 4, unsigned RESB = 1>
 static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* weight, __nv_bfloat16* history, unsigned channels,
-    unsigned width, unsigned tokens, unsigned slice, unsigned nblk) {
+    unsigned width, unsigned tokens, unsigned slice, unsigned nblk, unsigned is) {
     // Tiles of TILE tokens per (channel, tile) thread: a serial per-channel walk left 100 of 132
     // blocks idle and cost 123 ms for 4096 rows (48 layers). Only the tile-0 thread reads the
     // history (sources before the chunk) and, once its tile is done, rewrites it from the chunk's
@@ -974,7 +985,7 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
         const unsigned cg = channels >> 3, vt = qwen_conv4_tile_rows<DEPTH, RESB>(tokens, cg);
         const unsigned ntiles = (tokens + vt - 1) / vt;
         for (unsigned i = slice * blockDim.x + threadIdx.x; i < cg * ntiles; i += nblk * blockDim.x)
-            d_qwen_gdn_conv4_tile<DEPTH>(out, in, weight, history, channels, tokens, (i % cg) * 8u, i / cg, vt);
+            d_qwen_gdn_conv4_tile<DEPTH>(out, in, weight, history, channels, tokens, (i % cg) * 8u, i / cg, vt, is);
         return;
     }
     }
@@ -992,10 +1003,10 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
             for (unsigned j = 0; j + 1 < width; j++) {
                 const int source = (int)t0 + (int)j - (int)(width - 1);
                 win[j] = source < 0 ? __bfloat162float(h[t0 + j])
-                    : __bfloat162float(in[(size_t)source * channels + c]);
+                    : __bfloat162float(in[(size_t)source * is + c]);
             }
             for (unsigned t = t0; t < t1; t++) {
-                const float x = __bfloat162float(in[(size_t)t * channels + c]);
+                const float x = __bfloat162float(in[(size_t)t * is + c]);
                 float sum = 0.f;
                 for (unsigned j = 0; j + 1 < width; j++) sum = fmaf(win[j], wf[j], sum);
                 sum = fmaf(x, wf[width - 1], sum);
@@ -1005,12 +1016,12 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
             }
             if (tile == 0)
                 for (unsigned j = 0; j + 1 < width; j++)
-                    h[j] = in[(size_t)(tokens + j - (width - 1)) * channels + c];
+                    h[j] = in[(size_t)(tokens + j - (width - 1)) * is + c];
         }
         return;
     }
     for (unsigned c = slice * blockDim.x + threadIdx.x; c < channels; c += nblk * blockDim.x)
-        d_qwen_gdn_conv_serial_channel(out, in, weight, history, channels, width, tokens, c);
+        d_qwen_gdn_conv_serial_channel(out, in, weight, history, channels, width, tokens, c, is);
 }
 
 // A request shorter than width-1 rows (a rider's one-row decode request) for one 8-channel
@@ -1020,7 +1031,7 @@ static __device__ void d_qwen_gdn_conv_prefill_seq(__nv_bfloat16* out, const __n
 // as the serial walk; the window's floats are the bf16 values, so the rewrite is exact.
 static __device__ __forceinline__ void d_qwen_gdn_conv4_short(__nv_bfloat16* out,
     const __nv_bfloat16* in, const __nv_bfloat16* weight, __nv_bfloat16* history,
-    unsigned channels, unsigned tokens, unsigned c0) {
+    unsigned channels, unsigned tokens, unsigned c0, unsigned is) {
     float wf[4][8];
 #pragma unroll
     for (int ch = 0; ch < 8; ch++) {
@@ -1042,7 +1053,7 @@ static __device__ __forceinline__ void d_qwen_gdn_conv4_short(__nv_bfloat16* out
     }
     for (unsigned t = 0; t < tokens; t++) {
         float x[8], o[8];
-        qwen_bf_unpack8(*(const uint4*)(in + (size_t)t * channels + c0), x);
+        qwen_bf_unpack8(*(const uint4*)(in + (size_t)t * is + c0), x);
 #pragma unroll
         for (int ch = 0; ch < 8; ch++) {
             float sum = fmaf(r0[ch], wf[0][ch], 0.f);
@@ -1104,15 +1115,18 @@ template <bool PF, unsigned DEPTH = 4, unsigned RESB = 1>
 static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* weight, __nv_bfloat16* history, unsigned channels,
     unsigned width, unsigned tokens, unsigned rows, unsigned slice, unsigned nblk,
-    const int* req = nullptr) {
+    const int* req = nullptr, unsigned source = 0) {
     if (width < 2 || width > 8 || !tokens) { if (threadIdx.x == 0) __trap(); return; }
+    /* source (j1, 0 = contiguous in[T][C]): in_stride | in_col << 16 as d_qwen_gdn_conv. */
+    const unsigned is = source ? (source & 0xFFFFu) : channels;
+    in += source >> 16;
     if (rows > tokens) {
         const size_t pad0 = (size_t)tokens * channels, pad1 = (size_t)rows * channels;
         for (size_t i = pad0 + slice * blockDim.x + threadIdx.x; i < pad1; i += (size_t)nblk * blockDim.x)
             out[i] = __float2bfloat16(0.f);
     }
     if (!req) {
-        d_qwen_gdn_conv_prefill_seq<PF, DEPTH, RESB>(out, in, weight, history, channels, width, tokens, slice, nblk);
+        d_qwen_gdn_conv_prefill_seq<PF, DEPTH, RESB>(out, in, weight, history, channels, width, tokens, slice, nblk, is);
         return;
     }
     const unsigned n = (unsigned)req[0];
@@ -1162,14 +1176,14 @@ static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bf
                 const unsigned tile = i / cg, r = qwen_pack_find(s_tile, n, tile);
                 const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
                 const unsigned slot = (unsigned)req[3 + 4 * r];
-                d_qwen_gdn_conv4_tile<DEPTH>(out + (size_t)row0 * channels, in + (size_t)row0 * channels,
-                    weight, history + (size_t)slot * channels * 3u, channels, len, c0, tile - s_tile[r], vt);
+                d_qwen_gdn_conv4_tile<DEPTH>(out + (size_t)row0 * channels, in + (size_t)row0 * is,
+                    weight, history + (size_t)slot * channels * 3u, channels, len, c0, tile - s_tile[r], vt, is);
             } else {
                 const unsigned r = qwen_pack_find(s_short, n, (i - long_items) / cg);
                 const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
                 const unsigned slot = (unsigned)req[3 + 4 * r];
-                d_qwen_gdn_conv4_short(out + (size_t)row0 * channels, in + (size_t)row0 * channels,
-                    weight, history + (size_t)slot * channels * 3u, channels, len, c0);
+                d_qwen_gdn_conv4_short(out + (size_t)row0 * channels, in + (size_t)row0 * is,
+                    weight, history + (size_t)slot * channels * 3u, channels, len, c0, is);
             }
         }
         return;
@@ -1183,8 +1197,8 @@ static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bf
         const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
         const unsigned slot = (unsigned)req[3 + 4 * r];
         if (len + 1 < width) continue;
-        d_qwen_gdn_conv_prefill_seq<PF, DEPTH, RESB>(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
-            history + (size_t)slot * channels * (width - 1), channels, width, len, slice, nblk);
+        d_qwen_gdn_conv_prefill_seq<PF, DEPTH, RESB>(out + (size_t)row0 * channels, in + (size_t)row0 * is, weight,
+            history + (size_t)slot * channels * (width - 1), channels, width, len, slice, nblk, is);
     }
     // Requests shorter than width-1 rows (the riders' one-row decode requests) in one flat pass:
     // one serial pass per request cost a dependent-load round trip each, 25 riders ~50 us on a
@@ -1194,8 +1208,8 @@ static __device__ void d_qwen_gdn_conv_prefill(__nv_bfloat16* out, const __nv_bf
         const unsigned row0 = (unsigned)req[1 + 4 * r], len = (unsigned)req[2 + 4 * r];
         if (len + 1 >= width) continue;
         const unsigned slot = (unsigned)req[3 + 4 * r];
-        d_qwen_gdn_conv_serial_channel(out + (size_t)row0 * channels, in + (size_t)row0 * channels, weight,
-            history + (size_t)slot * channels * (width - 1), channels, width, len, c);
+        d_qwen_gdn_conv_serial_channel(out + (size_t)row0 * channels, in + (size_t)row0 * is, weight,
+            history + (size_t)slot * channels * (width - 1), channels, width, len, c, is);
     }
 }
 

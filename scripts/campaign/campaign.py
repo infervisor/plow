@@ -12,10 +12,11 @@
     campaign.py ledger  <results.csv> --cell NAME --note TEXT [--provisional]
     campaign.py gate    <recipe.toml> --assets DIR --out DIR [--only K] [--dry-run|--score-only]
     campaign.py rung-sweep <recipe.toml> --knob K --values 0,1 --out DIR --stage build|run|score|verify
+    campaign.py dist-gate <recipe.toml> --assets DIR --out DIR [--gate [--only K]]  # push -> clean load -> serve --model
 
 The recipe pins everything that decides a number: checkpoint revision, precision, emit
 knobs and flags, object-build gates, serve-side mirrors, and the client protocol. Every
-GPU stage runs under `perf-data/tools/gpulease`; a run the lease audits as contended is
+GPU stage runs as a `scripts/bench/gpuq.py` job (gpuq holds the lease); a run the lease audits as contended is
 recorded as such and refused by `ledger` unless `--provisional` is given. Stdlib only.
 """
 from __future__ import annotations
@@ -50,7 +51,8 @@ import rung_sweep
 import spec_env
 
 REPO = Path(__file__).resolve().parents[2]
-GPULEASE = REPO / "perf-data" / "tools" / "gpulease"
+GPUQ = REPO / "scripts" / "bench" / "gpuq.py"
+QUEUE = "/tmp/plow-gpuq"
 BENCH = REPO / "scripts" / "bench_plowrt_serve.sh"
 CSV_HEADER = (
     "input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,itl_p99,"
@@ -482,6 +484,26 @@ def run(cmd: list[str], env: dict, log: Path) -> int:
         return subprocess.run(cmd, env=env, stdout=f, stderr=subprocess.STDOUT, cwd=REPO).returncode
 
 
+def queued(label: str, ngpu: int, cmd: list[str], log: Path, queue: str | None) -> int:
+    """Run `cmd` as a gpuq job, wait for it, append its log to `log`. The runner strips PLOW_* and
+    keeps its own first submitter's env, so `cmd` must export every knob it needs."""
+    root = Path(queue or QUEUE).resolve()
+    submit = subprocess.run([sys.executable, str(GPUQ), "--root", str(root), "submit", label, str(ngpu), *cmd],
+                            capture_output=True, text=True, cwd=REPO)
+    if submit.returncode:
+        die(f"gpuq submit failed: {submit.stderr.strip()}")
+    job = submit.stdout.strip()
+    print(f"  queued {job} ({label}) in {root}", file=sys.stderr)
+    state = root / f"{job}.json"
+    while (rec := json.loads(state.read_text()))["state"] in ("queued", "running"):
+        time.sleep(5)
+    with open(log, "ab") as f:
+        f.write(f"$ gpuq {job}: {shlex.join(cmd)}\n".encode())
+        log_file = root / f"{job}.log"
+        f.write(log_file.read_bytes() if log_file.is_file() else f"gpuq {job} {rec['state']}\n".encode())
+    return rec.get("rc", 1)  # withdrawn: never ran
+
+
 def nix(cmd: list[str]) -> list[str]:
     # A box without nix may run the recipe in an equivalent hand-built shell, but only when asked
     # explicitly (PLOW_CAMPAIGN_NO_NIX=1); build-record.json records which one ran.
@@ -643,6 +665,9 @@ def cmd_build(a: argparse.Namespace) -> None:
     ]
     if "max_ctx" in cell and cell["max_ctx"]:
         base_args.extend(["--max-ctx", str(cell["max_ctx"])])
+    # plowc qualifies what it emits; a production recipe's emit fails on any Lean gap.
+    production = Path(a.recipe).resolve().is_relative_to((REPO / "recipes" / "infervisor").resolve())
+    base_args.extend(["--lean-qualify", "strict" if production and not block else "report"])
     if block:
         # A single-block packet with the recipe's own emit env, objects and routes.
         base_args.extend(["--block", block])
@@ -729,6 +754,7 @@ def cmd_build(a: argparse.Namespace) -> None:
         ]
         if sub.get("max_ctx"):
             sargs.extend(["--max-ctx", str(sub["max_ctx"])])
+        sargs.extend(["--lean-qualify", "strict" if production else "report"])
         sub_env[sub["name"]] = {k: expand(v, out) for k, v in sub.get("env", {}).items()}
         if run(nix([*sargs, "--out", str(assets / sub["name"])]), env_with(os.environ, sub_env[sub["name"]]), log):
             die(f"sub emit {sub['name']} failed; see build.log")
@@ -854,15 +880,15 @@ def store_cell(r: dict) -> str:
 
 
 def lean_qualify(assets: Path, report: Path, strict: bool) -> bool:
-    """`plowrt qualify` over a bundle's packets (receipts, approved verifier, replay, media
+    """`plowc qualify` over a bundle's packets (receipts, approved verifier, replay, media
     geometry; docs/bringup/lean-correctness-inventory.md §9-10), written to `report`. Recorded,
-    not fatal, unless `strict`; a missing plowrt or verifier is recorded as not checked."""
-    plowrt = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowrt"
-    if not plowrt.exists():
-        report.write_text(json.dumps({"checked": False, "reason": f"{plowrt} missing"}, indent=1))
-        print(f"lean qualify: not checked ({plowrt} missing)", file=sys.stderr)
+    not fatal, unless `strict`; a missing plowc or verifier is recorded as not checked."""
+    plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
+    if not plowc.exists():
+        report.write_text(json.dumps({"checked": False, "reason": f"{plowc} missing"}, indent=1))
+        print(f"lean qualify: not checked ({plowc} missing)", file=sys.stderr)
         return not strict
-    p = subprocess.run([str(plowrt), "qualify", "--assets", str(assets), "--format", "json"],
+    p = subprocess.run([str(plowc), "qualify", str(assets), "--format", "json"],
                        capture_output=True, text=True, env=env_with(os.environ, {"RUST_LOG": "warn"}))
     try:
         packets = json.loads(p.stdout)
@@ -970,8 +996,8 @@ def cmd_bench(a: argparse.Namespace) -> None:
     wrapper = out / "run.sh"
     lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
     for k, v in sorted(env.items()):
-        if k in os.environ and os.environ[k] == v and k not in overrides:
-            continue  # inherited, unchanged
+        if k in os.environ and os.environ[k] == v and k not in overrides and not k.startswith("PLOW_"):
+            continue  # inherited, unchanged (gpuq strips PLOW_*)
         lines.append(f"export {k}={shlex.quote(v)}")
     # `--quiet-lock`: the bench holds this file lock exclusively for its whole session, INSIDE the
     # GPU lease (lease first, then lock, everywhere — the other order deadlocks against a run that
@@ -982,11 +1008,10 @@ def cmd_bench(a: argparse.Namespace) -> None:
         str(BENCH), str(assets), str(bench.get("port", 8765)), model_id, expand(bench["tokenizer"], out), str(bench.get("ready_s", 1200))]))
     wrapper.write_text("\n".join(lines) + "\n")
     wrapper.chmod(0o755)
-    cmd = [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(wrapper)]
     log = out / "run.log"
     log.write_bytes(b"")
     before = execution_artifacts(private, assets, Path(a.recipe), env)
-    rc = run(cmd, dict(os.environ), log)
+    rc = queued(label, cell.get("n_gpu", 1), [str(wrapper)], log, getattr(a, "queue", None))
     after = execution_artifacts(private, assets, Path(a.recipe), env)
     text = log.read_text(errors="replace")
     peak = {}
@@ -1120,7 +1145,7 @@ def cmd_probe(a: argparse.Namespace) -> None:
     script = out / "probe.sh"
     lines = ["#!/usr/bin/env bash", "set -uo pipefail"]
     for k, v in sorted(env.items()):
-        if k in os.environ and os.environ[k] == v:
+        if k in os.environ and os.environ[k] == v and not k.startswith("PLOW_"):
             continue
         lines.append(f"export {k}={shlex.quote(v)}")
     lines += [
@@ -1144,9 +1169,11 @@ def cmd_probe(a: argparse.Namespace) -> None:
     log = out / "probe.log"
     log.write_bytes(b"")
     label = a.label or f"{cell['name']}-probe"
-    # A gpuq job already holds the lease; a nested gpulease would wait on itself.
-    lease = [] if getattr(a, "leased", False) else [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label]
-    rc = run([*lease, str(script)], dict(os.environ), log)
+    # A gpuq job already holds the lease; a nested job would wait on itself.
+    if getattr(a, "leased", False):
+        rc = run([str(script)], dict(os.environ), log)
+    else:
+        rc = queued(label, cell.get("n_gpu", 1), [str(script)], log, getattr(a, "queue", None))
     text = log.read_text(errors="replace")
     if rc != 0 or "probe PASS" not in text:
         die("probe failed; see probe/probe.log and probe/server.log")
@@ -1411,6 +1438,7 @@ def cmd_loop(a: argparse.Namespace) -> None:
             label=f"{cell['name']}-probe",
             force=False,
             env=a.env or [],
+            queue=getattr(a, "queue", None),
         )
         try:
             cmd_probe(probe_args)
@@ -1431,6 +1459,7 @@ def cmd_loop(a: argparse.Namespace) -> None:
         reference=a.reference,
         env=a.env or [],
         profile=a.profile,
+        queue=getattr(a, "queue", None),
     )
     cmd_bench(bench_args)
 
@@ -1487,6 +1516,7 @@ def cmd_sweep(a: argparse.Namespace) -> None:
             reference=a.reference,
             env=env_override,
             profile=a.profile,
+            queue=getattr(a, "queue", None),
         )
         cmd_bench(bench_args)
         if (bench_dir / "results.csv").is_file():
@@ -2029,7 +2059,7 @@ def cmd_gate(a: argparse.Namespace) -> None:
         env.update(dict(kv.split("=", 1) for kv in (a.env or [])))
         full = env_with(os.environ, env)
         packet_env(r, assets, full)
-        env.update({k: full[k] for k in ("PLOW_PF_SEG_DIR", "PLOW_LT_ALGOS") if k in full})
+        env.update({k: v for k, v in full.items() if k.startswith("PLOW_")})  # gpuq strips PLOW_*
         plowrt = Path(a.plowrt or serve.get("plowrt") or Path(target) / "release" / "plowrt").resolve()
         private_runtime(plowrt, out)
         lines = ["#!/usr/bin/env bash", "set -u", "source " + shlex.quote(str(REPO / "scripts/bench/plowbench.sh"))]
@@ -2053,7 +2083,8 @@ def cmd_gate(a: argparse.Namespace) -> None:
                       "PB_SERVER_LOG=" + shlex.quote(str(out / "serve.log")),
                       "SERVE_EXTRA=(" + " ".join(shlex.quote(v) for v in shlex.split(serve.get("extra_args", ""))) + ")",
                       "PLOW_HSACO=" + shlex.quote(str(assets)) + " " + shlex.quote(str(out / "plowrt")) +
-                      " serve --assets " + shlex.quote(str(assets)) + ' --port "$PB_SERVER_PORT" "${SERVE_EXTRA[@]}" > "$PB_SERVER_LOG" 2>&1 &',
+                      " serve " + (f"--model {shlex.quote(a.model)}" if getattr(a, "model", None) else f"--assets {shlex.quote(str(assets))}") +
+                      ' --port "$PB_SERVER_PORT" "${SERVE_EXTRA[@]}" > "$PB_SERVER_LOG" 2>&1 &',
                       "PB_SERVER_PID=$!", "trap pb_serve_stop EXIT",
                       f"pb_serve_wait {int(gates.get('ready_s', 900))} || exit 3", "MODEL=$(pb_model_id)", *up,
                       "pb_serve_stop"]
@@ -2061,13 +2092,13 @@ def cmd_gate(a: argparse.Namespace) -> None:
         (out / "run.sh").write_text("\n".join(lines) + "\n")
         subprocess.run(["bash", "-n", str(out / "run.sh")], check=True)
         run_s = int(a.timeout or sum(int(cfg[k].get("timeout_s", 900)) for k in kinds) + 300)
-        cmd = [str(GPULEASE), "-n", "1", a.label or f"gate-{r.get('name', Path(a.recipe).parent.name)}",
-               "timeout", "--kill-after=30s", str(run_s), "bash", str(out / "run.sh")]
+        label = a.label or f"gate-{r.get('name', Path(a.recipe).parent.name)}"
+        cmd = ["timeout", "--kill-after=30s", str(run_s), "bash", str(out / "run.sh")]
         if a.dry_run:
             print(shlex.join(cmd))
             print((out / "run.sh").read_text())
             return
-        rc = run(cmd, dict(os.environ), out / "gate.log")
+        rc = queued(label, 1, cmd, out / "gate.log", getattr(a, "queue", None))
         print(f"gate run rc={rc}; log {out / 'gate.log'}", file=sys.stderr)
     if not out.is_dir():
         die(f"{out}: no gate run to score")
@@ -2133,6 +2164,102 @@ def cmd_ledger(a: argparse.Namespace) -> None:
     print(f"appended {len(read_rows(res))} row(s) to {ledger}")
 
 
+DIST_FAULTS = re.compile(r"panicked|DeviceFault|CUDA_ERROR|refus", re.I)
+
+
+def dist_tree(assets: Path, objects: Path, bundle: Path) -> dict:
+    """The push inputs a pulled bundle must carry byte-for-byte: the packet-side files of `assets`
+    and, when built apart, every object under `objects/`."""
+    files = [(f, f.name) for pat in ("*.pkt", "*.cubin", "*.aot", "*.json", "*.jsonl") for f in sorted(assets.glob(pat))]
+    if objects != assets:
+        files += [(f, "objects/" + f.name) for f in sorted(objects.iterdir()) if f.is_file()]
+    missing = [rel for _, rel in files if not (bundle / rel).is_file()]
+    differ = [rel for f, rel in files if (bundle / rel).is_file() and sha(f) != sha(bundle / rel)]
+    return dict(files=len(files), missing=missing, differ=differ)
+
+
+def cmd_dist_gate(a: argparse.Namespace) -> None:
+    """Release gate for one asset: `plowrt push` to a file:// registry, `plowrt load` into a clean
+    PLOW_HOME, the pulled bundle equals the push input (tree + inventory), then on the GPU
+    `plowrt serve --model` comes up fault-free, or with --gate the recipe's gates run against it."""
+    recipe = Path(a.recipe).resolve()
+    with open(recipe, "rb") as f:
+        r = tomllib.load(f)
+    assets = Path(a.assets).resolve()
+    objects = Path(a.objects).resolve() if a.objects else (
+        assets.parent / "objects" if (assets.parent / "objects").is_dir() else assets)
+    out = Path(a.out).resolve()
+    home, reg = out / "home", out / "reg"
+    shutil.rmtree(home, ignore_errors=True)
+    shutil.rmtree(reg, ignore_errors=True)
+    out.mkdir(parents=True, exist_ok=True)
+    name = a.name or recipe.parent.name
+    plowrt = Path(a.plowrt or r.get("serve", {}).get("plowrt") or REPO / "target" / "release" / "plowrt").resolve()
+    env = dict(os.environ, PLOW_HOME=str(home), PLOW_REGISTRY=f"file://{reg}")
+    rec = dict(recipe=str(recipe), recipe_sha256=sha(recipe), assets=str(assets), objects=str(objects), name=name,
+               plowrt=str(plowrt), plowrt_sha256=sha(plowrt), utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               commit=git("rev-parse", "HEAD"))
+    def stage(step: str, cmd: list[str]) -> None:
+        rc = run(cmd, env, out / f"{step}.log")
+        rec[step] = rc
+        if rc:
+            (out / "dist-gate.json").write_text(json.dumps({**rec, "pass": False}, indent=1) + "\n")
+            die(f"dist-gate {step} rc={rc}; see {out / (step + '.log')}")
+    stage("push", [str(plowrt), "push", "--recipe", str(recipe), "--assets", str(assets), "--objects", str(objects),
+                   "--to", f"file://{reg}"])
+    ckpt = a.checkpoint
+    src = r.get("checkpoint", {})
+    if not ckpt and str(src.get("source", "")).startswith("hf:"):
+        ckpt = expand("{hf:" + src["source"][3:] + "@" + src["revision"] + "}", out, lenient=True)
+        ckpt = None if ckpt.startswith("{hf:") else ckpt
+    stage("load", [str(plowrt), "load", name, *(["--checkpoint", str(ckpt)] if ckpt else [])])
+    pins = json.loads(subprocess.run([str(plowrt), "ls", "--json"], env=env, capture_output=True, text=True, check=True).stdout)
+    bundle = next((Path(p["dir"]) for p in pins if p["name"] == name), None)
+    if bundle is None:
+        die(f"dist-gate: {name} not in the clean store after load; see {out / 'load.log'}")
+    rec["bundle"] = str(bundle)
+    rec["tree"] = dist_tree(assets, objects, bundle)
+    inv = [subprocess.run([str(plowrt), "inventory", str(d)], env=env, capture_output=True, text=True).stdout
+           for d in (assets, bundle)]
+    rec["inventory_equal"] = inv[0] == inv[1] and bool(inv[0])
+    why = [f"{k}: {', '.join(rec['tree'][k][:8])}" for k in ("missing", "differ") if rec["tree"][k]]
+    why += [] if rec["inventory_equal"] else ["plowrt inventory differs between the push input and the pulled bundle"]
+    if not why:
+        if a.gate:
+            gate = argparse.Namespace(recipe=str(recipe), assets=str(bundle), out=str(out / "gate"), only=a.only,
+                                      plowrt=str(plowrt), env=[f"PLOW_HOME={home}", f"PLOW_REGISTRY=file://{reg}"], label=f"dist-{name}",
+                                      timeout=None, dry_run=False, score_only=False, model=name, queue=a.queue)
+            cmd_gate(gate)
+            rec["gate"] = json.loads((out / "gate" / "gates.json").read_text()).get("pass")
+            served = out / "gate" / "serve.log"
+            why += [] if rec["gate"] else ["recipe gates failed; see gate/gates.json"]
+        else:
+            served = out / "serve.log"
+            serve = r.get("serve", {})
+            penv = {k: str(v) for k, v in serve.get("env", {}).items()}
+            penv.update({k: v for k, v in os.environ.items() if k.startswith("PLOW_")})
+            penv.update(PLOW_HOME=str(home), PLOW_REGISTRY=f"file://{reg}")  # --model resolves against the registry
+            lines = ["#!/usr/bin/env bash", "set -u", "source " + shlex.quote(str(REPO / "scripts/bench/plowbench.sh"))]
+            lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(penv.items())]
+            lines += ["PB_SERVER_PORT=$(pb_free_port)", "PB_SERVER_LOG=" + shlex.quote(str(served)),
+                      shlex.join([str(plowrt), "serve", "--model", name]) + ' --port "$PB_SERVER_PORT" > "$PB_SERVER_LOG" 2>&1 &',
+                      "PB_SERVER_PID=$!", "trap pb_serve_stop EXIT",
+                      f"pb_serve_wait {int(r.get('gates', {}).get('ready_s', 900))} || exit 3",
+                      "echo \"SMOKE model=$(pb_model_id)\""]
+            (out / "smoke.sh").write_text("\n".join(lines) + "\n")
+            rc = queued(f"dist-{name}", r.get("cell", {}).get("n_gpu", 1), ["bash", str(out / "smoke.sh")], out / "smoke.log", a.queue)
+            rec["smoke"] = rc
+            why += [] if rc == 0 else [f"serve --model smoke rc={rc}; see smoke.log"]
+        faults = len(DIST_FAULTS.findall(served.read_text(errors="replace"))) if served.is_file() else -1
+        rec["faults"] = faults
+        why += [] if faults == 0 else [f"serve log faults={faults}"]
+    rec["pass"], rec["why"] = not why, why
+    (out / "dist-gate.json").write_text(json.dumps(rec, indent=1) + "\n")
+    print(f"dist-gate {name}: {'PASS' if not why else 'FAIL'} " + "; ".join(why) + f"\nrecord {out / 'dist-gate.json'}", file=sys.stderr)
+    if why:
+        sys.exit(1)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -2188,6 +2315,7 @@ def main() -> None:
     b.add_argument("--hf-dir", help="checkpoint snapshot on this host, replacing [cell].hf_dir; recorded")
     b.add_argument("--block", metavar="L[..R]", help="emit only layers [L, R) as a block packet (block_run), "
                    "same emit env/objects/routes as the recipe; recorded")
+    b.add_argument("--queue", default=QUEUE, help="gpuq root for the GPU job")
     b.set_defaults(f=cmd_build)
     nb = sp.add_parser("nv-block-ab", help="NVIDIA four-arm single-block A/B in one queued lease (block_run)")
     nb.add_argument("--control", required=True, help="production block assets (campaign.py build --block)")
@@ -2205,7 +2333,7 @@ def main() -> None:
     nb.add_argument("--quiet-lock", default="/tmp/plow-campaign-quiet.lock")
     nb.add_argument("--dry-run", action="store_true", help="freeze and write run.sh, do not submit")
     nb.set_defaults(f=cmd_nv_block_ab)
-    q = sp.add_parser("qualify", help="Lean receipt/media qualification of a bundle (plowrt qualify)")
+    q = sp.add_parser("qualify", help="Lean receipt/media qualification of a bundle (plowc qualify)")
     q.add_argument("--assets", required=True); q.add_argument("--out", help="report (default <assets>/../lean-qualification.json)")
     q.add_argument("--strict", action="store_true", help="exit non-zero unless every packet qualifies")
     q.set_defaults(f=cmd_qualify)
@@ -2223,12 +2351,13 @@ def main() -> None:
     n.add_argument("--quiet-lock", metavar="FILE", help="hold this lock exclusively for the bench session, inside the GPU lease (scripts/bench/quietx.sh; builds take it shared via quiets.sh)")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
     n.add_argument("--profile", help="named workload from [bench.profiles.*] (e.g. realtime, throughput)")
+    n.add_argument("--queue", default=QUEUE, help="gpuq root for the GPU job")
     n.set_defaults(f=cmd_bench)
     pr = sp.add_parser("probe"); pr.add_argument("recipe"); pr.add_argument("--assets", required=True)
     pr.add_argument("--store-cell", help="tune-store SKU cell under tuning/nvidia/<arch>/ (default: [target].sku folded)")
     pr.add_argument("--label"); pr.add_argument("--force", action="store_true"); pr.add_argument("--plowrt")
     pr.add_argument("--leased", action="store_true", help="the caller holds the GPU lease (a gpuq job): no nested gpulease")
-    pr.add_argument("--env", action="append", metavar="K=V"); pr.set_defaults(f=cmd_probe)
+    pr.add_argument("--env", action="append", metavar="K=V"); pr.add_argument("--queue", default=QUEUE, help="gpuq root for the GPU job"); pr.set_defaults(f=cmd_probe)
     ce = sp.add_parser("cert"); ce.add_argument("--knob", required=True); ce.add_argument("--job", required=True)
     ce.add_argument("--cell", required=True, help="cell name used in rung digests, e.g. gemma4-12b.h100.bf16")
     for arm in ("ctrl", "ctrl2", "treat", "treat2"):
@@ -2251,7 +2380,7 @@ def main() -> None:
     lp = sp.add_parser("loop"); lp.add_argument("recipe"); lp.add_argument("--out"); lp.add_argument("--profile")
     lp.add_argument("--concs"); lp.add_argument("--in-lens"); lp.add_argument("--label"); lp.add_argument("--reference")
     lp.add_argument("--env", action="append", metavar="K=V"); lp.add_argument("--no-probe", action="store_true")
-    lp.add_argument("--skip-doctor", action="store_true"); lp.set_defaults(f=cmd_loop)
+    lp.add_argument("--skip-doctor", action="store_true"); lp.add_argument("--queue", default=QUEUE, help="gpuq root for the GPU job"); lp.set_defaults(f=cmd_loop)
     sw = sp.add_parser("sweep"); sw.add_argument("recipe"); sw.add_argument("--param", required=True)
     sw.add_argument("--values", required=True, help="comma-separated list of parameter values")
     sw.add_argument("--out"); sw.add_argument("--profile"); sw.add_argument("--concs"); sw.add_argument("--in-lens")
@@ -2282,8 +2411,19 @@ def main() -> None:
     ga.add_argument("--env", action="append", metavar="K=V", help="server env override")
     ga.add_argument("--label"); ga.add_argument("--timeout", type=int, help="run timeout inside the lease, s")
     ga.add_argument("--dry-run", action="store_true", help="write and print run.sh; no lease")
+    ga.add_argument("--model", help="serve this pulled model (`serve --model`, store at $PLOW_HOME) instead of --assets")
+    ga.add_argument("--queue", default=QUEUE, help="gpuq root for the GPU job")
     ga.add_argument("--score-only", action="store_true", help="re-score an existing --out dir")
     ga.set_defaults(f=cmd_gate)
+    dg = sp.add_parser("dist-gate", help="push -> load into a clean PLOW_HOME -> bundle == push input -> serve --model (smoke or --gate)")
+    dg.add_argument("recipe"); dg.add_argument("--assets", required=True); dg.add_argument("--out", required=True)
+    dg.add_argument("--objects", help="object dir pushed with the bundle (default <assets>/../objects, else --assets)")
+    dg.add_argument("--plowrt", help="plowrt binary (default [serve].plowrt, else target/release/plowrt)")
+    dg.add_argument("--checkpoint", help="HF snapshot for load (default the recipe's [checkpoint] hf: pin in the HF cache)")
+    dg.add_argument("--name", help="registry model name (default the recipe's directory name)")
+    dg.add_argument("--gate", action="store_true", help="run the recipe's [gates] against serve --model instead of the smoke")
+    dg.add_argument("--only", help="comma-separated gate kinds (with --gate)")
+    dg.add_argument("--queue", default=QUEUE, help="gpuq root for the GPU job"); dg.set_defaults(f=cmd_dist_gate)
     l = sp.add_parser("ledger"); l.add_argument("results"); l.add_argument("--cell", required=True); l.add_argument("--note", required=True)
     l.add_argument("--provisional", action="store_true"); l.set_defaults(f=cmd_ledger)
     a = p.parse_args()

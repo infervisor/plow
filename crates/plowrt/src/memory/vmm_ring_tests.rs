@@ -720,6 +720,42 @@ fn bounded_park_readmits_without_driver_calls_and_holds_its_cap_while_busy() {
 }
 
 #[test]
+fn release_parked_upto_bounds_the_slots_per_call() {
+    let ops = Arc::new(Mock::with_granularity(64));
+    ops.0.lock().unwrap().multi_map = true;
+    let tensors: Vec<_> = (0..4)
+        .map(|tensor| LiveRingTensor {
+            tensor,
+            slot_bytes: 128,
+        })
+        .collect();
+    let mut rings = VmmRings::new_idle_backed(ops.clone(), &tensors, 8).unwrap();
+    let charge = rings.slot_charge();
+    assert!(!rings.release_parked_upto(4), "parking off");
+    rings.enable_bounded_park(8 * charge);
+    for slot in 0..5 {
+        rings.ensure_slot(slot).unwrap();
+    }
+    for slot in 0..5 {
+        rings.release_slot(slot);
+    }
+    assert!(rings.release_parked_upto(2));
+    assert_eq!(rings.spare_bytes(), 3 * charge);
+    assert!(rings.release_parked_upto(4));
+    assert_eq!(rings.spare_bytes(), 0);
+    assert!(!rings.release_parked_upto(4), "nothing left");
+    rings.ensure_slot(0).unwrap();
+    rings.release_slot(0);
+    assert_eq!(
+        rings.spare_bytes(),
+        charge,
+        "the cap still parks after a bounded release"
+    );
+    drop(rings);
+    ops.empty();
+}
+
+#[test]
 fn release_parked_reports_whether_it_freed_memory() {
     let ops = Arc::new(Mock::with_granularity(64));
     ops.0.lock().unwrap().multi_map = true;
