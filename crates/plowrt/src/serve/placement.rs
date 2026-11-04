@@ -99,6 +99,10 @@ impl Layout {
 #[derive(Debug, PartialEq, Eq)]
 pub enum PlacementError {
     NoDevices,
+    InvalidGroups,
+    DuplicateInstance {
+        slug: String,
+    },
     /// A model's TP degree does not divide the visible device count, so no
     /// contiguous run of that width exists.
     NoRunOfWidth {
@@ -144,6 +148,8 @@ impl fmt::Display for PlacementError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlacementError::NoDevices => write!(f, "no visible devices to place models on"),
+            PlacementError::InvalidGroups => write!(f, "device groups must be nonempty and disjoint"),
+            PlacementError::DuplicateInstance { slug } => write!(f, "duplicate model instance {slug}"),
             PlacementError::NoRunOfWidth { slug, tp, visible } => write!(
                 f,
                 "{slug} needs a tensor-parallel run of {tp} device(s), but only {visible} are visible"
@@ -193,6 +199,13 @@ pub fn plan_groups(devices: &[u32], tp: u32, capacity: u64) -> Result<Vec<Group>
     if devices.is_empty() {
         return Err(PlacementError::NoDevices);
     }
+    if devices
+        .iter()
+        .enumerate()
+        .any(|(i, d)| devices[..i].contains(d))
+    {
+        return Err(PlacementError::InvalidGroups);
+    }
     let tp = tp.max(1) as usize;
     Ok(devices
         .chunks_exact(tp)
@@ -216,6 +229,21 @@ pub fn assign(
     if groups.is_empty() {
         return Err(PlacementError::NoDevices);
     }
+    let mut devices = std::collections::HashSet::new();
+    if groups
+        .iter()
+        .any(|g| g.ordinals.is_empty() || g.ordinals.iter().any(|d| !devices.insert(*d)))
+    {
+        return Err(PlacementError::InvalidGroups);
+    }
+    let mut instances = std::collections::HashSet::new();
+    for m in models {
+        if !instances.insert(&m.slug) {
+            return Err(PlacementError::DuplicateInstance {
+                slug: m.slug.clone(),
+            });
+        }
+    }
     for (i, m) in models.iter().enumerate() {
         if models[..i].iter().any(|o| o.model == m.model) {
             continue;
@@ -232,7 +260,9 @@ pub fn assign(
     let mut assignment = vec![usize::MAX; models.len()];
     // Bytes already promised to each group, so `spread` can pick the emptiest
     // and `pack` can tell when one is full.
-    let mut used = vec![0u64; groups.len()];
+    // Every requirement is u64 and a slice has at most usize::MAX entries.
+    // u128 therefore represents even an intentionally oversubscribed sum exactly.
+    let mut used = vec![0u128; groups.len()];
     // A group already holding a rank of this model is not a candidate for another.
     let taken = |assignment: &[usize], model: &str, g: usize| {
         models
@@ -265,7 +295,7 @@ pub fn assign(
             });
         }
         assignment[i] = g;
-        used[g] += m.required;
+        used[g] += u128::from(m.required);
     }
 
     // Pass 2: the policy.
@@ -278,7 +308,11 @@ pub fn assign(
         // against `groups[0]` rejected one that fits a larger card, and let
         // `spread` drop a model onto a card too small to hold it — a startup
         // failure at load time instead of a placement decision.
-        let fits = |g: usize| m.required <= groups[g].capacity && !taken(&assignment, &m.model, g);
+        let fits = |g: usize| {
+            (m.tp.max(1) == 1 || m.tp.max(1) == groups[g].degree())
+                && m.required <= groups[g].capacity
+                && !taken(&assignment, &m.model, g)
+        };
         let biggest = groups.iter().map(|g| g.capacity).max().unwrap_or(0);
         if !(0..groups.len()).any(fits) {
             return Err(PlacementError::WontFitAnywhere {
@@ -287,7 +321,7 @@ pub fn assign(
                 capacity: biggest,
             });
         }
-        let emptiest_that_fits = |used: &[u64]| {
+        let emptiest_that_fits = |used: &[u128]| {
             (0..groups.len())
                 .filter(|&g| fits(g))
                 .min_by_key(|&g| (used[g], g))
@@ -309,11 +343,13 @@ pub fn assign(
             // has spare room, since the manager still switches models in and
             // out of an oversubscribed group.
             Place::Pack => (0..groups.len())
-                .find(|&g| fits(g) && used[g] + m.required <= groups[g].capacity)
+                .find(|&g| {
+                    fits(g) && used[g] + u128::from(m.required) <= u128::from(groups[g].capacity)
+                })
                 .unwrap_or_else(|| emptiest_that_fits(&used)),
         };
         assignment[i] = g;
-        used[g] += m.required;
+        used[g] += u128::from(m.required);
     }
 
     Ok(Layout {
@@ -447,6 +483,83 @@ pub fn grouping_width(models: &[ModelSpec], visible: usize) -> Result<u32, Place
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn invalid_group_and_instance_shapes_are_rejected() {
+        use super::*;
+        let m = ModelSpec {
+            slug: "a".into(),
+            model: "a".into(),
+            tp: 1,
+            required: 1,
+            device: None,
+        };
+        let group = Group {
+            ordinals: vec![0],
+            capacity: 10,
+        };
+        assert!(plan_groups(&[0, 0], 1, 10).is_err());
+        assert!(assign(
+            &[m.clone()],
+            &[Group {
+                ordinals: vec![],
+                capacity: 10
+            }],
+            Place::Spread
+        )
+        .is_err());
+        assert!(assign(&[m.clone()], &[group.clone(), group.clone()], Place::Spread).is_err());
+        assert!(assign(&[m.clone(), m.clone()], &[group.clone()], Place::Spread).is_err());
+        let mut wide = m;
+        wide.tp = 2;
+        assert!(assign(&[wide], &[group], Place::Spread).is_err());
+    }
+
+    #[test]
+    fn oversubscribed_pins_do_not_wrap_the_policy_load_counter() {
+        use super::*;
+        let models = [
+            ModelSpec {
+                slug: "a".into(),
+                model: "a".into(),
+                tp: 1,
+                required: u64::MAX,
+                device: Some(0),
+            },
+            ModelSpec {
+                slug: "b".into(),
+                model: "b".into(),
+                tp: 1,
+                required: u64::MAX,
+                device: Some(0),
+            },
+            ModelSpec {
+                slug: "c".into(),
+                model: "c".into(),
+                tp: 1,
+                required: 1,
+                device: None,
+            },
+        ];
+        let groups = [
+            Group {
+                ordinals: vec![0],
+                capacity: u64::MAX,
+            },
+            Group {
+                ordinals: vec![1],
+                capacity: u64::MAX,
+            },
+        ];
+        assert_eq!(
+            assign(&models, &groups, Place::Pack).unwrap().assignment,
+            [0, 0, 1]
+        );
+        assert_eq!(
+            assign(&models, &groups, Place::Spread).unwrap().assignment,
+            [0, 0, 1]
+        );
+    }
     use super::*;
 
     const GIB: u64 = 1 << 30;

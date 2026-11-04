@@ -664,6 +664,8 @@ struct CfgRun {
 #[derive(Clone)]
 pub struct ModelMux {
     tx: mpsc::Sender<MuxMsg>,
+    retiring: Arc<std::sync::atomic::AtomicBool>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
     metrics: Arc<Metrics>,
     /// Preempt request flag, checked by the dispatcher at every loop top —
     /// the ONLY signal that reaches it while a full slot table keeps it away
@@ -823,6 +825,14 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
 }
 
 impl ModelMux {
+    pub(crate) fn retire(&self) {
+        self.retiring.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn retiring(&self) -> bool {
+        self.retiring.load(Ordering::Acquire)
+    }
+
     /// Whether any request is queued, tokenizing or holding an engine slot.
     pub fn in_flight(&self) -> bool {
         self.ingress.pending() > 0
@@ -977,9 +987,13 @@ impl ModelMux {
     /// completion. Returns when every in-flight slot has finished. Use before
     /// `Registry::unload` to avoid mid-generation errors.
     pub async fn drain(&self) {
+        let _ = self.drain_fenced().await;
+    }
+
+    pub(crate) async fn drain_fenced(&self) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(MuxMsg::Drain(tx)).await;
-        let _ = rx.await;
+        rx.await.is_ok() || self.completed.load(Ordering::Acquire)
     }
 
     /// Preemptive drain: close EVERY live stream now — `Done` with
@@ -989,6 +1003,10 @@ impl ModelMux {
     /// service_ms) — a 2048-token slot at 40 ms/token is an 82 s wait.
     /// Returns when the dispatcher has exited.
     pub async fn preempt(&self) {
+        let _ = self.preempt_fenced().await;
+    }
+
+    pub(crate) async fn preempt_fenced(&self) -> bool {
         self.preempted.store(true, Ordering::Release);
         self.preempt.store(true, Ordering::Release);
         self.preempt_notify.notify_one();
@@ -997,7 +1015,7 @@ impl ModelMux {
         // sees when a full slot table keeps it off the channel.
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(MuxMsg::Drain(tx)).await;
-        let _ = rx.await;
+        rx.await.is_ok() || self.completed.load(Ordering::Acquire)
     }
 }
 
@@ -1360,6 +1378,8 @@ fn spawn_scoped(
         .filter(|cpus| !cpus.is_empty() && crate::config::RuntimeConfig::get().dp_numa_pin);
     let downstream = state.downstream(&slug);
 
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completed_seen = Arc::clone(&completed);
     let dispatcher_scope = crate::config::current_scope();
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
@@ -1501,6 +1521,7 @@ fn spawn_scoped(
             }
             if drained && waiting.is_empty() {
                 turn.release();
+                completed_seen.store(true, Ordering::Release);
                 for done in drain_done.take().into_iter().chain(late_drains.drain(..)) {
                     let _ = done.send(());
                 }
@@ -2265,6 +2286,8 @@ fn spawn_scoped(
     }
 
     ModelMux {
+        retiring: Default::default(),
+        completed,
         tx,
         metrics: handle_metrics,
         preempt: preempt_flag,
@@ -9747,6 +9770,8 @@ pub(crate) fn scripted_mux(
         }
     });
     ModelMux {
+        retiring: Default::default(),
+        completed: Default::default(),
         tx,
         metrics: Arc::new(Metrics::default()),
         preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10469,6 +10494,8 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = mpsc::channel(1 + CONTROL_SLACK);
         let mux = ModelMux {
+            retiring: Default::default(),
+            completed: Default::default(),
             tx,
             metrics: Arc::clone(&metrics),
             preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10510,6 +10537,8 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = mpsc::channel(3 + CONTROL_SLACK);
         let mux = ModelMux {
+            retiring: Default::default(),
+            completed: Default::default(),
             tx,
             metrics: Arc::clone(&metrics),
             preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10609,7 +10638,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cpu"))]
     fn idle_test_mux(name: &str) -> ModelMux {
         let backend: Arc<dyn crate::device::Backend> =
             Arc::new(crate::device::cpu::CpuBackend::new(1));
@@ -10621,6 +10650,69 @@ mod tests {
             state,
             MuxConfig::default(),
         )
+    }
+
+    #[cfg(feature = "cpu")]
+    #[tokio::test]
+    async fn fenced_drain_survives_a_cancelled_waiter_and_can_be_retried() {
+        let mux = idle_test_mux("fenced-drain-retry");
+        let held = mux.ingress_owned();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), mux.drain_fenced())
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), mux.drain_fenced())
+                .await
+                .unwrap()
+        );
+        assert!(
+            mux.drain_fenced().await,
+            "successful completion persists after channel close"
+        );
+        assert!(
+            mux.preempt_fenced().await,
+            "a later preempt observes the same completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_acknowledgement_is_not_a_completion_fence() {
+        let mut mux = scripted_mux(|_| Vec::new());
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        mux.tx = tx;
+        assert!(!mux.drain_fenced().await);
+        assert!(!mux.preempt_fenced().await);
+    }
+
+    #[cfg(feature = "cpu")]
+    #[tokio::test]
+    async fn retiring_mux_leaves_routing_but_survives_cancelled_eviction() {
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        let mux = idle_test_mux("retiring-routing");
+        state.install_mux("m".into(), mux.clone());
+        let held = mux.ingress_owned();
+        let retiring = state.mux_for_retirement("m").unwrap();
+        assert!(state.mux("m").is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), retiring.drain_fenced())
+                .await
+                .is_err()
+        );
+        drop(retiring);
+        drop(held);
+        let resumed = state
+            .mux_for_retirement("m")
+            .expect("cancellation must retain the fence handle");
+        assert!(resumed.drain_fenced().await);
+        assert!(state.remove_mux("m").is_some());
+        assert!(state.remove_mux("m").is_none());
     }
 
     /// A DP rank taken out mid-burst: the router stops choosing it the moment its dispatcher leaves
