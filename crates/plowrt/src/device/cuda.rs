@@ -2859,7 +2859,9 @@ impl super::host_region::HostStaging for CudaBackend {
         if spans.is_empty() {
             return (None, Ok(()));
         }
+        let timing = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
         let copies = super::image_copy_rects(spans);
+        let planned = timing.map(|t| t.elapsed());
         let mut queued = Ok(());
         let mut previous = None;
         let fence = self.stage_fences.submit(|dependency| {
@@ -2870,6 +2872,8 @@ impl super::host_region::HostStaging for CudaBackend {
             let tier = self.copy_tier_mut(&mut tier)?;
             let event = self.take_copy_event(tier)?;
             let stream = tier.stream.raw as CUstream;
+            let setup = timing.map(|t| t.elapsed());
+            let enqueued = std::cell::Cell::new(None);
             let (result, fence) = submit_copy_batch(
                 copies.len(),
                 |i| {
@@ -2908,10 +2912,25 @@ impl super::host_region::HostStaging for CudaBackend {
                         0
                     }
                 },
-                || self.finish_copy_fence(tier, CopyDir::Spill, event, "CUDA staging batch"),
+                || {
+                    enqueued.set(timing.map(|t| t.elapsed()));
+                    self.finish_copy_fence(tier, CopyDir::Spill, event, "CUDA staging batch")
+                },
                 |rc| self.check(rc, "CUDA staging batch enqueue"),
             );
             queued = result;
+            if let (Some(start), Some(planned), Some(setup), Some(enqueued)) =
+                (timing, planned, setup, enqueued.get())
+            {
+                tracing::debug!(
+                    export,
+                    plan_ms = planned.as_secs_f64() * 1e3,
+                    setup_ms = (setup - planned).as_secs_f64() * 1e3,
+                    enqueue_ms = (enqueued - setup).as_secs_f64() * 1e3,
+                    fence_ms = (start.elapsed() - enqueued).as_secs_f64() * 1e3,
+                    "CUDA staging submission phases"
+                );
+            }
             tracing::debug!(
                 spans = spans.len(),
                 export,
@@ -3414,6 +3433,16 @@ impl CudaBackend {
             // SAFETY: per the contract.
             unsafe { (self.api.cuMemHostUnregister)(p.cast()) };
         }
+    }
+
+    pub(crate) fn prepare_staging(&self) -> Result<()> {
+        self.bind()?;
+        let mut tier = self.copy_tier.lock();
+        let tier = self.copy_tier_mut(&mut tier)?;
+        if tier.spare.is_empty() {
+            tier.spare.push(self.event_create(false)?);
+        }
+        Ok(())
     }
 
     fn copy_tier_mut<'a>(&self, tier: &'a mut Option<CopyTier>) -> Result<&'a mut CopyTier> {

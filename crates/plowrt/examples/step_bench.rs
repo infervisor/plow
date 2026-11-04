@@ -96,6 +96,7 @@ fn kv_image_peer_bench(
     device: &str,
     ctx: usize,
     prompt_file: Option<&str>,
+    early_import: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::asset::serve::checkpoint_dir;
     use std::sync::Arc;
@@ -152,9 +153,7 @@ fn kv_image_peer_bench(
         || ctx >= nv.max_ctx()
         || ctx >= amd.max_ctx()
     {
-        return Err(
-            "KV image check needs room for the prompt plus one decode row".into(),
-        );
+        return Err("KV image check needs room for the prompt plus one decode row".into());
     }
     let prompt: Vec<u32> = if let Some(file) = prompt_file {
         let prompts: Vec<Vec<u32>> = serde_json::from_slice(&std::fs::read(file)?)?;
@@ -185,6 +184,9 @@ fn kv_image_peer_bench(
         plowrt::serve::pd::KvBytes::default(),
         plowrt::serve::pd::KvBytes::default(),
     );
+    let request_started = Instant::now();
+    let mut preparation = (0., 0.);
+    let mut prefill_finished = 0.;
     let first = if main_nv {
         nv.begin_slot(nv_slot, ctx + 1)?;
         if nv.has_prefill() {
@@ -192,9 +194,29 @@ fn kv_image_peer_bench(
         } else {
             nv.consume_prompt(nv_slot, &prompt, &mut Vec::new())?
         }
+    } else if early_import {
+        std::thread::scope(|scope| -> Result<u32, Box<dyn std::error::Error>> {
+            let prepare = scope.spawn(|| {
+                let start = request_started.elapsed().as_secs_f64() * 1e3;
+                nv.prepare_kv_import(nv_slot, ctx, ctx + 1)?;
+                Ok::<_, plowrt::RuntimeError>((
+                    start,
+                    request_started.elapsed().as_secs_f64() * 1e3,
+                ))
+            });
+            let first = amd.prefill(amd_slot, &prompt)?;
+            prefill_finished = request_started.elapsed().as_secs_f64() * 1e3;
+            preparation = prepare
+                .join()
+                .map_err(|_| "decode preparation thread panicked")??;
+            Ok(first)
+        })?
     } else {
         amd.prefill(amd_slot, &prompt)?
     };
+    if prefill_finished == 0. {
+        prefill_finished = request_started.elapsed().as_secs_f64() * 1e3;
+    }
     let t = Instant::now();
     if main_nv {
         nv.export_kv_image(nv_slot, n, &mut a)?;
@@ -209,9 +231,12 @@ fn kv_image_peer_bench(
     if main_nv {
         amd.import_kv_image(amd_slot, &prompt, &a, first)?;
     } else {
-        nv.begin_slot(nv_slot, ctx + 1)?;
+        if !early_import {
+            nv.begin_slot(nv_slot, ctx + 1)?;
+        }
         nv.import_kv_image(nv_slot, &prompt, &a)?;
     }
+    let import_ready = request_started.elapsed().as_secs_f64() * 1e3;
     let import_ms = t.elapsed().as_secs_f64() * 1e3;
     if main_nv {
         amd.export_kv_image(amd_slot, n, &mut b)?;
@@ -236,6 +261,8 @@ fn kv_image_peer_bench(
         (amd_token, tokens[0])
     };
     println!("KV_IMAGE_XV_TOKENS prefill={first} main={main_token} peer={peer_token}");
+    println!("KV_IMAGE_XV_PHASES early={} prefill_ms={prefill_finished:.4} prepare_start_ms={:.4} prepare_end_ms={:.4} import_ready_ms={import_ready:.4} verified_decode_ms={:.4}",
+        u8::from(early_import), preparation.0, preparation.1, request_started.elapsed().as_secs_f64() * 1e3);
     if main_token != peer_token {
         return Err(format!("KV image peer decode differs: {main_token} vs {peer_token}").into());
     }
@@ -269,6 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let steps: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
     let mut same = false;
     let mut kv_image = false;
+    let mut kv_image_prepare = false;
     let mut kv_image_peer = None::<std::path::PathBuf>;
     let mut kv_image_peer_device = None::<String>;
     let mut spread = false;
@@ -327,6 +355,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--max-inst" => max_inst = Some(args.next().ok_or("--max-inst N")?.parse()?),
             "--same" => same = true,
             "--kv-image" => kv_image = true,
+            "--kv-image-prepare" => kv_image_prepare = true,
             "--kv-image-peer" => {
                 kv_image_peer = Some(args.next().ok_or("--kv-image-peer DIR")?.into())
             }
@@ -418,9 +447,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         #[cfg(feature = "hsa")]
-        return kv_image_peer_bench(&assets, &peer, &device, ctx, prompt_file.as_deref());
+        return kv_image_peer_bench(
+            &assets,
+            &peer,
+            &device,
+            ctx,
+            prompt_file.as_deref(),
+            kv_image_prepare,
+        );
         #[cfg(not(feature = "hsa"))]
         return Err("--kv-image-peer requires --features cuda,hsa".into());
+    }
+
+    if kv_image_prepare {
+        return Err("--kv-image-prepare requires the cross-vendor KV image check".into());
     }
 
     let ckpt = std::env::var("PLOW_CHECKPOINT")

@@ -78,27 +78,37 @@ impl GpuEngine {
         Ok(())
     }
 
-    /// Seat slot `b`, fresh from [`Self::begin_slot`], with `prompt`'s KV from an image another
-    /// engine exported. The slot then stands where its own prefill of `prompt` would leave it:
-    /// the first generated token is the caller's to feed at position `prompt.len()`.
-    pub fn import_kv_image(
-        &mut self,
-        b: usize,
-        prompt: &[u32],
-        image: &crate::serve::pd::KvBytes,
-    ) -> Result<()> {
-        let n = u32::try_from(prompt.len())
+    pub fn prepare_kv_import(&mut self, b: usize, prompt_rows: usize, total: usize) -> Result<()> {
+        let started = std::time::Instant::now();
+        // Inactive decode rows may still write padding into this slot's old mappings.
+        self.be.synchronize()?;
+        self.begin_slot(b, total)?;
+        let n = self.check_kv_import_slot(b, prompt_rows)?;
+        if let Some(v) = &self.vmm {
+            v.ensure_rows(b, n)?;
+        }
+        self.be.prepare_staging()?;
+        tracing::debug!(
+            slot = b,
+            rows = n,
+            prepare_ms = started.elapsed().as_secs_f64() * 1e3,
+            "KV image import prepared"
+        );
+        Ok(())
+    }
+
+    fn check_kv_import_slot(&self, b: usize, prompt_rows: usize) -> Result<u32> {
+        let n = u32::try_from(prompt_rows)
             .map_err(|_| RuntimeError::Rejected("KV image: prompt too long".into()))?;
         if b >= self.batch || self.pos[b] != 0 {
             return Err(RuntimeError::Rejected(format!(
                 "KV image import: slot {b} is not freshly begun"
             )));
         }
-        if prompt.len() >= self.max_ctx {
+        if prompt_rows >= self.max_ctx {
             return Err(RuntimeError::ContextLength(format!(
                 "KV image import: {} rows leave no room under the context {}",
-                prompt.len(),
-                self.max_ctx
+                prompt_rows, self.max_ctx
             )));
         }
         // State the image does not carry: recurrent layers and a block drafter's context caches.
@@ -111,6 +121,20 @@ impl GpuEngine {
                     .into(),
             ));
         }
+        self.kv_image_manifest()?;
+        Ok(n)
+    }
+
+    /// Seat slot `b`, fresh from [`Self::begin_slot`], with `prompt`'s KV from an image another
+    /// engine exported. The slot then stands where its own prefill of `prompt` would leave it:
+    /// the first generated token is the caller's to feed at position `prompt.len()`.
+    pub fn import_kv_image(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        image: &crate::serve::pd::KvBytes,
+    ) -> Result<()> {
+        let n = self.check_kv_import_slot(b, prompt.len())?;
         let (spans, total) = plan(self.kv_image_manifest()?, b as u32, n)?;
         if total != image.len() as u64 {
             return Err(RuntimeError::Rejected(format!(
@@ -122,7 +146,11 @@ impl GpuEngine {
             let timing = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
             v.ensure_rows(b, n)?;
             if let Some(t) = timing {
-                tracing::debug!(rows = n, mapping_ms = t.elapsed().as_secs_f64() * 1e3, "KV image import mapping");
+                tracing::debug!(
+                    rows = n,
+                    mapping_ms = t.elapsed().as_secs_f64() * 1e3,
+                    "KV image import mapping"
+                );
             }
         }
         // The staging stream must not race earlier writes to this slot.

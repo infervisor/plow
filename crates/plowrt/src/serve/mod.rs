@@ -320,6 +320,7 @@ pub(crate) struct RunObserver {
     /// Per engine slot, the P/D export of the prefill job seated there: it outlives the job's
     /// `Slot`, which is gone by the time the tick retires the engine slot.
     pub pd_exports: Vec<Option<Arc<pd::KvExport>>>,
+    pub pd_import_work: bool,
 }
 
 /// One recorded consumption of `KV_PAGES` by a `FLASH`-family packet.
@@ -345,6 +346,7 @@ impl RunObserver {
             kv_writes: Vec::new(),
             slo: Default::default(),
             pd_exports: Vec::new(),
+            pd_import_work: false,
         }
     }
 

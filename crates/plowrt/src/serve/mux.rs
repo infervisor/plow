@@ -914,12 +914,12 @@ impl ModelMux {
             Metrics::inc(&self.metrics.requests);
         }
         if self.shed_queue_depth() {
-            Metrics::inc(&self.metrics.rejected);
+            crate::serve::pd::refuse(&job, &self.metrics.rejected);
             Metrics::inc(&self.metrics.shed_queue);
             return Err(SubmitError::Full(job));
         }
         if !self.reserve_queue() {
-            Metrics::inc(&self.metrics.rejected);
+            crate::serve::pd::refuse(&job, &self.metrics.rejected);
             return Err(if self.tx.is_closed() {
                 SubmitError::Closed(job)
             } else {
@@ -940,16 +940,20 @@ impl ModelMux {
             }
             Err(mpsc::error::TrySendError::Full(MuxMsg::Job(job, _))) => {
                 self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-                Metrics::inc(&self.metrics.rejected);
+                crate::serve::pd::refuse(&job, &self.metrics.rejected);
                 Err(SubmitError::Full(job))
             }
             Err(mpsc::error::TrySendError::Closed(MuxMsg::Job(job, _))) => {
                 self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-                Metrics::inc(&self.metrics.rejected);
+                crate::serve::pd::refuse(&job, &self.metrics.rejected);
                 Err(SubmitError::Closed(job))
             }
             Err(_) => unreachable!(),
         }
+    }
+
+    pub(crate) fn wake_import(&self) {
+        self.arrival_notify.notify_one();
     }
 
     /// As [`Self::submit`], but a full ingress queue waits for room instead of failing: for a front
@@ -969,18 +973,18 @@ impl ModelMux {
             Metrics::inc(&self.metrics.requests);
         }
         if self.preempted() || self.tx.is_closed() {
-            Metrics::inc(&self.metrics.rejected);
+            crate::serve::pd::refuse(&job, &self.metrics.rejected);
             return Err(SubmitError::Closed(job));
         }
         if (job.opts.export.is_some() || job.opts.import.is_some()) && self.shed_queue_depth() {
-            Metrics::inc(&self.metrics.rejected);
+            crate::serve::pd::refuse(&job, &self.metrics.rejected);
             Metrics::inc(&self.metrics.shed_queue);
             return Err(SubmitError::Full(job));
         }
         let mut job = job;
         loop {
             if self.preempted() || self.tx.is_closed() {
-                Metrics::inc(&self.metrics.rejected);
+                crate::serve::pd::refuse(&job, &self.metrics.rejected);
                 return Err(SubmitError::Closed(job));
             }
             if self.reserve_queue() {
@@ -1000,7 +1004,7 @@ impl ModelMux {
                     }
                     Err(mpsc::error::TrySendError::Closed(MuxMsg::Job(returned, _))) => {
                         self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-                        Metrics::inc(&self.metrics.rejected);
+                        crate::serve::pd::refuse(&returned, &self.metrics.rejected);
                         return Err(SubmitError::Closed(returned));
                     }
                     Err(_) => unreachable!(),
@@ -1008,7 +1012,7 @@ impl ModelMux {
             }
             tokio::select! {
                 _ = self.tx.closed() => {
-                    Metrics::inc(&self.metrics.rejected);
+                    crate::serve::pd::refuse(&job, &self.metrics.rejected);
                     return Err(SubmitError::Closed(job));
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {}
@@ -1129,6 +1133,25 @@ struct Slot {
 }
 
 impl Slot {
+    fn needs_prefill(&self) -> bool {
+        self.step == 0 && self.import.is_none()
+    }
+
+    fn waiting_import(&self, can_prepare: bool) -> bool {
+        self.step == 0
+            && !self.respond.is_closed()
+            && self
+                .import
+                .as_ref()
+                .is_some_and(|i| i.waiting() && (i.prepared || !can_prepare))
+    }
+
+    fn changes_import(&self) -> bool {
+        self.import
+            .as_ref()
+            .is_some_and(|i| !i.waiting() || self.respond.is_closed())
+    }
+
     /// Rows the mixed-step program cannot carry: it does not stage overlays (see [`SpeechJob`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn serial_prefill(&self) -> bool {
@@ -1446,6 +1469,10 @@ fn spawn_scoped(
         // scan + bufs machinery on the dispatcher critical path entirely.
         #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         let has_gpu = state.gpu_engine(&slug).is_some();
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+        let can_prepare_import = state.gpu_engine(&slug).is_some_and(|e| e.lock().is_cuda());
+        #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+        let can_prepare_import = false;
         // Whose turn it is on this model's device. `None` when no turns were
         // installed, and a no-op under `--co-sched free` (the default), where
         // whoever is ready goes first and nothing here orders anything.
@@ -1488,8 +1515,9 @@ fn spawn_scoped(
                 retention.table.clear();
                 while let Some((job, _)) = waiting.pop_front() {
                     metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-                    Metrics::inc(&metrics.rejected);
-                    crate::serve::pd::settle_refused(&job);
+                    if !crate::serve::pd::refuse(&job, &metrics.rejected) {
+                        continue;
+                    }
                     let _ = job
                         .respond
                         .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
@@ -1570,8 +1598,9 @@ fn spawn_scoped(
                             let _ = done.send(());
                         }
                         MuxMsg::Job(job, _) => {
-                            Metrics::inc(&metrics.rejected);
-                            crate::serve::pd::settle_refused(&job);
+                            if !crate::serve::pd::refuse(&job, &metrics.rejected) {
+                                continue;
+                            }
                             let _ = job.respond.try_send(StreamChunk::Err(
                                 crate::RuntimeError::Rejected(
                                     "model preempted for an S1 switch — retry".into(),
@@ -1903,6 +1932,24 @@ fn spawn_scoped(
                 }
                 continue;
             }
+            for slot in slots.iter_mut().flatten() {
+                if let Some(import) = slot.import.as_mut() {
+                    import.poll();
+                }
+            }
+            if slots
+                .iter()
+                .flatten()
+                .all(|s| s.waiting_import(can_prepare_import))
+            {
+                turn.release();
+                tokio::select! {
+                    _ = arrival_wake.notified() => {},
+                    _ = preempt_wake.notified() => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {},
+                }
+                continue;
+            }
             // Every live slot is parked on a slow consumer: nothing to launch.
             if slots.iter().flatten().all(|s| s.parked_at.is_some()) {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -2085,6 +2132,10 @@ fn spawn_scoped(
             let arena_ref = arena.clone();
             let kv_pages_for_tick = kv_pages_range.clone();
 
+            let pending_import_turn = taken_slots
+                .iter()
+                .flatten()
+                .all(|s| s.import.as_ref().is_some_and(|i| i.waiting()));
             metrics.serving.tick_batch.tokens(live);
             let t_service_start = Instant::now();
             let host_timed = crate::obs::host::on();
@@ -2187,8 +2238,21 @@ fn spawn_scoped(
                             service / k,
                         )
                     };
-                    crate::sched::cost::record_id(cost_id, op, took);
-                    let sample = service_sample(ms, did_prefill);
+                    let import_wait = pending_import_turn
+                        && !did_prefill
+                        && decode_progress.is_none()
+                        && tokens_produced == 0
+                        && returned_slots
+                            .iter()
+                            .flatten()
+                            .all(|s| s.import.as_ref().is_some_and(|i| i.waiting()));
+                    let import_overhead = import_wait || returned_obs.pd_import_work;
+                    if !import_overhead {
+                        crate::sched::cost::record_id(cost_id, op, took);
+                    }
+                    let sample = (!import_overhead)
+                        .then(|| service_sample(ms, did_prefill))
+                        .flatten();
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
                     }
@@ -2229,13 +2293,12 @@ fn spawn_scoped(
                                 error_name = %f.name,
                                 "engine dead: fatal device fault — rejecting new requests"
                             );
-                            for s in slots.iter_mut() {
-                                if let Some(slot) = s.take() {
-                                    release_kv(&arena, slot.kv);
-                                    let _ = slot.respond.try_send(StreamChunk::Err(
-                                        crate::RuntimeError::DeviceFault { info: f.clone() },
-                                    ));
-                                }
+                            for slot in slots.iter_mut() {
+                                fail_slot(
+                                    slot,
+                                    &arena,
+                                    crate::RuntimeError::DeviceFault { info: f.clone() },
+                                );
                             }
                         }
                     }
@@ -2701,9 +2764,10 @@ fn drain_waiting_session(
                 false
             }
             Queued::Expired => {
-                Metrics::inc(&metrics.admit_shed);
-                crate::serve::pd::settle_refused(job);
                 metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                if !crate::serve::pd::refuse(job, &metrics.admit_shed) {
+                    return false;
+                }
                 let _ = job
                     .respond
                     .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(format!(
@@ -2872,7 +2936,7 @@ fn admit_into(
 fn admit_session(
     slots: &mut [Option<Slot>],
     limit: usize,
-    job: Job,
+    mut job: Job,
     arrived: Instant,
     arena: Option<&SharedKvState>,
     metrics: &Arc<Metrics>,
@@ -2883,6 +2947,13 @@ fn admit_session(
 ) -> Option<(Job, Instant)> {
     if job.respond.is_closed() {
         return None;
+    }
+
+    if let Some(import) = job.opts.import.as_mut() {
+        import.poll();
+        if import.abandoned() {
+            return None;
+        }
     }
 
     let pair = job.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
@@ -3012,9 +3083,9 @@ fn admit_session(
             // Counted for every terminal denial. Kept separate from the admission-shed path:
             // both end as a 429, but shedding is the controller dropping live work because
             // predicted wait passed the SLO, while these are arrival meeting a hard limit.
-            Metrics::inc(&metrics.rejected);
-            crate::serve::pd::settle_refused(&job);
-            let _ = job.respond.try_send(StreamChunk::Err(err));
+            if crate::serve::pd::refuse(&job, &metrics.rejected) {
+                let _ = job.respond.try_send(StreamChunk::Err(err));
+            }
             return None;
         }
     };
@@ -3023,8 +3094,9 @@ fn admit_session(
         match arena.lock().arena.allocate_slot(seq_upper) {
             Ok(h) => Some(h),
             Err(e) => {
-                Metrics::inc(&metrics.rejected);
-                crate::serve::pd::settle_refused(&job);
+                if !crate::serve::pd::refuse(&job, &metrics.rejected) {
+                    return None;
+                }
                 tracing::warn!(error = %e, seq_upper, "mux: kv arena OOM — request shed");
                 let _ = job
                     .respond
@@ -3038,23 +3110,41 @@ fn admit_session(
         None
     };
 
-    // A P/D decode leg reaches this queue at the handoff; its request arrived with the prefill.
-    let (leg, arrived) = match (&job.opts.export, &job.opts.import) {
-        (Some(_), _) => (Leg::Prefill, arrived),
-        (_, Some(i)) => {
-            i.outcome.settle();
-            (Leg::Decode { first: i.first }, i.arrived)
+    let telemetry = match (&job.opts.export, job.opts.import.as_mut()) {
+        (Some(_), _) => Some(RequestMetrics::leg(
+            Arc::clone(metrics),
+            Leg::Prefill,
+            arrived,
+            job.arrived,
+            job.prompt_ids.len(),
+            job.gen.max_tokens,
+        )),
+        (_, Some(import)) => {
+            if let Some(payload) = import.payload() {
+                let first = payload.first;
+                import.outcome.settle();
+                Some(RequestMetrics::leg(
+                    Arc::clone(metrics),
+                    Leg::Decode { first },
+                    import.arrived,
+                    job.arrived,
+                    job.prompt_ids.len(),
+                    job.gen.max_tokens,
+                ))
+            } else {
+                import.metrics = Some(Arc::clone(metrics));
+                None
+            }
         }
-        _ => (Leg::Whole, arrived),
+        _ => Some(RequestMetrics::leg(
+            Arc::clone(metrics),
+            Leg::Whole,
+            arrived,
+            job.arrived,
+            job.prompt_ids.len(),
+            job.gen.max_tokens,
+        )),
     };
-    let telemetry = Some(RequestMetrics::leg(
-        Arc::clone(metrics),
-        leg,
-        arrived,
-        job.arrived,
-        job.prompt_ids.len(),
-        job.gen.max_tokens,
-    ));
     if let Some(session) = &session {
         retention.table.forget(session);
     }
@@ -3132,10 +3222,17 @@ fn release_kv(arena: &Option<SharedKvState>, handle: Option<SlotHandle>) {
 
 /// Terminate a failing slot: release its KV allocation and notify the client.
 #[allow(dead_code)]
-#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
 fn fail_slot(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>, err: crate::RuntimeError) {
     if let Some(taken) = slot_opt.take() {
         release_kv(arena, taken.kv);
+        if taken.telemetry.is_none()
+            && taken
+                .import
+                .as_ref()
+                .is_some_and(|i| !i.outcome.report_abort())
+        {
+            return;
+        }
         let _ = taken.respond.try_send(StreamChunk::Err(err));
     }
 }
@@ -3167,6 +3264,11 @@ async fn preempt_slots(slots: &mut [Option<Slot>], arena: &Option<SharedKvState>
         };
         if let Some(telemetry) = slot.telemetry.as_mut() {
             telemetry.finish(FinishReason::Preempted, slot.executed);
+        } else if let Some(import) = slot.import.as_mut() {
+            if !import.preempt() {
+                release_kv(arena, slot.kv);
+                continue;
+            }
         }
         let done = StreamChunk::Done {
             executed: slot.executed,
@@ -3332,6 +3434,7 @@ fn run_one_tick(
     // execution, including tokens discarded after a stop within the quantum.
     Option<DecodeProgress>,
 ) {
+    obs.pd_import_work = false;
     let bucket = key.and_then(|k| bundle.bucket(k));
     for slot in slots.iter_mut() {
         if slot.as_ref().is_some_and(|s| s.parked_at.is_some()) {
@@ -3423,7 +3526,7 @@ fn run_one_tick(
                 // Whether this tick does any prefill work — reported to the dispatcher
                 // so prefill tick durations never enter the decode-service EWMA.
                 let did_prefill = (0..cap.min(slots.len()))
-                    .any(|i| slots[i].as_ref().is_some_and(|s| s.step == 0));
+                    .any(|i| slots[i].as_ref().is_some_and(|s| s.needs_prefill()));
 
                 // Decode feeds, gathered BEFORE the prefill pass so a slot prefilled
                 // this tick (which just produced its first token) doesn't also step.
@@ -3438,11 +3541,20 @@ fn run_one_tick(
                     feeds.clear();
                 }
 
+                for s in slots.iter_mut().take(cap).flatten() {
+                    if let Some(import) = s.import.as_mut() {
+                        import.poll();
+                    }
+                }
+                let import_changes = slots.iter().take(cap).flatten().any(Slot::changes_import);
                 // A pipelined decode step may still be in flight from the previous tick. Anything
                 // but its exact continuation (a prefill, a changed row set, a row the device cannot
                 // sample) completes it first, streams its tokens, and re-gathers.
                 if e.pipe_busy()
-                    && (did_prefill || !e.pipe_covers(&feeds) || !gpu_pipe_rows(&feeds, &slots))
+                    && (import_changes
+                        || did_prefill
+                        || !e.pipe_covers(&feeds)
+                        || !gpu_pipe_rows(&feeds, &slots))
                 {
                     let mut done = std::mem::take(&mut obs.host.pipe_tokens);
                     match e.pipe_drain(&mut done) {
@@ -3472,6 +3584,19 @@ fn run_one_tick(
                     }
                 }
 
+                // An empty pipeline makes the next upload include every imported position.
+                if !e.pipe_busy() {
+                    obs.pd_import_work |= gpu_seat_imports(
+                        &mut *e,
+                        &mut slots,
+                        cap,
+                        &arena,
+                        bundle,
+                        stop.as_slice(),
+                        &mut disconnected,
+                        &mut tick_fault,
+                    );
+                }
                 // Speculation census (`plowrt_spec_*`): every decode tick of a speculating engine
                 // counts its draftable rows and, unless it may speculate, its first blocker.
                 let spec_metrics = e
@@ -3731,16 +3856,6 @@ fn run_one_tick(
                     }
                 }
 
-                gpu_seat_imports(
-                    &mut *e,
-                    &mut slots,
-                    cap,
-                    &arena,
-                    bundle,
-                    stop.as_slice(),
-                    &mut disconnected,
-                    &mut tick_fault,
-                );
                 let pack_t = packlog::on().then(Instant::now);
                 let (pack_live, pack_prefilling) = if pack_t.is_some() {
                     let live = slots.iter().take(cap).flatten();
@@ -3949,11 +4064,7 @@ fn run_one_tick(
                     let mut serial_rows = 0usize;
                     loop {
                         let Some(i) = (0..slots.len().min(cap))
-                            .filter(|&i| {
-                                slots[i]
-                                    .as_ref()
-                                    .is_some_and(|s| s.step == 0 && s.import.is_none())
-                            })
+                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.needs_prefill()))
                             .min_by_key(|&i| slots[i].as_ref().map(|s| (s.class, s.arrived)))
                         else {
                             break;
@@ -4508,7 +4619,8 @@ fn run_one_tick(
             } else {
                 Vec::new()
             };
-            seq_seat_imports(e, &mut slots, &arena, bundle, &stop, &mut tick_fault);
+            obs.pd_import_work |=
+                seq_seat_imports(e, &mut slots, &arena, bundle, &stop, &mut tick_fault);
 
             // `capacity` is `batch()`, so this is only reachable on a mismatch;
             // a loud rejection beats a hang.
@@ -4606,7 +4718,7 @@ fn run_one_tick(
                 let (waiting, rows) = slots[..b.min(slots.len())]
                     .iter()
                     .flatten()
-                    .filter(|s| s.step == 0)
+                    .filter(|s| s.needs_prefill())
                     .fold((0u32, 0u32), |(n, r), s| {
                         (
                             n + 1,
@@ -4625,7 +4737,7 @@ fn run_one_tick(
             if slots[..b.min(slots.len())]
                 .iter()
                 .flatten()
-                .filter(|slot| slot.step == 0)
+                .filter(|slot| slot.needs_prefill())
                 .take(2)
                 .count()
                 == 2
@@ -4634,7 +4746,7 @@ fn run_one_tick(
                     if e.resume_before_pack() {
                         if let Some(s) = slot_opt
                             .as_mut()
-                            .filter(|s| s.step == 0 && s.pf_pos == 0 && s.resume > 0)
+                            .filter(|s| s.needs_prefill() && s.pf_pos == 0 && s.resume > 0)
                         {
                             s.resume = if s.cfg.is_none() {
                                 e.resume_slot(i, s.resume)
@@ -4645,7 +4757,7 @@ fn run_one_tick(
                             s.cached_tokens = s.resume;
                         }
                     }
-                    let Some(slot) = slot_opt.as_ref().filter(|slot| slot.step == 0) else {
+                    let Some(slot) = slot_opt.as_ref().filter(|slot| slot.needs_prefill()) else {
                         continue;
                     };
                     if let Err(err) = e.prepare_packed_prefill_slot(i, &slot.prompt_ids, tick_max) {
@@ -4664,7 +4776,8 @@ fn run_one_tick(
                 .take(b)
                 .filter_map(|(i, slot)| {
                     let slot = slot.as_ref()?;
-                    (slot.step == 0 && e.terminal_prefill_ready(i, &slot.prompt_ids)).then_some(i)
+                    (slot.needs_prefill() && e.terminal_prefill_ready(i, &slot.prompt_ids))
+                        .then_some(i)
                 })
                 .collect();
             if !terminal.is_empty() {
@@ -4706,7 +4819,7 @@ fn run_one_tick(
                         );
                         for (i, token) in output {
                             if let Some(slot) = slots[i].as_mut() {
-                                if slot.step == 0 {
+                                if slot.needs_prefill() {
                                     slot.pf_pos = slot.prompt_ids.len();
                                 }
                             }
@@ -4784,7 +4897,7 @@ fn run_one_tick(
                     if e.resume_before_pack() {
                         if let Some(s) = slot_opt
                             .as_mut()
-                            .filter(|s| s.step == 0 && s.pf_pos == 0 && s.resume > 0)
+                            .filter(|s| s.needs_prefill() && s.pf_pos == 0 && s.resume > 0)
                         {
                             s.resume = if s.cfg.is_none() {
                                 e.resume_slot(i, s.resume)
@@ -4797,7 +4910,7 @@ fn run_one_tick(
                     }
                     let Some(slot) = slot_opt
                         .as_ref()
-                        .filter(|slot| slot.step == 0 && !slot.respond.is_closed())
+                        .filter(|slot| slot.needs_prefill() && !slot.respond.is_closed())
                     else {
                         continue;
                     };
@@ -4829,7 +4942,7 @@ fn run_one_tick(
                     .take(b)
                     .filter_map(|(i, slot)| {
                         let slot = slot.as_ref()?;
-                        if slot.step != 0 || slot.respond.is_closed() {
+                        if !slot.needs_prefill() || slot.respond.is_closed() {
                             return None;
                         }
                         let rows = e.token_batch_prefill_rows(i, &slot.prompt_ids, u32::MAX);
@@ -4985,7 +5098,7 @@ fn run_one_tick(
                                 let slot = id as usize;
                                 if finished.contains(&slot) {
                                     if let Some(s) = slots[slot].as_mut() {
-                                        if s.step == 0 {
+                                        if s.needs_prefill() {
                                             s.pf_pos = s.prompt_ids.len();
                                             s.cached_tokens = e.cached_rows(slot);
                                         }
@@ -5056,7 +5169,7 @@ fn run_one_tick(
                     .take(b)
                     .filter_map(|(i, slot)| {
                         let slot = slot.as_ref()?;
-                        if slot.step != 0 || slot.respond.is_closed() {
+                        if !slot.needs_prefill() || slot.respond.is_closed() {
                             return None;
                         }
                         let rows = e.mixed_prefill_rows(i, &slot.prompt_ids, tick_max);
@@ -5205,7 +5318,7 @@ fn run_one_tick(
                 slots[..cap]
                     .iter()
                     .flatten()
-                    .filter(|s| s.step == 0 && !s.respond.is_closed())
+                    .filter(|s| s.needs_prefill() && !s.respond.is_closed())
                     .map(|s| {
                         (
                             s.prompt_ids.len().saturating_sub(s.pf_pos),
@@ -5247,7 +5360,7 @@ fn run_one_tick(
                 for _ in 0..prep_rounds {
                     if b2b_pass == 0 {
                         let pending: u32 = (0..cap)
-                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
+                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.needs_prefill()))
                             .filter_map(|i| e.next_prefill_rows(i))
                             .sum();
                         if pending >= full_budget {
@@ -5257,7 +5370,7 @@ fn run_one_tick(
                     let fresh = (0..cap)
                         .filter(|&i| {
                             slots[i].as_ref().is_some_and(|s| {
-                                s.step == 0
+                                s.needs_prefill()
                                     && s.pf_pos == 0
                                     && s.resume == 0
                                     && !s.respond.is_closed()
@@ -5286,7 +5399,7 @@ fn run_one_tick(
                     .filter_map(|i| {
                         let slot = slots[i]
                             .as_ref()
-                            .filter(|s| s.step == 0 && !s.respond.is_closed())?;
+                            .filter(|s| s.needs_prefill() && !s.respond.is_closed())?;
                         let arrival = arrival_key(slot.arrived, now);
                         if let Some(span) = pf_batch
                             .then(|| e.packable_prefill_span(i, full_budget))
@@ -5779,7 +5892,7 @@ fn run_one_tick(
             if did_prefill {
                 let prefill_remains = slots[..b.min(slots.len())]
                     .iter()
-                    .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
+                    .any(|s| s.as_ref().is_some_and(|s| s.needs_prefill()));
                 if amd_defer_decode(rt.pf_defer_decode, prefill_remains) {
                     tracing::debug!("amd: decode deferred while prefill remains");
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
@@ -5789,7 +5902,7 @@ fn run_one_tick(
             if did_prefill
                 && slots.iter().enumerate().take(b).any(|(i, slot)| {
                     slot.as_ref().is_some_and(|slot| {
-                        slot.step == 0 && e.terminal_prefill_ready(i, &slot.prompt_ids)
+                        slot.needs_prefill() && e.terminal_prefill_ready(i, &slot.prompt_ids)
                     })
                 })
             {
@@ -6497,7 +6610,7 @@ fn amd_slo_plan(
         .filter_map(|i| {
             let slot = slots[i]
                 .as_ref()
-                .filter(|s| s.step == 0 && !s.respond.is_closed())?;
+                .filter(|s| s.needs_prefill() && !s.respond.is_closed())?;
             let planned = e.next_prefill_rows(i);
             let rows = planned.unwrap_or(u32::MAX);
             let prior = u32::try_from(e.prefill_frontier(i).unwrap_or(0)).unwrap_or(u32::MAX);
@@ -6704,7 +6817,7 @@ fn itl_owed_rows(slots: &[Option<Slot>], cap: usize, withheld: usize, queued_row
     itl_backlog_rows(
         (0..cap.min(slots.len())).filter_map(|i| {
             let (s, pf_pos) = pack_row(slots, i)?;
-            (s.step == 0).then(|| s.prompt_ids.len().saturating_sub(withheld + pf_pos))
+            (s.needs_prefill()).then(|| s.prompt_ids.len().saturating_sub(withheld + pf_pos))
         }),
         queued_rows,
     )
@@ -7027,7 +7140,7 @@ fn gpu_prefill_batched_pass(
                 .filter_map(|i| {
                     let (s, pf_pos) = pack_row(slots, i)?;
                     let n = s.prompt_ids.len();
-                    (e.packed_slot_ready(i) && s.step == 0 && pf_pos + withheld < n)
+                    (e.packed_slot_ready(i) && s.needs_prefill() && pf_pos + withheld < n)
                         .then(|| (n - withheld - pf_pos).min(chunk_cap))
                 })
                 .sum();
@@ -7048,7 +7161,7 @@ fn gpu_prefill_batched_pass(
         });
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
             // A P/D decode job is seated from its image (`gpu_seat_imports`), never prefilled.
-            let Some(request) = slot.as_mut().filter(|s| s.step == 0 && s.import.is_none()) else {
+            let Some(request) = slot.as_mut().filter(|s| s.needs_prefill()) else {
                 continue;
             };
             if request.respond.is_closed() {
@@ -7172,7 +7285,8 @@ fn gpu_prefill_batched_pass(
             .filter_map(|i| {
                 let (s, pf_pos) = pack_row(slots, i)?;
                 let n = s.prompt_ids.len();
-                if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
+                if !e.packed_slot_ready(i) || !s.needs_prefill() || n == 0 || pf_pos + withheld >= n
+                {
                     return None;
                 }
                 let publish =
@@ -7605,7 +7719,7 @@ fn gpu_prefill_batched_pass(
         let any_ready = pack.iter().any(|&(i, _, _)| {
             slots[i].as_ref().is_some_and(|s| {
                 e.packed_slot_ready(i)
-                    && s.step == 0
+                    && s.needs_prefill()
                     && !s.prompt_ids.is_empty()
                     && packed_prompt_done(slots, i, withheld)
             })
@@ -7640,7 +7754,9 @@ fn gpu_seat_imports(
     stop: &[u32],
     disconnected: &mut [bool],
     tick_fault: &mut Option<crate::DeviceErrorInfo>,
-) {
+) -> bool {
+    let mut worked = false;
+    // Import states were snapshotted before draining: a later arrival waits for the next turn.
     for i in 0..slots.len().min(cap) {
         let Some(s) = slots[i]
             .as_mut()
@@ -7655,8 +7771,28 @@ fn gpu_seat_imports(
             }
             continue;
         }
+        let import = s.import.as_mut().expect("filtered on import");
+        if import.waiting() {
+            continue;
+        }
+        if import.abandoned() {
+            disconnected[i] = true;
+            if let Some(taken) = slots[i].take() {
+                release_kv(arena, taken.kv);
+            }
+            continue;
+        }
+        if let Some(telemetry) = import.start_metrics(s.prompt_ids.len(), s.gen.max_tokens) {
+            s.telemetry = Some(telemetry);
+        }
+        let prepared = import.prepared;
+        worked = true;
         let total = s.prompt_ids.len() + s.gen.max_tokens.max(1);
-        if let Err(err) = e.begin_slot(i, total) {
+        if let Err(err) = if prepared {
+            Ok(())
+        } else {
+            e.begin_slot(i, total)
+        } {
             // Out of device memory for live KV: wait, as a prefill would.
             let short = matches!(err, crate::RuntimeError::Oom(_)) || err.device_code() == Some(2);
             if short && !err.is_fatal() {
@@ -7668,9 +7804,11 @@ fn gpu_seat_imports(
             }
             continue;
         }
-        let import = s.import.take().expect("filtered on import");
+        let import = s.import.take().expect("filtered on import").take_ready();
         let seated = match e.kv_image_key() {
-            Some(key) if key == import.image.key => {
+            Some(key)
+                if key == import.image.key && s.prompt_ids.len() == import.image.rows as usize =>
+            {
                 e.import_kv_image(i, &s.prompt_ids, &import.image.bytes)
             }
             _ => Err(crate::RuntimeError::Rejected(
@@ -7699,6 +7837,39 @@ fn gpu_seat_imports(
             Some(stop),
         );
     }
+    if slots
+        .iter()
+        .flatten()
+        .any(|s| s.step > 0 || s.import.as_ref().is_none_or(|i| !i.waiting()))
+    {
+        return worked;
+    }
+    for i in 0..slots.len().min(cap) {
+        let Some(s) = slots[i]
+            .as_mut()
+            .filter(|s| s.step == 0 && !s.respond.is_closed())
+        else {
+            continue;
+        };
+        let Some(import) = s.import.as_mut().filter(|i| i.waiting() && !i.prepared) else {
+            continue;
+        };
+        let rows = s.prompt_ids.len();
+        let total = rows + s.gen.max_tokens.max(1);
+        worked = true;
+        if let Err(err) = import.prepare_with(|| e.prepare_kv_import(i, rows, total)) {
+            let short = matches!(err, crate::RuntimeError::Oom(_)) || err.device_code() == Some(2);
+            if short && !err.is_fatal() {
+                e.retire_slot(i, false);
+                e.note_kv_pressure();
+            } else {
+                note_fault(tick_fault, &err);
+                fail_slot(&mut slots[i], arena, err);
+            }
+        }
+        break;
+    }
+    worked
 }
 
 /// The KV image of engine slot `slot`, whose P/D prefill job has produced its first token.
@@ -7764,7 +7935,8 @@ fn seq_seat_imports(
     bundle: &ModelBundle,
     stop: &[u32],
     tick_fault: &mut Option<crate::DeviceErrorInfo>,
-) {
+) -> bool {
+    let mut worked = false;
     for i in 0..slots.len().min(e.batch()) {
         let Some(s) = slots[i]
             .as_mut()
@@ -7776,7 +7948,23 @@ fn seq_seat_imports(
             // The tick's disconnect pass releases this slot.
             continue;
         }
-        let import = s.import.take().expect("filtered on import");
+        let import = s.import.as_mut().expect("filtered on import");
+        import.poll();
+        if import.waiting() {
+            continue;
+        }
+        if import.abandoned() {
+            e.release(i);
+            if let Some(taken) = slots[i].take() {
+                release_kv(arena, taken.kv);
+            }
+            continue;
+        }
+        if let Some(telemetry) = import.start_metrics(s.prompt_ids.len(), s.gen.max_tokens) {
+            s.telemetry = Some(telemetry);
+        }
+        worked = true;
+        let import = s.import.take().expect("filtered on import").take_ready();
         let seated = match e.kv_image_key() {
             Some(key)
                 if key == import.image.key && s.prompt_ids.len() == import.image.rows as usize =>
@@ -7811,6 +7999,7 @@ fn seq_seat_imports(
             e.release(i);
         }
     }
+    worked
 }
 
 /// Advance a prefilling slot: one prompt chunk through the prefill bucket
@@ -10513,21 +10702,118 @@ mod tests {
         assert_eq!(multistep_requested(0, 8, 4), 0);
     }
 
+    fn queued_test_mux(
+        metrics: Arc<Metrics>,
+        capacity: usize,
+    ) -> (ModelMux, mpsc::Receiver<MuxMsg>) {
+        let (tx, rx) = mpsc::channel(capacity + CONTROL_SLACK);
+        (
+            ModelMux {
+                tx,
+                metrics,
+                preempt: Arc::default(),
+                preempt_notify: Arc::default(),
+                arrival_notify: Arc::default(),
+                ingress: Arc::default(),
+                preempted: Arc::default(),
+                queue_cap: capacity,
+                prefix_block_rows: 0,
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn pd_source_handoff_completes_while_actual_decode_admission_is_blocked() {
+        use crate::serve::pd::{KvImage, Outcome};
+        let now = Instant::now();
+        let source = Arc::new(Metrics::default());
+        let decode = Arc::new(Metrics::default());
+        let (mux, mut rx) = queued_test_mux(decode.clone(), 1);
+        assert!(mux.submit(test_job()).is_ok());
+        mux.arrival_notify.notified().await;
+        let (respond, mut client) = crate::serve::stream::channel();
+        let mut job = test_job();
+        job.respond = respond;
+        job.prompt_ids = vec![1, 2, 3];
+        job.gen.params.logprobs = Some(crate::text::logprobs::LogprobRequest {
+            top: 1,
+            raw_logits: false,
+        });
+        let (ptx, prx) = crate::serve::stream::channel();
+        let expected = crate::text::logprobs::TokenLogprobs {
+            logprob: -0.125,
+            top: vec![(120, -0.125)],
+        };
+        ptx.try_send(StreamChunk::Token {
+            id: 120,
+            text: String::new(),
+            logprobs: Some(Box::new(expected.clone())),
+            frame: None,
+        })
+        .unwrap();
+        ptx.try_send(StreamChunk::Done {
+            executed: 1,
+            reason: FinishReason::Length,
+            usage: crate::serve::stream::TokenUsage {
+                cached_tokens: 2,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+        drop(ptx);
+        let (image_tx, image_rx) = tokio::sync::oneshot::channel();
+        assert!(image_tx
+            .send(Ok(KvImage {
+                key: "key".into(),
+                rows: 3,
+                bytes: vec![42].into(),
+                handoff_started: now
+            }))
+            .is_ok());
+        let mut worker = Box::pin(crate::serve::pd::drive_handoff(
+            &mux,
+            job,
+            now,
+            prx,
+            image_rx,
+            Outcome::new(source.clone(), now),
+            None,
+        ));
+        tokio::select! {
+            _ = &mut worker => panic!("decode queue must still be full"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(1), mux.arrival_notify.notified()) => result.unwrap(),
+        }
+        // Only the completed handoff notifies while admission is blocked.
+        assert_eq!(decode.queued_requests.load(Ordering::Relaxed), 1);
+        let before_room = Instant::now();
+        let filler = rx.try_recv().unwrap();
+        note_dequeued(&filler, &decode);
+        tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+            .await
+            .unwrap();
+        let msg = rx.try_recv().unwrap();
+        note_dequeued(&msg, &decode);
+        let MuxMsg::Job(mut queued, _) = msg else {
+            panic!("missing decode job");
+        };
+        let import = queued.opts.import.as_mut().unwrap();
+        import.poll();
+        let payload = import.payload().unwrap();
+        assert!(payload.first >= now && payload.first <= before_room);
+        assert_eq!((payload.token, payload.cached_tokens), (120, 2));
+        assert_eq!(payload.logprobs.as_deref(), Some(&expected));
+        import.outcome.settle();
+        assert!(client.try_recv().is_err());
+        assert_eq!(decode.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(decode.queued_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+    }
+
     #[tokio::test]
     async fn bounded_ingress_reports_full_closed_and_depth() {
         let metrics = Arc::new(Metrics::default());
-        let (tx, mut rx) = mpsc::channel(1 + CONTROL_SLACK);
-        let mux = ModelMux {
-            tx,
-            metrics: Arc::clone(&metrics),
-            preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            preempt_notify: Arc::new(tokio::sync::Notify::new()),
-            arrival_notify: Arc::new(tokio::sync::Notify::new()),
-            ingress: Arc::default(),
-            preempted: Arc::default(),
-            queue_cap: 1,
-            prefix_block_rows: 0,
-        };
+        let (mux, mut rx) = queued_test_mux(metrics.clone(), 1);
 
         let (a, b) = (mux.ingress(), mux.ingress());
         assert_eq!(mux.ingress.pending(), 2);
@@ -10576,20 +10862,24 @@ mod tests {
         let import_job = |prefill, respond| {
             let mut job = test_job();
             job.respond = respond;
-            job.opts.import = Some(Box::new(crate::serve::pd::KvImport {
-                image: crate::serve::pd::KvImage {
-                    key: "key".into(),
-                    rows: 1,
-                    bytes: vec![0].into(),
-                    handoff_started: now,
+            job.opts.import = Some(Box::new(crate::serve::pd::KvImport::ready(
+                crate::serve::pd::ReadyImport {
+                    image: crate::serve::pd::KvImage {
+                        key: "key".into(),
+                        rows: 1,
+                        bytes: vec![0].into(),
+                        handoff_started: now,
+                    },
+                    token: 1,
+                    logprobs: None,
+
+                    first: now,
+
+                    cached_tokens: 0,
                 },
-                token: 1,
-                logprobs: None,
-                arrived: now,
-                first: now,
-                outcome: crate::serve::pd::Outcome::new(prefill, now),
-                cached_tokens: 0,
-            }));
+                now,
+                crate::serve::pd::Outcome::new(prefill, now),
+            )));
             job
         };
         let imported = import_job(metrics.clone(), crate::serve::stream::channel().0);
@@ -10639,18 +10929,7 @@ mod tests {
     #[test]
     fn the_queue_bound_counts_jobs_off_the_channel_too() {
         let metrics = Arc::new(Metrics::default());
-        let (tx, mut rx) = mpsc::channel(3 + CONTROL_SLACK);
-        let mux = ModelMux {
-            tx,
-            metrics: Arc::clone(&metrics),
-            preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            preempt_notify: Arc::new(tokio::sync::Notify::new()),
-            arrival_notify: Arc::new(tokio::sync::Notify::new()),
-            ingress: Arc::default(),
-            preempted: Arc::default(),
-            queue_cap: 3,
-            prefix_block_rows: 0,
-        };
+        let (mux, mut rx) = queued_test_mux(metrics.clone(), 3);
         let (mut waiting, mut load) = (std::collections::VecDeque::new(), LoadEstimator::default());
         let (mut draining, mut drain_done, mut late) = (false, None, Vec::new());
         for _ in 0..3 {
@@ -11874,13 +12153,15 @@ mod tests {
     mod seq_pd {
         use super::*;
         use crate::serve::engine::SeqEngine;
-        use crate::serve::pd::{KvExport, KvImage, KvImport, Outcome};
+        use crate::serve::pd::{KvExport, KvImage, KvImport, Outcome, ReadyImport};
 
         #[derive(Default)]
         struct Engine {
             stop: Arc<Vec<u32>>,
             live: bool,
             exports: usize,
+            imports: usize,
+            capacity: usize,
             seed: Option<u32>,
             logits: Vec<f32>,
             export_fault: bool,
@@ -11895,7 +12176,7 @@ mod tests {
                 &self.stop
             }
             fn batch(&self) -> usize {
-                1
+                self.capacity.max(1)
             }
             fn release(&mut self, _: usize) {
                 self.live = false;
@@ -11928,6 +12209,7 @@ mod tests {
                 assert_eq!(prompt, [1, 2, 3]);
                 assert_eq!(&**image, [42]);
                 self.live = true;
+                self.imports += 1;
                 self.seed = Some(first);
                 Ok(())
             }
@@ -11971,6 +12253,294 @@ mod tests {
             fn step_batch(&mut self, _: &[(usize, u32)]) -> Result<Vec<(usize, u32)>> {
                 unreachable!()
             }
+        }
+
+        #[test]
+        fn every_import_state_is_excluded_from_prefill_and_parks_only_when_safe() {
+            let now = Instant::now();
+            let (mut slot, client) = prefill_test_slot();
+            let s = slot.as_mut().unwrap();
+            assert!(s.needs_prefill());
+            let (import, deliver) = KvImport::pending(now, Outcome::new(Arc::default(), now));
+            s.import = Some(Box::new(import));
+            assert!(!s.needs_prefill() && s.waiting_import(false) && !s.waiting_import(true));
+            assert!(!s.changes_import());
+            s.import.as_mut().unwrap().prepare_with(|| Ok(())).unwrap();
+            assert!(s.waiting_import(true) && !s.changes_import());
+            assert!(deliver
+                .send(ReadyImport {
+                    image: KvImage {
+                        key: "key".into(),
+                        rows: 3,
+                        bytes: vec![42].into(),
+                        handoff_started: now
+                    },
+                    token: 120,
+                    logprobs: None,
+                    first: now,
+                    cached_tokens: 0,
+                })
+                .is_ok());
+            assert!(
+                !s.changes_import(),
+                "the channel is snapshotted before pipeline drain"
+            );
+            s.import.as_mut().unwrap().poll();
+            assert!(s.changes_import() && !s.waiting_import(true) && !s.needs_prefill());
+            let (import, deliver) = KvImport::pending(now, Outcome::new(Arc::default(), now));
+            s.import = Some(Box::new(import));
+            drop(deliver);
+            s.import.as_mut().unwrap().poll();
+            assert!(s.changes_import() && !s.waiting_import(false) && !s.needs_prefill());
+            let (mut import, _deliver) = KvImport::pending(now, Outcome::new(Arc::default(), now));
+            import.prepare_with(|| Ok(())).unwrap();
+            s.import = Some(Box::new(import));
+            drop(client);
+            assert!(s.changes_import() && !s.waiting_import(true) && !s.needs_prefill());
+        }
+
+        #[test]
+        fn the_sequential_slo_planner_never_prefills_a_pending_ready_or_abandoned_import() {
+            let now = Instant::now();
+            for state in ["pending", "prepared", "ready", "abandoned"] {
+                let (slot, _client) = prefill_test_slot();
+                let (mut active, _active_client) = prefill_test_slot();
+                active.as_mut().unwrap().step = 1;
+                active.as_mut().unwrap().out_ids.push(120);
+                let mut slots = vec![slot, active];
+                let (import, deliver) = KvImport::pending(now, Outcome::new(Arc::default(), now));
+                slots[0].as_mut().unwrap().import = Some(Box::new(import));
+                if state == "prepared" {
+                    slots[0]
+                        .as_mut()
+                        .unwrap()
+                        .import
+                        .as_mut()
+                        .unwrap()
+                        .prepare_with(|| Ok(()))
+                        .unwrap();
+                }
+                if state == "ready" {
+                    assert!(deliver
+                        .send(ReadyImport {
+                            image: KvImage {
+                                key: "key".into(),
+                                rows: 3,
+                                bytes: vec![42].into(),
+                                handoff_started: now
+                            },
+                            token: 120,
+                            logprobs: None,
+                            first: now,
+                            cached_tokens: 0,
+                        })
+                        .is_ok());
+                    slots[0].as_mut().unwrap().import.as_mut().unwrap().poll();
+                } else if state == "abandoned" {
+                    drop(deliver);
+                    slots[0].as_mut().unwrap().import.as_mut().unwrap().poll();
+                }
+                #[cfg(feature = "cuda")]
+                assert_eq!(gpu_decode_feeds(&slots, 2), [(1, 120)]);
+                let plan = amd_slo_plan(
+                    &Engine {
+                        capacity: 2,
+                        ..Default::default()
+                    },
+                    &slots,
+                    Default::default(),
+                    crate::sched::step::Tick {
+                        cap_rows: 128,
+                        packing: false,
+                        rotate: false,
+                        turn: 0,
+                        slots: 2,
+                    },
+                    crate::sched::slo::Targets {
+                        ttft_ms: Some(100.),
+                        tbt_ms: Some(10.),
+                    },
+                    &mut Default::default(),
+                    now,
+                );
+                assert!(
+                    plan.launches
+                        .iter()
+                        .all(|l| l.spans.iter().all(|s| s.slot != 0))
+                        && plan.decodes == [1],
+                    "{state}: {plan:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn engine_dead_pending_fanout_preserves_one_typed_terminal_and_abort() {
+            for source_first in [false, true] {
+                let now = Instant::now();
+                let source = Arc::new(Metrics::default());
+                let decode = Arc::new(Metrics::default());
+                let outcome = Outcome::new(source.clone(), now);
+                let (mut slot, mut client) = prefill_test_slot();
+                let (mut import, _deliver) = KvImport::pending(now, outcome.clone());
+                import.metrics = Some(decode.clone());
+                slot.as_mut().unwrap().import = Some(Box::new(import));
+                if source_first {
+                    assert!(outcome.report_abort());
+                    slot.as_ref()
+                        .unwrap()
+                        .respond
+                        .try_send(StreamChunk::Err(crate::RuntimeError::Unavailable(
+                            "source failed".into(),
+                        )))
+                        .unwrap();
+                }
+                fail_slot(
+                    &mut slot,
+                    &None,
+                    crate::RuntimeError::DeviceFault { info: fault(true) },
+                );
+                assert!(slot.is_none());
+                let StreamChunk::Err(error) = client.try_recv().unwrap() else {
+                    panic!("missing failure");
+                };
+                assert_eq!(error.is_fatal(), !source_first);
+                assert!(client.try_recv().is_err());
+                drop(outcome);
+                assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 1);
+                assert_eq!(decode.serving.aborted.load(Ordering::Relaxed), 0);
+            }
+        }
+
+        #[test]
+        fn pending_import_waits_without_prefill_then_seats_and_counts_decode_once() {
+            let now = Instant::now();
+            let source = Arc::new(Metrics::default());
+            let decode = Arc::new(Metrics::default());
+            let bundle = prefill_test_bundle("seq-pending-import");
+            let (slot, mut rx) = prefill_test_slot();
+            let mut slots = vec![slot];
+            let s = slots[0].as_mut().unwrap();
+            s.gen.max_tokens = 2;
+            s.raw_tokens = true;
+            let (mut import, deliver) = KvImport::pending(now, Outcome::new(source.clone(), now));
+            import.metrics = Some(decode.clone());
+            s.import = Some(Box::new(import));
+            let mut e = Engine::default();
+            assert!(!seq_seat_imports(
+                &mut e,
+                &mut slots,
+                &None,
+                &bundle,
+                &[],
+                &mut None
+            ));
+            assert_eq!(e.imports, 0);
+            assert!(slots[0].as_ref().unwrap().telemetry.is_none());
+            assert_eq!(decode.serving.running.load(Ordering::Relaxed), 0);
+            assert!(rx.try_recv().is_err());
+            assert!(deliver
+                .send(ReadyImport {
+                    image: KvImage {
+                        key: "key".into(),
+                        rows: 3,
+                        bytes: vec![42].into(),
+                        handoff_started: now
+                    },
+                    token: 120,
+                    logprobs: None,
+                    first: now,
+                    cached_tokens: 2,
+                })
+                .is_ok());
+            let import_work = seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
+            assert!(import_work && service_sample(12.0, import_work).is_none());
+            assert_eq!(e.imports, 1);
+            assert_eq!(e.seed, Some(120));
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                StreamChunk::Token { id: 120, .. }
+            ));
+            assert!(slots[0].as_ref().unwrap().telemetry.is_some());
+            handle_produced_token(&mut slots[0], &None, &bundle, 121, 1, &mut 0, Some(&[]));
+            assert!(slots[0].is_none());
+            let snapshot = crate::obs::serving::snapshot(&[("m".into(), decode, true)]);
+            let m = &snapshot.models[0];
+            assert_eq!(
+                (
+                    m.completed,
+                    m.generated_tokens,
+                    m.running,
+                    m.aborted,
+                    m.e2e.count
+                ),
+                (1, 2, 0, 0, 1)
+            );
+            assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn a_source_failure_closes_the_pending_decode_without_a_second_error_or_abort() {
+            let now = Instant::now();
+            let source = Arc::new(Metrics::default());
+            let decode = Arc::new(Metrics::default());
+            let bundle = prefill_test_bundle("seq-abandoned-import");
+            let (slot, mut rx) = prefill_test_slot();
+            let mut slots = vec![slot];
+            let outcome = Outcome::new(source.clone(), now);
+            let (mut import, deliver) = KvImport::pending(now, outcome.clone());
+            import.metrics = Some(decode.clone());
+            slots[0].as_mut().unwrap().import = Some(Box::new(import));
+            outcome.settle();
+            Metrics::inc(&source.rejected);
+            slots[0]
+                .as_ref()
+                .unwrap()
+                .respond
+                .try_send(StreamChunk::Err(crate::RuntimeError::Unavailable(
+                    "source failed".into(),
+                )))
+                .unwrap();
+            drop(deliver);
+            let mut e = Engine::default();
+            seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
+            assert!(slots[0].is_none());
+            assert_eq!(e.imports, 0);
+            assert!(matches!(rx.try_recv().unwrap(), StreamChunk::Err(_)));
+            assert!(rx.try_recv().is_err());
+            drop(outcome);
+            assert_eq!(source.rejected.load(Ordering::Relaxed), 1);
+            assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+            assert_eq!(decode.serving.aborted.load(Ordering::Relaxed), 0);
+            assert_eq!(decode.serving.running.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
+        async fn preempting_an_admitted_pending_leg_counts_once_and_cancels_its_source() {
+            let now = Instant::now();
+            let source = Arc::new(Metrics::default());
+            let decode = Arc::new(Metrics::default());
+            let (slot, mut rx) = prefill_test_slot();
+            let mut slots = vec![slot];
+            let (mut import, mut deliver) =
+                KvImport::pending(now, Outcome::new(source.clone(), now));
+            import.metrics = Some(decode.clone());
+            slots[0].as_mut().unwrap().import = Some(Box::new(import));
+            preempt_slots(&mut slots, &None).await;
+            assert!(slots[0].is_none());
+            tokio::time::timeout(std::time::Duration::from_secs(1), deliver.closed())
+                .await
+                .unwrap();
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                StreamChunk::Done {
+                    reason: FinishReason::Preempted,
+                    ..
+                }
+            ));
+            assert!(rx.try_recv().is_err());
+            assert_eq!(decode.serving.preempted.load(Ordering::Relaxed), 1);
+            assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+            assert_eq!(decode.serving.aborted.load(Ordering::Relaxed), 0);
         }
 
         #[test]
@@ -12028,15 +12598,19 @@ mod tests {
             s.gen.max_tokens = 3;
             s.gen.params.logprobs = Some(request);
             s.raw_tokens = true;
-            s.import = Some(Box::new(KvImport {
-                image: image.try_recv().unwrap().unwrap(),
-                token: id,
-                logprobs,
-                arrived: now,
-                first: now,
+            s.import = Some(Box::new(KvImport::ready(
+                ReadyImport {
+                    image: image.try_recv().unwrap().unwrap(),
+                    token: id,
+                    logprobs,
+
+                    first: now,
+
+                    cached_tokens: 0,
+                },
+                now,
                 outcome,
-                cached_tokens: 0,
-            }));
+            )));
             // The importing rank has no logits for token 1.
             e.logits.clear();
             seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
@@ -12109,15 +12683,19 @@ mod tests {
                 3,
                 2,
             ));
-            s.import = Some(Box::new(KvImport {
-                image,
-                token: 120,
-                logprobs: None,
-                arrived: now,
-                first: now,
+            s.import = Some(Box::new(KvImport::ready(
+                ReadyImport {
+                    image,
+                    token: 120,
+                    logprobs: None,
+
+                    first: now,
+
+                    cached_tokens: 2,
+                },
+                now,
                 outcome,
-                cached_tokens: 2,
-            }));
+            )));
             let mut fault = None;
             seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut fault);
             let s = slots[0].as_ref().unwrap();
@@ -12159,20 +12737,24 @@ mod tests {
                 let (slot, mut rx) = prefill_test_slot();
                 let mut slots = vec![slot];
                 let now = Instant::now();
-                slots[0].as_mut().unwrap().import = Some(Box::new(KvImport {
-                    image: KvImage {
-                        key: key.into(),
-                        rows,
-                        bytes: vec![42].into(),
-                        handoff_started: now,
+                slots[0].as_mut().unwrap().import = Some(Box::new(KvImport::ready(
+                    ReadyImport {
+                        image: KvImage {
+                            key: key.into(),
+                            rows,
+                            bytes: vec![42].into(),
+                            handoff_started: now,
+                        },
+                        token: 120,
+                        logprobs: None,
+
+                        first: now,
+
+                        cached_tokens: 0,
                     },
-                    token: 120,
-                    logprobs: None,
-                    arrived: now,
-                    first: now,
-                    outcome: Outcome::new(Arc::default(), now),
-                    cached_tokens: 0,
-                }));
+                    now,
+                    Outcome::new(Arc::default(), now),
+                )));
                 let mut e = Engine::default();
                 seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
                 assert!(slots[0].is_none());

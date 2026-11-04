@@ -75,19 +75,127 @@ impl KvExport {
     }
 }
 
-/// A decode job's starting point: the prompt's KV and the first token, sampled by the prefill
-/// rank.
-pub struct KvImport {
+pub struct ReadyImport {
     pub image: KvImage,
     pub token: u32,
     pub logprobs: Option<Box<crate::text::logprobs::TokenLogprobs>>,
-    /// The request's arrival, and when the prefill rank streamed the first token: the decode
-    /// rank's e2e and SLO count from them.
-    pub arrived: Instant,
     pub first: Instant,
-    pub outcome: Arc<Outcome>,
     /// Prompt rows the prefill rank served from its prefix cache (`usage.cached_tokens`).
     pub cached_tokens: usize,
+}
+
+enum ImportState {
+    Pending(oneshot::Receiver<ReadyImport>),
+    Ready(ReadyImport),
+    Abandoned,
+}
+
+/// A decode reservation can prepare its mappings while its prefill rank is still working.
+pub struct KvImport {
+    state: ImportState,
+    pub arrived: Instant,
+    pub outcome: Arc<Outcome>,
+    pub(crate) prepared: bool,
+    pub(crate) metrics: Option<Arc<Metrics>>,
+}
+
+impl KvImport {
+    fn new(state: ImportState, arrived: Instant, outcome: Arc<Outcome>) -> Self {
+        Self {
+            state,
+            arrived,
+            outcome,
+            prepared: false,
+            metrics: None,
+        }
+    }
+
+    pub(crate) fn pending(
+        arrived: Instant,
+        outcome: Arc<Outcome>,
+    ) -> (Self, oneshot::Sender<ReadyImport>) {
+        let (tx, rx) = oneshot::channel();
+        (Self::new(ImportState::Pending(rx), arrived, outcome), tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready(payload: ReadyImport, arrived: Instant, outcome: Arc<Outcome>) -> Self {
+        Self::new(ImportState::Ready(payload), arrived, outcome)
+    }
+
+    pub(crate) fn poll(&mut self) {
+        if let ImportState::Pending(rx) = &mut self.state {
+            match rx.try_recv() {
+                Ok(payload) => self.state = ImportState::Ready(payload),
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => self.state = ImportState::Abandoned,
+            }
+        }
+    }
+
+    pub(crate) fn waiting(&self) -> bool {
+        matches!(self.state, ImportState::Pending(_))
+    }
+
+    pub(crate) fn prepare_with(
+        &mut self,
+        prepare: impl FnOnce() -> crate::Result<()>,
+    ) -> crate::Result<bool> {
+        if !self.waiting() || self.prepared {
+            return Ok(false);
+        }
+        prepare()?;
+        self.prepared = true;
+        Ok(true)
+    }
+
+    pub(crate) fn abandoned(&self) -> bool {
+        matches!(self.state, ImportState::Abandoned)
+    }
+
+    pub(crate) fn preempt(&mut self) -> bool {
+        if let Some(metrics) = self.metrics.take() {
+            if self.outcome.claim_terminal() {
+                if self.outcome.settle() {
+                    Metrics::inc(&metrics.serving.preempted);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn payload(&self) -> Option<&ReadyImport> {
+        match &self.state {
+            ImportState::Ready(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_ready(mut self) -> ReadyImport {
+        match std::mem::replace(&mut self.state, ImportState::Abandoned) {
+            ImportState::Ready(payload) => payload,
+            _ => unreachable!("import has no payload"),
+        }
+    }
+
+    pub(crate) fn start_metrics(
+        &mut self,
+        prompt: usize,
+        max_tokens: usize,
+    ) -> Option<crate::obs::serving::RequestMetrics> {
+        let first = self.payload()?.first;
+        let metrics = self.metrics.take()?;
+        self.outcome.settle();
+        Some(crate::obs::serving::RequestMetrics::leg(
+            metrics,
+            crate::obs::serving::Leg::Decode { first },
+            self.arrived,
+            self.arrived,
+            prompt,
+            max_tokens,
+        ))
+    }
 }
 
 /// A P/D request's terminal outcome until its decode leg owns it. Settled by whoever counts it:
@@ -98,6 +206,7 @@ pub struct Outcome {
     metrics: Arc<Metrics>,
     arrived: Instant,
     open: AtomicBool,
+    terminal: AtomicBool,
 }
 
 impl Outcome {
@@ -106,21 +215,40 @@ impl Outcome {
             metrics,
             arrived,
             open: AtomicBool::new(true),
+            terminal: AtomicBool::new(false),
         })
     }
 
-    pub fn settle(&self) {
-        self.open.store(false, Ordering::Relaxed);
+    pub fn settle(&self) -> bool {
+        self.open.swap(false, Ordering::Relaxed)
+    }
+
+    fn claim_terminal(&self) -> bool {
+        !self.terminal.swap(true, Ordering::Relaxed)
+    }
+
+    fn count_abort(&self) {
+        let m = &self.metrics.serving;
+        Metrics::inc(&m.aborted);
+        Metrics::inc(&m.aborted_before_first);
+        m.aborted_elapsed.duration(self.arrived.elapsed());
+    }
+
+    pub(crate) fn report_abort(&self) -> bool {
+        if !self.claim_terminal() {
+            return false;
+        }
+        if self.settle() {
+            self.count_abort();
+        }
+        true
     }
 }
 
 impl Drop for Outcome {
     fn drop(&mut self) {
         if *self.open.get_mut() {
-            let m = &self.metrics.serving;
-            Metrics::inc(&m.aborted);
-            Metrics::inc(&m.aborted_before_first);
-            m.aborted_elapsed.duration(self.arrived.elapsed());
+            self.count_abort();
         }
     }
 }
@@ -132,6 +260,29 @@ pub(crate) fn settle_refused(job: &Job) {
     }
     if let Some(i) = &job.opts.import {
         i.outcome.settle();
+    }
+}
+
+pub(crate) fn refuse(job: &Job, counter: &std::sync::atomic::AtomicU64) -> bool {
+    let outcome = job
+        .opts
+        .import
+        .as_ref()
+        .map(|i| &i.outcome)
+        .or_else(|| job.opts.export.as_ref().map(|e| &e.outcome));
+    if let Some(outcome) = outcome {
+        let counted = outcome.settle();
+        if counted {
+            Metrics::inc(counter);
+        }
+        if job.opts.import.is_some() {
+            outcome.claim_terminal()
+        } else {
+            counted
+        }
+    } else {
+        Metrics::inc(counter);
+        true
     }
 }
 
@@ -333,7 +484,7 @@ pub(crate) async fn submit(
     // control (the decode rank commits the token through both), its id streamed raw.
     let outcome = Outcome::new(Arc::clone(mux.metrics()), arrived);
     let (sink, image) = KvExport::new(Arc::clone(&outcome));
-    let (ptx, mut prx) = stream::channel();
+    let (ptx, prx) = stream::channel();
     let mut gen = job.gen.clone();
     gen.max_tokens = 1;
     gen.min_tokens = 0;
@@ -354,6 +505,9 @@ pub(crate) async fn submit(
             ..Default::default()
         },
     };
+    let source_prompt = (tracing::enabled!(tracing::Level::DEBUG)
+        && job.gen.params.logprobs.is_some())
+    .then(|| job.prompt_ids.clone());
     if let Err(e) = mux.submit_wait_arrived(prefill, arrived, ingress).await {
         // The refusal is the caller's to retry or report, as for a whole request.
         outcome.settle();
@@ -366,128 +520,182 @@ pub(crate) async fn submit(
     }
     let set = state.dp_set(&set.model).map(Arc::clone);
     tokio::spawn(async move {
-        let fail = |job: &Job, outcome: &Outcome, msg: String| {
-            outcome.settle();
-            Metrics::inc(&outcome.metrics.rejected);
-            let _ = job
-                .respond
-                .try_send(StreamChunk::Err(RuntimeError::Unavailable(msg)));
-        };
-        // A client that leaves stops the handoff: dropping the prefill stream ends that job, and
-        // its dispatcher skips an export nobody waits for. `outcome` counts the abort.
-        let (mut first, mut cached_tokens) = (None, 0);
-        loop {
-            let chunk = tokio::select! {
-                c = prx.recv() => c,
-                _ = job.respond.closed() => return,
-            };
-            match chunk {
-                Some(StreamChunk::Token { id, logprobs, .. })
-                    if first.is_none() && id != stream::TEXT_ONLY =>
-                {
-                    let first_at = Instant::now();
-                    if tracing::enabled!(tracing::Level::DEBUG) {
-                        if let Some(lp) = &logprobs {
-                            use sha2::{Digest, Sha256};
-                            let mut hash = Sha256::new();
-                            for token in &job.prompt_ids {
-                                hash.update(token.to_le_bytes());
-                            }
-                            let top_bits: Vec<_> = lp
-                                .top
-                                .iter()
-                                .map(|&(token, value)| (token, value.to_bits()))
-                                .collect();
-                            tracing::debug!(
-                                prompt_sha256 = %format_args!("{:x}", hash.finalize()),
-                                rows = job.prompt_ids.len(), token = id,
-                                logprob_bits = lp.logprob.to_bits(), ?top_bits,
-                                "pd: source first logprobs"
-                            );
-                        }
-                    }
-                    first = Some((id, first_at, logprobs))
+        let respond = job.respond.clone();
+        let fail = |outcome: &Outcome, msg: String| {
+            if outcome.claim_terminal() {
+                if outcome.settle() {
+                    Metrics::inc(&outcome.metrics.rejected);
                 }
-                Some(StreamChunk::Done {
-                    reason: FinishReason::Preempted,
-                    executed,
-                    usage,
-                }) => {
-                    outcome.settle();
-                    Metrics::inc(&outcome.metrics.serving.preempted);
-                    let _ = job.respond.try_send(StreamChunk::Done {
+                let _ = respond.try_send(StreamChunk::Err(RuntimeError::Unavailable(msg)));
+            }
+        };
+        let Some(set) = set else {
+            return fail(&outcome, "P/D: the model's DP set is gone".into());
+        };
+        let Some(routed) = set.route_decode(&cfg, job.gen.params.samples()) else {
+            return fail(&outcome, "P/D: no decode rank is up".into());
+        };
+        let Some((_, mux)) = decoders.iter().find(|(r, _)| *r == routed.rank) else {
+            return fail(&outcome, "P/D: the decode rank has no dispatcher".into());
+        };
+        drive_handoff(mux, job, arrived, prx, image, outcome, source_prompt).await;
+        drop(routed);
+    });
+    Ok(())
+}
+
+pub(super) async fn drive_handoff(
+    mux: &ModelMux,
+    mut job: Job,
+    arrived: Instant,
+    prx: stream::ChunkReceiver,
+    image: oneshot::Receiver<crate::Result<KvImage>>,
+    outcome: Arc<Outcome>,
+    source_prompt: Option<Vec<u32>>,
+) {
+    let respond = job.respond.clone();
+    let (import, mut deliver) = KvImport::pending(arrived, Arc::clone(&outcome));
+    job.opts.import = Some(Box::new(import));
+    let admission = async {
+        match submit_decode(mux, job, Instant::now()).await {
+            Some(Ok(())) => Ok(()),
+            None => Err(()),
+            Some(Err(SubmitError::Full(job) | SubmitError::Closed(job))) => {
+                settle_refused(&job);
+                let _ = respond.try_send(StreamChunk::Err(RuntimeError::Unavailable(
+                    "P/D: the decode rank refused the request".into(),
+                )));
+                Err(())
+            }
+        }
+    };
+    let handoff = async {
+        let payload = collect_prefill(
+            prx,
+            image,
+            &mut deliver,
+            &respond,
+            &outcome,
+            source_prompt.as_deref(),
+        )
+        .await?;
+        deliver.send(payload).map_err(|_| ())?;
+        mux.wake_import();
+        Ok::<_, ()>(())
+    };
+    let _ = tokio::try_join!(admission, handoff);
+}
+
+async fn collect_prefill(
+    mut prx: stream::ChunkReceiver,
+    image: oneshot::Receiver<crate::Result<KvImage>>,
+    deliver: &mut oneshot::Sender<ReadyImport>,
+    respond: &stream::ChunkSender,
+    outcome: &Outcome,
+    source_prompt: Option<&[u32]>,
+) -> Result<ReadyImport, ()> {
+    let fail = |outcome: &Outcome, msg: String| {
+        if outcome.claim_terminal() {
+            if outcome.settle() {
+                Metrics::inc(&outcome.metrics.rejected);
+            }
+            let _ = respond.try_send(StreamChunk::Err(RuntimeError::Unavailable(msg)));
+        }
+    };
+    // A client that leaves stops the handoff: dropping the prefill stream ends that job, and
+    // its dispatcher skips an export nobody waits for. `outcome` counts the abort.
+    let (mut first, mut cached_tokens) = (None, 0);
+    loop {
+        let chunk = tokio::select! {
+            c = prx.recv() => c,
+            _ = respond.closed() => return Err(()),
+            _ = deliver.closed() => return Err(()),
+        };
+        match chunk {
+            Some(StreamChunk::Token { id, logprobs, .. })
+                if first.is_none() && id != stream::TEXT_ONLY =>
+            {
+                let first_at = Instant::now();
+                if let (Some(lp), Some(prompt)) = (&logprobs, source_prompt) {
+                    use sha2::{Digest, Sha256};
+                    let mut hash = Sha256::new();
+                    for token in prompt {
+                        hash.update(token.to_le_bytes());
+                    }
+                    let digest = format!("{:x}", hash.finalize());
+                    let rows = prompt.len();
+                    let top_bits: Vec<_> = lp
+                        .top
+                        .iter()
+                        .map(|&(token, value)| (token, value.to_bits()))
+                        .collect();
+                    tracing::debug!(prompt_sha256 = %digest, rows, token = id,
+                            logprob_bits = lp.logprob.to_bits(), ?top_bits,
+                            "pd: source first logprobs");
+                }
+                first = Some((id, first_at, logprobs))
+            }
+            Some(StreamChunk::Done {
+                reason: FinishReason::Preempted,
+                executed,
+                usage,
+            }) => {
+                if outcome.claim_terminal() {
+                    if outcome.settle() {
+                        Metrics::inc(&outcome.metrics.serving.preempted);
+                    }
+                    let _ = respond.try_send(StreamChunk::Done {
                         executed,
                         reason: FinishReason::Preempted,
                         usage,
                     });
-                    return;
                 }
-                Some(StreamChunk::Done { usage, .. }) => cached_tokens = usage.cached_tokens,
-                Some(StreamChunk::Err(err)) => {
-                    let _ = job.respond.try_send(StreamChunk::Err(err));
-                    return;
+                return Err(());
+            }
+            Some(StreamChunk::Done { usage, .. }) => cached_tokens = usage.cached_tokens,
+            Some(StreamChunk::Err(err)) => {
+                if outcome.report_abort() {
+                    let _ = respond.try_send(StreamChunk::Err(err));
                 }
-                Some(_) => {}
-                None => break,
+                return Err(());
             }
+            Some(_) => {}
+            None => break,
         }
-        let image = tokio::select! {
-            i = image => i,
-            _ = job.respond.closed() => return,
-        };
-        let image = match (&first, image) {
-            (Some(_), Ok(Ok(image))) => image,
-            (None, _) => {
-                let msg = "P/D: the prefill rank produced no token".into();
-                return fail(&job, &outcome, msg);
-            }
-            (_, Ok(Err(err))) => {
-                return fail(&job, &outcome, format!("P/D: KV export failed: {err}"))
-            }
-            (_, Err(_)) => {
-                let msg = "P/D: the prefill rank dropped the KV image".into();
-                return fail(&job, &outcome, msg);
-            }
-        };
-        if job.respond.is_closed() {
-            return;
+    }
+    let image = tokio::select! {
+        i = image => i,
+        _ = respond.closed() => return Err(()),
+            _ = deliver.closed() => return Err(()),
+    };
+    let image = match (&first, image) {
+        (Some(_), Ok(Ok(image))) => image,
+        (None, _) => {
+            let msg = "P/D: the prefill rank produced no token".into();
+            fail(outcome, msg);
+            return Err(());
         }
-        let Some(set) = set else {
-            return fail(&job, &outcome, "P/D: the model's DP set is gone".into());
-        };
-        let sampled = job.gen.params.samples();
-        let Some(routed) = set.route_decode(&cfg, sampled) else {
-            return fail(&job, &outcome, "P/D: no decode rank is up".into());
-        };
-        let Some((_, mux)) = decoders.iter().find(|(r, _)| *r == routed.rank) else {
-            let msg = "P/D: the decode rank has no dispatcher".into();
-            return fail(&job, &outcome, msg);
-        };
-        let (token, first, logprobs) = first.expect("matched Some");
-        job.opts.import = Some(Box::new(KvImport {
-            image,
-            token,
-            logprobs,
-            arrived,
-            first,
-            cached_tokens,
-            outcome,
-        }));
-        // The decode queue's clock starts now; `job.arrived` keeps the request's own.
-        if let Some(Err(SubmitError::Full(job) | SubmitError::Closed(job))) =
-            submit_decode(mux, job, Instant::now()).await
-        {
-            // The decode rank counted its refusal.
-            settle_refused(&job);
-            let _ = job
-                .respond
-                .try_send(StreamChunk::Err(RuntimeError::Unavailable(
-                    "P/D: the decode rank refused the request".into(),
-                )));
+        (_, Ok(Err(err))) => {
+            fail(outcome, format!("P/D: KV export failed: {err}"));
+            return Err(());
         }
-        drop(routed);
-    });
-    Ok(())
+        (_, Err(_)) => {
+            let msg = "P/D: the prefill rank dropped the KV image".into();
+            fail(outcome, msg);
+            return Err(());
+        }
+    };
+    if respond.is_closed() {
+        return Err(());
+    }
+    let (token, first, logprobs) = first.expect("matched Some");
+    Ok(ReadyImport {
+        image,
+        token,
+        first,
+        logprobs,
+        cached_tokens,
+    })
 }
 
 pub(crate) async fn submit_decode(
@@ -506,6 +714,476 @@ pub(crate) async fn submit_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn payload(now: Instant) -> ReadyImport {
+        ReadyImport {
+            image: KvImage {
+                key: "key".into(),
+                rows: 3,
+                bytes: vec![42].into(),
+                handoff_started: now,
+            },
+            token: 120,
+            first: now,
+            logprobs: Some(Box::new(crate::text::logprobs::TokenLogprobs {
+                logprob: -0.125,
+                top: vec![(120, -0.125), (121, -4.)],
+            })),
+            cached_tokens: 2,
+        }
+    }
+
+    #[test]
+    fn pending_import_prepares_once_and_starts_only_one_decode_telemetry() {
+        let now = Instant::now();
+        let source = Arc::new(Metrics::default());
+        let decode = Arc::new(Metrics::default());
+        let (mut import, deliver) = KvImport::pending(now, Outcome::new(source.clone(), now));
+        import.metrics = Some(decode.clone());
+        import.poll();
+        assert!(import.waiting() && !import.abandoned());
+        assert!(import.start_metrics(3, 1).is_none());
+        assert!(import.prepare_with(|| Ok(())).unwrap());
+        assert!(!import
+            .prepare_with(|| panic!("must not begin the slot twice"))
+            .unwrap());
+        assert_eq!(decode.serving.running.load(Ordering::Relaxed), 0);
+        assert!(deliver.send(payload(now)).is_ok());
+        import.poll();
+        assert!(!import.waiting() && !import.abandoned() && import.prepared);
+        assert_eq!(import.arrived, now);
+        let mut telemetry = import.start_metrics(3, 1).unwrap();
+        assert!(import.start_metrics(3, 1).is_none());
+        assert_eq!(decode.serving.running.load(Ordering::Relaxed), 1);
+        let ready = import.take_ready();
+        assert_eq!(
+            (ready.first, ready.token, ready.cached_tokens),
+            (now, 120, 2)
+        );
+        assert_eq!(ready.logprobs, payload(now).logprobs);
+        telemetry.token(ready.cached_tokens);
+        telemetry.finish(FinishReason::Length, 1);
+        drop(telemetry);
+        let snapshot = crate::obs::serving::snapshot(&[("m".into(), decode, true)]);
+        let m = &snapshot.models[0];
+        assert_eq!(
+            (
+                m.completed,
+                m.generated_tokens,
+                m.running,
+                m.aborted,
+                m.e2e.count
+            ),
+            (1, 1, 0, 0, 1)
+        );
+        assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn failed_preparation_retries_and_an_already_ready_image_does_not_prepare() {
+        let now = Instant::now();
+        let (mut import, deliver) = KvImport::pending(now, Outcome::new(Arc::default(), now));
+        assert!(import
+            .prepare_with(|| Err(RuntimeError::Oom("pressure".into())))
+            .is_err());
+        assert!(!import.prepared);
+        assert!(import.prepare_with(|| Ok(())).unwrap());
+        assert!(!import
+            .prepare_with(|| panic!("retry after success"))
+            .unwrap());
+        drop(deliver);
+        import.poll();
+        assert!(import.abandoned());
+        assert!(!import
+            .prepare_with(|| panic!("prepare cancelled request"))
+            .unwrap());
+
+        let mut ready = KvImport::ready(payload(now), now, Outcome::new(Arc::default(), now));
+        assert!(!ready
+            .prepare_with(|| panic!("ready import uses ordinary seating"))
+            .unwrap());
+    }
+
+    #[test]
+    fn abandoned_pending_import_counts_one_abort_unless_a_rank_already_settled_it() {
+        for settled in [false, true] {
+            for prepared in [false, true] {
+                let now = Instant::now();
+                let source = Arc::new(Metrics::default());
+                let decode = Arc::new(Metrics::default());
+                let outcome = Outcome::new(source.clone(), now);
+                if settled {
+                    outcome.settle();
+                }
+                let (mut import, deliver) = KvImport::pending(now, outcome);
+                import.metrics = Some(decode.clone());
+                if prepared {
+                    import.prepare_with(|| Ok(())).unwrap();
+                }
+                drop(deliver);
+                import.poll();
+                assert!(import.abandoned() && !import.waiting());
+                assert!(import.start_metrics(3, 1).is_none());
+                drop(import);
+                assert_eq!(
+                    source.serving.aborted.load(Ordering::Relaxed),
+                    u64::from(!settled)
+                );
+                assert_eq!(decode.serving.running.load(Ordering::Relaxed), 0);
+                assert_eq!(decode.serving.aborted.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preempted_pending_decode_counts_once_and_closes_the_producer_channel() {
+        let now = Instant::now();
+        let source = Arc::new(Metrics::default());
+        let decode = Arc::new(Metrics::default());
+        let (mut import, mut deliver) = KvImport::pending(now, Outcome::new(source.clone(), now));
+        import.metrics = Some(decode.clone());
+        import.preempt();
+        import.preempt();
+        drop(import);
+        tokio::time::timeout(std::time::Duration::from_secs(1), deliver.closed())
+            .await
+            .unwrap();
+        assert_eq!(decode.serving.preempted.load(Ordering::Relaxed), 1);
+        assert_eq!(decode.serving.aborted.load(Ordering::Relaxed), 0);
+        assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn refusal_accounting_distinguishes_internal_prefill_and_external_decode_terminals() {
+        for source_first in [false, true] {
+            let now = Instant::now();
+            let source = Arc::new(Metrics::default());
+            let decode = Arc::new(Metrics::default());
+            let outcome = Outcome::new(source.clone(), now);
+            let (export, _image) = KvExport::new(outcome.clone());
+            let (import, _deliver) = KvImport::pending(now, outcome.clone());
+            let job = |opts| Job {
+                prompt_ids: vec![1, 2, 3],
+                gen: crate::serve::GenParams::default(),
+                arrived: now,
+                respond: stream::channel().0,
+                opts,
+            };
+            let prefill = job(JobOpts {
+                export: Some(export),
+                ..Default::default()
+            });
+            let decoder = job(JobOpts {
+                import: Some(Box::new(import)),
+                ..Default::default()
+            });
+            if source_first {
+                assert!(refuse(&prefill, &source.rejected));
+                assert!(refuse(&decoder, &decode.rejected));
+                assert!(
+                    !outcome.report_abort(),
+                    "decoder reports the already-counted failure"
+                );
+            } else {
+                assert!(refuse(&decoder, &decode.rejected));
+                assert!(!refuse(&prefill, &source.rejected));
+                assert!(
+                    !outcome.report_abort(),
+                    "decoder already reported externally"
+                );
+            }
+            drop((prefill, decoder, outcome));
+            assert_eq!(
+                source.rejected.load(Ordering::Relaxed),
+                u64::from(source_first)
+            );
+            assert_eq!(
+                decode.rejected.load(Ordering::Relaxed),
+                u64::from(!source_first)
+            );
+            assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_source_abort_and_pending_decode_preempt_have_one_counter_and_terminal() {
+        for _ in 0..64 {
+            let now = Instant::now();
+            let source = Arc::new(Metrics::default());
+            let decode = Arc::new(Metrics::default());
+            let outcome = Outcome::new(source.clone(), now);
+            let (mut import, _deliver) = KvImport::pending(now, outcome.clone());
+            import.metrics = Some(decode.clone());
+            let terminals = std::sync::atomic::AtomicU64::new(0);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    if import.preempt() {
+                        terminals.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+                if outcome.report_abort() {
+                    terminals.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            drop((import, outcome));
+            assert_eq!(terminals.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                source.serving.aborted.load(Ordering::Relaxed)
+                    + decode.serving.preempted.load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(decode.serving.aborted.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    fn source_token(now: Instant) -> StreamChunk {
+        StreamChunk::Token {
+            id: 120,
+            text: String::new(),
+            logprobs: payload(now).logprobs,
+            frame: None,
+        }
+    }
+
+    fn source_done(reason: FinishReason) -> StreamChunk {
+        StreamChunk::Done {
+            executed: 1,
+            reason,
+            usage: stream::TokenUsage {
+                prompt_tokens: 3,
+                cached_tokens: 2,
+                completion_tokens: 1,
+                think: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn source_collection_does_not_wait_for_decoder_seating_or_image_completion() {
+        let now = Instant::now();
+        let metrics = Arc::new(Metrics::default());
+        let outcome = Outcome::new(metrics.clone(), now);
+        let (pending, mut deliver) = KvImport::pending(now, outcome.clone());
+        let (ptx, prx) = stream::channel();
+        let (respond, _client) = stream::channel();
+        let (image_tx, image_rx) = oneshot::channel();
+        ptx.try_send(source_token(now)).unwrap();
+        ptx.try_send(source_done(FinishReason::Length)).unwrap();
+        drop(ptx);
+        let mut collect = Box::pin(collect_prefill(
+            prx,
+            image_rx,
+            &mut deliver,
+            &respond,
+            &outcome,
+            None,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), collect.as_mut())
+                .await
+                .is_err()
+        );
+        let image_released = Instant::now();
+        assert!(image_tx.send(Ok(payload(now).image)).is_ok());
+        let ready = collect.await.unwrap();
+        assert!(ready.first >= now && ready.first <= image_released);
+        assert_eq!((ready.token, ready.cached_tokens), (120, 2));
+        assert_eq!(ready.logprobs, payload(now).logprobs);
+        assert_eq!(&*ready.image.bytes, [42]);
+        assert!(pending.waiting());
+        outcome.settle();
+        drop((pending, outcome));
+        assert_eq!(metrics.serving.aborted.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_internal_and_decode_refusals_keep_one_external_terminal() {
+        for source_first in [false, true] {
+            for _ in 0..32 {
+                let now = Instant::now();
+                let source = Arc::new(Metrics::default());
+                let decode = Arc::new(Metrics::default());
+                let outcome = Outcome::new(source.clone(), now);
+                let (pending, mut deliver) = KvImport::pending(now, outcome.clone());
+                let (respond, mut client) = stream::channel();
+                let (ptx, prx) = stream::channel();
+                let (export, _exported) = KvExport::new(outcome.clone());
+                let job = |opts, respond| Job {
+                    prompt_ids: vec![1, 2, 3],
+                    gen: crate::serve::GenParams::default(),
+                    arrived: now,
+                    respond,
+                    opts,
+                };
+                let prefill = job(
+                    JobOpts {
+                        export: Some(export),
+                        ..Default::default()
+                    },
+                    ptx,
+                );
+                let decoder = job(
+                    JobOpts {
+                        import: Some(Box::new(pending)),
+                        ..Default::default()
+                    },
+                    respond.clone(),
+                );
+                let reject_source = || {
+                    if refuse(&prefill, &source.rejected) {
+                        prefill
+                            .respond
+                            .try_send(StreamChunk::Err(RuntimeError::Unavailable(
+                                "prefill refused".into(),
+                            )))
+                            .unwrap();
+                    }
+                };
+                if source_first {
+                    reject_source();
+                }
+                assert!(refuse(&decoder, &decode.rejected));
+                decoder
+                    .respond
+                    .try_send(StreamChunk::Err(RuntimeError::Unavailable(
+                        "decode refused".into(),
+                    )))
+                    .unwrap();
+                if !source_first {
+                    reject_source();
+                }
+                drop(decoder);
+                let (_image_tx, image_rx) = oneshot::channel();
+                assert!(tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    collect_prefill(prx, image_rx, &mut deliver, &respond, &outcome, None)
+                )
+                .await
+                .unwrap()
+                .is_err());
+                assert!(matches!(client.try_recv().unwrap(), StreamChunk::Err(_)));
+                assert!(client.try_recv().is_err());
+                drop((prefill, outcome));
+                assert_eq!(
+                    source.rejected.load(Ordering::Relaxed)
+                        + decode.rejected.load(Ordering::Relaxed),
+                    1
+                );
+                assert_eq!(
+                    source.serving.aborted.load(Ordering::Relaxed)
+                        + decode.serving.aborted.load(Ordering::Relaxed),
+                    0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_failures_and_closed_peers_terminate_once_without_waiting() {
+        for case in [
+            "preempt",
+            "source-error",
+            "image-error",
+            "missing-token",
+            "missing-image",
+            "prefill-refused",
+            "client-gone",
+            "decode-gone",
+        ] {
+            let now = Instant::now();
+            let metrics = Arc::new(Metrics::default());
+            let outcome = Outcome::new(metrics.clone(), now);
+            let (pending, mut deliver) = KvImport::pending(now, outcome.clone());
+            let mut pending = Some(pending);
+            let (ptx, prx) = stream::channel();
+            let (respond, client) = stream::channel();
+            let mut client = Some(client);
+            let (image_tx, image_rx) = oneshot::channel();
+            if case == "client-gone" {
+                drop(client.take());
+            }
+            if case == "decode-gone" {
+                drop(pending.take());
+            }
+            let closed = case == "client-gone" || case == "decode-gone";
+            if case == "prefill-refused" {
+                outcome.settle();
+                Metrics::inc(&metrics.rejected);
+            }
+            if !closed {
+                if case != "missing-token" && case != "prefill-refused" {
+                    ptx.try_send(source_token(now)).unwrap();
+                }
+                ptx.try_send(if case == "source-error" || case == "prefill-refused" {
+                    StreamChunk::Err(RuntimeError::Unavailable("source failed".into()))
+                } else {
+                    source_done(if case == "preempt" {
+                        FinishReason::Preempted
+                    } else {
+                        FinishReason::Length
+                    })
+                })
+                .unwrap();
+                drop(ptx);
+            }
+            if case == "missing-image" {
+                drop(image_tx);
+            } else if !closed {
+                assert!(image_tx
+                    .send(if case == "image-error" {
+                        Err(RuntimeError::Rejected("export failed".into()))
+                    } else {
+                        Ok(payload(now).image)
+                    })
+                    .is_ok());
+            }
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                collect_prefill(prx, image_rx, &mut deliver, &respond, &outcome, None),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_err(), "{case}");
+            if let Some(client) = client.as_mut() {
+                if closed {
+                    assert!(client.try_recv().is_err());
+                } else {
+                    let terminal = client.try_recv().unwrap();
+                    assert!(
+                        matches!(terminal, StreamChunk::Err(_))
+                            || matches!(
+                                terminal,
+                                StreamChunk::Done {
+                                    reason: FinishReason::Preempted,
+                                    ..
+                                }
+                            )
+                    );
+                    assert!(client.try_recv().is_err());
+                }
+            }
+            drop((pending, outcome));
+            let rejected = matches!(
+                case,
+                "image-error" | "missing-token" | "missing-image" | "prefill-refused"
+            );
+            assert_eq!(
+                metrics.rejected.load(Ordering::Relaxed),
+                u64::from(rejected),
+                "{case}"
+            );
+            assert_eq!(
+                metrics.serving.preempted.load(Ordering::Relaxed),
+                u64::from(case == "preempt"),
+                "{case}"
+            );
+            assert_eq!(
+                metrics.serving.aborted.load(Ordering::Relaxed),
+                u64::from(!rejected && case != "preempt"),
+                "{case}"
+            );
+        }
+    }
 
     #[test]
     fn engine_keys_refuse_missing_storage_and_mismatch_only_selected_ranks() {
