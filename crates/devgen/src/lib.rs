@@ -7140,7 +7140,7 @@ fn emit_phase(
                     //
                     // ONE ROW: the body is a SINGLE CTA moving k*H f32 partials (90 KiB at the
                     // 26B) while every other CU gates on it, and this op sits on the B=1 decode
-                    // critical path once per layer. op_moe.cuh's PLOW_MOE_COMBINE_ALLBLK arm has
+                    // critical path once per layer. op_moe.cuh's removed PLOW_MOE_COMBINE_ALLBLK arm had
                     // each block redundantly recompute the reduction and write only its own
                     // disjoint slice -- it needs blocks > 1 HERE to do anything, since it slices
                     // on `slice`/`nblk`. The f32[H] it stages through is the per-block dynamic

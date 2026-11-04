@@ -137,19 +137,10 @@ static __device__ void d_qwen_gdn_conv(__nv_bfloat16* out, const __nv_bfloat16* 
 }
 
 // Default on: H100 27B decode, ms at B1/B16 ctx 1K, one-row body 26.9/39.5 vs this 26.6/34.8.
-#ifndef PLOW_NV_GDN_STEP_VROWS8
-#define PLOW_NV_GDN_STEP_VROWS8 1
-#endif
-#if PLOW_NV_GDN_STEP_VROWS8 != 0 && PLOW_NV_GDN_STEP_VROWS8 != 1
-#error "PLOW_NV_GDN_STEP_VROWS8 must be 0 or 1"
-#endif
 // The 8-row body stages its tile's state rows (8 x kdim fp32, 4 KB) in the warp's slice of the
 // shared arena by cp.async before the gate math, so the eight loads are in flight together
 // instead of one dependent round trip per row. Element ownership and reduction order are those
 // of the direct loads, so the outputs are bit-identical.
-#ifndef PLOW_NV_GDN_STEP_SMEM
-#define PLOW_NV_GDN_STEP_SMEM 1
-#endif
 // Folded residual+norm rungs keep the normalized rows in the arena for the tensor-core walk
 // (interp GEMV / GEMV_GLU arms); needs the mma walk at every folded rung, i.e. its B=1 arm too.
 // Off when the K-split walk (PLOW_NV_GEMV_K8) serves those rungs: it is worth 0.9 ms at B1 on
@@ -187,20 +178,15 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
     auto state_slot = [&](unsigned slot) {
         return slot_tab ? (unsigned)slot_tab[(size_t)slot * slot_stride] : slot;
     };
-#if PLOW_NV_GDN_STEP_VROWS8
     // A warp owns 8 consecutive V rows of one head: the q/k normalization and gate math run once
     // per tile and the rows follow serially. H100 27B decode, ms at B1/B16 ctx 1K: one-row body
     // 26.9/39.5, this 26.6/34.8. Issuing all 8 state-row loads before the first reduction
     // (h[8][4] in registers) pushed the decode entry to the 255-register cap with 304 B of
     // stack and measured 27.4/35.7 — slower at every rung, so the serial form stays.
     const unsigned tiles = (vdim + 7u) / 8u;
-#if PLOW_NV_GDN_STEP_SMEM
     // Prefetching the next tile into a second slice measured the same (B32 46.35 vs 46.14 ms),
     // so one slice per warp.
     float* buf = (stage && (size_t)warps * 8u * kdim <= stage_floats) ? stage + (size_t)warp * 8u * kdim : nullptr;
-#else
-    float* buf = nullptr;
-#endif
     for (unsigned tile = slice * warps + warp; tile < batch * hv * tiles; tile += nblk * warps) {
         const unsigned slot = tile / (hv * tiles);
         if (active && active[slot] <= 0) continue;
@@ -312,51 +298,6 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
             if (lane == 0) out[row] = __float2bfloat16(result);
         }
     }
-#else
-    // A warp owns one V row of the V-first state, so no state writers overlap.
-    for (unsigned row = slice * warps + warp; row < batch * hv * vdim; row += nblk * warps) {
-        const unsigned slot = row / (hv * vdim);
-        if (active && active[slot] <= 0) continue;
-        const unsigned head = row / vdim % hv, vcol = row % vdim, qhead = head / (hv / hk);
-        const size_t srow = ((size_t)state_slot(slot) * hv + head) * vdim + vcol;
-        const __nv_bfloat16* x = qkv + (size_t)slot * packed;
-        float q[4], k[4], h[4], qq = 0.f, kk = 0.f;
-#pragma unroll
-        for (unsigned j = 0; j < 4; j++) {
-            unsigned d = lane + 32 * j;
-            q[j] = __bfloat162float(x[qhead * kdim + d]);
-            k[j] = __bfloat162float(x[hk * kdim + qhead * kdim + d]);
-            qq += q[j] * q[j]; kk += k[j] * k[j];
-        }
-        const float qs = scale / sqrtf(qwen_warp_sum(qq) + eps);
-        const float ks = 1.f / sqrtf(qwen_warp_sum(kk) + eps);
-        const unsigned gate = slot * hv + head;
-        const float dt = __bfloat162float(a[gate]) + __bfloat162float(dt_bias[head]);
-        const float softplus = dt > 20.f ? dt : log1pf(expf(dt));
-        const float al = alog_f32 ? ((const float*)a_log)[head] : __bfloat162float(((const __nv_bfloat16*)a_log)[head]);
-        const float decay = expf(-expf(al) * softplus);
-        // vLLM's packed decode rounds beta to the projection dtype before recurrence.
-        const float beta = __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(b[gate])))));
-        float projection = 0.f;
-#pragma unroll
-        for (unsigned j = 0; j < 4; j++) {
-            q[j] *= qs; k[j] *= ks;
-            h[j] = state[srow * kdim + lane + 32 * j] * decay;
-            projection += h[j] * k[j];
-        }
-        const float value = __bfloat162float(x[2 * hk * kdim + head * vdim + vcol]);
-        const float delta = (value - qwen_warp_sum(projection)) * beta;
-        float result = 0.f;
-#pragma unroll
-        for (unsigned j = 0; j < 4; j++) {
-            h[j] = fmaf(delta, k[j], h[j]);
-            state[srow * kdim + lane + 32 * j] = h[j];
-            result += h[j] * q[j];
-        }
-        result = qwen_warp_sum(result);
-        if (lane == 0) out[row] = __float2bfloat16(result);
-    }
-#endif
 }
 
 // PF: the prefill fast path (the prefill interpreter and the decode object's light_pf, which

@@ -791,7 +791,6 @@ nobody re-runs them.
 | `PLOW_NV_FA_QGLOB` | 0 | read Q from global instead of staging to smem (WPR path). ⚠️ **`FA_WPR=1` + `FA_QGLOB=1` silently CORRUPTS the fp8/SZ arms** (PX-11): those arms read a never-written `qsm`. Non-default; **not fixed**. |
 | `PLOW_NV_FA_REDBOUND` | 0 | bound the softmax reductions to the tile's LIVE rows. |
 | `PLOW_NV_FA_VDBUF` | 0 | V double-buffer. **MEASURED NEGATIVE**: wash at 32k/64k, **+2.2% slower at 128k** — the 128k full-attn flash is HBM-bound. |
-| `PLOW_NV_FA_CORRSKIP` | 0 | fp8mma only — skip the softmax rescale when every lane's `corr` is exactly 1.0. Bitwise identical. |
 | `PLOW_NV_KVBOUNDS` | 0 | per-batch KV bounds checking. |
 | `PLOW_NV_FA256_BKV` / `PLOW_NV_FA512_BKV` | 32 / 16 | KV rows staged per flash-**prefill** tile, per head dim. The trade is smem footprint vs staging granularity. **64 / 32 are the sm_90a measured optima** and are what `build_sm90a_cubin.sh` is driven with; they are not validated as sm_120a defaults. |
 | `PLOW_FLASH_HD128` | off | enable the fused-write path in inline flash for D=128 (Llama/Qwen), avoiding register spill on the 8-wave interpreter. |
@@ -829,11 +828,8 @@ the end, not tabled.
 | `PLOW_ATTNRES_RG` | 9 | rows per sweep of the K3 hidden axis (tuned so one sweep covers `nb_max=8`). |
 
 **Measurement/diagnostic instruments — never ship** (numerically wrong or admit a
-data race; used only to price a protocol cost): `PLOW_GATE_HIER_CEIL`,
-`PLOW_GATE_NOINV`, `PLOW_GATE_RELAXSIG`, `PLOW_GATE_SC1_KEEPREL`, `PLOW_XR_ACQ_N`,
-`PLOW_XR_NOSIG`, `PLOW_XR_NOWAIT`, `PLOW_XR_NOWAIT_RS`, `PLOW_XR_SHUFFLE`,
-`PLOW_ACT_NT`, `PLOW_ACT_SCOPE_AGENT`, `PLOW_ICACHE_INV_PROBE`,
-`PLOW_FLASH_MERGE_DSPLIT` (measured dead), `PLOW_NSTAGE` (`experiments/` only).
+data race; used only to price a protocol cost): `PLOW_XR_NOSIG`, `PLOW_XR_NOWAIT`,
+`PLOW_XR_NOWAIT_RS`, `PLOW_XR_SHUFFLE`, `PLOW_FLASH_MERGE_DSPLIT` (measured dead), `PLOW_NSTAGE` (`experiments/` only).
 
 ### GEMM / GEMV
 
@@ -865,22 +861,17 @@ metadata.
 | `PLOW_NV_GEMV_RB` | 0 | MoE GEMV row-blocking. Off keeps every sm_120 object byte-identical; **the sm_90a build sets it to 1**. |
 | `PLOW_NV_PF_GEMV_HEAD` | 0 | run prefill's `lm_head` on the M=1 GEMV arm. **1.991 → 1.213 ms, −39%.** Prefill only; traps on M≠1. |
 | `GV_MM_MAX` | **8** | Widest `gemv_*_rows<MM>` rung for batched decode: batch `B` costs `ceil(B/GV_MM_MAX)` weight passes. **Match it to the batch you actually serve — mismatched, expensive both directions.** `=16` costs 1.1% at B=1 and 17% at B=8 to buy 34% at B=16. PX-10: an asset built `=16` and served at B=8 loses 19.4% at 131k. Pin `=16` only if you pin B≥16. |
-| `PLOW_NV_GEMV_LS` | 0 | GEMV row-blocking. Wins in isolation (qkv 1.43×) but **loses in the megakernel**. Compiled out, intact. |
 | `PLOW_NV_GEMV_NOSTAGE` | 0 | skip GEMV smem staging. |
 | `PLOW_NV_GEMV_STAGE_MINROWS` | 16 | row threshold below which staging is skipped. |
 | `PLOW_NV_RB_QKV`, `PLOW_NV_RB_LMHEAD`, `PLOW_NV_RB_GEMV` | 0 | per-op row-blocking A/B controls. |
-| `PLOW_NV_SZ` | 0 | **experimental** lossless bf16 weight decompression (SplitZip GEMV twins). Bit-exact, measured non-viable; kept as an A/B reference. |
 
 ### MoE
 
 | flag | default | effect |
 |---|---|---|
-| `PLOW_MOE_XN_BF16` | 0 | bf16 expert-N staging buffer. |
 | `PLOW_MOE_XN_MAX` | 2816 | expert-N staging cap. |
 | `PLOW_MOE_DOWN_SG` | 4 | subgroup count for the expert `down` arm. |
-| `PLOW_MOE_DOWN_LANESPLIT`, `PLOW_MOE_DOWN_STAGE_FU` | 0 | `down` lane-split / staged fixups. |
-| `PLOW_MOE_ROUTER_WIDE` | 0 | wide router arm. |
-| `PLOW_MOE_COMBINE_ALLBLK` | 0 | all-block combine. |
+| `PLOW_MOE_DOWN_LANESPLIT` | 0 | `down` lane-split. |
 | `PLOW_HSACO_EXTRA_DEFINES` | unset | `scripts/build_gfx942.sh`: raw `-D` appended to every row and recorded in `build_defines.json` (so `asm_audit.py --contract` sees the axis). For opt-in kernel arms whose header default is the shipped body. Refuses the tile / wave / decode-batch axes, which have their own variables and are cross-checked against the packet. |
 | `PLOW_COMBINE_VEC` / `PLOW_COMBINE_VEC_U` | **1 (gfx942 prefill/flash objects)** / 2 | AMD `d_moe_combine_pf` 8-wide arm (16 B loads, `_U` iterations in flight) for the `k == 1` combine every native-MoE / `PLOW_MOE_PF_DET` blob emits. Bit-identical to the scalar loop (standalone harness, production `-D` sets, 8- and 4-wave geometries, ragged cases included); −25 ms per GLM-5.3 8192 chunk (31.7 → 6.7 ms), served +1.9%. **Default ON** in `build_gfx942.sh` for the prefill and flash objects; rollback `PLOW_COMBINE_VEC=0`. Decode/mixed/packed objects keep the scalar body. |
 | `PLOW_RN_ROWS` | **2 (gfx942 prefill/flash objects)**, header default 1 | AMD `d_rmsnorm` multi-row arm: R rows' loads issued before any row is reduced (prefill norms hand each workgroup ~27 rows and paid one HBM round trip per row). Same per-thread element map and reduction tree; bit-identical by the standalone harness. **Default ON** (R=2) in `build_gfx942.sh` for the prefill and flash objects; rollback `PLOW_RN_ROWS=0`. |
@@ -912,7 +903,6 @@ All produce wrong logits by construction.
 | `PLOW_NV_SKELETON` | 0 | run gates + signals with no op bodies: the interpreter's dispatch floor. Garbage logits. |
 | `PLOW_NV_SKEL_PAD` | 160 | padding for that skeleton. |
 | `PLOW_NV_ABLATE_LO`, `PLOW_NV_ABLATE_HI` | 0 | 128-bit opcode mask — skip those ops' BODIES, keep every gate/signal. Garbage logits. |
-| `PLOW_NV_FA_FP8ABL` | 0 | flash fp8 ablation bitmask. **Never set on a shipped build.** |
 | `PLOW_NV_TRACE` | 0 | per-op `gate`/`body`/`signal` cycle trace. **Read the SHAPE, not the absolute total.** |
 
 Harness-only (not the served cubins): `PLOW_SM120_SMS` (188) and
@@ -1412,14 +1402,5 @@ decode pass costs ~95 ms per prefill tick, so decode rows riding inside every ch
 **Measured, that estimate does not hold:** it assumed the decode pass disappears when its rows ride, but
 inside the body the band's decode attention chain costs about as much per layer as the pass, so riding
 middle chunks measures −14 ms per chunk at 78 layers (see the review log's decode-rows negative).
-
-</details>
-
-<details>
-<summary>Renamed environment variables</summary>
-
-| Old name | Replacement |
-| --- | --- |
-| `PLOW_NV_PLACE_DISPATCH` | Runtime: `PLOW_L2_PLACE_DISPATCH` |
 
 </details>

@@ -105,20 +105,10 @@ __device__ __forceinline__ float plow_warp_dot_fp8_blk(const bf16* __restrict__ 
             p = fmaf(w1.x, x1.x, p);
             p = fmaf(w1.y, x1.y, p);
         }
-#ifdef PLOW_MOE_BAD_SCALE_EPILOGUE
-        /* NEGATIVE CONTROL ONLY (never define this in a shipping build): the per-channel
-         * idiom wrongly transplanted to block scales — accumulate raw, scale once at the
-         * end. This is the exact silent-wrong-answer trap the header warns about; the
-         * validation harness must FAIL when it is enabled, or the harness proves nothing. */
-        acc += live ? p : 0.0f;
-    }
-    return plow_warp_sum(acc) * srow[0];
-#else
         /* per-128-block dequant applied to THIS chunk's partial — see header note. */
         acc += live ? p * srow[kb] : 0.0f;
     }
     return plow_warp_sum(acc);
-#endif
 }
 
 /* --- routing table accessors (identical byte layout to the AMD path: 8B per slot) --- */

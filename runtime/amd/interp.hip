@@ -1230,17 +1230,8 @@ extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
 #ifndef PLOW_GEMM_SMALL_SPLITK
 #define PLOW_GEMM_SMALL_SPLITK 0
 #endif
-#ifndef PLOW_DSA_KPOOL_MFMA
-#define PLOW_DSA_KPOOL_MFMA 1
-#endif
 #ifndef PLOW_DSA_KPOOL_ROWWAVE
 #define PLOW_DSA_KPOOL_ROWWAVE 0
-#endif
-#ifndef PLOW_DSA_QQUANT_WAVE
-#define PLOW_DSA_QQUANT_WAVE 1
-#endif
-#ifndef PLOW_GEMM_F32_DEC_TILE
-#define PLOW_GEMM_F32_DEC_TILE 1
 #endif
 #if PLOW_GEMM_SMALL_SPLITK && !PLOW_BUCKET_DECODE
 #undef PLOW_GEMM_SMALL_SPLITK
@@ -4759,18 +4750,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              (const int*)TEN(4), in->i[0], in->i[1], in->i[2]);
             break;
         case PLOW_DOP_DSA_Q_QUANT:
-#if PLOW_DSA_QQUANT_WAVE
             if (in->i[1] == 128u) {
                 d_dsa_q_quant_wave((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), in->i[0],
                                    slice, nblk);
                 break;
             }
-#endif
             d_dsa_q_quant((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), in->i[0], in->i[1],
                           slice, nblk, (float*)sm->raw, sm->part);
             break;
         case PLOW_DOP_INDEX_SCORE_KPOOL:
-#if PLOW_DSA_KPOOL_MFMA
             if (in->i[3] == 128u && in->i[1] == 32u) {
                 constexpr int DI_ = 128, HI_ = 32;
                 constexpr int QSTRIDE = DI_ + FA_PAD, KSTRIDE = DI_ + FA_PAD;
@@ -4801,7 +4789,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     slice, nblk, qlds, ktile, wlds, wlds + HI_);
                 break;
             }
-#endif
             /* t6/kv_len is TOKEN-granular (i4=pool_size divides internally) — see
              * d_index_score_kpool's header comment for why this cannot be pool-granular
              * at the packet level (the runtime patches kv_len once per decode step, the
@@ -5165,7 +5152,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             } else
 #endif
             {
-#if PLOW_BUCKET_DECODE && PLOW_GEMV_F32_VEC && PLOW_GEMM_F32_DEC_TILE
+#if PLOW_BUCKET_DECODE && PLOW_GEMV_F32_VEC
                 /* Wide decode rung router: R x CN wave tiles (bit-identical, see
                  * d_gemv_bf16_f32_tile). */
                 const unsigned rows = PLOW_RUNTIME_ROWS(in->i[0]);
@@ -6794,12 +6781,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * The full model can still produce correct tokens under them, which is precisely the trap:
  * the 57 GiB/token weight stream evicts stale activation lines before re-read. That is a
  * hardware accident and it is why these are measurement instruments, not options. */
-#ifndef PLOW_GATE_NOINV
-#define PLOW_GATE_NOINV 0
-#endif
-#ifndef PLOW_GATE_RELAXSIG
-#define PLOW_GATE_RELAXSIG 0
-#endif
 
 /* ---------------------------------------------------------------------------------------
  * PLOW_GATE_HIER_CEIL — TWO-LEVEL CACHE MAINTENANCE, CEILING INSTRUMENT. NEVER SHIP.
@@ -6834,9 +6815,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * Expect the ceiling to be SMALLER than the microbench's 3.8x: that bench is an empty packet in
  * a tight chain with nothing to overlap, and the real per-packet gate is 2.255 us (traced), not
  * 13.16. If this knob does not move the token, the sound version cannot either. */
-#ifndef PLOW_GATE_HIER_CEIL
-#define PLOW_GATE_HIER_CEIL 0
-#endif
 
 /* ---------------------------------------------------------------------------------------
  * PLOW_GATE_HIER — the SOUND two-level cache maintenance. This is the shippable form of what
@@ -6873,18 +6851,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * REQUIRES PLOW_L2_PLACE_DISPATCH and an L2-placed blob. Without per-domain windows `nper` is
  * meaningless (a workgroup claims whatever entry is next, so the count is a run-time property),
  * and the emitter leaves the field zero — which this code reads as "no hierarchy". */
-#if PLOW_GATE_HIER && PLOW_GATE_HIER_CEIL
-#error "PLOW_GATE_HIER (sound) and PLOW_GATE_HIER_CEIL (the unsafe ceiling) are exclusive"
-#endif
 
 /* The two knobs do not compose, and combined they are silently worse than either. The HIER_CEIL
  * follower hand-rolls its relaxed RMW rather than calling `ctr_signal`, so under SC1 it would
  * also skip the `s_waitcnt vmcnt(0)` that arm performs — 248 of 256 workgroups would bump their
  * counter without retiring their stores at all. `perf-data/archive/k3/k3-hier2-ceiling.md` §2 says to drop
  * SC1 anyway; this makes the combination a build error instead of a debugging session. */
-#if PLOW_GATE_HIER_CEIL && PLOW_GATE_SC1
-#error "PLOW_GATE_HIER_CEIL and PLOW_GATE_SC1 are mutually exclusive (see k3-hier2-ceiling.md §2)"
-#endif
 
 /* ELECT THE MAINTENANCE LEADER OFF HW_REG_XCC_ID, NOT blockIdx.x.
  *
@@ -6911,12 +6883,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * it MEASURED 0.43 ms (l2hier 27.849 -> 28.271, ~1.3 ns/workgroup-packet, ~8 sd). The XCD a
  * workgroup runs on cannot change while it is resident, so it is read once. */
 __device__ __forceinline__ bool ctr_maint_leader_init(unsigned xcc) {
-#if PLOW_GATE_HIER_CEIL
-    return blockIdx.x == xcc;
-#else
     (void)xcc;
     return true;
-#endif
 }
 
 __device__ __forceinline__ uint32_t ctr_poll(const uint32_t* p) {
@@ -6940,11 +6908,7 @@ __device__ __forceinline__ void ctr_acquire_l1(void) {
     asm volatile("buffer_inv" ::: "memory");
 }
 __device__ __forceinline__ void ctr_acquire(void) {
-#if PLOW_GATE_NOINV
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup"); /* UNSAFE: no buffer_inv */
-#else
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-#endif
 }
 /* A RELEASE atomic RMW, and NOT an explicit release fence followed by relaxed RMWs.
  *
@@ -7006,19 +6970,7 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
      * `scripts/sc1_coverage.sh` fails the build on an unscoped one. Closing it is what proved
      * the defect above is ordering rather than coverage. */
     __builtin_amdgcn_s_waitcnt(/*vmcnt(0)*/ 0x0f70);
-#if PLOW_GATE_SC1_KEEPREL
-    /* DIAGNOSTIC ARM. Scoped stores, but the counter bump KEEPS its release (and therefore its
-     * `buffer_wbl2`). This separates the two halves of PLOW_GATE_SC1 that the plain arm changes
-     * together: it isolates the COST of scoped activation stores from the BENEFIT of dropping
-     * the writeback. If this arm is numerically correct while the plain arm is not, the defect is
-     * the ORDERING (`vmcnt(0)` retires a store when it leaves the CU, not when it is visible at
-     * the scope the consumer reads from), not the store scope. Not a shipping mode either way. */
-    __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#else
     __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-#endif
-#elif PLOW_GATE_RELAXSIG
-    __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); /* UNSAFE: no wbl2 */
 #else
     __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 #endif
@@ -7122,7 +7074,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
      * leaving it unconditional put one extra instruction into every object, including gfx950's,
      * and cost the byte-identity that makes "this change did not touch CDNA4" checkable rather
      * than merely asserted. */
-#if PLOW_GATE_HIER || PLOW_GATE_HIER_CEIL || defined(PLOW_L2_PLACE_DISPATCH)
+#if PLOW_GATE_HIER || defined(PLOW_L2_PLACE_DISPATCH)
     const unsigned plow_xcd =
         __builtin_amdgcn_s_getreg((20 /*HW_REG_XCC_ID*/) | (0 << 6) | ((32 - 1) << 11)) & 0xf;
 #else
@@ -7667,30 +7619,6 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
              * compiler's structural emit runs; the CP flash LSE-merge body lands with tp-host.
              * No-op keeps single-GPU decode bit-identical. */
         } else
-#endif
-#ifdef PLOW_ICACHE_INV_PROBE
-        /* MEASUREMENT INSTRUMENT, never on in a shipped build (guarded by a macro that nothing
-         * defines; with it undefined the preprocessed source — and therefore the tunedb build
-         * digest — is byte-identical).
-         *
-         * Question it answers: this interpreter is a persistent megakernel whose .text is 338 KB
-         * (`interp_decode_fp8kv_k3.elf`), and consecutive packets run DIFFERENT op bodies, so the
-         * instruction stream jumps across a large binary. How much of the runtime is the L1
-         * instruction cache missing on those jumps?
-         *
-         * `s_icache_inv` flushes the SQC instruction cache, so with this on EVERY packet's body is
-         * a GUARANTEED cold instruction fetch from L2 — the worst case a zero-hit-rate I-cache
-         * could produce. The delta (probe - baseline) is therefore an UPPER BOUND on everything
-         * instruction prefetch, body reordering or footprint shrinking could ever recover. It is
-         * an upper bound and not an estimate: the real run already hits in I-cache some of the
-         * time, and this also charges the cost of the s_icache_inv itself.
-         *
-         * gfx950 has no instruction-PREFETCH instruction to test the other direction with:
-         * `s_inst_prefetch` is GFX10/GFX11 only and `s_prefetch_inst` is GFX12 only (verified
-         * against the ROCm 7.2.4 assembler, /opt/rocm/llvm/bin/llvm-mc -mcpu=gfx950). Invalidation
-         * is the only I-cache lever the ISA gives this part, so bounding from above is the only
-         * experiment available. */
-        __asm__ __volatile__("s_icache_inv" ::: "memory");
 #endif
 /* THE DENSE DECODE PROJECTION OPCODES SKIP `plow_exec`.
  *

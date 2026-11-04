@@ -1232,9 +1232,6 @@ static __device__ void d_quant_fp8_ws384(uint8_t* __restrict__ xq, __nv_bfloat16
                     for (int j = 0; j < 8; j++) {
                         const float g = __bfloat162float(vg.x[j]);
                         float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh_pf(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-                        if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
                         vo.x[j] = __float2bfloat16(a * __bfloat162float(vu.x[j]));
                         amax = fmaxf(amax, fabsf(__bfloat162float(vo.x[j])));
                     }
@@ -1244,9 +1241,6 @@ static __device__ void d_quant_fp8_ws384(uint8_t* __restrict__ xq, __nv_bfloat16
                 for (unsigned kk = lane; kk < K; kk += 32u) {
                     const float g = __bfloat162float(gate[row + kk]);
                     float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-                    if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
                     const __nv_bfloat16 fb = __float2bfloat16(a * __bfloat162float(up[row + kk]));
                     x[row + kk] = fb;
                     amax = fmaxf(amax, fabsf(__bfloat162float(fb)));
@@ -2773,9 +2767,6 @@ __device__ __forceinline__ void d_gemv_sm90_xreg(__nv_bfloat16* C,
 #ifndef PLOW_NV_GEMV_KPANEL
 #define PLOW_NV_GEMV_KPANEL 0
 #endif
-#ifndef PLOW_NV_GEMV_KPANEL_F32
-#define PLOW_NV_GEMV_KPANEL_F32 0
-#endif
 #if PLOW_NV_GEMV_KPANEL
 template <unsigned N = 5120, unsigned K = 17408, unsigned max_rows_per_warp = 5, unsigned panel_chunks = 8>
 __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
@@ -2787,23 +2778,11 @@ __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
     float acc[max_rows_per_warp] = {};
 #pragma unroll 1
     for (unsigned panel = 0; panel < K; panel += panel_chunks * GV_STEP) {
-#if PLOW_NV_GEMV_KPANEL_F32
-        float xv[panel_chunks][8];
-#pragma unroll
-        for (unsigned c = 0; c < panel_chunks; c++) {
-            if (panel + c * GV_STEP < K) {
-                const bf16v8 packed = ld_glob8(x + panel + c * GV_STEP + lane * 8u);
-#pragma unroll
-                for (unsigned i = 0; i < 8; i++) xv[c][i] = __bfloat162float(packed.x[i]);
-            }
-        }
-#else
         bf16v8 xv[panel_chunks];
 #pragma unroll
         for (unsigned c = 0; c < panel_chunks; c++)
             if (panel + c * GV_STEP < K)
                 xv[c] = ld_glob8(x + panel + c * GV_STEP + lane * 8u);
-#endif
 #pragma unroll
         for (unsigned r = 0; r < max_rows_per_warp; r++) {
             const unsigned n = first + warp + r * 8u;
@@ -2819,13 +2798,7 @@ __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
 #pragma unroll
                 for (unsigned u = 0; u < 8; u++)
                     if (panel + (c + u) * GV_STEP < K) {
-#if PLOW_NV_GEMV_KPANEL_F32
-#pragma unroll
-                        for (unsigned i = 0; i < 8; i++)
-                            acc[r] = fmaf(__bfloat162float(weights[u].x[i]), xv[c + u][i], acc[r]);
-#else
                         acc[r] = dot8(weights[u], xv[c + u], acc[r]);
-#endif
                     }
             }
         }

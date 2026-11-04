@@ -128,11 +128,8 @@ __device__ __forceinline__ float act_gelu_tanh(float x) {
 }
 /* Prefill GeGLU: the hardware tanh (one MUFU.TANH, rel err ~2^-11) instead of tanhf's ~20
  * instruction sequence; the result is rounded to bf16 (2^-9) before use. Decode keeps tanhf. */
-#ifndef PLOW_NV_PF_FAST_TANH
-#define PLOW_NV_PF_FAST_TANH 1
-#endif
 __device__ __forceinline__ float act_gelu_tanh_pf(float x) {
-#if PLOW_NV_PREFILL && PLOW_NV_PF_FAST_TANH
+#if PLOW_NV_PREFILL
     float t;
     const float c = 0.7978845608028654f * (x + 0.044715f * x * x * x);
     asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(c));

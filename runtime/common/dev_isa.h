@@ -631,7 +631,7 @@ enum {
     /* SplitZip (bf16 lossless) DECODE GEMV twins (p9-v2 C-1). Each compressed weight is one
      * self-describing blob tensor: lo|cd|eoff|epos|eval (see op_gemm.cuh SzBlob). The bf16
      * output is BIT-IDENTICAL to the plain GEMV twin — only the weight bytes crossing HBM shrink
-     * 1.33x. Flag-gated by PLOW_NV_SZ in the interpreter.
+     * 1.33x.
      * Each blob is SELF-DESCRIBING (16-byte header {nesc, exp_base} + sized escape reservation),
      * so the op carries no data-dependent fields — the loader fills the header at bind time.
      *   GEMV_SZ      t0=C t1=x t2=blob            i0=M i1=N i2=K.

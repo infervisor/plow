@@ -81,9 +81,6 @@
 #define FA_SM90_STAGES(HD, BKV) \
     ((PLOW_NV_FA512_KV64 && (HD) == 512 && (BKV) == 64) ? 1 : FA_SM90_NS)
 
-#ifndef PLOW_NV_FA_SPLIT_OUTER
-#define PLOW_NV_FA_SPLIT_OUTER 0
-#endif
 
 /* Which <HD,BQ,BKV> instantiations take the wgmma arm. BQ must be the wgmma m64; HD must split
  * into an even number of n64 tiles (one half per warpgroup); BKV=32 is the n32 score tile and the
@@ -737,15 +734,6 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             if (kvoff) item_mapkv = nullptr;
 #endif
         } else {
-#if PLOW_NV_FA_SPLIT_OUTER
-            if constexpr (HD == 256 && BQ == 64 && BKV == 32) {
-                const unsigned head_tiles = ((seq_q + BQ - 1) / BQ) * n_head;
-                sp = witem / head_tiles;
-                const unsigned qh = witem % head_tiles;
-                h = qh % n_head;
-                q0 = (qh / n_head) * BQ;
-            } else
-#endif
             {
                 sp = witem % nsplit;
                 h = (witem / nsplit) % n_head;
