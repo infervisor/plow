@@ -261,7 +261,8 @@ static void t_dense(const char* name, unsigned m, unsigned n, unsigned k, unsign
     }
     c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[3] = act; c.in.i[4] = row0;
     c.in.i[5] = stride; c.in.i[6] = onehot; c.in.i[7] = flags;
-    run(name, c, g_dense_gemm_f32, {o}, flags & 3u ? BF16 : FP32, 1e-5, flags & 2u ? (size_t)m * n / 20000 : 0);
+    run(name, c, g_dense_gemm_f32, {o}, flags & 3u ? BF16 : FP32, 1e-5,
+        flags & 0x202u ? (size_t)m * n / 20000 : 0);
 }
 
 /* Flag 128: rows packed from several requests sum K as each request's own split-K launch would.
