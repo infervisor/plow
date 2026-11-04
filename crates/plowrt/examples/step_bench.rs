@@ -27,6 +27,13 @@
 //! the engine's host-op breakdown.
 
 #[cfg(any(feature = "cuda", test))]
+/// `--seg-sweep LO..HI` clamped to the chain's `1..=total` segments (a prefix of 0 segments is no
+/// decode); `None` when the range misses the chain.
+fn seg_sweep_range(lo: usize, hi: usize, total: usize) -> Option<(usize, usize)> {
+    let (lo, hi) = (lo.max(1), hi.min(total));
+    (lo <= hi).then_some((lo, hi))
+}
+
 fn record_inputs(histories: &mut [Vec<u32>], last: &[u32], outputs: &[u32], steps: usize) {
     for (row, history) in histories.iter_mut().enumerate() {
         history.push(last[row]);
@@ -478,6 +485,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             e.snapshot_slot(b)?;
         }
         let base_last = last.clone();
+        let total = e.debug_decode_segments();
+        let (lo, hi) = seg_sweep_range(lo, hi, total)
+            .ok_or("--seg-sweep: the widest decode rung has no segment chain")?;
+        println!("{{\"segments\":{total}}}");
         for n in (lo..=hi).step_by(step.max(1)) {
             e.capture_debug_decode_prefix(n)?;
             for (b, &p) in base_pos.iter().enumerate() {
@@ -859,6 +870,14 @@ fn ride_bench(
 #[cfg(test)]
 mod tests {
     use super::record_inputs;
+
+    #[test]
+    fn seg_sweep_range_clamps_to_the_chain() {
+        assert_eq!(super::seg_sweep_range(0, 400, 37), Some((1, 37)));
+        assert_eq!(super::seg_sweep_range(5, 9, 37), Some((5, 9)));
+        assert_eq!(super::seg_sweep_range(0, 400, 0), None);
+        assert_eq!(super::seg_sweep_range(50, 60, 37), None);
+    }
 
     #[test]
     fn histories_include_inputs_but_exclude_the_final_sample() {
