@@ -38,6 +38,8 @@
 //! device-visible memory, and the `Send`/`Sync` impls — because those carry an
 //! argument that is not shared with the rest of the file.
 
+use super::{image_copy_rects, ImageCopy};
+
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -470,15 +472,6 @@ type HsaCopyRect = unsafe extern "C" fn(
     HsaSignal,
 ) -> HsaStatus;
 
-#[derive(Clone, Copy, Debug)]
-struct ImageCopy {
-    host: u64,
-    device: u64,
-    bytes: u64,
-    pitch: usize,
-    rows: u32,
-}
-
 #[repr(C)]
 union HsaCopyAgents {
     agent: HsaAgent,
@@ -581,79 +574,6 @@ impl BatchCopies {
         copy.op.size_list = copy.sizes.as_mut_ptr();
         Ok(copy)
     }
-}
-
-impl ImageCopy {
-    fn linear((host, device, bytes): (u64, u64, u64)) -> Self {
-        Self {
-            host,
-            device,
-            bytes,
-            pitch: 0,
-            rows: 1,
-        }
-    }
-
-    fn slices(self) -> Option<(usize, usize)> {
-        let host = usize::try_from(self.bytes)
-            .ok()?
-            .checked_mul(self.rows as usize)?;
-        let device = self.pitch.checked_mul(self.rows as usize)?;
-        self.host.checked_add(host as u64)?;
-        self.device.checked_add(device as u64)?;
-        Some((host, device))
-    }
-}
-
-fn image_copy_rects(spans: &[(u64, u64, u64)]) -> smallvec::SmallVec<[ImageCopy; 64]> {
-    let mut copies = smallvec::SmallVec::new();
-    let mut i = 0;
-    while i < spans.len() {
-        let mut copy = ImageCopy::linear(spans[i]);
-        if copy.bytes > 0
-            && copy.bytes <= u32::MAX as u64
-            && (copy.host | copy.device | copy.bytes) % 4 == 0
-        {
-            if let Some(pitch) = spans
-                .get(i + 1)
-                .and_then(|next| next.1.checked_sub(copy.device))
-                .filter(|&pitch| pitch >= copy.bytes && pitch % 4 == 0)
-                .and_then(|pitch| usize::try_from(pitch).ok())
-            {
-                copy.pitch = pitch;
-                while copy.rows < u32::MAX {
-                    let Some(&(host, device, bytes)) = spans.get(i + copy.rows as usize) else {
-                        break;
-                    };
-                    let row = u64::from(copy.rows);
-                    if bytes != copy.bytes
-                        || copy
-                            .bytes
-                            .checked_mul(row)
-                            .and_then(|n| copy.host.checked_add(n))
-                            != Some(host)
-                        || (pitch as u64)
-                            .checked_mul(row)
-                            .and_then(|n| copy.device.checked_add(n))
-                            != Some(device)
-                    {
-                        break;
-                    }
-                    let next = ImageCopy {
-                        rows: copy.rows + 1,
-                        ..copy
-                    };
-                    if next.slices().is_none() {
-                        break;
-                    }
-                    copy = next;
-                }
-            }
-        }
-        i += copy.rows as usize;
-        copies.push(copy);
-    }
-    copies
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

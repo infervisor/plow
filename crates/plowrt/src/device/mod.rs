@@ -28,6 +28,88 @@ pub(crate) fn retirement_error(error: retirement::RetirementError) -> crate::Run
 }
 pub mod visibility;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImageCopy {
+    pub(crate) host: u64,
+    pub(crate) device: u64,
+    pub(crate) bytes: u64,
+    pub(crate) pitch: usize,
+    pub(crate) rows: u32,
+}
+
+impl ImageCopy {
+    pub(crate) fn linear((host, device, bytes): (u64, u64, u64)) -> Self {
+        Self {
+            host,
+            device,
+            bytes,
+            pitch: 0,
+            rows: 1,
+        }
+    }
+
+    pub(crate) fn slices(self) -> Option<(usize, usize)> {
+        let host = usize::try_from(self.bytes)
+            .ok()?
+            .checked_mul(self.rows as usize)?;
+        let device = self.pitch.checked_mul(self.rows as usize)?;
+        self.host.checked_add(host as u64)?;
+        self.device.checked_add(device as u64)?;
+        Some((host, device))
+    }
+}
+
+pub(crate) fn image_copy_rects(spans: &[(u64, u64, u64)]) -> smallvec::SmallVec<[ImageCopy; 64]> {
+    let mut copies = smallvec::SmallVec::new();
+    let mut i = 0;
+    while i < spans.len() {
+        let mut copy = ImageCopy::linear(spans[i]);
+        if copy.bytes > 0
+            && copy.bytes <= u32::MAX as u64
+            && (copy.host | copy.device | copy.bytes) % 4 == 0
+        {
+            if let Some(pitch) = spans
+                .get(i + 1)
+                .and_then(|next| next.1.checked_sub(copy.device))
+                .filter(|&pitch| pitch >= copy.bytes && pitch % 4 == 0)
+                .and_then(|pitch| usize::try_from(pitch).ok())
+            {
+                copy.pitch = pitch;
+                while copy.rows < u32::MAX {
+                    let Some(&(host, device, bytes)) = spans.get(i + copy.rows as usize) else {
+                        break;
+                    };
+                    let row = u64::from(copy.rows);
+                    if bytes != copy.bytes
+                        || copy
+                            .bytes
+                            .checked_mul(row)
+                            .and_then(|n| copy.host.checked_add(n))
+                            != Some(host)
+                        || (pitch as u64)
+                            .checked_mul(row)
+                            .and_then(|n| copy.device.checked_add(n))
+                            != Some(device)
+                    {
+                        break;
+                    }
+                    let next = ImageCopy {
+                        rows: copy.rows + 1,
+                        ..copy
+                    };
+                    if next.slices().is_none() {
+                        break;
+                    }
+                    copy = next;
+                }
+            }
+        }
+        i += copy.rows as usize;
+        copies.push(copy);
+    }
+    copies
+}
+
 /// Bring up the best backend this host can actually offer.
 ///
 /// One binary serves both CPU and GPU: the vendor drivers are `dlopen`ed, never
