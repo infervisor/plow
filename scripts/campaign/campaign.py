@@ -235,7 +235,8 @@ def prepare_block_bench(a: argparse.Namespace) -> dict:
                   cell=cell, commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")),
                   command=command, env=env, packet_sha256=sha(assets / "model.pkt"),
                   runtime_sha256=sha(private),
-                  objects={p.name: sha(p) for p in sorted((out / "objects").iterdir()) if p.is_file()},
+                  objects={str(p.relative_to(out / "objects")): sha(p)
+                           for p in sorted((out / "objects").rglob("*")) if p.is_file()},
                   inputs={p.name: sha(p) for p in sorted((out / "inputs").iterdir()) if p.is_file()})
     # The queue exports visibility inside gpulease; never capture a parent's GPU mask.
     wrapper = out / "run.sh"
@@ -253,7 +254,7 @@ def cmd_block_bench(a: argparse.Namespace) -> None:
     out = Path(a.out).resolve()
     cell = record["cell"]
     submitted = subprocess.run([sys.executable, str(REPO / "scripts/bench/gpuq.py"),
-                               "--root", str(Path(a.queue).resolve()), "submit", cell["name"],
+                               "--vendor", "amd", "--root", str(Path(a.queue).resolve()), "submit", cell["name"],
                                str(cell["n_gpu"]), "bash", str(out / "run.sh")], check=True, capture_output=True, text=True)
     record.update(queue=str(Path(a.queue).resolve()), job=submitted.stdout.strip())
     (out / "run-record.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -303,7 +304,7 @@ def cmd_block_ab(a: argparse.Namespace) -> None:
         score_command.append("--require-bitwise")
     lines += [shlex.join(score_command)]
     wrapper.write_text("\n".join(lines) + "\n")
-    command = [sys.executable, str(REPO / "scripts/bench/gpuq.py"), "--root", a.queue,
+    command = [sys.executable, str(REPO / "scripts/bench/gpuq.py"), "--vendor", "amd", "--root", a.queue,
                "submit", arms["ctl"]["cell"]["name"] + "-ab", str(arms["ctl"]["cell"]["n_gpu"]),
                "bash", str(REPO / "scripts/bench/quietx.sh"), str(Path(a.quiet_lock).resolve()),
                "bash", str(wrapper)]
@@ -457,7 +458,8 @@ def cmd_serve_bench(a: argparse.Namespace) -> None:
                   image=image, env=env, reference_env=reference_env, contexts=in_lens, concurrencies=concs, prompts=prompts,
                   output_len=output_len, raw_index_sha256=sha(raw / "model.safetensors.index.json"),
                   runtime_sha256=sha(out / "plowrt"), packet_sha256=sha(out / "assets/model.pkt"),
-                  objects={p.name: sha(p) for p in sorted((out / "objects").iterdir()) if p.is_file()},
+                  objects={str(p.relative_to(out / "objects")): sha(p)
+                           for p in sorted((out / "objects").rglob("*")) if p.is_file()},
                   status="prepared", numerics_qualified=False, precision_qualified=False,
                   comparison_scope="diagnostic; per-operation dtype parity and numerics not qualified")
     manifest = out / "assets/build.json"

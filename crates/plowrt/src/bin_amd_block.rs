@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use plowrt::{
     asset::devblob::DevBlob,
@@ -125,6 +125,53 @@ fn carried_state_layout(
     Ok((stride, prefix))
 }
 
+fn head_major_geometry<'a>(
+    producers: impl Iterator<Item = &'a packet::dev::DevInst64>,
+) -> Result<(usize, usize, usize), Error> {
+    let mut geometry = None;
+    for inst in producers {
+        let next = (inst.i[1] as usize, inst.fj[1] as usize, inst.i[2] as usize);
+        if inst.op != packet::dev::DevOp::HeadNormRope as u16
+            || next.0 == 0
+            || next.1 == 0
+            || next.2 == 0
+            || geometry.replace(next).is_some_and(|old| old != next)
+        {
+            return Err("inconsistent head-major KV producer geometry".into());
+        }
+    }
+    geometry.ok_or_else(|| "missing head-major KV producer".into())
+}
+
+fn validate_head_major_capacity(
+    capacity: u64,
+    slots: usize,
+    (heads, stride, dim): (usize, usize, usize),
+    ctx: u32,
+) -> Result<(), Error> {
+    let expected = [slots, heads, stride, dim, 2]
+        .into_iter()
+        .try_fold(1u64, |n, d| {
+            (d != 0).then_some(d).and_then(|d| n.checked_mul(d as u64))
+        });
+    if expected != Some(capacity) || ctx == 0 || ctx as usize > stride {
+        return Err("head-major KV extent or context differs from producer geometry".into());
+    }
+    Ok(())
+}
+
+fn declared_output(outputs: &[plow_asset::BlockTensor], hidden: i64) -> Result<&str, Error> {
+    match outputs {
+        [output]
+            if output.dtype == "bf16"
+                && matches!(output.shape.as_slice(), [plow_asset::Dim::Symbolic(t), plow_asset::Dim::Fixed(n)] if t == "T" && *n > 0 && *n == hidden) =>
+        {
+            Ok(&output.name)
+        }
+        _ => Err("block requires one declared BF16 output".into()),
+    }
+}
+
 fn check_output(bytes: &[u8], reference: &[u8], tolerance: f64) -> Result<f64, Error> {
     if bytes.len() != reference.len() || bytes.len() % 2 != 0 || bytes.is_empty() {
         return Err("reference residual size differs from block output".into());
@@ -186,7 +233,51 @@ pub fn run(
     if ctx == 0 || repeat == 0 {
         return Err("context and repeat must be positive".into());
     }
-    let parsed = DevBlob::parse_l2(&std::fs::read(&blob)?, true)?;
+    let packet_bytes = std::fs::read(&blob)?;
+    let parsed = DevBlob::parse_l2(&packet_bytes, true)?;
+    let descriptor: Option<plow_asset::BlockDescriptor> = parsed
+        .reserved_metadata(&packet_bytes, "block.json")?
+        .map(serde_json::from_slice)
+        .transpose()?;
+    let allocated_slots = if parsed.tensors.iter().any(|t| t.name == "in.kvlen") {
+        parsed
+            .decode_phase()
+            .map(|p| p.t as usize)
+            .max()
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    let mut head_major = HashMap::new();
+    if let Some(descriptor) = &descriptor {
+        for state in &descriptor.carried_state {
+            if state.layout != "head_major" {
+                continue;
+            }
+            for name in &state.tensors {
+                let handle = parsed
+                    .tensors
+                    .iter()
+                    .position(|tensor| tensor.name == *name)
+                    .ok_or("declared carried state absent from packet")?;
+                let geometry = head_major_geometry(
+                    parsed.progs.iter().flat_map(|p| &p.insts).filter(|inst| {
+                        inst.op == packet::dev::DevOp::HeadNormRope as u16
+                            && inst.t[0] as usize == handle
+                    }),
+                )?;
+                validate_head_major_capacity(
+                    parsed.tensors[handle].bytes,
+                    allocated_slots,
+                    geometry,
+                    ctx,
+                )?;
+                if head_major.insert(name.as_str(), geometry).is_some() {
+                    return Err("duplicate head-major carried state".into());
+                }
+            }
+        }
+    }
     if parsed.tp_degree() != tp {
         return Err(format!("block packet is TP{}, requested TP{tp}", parsed.tp_degree()).into());
     }
@@ -273,14 +364,28 @@ pub fn run(
             return Err(format!("missing carried-state operand {}.bin", tensor.name).into());
         }
     }
-    let output = "act.xnext";
+    let output = if parsed.tensors.iter().any(|t| t.name == "act.xnext") {
+        "act.xnext"
+    } else {
+        let descriptor = descriptor
+            .as_ref()
+            .ok_or("packet requires a declared block output")?;
+        declared_output(&descriptor.outputs, descriptor.hidden)?
+    };
     let output_capacity = parsed
         .tensors
         .iter()
         .find(|t| t.name == output)
-        .ok_or("packet has no act.xnext; use a single-layer block")?
+        .ok_or("declared block output absent from packet")?
         .bytes;
     let output_bytes = activation_prefix_bytes(output_capacity, allocated_rows, live_rows)?;
+    if output != "act.xnext"
+        && descriptor
+            .as_ref()
+            .is_none_or(|d| d.hidden <= 0 || output_bytes / live_rows != d.hidden as usize * 2)
+    {
+        return Err("declared block output width differs from packet".into());
+    }
     let reference = std::fs::read(inputs.join("reference.bf16"))?;
     // Per-slot decode positions (mixed-length rungs), else every slot at `prefix` (ctx - 1).
     let prefix = u32::try_from(metadata["prefix"].as_u64().unwrap_or(u64::from(ctx - 1)))?;
@@ -531,8 +636,21 @@ pub fn run(
             for (name, bytes) in &operands {
                 if name.starts_with("kv.") {
                     let capacity = engine.tensor_bytes(name).ok_or("missing KV tensor")? as usize;
-                    let (stride, prefix) =
-                        carried_state_layout(name, capacity, slots, engine.max_ctx(), ctx)?;
+                    let (heads, context_stride, head_dim) = head_major
+                        .get(name.as_str())
+                        .copied()
+                        .unwrap_or((1, engine.max_ctx(), 0));
+                    let (stride, head_prefix) = carried_state_layout(
+                        name,
+                        capacity,
+                        slots.checked_mul(heads).ok_or("KV head count overflow")?,
+                        context_stride,
+                        ctx,
+                    )?;
+                    if head_dim != 0 && stride / context_stride != head_dim * 2 {
+                        return Err("head-major KV capacity differs from producer geometry".into());
+                    }
+                    let prefix = head_prefix * heads;
                     let ranks = if tp > 1 && bytes.len() == prefix * batch * tp as usize {
                         tp as usize
                     } else {
@@ -546,7 +664,13 @@ pub fn run(
                     }
                     for (row, data) in bytes.chunks_exact(prefix * ranks).enumerate() {
                         let part = &data[rank % ranks * prefix..][..prefix];
-                        engine.write_tensor_at(name, (row * stride) as u64, part)?;
+                        for (head, bytes) in part.chunks_exact(head_prefix).enumerate() {
+                            engine.write_tensor_at(
+                                name,
+                                ((row * heads + head) * stride) as u64,
+                                bytes,
+                            )?;
+                        }
                     }
                 } else {
                     engine.write_tensor(name, bytes)?;
@@ -694,6 +818,88 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn head_major_capture_checks_every_producer() {
+        use packet::dev::{DevInst, DevOp};
+        let mut builder = DevInst {
+            op: DevOp::HeadNormRope as u16,
+            ..Default::default()
+        };
+        builder.i[1] = 8;
+        builder.i[2] = 128;
+        builder.j[0] = 8192;
+        let producer = builder.pack();
+        assert_eq!(
+            head_major_geometry([&producer, &producer].into_iter()).unwrap(),
+            (8, 8192, 128)
+        );
+        for axis in [1, 2] {
+            let mut wrong = builder;
+            wrong.i[axis] = 0;
+            assert!(head_major_geometry([&wrong.pack()].into_iter()).is_err());
+            wrong.i[axis] = builder.i[axis] / 2;
+            assert!(head_major_geometry([&producer, &wrong.pack()].into_iter()).is_err());
+        }
+        for stride in [0, 4096] {
+            let mut wrong = builder;
+            wrong.j[0] = stride;
+            assert!(head_major_geometry([&producer, &wrong.pack()].into_iter()).is_err());
+        }
+        assert!(head_major_geometry(std::iter::empty()).is_err());
+        builder.op = DevOp::Gemm as u16;
+        assert!(head_major_geometry([&builder.pack()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn declared_block_output_requires_one_bf16_row_tensor() {
+        let mut output = plow_asset::BlockTensor {
+            name: "act.x".into(),
+            dtype: "bf16".into(),
+            shape: vec![
+                plow_asset::Dim::Symbolic("T".into()),
+                plow_asset::Dim::Fixed(1024),
+            ],
+        };
+        assert_eq!(declared_output(&[output.clone()], 1024).unwrap(), "act.x");
+        assert!(declared_output(&[], 1024).is_err());
+        assert!(declared_output(&[output.clone(), output.clone()], 1024).is_err());
+        output.dtype = "fp32".into();
+        assert!(declared_output(&[output.clone()], 1024).is_err());
+        output.dtype = "bf16".into();
+        output.shape[1] = plow_asset::Dim::Fixed(1);
+        assert!(declared_output(&[output.clone()], 1024).is_err());
+        output.shape[1] = plow_asset::Dim::Fixed(0);
+        assert!(declared_output(&[output], 1024).is_err());
+    }
+
+    #[test]
+    fn head_major_capture_uses_each_heads_context_stride() {
+        for batch in [1, 2, 4, 8, 16] {
+            for heads in [1, 2, 8] {
+                for ctx in [1, 1024, 8192] {
+                    let capacity = batch * heads * 8192 * 128 * 2;
+                    validate_head_major_capacity(capacity as u64, batch, (heads, 8192, 128), ctx)
+                        .unwrap();
+                    assert!(validate_head_major_capacity(
+                        capacity as u64 - 2,
+                        batch,
+                        (heads, 8192, 128),
+                        1
+                    )
+                    .is_err());
+                    assert_eq!(
+                        carried_state_layout("kv.0.k", capacity, batch * heads, 8192, ctx).unwrap(),
+                        (8192 * 128 * 2, ctx as usize * 128 * 2)
+                    );
+                }
+            }
+        }
+        assert!(carried_state_layout("kv.0.k", 8192 * 256, 8, 8192, 8193).is_err());
+        assert!(validate_head_major_capacity(8192 * 256, 1, (1, 8192, 128), 8193).is_err());
+        assert!(validate_head_major_capacity(0, 1, (0, 8192, 128), 1).is_err());
+        assert!(validate_head_major_capacity(0, usize::MAX, (8, 8192, 128), 1).is_err());
+    }
 
     #[test]
     fn block_oracle_uses_live_decode_rows_not_prefill_capacity() {
