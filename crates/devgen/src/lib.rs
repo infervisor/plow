@@ -10770,10 +10770,10 @@ fn emit_dense_gqa(
     // So the axes get names. `PLOW_FP8` stays an alias for the weight axis — every existing script
     // and every line of the README keeps working, and unset means unset:
     //
-    //   weight      PLOW_W8A16=1 | PLOW_W8A8=1 | PLOW_W4A16=1   (alias: PLOW_FP8=1 -> w8a16)
+    //   weight      PLOW_W8A16=1 | PLOW_W8A8=1 | PLOW_MXFP4=1   (alias: PLOW_FP8=1 -> w8a16)
     //   activation  implied by the weight axis (w8a8 quantizes activations; the others do not)
     //   kv          PLOW_KV_FP8=1                               (alias: PLOW_FP8_KV=1)
-    //   experts     PLOW_MOE_ENC=bf16|fp8blk|mxfp4              (MLA family; see mla::MoeEnc)
+    //   experts     derived from the weight axis                (MLA family; see mla::MoeEnc)
     //
     // The activation axis is deliberately NOT a separate flag: w8a8 is one profile, not a free
     // cross-product with w8a16, and the kernels instantiate exactly those. Naming it separately

@@ -25,7 +25,6 @@ const UNSET: Default = Default::Static(Val::Unset);
 
 const OPT_IN: Status = Status::OptIn;
 const DIAG: Status = Status::Diagnostic;
-const REMOVED: Status = Status::Removed;
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=0` is the rollback"],
 };
@@ -1600,10 +1599,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.GLM_FULL", Some("GLM_FULL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.GLM_LAYER", Some("GLM_LAYER"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.GLM_NLAYERS", Some("GLM_NLAYERS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("env.PLOW_AMD_DECODE_GEMM_OVERLAP", Some("PLOW_AMD_DECODE_GEMM_OVERLAP"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_ATTNRES_MAXB", Some("PLOW_ATTNRES_MAXB"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_AUDIT_JOBS", Some("PLOW_AUDIT_JOBS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
-    KnobSpec::new("env.PLOW_BLOB_F_L2DOM", Some("PLOW_BLOB_F_L2DOM"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_BLOCK", Some("PLOW_BLOCK"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FA512", Some("PLOW_BUILD_FA512"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     // `scripts/build_sm90a_gemma4_segments.sh`: a BF16 packet defaults the recipe object set on.
@@ -1641,7 +1637,6 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_FUSE_XR_ATTNRES", Some("PLOW_FUSE_XR_ATTNRES"), Layer::RawEnv, Domain::Str, UNSET, SEG_EXPERIMENT_PARKED),
     KnobSpec::new("env.PLOW_GATE_RELAXSIG", Some("PLOW_GATE_RELAXSIG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_GEMM_JSONL", Some("PLOW_GEMM_JSONL"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
-    KnobSpec::new("env.PLOW_GLM_FOLD_LT_DECODE", Some("PLOW_GLM_FOLD_LT_DECODE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_GLM_GF", Some("PLOW_GLM_GF"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_GQ_ORDER", Some("PLOW_GQ_ORDER"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_KV_FP8", Some("PLOW_KV_FP8"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1651,12 +1646,10 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_MLA_PF_AITER", Some("PLOW_MLA_PF_AITER"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MLA_PF_V2", Some("PLOW_MLA_PF_V2"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_DECODE_STANDALONE", Some("PLOW_MOE_DECODE_STANDALONE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("env.PLOW_MOE_ENC", Some("PLOW_MOE_ENC"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_NV_ABLATE_HI", Some("PLOW_NV_ABLATE_HI"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_NV_ABLATE_LO", Some("PLOW_NV_ABLATE_LO"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_NV_FA512_BKV", Some("PLOW_NV_FA512_BKV"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_NV_PLACE", Some("PLOW_NV_PLACE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("env.PLOW_NV_ZG", Some("PLOW_NV_ZG"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     // plowc `--emit devblob+cubin`: the toolkit nvcc (the dev shell exports it); toolchain, not a
     // numerics knob.
     KnobSpec::new("env.PLOW_NVCC", Some("PLOW_NVCC"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
@@ -1666,13 +1659,11 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_PACKET_HAS_TOKEN_BATCH_BODIES", Some("PLOW_PACKET_HAS_TOKEN_BATCH_BODIES"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PHASE_OBJECTS", Some("PLOW_PHASE_OBJECTS"), Layer::RawEnv, Domain::Str, UNSET, SEG_EXPERIMENT_PARKED),
     KnobSpec::new("env.PLOW_PLACE_REPORT", Some("PLOW_PLACE_REPORT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
-    KnobSpec::new("env.PLOW_QWEN_DECODE_LT", Some("PLOW_QWEN_DECODE_LT"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_ROOT", Some("PLOW_ROOT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_SEG_CLASS_SLICE", Some("PLOW_SEG_CLASS_SLICE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_SEG_DUMP", Some("PLOW_SEG_DUMP"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_SEG_FA256_GQA2", Some("PLOW_SEG_FA256_GQA2"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_SEG_FA512", Some("PLOW_SEG_FA512"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("env.PLOW_SEG_PACKED_PREFILL", Some("PLOW_SEG_PACKED_PREFILL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_SEG_PER_OP", Some("PLOW_SEG_PER_OP"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_SEG_PURE_GEMM", Some("PLOW_SEG_PURE_GEMM"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_SEG_SLICE_ALL", Some("PLOW_SEG_SLICE_ALL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1686,7 +1677,6 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_UNISEG", Some("PLOW_UNISEG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_VERIFY_BIN", Some("PLOW_VERIFY_BIN"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_VERIFY_DUMP", Some("PLOW_VERIFY_DUMP"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
-    KnobSpec::new("env.PLOW_W4A16", Some("PLOW_W4A16"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_XR_NOSIG", Some("PLOW_XR_NOSIG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_XR_SCHED_AG_U", Some("PLOW_XR_SCHED_AG_U"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_XR_SCHED_NWG", Some("PLOW_XR_SCHED_NWG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -2380,11 +2370,6 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_ROPE_PF", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_FP8_KV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_KV_ILV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("def.PLOW_CUTLASS_HOST", None, Layer::ObjectDefine, Domain::Bool, OFF, REMOVED),
-    KnobSpec::new("def.PLOW_FA4_DTYPE", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("def.PLOW_FA4_HOST", None, Layer::ObjectDefine, Domain::Bool, UNSET, REMOVED),
-    KnobSpec::new("def.PLOW_FA4_H", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("def.PLOW_FA4_KVH", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("def.PLOW_NV_QUANT_WPR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_QWEN_FOLD_STAGED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_QWEN_GDN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

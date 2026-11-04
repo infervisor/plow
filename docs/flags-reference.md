@@ -233,7 +233,7 @@ changing them.
   that relaunches per segment** — there `seg` already carries the class the host
   dispatches on, and overwriting it sends the whole prefill to the 4-wave flash
   object and returns zero logits. So on gfx950 the **decode** program is placed and
-  prefill is not. A placement blob carries a header flag (`PLOW_BLOB_F_L2DOM`, plus
+  prefill is not. A placement blob carries a header flag (`BLOB_F_L2DOM`, plus
   SMs/partition + domain count in `reserved`) that a runtime **without**
   `PLOW_L2_PLACE_DISPATCH` refuses at load.
 
@@ -488,7 +488,6 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GEMMA_GEMM_LT` | `--emit-gemma-gemm-lt` | false | Qualified gfx942 TP1 Gemma-4-31B BF16 serial `o_proj`/`down_proj` kernels at the 2048/4096/8192 prefill rungs. Exact shape routing keeps slower Q/K/V, fused GLU, 2048 global `o_proj`, and unsupported rows on native Plow kernels. Requires the two objects produced by `scripts/build_gemma_lt.sh`. |
 | `PLOW_GLM_GEMM_BLK` | `--glm-gemm-blk` | unset (off) | Native gfx942 W8A8 block-scale FP8 prefill projections (rows 2048-8192) on AITER's pre-shuffled assembly: `1` = q_a_proj, kv_a_latent, indexer wq_b and o_proj, or a comma list of `q_a,kv_a,wq_b,o_proj`. Reads the checkpoint's own FP8 bytes and `[128,128]` grids (overlay: `scripts/glm53_prep_blk.py`), declared in addition to the bf16 weights decode keeps (~2.4 GB/rank of HBM); q_absorb is a prep product and stays bf16. Objects: `scripts/build_gemm_blk.sh`. Excludes `GLM_LINEAR_FP8` and `PLOW_GLM_OFOLD`. Standalone on one MI300X at M=8192: 706-783 TF/s (84-94% of AITER's gfx942 CK table), W8A8 rel-L2 3.6-3.8e-2 vs FP64. Served (20-prompt C20 A/B, two controls, the same 161 steady chunks per arm): prefill chunk drain -24.4 ms (-3.0%) with all four, all of it from o_proj (q_a/kv_a/wq_b net 0 at the current activation-quant cost); prefill-tick wall -1.5%. Out tok/s 55.64 (all four) / 54.71 (without o_proj) vs controls 55.00 / 56.08: +0.2% / -1.5% vs their mean, inside their 2% spread, which is decode-side drift. Not decisive, so opt-in, not a default. Second A/B (v2 quant, socket-pinned binary, control spread 0.97%): prefill chunk drain -24.7 ms, prefill-tick wall -2.4%, out tok/s -0.3% vs the control mean, a resolved no-gain; the route arm's +5% ITL is decode-state drift, not the route (identical decode program, KV geometry and map counts). Retrieval 18/18; captured-row rel-L2 1.8-2.4e-2 vs the BF16 path. |
 | `PLOW_GLM_FOLD_LT` | `--glm-fold-lt` | on for GLM on gfx942 TP8 (production default), off elsewhere | Native gfx942 FP32 MLA fold during prefill (buckets >= 2048). **Tier 3 (L4 TP8 packet, ctrl/fold/ctrl2/fold2 through the production mux): steady 8192 chunk 50.70 -> 49.67 ms (-1.03 ms per 4 layers, 5x the arms' 0.16/0.23 ms spread; TTFT at 73,728 tokens -9.2 ms) = -0.26 ms/layer, ~ -20 ms per full 78-layer chunk; decode ticks unchanged.** Each layer's `MlaMergeFold` (the W_uv fold, ~545 us/layer on the interpreter's VALU map) runs isolated as normalize -> pinned hipBLASLt FP32 GEMM (`glm_fold_lt_gfx942.elf`) -> bf16 convert. Packet: only the 78 folds of the 2048/8192 programs change (one block, `i[5]=1`), one extra segment per layer; pairing hash unchanged. Numerics: not bit-identical, 0.03% of bf16 outputs move by 1 ulp, rel-L2 vs FP64 unchanged (1.66e-3). Needs `glm_fold_lt_gfx942.elf` + `glm_fold_adapter.elf`, which `scripts/build_glm53_gfx942_serving_objects.sh` builds when the packet was emitted with the knob (VENDOR_DIR must hold the pinned image); +~504 MiB/rank HBM. Served on an older base: +0.49% with P99 TPOT +3.6% (one pair). **Tier 4 (job `0-1789204585-sp-proj-fold-t4`, batched with `PLOW_GLM_SEQ_PAR_PROJ`, one plowrt from 008dda69, ctrl / treat / ctrl2, 20 × 70k/700 at C20):** out tok/s 63.71 / 68.13 / 63.96 (+6.73% vs the control mean, controls 0.39% apart); full 8192 chunk 792.3 / 703.4 / 792.7 ms (−11.2%); prefill tick p50 −11.0%; decode-only tick unchanged (−0.4%, spread 0.8%); mean TTFT −9.3%; retrieval 18/18 base + 21/21 tail in every arm; VRAM floor 4.50 → 3.55 GiB free on the tightest card (the pair costs ~0.95 GiB/rank of HBM against the C20 × 64K headroom). Rollback: `--glm-fold-lt=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value — the frozen serving recipe records `false`, so drop it from a replayed recipe to take the default). |
-| `PLOW_GLM_FOLD_LT_DECODE` | — | removed | Removed: measured +2.2 ms/step at rung 20 (tier 2, job 0-1789201138); see 160c6b2e to resurrect. |
 | `PLOW_GLM_PF_WIDE` | `--glm-pf-wide` | true | Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the single-workgroup emit for A/B). Bit-identical either way. |
 | `PLOW_GLM_PLACE_PF` | `--glm-place-pf` | true | Per-XCD CU placement for the GLM prefill chain (`=0` rolls back). |
 | `PLOW_GLM_XR_BAND` | `--glm-xr-band` | unset | Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit). |
@@ -617,10 +616,8 @@ weights+activations, `PLOW_MXFP4` for the A4W4 (fp4+E8M0 microscale) path, and
 Setting two weight flags is refused. The axes are independent and compose: bf16
 weights with an fp8 KV is a legal combination and has its own object.
 
-> **Not real flags** (comment-only axis labels, do not set them): `PLOW_W4A16`
-> and `PLOW_MOE_ENC=`. The w4a16 / A4W4 encoding is realized by `PLOW_MXFP4=1`;
-> the routed-expert encoding is *derived* from `PLOW_MXFP4`/`PLOW_FP8` (the
-> `MoeEnc` enum in `crates/*/mla.rs`), not selected by a `PLOW_MOE_ENC` env var.
+> The w4a16 / A4W4 encoding is realized by `PLOW_MXFP4=1`; the routed-expert encoding is
+> *derived* from `PLOW_MXFP4`/`PLOW_FP8` (the `MoeEnc` enum in `crates/*/mla.rs`).
 
 **The spelling differs by model family, because the kernels do.** An axis name
 promises an encoding, so where a family cannot realize one it refuses rather than
@@ -829,7 +826,6 @@ the end, not tabled.
 | `PLOW_DSA_TP_SELECT_THR` | 0 | **objects** (`scripts/build_dsa_tp.sh OUT -DPLOW_DSA_TP_SELECT_THR=1`) — also export `plow_dsa_tp_select_thr` from `dsa_tp_adapter_gfx942.elf`: the TP indexer's selection as `d_index_select_pf_thr` (12-bit digits until the boundary bin holds ≤ 2048 keys, one collect scan, a byte radix over those keys in LDS; two row scans instead of five, the same `dsa_pack_key_a` set). Launched only under `PLOW_DSA_SELECT_THRESHOLD`; off, the adapter disassembly is unchanged. |
 | `PLOW_DSA_SELECT_SPLIT` | 0 | **objects** (`scripts/build_gfx942.sh`, decode and flash rows) — compile the split-row decode selection arm (`-DPLOW_DSA_SELECT_SPLIT=1`, op 59 `i[4] = 2`) and export `plow_dsa_select_split_arm`. Set automatically from the `requires` of a packet emitted with `PLOW_GLM_SELECT_SPLIT`; off, the objects are byte-unchanged. |
 | `PLOW_WG_WAVES` (alias `PLOW_WAVES`) | 8 | waves per AMD workgroup (8×64 = 512 threads); feeds reduction/tiling geometry. |
-| `PLOW_ATTNRES_MAXB` | 16 | **not a `-D` knob**: an `enum` constant in `runtime/amd/op_k3.h` (registered Removed so nothing sets it) — the compile-time cap on the K3 attention-residual batch (`nb`); over it traps. |
 | `PLOW_ATTNRES_RG` | 9 | rows per sweep of the K3 hidden axis (tuned so one sweep covers `nb_max=8`). |
 
 **Measurement/diagnostic instruments — never ship** (numerically wrong or admit a
@@ -873,7 +869,7 @@ metadata.
 | `PLOW_NV_GEMV_NOSTAGE` | 0 | skip GEMV smem staging. |
 | `PLOW_NV_GEMV_STAGE_MINROWS` | 16 | row threshold below which staging is skipped. |
 | `PLOW_NV_RB_QKV`, `PLOW_NV_RB_LMHEAD`, `PLOW_NV_RB_GEMV` | 0 | per-op row-blocking A/B controls. |
-| `PLOW_NV_SZ` | 0 | **experimental** lossless bf16 weight decompression (SplitZip GEMV twins). Bit-exact, measured non-viable; kept as an A/B reference. (`PLOW_NV_ZG` does not exist.) |
+| `PLOW_NV_SZ` | 0 | **experimental** lossless bf16 weight decompression (SplitZip GEMV twins). Bit-exact, measured non-viable; kept as an A/B reference. |
 
 ### MoE
 
@@ -1127,7 +1123,6 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_TOKEN_BATCH`, `--token-batch` | removed: the unified token batch is always selected wherever the backend, model and object support it (`--fusion` takes precedence); `=0` was not a working configuration under the always-on prefix cache |
 | `PLOW_PREFIX_POLICY`, `PLOW_PREFIX_CACHE_OUTPUT`, `PLOW_PREFIX_RETIRE_ATTACHED` | the boundary tree, always on for CUDA (`docs/runtime/prefix-cache.md`); the previous binary is the rollback |
 | `PLOW_KV_STORE`, `PLOW_VMM_SNAP_POOL`, `PLOW_VMM_SNAP_PITCHED` | the KV block store (`docs/arch/26-kv-block-store.md`) is the only CUDA boundary storage; the contiguous snapshot copy path, its pool and its pitched layout were deleted (2026-10-23) |
-| `PLOW_AMD_DECODE_GEMM_OVERLAP`, `--amd-decode-gemm-overlap` | never merged (branch `decode-latency`): AMD decode native GEMMs without the AQL barrier bit measured +1.5 ms/step (+14 %, 7-layer TP8, 14 runs) |
 | `PLOW_CUTLASS_FP8_DECODE`, `--cutlass-fp8-decode` | never qualified on a production packet; dlopened a host marshaller (`libplow_cutlass_fp8_decode_sm90.so`) beside its cubin. Small-M FP8 decode projections run on cuBLASLt (removed 2026-10-29) |
 
 | var | default | effect |
@@ -1432,8 +1427,6 @@ middle chunks measures −14 ms per chunk at 78 layers (see the review log's dec
 
 | Old name | Replacement |
 | --- | --- |
-| `PLOW_QWEN_DECODE_LT` | Compiler: `PLOW_EMIT_DECODE_CUBLASLT` |
-| `PLOW_SEG_PACKED_PREFILL` | Compiler: `PLOW_EMIT_PACKED_PREFILL` |
 | `PLOW_NV_PLACE_DISPATCH` | Runtime: `PLOW_L2_PLACE_DISPATCH` |
 
 </details>

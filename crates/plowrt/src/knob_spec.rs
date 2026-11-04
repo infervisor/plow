@@ -22,7 +22,6 @@ const UNSET: Default = Default::Static(Val::Unset);
 
 const OPT_IN: Status = Status::OptIn;
 const DIAG: Status = Status::Diagnostic;
-const REMOVED: Status = Status::Removed;
 const PREFIX_CACHE_CANDIDATE: Status = Status::Candidate {
     evidence: &[
         "review log #83: attach-verify4, 0/0 mismatches over 63 attaches; opt-in, unset by default",
@@ -647,11 +646,7 @@ pub fn renamed_serve_default(
 /// Warn about each retired knob still set in the environment: it no longer does anything, and
 /// `--objective` decides what it used to.
 pub fn warn_removed_env() {
-    for name in RAW_ENV
-        .iter()
-        .filter(|k| k.status == Status::Removed)
-        .filter_map(|k| k.env)
-    {
+    for &name in RETIRED_ENV {
         if std::env::var_os(name).is_some() {
             tracing::warn!(
                 knob = name,
@@ -839,20 +834,55 @@ pub fn knob_scope(env: &str) -> Option<KnobScope> {
 
 /// Whether `env` names a live runtime knob: what a packet's `serve.json` may carry a default for.
 pub fn is_runtime_env(env: &str) -> bool {
-    RUNTIME
-        .iter()
-        .chain(RAW_ENV)
-        .any(|k| k.env == Some(env) && !matches!(k.status, Status::Removed))
+    RUNTIME.iter().chain(RAW_ENV).any(|k| k.env == Some(env))
 }
 
 /// Whether `env` names a retired knob: a packet built before its removal may still carry a
 /// default for it, which is ignored rather than refused.
 pub fn is_removed_env(env: &str) -> bool {
-    RUNTIME
-        .iter()
-        .chain(RAW_ENV)
-        .any(|k| k.env == Some(env) && matches!(k.status, Status::Removed))
+    RETIRED_ENV.contains(&env)
 }
+
+/// Retired runtime env names: no longer read. A launcher setting one gets a warning, and a packet
+/// serve default naming one is ignored rather than refused, so packets built before the removal
+/// still load.
+pub const RETIRED_ENV: &[&str] = &[
+    "PLOW_AMD_DECODE_MIN_RUNG",
+    "PLOW_CFG_MULTISTEP",
+    "PLOW_CO_SCHED_QUANTUM",
+    "PLOW_CUTLASS_FP8_DECODE",
+    "PLOW_IDLE_DISPATCH",
+    "PLOW_MULTISTEP_ADAPTIVE",
+    "PLOW_MUX_INLINE_TICK",
+    "PLOW_PF_BATCH",
+    "PLOW_PF_CHUNK_COST",
+    "PLOW_PF_COVER",
+    "PLOW_PF_INTERLEAVE_ADAPTIVE",
+    "PLOW_PF_NO_CHUNK",
+    "PLOW_PF_NO_INTERLEAVE",
+    "PLOW_PF_SPAN_POLICY",
+    "PLOW_PIPE_PREFILL",
+    "PLOW_PREFIX_CACHE_OUTPUT",
+    "PLOW_KV_STORE",
+    "PLOW_VMM_RING_PARK",
+    "PLOW_VMM_SNAP_PITCHED",
+    "PLOW_VMM_SNAP_POOL",
+    "PLOW_VMM_HOST_CACHE_MIB",
+    "PLOW_QWEN_LIGHT_OCC",
+    "PLOW_QWEN_LIGHT_DECODE",
+    "PLOW_QWEN_PF_GRAPH",
+    "PLOW_GLM_ROWBAND",
+    "PLOW_GLM_ROWBAND_CLEAR_WS",
+    "PLOW_GLM_DSA_PF_MIN_CTX",
+    "PLOW_PREFIX_POLICY",
+    "PLOW_PREFIX_RETIRE_ATTACHED",
+    "PLOW_QUEUE_TTL_MS",
+    "PLOW_RIDE_FIXED",
+    "PLOW_RUNG_FAST_PROBE",
+    "PLOW_SERVE_POLICY",
+    "PLOW_TOKEN_BATCH",
+    "PLOW_TOKEN_BATCH_SOLO",
+];
 
 #[rustfmt::skip]
 pub const RUNTIME: &[KnobSpec] = &[
@@ -1217,41 +1247,6 @@ pub const RUNTIME: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
-    KnobSpec::new("env.PLOW_AMD_DECODE_MIN_RUNG", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_CFG_MULTISTEP", Some("PLOW_CFG_MULTISTEP"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_CO_SCHED_QUANTUM", Some("PLOW_CO_SCHED_QUANTUM"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_CUTLASS_FP8_DECODE", Some("PLOW_CUTLASS_FP8_DECODE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_IDLE_DISPATCH", Some("PLOW_IDLE_DISPATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_MULTISTEP_ADAPTIVE", Some("PLOW_MULTISTEP_ADAPTIVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_MUX_INLINE_TICK", Some("PLOW_MUX_INLINE_TICK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PF_BATCH", Some("PLOW_PF_BATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PF_CHUNK_COST", Some("PLOW_PF_CHUNK_COST"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PF_COVER", Some("PLOW_PF_COVER"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PF_INTERLEAVE_ADAPTIVE", Some("PLOW_PF_INTERLEAVE_ADAPTIVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PF_NO_CHUNK", Some("PLOW_PF_NO_CHUNK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PF_NO_INTERLEAVE", Some("PLOW_PF_NO_INTERLEAVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PF_SPAN_POLICY", Some("PLOW_PF_SPAN_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PIPE_PREFILL", Some("PLOW_PIPE_PREFILL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PREFIX_CACHE_OUTPUT", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_KV_STORE", Some("PLOW_KV_STORE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_VMM_RING_PARK", Some("PLOW_VMM_RING_PARK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_VMM_SNAP_PITCHED", Some("PLOW_VMM_SNAP_PITCHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_VMM_SNAP_POOL", Some("PLOW_VMM_SNAP_POOL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_VMM_HOST_CACHE_MIB", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_QWEN_LIGHT_OCC", Some("PLOW_QWEN_LIGHT_OCC"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_QWEN_LIGHT_DECODE", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_QWEN_PF_GRAPH", Some("PLOW_QWEN_PF_GRAPH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_GLM_ROWBAND", Some("PLOW_GLM_ROWBAND"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_GLM_ROWBAND_CLEAR_WS", Some("PLOW_GLM_ROWBAND_CLEAR_WS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_GLM_DSA_PF_MIN_CTX", Some("PLOW_GLM_DSA_PF_MIN_CTX"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PREFIX_POLICY", Some("PLOW_PREFIX_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_PREFIX_RETIRE_ATTACHED", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_QUEUE_TTL_MS", Some("PLOW_QUEUE_TTL_MS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_RIDE_FIXED", Some("PLOW_RIDE_FIXED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_RUNG_FAST_PROBE", Some("PLOW_RUNG_FAST_PROBE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_SERVE_POLICY", Some("PLOW_SERVE_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_TOKEN_BATCH", Some("PLOW_TOKEN_BATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
-    KnobSpec::new("env.PLOW_TOKEN_BATCH_SOLO", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PUBLISH_URL", Some("PLOW_PUBLISH_URL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PUBLISH_KEY", Some("PLOW_PUBLISH_KEY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_READELF", Some("PLOW_READELF"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1503,12 +1498,17 @@ mod tests {
             "raw env reads with no RAW_ENV spec: {unregistered:#?}"
         );
         for k in RAW_ENV {
-            let is_read = read.iter().any(|r| r == k.name());
-            if k.status == Status::Removed {
-                assert!(!is_read, "{} is Removed but still read", k.id);
-            } else {
-                assert!(is_read, "{} is read nowhere", k.id);
-            }
+            assert!(
+                read.iter().any(|r| r == k.name()),
+                "{} is read nowhere",
+                k.id
+            );
+        }
+        for name in RETIRED_ENV {
+            assert!(
+                !read.iter().any(|r| r == name),
+                "{name} is retired but still read"
+            );
         }
     }
 
@@ -1522,11 +1522,7 @@ mod tests {
         let builds_objects = |p: &std::path::Path| {
             p.ends_with("build_gfx942.sh") || p.ends_with("obj_baseline_gfx942.json")
         };
-        let removed: Vec<&str> = RAW_ENV
-            .iter()
-            .filter(|k| k.status == Status::Removed)
-            .filter_map(|k| k.env)
-            .collect();
+        let removed = RETIRED_ENV;
         let mut sources = Vec::new();
         for dir in ["recipes", "scripts"] {
             files(&root().join(dir), None, &mut sources);
@@ -1552,6 +1548,7 @@ mod tests {
             .iter()
             .flat_map(|k| [Some(k.name()), k.env])
             .flatten()
+            .chain(RETIRED_ENV.iter().copied())
             .collect();
         let unknown: std::collections::BTreeSet<&str> = doc
             .lines()
@@ -1561,7 +1558,7 @@ mod tests {
         assert!(
             unknown.is_empty(),
             "docs/flags-reference.md names knobs the registry does not declare (register them, \
-             or mark a retired spelling Removed): {unknown:?}"
+             or add a retired spelling to RETIRED_ENV): {unknown:?}"
         );
     }
 
