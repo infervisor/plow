@@ -4675,6 +4675,9 @@ fn emit_phase(
         } else {
             n_cu
         };
+        // A projection without an fp8 twin (a checkpoint's bf16 linear in an fp8 model, e.g. the
+        // E-series per-layer input gate/projection) takes the bf16 arms.
+        let fp8 = fp8 && w8 != TENSOR_NONE;
         if gemv_family && fp8 && !fp8_lt_decode {
             return b.emit(DevOp::GemvFp8, gemv_wg_cap(cus), deps, |d| {
                 d.t[0] = out;
@@ -7395,8 +7398,8 @@ fn emit_phase(
          -> u32 {
             if ple_split_on(c) {
                 assert!(
-                    !fp8 && !mx4 && !affine_q4,
-                    "E-series per-layer input split: bf16 weights only"
+                    !mx4 && !affine_q4,
+                    "E-series per-layer input split: bf16 or fp8 models only (bf16 projections)"
                 );
                 let none = TENSOR_NONE;
                 let (h, p) = (c.hidden, c.ple);

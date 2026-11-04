@@ -241,7 +241,7 @@ static unsigned splitk_scratch(Case& c) {
 
 static void t_dense(const char* name, unsigned m, unsigned n, unsigned k, unsigned flags,
                     unsigned act, unsigned row0, unsigned stride, unsigned onehot, bool bias,
-                    bool scratch = false) {
+                    bool scratch = false, const float* post = nullptr) {
     Case c;
     const unsigned ws = stride ? stride : k;
     unsigned o = c.out((size_t)m * n);
@@ -255,9 +255,14 @@ static void t_dense(const char* name, unsigned m, unsigned n, unsigned k, unsign
     c.in.op = PLOW_DOP_DENSE_GEMM_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
     if (scratch) c.in.t[4] = splitk_scratch(c);
+    if (post) {
+        c.in.t[5] = c.add(16);
+        memcpy(c.host[c.in.t[5]].data(), post, 16);
+    }
     c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[3] = act; c.in.i[4] = row0;
     c.in.i[5] = stride; c.in.i[6] = onehot; c.in.i[7] = flags;
-    run(name, c, g_dense_gemm_f32, {o}, flags & 3u ? BF16 : FP32, 1e-5, flags & 2u ? (size_t)m * n / 20000 : 0);
+    run(name, c, g_dense_gemm_f32, {o}, flags & 3u ? BF16 : FP32, 1e-5,
+        flags & 0x202u ? (size_t)m * n / 20000 : 0);
 }
 
 /* Flag 128: rows packed from several requests sum K as each request's own split-K launch would.
@@ -454,6 +459,13 @@ static void t_elementwise() {
         c.in.op = PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w;
         c.in.i[0] = rows; c.in.i[1] = ch; c.in.i[2] = kernel;
         run("CausalDepthwiseConv1dF32", c, g_causal_depthwise_conv1d_f32, {o}, FP32);
+    }
+    {
+        Case c; const unsigned rows = 50, ch = 96, kernel = 5;
+        unsigned o = c.out(rows * ch), x = c.f32(rows * ch, 1.f), w = c.f32(ch * kernel, 0.3f);
+        c.in.op = PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w;
+        c.in.i[0] = rows; c.in.i[1] = ch; c.in.i[2] = kernel; c.in.i[3] = 25; c.in.i[4] = 3;
+        run("CausalDepthwiseConv1dF32 f32w round items", c, g_causal_depthwise_conv1d_f32, {o}, FP32);
     }
     {
         Case c; const unsigned vocab = 50, width = 300;
@@ -936,6 +948,8 @@ static void t_binary() {
         {"BinaryF32 div per-item scalar", 3, 1, 0, 0, items, 0},
         {"BinaryF32 max scalar", 4, 0, 0, 0, 1, 0},
         {"BinaryF32 min shared column", 5, 0, 1, 0, rows, 1},
+        {"BinaryF32 add full round", 0, rows * width, width, 1, items * rows * width, 2},
+        {"BinaryF32 sub row-vector scaled round", 1, 0, 0, 1, width, 3},
     };
     for (const B& t : cases) {
         Case c;
@@ -961,6 +975,8 @@ static void t_vec_elementwise() {
         {"BinaryF32 add full float4", 0, rows * width, width, 1, items * rows * width, 0},
         {"BinaryF32 mul row-scalar float4", 2, rows, 1, 0, items * rows, 1},
         {"BinaryF32 sub item-scalar float4", 1, 1, 0, 0, items, 0},
+        {"BinaryF32 add full float4 round", 0, rows * width, width, 1, items * rows * width, 2},
+        {"BinaryF32 mul row-scalar float4 scaled round", 2, rows, 1, 0, items * rows, 3},
     };
     for (const B& t : cases) {
         Case c;
@@ -2221,6 +2237,16 @@ int main(int argc, char** argv) {
     t_dense("DenseGemmF32 tc-3xtf32 f32w 300x520x700", 300, 520, 700, 16, 0, 0, 0, 0, true);
     t_dense("DenseGemmF32 tc-3xtf32 f32w splitk 50x130x2000", 50, 130, 2000, 16, 1, 2, 0, 0, true, true);
     t_dense("DenseGemmF32 tc-3xtf32 onehot", 45, 67, 33, 16, 0, 0, 35, 34, false);
+    {
+        /* Post chain (flags 0x100 clamp, 0x200 SiLU + round, 0x400 clamp_next). */
+        static const float pc[4] = {-0.9f, 1.1f, -0.3f, 0.4f};
+        t_dense("DenseGemmF32 tc-bf16 post all 250x4096x1024", 250, 4096, 1024, 1 | 4 | 8 | 0x700, 0, 0, 0, 0,
+                false, true, pc);
+        t_dense("DenseGemmF32 tc-bf16 post clamp splitk 250x1024x4096", 250, 1024, 4096, 1 | 4 | 8 | 0x100, 0, 0,
+                0, 0, false, true, pc);
+        t_dense("DenseGemmF32 bf16w post silu+clamp 45x67x36", 45, 67, 36, 1 | 4 | 0x600, 0, 0, 0, 0, true, false,
+                pc);
+    }
     /* last: keeps the earlier cases' random data */
 #if defined(PLOW_NV_HOPPER)
     t_attention_prefix_h16("AttentionF32 h16 prefix 306+72 lengths", 4, 72, 306, 2, {0, 1, 0, 1}, {378, 350, 320, 306});
