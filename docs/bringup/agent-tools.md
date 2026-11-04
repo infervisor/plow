@@ -147,6 +147,12 @@ Agent-session hazards:
 * `compute-sanitizer` under `gpulease`: the lease log shows the sanitized process as
   `foreign-during` and the run ends rc 76. That is expected for a sanitizer run (take no timing
   from it). Run it with `--report-api-errors no`.
+* An agent that waits on queued or background work keeps waiting on it (a background wait or
+  monitor on the job's result), never ends its turn "until the job finishes": a release stalled
+  1.5 h with nobody driving the queue. One wait per job; duplicate wait loops hide the real one.
+* Shared scratch on the lab box: `/tmp` is tmpfs and counts against host RAM. Build dirs left
+  there (a stale 39 GB `CARGO_TARGET_DIR`) took the release box's emits to 27 GB available.
+  Build into the NVMe scratch, and remove your own `/tmp` trees when the workstream ends.
 
 ---
 
@@ -799,4 +805,59 @@ Each rule cost at least one campaign a day of misattributed results.
   `REPS=2`), reported with `campaign.py report --cells q<1000*rate>.g`. `REPS=1` cannot be reported
   (the report requires >= 2 repeats per cell); the full 2 rates x 2-3 reps is for promotion only.
 * Reuse captured vLLM peers and shared plowrt base arms; never recapture a vLLM arm for a screen.
+
+**Emits (lessons from the 2026-11 RC8 release)**
+
+* An emit needs no GPU except its cuBLASLt probe. Run emits CPU-only outside the queue
+  (`campaign.py build --no-probe` with `CUDA_VISIBLE_DEVICES=`), then one short queued
+  `campaign.py probe` per packet for the shapes `build-record.json` lists under
+  `cublaslt.missing`. A speech interpreter's ptxas is single-threaded and takes 1.5–2.2 h (fish,
+  maya2); inside a lease it held the GPU idle for hours and hit the 4 h lease timeout mid-emit.
+* Budget host RAM per emit before starting it: an interpreter ptxas holds 15–18 GB, a cicc up to
+  34 GB transiently, and parallel emits stack. Check `MemAvailable` before each start, keep a
+  floor (stop the newest parallel emit, never let the OOM killer choose), and never emit beside a
+  serving grid without measuring the server's peak RSS (§"Runtime environment").
+* Every worktree that runs plowc tests or emits points `PLOW_VERIFY_BIN` (or the
+  `lean-plow/.lake` symlink) at an approved verifier. A stale symlink to an unapproved hash
+  fails `cargo test -p plowc` in ways that look like code regressions; check the hash first.
+* `campaign.py` qualifies with strict Lean whenever the recipe lives under `recipes/infervisor`.
+  The logical-effects audit covers LLM ops only, so speech packets fail strict until their audit
+  lands; until then they emit with `--lean-qualify report`, recorded as a known issue.
+
+**Gates and A/B verdicts**
+
+* A "no-op for other packets" or "neutral change" resource rule is no regression, not byte
+  identity: REG, SHARED and LOCAL equal and STACK not larger (`cuobjdump --dump-resource-usage`).
+  An A/B tolerance band is one-sided: a faster arm passes. Write the rule into the verdict.
+* FP32 gate repeats measure nothing at c1 (deterministic on one binary and packet). A
+  measured-margin proposal needs >= 3 runs at c8/c32, quotes the spread table, and goes to the
+  user, who decides the margin; c1 misses are reported as systematic, not as noise.
+* A gate job checks its scorer's dependencies before serving (Python `import` of the CER/WER
+  stack, reference files present) and fails on a missing one. A CER run without the scorer's
+  `PYTHONPATH` produced results that had to be voided after the lease.
+* Recipe gates serve `--assets` from the emit tree with the prepared checkpoint; they prove the
+  packet, not the distribution path (below).
+
+**Release and distribution**
+
+* A distribution bundle (`plowrt push|load`) carries only what plow produces: packets, objects
+  and every tensor plowc or the recipe's prep step derives or changes. Raw weights and every other
+  file the model needs from its HF repo (config, tokenizer, chat template in either `.jinja` or
+  `.json` form, preprocessor config) come from the recipe's HF pin at load. Customer hosts run no
+  Python, so prep never runs at load.
+* The dist gate for every asset is: `push` to a `file://` registry, `load` into a clean
+  `PLOW_HOME`, `plowrt serve --model <name>` (never `--assets`), then the asset's digest or
+  CER/WER gate. `campaign.py dist-gate <recipe> --assets DIR --out DIR [--gate]` runs it: push,
+  clean load, bundle == push input (bytes + `inventory`) on CPU, then a gpuq job serving
+  `--model` (smoke, or the recipe's `[gates]` with `--gate`); record `dist-gate.json`. RC8 found
+  three failure classes only at this step: a missing HF sidecar, a prepared checkpoint the bundle
+  did not carry, and build-script packets with no `max_ctx`. Run it on every recipe at the start
+  of a release candidate, before any other GPU gate.
+* The release tip is frozen from the first emit to the PR. Later changes reach it only as
+  recipe-only commits on the release branch (pins, measured margins, known issues), merged by
+  the coordinator with a path guard (`recipes/infervisor/` only) and `check_recipe` +
+  `render --check`.
+* The nix release binary embeds its flake source path, so two commits with identical crates can
+  give different binary hashes. Ship the binary that was gated; compare others only after
+  normalising that path.
 
