@@ -399,6 +399,14 @@ fn write_zip(
         objects_root,
         checkpoint_in,
     } = args;
+    if !bundle.checkpoint.views.is_empty() {
+        return Err(format!(
+            "{}: a prepared checkpoint's derived blobs travel only with `push`; the archive does \
+             not carry them",
+            bundle.name
+        )
+        .into());
+    }
     // Exactly where `generate` read the objects from.
     let objects_in: Vec<_> = match (&objset, objects_root) {
         (Some((objset, _)), Some(dir)) => {
@@ -991,15 +999,22 @@ pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> 
     Ok(())
 }
 
-/// Refuse a prepared bundle whose checkpoint lacks a tensor a packet binds, the bundle's own and
-/// each sub-bundle's, and a packet bundle whose packets bind any: found here, not by `serve`.
+/// Refuse a prepared bundle whose checkpoint lacks a tensor its model packet (or a sub-bundle's)
+/// binds, a packet bundle whose packets bind any, and any packet that does not parse: found
+/// here, not by `serve`.
 fn check_bound(dir: &std::path::Path, bundle: &plow_asset::dist::Bundle) -> Result<(), Err> {
     let packet_layout = bundle.checkpoint.layout == plow_asset::dist::PACKET_LAYOUT;
     for f in &bundle.files {
+        let pkt = dir.join(&f.name);
+        // A codec or sidecar packet binds its own outputs and inter-packet buffers
+        // (`out.vc.*`), not checkpoint tensors: only that it is a readable packet is checked.
+        if matches!(f.role.as_str(), "codec_packet" | "sidecar_packet") {
+            plowrt::asset::serve::check_packet(&pkt)?;
+            continue;
+        }
         if f.role != "packet" && f.role != "sub_packet" {
             continue;
         }
-        let pkt = dir.join(&f.name);
         let ck = pkt.with_file_name("checkpoint");
         let ck = (!packet_layout && (f.role == "packet" || ck.is_dir())).then_some(ck);
         plowrt::asset::serve::check_bound_weights(&pkt, ck.as_deref())?;

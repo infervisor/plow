@@ -167,6 +167,7 @@ fn walk(dir: &Path, repo_only: bool) -> Result<Vec<(String, PathBuf)>> {
             // repository files are never directory links.
             if p.is_dir() && !(link && repo_only) {
                 go(root, &p, repo_only, seen, out)?;
+                seen.remove(&std::fs::canonicalize(&p).map_err(io(&p))?);
             } else if p.is_file() && (link || !repo_only) {
                 let rel = p.strip_prefix(root).unwrap_or(&p);
                 out.push((rel.to_string_lossy().replace('\\', "/"), p));
@@ -370,7 +371,18 @@ pub fn materialize(
     view.validate().map_err(RuntimeError::Dist)?;
     let dir = view_path(store.root(), bundle, view)?;
     // Published by rename once whole; its snapshot links dangle if the HF cache was evicted.
-    if dir.is_dir() && view.files.iter().all(|f| dir.join(&f.name).is_file()) {
+    // Its files were verified when it was built and are never written after; a reuse checks
+    // only that each is still there, the size it was, and that snapshot links still point at
+    // this snapshot.
+    let intact = |f: &plow_asset::dist::ViewFile| {
+        let p = dir.join(&f.name);
+        let linked = match &f.hf {
+            Some(hf) => std::fs::read_link(&p).is_ok_and(|t| t == snapshot.join(hf)),
+            None => true,
+        };
+        linked && std::fs::metadata(&p).is_ok_and(|m| m.is_file() && m.len() == f.bytes)
+    };
+    if dir.is_dir() && view.files.iter().all(intact) {
         return Ok(dir);
     }
     let _ = std::fs::remove_dir_all(&dir);
