@@ -151,6 +151,15 @@ pub trait SeqEngine {
             "KV image export unavailable".into(),
         ))
     }
+    fn export_kv_image_stream(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        _publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+    ) -> crate::Result<()> {
+        self.export_kv_image(slot, n, out)
+    }
     fn import_kv_image(
         &mut self,
         _slot: usize,
@@ -4294,6 +4303,26 @@ mod amd_serve {
             n: u32,
             out: &mut crate::serve::pd::KvBytes,
         ) -> Result<()> {
+            self.export_kv_image_with(slot, n, out, None)
+        }
+
+        pub fn export_kv_image_stream(
+            &mut self,
+            slot: usize,
+            n: u32,
+            out: &mut crate::serve::pd::KvBytes,
+            publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+        ) -> Result<()> {
+            self.export_kv_image_with(slot, n, out, Some(publish))
+        }
+
+        fn export_kv_image_with(
+            &mut self,
+            slot: usize,
+            n: u32,
+            out: &mut crate::serve::pd::KvBytes,
+            publish: Option<&mut dyn FnMut(crate::serve::pd::KvBytes)>,
+        ) -> Result<()> {
             self.check_slot(slot)?;
             if !self.live[slot] || self.pf[slot].is_some() || self.pos[slot] != n {
                 return Err(RuntimeError::Rejected(format!(
@@ -4301,7 +4330,10 @@ mod amd_serve {
                 )));
             }
             match &mut self.ranks {
-                Ranks::One(e) => e.export_kv_image(slot, n, out),
+                Ranks::One(e) => match publish {
+                    Some(publish) => e.export_kv_image_stream(slot, n, out, publish),
+                    None => e.export_kv_image(slot, n, out),
+                },
                 Ranks::Tp(_) => Err(RuntimeError::Rejected("KV image: TP unsupported".into())),
             }
         }
@@ -5705,6 +5737,15 @@ impl SeqEngine for AmdServe {
         out: &mut crate::serve::pd::KvBytes,
     ) -> crate::Result<()> {
         AmdServe::export_kv_image(self, slot, n, out)
+    }
+    fn export_kv_image_stream(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+    ) -> crate::Result<()> {
+        AmdServe::export_kv_image_stream(self, slot, n, out, publish)
     }
     fn import_kv_image(
         &mut self,

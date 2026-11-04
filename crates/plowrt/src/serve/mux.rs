@@ -800,8 +800,7 @@ fn note_fault(tick_fault: &mut Option<crate::DeviceErrorInfo>, err: &crate::Runt
 /// typed device fault stays typed (its fatality drives the 503 mapping);
 /// anything else degrades to the stringified `Msg` as before.
 #[allow(dead_code)]
-#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
-fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
+pub(super) fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
     match err.device_fault() {
         Some(info) => crate::RuntimeError::DeviceFault { info: info.clone() },
         None => crate::RuntimeError::Msg(msg.to_string()),
@@ -4578,7 +4577,9 @@ fn run_one_tick(
                     // A P/D prefill job just finished: its KV leaves before the slot retires.
                     if let Some(sink) = result.2.pd_exports.get_mut(slot).and_then(Option::take) {
                         if result.5.is_none() && sink.wanted() {
-                            sink.deliver(gpu_export_slot(&mut *e, slot));
+                            if let Err(error) = gpu_export_slot(&mut *e, slot, &sink) {
+                                note_fault(&mut result.5, &error);
+                            }
                         }
                     }
                     e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
@@ -7877,19 +7878,13 @@ fn gpu_seat_imports(
 fn gpu_export_slot(
     e: &mut crate::exec::gpu::GpuEngine,
     slot: usize,
-) -> Result<crate::serve::pd::KvImage> {
+    sink: &crate::serve::pd::KvExport,
+) -> Result<()> {
     let handoff_started = Instant::now();
-    let key = e
-        .kv_image_key()
-        .ok_or_else(|| crate::RuntimeError::Rejected("P/D: this packet has no KV image".into()))?;
+    let key = e.kv_image_key();
     let rows = e.slot_pos(slot) as u32;
-    let mut bytes = crate::serve::pd::KvBytes::default();
-    e.export_kv_image(slot, rows, &mut bytes)?;
-    Ok(crate::serve::pd::KvImage {
-        key,
-        rows,
-        bytes,
-        handoff_started,
+    sink.produce(key, rows, handoff_started, |bytes, publish| {
+        e.export_kv_image_stream(slot, rows, bytes, publish)
     })
 }
 
@@ -7902,25 +7897,15 @@ fn seq_release_slot(
 ) {
     if let Some((sink, rows)) = exports.get_mut(slot).and_then(Option::take) {
         if sink.wanted() {
-            let image = (|| {
-                let handoff_started = Instant::now();
-                let key = e.kv_image_key().ok_or_else(|| {
-                    crate::RuntimeError::Rejected("P/D: this packet has no KV image".into())
-                })?;
-                let mut bytes = crate::serve::pd::KvBytes::default();
-                e.export_kv_image(slot, rows, &mut bytes)?;
-                Ok(crate::serve::pd::KvImage {
-                    key,
-                    rows,
-                    bytes,
-                    handoff_started,
-                })
-            })();
-            if let Err(error) = &image {
+            let handoff_started = Instant::now();
+            let key = e.kv_image_key();
+            let result = sink.produce(key, rows, handoff_started, |bytes, publish| {
+                e.export_kv_image_stream(slot, rows, bytes, publish)
+            });
+            if let Err(error) = &result {
                 note_fault(tick_fault, error);
             }
             e.release(slot);
-            sink.deliver(image);
             return;
         }
     }
@@ -12165,6 +12150,7 @@ mod tests {
             seed: Option<u32>,
             logits: Vec<f32>,
             export_fault: bool,
+            on_export: Option<Arc<dyn Fn() + Send + Sync>>,
         }
 
         impl SeqEngine for Engine {
@@ -12197,6 +12183,21 @@ mod tests {
                 }
                 self.exports += 1;
                 *out = vec![42].into();
+                Ok(())
+            }
+            fn export_kv_image_stream(
+                &mut self,
+                slot: usize,
+                n: u32,
+                out: &mut crate::serve::pd::KvBytes,
+                publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+            ) -> Result<()> {
+                self.export_kv_image(slot, n, out)?;
+                if let Some(hook) = &self.on_export {
+                    publish(vec![42].into());
+                    hook();
+                    assert!(self.live, "publication precedes source release");
+                }
                 Ok(())
             }
             fn import_kv_image(
@@ -12557,6 +12558,55 @@ mod tests {
             assert!(tick_fault.unwrap().fatal);
             assert!(matches!(image.try_recv().unwrap(), Err(error) if error.is_fatal()));
             assert!(!e.live);
+        }
+
+        #[test]
+        fn source_done_and_usage_are_closed_before_early_image_publication() {
+            let now = Instant::now();
+            let outcome = Outcome::new(Arc::default(), now);
+            let (sink, image) = KvExport::new(outcome);
+            let (mut prefill, prx) = prefill_test_slot();
+            let s = prefill.as_mut().unwrap();
+            s.gen.max_tokens = 1;
+            s.cached_tokens = 2;
+            s.raw_tokens = true;
+            s.export = Some(sink.clone());
+            handle_produced_token(
+                &mut prefill,
+                &None,
+                &prefill_test_bundle("source-stream-closed"),
+                120,
+                1,
+                &mut 0,
+                Some(&[]),
+            );
+            assert!(prefill.is_none());
+            let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = observed.clone();
+            let channels = parking_lot::Mutex::new((prx, image));
+            let mut engine = Engine {
+                live: true,
+                on_export: Some(Arc::new(move || {
+                    let mut channels = channels.lock();
+                    assert!(matches!(
+                        channels.0.try_recv().unwrap(),
+                        StreamChunk::Token { id: 120, .. }
+                    ));
+                    assert!(
+                        matches!(channels.0.try_recv().unwrap(), StreamChunk::Done { usage, .. } if usage.cached_tokens == 2)
+                    );
+                    assert!(matches!(
+                        channels.0.try_recv(),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+                    ));
+                    let image = channels.1.try_recv().unwrap().unwrap();
+                    assert_eq!((image.rows, &*image.bytes), (3, &[42][..]));
+                    flag.store(true, Ordering::Release);
+                })),
+                ..Default::default()
+            };
+            seq_release_slot(&mut engine, 0, &mut [Some((sink, 3))], &mut None);
+            assert!(observed.load(Ordering::Acquire) && !engine.live);
         }
 
         #[test]

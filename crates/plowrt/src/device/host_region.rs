@@ -136,7 +136,53 @@ pub fn prepare_image_pool(bytes: usize, drivers: &[Arc<dyn HostStaging>]) -> Res
 pub struct RegionLease {
     region: Option<HostRegion>,
     len: usize,
-    ready: std::sync::atomic::AtomicBool,
+    stream_started: Option<std::time::Instant>,
+    pending: std::sync::atomic::AtomicUsize,
+    export: parking_lot::Mutex<ImageExport>,
+    changed: parking_lot::Condvar,
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+enum ImageExport {
+    Idle,
+    Active { ready: usize },
+    Complete,
+    Failed(String),
+}
+
+pub(crate) struct ImageExportGuard(Arc<RegionLease>);
+
+impl ImageExportGuard {
+    pub(crate) fn finish(self, result: Result<()>) -> Result<()> {
+        let mut state = self.0.export.lock();
+        let result = if result.is_ok()
+            && !matches!(*state, ImageExport::Active { ready } if ready == self.0.len)
+        {
+            Err(RuntimeError::Device(
+                "KV image export ended before its final range".into(),
+            ))
+        } else {
+            result
+        };
+        *state = match &result {
+            Ok(()) => ImageExport::Complete,
+            Err(error) => ImageExport::Failed(error.to_string()),
+        };
+        self.0.changed.notify_all();
+        drop(state);
+        result
+    }
+}
+
+impl Drop for ImageExportGuard {
+    fn drop(&mut self) {
+        let mut state = self.0.export.lock();
+        if matches!(*state, ImageExport::Active { .. }) {
+            *state = ImageExport::Failed("exporter left before completion".into());
+            self.0.changed.notify_all();
+        }
+    }
 }
 
 impl RegionLease {
@@ -148,7 +194,12 @@ impl RegionLease {
         Some(Self {
             region: Some(pool.swap_remove(i)),
             len,
-            ready: std::sync::atomic::AtomicBool::new(true),
+            stream_started: None,
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            export: parking_lot::Mutex::new(ImageExport::Idle),
+            changed: parking_lot::Condvar::new(),
+            #[cfg(test)]
+            waiting: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -156,18 +207,91 @@ impl RegionLease {
         self.region.as_ref()?.alias(vendor)
     }
 
-    pub(crate) fn set_ready(&self, ready: bool) {
-        self.ready
-            .store(ready, std::sync::atomic::Ordering::Release);
+    pub(crate) fn len(&self) -> usize {
+        self.len
     }
 
-    pub(crate) fn is_ready(&self) -> bool {
-        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    pub(crate) fn begin_dma(&self) {
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn retire_dma(&self) {
+        assert!(
+            self.pending
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                > 0
+        );
+    }
+
+    pub(crate) fn has_pending_dma(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn start_export(lease: &mut Arc<Self>) -> Option<ImageExportGuard> {
+        let unique = Arc::get_mut(lease)?;
+        unique.stream_started = Some(std::time::Instant::now());
+        *unique.export.get_mut() = ImageExport::Active { ready: 0 };
+        Some(ImageExportGuard(Arc::clone(lease)))
+    }
+
+    pub(crate) fn streaming(&self) -> bool {
+        !matches!(*self.export.lock(), ImageExport::Idle)
+    }
+
+    pub(crate) fn stream_ms(&self) -> Option<f64> {
+        self.stream_started.map(|t| t.elapsed().as_secs_f64() * 1e3)
+    }
+
+    pub(crate) fn stream_started(&self) -> Option<std::time::Instant> {
+        self.stream_started
+    }
+
+    pub(crate) fn publish(&self, end: usize) -> Result<()> {
+        let mut state = self.export.lock();
+        match &mut *state {
+            ImageExport::Active { ready } if *ready <= end && end <= self.len => *ready = end,
+            _ => {
+                return Err(RuntimeError::Device(
+                    "KV image export range out of order".into(),
+                ))
+            }
+        }
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn wait_export(&self, end: usize, complete: bool) -> Result<()> {
+        let mut state = self.export.lock();
+        loop {
+            match &*state {
+                ImageExport::Idle | ImageExport::Complete => return Ok(()),
+                ImageExport::Active { ready } if !complete && *ready >= end => return Ok(()),
+                ImageExport::Failed(error) => {
+                    return Err(RuntimeError::Unavailable(format!(
+                        "KV image peer export failed: {error}"
+                    )))
+                }
+                _ => {
+                    #[cfg(test)]
+                    self.waiting
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    self.changed.wait(&mut state);
+                    #[cfg(test)]
+                    self.waiting
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
-        assert!(self.ready.load(std::sync::atomic::Ordering::Acquire));
-        // SAFETY: the exclusive lease is readable only after all DMA has completed.
+        assert!(!self.has_pending_dma());
+        assert!(matches!(
+            *self.export.lock(),
+            ImageExport::Idle | ImageExport::Complete
+        ));
+        // SAFETY: publication is final and every source and consumer DMA has retired.
         unsafe { self.region.as_ref().expect("live lease").slice(0, self.len) }
     }
 }
@@ -175,7 +299,7 @@ impl RegionLease {
 impl Drop for RegionLease {
     fn drop(&mut self) {
         if let Some(region) = self.region.take() {
-            if *self.ready.get_mut() {
+            if *self.pending.get_mut() == 0 {
                 IMAGE_REGIONS.lock().push(region);
             } else {
                 // A failed fence cannot prove DMA stopped. Never reuse or unmap these pages.
@@ -516,7 +640,9 @@ mod tests {
             })
             .is_err());
         assert_eq!(drain, Some(3));
-        batch.wait(drain.unwrap(), |_| Ok(()), |_| unreachable!()).unwrap();
+        batch
+            .wait(drain.unwrap(), |_| Ok(()), |_| unreachable!())
+            .unwrap();
     }
 
     #[test]
@@ -539,73 +665,81 @@ mod tests {
         assert!(batch.pending.lock().is_empty());
     }
 
+    use crate::exec::kv_image::{ImageSpan, KvBytes};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static IMAGE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    struct StagingDriver {
+        vendor: hwspec::Vendor,
+        bias: u64,
+        registrations: AtomicUsize,
+        waits: AtomicUsize,
+        copies: parking_lot::Mutex<Vec<(u64, u64, u64)>>,
+        fail_enqueue: std::sync::atomic::AtomicBool,
+        fail_wait: std::sync::atomic::AtomicBool,
+        on_wait: parking_lot::Mutex<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    }
+    impl HostStaging for StagingDriver {
+        fn staging_vendor(&self) -> hwspec::Vendor {
+            self.vendor
+        }
+        unsafe fn host_register(&self, ptr: *mut u8, _: usize) -> Result<u64> {
+            self.registrations.fetch_add(1, Ordering::Relaxed);
+            Ok(ptr as u64 + self.bias)
+        }
+        unsafe fn host_unregister(&self, _: *mut u8) {}
+        fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64> {
+            let mut copies = self.copies.lock();
+            if !copies.is_empty() && self.fail_enqueue.load(Ordering::Relaxed) {
+                return Err(RuntimeError::Device("enqueue refused".into()));
+            }
+            copies.push((host - self.bias, src, bytes));
+            Ok(copies.len() as u64)
+        }
+        fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64> {
+            let mut copies = self.copies.lock();
+            copies.push((dst, host - self.bias, bytes));
+            Ok(copies.len() as u64)
+        }
+        fn stage_wait(&self, last: u64) -> Result<()> {
+            let mut copies = self.copies.lock();
+            assert_eq!(last, copies.len() as u64);
+            let call = self.waits.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.fail_wait.load(Ordering::Relaxed) {
+                return Err(RuntimeError::Device("wait failed".into()));
+            }
+            for (dst, src, bytes) in copies.drain(..) {
+                // SAFETY: the test keeps both disjoint buffers alive until this wait.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes as usize);
+                }
+            }
+            drop(copies);
+            let callback = self.on_wait.lock().clone();
+            if let Some(callback) = callback {
+                callback(call);
+            }
+            Ok(())
+        }
+    }
+    fn driver(vendor: hwspec::Vendor, bias: u64) -> Arc<StagingDriver> {
+        Arc::new(StagingDriver {
+            vendor,
+            bias,
+            registrations: AtomicUsize::new(0),
+            waits: AtomicUsize::new(0),
+            copies: Default::default(),
+            fail_enqueue: Default::default(),
+            fail_wait: Default::default(),
+            on_wait: Default::default(),
+        })
+    }
+
     #[test]
     fn staged_images_use_driver_aliases_wait_once_and_reuse_leases() {
-        use crate::exec::kv_image::{ImageSpan, KvBytes};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _serial = IMAGE_TEST_LOCK.lock();
 
-        struct Driver {
-            vendor: hwspec::Vendor,
-            bias: u64,
-            registrations: AtomicUsize,
-            waits: AtomicUsize,
-            copies: parking_lot::Mutex<Vec<(u64, u64, u64)>>,
-            fail_enqueue: std::sync::atomic::AtomicBool,
-            fail_wait: std::sync::atomic::AtomicBool,
-        }
-        impl HostStaging for Driver {
-            fn staging_vendor(&self) -> hwspec::Vendor {
-                self.vendor
-            }
-            unsafe fn host_register(&self, ptr: *mut u8, _: usize) -> Result<u64> {
-                self.registrations.fetch_add(1, Ordering::Relaxed);
-                Ok(ptr as u64 + self.bias)
-            }
-            unsafe fn host_unregister(&self, _: *mut u8) {}
-            fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64> {
-                let mut copies = self.copies.lock();
-                if !copies.is_empty() && self.fail_enqueue.load(Ordering::Relaxed) {
-                    return Err(RuntimeError::Device("enqueue refused".into()));
-                }
-                copies.push((host - self.bias, src, bytes));
-                Ok(copies.len() as u64)
-            }
-            fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64> {
-                let mut copies = self.copies.lock();
-                copies.push((dst, host - self.bias, bytes));
-                Ok(copies.len() as u64)
-            }
-            fn stage_wait(&self, last: u64) -> Result<()> {
-                let mut copies = self.copies.lock();
-                assert_eq!(last, copies.len() as u64);
-                self.waits.fetch_add(1, Ordering::Relaxed);
-                if self.fail_wait.load(Ordering::Relaxed) {
-                    return Err(RuntimeError::Device("wait failed".into()));
-                }
-                for (dst, src, bytes) in copies.drain(..) {
-                    // SAFETY: the test keeps both disjoint buffers alive until this wait.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src as *const u8,
-                            dst as *mut u8,
-                            bytes as usize,
-                        );
-                    }
-                }
-                Ok(())
-            }
-        }
-        let driver = |vendor, bias| {
-            Arc::new(Driver {
-                vendor,
-                bias,
-                registrations: AtomicUsize::new(0),
-                waits: AtomicUsize::new(0),
-                copies: Default::default(),
-                fail_enqueue: Default::default(),
-                fail_wait: Default::default(),
-            })
-        };
         let nv = driver(hwspec::Vendor::Nvidia, 0);
         let amd = driver(hwspec::Vendor::Amd, 4096);
         prepare_image_pool(16, &[nv.clone(), amd.clone()]).unwrap();
@@ -690,6 +824,340 @@ mod tests {
         drop(image);
         assert_eq!(IMAGE_REGIONS.lock().len(), 1);
         IMAGE_REGIONS.lock().clear();
+    }
+
+    fn image_spans() -> [ImageSpan; 4] {
+        std::array::from_fn(|i| ImageSpan {
+            handle: 0,
+            native_off: i as u64 * 4,
+            image_off: i as u64 * 4,
+            bytes: 4,
+        })
+    }
+
+    fn await_export_waiter(lease: &RegionLease) {
+        let started = std::time::Instant::now();
+        while lease.waiting.load(Ordering::Acquire) == 0 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn streaming_halves_overlap_but_partial_images_have_no_cpu_view() {
+        let _serial = IMAGE_TEST_LOCK.lock();
+        let nv = driver(Vendor::Nvidia, 0);
+        let amd = driver(Vendor::Amd, 4096);
+        prepare_image_pool(16, &[nv.clone(), amd.clone()]).unwrap();
+        let mut image = KvBytes::default();
+        image.prepare(16, Vendor::Nvidia);
+        let source: Vec<u8> = (0..16).collect();
+        let mut dest = vec![0u8; 16];
+        let src = [crate::device::DeviceMem::view(source.as_ptr() as u64, 16)];
+        let dst = [crate::device::DeviceMem::view(dest.as_mut_ptr() as u64, 16)];
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let second_rx = parking_lot::Mutex::new(second_rx);
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        *nv.on_wait.lock() = Some(Arc::new(move |n| {
+            if n == 2 {
+                second_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+        }));
+        *amd.on_wait.lock() = Some(Arc::new(move |n| {
+            if n == 1 {
+                second_rx
+                    .lock()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                first_tx.send(()).unwrap();
+            }
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                let result = image.export_with(Some(&mut |ready| tx.send(ready).unwrap()), |out| {
+                    out.transfer(&*nv, &image_spans(), &src, true)
+                        .map(|_| ())
+                        .map_err(|e| e.error)
+                });
+                assert!(result.is_ok());
+            });
+            let ready = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let KvBytes::Pooled(lease) = &ready else {
+                panic!("pooled image")
+            };
+            let lease = lease.clone();
+            let consumer = scope.spawn(move || ready.transfer(&*amd, &image_spans(), &dst, false));
+            first_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(lease.has_pending_dma());
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.bytes())).is_err()
+            );
+            release_tx.send(()).unwrap();
+            producer.join().unwrap();
+            assert!(consumer.join().unwrap().unwrap());
+            assert_eq!(lease.bytes(), source);
+        });
+        assert_eq!(dest, source);
+        drop(image);
+        assert_eq!(IMAGE_REGIONS.lock().len(), 2);
+        IMAGE_REGIONS.lock().clear();
+    }
+
+    #[test]
+    fn a_retired_export_error_does_not_claim_the_consumers_pending_dma() {
+        let _serial = IMAGE_TEST_LOCK.lock();
+        let nv = driver(Vendor::Nvidia, 0);
+        let amd = driver(Vendor::Amd, 4096);
+        prepare_image_pool(16, &[nv.clone(), amd.clone()]).unwrap();
+        let mut image = KvBytes::default();
+        image.prepare(16, Vendor::Nvidia);
+        let source: Vec<u8> = (0..16).collect();
+        let mut dest = vec![0u8; 16];
+        let src = [crate::device::DeviceMem::view(source.as_ptr() as u64, 16)];
+        let dst = [crate::device::DeviceMem::view(dest.as_mut_ptr() as u64, 16)];
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let second_rx = parking_lot::Mutex::new(second_rx);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let started_rx = parking_lot::Mutex::new(started_rx);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        let weak = Arc::downgrade(&nv);
+        *nv.on_wait.lock() = Some(Arc::new(move |n| {
+            if n == 1 {
+                weak.upgrade()
+                    .unwrap()
+                    .fail_enqueue
+                    .store(true, Ordering::Relaxed);
+            } else if n == 2 {
+                second_tx.send(()).unwrap();
+                started_rx
+                    .lock()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+        }));
+        *amd.on_wait.lock() = Some(Arc::new(move |n| {
+            if n == 1 {
+                second_rx
+                    .lock()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                started_tx.send(()).unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                image.export_with(Some(&mut |ready| tx.send(ready).unwrap()), |out| {
+                    let error = out.transfer(&*nv, &image_spans(), &src, true).unwrap_err();
+                    assert!(!error.unretired && out.has_pending_dma());
+                    Err(error.error)
+                })
+            });
+            let ready = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let consumer = scope.spawn(move || ready.transfer(&*amd, &image_spans(), &dst, false));
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(producer.join().unwrap().is_err());
+            release_tx.send(()).unwrap();
+            let error = consumer.join().unwrap().unwrap_err();
+            assert!(!error.unretired && matches!(error.error, RuntimeError::Unavailable(_)));
+        });
+        assert!(!image.has_pending_dma());
+        drop(image);
+        assert_eq!(IMAGE_REGIONS.lock().len(), 2);
+        IMAGE_REGIONS.lock().clear();
+    }
+
+    #[test]
+    fn source_final_success_gates_views_and_unretired_consumer_fences_retain_slabs() {
+        let _serial = IMAGE_TEST_LOCK.lock();
+        let nv = driver(Vendor::Nvidia, 0);
+        let amd = driver(Vendor::Amd, 4096);
+        prepare_image_pool(16, &[nv.clone(), amd.clone()]).unwrap();
+        let source: Vec<u8> = (0..16).collect();
+        let src = [crate::device::DeviceMem::view(source.as_ptr() as u64, 16)];
+        let mut image = KvBytes::default();
+        image.prepare(16, Vendor::Nvidia);
+        let mut ready = None;
+        image
+            .export_with(Some(&mut |bytes| ready = Some(bytes)), |out| {
+                out.transfer(&*nv, &image_spans(), &src, true)
+                    .map_err(|e| e.error)?;
+                assert!(!out.has_pending_dma());
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| &**out)).is_err());
+                Ok(())
+            })
+            .unwrap();
+        let ready = ready.unwrap();
+        assert_eq!(&*ready, source);
+        let mut dest = vec![0u8; 16];
+        let dst = [crate::device::DeviceMem::view(dest.as_mut_ptr() as u64, 16)];
+        amd.fail_wait.store(true, Ordering::Relaxed);
+        let error = ready
+            .transfer(&*amd, &image_spans(), &dst, false)
+            .unwrap_err();
+        assert!(error.unretired && image.has_pending_dma());
+        drop((ready, image));
+        assert_eq!(IMAGE_REGIONS.lock().len(), 1);
+        IMAGE_REGIONS.lock().clear();
+    }
+
+    #[test]
+    fn abandoned_publication_wakes_peers_without_dma_or_pool_loss() {
+        let _serial = IMAGE_TEST_LOCK.lock();
+        let nv = driver(Vendor::Nvidia, 0);
+        let amd = driver(Vendor::Amd, 4096);
+        prepare_image_pool(16, &[nv, amd.clone()]).unwrap();
+        let mut image = KvBytes::default();
+        image.prepare(16, Vendor::Nvidia);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    image.export_with(
+                        Some(&mut |bytes| {
+                            let KvBytes::Pooled(lease) = &bytes else {
+                                panic!("pooled image")
+                            };
+                            let lease = lease.clone();
+                            tx.send(bytes).unwrap();
+                            await_export_waiter(&lease);
+                            panic!("publisher stopped");
+                        }),
+                        |_| unreachable!(),
+                    )
+                }))
+                .is_err());
+            });
+            let ready = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let KvBytes::Pooled(lease) = &ready else {
+                panic!("pooled image")
+            };
+            let lease = lease.clone();
+            let consumer = scope.spawn(move || {
+                let error = ready
+                    .transfer(&*amd, &image_spans(), &[], false)
+                    .unwrap_err();
+                assert!(!error.unretired && matches!(error.error, RuntimeError::Unavailable(_)));
+                done_tx.send(()).unwrap();
+            });
+            let notified = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+            if notified.is_err() {
+                lease.changed.notify_all();
+            }
+            producer.join().unwrap();
+            consumer.join().unwrap();
+            assert!(
+                notified.is_ok(),
+                "abandoned export did not wake an already-blocked consumer"
+            );
+        });
+        assert!(!image.has_pending_dma());
+        drop(image);
+        assert_eq!(IMAGE_REGIONS.lock().len(), 2);
+        IMAGE_REGIONS.lock().clear();
+    }
+
+    #[test]
+    fn imported_halves_wait_for_final_source_success_or_error() {
+        let _serial = IMAGE_TEST_LOCK.lock();
+        for fail in [false, true] {
+            let nv = driver(Vendor::Nvidia, 0);
+            let amd = driver(Vendor::Amd, 4096);
+            prepare_image_pool(16, &[nv.clone(), amd.clone()]).unwrap();
+            let source: Vec<u8> = (0..16).collect();
+            let mut dest = vec![0u8; 16];
+            let src = [crate::device::DeviceMem::view(source.as_ptr() as u64, 16)];
+            let dst = [crate::device::DeviceMem::view(dest.as_mut_ptr() as u64, 16)];
+            let mut image = KvBytes::default();
+            image.prepare(16, Vendor::Nvidia);
+            let (copied_tx, copied_rx) = std::sync::mpsc::channel();
+            *amd.on_wait.lock() = Some(Arc::new(move |n| {
+                if n == 2 {
+                    copied_tx.send(()).unwrap();
+                }
+            }));
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = parking_lot::Mutex::new(release_rx);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let producer = scope.spawn(|| {
+                    image.export_with(Some(&mut |ready| tx.send(ready).unwrap()), |out| {
+                        out.transfer(&*nv, &image_spans(), &src, true)
+                            .map_err(|e| e.error)?;
+                        release_rx
+                            .lock()
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                        if fail {
+                            Err(RuntimeError::Unavailable("final source failure".into()))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                });
+                let ready = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                let KvBytes::Pooled(lease) = &ready else {
+                    panic!("pooled image")
+                };
+                let lease = lease.clone();
+                let consumer = scope.spawn(move || {
+                    let result = ready.transfer(&*amd, &image_spans(), &dst, false);
+                    done_tx.send(result.is_ok()).unwrap();
+                    result
+                });
+                copied_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                await_export_waiter(&lease);
+                assert!(!lease.has_pending_dma());
+                assert!(done_rx.try_recv().is_err());
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lease.bytes()))
+                        .is_err()
+                );
+                release_tx.send(()).unwrap();
+                assert_eq!(producer.join().unwrap().is_err(), fail);
+                let notified = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+                if notified.is_err() {
+                    lease.changed.notify_all();
+                }
+                let result = consumer.join().unwrap();
+                assert!(
+                    notified.is_ok(),
+                    "final export result did not wake the consumer"
+                );
+                assert_eq!(result.is_err(), fail);
+                if let Err(error) = result {
+                    assert!(
+                        !error.unretired && matches!(error.error, RuntimeError::Unavailable(_))
+                    );
+                }
+            });
+            assert_eq!(dest, source);
+            drop(image);
+            assert_eq!(IMAGE_REGIONS.lock().len(), 2);
+            IMAGE_REGIONS.lock().clear();
+        }
     }
 
     #[test]

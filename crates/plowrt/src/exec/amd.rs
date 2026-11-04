@@ -15291,9 +15291,9 @@ impl AmdEngine {
         spans: &[crate::exec::kv_image::ImageSpan],
         export: bool,
     ) -> Result<bool> {
-        let result = image.transfer(&*self.be, spans, &self.devp, export);
-        if let Err(error) = &result {
-            if image.has_pending_dma() {
+        match image.transfer(&*self.be, spans, &self.devp, export) {
+            Ok(staged) => Ok(staged),
+            Err(failure) if failure.unretired => {
                 image.quarantine(
                     &mut self.devp,
                     &mut self._weight_slab,
@@ -15301,10 +15301,10 @@ impl AmdEngine {
                     self.be.clone(),
                 );
                 self.kv_image_key = None;
-                return Err(self.be.quarantine_staging(error));
+                Err(self.be.quarantine_staging(&failure.error))
             }
+            Err(failure) => Err(failure.error),
         }
-        result
     }
 
     pub fn export_kv_image(
@@ -15313,29 +15313,51 @@ impl AmdEngine {
         n: u32,
         out: &mut crate::serve::pd::KvBytes,
     ) -> Result<()> {
+        self.export_kv_image_with(slot, n, out, None)
+    }
+
+    pub fn export_kv_image_stream(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+    ) -> Result<()> {
+        self.export_kv_image_with(slot, n, out, Some(publish))
+    }
+
+    fn export_kv_image_with(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        publish: Option<&mut dyn FnMut(crate::serve::pd::KvBytes)>,
+    ) -> Result<()> {
         let slot = u32::try_from(slot)
             .map_err(|_| RuntimeError::Rejected("KV image: slot out of range".into()))?;
         let (spans, total) = crate::exec::kv_image::plan(self.kv_image_manifest()?, slot, n)?;
         self.drain()?;
         out.prepare(total as usize, hwspec::Vendor::Amd);
-        #[cfg(target_os = "linux")]
-        if self.transfer_kv_image(out, &spans, true)? {
-            return Ok(());
-        }
-        let crate::serve::pd::KvBytes::Pageable(out) = out else {
-            return Err(RuntimeError::Device(
-                "KV image: unregistered export slab".into(),
-            ));
-        };
-        for s in spans {
-            EngineDevice::download(
-                &*self.be,
-                &self.devp[s.handle],
-                s.native_off,
-                &mut out[s.image_off as usize..(s.image_off + s.bytes) as usize],
-            )?;
-        }
-        Ok(())
+        out.export_with(publish, |out| {
+            #[cfg(target_os = "linux")]
+            if self.transfer_kv_image(out, &spans, true)? {
+                return Ok(());
+            }
+            let crate::serve::pd::KvBytes::Pageable(out) = out else {
+                return Err(RuntimeError::Device(
+                    "KV image: unregistered export slab".into(),
+                ));
+            };
+            for s in spans {
+                EngineDevice::download(
+                    &*self.be,
+                    &self.devp[s.handle],
+                    s.native_off,
+                    &mut out[s.image_off as usize..(s.image_off + s.bytes) as usize],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub fn import_kv_image(

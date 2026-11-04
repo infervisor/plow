@@ -17,7 +17,7 @@ use crate::{Result, RuntimeError};
 
 pub enum KvBytes {
     #[cfg(target_os = "linux")]
-    Pooled(crate::device::host_region::RegionLease),
+    Pooled(std::sync::Arc<crate::device::host_region::RegionLease>),
     Pageable(Vec<u8>),
 }
 
@@ -46,9 +46,29 @@ impl std::ops::Deref for KvBytes {
 }
 
 impl KvBytes {
-    #[cfg(target_os = "linux")]
+    pub fn len(&self) -> usize {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Pooled(lease) => lease.len(),
+            Self::Pageable(bytes) => bytes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn stream_started(&self) -> Option<std::time::Instant> {
+        #[cfg(target_os = "linux")]
+        if let Self::Pooled(lease) = self {
+            return lease.stream_started();
+        }
+        None
+    }
+
+    #[cfg(all(target_os = "linux", test))]
     pub(crate) fn has_pending_dma(&self) -> bool {
-        matches!(self, Self::Pooled(lease) if !lease.is_ready())
+        matches!(self, Self::Pooled(lease) if lease.has_pending_dma())
     }
 
     #[cfg(target_os = "linux")]
@@ -85,7 +105,7 @@ impl KvBytes {
         }
         #[cfg(target_os = "linux")]
         if let Some(lease) = crate::device::host_region::RegionLease::take(bytes, vendor) {
-            *self = Self::Pooled(lease);
+            *self = Self::Pooled(std::sync::Arc::new(lease));
             return;
         }
         let _ = vendor;
@@ -95,6 +115,30 @@ impl KvBytes {
         }
     }
 
+    pub(crate) fn export_with(
+        &mut self,
+        publish: Option<&mut dyn FnMut(Self)>,
+        copy: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        let guard = publish.and_then(|publish| {
+            let Self::Pooled(lease) = self else {
+                return None;
+            };
+            let guard = crate::device::host_region::RegionLease::start_export(lease)?;
+            publish(Self::Pooled(std::sync::Arc::clone(lease)));
+            Some(guard)
+        });
+        #[cfg(not(target_os = "linux"))]
+        let _ = publish;
+        let result = copy(self);
+        #[cfg(target_os = "linux")]
+        if let Some(guard) = guard {
+            return guard.finish(result);
+        }
+        result
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn transfer(
         &self,
@@ -102,43 +146,157 @@ impl KvBytes {
         spans: &[ImageSpan],
         devp: &[crate::device::DeviceMem],
         export: bool,
-    ) -> Result<bool> {
+    ) -> std::result::Result<bool, ImageTransferError> {
         let Self::Pooled(lease) = self else {
             return Ok(false);
         };
         let Some(alias) = lease.alias(driver.staging_vendor()) else {
+            if export {
+                return Err(RuntimeError::Device(
+                    "KV image export driver is not registered".into(),
+                )
+                .into());
+            }
+            lease.wait_export(lease.len(), true)?;
             return Ok(false);
         };
         let timing = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
-        lease.set_ready(false);
-        let copies: Vec<_> = spans
-            .iter()
-            .map(|s| {
-                (
-                    alias + s.image_off,
-                    devp[s.handle].base + s.native_off,
-                    s.bytes,
-                )
-            })
-            .collect();
-        let (last, queued) = driver.stage_batch(&copies, export);
-        let submitted = timing.map(|t| t.elapsed());
-        // Drain already submitted copies even if submitting a later span failed.
-        if let Some(fence) = last {
-            driver.stage_wait(fence)?;
+        let streaming = lease.streaming();
+        let mid = if streaming {
+            lease.len() / 2
+        } else {
+            lease.len()
+        };
+        let mut submit = std::time::Duration::ZERO;
+        let mut retire = std::time::Duration::ZERO;
+        let mut peer_wait = std::time::Duration::ZERO;
+        let mut chunks = 0;
+        for (lo, hi) in [(0, mid), (mid, lease.len())] {
+            if lo == hi {
+                continue;
+            }
+            if streaming && !export {
+                let start = timing.map(|_| std::time::Instant::now());
+                lease.wait_export(hi, false)?;
+                if let Some(start) = start {
+                    peer_wait += start.elapsed();
+                }
+            }
+            let start = timing.map(|_| std::time::Instant::now());
+            let mut copies = Vec::with_capacity(spans.len());
+            let mut bytes = 0;
+            for &span in spans {
+                if let Some(s) = image_span_range(span, lo as u64, hi as u64)? {
+                    copies.push((
+                        alias + s.image_off,
+                        devp[s.handle].base + s.native_off,
+                        s.bytes,
+                    ));
+                    bytes += s.bytes;
+                }
+            }
+            if bytes != (hi - lo) as u64 {
+                return Err(
+                    RuntimeError::Device("KV image range does not cover its bytes".into()).into(),
+                );
+            }
+            let dma_start = timing.and_then(|_| lease.stream_ms());
+            lease.begin_dma();
+            let (last, queued) = driver.stage_batch(&copies, export);
+            let submitted = start.map(|t| t.elapsed());
+            if let Some(fence) = last {
+                if let Err(error) = driver.stage_wait(fence) {
+                    return Err(ImageTransferError {
+                        error,
+                        unretired: true,
+                    });
+                }
+            } else if queued.is_ok() {
+                return Err(ImageTransferError {
+                    error: RuntimeError::Device("KV image batch has no completion fence".into()),
+                    unretired: true,
+                });
+            }
+            lease.retire_dma();
+            queued?;
+            if let (Some(start), Some(submitted)) = (start, submitted) {
+                submit += submitted;
+                retire += start.elapsed() - submitted;
+            }
+            if let Some(dma_start_ms) = dma_start {
+                tracing::debug!(vendor = ?driver.staging_vendor(), export, lo, hi,
+                    dma_start_ms, dma_end_ms = lease.stream_ms().expect("stream clock"),
+                    "KV image chunk retired");
+            }
+            if streaming && export {
+                lease.publish(hi)?;
+            }
+            chunks += 1;
         }
-        lease.set_ready(true);
-        queued?;
-        if let (Some(t), Some(submitted)) = (timing, submitted) {
+        if streaming && !export {
+            let start = timing.map(|_| std::time::Instant::now());
+            lease.wait_export(lease.len(), true)?;
+            if let Some(start) = start {
+                peer_wait += start.elapsed();
+            }
+        }
+        if let Some(t) = timing {
             tracing::debug!(
-                vendor = ?driver.staging_vendor(), export, spans = spans.len(), bytes = lease.bytes().len(),
-                submit_ms = submitted.as_secs_f64() * 1e3,
-                wait_retire_ms = (t.elapsed() - submitted).as_secs_f64() * 1e3,
+                vendor = ?driver.staging_vendor(), export, spans = spans.len(), bytes = lease.len(), chunks,
+                submit_ms = submit.as_secs_f64() * 1e3,
+                wait_retire_ms = retire.as_secs_f64() * 1e3,
+                peer_wait_ms = peer_wait.as_secs_f64() * 1e3,
+                transfer_ms = t.elapsed().as_secs_f64() * 1e3,
                 "KV image staged transfer"
             );
         }
         Ok(true)
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ImageTransferError {
+    pub error: RuntimeError,
+    pub unretired: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl From<RuntimeError> for ImageTransferError {
+    fn from(error: RuntimeError) -> Self {
+        Self {
+            error,
+            unretired: false,
+        }
+    }
+}
+
+fn image_span_range(span: ImageSpan, lo: u64, hi: u64) -> Result<Option<ImageSpan>> {
+    let end = span
+        .image_off
+        .checked_add(span.bytes)
+        .ok_or_else(|| RuntimeError::Device("KV image span overflow".into()))?;
+    if lo > hi {
+        return Err(RuntimeError::Device("KV image range is reversed".into()));
+    }
+    let start = lo.max(span.image_off);
+    let end = hi.min(end);
+    if start >= end {
+        return Ok(None);
+    }
+    let native_off = span
+        .native_off
+        .checked_add(start - span.image_off)
+        .ok_or_else(|| RuntimeError::Device("KV image native span overflow".into()))?;
+    native_off
+        .checked_add(end - start)
+        .ok_or_else(|| RuntimeError::Device("KV image native range overflow".into()))?;
+    Ok(Some(ImageSpan {
+        native_off,
+        image_off: start,
+        bytes: end - start,
+        ..span
+    }))
 }
 
 /// One contiguous copy between a cache tensor and the image.
@@ -351,5 +509,87 @@ mod tests {
         assert!(plan(&m, 4, 1).is_err());
         assert!(plan(&m, 0, 0).is_err());
         assert!(plan(&m, 0, 65).is_err());
+    }
+
+    #[test]
+    fn image_halves_preserve_all_live_bytes_across_native_layouts_and_wraps() {
+        let expand = |spans: &[ImageSpan]| {
+            spans
+                .iter()
+                .flat_map(|s| {
+                    (0..s.bytes).map(move |i| (s.image_off + i, s.handle, s.native_off + i))
+                })
+                .collect::<Vec<_>>()
+        };
+        for layout in [LAYOUT_HEAD_MAJOR, LAYOUT_ROW_INTERLEAVED] {
+            for scales in [false, true] {
+                for window in [0, 12] {
+                    if layout == LAYOUT_ROW_INTERLEAVED && window != 0 {
+                        continue;
+                    }
+                    for rows in [1, 3, 16, 40] {
+                        let mut c = cache([2, 3], 3, if window == 0 { 64 } else { 16 }, window);
+                        c.layout = layout;
+                        c.scales = scales.then_some([4, 5]);
+                        let (spans, total) =
+                            plan(&manifest(vec![c, cache([6, 7], 1, 64, 0)]), 2, rows).unwrap();
+                        let original = expand(&spans);
+                        assert_eq!(original.len() as u64, total);
+                        for cut in [1, total / 2, total - 1] {
+                            let mut split = Vec::new();
+                            for (lo, hi) in [(0, cut), (cut, total)] {
+                                let before = split.len();
+                                for &s in &spans {
+                                    if let Some(piece) = image_span_range(s, lo, hi).unwrap() {
+                                        assert!(
+                                            piece.image_off >= lo
+                                                && piece.image_off + piece.bytes <= hi
+                                        );
+                                        split.push(piece);
+                                    }
+                                }
+                                assert_eq!(
+                                    split[before..].iter().map(|s| s.bytes).sum::<u64>(),
+                                    hi - lo
+                                );
+                            }
+                            assert_eq!(expand(&split), original);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_ranges_refuse_overflow_and_do_not_copy_empty_intersections() {
+        let s = ImageSpan {
+            handle: 0,
+            native_off: 100,
+            image_off: 8,
+            bytes: 8,
+        };
+        for (lo, hi) in [(0, 8), (16, 20), (10, 10)] {
+            assert_eq!(image_span_range(s, lo, hi).unwrap(), None);
+        }
+        assert!(image_span_range(s, 11, 10).is_err());
+        assert!(image_span_range(
+            ImageSpan {
+                image_off: u64::MAX,
+                ..s
+            },
+            0,
+            20
+        )
+        .is_err());
+        assert!(image_span_range(
+            ImageSpan {
+                native_off: u64::MAX,
+                ..s
+            },
+            8,
+            16
+        )
+        .is_err());
     }
 }

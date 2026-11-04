@@ -73,6 +73,46 @@ impl KvExport {
             let _ = tx.send(image);
         }
     }
+
+    pub(super) fn produce(
+        &self,
+        key: Option<String>,
+        rows: u32,
+        handoff_started: Instant,
+        copy: impl FnOnce(&mut KvBytes, &mut dyn FnMut(KvBytes)) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let Some(key) = key else {
+            let error = RuntimeError::Rejected("P/D: this packet has no KV image".into());
+            self.deliver(Err(crate::serve::mux::fanout_err(
+                &error,
+                &error.to_string(),
+            )));
+            return Err(error);
+        };
+        let mut bytes = KvBytes::default();
+        let result = copy(&mut bytes, &mut |ready| {
+            self.deliver(Ok(KvImage {
+                key: key.clone(),
+                rows,
+                bytes: ready,
+                handoff_started,
+            }))
+        });
+        if let Err(error) = &result {
+            self.deliver(Err(crate::serve::mux::fanout_err(
+                error,
+                &error.to_string(),
+            )));
+        } else {
+            self.deliver(Ok(KvImage {
+                key,
+                rows,
+                bytes,
+                handoff_started,
+            }));
+        }
+        result
+    }
 }
 
 pub struct ReadyImport {
@@ -966,7 +1006,7 @@ mod tests {
         let (pending, mut deliver) = KvImport::pending(now, outcome.clone());
         let (ptx, prx) = stream::channel();
         let (respond, _client) = stream::channel();
-        let (image_tx, image_rx) = oneshot::channel();
+        let (sink, image_rx) = KvExport::new(outcome.clone());
         ptx.try_send(source_token(now)).unwrap();
         ptx.try_send(source_done(FinishReason::Length)).unwrap();
         drop(ptx);
@@ -984,8 +1024,22 @@ mod tests {
                 .is_err()
         );
         let image_released = Instant::now();
-        assert!(image_tx.send(Ok(payload(now).image)).is_ok());
-        let ready = collect.await.unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let producer = tokio::task::spawn_blocking(move || {
+            sink.produce(Some("key".into()), 3, now, |out, publish| {
+                *out = vec![42].into();
+                publish(vec![42].into());
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok(())
+            })
+        });
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(1), collect).await;
+        assert!(!producer.is_finished());
+        release_tx.send(()).unwrap();
+        producer.await.unwrap().unwrap();
+        let ready = ready.unwrap().unwrap();
         assert!(ready.first >= now && ready.first <= image_released);
         assert_eq!((ready.token, ready.cached_tokens), (120, 2));
         assert_eq!(ready.logprobs, payload(now).logprobs);
