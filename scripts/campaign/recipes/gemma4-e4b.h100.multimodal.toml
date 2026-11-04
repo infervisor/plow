@@ -10,6 +10,18 @@
 #
 # Gates: scripts/llm/gemma_logit_parity.py (served logprobs vs HF transformers bf16);
 # bench: scripts/llm/gemma_voice_bench.sh (plowbench conventions, vLLM reference same client).
+#
+# Audio encoder campaign (2026-11-04, H100, plowrt d22eacca4, vLLM 0.29 same checkpoint and client,
+# scripts/mm/load.py --perf, 40 LibriSpeech clips, 128 output tokens, 2 reps): sparse log-mel filter
+# sums (08a3bfe83, 26.6 -> 2.8 ms/6 s clip) and the fused conformer sidecar (d22eacca4: split-K
+# dense, clamp/SiLU/round epilogues, one-op light conv; 76 -> 42 instructions/layer; whole encoder
+# 400/1000/2000/3000 frames 8.72/10.64/14.12/19.66 -> 6.35/8.31/11.61/16.45 ms). Served ABBA,
+# base / new / vLLM: audio TTFT p50/p99 c1 72/199 -> 33/77 (vLLM 149/182), c8 161/249 -> 129/159
+# (345/467), c32 469/620 -> 334/487 (806/1082) ms; c32 out tok/s 2900 -> 3224 (2221); TPOT and the
+# text cells unchanged (model.pkt byte-identical). WER 0.1047 -> 0.1032 (vLLM 0.1047). Gates on the
+# new packet: llm_logit_parity PASS (top1 0.9948, KL 7.5e-4), mm_parity PASS 10/10, encoders 22/22
+# (cos >= 0.9996); FP32-ref/strict report unchanged from the text packet (MATCHED, EQUIVALENT).
+# Evidence: <lab scratch>/e4b-audio/p2/{audio,gate-mm2}, p1/{gate-text,report}.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
