@@ -520,11 +520,7 @@ impl GpuEngine {
             // cuMemCreate + map + set_access per unit, serial on the mux tick) cost 26B BF16 at
             // 1.8 sessions/s TTFT P99 1688 ms against 680 ms with every slot parked.
             let park = geo.batch;
-            if crate::config::RuntimeConfig::get().vmm_ring_recycle {
-                rings.enable_handle_recycling(crate::memory::vmm::kv_pool_cap());
-            } else {
-                rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
-            }
+            rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
             tracing::info!(
                 park,
                 slot_mib = rings.slot_charge() >> 20,

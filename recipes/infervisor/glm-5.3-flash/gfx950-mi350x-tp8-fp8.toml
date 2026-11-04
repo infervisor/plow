@@ -210,7 +210,7 @@ args = [
 # 0.2 ms host per 8x1k pack), `PLOW_AMD_PACKED_LEAN_KDA_BATCH = "1"` (each lean KDA segment of a packed launch is one
 # dispatch over the device span table, *_spans_gfx950.elf; isl1024 c128 +6.3%), `PLOW_KDA_CARRY_SPLIT = "4"` (prefill
 # key-fed carry split over the sequence: affine state recurrence, parallel segments + combine + fix; 8k -3%).
-# Decode rows riding the packed prefill (PLOW_AMD_MIXED_RIDE_TRIM/_LONE) measured -4..-23% and stays off.
+# Decode rows riding the packed prefill on trimmed or lone chunks measured -4..-23% (removed).
 # v19: `PLOW_PF_HOLD = "8192"` (prefill admission hold: rows 8192, 400 ms, min 16 decoding; isl1024 c64/c128
 # +3.5%, TTFT unchanged; 16384 added 190 ms TTFT), `PLOW_AMD_KARG_CHAIN_FLUSH = "1"` (one uncached
 # kernarg readback per deferred chain instead of per slot; enqueue 631 -> 295 us/token), `PLOW_TP_RANK_POOL = "1"`

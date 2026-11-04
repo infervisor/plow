@@ -845,31 +845,10 @@ pub(crate) struct GroupedDims {
     pub fp8: bool,
 }
 
-/// Device `i32[groups]` arrays of a grouped attention GEMM's per-group shapes (see
-/// [`AttentionGemm`]): `hd` every entry the head dim, `m` score rows, `n` the 8-aligned KV
-/// extent, `ld_s` / `ld_p` the score row pitch in S / P elements. Rewritten on the device
-/// before each launch; a group with `m = 0` does nothing.
-pub(crate) struct GroupedAttention {
-    pub groups: u32,
-    pub head_dim: u32,
-    pub hd: u64,
-    pub m: u64,
-    pub n: u64,
-    pub ld_s: u64,
-    pub ld_p: u64,
-    /// Expected shapes; only steer the heuristic.
-    pub average_m: u32,
-    pub average_n: u32,
-}
-
 /// One column-major grouped layout: `(dtype, rows, cols, ld)` device `i32` arrays.
 type GroupedLayout = (i32, u64, u64, u64);
 
 impl Lt {
-    pub(crate) fn has_grouped(&self) -> bool {
-        self.api.cublasLtGroupedMatrixLayoutCreate.is_some()
-    }
-
     /// The plan comes back unselected: every runnable heuristic candidate is a
     /// [`GroupedPlan::candidates`] entry, best-first by the heuristic.
     pub(crate) fn grouped_plan(self: &Arc<Self>, dims: &GroupedDims) -> Result<GroupedPlan> {
@@ -893,44 +872,6 @@ impl Lt {
             ],
         )?;
         Ok(plan)
-    }
-
-    /// The grouped form of [`Self::attention_plan`]: `alpha` scales the scores. The plan comes
-    /// back unselected: every heuristic candidate is a [`GroupedPlan::candidates`] entry.
-    pub(crate) fn grouped_attention_plan(
-        self: &Arc<Self>,
-        kind: AttentionGemm,
-        scores_f32: bool,
-        alpha: f32,
-        dims: &GroupedAttention,
-    ) -> Result<GroupedPlan> {
-        let hd = u64::from(dims.head_dim);
-        let (layouts, averages) = match kind {
-            AttentionGemm::Scores => (
-                [
-                    (14, dims.hd, dims.n, dims.hd),
-                    (14, dims.hd, dims.m, dims.hd),
-                    (if scores_f32 { 0 } else { 14 }, dims.n, dims.m, dims.ld_s),
-                ],
-                [hd, u64::from(dims.average_n), u64::from(dims.average_m)],
-            ),
-            AttentionGemm::Values => (
-                [
-                    (14, dims.hd, dims.n, dims.hd),
-                    (14, dims.n, dims.m, dims.ld_p),
-                    (14, dims.hd, dims.m, dims.hd),
-                ],
-                [u64::from(dims.average_n), hd, u64::from(dims.average_m)],
-            ),
-        };
-        self.grouped_plan_raw(
-            kind == AttentionGemm::Scores,
-            false,
-            alpha,
-            dims.groups,
-            layouts,
-            averages,
-        )
     }
 
     /// `layouts` = `[W, A, C]`; `averages` = `[reduction dim, D rows, D cols]` for the heuristic.
@@ -1506,22 +1447,6 @@ impl GroupedPlan {
     pub(crate) fn select(&mut self, index: usize) {
         self.algo = self.candidates[index];
         self.candidates.clear();
-    }
-
-    /// The opaque algorithm of candidate `index`, to hand another engine (see `select_algo`).
-    pub(crate) fn candidate_algo(&self, index: usize) -> [u64; 8] {
-        self.candidates[index].data
-    }
-
-    /// Select the candidate whose algorithm is `data`; `false` when the heuristic did not offer it.
-    pub(crate) fn select_algo(&mut self, data: &[u64; 8]) -> bool {
-        match self.candidates.iter().position(|c| c.data == *data) {
-            Some(index) => {
-                self.select(index);
-                true
-            }
-            None => false,
-        }
     }
 
     /// `a`, `w`, `c` are device arrays of `groups` matrix pointers.

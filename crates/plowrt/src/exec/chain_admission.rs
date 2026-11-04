@@ -39,7 +39,6 @@ pub(crate) fn finish_all<E>(
 
 pub(crate) fn prepare_all<E>(
     ranks: usize,
-    timing: bool,
     mut needed: impl FnMut(usize) -> Result<bool, E>,
     finish: impl FnMut(usize) -> Result<(), E>,
     mut prepare: impl FnMut(usize) -> Result<(), E>,
@@ -48,12 +47,10 @@ pub(crate) fn prepare_all<E>(
     for rank in 0..ranks {
         changed |= needed(rank)?;
     }
-    if changed || timing {
+    if changed {
         finish_all(ranks, finish)?;
-        if changed {
-            for rank in 0..ranks {
-                prepare(rank)?;
-            }
+        for rank in 0..ranks {
+            prepare(rank)?;
         }
     }
     Ok(())
@@ -76,7 +73,6 @@ mod tests {
         let events = RefCell::new(Vec::new());
         prepare_all(
             3,
-            false,
             |r| {
                 events.borrow_mut().push(("check", r));
                 Ok::<_, ()>(r == 2)
@@ -107,25 +103,11 @@ mod tests {
         );
         prepare_all(
             3,
-            false,
             |_| Ok::<_, ()>(false),
             |_| panic!("cached CSR must not drain"),
             |_| panic!("cached CSR must not upload"),
         )
         .unwrap();
-        let finished = Cell::new(0);
-        prepare_all(
-            3,
-            true,
-            |_| Ok::<_, ()>(false),
-            |_| {
-                finished.set(finished.get() + 1);
-                Ok(())
-            },
-            |_| panic!("timing alone must not upload"),
-        )
-        .unwrap();
-        assert_eq!(finished.get(), 3);
     }
 
     #[test]
@@ -133,7 +115,6 @@ mod tests {
         assert_eq!(
             prepare_all(
                 3,
-                false,
                 |r| if r == 2 { Err(2) } else { Ok(true) },
                 |_| panic!("preflight failed"),
                 |_| panic!("preflight failed")
@@ -144,7 +125,6 @@ mod tests {
         assert_eq!(
             prepare_all(
                 3,
-                false,
                 |_| Ok(true),
                 |r| {
                     finished.borrow_mut().push(r);
@@ -163,7 +143,6 @@ mod tests {
         assert_eq!(
             prepare_all(
                 3,
-                false,
                 |_| Ok(true),
                 |_| Ok(()),
                 |r| {
@@ -400,7 +379,6 @@ mod tests {
             for _ in 0..1_000_000 {
                 prepare_all(
                     black_box(8),
-                    black_box(false),
                     |rank| {
                         let (prior, rows) = &black_box(&keys)[rank];
                         Ok::<_, ()>(

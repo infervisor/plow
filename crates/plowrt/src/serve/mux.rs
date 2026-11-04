@@ -4211,8 +4211,7 @@ fn run_one_tick(
                             |b: usize, k: usize| draws.get(b * quantum + k).copied().unwrap_or(0.0);
                         let sample = (!specs.is_empty())
                             .then_some((specs.as_slice(), &rng as &dyn Fn(usize, usize) -> f32));
-                        let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0))
-                            .and_then(|()| gpu_stage_cfg(&mut *e, &feeds, &mut slots, requested));
+                        let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0));
                         let t_call = crate::obs::host::on().then(Instant::now);
                         let t_step = Instant::now();
                         let cut = || quantum_cut.fire();
@@ -4220,7 +4219,7 @@ fn run_one_tick(
                             .turn
                             .is_some()
                             .then_some(&cut as &dyn Fn() -> bool);
-                        let res = staged.and_then(|_| {
+                        let res = staged.and_then(|()| {
                             e.multi_step_sampled_at_most(&feeds, requested, sample, cut, &mut toks)
                         });
                         match res {
@@ -4229,7 +4228,6 @@ fn run_one_tick(
                                     feeds.len(),
                                     t_step.elapsed().as_secs_f64() * 1e3 / k.max(1) as f64,
                                 );
-                                gpu_cfg_advance(&feeds, &mut slots, k);
                                 gpu_pen_counted(&*e, &mut slots, feeds.iter().map(|f| f.0), k);
                                 let t_emit =
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
@@ -4290,15 +4288,10 @@ fn run_one_tick(
                             };
                         let t_call = crate::obs::host::on().then(Instant::now);
                         let t_step = Instant::now();
-                        let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0))
-                            .and_then(|()| gpu_stage_cfg(&mut *e, &feeds, &mut slots, 1));
-                        let (cfg_dev, step_res) = match staged {
-                            Ok(d) => (
-                                d,
-                                e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks),
-                            ),
-                            Err(err) => (false, Err(err)),
-                        };
+                        let step_res = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0))
+                            .and_then(|()| {
+                                e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks)
+                            });
                         match step_res {
                             Ok(()) => {
                                 let ms = t_step.elapsed().as_secs_f64() * 1e3;
@@ -4322,10 +4315,7 @@ fn run_one_tick(
                                     note_fault(&mut tick_fault, &err);
                                     fail_feeds(&mut slots, &feeds, &arena, &err);
                                 }
-                                let cfg_drawn = if cfg_dev {
-                                    gpu_cfg_advance(&feeds, &mut slots, 1);
-                                    true
-                                } else {
+                                let cfg_drawn =
                                     match gpu_cfg_draws(&mut *e, &feeds, &mut slots, &mut toks) {
                                         Ok(drawn) => drawn,
                                         Err(err) => {
@@ -4333,8 +4323,7 @@ fn run_one_tick(
                                             fail_feeds(&mut slots, &feeds, &arena, &err);
                                             false
                                         }
-                                    }
-                                };
+                                    };
                                 if let Err(err) = gpu_batch_logprobs(
                                     &mut *e,
                                     feeds.iter().zip(toks.iter()).map(|(&(i, _), &t)| (i, i, t)),
@@ -5167,27 +5156,9 @@ fn run_one_tick(
             let mut ride_filled = false;
             while hold != PfHold::Held {
                 let now = Instant::now();
-                // PLOW_AMD_MIXED_RIDE_TRIM: the first pass also initializes fresh cursors until the
-                // pending rows fill the tick budget, so a trimmed member's tail packs with fresh
-                // prompts instead of running as its own lone launch.
-                let prep_rounds = if b2b_pass > 0 {
-                    1
-                } else if rt.amd.mixed_ride_trim && mixed_pack && b2b {
-                    cap
-                } else {
-                    0
-                };
+                let prep_rounds = usize::from(b2b_pass > 0);
                 let mut prep_failed = false;
                 for _ in 0..prep_rounds {
-                    if b2b_pass == 0 {
-                        let pending: u32 = (0..cap)
-                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
-                            .filter_map(|i| e.next_prefill_rows(i))
-                            .sum();
-                        if pending >= full_budget {
-                            break;
-                        }
-                    }
                     let fresh = (0..cap)
                         .filter(|&i| {
                             slots[i].as_ref().is_some_and(|s| {
@@ -5355,21 +5326,14 @@ fn run_one_tick(
                     // launch as one-row spans. A lone chunk stays on its isolated program, whose
                     // lean KDA objects the packed siblings lack: as a pack of one carrying the
                     // decode rows it measured 5-7% slower at isl4096 c32/c128.
-                    // PLOW_AMD_MIXED_RIDE_LONE: a lone chunk whose cursor is already packable (a
-                    // long prompt's later chunks) runs as a pack of one so the riders come along.
-                    let lone_ride = rt.amd.mixed_ride_lone
-                        && !launch.is_pack()
-                        && !slo_on
-                        && e.packable_prefill_span(launch.spans[0].slot as usize, full_budget)
-                            .is_some_and(|span| span.n_rows == launch.spans[0].n_rows);
                     let ride = mixed_pack
                         && !decoded_in_pack
-                        && (launch.is_pack() || lone_ride)
+                        && launch.is_pack()
                         && slots[..cap].iter().any(|s| {
                             s.as_ref()
                                 .is_some_and(|s| s.parked_at.is_none() && !s.out_ids.is_empty())
                         });
-                    if launch.is_pack() || (lone_ride && ride) {
+                    if launch.is_pack() {
                         let packed = launch.spans.clone();
                         let feeds: Vec<(usize, u32)> = if ride {
                             slots[..cap]
@@ -8536,62 +8500,6 @@ fn gpu_cfg_draws(
     })
 }
 
-/// Stage every fed CFG owner's next `steps` guided draws on the device (`plow_sample_cfg`),
-/// seeding its penalty history on the first. `Ok(false)` = no owner fed or no device CFG sampler
-/// (the host draws). The uniforms are the owner's next `steps` SplitMix draws, the host path's.
-#[cfg(feature = "cuda")]
-fn gpu_stage_cfg(
-    e: &mut crate::exec::gpu::GpuEngine,
-    feeds: &[(usize, u32)],
-    slots: &mut [Option<Slot>],
-    steps: usize,
-) -> Result<bool> {
-    if !gpu_cfg_device(e) {
-        return Ok(false);
-    }
-    let mut rows = Vec::new();
-    let mut draws = Vec::new();
-    for &(i, _) in feeds {
-        let Some(slot) = slots[i].as_mut().filter(|s| host_cfg(s)) else {
-            continue;
-        };
-        let (Some(run), Some(cfg)) = (
-            slot.cfg.as_mut(),
-            slot.speech.as_ref().and_then(|s| s.cfg.as_ref()),
-        ) else {
-            continue;
-        };
-        if !run.dev_seeded {
-            e.cfg_seed_history(i, cfg.history.iter().chain(&slot.out_ids).copied())?;
-            run.dev_seeded = true;
-        }
-        let p = &cfg.params;
-        let mut rng = run.rng.clone();
-        rows.push((
-            i,
-            crate::exec::gpu::DevCfg {
-                weight: p.cfg_weight,
-                penalty: p.repetition_penalty,
-                temp: if rng.is_some() { p.temperature } else { 0.0 },
-                top_p: p.top_p,
-                min_p: p.min_p,
-            },
-        ));
-        draws.extend((0..steps).map(|_| rng.as_mut().map_or(0.0, |r| r.unit())));
-    }
-    if rows.is_empty() {
-        return Ok(false);
-    }
-    e.stage_cfg(&rows, &draws, steps)?;
-    Ok(true)
-}
-
-/// CFG pairs draw on the device: the sampler object has `plow_sample_cfg` and `--cfg-device`.
-#[cfg(feature = "cuda")]
-fn gpu_cfg_device(e: &crate::exec::gpu::GpuEngine) -> bool {
-    e.cfg_sampling() && crate::config::RuntimeConfig::get().nv.cfg_device
-}
-
 /// A CFG owner whose draws are the generic sampler's (not a depth-stage pair's).
 #[cfg(feature = "cuda")]
 fn host_cfg(s: &Slot) -> bool {
@@ -8601,18 +8509,6 @@ fn host_cfg(s: &Slot) -> bool {
             .as_ref()
             .and_then(|sp| sp.depth)
             .is_some_and(|d| d.cfg_scale.is_some())
-}
-
-/// Advance every fed CFG owner's SplitMix past the `k` device draws it consumed.
-#[cfg(feature = "cuda")]
-fn gpu_cfg_advance(feeds: &[(usize, u32)], slots: &mut [Option<Slot>], k: usize) {
-    for &(i, _) in feeds {
-        if let Some(rng) = slots[i].as_mut().and_then(|s| s.cfg.as_mut()?.rng.as_mut()) {
-            for _ in 0..k {
-                rng.unit();
-            }
-        }
-    }
 }
 
 /// A CFG owner's next token from its (cond, uncond) rows of the step's bf16 logits.
