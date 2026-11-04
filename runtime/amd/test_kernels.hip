@@ -14,6 +14,22 @@
 #include "op_elementwise.h"
 #include "op_norm.h"
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+#include "op_gemm.h"
+#include "op_collective.h"
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void gemm_f32_parts_test(
+    float* out, const bf16* a, const bf16* w, unsigned m, unsigned n, unsigned k) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    if(m>32) d_gemm_f32(out,a,w,m,n,k,blockIdx.x,gridDim.x,lds);
+    else d_gemv_bf16_f32(out, a, w, m, n, k, blockIdx.x, gridDim.x);
+}
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void reduce_f32_parts_test(
+    bf16* out, const float* a, const float* b, unsigned n) {
+    const void* peers[2]={a,b};
+    d_xreduce_f32_parts(out,peers,0,2,n,blockIdx.x,gridDim.x);
+}
+#endif
+
 #if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
 extern "C" __global__ __launch_bounds__(PLOW_THREADS) void residual_f32_test(
     unsigned op, void* out, float* resid, const float* a, const bf16* b,

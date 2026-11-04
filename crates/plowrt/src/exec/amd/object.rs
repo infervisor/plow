@@ -711,6 +711,28 @@ pub(super) fn check_compiled_opcode_markers<'a>(
                 path.display()
             )));
         }
+        for inst in prog
+            .insts
+            .iter()
+            .filter(|d| packet::dev::xreduce_partial_f32(d.op, d.fj[0]))
+        {
+            if !syms.contains(&"plow_xr_partial_f32_1") {
+                return Err(RuntimeError::Device(format!(
+                    "packet/object MISMATCH: FP32 peer partials require `plow_xr_partial_f32_1` in {}", path.display())));
+            }
+            if inst.i[0] == 0
+                || inst.i[1] < 2
+                || inst.i[2] % 4 != 0
+                || inst.i[4..].iter().any(|&v| v != 0)
+                || inst.t[0] == packet::dev::TENSOR_NONE16
+                || inst.t[1..].iter().any(|&t| t != packet::dev::TENSOR_NONE16)
+                || inst.fj[1] != 0
+            {
+                return Err(RuntimeError::Device(
+                    "invalid FP32 peer partial collective".into(),
+                ));
+            }
+        }
         let required = prog
             .insts
             .iter()

@@ -103,6 +103,7 @@ mod rewrite_lower;
 pub mod rnnt;
 pub mod s3gen;
 pub mod segment_resource;
+mod tp_precision;
 pub mod tts;
 pub mod tune_demand;
 pub mod vad;
@@ -11383,6 +11384,16 @@ fn emit_dense_gqa(
 
     residual_precision::apply(&mut m, ecfg.residual_f32, &arch)
         .unwrap_or_else(|error| panic!("residual precision: {error}"));
+    tp_precision::apply(
+        &mut m,
+        ecfg.tp_partial_f32,
+        &arch,
+        [
+            (emitter.tn.og_tp, emitter.tn.og),
+            (emitter.tn.dg_tp, emitter.tn.dg),
+        ],
+    )
+    .unwrap_or_else(|error| panic!("TP partial precision: {error}"));
     let projection_bindings =
         projection_rewrite::apply(&mut m, &ecfg, &gpu, &arch, std::path::Path::new(&out))
             .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));

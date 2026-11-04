@@ -702,6 +702,27 @@ fn residual_f32_preserves_existing_norm_stride_and_gemma3_flags() {
 }
 
 #[test]
+fn tp_partial_f32_requires_object_marker_and_plain_geometry() {
+    let path = Path::new("interp_decode.elf");
+    let mut p = segmented_prog(&[DevOp::XReduce], &[0]);
+    p.insts[0].t = [packet::dev::TENSOR_NONE16; 8];
+    p.insts[0].t[0] = 0;
+    p.insts[0].i = [3840, 2, 0, 0, 0, 0, 0, 0];
+    p.insts[0].fj[0] = packet::dev::XREDUCE_PARTIAL_F32_MARK;
+    assert!(check_compiled_opcode_markers(&[], path, [&p])
+        .unwrap_err()
+        .to_string()
+        .contains("plow_xr_partial_f32_1"));
+    let syms = ["plow_xr_partial_f32_1"];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    p.insts[0].i[5] = 8;
+    assert!(check_compiled_opcode_markers(&syms, path, [&p])
+        .unwrap_err()
+        .to_string()
+        .contains("invalid FP32 peer"));
+}
+
+#[test]
 fn block_fp8_split3_requires_marker_and_geometry() {
     let path = Path::new("interp_decode_gq.elf");
     let syms = [

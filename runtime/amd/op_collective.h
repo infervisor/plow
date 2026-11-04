@@ -567,11 +567,31 @@ __device__ __forceinline__ void d_xreduce(bf16* out, const void* const* peer_scr
  *   deadline_ticks : s_memrealtime budget; if the fabric does not propagate the
  *                    system atomic the kernel bails (status |= 0xDEAD0000) instead of
  *                    hanging the queue. status may be NULL. */
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+__device__ __forceinline__ void d_xreduce_f32_parts(
+    bf16* out, const void* const* peer_scratch, uint32_t slot_bytes,
+    uint32_t nranks, uint32_t n, unsigned slice, unsigned nblk) {
+    for (uint32_t e = slice * PLOW_THREADS + threadIdx.x; e < n;
+         e += nblk * PLOW_THREADS) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < nranks; r++) {
+            const float* p = (const float*)((const char*)peer_scratch[r] + slot_bytes);
+            acc += as_glob(p)[e];
+        }
+        st_act1(&as_glob(out)[e], f2bf(acc));
+    }
+}
+#endif
+
 __device__ __forceinline__ void d_xreduce_oneshot(
     bf16* out, const void* const* peer_scratch, uint32_t* const* peer_gate,
     uint32_t nranks, uint32_t rank, uint32_t n, uint32_t slot_bytes,
     uint32_t gate_target, bool do_signal, uint64_t deadline_ticks, uint32_t* status,
-    unsigned slice, unsigned nblk) {
+    unsigned slice, unsigned nblk
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    , bool partial_f32 = false
+#endif
+    ) {
     __shared__ int bailed;
     if (threadIdx.x == 0) bailed = 0;
     __syncthreads();
@@ -594,6 +614,10 @@ __device__ __forceinline__ void d_xreduce_oneshot(
     __syncthreads();
     if (bailed) return;
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    if (partial_f32) d_xreduce_f32_parts(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+    else
+#endif
     d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
 }
 
@@ -620,6 +644,9 @@ __device__ __forceinline__ void d_xreduce_mega(
     uint32_t gslot_bytes = 0, uint32_t gcols = 0, uint32_t row_w = 0
 #if PLOW_XR_TRACE_PHASES
     , PlowTraceRec* xr_trace = nullptr
+#endif
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    , bool partial_f32 = false
 #endif
     ) {
     __shared__ int bailed;
@@ -662,6 +689,10 @@ __device__ __forceinline__ void d_xreduce_mega(
      * PLOW_CHAIN_BYPASS (knob-contract §7a-CHAIN): implementation cost zero, ceiling real. */
     if (threadIdx.x == 0) xctr_acquire();
     __syncthreads();
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    if (partial_f32) d_xreduce_f32_parts(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+    else
+#endif
     d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk, gslot_bytes, gcols, row_w);
     return;
 #endif
@@ -690,6 +721,10 @@ __device__ __forceinline__ void d_xreduce_mega(
 #endif
     if (bailed) return;
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+    if (partial_f32) d_xreduce_f32_parts(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+    else
+#endif
     d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk, gslot_bytes, gcols, row_w);
 #if PLOW_XR_TRACE_PHASES
     __syncthreads();

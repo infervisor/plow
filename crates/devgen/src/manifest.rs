@@ -2713,6 +2713,13 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
     {
         objects["residual_f32"] = json!({ "required": true });
     }
+    if m.progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|d| packet::dev::xreduce_partial_f32(d.op, d.f[0].to_bits()))
+    {
+        objects["xr_partial_f32"] = json!({ "required": true });
+    }
     let kda_intra_wave_items_required = m.progs.iter().any(|p| {
         p.stream.iter().any(|e| {
             e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0
@@ -3223,6 +3230,15 @@ pub fn config_header(manifest: &Value) -> String {
         )
     ));
     out.push_str("#define PLOW_PACKET_HAS_TOKEN_BATCH_INVENTORY 1\n");
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 {}\n",
+        u8::from(
+            manifest
+                .pointer("/objects/xr_partial_f32/required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        )
+    ));
     if manifest
         .pointer("/objects/packed_prefill/max_request_rows")
         .is_some()
@@ -4388,6 +4404,22 @@ mod tests {
                 config_header(&required).contains("#define PLOW_PACKET_REQUIRES_RESIDUAL_F32 1\n")
             );
         }
+    }
+
+    #[test]
+    fn tp_partial_f32_requirement_preserves_default_pairing() {
+        let mut m = model();
+        m.progs[0].insts.push(inst(DevOp::XReduce, [0; 8]));
+        let plain = build(&m, "gfx1201");
+        assert!(plain["objects"].get("xr_partial_f32").is_none());
+        m.progs[0].insts.last_mut().unwrap().f[0] =
+            f32::from_bits(packet::dev::XREDUCE_PARTIAL_F32_MARK);
+        let required = build(&m, "gfx1201");
+        assert_eq!(required["objects"]["xr_partial_f32"]["required"], true);
+        assert_ne!(pairing_hash(&plain), pairing_hash(&required));
+        assert!(
+            config_header(&required).contains("#define PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 1\n")
+        );
     }
 
     /// A packet whose object requirements changed must not keep its stamp: a same-recipe
