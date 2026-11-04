@@ -5,6 +5,7 @@
 //! own slot, joining one launch apart (different positions), each with its own chunk sizes.
 //! CODES.i32 = [items][FRAMES][frame_codes] little-endian i32 (else random codes).
 //! Prints per-stream rel-L2 / max |d| of the streamed PCM vs `decode.b1.f*` and sample counts.
+//! `CSC_DUMP=PREFIX` writes stream 0's PCM (raw f32) to PREFIX.stream.f32 and PREFIX.whole.f32.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -208,6 +209,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t += k;
     }
     report("single", 0, &got);
+    if let Ok(dir) = std::env::var("CSC_DUMP") {
+        // Raw f32 PCM of stream 0, streamed and whole, for cross-packet comparison.
+        std::fs::write(format!("{dir}.stream.f32"), bytemuck::cast_slice(&got))?;
+        std::fs::write(format!("{dir}.whole.f32"), bytemuck::cast_slice(&whole[0]))?;
+    }
     let med = |v: &mut Vec<f64>| {
         v.sort_by(f64::total_cmp);
         v.get(v.len() / 2).copied().unwrap_or(0.0)

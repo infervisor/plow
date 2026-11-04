@@ -1879,7 +1879,8 @@ impl StageProgram {
             | (u32::from(stage.weight_tap_major) << 15)
             | (u32::from(stage.wgmma && stage.split_bf16) << 17)
             | (u32::from(stage.weight_split) << 18)
-            | (u32::from(stage.dual_alpha) << 19);
+            | (u32::from(stage.dual_alpha) << 19)
+            | (u32::from(conv1d_warp(&stage, transpose, out_rows).is_some()) << 16);
         let op = if transpose {
             DevOp::ConvTranspose1dF32
         } else {
@@ -2620,11 +2621,58 @@ fn tensor_bytes(rows: u32, columns: u32, element_bytes: u32) -> Result<u64, Stri
         .ok_or_else(|| "tensor size overflows".into())
 }
 
+/// SP_ARENA_FLOATS of the sm_90a speech object and its per-warp weight slots (op_speech_f32.cuh).
+const SPV_ARENA_FLOATS: u64 = 25856;
+const SPV_SLOT_FLOATS: u64 = 8 * 512;
+
+/// Conv1dF32 flag bit 16 (`PLOW_EMIT_CODEC_ROW_GEMV`, wgmma convs, one group): `Rows` when at
+/// most 16 output rows of a zero-padded conv fit `sp_conv1d_rows` (padded input staged in smem,
+/// one warp per output channel sharing each weight across the rows), `Warp` when at most 4 output
+/// channels run one warp per output element (`sp_conv1d_warp`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConvWarp {
+    Rows,
+    Warp,
+}
+
+fn conv1d_warp(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32) -> Option<ConvWarp> {
+    if !crate::emit_config::active().codec_row_gemv
+        || !stage.wgmma
+        || transpose
+        || stage.groups != 1
+    {
+        return None;
+    }
+    let k = u64::from(stage.in_channels) * u64::from(stage.kernel);
+    let batch = u64::from(stage.batch);
+    let staged = batch
+        * u64::from(stage.in_rows + stage.pad_before + stage.pad_after)
+        * u64::from(stage.in_channels);
+    if batch * u64::from(out_rows) <= 16
+        && stage.pad_mode == PadMode::Zero
+        && k % 4 == 0
+        && !stage.weight_f16
+        && staged + SPV_SLOT_FLOATS <= SPV_ARENA_FLOATS
+    {
+        return Some(ConvWarp::Rows);
+    }
+    (stage.out_channels <= 4 && k >= 32).then_some(ConvWarp::Warp)
+}
+
 /// Conv1dF32 / ConvTranspose1dF32 slices, mirroring the interpreter's paths (op_speech_f32.cuh
-/// d_conv1d_f32): depthwise 64-row x 64-channel tiles; the direct form per 256 outputs; the GEMM
-/// form 64x64 tiles per (group, phase). `slices` caps the result at the machine.
+/// d_conv1d_f32): bit 16 one warp per output; depthwise 64-row x 64-channel tiles; the direct
+/// form per 256 outputs; the GEMM form 64x64 tiles per (group, phase). `slices` caps the result at the machine.
 fn conv1d_units(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32, n_cu: u32) -> u64 {
     let (batch, cout) = (u64::from(stage.batch), u64::from(stage.out_channels));
+    match conv1d_warp(stage, transpose, out_rows) {
+        Some(ConvWarp::Rows) => return cout.div_ceil(8).min(u64::from(n_cu)),
+        Some(ConvWarp::Warp) => {
+            return (batch * u64::from(out_rows) * cout)
+                .div_ceil(8)
+                .min(u64::from(n_cu))
+        }
+        None => {}
+    }
     let cg = stage.in_channels / stage.groups;
     let ng = stage.out_channels / stage.groups;
     if !transpose && cg == 1 && ng == 1 {

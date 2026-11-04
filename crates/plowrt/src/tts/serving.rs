@@ -973,6 +973,7 @@ async fn speech_with(
         Err(e) => return crate::serve::json_rejection(e),
     };
     let t_arrive = Instant::now();
+    crate::obs::ttft::reset();
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
@@ -2442,11 +2443,17 @@ async fn stream_task(
                     break;
                 };
                 let codes = frames[emitted * fc..(emitted + k) * fc].to_vec();
-                model
-                    .codec
-                    .step(slot, codes, k, urgency, due)
-                    .await
-                    .map(|pcm| (pcm, 0, emitted + k, k))
+                let t_codec = (crate::obs::ttft::on() && emitted == 0).then(|| {
+                    if let Some(t) = first_frame_at {
+                        crate::obs::ttft::SPEECH_FRAMES.add(t.elapsed().as_nanos() as u64);
+                    }
+                    Instant::now()
+                });
+                let r = model.codec.step(slot, codes, k, urgency, due).await;
+                if let Some(t) = t_codec {
+                    crate::obs::ttft::SPEECH_CODEC.add(t.elapsed().as_nanos() as u64);
+                }
+                r.map(|pcm| (pcm, 0, emitted + k, k))
             } else {
                 let Some((s, e, upto)) =
                     stream_step(n, emitted, done, model.codec.window, lookahead, chunk)
@@ -2498,6 +2505,7 @@ async fn stream_task(
                     if !bytes.is_empty() {
                         if first.is_none() {
                             ticket.first_audio();
+                            crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, 0);
                         }
                         first.get_or_insert_with(|| t_arrive.elapsed());
                         playing.get_or_insert_with(Instant::now);

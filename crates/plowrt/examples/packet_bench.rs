@@ -33,7 +33,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iters: usize = pos.get(3).map_or(Ok(50), |s| s.parse())?;
     let mut rt = CudaPacketRuntime::load(path, 0)?;
     let asset = PacketAsset::load(path)?;
-    let pipeline = asset.bind(pos[1], &rt)?;
+    // PIPELINE is a pipeline name or its driver (`codec.v1`).
+    let pipeline = asset
+        .bind(pos[1], &rt)
+        .or_else(|_| asset.bind_driver(pos[1], &rt))?;
     if each {
         for (n, program) in pipeline.program_sequence(pos[2])?.into_iter().enumerate() {
             for _ in 0..3 {
@@ -102,7 +105,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for cap in 0..=insts.len() {
             rt.set_debug_max_inst(cap as u32)?;
             let op = cap.checked_sub(1).map_or(-1, |i| i64::from(insts[i].op));
-            println!("{{\"cap\":{cap},\"op\":{op},\"us\":{:.2}}}", time(&mut rt)?);
+            let (blocks, i, j) = cap.checked_sub(1).map_or((0, [0; 8], [0; 3]), |k| {
+                (insts[k].blocks, insts[k].i, insts[k].fj)
+            });
+            println!(
+                "{{\"cap\":{cap},\"op\":{op},\"blocks\":{blocks},\"i\":{i:?},\"fj\":{j:?},\"us\":{:.2}}}",
+                time(&mut rt)?
+            );
         }
         rt.set_debug_max_inst(u32::MAX)?;
     }
