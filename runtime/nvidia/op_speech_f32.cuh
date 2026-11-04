@@ -1730,11 +1730,14 @@ __device__ __forceinline__ unsigned sp_tcn_shape(unsigned M, unsigned N, unsigne
 
 /* DenseGemmF32 (170). flags: 1 = bf16-round, 2 = bf16 erf-GELU (implies the round), 4 = bf16
  * weights, 8 = A (and f32 W) bf16-representable -> bf16 tensor cores, 16 = 3xTF32 tensor cores.
+ * Post chain (no prologue, no reference split; t5 = f32 [lo0, hi0, lo1, hi1]), after the round:
+ * 0x100 clamp to [lo0, hi0], 0x200 SiLU then bf16 round, 0x400 clamp to [lo1, hi1].
  * i5 != 0: weight row stride, and i6 < i5 names a one-hot weight column added in. t4: optional
  * split-K scratch (sp_tc_gemm); with flag 128 instead per-row reference rows (SpRefSplit, j0 units) and
  * t5 the optional packed split-K scratch (sp_tcn_gemm). */
 struct SpDenseEpi {
     float* out; const float* bias; const void* w; unsigned n, stride, onehot, flags, relu;
+    float lo0 = 0.f, hi0 = 0.f, lo1 = 0.f, hi1 = 0.f;
     __device__ void operator()(unsigned m, unsigned c, float acc) const {
         float value = bias ? __fadd_rn(acc, bias[c]) : acc;
         if (onehot < stride) {
@@ -1744,6 +1747,9 @@ struct SpDenseEpi {
         }
         if (flags & 2u) value = sp_gelu_erf_bf16(value);
         else if (flags & 1u) value = sp_bf16(value);
+        if (flags & 0x100u) value = fminf(fmaxf(value, lo0), hi0);
+        if (flags & 0x200u) value = sp_bf16(__fdiv_rn(value, __fadd_rn(1.0f, expf(-value))));
+        if (flags & 0x400u) value = fminf(fmaxf(value, lo1), hi1);
         out[(size_t)m * n + c] = relu ? fmaxf(value, 0.0f) : value;
     }
 };
@@ -1760,13 +1766,17 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
                                         unsigned m, unsigned n, unsigned k, unsigned activation,
                                         unsigned a_row0, unsigned wstride_op, unsigned onehot,
                                         unsigned flags, unsigned slice, unsigned nblk, float* arena,
-                                        float* scratch, const SpLn* ln, const SpRefSplit* rs = nullptr) {
+                                        float* scratch, const SpLn* ln, const SpRefSplit* rs = nullptr,
+                                        const float* post = nullptr) {
     arena = sp_smem;
     const unsigned stride = wstride_op ? wstride_op : k;
     x += (size_t)a_row0 * k;
     const SpRowF32 la{x, k, (k & 3u) == 0 && sp_aligned(x, 16)};
-    const SpDenseEpi ep{out, bias, w, n, stride, wstride_op ? onehot : 0xFFFFFFFFu, flags,
-                        activation == 1u};
+    SpDenseEpi ep{out, bias, w, n, stride, wstride_op ? onehot : 0xFFFFFFFFu, flags, activation == 1u};
+    if (flags & 0x700u) {
+        if (!post || ln || rs) __trap();
+        ep.lo0 = post[0], ep.hi0 = post[1], ep.lo1 = post[2], ep.hi1 = post[3];
+    }
     if (flags & 4u) {
         const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
         if ((flags & 8u) && (k & 7u) == 0 && (stride & 7u) == 0 && sp_aligned(x, 16) && sp_aligned(wb, 16)) {
@@ -2816,20 +2826,22 @@ static __device__ __noinline__ void d_broadcast_add_f32(float* out, const float*
 
 /* CausalDepthwiseConv1dF32 (167): f16 weights [channel][kernel], taps summed in order. Rows come in
  * items of `item_rows` (0 = one item); taps stop at the item's first row. */
-static __device__ __noinline__ void d_causal_dwconv1d_f32(float* out, const float* x, const uint16_t* w,
+/* flags (i4): 1 = f32 weights (else fp16), 2 = bf16-round the output. */
+static __device__ __noinline__ void d_causal_dwconv1d_f32(float* out, const float* x, const void* w,
                                              unsigned rows, unsigned channels, unsigned kernel,
-                                             unsigned item_rows, unsigned slice, unsigned nblk) {
+                                             unsigned item_rows, unsigned flags, unsigned slice, unsigned nblk) {
     if (!item_rows) item_rows = rows;
     SP_FOR_EACH(i, rows * channels) {
         const unsigned r = i / channels, c = i - r * channels, ir = r % item_rows;
         float sum = 0.f;
         for (unsigned tap = 0; tap < kernel; tap++) {
             const int src = (int)ir + (int)tap + 1 - (int)kernel;
+            const size_t wi = (size_t)c * kernel + tap;
             if (src >= 0)
                 sum = __fadd_rn(sum, __fmul_rn(x[(size_t)(r - ir + src) * channels + c],
-                                               sp_f16(w[(size_t)c * kernel + tap])));
+                                               (flags & 1u) ? ((const float*)w)[wi] : sp_f16(((const uint16_t*)w)[wi])));
         }
-        out[i] = sum;
+        out[i] = (flags & 2u) ? sp_bf16(sum) : sum;
     }
 }
 
@@ -3794,7 +3806,7 @@ static __device__ __noinline__ void d_binary_f32(const PlowDevInst* in, void* co
     const float* b = (const float*)SP_TEN(2);
     const unsigned items = in->i[0], rows = in->i[1], width = in->i[2], op = in->i[3];
     if (!rows || !width || op > 5u || (uint64_t)items * rows * width > 0xFFFFFFFFull) return;
-    const bool scaled = in->i[7] & 1u;
+    const bool scaled = in->i[7] & 1u, rounded = in->i[7] & 2u;
     const float scale = in->fj[0].f;
     const unsigned bis = in->i[4], brs = in->i[5], bcs = in->i[6];
     /* float4 form: b contiguous (column stride 1, 16B-aligned rows) or broadcast along the row. */
@@ -3817,6 +3829,7 @@ static __device__ __noinline__ void d_binary_f32(const PlowDevInst* in, void* co
                     if (scaled)
                         r = make_float4(__fmul_rn(scale, r.x), __fmul_rn(scale, r.y), __fmul_rn(scale, r.z),
                                         __fmul_rn(scale, r.w));
+                    if (rounded) r = make_float4(sp_bf16(r.x), sp_bf16(r.y), sp_bf16(r.z), sp_bf16(r.w));
                     ((float4*)out)[e] = r;
                 });
             return;
@@ -3828,8 +3841,8 @@ static __device__ __noinline__ void d_binary_f32(const PlowDevInst* in, void* co
                 return make_float2(a[e], b[(size_t)item * in->i[4] + (size_t)row * in->i[5] + (size_t)c * in->i[6]]);
             },
             [&](unsigned e, float2 v) {
-                const float r = f(v.x, v.y);
-                out[e] = scaled ? __fmul_rn(scale, r) : r;
+                const float r = f(v.x, v.y), y = scaled ? __fmul_rn(scale, r) : r;
+                out[e] = rounded ? sp_bf16(y) : y;
             });
     };
     switch (op) {
@@ -6241,10 +6254,12 @@ static __device__ __noinline__ void d_rmsnorm_f32(const PlowDevInst* in, void* c
         const float* xr = x + (size_t)r * stride + (size_t)g * gs;
         float* orow = out + (size_t)r * stride + (size_t)g * gs;
         float s = 0.f;
+#pragma unroll 8
         for (unsigned c = lane; c < gw; c += 32u) s = fmaf(xr[c], xr[c], s);
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
         const float inv = __frcp_rn(sqrtf(__fadd_rn(__fdiv_rn(s, (float)gw), eps)));
+#pragma unroll 8
         for (unsigned c = lane; c < gw; c += 32u) {
             float v = __fmul_rn(xr[c], inv);
             if (gamma) v = __fmul_rn(v, gamma[(flags & 1u) ? g * gw + c : c]);
@@ -6417,8 +6432,8 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         d_glu_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], in->i[1], slice, nblk);
         break;
     SP_CASE(CAUSAL_DEPTHWISE_CONV1D_F32)
-        d_causal_dwconv1d_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const uint16_t*)SP_TEN(2), in->i[0],
-                              in->i[1], in->i[2], in->i[3], slice, nblk);
+        d_causal_dwconv1d_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), in->i[0],
+                              in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk);
         break;
     SP_CASE(RELATIVE_ATTENTION_F32)
         d_relative_attention_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2),
@@ -6447,7 +6462,8 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         }
         d_dense_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],
                          in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice,
-                         nblk, arena, (float*)SP_TEN(4), nullptr);
+                         nblk, arena, (float*)SP_TEN(4), nullptr, nullptr,
+                         (in->i[7] & 0x700u) ? (const float*)SP_TEN(5) : nullptr);
         break;
     SP_CASE(EMBED_F16_F32)
         d_embed_f16_f32((float*)SP_TEN(0), (const uint16_t*)SP_TEN(1), (const unsigned*)SP_TEN(2), in->i[0],

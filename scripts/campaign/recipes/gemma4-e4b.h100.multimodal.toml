@@ -10,6 +10,18 @@
 #
 # Gates: scripts/llm/gemma_logit_parity.py (served logprobs vs HF transformers bf16);
 # bench: scripts/llm/gemma_voice_bench.sh (plowbench conventions, vLLM reference same client).
+#
+# Audio encoder campaign (2026-11-04, H100, plowrt d22eacca4, vLLM 0.29 same checkpoint and client,
+# scripts/mm/load.py --perf, 40 LibriSpeech clips, 128 output tokens, 2 reps): sparse log-mel filter
+# sums (08a3bfe83, 26.6 -> 2.8 ms/6 s clip) and the fused conformer sidecar (d22eacca4: split-K
+# dense, clamp/SiLU/round epilogues, one-op light conv; 76 -> 42 instructions/layer; whole encoder
+# 400/1000/2000/3000 frames 8.72/10.64/14.12/19.66 -> 6.35/8.31/11.61/16.45 ms). Served ABBA,
+# base / new / vLLM: audio TTFT p50/p99 c1 72/199 -> 33/77 (vLLM 149/182), c8 161/249 -> 129/159
+# (345/467), c32 469/620 -> 334/487 (806/1082) ms; c32 out tok/s 2900 -> 3224 (2221); TPOT and the
+# text cells unchanged (model.pkt byte-identical). WER 0.1047 -> 0.1032 (vLLM 0.1047). Gates on the
+# new packet: llm_logit_parity PASS (top1 0.9948, KL 7.5e-4), mm_parity PASS 10/10, encoders 22/22
+# (cos >= 0.9996); FP32-ref/strict report unchanged from the text packet (MATCHED, EQUIVALENT).
+# Evidence: <lab scratch>/e4b-audio/p2/{audio,gate-mm2}, p1/{gate-text,report}.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -26,6 +38,7 @@ vendor = "nvidia"
 isa = "sm_90a"
 sku = "H100 SXM5"
 units = 132
+toolchain = "cuda-12.9-nix"
 num_gpus = 1
 parallel = "tp"
 
@@ -127,6 +140,15 @@ python = "{env:PYREF}"
 hf_dir = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
 top1_min = 0.98
 kl_mean_max = 2e-3
+# Same FP32-reference gate as the production recipe (the sidecar emit must not move text quality).
+[gates.llm_fp32_ref]
+reference = "{env:E4B_FP32_REF}"
+concurrency = [1, 8, 32]
+vllm_hf = "{hf:google/gemma-4-E4B-it@ee0ef6023621cff504d758262d4e04895a5af4a2}"
+vllm_python = "{env:VLLM_PYTHON}"
+vllm_args = "--served-model-name gemma-4-e4b --max-model-len 8192 --gpu-memory-utilization 0.85 --max-num-seqs 256 --limit-mm-per-prompt '{\"image\":0,\"audio\":0}'"
+timeout_s = 3600
+needle_min = 0.0
 
 # 2026-10-10 (mm-harden a00d40f2, packet built from this recipe): mm_parity PASS 10/10 cases,
 # refusals 11/11, encoders 22/22 (cos >= 0.9996); llm_logit_parity PASS top1 0.9948, KL 7.5e-4.

@@ -16,8 +16,8 @@ use serde_json::Value;
 
 use crate::checkpoint::TensorReader;
 use crate::pipeline::{
-    AttentionF32Stage, DenseActivation, DenseF32ProgramStage, DenseWeight, GatherRowsF32Stage,
-    PacketPrefix, StageProgram, TensorRef,
+    AttentionF32Stage, DenseActivation, DenseF32ProgramStage, DensePost, DenseWeight,
+    GatherRowsF32Stage, PacketPrefix, StageProgram, TensorRef,
 };
 
 pub const VISION_PACKET: &str = "mm_vision.pkt";
@@ -110,6 +110,7 @@ struct Seq {
     last: Option<u32>,
     init: BTreeMap<String, Init>,
     tag: u32,
+    split_k: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +118,8 @@ struct Clip {
     lo: f32,
     hi: f32,
 }
+
+const NO_CLIP: Clip = Clip { lo: 0.0, hi: 0.0 };
 
 impl Seq {
     fn p(&mut self) -> &mut StageProgram {
@@ -241,9 +244,38 @@ impl Seq {
         weight: &str,
         bias: Option<&str>,
     ) -> Result<u32, String> {
+        self.dense_post(x, out, rows, k, n, weight, bias, None, false, None)
+    }
+
+    /// [`Self::dense`] then, in its epilogue: clamp to `clip_out`, SiLU + bf16 round, clamp to
+    /// `clip_next` (the next linear's input clip; `out` must have no other consumer).
+    #[allow(clippy::too_many_arguments)]
+    fn dense_post(
+        &mut self,
+        x: u32,
+        out: &str,
+        rows: u32,
+        k: u32,
+        n: u32,
+        weight: &str,
+        bias: Option<&str>,
+        clip_out: Option<Clip>,
+        silu_round: bool,
+        clip_next: Option<Clip>,
+    ) -> Result<u32, String> {
         let deps = self.deps();
         let w = self.weight_bf16(weight, u64::from(n) * u64::from(k));
+        let split_k = self.split_k;
         let b = bias.map(|name| self.weight_f32(name, u64::from(n)));
+        let post = (clip_out.is_some() || silu_round || clip_next.is_some()).then(|| {
+            let (o, x) = (clip_out.unwrap_or(NO_CLIP), clip_next.unwrap_or(NO_CLIP));
+            DensePost {
+                table: self.constant(&format!("{weight}.post"), vec![o.lo, o.hi, x.lo, x.hi]),
+                clamp: clip_out.is_some(),
+                silu_round,
+                clamp_next: clip_next.is_some(),
+            }
+        });
         let e = self.p().dense_f32(
             x,
             &deps,
@@ -260,6 +292,8 @@ impl Seq {
                 operands_bf16_exact: true,
                 tf32x3: false,
                 layer_norm: None,
+                split_k,
+                post,
             },
         )?;
         Ok(self.done(e))
@@ -277,7 +311,7 @@ impl Seq {
         weight: u32,
         bf16_exact: bool,
     ) -> Result<u32, String> {
-        let deps = self.deps();
+        let (deps, split_k) = (self.deps(), self.split_k);
         let e = self.p().dense_f32(
             x,
             &deps,
@@ -294,6 +328,8 @@ impl Seq {
                 operands_bf16_exact: bf16_exact,
                 tf32x3: !bf16_exact,
                 layer_norm: None,
+                split_k,
+                post: None,
             },
         )?;
         Ok(self.done(e))
@@ -313,8 +349,7 @@ impl Seq {
         clip_out: Option<Clip>,
     ) -> Result<u32, String> {
         let input = self.clamp(x, Some(&format!("{out}.in")), rows, k, clip_in)?;
-        let y = self.dense(input, out, rows, k, n, weight, None)?;
-        self.clamp(y, None, rows, n, clip_out)
+        self.dense_post(input, out, rows, k, n, weight, None, clip_out, false, None)
     }
 
     /// Grouped RMSNorm (RmsNormF32), bf16-rounded output.
@@ -414,20 +449,11 @@ impl Seq {
                     b_strides[0],
                     b_strides[1],
                     b_strides[2],
-                    0,
+                    u32::from(round) << 1,
                 ];
             },
         )?;
-        let y = self.done(e);
-        if round {
-            self.round(
-                y,
-                1,
-                u32::try_from(elements).map_err(|_| "binary too large")?,
-            )
-        } else {
-            Ok(y)
-        }
+        Ok(self.done(e))
     }
 
     fn add(&mut self, a: u32, b: u32, rows: u32, width: u32) -> Result<u32, String> {
@@ -963,6 +989,7 @@ impl Towers {
         frames.sort_unstable_by(|a, b| b.cmp(a));
         frames.dedup();
         let mut seq = new_seq(n_cu, target);
+        seq.split_k = true;
         let mut programs = BTreeMap::new();
         for &n in &frames {
             let first = seq.prefix.as_ref().map_or(0, |p| p.programs.len());
@@ -1167,6 +1194,7 @@ fn new_seq(n_cu: u32, target: u32) -> Seq {
         last: None,
         init: BTreeMap::new(),
         tag: 0,
+        split_k: false,
     }
 }
 
@@ -1700,29 +1728,38 @@ fn lower_audio_capacity(
             Some(&format!("{block}pre_layer_norm.weight")),
             a.eps,
         )?;
-        let l1 = format!("{block}ffw_layer_1");
-        let y = seq.clipped(
+        let (l1, l2) = (format!("{block}ffw_layer_1"), format!("{block}ffw_layer_2"));
+        // ffw_layer_1 -> clamp -> SiLU -> bf16 -> ffw_layer_2's input clamp, all in one epilogue.
+        let n = seq.clamp(
+            n,
+            Some("act.mm.a.ffn_mid.in"),
+            t2,
+            h,
+            clip(ckpt, a.clipped, &l1, "input")?,
+        )?;
+        let y = seq.dense_post(
             n,
             "act.mm.a.ffn_mid",
             t2,
             h,
             4 * h,
             &format!("{l1}.linear.weight"),
-            clip(ckpt, a.clipped, &l1, "input")?,
+            None,
             clip(ckpt, a.clipped, &l1, "output")?,
+            true,
+            clip(ckpt, a.clipped, &l2, "input")?,
         )?;
-        seq.unary(y, None, t2, 4 * h, ACT_SILU, 0.0, 0.0)?;
-        seq.round(y, t2, 4 * h)?;
-        let l2 = format!("{block}ffw_layer_2");
-        let y = seq.clipped(
+        let y = seq.dense_post(
             y,
             "act.mm.a.ffn_out",
             t2,
             4 * h,
             h,
             &format!("{l2}.linear.weight"),
-            clip(ckpt, a.clipped, &l2, "input")?,
+            None,
             clip(ckpt, a.clipped, &l2, "output")?,
+            false,
+            None,
         )?;
         seq.rms(
             y,
@@ -1865,29 +1902,26 @@ fn lower_audio_capacity(
         )?;
         seq.done(e);
         seq.round(g, t2, h)?;
-        // Causal depthwise conv as shifted row gathers times per-channel taps, accumulated in f32
-        // and rounded once: y[t] = sum_k w[:, k] * g[t - (K - 1) + k]. (The speech Conv1d arm
-        // would add ~300k PTX lines to the speech object for one op.)
-        let wk = ckpt.f32s(&format!("{lc}depthwise_conv1d.weight"))?;
+        // Causal depthwise conv: y[t] = sum_k w[:, k] * g[t - (K - 1) + k], f32 taps accumulated
+        // from the oldest row, rounded once.
         let kn = a.conv_kernel;
+        let wk = seq.constant(
+            &format!("{lc}depthwise_conv1d.weight.f32"),
+            ckpt.f32s(&format!("{lc}depthwise_conv1d.weight"))?,
+        );
         let cv = seq.t("act.mm.a.lc_conv", u64::from(t2 * h));
-        let tap = seq.t("act.mm.a.lc_tap", u64::from(t2 * h));
-        for k in 0..kn {
-            let shift = kn - 1 - k;
-            let index: Vec<u32> = (0..t2)
-                .map(|t| if t >= shift { t - shift } else { u32::MAX })
-                .collect();
-            let index = seq.constant_u32(&format!("const.mm.a.shift{shift}.{t2}"), &index);
-            let w: Vec<f32> = (0..h).map(|c| wk[(c * kn + k) as usize]).collect();
-            let w = seq.constant(&format!("{lc}depthwise_conv1d.tap{k}"), w);
-            let dst = if k == 0 { cv } else { tap };
-            seq.gather(dst, g, t2, index, t2, h, false)?;
-            seq.binary(dst, w, None, 2, [1, t2, h], [0, 0, 1], false)?;
-            if k > 0 {
-                seq.binary(cv, tap, None, 0, [1, t2, h], [0, h, 1], false)?;
-            }
-        }
-        seq.round(cv, t2, h)?;
+        let deps = seq.deps();
+        let e = seq.p().raw(
+            DevOp::CausalDepthwiseConv1dF32,
+            u64::from(t2 * h).div_ceil(2048),
+            &deps,
+            cv,
+            |d| {
+                d.t[..3].copy_from_slice(&[cv, g, wk]);
+                d.i[..5].copy_from_slice(&[t2, h, kn, 0, 3]);
+            },
+        )?;
+        seq.done(e);
         seq.rms(
             cv,
             None,
