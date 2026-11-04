@@ -26,6 +26,9 @@
  *   /tmp/gemv-rate/gemv_rate --objects=/tmp/gemv-rate
  * Add --old-only or --new-only for independent runs; --m=1 --shape=qwen-qkv
  * selects one point. --list lists shapes without opening HSA. Stdout is CSV.
+ * --op=qkv|glu selects the actual fused path (new-only); --act=0|1|2 selects
+ * GELU-tanh/SiLU/SITU for GLU. --edges checks tiny ragged/empty/fallback cases;
+ * their timing is diagnostic. The capacity probe checks both MM and walk.
  *
  * Median HSA dispatch timestamps exclude launch/wait overhead and an untimed
  * 256 MiB stream-read eviction before EVERY sample (including warmups). Reported
@@ -63,6 +66,10 @@ static const Shape shapes[] = {
     {"e4b-gate-up", 20480, 2560}, {"e4b-down", 2560, 10240},
     {"12b-gate-up", 30720, 3840}, {"12b-down", 3840, 15360},
     {"12b-lm-head", 262144, 3840},
+};
+static const Shape edge_shapes[] = {
+    {"tail-qkv", 37, 96}, {"empty-kv-qkv", 19, 64}, {"fallback-qkv", 37, 40},
+    {"tail-gate-up", 38, 96}, {"fallback-gate-up", 38, 40},
 };
 static float bf2f(bf16 b) {
     uint32_t bits = (uint32_t)b << 16;
@@ -131,8 +138,8 @@ static Error error(const bf16* got, const float* ref, size_t count) {
 
 int main(int argc, char** argv) {
     const char* objects = "/tmp/gemv-rate", *shape = NULL;
-    unsigned only_m = 0, reps = 21, warmups = 3, dev = 0;
-    int mode = 0, list = 0, failures = 0;
+    unsigned only_m = 0, reps = 21, warmups = 3, dev = 0, act = 1;
+    int mode = 0, list = 0, failures = 0, op = 0, edges = 0;
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--objects=", 10)) objects = argv[i] + 10;
         else if (!strncmp(argv[i], "--shape=", 8)) shape = argv[i] + 8;
@@ -142,26 +149,46 @@ int main(int argc, char** argv) {
         else if (!strncmp(argv[i], "--dev=", 6)) dev = integer(argv[i] + 6);
         else if (!strcmp(argv[i], "--old-only") && !mode) mode = 1;
         else if (!strcmp(argv[i], "--new-only") && !mode) mode = 2;
+        else if (!strcmp(argv[i], "--edges")) edges = 1;
+        else if (!strncmp(argv[i], "--act=", 6)) act = integer(argv[i] + 6);
+        else if (!strcmp(argv[i], "--op=qkv")) op = 1;
+        else if (!strcmp(argv[i], "--op=glu")) op = 2;
         else if (!strcmp(argv[i], "--list")) list = 1;
         else goto usage;
     }
     if ((only_m && (only_m > 16 || (only_m & (only_m - 1)))) ||
         reps < 3 || reps > 1001 || !(reps & 1u) || warmups > 100) goto usage;
+    if (edges && !op) goto usage;
+    if (act > 2) goto usage;
+    if (op) { if (mode == 1) goto usage; mode = 2; }
+    const Shape* catalog = edges ? edge_shapes : shapes;
+    const unsigned n_shapes = edges ? sizeof(edge_shapes) / sizeof(edge_shapes[0]) : sizeof(shapes) / sizeof(shapes[0]);
     int found = !shape;
-    for (unsigned s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
-        if (shape && !strcmp(shape, shapes[s].name)) found = 1;
+    for (unsigned s = 0; s < n_shapes; s++) {
+        if (shape && !strcmp(shape, catalog[s].name)) found = 1;
         if (list) printf("%s N=%u K=%u weight_bytes=%zu floor_us=%.3f\n",
-                         shapes[s].name, shapes[s].N, shapes[s].K,
-                         (size_t)shapes[s].N * shapes[s].K * 2,
-                         (double)shapes[s].N * shapes[s].K * 2 / 640e3);
+                         catalog[s].name, catalog[s].N, catalog[s].K,
+                         (size_t)catalog[s].N * catalog[s].K * 2,
+                         (double)catalog[s].N * catalog[s].K * 2 / 640e3);
     }
     if (!found) goto usage;
     if (list) return 0;
 
     printf("shape,N,K,M,body,weight_bytes,floor_us,median_us,GB_s,pct_640,max_abs,max_rel_ge_1e-2,over,old_new_max_abs,old_new_max_rel_ge_1e-2,old_new_byte_mismatches,fused_byte_mismatches\n");
-    for (unsigned s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
-        const Shape sh = shapes[s];
+    for (unsigned s = 0; s < n_shapes; s++) {
+        const Shape sh = catalog[s];
         if (shape && strcmp(shape, sh.name)) continue;
+        unsigned nq = 0, nk = 0;
+        if (!strcmp(sh.name, "qwen-qkv")) { nq = 2048; nk = 1024; }
+        else if (!strcmp(sh.name, "e4b-qkv-sliding")) { nq = 2048; nk = 512; }
+        else if (!strcmp(sh.name, "e4b-qkv-global")) { nq = 4096; nk = 1024; }
+        if (!strcmp(sh.name, "tail-qkv") || !strcmp(sh.name, "fallback-qkv")) { nq = 19; nk = 9; }
+        else if (!strcmp(sh.name, "empty-kv-qkv")) { nq = 19; nk = 0; }
+        if ((op == 1 && !nq) || (op == 2 && !strstr(sh.name, "gate-up"))) {
+            if (shape) goto usage;
+            continue;
+        }
+        const unsigned out_n = op == 2 ? sh.N / 2 : sh.N;
         const unsigned max_m = only_m ? only_m : 16;
         const size_t nw = (size_t)sh.N * sh.K, nx = (size_t)max_m * sh.K;
         bf16* w = allocate(nw * 2), *x = allocate(nx * 2);
@@ -180,6 +207,19 @@ int main(int argc, char** argv) {
                 ref[(size_t)m * sh.N + n] = sum;
             }
         }
+        if (op == 2) {
+            for (unsigned m = 0; m < max_m; m++)
+                for (unsigned n = 0; n < out_n; n++) {
+                    const float g = ref[(size_t)m * sh.N + n];
+                    const float u = ref[(size_t)m * sh.N + out_n + n];
+                    const float sigmoid = 1.0f / (1.0f + expf(-g));
+                    if (act == 0)
+                        ref[(size_t)m * out_n + n] = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g))) * u;
+                    else if (act == 2)
+                        ref[(size_t)m * out_n + n] = (0.75f * tanhf(g / 0.75f) * sigmoid) * (0.5f * tanhf(u / 0.5f));
+                    else ref[(size_t)m * out_n + n] = (g * sigmoid) * u;
+                }
+        }
         for (unsigned M = only_m ? only_m : 1; M <= max_m; M *= 2) {
             /* Fresh HSA executable per bucket avoids duplicate-symbol resolution
              * choosing an earlier object's MM capacity. */
@@ -189,7 +229,7 @@ int main(int argc, char** argv) {
             if (plow_hsa_device_info(h, (int)dev, name, &cus, &lds)) die("device info");
             if (strcmp(name, "gfx1201") || cus != 64) die("requires gfx1201 with 64 CUs");
             load_object(h, (int)dev, objects, M);
-            const size_t no = (size_t)M * sh.N, evict_bytes = 256u * 1024u * 1024u;
+            const size_t no = (size_t)M * out_n, evict_bytes = 256u * 1024u * 1024u;
             void *dw = plow_hsa_alloc(h, (int)dev, nw * 2), *dx = plow_hsa_alloc(h, (int)dev, nx * 2);
             void *out = plow_hsa_alloc(h, (int)dev, no * 2), *evict = plow_hsa_alloc(h, (int)dev, evict_bytes);
             void *checksum = plow_hsa_alloc(h, (int)dev, 64 * 512 * sizeof(float));
@@ -202,14 +242,27 @@ int main(int argc, char** argv) {
                 plow_hsa_get_kernel(h, (int)dev, "bw_probe_init", &init) ||
                 plow_hsa_get_kernel(h, (int)dev, "bw_probe_stream", &flush)) die("utility symbols");
             launch(h, (int)dev, &probe, &checksum, sizeof(checksum));
-            unsigned capacity;
-            if (plow_hsa_download(h, (int)dev, &capacity, checksum, sizeof(capacity)) || capacity != M)
-                die("object GEMV capacity mismatch");
+            unsigned capacity[2];
+            if (plow_hsa_download(h, (int)dev, capacity, checksum, sizeof(capacity)) ||
+                capacity[1] > 1 || !capacity[0] || (capacity[0] != M && !capacity[1]))
+                die("object GEMV capacity/walk mismatch");
             struct { void* p; unsigned long long n; } ia = {evict, evict_bytes / 16};
             struct { void *out, *src; unsigned long long n; } fa = {checksum, evict, evict_bytes / 16};
             launch(h, (int)dev, &init, &ia, sizeof(ia));
             const unsigned first = mode == 2 ? 1 : 0, count = mode ? 1 : 2;
-            const char* names[] = {"gemv_rate_old", "gemv_rate_new"};
+            const char* names[] = {"gemv_rate_old", op == 1 ? "gemv_rate_qkv" : op == 2 ? "gemv_rate_glu" : "gemv_rate_new"};
+            float* expected = ref;
+            if (op == 1) {
+                expected = allocate(no * sizeof(float));
+                unsigned offset = 0;
+                const unsigned widths[] = {nq, nk, sh.N - nq - nk};
+                for (unsigned stream = 0; stream < 3; stream++) {
+                    for (unsigned m = 0; m < M; m++)
+                        memcpy(expected + (size_t)M * offset + (size_t)m * widths[stream],
+                               ref + (size_t)m * sh.N + offset, widths[stream] * sizeof(float));
+                    offset += widths[stream];
+                }
+            }
             double* times[2] = {allocate(reps * sizeof(double)), allocate(reps * sizeof(double))};
             bf16* got[2] = {allocate(no * 2), allocate(no * 2)};
             bf16* poison = allocate(no * 2);
@@ -224,12 +277,13 @@ int main(int argc, char** argv) {
                 hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &freq) != HSA_STATUS_SUCCESS || !freq)
                 die("HSA profiling setup");
             struct { void *out, *x, *w; unsigned M, N, K; } ga = {out, dx, dw, M, sh.N, sh.K};
+            struct { void *out, *x, *w; unsigned M, N, K, Nq, Nk; } qa = {out, dx, dw, M, sh.N, sh.K, op == 2 ? act : nq, nk};
             for (unsigned r = 0; r < warmups + reps; r++) {
                 for (unsigned j = 0; j < count; j++) {
                     unsigned a = first + ((r + j) % count);
                     if (plow_hsa_upload(h, (int)dev, out, poison, no * 2)) die("poison output");
                     launch(h, (int)dev, &flush, &fa, sizeof(fa));
-                    launch(h, (int)dev, &kernels[a], &ga, sizeof(ga));
+                    launch(h, (int)dev, &kernels[a], op ? (const void*)&qa : (const void*)&ga, op ? sizeof(qa) : sizeof(ga));
                     hsa_amd_profiling_dispatch_time_t t;
                     if (hsa_amd_profiling_get_dispatch_time(agent, signal, &t) != HSA_STATUS_SUCCESS || t.end <= t.start)
                         die("HSA dispatch timestamp");
@@ -240,7 +294,7 @@ int main(int argc, char** argv) {
             }
             size_t fused_diff = 0, pair_diff = 0;
             Error pair = {0};
-            if (mode != 1) {
+            if (mode != 1 && !op) {
                 if (plow_hsa_get_kernel(h, (int)dev, "gemv_rate_argmax", &fused)) die("fused symbol");
                 struct { void *out, *x, *w, *part; unsigned M, N, K; } aa = {out, dx, dw, part, M, sh.N, sh.K};
                 if (plow_hsa_upload(h, (int)dev, out, poison, no * 2)) die("poison fused output");
@@ -261,10 +315,10 @@ int main(int argc, char** argv) {
                 free(old);
             }
             for (unsigned a = first; a < first + count; a++) {
-                Error e = error(got[a], ref, no);
+                Error e = error(got[a], expected, no);
                 if (e.over) {
                     failures++;
-                    for (unsigned m = 0; m < M; m++) {
+                    for (unsigned m = 0; m < M && !op; m++) {
                         Error row = error(got[a] + (size_t)m * sh.N, ref + (size_t)m * sh.N, sh.N);
                         fprintf(stderr, "row-error %s body=%s M=%u row=%u over=%zu max_rel=%.9g samples=",
                                 sh.name, a ? "new" : "old", M, m, row.over, row.rel);
@@ -281,9 +335,10 @@ int main(int argc, char** argv) {
                        nw * 2 / 640e3, us, bw, bw / 6.4, e.abs, e.rel, e.over);
                 if (!mode) printf("%.9g,%.9g,%zu,", pair.abs, pair.rel, pair_diff);
                 else printf("NA,NA,NA,");
-                if (a) printf("%zu\n", fused_diff); else printf("NA\n");
+                if (a && !op) printf("%zu\n", fused_diff); else printf("NA\n");
                 fflush(stdout);
             }
+            if (op == 1) free(expected);
             free(times[0]); free(times[1]); free(got[0]); free(got[1]); free(poison);
             plow_hsa_free(h, part); plow_hsa_free(h, checksum); plow_hsa_free(h, evict);
             plow_hsa_free(h, out); plow_hsa_free(h, dx); plow_hsa_free(h, dw);
@@ -296,6 +351,6 @@ int main(int argc, char** argv) {
     return failures ? 1 : 0;
 usage:
     fprintf(stderr, "usage: %s [--objects=DIR] [--old-only|--new-only] [--m=1|2|4|8|16]\n"
-            "  [--shape=NAME] [--reps=ODD] [--warmups=N] [--dev=N] [--list]\n", argv[0]);
+            "  [--op=qkv|glu] [--act=0|1|2] [--edges] [--shape=NAME] [--reps=ODD] [--warmups=N] [--dev=N] [--list]\n", argv[0]);
     return 2;
 }
