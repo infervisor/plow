@@ -153,6 +153,15 @@ pub fn cmd_load(
     let (dir, t) = pull::pull(&st, &*f, &resolved)?;
     println!("transferred: {t}");
 
+    // The packets carry every weight: the checkpoint is provenance, nothing to prepare.
+    if resolved.bundle.checkpoint.layout == plow_asset::dist::PACKET_LAYOUT {
+        check_bound(&dir, &resolved.bundle)?;
+        st.pin(&r.pin_key(), &v.variant_id)?;
+        println!("checkpoint: none needed (the packets carry their weights)");
+        println!("\nserve it with:\n  plowrt serve --model {r} --port 8080");
+        return Ok(());
+    }
+
     // A `dist` checkpoint came with the pull, linked into its snapshot. An
     // `hf:` one is not distributed: resolve it, or say precisely what to do.
     let dist_snapshot = (resolved.bundle.checkpoint.source == plow_asset::dist::DIST_SOURCE)
@@ -187,6 +196,7 @@ pub fn cmd_load(
     };
 
     let farm = prepare::build(st.root(), &resolved.bundle, &dir, &ckpt)?;
+    check_bound(&dir, &resolved.bundle)?;
     st.pin(&r.pin_key(), &v.variant_id)?;
     println!(
         "checkpoint: {} ({} shards{})",
@@ -389,6 +399,14 @@ fn write_zip(
         objects_root,
         checkpoint_in,
     } = args;
+    if !bundle.checkpoint.views.is_empty() {
+        return Err(format!(
+            "{}: a prepared checkpoint's derived blobs travel only with `push`; the archive does \
+             not carry them",
+            bundle.name
+        )
+        .into());
+    }
     // Exactly where `generate` read the objects from.
     let objects_in: Vec<_> = match (&objset, objects_root) {
         (Some((objset, _)), Some(dir)) => {
@@ -962,6 +980,11 @@ pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> 
     let bundle_json = dir.join("bundle.json");
     let bundle: plow_asset::dist::Bundle = serde_json::from_slice(&std::fs::read(&bundle_json)?)
         .map_err(|e| format!("{}: {e}", bundle_json.display()))?;
+    if bundle.checkpoint.layout == plow_asset::dist::PACKET_LAYOUT {
+        check_bound(&dir, &bundle)?;
+        println!("{r}: no checkpoint needed (the packets carry their weights)");
+        return Ok(());
+    }
     // A `dist` checkpoint came with the pull, as for `load`.
     let dist_snapshot = (bundle.checkpoint.source == plow_asset::dist::DIST_SOURCE)
         .then(|| dist::weights::dist_snapshot_path(st.root(), &bundle))
@@ -971,7 +994,31 @@ pub fn cmd_prepare(model: &str, checkpoint: Option<PathBuf>) -> Result<(), Err> 
         .or(dist_snapshot)
         .ok_or("pass --checkpoint <dir> (or set PLOW_CHECKPOINT)")?;
     let farm = prepare::build(st.root(), &bundle, &dir, &ckpt)?;
+    check_bound(&dir, &bundle)?;
     println!("{}: {} shards at {}", r, farm.shards, farm.dir.display());
+    Ok(())
+}
+
+/// Refuse a prepared bundle whose checkpoint lacks a tensor its model packet (or a sub-bundle's)
+/// binds, a packet bundle whose packets bind any, and any packet that does not parse: found
+/// here, not by `serve`.
+fn check_bound(dir: &std::path::Path, bundle: &plow_asset::dist::Bundle) -> Result<(), Err> {
+    let packet_layout = bundle.checkpoint.layout == plow_asset::dist::PACKET_LAYOUT;
+    for f in &bundle.files {
+        let pkt = dir.join(&f.name);
+        // A codec or sidecar packet binds its own outputs and inter-packet buffers
+        // (`out.vc.*`), not checkpoint tensors: only that it is a readable packet is checked.
+        if matches!(f.role.as_str(), "codec_packet" | "sidecar_packet") {
+            plowrt::asset::serve::check_packet(&pkt)?;
+            continue;
+        }
+        if f.role != "packet" && f.role != "sub_packet" {
+            continue;
+        }
+        let ck = pkt.with_file_name("checkpoint");
+        let ck = (!packet_layout && (f.role == "packet" || ck.is_dir())).then_some(ck);
+        plowrt::asset::serve::check_bound_weights(&pkt, ck.as_deref())?;
+    }
     Ok(())
 }
 
@@ -992,6 +1039,86 @@ pub fn cmd_rm(model: &str, gc: bool) -> Result<(), Err> {
     } else {
         println!("blobs kept; `plowrt rm {model} --gc` reclaims what nothing references");
     }
+    Ok(())
+}
+
+/// `serve --model` of a packet-layout bundle (the packets carry their weights): routed to the
+/// service its packet's pipeline declares, exactly as `--asr-packet` (an ASR packet) or
+/// `--asr-vad-packet` (a VAD packet) would. Runs before the runtime configuration is fixed, so
+/// the rest of `serve` sees one configuration; other models are left for the registry.
+pub fn route_packet_models(
+    models: &mut Vec<String>,
+    cfg: &mut plowrt::config::RuntimeConfig,
+) -> Result<(), Err> {
+    let mut kept = Vec::new();
+    for m in models.drain(..) {
+        let mut r = reference::parse(&m)?;
+        if r.registry == reference::DEFAULT_REGISTRY {
+            r.registry = cfg.registry.clone();
+        }
+        let st = Store::open_home(cfg.plow_home.as_deref())?;
+        let Some(variant_id) = st.pinned(&r.pin_key()) else {
+            kept.push(m);
+            continue;
+        };
+        let dir = st.root().join("bundles").join(&variant_id);
+        let Ok(raw) = std::fs::read(dir.join(plow_asset::dist::BUNDLE_MANIFEST)) else {
+            kept.push(m);
+            continue;
+        };
+        let bundle: plow_asset::dist::Bundle = serde_json::from_slice(&raw)?;
+        if bundle.checkpoint.layout != plow_asset::dist::PACKET_LAYOUT {
+            kept.push(m);
+            continue;
+        }
+        let file = bundle
+            .files
+            .iter()
+            .find(|f| f.role == "packet")
+            .ok_or_else(|| format!("{r}: the bundle names no packet"))?;
+        let packet = dir.join(&file.name);
+        let asset = plowrt::exec::packet_runtime::PacketAsset::load(&packet)?;
+        let drivers: Vec<&str> = asset
+            .pipelines()
+            .iter()
+            .map(|p| p.driver.as_str())
+            .collect();
+        if drivers.contains(&plowrt::asr::vad::DRIVER) {
+            if let Some(have) = &cfg.asr_vad_packet {
+                return Err(format!(
+                    "--model {m} is a VAD packet, and --asr-vad-packet already names {}",
+                    have.display()
+                )
+                .into());
+            }
+            println!("{m}: VAD packet {}", packet.display());
+            cfg.asr_vad_packet = Some(packet);
+        } else if drivers
+            .iter()
+            .any(|d| matches!(*d, "rnnt.greedy.v1" | "causal.v1"))
+        {
+            if bundle.target.vendor != "nvidia" {
+                return Err(format!(
+                    "--model {m}: a packet ASR model serves on CUDA; this bundle targets {}",
+                    bundle.target.vendor
+                )
+                .into());
+            }
+            println!("{m}: ASR packet {}", packet.display());
+            cfg.asr_packets.push(plowrt::config::AsrPacket {
+                name: bundle.name.clone(),
+                packet,
+                tokenizer: dir.join("checkpoint"),
+                backend: "cuda".into(),
+            });
+        } else {
+            return Err(format!(
+                "--model {m}: its packet declares no pipeline `serve` hosts (drivers {drivers:?})"
+            )
+            .into());
+        }
+    }
+    *models = kept;
     Ok(())
 }
 

@@ -25,6 +25,17 @@ pub const BUNDLE_SCHEMA: &str = "plow.dist.bundle.v1";
 /// ([`objset_root`]). A v1 reader would lay those objects under `hsaco/`, where NVIDIA serving
 /// never reads them, and serve without them; the schema makes it refuse instead.
 pub const BUNDLE_SCHEMA_NVIDIA_TREE: &str = "plow.dist.bundle.v2";
+/// A bundle that carries what a v2 reader would drop or misplace: checkpoint views
+/// ([`CheckpointView`]), sub-bundle files (`<sub>/<file>`), or a packet-layout checkpoint
+/// ([`PACKET_LAYOUT`]). A v2 reader refuses it instead of building a farm that cannot serve.
+pub const BUNDLE_SCHEMA_VIEWS: &str = "plow.dist.bundle.v3";
+/// `checkpoint.layout` of a bundle whose packets carry every weight they bind: the checkpoint
+/// is provenance only, and `load` builds no farm for it.
+pub const PACKET_LAYOUT: &str = "packet";
+
+/// A recipe's `[target] executor` for a packet plowrt runs on the host CPU of the target: its
+/// bundle is [`PACKET_LAYOUT`] and ships no objset.
+pub const HOST_EXECUTOR: &str = "host";
 
 /// The schema a bundle for `vendor` is written with.
 pub fn bundle_schema(vendor: &str) -> &'static str {
@@ -122,6 +133,9 @@ pub struct Build {
     /// compiled, no `plow_packet_hash_{lo,hi}` stamp) which pairs with any packet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_hash: Option<String>,
+    /// [`HOST_EXECUTOR`] for a packet the serving host's CPU runs: no objset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -252,6 +266,9 @@ pub struct Bundle {
     pub runtime_env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe: Option<String>,
+    /// [`HOST_EXECUTOR`]: the packet runs on the host CPU and the bundle ships no objset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +285,126 @@ pub struct BundleCheckpoint {
     /// air-gapped checkpoint that has no Hugging Face repository to fetch from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<CheckpointFile>,
+    /// The checkpoints the packets were emitted against, when the recipe's prep built them from
+    /// the snapshot: every file either an HF file, a derived blob, or a safetensors file
+    /// assembled from HF tensors and derived bytes. Empty: the packets bound the snapshot itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<CheckpointView>,
+}
+
+/// One bound checkpoint directory, rebuilt at load from the snapshot and the bundle's blobs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointView {
+    /// Where the bundle links it: `checkpoint`, or `<sub>/checkpoint` for a sub-bundle.
+    pub dir: String,
+    pub files: Vec<ViewFile>,
+}
+
+/// One file of a [`CheckpointView`], pinned by the digest of its bytes as the packets bound them.
+/// Neither `hf` nor `assembled`: the file is derived and ships as blob `sha256`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewFile {
+    pub name: String,
+    pub sha256: String,
+    pub bytes: u64,
+    /// The snapshot file (path in the repository) whose bytes these are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembled: Option<Assembled>,
+}
+
+/// A safetensors file rebuilt from its header, snapshot tensors and derived bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assembled {
+    /// The header JSON exactly as the file holds it (padding included).
+    pub header: String,
+    /// One part per tensor, in data-offset order.
+    pub parts: Vec<Part>,
+    /// The derived parts' bytes, concatenated in order. Absent when every part is a snapshot tensor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived: Option<CheckpointFile>,
+}
+
+/// A tensor's bytes: snapshot tensor `tensor` of shard `hf`, or the next `derived` bytes of the
+/// derived blob.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Part {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived: Option<u64>,
+}
+
+impl CheckpointView {
+    pub fn validate(&self) -> Result<(), String> {
+        let ok_dir = match self.dir.split('/').collect::<Vec<_>>().as_slice() {
+            ["checkpoint"] => true,
+            [sub, "checkpoint"] => is_plain_name(sub) && *sub != SEGMENT_OBJECTS_DIR,
+            _ => false,
+        };
+        if !ok_dir {
+            return Err(format!("bundle: bad checkpoint view dir {:?}", self.dir));
+        }
+        if self.files.is_empty() {
+            return Err(format!(
+                "bundle: checkpoint view {} lists no files",
+                self.dir
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for f in &self.files {
+            let bad = |why: &str| format!("bundle: view {}: file {}: {why}", self.dir, f.name);
+            if !is_safe_relative_path(&f.name) || !is_sha256(&f.sha256) || f.name.starts_with('.') {
+                return Err(bad("bad entry"));
+            }
+            if !seen.insert(f.name.as_str()) {
+                return Err(bad("duplicate"));
+            }
+            if f.hf.as_deref().is_some_and(|h| !is_safe_relative_path(h)) {
+                return Err(bad("bad snapshot path"));
+            }
+            let Some(a) = &f.assembled else {
+                continue;
+            };
+            if f.hf.is_some() || !f.name.ends_with(".safetensors") {
+                return Err(bad(
+                    "an assembled file is a safetensors file with no `hf` source",
+                ));
+            }
+            let mut derived = 0u64;
+            for p in &a.parts {
+                match (&p.hf, &p.tensor, p.derived) {
+                    (Some(h), Some(_), None) if is_safe_relative_path(h) => {}
+                    (None, None, Some(n)) => derived += n,
+                    _ => return Err(bad("a part is a snapshot tensor or derived bytes")),
+                }
+            }
+            match &a.derived {
+                Some(d) if !is_sha256(&d.sha256) || d.bytes != derived => {
+                    return Err(bad("derived blob does not cover the derived parts"))
+                }
+                None if derived != 0 => return Err(bad("derived parts without a derived blob")),
+                _ => {}
+            }
+        }
+        for f in &self.files {
+            if let Some(p) = f
+                .name
+                .match_indices('/')
+                .map(|(i, _)| &f.name[..i])
+                .find(|p| seen.contains(p))
+            {
+                return Err(format!(
+                    "bundle: view {}: file {} sits under {p}, which is also a file",
+                    self.dir, f.name
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The checkpoint source whose files travel in the distribution.
@@ -669,15 +806,55 @@ fn is_plain_name(s: &str) -> bool {
     matches!(c.next(), Some(std::path::Component::Normal(_))) && c.next().is_none()
 }
 
+/// A sub-bundle directory name: one plain component that no other part of the layout uses.
+fn is_sub_bundle(s: &str) -> bool {
+    is_plain_name(s) && ![SEGMENT_OBJECTS_DIR, "hsaco", "checkpoint"].contains(&s)
+}
+
+/// Whether a bundle file or object name lies in a sub-bundle's tree (`text_encoder/...`).
+pub fn in_sub_bundle(name: &str) -> bool {
+    name.split_once('/')
+        .is_some_and(|(sub, _)| is_sub_bundle(sub))
+}
+
+/// A bundle file name: one plain component, or one inside a sub-bundle (`text_encoder/model.pkt`).
+fn is_bundle_file_name(s: &str) -> bool {
+    match s.split('/').collect::<Vec<_>>().as_slice() {
+        [name] => is_plain_name(name),
+        [sub, name] => is_sub_bundle(sub) && is_plain_name(name),
+        _ => false,
+    }
+}
+
+impl Bundle {
+    /// Whether this bundle carries anything a v2 reader would drop or misplace.
+    pub fn needs_views_schema(&self) -> bool {
+        !self.checkpoint.views.is_empty()
+            || self.checkpoint.layout == PACKET_LAYOUT
+            || self.files.iter().any(|f| f.name.contains('/'))
+    }
+
+    /// plowrt runs this bundle's packet on the host CPU ([`HOST_EXECUTOR`]): no objset.
+    pub fn host_executed(&self) -> bool {
+        self.executor.as_deref() == Some(HOST_EXECUTOR)
+    }
+}
+
 /// An objset object name: one plain component, or one under [`SEGMENT_OBJECTS_DIR`]. Checked
 /// segment by segment as written: `Path` would drop a trailing `/` or `/.` and pass a name
 /// that materializes as a directory.
 fn is_object_name(s: &str) -> bool {
     let plain = |seg: &str| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\');
-    match s.split('/').collect::<Vec<_>>().as_slice() {
+    let segment = |name: &[&str]| match name {
         [name] => plain(name) && *name != SEGMENT_OBJECTS_DIR,
         [dir, name] => *dir == SEGMENT_OBJECTS_DIR && plain(name),
         _ => false,
+    };
+    match s.split('/').collect::<Vec<_>>().as_slice() {
+        [sub, rest @ ..] if !rest.is_empty() && *sub != SEGMENT_OBJECTS_DIR => {
+            is_sub_bundle(sub) && segment(rest)
+        }
+        all => segment(all),
     }
 }
 
@@ -719,7 +896,10 @@ impl Variant {
                 self.label
             ));
         }
-        if self.build.objset_id.is_empty() && !runtime_compiled(&self.target.vendor) {
+        if self.build.objset_id.is_empty()
+            && !runtime_compiled(&self.target.vendor)
+            && self.build.executor.as_deref() != Some(HOST_EXECUTOR)
+        {
             return Err(format!(
                 "variant {}: no objset, and {} kernels do not compile at run time",
                 self.label, self.target.vendor
@@ -778,8 +958,11 @@ impl ObjSet {
     /// specialised one carries `plow_packet_hash_{lo,hi}` and pairs only with
     /// the packet that produced it. Publishing a mismatch would turn into a
     /// confusing refusal deep in the loader, so the packer checks it here.
+    ///
+    /// A sub-bundle's objects pair with its own packet, checked against that packet's build when
+    /// published and by the loader's stamp check when served.
     pub fn pairs_with(&self, packet_pairing_hash: Option<&str>) -> Result<(), String> {
-        for o in &self.objects {
+        for o in self.objects.iter().filter(|o| !in_sub_bundle(&o.name)) {
             match (&o.packet_hash, packet_pairing_hash) {
                 (None, _) => {}
                 (Some(stamp), Some(want)) if stamp == want => {}
@@ -801,15 +984,25 @@ impl ObjSet {
 impl Bundle {
     pub fn validate(&self) -> Result<(), String> {
         // A v1 NVIDIA bundle predates the tree layout; it is read, and laid out, as one.
-        if self.schema != BUNDLE_SCHEMA && self.schema != bundle_schema(&self.target.vendor) {
+        if self.schema != BUNDLE_SCHEMA
+            && self.schema != bundle_schema(&self.target.vendor)
+            && self.schema != BUNDLE_SCHEMA_VIEWS
+        {
             return Err(format!("bundle: unsupported schema {}", self.schema));
+        }
+        if self.needs_views_schema() && self.schema != BUNDLE_SCHEMA_VIEWS {
+            return Err(format!(
+                "bundle: checkpoint views, sub-bundle files or a packet layout need schema \
+                 {BUNDLE_SCHEMA_VIEWS}, not {}",
+                self.schema
+            ));
         }
         if self.files.is_empty() {
             return Err("bundle: no files".into());
         }
         let mut seen = std::collections::BTreeSet::new();
         for f in &self.files {
-            if !is_plain_name(&f.name) || !is_sha256(&f.sha256) {
+            if !is_bundle_file_name(&f.name) || !is_sha256(&f.sha256) {
                 return Err(format!("bundle: bad file entry {}", f.name));
             }
             if !seen.insert(f.name.as_str()) {
@@ -824,8 +1017,19 @@ impl Bundle {
         if !self.files.iter().any(|f| f.role == "packet") {
             return Err("bundle: no file with role `packet`".into());
         }
+        if let Some(e) = &self.executor {
+            if !self.host_executed()
+                || self.checkpoint.layout != PACKET_LAYOUT
+                || self.objset.is_some()
+            {
+                return Err(format!(
+                    "bundle: executor {e:?}: only a `{PACKET_LAYOUT}` bundle without an objset \
+                     runs on `{HOST_EXECUTOR}`"
+                ));
+            }
+        }
         if self.objset.is_none() {
-            if !runtime_compiled(&self.target.vendor) {
+            if !runtime_compiled(&self.target.vendor) && !self.host_executed() {
                 return Err(format!(
                     "bundle: no objset, and {} kernels do not compile at run time",
                     self.target.vendor
@@ -866,6 +1070,16 @@ impl Bundle {
             }
         }
         self.checkpoint.validate()?;
+        let mut dirs = std::collections::BTreeSet::new();
+        for v in &self.checkpoint.views {
+            v.validate()?;
+            if !dirs.insert(v.dir.as_str()) {
+                return Err(format!("bundle: two checkpoint views at {}", v.dir));
+            }
+            if !self.checkpoint.source.starts_with("hf:") {
+                return Err("bundle: a checkpoint view is built from an `hf:` snapshot".into());
+            }
+        }
         // A `dist` checkpoint is stored as `dist+<namespace>--<name>@<rev>-<hash>`:
         // each part one path component, and no `--` inside one, or two models
         // (`a--b/c`, `a/b--c`) would share a snapshot.
@@ -902,6 +1116,15 @@ impl BundleCheckpoint {
     /// files; a `dist` one lists every file it carries, and its shard count
     /// is the one `prepare` will hold the snapshot to.
     pub fn validate(&self) -> Result<(), String> {
+        // Provenance only: the packets carry the weights, so any source names where they came from.
+        if self.layout == PACKET_LAYOUT {
+            if self.source.is_empty() || !self.files.is_empty() || !self.views.is_empty() {
+                return Err(format!(
+                    "bundle: a `{PACKET_LAYOUT}` checkpoint names its source and carries no files"
+                ));
+            }
+            return Ok(());
+        }
         if self.source.starts_with("hf:") {
             if !self.files.is_empty() {
                 return Err(

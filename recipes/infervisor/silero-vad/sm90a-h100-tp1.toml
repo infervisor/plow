@@ -33,6 +33,8 @@ num_gpus = 1
 parallel = "tp"
 # The packet executes on the host CPU of this target.
 executor = "host"
+# Samples one packet step reads (frame 512); the LSTM state carries the rest of a stream.
+max_ctx = 512
 
 [checkpoint]
 # snakers4/silero-vad (MIT), pip package silero-vad 5.1.2 (its TorchScript silero_vad.jit).
