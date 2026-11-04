@@ -2625,38 +2625,82 @@ fn tensor_bytes(rows: u32, columns: u32, element_bytes: u32) -> Result<u64, Stri
 const SPV_ARENA_FLOATS: u64 = 25856;
 const SPV_SLOT_FLOATS: u64 = 8 * 512;
 
-/// Conv1dF32 flag bit 16 (`PLOW_EMIT_CODEC_ROW_GEMV`, wgmma convs, one group): `Rows` when at
-/// most 16 output rows of a zero-padded conv fit `sp_conv1d_rows` (padded input staged in smem,
-/// one warp per output channel sharing each weight across the rows), `Warp` when at most 4 output
-/// channels run one warp per output element (`sp_conv1d_warp`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Conv1dF32 flag bit 16 arms (wgmma convs, one group), chosen per conv shape by measurement
+/// (`PLOW_EMIT_CODEC_CONV_ARMS`): `Rows` = at most 16 output rows of a zero-padded conv in
+/// `sp_conv1d_rows` (padded input staged in smem, one warp per output channel sharing each weight
+/// across the rows); `Warp` = at most 4 output channels, one warp per output element
+/// (`sp_conv1d_warp`). Unlisted shapes keep the GEMM tiles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ConvWarp {
     Rows,
     Warp,
 }
 
+/// (batch, in_rows, in_channels, out_channels, kernel, stride, dilation, pad_before, pad_after)
+type ConvShape = [u32; 9];
+
+fn conv_shape(stage: &Conv1dF32Stage<'_>) -> ConvShape {
+    [
+        stage.batch,
+        stage.in_rows,
+        stage.in_channels,
+        stage.out_channels,
+        stage.kernel,
+        stage.stride,
+        stage.dilation_or_output_padding,
+        stage.pad_before,
+        stage.pad_after,
+    ]
+}
+
+/// The measured arm table: one JSON object per line with `shape` (a [`ConvShape`]) and `arm`
+/// (`rows`, `warp` or `tile`); a later line for the same shape wins.
+fn conv_arms() -> &'static std::collections::HashMap<ConvShape, ConvWarp> {
+    static ARMS: std::sync::OnceLock<std::collections::HashMap<ConvShape, ConvWarp>> =
+        std::sync::OnceLock::new();
+    ARMS.get_or_init(|| {
+        let mut arms = std::collections::HashMap::new();
+        let Some(path) = crate::emit_config::active().codec_conv_arms.clone() else {
+            return arms;
+        };
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("codec conv arms {}: {e}", path.display()));
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("codec conv arms {}: {e}", path.display()));
+            let shape: ConvShape = serde_json::from_value(v["shape"].clone())
+                .unwrap_or_else(|e| panic!("codec conv arms shape: {e}"));
+            match v["arm"].as_str() {
+                Some("rows") => arms.insert(shape, ConvWarp::Rows),
+                Some("warp") => arms.insert(shape, ConvWarp::Warp),
+                _ => arms.remove(&shape),
+            };
+        }
+        arms
+    })
+}
+
 fn conv1d_warp(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32) -> Option<ConvWarp> {
-    if !crate::emit_config::active().codec_row_gemv
-        || !stage.wgmma
-        || transpose
-        || stage.groups != 1
-    {
+    if !stage.wgmma || transpose || stage.groups != 1 {
         return None;
     }
+    let arm = *conv_arms().get(&conv_shape(stage))?;
     let k = u64::from(stage.in_channels) * u64::from(stage.kernel);
     let batch = u64::from(stage.batch);
     let staged = batch
         * u64::from(stage.in_rows + stage.pad_before + stage.pad_after)
         * u64::from(stage.in_channels);
-    if batch * u64::from(out_rows) <= 16
-        && stage.pad_mode == PadMode::Zero
-        && k % 4 == 0
-        && !stage.weight_f16
-        && staged + SPV_SLOT_FLOATS <= SPV_ARENA_FLOATS
-    {
-        return Some(ConvWarp::Rows);
-    }
-    (stage.out_channels <= 4 && k >= 32).then_some(ConvWarp::Warp)
+    let fits = match arm {
+        ConvWarp::Rows => {
+            batch * u64::from(out_rows) <= 16
+                && stage.pad_mode == PadMode::Zero
+                && k % 4 == 0
+                && !stage.weight_f16
+                && staged + SPV_SLOT_FLOATS <= SPV_ARENA_FLOATS
+        }
+        ConvWarp::Warp => stage.out_channels <= 4,
+    };
+    fits.then_some(arm)
 }
 
 /// Conv1dF32 / ConvTranspose1dF32 slices, mirroring the interpreter's paths (op_speech_f32.cuh
