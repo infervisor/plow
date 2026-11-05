@@ -11,6 +11,8 @@ struct Facts {
     /// Runs the FP8 opcode family.
     fp8_arms: bool,
     gdn: bool,
+    /// Runs a GDN conv or gated norm over a row-pitched source.
+    gdn_pitched: bool,
     /// Runs the full-tile FP8 GEMM, the opcode the route-specific arms serve.
     fp8_gemm: bool,
     rows: u32,
@@ -20,6 +22,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
     let mut f = Facts {
         fp8_arms: false,
         gdn: false,
+        gdn_pitched: false,
         fp8_gemm: false,
         rows: 0,
     };
@@ -28,7 +31,17 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
         for inst in &m.progs[index].insts {
             f.fp8_arms |= req::fp8_arm_op(inst.op);
             f.gdn |= req::gdn_op(inst.op);
-            f.fp8_gemm |= inst.op == DevOp::GemmFp8 as u16;
+            f.gdn_pitched |= inst.j[1] != 0
+                && [
+                    DevOp::QwenGdnConv,
+                    DevOp::QwenGdnConvPrefill,
+                    DevOp::QwenGatedNorm,
+                ]
+                .iter()
+                .any(|&op| inst.op == op as u16);
+            // Block-scaled FP8 GEMMs run on cuBLASLt only, never on an interpreter arm.
+            f.fp8_gemm |=
+                inst.op == DevOp::GemmFp8 as u16 && inst.i[5] != packet::dev::FP8_BLOCK_GROUP;
         }
     }
     f
@@ -64,6 +77,9 @@ fn prefill_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requireme
     if f.gdn {
         out.push(Requirement::new(req::GDN_PREFILL_ABI, 1));
     }
+    if f.gdn_pitched {
+        out.push(Requirement::new(req::GDN_PITCHED_ABI, 1));
+    }
     if routes.w8a8 && f.fp8_arms {
         out.push(Requirement::new(req::W8A8_ARMS, 1));
     }
@@ -83,6 +99,9 @@ fn prefill_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requireme
 fn decode_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requirement> {
     let f = facts(m, programs.iter());
     let mut out = Vec::new();
+    if f.gdn_pitched {
+        out.push(Requirement::new(req::GDN_PITCHED_ABI, 1));
+    }
     if routes.w8a8 && f.fp8_arms {
         out.push(Requirement::new(req::W8A8_ARMS, 1));
     }

@@ -187,11 +187,11 @@ Highest value first; keep only what helps *your* target:
    Stage 5 (`PLOW_DECODE_BATCH`).
 3. **Prefill chunking / interleave** only if the TTFT-under-load tail is the
    problem (`--pf-interleave`, `--pf-chunk`; both vendors). Measure —
-   finer often loses throughput; and re-fit `--pf-chunk-cost` on `$GPU`, its
-   default is another part's launch cost. AMD TP selects from its compiled
+   finer often loses throughput (the chunk cost model is fixed: `--pf-chunk-cost`
+   was removed). AMD TP selects from its compiled
    ladder, re-splits a pending chunk when decode lowers the cap, and keeps
-   recurrent requests isolated; `PLOW_PF_BATCH=1` is fair rotation, not
-   co-packing. Its ragged-tail chunk (`PLOW_RAGGED_CHUNK`) is on by default.
+   recurrent requests isolated; isolated admission rotates across slots
+   under `PLOW_PF_CHUNK` (`PLOW_PF_BATCH` was removed), which is not co-packing. Its ragged-tail chunk (`PLOW_RAGGED_CHUNK`) is on by default.
    To implement AMD co-packing, extend the packet ABI with per-request row range,
    slot, KV base/length and recurrent reset metadata; form a token-budgeted ragged
    batch from compatible compiled rungs; execute with parked-row masks and per-slot
@@ -203,10 +203,12 @@ Highest value first; keep only what helps *your* target:
    Sequential drain is therefore required. Phase-local scratch/tensor tables,
    KV rebasing, staging and trace ownership are prerequisites to overlap, along
    with a physical-range disjointness proof and concurrent parity tests.
-4. **Prefix cache** if traffic shares prefixes: `--vmm-prefix` (nvidia;
-   `--vmm-block-mib` is the real knob — 64 MiB won at long ctx on the measured
-   part) or `--prefix-cache` (amd, recurrent families).
-   **Always report the hit rate** — a low-hit cache is a net loss.
+4. **Prefix cache** is always on, VMM prefix included (`--vmm-prefix` on
+   nvidia, `--vmm-block-mib` is the real knob — 64 MiB won at long ctx on the
+   measured part; `--prefix-cache` on amd, recurrent families). Never disable it
+   as a tuning lever: a prefix-cache cost (low-hit snapshot/insert overhead) is a
+   plowrt bug to fix in this campaign. **Always report the hit rate**, and bench
+   against a reference with its prefix cache on too.
 5. **TP** if one `$GPU` cannot hold the model / hit the budget; `$PARALLEL` must
    be `tp`. Check peer visibility with `plowrt devices --tp $NGPU`, then gate
    performance and rank agreement with `plowrt bench` on the TP assets. The

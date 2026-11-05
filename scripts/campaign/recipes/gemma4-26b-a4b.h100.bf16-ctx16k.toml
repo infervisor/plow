@@ -106,7 +106,7 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 # the one-word BPE tokenizer (PLOW_ENCODE_THREADS 16 / PLOW_ENCODE_SPLIT_MIN 512) and the inline
 # mux tick on CUDA. PLOW_PF_ATTN_GEMM follows the KV budget: realtime (rung 4) routes,
 # high_concurrency (rung 16) stays native.
-PLOW_PREFIX_CACHE = "0"
+# Prefix cache stays on (policy: never disabled in a recipe; match the vLLM peer with its prefix caching on).
 PLOW_PF_INTERLEAVE = "0"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"

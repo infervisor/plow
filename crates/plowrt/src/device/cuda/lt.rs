@@ -205,16 +205,17 @@ pub(crate) struct Lt {
     stored: std::collections::HashMap<StoredKey, Algo>,
     /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
     write: Option<std::path::PathBuf>,
-    /// `PLOW_CUTLASS_FP8_DECODE`: small-M FP8 decode projections.
-    cutlass_fp8: Option<Arc<super::cutlass_fp8::CutlassFp8>>,
+    /// Set once this engine has warned that it times a plan no table pins.
+    unpinned_warned: std::sync::atomic::AtomicBool,
 }
 
 impl Lt {
-    /// `objects`: the serving bundle's object dir (`asset::serve::objects_dir`), where the
-    /// `PLOW_CUTLASS_FP8_DECODE` library lives.
+    /// `assets_dir`: the engine's bundle, whose `cublaslt_algos.jsonl` pins its shapes unless
+    /// `PLOW_LT_ALGOS` names a table (or `PLOW_LT_ALGOS_WRITE` is recording one). Per engine, not
+    /// per process: two co-served bundles carry two tables.
     pub(crate) fn load(
         be: &Arc<CudaBackend>,
-        objects: Option<&std::path::Path>,
+        assets_dir: Option<&std::path::Path>,
     ) -> Result<Arc<Self>> {
         be.bind()?;
         let api = Api::load()?;
@@ -226,7 +227,10 @@ impl Lt {
         }
         let nv = &crate::config::RuntimeConfig::get().nv;
         let mut stored = std::collections::HashMap::new();
-        if let Some(path) = nv.lt_algos.as_deref().map(std::path::PathBuf::from) {
+        let own = assets_dir
+            .map(|d| d.join("cublaslt_algos.jsonl"))
+            .filter(|p| nv.lt_algos_write.is_none() && p.is_file());
+        if let Some(path) = nv.lt_algos.as_deref().map(std::path::PathBuf::from).or(own) {
             let text = std::fs::read_to_string(&path).map_err(|e| {
                 RuntimeError::Device(format!("PLOW_LT_ALGOS {}: {e}", path.display()))
             })?;
@@ -248,19 +252,6 @@ impl Lt {
             );
         }
         let write = nv.lt_algos_write.as_deref().map(std::path::PathBuf::from);
-        let cutlass_fp8 = nv
-            .cutlass_fp8_decode
-            .as_deref()
-            .map(|pins| {
-                let dir = objects.ok_or_else(|| {
-                    RuntimeError::Rejected(
-                        "PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR or the bundle's objects/"
-                            .into(),
-                    )
-                })?;
-                super::cutlass_fp8::CutlassFp8::load(be, dir, pins)
-            })
-            .transpose()?;
         Ok(Arc::new(Self {
             be: be.clone(),
             api,
@@ -268,12 +259,8 @@ impl Lt {
             workspace,
             stored,
             write,
-            cutlass_fp8,
+            unpinned_warned: std::sync::atomic::AtomicBool::new(false),
         }))
-    }
-
-    pub(crate) fn cutlass_fp8(&self) -> Option<&Arc<super::cutlass_fp8::CutlassFp8>> {
-        self.cutlass_fp8.as_ref()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -344,6 +331,7 @@ impl Lt {
         weight_scale: u64,
         input_scale: u64,
         fast_accum: bool,
+        block: bool,
     ) -> Result<Arc<Plan>> {
         self.be.bind()?;
         let mut plan = Plan {
@@ -356,7 +344,10 @@ impl Lt {
             algo: Algo::default(),
         };
         let mut raw = std::ptr::null_mut();
-        // CUDA 12.9: E4M3=28, BF16=14, OUTER_VEC_32F=3. A is W^T, B is X.
+        // CUDA 12.9: E4M3=28, BF16=14, OUTER_VEC_32F=3, VEC128_32F=4, BLK128x128_32F=5. A is W^T,
+        // B is X. Block route: weight scales [N/128][K/128], activation scales [K/128][m] (m
+        // padded to 4), measured exact against an f64 dequant on cuBLASLt 13.4 (sm_90).
+        let (a_mode, b_mode) = if block { (5, 4) } else { (3, 3) };
         // SAFETY: CUDA C ABI; Plan owns descriptors and the route retains the scale buffers.
         unsafe {
             check(
@@ -364,7 +355,7 @@ impl Lt {
                 "FP8 Lt descriptor",
             )?;
             plan.desc = raw as usize;
-            for (attr, value) in [(3, 1i32), (31, 3), (32, 3)] {
+            for (attr, value) in [(3, 1i32), (31, a_mode), (32, b_mode)] {
                 check(
                     (self.api.cublasLtMatmulDescSetAttribute)(
                         raw,
@@ -1185,6 +1176,22 @@ impl Plan {
             );
             return Ok(());
         }
+        if self.lt.write.is_none()
+            && !self
+                .lt
+                .unpinned_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                m,
+                n,
+                k,
+                pinned_shapes = self.lt.stored.len(),
+                "cuBLASLt plan timed at load: no cublaslt_algos.jsonl row pins it, so the \
+                 algorithm (and its reduction order) can differ between server starts; record \
+                 the bundle's table (campaign probe)"
+            );
+        }
         match pair {
             Some(pair) => self.select_pair(candidates, m, n, k, weight, pair, rows)?,
             None => self.select_timed(candidates, m, n, k, weight, rows, ns)?,
@@ -1628,8 +1635,10 @@ mod tests {
         be.upload(&weight, 0, &w)?;
         be.upload(&ws, 0, bytemuck::cast_slice(&scales))?;
         be.upload(&ws2, 0, bytemuck::cast_slice(&scales2))?;
-        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base, false)?;
-        let second = lt.fp8_plan(m as u32, n as u32, k as u32, ws2.base, xs.base, false)?;
+        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base, false, false)?;
+        let second = lt.fp8_plan(
+            m as u32, n as u32, k as u32, ws2.base, xs.base, false, false,
+        )?;
         for iteration in 1..=2 {
             let xscales: Vec<f32> = (0..m)
                 .map(|i| (1 + i % 8) as f32 * iteration as f32 / 16.0)

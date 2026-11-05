@@ -102,6 +102,12 @@ pub trait VmmOps: Send + Sync {
         None
     }
 
+    /// Block until every copy this backend queued on any stream has completed (teardown, before
+    /// the memory those copies touch is freed). Default: copies are complete on return.
+    fn quiesce(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Take every pooled physical chunk `(handle, bytes)` a previous
     /// [`VmmSlab`] kept via [`Self::pool_put`]. Re-mapping a pooled chunk is
     /// ~free (map+set_access, µs-class) where creating one pays the driver's
@@ -484,6 +490,33 @@ impl VmmRings {
         self.bounded = true;
     }
 
+    /// Slots the rings serve.
+    pub fn slots(&self) -> usize {
+        self.mapped.len()
+    }
+
+    /// What released units the rings keep: `(recycle, bounded, cap)`.
+    pub fn retention(&self) -> (bool, bool, u64) {
+        (self.recycle, self.bounded, self.spare_cap)
+    }
+
+    /// Restore a [`Self::retention`]; `(true, true, 0)` returns every parked slot and spare unit
+    /// to the driver and keeps none released after.
+    pub fn set_retention(&mut self, (recycle, bounded, cap): (bool, bool, u64)) {
+        self.recycle = recycle;
+        self.bounded = bounded;
+        self.spare_cap = cap;
+        self.trim_spare();
+    }
+
+    /// Set the bounded park's cap, releasing what it holds above it.
+    pub fn set_park_cap(&mut self, cap_bytes: u64) {
+        if self.bounded {
+            self.spare_cap = cap_bytes;
+            self.trim_spare();
+        }
+    }
+
     /// Released units kept for reuse ([`Self::enable_handle_recycling`]), parked ones included.
     pub fn spare_bytes(&self) -> u64 {
         let parked = self.parked.iter().filter(|&&p| p).count() as u64;
@@ -684,6 +717,21 @@ impl VmmRings {
         let cap = std::mem::replace(&mut self.spare_cap, 0);
         self.trim_spare();
         self.spare_cap = cap;
+        self.spare_bytes() < before
+    }
+
+    /// [`Self::release_parked`] for at most `max_slots` slots' worth of kept units (bounded
+    /// driver work per call). Returns whether any kept memory went back to the driver.
+    pub fn release_parked_upto(&mut self, max_slots: usize) -> bool {
+        if !self.bounded {
+            return false;
+        }
+        let before = self.spare_bytes();
+        let cap = before.saturating_sub(max_slots as u64 * self.slot_charge());
+        let cap = cap.min(self.spare_cap);
+        let saved = std::mem::replace(&mut self.spare_cap, cap);
+        self.trim_spare();
+        self.spare_cap = saved;
         self.spare_bytes() < before
     }
 
@@ -1326,7 +1374,8 @@ pub trait SnapBlocks: Send + Sync {
     /// where they have not landed. Called at an attach and, ahead of it, by the arrival
     /// prefetch ([`VmmKv::prefetch`]).
     fn restore(&self, handle: u64) -> Result<()>;
-    /// A restore of the boundary's blocks is still in flight.
+    /// A block of the boundary is not readable on the device yet (host-resident, or its
+    /// restore in flight).
     fn restoring(&self, _handle: u64) -> bool {
         false
     }
@@ -1336,6 +1385,11 @@ pub trait SnapBlocks: Send + Sync {
     fn pending_spill_bytes(&self) -> u64;
     /// Device pressure: drop released blocks and give empty slabs back; bytes released.
     fn shrink(&self, bytes: u64) -> u64;
+    /// Boundaries carry recurrent state: one is publishable only while its slot's prefill stands
+    /// exactly at it.
+    fn captures_state(&self) -> bool {
+        false
+    }
 }
 
 impl SnapStore {
@@ -1386,6 +1440,9 @@ struct HostTier {
     quarantined: u32,
 }
 
+/// Spill copies in flight before a new boundary spill waits for them to land (the boundary that
+/// crosses it is queued whole).
+pub const SPILL_AHEAD_INFLIGHT_BYTES: u64 = 256 << 20;
 /// One pinned allocation per chunk of host tier slots.
 const HOST_CHUNK_BYTES: u64 = 1 << 30;
 /// Spills whose device buffer is still held; at the cap the oldest is waited for.
@@ -1675,7 +1732,22 @@ struct Shared {
     /// Bumped by every change to what [`rows_for`] can match (published blocks and snapshots), so
     /// a [`PrefixProbe`] reader may keep a prompt's rows until it moves.
     cache_gen: AtomicU64,
+    /// Block-store restores for the `vmm-restore` worker ([`VmmKv::spawn_spill_ahead`]); `None`
+    /// = no worker, prefetches restore inline.
+    restore_jobs: Mutex<Option<std::collections::VecDeque<RestoreJob>>>,
+    restore_cv: parking_lot::Condvar,
 }
+
+/// A queued block-store restore: a host-resident boundary (snapshot id), or the host-resident
+/// blocks of a device boundary (store handle; blocks it shares with a spilled boundary).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreJob {
+    Snapshot(u64),
+    Blocks(u64),
+}
+
+/// Queue bound: a burst of arrivals beyond it restores at admission instead.
+const RESTORE_JOBS_MAX: usize = 256;
 
 fn cache_changed(s: &Shared) {
     s.cache_gen.fetch_add(1, Ordering::Release);
@@ -1702,6 +1774,11 @@ pub struct VmmKv {
     host_join: Option<std::thread::JoinHandle<()>>,
     /// [`Self::spawn_spill_ahead`]: stop flag + join.
     spill_ahead: Option<(
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
+    /// [`Self::spawn_spill_ahead`]'s restore worker: stop flag + join.
+    restorer: Option<(
         Arc<std::sync::atomic::AtomicBool>,
         std::thread::JoinHandle<()>,
     )>,
@@ -1861,6 +1938,8 @@ impl VmmKv {
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
             generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
             cache_gen: AtomicU64::new(0),
+            restore_jobs: Mutex::new(None),
+            restore_cv: parking_lot::Condvar::new(),
         });
         let mut pool = VmmKv {
             prefix_reuse,
@@ -1872,6 +1951,7 @@ impl VmmKv {
             precreate: None,
             host_join: None,
             spill_ahead: None,
+            restorer: None,
         };
         {
             let mut inner = shared.inner.lock();
@@ -1896,7 +1976,7 @@ impl VmmKv {
         let premap_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
             .name("vmm-premap".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 while let Ok(job) = rx.recv() {
                     let s = &premap_shared;
                     match job {
@@ -1937,7 +2017,7 @@ impl VmmKv {
                         }
                     }
                 }
-            })
+            }))
             .map_err(|e| RuntimeError::Device(format!("vmm premap thread: {e}")))?;
         pool.premap_join = Some(join);
 
@@ -1993,7 +2073,7 @@ impl VmmKv {
         let (t_s, t_stop) = (Arc::clone(&self.shared), Arc::clone(&stop));
         let join = std::thread::Builder::new()
             .name("vmm-kv-pool".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 for _ in 0..target {
                     if t_stop.load(Ordering::Acquire) || t_s.inner.lock().pooled.len() >= target {
                         break;
@@ -2013,7 +2093,7 @@ impl VmmKv {
                         Err(_) => break,
                     }
                 }
-            });
+            }));
         if let Ok(j) = join {
             self.precreate = Some((stop, j));
         }
@@ -2121,7 +2201,7 @@ impl VmmKv {
         let shared = Arc::clone(s);
         let join = match std::thread::Builder::new()
             .name("vmm-host-tier".into())
-            .spawn(move || host_tier_thread(&shared))
+            .spawn(crate::config::inherit(move || host_tier_thread(&shared)))
         {
             Ok(join) => join,
             Err(e) => {
@@ -2431,6 +2511,34 @@ impl VmmKv {
 
     /// Release a finished request's cache holds while retaining its writable KV mappings.
     /// CUDA's inactive decode rows can still write at the saved frontier.
+    /// Free `bytes` more device memory than is free now (and at least `bytes` above the pressure
+    /// floor) for an allocation outside the pool (a live ring commit, a co-tenant load): the
+    /// store's reclaimable chunks first, then LRU boundaries, as the pressure trim does.
+    /// Releases already queued count as made (they land on the store's free thread). Returns
+    /// whether anything was released or queued; `false` without a pressure floor.
+    pub fn reclaim_above_floor(&self, bytes: u64) -> bool {
+        let s = &self.shared;
+        let floor = s.cache_min_free.load(Ordering::Relaxed);
+        if floor == 0 {
+            return false;
+        }
+        let mut inner = s.inner.lock();
+        let free = s.ops.free_bytes().unwrap_or(0);
+        let bytes = free.saturating_sub(floor).saturating_add(bytes);
+        let coming = |inner: &Inner| {
+            s.ops.free_bytes().unwrap_or(0)
+                + inner.release_queued
+                + pending_spill_bytes(inner)
+                + inner
+                    .block_store
+                    .as_ref()
+                    .map_or(0, |hook| hook.pending_spill_bytes())
+        };
+        let before = coming(&inner);
+        trim_cache_above(s, &mut inner, evict_one, bytes);
+        coming(&inner) > before
+    }
+
     pub fn release_prefix(&self, seq: usize) {
         let s = &self.shared;
         let mut inner = s.inner.lock();
@@ -2468,6 +2576,17 @@ impl VmmKv {
 
     pub fn try_attach(&self, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
         self.try_attach_keyed(seq, prompt, None)
+    }
+
+    /// The block-store handle `prompt` would attach, when its boundary lives in the store.
+    pub fn attach_handle(&self, prompt: &[u32], key: Option<&PrefixKey>) -> Option<u64> {
+        let s = &self.shared;
+        let mut inner = s.inner.lock();
+        let id = attach_target(s, &mut inner, prompt, key)?;
+        match snap_ref(&inner, id)?.store {
+            SnapStore::Blocks { handle, .. } => Some(handle),
+            _ => None,
+        }
     }
 
     /// [`Self::try_attach`] with the prompt's block hashes already computed (by the DP router);
@@ -3061,6 +3180,10 @@ impl VmmKv {
             }
         }
         inner.cache.release(&hashes, m.blocks);
+        let state = inner
+            .block_store
+            .as_ref()
+            .is_some_and(|h| h.captures_state());
         let mut best: Option<(usize, u32, bool)> = None;
         for (owner, other) in inner.seqs.iter().enumerate() {
             if owner == seq || !inner.prefilling[owner] {
@@ -3079,7 +3202,11 @@ impl VmmKv {
                 .prompt_rows
                 .saturating_sub(lookback as usize)
                 .div_ceil(br);
-            let block_rows = if shared >= reachable {
+            // A recurrent model's owner captures a checkpoint only at a chunk end it has not
+            // passed yet (`state_capture_cut`).
+            let block_rows = if shared >= reachable
+                && !(state && shared * br <= frontier.get(owner).copied().unwrap_or(0) as usize)
+            {
                 (shared * br) as u32
             } else {
                 0
@@ -3362,19 +3489,65 @@ impl VmmKv {
         let flag = Arc::clone(&stop);
         let spawned = std::thread::Builder::new()
             .name("vmm-spill-ahead".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 while !flag.load(Ordering::Relaxed) {
                     store.reap();
-                    let spilled =
-                        store.device_headroom_bytes() < headroom && spill_ahead_step(&shared);
+                    // Spills in flight count as headroom already, and few are queued at once:
+                    // the copies share the device-to-host copy engine with the engine's own
+                    // readbacks, which waited behind GiB-sized spill bursts (ticks of 0.3-0.9 s
+                    // at c32 on Qwen3.8 BF16, 147 MiB state blocks).
+                    let pending = store.pending_spill_bytes();
+                    let spilled = pending < SPILL_AHEAD_INFLIGHT_BYTES
+                        && store.device_headroom_bytes() + pending < headroom
+                        && spill_ahead_step(&shared);
                     if !spilled {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                 }
-            });
+            }));
         match spawned {
             Ok(j) => self.spill_ahead = Some((stop, j)),
             Err(e) => tracing::warn!(error = %e, "vmm: spill-ahead thread not started"),
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        // Arrival prefetches and admission-time restores queue here: each queues one H2D copy
+        // per host block (2-3 ms per boundary), which on the dispatcher delayed the next tick.
+        *self.shared.restore_jobs.lock() = Some(std::collections::VecDeque::new());
+        let shared = Arc::clone(&self.shared);
+        let spawned = std::thread::Builder::new()
+            .name("vmm-restore".into())
+            .spawn(crate::config::inherit(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    let job = {
+                        let mut jobs = shared.restore_jobs.lock();
+                        if jobs.as_ref().is_some_and(|q| q.is_empty()) {
+                            shared
+                                .restore_cv
+                                .wait_for(&mut jobs, std::time::Duration::from_millis(20));
+                        }
+                        jobs.as_mut().and_then(|q| q.pop_front())
+                    };
+                    match job {
+                        Some(RestoreJob::Snapshot(id)) => {
+                            restore_snapshot_blocks(&shared, id);
+                        }
+                        Some(RestoreJob::Blocks(handle)) => {
+                            let hook = shared.inner.lock().block_store.clone();
+                            if let Some(hook) = hook {
+                                let _ = hook.restore(handle);
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }));
+        match spawned {
+            Ok(j) => self.restorer = Some((stop, j)),
+            Err(e) => {
+                *self.shared.restore_jobs.lock() = None;
+                tracing::warn!(error = %e, "vmm: restore worker not started");
+            }
         }
     }
 
@@ -3781,8 +3954,19 @@ impl PrefixProbe {
         let Some(id) = attach_target(s, &mut inner, prompt, key) else {
             return false;
         };
+        // With the restore worker the copies are queued off this (the dispatcher's) thread.
+        match snap_ref(&inner, id).map(|x| x.store) {
+            Some(SnapStore::Blocks {
+                state: BlockState::Host,
+                ..
+            }) if queue_restore(s, RestoreJob::Snapshot(id)) => return true,
+            Some(SnapStore::Blocks {
+                handle,
+                state: BlockState::Device,
+            }) if queue_restore(s, RestoreJob::Blocks(handle)) => return false,
+            _ => {}
+        }
         let snap = snap_mut(&mut inner, id).expect("found above");
-        let bytes = snap.bytes;
         let handle = match snap.store {
             SnapStore::Host(slot) => {
                 snap.store = SnapStore::Restoring(slot);
@@ -3793,64 +3977,27 @@ impl PrefixProbe {
                 return true;
             }
             SnapStore::Blocks {
-                handle,
                 state: BlockState::Host,
-            } => handle,
+                ..
+            } => {
+                drop(inner);
+                return restore_snapshot_blocks(s, id);
+            }
             // Blocks spilled with another boundary and shared by this one are host-resident
             // under a boundary the pool holds on the device: the store restores those too.
             SnapStore::Blocks {
                 handle,
                 state: BlockState::Device,
-            } => {
-                let hook = inner
-                    .block_store
-                    .clone()
-                    .expect("a block snapshot has a store");
-                drop(inner);
-                let _ = hook.restore(handle);
-                return false;
-            }
+            } => handle,
             _ => return false,
         };
-        snap.store = SnapStore::Blocks {
-            handle,
-            state: BlockState::Restoring,
-        };
-        snap.users += 1;
-        inner.stats.host_prefetches += 1;
         let hook = inner
             .block_store
             .clone()
             .expect("a block snapshot has a store");
         drop(inner);
-        let restored = hook.restore(handle);
-        let mut inner = s.inner.lock();
-        let tick = inner.snapshot_tick;
-        let snap = snap_mut(&mut inner, id).expect("held");
-        snap.users -= 1;
-        match restored {
-            Ok(()) => {
-                snap.store = SnapStore::Blocks {
-                    handle,
-                    state: BlockState::Device,
-                };
-                snap.last_used = tick;
-                inner.stats.host_snapshots -= 1;
-                inner.stats.host_snapshot_bytes -= bytes;
-                inner.stats.snapshot_bytes += bytes;
-                inner.stats.cache_bytes += bytes;
-                inner.stats.snapshots_restored += 1;
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "kv store: prefetch restore failed");
-                snap.store = SnapStore::Blocks {
-                    handle,
-                    state: BlockState::Host,
-                };
-            }
-        }
-        s.host_cv.notify_all();
-        true
+        let _ = hook.restore(handle);
+        false
     }
 
     /// The restore of the boundary `prompt` would attach is still in flight: the request is
@@ -3870,6 +4017,16 @@ impl PrefixProbe {
                 state: BlockState::Restoring,
                 ..
             }) => true,
+            // Not restored yet (its prefetch is queued, or was refused): queue it again; the
+            // gather would otherwise read it in place over the host link. Pending while it is
+            // host-resident (the caller bounds the wait), queued or not.
+            Some(SnapStore::Blocks {
+                state: BlockState::Host,
+                ..
+            }) => {
+                queue_restore(s, RestoreJob::Snapshot(id));
+                true
+            }
             Some(SnapStore::Blocks {
                 handle,
                 state: BlockState::Device,
@@ -3878,6 +4035,7 @@ impl PrefixProbe {
                 drop(inner);
                 let pending = hook.restoring(handle);
                 if pending {
+                    queue_restore(s, RestoreJob::Blocks(handle));
                     s.inner.lock().stats.restore_holds += 1;
                 }
                 return pending;
@@ -3893,6 +4051,79 @@ impl PrefixProbe {
     pub fn key(&self, prompt: &[u32]) -> PrefixKey {
         PrefixKey::new(prompt, self.0.block_rows)
     }
+}
+
+/// Queue `job` for the restore worker; `false` = no worker or the queue is full (the caller
+/// restores inline or not at all). A job already queued is not queued twice.
+fn queue_restore(s: &Shared, job: RestoreJob) -> bool {
+    let mut jobs = s.restore_jobs.lock();
+    let Some(q) = jobs.as_mut() else {
+        return false;
+    };
+    if !q.contains(&job) {
+        if q.len() >= RESTORE_JOBS_MAX {
+            return false;
+        }
+        q.push_back(job);
+        s.restore_cv.notify_one();
+    }
+    true
+}
+
+/// Restore the host-resident block-store boundary `id` (its blocks' H2D copies are queued by
+/// the store; a gather waits on their fences). `false` = it is not a host-resident boundary.
+fn restore_snapshot_blocks(s: &Shared, id: u64) -> bool {
+    let mut inner = s.inner.lock();
+    let Some(snap) = snap_mut(&mut inner, id) else {
+        return false;
+    };
+    let SnapStore::Blocks {
+        handle,
+        state: BlockState::Host,
+    } = snap.store
+    else {
+        return false;
+    };
+    let bytes = snap.bytes;
+    snap.store = SnapStore::Blocks {
+        handle,
+        state: BlockState::Restoring,
+    };
+    snap.users += 1;
+    inner.stats.host_prefetches += 1;
+    let hook = inner
+        .block_store
+        .clone()
+        .expect("a block snapshot has a store");
+    drop(inner);
+    let restored = hook.restore(handle);
+    let mut inner = s.inner.lock();
+    let tick = inner.snapshot_tick;
+    let snap = snap_mut(&mut inner, id).expect("held");
+    snap.users -= 1;
+    match restored {
+        Ok(()) => {
+            snap.store = SnapStore::Blocks {
+                handle,
+                state: BlockState::Device,
+            };
+            snap.last_used = tick;
+            inner.stats.host_snapshots -= 1;
+            inner.stats.host_snapshot_bytes -= bytes;
+            inner.stats.snapshot_bytes += bytes;
+            inner.stats.cache_bytes += bytes;
+            inner.stats.snapshots_restored += 1;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "kv store: prefetch restore failed");
+            snap.store = SnapStore::Blocks {
+                handle,
+                state: BlockState::Host,
+            };
+        }
+    }
+    s.host_cv.notify_all();
+    true
 }
 
 /// The published boundary `prompt` would attach: the longest whose rows the prompt extends.
@@ -4561,6 +4792,11 @@ impl Drop for VmmKv {
             stop.store(true, Ordering::Release);
             let _ = j.join();
         }
+        if let Some((stop, j)) = self.restorer.take() {
+            stop.store(true, Ordering::Release);
+            self.shared.restore_cv.notify_all();
+            let _ = j.join();
+        }
         if let Some(j) = self.host_join.take() {
             {
                 // Under the worker's mutex: it checks the flag and parks on `host_cv` without
@@ -4910,12 +5146,25 @@ fn trim_cache_by(
     inner: &mut Inner,
     evict_one: impl Fn(&Shared, &mut Inner, bool) -> bool,
 ) {
+    trim_cache_above(s, inner, evict_one, 0);
+}
+
+/// [`trim_cache_by`] holding `extra` bytes above the pressure floor (pressure mode only).
+fn trim_cache_above(
+    s: &Shared,
+    inner: &mut Inner,
+    evict_one: impl Fn(&Shared, &mut Inner, bool) -> bool,
+    extra: u64,
+) {
     reap_spills(s, inner);
     if let Some(hook) = &inner.block_store {
         hook.reap();
     }
     demote_expired(s, inner);
-    let min_free = s.cache_min_free.load(Ordering::Relaxed);
+    let min_free = match s.cache_min_free.load(Ordering::Relaxed) {
+        0 => 0,
+        floor => floor.saturating_add(extra),
+    };
     if min_free > 0 {
         if let Some(mut free) = s.ops.free_bytes() {
             if pfx_trace::on() {
@@ -5297,11 +5546,82 @@ pub(crate) fn host_mem_available() -> Option<(u64, u64)> {
 
 /// Host RAM the pinned tier leaves to the rest of the machine: an eighth of it, at least
 /// 16 GiB (pinned pages cannot be reclaimed; a co-tenant build must not OOM-kill the server).
-/// `host_tier_auto` is the tier the rule allows now: `MemAvailable` minus that reserve.
+/// `host_tier_auto` returns `(default tier capacity, host reserve)`; see [`host_tier_default`].
+/// Host-tier bytes granted to live engines' block stores, and the process budget they share.
+static HOST_TIER_GRANTED: AtomicU64 = AtomicU64::new(0);
+static HOST_TIER_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+/// One engine's share of the process host-tier budget, returned when its store goes.
+#[derive(Debug)]
+pub(crate) struct HostTierGrant(u64);
+
+impl HostTierGrant {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Drop for HostTierGrant {
+    fn drop(&mut self) {
+        HOST_TIER_GRANTED.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
+
+/// Grant an engine asking `requested` host-tier bytes its share. The tier pins host memory and
+/// never gives it back, so co-served engines draw from ONE budget — the largest any engine has
+/// asked (its packet's `PLOW_HOST_KVCACHE_SIZE`, or the auto size) — never one each: the second
+/// of two 64 GiB engines gets what the first left. A lone engine gets exactly what it asked.
+pub(crate) fn host_tier_grant(requested: u64) -> HostTierGrant {
+    HOST_TIER_BUDGET.fetch_max(requested, Ordering::AcqRel);
+    let mut granted = HOST_TIER_GRANTED.load(Ordering::Acquire);
+    loop {
+        // Re-read every attempt: a larger request may have raised the budget meanwhile.
+        let budget = HOST_TIER_BUDGET.load(Ordering::Acquire);
+        let give = requested.min(budget.saturating_sub(granted));
+        match HOST_TIER_GRANTED.compare_exchange_weak(
+            granted,
+            granted + give,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return HostTierGrant(give),
+            Err(now) => granted = now,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn co_served_engines_share_one_host_tier_budget() {
+    const G: u64 = 1 << 30;
+    let first = host_tier_grant(64 * G);
+    assert_eq!(first.bytes(), 64 * G, "a lone engine gets what it asked");
+    let second = host_tier_grant(64 * G);
+    assert_eq!(second.bytes(), 0, "never two 64 GiB tiers in one process");
+    drop(first);
+    let third = host_tier_grant(16 * G);
+    assert_eq!(third.bytes(), 16 * G);
+    let fourth = host_tier_grant(64 * G);
+    assert_eq!(
+        fourth.bytes(),
+        48 * G,
+        "what the others left of the largest request"
+    );
+    drop((second, third, fourth));
+    assert_eq!(HOST_TIER_GRANTED.load(Ordering::Acquire), 0);
+}
+
 pub(crate) fn host_tier_auto() -> Option<(u64, u64)> {
     let (avail, total) = host_mem_available()?;
-    let reserve = host_reserve(total);
-    Some((avail.saturating_sub(reserve), reserve))
+    Some((host_tier_default(avail, total), host_reserve(total)))
+}
+
+/// The unconfigured tier: `MemAvailable` less the reserve, and at most a quarter of the host.
+/// The tier never gives pages back, so filling the host to the reserve left a co-tenant
+/// compile (22-38 GB per process) nothing and the OOM killer took the server; the 12B prefix
+/// hit rate moved at most 0.2 pt between 64 GiB and 205 GiB on a 248 GiB host.
+pub(crate) fn host_tier_default(avail: u64, total: u64) -> u64 {
+    avail.saturating_sub(host_reserve(total)).min(total / 4)
 }
 
 pub(crate) fn host_reserve(total: u64) -> u64 {
@@ -6494,7 +6814,7 @@ impl VmmSlab {
         let (t_ops, t_shared) = (Arc::clone(&ops), Arc::clone(&shared));
         let join = std::thread::Builder::new()
             .name("wslab-map".into())
-            .spawn(move || {
+            .spawn(crate::config::inherit(move || {
                 let mut off = 0u64;
                 while off < reserved {
                     if t_shared.m.lock().stop {
@@ -6545,7 +6865,7 @@ impl VmmSlab {
                 if !pooled.is_empty() {
                     t_ops.pool_put(pooled);
                 }
-            })
+            }))
             .map_err(|e| RuntimeError::Device(format!("vmm slab mapper thread: {e}")))?;
         Ok(VmmSlab {
             ops,
@@ -6657,6 +6977,19 @@ pub fn hash_blocks(prompt: &[u32], block_rows: u32) -> Vec<BlockHash> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, AtomicU64};
+
+    #[test]
+    fn host_tier_default_respects_cap_and_reserve() {
+        const GIB: u64 = 1 << 30;
+        // 248 GiB host, idle: a quarter, not everything above the 31 GiB reserve.
+        assert_eq!(host_tier_default(240 * GIB, 248 * GIB), 62 * GIB);
+        // Busy host: the reserve still binds below the quarter.
+        assert_eq!(host_tier_default(60 * GIB, 248 * GIB), 29 * GIB);
+        // Small host: the 16 GiB reserve floor.
+        assert_eq!(host_tier_default(30 * GIB, 32 * GIB), 8 * GIB);
+        assert_eq!(host_tier_default(20 * GIB, 32 * GIB), 4 * GIB);
+        assert_eq!(host_tier_default(10 * GIB, 32 * GIB), 0);
+    }
 
     fn live_blob() -> crate::asset::devblob::DevBlob {
         use crate::asset::devblob::{DevBlob, DevProg, DevTensor};
@@ -8646,6 +8979,32 @@ mod tests {
         policy::check_tree(&p.shared.inner.lock());
     }
 
+    /// With every store boundary on the host, device pressure has nothing to take: the radix
+    /// leaf fallback must not drop host-resident boundaries (it freed no device bytes and emptied
+    /// the host tier, one leaf per retry of a refused publish).
+    #[test]
+    fn reclaim_never_drops_host_resident_store_boundaries() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        p.enable_block_store(Arc::new(SpillBlocks), true);
+        for (i, base) in [0u32, 500].into_iter().enumerate() {
+            let t: Vec<u32> = (base..base + 17).collect();
+            p.try_attach(0, &t).unwrap();
+            p.ensure_rows(0, 17).unwrap();
+            p.publish_blocks(0, &t, 16, Kind::PROMPT_END, || Ok((7 + i as u64, 100)))
+                .unwrap();
+            p.begin_seq(0);
+        }
+        assert!(p.reclaim_one());
+        assert!(p.reclaim_one());
+        assert_eq!(p.stats().host_snapshots, 2);
+        assert!(!p.reclaim_one(), "nothing on the device");
+        let st = p.stats();
+        assert_eq!((st.snapshots_live, st.nodes_evicted), (2, 0));
+        assert_eq!(p.cached_rows(&(500..517).collect::<Vec<u32>>()), 16);
+        policy::check_tree(&p.shared.inner.lock());
+    }
+
     /// Spill-ahead moves the LRU device boundary to the host before any allocation needs
     /// the bytes; the boundary stays attachable; nothing on the device left = nothing spilled.
     #[test]
@@ -8799,6 +9158,37 @@ mod tests {
         p.release_prefix(1); // a trim: one prefix's 4 blocks (256) queued for release + 200 free
         assert_eq!(p.stats().eviction_units, 1);
         assert_eq!(p.stats().cache_blocks, 4, "the other prefix stays cached");
+    }
+
+    /// A commit outside the pool (a live ring) asks for `bytes` more than is free: the same trim
+    /// evicts only until that is free or on its way, and reports whether it did.
+    #[test]
+    fn reclaim_above_floor_evicts_only_for_the_requested_bytes() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 1 << 20);
+        p.enable_deferred_reclaim();
+        let a = prompt(17);
+        let c: Vec<u32> = a.iter().map(|t| t + 1).collect();
+        for (seq, pr) in [(0, &a), (1, &c)] {
+            p.try_attach(seq, pr).unwrap();
+            p.ensure_rows(seq, 17).unwrap();
+            p.publish(seq, pr, 48, |_| Ok(())).unwrap();
+            p.begin_seq(seq);
+        }
+        p.sync_reclaim();
+        assert!(
+            !p.reclaim_above_floor(256),
+            "no pressure floor: nothing to do"
+        );
+        *ops.free_bytes.lock().unwrap() = Some(400);
+        p.enable_pressure_eviction(300);
+        assert!(p.reclaim_above_floor(100), "one prefix (256 B) queued");
+        assert_eq!(p.stats().eviction_units, 1);
+        assert_eq!(p.stats().cache_blocks, 4, "the other prefix stays cached");
+        // Each call asks beyond what is free now; the caller re-reads free memory in between.
+        assert!(p.reclaim_above_floor(100));
+        assert_eq!(p.stats().cache_blocks, 0);
+        assert!(!p.reclaim_above_floor(100), "nothing left to give");
     }
 
     #[test]
@@ -11206,6 +11596,16 @@ mod tests {
         p.shared.inner.lock().spares
     }
 
+    /// Bounded [`VmmKv::sync_reclaim`], twice: the jobs queued so far, then the refill a
+    /// copy-out queues behind them. True once both ran within `limit` each.
+    fn reclaim_settled_within(p: &VmmKv, limit: std::time::Duration) -> bool {
+        let Some(tx) = &p.premap_tx else { return true };
+        (0..2).all(|_| {
+            let (reply, done) = std::sync::mpsc::channel();
+            tx.send(Job::Sync(reply)).is_ok() && done.recv_timeout(limit).is_ok()
+        })
+    }
+
     /// The copy-out gives the cache copies of the released slot's shared row 0 without a single
     /// unmap: the next occupant keeps row 0 in place, and another slot attaches the copies.
     #[test]
@@ -11406,7 +11806,15 @@ mod tests {
                 p.release_prefix(0);
                 p.retire_released(0);
             }
+            // The think time, then the reclaimer's turn: a loaded host can starve its thread
+            // past 25 ms, which is scheduling, not the admission path under test.
             std::thread::sleep(std::time::Duration::from_millis(25));
+            for (rank, (_, p)) in ranks.iter().enumerate() {
+                assert!(
+                    reclaim_settled_within(p, std::time::Duration::from_secs(5)),
+                    "request {request} rank {rank}: reclaim not settled (5 s per round)"
+                );
+            }
         }
         println!("C1 model: worst begin_seq across ranks {worst:?}");
         for (ops, p) in ranks {

@@ -156,6 +156,7 @@ const GEN_DECODE_STEP_DEFAULT: Status = Status::Candidate {
     evidence: &[
         "scripts/gen_kernels/bench_decode.py (k1tune2, H100): the generated hd256 GQA6 flash decode 59 / 200 / 356 / 288 us at B8x4K / B16x8K / B16x15K / B48x4K; the interpreter FlashDecode runs 3.8x the HBM floor at B16x8K",
         "plans/qwen38-27b-h100.md (ab71/ab72, build71/72, step_bench ms, interpreter pair vs object, 4K / 15K): B1 23.85 vs 24.18 / 24.30 vs 25.20; B2 25.08 vs 25.10 / 26.01 vs 26.02; B4 26.90 vs 26.49 / 28.74 vs 27.40; B8 28.21 vs 27.39 / 31.82 vs 29.44; B16 33.46 vs 31.56 / 40.71 vs 35.56; B32 42.78 vs 38.32 (4K): the object from 4 rows",
+        "Qwen3.8-27B FP8 H100 (segmented cuBLASLt / native FP8 rungs, step_bench ctx 4096, interpreter pair vs object at 1 / 2 rows): 14.05 vs 13.56 / 14.69 vs 13.70 ms; BF16 (one-launch rungs) 22.19 vs 22.56 / 23.27 vs 23.38: the FP8 recipe sets 1, the default stays 4",
         "`=0` is the rollback to the interpreter pair",
     ],
 };
@@ -171,7 +172,7 @@ const GEN_DECODE_PIN_NSPLIT: Status = Status::Candidate {
 /// The Qwen3.5 chain's pointwise prefill segments as light launches of the prefill object, four
 /// blocks per SM. The interpreter window runs one 256-thread block per SM (its entry is at the
 /// register cap), which left the issue-bound pointwise arms at 10-30% of their byte floors.
-const QWEN_LIGHT_DEFAULT: Status = Status::Candidate {
+const GDN_LIGHT_DEFAULT: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (segtime62, build59): the chain's pointwise class 24.4 / 74.2 ms per 1024 / 4096 rows as interpreter windows, 16.7 / 52.0 as light launches at occ 2 or 4 (two blocks per SM, the chunk's own tensor table); digests B1 / B8 = build50",
         "`=0` is the rollback to interpreter windows",
@@ -181,7 +182,7 @@ const QWEN_LIGHT_DEFAULT: Status = Status::Candidate {
 /// idle between them (3 ms of a 99 ms tick); its cuBLASLt, light and window launches take only
 /// per-bucket arguments (per-tick data goes through the instruction patch and device tables),
 /// so the runs between the external GDN segments and the rider attention replay as graphs.
-const QWEN_PF_GRAPH: Status = Status::Candidate {
+const GDN_PF_GRAPH: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (srvprof_conv102, segtime108): 1122 launches and 3.0 ms of gaps per 4K c32 tick; the chain still returns to the host at every external GDN segment, so a chunk replays ~50 pieces",
         "ab110 (build106): packed 2x512 / 8x512 digests and RIDE_VS_STEP identical graph on/off; twin110 4K c32 two reps: tok/s 292.1/291.8 vs 290.3/291.1, TPOT p99 96.9/97.3 vs 97.9/97.9, TTFT p99 within 50 ms",
@@ -191,6 +192,12 @@ const QWEN_PF_GRAPH: Status = Status::Candidate {
 /// The packed compact terminal ran its lm_head on the prefill object's tiled MMA arm: one
 /// 1.8-2.0 ms window per tick (seg960 at 4K) for 2.5 GB of weights, ~40% of the byte floor;
 /// the routed decode rungs read the same weights through cuBLASLt at ~2.6 TB/s.
+const FP8_BLOCK_NATIVE: Status = Status::Candidate {
+    evidence: &[
+        "packet-declared native block-FP8 decode object (segment_roles NATIVE_DECODE_FP8_BLOCK); single-projection screen in the qwen FP8 decode campaign",
+        "`=0` serves the declared projections on cuBLASLt (same packet A/B)",
+    ],
+};
 const TERMINAL_LT: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (srvprof_clk15k, segtime108): one interp_pf window of 1.8-2.0 ms per mixed tick = the compact terminal (gather, norm, head, argmax, fin) at 4K and 15K",
@@ -199,9 +206,17 @@ const TERMINAL_LT: Status = Status::Candidate {
 };
 /// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows as light launches of the same
 /// `light_pf` kernel (block-per-row bodies: the window's outputs).
-const QWEN_LIGHT_DECODE: Status = Status::Candidate {
+const GDN_LIGHT_DECODE: Status = Status::Candidate {
     evidence: &[
         "plans/qwen38-27b-h100.md (decprof105, build105): 289 interpreter windows per B16 step at 19.4 us each (5.6 ms of 29.4) beside the cuBLASLt projections; the light launch of the same body costs ~4 us; ab106/ab107 (build106) B16/32/48 29.51/33.09/34.78 -> 27.56/31.00/32.88 ms with 287 windows routed, digests unchanged",
+        "`=0` is the rollback to interpreter windows",
+    ],
+};
+
+/// A routed decode segment [producer -> QuantFp8 1x128 groups] as one `light_quant` launch.
+const LIGHT_QUANT: Status = Status::Candidate {
+    evidence: &[
+        "qwen-fp8-decode campaign (Qwen3.8-27B FP8 hub, H100): 4 interpreter windows per layer [norm|gate|glu -> group quant], 257 per step at 15-29 us (6.55 ms of 21.9 ms B1)",
         "`=0` is the rollback to interpreter windows",
     ],
 };
@@ -245,14 +260,84 @@ const C_PF_SEG_GEMM_SMALL: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
-const C_CUTLASS_FP8_DECODE: &[Constraint] = &[Constraint {
-    id: "cutlass_fp8_decode_requires_seg_dir",
-    formula: F::Implies(
-        &F::Atom("rt.cutlass_fp8_decode", Cmp::Ne, Val::Unset),
-        &F::Atom("rt.pf_seg_dir", Cmp::Ne, Val::Unset),
-    ),
-    site: "crates/plowrt/src/device/cuda/lt.rs: PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR",
-    check: Check::Site,
+/// The prefill segment classing must mirror the emitter's (`DevProg::seg_classes_with`): a runtime
+/// value the packet was not emitted with sends segments to objects built without those arms. A
+/// co-served packet's `PLOW_PF_SEG_FA512=1` under one emitted `PLOW_SEG_FA512=all` put hd256 flash on
+/// its FATLITE flash-class object: a trap and a poisoned context on its first prefill.
+const C_PF_SEG_FA512: &[Constraint] = &[Constraint {
+    id: "pf_seg_fa512_matches_emit",
+    formula: F::And(&[
+            F::Implies(
+                &F::Atom("rt.pf_seg_fa512", Cmp::Eq, Val::Str("1")),
+                &F::Atom("emit.seg_fa512", Cmp::Eq, Val::Str("1")),
+            ),
+            F::Implies(
+                &F::Atom("rt.pf_seg_fa512", Cmp::Eq, Val::Str("all")),
+                &F::Atom("emit.seg_fa512", Cmp::Eq, Val::Str("all")),
+            ),
+            F::Implies(
+                &F::And(&[
+                    F::Atom("rt.pf_seg_fa512", Cmp::Ne, Val::Unset),
+                    F::Atom("rt.pf_seg_fa512", Cmp::Ne, Val::Str("1")),
+                    F::Atom("rt.pf_seg_fa512", Cmp::Ne, Val::Str("all")),
+                ]),
+                &F::Or(&[
+                    F::Atom("emit.seg_fa512", Cmp::Eq, Val::Unset),
+                    F::Atom("emit.seg_fa512", Cmp::Eq, Val::Str("0")),
+                ]),
+            ),
+    ]),
+    site: "crates/plowrt/src/asset/devblob.rs seg_classes_with: PLOW_PF_SEG_FA512 mirrors the emit-side PLOW_SEG_FA512",
+    check: Check::Load,
+}];
+
+/// Pure modes `1` and `fp8` class identically and load the same objects unless `PLOW_PF_SEG_V2`
+/// routes `QuantFp8` by mode, so either serves a packet emitted with the other.
+const C_PF_SEG_PURE: &[Constraint] = &[Constraint {
+    id: "pf_seg_pure_matches_emit",
+    formula: F::And(&[
+        F::Implies(
+            &F::Or(&[
+                F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("1")),
+                F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("fp8")),
+            ]),
+            &F::Or(&[
+                F::And(&[
+                    F::Atom("rt.pf_seg_v2", Cmp::Eq, Val::Unset),
+                    F::Or(&[
+                        F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("1")),
+                        F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("fp8")),
+                    ]),
+                ]),
+                F::And(&[
+                    F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("1")),
+                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("1")),
+                ]),
+                F::And(&[
+                    F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("fp8")),
+                    F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("fp8")),
+                ]),
+            ]),
+        ),
+        F::Implies(
+            &F::Atom("rt.pf_seg_pure", Cmp::Eq, Val::Str("w8a16")),
+            &F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("w8a16")),
+        ),
+        F::Implies(
+            &F::And(&[
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Unset),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("1")),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("fp8")),
+                F::Atom("rt.pf_seg_pure", Cmp::Ne, Val::Str("w8a16")),
+            ]),
+            &F::Or(&[
+                F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Unset),
+                F::Atom("emit.seg_pure_gemm", Cmp::Eq, Val::Str("0")),
+            ]),
+        ),
+    ]),
+    site: "crates/plowrt/src/asset/devblob.rs seg_classes_with: PLOW_PF_SEG_PURE mirrors the emit-side PLOW_SEG_PURE_GEMM",
+    check: Check::Load,
 }];
 
 const C_CHANNEL_MLP_RUNTIME: &[Constraint] = &[Constraint {
@@ -299,9 +384,9 @@ type Reader = fn(&RuntimeConfig) -> Val<'_>;
 const READERS: &[(&str, Reader)] = &[
     ("rt.pf_seg_dir", |c| opt_str(&c.nv.pf_seg_dir)),
     ("rt.pf_seg_gemm_small", |c| opt_str(&c.nv.pf_seg_gemm_small)),
-    ("rt.cutlass_fp8_decode", |c| {
-        opt_str(&c.nv.cutlass_fp8_decode)
-    }),
+    ("rt.pf_seg_pure", |c| opt_str(&c.nv.pf_seg_pure)),
+    ("rt.pf_seg_fa512", |c| opt_str(&c.nv.pf_seg_fa512)),
+    ("rt.pf_seg_v2", |c| opt_str(&c.nv.pf_seg_v2)),
     ("rt.mla_pf_v2", |c| Val::Bool(c.amd.mla_pf_v2)),
     ("rt.serial", |c| Val::Bool(c.apple.serial)),
     ("rt.ane_mlp", |c| Val::Bool(c.apple.ane_mlp)),
@@ -475,6 +560,13 @@ pub fn check_knobs(knobs: &Value, rt: &RuntimeConfig) -> std::result::Result<(),
     let c = &knob_gen::CONSTRAINTS[i];
     let mut vars = Vec::new();
     c.formula.vars(&mut vars);
+    let mut seen = Vec::new();
+    vars.retain(|v| {
+        !seen.contains(v) && {
+            seen.push(*v);
+            true
+        }
+    });
     let shown: Vec<String> = vars
         .iter()
         .filter_map(|v| {
@@ -488,6 +580,68 @@ pub fn check_knobs(knobs: &Value, rt: &RuntimeConfig) -> std::result::Result<(),
         c.site,
         shown.join(" ")
     ))
+}
+
+/// Removed knobs renamed with a unit change: the old name, and its value in the new knob's
+/// spelling (`None` = not a value the old knob took).
+const RENAMED: &[(&str, &str, fn(&str) -> Option<String>)] = &[
+    (
+        "PLOW_VMM_HOST_CACHE_MIB",
+        "PLOW_HOST_KVCACHE_SIZE",
+        |mib| match mib.trim().parse::<u64>().ok()? {
+            0 => Some("0".into()),
+            n => Some(format!("{n}MB")),
+        },
+    ),
+    ("PLOW_QWEN_LIGHT_OCC", "PLOW_GDN_LIGHT_OCC", same_value),
+    (
+        "PLOW_QWEN_LIGHT_DECODE",
+        "PLOW_GDN_LIGHT_DECODE",
+        same_value,
+    ),
+    ("PLOW_QWEN_PF_GRAPH", "PLOW_GDN_PF_GRAPH", same_value),
+    ("PLOW_GLM_ROWBAND", "PLOW_ROWBAND", same_value),
+    (
+        "PLOW_GLM_ROWBAND_CLEAR_WS",
+        "PLOW_ROWBAND_CLEAR_WS",
+        same_value,
+    ),
+    ("PLOW_GLM_DSA_PF_MIN_CTX", "PLOW_DSA_PF_MIN_CTX", same_value),
+];
+
+fn same_value(v: &str) -> Option<String> {
+    Some(v.to_string())
+}
+
+fn renamed_hint(old: &str, new: &str, value: Option<String>) -> String {
+    format!(
+        "{old} was renamed: use {new}={}",
+        value.as_deref().unwrap_or("<size>")
+    )
+}
+
+/// Refuse a renamed knob still set in the environment (`env`), naming the new spelling and
+/// value: the setting is never silently dropped.
+pub fn refuse_renamed_env(env: impl Fn(&str) -> Option<String>) -> std::result::Result<(), String> {
+    for (old, new, convert) in RENAMED {
+        if let Some(v) = env(old) {
+            return Err(renamed_hint(old, new, convert(&v)));
+        }
+    }
+    Ok(())
+}
+
+/// A packet serve default under a renamed knob, as the new knob and value. Packets emitted
+/// before the rename carry the old name; their qualified value carries over exactly.
+pub fn renamed_serve_default(
+    key: &str,
+    value: &str,
+) -> Option<std::result::Result<(String, String), String>> {
+    let (old, new, convert) = RENAMED.iter().find(|(old, _, _)| *old == key)?;
+    Some(match convert(value) {
+        Some(v) => Ok(((*new).to_owned(), v)),
+        None => Err(renamed_hint(old, new, None)),
+    })
 }
 
 /// Warn about each retired knob still set in the environment: it no longer does anything, and
@@ -505,6 +659,181 @@ pub fn warn_removed_env() {
                  (docs/flags-reference.md, \"Serving objective\")"
             );
         }
+    }
+}
+
+/// Where a runtime knob's value lives when one process serves several models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnobScope {
+    /// Configures one model's engine (routes, kernels, KV, its dispatcher): resolved per bundle,
+    /// explicit setting > the bundle's packet default > the built-in default
+    /// ([`crate::config::bundle_config`]).
+    Engine,
+    /// One value for the process (listeners, placement, admission across models, request-path
+    /// parsing, shared pools, diagnostics). Every raw environment read is process-wide.
+    Process,
+}
+
+/// Knob families (env-name prefixes) that configure a model's engine.
+const ENGINE_FAMILIES: &[&str] = &[
+    "PLOW_AMD_",
+    "PLOW_ATTNRES_",
+    "PLOW_CPU_",
+    "PLOW_DECODE_",
+    "PLOW_DSA_",
+    "PLOW_GDN_",
+    "PLOW_GEN_DECODE_",
+    "PLOW_GLM_",
+    "PLOW_HSACO",
+    "PLOW_KDA_",
+    "PLOW_KV_",
+    "PLOW_LT_",
+    "PLOW_MLA_",
+    "PLOW_MOE_",
+    "PLOW_NV_",
+    "PLOW_PF_",
+    "PLOW_PREFIX_",
+    "PLOW_QWEN_",
+    "PLOW_ROWBAND",
+    "PLOW_SEG_",
+    "PLOW_SPEC",
+    "PLOW_TB_",
+    "PLOW_TP_",
+    "PLOW_VMM_",
+];
+
+/// Single engine knobs outside those families.
+const ENGINE_KNOBS: &[&str] = &[
+    "PLOW_AFFINE_Q4_DIR",
+    "PLOW_CFG_DEVICE",
+    "PLOW_CTR_DBUF",
+    "PLOW_DSTEP_EVERY",
+    "PLOW_FP8_DIR",
+    "PLOW_FUSION",
+    "PLOW_GLOBAL_QUEUE",
+    "PLOW_HOST_KVCACHE_SIZE",
+    "PLOW_HSA_DRAIN_BLOCKED",
+    "PLOW_L2_PLACE_DISPATCH",
+    "PLOW_LAUNCH_ROWS",
+    "PLOW_LIGHT_QUANT",
+    "PLOW_LIVE_CTX",
+    "PLOW_LIVE_CTX_MODELS",
+    "PLOW_LM_ROW0",
+    "PLOW_LOWRUNG_MAX",
+    "PLOW_MULTISTEP",
+    "PLOW_MXFP4_DIR",
+    "PLOW_OUT_RANGE",
+    "PLOW_OVERSUB",
+    "PLOW_PACKED_PREFILL_ROUTE",
+    "PLOW_PHASE_OBJECTS",
+    "PLOW_PREFILL_LIGHT",
+    "PLOW_RAGGED_CHUNK",
+    "PLOW_SHARE_CKPT",
+    "PLOW_STATE_CLEAR_DEVICE",
+    "PLOW_STATIC",
+    "PLOW_TERMINAL_LT",
+    "PLOW_TOKEN_BATCH_ROWS",
+    "PLOW_TOKEN_BATCH_WIDE",
+    "PLOW_UPLOAD_DIRECT",
+    "PLOW_UPLOAD_SLOTS",
+    "PLOW_WEIGHT_SLAB",
+    "PLOW_WEIGHT_VMM",
+    "PLOW_XR_TAG_SLOT",
+];
+
+/// Process-wide knob families.
+const PROCESS_FAMILIES: &[&str] = &[
+    "PLOW_ANE_",
+    "PLOW_API_",
+    "PLOW_ASR_",
+    "PLOW_CHAT_",
+    "PLOW_CO_SCHED",
+    "PLOW_COSCHED_",
+    "PLOW_DP",
+    "PLOW_DUMP_",
+    "PLOW_ENCODE_",
+    "PLOW_HET_",
+    "PLOW_HTTP_",
+    "PLOW_METAL_",
+    "PLOW_MM_",
+    "PLOW_OVERLOAD",
+    "PLOW_PFX_",
+    "PLOW_PIN",
+    "PLOW_PUBLISH_",
+    "PLOW_REASONING",
+    "PLOW_ROUTE_",
+    "PLOW_SESSION_",
+    "PLOW_SNAP_",
+    "PLOW_TEST_",
+    "PLOW_TICK_",
+    "PLOW_TRACE_",
+    "PLOW_TTS_",
+    "PLOW_TURN_",
+];
+
+/// Single process-wide knobs.
+const PROCESS_KNOBS: &[&str] = &[
+    "PLOW_ANE",
+    "PLOW_BACKEND",
+    "PLOW_CHECKPOINT",
+    "PLOW_CTR_SNAP",
+    "PLOW_DEFAULT_CHAT_TEMPLATE_KWARGS",
+    "PLOW_DEV_SAMPLE",
+    "PLOW_DEVICES",
+    "PLOW_DRAIN_TIMEOUT_MS",
+    "PLOW_DSTEP_LOG",
+    "PLOW_ENABLE_REASONING",
+    "PLOW_EXIT_ON_ENGINE_DEATH",
+    "PLOW_GENERATION_CONFIG",
+    "PLOW_HOME",
+    "PLOW_HOST_TIMING",
+    "PLOW_LADDER_DEBUG",
+    "PLOW_LIBCUDA",
+    "PLOW_LOAD_PROFILE",
+    "PLOW_MAX_QUEUED_REQUESTS",
+    "PLOW_MAX_REPLY_TOKENS",
+    "PLOW_MODELS_ROOT",
+    "PLOW_NATIVE_LAUNCH_TIMING",
+    "PLOW_OBJECTIVE",
+    "PLOW_OVERRIDE_GENERATION_CONFIG",
+    "PLOW_PLACE",
+    "PLOW_PREFETCH",
+    "PLOW_PREFETCH_THREADS",
+    "PLOW_PREFILL_SEG_TIMING",
+    "PLOW_PRELOAD",
+    "PLOW_REGISTRY",
+    "PLOW_RENDER_YIELD_MARGIN_MS",
+    "PLOW_RT_MAX_CTX",
+    "PLOW_SHED_QUEUE_DEPTH",
+    "PLOW_SIGNING_KEY",
+    "PLOW_SLAB_KEEP",
+    "PLOW_STEP_TIME",
+    "PLOW_SWITCH_TIMEOUT_MS",
+    "PLOW_TBT_SLO_MS",
+    "PLOW_TENS_SNAP",
+    "PLOW_TRUSTED_KEYS",
+    "PLOW_TTFT_LOG",
+    "PLOW_TTFT_SLO_MS",
+    "PLOW_VRAM_BUDGET_MIB",
+];
+
+/// [`KnobScope`] of the knob `env` names; `None` for a name no table classifies (the
+/// `every_knob_has_a_scope` test keeps that set empty for registered knobs). A raw environment
+/// read cannot be scoped, so a knob only [`RAW_ENV`] registers is process-wide; one that is also
+/// a runtime arg is read raw only before the config exists (`config::env_fallback`).
+pub fn knob_scope(env: &str) -> Option<KnobScope> {
+    let runtime = RUNTIME.iter().any(|k| k.env == Some(env));
+    if PROCESS_KNOBS.contains(&env) || (!runtime && RAW_ENV.iter().any(|k| k.env == Some(env))) {
+        return Some(KnobScope::Process);
+    }
+    if ENGINE_KNOBS.contains(&env) {
+        return Some(KnobScope::Engine);
+    }
+    let family = |f: &[&str]| f.iter().any(|p| env.starts_with(p));
+    match (family(ENGINE_FAMILIES), family(PROCESS_FAMILIES)) {
+        (true, false) => Some(KnobScope::Engine),
+        (false, true) => Some(KnobScope::Process),
+        _ => None,
     }
 }
 
@@ -542,7 +871,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.bf16_m4", Some("PLOW_METAL_BF16_M4"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.bf16_m8", Some("PLOW_METAL_BF16_M8"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.affine_q4_dir", Some("PLOW_AFFINE_Q4_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.token_batch", Some("PLOW_TOKEN_BATCH"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.prefix_cache", Some("PLOW_PREFIX_CACHE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_first_lookahead", Some("PLOW_TTS_FIRST_LOOKAHEAD"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("rt.tts_stream_first_frames", Some("PLOW_TTS_STREAM_FIRST_FRAMES"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
@@ -558,12 +886,10 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.asr_request_timeout_ms", Some("PLOW_ASR_REQUEST_TIMEOUT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(120_000)), OPT_IN),
     KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.asr_encode_hold_inflight", Some("PLOW_ASR_ENCODE_HOLD_INFLIGHT"), Layer::Runtime, USIZE, Default::Static(Val::Nat(32)), DIAG),
-    // `strict` refuses every current production bundle until its listed gaps close
-    // (docs/bringup/lean-correctness-inventory.md §9), so it stays opt-in.
-    KnobSpec::new("rt.lean_qualify", Some("PLOW_LEAN_QUALIFY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("off")), OPT_IN),
     KnobSpec::new("rt.asr_context_max_tokens", Some("PLOW_ASR_CONTEXT_MAX_TOKENS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_numerals", Some("PLOW_ASR_NUMERALS"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("rt.asr_stream_finals", Some("PLOW_ASR_STREAM_FINALS"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("rt.asr_auto_languages", Some("PLOW_ASR_AUTO_LANGUAGES"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_vad_packet", Some("PLOW_ASR_VAD_PACKET"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.asr_packets", Some("PLOW_ASR_PACKETS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -583,14 +909,14 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
-    KnobSpec::new("rt.vmm_host_cache_mib", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::Runtime, USIZE, UNSET, OPT_IN),
+    KnobSpec::new("rt.host_kvcache_size", Some("PLOW_HOST_KVCACHE_SIZE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
     KnobSpec::new("rt.kv_mem_util", Some("PLOW_KV_MEM_UTIL"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.mla_pf_row_split", Some("PLOW_MLA_PF_ROW_SPLIT"), Layer::Runtime, Domain::Bool, ON, ROW_SPLIT_QUALIFIED),
     KnobSpec::new("rt.gemm_group_lt", Some("PLOW_AMD_GEMM_GROUP_LT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.mla_pf_row_split_native_lo", Some("PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO"), Layer::Runtime, Domain::Bool, ON, NATIVE_LO_QUALIFIED),
-    KnobSpec::new("rt.glm_rowband_clear_ws", Some("PLOW_GLM_ROWBAND_CLEAR_WS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.rowband_clear_ws", Some("PLOW_ROWBAND_CLEAR_WS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_cache_mib", Some("PLOW_VMM_CACHE_MIB"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_block_mib", Some("PLOW_VMM_BLOCK_MIB"), Layer::Runtime, U32, Default::Static(Val::Nat(2)), OPT_IN),
     KnobSpec::new("rt.weight_vmm", Some("PLOW_WEIGHT_VMM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
@@ -605,7 +931,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefix_arm_end", Some("PLOW_PREFIX_ARM_END"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_strict_publish", Some("PLOW_VMM_STRICT_PUBLISH"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.vmm_ring_recycle", Some("PLOW_VMM_RING_RECYCLE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
-    KnobSpec::new("rt.vmm_ring_park", Some("PLOW_VMM_RING_PARK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.pf_admit_overlap", Some("PLOW_PF_ADMIT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.shed_queue_depth", Some("PLOW_SHED_QUEUE_DEPTH"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
@@ -628,6 +953,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.route_prefix_slack", Some("PLOW_ROUTE_PREFIX_SLACK"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), OPT_IN),
     KnobSpec::new("rt.co_sched", Some("PLOW_CO_SCHED"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.cosched_max_wait_ms", Some("PLOW_COSCHED_MAX_WAIT_MS"), Layer::Runtime, U32, UNSET, DIAG),
+    KnobSpec::new("rt.cosched_early_release", Some("PLOW_COSCHED_EARLY_RELEASE"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.serve_max_queued_requests", Some("PLOW_MAX_QUEUED_REQUESTS"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.models_root", Some("PLOW_MODELS_ROOT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.preload", Some("PLOW_PRELOAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
@@ -691,9 +1017,9 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lt_algos_write", Some("PLOW_LT_ALGOS_WRITE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.lt_pair", Some("PLOW_LT_PAIR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.lt_rung_algos", Some("PLOW_LT_RUNG_ALGOS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.fp8_block_native", Some("PLOW_NV_FP8_BLOCK_NATIVE"), Layer::Runtime, Domain::Bool, ON, FP8_BLOCK_NATIVE),
     KnobSpec::new("rt.lt_fp8_fast_accum_max_k", Some("PLOW_LT_FP8_FAST_ACCUM_MAX_K"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_norm_row_blocks", Some("PLOW_PF_NORM_ROW_BLOCKS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
-    KnobSpec::new("rt.cutlass_fp8_decode", Some("PLOW_CUTLASS_FP8_DECODE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_CUTLASS_FP8_DECODE),
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_light_flash", Some("PLOW_DECODE_LIGHT_FLASH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tb_split_attn", Some("PLOW_TB_SPLIT_ATTN"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
@@ -704,9 +1030,10 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.decode_head_argmax", Some("PLOW_DECODE_HEAD_ARGMAX"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.terminal_lt", Some("PLOW_TERMINAL_LT"), Layer::Runtime, Domain::Bool, ON, TERMINAL_LT),
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.qwen_light_occ", Some("PLOW_QWEN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), QWEN_LIGHT_DEFAULT),
-    KnobSpec::new("rt.qwen_light_decode", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::Runtime, Domain::Bool, ON, QWEN_LIGHT_DECODE),
-    KnobSpec::new("rt.qwen_pf_graph", Some("PLOW_QWEN_PF_GRAPH"), Layer::Runtime, Domain::Bool, ON, QWEN_PF_GRAPH),
+    KnobSpec::new("rt.gdn_light_occ", Some("PLOW_GDN_LIGHT_OCC"), Layer::Runtime, U32, Default::Static(Val::Nat(4)), GDN_LIGHT_DEFAULT),
+    KnobSpec::new("rt.gdn_light_decode", Some("PLOW_GDN_LIGHT_DECODE"), Layer::Runtime, Domain::Bool, ON, GDN_LIGHT_DECODE),
+    KnobSpec::new("rt.light_quant", Some("PLOW_LIGHT_QUANT"), Layer::Runtime, Domain::Bool, ON, LIGHT_QUANT),
+    KnobSpec::new("rt.gdn_pf_graph", Some("PLOW_GDN_PF_GRAPH"), Layer::Runtime, Domain::Bool, ON, GDN_PF_GRAPH),
     KnobSpec::new("rt.decode_lt_qkv", Some("PLOW_DECODE_LT_QKV"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
     KnobSpec::new("rt.moe_dec_lt", Some("PLOW_MOE_DEC_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
@@ -716,14 +1043,15 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.l2_place_dispatch", Some("PLOW_L2_PLACE_DISPATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_dir", Some("PLOW_PF_SEG_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_seg_gemm_small", Some("PLOW_PF_SEG_GEMM_SMALL"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_GEMM_SMALL),
-    KnobSpec::new("rt.pf_seg_pure", Some("PLOW_PF_SEG_PURE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.pf_seg_fa512", Some("PLOW_PF_SEG_FA512"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.pf_seg_pure", Some("PLOW_PF_SEG_PURE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_PURE),
+    KnobSpec::new("rt.pf_seg_fa512", Some("PLOW_PF_SEG_FA512"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_FA512),
     KnobSpec::new("rt.pf_seg_fa256_gqa2", Some("PLOW_PF_SEG_FA256_GQA2"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_graph", Some("PLOW_PF_SEG_GRAPH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pf_shared_tail", Some("PLOW_PF_SHARED_TAIL"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.pf_segment_gates", Some("PLOW_PF_SEGMENT_GATES"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.pf_entry_trace", Some("PLOW_PF_ENTRY_TRACE"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.pf_seg_v2", Some("PLOW_PF_SEG_V2"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.pf_attn_library", Some("PLOW_PF_ATTN_LIBRARY"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pf_attn_gemm", Some("PLOW_PF_ATTN_GEMM"), Layer::Runtime, Domain::Bool, UNSET, PF_ATTN_GEMM_AUTO),
     KnobSpec::new("rt.pf_attn_gemm_tile", Some("PLOW_PF_ATTN_GEMM_TILE"), Layer::Runtime, U32, Default::Static(Val::Nat(2048)), OPT_IN),
     KnobSpec::new("rt.pf_attn_gemm_min_rows", Some("PLOW_PF_ATTN_GEMM_MIN_ROWS"), Layer::Runtime, U32, Default::Static(Val::Nat(1024)), OPT_IN),
@@ -791,7 +1119,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.token_batch_rows", Some("PLOW_TOKEN_BATCH_ROWS"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.decode_min_rung", Some("PLOW_DECODE_MIN_RUNG"), Layer::Runtime, U32, UNSET, DIAG).scoped(DECODE_MIN_RUNG_SCOPE),
     KnobSpec::new("rt.tail_sparse_ctx", Some("PLOW_AMD_TAIL_SPARSE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(TAIL_SPARSE_SCOPE),
-    KnobSpec::new("rt.dsa_pf_min_ctx", Some("PLOW_GLM_DSA_PF_MIN_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.dsa_pf_min_ctx", Some("PLOW_DSA_PF_MIN_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.tail_sparse_min_pairs", Some("PLOW_AMD_TAIL_SPARSE_MIN_PAIRS"), Layer::Runtime, U32, UNSET, OPT_IN).scoped(TAIL_SPARSE_SCOPE),
     KnobSpec::new("rt.token_batch_wide_tiles", Some("PLOW_TOKEN_BATCH_WIDE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, DIAG),
@@ -802,7 +1130,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.amd_decode_dense_exact", Some("PLOW_AMD_DECODE_DENSE_EXACT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN).scoped(DECODE_DENSE_EXACT_SCOPE),
     KnobSpec::new("rt.amd_decode_dense_max_ctx", Some("PLOW_AMD_DECODE_DENSE_MAX_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.cu_mask", Some("PLOW_AMD_CU_MASK"), Layer::Runtime, Domain::Str, UNSET, DIAG),
-    KnobSpec::new("rt.glm_rowband", Some("PLOW_GLM_ROWBAND"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.rowband", Some("PLOW_ROWBAND"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.decode_max_rung", Some("PLOW_DECODE_MAX_RUNG"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.rt_hsaco", Some("PLOW_HSACO"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.fp8_dir", Some("PLOW_FP8_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -892,6 +1220,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_AMD_DECODE_MIN_RUNG", Some("PLOW_AMD_DECODE_MIN_RUNG"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_CFG_MULTISTEP", Some("PLOW_CFG_MULTISTEP"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_CO_SCHED_QUANTUM", Some("PLOW_CO_SCHED_QUANTUM"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_CUTLASS_FP8_DECODE", Some("PLOW_CUTLASS_FP8_DECODE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_IDLE_DISPATCH", Some("PLOW_IDLE_DISPATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_MULTISTEP_ADAPTIVE", Some("PLOW_MULTISTEP_ADAPTIVE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_MUX_INLINE_TICK", Some("PLOW_MUX_INLINE_TICK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
@@ -905,14 +1234,23 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_PIPE_PREFILL", Some("PLOW_PIPE_PREFILL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_CACHE_OUTPUT", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_KV_STORE", Some("PLOW_KV_STORE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_VMM_RING_PARK", Some("PLOW_VMM_RING_PARK"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_VMM_SNAP_PITCHED", Some("PLOW_VMM_SNAP_PITCHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_VMM_SNAP_POOL", Some("PLOW_VMM_SNAP_POOL"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_VMM_HOST_CACHE_MIB", Some("PLOW_VMM_HOST_CACHE_MIB"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_QWEN_LIGHT_OCC", Some("PLOW_QWEN_LIGHT_OCC"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_QWEN_LIGHT_DECODE", Some("PLOW_QWEN_LIGHT_DECODE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_QWEN_PF_GRAPH", Some("PLOW_QWEN_PF_GRAPH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_GLM_ROWBAND", Some("PLOW_GLM_ROWBAND"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_GLM_ROWBAND_CLEAR_WS", Some("PLOW_GLM_ROWBAND_CLEAR_WS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_GLM_DSA_PF_MIN_CTX", Some("PLOW_GLM_DSA_PF_MIN_CTX"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_POLICY", Some("PLOW_PREFIX_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PREFIX_RETIRE_ATTACHED", Some("PLOW_PREFIX_RETIRE_ATTACHED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_QUEUE_TTL_MS", Some("PLOW_QUEUE_TTL_MS"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_RIDE_FIXED", Some("PLOW_RIDE_FIXED"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_RUNG_FAST_PROBE", Some("PLOW_RUNG_FAST_PROBE"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_SERVE_POLICY", Some("PLOW_SERVE_POLICY"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("env.PLOW_TOKEN_BATCH", Some("PLOW_TOKEN_BATCH"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_TOKEN_BATCH_SOLO", Some("PLOW_TOKEN_BATCH_SOLO"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_PUBLISH_URL", Some("PLOW_PUBLISH_URL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PUBLISH_KEY", Some("PLOW_PUBLISH_KEY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -964,6 +1302,112 @@ pub const RAW_ENV: &[KnobSpec] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every registered knob is classified engine or process-wide: a model co-served with
+    /// another resolves its own engine knobs and shares the rest. A new knob outside every
+    /// table fails here until it is placed.
+    #[test]
+    fn every_knob_has_a_scope() {
+        let unscoped: Vec<&str> = RUNTIME
+            .iter()
+            .chain(RAW_ENV)
+            .filter_map(|k| k.env)
+            .filter(|e| knob_scope(e).is_none())
+            .collect();
+        assert!(unscoped.is_empty(), "knobs without a scope: {unscoped:?}");
+        // The families and the single lists never overlap: a knob is one or the other.
+        for e in ENGINE_KNOBS {
+            assert!(!PROCESS_KNOBS.contains(e), "{e} in both lists");
+        }
+    }
+
+    /// What the production packets carry resolves where it acts: their engine knobs per bundle,
+    /// the mux queue bound and the speech front-end settings once per process.
+    #[test]
+    fn packet_serve_knobs_scope_as_they_act() {
+        for e in [
+            "PLOW_PF_SEG_PURE",
+            "PLOW_PF_SEG_FA512",
+            "PLOW_PF_INTERLEAVE",
+            "PLOW_PF_NORM_ROW_BLOCKS",
+            "PLOW_DECODE_MAX_RUNG",
+            "PLOW_MULTISTEP",
+            "PLOW_VMM_PREFIX",
+            "PLOW_VMM_LIVE_RINGS",
+            "PLOW_HOST_KVCACHE_SIZE",
+            "PLOW_LT_RUNG_ALGOS",
+            "PLOW_PREFIX_CACHE",
+            "PLOW_KV_POOL_MIB",
+            "PLOW_TERMINAL_LT",
+            "PLOW_AMD_ROUTER_NATIVE",
+        ] {
+            assert_eq!(knob_scope(e), Some(KnobScope::Engine), "{e}");
+        }
+        for e in [
+            "PLOW_MAX_QUEUED_REQUESTS",
+            "PLOW_TTS_REALTIME",
+            "PLOW_ASR_ENCODE_HOLD_MS",
+            "PLOW_SLAB_KEEP",
+            "PLOW_THROUGHPUT_K",
+            "PLOW_DRAIN_TIMEOUT_MS",
+            "PLOW_COSCHED_EARLY_RELEASE",
+        ] {
+            assert_eq!(knob_scope(e), Some(KnobScope::Process), "{e}");
+        }
+    }
+    #[test]
+    fn renamed_host_cache_knob_is_refused_with_the_new_spelling() {
+        assert_eq!(
+            renamed_serve_default("PLOW_VMM_HOST_CACHE_MIB", "65536"),
+            Some(Ok(("PLOW_HOST_KVCACHE_SIZE".into(), "65536MB".into())))
+        );
+        assert_eq!(
+            renamed_serve_default("PLOW_VMM_HOST_CACHE_MIB", "0"),
+            Some(Ok(("PLOW_HOST_KVCACHE_SIZE".into(), "0".into())))
+        );
+        assert!(matches!(
+            renamed_serve_default("PLOW_VMM_HOST_CACHE_MIB", "lots"),
+            Some(Err(_))
+        ));
+        assert_eq!(
+            renamed_serve_default("PLOW_HOST_KVCACHE_SIZE", "64GB"),
+            None
+        );
+        assert!(is_removed_env("PLOW_VMM_HOST_CACHE_MIB"));
+        assert!(is_runtime_env("PLOW_HOST_KVCACHE_SIZE"));
+        assert_eq!(
+            knob_scope("PLOW_HOST_KVCACHE_SIZE"),
+            Some(KnobScope::Engine)
+        );
+        let env = |k: &str| (k == "PLOW_VMM_HOST_CACHE_MIB").then(|| "65536".to_string());
+        let err = refuse_renamed_env(env).unwrap_err();
+        assert_eq!(
+            err,
+            "PLOW_VMM_HOST_CACHE_MIB was renamed: use PLOW_HOST_KVCACHE_SIZE=65536MB"
+        );
+        assert_eq!(refuse_renamed_env(|_| None), Ok(()));
+    }
+
+    #[test]
+    fn model_named_knobs_are_refused_with_the_technique_name() {
+        for (old, new) in [
+            ("PLOW_QWEN_LIGHT_OCC", "PLOW_GDN_LIGHT_OCC"),
+            ("PLOW_QWEN_LIGHT_DECODE", "PLOW_GDN_LIGHT_DECODE"),
+            ("PLOW_QWEN_PF_GRAPH", "PLOW_GDN_PF_GRAPH"),
+            ("PLOW_GLM_ROWBAND", "PLOW_ROWBAND"),
+            ("PLOW_GLM_ROWBAND_CLEAR_WS", "PLOW_ROWBAND_CLEAR_WS"),
+            ("PLOW_GLM_DSA_PF_MIN_CTX", "PLOW_DSA_PF_MIN_CTX"),
+        ] {
+            assert!(is_removed_env(old) && is_runtime_env(new), "{old}");
+            assert_eq!(
+                renamed_serve_default(old, "4"),
+                Some(Ok((new.into(), "4".into())))
+            );
+            let err = refuse_renamed_env(|k| (k == old).then(|| "1".to_string())).unwrap_err();
+            assert_eq!(err, format!("{old} was renamed: use {new}=1"));
+        }
+    }
+
     use plow_asset::knob::test_util::{check_table, env_reads, files, plow_tokens, ArgFacts};
     use plow_asset::knob::{Formula, KnobSpec, TargetSpec};
     use std::path::PathBuf;
@@ -1072,6 +1516,12 @@ mod tests {
     /// measured with; migrate it to `PLOW_OBJECTIVE` (or an expert override) instead.
     #[test]
     fn recipes_and_launchers_set_no_removed_knob() {
+        // Removed runtime knobs whose name lives on as an object build define (devgen
+        // `def.PLOW_TOKEN_BATCH`), set by the gfx942 object build and its baseline.
+        const DEFINE_TWINS: &[&str] = &["PLOW_TOKEN_BATCH"];
+        let builds_objects = |p: &std::path::Path| {
+            p.ends_with("build_gfx942.sh") || p.ends_with("obj_baseline_gfx942.json")
+        };
         let removed: Vec<&str> = RAW_ENV
             .iter()
             .filter(|k| k.status == Status::Removed)
@@ -1088,6 +1538,7 @@ mod tests {
                 text.lines()
                     .flat_map(plow_tokens)
                     .filter(|t| removed.contains(t))
+                    .filter(|t| !(DEFINE_TWINS.contains(t) && builds_objects(path)))
                     .map(move |t| format!("{}: {t}", path.display()))
             })
             .collect();
@@ -1221,11 +1672,6 @@ mod tests {
             "gpu.rs",
             "PLOW_PF_SEG_GEMM_SMALL requires PLOW_PF_SEG_DIR",
             Site::Encoded("pf_seg_gemm_small_requires_seg_dir"),
-        ),
-        (
-            "lt.rs",
-            "PLOW_CUTLASS_FP8_DECODE requires PLOW_PF_SEG_DIR",
-            Site::Encoded("cutlass_fp8_decode_requires_seg_dir"),
         ),
         (
             "amd.rs",
@@ -1710,6 +2156,43 @@ mod tests {
         k["values"]["emit.glm_xr_band"] = 2.into();
         let err = check_knobs(&k, &rt).unwrap_err();
         assert!(err.contains("seq_par_excludes_two_shot_seams"), "{err}");
+    }
+
+    /// gemma-4-e4b (emitted `PLOW_SEG_FA512=all`) under a co-tenant's `PLOW_PF_SEG_FA512=1` trapped
+    /// on its first prefill; the load check now refuses any runtime classing the packet lacks.
+    #[test]
+    fn load_check_refuses_a_segment_classing_the_packet_was_not_emitted_for() {
+        let mut k = production_knobs();
+        k["values"]["emit.seg_fa512"] = "all".into();
+        k["values"]["emit.seg_pure_gemm"] = "1".into();
+        let mut rt = runtime_config();
+        rt.amd.mla_pf_v2 = true;
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_fa512 = Some("all".into());
+        rt.nv.pf_seg_pure = Some("1".into());
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_fa512 = Some("1".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_fa512_matches_emit"), "{err}");
+        assert_eq!(err.matches("rt.pf_seg_fa512=").count(), 1, "{err}");
+        rt.nv.pf_seg_fa512 = None;
+        // `fp8` classes like the emitted `1` unless PLOW_PF_SEG_V2 routes by mode.
+        rt.nv.pf_seg_pure = Some("fp8".into());
+        check_knobs(&k, &rt).unwrap();
+        rt.nv.pf_seg_v2 = Some("q8".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_pure_matches_emit"), "{err}");
+        rt.nv.pf_seg_v2 = None;
+        rt.nv.pf_seg_pure = Some("w8a16".into());
+        let err = check_knobs(&k, &rt).unwrap_err();
+        assert!(err.contains("pf_seg_pure_matches_emit"), "{err}");
+        // A packet emitted without the classing runs only without it.
+        k["values"]["emit.seg_fa512"] = Value::Null;
+        rt.nv.pf_seg_pure = None;
+        rt.nv.pf_seg_fa512 = Some("1".into());
+        assert!(check_knobs(&k, &rt).is_err());
+        rt.nv.pf_seg_fa512 = Some("0".into());
+        check_knobs(&k, &rt).unwrap();
     }
 
     #[test]

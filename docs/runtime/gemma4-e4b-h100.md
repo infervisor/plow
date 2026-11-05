@@ -335,7 +335,8 @@ Rungs of 48+ rows run their projections on cuBLASLt (see "Decode rungs vs roofli
 
 `scripts/llm/gemma_voice_bench.sh plow|vllm` runs the same client against both servers: TTFT
 p50 ms / TPOT p50 ms / output tok/s. vLLM 0.28 runs from `$PYREF` (`--max-num-seqs 256`,
-`--max-model-len 8192`). Plow runs the recipe (`--multistep-adaptive`, unified token batch).
+`--max-model-len 8192`). Plow runs the recipe (adaptive multistep and the unified token batch, both
+derived by the `auto` objective; the `--multistep-adaptive` flag of that run is removed).
 
 The client sends no `temperature`, so every request samples with the checkpoint's generation
 config (T=1, top_k=64, top_p=0.95). "greedy" pins `temperature: 0` (`BENCH_ARGS`).
@@ -382,10 +383,10 @@ On 54f789dd:
   TTFT p50 / TPOT p50 / tok/s: c1 15.9 / 5.74 / 169, c8 41.9 / 6.40 / 1176, c32 47.7 / 10.4 /
   2870, c64 77.6 / 13.8 / 4185 (vLLM 4187), c128 115 / 20.9 / 5393 (vLLM 5103). Loaded parity
   with 60 background streams: top1 0.992, KL mean 8.3e-4. The c128 TTFT p50 moves between cells
-  with the prompt set (92.6 vs 121.6 ms across two seeds). On one seed with `PLOW_PACKLOG`, the
+  with the prompt set (92.6 vs 121.6 ms across two seeds). On one seed with `PLOW_PF_PACKLOG`, the
   routed and native packets have the same tick structure and TTFT (96.0 vs 96.3 ms); only the
   decode ms/step differs (12.9 vs 16.4).
-* c64 `PLOW_PACKLOG`: decode ticks are 54% of the device time (49 rows, 52.7 ms per multistep
+* c64 `PLOW_PF_PACKLOG`: decode ticks are 54% of the device time (49 rows, 52.7 ms per multistep
   tick), mixed ticks 41% (1922 prefill rows + 51 riders, 31.4 ms), host 0.3%.
 * Riding costs ~0.09 ms/row against ~0.2 ms/row for a separate step, so `sched::ride` keeps
   riding. Smaller launches that would let more ticks carry riders (`PLOW_PF_INTERLEAVE=1024`)
@@ -430,7 +431,7 @@ On 54f789dd:
   * Per request, 1000 prefill rows are 17.4 ms of device and 128 decode tokens at B~50 are
     ~28 ms. That bounds c64 near 2900-3100 tok/s, and plow measures 3041-3117.
 
-### Where the tick time goes (`PLOW_PACKLOG`, c64 sampled)
+### Where the tick time goes (`PLOW_PF_PACKLOG`, c64 sampled)
 
 | | mixed ticks (share of wall, mean) | decode ticks | host gap | idle |
 |---|---|---|---|---|
@@ -462,10 +463,11 @@ buys at most 1%, and it was not built. What is left is device time per token:
   roofline), not a scheduling one.
 * **Ride or step.** A decode row riding a prefill launch costs ~0.16 ms. A standalone step costs
   8.5 + 0.077·B ms. Below ~50 rows riding is cheaper, above ~100 the step is. At c128 the
-  non-riding arm (`PLOW_PF_NO_INTERLEAVE=1`) served 3405 vs 3097 tok/s. `sched::ride` measures
+  non-riding arm (then `PLOW_PF_NO_INTERLEAVE=1`; the knob is removed) served 3405 vs 3097 tok/s. `sched::ride` measures
   both costs per engine and picks per launch: rows ride iff `per-row ride ms × rows ≤ step ms`
   (EWMAs of the observed launches and steps, one launch in 32 explores the other arm).
-  `PLOW_RIDE_FIXED=1` restores always-ride. Sampled, adaptive vs fixed (two adaptive runs):
+  The always-ride control (`PLOW_RIDE_FIXED=1` at the time) is removed with the knob; adaptive
+  ride is the only path. Sampled, adaptive vs fixed (two adaptive runs):
 
   | conc | fixed | adaptive |
   |---|---|---|
@@ -486,7 +488,7 @@ its default automatic prefix caching.
 
 TTFT first turn p50 / later turns p50 (p90) ms, TPOT p50 ms, out tok/s:
 
-| calls | vLLM 0.28 (APC) | plow A: default (token batch) | plow B: `--token-batch=false` | plow A, device-sampled rows |
+| calls | vLLM 0.28 (APC) | plow A: default (token batch) | plow B: token batch off (`--token-batch=false`, since removed: the batch is always on) | plow A, device-sampled rows |
 |---|---|---|---|---|
 | 64 | 33 / 47 (77), 8.5, 2322 | 51 / **42 (65)**, 18.6, 1754 | 74 / 143 (293), 28.3, 1334 | 39 / **39 (57)**, 18.7, 1771 |
 | 200 | 98 / 202 (488), 17.3, 4943 | 87 / 622 (924), 39.4, 3016 | 1793 / 4522 (4646), 33.2, 1428 | 82 / 657 (841), 40.5, 2977 |
@@ -915,7 +917,8 @@ What pf_5 changed:
     only ~0.04 ms.
   * It also shifted E4B numerics deterministically: parity 0.985 → 0.974 over 3 runs, versus
     0.985 with it off. The cause is not identified, so prefill does not use it.
-  * Any PDL user should gate on parity.
+  * Any PDL user should gate on parity. The helper and the device wait are in the tree, unused;
+    the PDL launch route itself is parked on branch `sm90-pdl`, not merged.
 * **HeadNormRope, hd256:** the rope-table fetch (`pos[t]` → cos/sin) is issued with the x
   fetch instead of after the norm: 16.8 → 15.3 µs at 1000 rows, 26 → 22.6 µs at 2000.
 * **NormResidualNorm row teams** load `gn` with the other operands
@@ -1112,7 +1115,8 @@ B=64.
 Tried, not kept:
 * Tail ops (SoftCap/Argmax) inside `plow_light`: NormResidual and GluStrided became ~2 µs
   slower, so the tail got its own kernel.
-* RGM (mma.sync) hd256 flash in the light clone (`PLOW_NV_FA_RGM_LIGHT`): no gain once HNR is
+* RGM (mma.sync) hd256 flash in the light clone (then `PLOW_NV_FA_RGM_LIGHT`; the define is
+  removed): no gain once HNR is
   fused (B=64 7.71 vs 7.64). It also perturbed the interpreter arena.
 * SIMT split-K kernel for the PLE gate (N 256, K 2560): 19.7 µs with a serial last-block
   reduce, 14.0 µs with a distributed reduce, vs 6.0 µs on Lt. B=64 was +0.36 ms.

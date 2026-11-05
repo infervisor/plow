@@ -153,9 +153,10 @@ a 32 GiB card.
 
 > **Pitfall — report the hit rate with any prefix-cache number.** A cache that
 > misses pays snapshot/insert cost with no benefit; at low hit rates the
-> same-slot cache is a net *loss*. **Both are on by default now**, so a
-> benchmark against an engine with prefix caching disabled must set
-> `PLOW_PREFIX_CACHE=0` or random prompts sharing a short lead become hits.
+> same-slot cache is a net *loss*. **Both are on by default and stay on** (a
+> prefix-cache cost is a plowrt bug to fix, never a recipe flip); benchmark
+> against a reference with its prefix cache on too (vLLM APC) and draw unique
+> prompts per cell (`llm_grid.sh`), so a short shared lead does not become a hit.
 > The `BlockHash` collision gap is **closed**: `PrefixCache::lookup` and
 > `insert` compare the stored tokens for each matched block and end the match on
 > a mismatch, counting it in `collisions()` (`memory/prefix.rs`).
@@ -173,9 +174,7 @@ on an AMD TP4 configuration (`perf-data/glm52-ttft-breakdown.md`).
 |---|---|---|---|
 | Chunk-interleave quantum | `--pf-interleave N` / `PLOW_PF_INTERLEAVE` | unset: **CUDA 2048, AMD the widest compiled rung** | rows admitted per tick before decode runs; caps how long a decode stream stalls behind a new prefill. `0` = uncapped, which is AMD's default. AMD TP re-splits a pending compiled step if the cap shrinks after decode becomes live *(both)* |
 | Per-request chunk-row cap | `--pf-chunk N` / `PLOW_PF_CHUNK` | 0 (off) | finer chunking. **Tail-latency tool** — measured a net throughput *loss* at B=8 (`perf-data/serving-capacity-report.md`) *(both; AMD TP uses its compiled ladder)* |
-| Disable chunking / interleave | `--pf-no-chunk`, `--pf-no-interleave` | off | A/B and pure-throughput controls *(both)* |
-| Chunk cost model | `--pf-chunk-cost N` / `PLOW_PF_CHUNK_COST`, `--pf-cover` | 512; `--pf-cover` off | fixed launch cost in padded-row equivalents — **re-fit this on `$GPU`**, the default is another part's number (`perf-data/chunk-cost-model.md`, `perf-data/rtx12-chunked-packing.md`). On the 12B H100 ladder packet the launch fixed cost measures ~5.2 ms against ~0.0398 ms per bucket row, i.e. **≈131 rows**, not 512. `--pf-cover` unset = the cost-aware DP cover (the shipped pick); `=1` restores the covering pick as the A/B control *(nvidia)* |
-| Cross-request prefill scheduling | `--pf-batch` / `PLOW_PF_BATCH` | unset: **AMD on, CUDA off** | NVIDIA packs chunks into one launch when set. AMD packs by default (oldest-first); `=0` is the rollback, and an explicit `=1` additionally rotates isolated admission across slots *(both)* |
+| Removed | `--pf-no-chunk`, `--pf-no-interleave`, `--pf-chunk-cost`/`PLOW_PF_CHUNK_COST`, `--pf-cover`, `--pf-batch`/`PLOW_PF_BATCH` | — | removed with the `--objective` policy: the cost-aware DP cover at 512 rows per launch, chunked + interleaved prefill and packet-declared packing are always on (`docs/flags-reference.md`, "Serving objective", removed table) *(both)* |
 | Throughput mode | `--pf-defer-decode` / `PLOW_PF_DEFER_DECODE=1` | off | run prefill chains to completion before decode. Trades streaming latency for aggregate tok/s. Not a shippable default *(both)* |
 | Ragged-tail chunk | `--amd-ragged-chunk` / `PLOW_RAGGED_CHUNK` | **on** | cover a prompt in fewest launches, run the last chunk at its real row count (measured −239 ms @4097 tok on one part; `exec::amd::rebase_chunk_rows`). `=0` restores the padding-vs-launch DP for a controlled A/B — see the flag's own doc in `config.rs` for the quality-gate caveat *(amd)* |
 | Segmented prefill | `--pf-seg-*` (nvidia), `--amd-seg-window` (amd) | seg-window on | prefill as a sequence of same-occupancy launches (measured −11%/−12% at 8k/16k on one part — `docs/arch/06-runtime.md`, `perf-data/gemma12b-gh200-prefill-campaign.md`). `--pf-seg-*` are mostly A/B diagnostics; emit-side classing must match the blob |

@@ -7,12 +7,26 @@
 #     python3 scripts/campaign/campaign.py build recipes/infervisor/maya2-native/sm90a-h100-tp1.toml --out <fresh dir>
 #
 # Gates: Whisper CER of served speech.
+#
+# 2026-11-01 (plow_git below, packet a8fc6c75a6bd): prompt prefill projections on cuBLASLt
+# (PLOW_EMIT_PREFILL_CUBLASLT, 784 segments). step_bench packed prefill vs the interpreter GEMM,
+# ms: 64 rows 3.91/12.78, 128 4.15/13.57, 256 4.66/14.38, 512 5.91/17.57, 8x64 5.34/16.99,
+# 4x128 5.35/17.46. Served vs the same-commit base (packet ccc4ff76600f), same plowrt, 2 reps:
+# c1 TTFA 34/41 ms, c8 100/108 ms, c32 379/415 ms, audio s/s +1..+3% at c8-c128, nothing slower;
+# tts_cer c1+c8 CER median 0.000 (n=48), as base. Evidence: <lab scratch>/maya2-caps
+# run2, bench-pf, bench-pf-wav, gate-pf.
+# Decode projections on cuBLASLt (PLOW_EMIT_DECODE_CUBLASLT, MIN_ROWS 32) win the backbone step
+# at B64/B128 (3.56/5.52, 5.01/7.72 ms) but serve no faster at c1-c128 (bench-cap: audio s/s and
+# TTFA within 2%, c64 median TTFA +12%): served speech is bound by the depth stage, not the
+# backbone. Decode Lt stops at 128 rows (crates/plow-asset/src/segment_roles.rs:262), and plowrt
+# enables it only when the widest rung is routed, so it needs the ladder capped at 128; capped,
+# c160/c256 trade median TTFA (19.5/75 s vs 3.5/44 s) for audio s/s (8.6/9.2 vs 7.8/6.7). Not adopted.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "maya2-native"
 label = "sm90a-h100-tp1"
-plow_git = "81b75a754edbb1691218521bc1e3e7f9ebcf3bdf"
+plow_git = "817a55cbb588b712f5d69c283300ca7986ad045c"
 network = "qwen3"
 doc = "docs/runtime/tts.md"
 
@@ -20,6 +34,8 @@ doc = "docs/runtime/tts.md"
 vendor = "nvidia"
 isa = "sm_90a"
 sku = "H100 SXM5"
+# CUDA 12.9 nvcc (g++-14 host), as the gemma-4-26b-a4b H100 recipes record.
+toolchain = "cuda-12.9"
 units = 132
 num_gpus = 1
 parallel = "tp"
@@ -79,12 +95,11 @@ PLOW_FUSE_KV_HNR = "1"
 PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_DENSE_TUNE = "1"
 PLOW_NV_FA_FOLD = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
 
 [capabilities]
-masked_padding = "Maya2 speech-LM prompts are short (<512) and padded directly into packed prefill launches"
-segment_roles = "Maya2 Qwen3-1.7B backbone uses native SM90 CUTLASS/CUDA kernels; cuBLASLt dense decode is incompatible with cb0 2049 head"
-generated_kernels = "Native CUTLASS/SM90a attention and GEMV kernels built into interp_sm90a.cubin"
-cublaslt_prefill = "Maya2 uses native SM90 CUTLASS projection kernels for prompt prefill"
+masked_padding = "structural: request chunk limits (masked padding) are Gemma 4 only (crates/devgen/src/lib.rs:9382), and the packed contract needs the plow_pf_masked_padding_abi object capability (crates/plow-asset/src/packed_prefill.rs:87), which only the hd256/hd512 attention and Gemma 4 GLU objects declare; Maya2 is hd128 GQA2 on interp_sm90a*. Unmasked pad rows fit: prompts < 512 rows, max_ctx 2048"
+generated_kernels = "structural: no generated role for hd128 GQA2 attention (16 q / 8 kv heads); the sm_90a catalog tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json has hd256/hd512 entries only, matched on head width (crates/devgen/src/gen_kernels.rs:406,414)"
 
 [bench]
 kind = "speech"

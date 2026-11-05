@@ -345,16 +345,28 @@ pub fn co_sched(models: usize, amd: bool) -> crate::serve::cosched::CoSched {
     }
 }
 
-static CO_SCHED: OnceLock<crate::serve::cosched::CoSched> = OnceLock::new();
+/// The installed [`CoSched`](crate::serve::cosched::CoSched) as its `u8`; `UNSET` before any.
+static CO_SCHED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(UNSET);
+const UNSET: u8 = u8::MAX;
 
-/// Record the mode the device turns were installed with.
+/// Record the mode the device turns were installed with (the first record wins, except that a
+/// `free` one is raised when a group gains co-tenants at runtime).
 pub fn set_co_sched(mode: crate::serve::cosched::CoSched) {
-    let _ = CO_SCHED.set(mode);
+    use std::sync::atomic::Ordering;
+    let free = crate::serve::cosched::CoSched::Free as u8;
+    let _ = CO_SCHED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+        (cur == UNSET || cur == free).then_some(mode as u8)
+    });
 }
 
 /// The installed co-tenant mode (`free` before any turn is installed).
 pub fn installed_co_sched() -> crate::serve::cosched::CoSched {
-    CO_SCHED.get().copied().unwrap_or_default()
+    use crate::serve::cosched::CoSched;
+    match CO_SCHED.load(std::sync::atomic::Ordering::Acquire) {
+        1 => CoSched::Rr,
+        2 => CoSched::Deadline,
+        _ => CoSched::Free,
+    }
 }
 
 #[cfg(test)]

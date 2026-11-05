@@ -93,10 +93,9 @@ enum Cmd {
         backend: String,
     },
     /// Load compiled assets and serve the OpenAI-compatible API.
-    // A serve needs a source: a directory on disk, a reference in the local store, or a packet
-    // ASR model. Grouping them means the error names all of them, rather than telling a
-    // `--model` user that `--assets` is required.
-    #[command(group(clap::ArgGroup::new("model_source").required(true).multiple(true)
+    // A serve can start with models, or with none and receive models dynamically
+    // via /v1/models/load.
+    #[command(group(clap::ArgGroup::new("model_source").required(false).multiple(true)
         .args(["assets", "model", "asr_packets"])))]
     Serve {
         /// One or more compiled-model directories, each `DIR[,checkpoint=PATH][,slug=NAME]`: the
@@ -557,19 +556,6 @@ enum Cmd {
         /// `model.pkt`, or an asset directory containing one (the directory also supplies the
         /// generated roles, the sampler object and the emit replay).
         assets: PathBuf,
-        /// `text` (default) or `json`.
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-
-    /// Lean receipt qualification of every `*.pkt` in each directory: derives the required
-    /// obligations from the packet, matches receipts, checks verifier approval and (unless
-    /// `--no-replay`) replays them. CPU only. Exits non-zero when a packet does not qualify.
-    Qualify {
-        #[arg(long = "assets", required = true)]
-        assets: Vec<PathBuf>,
-        #[arg(long)]
-        no_replay: bool,
         /// `text` (default) or `json`.
         #[arg(long, default_value = "text")]
         format: String,
@@ -1047,6 +1033,10 @@ impl SelectArgs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = plowrt::knob_spec::refuse_renamed_env(|k| std::env::var(k).ok()) {
+        eprintln!("plowrt: {e}");
+        std::process::exit(2);
+    }
     // Before the runtime starts threads and before the CLI reads the environment.
     let asset_defaults = apply_asset_env_defaults();
     let result = tokio::runtime::Builder::new_multi_thread()
@@ -1109,11 +1099,9 @@ async fn async_main(
     // `op-audit --format json` writes a document to stdout; the startup banner
     // would land inside it. Same reason `bench` logs to stderr.
     let structured_output = match &cli.cmd {
-        Cmd::Bench { .. }
-        | Cmd::OpAudit { .. }
-        | Cmd::Inventory { .. }
-        | Cmd::KnobScope { .. }
-        | Cmd::Qualify { .. } => true,
+        Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::Inventory { .. } | Cmd::KnobScope { .. } => {
+            true
+        }
         // A node's check-in parses this array; the banner must not precede it.
         Cmd::Ls { json: true, .. } => true,
         #[cfg(any(
@@ -1159,6 +1147,12 @@ async fn async_main(
         tracing::info!(%key, %value, %source, "serve default from the assets");
     }
     RuntimeConfig::init(cli.rt_cfg);
+    plowrt::config::record_startup(plowrt::config::Startup::from_matches(
+        &matches,
+        asset_defaults
+            .iter()
+            .map(|(k, v, _)| (k.clone(), v.clone())),
+    ));
     let _ = plowrt::obs::serving::started_at_unix_ms();
     plowrt::knob_spec::warn_removed_env();
     match cli.cmd {
@@ -1370,11 +1364,6 @@ async fn async_main(
         } => knob_scope_cmd(
             base, variant, knob, values, workload, model, out, scope_json,
         ),
-        Cmd::Qualify {
-            assets,
-            no_replay,
-            format,
-        } => qualify_cmd(assets, !no_replay, &format),
         Cmd::Inventory { assets, format } => inventory_cmd(&assets, &format),
         Cmd::Devices {
             tp,
@@ -1773,7 +1762,7 @@ mod amd_bench_cli_tests {
     fn serve_accepts_a_packet_asr_model_alone() {
         let cli = Cli::try_parse_from(["plowrt", "serve", "--asr-packet", "asr=a.pkt"]).unwrap();
         assert!(matches!(cli.cmd, super::Cmd::Serve { ref assets, .. } if assets.is_empty()));
-        assert!(Cli::try_parse_from(["plowrt", "serve"]).is_err());
+        assert!(Cli::try_parse_from(["plowrt", "serve"]).is_ok());
     }
 
     #[test]
@@ -3412,50 +3401,6 @@ fn knob_routes(
     Err("the route trace plans the AMD serve: build plowrt with --features hsa".into())
 }
 
-fn qualify_cmd(
-    dirs: Vec<PathBuf>,
-    replay: bool,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut report = Vec::new();
-    let mut failed = 0;
-    for dir in &dirs {
-        for (packet, q) in plowrt::certificate_checks::qualify_dir(dir, replay)? {
-            failed += usize::from(!q.qualified());
-            if format == "json" {
-                report.push(
-                    serde_json::json!({"packet": packet, "qualified": q.qualified(),
-                    "replayed": replay, "qualification": q}),
-                );
-            } else {
-                println!(
-                    "{} {}: {}/{} obligations, {} policy receipts, verifiers {:?}",
-                    if q.qualified() {
-                        "QUALIFIED  "
-                    } else {
-                        "UNQUALIFIED"
-                    },
-                    packet.display(),
-                    q.satisfied.len(),
-                    q.required.len(),
-                    q.policy_receipts,
-                    q.receipt_verifiers
-                );
-                for gap in &q.gaps {
-                    println!("    gap: {gap}");
-                }
-            }
-        }
-    }
-    if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    }
-    if failed > 0 {
-        return Err(format!("{failed} packet(s) do not qualify under the strict policy").into());
-    }
-    Ok(())
-}
-
 fn knob_scope_cmd(
     base: PathBuf,
     variant: PathBuf,
@@ -4046,21 +3991,14 @@ async fn bringup_runtime(
 
     let state = Arc::new(AppState::with_trace(registry, execset, trace));
 
-    // Where a control-plane load may take an assets dir from. Explicit
-    // `--models-root` entries, plus the parents of the dirs this process was
-    // started with — so the common case (serve two of the bundles that already
-    // live side by side) needs no extra flag, while an arbitrary path in a
-    // request body stays refused. `serve::admin` canonicalizes both sides
-    // before the prefix test.
-    let mut roots: Vec<PathBuf> = RuntimeConfig::get()
-        .models_root
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-    roots.extend(
-        assets
-            .iter()
-            .filter_map(|a| a.parent().map(std::path::Path::to_path_buf)),
+    // Where a control-plane load may take an assets dir from (`admin::startup_models_roots`).
+    let store_bundles = plowrt::dist::Store::open_default()
+        .ok()
+        .map(|st| st.root().join("bundles"));
+    let roots = plowrt::serve::admin::startup_models_roots(
+        &RuntimeConfig::get().models_root,
+        &assets,
+        store_bundles,
     );
     state.install_models_roots(roots);
 
@@ -4139,11 +4077,94 @@ async fn bringup_runtime(
         // Keep CLI registration order (registry iteration is sorted by slug).
         models.sort_by_key(|(_, dir, _)| assets.iter().position(|a| a == dir));
 
-        if !models.is_empty() {
-            let budget = RuntimeConfig::get().nv.vram_budget_mib.map(|mib| mib << 20);
+        let budget = RuntimeConfig::get().nv.vram_budget_mib.map(|mib| mib << 20);
+
+        // Visible ordinals.
+        //
+        // `CUDA_VISIBLE_DEVICES` is applied by libcuda at `cuInit`, so the
+        // count below and every ordinal plowrt uses are ALREADY indices
+        // into the masked set — `--devices 1` means the second visible GPU,
+        // not physical GPU 1. That is the vendor's numbering and matching
+        // it is the point; the startup log prints both so the mapping is
+        // never something an operator has to infer.
+        let visible_count = cuda.device_count()?;
+        let mask = device::visibility::describe_env();
+        if !mask.is_empty() {
+            tracing::info!(
+                visible_devices = ?mask,
+                visible_count,
+                "visible-device mask in force; every ordinal below indexes the MASKED set"
+            );
+        }
+
+        let configured = RuntimeConfig::get().devices.clone();
+        // Validate against the visible set BEFORE opening anything, so an
+        // out-of-range ordinal reads as what it is rather than as a device
+        // that would not initialise.
+        if let Some(&bad) = configured.iter().find(|&&d| d >= visible_count) {
+            let hint = if mask.is_empty() {
+                String::new()
+            } else {
+                format!(" (a visible-device mask is in force: {mask:?})")
+            };
+            return Err(format!(
+                "--devices names device {bad}, but only {visible_count} device(s) are \
+                 visible to this process{hint}"
+            )
+            .into());
+        }
+
+        // STRICTLY the requested set: `--devices 1` must not serve on GPU
+        // 0. The already-open probe backend is reused only if its ordinal
+        // is actually in that set.
+        let probe_ordinal = u32::from(cuda.device_ordinal);
+        let wanted = placement::requested_ordinals(&configured, visible_count);
+        let mut backends: Vec<(u32, Arc<device::cuda::CudaBackend>)> =
+            Vec::with_capacity(wanted.len());
+        for d in wanted {
+            if d == probe_ordinal {
+                backends.push((d, Arc::clone(cuda)));
+                continue;
+            }
+            match device::cuda::CudaBackend::new(d as u8) {
+                Ok(b) => backends.push((d, Arc::new(b))),
+                // Enumerated but not usable. Not a "that was the last one"
+                // break any more: the count came from the driver, so this
+                // is a real failure on a device we were told exists.
+                Err(e) => {
+                    return Err(
+                        format!("device {d} of {visible_count} visible will not open: {e}").into(),
+                    )
+                }
+            }
+        }
+        let visible: Vec<u32> = backends.iter().map(|(d, _)| *d).collect();
+
+        if models.is_empty() {
+            let mut managers = Vec::new();
+            for (_ord, be) in &backends {
+                let mgr = Arc::new(plowrt::serve::manager::ModelManager::new(
+                    Arc::clone(be),
+                    &state,
+                    mux_cfg,
+                    Vec::new(),
+                    budget,
+                )?);
+                managers.push(mgr);
+            }
+            let n_groups = managers.len().max(1);
+            state.install_managers(managers);
+            state.install_device_turns(n_groups, true);
+        } else {
             let policy: Place = RuntimeConfig::get().place;
 
-            // Per-model footprint and TP degree, both from the blob header.
+            // Per-model footprint and TP degree, both from the blob header. Holding each packet and
+            // build.json until the initial loads finish makes the plan, the TP probe and the engine
+            // load share one read and parse.
+            let _anchors: Vec<_> = models
+                .iter()
+                .map(|(_, dir, _)| plowrt::asset::packet_image::LoadAnchor::hold(dir))
+                .collect();
             let granularity = cuda.granularity()?;
             let mut specs: Vec<ModelSpec> = Vec::with_capacity(models.len());
             for (slug, dir, checkpoint) in &models {
@@ -4156,74 +4177,10 @@ async fn bringup_runtime(
                     slug: slug.clone(),
                     model: slug.clone(),
                     tp: plowrt::serve::manager::tp_degree(dir)?,
-                    required: plan.tensor_total()
-                        + plowrt::serve::manager::DEFAULT_OVERHEAD
-                        + plowrt::serve::manager::RESERVE,
+                    required: plan.required(plan.overhead_bound) + plowrt::serve::manager::RESERVE,
                     device: None,
                 });
             }
-
-            // Visible ordinals.
-            //
-            // `CUDA_VISIBLE_DEVICES` is applied by libcuda at `cuInit`, so the
-            // count below and every ordinal plowrt uses are ALREADY indices
-            // into the masked set — `--devices 1` means the second visible GPU,
-            // not physical GPU 1. That is the vendor's numbering and matching
-            // it is the point; the startup log prints both so the mapping is
-            // never something an operator has to infer.
-            let visible_count = cuda.device_count()?;
-            let mask = device::visibility::describe_env();
-            if !mask.is_empty() {
-                tracing::info!(
-                    visible_devices = ?mask,
-                    visible_count,
-                    "visible-device mask in force; every ordinal below indexes the MASKED set"
-                );
-            }
-
-            let configured = RuntimeConfig::get().devices.clone();
-            // Validate against the visible set BEFORE opening anything, so an
-            // out-of-range ordinal reads as what it is rather than as a device
-            // that would not initialise.
-            if let Some(&bad) = configured.iter().find(|&&d| d >= visible_count) {
-                let hint = if mask.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (a visible-device mask is in force: {mask:?})")
-                };
-                return Err(format!(
-                    "--devices names device {bad}, but only {visible_count} device(s) are \
-                     visible to this process{hint}"
-                )
-                .into());
-            }
-
-            // STRICTLY the requested set: `--devices 1` must not serve on GPU
-            // 0. The already-open probe backend is reused only if its ordinal
-            // is actually in that set.
-            let probe_ordinal = u32::from(cuda.device_ordinal);
-            let wanted = placement::requested_ordinals(&configured, visible_count);
-            let mut backends: Vec<(u32, Arc<device::cuda::CudaBackend>)> =
-                Vec::with_capacity(wanted.len());
-            for d in wanted {
-                if d == probe_ordinal {
-                    backends.push((d, Arc::clone(cuda)));
-                    continue;
-                }
-                match device::cuda::CudaBackend::new(d as u8) {
-                    Ok(b) => backends.push((d, Arc::new(b))),
-                    // Enumerated but not usable. Not a "that was the last one"
-                    // break any more: the count came from the driver, so this
-                    // is a real failure on a device we were told exists.
-                    Err(e) => {
-                        return Err(format!(
-                            "device {d} of {visible_count} visible will not open: {e}"
-                        )
-                        .into())
-                    }
-                }
-            }
-            let visible: Vec<u32> = backends.iter().map(|(d, _)| *d).collect();
 
             let width = placement::grouping_width(&specs, visible.len())
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
@@ -4620,14 +4577,64 @@ async fn bringup_runtime(
                     let first = u8::try_from(first_of(&key))
                         .map_err(|_| format!("{key}: device ordinal out of range"))?;
                     let t0 = std::time::Instant::now();
-                    let eng =
-                        plowrt::serve::engine::AmdServe::load_on(blob, &hsaco, Some(&ckpt), first)?;
+                    // This bundle's engine defaults, not the first exported bundle's.
+                    let cfg = state.bundle_engine_config(&key, &bundle.dir)?;
+                    let eng = plowrt::config::scoped(Some(cfg), || {
+                        plowrt::serve::engine::AmdServe::load_on(blob, &hsaco, Some(&ckpt), first)
+                    })?;
                     tracing::info!(
                         %key, first_device = first, tp, secs = t0.elapsed().as_secs_f64(),
                         max_ctx = eng.max_ctx(), "AMD engine loaded"
                     );
                     state.install_gpu_engine(key, plowrt::serve::engine::ServeEngine::Amd(eng));
                 }
+            }
+            let mut managers = Vec::with_capacity(layout.groups.len());
+            for (g, group) in layout.groups.iter().enumerate() {
+                let first = u8::try_from(group.first())
+                    .map_err(|_| "device ordinal out of range".to_string())?;
+                let be = Arc::new(plowrt::device::hsa::HsaBackend::new(first)?);
+                let group_models: Vec<(String, PathBuf, PathBuf)> = specs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| layout.assignment[*i] == g)
+                    .filter_map(|(_, s)| {
+                        let bundle = state.registry.get(&s.model).ok()?;
+                        let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
+                        Some((s.slug.clone(), bundle.dir.clone(), ckpt))
+                    })
+                    .collect();
+                let width = u32::try_from(group.ordinals.len()).unwrap_or(u32::MAX);
+                let mgr = Arc::new(plowrt::serve::manager::ModelManager::from_hsa(
+                    be,
+                    width,
+                    &state,
+                    mux_cfg,
+                    group_models,
+                    None,
+                )?);
+                managers.push(mgr);
+            }
+            state.install_managers(managers);
+        } else {
+            let mut managers = Vec::new();
+            for d in 0..visible as u8 {
+                if let Ok(be) = plowrt::device::hsa::HsaBackend::new(d) {
+                    if let Ok(mgr) = plowrt::serve::manager::ModelManager::from_hsa(
+                        Arc::new(be),
+                        1,
+                        &state,
+                        mux_cfg,
+                        Vec::new(),
+                        None,
+                    ) {
+                        managers.push(Arc::new(mgr));
+                    }
+                }
+            }
+            if !managers.is_empty() {
+                state.install_managers(managers);
+                state.install_device_turns(1, false);
             }
         }
     }
@@ -4652,11 +4659,29 @@ async fn bringup_runtime(
                 .into());
             }
             let ckpt = plowrt::asset::serve::checkpoint_dir(&bundle.dir);
-            let eng = plowrt::serve::portable::load_engine(&blob, &ckpt)?;
+            let cfg = state.bundle_engine_config(&slug, &bundle.dir)?;
+            let eng = plowrt::config::scoped(Some(cfg), || {
+                plowrt::serve::portable::load_engine(&blob, &ckpt)
+            })?;
             portable.register(slug.clone(), ckpt);
             state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Cpu(eng));
         }
         state.install_portable_manager(portable);
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    if state.managers().is_empty() {
+        let host_dev = Arc::new(plowrt::serve::manager::HostManagerDevice::new());
+        if let Ok(mgr) = plowrt::serve::manager::ModelManager::with_device(
+            host_dev,
+            &state,
+            mux_cfg,
+            Vec::new(),
+            None,
+        ) {
+            state.install_managers(vec![Arc::new(mgr)]);
+            state.install_device_turns(1, false);
+        }
     }
 
     // Backends without a placement pass serve ONE device set, so one turn covers
@@ -5121,6 +5146,7 @@ async fn serve(
             if let Some(path) = shutdown_socket {
                 let _ = std::fs::remove_file(path);
             }
+            log_library_attention_launches();
             plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
             std::process::exit(1);
         }
@@ -5137,6 +5163,7 @@ async fn serve(
                 let _ = std::fs::remove_file(path);
             }
             tracing::info!("shutdown: drained");
+            log_library_attention_launches();
             plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
             // Engine threads and blocking tick tasks never finish on their own; the runtime's
             // drop would wait on them forever.
@@ -5144,6 +5171,16 @@ async fn serve(
         }
     }
     Ok(())
+}
+
+/// The served / fallback audit line at exit: the exit skips the engines' unload, which logs it.
+fn log_library_attention_launches() {
+    #[cfg(feature = "cuda")]
+    if let Some((served, fallback)) =
+        plowrt::exec::gpu::GpuEngine::library_attention_process_launches()
+    {
+        tracing::info!(served, fallback, "library prefill attention launches");
+    }
 }
 
 /// `plowrt asr --port`: the cohort engine's routes over TCP and, optionally, a Unix socket, with

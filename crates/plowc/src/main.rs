@@ -254,6 +254,12 @@ struct Cli {
           require_equals = true, default_missing_value = "true")]
     lean_oracle_devblob: bool,
 
+    /// Bundle qualification after a devblob emit (`plowc qualify` over the written packets),
+    /// recorded in `build.json` `lean.bundle_qualification`. `strict` also fails the emit on any
+    /// gap; campaign builds of a production recipe (`recipes/infervisor`) pass it.
+    #[arg(long = "lean-qualify", value_enum, default_value_t = LeanQualify::Report)]
+    lean_qualify: LeanQualify,
+
     /// Skip checkpoint K, the knob-consistency certificate. On by default: a rejection, or no
     /// runnable `plow_verify`, fails the emit. Bring-up only: `build.json` records
     /// `knobs.K = "skipped"`: plowrt serves it with a warning, `scripts/freeze_serving_set.sh`
@@ -424,6 +430,12 @@ impl Preset {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LeanQualify {
+    Report,
+    Strict,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum PhaseArg {
     Prefill,
@@ -504,6 +516,27 @@ enum Cmd {
     /// plowc --hf-dir <ckpt> stage-plan --cores 90 --batch 16 --ctx 16384 --out stage_plan.json
     /// ```
     StagePlan(StagePlanCli),
+
+    /// Lean receipt qualification of a bundle directory (every `*.pkt`) or one packet: derives
+    /// the required obligations from the packet, matches receipts, checks verifier approval and
+    /// (unless `--no-replay`) replays them. CPU only. Exits non-zero when a packet does not
+    /// qualify.
+    ///
+    /// ```text
+    /// plowc qualify <assets-dir|model.pkt> [--format json]
+    /// ```
+    Qualify(QualifyCli),
+}
+
+#[derive(Args, Debug)]
+struct QualifyCli {
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+    #[arg(long)]
+    no_replay: bool,
+    /// `text` (default) or `json`.
+    #[arg(long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Args, Debug)]
@@ -1071,6 +1104,16 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 error!(error = %e, "stage-plan failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(Cmd::Qualify(q)) = &cli.cmd {
+        return match run_qualify(q) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!(error = %e, "qualify failed");
                 ExitCode::FAILURE
             }
         };
@@ -1892,9 +1935,6 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         .clone()
         .ok_or("--emit devblob requires --hf-dir <checkpoint>")?;
 
-    let config_json = std::fs::read_to_string(dir.join("config.json"))?;
-    ensure_devblob_arch_supported(&config_json)?;
-
     let slug = plowc::hf_config::dir_slug(&dir);
 
     // Two output shapes:
@@ -2233,6 +2273,13 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         }
     }
 
+    let scope = if out_is_pkt {
+        pkt.as_path()
+    } else {
+        out_dir.as_path()
+    };
+    qualify_emit(scope, &pkt.with_file_name("build.json"), cli.lean_qualify)?;
+
     info!(
         slug = %slug, n_cu, tp, bundle = !out_is_pkt, out = %pkt.display(),
         "devblob written"
@@ -2240,14 +2287,108 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(pkt)
 }
 
-fn ensure_devblob_arch_supported(config_json: &str) -> Result<(), String> {
-    let v: serde_json::Value =
-        serde_json::from_str(config_json).map_err(|e| format!("invalid config.json: {e}"))?;
-    if v["model_type"].as_str() == Some("qwen3_5")
-        && (v.get("quantization_config").is_some()
-            || v["text_config"].get("quantization_config").is_some())
-    {
-        return Err("qwen3_5 native checkpoint FP8 lowering is not implemented yet".into());
+#[cfg(feature = "lean-verify")]
+fn qualify_json(path: &std::path::Path, replay: bool) -> Result<Vec<serde_json::Value>, String> {
+    Ok(plowc::qualify::qualify_path(path, replay)?
+        .into_iter()
+        .map(|(packet, q)| {
+            serde_json::json!({"packet": packet, "qualified": q.qualified(),
+                "replayed": replay, "qualification": q})
+        })
+        .collect())
+}
+
+#[cfg(not(feature = "lean-verify"))]
+fn qualify_json(_path: &std::path::Path, _replay: bool) -> Result<Vec<serde_json::Value>, String> {
+    Err("plowc was built without the `lean-verify` feature".into())
+}
+
+fn print_qualification(entry: &serde_json::Value) {
+    let q = &entry["qualification"];
+    let count = |k: &str| q[k].as_array().map_or(0, Vec::len);
+    println!(
+        "{} {}: {}/{} obligations, {} policy receipts, verifiers {}",
+        if entry["qualified"] == true {
+            "QUALIFIED  "
+        } else {
+            "UNQUALIFIED"
+        },
+        entry["packet"].as_str().unwrap_or_default(),
+        count("satisfied"),
+        count("required"),
+        q["policy_receipts"],
+        q["receipt_verifiers"]
+    );
+    for gap in q["gaps"].as_array().into_iter().flatten() {
+        println!("    gap: {}", gap.as_str().unwrap_or_default());
+    }
+}
+
+fn run_qualify(q: &QualifyCli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut report = Vec::new();
+    for path in &q.paths {
+        report.extend(qualify_json(path, !q.no_replay)?);
+    }
+    if q.format == "json" {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        report.iter().for_each(print_qualification);
+    }
+    let failed = report.iter().filter(|e| e["qualified"] != true).count();
+    if failed > 0 {
+        return Err(format!("{failed} packet(s) do not qualify").into());
+    }
+    Ok(())
+}
+
+/// The emit's own qualification of what it wrote, recorded in `build.json`
+/// `lean.bundle_qualification`; `strict` fails the emit on any gap.
+fn qualify_emit(
+    scope: &std::path::Path,
+    build_json: &std::path::Path,
+    policy: LeanQualify,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (qualified, record) = match qualify_json(scope, true) {
+        Ok(packets) => {
+            for e in &packets {
+                info!(packet = %e["packet"], qualified = %e["qualified"],
+                    gaps = %e["qualification"]["gaps"], "lean qualification");
+            }
+            let qualified = packets.iter().all(|e| e["qualified"] == true);
+            let packets: Vec<_> = packets
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "packet": std::path::Path::new(e["packet"].as_str().unwrap_or_default())
+                            .file_name().and_then(|f| f.to_str()),
+                        "qualified": e["qualified"],
+                        "gaps": e["qualification"]["gaps"],
+                    })
+                })
+                .collect();
+            (
+                qualified,
+                serde_json::json!({"qualified": qualified, "packets": packets}),
+            )
+        }
+        Err(error) => (
+            false,
+            serde_json::json!({"qualified": false, "error": error}),
+        ),
+    };
+    let mut record = record;
+    record["policy"] = serde_json::json!(format!("{policy:?}").to_lowercase());
+    if build_json.is_file() {
+        let mut build: serde_json::Value = serde_json::from_slice(&std::fs::read(build_json)?)?;
+        build["lean"]["bundle_qualification"] = record.clone();
+        std::fs::write(build_json, serde_json::to_vec_pretty(&build)?)?;
+    }
+    if qualified {
+        info!(scope = %scope.display(), "lean bundle qualification complete");
+    } else if policy == LeanQualify::Strict {
+        return Err(format!("strict lean qualification failed: {record}").into());
+    } else {
+        warn!(scope = %scope.display(), "lean bundle qualification incomplete (recorded in build.json)");
     }
     Ok(())
 }
@@ -3720,17 +3861,6 @@ mod cli_tests {
         let mut argv = vec!["plowc", "--hf-dir", "/tmp/x", "--emit", "devblob"];
         argv.extend_from_slice(extra);
         Box::new(try_parse(&argv).expect("parse"))
-    }
-
-    #[test]
-    fn qwen35_devblob_routes_bf16_and_rejects_unimplemented_fp8() {
-        ensure_devblob_arch_supported(r#"{"model_type":"qwen3_5"}"#).unwrap();
-        ensure_devblob_arch_supported(r#"{"model_type":"qwen3"}"#).unwrap();
-        let err = ensure_devblob_arch_supported(
-            r#"{"model_type":"qwen3_5","quantization_config":{"quant_method":"fp8"}}"#,
-        )
-        .unwrap_err();
-        assert!(err.contains("FP8 lowering"));
     }
 
     #[test]

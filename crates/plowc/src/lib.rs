@@ -46,6 +46,8 @@
 pub mod hf_config;
 pub mod net;
 pub mod parallel;
+#[cfg(feature = "lean-verify")]
+pub mod qualify;
 pub mod stage_plan;
 #[cfg(feature = "tuner")]
 pub mod tune;

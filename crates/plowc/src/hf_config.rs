@@ -272,9 +272,14 @@ pub fn dir_slug(dir: &Path) -> String {
     if let Some(repo) = hub_repo_id(dir) {
         return repo.rsplit('/').next().unwrap().to_lowercase();
     }
-    dir.file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_else(|| dir.display().to_string().to_lowercase())
+    let name = |d: &Path| d.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    // A model's `<dir>/checkpoint` names the container, not the model.
+    if name(dir).as_deref() == Some("checkpoint") {
+        if let Some(parent) = dir.parent().and_then(name) {
+            return parent;
+        }
+    }
+    name(dir).unwrap_or_else(|| dir.display().to_string().to_lowercase())
 }
 
 /// Fetch a required integer field or error with its name — never default.
@@ -2505,6 +2510,18 @@ mod tests {
         assert!(plan.ops.iter().any(|o| o.name == "q_a_proj_L0"));
         assert!(plan.ops.iter().any(|o| o.name == "moe_gate_up_L3"));
         assert!(plan.ops.iter().any(|o| o.name == "lm_head"));
+    }
+
+    #[test]
+    fn dir_slug_names_a_checkpoint_subdir_after_its_parent() {
+        assert_eq!(
+            dir_slug(Path::new("/tmp/gemma12b-fp8/checkpoint")),
+            "gemma12b-fp8"
+        );
+        assert_eq!(dir_slug(Path::new("/m/Model-X/Checkpoint")), "model-x");
+        assert_eq!(dir_slug(Path::new("checkpoint")), "checkpoint");
+        assert_eq!(dir_slug(Path::new("/checkpoint")), "checkpoint");
+        assert_eq!(dir_slug(Path::new("/m/checkpoints")), "checkpoints");
     }
 
     #[test]

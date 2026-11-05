@@ -86,5 +86,24 @@ class BenchClientTests(unittest.TestCase):
                 self.assertEqual(argv[:len(prefix)], prefix)
 
 
+class HostSamplerTests(unittest.TestCase):
+    def test_host_start_stop_writes_session_summary(self):
+        server = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                subprocess.run(["bash", "-c", 'source "$1"; pb_host_start "$2" "$3"; sleep 1; pb_host_stop',
+                                "test", str(HELPERS), directory, str(server.pid)],
+                               check=True, env=dict(os.environ, PB_HOST_MS="200"), timeout=20)
+                summary = json.loads((Path(directory) / "host.json").read_text())
+                self.assertEqual(summary["procs"]["peak"], 1)
+                self.assertGreater(summary["rss_mib"]["peak"], 0)
+                self.assertNotIn("pss_mib", summary)
+                self.assertEqual(summary["processes"][0]["pid"], server.pid)
+                self.assertTrue((Path(directory) / "host.tsv").read_text().startswith("t\tprocs"))
+        finally:
+            server.kill()
+            server.wait()
+
+
 if __name__ == "__main__":
     unittest.main()

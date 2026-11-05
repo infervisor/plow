@@ -77,7 +77,7 @@ One all-rank trace of this rung only (`PLOW_TRACE_RAW=1`, `PLOW_TICK_LOG=1`,
 |---|---|---|
 | T1 CPU | build; tests; knob-off `model.pkt` sha256 identical; untouched objects disassembly-identical (dead code can shift sibling codegen, so guard new code with a define); instruction diff equals the declared scope and nothing else | all identical outside scope; diff ⊆ scope |
 | T2 one GPU | kernel harness on captured production operands against **the exact dispatched route** (not a nearby shape, not the library's best, not a re-picked kernel), same inputs, device-event timing, bit or FP floor check. Run control-before/candidate/control-after anchors and emit the lever card's counters. | faster than the interpolated control beyond `abs(ctrl-before - ctrl-after) + 2*MAD`; predicted counters move in the declared direction in at least 3/4 trials; include the boundary cost the change adds or removes (6–52 µs per native↔interpreter transition) |
-| T3 eight GPUs | the rung itself: truncated `--layers N` packet (N just past the changed ops, with its own object set) or the full model on the rung's workload. ctrl / treat / ctrl2 in one job; value check vs the cross-process floor; the lever's firing proven (launch counts, trace) | rung median faster beyond the noise floor; values inside the floor; every other touched rung not slower |
+| T3 eight GPUs | the rung itself on a single block: `--block` or truncated `--layers N` packet (N just past the changed ops, with its own object set) against the block's calibrated roofline; the full model on the rung's workload only where the block harness cannot express the rung (name the gap, `agent-tools.md` "HARD RULE"). ctrl / treat / ctrl2 in one job; value check vs the cross-process floor; the lever's firing proven (launch counts, trace) | rung median faster beyond the noise floor; values inside the floor; every other touched rung not slower |
 | T4 serve | only to flip a default: interleaved ctrl / treat / ctrl2 / treat2 arms, exact-length prompts, ≥ 32 prompts at C1 and ≥ 160 at C16, `--save-detailed`, bootstrap 95% CI of the per-request TTFT/TPOT difference; retrieval base + tail suite; serving guard | CI upper bound < 0 in every cell; no failed requests; TPOT not worse beyond the control spread; retrieval all pass |
 
 Rules at every tier:
@@ -111,8 +111,10 @@ Rules at every tier:
 
 ## 5. Decide, then record
 
-- **Decision:** one of land-opt-in, flip-default, park (with the measured reason), or kill. A
-  T3-positive lever lands opt-in (off by default, byte-identical). A default flips only on T4.
+- **Decision:** one of land (default on), park (with the measured reason), or kill. No
+  default-off knob ships: a T3-positive lever stays on its branch until T4 qualifies it, then lands
+  default on; a parked or killed lever's code does not land. The candidate is judged against the
+  same-concurrency vLLM peer, not against plowrt's own production packet.
 - **Ledger:** append one entry per arm in the §5.1 schema of `plans/lean-knob-verification.md`
   (rung digest, recipe digest, metric, samples, control ids) to the external ledger.
 - **Tracker:** one row in `docs/bringup/tp-bringup-upstream-review-log.md` with numbers and job

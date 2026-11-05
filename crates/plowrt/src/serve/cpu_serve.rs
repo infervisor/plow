@@ -202,7 +202,7 @@ impl CpuServe {
             batch,
             prefix_share_tensors = share_kv.len(),
             packed_prefill = pack.is_some(),
-            token_batch = pack.is_some() && crate::config::RuntimeConfig::get().token_batch,
+            token_batch = pack.is_some(),
             rungs = ?decode_rungs,
             prefill_buckets = ?buckets,
             pf_chunk,
@@ -233,7 +233,7 @@ impl CpuServe {
             share_kv,
             share_rows,
             hist: vec![Vec::new(); batch],
-            token_batch: pack.is_some() && crate::config::RuntimeConfig::get().token_batch,
+            token_batch: pack.is_some(),
             pack,
             pend: vec![0; batch],
             packed_tokens: Vec::new(),
@@ -811,6 +811,11 @@ impl SeqEngine for CpuServe {
             }
         }
         Ok(())
+    }
+
+    /// `token_batch_step` points `lp_row` at each sampled row.
+    fn token_batch_logprobs(&self) -> bool {
+        true
     }
 
     fn take_packed_tokens(&mut self) -> Vec<(usize, u32)> {

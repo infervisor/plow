@@ -530,6 +530,16 @@ impl GpuEngine {
         reqs: &[PfBatchReq<'_>],
         out: &mut Vec<(usize, u32)>,
     ) -> Result<()> {
+        let r = self.prefill_batched_complete_unchecked(reqs, out);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    fn prefill_batched_complete_unchecked(
+        &mut self,
+        reqs: &[PfBatchReq<'_>],
+        out: &mut Vec<(usize, u32)>,
+    ) -> Result<()> {
         if self.packed_terminal.is_none() {
             return Err(RuntimeError::Rejected(
                 "compact packed terminal unavailable".into(),

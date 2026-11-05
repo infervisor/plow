@@ -8,7 +8,7 @@
 
 Run every compiled bucket of the new model through the `plow_verify` Lean CLI
 and get an `ok` certificate from every checkpoint its pipeline calls, then qualify
-the bundle with `plowrt qualify --assets <dir>`: every required obligation present,
+the bundle with `plowc qualify <dir>`: every required obligation present,
 bound to the packet and replayed on an approved verifier. A rejection is a
 real correctness finding, not a warning: it means the compiler produced a
 schedule that the formal model can prove is wrong (a fusion that changes
@@ -49,8 +49,8 @@ re-checks an emit-time obligation and has no stage of its own.
 | F | Allocation safety | No byte-overlapping address-map entries lack a bridging ordering (reclamation-safe) | same bundle as D | `Plow.Memory.AddressMapSound` (via `Plow.Verify`) |
 | G | Staged-LDS fit | Every always-staged GEMV instance fits the decode object's LDS arena | `{"arena", "ops": [...]}` | `Plow.LdsFit.fits_of_check_ok` |
 
-Versioned endpoints, checked at qualification (`plowrt qualify`), not carried as compiler
-receipts (details: [`lean-correctness-inventory.md`](lean-correctness-inventory.md) §10–12):
+Versioned endpoints, checked at qualification (`plowc qualify`), not carried as compiler
+receipts (details: [`lean-correctness-inventory.md`](lean-correctness-inventory.md) §10–13):
 
 | ID | Proves | Input derived by | Backing theorems |
 |----|--------|------------------|------------------|
@@ -58,6 +58,7 @@ receipts (details: [`lean-correctness-inventory.md`](lean-correctness-inventory.
 | `kv_ring.v1` | No packed prefill launch writes a sliding-ring row its own queries read | `plow_asset::kv_ring` (runtime planner) | `Plow.KvRing.checkLaunch_sound`, `launch_safe_masked`, `slots_distinct` |
 | `vmm_trace.v1` | VMM driver traces keep mappings on live handles, disjoint, inside reservations; everything returned | `memory::vmm` mock traces (test) | `Plow.KvRing.traceOk_sound`, `step_preserves` |
 | `speech_fusion.v1` | Fused LayerNorm prologue / Conv1dF32 row_scale sites meet `Plow.Speech`'s preconditions | `plow_asset::speech_fusion` | `Plow.SpeechFusion.ln_site_gemm_eq`, `conv_site_in_bounds`, `conv_site_eq` |
+| `page_envelope.v1` | The paged library attention loader reads only its request's padded page-table row, at every split count up to the cap | `exec::gpu::lib_attention` constants (test) | `Plow.PageEnvelope.checkRoute_sound`, `route_safe`, `envelope_tight` |
 
 Detail per checkpoint:
 
@@ -224,8 +225,8 @@ Debug aids: `PLOW_VERIFY_DUMP=<dir>` writes every request to a file for replay;
 
 - `cd lean-plow && lake build plow_verify proof_audit && lake exe proof_audit`
   completes clean; `scripts/lean_correctness_ci.sh` passes.
-- `plowrt qualify --assets <dir>` lists no gap you cannot name (the strict
-  policy, `PLOW_LEAN_QUALIFY=strict`, refuses any gap at load).
+- `plowc qualify <dir>` lists no gap you cannot name (a
+  `--lean-qualify strict` emit refuses any gap).
 - No `sorry` and no vacuous/tautological proofs anywhere in `lean-plow/`
   (`grep -rn 'sorry' lean-plow --include='*.lean'` returns nothing outside
   comments; every `rule_*` theorem is a real equality that closes by `rfl`).
@@ -270,7 +271,7 @@ Debug aids: `PLOW_VERIFY_DUMP=<dir>` writes every request to a file for replay;
   [`ProofAudit.lean`](../../lean-plow/ProofAudit.lean) +
   [`proof-manifest.json`](../../lean-plow/proof-manifest.json).
 - Qualification: `plow_asset::certificates` (`qualify_packet`, `qualify_sidecar`),
-  `plowrt::certificate_checks` (`qualify_dir`, `plowrt qualify`).
+  `plowc::qualify` (`qualify_dir`, `plowc qualify`).
 - Handlers `checkA`…`checkG`:
   [`lean-plow/Plow/CLI/Checkpoints.lean`](../../lean-plow/Plow/CLI/Checkpoints.lean);
   stack-safe D/F twin

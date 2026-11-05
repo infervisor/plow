@@ -10,6 +10,8 @@ pub(super) struct DecodeSegment {
     pub(super) output_bytes: u64,
     pub(super) input_bytes: u64,
     pub(super) weight_bytes: u64,
+    /// Block-scaled FP8 ([`packet::dev::FP8_BLOCK_GROUP`]): cuBLASLt runs `m` padded to 4.
+    pub(super) block: bool,
 }
 
 pub(super) struct CublasLtDecodeRoute {
@@ -277,12 +279,44 @@ impl LightOp {
     }
 }
 
+/// `PlowLightQuantArgs` (interp_sm120.cu): `light_quant`'s producer and quant by value.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightQuantArgs {
+    p: LightQuantOp,
+    q: LightQuantOp,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightQuantOp {
+    d: DevInst64,
+    t: [u64; 8],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<DevInst64>() == 64
+        && std::mem::size_of::<LightQuantOp>() == 128
+        && std::mem::size_of::<LightQuantArgs>() == 256
+        && std::mem::align_of::<LightQuantArgs>() == 8
+);
+
+impl LightQuantOp {
+    fn resolve(d: &DevInst64, devp: &[DeviceMem]) -> Self {
+        let op = LightOp::resolve(d, devp);
+        Self { d: op.d, t: op.t }
+    }
+}
+
 struct LightLaunch {
     function: KernelFn,
     xs: LightX,
     kind: LightKind,
     /// Light ABI 2: the launch's instructions by value (`Single` = `op[0]`).
     direct: Option<Box<LightSpan>>,
+    /// `light_quant`'s arguments (its only parameter), resolved at load: decode routes only (one
+    /// tensor table; `run_with`'s per-slot table never reaches them).
+    quant: Option<Box<LightQuantArgs>>,
     instruction: u32,
     blocks: u32,
     block: u32,
@@ -298,6 +332,19 @@ impl LightRoute {
     /// table (kv.*, recurrent state) through its kernarg; the route's own copy is slot 0's.
     pub(super) fn run_with(&self, stream: &CudaStream, tensors: u64) -> Result<()> {
         for launch in &self.launches {
+            if let Some(args) = &launch.quant {
+                let mut args = **args;
+                let mut params = [&mut args as *mut LightQuantArgs as *mut std::ffi::c_void];
+                self.be.launch_kernel(
+                    launch.function,
+                    launch.blocks,
+                    launch.block,
+                    launch.smem,
+                    &mut params,
+                    Some(stream),
+                )?;
+                continue;
+            }
             if let Some(span) = &launch.direct {
                 let mut span = **span;
                 let mut op = span.op[0];
@@ -368,6 +415,8 @@ pub(super) struct LightFunctions {
     /// `plow_<arch>_light_attn_s`: the hd256 attention alone, two blocks per SM.
     attn_s: Option<KernelFn>,
     fp8_flash256: Option<(KernelFn, u32)>,
+    /// `plow_<arch>_light_router`, its arena and `plow_light_router_ops` (the opcodes it runs).
+    router: Option<(KernelFn, u32, u32)>,
     /// `plow_<arch>_light_head` (unaligned lm_head tail).
     pub(super) head: Option<KernelFn>,
     /// `plow_<arch>_light_flash` (streamed hd128 FlashDecode) and its smem.
@@ -376,6 +425,31 @@ pub(super) struct LightFunctions {
     pub(super) prefill: Option<KernelFn>,
     /// `plow_light_pf_qwen_conv`: `light_pf` also runs the Qwen decode conv step.
     pub(super) prefill_conv: bool,
+    /// `plow_<arch>_light_qnorm`: a routed decode rung's QwenRmsNorm, register-resident rows.
+    pub(super) qwen_norm: Option<KernelFn>,
+    /// `plow_<arch>_light_quant` (`plow_light_quant_abi` 1 or 2, `PLOW_LIGHT_QUANT`): a decode segment
+    /// [producer -> QuantFp8 1x128 groups] as one launch (`light_quant_pair`), and
+    /// `plow_<arch>_light_quant_norm` for the RMSNorm producer.
+    pub(super) quant: Option<LightQuant>,
+}
+
+/// The `light_quant` entries of a decode object.
+#[derive(Clone, Copy)]
+pub(super) struct LightQuant {
+    pointwise: KernelFn,
+    norm: KernelFn,
+    norm_threads: u32,
+}
+
+/// Block size of `light_quant_norm` for an object's `plow_light_quant_abi` and
+/// `plow_light_quant_norm_threads`: ABI 1 = 256 threads, ABI 2 = the declared 1024; anything else
+/// keeps the interpreter window.
+fn light_quant_norm_threads(abi: Option<u32>, threads: Option<u32>) -> Option<u32> {
+    match (abi, threads) {
+        (Some(1), _) => Some(256),
+        (Some(2), Some(1024)) => Some(1024),
+        _ => None,
+    }
 }
 
 /// `FA_ST_THREADS`: eight row-group warps and the producer warp.
@@ -439,6 +513,23 @@ pub(super) fn light_functions(
         .get_function(module, &format!("plow_{arch}_light_pf"))
         .ok()
         .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light);
+    let qwen_norm = prefill.and_then(|_| {
+        be.get_function(module, &format!("plow_{arch}_light_qnorm"))
+            .ok()
+    });
+    let quant = match light_quant_norm_threads(
+        be.module_global_u32(module, "plow_light_quant_abi")?,
+        be.module_global_u32(module, "plow_light_quant_norm_threads")?,
+    ) {
+        Some(norm_threads) if crate::config::RuntimeConfig::get().nv.light_quant => {
+            Some(LightQuant {
+                pointwise: be.get_function(module, &format!("plow_{arch}_light_quant"))?,
+                norm: be.get_function(module, &format!("plow_{arch}_light_quant_norm"))?,
+                norm_threads,
+            })
+        }
+        _ => None,
+    };
     let prefill_conv = prefill.is_some()
         && be
             .module_global_u32(module, "plow_light_pf_qwen_conv")?
@@ -454,6 +545,17 @@ pub(super) fn light_functions(
             .ok()
     } else {
         None
+    };
+    let router = match (
+        be.module_global_u32(module, "plow_light_router_smem")?,
+        be.module_global_u32(module, "plow_light_router_ops")?,
+    ) {
+        (Some(smem), Some(ops)) if abi == Some(2) => {
+            let f = be.get_function(module, &format!("plow_{arch}_light_router"))?;
+            be.set_max_dynamic_smem(f, smem)?;
+            Some((f, smem, ops))
+        }
+        _ => None,
     };
     let attn_s = match be.get_function(module, &format!("plow_{arch}_light_attn_s")) {
         Ok(f) if crate::config::RuntimeConfig::get().nv.decode_light_attn_s => {
@@ -473,11 +575,31 @@ pub(super) fn light_functions(
         attn,
         attn_s,
         fp8_flash256,
+        router,
         head,
         flash,
         prefill,
         prefill_conv,
+        qwen_norm,
+        quant,
     }))
+}
+
+impl LightFunctions {
+    /// `Some(scoped)` when `plow_<arch>_light_router` runs `d` (`scoped`: a router-window opcode
+    /// that makes a segment a router window; RmsNorm and QuantFp8 only ride along).
+    fn router_op(&self, d: &packet::dev::DevInst64) -> Option<bool> {
+        let (_, _, ops) = self.router?;
+        let (bit, scoped) = match DevOp::from_u16(d.op)? {
+            DevOp::RmsNorm => (1, false),
+            DevOp::MoeRouterGemmaScoreFast => (2, true),
+            DevOp::MoeRouterGemmaTopk => (4, true),
+            DevOp::MoeAlignGemmaPf => (8, true),
+            DevOp::QuantFp8 => (16, false),
+            _ => return None,
+        };
+        (ops & bit != 0).then_some(scoped)
+    }
 }
 
 fn fp8_attention_tail(d: &packet::dev::DevInst64) -> bool {
@@ -597,11 +719,26 @@ pub(super) fn light_segments(
                     op(inst),
                     Some(DevOp::NormResidual | DevOp::NormResidualNorm | DevOp::GluStrided)
                 );
-                if matches!(op(inst), Some(DevOp::AddNorm | DevOp::Glu))
-                    || (functions.gemma && gemma_op)
+                if matches!(
+                    op(inst),
+                    Some(DevOp::AddNorm | DevOp::Glu | DevOp::GluPitched)
+                ) || (functions.gemma && gemma_op)
                 {
                     return Some((seg, vec![(inst, 0)]));
                 }
+            }
+            if functions.gemma
+                && insts.iter().any(|&i| {
+                    functions
+                        .router_op(&g.insts[i])
+                        .is_some_and(|scoped| scoped)
+                })
+                && insts.iter().all(|&i| {
+                    op(i) == Some(DevOp::NormResidualNorm)
+                        || functions.router_op(&g.insts[i]).is_some()
+                })
+            {
+                return Some((seg, insts.iter().map(|&i| (i, 0)).collect()));
             }
             let attn_hd = |hd: u32| functions.attn.is_some_and(|(_, _, hds)| hds.contains(&hd));
             let attn = functions.attn.is_some()
@@ -677,7 +814,7 @@ pub(super) fn prefill_light_segments(
     light_segments_matching(g, library, 3, |d| match DevOp::from_u16(d.op) {
         Some(DevOp::RmsNorm) => d.t[3] == none && d.t[4] == none,
         Some(DevOp::Residual) => true,
-        Some(DevOp::Glu) => d.i[1] == 1,
+        Some(DevOp::Glu | DevOp::GluPitched) => d.i[1] == 1,
         _ => false,
     })
 }
@@ -685,12 +822,15 @@ pub(super) fn prefill_light_segments(
 /// The Qwen3.5 chain's interpreter segments made only of its prefill pointwise arms (and SiLU
 /// Glu / Residual), at most four instructions: `plow_<arch>_light_pf` of the PREFILL object runs
 /// them one launch each in program order (`qwen_light_route`).
+/// `quant` (the tensors, when `light_quant` runs): also the [producer, QuantFp8] pairs of
+/// `light_quant_pair`.
 pub(super) fn qwen_light_segments(
     g: &DevProg,
     library: &[Option<usize>],
     conv: bool,
+    quant: Option<&[DeviceMem]>,
 ) -> Vec<(usize, Vec<usize>)> {
-    light_segments_matching(g, library, 4, |d| match DevOp::from_u16(d.op) {
+    let mut light = light_segments_matching(g, library, 4, |d| match DevOp::from_u16(d.op) {
         Some(DevOp::QwenGdnConv) => conv,
         Some(
             DevOp::QwenRmsNorm
@@ -703,9 +843,189 @@ pub(super) fn qwen_light_segments(
             | DevOp::QwenGdnGatePrep
             | DevOp::Residual,
         ) => true,
-        Some(DevOp::Glu) => d.i[1] == 1,
+        Some(DevOp::Glu | DevOp::GluPitched) => d.i[1] == 1,
         _ => false,
-    })
+    });
+    if let Some(devp) = quant {
+        light.extend(
+            (0..g.gq_seg_ofs.len().saturating_sub(1))
+                .filter(|&seg| library.get(seg).copied().flatten().is_none())
+                .filter_map(|seg| {
+                    let entries =
+                        &g.gq_stream[g.gq_seg_ofs[seg] as usize..g.gq_seg_ofs[seg + 1] as usize];
+                    light_quant_pair(g, entries, devp).map(|(p, q)| (seg, vec![p, q]))
+                }),
+        );
+        light.sort_unstable_by_key(|(seg, _)| *seg);
+    }
+    light
+}
+
+/// A segment that is exactly [producer, QuantFp8 of the producer's bf16 output in 1x128 groups],
+/// both instructions whole, which `light_quant` runs as one launch of one block per padded row:
+/// `(producer, quant)`. The producer must be one whose per-row body the kernel reproduces bit for
+/// bit (the interpreter's block-per-row RMSNorm, the per-head gated norm, SiLU Glu, the sigmoid
+/// gate) over exactly the quant's rows, and the quant's outputs must not overlap any producer
+/// operand: the fused launch drops the grid-wide round between the two.
+fn light_quant_pair(
+    g: &DevProg,
+    entries: &[packet::dev::StreamEnt],
+    devp: &[DeviceMem],
+) -> Option<(usize, usize)> {
+    let none = packet::dev::TENSOR_NONE16;
+    let p = entries.first()?.inst as usize;
+    let q = p + 1;
+    let (pd, qd) = (g.insts.get(p)?, g.insts.get(q)?);
+    let (pb, qb) = (usize::from(pd.blocks), usize::from(qd.blocks));
+    let whole = pb != 0
+        && qb != 0
+        && entries.len() == pb + qb
+        && entries[..pb]
+            .iter()
+            .enumerate()
+            .all(|(i, e)| e.inst as usize == p && e.slice as usize == i)
+        && entries[pb..]
+            .iter()
+            .enumerate()
+            .all(|(i, e)| e.inst as usize == q && e.slice as usize == i);
+    let (m, k, rp) = (qd.i[0], qd.i[1], qd.i[4]);
+    let quant = qd.op == DevOp::QuantFp8 as u16
+        && qd.i[2] == 0
+        && qd.i[3] == packet::dev::FP8_BLOCK_GROUP
+        && m > 0
+        && k > 0
+        && k % 128 == 0
+        && rp == m.next_multiple_of(4)
+        && qd.t[..3].iter().all(|&t| t != none)
+        && qd.t[3] == none
+        && qd.t[4] == none
+        && qd.t[1] == pd.t[0];
+    if !whole || !quant {
+        return None;
+    }
+    // Producer operands (slot, required bytes), its active mask slot and its shape agreement
+    // with the quant.
+    let row = u64::from(m) * u64::from(k) * 2;
+    let mask = u64::from(m) * 4;
+    // A gated norm's z may be a column of a row-pitched N-concatenated output (j1).
+    let zsrc = pd.fj[2];
+    let (zs, zc) = (u64::from(zsrc & 0xFFFF), u64::from(zsrc >> 16));
+    let z_bytes = if zsrc == 0 {
+        row
+    } else {
+        (u64::from(m - 1) * zs + zc + u64::from(k)) * 2
+    };
+    let (shape, active, operands): (bool, usize, &[(usize, u64)]) = match DevOp::from_u16(pd.op)? {
+        // The interpreter's block-per-row path (`batch <= nblk`), at most 32 elements per thread
+        // in the kernel.
+        DevOp::QwenRmsNorm => (
+            pd.i[0] == k && pd.i[1] == m && pb >= m as usize && k <= 8192 && k % 8 == 0,
+            3,
+            &[
+                (0, row),
+                (1, row),
+                (2, u64::from(k) * 2),
+                (3, mask),
+                (4, row),
+            ],
+        ),
+        // One head = one 128-wide group.
+        DevOp::QwenGatedNorm => (
+            pd.i[1] == 128
+                && pd.i[0].checked_mul(pd.i[1]) == Some(k)
+                && pd.i[2] == m
+                && (zsrc == 0 || (zs % 8 == 0 && zc % 8 == 0 && zc + u64::from(k) <= zs)),
+            4,
+            &[
+                (0, row),
+                (1, row),
+                (2, z_bytes),
+                (3, u64::from(pd.i[1]) * 2),
+                (4, mask),
+            ],
+        ),
+        DevOp::QwenSigmoidGate => (
+            pd.i[0] == k && pd.i[1] == m,
+            3,
+            &[(0, row), (1, row), (2, row), (3, mask)],
+        ),
+        DevOp::Glu => (
+            pd.i[1] == 1 && u64::from(pd.i[0]) == u64::from(m) * u64::from(k),
+            usize::MAX,
+            &[(0, row), (1, row), (2, row)],
+        ),
+        // One gu input, row pitch i3, up at column i4: the kernel's 8-byte loads need both
+        // 4-aligned.
+        DevOp::GluPitched => (
+            pd.i[1] == 1
+                && u64::from(pd.i[0]) == u64::from(m) * u64::from(k)
+                && pd.i[2] == k
+                && pd.i[3] % 4 == 0
+                && pd.i[4] % 4 == 0
+                && u64::from(pd.i[4]) + u64::from(k) <= u64::from(pd.i[3])
+                && pd.t[2] == none,
+            usize::MAX,
+            &[
+                (
+                    1,
+                    (u64::from(m - 1) * u64::from(pd.i[3]) + u64::from(pd.i[4]) + u64::from(k)) * 2,
+                ),
+                (0, row),
+            ],
+        ),
+        _ => return None,
+    };
+    let required = |slot: usize| match DevOp::from_u16(pd.op) {
+        Some(DevOp::GluPitched) => slot <= 1,
+        Some(DevOp::QwenGatedNorm) => slot <= 3,
+        _ => slot <= 2,
+    };
+    let range = |h: u16| devp.get(usize::from(h)).map(|t| (t.base, t.base + t.len));
+    let (xq, gs) = (range(qd.t[0])?, range(qd.t[2])?);
+    let fits = xq.1 - xq.0 >= u64::from(rp) * u64::from(k)
+        && gs.1 - gs.0 >= u64::from(k / 128) * u64::from(rp) * 4;
+    let disjoint = |a: (u64, u64), b: (u64, u64)| a.1 <= b.0 || b.1 <= a.0;
+    let operands_ok = operands.iter().all(|&(slot, bytes)| {
+        let h = pd.t[slot];
+        if h == none {
+            return !required(slot);
+        }
+        range(h).is_some_and(|r| r.1 - r.0 >= bytes && disjoint(r, xq) && disjoint(r, gs))
+    });
+    let present = |slots: &[usize]| -> Vec<(u64, u64)> {
+        slots
+            .iter()
+            .filter(|&&slot| slot < 8 && pd.t[slot] != none)
+            .filter_map(|&slot| range(pd.t[slot]))
+            .collect()
+    };
+    let pairwise = |r: &[(u64, u64)]| {
+        r.iter()
+            .enumerate()
+            .all(|(i, &a)| r[i + 1..].iter().all(|&b| disjoint(a, b)))
+    };
+    // The RMSNorm entry reads its operands through restrict pointers; no producer writes its
+    // active mask.
+    let alias_ok = if pd.op == DevOp::QwenRmsNorm as u16 {
+        pairwise(&present(&[0, 1, 2, 3, 4]))
+    } else if pd.op == DevOp::GluPitched as u16 {
+        pairwise(&present(&[0, 1]))
+    } else {
+        present(&[active])
+            .iter()
+            .all(|&a| present(&[0]).iter().all(|&o| disjoint(a, o)))
+            // Rows of a pitched z are read while other rows' outputs are written.
+            && (zsrc == 0 || pd.op != DevOp::QwenGatedNorm as u16 || pairwise(&present(&[0, 2])))
+    };
+    // light_quant_norm: 16-byte row/gamma/add accesses, 8-byte xq stores, scalar active and scales.
+    let aligned =
+        |h: u16, a: u64| h == none || devp.get(usize::from(h)).is_some_and(|t| t.base % a == 0);
+    let align_ok = pd.op != DevOp::QwenRmsNorm as u16
+        || ([0, 1, 2, 4].iter().all(|&i| aligned(pd.t[i], 16))
+            && aligned(pd.t[3], 4)
+            && aligned(qd.t[0], 8)
+            && aligned(qd.t[2], 4));
+    (shape && fits && disjoint(xq, gs) && operands_ok && alias_ok && align_ok).then_some((p, q))
 }
 
 /// Segments of 1..=`max` whole instructions (every slice, ascending, in program order) that
@@ -838,12 +1158,13 @@ pub(super) fn qwen_decode_light_segments(
     g: &DevProg,
     folds: &[ArgmaxFold],
     conv: bool,
+    quant: Option<&[DeviceMem]>,
     taken: impl Fn(usize) -> bool,
 ) -> Vec<(usize, Vec<usize>)> {
     let library: Vec<Option<usize>> = (0..g.gq_seg_ofs.len().saturating_sub(1))
         .map(|seg| (taken(seg) || folds.iter().any(|f| f.segment == seg)).then_some(0))
         .collect();
-    qwen_light_segments(g, &library, conv)
+    qwen_light_segments(g, &library, conv, quant)
 }
 
 pub(super) fn qwen_light_instructions(light: &[(usize, Vec<usize>)]) -> Vec<(usize, usize)> {
@@ -853,10 +1174,13 @@ pub(super) fn qwen_light_instructions(light: &[(usize, Vec<usize>)]) -> Vec<(usi
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn add_qwen_light_routes(
     routes: &mut Vec<Option<LibraryRoute>>,
     be: &Arc<CudaBackend>,
     function: KernelFn,
+    norm: Option<KernelFn>,
+    quant: Option<(LightQuant, &[DeviceMem])>,
     kernarg: DevProgram,
     g: &DevProg,
     light: &[(usize, Vec<usize>)],
@@ -866,9 +1190,53 @@ pub(super) fn add_qwen_light_routes(
         if routes.len() <= *seg {
             routes.resize_with(seg + 1, || None);
         }
-        routes[*seg] = Some(LibraryRoute::Light(qwen_light_route(
-            be, function, kernarg, g, insts, grid,
-        )));
+        if let ([p, q], Some((quant, devp))) = (&insts[..], quant) {
+            let (pd, qd) = (&g.insts[*p], &g.insts[*q]);
+            if qd.op == DevOp::QuantFp8 as u16 {
+                let norm = pd.op == DevOp::QwenRmsNorm as u16;
+                routes[*seg] = Some(LibraryRoute::Light(LightRoute {
+                    be: Arc::clone(be),
+                    kernarg,
+                    launches: vec![LightLaunch {
+                        function: if norm { quant.norm } else { quant.pointwise },
+                        xs: LightX::default(),
+                        kind: LightKind::Single,
+                        direct: None,
+                        quant: Some(Box::new(LightQuantArgs {
+                            p: LightQuantOp::resolve(pd, devp),
+                            q: LightQuantOp::resolve(qd, devp),
+                        })),
+                        instruction: *p as u32,
+                        blocks: if norm {
+                            qd.i[4]
+                        } else {
+                            (qd.i[4] * (qd.i[1] / 128)).div_ceil(BLOCK / 32)
+                        },
+                        block: if norm { quant.norm_threads } else { BLOCK },
+                        smem: 0,
+                    }],
+                    _scratch: None,
+                }));
+                continue;
+            }
+        }
+        let mut route = qwen_light_route(be, function, kernarg, g, insts, grid);
+        if let Some(norm) = norm {
+            for launch in &mut route.launches {
+                let d = &g.insts[launch.instruction as usize];
+                // One block per row (i1 = rows): the body takes the block-per-row walk at any
+                // grid >= rows, and the 528-block light grid paid four waves of empty blocks.
+                // i0 = width; the register-resident walk covers 32 elements per thread.
+                if d.op == DevOp::QwenRmsNorm as u16
+                    && (1..=grid).contains(&d.i[1])
+                    && d.i[0] <= 32 * BLOCK
+                {
+                    launch.function = norm;
+                    launch.blocks = d.i[1];
+                }
+            }
+        }
+        routes[*seg] = Some(LibraryRoute::Light(route));
     }
 }
 
@@ -882,6 +1250,7 @@ fn prefill_light_launches(function: KernelFn, g: &DevProg, insts: &[usize]) -> V
             xs: LightX::default(),
             kind: LightKind::Single,
             direct: None,
+            quant: None,
             instruction: inst as u32,
             blocks: u32::from(g.insts[inst].blocks),
             block: BLOCK,
@@ -914,13 +1283,23 @@ pub(super) fn prefill_glu_quant_route(
     route
 }
 
+/// Every layer's GLU quant writes the same activation, so another GLU quant naming it in its
+/// output slot (and nowhere else) is a writer, not a reader.
 fn glu_output_unread(g: &DevProg, inst: usize) -> bool {
     let output = g.insts[inst].t[1];
-    output != packet::dev::TENSOR_NONE16
+    let none = packet::dev::TENSOR_NONE16;
+    let glu_writer = |d: &packet::dev::DevInst64| {
+        d.op == DevOp::QuantFp8 as u16
+            && d.t[1] == output
+            && d.t[3] != none
+            && d.t[4] != none
+            && d.t.iter().filter(|&&t| t == output).count() == 1
+    };
+    output != none
         && g.insts
             .iter()
             .enumerate()
-            .all(|(i, d)| i == inst || !d.t.contains(&output))
+            .all(|(i, d)| i == inst || glu_writer(d) || !d.t.contains(&output))
 }
 
 /// Segments that are exactly a prefill NormResidual and the RmsNorm reading its output (the next
@@ -1216,6 +1595,20 @@ pub(super) fn add_light_routes(
     folds: &[ArgmaxFold],
     devp: &[DeviceMem],
 ) {
+    if functions.router.is_some() {
+        let router_segments = light
+            .iter()
+            .filter(|(_, levels)| {
+                levels.iter().any(|&(inst, n)| {
+                    n == 0
+                        && functions
+                            .router_op(&g.insts[inst])
+                            .is_some_and(|scoped| scoped)
+                })
+            })
+            .count();
+        tracing::info!(router_segments, "decode router windows as light launches");
+    }
     if functions.fp8_attn {
         let attention_segments = light
             .iter()
@@ -1258,6 +1651,7 @@ pub(super) fn add_light_routes(
                         xs: LightX::default(),
                         kind: LightKind::NormQuant,
                         direct: Some(Box::new(span)),
+                        quant: None,
                         instruction: *n as u32,
                         blocks: u32::from(g.insts[*n].blocks),
                         block: BLOCK,
@@ -1292,6 +1686,7 @@ pub(super) fn add_light_routes(
                     block: FLASH_BLOCK,
                     smem,
                     direct: None,
+                    quant: None,
                 })
         };
         let folded = folded_hnr(g, levels)
@@ -1336,23 +1731,36 @@ pub(super) fn add_light_routes(
                             block: BLOCK,
                             smem,
                             direct,
+                            quant: None,
                         },
-                        _ => LightLaunch {
-                            function: match (functions.tail, DevOp::from_u16(g.insts[inst].op)) {
+                        _ => {
+                            let (function, smem) = match (
+                                functions.tail,
+                                DevOp::from_u16(g.insts[inst].op),
+                                functions.router.filter(|_| {
+                                    n == 0 && functions.router_op(&g.insts[inst]).is_some()
+                                }),
+                            ) {
                                 (
                                     Some(tail),
                                     Some(DevOp::SoftCap | DevOp::Argmax | DevOp::ArgmaxFin),
-                                ) => tail,
-                                _ => functions.single,
-                            },
-                            xs,
-                            kind: LightKind::Single,
-                            instruction: inst as u32,
-                            blocks,
-                            block: BLOCK,
-                            smem: 0,
-                            direct,
-                        },
+                                    _,
+                                ) => (tail, 0),
+                                (_, _, Some((router, smem, _))) => (router, smem),
+                                _ => (functions.single, 0),
+                            };
+                            LightLaunch {
+                                function,
+                                xs,
+                                kind: LightKind::Single,
+                                instruction: inst as u32,
+                                blocks,
+                                block: BLOCK,
+                                smem,
+                                direct,
+                                quant: None,
+                            }
+                        }
                     }
                 })
                 .collect::<Vec<LightLaunch>>(),
@@ -1374,6 +1782,7 @@ pub(super) fn add_light_routes(
                     block: flash.block,
                     smem: flash.smem,
                     direct: Some(Box::new(span)),
+                    quant: None,
                 }]
             }
             [cap, amax, fin] => match capmax(functions, cap, amax) {
@@ -1454,6 +1863,7 @@ fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
                 blocks,
                 smem,
                 direct: Some(Box::new(span)),
+                quant: None,
                 ..launch
             };
         }
@@ -1488,6 +1898,7 @@ fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
         blocks,
         smem: ATTN_S_SMEM,
         direct: Some(Box::new(span)),
+        quant: None,
         ..launch
     }
 }
@@ -1495,6 +1906,7 @@ fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
 fn clone_launch(l: &LightLaunch) -> LightLaunch {
     LightLaunch {
         direct: l.direct.clone(),
+        quant: None,
         ..*l
     }
 }
@@ -1535,6 +1947,7 @@ fn capmax(
         block: BLOCK,
         smem: 0,
         direct: Some(Box::new(span)),
+        quant: None,
     })
 }
 
@@ -1628,8 +2041,7 @@ pub(super) enum ProjectionBackend {
 enum ProjectionPlan {
     Lt(Arc<crate::device::cuda::lt::Plan>),
     Native(native_decode::Plan),
-    /// Operands are bound into the plan's Params blob.
-    Cutlass(crate::device::cuda::cutlass_fp8::Plan),
+    Fp8Block(fp8_block::Plan),
     Folded,
 }
 
@@ -1638,7 +2050,7 @@ impl ProjectionPlan {
         match self {
             Self::Lt(p) => p.run(input, weight, output, stream),
             Self::Native(p) => p.run(input, weight, output, stream),
-            Self::Cutlass(p) => p.run(stream),
+            Self::Fp8Block(p) => p.run(input, weight, output, stream),
             Self::Folded => Ok(()),
         }
     }
@@ -1786,6 +2198,7 @@ pub(super) fn ordered_waits_for(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_routes(
     backend: &ProjectionBackend,
+    fp8_block: Option<&Arc<fp8_block::Fp8Block>>,
     segments: Vec<Option<DecodeSegment>>,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
@@ -1830,7 +2243,7 @@ pub(super) fn prepare_routes(
     let mut plans = std::collections::HashMap::new();
     let mut pair_plans = std::collections::HashMap::new();
     let mut fp8_plans = 0usize;
-    let mut cutlass_plans = 0usize;
+    let mut fp8_native = 0usize;
     let mut pairs = 0usize;
     let mut index = 0;
     while index < segments.len() {
@@ -1873,8 +2286,21 @@ pub(super) fn prepare_routes(
                     "FP8 projection cannot fold an output head".into(),
                 ));
             }
+            let lt_m = if segment.block {
+                segment.m.next_multiple_of(4)
+            } else {
+                segment.m
+            };
+            let elements = if segment.block {
+                [
+                    (segment.k / 128) * lt_m,
+                    (segment.n / 128) * (segment.k / 128),
+                ]
+            } else {
+                [segment.m, segment.n]
+            };
             let mut scales = [0; 2];
-            for (index, (handle, elements)) in [(op.t[3], segment.m), (op.t[4], segment.n)]
+            for (index, (handle, elements)) in [(op.t[3], elements[0]), (op.t[4], elements[1])]
                 .into_iter()
                 .enumerate()
             {
@@ -1900,28 +2326,25 @@ pub(super) fn prepare_routes(
                 .nv
                 .lt_fp8_fast_accum_max_k
                 .is_some_and(|max_k| segment.k <= max_k);
-            let cutlass = match lt.cutlass_fp8().filter(|_| decode) {
-                Some(c) => c.plan(
-                    segment.m,
-                    segment.n,
-                    segment.k,
-                    [input, weight, output, scales[0], scales[1]],
-                    fast_k,
+            let native = match fp8_block.filter(|_| segment.block && decode) {
+                Some(owner) => owner.plan(
+                    segment.m, segment.n, segment.k, input, weight, scales[0], scales[1],
                 )?,
                 None => None,
             };
-            let plan = match cutlass {
+            let plan = match native {
                 Some(plan) => {
-                    cutlass_plans += 1;
-                    ProjectionPlan::Cutlass(plan)
+                    fp8_native += 1;
+                    ProjectionPlan::Fp8Block(plan)
                 }
                 None => ProjectionPlan::Lt(lt.fp8_plan(
-                    segment.m,
+                    lt_m,
                     segment.n,
                     segment.k,
                     scales[1],
                     scales[0],
-                    !decode && fast_k,
+                    !decode && fast_k && !segment.block,
+                    segment.block,
                 )?),
             };
             fp8_plans += 1;
@@ -2111,7 +2534,7 @@ pub(super) fn prepare_routes(
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
         fp8_plans,
-        cutlass_plans,
+        fp8_native,
         pairs,
         native = matches!(backend, ProjectionBackend::Native(_)),
         "projection routes prepared"
@@ -2358,6 +2781,15 @@ pub(super) fn prefill_segments(
     projection_segments(program, tensors, roles, ProjectionPhase::Prefill(profile))
 }
 
+/// The rows cuBLASLt reads and writes: the block-scaled route pads to 4.
+fn lt_rows(m: u32, block: bool) -> Option<u32> {
+    if block {
+        m.checked_next_multiple_of(4)
+    } else {
+        Some(m)
+    }
+}
+
 fn projection_segments(
     program: &DevProg,
     tensors: &[DevTensor],
@@ -2430,10 +2862,13 @@ fn projection_segments(
                 }
             }
         };
-        let valid_immediates = match phase {
-            ProjectionPhase::Decode => op.i[3..].iter().all(|&value| value == 0),
-            ProjectionPhase::Prefill(_) => op.i[3..6].iter().all(|&value| value == 0),
+        let block = fp8 && op.i[5] == packet::dev::FP8_BLOCK_GROUP;
+        let end = match phase {
+            ProjectionPhase::Decode => op.i.len(),
+            ProjectionPhase::Prefill(_) => 6,
         };
+        let valid_immediates = (3..end).all(|j| op.i[j] == 0 || (block && j == 5))
+            && (!block || op.i[6..].iter().all(|&value| value == 0));
         if !valid_op
             || op.t[if fp8 { 5 } else { 3 }..]
                 .iter()
@@ -2452,14 +2887,20 @@ fn projection_segments(
             return Err(fail());
         }
         let [m, n, k] = [op.i[0], op.i[1], op.i[2]];
+        // cuBLASLt reads BLK128x128 weight-scale rows at a stride of K/128 rounded up to 4; the
+        // packed [N/128][K/128] grid matches it only when K/128 is a multiple of 4.
+        if block && (n % 128 != 0 || k % 512 != 0) {
+            return Err(fail());
+        }
+        let lt_m = lt_rows(m, block).ok_or_else(fail)?;
         let bytes = |a: u32, b: u32| {
             u64::from(a)
                 .checked_mul(u64::from(b))
                 .and_then(|elements| elements.checked_mul(2))
                 .ok_or_else(fail)
         };
-        let output_bytes = bytes(m, n)?;
-        let input_bytes = bytes(m, k)? / if fp8 { 2 } else { 1 };
+        let output_bytes = bytes(lt_m, n)?;
+        let input_bytes = bytes(lt_m, k)? / if fp8 { 2 } else { 1 };
         let weight_bytes = bytes(n, k)? / if fp8 { 2 } else { 1 };
         if fp8 {
             if op.t[..5]
@@ -2471,7 +2912,15 @@ fn projection_segments(
             {
                 return Err(fail());
             }
-            for (handle, required) in [(op.t[3], u64::from(m) * 4), (op.t[4], u64::from(n) * 4)] {
+            let scales = if block {
+                [
+                    (op.t[3], u64::from(k / 128) * u64::from(lt_m) * 4),
+                    (op.t[4], u64::from(n / 128) * u64::from(k / 128) * 4),
+                ]
+            } else {
+                [(op.t[3], u64::from(m) * 4), (op.t[4], u64::from(n) * 4)]
+            };
+            for (handle, required) in scales {
                 if tensors
                     .get(handle as usize)
                     .is_none_or(|tensor| tensor.bytes < required)
@@ -2503,6 +2952,7 @@ fn projection_segments(
             output_bytes,
             input_bytes,
             weight_bytes,
+            block,
         });
     }
     Ok(routes)
@@ -2512,6 +2962,116 @@ fn projection_segments(
 mod tests {
     use super::*;
     use packet::dev::{DevInst64, StreamEnt};
+
+    #[test]
+    fn light_quant_pair_takes_only_a_fitting_disjoint_pitched_gated_norm_z() {
+        let none = packet::dev::TENSOR_NONE16;
+        let (m, heads, dim, pitch, col) = (4u32, 48u32, 128u32, 16384u32, 10240u32);
+        let k = heads * dim;
+        let mut norm = DevInst64 {
+            op: DevOp::QwenGatedNorm as u16,
+            blocks: 2,
+            ..Default::default()
+        };
+        norm.t.fill(none);
+        norm.t[..4].copy_from_slice(&[0, 1, 2, 3]);
+        norm.i[..3].copy_from_slice(&[heads, dim, m]);
+        norm.fj[2] = pitch | col << 16;
+        let mut quant = DevInst64 {
+            op: DevOp::QuantFp8 as u16,
+            blocks: 2,
+            ..Default::default()
+        };
+        quant.t.fill(none);
+        quant.t[..3].copy_from_slice(&[4, 0, 5]);
+        quant.i[..5].copy_from_slice(&[m, k, 0, packet::dev::FP8_BLOCK_GROUP, m]);
+        let mut g = DevProg {
+            t: m,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: m },
+            n_counter: 0,
+            insts: vec![norm, quant],
+            stream: vec![],
+            stream_ofs: vec![0],
+            stream_len: vec![0],
+            waits: vec![],
+            succs: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![0],
+            l2_domains: 0,
+        };
+        let entries: Vec<_> = [(0, 0), (0, 1), (1, 0), (1, 1)]
+            .into_iter()
+            .map(|(inst, slice)| StreamEnt {
+                inst,
+                slice,
+                ..Default::default()
+            })
+            .collect();
+        let row = u64::from(m * k) * 2;
+        let qkvz = u64::from(m * pitch) * 2;
+        let sizes = [
+            row,
+            row,
+            qkvz,
+            256,
+            u64::from(m * k),
+            u64::from(k / 128 * m) * 4,
+        ];
+        // z at its own base, or at the output's base (an overlapping view).
+        let view = |z: u64, alias: bool| -> Vec<DeviceMem> {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| match i {
+                    2 => DeviceMem::view(if alias { 1 << 24 } else { 3 << 24 }, z),
+                    _ => DeviceMem::view((i as u64 + 1) << 24, len),
+                })
+                .collect()
+        };
+        let devp = |z: u64| view(z, false);
+        assert_eq!(light_quant_pair(&g, &entries, &devp(qkvz)), Some((0, 1)));
+        // The last row's z ends at (m - 1) * pitch + col + k.
+        let last = u64::from((m - 1) * pitch + col + k) * 2;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(last)), Some((0, 1)));
+        assert_eq!(light_quant_pair(&g, &entries, &devp(last - 2)), None);
+        // z lies inside the row, 8-element aligned; each case otherwise fits a wide buffer.
+        let wide = u64::from(m * (pitch + 64)) * 2;
+        g.insts[0].fj[2] = pitch | (col + 8) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 4) | col << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 8) | (col + 4) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), None);
+        g.insts[0].fj[2] = (pitch + 8) | (col + 8) << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(wide)), Some((0, 1)));
+        // Other rows' outputs are written while a pitched z is read: a z overlapping the output
+        // is refused even when it is large enough.
+        g.insts[0].fj[2] = pitch | col << 16;
+        assert_eq!(light_quant_pair(&g, &entries, &view(qkvz, true)), None);
+        // A dense z (no j1) needs only its rows.
+        g.insts[0].fj[2] = 0;
+        assert_eq!(light_quant_pair(&g, &entries, &devp(row)), Some((0, 1)));
+    }
+
+    #[test]
+    fn light_quant_norm_threads_abi() {
+        assert_eq!(light_quant_norm_threads(Some(1), None), Some(256));
+        assert_eq!(light_quant_norm_threads(Some(2), Some(1024)), Some(1024));
+        assert_eq!(light_quant_norm_threads(Some(2), None), None);
+        assert_eq!(light_quant_norm_threads(Some(2), Some(256)), None);
+        assert_eq!(light_quant_norm_threads(Some(2), Some(512)), None);
+        assert_eq!(light_quant_norm_threads(Some(3), Some(1024)), None);
+        assert_eq!(light_quant_norm_threads(None, Some(1024)), None);
+    }
+
+    #[test]
+    fn block_fp8_row_padding_refuses_overflow() {
+        assert_eq!(lt_rows(5, true), Some(8));
+        assert_eq!(lt_rows(8, true), Some(8));
+        assert_eq!(lt_rows(u32::MAX - 3, true), Some(u32::MAX - 3));
+        assert_eq!(lt_rows(u32::MAX - 2, true), None);
+        assert_eq!(lt_rows(u32::MAX, false), Some(u32::MAX));
+    }
 
     #[test]
     fn prefill_light_launches_take_the_launch_tensor_table() {
@@ -2689,6 +3249,33 @@ mod tests {
     }
 
     #[test]
+    fn glu_output_shared_by_layer_writers_is_unread() {
+        let (mut g, _) = fixture(128);
+        for i in [0, 1] {
+            g.insts[i].op = DevOp::QuantFp8 as u16;
+            g.insts[i].t[..5].copy_from_slice(&[10 + i as u16, 7, 20 + i as u16, 3, 4]);
+        }
+        g.insts[2].t = [packet::dev::TENSOR_NONE16; 8];
+        assert!(glu_output_unread(&g, 0) && glu_output_unread(&g, 1));
+        // A GLU quant naming it beyond its output slot, or missing gate or up, reads it.
+        for (slot, value) in [(3, 7), (5, 7), (4, packet::dev::TENSOR_NONE16)] {
+            let keep = g.insts[1].t[slot];
+            g.insts[1].t[slot] = value;
+            assert!(!glu_output_unread(&g, 0), "slot {slot}");
+            g.insts[1].t[slot] = keep;
+        }
+        // A plain quant reading it (t[1] = source, no gate/up) is a reader.
+        g.insts[2].op = DevOp::QuantFp8 as u16;
+        g.insts[2].t[1] = 7;
+        assert!(!glu_output_unread(&g, 0));
+        // So is any other op naming it.
+        g.insts[2].op = DevOp::Glu as u16;
+        g.insts[2].t[1] = packet::dev::TENSOR_NONE16;
+        g.insts[2].t[0] = 7;
+        assert!(!glu_output_unread(&g, 0));
+    }
+
+    #[test]
     fn prefill_glu_quant_requires_supported_shape_and_complete_segment() {
         let make = || {
             let (mut g, _) = fixture(128);
@@ -2860,6 +3447,7 @@ mod tests {
                         output_bytes: u64::from(batch) * 48 * 2,
                         input_bytes: u64::from(batch) * 5120 * 2,
                         weight_bytes: 48 * 5120 * 2,
+                        block: false,
                     }),
                     None,
                 ]

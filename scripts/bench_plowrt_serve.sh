@@ -30,6 +30,8 @@
 #                 (--random-prefix-len); total input stays input_len. Default 0.
 #   MEM_SAMPLE_MS  GPU memory sampling period per cell, printed as `peak_mem_mib,<in>,<c>,<MiB>`
 #                  lines (default 1000; 0 = off)
+#   HOST_SAMPLE_MS host resources of the server tree per cell into OUTDIR/in<L>_c<C>.host.json
+#                  (scripts/bench/host_res.py; default 2000; 0 = off)
 set -euo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="${1:?assets}"; PORT="${2:?port}"; MODEL="${3:?model}"; TOKZ="${4:?tokenizer}"
@@ -179,6 +181,12 @@ for L in $IN_LENS; do
         -lms "${MEM_SAMPLE_MS:-1000}" > "$memlog" 2>/dev/null &
       mempid=$!
     fi
+    hostpid=
+    if [ "${HOST_SAMPLE_MS:-2000}" != 0 ]; then
+      python3 "$WT/scripts/bench/host_res.py" sample --root-pid "$SRV" --json "$OUTDIR/in${L}_c${C}.host.json" \
+        --interval-ms "${HOST_SAMPLE_MS:-2000}" 2>/dev/null &
+      hostpid=$!
+    fi
     "${CLIENT[@]}" \
       bench serve --backend "$BENCH_BACKEND" \
       --base-url "http://127.0.0.1:$PORT" --endpoint "$ENDPOINT" \
@@ -187,6 +195,7 @@ for L in $IN_LENS; do
       --max-concurrency "$C" --num-prompts "$NP" "${WARM_ARGS[@]}" \
       --save-result --save-detailed --result-dir "$RESULT_DIR" --result-filename "in${L}_c${C}.json" \
       > "$blog" 2>&1
+    if [ -n "$hostpid" ]; then kill "$hostpid" 2>/dev/null || true; wait "$hostpid" 2>/dev/null || true; fi
     if [ -n "$mempid" ]; then
       kill "$mempid" 2>/dev/null || true; wait "$mempid" 2>/dev/null || true; mempid=
       # The server was `setsid`'d: its session is exactly its process tree.

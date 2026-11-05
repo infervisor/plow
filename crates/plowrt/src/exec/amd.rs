@@ -5941,7 +5941,7 @@ fn column_twins(tensors: &[crate::asset::devblob::DevTensor], n_gpu: u32) -> Vec
 }
 
 /// The full-width twins the row-band arm declares: a checkpoint weight that also has a
-/// `1/n_gpu` declaration. With `--glm-rowband` off these are never carved and never uploaded,
+/// `1/n_gpu` declaration. With `--rowband` off these are never carved and never uploaded,
 /// so a packet that carries the siblings costs their program records and nothing else.
 fn rowband_twin_ids(tensors: &[crate::asset::devblob::DevTensor], n_gpu: u32) -> Vec<bool> {
     tensors
@@ -8204,7 +8204,7 @@ pub struct AmdEngine {
     /// Per program: a `PLOW_GLM_DSA_PF_A2A` sibling (pooled interpreter selection feeding the
     /// gather flash object; no native sparse route needed).
     a2a_sibling: Vec<bool>,
-    /// `--glm-rowband` as read at engine build. Serve-start only: with it off the packet's
+    /// `--rowband` as read at engine build. Serve-start only: with it off the packet's
     /// full-width twins were never bound, so the siblings must never be dispatched either.
     rowband_on: bool,
     devp: Vec<DeviceMem>,
@@ -8302,7 +8302,7 @@ pub struct AmdEngine {
     k_gemm_group: Option<HsaKernel>,
     k_mla_pf_dense: Option<HsaKernel>,
     k_mla_pf_gather: Option<HsaKernel>,
-    /// `PLOW_GLM_DSA_PF_MIN_CTX`: this chunk's sparse rung runs dense (selection Nop'd).
+    /// `PLOW_DSA_PF_MIN_CTX`: this chunk's sparse rung runs dense (selection Nop'd).
     dsa_pf_dense_chunk: bool,
     k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
     k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
@@ -8789,9 +8789,15 @@ impl AmdEngine {
     ) -> Result<Self> {
         let t_rank = Instant::now();
         crate::knob_spec::check_assets(blob_path)?;
-        let raw = std::fs::read(blob_path)
-            .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
+        let image = crate::asset::packet_image::PacketImage::open(blob_path)?;
+        let _build = image.build_info().ok().flatten();
+        let raw = &image.raw;
         let arch = EngineDevice::arch(&*be);
+        if let Some(target) = image.blob.abi(raw)?.and_then(|a| a.target) {
+            target
+                .check_hsa(&arch)
+                .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", blob_path.display())))?;
+        }
         let n_cu_dev = EngineDevice::sm_count(&*be);
         // ACCEPT L2-DOMAIN PLACEMENT AND CHECK IT AT OBJECT LOAD, rather than making the operator
         // assert it by env. scripts/build_gfx942.sh now ships -DPLOW_L2_PLACE_DISPATCH by default
@@ -8800,8 +8806,8 @@ impl AmdEngine {
         // stronger than the env var ever was -- `plow_l2_place_dispatch_1` is checked against the
         // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
-        let mut blob = DevBlob::parse_l2(&raw, true)?;
-        crate::certificate_checks::check_packet(blob_path, &raw, &blob)?;
+        let mut blob = image.blob.clone();
+        crate::asset::serve::refuse_concat_features(&blob, raw)?;
         let shards = crate::asset::shard::DeclaredShards::from_blob(&blob, &raw)?;
         // BEFORE anything reads the blob's geometry: `max_ctx`, the KV slot
         // stride, the VMM geometry and the prefill planner all derive from the
@@ -12353,7 +12359,7 @@ impl AmdEngine {
         // Serve-start, never per request: the row-band cost is RESIDENT weights, so the knob
         // has to decide binding, not just dispatch. Off, the shard carves its own storage (the
         // ordinary path) and the full twin is skipped entirely.
-        let rowband_on = config.glm_rowband();
+        let rowband_on = config.rowband();
         let rb_twin = rowband_twin_ids(&blob.tensors, n_gpu);
         let twins = if rowband_on {
             column_twins(&blob.tensors, n_gpu)
@@ -13006,7 +13012,7 @@ impl AmdEngine {
             // Row-band off: skip the siblings. Their full-width W_uv twin is bound at address 0
             // (see `rb_twin` above), and `MlaFold::load` converts every routed weight to FP32 at
             // load time — including one it will never dispatch. Reading that bind is the
-            // near-null fault that made `PLOW_GLM_ROWBAND=0` unusable as a rollback.
+            // near-null fault that made `PLOW_ROWBAND=0` unusable as a rollback.
             let progs = blob
                 .prefill_phase()
                 .filter(|p| rowband_on || !p.role.is_rowsplit_sibling());
@@ -14251,9 +14257,7 @@ impl AmdEngine {
         // packet on an object without the arms, because AMD's dispatch `default:` writes
         // nothing and does not trap.
         let cfg = crate::config::RuntimeConfig::get();
-        let mut token_batch_refusal = if !cfg.token_batch {
-            Some(token_batch::TokenBatchRefusal::NotRequested.to_string())
-        } else if cfg.fusion {
+        let mut token_batch_refusal = if cfg.fusion {
             Some("explicit fusion takes precedence".to_owned())
         } else if tp.is_some() {
             Some("token batching does not support tensor parallelism".to_owned())
@@ -18611,7 +18615,7 @@ impl AmdEngine {
         }) {
             prog = s;
         }
-        // PLOW_GLM_DSA_PF_A2A: chunks ending at or below PLOW_GLM_DSA_PF_MIN_CTX stay dense.
+        // PLOW_GLM_DSA_PF_A2A: chunks ending at or below PLOW_DSA_PF_MIN_CTX stay dense.
         if self.a2a_sibling.get(prog).copied().unwrap_or(false)
             && crate::config::RuntimeConfig::get()
                 .amd

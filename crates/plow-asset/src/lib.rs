@@ -15,14 +15,25 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod abi;
 pub mod certificates;
 pub mod chat;
 pub mod gemm_policy;
 pub mod logical_effects;
 
-/// The plowrt runtime contract a bundle emitted by this tree declares (`build.json`
-/// `runtime_requires.plowrt_contract`); plowrt refuses a bundle that declares a higher one.
-pub const RUNTIME_CONTRACT: u32 = 2;
+/// The plowrt runtime contract this tree implements; plowrt refuses a bundle whose `build.json`
+/// `runtime_requires.plowrt_contract` is higher.
+pub const RUNTIME_CONTRACT: u32 = RUNTIME_CONTRACT_FP8_BLOCK_NATIVE;
+/// The contract a bundle declares unless it uses a later feature.
+pub const RUNTIME_CONTRACT_BASE: u32 = 2;
+/// Block-scaled FP8 projections (`packet::dev::FP8_BLOCK_GROUP`) on cuBLASLt.
+pub const RUNTIME_CONTRACT_FP8_BLOCK: u32 = 3;
+/// Load-time concatenated weights (`packet::names::CONCAT_PREFIX`) and the row-pitched GLU
+/// (`packet::dev::DevOp::GluPitched`) that reads their projection's output.
+pub const RUNTIME_CONTRACT_CONCAT: u32 = 4;
+/// The native block-scaled FP8 decode GEMM object
+/// (`segment_roles::NATIVE_DECODE_FP8_BLOCK`) beside cuBLASLt projections.
+pub const RUNTIME_CONTRACT_FP8_BLOCK_NATIVE: u32 = 5;
 
 // --- Shared domain enums -----------------------------------------------------
 
@@ -84,6 +95,25 @@ pub struct Manifest {
     /// the design notes for the layout formula the runtime uses.
     #[serde(default)]
     pub weight_tiling: Option<WeightTiling>,
+}
+
+impl Manifest {
+    /// The slug the bundle at `dir` is served under when none is given: `served_name`, else
+    /// `network`, else the bundle dir's name. A `network` that names an entry of the bundle was
+    /// taken from the checkpoint dir the emit read (`<assets>/checkpoint`), not the model.
+    pub fn default_slug(&self, dir: &std::path::Path) -> String {
+        if let Some(name) = &self.served_name {
+            return name.clone();
+        }
+        if self.network.is_empty() || std::fs::symlink_metadata(dir.join(&self.network)).is_ok() {
+            let named =
+                |d: &std::path::Path| d.file_name().map(|n| n.to_string_lossy().into_owned());
+            if let Some(name) = named(dir).or_else(|| named(&dir.canonicalize().ok()?)) {
+                return name;
+            }
+        }
+        self.network.clone()
+    }
 }
 
 /// Shared weight tiling `(bn, bk)` reported in the manifest.
@@ -724,6 +754,7 @@ pub mod speech_contract;
 pub mod speech_fusion;
 pub mod structure_only;
 
+pub mod derived_weights;
 pub mod hetero;
 pub mod hetero_channel;
 pub mod modular;

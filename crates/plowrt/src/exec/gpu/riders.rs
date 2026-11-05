@@ -372,6 +372,7 @@ impl Riders {
         };
         let dynamic = [n as i32, split(256), split(512)];
         self.host[2 * self.batch..].copy_from_slice(&dynamic);
+        be.poison_table(self.tables.base, (self.batch * 8) as u64, stream)?;
         unsafe {
             be.memcpy_htod_async(
                 self.tables.base,

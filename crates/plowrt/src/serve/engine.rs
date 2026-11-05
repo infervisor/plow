@@ -306,6 +306,10 @@ pub trait SeqEngine {
     fn token_batch_member_fits_body(&self, _slot: usize, _rows: u32) -> bool {
         true
     }
+    /// Whether [`Self::logits_row`] serves the tokens a token batch sampled (OpenAI logprobs).
+    fn token_batch_logprobs(&self) -> bool {
+        false
+    }
     /// Run one token batch. `output` receives `(slot, id)` per leading row — the `feeds` in
     /// order, then the members whose prompt completes in this step — the same delivery shape
     /// the CUDA route's `token_batch_step` produces, so one mux arm reads both.
@@ -451,6 +455,74 @@ impl ServeEngine {
             ServeEngine::Amd(e) => e.kv_admission_budget(),
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => None,
+        }
+    }
+
+    /// Free device memory the KV admission budget leaves unbudgeted. A co-resident load that
+    /// takes it starves this engine's admission.
+    pub fn kv_admit_reserve(&self) -> u64 {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.kv_admit_reserve(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
+    /// Device bytes this engine's live KV holds (0: no device KV pool).
+    pub fn kv_live_held(&self) -> u64 {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.kv_live_held(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
+    /// Whether the manager splits the device's KV budget across this engine and its co-tenants
+    /// (CUDA only; other backends keep their own admission).
+    pub fn shares_device_kv(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
+    /// See [`crate::exec::gpu::GpuEngine::set_co_tenant`]; a no-op off CUDA.
+    pub fn set_co_tenant(&mut self, cap: Option<u64>, keep_free: u64) {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.set_co_tenant(cap, keep_free),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = (cap, keep_free);
+            }
+        }
+    }
+
+    /// See [`crate::exec::gpu::GpuEngine::enter_co_tenancy`]; a no-op off CUDA.
+    pub fn enter_co_tenancy(&mut self) -> crate::Result<()> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.enter_co_tenancy(),
+            #[allow(unreachable_patterns)]
+            _ => Ok(()),
+        }
+    }
+
+    /// Give `bytes` back from this engine's caches for another model's load; whether anything
+    /// was released or queued.
+    pub fn reclaim_device(&mut self, bytes: u64) -> crate::Result<bool> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.reclaim_device(bytes),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = bytes;
+                Ok(false)
+            }
         }
     }
 
@@ -1853,7 +1925,7 @@ mod amd_serve {
                 "AMD prefix cache selection"
             );
             let token_batch_tp = match &ranks {
-                Ranks::Tp(g) if crate::config::RuntimeConfig::get().token_batch && has_prefill => {
+                Ranks::Tp(g) if has_prefill => {
                     let bodies = g.token_batch_bodies();
                     let any_body = g.rank(0).has_token_batch_bodies();
                     let band = bodies.first().map(|b| b.2);

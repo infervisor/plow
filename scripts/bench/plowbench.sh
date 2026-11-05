@@ -63,7 +63,7 @@ PLOW_TUNEDB:selects measured GEMM tiles; measured tiles are SLOWER at every rung
 PLOW_HSACO_LOWRUNG:swaps in a different object tier for the narrow rungs
 PLOW_DECODE_MIN_RUNG:changes which decode program runs; default 8 is the measured optimum
 PLOW_OBJECTIVE:pins latency or throughput scheduling; recipes and production run the default auto
-PLOW_GLM_ROWBAND:the row-band serve gate; arms must agree on it
+PLOW_ROWBAND:the row-band serve gate; arms must agree on it
 PLOW_TICK_LOG:adds per-tick logging; fine for instrumented arms, not for a clean number"
 
 # ---------------------------------------------------------------- architecture detection
@@ -167,7 +167,7 @@ pb_require_nix() {
 }
 
 # Warn on (do not refuse) an environment that silently redefines the measurement.
-# PB_ALLOW_HAZARD="PLOW_TICK_LOG PLOW_GLM_ROWBAND" to opt in deliberately.
+# PB_ALLOW_HAZARD="PLOW_TICK_LOG PLOW_ROWBAND" to opt in deliberately.
 pb_hazard_env() {
     local allow=" ${PB_ALLOW_HAZARD:-} "
     local line name why
@@ -488,6 +488,24 @@ pb_metrics_stop() {
     [ -n "${PB_METRICS_PID:-}" ] || return 0
     kill "$PB_METRICS_PID" 2>/dev/null; wait "$PB_METRICS_PID" 2>/dev/null
     PB_METRICS_PID=
+}
+
+# pb_host_start <resdir> <root-pid> [metrics-url] / pb_host_stop — sample the server's host process
+# tree (RSS, VmLck/VmPin, cores busy, threads, processes, MemAvailable, mapped libraries and,
+# with a plowrt /metrics URL, the pinned KV host tier) every PB_HOST_MS (2000; 0 = off) ms into
+# <resdir>/host.tsv and, on stop, the session summary <resdir>/host.json (scripts/bench/host_res.py).
+# PB_HOST_PSS=1 adds Pss, which stalls a server with a large resident set (host_res.py docstring).
+pb_host_start() {
+    [ "${PB_HOST_MS:-2000}" != 0 ] || return 0
+    python3 "$(dirname "${BASH_SOURCE[0]}")/host_res.py" sample --root-pid "$2" --json "$1/host.json" \
+        --tsv "$1/host.tsv" --interval-ms "${PB_HOST_MS:-2000}" ${3:+--metrics-url "$3"} \
+        ${PB_HOST_PSS:+--pss} 2> "$1/host.log" &
+    PB_HOST_PID=$!
+}
+pb_host_stop() {
+    [ -n "${PB_HOST_PID:-}" ] || return 0
+    kill "$PB_HOST_PID" 2>/dev/null; wait "$PB_HOST_PID" 2>/dev/null
+    PB_HOST_PID=
 }
 
 # pb_result <resdir> <tag> — print the result JSON path, wherever the client decided to put it.

@@ -815,6 +815,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::HeadNormRopeFp8
                 | DevOp::Residual
                 | DevOp::Glu
+                | DevOp::GluPitched
                 // Gemma-4 E-series per-layer input gate: activations only (gate, table, out).
                 | DevOp::GluStrided
                 | DevOp::Gemm

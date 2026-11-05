@@ -33,6 +33,98 @@ pub const GENERATED_FIRST: u8 = 18;
 pub const GENERATED_LAST: u8 = 25;
 pub const MAX_ROLE: u8 = GENERATED_LAST;
 
+/// Object ID of a host-launched library attention route (not a segment role: segments keep their
+/// native role, which is the declared fallback). A program lists the segments the library serves
+/// in [`ProgramRoles::library`]; each is a lone `FlashPrefill(Fp8)` instruction.
+pub const LIBRARY_PREFILL_ATTENTION: u8 = 26;
+/// Prefix of a library attention object's ABI: v2 = a cubin container (`PLOWAOT1`) plowrt
+/// launches itself; v1 (a host library) is retired and refused.
+const LIBRARY_ABI_PREFIX: &str = "lib_flash_prefill_v2:fa4:";
+/// Object ID (not a segment role) of the native block-scaled FP8 decode GEMM: a program's
+/// [`CUBLASLT`] decode segments whose `GemmFp8` shape is in the object's `decode_plan` run on it
+/// instead of cuBLASLt; every other segment keeps cuBLASLt.
+pub const NATIVE_DECODE_FP8_BLOCK: u8 = 27;
+pub const NATIVE_DECODE_FP8_BLOCK_ABI: &str = "gemm_fp8_block_sm90_v1";
+/// Rows one native FP8 block launch serves (the widest WGMMA N tile).
+pub const NATIVE_DECODE_FP8_BLOCK_MAX_ROWS: u32 = 32;
+
+/// KV cache layout a library reads in place or through its gather pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibraryKvLayout {
+    /// `[slot][kv head][ctx][hd]`.
+    HeadMajor,
+    /// `[slot][ctx][kv head][hd]`.
+    RowInterleaved,
+}
+
+/// What a library attention object computes: causal global attention of `heads` query heads
+/// over any of `kv_heads` KV heads at `head_dim`, on a `layout` cache, in `f16` or bf16.
+/// `lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryAbi {
+    pub head_dim: u32,
+    pub heads: u32,
+    pub kv_heads: Vec<u32>,
+    pub layout: LibraryKvLayout,
+    pub f16: bool,
+}
+
+impl LibraryAbi {
+    pub fn parse(abi: &str) -> Option<Self> {
+        let fields: BTreeMap<&str, &str> = abi
+            .strip_prefix(LIBRARY_ABI_PREFIX)?
+            .split(':')
+            .map(|kv| kv.split_once('='))
+            .collect::<Option<_>>()?;
+        let num = |k: &str| fields.get(k)?.parse::<u32>().ok().filter(|&v| v > 0);
+        let kv_heads: Vec<u32> = fields
+            .get("kv_heads")?
+            .split(',')
+            .map(|v| v.parse::<u32>().ok().filter(|&v| v > 0))
+            .collect::<Option<_>>()?;
+        let out = LibraryAbi {
+            head_dim: num("hd")?,
+            heads: num("heads")?,
+            layout: match *fields.get("layout")? {
+                "head_major" => LibraryKvLayout::HeadMajor,
+                "ilv" => LibraryKvLayout::RowInterleaved,
+                _ => return None,
+            },
+            f16: match *fields.get("dtype")? {
+                "bf16" => false,
+                "f16" => true,
+                _ => return None,
+            },
+            kv_heads,
+        };
+        (fields.len() == 5
+            && matches!(out.head_dim, 64 | 128 | 256 | 512)
+            && !out.kv_heads.is_empty()
+            && out.kv_heads.windows(2).all(|w| w[0] < w[1])
+            && out.kv_heads.iter().all(|&k| out.heads % k == 0)
+            && out.format() == abi)
+            .then_some(out)
+    }
+
+    pub fn format(&self) -> String {
+        format!(
+            "{LIBRARY_ABI_PREFIX}hd={}:heads={}:kv_heads={}:layout={}:dtype={}",
+            self.head_dim,
+            self.heads,
+            self.kv_heads
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            match self.layout {
+                LibraryKvLayout::HeadMajor => "head_major",
+                LibraryKvLayout::RowInterleaved => "ilv",
+            },
+            if self.f16 { "f16" } else { "bf16" }
+        )
+    }
+}
+
 pub fn is_generated(role: u8) -> bool {
     (GENERATED_FIRST..=GENERATED_LAST).contains(&role)
 }
@@ -279,16 +371,21 @@ pub const CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES: [(u32, u32); 5] = [
 /// [q | gate] projection, GDN 16 k x 128 + 48 v x 128): q|gate, k/v, o and GDN out (K = 6144),
 /// gate/up, down, GDN in_proj_qkv, in_proj_z, and the 48-wide a/b projections (the interpreter's
 /// 128-wide tensor-core tiles ran them as eight CTAs per 1024 rows: 17.9 ms of a 122 ms prefill
-/// with their preps, floor 0.9).
-pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 8] = [
+/// with their preps, floor 0.9), and gate|up and q|gate|k|v concatenated along N
+/// (`PLOW_FP8_BLOCK_CONCAT`).
+pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 11] = [
     (12288, 5120),
     (1024, 5120),
     (5120, 6144),
     (17408, 5120),
+    (34816, 5120),
+    (14336, 5120),
     (5120, 17408),
     (10240, 5120),
     (6144, 5120),
     (48, 5120),
+    // GDN in_proj qkv|z, N-concatenated (PLOW_FP8_BLOCK_CONCAT).
+    (16384, 5120),
 ];
 
 pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
@@ -556,6 +653,102 @@ fn valid_attention_shape(role: u8, a: &AttentionCapability, s: &AttentionShape) 
         }
 }
 
+/// `cfg` of a native FP8 block plan entry `[m, n, k, cfg, splits]`: `stages << 4 | variant`,
+/// variant bit 0 = 64-row N tiles (one consumer warpgroup), bit 1 = pipelined promotion,
+/// bit 2 = in-kernel split reduce, bit 3 = per-tile rotated group order.
+pub fn fp8_block_cfg(cfg: u32) -> Option<(u32, u32)> {
+    let (stages, variant) = (cfg >> 4, cfg & 15);
+    matches!(stages, 4 | 6).then_some((stages, variant))
+}
+
+/// Measured Qwen3.8-27B block-FP8 decode plans `[m, n, k, cfg, splits]` (single-projection
+/// screen, H100 SXM5, CUDA-graph timed, published checkpoint scales), only where faster than
+/// cuBLASLt: devgen plans the routed shapes it finds here; others stay on cuBLASLt.
+pub const NATIVE_DECODE_FP8_BLOCK_SHAPES: [[u32; 5]; 39] = [
+    [1, 5120, 6144, 65, 4],
+    [2, 5120, 6144, 97, 4],
+    [4, 5120, 6144, 67, 3],
+    [8, 5120, 6144, 65, 4],
+    [16, 5120, 6144, 65, 3],
+    [32, 5120, 6144, 107, 2],
+    [1, 5120, 17408, 65, 4],
+    [2, 5120, 17408, 97, 4],
+    [4, 5120, 17408, 65, 4],
+    [8, 5120, 17408, 65, 4],
+    [16, 5120, 17408, 72, 4],
+    [32, 5120, 17408, 104, 2],
+    [1, 6144, 5120, 65, 3],
+    [2, 6144, 5120, 75, 4],
+    [4, 6144, 5120, 65, 3],
+    [8, 6144, 5120, 65, 4],
+    [16, 6144, 5120, 107, 2],
+    [32, 6144, 5120, 73, 2],
+    [1, 10240, 5120, 105, 1],
+    [2, 10240, 5120, 105, 1],
+    [4, 10240, 5120, 107, 1],
+    [1, 14336, 5120, 73, 1],
+    [2, 14336, 5120, 73, 1],
+    [4, 14336, 5120, 67, 1],
+    [8, 14336, 5120, 72, 1],
+    [16, 14336, 5120, 73, 1],
+    [32, 14336, 5120, 73, 1],
+    [1, 16384, 5120, 75, 1],
+    [2, 16384, 5120, 67, 1],
+    [4, 16384, 5120, 67, 1],
+    [8, 16384, 5120, 73, 1],
+    [16, 16384, 5120, 73, 1],
+    [32, 16384, 5120, 73, 1],
+    [1, 34816, 5120, 65, 1],
+    [2, 34816, 5120, 65, 1],
+    [4, 34816, 5120, 65, 1],
+    [8, 34816, 5120, 65, 1],
+    [16, 34816, 5120, 73, 1],
+    [32, 34816, 5120, 99, 1],
+];
+
+fn valid_fp8_block_plan(plan: &[[u32; 5]]) -> bool {
+    let mut shapes = BTreeSet::new();
+    !plan.is_empty()
+        && plan.iter().all(|&[m, n, k, cfg, splits]| {
+            (1..=NATIVE_DECODE_FP8_BLOCK_MAX_ROWS).contains(&m)
+                && n > 0
+                && k > 0
+                && n % 128 == 0
+                && k % 128 == 0
+                && n <= i32::MAX as u32
+                && k <= i32::MAX as u32
+                && fp8_block_cfg(cfg).is_some()
+                && (1..=8).contains(&splits)
+                && splits <= k / 128
+                && shapes.insert((m, n, k))
+        })
+}
+
+fn validate_fp8_block(object: &SegmentObject) -> Result<(), String> {
+    let valid_hash = object.sha256.as_deref().is_some_and(|s| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
+    if !valid_hash
+        || object.abi != NATIVE_DECODE_FP8_BLOCK_ABI
+        || object.file.is_empty()
+        || std::path::Path::new(&object.file)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || object.promote_k512.is_some()
+        || object.attention.is_some()
+        || object.gemm.is_some()
+        || object
+            .decode_plan
+            .as_deref()
+            .is_none_or(|plan| !valid_fp8_block_plan(plan))
+    {
+        return Err("invalid native FP8 block packet object".into());
+    }
+    Ok(())
+}
+
 fn valid_decode_plan(plan: &[[u32; 5]]) -> bool {
     let mut shapes = BTreeSet::new();
     !plan.is_empty()
@@ -577,6 +770,10 @@ fn valid_decode_plan(plan: &[[u32; 5]]) -> bool {
 pub struct ProgramRoles {
     pub index: usize,
     pub roles: Vec<u8>,
+    /// Segments [`LIBRARY_PREFILL_ATTENTION`] serves, ascending; their `roles` entry is the
+    /// fallback for launches outside the library's envelope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library: Vec<u32>,
 }
 
 fn validate_generated(object: &SegmentObject) -> Result<(), String> {
@@ -609,6 +806,28 @@ fn validate_generated(object: &SegmentObject) -> Result<(), String> {
             })
     {
         return Err("invalid generated packet segment object".into());
+    }
+    Ok(())
+}
+
+fn validate_library(object: &SegmentObject) -> Result<(), String> {
+    let valid_hash = object.sha256.as_deref().is_some_and(|s| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
+    if !valid_hash
+        || LibraryAbi::parse(&object.abi).is_none()
+        || object.file.is_empty()
+        || std::path::Path::new(&object.file)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || object.promote_k512.is_some()
+        || object.attention.is_some()
+        || object.gemm.is_some()
+        || object.decode_plan.is_some()
+    {
+        return Err("invalid library attention packet object".into());
     }
     Ok(())
 }
@@ -647,11 +866,23 @@ impl SegmentRoles {
     pub fn validate_schema(&self) -> Result<(), String> {
         if self.version != 1
             || self.programs.is_empty()
-            || self.objects.keys().any(|&id| !requires_object(id))
+            || self.objects.keys().any(|&id| {
+                !requires_object(id)
+                    && id != LIBRARY_PREFILL_ATTENTION
+                    && id != NATIVE_DECODE_FP8_BLOCK
+            })
         {
             return Err("unsupported packet segment roles".into());
         }
         for (&id, object) in &self.objects {
+            if id == LIBRARY_PREFILL_ATTENTION {
+                validate_library(object)?;
+                continue;
+            }
+            if id == NATIVE_DECODE_FP8_BLOCK {
+                validate_fp8_block(object)?;
+                continue;
+            }
             if is_generated(id) {
                 validate_generated(object)?;
                 continue;
@@ -809,8 +1040,23 @@ impl SegmentRoles {
                 || program.roles.is_empty()
                 || program.roles.iter().any(|&r| r > MAX_ROLE)
                 || (program.roles.contains(&CUBLASLT) && program.roles.contains(&NATIVE_DECODE_TC))
+                || !program.library.windows(2).all(|w| w[0] < w[1])
+                || program.library.iter().any(|&seg| {
+                    program.roles.get(seg as usize).is_none_or(|&role| {
+                        !(matches!(
+                            role,
+                            INTERPRETER
+                                | PREFILL_ATTENTION
+                                | PREFILL_ATTENTION_HD512_WG32
+                                | PREFILL_ATTENTION_HD512_PX4_BQ64
+                        ) || is_generated(role))
+                    })
+                })
             {
                 return Err("invalid packet segment program".into());
+            }
+            if !program.library.is_empty() {
+                used.insert(LIBRARY_PREFILL_ATTENTION);
             }
             used.extend(
                 program
@@ -819,13 +1065,19 @@ impl SegmentRoles {
                     .copied()
                     .filter(|&role| requires_object(role)),
             );
+            if program.roles.contains(&CUBLASLT) {
+                used.insert(NATIVE_DECODE_FP8_BLOCK);
+            }
         }
         // A generated decode object may be launched by the runtime alone (riders, decode steps),
         // so it is declared with or without a program use; every other object needs one.
         let required = self.objects.iter().filter(|(_, object)| {
             !GeneratedAbi::parse(&object.abi).is_some_and(|abi| abi.decode())
         });
-        if !used.iter().all(|role| self.objects.contains_key(role))
+        if !used
+            .iter()
+            .filter(|&&role| role != NATIVE_DECODE_FP8_BLOCK)
+            .all(|role| self.objects.contains_key(role))
             || !required.into_iter().all(|(id, _)| used.contains(id))
         {
             return Err("packet segment declarations do not match use".into());
@@ -836,6 +1088,52 @@ impl SegmentRoles {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn library_attention_is_declared_per_program_over_a_native_fallback() {
+        let doc = |abi: &str, library: &str| {
+            format!(
+                r#"{{"version":1,"objects":{{"26":{{"abi":"{abi}","file":"plow_fa4_hd512.aot","sha256":"{}"}}}},
+                "programs":[{{"index":0,"roles":[0,0,0]{library}}}]}}"#,
+                "a".repeat(64)
+            )
+        };
+        let parse =
+            |abi: &str, library: &str| SegmentRoles::from_bytes(doc(abi, library).as_bytes());
+        let hd512 =
+            "lib_flash_prefill_v2:fa4:hd=512:heads=16:kv_heads=1,2:layout=head_major:dtype=bf16";
+        let hd512_f16 =
+            "lib_flash_prefill_v2:fa4:hd=512:heads=16:kv_heads=1,2:layout=head_major:dtype=f16";
+        assert!(parse(hd512, r#","library":[1]"#).is_ok());
+        assert!(parse(hd512_f16, r#","library":[0,2]"#).is_ok());
+        // Declared but unused, out of range, unordered, unknown ABI, the retired host library.
+        assert!(parse(hd512, "").is_err());
+        assert!(parse(hd512, r#","library":[3]"#).is_err());
+        assert!(parse(hd512, r#","library":[2,1]"#).is_err());
+        assert!(parse("lib_flash_prefill_v1:fa4_hd512:bf16", r#","library":[1]"#).is_err());
+        assert!(parse(
+            "lib_flash_prefill_v1:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16",
+            r#","library":[1]"#
+        )
+        .is_err());
+        let qwen = "lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16";
+        assert!(parse(qwen, r#","library":[1]"#).is_ok());
+        assert_eq!(
+            LibraryAbi::parse(qwen).map(|a| a.format()).as_deref(),
+            Some(qwen)
+        );
+        assert_eq!(
+            LibraryAbi::parse(hd512).map(|a| a.kv_heads),
+            Some(vec![1, 2])
+        );
+        for bad in [
+            "lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=5:layout=ilv:dtype=bf16",
+            "lib_flash_prefill_v2:fa4:hd=256:heads=24:kv_heads=4:layout=ilv:dtype=bf16:x=1",
+            "lib_flash_prefill_v2:fa4:heads=24:hd=256:kv_heads=4:layout=ilv:dtype=bf16",
+        ] {
+            assert!(LibraryAbi::parse(bad).is_none(), "{bad}");
+        }
+    }
+
     #[test]
     fn fp8_padded_rungs_keep_native_losses_and_near_ties() {
         for m in [64, 1088, 1152, 2112, 2176, 4160, 4224] {
@@ -1396,6 +1694,37 @@ mod tests {
             ),
         );
         assert!(SegmentRoles::from_bytes(misplaced.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn native_fp8_block_object_rides_cublaslt_programs() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"27":{{"abi":"{NATIVE_DECODE_FP8_BLOCK_ABI}","file":"f.cubin","sha256":"{}","decode_plan":[[1,16384,5120,64,2],[32,5120,6144,103,3]]}}}},"programs":[{{"index":0,"roles":[0,5,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        let parsed = SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), raw);
+        assert_eq!(fp8_block_cfg(103), Some((6, 7)));
+        assert!(valid_fp8_block_plan(&NATIVE_DECODE_FP8_BLOCK_SHAPES));
+        for bad in [
+            raw.replace("[0,5,0]", "[0,0,0]"),
+            raw.replace(NATIVE_DECODE_FP8_BLOCK_ABI, "gemm_fp8_block_sm90_v0"),
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("f.cubin", "../f.cubin"),
+            raw.replace("[1,16384,5120,64,2]", "[33,16384,5120,64,2]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16320,5120,64,2]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16384,5000,64,2]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16384,5120,80,2]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16384,5120,64,9]"),
+            raw.replace("[1,16384,5120,64,2]", "[1,16384,256,64,3]"),
+            raw.replace("[1,16384,5120,64,2]", "[32,5120,6144,64,2]"),
+            raw.replace(
+                r#","decode_plan":[[1,16384,5120,64,2],[32,5120,6144,103,3]]"#,
+                "",
+            ),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[test]

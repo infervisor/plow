@@ -112,6 +112,8 @@ static __device__ void d_gemv_fp8_wgmma(
             if (step + 1 < stages) stage((step + 1) & 1, col, (step + 1) * 128);
             sm90_cp_commit();
             sm90_cp_wait<1>();
+            /* cp.async writes through the generic proxy; wgmma reads through the async proxy. */
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             uint8_t* current = base + (step & 1) * stage_bytes;
             sm90_wg_fence();

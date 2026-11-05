@@ -82,7 +82,7 @@ pub fn plan_cores(cores: &[Core], explicit: Option<&[u32]>, reserve: usize) -> C
 pub fn plan() -> &'static CorePlan {
     static PLAN: std::sync::OnceLock<CorePlan> = std::sync::OnceLock::new();
     PLAN.get_or_init(|| {
-        let cfg = &crate::config::RuntimeConfig::get().het;
+        let cfg = &crate::config::RuntimeConfig::process_get().het;
         let explicit = cfg
             .cores
             .as_deref()

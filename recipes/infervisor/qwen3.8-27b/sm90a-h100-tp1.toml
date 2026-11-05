@@ -3,7 +3,7 @@
 # prefill (concurrent prompts share one launch), prefix cache on (the KV block store captures the
 # GDN state at the prompt-end boundary). Production recipe for this model/GPU/precision.
 #
-#   PYREF=/opt/pytorch/bin/python3 PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
+#   PYREF=<python with torch> PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3.8-27b/sm90a-h100-tp1.toml --out <fresh dir>
 #
 # Qualified (2026-10-11, plowrt 8d25a203, packet a6d706647465f718, pairing 0xc3f74a8e97e4d467): FP32-reference gate PASS at c1,
@@ -30,6 +30,15 @@
 # (same hash; two decode interpreter objects differ in SASS from the shared runtime hunks), and
 # step_bench B1/8/16/32/48 at ctx 4K, B16 at 1K/15K and the 32 x 4K ride give identical token
 # digests and ride-vs-step lines against build106 on one plowrt (ab113).
+# 2026-10-27 (branch bf16-decode, plow_git below, clean emit packet cb2ea611523da092, plowrt
+# ecb90f0d1): QwenRmsNorm on the Lt rungs runs on a one-block-per-row light entry (16 -> 6.5 us per
+# norm) and the interpreter emits RAW_NARROW + INST_PRELOAD. step_bench @8K B1/4/8/16/32 22.51 /
+# 23.61 / 25.17 / 27.75 / 32.31 -> 22.23 / 21.96 / 23.52 / 26.18 / 30.73 ms (B8 1K 23.79 -> 22.22),
+# token digests inside the control's Lt re-roll set, ctx 4094/4095/8191 sweep clean. FP32 gate PASS
+# at c1/c8/c32 (c1 kl_trim 0.00047 vs vLLM 0.00034, top1_decisive 0.9988, continuation 0.871;
+# bf16-decode/gates1). Production mix vs vLLM 0.29 (0.45 req/s, strict report MATCHED +
+# EQUIVALENT): SLO met 62.7% -> 69.7% vs vLLM 99.3%, TPOT p50 57.8 -> 46.9 ms vs 26.7; still behind
+# (prefix hit 52% vs 69% and prefill time dominate; bf16-decode/prod/report-qwenbf16).
 #
 # Routes (per-rung evidence: plans/qwen38-27b-h100.md, step_bench ctx 1K):
 #   prefill projections   cuBLASLt segments on every bucket, the 48-wide GDN a/b included (the
@@ -46,7 +55,7 @@
 #                         1.409 -> 1.364 s, bit-identical to the cp.async staging (swap78); 15K
 #                         c16/32/64 tok/s +2.2-2.6%, 4K +0.5-1.9%. The TileLang hd256 body (K5,
 #                         tlpf) ran 25-32% slower than this hand role at every class
-#   prefill GDN scan      host-side FlashInfer CuTe DSL kernel (libplow_gdn_prefill.so); prompts pad
+#   prefill GDN scan      FlashInfer CuTe DSL kernel (plow_gdn_prefill.aot cubin); prompts pad
 #                         to the bucket like every model (plowrt 851bbc8d: 1000-token TTFT 2853 -> 131 ms)
 #   packed prefill        concurrent prompts share one bucket launch (masked padding, slot -1 pads;
 #                         per-request state gathered into the init scratch, one varlen GDN scan over
@@ -82,7 +91,7 @@
 #                         interpreter pair is as fast or faster (build72 ab72_mid2, ab71)
 #   prefill interleave    1024-row chunks with the decode rows riding each (gdn_ride + rider attention;
 #                         PLOW_PF_INTERLEAVE = 1024 below); the chain's pointwise segments of a chunk run
-#                         as light launches on the decode object (PLOW_QWEN_LIGHT_OCC 4; branch-free
+#                         as light launches on the decode object (PLOW_GDN_LIGHT_OCC 4; branch-free
 #                         sigmoid/SiLU, rolled conv tile: light table 11.6 -> 9.9 ms per chunk, prefill
 #                         digest unchanged); 4K c16/c32/c64 tok/s 7032 / 8536 / 8841 (build77)
 #   step ms B1/8/16/32/48 23.8/27.2/31.0/38.8/48.0 (ctx 1K, build48; build32 23.75/27.46/31.43/
@@ -92,12 +101,28 @@
 #                         still gated; untested against the robust verdict)
 # Ladder tops at 48: the 64-slot recurrent state (151 MB per slot) left the planner 0.5 GiB short on
 # the 80 GB part.
+# 2026-10-27 vs vLLM 0.29 (plowrt bb9f389fd, packet 3157ca560892, campaign.py report MATCHED +
+# EQUIVALENT; docs/bringup/results/qwen38-27b-h100/comparison.md): NOT production ready. 1000/128
+# c1/c8/c32 tok/s 0.91x/0.88x/0.80x, TPOT P99 1.12x/1.41x/1.60x (c32 was 0.96x/1.25x vs vLLM 0.28 on
+# 2026-10-13 with the prefix cache off); prod mix (1.8 sessions/s overloads vLLM too) at 0.45: tok/s
+# 0.95x, TTFT/TPOT P99 3.9x/1.8x, SLO met 63 vs 99 %; 0.7 overloads plowrt. Decode ~25 ms at 4 rows,
+# 1024-row prefill chunk 89 ms, and prefix hit 52 -> 13 % under load (vLLM 63-69 %). Serve tunes not run.
+# 2026-10-28 (branch qwen-prefix, plowrt 87e820a40, same packet cb2ea611523da092; serve env below
+# plus PLOW_HOST_KVCACHE_SIZE=62GB, the 62 GiB pinned host tier the planned MemTotal/4 default
+# gives on this 249 GB box): prefix retention fixed in plowrt (GDN state captured at the shared
+# system-prompt end and at awaited checkpoints, no host-tier wipe under device pressure, spills paced
+# at 256 MiB in flight, failed refills keep their host bytes). Prod mix at 0.45 vs vLLM 0.29: tok/s
+# 1.00x, TTFT/TPOT P99 1.27x/1.03x (both spread-flagged), SLO met 99.3 vs 99.3 %, prefix hit 78 %
+# (was 52 %; vLLM 63-69 %); 0.7: 1.02x, 1.58x/0.64x, SLO 55.6 vs 54.4 % (both overload one repeat).
+# c1/c8/c32 0.92x/0.96x/0.96x (c32 was 0.80x; prefix-off control 708 vs 682 out tok/s), the rest is
+# the decode step. FP32 gate c1/c8/c32 PASS on this binary with the host cap (qwen-prefix/gates/bin8);
+# FP32-gate stress (c1, c8, 4 x c32 on one server) at most 1 position over 0.1 nat per capture.
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "8b811e455ffed12486742718128efc439bc090ba"
+plow_git = "b3a2168bda58119c2c28a83183165728bae0a6d5"
 network = "qwen3.5"
 
 [target]
@@ -126,8 +151,9 @@ n_cu = 132
 max_ctx = 16384
 precision = "bf16"
 
-# GDN prefill runs host-side from <assets>/libplow_gdn_prefill.so (exec/gpu.rs NativeGdn); the
-# FlashInfer CuTe DSL export needs the vLLM python (flashinfer 0.6.16 + cutlass 4.6.2).
+# GDN prefill: <assets>/plow_gdn_prefill.aot, the FlashInfer CuTe DSL kernel as a cubin plowrt
+# launches itself (device/cuda/qwen_gdn.rs); the export needs the vLLM python (flashinfer 0.6.16 +
+# cutlass 4.6.2).
 [[prep]]
 name = "gdn-prefill-lib"
 script = "scripts/build_sm90a_qwen_gdn.py"
@@ -155,15 +181,34 @@ args = ["build", "{out}/assets", "--entries", "attn_dec_hd256_gqa6_ilv"]
 TILELANG_DISABLE_CACHE = "1"
 TVM_FFI_DISABLE_TORCH_C_DLPACK = "1"
 
+# Full-attention (hd256, 24 heads over 4 KV heads) prefill on every prefill rung through the library
+# route (plowrt exec/gpu/lib_attention.rs, docs/arch/28): FlashAttention-4's SM90 forward exported
+# AOT as cubins into <assets>/plow_fa4_hd256.aot (plowrt launches them; scripts/fa4_aot/build.py),
+# reading the row-interleaved BF16 KV in place (no adapter,
+# no copy); the generated role stays the declared fallback (PLOW_PF_ATTN_LIBRARY=0 runs it).
+# Qualified 2026-10-29 on lib-attn2 (plowrt a50a58555, packet 48cf345c9314): one 16000-token
+# prompt, packed prefill chunk 4096/1024/512/128 1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/
+# 3.996 s (-1.2/-1.7/-1.5/-7.6%), ctx 4094/4095/8191 sweep clean. FP32 gate PASS c1/c8/c32 (c1
+# kl_trim 0.000456 vs native 0.000448, p95 0.0026, top1_decisive 0.9988, cont_decisive 1).
+# Production mix 0.45/s, 2 reps, vs vLLM 0.29: TTFT P99 1728 -> 1504 ms, TPOT P99 81.3 -> 75.7 ms,
+# SLO met 99.3 -> 99.9% (spread > 10%; better in both reps). Evidence:
+# docs/bringup/results/qwen38-27b-h100/comparison.md.
+[[prep]]
+name = "fa4-hd256-lib"
+script = "scripts/fa4_aot/build.py"
+python = "{env:PYREF}"
+args = ["{out}/assets", "hd256", "24", "4"]
+
 [emit]
 emit = "devblob+cubin"
-args = []
+args = ["--served-name", "qwen3.8-27b"]
 [emit.env]
 PLOW_QWEN_PREFILL = "128,512,1024,4096"
 PLOW_DECODE_BATCH = "4"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_causal_ilv,attn_dec_hd256_gqa6_ilv"
+PLOW_EMIT_ATTN_LIBRARY = "1"
 # Row-interleaved full-attention KV ([slot][ctx][kvh][hd]): the live-KV allocator charges
 # 1024-row blocks instead of a 4096-row block per head (4.2K-row slot 512 -> 320 MiB). build97:
 # step_bench digests identical to build96 at 20 (B, ctx) cells incl. the VMM boundaries; grid97
@@ -187,7 +232,7 @@ PLOW_NV_FA_RG_U = "8"
 PLOW_QWEN_GDN_ISOLATE = "4"
 # Decode projections on rungs >= 16 as cuBLASLt segments (496 per rung; fuse_ab / fuse_mlp / fold
 # off there, the generated attention and GDN step routes beside them; plowrt merges the route
-# tables, runs the rung's pointwise windows as light launches (PLOW_QWEN_LIGHT_DECODE) and
+# tables, runs the rung's pointwise windows as light launches (PLOW_GDN_LIGHT_DECODE) and
 # graph-captures the rung with the generated attention's split count pinned to the SM cover
 # (PLOW_GEN_DECODE_PIN_NSPLIT)). Rung 8 keeps the native walks (its roles differ under
 # GDN_ISOLATE=16). build105: B1-8 bit-identical, B16/32/48 29.77/36.13/41.00 -> 29.51/33.09/34.78
@@ -202,7 +247,7 @@ PLOW_QWEN_GDN_ISOLATE = "4"
 # with identical digests; from 1 row B1/B2 22.19/23.16 -> 22.94/23.47 ms (not taken). --same 8 x 4K
 # 8/8. FP32 gate c1/c8/c32 PASS: kl_trim 0.000461/0.000450/0.000415 vs vLLM 0.000338/0.000346/
 # 0.000356, top1_decisive 0.9988/0.9988/1, cont_frac 0.862/0.874/0.883 vs 0.861/0.866/0.870, needle 1.
-# Evidence: /opt/dlami/nvme/lava-tts/route-sweep (C/qwen, gates/qwenbf16-lt4i).
+# Evidence: <lab scratch>/route-sweep (C/qwen, gates/qwenbf16-lt4i).
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "4"
 # Remainder split-K in the mma row-block walks; rungs 1..4 take the K8 tensor-core walk too
@@ -210,6 +255,9 @@ PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "4"
 # identical through B32; grid94 4K c16 tok/s 226.3 -> 229.1).
 PLOW_NV_GEMV_REM_SPLIT = "1"
 PLOW_NV_GEMV_K8_B1 = "1"
+# Packed narrow bodies and instruction preload in the interpreter objects: token digests
+# unchanged, B1 -0.2 ms.
+NVCC_APPEND_FLAGS = "-DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1"
 
 # PLOW_VMM_LIVE: KV reserved virtually at the ceiling, physical commit per admitted slot and rows
 # (flat KV is 1 GiB per slot at 16K). Under PLOW_VMM_LIVE the prefix cache is not auto-selected,
@@ -233,10 +281,10 @@ PLOW_PREFIX_CACHE = "1"
 PLOW_VMM_PREFIX = "1"
 # Prefill in 1024-row chunks with the decode rows riding each chunk (gdn_ride + rider attention):
 # the 4K / 15K serving grids (lc43 plow4k_k1 / plow15k_k1, build64) ran here; the chain's
-# pointwise segments of a chunk are light launches (PLOW_QWEN_LIGHT_OCC default 4) and the decode
+# pointwise segments of a chunk are light launches (PLOW_GDN_LIGHT_OCC default 4) and the decode
 # attention from four rows the generated flash-decode object (PLOW_GEN_DECODE_STEP default 4).
 # A packed chunk's chain replays as CUDA graph pieces between its per-tick launches
-# (PLOW_QWEN_PF_GRAPH default on; grid110 on the build106 packet: 4K tok/s 241.0/293.7/305.1,
+# (PLOW_GDN_PF_GRAPH default on; grid110 on the build106 packet: 4K tok/s 241.0/293.7/305.1,
 # TTFT p99 5865/11929/24524, TPOT p99 59.7/96.8/98.0; 15K 82.1/83.9/84.8, 22946/46136/92517,
 # 101.1/101.3/101.5; digests unchanged; gate110/110b/110c c1/c8/c32 PASS, c32 on the third serve
 # with a graphs-off control serve at 0.8572 cont_frac beside the 0.8402 pass). The packed compact
@@ -257,13 +305,18 @@ outlen = 128
 warmups = 2
 seed = 42
 tokenizer = "{env:QWEN38_CHECKPOINT}"
-model_id = "checkpoint"
+model_id = "qwen3.8-27b"
 gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 # Served c1 (grid43full, docs/bringup/results/qwen38-27b-h100/comparison.md): vLLM 0.28 at the same
 # cell 415 total tok/s, TPOT p99 19.97 ms, TTFT p99 242 ms. Wins TTFT P99 (0.48x) and memory; loses
 # throughput (0.87x) and TPOT (1.19x) here and in every wider cell (c32 0.67x, c64 0.58x: the 40 ms
 # B32 step, ladder tops at 48 slots).
+[rung_choices.PLOW_EMIT_ATTN_LIBRARY]
+# Library vs declared native role, every prefill rung (see the PLOW_BUILD_FA4_* comment above).
+label = "qualified"
+evidence = ["lib-attn2 2026-10-29 plowrt a50a58555, packet 48cf345c9314: chunk 4096/1024/512/128 1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/3.996 s; FP32 gate c1/c8/c32 PASS", "docs/bringup/results/qwen38-27b-h100/comparison.md", "docs/arch/28-library-attention.md"]
+
 [measured]
 tok_s = 40.9
 p50_tpot_ms = 23.8

@@ -1024,6 +1024,7 @@ fn launch(
                 true,
             ),
             _cancel: Cancellation(Arc::new(AtomicBool::new(false))),
+            _stream: None,
         });
     }
     let mut samples = segment.samples.clone();
@@ -1076,6 +1077,7 @@ fn launch(
             .map(|t| tokio::time::Instant::now() + t),
         run,
         _cancel: cancel,
+        _stream: None,
     })
 }
 

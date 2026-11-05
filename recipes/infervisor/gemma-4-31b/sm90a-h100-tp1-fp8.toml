@@ -42,7 +42,7 @@ namespace = "infervisor"
 name = "gemma-4-31b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "071d8f13cd546dc052d2e4702ac6c4aed1af1ff0"
+plow_git = "b3a2168bda58119c2c28a83183165728bae0a6d5"
 network = "gemma4"
 
 [target]
@@ -124,7 +124,6 @@ PLOW_PF_SEG_FA512 = "1"
 PLOW_VMM_LIVE_RINGS = "0"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "32"
-PLOW_TOKEN_BATCH = "1"
 PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
 
 [bench]

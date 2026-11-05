@@ -45,47 +45,7 @@ pub(crate) fn derive_kvrow(p: &DevProg, names: &[String]) -> (Vec<u32>, Vec<u32>
     (i3, i2)
 }
 
-/// Which `i[]` field of an instruction carries the KV-cache WRITE ROW, or `None`
-/// when the instruction does not write the cache at all.
-///
-/// ONE rule, consulted by BOTH phases — [`derive_kvrow`] for the decode step's
-/// per-token row and [`rebase_chunk`] for a prefill chunk's base row. They used
-/// to disagree: decode found the sites by destination NAME, prefill by
-/// `HeadNormRope` + `fj[1] != 0`, and the second test matches nothing on GLM's
-/// MLA (its k_rope sets `j[1]`, which packs into `fj[2]`, and leaves `f[1]`/`j[0]`
-/// — the two halves of `fj[1]` — at zero). So a GLM prefill chunk wrote every
-/// latent row of every chunk at row 0 and only the LAST chunk's tail survived,
-/// with no error anywhere. Two phases deriving "what is a KV write" by two rules
-/// is the bug; this is the one rule.
-///
-/// The destination NAME is the discriminator, and it has to be: the field alone
-/// cannot tell GLM's `kv_a_layernorm` (an `RmsNorm` whose `i[2]` is the latent
-/// out-row) from the input/post-attention norms, which are the same opcode with
-/// `i[2]` meaning nothing. Keying on the opcode alone would rebase those two and
-/// corrupt the block input.
-///
-/// The `HeadNormRopeFp8` twin is included for the same reason the flash test
-/// includes its own: an fp8-KV packet emits the fp8 opcode, and a bf16-only test
-/// silently matches nothing there — the class of miss `derive_segments` records.
-pub(crate) fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
-    if !dst.is_some_and(|n| n.starts_with("kv.")) {
-        return None;
-    }
-    if op == DevOp::RmsNorm as u16 {
-        // GLM/DeepSeek MLA: `kv_a_layernorm` -> `kv.{L}.ckv`, out_row0 in i[2]
-        // (`runtime/amd/interp.hip`, PLOW_DOP_RMSNORM).
-        Some(2)
-    } else if op == DevOp::DsaPoolCompress as u16 {
-        // GLM-5.3 pooled indexer: prefill pool-cache base in i[3].
-        Some(3)
-    } else if op == DevOp::HeadNormRope as u16 || op == DevOp::HeadNormRopeFp8 as u16 {
-        // Dense GQA k/v norm -> `kv.{L}.k`/`.v`, and MLA's k_rope -> `kv.{L}.krot`.
-        // Both carry the write row in i[3].
-        Some(3)
-    } else {
-        None
-    }
-}
+pub(crate) use plow_asset::abi::kv_write_row_field;
 
 /// Rebase one prefill program's instructions onto the chunk `[c0, c0+clen)`.
 ///
@@ -240,6 +200,7 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::Residual, RowField::RowsTimes(0)),
     (DevOp::AddNorm, RowField::Rows(0)),
     (DevOp::Glu, RowField::RowsTimes(0)),
+    (DevOp::GluPitched, RowField::RowsTimes(0)),
     (DevOp::Gemm, RowField::Rows(0)),
     (DevOp::GemmNorm, RowField::Rows(0)),
     (DevOp::GemmSmall, RowField::Rows(0)),

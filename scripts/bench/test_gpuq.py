@@ -28,12 +28,12 @@ class QueueTests(unittest.TestCase):
     def test_long_jobs_drain_fifo_and_record_failed_lease(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for number in (2, 1):
-                gpuq.save(root / f"{number}.json", dict(state="queued", ngpu=1, label=str(number), command=["true"], cwd=directory))
+            gpuq.save(root / "2.json", dict(state="queued", ngpu=1, label="2", command=["true"], cwd=directory))
+            gpuq.save(root / "1.json", dict(state="queued", ngpu=1, label="1", command=["true"], cwd=directory, lease_timeout=600))
             with patch.object(gpuq.os, "access", return_value=True), \
                  patch.object(gpuq.time, "monotonic", side_effect=[0, 1, 1, 2001, 2002, 2002, 4002, 6003]), \
                  patch.object(gpuq.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "GPU: no foreign compute procs\n")), \
-                 patch.dict(gpuq.os.environ, {"PLOW_MULTISTEP": "8", "PATH": "/nix/bin"}), \
+                 patch.dict(gpuq.os.environ, {"PLOW_MULTISTEP": "8", "PATH": "/nix/bin", "GPU_LEASE_TIMEOUT": "1800"}), \
                  patch.object(gpuq.subprocess, "Popen") as launch:
                 launch.return_value.pid = 123
                 launch.return_value.wait.side_effect = [76, 0]
@@ -42,6 +42,8 @@ class QueueTests(unittest.TestCase):
                 self.assertTrue(all("PLOW_MULTISTEP" not in call.kwargs["env"]
                                     and call.kwargs["env"]["PATH"] == "/nix/bin"
                                     for call in launch.call_args_list))
+                # Per-job submitter value wins; a job without one gets the queue default, not the runner's inherited env.
+                self.assertEqual([call.kwargs["env"]["GPU_LEASE_TIMEOUT"] for call in launch.call_args_list], ["600", "14400"])
             self.assertEqual(json.loads((root / "1.json").read_text())["state"], "failed")
             self.assertEqual(json.loads((root / "2.json").read_text())["state"], "done")
 

@@ -33,10 +33,8 @@ export PLOW_PF_SEG_FA512=1
 export PLOW_PF_SEG_PURE=fp8
 export PLOW_PREFIX_CACHE=1
 export PLOW_TERMINAL_LT=0
-export PLOW_TOKEN_BATCH=1
 export PLOW_VMM_LIVE_RINGS=1
 export PLOW_VMM_PREFIX=1
-export PLOW_VMM_RING_PARK=8
 export PLOW_VMM_STRICT_PUBLISH=1
 
 # Multi-tenant voice knobs

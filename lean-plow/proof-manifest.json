@@ -65,6 +65,12 @@
       {"theorem": "Plow.SpeechFusion.ln_site_stats", "checker": "Plow.SpeechFusion.LnSite.Contract"},
       {"theorem": "Plow.SpeechFusion.ln_site_gemm_eq", "checker": "Plow.SpeechFusion.LnSite.Contract"},
       {"theorem": "Plow.SpeechFusion.conv_site_in_bounds", "checker": "Plow.SpeechFusion.ConvSite.Contract"},
-      {"theorem": "Plow.SpeechFusion.conv_site_eq", "checker": "Plow.SpeechFusion.ConvSite.Contract"}]}
+      {"theorem": "Plow.SpeechFusion.conv_site_eq", "checker": "Plow.SpeechFusion.ConvSite.Contract"}]},
+    {"id": "page_envelope.v1", "scope": "paged_table_envelope", "soundness": [
+      {"theorem": "Plow.PageEnvelope.checkRoute_sound", "checker": "Plow.PageEnvelope.checkRoute"},
+      {"theorem": "Plow.PageEnvelope.route_safe", "checker": "Plow.PageEnvelope.Route.Contract"},
+      {"theorem": "Plow.PageEnvelope.read_in_envelope"},
+      {"theorem": "Plow.PageEnvelope.padded_entry_own"},
+      {"theorem": "Plow.PageEnvelope.envelope_tight"}]}
   ]
 }

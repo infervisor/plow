@@ -183,7 +183,7 @@ async fn busy_device_group_does_not_stall_another_groups_response() {
 async fn a_slow_consumer_gets_an_error_while_another_model_completes() {
     let (_state, muxes) = setup("slow-consumer");
     let mut slow = submit(&muxes[0], 65, 64);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(5200)).await;
     assert!(collect(submit(&muxes[1], 66, 12)).await.1);
     let mut terminal = false;
     while let Some(chunk) = slow.recv().await {

@@ -492,17 +492,21 @@
           ];
           plow-interp-sm90a = mkNvCubin "sm90a" [
             "-DPLOW_SM90A_CUBIN=ON"
+            # The device sampler's -arch; its sm_120a default does not load on Hopper.
+            "-DPLOW_CUBIN_ARCH=sm_90a"
             "-DPLOW_SM120_CUBIN_FP8KV=ON"
             "-DPLOW_FP8_KV_FASTPF=ON"
           ];
           # Every flavour under one root: hsaco/<gfx-arch>/*.elf + cubin/*.cubin.
           plow-interp = pkgs.symlinkJoin {
             name = "plow-interp";
+            # Both NVIDIA packages write cubin/sample_sm120.cubin; the first path wins, so the
+            # joined tree keeps the sm_120a sampler it always had.
             paths = [
               plow-interp-gfx942
               plow-interp-gfx950
-              plow-interp-sm90a
               plow-interp-sm120a
+              plow-interp-sm90a
             ];
           };
         })

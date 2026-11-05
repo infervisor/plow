@@ -18,7 +18,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "fish-s2-pro"
 label = "sm90a-h100-tp1"
-plow_git = "29a629ca44f1e102e74002cbb0542e468d7fb364"
+plow_git = "817a55cbb588b712f5d69c283300ca7986ad045c"
 network = "qwen3"
 doc = "docs/runtime/tts.md"
 tracker = "docs/runtime/h100-speech-recipes.md"
@@ -78,6 +78,10 @@ PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "64,256"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64"
+# Codec arena capped at the kit's qualified 32-stream set (32 x 17 chunk steps): the full
+# 256-stream set sized it at 33 GiB of codec beside 36 GiB of static KV and the bundle no longer
+# fit one H100. 64 streams (1088 rows) is unmeasured on H100.
+PLOW_EMIT_FISH_CODEC_MAX_ROWS = "544"
 # Veena's measured decode set (A/B on this model, same plowrt, fish_gen --slots backbone+depth ms
 # per step: 8 slots 11.47 -> 8.78, 32: 14.40 -> 13.30, 64: 21.16 -> 17.37; served stream c1
 # TTFA 89 -> 46 ms, c8 13.3 -> 17.3, c32 16.2 -> 20.7 audio s/s; Whisper CER 0.000 both, n=165/186).

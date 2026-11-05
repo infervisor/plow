@@ -69,21 +69,36 @@ Every `packet_sha256` on disk matches its packet. Every receipt names verifier `
 | R | devblob hook, measured/GEMM policies | policies recorded | unusable | `MeasuredPolicy` / `SelectedGemmPolicy` |
 | L | devblob hook, `FlashMerge i4=1024` (padded MLA) | GLM-class packets | unusable | `LayoutMapping` |
 
-Runtime replay (`plowrt certificate_checks::check_packet`, called by the CUDA, HSA and CPU engines):
+plowrt does not read or replay receipts. Qualification is plowc's: every devblob emit qualifies
+what it wrote (`--lean-qualify report|strict`, recorded in `build.json` `lean.bundle_qualification`),
+and `plowc qualify <dir|packet>` runs the same checks offline. Packet integrity at load is the dist
+signatures and digests. Nemotron, Parakeet and Silero packets bypass every gate, including K.
 
-- It loads silently with no receipts, with zero checks, with a missing or changed verifier, or with
-  an unusable binary.
-- It rejects a binding mismatch, a rejected certificate or a changed envelope.
-- Sidecar receipts are never read at runtime.
-- `CudaPacketRuntime` (encoder/codec/s3gen on CUDA) never calls it.
-- Nemotron, Parakeet and Silero packets bypass every gate, including K.
-- Hazard: `check_packet` always reads `<dir>/lean-checks.json`. A CPU/Metal load of `encoder.pkt`
-  therefore reads `model.pkt`'s receipts and fails the hash binding.
+The load-time receipt binding (malformed receipts, `packet_sha256` mismatch, a receipt that does
+not rebind, a changed envelope on replay) was removed with the plowrt qualify path. These are
+evidence-integrity checks, not execution guards: a dist pull already verifies signatures and
+digests, and a local non-dist load is a development path. `check_l2_dispatch` and
+`refuse_concat_features` stay in plowrt.
 
 ### Logical-effects coverage of the main packets
 
-`logical_effects::obligation` covers 46 opcodes (the FP32 speech set plus Gemm/Gemv/norm/residual
-basics). It rejects a whole program at the first unaudited op. It also rejects TP, packed/token-batch
+`logical_effects::obligation` covers the FP32 speech set, Gemm/Gemv/norm/residual basics and,
+since lean-llm-effects, every opcode of the 7 H100 RC8 LLM packets (attention, RoPE/KV writes,
+GEMV/GEMM, quantization, MoE, Qwen GDN, sampling), including operands reached through `i`/`fj`
+handles. Known limits of that audit:
+
+- Write sets are cited from the NVIDIA kernels (`runtime/nvidia`). The same table serves AMD
+  packets; only the decode `MoeAlignGemmaPf` no-op (i0 < i3) is target-gated. AMD write sets are
+  not separately audited.
+- `QwenGdnPrefill`'s packed path writes runtime scratch `act.gdn.initstate`; the obligation does
+  not model it. It is a runtime obligation.
+- Runtime launch fusions are outside the program and not covered.
+- Instructions that write a generated tensor map are rejected; maps are load-time descriptors.
+- A read of a `moe.ewt.{l}`/`moe.est.{l}` expert pointer table also reads the expert weight/scale
+  tensors the runtime points it at; writing a table is rejected, and an MoE expert kernel's
+  table operand must be a `moe.ewt.`/`moe.est.` table.
+
+The table below is the coverage before that change. It rejects a whole program at the first unaudited op. It also rejects TP, packed/token-batch
 siblings, `l2_domains`, fine counters and `@` aliases. Unaudited opcodes in production main packets
 (from each `build.json` `opcodes`):
 
@@ -108,7 +123,7 @@ empty input is not complete.
 | Packet kind | Required obligations | Today |
 | --- | --- | --- |
 | plowc main packet | A once; per program: coarse D, logical-effects D; L per padded-MLA producer | A + coarse D complete; logical effects 0 of N |
-| plowc sidecar | per program: logical-effects D via `program_checks` | complete for all 4 production sidecar kinds; checked at load under `PLOW_LEAN_QUALIFY` |
+| plowc sidecar | per program: logical-effects D via `program_checks` | complete for all 4 production sidecar kinds; checked by `plowc qualify` |
 | multimodal sidecars (`mm_vision.pkt`, `mm_audio.pkt`, merged from mm-vision at 3d0b6948) | sidecar route (not named `model`), receipts through `write_sidecar_packet`; `media_geometry.v1` multimodal family on the main packet | no built bundle yet; the 4de53bf6 baseline predates them |
 | policy receipts (R) | none required. They bind when present (selection evidence, not structure) | — |
 | example-built ASR/VAD packets | per program: logical-effects D, or a recorded exemption | no gate, no receipts |
@@ -116,6 +131,7 @@ empty input is not complete.
 | KV ring / VMM lifecycle | `kv_ring.v1` per packet with packed prefill over a sliding ring; `vmm_trace.v1` on runtime traces (CPU lane) | done (§11) |
 | multimodal slab lifecycle | reserve/stage/release/unload invariants (Phase 4) | Rust tests only |
 | speech fusions | `speech_fusion.v1` per packet with a fused site | done (§12); no production packet has one |
+| paged library attention table | `page_envelope.v1` on the runtime's split cap and table pad (CPU lane) | done (§13) |
 
 ## 5. Proof roots
 
@@ -151,7 +167,7 @@ never built. It is now imported.
 - **CPU-verifier:**
   - all ignored tests in `lean_verify` (tests/*);
   - all ignored tests in `plowc` integration targets, plus `plowc --bin plowc cli_tests::actual_devblob_hook_*`;
-  - `plowrt --lib certificate_checks::tests::*`.
+  - `plowc --lib qualify::tests::*`.
 - **Artifact:** `plowrt` `vmm_packet_geometry`, `vmm_ring_tests::actual_*`, `knob_scope::incident_fixtures`,
   `exec/gpu/*_tests::actual_*`, `cpu_serve_live`, `plow-asset packed_prefill::fp8_*`. These need bundle
   paths in env vars, so they belong to the production artifact lane.
@@ -184,8 +200,8 @@ unrelated to this work and are not chased.
 
 | Gap | Task |
 | --- | --- |
-| No completeness or verifier policy at load or qualification | Strict policy, `plowrt qualify`, `PLOW_LEAN_QUALIFY` (Phase 1) |
-| Sidecar receipts unchecked at load; encoder receipt-file hazard | Sidecar route in `certificate_checks`, `program_checks` completeness (Phase 1) |
+| No completeness or verifier policy at load or qualification | Strict policy, `plowc qualify`, `plowc --lean-qualify` |
+| Sidecar receipts unchecked at load; encoder receipt-file hazard | Sidecar route in `plowc::qualify`, `program_checks` completeness (Phase 1) |
 | 34 unaudited opcodes in main packets | Extend `logical_effects` footprints (Phase 2 follow-up). Until then a listed gap per bundle |
 | Example-built ASR/VAD packets have no receipts | Route their builders through the sidecar verifier hook, or record an exemption |
 | KV ring / shared backing lifecycle | Done: `kv_ring.v1`, `vmm_trace.v1` (§11) |
@@ -201,7 +217,7 @@ unrelated to this work and are not chased.
 
 `plow_asset::certificates` derives each packet's required obligations from its programs. It then
 matches receipts to them and records a `Qualification`: required and satisfied obligations, policy
-receipts, receipt verifiers, and gaps. `plowrt certificate_checks` adds the replay.
+receipts, receipt verifiers, and gaps. `plowc::qualify` adds the replay.
 
 - **Required set.**
   - Compiler packet (`model.pkt`, or any packet whose `lean-checks.json` binds its bytes): A once;
@@ -226,21 +242,15 @@ receipts, receipt verifiers, and gaps. `plowrt certificate_checks` adds the repl
 - **Cache.** Replay results are cached per (receipts digest, verifier, required-scope-set digest),
   so a verdict is never reused for a different scope set.
 - **Entry points.**
-  - `plowrt qualify --assets DIR...` qualifies every `*.pkt` with replay (`--no-replay` skips the
-    verifier and then cannot qualify). It exits non-zero on any gap.
-  - At load, `PLOW_LEAN_QUALIFY` applies to `check_packet` (CUDA/HSA/CPU engines) and to
-    `check_sidecar` (`CudaPacketRuntime`, i.e. encoder/codec/s3gen on CUDA).
-- **Knob.** `PLOW_LEAN_QUALIFY` (`rt.lean_qualify`, `--lean-qualify`, opt-in) takes `off`, `report` or
-  `strict`. The default is `off`.
-  - `off` is the pre-policy load path, with one fix: a sidecar now reads `<stem>.lean-checks.json`,
-    never the compiler packet's receipts.
-  - `report` also logs every gap.
-  - `strict` refuses any packet with a gap.
-  - The default stays `off` because `strict` refuses all 14 production bundles: 12 have the
-    logical-effects gap and 2 have no receipts. `report` re-reads sidecar obligations at load
-    (s3gen has 1931 programs), so it is not free either.
+  - `plowc qualify DIR|PACKET...` qualifies every `*.pkt` with replay (`--no-replay` skips the
+    verifier and then cannot qualify). It exits non-zero on any gap. A sidecar reads
+    `<stem>.lean-checks.json`, never the compiler packet's receipts.
+  - Every plowc devblob emit runs it on its output. `--lean-qualify report` (default) records the
+    result in `build.json`; `strict` fails the emit on any gap. `campaign.py build` passes
+    `strict` for a `recipes/infervisor` recipe.
+  - plowrt has no qualification path (no load-time replay, no knob).
 
-Strict results for the 14 H100 production bundles (`plowrt qualify`, replay on), at 4de53bf6:
+Strict results for the 14 H100 production bundles (`plowc qualify`, replay on), at 4de53bf6:
 
 | Bundle | Packet | Verdict | Gap |
 | --- | --- | --- | --- |
@@ -286,7 +296,7 @@ declared maxima.
 `plow_asset::media_geometry::request` derives the input from the bundle's packet pipeline sections,
 which `PacketAsset` validates against the tensor bytes, and from `asr_vocabulary.json` and the
 multimodal contract. A missing parameter, an absent referenced sidecar, or an overflowing shape
-product rejects. Unknown fields and kinds are rejected on the Lean side. `plowrt qualify` adds the
+product rejects. Unknown fields and kinds are rejected on the Lean side. `plowc qualify` adds the
 obligation to the packet that owns the pipeline. Load-time `strict` does not re-run it.
 
 ## 11. KV ring and VMM lifecycle (`kv_ring.v1`, `vmm_trace.v1`)
@@ -311,7 +321,7 @@ obligation to the packet that owns the pipeline. Load-time `strict` does not re-
   - staggered requests that wrap the ring;
   - one one-row request, whose padding writes the rest of the bucket on an unmasked plan.
   A span is a maximal run of one slot at consecutive positions. A negative position rejects. A slot
-  split into two runs is rejected by Lean. `plowrt qualify` adds the obligation to every packet with
+  split into two runs is rejected by Lean. `plowc qualify` adds the obligation to every packet with
   packed prefill over a sliding ring. Production: all six Gemma packets pass.
   - 12B, 26B and 31B: ring 2048, window 1024, staged 1024 of 4096.
   - E4B: ring 4096, window 512, unstaged 2048.
@@ -374,10 +384,10 @@ obligation to the packet that owns the pipeline. Load-time `strict` does not re-
     - the scale aliases neither the output nor the residual.
   - **`conv_site_in_bounds`.** Every `(b, t, c)` index into the scale and the residual is in bounds.
   - **`conv_site_eq`.** Lifts `conv_row_scale_residual_eq` to every element.
-- **Qualification.** `plowrt qualify` adds the obligation to any packet with a fused site.
+- **Qualification.** `plowc qualify` adds the obligation to any packet with a fused site.
   - None of the 14 production bundles has one: Qwen's `fuse_layer_norm` is off, and no production
     builder emits `row_scale`.
-  - The ignored test `certificate_checks::tests::emitted_speech_fusion_sites_meet_the_lean_preconditions`
+  - The ignored test `qualify::tests::emitted_speech_fusion_sites_meet_the_lean_preconditions`
     checks devgen's actual emitters: a two-layer fused Qwen audio tower and `conv1d_f32_row_scaled`.
     Both are accepted.
   - It rejects nine single-field mutations, one per bound precondition. It also checks that a GEMM
@@ -385,3 +395,26 @@ obligation to the packet that owns the pipeline. Load-time `strict` does not re-
 - **Assumptions.**
   - Programs run in index order, one after another. This holds for forward-pipeline sequences.
   - The arithmetic premises are those of `Plow.Speech`.
+
+## 13. Paged table envelope (`page_envelope.v1`)
+
+`Plow/PageEnvelope.lean` models the paged producer of the library flash prefill attention (TMA KV
+branch): per (request, tile, split) it reads page-table columns `hi − 1`, `[lo, hi)` and `lo`.
+
+- **Input.** Routes `{abi, page, kv_tile, max_splits, pad}`.
+- **Contract (`Route.Contract`).** `0 < page`, `kv_tile = page`, `0 < max_splits ≤ pad + 1`.
+  A KV tile other than the page is refused: the model does not apply.
+- **Theorems.**
+  - `checkRoute_sound`.
+  - `route_safe`: for any request of `kv_len > 0` rows, any tile limit, and any split count up to
+    `max_splits`, every column read lies in `[−1, width + pad)`; `−1` only for an empty tile.
+  - `read_in_envelope`, `padded_entry_own`: a non-negative read finds one of the request's own pages.
+  - `unpadded_overreads`, `envelope_tight`: `pad = 0` over-reads; `pad ≥ max_splits − 1` is necessary.
+- **Source.** The pad and split cap are runtime constants, not packet data. The ignored test
+  `exec::gpu::lib_attention::tests::paged_table_pad_satisfies_the_lean_envelope` sends `PAGE`,
+  `MAX_SPLITS`, `TABLE_PAD` (the pad `plan` writes) and each ABI's KV tile from `tiles`, and checks
+  the split rule never exceeds `MAX_SPLITS`. The hd 512 head-major route is the TMA paged one; hd 256
+  loads row-predicated and is out of scope. A pad of `MAX_SPLITS − 2`, no pad, and the hd 256 tile
+  are refused. A const assert in `lib_attention.rs` repeats the hypothesis at compile time.
+- **Out of scope.** The loader read set is modelled from the upstream source, not derived from
+  machine code. The word before row 0 (`n_block_max = 0`) is written by `plan`, outside the model.

@@ -19,7 +19,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "silero-vad"
 label = "sm90a-h100-tp1"
-plow_git = "f0766b0d1c6fa9d6a68d8910fea2133670e204c0"
+plow_git = "b3a2168bda58119c2c28a83183165728bae0a6d5"
 network = "silero-vad-v5"
 doc = "docs/runtime/asr.md"
 

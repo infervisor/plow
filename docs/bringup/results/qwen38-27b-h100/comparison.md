@@ -251,3 +251,118 @@ slots x 16K (48 x 8K) step_bench runs out of KV memory on this packet (capacity,
 | prefill | 1 x 128 | 33.03 | 33.42 | +1.2% | 47 / 46 | equal |
 | prefill | 1 x 1024 | 85.04 | 86.09 | +1.2% | 63 / 62 | equal |
 | prefill | 1 x 4096 | 322.56 | 321.99 | -0.2% | 67 / 67 | equal |
+
+## 2026-10-27: BF16 packet vs vLLM 0.29 on the final PR #108 build (production readiness)
+
+**Result: not production ready against vLLM 0.29. Every cell is a loss on throughput, and every cell
+but one loses on latency.** `campaign.py report` MATCHED + EQUIVALENT on every cell; rows in
+[comparison.csv](comparison.csv) under `campaign_source` `q38-20261027-v029-bf16`.
+
+- Infervisor: plowrt `bb9f389fd`, packet `3157ca560892` (route-sweep `qwenbf16-lt4i`: cuBLASLt
+  decode from 4 rows, GDN step isolated from 4), server env = the recipe's `[serve.env]` (live KV,
+  prefix cache + VMM prefix with the KV block store and its host tier on auto, `PLOW_PF_INTERLEAVE=1024`).
+- Baseline: vLLM 0.29.0, BF16 weights and KV, `--max-model-len 16384 --gpu-memory-utilization 0.9
+  --max-num-seqs 256`, prefix caching on (mamba cache mode `align`), FLASH_ATTN and the FlashInfer
+  GDN prefill (defaults; the venv needs the cutlass DSL path on `PYTHONPATH`). 2 repeats, same seeds.
+- Quality: FP32-reference gate c1/c8/c32 PASS on the served packet (bin43 gate).
+- Open-loop rates: the production mix at 1.8 sessions/s overloads vLLM itself on this dense 27B
+  (goodput 0 %, TTFT P50 75 s, 3.6 req/s served), so the mix runs at 0.45 and 0.7 sessions/s.
+- Raw evidence: `/opt/dlami/nvme/lava-tts/prod-compare/qwenbf16-{prod,grid}/{plow,vllm,report-plow}`.
+
+| Cell | Total throughput | TTFT P99 | TPOT P99 | Peak memory |
+|---|---:|---:|---:|---:|
+| prod mix, 0.45 sessions/s | 0.95x | 3.85x * | 1.76x * | 1.06x |
+| prod mix, 0.7 sessions/s | 0.85x | 4.75x * | 0.54x | 1.03x |
+| 1000/128 c1 greedy | 0.91x | 0.90x * | 1.12x | 1.01x * |
+| 1000/128 c8 greedy | 0.88x | 1.32x * | 1.41x * | 1.04x |
+| 1000/128 c32 greedy | 0.80x | 1.48x * | 1.60x | 1.08x |
+
+`*` = repeat spread > 10% (FLAGGED; direction only). The c1 TTFT P99 (0.90x) sits on a 60 % plowrt
+spread. The 0.7 TPOT P99 (0.54x) is not a win: vLLM's first repeat at 0.7 overloaded (TTFT P50 3.7 s,
+TPOT P50 217 ms), and plowrt overloaded on both repeats (goodput 0 % and 5.5 % vs vLLM 13 % and 96 %).
+Supplementary at 0.45, vLLM / Infervisor: goodput 1.68 / 1.01 req/s, SLO met 99.3 % / 62.7 %,
+TTFT P50 264 / 1084 ms, TPOT P50 26.7 / 57.8 ms, in-flight 3.3 / 7.6; prefix token hit (server
+metrics) vLLM 63-69 % vs plowrt 52 % then 34 % at 0.45, and 4-13 % at 0.7.
+
+Against the 2026-10-13 report (vLLM 0.28, prefix cache off, packet `3fb7cefaf150`), c32 throughput
+fell from 0.96x to 0.80x and TPOT P99 rose from 1.25x to 1.60x. The baseline is flat (6,235 vs 6,237
+tok/s), so the regression is on the plowrt side: this packet, the block store and the prefix cache
+are now on. Not attributed: the prefix-off control grid was withdrawn (see below).
+
+Diagnosis (packlog_audit, 0.45 sessions/s): decode at ~4 rows runs 25 ms per step (vLLM TPOT P50
+26 ms, including its prefill interference), and a 1024-row prefill chunk takes 89 ms (11.5K rows/s).
+Prefill is 49 % and decode 48 % of the wall clock, and riders add 1.4-3 ms each. Prefix retention is
+the second factor. It falls during the run, and the host tier froze at its reserve
+(`kv store: host tier frozen at the host reserve`, 208 GB reserved) during the 0.7 cell. The decode
+and prefill step gap belongs to the BF16 decode kernel work. Recipe-level variants were queued
+(`PLOW_PF_INTERLEAVE=0`, plus ITL budget 60 / decode pipeline / admission overlap,
+`PLOW_VMM_HOST_CACHE_MIB=0`, `PLOW_LT_RUNG_ALGOS=true`, prefix-off attribution grid) but were
+withdrawn before running, to give the GPU to that work. The recipe is unchanged.
+
+## 2026-10-28: prefix-cache retention fixes vs vLLM 0.29 (production mix at parity)
+
+**Result: production mix at parity with vLLM 0.29 at 0.45 sessions/s (SLO met 99.3 % on both, goodput
+1.683 req/s on both). No qualified win: the cells are ties or spread-flagged.** `campaign.py report`
+MATCHED + EQUIVALENT on every cell; rows in [comparison.csv](comparison.csv) under `campaign_source`
+`q38-20261028-prefix-bf16`.
+
+- Infervisor: plowrt `87e820a40` (branch `qwen-prefix`), packet `cb2ea611523da092` (unchanged), the
+  recipe's `[serve.env]` plus `PLOW_VMM_HOST_CACHE_MIB=63488` (host tier capped at 62 GiB, the size
+  the planned default of `min(MemAvailable - reserve, MemTotal / 4)` gives on this box).
+- Baseline: the vLLM 0.29 arms of the 2026-10-27 section (same seeds, same client).
+- Quality: FP32-reference gate c1/c8/c32 PASS on this binary with the same host cap (c1 kl_trim
+  0.00047 vs vLLM 0.00034, top1_decisive 0.9988, continuation 0.871; c8 / c32 continuation 0.915 /
+  0.861, top1_decisive 1 / 1, needles 1).
+- What changed in plowrt: a recurrent model's GDN state is also captured at the shared-prefix end
+  (system prompt) and at whole-block checkpoints a request waits on; a publish refused for want of a
+  device slot waits for spills that already landed instead of spilling every device boundary and
+  then dropping host-resident ones; spills are paced at 256 MiB in flight so the copy engine stays
+  free for the engine's readbacks; a refill of a host block that fails goes back to its host bytes.
+  Prefix hit at 0.45: 52 % -> 78 % (vLLM 63-69 %).
+
+| Cell | Total throughput | TTFT P99 | TPOT P99 | Peak memory |
+|---|---:|---:|---:|---:|
+| prod mix, 0.45 sessions/s | 1.00x | 1.27x * | 1.03x * | 1.06x |
+| prod mix, 0.7 sessions/s | 1.02x * | 1.58x * | 0.64x | 1.04x |
+| 1000/128 c1 greedy | 0.92x | 0.92x * | 1.11x | 1.00x * |
+| 1000/128 c8 greedy | 0.96x | 1.15x | 1.20x | 1.04x |
+| 1000/128 c32 greedy | 0.96x | 1.22x | 1.19x | 1.06x |
+
+`*` = repeat spread > 10% (FLAGGED; direction only). Before (2026-10-27 recipe binary `ecb90f0d1`,
+same packet): 0.45 throughput 0.95x, TTFT P99 4.55x, TPOT P99 1.84x, SLO met 69.7 %; 0.7 0.83x /
+5.82x / 0.59x; c32 0.80x. Supplementary at 0.45, vLLM / Infervisor: TTFT P50 264 / 371 ms, TPOT P50
+26.7 / 27.2 ms, in-flight 3.3 / 3.6. At 0.7 both stacks overload on one repeat (SLO met 54.4 % /
+55.6 %, goodput 1.05 / 1.10 req/s, TPOT P50 125 / 67 ms). The c1/c8/c32 gaps are the decode step,
+not the cache (prefix-off control at c32: 708 out tok/s vs 682 with the cache on).
+Raw evidence: `/opt/dlami/nvme/lava-tts/qwen-prefix/l18/{prod,grid,report-prod,report-grid}`.
+
+## 2026-10-29: full-attention prefill through the FA4 library route (BF16)
+
+**Result: qualified per-rung win, adopted on every prefill rung.** The library route lowers prefill
+time on every rung (128 rows -7.6 %) and improves production-mix TTFT / TPOT P99 against native in both
+repeats; the FP32 gate passes c1/c8/c32. `campaign.py report` MATCHED + EQUIVALENT on every cell; rows
+in [comparison.csv](comparison.csv) under `campaign_source` `q38-20261029-libattn-bf16`.
+
+- Infervisor: plowrt `a50a58555` (branch `lib-attn2`, prod-next 949e3fdb9 merged), packet
+  `48cf345c9314` (the recipe with `fa4-hd256-lib` and `PLOW_EMIT_ATTN_LIBRARY=1`): the 16 hd256
+  layers' prefill attention runs FlashAttention-4's SM90 forward from `libplow_fa4_hd256.so`
+  directly on the row-interleaved BF16 KV. Native arm = same binary and packet with
+  `PLOW_PF_ATTN_LIBRARY=0` (the generated role). Recipe serve env, host tier as on 2026-10-28.
+- Baseline: the vLLM 0.29 arms of the 2026-10-27 section (same seeds, same client).
+- Prefill, one 16000-token prompt (step_bench packed prefill), chunk 4096/1024/512/128:
+  1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/3.996 s. ctx 4094/4095/8191, 8 x 2048 and
+  16 x 1000: ties, no faults.
+- FP32 gate vs same-concurrency vLLM 0.28 peers, PASS c1/c8/c32: kl_trim 0.000456 / 0.000483 /
+  0.000448 (native 0.000448 / 0.000460 / 0.000483), top1_decisive 0.9988, cont_decisive 1 / 0.978 /
+  0.978 (native identical).
+
+| Cell (vs vLLM 0.29) | arm | Total throughput | TTFT P99 | TPOT P99 | SLO met |
+|---|---|---:|---:|---:|---:|
+| prod mix, 0.45 sessions/s | native | 1.00x | 1.33x * | 1.05x * | 99.3 % |
+| prod mix, 0.45 sessions/s | library | 1.00x | 1.15x * | 0.98x * | 99.9 % |
+| prod mix, 0.7 sessions/s | native | 1.00x * | 1.83x * | 0.49x | 51.3 % |
+| prod mix, 0.7 sessions/s | library | 1.01x * | 1.84x * | 0.48x | 52.2 % |
+
+`*` = repeat spread > 10% (FLAGGED; direction only). At 0.45 the library is ahead in each repeat
+(TTFT P99 1265 / 1744 vs 1559 / 1897 ms). 0.7 overloads both stacks on one repeat (vLLM SLO 54.4 %).
+Raw evidence: `/opt/dlami/nvme/lava-tts/lib-attn/decl/{qsb,qgate-lib,qgate-nat,qprod-lib,qprod-nat}`.

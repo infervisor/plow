@@ -71,7 +71,7 @@ PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 
 [serve.env]
-PLOW_PREFIX_CACHE = "0"
+# Prefix cache stays on (policy: never disabled in a recipe; match the vLLM peer with its prefix caching on).
 # Forced past the KV-budget gate, as measured: the unset rule is unchecked at rung 32 on this
 # 32-slot packet.
 PLOW_PF_ATTN_GEMM = "1"

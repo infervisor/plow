@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use plow_asset::dist::{
     Bundle, BundleCheckpoint, BundleObjset, CheckpointFile, FileRef, LowRung, ObjSet, ObjSetObject,
-    Parallel, Provenance, Target, TokenizerRef, BUNDLE_SCHEMA, OBJSET_SCHEMA,
+    Parallel, Provenance, Target, TokenizerRef, OBJSET_SCHEMA,
 };
 
 use crate::{Result, RuntimeError};
@@ -56,10 +56,9 @@ const ROLES: &[(&str, &str)] = &[
     // gone — so they are roles, not sidecars.
     ("codec.pkt", "codec_packet"),
     ("cublaslt_algos.jsonl", "algo_table"),
-    // Lean compile receipts, read from beside the packet they bind. Optional
-    // at load (`--lean-qualify` defaults to `off`), but `strict` REFUSES a
-    // packet whose receipts are absent, so a bundle that drops them can never
-    // be verified strictly for as long as it exists.
+    // Lean compile receipts, read from beside the packet they bind by
+    // `plowc qualify`. A bundle that drops them can never be qualified for as
+    // long as it exists.
     ("lean-checks.json", "packet_checks"),
     // The host-side GDN prefill library a Qwen3.5-family packet's prefill
     // loads from beside it (`exec/gpu.rs`, `NativeGdn::load`): built per
@@ -72,7 +71,16 @@ const ROLES: &[(&str, &str)] = &[
 /// [`discover_objects`] collects. `.so` is deliberately absent — `campaign.py`
 /// counts it as an object but no glob takes it, so one sitting in an asset
 /// directory is claimed by nothing and must be reported.
-const OBJSET_SUFFIXES: &[&str] = &[".cubin", ".elf", ".co"];
+const OBJSET_SUFFIXES: &[&str] = &[".cubin", ".elf", ".co", LIBRARY_OBJECT_SUFFIX];
+
+/// A library object container (`device/cuda/aot.rs`: FA4 attention, GDN prefill) that NVIDIA
+/// serving loads from the asset directory by the name its packet declares: an objset object.
+const LIBRARY_OBJECT_SUFFIX: &str = ".aot";
+
+/// The GDN prefill library (`device::cuda::qwen_gdn::OBJECT`), loaded from the asset directory
+/// whenever a prefill program runs `QwenGdnPrefill`; the packet names it by that opcode, not in
+/// `segment_roles`.
+const GDN_PREFILL_OBJECT: &str = "plow_gdn_prefill.aot";
 
 /// Shares the directory and belongs to something else: the tokenizer, which is
 /// classified by provenance rather than by name.
@@ -416,11 +424,14 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
     };
 
     // A runtime-compiled target (Apple) ships no objset, so nothing records a
-    // compiler: the shaders are built on the serving machine.
+    // compiler: the shaders are built on the serving machine. NVIDIA cubins are
+    // pinned by their bytes in the objset content digest and run on any driver
+    // new enough for them, so a CUDA toolchain is recorded when the recipe names
+    // one but never required.
     let toolchain =
         match over.toolchain.map(str::to_string).or(t.toolchain) {
             Some(v) => v,
-            None if runtime_compiled(&vendor) => String::new(),
+            None if runtime_compiled(&vendor) || vendor == "nvidia" => String::new(),
             None => return Err(bad(at(
                 "[target] has no `toolchain`: the objset records the compiler its objects were \
                  built with, and the recipe checker verifies it",
@@ -749,6 +760,202 @@ pub fn discover_objects(dir: &Path, syms: &dyn SymbolReader) -> Result<Vec<ObjSe
     Ok(objects)
 }
 
+/// NVIDIA: every object serving resolves for this asset directory, as the build left it — the
+/// directory's own `*.cubin` and `*.aot` (interpreter, generated, sampler and library images
+/// are read from beside the packet), then `objects/*` named `objects/<file>`
+/// (`asset::serve::objects_dir`, the segmented-prefill set). A name in both places names two
+/// different builds and serving reads each from its own place, so both ship.
+///
+/// Identity order: the top-level cubins exactly as [`discover_objects`] orders them, so a
+/// directory without library objects or segment objects keeps the objset id it always had; then
+/// `.aot`; then `objects/`, each sorted.
+pub fn served_objects(assets: &Path) -> Result<Vec<ObjSetObject>> {
+    // A packet that embeds its interpreters may have no object beside it but its library or
+    // segment objects; only an empty set as a whole is an error.
+    let mut objects = if sorted_files(assets, &[".elf", ".co", ".cubin"])?.is_empty() {
+        Vec::new()
+    } else {
+        discover_objects(assets, &Readelf)?
+    };
+    for p in sorted_files(assets, &[LIBRARY_OBJECT_SUFFIX])? {
+        objects.push(digest_object(&p, file_name(&p))?);
+    }
+    let segment_dir = assets.join(plow_asset::dist::SEGMENT_OBJECTS_DIR);
+    if segment_dir.is_dir() {
+        let mut stray = Vec::new();
+        for p in sorted_files(&segment_dir, &[])? {
+            let name = file_name(&p);
+            if [".cubin", LIBRARY_OBJECT_SUFFIX]
+                .iter()
+                .any(|s| name.ends_with(s))
+            {
+                let path = format!("{}/{name}", plow_asset::dist::SEGMENT_OBJECTS_DIR);
+                objects.push(digest_object(&p, path)?);
+            } else {
+                stray.push(name);
+            }
+        }
+        if !stray.is_empty() {
+            eprintln!(
+                "warning: {} file(s) in {} are not objects and are NOT in this bundle: {}",
+                stray.len(),
+                segment_dir.display(),
+                stray.join(", ")
+            );
+        }
+    }
+    if objects.is_empty() {
+        return Err(bad(format!(
+            "{}: no *.cubin, *.aot or {}/ objects found",
+            assets.display(),
+            plow_asset::dist::SEGMENT_OBJECTS_DIR
+        )));
+    }
+    Ok(objects)
+}
+
+/// Regular files directly in `dir`, sorted; only those ending in one of `suffixes` unless it is
+/// empty.
+fn sorted_files(dir: &Path, suffixes: &[&str]) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| bad(format!("{}: {e}", dir.display())))? {
+        let p = entry
+            .map_err(|e| bad(format!("{}: {e}", dir.display())))?
+            .path();
+        let name = file_name(&p);
+        if p.is_file() && (suffixes.is_empty() || suffixes.iter().any(|s| name.ends_with(s))) {
+            out.push(p);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn digest_object(p: &Path, name: String) -> Result<ObjSetObject> {
+    Ok(ObjSetObject {
+        name,
+        sha256: sha256_file(p)?,
+        bytes: size(p)?,
+        arms: Vec::new(),
+        packet_hash: None,
+    })
+}
+
+/// The objects a packet loads from its asset directory by name, with the digest it pins when
+/// it pins one: every `segment_roles` object, and the GDN prefill library when a
+/// prefill program runs `QwenGdnPrefill`. Empty for a file that is not a PLOWDEV packet.
+pub fn declared_objects(packet: &Path) -> Result<Vec<(String, Option<String>)>> {
+    use crate::asset::devblob::DevBlob;
+    let buf = std::fs::read(packet).map_err(|e| bad(format!("{}: {e}", packet.display())))?;
+    let magic: Option<&[u8; 8]> = buf.get(..8).and_then(|s| s.try_into().ok());
+    if !magic.is_some_and(packet::devbuild::is_blob_magic) {
+        return Ok(Vec::new());
+    }
+    let blob =
+        DevBlob::parse_l2(&buf, true).map_err(|e| bad(format!("{}: {e}", packet.display())))?;
+    let mut out = Vec::new();
+    let section = blob
+        .reserved_metadata(&buf, plow_asset::segment_roles::SECTION)
+        .map_err(|e| bad(format!("{}: {e}", packet.display())))?;
+    if let Some(bytes) = section {
+        let v: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| bad(format!("{}: segment_roles section: {e}", packet.display())))?;
+        // Every declared object names the file a role loads from beside the packet.
+        for object in v["objects"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(_, o)| o)
+        {
+            if let Some(file) = object["file"].as_str().filter(|f| !f.is_empty()) {
+                let sha = object["sha256"].as_str().map(str::to_string);
+                out.push((file.to_string(), sha));
+            }
+        }
+    }
+    let gdn = blob
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|i| i.op == packet::dev::DevOp::QwenGdnPrefill as u16);
+    if gdn {
+        out.push((GDN_PREFILL_OBJECT.to_string(), None));
+    }
+    Ok(out)
+}
+
+/// Refuse an objset that does not carry, byte for byte, an object the packet loads by name.
+fn check_declared(packet: &Path, objects: &[ObjSetObject]) -> Result<()> {
+    let mut problems = Vec::new();
+    for (file, sha) in declared_objects(packet)? {
+        match objects.iter().find(|o| o.name == file) {
+            None => problems.push(format!("{file} is not in the asset directory")),
+            Some(o) if sha.as_deref().is_some_and(|s| s != o.sha256) => problems.push(format!(
+                "{file} hashes to {}, the packet declares {}",
+                o.sha256,
+                sha.unwrap_or_default()
+            )),
+            Some(_) => {}
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(bad(format!(
+        "{}: the objects this packet loads by name do not match what would ship: {}",
+        packet.display(),
+        problems.join("; ")
+    )))
+}
+
+/// A `--objects` directory beside an NVIDIA asset directory must be the very set serving
+/// resolves there (`<assets>/objects`): the objset ships what qualification served, never
+/// another copy of it.
+fn check_named_objects(assets: &Path, named: &Path, objects: &[ObjSetObject]) -> Result<()> {
+    let same = |a: &Path, b: &Path| matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y);
+    let segment_dir = assets.join(plow_asset::dist::SEGMENT_OBJECTS_DIR);
+    if same(named, assets) || same(named, &segment_dir) {
+        return Ok(());
+    }
+    let prefix = format!("{}/", plow_asset::dist::SEGMENT_OBJECTS_DIR);
+    let mut problems = Vec::new();
+    let named_files = sorted_files(named, &[])?;
+    for p in &named_files {
+        let name = file_name(p);
+        if !OBJSET_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+            continue;
+        }
+        let want = sha256_file(p)?;
+        match objects.iter().find(|o| o.name == format!("{prefix}{name}")) {
+            None => problems.push(format!("{name} is not in {}", segment_dir.display())),
+            Some(o) if o.sha256 != want => {
+                problems.push(format!("{name} differs from {}", segment_dir.display()))
+            }
+            Some(_) => {}
+        }
+    }
+    for o in objects.iter().filter(|o| o.name.starts_with(&prefix)) {
+        let name = &o.name[prefix.len()..];
+        if !named_files.iter().any(|p| file_name(p) == name) {
+            problems.push(format!(
+                "{name} is served from {} but not in {}",
+                segment_dir.display(),
+                named.display()
+            ));
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(bad(format!(
+        "{}: NVIDIA serving reads segment objects from {}, and this directory is not that set: {}. \
+         Pack the asset directory the build served from",
+        named.display(),
+        segment_dir.display(),
+        problems.join("; ")
+    )))
+}
+
 fn file_name(p: &Path) -> String {
     p.file_name()
         .unwrap_or_default()
@@ -960,6 +1167,17 @@ pub fn build_bundle(
             )));
         }
     }
+    // Without a table plowrt times every BF16 cuBLASLt plan at load, and the pick (a split-K
+    // reduction among them) re-rolls per server start: greedy output then differs between starts.
+    let lt_shapes = lt_bf16_shapes(&build_json);
+    if lt_shapes > 0 && !files.iter().any(|f| f.name == "cublaslt_algos.jsonl") {
+        return Err(bad(format!(
+            "{}: build.json plans {lt_shapes} BF16 cuBLASLt shape(s) but there is no \
+             cublaslt_algos.jsonl; serving would time them at every load and its numerics would \
+             vary per start. Run the campaign probe step to record the table",
+            assets.display()
+        )));
+    }
     if !unclaimed.is_empty() {
         // stderr: an `--out`-less run prints the manifest to stdout.
         eprintln!(
@@ -1047,7 +1265,7 @@ pub fn build_bundle(
         .unwrap_or_else(|| default_label(&id.target, &id.parallel, id.max_ctx, &features));
 
     let mut bundle = Bundle {
-        schema: BUNDLE_SCHEMA.to_string(),
+        schema: plow_asset::dist::bundle_schema(&id.target.vendor).to_string(),
         namespace: id.namespace.clone(),
         name: id.name.clone(),
         label,
@@ -1103,6 +1321,19 @@ fn classify(name: &str) -> Option<&'static str> {
         return Some("sidecar_packet");
     }
     None
+}
+
+/// `build.json` `cublaslt.shapes` with dtype `bf16`: the plans plowrt selects by load-time timing
+/// unless the bundle's table pins them.
+fn lt_bf16_shapes(build_json: &serde_json::Value) -> usize {
+    build_json
+        .pointer("/cublaslt/shapes")
+        .and_then(|s| s.as_array())
+        .map_or(0, |s| {
+            s.iter()
+                .filter(|x| x.get("dtype").and_then(|d| d.as_str()) == Some("bf16"))
+                .count()
+        })
 }
 
 fn read_json_if_present(p: &Path) -> Result<serde_json::Value> {
@@ -1238,6 +1469,8 @@ pub struct Generated {
     pub bundle: Bundle,
     pub bundle_bytes: Vec<u8>,
     pub objset: Option<(ObjSet, Vec<u8>)>,
+    /// The directory the objset's object names are relative to.
+    pub objects_root: Option<PathBuf>,
 }
 
 /// Generate `bundle.json` and `objset.json` for a built variant.
@@ -1263,11 +1496,32 @@ pub fn generate(
             )))
         }
         (true, None) => None,
+        // NVIDIA serves its objects from the asset directory, so that is what ships.
+        (false, named) if id.target.vendor == "nvidia" => {
+            let objects = served_objects(assets)?;
+            if let Some(named) = named {
+                check_named_objects(assets, named, &objects)?;
+            }
+            for packet in sorted_files(assets, &[".pkt"])? {
+                check_declared(&packet, &objects)?;
+            }
+            let defines_dir = named
+                .filter(|d| d.join("build_defines.json").exists())
+                .unwrap_or(assets);
+            Some((
+                build_objset(&id, defines_dir, objects)?,
+                assets.to_path_buf(),
+            ))
+        }
         (false, dir) => {
             let dir = dir.unwrap_or(assets);
             let objects = discover_objects(dir, &Readelf)?;
-            Some(build_objset(&id, dir, objects)?)
+            Some((build_objset(&id, dir, objects)?, dir.to_path_buf()))
         }
+    };
+    let (objset, objects_root) = match objset {
+        Some((o, root)) => (Some(o), Some(root)),
+        None => (None, None),
     };
     let bundle = build_bundle(assets, &id, objset.as_ref(), args)?;
 
@@ -1285,9 +1539,10 @@ pub fn generate(
         bundle,
         bundle_bytes,
         objset,
+        objects_root,
     })
 }
 
 #[cfg(test)]
 #[path = "manifest_tests.rs"]
-mod tests;
+pub(crate) mod tests;

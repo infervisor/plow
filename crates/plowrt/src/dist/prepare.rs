@@ -45,6 +45,57 @@ fn link(src: &Path, dst: &Path) -> Result<()> {
     })
 }
 
+fn same_dir(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+fn same_dir_prefix(path: &Path, dir: &Path) -> bool {
+    path.parent().is_some_and(|p| same_dir(p, dir))
+}
+
+/// The snapshot an existing farm's base shards link into (one directory for all of them).
+fn farm_snapshot(farm: &Path, bundles: &Path) -> Result<PathBuf> {
+    let mut snapshot: Option<PathBuf> = None;
+    let rd = std::fs::read_dir(farm).map_err(|source| RuntimeError::Io {
+        path: farm.to_path_buf(),
+        source,
+    })?;
+    for e in rd.flatten() {
+        if !e.file_name().to_string_lossy().ends_with(".safetensors") {
+            continue;
+        }
+        // The link's own target, not its canonical file: a hub snapshot's shards are links
+        // into `blobs/`, which has neither the shard names nor the metadata.
+        let Ok(target) = std::fs::read_link(e.path()) else {
+            continue;
+        };
+        let target = farm.join(target);
+        if !target.is_file() || target.starts_with(bundles) || same_dir_prefix(&target, farm) {
+            continue;
+        }
+        let parent = target.parent().map(Path::to_path_buf);
+        match (&snapshot, parent) {
+            (_, None) => continue,
+            (None, Some(p)) => snapshot = Some(p),
+            (Some(have), Some(p)) if *have == p => {}
+            (Some(have), Some(p)) => {
+                return Err(RuntimeError::Dist(format!(
+                    "{}: its shards link into two snapshots ({} and {}); pass --checkpoint <dir>",
+                    farm.display(),
+                    have.display(),
+                    p.display()
+                )))
+            }
+        }
+    }
+    snapshot.ok_or_else(|| {
+        RuntimeError::Dist(format!(
+            "{}: the farm links no snapshot shard to rebuild from; pass --checkpoint <dir>",
+            farm.display()
+        ))
+    })
+}
+
 /// Where a checkpoint's farm lives in the store.
 pub fn farm_path(store_root: &Path, bundle: &Bundle) -> PathBuf {
     store_root.join("checkpoints").join(format!(
@@ -76,6 +127,17 @@ pub fn build(
         )));
     }
     let dir = farm_path(store_root, bundle);
+    let bundles = store_root.join("bundles");
+    // The farm passed as its own snapshot (a second variant of this checkpoint finds the farm
+    // first): relinked from itself, every link would point at itself and break every bundle on
+    // the checkpoint. Its base shards' snapshot is the source.
+    let original;
+    let snapshot = if same_dir(snapshot, &dir) {
+        original = farm_snapshot(&dir, &bundles)?;
+        original.as_path()
+    } else {
+        snapshot
+    };
     std::fs::create_dir_all(&dir).map_err(|source| RuntimeError::Io {
         path: dir.clone(),
         source,
@@ -116,7 +178,6 @@ pub fn build(
     // sidecars here. But a base shard from another snapshot (an operator's
     // `--checkpoint` that changed) would load beside the new ones, so every
     // shard link that does not point into a bundle goes before relinking.
-    let bundles = store_root.join("bundles");
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();

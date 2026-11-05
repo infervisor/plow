@@ -21,8 +21,9 @@ The TileGraph is the **handoff artifact** — everything upstream (fusion, extra
 > **Deviation from implementation:** the `LayerPlan` that `assemble` consumes on
 > the shipping `--emit devblob` path is built by `plowc::hf_config` /
 > `rewrite::plan_from_all_blocks` directly from the operator graph — the egglog
-> extraction step shown above does not run on the way to an asset (see
-> [01-compiler-pipeline.md](01-compiler-pipeline.md)). Everything below the
+> extraction step shown above does not feed `assemble` (its fused sites go to devgen
+> instead, see [01-compiler-pipeline.md](01-compiler-pipeline.md)), and the shipping
+> devblob packets do not go through the TileGraph at all. Everything below the
 > `LayerPlan` (tile selection, node generation, constraints) is exactly as built.
 
 ---

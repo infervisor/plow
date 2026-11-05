@@ -32,8 +32,8 @@ impl Registry {
         Registry::default()
     }
 
-    /// Load a bundle from `dir` and register it under `slug` (defaults to the
-    /// manifest network name). Returns the slug it was registered under.
+    /// Load a bundle from `dir` and register it under `slug` (defaults to
+    /// `Manifest::default_slug`). Returns the slug it was registered under.
     ///
     /// A slug already in the registry is an ERROR, not an overwrite. Two
     /// bundles whose manifests carry the same network name used to silently
@@ -41,9 +41,7 @@ impl Registry {
     /// other's weights under it, with nothing in the log.
     pub fn load(&self, dir: impl AsRef<Path>, slug: Option<String>) -> Result<String> {
         let bundle = ModelBundle::load(dir)?;
-        let slug = slug
-            .or_else(|| bundle.manifest.served_name.clone())
-            .unwrap_or_else(|| bundle.network().to_string());
+        let slug = slug.unwrap_or_else(|| bundle.manifest.default_slug(&bundle.dir));
         let mut models = self.models.write();
         if models.contains_key(&slug) {
             return Err(RuntimeError::Msg(format!(

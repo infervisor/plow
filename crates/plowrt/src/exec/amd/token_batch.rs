@@ -64,9 +64,6 @@ pub(super) enum TokenBatchRefusal {
     /// FlashPrefill's split count and output binding disagree. An unsplit flash writes its final
     /// output directly; a split flash leaves partials for the following FlashMerge.
     AttentionEpilogue { nsplit: u32, fused: bool },
-    /// The route was not asked for. Distinct from every other variant: nothing is wrong, and
-    /// reporting it as a capability failure would make an opt-in read like a defect.
-    NotRequested,
     /// The object is armed but this blob has no prefill bucket the route can execute — every
     /// one splits its attention over KV.
     NoLegalBucket,
@@ -100,9 +97,6 @@ impl std::fmt::Display for TokenBatchRefusal {
                  fused_epilogue={fused}; nsplit=1 requires the fused output and nsplit>1 \
                  requires contiguous partials for FlashMerge"
             ),
-            Self::NotRequested => {
-                write!(f, "disabled by --token-batch=false or PLOW_TOKEN_BATCH=0")
-            }
             Self::NoLegalBucket => write!(
                 f,
                 "capability `token_batch_attention_epilogue`: no prefill bucket in this blob has \

@@ -54,6 +54,23 @@ fn make_app_with_tokenizer(tokenizer_json: Option<&str>) -> axum::Router {
     app(state)
 }
 
+#[test]
+fn an_assets_dir_is_not_served_under_its_checkpoint_subdir_name() {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("plowrt_api_slug_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("model-x");
+    common::write_bundle(&dir, "checkpoint");
+    std::fs::create_dir_all(dir.join("checkpoint")).unwrap();
+    let registry = Registry::new();
+    assert_eq!(registry.load(&dir, None).unwrap(), "model-x");
+
+    let named = root.join("named");
+    common::write_bundle(&named, "net-y");
+    assert_eq!(registry.load(&named, None).unwrap(), "net-y");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 async fn body_string(resp: axum::response::Response) -> String {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()

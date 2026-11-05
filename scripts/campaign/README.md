@@ -13,6 +13,15 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
 
 ## The method
 
+0. **HARD RULE: screen on a single block first.** A kernel/fusion/route/knob candidate is
+   measured on one block at the served shape, precision, flags, rung width and context against a
+   calibrated roofline for that block (`docs/bringup/05-single-block-sweep.md`; NVIDIA
+   `build --block`, `block_run bench|prefill-bench`, `block_roofline.py --ceilings`,
+   `nv-block-ab`; AMD `block-roofline` / `block-bench` / `block-ab` below). Whole-network `step_bench` (`rung-sweep`), `gate` and serving grids run only for a
+   block-level winner, and the campaign report starts with the block-vs-roofline table (block
+   time, roofline floor, % of floor, delta vs current). Harness gaps:
+   `docs/bringup/agent-tools.md` "HARD RULE". The baseline of every comparison is the
+   same-concurrency vLLM peer, never plowrt's own production packet.
 1. **Fix the cell first.** A cell is `(model revision, weight/KV dtype, GPU SKU,
    TP, prompt/output shape, concurrency, cache policy, client protocol)`. The
    reference engine runs the same client binary with the same flags on the same
@@ -27,8 +36,10 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
    runtime binary so a concurrent `cargo build` cannot swap it mid-run, runs the
    coherence gate before the first timed request, and exits non-zero if the gate
    fails. A model that answers the gate wrong has no numbers.
-4. **Every GPU stage is leased.** `perf-data/tools/gpulease -n <k>` wraps the
-   server and client together. If the audit sees a foreign process the run is
+4. **Every GPU stage is a gpuq job.** `probe`, `bench`, `gate` and `dist-gate`
+   submit to `scripts/bench/gpuq.py` (`--queue`, default `/tmp/plow-gpuq`) and wait;
+   the job's lease wraps server and client together, and its wrapper exports every
+   `PLOW_*` knob because the runner strips them. If the audit sees a foreign process the run is
    recorded `contended`; `ledger` refuses it unless `--provisional`.
 5. **One variable per experiment.** `ledger --note` is mandatory and names the
    single change. Rejected candidates stay in the ledger so they are not re-run.
@@ -44,7 +55,9 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
    as `peak_mem_mib` in `results.csv` and the ledger (a ledger from before the column is widened
    in place). Both engines preallocate weights + KV pools, so the number is the configured
    footprint plus transient workspace: compare it at equal `max_ctx` / slot count, and quote the
-   KV budget beside it.
+   KV budget beside it. Host resources are sampled too (`HOST_SAMPLE_MS`, default 2000,
+   `scripts/bench/host_res.py`): per cell host RSS (Pss opt-in, `PB_HOST_PSS`), VmLck/VmPin, cores busy, threads,
+   processes and mapped libraries land in `run-record.json` under `host_resources`.
 9. **Quiet box for report-grade cells.** `bench --quiet-lock FILE` holds `FILE` exclusively for
    the whole session through `scripts/bench/quietx.sh`, taken INSIDE the GPU lease; builds and
    other CPU-heavy work hold it shared through `scripts/bench/quiets.sh FILE nice -n 19 <cmd>`.
@@ -258,6 +271,10 @@ campaign.py rung-sweep ... --stage verify      # mixed packet; per-rung program 
 
 ## Known protocol traps (each cost a run once)
 
+- `build` runs the prebuilt `$CARGO_TARGET_DIR/release/plowc` and never rebuilds it: run
+  `cargo build --release -p plowc` after any devgen/plowc change, set `CARGO_TARGET_DIR` after
+  sourcing a box env file, and rebuild into a fresh `--out` after a killed build
+  (`docs/bringup/agent-tools.md` §9).
 - plowrt names a model by checkpoint slug, not the HF repo id (`model_id`).
 - plowrt `/v1/completions` adds no BOS; Gemma degenerates without it. Use a
   chat-formatted `gate_prompt` with explicit special tokens.
@@ -276,10 +293,13 @@ campaign.py rung-sweep ... --stage verify      # mixed packet; per-rung program 
   flash segment" warning is an AMD relaunch concern.
 - Packed prefill is default-on only for BF16 Hopper packets; W8A8 needs
   `PLOW_EMIT_PACKED_PREFILL=1` explicitly or the roles have no metadata.
-- **Prefix cache.** plowrt serves with the prefix cache ON by default; vLLM-bench's random
-  prompts share long prefixes, so cells silently become cache-hit suffixes (a 128-token
-  request ran as a 39-row token batch after a 96-row hit). The vLLM references ran with
-  prefix caching disabled: every vLLM-matched recipe sets `PLOW_PREFIX_CACHE=0`.
+- **Prefix cache.** plowrt serves with the prefix cache ON, and it stays on in every recipe and
+  release (`PLOW_PREFIX_CACHE=0` / `PLOW_VMM_PREFIX=0` only as an attribution arm). vLLM-bench's
+  random prompts share long prefixes, so cells silently become cache-hit suffixes (a 128-token
+  request ran as a 39-row token batch after a 96-row hit). Match the arms with unique prompts per
+  cell and repeat (`llm_grid.sh`; `waterfall.py` fails a reference hit rate > 5%) and the
+  reference's prefix cache on, not by disabling plow's cache. Older trial recipes that set
+  `PLOW_PREFIX_CACHE=0` predate this rule; do not copy them.
 - A W8A8 packet loads `fp8/…` twins from any safetensors in `checkpoint/`;
   compose a directory (BF16 shards + `fp8-model.safetensors`) and point
   `checkpoint_dir` at it.

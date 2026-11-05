@@ -68,7 +68,9 @@ pub struct Resolved {
 impl Resolved {
     /// Every blob this variant needs, as `(path within the bundle, digest, bytes)`.
     ///
-    /// Objects land under `hsaco/`, and a low-rung tier under
+    /// Objects land where serving reads them (`plow_asset::dist::objset_root`): on NVIDIA
+    /// beside the packet, segment objects under `objects/`, the asset directory the build
+    /// served from; elsewhere under `hsaco/`, and a low-rung tier under
     /// `hsaco/lowrung<max>/` — the layout `scripts/glm53_serve_inner.sh` already
     /// wires `PLOW_HSACO_LOWRUNG` to, so the runtime finds them without an
     /// absolute path leaving the build host.
@@ -77,17 +79,25 @@ impl Resolved {
         for f in &self.bundle.files {
             out.push((f.name.clone(), Digest::parse(&f.sha256)?, f.bytes));
         }
+        let root = plow_asset::dist::objset_root(&self.bundle.target.vendor);
         for (rung, set) in &self.objsets {
             let dir = match rung {
-                None => "hsaco".to_string(),
-                Some(max) => format!("hsaco/lowrung{max}"),
+                None => root.to_string(),
+                Some(max) if root.is_empty() => format!("lowrung{max}"),
+                Some(max) => format!("{root}/lowrung{max}"),
             };
             for o in &set.objects {
-                out.push((
-                    format!("{dir}/{}", o.name),
-                    Digest::parse(&o.sha256)?,
-                    o.bytes,
-                ));
+                let name = if dir.is_empty() {
+                    o.name.clone()
+                } else {
+                    format!("{dir}/{}", o.name)
+                };
+                if out.iter().any(|(n, _, _)| *n == name) {
+                    return Err(RuntimeError::Dist(format!(
+                        "{name}: an objset object and a bundle file share one path"
+                    )));
+                }
+                out.push((name, Digest::parse(&o.sha256)?, o.bytes));
             }
         }
         Ok(out)

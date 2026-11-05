@@ -5,7 +5,8 @@ Gemma-4 E4B on one H100 SXM, ISL 1000 / OSL 128, `vllm bench serve` (same client
 chunked prefill with an 8192-token budget, async scheduling, FULL_AND_PIECEWISE CUDA graphs,
 FlashAttention on sm90, prefix caching on). The second model is Veena (Llama-3.2-3B, hd128) served as
 a plain LLM. plow runs HEAD 5eea79c4 on the E4B packet with the KV-shared-tail skip, with
-`--multistep-adaptive`.
+`--multistep-adaptive` (a flag of that build; adaptive multistep is now derived by the `auto`
+objective and the flag is removed).
 
 ## Verdict
 

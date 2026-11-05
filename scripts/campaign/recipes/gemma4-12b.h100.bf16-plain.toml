@@ -19,7 +19,7 @@ PLOW_DECODE_BATCH_LADDER = "1"
 PLOW_MAX_CHUNK = "4096"
 
 [serve.env]
-PLOW_PREFIX_CACHE = "0"   # vLLM reference ran with prefix caching disabled
+# Prefix cache stays on (policy: never disabled in a recipe; match the vLLM peer with its prefix caching on).
 
 [bench]
 backend = "openai"

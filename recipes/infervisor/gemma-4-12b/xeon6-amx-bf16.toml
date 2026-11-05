@@ -55,7 +55,7 @@ precision = "bf16"
 
 [emit]
 emit = "devblob"
-args = []
+args = ["--served-name", "gemma-4-12b-it"]
 [emit.env]
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,64"
 PLOW_MAX_CHUNK = "2048"
@@ -73,7 +73,7 @@ outlen = 128
 warmups = 2
 seed = 42
 tokenizer = "{env:GEMMA4_12B_CHECKPOINT}"
-model_id = "checkpoint"
+model_id = "gemma-4-12b-it"
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py, 2K prompt set, --device cpu reference):
 # GEMMA4_12B_FP32_REF = ref.json, GEMMA4_12B_FP32_VLLM = the vLLM 0.30 capture against it.

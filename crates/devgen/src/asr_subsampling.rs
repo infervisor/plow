@@ -49,6 +49,18 @@ pub fn lower(
     projection: Projection<'_>,
     n_cu: u32,
 ) -> Result<SubsamplingPackets, String> {
+    lower_items(spec, stages, projection, n_cu, 1)
+}
+
+/// [`lower`] over `items` inputs at once (`in.conv2d` is `[items][input_frames][input_width]`):
+/// `output_frames` rows per item, the items' rows one after another in the output.
+pub fn lower_items(
+    spec: SubsamplingSpec,
+    stages: &[Conv2dStage<'_>],
+    projection: Projection<'_>,
+    n_cu: u32,
+    items: u32,
+) -> Result<SubsamplingPackets, String> {
     if projection.output_width == 0
         || stages
             .last()
@@ -58,7 +70,7 @@ pub fn lower(
     }
     let convolution = conv2d::lower(
         Conv2dSpec {
-            batches: 1,
+            batches: items,
             input_frames: spec.input_frames,
             input_width: spec.input_width,
             input_channels: 1,
@@ -79,12 +91,15 @@ pub fn lower(
     let input = convolution.input;
     let source = convolution.output;
     let frames = convolution.output_frames;
+    let rows = frames
+        .checked_mul(items)
+        .ok_or("subsampled rows overflow")?;
     let input_shape = convolution.input_shape;
     let mut model = convolution.model;
     builder.adopt_tensors(std::mem::take(&mut model.tensors));
     let output = builder.tensor(
         "act.asr.io",
-        u64::from(frames) * u64::from(projection.output_width) * 4,
+        u64::from(rows) * u64::from(projection.output_width) * 4,
     );
     let weight = builder.tensor(
         projection.weight,
@@ -95,22 +110,18 @@ pub fn lower(
         DevOp::Q8GemmF32,
         repeated(
             n_cu,
-            frames.div_ceil(64) * projection.output_width.div_ceil(64),
+            rows.div_ceil(64) * projection.output_width.div_ceil(64),
         ),
         &[],
         |instruction| {
             instruction.t[..4].copy_from_slice(&[output, source, weight, bias]);
-            instruction.i[..3].copy_from_slice(&[
-                frames,
-                projection.output_width,
-                projection_input,
-            ]);
+            instruction.i[..3].copy_from_slice(&[rows, projection.output_width, projection_input]);
         },
     );
     let projection_program = model.progs.len();
     model.tensors = builder.tensors();
     model.progs.push(builder.finish());
-    model.prog_t.push(frames);
+    model.prog_t.push(rows);
     Ok(SubsamplingPackets {
         model,
         programs: vec![0, projection_program],

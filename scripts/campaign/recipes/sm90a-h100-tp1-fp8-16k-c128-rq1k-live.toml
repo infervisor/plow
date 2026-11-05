@@ -98,7 +98,6 @@ PLOW_KV_MEM_UTIL = "0.9"
 PLOW_PF_ATTN_GEMM = "1"
 PLOW_MULTISTEP = "0"
 PLOW_DECODE_MAX_RUNG = "128"
-PLOW_TOKEN_BATCH = "1"
 
 [bench]
 backend = "openai"

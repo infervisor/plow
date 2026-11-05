@@ -1,111 +1,124 @@
-# plow — full flag & knob reference
+# Configuration
 
-Exhaustive reference for every emit-time (`plowc` env), build-time (`nvcc`/CMake
-`-D…`), and runtime (`plowrt` env) flag. The README keeps only the load-bearing
-traps and the four configurations anyone actually builds; everything here is for
-kernel/perf work. Measured results live in `perf-data/` (one JSON + MD per
-campaign).
+Start with the defaults and a matching [model recipe](../recipes/infervisor/).
+Most deployments only need a model, a checkpoint, and a listening address.
 
-Perf features from the rtx-11/12/13 campaigns are gated so the **default build is
-a fixed, validated configuration**; every flag is an A/B control with a
-correctness gate (token-identity or a bit-exact vs-f32 oracle). **Unset = shipped
-default**, and most flags are byte-identical when unset.
+[Serving](#serving) · [Loading models](#loading-models) ·
+[Compiling models](#compiling-models) · [Advanced reference](#advanced-reference)
 
----
+## Find an option
 
-## Unified CLI args (new)
-
-Both `plowc` and `plowrt` now support structured **clap CLI args with
-environment-variable fallback**. Every knob formerly set via `PLOW_*` env can now
-be passed as a `--long-flag`, and the old env var still works transparently
-(clap's `env` attribute reads it). **CLI takes precedence over env.** Library
-benches that do not initialize CLI configuration may change cold-path resource
-options before constructing the next engine.
+Use your installed binary's help for available flags, defaults, and environment
+variables. Options can vary with the version and enabled backends.
 
 ```bash
-# These are equivalent:
-PLOW_PF_INTERLEAVE=4096 plowrt serve …
-plowrt serve --pf-interleave 4096 …
-
-# CLI overrides env:
-PLOW_PF_INTERLEAVE=2048 plowrt serve --pf-interleave 4096 …   # uses 4096
+plowrt serve --help
+plowrt load --help
+plowc --help
+plowc --list-gpus
 ```
 
-### Config structs
-
-| binary | struct | file | scope |
-|--------|--------|------|-------|
-| `plowc` | `EmitConfig` | `crates/devgen/src/emit_config.rs` | Emit-time knobs (211 fields, 14 hidden diagnostics) |
-| `plowrt` | `RuntimeConfig` | `crates/plowrt/src/config.rs` | Shared runtime knobs |
-| `plowrt` | `NvidiaRuntimeConfig` | (nested in RuntimeConfig) | NVIDIA/sm_120 serving |
-| `plowrt` | `AmdRuntimeConfig` | (nested in RuntimeConfig) | AMD/gfx950 serving |
-
-### Hot-path access pattern
-
-Both structs use a **process-global `OnceLock`** initialized once after CLI
-parse, so deep call sites pay a single atomic load (identical cost to the old
-`env_flag!` macro):
-
-```rust
-// devgen (emit time)
-emit_config::active().k3_full
-
-// plowrt (runtime)
-RuntimeConfig::get().nv.pf_interleave_rows()
-RuntimeConfig::get().pf_packlog
-```
-
-Use `get()`, never `global()`: `global()` panics when the config was never
-installed, which is the normal state for every library embedder — GPU tests,
-examples and benches build engines directly and never run `main()`'s CLI
-parse. `get()` falls back to an env-only parse there.
-
-### Discovering all flags
+For options with an environment-variable equivalent, precedence is:
+**CLI flag → environment variable → default**. Not every `PLOW_*` variable has
+a CLI equivalent.
 
 ```bash
-plowc --help          # shows all emit-time flags with env fallback
-plowrt serve --help   # shows all runtime flags with env fallback
+plowrt serve --model kimi-k3 --objective throughput
+
+# Equivalent environment setting:
+PLOW_OBJECTIVE=throughput plowrt serve --model kimi-k3
 ```
 
-### The knob registries are the authoritative list
+## Serving
 
-`crates/devgen/src/knob_spec.rs` (emit: `EMIT`, `RAW_ENV`, `OBJECT_DEFINES`) and
-`crates/plowrt/src/knob_spec.rs` (runtime) declare **every** knob, its default,
-its status and the constraints over it; checkpoint K verifies an emit against
-them and `build.json` records the verdict. Their evidence strings cite *this*
-file, so a default or rollback direction changed in one must be changed in both.
-A new `PLOW_*` knob, env read or `#if PLOW_*` define has to be registered there
-(`cargo test -p devgen --lib knob`, `cargo test -p plowrt --features cuda,hsa
---lib knob`).
+```bash
+plowrt serve --model kimi-k3 --bind 127.0.0.1 --port 8080
+```
 
-**This file is not exhaustive against those registries.** Roughly 130 registered
-env knobs — test fixtures (`PLOW_TEST_*`), dumps and snapshots
-(`PLOW_SEG_DUMP`, `PLOW_TENS_SNAP`, `PLOW_DUMP_ACT`), and per-family experiment
-arms — are deliberately not tabulated here. Grep the registries before concluding
-a knob does not exist.
+| Flag | Purpose |
+| --- | --- |
+| `--model NAME` | Serve a model already loaded into the local store. Repeat for more models. |
+| `--assets DIR` | Serve a local compiled asset directory instead. Repeat for more models. |
+| `--rt-checkpoint DIR` | Set the checkpoint location (`PLOW_CHECKPOINT`). |
+| `--served-model-name NAME` | Add an API model alias. Use `ALIAS=SLUG` with multiple models. |
+| `--bind ADDRESS` | Listening address. Default: `0.0.0.0`; use `127.0.0.1` for local access. |
+| `--port PORT` | HTTP port. Default: `8080`. |
+| `--objective MODE` | Scheduling policy: `auto` (default), `latency`, or `throughput`. |
+| `--max-queued-requests N` | Limit waiting requests. Default: `0`, meaning four batches. |
+| `--slo-ms MS` | Scheduler latency target in milliseconds. Default: `250`. |
+| `--fp8-dir DIR` | Location of prepared FP8 weights when required by the packet. |
 
-### Environment compatibility
+`auto` adapts scheduling to demand. `latency` favors response time;
+`throughput` favors batching. A policy only enables features supported by the
+packet and backend.
 
-Environment variables declared by the current config structs continue to work.
-Three compiler/runtime ambiguities have explicit replacements:
+For CPU execution, start with `--cpu-threads`, `--cpu-numa`, and `--cpu-isa`.
+See the [CPU guide](runtime/cpu.md) for their behavior. Speech commands have
+their own guides: [ASR](runtime/asr.md) and [TTS](runtime/tts.md).
 
-| removed spelling | replacement |
-|---|---|
-| `PLOW_QWEN_DECODE_LT` | compiler option `PLOW_EMIT_DECODE_CUBLASLT` |
-| `PLOW_SEG_PACKED_PREFILL` | compiler option `PLOW_EMIT_PACKED_PREFILL` |
-| `PLOW_NV_PLACE_DISPATCH` | runtime option `PLOW_L2_PLACE_DISPATCH` |
+## Loading models
 
-PlowRT reads runtime configuration through `RuntimeConfig`; the retired
-`env_flag!` and `env_usize!` macros are no longer part of the runtime API.
+```bash
+plowrt show kimi-k3
+plowrt load kimi-k3 --checkpoint "$HOME/models/Kimi-K3"
+```
 
-**Why there are so many.** The interpreter is one persistent megakernel that
-inlines every op arm, so its **register and shared-memory footprint is the WORST
-CASE over everything compiled in**, and smem is the *union* over all ops in the
-object. A knob therefore usually does one of two things: compile an arm *out* to
-buy back registers/occupancy for everything else, or A/B a body against the
-shipped one.
+`show` lists published variants and compatibility. `load` selects and downloads
+compiled assets. `serve --model` reads the local store; it does not download.
 
----
+| Setting | Purpose |
+| --- | --- |
+| `load --checkpoint DIR` | Use a local model checkpoint. |
+| `--plow-home DIR` / `PLOW_HOME` | Local asset store. Default: `~/.plow`. |
+| `--registry URL` / `PLOW_REGISTRY` | Registry or local mirror. Default: `pdist.infervisor.ai`. |
+
+See [distribution](DISTRIBUTION.md) for model references, variant selection,
+upgrades, and offline use.
+
+## Compiling models
+
+Compiler settings define the packet. Runtime flags cannot change its hardware
+target, precision, or compiled context limit. Use the settings and GPU objects
+from a matching [recipe](../recipes/infervisor/).
+
+| Flag | Purpose |
+| --- | --- |
+| `--hf-dir DIR` | Read a local Hugging Face checkpoint. |
+| `--out DIR` | Write compiled assets here. |
+| `--gpu NAME` | Select the hardware specification; list names with `--list-gpus`. |
+| `--arch ISA` | Set the target ISA metadata and object build target. |
+| `--n-cu N` | Override the packet executor count. Default: the selected hardware's count. |
+| `--max-ctx N` | Set the compiled context limit in tokens. |
+| `--batch LIST` | Compile comma-separated batch sizes. |
+| `--seq LIST` | Compile comma-separated sequence lengths. |
+| `--preset NAME` | Use a bucket preset instead of `--batch` and `--seq`. |
+| `--num-gpus N` | Set the number of devices. Default: `1`. |
+| `--served-name NAME` | Set the model ID written into the asset manifest. |
+| `--replay-knobs FILE` | Replay explicitly recorded emit settings from a `build.json`. |
+
+GPU packets and interpreter objects must match the target and configuration.
+Changing compiler settings requires re-emitting the packet; changing build
+defines requires rebuilding the objects. Run source builds and compilation
+inside `nix develop`; see [building](BUILD.md).
+
+## Advanced reference
+
+Expand a section for backend-specific controls, compatibility notes, and tuning
+evidence. These settings are model- and hardware-specific.
+
+The authoritative configuration lives in:
+
+- [Compiler options](../crates/devgen/src/emit_config.rs) and
+  [compiler knob registry](../crates/devgen/src/knob_spec.rs).
+- [Runtime options](../crates/plowrt/src/config.rs) and
+  [runtime knob registry](../crates/plowrt/src/knob_spec.rs).
+
+The registries include diagnostics and experiments not listed here. They also
+cite the evidence below; keep defaults and rollback directions consistent when
+changing them.
+
+<details>
+<summary>Compiler options and model-specific tuning</summary>
 
 ## `plowc` emit-time knobs
 
@@ -457,7 +470,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_MOE_SHARED_SEED` | `--glm-moe-shared-seed` | false | GLM TP8 prefill on the AITER MoE route. The shared expert's down projection writes the MoE seam's reduce-scatter source (`dg_tp`), `MoeAiterFp8Pf` mode 3 keeps it (prepare skips the zero fill; the adapter needs `plow_moe_aiter_keep_out_abi_1`) and the fused call accumulates the routed partials onto it, so no `MoeCombinePf` runs. Floor-bounded numerics (bf16 accumulation order). T3 on P8192-S: 648.5 / 641.4 / 648.8 ms (off / on / off2), −7.3 against a 2.3 ms floor; P4096-S −3.3; P8192-0 −8.6 (`glue2-t3-g4-rung`). |
 | `PLOW_GLM_ROUTER_OVERLAP` | `--glm-router-overlap` | unset | GLM TP8 sequence-parallel prefill (2048/8192 buckets, interpreter band router). The router score reads the post-attention norm's band in peer slot 3, the bytes the hidden `XAllGather` copies into `xn2@band`, and depends on that norm instead of on the gather, so it runs while the gather is in flight. `1`: score and top-k are emitted ahead of the shared gate/up `GemmLtPf`, inside the attention-seam segment. `2`: the route-table gather and `MoeAlignPf` move there too. Bit-identical by construction (same kernels, same input bytes); no object change. Unset/`0` = byte-identical blob. Opt-in pending tier 3. |
 | `PLOW_GLM_ROWBAND_ATTN` | `--glm-rowband-attn` | false | GLM-5.3 TP8 gfx942, 8192 prefill rung: the row-split sibling's replicated-projections arm. Each rank runs its `T/8` row band with all 64 heads: q_absorb (1024×32768×2048) and q_rope (1024×4096×2048) at full width from the band's q latents, the q RoPE at the band's positions, four 16-head `mla_dec_stage1_bf16_a16w16_subQ16_mqa16` launches, one native grouped fold (`plow_glm_fold_normalize_grouped`, adapter marker `plow_glm_fold_grouped_abi_1`) and o_proj (1024×6144×16384) straight into the band; no head all-to-all and no attention reduce-scatter, and q latents are all-gathered only on indexer layers. The runtime selects the sibling for full 8192 chunks whose bands all have a key plan: prior 0, 1023–1024 or ≥ 2047 (ranks below row 2047 read every causal key through the lower-half identity CSR). Excludes `PLOW_GLM_ROWSPLIT_ATTN` (checkpoint K constraint `rowband_attn_excludes_rowsplit_attn`). **Memory:** the full-width q_absorb, q_rope, o_proj and W_uv cost **29.25 GiB per rank measured** on GLM-5.3 (the earlier +16.9 GiB estimate was low by ~1.7x) (column shards bind as views into their full twins; o_proj and the FP32 fold copy do not); load refuses unless `free_bytes()` after load ≥ the replicated bytes + 8 GiB and logs `device memory after load` per rank. That comes out of the long-context KV headroom, free after load 83.44 → 55.58 GiB per rank measured (lh-t3-stage2-rowband); a default flip must weigh that. Floor-bounded numerics (different attention object, fold and GEMM accumulation order). T2 kernel price (lever-hunt T2-A, 1 GPU, prior 0): slowest band 1226 µs vs today's 1855 µs per layer, −49.0 ms per P8192-0 chunk. T3 (lh-t3-stage2-rowband, full depth): P8192-0 574.79 -> 465.06 ms (-110.23, floor 6.33) and P8192-S 650.85 -> 515.68 (-135.13, floor 3.95), both PASS; P4096-0 +0.78 ms against a 0.61 floor, not attributable -- the 4096 program is byte-identical between the two packets (all 5689 shared program keys identical; the row-band packet only adds 1414 rowsplit siblings). Served T4 pending. |
-| `PLOW_GLM_ROWBAND` | `--glm-rowband` | false | **Runtime, read once at engine build.** Binds and dispatches the row-band arm carried by the packet. Serve-start only, never per request: the cost is the full-width `q_absorb`/`q_rope`/`o_proj` twins RESIDENT on every rank, so the knob decides *binding*, not just routing. Off, the twins are neither carved nor uploaded (each column shard carves its own storage, the ordinary path), the load-time free-VRAM refusal does not apply, and the siblings are never selected -- a packet carrying them then costs only their program records. This is what lets ONE packet serve both a latency profile and a capacity profile. Off, the twins are bound as a 1-byte view at address 0 so a stray read faults instead of silently returning another tensor. |
+| `PLOW_ROWBAND` | `--rowband` | false | **Runtime, read once at engine build.** Binds and dispatches the row-band arm carried by the packet. Serve-start only, never per request: the cost is the full-width `q_absorb`/`q_rope`/`o_proj` twins RESIDENT on every rank, so the knob decides *binding*, not just routing. Off, the twins are neither carved nor uploaded (each column shard carves its own storage, the ordinary path), the load-time free-VRAM refusal does not apply, and the siblings are never selected -- a packet carrying them then costs only their program records. This is what lets ONE packet serve both a latency profile and a capacity profile. Off, the twins are bound as a 1-byte view at address 0 so a stray read faults instead of silently returning another tensor. |
 | `PLOW_GLM_MOE_RESIDENT` | `--glm-moe-resident` | on for GLM on gfx942 TP8 (production default), off elsewhere | Pack GLM expert weights once for native gfx942 TP8 prefill and decode. +13.4% C20 / −10.9% TPOT on GLM-5.3; same A8 numerics contract as `PLOW_GLM_MOE_AITER`. Rollback: `--glm-moe-resident=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
 | `PLOW_GLM_INDEX_TP` | `--glm-index-tp` | on for GLM on gfx942 TP8 (production default), off elsewhere | Partition large GLM prefill index queries across eight gfx942 ranks instead of replicating them. Exact top-k; +8.2% serving; keep the ≥2048-row gate (small chunks regress). Also the precondition for packing a sparse bucket (`PLOW_PACKED_SPARSE_PF`): the native kernels take a per-request `PlowKvSpan` table (`dsa_tp_adapter_gfx942.elf`, `plow_dsa_tp_abi_2`), which the interpreter selectors cannot. Rollback: `--glm-index-tp=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
 | `PLOW_GLM_SELECT_LOCAL` | `--glm-select-local` | on for GLM on gfx942 TP8 (production default), off elsewhere | One independent single-workgroup radix selection per GLM decode row instead of a serialized shared-histogram chain. Exact top-k; +10.6% C20, −19% median ITL. Rollback: `--glm-select-local=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
@@ -587,6 +600,11 @@ Raw `std::env::var` reads owned by `packet::devbuild` / `plowc` (see the module 
 
 ---
 
+</details>
+
+<details>
+<summary>FP8 precision</summary>
+
 ## fp8 precision — full detail
 
 fp8 is **not** a runtime toggle — it is baked when the model is compiled and the
@@ -663,6 +681,11 @@ closes the short-ctx gap to ~1.1–1.3× (still trails vLLM-fp8, which uses
 cudagraphs + FA-class flash). `PLOW_FP8_KV` doubles the 31B concurrency ceiling.
 
 ---
+
+</details>
+
+<details>
+<summary>GPU interpreter build settings</summary>
 
 ## Interpreter compilation knobs (`nvcc -D…`)
 
@@ -806,7 +829,7 @@ the end, not tabled.
 | `PLOW_DSA_TP_SELECT_THR` | 0 | **objects** (`scripts/build_dsa_tp.sh OUT -DPLOW_DSA_TP_SELECT_THR=1`) — also export `plow_dsa_tp_select_thr` from `dsa_tp_adapter_gfx942.elf`: the TP indexer's selection as `d_index_select_pf_thr` (12-bit digits until the boundary bin holds ≤ 2048 keys, one collect scan, a byte radix over those keys in LDS; two row scans instead of five, the same `dsa_pack_key_a` set). Launched only under `PLOW_DSA_SELECT_THRESHOLD`; off, the adapter disassembly is unchanged. |
 | `PLOW_DSA_SELECT_SPLIT` | 0 | **objects** (`scripts/build_gfx942.sh`, decode and flash rows) — compile the split-row decode selection arm (`-DPLOW_DSA_SELECT_SPLIT=1`, op 59 `i[4] = 2`) and export `plow_dsa_select_split_arm`. Set automatically from the `requires` of a packet emitted with `PLOW_GLM_SELECT_SPLIT`; off, the objects are byte-unchanged. |
 | `PLOW_WG_WAVES` (alias `PLOW_WAVES`) | 8 | waves per AMD workgroup (8×64 = 512 threads); feeds reduction/tiling geometry. |
-| `PLOW_ATTNRES_MAXB` | 16 | compile-time hard cap on K3 attention-residual batch (`nb`); over it traps. |
+| `PLOW_ATTNRES_MAXB` | 16 | **not a `-D` knob**: an `enum` constant in `runtime/amd/op_k3.h` (registered Removed so nothing sets it) — the compile-time cap on the K3 attention-residual batch (`nb`); over it traps. |
 | `PLOW_ATTNRES_RG` | 9 | rows per sweep of the K3 hidden axis (tuned so one sweep covers `nb_max=8`). |
 
 **Measurement/diagnostic instruments — never ship** (numerically wrong or admit a
@@ -824,8 +847,8 @@ segments and packed BF16-KV GEMM segments without W8A8. This removes the
 `perf-data` readiness report, which is kept out of source control. Rebuild with
 `PLOW_EXTRA_DEFINES="-DPLOW_NV_SEG_OCC1=0"` to restore that cap. This build
 default does not by itself enable packed serving; the CUDA unified token-batch
-executor is selected at runtime by `PLOW_TOKEN_BATCH` (default on) when the
-packet carries packed-prefill metadata.
+executor is always selected at runtime when the packet carries packed-prefill
+metadata.
 
 | flag | default | effect |
 |---|---|---|
@@ -974,6 +997,11 @@ values cost.
 
 ---
 
+</details>
+
+<details>
+<summary>CPU runtime settings</summary>
+
 ## CPU runtime knobs (`plowrt --cpu-*`)
 
 Only present in a build carrying the `cpu` feature. Every one is a CLI flag with an
@@ -1014,10 +1042,15 @@ The global-queue and L2-place knobs are off because they were *measured* worse, 
 unfinished — neither changes what is computed, so both are safe to flip for an A/B
 on another host.
 
-Compile-side, there is no CPU emit target: `plowc` emits for a device target and the
-CPU interprets that packet. Use an **NVIDIA** `--gpu` (a gfx942/gfx950 packet is
-rejected at load), and set `--n-cu` explicitly — it is the virtual executor count,
-capped at 256, and need not match any thread count.
+Compile with a CPU target such as `--gpu xeon6975p --arch amx`; see
+[CPU bundle compilation](runtime/cpu.md#compiling-a-bundle). Set `--n-cu` for
+the virtual executor count, capped at 256. It need not match the worker thread
+count. AMD gfx942/gfx950 packets are rejected by the CPU backend.
+
+</details>
+
+<details>
+<summary>Asset store and registry settings</summary>
 
 ## Asset distribution (`plowrt pull` / `load` / `serve --model`)
 
@@ -1033,6 +1066,11 @@ subcommands. `serve` reads the local store and never the network; see
 `PLOW_CHECKPOINT` / `--rt-checkpoint` (below) doubles as `load`'s default
 checkpoint location, because the weights a bundle needs are the same weights
 `serve` binds.
+
+</details>
+
+<details>
+<summary>Scheduling and backend runtime settings</summary>
 
 ## Serving / runtime knobs (`plowrt` env)
 
@@ -1068,7 +1106,7 @@ per-request cap after 2 s with no request waiting and KV under 75% (`plowrt_pref
 Expert overrides (hidden from `--help`, documented in the table below): `PLOW_MULTISTEP`,
 `PLOW_PF_INTERLEAVE`, `PLOW_PF_CHUNK`, `PLOW_PF_DEFER_DECODE`, `PLOW_DECODE_MAX_RUNG`,
 `PLOW_DECODE_MIN_RUNG`, `PLOW_CO_SCHED`, `PLOW_CFG_DEVICE`, `PLOW_TTS_TURN_BATCH`,
-`PLOW_ASR_PARTIAL_DUTY`. Diagnostic rollbacks of capabilities: `PLOW_TOKEN_BATCH`,
+`PLOW_ASR_PARTIAL_DUTY`. Diagnostic rollbacks of capabilities:
 `PLOW_DECODE_PIPELINE`, `PLOW_PF_SHARED_TAIL`, `PLOW_PF_SEGMENT_GATES`, `PLOW_RAGGED_CHUNK`,
 `PLOW_AMD_RAGGED_SEAMS`, `PLOW_PACKED_PREFILL_ROUTE`.
 
@@ -1086,7 +1124,11 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_PF_COVER`, `PLOW_PF_CHUNK_COST` | the cost-aware DP cover at 512 rows per launch |
 | `PLOW_RIDE_FIXED`, `PLOW_PF_NO_CHUNK`, `PLOW_PF_NO_INTERLEAVE`, `PLOW_PF_SPAN_POLICY` | `sched::ride`, chunked and interleaved prefill, greedy spans |
 | `PLOW_PIPE_PREFILL`, `PLOW_CFG_MULTISTEP`, `PLOW_TOKEN_BATCH_SOLO`, `PLOW_CO_SCHED_QUANTUM` | removed with their code paths (never faster; the first faulted) |
+| `PLOW_TOKEN_BATCH`, `--token-batch` | removed: the unified token batch is always selected wherever the backend, model and object support it (`--fusion` takes precedence); `=0` was not a working configuration under the always-on prefix cache |
 | `PLOW_PREFIX_POLICY`, `PLOW_PREFIX_CACHE_OUTPUT`, `PLOW_PREFIX_RETIRE_ATTACHED` | the boundary tree, always on for CUDA (`docs/runtime/prefix-cache.md`); the previous binary is the rollback |
+| `PLOW_KV_STORE`, `PLOW_VMM_SNAP_POOL`, `PLOW_VMM_SNAP_PITCHED` | the KV block store (`docs/arch/26-kv-block-store.md`) is the only CUDA boundary storage; the contiguous snapshot copy path, its pool and its pitched layout were deleted (2026-10-23) |
+| `PLOW_AMD_DECODE_GEMM_OVERLAP`, `--amd-decode-gemm-overlap` | never merged (branch `decode-latency`): AMD decode native GEMMs without the AQL barrier bit measured +1.5 ms/step (+14 %, 7-layer TP8, 14 runs) |
+| `PLOW_CUTLASS_FP8_DECODE`, `--cutlass-fp8-decode` | never qualified on a production packet; dlopened a host marshaller (`libplow_cutlass_fp8_decode_sm90.so`) beside its cubin. Small-M FP8 decode projections run on cuBLASLt (removed 2026-10-29) |
 
 | var | default | effect |
 |---|---|---|
@@ -1109,21 +1151,19 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_VMM_CACHE_MIB=M` | unset | Explicit cap in MiB (vLLM's `--kv-cache-memory-bytes` role); overrides `PLOW_VMM_CACHE_MEMORY_UTILIZATION`. `0` = OOM-driven eviction only. When the backend cannot report the device size the cap falls back to 4096 MiB. |
 | `PLOW_VMM_CACHE_MIN_FREE_MIB=M` | 4% of the device (CUDA: 2%, at most half of free-after-load; an eighth of it when the rings leave no room for 2% plus the static cache budget) | Pressure eviction: keep cached prefixes (shared blocks and boundary snapshots) until free device memory would drop below M MiB, instead of trimming at the static `PLOW_VMM_CACHE_MIB`/`_MEMORY_UTILIZATION` budget. Needs a backend that reports free device memory (HSA agent info `0xA015`; CUDA `cuMemGetInfo`, armed at load on the VMM prefix pool, log `vmm prefix cache: pressure eviction armed`); others keep the static budget. Unset derives 4% of the device (~7.7 GiB on a 192 GiB MI300X) rather than a fixed MiB figure that would be a third of a small card; on CUDA it derives 2% of the device (1.6 GiB on an 80 GiB H100), at most half of the memory free after the weights and KV rings loaded: the engine preallocates activations, workspaces and rings at load, and what serving adds outside the prefix pool is lazily captured prefill graphs and the 512 MiB block reuse pool (Gemma-4-12B BF16 KV 16K/64, agentic16k c32-c128: +1.0 GiB over a whole run); snapshots and KV blocks evict and retry on OOM. When that free memory cannot hold the 2% plus 5% of the device of cache room (or the static cap, if larger), the floor is an eighth of it instead. Gemma-4-12B BF16 KV (request chunk 4096, 24.1 GiB free after load) went from vLLM's 10% (8.1 GiB) to 1.6 GiB: agentic16k c64 cached 26.7% -> 76-78% and 408 -> 772-833 tok/s when the cell starts on a fresh cache (38-39% and 451-459 tok/s right after a c128 cell, still above the old floor), c128 16% / 374 tok/s unchanged (capacity-bound: 64 idle sessions need ~35 GiB), c32, 4K and 15K single-turn unchanged, FP32-reference gate PASS, 0 errors including 384 x 15K at c128. Gemma-4-26B leaves 4.8 GiB: floor 602 MiB; its prefix-repetition C16 hits were 57/67 at 602 MiB, 52 at 764 and 8 at 2409, because a larger floor evicts the shared checkpoints. `=0` is the rollback to the static budget alone. |
 | `PLOW_PREFIX_SESSION_TTL_S=S` / `--prefix-session-ttl-s` | 150 | CUDA VMM prefix cache: a request with `X-Session-Id` protects its newest boundary (prompt end, ~118 MiB snapshot on Gemma-4 26B, plus the blocks only it keeps attachable) from LRU for `S` seconds after its last use (publish, turn-end touch, the next turn's attach); pressure takes a protected boundary only once nothing unprotected is left. After `S` seconds without a new turn it is demoted (snapshot and private blocks freed, newest block first; shared ancestors stay under LRU), lazily from the cache trim. `0` = sessions get no special retention (same as no header). `/metrics`: `plowrt_prefix_sessions_protected`, `plowrt_prefix_session_demotions_total`, `plowrt_prefix_session_demoted_bytes_total`. |
-| `PLOW_VMM_HOST_CACHE_MIB=M` / `--vmm-host-cache-mib` | unset (sized by the host-reserve rule) | Pinned host memory (MiB) for the prefix cache's host tier on CUDA: the KV block store's second LRU level, where evicted boundaries spill (D2H, asynchronous) and from which a gather reads them in place. Unset = `MemAvailable` minus an eighth of RAM (at least 16 GiB) at start, growth frozen if that reserve would be touched; `0` = no host tier; `M` = that size, under the same rule. Chunks are allocated ahead on a grower thread, never under the pool lock. AMD: the snapshot host tier of `docs/arch/22-kv-cache.md` §9, `0`/unset = off. |
+| `PLOW_HOST_KVCACHE_SIZE=<n>MB\|<n>GB` / `--host-kvcache-size` | unset (sized by the host-reserve rule) | Pinned host memory for the KV cache's host tier on CUDA. Units are binary and case-insensitive (`64GB` = `65536MB` = 64 GiB); a bare number other than `0` is refused; `auto` = unset. Renamed from `PLOW_VMM_HOST_CACHE_MIB` (MiB): plowrt refuses to start with the old name set and prints the new spelling, and a packet emitted before the rename has its value carried over. The tier is the KV block store's second LRU level, where evicted boundaries spill (D2H, asynchronous) and from which a gather reads them in place. Unset = `MemAvailable` minus an eighth of RAM (at least 16 GiB), capped at a quarter of RAM (`memory::vmm::host_tier_default`), at start, growth frozen if that reserve would be touched; `0` = no host tier; a size = that size, under the same rule. Chunks are allocated ahead on a grower thread, never under the pool lock. AMD: the snapshot host tier of `docs/arch/22-kv-cache.md` §9, `0`/unset = off. |
 | `PLOW_PF_ITL_BUDGET_MS=N` / `--pf-itl-budget-ms` | 0 (off; diagnostic, not qualified) | CUDA: a prefill launch that carries live decode rows takes the widest prefill rung whose measured launch time (per-engine EWMA keyed by the launched rung, `sched::ride::RideCost`) fits `N` ms, reserving the riders inside the rung; it skips a rung the riders would half fill and yields while the prefill backlog exceeds one full launch. Launches without decode rows are unchanged. |
 | `PLOW_PF_ADMIT_OVERLAP=0/1` / `--pf-admit-overlap` | 0 (diagnostic, not qualified) | CUDA unified token batch: admit (begin_slot + prefix attach) the requests the next launch takes while the current prefill launch runs, when that launch is already full of admitted rows. |
 | `PLOW_VMM_RING_RECYCLE=0/1` / `--vmm-ring-recycle` | 0 (diagnostic, not qualified) | CUDA VMM prefix cache with live sliding rings: a finished request's ring units stay mapped in its slot (or as spares, trimmed to `PLOW_KV_POOL_MIB` once no slot is live) instead of `cuMemRelease`. |
-| `PLOW_VMM_RING_PARK=N` / `--vmm-ring-park` | 0 (off; diagnostic, not qualified) | CUDA VMM prefix live rings: keep up to `N` released slots' sliding-ring units mapped in place, so readmitting a parked slot makes no driver call; admission retries after parked rings free memory. |
 | `PLOW_SHED_QUEUE_DEPTH=N` / `--shed-queue-depth` | 0 (off; diagnostic, not qualified) | Refuse a new request (429, `Retry-After: 1`) while `N` requests already wait for their first token (queued plus seated in prefill), so a load balancer spills it. A soft bound: the seated count refreshes once per dispatcher tick. |
 | `PLOW_KV_ADMIT_HEADROOM=F` | 0.9 | **AMD** — fraction of the free-after-load device memory the mux may commit to admitted sequences' KV. Admission charges every live slot's reserved rows (prompt + `max_tokens`) at the packet's bytes-per-token and holds a request in the queue when it would not fit, instead of dispatching it into a device that cannot back it. Measured need: 20 x 70,000 rows wants 72.1 GiB where the load left 55.59 GiB free, which faulted the queue with `HSA_STATUS_ERROR_OUT_OF_RESOURCES`. A request larger than the whole budget is answered with a context-length error rather than queued forever. `0` is the rollback to slot-count-only admission. |
 | `PLOW_KV_MEM_UTIL=F` / `--kv-mem-util` | 0 (off) | **CUDA** — caps the KV admission budget so the process, with KV fully admitted, holds at most `F` of device memory (vLLM's `--gpu-memory-utilization`). The budget is `min(headroom x free, F x total - used)` after load. |
 | `PLOW_AMD_PREFIX_FINE_ROWS=N` | unset | Share AMD prefix content below the 2 MiB VMM block floor in N-row chunks instead of leaving it a private copy. N must divide every cache group's block size. **CUDA** VMM prefix cache: the step of the intermediate checkpoints a publish records below the boundary; unset publishes one at every whole-block boundary (2048 rows at hd512 BF16 — a block-aligned boundary has no tail, so any prompt sharing those blocks attaches to it). Each checkpoint is a sliding-window snapshot (window x `snap_row_bytes`, 320 MiB on Gemma-4-12B), so a finer step multiplies that. |
 | `PLOW_VMM_KV=0/1` | on | **AMD** — VMM-backed KV on ROCr (`hsa_amd_vmem_*`): reserve VA for `max_ctx`, map physical at each sequence's frontier; warns and falls back to the flat carve if the platform can't support it. Reached only when the shared-prefix pool is absent (`vmm_bringup` runs iff `shared_prefix.is_none()`), so with the prefix cache on — the default — this changes nothing; it makes the fallback path grow with context the same way. `=0` is the rollback. |
 | `PLOW_PREFIX_CACHE=0/1` | on | Prefix reuse on compatible AMD and NVIDIA assets: the VMM prefix pool on Hopper, slot-local prompt snapshots on AMD (single-GPU and TP). `0` disables both. Default-on since 3ca64e93; the isolated A/B against `0` on H100 and MI300X is still owed. |
-| `PLOW_TOKEN_BATCH=0/1` | on | **Diagnostic rollback.** The unified token-batch executor (decode and prefill rows in one packed launch) is selected wherever the backend, model and object support it; unsupported configurations use ordinary execution and `--fusion` takes precedence. `=0` is the rollback. |
 | `PLOW_TB_SPLIT_ATTN=0/1` | on | **CUDA sm_90a** token batch: decode rows riding a packed prefill launch attend through split-KV flash decode (`plow_<arch>_rider_*` in the decode object) instead of as one-row requests of the prefill FlashAttention (`docs/arch/17-unified-token-batch.md`). Arms only with a decode object that carries the rider kernels. `=0` is the rollback. |
-| `PLOW_GEN_DECODE_STEP=N` / `--gen-decode-step` | 4 | **CUDA sm_90a** decode rungs from N rows run each declared FlashDecode + FlashMerge pair as one launch of the packet's generated flash-decode object (`gen_sm90a_attn_dec_*.cubin`, `PLOW_EMIT_GEN_KERNELS` at emit); narrower rungs keep the interpreter pair. Qwen3.8-27B H100: the object wins from four rows (B4/8 × 4K 26.9/28.2 → 26.5/27.4 ms, B32 −4.5 ms), at one or two rows the interpreter is as fast. `=0` never routes. |
-| `PLOW_QWEN_LIGHT_OCC=N` / `--qwen-light-occ` | 4 | **CUDA sm_90a** the Qwen3.5 chain's pointwise prefill segments (norms, conv, gates, GLU) of a packed chunk run as light launches of the decode object's `plow_<arch>_light_pf` entry at N blocks per SM instead of interpreter windows (light table 11.6 → 9.9 ms per 1024-row chunk on build77). `=0` keeps the interpreter windows. |
+| `PLOW_GEN_DECODE_STEP=N` / `--gen-decode-step` | 4 | **CUDA sm_90a** decode rungs from N rows run each declared FlashDecode + FlashMerge pair as one launch of the packet's generated flash-decode object (`gen_sm90a_attn_dec_*.cubin`, `PLOW_EMIT_GEN_KERNELS` at emit); narrower rungs keep the interpreter pair. Qwen3.8-27B BF16 H100 (rungs that run as one interpreter launch): the object wins from four rows (B4/8 × 4K 26.9/28.2 → 26.5/27.4 ms, B32 −4.5 ms); at one or two rows it is slower (B1/B2 22.19/23.27 → 22.56/23.38 ms). Qwen3.8-27B FP8 (cuBLASLt / native FP8 segmented rungs) wins from one row (B1/B2 14.05/14.69 → 13.56/13.70 ms); its recipe sets `1`. `=0` never routes. |
+| `PLOW_GDN_LIGHT_OCC=N` / `--gdn-light-occ` | 4 | **CUDA sm_90a** the Qwen3.5 chain's pointwise prefill segments (norms, conv, gates, GLU) of a packed chunk run as light launches of the decode object's `plow_<arch>_light_pf` entry at N blocks per SM instead of interpreter windows (light table 11.6 → 9.9 ms per 1024-row chunk on build77). `=0` keeps the interpreter windows. |
 | `PLOW_ENCODE_FAST` | **on**; `=0` restores `encode` | Tokenize prompts with `encode_fast` (no offsets). Ids are identical to the default `encode`; GLM-5.3 CPU 8192-token prompt 12.3 → 11.1 ms. Runtime only. |
 | `PLOW_ENCODE_THREADS=N` | 16 for a metaspace one-word BPE (Gemma), else unset | Tokenize a prompt of ≥ 8 KiB in up to N pieces on a dedicated N-thread pool, cut at a single ASCII space between two ASCII letters. Enabled only for a BPE tokenizer with no normalizer, truncation, padding, post-processor tokens, stripped added tokens, or dropout, and a `Split(Isolated)` + `ByteLevel(use_regex=false, add_prefix_space=false)` pre-tokenizer on the GLM or Qwen2 pattern, where such a space always starts a pre-token; any other tokenizer warns and stays serial. Ids identical to `encode` on 1420 GLM-5.3 prompts (vLLM random 1k–16k, chat template, adversarial). GLM-5.3 CPU 8192-token prompt 12.3 → 4.8 ms (N=4), 2.6 ms (N=8). A metaspace one-word BPE (space → `▁` normalizer, Split-on-space, no vocabulary token with an ASCII letter before `▁`: Gemma) splits by default with N=16 and `PLOW_ENCODE_SPLIT_MIN=512` (its default for that tokenizer; 4096 otherwise): Gemma-4 served TTFT 50.1 → 47.3 ms at 1024 in, 186.3 → 176.7 at 4096. `PLOW_ENCODE_THREADS=0` is the rollback. Runtime only. |
 | `PLOW_MLA_PF_AITER=0/1` | off | AMD: route isolated GLM sparse MLA prefill boundaries through the qualified gfx942 AITER assembly object (pinned SHA, 320-B ABI). −6.6% prefill time at 70k; 18/18 retrieval cases. |
@@ -1163,7 +1203,6 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_TP_PREFILL_SEGMENT_MAJOR=0/1` (`--amd-tp-prefill-segment-major`) | on | **AMD TP prefill** — enqueue a chunk's segments in segment-major rank order and drain once per chunk, rather than after every segment. `=0` is the rollback. **`PLOW_PREFILL_SEG_TIMING=1` silently turns this off** (it adds an all-rank barrier per segment for timing), so a prefill measurement taken with segment timing on is not comparable to one taken without: on an 8-layer GLM packet a 65,536-token prefill measured ~593 ms with it and ~572 ms without. Undocumented until the flags audit. |
 | `PLOW_CTR_DBUF=0/1` (`--amd-ctr-dbuf`) | on | **AMD** — counter double-buffering. `--amd-ctr-dbuf=false` disables. Undocumented until the flags audit. |
 | `PLOW_L2_PLACE_PREFILL=0/1` (`--l2-place-prefill`) | on | **Emit** — apply the requested L2 placement to prefill programs as well as decode; the prefill counterpart of `PLOW_L2_PLACE`. Undocumented until the flags audit. |
-| `PLOW_AMD_DECODE_GEMM_OVERLAP=0/1` (`--amd-decode-gemm-overlap`) | **not in this tree** | **Not implemented on this branch: nothing here reads this flag, so setting it does nothing.** The code lives on the unmerged branch `decode-latency`; the row is kept for its measured result. **AMD decode** — dispatch a native decode GEMM without the AQL barrier bit when it directly follows native GEMMs it is independent of (byte ranges planned at load, `amd_gemm_lt::overlap_barriers`). Bit-identical by construction. **Measured loss, keep off:** 7-layer TP8, 14 runs, median +1.5 ms/step (+14 %); `PLOW_TRACE_RAW` shows the native GEMM runs do not shorten and, on the grouped packet, every native interval grows 40–50 µs. Code on branch `decode-latency`. |
 | `PLOW_AMD_NUMA_HOST_POOLS=0/1` (`--amd-numa-host-pools`) | on | **AMD** — take each rank's kernarg ring and fine-grained host staging (pinned upload/readback buffers, fill and zero stages) from the CPU agent nearest its GPU (`HSA_AMD_AGENT_INFO_NEAREST_CPU`) instead of the first CPU agent, so a GPU on the far socket reads every dispatch's kernargs from local memory; the host writer's cross-socket stores are posted. No fine-grained allocation is shared across ranks (peer buffers are VRAM). Every load logs one `HSA host placement` INFO line per rank: chosen/first/nearest CPU node and the page nodes (`get_mempolicy`) of the kernarg ring, AQL ring and completion signal. `=0` / `--amd-numa-host-pools=false` = the single-agent placement (rollback). **Tier 3** (7-layer TP8, 6 processes per arm interleaved): 12.576 → 9.665 ms/step median (−23 %), spread 1.8 → 0.23 ms (the per-process slow level is gone), ranks 0–3 wait inside the one-shot XReduce 196 → 39 µs; projected ≈ −25 ms per 78-layer rung-20 tick. **Tier 4** (combined with the collective RS8/AG24 schedule, tail-sparse on in every arm; 20 × 70k/700, C20): +3.66 % out tok/s against the control mean (controls 1.14 % apart), decode-only tick p50 89.6 / 87.7 / 92.1 ms (−3.4 %, just outside the 2.7 % control spread), retrieval 18/18 + 21/21 in every arm; under `serve` ranks 4–7 get kernarg pages on nodes 7/7/4/7. The gain is credited to the pair; NUMA's own full-model decode share is unresolved (serve pins its engine thread to rank 0's socket, so its control never had the tier-3 slow level). |
 | `PLOW_AMD_KERNARG_VRAM=0/1` (`--amd-kernarg-vram`) | on | **AMD** — put each rank's kernarg ring in its own GPU's VRAM through the large-BAR host mapping (prefaulted every 64 KiB), so the GPU reads kernargs locally with no host-cache snoop whichever socket the writer thread runs on. Each slot is staged on the stack, copied through the BAR and made visible with CLR's `DeviceKernelArgsReadback` sequence — sfence, rewrite the last kernarg byte, mfence, volatile read of it back (ROCm/clr `rocclr/device/rocm/rocvirtual.cpp`, `VirtualGPU::submitKernelInternal`; the gfx94x default in `rocsettings.cpp`) — before the packet header is published; no existing fence changes. Falls back to the host kernarg pool (logged) when the VRAM pool or BAR mapping refuses. Pinned staging stays on the `PLOW_AMD_NUMA_HOST_POOLS` pools. The `HSA host placement` line carries `kernarg_vram`. **Tier 3** (7-layer TP8, every process pinned to socket 0 as serve pins its engine thread, 6 processes per arm interleaved): 10.910 (pinned control) / 9.988 (NUMA pools) / **7.062 ms/step** (NUMA pools + VRAM kernargs, spread 0.020 ms), −29 % against NUMA pools alone and −35 % against the pinned control; the rank 4–7 minus rank 0–3 per-window gap 105 / 77 / **0.6 µs**, one-shot XReduce time ranks 0–3 / 4–7 189/48 → 29/26 µs, lone-GEMM interval 20 µs on every rank; all 8 ranks token-identical in every process. **Tier 4** (job `0-1789202824-kernarg-vram-t4`, runtime-only arm on the 08c0ad44 checkpoint set, one binary, 20 × 70k/700, C20, ctrl / treat / ctrl2): out tok/s 63.08 / 70.18 / 63.37 (+11.0 % against the control mean, controls 0.46 % apart); decode-only tick p50 88.0 / 62.9 / 85.1 ms (−27.3 %, controls 3.3 % apart; p90 −28.0 %); prefill tick p50 855.3 / 834.5 / 853.9 ms (−2.4 %, controls 0.2 % apart); full 8192 chunk mean 793.3 / 792.7 / 799.3 ms (−0.4 %, inside the 0.8 % control spread: the prefill tick's gain is the decode dispatched in it, 72.5 / 54.2 / 70.4 ms); retrieval 18/18 + 21/21 in every arm. **Default on**; `=0` / `--amd-kernarg-vram=false` = the host kernarg ring (rollback). |
 | `PLOW_AMD_PUBLISH_DEFER=0/1` (`--amd-publish-defer`) | on | **AMD TP** shared-prefix cache — stash a completed chunk's prefix publish (snapshot allocation + scale/tail copy + radix insert, every 16384-row boundary and at the prompt's end) and run it at the next GPU drain window: the next chunk's, between its enqueue and drain, or the decode's `drain_and_audit`. The snapshot reads only rows below the frontier, which nothing writes before the flush; `begin_slot` / `stage_attach` / `commit_attach` / `publish` / `release` flush first, so no request sees the cache without it (`SharedPrefix::defer_publish`). `PLOW_TICK_LOG=1`: `TICK pub_deferred`, `PFSEG publish_deferred`. |
@@ -1211,6 +1250,11 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may 
 | `PLOW_NATIVE_LAUNCH_TIMING=1` | off | AMD prefill diagnostic: drain after each launch of the native sparse routes and print one line per segment — `route=sparse_mla[_single] rows=… pack_us=… attention_us=… [reduce_us=…]` for the AITER sparse MLA, `route=index_tp rows=… score_us=…` for the TP indexer (only its score pass can be drained: select/gather/complete open with an all-rank rendezvous the peers have not reached yet, so the rest of that segment is `critical_us - score_us` in the `PLOW_PREFILL_SEG_TIMING` line). Serialises those segments — use on a `plowrt bench` run, never in serving. |
 | `PLOW_AMD_UNION_SKIP=0` | on | GLM sparse prefill (AMD): the host skips the `IndexUnionPf` segments while the native sparse attention route is active (prior ≥ 2047), because that route gathers `iidx_pf` and nothing reads the union table. Load logs `index union segments unread … skippable=N`. Runtime only: the packet and objects are unchanged. T3 on P8192-S: 667.2 / 648.3 / 666.8 ms (ctrl / on / ctrl2), −18.7 against a 3.7 ms noise floor; P4096-S −11.1; P8192-0 unchanged (`glue2-t3-g1-rung`). Default on since review log #92: served T4 (`glue2-t4`, off/on/off2/on2, bundled with `PLOW_GLM_MOE_SHARED_SEED`) not worse beyond the checkpoint P floor in any cell, C16 TTFT −39.0 / −23.1 ms and TPOT −2.66 / −1.92 ms beyond it; retrieval 18/18 + 21/21; certificate `perf-certs/rt.union_skip.json`. `=0` is the rollback. |
 | `PLOW_DSA_SELECT_THRESHOLD=1` | off | GLM sparse prefill (AMD): the TP indexer launches `plow_dsa_tp_select_thr` instead of `plow_dsa_tp_select` — the same top-2048 set per row (same key, row-set identical in `runtime/tests/dsa_select_thr_gfx942_test.hip`) in two row scans instead of five. Needs the adapter built with `-DPLOW_DSA_TP_SELECT_THR=1`; the load fails by name otherwise. Runtime only: the packet is unchanged. T2 (`idxtier-t2-thr`, one rank band, device events): slowest-rank select 566 → 372 µs at 8192 rows / prior 65536, 318 → 197 at 4096 rows. Opt-in; T3 pending. |
+
+</details>
+
+<details>
+<summary>Device selection and execution details</summary>
 
 ## Visible devices: `CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`
 
@@ -1296,7 +1340,7 @@ used to derive the fail-closed result.
 | `PLOW_EMIT_S3GEN_ATTN_H16=1` | off | Compiler option (S3Gen): emit the voice caches pre-formatted for the 3xFP16 cached attention of the sm_90 speech object. |
 | `PLOW_EMIT_DECODE_NATIVE_TC=1` | off | Compiler option that marks eligible BF16 decode projections with the native sm_90a transposed tensor-core GEMV role (`gemv_sm90_transposed`). Serving qualification pending; 35.4 µs vs cuBLASLt 32.7 µs at B8 in isolation. |
 | `PLOW_EMIT_PACKED_PREFILL` / `--emit-packed-prefill` | on for qualified Hopper TP1 BF16 dense packets and for GLM (`glm_moe_dsa`/`glm5_next`) on gfx942 | Emit the packed-prefill request ABI and dedicated packet-paired objects. Packed prefill uses one attention split across buckets so packing and chunk length do not change the softmax reduction. This trades short-prompt split parallelism for stable request numerics. The runtime activates it from metadata and uses ordinary prefill with automatic prefix reuse. `false` is the rollback. On AMD it emits a SECOND, family-segmented copy of every prefill bucket (a `packed_prefill_program_t` sibling the runtime resolves only while staging a packed binding); unset, the packet is byte-identical. Implemented for the Kimi-K3 and GLM emitters. **GLM gfx942 emits the siblings by default** (recorded as `production_default`; a `--replay-knobs` recipe keeps its own value): the ordinary programs are byte-identical with or without them, the siblings ride next to the native AITER MoE / hipBLASLt / resident-MoE segments (class A, row-agnostic over the dense live rows), and sparse (DSA) buckets get a sibling only under `PLOW_PACKED_SPARSE_PF=1` (their interpreter selectors are class C; the span-aware TP-indexer + AITER chain is not). Without siblings an MLA blob's norm ops share a segment with the Gemms and the packed route refuses every rung. **The shipping GLM-5.3 serving set overrides this to off:** its `build.json` records `emit_packed_prefill=false` with source `env`, and its `plow_config.h` has `PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 0`, so the served blob carries no siblings. Packing on the 8192 rung is being qualified as an object-build capability of the ordinary program instead, to avoid a second copy of every prefill bucket (+314 segments, +23% at 8192). |
-| `PLOW_PACKED_PREFILL_ROUTE` | unset: follows the packet | Load the lean packed-family HSACO objects (`interp_packed_mla_norm`, `interp_packed_mla_flash`, their `_fp8kv` twins for FP8-KV packets, `_tb` twins for token-batch bodies, `interp_packed_kda`) and permit exact-family routing after metadata is staged. **Unset = on exactly when the blob carries packed-prefill siblings or token-batch bodies**, and then a family object those programs need that is missing from `PLOW_HSACO` is a load error naming the file — never a silent isolated fallback. `=0` is the rollback (every prefill isolated); `=1` forces the load on a packet without siblings. Missing/wrong markers and mixed segments refuse. Dense AMD packing uses the normal span-aware objects with `PLOW_PF_BATCH=1` and needs neither this route nor `PLOW_EMIT_PACKED_PREFILL`; an **MLA** blob needs BOTH, plus objects from a `PLOW_PACKED_PREFILL_CONSUMERS=1` build (gfx942) / `PLOW_HSACO_PACKED_PREFILL_CONSUMERS=ON` (cmake). The runtime says at load which of the three preconditions is missing — see `report_packed_prefill_route`. |
+| `PLOW_PACKED_PREFILL_ROUTE` | unset: follows the packet | Load the lean packed-family HSACO objects (`interp_packed_mla_norm`, `interp_packed_mla_flash`, their `_fp8kv` twins for FP8-KV packets, `_tb` twins for token-batch bodies, `interp_packed_kda`) and permit exact-family routing after metadata is staged. **Unset = on exactly when the blob carries packed-prefill siblings or token-batch bodies**, and then a family object those programs need that is missing from `PLOW_HSACO` is a load error naming the file — never a silent isolated fallback. `=0` is the rollback (every prefill isolated); `=1` forces the load on a packet without siblings. Missing/wrong markers and mixed segments refuse. Dense AMD packing uses the normal span-aware objects (packing follows the packet; `PLOW_PF_BATCH` was removed) and needs neither this route nor `PLOW_EMIT_PACKED_PREFILL`; an **MLA** blob needs BOTH, plus objects from a `PLOW_PACKED_PREFILL_CONSUMERS=1` build (gfx942) / `PLOW_HSACO_PACKED_PREFILL_CONSUMERS=ON` (cmake). The runtime says at load which of the three preconditions is missing — see `report_packed_prefill_route`. |
 | `PLOW_TOKEN_BATCH_TP` / `--token-batch-tp` | off | Emit one token-batch BODY program per GLM prefill bucket wider than the decode band: the bucket's packed-segment topology plus the batched decode attention chain and a band-sampling tail over a slot-indexed band of `decode_rungs().last()` rows (`plans/unified-token-batch.md`, "AMD TP8 lowering decision"; tag `TOKEN_BATCH_PROG`). Sparse-prefill buckets are skipped unless `PLOW_PACKED_SPARSE_PF=1` (below). The body carries its own packed topology, so `PLOW_EMIT_PACKED_PREFILL` may stay off. Unset ⇒ byte-identical blob. Serving: `PLOW_TOKEN_BATCH=1` (default) + `PLOW_PACKED_PREFILL_ROUTE=1` + the `_tb` objects below; the load line `route="unified-token-batch/slot-band" armed=… bodies=…` names what is missing. **Parked (review log #63), keep off:** on GLM-5.3 TP8 a body without seams measured −6.6% out tok/s, and the seams-aware body −0.9% while corrupting long-context prefill (retrieval 9/18 base, 0/21 tail) because the `_tb` norm twin sized band norms to the decode-span count. A corrected body is estimated at +16 ms per middle chunk against control. |
 | `PLOW_PACKED_SPARSE_PF` / `--packed-sparse-pf` | off | Let the packed siblings (`PLOW_EMIT_PACKED_PREFILL`) and token-batch bodies (`PLOW_TOKEN_BATCH_TP`) cover the SPARSE (DSA) prefill buckets too — on GLM-5.3 TP8 the 8192 rung, the one every 64K-context chunk runs. Requires `PLOW_GLM_INDEX_TP=1`, an unpooled indexer and FP8 KV: under the packed topology the native TP indexer (`IndexTpPf`) feeds the sparse FP8 flash directly (`fj[1] = iidx_pf + 1`; no per-8-query `IndexUnionPf`, whose tiles could straddle two requests), and at the runtime every row's position, causal bound and key base come from the launch's `PlowKvSpan` table (`dsa_tp_adapter_gfx942.elf` with `plow_dsa_tp_abi_2`, `scripts/build_dsa_tp.sh`) while the AITER sparse flash runs one pack→attention→reduce chain per span against that span's own slot cache. The interpreter selectors (`IndexScorePf`/`IndexSelectPf`/`IndexUnionPf`, pooled chains) stay class C and are refused in packed programs. A span packed onto a sparse rung must start ≥ 2047 keys deep (the fixed-width 2048-key CSR): the scheduler admits spans by that rule (`packed_span_admissible`; a request's first rows ride the widest dense body or run isolated) and the staging path refuses by name. Serving a packet with sparse siblings/bodies on an ABI-1 adapter or without `PLOW_MLA_PF_AITER=1` leaves those programs un-offered (`check_packed_prefill_program` names the missing piece); isolated prefill is unaffected. Unset ⇒ byte-identical blob. Default off until the 8-GPU A/B lands (`docs/amd/tp-bringup-mi300x.md` §22). |
 | `PLOW_TOKEN_BATCH_TP_OBJECTS=1` | off (`scripts/build_gfx942.sh`) | Also build `interp_packed_mla_{norm,flash}_tb{,_fp8kv}`: the packed MLA family objects with the slot-band resolver compiled in (`PLOW_PACKED_PREFILL_BAND=1`, marker `plow_packed_prefill_band_1`), which a token-batch body's MLA family segments are routed to. Requires `PLOW_PACKED_PREFILL_CONSUMERS=1`. Shipped objects untouched. Under `PLOW_HSACO_CONFIG` both are derived from the packet's `plow_config.h`: `PLOW_PACKET_HAS_TOKEN_BATCH_BODIES 1` turns on this and `PLOW_PACKED_PREFILL_CONSUMERS`, `PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 1` the latter, and an explicit `=0` the packet contradicts is refused by name (the set would fail to load on the first body or sibling). |
@@ -1380,3 +1424,16 @@ decode pass costs ~95 ms per prefill tick, so decode rows riding inside every ch
 **Measured, that estimate does not hold:** it assumed the decode pass disappears when its rows ride, but
 inside the body the band's decode attention chain costs about as much per layer as the pass, so riding
 middle chunks measures −14 ms per chunk at 78 layers (see the review log's decode-rows negative).
+
+</details>
+
+<details>
+<summary>Renamed environment variables</summary>
+
+| Old name | Replacement |
+| --- | --- |
+| `PLOW_QWEN_DECODE_LT` | Compiler: `PLOW_EMIT_DECODE_CUBLASLT` |
+| `PLOW_SEG_PACKED_PREFILL` | Compiler: `PLOW_EMIT_PACKED_PREFILL` |
+| `PLOW_NV_PLACE_DISPATCH` | Runtime: `PLOW_L2_PLACE_DISPATCH` |
+
+</details>

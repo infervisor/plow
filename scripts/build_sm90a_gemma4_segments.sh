@@ -372,24 +372,15 @@ if [ -n "${PLOW_BUILD_GEN_KERNELS:-}" ]; then
   "${PYREF:-python3}" scripts/gen_kernels/build_catalog.py build "$gemma_out" \
     --entries "$PLOW_BUILD_GEN_KERNELS"
 fi
-# CUTLASS small-M FP8 decode projections (plowrt PLOW_CUTLASS_FP8_DECODE pins both sha256): the
-# kernel cubin and its host Params marshaller, stripped so the library bytes are reproducible.
-# cicc and cudafe++ hash the source's absolute path into the anonymous-namespace module id
-# (_INTERNAL_<hash>_...; -frandom-seed does not cover it): both get the repo-relative path, so
-# every checkout builds the same bytes.
-if [ "${PLOW_BUILD_CUTLASS_FP8_DECODE:-0}" = 1 ]; then
-  gemma_cutlass_src=runtime/nvidia/cutlass_fp8_decode_sm90.cu
-  gemma_cutlass_inc=${CUTLASS_INCLUDE_DIR:-$("${PYREF:-python3}" -c \
-    'from tilelang import env; print(env.CUTLASS_INCLUDE_DIR)')}
-  gemma_cutlass_flags=(-std=c++17 -arch=sm_90a -O3 --expt-relaxed-constexpr -DNDEBUG
-    -DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1 -I "$gemma_cutlass_inc"
-    -Xcicc --orig_src_path_name -Xcicc "$gemma_cutlass_src"
-    -Xcudafe --orig_src_path_name -Xcudafe "$gemma_cutlass_src")
-  "${gemma_nvenv[@]}" "$gemma_nvcc" "${gemma_cutlass_flags[@]}" -cubin \
-    -o "$gemma_out/cutlass_fp8_decode_sm90.cubin" "$gemma_cutlass_src"
-  "${gemma_nvenv[@]}" "$gemma_nvcc" "${gemma_cutlass_flags[@]}" -DPLOW_CUTLASS_HOST -shared \
-    -Xcompiler -fPIC -Xlinker -s -L "$gemma_cuda_bin/../lib64/stubs" -L "$gemma_cuda_bin/../lib/stubs" \
-    -lcuda -o "$gemma_out/libplow_cutlass_fp8_decode_sm90.so" "$gemma_cutlass_src"
+# Library hd512 prefill attention (plowrt exec/gpu/lib_attention.rs): FlashAttention-4's SM90
+# forward AOT-exported as cubins into plow_fa4_hd512.aot with the KV adapter cubin (plowrt launches
+# them; scripts/fa4_aot/build.py). The export needs a Python with vLLM's vllm_flash_attn (0.28.0
+# built) and the CuTe DSL (PLOW_FA4_PY, default PYREF). PLOW_BUILD_FA4_HD512=1 builds the bf16
+# page-pool variant, =f16 the fp16 one.
+if [ "${PLOW_BUILD_FA4_HD512:-0}" = 1 ] || [ "${PLOW_BUILD_FA4_HD512:-0}" = f16 ]; then
+  gemma_fa4_dtype=(); [ "$PLOW_BUILD_FA4_HD512" = f16 ] && gemma_fa4_dtype=(f16)
+  PLOW_NVCC="$gemma_nvcc" "${PLOW_FA4_PY:-${PYREF:-python3}}" scripts/fa4_aot/build.py "$gemma_out" hd512 \
+    "${gemma_fa4_dtype[@]}"
 fi
 # Glue kernels of the cuBLASLt grouped-GEMM MoE prefill route (PLOW_MOE_PF_LT): only for a packet
 # that carries the grouped expert GEMMs.

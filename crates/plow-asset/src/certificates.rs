@@ -231,7 +231,7 @@ pub enum SemanticScope {
     LayoutMapping,
     LogicalTensorEffects,
     /// `media_geometry.v1`: speech/multimodal contract geometry of a bundle, checked at
-    /// qualification (`plowrt qualify`), not carried as a compiler receipt.
+    /// qualification (`plowc qualify`), not carried as a compiler receipt.
     MediaGeometry,
     /// `kv_ring.v1`: packed prefill writes never overwrite a ring row their own queries read,
     /// checked at qualification from the packet's `live_kv`/`packed_prefill` sections.
@@ -400,10 +400,11 @@ pub fn sidecar_checks_file(packet: &std::path::Path) -> std::path::PathBuf {
 }
 
 impl SidecarCheckReceipts {
-    pub fn validate_packet(&self, packet: &[u8]) -> Result<(), String> {
+    /// `packet_sha256` is the loaded packet's [`crate::decode_objects::image_sha256`].
+    pub fn validate_packet(&self, packet_sha256: &str) -> Result<(), String> {
         if self.schema != 1
             || !is_sha256(&self.compiler_sha256)
-            || self.packet_sha256 != crate::decode_objects::image_sha256(packet)
+            || self.packet_sha256 != packet_sha256
         {
             return Err("sidecar check receipt does not match loaded packet".into());
         }
@@ -445,10 +446,11 @@ impl SidecarCheckReceipts {
 }
 
 impl PacketCheckReceipts {
-    pub fn validate_packet(&self, packet: &[u8]) -> Result<(), String> {
+    /// `packet_sha256` is the loaded packet's [`crate::decode_objects::image_sha256`].
+    pub fn validate_packet(&self, packet_sha256: &str) -> Result<(), String> {
         if self.schema != 1
             || !is_sha256(&self.compiler_sha256)
-            || self.packet_sha256 != crate::decode_objects::image_sha256(packet)
+            || self.packet_sha256 != packet_sha256
         {
             return Err("compiler check receipt does not match loaded packet".into());
         }
@@ -522,33 +524,6 @@ impl PacketCheckReceipts {
     }
 }
 
-/// How load and artifact qualification treat compiler receipts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VerificationPolicy {
-    /// Pre-policy behavior: absent receipts or an unavailable/changed verifier load unverified.
-    Off,
-    /// Derive the full obligation set and report every gap; reject only what `Off` rejects.
-    Report,
-    /// Any gap rejects: missing/unrunnable/unapproved verifier, absent, unused, duplicated or
-    /// wrong-program receipts, and uncovered required obligations.
-    Strict,
-}
-
-impl VerificationPolicy {
-    pub const VALUES: &'static [&'static str] = &["off", "report", "strict"];
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "off" => Ok(Self::Off),
-            "report" => Ok(Self::Report),
-            "strict" => Ok(Self::Strict),
-            other => Err(format!(
-                "unknown verification policy {other:?} (off, report, strict)"
-            )),
-        }
-    }
-}
-
 /// One verifier executable approved for receipts: the sha256 of the immutable `plow_verify` image
 /// built from Lean sources whose digest is `lean_sources_sha256`. `commit` is traceability only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -618,9 +593,9 @@ pub struct Qualification {
 }
 
 impl Qualification {
-    fn new(packet: &[u8], programs: usize, required: BTreeSet<Obligation>) -> Self {
+    fn new(packet_sha256: &str, programs: usize, required: BTreeSet<Obligation>) -> Self {
         Self {
-            packet_sha256: crate::decode_objects::image_sha256(packet),
+            packet_sha256: packet_sha256.to_string(),
             programs,
             required,
             satisfied: BTreeSet::new(),
@@ -810,11 +785,11 @@ pub fn bind_packet_receipt(
 /// legacy path reports them as rejections.
 pub fn qualify_packet(
     receipts: Option<&PacketCheckReceipts>,
-    raw: &[u8],
+    packet_sha256: &str,
     packet: &crate::program::Packet<'_>,
 ) -> Qualification {
     let mut q = Qualification::new(
-        raw,
+        packet_sha256,
         packet.programs.len(),
         required_packet_obligations(packet),
     );
@@ -823,7 +798,7 @@ pub fn qualify_packet(
         q.missing(packet);
         return q;
     };
-    if let Err(error) = receipts.validate_packet(raw) {
+    if let Err(error) = receipts.validate_packet(packet_sha256) {
         q.gaps.push(error);
         q.missing(packet);
         return q;
@@ -854,7 +829,7 @@ pub fn qualify_packet(
 /// that program's reconstructed logical-effects obligation.
 pub fn qualify_sidecar(
     receipts: Option<&SidecarCheckReceipts>,
-    raw: &[u8],
+    packet_sha256: &str,
     packet: &crate::program::Packet<'_>,
 ) -> Qualification {
     let required = (0..packet.programs.len())
@@ -865,13 +840,13 @@ pub fn qualify_sidecar(
             site: None,
         })
         .collect();
-    let mut q = Qualification::new(raw, packet.programs.len(), required);
+    let mut q = Qualification::new(packet_sha256, packet.programs.len(), required);
     let Some(receipts) = receipts else {
         q.gaps.push("no sidecar check receipts".into());
         q.missing(packet);
         return q;
     };
-    if let Err(error) = receipts.validate_packet(raw) {
+    if let Err(error) = receipts.validate_packet(packet_sha256) {
         q.gaps.push(error);
         q.missing(packet);
         return q;
@@ -1338,7 +1313,9 @@ mod tests {
         raw: &[u8],
         receipts: Option<&PacketCheckReceipts>,
     ) -> Qualification {
-        crate::program::with_model(model, |packet| qualify_packet(receipts, raw, packet))
+        crate::program::with_model(model, |packet| {
+            qualify_packet(receipts, &crate::decode_objects::image_sha256(raw), packet)
+        })
     }
 
     #[test]
@@ -1416,7 +1393,9 @@ mod tests {
             program_checks: vec![Some(0), Some(1)],
         };
         let q = |r: Option<&SidecarCheckReceipts>| {
-            crate::program::with_model(&model, |packet| qualify_sidecar(r, &raw, packet))
+            crate::program::with_model(&model, |packet| {
+                qualify_sidecar(r, &crate::decode_objects::image_sha256(&raw), packet)
+            })
         };
         assert!(
             q(Some(&receipts)).qualified(),
@@ -1458,11 +1437,6 @@ mod tests {
             .iter()
             .all(|v| is_approved_verifier(&v.sha256)));
         assert!(!is_approved_verifier(&"0".repeat(64)));
-        assert_eq!(
-            VerificationPolicy::parse("strict"),
-            Ok(VerificationPolicy::Strict)
-        );
-        assert!(VerificationPolicy::parse("on").is_err());
     }
 
     #[test]

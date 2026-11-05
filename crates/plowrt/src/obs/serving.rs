@@ -1311,6 +1311,8 @@ impl RequestMetrics {
         }
         self.finished = true;
         let m = &self.metrics.serving;
+        // Before the final chunk is sent: a reader of the response sees the request settled.
+        m.running.fetch_sub(1, Relaxed);
         use crate::serve::stream::FinishReason;
         if matches!(reason, FinishReason::Preempted) {
             m.preempted.fetch_add(1, Relaxed);
@@ -1360,9 +1362,9 @@ impl RequestMetrics {
 
 impl Drop for RequestMetrics {
     fn drop(&mut self) {
-        self.metrics.serving.running.fetch_sub(1, Relaxed);
         if !self.finished {
             let m = &self.metrics.serving;
+            m.running.fetch_sub(1, Relaxed);
             m.aborted.fetch_add(1, Relaxed);
             if self.first.is_none() {
                 m.aborted_before_first.fetch_add(1, Relaxed);
@@ -1415,6 +1417,11 @@ mod tests {
         r.token(40);
         r.token(40);
         r.finish(FinishReason::Length, 3);
+        assert_eq!(
+            m.serving.running.load(Relaxed),
+            0,
+            "settled before the response ends"
+        );
         r.finish(FinishReason::Length, 3);
         drop(r);
         assert_eq!(m.serving.running.load(Relaxed), 0);

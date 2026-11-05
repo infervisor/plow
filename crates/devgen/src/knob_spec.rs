@@ -1463,6 +1463,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_pf_w8a8_fq", Some("PLOW_MOE_PF_W8A8_FQ"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.attn_library", Some("PLOW_EMIT_ATTN_LIBRARY"), Layer::Emit, Domain::Bool, OFF, OPT_IN).per_rung(PREFILL_RUNGS),
     KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED).per_rung(PREFILL_RUNGS),
     KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_gemm_glu_role", Some("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1478,11 +1479,13 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.attention_pf_role", Some("PLOW_ATTENTION_PF_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.attention_pf_isolate", Some("PLOW_ATTENTION_PF_ISOLATE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemv_decode_role", Some("PLOW_GEMV_DECODE_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.fp8_block_concat", Some("PLOW_FP8_BLOCK_CONCAT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fp8_m1_tma", Some("PLOW_QWEN_FP8_M1_TMA"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_w8a8_prefill", Some("PLOW_QWEN_W8A8_PREFILL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt", Some("PLOW_EMIT_DECODE_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt_min_rows", Some("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt_head", Some("PLOW_EMIT_DECODE_CUBLASLT_HEAD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.decode_fp8_block", Some("PLOW_EMIT_DECODE_FP8_BLOCK"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.prefill_cublaslt", Some("PLOW_EMIT_PREFILL_CUBLASLT"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
     KnobSpec::new("emit.fp8_decode_tc64", Some("PLOW_FP8_DECODE_TC64"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_pf_lt", Some("PLOW_EMIT_MOE_PF_LT"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_MOE_ON, MOE_LT_EMIT_QUALIFIED),
@@ -1609,6 +1612,8 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_BUILD_FA_GQA2_PAIR", Some("PLOW_BUILD_FA_GQA2_PAIR"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FP8KV_FA", Some("PLOW_BUILD_FP8KV_FA"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FP8KV_GEMM", Some("PLOW_BUILD_FP8KV_GEMM"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_FA4_HD512", Some("PLOW_BUILD_FA4_HD512"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_FA4_PY", Some("PLOW_FA4_PY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_GEMM_SMEPI", Some("PLOW_BUILD_GEMM_SMEPI"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FATLITE", Some("PLOW_BUILD_FATLITE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FATLITE_MOE", Some("PLOW_BUILD_FATLITE_MOE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1679,6 +1684,8 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_TR_QUIET", Some("PLOW_TR_QUIET"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TUNE_DUMP", Some("PLOW_TUNE_DUMP"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_UNISEG", Some("PLOW_UNISEG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_VERIFY_BIN", Some("PLOW_VERIFY_BIN"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_VERIFY_DUMP", Some("PLOW_VERIFY_DUMP"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_W4A16", Some("PLOW_W4A16"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_XR_NOSIG", Some("PLOW_XR_NOSIG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_XR_SCHED_AG_U", Some("PLOW_XR_SCHED_AG_U"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1864,6 +1871,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_HAS_DCP_KV_SCATTER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_DENSE_GLU_FP8_BLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_EMBED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_EMBED_FRAME_BF16", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_FLASH_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_FLASH_DECODE_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_FLASH_GATHER_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2372,7 +2380,11 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_ROPE_PF", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_FP8_KV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("def.PLOW_GEN_KV_ILV", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("def.PLOW_CUTLASS_HOST", None, Layer::ObjectDefine, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("def.PLOW_CUTLASS_HOST", None, Layer::ObjectDefine, Domain::Bool, OFF, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_DTYPE", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_HOST", None, Layer::ObjectDefine, Domain::Bool, UNSET, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_H", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
+    KnobSpec::new("def.PLOW_FA4_KVH", None, Layer::ObjectDefine, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("def.PLOW_NV_QUANT_WPR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_QWEN_FOLD_STAGED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_QWEN_GDN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2432,6 +2444,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_PACKET_HASH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_GEMM_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_MOE_ROUTER_GEMMA_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_PACKET_HAS_GLU_PITCHED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_LINEAR_BIAS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_QKV_DOT4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2459,6 +2472,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_SMP_THREADS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SMP_CAND", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SPEECH_OPS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_SPEECH_CONV_POSTS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_STAGE1_MIN_OCC", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_STAGE1_WG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_TB_DEVICE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2864,6 +2878,7 @@ mod tests {
             "crates/packet/src",
             "crates/plowc/src",
             "crates/kernelcaps/src",
+            "crates/lean_verify/src",
         ] {
             files(&root().join(d), Some("rs"), &mut sources);
         }
@@ -2956,11 +2971,16 @@ mod tests {
         );
         for k in OBJECT_DEFINES {
             let name = k.name();
-            assert!(
-                runtime.iter().chain(&crates).any(|(_, t)| t.contains(name)),
-                "{} appears in no runtime or crate source: delete the line",
-                k.id
-            );
+            let used = runtime.iter().chain(&crates).any(|(_, t)| t.contains(name));
+            if k.status == Status::Removed {
+                assert!(!used, "{} is Removed but still used", k.id);
+            } else {
+                assert!(
+                    used,
+                    "{} appears in no runtime or crate source: mark it Removed",
+                    k.id
+                );
+            }
         }
     }
 

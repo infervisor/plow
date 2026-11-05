@@ -1365,6 +1365,22 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             }
         }
     }
+    // A packet without a decode GEMV (a W8A8 block, no lm_head) still writes interleaved KV, so
+    // its objects need the same layout and row-group body.
+    // (The runtime refuses a packet whose objects disagree with its cache writers.)
+    if sm90a
+        && crate::emit_config::active().qwen_kv_interleave
+        && crate::emit_config::active().nv_fa_rg_wide
+        && crate::emit_config::active().gen_kernels.is_some()
+        && !t.contains_key("kv_ilv")
+    {
+        t.insert("fa_rg".into(), json!(1));
+        t.insert("fa_rg_wide".into(), json!(1));
+        if let Some(u) = crate::emit_config::active().nv_fa_rg_u.filter(|&u| u > 0) {
+            t.insert("fa_rg_u".into(), json!(u));
+        }
+        t.insert("kv_ilv".into(), json!(1));
+    }
     // GB202 (sm_120a): a dense hd <= 128 packet walks its B=1 GEMVs on the tensor cores too.
     // Qwen3-ASR rtx-5090 step_bench ctx 512 B=1/8/16/32, PLOW_GEMV_PREFETCH on, token digests
     // unchanged: 1.7B 2.722/3.091/3.469/4.270 -> 2.630/3.091/3.470/4.268 ms; 0.6B
@@ -2659,9 +2675,35 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
     out
 }
 
+/// Opcodes whose interpreter arms compile only under their `PLOW_PACKET_HAS_*` define
+/// (`runtime/nvidia/op_elementwise.cuh` GLU_PITCHED_ARMS): derived from the arm union, so a
+/// program instruction the union misses would build objects without its case.
+const PACKET_GATED_OPS: [DevOp; 1] = [DevOp::GluPitched];
+
+/// The packet-gated opcodes some program instruction uses that `union` (which sets their
+/// `PLOW_PACKET_HAS_*` defines) does not hold.
+fn ungated_packet_ops(m: &Model, union: &BTreeSet<Arm>) -> Vec<DevOp> {
+    PACKET_GATED_OPS
+        .into_iter()
+        .filter(|&op| {
+            m.progs
+                .iter()
+                .any(|p| p.insts.iter().any(|d| d.op == op as u16))
+                && !union.iter().any(|a| a.op == op_name(op))
+        })
+        .collect()
+}
+
 fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: bool) -> Value {
     let progs = program_arms(m);
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
+    // A gated-out case traps at its first launch: refuse the packet here instead.
+    let missing = ungated_packet_ops(m, &union);
+    assert!(
+        missing.is_empty(),
+        "packet programs use {missing:?} but the object arm set does not: its \
+         PLOW_PACKET_HAS_* define would compile the case out"
+    );
     let mut objects = object_inventory(&progs, arch, packed_prefill);
     let kda_intra_wave_items_required = m.progs.iter().any(|p| {
         p.stream.iter().any(|e| {
@@ -3049,6 +3091,47 @@ pub fn speech_ops(model: &packet::devbuild::Model) -> u64 {
         .fold(0, |mask, i| mask | 1 << (i.op - 163))
 }
 
+/// The post activations (flags bits 8..11) of convs that can reach the wide-tile or wgmma
+/// epilogues, bit `post`: `PLOW_SPEECH_CONV_POSTS`.
+pub fn speech_conv_posts(model: &packet::devbuild::Model) -> u64 {
+    model
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|i| {
+            let flags = i.j[1]; // Packed as fj[2], as read by sp_w_conv_width / sp_wg_conv1d.
+            if i.op == DevOp::Conv1dF32 as u16 {
+                flags & ((1 << 14) | (1 << 17)) != 0
+            } else {
+                // ConvT only reaches wgmma with both flags and post 0 (spg_ct_eligible).
+                i.op == DevOp::ConvTranspose1dF32 as u16
+                    && (flags >> 17) & 3 == 3
+                    && (flags >> 8) & 15 == 0
+            }
+        })
+        .fold(0, |mask, i| mask | 1 << ((i.j[1] >> 8) & 15))
+}
+
+/// The speech object's arm masks, accumulated together so every sidecar path feeds both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeechMasks {
+    pub ops: u64,
+    pub conv_posts: u64,
+}
+
+impl SpeechMasks {
+    pub fn of(model: &packet::devbuild::Model) -> Self {
+        Self {
+            ops: speech_ops(model),
+            conv_posts: speech_conv_posts(model),
+        }
+    }
+    pub fn add(&mut self, other: Self) {
+        self.ops |= other.ops;
+        self.conv_posts |= other.conv_posts;
+    }
+}
+
 /// Generate the header a specialised object compiles against.
 ///
 /// Two halves, and both matter:
@@ -3094,6 +3177,11 @@ pub fn config_header(manifest: &Value) -> String {
         out.push_str(&format!(
             "/* FP32 speech ops of the sidecar packets: the speech object's arm set. */\n\
              #ifndef PLOW_SPEECH_OPS\n#define PLOW_SPEECH_OPS 0x{mask:x}ull\n#endif\n\n"
+        ));
+    }
+    if let Some(mask) = manifest.get("speech_conv_posts").and_then(Value::as_u64) {
+        out.push_str(&format!(
+            "#ifndef PLOW_SPEECH_CONV_POSTS\n#define PLOW_SPEECH_CONV_POSTS 0x{mask:x}ull\n#endif\n\n"
         ));
     }
 
@@ -3799,6 +3887,49 @@ mod tests {
         assert!(cases["performance_evidence"].is_null());
     }
 
+    #[test]
+    fn glu_pitched_compiles_only_for_a_packet_that_emits_it() {
+        let plain = config_header(&build(&model(), "sm_90a"));
+        assert!(plain.contains("#define PLOW_PACKET_HAS_GLU_PITCHED 0\n"));
+        let mut m = model();
+        m.progs[1]
+            .insts
+            .push(inst(DevOp::GluPitched, [64, 0, 32, 64, 32, 0, 0, 0]));
+        let pitched = config_header(&build(&m, "sm_90a"));
+        assert!(pitched.contains("#define PLOW_PACKET_HAS_GLU_PITCHED 1\n"));
+    }
+
+    #[test]
+    fn a_gated_op_the_object_arm_set_misses_is_refused() {
+        let mut m = model();
+        m.progs[1].insts.push(inst(DevOp::GluPitched, [0; 8]));
+        assert_eq!(
+            ungated_packet_ops(&m, &BTreeSet::new()),
+            vec![DevOp::GluPitched]
+        );
+        let union: BTreeSet<Arm> = program_arms(&m)
+            .iter()
+            .flat_map(|p| p.arms.iter().cloned())
+            .collect();
+        assert!(ungated_packet_ops(&m, &union).is_empty());
+        assert!(ungated_packet_ops(&model(), &BTreeSet::new()).is_empty());
+
+        // Segmented: the GQ stream covers segment 0 only, so its arm set misses the GluPitched
+        // instruction (a light-segment-only op) and the build refuses the packet.
+        let mut m = model();
+        let p = &mut m.progs[1];
+        p.insts = vec![inst(DevOp::Gemv, [0; 8]), inst(DevOp::GluPitched, [0; 8])];
+        let ent = |inst: u32, seg: u16| packet::dev::StreamEnt {
+            inst,
+            seg,
+            ..Default::default()
+        };
+        p.stream = vec![ent(0, 0), ent(1, 1)];
+        p.gq_stream = vec![ent(0, 0)];
+        p.gq_seg_ofs = vec![0, 1, 1];
+        assert!(std::panic::catch_unwind(|| build(&m, "sm_90a")).is_err());
+    }
+
     /// The manifest must reflect the STREAM. An op nothing emitted must not
     /// appear just because the emitter could have emitted it.
     #[test]
@@ -3877,6 +4008,59 @@ mod tests {
             "#ifndef PLOW_SPEECH_OPS\n#define PLOW_SPEECH_OPS 0x{mask:x}ull\n#endif\n"
         )));
         assert!(!config_header(&plain).contains("PLOW_SPEECH_OPS"));
+    }
+
+    #[test]
+    fn speech_conv_posts_select_epilogues_without_moving_the_pairing_hash() {
+        let conv = |op, post: u32, flags: u32| {
+            let mut i = inst(op, [0; 8]);
+            i.j = [u32::MAX, flags | (post << 8)];
+            assert_eq!(i.pack().fj[2], i.j[1]);
+            assert_eq!((i.pack().fj[2] >> 8) & 15, post);
+            i
+        };
+        let mut sidecar = model();
+        assert_eq!(speech_conv_posts(&sidecar), 0);
+        for (op, post, flags, expected) in [
+            (DevOp::Conv1dF32, 9, 0, 0),
+            (DevOp::Conv1dF32, 9, 1 << 13, 0),
+            (DevOp::Conv1dF32, 9, 1 << 14, 1 << 9),
+            (DevOp::Conv1dF32, 11, 1 << 17, 1 << 11),
+            (DevOp::ConvTranspose1dF32, 0, 0, 0),
+            (DevOp::ConvTranspose1dF32, 0, 1 << 14, 0),
+            (DevOp::ConvTranspose1dF32, 0, 1 << 17, 0),
+            (DevOp::ConvTranspose1dF32, 0, 1 << 18, 0),
+            (DevOp::ConvTranspose1dF32, 0, 3 << 17, 1),
+            (DevOp::ConvTranspose1dF32, 11, 3 << 17, 0),
+            (DevOp::UnaryF32, 5, (1 << 14) | (1 << 17), 0),
+        ] {
+            sidecar.progs = vec![prog(vec![conv(op, post, flags)])];
+            assert_eq!(speech_conv_posts(&sidecar), expected);
+        }
+        sidecar.progs = vec![
+            prog(vec![
+                conv(DevOp::Conv1dF32, 9, 1 << 14),
+                conv(DevOp::Conv1dF32, 9, 1 << 17),
+                conv(DevOp::Conv1dF32, 11, 1 << 17),
+                conv(DevOp::Conv1dF32, 15, 0),
+            ]),
+            prog(vec![
+                conv(DevOp::ConvTranspose1dF32, 0, 3 << 17),
+                conv(DevOp::ConvTranspose1dF32, 15, 3 << 17),
+            ]),
+        ];
+        let mask = speech_conv_posts(&sidecar);
+        assert_eq!(mask, 1 | 1 << 9 | 1 << 11);
+        let plain = build(&model(), "sm_90a");
+        let mut man = plain.clone();
+        man["speech_conv_posts"] = mask.into();
+        assert_eq!(pairing_hash(&man), pairing_hash(&plain));
+        assert!(config_header(&man).contains(&format!(
+            "#ifndef PLOW_SPEECH_CONV_POSTS\n#define PLOW_SPEECH_CONV_POSTS 0x{mask:x}ull\n#endif\n"
+        )));
+        assert!(!config_header(&plain).contains("PLOW_SPEECH_CONV_POSTS"));
+        man["speech_conv_posts"] = 0.into();
+        assert!(config_header(&man).contains("#define PLOW_SPEECH_CONV_POSTS 0x0ull\n"));
     }
 
     /// The opt-in lean MoE body variants are object requests carried by the config header;

@@ -55,6 +55,7 @@ mod block;
 mod gemma4_gemm_glu_role;
 mod gemma4_w8a8_gemm_glu_role;
 mod gen_kernels;
+mod library_attention;
 mod serve_section;
 mod w8a16_prefill_role;
 use block::{parse_block, write_block_descriptor};
@@ -74,6 +75,7 @@ mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
+mod abi_section;
 pub mod asr;
 pub mod asr_subsampling;
 pub mod codec;
@@ -2176,6 +2178,9 @@ fn declare(
     merge_fold: bool,
 ) -> Tn {
     let affine_q4 = emit_config::active().affine_q4;
+    // A block packet has no token entry: the per-layer-input prologue (and its whole-model
+    // tables) is dropped, the in-block layers read `act.ple` as an input.
+    let partial = block != (0..c.layers as usize);
     if affine_q4 {
         assert!(
             c.hidden % 64 == 0 && c.inter % 64 == 0 && (c.heads * c.hd_full) % 64 == 0,
@@ -2467,7 +2472,7 @@ fn declare(
         } else {
             TENSOR_NONE
         },
-        ple_tab: if c.ple > 0 {
+        ple_tab: if c.ple > 0 && !partial {
             b.tensor(
                 &format!("{}embed_tokens_per_layer.weight", c.prefix),
                 (c.vocab as u64) * (c.layers * c.ple) as u64 * BF16,
@@ -2475,7 +2480,7 @@ fn declare(
         } else {
             TENSOR_NONE
         },
-        ple_proj: if c.ple > 0 {
+        ple_proj: if c.ple > 0 && !partial {
             b.tensor(
                 &format!("{}per_layer_model_projection.weight", c.prefix),
                 (c.layers * c.ple) as u64 * c.hidden as u64 * BF16,
@@ -2483,7 +2488,7 @@ fn declare(
         } else {
             TENSOR_NONE
         },
-        ple_norm: if c.ple > 0 {
+        ple_norm: if c.ple > 0 && !partial {
             b.tensor(
                 &format!("{}per_layer_projection_norm.weight", c.prefix),
                 c.ple as u64 * BF16,
@@ -4501,12 +4506,19 @@ fn emit_phase(
     // the RMSNorm that follows is scale-invariant); ple = (RMSNorm_P(ple_pp) * gamma + ple_raw) / sqrt(2).
     // Every layer's block then reads its P-column slice of `ple`. Emitted before the hetero
     // join so the CPU lane's rows see it.
-    assert!(
-        !(block_mode && (c.ple > 0 || c.kv_shared > 0)),
-        "block mode uploads act.x only: a per-layer-input or KV-shared model has no per-layer inputs \
-         or source caches inside one block"
-    );
-    let c_ple = if c.ple > 0 {
+    // Block mode uploads act.x only: the per-layer-input prologue needs token ids and the
+    // whole-model tables, so the block's layers read `act.ple` as an input (timing only).
+    if block_mode {
+        for l in block.clone().filter(|&l| c.kv_is_shared(l)) {
+            assert!(
+                block.contains(&c.kv_source(l)),
+                "block {block:?}: KV-shared layer {l} reads layer {}'s cache; start the block at or \
+                 before it",
+                c.kv_source(l)
+            );
+        }
+    }
+    let (c_ple, c_pp) = if c.ple > 0 && !block_mode {
         let lp = c.layers * c.ple;
         let c_pe = b.emit(DevOp::Embed, rows.clone(), &[], |d| {
             d.t[0] = n.ple_raw;
@@ -4546,15 +4558,16 @@ fn emit_phase(
                 d.f[0] = c.eps;
             },
         );
-        b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
+        let c_ple = b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
             d.t[0] = n.ple;
             d.t[1] = n.ple;
             d.t[2] = n.ple_raw;
             d.i[0] = t * lp;
             d.f[0] = std::f32::consts::FRAC_1_SQRT_2;
-        })
+        });
+        (c_ple, Some(c_pp))
     } else {
-        0
+        (0, None)
     };
     if hj {
         b.host_join();
@@ -4993,7 +5006,7 @@ fn emit_phase(
         });
     // First layer of the trailing KV-shared run: a prefill program marks where its row-local
     // tail begins (plow_asset::kv_shared_tail).
-    let shared_tail_start = (!block_mode && !hj && tp == 1 && block.end == c.layers as usize)
+    let shared_tail_start = (!hj && tp == 1 && block.end == c.layers as usize)
         .then(|| {
             (0..c.layers as usize)
                 .rev()
@@ -5376,8 +5389,12 @@ fn emit_phase(
             // The block's FIRST layer reads the uploaded `act.x` with no producer
             // (Embed was skipped), so its RmsNorm depends on `&[]`. Full model =>
             // block.start==0 and this only affects l==0, whose dep IS the Embed.
+            // Layer 0 overwrites `act.x` after the per-layer projection read it.
+            let first_x = [dep, c_pp.unwrap_or(dep)];
             let nd: &[u32] = if block_mode && l == block.start {
                 &[]
+            } else if l == 0 && c_pp.is_some() {
+                &first_x
             } else {
                 &[dep]
             };
@@ -8270,7 +8287,7 @@ pub(crate) fn write_lean_receipts(packet: &std::path::Path, lean: &LeanReport) {
         checks: lean.compile_checks.clone(),
     };
     receipts
-        .validate_packet(&bytes)
+        .validate_packet(&plow_asset::decode_objects::image_sha256(&bytes))
         .expect("compiler check receipt binding");
     let path = packet.with_file_name(PACKET_CHECKS_FILE);
     std::fs::write(
@@ -8384,6 +8401,7 @@ pub fn write_sidecar_packet(
         }
     };
     let mut sections = sections.to_vec();
+    abi_section::append(model, &mut sections, "", "");
     if checkpoint::header_only_used() {
         sections.push(plow_asset::structure_only::section());
     }
@@ -8404,7 +8422,7 @@ pub fn write_sidecar_packet(
         program_checks,
     };
     receipts
-        .validate_packet(&blob)
+        .validate_packet(&plow_asset::decode_objects::image_sha256(&blob))
         .expect("sidecar check receipt binding");
     std::fs::write(
         &checks_path,
@@ -10144,9 +10162,10 @@ fn dsv41_refusal(dir: &std::path::Path) -> String {
     }
 
     out.push_str(
-        " The runtime side is most of the way there -- mHC, the DSA indexer, the MXFP4 experts, \
-         the clamped SwiGLU dispatch today. The CSA2 (ops 212/213) and Engram (ops 214/215) \
-         device functions exist but have no interp.hip arm on AMD. What the EMITTER still needs:",
+        " The runtime side is partly there -- mHC, the DSA indexer, the MXFP4 experts, the \
+         clamped SwiGLU and the CSA2 output de-rotation (op 213) dispatch today; the CSA2 \
+         compressor (ops 212/217) and Engram (ops 214/215) exist only as kernels \
+         (op_compress.h, op_engram.h) with no interpreter case yet. What the EMITTER still needs:",
     );
     for (i, gap) in mla::dsv41_gaps(&cfg).iter().enumerate() {
         out.push_str(&format!(" ({}) {gap};", i + 1));
@@ -11391,9 +11410,35 @@ fn emit_dense_gqa(
         let full = c.is_full[l0];
         let head_dim = if full { c.hd_full } else { c.hd_slide };
         let kv_heads = if full { c.kvh_full } else { c.kvh_slide };
-        let kv_tensors: Vec<String> = block
-            .clone()
+        let mut sources: Vec<usize> = block.clone().map(|l| c.kv_source(l)).collect();
+        sources.sort_unstable();
+        sources.dedup();
+        let kv_tensors: Vec<String> = sources
+            .iter()
             .flat_map(|l| [format!("kv.{l}.k"), format!("kv.{l}.v")])
+            .collect();
+        let kind: Vec<String> = block
+            .clone()
+            .flat_map(|l| {
+                let attn = if c.is_full[l] {
+                    "full_attn"
+                } else {
+                    "sliding_attn"
+                };
+                let attn = if c.kv_is_shared(l) {
+                    format!("{attn}_kv_shared")
+                } else {
+                    attn.into()
+                };
+                [
+                    attn,
+                    if c.moe {
+                        "moe_ffn".into()
+                    } else {
+                        "dense_ffn".into()
+                    },
+                ]
+            })
             .collect();
         let hidden = c.hidden as i64;
         let ckpt = dir
@@ -11406,7 +11451,7 @@ fn emit_dense_gqa(
             model: ckpt.clone(),
             arch: "gemma_dense".into(),
             layer: l0 as u32,
-            kind: vec!["dense_attn".into(), "dense_ffn".into()],
+            kind,
             hidden,
             dtype: if fp8 { "fp8".into() } else { "bf16".into() },
             dims: BlockDims {
@@ -11502,17 +11547,17 @@ fn emit_dense_gqa(
         sections.extend(fish_depth::sections(&c, &emitter.tn, t, &m, &rungs));
     }
     // Speech ops of auxiliary programs (not in `m.progs`), for the speech object's arm mask.
-    let mut aux_speech_ops = 0u64;
+    let mut aux_speech = manifest::SpeechMasks::default();
     if c.frame
         .as_ref()
         .and_then(|f| f.depth.as_ref())
         .is_some_and(|d| d.maya2.is_some())
     {
         let n = &emitter.tn;
-        let (depth, ops) =
+        let (depth, speech) =
             maya2_depth::lm_sections(&mut m, &c, n.hn, n.frame_dcodes, n.frame_codes, &rungs);
         sections.extend(depth);
-        aux_speech_ops |= ops;
+        aux_speech.add(speech);
     }
     if let Some(t) = &emitter.tn.mtp {
         sections.extend(mtp::sections(&dir, &c, &emitter.tn, t, &m, &rung_progs));
@@ -11729,6 +11774,13 @@ fn emit_dense_gqa(
         .unwrap_or_else(|error| panic!("Gemma-4 W8A8 GemmGlu object: {error}"));
         eprintln!("  Gemma-4 W8A8 GemmGlu: {selected} lean segments");
     }
+    // Last: the declared library segments keep whatever native role the passes above chose.
+    let selected =
+        library_attention::apply_output_object(&m, &mut sections, std::path::Path::new(&out))
+            .unwrap_or_else(|error| panic!("library attention: {error}"));
+    if selected > 0 {
+        eprintln!("  library prefill attention: {selected} segments");
+    }
     if let Some(live_position) = sections
         .iter()
         .position(|section| section.name == plow_asset::live_kv::SECTION)
@@ -11785,6 +11837,7 @@ fn emit_dense_gqa(
     modular::update_section_with_lean(&mut sections, &lean);
     object_requirements::append(&m, &mut sections)
         .unwrap_or_else(|error| panic!("object requirements: {error}"));
+    abi_section::append(&m, &mut sections, &arch, &gpu);
     if checkpoint::header_only_dir(&dir) || checkpoint::header_only_used() {
         eprintln!("  structure-only packet: compiled from header-only checkpoints (zero weights)");
         sections.push(plow_asset::structure_only::section());
@@ -11887,7 +11940,7 @@ fn emit_dense_gqa(
                 (encoder.prefix.model, section)
             });
     std::fs::write(&out, blob).unwrap();
-    let mut speech_ops = aux_speech_ops;
+    let mut speech = aux_speech;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
         let fish = std::fs::read(dir.join("config.json"))
@@ -11912,7 +11965,7 @@ fn emit_dense_gqa(
         }
         .unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(tts::CODEC_PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
         let enc = dir.join("encoder");
@@ -11928,7 +11981,7 @@ fn emit_dense_gqa(
             }
             .unwrap_or_else(|error| panic!("reference encoder packet: {error}"));
             let path = std::path::Path::new(&out).with_file_name(mimi_encoder::PACKET);
-            speech_ops |= manifest::speech_ops(&model);
+            speech.add(manifest::SpeechMasks::of(&model));
             write_sidecar_packet(&path, &model, &[section]);
             eprintln!("  reference encoder packet -> {}", path.display());
         }
@@ -11938,7 +11991,7 @@ fn emit_dense_gqa(
         let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16)
             .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
         let voice = dir.join("voice");
@@ -11946,7 +11999,7 @@ fn emit_dense_gqa(
             let (model, section) = voice_cond::lower_voice_cond(&voice, n_cu, m.target)
                 .unwrap_or_else(|error| panic!("voice conditioning packet: {error}"));
             let path = std::path::Path::new(&out).with_file_name(voice_cond::PACKET);
-            speech_ops |= manifest::speech_ops(&model);
+            speech.add(manifest::SpeechMasks::of(&model));
             write_sidecar_packet(&path, &model, &[section]);
             eprintln!("  voice conditioning packet -> {}", path.display());
         }
@@ -11970,14 +12023,14 @@ fn emit_dense_gqa(
         for (file, sidecar) in lowered.into_iter().flatten() {
             let sidecar = sidecar.unwrap_or_else(|e| panic!("multimodal {file}: {e}"));
             let path = std::path::Path::new(&out).with_file_name(file);
-            speech_ops |= manifest::speech_ops(&sidecar.model);
+            speech.add(manifest::SpeechMasks::of(&sidecar.model));
             write_sidecar_packet(&path, &sidecar.model, &[sidecar.section]);
             eprintln!("  multimodal encoder packet -> {}", path.display());
         }
     }
     if let Some((model, section)) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name(asr::qwen::ENCODER_PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  audio encoder packet -> {}", path.display());
     }
@@ -12000,8 +12053,9 @@ fn emit_dense_gqa(
     if !arch.is_empty() {
         write_lean_receipts(std::path::Path::new(&out), &lean);
         let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
-        if speech_ops != 0 {
-            man["speech_ops"] = speech_ops.into();
+        if speech.ops != 0 {
+            man["speech_ops"] = speech.ops.into();
+            man["speech_conv_posts"] = speech.conv_posts.into();
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes

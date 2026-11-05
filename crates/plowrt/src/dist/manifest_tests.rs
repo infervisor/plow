@@ -669,6 +669,37 @@ fn a_mismatched_packet_stamp_is_refused_at_pack_time() {
     assert!(e.contains("records no pairing hash"), "{e}");
 }
 
+/// A build that plans BF16 cuBLASLt shapes ships the table that pins them, whatever the recipe's
+/// serve env says: an unpinned plan is re-timed at every load and its numerics re-roll.
+#[test]
+fn a_build_with_bf16_lt_shapes_needs_its_algorithm_table() {
+    let dir = speech_assets("lt-table");
+    let objset = objset_for(&dir);
+    std::fs::write(
+        dir.join("build.json"),
+        br#"{"pairing":{"hash":"0x541009da5f9890c1"},
+             "cublaslt":{"shapes":[{"phase":"prefill","rows":256,"m":256,"n":1024,"k":4096,"dtype":"bf16"}]}}"#,
+    )
+    .unwrap();
+    assert!(veena().required.is_empty());
+    build_bundle(&dir, &veena(), Some(&objset), &BundleArgs::default()).unwrap();
+
+    std::fs::remove_file(dir.join("cublaslt_algos.jsonl")).unwrap();
+    let e = build_bundle(&dir, &veena(), Some(&objset), &BundleArgs::default())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("plans 1 BF16 cuBLASLt shape(s)"), "{e}");
+
+    // FP8 plans take the heuristic algorithm, not a timed one: no table needed.
+    std::fs::write(
+        dir.join("build.json"),
+        br#"{"pairing":{"hash":"0x541009da5f9890c1"},
+             "cublaslt":{"shapes":[{"phase":"prefill","rows":256,"m":256,"n":1024,"k":4096,"dtype":"e4m3"}]}}"#,
+    )
+    .unwrap();
+    build_bundle(&dir, &veena(), Some(&objset), &BundleArgs::default()).unwrap();
+}
+
 #[test]
 fn a_directory_without_a_packet_is_not_an_asset_directory() {
     let dir = speech_assets("nopacket");
@@ -837,10 +868,6 @@ fn an_override_reproduces_a_manifest_whose_recipe_moved() {
 fn a_recipe_missing_an_identity_field_is_refused_by_name() {
     let dir = tmp("missing");
     for (drop, want) in [
-        (
-            "toolchain = \"cuda-13.4+gcc-13\"\n",
-            "[target] has no `toolchain`",
-        ),
         ("max_ctx = 2048\n", "declares `max_ctx`"),
         (
             "source = \"hf:maya-research/Veena\"\n",
@@ -1011,7 +1038,10 @@ fn a_target_that_ships_objects_needs_them_somewhere() {
     )
     .unwrap_err()
     .to_string();
-    assert!(e.contains("no *.elf, *.cubin or *.co found"), "{e}");
+    assert!(
+        e.contains("no *.cubin, *.aot or objects/ objects found"),
+        "{e}"
+    );
 }
 
 /// The GDN prefill library is loaded from beside the packet, so it travels
@@ -1022,9 +1052,37 @@ fn the_gdn_prefill_library_has_a_role_and_other_shared_objects_do_not() {
     assert_eq!(classify("libsomething.so"), None);
 }
 
+/// A CUDA recipe may omit `toolchain`: the cubins are pinned by content, and
+/// the recipe's toolchain is recorded only when it names one.
+#[test]
+fn a_cuda_recipe_needs_no_toolchain() {
+    let p = write_recipe(
+        &tmp("cuda-no-toolchain"),
+        &MINIMAL.replace("toolchain = \"cuda-13.4+gcc-13\"\n", ""),
+    );
+    let id = read_recipe(&p, Overrides::default()).unwrap();
+    assert_eq!(id.toolchain, "");
+}
+
+/// An AMD code object is tied to the ROCm toolchain that built it, so an AMD
+/// recipe without `toolchain` is still refused.
+#[test]
+fn an_amd_recipe_without_a_toolchain_is_refused() {
+    let p = write_recipe(
+        &tmp("amd-no-toolchain"),
+        &MINIMAL
+            .replace("vendor = \"nvidia\"", "vendor = \"amd\"")
+            .replace("isa = \"sm_90a\"", "isa = \"gfx942\"")
+            .replace("toolchain = \"cuda-13.4+gcc-13\"\n", ""),
+    );
+    let e = read_recipe(&p, Overrides::default())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("[target] has no `toolchain`"), "{e}");
+}
+
 /// Nothing records a compiler for a runtime-compiled target, so its recipe
-/// may omit `toolchain`; a CUDA recipe without one is still refused (see
-/// `a_recipe_missing_an_identity_field_is_refused_by_name`).
+/// may omit `toolchain`.
 #[test]
 fn a_runtime_compiled_recipe_needs_no_toolchain() {
     let assets = speech_assets("apple-no-toolchain");
@@ -1303,4 +1361,338 @@ fn a_sidecar_packet_and_its_receipts_are_bundled_by_suffix() {
     );
     assert_eq!(super::classify("lean-checks.json"), Some("packet_checks"));
     assert_eq!(super::classify("notes.txt"), None);
+}
+
+// --- NVIDIA: the served tree ---------------------------------------------------
+
+/// A FA4-style library object and its declaring packet: a v6 blob whose `segment_roles` names
+/// `plow_fa4_hd512.aot` (pinned by digest) and a generated cubin, the way an emit declares them.
+pub(crate) const AOT: &[u8] = b"PLOWAOT1-fa4-hd512";
+
+pub(crate) fn declaring_packet(aot_sha: &str) -> Vec<u8> {
+    let roles = serde_json::json!({
+        "version": 1,
+        "objects": {
+            "26": {"abi": "lib_flash_prefill_v2:fa4:hd=512", "file": "plow_fa4_hd512.aot",
+                   "sha256": aot_sha},
+            "40": {"abi": "gen", "file": "gen_sm90a_attn_pf_hd256_sliding.cubin"}
+        },
+        "programs": []
+    });
+    let sections = vec![packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: plow_asset::segment_roles::SECTION.into(),
+        data: serde_json::to_vec(&roles).unwrap(),
+    }];
+    packet::devbuild::Model {
+        n_cu: 132,
+        target: 0,
+        tensors: Vec::new(),
+        progs: Vec::new(),
+        kv_row_insts: Vec::new(),
+        prog_t: Vec::new(),
+        gen: Vec::new(),
+    }
+    .to_blob_v6(&sections)
+}
+
+/// An NVIDIA asset directory as a campaign build leaves it: the interpreter, generated and
+/// sampler cubins and the library object beside the packet, the segment objects under
+/// `objects/` — one of them under a name the top level also has, with other bytes.
+pub(crate) fn served_tree(dir: &Path) {
+    std::fs::create_dir_all(dir.join("objects")).unwrap();
+    let pkt = declaring_packet(&sha256_bytes(AOT));
+    for (file, body) in [
+        ("model.pkt", pkt.as_slice()),
+        ("plow_config.h", b"#define X 1".as_slice()),
+        ("weights.json", br#"{"network":"veena"}"#.as_slice()),
+        (
+            "build.json",
+            br#"{"pairing":{"hash":"0x541009da5f9890c1"},"features":{}}"#.as_slice(),
+        ),
+        ("interp_sm90a.cubin", b"ELF-decode"),
+        ("interp_sm90a_pfseg.cubin", b"ELF-role-emit-pfseg"),
+        ("gen_sm90a_attn_pf_hd256_sliding.cubin", b"ELF-gen"),
+        ("sample_sm120.cubin", b"ELF-sampler"),
+        ("plow_fa4_hd512.aot", AOT),
+        ("objects/interp_sm90a_pfseg.cubin", b"ELF-segment-pfseg"),
+        ("objects/attn_softmax_sm90a.cubin", b"ELF-softmax"),
+        ("objects/plow_fa4_hd512.aot", AOT),
+    ] {
+        std::fs::write(dir.join(file), body).unwrap();
+    }
+}
+
+fn names(o: &ObjSet) -> Vec<&str> {
+    o.objects.iter().map(|o| o.name.as_str()).collect()
+}
+
+#[test]
+fn nvidia_ships_the_tree_serving_reads() {
+    let assets = tmp("served");
+    served_tree(&assets);
+    let p = write_recipe(&tmp("served-recipe"), MINIMAL);
+    let g = generate(
+        &p,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
+    let (objset, _) = g.objset.as_ref().unwrap();
+    objset.validate().unwrap();
+    assert_eq!(
+        names(objset),
+        [
+            "gen_sm90a_attn_pf_hd256_sliding.cubin",
+            "interp_sm90a.cubin",
+            "interp_sm90a_pfseg.cubin",
+            "sample_sm120.cubin",
+            "plow_fa4_hd512.aot",
+            "objects/attn_softmax_sm90a.cubin",
+            "objects/interp_sm90a_pfseg.cubin",
+            "objects/plow_fa4_hd512.aot",
+        ]
+    );
+    // The two `interp_sm90a_pfseg.cubin` are two builds; each ships with its own bytes.
+    let digest = |n: &str| {
+        objset
+            .objects
+            .iter()
+            .find(|o| o.name == n)
+            .unwrap()
+            .sha256
+            .clone()
+    };
+    assert_eq!(
+        digest("interp_sm90a_pfseg.cubin"),
+        sha256_bytes(b"ELF-role-emit-pfseg")
+    );
+    assert_eq!(
+        digest("objects/interp_sm90a_pfseg.cubin"),
+        sha256_bytes(b"ELF-segment-pfseg")
+    );
+    assert_eq!(g.objects_root.as_deref(), Some(assets.as_path()));
+    // The library object is an object, not an unclaimed bundle file.
+    assert!(!g.bundle.files.iter().any(|f| f.name.ends_with(".aot")));
+}
+
+#[test]
+fn a_tree_without_library_or_segment_objects_keeps_its_objset_id() {
+    let assets = speech_assets("served-plain");
+    std::fs::write(assets.join("interp_sm90a.cubin"), b"ELF-cubin").unwrap();
+    assert_eq!(
+        served_objects(&assets).unwrap(),
+        discover_objects(&assets, &Refuse).unwrap()
+    );
+}
+
+#[test]
+fn an_object_the_packet_loads_by_name_must_ship_with_its_declared_bytes() {
+    let p = write_recipe(&tmp("declared-recipe"), MINIMAL);
+    let gen = |assets: &Path| {
+        generate(
+            &p,
+            assets,
+            None,
+            Overrides::default(),
+            &BundleArgs::default(),
+        )
+        .unwrap_err()
+        .to_string()
+    };
+
+    let missing = tmp("declared-missing");
+    served_tree(&missing);
+    std::fs::remove_file(missing.join("plow_fa4_hd512.aot")).unwrap();
+    let e = gen(&missing);
+    assert!(
+        e.contains("plow_fa4_hd512.aot is not in the asset directory"),
+        "{e}"
+    );
+
+    let other = tmp("declared-other");
+    served_tree(&other);
+    std::fs::write(other.join("plow_fa4_hd512.aot"), b"PLOWAOT1-rebuilt").unwrap();
+    let e = gen(&other);
+    assert!(e.contains("plow_fa4_hd512.aot hashes to"), "{e}");
+
+    let gen_gone = tmp("declared-gen");
+    served_tree(&gen_gone);
+    std::fs::remove_file(gen_gone.join("gen_sm90a_attn_pf_hd256_sliding.cubin")).unwrap();
+    let e = gen(&gen_gone);
+    assert!(
+        e.contains("gen_sm90a_attn_pf_hd256_sliding.cubin is not in"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_named_object_directory_must_be_the_segment_set_serving_reads() {
+    let assets = tmp("named");
+    served_tree(&assets);
+    let p = write_recipe(&tmp("named-recipe"), MINIMAL);
+    let gen = |named: &Path| {
+        generate(
+            &p,
+            &assets,
+            Some(named),
+            Overrides::default(),
+            &BundleArgs::default(),
+        )
+    };
+    let base = gen(&assets).unwrap().objset.unwrap().0;
+    // The asset directory itself, its `objects/`, or a byte-identical copy of it: one objset.
+    assert_eq!(
+        gen(&assets.join("objects")).unwrap().objset.unwrap().0,
+        base
+    );
+    let copy = tmp("named-copy");
+    for f in [
+        "interp_sm90a_pfseg.cubin",
+        "attn_softmax_sm90a.cubin",
+        "plow_fa4_hd512.aot",
+    ] {
+        std::fs::copy(assets.join("objects").join(f), copy.join(f)).unwrap();
+    }
+    std::fs::write(copy.join("build.log"), b"not an object").unwrap();
+    assert_eq!(gen(&copy).unwrap().objset.unwrap().0.objects, base.objects);
+
+    std::fs::write(copy.join("interp_sm90a_pfseg.cubin"), b"ELF-another-build").unwrap();
+    let e = gen(&copy).unwrap_err().to_string();
+    assert!(e.contains("interp_sm90a_pfseg.cubin differs from"), "{e}");
+
+    let short = tmp("named-short");
+    std::fs::copy(
+        assets.join("objects/attn_softmax_sm90a.cubin"),
+        short.join("attn_softmax_sm90a.cubin"),
+    )
+    .unwrap();
+    let e = gen(&short).unwrap_err().to_string();
+    assert!(e.contains("interp_sm90a_pfseg.cubin is served from"), "{e}");
+}
+
+#[test]
+fn a_gdn_prefill_program_needs_the_gdn_library_beside_it() {
+    let mut b = packet::devbuild::Builder::new(1);
+    b.emit(packet::dev::DevOp::QwenGdnPrefill, vec![0], &[], |_| {});
+    let p = b.finish();
+    let model = packet::devbuild::Model {
+        n_cu: 1,
+        target: 0,
+        tensors: p.tensors.clone(),
+        progs: vec![p],
+        kv_row_insts: Vec::new(),
+        prog_t: vec![1],
+        gen: Vec::new(),
+    };
+    let assets = tmp("gdn");
+    served_tree(&assets);
+    std::fs::write(assets.join("model.pkt"), model.to_blob_v6(&[])).unwrap();
+    assert_eq!(
+        declared_objects(&assets.join("model.pkt")).unwrap(),
+        [(GDN_PREFILL_OBJECT.to_string(), None)]
+    );
+    let r = write_recipe(&tmp("gdn-recipe"), MINIMAL);
+    let gen = || {
+        generate(
+            &r,
+            &assets,
+            None,
+            Overrides::default(),
+            &BundleArgs::default(),
+        )
+    };
+    let e = gen().unwrap_err().to_string();
+    assert!(
+        e.contains("plow_gdn_prefill.aot is not in the asset directory"),
+        "{e}"
+    );
+    std::fs::write(assets.join(GDN_PREFILL_OBJECT), b"PLOWAOT1-gdn").unwrap();
+    let g = gen().unwrap();
+    assert!(names(&g.objset.unwrap().0).contains(&GDN_PREFILL_OBJECT));
+}
+
+/// A packet that embeds its interpreters ships only its library and segment objects.
+#[test]
+fn an_embedded_interpreter_build_packs_its_other_objects() {
+    let assets = tmp("embedded");
+    served_tree(&assets);
+    for f in [
+        "interp_sm90a.cubin",
+        "interp_sm90a_pfseg.cubin",
+        "gen_sm90a_attn_pf_hd256_sliding.cubin",
+        "sample_sm120.cubin",
+    ] {
+        std::fs::remove_file(assets.join(f)).unwrap();
+    }
+    std::fs::write(
+        assets.join("model.pkt"),
+        declaring_packet(&sha256_bytes(AOT)).as_slice(),
+    )
+    .unwrap();
+    // The generated role the fixture packet declares is gone with it; declare the library only.
+    let only_aot = {
+        let roles = serde_json::json!({"version": 1, "objects": {"26": {"abi": "x",
+            "file": "plow_fa4_hd512.aot", "sha256": sha256_bytes(AOT)}}, "programs": []});
+        packet::devbuild::Model {
+            n_cu: 132,
+            target: 0,
+            tensors: Vec::new(),
+            progs: Vec::new(),
+            kv_row_insts: Vec::new(),
+            prog_t: Vec::new(),
+            gen: Vec::new(),
+        }
+        .to_blob_v6(&[packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::segment_roles::SECTION.into(),
+            data: serde_json::to_vec(&roles).unwrap(),
+        }])
+    };
+    std::fs::write(assets.join("model.pkt"), only_aot).unwrap();
+    let r = write_recipe(&tmp("embedded-recipe"), MINIMAL);
+    let g = generate(
+        &r,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        names(&g.objset.unwrap().0),
+        [
+            "plow_fa4_hd512.aot",
+            "objects/attn_softmax_sm90a.cubin",
+            "objects/interp_sm90a_pfseg.cubin",
+            "objects/plow_fa4_hd512.aot",
+        ]
+    );
+}
+
+/// A v1 reader lays objects under `hsaco/`, where NVIDIA serving never looks: an NVIDIA bundle
+/// is written as v2 so that reader refuses it, and a v1 NVIDIA bundle still reads.
+#[test]
+fn an_nvidia_bundle_is_one_a_hsaco_layout_reader_refuses() {
+    let assets = tmp("schema");
+    served_tree(&assets);
+    let r = write_recipe(&tmp("schema-recipe"), MINIMAL);
+    let g = generate(
+        &r,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
+    assert_eq!(g.bundle.schema, plow_asset::dist::BUNDLE_SCHEMA_NVIDIA_TREE);
+    g.bundle.validate().unwrap();
+    let mut v1 = g.bundle.clone();
+    v1.schema = plow_asset::dist::BUNDLE_SCHEMA.into();
+    v1.validate().unwrap();
+    let mut amd = g.bundle;
+    amd.target.vendor = "amd".into();
+    assert!(amd.validate().unwrap_err().contains("unsupported schema"));
 }

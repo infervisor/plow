@@ -18,7 +18,7 @@ use packet::dev::{
 };
 use packet::devbuild::{
     BlobHeader, BlobProgHeader, BlobSectionEntry, BlobTensor, BLOB_MAGIC, BLOB_MAGIC_V7, INIT_NONE,
-    NAME_LEN, SECT_NAME_LEN,
+    NAME_LEN, SECT_F_MUST_UNDERSTAND, SECT_NAME_LEN,
 };
 use packet::rope::GenTensor;
 
@@ -108,7 +108,9 @@ int main(void) {{
     printf("SectionEntry.kind %zu\n", offsetof(PlowSectionEntry, kind));
     printf("SectionEntry.offset %zu\n", offsetof(PlowSectionEntry, offset));
     printf("SectionEntry.size_f %zu\n", offsetof(PlowSectionEntry, size));
+    printf("SectionEntry.flags %zu\n", offsetof(PlowSectionEntry, flags));
     printf("SectionEntry.name %zu\n", offsetof(PlowSectionEntry, name));
+    printf("SECT_F_MUST_UNDERSTAND %u\n", (unsigned)PLOW_SECT_F_MUST_UNDERSTAND);
     printf("SECT_NAME_LEN %u\n", (unsigned)PLOW_SECT_NAME_LEN);
     /* v7 generated-tensor recipe */
     printf("GenTensor.size %zu\n", sizeof(PlowGenTensor));
@@ -405,6 +407,16 @@ fn rust_and_c_agree_on_the_device_isa() {
         "SectionEntry.name"
     );
     assert_eq!(SECT_NAME_LEN, get("SECT_NAME_LEN"), "PLOW_SECT_NAME_LEN");
+    assert_eq!(
+        offset_of!(BlobSectionEntry, flags),
+        get("SectionEntry.flags"),
+        "SectionEntry.flags"
+    );
+    assert_eq!(
+        SECT_F_MUST_UNDERSTAND as usize,
+        get("SECT_F_MUST_UNDERSTAND"),
+        "PLOW_SECT_F_MUST_UNDERSTAND"
+    );
 
     // v7 generated-tensor recipe. A drifted offset here means the runtime builds
     // a RoPE table from the wrong scalars — fluent, wrong output, no error.

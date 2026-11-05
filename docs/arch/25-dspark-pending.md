@@ -1,8 +1,9 @@
 # 25 — DSpark block drafter (pending support)
 
 **Status: paused (2026-10-22).** MTP (the Gemma-4 assistant drafter) is the shipped speculative
-decoder. DSpark phases D1 (target-side context) and D2 (draft program) are implemented and gated on
-branch `g12-dspark` (`e3a556c5`, on top of main `cd3cf800`); D3 (serving) is not built. This page
+decoder. DSpark phases D1 (target-side context) and D2 (draft program) were implemented and gated on
+branch `g12-dspark` (`e3a556c5`) and merged on 2026-10-26 (`172dd6f7b`), off unless emitted with
+`PLOW_SPEC_KIND=gemma4_dspark`; D3 (serving) is not built: `spec_serve` refuses block drafters. This page
 records what exists, what was measured and the plan to finish it.
 
 ## What DSpark is
@@ -17,7 +18,7 @@ It plugs into the generic spec contract (`devgen/src/mtp.rs` emit, `exec/gpu/spe
 `spec_draft.rs` draft programs, `orch/speculative.rs` policy) as `drafter.kind = device_block`,
 spec family `gemma4_dspark`, selected with `PLOW_EMIT_SPEC=1 PLOW_SPEC_KIND=gemma4_dspark`.
 
-## Done on `g12-dspark`
+## Done (branch `g12-dspark`, merged `172dd6f7b`)
 
 | Phase | Commit | Content |
 |---|---|---|
@@ -80,5 +81,5 @@ Each step lists its gate; stop at any failing gate.
 
 ## Where things are
 
-- Code: branch `g12-dspark` (`6606a5a3..e3a556c5`).
+- Code: in the tree since `172dd6f7b` (branch `g12-dspark`, `6606a5a3..e3a556c5`).
 - Checkpoint: `deepseek-ai/dspark_gemma4_12b_block7`, revision `2fa72e76`.

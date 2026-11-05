@@ -188,8 +188,10 @@ pub enum DevOp {
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=O_final?` ·
     /// `i0=n_q i1=n_kv i2=n_head i3=n_kv_head i4=q_pos0 i5=window i6=hd i7=nsplit` ·
     /// `f0=scale j0=kv_stride j1=kv_mask`.
-    /// `window = 0` is full causal. `hd` must be 256 or 512.
-    /// For Gemma `scale = 1.0` — there is NO `1/sqrt(head_dim)`.
+    /// `window = 0` is full causal. `hd` selects a compiled instantiation (64/128/256/512,
+    /// per backend and object); an `hd` with no arm traps. `f0 = scale` is applied as given:
+    /// the emitter supplies the model's softmax scale (e.g. 1.0 for Gemma-4, which has no
+    /// `1/sqrt(head_dim)`).
     ///
     /// This spec read `t0=O t1=Q t2=K t3=V` until 2026-07-29 and was STALE: it
     /// predates the split-K epilogue that added `Opart`/`mlpart` and moved the
@@ -576,14 +578,14 @@ pub enum DevOp {
     MoeGroupDownFp8Blk = 49,
 
     // ===== DeepSeek MLA (Multi-head Latent Attention) — flash READ path. =====
-    // Opcodes 50+, mirroring `runtime/common/dev_isa.h` (sparse-attn-design.md §4
-    // renumbered into the free band above MoE). The WRITE path reuses existing ops
+    // Opcodes 50+, mirroring `runtime/common/dev_isa.h` (the free band above MoE; design:
+    // docs/arch/29-techniques.md, MLA). The WRITE path reuses existing ops
     // (GEMV/GEMM for the c_kv/k_rope down-projections, HEADNORM_ROPE for the shared
     // rope key). These carry the latent geometry as compile-time-fixed operands; the
     // interpreter dispatches `d_flash_mla_decode<512,64,8>` (DK=kv_lora_rank=512,
     // DR=qk_rope_dim=64, GF=8 head-fusion). FLASH_MLA_MERGE is not a new opcode — the
     // latent-wide LSE merge reuses [`DevOp::FlashMerge`] at `hd=512`.
-    /// MLA latent flash decode (`sparse-attn-design.md §2.3`). Per head g, kv row j:
+    /// MLA latent flash decode. Per head g, kv row j:
     /// `score[g] = q_abs[g]·C_kv[j] + q_rope[g]·K_rope[j]`, online softmax, then
     /// `oacc[g] += p[g]·C_kv[j]` (PV accumulates on the latent). Emits latent-wide
     /// `(O_partial,m,l)` for [`DevOp::FlashMerge`] at `hd=512`; [`DevOp::OUvFold`]
@@ -614,22 +616,24 @@ pub enum DevOp {
     /// [`DevOp::FlashMlaDecodeFp8`] puts its per-row scale strip in `t7`. plowc refuses the
     /// combinations.
     FlashMlaDecode = 50,
-    /// MLA prefill MFMA twin — not yet built (reserved so the ABI is stable).
+    /// MLA latent prefill: AMD `exec_flash_mla_prefill` (interp.hip), emitted for Kimi K3's MLA
+    /// layers (`k3.rs`). No NVIDIA arm.
     FlashMlaPrefill = 51,
-    /// Per-head `W_uv` fold (`sparse-attn-design.md §2.5`): `o[b][h][v] =
+    /// Per-head `W_uv` fold: `o[b][h][v] =
     /// Σ_l O_latent[b][h][l]·W_uv[h][l][v]` — the O(n_q) query-side epilogue that folds
     /// the merged latent accumulator down to `v_head_dim`. `W_uv` is `[n_head][DK][V]`
     /// (l-major), the reduction runs `l=0..DK` in order (bit-exact to reference).
     /// `t0=O t1=Olat t2=Wuv` · `i0=n_batch i1=n_head i2=V`.
     OUvFold = 52,
 
-    // ===== Sparse top-k DSA (sparse-attn-design.md §3). =====
-    /// On-device top-k KV selection (`sparse-attn-design.md §3.2`) — the attention twin
+    // ===== Sparse top-k DSA (docs/arch/29-techniques.md, DSA). =====
+    /// On-device top-k KV selection — the attention twin
     /// of the MoE routing table. Scores the indexer queries against the index keys,
     /// keeps the top-k KV row indices per query (deterministic lowest-index tie-break),
-    /// writes the `idx` table [`DevOp::FlashGatherDecode`] reads. Reserved; body TBD.
+    /// writes the `idx` table [`DevOp::FlashGatherDecode`] reads. AMD body `d_attn_select`
+    /// (interp.hip); no emit site yet.
     AttnSelect = 53,
-    /// Gathered flash decode (`sparse-attn-design.md §3.3`) — the MLA latent flash
+    /// Gathered flash decode — the MLA latent flash
     /// reading ONLY the `top_k` selected latent rows via the `idx` table (the
     /// `GATHER=true` instantiation of `d_flash_mla_decode`). Everything else (absorbed
     /// score, online softmax, split, merge) is byte-identical to the dense MLA decode.
@@ -637,7 +641,7 @@ pub enum DevOp {
     /// t7=idx(i32)` · `i0=n_batch i1=n_head i2=kv_stride i4=nsplit i5=kv_mask i6=top_k` ·
     /// `f0=scale`.
     FlashGatherDecode = 54,
-    /// Gathered flash prefill — reserved, not yet built.
+    /// Gathered flash prefill: AMD `exec_flash_mla_prefill` with the gather table; no emit site yet.
     FlashGatherPrefill = 55,
 
     /// ROUTER TOP-K tail (the router SPLIT). The score matmul `logit = x·Wr` is now the ordinary
@@ -664,7 +668,7 @@ pub enum DevOp {
     /// `n_head`-wide slice — see `runtime/amd/interp.hip`'s `exec_mla_merge_fold`.
     MlaMergeFold = 57,
 
-    // ===== DSA lightning indexer (GLM-5.2 GlmMoeDsa; sparse-attn-design.md §3.1, arXiv 2512.02556
+    // ===== DSA lightning indexer (GLM-5.2 GlmMoeDsa; arXiv 2512.02556
     // eq.1). The two ops that PRODUCE the `idx` table [`DevOp::FlashGatherDecode`] gathers over —
     // scoring the pre-projected/pre-RoPE'd indexer q/k, then the top-k radix select. =====
     /// Lightning-indexer SCORE (`d_index_score`/`d_index_score_fast`). For every KV position `t`,
@@ -933,7 +937,7 @@ pub enum DevOp {
     // The chunked prefill scan of §7.6 is deliberately ABSENT. `KdaStateStep` takes a serial-`T`
     // loop, which is the reference `fused_recurrent` algorithm at any `T` and is exact; the
     // chunked form is a matmul-bound rewrite of a path that then already works. An opcode declared
-    // before its kernel exists is how op 90 became dead code.
+    // before its kernel exists is how op 90 ended up block-only (Nemotron-H extraction, sm_120).
     /// KDA causal depthwise short conv + SiLU over the concatenated `q|k|v` projections.
     ///
     /// Three independent width-`i2` depthwise convs over `H*D` channels each (`groups =
@@ -1790,7 +1794,10 @@ pub enum DevOp {
     GemvF32 = 135,
     /// Packed causal convolution plus SiLU. BF16 x/out[B,C], weight[C,W], and mutable history[B,C,W-1] (oldest first); optional I32 active[B] masks writes.
     ///
-    /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B`.
+    /// `source` (j1, 0 = contiguous x) is `in_stride | in_col << 16` in elements: x's row pitch and
+    /// column inside an N-concatenated projection's output (runtime contract 4).
+    ///
+    /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B` · `j1=source?`.
     QwenGdnConv = 136,
     /// Recurrent GDN with K=128 and HV divisible by HK. BF16 out[B,HV,V], packed qkv[B,2*HK*K+HV*V], a/b[B,HV], and dt_bias[HV]. A_log[HV] is BF16 unless alog_f32 is nonzero. Mutable FP32 state[B,HV,V,K]; optional I32 active[B] masks writes. Beta rounds to BF16 before recurrence.
     ///
@@ -1798,11 +1805,16 @@ pub enum DevOp {
     QwenGdnStep = 137,
     /// Ordinary per-head RMSNorm(core) times SiLU(z). BF16 core/z/out[B,HV,V] and gamma[V]; optional I32 active[B].
     ///
-    /// `t0=out t1=core t2=z t3=gamma t4=active?` · `i0=HV i1=V i2=B` · `f0=eps`.
+    /// `source` (j1, 0 = contiguous z) is `z_stride | z_col << 16` in elements: z's row pitch and
+    /// column inside an N-concatenated projection's output (runtime contract 4).
+    ///
+    /// `t0=out t1=core t2=z t3=gamma t4=active?` · `i0=HV i1=V i2=B` · `f0=eps` · `j1=source?`.
     QwenGatedNorm = 138,
     /// Deinterleave each head of BF16 packed[B,H,2*D] into Q/gate[B,H,D]; optional I32 active[B].
+    /// `in_stride` (elements, 0 = 2*H*D) is packed's row pitch when it is the q|gate block at
+    /// column 0 of an N-concatenated projection's output (runtime contract 4).
     ///
-    /// `t0=Q t1=gate t2=packed t3=active?` · `i0=H i1=D i2=B`.
+    /// `t0=Q t1=gate t2=packed t3=active?` · `i0=H i1=D i2=B i3=in_stride?`.
     QwenQGateSplit = 139,
     /// BF16 out[B,width] = x times sigmoid(gate), with sigmoid rounded to BF16 before multiplication. Output may alias x; optional I32 active[B].
     ///
@@ -1814,11 +1826,16 @@ pub enum DevOp {
     QwenRmsNorm = 141,
     /// D=256; rotary is 0 or 64. BF16 x[rows,H,D] and optional gamma[D]. FP32 cos/sin tables are required when rotary is nonzero and round to BF16 before rotation; normalization also rounds to BF16 first. Optional I32 pos[rows] defaults to zero; optional I32 active[rows] masks writes. ctx=0 writes contiguous output; otherwise writes KV[slot,H,ctx,D]. prefill=1 treats rows as query tokens and writes the single selected KV slot, while decode uses one slot per row.
     ///
-    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill` · `f0=eps f1=gamma_offset`.
+    /// `source` (j1, 0 = contiguous x) is `in_stride | in_col << 16` in elements: x's row pitch and
+    /// column inside an N-concatenated projection's output (runtime contract 4).
+    ///
+    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill` · `f0=eps f1=gamma_offset` · `j1=source?`.
     QwenHeadNormRope = 142,
     /// BF16 causal convolution plus SiLU for exactly T valid tokens: x/out[T,C], weight[C,W], mutable oldest-first history[1,C,W-1]. Updates history after the chunk.
     ///
-    /// `t0=out t1=x t2=weight t3=history` · `i0=C i1=W i2=T`.
+    /// `source` (j1) as [`DevOp::QwenGdnConv`].
+    ///
+    /// `t0=out t1=x t2=weight t3=history` · `i0=C i1=W i2=T` · `j1=source?`.
     QwenGdnConvPrefill = 143,
     /// Unpack BF16 packed[T,2*HK*K+HV*V]; normalize Q/K[T,HK,K] and round to BF16, copy V[T,HV,V]. No Q scaling.
     ///
@@ -1972,9 +1989,11 @@ pub enum DevOp {
     GemmAffineQ4 = 162,
     /// GGUF Q8_0 projection with FP32 activations and output. The weight is `[N,K]` in canonical
     /// 34-byte blocks (FP16 scale followed by 32 signed bytes); optional FP32 bias is added before
-    /// `activation` (0 = identity, 1 = SiLU).
+    /// `activation` (0 = identity, 1 = SiLU). `path` fixes the kernel, whose two paths round
+    /// differently: 0 = by row count (the GEMV walk at most 8 rows, tiles above), 1 = the GEMV
+    /// walk, 2 = tiles. A fixed path keeps each row's result independent of the launch's rows.
     /// `t0=C(f32) t1=A(f32) t2=W(q8_0) t3=bias?` ·
-    /// `i0=M i1=N i2=K i3=activation i4=a_row0`.
+    /// `i0=M i1=N i2=K i3=activation i4=a_row0 i7=path`.
     Q8GemmF32 = 163,
     /// FP32 LayerNorm with population variance and optional FP32 affine parameters.
     /// Numerical flag `i2` bit 0 rounds each output to BF16; bit 1 computes mean and variance
@@ -1990,7 +2009,9 @@ pub enum DevOp {
     /// `t0=out t1=x` · `i0=rows i1=width`.
     GluF32 = 166,
     /// FP32 causal depthwise convolution with FP16 `[channels,kernel]` weights and zero left pad.
-    /// `t0=out t1=x t2=weight(f16)` · `i0=rows i1=channels i2=kernel`.
+    /// Rows come in items of `rows_per_item` (0 = one item); taps before an item's first row read
+    /// zero.
+    /// `t0=out t1=x t2=weight(f16)` · `i0=rows i1=channels i2=kernel i3=rows_per_item`.
     CausalDepthwiseConv1dF32 = 167,
     /// FP32 relative-position attention. Q/K/V/position/context are `[rows,width]`, position has
     /// `2*rows-1` rows, and u/v are `[heads,width/heads]`. `left_chunks = u32::MAX` selects full
@@ -1999,8 +2020,10 @@ pub enum DevOp {
     /// window); full attention: the valid rows of a padded input, so later keys are excluded and
     /// later context rows are written as zeros.
     /// `i5` (0 = all) skips the query rows before it; their context rows are not written.
+    /// `i6` items (0 = 1): Q/K/V/context are `[items,rows,width]`, each item its own sequence with
+    /// its own `t7` entry (`u32[items]`); the position rows are shared.
     /// `t0=context t1=query t2=key t3=value t4=position t5=bias_u t6=bias_v t7=key_start?` ·
-    /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks i5=query_row0`.
+    /// `i0=rows i1=width i2=heads i3=chunk_size i4=left_chunks i5=query_row0 i6=items`.
     RelativeAttentionF32 = 168,
     /// Elementwise FP32 SiLU: `out = x / (1 + exp(-x))`; output may alias input.
     /// `t0=out t1=x` · `i0=n`.
@@ -2542,6 +2565,12 @@ pub enum DevOp {
     /// · `j1=T`. `gate_eps`, `oscale` (0 = 1) and `T` are f32 bit patterns; `out_res` may alias
     /// `res`.
     MuseNormGateNorm = 229,
+    /// [`DevOp::Glu`] over one row-pitched input holding both halves (an N-concatenated
+    /// gate|up projection's output): `out[r*width + p] = bf16(act(g) * u)` with
+    /// `g = gu[r*in_stride + p]`, `u = gu[r*in_stride + up_col + p]`, the act and rounding of op 5.
+    /// `t0=out t1=gu` · `i0=n i1=act i2=width i3=in_stride i4=up_col` · `f0=alpha f1=limit`.
+    /// `n = rows*width`; strides and `up_col` count elements; requires `up_col + width <= in_stride`.
+    GluPitched = 230,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2839,6 +2868,7 @@ impl DevOp {
         DevOp::MuseResidualGate,
         DevOp::MuseMoeCombineNorm,
         DevOp::MuseNormGateNorm,
+        DevOp::GluPitched,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -3089,6 +3119,7 @@ impl DevOp {
             DevOp::MuseResidualGate => "PLOW_DOP_MUSE_RESIDUAL_GATE",
             DevOp::MuseMoeCombineNorm => "PLOW_DOP_MUSE_MOE_COMBINE_NORM",
             DevOp::MuseNormGateNorm => "PLOW_DOP_MUSE_NORM_GATE_NORM",
+            DevOp::GluPitched => "PLOW_DOP_GLU_PITCHED",
         }
     }
 
@@ -3157,7 +3188,8 @@ impl DevOp {
     /// front-ends).
     /// 225 -> 226 for `TrimSilenceF32 = 225` (reference-audio silence trim).
     /// 226 -> 230 for `MuseRmsNorm = 226` .. `MuseNormGateNorm = 229` (Muse Spark).
-    pub const COUNT: u16 = 230;
+    /// 230 -> 231 for `GluPitched = 230` (N-concatenated gate|up projections).
+    pub const COUNT: u16 = 231;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -3271,6 +3303,11 @@ pub struct DevInst {
 /// Wire sentinel for an absent tensor operand in [`DevInst64::t`]. The u16 twin
 /// of [`TENSOR_NONE`]; usable handles are `0..0xFFFE`.
 pub const TENSOR_NONE16: u16 = 0xFFFF;
+
+/// `QuantFp8` `i3` / `GemmFp8` `i5`: block-scaled FP8 (the published checkpoints' format): 1x128
+/// activation groups (`QuantFp8` writes f32 scales `[K/128][i4]`, `i4` = rows padded to 4) and
+/// 128x128 weight blocks (`GemmFp8` `t4` = f32 `[N/128][K/128]`). Runs on cuBLASLt only.
+pub const FP8_BLOCK_GROUP: u32 = 128;
 
 /// One instruction, WIRE format. Fixed 64-byte stride — no variable-length
 /// records on device. Byte-for-byte mirror of `PlowDevInst` in

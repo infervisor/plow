@@ -526,6 +526,69 @@ Next: the hd512 prefill attention under a cached prefix (KV split for small quer
 FP8 projections (~13 us cuBLASLt minimum per call; algorithm search or q|k|v and gate|up
 concatenation).
 
+## 2026-10-27: prefill TTFT tail, phase 3 (attention, projections, serve env)
+
+plowrt efd10cbe0 (GLU change 687d8ec73), packet a0464475f8ab unchanged. Raw:
+`/opt/dlami/nvme/lava-tts/g12-decode` (`pf/p30*`, `pf/fa1.out`, `hd512/`, `gemm/`, `grid-{il4k,il1k,t0ao,d5fa}`,
+`gates/{fa-c16,fa-c16b,fat0-a,d5-c16}`).
+
+Where the tail comes from (2.7/s, `grid-pf2`): prefill launches hold ~60% of the wall; by bucket, 2048
+and 2112 launches are 66% of prefill launch time (mean 76-81 ms), 128-512 launches 19%. TTFT by
+uncached prompt tokens against vLLM on the same sessions: 4K-token first turns p50 417-482 vs
+329-340 ms, p99 1.65-1.73 vs 1.34-1.36 s; short cached turns p50 176-192 vs 138-196 ms. Prefix
+attach at admission (KV block store gather): p50 1.4 ms, p90 16 ms, p99 126 ms.
+
+One 2048-row launch behind a 4096-token prefix (69 ms, nsys): per sliding layer gate 200 + up 201 +
+native down 191 us (61-63% of FP8 dense peak), GLU quant 93, q/k/v 52/27/25, o 51, norms 64,
+rope 62, hd256 flash 160 (two staged 1024-row halves); per global layer the hd512 flash is 1852
+us (186 TF/s), 14.8 ms = 21% of the launch. At 128 rows + 4K prefix the flash is 336 us (hd512)
+and 72 us (hd256) per layer, 5.6 of 15.3 ms: 32 resp. 16 work items on 132 SMs.
+
+- hd512 attention: a warp-specialized wgmma kernel (producer converting e4m3 tiles, two consumer
+  warpgroups splitting the score tile by N and O by D, fp16 rounding points of the generated
+  kernel) was correct (rel-L2 1.7e-3, equal to the current kernel) but slower: 2048 rows + 4K
+  prefix 2885 vs 1799 us, 239 TF/s with the conversion removed. The generated kernel already
+  runs that layout (m64n16k16 QK per warpgroup, PV from shared memory); at head_dim 512 the
+  per-tile QK chain and the K/V conversion bound it. Not shipped. A faster global layer needs a
+  different structure (FP8 QK with a quantized Q, or a dequantized KV pass shared by the 16 query
+  heads); small query counts need a KV split, which needs partial-output scratch the role ABI
+  lacks.
+- FP8 projections: the same shapes through a row-wise scaled FP8 GEMM library path measure within
+  5% of the current routes (2048 rows: gate/up 192 vs 200 us, down 187 vs 191, q 60 vs 52); the
+  ~13 us per-call floor at 128 rows matters only to the 19% small-launch share. Fast accumulation
+  (`PLOW_LT_FP8_FAST_ACCUM_MAX_K=8192`, the 26B setting) cuts 512-4096-row launches 4-9%, but the
+  FP32-reference gate c16 passed 1 of 3 runs (cont_decisive 42, 38, 39 of 46 against 41; kl_trim
+  0.053-0.061 vs 0.045-0.048 without; one run with the terminal lm_head off cuBLASLt): not taken.
+- GLU quant: every layer's fused GLU quant writes the same bf16 activation, so the no-store twin
+  was never chosen; with the check fixed, 512-4096-row launches are 1.2-2.2% faster, outputs
+  unchanged (rider-vs-step agreement and KL identical on every rung).
+  FP32-reference gate c16 on this binary: cont_decisive 40 of 46 (FAIL by one case) with kl_trim
+  0.04778, identical to the first canonical run; the canonical packet now passes 3 of 5 runs
+  (40, 41, 43, 41, 40 against the 41 floor, vLLM 42; earlier packets 42-43).
+
+| rows x prefix | base ms | GLU fix | fast accum | both |
+|---|---|---|---|---|
+| 128 x 0 | 10.03 | -0.6% | -0.5% | -1.5% |
+| 512 x 4096 | 20.39 | -1.7% | -4.2% | -5.7% |
+| 1024 x 4096 | 34.77 | -1.8% | -7.2% | -8.5% |
+| 2048 x 4096 | 68.52 | -1.4% | -5.7% | -7.6% |
+| 4096 x 4096 | 144.27 | -0.6% | -7.9% | -8.8% |
+
+Serve env on the production mix (campaign.py report vs the same vLLM arm):
+
+| Variant | 1.8/s TTFT P99 | 2.7/s TTFT P99 | 2.7/s SLO met |
+|---|---|---|---|
+| canonical (interleave 2048) | 1.24x | 1.25x | 97.2% |
+| interleave 4096 | 1.15x | 1.74x | 96.3 / 88.1% |
+| interleave 1024 | 928 / 1394 ms | 3.2 s (rep 2 lost: server killed) | 92.3% |
+| host tier off, admit overlap, pool 2 GiB | 2.3 / 5.6 s | 7.9 / 22 s | 26.9 / 6.3% (cached 37-46%) |
+| GLU fix + fast accum (3 reps) | 0.87x | 1.24x (reps 1-3: 1372 / 1419 / 1286 ms) | 98.7 / 95.7 / 96.8% |
+
+The host tier is needed for the hit rate (device store ~14 GB); unbounded it pinned 216 GB of a
+249 GB host before the interleave-1024 server died without a log line, so the tier needs a cap on
+a shared box. Remaining gap at 2.7/s: TTFT P99 ~1.2x, from 4K-token first turns queueing behind
+2048-row launches whose global-layer attention is 21% of their time.
+
 ## 2026-10-27: native vs cuBLASLt route sweep (Gemma-4 12B FP8)
 
 Protocol: `step_bench` on one H100, decode 48 steps `--spread`, prefill `--packed-prefill --pf-reps 3`
@@ -577,3 +640,105 @@ or faster. Decode below rung 128 stays native per the 2026-10-26 measurement abo
 |---|---|---|---|---|---|---|
 | prefill | 1 x 1024 | 33.69 | 34.03 | +1.0% | 37 / 36 | equal |
 | prefill | 1 x 4096 | 136.13 | 136.54 | +0.3% | 36 / 36 | equal |
+
+## 2026-10-28: host KV tier cap
+
+Unset `PLOW_VMM_HOST_CACHE_MIB` sized the pinned host tier to `MemAvailable` less the reserve
+(`max(MemTotal/8, 16 GiB)`). On the 248 GiB lab host the server's RSS grew to 203-205 GiB within
+eight minutes of the 2.7/s replay and the tier froze with 31 GB available. Pinned pages are never
+reclaimed, so the earlier interleave-1024 grid lost its server at 16:23:56 with no log line,
+two minutes after a co-tenant `interp_sm90a` compile (22-38 GB per compiler process) started.
+The reserve covers plowrt's own non-tier memory and the OS. It leaves a co-tenant nothing.
+
+Production replay, plowrt c0d9e0d5, packet a0464475f8ab, 2 reps per rate, vLLM 0.29 baseline as
+before. Prefix token hit per cell (1.8 r1 / 2.7 r1 / 1.8 r2 / 2.7 r2):
+
+| host tier | peak RSS | token hit % | 1.8/s TTFT P99 | 2.7/s TTFT P99 | 2.7/s SLO met (r1 / r2) |
+|---|---|---|---|---|---|
+| unset (old default) | 203.5 GiB | 78.3 / 76.8 / 79.6 / 77.6 | 0.93x | 3.00x | 93.3 / 93.4% |
+| 128 GiB | 129.7 GiB | 78.3 / 76.8 / 79.6 / 77.6 | 0.98x | 1.93x | 99.3 / 88.8% |
+| 64 GiB | 65.6 GiB | 78.3 / 76.8 / 79.6 / 77.6 | 0.92x | 1.34x | 98.2 / 94.3% |
+| 32 GiB | 33.6 GiB | 78.0 / 75.8 / 79.3 / 74.1 | 1.34x | 1.30x | 99.5 / 89.1% |
+| unset, new default (MemTotal/4) | 64.0 GiB | 78.3 / 76.9 / 79.6 / 77.7 | 1.32x | 1.80x | 94.9 / 95.7% |
+
+- 64 GiB is the smallest measured cap within 1 pt of the unset hit rate (max -0.2 pt); 32 GiB
+  loses 3.5 pt in the second 2.7/s rep. The recipe sets `PLOW_VMM_HOST_CACHE_MIB = "65536"`.
+- TTFT P99 at 2.7/s spreads 1.3-5.3 s between reps of the same arm. The unset tier's 5.3 s rep
+  is the one in which the tier grew to 205 GiB.
+- plowrt default: the unset tier is now also bounded by `MemTotal/4` (`host_tier_default`), which
+  is 62 GiB on this host. In that run a co-tenant took host `MemAvailable` down to 44 GiB and
+  the server kept running. The reserve and the growth-time floor check are unchanged.
+  On a multi-GPU host each server still takes its own quarter.
+
+Evidence: `/opt/dlami/nvme/lava-tts/g12-decode/grid-{hmem1k,uncap,cap128,cap64,cap32,auto6}`
+(`mem.tsv` = 5 s RSS / MemAvailable samples).
+
+26B check of the new default (2026-10-28, plowrt e4ba03a09 = this change on prod-next, recipe serve
+env, `--prod-fidelity`, 2 reps per rate). The default tier peaked at 64 GiB RSS in every arm.
+
+| model, think | tier | token hit % (1.8 r1 / 2.7 r1 / 1.8 r2 / 2.7 r2) | TTFT P99 ms | TPOT P99 ms | goodput |
+|---|---|---|---|---|---|
+| 26B FP8 (caf6c4a47ba6), 10 s | default (62 GiB) | 78.4 / 77.1 / 79.8 / 78.2 | 321 / 460 / 272 / 516 | 25.9 / 38.4 / 22.3 / 54.2 | 100% all |
+| 26B FP8, 10 s | 128 GiB | 78.4 / 77.1 / 79.8 / 78.1 | 343 / 1002 / 310 / 478 | 26.3 / 95.3 / 26.9 / 54.9 | 99.2-100% |
+| 26B FP8, 10 s | 200 GiB (old default; 202 GiB RSS, 33 GiB left) | 78.4 / 77.1 / 79.7 / 78.1 | 340 / 453 / 1711 / 886 | 25.2 / 41.8 / 180.4 / 47.3 | 96.7-100% |
+| 26B FP8, 45 s | default | 69.6 / 67.9 / 68.9 / 68.4 | 446 / 506 / 332 / 500 | 20.8 / 34.9 / 20.1 / 45.9 | 100% all |
+| 26B FP8, 45 s | 200 GiB | 69.6 / 67.9 / 68.9 / 68.3 | 364 / 463 / 293 / 530 | 19.8 / 34.9 / 22.8 / 45.9 | 100% all |
+| 26B BF16 (f72d0330f9d8), 10 s, 1.8/s x4 | default | 77.7 / 78.8 / 77.8 / 78.9 | 4042 / 4493 / 5008 / 3793 | 107 / 118 / 107 / 101 | 92.2-95.8% |
+| 26B BF16, 10 s, 1.8/s x4 | 128 GiB | 77.9 / 78.8 / 78.0 / 78.6 | 2891 / 3451 / 2789 / 5193 | 120 / 108 / 120 / 113 | 89.4-95.7% |
+
+- The hit rate is equal within 0.1 pt in every comparison, including the 45 s think mix. The larger
+  tiers only add P99 outliers in the reps where they grow past 100 GiB.
+- 26B BF16 TTFT P99 is lower with 128 GiB in 3 of 4 reps, but TPOT P99 moves the other way.
+  The rank-sum p is about 0.34, and this step-bound recipe swings 3-13 s run to run. No cap set.
+
+Evidence: `/opt/dlami/nvme/lava-tts/g12-decode/g26/{fp8,bf16}-*`.
+
+## 2026-10-29: KV store copies off the engine thread (F1, docs/arch/27 §6.3)
+
+plowrt 575a313a4 (branch kv-f1-p0) vs its base prod-next b9be33db4. Same packet a0464475f8ab, recipe serve
+env with the 64 GiB host tier, `--prod-fidelity`, 2.7 sessions/s, 10 s think, 2 reps per arm, run
+back to back in one lease. Strict `campaign.py report` against the existing vLLM 0.29 arm
+(`strict-g12-23/vllm`).
+
+| arm | TTFT P99 (r1 / r2) | TPOT P99 (r1 / r2) | strict TTFT P99 | strict TPOT P99 | goodput | store time on the engine thread |
+|---|---|---|---|---|---|---|
+| prod-next b9be33db4 | 1001 / 1294 ms | 90.6 / 111.8 ms | 1147.5 ms (1.02x vLLM) | 101.23 ms (0.74x) | 99.6 / 96.4% | 13.0% of tick (gather 8.9 ms, 8.5 ms of it a stream drain) |
+| F1 575a313a4 | 699 / 956 ms | 54.9 / 82.0 ms | 827.6 ms (0.73x) | 68.47 ms (0.50x) | 100 / 99.9% | 0.53% (gather 63 µs, publish 310 µs, no drain) |
+
+- Both reps improve on every P99. Throughput 55,549 -> 55,972 tok/s; token hit rate unchanged
+  (79.2 / 79.3 vs 79.3 / 79.1%).
+- What moved: the gather's segment table became per-block descriptors in the launch parameters;
+  a gather outside a launch window and every publish retire their holds and seals behind an
+  event instead of draining the stream; host-resident boundaries restore on a worker thread
+  ahead of admission, and a packed admission waits up to 250 ms for an in-flight restore.
+- FP32 gate on the F1 binary: PASS (kl_trim_mean 0.0483, top1_decisive 0.9852, needle_acc 1).
+
+Evidence: `/opt/dlami/nvme/lava-tts/kv-f1p0/rep/g12-{pnext,f1c}-promo` (`report/`, `metrics_1s.tsv`),
+gate `/opt/dlami/nvme/lava-tts/kv-f1p0/gates/f1c/g12`.
+
+## 2026-10-29: global (hd512) prefill attention through the FA4 library route, fp16 pool
+
+lib-attn on prod-next b36fcf18c (bin6 aef05632), packet a0464475f8ab with `objects/libplow_fa4_hd512.so`
+(fp16 variant, `PLOW_BUILD_FA4_HD512=f16`) and `objects/kv_dequant_sm90.cubin` beside it; docs/arch/28.
+Native arm = same binary and packet without the two files. Recipe serve env, `--prod-fidelity`,
+2.7 sessions/s, 2 reps per arm, back to back in one lease, strict `campaign.py report` against
+`strict-g12-23/vllm`.
+
+| arm | TTFT P99 (r1 / r2) | TPOT P99 (r1 / r2) | strict TTFT P99 | strict TPOT P99 | goodput | SLO met |
+|---|---|---|---|---|---|---|
+| native | 730 / 923 ms | 57.4 / 84.9 ms | 826.7 ms (0.73x vLLM) | 71.13 ms (0.52x) | 9.39 req/s | 99.9% |
+| FA4 route, fp16 pool | 657 / 738 ms | 52.9 / 72.5 ms | 697.2 ms (0.62x) | 62.69 ms (0.46x) | 9.41 req/s | 100.0% |
+
+- Prefill, one 16000-token prompt (step_bench packed prefill): chunk 2048/1024/512/128
+  0.608/0.633/0.758/2.375 -> 0.549/0.572/0.677/1.813 s (-10/-10/-11/-24%).
+- FP32 gate vs same-concurrency vLLM 0.28 peers: c1 PASS kl_trim 0.0678 (peer 0.0631), top1_decisive
+  0.9764 (0.9803), cont_decisive 41/46 (43; limit 41, at the limit; c1 is deterministic, native 44);
+  c8 PASS 0.0680 (0.0678), cont 40 (42); c32 PASS 0.0707 (0.0710), cont 39 (41). The relax-for-perf
+  check holds independently at c1: kl_trim 0.0678 <= 1.10 x 0.0631, top1 >= peer - 0.005, cont >= peer - 2.
+- The bf16 pool failed c1 (cont 40/46): it rounds every dequantized row to bf16.
+- Per-site dumps of the 15872-token natural case: route O vs an FP32 attention on the same inputs
+  rel-L2 1.69-1.73e-3 on all 56 hd512 sites (native kernel 1.7e-3). The natural-text KL difference
+  against native moves both ways per case (9 better, 11 worse of 20), a rounding re-roll.
+
+Evidence: `/opt/dlami/nvme/lava-tts/lib-attn/f1ab` (`prod-{nat,h16}/report`, `gate-h16`, `gate-nat`),
+`/opt/dlami/nvme/lava-tts/lib-attn/f16` (screen, `an-*.txt`, `qbench.*`, `kbench.*`).

@@ -28,7 +28,7 @@
  *     (lowest-id tie-break), the weight-base indirection, and the fixed-order combine.
  *   - MLA is validated to the established output-scaled tolerance (~1e-3): it keeps P in f32
  *     but latent/query/W_uv are bf16 and the online-softmax reassociates vs the reference's
- *     single-pass softmax (sparse-attn-design.md §2.6) — the SAME metric mla_gfx950_test.c uses.
+ *     single-pass softmax — the SAME metric mla_gfx950_test.c uses.
  *   The oracle is fed the DEVICE's RMSNorm output (xn) for the MLA leg so the block reductions
  *   (block_sum + rsqrtf, not bit-reproducible by a scalar reference) don't pollute the compare.
  *

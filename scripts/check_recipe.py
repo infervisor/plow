@@ -113,6 +113,46 @@ def check_rung_env(over: dict, build_json: dict, observed: dict) -> None:
                 )
 
 
+INVENTORY_RS = REPO / "crates/plowrt/src/inventory.rs"
+UNMEASURED = re.compile(r"not (yet )?measured|unmeasured|\btodo\b|\btbd\b", re.I)
+
+
+def check_capabilities(recipe: dict) -> None:
+    """`[capabilities]` waives `plowrt inventory` items by name, each with a reason (doctor [8])."""
+    caps = recipe.get("capabilities") or {}
+    if not caps:
+        return
+    items = set(re.findall(r'item\(\s*"([a-z_]+)"', INVENTORY_RS.read_text()))
+    for name, reason in sorted(caps.items()):
+        need(name in items, f"capabilities: {name!r} is not a plowrt inventory item ({', '.join(sorted(items))})")
+        need(isinstance(reason, str) and reason.strip(), f"capabilities: {name} needs the measured reason")
+        need(not UNMEASURED.search(reason), f"capabilities: {name}: an unmeasured route is not a waiver ({reason!r})")
+
+
+def check_rung_choices(recipe: dict) -> None:
+    """A `validated` recipe states a rung-eligible knob (packet-wide or in `[emit.rung_env]`) only
+    with `[rung_choices.<KNOB>]`: `label = "qualified"` and the per-rung measurement as `evidence`
+    (docs/bringup/agent-tools.md "Per-rung gate and recipe selection")."""
+    if recipe.get("status") != "validated":
+        return
+    _, rungs = rung_env.registry()
+    stated = set()
+    for table in ((recipe.get("emit") or {}).get("env"), (recipe.get("emit_roles") or {}).get("env")):
+        stated |= set(table or {}) & set(rungs)
+    for knobs in rung_env.from_recipe(recipe).values():
+        stated |= set(knobs)
+    choices = recipe.get("rung_choices") or {}
+    for env in sorted(stated):
+        c = choices.get(env)
+        need(isinstance(c, dict), f"rung_choices: {env} is a per-rung choice; a validated recipe needs [rung_choices.{env}]")
+        need(c.get("label") == "qualified", f"rung_choices: {env} label {c.get('label')!r}, a validated recipe needs 'qualified'")
+        ev = c.get("evidence")
+        need(
+            isinstance(ev, list) and ev and all(isinstance(e, str) and e.strip() for e in ev),
+            f"rung_choices: {env} needs `evidence`, a non-empty list of the per-rung measurements",
+        )
+
+
 # Emit env keys that locate a tool on the build host rather than shape the
 # packet; a recipe states them for the build command, the checker ignores them.
 MACHINE_PATH_KNOBS = ("PLOW_VERIFY_BIN",)
@@ -351,6 +391,8 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
 
     notes += check_lowrung_tiers(recipe)
     recipe_rung_env(recipe)
+    check_rung_choices(recipe)
+    check_capabilities(recipe)
     spec_errors = spec_env.errors(recipe)
     need(not spec_errors, "; ".join(spec_errors))
 
@@ -583,8 +625,39 @@ def self_test() -> None:
         rung = json.loads(json.dumps(good))
         del rung["artifacts"]
         rung["emit"]["rung_env"] = {"prefill": {"128": {"PLOW_NO_GLU_FUSE": "0"}}}
+        rung["rung_choices"] = {"PLOW_NO_GLU_FUSE": {"label": "qualified", "evidence": ["rung-sweep/choice.json"]}}
         notes = check(write(rung), rb, None, strict=False)
         assert not any("PLOW_EMIT_RUNG_ENV" in n for n in notes), notes
+        # A validated recipe's per-rung choice carries qualified evidence.
+        for edit, why in [
+            (lambda x: x.pop("rung_choices"), "needs [rung_choices.PLOW_NO_GLU_FUSE]"),
+            (lambda x: x["rung_choices"]["PLOW_NO_GLU_FUSE"].update(label="experimental"), "needs 'qualified'"),
+            (lambda x: x["rung_choices"]["PLOW_NO_GLU_FUSE"].update(evidence=[]), "needs `evidence`"),
+        ]:
+            bad = json.loads(json.dumps(rung))
+            edit(bad)
+            try:
+                check(write(bad), rb, None, strict=False)
+                raise AssertionError(f"accepted a per-rung choice without evidence ({why})")
+            except rc.Fail as e:
+                assert why in str(e), e
+        for caps, why in [
+            ({"no_such_route": "x"}, "not a plowrt inventory item"),
+            ({"live_kv": ""}, "needs the measured reason"),
+            ({"live_kv": "not measured yet"}, "unmeasured route is not a waiver"),
+        ]:
+            bad = json.loads(json.dumps(rung))
+            bad["capabilities"] = caps
+            try:
+                check(write(bad), rb, None, strict=False)
+                raise AssertionError(f"accepted a bad waiver ({why})")
+            except rc.Fail as e:
+                assert why in str(e), e
+        unvalidated = json.loads(json.dumps(rung))
+        unvalidated.pop("rung_choices")
+        unvalidated["status"] = "emits"
+        unvalidated.pop("measured", None)
+        check(write(unvalidated), rb, None, strict=False)
         for edit, why in [
             (lambda x: x["emit"]["rung_env"]["prefill"]["128"].update(PLOW_NO_GLU_FUSE="1"), "contradictory PLOW_EMIT_RUNG_ENV"),
             (lambda x: x["emit"]["rung_env"]["prefill"]["128"].update(PLOW_FP8_KV="1"), "packet-wide"),

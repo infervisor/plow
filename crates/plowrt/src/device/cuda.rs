@@ -39,7 +39,7 @@ use rustc_hash::FxHashMap;
 use crate::device::{Backend, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module};
 use crate::{DeviceErrorInfo, Result, RuntimeError};
 
-pub(crate) mod cutlass_fp8;
+pub(crate) mod aot;
 pub(crate) mod lt;
 pub use lt::library as cublaslt_library;
 pub(crate) mod qwen_gdn;
@@ -122,6 +122,13 @@ const STREAM_NON_BLOCKING: u32 = 1;
 /// the cheaper record path).
 const EVENT_DEFAULT: u32 = 0;
 const EVENT_DISABLE_TIMING: u32 = 2;
+/// `CU_CTX_SCHED_SPIN` / `CU_CTX_SCHED_MASK`. Measured on H100 serving: a blocking-sync
+/// context adds 65-130 us to every same-step wait, and sleeping even only on pipelined decode
+/// waits (newer step queued) raised TPOT p99 under load; yield matches spin's latency while
+/// still burning the core. Spin is the default `SCHED_AUTO` choice on a many-core host; it is
+/// set explicitly so a host with fewer CPUs than contexts does not fall back to yield.
+const CTX_SCHED_SPIN: u32 = 1;
+const CTX_SCHED_MASK: u32 = 7;
 
 // CUdevice_attribute values used here (cuda.h).
 const ATTR_WARP_SIZE: i32 = 10;
@@ -141,8 +148,13 @@ const ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
 /// same copy degrades to fault-driven migration.
 const ATTR_PAGEABLE_USES_HOST_PAGE_TABLES: i32 = 100;
 // CUfunction_attribute.
-const FUNC_ATTR_SHARED_SIZE_BYTES: i32 = 1;
-const FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+pub(crate) const FUNC_ATTR_MAX_THREADS_PER_BLOCK: i32 = 0;
+pub(crate) const FUNC_ATTR_SHARED_SIZE_BYTES: i32 = 1;
+pub(crate) const FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+/// `plow_small_copy` (shares the block store's embedded PTX).
+const SMALL_COPY_PTX: &str = include_str!("../../../../runtime/nvidia/kv_segcopy.ptx");
+/// Largest engine copy `plow_small_copy` takes instead of a cuMemcpy.
+const SMALL_COPY_MAX: usize = 16 << 10;
 // cuMemHostAlloc flags.
 const MEMHOSTALLOC_PORTABLE: u32 = 1;
 // cuMemHostRegister flags.
@@ -239,6 +251,8 @@ driver_api! {
     cuDeviceGetAttribute: fn(*mut i32, i32, CUdevice) -> CUresult,
     cuDevicePrimaryCtxRetain: fn(*mut CUcontext, CUdevice) -> CUresult,
     cuDevicePrimaryCtxRelease_v2: fn(CUdevice) -> CUresult,
+    cuDevicePrimaryCtxGetState: fn(CUdevice, *mut u32, *mut i32) -> CUresult,
+    cuDevicePrimaryCtxSetFlags_v2: fn(CUdevice, u32) -> CUresult,
     cuCtxSetCurrent: fn(CUcontext) -> CUresult,
     cuCtxSynchronize: fn() -> CUresult,
     cuModuleLoadData: fn(*mut CUmodule, *const c_void) -> CUresult,
@@ -319,6 +333,8 @@ driver_api! {
 
 thread_local! {
     static LAST_CTX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Modules this thread loaded inside [`CudaBackend::unload_modules_on_err`].
+    static LOAD_SCOPE: std::cell::RefCell<Option<Vec<u64>>> = const { std::cell::RefCell::new(None) };
 }
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -439,6 +455,10 @@ struct CudaFreer {
     /// (which all fail with the same sticky status) report at debug, not one
     /// warn per allocation — a poisoned engine teardown frees hundreds.
     poisoned: Arc<std::sync::OnceLock<DeviceErrorInfo>>,
+    /// Live [`PinnedHost`] allocations, start -> len: the ranges small copies may reach
+    /// through the UVA mapping (`plow_small_copy`). Holds only `host_alloc_pinned`'s
+    /// portable, not write-combined, allocations, whose host pointer is the device pointer.
+    pinned: Mutex<std::collections::BTreeMap<usize, usize>>,
 }
 
 // SAFETY: as CudaBackend — driver calls are thread-safe, handles are
@@ -496,6 +516,13 @@ pub struct CudaStream {
 // retained context (threads vary).
 unsafe impl Send for CudaStream {}
 unsafe impl Sync for CudaStream {}
+
+impl CudaStream {
+    /// The driver handle, for host libraries launching on this stream.
+    pub(crate) fn raw(&self) -> usize {
+        self.raw
+    }
+}
 
 impl Drop for CudaStream {
     fn drop(&mut self) {
@@ -584,6 +611,7 @@ impl PinnedHost {
 
 impl Drop for PinnedHost {
     fn drop(&mut self) {
+        self.keep.pinned.lock().remove(&(self.ptr as usize));
         // SAFETY: ptr from cuMemHostAlloc, freed exactly once.
         let rc = unsafe {
             let _ = bind_context(&self.keep.api, self.keep.ctx, self.keep.context_id);
@@ -643,10 +671,14 @@ type TmapEncodeFn = unsafe extern "C" fn(
     u32,
 ) -> CUresult;
 
+/// `cuFuncGetParamInfo` (CUDA 12.4+): kernel parameter `index`'s byte offset and size.
+type ParamInfoFn = unsafe extern "C" fn(CUfunction, usize, *mut usize, *mut usize) -> CUresult;
+
 pub struct CudaBackend {
     api: Arc<Api>,
     /// See the resolve site in [`CudaBackend::open`] — `None` on pre-12.0 drivers.
     tmap_encode: Option<TmapEncodeFn>,
+    param_info: Option<ParamInfoFn>,
     /// Primary context, retained once; re-bound per call (threads vary).
     ctx: usize,
     /// Handed to every owned `DeviceMem`; its Drop releases the primary ctx.
@@ -679,6 +711,9 @@ pub struct CudaBackend {
     slab_pool: Mutex<Vec<(u64, u64)>>,
     /// Snapshot spill copies ([`CopyTier`]); `None` until the first spill.
     copy_tier: Mutex<Option<CopyTier>>,
+    /// `plow_small_copy`: engine copies up to [`SMALL_COPY_MAX`] bytes between device and pinned
+    /// host memory run on the SMs, never queued behind bulk copies on a copy engine.
+    small_copy: Option<KernelFn>,
     // Serialize driver mutations with metadata so rebinding cannot revive stale evidence.
     vmm_provenance: Mutex<super::provenance::VmmProvenance>,
     /// Set once, on the first fatal driver status ([`is_cuda_fatal`]): the
@@ -769,6 +804,12 @@ impl CudaBackend {
                 .ok()
                 .map(|s| *s)
         };
+        // SAFETY: signature transcribed from cuda.h (CUDA 12.4+); optional like the encoder.
+        let param_info: Option<ParamInfoFn> = unsafe {
+            lib.get::<ParamInfoFn>(b"cuFuncGetParamInfo\0")
+                .ok()
+                .map(|s| *s)
+        };
         let api = Api::resolve(lib)?;
 
         let check = |rc: CUresult, what: &str| -> Result<()> {
@@ -798,6 +839,25 @@ impl CudaBackend {
                 (api.cuDeviceGet)(&mut dev, device_ordinal as i32),
                 "cuDeviceGet",
             )?;
+            let (mut flags, mut active) = (0u32, 0i32);
+            check(
+                (api.cuDevicePrimaryCtxGetState)(dev, &mut flags, &mut active),
+                "cuDevicePrimaryCtxGetState",
+            )?;
+            if (flags & CTX_SCHED_MASK) != CTX_SCHED_SPIN {
+                // An active primary context's flags belong to whoever retained it first.
+                if active != 0 {
+                    tracing::warn!(flags, "primary context already active without SCHED_SPIN");
+                } else {
+                    let rc = (api.cuDevicePrimaryCtxSetFlags_v2)(
+                        dev,
+                        (flags & !CTX_SCHED_MASK) | CTX_SCHED_SPIN,
+                    );
+                    if rc != 0 {
+                        tracing::warn!(rc, flags, "cuDevicePrimaryCtxSetFlags(SCHED_SPIN)");
+                    }
+                }
+            }
             let mut ctx: CUcontext = std::ptr::null_mut();
             check(
                 (api.cuDevicePrimaryCtxRetain)(&mut ctx, dev),
@@ -871,10 +931,12 @@ impl CudaBackend {
                 ctx: ctx as usize,
                 dev,
                 poisoned: Arc::clone(&poisoned),
+                pinned: Mutex::new(std::collections::BTreeMap::new()),
             });
-            Ok(CudaBackend {
+            let mut be = CudaBackend {
                 api,
                 tmap_encode,
+                param_info,
                 ctx: ctx as usize,
                 freer,
                 capture_exclusion: capture_exclusion(dev),
@@ -894,8 +956,78 @@ impl CudaBackend {
                 copy_tier: Mutex::new(None),
                 vmm_provenance: Mutex::new(super::provenance::VmmProvenance::default()),
                 poisoned,
-            })
+                small_copy: None,
+            };
+            be.small_copy = be.load_small_copy();
+            Ok(be)
         }
+    }
+
+    /// `plow_small_copy` from the embedded PTX; `None` (cuMemcpy for every copy) where the
+    /// driver cannot JIT it.
+    fn load_small_copy(&self) -> Option<KernelFn> {
+        let mut image = SMALL_COPY_PTX.as_bytes().to_vec();
+        image.push(0);
+        let loaded = Backend::module_load(self, &image)
+            .and_then(|m| self.get_function(&m, "plow_small_copy"));
+        match loaded {
+            Ok(f) => Some(f),
+            Err(error) => {
+                tracing::debug!(%error, "small-copy kernel unavailable; engine copies stay on cuMemcpy");
+                None
+            }
+        }
+    }
+
+    /// The small-copy kernel for a copy of `bytes` between `dev` and the host range at `host`,
+    /// when every condition holds: small, 4-byte aligned, host side inside a live pinned
+    /// allocation.
+    fn small_copy_for(&self, host: usize, dev: u64, bytes: usize, max: usize) -> Option<KernelFn> {
+        let f = self.small_copy?;
+        if bytes == 0 || bytes > max || (bytes | host | dev as usize) % 4 != 0 {
+            return None;
+        }
+        let pinned = self.freer.pinned.lock();
+        let (&start, &len) = pinned.range(..=host).next_back()?;
+        (host + bytes <= start + len).then_some(f)
+    }
+
+    fn launch_small_copy(
+        &self,
+        f: KernelFn,
+        src: u64,
+        dst: u64,
+        bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let (mut src, mut dst, mut words) = (src, dst, (bytes / 4) as u32);
+        let grid = words.div_ceil(128).min(2 * self.sm_count);
+        let mut params = [
+            &mut src as *mut u64 as *mut c_void,
+            &mut dst as *mut u64 as *mut c_void,
+            &mut words as *mut u32 as *mut c_void,
+        ];
+        self.launch_kernel(f, grid, 128, 0, &mut params, Some(stream))
+    }
+
+    /// H2D of up to 1 GiB from a live pinned allocation on the SMs, off the copy engines (bulk
+    /// restores queue there); `false` = not eligible, nothing enqueued.
+    ///
+    /// # Safety
+    /// As [`Self::memcpy_htod_async`]: `src` stays valid and unchanged until the stream
+    /// reaches the copy's end.
+    pub unsafe fn pinned_htod_on_sms(
+        &self,
+        dptr: u64,
+        src: &[u8],
+        stream: &CudaStream,
+    ) -> Result<bool> {
+        self.bind()?;
+        let Some(f) = self.small_copy_for(src.as_ptr() as usize, dptr, src.len(), 1 << 30) else {
+            return Ok(false);
+        };
+        self.launch_small_copy(f, src.as_ptr() as u64, dptr, src.len(), stream)?;
+        Ok(true)
     }
 
     /// Encode the `tma_ws_gemm_bf16.cu` tensor-map recipe over a device tensor: rank-2
@@ -921,6 +1053,163 @@ impl CudaBackend {
         box_rows: u32,
     ) -> Result<[u8; 128]> {
         self.encode_tmap(base, rows, k, box_rows, true)
+    }
+
+    /// Any tiled tensor map (`cuTensorMapEncodeTiled`): `dims` / `boxes` / `elem_strides` of one
+    /// rank, `strides` (bytes) of rank - 1; enum arguments as in cuda.h.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_tmap_tiled(
+        &self,
+        dtype: u32,
+        base: u64,
+        dims: &[u64],
+        strides: &[u64],
+        boxes: &[u32],
+        elem_strides: &[u32],
+        interleave: u32,
+        swizzle: u32,
+        l2_promotion: u32,
+        oob_fill: u32,
+    ) -> Result<[u8; 128]> {
+        let f = self.tmap_encode.ok_or_else(|| {
+            RuntimeError::Device("cuTensorMapEncodeTiled unresolved (driver < CUDA 12.0)".into())
+        })?;
+        let rank = dims.len();
+        if !(1..=5).contains(&rank)
+            || strides.len() + 1 != rank
+            || boxes.len() != rank
+            || elem_strides.len() != rank
+        {
+            return Err(RuntimeError::Rejected(format!(
+                "tensor map rank {rank}: {} strides, {} boxes, {} element strides",
+                strides.len(),
+                boxes.len(),
+                elem_strides.len()
+            )));
+        }
+        #[repr(C, align(128))]
+        struct Buf([u8; 128]);
+        let mut m = Buf([0u8; 128]);
+        self.check(
+            unsafe { bind_context(&self.api, self.ctx, self.freer.context_id) },
+            "cuCtxSetCurrent",
+        )?;
+        // SAFETY: driver call; the arrays hold `rank` (strides rank - 1) entries and outlive it;
+        // out is 128 B and 128-aligned.
+        let rc = unsafe {
+            f(
+                &mut m as *mut Buf as *mut c_void,
+                dtype,
+                rank as u32,
+                base as *mut c_void,
+                dims.as_ptr(),
+                strides.as_ptr(),
+                boxes.as_ptr(),
+                elem_strides.as_ptr(),
+                interleave,
+                swizzle,
+                l2_promotion,
+                oob_fill,
+            )
+        };
+        self.check(rc, "cuTensorMapEncodeTiled")?;
+        Ok(m.0)
+    }
+
+    /// `f`'s kernel parameters as `(offset, size)` bytes, in order (`cuFuncGetParamInfo`);
+    /// `None` on a driver without it (< CUDA 12.4).
+    pub fn param_layout(&self, f: KernelFn) -> Result<Option<Vec<(usize, usize)>>> {
+        let Some(info) = self.param_info else {
+            return Ok(None);
+        };
+        self.bind()?;
+        let mut out = Vec::new();
+        loop {
+            let (mut offset, mut size) = (0usize, 0usize);
+            // SAFETY: live function handle; outputs are locals. Past the last parameter the
+            // driver returns CUDA_ERROR_INVALID_VALUE; any other failure is an error.
+            let rc = unsafe { info(f.0 as CUfunction, out.len(), &mut offset, &mut size) };
+            if rc == 1 {
+                return Ok(Some(out));
+            }
+            self.check(rc, "cuFuncGetParamInfo")?;
+            out.push((offset, size));
+        }
+    }
+
+    /// `cuFuncGetAttribute(attribute, f)` (CUfunction_attribute ids).
+    pub fn function_attribute(&self, f: KernelFn, attribute: i32) -> Result<i32> {
+        self.bind()?;
+        let mut v = 0i32;
+        // SAFETY: valid function handle; `v` outlives the call.
+        self.check(
+            unsafe { (self.api.cuFuncGetAttribute)(&mut v, attribute, f.0 as CUfunction) },
+            "cuFuncGetAttribute",
+        )?;
+        Ok(v)
+    }
+
+    /// The device's per-block shared memory opt-in limit (static + dynamic).
+    pub fn smem_optin(&self) -> u32 {
+        self.smem_optin
+    }
+
+    /// `cuFuncSetAttribute(f, attribute, value)` (CUfunction_attribute ids).
+    pub fn set_function_attribute(&self, f: KernelFn, attribute: i32, value: i32) -> Result<()> {
+        self.bind()?;
+        // SAFETY: valid function handle.
+        self.check(
+            unsafe { (self.api.cuFuncSetAttribute)(f.0 as CUfunction, attribute, value) },
+            "cuFuncSetAttribute",
+        )
+    }
+
+    /// `cuLaunchKernelEx` with a 3-D grid and block and int-valued launch attributes
+    /// `(CUlaunchAttributeID, value)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_ex(
+        &self,
+        f: KernelFn,
+        grid: [u32; 3],
+        block: [u32; 3],
+        smem_bytes: u32,
+        attributes: &[(i32, i32)],
+        params: &mut [*mut c_void],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.bind()?;
+        let mut attrs: smallvec::SmallVec<[CUlaunchAttribute; 4]> = attributes
+            .iter()
+            .map(|&(id, v)| {
+                let mut value = [0u8; 64];
+                value[..4].copy_from_slice(&v.to_ne_bytes());
+                CUlaunchAttribute {
+                    id,
+                    pad: [0; 4],
+                    value,
+                }
+            })
+            .collect();
+        let config = CUlaunchConfig {
+            grid,
+            block,
+            shared_mem_bytes: smem_bytes,
+            stream: stream.raw as CUstream,
+            attrs: attrs.as_mut_ptr(),
+            num_attrs: attrs.len() as u32,
+        };
+        // SAFETY: config, attrs and params live for the call; the driver copies arguments out.
+        self.check(
+            unsafe {
+                (self.api.cuLaunchKernelEx)(
+                    &config,
+                    f.0 as CUfunction,
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernelEx",
+        )
     }
 
     /// Rank-3 bf16 map over a `[n_kv_head][ring_rows][hd]` KV cache tensor: globalDim
@@ -1095,7 +1384,7 @@ impl CudaBackend {
     /// On a poisoned context this short-circuits with the recorded fault
     /// BEFORE calling the driver — every public entry point crosses here, so
     /// this is what stops a dead context from flooding the log.
-    fn bind(&self) -> Result<()> {
+    pub(crate) fn bind(&self) -> Result<()> {
         if let Some(info) = self.poisoned.get() {
             return Err(RuntimeError::DeviceFault { info: info.clone() });
         }
@@ -1808,6 +2097,10 @@ impl CudaBackend {
         stream: &CudaStream,
     ) -> Result<()> {
         self.bind()?;
+        if let Some(f) = self.small_copy_for(src.as_ptr() as usize, dptr, src.len(), SMALL_COPY_MAX)
+        {
+            return self.launch_small_copy(f, src.as_ptr() as u64, dptr, src.len(), stream);
+        }
         self.check(
             // SAFETY: caller upholds the lifetime/range contract above.
             unsafe {
@@ -1834,6 +2127,11 @@ impl CudaBackend {
         stream: &CudaStream,
     ) -> Result<()> {
         self.bind()?;
+        if let Some(f) =
+            self.small_copy_for(dst.as_mut_ptr() as usize, dptr, dst.len(), SMALL_COPY_MAX)
+        {
+            return self.launch_small_copy(f, dptr, dst.as_mut_ptr() as u64, dst.len(), stream);
+        }
         self.check(
             // SAFETY: caller upholds the lifetime/range contract above.
             unsafe {
@@ -1919,6 +2217,17 @@ impl CudaBackend {
         )
     }
 
+    /// `poison-tables` builds: fill a per-launch device table with 0xFF before the launch writes
+    /// its entries, so entries it leaves stale read as out-of-range ids. A no-op otherwise.
+    pub fn poison_table(&self, dptr: u64, n: u64, stream: &CudaStream) -> Result<()> {
+        #[cfg(feature = "poison-tables")]
+        if n > 0 {
+            return self.memset_d8_async(dptr, 0xFF, n as usize, stream);
+        }
+        let _ = (dptr, n, stream);
+        Ok(())
+    }
+
     /// A CUDA event. `timing = true` supports [`Self::event_elapsed_ms`]
     /// (device-timeline instrumentation); `false` records cheaper (sync-only).
     pub fn event_create(&self, timing: bool) -> Result<CudaEvent> {
@@ -1993,6 +2302,7 @@ impl CudaBackend {
     /// scarce OS resource, not just process memory).
     pub fn host_alloc_pinned(&self, bytes: usize) -> Result<PinnedHost> {
         let ptr = self.host_alloc(bytes)?;
+        self.freer.pinned.lock().insert(ptr as usize, bytes);
         Ok(PinnedHost {
             ptr,
             len: bytes,
@@ -2069,6 +2379,38 @@ impl CudaBackend {
             unsafe { (self.api.cuModuleUnload)(raw as CUmodule) },
             "cuModuleUnload",
         )
+    }
+
+    /// Run `f` (an engine load) and, when it fails, unload every module this thread loaded
+    /// inside it. Modules are not RAII, so a load refused after its first `module_load` (a
+    /// rejected object, an OOM mid-load) otherwise pinned the cubins and their image copies
+    /// until process exit, once per failed attempt. Modules a failed load's own teardown
+    /// already unloaded are skipped.
+    pub fn unload_modules_on_err<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let outer = LOAD_SCOPE.with(|s| s.borrow_mut().replace(Vec::new()));
+        // A panicking load is swept too, then resumes unwinding.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let ids = LOAD_SCOPE.with(|s| std::mem::replace(&mut *s.borrow_mut(), outer));
+        let ids = ids.unwrap_or_default();
+        if let Ok(Ok(_)) = &r {
+            LOAD_SCOPE.with(|s| {
+                if let Some(outer) = s.borrow_mut().as_mut() {
+                    outer.extend(ids);
+                }
+            });
+        } else {
+            let swept = ids
+                .into_iter()
+                .filter(|&id| self.module_unload(&Module { id }).is_ok())
+                .count();
+            tracing::debug!(swept, "unloaded the modules of a failed load");
+        }
+        r.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    /// Modules currently loaded through this backend (lifecycle accounting).
+    pub fn live_modules(&self) -> usize {
+        self.modules.lock().len()
     }
 
     /// `(free, total)` device memory in bytes (`cuMemGetInfo`) — the VRAM
@@ -2281,6 +2623,10 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
 
     fn free_bytes(&self) -> Option<u64> {
         self.mem_info().ok().map(|(free, _)| free)
+    }
+
+    fn quiesce(&self) -> Result<()> {
+        self.synchronize()
     }
 
     fn free(&self, va: u64) {
@@ -2767,6 +3113,11 @@ impl Backend for CudaBackend {
         let id = self.next_module.fetch_add(1, Ordering::Relaxed);
         self.modules.lock().insert(id, m as usize);
         self.module_images.lock().insert(id, image.to_vec());
+        LOAD_SCOPE.with(|s| {
+            if let Some(ids) = s.borrow_mut().as_mut() {
+                ids.push(id);
+            }
+        });
         Ok(Module { id })
     }
     fn launch_persistent(&self, module: &Module, _cfg: LaunchCfg) -> Result<()> {

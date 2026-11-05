@@ -261,8 +261,8 @@ the shared AMD engine. Evidence covers a full-causal MLA model and a sliding-win
 latter byte-identical. `PLOW_RAGGED_CHUNK=0` is the escape hatch and is byte-identical to the
 pre-flip engine.
 
-**The cheapest cross-pollination runs the other way.** NVIDIA already reads its launch cost from
-config (`nv.pf_chunk_cost`, `PLOW_PF_CHUNK_COST`, default 512 rows) where AMD hardcodes
+**The cheapest cross-pollination runs the other way.** NVIDIA keeps its launch cost in one
+constant (`exec::gpu::PF_CHUNK_COST_ROWS`, 512 rows; the `PLOW_PF_CHUNK_COST` knob was removed) where AMD hardcodes
 `LAUNCH_ROWS`. AMD should adopt that **only as a fallback for the non-ragged path** — under
 ragged-M neither engine's constant is consulted, so tuning it is work on a path ragged-M deletes.
 

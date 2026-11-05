@@ -3,27 +3,26 @@
 > The compiler is two distinct halves with a clean interface: the **rewriting half** (egglog) finds the best equivalent computation; the **scheduling half** maps it to hardware.
 
 > [!WARNING]
-> **The rewriting half described below is not in the shipping emit path.** This
-> document describes the pipeline as DESIGNED. As built:
+> **The rewriting half reaches a packet only as a fusion-site oracle.** This document
+> describes the pipeline as DESIGNED. As built:
 >
 > * `plowc`'s plan path lowers the **raw** `nn_graph::Graph` (`plan_from_all_blocks`).
->   The `FusedGraph` is computed for statistics and discarded. `plan_from_fused` — the
->   only bridge that consumes a fused term — has no production caller.
-> * `plowc --emit devblob` (the path every gfx950 asset is built with) calls
->   `report_devblob_egglog`, which saturates a second graph, `info!`s the fusion count,
->   and drops it. On Gemma-4-31B that is `graph_ops=1444, fusions_found=662`, **0 applied**.
-> * `crates/devgen/Cargo.toml` has **no `rewrite`/`egglog` dependency**, so no fused
->   term can reach the emitter even in principle.
+>   `plan_from_fused` — the only bridge that consumes a fused term — has no production caller.
+> * `plowc --emit devblob` (the path every shipping GPU asset is built with), under
+>   `PLOW_EMIT_REWRITE` (default on since 2026-09-14, e64b6d840), extracts the whole-graph
+>   rewrite from the checkpoint's `config.json` (`rewrite::fused_sites_for_config`) and passes
+>   fused kind → anchor weight names to devgen (`crates/devgen/src/rewrite_lower.rs`). devgen
+>   then emits its hand-written fused opcodes (`AddNorm`, `NormResidualNorm`, `NormLinear`,
+>   `GatedMlp`, `NormRope`, `Residual3Norm`, conv activations) only where the extracted graph
+>   fused that site. An architecture without a rewrite keeps the hand fusions;
+>   `PLOW_EMIT_REWRITE=1` makes a missing rewrite fatal.
+> * The same extracted graph feeds a fail-closed semantic-coverage gate over the finished
+>   program (`crates/plowc/src/fusion_coverage.rs`).
+> * `crates/devgen/Cargo.toml` has `rewrite` only as a dev-dependency: no fused *term* reaches
+>   the emitter, only site names, and every device kernel is hand-written in `devgen`.
 >
-> **No egglog rewrite reaches a GPU.** Measured coverage on Gemma-4-12B: 0 of 1156 ops,
-> 0 of 24,226 GFLOP (`perf-data/px18-egglog-wholemodel.md`). Every fusion in a shipped
-> packet — `GemvQkv` (op 22), `GemvGlu` (op 19), `NormResidualNorm` — is hand-written in
-> `devgen`.
->
-> Wiring it up is **not** a measured perf lever: A/B on gfx950 shows deleting 100
-> packets/token is worth ≤0.064 ms, and the +100-gate arm actually ran *faster*
-> (17.704 vs 18.070 ms/token, n=8). Sections 2–3 below therefore document intent and a
-> working library, not a stage that runs on the way to an asset.
+> The scheduling half (Stages 4–5) does not run on the way to an asset. Sections 2–3 below
+> document intent and a working library plus the fusion decisions above.
 
 ---
 
@@ -88,8 +87,8 @@ DeepSeek, GLM, Kimi, SigLIP.
 > does **not** build an `nn_graph::Graph`. `plowc::hf_config` synthesizes a
 > full-model `LayerPlan` directly from `config.json` dimensions (compile-time
 > layer unroll) and feeds it straight to `assemble`, bypassing Stages 2–3
-> entirely. The `nn_graph::Graph` → egglog path is exercised only by the advisory
-> `report_devblob_egglog` fusion count.
+> entirely. The `nn_graph::Graph` → egglog path runs only to extract the fused sites that
+> `PLOW_EMIT_REWRITE` hands to devgen (above).
 
 ### Design Decision: nn-graph as a Workspace Crate
 
@@ -320,7 +319,7 @@ Optional (controlled by `--lean-verify` flag). Each bucket's compiled output is 
 | E | Wire format round-trips correctly |
 | F | Address-map allocation non-overlapping + within arena |
 
-See [08-formal-verification.md](08-formal-verification.md) for details.
+The devblob emit additionally runs checkpoint K (knob consistency, default on; needs `PLOW_VERIFY_BIN` or `plow_verify` on `PATH`). See [08-formal-verification.md](08-formal-verification.md) for the full set (A–G, K, S, P, R, L).
 
 ---
 
@@ -328,7 +327,7 @@ See [08-formal-verification.md](08-formal-verification.md) for details.
 
 | Artifact | Format | Consumer |
 |----------|--------|----------|
-| `{stem}.pkt` | Binary packet stream (v5) | Runtime interpreter |
+| `{stem}.pkt` | Binary packet stream (v7) | Runtime interpreter |
 | `{stem}.map.json` | Address map (arena layout) | Runtime memory allocator |
 | `{stem}.blocks.json` | Per-block task ranges | Pipeline-parallel sharding |
 | `{stem}.experts.json` | MoE routing metadata | Expert-parallel dispatch |

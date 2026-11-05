@@ -190,12 +190,6 @@ pub struct RuntimeConfig {
     #[arg(long = "fusion", env = "PLOW_FUSION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub fusion: bool,
 
-    /// Select unified token batching when the backend, model and object support it.
-    /// Unsupported configurations use ordinary execution; --fusion takes precedence.
-    /// Disable with --token-batch=false or PLOW_TOKEN_BATCH=0.
-    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", hide = true, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub token_batch: bool,
-
     /// Prefix reuse on compatible AMD and NVIDIA assets.
     #[arg(long = "prefix-cache", env = "PLOW_PREFIX_CACHE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_cache: bool,
@@ -293,11 +287,6 @@ pub struct RuntimeConfig {
     )]
     pub asr_encode_hold_inflight: usize,
 
-    /// Lean receipt qualification at packet load (`certificate_checks`): `off` keeps the
-    /// pre-policy behavior, `report` logs every gap, `strict` refuses a packet with any gap.
-    #[arg(long = "lean-qualify", env = "PLOW_LEAN_QUALIFY", default_value = "off", value_parser = ["off", "report", "strict"], global = true)]
-    pub lean_qualify: String,
-
     /// Upper bound (tokens) on an audio-LM request's context (`prompt`). The context is otherwise
     /// sized per request to what the window leaves after the template, the audio and the output
     /// reserve, trimmed from its oldest words. 0 = no bound beyond the window.
@@ -314,6 +303,12 @@ pub struct RuntimeConfig {
     /// runs, and ends streaming turns in place of the energy endpointer. Unset = none of these.
     #[arg(long = "asr-vad-packet", env = "PLOW_ASR_VAD_PACKET", global = true)]
     pub asr_vad_packet: Option<std::path::PathBuf>,
+
+    /// WebSocket finals from the session's batched encoder stream (packets with one): the stream
+    /// runs as audio arrives and its final decodes the offline transcription's rows. Off: each
+    /// final transcribes the whole recording again.
+    #[arg(long = "asr-stream-finals", env = "PLOW_ASR_STREAM_FINALS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub asr_stream_finals: bool,
 
     /// Write spoken digit runs in transcripts as numerals (`asr::numerals`): "nine one eight seven
     /// three four one five three eight" becomes "918-734-1538".
@@ -663,19 +658,6 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-ring-recycle", env = "PLOW_VMM_RING_RECYCLE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_ring_recycle: bool,
 
-    /// CUDA VMM prefix live rings: keep up to N released slots' sliding-ring units mapped in
-    /// place (parked) instead of returning them to the driver. Readmitting a parked slot costs no
-    /// driver call (otherwise unmap + cuMemCreate + map + set_access per unit, ~8 ms a request on
-    /// Gemma-4 26B); held memory is bounded by N slots. 0 = off.
-    #[arg(
-        long = "vmm-ring-park",
-        env = "PLOW_VMM_RING_PARK",
-        default_value_t = 0,
-        hide = true,
-        global = true
-    )]
-    pub vmm_ring_park: u32,
-
     /// CUDA unified token batch: admit (begin_slot + prefix attach) requests the next launch
     /// takes while the current prefill launch runs on the device, instead of before it, whenever
     /// the launch is already full of admitted rows. Admission then costs no GPU time.
@@ -864,6 +846,12 @@ pub struct RuntimeConfig {
     )]
     pub cosched_max_wait_ms: Option<u32>,
 
+    /// Expert: under `--co-sched rr|deadline`, hand a spent device turn on as soon as the tick
+    /// returns instead of at the model's next tick (`serve::cosched::Turn::finish`); `false` is
+    /// the rollback.
+    #[arg(long = "cosched-early-release", env = "PLOW_COSCHED_EARLY_RELEASE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", hide = true, global = true)]
+    pub cosched_early_release: bool,
+
     /// `serve --max-queued-requests` when that flag is 0 (a packet serve default lands here).
     #[arg(
         long = "serve-max-queued-requests",
@@ -877,8 +865,9 @@ pub struct RuntimeConfig {
     ///
     /// This is a security boundary, not ergonomics: loading a bundle loads and
     /// EXECUTES its cubins/hsaco, so an unconstrained path in a request body is
-    /// arbitrary code execution. Unset = only the assets dirs the process was
-    /// started with (their parents) are reachable.
+    /// arbitrary code execution. Always reachable as well: the parents of the
+    /// assets dirs the process was started with, and the local store's
+    /// `bundles/` (signature-checked pulls). Never the working directory.
     #[arg(
         long = "models-root",
         env = "PLOW_MODELS_ROOT",
@@ -919,16 +908,18 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-publish-shared", env = "PLOW_VMM_PUBLISH_SHARED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_publish_shared: bool,
 
-    /// Pinned host memory (MiB) for the prefix cache's host tier (the second level of its
-    /// LRU: evicted boundaries spill there and attach from there). Unset = sized by the
-    /// host-reserve rule (`MemAvailable` minus an eighth of RAM, at least 16 GiB); `0` = no
-    /// host tier.
+    /// Pinned host memory for the KV cache's host tier (the second level of the prefix cache's
+    /// LRU: evicted boundaries spill there and attach from there), as `<n>MB` or `<n>GB`
+    /// (binary: MiB, GiB; case-insensitive). Unset or `auto` = sized by
+    /// `memory::vmm::host_tier_default`: `MemAvailable` minus the host reserve (an eighth of RAM,
+    /// at least 16 GiB), capped at a quarter of RAM (AMD: no host tier); `0` = no host tier.
     #[arg(
-        long = "vmm-host-cache-mib",
-        env = "PLOW_VMM_HOST_CACHE_MIB",
+        long = "host-kvcache-size",
+        env = "PLOW_HOST_KVCACHE_SIZE",
+        value_parser = parse_host_kvcache_size,
         global = true
     )]
-    pub vmm_host_cache_mib: Option<u64>,
+    pub host_kvcache_size: Option<HostKvcacheSize>,
 
     /// CUDA VMM prefix cache: seconds a request with
     /// `X-Session-Id` keeps its newest boundary protected from LRU after its last use; then the
@@ -968,8 +959,8 @@ pub struct RuntimeConfig {
     /// the cost is the full-width `q_absorb`/`q_rope`/`o_proj` twins resident on every rank, so
     /// turning it off has to skip BINDING them, not just dispatching to them. Off, a packet that
     /// carries the siblings costs only their program records.
-    #[arg(long = "glm-rowband", env = "PLOW_GLM_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub glm_rowband: bool,
+    #[arg(long = "rowband", env = "PLOW_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub rowband: bool,
     /// Expert: widest decode rung a serving engine admits; unset = no ceiling.
     #[arg(
         long = "decode-max-rung",
@@ -1710,6 +1701,11 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-attn-gemm-grouped", env = "PLOW_PF_ATTN_GEMM_GROUPED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_attn_gemm_grouped: bool,
 
+    /// Run the packet-declared library prefill attention segments (`segment_roles.json`
+    /// `library`). `=0` runs their declared native roles instead (A/B and rollback).
+    #[arg(long = "pf-attn-library", env = "PLOW_PF_ATTN_LIBRARY", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_attn_library: bool,
+
     /// Diagnostic: per-class wall attribution via one event pair per segment.
     #[arg(long = "pf-seg-time", env = "PLOW_PF_SEG_TIME", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_time: bool,
@@ -1777,12 +1773,16 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "lt-rung-algos", env = "PLOW_LT_RUNG_ALGOS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lt_rung_algos: bool,
 
+    /// A packet's native block-scaled FP8 decode object serves its declared projections; `=0`
+    /// keeps them on cuBLASLt (same-packet A/B).
+    #[arg(long = "nv-fp8-block-native", env = "PLOW_NV_FP8_BLOCK_NATIVE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub fp8_block_native: bool,
+
     /// Prefill FP8 (W8A8 vector-scale) cuBLASLt projections with K at most this run with
     /// `CUBLASLT_MATMUL_DESC_FAST_ACCUM` (wgmma accumulation without periodic FP32 promotion, as
     /// vLLM's CUTLASS FP8 kernels). Unset = off. H100 standalone at M=4096: q 102 -> 88 us,
     /// gate 374 -> 331 us; down (K 15360) unchanged with 2x the rel-L2, hence the K bound.
-    /// cuBLASLt decode rungs keep promoted accumulation (no measured gain at B=64); the CUTLASS
-    /// decode route (`--cutlass-fp8-decode`) applies the same K bound.
+    /// cuBLASLt decode rungs keep promoted accumulation (no measured gain at B=64).
     #[arg(
         long = "lt-fp8-fast-accum-max-k",
         env = "PLOW_LT_FP8_FAST_ACCUM_MAX_K",
@@ -1800,17 +1800,6 @@ pub struct NvidiaRuntimeConfig {
         global = true
     )]
     pub pf_norm_row_blocks: u32,
-
-    /// `<cubin sha256>:<host library sha256>` of `cutlass_fp8_decode_sm90.cubin` and its Params
-    /// marshaller `libplow_cutlass_fp8_decode_sm90.so` in `--pf-seg-dir`: routed FP8 W8A8 decode
-    /// projections with M <= 128 run those CUTLASS swap-AB kernels instead of cuBLASLt (no ~13 us
-    /// small-M floor). Other bytes are rejected. Unset = cuBLASLt.
-    #[arg(
-        long = "cutlass-fp8-decode",
-        env = "PLOW_CUTLASS_FP8_DECODE",
-        global = true
-    )]
-    pub cutlass_fp8_decode: Option<String>,
 
     /// A routed decode rung's one-instruction AddNorm / Glu segments run as ordinary launches
     /// of the decode object's light kernel instead of interpreter windows.
@@ -1839,9 +1828,11 @@ pub struct NvidiaRuntimeConfig {
     /// Decode rungs of at least this many rows run each attention pair the packet declares
     /// with the generated decode role (an isolated FlashDecode + FlashMerge) as one launch of
     /// the generated flash-decode object between interpreter windows; narrower rungs, and 0,
-    /// run the untouched interpreter pair in one launch. 4: the object wins from four rows
-    /// (Qwen3.8-27B H100, knob_spec evidence); at one or two rows the interpreter's single
-    /// launch is as fast or faster.
+    /// run the untouched interpreter pair in one launch. 4: the object wins from four rows on a
+    /// packet whose decode rungs are one interpreter launch (Qwen3.8-27B BF16 H100, knob_spec
+    /// evidence; 1 measured slower there at one and two rows). The Qwen3.8-27B FP8 H100 packet,
+    /// whose projections already split each rung into windows, wins from one row (ctx 4096):
+    /// its recipe sets 1.
     #[arg(
         long = "gen-decode-step",
         env = "PLOW_GEN_DECODE_STEP",
@@ -1882,24 +1873,30 @@ pub struct NvidiaRuntimeConfig {
     /// of the prefill object's `plow_<arch>_light_pf` kernel on this many blocks per SM instead
     /// of interpreter windows. 0 = windows.
     #[arg(
-        long = "qwen-light-occ",
-        env = "PLOW_QWEN_LIGHT_OCC",
+        long = "gdn-light-occ",
+        env = "PLOW_GDN_LIGHT_OCC",
         default_value_t = 4,
         global = true
     )]
-    pub qwen_light_occ: u32,
+    pub gdn_light_occ: u32,
 
     /// A cuBLASLt-routed decode rung's Qwen3.5 pointwise windows (norms, gates, rope) run as
-    /// `plow_<arch>_light_pf` launches on the `--qwen-light-occ` grid instead of interpreter
+    /// `plow_<arch>_light_pf` launches on the `--gdn-light-occ` grid instead of interpreter
     /// windows (the same block-per-row bodies: the outputs are the window's).
-    #[arg(long = "qwen-light-decode", env = "PLOW_QWEN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub qwen_light_decode: bool,
+    #[arg(long = "gdn-light-decode", env = "PLOW_GDN_LIGHT_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gdn_light_decode: bool,
+
+    /// A routed decode segment [producer -> QuantFp8 in 1x128 groups] (RMSNorm, gated norm,
+    /// SiLU Glu, sigmoid gate) runs as one `plow_<arch>_light_quant[_norm]` launch instead of an
+    /// interpreter window; needs the object's `plow_light_quant_abi` 1 or 2.
+    #[arg(long = "light-quant", env = "PLOW_LIGHT_QUANT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub light_quant: bool,
 
     /// A packed Qwen3.5 prefill chunk's segments between its per-tick launches (the external GDN
     /// segments, the rider attention) replay as CUDA graph pieces captured once per bucket
     /// (needs `--pf-seg-graph`).
-    #[arg(long = "qwen-pf-graph", env = "PLOW_QWEN_PF_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub qwen_pf_graph: bool,
+    #[arg(long = "gdn-pf-graph", env = "PLOW_GDN_PF_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gdn_pf_graph: bool,
 
     /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
     /// weights are contiguous and a light attention launch reads the three outputs.
@@ -2399,11 +2396,7 @@ pub struct AmdRuntimeConfig {
     /// DSA sparse prefill chunk floor: a chunk on the sparse prefill rung whose context end
     /// (`c0 + clen`) is at most this many tokens skips the indexer selection and runs the dense
     /// flash. Unset = every chunk of the sparse rung is sparse.
-    #[arg(
-        long = "glm-dsa-pf-min-ctx",
-        env = "PLOW_GLM_DSA_PF_MIN_CTX",
-        global = true
-    )]
+    #[arg(long = "dsa-pf-min-ctx", env = "PLOW_DSA_PF_MIN_CTX", global = true)]
     pub dsa_pf_min_ctx: Option<u32>,
 
     /// With the tail-sparse floor: the dense final chunk moves only when `prior x tail rows` (the
@@ -2661,8 +2654,8 @@ pub struct AmdRuntimeConfig {
     /// row-band wrong-answer defect: that defect is armed by any ordinary program-3 execution in
     /// the 8192 bucket, and this workspace is the only device memory both paths share that no
     /// per-sequence clear covers. Hundreds of MB of H2D per dispatch — never leave it on.
-    #[arg(long = "amd-glm-rowband-clear-ws", env = "PLOW_GLM_ROWBAND_CLEAR_WS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub glm_rowband_clear_ws: bool,
+    #[arg(long = "amd-rowband-clear-ws", env = "PLOW_ROWBAND_CLEAR_WS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub rowband_clear_ws: bool,
 
     /// Run native GLM MoE prefill rows >= 1024 on AITER's 64-row persistent tile
     /// (`..._psx_64x256.co`), the object its GLM-5 gfx942 tuning selects there.
@@ -2834,6 +2827,15 @@ fn select_compat<T>(parsed: T, environment: Option<T>, allow_environment: bool) 
 }
 
 impl RuntimeConfig {
+    /// The environment as a fallback for an env-backed field, read only before the process
+    /// config exists (library embedders): an initialized config already parsed it, and an
+    /// engine config deliberately ignores what startup exported for another bundle.
+    fn env_fallback(var: &str) -> Option<String> {
+        (!Self::is_initialized())
+            .then(|| Self::env_nonempty(var))
+            .flatten()
+    }
+
     fn env_bool(var: &str) -> Option<bool> {
         let value = std::env::var(var).ok()?;
         Some(matches!(
@@ -2938,7 +2940,7 @@ impl RuntimeConfig {
             .nv
             .vmm_live_rings_models
             .clone()
-            .or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+            .or_else(|| Self::env_fallback("PLOW_VMM_LIVE_RINGS_MODELS"));
         let listed = spec.is_some_and(|spec| {
             served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
         });
@@ -2955,7 +2957,7 @@ impl RuntimeConfig {
             .nv
             .vmm_live_rings_models
             .clone()
-            .or_else(|| Self::env_nonempty("PLOW_VMM_LIVE_RINGS_MODELS"));
+            .or_else(|| Self::env_fallback("PLOW_VMM_LIVE_RINGS_MODELS"));
         spec.is_some_and(|spec| {
             served_name(assets_dir).is_some_and(|slug| spec.split(',').any(|m| m.trim() == slug))
         })
@@ -2973,7 +2975,7 @@ impl RuntimeConfig {
     pub fn live_ctx(&self) -> Option<u32> {
         self.amd
             .live_ctx
-            .or_else(|| Self::env_nonempty("PLOW_LIVE_CTX").and_then(|v| v.parse().ok()))
+            .or_else(|| Self::env_fallback("PLOW_LIVE_CTX").and_then(|v| v.parse().ok()))
     }
 
     /// Live bound for the packet in `assets_dir`: its served name's `--live-ctx-models` entry,
@@ -2983,7 +2985,7 @@ impl RuntimeConfig {
             .amd
             .live_ctx_models
             .clone()
-            .or_else(|| Self::env_nonempty("PLOW_LIVE_CTX_MODELS"));
+            .or_else(|| Self::env_fallback("PLOW_LIVE_CTX_MODELS"));
         let per_model = spec.and_then(|spec| {
             let slug = served_name(assets_dir)?;
             spec.split(',').find_map(|kv| {
@@ -3239,14 +3241,21 @@ impl RuntimeConfig {
         )
     }
 
-    /// `None` = unset (the store sizes its host tier by the host-reserve rule); `Some(0)` = off.
-    pub(crate) fn vmm_host_cache_bytes(&self) -> Option<u64> {
-        let mib = if Self::is_initialized() {
-            self.vmm_host_cache_mib
+    /// `None` = unset or `auto` (the store sizes its host tier by the host-reserve rule);
+    /// `Some(0)` = off.
+    pub(crate) fn host_kvcache_bytes(&self) -> Option<u64> {
+        let size = if Self::is_initialized() {
+            self.host_kvcache_size
         } else {
-            Self::env_parse("PLOW_VMM_HOST_CACHE_MIB").or(self.vmm_host_cache_mib)
+            std::env::var("PLOW_HOST_KVCACHE_SIZE")
+                .ok()
+                .and_then(|v| parse_host_kvcache_size(&v).ok())
+                .or(self.host_kvcache_size)
         };
-        mib.map(|m| m << 20)
+        match size? {
+            HostKvcacheSize::Auto => None,
+            HostKvcacheSize::Bytes(b) => Some(b),
+        }
     }
 
     pub(crate) fn prefix_session_ttl(&self) -> std::time::Duration {
@@ -3282,10 +3291,10 @@ impl RuntimeConfig {
         )
     }
 
-    pub(crate) fn glm_rowband(&self) -> bool {
+    pub(crate) fn rowband(&self) -> bool {
         select_compat(
-            self.glm_rowband,
-            Self::env_bool("PLOW_GLM_ROWBAND"),
+            self.rowband,
+            Self::env_bool("PLOW_ROWBAND"),
             !Self::is_initialized(),
         )
     }
@@ -3327,13 +3336,41 @@ impl RuntimeConfig {
     /// without running `main()`'s CLI parse; parsing an empty argv lets clap's
     /// `env` attributes do the reading, so the `PLOW_*` contract holds for
     /// every entry point. Cold-path accessor — one atomic load once cached.
+    ///
+    /// Engine code (`exec/`, `memory/`, the dispatcher) must run under its model's scope once
+    /// models diverge: an unscoped read there would take another model's knobs. That is checked
+    /// at the caller — a panic in debug builds, one warning per call site in release.
+    #[track_caller]
+    #[inline]
     pub fn get() -> &'static RuntimeConfig {
+        if let Some(c) = SCOPED.with(std::cell::Cell::get) {
+            return c;
+        }
+        if ENGINES_DIVERGE.load(std::sync::atomic::Ordering::Relaxed) {
+            unscoped_engine_read(std::panic::Location::caller());
+        }
+        Self::process()
+    }
+
+    /// The process config, for a process-scoped knob read in engine code (exempt from the
+    /// engine-scope check of [`Self::get`]).
+    pub fn process_get() -> &'static RuntimeConfig {
+        Self::process()
+    }
+
+    /// The process config, ignoring any engine scope.
+    fn process() -> &'static RuntimeConfig {
         if let Some(c) = RUNTIME_CONFIG.get() {
             return c;
         }
         static FALLBACK: OnceLock<RuntimeConfig> = OnceLock::new();
         FALLBACK.get_or_init(|| {
             use clap::Parser;
+            // Fails like the parse below does on a bad value.
+            if let Err(e) = crate::knob_spec::refuse_renamed_env(|k| std::env::var(k).ok()) {
+                eprintln!("plowrt: {e}");
+                std::process::exit(2);
+            }
             #[derive(Parser)]
             struct EnvOnly {
                 #[command(flatten)]
@@ -3342,6 +3379,284 @@ impl RuntimeConfig {
             EnvOnly::parse_from(["plowrt"]).cfg
         })
     }
+}
+
+thread_local! {
+    /// The engine config of the model this thread is working for ([`scoped`]): what
+    /// [`RuntimeConfig::get`] returns while it is set.
+    static SCOPED: std::cell::Cell<Option<&'static RuntimeConfig>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Some engine runs a config other than the process one ([`bundle_config`]): from then on an
+/// unscoped config read in engine code is a wrong-model read.
+static ENGINES_DIVERGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Source files whose code runs for one model's engine, relative to this crate's `src/`.
+const ENGINE_SOURCES: &[&str] = &["exec/", "memory/", "serve/engine.rs", "serve/mux.rs"];
+
+fn engine_source(file: &str) -> bool {
+    // `Location::file` spells paths as `file!()` does in this build (workspace-relative,
+    // absolute or remapped): strip the same prefix this file has.
+    let src = file!().strip_suffix("config.rs").unwrap_or("");
+    let Some(rel) = file.strip_prefix(src) else {
+        return false;
+    };
+    ENGINE_SOURCES.iter().any(|p| rel.starts_with(p))
+}
+
+/// Mark engine configs as diverged, so the engine-scope check of [`RuntimeConfig::get`] runs
+/// without a co-served bundle (tests).
+#[doc(hidden)]
+pub fn check_engine_scope() {
+    ENGINES_DIVERGE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cold]
+#[inline(never)]
+fn unscoped_engine_read(at: &'static std::panic::Location<'static>) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Sites already reported (release): one bit per hashed site, so a repeated read costs one
+    // load and no lock (a collision only drops a second site's warning).
+    static SEEN: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (at.file(), at.line(), at.column()).hash(&mut h);
+    let h = h.finish() as usize % (64 * 64);
+    let (word, bit) = (&SEEN[h / 64], 1u64 << (h % 64));
+    if word.load(Ordering::Relaxed) & bit != 0 || !engine_source(at.file()) {
+        return;
+    }
+    let first = word.fetch_or(bit, Ordering::Relaxed) & bit == 0;
+    let thread = std::thread::current();
+    let msg = format!(
+        "engine code read the runtime config with no engine scope at {at} on thread {:?}: \
+         with co-served models it gets the process config, not its own model's",
+        thread.name().unwrap_or("<unnamed>")
+    );
+    if cfg!(debug_assertions) {
+        panic!("{msg}");
+    }
+    if first {
+        tracing::warn!("{msg}");
+    }
+}
+
+/// The engine scope this thread runs under, to carry onto a thread or task it starts.
+pub fn current_scope() -> Option<&'static RuntimeConfig> {
+    SCOPED.with(std::cell::Cell::get)
+}
+
+/// Run `f` with `cfg` as this thread's engine scope (`None` = the process config), restoring
+/// the previous scope after, also on unwind.
+pub fn scoped<R>(cfg: Option<&'static RuntimeConfig>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<&'static RuntimeConfig>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPED.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(SCOPED.with(|s| s.replace(cfg)));
+    f()
+}
+
+/// `f` under the calling thread's engine scope, for a thread an engine starts (its host-tier
+/// grower, spill-ahead, store workers): without it, the thread read the process config.
+pub fn inherit<R>(f: impl FnOnce() -> R) -> impl FnOnce() -> R {
+    let scope = current_scope();
+    move || scoped(scope, f)
+}
+
+/// A future polled (and dropped) under an engine scope: a model's dispatcher task, which tokio
+/// may poll on any worker thread.
+pub struct Scoped<F: std::future::Future> {
+    cfg: Option<&'static RuntimeConfig>,
+    fut: Option<std::pin::Pin<Box<F>>>,
+}
+
+impl<F: std::future::Future> Scoped<F> {
+    pub fn new(cfg: Option<&'static RuntimeConfig>, fut: F) -> Self {
+        Scoped {
+            cfg,
+            fut: Some(Box::pin(fut)),
+        }
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for Scoped<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let this = self.get_mut();
+        let fut = this.fut.as_mut().expect("polled after completion");
+        scoped(this.cfg, || fut.as_mut().poll(cx))
+    }
+}
+
+impl<F: std::future::Future> Drop for Scoped<F> {
+    fn drop(&mut self) {
+        let fut = self.fut.take();
+        scoped(self.cfg, || drop(fut));
+    }
+}
+
+/// The settings every engine config starts from: runtime args given on the command line, and
+/// the packet serve defaults startup exported into the environment (which are not the
+/// operator's, and so lose to each engine's own bundle).
+pub struct Startup {
+    cli: Vec<(String, Vec<std::ffi::OsString>)>,
+    exported: std::collections::BTreeMap<String, String>,
+}
+
+static STARTUP: OnceLock<Startup> = OnceLock::new();
+
+impl Startup {
+    /// `cli`: arg id -> raw values given on the command line; `exported`: what startup exported.
+    pub fn new(
+        cli: Vec<(String, Vec<std::ffi::OsString>)>,
+        exported: std::collections::BTreeMap<String, String>,
+    ) -> Startup {
+        Startup { cli, exported }
+    }
+
+    pub fn from_matches(
+        m: &clap::ArgMatches,
+        exported: impl IntoIterator<Item = (String, String)>,
+    ) -> Startup {
+        use clap::Args;
+        let cmd = RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+        let cli = cmd
+            .get_arguments()
+            .map(|a| a.get_id().as_str())
+            .filter(|id| m.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
+            .filter_map(|id| {
+                let raw = m.get_raw(id)?.map(|v| v.to_os_string()).collect();
+                Some((id.to_string(), raw))
+            })
+            .collect();
+        Startup {
+            cli,
+            exported: exported.into_iter().collect(),
+        }
+    }
+}
+
+/// Record the startup inputs of [`bundle_config`] (once, from `main`, after the CLI parse).
+pub fn record_startup(startup: Startup) {
+    let _ = STARTUP.set(startup);
+}
+
+/// The config of an engine whose bundle asks `defaults` (engine-scoped `(env, value)` pairs).
+/// Per engine-scoped knob: the command line, else the operator's environment, else `defaults`,
+/// else the built-in default; every process-scoped knob as the process has it.
+///
+/// Built by the same clap parse as the process config, with each packet default as the arg's
+/// default value (one value parser, one precedence), never by rewriting argv or the environment.
+pub fn resolve_engine(
+    st: &Startup,
+    defaults: &[(String, String)],
+) -> std::result::Result<RuntimeConfig, String> {
+    use clap::{Args, FromArgMatches};
+    fn leak(v: &str) -> &'static str {
+        Box::leak(v.to_owned().into_boxed_str())
+    }
+    let mut cmd = RuntimeConfig::augment_args(clap::Command::new("plowrt"));
+    let args: Vec<(String, Option<String>)> = cmd
+        .get_arguments()
+        .map(|a| {
+            let env = a.get_env().map(|e| e.to_string_lossy().into_owned());
+            (a.get_id().to_string(), env)
+        })
+        .collect();
+    for (id, env) in args {
+        if let Some((_, raw)) = st.cli.iter().find(|(i, _)| *i == id) {
+            let vals: Vec<&'static std::ffi::OsStr> = raw
+                .iter()
+                .map(|v| &*Box::leak(v.clone().into_boxed_os_str()))
+                .collect();
+            cmd = cmd.mut_arg(&id, |a| a.env(None::<&'static str>).default_values(vals));
+            continue;
+        }
+        let Some(env) = env else { continue };
+        if crate::knob_spec::knob_scope(&env) != Some(crate::knob_spec::KnobScope::Engine) {
+            continue;
+        }
+        let exported = st.exported.contains_key(&env);
+        if !exported && std::env::var_os(&env).is_some() {
+            continue;
+        }
+        let own = defaults
+            .iter()
+            .find(|(k, _)| *k == env)
+            .map(|(_, v)| leak(v));
+        cmd = cmd.mut_arg(&id, |a| {
+            let a = if exported {
+                a.env(None::<&'static str>)
+            } else {
+                a
+            };
+            match own {
+                Some(v) => a.default_value(v),
+                None => a,
+            }
+        });
+    }
+    let m = cmd
+        .try_get_matches_from(["plowrt"])
+        .map_err(|e| e.to_string())?;
+    RuntimeConfig::from_arg_matches(&m).map_err(|e| e.to_string())
+}
+
+/// The engine config for the bundle in `dir`: [`resolve_engine`] over its packet's engine-scoped
+/// serve defaults, resolved once per bundle and defaults (an engine owns the `&'static` and
+/// every reload of the bundle shares it). The process config itself when they agree — a
+/// single-model serve, whose startup exported exactly this bundle's defaults. Without a
+/// recorded startup (a library embedder) the process config.
+pub fn bundle_config(dir: &std::path::Path) -> crate::Result<&'static RuntimeConfig> {
+    let process = RuntimeConfig::process();
+    let Some(st) = STARTUP.get() else {
+        return Ok(process);
+    };
+    let all = crate::asset::serve::bundle_serve_defaults(dir)?
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let (defaults, shared): (Vec<_>, Vec<_>) = all.into_iter().partition(|(k, _)| {
+        crate::knob_spec::knob_scope(k) == Some(crate::knob_spec::KnobScope::Engine)
+    });
+    for (key, value) in &shared {
+        if std::env::var(key).ok().as_deref() != Some(value.as_str()) {
+            tracing::warn!(
+                bundle = %dir.display(), knob = %key, packet = %value,
+                "packet serve default is process-wide; this model runs with the process value"
+            );
+        }
+    }
+    static CACHE: std::sync::Mutex<
+        Vec<(
+            std::path::PathBuf,
+            Vec<(String, String)>,
+            &'static RuntimeConfig,
+        )>,
+    > = std::sync::Mutex::new(Vec::new());
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, cfg)) = cache.iter().find(|(d, k, _)| *d == canon && *k == defaults) {
+        return Ok(cfg);
+    }
+    let cfg = resolve_engine(st, &defaults).map_err(|e| {
+        crate::RuntimeError::Rejected(format!("{}: engine config: {e}", dir.display()))
+    })?;
+    let cfg: &'static RuntimeConfig = if format!("{cfg:?}") == format!("{process:?}") {
+        process
+    } else {
+        tracing::info!(bundle = %dir.display(), defaults = ?defaults, "engine config resolved for the bundle");
+        ENGINES_DIVERGE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Box::leak(Box::new(cfg))
+    };
+    cache.push((canon, defaults, cfg));
+    Ok(cfg)
 }
 
 /// Explicit runtime settings from the resolved CLI, in replayable environment spelling.
@@ -3390,6 +3705,48 @@ pub fn is_secret_env(name: &str) -> bool {
             .any(|suffix| upper.ends_with(suffix))
 }
 
+/// `PLOW_HOST_KVCACHE_SIZE`: the host KV tier's size, or `auto` (the host-reserve rule).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostKvcacheSize {
+    Auto,
+    Bytes(u64),
+}
+
+/// `<n>MB` / `<n>GB` (binary units, any case, optional space), `0` (off) or `auto`. A bare
+/// number is refused: the old knob took MiB, so its meaning would be a guess.
+pub fn parse_host_kvcache_size(s: &str) -> std::result::Result<HostKvcacheSize, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Ok(HostKvcacheSize::Auto);
+    }
+    if t == "0" {
+        return Ok(HostKvcacheSize::Bytes(0));
+    }
+    let lower = t.to_ascii_lowercase();
+    let unit = |suffix: &str, shift: u32| {
+        lower
+            .strip_suffix(suffix)
+            .map(|n| (n.trim_end().to_owned(), shift))
+    };
+    let Some((num, shift)) = unit("gb", 30).or_else(|| unit("mb", 20)) else {
+        let hint = if t.bytes().all(|b| b.is_ascii_digit()) {
+            format!(" (did you mean {t}MB?)")
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "{s:?} needs a unit: <n>MB or <n>GB (MiB, GiB), 0 = off, auto = sized from free \
+             RAM{hint}"
+        ));
+    };
+    num.parse::<u64>()
+        .ok()
+        .filter(|_| num.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.checked_mul(1 << shift))
+        .map(HostKvcacheSize::Bytes)
+        .ok_or_else(|| format!("{s:?} is not a size: <n>MB or <n>GB (MiB, GiB), 0 or auto"))
+}
+
 fn parse_pf_hold(spec: &str) -> Option<(u32, f64, usize)> {
     let mut it = spec.split(',').map(str::trim);
     let rows: u32 = it.next()?.parse().ok().filter(|&r| r > 0)?;
@@ -3405,6 +3762,67 @@ fn parse_pf_hold(spec: &str) -> Option<(u32, f64, usize)> {
         None => 16,
     };
     it.next().is_none().then_some((rows, ms, min_decode))
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    /// The scope follows the thread and the tasks and threads an engine starts, and is
+    /// restored after.
+    #[test]
+    fn engine_scope_follows_its_threads_and_restores() {
+        let cfg: &'static RuntimeConfig = Box::leak(Box::new(RuntimeConfig::process().clone()));
+        let is = move |c: &RuntimeConfig| std::ptr::eq(c, cfg);
+        assert!(!is(RuntimeConfig::get()));
+        scoped(Some(cfg), || {
+            assert!(is(RuntimeConfig::get()));
+            let inherited = std::thread::spawn(inherit(move || is(RuntimeConfig::get())));
+            assert!(
+                inherited.join().unwrap(),
+                "a spawned helper inherits the scope"
+            );
+            let bare = std::thread::spawn(move || is(RuntimeConfig::get()));
+            assert!(!bare.join().unwrap());
+            scoped(None, || assert!(!is(RuntimeConfig::get())));
+            assert!(
+                is(RuntimeConfig::get()),
+                "an inner scope restores the outer one"
+            );
+        });
+        assert!(!is(RuntimeConfig::get()));
+        let r = std::panic::catch_unwind(|| scoped(Some(cfg), || panic!("unwind")));
+        assert!(r.is_err());
+        assert!(!is(RuntimeConfig::get()), "restored on unwind");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let polled = rt.block_on(async move {
+            let fut = Scoped::new(Some(cfg), async move { is(RuntimeConfig::get()) });
+            tokio::spawn(fut).await.unwrap()
+        });
+        assert!(polled, "polled under the scope");
+    }
+
+    /// The check covers the engine's sources and nothing on the request path.
+    #[test]
+    fn engine_sources_are_the_engine_and_dispatcher() {
+        let src = file!().strip_suffix("config.rs").unwrap();
+        for (f, engine) in [
+            ("exec/gpu.rs", true),
+            ("memory/vmm.rs", true),
+            ("serve/mux.rs", true),
+            ("serve/chat.rs", false),
+            ("main.rs", false),
+        ] {
+            assert_eq!(engine_source(&format!("{src}{f}")), engine, "{f}");
+        }
+        assert!(
+            !engine_source("exec/gpu.rs"),
+            "a path outside this crate's sources"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3436,29 +3854,6 @@ mod tests {
         let off = parse(&["test", "--moe-pf-lt=0", "--moe-dec-lt=0"]);
         assert_eq!(off.nv.moe_pf_lt_min_rows(), None);
         assert_eq!(off.nv.moe_dec_lt_min_rows(Some(4)), None);
-    }
-
-    #[test]
-    fn token_batch_defaults_on_with_explicit_rollback() {
-        use clap::{Args, FromArgMatches};
-        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
-        let arg = command
-            .get_arguments()
-            .find(|arg| arg.get_id() == "token_batch")
-            .unwrap();
-        assert_eq!(arg.get_default_values(), ["true"]);
-        for (flag, enabled) in [("--token-batch", true), ("--token-batch=false", false)] {
-            let matches = command
-                .clone()
-                .try_get_matches_from(["test", flag])
-                .unwrap();
-            assert_eq!(
-                super::RuntimeConfig::from_arg_matches(&matches)
-                    .unwrap()
-                    .token_batch,
-                enabled
-            );
-        }
     }
 
     #[test]
@@ -3578,24 +3973,22 @@ mod tests {
     }
 
     #[test]
-    fn shared_prefix_and_token_batch_defaults_allow_independent_rollback() {
+    fn shared_prefix_defaults_on_with_rollback() {
         use clap::{Args, FromArgMatches};
         let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
-        for field in ["prefix_cache", "token_batch"] {
-            assert_eq!(
-                command
-                    .get_arguments()
-                    .find(|arg| arg.get_id() == field)
-                    .unwrap()
-                    .get_default_values(),
-                ["true"]
-            );
-        }
+        assert_eq!(
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id() == "prefix_cache")
+                .unwrap()
+                .get_default_values(),
+            ["true"]
+        );
         let defaults = super::RuntimeConfig::from_arg_matches(
             &command.clone().try_get_matches_from(["test"]).unwrap(),
         )
         .unwrap();
-        assert!(defaults.prefix_cache && defaults.token_batch);
+        assert!(defaults.prefix_cache);
         assert!(!defaults.fusion && !defaults.pf_defer_decode);
         assert!(!defaults.pf_rotate());
         assert_eq!(defaults.objective, crate::serve::policy::Objective::Auto);
@@ -3620,7 +4013,6 @@ mod tests {
             .unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(!config.prefix_cache);
-        assert!(config.token_batch);
         assert_eq!(config.vmm_cache_mib, Some(512));
         // Explicit MiB wins over the percentage, whatever the device size.
         assert_eq!(config.prefix_cache_cap_bytes(192 << 30), 512 << 20);
@@ -4276,5 +4668,34 @@ mod tests {
 
     fn walk(dir: &std::path::Path) -> String {
         files(dir).into_iter().map(|(_, t)| t).collect()
+    }
+}
+
+#[cfg(test)]
+mod host_kvcache_size_tests {
+    use super::{parse_host_kvcache_size as parse, HostKvcacheSize::*};
+
+    #[test]
+    fn parses_binary_mb_and_gb_in_any_case() {
+        assert_eq!(parse("65536MB"), Ok(Bytes(64 << 30)));
+        assert_eq!(parse("64GB"), Ok(Bytes(64 << 30)));
+        assert_eq!(parse("64 gb"), Ok(Bytes(64 << 30)));
+        assert_eq!(parse("512Mb"), Ok(Bytes(512 << 20)));
+        assert_eq!(parse("0"), Ok(Bytes(0)));
+        assert_eq!(parse("0GB"), Ok(Bytes(0)));
+        assert_eq!(parse("auto"), Ok(Auto));
+        assert_eq!(parse("AUTO"), Ok(Auto));
+    }
+
+    #[test]
+    fn refuses_a_bare_number_and_garbage() {
+        let bare = parse("65536").unwrap_err();
+        assert!(bare.contains("did you mean 65536MB"), "{bare}");
+        for bad in [
+            "", "MB", "64KB", "64 G", "1.5GB", "-1GB", "+64GB", "64GiB", "x64MB",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse("18446744073709551615GB").is_err());
     }
 }

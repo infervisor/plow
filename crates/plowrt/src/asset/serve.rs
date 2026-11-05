@@ -211,6 +211,11 @@ pub fn set_checkpoint(asset_dir: &Path, checkpoint: &Path) -> Result<()> {
     }
 }
 
+/// Forget `asset_dir`'s explicit checkpoint pairing (a control-plane registration rolled back).
+pub fn clear_checkpoint(asset_dir: &Path) {
+    explicit_checkpoints().write().remove(&map_key(asset_dir));
+}
+
 /// Split one `--assets` value, `<dir>[,checkpoint=<path>][,slug=<name>]`, and record the
 /// pairing. A value that names an existing path is taken literally (a directory name may contain
 /// a comma).
@@ -338,69 +343,86 @@ fn objects_dir_with(explicit: Option<&str>, assets_dir: &Path) -> Option<PathBuf
         })
 }
 
-/// `serve.json` serve-knob defaults of the bundles in `asset_dirs`, plus the cuBLASLt table a
-/// self-contained bundle carries (`cublaslt_algos.jsonl` for `PLOW_LT_ALGOS`), as
-/// `(knob, value, source)`. A bundle's `objects/` is not exported: each bundle resolves it
-/// itself ([`objects_dir`]). A knob the environment already sets is left out, so an explicit
-/// setting always wins. Every packet-carried key must be a registered runtime knob.
+/// `serve.json` serve-knob defaults of the bundles in `asset_dirs`, as `(knob, value, source)`:
+/// what startup exports into the environment. A bundle's `objects/` and `cublaslt_algos.jsonl`
+/// are not exported: each engine resolves its own ([`objects_dir`], `Lt::load`). A knob the
+/// environment already sets is left out, so an explicit setting always wins.
+///
+/// Two bundles may ask different values of an ENGINE-scoped knob (`knob_spec::knob_scope`):
+/// each engine resolves its own bundle's ([`crate::config::bundle_config`]), and the first value
+/// is what non-engine code sees. A process-scoped knob has one value, so a disagreement there
+/// is refused.
 pub fn asset_env_defaults(
     asset_dirs: &[PathBuf],
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut out: Vec<(String, String, String)> = Vec::new();
-    let mut put = |key: &str,
-                   value: String,
-                   source: String,
-                   out: &mut Vec<(String, String, String)>|
-     -> Result<()> {
-        if env(key).is_some() {
-            return Ok(());
-        }
-        if let Some((_, have, from)) = out.iter().find(|(k, _, _)| k == key) {
-            if *have != value {
-                return Err(RuntimeError::Rejected(format!(
-                    "{key}: {from} asks for {have} and {source} for {value}; set {key} explicitly to serve both"
-                )));
-            }
-            return Ok(());
-        }
-        out.push((key.to_string(), value, source));
-        Ok(())
-    };
     for dir in asset_dirs {
-        if let Some(pkt) = crate::asset::devblob::DevBlob::find_in_dir(dir)? {
-            if let Some(bytes) = read_section(&pkt)? {
-                let m = ServeManifest::parse(&bytes).map_err(RuntimeError::Device)?;
-                for (key, value) in &m.serve_defaults {
-                    if crate::knob_spec::is_removed_env(key) {
-                        tracing::warn!(
-                            knob = key.as_str(),
-                            packet = %pkt.display(),
-                            "packet serve default names a removed knob; ignored"
-                        );
-                        continue;
-                    }
-                    if !crate::knob_spec::is_runtime_env(key) {
-                        return Err(RuntimeError::Rejected(format!(
-                            "{}: serve default {key} is not a registered plowrt runtime knob",
-                            pkt.display()
-                        )));
-                    }
-                    put(key, value.clone(), pkt.display().to_string(), &mut out)?;
-                }
+        let Some((pkt, defaults)) = bundle_serve_defaults(dir)? else {
+            continue;
+        };
+        let source = pkt.display().to_string();
+        for (key, value) in defaults {
+            if env(&key).is_some() {
+                continue;
             }
-        }
-        let lt = dir.join("cublaslt_algos.jsonl");
-        if lt.is_file() && env("PLOW_LT_ALGOS_WRITE").is_none() {
-            put(
-                "PLOW_LT_ALGOS",
-                lt.display().to_string(),
-                dir.display().to_string(),
-                &mut out,
-            )?;
+            if let Some((_, have, from)) = out.iter().find(|(k, _, _)| *k == key) {
+                if *have != value
+                    && crate::knob_spec::knob_scope(&key)
+                        != Some(crate::knob_spec::KnobScope::Engine)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "{key}: {from} asks for {have} and {source} for {value}; it is one value \
+                         per process, set {key} explicitly to serve both"
+                    )));
+                }
+                continue;
+            }
+            out.push((key, value, source.clone()));
         }
     }
     Ok(out)
+}
+
+/// The packet serve defaults of the bundle in `dir` (`None` without a device packet), every
+/// key a registered runtime knob; a renamed knob is carried over to its new name, other removed
+/// knobs are dropped with a warning.
+pub fn bundle_serve_defaults(dir: &Path) -> Result<Option<(PathBuf, Vec<(String, String)>)>> {
+    let Some(pkt) = crate::asset::devblob::DevBlob::find_in_dir(dir)? else {
+        return Ok(None);
+    };
+    let Some(bytes) = read_section(&pkt)? else {
+        return Ok(Some((pkt, Vec::new())));
+    };
+    let m = ServeManifest::parse(&bytes).map_err(RuntimeError::Device)?;
+    let mut out = Vec::with_capacity(m.serve_defaults.len());
+    for (key, value) in &m.serve_defaults {
+        if let Some(renamed) = crate::knob_spec::renamed_serve_default(key, value) {
+            let (key, value) =
+                renamed.map_err(|e| RuntimeError::Rejected(format!("{}: {e}", pkt.display())))?;
+            // A packet carrying both spellings keeps the new one.
+            if !m.serve_defaults.contains_key(&key) {
+                out.push((key, value));
+            }
+            continue;
+        }
+        if crate::knob_spec::is_removed_env(key) {
+            tracing::warn!(
+                knob = key.as_str(),
+                packet = %pkt.display(),
+                "packet serve default names a removed knob; ignored"
+            );
+            continue;
+        }
+        if !crate::knob_spec::is_runtime_env(key) {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: serve default {key} is not a registered plowrt runtime knob",
+                pkt.display()
+            )));
+        }
+        out.push((key.clone(), value.clone()));
+    }
+    Ok(Some((pkt, out)))
 }
 
 /// The runtime contract this plowrt implements. A bundle whose `build.json`
@@ -422,15 +444,22 @@ pub struct RuntimeRequires {
 /// `build.json` `runtime_requires` (`{"cublaslt": "13.4", "plowrt_contract": 1}`) when the
 /// bundle declares it; otherwise derived from the emit knobs the packet was built with: a grouped
 /// cuBLASLt MoE route (`emit.moe_pf_lt` / `emit.moe_dec_lt`) needs cuBLASLt 13.4. A bundle without
-/// `build.json` requires nothing.
+/// `build.json` requires nothing; one whose `build.json` cannot be read or parsed is refused.
 pub fn runtime_requires(asset_dir: &Path) -> Result<RuntimeRequires> {
-    let path = asset_dir.join("build.json");
-    let Ok(bytes) = std::fs::read(&path) else {
+    let path = asset_dir.join(crate::asset::packet_image::BUILD_FILE);
+    let Some(build) = crate::asset::packet_image::BuildInfo::read(&path)? else {
         return Ok(RuntimeRequires::default());
     };
-    let build: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
-    runtime_requires_from(&build)
+    let mut doc = serde_json::Map::new();
+    for (key, value) in [
+        ("runtime_requires", &build.runtime_requires),
+        ("knobs", &build.knobs),
+    ] {
+        if let Some(v) = value {
+            doc.insert(key.into(), v.clone());
+        }
+    }
+    runtime_requires_from(&serde_json::Value::Object(doc))
         .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))
 }
 
@@ -493,6 +522,151 @@ fn show_version(v: usize) -> String {
     format!("{}.{}.{}", v / 10000, v / 100 % 100, v % 100)
 }
 
+/// Fail closed when a packet uses a contract-gated feature its `build.json` does not declare
+/// (a load-time concatenated weight or `GluPitched`: `RUNTIME_CONTRACT_CONCAT`), so dropping
+/// `runtime_requires` cannot route such a packet past an older runtime's refusal.
+/// The first contract-4 feature `blob` uses (derived concat weights, a row-pitched source), if any.
+pub fn concat_feature(blob: &crate::asset::devblob::DevBlob, raw: &[u8]) -> Result<Option<String>> {
+    Ok(blob
+        .reserved_metadata(raw, plow_asset::derived_weights::SECTION)?
+        .map(|_| plow_asset::derived_weights::SECTION.to_string())
+        .or_else(|| {
+            blob.tensors
+                .iter()
+                .find(|t| t.name.starts_with(packet::names::CONCAT_PREFIX))
+                .map(|t| t.name.clone())
+        })
+        .or_else(|| {
+            blob.progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .find_map(pitched_source)
+                .map(|(op, _)| format!("a row-pitched {op:?} source"))
+        }))
+}
+
+/// Refuse a packet with contract-4 features on a backend that does not implement them.
+pub fn refuse_concat_features(blob: &crate::asset::devblob::DevBlob, raw: &[u8]) -> Result<()> {
+    match concat_feature(blob, raw)? {
+        Some(feature) => Err(RuntimeError::Rejected(format!(
+            "packet uses derived concat weights / pitched ops (contract {}: {feature}) that this \
+             backend does not implement",
+            plow_asset::RUNTIME_CONTRACT_CONCAT
+        ))),
+        None => Ok(()),
+    }
+}
+
+pub fn check_packet_contract(
+    packet: &Path,
+    blob: &crate::asset::devblob::DevBlob,
+    raw: &[u8],
+) -> Result<()> {
+    let concat = concat_feature(blob, raw)?;
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if let Some((op, footprint)) = pitched_source(d) {
+            let slot = if matches!(
+                op,
+                packet::dev::DevOp::QwenQGateSplit | packet::dev::DevOp::QwenGatedNorm
+            ) {
+                2
+            } else {
+                1
+            };
+            let bytes = |h: u16| blob.tensors.get(usize::from(h)).map(|t| t.bytes);
+            let fits = footprint
+                .zip(bytes(d.t[slot]))
+                .is_some_and(|(elements, have)| elements.checked_mul(2).is_some_and(|b| b <= have));
+            if !fits {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {op:?} reads past its row-pitched source",
+                    packet.display()
+                )));
+            }
+            // Outputs are written row by row while later rows of the source are still unread.
+            let outputs: &[usize] = match op {
+                packet::dev::DevOp::QwenQGateSplit => &[0, 1],
+                // The conv also rewrites its history from the source rows.
+                packet::dev::DevOp::QwenGdnConv | packet::dev::DevOp::QwenGdnConvPrefill => &[0, 3],
+                _ => &[0],
+            };
+            if outputs.iter().any(|&o| d.t[o] == d.t[slot]) {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {op:?} writes the row-pitched source it reads",
+                    packet.display()
+                )));
+            }
+            // The pitched split moves 16-byte vectors.
+            if op == packet::dev::DevOp::QwenQGateSplit && (d.i[1] % 8 != 0 || d.i[3] % 8 != 0) {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {op:?} pitch or head dim is not a multiple of 8 elements",
+                    packet.display()
+                )));
+            }
+            // The conv's and gated norm's vector loads (16 / 8 bytes) need an 8-element pitch and
+            // column.
+            let gdn = matches!(
+                op,
+                packet::dev::DevOp::QwenGdnConv
+                    | packet::dev::DevOp::QwenGdnConvPrefill
+                    | packet::dev::DevOp::QwenGatedNorm
+            );
+            if gdn && ((d.fj[2] & 0xFFFF) % 8 != 0 || (d.fj[2] >> 16) % 8 != 0) {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {op:?} pitch or column is not a multiple of 8 elements",
+                    packet.display()
+                )));
+            }
+        }
+    }
+    let Some(feature) = concat else {
+        return Ok(());
+    };
+    let declared = match blob.abi(raw)? {
+        Some(abi) => abi.contract,
+        None => runtime_requires(packet.parent().unwrap_or(Path::new(".")))?.plowrt_contract,
+    };
+    if declared < plow_asset::RUNTIME_CONTRACT_CONCAT {
+        return Err(RuntimeError::Rejected(format!(
+            "{}: uses {feature} but declares plowrt contract {declared} (needs {})",
+            packet.display(),
+            plow_asset::RUNTIME_CONTRACT_CONCAT
+        )));
+    }
+    Ok(())
+}
+
+/// An instruction that reads a row-pitched source (an N-concatenated projection's output): the
+/// op and the source elements it reads, `None` when its pitch fields are inconsistent.
+fn pitched_source(d: &packet::dev::DevInst64) -> Option<(packet::dev::DevOp, Option<u64>)> {
+    use packet::dev::DevOp;
+    let op = DevOp::from_u16(d.op)?;
+    let span = |rows: u64, stride: u64, col: u64, width: u64| {
+        (width > 0 && rows > 0 && col + width <= stride)
+            .then(|| (rows - 1).checked_mul(stride)?.checked_add(col + width))
+            .flatten()
+    };
+    let (i, w) = (|k: usize| u64::from(d.i[k]), u64::from(d.fj[2]));
+    match op {
+        DevOp::GluPitched => {
+            let (n, width) = (i(0), i(2));
+            let rows = (width > 0 && n % width == 0).then(|| n / width);
+            Some((op, rows.and_then(|r| span(r, i(3), i(4), width))))
+        }
+        DevOp::QwenQGateSplit if d.i[3] != 0 => Some((op, span(i(2), i(3), 0, 2 * i(0) * i(1)))),
+        DevOp::QwenHeadNormRope if w != 0 => {
+            Some((op, span(i(3), w & 0xFFFF, w >> 16, i(0) * i(1))))
+        }
+        // x[B or T rows][C]; the prefill conv's i2 is the bucket's rows (plowrt lowers it to the
+        // real rows per chunk).
+        DevOp::QwenGdnConv | DevOp::QwenGdnConvPrefill if w != 0 => {
+            Some((op, span(i(2), w & 0xFFFF, w >> 16, i(0))))
+        }
+        DevOp::QwenGatedNorm if w != 0 => Some((op, span(i(2), w & 0xFFFF, w >> 16, i(0) * i(1)))),
+        _ => None,
+    }
+}
+
 /// Fail closed when this runtime cannot serve the bundle: an older runtime contract than it
 /// declares, or a cuBLASLt (`lt`: the library this process binds, or why none loads) older than
 /// it needs.
@@ -533,6 +707,154 @@ pub fn check_runtime(
 mod tests {
     use super::*;
     use packet::devbuild::{Model, SectionData};
+
+    #[test]
+    fn pitched_sources_must_fit_their_tensor() {
+        use packet::dev::DevOp;
+        // rows 2; split H 1 x D 8 (q|gate width 16); HNR H 1 x D 2 (KV width 2).
+        let blob = |op: DevOp, stride: u32, col: u32, src_bytes: u64, alias: bool| {
+            let mut b = packet::devbuild::Builder::new(1);
+            let out = b.tensor("act.out", 64);
+            let src = if alias {
+                out
+            } else {
+                b.tensor("act.qkv", src_bytes)
+            };
+            b.emit(op, vec![0], &[], |d| {
+                if op == DevOp::QwenQGateSplit {
+                    d.t[..3].copy_from_slice(&[out, out, src]);
+                    d.i[..4].copy_from_slice(&[1, 8, 2, stride]);
+                } else if op == DevOp::QwenGatedNorm {
+                    // HV 1 x V 8, 2 rows: z read at column `col` of a `stride`-wide row.
+                    d.t[..3].copy_from_slice(&[out, out, src]);
+                    d.i[..3].copy_from_slice(&[1, 8, 2]);
+                    d.j[1] = stride | (col << 16);
+                } else if op == DevOp::QwenGdnConv {
+                    // C 8, W 4, 2 rows; history t3.
+                    d.t[..4].copy_from_slice(&[out, src, out, out]);
+                    d.i[..3].copy_from_slice(&[8, 4, 2]);
+                    d.j[1] = stride | (col << 16);
+                } else {
+                    d.t[..2].copy_from_slice(&[out, src]);
+                    d.i[..4].copy_from_slice(&[1, 2, 0, 2]);
+                    d.j[1] = stride | (col << 16);
+                }
+            });
+            let p = b.finish();
+            let raw = Model {
+                n_cu: 1,
+                target: 0,
+                tensors: p.tensors.clone(),
+                progs: vec![p],
+                prog_t: vec![1],
+                gen: vec![],
+                kv_row_insts: vec![],
+            }
+            .to_blob();
+            (crate::asset::devblob::DevBlob::parse(&raw).unwrap(), raw)
+        };
+        let dir = std::env::temp_dir().join(format!("plowrt-pitched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("build.json"),
+            serde_json::json!({"runtime_requires": {"plowrt_contract": 4}}).to_string(),
+        )
+        .unwrap();
+        let pkt = dir.join("model.pkt");
+        let ok = |(b, r): (crate::asset::devblob::DevBlob, Vec<u8>)| {
+            check_packet_contract(&pkt, &b, &r).is_ok()
+        };
+        // Last row ends at 24 + 16 = 40 elements (q|gate) / 12 + 10 + 2 = 24 (v at column 10).
+        assert!(ok(blob(DevOp::QwenQGateSplit, 24, 0, 80, false)));
+        assert!(!ok(blob(DevOp::QwenQGateSplit, 24, 0, 78, false)));
+        assert!(!ok(blob(DevOp::QwenQGateSplit, 12, 0, 400, false)));
+        // a pitch off the 16-byte vector, or an output aliasing the source
+        assert!(!ok(blob(DevOp::QwenQGateSplit, 20, 0, 400, false)));
+        assert!(!ok(blob(DevOp::QwenQGateSplit, 24, 0, 64, true)));
+        assert!(ok(blob(DevOp::QwenHeadNormRope, 12, 10, 48, false)));
+        assert!(!ok(blob(DevOp::QwenHeadNormRope, 12, 10, 46, false)));
+        assert!(!ok(blob(DevOp::QwenHeadNormRope, 12, 11, 400, false)));
+        assert!(!ok(blob(DevOp::QwenHeadNormRope, 12, 10, 64, true)));
+        // z at column 8 of 16-wide rows: last row ends at 16 + 8 + 8 = 32 elements.
+        assert!(ok(blob(DevOp::QwenGatedNorm, 16, 8, 64, false)));
+        assert!(!ok(blob(DevOp::QwenGatedNorm, 16, 8, 62, false)));
+        assert!(!ok(blob(DevOp::QwenGatedNorm, 16, 4, 400, false)));
+        assert!(!ok(blob(DevOp::QwenGatedNorm, 16, 8, 64, true)));
+        assert!(ok(blob(DevOp::QwenGdnConv, 16, 0, 48, false)));
+        assert!(!ok(blob(DevOp::QwenGdnConv, 16, 0, 46, false)));
+        assert!(!ok(blob(DevOp::QwenGdnConv, 12, 0, 400, false)));
+        assert!(!ok(blob(DevOp::QwenGdnConv, 16, 0, 64, true)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concatenated_weights_and_pitched_glu_require_their_contract() {
+        use packet::dev::DevOp;
+        let blob = |concat: bool, pitched: bool| {
+            let mut b = packet::devbuild::Builder::new(1);
+            let out = b.tensor("act.out", 8);
+            let w = b.tensor(if concat { "cat/a.weight" } else { "a.weight" }, 8);
+            b.emit(
+                if pitched {
+                    DevOp::GluPitched
+                } else {
+                    DevOp::Glu
+                },
+                vec![0],
+                &[],
+                |d| {
+                    d.t[..2].copy_from_slice(&[out, w]);
+                    if pitched {
+                        d.i[..5].copy_from_slice(&[2, 1, 2, 4, 2]);
+                    }
+                },
+            );
+            let p = b.finish();
+            let raw = Model {
+                n_cu: 1,
+                target: 0,
+                tensors: p.tensors.clone(),
+                progs: vec![p],
+                prog_t: vec![1],
+                gen: vec![],
+                kv_row_insts: vec![],
+            }
+            .to_blob();
+            (crate::asset::devblob::DevBlob::parse(&raw).unwrap(), raw)
+        };
+        let check = |pkt: &Path, (blob, raw): (crate::asset::devblob::DevBlob, Vec<u8>)| {
+            check_packet_contract(pkt, &blob, &raw)
+        };
+        let dir =
+            std::env::temp_dir().join(format!("plowrt-concat-contract-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkt = dir.join("model.pkt");
+        assert!(check(&pkt, blob(false, false)).is_ok());
+        // The HSA loader refuses every contract-4 feature outright.
+        let (b, r) = blob(false, false);
+        assert!(refuse_concat_features(&b, &r).is_ok());
+        for (c, p) in [(true, false), (false, true)] {
+            let (b, r) = blob(c, p);
+            let err = refuse_concat_features(&b, &r).unwrap_err().to_string();
+            assert!(err.contains("does not implement"), "{err}");
+        }
+        for (c, p) in [(true, false), (false, true)] {
+            std::fs::remove_file(dir.join("build.json")).ok();
+            assert!(check(&pkt, blob(c, p)).is_err());
+            for (declared, ok) in [(3, false), (4, true)] {
+                std::fs::write(
+                    dir.join("build.json"),
+                    serde_json::json!({"runtime_requires": {"plowrt_contract": declared}})
+                        .to_string(),
+                )
+                .unwrap();
+                assert_eq!(check(&pkt, blob(c, p)).is_ok(), ok, "{c} {p} {declared}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn asset_args_pair_a_bundle_with_its_checkpoint() {
@@ -773,6 +1095,58 @@ mod tests {
         assert!(!got.iter().any(|(k, _, _)| k == "PLOW_PF_SEG_DIR"));
         std::fs::remove_dir_all(with).unwrap();
         std::fs::remove_dir_all(without).unwrap();
+    }
+
+    /// Two bundles may ask different values of an engine knob (each engine resolves its own);
+    /// a process-wide knob has one value, so disagreeing there is refused.
+    #[test]
+    fn co_served_defaults_conflict_only_on_process_knobs() {
+        let with = |name: &str, pairs: &[(&str, &str)]| {
+            let mut m = ServeManifest {
+                version: 1,
+                ..Default::default()
+            };
+            for (k, v) in pairs {
+                m.serve_defaults.insert(k.to_string(), v.to_string());
+            }
+            bundle(name, Some(&m))
+        };
+        let a = with(
+            "scope-a",
+            &[
+                ("PLOW_DECODE_MAX_RUNG", "128"),
+                ("PLOW_MAX_QUEUED_REQUESTS", "64"),
+            ],
+        );
+        let b = with("scope-b", &[("PLOW_DECODE_MAX_RUNG", "64")]);
+        let c = with("scope-c", &[("PLOW_MAX_QUEUED_REQUESTS", "8")]);
+        let got = asset_env_defaults(&[a.clone(), b.clone()], |_| None).unwrap();
+        assert!(got
+            .iter()
+            .any(|(k, v, _)| k == "PLOW_DECODE_MAX_RUNG" && v == "128"));
+        let e = asset_env_defaults(&[a.clone(), c.clone()], |_| None).unwrap_err();
+        assert!(e.to_string().contains("PLOW_MAX_QUEUED_REQUESTS"), "{e}");
+        assert_eq!(
+            bundle_serve_defaults(&b).unwrap().unwrap().1,
+            vec![("PLOW_DECODE_MAX_RUNG".to_string(), "64".to_string())]
+        );
+        for d in [a, b, c] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// Each co-served bundle's cuBLASLt table stays with its engine: exported process-wide, two
+    /// production bundles refused to start side by side.
+    #[test]
+    fn co_served_lt_tables_do_not_collide() {
+        let a = bundle("lt-a", None);
+        let b = bundle("lt-b", None);
+        std::fs::write(a.join("cublaslt_algos.jsonl"), "").unwrap();
+        std::fs::write(b.join("cublaslt_algos.jsonl"), "").unwrap();
+        let got = asset_env_defaults(&[a.clone(), b.clone()], |_| None).unwrap();
+        assert!(!got.iter().any(|(k, _, _)| k == "PLOW_LT_ALGOS"), "{got:?}");
+        std::fs::remove_dir_all(a).unwrap();
+        std::fs::remove_dir_all(b).unwrap();
     }
 
     #[test]

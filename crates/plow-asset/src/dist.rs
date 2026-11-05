@@ -21,6 +21,19 @@ use std::collections::BTreeMap;
 
 pub const INDEX_SCHEMA: &str = "plow.dist.model.v1";
 pub const BUNDLE_SCHEMA: &str = "plow.dist.bundle.v1";
+/// An NVIDIA bundle whose objset lays out as the asset tree it was served from
+/// ([`objset_root`]). A v1 reader would lay those objects under `hsaco/`, where NVIDIA serving
+/// never reads them, and serve without them; the schema makes it refuse instead.
+pub const BUNDLE_SCHEMA_NVIDIA_TREE: &str = "plow.dist.bundle.v2";
+
+/// The schema a bundle for `vendor` is written with.
+pub fn bundle_schema(vendor: &str) -> &'static str {
+    if vendor == "nvidia" {
+        BUNDLE_SCHEMA_NVIDIA_TREE
+    } else {
+        BUNDLE_SCHEMA
+    }
+}
 pub const OBJSET_SCHEMA: &str = "plow.dist.objset.v1";
 
 /// The name a bundle's manifest goes by beside its files: in a `plowc` assets
@@ -66,6 +79,21 @@ pub struct Target {
 /// a bundle for it carries no objset, and `plowrt serve` compiles on load.
 pub fn runtime_compiled(vendor: &str) -> bool {
     vendor == "apple"
+}
+
+/// The subdirectory of an NVIDIA asset directory that serving resolves its segment objects from
+/// (`plowrt::asset::serve::objects_dir`): an objset object there is named `objects/<file>`.
+pub const SEGMENT_OBJECTS_DIR: &str = "objects";
+
+/// Where a pulled bundle puts its objset objects, relative to the bundle directory. NVIDIA
+/// serving reads them from the asset directory itself, exactly as the build left them; AMD reads
+/// `hsaco/`.
+pub fn objset_root(vendor: &str) -> &'static str {
+    if vendor == "nvidia" {
+        ""
+    } else {
+        "hsaco"
+    }
 }
 
 /// How work is spread across GPUs. An object, not a string, so a composite
@@ -641,6 +669,18 @@ fn is_plain_name(s: &str) -> bool {
     matches!(c.next(), Some(std::path::Component::Normal(_))) && c.next().is_none()
 }
 
+/// An objset object name: one plain component, or one under [`SEGMENT_OBJECTS_DIR`]. Checked
+/// segment by segment as written: `Path` would drop a trailing `/` or `/.` and pass a name
+/// that materializes as a directory.
+fn is_object_name(s: &str) -> bool {
+    let plain = |seg: &str| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains('\\');
+    match s.split('/').collect::<Vec<_>>().as_slice() {
+        [name] => plain(name) && *name != SEGMENT_OBJECTS_DIR,
+        [dir, name] => *dir == SEGMENT_OBJECTS_DIR && plain(name),
+        _ => false,
+    }
+}
+
 /// A path that stays under the directory it is joined to: relative, `/`
 /// separated, no empty, `.` or `..` segment, no Windows separator. A
 /// checkpoint file nests (`onnx/model.onnx`); a bundle file may not.
@@ -724,7 +764,7 @@ impl ObjSet {
         }
         let mut seen = std::collections::BTreeSet::new();
         for o in &self.objects {
-            if !is_plain_name(&o.name) || !is_sha256(&o.sha256) || o.bytes == 0 {
+            if !is_object_name(&o.name) || !is_sha256(&o.sha256) || o.bytes == 0 {
                 return Err(format!("objset: bad object entry {}", o.name));
             }
             if !seen.insert(o.name.as_str()) {
@@ -760,7 +800,8 @@ impl ObjSet {
 
 impl Bundle {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != BUNDLE_SCHEMA {
+        // A v1 NVIDIA bundle predates the tree layout; it is read, and laid out, as one.
+        if self.schema != BUNDLE_SCHEMA && self.schema != bundle_schema(&self.target.vendor) {
             return Err(format!("bundle: unsupported schema {}", self.schema));
         }
         if self.files.is_empty() {

@@ -221,7 +221,7 @@ fn each_rank<T: Send>(
     std::thread::scope(|scope| {
         let handles: Vec<_> = ranks
             .iter_mut()
-            .map(|e| scope.spawn(move || f(e)))
+            .map(|e| scope.spawn(crate::config::inherit(move || f(e))))
             .collect();
         let mut out = Vec::with_capacity(handles.len());
         let mut first = None;
@@ -782,7 +782,7 @@ impl AmdTpGroup {
                     .map(|(be, bind, ordinal)| {
                         let shared = shared_ckpt.clone();
                         tracing::info!(rank = bind.rank, ordinal, "binding rank");
-                        s.spawn(move || {
+                        s.spawn(crate::config::inherit(move || {
                             AmdEngine::load_rank(
                                 be,
                                 blob_path,
@@ -791,7 +791,7 @@ impl AmdTpGroup {
                                 Some(bind),
                                 shared,
                             )
-                        })
+                        }))
                     })
                     .collect();
                 let mut out = Vec::with_capacity(handles.len());
@@ -1310,7 +1310,7 @@ impl AmdTpGroup {
                         .iter_mut()
                         .enumerate()
                         .map(|(rank, e)| {
-                            scope.spawn(move || -> Result<()> {
+                            scope.spawn(crate::config::inherit(move || -> Result<()> {
                                 let k = e.decode_kernel_for(dp);
                                 for seg in 1..n_segments {
                                     e.enqueue_decode_segment(dp, seg, k).map_err(|err| {
@@ -1320,7 +1320,7 @@ impl AmdTpGroup {
                                     })?;
                                 }
                                 Ok(())
-                            })
+                            }))
                         })
                         .collect();
                     let mut fill_error = None;
@@ -1651,7 +1651,7 @@ impl AmdTpGroup {
             let handles: Vec<_> = self
                 .ranks
                 .iter_mut()
-                .map(|e| scope.spawn(move || f(e)))
+                .map(|e| scope.spawn(crate::config::inherit(move || f(e))))
                 .collect();
             let mut first = None;
             for handle in handles {

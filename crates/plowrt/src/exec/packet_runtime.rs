@@ -314,30 +314,59 @@ pub fn stage_packet(model_pkt: &Path, key: &str, legacy: &str) -> Result<std::pa
     Ok(model_pkt.with_file_name(PacketAsset::load(model_pkt)?.stage_file(key, legacy)?))
 }
 
+/// The pipeline string naming the clone stage's reference encoder packet.
+pub const CLONE_ENCODER: &str = "clone.encoder";
+/// The pipeline string naming a speech pipeline's text-encoder sub-bundle.
+pub const TEXT_ENCODER: &str = "text.encoder";
+/// The voice-conditioning packet a speech bundle binds when its pipeline names none.
+pub const VOICE_COND_PACKET: &str = "voice_cond.pkt";
+
+fn beside_packet(key: &str, name: &str) -> Result<String> {
+    if !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".." {
+        Ok(name.to_string())
+    } else {
+        Err(RuntimeError::Rejected(format!(
+            "{key} {name:?} is not a file name beside the packet"
+        )))
+    }
+}
+
 impl PacketAsset {
+    #[cfg(test)]
+    pub(crate) fn from_pipelines(
+        pipelines: Vec<plow_asset::packet_pipeline::PacketPipeline>,
+    ) -> Self {
+        Self {
+            pipelines: PacketPipelines {
+                version: 1,
+                pipelines,
+            },
+            sections: Default::default(),
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
-        let image = std::fs::read(path).map_err(|source| RuntimeError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        Self::from_bytes(&image)
+        let image = crate::asset::packet_image::PacketImage::open(path)?;
+        Self::from_parsed(&image.raw, &image.blob)
     }
 
     /// `None` for a packet without a pipeline section (a plain language-model packet).
     pub fn load_if_present(path: &Path) -> Result<Option<Self>> {
-        let image = std::fs::read(path).map_err(|source| RuntimeError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        let blob = crate::asset::devblob::DevBlob::parse_l2(&image, true)?;
-        if blob.reserved_metadata(&image, SECTION)?.is_none() {
+        let image = crate::asset::packet_image::PacketImage::open(path)?;
+        if image.blob.reserved_metadata(&image.raw, SECTION)?.is_none() {
             return Ok(None);
         }
-        Self::from_bytes(&image).map(Some)
+        Self::from_parsed(&image.raw, &image.blob).map(Some)
     }
 
     pub fn from_bytes(image: &[u8]) -> Result<Self> {
-        let blob = crate::asset::devblob::DevBlob::parse_l2(image, true)?;
+        Self::from_parsed(
+            image,
+            &crate::asset::devblob::DevBlob::parse_l2(image, true)?,
+        )
+    }
+
+    fn from_parsed(image: &[u8], blob: &crate::asset::devblob::DevBlob) -> Result<Self> {
         let raw = blob
             .reserved_metadata(image, SECTION)?
             .ok_or_else(|| RuntimeError::Rejected(format!("packet is missing {SECTION}")))?;
@@ -381,21 +410,40 @@ impl PacketAsset {
     /// The sidecar packet a pipeline names under `key` (e.g. `encoder.packet`), else `legacy`
     /// for a packet emitted before the name was carried. A bare file name beside the packet.
     pub fn stage_file(&self, key: &str, legacy: &str) -> Result<String> {
-        let named = self.pipelines().iter().find_map(|p| p.strings.get(key));
-        match named {
+        match self.pipelines().iter().find_map(|p| p.strings.get(key)) {
             None => Ok(legacy.to_string()),
-            Some(name)
-                if !name.is_empty()
-                    && !name.contains(['/', '\\'])
-                    && name != "."
-                    && name != ".." =>
-            {
-                Ok(name.clone())
-            }
-            Some(name) => Err(RuntimeError::Rejected(format!(
-                "{key} {name:?} is not a file name beside the packet"
-            ))),
+            Some(name) => beside_packet(key, name),
         }
+    }
+
+    /// Whether a pipeline names the sidecar packet under `key`.
+    pub fn names_stage(&self, key: &str) -> bool {
+        self.pipelines().iter().any(|p| p.strings.contains_key(key))
+    }
+
+    /// Every sibling packet the pipelines declare, by stage: each `*.packet` stage and the
+    /// clone stage's reference encoder ([`CLONE_ENCODER`]), as bare file names beside the
+    /// packet. Each stage binds its own runtime, so two stages naming one file are two entries.
+    pub fn stage_files(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let mut out = std::collections::BTreeMap::new();
+        for p in self.pipelines() {
+            for (key, name) in &p.strings {
+                if key.ends_with(".packet") || key == CLONE_ENCODER {
+                    out.insert(key.clone(), beside_packet(key, name)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The text-encoder sub-bundle a speech pipeline declares ([`TEXT_ENCODER`]), a bare name
+    /// beside the packet.
+    pub fn text_encoder(&self) -> Result<Option<String>> {
+        self.pipelines()
+            .iter()
+            .find_map(|p| p.strings.get(TEXT_ENCODER))
+            .map(|name| beside_packet(TEXT_ENCODER, name))
+            .transpose()
     }
 
     pub fn bind(&self, name: &str, runtime: &dyn PacketRuntime) -> Result<BoundPacketPipeline> {

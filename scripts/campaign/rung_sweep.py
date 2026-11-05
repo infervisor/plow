@@ -397,9 +397,10 @@ def switches(choice: dict, recipe: dict) -> dict[int, str]:
             if r.get("winner") is not None and canon(r["winner"]) != canon(packet)}
 
 
-def snippet(choice: dict, recipe: dict) -> str:
+def snippet(choice: dict, recipe: dict, evidence: list[str] | None = None) -> str:
     """[emit.rung_env] entries for the swept knob: one per rung whose winner differs from the
-    packet-wide value, and the recipe's existing entries for it that must go."""
+    packet-wide value, the recipe's existing entries for it that must go, and the
+    [rung_choices] record check_recipe.py requires of a validated recipe."""
     knob = choice["knob"]
     packet = (recipe.get("emit") or {}).get("env", {}).get(knob)
     want = {("prefill", rows): {knob: v} for rows, v in switches(choice, recipe).items()}
@@ -411,7 +412,9 @@ def snippet(choice: dict, recipe: dict) -> str:
             f"# {q['label'].upper()}: " + "; ".join(q["why"]) + ".",
             "# NOT promotable as is: " + "; ".join(choice["requires"]) + "."]
     head += [f"# delete {knob} from [emit.rung_env.prefill.{rows}] (now the packet-wide value)" for rows in stale]
-    return "\n".join(head) + "\n\n" + rung_env.toml_snippet(want)
+    record = [f"[rung_choices.{knob}]", f'label = "{q["label"]}"',
+              "evidence = [" + ", ".join(json.dumps(e) for e in (evidence or [])) + "]", ""]
+    return "\n".join(head) + "\n\n" + rung_env.toml_snippet(want) + "\n".join(record)
 
 
 def table(choice: dict) -> str:
