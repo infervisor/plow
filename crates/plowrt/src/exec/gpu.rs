@@ -9111,9 +9111,24 @@ impl GpuEngine {
         specs: Option<&[DevSample]>,
         toks: &mut Vec<u32>,
     ) -> Result<()> {
-        let r = self.step_slots_sampled_unchecked(feeds, specs, toks);
+        let r = self.step_slots_sampled_unchecked(feeds, specs, toks, true);
         self.note_step_result(r.is_err());
         r
+    }
+
+    /// One decode step whose tokens nobody reads: every fed row's token comes from the depth
+    /// stage launched next on the same stream ([`Self::fish_depth_step`]), whose synchronize is
+    /// the tick's only one. `toks` gets a 0 per feed. Callers must run that depth step (or
+    /// [`Self::sync_stream`]) before the next host write to the step's pinned staging.
+    pub fn step_slots_unread(&mut self, feeds: &[(usize, u32)], toks: &mut Vec<u32>) -> Result<()> {
+        let r = self.step_slots_sampled_unchecked(feeds, None, toks, false);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    /// Wait for the engine stream (after [`Self::step_slots_unread`] when no depth step follows).
+    pub fn sync_stream(&mut self) -> Result<()> {
+        self.be.stream_synchronize(&self.stream)
     }
 
     fn step_slots_sampled_unchecked(
@@ -9121,6 +9136,7 @@ impl GpuEngine {
         feeds: &[(usize, u32)],
         specs: Option<&[DevSample]>,
         toks: &mut Vec<u32>,
+        readback: bool,
     ) -> Result<()> {
         toks.clear();
         let cfg_steps = self.take_cfg_staged();
@@ -9345,15 +9361,32 @@ impl GpuEngine {
         // Token readback: `in.ids` (rewritten by `ARGMAX_FIN`, or by the
         // device sampler above) round-trips through the pinned ids section.
         // SAFETY: as the uploads — the slab outlives the synchronize.
-        unsafe {
-            let base = self.devp[self.t_ids].base;
-            self.be
-                .memcpy_dtoh_async(self.stage.section_mut(0), base, &self.stream)?;
+        if readback {
+            unsafe {
+                let base = self.devp[self.t_ids].base;
+                self.be
+                    .memcpy_dtoh_async(self.stage.section_mut(0), base, &self.stream)?;
+            }
         }
         if let Some(t) = &self.timing {
             self.be.event_record(&t.ev[3], &self.stream)?;
         }
         let t_submit = timed.then(now);
+        if !readback {
+            toks.resize(feeds.len(), 0);
+            for &(b, tok) in feeds {
+                self.pos[b] += 1;
+                if self.vmm_prefix_enabled() {
+                    self.seq_tokens[b].push(tok);
+                }
+            }
+            if let Some(v) = &self.vmm {
+                for &(b, _) in feeds {
+                    v.advise(b, self.pos[b]);
+                }
+            }
+            return Ok(());
+        }
 
         // The step's single sync point (the whole queue retires in order).
         // A failure here is where an async kernel trap surfaces — capture the

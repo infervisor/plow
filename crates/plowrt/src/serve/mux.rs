@@ -4330,7 +4330,17 @@ fn run_one_tick(
                         let t_step = Instant::now();
                         let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0))
                             .and_then(|()| gpu_stage_cfg(&mut *e, &feeds, &mut slots, 1));
+                        // Every fed row's token is its depth stage's draw: the step's own tokens
+                        // stay on the device and the depth launch's synchronize is the tick's one.
+                        let unread = e.depth_packs()
+                            && feeds.iter().all(|&(i, _)| {
+                                slots[i].as_ref().is_some_and(|s| {
+                                    s.cfg.is_none()
+                                        && s.speech.as_ref().is_some_and(|sp| sp.depth.is_some())
+                                })
+                            });
                         let (cfg_dev, step_res) = match staged {
+                            Ok(d) if unread => (d, e.step_slots_unread(&feeds, &mut toks)),
                             Ok(d) => (
                                 d,
                                 e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks),
@@ -4339,12 +4349,18 @@ fn run_one_tick(
                         };
                         match step_res {
                             Ok(()) => {
-                                let ms = t_step.elapsed().as_secs_f64() * 1e3;
-                                obs.host.ride.observe_step(feeds.len(), ms);
-                                if let Some(p) = obs.host.spec.as_mut() {
-                                    p.observe_step(feeds.len(), ms);
+                                // An unread step is timed with its depth launch, below.
+                                let observe =
+                                    |obs: &mut crate::exec::host::HostExecutor, ms: f64| {
+                                        obs.ride.observe_step(feeds.len(), ms);
+                                        if let Some(p) = obs.spec.as_mut() {
+                                            p.observe_step(feeds.len(), ms);
+                                        }
+                                    };
+                                if !unread {
+                                    observe(&mut obs.host, t_step.elapsed().as_secs_f64() * 1e3);
                                 }
-                                if dev_specs.is_some() {
+                                if dev_specs.is_some() && !unread {
                                     gpu_pen_counted(&*e, &mut slots, feeds.iter().map(|f| f.0), 1);
                                 }
                                 let t_emit =
@@ -4357,8 +4373,14 @@ fn run_one_tick(
                                     })
                                     .unwrap_or(Ok(()))
                                 {
+                                    if unread {
+                                        // The unread step's staging is free only once it retires.
+                                        let _ = e.sync_stream();
+                                    }
                                     note_fault(&mut tick_fault, &err);
                                     fail_feeds(&mut slots, &feeds, &arena, &err);
+                                } else if unread {
+                                    observe(&mut obs.host, t_step.elapsed().as_secs_f64() * 1e3);
                                 }
                                 let cfg_drawn = if cfg_dev {
                                     gpu_cfg_advance(&feeds, &mut slots, 1);
@@ -7714,6 +7736,7 @@ fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap:
     }
     admitted || prompts >= 2
 }
+
 /// A speech job's `max_tokens` is its packet's cap (an ASR transcript, a TTS utterance), not a
 /// client's ask: under a live context bound (`--live-ctx-models`) the stream ends at the context
 /// instead of the request failing.
