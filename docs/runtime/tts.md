@@ -37,6 +37,10 @@ left there, without reserving the slot. The last prompt row is always replayed. 
 consumes the old provenance, successful prefill publishes the new prefix, and a failed device
 step invalidates the engine's prefixes. Sessions, CFG pairs, pending encoders, P/D and multimodal
 jobs do not use this cache; packets without the capability retain their current behavior.
+With a packed depth contract, live VMM uses bounded engine-local identities for these same
+content keys, outside the packet's input-token vocabulary. Identities are never recycled while
+cache entries can refer to them; exhaustion declines caching. Prompt lookup, boundary storage
+and publication use the same identities. Generated frame rows are not published as token prefixes.
 
 Depth speaker-conditioning inputs also stay resident per slot. Rebinding the same immutable
 speaker allocation (or null speaker) resets the request's controller while reusing its uploaded
@@ -47,17 +51,23 @@ prefix can feed its terminal row straight into batched decode. Terminal overlay 
 prefill because decode does not read those overlays. Host-controlled predictors bind each new
 request's controller and speaker memory before its first batched launch. First-frame codes for
 completed prompts are staged together: adjacent slots share an upload, and all uploads share
-one synchronization before per-slot history resets. Unified token-batch
-programs still require per-row frame-code and overlay input support; enabling the flag alone is
-not sufficient. These paths require numerical and latency qualification before promotion.
+one synchronization before per-slot history resets. These paths require numerical and latency
+qualification before promotion.
 The streaming LM drain hands off each complete frame as an owned buffer and retains only an
 incomplete token frame, rather than another copy of the utterance's code history.
 
 Hopper objects can carry ABI 2 split-attention riders for head width 128. The runtime requires
 the hd128 function, shared-memory claim and complete bucket coverage before selecting that
-route; older objects keep their existing path. This attention support does not yet provide
-packed depth frame inputs, overlays or predictor output-row mapping, so depth speech packets
-remain excluded from unified token batching.
+route; older objects keep their existing path.
+
+`fish_depth.json` may carry `packed` version 1: `input_vocab`, normalized `hidden` tensor,
+`backbone_logits` consumption, and an optional `decode_token` for frame-only decode embeddings.
+The emitter declares these choices; runtime dispatch does not inspect model names. The token
+batch stages prompt codes and overlays in planner order and copies continuing slots' latest
+codes into their launch rows. Compact normalized hidden rows are gathered back to physical
+slots. Predictors that consume backbone logits use a separate gathered buffer, preserving the
+compact logits. Requests keep their original token history and sampling coordinates. Packets
+without this contract, CFG pairs and learned decode position bases retain their existing routes.
 
 Reproduced 2026-09-27 at 7c0a7f7e into fresh directories (H100): every packet
 (`model.pkt`, `encoder.pkt`, `codec.pkt`, `s3gen.pkt`) byte-identical to the working assets,

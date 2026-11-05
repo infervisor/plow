@@ -7463,7 +7463,6 @@ fn gpu_prefill_batched_pass(
                                 .map_err(crate::RuntimeError::Rejected)
                         });
                         // Frame rows' embeddings come from their staged codes, not their ids.
-                        e.set_prefix_attach(i, sp.frame_codes.is_empty());
                         keyed
                     }
                     None => Ok(()),
@@ -7473,6 +7472,7 @@ fn gpu_prefill_batched_pass(
                     fail_slot(slot, arena, err);
                     continue;
                 }
+                configure_speech_prefix(e, i, request);
             }
             let admitted = (|| -> Result<()> {
                 reconcile_slot_prefix(request, e.slot_prefix_epoch());
@@ -7815,6 +7815,34 @@ fn gpu_prefill_batched_pass(
             let stepped = pen_synced.is_ok();
             let result = if let Err(err) = pen_synced {
                 Err(err)
+            } else if e.packed_depth_enabled() {
+                let sampled = e.dev_sample_enabled();
+                *dev_sampled = sampled;
+                let spec = |slot: u32, j: u32| ride_row_spec(slots, feeds, spans, pen, slot, j);
+                e.token_batch_step_staged(
+                    &requests,
+                    unified_output,
+                    sampled.then_some(
+                        &spec as &dyn Fn(u32, u32) -> Option<crate::exec::gpu::DevSample>,
+                    ),
+                    &mut |e| {
+                        if !window.is_empty() {
+                            window_time = Some(admit_window(e, &mut window, true));
+                        }
+                    },
+                    &mut |e, plan| {
+                        let pack: smallvec::SmallVec<[_; 16]> = plan
+                            .spans
+                            .iter()
+                            .map(|s| (s.slot as usize, s.kv_row0 as usize, s.n_rows as usize))
+                            .collect();
+                        if overlay_rows.is_some() {
+                            gpu_speech_pack_inputs(e, slots, &pack)?;
+                        }
+                        gpu_speech_pack_codes(e, slots, &pack)?;
+                        e.stage_depth_decode_codes(plan)
+                    },
+                )
             } else if !window.is_empty() {
                 let sampled = e.dev_sample_enabled();
                 *dev_sampled = sampled;
@@ -7901,7 +7929,13 @@ fn gpu_prefill_batched_pass(
                     *dev_sampled = true;
                     Ok(())
                 })
-        };
+        }
+        .and_then(|()| {
+            if e.packed_depth_enabled() && !completed.is_empty() {
+                gpu_compact_depth_frames(e, slots, completed)?;
+            }
+            Ok(())
+        });
         if !window.is_empty() {
             // A launch without a host window (the decode rows left it) admits them now.
             if window.iter().all(|job| job.outcome.is_none()) && !unified {
@@ -8131,6 +8165,14 @@ fn speech_prefix_keys(s: &Slot) -> Option<Vec<u64>> {
         return None;
     }
     Some(keys)
+}
+
+#[cfg(feature = "cuda")]
+fn configure_speech_prefix(e: &mut crate::exec::gpu::GpuEngine, i: usize, s: &Slot) {
+    if s.speech.is_some() {
+        let ready = speech_prefix_keys(s).is_some_and(|keys| e.stage_speech_prefix(i, &keys));
+        e.set_prefix_attach(i, ready);
+    }
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -8421,8 +8463,14 @@ fn gpu_prefill_advance(
         return Err(crate::RuntimeError::Rejected("empty prompt".into()));
     }
     fit_speech_budget(slot, e.max_ctx());
+    if let Some(sp) = slot.speech.as_deref_mut() {
+        if let Some(encode) = sp.encode.take() {
+            encode(sp, &mut slot.prompt_ids).map_err(crate::RuntimeError::Rejected)?;
+        }
+    }
     let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
+        configure_speech_prefix(e, slot_idx, slot);
         reconcile_slot_prefix(slot, e.slot_prefix_epoch());
         let kept = if slot.resume > 0 && slot.cfg.is_none() {
             e.resume_slot(slot_idx, slot.resume)
@@ -8460,26 +8508,12 @@ fn gpu_prefill_advance(
         }
         e.set_session_end(slot_idx, slot.session_end);
     }
-    if let Some(sp) = slot.speech.as_deref_mut() {
-        if let Some(encode) = sp.encode.take() {
-            encode(sp, &mut slot.prompt_ids).map_err(crate::RuntimeError::Rejected)?;
-        }
-    }
-    if slot.pf_pos == 0 {
-        // Frame rows' embeddings come from their staged codes, not their ids: a cached prefix
-        // keyed by the ids would misplace them.
-        let keyed = slot
-            .speech
-            .as_deref()
-            .is_none_or(|sp| sp.frame_codes.is_empty());
-        e.set_prefix_attach(slot_idx, keyed);
-    }
     if let Some(sp) = slot.speech.as_deref() {
         // The pair prefills as one unit: the unconditional member to completion on the partner
         // first, its last-row logits stashed before the owner's prefill overwrites row 0.
         if let (0, Some(cfg), Some(run)) = (slot.pf_pos, sp.cfg.as_ref(), slot.cfg.as_mut()) {
             let partner = slot_idx + 1;
-            e.set_prefix_attach(partner, sp.frame_codes.is_empty());
+            e.set_prefix_attach(partner, false);
             let (ids, pos) = if cfg.uncond_ids.is_empty() {
                 (&slot.prompt_ids, &sp.overlay_pos)
             } else {
@@ -8636,7 +8670,10 @@ pub fn check_speech_packet(e: &crate::exec::gpu::GpuEngine) -> Result<()> {
     if !overlay && e.tensor_bytes("in.pos_base").is_none() {
         return Ok(());
     }
-    if e.token_batch_enabled() || e.mixed_step_rows(1, 1).is_some() {
+    if (e.token_batch_enabled() && !e.packed_depth_enabled())
+        || e.mixed_step_rows(1, 1).is_some()
+        || (e.token_batch_enabled() && e.tensor_bytes("in.pos_base").is_some())
+    {
         return Err(crate::RuntimeError::Rejected(
             "packet has per-row host inputs (overlay / position base) and a mixed-step or \
              token-batch program, which do not stage them per row"
@@ -8819,6 +8856,10 @@ fn speech_pack_overlay(
     for &(i, c0, len) in pack {
         let partner = slots[i].is_none();
         if let Some(sp) = pack_row(slots, i).and_then(|(s, _)| s.speech.as_deref()) {
+            if sp.depth.is_some() || !sp.frame_codes.is_empty() {
+                let end = (launch_row + len).min(index.len());
+                index[launch_row..end].fill(OVERLAY_KEEP);
+            }
             let src = match (partner, sp.cfg.as_ref()) {
                 (true, Some(cfg)) => &cfg.uncond_overlay,
                 _ => &sp.overlay,
@@ -8856,9 +8897,9 @@ fn gpu_speech_pack_inputs(
     STAGE.with_borrow_mut(|(rows, index)| {
         speech_pack_overlay(slots, pack, window, rows, index);
         if !rows.is_empty() {
-            e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(rows))?;
+            e.write_tensor_ordered("in.encoder_overlay", 0, bytemuck::cast_slice(rows))?;
         }
-        e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(index))
+        e.write_tensor_ordered("in.encoder_overlay_index", 0, bytemuck::cast_slice(index))
     })
 }
 
@@ -8911,7 +8952,7 @@ fn gpu_speech_pack_codes(
             }
             launch_row += len;
         }
-        e.write_tensor("in.frame_codes", 0, bytemuck::cast_slice(codes))
+        e.write_tensor_ordered("in.frame_codes", 0, bytemuck::cast_slice(codes))
     })
 }
 
@@ -9006,6 +9047,9 @@ fn dev_sample_spec(slot: &Slot, pen: bool) -> Option<crate::exec::gpu::DevSample
 /// no host logits. `None` keeps the argmax and the host path.
 #[cfg(feature = "cuda")]
 fn dev_row_spec(slot: &Slot, pen: bool) -> Option<crate::exec::gpu::DevSample> {
+    if slot.speech.as_ref().is_some_and(|s| s.depth.is_some()) {
+        return None;
+    }
     slot.cfg
         .is_none()
         .then(|| dev_sample_spec(slot, pen))
@@ -9293,8 +9337,67 @@ fn greedy_device_logprobs(
     Ok(Some(stats_logprobs(&out, k as usize, req.raw_logits)))
 }
 
-/// Depth-stage packets: sample every fed depth slot's frame after the backbone step (decode row
-/// = slot) and put its token in `toks`, its codes on the slot.
+/// Sample compact backbone outputs through the packet's physical-slot depth interface.
+#[cfg(feature = "cuda")]
+fn gpu_compact_depth_frames(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    completed: &mut [(usize, u32)],
+) -> Result<()> {
+    type Bufs = (
+        Vec<u32>,
+        Vec<(usize, DepthJob)>,
+        Vec<crate::exec::gpu::FishRow>,
+        Vec<u32>,
+    );
+    thread_local! {
+        static BUFS: std::cell::RefCell<Bufs> = const {
+            std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new()))
+        };
+    }
+    BUFS.with_borrow_mut(|(owners, rows, fish, codes)| {
+        owners.clear();
+        owners.extend(completed.iter().map(|c| c.0 as u32));
+        rows.clear();
+        fish.clear();
+        for (k, &(i, _)) in completed.iter().enumerate() {
+            let Some(s) = slots[i].as_mut() else { continue };
+            let Some(job) = s.speech.as_ref().and_then(|sp| sp.depth) else {
+                continue;
+            };
+            if s.step == 0 {
+                e.fish_reset_slot(i)?;
+                if let Some(plan) = job.maya2 {
+                    e.maya2_bind(
+                        i,
+                        plan,
+                        s.speech.as_ref().and_then(|sp| sp.maya2_memory.as_ref()),
+                    )?;
+                }
+                if let Some((epoch, keys)) = s.slot_prefix_keys.take() {
+                    e.keep_slot_prefix(i, epoch, keys);
+                }
+            }
+            rows.push((k, job));
+            fish.push(job.row(i, i as u32, s.step, None));
+        }
+        if fish.is_empty() {
+            return Ok(());
+        }
+        codes.clear();
+        e.fish_depth_step_compact(fish, owners, codes)?;
+        let n = codes.len() / rows.len();
+        for (r, &(k, job)) in rows.iter().enumerate() {
+            let (token, frame) = job.token(&codes[r * n..(r + 1) * n]);
+            completed[k].1 = token;
+            if let Some(slot) = slots[completed[k].0].as_mut() {
+                slot.frame = frame;
+            }
+        }
+        Ok(())
+    })
+}
+
 #[cfg(feature = "cuda")]
 fn gpu_depth_frames(
     e: &mut crate::exec::gpu::GpuEngine,
@@ -12498,6 +12601,25 @@ mod tests {
         assert_eq!(pack_row(&slots, 3).map(|(_, pf)| pf), Some(2));
         assert!(packed_prompt_done(&slots, 2, 1) && !packed_prompt_done(&slots, 2, 0));
         assert!(pack_row(&slots, 1).is_none());
+    }
+
+    #[test]
+    fn packed_speech_keeps_prompt_and_decode_frame_embeddings_between_overlays() {
+        let (mut a, _rx) = prefill_test_slot();
+        a.as_mut().unwrap().speech = Some(Box::new(prefix_test_speech()));
+        let (mut b, _rx_b) = prefill_test_slot();
+        b.as_mut().unwrap().speech = Some(Box::new(SpeechJob {
+            overlay: vec![9.0, 8.0],
+            overlay_pos: vec![0],
+            ..prefix_test_speech()
+        }));
+        let slots = [a, None, b];
+        let mut rows = Vec::new();
+        let mut index = Vec::new();
+        // Decode slot 0 at a position past all prompt overlays, then a new prompt on slot 2.
+        speech_pack_overlay(&slots, &[(0, 100, 1), (2, 0, 2)], 5, &mut rows, &mut index);
+        assert_eq!(index, [OVERLAY_KEEP, 0, OVERLAY_KEEP, u32::MAX, u32::MAX]);
+        assert_eq!(rows, [9.0, 8.0]);
     }
 
     /// A full downstream stage keeps a request queued, answered with nothing.

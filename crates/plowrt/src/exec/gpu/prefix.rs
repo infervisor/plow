@@ -10,6 +10,42 @@ use crate::{Result, RuntimeError};
 
 use super::GpuEngine;
 
+const SPEECH_IDENTITIES: usize = 1 << 20;
+
+pub(super) struct SpeechIdentities {
+    next: u32,
+    rows: rustc_hash::FxHashMap<u64, u32>,
+}
+
+impl SpeechIdentities {
+    pub(super) fn new(vocab: usize) -> Self {
+        Self {
+            next: u32::try_from(vocab).unwrap_or(u32::MAX),
+            rows: Default::default(),
+        }
+    }
+
+    fn encode(&mut self, keys: &[u64]) -> Option<Arc<[u32]>> {
+        let mut ids = Vec::with_capacity(keys.len());
+        for key in keys {
+            let id = if let Some(&id) = self.rows.get(key) {
+                id
+            } else {
+                if self.rows.len() == SPEECH_IDENTITIES || self.next == u32::MAX {
+                    return None;
+                }
+                let id = self.next;
+                self.next += 1;
+                // Never recycle an identity while a VMM boundary or store block can name it.
+                self.rows.insert(*key, id);
+                id
+            };
+            ids.push(id);
+        }
+        Some(ids.into())
+    }
+}
+
 pub(super) struct SlotPrefixes {
     rows: Vec<Vec<u64>>,
     pub(super) epoch: u64,
@@ -848,6 +884,24 @@ impl GpuEngine {
     /// none either until retired.
     pub fn set_prefix_attach(&mut self, b: usize, on: bool) {
         self.prefix_attach_off[b] = !on;
+        if !on {
+            self.staged_speech_prefix[b] = None;
+        }
+    }
+
+    pub fn stage_speech_prefix(&mut self, b: usize, keys: &[u64]) -> bool {
+        self.staged_speech_prefix[b] = (self.vmm_prefix_enabled() && self.packed_depth_enabled())
+            .then(|| self.speech_identities.encode(keys))
+            .flatten();
+        let ready = self.staged_speech_prefix[b].is_some();
+        self.set_prefix_attach(b, ready);
+        ready
+    }
+
+    pub(super) fn record_prompt_prefix(&mut self, b: usize, prompt: &[u32], end: usize) {
+        let ids = self.speech_prefix[b].as_deref().unwrap_or(prompt);
+        self.seq_tokens[b].clear();
+        self.seq_tokens[b].extend_from_slice(&ids[..end]);
     }
 
     /// [`Self::attach_prompt`] with the prompt's block hashes already computed.
@@ -858,7 +912,12 @@ impl GpuEngine {
         key: Option<crate::memory::vmm::PrefixKey>,
     ) -> Result<usize> {
         if self.pos[b] == 0 && self.vmm_prefix_enabled() && !self.prefix_attach_off[b] {
-            self.vmm_attach(b, prompt, key)?;
+            let ids = self.speech_prefix[b].clone();
+            if ids.is_some() {
+                self.staged_prefix[b] = None;
+            }
+            let key = if ids.is_some() { None } else { key };
+            self.vmm_attach(b, ids.as_deref().unwrap_or(prompt), key)?;
         }
         Ok(self.pos[b] as usize)
     }
@@ -870,6 +929,12 @@ impl GpuEngine {
         kind: crate::memory::vmm::Kind,
     ) -> bool {
         if self.publish_off[b] {
+            return false;
+        }
+        if self.speech_prefix[b]
+            .as_ref()
+            .is_some_and(|ids| p_a as usize >= ids.len())
+        {
             return false;
         }
         let Some((v, kv)) = self.vmm_prefix().filter(|_| !self.prefix_attach_off[b]) else {
@@ -942,6 +1007,9 @@ impl GpuEngine {
         let Some((v, kv)) = self.vmm_prefix() else {
             return;
         };
+        let max_rows = self.speech_prefix[b].as_ref().map_or(max_rows, |ids| {
+            max_rows.min(ids.len().saturating_sub(1) as u32)
+        });
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = kv.geometry();
@@ -1163,7 +1231,23 @@ fn prompt_end_covers_the_withheld_last_token() {
 
 #[cfg(test)]
 mod slot_prefix_tests {
-    use super::SlotPrefixes;
+    use super::{SlotPrefixes, SpeechIdentities};
+
+    #[test]
+    fn speech_identities_preserve_content_and_never_alias_token_ids() {
+        let mut ids = SpeechIdentities::new(8194);
+        let a = ids.encode(&[10, 20, 30, 20]).unwrap();
+        let b = ids.encode(&[10, 21, 30, 20]).unwrap();
+        assert!(a.iter().all(|&id| id >= 8194));
+        assert_eq!(a[0], b[0]);
+        assert_ne!(a[1], b[1]);
+        assert_eq!(a[2..], b[2..]);
+        assert_eq!(a[1], a[3]);
+        assert_eq!(&*a, &*ids.encode(&[10, 20, 30, 20]).unwrap());
+        ids.next = u32::MAX;
+        assert!(ids.encode(&[99]).is_none());
+        assert_eq!(&*a, &*ids.encode(&[10, 20, 30, 20]).unwrap());
+    }
 
     #[test]
     fn slot_prefix_keeps_only_matching_prompt_rows_and_always_replays_the_last() {

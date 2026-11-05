@@ -9,7 +9,7 @@ use crate::device::cuda::{KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
 use crate::{Result, RuntimeError};
 
-use super::{DevProgram, GpuEngine, BLOCK};
+use super::{DevInst64, DevOp, DevProgram, GpuEngine, BLOCK, TENSOR_NONE16};
 
 const STAGE_CONTROL_BYTES: usize = 8 + 16 + 8 + 4 + 4;
 
@@ -29,6 +29,153 @@ pub(super) struct FishDepth {
     stage: PinnedHost,
     rows: usize,
     maya2: Option<Maya2>,
+    compact: Option<CompactDepth>,
+}
+
+struct CompactDepth {
+    remap: Loaded,
+    index: DeviceMem,
+    host_index: PinnedHost,
+    _remap_tensors: DeviceMem,
+    depth_tensors: DeviceMem,
+    logits: Option<DeviceMem>,
+}
+
+fn inverse_rows(index: &mut [u32], owners: &[u32]) -> Result<()> {
+    index.fill(u32::MAX);
+    if owners.is_empty() || owners.len() > index.len() {
+        return Err(reject("invalid compact output count"));
+    }
+    for (row, &slot) in owners.iter().enumerate() {
+        let dst = index
+            .get_mut(slot as usize)
+            .ok_or_else(|| reject("compact slot out of range"))?;
+        if *dst != u32::MAX {
+            return Err(reject("duplicate compact slot"));
+        }
+        *dst = row as u32;
+    }
+    for row in index {
+        if *row == u32::MAX {
+            *row = 0;
+        }
+    }
+    Ok(())
+}
+
+impl CompactDepth {
+    fn load(e: &GpuEngine, m: &Manifest) -> Result<Option<Self>> {
+        let (Some(contract), Some(terminal)) = (&m.packed, &e.packed_terminal) else {
+            return Ok(None);
+        };
+        let (hidden, pitch) = terminal.hidden_rows();
+        let output = &e.devp[contract.hidden as usize];
+        let logits = &e.devp[e.t_logits];
+        if pitch == 0
+            || pitch % 2 != 0
+            || output.len < e.batch as u64 * pitch
+            || (output.base < logits.base + logits.len && logits.base < output.base + output.len)
+            || e.handle_of("in.frame_codes") != Some(m.tensors.prompt_codes as usize)
+            || e.devp[m.tensors.prompt_codes as usize].len
+                < e.pf_max_rows() as u64 * u64::from(m.codebooks) * 4
+            || e.prefill.iter().any(|b| {
+                !b.h_inst
+                    .iter()
+                    .any(|i| i.op == DevOp::EmbedFrameBf16 as u16 && i.i[2] == contract.input_vocab)
+            })
+        {
+            return Err(reject("packed depth hidden or embedding extent mismatch"));
+        }
+        let blocks = u16::try_from(e.batch).map_err(|_| reject("packed depth batch overflow"))?;
+        let index = e.be.alloc(0, e.batch as u64 * 4)?;
+        let logits = contract
+            .backbone_logits
+            .then(|| e.be.alloc(0, e.batch as u64 * e.vocab as u64 * 2))
+            .transpose()?;
+        let mut pointers: Vec<u64> = e.devp.iter().map(|p| p.base).collect();
+        let base = u16::try_from(pointers.len())
+            .ok()
+            .filter(|&h| h < TENSOR_NONE16 - 2)
+            .ok_or_else(|| reject("packed depth tensor handles exhausted"))?;
+        pointers.extend([hidden, index.base, logits.as_ref().map_or(0, |p| p.base)]);
+        let remap_tensors = e.be.alloc(0, pointers.len() as u64 * 8)?;
+        e.be.upload(&remap_tensors, 0, super::pod_bytes(&pointers))?;
+        if let Some(logits) = &logits {
+            pointers[e.t_logits] = logits.base;
+        }
+        let depth_tensors = e.be.alloc(0, pointers.len() as u64 * 8)?;
+        e.be.upload(&depth_tensors, 0, super::pod_bytes(&pointers))?;
+        let gather = |dst, src, width| {
+            let mut i = DevInst64 {
+                op: DevOp::RowGather as u16,
+                blocks,
+                t: [TENSOR_NONE16; 8],
+                ..Default::default()
+            };
+            i.t[..3].copy_from_slice(&[dst, src, base + 1]);
+            i.i[..3].copy_from_slice(&[e.batch as u32, width, e.batch as u32]);
+            i
+        };
+        let mut insts = vec![gather(contract.hidden, base, (pitch / 2) as u32)];
+        if logits.is_some() {
+            insts.push(gather(base + 2, e.t_logits as u16, e.vocab as u32));
+        }
+        let program = super::packed_terminal::chain(insts, e.grid_pf, e.batch as u32);
+        plow_asset::aux_program::Section {
+            n_cu: e.grid_pf,
+            programs: vec![program.clone()],
+        }
+        .validate(pointers.len())
+        .map_err(reject)?;
+        let (arg, _, counter_bytes, tables) =
+            super::mixed_step::upload_program(&e.be, &program, remap_tensors.base, 0, 0)?;
+        Ok(Some(Self {
+            remap: Loaded {
+                rows: e.batch as u32,
+                arg,
+                counter_bytes,
+                _tables: tables,
+            },
+            index,
+            host_index: e.be.host_alloc_pinned(e.batch * 4)?,
+            _remap_tensors: remap_tensors,
+            depth_tensors,
+            logits,
+        }))
+    }
+
+    fn launch(&mut self, e: &GpuEngine, owners: &[u32]) -> Result<()> {
+        inverse_rows(
+            bytemuck::cast_slice_mut(self.host_index.as_mut_slice()),
+            owners,
+        )?;
+        // The predictor drains the stream before this pinned stage can be reused.
+        unsafe {
+            e.be.memcpy_htod_async(self.index.base, self.host_index.as_slice(), &e.stream)?;
+        }
+        e.be.memset_d8_async(
+            self.remap.arg.counters,
+            0,
+            self.remap.counter_bytes,
+            &e.stream,
+        )?;
+        let mut arg = self.remap.arg;
+        let mut args = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+        e.be.launch_cooperative(
+            e.f_pf.unwrap(),
+            e.grid_pf,
+            BLOCK,
+            e.smem_pf,
+            &mut args,
+            Some(&e.stream),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DepthOutputs {
+    tensors: u64,
+    logits: u64,
 }
 
 /// Maya 2's host cb0 controller: per-slot state, and the widest program's read-back cb0 logits.
@@ -305,6 +452,7 @@ impl FishDepth {
             }),
             _ => None,
         };
+        let compact = CompactDepth::load(e, &manifest)?;
         tracing::info!(
             programs = programs.len(),
             rows,
@@ -317,6 +465,7 @@ impl FishDepth {
             stage,
             rows,
             maya2,
+            compact,
         })
     }
 }
@@ -415,12 +564,59 @@ impl GpuEngine {
     /// Sample one frame for each of `rows` (distinct slots) and append its codes
     /// (`codebooks` per row, column 0 the backbone class) to `out`.
     pub fn fish_depth_step(&mut self, rows: &[FishRow], out: &mut Vec<u32>) -> Result<()> {
+        self.fish_depth_step_inner(rows, None, out)
+    }
+
+    pub fn fish_depth_step_compact(
+        &mut self,
+        rows: &[FishRow],
+        owners: &[u32],
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        self.fish_depth_step_inner(rows, Some(owners), out)
+    }
+
+    fn fish_depth_step_inner(
+        &mut self,
+        rows: &[FishRow],
+        owners: Option<&[u32]>,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
         let mut d = self.fish.take().ok_or_else(|| reject("not enabled"))?;
-        let r = if d.maya2.is_some() {
-            self.maya2_launch(&mut d, rows, out)
-        } else {
-            self.fish_launch(&mut d, rows, out)
-        };
+        out.clear();
+        let r = (|| {
+            let outputs = if let Some(owners) = owners {
+                if rows.iter().any(|r| {
+                    r.cfg.is_some()
+                        || r.hidden_row as usize != r.slot
+                        || !owners.contains(&(r.slot as u32))
+                }) {
+                    return Err(reject("invalid compact predictor row"));
+                }
+                let compact = d
+                    .compact
+                    .as_mut()
+                    .ok_or_else(|| reject("no packed depth contract"))?;
+                compact.launch(self, owners)?;
+                Some(DepthOutputs {
+                    tensors: compact.depth_tensors.base,
+                    logits: compact
+                        .logits
+                        .as_ref()
+                        .map_or(self.devp[self.t_logits].base, |p| p.base),
+                })
+            } else {
+                None
+            };
+            if d.maya2.is_some() {
+                self.maya2_launch(&mut d, rows, outputs, out)
+            } else {
+                self.fish_launch(&mut d, rows, outputs, out)
+            }
+        })();
+        if r.is_err() {
+            let _ = self.be.stream_synchronize(&self.stream);
+        }
         self.fish = Some(d);
         self.note_step_result(r.is_err());
         r
@@ -430,6 +626,7 @@ impl GpuEngine {
         &mut self,
         d: &mut FishDepth,
         rows: &[FishRow],
+        outputs: Option<DepthOutputs>,
         out: &mut Vec<u32>,
     ) -> Result<()> {
         let batch = self.batch;
@@ -546,6 +743,9 @@ impl GpuEngine {
         self.be
             .memset_d8_async(p.arg.counters, 0, p.counter_bytes, &self.stream)?;
         let mut arg = p.arg;
+        if let Some(outputs) = outputs {
+            arg.tensors = outputs.tensors;
+        }
         let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
         self.be.launch_cooperative(
             self.f,
@@ -580,6 +780,7 @@ impl GpuEngine {
         &mut self,
         d: &mut FishDepth,
         rows: &[FishRow],
+        outputs: Option<DepthOutputs>,
         out: &mut Vec<u32>,
     ) -> Result<()> {
         use crate::tts::maya2::Tick;
@@ -610,7 +811,7 @@ impl GpuEngine {
         unsafe {
             self.be.memcpy_dtoh_async(
                 &mut m.logits.as_mut_slice()[..n * vocab * 2],
-                l.base,
+                outputs.map_or(l.base, |o| o.logits),
                 &self.stream,
             )?;
         }
@@ -731,6 +932,9 @@ impl GpuEngine {
         self.be
             .memset_d8_async(p.arg.counters, 0, p.counter_bytes, &self.stream)?;
         let mut arg = p.arg;
+        if let Some(outputs) = outputs {
+            arg.tensors = outputs.tensors;
+        }
         let mut args = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
         self.be.launch_cooperative(
             m.speech.f,
@@ -779,10 +983,45 @@ impl GpuEngine {
         self.fish.is_some()
     }
 
-    /// Whether packed prefill completes prompts in the compact terminal; a depth stage withholds
-    /// the last row instead (its first frame needs the decode step's hidden row).
+    /// Depth packets without a compact output contract keep their withheld prompt tail.
     pub fn pf_compact(&self) -> bool {
-        self.has_packed_terminal() && !self.has_depth_stage()
+        self.has_packed_terminal() && (!self.has_depth_stage() || self.packed_depth_enabled())
+    }
+
+    pub fn packed_depth_enabled(&self) -> bool {
+        self.fish.as_ref().is_some_and(|d| d.compact.is_some())
+    }
+
+    pub(super) fn depth_embedding_token(&self) -> Option<u32> {
+        self.fish.as_ref()?.manifest.packed.as_ref()?.decode_token
+    }
+
+    pub(super) fn token_input_vocab(&self) -> usize {
+        self.fish
+            .as_ref()
+            .and_then(|d| d.manifest.packed.as_ref())
+            .map_or(self.vocab, |p| p.input_vocab as usize)
+    }
+
+    pub fn stage_depth_decode_codes(&self, plan: &plow_asset::token_batch::Plan) -> Result<()> {
+        let d = self.fish.as_ref().ok_or_else(|| reject("not enabled"))?;
+        let pitch = u64::from(d.manifest.codebooks) * 4;
+        let t = &d.manifest.tensors;
+        for (span, phase) in plan.spans.iter().zip(&plan.phases) {
+            match phase {
+                plow_asset::token_batch::Phase::Prefill => {}
+                plow_asset::token_batch::Phase::Decode if span.n_rows == 1 => {
+                    self.be.memcpy_dtod_async(
+                        self.devp[t.prompt_codes as usize].base + u64::from(span.row0) * pitch,
+                        self.devp[t.frame_codes as usize].base + u64::from(span.slot) * pitch,
+                        pitch,
+                        &self.stream,
+                    )?;
+                }
+                _ => return Err(reject("speech token batch requires single-row decode")),
+            }
+        }
+        Ok(())
     }
 
     /// Seed `slot`'s decode frame input (`in.fish.dcodes[slot]`) with a withheld prompt row's
@@ -855,8 +1094,24 @@ impl GpuEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{seed_frame_codes, SpeakerMemory};
+    use super::{inverse_rows, seed_frame_codes, SpeakerMemory};
     use std::sync::Arc;
+
+    #[test]
+    fn compact_depth_remap_preserves_permuted_slots_and_source_rows() {
+        let mut index = [0; 5];
+        inverse_rows(&mut index, &[3, 0, 2]).unwrap();
+        assert_eq!(index, [1, 0, 2, 0, 0]);
+        let compact = [[31, 32], [11, 12], [21, 22]];
+        let slots = index.map(|r| compact[r as usize]);
+        assert_eq!(slots[0], [11, 12]);
+        assert_eq!(slots[2], [21, 22]);
+        assert_eq!(slots[3], [31, 32]);
+        assert_eq!(compact[0], [31, 32]);
+        assert!(inverse_rows(&mut index, &[0, 0]).is_err());
+        assert!(inverse_rows(&mut index, &[5]).is_err());
+        assert!(inverse_rows(&mut index, &[]).is_err());
+    }
 
     #[test]
     fn speaker_memory_retains_identity_and_distinguishes_null_and_uninitialized() {
@@ -910,3 +1165,7 @@ mod tests {
         assert!(seed_frame_codes(&mut stage, &[], 8, 65).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "fish_depth_tests.rs"]
+mod packed_tests;

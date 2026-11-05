@@ -2916,6 +2916,9 @@ pub struct GpuEngine {
     /// GENERATED blocks into the prefix cache, so a follow-up turn embedding
     /// this turn's output attaches instead of re-prefilling it.
     seq_tokens: Vec<Vec<u32>>,
+    speech_identities: prefix::SpeechIdentities,
+    speech_prefix: Vec<Option<Arc<[u32]>>>,
+    staged_speech_prefix: Vec<Option<Arc<[u32]>>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
     staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
     /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
@@ -3861,6 +3864,7 @@ struct PackedTokenReq<'a> {
     tokens: &'a [u32],
     c0: usize,
     prompt_len: usize,
+    embedding_token: Option<u32>,
 }
 
 /// Per-row device sampling request (plan stage 4). `temp <= 0` is greedy
@@ -8059,6 +8063,9 @@ impl GpuEngine {
             kv_admission_epoch: 0,
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
+            speech_identities: prefix::SpeechIdentities::new(vocab),
+            speech_prefix: vec![None; batch],
+            staged_speech_prefix: vec![None; batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
             publish_off: vec![false; batch],
@@ -8142,6 +8149,7 @@ impl GpuEngine {
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
         engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw, assets_dir)?;
+        engine.speech_identities = prefix::SpeechIdentities::new(engine.token_input_vocab());
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
         if token_batch::CudaTokenBatch::eligible(&engine) {
@@ -8768,8 +8776,10 @@ impl GpuEngine {
                 self.max_ctx
             )));
         }
+        let attach_off = self.prefix_attach_off[b];
         self.slot_prefixes.clear(b);
         self.reset_packed_admission(b);
+        self.prefix_attach_off[b] = attach_off;
         self.state_drop(b);
         // A retirement deferred behind a step that then failed (queue cleared) must not fire
         // against the request seated here now.
@@ -8805,6 +8815,7 @@ impl GpuEngine {
         let t_publish = t0.map(|t| t.elapsed());
         self.pos[b] = keep;
         self.vmm_attached[b] = 0;
+        self.speech_prefix[b] = self.staged_speech_prefix[b].take();
         if let Some(v) = &self.vmm {
             self.vmm_active[b] = true;
             self.seq_tokens[b].clear();
@@ -8997,6 +9008,7 @@ impl GpuEngine {
         // Rows not keyed by their ids (speech frame rows) are never published.
         let cache_output = cache_output && !self.prefix_attach_off[b];
         self.staged_prefix[b] = None;
+        self.staged_speech_prefix[b] = None;
         self.prefix_attach_off[b] = false;
         if let Some(p) = self.pipe.as_mut() {
             if p.queue.defer_retire(b, cache_output) {
@@ -9074,6 +9086,7 @@ impl GpuEngine {
         self.vmm.as_ref().unwrap().begin_seq(b);
         self.seq_tokens[b].clear();
         self.vmm_active[b] = false;
+        self.speech_prefix[b] = None;
     }
 
     fn reset_packed_admission(&mut self, b: usize) {
@@ -9121,10 +9134,15 @@ impl GpuEngine {
             None => return Err(RuntimeError::Rejected(format!("slot {b} out of range"))),
             _ => {}
         }
+        let identities = self.staged_speech_prefix[b].clone();
+        let cache_prompt = identities.as_deref().unwrap_or(prompt);
         // In-flight sharing: another slot is prefilling this prompt's shared prefix. Wait
         // for its whole-block checkpoint (one attach + the tail) instead of recomputing the
         // shared rows beside it; bounded, and released when the owner publishes or retires.
-        if self.vmm_prefix_enabled() && crate::config::RuntimeConfig::get().prefix_inflight_wait() {
+        if self.vmm_prefix_enabled()
+            && !self.prefix_attach_off[b]
+            && crate::config::RuntimeConfig::get().prefix_inflight_wait()
+        {
             // One deadline for both waits: alternating them must not restart either.
             let since = match self.packed_admission[b] {
                 PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
@@ -9133,7 +9151,7 @@ impl GpuEngine {
                 _ => std::time::Instant::now(),
             };
             if since.elapsed() < INFLIGHT_WAIT_LIMIT {
-                if let Some((owner, rows)) = self.vmm_inflight_prefix(b, prompt) {
+                if let Some((owner, rows)) = self.vmm_inflight_prefix(b, cache_prompt) {
                     if self.packed_admission[b] != PackedAdmission::WaitingPrefix(since) {
                         tracing::info!(
                             slot = b,
@@ -9158,7 +9176,16 @@ impl GpuEngine {
             let restoring = since.elapsed() < RESTORE_WAIT_LIMIT
                 && self
                     .vmm_prefix()
-                    .and_then(|(_, kv)| kv.attach_handle(prompt, self.staged_prefix[b].as_ref()))
+                    .and_then(|(_, kv)| {
+                        kv.attach_handle(
+                            cache_prompt,
+                            if identities.is_some() {
+                                None
+                            } else {
+                                self.staged_prefix[b].as_ref()
+                            },
+                        )
+                    })
                     .is_some_and(|handle| self.blocks_restoring(handle));
             if restoring {
                 self.packed_admission[b] = PackedAdmission::WaitingRestore(since);
@@ -12541,7 +12568,7 @@ impl GpuEngine {
         // VMM: first chunk of a fresh sequence consults the prefix cache —
         // a hit shares the whole-block prefix and moves the frontier there.
         if self.pos[b] == 0 && self.vmm_prefix_enabled() && !self.prefix_attach_off[b] {
-            self.vmm_attach(b, prompt, None)?;
+            self.attach_prompt(b, prompt)?;
         }
         let c0 = self.pos[b] as usize;
         debug_assert!(c0 < n, "prefill_chunk past the prompt end");
@@ -12553,8 +12580,7 @@ impl GpuEngine {
         let real = self.run_one_prefill_chunk(f_pf, b, prompt, c0, cap)?;
         self.pos[b] = (c0 + real) as u32;
         if self.kv_blocks().is_some_and(|bs| bs.captures_state()) {
-            self.seq_tokens[b].clear();
-            self.seq_tokens[b].extend_from_slice(&prompt[..c0 + real]);
+            self.record_prompt_prefix(b, prompt, c0 + real);
             self.state_capture_publish(b, n);
         }
 
@@ -12566,8 +12592,7 @@ impl GpuEngine {
         // The consumed prompt also seeds the slot's row-token record so the
         // sequence's GENERATED blocks can publish at the next begin_slot.
         if self.vmm_prefix_enabled() {
-            self.seq_tokens[b].clear();
-            self.seq_tokens[b].extend_from_slice(prompt);
+            self.record_prompt_prefix(b, prompt, prompt.len());
             self.vmm_publish(b, n.saturating_sub(1) as u32);
             self.vmm_prefill_done(b);
         }
@@ -14579,6 +14604,7 @@ impl GpuEngine {
                         tokens,
                         c0: r.c0,
                         prompt_len: r.prompt.len(),
+                        embedding_token: None,
                     })
                 })
                 .collect::<Result<smallvec::SmallVec<[_; 16]>>>()?;
@@ -14600,8 +14626,7 @@ impl GpuEngine {
             // which checks its frontier against it.
             if self.vmm_prefix_enabled() {
                 let end = r.c0 + r.len;
-                self.seq_tokens[r.slot].clear();
-                self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
+                self.record_prompt_prefix(r.slot, r.prompt, end);
                 self.state_capture_publish(r.slot, r.prompt.len());
             }
             if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
@@ -14781,7 +14806,7 @@ impl GpuEngine {
             let mut cur = 0usize;
             for r in reqs {
                 for (k, &token) in r.tokens.iter().enumerate() {
-                    self.pf_ids[cur + k] = token as i32;
+                    self.pf_ids[cur + k] = r.embedding_token.unwrap_or(token) as i32;
                     self.pf_pos[cur + k] = (r.c0 + k) as i32;
                     pb.slot_buf[cur + k] = r.slot as i32;
                 }

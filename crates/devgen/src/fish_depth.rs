@@ -680,6 +680,13 @@ pub(crate) fn sections(
         pair_cfg: t.d.breeze,
         depth_sampling: None,
         slot_memory: Vec::new(),
+        packed: Some(manifest::PackedDepth {
+            version: 1,
+            input_vocab: c.vocab,
+            backbone_logits: !t.d.breeze,
+            hidden: h(n.hn),
+            decode_token: f.decode_only.then_some(f.lo),
+        }),
         tensors: manifest::Tensors {
             params: h(t.params),
             top_k: h(t.top_k),
