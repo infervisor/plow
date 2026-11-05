@@ -965,7 +965,7 @@ pub(super) fn run(
         sections.push(write_block_descriptor(out, &desc));
     }
     let ecfg = emit_config::active();
-    if block.is_some() || ecfg.block_packets || ecfg.pf_modular {
+    if block.is_some() || ecfg.block_packets {
         let mut modular_progs = Vec::new();
         for (i, &t) in buckets.iter().enumerate() {
             modular_progs.push(modular::create_modular_block_prog(

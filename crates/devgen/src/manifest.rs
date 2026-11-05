@@ -1578,7 +1578,6 @@ pub(crate) const UNRECORDED_ENV: &[&str] = &[
     // carries what the builder actually saw alongside what the field claimed.
     "PLOW_UNISEG",
     "PLOW_CHAIN_BYPASS",
-    "PLOW_FINE_FORCE",
     "PLOW_FUSE_XR_ATTNRES",
     "PLOW_GQ_ORDER",
     "PLOW_MLA_PF_V2",

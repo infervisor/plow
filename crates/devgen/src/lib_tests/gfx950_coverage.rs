@@ -342,7 +342,7 @@ const GFX950_UNEMITTED: &[(&str, &str)] = &[
     (
         "PLOW_DOP_MOE_ROUTER",
         "Legacy fused router score and top-k arm. MLA emitters use the split GEMV/GEMM_F32 + \
-         MoeRouterTopk path and explicitly refuse the legacy GLM_ROUTER_OLD selector.",
+         MoeRouterTopk path.",
     ),
     (
         "PLOW_DOP_FLASH_GATHER_PREFILL",
@@ -380,6 +380,12 @@ const GFX950_UNEMITTED: &[(&str, &str)] = &[
           pre-FFN RMSNorm into the expert gate/up dots and is what lib.rs:3599 emits. Op 62 is \
           the unfused twin (it takes an already-normed x); the AMD arm exists for the A/B and \
           for a pre-fuse packet. Not a precision arm.",
+    ),
+    (
+        "PLOW_DOP_MOE_ROUTER_GEMMA_SCORE",
+        "Exact Gemma MoE router scorer. The emitter always selects MoeRouterGemmaScoreFast; \
+          the opcode stays in the packet ISA for packets emitted before the exact arm was \
+          dropped.",
     ),
     (
         "PLOW_DOP_XFLASHMERGE",

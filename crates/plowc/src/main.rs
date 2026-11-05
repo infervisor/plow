@@ -2061,11 +2061,6 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // unset, or an unpartitioned GPU such as consumer Blackwell) ⇒ byte-identical blob. The
     // physical-SM dispatch that consumes this is a runtime/interp feature —
     // see the design notes.
-    //
-    // WAS `PLOW_NV_PLACE`, still accepted. The concept is vendor-neutral — an L2 domain is a GPC
-    // on NVIDIA and an XCD on AMD — and the NVIDIA-specific name was reading as "this is an
-    // NVIDIA feature" for something `hwspec` describes on both vendors. The old spelling stays
-    // live so in-flight scripts and recipes do not break.
     let l2_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
     let l2_off = |k: &str| std::env::var(k).ok().as_deref() == Some("0");
     // DEFAULT ON FOR gfx942/gfx950. Per-XCD queues are the shipped CDNA decode/prefill path,
@@ -2077,7 +2072,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Both shipping AMD object recipes carry the checked dispatch marker. Other architectures
     // remain explicit opt-in until their physical-domain mapping is measured.
     let l2_default = matches!(cli.arch.as_str(), "gfx942" | "gfx950") && !l2_off("PLOW_L2_PLACE");
-    let l2_layout = if l2_default || l2_on("PLOW_L2_PLACE") || l2_on("PLOW_NV_PLACE") {
+    let l2_layout = if l2_default || l2_on("PLOW_L2_PLACE") {
         hwspec::registry::lookup(&cli.gpu)
             .and_then(|s| s.l2_partitioning.as_ref())
             // WHICH WORKGROUP LANDS ON WHICH DOMAIN IS VENDOR-SPECIFIC, and getting it from the

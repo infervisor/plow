@@ -1309,15 +1309,8 @@ fn k3_build_model(
             sequence_slots,
             n_cu,
             // Every rung of a ladder carries independent sequences, including B1. Without a
-            // ladder, B1 remains byte-identical unless PLOW_K3_SEQ_ROWS forces the carrier.
-            // PLOW_K3_SEQ_ROWS is a
-            // BISECTION INSTRUMENT, not a serving knob: at one row every carrier is a no-op by
-            // construction (the only slot is slot 0, at offset 0 under either addressing), so a
-            // B=1 emit with it on MUST reproduce the known-good B=1 stream token for token. If it
-            // does not, the carrier that broke it is separable from batching itself — which is the
-            // one question a B>1 run cannot answer, because at B>1 there is no reference stream to
-            // compare against.
-            if ladder_on || t > 1 || emit_config::active().k3_seq_rows {
+            // ladder, B1 remains byte-identical.
+            if ladder_on || t > 1 {
                 crate::k3::RowKind::Sequences
             } else {
                 crate::k3::RowKind::Tokens

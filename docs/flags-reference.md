@@ -185,25 +185,8 @@ changing them.
 - `PLOW_FUSE_ARGMAX=1` — fold greedy argmax into the lm_head GEMV epilogue
   (byte-identical, ~0 perf — the logit round-trip is ~0.1%; a correctness-neutral
   cleanup, kept as a flag).
-- `PLOW_FINE_FORCE=1` — keep per-slice (**fine**) counter gates instead of the
-  default whole-op (**coarse**) ones. The emitter declares a fine edge wherever a
-  consumer slice reads only part of a producer (headnorm→flash, flash→merge, MoE
-  down→GLU); by default `select_granularity` collapses every *homogeneous* region
-  back to coarse, because `lean-plow/Plow/CounterGranularity.lean:collapse` proves
-  fine buys nothing when per-slice work is uniform — and it isn't free (an extra
-  counter per producer slice, an extra atomic per producer, a wider wait list).
-  This lever keeps the fine edge iff it is genuinely *sparse* (some consumer slice
-  waits on strictly fewer than all producer slices) so it isolates the recoverable
-  straggler gates without paying the 256×256-atomic all-to-all cost. It exists to
-  **measure** the real-hardware straggler delta the uniform cost model can't see:
-  on dense Gemma it was a wash-to-loss (16.9 → 17.2 ms/token), which is why coarse
-  is the default. Lean-safe (a fine list only lowers a threshold / narrows a wait
-  set), and **unset = byte-identical** coarse. There is no all-to-all "everything
-  fine" mode — see the design notes.
 - `PLOW_L2_PLACE=1` — **L2-domain packet grouping** (compiler half of physical-SM
-  locality). *Was `PLOW_NV_PLACE`, still accepted as a deprecated alias: an L2
-  domain is a GPC on NVIDIA and an XCD on AMD, and `hwspec` describes both, so the
-  NVIDIA-specific name was wrong about its own scope.* Groups the device blob's
+  locality). Groups the device blob's
   global-queue stream into P per-L2-domain windows, so a full op's slices spread
   evenly across all domains and slice `s` stays in one domain across ops (consumer
   reads producer from the same L2 slice). It does NOT touch `cus` (so it can't
@@ -295,7 +278,6 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_NO_FUSE_NRN` | `--no-fuse-nrn` | false | Disable norm+residual+norm fusion. |
 | `PLOW_FUSE_HNR` | `--fuse-hnr` | false | Fuse head-norm + reduce. |
 | `PLOW_FUSE_MERGE` | `--fuse-merge` | false | Fuse merge fold. |
-| `PLOW_HN_SPLIT` | `--hn-split` | false | Head-number split (3*nhn <= n_cu). |
 | `PLOW_QNORM_FUSE` | `--qnorm-fuse` | false | Fuse the q/k RMSNorm into the QKV GEMV epilogue. |
 | `PLOW_FUSE_QUANT` | `--fuse-quant` | true | Fuse activation quantisation into the producing epilogue. DEFAULT ON for AMD (opt out with `=0`); the `amd &&` guard stays at the call site. |
 | `PLOW_FUSE_RESIDUAL_INPUT` | `--fuse-residual-input` | true | Fold graph-adjacent materialized Residual inputs into AttnRes. Bit-identical and model-independent. DEFAULT ON; set `PLOW_FUSE_RESIDUAL_INPUT=0` to roll back. |
@@ -416,7 +398,6 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_MOE_PREFILL` | `--moe-prefill` | unset | MoE prefill control. "0" to disable, unset = auto (on for MoE bf16). |
 | `PLOW_GEMMA_MOE_ROUTER_FUSED` | `--gemma-moe-router-fused` | false | Disable split router, serialize score GEMV on one CTA. |
 | `PLOW_GEMMA_MOE_ROUTER_BLOCKS` | `--gemma-moe-router-blocks` | unset | CTA count for the split router score GEMV. |
-| `PLOW_GEMMA_MOE_ROUTER_EXACT` | `--gemma-moe-router-exact` | false | Exact MoeRouterGemmaScore op instead of ScoreFast. |
 | `PLOW_GEMMA_MOE_TAIL_FUSE` | `--gemma-moe-tail-fuse` | false | Fuse MoE-combine residual/norm tail (B=1 only, reorders summation). |
 
 #### GLM family
@@ -453,8 +434,6 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_GLM_MOE_NATIVE_ALIGN` | `--glm-moe-native-align` | false | GLM prefill on the AITER MoE route (256 experts, top-8, align_par): the four interpreter `MoeAlignPf` packets are not emitted; `MoeAiterFp8Pf` names the gathered routing table (`j0` = table + 1) and the align partition count (`j1` = 64), and the host launches `plow_moe_align` (`moe_align_adapter_gfx942.elf`, `d_moe_align_pf` phases 1-4 on grids 64/1/64/64) before prepare. Byte-identical row maps and meta. The route refuses without the adapter. T3 stacked with the SP-seam fusion (review log #104, #105). |
 | `PLOW_GLM_FUSE_SEAM_RN` | `--glm-fuse-seam-rn` | false | GLM TP8 prefill, sequence-parallel attention seam: the band `Residual` (xmid = x_in + reduced o_proj) and the post-attention `RmsNorm` into peer slot 3 become one `AddNorm` with `i2 = 1` (`d_residual_rmsnorm`: the sum is rounded to bf16 first, then reduced exactly as `d_rmsnorm`, so both outputs are the separate ops' bytes). The packet requires `PLOW_GLM_FUSE_SEAM_RN=1`; `build_gfx942.sh` sets the define on the prefill objects and plowrt refuses an object without `plow_glm_fuse_seam_rn_arm`. The MoE seam (whose norm belongs to the next layer) is not fused. T3 stacked with `PLOW_GLM_MOE_NATIVE_ALIGN` (review log #105). |
 | `PLOW_GLM_FUSE_QNORM` | `--glm-fuse-qnorm` | false | GLM decode q-norm fold: compute `q_a_layernorm` inside fusion G's `GemvQkv` LDS staging and drop the one-workgroup `RmsNorm` packet (opt-in, off by default). |
-| `GLM_ROUTER_OFF_SHARED` | `--glm-router-off-shared` | false | GLM router off-shared dispatch (co-resident mode 2 only). |
-| `GLM_ROUTER_OLD` | `--glm-router-old` | false | GLM use legacy (unfused) single-CU router. |
 | `PLOW_GLM_DSA_PF` | `--glm-dsa-pf` | false | Route GLM's DSA indexer through the prefill chain (requires `has_dsa`). |
 | `PLOW_GLM_FP8_KV` | `--glm-fp8-kv` | on for GLM on gfx942 TP8 (production default), off elsewhere | Store the MLA latent cache as e4m3 + per-row f32 scale. NOT bit-identical. Rollback: `--glm-fp8-kv=false` (recorded as `cli`, and a `--replay-knobs` recipe keeps its own value). |
 | `PLOW_GLM_GEMV_WG` | `--glm-gemv-wg` | unset | Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical. |
@@ -566,10 +545,6 @@ concurrency. See [docs/arch/16-object-contract.md](arch/16-object-contract.md).
 |---|---|---|---|
 | `K3_FULL` | `--k3-full` | true | Diagnostic: `K3_FULL=0` prints the legacy K3 capability report instead of emitting. |
 | `PLOW_LAYERS` | `--layers` | all | Layers to emit (K3 and GLM): "all", a number N (first N layers), or "single:L". A truncation instrument for block sweeps and TP-equivalence checks; never a served packet. |
-| `PLOW_K3_SEQ_ROWS` | `--k3-seq-rows` | false | Diagnostic: force the per-sequence GEMV row carrier at B=1 (bisects the batched-decode addressing against the known-good B=1 stream). |
-| `PLOW_GLM_XR_BAND_SEAM` | `--glm-xr-band-seam` | unset | Diagnostic: restrict banding to one seam (`attn` \| `moe`) to bisect a divergence. |
-| `PLOW_FLASH_MERGE_DSPLIT` | `--flash-merge-dsplit` | unset | Widen the flash-merge dispatch by this factor (diagnostic; measured no effect). |
-| `PLOW_NO_XREDUCE` | `--no-xreduce` | false | Disable all XReduce collectives (diagnostic — numerically wrong). |
 | `PLOW_TUNE_DUMP` | `--tune-dump` | false | Print a TUNEDUMP census line per resolved GEMV shape (tuning-harness diagnostic). |
 | `PLOW_SKIP_COVERAGE` | `--skip-coverage` | false | Emit a model known to fail coverage checks (diagnostic only). |
 | `PLOW_K3_ABLATE` | `--k3-ablate` | unset | K3 bisection instrument (diagnostic only). |
@@ -594,8 +569,7 @@ Raw `std::env::var` reads owned by `packet::devbuild` / `plowc` (see the module 
   field is what would make it recordable.
 - **Known-wrong escape hatches** (garbage tokens by design — never serve):
   `PLOW_CHAIN_BYPASS=<op[,op…]>` splices opcodes out of the chain; the hidden `EmitConfig`
-  diagnostics above (`PLOW_SKIP_COVERAGE`, `PLOW_K3_ABLATE`, `PLOW_K3_SEQ_ROWS`,
-  `PLOW_NO_XREDUCE`) are the same class.
+  diagnostics above (`PLOW_SKIP_COVERAGE`, `PLOW_K3_ABLATE`) are the same class.
 
 ---
 
@@ -817,9 +791,7 @@ the end, not tabled.
 | `PLOW_XR_TAGGED` / `PLOW_XR_DEC_MLP` / `PLOW_XR_DEC_AGG` | **1** / **1** / **1** | **objects** (`scripts/build_gfx950.sh`, decode rows) — tagged one-shot XReduce (r1 15.2 -> 8.0 us), peer-batched one-shot reduce (B=8 25.2 -> 18.5 us) and the two-shot all-gather aggregation. Bit-identical; `=0` is the rollback. |
 | `PLOW_FA_MERGE_LDS` | 0 | **objects** (`scripts/build_gfx950.sh`, decode) — the serial gfx950 flash-decode merge reads its splits from an LDS copy staged in one load round. Bit-identical; Muse TP8 B1 merge 20.5 -> 13.6 us/layer, 18.24 -> 17.91 ms/token. |
 | `PLOW_MUSE_CMB_ILP` | 0 | **objects** (`scripts/build_gfx950.sh`, decode) — the one-row TP `MuseMoeCombineNorm` reads its routing table once and issues its k loads together. Bit-identical; 21.8 -> 16.9 us/layer, 18.24 -> 17.78 ms/token. |
-| `PLOW_XR_DEC_TWOSHOT_MIN` | unset | **emit** — two-shot decode all-reduce for messages of at least this many bytes. Streams identical, but B=128 measured 69.0 us two-shot vs 68.6 one-shot, so it stays off. |
 | `PLOW_FA_DEC_KL` | 1 | **objects** (`scripts/build_gfx950.sh`) — `8` = eight lanes per KV row in the decode flash K-phase (61k-context flash 126 -> 94 us). Not bit-identical: r1 streams changed at p4096/p16384, so it stays off. |
-| `PLOW_NO_XREDUCE` | unset | **emit** — disable all XReduce all-reduce collectives (diagnostic; numerically wrong). |
 | `PLOW_XR_SCHED` / `PLOW_XR_SCHED_NWG` / `PLOW_XR_SCHED_NWG_RS` / `PLOW_XR_SCHED_AG_U` | **aiter (gfx942 prefill rows)** / 24 / 8 / 1 | **objects** (`scripts/build_gfx942.sh`, prefill rows) — `aiter` builds the strict-rank-order 16-byte prefill collective schedule (`-DPLOW_XR_SCHED_AITER=1`) on the first `NWG` workgroups of each `XReduceTwoShot` / `XReduceScatter` / `XAllGather` packet, the two-shot's reduce-scatter on the first `NWG_RS`; the other workgroups take only their `gate_ag` arrival and leave, so the packet (304 workgroups) is unchanged. `AG_U` = all-gather packs in flight per lane. The objects export `plow_xr_sched_aiter_1`, `plow_xr_sched_nwg` and `plow_xr_sched_nwg_rs` (u32 values = the caps). Bit-identical (host strict-order oracle, every bucket). 8x MI300X two-shot, 304 workgroups launched: 8192x6144 bf16 1002 → 728 µs (-27%, 181 → 242 GB/s effective; one shared cap of 24 gives 795), 2048 rows 289 → 186, 512 rows 119 → 76, 128 rows 68 → 42 µs. In model (4-layer TP8 packet, last 8192 chunk at prior 65536, bracketed by two controls): 1.06 → 0.92 ms per collective (rank 0; rank 4 0.97 → 0.79) with the defaults, 1.08 → 0.99 ms with one cap of 24; projected −23 to −31 ms per 78-layer 8192 chunk. Decode is not affected (decode rungs emit only the one-shot `XReduce`). **Default on** in `build_gfx942.sh` after the served A/B (credited as a pair with `PLOW_AMD_NUMA_HOST_POOLS`: full 8192 chunks 823.4 / 793.9 / 824.4 ms ctrl / treat / ctrl2, −29.9 ms per chunk against a 1.0 ms control gap; prefill tick p50 888.8 / 857.0 / 890.3 ms; +3.66 % out tok/s against a 1.14 % control spread; retrieval 18/18 + 21/21 in every arm); rollback `PLOW_XR_SCHED=twoshot` (`off` is an alias), which compiles none of it. The CMake option (the gfx950 path) keeps `off`. `PLOW_XR_TRACE_PHASES=1` (diagnostic) also reaches the decode objects. |
 | `PLOW_XR_SCHED_NWG_SRS` / `PLOW_XR_SCHED_NWG_SAG` | **8** / unset (= `PLOW_XR_SCHED_NWG`, 24) | **objects** (`scripts/build_gfx942.sh`, prefill rows, with `PLOW_XR_SCHED=aiter`) — separate data-workgroup caps for the sequence-parallel seam halves, op 25 `XReduceScatter` (`_SRS`) and op 26 `XAllGather` (`_SAG`); the objects export `plow_xr_sched_nwg_srs` / `_sag`. The seam reduce-scatter runs on 8 workgroups by default (micro5, 8x MI300X, 304 launched: 8192x6144 394.5 → ~347 µs, 2048x6144 108.2 → 93.9 µs; in model, 4-layer TP8 seams packet, ctl / treat / ctl2: 73,728-row prefill 393.5 / 388.0 / 393.8 ms, per-reduce-scatter −63 µs (mean over ranks) to −92 µs (min), ≈ −10 to −14 ms per 78-layer 8192 chunk; logits within the control-vs-control spread); rollback `PLOW_XR_SCHED_NWG_SRS=24`, the cap it used before. No all-gather cap below 24 pays (16: +134 µs, 8: +512 µs at 8192x6144), so `_SAG` stays unset. Bit-identical (strict-order oracle). |
 | `PLOW_DSA_TP_SELECT_THR` | 0 | **objects** (`scripts/build_dsa_tp.sh OUT -DPLOW_DSA_TP_SELECT_THR=1`) — also export `plow_dsa_tp_select_thr` from `dsa_tp_adapter_gfx942.elf`: the TP indexer's selection as `d_index_select_pf_thr` (12-bit digits until the boundary bin holds ≤ 2048 keys, one collect scan, a byte radix over those keys in LDS; two row scans instead of five, the same `dsa_pack_key_a` set). Launched only under `PLOW_DSA_SELECT_THRESHOLD`; off, the adapter disassembly is unchanged. |
@@ -829,7 +801,7 @@ the end, not tabled.
 
 **Measurement/diagnostic instruments — never ship** (numerically wrong or admit a
 data race; used only to price a protocol cost): `PLOW_XR_NOSIG`, `PLOW_XR_NOWAIT`,
-`PLOW_XR_NOWAIT_RS`, `PLOW_XR_SHUFFLE`, `PLOW_FLASH_MERGE_DSPLIT` (measured dead), `PLOW_NSTAGE` (`experiments/` only).
+`PLOW_XR_NOWAIT_RS`, `PLOW_XR_SHUFFLE`, `PLOW_NSTAGE` (`experiments/` only).
 
 ### GEMM / GEMV
 
