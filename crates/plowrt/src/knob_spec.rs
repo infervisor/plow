@@ -876,6 +876,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tts_first_lookahead", Some("PLOW_TTS_FIRST_LOOKAHEAD"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("rt.tts_stream_first_frames", Some("PLOW_TTS_STREAM_FIRST_FRAMES"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tts_codec_hold_ms", Some("PLOW_TTS_CODEC_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("rt.tts_codec_launch_us", Some("PLOW_TTS_CODEC_LAUNCH_US"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.tts_onset_trim", Some("PLOW_TTS_ONSET_TRIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_realtime", Some("PLOW_TTS_REALTIME"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_admit_wait_ms", Some("PLOW_TTS_ADMIT_WAIT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(6000)), OPT_IN),

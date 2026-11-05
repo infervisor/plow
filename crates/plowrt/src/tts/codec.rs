@@ -269,6 +269,8 @@ struct Job {
     /// A first audio holds the feeding model's next tick until it is answered: both stages'
     /// kernels take the whole device, so a tick launched ahead of it delays the first audio.
     _urgent: Option<crate::sched::admission::DownstreamUrgent>,
+    /// PCM of this step's frames already decoded by earlier pieces of a bounded launch.
+    carry: Vec<f32>,
 }
 
 impl Job {
@@ -748,6 +750,7 @@ impl Codec {
                 reply,
                 _work,
                 _urgent,
+                carry: Vec::new(),
             }))
             .map_err(|_| "codec worker stopped".to_string())?;
         rx.await
@@ -1538,6 +1541,8 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
     let hold_guard = std::time::Duration::from_millis(
         crate::config::RuntimeConfig::get().tts_codec_hold_ms as u64,
     );
+    let bound_us = crate::config::RuntimeConfig::get().tts_codec_launch_us as f64;
+    let mut costs = StepCosts::default();
     let mut pending: Vec<Job> = Vec::new();
     let mut hold = None;
     let mut open = true;
@@ -1596,10 +1601,60 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         });
         let mut batch: Vec<Job> = take.iter().rev().map(|&k| pending.remove(k)).collect();
         batch.reverse();
-        match codec.launch(&batch) {
+        // Bounded stream steps: a launch whose measured time exceeds the bound runs the measured
+        // capacity under it that decodes the most frames per second; the jobs it leaves out stay
+        // queued and the frames it cuts decode as the same steps' next pieces, after anything
+        // more urgent that arrived meanwhile.
+        let mut rests: Vec<Option<(Vec<i32>, usize)>> = Vec::new();
+        if bound_us > 0.0 && batch[0].step.is_some() {
+            let frames: Vec<usize> = batch.iter().map(|j| j.frames).collect();
+            if let Some((keep, cap)) = bound_step(&codec.steps, &costs, &frames, bound_us) {
+                for j in batch.drain(keep..).rev() {
+                    pending.insert(0, j);
+                }
+                let fc = codec.frame_codes;
+                rests = batch
+                    .iter_mut()
+                    .map(|j| {
+                        (j.frames > cap).then(|| {
+                            let rest = j.codes.split_off(cap * fc);
+                            let n = j.frames - cap;
+                            j.frames = cap;
+                            (rest, n)
+                        })
+                    })
+                    .collect();
+            }
+        }
+        let t = std::time::Instant::now();
+        let out = codec.launch(&batch);
+        if batch[0].step.is_some() {
+            let frames = batch.iter().map(|j| j.frames).max().unwrap_or(0);
+            if let Some(&(cb, cn, _)) = codec.capacity(Family::Step, batch.len(), frames) {
+                costs.observe(cb, cn, t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        rests.resize_with(batch.len(), || None);
+        match out {
             Ok(pcm) => {
-                for (j, p) in batch.into_iter().zip(pcm) {
-                    let _ = j.reply.send(Ok(p));
+                for ((mut j, mut p), rest) in batch.into_iter().zip(pcm).zip(rests) {
+                    match rest {
+                        Some((codes, n)) => {
+                            j.carry.extend_from_slice(&p.pcm);
+                            if let Some(st) = j.step.as_mut() {
+                                st.pos += j.frames;
+                            }
+                            (j.codes, j.frames) = (codes, n);
+                            pending.push(j);
+                        }
+                        None => {
+                            if !j.carry.is_empty() {
+                                j.carry.extend_from_slice(&p.pcm);
+                                p.pcm = std::mem::take(&mut j.carry);
+                            }
+                            let _ = j.reply.send(Ok(p));
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -1609,6 +1664,56 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
             }
         }
     }
+}
+
+/// Measured wall time of each stream-step capacity `(batch, frames)`, µs (moving average).
+#[derive(Default)]
+struct StepCosts(std::collections::HashMap<(usize, usize), f64>);
+
+impl StepCosts {
+    fn observe(&mut self, cb: usize, cn: usize, us: f64) {
+        let c = self.0.entry((cb, cn)).or_insert(us);
+        *c += 0.25 * (us - *c);
+    }
+
+    fn get(&self, cb: usize, cn: usize) -> Option<f64> {
+        self.0.get(&(cb, cn)).copied()
+    }
+}
+
+/// A bounded launch of stream steps of `frames` (launch order): `(jobs kept, frames per job)`
+/// on the measured capacity at most `bound_us` that decodes the most frames per µs, when the
+/// capacity `frames` would take is measured above the bound. `None` launches as packed: under
+/// the bound, not yet measured, or no measured capacity fits the bound.
+fn bound_step(
+    caps: &[Capacity],
+    costs: &StepCosts,
+    frames: &[usize],
+    bound_us: f64,
+) -> Option<(usize, usize)> {
+    let longest = frames.iter().copied().max()?;
+    let &(cb, cn, _) = smallest(caps, frames.len(), longest)?;
+    if costs.get(cb, cn)? <= bound_us {
+        return None;
+    }
+    let mut best: Option<(f64, usize, usize, usize)> = None;
+    for &(cb, cn, _) in caps {
+        let keep = cb.min(frames.len());
+        let longest = frames[..keep].iter().map(|&f| f.min(cn)).max().unwrap_or(0);
+        // Priced by the capacity the launch of these pieces selects, not the candidate's.
+        let Some(&(lb, ln, _)) = smallest(caps, keep, longest) else {
+            continue;
+        };
+        let Some(us) = costs.get(lb, ln).filter(|&us| us <= bound_us) else {
+            continue;
+        };
+        let decoded: usize = frames[..keep].iter().map(|&f| f.min(cn)).sum();
+        let rate = decoded as f64 / us;
+        if best.is_none_or(|(r, d, ..)| rate > r || (rate == r && decoded > d)) {
+            best = Some((rate, decoded, keep, cn));
+        }
+    }
+    best.map(|(_, _, keep, cap)| (keep, cap))
 }
 
 /// Stream steps that wait together for one launch: fewer than this many pending hold.
@@ -1660,7 +1765,42 @@ mod tests {
             reply: tokio::sync::oneshot::channel().0,
             _work: None,
             _urgent: None,
+            carry: Vec::new(),
         }
+    }
+
+    #[test]
+    fn bounded_steps_take_the_fastest_measured_capacity_under_the_bound() {
+        let caps: Vec<Capacity> = [(1, 1), (1, 17), (4, 4), (4, 17), (8, 1), (8, 17)]
+            .into_iter()
+            .map(|(b, f)| (b, f, Vec::new()))
+            .collect();
+        let mut costs = StepCosts::default();
+        let frames = [17; 8];
+        // Unmeasured: launch as packed.
+        assert_eq!(bound_step(&caps, &costs, &frames, 17_500.0), None);
+        for (b, f, us) in [
+            (1, 1, 4000.0),
+            (1, 17, 7400.0),
+            (4, 4, 7500.0),
+            (4, 17, 16900.0),
+        ] {
+            costs.observe(b, f, us);
+        }
+        costs.observe(8, 17, 29900.0);
+        // b4.f17: 68 frames in 16.9 ms beats b1.f17 (17 in 7.4) and b4.f4 (16 in 7.5).
+        assert_eq!(bound_step(&caps, &costs, &frames, 17_500.0), Some((4, 17)));
+        assert_eq!(bound_step(&caps, &costs, &frames, 8_000.0), Some((1, 17)));
+        // Under the bound, or nothing measured fits it: as packed.
+        assert_eq!(bound_step(&caps, &costs, &frames, 30_000.0), None);
+        assert_eq!(bound_step(&caps, &costs, &frames, 3_000.0), None);
+        assert_eq!(bound_step(&caps, &costs, &[2], 3_000.0), None);
+        // A cheap wider capacity the cut launch would not select does not qualify it.
+        let caps: Vec<Capacity> = vec![(4, 2, Vec::new()), (16, 2, Vec::new())];
+        let mut costs = StepCosts::default();
+        costs.observe(4, 2, 20_000.0);
+        costs.observe(16, 2, 5_000.0);
+        assert_eq!(bound_step(&caps, &costs, &[2, 2], 10_000.0), None);
     }
 
     #[test]
