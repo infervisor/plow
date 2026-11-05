@@ -32,6 +32,7 @@ pub(super) struct FishDepth {
 /// Maya 2's host cb0 controller: per-slot state, and the widest program's read-back cb0 logits.
 struct Maya2 {
     slots: Vec<Option<crate::tts::maya2::Slot>>,
+    memory: Vec<SpeakerMemory>,
     logits: PinnedHost,
     scratch: Vec<f32>,
     /// The depth levels' (temperature, top-k).
@@ -41,6 +42,23 @@ struct Maya2 {
     speech: SpeechFn,
     /// The null speaker's depth memory, `[layers][hidden]` (named, plain and `icl` voices).
     null_memory: Vec<f32>,
+}
+
+#[derive(Clone)]
+enum SpeakerMemory {
+    Unbound,
+    Null,
+    Voice(std::sync::Arc<[f32]>),
+}
+
+impl SpeakerMemory {
+    fn matches(&self, memory: Option<&std::sync::Arc<[f32]>>) -> bool {
+        match (self, memory) {
+            (Self::Null, None) => true,
+            (Self::Voice(old), Some(new)) => std::sync::Arc::ptr_eq(old, new),
+            _ => false,
+        }
+    }
 }
 
 struct SpeechFn {
@@ -247,6 +265,7 @@ impl FishDepth {
         let maya2 = match (maya2, manifest.depth_sampling) {
             (true, Some([t, k])) => Some(Maya2 {
                 slots: vec![None; e.batch],
+                memory: vec![SpeakerMemory::Unbound; e.batch],
                 logits: e.be.host_alloc_pinned(rows * e.vocab() * 2)?,
                 scratch: Vec::new(),
                 depth: (f32::from_bits(t), k),
@@ -309,7 +328,7 @@ impl GpuEngine {
         &mut self,
         slot: usize,
         plan: crate::tts::maya2::Plan,
-        memory: Option<&[f32]>,
+        memory: Option<&std::sync::Arc<[f32]>>,
     ) -> Result<()> {
         let d = self.fish.as_mut().ok_or_else(|| reject("not enabled"))?;
         let m = d
@@ -321,18 +340,31 @@ impl GpuEngine {
             .get_mut(slot)
             .ok_or_else(|| reject("slot out of range"))?;
         *s = Some(crate::tts::maya2::Slot::new(plan));
-        let mem = memory.unwrap_or(&m.null_memory);
+        let mem = memory.map_or(m.null_memory.as_slice(), |m| m.as_ref());
         let layers = d.manifest.slot_memory.len();
         if mem.len() != m.null_memory.len() {
             return Err(reject("speaker memory width disagrees with the packet"));
         }
+        if m.memory[slot].matches(memory) {
+            return Ok(());
+        }
+        // These tensors are read-only depth inputs. Retain the owner so pointer identity cannot
+        // outlive its allocation, and publish only after every layer's upload succeeds.
+        m.memory[slot] = SpeakerMemory::Unbound;
         let width = mem.len() / layers;
         for (l, &h) in d.manifest.slot_memory.iter().enumerate() {
             let row: &[u8] = bytemuck::cast_slice(&mem[l * width..(l + 1) * width]);
             self.be
                 .upload(&self.devp[usize::from(h)], (slot * row.len()) as u64, row)?;
         }
+        m.memory[slot] = memory.map_or(SpeakerMemory::Null, |m| SpeakerMemory::Voice(m.clone()));
         Ok(())
+    }
+
+    pub(super) fn forget_depth_memory(&mut self) {
+        if let Some(m) = self.fish.as_mut().and_then(|d| d.maya2.as_mut()) {
+            m.memory.fill(SpeakerMemory::Unbound);
+        }
     }
 
     /// A prompt's first frame samples from prefill's logits (row 0): move them to `slot`'s row.
@@ -766,5 +798,28 @@ impl GpuEngine {
             return Err(reject("prompt codes exceed the context"));
         }
         self.be.upload(h, 0, bytemuck::cast_slice(codes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpeakerMemory;
+    use std::sync::Arc;
+
+    #[test]
+    fn speaker_memory_retains_identity_and_distinguishes_null_and_uninitialized() {
+        let memory: Arc<[f32]> = Arc::from([1.0, 2.0]);
+        let same = Arc::clone(&memory);
+        let other: Arc<[f32]> = Arc::from([1.0, 2.0]);
+        let mut bound = SpeakerMemory::Voice(memory);
+        assert!(bound.matches(Some(&same)));
+        assert!(!bound.matches(Some(&other)));
+        assert!(!bound.matches(None));
+        bound = SpeakerMemory::Unbound;
+        assert!(!bound.matches(Some(&same)));
+        assert!(!bound.matches(None));
+        bound = SpeakerMemory::Null;
+        assert!(bound.matches(None));
+        assert!(!bound.matches(Some(&same)));
     }
 }

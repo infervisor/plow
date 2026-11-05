@@ -8981,6 +8981,7 @@ impl GpuEngine {
         self.drain_before_unmap |= failed;
         if failed {
             self.slot_prefixes.clear_all();
+            self.forget_depth_memory();
         }
     }
 

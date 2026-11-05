@@ -4184,7 +4184,7 @@ fn run_one_tick(
                                 let codes = sp.frame_codes.get((n - 1) * k..n * k).unwrap_or(&[]);
                                 let initialized = e.fish_seed_slot(i, codes).and_then(|()| {
                                     sp.depth.and_then(|d| d.maya2).map_or(Ok(()), |plan| {
-                                        e.maya2_bind(i, plan, sp.maya2_memory.as_deref())
+                                        e.maya2_bind(i, plan, sp.maya2_memory.as_ref())
                                     })
                                 });
                                 if let Err(err) = initialized {
@@ -8537,7 +8537,7 @@ fn gpu_prefill_advance(
         e.fish_reset_slot(slot_idx)?;
         if let Some(plan) = job.maya2 {
             let memory = slot.speech.as_ref().and_then(|s| s.maya2_memory.clone());
-            e.maya2_bind(slot_idx, plan, memory.as_deref())?;
+            e.maya2_bind(slot_idx, plan, memory.as_ref())?;
         }
         e.fish_logits_to_slot(slot_idx)?;
         let cond_row = e.prefill_terminal_row();

@@ -38,6 +38,10 @@ consumes the old provenance, successful prefill publishes the new prefix, and a 
 step invalidates the engine's prefixes. Sessions, CFG pairs, pending encoders, P/D and multimodal
 jobs do not use this cache; packets without the capability retain their current behavior.
 
+Depth speaker-conditioning inputs also stay resident per slot. Rebinding the same immutable
+speaker allocation (or null speaker) resets the request's controller while reusing its uploaded
+conditioning. A changed speaker, incomplete upload or failed device step requires a fresh upload.
+
 Compatible depth prompts share packed prefill and their first predictor launch. A fully cached
 prefix can feed its terminal row straight into batched decode. Terminal overlay rows keep serial
 prefill because decode does not read those overlays. Host-controlled predictors bind each new
