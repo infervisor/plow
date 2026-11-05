@@ -261,6 +261,24 @@ Depth decoders (Fish, Breeze and Maya2) use the shared auxiliary-program parser;
 appear beside the backbone's programs, with validated depth manifests and row counts. Companion
 roles name the text and reference-audio encoder stages. SVG handoffs use the same declared edges,
 not packet filename order.
+Visualizing a compiled pipeline does not need weights. `scripts/tts/header_only.py` fetches a
+pinned Hub revision with only the safetensors headers (two range reads per file) and the tensor tree
+of `.pth` pickles, then runs the unmodified exporters on shape-only tensors; plowc compiles their
+header-only outputs to zero-filled, structure-only packets:
+
+```bash
+nix develop .#quantize --command python3 scripts/tts/header_only.py fetch fishaudio/s2-pro <rev> <scratch>/hub
+HF_HUB_CACHE=<scratch>/hub nix develop .#quantize --command \
+  python3 scripts/tts/header_only.py run scripts/tts/fish_prep.py <scratch>/prep/slow <rev>
+nix develop --command plowc --hf-dir <scratch>/prep/slow --emit devblob --tts-profile fish \
+  --tts-codec <scratch>/prep/codec ...   # the recipe's emit settings
+```
+
+The header-only marker is explicit (`__metadata__["plow.header_only"]`), so a truncated real
+checkpoint is still an error, never zeros. Every packet built from one carries
+`structure_only.json`: plowrt refuses to execute it and the viewer labels it. Programs, buffer
+capacities, depth stages and contracts are identical to a real-weights build (checked on Breeze).
+Exporters that compute on weight values (Chatterbox's voice export) cannot run header-only.
 The same bundle and renderer back the server and all static assets. Asset-only exports do not
 also overwrite an unrelated `graph.html` in the working directory.
 

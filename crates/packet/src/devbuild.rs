@@ -4190,6 +4190,7 @@ pub struct BlobSectionEntry {
 const _: () = assert!(size_of::<BlobSectionEntry>() == 48);
 
 /// A section to embed in a v6 blob (compiler-side, not serialized directly).
+#[derive(Clone)]
 pub struct SectionData {
     pub kind: u32,
     pub name: String,

@@ -49,6 +49,7 @@ pub fn bundle_from_path(path: &Path) -> Result<VizModelBundle, String> {
     let mut stages = Vec::new();
     let mut contracts = Vec::new();
     let mut packet_contracts = Vec::new();
+    let mut structure_only = Vec::new();
     let root = std::fs::canonicalize(if path.is_dir() {
         path
     } else {
@@ -64,7 +65,18 @@ pub fn bundle_from_path(path: &Path) -> Result<VizModelBundle, String> {
         }
         let file = paths[file_index].clone();
         let blob = DevBlobMetadata::load(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-        let label = file.file_name().unwrap_or_default().to_string_lossy();
+        let label = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .into_owned();
+        if blob
+            .sections
+            .iter()
+            .any(|(_, n, _)| n == plow_asset::structure_only::SECTION)
+        {
+            structure_only.push(label.to_string());
+        }
         let metadata = blob
             .sections
             .iter()
@@ -275,7 +287,10 @@ pub fn bundle_from_path(path: &Path) -> Result<VizModelBundle, String> {
         .summary
         .category_counts
         .insert(OpCategory::Layout, overview.nodes.len());
-    bundle.networks.insert(0, VizNetwork { kind: "packet", id: "pipeline".into(), title: "Speech pipeline".into(), description: "Packet handoffs come from embedded driver contracts. Detail shows every compiled program; alternative buckets and state banks are not sequential layers.".into(), stages, graph: overview, checkpoint: None, metadata: Some(serde_json::json!({"contracts": contracts})) });
+    bundle.networks.insert(0, VizNetwork { kind: "packet", id: "pipeline".into(), title: "Speech pipeline".into(), description: "Packet handoffs come from embedded driver contracts. Detail shows every compiled program; alternative buckets and state banks are not sequential layers.".into(), stages, graph: overview, checkpoint: None, metadata: Some(serde_json::json!({"contracts": contracts, "structure_only": structure_only})) });
+    if !structure_only.is_empty() {
+        bundle.notes.push(format!("Structure only: {} compiled from checkpoint headers. Programs, buffer capacities and contracts are real; weights were never downloaded and these packets cannot be executed.", structure_only.join(", ")));
+    }
     if paths.len() > 1 && links.is_empty() {
         bundle.notes.push("No cross-packet handoff contracts were found. Components are shown independently; execution order is not inferred from filenames.".into());
     }

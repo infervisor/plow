@@ -517,6 +517,17 @@ impl DevBlob {
         } else {
             Vec::new()
         };
+        if copy_init
+            && sections
+                .iter()
+                .any(|s| s.name == plow_asset::structure_only::SECTION)
+        {
+            return Err(RuntimeError::Device(
+                "devblob: structure-only packet (compiled from header-only checkpoints, zero \
+                 weights) is for inspection and cannot be executed"
+                    .into(),
+            ));
+        }
 
         // v7 carries RoPE tables as recipes instead of init bytes. Parse them
         // eagerly (a handful of 72-byte records) so the upload path does not need
@@ -1532,6 +1543,16 @@ mod tests {
             assert_eq!(a.insts, b.insts);
         }
         assert!(DevBlobMetadata::parse(&bytes[..63]).is_err());
+    }
+
+    #[test]
+    fn structure_only_packets_are_inspectable_but_not_executable() {
+        let bytes = tiny_model().to_blob_v6(&[plow_asset::structure_only::section()]);
+        let err = DevBlob::parse(&bytes)
+            .err()
+            .expect("executable parse must refuse");
+        assert!(err.to_string().contains("structure-only"));
+        assert!(DevBlobMetadata::parse(&bytes).is_ok());
     }
 
     /// A tiny two-program model exercised through the REAL writer

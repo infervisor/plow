@@ -407,11 +407,12 @@ function renderChrome() {
   const n = net(), s = n.graph.summary;
   $('title').textContent = BUNDLE.title;
   $('modality').textContent = ({ llm: 'LLM', asr: 'ASR', vad: 'VAD', tts: 'TTS', multimodal: 'Multimodal', vision: 'Vision', audio_codec: 'Codec', image: 'Image' })[BUNDLE.modality] || BUNDLE.modality;
-  $('facts').innerHTML = n.kind === 'packet' ? `<b>${fmtBytes(s.total_weight_bytes)}</b> declared buffers` : `<b>${fmtParams(s.total_params)}</b> unique params · <b>${fmtBytes(s.total_weight_bytes)}</b> ${n.checkpoint ? 'graph weights' : 'estimated weights'}`;
+  const structureOnly = n.kind === 'packet' && BUNDLE.networks.some(x => x.metadata?.structure_only?.length);
+  $('facts').innerHTML = n.kind === 'packet' ? `<b>${fmtBytes(s.total_weight_bytes)}</b> declared buffers${structureOnly ? ' · <b>structure only</b>, no weights' : ''}` : `<b>${fmtParams(s.total_params)}</b> unique params · <b>${fmtBytes(s.total_weight_bytes)}</b> ${n.checkpoint ? 'graph weights' : 'estimated weights'}`;
   const sel = $('network');
   sel.hidden = BUNDLE.networks.length < 2 || S.view === 'overview';
   sel.innerHTML = BUNDLE.networks.map(x => `<option value="${esc(x.id)}"${x.id === S.net ? ' selected' : ''}>${esc(x.title)}</option>`).join('');
-  $('notes').innerHTML = `<summary>${n.kind === 'packet' ? 'Compiled packet inspection' : n.checkpoint ? 'Checkpoint weight shapes checked' : 'Config-only view · weight sizes are estimates'}${BUNDLE.notes.length ? ' · scope and limitations' : ' · data details'}</summary>
+  $('notes').innerHTML = `<summary>${n.kind === 'packet' ? (structureOnly ? 'Compiled from checkpoint headers · structure only' : 'Compiled packet inspection') : n.checkpoint ? 'Checkpoint weight shapes checked' : 'Config-only view · weight sizes are estimates'}${BUNDLE.notes.length ? ' · scope and limitations' : ' · data details'}</summary>
     ${BUNDLE.notes.map(t => `<p>${esc(t)}</p>`).join('')}<p>Weight sizes are not runtime memory requirements. KV cache, activations, workspace and quantization overhead are separate. Shape checks do not establish numerical equivalence.</p>`;
   $('v-overview').setAttribute('aria-pressed', S.view === 'overview');
   $('v-detail').setAttribute('aria-pressed', S.view === 'detail');

@@ -7,6 +7,86 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+/// `__metadata__` key `scripts/tts/header_only.py` writes on a safetensors file that carries a
+/// header and no tensor data. Explicit, so a truncated real checkpoint is still an error.
+const HEADER_ONLY: &str = "plow.header_only";
+
+static HEADER_ONLY_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has bound any header-only checkpoint; its packets are structure-only.
+pub(crate) fn header_only_used() -> bool {
+    HEADER_ONLY_READ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `dir`'s shards are header-only (and records that they were read).
+pub(crate) fn header_only_dir(dir: &Path) -> bool {
+    has_shards(dir)
+        && shard_files(dir)
+            .iter()
+            .any(|p| read_header(p).unwrap_or_else(|e| panic!("{e}")).header_only)
+}
+
+struct Header {
+    json: Value,
+    data_start: u64,
+    header_only: bool,
+}
+
+fn read_header(path: &Path) -> Result<Header, String> {
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut length = [0; 8];
+    file.read_exact(&mut length)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let header_bytes = u64::from_le_bytes(length);
+    let mut bytes =
+        vec![
+            0;
+            usize::try_from(header_bytes)
+                .map_err(|_| format!("{}: safetensors header is too large", path.display()))?
+        ];
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let json: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{}: bad safetensors header: {error}", path.display()))?;
+    if !json.is_object() {
+        return Err(format!(
+            "{}: safetensors header is not an object",
+            path.display()
+        ));
+    }
+    let data_start = 8u64
+        .checked_add(header_bytes)
+        .ok_or_else(|| format!("{}: safetensors offset overflows", path.display()))?;
+    let header_only = json["__metadata__"][HEADER_ONLY] == "1";
+    if header_only {
+        let len = file
+            .metadata()
+            .map_err(|error| format!("{}: {error}", path.display()))?
+            .len();
+        if len != data_start {
+            return Err(format!(
+                "{}: header-only marker on a file that carries tensor data",
+                path.display()
+            ));
+        }
+        HEADER_ONLY_READ.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(Header {
+        json,
+        data_start,
+        header_only,
+    })
+}
+
+fn has_shards(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.filter_map(Result::ok)
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("safetensors"))
+    })
+}
+
 pub(crate) struct TensorReader {
     entries: HashMap<String, TensorEntry>,
 }
@@ -16,37 +96,19 @@ struct TensorEntry {
     offset: u64,
     bytes: usize,
     dtype: String,
+    header_only: bool,
 }
 
 impl TensorReader {
     pub(crate) fn open(dir: &Path) -> Result<Self, String> {
         let mut entries = HashMap::new();
         for path in shard_files(dir) {
-            use std::io::Read;
-            let mut file = std::fs::File::open(&path)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            let mut length = [0; 8];
-            file.read_exact(&mut length)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            let header_bytes = u64::from_le_bytes(length);
-            let mut bytes = vec![
-                0;
-                usize::try_from(header_bytes).map_err(|_| format!(
-                    "{}: safetensors header is too large",
-                    path.display()
-                ))?
-            ];
-            file.read_exact(&mut bytes)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            let header: Value = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("{}: bad safetensors header: {error}", path.display()))?;
-            let data_start = 8u64
-                .checked_add(header_bytes)
-                .ok_or_else(|| format!("{}: safetensors offset overflows", path.display()))?;
-            for (name, value) in header
-                .as_object()
-                .ok_or_else(|| format!("{}: safetensors header is not an object", path.display()))?
-            {
+            let Header {
+                json: header,
+                data_start,
+                header_only,
+            } = read_header(&path)?;
+            for (name, value) in header.as_object().expect("checked object") {
                 if name == "__metadata__" {
                     continue;
                 }
@@ -74,6 +136,7 @@ impl TensorReader {
                         .as_str()
                         .ok_or_else(|| format!("{name}: missing safetensors dtype"))?
                         .to_owned(),
+                    header_only,
                 };
                 if entries.insert(name.clone(), entry).is_some() {
                     return Err(format!("duplicate checkpoint tensor {name}"));
@@ -89,6 +152,9 @@ impl TensorReader {
             .entries
             .get(name)
             .ok_or_else(|| format!("checkpoint has no {name}"))?;
+        if entry.header_only {
+            return Ok((&entry.dtype, vec![0; entry.bytes]));
+        }
         let mut file = std::fs::File::open(&entry.path)
             .map_err(|error| format!("{}: {error}", entry.path.display()))?;
         file.seek(SeekFrom::Start(entry.offset))
@@ -205,13 +271,9 @@ pub(crate) fn layer_scalars(dir: &Path, layers: u32, prefix: &str) -> Vec<f32> {
     // back to the identity scale (1.0) so a structural devblob emit succeeds, and
     // say so on stderr, mirroring the coverage gate's own no-safetensors skip.
     // `shard_files` PANICS on an empty dir, so this guard must precede it.
-    let has_shards = std::fs::read_dir(dir).is_ok_and(|rd| {
-        rd.filter_map(Result::ok)
-            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("safetensors"))
-    });
-    if !has_shards {
+    if !has_shards(dir) || header_only_dir(dir) {
         eprintln!(
-            "devgen: {} has no .safetensors — layer_scalar defaults to 1.0 \
+            "devgen: {} has no tensor data — layer_scalar defaults to 1.0 \
              (structural emit; weights are unbound and numerics are not representative)",
             dir.display()
         );
@@ -222,26 +284,18 @@ pub(crate) fn layer_scalars(dir: &Path, layers: u32, prefix: &str) -> Vec<f32> {
     let mut hdr_cache: HashMap<PathBuf, (Value, u64)> = HashMap::new();
     let mut map: HashMap<String, PathBuf> = HashMap::new();
     for p in shard_files(dir) {
-        // Read ONLY the header. The old code did `fs::read(&p)` — the whole
-        // shard — to fetch a handful of `[1]` scalars; that is 23 GB of I/O on
-        // the 12B checkpoint.
-        use std::io::Read;
-        let mut f = std::fs::File::open(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        let mut len = [0u8; 8];
-        f.read_exact(&mut len)
-            .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        let n = u64::from_le_bytes(len);
-        let mut hbuf = vec![0u8; n as usize];
-        f.read_exact(&mut hbuf)
-            .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        let h: Value = serde_json::from_slice(&hbuf)
-            .unwrap_or_else(|e| panic!("{}: bad safetensors header: {e}", p.display()));
+        // Read ONLY the header, never the 23 GB of shard data behind a few `[1]` scalars.
+        let Header {
+            json: h,
+            data_start,
+            ..
+        } = read_header(&p).unwrap_or_else(|e| panic!("{e}"));
         for k in h.as_object().expect("header object").keys() {
             if k != "__metadata__" {
                 map.insert(k.clone(), p.clone());
             }
         }
-        hdr_cache.insert(p, (h, 8 + n));
+        hdr_cache.insert(p, (h, data_start));
     }
     let mut out = Vec::with_capacity(layers as usize);
     for l in 0..layers {
@@ -268,11 +322,7 @@ pub(crate) fn layer_scalars(dir: &Path, layers: u32, prefix: &str) -> Vec<f32> {
 
 /// Every tensor name `dir`'s shards carry, verbatim; empty when it has no shards.
 pub(crate) fn shipped_names(dir: &Path) -> HashSet<String> {
-    let has_shards = std::fs::read_dir(dir).is_ok_and(|rd| {
-        rd.filter_map(Result::ok)
-            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("safetensors"))
-    });
-    if has_shards {
+    if has_shards(dir) {
         ckpt_names_all(dir)
     } else {
         HashSet::new()
@@ -283,16 +333,7 @@ pub(crate) fn shipped_names(dir: &Path) -> HashSet<String> {
 fn ckpt_names_all(dir: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
     for p in shard_files(dir) {
-        use std::io::Read;
-        let mut f = std::fs::File::open(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        let mut len = [0u8; 8];
-        f.read_exact(&mut len)
-            .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        let mut hbuf = vec![0u8; u64::from_le_bytes(len) as usize];
-        f.read_exact(&mut hbuf)
-            .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        let h: Value = serde_json::from_slice(&hbuf)
-            .unwrap_or_else(|e| panic!("{}: bad safetensors header: {e}", p.display()));
+        let h = read_header(&p).unwrap_or_else(|e| panic!("{e}")).json;
         for k in h.as_object().expect("header object").keys() {
             if k != "__metadata__" {
                 out.insert(k.clone());
@@ -411,11 +452,7 @@ pub(crate) fn validate_coverage(
     // reaching it here aborts a valid emit. Say so on stderr rather than skipping silently: a
     // genuinely missing checkpoint is still visible, it just no longer kills the process from
     // inside a gate whose whole purpose is comparing two sets, one of which does not exist.
-    let has_shards = std::fs::read_dir(dir).is_ok_and(|rd| {
-        rd.filter_map(Result::ok)
-            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("safetensors"))
-    });
-    if !has_shards {
+    if !has_shards(dir) {
         eprintln!(
             "devgen: {} has no .safetensors — skipping the checkpoint coverage gate \
              (nothing to compare the plan against)",
@@ -538,6 +575,61 @@ pub(crate) fn validate_coverage(
         );
     }
     Err(e)
+}
+
+#[cfg(test)]
+mod header_only_tests {
+    use super::*;
+
+    fn shard(dir: &Path, metadata: Value, data: &[u8]) {
+        let header = serde_json::json!({
+            "__metadata__": metadata,
+            "w": {"dtype": "F32", "shape": [2, 3], "data_offsets": [0, 24]},
+        });
+        let raw = serde_json::to_vec(&header).unwrap();
+        let mut bytes = (raw.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&raw);
+        bytes.extend_from_slice(data);
+        std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("plow-header-only-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn marked_header_only_shards_read_as_zeros_and_mark_the_process() {
+        let dir = scratch("marked");
+        shard(&dir, serde_json::json!({"plow.header_only": "1"}), &[]);
+        let reader = TensorReader::open(&dir).unwrap();
+        assert_eq!(reader.read("w").unwrap(), ("F32", vec![0; 24]));
+        assert!(header_only_used());
+        assert!(header_only_dir(&dir));
+        assert_eq!(layer_scalars(&dir, 2, "model."), [1.0, 1.0]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_marker_on_real_data_or_an_unmarked_truncated_shard_is_an_error() {
+        let dir = scratch("forged");
+        shard(&dir, serde_json::json!({"plow.header_only": "1"}), &[1; 24]);
+        assert!(TensorReader::open(&dir)
+            .err()
+            .unwrap()
+            .contains("carries tensor data"));
+        shard(&dir, serde_json::json!({}), &[1; 8]);
+        let reader = TensorReader::open(&dir).unwrap();
+        assert!(
+            reader.read("w").is_err(),
+            "a truncated real checkpoint must not read as zeros"
+        );
+        assert!(!header_only_dir(&dir));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[cfg(test)]
