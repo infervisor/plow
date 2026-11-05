@@ -55,8 +55,8 @@ pub(super) struct CudaTokenBatch {
 }
 
 impl CudaTokenBatch {
-    pub(super) fn load(e: &GpuEngine) -> Option<Self> {
-        (!RuntimeConfig::get().fusion
+    pub(super) fn eligible(e: &GpuEngine) -> bool {
+        !RuntimeConfig::get().fusion
             && e.be.compute_capability() == (9, 0)
             && e.packed_prefill.is_some()
             && e.has_packed_terminal()
@@ -66,22 +66,36 @@ impl CudaTokenBatch {
             // prefill attention's request table.
             && (e.recurrent.is_none() || e.recurrent_packs)
             && e.mixed_step.is_none()
+            // Depth codes and predictor outputs still use physical slots, not packed rows.
+            && !e.has_depth_stage()
             // Host rows spliced by launch row (overlay) or a decode-only embedding (position
             // base): the batch embeds decode rows through the prefill program, in its own order.
             && e.handle_of("in.encoder_overlay").is_none()
             && e.handle_of("in.pos_base").is_none()
-            // Decode rows ride as one-row requests of the packed prefill attention, which is
-            // qualified only on the hd256/512 attention arms. At hd128 (Veena, H100, c64) its
-            // ticks carried ~77 one-row requests and served 27.1 audio s/s against 33.8 for
-            // packed prefill plus the ordinary decode launch.
-            && e.prefill.iter().all(|b| {
-                b.flash_sites.iter().all(|&pc| matches!(b.h_inst[pc].i[6], 256 | 512))
+    }
+
+    pub(super) fn load(e: &GpuEngine) -> Option<Self> {
+        (Self::eligible(e)
+            && e.prefill.iter().enumerate().all(|(i, b)| {
+                attention_supported(
+                    b.flash_sites.iter().map(|&pc| b.h_inst[pc].i[6]),
+                    e.riders.as_ref().is_some_and(|r| r.serves(i)),
+                )
             }))
         .then(|| Self {
             staging: TokenBatchStaging::with_capacity(e.pf_max_rows(), e.batch),
             fired: false,
         })
     }
+}
+
+fn attention_supported(widths: impl Iterator<Item = u32>, split_attention: bool) -> bool {
+    widths.into_iter().all(|hd| match hd {
+        // hd128 one-row prefill attention regressed serving; require the separate decode route.
+        128 => split_attention,
+        256 | 512 => true,
+        _ => false,
+    })
 }
 
 /// `PLOW_PF_PACKLOG=1`: one `PACKLOG STEP` line per unified token-batch launch. `enq` is the host
@@ -630,6 +644,22 @@ impl GpuEngine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hd128_token_batch_requires_split_attention_for_the_whole_bucket() {
+        assert!(!super::attention_supported([128].into_iter(), false));
+        assert!(super::attention_supported([128].into_iter(), true));
+        assert!(!super::attention_supported(
+            [256, 128, 512].into_iter(),
+            false
+        ));
+        assert!(super::attention_supported(
+            [256, 128, 512].into_iter(),
+            true
+        ));
+        assert!(super::attention_supported([256, 512].into_iter(), false));
+        assert!(!super::attention_supported([64, 128].into_iter(), true));
+    }
+
     use super::*;
 
     fn request<'a>(

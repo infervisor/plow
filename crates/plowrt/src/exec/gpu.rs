@@ -8144,9 +8144,12 @@ impl GpuEngine {
         engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw, assets_dir)?;
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
-        engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
-        if engine.token_batch.is_some() {
+        if token_batch::CudaTokenBatch::eligible(&engine) {
             engine.riders = riders::Riders::load(&engine, &blob)?;
+            engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
+            if engine.token_batch.is_none() {
+                engine.riders = None;
+            }
         }
         if engine.recurrent_initstate.is_some() {
             let profile = interpreter_profile(engine.be.compute_capability());

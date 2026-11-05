@@ -25,7 +25,7 @@ struct RiderArgs {
     kv_len: u64,
     slot: u64,
     out: u64,
-    /// Non-zero: `[rows, nsplit hd256, nsplit hd512]` on the device (a captured launch).
+    /// Non-zero: `[rows, nsplit hd256, nsplit hd512, nsplit hd128]` for object ABI 2.
     dynamic: u64,
     rows: u32,
     n_head: u32,
@@ -68,6 +68,7 @@ const SPLITS_PER_SLOT: u64 = 16;
 const NSPLIT_CAP: u64 = 64;
 
 pub(super) struct Riders {
+    flash128: Option<(KernelFn, u32)>,
     flash256: (KernelFn, u32),
     flash512: (KernelFn, u32),
     merge: KernelFn,
@@ -77,9 +78,10 @@ pub(super) struct Riders {
     sites: Vec<Vec<Site>>,
     opart: DeviceMem,
     mlpart: DeviceMem,
-    /// `kv_len[batch]` then `slot[batch]`, then the captured launches' `[rows, nsplit x 2]`.
+    /// `kv_len[batch]` then `slot[batch]`, then the captured launches' `[rows, nsplit x 3]`.
     tables: DeviceMem,
     host: Vec<i32>,
+    seen: Vec<u64>,
     batch: usize,
     sms: u32,
     /// Rows riding the launch being enqueued (0 = none) and their longest KV.
@@ -87,13 +89,106 @@ pub(super) struct Riders {
     max_kv: u32,
 }
 
+struct RiderFunctions {
+    flash128: Option<(KernelFn, u32)>,
+    flash256: (KernelFn, u32),
+    flash512: (KernelFn, u32),
+    merge: KernelFn,
+}
+
+fn object_abi(version: Option<u32>) -> Option<u32> {
+    match version {
+        None | Some(1) => Some(1),
+        Some(2) => Some(2),
+        _ => None,
+    }
+}
+
+fn head_group(hd: u32, heads: u32, kv_heads: u32, gf512: u32, hd128: bool) -> Option<u32> {
+    let group = match hd {
+        128 if hd128 => 2,
+        256 => 2,
+        512 if gf512 > 0 => gf512,
+        _ => return None,
+    };
+    (heads > 0 && kv_heads > 0 && heads % kv_heads == 0 && (heads / kv_heads) % group == 0)
+        .then_some(group)
+}
+
+fn stage_riders(
+    host: &mut [i32],
+    seen: &mut [u64],
+    batch: usize,
+    riders: impl ExactSizeIterator<Item = (usize, u32)>,
+) -> Result<u32> {
+    if riders.len() > batch || host.len() < batch * 2 || seen.len() < batch.div_ceil(64) {
+        return Err(RuntimeError::Rejected(
+            "rider table capacity exceeded".into(),
+        ));
+    }
+    seen.fill(0);
+    let mut max_kv = 0;
+    for (i, (slot, kv_len)) in riders.enumerate() {
+        if slot >= batch || slot > i32::MAX as usize || kv_len == 0 || kv_len > i32::MAX as u32 {
+            return Err(RuntimeError::Rejected(
+                "invalid rider slot or KV length".into(),
+            ));
+        }
+        let bit = 1u64 << (slot % 64);
+        if seen[slot / 64] & bit != 0 {
+            return Err(RuntimeError::Rejected("duplicate rider slot".into()));
+        }
+        seen[slot / 64] |= bit;
+        host[i] = kv_len as i32;
+        host[batch + i] = slot as i32;
+        max_kv = max_kv.max(kv_len);
+    }
+    Ok(max_kv)
+}
+
+fn split_count(
+    a: &RiderArgs,
+    rows: u32,
+    max_kv: u32,
+    sms: u32,
+    gf: u32,
+    opart: u64,
+    mlpart: u64,
+) -> Option<u32> {
+    if rows == 0
+        || max_kv == 0
+        || sms == 0
+        || a.n_head == 0
+        || a.hd == 0
+        || gf == 0
+        || a.n_head % gf != 0
+    {
+        return None;
+    }
+    let heads = u64::from(rows).checked_mul(u64::from(a.n_head))?;
+    let row_bytes = heads.checked_mul(u64::from(a.hd))?.checked_mul(4)?;
+    let span = if a.window > 0 {
+        max_kv.min(a.window)
+    } else {
+        max_kv
+    };
+    let limit = (4 * u64::from(sms))
+        .div_ceil(heads / u64::from(gf))
+        .min(u64::from(span.div_ceil(256)).max(1))
+        .min(opart / row_bytes)
+        .min(mlpart / heads.checked_mul(8)?)
+        .min(NSPLIT_CAP);
+    (limit > 0).then_some(limit as u32)
+}
+
 fn rider_functions(
     be: &CudaBackend,
     module: &Module,
     arch: &str,
     fp8: bool,
-) -> Option<[(KernelFn, u32); 3]> {
+) -> Option<RiderFunctions> {
     let global = |name: &str| be.module_global_u32(module, name).ok().flatten();
+    let abi = object_abi(be.module_global_u32(module, "plow_rider_abi").ok()?)?;
     if global("plow_rider_fp8_kv") != Some(u32::from(fp8)) {
         return None;
     }
@@ -106,7 +201,20 @@ fn rider_functions(
     );
     be.set_max_dynamic_smem(f256, s256).ok()?;
     be.set_max_dynamic_smem(f512, s512).ok()?;
-    Some([(f256, s256), (f512, s512), (merge, 0)])
+    let flash128 = (abi == 2)
+        .then(|| {
+            let smem = global("plow_rider_smem128").filter(|&bytes| bytes > 0)?;
+            let function = f("rider_flash128")?;
+            be.set_max_dynamic_smem(function, smem).ok()?;
+            Some((function, smem))
+        })
+        .flatten();
+    Some(RiderFunctions {
+        flash128,
+        flash256: (f256, s256),
+        flash512: (f512, s512),
+        merge,
+    })
 }
 
 impl Riders {
@@ -133,8 +241,12 @@ impl Riders {
         let Some(profile) = interpreter_profile(e.be.compute_capability()) else {
             return Ok(None);
         };
-        let Some([flash256, flash512, (merge, _)]) =
-            rider_functions(&e.be, &e.module, profile.tag, fp8)
+        let Some(RiderFunctions {
+            flash128,
+            flash256,
+            flash512,
+            merge,
+        }) = rider_functions(&e.be, &e.module, profile.tag, fp8)
         else {
             tracing::info!(
                 route = "token-batch-split-attention",
@@ -203,7 +315,7 @@ impl Riders {
                     let pfp8 = p.op == DevOp::FlashPrefillFp8 as u16;
                     if pfp8 != fp8
                         || d.op != first.op
-                        || !matches!(hd, 256 | 512)
+                        || head_group(hd, d.i[1], d.i[2], gf512, flash128.is_some()).is_none()
                         || shares_segment
                         || consumer.is_none_or(|c| c <= seg)
                         || p.t[5] == TENSOR_NONE16
@@ -212,8 +324,6 @@ impl Riders {
                         || (fp8 && (p.t[6], p.t[7]) != (d.t[6], d.t[7]))
                         || (p.i[2], p.i[3], p.i[5], hd) != (d.i[1], d.i[2], d.i[4], d.i[6])
                         || (p.fj[1], p.fj[2], p.fj[0]) != (d.i[3], d.i[7], d.fj[0])
-                        || (hd == 512 && (d.i[1] / d.i[2].max(1)) % gf512 != 0)
-                        || (hd == 256 && (d.i[1] / d.i[2].max(1)) % 2 != 0)
                     {
                         return None;
                     }
@@ -257,8 +367,14 @@ impl Riders {
         let batch = e.batch;
         let partials = batch as u64 * SPLITS_PER_SLOT * max_heads;
         let opart = e.be.alloc(0, partials * max_hd * 4)?;
-        // An hd256 site may split twice as wide in the same opart bytes.
-        let mlpart = e.be.alloc(0, partials * (max_hd / 256).max(1) * 2 * 4)?;
+        let min_hd = sites
+            .iter()
+            .flatten()
+            .map(|s| u64::from(s.args.hd))
+            .min()
+            .unwrap();
+        // Narrower sites may split wider in the same output-partials allocation.
+        let mlpart = e.be.alloc(0, partials * max_hd.div_ceil(min_hd) * 2 * 4)?;
         let tables = e.be.alloc(0, (batch * 2 * 4 + 16) as u64)?;
         // The generated decode object takes every site at its head width whose GQA ratio it
         // was compiled for (bf16 KV only); the rider kernels keep the rest.
@@ -311,6 +427,7 @@ impl Riders {
             "decode rows riding packed prefill launches attend through split-KV flash decode"
         );
         Ok(Some(Self {
+            flash128,
             flash256,
             flash512,
             merge,
@@ -320,7 +437,8 @@ impl Riders {
             opart,
             mlpart,
             tables,
-            host: vec![0; batch * 2 + 3],
+            host: vec![0; batch * 2 + 4],
+            seen: vec![0; batch.div_ceil(64)],
             batch,
             sms: e.be.sm_count().max(1),
             rows: 0,
@@ -350,27 +468,21 @@ impl Riders {
         if n == 0 {
             return Ok(());
         }
-        if n > self.batch {
-            return Err(RuntimeError::Rejected(
-                "token-batch riders exceed the slot count".into(),
-            ));
-        }
-        for (i, (slot, kv_len)) in riders.enumerate() {
-            self.host[i] = kv_len as i32;
-            self.host[self.batch + i] = slot as i32;
-            self.max_kv = self.max_kv.max(kv_len);
-        }
+        self.max_kv = stage_riders(&mut self.host, &mut self.seen, self.batch, riders)?;
         // SAFETY: `host` lives on `self` and is not resized; pageable copies are staged before
         // the call returns. Both ranges lie inside `tables`.
         self.rows = n as u32;
-        let split = |hd: u32| {
-            self.sites
-                .iter()
-                .flatten()
-                .find(|s| s.args.hd == hd)
-                .map_or(1, |s| self.nsplit(&s.args) as i32)
+        let split = |hd: u32| -> Result<i32> {
+            let mut count = None;
+            for site in self.sites.iter().flatten().filter(|s| s.args.hd == hd) {
+                let n = self.nsplit(&site.args).ok_or_else(|| {
+                    RuntimeError::Rejected("rider partials cannot hold one split".into())
+                })?;
+                count = Some(count.map_or(n, |c: u32| c.min(n)));
+            }
+            Ok(count.unwrap_or(1) as i32)
         };
-        let dynamic = [n as i32, split(256), split(512)];
+        let dynamic = [n as i32, split(256)?, split(512)?, split(128)?];
         self.host[2 * self.batch..].copy_from_slice(&dynamic);
         be.poison_table(self.tables.base, (self.batch * 8) as u64, stream)?;
         unsafe {
@@ -400,20 +512,26 @@ impl Riders {
 
     /// Splits per (row, head group) for the armed rows: enough items to fill the device, at
     /// least one 256-row tile each, within the partials scratch.
-    fn nsplit(&self, a: &RiderArgs) -> u32 {
-        let gf = if a.hd == 256 { 2 } else { self.gf512 };
-        let groups = u64::from(self.rows) * u64::from((a.n_head / gf).max(1));
-        let span = if a.window > 0 {
-            self.max_kv.min(a.window)
-        } else {
-            self.max_kv
-        };
-        let row_bytes = u64::from(self.rows) * u64::from(a.n_head) * u64::from(a.hd) * 4;
-        (4 * u64::from(self.sms))
-            .div_ceil(groups.max(1))
-            .min(u64::from(span.div_ceil(256)).max(1))
-            .min(self.opart.len / row_bytes.max(1))
-            .clamp(1, NSPLIT_CAP) as u32
+    fn nsplit(&self, a: &RiderArgs) -> Option<u32> {
+        let gf = if a.hd == 512 { self.gf512 } else { 2 };
+        split_count(
+            a,
+            self.rows,
+            self.max_kv,
+            self.sms,
+            gf,
+            self.opart.len,
+            self.mlpart.len,
+        )
+    }
+
+    fn flash(&self, hd: u32) -> (KernelFn, u32) {
+        match hd {
+            128 => self.flash128.expect("validated hd128 rider"),
+            256 => self.flash256,
+            512 => self.flash512,
+            _ => unreachable!("validated rider width"),
+        }
     }
 
     /// As [`Self::launch_after`] for a graph capture: every size is read on the device from the
@@ -436,11 +554,7 @@ impl Riders {
             dynamic: self.tables.base + (self.batch * 8) as u64,
             ..site.args
         };
-        let (function, smem) = if site.args.hd == 256 {
-            self.flash256
-        } else {
-            self.flash512
-        };
+        let (function, smem) = self.flash(site.args.hd);
         let grid = self.sms * 4;
         let mut params = [&mut args as *mut RiderArgs as *mut std::ffi::c_void];
         be.launch_kernel(function, grid, BLOCK, smem, &mut params, Some(stream))?;
@@ -523,9 +637,11 @@ impl Riders {
                 Some(stream),
             );
         }
-        let gf = if a.hd == 256 { 2 } else { self.gf512 };
+        let gf = if a.hd == 512 { self.gf512 } else { 2 };
         let groups = u64::from(rows) * u64::from((a.n_head / gf).max(1));
-        let nsplit = self.nsplit(a);
+        let nsplit = self
+            .nsplit(a)
+            .ok_or_else(|| RuntimeError::Rejected("rider partials cannot hold one split".into()))?;
         let mut args = RiderArgs {
             opart: self.opart.base,
             mlpart: self.mlpart.base,
@@ -535,11 +651,7 @@ impl Riders {
             nsplit,
             ..*a
         };
-        let (function, smem) = if a.hd == 256 {
-            self.flash256
-        } else {
-            self.flash512
-        };
+        let (function, smem) = self.flash(a.hd);
         let items = groups * u64::from(nsplit);
         let grid = items.min(u64::from(self.sms) * 4) as u32;
         let mut params = [&mut args as *mut RiderArgs as *mut std::ffi::c_void];
@@ -567,7 +679,96 @@ fn split_after(afters: impl Iterator<Item = usize>, segments: usize) -> Vec<(usi
 
 #[cfg(test)]
 mod tests {
-    use super::split_after;
+    use super::{head_group, object_abi, split_after, split_count, stage_riders, RiderArgs};
+
+    #[test]
+    fn hd128_requires_a_new_object_and_integral_gqa_groups() {
+        assert_eq!(object_abi(None), Some(1));
+        assert_eq!(object_abi(Some(1)), Some(1));
+        assert_eq!(object_abi(Some(2)), Some(2));
+        for version in [0, 3, u32::MAX] {
+            assert_eq!(object_abi(Some(version)), None);
+        }
+        assert_eq!(head_group(128, 16, 8, 1, true), Some(2));
+        assert_eq!(head_group(128, 16, 8, 1, false), None);
+        assert_eq!(head_group(128, 32, 8, 1, true), Some(2));
+        for (heads, kv) in [(0, 8), (16, 0), (15, 8), (16, 16), (24, 8)] {
+            assert_eq!(head_group(128, heads, kv, 1, true), None);
+        }
+        assert_eq!(head_group(256, 16, 8, 1, false), Some(2));
+        assert_eq!(head_group(512, 32, 8, 4, false), Some(4));
+        assert_eq!(head_group(512, 32, 8, 0, false), None);
+        assert_eq!(head_group(64, 16, 8, 1, true), None);
+    }
+
+    #[test]
+    fn rider_slot_tables_preserve_order_and_reject_aliases_and_invalid_lengths() {
+        let mut host = vec![0; 128 * 2 + 4];
+        let mut seen = vec![0; 2];
+        assert_eq!(
+            stage_riders(&mut host, &mut seen, 128, [(70, 257), (2, 1)].into_iter()).unwrap(),
+            257
+        );
+        assert_eq!(&host[..2], &[257, 1]);
+        assert_eq!(&host[128..130], &[70, 2]);
+        for rows in [
+            vec![(70, 1), (70, 2)],
+            vec![(128, 1)],
+            vec![(0, 0)],
+            vec![(0, u32::MAX)],
+        ] {
+            assert!(stage_riders(&mut host, &mut seen, 128, rows.into_iter()).is_err());
+        }
+        assert!(stage_riders(&mut host, &mut seen, 1, [(0, 1), (0, 2)].into_iter()).is_err());
+        assert!(stage_riders(&mut host[..1], &mut seen, 128, [(0, 1)].into_iter()).is_err());
+        assert!(stage_riders(&mut host, &mut [], 128, [(0, 1)].into_iter()).is_err());
+        assert_eq!(
+            stage_riders(&mut host, &mut seen, 128, [(70, 2)].into_iter()).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn rider_splits_fit_output_and_logsum_partials_at_every_width() {
+        let output = 64 * 16 * 16 * 512 * 4;
+        let logsum = 64 * 16 * 16 * 4 * 8;
+        for hd in [128, 256, 512] {
+            let mut a = RiderArgs {
+                n_head: 16,
+                hd,
+                ..Default::default()
+            };
+            for rows in [1, 2, 16, 64] {
+                for kv in [1u32, 255, 256, 257, 2048, 16384] {
+                    for window in [0, 128, 2048] {
+                        a.window = window;
+                        let n = split_count(&a, rows, kv, 132, 2, output, logsum).unwrap();
+                        let span = if window == 0 { kv } else { kv.min(window) };
+                        assert!(n >= 1 && n <= 64 && n <= span.div_ceil(256));
+                        assert!(u64::from(rows) * 16 * u64::from(n) * u64::from(hd) * 4 <= output);
+                        assert!(u64::from(rows) * 16 * u64::from(n) * 8 <= logsum);
+                    }
+                }
+            }
+        }
+        let a = RiderArgs {
+            n_head: 16,
+            hd: 128,
+            ..Default::default()
+        };
+        assert_eq!(
+            split_count(&a, 64, 16384, 8192, 2, output, logsum),
+            Some(64)
+        );
+        assert_eq!(
+            split_count(&a, 64, 16384, 8192, 2, output, logsum / 2),
+            Some(32)
+        );
+        assert_eq!(split_count(&a, 1, 2048, 132, 2, 0, logsum), None);
+        assert_eq!(split_count(&a, 1, 2048, 132, 2, output, 0), None);
+        assert_eq!(split_count(&a, 0, 2048, 132, 2, output, logsum), None);
+        assert_eq!(split_count(&a, 1, 0, 132, 2, output, logsum), None);
+    }
 
     #[test]
     fn pieces_end_at_each_attention_segment_and_cover_the_chain() {

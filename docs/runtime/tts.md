@@ -53,6 +53,12 @@ not sufficient. These paths require numerical and latency qualification before p
 The streaming LM drain hands off each complete frame as an owned buffer and retains only an
 incomplete token frame, rather than another copy of the utterance's code history.
 
+Hopper objects can carry ABI 2 split-attention riders for head width 128. The runtime requires
+the hd128 function, shared-memory claim and complete bucket coverage before selecting that
+route; older objects keep their existing path. This attention support does not yet provide
+packed depth frame inputs, overlays or predictor output-row mapping, so depth speech packets
+remain excluded from unified token batching.
+
 Reproduced 2026-09-27 at 7c0a7f7e into fresh directories (H100): every packet
 (`model.pkt`, `encoder.pkt`, `codec.pkt`, `s3gen.pkt`) byte-identical to the working assets,
 cubins SASS-identical; Qwen3-ASR WER 3.913% (p50 60.1 ms), SNAC parity rel-L2 ≤ 5.3e-6,
