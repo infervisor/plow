@@ -8888,8 +8888,11 @@ impl GpuEngine {
         // `begin_slot` resets the slot's admission state, staged key included: carry the key
         // across it to the attach (a failed attempt drops it; the mux keeps its own copy).
         let staged = self.staged_prefix[b].take();
+        // So is a refused attach (`set_prefix_attach`): rows not keyed by their ids.
+        let attach_off = self.prefix_attach_off[b];
         let started = (|| {
             self.begin_slot(b, total)?;
+            self.prefix_attach_off[b] = attach_off;
             if let Some(t) = host_t {
                 marks[0] = t.elapsed().as_nanos() as u64;
             }

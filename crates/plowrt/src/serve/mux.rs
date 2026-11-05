@@ -3746,10 +3746,12 @@ fn run_one_tick(
                 // them; the rung controller still owes that step its progress.
                 let feeds_before = decode_feed_extent(&feeds);
                 let mut unified_progress = None;
-                // A depth stage samples each prompt's first frame in serial prefill's tail
-                // (`gpu_prefill_advance`); the packed completions do not run it.
-                if e.pf_batch_enabled() && !e.has_depth_stage() {
-                    let compact = e.has_packed_terminal();
+                // A depth stage that cannot pack samples each prompt's first frame in serial
+                // prefill's tail (`gpu_prefill_advance`).
+                if e.pf_batch_enabled()
+                    && (!e.has_depth_stage() || gpu_depth_packs(&*e, &slots, cap))
+                {
+                    let compact = e.pf_compact();
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                     completed.clear();
                     let mut dev_sampled = false;
@@ -3913,6 +3915,17 @@ fn run_one_tick(
                                         )
                                     });
                                 if let Err(err) = written {
+                                    note_fault(&mut tick_fault, &err);
+                                    fail_slot(&mut slots[i], &arena, err);
+                                    continue;
+                                }
+                            }
+                            // A depth row's decode embeds the withheld row from `in.fish.dcodes`.
+                            if s.speech.as_ref().is_some_and(|sp| sp.depth.is_some()) {
+                                let sp = s.speech.as_deref().expect("checked Some");
+                                let k = sp.frame_codes_per_row.max(1);
+                                let codes = sp.frame_codes.get((n - 1) * k..n * k).unwrap_or(&[]);
+                                if let Err(err) = e.fish_seed_slot(i, codes) {
                                     note_fault(&mut tick_fault, &err);
                                     fail_slot(&mut slots[i], &arena, err);
                                     continue;
@@ -7011,7 +7024,7 @@ fn gpu_prefill_batched_pass(
 
     completed.clear();
     *dev_sampled = false;
-    let compact = e.has_packed_terminal();
+    let compact = e.pf_compact();
     // A CFG pair's partner row has no slot entry of its own, and its uncond logits are read at
     // the owner's row + 1: the unified batch carries neither, so pairs take the ordinary path.
     let mut unified =
@@ -7118,6 +7131,25 @@ fn gpu_prefill_batched_pass(
                         session_end: request.session_end,
                         outcome: None,
                     });
+                    continue;
+                }
+            }
+            if request.pf_pos == 0 && !e.packed_slot_ready(i) && e.has_depth_stage() {
+                let encoded = match request.speech.as_deref_mut() {
+                    Some(sp) => {
+                        let keyed = sp.encode.take().map_or(Ok(()), |encode| {
+                            encode(sp, &mut request.prompt_ids)
+                                .map_err(crate::RuntimeError::Rejected)
+                        });
+                        // Frame rows' embeddings come from their staged codes, not their ids.
+                        e.set_prefix_attach(i, sp.frame_codes.is_empty());
+                        keyed
+                    }
+                    None => Ok(()),
+                };
+                if let Err(err) = encoded {
+                    note_fault(&mut tick_fault, &err);
+                    fail_slot(slot, arena, err);
                     continue;
                 }
             }
@@ -7495,10 +7527,12 @@ fn gpu_prefill_batched_pass(
             }
             result
         } else {
-            let staged = pen_synced.and_then(|()| match overlay_rows {
-                Some(_) => gpu_speech_pack_inputs(e, slots, &pack),
-                None => Ok(()),
-            });
+            let staged = pen_synced
+                .and_then(|()| match overlay_rows {
+                    Some(_) => gpu_speech_pack_inputs(e, slots, &pack),
+                    None => Ok(()),
+                })
+                .and_then(|()| gpu_speech_pack_codes(e, slots, &pack));
             let reqs: Vec<PfBatchReq> = pack
                 .iter()
                 .map(|&(i, c0, len)| PfBatchReq {
@@ -7655,6 +7689,31 @@ fn gpu_prefill_batched_pass(
     }
 }
 
+/// Whether this tick's depth-packet prompts take the packed pass: two or more prompts to prefill
+/// (one launch, and their first frames in one depth launch), or a prompt already admitted to it.
+/// A lone prompt prefills serially: its first frame then needs no extra decode step (c1 TTFA,
+/// Qwen3-TTS H100: 19.6 vs 21.4 ms). A live CFG pair keeps the tick serial, and a prompt part way
+/// through serial prefill keeps it serial until done (packed admission restarts a slot).
+#[cfg(feature = "cuda")]
+fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap: usize) -> bool {
+    if !e.depth_packs() || slots.iter().take(cap).flatten().any(|s| s.cfg.is_some()) {
+        return false;
+    }
+    let (mut prompts, mut admitted) = (0, false);
+    for (i, s) in slots.iter().enumerate().take(cap) {
+        let Some(s) = s.as_ref().filter(|s| s.step == 0) else {
+            continue;
+        };
+        if e.packed_slot_ready(i) {
+            admitted = true;
+        } else if s.pf_pos > 0 {
+            return false;
+        } else {
+            prompts += 1;
+        }
+    }
+    admitted || prompts >= 2
+}
 /// A speech job's `max_tokens` is its packet's cap (an ASR transcript, a TTS utterance), not a
 /// client's ask: under a live context bound (`--live-ctx-models`) the stream ends at the context
 /// instead of the request failing.
@@ -8119,6 +8178,59 @@ fn gpu_speech_pack_inputs(
             e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(rows))?;
         }
         e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(index))
+    })
+}
+
+/// Each member's prompt frame codes (`in.frame_codes`, `[launch row][codes]`) at its chunk's launch
+/// offset, zeros elsewhere. Written for every launch of a depth packet: the tensor is shared.
+#[cfg(feature = "cuda")]
+fn gpu_speech_pack_codes(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &[Option<Slot>],
+    pack: &[(usize, usize, usize)],
+) -> Result<()> {
+    if !e.has_depth_stage() {
+        return Ok(());
+    }
+    let Some(bytes) = e.tensor_bytes("in.frame_codes") else {
+        return Ok(());
+    };
+    let Some(k) = pack
+        .iter()
+        .filter_map(|&(i, _, _)| pack_row(slots, i)?.0.speech.as_deref())
+        .map(|sp| sp.frame_codes_per_row)
+        .find(|&k| k > 0)
+    else {
+        return Ok(());
+    };
+    thread_local! {
+        static CODES: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let window = (bytes as usize / 4 / k).min(e.pf_max_rows().max(1));
+    CODES.with_borrow_mut(|codes| {
+        codes.clear();
+        codes.resize(window * k, 0);
+        let mut launch_row = 0usize;
+        for &(i, c0, len) in pack {
+            if let Some(sp) = pack_row(slots, i).and_then(|(s, _)| s.speech.as_deref()) {
+                if sp.frame_codes_per_row != k && !sp.frame_codes.is_empty() {
+                    return Err(crate::RuntimeError::Rejected(
+                        "packed prompts disagree on codes per frame row".into(),
+                    ));
+                }
+                let src = sp.frame_codes.get(c0 * k..).unwrap_or(&[]);
+                let n = src.len().min(len * k);
+                let dst = launch_row * k;
+                if dst + n > codes.len() {
+                    return Err(crate::RuntimeError::Rejected(
+                        "packed launch exceeds in.frame_codes".into(),
+                    ));
+                }
+                codes[dst..dst + n].copy_from_slice(&src[..n]);
+            }
+            launch_row += len;
+        }
+        e.write_tensor("in.frame_codes", 0, bytemuck::cast_slice(codes))
     })
 }
 

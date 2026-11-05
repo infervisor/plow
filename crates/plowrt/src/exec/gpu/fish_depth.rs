@@ -702,9 +702,56 @@ impl GpuEngine {
         Ok(())
     }
 
-    /// Whether a depth stage is loaded: its prompts take serial prefill.
+    /// Whether a depth stage is loaded.
     pub fn has_depth_stage(&self) -> bool {
         self.fish.is_some()
+    }
+
+    /// Whether depth prompts may take packed prefill: the last prompt row is withheld and fed to the
+    /// decode step, whose depth launch samples the first frame beside every other row's. Only when
+    /// decode embeds that row as prefill does (token + frame codes): not under a host overlay (a
+    /// text encoder's rows), and not with a host-drawn (Maya 2) stage. A CFG pair also samples its
+    /// first frame from prefill's tail (the mux keeps a tick with one live on serial prefill).
+    pub fn depth_packs(&self) -> bool {
+        self.fish.as_ref().is_some_and(|d| d.maya2.is_none())
+            && self.tensor_bytes("in.encoder_overlay").is_none()
+    }
+
+    /// Whether packed prefill completes prompts in the compact terminal; a depth stage withholds
+    /// the last row instead (its first frame needs the decode step's hidden row).
+    pub fn pf_compact(&self) -> bool {
+        self.has_packed_terminal() && !self.has_depth_stage()
+    }
+
+    /// Seed `slot`'s decode frame input (`in.fish.dcodes[slot]`) with a withheld prompt row's
+    /// codes (`codebooks` entries; missing = 0) and start its sampling history.
+    pub fn fish_seed_slot(&mut self, slot: usize, codes: &[u32]) -> Result<()> {
+        let d = self.fish.as_ref().ok_or_else(|| reject("not enabled"))?;
+        let k = d.manifest.codebooks as usize;
+        if codes.len() > k {
+            return Err(reject("prompt row has more codes than the depth stage"));
+        }
+        let mut row = [0u32; 64];
+        let row = row
+            .get_mut(..k)
+            .ok_or_else(|| reject("too many codebooks"))?;
+        row[..codes.len()].copy_from_slice(codes);
+        let h = usize::from(d.manifest.tensors.frame_codes);
+        let off = (slot * k * 4) as u64;
+        if off + (k * 4) as u64 > self.devp[h].len {
+            return Err(reject("slot out of range"));
+        }
+        // SAFETY: the range is inside the allocation (checked above) and `row` outlives the
+        // stream synchronize below.
+        unsafe {
+            self.be.memcpy_htod_async(
+                self.devp[h].base + off,
+                bytemuck::cast_slice(row),
+                &self.stream,
+            )?
+        };
+        self.be.stream_synchronize(&self.stream)?;
+        self.fish_reset_slot(slot)
     }
 
     /// The row of `act.hn` holding the last serial prefill's terminal hidden.
