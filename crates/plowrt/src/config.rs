@@ -952,11 +952,6 @@ pub struct RuntimeConfig {
     )]
     pub host_kvcache_size: Option<HostKvcacheSize>,
 
-    /// Pin the whole host tier when the KV block store arms, before the server is ready, so
-    /// serving never registers host memory (a registration holds the driver's context lock).
-    #[arg(long = "kv-host-prepin", env = "PLOW_KV_HOST_PREPIN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub kv_host_prepin: bool,
-
     /// CUDA VMM prefix cache: seconds a request with
     /// `X-Session-Id` keeps its newest boundary protected from LRU after its last use; then the
     /// boundary and the blocks only it kept attachable are demoted (freed). `0` = sessions get

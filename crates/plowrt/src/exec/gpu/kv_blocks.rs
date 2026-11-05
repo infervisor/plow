@@ -34,8 +34,6 @@ const ROWS_PER_BLOCK: u32 = 32;
 const CHUNK_BYTES: u64 = 8 << 20;
 /// Least pause after each pinned host chunk the grower allocates (see the grower thread).
 const HOST_GROW_GAP: std::time::Duration = std::time::Duration::from_millis(1);
-/// Pinned bytes per host-tier registration at arm time (`KvStore::host_prepin`).
-const HOST_PREPIN_REGION: u64 = 256 << 20;
 /// Device headroom the spill-ahead thread keeps for publishes when a host tier is armed
 /// (`VmmKv::spawn_spill_ahead`): about a second of boundaries at the production rate.
 pub const SPILL_AHEAD_BYTES: u64 = 2 << 30;
@@ -287,8 +285,7 @@ impl BlockServe {
         be: &Arc<CudaBackend>,
         v: &VmmServe,
         device_cap: u64,
-        mut host_grant: crate::memory::vmm::HostTierGrant,
-        host_reserve: u64,
+        host_grant: crate::memory::vmm::HostTierGrant,
         state_tensors: &[(usize, u64)],
     ) -> Result<Arc<Self>> {
         let host_cap = host_grant.bytes();
@@ -355,17 +352,6 @@ impl BlockServe {
             device_cap,
             host_cap,
         ));
-        store.set_host_reserve(host_reserve);
-        if host_cap > 0 && crate::config::RuntimeConfig::get().kv_host_prepin {
-            let t = std::time::Instant::now();
-            let pinned = store.host_prepin(HOST_PREPIN_REGION);
-            host_grant.shrink_to(pinned);
-            tracing::info!(
-                pinned_mib = pinned >> 20,
-                ms = t.elapsed().as_millis() as u64,
-                "kv store: host tier pre-pinned"
-            );
-        }
         let batch = g.batch as usize;
         // Pinned chunks are allocated ahead on their own thread (`host_grow_step`), never
         // under the pool lock, and released device chunks are freed on another (a device free
@@ -691,6 +677,10 @@ impl BlockServe {
     pub fn set_device_cap(&self, bytes: u64) {
         self.store.set_device_cap(bytes);
         tracing::info!(device_cap_mib = bytes >> 20, "kv store: device cap");
+    }
+
+    pub fn set_host_reserve(&self, bytes: u64) {
+        self.store.set_host_reserve(bytes);
     }
 
     pub fn store(&self) -> Arc<KvStore> {
