@@ -173,6 +173,11 @@ pub struct EmitConfig {
     #[arg(skip)]
     pub packed_prefill_default: bool,
 
+    /// `emit_packed_prefill` was set by the sm_120a FP8-KV production default rather than the
+    /// recipe: a packet the contract does not fit declines it instead of failing the emit.
+    #[arg(skip)]
+    pub packed_prefill_fp8kv_default: bool,
+
     /// Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs in their own gfx950 segment.
     /// Default on; `=0` is the rollback to the interpreter-resident pair.
     #[arg(long = "emit-decode-mla-segments", env = "PLOW_SEG_DECODE_MLA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -2002,6 +2007,7 @@ impl EmitConfig {
             seg_fa256_gqa2: env_bool_opt("PLOW_SEG_FA256_GQA2"),
             emit_packed_prefill: env_bool_opt("PLOW_EMIT_PACKED_PREFILL"),
             packed_prefill_default: false,
+            packed_prefill_fp8kv_default: false,
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
             // value; direct legacy callers must name the feature explicitly.
             decode_mla_segments: env_bool("PLOW_SEG_DECODE_MLA"),

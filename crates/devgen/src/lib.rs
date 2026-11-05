@@ -9252,6 +9252,7 @@ fn apply_production_defaults(
         && cfg.emit_packed_prefill.is_none()
     {
         cfg.emit_packed_prefill = Some(true);
+        cfg.packed_prefill_fp8kv_default = true;
         emit_config::note_production_default("emit_packed_prefill", "true".into());
     }
     // GLM on gfx942: the packed siblings are a SECOND copy of the dense prefill buckets, and the
@@ -11865,7 +11866,8 @@ fn emit_dense_gqa(
                 packed_prefill_emitted = true;
             }
             Err(error)
-                if ecfg.emit_packed_prefill.is_none() && ecfg.max_request_chunk.is_none() =>
+                if (ecfg.emit_packed_prefill.is_none() || ecfg.packed_prefill_fp8kv_default)
+                    && ecfg.max_request_chunk.is_none() =>
             {
                 m.tensors.truncate(packed_tensor_base);
                 eprintln!("  packed prefill not selected: {error}");
