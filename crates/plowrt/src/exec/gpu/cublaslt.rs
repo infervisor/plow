@@ -2666,12 +2666,17 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Segments of the widest-rung decode chain that [`Self::capture_debug_decode_prefix`] can
+    /// cut at (0: no library-routed or role-split chain).
+    pub fn debug_decode_segments(&self) -> usize {
+        self.cublaslt_decode
+            .len()
+            .max(self.decode_packet_roles.len())
+    }
+
     /// Capture a partial widest-rung decode for tensor inspection. Later outputs are stale.
     pub fn capture_debug_decode_prefix(&mut self, segments: usize) -> Result<()> {
-        let total = self
-            .cublaslt_decode
-            .len()
-            .max(self.decode_packet_roles.len());
+        let total = self.debug_decode_segments();
         if segments == 0
             || segments > total
             || !self.cublaslt_decode_capture
