@@ -10,6 +10,45 @@ use crate::{Result, RuntimeError};
 
 use super::GpuEngine;
 
+pub(super) struct SlotPrefixes {
+    rows: Vec<Vec<u64>>,
+    pub(super) epoch: u64,
+}
+
+impl SlotPrefixes {
+    pub(super) fn new(slots: usize) -> Self {
+        Self {
+            rows: vec![Vec::new(); slots],
+            epoch: 0,
+        }
+    }
+
+    pub(super) fn take(&mut self, slot: usize, keys: &[u64]) -> usize {
+        let old = std::mem::take(&mut self.rows[slot]);
+        old.iter()
+            .zip(keys)
+            .take(keys.len().saturating_sub(1))
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
+    pub(super) fn publish(&mut self, slot: usize, mut keys: Vec<u64>) {
+        keys.truncate(keys.len().saturating_sub(1));
+        self.rows[slot] = keys;
+    }
+
+    pub(super) fn clear(&mut self, slot: usize) {
+        self.rows[slot].clear();
+    }
+
+    pub(super) fn clear_all(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        for keys in &mut self.rows {
+            keys.clear();
+        }
+    }
+}
+
 pub(crate) struct VmmPrefixLayout {
     pub(crate) geo: crate::memory::vmm::VmmGeometry,
     pub(super) slide: Vec<(usize, usize, u64)>,
@@ -1120,4 +1159,63 @@ fn prompt_end_covers_the_withheld_last_token() {
     assert!(!is_prompt_end(2048, 2047, 3000), "chunk end");
     assert!(!is_prompt_end(2999, 2048, 3000), "chunk-capped publish");
     assert!(!is_prompt_end(3100, 3099, 3000), "turn end");
+}
+
+#[cfg(test)]
+mod slot_prefix_tests {
+    use super::SlotPrefixes;
+
+    #[test]
+    fn slot_prefix_keeps_only_matching_prompt_rows_and_always_replays_the_last() {
+        let mut cache = SlotPrefixes::new(2);
+        cache.publish(0, vec![10, 20, 30, 40]);
+        assert_eq!(cache.take(1, &[10, 20, 30, 50]), 0);
+        assert_eq!(cache.take(0, &[10, 20, 30, 50]), 3);
+        assert_eq!(
+            cache.take(0, &[10, 20, 30, 50]),
+            0,
+            "lookup consumes provenance"
+        );
+        cache.publish(0, vec![10, 20, 30, 40]);
+        assert_eq!(
+            cache.take(0, &[10, 20]),
+            1,
+            "the new prompt keeps a terminal row"
+        );
+        cache.publish(0, vec![10, 20, 30, 40]);
+        assert_eq!(cache.take(0, &[10, 99, 30, 40]), 1);
+        cache.publish(0, vec![10, 20, 30, 40]);
+        assert_eq!(
+            cache.take(0, &[10, 20, 30, 40, 50]),
+            3,
+            "decode-written rows are excluded"
+        );
+    }
+
+    #[test]
+    fn slot_prefix_requires_explicit_successful_publication_after_reseating() {
+        let mut cache = SlotPrefixes::new(2);
+        for slot in 0..2 {
+            cache.publish(slot, vec![1, 2, 3]);
+        }
+        cache.clear(0);
+        assert_eq!(cache.take(0, &[1, 2, 3]), 0);
+        assert_eq!(cache.take(1, &[1, 2, 3]), 2);
+        // Refused resume or failed/cancelled prefill publishes nothing.
+        assert_eq!(cache.take(1, &[1, 2, 3]), 0);
+        for slot in 0..2 {
+            cache.publish(slot, vec![1, 2, 3]);
+        }
+        let epoch = cache.epoch;
+        cache.clear_all();
+        assert_ne!(
+            cache.epoch, epoch,
+            "a fault also invalidates pending publication"
+        );
+        for slot in 0..2 {
+            assert_eq!(cache.take(slot, &[1, 2, 3]), 0);
+        }
+        cache.publish(0, vec![1]);
+        assert_eq!(cache.take(0, &[1, 2]), 0);
+    }
 }

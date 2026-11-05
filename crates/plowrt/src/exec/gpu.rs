@@ -2892,6 +2892,7 @@ pub struct GpuEngine {
     vmm_attached: Vec<u32>,
     /// Cache rows the next `begin_slot` keeps (a retained session prefix); 0 = start cold.
     resume_rows: Vec<u32>,
+    slot_prefixes: prefix::SlotPrefixes,
     /// The packet's declared caches: what a KV image of one slot carries (docs/arch/30 §5).
     kv_image: Option<plow_asset::live_kv::Manifest>,
     /// Digest of the caches' semantic header without the checkpoint (`plow_asset::kv_image`):
@@ -8048,6 +8049,7 @@ impl GpuEngine {
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
             resume_rows: vec![0; batch],
+            slot_prefixes: prefix::SlotPrefixes::new(batch),
             kv_image,
             kv_image_key,
             rewind_snapshots: (0..batch).map(|_| None).collect(),
@@ -8763,6 +8765,7 @@ impl GpuEngine {
                 self.max_ctx
             )));
         }
+        self.slot_prefixes.clear(b);
         self.reset_packed_admission(b);
         self.state_drop(b);
         // A retirement deferred behind a step that then failed (queue cleared) must not fire
@@ -8888,18 +8891,44 @@ impl GpuEngine {
         self.vmm.is_none() && self.recurrent.is_none()
     }
 
+    pub fn reuse_slot_prefix(&mut self, b: usize, keys: &[u64]) -> usize {
+        let rows = self.slot_prefixes.take(b, keys);
+        if !self.slot_prefix_reuse_supported() {
+            return 0;
+        }
+        if self.can_resume_slot(b, rows) {
+            rows
+        } else {
+            0
+        }
+    }
+
+    pub fn keep_slot_prefix(&mut self, b: usize, epoch: u64, keys: Vec<u64>) {
+        if epoch == self.slot_prefix_epoch()
+            && self.slot_prefix_reuse_supported()
+            && self.pos[b] as usize >= keys.len().saturating_sub(1)
+        {
+            self.slot_prefixes.publish(b, keys);
+        }
+    }
+
+    pub fn forget_slot_prefix(&mut self, b: usize) {
+        self.slot_prefixes.clear(b);
+    }
+
+    pub fn slot_prefix_epoch(&self) -> u64 {
+        self.slot_prefixes.epoch
+    }
+
+    pub fn slot_prefix_reuse_supported(&self) -> bool {
+        self.slot_resume_supported() && self.resume_ring_slack.is_none() && !self.drain_before_unmap
+    }
+
     /// Make the next `begin_slot(b, ..)` keep slot `b`'s first `rows` cache rows (a retained
     /// session prefix) and start its sequence there. Returns the rows kept: `rows`, or 0 (the
     /// sequence starts cold) unless the slot still holds that many rows.
     pub fn resume_slot(&mut self, b: usize, rows: usize) -> usize {
-        let ok = self.slot_resume_supported()
-            && b < self.batch
-            && rows <= self.pos[b] as usize
-            && rows < self.max_ctx
-            && self
-                .resume_ring_slack
-                .is_none_or(|s| self.pos[b].max(self.kv_hw[b]) as usize - rows <= s as usize)
-            && self.pipe.as_ref().is_none_or(|p| !p.holds(b));
+        let ok = self.can_resume_slot(b, rows);
         if let Some(r) = self.resume_rows.get_mut(b) {
             *r = if ok { rows as u32 } else { 0 };
         }
@@ -8908,6 +8937,17 @@ impl GpuEngine {
         } else {
             0
         }
+    }
+
+    fn can_resume_slot(&self, b: usize, rows: usize) -> bool {
+        self.slot_resume_supported()
+            && b < self.batch
+            && rows <= self.pos[b] as usize
+            && rows < self.max_ctx
+            && self
+                .resume_ring_slack
+                .is_none_or(|s| self.pos[b].max(self.kv_hw[b]) as usize - rows <= s as usize)
+            && self.pipe.as_ref().is_none_or(|p| !p.holds(b))
     }
 
     /// Slot `b`'s current sequence belongs to a session (`X-Session-Id`): the VMM prefix cache
@@ -8939,6 +8979,9 @@ impl GpuEngine {
     /// Step entry points report their outcome: a failed step may leave kernels queued.
     fn note_step_result(&mut self, failed: bool) {
         self.drain_before_unmap |= failed;
+        if failed {
+            self.slot_prefixes.clear_all();
+        }
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {

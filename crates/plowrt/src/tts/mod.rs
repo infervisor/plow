@@ -113,6 +113,7 @@ pub struct SpeechContract {
     pub onset_trim: Option<OnsetTrimPolicy>,
     /// New frames a stream's first stateful codec step waits for (`stream.first_frames`).
     pub stream_first_frames: Option<usize>,
+    pub slot_prefix_reuse: bool,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -155,6 +156,15 @@ impl SpeechContract {
                 .collect()
         };
         let f32p = |k: &str| get(k).map(|v| f32::from_bits(v as u32));
+        let slot_prefix_reuse = match p.parameters.get("prompt.slot_prefix_version") {
+            None | Some(0) => false,
+            Some(1) => true,
+            Some(v) => {
+                return Err(RuntimeError::Rejected(format!(
+                    "unsupported speech slot prefix version {v}"
+                )))
+            }
+        };
         let mut c = SpeechContract {
             pipeline: p.name.clone(),
             prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| {
@@ -234,6 +244,7 @@ impl SpeechContract {
                 max_ms: p.parameters.get(ONSET_TRIM_MAX_MS).map_or(0, |&m| m as u32),
             }),
             stream_first_frames: p.parameters.get("stream.first_frames").map(|&n| n as usize),
+            slot_prefix_reuse,
         };
         if let Some(encoder) = p.strings.get(crate::exec::packet_runtime::CLONE_ENCODER) {
             let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {
@@ -1079,6 +1090,16 @@ mod tests {
         bad = pipeline();
         bad.driver = "causal.v1".into();
         assert!(SpeechContract::from_pipeline(&bad).is_err());
+    }
+
+    #[test]
+    fn slot_prefix_capability_is_versioned_and_absent_on_old_packets() {
+        let mut p = pipeline();
+        assert!(!SpeechContract::from_pipeline(&p).unwrap().slot_prefix_reuse);
+        p.parameters.insert("prompt.slot_prefix_version".into(), 1);
+        assert!(SpeechContract::from_pipeline(&p).unwrap().slot_prefix_reuse);
+        p.parameters.insert("prompt.slot_prefix_version".into(), 2);
+        assert!(SpeechContract::from_pipeline(&p).is_err());
     }
 
     #[test]

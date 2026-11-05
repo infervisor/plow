@@ -1127,6 +1127,10 @@ fastconformer RNNT, fish-s2.
   `in.encoder_overlay` handling (`exec/gpu/token_batch.rs`, `ctx_bound.rs`) have no AMD arms.
 - **Speech on CPU**: CPU has `LENGTH_AFFINE_U32`, `REDUCE_ROWS_F32`, `STREAM_TAIL_F32`,
   `TRIM_SILENCE_F32`; missing `CHUNK_ATTENTION_F32`, `RMSNORM_F32`, `ROPE_AXIAL_F32`.
+- **Static speech slot-prefix reuse**: CUDA implements the experimental
+  `prompt.slot_prefix_version = 1` capability, keyed by tokens, overlays and frame codes, with
+  fault-epoch invalidation. AMD and CPU lack this cache and the batched depth-stage completion;
+  they need the same accepted-frontier and input-identity checks before honoring the capability.
 
 ### NVIDIA → AMD candidates
 

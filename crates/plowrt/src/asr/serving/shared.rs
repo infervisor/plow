@@ -531,6 +531,7 @@ impl SharedAsr {
                     frame_codes_per_row: 0,
                     feed: None,
                     maya2_memory: None,
+                    slot_prefix_reuse: false,
                 })),
                 prefix: None,
                 tenant: None,

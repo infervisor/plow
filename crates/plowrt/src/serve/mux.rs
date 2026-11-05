@@ -548,6 +548,8 @@ type HeldToken = (
 /// must be the token whose decode embedding the overlay row is.
 #[derive(Default)]
 pub struct SpeechJob {
+    /// Packet-declared v1: prompt inputs are token IDs, finalized overlays and frame codes.
+    pub slot_prefix_reuse: bool,
     /// `[rows][hidden]` f32, one row per entry of `overlay_pos`.
     pub overlay: Vec<f32>,
     /// Absolute prompt position each overlay row replaces, strictly increasing.
@@ -1093,6 +1095,8 @@ struct Slot {
     /// sequence (GPU path, `PLOW_VMM_PREFIX=1`); 0 = cold. Reported as
     /// OpenAI `usage.prompt_tokens_details.cached_tokens`.
     cached_tokens: usize,
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    slot_prefix_keys: Option<(u64, Vec<u64>)>,
     /// KV arena handle held for this slot's lifetime. `None` when the bundle
     /// has no `KvPaging` (test bundles / models without attention).
     kv: Option<SlotHandle>,
@@ -3281,6 +3285,7 @@ fn admit_session(
         step: 0,
         pf_pos: 0,
         cached_tokens: 0,
+        slot_prefix_keys: None,
         kv,
         class: job.opts.class,
         raw_tokens: job.opts.raw_tokens,
@@ -3969,6 +3974,24 @@ fn run_one_tick(
                     }
                 }
 
+                if did_prefill && e.has_depth_stage() && e.slot_prefix_reuse_supported() {
+                    for (i, slot) in slots.iter_mut().enumerate().take(cap) {
+                        let Some(s) = slot.as_mut().filter(|s| {
+                            s.step == 0 && s.pf_pos == 0 && s.slot_prefix_keys.is_none()
+                        }) else {
+                            continue;
+                        };
+                        if e.packed_slot_ready(i) {
+                            continue;
+                        }
+                        if let Some(keys) = speech_prefix_keys(s) {
+                            s.resume = e.reuse_slot_prefix(i, &keys);
+                            s.slot_prefix_keys = Some((e.slot_prefix_epoch(), keys));
+                        } else {
+                            e.forget_slot_prefix(i);
+                        }
+                    }
+                }
                 let pack_t = packlog::on().then(Instant::now);
                 let (pack_live, pack_prefilling) = if pack_t.is_some() {
                     let live = slots.iter().take(cap).flatten();
@@ -4159,11 +4182,21 @@ fn run_one_tick(
                                 let sp = s.speech.as_deref().expect("checked Some");
                                 let k = sp.frame_codes_per_row.max(1);
                                 let codes = sp.frame_codes.get((n - 1) * k..n * k).unwrap_or(&[]);
-                                if let Err(err) = e.fish_seed_slot(i, codes) {
+                                let initialized = e.fish_seed_slot(i, codes).and_then(|()| {
+                                    sp.depth.and_then(|d| d.maya2).map_or(Ok(()), |plan| {
+                                        e.maya2_bind(i, plan, sp.maya2_memory.as_deref())
+                                    })
+                                });
+                                if let Err(err) = initialized {
                                     note_fault(&mut tick_fault, &err);
                                     fail_slot(&mut slots[i], &arena, err);
                                     continue;
                                 }
+                            }
+                            if let Some((epoch, keys)) =
+                                slots[i].as_mut().and_then(|s| s.slot_prefix_keys.take())
+                            {
+                                e.keep_slot_prefix(i, epoch, keys);
                             }
                             feeds.push((i, last));
                             if pair {
@@ -7426,6 +7459,7 @@ fn gpu_prefill_batched_pass(
                 }
             }
             let admitted = (|| -> Result<()> {
+                reconcile_slot_prefix(request, e.slot_prefix_epoch());
                 for row in [i, i + 1].into_iter().take(1 + pair as usize) {
                     let fresh = !e.packed_slot_ready(row);
                     if fresh && request.resume > 0 {
@@ -7969,7 +8003,12 @@ fn gpu_prefill_batched_pass(
 /// through serial prefill keeps it serial until done (packed admission restarts a slot).
 #[cfg(feature = "cuda")]
 fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap: usize) -> bool {
-    if !e.depth_packs() || slots.iter().take(cap).flatten().any(|s| s.cfg.is_some()) {
+    e.depth_packs() && depth_prompts_pack(slots, cap, |i| e.packed_slot_ready(i))
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn depth_prompts_pack(slots: &[Option<Slot>], cap: usize, ready: impl Fn(usize) -> bool) -> bool {
+    if slots.iter().take(cap).flatten().any(|s| s.cfg.is_some()) {
         return false;
     }
     let (mut prompts, mut admitted) = (0, false);
@@ -7977,15 +8016,86 @@ fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap:
         let Some(s) = s.as_ref().filter(|s| s.step == 0) else {
             continue;
         };
-        if e.packed_slot_ready(i) {
+        if !depth_prompt_can_pack(s) {
+            return false;
+        }
+        if ready(i) {
             admitted = true;
         } else if s.pf_pos > 0 {
             return false;
         } else {
             prompts += 1;
+            admitted |= s.resume > 0 && s.resume + 1 == s.prompt_ids.len();
         }
     }
     admitted || prompts >= 2
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn depth_prompt_can_pack(s: &Slot) -> bool {
+    s.cfg.is_none()
+        && s.mm.is_none()
+        && s.import.is_none()
+        && s.speech.as_ref().is_some_and(|sp| {
+            sp.depth.is_some()
+                && sp.cfg.is_none()
+                && sp.encode.is_none()
+                && sp
+                    .depth
+                    .is_none_or(|d| d.maya2.is_none() || sp.slot_prefix_reuse)
+                && sp
+                    .overlay_pos
+                    .iter()
+                    .all(|&p| p as usize + 1 < s.prompt_ids.len())
+        })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn speech_prefix_keys(s: &Slot) -> Option<Vec<u64>> {
+    let sp = s.speech.as_ref()?;
+    if !sp.slot_prefix_reuse
+        || sp.depth.is_none()
+        || sp.encode.is_some()
+        || sp.cfg.is_some()
+        || s.cfg.is_some()
+        || s.session.is_some()
+        || s.import.is_some()
+        || s.export.is_some()
+        || s.mm.is_some()
+        || s.prompt_ids.len() < 2
+        || (sp.overlay_pos.is_empty() != sp.overlay.is_empty())
+        || (!sp.overlay_pos.is_empty()
+            && (sp.overlay.len() % sp.overlay_pos.len() != 0
+                || sp
+                    .overlay_pos
+                    .iter()
+                    .any(|&p| p as usize >= s.prompt_ids.len())
+                || sp.overlay_pos.windows(2).any(|p| p[0] >= p[1])))
+    {
+        return None;
+    }
+    let mut keys = crate::serve::session::row_keys(&s.prompt_ids, &sp.overlay_pos, &[&sp.overlay]);
+    if !sp.frame_codes.is_empty()
+        && !crate::serve::session::frame_row_keys(
+            &mut keys,
+            &sp.frame_codes,
+            sp.frame_codes_per_row,
+        )
+    {
+        return None;
+    }
+    Some(keys)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn reconcile_slot_prefix(s: &mut Slot, epoch: u64) {
+    if s.slot_prefix_keys
+        .as_ref()
+        .is_some_and(|(at, _)| *at != epoch)
+    {
+        s.slot_prefix_keys = None;
+        s.resume = 0;
+    }
 }
 
 /// A speech job's `max_tokens` is its packet's cap (an ASR transcript, a TTS utterance), not a
@@ -8267,6 +8377,7 @@ fn gpu_prefill_advance(
     fit_speech_budget(slot, e.max_ctx());
     let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
+        reconcile_slot_prefix(slot, e.slot_prefix_epoch());
         let kept = if slot.resume > 0 && slot.cfg.is_none() {
             e.resume_slot(slot_idx, slot.resume)
         } else {
@@ -8293,8 +8404,8 @@ fn gpu_prefill_advance(
             e.note_kv_pressure();
             return Ok(None);
         }
+        slot.resume = kept;
         if kept > 0 {
-            slot.resume = kept;
             slot.pf_pos = kept;
             slot.cached_tokens = kept;
         }
@@ -8365,12 +8476,14 @@ fn gpu_prefill_advance(
             PrefillStep::Progress(frontier) => {
                 slot.pf_pos = frontier;
                 // First chunk consulted the prefix cache — record the hit.
-                slot.cached_tokens = e.attached_rows(slot_idx) as usize;
+                slot.cached_tokens =
+                    (e.attached_rows(slot_idx) as usize).max(slot.resume.min(frontier));
                 return Ok(None);
             }
             PrefillStep::Done(tok) => {
                 slot.pf_pos = slot.prompt_ids.len();
-                slot.cached_tokens = e.attached_rows(slot_idx) as usize;
+                slot.cached_tokens =
+                    (e.attached_rows(slot_idx) as usize).max(slot.resume.min(slot.pf_pos));
                 tok
             }
         }
@@ -8406,6 +8519,9 @@ fn gpu_prefill_advance(
         }
         tok
     };
+    if let Some((epoch, keys)) = slot.slot_prefix_keys.take() {
+        e.keep_slot_prefix(slot_idx, epoch, keys);
+    }
     // Parity artifact: these ids + the per-step tokens are what the
     // standalone gemma4_sm120_chat harness is diffed against.
     tracing::debug!(
@@ -13571,6 +13687,7 @@ mod tests {
                 step: 0,
                 pf_pos: 2,
                 cached_tokens: 0,
+                slot_prefix_keys: None,
                 kv: None,
                 arrived: Instant::now(),
                 stop_tail: String::new(),
@@ -13596,6 +13713,179 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    fn prefix_test_speech() -> SpeechJob {
+        SpeechJob {
+            slot_prefix_reuse: true,
+            frame_codes: vec![10, 11, 20, 21, 30, 31],
+            frame_codes_per_row: 2,
+            depth: Some(DepthJob {
+                seed: 1,
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 1,
+                ras_temperature: 1.0,
+                ras_top_p: 1.0,
+                repetition_penalty: 1.0,
+                cfg_scale: None,
+                semantic_base: 0,
+                stop_class: 2048,
+                stop_token: 2048,
+                maya2: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn speech_prefix_keys_cover_tokens_frames_and_speaker_overlays() {
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.speech = Some(Box::new(prefix_test_speech()));
+        let a = speech_prefix_keys(s).unwrap();
+        s.speech.as_mut().unwrap().frame_codes[3] += 1;
+        let b = speech_prefix_keys(s).unwrap();
+        assert_eq!(a[0], b[0]);
+        assert_ne!(a[1], b[1]);
+        s.prompt_ids[0] += 1;
+        let c = speech_prefix_keys(s).unwrap();
+        assert_ne!(b[0], c[0]);
+        assert_eq!(b[1..], c[1..]);
+        let sp = s.speech.as_mut().unwrap();
+        sp.overlay_pos = vec![1];
+        sp.overlay = vec![0.5, 0.75];
+        let d = speech_prefix_keys(s).unwrap();
+        assert_eq!(c[0], d[0]);
+        assert_ne!(c[1], d[1]);
+        s.speech.as_mut().unwrap().overlay[1] += 1.0;
+        assert_ne!(d[1], speech_prefix_keys(s).unwrap()[1]);
+    }
+
+    #[test]
+    fn speech_prefix_reuse_rejects_unfinalized_or_unkeyed_inputs() {
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.speech = Some(Box::new(prefix_test_speech()));
+        s.speech.as_mut().unwrap().slot_prefix_reuse = false;
+        assert!(speech_prefix_keys(s).is_none());
+        s.speech.as_mut().unwrap().slot_prefix_reuse = true;
+        s.speech.as_mut().unwrap().encode = Some(Box::new(|_, _| Ok(())));
+        assert!(speech_prefix_keys(s).is_none());
+        s.speech.as_mut().unwrap().encode = None;
+        s.speech.as_mut().unwrap().frame_codes.pop();
+        assert!(speech_prefix_keys(s).is_none());
+        s.speech.as_mut().unwrap().frame_codes.clear();
+        assert!(
+            speech_prefix_keys(s).is_some(),
+            "plain token prompts are keyed too"
+        );
+        s.speech.as_mut().unwrap().overlay_pos = vec![1];
+        assert!(speech_prefix_keys(s).is_none());
+        s.speech.as_mut().unwrap().overlay = vec![0.5];
+        assert!(speech_prefix_keys(s).is_some());
+        s.speech.as_mut().unwrap().overlay_pos = vec![3];
+        assert!(speech_prefix_keys(s).is_none());
+    }
+
+    #[test]
+    fn slot_prefix_fault_epoch_cancels_a_prepared_resume() {
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.resume = 2;
+        s.slot_prefix_keys = Some((7, vec![1, 2, 3]));
+        reconcile_slot_prefix(s, 7);
+        assert_eq!(s.resume, 2);
+        reconcile_slot_prefix(s, 8);
+        assert_eq!(s.resume, 0);
+        assert!(s.slot_prefix_keys.is_none());
+        s.resume = 2;
+        reconcile_slot_prefix(s, 9);
+        assert_eq!(s.resume, 2, "session retention has separate provenance");
+    }
+
+    #[test]
+    fn depth_packing_requires_the_terminal_decode_embedding_to_match_prefill() {
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.speech = Some(Box::new(prefix_test_speech()));
+        assert!(depth_prompt_can_pack(s));
+        s.speech.as_mut().unwrap().overlay_pos = vec![2];
+        assert!(
+            !depth_prompt_can_pack(s),
+            "terminal speaker anchor must be prefilled"
+        );
+        s.speech.as_mut().unwrap().overlay_pos = vec![1];
+        assert!(
+            depth_prompt_can_pack(s),
+            "earlier overlays are staged by packed prefill"
+        );
+        s.speech.as_mut().unwrap().encode = Some(Box::new(|_, _| Ok(())));
+        assert!(
+            !depth_prompt_can_pack(s),
+            "pending encoders may create terminal overlays"
+        );
+        s.speech.as_mut().unwrap().encode = None;
+        s.speech.as_mut().unwrap().depth = None;
+        assert!(!depth_prompt_can_pack(s));
+    }
+
+    #[test]
+    fn depth_packing_admits_a_warm_single_prompt_without_waiting_for_a_peer() {
+        let (mut a, _ra) = prefill_test_slot();
+        let (mut b, _rb) = prefill_test_slot();
+        for s in [&mut a, &mut b].into_iter().flatten() {
+            s.pf_pos = 0;
+            s.speech = Some(Box::new(prefix_test_speech()));
+        }
+        let mut slots = vec![a, None];
+        assert!(
+            !depth_prompts_pack(&slots, 2, |_| false),
+            "a cold single prompt stays serial"
+        );
+        slots[0].as_mut().unwrap().resume = 2;
+        assert!(depth_prompts_pack(&slots, 2, |_| false));
+        slots[0].as_mut().unwrap().resume = 1;
+        assert!(!depth_prompts_pack(&slots, 2, |_| false));
+        slots[1] = b;
+        assert!(depth_prompts_pack(&slots, 2, |_| false));
+        slots[0].as_mut().unwrap().pf_pos = 1;
+        assert!(
+            !depth_prompts_pack(&slots, 2, |_| false),
+            "serial work cannot change routes mid-prompt"
+        );
+        assert!(depth_prompts_pack(&slots, 2, |i| i == 0));
+        slots[1]
+            .as_mut()
+            .unwrap()
+            .speech
+            .as_mut()
+            .unwrap()
+            .overlay_pos = vec![2];
+        assert!(!depth_prompts_pack(&slots, 2, |_| true));
+    }
+
+    #[test]
+    fn depth_packing_host_controller_requires_the_packet_capability() {
+        let controller = crate::tts::maya2::Controller::parse(
+            r#"{"cb0":{"temperature":0.9,"top_k":64,"top_p":1.0,"presence_penalty":0.8,
+            "penalty_window":12,"stop_p":0.35,"stop_hazard":0.6,"min_frames_floor":4},
+            "guard":{"dur_k":2.2,"dur_margin_s":1.2,"stall":32,"period_win":64,"period_thr":0.7,
+            "pmin":2,"pmax":16,"start":32,"every":2,"boost":4.0,"backstop":24,"hist":96,"hard_cap":1500},
+            "frame_s":0.08,"chunk_s":20.0,"gap_s":0.15,"frames_prior":{},"duration_prior":{}}"#,
+        ).unwrap();
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        let mut sp = prefix_test_speech();
+        sp.depth.as_mut().unwrap().maya2 =
+            Some(controller.plan("Hello.", "en", None, controller.cb0, 1));
+        sp.slot_prefix_reuse = false;
+        s.speech = Some(Box::new(sp));
+        assert!(!depth_prompt_can_pack(s));
+        s.speech.as_mut().unwrap().slot_prefix_reuse = true;
+        assert!(depth_prompt_can_pack(s));
+        s.speech.as_mut().unwrap().overlay_pos = vec![2];
+        assert!(!depth_prompt_can_pack(s));
     }
 
     #[cfg(feature = "cuda")]

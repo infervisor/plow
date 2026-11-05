@@ -30,6 +30,21 @@ Hosts without nix: `PLOW_CAMPAIGN_NO_NIX=1`, `CARGO_TARGET_DIR` holding a releas
 `PYREF` (torch + snac) and, for Chatterbox, `CBX_PY` (chatterbox-tts 0.1.7; for the
 multilingual recipe the upstream git package, whose `mtl_tts` loads `t3_mtl23ls_v3`).
 
+Depth-stage packets may declare `prompt.slot_prefix_version = 1` in their speech pipeline.
+The version covers token IDs, finalized host overlay rows and frame codes as prompt inputs.
+On static full-attention KV, a free slot can reuse the matching prefix its previous request
+left there, without reserving the slot. The last prompt row is always replayed. New occupancy
+consumes the old provenance, successful prefill publishes the new prefix, and a failed device
+step invalidates the engine's prefixes. Sessions, CFG pairs, pending encoders, P/D and multimodal
+jobs do not use this cache; packets without the capability retain their current behavior.
+
+Compatible depth prompts share packed prefill and their first predictor launch. A fully cached
+prefix can feed its terminal row straight into batched decode. Terminal overlay rows keep serial
+prefill because decode does not read those overlays. Host-controlled predictors bind each new
+request's controller and speaker memory before its first batched launch. Unified token-batch
+programs still require per-row frame-code and overlay input support; enabling the flag alone is
+not sufficient. These paths require numerical and latency qualification before promotion.
+
 Reproduced 2026-09-27 at 7c0a7f7e into fresh directories (H100): every packet
 (`model.pkt`, `encoder.pkt`, `codec.pkt`, `s3gen.pkt`) byte-identical to the working assets,
 cubins SASS-identical; Qwen3-ASR WER 3.913% (p50 60.1 ms), SNAC parity rel-L2 ≤ 5.3e-6,

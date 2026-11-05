@@ -1880,6 +1880,7 @@ impl SegmentMaker {
             let greedy = self.temperature <= 0.0;
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
                 cfg,
+                slot_prefix_reuse: c.slot_prefix_reuse,
                 overlay,
                 overlay_pos,
                 encode,

@@ -359,6 +359,7 @@ impl GpuEngine {
             self.fish_launch(&mut d, rows, out)
         };
         self.fish = Some(d);
+        self.note_step_result(r.is_err());
         r
     }
 
@@ -709,12 +710,10 @@ impl GpuEngine {
 
     /// Whether depth prompts may take packed prefill: the last prompt row is withheld and fed to the
     /// decode step, whose depth launch samples the first frame beside every other row's. Only when
-    /// decode embeds that row as prefill does (token + frame codes): not under a host overlay (a
-    /// text encoder's rows), and not with a host-drawn (Maya 2) stage. A CFG pair also samples its
-    /// first frame from prefill's tail (the mux keeps a tick with one live on serial prefill).
+    /// decode embeds that row as prefill does. The mux checks per-request overlays and binds a
+    /// host controller before the first depth launch. CFG pairs keep their serial prefill tail.
     pub fn depth_packs(&self) -> bool {
-        self.fish.as_ref().is_some_and(|d| d.maya2.is_none())
-            && self.tensor_bytes("in.encoder_overlay").is_none()
+        self.fish.is_some()
     }
 
     /// Whether packed prefill completes prompts in the compact terminal; a depth stage withholds

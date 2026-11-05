@@ -526,6 +526,10 @@ pub fn speech_pipeline_section(
         let json = serde_json::to_string(&d).map_err(|e| e.to_string())?;
         pipe.strings.insert(KEY.into(), json);
     }
+    if p.dual_stream || p.depth_sampler == 2 {
+        pipe.parameters
+            .insert("prompt.slot_prefix_version".into(), 1);
+    }
     if let Some(t) = p.text_encoder {
         pipe.strings.insert("text.encoder".into(), t.into());
     }
