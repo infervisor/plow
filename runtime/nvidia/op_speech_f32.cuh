@@ -1824,9 +1824,13 @@ struct SpQ8Epi {
 };
 /* At most this many rows (a stream step, the RNNT predictor and joint) take the GEMV walk. */
 #define SPQ_GEMV_ROWS 8u
+/* A pass of sp_q8_gemv_t stages its rows as [k][rows + 4] floats. */
+#define SPQ_T_FITS(rows, k) ((size_t)(k) * ((rows) + 4u) <= SP_ARENA_FLOATS)
 /* A warp per output column walks K in Q8_0 blocks (lane = element), every row's sum in a register,
  * then one fixed-order warp reduction: bandwidth-bound on the weights, every slice's warps sharing
- * the columns. */
+ * the columns. A row's sum is the same whatever ROWS. sp_q8_gemv_t has the same sums; this one
+ * takes the rows that do not fit its stage. */
+template <unsigned ROWS>
 static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                                                   const SpQ8Epi& ep, unsigned m, unsigned n, unsigned k,
                                                   unsigned slice, unsigned nblk) {
@@ -1840,20 +1844,20 @@ static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, c
     }
     for (unsigned c = slice * PLOW_NV_WARPS + warp; c < n; c += nblk * PLOW_NV_WARPS) {
         const uint8_t* row = w + (size_t)c * blocks * 34u;
-        float acc[SPQ_GEMV_ROWS];
+        float acc[ROWS];
 #pragma unroll
-        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) acc[r] = 0.f;
+        for (unsigned r = 0; r < ROWS; r++) acc[r] = 0.f;
 #pragma unroll 4
         for (unsigned b = 0; b < blocks; b++) {
             const uint8_t* block = row + b * 34u;
             const float wv = __fmul_rn(sp_f16(*(const uint16_t*)block), (float)((const int8_t*)(block + 2))[lane]);
             const float* xk = x + b * 32u + lane;
 #pragma unroll
-            for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++)
+            for (unsigned r = 0; r < ROWS; r++)
                 if (r < m) acc[r] = fmaf(xk[(size_t)r * k], wv, acc[r]);
         }
 #pragma unroll
-        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) {
+        for (unsigned r = 0; r < ROWS; r++) {
             if (r >= m) break;
             float v = acc[r];
             for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -1861,6 +1865,95 @@ static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, c
         }
     }
     if (staged) __syncthreads(); /* the next op may reuse the arena */
+}
+
+/* Lane partial sums of 2H rows -> each row's warp sum as sp_q8_gemv's butterfly forms it: a step
+ * pairs lane and lane ^ O in the same order (O = 16..1), each keeping half its rows (the upper half
+ * when bit O is set) and adding the partner's value of each; once one row is left, the plain
+ * butterfly. The row sum ends in v[0]. A template per step, so every index is a constant. */
+template <unsigned H, unsigned O> struct SpQ8RowsSum {
+    static __device__ __forceinline__ void run(float* v, unsigned lane) {
+        const bool up = lane & O;
+#pragma unroll
+        for (unsigned i = 0; i < H; i++) {
+            const float send = up ? v[i] : v[i + H];
+            v[i] = (up ? v[i + H] : v[i]) + __shfl_xor_sync(0xffffffffu, send, O);
+        }
+        SpQ8RowsSum<H / 2u, O / 2u>::run(v, lane);
+    }
+};
+template <unsigned O> struct SpQ8RowsSum<0u, O> {
+    static __device__ __forceinline__ void run(float* v, unsigned lane) {
+        v[0] += __shfl_xor_sync(0xffffffffu, v[0], O);
+        SpQ8RowsSum<0u, O / 2u>::run(v, lane);
+    }
+};
+template <> struct SpQ8RowsSum<0u, 0u> {
+    static __device__ __forceinline__ void run(float*, unsigned) {}
+};
+
+/* sp_q8_gemv's sums, faster: ROWS rows staged transposed ([k][ROWS + 4], rows from m zero), so a
+ * lane reads its element of four rows per conflict-free LDS.128; each read serves two columns; one
+ * SpQ8RowsSum per column instead of ROWS butterflies. */
+template <unsigned ROWS>
+static __device__ __forceinline__ void sp_q8_gemv_t(const float* __restrict__ x, const uint8_t* __restrict__ w,
+                                                    const SpQ8Epi& ep, unsigned m, unsigned n, unsigned k,
+                                                    unsigned slice, unsigned nblk) {
+    static_assert(ROWS >= 4u && ROWS <= 32u && (ROWS & (ROWS - 1u)) == 0, "rows");
+    constexpr unsigned LD = ROWS + 4u;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, blocks = k / 32u;
+#pragma unroll
+    for (unsigned r = 0; r < ROWS; r += 4u)
+        for (unsigned e = threadIdx.x; e < k; e += PLOW_NV_THREADS) {
+            float4 v;
+            v.x = r < m ? x[(size_t)r * k + e] : 0.f;
+            v.y = r + 1u < m ? x[(size_t)(r + 1u) * k + e] : 0.f;
+            v.z = r + 2u < m ? x[(size_t)(r + 2u) * k + e] : 0.f;
+            v.w = r + 3u < m ? x[(size_t)(r + 3u) * k + e] : 0.f;
+            *(float4*)(sp_smem + e * LD + r) = v;
+        }
+    __syncthreads();
+    unsigned row = 0; /* the row whose sum this lane ends with (32 / ROWS lanes per row) */
+#pragma unroll
+    for (unsigned h = ROWS / 2u, o = 16u; h >= 1u; h >>= 1, o >>= 1)
+        if (lane & o) row += h;
+    const bool store = row < m && (lane & (32u / ROWS - 1u)) == 0u;
+    const float4* xl = (const float4*)(sp_smem + lane * LD);
+    for (unsigned c0 = 2u * (slice * PLOW_NV_WARPS + warp); c0 < n; c0 += 2u * nblk * PLOW_NV_WARPS) {
+        const unsigned c1 = c0 + 1u < n ? c0 + 1u : c0;
+        const uint8_t* w0 = w + (size_t)c0 * blocks * 34u;
+        const uint8_t* w1 = w + (size_t)c1 * blocks * 34u;
+        float a0[ROWS], a1[ROWS];
+#pragma unroll
+        for (unsigned r = 0; r < ROWS; r++) a0[r] = a1[r] = 0.f;
+#pragma unroll 4
+        for (unsigned b = 0; b < blocks; b++) {
+            const uint8_t* b0 = w0 + b * 34u;
+            const uint8_t* b1 = w1 + b * 34u;
+            const float v0 = __fmul_rn(sp_f16(*(const uint16_t*)b0), (float)((const int8_t*)(b0 + 2))[lane]);
+            const float v1 = __fmul_rn(sp_f16(*(const uint16_t*)b1), (float)((const int8_t*)(b1 + 2))[lane]);
+            const float4* xb = xl + b * (8u * LD);
+#pragma unroll
+            for (unsigned q = 0; q < ROWS / 4u; q++) {
+                const float4 xv = xb[q];
+                a0[4u * q] = fmaf(xv.x, v0, a0[4u * q]);
+                a0[4u * q + 1u] = fmaf(xv.y, v0, a0[4u * q + 1u]);
+                a0[4u * q + 2u] = fmaf(xv.z, v0, a0[4u * q + 2u]);
+                a0[4u * q + 3u] = fmaf(xv.w, v0, a0[4u * q + 3u]);
+                a1[4u * q] = fmaf(xv.x, v1, a1[4u * q]);
+                a1[4u * q + 1u] = fmaf(xv.y, v1, a1[4u * q + 1u]);
+                a1[4u * q + 2u] = fmaf(xv.z, v1, a1[4u * q + 2u]);
+                a1[4u * q + 3u] = fmaf(xv.w, v1, a1[4u * q + 3u]);
+            }
+        }
+        SpQ8RowsSum<ROWS / 2u, 16u>::run(a0, lane);
+        SpQ8RowsSum<ROWS / 2u, 16u>::run(a1, lane);
+        if (store) {
+            ep(row, c0, a0[0]);
+            if (c1 != c0) ep(row, c1, a1[0]);
+        }
+    }
+    __syncthreads(); /* the next pass or op reuses the arena */
 }
 
 static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const float* __restrict__ x,
@@ -1875,10 +1968,24 @@ static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const
     const SpRowQ8 lb{w, k};
     const SpQ8Epi ep{out, bias, n, activation == 1u};
     if (path == 1u || (path == 0u && m <= SPQ_GEMV_ROWS)) {
-        /* Rows in groups of SPQ_GEMV_ROWS: each row sums exactly as it would in a launch of its own. */
-        for (unsigned r0 = 0; r0 < m; r0 += SPQ_GEMV_ROWS)
-            sp_q8_gemv(x + (size_t)r0 * k, w, SpQ8Epi{out + (size_t)r0 * n, bias, n, activation == 1u},
-                       m - r0 < SPQ_GEMV_ROWS ? m - r0 : SPQ_GEMV_ROWS, n, k, slice, nblk);
+        /* Rows in passes: each row sums exactly as it would in a launch of its own. */
+        for (unsigned r0 = 0; r0 < m;) {
+            const unsigned left = m - r0;
+            const float* xr = x + (size_t)r0 * k;
+            const SpQ8Epi pe{out + (size_t)r0 * n, bias, n, activation == 1u};
+            if (left > 16u && SPQ_T_FITS(32u, k)) {
+                sp_q8_gemv_t<32>(xr, w, pe, left < 32u ? left : 32u, n, k, slice, nblk);
+                r0 += 32u;
+            } else if (left > 8u && SPQ_T_FITS(16u, k)) {
+                sp_q8_gemv_t<16>(xr, w, pe, left < 16u ? left : 16u, n, k, slice, nblk);
+                r0 += 16u;
+            } else {
+                const unsigned rows = left < SPQ_GEMV_ROWS ? left : SPQ_GEMV_ROWS;
+                if (SPQ_T_FITS(SPQ_GEMV_ROWS, k)) sp_q8_gemv_t<SPQ_GEMV_ROWS>(xr, w, pe, rows, n, k, slice, nblk);
+                else sp_q8_gemv<SPQ_GEMV_ROWS>(xr, w, pe, rows, n, k, slice, nblk);
+                r0 += SPQ_GEMV_ROWS;
+            }
+        }
         return;
     }
     /* 64x64 tiles when 128x128 ones leave slices idle (the small-M conformer rows). */
@@ -3171,14 +3278,22 @@ static __device__ __forceinline__ void sp_relative_attention_rows(
             if (lane == 0) scores[kr - first] = s;
         }
         __syncthreads();
+        /* The exps in parallel, their sum in key order by one thread: the values and the order of the
+         * serial softmax (the sign of a zero maximum changes no exp). */
+        const unsigned n = last - first;
+        float mx = -INFINITY;
+        for (unsigned j = lane; j < n; j += 32u) mx = fmaxf(mx, scores[j]);
+        mx = sp_warp_max(mx);
+        for (unsigned j = threadIdx.x; j < n; j += PLOW_NV_THREADS) probs[j] = sp_expf(__fsub_rn(scores[j], mx));
+        __syncthreads();
         if (threadIdx.x == 0) {
-            float mx = -INFINITY;
-            for (unsigned kr = first; kr < last; kr++) mx = fmaxf(mx, scores[kr - first]);
             float den = 0.f;
-            for (unsigned kr = first; kr < last; kr++) den = __fadd_rn(den, sp_expf(__fsub_rn(scores[kr - first], mx)));
-            for (unsigned kr = first; kr < last; kr++)
-                probs[kr - first] = __fdiv_rn(sp_expf(__fsub_rn(scores[kr - first], mx)), den);
+            for (unsigned j = 0; j < n; j++) den = __fadd_rn(den, probs[j]);
+            scores[0] = den;
         }
+        __syncthreads();
+        const float den = scores[0];
+        for (unsigned j = threadIdx.x; j < n; j += PLOW_NV_THREADS) probs[j] = __fdiv_rn(probs[j], den);
         __syncthreads();
         for (unsigned c = threadIdx.x; c < hw; c += PLOW_NV_THREADS) {
             float acc = 0.f;
