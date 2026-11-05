@@ -65,6 +65,15 @@ static const size_t COLD_MB = 2048;
 static const size_t COLD_MB = 700; /* PX-9's own L2-cold budget */
 #endif
 
+/* PLOW_BENCH_SHAPE: one shape name, or a prefix ending in '*' (e.g. "e4b_*"). */
+static bool shape_skipped(const char* name) {
+    const char* filter = getenv("PLOW_BENCH_SHAPE");
+    if (!filter) return false;
+    const size_t n = strlen(filter);
+    if (n && filter[n - 1] == '*') return strncmp(filter, name, n - 1) != 0;
+    return strcmp(filter, name) != 0;
+}
+
 static int oracle_grid(unsigned T, int P) {
     for (int g = std::min<int>(P, (int)T); g >= 1; g--) if (T % (unsigned)g == 0) return g;
     return 1;
@@ -97,6 +106,14 @@ static const Shape SHAPES[] = {
     {"m26_local_q",4096,2816,0}, {"m26_local_kv",2048,2816,0},
     {"m26_local_o",2816,4096,0}, {"m26_global_q",8192,2816,0},
     {"m26_global_k",1024,2816,0}, {"m26_global_o",2816,8192,0},
+#endif
+#ifdef PLOW_BENCH_GEMMA4_E4B
+    /* segment_roles::CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES — Gemma-4 E4B projections (hidden 2560,
+     * inter 10240; sliding q 2048 / kv 512, full q 4096 / kv 1024; per-layer input 256 x 42). */
+    {"e4b_gate_or_up",10240,2560,0}, {"e4b_down",2560,10240,0},
+    {"e4b_local_q",2048,2560,0}, {"e4b_local_k_or_v",512,2560,0},
+    {"e4b_local_o",2560,2048,0}, {"e4b_global_q",4096,2560,0},
+    {"e4b_global_k_or_v",1024,2560,0}, {"e4b_global_o",2560,4096,0},
 #endif
 #ifdef PLOW_BENCH_GEMMA4_31B
     /* segment_roles::CUBLASLT_PREFILL_GEMMA4_31B_SHAPES — Gemma-4-31B dense projections
@@ -304,8 +321,7 @@ static void bench_plow(unsigned M, unsigned P) {
     printf("%-9s %6s %6s %6s %5s %6s %8s %9s\n","shape","M","T","G*","u","arm","ms","TFLOP/s");
     for (int si = 0; si < NSHAPE; si++) {
         const Shape& s = SHAPES[si];
-        const char* filter = getenv("PLOW_BENCH_SHAPE");
-        if (filter && strcmp(filter, s.name)) continue;
+        if (shape_skipped(s.name)) continue;
         unsigned bn = s.glu ? (unsigned)PGM_BN_GLU : (unsigned)PGM_BN;
         unsigned tm = (M + PGM_BM - 1)/PGM_BM, tn = (s.N + bn - 1)/bn;
         unsigned T = tm*tn;
@@ -362,8 +378,7 @@ static void bench_cublas(unsigned M) {
     printf("\n%-9s %6s %8s %9s\n","shape(cuBLASLt)","M","ms","TFLOP/s");
     for (int si = 0; si < NSHAPE; si++) {
         const Shape& s = SHAPES[si];
-        const char* filter = getenv("PLOW_BENCH_SHAPE");
-        if (filter && strcmp(filter, s.name)) continue;
+        if (shape_skipped(s.name)) continue;
         /* GLU shape measured as ONE bf16xbf16 matmul at its (N,K) — same simplification px9's
          * own k_bf16 control used; the two-B-stream GLU cost is ~2x this by construction (same
          * A ring, same mma throughput, just two independent accumulations) so this is still a
@@ -682,8 +697,7 @@ static void bench_w8a8(unsigned M) {
                cublasLtGetVersion());
     for (int si = 0; si < NSHAPE; si++) {
         const Shape& s = SHAPES[si];
-        const char* filter = getenv("PLOW_BENCH_SHAPE");
-        if (filter && strcmp(filter, s.name)) continue;
+        if (shape_skipped(s.name)) continue;
         const size_t wn = (size_t)s.N * s.K;
         int nrep = (int)std::max<size_t>(2, ((size_t)COLD_MB << 20) / std::max<size_t>(wn, 1));
         nrep = std::min(nrep, 16);

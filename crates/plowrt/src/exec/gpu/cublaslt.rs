@@ -1087,9 +1087,13 @@ pub(super) fn prefill_glu_quant_segments(g: &DevProg, any_width: bool) -> Vec<(u
         .collect()
 }
 
-/// Segments that are exactly one plain (no GLU) QuantFp8 over a 4096- or 8192-wide row, all
-/// slices: `plow_quant_cached` runs it one row per CTA.
-pub(super) fn prefill_plain_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
+/// Segments that are exactly one plain (no GLU, no group scale) QuantFp8 over a 4096- or
+/// 8192-wide row (`any_width`, object ABI 2: any 8-aligned width below 4096), all slices:
+/// `plow_quant_cached` runs it one row per CTA.
+pub(super) fn prefill_plain_quant_segments(
+    g: &DevProg,
+    any_width: bool,
+) -> Vec<(usize, Vec<usize>)> {
     let none = packet::dev::TENSOR_NONE16;
     g.gq_seg_ofs
         .windows(2)
@@ -1100,8 +1104,10 @@ pub(super) fn prefill_plain_quant_segments(g: &DevProg) -> Vec<(usize, Vec<usize
             let d = g.insts.get(inst)?;
             let matches = d.op == DevOp::QuantFp8 as u16
                 && d.i[0] >= 32
-                && matches!(d.i[1], 4096 | 8192)
+                && (matches!(d.i[1], 4096 | 8192)
+                    || any_width && d.i[1] < 4096 && d.i[1] != 0 && d.i[1] % 8 == 0)
                 && d.i[2] == 0
+                && d.i[3] == 0
                 && d.t[..3].iter().all(|&t| t != none)
                 && d.t[3] == none
                 && d.t[4] == none

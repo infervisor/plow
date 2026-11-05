@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build and run the Gemma-4 per-kernel ROUTE MATRIX on sm_90a: for every dense projection shape
-# of the 12B, the 26B-A4B and the 31B, plow's shipped ws384 GEMM body vs cuBLASLt, in BOTH precisions.
+# of the 12B, the 26B-A4B, the 31B and the E4B, plow's shipped ws384 GEMM body vs cuBLASLt, in BOTH precisions.
 #
 #   bf16 arm : k_ws384 <PROD,false>  vs  cuBLASLt bf16          (the shipped BF16 route pair)
 #   w8a8 arm : k_ws384_fp8 <PROD,true> vs cuBLASLt e4m3 with
@@ -21,7 +21,7 @@
 #   unset              both, in order
 #   ROUTE_TC64=1       W8A8 only, default M64; M128 probes two TC64 passes vs quantization + Lt
 #   ROUTE_ARM=bf16|w8a8|both  compile/run one or both precisions (default both)
-#   PLOW_BENCH_SHAPE=name   queue just one named shape (for example g12_lmhead)
+#   PLOW_BENCH_SHAPE=name   queue just one named shape (for example g12_lmhead), or a prefix* (e4b_*)
 set -euo pipefail
 : "${ROCM_PATH:?run inside nix develop}" "${CUDA_PATH:?CUDA toolkit missing}"
 : "${PLOW_NVCC:?Nix nvcc missing}" "${PLOW_NVCC_PATH:?Nix nvcc PATH missing}"
@@ -54,7 +54,7 @@ common=(
   # rejected there before the real sm_90a pass ever runs. -gencode emits SASS only.
   -std=c++17 -gencode arch=compute_90a,code=sm_90a -O3 -Xptxas=-v
   -I "$root/runtime/common" -I "$root/runtime/nvidia"
-  -DPLOW_BENCH_WS384=1 -DPLOW_BENCH_GEMMA4_ALL=1 -DPLOW_BENCH_GEMMA4_26B=1 -DPLOW_BENCH_GEMMA4_31B=1
+  -DPLOW_BENCH_WS384=1 -DPLOW_BENCH_GEMMA4_ALL=1 -DPLOW_BENCH_GEMMA4_26B=1 -DPLOW_BENCH_GEMMA4_31B=1 -DPLOW_BENCH_GEMMA4_E4B=1
   -DPGM90_TMA_STAGES=3 -DPGM90_WS384_PREFETCH=1 -DPGM90_WS384_ISSUE_CURSOR=1
   -DPGM90_WS384_SMEPI=0
   -DPLOW_NV_GEMM_ONLY=1
