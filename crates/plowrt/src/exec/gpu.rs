@@ -8923,6 +8923,10 @@ impl GpuEngine {
     pub fn reuse_slot_prefix(&mut self, b: usize, keys: &[u64]) -> usize {
         let backing = self.slot_prefix_backing(b);
         let rows = self.slot_prefixes.take(b, keys, backing);
+        let tail = (self.pf_compact() && self.packed_padding_limit().is_none())
+            .then(|| self.prefill.first().map(|p| p.t as usize))
+            .flatten();
+        let rows = prefix::prefix_with_tail_room(rows, self.max_ctx, tail);
         if !self.slot_prefix_reuse_supported() {
             return 0;
         }

@@ -12,6 +12,10 @@ use super::GpuEngine;
 
 const SPEECH_IDENTITIES: usize = 1 << 20;
 
+pub(super) fn prefix_with_tail_room(rows: usize, max_ctx: usize, tail: Option<usize>) -> usize {
+    rows.min(max_ctx.saturating_sub(tail.unwrap_or(0)))
+}
+
 pub(super) struct SpeechIdentities {
     next: u32,
     rows: rustc_hash::FxHashMap<u64, u32>,
@@ -1251,7 +1255,32 @@ fn prompt_end_covers_the_withheld_last_token() {
 
 #[cfg(test)]
 mod slot_prefix_tests {
-    use super::{SlotPrefixes, SpeechIdentities};
+    use super::{prefix_with_tail_room, SlotPrefixes, SpeechIdentities};
+
+    #[test]
+    fn compact_prefix_leaves_a_physical_bucket_for_unmasked_tail_replay() {
+        use plow_asset::packed_prefill::{plan_with_limit, Request};
+        let start = prefix_with_tail_room(2039, 2048, Some(64));
+        assert_eq!(start, 1984);
+        for (start, masked, ok) in [
+            (2039, None, false),
+            (start, None, true),
+            (2039, Some(64), true),
+        ] {
+            let request = Request {
+                slot: 0,
+                start,
+                len: 2040 - start,
+                prompt: 2040,
+            };
+            assert_eq!(
+                plan_with_limit(&[request], &[start as u32], 64, 2048, masked).is_ok(),
+                ok
+            );
+        }
+        assert_eq!(prefix_with_tail_room(36, 2048, Some(64)), 36);
+        assert_eq!(prefix_with_tail_room(2039, 2048, None), 2039);
+    }
 
     #[test]
     fn reclaimed_slot_prefix_is_refused_even_after_the_slot_is_mapped_again() {

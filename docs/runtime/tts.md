@@ -45,6 +45,7 @@ Short-context live KV may instead commit whole private slots. Those slots can re
 within the existing released-memory cap. A residency generation invalidates keys and staged
 resumes after reclamation or reassignment; idle lanes write beyond the retained prefix. Sliding
 and recurrent caches remain excluded from this slot reuse route.
+Unmasked compact tails leave room for the smallest prefill bucket when choosing a retained prefix.
 
 Depth speaker-conditioning inputs also stay resident per slot. Rebinding the same immutable
 speaker allocation (or null speaker) resets the request's controller while reusing its uploaded

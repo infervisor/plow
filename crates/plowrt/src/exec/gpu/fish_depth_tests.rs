@@ -344,6 +344,68 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
         draw(&mut e, &outputs, step);
     }
 
+    // A retained tail near max_ctx must also fit the packet's unmasked prefill bucket.
+    if !shared {
+        let n = e.max_ctx - 8;
+        let mut prompt: Vec<_> = (0..n)
+            .map(|i| (31 + i as u32 * 7919) % contract.input_vocab)
+            .collect();
+        if let Some(token) = contract.decode_token {
+            prompt[3] = token;
+        }
+        let keys: Vec<_> = (0..n as u64).map(|i| i + 9000).collect();
+        e.admit_packed_slot(2, &prompt, n + 8).unwrap().unwrap();
+        while (e.pos[2] as usize) < n {
+            let start = e.pos[2] as usize;
+            let end = (start + e.pf_max_rows()).min(n);
+            let requests = [Request {
+                id: 2,
+                slot: 2,
+                state_slot: 2,
+                generation: e.slot_generation(2).unwrap(),
+                phase: Phase::Prefill,
+                tokens: &prompt[start..end],
+                prompt_len: n as u32,
+                selection: Selection::default(),
+            }];
+            e.token_batch_step_staged(&requests, &mut outputs, None, &mut |_| {}, &mut |e, p| {
+                upload_inputs(e, &m, p)
+            })
+            .unwrap();
+        }
+        let mut fresh = Vec::new();
+        e.logits_row(0, &mut fresh).unwrap();
+        e.keep_slot_prefix(2, e.slot_prefix_epoch(), keys.clone());
+        e.retire_slot(2, false);
+        let cached = e.reuse_slot_prefix(2, &keys);
+        assert!(cached > 0 && cached < n);
+        assert_eq!(e.resume_slot(2, cached), cached);
+        assert_eq!(
+            e.admit_packed_slot(2, &prompt, n + 8).unwrap(),
+            Some(cached)
+        );
+        let requests = [Request {
+            id: 2,
+            slot: 2,
+            state_slot: 2,
+            generation: e.slot_generation(2).unwrap(),
+            phase: Phase::Prefill,
+            tokens: &prompt[cached..],
+            prompt_len: n as u32,
+            selection: Selection::default(),
+        }];
+        e.token_batch_step_staged(&requests, &mut outputs, None, &mut |_| {}, &mut |e, p| {
+            upload_inputs(e, &m, p)
+        })
+        .unwrap();
+        let mut resumed = Vec::new();
+        e.logits_row(0, &mut resumed).unwrap();
+        assert_eq!(
+            fresh, resumed,
+            "near-limit retained tail changed the output"
+        );
+    }
+
     e.retire_slot(0, false);
     let mut changed = keys_b.clone();
     changed[0] ^= 1;
