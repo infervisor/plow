@@ -23,12 +23,12 @@ def save(path, value):
     temporary.replace(path)
 
 
-def gpu_count():
-    """Cards on the box as gpulease counts them (nvidia-smi -L lines; one amd-smi process entry per GPU)."""
-    if Path("/dev/nvidiactl").exists():
+def gpu_count(vendor=None):
+    """Cards in the vendor's pool as gpulease counts them (nvidia-smi -L lines; one amd-smi process entry per GPU)."""
+    if Path("/dev/nvidiactl").exists() and vendor != "amd":
         smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
         return None if smi.returncode else len(smi.stdout.splitlines())
-    if Path("/dev/kfd").exists():
+    if Path("/dev/kfd").exists() and vendor != "nvidia":
         smi = subprocess.run(["amd-smi", "process", "--json"], capture_output=True, text=True)
         try:
             return None if smi.returncode else len([e for e in json.loads(smi.stdout) if "gpu" in e])
@@ -37,11 +37,11 @@ def gpu_count():
     return None
 
 
-def tenant_blocks(audit, ngpu):
+def tenant_blocks(audit, ngpu, vendor=None):
     """True unless `ngpu` cards are free of foreign processes (gpulease leases around them)."""
     if audit.strip() == "GPU: no foreign compute procs":
         return False
-    total = gpu_count()
+    total = gpu_count(vendor)
     if not total:
         return True
     busy = {line.split(":")[0] for line in audit.splitlines() if line.startswith("gpu")}
@@ -70,9 +70,13 @@ def work(root):
             idle = time.monotonic()
             # Do not run a benchmark alongside a server that bypassed the lease locks.
             metal = platform.system() == "Darwin"
-            audit = None if metal else subprocess.run([str(LEASE), "--audit"], capture_output=True, text=True)
             path, job = pending[0]
-            if audit is not None and (audit.returncode or tenant_blocks(audit.stdout, job["ngpu"])):
+            # Mixed NVIDIA+AMD box: gpulease keeps one pool per vendor and refuses a lease without one.
+            vendor = ["--vendor", job["vendor"]] if job.get("vendor") else []
+            # Named cards (possibly both vendors): gpulease waits for exactly those and audits them.
+            devices = job.get("devices")
+            audit = None if metal or devices else subprocess.run([str(LEASE), *vendor, "--audit"], capture_output=True, text=True)
+            if audit is not None and (audit.returncode or tenant_blocks(audit.stdout, job["ngpu"], job.get("vendor"))):
                 time.sleep(5)
                 continue
             job.update(state="running", runner_pid=os.getpid(), started=time.time())
@@ -87,7 +91,8 @@ def work(root):
                 if metal:
                     metal_lock = open("/tmp/plow-metal-gpu.lock", "a")
                     fcntl.flock(metal_lock, fcntl.LOCK_EX)
-                command = job["command"] if metal else [str(LEASE), "-n", str(job["ngpu"]), job["label"], *job["command"]]
+                lease = ["--devices", devices] if devices else [*vendor, "-n", str(job["ngpu"])]
+                command = job["command"] if metal else [str(LEASE), *lease, job["label"], *job["command"]]
                 child = subprocess.Popen(command,
                                          cwd=job["cwd"], env=child_env, stdout=log, stderr=subprocess.STDOUT)
                 job["pid"] = child.pid
@@ -102,7 +107,11 @@ def work(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path("/tmp/plow-gpuq"))
+    parser.add_argument("--root", type=Path)
+    parser.add_argument("--vendor", choices=["nvidia", "amd"], default=os.environ.get("GPU_LEASE_VENDOR") or None,
+                        help="lease pool on a mixed NVIDIA+AMD box; default queue root /tmp/plow-gpuq.<vendor>")
+    parser.add_argument("--devices", help="exact cards, e.g. nvidia:0,amd:1 (either vendor or both); "
+                        "the ngpu argument must equal their count; default queue root /tmp/plow-gpuq.devices")
     sub = parser.add_subparsers(dest="action", required=True)
     submit = sub.add_parser("submit")
     submit.add_argument("label")
@@ -111,7 +120,8 @@ def main():
     sub.add_parser("run")
     sub.add_parser("status")
     args = parser.parse_args()
-    root = args.root.resolve()
+    pool = "devices" if args.devices else args.vendor
+    root = (args.root or Path("/tmp/plow-gpuq" + (f".{pool}" if pool else ""))).resolve()
     root.mkdir(parents=True, exist_ok=True)
     if args.action == "run":
         work(root)
@@ -126,13 +136,16 @@ def main():
             parser.error("Metal uses one shared device")
         if args.ngpu < 1 or not args.command:
             parser.error("submit needs a positive GPU count and a command")
+        if args.devices and len(args.devices.split(",")) != args.ngpu:
+            parser.error("--devices names a different number of cards than ngpu")
         try:
             lease_timeout = int(os.environ.get("GPU_LEASE_TIMEOUT", LEASE_TIMEOUT))
         except ValueError:
             parser.error("GPU_LEASE_TIMEOUT must be whole seconds")
         job_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         save(root / (job_id + ".json"), dict(state="queued", label=args.label, ngpu=args.ngpu,
-             command=args.command, cwd=os.getcwd(), submitted=time.time(), lease_timeout=lease_timeout))
+             command=args.command, cwd=os.getcwd(), submitted=time.time(), lease_timeout=lease_timeout,
+             vendor=args.vendor, devices=args.devices))
         with (root / "runner.log").open("ab") as log:
             subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--root", str(root), "run"],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

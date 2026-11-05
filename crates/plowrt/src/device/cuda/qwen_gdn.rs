@@ -1,7 +1,7 @@
 use super::aot::{Exemplar, Image, Kernel, Launch, Manifest};
-use super::{CudaBackend, CudaStream};
+use super::{CudaBackend, CudaStream, KernelFn};
 use crate::{
-    device::{Backend, DeviceMem},
+    device::{Backend, DeviceMem, Module},
     Result, RuntimeError,
 };
 use std::{path::Path, sync::Arc};
@@ -17,6 +17,10 @@ pub(crate) const MAX_SEQS: usize = 64;
 /// The packet object (`scripts/build_sm90a_qwen_gdn.py`) and the host stub this file implements.
 pub(crate) const OBJECT: &str = "plow_gdn_prefill.aot";
 const ENTRY: &str = "gdn_prefill";
+/// The native packet cubin (runtime/nvidia/gdn_prefill_sm120.cu) every non-Hopper CUDA target
+/// loads: one 88-byte `GdnPrefillArgs` parameter, grid (8, 48, nseq) x 128 threads.
+pub(crate) const OBJECT_NATIVE: &str = "gdn_prefill_sm120.cubin";
+const NATIVE_ENTRY: &str = "gdn_prefill_sm120";
 const HOST_STUB: &str = "gdn_sm90_prefill";
 const HOST_STUB_VERSION: u32 = 1;
 const ABI: &str = "plow_gdn_prefill:v1:hk=16:hv=48:d=128:dtype=bf16:state=f32_vk";
@@ -229,10 +233,38 @@ fn exemplar_operands(x: &Exemplar) -> Result<(u64, u64, Operands)> {
     ))
 }
 
+enum Imp {
+    /// sm_90: the CuTe export, its launch rebuilt by the host stub against the manifest.
+    Aot {
+        kernel: Kernel,
+        launch: Launch,
+        maps: DeviceMem,
+    },
+    Native {
+        module: Module,
+        f: KernelFn,
+    },
+}
+
+/// `GdnPrefillArgs` (runtime/nvidia/gdn_prefill_sm120.h): nine pointers, tokens, nseq, scale.
+fn native_args(tokens: u64, nseq: u64, p: &Operands) -> [u8; 88] {
+    let mut a = [0u8; 88];
+    for (i, ptr) in [
+        p.q, p.k, p.v, p.o, p.alpha, p.beta, p.state, p.initial, p.offsets,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        a[i * 8..i * 8 + 8].copy_from_slice(&ptr.to_le_bytes());
+    }
+    a[72..76].copy_from_slice(&(tokens as u32).to_le_bytes());
+    a[76..80].copy_from_slice(&(nseq as u32).to_le_bytes());
+    a[80..84].copy_from_slice(&0x3db5_04f3_u32.to_le_bytes());
+    a
+}
+
 pub(crate) struct NativeGdn {
-    kernel: Kernel,
-    launch: Launch,
-    maps: DeviceMem,
+    imp: Imp,
     /// `{0, tokens}` cu_seqlens per single-sequence token count.
     offsets: DeviceMem,
     /// cu_seqlens of the current packed launch (device, MAX_SEQS + 1 i64) and its host image,
@@ -244,17 +276,32 @@ pub(crate) struct NativeGdn {
 }
 
 impl NativeGdn {
-    pub(crate) fn load(backend: Arc<CudaBackend>, path: &Path) -> Result<Self> {
+    /// The CuTe export on sm_90 (TMA/WGMMA), the native cubin on every other CUDA target.
+    pub(crate) fn load(backend: Arc<CudaBackend>, assets: &Path) -> Result<Self> {
         backend.bind()?;
-        let kernel = load_kernel(&backend, path)?;
-        let launch = Launch::new(&kernel.layout);
+        let imp = if backend.compute_capability() == (9, 0) {
+            let kernel = load_kernel(&backend, &assets.join(OBJECT))?;
+            let launch = Launch::new(&kernel.layout);
+            let maps = backend.alloc(backend.device_ordinal, MAP_BYTES)?;
+            if maps.base % 128 != 0 {
+                return Err(RuntimeError::Device(
+                    "native GDN maps require 128-byte alignment".into(),
+                ));
+            }
+            Imp::Aot {
+                kernel,
+                launch,
+                maps,
+            }
+        } else {
+            let path = assets.join(OBJECT_NATIVE);
+            let image =
+                std::fs::read(&path).map_err(|e| rejected(format!("{}: {e}", path.display())))?;
+            let module = Backend::module_load(&*backend, &image)?;
+            let f = backend.get_function(&module, NATIVE_ENTRY)?;
+            Imp::Native { module, f }
+        };
         let cu = backend.alloc(backend.device_ordinal, ((MAX_SEQS + 1) * 8) as u64)?;
-        let maps = backend.alloc(backend.device_ordinal, MAP_BYTES)?;
-        if maps.base % 128 != 0 {
-            return Err(RuntimeError::Device(
-                "native GDN maps require 128-byte alignment".into(),
-            ));
-        }
         let offsets = backend.alloc(backend.device_ordinal, (MAX_TOKENS * 16) as u64)?;
         let mut pairs = Vec::with_capacity(MAX_TOKENS * 16);
         for tokens in 1..=MAX_TOKENS {
@@ -263,9 +310,7 @@ impl NativeGdn {
         }
         backend.memcpy_htod(offsets.base, &pairs)?;
         Ok(Self {
-            kernel,
-            launch,
-            maps,
+            imp,
             offsets,
             cu,
             cu_host: Vec::with_capacity(MAX_SEQS + 1),
@@ -289,7 +334,7 @@ impl NativeGdn {
         }
         self.backend.bind()?;
         self.stream = Some(stream.raw);
-        let p = Operands {
+        let mut p = Operands {
             q: tensors[0].base,
             k: tensors[1].base,
             v: tensors[2].base,
@@ -298,17 +343,32 @@ impl NativeGdn {
             beta: tensors[5].base,
             state: tensors[6].base,
             initial: tensors[7].base,
-            maps: self.maps.base,
+            maps: 0,
             offsets,
         };
-        build(
-            &self.backend,
-            &mut self.launch,
-            tokens as u64,
-            nseq as u64,
-            &p,
-        )?;
-        self.kernel.launch(&self.backend, &mut self.launch, stream)
+        match &mut self.imp {
+            Imp::Aot {
+                kernel,
+                launch,
+                maps,
+            } => {
+                p.maps = maps.base;
+                build(&self.backend, launch, tokens as u64, nseq as u64, &p)?;
+                kernel.launch(&self.backend, launch, stream)
+            }
+            Imp::Native { f, .. } => {
+                let mut args = native_args(tokens as u64, nseq as u64, &p);
+                let mut params = [args.as_mut_ptr() as *mut std::ffi::c_void];
+                self.backend.launch_kernel_grid(
+                    *f,
+                    [8, 48, nseq as u32],
+                    128,
+                    0,
+                    &mut params,
+                    Some(stream),
+                )
+            }
+        }
     }
 
     /// Enqueues BF16 Q/K/V/output, F32 alpha/beta, and F32 V-first states, then copies the
@@ -436,6 +496,9 @@ impl Drop for NativeGdn {
         // Destruction is cold; retire queued work before the module unloads.
         if self.backend.bind().is_ok() {
             let _ = self.backend.synchronize();
+            if let Imp::Native { module, .. } = &self.imp {
+                let _ = self.backend.module_unload(module);
+            }
         }
     }
 }
@@ -488,11 +551,11 @@ mod tests {
     /// initial state after the launch) under `GDN_AOT_DIR` for a byte comparison against another
     /// route, and prints the mean launch time over 20 back-to-back launches.
     #[test]
-    #[ignore = "requires a leased SM90 GPU; GDN_AOT_DIR=<dir holding plow_gdn_prefill.aot>"]
+    #[ignore = "requires a leased GPU; GDN_AOT_DIR=<dir holding plow_gdn_prefill.aot (sm_90) or gdn_prefill_sm120.cubin>"]
     fn layer_dump() -> Result<()> {
         let dir = std::path::PathBuf::from(std::env::var("GDN_AOT_DIR").expect("GDN_AOT_DIR"));
         let be = Arc::new(CudaBackend::new(0)?);
-        let mut g = NativeGdn::load(be.clone(), &dir.join(OBJECT))?;
+        let mut g = NativeGdn::load(be.clone(), &dir)?;
         let stream = be.stream_create()?;
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move |lo: f32, hi: f32| {

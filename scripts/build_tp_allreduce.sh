@@ -6,15 +6,16 @@
 #   tp_allreduce_bench         one-shot host harness
 #   tp_allreduce_prefill_bench configurable transformer-prefill two-shot host harness
 #
-# Same toolchain contract as build_tp_p2p.sh: nix-shell hipcc for the device code,
-# the SYSTEM gcc in a CLEAN env for the host.
+# Build inside nix develop for both device and host code.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 R="$REPO/runtime"
 OUT="${1:-${PLOW_BUILD_DIR:-/tmp/tpar}}"
 ARCH="${PLOW_HIP_ARCH:-gfx950}"
-BUN="${PLOW_BUNDLER:-/opt/rocm/lib/llvm/bin/clang-offload-bundler}"
+: "${ROCM_PATH:?run inside nix develop}"
+BUN="${PLOW_BUNDLER:-$ROCM_PATH/llvm/bin/clang-offload-bundler}"
+HIPCC="${PLOW_HIPCC:-hipcc}"
 mkdir -p "$OUT"; cd "$OUT"
 
 rm -f tp_allreduce.co tp_allreduce_kernels.elf tp_allreduce_bench tp_allreduce_prefill_bench
@@ -44,31 +45,30 @@ esac
 [ -n "${PLOW_XR_EXTRA_DEFS:-}" ] && read -r -a _extra <<<"$PLOW_XR_EXTRA_DEFS" && XR_DEF+=("${_extra[@]}")
 # The sequence-parallel seam halves (ops 25/26) ride the same object for tp_seqpar_smoke.
 XR_DEF+=("-DPLOW_SEQ_PAR_SEAMS=1")
-hipcc --offload-arch="$ARCH" -O3 -w "${XR_DEF[@]}" --genco \
+ARCH_FLAGS=()
+[ "$ARCH" = gfx1201 ] && ARCH_FLAGS+=(-mwavefrontsize64 -mcumode)
+"$HIPCC" "${ARCH_FLAGS[@]}" --offload-arch="$ARCH" -O3 -w "${XR_DEF[@]}" --genco \
     "$R/tests/tp_allreduce_kernels.hip" -o tp_allreduce.co
 "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
        --input=tp_allreduce.co --output=tp_allreduce_kernels.elf
 
-# Host harness with system gcc, clean env.
-/usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" /usr/bin/gcc -O2 -std=gnu11 -o tp_allreduce_bench \
+# Host harnesses use the pinned Nix compiler.
+cc -O2 -std=gnu11 -o tp_allreduce_bench \
     "$R/tests/tp_allreduce_bench.c" "$R/amd/hsa_backend.c" \
-    -I/opt/rocm/include -L/opt/rocm/lib -lhsa-runtime64 -lm
-/usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" /usr/bin/gcc -O2 -std=gnu11 \
+    -I"$ROCM_PATH/include" -L"$ROCM_PATH/lib" -lhsa-runtime64 -lm
+cc -O2 -std=gnu11 \
     -o tp_allreduce_prefill_bench \
     "$R/tests/tp_allreduce_prefill_bench.c" "$R/amd/hsa_backend.c" \
-    -I/opt/rocm/include -L/opt/rocm/lib -lhsa-runtime64 -lm
-/usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" /usr/bin/gcc -O2 -std=gnu11 \
+    -I"$ROCM_PATH/include" -L"$ROCM_PATH/lib" -lhsa-runtime64 -lm
+cc -O2 -std=gnu11 \
     -o tp_seqpar_smoke \
     "$R/tests/tp_seqpar_smoke.c" "$R/amd/hsa_backend.c" \
-    -I/opt/rocm/include -L/opt/rocm/lib -lhsa-runtime64 -lm
-readelf -d tp_allreduce_bench | grep -qi runpath && { echo "FAIL: RUNPATH leaked"; exit 1; }
-readelf -d tp_allreduce_prefill_bench | grep -qi runpath && { echo "FAIL: RUNPATH leaked"; exit 1; }
-readelf -d tp_seqpar_smoke | grep -qi runpath && { echo "FAIL: RUNPATH leaked"; exit 1; }
+    -I"$ROCM_PATH/include" -L"$ROCM_PATH/lib" -lhsa-runtime64 -lm
 
 ls -l --time-style=+%H:%M:%S tp_allreduce_kernels.elf tp_allreduce_bench \
     tp_allreduce_prefill_bench \
   | awk '{print "   ", $NF, $5"B", $6}'
-echo "run:  (cd $OUT && /usr/bin/env -i PATH=/usr/bin:/bin HOME=\$HOME LD_LIBRARY_PATH=/opt/rocm/lib ./tp_allreduce_bench 1 2 3)"
+echo "run inside nix develop: (cd $OUT && LD_LIBRARY_PATH=\$ROCM_PATH/lib ./tp_allreduce_bench 0 1)"
 echo "      rank count = number of device ids; env TP_HIDDEN (default 7168) TP_ITERS TP_ELF"
 echo "prefill: (cd $OUT && ./tp_allreduce_prefill_bench 0 1 2 3 4 5 6 7)  PLOW_XR_AGG=${PLOW_XR_AGG:-0}"
 echo "         PLOW_XR_WAVE_RS=${PLOW_XR_WAVE_RS:-0}"

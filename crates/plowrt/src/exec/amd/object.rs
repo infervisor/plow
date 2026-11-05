@@ -556,6 +556,16 @@ pub(super) fn check_compiled_opcode_markers<'a>(
     progs: impl IntoIterator<Item = &'a DevProg>,
 ) -> Result<()> {
     for prog in progs {
+        if (prog.role.is_packed_sibling() || prog.role.is_token_batch_body())
+            && prog
+                .insts
+                .iter()
+                .any(|inst| packet::dev::uses_residual_f32(inst.op, inst.i[6]))
+        {
+            return Err(RuntimeError::Rejected(
+                "FP32 residual state is unsupported by packed/token-batch objects".into(),
+            ));
+        }
         for inst in &prog.insts {
             if inst.op == DevOp::MlaBmmFp8 as u16 && inst.i[5] != 0 {
                 if !(1..32).contains(&inst.i[0])
@@ -689,6 +699,39 @@ pub(super) fn check_compiled_opcode_markers<'a>(
                 "packet/object MISMATCH: BF16-rounded SiLU requires `plow_glu_silu_bf16_1` in {}",
                 path.display()
             )));
+        }
+        if prog
+            .insts
+            .iter()
+            .any(|inst| packet::dev::uses_residual_f32(inst.op, inst.i[6]))
+            && !syms.contains(&"plow_residual_f32_1")
+        {
+            return Err(RuntimeError::Device(format!(
+                "packet/object MISMATCH: FP32 residual state requires `plow_residual_f32_1` in {}",
+                path.display()
+            )));
+        }
+        for inst in prog
+            .insts
+            .iter()
+            .filter(|d| packet::dev::xreduce_partial_f32(d.op, d.fj[0]))
+        {
+            if !syms.contains(&"plow_xr_partial_f32_1") {
+                return Err(RuntimeError::Device(format!(
+                    "packet/object MISMATCH: FP32 peer partials require `plow_xr_partial_f32_1` in {}", path.display())));
+            }
+            if inst.i[0] == 0
+                || inst.i[1] < 2
+                || inst.i[2] % 4 != 0
+                || inst.i[4..].iter().any(|&v| v != 0)
+                || inst.t[0] == packet::dev::TENSOR_NONE16
+                || inst.t[1..].iter().any(|&t| t != packet::dev::TENSOR_NONE16)
+                || inst.fj[1] != 0
+            {
+                return Err(RuntimeError::Device(
+                    "invalid FP32 peer partial collective".into(),
+                ));
+            }
         }
         let required = prog
             .insts
@@ -1127,10 +1170,14 @@ pub(super) fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
     // without its arms sailed through and completed with garbage (measured: a
     // PLOW_MOE_PF_PART16 blob ran on a pre-arm object with no complaint — the exact
     // silent-heap-overrun the check exists to refuse). A blob carries exactly one AMD key, so
-    // probing both is unambiguous.
-    Ok(["/backends/gfx942/requires", "/backends/gfx950/requires"]
-        .iter()
-        .find_map(|k| man.pointer(k))
+    // taking the one `gfx*` backend is unambiguous.
+    Ok(man
+        .get("backends")
+        .and_then(|b| b.as_object())
+        .and_then(|b| {
+            b.iter()
+                .find_map(|(k, v)| k.starts_with("gfx").then(|| v.get("requires")).flatten())
+        })
         .and_then(|r| r.as_array())
         .map(|a| {
             a.iter()

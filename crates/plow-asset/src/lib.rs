@@ -730,6 +730,7 @@ pub mod splitk;
 pub mod knob;
 pub mod knob_gen;
 pub mod kv_contract;
+pub mod kv_image;
 pub mod live_kv;
 pub mod mixed_step;
 

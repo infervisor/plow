@@ -173,6 +173,11 @@ pub struct EmitConfig {
     #[arg(skip)]
     pub packed_prefill_default: bool,
 
+    /// `emit_packed_prefill` was set by the sm_120a FP8-KV production default rather than the
+    /// recipe: a packet the contract does not fit declines it instead of failing the emit.
+    #[arg(skip)]
+    pub packed_prefill_fp8kv_default: bool,
+
     /// Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs in their own gfx950 segment.
     /// Default on; `=0` is the rollback to the interpreter-resident pair.
     #[arg(long = "emit-decode-mla-segments", env = "PLOW_SEG_DECODE_MLA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -308,6 +313,14 @@ pub struct EmitConfig {
     /// Disable norm+residual+norm fusion.
     #[arg(long, env = "PLOW_NO_FUSE_NRN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub no_fuse_nrn: bool,
+
+    /// Keep residual state in FP32 while projections and KV remain BF16.
+    #[arg(long, env = "PLOW_RESIDUAL_F32", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub residual_f32: bool,
+
+    /// Keep prefill O and decode down-projection partials in FP32 until one-shot all-reduce.
+    #[arg(long, env = "PLOW_TP_PARTIAL_F32", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub tp_partial_f32: bool,
 
     /// Fuse head-norm + reduce.
     #[arg(long, env = "PLOW_FUSE_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1911,6 +1924,7 @@ impl EmitConfig {
             seg_fa256_gqa2: env_bool_opt("PLOW_SEG_FA256_GQA2"),
             emit_packed_prefill: env_bool_opt("PLOW_EMIT_PACKED_PREFILL"),
             packed_prefill_default: false,
+            packed_prefill_fp8kv_default: false,
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
             // value; direct legacy callers must name the feature explicitly.
             decode_mla_segments: env_bool("PLOW_SEG_DECODE_MLA"),
@@ -1935,6 +1949,8 @@ impl EmitConfig {
             no_fuse_qkv: env_bool("PLOW_NO_FUSE_QKV"),
             fuse_qkv_fp8: env_bool("PLOW_FUSE_QKV_FP8"),
             no_fuse_nrn: env_bool("PLOW_NO_FUSE_NRN"),
+            residual_f32: env_bool("PLOW_RESIDUAL_F32"),
+            tp_partial_f32: env_bool("PLOW_TP_PARTIAL_F32"),
             fuse_hnr: env_bool("PLOW_FUSE_HNR"),
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),

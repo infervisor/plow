@@ -38,6 +38,7 @@ typedef struct {
     hsa_amd_memory_pool_t vram;
     hsa_queue_t*         queue;
     hsa_signal_t         done;     /* counting: +1 per dispatch, -1 on completion */
+    hsa_fence_scope_t    dispatch_scope;
     hsa_executable_t     exe;
     int                  has_exe;
     plow_hsa_module*      modules;
@@ -114,6 +115,17 @@ plow_hsa* plow_hsa_init(void) {
 
     for (int i = 0; i < h->n_dev; i++) {
         plow_dev_t* d = &h->dev[i];
+        uint32_t wavefront_size = 0;
+        s = hsa_agent_get_info(d->agent, HSA_AGENT_INFO_WAVEFRONT_SIZE, &wavefront_size);
+        if (s != HSA_STATUS_SUCCESS) {
+            set_err("agent wavefront size", s);
+            free(h);
+            return NULL;
+        }
+        /* RDNA's native wave32 identifies the agent even for wave64 objects.
+         * Host-memory outputs need system release; host rewrites between launches
+         * need system acquire. Preserve the CDNA dispatch policy. */
+        d->dispatch_scope = wavefront_size == 32 ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         if (pick_pool(d->agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED, &d->vram) != 0) {
             snprintf(g_err, sizeof(g_err), "device %d: no coarse-grained VRAM pool", i);
             free(h);
@@ -532,8 +544,8 @@ int plow_hsa_launch(plow_hsa* h, int dev, const plow_hsa_kernel* k,
     const uint16_t dims = (uint16_t)(grid_z > 1 ? 3 : (grid_y > 1 ? 2 : 1));
     uint16_t header = (uint16_t)((HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE)
                     | (1 << HSA_PACKET_HEADER_BARRIER)
-                    | (HSA_FENCE_SCOPE_AGENT << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
-                    | (HSA_FENCE_SCOPE_AGENT << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE));
+                    | (d->dispatch_scope << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
+                    | (d->dispatch_scope << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE));
     uint16_t setup = (uint16_t)(dims << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS);
 
     /* One release store publishes the packet: the type field is what makes the

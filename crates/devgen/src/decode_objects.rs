@@ -7,7 +7,7 @@ use std::path::Path;
 fn validate(model: &Model, metadata: &DecodeObjects, arch: &str) -> Result<(), String> {
     let profile = match arch {
         "sm_90a" => "sm90a",
-        "sm_120" => "sm120",
+        "sm_120" | "sm_120a" => "sm120",
         _ => return Err("unsupported CUDA profile".into()),
     };
     let start = model
@@ -94,7 +94,7 @@ pub(crate) fn append_metadata(
         let info = plow_asset::cubin::inspect(&image).ok_or("invalid object ELF")?;
         let sm = match arch {
             "sm_90a" => 90,
-            "sm_120" => 120,
+            "sm_120" | "sm_120a" => 120,
             _ => unreachable!(),
         };
         if info.sm != sm || !info.entries.contains(&spec.entry) {

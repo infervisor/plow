@@ -11,6 +11,25 @@
  */
 #include "../amd/op_collective.h"
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+extern "C" __global__ void tp_fill_partial_f32(float* part, uint32_t n, uint32_t rank,
+                                              uint32_t iter, uint32_t order) {
+    for (uint32_t e=blockIdx.x*blockDim.x+threadIdx.x;e<n;e+=gridDim.x*blockDim.x)
+        part[e] = rank == 0 ? 1.0f + (float)((e&3u)+1u)*0x1p-9f
+                  : rank == 1 ? -1.0f + (float)((e&7u)+1u)*0x1p-12f
+                              : (float)(rank+1u)*0x1p-14f;
+}
+extern "C" __global__ void tp_allreduce_f32_parts(bf16* out, const void* const* peer_scratch,
+    uint32_t* const* peer_gate, uint32_t nranks, uint32_t rank, uint32_t n,
+    uint32_t slot_bytes, uint32_t iters, uint64_t deadline, uint64_t* cycles, uint32_t* status) {
+    const uint64_t t0=plow_realtime();
+    for (uint32_t i=1;i<=iters;i++)
+        d_xreduce_oneshot(out,peer_scratch,peer_gate,nranks,rank,n,slot_bytes,i*nranks,
+            blockIdx.x==0,deadline,status,blockIdx.x,gridDim.x,true);
+    if(blockIdx.x==0&&threadIdx.x==0&&cycles)*cycles=plow_realtime()-t0;
+}
+#endif
+
 /* Fill this rank's partial slot with a checkable element-varying bf16 pattern.
  * val(r,e) = (r+1) * (1 + (e&7)*0.125) — all exact in bf16, and it varies per
  * element so a mis-indexed peer read or a partial write is caught, not just a
@@ -30,13 +49,13 @@ extern "C" __global__ void tp_allreduce(bf16* out, const void* const* peer_scrat
                                         uint32_t rank, uint32_t n, uint32_t slot_bytes,
                                         uint32_t iters, uint64_t deadline,
                                         uint64_t* cycles, uint32_t* status) {
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t0 = plow_realtime();
     for (uint32_t i = 1; i <= iters; i++) {
         d_xreduce_oneshot(out, peer_scratch, peer_gate, nranks, rank, n, slot_bytes,
                           i * nranks, blockIdx.x == 0, deadline, status,
                           blockIdx.x, gridDim.x);
     }
-    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t1 = plow_realtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
 
@@ -47,12 +66,12 @@ extern "C" __global__ void tp_allreduce_twoshot(
     bf16* out, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
     uint32_t n, uint32_t slot_bytes, uint64_t xctr_byte_off, uint32_t iters,
     uint64_t deadline, uint64_t* cycles, uint32_t* status) {
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t0 = plow_realtime();
     for (uint32_t i = 0; i < iters; i++)
         d_xreduce_twoshot_mega(out, peer_scratch, nranks, rank, n, slot_bytes,
                                (size_t)xctr_byte_off, 2u * i, 2u * i + 1u,
                                deadline, status, blockIdx.x, gridDim.x);
-    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t1 = plow_realtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
 
@@ -61,13 +80,13 @@ extern "C" __global__ void tp_allreduce_twoshot_gather(
     uint32_t n, uint32_t slot_bytes, uint64_t xctr_byte_off, uint32_t iters,
     uint64_t deadline, uint64_t* cycles, uint32_t* status,
     uint32_t gslot_bytes, uint32_t gcols) {
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t0 = plow_realtime();
     for (uint32_t i = 0; i < iters; i++)
         d_xreduce_twoshot_mega(out, peer_scratch, nranks, rank, n, slot_bytes,
                                (size_t)xctr_byte_off, 2u * i, 2u * i + 1u,
                                deadline, status, blockIdx.x, gridDim.x,
                                nullptr, nullptr, gslot_bytes, gcols);
-    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t1 = plow_realtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
 
@@ -99,7 +118,7 @@ extern "C" __global__ void tp_seams_timed(bf16* out, const void* const* peer_scr
                                           uint32_t* status, uint32_t* lctr) {
     uint64_t rs = 0, ag = 0;
     for (uint32_t i = 0; i < iters; i++) {
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         d_xreduce_scatter_mega(peer_scratch, nranks, rank, n, slot_bytes, (size_t)xctr_byte_off,
                                2u * i, deadline, status, blockIdx.x, gridDim.x, 0u, 0u, nullptr);
         if (threadIdx.x == 0) {
@@ -110,12 +129,12 @@ extern "C" __global__ void tp_seams_timed(bf16* out, const void* const* peer_scr
             xctr_acquire();
         }
         __syncthreads();
-        const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t1 = plow_realtime();
         d_xall_gather_mega(peer_scratch, nranks, rank, (size_t)xctr_byte_off, 2u * i + 1u,
                            deadline, status, blockIdx.x, gridDim.x, out, n, slot_bytes, nullptr,
                            0u, 0u, nullptr, 0u, 0u);
         __syncthreads();
-        const uint64_t t2 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t2 = plow_realtime();
         rs += t1 - t0;
         ag += t2 - t1;
     }
@@ -133,7 +152,7 @@ extern "C" __global__ void tp_seams_timed(bf16* out, const void* const* peer_scr
  *   tp_seams_banded op 26 split into K row bands, each with its own one-workgroup rendezvous;
  *   tp_seams_corun  op 26 on its capped workgroups beside an MFMA + streaming consumer on the rest.
  * ts[4*wg + {0..3}] = start, work done, rendezvous passed, end (s_memrealtime). */
-__device__ __forceinline__ uint64_t tp_now(void) { return __builtin_amdgcn_s_memrealtime(); }
+__device__ __forceinline__ uint64_t tp_now(void) { return plow_realtime(); }
 
 /* Every workgroup arrives (the two-shot's gate_ag arrival: system-scope release, device-local
  * aggregation under PLOW_XR_AGG) and waits for nranks * nblk arrivals, then one system acquire. */
@@ -337,12 +356,12 @@ extern "C" __global__ void tp_allreduce_oneshot_gather(
     uint32_t n, uint32_t slot_bytes, uint64_t xctr_byte_off, uint32_t iters,
     uint64_t deadline, uint64_t* cycles, uint32_t* status,
     uint32_t gslot_bytes, uint32_t gcols) {
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t0 = plow_realtime();
     for (uint32_t i = 0; i < iters; i++)
         d_xreduce_mega(out, peer_scratch, nranks, rank, n, slot_bytes,
                        (size_t)xctr_byte_off, i, deadline, status,
                        blockIdx.x, gridDim.x, gslot_bytes, gcols, nranks * gcols);
-    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t1 = plow_realtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
 
@@ -391,14 +410,14 @@ extern "C" __global__ void tp_allreduce_cold(bf16* out, const void* const* peer_
                                              uint32_t iters, uint64_t deadline,
                                              uint64_t* cycles, uint32_t* status,
                                              uint32_t* lctr, uint32_t order) {
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t0 = plow_realtime();
     for (uint32_t i = 1; i <= iters; i++) {
         const uint32_t sb = slot_bytes * (i & 1u);
         tp_local_produce((bf16*)((char*)peer_scratch[rank] + sb), n, rank, i, order, lctr);
         d_xreduce_oneshot(out, peer_scratch, peer_gate, nranks, rank, n, sb, i * nranks,
                           blockIdx.x == 0, deadline, status, blockIdx.x, gridDim.x);
     }
-    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t1 = plow_realtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
 /* Tagged one-shot, the production body. Gate id = i & 1023 (parity alternates, the audit
@@ -412,7 +431,7 @@ extern "C" __global__ void tp_allreduce_tagged(bf16* out, const void* const* pee
                                                uint64_t* cycles, uint32_t* status,
                                                uint32_t* lctr, uint32_t order, uint32_t cold,
                                                uint32_t tag_slot, uint32_t xctr_off) {
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t0 = plow_realtime();
     for (uint32_t i = 1; i <= iters; i++) {
         const uint32_t sb = slot_bytes * (i & 1u);
         if (cold)
@@ -421,7 +440,7 @@ extern "C" __global__ void tp_allreduce_tagged(bf16* out, const void* const* pee
                               (size_t)xctr_off, i & 1023u, deadline, status, blockIdx.x,
                               gridDim.x, 0u, 0u, 0u, tag_off, tag_slot);
     }
-    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t1 = plow_realtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
 /* tp_allreduce_prefill_bench TP_TAGGED=1: the tagged body on the production one-shot
@@ -431,13 +450,13 @@ extern "C" __global__ void tp_allreduce_tagged_x(
     uint32_t n, uint32_t slot_bytes, uint64_t xctr_byte_off, uint32_t iters,
     uint64_t deadline, uint64_t* cycles, uint32_t* status,
     uint32_t gslot_bytes, uint32_t gcols, uint32_t tag_off, uint32_t tag_slot) {
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t0 = plow_realtime();
     for (uint32_t i = 0; i < iters; i++)
         d_xreduce_tagged_mega(out, peer_scratch, nranks, rank, n, slot_bytes,
                               (size_t)xctr_byte_off, i, deadline, status, blockIdx.x,
                               gridDim.x, gslot_bytes, gcols, gcols ? n : 0u, tag_off,
                               tag_slot);
-    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    const uint64_t t1 = plow_realtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
 
@@ -461,29 +480,29 @@ extern "C" __global__ void tp_peer_probe(const void* const* peer_scratch,
     uint64_t t0, t1;
     if (threadIdx.x == 0) {
         uint32_t idx = 0;
-        t0 = __builtin_amdgcn_s_memrealtime();
+        t0 = plow_realtime();
         for (uint32_t h = 0; h < hops; h++) {
             const uint64_t v = xrt_load(win + idx);
             idx = (idx + (uint32_t)v + 16u) & 4095u;
         }
-        t1 = __builtin_amdgcn_s_memrealtime();
+        t1 = plow_realtime();
         res[0] = t1 - t0;
         acc += idx;
         /* `a >> 31` is 0 for any count this probe can reach but not foldable, so each
          * atomic's operand depends on the previous one's return: a true chain. */
         uint32_t a = 0;
-        t0 = __builtin_amdgcn_s_memrealtime();
+        t0 = plow_realtime();
         for (uint32_t h = 0; h < hops; h++)
             a = __hip_atomic_fetch_add(rg, a >> 31, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        t1 = __builtin_amdgcn_s_memrealtime();
+        t1 = plow_realtime();
         res[1] = t1 - t0;
         acc += a;
-        t0 = __builtin_amdgcn_s_memrealtime();
+        t0 = plow_realtime();
         for (uint32_t h = 0; h < hops; h++) {
             __hip_atomic_fetch_add(rg, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
-        t1 = __builtin_amdgcn_s_memrealtime();
+        t1 = plow_realtime();
         res[2] = t1 - t0;
     }
     uint64_t sum = 0;
@@ -493,26 +512,26 @@ extern "C" __global__ void tp_peer_probe(const void* const* peer_scratch,
             st_act1(&as_glob(dirty)[(threadIdx.x * 64u + k) & 0xffffu], (bf16)(h + k));
         __syncthreads();
         if (threadIdx.x == 0) {
-            t0 = __builtin_amdgcn_s_memrealtime();
+            t0 = plow_realtime();
             __hip_atomic_fetch_add(rg, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-            sum += __builtin_amdgcn_s_memrealtime() - t0;
+            sum += plow_realtime() - t0;
         }
     }
     if (threadIdx.x == 0) {
         res[3] = sum;
         uint32_t v = 0;
-        t0 = __builtin_amdgcn_s_memrealtime();
+        t0 = plow_realtime();
         for (uint32_t h = 0; h < hops; h++) v = xctr_poll(own + (v >> 31));
-        t1 = __builtin_amdgcn_s_memrealtime();
+        t1 = plow_realtime();
         res[4] = t1 - t0;
         acc += v;
-        t0 = __builtin_amdgcn_s_memrealtime();
+        t0 = plow_realtime();
         for (uint32_t h = 0; h < hops; h++) {
             v = xctr_poll(own + (v >> 31));
             xctr_acquire();
         }
-        t1 = __builtin_amdgcn_s_memrealtime();
+        t1 = plow_realtime();
         res[5] = t1 - t0;
         res[6] = acc + v;
     }

@@ -158,7 +158,24 @@ async fn chat_completions_with(
     {
         use crate::serve::manager::EnsureError;
         let ensured = match state.dp_set(&req.model) {
-            Some(set) => Some(state.dp_admit(set).await),
+            Some(set) => {
+                // The sampling the request resolves to below: a sampled request needs a rank that
+                // applies it resident.
+                let mut params = state
+                    .registry
+                    .get(&req.model)
+                    .map(|b| crate::serve::config::base_sampling(&b))
+                    .unwrap_or_default();
+                req.sampling.apply(&mut params);
+                params.logprobs = crate::serve::logprobs::parse_chat(
+                    req.logprobs.as_ref(),
+                    req.top_logprobs.as_ref(),
+                    req.logprobs_mode.as_deref(),
+                )
+                .ok()
+                .flatten();
+                Some(state.dp_admit(set, params.samples()).await)
+            }
             None => match state.manager_for(&req.model) {
                 Some(mgr) if mgr.manages(&req.model) => Some(mgr.ensure_resident(&req.model).await),
                 _ => None,
@@ -747,7 +764,13 @@ async fn chat_completions_with(
     let mux = match (&direct, dp) {
         (Some(m), _) => m,
         (None, Some(set)) => {
-            match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+            match state.dp_route(
+                set,
+                ids.session.as_deref(),
+                Some(&prompt_ids),
+                0,
+                gen.params.samples(),
+            ) {
                 Some((r, m, key, pick)) => {
                     (rank, prefix, _pick) = (r, key, Some(pick));
                     routed = m;
@@ -833,6 +856,7 @@ async fn chat_completions_with(
         arrived: std::time::Instant::now(),
         respond: tx,
         opts: crate::serve::mux::JobOpts {
+            prompt_logprobs: req.sampling.prompt_logprobs.is_some(),
             session,
             turn: run.key(),
             continuing: run.continuing(),
@@ -846,14 +870,17 @@ async fn chat_completions_with(
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
     }
-    if let Err(err) = state.submit_routed(
-        dp.map(|s| (&**s, rank)),
-        ids.session.as_deref(),
-        mux,
-        job,
-        t_arrive,
-        ingress,
-    ) {
+    if let Err(err) = state
+        .submit_routed(
+            dp.map(|s| (&**s, rank)),
+            ids.session.as_deref(),
+            mux,
+            job,
+            t_arrive,
+            ingress,
+        )
+        .await
+    {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 let mut r = crate::serve::api_error(
@@ -1084,6 +1111,95 @@ pub(crate) enum PromptError {
     Request(crate::serve::tools::request::Refusal),
     /// The packet names a built-in builder this server does not have.
     NoTemplate(String),
+}
+
+/// Why bundle `b` cannot serve as another vendor's variant of the model `a` serves, if it
+/// cannot: every rank of a model must answer a prompt with the same text (docs/arch/30 §3.1).
+/// Compared: the checkpoint pins, stop ids, sampling defaults and chat declarations of
+/// `serve.json`, the tokenizer files, and a probe conversation rendered by each bundle's own
+/// prompt path and tokenized by its own tokenizer. A packet's KV geometry and serve knobs are
+/// per-target and may differ.
+pub(crate) fn variant_mismatch(
+    a: &crate::asset::ModelBundle,
+    b: &crate::asset::ModelBundle,
+) -> Option<String> {
+    let (ma, mb) = (&a.serve().manifest, &b.serve().manifest);
+    if ma.weights != mb.weights {
+        return Some("different checkpoint pins".into());
+    }
+    if ma.stop_token_ids != mb.stop_token_ids {
+        return Some("different stop token ids".into());
+    }
+    if ma.sampling != mb.sampling {
+        return Some("different sampling defaults".into());
+    }
+    if ma.chat != mb.chat || a.serve().from_packet != b.serve().from_packet {
+        return Some("different chat declarations in serve.json".into());
+    }
+    if tokenizer_digest(a) != tokenizer_digest(b) {
+        return Some("different tokenizer files".into());
+    }
+    let probe: Vec<Message> = serde_json::from_value(serde_json::json!([
+        {"role": "system", "content": "You are a careful assistant."},
+        {"role": "user", "content": "Hello <b>wörld</b> 123 \u{1F600}?"},
+        {"role": "assistant", "content": "Hi."},
+        {"role": "user", "content": "Bye"}
+    ]))
+    .expect("probe conversation");
+    let opts = crate::serve::template::RenderOpts::default();
+    let (pa, pb) = (
+        chat_prompt(Some(a), &probe, &opts),
+        chat_prompt(Some(b), &probe, &opts),
+    );
+    match (pa, pb) {
+        (Ok(pa), Ok(pb)) if pa == pb => {
+            if a.tokenizer().encode(&pa) != b.tokenizer().encode(&pb) {
+                return Some("the probe prompt tokenizes differently".into());
+            }
+        }
+        (Err(_), Err(_)) => {}
+        _ => return Some("the probe conversation renders a different prompt".into()),
+    }
+    None
+}
+
+/// Digest of the tokenizer files the bundle loaded from (`tokenizer.json`, or the Qwen2
+/// `vocab.json` + `merges.txt` pair), `None` when it has none.
+fn tokenizer_digest(b: &crate::asset::ModelBundle) -> Option<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    let ckpt = crate::asset::serve::checkpoint_dir(&b.dir);
+    let bases = [b.dir.as_path(), ckpt.as_path()];
+    // tokenizer_config.json carries added tokens and processor settings; the loader reads it
+    // beside the tokenizer or from the checkpoint, so both copies count.
+    let finish = |mut h: Sha256, _: &std::path::Path| {
+        for (tag, base) in [(b"d", bases[0]), (b"c", bases[1])] {
+            if let Ok(c) = std::fs::read(base.join("tokenizer_config.json")) {
+                h.update(tag);
+                h.update((c.len() as u64).to_le_bytes());
+                h.update(&c);
+            }
+        }
+        Some(h.finalize().to_vec())
+    };
+    for base in bases {
+        if let Ok(bytes) = std::fs::read(base.join("tokenizer.json")) {
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            return finish(h, base);
+        }
+    }
+    for base in bases {
+        if let (Ok(v), Ok(m)) = (
+            std::fs::read(base.join("vocab.json")),
+            std::fs::read(base.join("merges.txt")),
+        ) {
+            let mut h = Sha256::new();
+            h.update(&v);
+            h.update(&m);
+            return finish(h, base);
+        }
+    }
+    None
 }
 
 /// The prompt a templated (GPU-served) model gets for `messages`: THE CHECKPOINT'S OWN TEMPLATE

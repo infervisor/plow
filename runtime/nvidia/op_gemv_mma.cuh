@@ -335,6 +335,12 @@ __device__ __forceinline__ void gvmma_store2(__nv_bfloat16* C, unsigned N, unsig
     }
 }
 
+__device__ __forceinline__ void gvmma_store2(float* C, unsigned N, unsigned m, unsigned n,
+                                             float c0, float c1) {
+    if (n < N) C[(size_t)m * N + n] = c0;
+    if (n + 1u < N) C[(size_t)m * N + n + 1u] = c1;
+}
+
 /* Split-K reduction slots: partial warps (part > 0) park their C fragments here, part 0 sums.
  * Sized for the widest tile; static so the arms need no arena hand-off. The FP8 M1 XCACHE
  * objects (dynamic arena >= 51456 floats, 201 KiB) cannot also afford the static slots (40 KiB
@@ -378,8 +384,8 @@ __device__ __forceinline__ gvmma_red_t<MT>* gvmma_red2() {
 #define GVMMA_RED_DYN_BYTES (3u * sizeof(gvmma_red_t<GVMMA_MT_MAX>))
 #endif
 
-template <bool BIAS, int MT>
-__device__ __forceinline__ void gvmma_store_tile(__nv_bfloat16* __restrict__ C, const float (&acc)[MT][4],
+template <bool BIAS, int MT, typename Output = __nv_bfloat16>
+__device__ __forceinline__ void gvmma_store_tile(Output* __restrict__ C, const float (&acc)[MT][4],
                                                  unsigned nb, unsigned rows, unsigned N,
                                                  const __nv_bfloat16* __restrict__ bias) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
@@ -503,8 +509,8 @@ __device__ __forceinline__ unsigned gvmma_xk_sb(unsigned rows, unsigned N, unsig
 }
 /* FOLD: the fold producer's epilogue; FOLD_IN: the fold consumer's inv scale. W / C / N are the
  * matrix holding the unit's rows, n0 its first row in the concatenated range the units walk. */
-template <bool BIAS, int MT, bool ONE, bool FOLD, bool FOLD_IN = false>
-__device__ __forceinline__ void gvmma_xk_unit(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+template <bool BIAS, int MT, bool ONE, bool FOLD, bool FOLD_IN = false, typename Output = __nv_bfloat16>
+__device__ __forceinline__ void gvmma_xk_unit(Output* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                               const __nv_bfloat16* __restrict__ W, unsigned rows, unsigned N,
                                               unsigned K, unsigned slice, unsigned sb,
                                               const __nv_bfloat16* __restrict__ bias, const GvFoldOut* fo,
@@ -557,8 +563,15 @@ __device__ __forceinline__ void gvmma_xk_unit(__nv_bfloat16* __restrict__ C, con
     if (threadIdx.x == 0) atomicExch(gvmma_xk_cnt + g, 0u);
 }
 #endif
-template <bool BIAS, int MT = 1, bool ONE = false, bool FOLD = false>
-__device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && !GVMMA_RED_DYN
+template <bool BIAS, int MT, bool ONE, bool FOLD>
+__device__ __forceinline__ gvmma_red_t<MT>* gvmma_tp_red2() {
+    __shared__ gvmma_red_t<MT> red[2];
+    return red;
+}
+#endif
+template <bool BIAS, int MT = 1, bool ONE = false, bool FOLD = false, typename Output = __nv_bfloat16>
+__device__ __forceinline__ void gemv_rows_mma(Output* __restrict__ C,
                                               const __nv_bfloat16* __restrict__ x,
                                               const __nv_bfloat16* __restrict__ W, unsigned rows,
                                               unsigned N, unsigned K, unsigned slice,
@@ -597,6 +610,8 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
         if (per != 0u && gpow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / gpow)) == 0u) {
 #if GVMMA_RED_DYN
             gvmma_red_t<MT>* const red2 = gvmma_red2<MT>();
+#elif PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+            gvmma_red_t<MT>* const red2 = gvmma_tp_red2<BIAS, MT, ONE, FOLD>();
 #else
             __shared__ gvmma_red_t<MT> red2[2];
 #endif

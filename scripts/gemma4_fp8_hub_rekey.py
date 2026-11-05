@@ -4,7 +4,7 @@ checkpoint to plow's `fp8/` contract. Nothing is requantized; the inverse of gem
 
   X.weight        F8_E4M3        -> fp8/X.weight        (bytes verbatim)
   X.weight_scale  BF16 [N, 1]    -> fp8/X.weight_scale  F32 [N] (exact widening)
-  X (fused MoE experts) F8_E4M3 -> fp8/X, X.weight_scale BF16 [E, N, 1] -> fp8/X_scale F32 [E*N]
+  X (fused MoE experts) F8_E4M3 -> fp8/X, X.weight_scale BF16 [E, N, 1] -> fp8/X_scale F32 [E, N]
   everything else                -> unchanged
 
 Usage: gemma4_fp8_hub_rekey.py <hub-fp8-dir> <out-dir>   (single model.safetensors or an index of shards)
@@ -30,7 +30,7 @@ for path in shards:
         hdr[k] = (path, 8 + n, v)
 fp8 = {k for k, (_, _, v) in hdr.items() if v["dtype"] == "F8_E4M3"}
 # Projections: X.weight -> X.weight_scale [N, 1]. Fused MoE experts (no .weight suffix):
-# X -> X.weight_scale [E, N, 1], renamed fp8/X_scale and flattened to [E*N].
+# X -> X.weight_scale [E, N, 1], renamed fp8/X_scale with its expert axis preserved.
 scale_of = {k: k + "_scale" if k.endswith(".weight") else k + ".weight_scale" for k in fp8}
 scale_out = {s: "fp8/" + k + "_scale" for k, s in scale_of.items()}
 assert all(s in hdr and hdr[s][2]["dtype"] == "BF16" and hdr[s][2]["shape"][-1] == 1 for s in scale_of.values())
@@ -50,10 +50,7 @@ for k in sorted(hdr, key=lambda k: (hdr[k][0], hdr[k][2]["data_offsets"][0])):
     if k in fp8:
         plan.append(("fp8/" + k, "F8_E4M3", v["shape"], path, base + lo, hi - lo, False))
     elif k in scale_out:
-        n = 1
-        for d in v["shape"][:-1]:
-            n *= d
-        plan.append((scale_out[k], "F32", [n], path, base + lo, hi - lo, True))
+        plan.append((scale_out[k], "F32", v["shape"][:-1], path, base + lo, hi - lo, True))
     else:
         plan.append((k, v["dtype"], v["shape"], path, base + lo, hi - lo, False))
 

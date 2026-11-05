@@ -183,7 +183,8 @@ use crate::device::hsa::HsaBackend;
 use crate::device::Backend;
 use crate::exec::amd::{AmdEngine, ChunkStep, TpBind};
 use crate::exec::tp::{
-    gate_error, is_deadline_status, PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS, XCTR_STRIDE,
+    count_xgates, gate_error, is_deadline_status, PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS,
+    XCTR_STRIDE,
 };
 use crate::{Result, RuntimeError};
 
@@ -2673,34 +2674,6 @@ fn check_dcp_gather(blob: &DevBlob, slots: u64, slot_bytes: u64) -> Result<u64> 
     } else {
         slots
     })
-}
-
-fn count_xgates(blob: &DevBlob) -> u32 {
-    use packet::dev::DevOp;
-    let mut top = 0u32;
-    for p in &blob.progs {
-        for d in &p.insts {
-            if d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceAddNorm as u16 {
-                top = top.max(d.i[3] + 1); // one-shot: one gate, i3 (fused AddNorm form included)
-            } else if d.op == DevOp::XReduceTwoShot as u16 {
-                // two-shot: reduce-scatter (i3) and all-gather (i4)
-                top = top.max(d.i[3] + 1).max(d.i[4] + 1);
-            } else if d.op == DevOp::IndexTpPf as u16 {
-                top = top.max(d.i[5] + 1).max(d.i[6] + 1);
-            } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
-                // split seams: one gate each (i3)
-                top = top.max(d.i[3] + 1);
-            } else if d.op == DevOp::XDcpGather as u16 {
-                top = top.max(d.i[6] + 1);
-            } else if d.op == DevOp::XArgmaxFin as u16 {
-                // sharded-head fold: arrival gate (i3), then consecutive value lines at i4
-                top = top
-                    .max(d.i[3] + 1)
-                    .max(d.i[4] + xargmax_value_lines(d.i[1]));
-            }
-        }
-    }
-    top
 }
 
 /// Per-program table of what each cross-GPU gate must read after a dispatch.

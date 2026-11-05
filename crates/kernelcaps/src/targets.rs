@@ -134,7 +134,7 @@ pub fn prefill_recipe(isa: IsaLevel) -> Option<ObjectRecipe> {
         // for gfx942" -- which dead-ended the whole capability probe, the tile selector and the
         // tuning path for a part the kernels already run on. The recipe differs between the two
         // only in the arch token and the tile/stage geometry the object is actually built with.
-        isa @ (IsaLevel::Gfx942 | IsaLevel::Gfx950) => ObjectRecipe {
+        isa @ (IsaLevel::Gfx942 | IsaLevel::Gfx950 | IsaLevel::Gfx1201) => ObjectRecipe {
             isa,
             profile: ProfileId::PrefillDense,
             source: "runtime/amd/interp.hip",
@@ -150,12 +150,14 @@ pub fn prefill_recipe(isa: IsaLevel) -> Option<ObjectRecipe> {
             // describing the object the build produces. A 64 KiB workgroup cannot hold a
             // double-buffered stage wider than 64x128, so gfx942 ships single-buffered at
             // 192x256 and eight waves -- see GM_DBUF in runtime/amd/op_gemm.h.
+            // gfx1201 (RDNA4) is built wave64 in CU mode from the same sources on the CDNA3 tile arm.
             defines: match isa {
-                IsaLevel::Gfx942 => AMD_PREFILL_DEFINES_CDNA3,
+                IsaLevel::Gfx942 | IsaLevel::Gfx1201 => AMD_PREFILL_DEFINES_CDNA3,
                 _ => AMD_PREFILL_DEFINES_CDNA4,
             },
             arch_flag: match isa {
                 IsaLevel::Gfx942 => "--offload-arch=gfx942",
+                IsaLevel::Gfx1201 => "--offload-arch=gfx1201 -mwavefrontsize64 -mcumode",
                 _ => "--offload-arch=gfx950",
             },
             compiler: "hipcc",
@@ -339,7 +341,7 @@ pub fn dense_gemm_tuning_build(root: &Path, isa: IsaLevel) -> Result<crate::Buil
     let target = recipe.target(root);
     let toolchain = toolchain_label(recipe.isa);
 
-    if !matches!(isa, IsaLevel::Gfx942 | IsaLevel::Gfx950) {
+    if !matches!(isa, IsaLevel::Gfx942 | IsaLevel::Gfx950 | IsaLevel::Gfx1201) {
         let text = target.preprocess()?;
         return Ok(target.build_id_from(isa, &toolchain, &text));
     }
@@ -378,7 +380,7 @@ pub fn toolchain_label(isa: IsaLevel) -> String {
         return label;
     }
     match isa {
-        IsaLevel::Gfx942 | IsaLevel::Gfx950 => "rocm".into(),
+        IsaLevel::Gfx942 | IsaLevel::Gfx950 | IsaLevel::Gfx1201 => "rocm".into(),
         _ => "cuda".into(),
     }
 }

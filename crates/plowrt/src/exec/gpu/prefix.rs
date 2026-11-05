@@ -226,12 +226,16 @@ impl GpuEngine {
             return declined("encoder overlay rows are not keyed by the prompt ids");
         }
         let requested = config.nv_vmm_prefix();
+        // GB202 (sm_120) auto-selects the cache for every packet with a layout, rank groups
+        // included. Hopper keeps the geometry allowlist it was qualified on; other targets
+        // need an explicit PLOW_VMM_PREFIX=1.
+        let gb202 = capability == (12, 0);
         if requested == Some(false)
             || (requested.is_none()
-                && (capability != (9, 0)
+                && ((capability != (9, 0) && !gb202)
                     || config.nv_vmm_live()
                     || config.nv_vmm_live_rings() == Some(true)
-                    || blob.tp.is_some()
+                    || (blob.tp.is_some() && !gb202)
                     || blob.sections.iter().any(|section| {
                         matches!(
                             section.name.as_str(),
@@ -244,13 +248,33 @@ impl GpuEngine {
             return declined(if requested == Some(false) {
                 "PLOW_VMM_PREFIX=0"
             } else {
-                "auto mode: not Hopper, live KV/rings, TP, or a mixed-step/decode-object packet"
+                "auto mode: not Hopper/GB202, live KV/rings, TP off GB202, or a mixed-step/decode-object packet"
             });
         }
         let Some(layout) = Self::vmm_prefix_layout(blob, kv, row_interleaved) else {
             return declined("no VMM prefix KV layout for this packet");
         };
-        if requested.is_none() {
+        if gb202 {
+            // KV element widths the snapshot path stores (BF16 rows, FP8 rows with
+            // per-token-head scales); no per-geometry allowlist on this target.
+            let g = &layout.geo;
+            if !matches!(g.elem, 1 | 2) || !matches!(g.elem_slide, 1 | 2) {
+                return declined("KV element width outside the snapshot path (1 or 2 bytes)");
+            }
+            tracing::info!(
+                hd_full = g.hd_full,
+                hd_slide = g.hd_slide,
+                window = g.window,
+                kv_elem = g.elem,
+                kv_elem_slide = g.elem_slide,
+                mode = if requested.is_none() {
+                    "auto"
+                } else {
+                    "explicit"
+                },
+                "vmm prefix layout accepted (PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables)"
+            );
+        } else if requested.is_none() {
             // Auto-selection is an allowlist of the geometry the sliding-ring
             // snapshot path was qualified on (Gemma 4 hybrid KV), not a
             // capability probe; other layouts need an explicit PLOW_VMM_PREFIX=1.
@@ -474,13 +498,17 @@ impl GpuEngine {
     }
 
     /// `state_tensors`: the engine's recurrent state tensors (`(devp index, per-slot bytes)`),
-    /// the block store's `State` class; empty for a model without one.
+    /// the block store's `State` class; empty for a model without one. `rank_group`: a
+    /// tensor-parallel rank, whose cache must decide every attach exactly as its peers do —
+    /// no host tier (sized from this process's view of free host RAM, and refilled by a
+    /// background thread).
     pub(super) fn vmm_bringup(
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
         layout: Option<VmmPrefixLayout>,
         live_rings: bool,
         state_tensors: &[(usize, u64)],
+        rank_group: bool,
     ) -> Result<Option<VmmServe>> {
         let Some(VmmPrefixLayout {
             geo,
@@ -593,6 +621,7 @@ impl GpuEngine {
                     let auto = crate::memory::vmm::host_tier_auto();
                     let host_cap =
                         crate::memory::vmm::host_tier_grant(match rt.host_kvcache_bytes() {
+                            _ if rank_group => 0,
                             None => auto.map_or(0, |(cap, _)| cap),
                             Some(cap) => cap,
                         });
@@ -666,6 +695,21 @@ impl GpuEngine {
         let Some(a) = att else {
             return Ok(());
         };
+        // Every prefill bucket writes all its rows: a tail left fewer rows of context than the
+        // narrowest bucket cannot run after the prefix, while the cold prompt (chunked from 0)
+        // can. Serve such a prompt cold.
+        let room = self.max_ctx.saturating_sub(a.rows as usize);
+        let narrowest = self.prefill.iter().map(|p| p.t as usize).min();
+        if prompt.len() > a.rows as usize && narrowest.is_some_and(|t| t > room) {
+            kv.begin_seq(b);
+            tracing::debug!(
+                slot = b,
+                rows = a.rows,
+                room,
+                "vmm: prefix attach declined, tail too near the context limit"
+            );
+            return Ok(());
+        }
         let restored = (|| {
             // The slot's own blocks hold the prefix: map them, then gather every row.
             kv.ensure_rows(b, a.rows + 1)?;
@@ -785,6 +829,9 @@ impl GpuEngine {
         p_a: u32,
         kind: crate::memory::vmm::Kind,
     ) -> bool {
+        if self.publish_off[b] {
+            return false;
+        }
         let Some((v, kv)) = self.vmm_prefix() else {
             return false;
         };

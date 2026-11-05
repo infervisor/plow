@@ -94,7 +94,7 @@ static void* slurp(const char* path, size_t* len) {
     fclose(f); *len = n; return p;
 }
 
-enum { MODE_ONESHOT, MODE_COLD, MODE_TAGGED, MODE_TAGGED_COLD };
+enum { MODE_ONESHOT, MODE_COLD, MODE_TAGGED, MODE_TAGGED_COLD, MODE_F32_PARTS };
 
 int main(int argc, char** argv) {
     int dev[TP_MAXR]; uint32_t NR = 0;
@@ -112,10 +112,13 @@ int main(int argc, char** argv) {
     else if (!strcmp(mode_s, "cold")) mode = MODE_COLD;
     else if (!strcmp(mode_s, "tagged")) mode = MODE_TAGGED;
     else if (!strcmp(mode_s, "tagged_cold")) mode = MODE_TAGGED_COLD;
-    else { printf("TP_MODE must be oneshot|cold|tagged|tagged_cold\n"); return 2; }
+    else if (!strcmp(mode_s, "f32_parts")) mode = MODE_F32_PARTS;
+    else { printf("TP_MODE must be oneshot|cold|tagged|tagged_cold|f32_parts\n"); return 2; }
+    const int f32_parts = mode == MODE_F32_PARTS;
+    if (f32_parts && (order || probe)) { printf("f32_parts uses its cancellation oracle\n"); return 2; }
     const int tagged = mode == MODE_TAGGED || mode == MODE_TAGGED_COLD;
     const int cold = mode == MODE_COLD || mode == MODE_TAGGED_COLD;
-    const char* kname = mode == MODE_ONESHOT ? "tp_allreduce"
+    const char* kname = f32_parts ? "tp_allreduce_f32_parts" : mode == MODE_ONESHOT ? "tp_allreduce"
                         : mode == MODE_COLD  ? "tp_allreduce_cold"
                                              : "tp_allreduce_tagged";
     /* batch points: dense at the low end where a launched engine needs one-stage, then the
@@ -155,7 +158,7 @@ int main(int argc, char** argv) {
     plow_hsa_kernel k_fill[TP_MAXR], k_ar[TP_MAXR], k_probe[TP_MAXR];
     for (uint32_t i = 0; i < NR; i++) {
         if (plow_hsa_load_code_object(h, dev[i], elf, elf_len) != 0 ||
-            plow_hsa_get_kernel(h, dev[i], "tp_fill_partial_v", &k_fill[i]) != 0 ||
+            plow_hsa_get_kernel(h, dev[i], f32_parts ? "tp_fill_partial_f32" : "tp_fill_partial_v", &k_fill[i]) != 0 ||
             plow_hsa_get_kernel(h, dev[i], kname, &k_ar[i]) != 0 ||
             plow_hsa_get_kernel(h, dev[i], "tp_peer_probe", &k_probe[i]) != 0) {
             printf("load/get_kernel: %s\n", plow_hsa_last_error()); return 2;
@@ -166,7 +169,7 @@ int main(int argc, char** argv) {
      * (PlowProgram's xr_tag layout), the probe window, then 1024 xctr lines for the tagged
      * arm's audit bumps. Every offset is a multiple of 256 B. */
     const uint32_t NMAX = HID * BATCH[NB - 1];
-    const uint32_t SLOT = (NMAX * 2u + 255u) & ~255u;
+    const uint32_t SLOT = (NMAX * (f32_parts ? 4u : 2u) + 255u) & ~255u;
     const uint32_t TSLOT = (((NMAX + 2u) / 3u) * 8u + 255u) & ~255u;
     const uint32_t PROBE_OFF = 2u * SLOT + 4u * TSLOT;
     const uint32_t XCTR_OFF = PROBE_OFF + PROBE_BYTES;
@@ -178,7 +181,7 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < NR; i++) {
         scratch[i]  = plow_hsa_alloc_peer(h, dev[i], REGION);
         gate[i]     = plow_hsa_alloc_peer(h, dev[i], 256);
-        out[i]      = plow_hsa_alloc(h, dev[i], (size_t)NMAX * 2);
+        out[i]      = plow_hsa_alloc(h, dev[i], ((size_t)NMAX + 16) * 2);
         scr_tbl[i]  = plow_hsa_alloc(h, dev[i], NR * sizeof(void*));
         gate_tbl[i] = plow_hsa_alloc(h, dev[i], NR * sizeof(void*));
         stat[i]     = (uint32_t*)plow_hsa_alloc(h, dev[i], 4);
@@ -197,7 +200,7 @@ int main(int argc, char** argv) {
         plow_hsa_upload(h, dev[i], gate_tbl[i], gate_pv, NR * sizeof(void*));
     }
     const uint64_t deadline = (uint64_t)(ts_freq ? ts_freq : 1000000000);
-    bf16* hb = malloc((size_t)NMAX * 2);
+    bf16* hb = malloc(((size_t)NMAX + 16) * 2);
     unsigned char* zero_page = calloc(1, PROBE_BYTES);
 
     if (probe) {
@@ -233,6 +236,8 @@ int main(int argc, char** argv) {
          * a tag from the previous point cannot match (tags restart at 1). */
         uint32_t z[64] = {0};
         for (uint32_t i = 0; i < NR; i++) {
+            for (uint32_t e=0;e<N+16;e++) hb[e]=0x42f6u;
+            plow_hsa_upload(h,dev[i],out[i],hb,((size_t)N+16)*2);
             plow_hsa_upload(h, dev[i], gate[i], z, 256);
             plow_hsa_upload(h, dev[i], stat[i], z, 4);
             plow_hsa_upload(h, dev[i], lctr[i], z, 128);
@@ -258,7 +263,7 @@ int main(int argc, char** argv) {
             const uint32_t i = (uint32_t)ii;
             void* c = i ? NULL : cyc;
             const void* ka; size_t kz;
-            if (mode == MODE_ONESHOT) {
+            if (mode == MODE_ONESHOT || f32_parts) {
                 a[i] = (arg_ar){ out[i], scr_tbl[i], gate_tbl[i], NR, i, N, 0, ITERS, deadline, c, stat[i] };
                 ka = &a[i]; kz = sizeof a[i];
             } else if (mode == MODE_COLD) {
@@ -283,15 +288,24 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < NR; i++) {
             uint32_t st = 0; plow_hsa_download(h, dev[i], &st, stat[i], 4);
             if (st) { printf("  FAIL: rank %u xctr gate did not propagate (0x%08x)\n", i, st); timeout = 1; }
+            if(f32_parts) {
+                uint32_t count=0;plow_hsa_download(h,dev[i],&count,gate[i],4);
+                if(count!=ITERS*NR){printf("  FAIL: rank %u counter %u expected %u\n",i,count,ITERS*NR);timeout=1;}
+            }
         }
         if (timeout) { fails++; continue; }
 
         int exact = 1; size_t bad = 0;
         for (uint32_t i = 0; i < NR; i++) {
-            plow_hsa_download(h, dev[i], hb, out[i], (size_t)N * 2);
+            plow_hsa_download(h, dev[i], hb, out[i], ((size_t)N+16) * 2);
+            for (uint32_t e=N;e<N+16;e++) if(hb[e]!=0x42f6u) {exact=0;bad++;}
             for (uint32_t e = 0; e < N; e++) {
                 float sum = 0.0f;
-                for (uint32_t r = 0; r < NR; r++) sum += bf2f(partial_val(r, e, ITERS, order));
+                for (uint32_t r = 0; r < NR; r++) {
+                    if(f32_parts) sum += r==0 ? 1.0f+(float)((e&3u)+1u)*0x1p-9f
+                        : r==1 ? -1.0f+(float)((e&7u)+1u)*0x1p-12f : (float)(r+1u)*0x1p-14f;
+                    else sum += bf2f(partial_val(r, e, ITERS, order));
+                }
                 if (hb[e] != f2bf(sum)) {
                     if (exact)
                         printf("  FAIL: rank %u e=%u got %.4f want %.4f\n", i, e, bf2f(hb[e]), sum);
