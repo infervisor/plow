@@ -279,6 +279,14 @@ if(PLOW_CUDA)
     target_link_libraries(speech_f32_op_test PRIVATE m)
     add_test(NAME speech_f32_ops COMMAND speech_f32_op_test)
 
+    # Radix top-k vs the K-round block_max selection in d_sample_small / d_sample_fish: bit-identical
+    # codes on synthetic rows (optional args: recorded depth [rows][2048] and backbone [rows][2049]
+    # f32 logits).
+    add_executable(sample_topk_test tests/sample_topk_test.cu)
+    set_target_properties(sample_topk_test PROPERTIES CUDA_ARCHITECTURES "90a")
+    target_include_directories(sample_topk_test PRIVATE nvidia common)
+    add_test(NAME sample_topk COMMAND sample_topk_test)
+
     # NEGATIVE CONTROL AS A BUILD TARGET. The same test compiled with the naively
     # transliterated wave64 reduction offsets (__shfl_xor starting at 32 on a 32-lane warp).
     # It MUST fail: measured, it breaks 7 of 10 ops (HEADNORM_ROPE relL2 0.29, FLASH 0.50).
