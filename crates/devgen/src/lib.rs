@@ -8402,6 +8402,9 @@ pub fn write_sidecar_packet(
     };
     let mut sections = sections.to_vec();
     abi_section::append(model, &mut sections, "", "");
+    if checkpoint::header_only_used() {
+        sections.push(plow_asset::structure_only::section());
+    }
     let blob = model.to_blob_v6(&sections);
     std::fs::write(path, &blob).unwrap_or_else(|error| panic!("{name}: {error}"));
     let Some((checks, program_checks)) = receipts else {
@@ -11835,6 +11838,10 @@ fn emit_dense_gqa(
     object_requirements::append(&m, &mut sections)
         .unwrap_or_else(|error| panic!("object requirements: {error}"));
     abi_section::append(&m, &mut sections, &arch, &gpu);
+    if checkpoint::header_only_dir(&dir) || checkpoint::header_only_used() {
+        eprintln!("  structure-only packet: compiled from header-only checkpoints (zero weights)");
+        sections.push(plow_asset::structure_only::section());
+    }
     let blob = m.to_blob_v6(&sections);
     // Coverage gate BEFORE the blob lands on disk: a wrong .pkt that exists will be
     // benchmarked by someone. PLOW_SKIP_COVERAGE=1 is the deliberate escape hatch for

@@ -216,16 +216,9 @@ impl Ctx<'_> {
                     req_static(self, w.dim(2), "kernel h")?,
                     req_static(self, w.dim(3), "kernel w")?,
                 );
-                let h = req_static(self, x.dim(2), "input h")?;
-                let wd = req_static(self, x.dim(3), "input w")?;
-                let oh = (h + 2 * padding.0 as i64 - kh) / stride.0 as i64 + 1;
-                let ow = (wd + 2 * padding.1 as i64 - kw) / stride.1 as i64 + 1;
-                Ok(Shape::new([
-                    x.dim(0).clone(),
-                    out_c,
-                    Dim::stat(oh),
-                    Dim::stat(ow),
-                ]))
+                let oh = conv2d_dim(self, x.dim(2), kh, stride.0, padding.0)?;
+                let ow = conv2d_dim(self, x.dim(3), kw, stride.1, padding.1)?;
+                Ok(Shape::new([x.dim(0).clone(), out_c, oh, ow]))
             }
 
             Op::Conv3d { stride, padding } => {
@@ -764,6 +757,32 @@ fn replace_last(shape: &Shape, last: Dim) -> Shape {
     let n = dims.len();
     dims[n - 1] = last;
     Shape::new(dims)
+}
+
+fn conv2d_dim(
+    cx: &Ctx,
+    input: &Dim,
+    kernel: i64,
+    stride: u32,
+    padding: u32,
+) -> Result<Dim, InferError> {
+    if stride == 0 {
+        return Err(cx.err("conv2d stride must be positive"));
+    }
+    let stride = i64::from(stride);
+    let offset = 2 * i64::from(padding) - kernel;
+    if let Some(input) = input.as_static() {
+        return Ok(Dim::stat((input + offset).div_euclid(stride) + 1));
+    }
+    // Floor only the constant remainder when the symbolic part divides exactly.
+    if let Some(d) = input.div_static(stride) {
+        return Ok(d.add(&Dim::stat(offset.div_euclid(stride) + 1)));
+    }
+    input
+        .add(&Dim::stat(offset))
+        .div_static(stride)
+        .map(|d| d.add(&Dim::stat(1)))
+        .ok_or_else(|| cx.err("conv2d cannot represent this symbolic output size; bind the input size first"))
 }
 
 fn req_static(cx: &Ctx, d: &Dim, what: &str) -> Result<i64, InferError> {

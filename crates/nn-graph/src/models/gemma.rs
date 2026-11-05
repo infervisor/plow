@@ -47,6 +47,7 @@ pub fn build(cfg: &GemmaConfig) -> Graph {
         (h as f32).sqrt()
     };
     x = nn.scale(x, embedding_scale);
+    let per_layer = per_layer_inputs(&mut nn, cfg, &name, ids, x, &b, &s);
 
     for layer in 0..cfg.num_hidden_layers {
         let p = name(&format!("layers.{layer}"));
@@ -71,10 +72,13 @@ pub fn build(cfg: &GemmaConfig) -> Graph {
         let mlp = if cfg.layer_is_moe(layer) {
             moe_ffn(&mut nn, cfg, &p, normed, h)
         } else {
-            geglu_mlp(&mut nn, cfg, &p, normed, h)
+            geglu_mlp(&mut nn, cfg.intermediate_size_for(layer), &p, normed, h)
         };
         let mlp = nn.rmsnorm(&format!("{p}.post_feedforward_layernorm"), mlp, h, eps);
         x = nn.add(residual, mlp);
+        if let Some(per_layer) = per_layer {
+            x = per_layer_block(&mut nn, cfg, &p, x, per_layer, layer, &b, &s);
+        }
         if cfg.is_gemma4() {
             let layer_scalar = nn.param(&format!("{p}.layer_scalar"), [Dim::stat(1)]);
             x = nn.mul(x, layer_scalar);
@@ -96,6 +100,73 @@ pub fn build(cfg: &GemmaConfig) -> Graph {
     }
     nn.mark_output(logits);
     nn.finish()
+}
+
+/// Gemma 4 E-models: every layer also reads its own slice of a per-layer input,
+/// `(per_layer_projection_norm(per_layer_model_projection(x) / sqrt(h))
+///   + embed_tokens_per_layer(ids) * sqrt(d)) / sqrt(2)`, shaped `[B, S, layers, d]`.
+fn per_layer_inputs(
+    nn: &mut Nn,
+    cfg: &GemmaConfig,
+    name: &dyn Fn(&str) -> String,
+    ids: TensorId,
+    x: TensorId,
+    b: &Dim,
+    s: &Dim,
+) -> Option<TensorId> {
+    let d = cfg.hidden_size_per_layer_input;
+    if d <= 0 {
+        return None;
+    }
+    let (h, layers) = (cfg.hidden_size, cfg.num_hidden_layers as i64);
+    let vocab = match cfg.vocab_size_per_layer_input {
+        0 => cfg.vocab_size,
+        v => v,
+    };
+    let split =
+        |nn: &mut Nn, t| nn.reshape(t, [b.clone(), s.clone(), Dim::stat(layers), Dim::stat(d)]);
+    let embedded = nn.embedding(&name("embed_tokens_per_layer"), ids, vocab, layers * d);
+    let embedded = nn.scale(embedded, (d as f32).sqrt());
+    let embedded = split(nn, embedded);
+    let projected = nn.linear(&name("per_layer_model_projection"), x, h, layers * d, false);
+    let projected = nn.scale(projected, 1.0 / (h as f32).sqrt());
+    let projected = split(nn, projected);
+    let projected = nn.rmsnorm(
+        &name("per_layer_projection_norm"),
+        projected,
+        d,
+        cfg.rms_norm_eps,
+    );
+    let sum = nn.add(projected, embedded);
+    Some(nn.scale(sum, std::f32::consts::FRAC_1_SQRT_2))
+}
+
+/// Gated residual that injects layer `layer`'s per-layer input.
+#[allow(clippy::too_many_arguments)]
+fn per_layer_block(
+    nn: &mut Nn,
+    cfg: &GemmaConfig,
+    p: &str,
+    x: TensorId,
+    per_layer: TensorId,
+    layer: u32,
+    b: &Dim,
+    s: &Dim,
+) -> TensorId {
+    let (h, d) = (cfg.hidden_size, cfg.hidden_size_per_layer_input);
+    let gate = nn.linear(&format!("{p}.per_layer_input_gate"), x, h, d, false);
+    let gate = nn.act(ActKind::GeluTanh, gate);
+    let input = nn.slice(per_layer, 2, layer as i64, 1);
+    let input = nn.reshape(input, [b.clone(), s.clone(), Dim::stat(d)]);
+    let gated = nn.mul(gate, input);
+    let out = nn.linear(&format!("{p}.per_layer_projection"), gated, d, h, false);
+    let out = nn.rmsnorm(
+        &format!("{p}.post_per_layer_input_norm"),
+        out,
+        h,
+        cfg.rms_norm_eps,
+    );
+    nn.add(x, out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -189,8 +260,7 @@ fn round_to_bf16(value: f32) -> f32 {
 }
 
 /// GeGLU MLP: `down(act(gate(x)) * up(x))`.
-fn geglu_mlp(nn: &mut Nn, cfg: &GemmaConfig, prefix: &str, x: TensorId, h: i64) -> TensorId {
-    let inter = cfg.intermediate_size;
+fn geglu_mlp(nn: &mut Nn, inter: i64, prefix: &str, x: TensorId, h: i64) -> TensorId {
     let gate = nn.linear(&format!("{prefix}.mlp.gate_proj"), x, h, inter, false);
     let up = nn.linear(&format!("{prefix}.mlp.up_proj"), x, h, inter, false);
     let gate = nn.act(ActKind::GeluTanh, gate);

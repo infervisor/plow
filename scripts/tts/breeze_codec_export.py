@@ -18,6 +18,7 @@ the fish_dac export's naming (crates/devgen/src/fish_codec.rs), model_type qwen3
   HF_HOME=... python scripts/tts/breeze_codec_export.py OUT_DIR REVISION
 """
 import json
+import math
 import os
 import sys
 
@@ -117,7 +118,7 @@ def main():
     assert dc["num_key_value_heads"] == heads
     config = dict(
         model_type="qwen3_tts_12hz", sampling_rate=24000,
-        frame_samples=2 ** ups * int(torch.tensor(rates).prod()), frame_codes=n_q,
+        frame_samples=2 ** ups * math.prod(rates), frame_codes=n_q,
         codebook_sizes=[dc["codebook_size"]] * n_q, vq_dim=dc["codebook_dim"], latent_dim=dc["latent_dim"],
         pre_kernel=3,
         transformer=dict(layers=dc["num_hidden_layers"], dim=hidden, heads=heads, head_dim=hd,

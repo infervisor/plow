@@ -752,6 +752,7 @@ pub mod recurrent_state;
 pub mod serve_manifest;
 pub mod speech_contract;
 pub mod speech_fusion;
+pub mod structure_only;
 
 pub mod derived_weights;
 pub mod hetero;

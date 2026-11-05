@@ -1,22 +1,32 @@
 """Export Silero VAD v5's 16 kHz weights (from the `silero-vad` package's TorchScript model) to a
 safetensors checkpoint that `asr_silero_vad_compile` lowers into a `vad.frame.v1` packet.
 
-  python scripts/asr/silero_export.py <out dir>      (needs torch, silero-vad, safetensors)
+  python scripts/asr/silero_export.py <out dir> [--jit <silero_vad.jit>]
+
+An explicit TorchScript checkpoint needs only torch, numpy and safetensors; otherwise the
+checkpoint comes from the installed silero-vad package.
 
 Writes <out dir>/model.safetensors and <out dir>/reference.json: per-frame speech probabilities
 for a fixed test signal, which the packet's Rust executor is checked against."""
+import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from safetensors.torch import save_file
-from silero_vad import load_silero_vad
 
-out = Path(sys.argv[1])
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("out", type=Path)
+parser.add_argument("--jit", type=Path, help="Pinned Silero TorchScript checkpoint")
+args = parser.parse_args()
+out = args.out
 out.mkdir(parents=True, exist_ok=True)
-vad = load_silero_vad()
+if args.jit is not None:
+    vad = torch.jit.load(str(args.jit), map_location="cpu").eval()
+else:
+    from silero_vad import load_silero_vad
+    vad = load_silero_vad()
 model = vad._model
 state = {k: v.detach().float().contiguous() for k, v in model.state_dict().items()}
 names = {
