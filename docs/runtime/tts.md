@@ -205,11 +205,9 @@ The T3 asset runs on the shared text mux as guided jobs (two slots per request f
 guidance); `s3gen.pkt` renders audio on a render thread.
 
 Each token is drawn from the pair's logits with the packet's `lm.*` chain (guidance weight,
-repetition penalty, temperature, min_p, top_p). The host draws by default; `--cfg-device` /
-`PLOW_CFG_DEVICE=1` draws on the device (`plow_sample_cfg` in `sample_sm120.cubin`: same
-uniforms, per-slot penalty history, token written to both members; the `--cfg-multistep`
-variant that ran pairs in the multi-step quantum is removed). It stays off because it lost served aps at c16..c64 (H100: the
-host draw's gap paced T3 so utterances closed in batches; without it S3Gen renders batch smaller).
+repetition penalty, temperature, min_p, top_p) on the host. A device draw lost served aps at
+c16..c64 (H100: the host draw's gap paced T3 so utterances closed in batches; without it S3Gen
+renders batch smaller).
 The repetition penalty applies once per distinct history token, as HF's
 `RepetitionPenaltyLogitsProcessor` (gather / scatter); applying it per occurrence (before
 2026-09-27) pushed repeated speech tokens away exponentially and ran 7/96 multilingual requests to

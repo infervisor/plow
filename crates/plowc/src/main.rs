@@ -133,9 +133,10 @@ struct Cli {
     ///     streams + manifest, run on the CPU reference interpreter /
     ///     simulator;
     ///   * `devblob+cubin` — as `devblob`, then BUILD the interpreter object
-    ///     from the manifest it just wrote. Opt-in, and only this form needs a
-    ///     CUDA toolkit: `devblob` alone still requires none, so the shipped
-    ///     binaries keep working against prebuilt assets.
+    ///     from the manifest it just wrote (`.cubin`, or `<out>/hsaco/*.elf` for
+    ///     gfx942/gfx1201). Opt-in, and only this form needs a GPU toolkit:
+    ///     `devblob` alone still requires none, so the shipped binaries keep
+    ///     working against prebuilt assets.
     #[arg(long, value_enum)]
     emit: Option<EmitKind>,
 
@@ -253,6 +254,12 @@ struct Cli {
           action = clap::ArgAction::Set, num_args = 0..=1,
           require_equals = true, default_missing_value = "true")]
     lean_oracle_devblob: bool,
+
+    /// Bundle qualification after a devblob emit (`plowc qualify` over the written packets),
+    /// recorded in `build.json` `lean.bundle_qualification`. `strict` also fails the emit on any
+    /// gap; campaign builds of a production recipe (`recipes/infervisor`) pass it.
+    #[arg(long = "lean-qualify", value_enum, default_value_t = LeanQualify::Report)]
+    lean_qualify: LeanQualify,
 
     /// Skip checkpoint K, the knob-consistency certificate. On by default: a rejection, or no
     /// runnable `plow_verify`, fails the emit. Bring-up only: `build.json` records
@@ -424,6 +431,12 @@ impl Preset {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LeanQualify {
+    Report,
+    Strict,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum PhaseArg {
     Prefill,
@@ -504,6 +517,27 @@ enum Cmd {
     /// plowc --hf-dir <ckpt> stage-plan --cores 90 --batch 16 --ctx 16384 --out stage_plan.json
     /// ```
     StagePlan(StagePlanCli),
+
+    /// Lean receipt qualification of a bundle directory (every `*.pkt`) or one packet: derives
+    /// the required obligations from the packet, matches receipts, checks verifier approval and
+    /// (unless `--no-replay`) replays them. CPU only. Exits non-zero when a packet does not
+    /// qualify.
+    ///
+    /// ```text
+    /// plowc qualify <assets-dir|model.pkt> [--format json]
+    /// ```
+    Qualify(QualifyCli),
+}
+
+#[derive(Args, Debug)]
+struct QualifyCli {
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+    #[arg(long)]
+    no_replay: bool,
+    /// `text` (default) or `json`.
+    #[arg(long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Args, Debug)]
@@ -1031,6 +1065,16 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 error!(error = %e, "stage-plan failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(Cmd::Qualify(q)) = &cli.cmd {
+        return match run_qualify(q) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!(error = %e, "qualify failed");
                 ExitCode::FAILURE
             }
         };
@@ -2018,11 +2062,6 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // unset, or an unpartitioned GPU such as consumer Blackwell) ⇒ byte-identical blob. The
     // physical-SM dispatch that consumes this is a runtime/interp feature —
     // see the design notes.
-    //
-    // WAS `PLOW_NV_PLACE`, still accepted. The concept is vendor-neutral — an L2 domain is a GPC
-    // on NVIDIA and an XCD on AMD — and the NVIDIA-specific name was reading as "this is an
-    // NVIDIA feature" for something `hwspec` describes on both vendors. The old spelling stays
-    // live so in-flight scripts and recipes do not break.
     let l2_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
     let l2_off = |k: &str| std::env::var(k).ok().as_deref() == Some("0");
     // DEFAULT ON FOR gfx942/gfx950. Per-XCD queues are the shipped CDNA decode/prefill path,
@@ -2034,7 +2073,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Both shipping AMD object recipes carry the checked dispatch marker. Other architectures
     // remain explicit opt-in until their physical-domain mapping is measured.
     let l2_default = matches!(cli.arch.as_str(), "gfx942" | "gfx950") && !l2_off("PLOW_L2_PLACE");
-    let l2_layout = if l2_default || l2_on("PLOW_L2_PLACE") || l2_on("PLOW_NV_PLACE") {
+    let l2_layout = if l2_default || l2_on("PLOW_L2_PLACE") {
         hwspec::registry::lookup(&cli.gpu)
             .and_then(|s| s.l2_partitioning.as_ref())
             // WHICH WORKGROUP LANDS ON WHICH DOMAIN IS VENDOR-SPECIFIC, and getting it from the
@@ -2190,11 +2229,124 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         }
     }
 
+    let scope = if out_is_pkt {
+        pkt.as_path()
+    } else {
+        out_dir.as_path()
+    };
+    qualify_emit(scope, &pkt.with_file_name("build.json"), cli.lean_qualify)?;
+
     info!(
         slug = %slug, n_cu, tp, bundle = !out_is_pkt, out = %pkt.display(),
         "devblob written"
     );
     Ok(pkt)
+}
+
+#[cfg(feature = "lean-verify")]
+fn qualify_json(path: &std::path::Path, replay: bool) -> Result<Vec<serde_json::Value>, String> {
+    Ok(plowc::qualify::qualify_path(path, replay)?
+        .into_iter()
+        .map(|(packet, q)| {
+            serde_json::json!({"packet": packet, "qualified": q.qualified(),
+                "replayed": replay, "qualification": q})
+        })
+        .collect())
+}
+
+#[cfg(not(feature = "lean-verify"))]
+fn qualify_json(_path: &std::path::Path, _replay: bool) -> Result<Vec<serde_json::Value>, String> {
+    Err("plowc was built without the `lean-verify` feature".into())
+}
+
+fn print_qualification(entry: &serde_json::Value) {
+    let q = &entry["qualification"];
+    let count = |k: &str| q[k].as_array().map_or(0, Vec::len);
+    println!(
+        "{} {}: {}/{} obligations, {} policy receipts, verifiers {}",
+        if entry["qualified"] == true {
+            "QUALIFIED  "
+        } else {
+            "UNQUALIFIED"
+        },
+        entry["packet"].as_str().unwrap_or_default(),
+        count("satisfied"),
+        count("required"),
+        q["policy_receipts"],
+        q["receipt_verifiers"]
+    );
+    for gap in q["gaps"].as_array().into_iter().flatten() {
+        println!("    gap: {}", gap.as_str().unwrap_or_default());
+    }
+}
+
+fn run_qualify(q: &QualifyCli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut report = Vec::new();
+    for path in &q.paths {
+        report.extend(qualify_json(path, !q.no_replay)?);
+    }
+    if q.format == "json" {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        report.iter().for_each(print_qualification);
+    }
+    let failed = report.iter().filter(|e| e["qualified"] != true).count();
+    if failed > 0 {
+        return Err(format!("{failed} packet(s) do not qualify").into());
+    }
+    Ok(())
+}
+
+/// The emit's own qualification of what it wrote, recorded in `build.json`
+/// `lean.bundle_qualification`; `strict` fails the emit on any gap.
+fn qualify_emit(
+    scope: &std::path::Path,
+    build_json: &std::path::Path,
+    policy: LeanQualify,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (qualified, record) = match qualify_json(scope, true) {
+        Ok(packets) => {
+            for e in &packets {
+                info!(packet = %e["packet"], qualified = %e["qualified"],
+                    gaps = %e["qualification"]["gaps"], "lean qualification");
+            }
+            let qualified = packets.iter().all(|e| e["qualified"] == true);
+            let packets: Vec<_> = packets
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "packet": std::path::Path::new(e["packet"].as_str().unwrap_or_default())
+                            .file_name().and_then(|f| f.to_str()),
+                        "qualified": e["qualified"],
+                        "gaps": e["qualification"]["gaps"],
+                    })
+                })
+                .collect();
+            (
+                qualified,
+                serde_json::json!({"qualified": qualified, "packets": packets}),
+            )
+        }
+        Err(error) => (
+            false,
+            serde_json::json!({"qualified": false, "error": error}),
+        ),
+    };
+    let mut record = record;
+    record["policy"] = serde_json::json!(format!("{policy:?}").to_lowercase());
+    if build_json.is_file() {
+        let mut build: serde_json::Value = serde_json::from_slice(&std::fs::read(build_json)?)?;
+        build["lean"]["bundle_qualification"] = record.clone();
+        std::fs::write(build_json, serde_json::to_vec_pretty(&build)?)?;
+    }
+    if qualified {
+        info!(scope = %scope.display(), "lean bundle qualification complete");
+    } else if policy == LeanQualify::Strict {
+        return Err(format!("strict lean qualification failed: {record}").into());
+    } else {
+        warn!(scope = %scope.display(), "lean bundle qualification incomplete (recorded in build.json)");
+    }
+    Ok(())
 }
 
 /// `--emit devblob+cubin`: drive the Phase-A CMake target with the defines the
@@ -2216,6 +2368,9 @@ fn build_cubin_from_manifest(
     speech: bool,
     t3: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if arch.starts_with("gfx") {
+        return build_hsaco_from_packet(pkt, arch);
+    }
     let mpath = pkt.with_file_name("build.json");
     let man: serde_json::Value = serde_json::from_slice(
         &std::fs::read(&mpath)
@@ -2247,8 +2402,7 @@ fn build_cubin_from_manifest(
     }
 
     // The manifest is arch-agnostic on purpose; picking the backend is this
-    // function's job. hipcc → .hsaco (runtime/amd/) is the same shape and is
-    // deliberately left for a follow-up.
+    // function's job (hipcc → .hsaco is `build_hsaco_from_packet`).
     let flags = man
         .get("backends")
         .and_then(|b| b.get("nvcc"))
@@ -2401,6 +2555,65 @@ fn build_cubin_from_manifest(
     Ok(())
 }
 
+/// `--emit devblob+cubin` on an AMD arch: `scripts/build_gfx942.sh` in its `PLOW_HSACO_CONFIG`
+/// mode, which stamps every row with the packet hash and derives the object set (decode batch,
+/// tiers, opt-in arms) from the packet's `plow_config.h`. Writes `<assets>/hsaco`, where
+/// `plowrt serve` looks by default.
+fn build_hsaco_from_packet(pkt: &Path, arch: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let script = hsaco_build_script(arch)?;
+    let config = pkt.with_file_name("plow_config.h");
+    if !config.is_file() {
+        return Err(format!(
+            "--emit devblob+cubin: packet config {} was not emitted",
+            config.display()
+        )
+        .into());
+    }
+    // Absolute: the script changes into its output directory before reading either.
+    let config = std::fs::canonicalize(&config)?;
+    if std::env::var_os("PLOW_HIPCC").is_none() {
+        return Err(format!(
+            "--emit devblob+cubin --arch {arch} needs the ROCm toolchain from `nix develop` \
+             (PLOW_HIPCC is unset). The packet and {} were written successfully; build the \
+             objects with scripts/{script}, or use --emit devblob.",
+            config.display()
+        )
+        .into());
+    }
+    let root = repo_runtime_dir()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or("--emit devblob+cubin: runtime/ has no parent directory")?;
+    let out = config.with_file_name("hsaco");
+    let status = std::process::Command::new("bash")
+        .arg(root.join("scripts").join(script))
+        .arg(&out)
+        .env("PLOW_HIP_ARCH", arch)
+        .env("PLOW_HSACO_CONFIG", &config)
+        .status()?;
+    if !status.success() {
+        return Err(format!("scripts/{script} failed ({status})").into());
+    }
+    info!(out = %out.display(), "interpreter objects built");
+    Ok(())
+}
+
+fn hsaco_build_script(arch: &str) -> Result<&'static str, String> {
+    match arch {
+        "gfx942" | "gfx1201" => Ok("build_gfx942.sh"),
+        // build_gfx950.sh's config mode does not derive the decode batch from the packet, so
+        // an emitted object could be narrower than the packet and refused at load.
+        "gfx950" => Err("--emit devblob+cubin: gfx950 objects are built by \
+             scripts/build_gfx950.sh with the packet's decode batch set explicitly; \
+             use --emit devblob and run it."
+            .into()),
+        _ => Err(format!(
+            "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
+             supported AMD architectures are gfx942 and gfx1201."
+        )),
+    }
+}
+
 fn effective_uniseg(
     arch: &str,
     cpu: bool,
@@ -2459,10 +2672,6 @@ fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
         _ if devgen::target_is_cpu(arch, "") => Err(format!(
             "--emit devblob+cubin: --arch {arch} is a CPU target; the CPU engine needs no \
              interpreter object, use --emit devblob."
-        )),
-        _ if !arch.starts_with("sm_") => Err(format!(
-            "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
-             need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
         )),
         _ => Err(format!(
             "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
@@ -3484,9 +3693,14 @@ mod cli_tests {
         assert!(cubin_arch_option("sm_100a")
             .unwrap_err()
             .contains("no served interpreter"));
-        assert!(cubin_arch_option("gfx950")
+        assert_eq!(hsaco_build_script("gfx942").unwrap(), "build_gfx942.sh");
+        assert_eq!(hsaco_build_script("gfx1201").unwrap(), "build_gfx942.sh");
+        assert!(hsaco_build_script("gfx950")
             .unwrap_err()
-            .contains("hipcc/.hsaco"));
+            .contains("build_gfx950.sh"));
+        assert!(hsaco_build_script("gfx90a")
+            .unwrap_err()
+            .contains("no served interpreter"));
     }
 
     #[test]

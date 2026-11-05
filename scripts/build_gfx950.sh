@@ -150,11 +150,6 @@ case "${PLOW_GEMV_F32_COL:-0}" in
   1|2) DEC_KNOBS="$DEC_KNOBS -DPLOW_GEMV_F32_COL=$PLOW_GEMV_F32_COL" ;;
   *) echo "PLOW_GEMV_F32_COL must be 0, 1 or 2" >&2; exit 2 ;;
 esac
-case "${PLOW_MLA_DEC_MINPER:-0}" in
-  0) ;;
-  *[!0-9]*) echo "PLOW_MLA_DEC_MINPER must be a row count" >&2; exit 2 ;;
-  *) DEC_KNOBS="$DEC_KNOBS -DPLOW_MLA_DEC_MINPER=$PLOW_MLA_DEC_MINPER" ;;
-esac
 # PLOW_MLA_DEC_HPACK (decode-MLA segment objects only): GF=8 NoPE dense flash packets run on
 # the head-packed MFMA kernel (=1, d_flash_mla_decode_mfma) or the scalar GF=8 arm (=2).
 DMLA_X=""
@@ -213,8 +208,8 @@ case "${PLOW_XR_TAGGED:-1}" in
   *) echo "PLOW_XR_TAGGED must be 0 or 1" >&2; exit 2 ;;
 esac
 # PLOW_XR_DEC_AGG (default 1; 0 = rollback): device-local aggregation of the two-shot's all-gather
-# signal (PLOW_XR_AGG, build_gfx942.sh's default) in the decode objects, for packets emitted with
-# PLOW_XR_DEC_TWOSHOT_MIN. Bit-identical; inert without decode two-shots.
+# signal (PLOW_XR_AGG, build_gfx942.sh's default) in the decode objects. Bit-identical; inert
+# without decode two-shots.
 # PLOW_FA_DEC_KL=8: decode flash K-phase with eight lanes per KV row (gfx942's map; one 128-byte
 # line per row per instruction instead of 64 rows per instruction) plus the interleaved row->wave
 # map. NOT bit-identical (the per-row dot is summed in a different order); 1 = shipped map.
@@ -231,16 +226,6 @@ case "${PLOW_XR_DEC_MLP:-1}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_MLP=1" ;;
   *) echo "PLOW_XR_DEC_MLP must be 0 or 1" >&2; exit 2 ;;
-esac
-# PLOW_XR_DEC_VEC (default 0 = off; 2/4/8): the decode one-shot reduce loads that many bf16 per
-# peer per thread (PLOW_XR_VEC, op_collective.h) for the batched rungs' gate path. Bit-identical.
-# MEASURED SLOWER, keep 0 (tp_allreduce_bench cold, 8x MI350X, [128,4096] at 256 WGs: 52.3 us
-# scalar vs 59.6 (V=4) / 59.0 (V=8)). The lever there is fewer workgroups: PLOW_XR_DEC_CUS=64
-# gives 31.3 us (B=32 shape 27.1 -> 15.6, B=8 18.5 -> 11.5).
-case "${PLOW_XR_DEC_VEC:-0}" in
-  0) ;;
-  2|4|8) DEC_KNOBS="$DEC_KNOBS -DPLOW_XR_VEC=$PLOW_XR_DEC_VEC" ;;
-  *) echo "PLOW_XR_DEC_VEC must be 0, 2, 4 or 8" >&2; exit 2 ;;
 esac
 # PLOW_XR_TAG_SLOT (default 20480; bytes, multiple of 256): the tagged one-shot slot of the decode
 # objects. 90112 lets B=8 x hidden 4096 take the tagged path. Serve with the same PLOW_XR_TAG_SLOT.

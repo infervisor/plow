@@ -25,8 +25,8 @@
 //! genuinely implemented somewhere else off a direct `env::var` read and nothing here ever
 //! intended to consume the parsed copy:
 //!
-//! * `packet::devbuild` reads `PLOW_SEG_PER_OP`, `PLOW_SEG_CLASS_SLICE`, `PLOW_FINE_FORCE`,
-//!   `PLOW_CHAIN_BYPASS`, `PLOW_SEG_DUMP`, `PLOW_PLACE_REPORT` directly;
+//! * `packet::devbuild` reads `PLOW_SEG_PER_OP`, `PLOW_SEG_CLASS_SLICE` and `PLOW_CHAIN_BYPASS`
+//!   directly;
 //! * `plowc::main` reads `PLOW_BLOCK` (behind its own `--block`), `PLOW_L2_PLACE` and
 //!   `PLOW_ROOT` directly;
 //! * `plowrt::config` owns `PLOW_CHECKPOINT` as `--rt-checkpoint`; devgen binds weights from
@@ -173,6 +173,11 @@ pub struct EmitConfig {
     #[arg(skip)]
     pub packed_prefill_default: bool,
 
+    /// `emit_packed_prefill` was set by the sm_120a FP8-KV production default rather than the
+    /// recipe: a packet the contract does not fit declines it instead of failing the emit.
+    #[arg(skip)]
+    pub packed_prefill_fp8kv_default: bool,
+
     /// Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs in their own gfx950 segment.
     /// Default on; `=0` is the rollback to the interpreter-resident pair.
     #[arg(long = "emit-decode-mla-segments", env = "PLOW_SEG_DECODE_MLA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -309,6 +314,14 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NO_FUSE_NRN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub no_fuse_nrn: bool,
 
+    /// Keep residual state in FP32 while projections and KV remain BF16.
+    #[arg(long, env = "PLOW_RESIDUAL_F32", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub residual_f32: bool,
+
+    /// Keep prefill O and decode down-projection partials in FP32 until one-shot all-reduce.
+    #[arg(long, env = "PLOW_TP_PARTIAL_F32", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub tp_partial_f32: bool,
+
     /// Fuse head-norm + reduce.
     #[arg(long, env = "PLOW_FUSE_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_hnr: bool,
@@ -391,10 +404,6 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_FA_SPLIT_PREFILL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_fa_split_prefill: bool,
 
-    /// Head-number split (3*nhn <= n_cu).
-    #[arg(long, env = "PLOW_HN_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub hn_split: bool,
-
     /// Emit the k and v head-norms as ONE instruction on a fused-QKV decode program.
     #[arg(long, env = "PLOW_FUSE_KV_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_kv_hnr: bool,
@@ -461,10 +470,6 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_DECODE_GEMV_W_CS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_gemv_w_cs: bool,
 
-    /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
-    #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
-    pub moe_combine_blocks: Option<u32>,
-
     // ──────────────────────────────────────────────────────────────────────────
     // Attention / flash-decode geometry
     // ──────────────────────────────────────────────────────────────────────────
@@ -506,10 +511,6 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_TTS_VOCODER_DIR")]
     pub tts_vocoder: Option<std::path::PathBuf>,
 
-    /// Widen the flash-merge dispatch by this factor (diagnostic; measured no effect).
-    #[arg(long, env = "PLOW_FLASH_MERGE_DSPLIT", hide = true)]
-    pub flash_merge_dsplit: Option<u32>,
-
     /// Scale the CU-fill target for flash-decode nsplit.
     #[arg(long, env = "PLOW_NS_MUL")]
     pub ns_mul: Option<u32>,
@@ -541,17 +542,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_BLOCK_PACKETS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub block_packets: bool,
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Placement / L2 / counters
+    // ──────────────────────────────────────────────────────────────────────────
     /// Opt-in knob for modular block prefill pipeline and fine-grained ladder decomposition.
     #[arg(long, env = "PLOW_PF_MODULAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub pf_modular: bool,
 
-    /// Single block stage to emit in isolation: "attn", "ffn", "embed", "vocab", or "all".
-    #[arg(long, env = "PLOW_BLOCK_STAGE", value_parser = clap::builder::PossibleValuesParser::new(["attn", "ffn", "embed", "vocab", "all"]))]
-    pub block_stage: Option<String>,
-
-    // ──────────────────────────────────────────────────────────────────────────
-    // Placement / L2 / counters
-    // ──────────────────────────────────────────────────────────────────────────
     /// Cap XReduce participant CUs.
     #[arg(long, env = "PLOW_XR_CUS")]
     pub xr_cus: Option<u32>,
@@ -566,20 +563,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_XR_DEC_CUS")]
     pub xr_dec_cus: Option<u32>,
 
-    /// DECODE all-reduces of at least N elements (a batched rung's [rows, hidden]) take the
-    /// two-shot (reduce-scatter + all-gather) instead of the one-shot. Bit-identical.
-    #[arg(long, env = "PLOW_XR_DEC_TWOSHOT_MIN")]
-    pub xr_dec_twoshot_min: Option<u32>,
-
     /// Use reduce-scatter/all-gather for complete folded-gather collectives. The second
     /// partial is added while the reduced slices are gathered. Default on; `=0` is the
     /// rollback to the one-shot collective.
     #[arg(long, env = "PLOW_XR2_GATHER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub xr2_gather: bool,
-
-    /// Disable all XReduce collectives (diagnostic — numerically wrong).
-    #[arg(long, env = "PLOW_NO_XREDUCE", default_value_t = false, hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub no_xreduce: bool,
 
     // ──────────────────────────────────────────────────────────────────────────
     // MoE (Gemma MoE family)
@@ -601,10 +589,6 @@ pub struct EmitConfig {
     /// Needs a decode object built with `PLOW_MOE_DEC_GROUP=1`.
     #[arg(long, env = "PLOW_GEMMA_MOE_DEC_GROUP")]
     pub gemma_moe_dec_group: Option<u32>,
-
-    /// Exact MoeRouterGemmaScore op instead of ScoreFast.
-    #[arg(long, env = "PLOW_GEMMA_MOE_ROUTER_EXACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub gemma_moe_router_exact: bool,
 
     /// Fuse the Gemma-4 MoE layer tail (op70 + NormResidualNorm) into one op72 packet per row.
     #[arg(long, env = "PLOW_GEMMA_MOE_TAIL_FUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -660,17 +644,6 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_DSV41_SEQ_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub dsv41_seq_par: bool,
 
-    /// Ceiling instrument: run the V4.1 mHC and norm packets over `t/tp` rows. WRONG ANSWER by
-    /// construction -- it prices sequence parallelism, it does not implement it.
-    #[arg(long, env = "PLOW_DSV41_SP_ABL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub dsv41_sp_abl: bool,
-
-    #[arg(long = "k3-ns", env = "PLOW_K3_NS", hide = true)]
-    legacy_k3_ns: Option<u32>,
-
-    #[arg(long = "glm-ns", env = "PLOW_GLM_NS", hide = true)]
-    legacy_glm_ns: Option<u32>,
-
     /// Layers to emit (K3 and GLM): "all", a number N (first N layers), or "single:L".
     /// A truncation instrument for block sweeps and TP-equivalence checks; never a served packet.
     #[arg(long, env = "PLOW_LAYERS", hide = true)]
@@ -678,9 +651,6 @@ pub struct EmitConfig {
 
     #[arg(long = "k3-layers", env = "PLOW_K3_LAYERS", hide = true)]
     legacy_k3_layers: Option<String>,
-
-    #[arg(long = "glm-layers", env = "PLOW_GLM_LAYERS", hide = true)]
-    legacy_glm_layers: Option<String>,
 
     /// K3 prefill bucket control: unset/`full` = the whole ladder, `0` = decode only,
     /// `512,1024` = those rungs.
@@ -845,14 +815,6 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_TUNE_IGNORE_DIGEST", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub tune_ignore_digest: bool,
 
-    /// GLM router off-shared dispatch (co-resident mode 2 only).
-    #[arg(long, env = "GLM_ROUTER_OFF_SHARED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_router_off_shared: bool,
-
-    /// GLM use legacy (unfused) single-CU router.
-    #[arg(long, env = "GLM_ROUTER_OLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub glm_router_old: bool,
-
     // ──────────────────────────────────────────────────────────────────────────
     // Norm/GEMV fusion and KDA prefill chain (K3 hybrid family)
     // ──────────────────────────────────────────────────────────────────────────
@@ -924,11 +886,6 @@ pub struct EmitConfig {
     /// (TTFT +8 ms for TPOT -0.09 ms); kept for `scripts/k3_tp_equivalence.sh`.
     #[arg(long, env = "PLOW_K3_SHARD_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_shard_head: bool,
-
-    /// Diagnostic: force the per-sequence GEMV row carrier at B=1 (bisects the batched-decode
-    /// addressing against the known-good B=1 stream).
-    #[arg(long, env = "PLOW_K3_SEQ_ROWS", default_value_t = false, hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub k3_seq_rows: bool,
 
     // ──────────────────────────────────────────────────────────────────────────
     // GEMV geometry
@@ -1385,29 +1342,6 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_DSA_PF_DEXACT")]
     pub glm_dsa_pf_dexact: Option<u32>,
 
-    /// Add the sub-128 prefill rungs (32, 64) on AMD. DEFAULT OFF, and it earned that.
-    ///
-    /// It shipped on by default and was withdrawn on measurement. What it buys is a 29.5% /
-    /// 11.3% reduction in emitted workgroup-packets at t=32 / t=64 against the 128 rung —
-    /// sublinear, because `GM_BM=192` makes `ceil(t/192) == 1` for every rung at or below 192,
-    /// so the dense GEMM does not shrink at all and only flash, norms and rope do. Nothing has
-    /// ever priced that in wall-clock, and two serving campaigns measured it at zero.
-    ///
-    /// What it COSTS was measured: +940 tile lookups that are all analytical and stay that way
-    /// (16 distinct GEMM shapes, `{32,64} × {2048,4096,5376,8192,16384,21504}`), +30.9% blob
-    /// size, and 14 extra dispatch-audit findings — `GemmSmall` at 13.8-47.4% occupancy, the
-    /// worst in the blob.
-    ///
-    /// And it caps the DECODE ladder at 16. Decode and prefill rungs share one width-ordered
-    /// space (`packet::devbuild::decode_rung_lo` separates them by width and the blob carries no
-    /// field distinguishing them), so a 32 prefill bucket collides with a 32 decode rung and the
-    /// emit refuses. With the floor off the decode ceiling is 64; with it on, 16. That is the
-    /// concrete reason this is off rather than deleted: the rungs are still one flag away for
-    /// anyone who wants to measure them, but they do not get to block decode concurrency by
-    /// default.
-    #[arg(long = "pf-floor", env = "PLOW_PF_FLOOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub pf_floor: bool,
-
     /// CAP on the dense-GQA prefill `FlashPrefill` KV split (`dense_flash_split`). Unset = the
     /// CU-fill heuristic, unchanged.
     ///
@@ -1458,10 +1392,6 @@ pub struct EmitConfig {
     /// (`d_attn_res_mwg`, C3 f32-mix contract). 0/unset = the single-workgroup arm.
     #[arg(long, env = "PLOW_ATTNRES_DECODE_MWG")]
     pub attnres_decode_mwg: Option<u32>,
-
-    /// Diagnostic: restrict banding to one seam (`attn` | `moe`) to bisect a divergence.
-    #[arg(long, env = "PLOW_GLM_XR_BAND_SEAM", hide = true)]
-    pub glm_xr_band_seam: Option<String>,
 
     /// Fold the post-collective Residual into the two-shot all-gather. Bit-identical.
     #[arg(long, env = "PLOW_GLM_XR_RES", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1743,6 +1673,7 @@ pub struct EmitConfig {
 
     /// Generated-kernel catalog entries to emit as role objects, comma-separated (e.g.
     /// "attn_pf_hd512"); each binds the packet ops matching its signature (`gen_kernels.rs`).
+    /// `name@rows` overrides the smallest prefill rung the entry binds.
     #[arg(long = "emit-gen-kernels", env = "PLOW_EMIT_GEN_KERNELS")]
     pub gen_kernels: Option<String>,
 
@@ -2002,6 +1933,7 @@ impl EmitConfig {
             seg_fa256_gqa2: env_bool_opt("PLOW_SEG_FA256_GQA2"),
             emit_packed_prefill: env_bool_opt("PLOW_EMIT_PACKED_PREFILL"),
             packed_prefill_default: false,
+            packed_prefill_fp8kv_default: false,
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
             // value; direct legacy callers must name the feature explicitly.
             decode_mla_segments: env_bool("PLOW_SEG_DECODE_MLA"),
@@ -2026,6 +1958,8 @@ impl EmitConfig {
             no_fuse_qkv: env_bool("PLOW_NO_FUSE_QKV"),
             fuse_qkv_fp8: env_bool("PLOW_FUSE_QKV_FP8"),
             no_fuse_nrn: env_bool("PLOW_NO_FUSE_NRN"),
+            residual_f32: env_bool("PLOW_RESIDUAL_F32"),
+            tp_partial_f32: env_bool("PLOW_TP_PARTIAL_F32"),
             fuse_hnr: env_bool("PLOW_FUSE_HNR"),
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),
@@ -2043,7 +1977,6 @@ impl EmitConfig {
             nv_fa_rg_u: env_u32("PLOW_NV_FA_RG_U"),
             nv_fa_rgt: env_bool("PLOW_NV_FA_RGT"),
             nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
-            hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             span_verify: env_bool("PLOW_EMIT_SPAN_VERIFY"),
             emit_spec: env_bool("PLOW_EMIT_SPEC"),
@@ -2058,7 +1991,6 @@ impl EmitConfig {
             decode_gemv_xk: env_u32("PLOW_DECODE_GEMV_XK"),
             decode_gemv_xk_qkv: env_bool("PLOW_DECODE_GEMV_XK_QKV"),
             decode_gemv_w_cs: env_bool("PLOW_DECODE_GEMV_W_CS"),
-            moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             fa_gf_64: env_u32("PLOW_FA_GF_64"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
@@ -2067,7 +1999,6 @@ impl EmitConfig {
             tts_profile: env_str("PLOW_TTS_PROFILE"),
             tts_codec: env_str("PLOW_TTS_CODEC_DIR").map(std::path::PathBuf::from),
             tts_vocoder: env_str("PLOW_TTS_VOCODER_DIR").map(std::path::PathBuf::from),
-            flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),
             ns_full_abs: env_u32("PLOW_NS_FULL_ABS"),
@@ -2076,18 +2007,14 @@ impl EmitConfig {
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
             block_packets: env_bool_default_true("PLOW_BLOCK_PACKETS"),
             pf_modular: env_bool_default_true("PLOW_PF_MODULAR"),
-            block_stage: env_str("PLOW_BLOCK_STAGE"),
             xr_cus: env_u32("PLOW_XR_CUS"),
             glm_pf_small_cus: env_str("PLOW_GLM_PF_SMALL_CUS"),
             xr_dec_cus: env_u32("PLOW_XR_DEC_CUS"),
-            xr_dec_twoshot_min: env_u32("PLOW_XR_DEC_TWOSHOT_MIN"),
             xr2_gather: env_opt_out("PLOW_XR2_GATHER"),
-            no_xreduce: env_bool("PLOW_NO_XREDUCE"),
             moe_prefill: env_str("PLOW_MOE_PREFILL"),
             gemma_moe_router_fused: env_bool("PLOW_GEMMA_MOE_ROUTER_FUSED"),
             gemma_moe_router_blocks: env_u32("PLOW_GEMMA_MOE_ROUTER_BLOCKS"),
             gemma_moe_dec_group: env_u32("PLOW_GEMMA_MOE_DEC_GROUP"),
-            gemma_moe_router_exact: env_bool("PLOW_GEMMA_MOE_ROUTER_EXACT"),
             gemma_moe_tail_fuse: env_bool("PLOW_GEMMA_MOE_TAIL_FUSE"),
             gemma_moe_gq_hoist: env_bool("PLOW_GEMMA_MOE_GQ_HOIST"),
             k3_full: env_bool_default_true("K3_FULL"),
@@ -2101,9 +2028,6 @@ impl EmitConfig {
             dsv41_xr_band: env_u32("PLOW_DSV41_XR_BAND").unwrap_or(1),
             dsv41_xr_band_cus: env_u32("PLOW_DSV41_XR_BAND_CUS"),
             dsv41_seq_par: env_bool("PLOW_DSV41_SEQ_PAR"),
-            dsv41_sp_abl: env_bool("PLOW_DSV41_SP_ABL"),
-            legacy_k3_ns: env_u32("PLOW_K3_NS"),
-            legacy_glm_ns: env_u32("PLOW_GLM_NS"),
             k3_prefill: env_str("K3_PREFILL"),
             glm_dsa: env_str("PLOW_GLM_DSA"),
             glm_gf: env_u32("PLOW_GLM_GF"),
@@ -2153,7 +2077,6 @@ impl EmitConfig {
                 }
             })),
             legacy_k3_layers: env_str("PLOW_K3_LAYERS"),
-            legacy_glm_layers: env_str("PLOW_GLM_LAYERS"),
             mla_prefill: env_str("PLOW_MLA_PREFILL"),
             glm_ep: env_bool("GLM_EP"),
             glm_group: env_bool("GLM_GROUP"),
@@ -2166,8 +2089,6 @@ impl EmitConfig {
             glm_fuse_seam_rn: env_bool("PLOW_GLM_FUSE_SEAM_RN"),
             emit_rewrite: env_opt_out("PLOW_EMIT_REWRITE"),
             tune_ignore_digest: env_opt_out("PLOW_TUNE_IGNORE_DIGEST"),
-            glm_router_off_shared: env_bool("GLM_ROUTER_OFF_SHARED"),
-            glm_router_old: env_bool("GLM_ROUTER_OLD"),
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
             k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
             kda_decode_fused: env_bool("PLOW_KDA_DECODE_FUSED"),
@@ -2181,7 +2102,6 @@ impl EmitConfig {
             kda_wu_lean: env_opt_out("PLOW_KDA_WU_LEAN"),
             kda_carry_keyfeed: env_opt_out("PLOW_KDA_CARRY_KEYFEED"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),
-            k3_seq_rows: std::env::var_os("PLOW_K3_SEQ_ROWS").is_some(),
             gemv_mm: env_u32("PLOW_GEMV_MM"),
             gemv_walk: env_bool("PLOW_GEMV_WALK"),
             dec_stage_halves: env_u32("PLOW_DEC_STAGE_HALVES"),
@@ -2272,14 +2192,12 @@ impl EmitConfig {
             glm_dsa_pf_dexact: env_u32("PLOW_GLM_DSA_PF_DEXACT"),
             dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
             dense_pf_ns_min: env_u32("PLOW_DENSE_PF_NS_MIN"),
-            pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
             glm_place_pf: env_opt_out("PLOW_GLM_PLACE_PF"),
             glm_moe_stage1_native: env_bool("PLOW_GLM_MOE_STAGE1_NATIVE"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),
             glm_xr_band_cus: env_u32("PLOW_GLM_XR_BAND_CUS"),
             attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),
-            glm_xr_band_seam: env_str("PLOW_GLM_XR_BAND_SEAM"),
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
             glm_seq_par: env_bool_opt("PLOW_GLM_SEQ_PAR"),
             glm_seq_par_proj: env_bool_opt("PLOW_GLM_SEQ_PAR_PROJ"),
@@ -2392,32 +2310,7 @@ impl EmitConfig {
     /// Validate cross-field constraints. Panics on incompatible combinations
     /// (same behavior as existing `assert!` calls scattered in devgen).
     fn resolve_deprecated_aliases(&mut self) {
-        let legacy_ns = match (self.legacy_k3_ns, self.legacy_glm_ns) {
-            (Some(k3), Some(glm)) if k3 != glm => {
-                panic!("PLOW_K3_NS={k3} conflicts with PLOW_GLM_NS={glm}; use PLOW_MLA_NS")
-            }
-            (Some(v), _) | (_, Some(v)) => Some(v),
-            (None, None) => None,
-        };
-        if let Some(legacy) = legacy_ns {
-            if self.mla_ns.is_some_and(|current| current != legacy) {
-                panic!(
-                    "PLOW_MLA_NS={} conflicts with deprecated per-model value {legacy}",
-                    self.mla_ns.unwrap()
-                );
-            }
-            tracing::warn!("PLOW_K3_NS/PLOW_GLM_NS are deprecated — use PLOW_MLA_NS");
-            self.mla_ns = Some(legacy);
-        }
-
-        let legacy_layers = match (&self.legacy_k3_layers, &self.legacy_glm_layers) {
-            (Some(k3), Some(glm)) if k3 != glm => {
-                panic!("PLOW_K3_LAYERS={k3} conflicts with PLOW_GLM_LAYERS={glm}; use PLOW_LAYERS")
-            }
-            (Some(v), _) | (_, Some(v)) => Some(v.clone()),
-            (None, None) => None,
-        };
-        if let Some(legacy) = legacy_layers {
+        if let Some(legacy) = self.legacy_k3_layers.clone() {
             if self
                 .layers
                 .as_deref()
@@ -2428,7 +2321,7 @@ impl EmitConfig {
                     self.layers.as_deref().unwrap()
                 );
             }
-            tracing::warn!("PLOW_K3_LAYERS/PLOW_GLM_LAYERS are deprecated — use PLOW_LAYERS");
+            tracing::warn!("PLOW_K3_LAYERS is deprecated — use PLOW_LAYERS");
             self.layers = Some(legacy);
         }
     }
@@ -2449,9 +2342,6 @@ impl EmitConfig {
         // Deprecated alias warnings
         if std::env::var("PLOW_KV_FP8").ok().as_deref() == Some("1") {
             tracing::warn!("PLOW_KV_FP8 is deprecated — use --fp8-kv or PLOW_FP8_KV instead");
-        }
-        if std::env::var("PLOW_NV_PLACE").ok().as_deref() == Some("1") {
-            tracing::warn!("PLOW_NV_PLACE is deprecated — use PLOW_L2_PLACE instead");
         }
     }
 
@@ -3435,33 +3325,27 @@ mod tests {
 
     #[test]
     fn deprecated_model_specific_pins_match_unified_pins() {
-        let mut old = TestArgs::try_parse_from(["test", "--k3-ns", "4", "--k3-layers", "single:2"])
+        let mut old = TestArgs::try_parse_from(["test", "--k3-layers", "single:2"])
             .unwrap()
             .emit;
         old.resolve_deprecated_aliases();
 
-        let new = TestArgs::try_parse_from(["test", "--mla-ns", "4", "--layers", "single:2"])
+        let new = TestArgs::try_parse_from(["test", "--layers", "single:2"])
             .unwrap()
             .emit;
-        assert_eq!(old.mla_ns, new.mla_ns);
         assert_eq!(old.layers, new.layers);
     }
 
     #[test]
     fn deprecated_model_specific_pins_reject_conflicts() {
-        let mut cfg = TestArgs::try_parse_from(["test", "--mla-ns", "4", "--glm-ns", "8"])
-            .unwrap()
-            .emit;
-        assert!(std::panic::catch_unwind(move || cfg.resolve_deprecated_aliases()).is_err());
-
         let mut cfg =
-            TestArgs::try_parse_from(["test", "--layers", "3", "--glm-layers", "single:1"])
+            TestArgs::try_parse_from(["test", "--layers", "3", "--k3-layers", "single:1"])
                 .unwrap()
                 .emit;
         assert!(std::panic::catch_unwind(move || cfg.resolve_deprecated_aliases()).is_err());
 
         let mut cfg =
-            TestArgs::try_parse_from(["test", "--layers", "all", "--glm-layers", "single:1"])
+            TestArgs::try_parse_from(["test", "--layers", "all", "--k3-layers", "single:1"])
                 .unwrap()
                 .emit;
         assert!(std::panic::catch_unwind(move || cfg.resolve_deprecated_aliases()).is_err());
@@ -3679,9 +3563,8 @@ mod tests {
              nothing is worse than no knob — either wire it to the code that was supposed to \
              consume it, or delete the field and leave the env var to whoever already reads it \
              (that is what happened to PLOW_BLOCK, PLOW_SEG_PER_OP, PLOW_SEG_CLASS_SLICE, \
-             PLOW_L2_PLACE, PLOW_FINE_FORCE, PLOW_CHAIN_BYPASS, PLOW_SEG_DUMP, \
-             PLOW_PLACE_REPORT, PLOW_ROOT and PLOW_CHECKPOINT). If the reader is a new accessor \
-             on EmitConfig, add it to `via_method` above."
+             PLOW_L2_PLACE, PLOW_CHAIN_BYPASS, PLOW_ROOT and PLOW_CHECKPOINT). If the reader is \
+             a new accessor on EmitConfig, add it to `via_method` above."
         );
     }
 

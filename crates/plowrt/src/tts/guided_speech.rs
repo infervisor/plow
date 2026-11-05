@@ -1110,6 +1110,9 @@ impl GuidedSpeech {
                 round: 0,
                 cached: None,
                 mm: None,
+                export: None,
+                import: None,
+                prompt_logprobs: false,
             },
         })
     }

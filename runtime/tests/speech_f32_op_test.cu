@@ -241,7 +241,7 @@ static unsigned splitk_scratch(Case& c) {
 
 static void t_dense(const char* name, unsigned m, unsigned n, unsigned k, unsigned flags,
                     unsigned act, unsigned row0, unsigned stride, unsigned onehot, bool bias,
-                    bool scratch = false) {
+                    bool scratch = false, const float* post = nullptr) {
     Case c;
     const unsigned ws = stride ? stride : k;
     unsigned o = c.out((size_t)m * n);
@@ -255,9 +255,14 @@ static void t_dense(const char* name, unsigned m, unsigned n, unsigned k, unsign
     c.in.op = PLOW_DOP_DENSE_GEMM_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
     if (scratch) c.in.t[4] = splitk_scratch(c);
+    if (post) {
+        c.in.t[5] = c.add(16);
+        memcpy(c.host[c.in.t[5]].data(), post, 16);
+    }
     c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[3] = act; c.in.i[4] = row0;
     c.in.i[5] = stride; c.in.i[6] = onehot; c.in.i[7] = flags;
-    run(name, c, g_dense_gemm_f32, {o}, flags & 3u ? BF16 : FP32, 1e-5, flags & 2u ? (size_t)m * n / 20000 : 0);
+    run(name, c, g_dense_gemm_f32, {o}, flags & 3u ? BF16 : FP32, 1e-5,
+        flags & 0x202u ? (size_t)m * n / 20000 : 0);
 }
 
 /* Flag 128: rows packed from several requests sum K as each request's own split-K launch would.
@@ -454,6 +459,13 @@ static void t_elementwise() {
         c.in.op = PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w;
         c.in.i[0] = rows; c.in.i[1] = ch; c.in.i[2] = kernel;
         run("CausalDepthwiseConv1dF32", c, g_causal_depthwise_conv1d_f32, {o}, FP32);
+    }
+    {
+        Case c; const unsigned rows = 50, ch = 96, kernel = 5;
+        unsigned o = c.out(rows * ch), x = c.f32(rows * ch, 1.f), w = c.f32(ch * kernel, 0.3f);
+        c.in.op = PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w;
+        c.in.i[0] = rows; c.in.i[1] = ch; c.in.i[2] = kernel; c.in.i[3] = 25; c.in.i[4] = 3;
+        run("CausalDepthwiseConv1dF32 f32w round items", c, g_causal_depthwise_conv1d_f32, {o}, FP32);
     }
     {
         Case c; const unsigned vocab = 50, width = 300;
@@ -947,6 +959,8 @@ static void t_binary() {
         {"BinaryF32 div per-item scalar", 3, 1, 0, 0, items, 0},
         {"BinaryF32 max scalar", 4, 0, 0, 0, 1, 0},
         {"BinaryF32 min shared column", 5, 0, 1, 0, rows, 1},
+        {"BinaryF32 add full round", 0, rows * width, width, 1, items * rows * width, 2},
+        {"BinaryF32 sub row-vector scaled round", 1, 0, 0, 1, width, 3},
     };
     for (const B& t : cases) {
         Case c;
@@ -972,6 +986,8 @@ static void t_vec_elementwise() {
         {"BinaryF32 add full float4", 0, rows * width, width, 1, items * rows * width, 0},
         {"BinaryF32 mul row-scalar float4", 2, rows, 1, 0, items * rows, 1},
         {"BinaryF32 sub item-scalar float4", 1, 1, 0, 0, items, 0},
+        {"BinaryF32 add full float4 round", 0, rows * width, width, 1, items * rows * width, 2},
+        {"BinaryF32 mul row-scalar float4 scaled round", 2, rows, 1, 0, items * rows, 3},
     };
     for (const B& t : cases) {
         Case c;
@@ -1427,7 +1443,7 @@ static void t_q8_path(unsigned path, unsigned m_small, unsigned m_big, unsigned 
     char name[64];
     snprintf(name, sizeof name, "Q8GemmF32 path %u %ux%ux%u", path, m_big, n, k);
     Case c;
-    unsigned big = c.out((size_t)m_big * n), small = c.out((size_t)m_small * n);
+    unsigned big = c.out((size_t)m_big * n), small = c.out((size_t)m_small * n), last = c.out((size_t)m_small * n);
     unsigned x = c.f32((size_t)m_big * k, 1.f), w = q8_weights(c, n, k), b = c.f32(n, 0.3f);
     c.in.op = PLOW_DOP_Q8_GEMM_F32;
     c.in.t[0] = big; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
@@ -1436,8 +1452,76 @@ static void t_q8_path(unsigned path, unsigned m_small, unsigned m_big, unsigned 
     PlowDevInst alone = c.in;
     alone.t[0] = small; alone.i[0] = m_small;
     launch(alone, c.dev);
-    const std::vector<uint32_t> batched = fetch(c, big), own = fetch(c, small);
-    verdict(name, "rows alone == rows in the launch", std::equal(own.begin(), own.end(), batched.begin()));
+    /* The launch's last rows too (a_row0): they sit in its last group of rows. */
+    PlowDevInst tail = alone;
+    tail.t[0] = last; tail.i[4] = m_big - m_small;
+    launch(tail, c.dev);
+    const std::vector<uint32_t> batched = fetch(c, big), own = fetch(c, small), own_last = fetch(c, last);
+    verdict(name, "rows alone == rows in the launch",
+            std::equal(own.begin(), own.end(), batched.begin()) &&
+                std::equal(own_last.begin(), own_last.end(), batched.end() - own_last.size()));
+}
+
+/* Q8GemmF32's GEMV walk (path 1) bit for bit against its order on the host: lane l's fma over blocks
+ * of x[r][32b + l] * (scale_b * q_b[l]) from 0, the butterfly over lanes (offsets 16..1), the bias. */
+static void t_q8_gemv_order(unsigned m, unsigned n, unsigned k) {
+    char name[64];
+    snprintf(name, sizeof name, "Q8GemmF32 gemv order %ux%ux%u", m, n, k);
+    Case c;
+    unsigned o = c.out((size_t)m * n), x = c.f32((size_t)m * k, 1.f), w = q8_weights(c, n, k), b = c.f32(n, 0.3f);
+    c.in.op = PLOW_DOP_Q8_GEMM_F32;
+    c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
+    c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[7] = 1;
+    run(name, c, g_q8_gemm_f32, {o}, FP32);
+    const std::vector<uint32_t> got = fetch(c, o);
+    const float* X = (const float*)c.host[x].data();
+    const float* B = (const float*)c.host[b].data();
+    size_t bad = 0;
+    for (unsigned col = 0; col < n; col++) {
+        const uint8_t* wc = c.host[w].data() + (size_t)col * (k / 32) * 34;
+        for (unsigned r = 0; r < m; r++) {
+            float p[32], q[32];
+            for (unsigned l = 0; l < 32; l++) {
+                float acc = 0.f;
+                for (unsigned blk = 0; blk < k / 32; blk++) {
+                    uint16_t hs;
+                    memcpy(&hs, wc + blk * 34, 2);
+                    const float wv = __half2float(__ushort_as_half(hs)) * (float)(int8_t)wc[blk * 34 + 2 + l];
+                    acc = fmaf(X[(size_t)r * k + 32 * blk + l], wv, acc);
+                }
+                p[l] = acc;
+            }
+            for (unsigned off = 16; off > 0; off >>= 1) {
+                for (unsigned l = 0; l < 32; l++) q[l] = p[l] + p[l ^ off];
+                memcpy(p, q, sizeof p);
+            }
+            const float want = p[0] + B[col];
+            uint32_t bits;
+            memcpy(&bits, &want, 4);
+            bad += got[(size_t)r * n + col] != bits;
+        }
+    }
+    verdict(name, "== its order on the host", bad == 0);
+}
+
+/* Q8GemmF32 tiles (path 2): 128x128 tiles (as many slices as tiles) give the 64x64 tiles' bits. */
+static void t_q8_tiles(unsigned m, unsigned n, unsigned k) {
+    char name[64];
+    snprintf(name, sizeof name, "Q8GemmF32 tiles %ux%ux%u", m, n, k);
+    Case c;
+    unsigned small = c.out((size_t)m * n), large = c.out((size_t)m * n);
+    unsigned x = c.f32((size_t)m * k, 1.f), w = q8_weights(c, n, k), b = c.f32(n, 0.3f);
+    c.in.op = PLOW_DOP_Q8_GEMM_F32;
+    c.in.t[0] = small; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
+    c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[7] = 2;
+    run(name, c, g_q8_gemm_f32, {small}, FP32);
+    PlowDevInst one = c.in;
+    one.t[0] = large;
+    const int slices = g_nblk;
+    g_nblk = (int)(((m + SPG_BM - 1) / SPG_BM) * ((n + SPG_BN - 1) / SPG_BN));
+    launch(one, c.dev);
+    g_nblk = slices;
+    verdict(name, "128x128 tiles == 64x64 tiles", fetch(c, large) == fetch(c, small));
 }
 
 /* Item `b` of an [items][bytes] tensor as a tensor of its own. */
@@ -1509,13 +1593,15 @@ static void t_dwconv_items(unsigned items, unsigned item_rows, unsigned ch, unsi
     verdict(name, "each item == the item alone", same);
 }
 
-/* Q8GemmF32 at Nemotron's shapes: the GEMV walk (path 1) against tiles (path 2) by row count. */
+/* Q8GemmF32 at Nemotron's shapes: the GEMV walk (path 1) against tiles (path 2) by row count, then
+ * tiles alone at an upload launch's rows. */
 static void bench_q8_paths() {
     const unsigned shapes[][2] = {{1024, 1024}, {4096, 1024}, {1024, 4096}, {2048, 1024}, {13088, 640}, {2560, 640}};
     for (const auto& shape : shapes) {
         const unsigned n = shape[0], k = shape[1];
-        for (unsigned m : {1u, 4u, 8u, 16u, 32u, 64u, 128u, 256u}) {
+        for (unsigned m : {1u, 4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u, 1024u, 2048u}) {
             for (unsigned path : {1u, 2u}) {
+                if (path == 1u && m > 1024u) continue;
                 Case c;
                 unsigned o = c.out((size_t)m * n), x = c.f32((size_t)m * k, 1.f), w = q8_weights(c, n, k);
                 c.in.op = PLOW_DOP_Q8_GEMM_F32;
@@ -1527,6 +1613,24 @@ static void bench_q8_paths() {
             }
         }
     }
+}
+
+/* RelativeAttentionF32 at Nemotron's batched stream steps: `items` windows of `rows` rows, the rows from
+ * query_row0 querying (live 60/56, upload 88/56), every key filled. */
+static void bench_relative_items(unsigned items, unsigned rows, unsigned query_row0) {
+    Case c;
+    const unsigned width = 1024;
+    const size_t n = (size_t)items * rows * width;
+    unsigned o = c.out(n), q = c.f32(n, 1.f), k = c.f32(n, 1.f), v = c.f32(n, 1.f);
+    unsigned p = c.f32((size_t)(2 * rows - 1) * width, 1.f), u = c.f32(width, 0.3f), bv = c.f32(width, 0.3f);
+    c.in.op = PLOW_DOP_RELATIVE_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = p; c.in.t[5] = u; c.in.t[6] = bv;
+    c.in.t[7] = c.u32(std::vector<uint32_t>(items, 0u));
+    c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = 8; c.in.i[3] = 4; c.in.i[4] = 14;
+    c.in.i[5] = query_row0; c.in.i[6] = items;
+    char name[64];
+    snprintf(name, sizeof name, "RelativeAttentionF32 items=%u rows=%u from %u", items, rows, query_row0);
+    bench(name, c, 0, 0);
 }
 
 /* Per-item prefix rows (AttentionF32 flags bit 5, t5 = pre_b per item). Separate Q/K/V; own K/V
@@ -1971,6 +2075,8 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && !strcmp(argv[1], "--bench-asr")) {
         bench_q8_paths();
+        bench_relative_items(128, 60, 56);
+        bench_relative_items(32, 88, 56);
         return 0;
     }
     t_dense("DenseGemmF32 qwen q 300x1024x1024", 300, 1024, 1024, 1 | 4, 0, 0, 0, 0, true);
@@ -1988,9 +2094,25 @@ int main(int argc, char** argv) {
     t_q8(20, 96, 256, 1);
     t_q8_path(1, 4, 20, 96, 256);
     t_q8_path(1, 5, 37, 130, 512);
+    /* A batched joint's rows: GEMV passes of 32 rows (32, 32, 6) against an 8-row launch. */
+    t_q8_path(1, 8, 70, 640, 640);
+    /* Passes of 8 (odd n), 16, 32 + 8 rows (several columns per warp), 16 + 8 at k 1024, 8 filling
+     * the arena; then the untransposed walk, staged and from global. */
+    t_q8_gemv_order(1, 300, 640);
+    t_q8_gemv_order(8, 301, 640);
+    t_q8_gemv_order(16, 300, 640);
+    t_q8_gemv_order(37, 2701, 640);
+    t_q8_gemv_order(20, 150, 1024);
+    t_q8_gemv_order(8, 100, 2048);
+    t_q8_gemv_order(4, 200, 4096);
+    t_q8_gemv_order(5, 96, 8192);
+    t_q8_tiles(200, 300, 256);
+    t_q8_tiles(150, 260, 1024);
     t_q8_path(2, 4, 70, 130, 512);
     /* Nemotron's stream window: 14 chunks of 4 rows of keys, then the step's 4 query rows. */
     t_relative_items("RelativeAttentionF32 stream items", 60, 1024, 8, 4, 14, 56, {56, 52, 0, 8, 56});
+    /* An upload stream's window: the same 56 rows of keys, then 32 query rows. */
+    t_relative_items("RelativeAttentionF32 upload items", 88, 1024, 8, 4, 14, 56, {56, 24, 0, 8, 56});
     t_relative_items("RelativeAttentionF32 chunked items", 40, 256, 4, 8, 2, 0, {0, 3, 17});
     t_relative_items("RelativeAttentionF32 full items", 21, 640, 2, 1, 0xFFFFFFFFu, 0, {21, 9, 15});
     t_dwconv_items(5, 12, 1024, 9);
@@ -2258,6 +2380,16 @@ int main(int argc, char** argv) {
     t_dense("DenseGemmF32 tc-3xtf32 f32w 300x520x700", 300, 520, 700, 16, 0, 0, 0, 0, true);
     t_dense("DenseGemmF32 tc-3xtf32 f32w splitk 50x130x2000", 50, 130, 2000, 16, 1, 2, 0, 0, true, true);
     t_dense("DenseGemmF32 tc-3xtf32 onehot", 45, 67, 33, 16, 0, 0, 35, 34, false);
+    {
+        /* Post chain (flags 0x100 clamp, 0x200 SiLU + round, 0x400 clamp_next). */
+        static const float pc[4] = {-0.9f, 1.1f, -0.3f, 0.4f};
+        t_dense("DenseGemmF32 tc-bf16 post all 250x4096x1024", 250, 4096, 1024, 1 | 4 | 8 | 0x700, 0, 0, 0, 0,
+                false, true, pc);
+        t_dense("DenseGemmF32 tc-bf16 post clamp splitk 250x1024x4096", 250, 1024, 4096, 1 | 4 | 8 | 0x100, 0, 0,
+                0, 0, false, true, pc);
+        t_dense("DenseGemmF32 bf16w post silu+clamp 45x67x36", 45, 67, 36, 1 | 4 | 0x600, 0, 0, 0, 0, true, false,
+                pc);
+    }
     /* last: keeps the earlier cases' random data */
 #if defined(PLOW_NV_HOPPER)
     t_attention_prefix_h16("AttentionF32 h16 prefix 306+72 lengths", 4, 72, 306, 2, {0, 1, 0, 1}, {378, 350, 320, 306});

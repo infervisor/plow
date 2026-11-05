@@ -350,7 +350,8 @@ fn collapse_repeats(text: &str) -> Option<String> {
 struct AsrMux {
     tx: mpsc::Sender<AsrJob>,
     metrics: Arc<crate::obs::Metrics>,
-    /// The engine's batched streams: how many can be open, and whether they answer finals.
+    /// The engine's batched streams: how many sessions can hold one (upload streams keep the
+    /// rest), and whether they answer finals.
     stream_slots: Option<usize>,
     stream_finals: bool,
 }
@@ -383,123 +384,247 @@ struct OpenStream {
 /// Audio a final may have left to push into its stream; past it the final transcribes offline.
 const FINAL_STREAM_LAG: usize = 2 * SAMPLE_RATE as usize;
 
-/// Jobs that continue their recording's engine stream: partials, and finals when the engine
-/// answers them from the stream. They go in waves of one job per stream, a wave's pushes stepping
-/// together. A job with no stream to take it (the engine has none, or a final whose stream is not
-/// open) goes to `offline`, to transcribe its whole recording.
-fn run_streams(
+/// Upload streams a round steps while sessions hold engine streams: a short launch after theirs
+/// (8 x 32 rows: ~65 ms on an H100) keeps their next windows' wait short.
+const UPLOAD_LANES_BESIDE_STREAMS: usize = 8;
+
+/// A whole recording stepping in an engine upload stream (`Transcriber::upload_open`).
+struct Upload {
+    job: AsrJob,
+    id: u64,
+    /// Its audio went in with its first round's push.
+    pushed: bool,
+}
+
+/// Opens upload streams for the queued whole recordings, oldest first, up to `batch` stepping;
+/// the rest wait (all of them while the engine has no stream slot free).
+fn open_uploads(
+    engine: &mut dyn Transcriber,
+    uploading: &mut Vec<Upload>,
+    offline: &mut VecDeque<AsrJob>,
+    batch: usize,
+) {
+    while uploading.len() < batch {
+        let Some(job) = offline.pop_front() else {
+            break;
+        };
+        // An upload stream's push carries no prompt: refused as the offline pass refuses it.
+        if !job.context.is_empty() && !engine.accepts_context() {
+            finish_job(
+                job,
+                Err(crate::RuntimeError::Rejected(
+                    crate::asr::CONTEXT_UNSUPPORTED.into(),
+                )),
+            );
+            continue;
+        }
+        match engine.upload_open() {
+            Ok(Some(id)) => uploading.push(Upload {
+                job,
+                id,
+                pushed: false,
+            }),
+            Ok(None) => {
+                offline.push_front(job);
+                break;
+            }
+            Err(error) => finish_job(job, Err(error)),
+        }
+    }
+}
+
+/// One round of upload streams: the oldest `lanes` push (all their audio, the round they join)
+/// and step a window; each answers its job once its stream has decoded everything.
+fn step_uploads(engine: &mut dyn Transcriber, uploading: &mut Vec<Upload>, lanes: usize) {
+    for upload in std::mem::take(uploading) {
+        if upload.job.cancel.load(Ordering::Relaxed) || upload.job.respond.is_closed() {
+            engine.stream_close(upload.id);
+            finish_job(
+                upload.job,
+                Err(crate::RuntimeError::Rejected("ASR cancelled".into())),
+            );
+        } else {
+            uploading.push(upload);
+        }
+    }
+    let waiting = uploading.split_off(lanes.min(uploading.len()));
+    let pushes: Vec<_> = uploading
+        .iter()
+        .map(|upload| StreamPush {
+            id: upload.id,
+            samples: if upload.pushed {
+                &[]
+            } else {
+                &upload.job.samples
+            },
+            finish: true,
+        })
+        .collect();
+    let results = engine.stream_push_round(&pushes);
+    drop(pushes);
+    for (mut upload, result) in std::mem::take(uploading).into_iter().zip(results) {
+        upload.pushed = true;
+        let text = match result {
+            Ok(None) => {
+                uploading.push(upload);
+                continue;
+            }
+            Ok(Some(text)) => Ok(text),
+            Err(error) => Err(error),
+        };
+        let result = text.and_then(|text| {
+            Ok(Transcript {
+                text,
+                language: engine.language(upload.job.language.as_deref())?,
+            })
+        });
+        finish_job(upload.job, result);
+    }
+    uploading.extend(waiting);
+}
+
+/// One round of the recordings' engine streams. Jobs that continue their recording's stream
+/// (partials, and finals when the engine answers them from the stream) take it one at a time:
+/// `stepping` holds those that pushed their audio and step a window per round until the stream has
+/// stepped all of it, `waiting` those whose stream has one stepping. A job with no stream to take it
+/// (the engine has none, or a final whose stream is not open) goes to `offline`, to transcribe its
+/// whole recording.
+fn step_streams(
     engine: &mut dyn Transcriber,
     streams: &mut Vec<OpenStream>,
-    mut jobs: Vec<AsrJob>,
+    stepping: &mut Vec<(AsrJob, u64)>,
+    waiting: &mut Vec<AsrJob>,
+    jobs: Vec<AsrJob>,
     offline: &mut VecDeque<AsrJob>,
 ) {
-    while !jobs.is_empty() {
-        let mut wave: Vec<(AsrJob, u64)> = Vec::with_capacity(jobs.len());
-        let mut later = Vec::new();
-        for job in jobs.drain(..) {
-            let key = job.stream.clone().expect("stream jobs");
-            if wave
-                .iter()
-                .any(|(queued, _)| queued.stream.as_ref().is_some_and(|k| k.ptr_eq(&key)))
+    // A job nobody awaits stops (a partial's final supersedes it): the stream's next job steps on.
+    let abandoned = |job: &AsrJob| job.cancel.load(Ordering::Relaxed) || job.respond.is_closed();
+    let cancelled = || Err(crate::RuntimeError::Rejected("ASR cancelled".into()));
+    for (job, id) in std::mem::take(stepping) {
+        if !abandoned(&job) {
+            stepping.push((job, id));
+            continue;
+        }
+        if job.finish {
+            engine.stream_close(id);
+            streams.retain(|open| open.id != id);
+        }
+        finish_job(job, cancelled());
+    }
+    waiting.extend(jobs);
+    for job in std::mem::take(waiting) {
+        let key = job.stream.clone().expect("stream jobs");
+        if stepping
+            .iter()
+            .any(|(queued, _)| queued.stream.as_ref().is_some_and(|k| k.ptr_eq(&key)))
+        {
+            waiting.push(job);
+            continue;
+        }
+        if abandoned(&job) {
+            finish_job(job, cancelled());
+            continue;
+        }
+        // The stream push carries no prompt: refused here as the offline pass refuses it, or
+        // whether a prompt is accepted depends on how far the recording's stream got.
+        if !job.context.is_empty() && !engine.accepts_context() {
+            finish_job(
+                job,
+                Err(crate::RuntimeError::Rejected(
+                    crate::asr::CONTEXT_UNSUPPORTED.into(),
+                )),
+            );
+            continue;
+        }
+        let id = match streams.iter().position(|open| open.key.ptr_eq(&key)) {
+            // A final far ahead of its stream goes offline: one pass beats many steps.
+            Some(index)
+                if streams[index].pushed <= job.samples.len()
+                    && !(job.finish
+                        && job.samples.len() - streams[index].pushed > FINAL_STREAM_LAG) =>
             {
-                later.push(job);
-                continue;
+                streams[index].id
             }
-            if job.cancel.load(Ordering::Relaxed) {
-                finish_job(
-                    job,
-                    Err(crate::RuntimeError::Rejected("ASR cancelled".into())),
-                );
-                continue;
-            }
-            // The stream push carries no prompt: refused here as the offline pass refuses it, or
-            // whether a prompt is accepted depends on how far the recording's stream got.
-            if !job.context.is_empty() && !engine.accepts_context() {
-                finish_job(
-                    job,
-                    Err(crate::RuntimeError::Rejected(
-                        crate::asr::CONTEXT_UNSUPPORTED.into(),
-                    )),
-                );
-                continue;
-            }
-            let id = match streams.iter().position(|open| open.key.ptr_eq(&key)) {
-                // A final far ahead of its stream goes offline: one pass beats many steps.
-                Some(index)
-                    if streams[index].pushed <= job.samples.len()
-                        && !(job.finish
-                            && job.samples.len() - streams[index].pushed > FINAL_STREAM_LAG) =>
-                {
-                    streams[index].id
+            found => {
+                if let Some(index) = found {
+                    engine.stream_close(streams.swap_remove(index).id);
                 }
-                found => {
-                    if let Some(index) = found {
-                        engine.stream_close(streams.swap_remove(index).id);
+                if job.finish {
+                    offline.push_back(AsrJob {
+                        stream: None,
+                        ..job
+                    });
+                    continue;
+                }
+                match engine.stream_open() {
+                    Ok(Some(id)) => {
+                        streams.push(OpenStream { key, id, pushed: 0 });
+                        id
                     }
-                    if job.finish {
+                    Ok(None) => {
                         offline.push_back(AsrJob {
                             stream: None,
                             ..job
                         });
                         continue;
                     }
-                    match engine.stream_open() {
-                        Ok(Some(id)) => {
-                            streams.push(OpenStream { key, id, pushed: 0 });
-                            id
-                        }
-                        Ok(None) => {
-                            offline.push_back(AsrJob {
-                                stream: None,
-                                ..job
-                            });
-                            continue;
-                        }
-                        Err(error) => {
-                            finish_job(job, Err(error));
-                            continue;
-                        }
+                    Err(error) => {
+                        finish_job(job, Err(error));
+                        continue;
                     }
                 }
-            };
-            wave.push((job, id));
-        }
-        jobs = later;
-        if wave.is_empty() {
-            continue;
-        }
-        let pushes: Vec<_> = wave
-            .iter()
-            .map(|(job, id)| {
-                let pushed = streams.iter().find(|o| o.id == *id).map_or(0, |o| o.pushed);
-                StreamPush {
-                    id: *id,
-                    samples: &job.samples[pushed..],
-                    finish: job.finish,
-                }
-            })
-            .collect();
-        let results = engine.stream_push_batch(&pushes);
-        drop(pushes);
-        for ((job, id), result) in wave.into_iter().zip(results) {
-            if let Some(index) = streams.iter().position(|o| o.id == id) {
-                if job.finish {
-                    streams.swap_remove(index);
-                } else if result.is_err() {
-                    // The stream's state is unknown: the next partial reopens it from the start.
-                    engine.stream_close(streams.swap_remove(index).id);
-                } else {
-                    streams[index].pushed = job.samples.len();
-                }
             }
-            let result = result.and_then(|text| {
-                Ok(Transcript {
-                    text,
-                    language: engine.language(job.language.as_deref())?,
-                })
-            });
-            finish_job(job, result);
+        };
+        stepping.push((job, id));
+    }
+    if stepping.is_empty() {
+        return;
+    }
+    // A job pushes its audio the round it joins, then nothing more.
+    let pushes: Vec<_> = stepping
+        .iter()
+        .map(|(job, id)| {
+            let pushed = streams
+                .iter()
+                .find(|o| o.id == *id)
+                .map_or(job.samples.len(), |o| o.pushed);
+            StreamPush {
+                id: *id,
+                samples: &job.samples[pushed..],
+                finish: job.finish,
+            }
+        })
+        .collect();
+    let results = engine.stream_push_round(&pushes);
+    drop(pushes);
+    for ((job, id), result) in std::mem::take(stepping).into_iter().zip(results) {
+        let index = streams.iter().position(|o| o.id == id);
+        if let Some(index) = index {
+            streams[index].pushed = job.samples.len();
         }
+        let text = match result {
+            Ok(None) => {
+                stepping.push((job, id));
+                continue;
+            }
+            Ok(Some(text)) => Ok(text),
+            Err(error) => Err(error),
+        };
+        if let Some(index) = index {
+            if job.finish {
+                streams.swap_remove(index);
+            } else if text.is_err() {
+                // The stream's state is unknown: the next partial reopens it from the start.
+                engine.stream_close(streams.swap_remove(index).id);
+            }
+        }
+        let result = text.and_then(|text| {
+            Ok(Transcript {
+                text,
+                language: engine.language(job.language.as_deref())?,
+            })
+        });
+        finish_job(job, result);
     }
 }
 
@@ -526,19 +651,29 @@ impl AsrMux {
         let batch_capacity = engine.batch_capacity().max(1);
         let finalization = engine.finalization_policy();
         let stream_slots = engine.stream_slots();
+        let upload_batch = engine.upload_batch();
         let stream_finals =
             engine.stream_finals() && crate::config::RuntimeConfig::get().asr_stream_finals;
-        let ingress_capacity = batch_capacity.saturating_mul(4).max(min_queue);
-        let queue = ingress_capacity.max(stream_slots.unwrap_or(0).saturating_mul(3));
+        let ingress_capacity = batch_capacity
+            .max(upload_batch)
+            .saturating_mul(4)
+            .max(min_queue);
+        let queue = ingress_capacity + stream_slots.unwrap_or(0).saturating_mul(3);
         let (tx, mut rx) = mpsc::channel::<AsrJob>(queue);
         std::thread::Builder::new()
             .name("plow-asr-engine".into())
             .spawn(move || {
                 let mut offline = VecDeque::with_capacity(batch_capacity);
                 let mut streams: Vec<OpenStream> = Vec::new();
+                let (mut stepping, mut waiting) = (Vec::new(), Vec::new());
+                let mut uploading: Vec<Upload> = Vec::new();
                 loop {
                     let mut cohort = Vec::with_capacity(batch_capacity);
-                    if offline.is_empty() {
+                    if offline.is_empty()
+                        && stepping.is_empty()
+                        && waiting.is_empty()
+                        && uploading.is_empty()
+                    {
                         let Some(first) = rx.blocking_recv() else {
                             break;
                         };
@@ -593,7 +728,28 @@ impl AsrMux {
                             }),
                         }
                     }
-                    run_streams(&mut *engine, &mut streams, continuing, &mut offline);
+                    step_streams(
+                        &mut *engine,
+                        &mut streams,
+                        &mut stepping,
+                        &mut waiting,
+                        continuing,
+                        &mut offline,
+                    );
+                    // Whole recordings: one alone takes a batch's single launch; with company they
+                    // step as upload streams after the stream round, and the rest wait for one.
+                    if upload_batch != 0 && (!uploading.is_empty() || offline.len() > 1) {
+                        open_uploads(&mut *engine, &mut uploading, &mut offline, upload_batch);
+                        if !uploading.is_empty() {
+                            let lanes = if streams.is_empty() {
+                                upload_batch
+                            } else {
+                                UPLOAD_LANES_BESIDE_STREAMS.min(upload_batch)
+                            };
+                            step_uploads(&mut *engine, &mut uploading, lanes);
+                            continue;
+                        }
+                    }
                     // One batch of whole recordings per round: stream rounds go between them.
                     let take = offline.len().min(batch_capacity);
                     if take == 0 {
@@ -658,7 +814,7 @@ impl AsrMux {
             Self {
                 tx,
                 metrics,
-                stream_slots,
+                stream_slots: stream_slots.map(|slots| slots.saturating_sub(upload_batch)),
                 stream_finals,
             },
             ingress_capacity,
@@ -2973,6 +3129,232 @@ mod tests {
         let log = log.lock();
         assert_eq!(log.pushed, [(1, 100), (1, 150), (2, 50)]);
         assert_eq!(log.closed, [1]);
+    }
+
+    #[tokio::test]
+    async fn stream_jobs_step_a_window_per_round_and_a_superseded_partial_never_runs() {
+        type Round = Vec<(u64, usize, bool)>;
+        /// A window per 100 samples (a final two more); each round waits for the test's go.
+        struct Rounds {
+            rounds: std::sync::mpsc::Sender<Round>,
+            go: std::sync::mpsc::Receiver<()>,
+            streams: std::collections::HashMap<u64, (usize, usize)>,
+        }
+        impl Transcriber for Rounds {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                Err(crate::RuntimeError::Rejected("offline".into()))
+            }
+            fn stream_open(&mut self) -> crate::Result<Option<u64>> {
+                let id = self.streams.len() as u64 + 1;
+                self.streams.insert(id, (0, 0));
+                Ok(Some(id))
+            }
+            fn stream_finals(&self) -> bool {
+                true
+            }
+            fn stream_slots(&self) -> Option<usize> {
+                Some(8)
+            }
+            fn stream_push_round(
+                &mut self,
+                pushes: &[StreamPush<'_>],
+            ) -> Vec<crate::Result<Option<String>>> {
+                let round = pushes.iter().map(|p| (p.id, p.samples.len(), p.finish));
+                self.rounds.send(round.collect()).unwrap();
+                self.go.recv().unwrap();
+                pushes
+                    .iter()
+                    .map(|push| {
+                        let (samples, stepped) = self.streams.get_mut(&push.id).unwrap();
+                        *samples += push.samples.len();
+                        let windows = *samples / 100 + if push.finish { 2 } else { 0 };
+                        *stepped += 1;
+                        Ok((*stepped == windows).then(|| format!("{} {stepped}", push.id)))
+                    })
+                    .collect()
+            }
+        }
+        let (rounds, observed) = std::sync::mpsc::channel();
+        let (go, gate) = std::sync::mpsc::channel();
+        let engine = Rounds {
+            rounds,
+            go: gate,
+            streams: Default::default(),
+        };
+        let (mux, _, _) = AsrMux::spawn(Box::new(engine));
+        let recordings: [Arc<parking_lot::Mutex<WindowCache>>; 3] = Default::default();
+        let submit = |recording: usize, samples: usize, finish: bool| {
+            mux.submit_with(
+                vec![0.0; samples],
+                None,
+                String::new(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Some(Arc::downgrade(&recordings[recording])),
+                finish,
+            )
+            .unwrap()
+        };
+        let round = |expected: Round| {
+            let pushes = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(pushes, expected);
+            go.send(()).unwrap();
+        };
+        let text = |reply: crate::Result<Transcript>| reply.unwrap().text;
+        let a = submit(0, 100, false);
+        round(vec![(1, 100, false)]);
+        assert_eq!(text(a.await.unwrap()), "1 1");
+        let b = submit(1, 100, false);
+        round(vec![(2, 100, false)]);
+        assert_eq!(text(b.await.unwrap()), "2 1");
+        // A's final has four windows to go; B's final supersedes a partial nobody awaits.
+        let mut a = submit(0, 300, true);
+        let observed_round = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(observed_round, vec![(1, 200, true)]);
+        drop(submit(1, 200, false));
+        let mut b = submit(1, 300, true);
+        go.send(()).unwrap();
+        let observed_round = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(observed_round, vec![(1, 0, true), (2, 200, true)]);
+        // A new recording's partial answers in its first round, between the finals' rounds.
+        let c = submit(2, 100, false);
+        go.send(()).unwrap();
+        round(vec![(1, 0, true), (2, 0, true), (3, 100, false)]);
+        assert_eq!(text(c.await.unwrap()), "3 1");
+        assert!(a.try_recv().is_err() && b.try_recv().is_err());
+        round(vec![(1, 0, true), (2, 0, true)]);
+        assert_eq!(text(a.await.unwrap()), "1 5");
+        round(vec![(2, 0, true)]);
+        assert_eq!(text(b.await.unwrap()), "2 5");
+    }
+
+    #[tokio::test]
+    async fn a_lone_upload_runs_offline_and_a_burst_steps_as_upload_streams() {
+        type Round = Vec<(u64, usize)>;
+        /// Two upload streams a round, a window per 100 samples; each call waits for the go.
+        struct Uploads {
+            rounds: std::sync::mpsc::Sender<Round>,
+            go: std::sync::mpsc::Receiver<()>,
+            streams: HashMap<u64, (usize, usize)>,
+            opened: u64,
+        }
+        impl Transcriber for Uploads {
+            fn language(&self, _: Option<&str>) -> crate::Result<Option<String>> {
+                Ok(None)
+            }
+            fn transcribe(
+                &mut self,
+                samples: &[f32],
+                _: Option<&str>,
+                _: &str,
+                _: &AtomicBool,
+            ) -> crate::Result<Transcript> {
+                self.rounds.send(vec![(0, samples.len())]).unwrap();
+                self.go.recv().unwrap();
+                Ok(Transcript {
+                    text: format!("offline {}", samples.len()),
+                    language: None,
+                })
+            }
+            fn accepts_context(&self) -> bool {
+                false
+            }
+            fn stream_slots(&self) -> Option<usize> {
+                Some(4)
+            }
+            fn upload_batch(&self) -> usize {
+                2
+            }
+            fn upload_open(&mut self) -> crate::Result<Option<u64>> {
+                self.opened += 1;
+                self.streams.insert(self.opened, (0, 0));
+                Ok(Some(self.opened))
+            }
+            fn stream_push_round(
+                &mut self,
+                pushes: &[StreamPush<'_>],
+            ) -> Vec<crate::Result<Option<String>>> {
+                let round = pushes.iter().map(|p| (p.id, p.samples.len()));
+                self.rounds.send(round.collect()).unwrap();
+                self.go.recv().unwrap();
+                pushes
+                    .iter()
+                    .map(|push| {
+                        assert!(push.finish);
+                        let (samples, stepped) = self.streams.get_mut(&push.id).unwrap();
+                        *samples += push.samples.len();
+                        *stepped += 1;
+                        Ok((*stepped == *samples / 100).then(|| format!("upload {stepped}")))
+                    })
+                    .collect()
+            }
+        }
+        let (rounds, observed) = std::sync::mpsc::channel();
+        let (go, gate) = std::sync::mpsc::channel();
+        let engine = Uploads {
+            rounds,
+            go: gate,
+            streams: Default::default(),
+            opened: 0,
+        };
+        let (mux, uploads, _) = AsrMux::spawn(Box::new(engine));
+        assert_eq!((uploads, mux.stream_slots), (8, Some(2)));
+        let submit_with = |samples: usize, context: &str| {
+            mux.submit_with(
+                vec![0.0; samples],
+                None,
+                context.to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                None,
+                true,
+            )
+            .unwrap()
+        };
+        let submit = |samples: usize| submit_with(samples, "");
+        let round = |expected: Round| {
+            let pushes = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(pushes, expected);
+            go.send(()).unwrap();
+        };
+        let text = |reply: crate::Result<Transcript>| reply.unwrap().text;
+        // Alone: the offline pass. Three more queue behind it and step as upload streams, two
+        // at a time, oldest first; the third opens when the second finishes.
+        let a = submit(200);
+        let observed_round = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(observed_round, vec![(0, 200)]);
+        let (b, c, d) = (submit(300), submit(100), submit(200));
+        go.send(()).unwrap();
+        assert_eq!(text(a.await.unwrap()), "offline 200");
+        round(vec![(1, 300), (2, 100)]);
+        assert_eq!(text(c.await.unwrap()), "upload 1");
+        round(vec![(1, 0), (3, 200)]);
+        round(vec![(1, 0), (3, 0)]);
+        assert_eq!(text(b.await.unwrap()), "upload 3");
+        assert_eq!(text(d.await.unwrap()), "upload 2");
+        // A prompt the engine cannot take is refused in a burst as it is offline.
+        let e = submit(100);
+        let observed_round = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(observed_round, vec![(0, 100)]);
+        let (prompted, f) = (submit_with(100, "a prompt"), submit(100));
+        go.send(()).unwrap();
+        assert_eq!(text(e.await.unwrap()), "offline 100");
+        assert!(prompted
+            .await
+            .unwrap()
+            .is_err_and(|e| e.to_string().contains(crate::asr::CONTEXT_UNSUPPORTED)));
+        round(vec![(4, 100)]);
+        assert_eq!(text(f.await.unwrap()), "upload 1");
+        assert!(observed.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -113,7 +113,7 @@ impl MetalAudioLmExecution {
             embedding_handle,
             decode_capacity,
             max_context,
-            device_handoff: false,
+            device_handoff: true,
             positions: vec![0; decode_capacity],
             kv_lengths: vec![1; decode_capacity],
             token_ids: vec![0; decode_capacity],

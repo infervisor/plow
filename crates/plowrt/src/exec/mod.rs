@@ -87,6 +87,8 @@ pub mod indirection;
 // in the same commit as the pool that drives them.
 #[allow(dead_code)]
 pub mod kv_handoff;
+#[allow(dead_code)]
+pub(crate) mod kv_image;
 /// KV write-row sites + prefill-chunk rebasing, shared by the AMD and CPU engines.
 // Prefill-chunk helpers are only exercised by an engine with a prefill path (AMD today).
 #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
@@ -97,6 +99,8 @@ pub(crate) mod mixed_program;
 pub mod mixed_step_staging;
 pub mod oob;
 pub mod packet_runtime;
+#[cfg(unix)]
+pub mod proc_group;
 pub mod queue;
 #[cfg(feature = "hsa")]
 mod rank_pool;

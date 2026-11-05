@@ -1071,7 +1071,7 @@ impl Emitter<'_> {
                 .as_deref()
                 .is_some_and(|list| {
                     crate::gen_kernels::parse(list)
-                        .is_ok_and(|entries| entries.iter().any(|e| e.decode))
+                        .is_ok_and(|entries| entries.iter().any(|(e, _)| e.decode))
                 });
         // HD256 uses the slide GF selector in the Hopper interpreter even for full attention.
         let ns = if gen_attention {

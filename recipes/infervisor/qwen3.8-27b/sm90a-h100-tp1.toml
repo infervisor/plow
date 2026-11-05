@@ -3,7 +3,7 @@
 # prefill (concurrent prompts share one launch), prefix cache on (the KV block store captures the
 # GDN state at the prompt-end boundary). Production recipe for this model/GPU/precision.
 #
-#   PYREF=/opt/pytorch/bin/python3 PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
+#   PYREF=<python with torch> PLOW_CAMPAIGN_NO_NIX=1 (box without nix only) \
 #   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3.8-27b/sm90a-h100-tp1.toml --out <fresh dir>
 #
 # Qualified (2026-10-11, plowrt 8d25a203, packet a6d706647465f718, pairing 0xc3f74a8e97e4d467): FP32-reference gate PASS at c1,
@@ -122,7 +122,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "ecb90f0d1c999c2d6838eb58d84c5e52ff1c5098"
+plow_git = "6a4ccff51e729669e8acb480b3ba6323459435d5"
 network = "qwen3.5"
 
 [target]
@@ -247,7 +247,7 @@ PLOW_QWEN_GDN_ISOLATE = "4"
 # with identical digests; from 1 row B1/B2 22.19/23.16 -> 22.94/23.47 ms (not taken). --same 8 x 4K
 # 8/8. FP32 gate c1/c8/c32 PASS: kl_trim 0.000461/0.000450/0.000415 vs vLLM 0.000338/0.000346/
 # 0.000356, top1_decisive 0.9988/0.9988/1, cont_frac 0.862/0.874/0.883 vs 0.861/0.866/0.870, needle 1.
-# Evidence: /opt/dlami/nvme/lava-tts/route-sweep (C/qwen, gates/qwenbf16-lt4i).
+# Evidence: <lab scratch>/route-sweep (C/qwen, gates/qwenbf16-lt4i).
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "4"
 # Remainder split-K in the mma row-block walks; rungs 1..4 take the K8 tensor-core walk too

@@ -74,6 +74,7 @@ blobs/sha256/<hex>          content-addressed
 refs/<digest>.json          {ref, variant, previous[]} for one pin
 bundles/<variant_id>/       hard links into blobs/ — what --assets receives
 checkpoints/<org>--<repo>@<rev>/   the farm: links to the snapshot + derived shard
+checkpoints/<org>--<repo>@<rev>+<view>/   a prepared checkpoint rebuilt from the snapshot
 snapshots/<org>--<repo>@<rev>/     a snapshot `load --fetch-weights` downloaded
 ```
 
@@ -275,6 +276,33 @@ refuses. An NVIDIA recipe's `[target] toolchain` is optional: the cubins are
 pinned by their bytes, so the CUDA toolchain is recorded when the recipe names
 one and never matched. An AMD bundle's objects come from `--objects` and land
 under `hsaco/`, and an AMD recipe must name its `toolchain`.
+
+### Prepared checkpoints, sub-bundles and packet bundles
+
+These need `plow.dist.bundle.v3`; a v2 client refuses such a bundle.
+
+- **Prepared checkpoint (view).** A recipe whose `[cell] hf_dir` (or a `[[sub_emit]] hf_dir`)
+  is `{out}/...` binds a checkpoint its prep wrote: renamed, re-laid-out or converted
+  tensors. `push` records it as a view of the pinned snapshot, file by file: an HF file
+  (`hf`), a safetensors file `assembled` from its exact header, snapshot tensors and the
+  derived tensor bytes, or a derived file. Only derived bytes become blobs. `load`
+  rebuilds the view byte for byte into `checkpoints/<org>--<repo>@<rev>+<digest>/`,
+  verifying every snapshot file and the whole rebuilt file against their sha256, and
+  links it in as `checkpoint` (or `<sub>/checkpoint`). A prepared safetensors file that
+  is not header plus tensors is refused at push, never shipped whole.
+- **Sub-bundle.** A directory beside `model.pkt` holding its own `model.pkt` (Breeze's
+  `text_encoder/`) ships as `<sub>/<file>`; its objects join the objset as `<sub>/<obj>`
+  and are checked against the sub-bundle's own `build.json` pairing hash.
+- **Packet bundle.** A `[build]` recipe (no `plowc` emit) ships `[build] output` and
+  carries every weight in its packets: `checkpoint.layout = "packet"`, the checkpoint
+  is provenance only, and `load` refuses a packet that binds any checkpoint tensor.
+  `[target] executor = "host"` (Silero VAD) runs the packet on the host CPU and ships
+  no objset. `serve --model` routes a packet bundle by its pipeline driver
+  (`vad.frame.v1` as the VAD packet, `rnnt.greedy.v1`/`causal.v1` as an ASR packet).
+
+`load` refuses a bundle whose checkpoint lacks a tensor one of its packets binds. The
+checkpoint farm links every file of the snapshot, so a model's serve contract finds
+`chat_template.json`, `preprocessor_config.json` and the like.
 
 A measurement is not a condition of publishing: a build goes up as `emits`
 and is re-pushed as `validated` with `--tok-s` when it has been gated and

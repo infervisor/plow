@@ -99,10 +99,12 @@ mod mxfp4_moe_role;
 mod object_requirements;
 pub mod pipeline;
 mod projection_rewrite;
+mod residual_precision;
 mod rewrite_lower;
 pub mod rnnt;
 pub mod s3gen;
 pub mod segment_resource;
+mod tp_precision;
 pub mod tts;
 pub mod tune_demand;
 pub mod vad;
@@ -147,14 +149,13 @@ pub mod voice_cond;
 //
 // * opcode-changing, but every op has an AMD arm: `PLOW_NO_FUSE_QKV`, `PLOW_FP8_HEAD`,
 //   `PLOW_MX4_HEAD`, `PLOW_FP8_KV`, `PLOW_FP8_KV_FULL`, `PLOW_MXFP4`, `PLOW_MLA_PREFILL`,
-//   `PLOW_MOE_PREFILL`, `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_ROUTER_OLD` (GLM arm), `GLM_GROUP`;
+//   `PLOW_MOE_PREFILL`, `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_GROUP`;
 // * tuning constants carried in an existing instruction field, read identically by both
 //   interpreters: `PLOW_NS_MUL`, `PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_GLM_GF`, `PLOW_MLA_NS`,
 //   `PLOW_MAX_CHUNK`, `PLOW_DECODE_BATCH`. (`PLOW_NS_FULL_ABS`'s comment cites an sm_120 part —
 //   that records where it was MEASURED, not a target dependence.)
 // * structure, but geometry-driven rather than ISA-driven: `GLM_EP`, `GLM_MOE_CORESIDENT`,
-//   `PLOW_XR_CUS`, `PLOW_SEG_CLASS_SLICE`, `PLOW_FINE_FORCE`, `PLOW_NO_XREDUCE` (which is
-//   numerically wrong on BOTH targets and says so);
+//   `PLOW_XR_CUS`, `PLOW_SEG_CLASS_SLICE`;
 // * compiler-side only, never in the packet: `PLOW_ROOT`, `PLOW_BLOCK`, `PLOW_SKIP_COVERAGE`,
 //   `GLM_FULL`, `GLM_LAYER`, `GLM_NLAYERS`.
 //
@@ -935,8 +936,10 @@ fn glu_era_inventory() -> &'static kernelcaps::Inventory {
     const RUNGS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall];
     static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static RDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     let cell = match amd_target::active().1 {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
@@ -1060,8 +1063,10 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
     use std::sync::OnceLock;
     static CDNA3: OnceLock<GemmMeasurements> = OnceLock::new();
     static CDNA4: OnceLock<GemmMeasurements> = OnceLock::new();
+    static RDNA4: OnceLock<GemmMeasurements> = OnceLock::new();
     let slot = match amd_target::active().1 {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     slot.get_or_init(|| {
@@ -1296,7 +1301,7 @@ mod amd_target {
     pub fn set_for(arch: &str, gpu: &str) {
         if let Some(spec) = hwspec::registry::lookup(gpu) {
             if let Some(isa) = IsaLevel::from_spec(spec) {
-                if matches!(isa, IsaLevel::Gfx942 | IsaLevel::Gfx950) {
+                if matches!(isa, IsaLevel::Gfx942 | IsaLevel::Gfx950 | IsaLevel::Gfx1201) {
                     ACTIVE.with(|a| a.set(Some((spec, isa))));
                     return;
                 }
@@ -1307,12 +1312,13 @@ mod amd_target {
         } else if hwspec::registry::lookup(gpu).is_none() {
             format!("--gpu {gpu} is not in the hwspec registry")
         } else {
-            format!("--gpu {gpu} is not a CDNA part")
+            format!("--gpu {gpu} is not a CDNA/RDNA4 part")
         };
         // Fall back to the arch the caller DID state, rather than to a constant.
         let (sku, isa) = match arch {
             "gfx942" => ("MI300X", IsaLevel::Gfx942),
             "gfx950" => ("MI350X", IsaLevel::Gfx950),
+            "gfx1201" => ("R9700", IsaLevel::Gfx1201),
             _ => {
                 eprintln!(
                     "warning: {why} and --arch {arch:?} names no CDNA part; AMD tiles will be \
@@ -1690,8 +1696,10 @@ fn amd_gemm_inventory(isa: hwspec::IsaLevel) -> &'static kernelcaps::Inventory {
     use std::sync::OnceLock;
     static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static RDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     let cell = match isa {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
@@ -1880,8 +1888,10 @@ fn amd_gemm_inventory(isa: hwspec::IsaLevel) -> &'static kernelcaps::Inventory {
     use std::sync::OnceLock;
     static CDNA3: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     static CDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    static RDNA4: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     let cell = match isa {
         hwspec::IsaLevel::Gfx942 => &CDNA3,
+        hwspec::IsaLevel::Gfx1201 => &RDNA4,
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
@@ -2016,6 +2026,9 @@ struct Tn {
     // and XReduce sums the N peers' slots into `og`/`dg`. TENSOR_NONE when tp==1.
     og_tp: u32,
     dg_tp: u32,
+    /// The third peer slot (`2 * slot_b`): the routed-expert partial of a tensor-parallel MoE
+    /// layer, reduced before its post-FFN norm. TENSOR_NONE unless tp > 1 and MoE.
+    mg_tp: u32,
     kc: Vec<u32>,
     vc: Vec<u32>,
     // fp8-KV: per-(token,kv_head) f32 dequant scales, one per KV row (TENSOR_NONE in bf16 mode).
@@ -2208,6 +2221,23 @@ fn declare(
         "--tp {tp} must divide intermediate {}",
         c.inter
     );
+    // Tensor-parallel MoE slices every expert's intermediate: each rank runs the same routed
+    // experts over moe_inter/tp channels, so the expert GEMMs keep their K%16 (fp8/W8A8 staging)
+    // contract on the local width. MXFP4 microscale blocks would split mid-block below 32.
+    if c.moe && tp > 1 {
+        assert_eq!(
+            c.moe_inter % (tp * 16),
+            0,
+            "--tp {tp}: MoE intermediate {} must split into 16-aligned rank slices",
+            c.moe_inter
+        );
+        // The routed prefill library route fuses the combine with the post-FFN norm, which
+        // under TP must wait for the cross-rank reduction.
+        assert!(
+            !emit_config::active().moe_pf_lt,
+            "PLOW_EMIT_MOE_PF_LT: the routed MoE library route is single-rank only"
+        );
+    }
     // GEMV 8-wide load contract (runtime/nvidia/op_gemm.cuh): the decode GEMV family loads the
     // contraction dim (K) in 8-element vectors guarded only by `k < K`, so a K that is not a
     // multiple of 8 over-reads the final vector past the row. Every dim that becomes a GEMV K —
@@ -2589,6 +2619,12 @@ fn declare(
         } else {
             TENSOR_NONE
         },
+        mg_tp: if tp > 1 && c.moe {
+            // Slot 2 keeps the loaders' existing name for it (`act.ug_tp`).
+            ac(b, "ug_tp", (rows * c.hidden) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
         // MoE decode scratch (B=1). Only for the 26B-A4B MoE path; TENSOR_NONE otherwise so the
         // dense 12B/31B blob stays byte-identical. Sized by ONE token (decode); mfu/part are [k,·].
         // moe_rows scales the per-token MoE scratch (1 for decode, chunk `rows` for grouped prefill).
@@ -2613,7 +2649,11 @@ fn declare(
             TENSOR_NONE
         },
         moe_mfu: if c.moe {
-            ac(b, "moe.mfu", (dbatch * c.top_k * c.moe_inter) as u64 * BF16)
+            ac(
+                b,
+                "moe.mfu",
+                (dbatch * c.top_k * (c.moe_inter / c.tp)) as u64 * BF16,
+            )
         } else {
             TENSOR_NONE
         },
@@ -2623,7 +2663,9 @@ fn declare(
             TENSOR_NONE
         },
         moe_sum: if c.moe {
-            ac(b, "moe.sum", c.hidden as u64 * BF16)
+            // Under TP it holds the reduced routed sum of every row.
+            let r = if tp > 1 { moe_rows } else { 1 };
+            ac(b, "moe.sum", (r * c.hidden) as u64 * BF16)
         } else {
             TENSOR_NONE
         },
@@ -2660,12 +2702,22 @@ fn declare(
             TENSOR_NONE
         },
         moe_fug: if moe_pf_on {
-            ac(b, "moe.fug", (total_pad * c.moe_inter) as u64 * BF16)
+            ac(
+                b,
+                "moe.fug",
+                (total_pad * (c.moe_inter / c.tp)) as u64 * BF16,
+            )
         } else {
             TENSOR_NONE
         },
         moe_fuq: if moe_pf_on && w8a8 {
-            ac(b, "moe.fuq", (total_pad * c.moe_inter) as u64) // e4m3, 1 byte/elt
+            // e4m3, 1 byte/elt; also stages the [rows, hidden] xn2 quant, which outgrows the
+            // gathered intermediate once TP narrows it.
+            ac(
+                b,
+                "moe.fuq",
+                ((total_pad * (c.moe_inter / c.tp)).max(moe_rows * c.hidden)) as u64,
+            )
         } else {
             TENSOR_NONE
         },
@@ -2853,11 +2905,15 @@ fn declare(
         // (the SM indexes them through the ewt pointer table), so the handles are discarded here.
         let mut ex4 = [TENSOR_NONE; 4];
         if c.moe && in_block {
-            let gu_n = (c.n_exp * 2 * c.moe_inter) as u64;
+            assert!(
+                !(mx4 && c.tp > 1),
+                "MXFP4 experts are not sliced for tensor parallelism"
+            );
+            let gu_n = (c.n_exp * 2 * (c.moe_inter / c.tp)) as u64;
             let dn_n = (c.n_exp * c.hidden) as u64;
             if mx4 {
                 let gu = gu_n * c.hidden as u64;
-                let dn = dn_n * c.moe_inter as u64;
+                let dn = dn_n * (c.moe_inter / c.tp) as u64;
                 ex4 = [
                     b.tensor(
                         &format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj"),
@@ -2887,7 +2943,7 @@ fn declare(
                 );
                 b.tensor(
                     &format!("fp8/{prefix}layers.{l}.experts.down_proj"),
-                    dn_n * c.moe_inter as u64,
+                    dn_n * (c.moe_inter / c.tp) as u64,
                 );
                 b.tensor(
                     &format!("fp8/{prefix}layers.{l}.experts.down_proj_scale"),
@@ -2895,7 +2951,11 @@ fn declare(
                 );
             } else {
                 w(b, "experts.gate_up_proj", gu_n * c.hidden as u64 * BF16);
-                w(b, "experts.down_proj", dn_n * c.moe_inter as u64 * BF16);
+                w(
+                    b,
+                    "experts.down_proj",
+                    dn_n * (c.moe_inter / c.tp) as u64 * BF16,
+                );
             }
         }
         // FP8 decode twin of a projection: the quantized weight (1 byte/elt) under an "fp8/" name
@@ -3778,29 +3838,6 @@ fn flash_merge_map(
         .collect()
 }
 
-/// How many D-chunks each `(row, head)` merge item is split into.
-///
-/// **This was the L1 decode lever and it is MEASURED DEAD. Default 1; do not change it.**
-///
-/// The premise was sound on paper: `flash_merge` is 32 workgroups on a 256-CU machine at
-/// Gemma-31B decode (`n_bh = t*heads = 32`), holds the machine for 0.928 ms/token with a
-/// measured-EMPTY ready queue behind it, and is embarrassingly parallel over D — so `dsplit=8`
-/// takes it to 256 workgroups with no new reduction and no new gate, which an ideal-schedule
-/// simulation on the real DAG priced at **−0.805 ms/token**, the largest single decode lever.
-///
-/// Measured (MI355X, Gemma-4-31B bf16, ctx 1024, interleaved, same code object in every arm):
-/// **+0.555 ms/token at dsplit=8**, monotone in width (+0.243 at 2, +0.348 at 4), n=28 per arm
-/// over three independent sets, every arm token-identical. Wrong sign, and not marginally.
-/// `d_flash_merge` in `runtime/amd/op_attention.h` carries the numbers and the mechanism
-/// (widening an op widens its COARSE consumer's gate: o_proj then waits on a max over 256
-/// stragglers instead of 32).
-///
-/// The knob survives as the reproduction vehicle only. At 1 the emitted blob is byte-identical
-/// to the pre-change emitter's, so nothing ships differently.
-fn flash_merge_dsplit() -> u32 {
-    emit_config::active().flash_merge_dsplit.unwrap_or(1).max(1)
-}
-
 #[cfg(test)]
 #[path = "lib_tests/flash_merge_map.rs"]
 mod flash_merge_map_tests;
@@ -3836,6 +3873,58 @@ fn emit_xreduce(
         slot,
         None,
     )
+}
+
+/// The routed-expert half of a tensor-parallel Gemma MoE layer after its down GEMM. Each rank
+/// holds `part[rows][k][H]` over its slice of the expert intermediate, so the sum over the k
+/// selected experts is a partial: sum it into the rank's third peer slot (bf16), all-reduce it
+/// into `moe_sum`, then `moe_comb = h1 + RMSNorm(moe_sum, g_pf2)` — the reduction must precede
+/// the norm, which is nonlinear. Replaces the fused combine+norm packet at tp == 1.
+#[allow(clippy::too_many_arguments)]
+fn emit_moe_tp_reduce(
+    b: &mut Builder,
+    xgate: &mut u32,
+    decode: bool,
+    xr_cus: &[u32],
+    deps: &[u32],
+    n: &Tn,
+    g_pf2: u32,
+    t: u32,
+    c: &Cfg,
+    tp: u32,
+    slot_b: u32,
+) -> u32 {
+    let elems = t * c.hidden;
+    let cus: Vec<u32> = (0..elems.div_ceil(4096).clamp(1, b.n_cu())).collect();
+    let c_sum = b.emit(DevOp::MoeCombinePf, cus, deps, |d| {
+        d.t[0] = n.mg_tp;
+        d.t[3] = n.moe_part;
+        d.i[0] = c.hidden;
+        d.i[1] = c.top_k;
+        d.i[2] = t;
+    });
+    let c_red = emit_xreduce(
+        b,
+        xgate,
+        decode,
+        xr_cus,
+        c_sum,
+        n.moe_sum,
+        elems,
+        tp,
+        2 * slot_b,
+    );
+    let rows: Vec<u32> = (0..t.min(b.n_cu()).max(1)).collect();
+    b.emit(DevOp::NormResidual, rows, &[c_red], |d| {
+        d.t[0] = n.moe_comb;
+        d.t[1] = n.moe_h1;
+        d.t[2] = n.moe_sum;
+        d.t[3] = g_pf2;
+        d.i[0] = t;
+        d.i[1] = c.hidden;
+        d.f[0] = c.eps;
+        d.f[1] = 1.0;
+    })
 }
 
 /// [`emit_xreduce`] for the decode one-shot with the K3 latent `MoeCombine` folded into the
@@ -3921,7 +4010,7 @@ fn emit_xreduce_twoshot_band(
         d.i[0] = elems;
         d.i[1] = tp;
         d.i[2] = slot; // the REGION base (0 or slot_b) — never band-advanced: the loader
-                       // infers the blob's slot_bytes as max(i2) (asset/devblob.rs), so a
+                       // infers the blob's slot_bytes as the smallest nonzero i2 (asset/devblob.rs), so a
                        // band offset here would inflate it and shift the second partial's
                        // binding. The dispatch derives the band's window offset from e0.
         d.i[3] = gate_rs;
@@ -4117,14 +4206,7 @@ fn emit_xreduce_gather(
     let xr2_gather = !decode
         && emit_config::active().xr2_gather
         && gather.is_some_and(|(_, gcols, row_w)| row_w == tp.saturating_mul(gcols));
-    // PLOW_XR_DEC_TWOSHOT_MIN: a batched decode rung's [rows, hidden] message is bandwidth-bound
-    // like prefill's (B=128: 1 MB, every rank reading all 7 peers' copies in the one-shot).
-    let dec_twoshot = decode
-        && gather.is_none()
-        && emit_config::active()
-            .xr_dec_twoshot_min
-            .is_some_and(|m| xr_elems >= m.max(1));
-    if (decode && !dec_twoshot) || (gather.is_some() && !xr2_gather) {
+    if decode || (gather.is_some() && !xr2_gather) {
         let gate = *xgate;
         *xgate += 1;
         let (gslot, gcols, row_w) = gather.unwrap_or((0, 0, 0));
@@ -4208,12 +4290,7 @@ fn gemma_moe_router_split_plan(n_cu: u32, n_exp: u32, nrow: u32) -> Option<(u32,
         .gemma_moe_router_blocks
         .unwrap_or(max_useful)
         .clamp(1, max_useful);
-    let op = if emit_config::active().gemma_moe_router_exact {
-        DevOp::MoeRouterGemmaScore
-    } else {
-        DevOp::MoeRouterGemmaScoreFast
-    };
-    Some((blocks, op))
+    Some((blocks, DevOp::MoeRouterGemmaScoreFast))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4518,7 +4595,7 @@ fn emit_phase(
             );
         }
     }
-    let c_ple = if c.ple > 0 && !block_mode {
+    let (c_ple, c_pp) = if c.ple > 0 && !block_mode {
         let lp = c.layers * c.ple;
         let c_pe = b.emit(DevOp::Embed, rows.clone(), &[], |d| {
             d.t[0] = n.ple_raw;
@@ -4558,15 +4635,16 @@ fn emit_phase(
                 d.f[0] = c.eps;
             },
         );
-        b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
+        let c_ple = b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
             d.t[0] = n.ple;
             d.t[1] = n.ple;
             d.t[2] = n.ple_raw;
             d.i[0] = t * lp;
             d.f[0] = std::f32::consts::FRAC_1_SQRT_2;
-        })
+        });
+        (c_ple, Some(c_pp))
     } else {
-        0
+        (0, None)
     };
     if hj {
         b.host_join();
@@ -4674,6 +4752,9 @@ fn emit_phase(
         } else {
             n_cu
         };
+        // A projection without an fp8 twin (a checkpoint's bf16 linear in an fp8 model, e.g. the
+        // E-series per-layer input gate/projection) takes the bf16 arms.
+        let fp8 = fp8 && w8 != TENSOR_NONE;
         if gemv_family && fp8 && !fp8_lt_decode {
             return b.emit(DevOp::GemvFp8, gemv_wg_cap(cus), deps, |d| {
                 d.t[0] = out;
@@ -5388,8 +5469,12 @@ fn emit_phase(
             // The block's FIRST layer reads the uploaded `act.x` with no producer
             // (Embed was skipped), so its RmsNorm depends on `&[]`. Full model =>
             // block.start==0 and this only affects l==0, whose dep IS the Embed.
+            // Layer 0 overwrites `act.x` after the per-layer projection read it.
+            let first_x = [dep, c_pp.unwrap_or(dep)];
             let nd: &[u32] = if block_mode && l == block.start {
                 &[]
+            } else if l == 0 && c_pp.is_some() {
+                &first_x
             } else {
                 &[dep]
             };
@@ -5649,40 +5734,6 @@ fn emit_phase(
         // head->wave map, which cannot be done at hd=256 without breaking pair locality.
         let hn_cus: Vec<u32> = (0..((t * heads).div_ceil(8)).min(n_cu).max(1)).collect();
         let nhn = hn_cus.len() as u32;
-        // q/k/v HEADNORM ON DISJOINT CU SETS. The three are mutually INDEPENDENT -- each depends
-        // only on its own projection, never on the others -- but all three were emitted on the
-        // SAME `hn_cus`, so a workgroup had to finish q before it could start k. At decode
-        // (t=1, heads=16) `nhn` is 2, so three 8.9 us packets ran back to back on 2 of 304 CUs.
-        //
-        // This is NOT the widening the note above refuses. Each op keeps its own `nhn`
-        // workgroups and its own head->wave map; only their PLACEMENT moves apart, which is what
-        // `Builder::split` exists for ("so independent ops overlap"). Guarded on 3*nhn fitting,
-        // because at prefill `nhn` is already the whole machine and there is nothing to separate.
-        // OFF BY DEFAULT, and NOW MEASURED: it is a NO-OP UNDER THE GLOBAL QUEUE.
-        //
-        // The premise -- "three 8.9 us packets ran back to back on 2 of 304 CUs" -- is a property
-        // of the STATIC per-CU stream, where a workgroup executes its own fixed packet list and so
-        // must finish q before it starts k. Under PLOW_GLOBAL_QUEUE the three packets are claimed
-        // by whichever workgroups are free, so they spread on their own. TRACED on MI300X
-        // (gfx942, 304 CU, Gemma-4-12B decode, PLOW_TRACE_RAW), layer 1, hn_split OFF:
-        //
-        //     inst 18 (q)  cus [65, 120]   starts 257.28 / 257.23 us
-        //     inst 19 (k)  cus [41, 272]   starts 257.44 / 257.23
-        //     inst 20 (v)  cus [40, 233]   starts 257.16 / 257.15
-        //
-        // SIX DISTINCT CUs, all three within 0.3 us of each other -- already fully concurrent, so
-        // there is nothing for the split to recover. It may still be worth something on the static
-        // path, which is where the original observation came from; it is dead weight on the
-        // global-queue path that every AMD decode object ships today.
-        // Enable with PLOW_HN_SPLIT=1 if you are on the static scheduler.
-        let hn_split = 3 * nhn <= n_cu && emit_config::active().hn_split;
-        let hn_set = |i: u32| -> Vec<u32> {
-            if hn_split {
-                (i * nhn..(i + 1) * nhn).collect()
-            } else {
-                hn_cus.clone()
-            }
-        };
 
         // gemv -> headnorm. headnorm workgroup j owns whole HEADS, and head h is the 256 (or
         // 512) consecutive output columns [h*hd, h*hd+hd) of the projection — so it needs only
@@ -5790,7 +5841,7 @@ fn emit_phase(
         } else {
             b.emit_dep(
                 DevOp::HeadNormRope,
-                hn_set(0),
+                hn_cus.clone(),
                 hn_dep(c_q, nq, heads),
                 |d| {
                     d.t[0] = n.q;
@@ -5823,8 +5874,7 @@ fn emit_phase(
         // two did, and the chain loses one coarse gate per layer. A live coarse-gated op costs
         // 3.01 us on this packet (measured by injection: 30 and 90 duplicate live ops, slope
         // 3.01 us/op), so 30 layers is 0.090 ms of a 5.378 ms B=1 step.
-        // t6 carries the fp8 per-row scale, so this needs bf16 KV; hn_split would put the two
-        // on DIFFERENT CU sets, so it needs the default placement too.
+        // t6 carries the fp8 per-row scale, so this needs bf16 KV.
         let span_kv = decode && n.rowslot != TENSOR_NONE;
         assert!(
             !span_kv || (fp8_kv && gemv_family && !fuse_hnr && !shared),
@@ -5834,7 +5884,6 @@ fn emit_phase(
             && !fuse_hnr
             && !shared
             && !fp8_kv
-            && !hn_split
             && (fuse_qkv || fuse_qkv_fp8)
             && c_k == c_v
             && qk_skip == v_skip
@@ -5842,7 +5891,7 @@ fn emit_phase(
         let c_kn = if fuse_hnr || shared || hnr_fold {
             0
         } else {
-            b.emit_dep(hn_op, hn_set(1), hn_dep(c_k, nk, kvh), |d| {
+            b.emit_dep(hn_op, hn_cus.clone(), hn_dep(c_k, nk, kvh), |d| {
                 d.t[0] = n.kc[l];
                 d.t[1] = n.kg;
                 d.t[2] = w.kn;
@@ -5902,7 +5951,7 @@ fn emit_phase(
         } else if fuse_hnr || shared || hnr_fold {
             0
         } else {
-            b.emit_dep(hn_op, hn_set(2), vn_dep, |d| {
+            b.emit_dep(hn_op, hn_cus.clone(), vn_dep, |d| {
                 d.t[0] = n.vc[l];
                 d.t[1] = v_src;
                 d.t[5] = n.pos;
@@ -6276,12 +6325,10 @@ fn emit_phase(
         let attn_deps = if fused || fuse_merge || dec_fused {
             vec![c_fa]
         } else {
-            // L1: fold a D-chunk axis into the merge's work id so it can occupy more than
-            // `t*heads` (= 32 at Gemma-31B decode) of 256 CUs. `flash_merge_map` and
-            // `d_flash_merge` both RE-DERIVE dsplit from this length, so this is the single
-            // input. Default 1 => `(t*heads).min(n_cu)`, exactly as before.
-            let mg_cus: Vec<u32> =
-                (0..(t * heads * flash_merge_dsplit()).min(n_cu).max(1)).collect();
+            // `flash_merge_map` and `d_flash_merge` both RE-DERIVE the D-chunk split from this
+            // length. Widening past `t*heads` (dsplit > 1) MEASURED SLOWER on MI355X Gemma-4-31B
+            // decode (+0.555 ms/token at dsplit=8): it widens o_proj's coarse gate.
+            let mg_cus: Vec<u32> = (0..(t * heads).min(n_cu).max(1)).collect();
             let fill = |d: &mut DevInst| {
                 d.t[0] = n.at;
                 d.t[1] = n.opart;
@@ -6949,7 +6996,7 @@ fn emit_phase(
                         d.t[3] = w.egu8;
                         d.t[4] = w.egus;
                         d.i[0] = c.top_k;
-                        d.i[1] = c.moe_inter;
+                        d.i[1] = c.moe_inter / c.tp;
                         d.i[2] = c.hidden;
                         d.i[3] = c.n_exp;
                         d.i[4] = 1;
@@ -6964,7 +7011,7 @@ fn emit_phase(
                         d.t[4] = w.edns;
                         d.i[0] = c.top_k;
                         d.i[1] = c.hidden;
-                        d.i[2] = c.moe_inter;
+                        d.i[2] = c.moe_inter / c.tp;
                         d.i[3] = c.n_exp;
                         d.i[6] = nb;
                     })]
@@ -6994,7 +7041,7 @@ fn emit_phase(
                                 d.t[3] = w.ewt;
                                 d.t[4] = w.est;
                                 d.i[0] = c.top_k;
-                                d.i[1] = c.moe_inter;
+                                d.i[1] = c.moe_inter / c.tp;
                                 d.i[2] = c.hidden;
                                 d.i[3] = c.n_exp;
                                 d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
@@ -7046,7 +7093,7 @@ fn emit_phase(
                             // operands across rungs, else it keeps widest-only execution.
                             d.t[5] = n.moe_xn2;
                             d.i[0] = c.top_k;
-                            d.i[1] = c.moe_inter;
+                            d.i[1] = c.moe_inter / c.tp;
                             d.i[2] = c.hidden;
                             d.i[3] = c.n_exp;
                             d.i[5] = nb; // BATCH B (0 at B=1)
@@ -7076,7 +7123,7 @@ fn emit_phase(
                         d.t[4] = w.est;
                         d.i[0] = c.top_k;
                         d.i[1] = c.hidden;
-                        d.i[2] = c.moe_inter;
+                        d.i[2] = c.moe_inter / c.tp;
                         d.i[3] = c.n_exp;
                         d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
                         if let Some(min) = moe_dec_group {
@@ -7097,12 +7144,16 @@ fn emit_phase(
                 // drift vs the pair). The NVIDIA body is now op70's body + NRN's body in one CTA
                 // (b staged in smem), bit-exact to the pair by construction. Opt in:
                 // PLOW_GEMMA_MOE_TAIL_FUSE=1.
-                let tail_fuse = emit_config::active().gemma_moe_tail_fuse;
+                let tail_fuse = emit_config::active().gemma_moe_tail_fuse && tp == 1;
                 // op72 IS batched now (op_moe.cuh: per-row block loop, `part` rows k*H apart),
                 // so the old B=1-only assert is gone. At B=1 it still emits one block and runs
                 // one row, so the B=1 program is unchanged and the fusion can be A/B'd at C1
                 // without the batching being a second variable.
-                let c_comb = if gfuse && tail_fuse {
+                let c_comb = if tp > 1 {
+                    emit_moe_tp_reduce(
+                        b, &mut xgate, decode, &xr_cus, &comb_deps, &n, w.g_pf2, t, c, tp, slot_b,
+                    )
+                } else if gfuse && tail_fuse {
                     // op72: fused combine + post_ffn norm + sandwich residual + NEXT input norm.
                     // One 1-block packet replaces the (op70, NormResidualNorm) pair on the layer
                     // tail — the chain next-QKV gates on loses a packet boundary. Bit-exact.
@@ -7131,34 +7182,11 @@ fn emit_phase(
                     moe_fused_tail = Some(ct);
                     ct
                 } else {
-                    // BATCH B>1: one CTA per row (the body is a per-row block loop).
-                    //
-                    // ONE ROW: the body is a SINGLE CTA moving k*H f32 partials (90 KiB at the
-                    // 26B) while every other CU gates on it, and this op sits on the B=1 decode
-                    // critical path once per layer. op_moe.cuh's PLOW_MOE_COMBINE_ALLBLK arm has
-                    // each block redundantly recompute the reduction and write only its own
-                    // disjoint slice -- it needs blocks > 1 HERE to do anything, since it slices
-                    // on `slice`/`nblk`. The f32[H] it stages through is the per-block dynamic
-                    // smem arena, so the redundant writes cannot race.
-                    //
-                    // MEASURED NEGATIVE 2026-09-24, and left at 1 because of it. With
-                    // -DPLOW_MOE_COMBINE_ALLBLK=1 on sm_90a, 26B B=1 ctx128 step_bench:
-                    //     1 blk 5.3693 | 8 blk 5.5017 (+0.1323) | 32 blk 5.5097 (+0.1403)
-                    // i.e. +4.4 us per layer, not the saving the kernel comment's "0.317 ms of a
-                    // 6.12 ms step" suggests. Widening does not help because the consumer then
-                    // waits the MAX over N blocks instead of one, and every extra block pays the
-                    // coarse-gate machinery on the very gate that was the serialization point.
-                    // Fusing these narrow spine ops is a null too (PLOW_FUSE_KV_HNR, +0.0127 ms
-                    // for 25 ops removed), so neither widening nor merging is the lever here.
-                    let comb_cus: Vec<u32> = if t == 1 {
-                        let n = emit_config::active()
-                            .moe_combine_blocks
-                            .unwrap_or(1)
-                            .clamp(1, n_cu);
-                        (0..n).collect()
-                    } else {
-                        (0..t).collect()
-                    };
+                    // BATCH B>1: one CTA per row (the body is a per-row block loop). ONE ROW: a
+                    // single CTA. An all-block combine MEASURED NEGATIVE 2026-09-24 (26B B=1
+                    // ctx128 step_bench, +4.4 us per layer at 8 or 32 blocks): the consumer then
+                    // waits the MAX over N blocks and every extra block pays the coarse gate.
+                    let comb_cus: Vec<u32> = if t == 1 { vec![0] } else { (0..t).collect() };
                     b.emit(DevOp::MoeCombineNormGemma, comb_cus, &comb_deps, |d| {
                         d.t[0] = n.moe_comb;
                         d.t[1] = n.moe_part;
@@ -7244,7 +7272,7 @@ fn emit_phase(
                     let xn2_bytes = t as u64 * c.hidden as u64;
                     assert!(
                         xn2_bytes <= fuq_bytes,
-                        "moe.fuq ({fuq_bytes} B = total_pad*moe_inter) cannot stage xn2 e4m3 ({t} rows x {} = {xn2_bytes} B)",
+                        "moe.fuq ({fuq_bytes} B = max(total_pad*moe_inter_local, rows*hidden)) cannot stage xn2 e4m3 ({t} rows x {} = {xn2_bytes} B)",
                         c.hidden
                     );
                     let c_xn2q = quant(b, n.moe_fuq, n.moe_xas, n.moe_xn2, c.hidden, c_xn2);
@@ -7260,7 +7288,7 @@ fn emit_phase(
                             d.t[4] = n.moe_rowtok;
                             d.t[5] = n.moe_xas; // per-token a_scale
                             d.t[6] = w.est; // per-channel weight scales
-                            d.i[0] = c.moe_inter;
+                            d.i[0] = c.moe_inter / c.tp;
                             d.i[1] = c.hidden;
                             d.i[2] = c.n_exp;
                             d.i[5] = c.mlp_act;
@@ -7272,7 +7300,7 @@ fn emit_phase(
                         d.t[1] = n.moe_fug;
                         d.t[2] = n.moe_fus;
                         d.i[0] = moe_total_pad;
-                        d.i[1] = c.moe_inter;
+                        d.i[1] = c.moe_inter / c.tp;
                     });
                     b.emit(
                         DevOp::MoeGroupDownGemmaPfW8a8,
@@ -7288,7 +7316,7 @@ fn emit_phase(
                             d.t[6] = w.est;
                             d.t[7] = n.moe_fus; // per-row fu scale
                             d.i[0] = c.hidden;
-                            d.i[1] = c.moe_inter;
+                            d.i[1] = c.moe_inter / c.tp;
                             d.i[2] = c.n_exp;
                         },
                     )
@@ -7302,7 +7330,7 @@ fn emit_phase(
                         d.t[3] = w.egus;
                         d.t[4] = n.moe_meta;
                         d.t[5] = n.moe_rowtok;
-                        d.i[0] = c.moe_inter;
+                        d.i[0] = c.moe_inter / c.tp;
                         d.i[1] = c.hidden;
                         d.i[2] = c.n_exp;
                         d.i[3] = 1;
@@ -7317,7 +7345,7 @@ fn emit_phase(
                         d.t[6] = n.moe_rowpart;
                         d.t[7] = n.moe_rowgate;
                         d.i[0] = c.hidden;
-                        d.i[1] = c.moe_inter;
+                        d.i[1] = c.moe_inter / c.tp;
                         d.i[2] = c.n_exp;
                     })
                 } else {
@@ -7331,7 +7359,7 @@ fn emit_phase(
                             d.t[2] = w.ewt;
                             d.t[3] = n.moe_meta;
                             d.t[4] = n.moe_rowtok;
-                            d.i[0] = c.moe_inter;
+                            d.i[0] = c.moe_inter / c.tp;
                             d.i[1] = c.hidden;
                             d.i[2] = c.n_exp;
                             d.i[5] = c.mlp_act; // 0 GeGLU (Gemma)
@@ -7350,27 +7378,43 @@ fn emit_phase(
                             d.t[4] = n.moe_rowpart;
                             d.t[5] = n.moe_rowgate;
                             d.i[0] = c.hidden;
-                            d.i[1] = c.moe_inter;
+                            d.i[1] = c.moe_inter / c.tp;
                             d.i[2] = c.n_exp;
                         },
                     )
                 };
                 // T-row combine + sandwich: out[t] = RMSNorm(Σ_slot part[t][slot], g_pf2) + h1[t].
-                let c_comb = b.emit(
-                    DevOp::MoeCombineNormGemmaPf,
-                    all.clone(),
-                    &[c_dn, c_h1],
-                    |d| {
-                        d.t[0] = n.moe_comb;
-                        d.t[1] = n.moe_part;
-                        d.t[2] = n.moe_h1;
-                        d.t[3] = w.g_pf2;
-                        d.i[0] = c.hidden;
-                        d.i[1] = c.top_k;
-                        d.i[2] = t;
-                        d.f[0] = c.eps;
-                    },
-                );
+                let c_comb = if tp > 1 {
+                    emit_moe_tp_reduce(
+                        b,
+                        &mut xgate,
+                        decode,
+                        &xr_cus,
+                        &[c_dn, c_h1],
+                        &n,
+                        w.g_pf2,
+                        t,
+                        c,
+                        tp,
+                        slot_b,
+                    )
+                } else {
+                    b.emit(
+                        DevOp::MoeCombineNormGemmaPf,
+                        all.clone(),
+                        &[c_dn, c_h1],
+                        |d| {
+                            d.t[0] = n.moe_comb;
+                            d.t[1] = n.moe_part;
+                            d.t[2] = n.moe_h1;
+                            d.t[3] = w.g_pf2;
+                            d.i[0] = c.hidden;
+                            d.i[1] = c.top_k;
+                            d.i[2] = t;
+                            d.f[0] = c.eps;
+                        },
+                    )
+                };
                 (n.moe_comb, c_comb)
             }
         } else {
@@ -7390,8 +7434,8 @@ fn emit_phase(
          -> u32 {
             if ple_split_on(c) {
                 assert!(
-                    !fp8 && !mx4 && !affine_q4,
-                    "E-series per-layer input split: bf16 weights only"
+                    !mx4 && !affine_q4,
+                    "E-series per-layer input split: bf16 or fp8 models only (bf16 projections)"
                 );
                 let none = TENSOR_NONE;
                 let (h, p) = (c.hidden, c.ple);
@@ -9080,7 +9124,7 @@ fn apply_production_defaults(
     // `PLOW_DECODE_TIERS` (a per-rung object) is what makes the 16 rung payable; until a
     // tiered gfx942 recipe ships and is measured, the ladder stops at 8.
     let ladder = match arch {
-        "sm_90a" => Some("1,2,4,8,16"),
+        "sm_90a" | "sm_120a" => Some("1,2,4,8,16"),
         "gfx942" => Some("1,2,4,8"),
         _ => None,
     };
@@ -9099,6 +9143,21 @@ fn apply_production_defaults(
         && tp == 1
         && !cfg.fp8_kv
         && (arch == "sm_90a" || (arch == "gfx942" && !cfg.any_fp8_weights()));
+    // FP8-KV segmented prefill runs only through the packed request contract (plowrt refuses the
+    // packet otherwise), W8A8 included, so a segmented FP8-KV emit on sm_120a carries it unless
+    // the recipe says otherwise. sm_90a recipes set it explicitly; there an unset knob keeps the
+    // contract optional (declined when it does not fit).
+    if cfg.fp8_kv
+        && !cfg.uniseg
+        && tp == 1
+        && capabilities.dense_packet_contracts
+        && arch == "sm_120a"
+        && cfg.emit_packed_prefill.is_none()
+    {
+        cfg.emit_packed_prefill = Some(true);
+        cfg.packed_prefill_fp8kv_default = true;
+        emit_config::note_production_default("emit_packed_prefill", "true".into());
+    }
     // GLM on gfx942: the packed siblings are a SECOND copy of the dense prefill buckets, and the
     // ordinary programs are byte-identical with or without them (`glm_tests`), so the packet
     // can carry them by default. The serve side arms its packed route from their presence.
@@ -9265,6 +9324,17 @@ fn apply_production_defaults(
     }
 }
 
+/// CUDA targets where cuBLASLt has OUTER_VEC (per-row/per-column) FP8 scaling algorithms.
+fn cublaslt_fp8_vector_scale_arch(arch: &str) -> bool {
+    arch == "sm_90a"
+}
+
+/// CUDA targets whose prefill objects carry the packed-request ABI (`PLOW_NV_PACKED_REQUEST`):
+/// the interpreter's non-wgmma packed arms compile for GB202 as well as Hopper.
+fn nv_packed_request_arch(arch: &str) -> bool {
+    matches!(arch, "sm_90a" | "sm_120a")
+}
+
 fn cublaslt_emit_supported(
     capabilities: EmitCapabilities,
     arch: &str,
@@ -9385,12 +9455,12 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     if emit_config::active().max_request_chunk.is_some() {
         assert!(
             model_type.starts_with("gemma4")
-                && arch == "sm_90a"
+                && nv_packed_request_arch(&arch)
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights() || emit_config::active().w8a8)
                 && !emit_config::active().mxfp4
                 && emit_config::active().packed_prefill_metadata_on(),
-            "request chunk limits require packed Gemma 4 BF16 or W8A8 weights on SM90 TP1"
+            "request chunk limits require packed Gemma 4 BF16 or W8A8 weights on a packed-request CUDA target (sm_90a, sm_120a) at TP1"
         );
     }
 
@@ -9436,6 +9506,13 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             ),
             "cuBLASLt decode emission requires a supported single-GPU CUDA emitter without decode objects"
         );
+        assert!(
+            !emit_config::active().decode_cublaslt
+                || !emit_config::active().any_fp8_weights()
+                || cublaslt_fp8_vector_scale_arch(&arch),
+            "FP8 cuBLASLt decode needs vector-scale FP8 cuBLASLt algorithms, which only sm_90a has \
+             (cuBLASLt 12.9 returns NOT_SUPPORTED on sm_120a); use the native FP8 decode routes"
+        );
     }
     if emit_config::active().prefill_cublaslt {
         assert!(
@@ -9443,14 +9520,13 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                 || model_type == "qwen3_5")
                 && arch == "sm_90a"
                 || (model_type == "qwen3_asr" || model_type == "qwen3" || model_type == "llama" || model_type.starts_with("gemma4"))
-                    && arch == "sm_89"
-                || model_type == "qwen3_asr" && arch == "sm_120a")
+                    && matches!(arch.as_str(), "sm_89" | "sm_120a"))
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights()
                     || ((model_type.starts_with("gemma4") || model_type == "qwen3_5")
                         && emit_config::active().w8a8))
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 / Qwen3.5 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR and Llama BF16 also on SM89, Qwen3-ASR on SM120)"
+            "cuBLASLt prefill emission requires Gemma 4 / Qwen3.5 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR, Qwen3, Llama and Gemma 4 BF16 also on SM89 and SM120)"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {
@@ -9492,8 +9568,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // `mla/kimi_k3.rs` has asked for the sibling topology since it was written and this
         // assertion is why it could never be given one; a GLM-5.3 gfx942 TP4 emit died here.
         assert!(
-            emit_is_amd() || (arch == "sm_90a" && tp == 1),
-            "packed request emission requires Hopper single-GPU direct KV"
+            emit_is_amd() || (nv_packed_request_arch(&arch) && tp == 1),
+            "packed request emission requires a packed-request CUDA target (sm_90a, sm_120a), single-GPU direct KV"
         );
         assert!(
             emit_is_amd() || capabilities.dense_packet_contracts,
@@ -9512,7 +9588,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().decode_objects.is_some() {
         assert!(
-            matches!(arch.as_str(), "sm_90a" | "sm_120") && tp == 1,
+            matches!(arch.as_str(), "sm_90a" | "sm_120" | "sm_120a") && tp == 1,
             "decode objects require a supported single-GPU CUDA target"
         );
         assert!(
@@ -10336,6 +10412,16 @@ const GFX950_DISPATCHED: &[&str] = &[
 ];
 
 /// Opcodes executed by isolated `AmdEngine` segments instead of `interp.hip`.
+/// Opcodes whose interp.hip arms compile only into gfx12 objects (`#if PLOW_GFX12`): no CDNA
+/// object has been gated with them, so a CDNA packet carrying one is refused.
+const GFX12_DISPATCHED: &[&str] = &[
+    "PLOW_DOP_EMBED_FRAME_BF16",
+    "PLOW_DOP_EMBED_OVERLAY_BF16",
+    "PLOW_DOP_EMBED_POS_BF16",
+    "PLOW_DOP_GEMV_ARGMAX",
+    "PLOW_DOP_PER_LAYER_INPUT",
+];
+
 const AMD_HOST_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_BLK_PF",
     "PLOW_DOP_GEMM_LT_PF",
@@ -10401,6 +10487,12 @@ fn check_group_routing_supported(m: &Model, amd: bool, arch: &str) {
 }
 
 fn check_gfx950_opcode_coverage(m: &Model, amd: bool) {
+    check_amd_opcode_coverage(m, amd, false);
+}
+
+/// [`check_gfx950_opcode_coverage`] for a known AMD arch: a gfx12 target also has the
+/// [`GFX12_DISPATCHED`] arms.
+fn check_amd_opcode_coverage(m: &Model, amd: bool, gfx12: bool) {
     if !amd {
         return;
     }
@@ -10412,6 +10504,7 @@ fn check_gfx950_opcode_coverage(m: &Model, amd: bool) {
             };
             let c = op.c_name();
             if !GFX950_DISPATCHED.contains(&c)
+                && !(gfx12 && GFX12_DISPATCHED.contains(&c))
                 && !AMD_HOST_DISPATCHED.contains(&c)
                 && !missing.contains(&c)
             {
@@ -10765,10 +10858,10 @@ fn emit_dense_gqa(
     // So the axes get names. `PLOW_FP8` stays an alias for the weight axis — every existing script
     // and every line of the README keeps working, and unset means unset:
     //
-    //   weight      PLOW_W8A16=1 | PLOW_W8A8=1 | PLOW_W4A16=1   (alias: PLOW_FP8=1 -> w8a16)
+    //   weight      PLOW_W8A16=1 | PLOW_W8A8=1 | PLOW_MXFP4=1   (alias: PLOW_FP8=1 -> w8a16)
     //   activation  implied by the weight axis (w8a8 quantizes activations; the others do not)
     //   kv          PLOW_KV_FP8=1                               (alias: PLOW_FP8_KV=1)
-    //   experts     PLOW_MOE_ENC=bf16|fp8blk|mxfp4              (MLA family; see mla::MoeEnc)
+    //   experts     derived from the weight axis                (MLA family; see mla::MoeEnc)
     //
     // The activation axis is deliberately NOT a separate flag: w8a8 is one profile, not a free
     // cross-product with w8a16, and the kernels instantiate exactly those. Naming it separately
@@ -10867,16 +10960,10 @@ fn emit_dense_gqa(
     const LADDER_BM: u32 = 128;
     const LADDER_BN: u32 = 128;
     let cap = rung_cap(c.window, ctx);
-    // SUB-128 PREFILL RUNGS (32, 64), AMD only and OFF BY DEFAULT — see `PLOW_PF_FLOOR`, which
-    // carries the measurement that withdrew them. The short version: sublinear saving because
-    // `GM_BM=192` means the GEMM does not shrink below t=192 at all, zero in two serving
-    // campaigns, and they cap the decode ladder at 16 because prefill and decode rungs share one
-    // width-ordered space.
-    let floor: &[u32] = if amd && ecfg.pf_floor { &[32, 64] } else { &[] };
-    let shipped: Vec<u32> = floor
-        .iter()
-        .copied()
-        .chain([128u32, 512, 1024, 2048, 4096, 8192, 16384])
+    // No sub-128 prefill rungs: they shipped on AMD and were withdrawn on measurement (zero in
+    // two serving campaigns, +30.9% blob, and a 32 prefill rung collides with a 32 decode rung).
+    let shipped: Vec<u32> = [128u32, 512, 1024, 2048, 4096, 8192, 16384]
+        .into_iter()
         .filter(|&x| x <= cap)
         .collect();
     // PLOW_PF_LADDER is sm_120-only, and its own comment above says why: the rungs are derived from
@@ -11241,6 +11328,18 @@ fn emit_dense_gqa(
         }
     }
 
+    residual_precision::apply(&mut m, ecfg.residual_f32, &arch)
+        .unwrap_or_else(|error| panic!("residual precision: {error}"));
+    tp_precision::apply(
+        &mut m,
+        ecfg.tp_partial_f32,
+        &arch,
+        [
+            (emitter.tn.og_tp, emitter.tn.og),
+            (emitter.tn.dg_tp, emitter.tn.dg),
+        ],
+    )
+    .unwrap_or_else(|error| panic!("TP partial precision: {error}"));
     let projection_bindings =
         projection_rewrite::apply(&mut m, &ecfg, &gpu, &arch, std::path::Path::new(&out))
             .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));
@@ -11539,17 +11638,17 @@ fn emit_dense_gqa(
         sections.extend(fish_depth::sections(&c, &emitter.tn, t, &m, &rungs));
     }
     // Speech ops of auxiliary programs (not in `m.progs`), for the speech object's arm mask.
-    let mut aux_speech_ops = 0u64;
+    let mut aux_speech = manifest::SpeechMasks::default();
     if c.frame
         .as_ref()
         .and_then(|f| f.depth.as_ref())
         .is_some_and(|d| d.maya2.is_some())
     {
         let n = &emitter.tn;
-        let (depth, ops) =
+        let (depth, speech) =
             maya2_depth::lm_sections(&mut m, &c, n.hn, n.frame_dcodes, n.frame_codes, &rungs);
         sections.extend(depth);
-        aux_speech_ops |= ops;
+        aux_speech.add(speech);
     }
     if let Some(t) = &emitter.tn.mtp {
         sections.extend(mtp::sections(&dir, &c, &emitter.tn, t, &m, &rung_progs));
@@ -11664,7 +11763,8 @@ fn emit_dense_gqa(
                 packed_prefill_emitted = true;
             }
             Err(error)
-                if ecfg.emit_packed_prefill.is_none() && ecfg.max_request_chunk.is_none() =>
+                if (ecfg.emit_packed_prefill.is_none() || ecfg.packed_prefill_fp8kv_default)
+                    && ecfg.max_request_chunk.is_none() =>
             {
                 m.tensors.truncate(packed_tensor_base);
                 eprintln!("  packed prefill not selected: {error}");
@@ -11869,12 +11969,13 @@ fn emit_dense_gqa(
     // GATE: an fp8 GEMM whose a_scale operand is unbound is a NULL DEREFERENCE on gfx950. Checked
     // against the emitted stream and BEFORE the blob is written, so the bad packet never exists.
     check_fp8_a_scale_bound(&m, &arch, &gpu);
-    check_gfx950_opcode_coverage(&m, amd);
+    check_amd_opcode_coverage(&m, amd, arch == "gfx1201");
     check_nvidia_opcode_coverage(&m, amd);
     check_cpu_or_metal_opcode_coverage(
         &m,
         arch == "metal3" || target_is_cpu(&arch, &gpu) || (arch.is_empty() && gpu.is_empty()),
         arch.starts_with("sm_"),
+        amd && arch == "gfx1201",
     );
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
@@ -11928,7 +12029,7 @@ fn emit_dense_gqa(
                 (encoder.prefix.model, section)
             });
     std::fs::write(&out, blob).unwrap();
-    let mut speech_ops = aux_speech_ops;
+    let mut speech = aux_speech;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
         let fish = std::fs::read(dir.join("config.json"))
@@ -11953,7 +12054,7 @@ fn emit_dense_gqa(
         }
         .unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(tts::CODEC_PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
         let enc = dir.join("encoder");
@@ -11969,7 +12070,7 @@ fn emit_dense_gqa(
             }
             .unwrap_or_else(|error| panic!("reference encoder packet: {error}"));
             let path = std::path::Path::new(&out).with_file_name(mimi_encoder::PACKET);
-            speech_ops |= manifest::speech_ops(&model);
+            speech.add(manifest::SpeechMasks::of(&model));
             write_sidecar_packet(&path, &model, &[section]);
             eprintln!("  reference encoder packet -> {}", path.display());
         }
@@ -11979,7 +12080,7 @@ fn emit_dense_gqa(
         let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16)
             .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
         let voice = dir.join("voice");
@@ -11987,7 +12088,7 @@ fn emit_dense_gqa(
             let (model, section) = voice_cond::lower_voice_cond(&voice, n_cu, m.target)
                 .unwrap_or_else(|error| panic!("voice conditioning packet: {error}"));
             let path = std::path::Path::new(&out).with_file_name(voice_cond::PACKET);
-            speech_ops |= manifest::speech_ops(&model);
+            speech.add(manifest::SpeechMasks::of(&model));
             write_sidecar_packet(&path, &model, &[section]);
             eprintln!("  voice conditioning packet -> {}", path.display());
         }
@@ -12011,14 +12112,14 @@ fn emit_dense_gqa(
         for (file, sidecar) in lowered.into_iter().flatten() {
             let sidecar = sidecar.unwrap_or_else(|e| panic!("multimodal {file}: {e}"));
             let path = std::path::Path::new(&out).with_file_name(file);
-            speech_ops |= manifest::speech_ops(&sidecar.model);
+            speech.add(manifest::SpeechMasks::of(&sidecar.model));
             write_sidecar_packet(&path, &sidecar.model, &[sidecar.section]);
             eprintln!("  multimodal encoder packet -> {}", path.display());
         }
     }
     if let Some((model, section)) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name(asr::qwen::ENCODER_PACKET);
-        speech_ops |= manifest::speech_ops(&model);
+        speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  audio encoder packet -> {}", path.display());
     }
@@ -12050,8 +12151,9 @@ fn emit_dense_gqa(
         {
             man["features"]["linear_bias"] = true.into();
         }
-        if speech_ops != 0 {
-            man["speech_ops"] = speech_ops.into();
+        if speech.ops != 0 {
+            man["speech_ops"] = speech.ops.into();
+            man["speech_conv_posts"] = speech.conv_posts.into();
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes
@@ -12254,15 +12356,17 @@ mod xalltoall_heads_tests;
 
 pub mod fp8_m1_role;
 
-/// Opcodes only the Metal interpreter (and the CPU golden tier) implement. Refused at emit for
-/// any other GPU target, so an E-series blob cannot reach a CUDA/HIP interpreter's
-/// `default: __trap()`.
-fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
+/// Refuse operations outside each backend's implemented subset.
+fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool, gfx12: bool) {
     if supported {
         return;
     }
     // The CUDA interpreter carries the embedding-overlay handoff (op 179) too.
-    let cuda_ok = |op: DevOp| cuda && matches!(op, DevOp::EmbedOverlayBf16 | DevOp::GluStrided);
+    // The gfx12 AMD interpreter carries PerLayerInput and EmbedOverlayBf16.
+    let target_ok = |op: DevOp| {
+        (cuda && matches!(op, DevOp::EmbedOverlayBf16 | DevOp::GluStrided))
+            || (gfx12 && matches!(op, DevOp::PerLayerInput | DevOp::EmbedOverlayBf16))
+    };
     const CPU_OR_METAL_ONLY: [DevOp; 5] = [
         DevOp::PerLayerInput,
         DevOp::GluStrided,
@@ -12272,7 +12376,7 @@ fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
     ];
     let bad: Vec<&'static str> = CPU_OR_METAL_ONLY
         .iter()
-        .filter(|op| !cuda_ok(**op))
+        .filter(|op| !target_ok(**op))
         .filter(|op| {
             m.progs
                 .iter()

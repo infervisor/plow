@@ -3168,6 +3168,7 @@ name = "plow-asset"
 version = "0.1.3"
 dependencies = [
  "chrono",
+ "hwspec",
  "minijinja",
  "packet",
  "serde",

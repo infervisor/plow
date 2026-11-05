@@ -267,10 +267,12 @@ pub fn lower(
                 .checked_mul(stage.output_channels.div_ceil(64))
                 .ok_or("pointwise block count overflows")?
         } else {
+            // The direct body strides its elements over the slices; an op holds at most u16::MAX.
             spatial
                 .checked_mul(stage.output_channels)
                 .ok_or("convolution element count overflows")?
                 .div_ceil(256)
+                .min(u32::from(u16::MAX))
         };
         dependency = Some(builder.emit(
             DevOp::Conv2dF32,

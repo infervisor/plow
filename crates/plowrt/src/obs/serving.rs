@@ -109,7 +109,17 @@ pub struct LatencySnapshot {
 
 impl Histogram {
     pub fn snapshot(&self) -> LatencySnapshot {
-        let bins: Vec<_> = self.bins.iter().map(|b| b.load(Relaxed)).collect();
+        Self::snapshot_of(&[self])
+    }
+
+    /// One snapshot over several histograms' observations (a DP set's ranks).
+    pub fn snapshot_of(hs: &[&Self]) -> LatencySnapshot {
+        let mut bins = [0u64; 21];
+        for h in hs {
+            for (sum, bin) in bins.iter_mut().zip(&h.bins) {
+                *sum += bin.load(Relaxed);
+            }
+        }
         let count = bins.iter().sum();
         let quantile = |percent: u64| {
             if count == 0 {
@@ -127,7 +137,7 @@ impl Histogram {
         };
         LatencySnapshot {
             count,
-            sum_ms: self.sum.load(Relaxed) as f64 / 1000.0,
+            sum_ms: hs.iter().map(|h| h.sum.load(Relaxed)).sum::<u64>() as f64 / 1000.0,
             p50_ms: quantile(50),
             p95_ms: quantile(95),
             p99_ms: quantile(99),
@@ -224,6 +234,10 @@ impl TtsMetrics {
 #[derive(serde::Serialize)]
 pub struct ModelSnapshot {
     pub id: String,
+    /// A DP rank's row: the model whose set it belongs to (that model's row counts each request
+    /// once; rank rows count each rank's share of it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank_of: Option<String>,
     pub ready: bool,
     pub requests: u64,
     pub queued: u64,
@@ -264,72 +278,107 @@ pub fn started_at_unix_ms() -> u64 {
     *STARTED.get_or_init(unix_ms)
 }
 
+/// One row per model key; a DP set's ranks also get one row for the set (`id` the model), so a
+/// request is counted once there whichever ranks served it. Rank rows name their set in `rank_of`.
 pub fn snapshot(models: &[(String, Arc<Metrics>, bool)]) -> RuntimeSnapshot {
+    let mut rows: Vec<ModelSnapshot> = models
+        .iter()
+        .map(|(id, m, ready)| {
+            let rank_of = crate::serve::dp::split_key(id).map(|(model, _)| model.to_string());
+            model_snapshot(id.clone(), rank_of, &[m], *ready)
+        })
+        .collect();
+    let mut sets: Vec<&str> = models
+        .iter()
+        .filter_map(|(id, _, _)| crate::serve::dp::split_key(id).map(|(model, _)| model))
+        .collect();
+    sets.sort_unstable();
+    sets.dedup();
+    for set in sets {
+        let ranks: Vec<_> = models
+            .iter()
+            .filter(|(id, _, _)| crate::serve::dp::split_key(id).is_some_and(|(m, _)| m == set))
+            .collect();
+        let ms: Vec<&Arc<Metrics>> = ranks.iter().map(|(_, m, _)| m).collect();
+        let ready = ranks.iter().any(|(_, _, ready)| *ready);
+        rows.push(model_snapshot(set.to_string(), None, &ms, ready));
+    }
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
     RuntimeSnapshot {
         object: "runtime.metrics",
         started_at_unix_ms: started_at_unix_ms(),
         observed_at_unix_ms: unix_ms(),
-        models: models
-            .iter()
-            .map(|(id, m, ready)| {
-                let s = &m.serving;
-                let asr = s.asr.snapshot();
-                let tts = s.tts.snapshot();
-                let cohort = s.asr.cohort.load(Relaxed);
-                ModelSnapshot {
-                    id: id.clone(),
-                    ready: *ready,
-                    requests: if cohort {
-                        s.asr.jobs.load(Relaxed)
-                    } else {
-                        m.requests.load(Relaxed)
-                    },
-                    queued: if cohort {
-                        s.asr.queued.load(Relaxed)
-                    } else {
-                        m.queued_requests.load(Relaxed)
-                    },
-                    running: if cohort {
-                        s.asr.running.load(Relaxed)
-                    } else {
-                        s.running.load(Relaxed)
-                    },
-                    completed: if cohort {
-                        s.asr.completed.load(Relaxed)
-                    } else {
-                        s.success.iter().map(|n| n.load(Relaxed)).sum()
-                    },
-                    aborted: if cohort {
-                        s.asr.cancelled.load(Relaxed)
-                    } else {
-                        s.aborted.load(Relaxed)
-                    },
-                    preempted: s.preempted.load(Relaxed),
-                    rejected: if cohort {
-                        s.asr.rejected.load(Relaxed)
-                    } else {
-                        m.rejected.load(Relaxed)
-                    },
-                    tick_errors: s.tick_errors.load(Relaxed),
-                    prompt_tokens: s.prompt_computed.load(Relaxed),
-                    cached_tokens: s.prompt_cached.load(Relaxed),
-                    generated_tokens: s.generation.load(Relaxed),
-                    ttft: s.ttft.snapshot(),
-                    e2e: if cohort {
-                        s.asr.e2e.snapshot()
-                    } else {
-                        s.e2e.snapshot()
-                    },
-                    queue: if cohort {
-                        s.asr.queue.snapshot()
-                    } else {
-                        s.queue.snapshot()
-                    },
-                    asr,
-                    tts,
-                }
-            })
-            .collect(),
+        models: rows,
+    }
+}
+
+fn model_snapshot(
+    id: String,
+    rank_of: Option<String>,
+    ms: &[&Arc<Metrics>],
+    ready: bool,
+) -> ModelSnapshot {
+    let sum = |f: &dyn Fn(&Metrics) -> u64| ms.iter().map(|m| f(m)).sum::<u64>();
+    let hist = |f: &dyn Fn(&ServingMetrics) -> &Histogram| {
+        Histogram::snapshot_of(&ms.iter().map(|m| f(&m.serving)).collect::<Vec<_>>())
+    };
+    let cohort = ms.iter().any(|m| m.serving.asr.cohort.load(Relaxed));
+    let (asr, tts) = match ms {
+        [m] => (m.serving.asr.snapshot(), m.serving.tts.snapshot()),
+        _ => (None, None),
+    };
+    ModelSnapshot {
+        id,
+        rank_of,
+        ready,
+        requests: if cohort {
+            sum(&|m| m.serving.asr.jobs.load(Relaxed))
+        } else {
+            sum(&|m| m.requests.load(Relaxed))
+        },
+        queued: if cohort {
+            sum(&|m| m.serving.asr.queued.load(Relaxed))
+        } else {
+            sum(&|m| m.queued_requests.load(Relaxed))
+        },
+        running: if cohort {
+            sum(&|m| m.serving.asr.running.load(Relaxed))
+        } else {
+            sum(&|m| m.serving.running.load(Relaxed))
+        },
+        completed: if cohort {
+            sum(&|m| m.serving.asr.completed.load(Relaxed))
+        } else {
+            sum(&|m| m.serving.success.iter().map(|n| n.load(Relaxed)).sum())
+        },
+        aborted: if cohort {
+            sum(&|m| m.serving.asr.cancelled.load(Relaxed))
+        } else {
+            sum(&|m| m.serving.aborted.load(Relaxed))
+        },
+        preempted: sum(&|m| m.serving.preempted.load(Relaxed)),
+        rejected: if cohort {
+            sum(&|m| m.serving.asr.rejected.load(Relaxed))
+        } else {
+            sum(&|m| m.rejected.load(Relaxed))
+        },
+        tick_errors: sum(&|m| m.serving.tick_errors.load(Relaxed)),
+        prompt_tokens: sum(&|m| m.serving.prompt_computed.load(Relaxed)),
+        cached_tokens: sum(&|m| m.serving.prompt_cached.load(Relaxed)),
+        generated_tokens: sum(&|m| m.serving.generation.load(Relaxed)),
+        ttft: hist(&|s| &s.ttft),
+        e2e: if cohort {
+            hist(&|s| &s.asr.e2e)
+        } else {
+            hist(&|s| &s.e2e)
+        },
+        queue: if cohort {
+            hist(&|s| &s.asr.queue)
+        } else {
+            hist(&|s| &s.queue)
+        },
+        asr,
+        tts,
     }
 }
 
@@ -1244,8 +1293,23 @@ impl ServingMetrics {
     }
 }
 
+/// A request's part in a prefill/decode split (`serve::pd`). The request counts once: its prefill
+/// rank records the time to first token and the prompt, its decode rank the generated tokens and
+/// the completion, and `serve::pd::Outcome` any end before the decode leg is seated. Neither leg runs while the other does, so each counts as running in turn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Leg {
+    #[default]
+    Whole,
+    Prefill,
+    /// `first`: when the prefill rank produced the first token (the request's TTFT for its SLO).
+    Decode {
+        first: Instant,
+    },
+}
+
 pub struct RequestMetrics {
     metrics: Arc<Metrics>,
+    leg: Leg,
     arrived: Instant,
     admitted: Instant,
     first: Option<Instant>,
@@ -1255,6 +1319,21 @@ pub struct RequestMetrics {
     cached: usize,
     max_tokens: usize,
     finished: bool,
+    max_itl: Duration,
+}
+
+/// The `PLOW_PF_PACKLOG` clock: every pack-log line's `t_ms` counts from this one instant.
+pub fn packlog_epoch() -> Instant {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+fn packlog_on() -> bool {
+    crate::config::RuntimeConfig::get().pf_packlog
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
 }
 
 impl RequestMetrics {
@@ -1265,14 +1344,28 @@ impl RequestMetrics {
         prompt: usize,
         max_tokens: usize,
     ) -> Self {
+        Self::leg(metrics, Leg::Whole, arrived, queued, prompt, max_tokens)
+    }
+
+    pub fn leg(
+        metrics: Arc<Metrics>,
+        leg: Leg,
+        arrived: Instant,
+        queued: Instant,
+        prompt: usize,
+        max_tokens: usize,
+    ) -> Self {
         let admitted = Instant::now();
         metrics.serving.running.fetch_add(1, Relaxed);
-        metrics
-            .serving
-            .queue
-            .duration(admitted.saturating_duration_since(queued));
+        if !matches!(leg, Leg::Decode { .. }) {
+            metrics
+                .serving
+                .queue
+                .duration(admitted.saturating_duration_since(queued));
+        }
         Self {
             metrics,
+            leg,
             arrived,
             admitted,
             first: None,
@@ -1282,6 +1375,7 @@ impl RequestMetrics {
             cached: 0,
             max_tokens,
             finished: false,
+            max_itl: Duration::ZERO,
         }
     }
 
@@ -1289,20 +1383,37 @@ impl RequestMetrics {
         let now = Instant::now();
         let m = &self.metrics.serving;
         if let Some(last) = self.last {
-            m.itl.duration(now.saturating_duration_since(last));
+            let itl = now.saturating_duration_since(last);
+            m.itl.duration(itl);
+            self.max_itl = self.max_itl.max(itl);
         } else {
             self.first = Some(now);
+            if packlog_on() {
+                eprintln!(
+                    "PACKLOG REQ first t_ms={:.1} queue_ms={:.1} pf_ms={:.1} ttft_ms={:.1} prompt={} cached={}",
+                    ms(now.saturating_duration_since(packlog_epoch())),
+                    ms(self.admitted.saturating_duration_since(self.arrived)),
+                    ms(now.saturating_duration_since(self.admitted)),
+                    ms(now.saturating_duration_since(self.arrived)),
+                    self.prompt,
+                    cached.min(self.prompt),
+                );
+            }
             self.cached = cached.min(self.prompt);
-            m.ttft.duration(now.saturating_duration_since(self.arrived));
-            m.prefill
-                .duration(now.saturating_duration_since(self.admitted));
-            m.prompt_computed
-                .fetch_add((self.prompt - self.cached) as u64, Relaxed);
-            m.prompt_cached.fetch_add(self.cached as u64, Relaxed);
+            if !matches!(self.leg, Leg::Decode { .. }) {
+                m.ttft.duration(now.saturating_duration_since(self.arrived));
+                m.prefill
+                    .duration(now.saturating_duration_since(self.admitted));
+                m.prompt_computed
+                    .fetch_add((self.prompt - self.cached) as u64, Relaxed);
+                m.prompt_cached.fetch_add(self.cached as u64, Relaxed);
+            }
         }
         self.last = Some(now);
         self.tokens += 1;
-        m.generation.fetch_add(1, Relaxed);
+        if self.leg != Leg::Prefill {
+            m.generation.fetch_add(1, Relaxed);
+        }
     }
 
     pub fn finish(&mut self, reason: crate::serve::stream::FinishReason, packets: usize) {
@@ -1314,6 +1425,10 @@ impl RequestMetrics {
         // Before the final chunk is sent: a reader of the response sees the request settled.
         m.running.fetch_sub(1, Relaxed);
         use crate::serve::stream::FinishReason;
+        // A prefill leg's outcome is its request's (`serve::pd::Outcome`).
+        if self.leg == Leg::Prefill {
+            return;
+        }
         if matches!(reason, FinishReason::Preempted) {
             m.preempted.fetch_add(1, Relaxed);
             return;
@@ -1327,6 +1442,18 @@ impl RequestMetrics {
         ))]
         .fetch_add(1, Relaxed);
         let now = Instant::now();
+        if packlog_on() {
+            if let (Some(first), Some(last)) = (self.first, self.last) {
+                eprintln!(
+                    "PACKLOG REQ done t_ms={:.1} prompt={} tokens={} decode_ms={:.1} max_itl_ms={:.1}",
+                    ms(now.saturating_duration_since(packlog_epoch())),
+                    self.prompt,
+                    self.tokens,
+                    ms(last.saturating_duration_since(first)),
+                    ms(self.max_itl),
+                );
+            }
+        }
         m.e2e.duration(now.saturating_duration_since(self.arrived));
         m.inference
             .duration(now.saturating_duration_since(self.admitted));
@@ -1340,6 +1467,10 @@ impl RequestMetrics {
             });
             let targets = crate::config::RuntimeConfig::get().slo_targets();
             if targets.active() {
+                let first = match self.leg {
+                    Leg::Decode { first } => first,
+                    _ => first,
+                };
                 let ttft_ms = first.saturating_duration_since(self.arrived).as_secs_f64() * 1e3;
                 let tpot_ms =
                     decode.as_secs_f64() * 1e3 / self.tokens.saturating_sub(1).max(1) as f64;
@@ -1365,6 +1496,10 @@ impl Drop for RequestMetrics {
         if !self.finished {
             let m = &self.metrics.serving;
             m.running.fetch_sub(1, Relaxed);
+            // A prefill leg's outcome is its request's (`serve::pd::Outcome`).
+            if self.leg == Leg::Prefill {
+                return;
+            }
             m.aborted.fetch_add(1, Relaxed);
             if self.first.is_none() {
                 m.aborted_before_first.fetch_add(1, Relaxed);
@@ -1441,6 +1576,46 @@ mod tests {
         assert_eq!(m.serving.aborted_before_first.load(Relaxed), 1);
         assert_eq!(m.serving.preempted.load(Relaxed), 1);
         assert_eq!(m.serving.success[0].load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_prefill_decode_split_counts_one_request() {
+        let (p, d) = (Arc::new(Metrics::default()), Arc::new(Metrics::default()));
+        let now = Instant::now();
+        let mut prefill = RequestMetrics::leg(p.clone(), Leg::Prefill, now, now, 100, 1);
+        prefill.token(40);
+        prefill.finish(FinishReason::Length, 1);
+        drop(prefill);
+        let mut decode =
+            RequestMetrics::leg(d.clone(), Leg::Decode { first: now }, now, now, 100, 8);
+        for _ in 0..3 {
+            decode.token(40);
+        }
+        decode.finish(FinishReason::Stop, 2);
+        drop(decode);
+        let models = vec![
+            ("m#0".to_string(), p.clone(), true),
+            ("m#1".to_string(), d.clone(), true),
+        ];
+        let snap = snapshot(&models);
+        let ids: Vec<_> = snap.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["m", "m#0", "m#1"]);
+        let set = &snap.models[0];
+        assert!(set.rank_of.is_none());
+        assert_eq!(snap.models[1].rank_of.as_deref(), Some("m"));
+        assert_eq!(
+            (
+                set.completed,
+                set.running,
+                set.generated_tokens,
+                set.aborted
+            ),
+            (1, 0, 3, 0)
+        );
+        assert_eq!((set.ttft.count, set.e2e.count, set.queue.count), (1, 1, 1));
+        assert_eq!((set.prompt_tokens, set.cached_tokens), (60, 40));
+        assert_eq!(snap.models[1].ttft.count, 1);
+        assert_eq!(snap.models[2].e2e.count, 1);
     }
 
     /// Each thinking-control family moves once per request: the controller's report at finish,

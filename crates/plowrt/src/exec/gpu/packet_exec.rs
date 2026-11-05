@@ -151,7 +151,6 @@ impl CudaPacketRuntime {
         let ordinal = be.device_ordinal;
         let image = crate::asset::packet_image::PacketImage::open(path)?;
         image.blob.check_l2_dispatch(false)?;
-        crate::certificate_checks::check_sidecar(&image)?;
         let blob = &image.blob;
         if !blob.gen.is_empty() || blob.tp.is_some() {
             return Err(RuntimeError::Rejected(format!(

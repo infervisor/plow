@@ -432,21 +432,13 @@ impl IndexTp {
             kv_bound: route.inst.i[1],
         };
         let [ks, ki, kg, kc] = self.kernels;
-        // Only the score pass can be drained here: select/gather/complete open with an all-rank
-        // rendezvous, and this rank's queue would be drained before the peers have even been
-        // enqueued, so a lap around them deadlocks until the bail deadline. The rest of the
-        // segment is `critical_us - score_us` in the PLOW_PREFILL_SEG_TIMING line.
-        let mut timer = super::amd_sparse_mla::SplitTimer::start(be)?;
         if self.abi >= 2 {
             be.launch(ks, 304, 512, 0, bytemuck::bytes_of(&score2))?;
-            timer.lap(be, "score")?;
             be.launch(ki, 304, 512, 0, bytemuck::bytes_of(&select2))?;
         } else {
             be.launch(ks, 304, 512, 0, bytemuck::bytes_of(&score))?;
-            timer.lap(be, "score")?;
             be.launch(ki, 304, 512, 0, bytemuck::bytes_of(&select))?;
         }
-        timer.report("index_tp", route.rows);
         if route.local_band() {
             let local = self.local.ok_or_else(|| {
                 RuntimeError::Device("TP indexer adapter lacks plow_dsa_tp_local".into())

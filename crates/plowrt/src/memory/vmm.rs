@@ -1443,6 +1443,15 @@ struct HostTier {
 /// Spill copies in flight before a new boundary spill waits for them to land (the boundary that
 /// crosses it is queued whole).
 pub const SPILL_AHEAD_INFLIGHT_BYTES: u64 = 256 << 20;
+
+/// Whether the spill-ahead thread spills another boundary. While a restore is in flight it keeps
+/// only a quarter of `headroom`: a concurrent device-to-host spill halved the restore copies'
+/// bandwidth (26B BF16 at 1.8 sessions/s: 14 -> 5-7 GB/s), and an attach waits on them.
+fn spill_ahead_wanted(pending: u64, available: u64, headroom: u64, restoring: bool) -> bool {
+    let target = if restoring { headroom / 4 } else { headroom };
+    pending < SPILL_AHEAD_INFLIGHT_BYTES && available + pending < target
+}
+
 /// One pinned allocation per chunk of host tier slots.
 const HOST_CHUNK_BYTES: u64 = 1 << 30;
 /// Spills whose device buffer is still held; at the cap the oldest is waited for.
@@ -3498,7 +3507,12 @@ impl VmmKv {
                     // at c32 on Qwen3.8 BF16, 147 MiB state blocks).
                     let pending = store.pending_spill_bytes();
                     let spilled = pending < SPILL_AHEAD_INFLIGHT_BYTES
-                        && store.device_headroom_bytes() + pending < headroom
+                        && spill_ahead_wanted(
+                            pending,
+                            store.device_headroom_bytes(),
+                            headroom,
+                            store.restores_pending(),
+                        )
                         && spill_ahead_step(&shared);
                     if !spilled {
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -9042,6 +9056,17 @@ mod tests {
     /// An arrival prefetch of a host-resident block-store boundary restores it through the
     /// store's hook (lock released) and marks it on the device; the attach then finds it there
     /// and a second prefetch does nothing.
+    #[test]
+    fn spill_ahead_keeps_a_quarter_headroom_while_restores_run() {
+        let h = 2u64 << 30;
+        assert!(spill_ahead_wanted(0, h - 1, h, false));
+        assert!(!spill_ahead_wanted(0, h, h, false));
+        assert!(!spill_ahead_wanted(0, h / 4, h, true));
+        assert!(spill_ahead_wanted(0, h / 4 - 1, h, true));
+        assert!(!spill_ahead_wanted(h / 8, h / 8, h, true));
+        assert!(!spill_ahead_wanted(SPILL_AHEAD_INFLIGHT_BYTES, 0, h, false));
+    }
+
     #[test]
     fn prefetch_restores_a_host_block_boundary_through_the_store() {
         #[derive(Default)]

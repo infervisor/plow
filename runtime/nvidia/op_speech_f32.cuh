@@ -28,6 +28,14 @@ __device__ __forceinline__ constexpr bool sp_op_on(unsigned op) {
     return op < 163u || op > 204u || ((PLOW_SPEECH_OPS >> (op - 163u)) & 1ull);
 }
 
+/* Unused conv post epilogues cost 60-120 min/object in CUDA 12.9 ptxas -O3 (sm_120a). */
+#ifndef PLOW_SPEECH_CONV_POSTS
+#define PLOW_SPEECH_CONV_POSTS (~0ull)
+#endif
+__device__ __forceinline__ constexpr bool sp_post_on(unsigned p) {
+    return (PLOW_SPEECH_CONV_POSTS >> p) & 1ull;
+}
+
 #define SPG_TM 8
 #define SPG_TN 8
 #define SPG_BK 16
@@ -1722,11 +1730,14 @@ __device__ __forceinline__ unsigned sp_tcn_shape(unsigned M, unsigned N, unsigne
 
 /* DenseGemmF32 (170). flags: 1 = bf16-round, 2 = bf16 erf-GELU (implies the round), 4 = bf16
  * weights, 8 = A (and f32 W) bf16-representable -> bf16 tensor cores, 16 = 3xTF32 tensor cores.
+ * Post chain (no prologue, no reference split; t5 = f32 [lo0, hi0, lo1, hi1]), after the round:
+ * 0x100 clamp to [lo0, hi0], 0x200 SiLU then bf16 round, 0x400 clamp to [lo1, hi1].
  * i5 != 0: weight row stride, and i6 < i5 names a one-hot weight column added in. t4: optional
  * split-K scratch (sp_tc_gemm); with flag 128 instead per-row reference rows (SpRefSplit, j0 units) and
  * t5 the optional packed split-K scratch (sp_tcn_gemm). */
 struct SpDenseEpi {
     float* out; const float* bias; const void* w; unsigned n, stride, onehot, flags, relu;
+    float lo0 = 0.f, hi0 = 0.f, lo1 = 0.f, hi1 = 0.f;
     __device__ void operator()(unsigned m, unsigned c, float acc) const {
         float value = bias ? __fadd_rn(acc, bias[c]) : acc;
         if (onehot < stride) {
@@ -1736,6 +1747,9 @@ struct SpDenseEpi {
         }
         if (flags & 2u) value = sp_gelu_erf_bf16(value);
         else if (flags & 1u) value = sp_bf16(value);
+        if (flags & 0x100u) value = fminf(fmaxf(value, lo0), hi0);
+        if (flags & 0x200u) value = sp_bf16(__fdiv_rn(value, __fadd_rn(1.0f, expf(-value))));
+        if (flags & 0x400u) value = fminf(fmaxf(value, lo1), hi1);
         out[(size_t)m * n + c] = relu ? fmaxf(value, 0.0f) : value;
     }
 };
@@ -1752,13 +1766,17 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
                                         unsigned m, unsigned n, unsigned k, unsigned activation,
                                         unsigned a_row0, unsigned wstride_op, unsigned onehot,
                                         unsigned flags, unsigned slice, unsigned nblk, float* arena,
-                                        float* scratch, const SpLn* ln, const SpRefSplit* rs = nullptr) {
+                                        float* scratch, const SpLn* ln, const SpRefSplit* rs = nullptr,
+                                        const float* post = nullptr) {
     arena = sp_smem;
     const unsigned stride = wstride_op ? wstride_op : k;
     x += (size_t)a_row0 * k;
     const SpRowF32 la{x, k, (k & 3u) == 0 && sp_aligned(x, 16)};
-    const SpDenseEpi ep{out, bias, w, n, stride, wstride_op ? onehot : 0xFFFFFFFFu, flags,
-                        activation == 1u};
+    SpDenseEpi ep{out, bias, w, n, stride, wstride_op ? onehot : 0xFFFFFFFFu, flags, activation == 1u};
+    if (flags & 0x700u) {
+        if (!post || ln || rs) __trap();
+        ep.lo0 = post[0], ep.hi0 = post[1], ep.lo1 = post[2], ep.hi1 = post[3];
+    }
     if (flags & 4u) {
         const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
         if ((flags & 8u) && (k & 7u) == 0 && (stride & 7u) == 0 && sp_aligned(x, 16) && sp_aligned(wb, 16)) {
@@ -1816,9 +1834,13 @@ struct SpQ8Epi {
 };
 /* At most this many rows (a stream step, the RNNT predictor and joint) take the GEMV walk. */
 #define SPQ_GEMV_ROWS 8u
+/* A pass of sp_q8_gemv_t stages its rows as [k][rows + 4] floats. */
+#define SPQ_T_FITS(rows, k) ((size_t)(k) * ((rows) + 4u) <= SP_ARENA_FLOATS)
 /* A warp per output column walks K in Q8_0 blocks (lane = element), every row's sum in a register,
  * then one fixed-order warp reduction: bandwidth-bound on the weights, every slice's warps sharing
- * the columns. */
+ * the columns. A row's sum is the same whatever ROWS. sp_q8_gemv_t has the same sums; this one
+ * takes the rows that do not fit its stage. */
+template <unsigned ROWS>
 static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                                                   const SpQ8Epi& ep, unsigned m, unsigned n, unsigned k,
                                                   unsigned slice, unsigned nblk) {
@@ -1832,20 +1854,20 @@ static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, c
     }
     for (unsigned c = slice * PLOW_NV_WARPS + warp; c < n; c += nblk * PLOW_NV_WARPS) {
         const uint8_t* row = w + (size_t)c * blocks * 34u;
-        float acc[SPQ_GEMV_ROWS];
+        float acc[ROWS];
 #pragma unroll
-        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) acc[r] = 0.f;
+        for (unsigned r = 0; r < ROWS; r++) acc[r] = 0.f;
 #pragma unroll 4
         for (unsigned b = 0; b < blocks; b++) {
             const uint8_t* block = row + b * 34u;
             const float wv = __fmul_rn(sp_f16(*(const uint16_t*)block), (float)((const int8_t*)(block + 2))[lane]);
             const float* xk = x + b * 32u + lane;
 #pragma unroll
-            for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++)
+            for (unsigned r = 0; r < ROWS; r++)
                 if (r < m) acc[r] = fmaf(xk[(size_t)r * k], wv, acc[r]);
         }
 #pragma unroll
-        for (unsigned r = 0; r < SPQ_GEMV_ROWS; r++) {
+        for (unsigned r = 0; r < ROWS; r++) {
             if (r >= m) break;
             float v = acc[r];
             for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -1853,6 +1875,95 @@ static __device__ __forceinline__ void sp_q8_gemv(const float* __restrict__ x, c
         }
     }
     if (staged) __syncthreads(); /* the next op may reuse the arena */
+}
+
+/* Lane partial sums of 2H rows -> each row's warp sum as sp_q8_gemv's butterfly forms it: a step
+ * pairs lane and lane ^ O in the same order (O = 16..1), each keeping half its rows (the upper half
+ * when bit O is set) and adding the partner's value of each; once one row is left, the plain
+ * butterfly. The row sum ends in v[0]. A template per step, so every index is a constant. */
+template <unsigned H, unsigned O> struct SpQ8RowsSum {
+    static __device__ __forceinline__ void run(float* v, unsigned lane) {
+        const bool up = lane & O;
+#pragma unroll
+        for (unsigned i = 0; i < H; i++) {
+            const float send = up ? v[i] : v[i + H];
+            v[i] = (up ? v[i + H] : v[i]) + __shfl_xor_sync(0xffffffffu, send, O);
+        }
+        SpQ8RowsSum<H / 2u, O / 2u>::run(v, lane);
+    }
+};
+template <unsigned O> struct SpQ8RowsSum<0u, O> {
+    static __device__ __forceinline__ void run(float* v, unsigned lane) {
+        v[0] += __shfl_xor_sync(0xffffffffu, v[0], O);
+        SpQ8RowsSum<0u, O / 2u>::run(v, lane);
+    }
+};
+template <> struct SpQ8RowsSum<0u, 0u> {
+    static __device__ __forceinline__ void run(float*, unsigned) {}
+};
+
+/* sp_q8_gemv's sums, faster: ROWS rows staged transposed ([k][ROWS + 4], rows from m zero), so a
+ * lane reads its element of four rows per conflict-free LDS.128; each read serves two columns; one
+ * SpQ8RowsSum per column instead of ROWS butterflies. */
+template <unsigned ROWS>
+static __device__ __forceinline__ void sp_q8_gemv_t(const float* __restrict__ x, const uint8_t* __restrict__ w,
+                                                    const SpQ8Epi& ep, unsigned m, unsigned n, unsigned k,
+                                                    unsigned slice, unsigned nblk) {
+    static_assert(ROWS >= 4u && ROWS <= 32u && (ROWS & (ROWS - 1u)) == 0, "rows");
+    constexpr unsigned LD = ROWS + 4u;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, blocks = k / 32u;
+#pragma unroll
+    for (unsigned r = 0; r < ROWS; r += 4u)
+        for (unsigned e = threadIdx.x; e < k; e += PLOW_NV_THREADS) {
+            float4 v;
+            v.x = r < m ? x[(size_t)r * k + e] : 0.f;
+            v.y = r + 1u < m ? x[(size_t)(r + 1u) * k + e] : 0.f;
+            v.z = r + 2u < m ? x[(size_t)(r + 2u) * k + e] : 0.f;
+            v.w = r + 3u < m ? x[(size_t)(r + 3u) * k + e] : 0.f;
+            *(float4*)(sp_smem + e * LD + r) = v;
+        }
+    __syncthreads();
+    unsigned row = 0; /* the row whose sum this lane ends with (32 / ROWS lanes per row) */
+#pragma unroll
+    for (unsigned h = ROWS / 2u, o = 16u; h >= 1u; h >>= 1, o >>= 1)
+        if (lane & o) row += h;
+    const bool store = row < m && (lane & (32u / ROWS - 1u)) == 0u;
+    const float4* xl = (const float4*)(sp_smem + lane * LD);
+    for (unsigned c0 = 2u * (slice * PLOW_NV_WARPS + warp); c0 < n; c0 += 2u * nblk * PLOW_NV_WARPS) {
+        const unsigned c1 = c0 + 1u < n ? c0 + 1u : c0;
+        const uint8_t* w0 = w + (size_t)c0 * blocks * 34u;
+        const uint8_t* w1 = w + (size_t)c1 * blocks * 34u;
+        float a0[ROWS], a1[ROWS];
+#pragma unroll
+        for (unsigned r = 0; r < ROWS; r++) a0[r] = a1[r] = 0.f;
+#pragma unroll 4
+        for (unsigned b = 0; b < blocks; b++) {
+            const uint8_t* b0 = w0 + b * 34u;
+            const uint8_t* b1 = w1 + b * 34u;
+            const float v0 = __fmul_rn(sp_f16(*(const uint16_t*)b0), (float)((const int8_t*)(b0 + 2))[lane]);
+            const float v1 = __fmul_rn(sp_f16(*(const uint16_t*)b1), (float)((const int8_t*)(b1 + 2))[lane]);
+            const float4* xb = xl + b * (8u * LD);
+#pragma unroll
+            for (unsigned q = 0; q < ROWS / 4u; q++) {
+                const float4 xv = xb[q];
+                a0[4u * q] = fmaf(xv.x, v0, a0[4u * q]);
+                a0[4u * q + 1u] = fmaf(xv.y, v0, a0[4u * q + 1u]);
+                a0[4u * q + 2u] = fmaf(xv.z, v0, a0[4u * q + 2u]);
+                a0[4u * q + 3u] = fmaf(xv.w, v0, a0[4u * q + 3u]);
+                a1[4u * q] = fmaf(xv.x, v1, a1[4u * q]);
+                a1[4u * q + 1u] = fmaf(xv.y, v1, a1[4u * q + 1u]);
+                a1[4u * q + 2u] = fmaf(xv.z, v1, a1[4u * q + 2u]);
+                a1[4u * q + 3u] = fmaf(xv.w, v1, a1[4u * q + 3u]);
+            }
+        }
+        SpQ8RowsSum<ROWS / 2u, 16u>::run(a0, lane);
+        SpQ8RowsSum<ROWS / 2u, 16u>::run(a1, lane);
+        if (store) {
+            ep(row, c0, a0[0]);
+            if (c1 != c0) ep(row, c1, a1[0]);
+        }
+    }
+    __syncthreads(); /* the next pass or op reuses the arena */
 }
 
 static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const float* __restrict__ x,
@@ -1867,10 +1978,24 @@ static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const
     const SpRowQ8 lb{w, k};
     const SpQ8Epi ep{out, bias, n, activation == 1u};
     if (path == 1u || (path == 0u && m <= SPQ_GEMV_ROWS)) {
-        /* Rows in groups of SPQ_GEMV_ROWS: each row sums exactly as it would in a launch of its own. */
-        for (unsigned r0 = 0; r0 < m; r0 += SPQ_GEMV_ROWS)
-            sp_q8_gemv(x + (size_t)r0 * k, w, SpQ8Epi{out + (size_t)r0 * n, bias, n, activation == 1u},
-                       m - r0 < SPQ_GEMV_ROWS ? m - r0 : SPQ_GEMV_ROWS, n, k, slice, nblk);
+        /* Rows in passes: each row sums exactly as it would in a launch of its own. */
+        for (unsigned r0 = 0; r0 < m;) {
+            const unsigned left = m - r0;
+            const float* xr = x + (size_t)r0 * k;
+            const SpQ8Epi pe{out + (size_t)r0 * n, bias, n, activation == 1u};
+            if (left > 16u && SPQ_T_FITS(32u, k)) {
+                sp_q8_gemv_t<32>(xr, w, pe, left < 32u ? left : 32u, n, k, slice, nblk);
+                r0 += 32u;
+            } else if (left > 8u && SPQ_T_FITS(16u, k)) {
+                sp_q8_gemv_t<16>(xr, w, pe, left < 16u ? left : 16u, n, k, slice, nblk);
+                r0 += 16u;
+            } else {
+                const unsigned rows = left < SPQ_GEMV_ROWS ? left : SPQ_GEMV_ROWS;
+                if (SPQ_T_FITS(SPQ_GEMV_ROWS, k)) sp_q8_gemv_t<SPQ_GEMV_ROWS>(xr, w, pe, rows, n, k, slice, nblk);
+                else sp_q8_gemv<SPQ_GEMV_ROWS>(xr, w, pe, rows, n, k, slice, nblk);
+                r0 += SPQ_GEMV_ROWS;
+            }
+        }
         return;
     }
     /* 64x64 tiles when 128x128 ones leave slices idle (the small-M conformer rows). */
@@ -2701,20 +2826,22 @@ static __device__ __noinline__ void d_broadcast_add_f32(float* out, const float*
 
 /* CausalDepthwiseConv1dF32 (167): f16 weights [channel][kernel], taps summed in order. Rows come in
  * items of `item_rows` (0 = one item); taps stop at the item's first row. */
-static __device__ __noinline__ void d_causal_dwconv1d_f32(float* out, const float* x, const uint16_t* w,
+/* flags (i4): 1 = f32 weights (else fp16), 2 = bf16-round the output. */
+static __device__ __noinline__ void d_causal_dwconv1d_f32(float* out, const float* x, const void* w,
                                              unsigned rows, unsigned channels, unsigned kernel,
-                                             unsigned item_rows, unsigned slice, unsigned nblk) {
+                                             unsigned item_rows, unsigned flags, unsigned slice, unsigned nblk) {
     if (!item_rows) item_rows = rows;
     SP_FOR_EACH(i, rows * channels) {
         const unsigned r = i / channels, c = i - r * channels, ir = r % item_rows;
         float sum = 0.f;
         for (unsigned tap = 0; tap < kernel; tap++) {
             const int src = (int)ir + (int)tap + 1 - (int)kernel;
+            const size_t wi = (size_t)c * kernel + tap;
             if (src >= 0)
                 sum = __fadd_rn(sum, __fmul_rn(x[(size_t)(r - ir + src) * channels + c],
-                                               sp_f16(w[(size_t)c * kernel + tap])));
+                                               (flags & 1u) ? ((const float*)w)[wi] : sp_f16(((const uint16_t*)w)[wi])));
         }
-        out[i] = sum;
+        out[i] = (flags & 2u) ? sp_bf16(sum) : sum;
     }
 }
 
@@ -3163,14 +3290,22 @@ static __device__ __forceinline__ void sp_relative_attention_rows(
             if (lane == 0) scores[kr - first] = s;
         }
         __syncthreads();
+        /* The exps in parallel, their sum in key order by one thread: the values and the order of the
+         * serial softmax (the sign of a zero maximum changes no exp). */
+        const unsigned n = last - first;
+        float mx = -INFINITY;
+        for (unsigned j = lane; j < n; j += 32u) mx = fmaxf(mx, scores[j]);
+        mx = sp_warp_max(mx);
+        for (unsigned j = threadIdx.x; j < n; j += PLOW_NV_THREADS) probs[j] = sp_expf(__fsub_rn(scores[j], mx));
+        __syncthreads();
         if (threadIdx.x == 0) {
-            float mx = -INFINITY;
-            for (unsigned kr = first; kr < last; kr++) mx = fmaxf(mx, scores[kr - first]);
             float den = 0.f;
-            for (unsigned kr = first; kr < last; kr++) den = __fadd_rn(den, sp_expf(__fsub_rn(scores[kr - first], mx)));
-            for (unsigned kr = first; kr < last; kr++)
-                probs[kr - first] = __fdiv_rn(sp_expf(__fsub_rn(scores[kr - first], mx)), den);
+            for (unsigned j = 0; j < n; j++) den = __fadd_rn(den, probs[j]);
+            scores[0] = den;
         }
+        __syncthreads();
+        const float den = scores[0];
+        for (unsigned j = threadIdx.x; j < n; j += PLOW_NV_THREADS) probs[j] = __fdiv_rn(probs[j], den);
         __syncthreads();
         for (unsigned c = threadIdx.x; c < hw; c += PLOW_NV_THREADS) {
             float acc = 0.f;
@@ -3671,7 +3806,7 @@ static __device__ __noinline__ void d_binary_f32(const PlowDevInst* in, void* co
     const float* b = (const float*)SP_TEN(2);
     const unsigned items = in->i[0], rows = in->i[1], width = in->i[2], op = in->i[3];
     if (!rows || !width || op > 5u || (uint64_t)items * rows * width > 0xFFFFFFFFull) return;
-    const bool scaled = in->i[7] & 1u;
+    const bool scaled = in->i[7] & 1u, rounded = in->i[7] & 2u;
     const float scale = in->fj[0].f;
     const unsigned bis = in->i[4], brs = in->i[5], bcs = in->i[6];
     /* float4 form: b contiguous (column stride 1, 16B-aligned rows) or broadcast along the row. */
@@ -3694,6 +3829,7 @@ static __device__ __noinline__ void d_binary_f32(const PlowDevInst* in, void* co
                     if (scaled)
                         r = make_float4(__fmul_rn(scale, r.x), __fmul_rn(scale, r.y), __fmul_rn(scale, r.z),
                                         __fmul_rn(scale, r.w));
+                    if (rounded) r = make_float4(sp_bf16(r.x), sp_bf16(r.y), sp_bf16(r.z), sp_bf16(r.w));
                     ((float4*)out)[e] = r;
                 });
             return;
@@ -3705,8 +3841,8 @@ static __device__ __noinline__ void d_binary_f32(const PlowDevInst* in, void* co
                 return make_float2(a[e], b[(size_t)item * in->i[4] + (size_t)row * in->i[5] + (size_t)c * in->i[6]]);
             },
             [&](unsigned e, float2 v) {
-                const float r = f(v.x, v.y);
-                out[e] = scaled ? __fmul_rn(scale, r) : r;
+                const float r = f(v.x, v.y), y = scaled ? __fmul_rn(scale, r) : r;
+                out[e] = rounded ? sp_bf16(y) : y;
             });
     };
     switch (op) {
@@ -4304,17 +4440,35 @@ static __device__ __forceinline__ void sp_w_conv_store(unsigned m0, unsigned n0,
                                                        const SpConvEpi1& ep, const float (&acc)[SpB<BN>::MI][4][4]) {
     const unsigned post = ep.a.post;
     switch (post) {
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 0))
     case 0: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float) { return x; }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 9))
     case 9: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return x >= 0.0f ? x : __fmul_rn(x, p); }); break;
+#endif
     /* The output activations the speech lowerings use are inlined: a call keeps every live
      * accumulator on the stack around it. */
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 1))
     case 1: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(1u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 5))
     case 5: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(5u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 7))
     case 7: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(7u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 8))
     case 8: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(8u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 10))
     case 10: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(10u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 11))
     case 11: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(11u, x, p, 0.f); }); break;
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 12))
     case 12: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_snake(x, p); }); break;
+#endif
     default: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [post](float x, float p) { return sp_act_call(post, x, p); }); break;
     }
 }
@@ -4408,17 +4562,31 @@ __device__ __forceinline__ void spwg_m64n64k16(float* d, uint64_t da, uint64_t d
  * own instantiation (P: 0 none, 1 GELU, 2 snake), the rest one uniform switch (P = 3). */
 template <unsigned P>
 __device__ __forceinline__ float spg_post(unsigned post, float x, float p) {
-    if constexpr (P == 0u) return x;
-    if constexpr (P == 1u) return sp_act(11u, x, p, 0.f);
-    if constexpr (P == 2u) return sp_snake(x, p);
+    if constexpr (P == 0u && sp_post_on(0u)) return x;
+    if constexpr (P == 1u && sp_post_on(11u)) return sp_act(11u, x, p, 0.f);
+    if constexpr (P == 2u && sp_post_on(12u)) return sp_snake(x, p);
     switch (post) {
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 1))
     case 1: return sp_act(1u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 7))
     case 7: return sp_act(7u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 8))
     case 8: return sp_act(8u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 9))
     case 9: return x >= 0.0f ? x : __fmul_rn(x, p);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 10))
     case 10: return sp_act(10u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 11))
     case 11: return sp_act(11u, x, p, 0.f);
+#endif
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 12))
     case 12: return sp_snake(x, p);
+#endif
     default: return x;
     }
 }
@@ -4709,7 +4877,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     __syncthreads();
 }
 __device__ __forceinline__ bool spg_post_ok(unsigned post) {
-    return post == 0u || post == 1u || post == 7u || post == 8u || post == 9u || post == 10u || post == 11u || post == 12u;
+    return sp_post_on(post) && (post == 0u || post == 1u || post == 7u || post == 8u || post == 9u || post == 10u || post == 11u || post == 12u);
 }
 __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a) {
     const bool pw = a.kernel == 1u && a.stride == 1u && a.before == 0u && a.in_rows == a.out_rows && a.cg % 4u == 0 && a.pre == 0u;
@@ -4723,7 +4891,7 @@ __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a) {
  * weights with the pre-split image, no activations, residual or output padding. */
 __device__ __forceinline__ bool spg_ct_eligible(const SpConvArgs& a) {
     return a.phasemajor && a.kernel == 2u * a.stride && a.groups == 1u && a.opad == 0u && a.pre == 0u &&
-           a.post == 0u && !a.alpha && !a.residual && !a.wf16 && a.cin % 64u == 0 && a.cout % 64u == 0 &&
+           sp_post_on(0u) && a.post == 0u && !a.alpha && !a.residual && !a.wf16 && a.cin % 64u == 0 && a.cout % 64u == 0 &&
            sp_aligned(a.out, 16) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) && sp_aligned(a.x, 16);
 }
 __device__ __forceinline__ void sp_wg_run_ct(const SpConvArgs& a, unsigned slice, unsigned nblk) {
@@ -4749,17 +4917,17 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
     const bool wide = !sk && 20u * r128 <= 13u * r64;
     /* The combinations the speech lowerings use: pointwise with none / GELU / other, taps with
      * none / snake / other, grouped pointwise with none. */
-    if (a.groups > 1u) {
+    if (sp_post_on(0u) && a.groups > 1u) {
         sp_wg_gemm<128, false, 0, true>(M, a.ng, K, a.x, w, ep, slice, nblk);
     } else if (a.kernel == 1u) {
-        if (sk) sp_wg_gemm<64, false, 0, false, false, true>(M, a.ng, K, a.x, w, ep, slice, nblk, sk);
-        else if (a.post == 0u) wide ? sp_wg_gemm<128, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk);
-        else if (a.post == 11u) wide ? sp_wg_gemm<128, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk);
+        if (sp_post_on(0u) && sk) sp_wg_gemm<64, false, 0, false, false, true>(M, a.ng, K, a.x, w, ep, slice, nblk, sk);
+        else if (sp_post_on(0u) && a.post == 0u) wide ? sp_wg_gemm<128, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk);
+        else if (sp_post_on(11u) && a.post == 11u) wide ? sp_wg_gemm<128, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk);
         else wide ? sp_wg_gemm<128, false, 3>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 3>(M, a.ng, K, a.x, w, ep, slice, nblk);
     } else {
-        if (sk) sp_wg_gemm<64, true, 0, false, false, true>(M, a.cout, K, a.x, w, ep, slice, nblk, sk);
-        else if (a.post == 0u) wide ? sp_wg_gemm<128, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk);
-        else if (a.post == 12u) wide ? sp_wg_gemm<128, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk);
+        if (sp_post_on(0u) && sk) sp_wg_gemm<64, true, 0, false, false, true>(M, a.cout, K, a.x, w, ep, slice, nblk, sk);
+        else if (sp_post_on(0u) && a.post == 0u) wide ? sp_wg_gemm<128, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk);
+        else if (sp_post_on(12u) && a.post == 12u) wide ? sp_wg_gemm<128, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk);
         else wide ? sp_wg_gemm<128, true, 3>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 3>(M, a.cout, K, a.x, w, ep, slice, nblk);
     }
 }
@@ -6264,10 +6432,12 @@ static __device__ __noinline__ void d_rmsnorm_f32(const PlowDevInst* in, void* c
         const float* xr = x + (size_t)r * stride + (size_t)g * gs;
         float* orow = out + (size_t)r * stride + (size_t)g * gs;
         float s = 0.f;
+#pragma unroll 8
         for (unsigned c = lane; c < gw; c += 32u) s = fmaf(xr[c], xr[c], s);
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
         const float inv = __frcp_rn(sqrtf(__fadd_rn(__fdiv_rn(s, (float)gw), eps)));
+#pragma unroll 8
         for (unsigned c = lane; c < gw; c += 32u) {
             float v = __fmul_rn(xr[c], inv);
             if (gamma) v = __fmul_rn(v, gamma[(flags & 1u) ? g * gw + c : c]);
@@ -6440,8 +6610,8 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         d_glu_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], in->i[1], slice, nblk);
         break;
     SP_CASE(CAUSAL_DEPTHWISE_CONV1D_F32)
-        d_causal_dwconv1d_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const uint16_t*)SP_TEN(2), in->i[0],
-                              in->i[1], in->i[2], in->i[3], slice, nblk);
+        d_causal_dwconv1d_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), in->i[0],
+                              in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk);
         break;
     SP_CASE(RELATIVE_ATTENTION_F32)
         d_relative_attention_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2),
@@ -6470,7 +6640,8 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         }
         d_dense_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],
                          in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice,
-                         nblk, arena, (float*)SP_TEN(4), nullptr);
+                         nblk, arena, (float*)SP_TEN(4), nullptr, nullptr,
+                         (in->i[7] & 0x700u) ? (const float*)SP_TEN(5) : nullptr);
         break;
     SP_CASE(EMBED_F16_F32)
         d_embed_f16_f32((float*)SP_TEN(0), (const uint16_t*)SP_TEN(1), (const unsigned*)SP_TEN(2), in->i[0],

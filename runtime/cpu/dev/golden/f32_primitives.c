@@ -203,6 +203,13 @@ G_K(g_dense_gemm_f32) {
             } else if (flags & 1u) {
                 value = plow_bf2f(plow_f2bf(value));
             }
+            /* flags 0x100/0x200/0x400: post chain over t5 = [lo0, hi0, lo1, hi1]. */
+            if (flags & 0x700u) {
+                const float* post = PLOW_CPU_TEN(in, T, 5);
+                if (flags & 0x100u) value = fminf(fmaxf(value, post[0]), post[1]);
+                if (flags & 0x200u) value = plow_bf2f(plow_f2bf(value / (1.0f + expf(-value))));
+                if (flags & 0x400u) value = fminf(fmaxf(value, post[2]), post[3]);
+            }
             out[(size_t)row * n + column] = activation == 1u ? fmaxf(value, 0.0f) : value;
         }
     }
@@ -781,9 +788,10 @@ G_K(g_causal_depthwise_conv1d_f32) {
     (void)ctx;
     float* out = PLOW_CPU_TEN(in, T, 0);
     const float* x = PLOW_CPU_TEN(in, T, 1);
-    const uint16_t* weight = PLOW_CPU_TEN(in, T, 2);
-    const uint32_t rows = in->i[0], channels = in->i[1], kernel = in->i[2];
-    /* i3: rows per item (0 = one item); taps stop at the item's first row. */
+    const void* weight = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t rows = in->i[0], channels = in->i[1], kernel = in->i[2], flags = in->i[4];
+    /* i3: rows per item (0 = one item); taps stop at the item's first row. i4: 1 = f32 weights
+     * (else fp16), 2 = bf16-round the output. */
     const uint32_t item_rows = in->i[3] ? in->i[3] : rows;
     uint32_t lo, hi;
     g_range(rows * channels, slice, nblk, &lo, &hi);
@@ -792,10 +800,12 @@ G_K(g_causal_depthwise_conv1d_f32) {
         float sum = 0.0f;
         for (uint32_t tap = 0; tap < kernel; tap++) {
             const int64_t source = (int64_t)item_row + tap + 1 - kernel;
+            const size_t wi = (size_t)channel * kernel + tap;
             if (source >= 0) sum += x[(size_t)(row - item_row + source) * channels + channel] *
-                                   f16_to_f32(weight[(size_t)channel * kernel + tap]);
+                                   (flags & 1u ? ((const float*)weight)[wi]
+                                               : f16_to_f32(((const uint16_t*)weight)[wi]));
         }
-        out[index] = sum;
+        out[index] = flags & 2u ? plow_bf2f(plow_f2bf(sum)) : sum;
     }
 }
 
@@ -1339,7 +1349,8 @@ G_K(g_binary_f32) {
                                (size_t)column * in->i[6]];
             float v = op == 0u ? av + bv : op == 1u ? av - bv : op == 2u ? av * bv
                     : op == 3u ? av / bv : op == 4u ? fmaxf(av, bv) : fminf(av, bv);
-            out[i] = in->i[7] & 1u ? in->fj[0].f * v : v;
+            v = in->i[7] & 1u ? in->fj[0].f * v : v;
+            out[i] = in->i[7] & 2u ? plow_bf2f(plow_f2bf(v)) : v;
         }
     }
 }

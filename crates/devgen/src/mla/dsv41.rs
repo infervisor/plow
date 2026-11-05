@@ -1471,21 +1471,10 @@ pub(crate) fn dsv41_sp(t: u32, tp: u32) -> bool {
     crate::emit_config::active().dsv41_seq_par && tp > 1 && t > 1 && t % tp == 0
 }
 
-/// CEILING INSTRUMENT ONLY (`PLOW_DSV41_SP_ABL=1`): run the per-token mHC and norm packets over
-/// `t/tp` rows instead of `t`.
-///
-/// The ANSWER IS WRONG -- 7/8 of the rows are never written, so the residual stream is garbage
-/// from the first layer on. What it measures is right: these packets are replicated across the
-/// ranks today (every rank computes all `t` rows of work that depends only on its own token), and
-/// sequence parallelism would leave each rank exactly this band. So the run time of this emit is
-/// the run time SP would reach, without building SP's reduce-scatter/all-gather plumbing or the
-/// third peer-slot region the dsv41 layout would need for it.
-///
-/// Read it against the unablated control and the difference is the SP budget, nothing more.
-fn sp_abl_rows(t: u32, tp: u32) -> u32 {
-    // The real thing and the instrument that prices it land on the same row count; only the real
-    // one also moves the addresses, which is the whole difference between a band and a wrong answer.
-    if dsv41_sp(t, tp) || (crate::emit_config::active().dsv41_sp_abl && tp > 1) {
+/// The rows this rank's per-token mHC and norm packets cover: its `t/tp` band under sequence
+/// parallelism, else all `t`.
+fn sp_rows(t: u32, tp: u32) -> u32 {
+    if dsv41_sp(t, tp) {
         t / tp
     } else {
         t
@@ -1553,7 +1542,7 @@ pub(crate) fn emit_dsv41_mhc_pre(
         c.hc_sinkhorn_iters,
         c.eps,
         c.raw.hc_eps,
-        sp_abl_rows(t, tp),
+        sp_rows(t, tp),
         deps,
     )
 }
@@ -1578,7 +1567,7 @@ pub(crate) fn emit_dsv41_mhc_post(
             t / tp,
         )
     } else {
-        (m.residual[ri ^ 1], m.residual[ri], sp_abl_rows(t, tp))
+        (m.residual[ri ^ 1], m.residual[ri], sp_rows(t, tp))
     };
     super::emit_mhc_post(
         b, out, raw, rin, m.post_mix, m.comb_mix, c.hidden, c.hc_mult, rw, deps,

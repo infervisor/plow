@@ -57,14 +57,7 @@ __device__ __forceinline__ unsigned k8_split(unsigned N, unsigned K, unsigned nb
 
 /* NW = 1: C = x W^T over the stacked matrices. NW = 2: gate|up with the GLU epilogue (m.w[0] gate,
  * m.w[1] up, one output m.c[0], N = m.n[0]). MT 8-row activation tiles: M <= 8 * MT. */
-#ifndef PLOW_NV_GEMV_K8_INLINE
-#define PLOW_NV_GEMV_K8_INLINE 1
-#endif
-#if PLOW_NV_GEMV_K8_INLINE
 #define PLOW_NV_K8_ATTR __forceinline__
-#else
-#define PLOW_NV_K8_ATTR __noinline__
-#endif
 template <int NW, int MT>
 __device__ PLOW_NV_K8_ATTR void d_gemv_k8(const K8Mats& m, const __nv_bfloat16* __restrict__ x,
                                           unsigned M, unsigned K, unsigned act, unsigned slice,

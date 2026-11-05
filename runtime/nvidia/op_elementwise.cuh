@@ -1005,9 +1005,6 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
         for (int j = 0; j < 8; j++) {
             const float g = __bfloat162float(vg.x[j]);
             float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh_pf(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-            if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
             vo.x[j] = __float2bfloat16(a * __bfloat162float(vu.x[j]));
         }
         return vo;
@@ -1030,9 +1027,6 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
             for (unsigned j = i; j < n; j++) {
                 const float g = __bfloat162float(gate[j]);
                 float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-                if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
                 out[j] = __float2bfloat16(a * __bfloat162float(up[j]));
             }
         }
@@ -1056,9 +1050,6 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
 #if GLU_PITCHED_ARMS
 static __device__ __forceinline__ float glu_pitched_one(float g, float u, unsigned act) {
     float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh_pf(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-    if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
     return a * u;
 }
 static __device__ void d_glu_pitched(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ gu,

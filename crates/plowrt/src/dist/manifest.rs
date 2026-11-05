@@ -56,10 +56,9 @@ const ROLES: &[(&str, &str)] = &[
     // gone — so they are roles, not sidecars.
     ("codec.pkt", "codec_packet"),
     ("cublaslt_algos.jsonl", "algo_table"),
-    // Lean compile receipts, read from beside the packet they bind. Optional
-    // at load (`--lean-qualify` defaults to `off`), but `strict` REFUSES a
-    // packet whose receipts are absent, so a bundle that drops them can never
-    // be verified strictly for as long as it exists.
+    // Lean compile receipts, read from beside the packet they bind by
+    // `plowc qualify`. A bundle that drops them can never be qualified for as
+    // long as it exists.
     ("lean-checks.json", "packet_checks"),
     // The host-side GDN prefill library a Qwen3.5-family packet's prefill
     // loads from beside it (`exec/gpu.rs`, `NativeGdn::load`): built per
@@ -241,6 +240,22 @@ struct Recipe {
     #[serde(default)]
     serve: RecipeServe,
     objects: Option<RecipeObjects>,
+    #[serde(default)]
+    sub_emit: Vec<RecipeSubEmit>,
+    build: Option<RecipeBuild>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RecipeSubEmit {
+    name: String,
+    hf_dir: String,
+}
+
+/// `[build]`: a packet built by a script rather than a `plowc` emit.
+#[derive(Debug, Default, serde::Deserialize)]
+struct RecipeBuild {
+    /// The packet the build writes; the bundle's `packet`.
+    output: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -254,6 +269,7 @@ struct RecipeTarget {
     parallel: Option<String>,
     toolchain: Option<String>,
     max_ctx: Option<u32>,
+    executor: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -270,6 +286,13 @@ struct RecipeCheckpoint {
 #[derive(Debug, Default, serde::Deserialize)]
 struct RecipeCell {
     max_ctx: Option<u32>,
+    hf_dir: Option<String>,
+}
+
+/// A checkpoint the recipe's own prep steps write under the build's out dir: plow-produced,
+/// so the bundle carries it as a view of the snapshot.
+fn prepared(hf_dir: &str) -> bool {
+    hf_dir.starts_with("{out}/")
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -332,6 +355,14 @@ pub struct Identity {
     pub checkpoint_bytes: u64,
     /// The recipe's path, recorded verbatim.
     pub recipe: String,
+    /// The bundle directories (`checkpoint`, `<sub>/checkpoint`) whose checkpoint the recipe's
+    /// prep built: each is published as a view of the snapshot.
+    pub views: Vec<String>,
+    /// A `[build]` recipe's packet (`[build] output`): its packets carry every weight, so the
+    /// bundle names its checkpoint for provenance only ([`plow_asset::dist::PACKET_LAYOUT`]).
+    pub packet: Option<String>,
+    /// `[target] executor = "host"`: plowrt runs the packet on the host CPU; no objset.
+    pub host: bool,
 }
 
 /// Read a variant's identity out of its recipe.
@@ -439,6 +470,25 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
             ))),
         };
 
+    // A script-built packet carries every weight it binds: no plowc emit, no checkpoint to bind.
+    let packet = match (&r.build, &r.cell.hf_dir) {
+        (Some(b), None) => Some(b.output.clone().ok_or_else(|| {
+            bad(at(
+                "[build] names no `output`: a script-built bundle ships the packet it names",
+            ))
+        })?),
+        _ => None,
+    };
+    let host = match t.executor.as_deref() {
+        None => false,
+        Some(plow_asset::dist::HOST_EXECUTOR) if packet.is_some() => true,
+        Some(e) => {
+            return Err(bad(at(&format!(
+                "[target] executor = {e:?}: only a `[build]` packet runs on `{}`",
+                plow_asset::dist::HOST_EXECUTOR
+            ))))
+        }
+    };
     let max_ctx = t
         .max_ctx
         .or(r.cell.max_ctx)
@@ -451,7 +501,10 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
     // A bundle names the bytes it was validated against. A Hugging Face
     // repository is referenced by commit, never by a branch that can move, and
     // the farm links the snapshot of exactly that commit into the bundle.
-    if checkpoint_source != plow_asset::dist::DIST_SOURCE && r.status.as_deref() != Some("refused")
+    let provenance_only = packet.is_some() && !checkpoint_source.starts_with("hf:");
+    if checkpoint_source != plow_asset::dist::DIST_SOURCE
+        && r.status.as_deref() != Some("refused")
+        && !provenance_only
     {
         let repo = checkpoint_source.strip_prefix("hf:").ok_or_else(|| {
             bad(at(&format!(
@@ -495,6 +548,16 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
         required.push("cublaslt_algos.jsonl".to_string());
     }
 
+    let mut views = Vec::new();
+    if r.cell.hf_dir.as_deref().is_some_and(prepared) {
+        views.push("checkpoint".to_string());
+    }
+    for sub in &r.sub_emit {
+        if prepared(&sub.hf_dir) {
+            views.push(format!("{}/checkpoint", sub.name));
+        }
+    }
+
     let objects = r.objects.unwrap_or_default();
     Ok(Identity {
         namespace: r.namespace.unwrap_or_else(|| "infervisor".into()),
@@ -522,10 +585,16 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
         runtime_env: r.serve.env,
         checkpoint_source,
         checkpoint_revision: c.revision.unwrap_or_default(),
-        checkpoint_layout: c.layout.unwrap_or_else(|| "hf-safetensors".into()),
+        checkpoint_layout: match &packet {
+            Some(_) => plow_asset::dist::PACKET_LAYOUT.to_string(),
+            None => c.layout.unwrap_or_else(|| "hf-safetensors".into()),
+        },
         checkpoint_shards: c.shards.unwrap_or(0),
         checkpoint_bytes: c.bytes.unwrap_or(0),
         recipe: path.to_string_lossy().into_owned(),
+        views,
+        packet,
+        host,
     })
 }
 
@@ -1064,6 +1133,40 @@ pub struct BundleArgs<'a> {
     pub checkpoint_dir: Option<&'a Path>,
 }
 
+/// A specialised object pairs only with the packet that produced it (`<dir>/build.json`'s
+/// pairing hash). Catching a mismatch here turns a refusal twenty frames into the loader into an
+/// obvious one.
+fn check_stamps<'a>(
+    dir: &Path,
+    pairing: Option<&str>,
+    objects: impl Iterator<Item = &'a ObjSetObject>,
+) -> Result<()> {
+    for o in objects {
+        let Some(stamp) = o.packet_hash.as_deref() else {
+            continue;
+        };
+        match pairing {
+            None => {
+                return Err(bad(format!(
+                    "{} is stamped for packet {stamp}, but {} records no pairing hash. \
+                     Publishing this pair would be refused at load.",
+                    o.name,
+                    dir.join("build.json").display()
+                )))
+            }
+            Some(p) if p != stamp => {
+                return Err(bad(format!(
+                    "{} is stamped for packet {stamp}, but this packet is {p}. The objset was \
+                     built against a different emit; rebuild one of them.",
+                    o.name
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Assemble the bundle from a built asset directory.
 pub fn build_bundle(
     assets: &Path,
@@ -1083,7 +1186,7 @@ pub fn build_bundle(
                 id.target.vendor
             )))
         }
-        (None, false) => {
+        (None, false) if !id.host => {
             return Err(bad(format!(
                 "vendor {} ships device objects: the bundle needs an objset",
                 id.target.vendor
@@ -1100,50 +1203,38 @@ pub fn build_bundle(
             .and_then(|h| h.as_str()),
     );
 
-    // A specialised object pairs only with the packet that produced it.
-    // Catching a mismatch here turns a refusal twenty frames into the loader
-    // into an obvious one.
-    for o in objset.map(|s| s.objects.as_slice()).unwrap_or_default() {
-        let Some(stamp) = o.packet_hash.as_deref() else {
-            continue;
-        };
-        match pairing {
-            None => {
-                return Err(bad(format!(
-                    "{} is stamped for packet {stamp}, but {} records no pairing hash. \
-                     Publishing this pair would be refused at load.",
-                    o.name,
-                    assets.join("build.json").display()
-                )))
-            }
-            Some(p) if p != stamp => {
-                return Err(bad(format!(
-                    "{} is stamped for packet {stamp}, but this packet is {p}. The objset was \
-                     built against a different emit; rebuild one of them.",
-                    o.name
-                )))
-            }
-            Some(_) => {}
-        }
-    }
+    // A sub-bundle's objects were checked against its own packet when the objset was built.
+    let root_objects = objset
+        .map(|s| s.objects.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|o| !plow_asset::dist::in_sub_bundle(&o.name));
+    check_stamps(assets, pairing, root_objects)?;
 
     let mut files = Vec::new();
     let mut unclaimed = Vec::new();
-    let mut names: Vec<PathBuf> = std::fs::read_dir(assets)
-        .map_err(|e| bad(format!("{}: {e}", assets.display())))?
-        .map(|e| e.map(|e| e.path()))
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| bad(format!("{}: {e}", assets.display())))?;
-    names.sort();
-    for p in &names {
-        if !p.is_file() {
-            continue;
+    let mut names: Vec<(String, PathBuf)> = sorted_files(assets, &[])?
+        .into_iter()
+        .map(|p| (file_name(&p), p))
+        .collect();
+    // A sub-bundle (Breeze's `text_encoder/`) is its own emit beside the packet: its files ship
+    // under its name, classified like the top level's.
+    for sub in sub_bundles(assets)? {
+        for p in sorted_files(&assets.join(&sub), &[])? {
+            names.push((format!("{sub}/{}", file_name(&p)), p));
         }
-        let name = file_name(p);
-        match classify(&name) {
+    }
+    for (name, p) in &names {
+        let base = name.rsplit('/').next().unwrap_or(name);
+        let role = match &id.packet {
+            Some(packet) if name == packet => Some("packet"),
+            _ if name.contains('/') && base == "model.pkt" => Some("sub_packet"),
+            _ => classify(base),
+        };
+        match role {
             Some(role) => files.push(FileRef {
                 role: role.to_string(),
-                name,
+                name: name.clone(),
                 sha256: sha256_file(p)?,
                 bytes: size(p)?,
             }),
@@ -1151,10 +1242,10 @@ pub fn build_bundle(
             // result is a published generation that looks complete and serves
             // wrongly — a published generation is IMMUTABLE.
             None => {
-                if !SKIP_QUIETLY.contains(&name.as_str())
-                    && !OBJSET_SUFFIXES.iter().any(|s| name.ends_with(s))
+                if !SKIP_QUIETLY.contains(&base)
+                    && !OBJSET_SUFFIXES.iter().any(|s| base.ends_with(s))
                 {
-                    unclaimed.push(name);
+                    unclaimed.push(name.clone());
                 }
             }
         }
@@ -1192,8 +1283,9 @@ pub fn build_bundle(
     }
     if !files.iter().any(|f| f.role == "packet") {
         return Err(bad(format!(
-            "{}: no model.pkt — that is not a compiled asset directory",
-            assets.display()
+            "{}: no {} — that is not a compiled asset directory",
+            assets.display(),
+            id.packet.as_deref().unwrap_or("model.pkt")
         )));
     }
 
@@ -1239,10 +1331,12 @@ pub fn build_bundle(
     let weights: serde_json::Value = read_json_if_present(&assets.join("weights.json"))?;
     // `weights.json`'s `network`, not the recipe's: the recipe's names the
     // ARCHITECTURE family (veena's says `llama`) while the bundle's is the
-    // registry key `plowrt serve` registers under (`veena`).
+    // registry key `plowrt serve` registers under (`veena`). A script-built
+    // packet writes no `weights.json` and serves under the model's name.
     let network = weights
         .get("network")
         .and_then(|n| n.as_str())
+        .or(id.packet.as_ref().map(|_| id.name.as_str()))
         .ok_or_else(|| {
             bad(format!(
                 "{}: no `network` — it is the registry key `plowrt serve` registers under",
@@ -1265,6 +1359,19 @@ pub fn build_bundle(
         .clone()
         .unwrap_or_else(|| default_label(&id.target, &id.parallel, id.max_ctx, &features));
 
+    let mut views = Vec::new();
+    for dir in &id.views {
+        let bound = assets.join(dir);
+        if !bound.is_dir() {
+            return Err(bad(format!(
+                "{}: the recipe's prep built this checkpoint, but it is not there to publish",
+                bound.display()
+            )));
+        }
+        let snapshot = super::view::local_snapshot(&id.checkpoint_source, &id.checkpoint_revision)?;
+        views.push(super::view::compute(dir, &bound, &snapshot)?);
+    }
+
     let mut bundle = Bundle {
         schema: plow_asset::dist::bundle_schema(&id.target.vendor).to_string(),
         namespace: id.namespace.clone(),
@@ -1280,12 +1387,19 @@ pub fn build_bundle(
         max_ctx: id.max_ctx,
         files,
         tokenizer,
-        checkpoint: build_checkpoint(id, args.checkpoint_dir)?,
+        checkpoint: plow_asset::dist::BundleCheckpoint {
+            views,
+            ..build_checkpoint(id, args.checkpoint_dir)?
+        },
         objset: None,
         pairing_hash: pairing.map(str::to_string),
         runtime_env: id.runtime_env.clone(),
         recipe: Some(id.recipe.clone()),
+        executor: id.host.then(|| plow_asset::dist::HOST_EXECUTOR.to_string()),
     };
+    if bundle.needs_views_schema() {
+        bundle.schema = plow_asset::dist::BUNDLE_SCHEMA_VIEWS.to_string();
+    }
     if let Some(objset) = objset {
         bundle.objset = Some(BundleObjset {
             objset_id: objset.objset_id.clone(),
@@ -1299,6 +1413,28 @@ pub fn build_bundle(
         ));
     }
     Ok(bundle)
+}
+
+/// The sub-bundles of an asset directory: each subdirectory holding its own `model.pkt` (not a
+/// link: `checkpoint` is the farm; not hidden: `.cubin-build` is build state).
+fn sub_bundles(assets: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(assets).map_err(|e| bad(format!("{}: {e}", assets.display())))? {
+        let p = e
+            .map_err(|e| bad(format!("{}: {e}", assets.display())))?
+            .path();
+        let name = file_name(&p);
+        let real_dir = std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir());
+        if real_dir
+            && !name.starts_with('.')
+            && name != plow_asset::dist::SEGMENT_OBJECTS_DIR
+            && p.join("model.pkt").is_file()
+        {
+            out.push(name);
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn classify(name: &str) -> Option<&'static str> {
@@ -1357,6 +1493,7 @@ fn build_checkpoint(id: &Identity, dir: Option<&Path>) -> Result<BundleCheckpoin
             layout: id.checkpoint_layout.clone(),
             bytes: id.checkpoint_bytes,
             files: Vec::new(),
+            views: Vec::new(),
         });
     };
     if !root.is_dir() {
@@ -1397,6 +1534,7 @@ fn build_checkpoint(id: &Identity, dir: Option<&Path>) -> Result<BundleCheckpoin
         layout: id.checkpoint_layout.clone(),
         bytes: files.iter().map(|f| f.bytes).sum(),
         files,
+        views: Vec::new(),
     })
 }
 
@@ -1497,14 +1635,43 @@ pub fn generate(
             )))
         }
         (true, None) => None,
+        (false, _) if id.host => {
+            let objects = sorted_files(assets, OBJSET_SUFFIXES)?;
+            if let Some(o) = objects.first() {
+                return Err(bad(format!(
+                    "{}: a host-executed packet ships no device object",
+                    o.display()
+                )));
+            }
+            None
+        }
         // NVIDIA serves its objects from the asset directory, so that is what ships.
         (false, named) if id.target.vendor == "nvidia" => {
-            let objects = served_objects(assets)?;
+            let mut objects = served_objects(assets)?;
             if let Some(named) = named {
                 check_named_objects(assets, named, &objects)?;
             }
             for packet in sorted_files(assets, &[".pkt"])? {
                 check_declared(&packet, &objects)?;
+            }
+            // A sub-bundle serves its own objects from beside its packet; appended, so a
+            // directory without one keeps the objset id it always had.
+            for sub in sub_bundles(assets)? {
+                let dir = assets.join(&sub);
+                let own = served_objects(&dir)?;
+                for packet in sorted_files(&dir, &[".pkt"])? {
+                    check_declared(&packet, &own)?;
+                }
+                let build: serde_json::Value = read_json_if_present(&dir.join("build.json"))?;
+                let pairing = build
+                    .get("pairing")
+                    .and_then(|p| p.get("hash"))
+                    .and_then(|h| h.as_str());
+                check_stamps(&dir, pairing, own.iter())?;
+                objects.extend(own.into_iter().map(|o| ObjSetObject {
+                    name: format!("{sub}/{}", o.name),
+                    ..o
+                }));
             }
             let defines_dir = named
                 .filter(|d| d.join("build_defines.json").exists())

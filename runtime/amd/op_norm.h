@@ -23,6 +23,7 @@
 #include "token_batch.h"
 
 #include "amd_common.h"
+#include "op_elementwise.h"
 #include "packed_prefill.h"
 #include "mixed_step.h"
 
@@ -33,6 +34,59 @@ constexpr unsigned rn_groups = 1;
 #endif
 constexpr unsigned rn_threads = PLOW_THREADS * rn_groups;
 constexpr unsigned rn_vecs = RN_VEC * rn_groups;
+
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+__device__ void d_rmsnorm_residual_f32(bf16* out, const float* x, const bf16* gamma,
+                                      unsigned rows, unsigned feat, float eps,
+                                      unsigned slice, unsigned nblk, float* part) {
+    const auto* src = as_glob(x);
+    auto* dst = as_glob(out);
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * feat;
+        float ss = 0.0f;
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
+            const float v = src[base + i];
+            ss += v * v;
+        }
+        const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS)
+            dst[base + i] = f2bf(src[base + i] * inv * (gamma ? bf2f(gamma[i]) : 1.0f));
+        __syncthreads();
+    }
+}
+
+__device__ void d_norm_residual_f32(float* out, const float* a, const bf16* b,
+                                    const bf16* gamma, unsigned rows, unsigned feat,
+                                    float eps, float scale, unsigned slice,
+                                    unsigned nblk, float* part) {
+    const auto* src = as_glob(b);
+    const auto* residual = as_glob(a);
+    auto* dst = as_glob(out);
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * feat;
+        float ss = 0.0f;
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
+            const float v = bf2f(src[base + i]);
+            ss += v * v;
+        }
+        const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
+            const float normalized = bf2f(src[base + i]) * inv * (gamma ? bf2f(gamma[i]) : 1.0f);
+            dst[base + i] = (residual[base + i] + normalized) * scale;
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void d_norm_residual_norm_f32(bf16* out, float* resid, const float* a,
+                                         const bf16* b, const bf16* gb, const bf16* gn,
+                                         unsigned rows, unsigned feat, float eps,
+                                         float scale, unsigned slice, unsigned nblk, float* part) {
+    // Both passes assign every row to the same workgroup; no inter-group dependency.
+    d_norm_residual_f32(resid, a, b, gb, rows, feat, eps, scale, slice, nblk, part);
+    d_rmsnorm_residual_f32(out, resid, gn, rows, feat, eps, slice, nblk, part);
+}
+#endif
 
 /* THE INPUT-RANGE CONTRACT OF EVERY REDUCTION IN THIS FILE, and the debug build that asserts it.
  *                                             [F5, plans/gpu-kernel-static-audit-20260908.md]
@@ -434,7 +488,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
  * QuantFp8Block128 over `out` produces (same amax floor, scale, and PLOW_GM_FP8_PACK2 on the
  * ROUNDED outputs), so the pair becomes one packet. A 128-group is 16 consecutive lanes' 8-element
  * chunks of rn_index. Requires the register-resident row (`fits`) and feat % 128 == 0. */
-#ifdef PLOW_GM_FP8_PACK2
+#if defined(PLOW_GM_FP8_PACK2) && PLOW_CDNA4 /* its only dispatch sites are PLOW_CDNA4 */
 __device__ void d_rmsnorm_q128(bf16* __restrict__ out, const bf16* __restrict__ x,
                                const bf16* __restrict__ gamma, unsigned rows, unsigned feat,
                                float eps, unsigned slice, unsigned nblk, float* part,
@@ -1386,6 +1440,110 @@ __device__ void d_norm_residual_norm(bf16* __restrict__ out, bf16* resid, const 
                 st_act1(&out[base + i], f2bf(bf2f(resid[base + i]) * invr * g));
             }
         }
+    }
+}
+
+/* Gemma-4 E-series PER-LAYER INPUT block, fused (PLOW_DOP_PER_LAYER_INPUT).
+ *   t0=x(in/out) t1=Wg t2=Wp t3=gamma_post t4=ple t5=hn_out? t6=gamma_next?
+ *   i0=T i1=H i2=P i3=col0 i4=stride   f0=eps f1=layer_scalar
+ * per row t: g = gelu_tanh(Wg . x[t]); a = g * ple[t][col0..col0+P); y = Wp . a;
+ *            x[t] = (x[t] + RMSNorm(y) * gamma_post) * layer_scalar;
+ *            hn[t] = RMSNorm(x[t]) * gamma_next (optional) */
+__device__ __attribute__((noinline)) void d_per_layer_input(
+    bf16* __restrict__ x, const bf16* __restrict__ wg, const bf16* __restrict__ wp,
+    const bf16* __restrict__ gamma, const bf16* __restrict__ ple,
+    bf16* __restrict__ hn, const bf16* __restrict__ gnext,
+    unsigned rows, unsigned H, unsigned P, unsigned col0, unsigned stride,
+    float eps, float ls, unsigned slice, unsigned nblk,
+    bf16* __restrict__ lds, unsigned arena_halves) {
+    if (!rows || !H || !P) return;
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned step = PLOW_WAVE * 8; /* 512 halves */
+
+    const size_t hs = ((size_t)H + 7u) & ~7ull;
+    const size_t ps = ((size_t)P + 7u) & ~7ull;
+    if (2u * hs + ps + 2u * PLOW_WAVES > arena_halves || col0 > stride || P > stride - col0) {
+        __builtin_trap();
+        return;
+    }
+    bf16* lds_x = lds;
+    bf16* lds_a = lds + hs;
+    bf16* lds_y = lds + hs + ps;
+    float* red_part = (float*)(lds + 2u * hs + ps);
+
+    for (unsigned t = slice; t < rows; t += nblk) {
+        bf16* xr = x + (size_t)t * H;
+        const bf16* pr = ple + (size_t)t * stride + col0;
+
+        stage_x_lds(lds_x, xr, H);
+        __syncthreads();
+
+        for (unsigned p = wave; p < P; p += PLOW_WAVES) {
+            const __amdgpu_buffer_rsrc_t rsrc = buf_rsrc(wg + (size_t)p * H, H);
+            float acc = 0.0f;
+            for (unsigned c = 0; c < H; c += step) {
+                const unsigned h_idx = c + lane * 8u;
+                const bf16v8 wv = gemv_load8(wg + (size_t)p * H, rsrc, h_idx, H);
+                const bf16v8 xv = gemv_lds8(lds_x, h_idx, H);
+                acc = dot8(wv, xv, acc);
+            }
+            const float s = wave_sum(acc);
+            if (lane == 0) {
+                const float s_bf = bf2f(f2bf(s));
+                const float g = bf2f(f2bf(act_gelu_tanh(s_bf)));
+                lds_a[p] = f2bf(g * bf2f(pr[p]));
+            }
+        }
+        __syncthreads();
+
+        for (unsigned h = wave; h < H; h += PLOW_WAVES) {
+            const __amdgpu_buffer_rsrc_t rsrc = buf_rsrc(wp + (size_t)h * P, P);
+            float acc = 0.0f;
+            for (unsigned c = 0; c < P; c += step) {
+                const unsigned p_idx = c + lane * 8u;
+                const bf16v8 wv = gemv_load8(wp + (size_t)h * P, rsrc, p_idx, P);
+                const bf16v8 av = gemv_lds8(lds_a, p_idx, P);
+                acc = dot8(wv, av, acc);
+            }
+            const float s = wave_sum(acc);
+            if (lane == 0) {
+                lds_y[h] = f2bf(s);
+            }
+        }
+        __syncthreads();
+
+        float ss = 0.0f;
+        for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+            const float yf = bf2f(lds_y[h]);
+            ss += yf * yf;
+        }
+        ss = block_sum(ss, red_part);
+        const float inv = rsqrtf(rn_ss(ss) / (float)H + eps);
+        for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+            const float g = gamma ? bf2f(gamma[h]) : 1.0f;
+            const float n = bf2f(f2bf(bf2f(lds_y[h]) * inv * g));
+            const bf16 v = f2bf(bf2f(f2bf(bf2f(lds_x[h]) + n)) * ls);
+            st_act1(&xr[h], v);
+            lds_x[h] = v;
+        }
+
+        if (hn != nullptr) {
+            __syncthreads();
+            float ss2 = 0.0f;
+            for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+                const float xf = bf2f(lds_x[h]);
+                ss2 += xf * xf;
+            }
+            ss2 = block_sum(ss2, red_part);
+            const float inv2 = rsqrtf(rn_ss(ss2) / (float)H + eps);
+            bf16* o = hn + (size_t)t * H;
+            for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+                const float gn = gnext ? bf2f(gnext[h]) : 1.0f;
+                st_act1(&o[h], f2bf(bf2f(lds_x[h]) * inv2 * gn));
+            }
+        }
+        __syncthreads();
     }
 }
 

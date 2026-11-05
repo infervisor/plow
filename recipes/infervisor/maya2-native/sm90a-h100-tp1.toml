@@ -13,7 +13,7 @@
 # ms: 64 rows 3.91/12.78, 128 4.15/13.57, 256 4.66/14.38, 512 5.91/17.57, 8x64 5.34/16.99,
 # 4x128 5.35/17.46. Served vs the same-commit base (packet ccc4ff76600f), same plowrt, 2 reps:
 # c1 TTFA 34/41 ms, c8 100/108 ms, c32 379/415 ms, audio s/s +1..+3% at c8-c128, nothing slower;
-# tts_cer c1+c8 CER median 0.000 (n=48), as base. Evidence: /opt/dlami/nvme/lava-tts/maya2-caps
+# tts_cer c1+c8 CER median 0.000 (n=48), as base. Evidence: <lab scratch>/maya2-caps
 # run2, bench-pf, bench-pf-wav, gate-pf.
 # Decode projections on cuBLASLt (PLOW_EMIT_DECODE_CUBLASLT, MIN_ROWS 32) win the backbone step
 # at B64/B128 (3.56/5.52, 5.01/7.72 ms) but serve no faster at c1-c128 (bench-cap: audio s/s and
@@ -26,7 +26,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "maya2-native"
 label = "sm90a-h100-tp1"
-plow_git = "f9259e8cbfec2ff9a0120d1827c4f96d3ba070cb"
+plow_git = "6a4ccff51e729669e8acb480b3ba6323459435d5"
 network = "qwen3"
 doc = "docs/runtime/tts.md"
 

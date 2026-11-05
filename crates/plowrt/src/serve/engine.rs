@@ -30,6 +30,9 @@ pub enum ServeEngine {
     /// The sm_120 persistent-interpreter engine (slotted, continuous batching).
     #[cfg(feature = "cuda")]
     Cuda(crate::exec::gpu::GpuEngine),
+    /// A tensor-parallel CUDA packet over a process rank group (rank 0 local, slotted).
+    #[cfg(feature = "cuda")]
+    CudaGroup(super::cuda_group::CudaGroupServe),
     /// The gfx950 engine (single sequence, optionally tensor-parallel).
     #[cfg(feature = "hsa")]
     Amd(AmdServe),
@@ -39,6 +42,19 @@ pub enum ServeEngine {
 }
 
 impl ServeEngine {
+    pub fn kv_image_key(&self) -> Option<String> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(e) => e.kv_image_key(),
+            #[cfg(feature = "cuda")]
+            Self::CudaGroup(_) => None,
+            #[cfg(feature = "hsa")]
+            Self::Amd(e) => e.kv_image_key(),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(e) => SeqEngine::kv_image_key(e),
+        }
+    }
+
     /// Whether this is the CUDA engine.
     pub fn is_cuda(&self) -> bool {
         #[cfg(feature = "cuda")]
@@ -64,10 +80,11 @@ impl ServeEngine {
 
     /// Whether this backend applies the request's sampling parameters.
     ///
-    /// ONLY THE CUDA ENGINE DOES. The gfx950 engine and the CPU/Metal engine
-    /// both sample on device and never hand the host a logit row, so every
-    /// token is the argmax whatever `temperature`, `top_p`, `top_k`, the
-    /// penalties or `seed` said. The host resample (`gpu_finish_token`) is
+    /// The CUDA engine does, and the AMD engine does when its packet leaves a
+    /// full-vocab logits row on device (`host_sampling`): the same host sampler
+    /// then replaces the device argmax. The CPU/Metal engine samples on device
+    /// and every token is the argmax whatever `temperature`, `top_p`, `top_k`,
+    /// the penalties or `seed` said. The host resample (`gpu_finish_token`) is
     /// reached only from `cfg(cuda)` call sites, and neither `serve::cpu_serve`
     /// nor the Apple engine contains a sampler at all.
     ///
@@ -81,8 +98,10 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(_) => true,
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(_) => true,
             #[cfg(feature = "hsa")]
-            ServeEngine::Amd(_) => false,
+            ServeEngine::Amd(e) => SeqEngine::host_sampling(e),
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => false,
         }
@@ -94,6 +113,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.max_ctx(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => e.max_ctx(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.max_ctx(),
             #[cfg(feature = "cpu")]
@@ -109,7 +130,7 @@ pub use super::cpu_serve::CpuServe;
 /// whole-or-chunked prefill, one decode step per live slot, plus the AMD-only
 /// packed-prefill / deferred multistep extensions, which other engines decline
 /// by returning `None`/`Err` (the tick already handles both).
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 pub trait SeqEngine {
     fn stop_ids(&self) -> &Arc<Vec<u32>>;
     fn batch(&self) -> usize;
@@ -117,6 +138,39 @@ pub trait SeqEngine {
     /// its submission thread runs binds it here, once per thread.
     fn bind_engine_thread(&self) {}
     fn release(&mut self, slot: usize);
+    fn kv_image_key(&self) -> Option<String> {
+        None
+    }
+    fn export_kv_image(
+        &mut self,
+        _slot: usize,
+        _n: u32,
+        _out: &mut crate::serve::pd::KvBytes,
+    ) -> crate::Result<()> {
+        Err(crate::RuntimeError::Rejected(
+            "KV image export unavailable".into(),
+        ))
+    }
+    fn export_kv_image_stream(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        _publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+    ) -> crate::Result<()> {
+        self.export_kv_image(slot, n, out)
+    }
+    fn import_kv_image(
+        &mut self,
+        _slot: usize,
+        _prompt: &[u32],
+        _image: &crate::serve::pd::KvBytes,
+        _first_token: u32,
+    ) -> crate::Result<()> {
+        Err(crate::RuntimeError::Rejected(
+            "KV image import unavailable".into(),
+        ))
+    }
     fn prefill_turn(&self) -> usize;
     fn advance_prefill_turn(&mut self, slot: usize);
     fn prefill_prog_t(&self, prog: usize) -> Option<u32>;
@@ -185,6 +239,11 @@ pub trait SeqEngine {
     }
     fn cached_rows(&self, _slot: usize) -> usize {
         0
+    }
+    /// Whether the serving loop draws sampled and logit-edited rows from [`Self::logits_row`]
+    /// (the engine's own token is its argmax). `false` = rows are served by device argmax.
+    fn host_sampling(&self) -> bool {
+        false
     }
     /// The softcapped logits behind `slot`'s most recent token (host logprobs); `false` = the
     /// engine keeps them on device.
@@ -334,6 +393,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.step_backend(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => SeqEngine::step_backend(e),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.step_backend(),
             #[cfg(feature = "cpu")]
@@ -341,11 +402,13 @@ impl ServeEngine {
         }
     }
     /// The single-sequence tick surface, for the gfx950 and CPU engines.
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     pub fn seq_engine_mut(&mut self) -> Option<&mut dyn SeqEngine> {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(_) => None,
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => Some(e),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => Some(e),
             #[cfg(feature = "cpu")]
@@ -357,7 +420,7 @@ impl ServeEngine {
     pub fn amd_overlap_capability(&self) -> Option<crate::exec::amd::AmdOverlapCapability> {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => None,
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => None,
             ServeEngine::Amd(e) => Some(e.overlap_capability()),
@@ -368,7 +431,7 @@ impl ServeEngine {
     pub fn amd_overlap_evidence(&self) -> Option<Vec<crate::exec::amd::AmdOverlapRankEvidence>> {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => None,
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "cpu")]
             ServeEngine::Cpu(_) => None,
             ServeEngine::Amd(e) => Some(e.overlap_evidence()),
@@ -378,7 +441,7 @@ impl ServeEngine {
     pub fn begin_diagnostics(&mut self) {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => {}
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => {}
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.begin_diagnostics(),
             #[cfg(feature = "cpu")]
@@ -389,7 +452,7 @@ impl ServeEngine {
     pub fn finish_diagnostics(&mut self) -> EngineDiagnostics {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => EngineDiagnostics::unsupported(),
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => EngineDiagnostics::unsupported(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.finish_diagnostics(),
             #[cfg(feature = "cpu")]
@@ -403,6 +466,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.batch(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => SeqEngine::batch(e),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.batch(),
             #[cfg(feature = "cpu")]
@@ -415,6 +480,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.effective_decode_rungs(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => vec![SeqEngine::batch(e) as u32].into(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.decode_rungs().into(),
             #[cfg(feature = "cpu")]
@@ -451,6 +518,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.kv_admission(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.kv_admission_budget(),
             #[cfg(feature = "cpu")]
@@ -554,6 +623,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.vmm_prefix_enabled(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(g) => g.prefix_cache_enabled(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.prefix_cache_enabled(),
             #[cfg(feature = "cpu")]
@@ -566,6 +637,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.stop_ids(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(e) => SeqEngine::stop_ids(e),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.stop_ids(),
             #[cfg(feature = "cpu")]
@@ -584,7 +657,7 @@ impl ServeEngine {
         match self {
             ServeEngine::Amd(e) => e.write_packet_trace(path),
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => Err(crate::RuntimeError::Device(
+            ServeEngine::Cuda(_) | ServeEngine::CudaGroup(_) => Err(crate::RuntimeError::Device(
                 "raw AMD packet traces require an AMD serving engine".into(),
             )),
             #[cfg(feature = "cpu")]
@@ -600,6 +673,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.vmm_stats_handle(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.vmm_stats_handle(),
             #[cfg(feature = "cpu")]
@@ -623,6 +698,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => e.vmm_prefix_probe(),
+            #[cfg(feature = "cuda")]
+            ServeEngine::CudaGroup(_) => None,
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.vmm_prefix_probe(),
             #[cfg(feature = "cpu")]
@@ -2370,6 +2447,10 @@ mod amd_serve {
         /// the same replicated row behind its device argmax; `in.ids` and `act.logits` are both
         /// slot-indexed), or concatenated over the ranks' vocab slices under a sharded head.
         /// `false` when the packet keeps no such row (see `logits_elem`).
+        pub fn host_sampling(&self) -> bool {
+            self.logits_elem.is_some()
+        }
+
         pub fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
             let Some(elem) = self.logits_elem else {
                 return false;
@@ -3665,47 +3746,6 @@ mod amd_serve {
             shrink_pending_prefill(cur, rows, |a, b| g.plan_span_at_most(a, b, max_bucket))
         }
 
-        /// `PLOW_AMD_MIXED_RIDE_TRIM`: shorten the last member's pending chunk so `riders` one-row
-        /// decode spans fit the rung the prefill spans already fill; the cut rows become its next
-        /// chunk. A member left under 64 rows is not cut (the riders then step separately).
-        fn trim_pack_for_riders(&mut self, members: &[(usize, &[u32])], riders: u32) -> Result<()> {
-            let pending = |slot: usize| {
-                self.pf
-                    .get(slot)
-                    .and_then(Option::as_ref)
-                    .and_then(|cur| cur.steps.get(cur.next).copied())
-            };
-            let Some(pf_rows) = members
-                .iter()
-                .map(|&(slot, _)| pending(slot).map(|s| s.clen))
-                .sum::<Option<u32>>()
-            else {
-                return Ok(());
-            };
-            let Some(width) = self
-                .packed_prefill_program(pf_rows, u32::MAX, false, None)
-                .and_then(|prog| self.prefill_prog_t(prog))
-            else {
-                return Ok(());
-            };
-            let excess = (pf_rows + riders).saturating_sub(width);
-            let Some(&(slot, _)) = members.last() else {
-                return Ok(());
-            };
-            let Some(step) = pending(slot) else {
-                return Ok(());
-            };
-            if excess == 0 || step.clen < excess + 64 {
-                return Ok(());
-            }
-            let max_bucket = self.prefill_chunk_rows.max(step.clen);
-            let g = &self.ranks;
-            let cur = self.pf[slot].as_mut().expect("pending step checked above");
-            shrink_pending_prefill(cur, step.clen - excess, |a, b| {
-                g.plan_span_at_most(a, b, max_bucket)
-            })
-        }
-
         /// `Ok(true)` iff the decode `feeds` rode the launch.
         fn advance_packed(
             &mut self,
@@ -3713,9 +3753,6 @@ mod amd_serve {
             mut feeds: &[(usize, u32)],
             output: &mut [u32],
         ) -> Result<bool> {
-            if !feeds.is_empty() && crate::config::RuntimeConfig::get().amd.mixed_ride_trim {
-                self.trim_pack_for_riders(members, feeds.len() as u32)?;
-            }
             let terminal = self.packed_terminal();
             let n = feeds.len() + members.len();
             let mut spans = Vec::with_capacity(n);
@@ -4256,6 +4293,97 @@ mod amd_serve {
             if let Err(err) = pin_current_thread(&cpus) {
                 tracing::warn!(error = %err, "amd: pinning the engine thread failed; left unpinned");
             }
+        }
+
+        #[cfg(target_os = "linux")]
+        pub fn kv_image_staging(&self) -> Option<Arc<dyn crate::device::host_region::HostStaging>> {
+            match &self.ranks {
+                Ranks::One(e) => Some(e.kv_image_staging()),
+                Ranks::Tp(_) => None,
+            }
+        }
+
+        pub fn kv_image_key(&self) -> Option<String> {
+            match &self.ranks {
+                Ranks::One(e) => e.kv_image_key(),
+                Ranks::Tp(_) => None,
+            }
+        }
+
+        pub fn export_kv_image(
+            &mut self,
+            slot: usize,
+            n: u32,
+            out: &mut crate::serve::pd::KvBytes,
+        ) -> Result<()> {
+            self.export_kv_image_with(slot, n, out, None)
+        }
+
+        pub fn export_kv_image_stream(
+            &mut self,
+            slot: usize,
+            n: u32,
+            out: &mut crate::serve::pd::KvBytes,
+            publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+        ) -> Result<()> {
+            self.export_kv_image_with(slot, n, out, Some(publish))
+        }
+
+        fn export_kv_image_with(
+            &mut self,
+            slot: usize,
+            n: u32,
+            out: &mut crate::serve::pd::KvBytes,
+            publish: Option<&mut dyn FnMut(crate::serve::pd::KvBytes)>,
+        ) -> Result<()> {
+            self.check_slot(slot)?;
+            if !self.live[slot] || self.pf[slot].is_some() || self.pos[slot] != n {
+                return Err(RuntimeError::Rejected(format!(
+                    "KV image export: slot {slot} is not at the completed {n}-row frontier"
+                )));
+            }
+            match &mut self.ranks {
+                Ranks::One(e) => match publish {
+                    Some(publish) => e.export_kv_image_stream(slot, n, out, publish),
+                    None => e.export_kv_image(slot, n, out),
+                },
+                Ranks::Tp(_) => Err(RuntimeError::Rejected("KV image: TP unsupported".into())),
+            }
+        }
+
+        pub fn import_kv_image(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            image: &crate::serve::pd::KvBytes,
+            first_token: u32,
+        ) -> Result<()> {
+            self.check_slot(slot)?;
+            let n = u32::try_from(prompt.len())
+                .map_err(|_| RuntimeError::Rejected("KV image: prompt too long".into()))?;
+            self.invalidate_prefix(slot);
+            self.cached_prompt[slot].clear();
+            self.snap_at[slot] = 0;
+            self.end_logits[slot].clear();
+            self.lp_row[slot] = usize::MAX;
+            self.head_rows[slot] = 0;
+            self.pf[slot] = None;
+            self.live[slot] = false;
+            self.pos[slot] = 0;
+            self.cached_rows[slot] = 0;
+            match &mut self.ranks {
+                Ranks::One(e) => {
+                    e.begin_slot(slot)?;
+                    e.import_kv_image(slot, n, image)?;
+                }
+                Ranks::Tp(_) => {
+                    return Err(RuntimeError::Rejected("KV image: TP unsupported".into()))
+                }
+            }
+            self.pos[slot] = n;
+            self.live[slot] = true;
+            self.next_id[slot] = first_token;
+            Ok(())
         }
 
         pub fn release(&mut self, slot: usize) {
@@ -5612,6 +5740,35 @@ mod amd_serve {
 
 #[cfg(feature = "hsa")]
 impl SeqEngine for AmdServe {
+    fn kv_image_key(&self) -> Option<String> {
+        AmdServe::kv_image_key(self)
+    }
+    fn export_kv_image(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+    ) -> crate::Result<()> {
+        AmdServe::export_kv_image(self, slot, n, out)
+    }
+    fn export_kv_image_stream(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+    ) -> crate::Result<()> {
+        AmdServe::export_kv_image_stream(self, slot, n, out, publish)
+    }
+    fn import_kv_image(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        image: &crate::serve::pd::KvBytes,
+        first_token: u32,
+    ) -> crate::Result<()> {
+        AmdServe::import_kv_image(self, slot, prompt, image, first_token)
+    }
     fn stop_ids(&self) -> &Arc<Vec<u32>> {
         AmdServe::stop_ids(self)
     }
@@ -5683,6 +5840,9 @@ impl SeqEngine for AmdServe {
     }
     fn logits_row(&self, slot: usize, out: &mut Vec<f32>) -> bool {
         AmdServe::logits_row(self, slot, out)
+    }
+    fn host_sampling(&self) -> bool {
+        AmdServe::host_sampling(self)
     }
     fn prefill_chunked_at_most(
         &mut self,

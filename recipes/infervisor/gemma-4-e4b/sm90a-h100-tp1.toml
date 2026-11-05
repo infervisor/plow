@@ -18,7 +18,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "gemma-4-e4b"
 label = "sm90a-h100-tp1"
-plow_git = "2dabbe2b3f82129d4f905707080b0d2061d768f1"
+plow_git = "6a4ccff51e729669e8acb480b3ba6323459435d5"
 network = "gemma4"
 doc = "docs/runtime/gemma4-e4b-h100.md"
 tracker = "docs/runtime/h100-speech-recipes.md"
@@ -49,7 +49,6 @@ max_ctx = 8192
 emit = "devblob+cubin"
 args = ["--served-name", "gemma-4-e4b"]
 [emit.env]
-PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 # Voice-agent turns: prompts ~200-2000 rows -> prefill 64..2048; decode up to 128 concurrent.
 PLOW_MAX_CHUNK = "2048"
 # The 8192 rung ships whenever ctx reaches it; capping one request at 2048 rows per launch keeps

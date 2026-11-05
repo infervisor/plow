@@ -9,6 +9,8 @@ pub mod config;
 pub mod cosched;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
+#[cfg(feature = "cuda")]
+pub mod cuda_group;
 pub mod deadlines;
 pub mod dp;
 /// The loaded device engine behind a slug, as one type over both backends —
@@ -30,14 +32,16 @@ pub mod models;
 pub mod mux;
 pub mod openai;
 pub mod overload;
+pub mod pd;
 pub mod placement;
 pub mod policy;
 #[cfg(feature = "cpu")]
 pub mod portable;
 pub mod reasoning;
 pub mod reply_guard;
+pub mod residency_contract;
 pub mod session;
-#[cfg(all(test, any(feature = "hsa", feature = "cpu")))]
+#[cfg(all(test, any(feature = "hsa", feature = "cpu", feature = "cuda")))]
 mod step_lowering_tests;
 pub mod stream;
 pub mod template;
@@ -314,6 +318,10 @@ pub(crate) struct RunObserver {
     pub kv_writes: Vec<KvWrite>,
     /// SLO tick planner state (`PLOW_TBT_SLO_MS` / `PLOW_TTFT_SLO_MS`); untouched when unset.
     pub slo: crate::sched::slo::SloState,
+    /// Per engine slot, the P/D export of the prefill job seated there: it outlives the job's
+    /// `Slot`, which is gone by the time the tick retires the engine slot.
+    pub pd_exports: Vec<Option<Arc<pd::KvExport>>>,
+    pub pd_import_work: bool,
 }
 
 /// One recorded consumption of `KV_PAGES` by a `FLASH`-family packet.
@@ -338,6 +346,8 @@ impl RunObserver {
             kv_pages_range: crate::exec::indirection::slots::kv_pages(0, 0),
             kv_writes: Vec::new(),
             slo: Default::default(),
+            pd_exports: Vec::new(),
+            pd_import_work: false,
         }
     }
 
@@ -707,8 +717,10 @@ impl AppState {
 
     fn refresh_up(&self, key: &str) {
         if let Some((set, r)) = self.dp_rank(key) {
-            set.ranks[r]
-                .set_up(self.muxes.read().contains_key(key) && self.residency(key).admits());
+            set.ranks[r].set_up(
+                self.muxes.read().get(key).is_some_and(|m| !m.retiring())
+                    && self.residency(key).admits(),
+            );
         }
     }
 
@@ -722,6 +734,7 @@ impl AppState {
         session: Option<&str>,
         prompt: Option<&[u32]>,
         mut exclude: u32,
+        sampled: bool,
     ) -> Option<(
         usize,
         mux::ModelMux,
@@ -730,7 +743,7 @@ impl AppState {
     )> {
         let cfg = self.dp.get()?.cfg;
         loop {
-            let routed = set.route(&cfg, session, prompt, exclude)?;
+            let routed = set.route_sampled(&cfg, session, prompt, exclude, sampled)?;
             match self.mux(&set.ranks[routed.rank].key) {
                 Some(m) if !m.preempted() => {
                     return Some((routed.rank, m, routed.key, routed.pick))
@@ -743,7 +756,7 @@ impl AppState {
     /// Submit `job` to `mux`, the dispatcher of `set`'s rank `rank` when routed data-parallel. A
     /// rank that has closed or is full hands the same job (tokens and prefix key included) to
     /// another rank.
-    pub(crate) fn submit_routed(
+    pub(crate) async fn submit_routed(
         &self,
         routed: Option<(&dp::DpSet, usize)>,
         session: Option<&str>,
@@ -755,9 +768,13 @@ impl AppState {
         let Some((set, mut rank)) = routed else {
             return mux.submit_arrived(job, arrived, ingress);
         };
+        if set.pd.is_some() && pd::eligible(&job) {
+            return pd::submit(self, set, mux, job, arrived, ingress).await;
+        }
         let mut exclude = 0u32;
         let mut next: Option<mux::ModelMux> = None;
         let mut held: Option<dp::Pick<'_>> = None;
+        let sampled = job.gen.params.samples();
         let mut job = job;
         let mut ingress = ingress;
         loop {
@@ -768,7 +785,7 @@ impl AppState {
             };
             drop(held.take());
             exclude |= 1 << rank;
-            let Some((r, m, _, pick)) = self.dp_route(set, session, None, exclude) else {
+            let Some((r, m, _, pick)) = self.dp_route(set, session, None, exclude, sampled) else {
                 return Err(refused);
             };
             job = match refused {
@@ -792,12 +809,22 @@ impl AppState {
     /// Make some rank of `set` serve: a no-op while one does; otherwise load one whose residency
     /// admits (S1 switch on its group).
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    pub async fn dp_admit(&self, set: &dp::DpSet) -> std::result::Result<(), manager::EnsureError> {
-        if set.ranks.iter().any(|r| r.is_up()) {
+    /// `sampled`: the request needs a rank that applies sampling parameters, when the set has one.
+    pub async fn dp_admit(
+        &self,
+        set: &dp::DpSet,
+        sampled: bool,
+    ) -> std::result::Result<(), manager::EnsureError> {
+        let fit = |r: &dp::DpRank| !sampled || !set.any_samples() || set.rank_samples(r.rank);
+        if set.ranks.iter().any(|r| r.is_up() && fit(r)) {
             return Ok(());
         }
         let mut last = manager::EnsureError::Unloaded;
-        for r in set.ranks.iter().filter(|r| self.residency(&r.key).admits()) {
+        for r in set
+            .ranks
+            .iter()
+            .filter(|r| fit(r) && self.residency(&r.key).admits())
+        {
             let Some(mgr) = self.manager_for(&r.key) else {
                 continue;
             };
@@ -820,21 +847,32 @@ impl AppState {
         if let Some(h) = engine.kv_store_handle() {
             self.kv_store.write().insert(slug.clone(), h);
         }
-        self.max_ctx.write().insert(slug.clone(), engine.max_ctx());
+        let mut max_ctx = self.max_ctx.write();
+        max_ctx.insert(slug.clone(), engine.max_ctx());
         self.sampling_honoured
             .write()
             .insert(slug.clone(), engine.honours_sampling());
         if let Some((set, r)) = self.dp_rank(&slug) {
-            self.max_ctx
-                .write()
-                .insert(set.model.clone(), engine.max_ctx());
+            // The model admits what every rank can hold: ranks of different vendors' bundles may
+            // compile different context lengths. One lock across, so concurrent installs agree.
+            let ctx = set
+                .ranks
+                .iter()
+                .filter_map(|o| max_ctx.get(&o.key).copied())
+                .min()
+                .unwrap_or(engine.max_ctx());
+            max_ctx.insert(set.model.clone(), ctx);
+            drop(max_ctx);
+            set.set_samples(r, engine.honours_sampling());
             self.sampling_honoured
                 .write()
-                .insert(set.model.clone(), engine.honours_sampling());
+                .insert(set.model.clone(), set.any_samples());
             #[cfg(any(feature = "cuda", feature = "hsa"))]
             set.set_probe(r, engine.vmm_prefix_probe());
             #[cfg(not(any(feature = "cuda", feature = "hsa")))]
             let _ = r;
+        } else {
+            drop(max_ctx);
         }
         if let Ok(bundle) = self.registry.get(self.model_of(&slug)) {
             if let Some(c) = bundle.serve().multimodal.as_ref() {
@@ -982,12 +1020,30 @@ impl AppState {
     /// shares nothing, so its turn stays free unless `--co-sched` says otherwise. The
     /// process-wide mode ([`policy::installed_co_sched`]) is the most-shared group's.
     pub fn install_group_turns(&self, tenants: &[usize], cuda: bool) {
+        let groups: Vec<(Option<usize>, bool)> = tenants.iter().map(|&t| (Some(t), cuda)).collect();
+        self.install_turns_per_group(&groups);
+    }
+
+    /// [`Self::install_group_turns`] for a node whose groups differ in vendor: per group, its
+    /// instance count (`None` = every registered model) and whether it is a CUDA group.
+    pub fn install_turns_per_group(&self, groups: &[(Option<usize>, bool)]) {
         self.turns.get_or_init(|| {
-            let busiest = tenants.iter().copied().max().unwrap_or(1);
-            policy::set_co_sched(policy::co_sched(busiest, !cuda));
-            let turns = tenants
+            let models = self.registry.slugs().len();
+            let groups: Vec<(usize, bool)> = groups
                 .iter()
-                .map(|&t| Arc::new(cosched::DeviceTurn::serving(policy::co_sched(t, !cuda))))
+                .map(|&(t, c)| (t.unwrap_or(models), c))
+                .collect();
+            let (busiest, cuda) = groups
+                .iter()
+                .copied()
+                .max_by_key(|g| g.0)
+                .unwrap_or((1, cfg!(feature = "cuda")));
+            policy::set_co_sched(policy::co_sched(busiest, !cuda));
+            let turns = groups
+                .iter()
+                .map(|&(t, cuda)| {
+                    Arc::new(cosched::DeviceTurn::serving(policy::co_sched(t, !cuda)))
+                })
                 .collect::<Vec<_>>();
             if let Some(first) = turns.first() {
                 tracing::info!(
@@ -1088,16 +1144,23 @@ impl AppState {
     /// The manager a NEW model should be registered with: the named group, or
     /// the one with the most free memory when the caller did not name one.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    /// `vendor`: the vendor the incoming packet targets, when known; on a mixed-vendor node only
+    /// that vendor's groups can take it.
     pub fn manager_for_new(
         &self,
         group: Option<usize>,
+        vendor: Option<hwspec::Vendor>,
     ) -> Option<(usize, &Arc<manager::ModelManager>)> {
         let managers = self.managers();
+        let fits = |m: &Arc<manager::ModelManager>| {
+            vendor.is_none() || m.vendor().is_none() || m.vendor() == vendor
+        };
         match group {
-            Some(g) => managers.get(g).map(|m| (g, m)),
+            Some(g) => managers.get(g).filter(|m| fits(m)).map(|m| (g, m)),
             None => managers
                 .iter()
                 .enumerate()
+                .filter(|(_, m)| fits(m))
                 .max_by_key(|(_, m)| m.device_mem_info().map(|(free, _)| free).unwrap_or(0)),
         }
     }
@@ -1223,7 +1286,20 @@ impl AppState {
 
     /// Look up the dispatcher for a slug (clones the underlying Sender).
     pub fn mux(&self, slug: &str) -> Option<mux::ModelMux> {
-        self.muxes.read().get(slug).cloned()
+        self.muxes
+            .read()
+            .get(slug)
+            .filter(|m| !m.retiring())
+            .cloned()
+    }
+
+    /// Retain the retiring dispatcher until its completion fence is observed.
+    /// Keeping this handle survives cancellation of an eviction future.
+    pub(crate) fn mux_for_retirement(&self, slug: &str) -> Option<mux::ModelMux> {
+        let mux = self.muxes.read().get(slug).cloned()?;
+        mux.retire();
+        self.refresh_up(slug);
+        Some(mux)
     }
 
     /// Run one request end-to-end: tokenize the prompt, then autoregressively
@@ -1456,6 +1532,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/metrics", get(metrics_snapshot_handler))
         .route("/trace", get(trace_handler))
         .route("/v1/turns/:session", get(turns::session_turns))
+        .route("/v1/placement", get(placement_handler))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::clone(&state));
     #[cfg(feature = "cuda")]
@@ -1532,6 +1609,71 @@ pub fn dead_engines(state: &AppState) -> (Vec<String>, Vec<String>) {
     (dead, degraded)
 }
 
+/// `GET /v1/placement`: device groups, the instances placed on each, and every DP model's
+/// ranks with their vendor (docs/arch/30 §2.4).
+async fn placement_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::Json<serde_json::Value> {
+    use serde_json::json;
+    let tag = |v: Option<hwspec::Vendor>| v.map_or("host", crate::device::vendor_tag);
+    let mut instances: Vec<(String, usize)> = state
+        .slug_group
+        .read()
+        .iter()
+        .map(|(k, g)| (k.clone(), *g))
+        .collect();
+    instances.sort_unstable();
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    let groups: Vec<_> = state
+        .managers()
+        .iter()
+        .enumerate()
+        .map(|(g, m)| {
+            json!({
+                "group": g,
+                "vendor": tag(m.vendor()),
+                "devices": m.ordinals().iter().map(|o| format!("{}:{o}", tag(m.vendor()))).collect::<Vec<_>>(),
+                "instances": instances.iter().filter(|i| i.1 == g).map(|i| i.0.as_str()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    let groups: Vec<serde_json::Value> = Vec::new();
+    let models: Vec<_> = state
+        .registry
+        .slugs()
+        .into_iter()
+        .map(|slug| {
+            let ranks: Vec<_> = state
+                .dp_set(&slug)
+                .map(|set| {
+                    set.ranks
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "rank": r.rank,
+                                "key": r.key,
+                                "vendor": tag(r.vendor),
+                                "device": format!("{}:{}", tag(r.vendor), r.ordinal),
+                                "group": r.group,
+                                "up": r.cand().up,
+                                "samples": set.rank_samples(r.rank),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            json!({
+                "model": slug,
+                "vendors": state.registry.vendors(&slug).into_iter().map(crate::device::vendor_tag).collect::<Vec<_>>(),
+                "group": state.slug_group(&slug),
+                "dp": ranks,
+            })
+        })
+        .collect();
+    axum::Json(json!({ "groups": groups, "models": models }))
+}
+
 fn dp_metrics(out: &mut String, router: &dp::DpRouter, state: &AppState) {
     use crate::obs::serving::{escape_label, family};
     use std::fmt::Write;
@@ -1549,8 +1691,10 @@ fn dp_metrics(out: &mut String, router: &dp::DpRouter, state: &AppState) {
             let m = escape_label(&set.model);
             let _ = writeln!(
                 out,
-                "plowrt_dp_rank_info{{model_name=\"{m}\",engine=\"{}\",device=\"{}\"}} 1",
-                r.rank, r.ordinal
+                "plowrt_dp_rank_info{{model_name=\"{m}\",engine=\"{}\",device=\"{}\",vendor=\"{}\"}} 1",
+                r.rank,
+                r.ordinal,
+                r.vendor.map_or("", crate::device::vendor_tag)
             );
         }
     }
@@ -1814,6 +1958,8 @@ async fn metrics_handler(
         aggregate.accumulate(metrics);
     }
     let mut out = aggregate.to_prometheus();
+    #[cfg(feature = "cuda")]
+    cuda_group::write_transport_metrics(&mut out);
     for (index, (slug, metrics, _)) in models.iter().enumerate() {
         let label = crate::obs::serving::model_labels(slug);
         for line in metrics

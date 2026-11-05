@@ -8,7 +8,7 @@
 
 Run every compiled bucket of the new model through the `plow_verify` Lean CLI
 and get an `ok` certificate from every checkpoint its pipeline calls, then qualify
-the bundle with `plowrt qualify --assets <dir>`: every required obligation present,
+the bundle with `plowc qualify <dir>`: every required obligation present,
 bound to the packet and replayed on an approved verifier. A rejection is a
 real correctness finding, not a warning: it means the compiler produced a
 schedule that the formal model can prove is wrong (a fusion that changes
@@ -49,7 +49,7 @@ re-checks an emit-time obligation and has no stage of its own.
 | F | Allocation safety | No byte-overlapping address-map entries lack a bridging ordering (reclamation-safe) | same bundle as D | `Plow.Memory.AddressMapSound` (via `Plow.Verify`) |
 | G | Staged-LDS fit | Every always-staged GEMV instance fits the decode object's LDS arena | `{"arena", "ops": [...]}` | `Plow.LdsFit.fits_of_check_ok` |
 
-Versioned endpoints, checked at qualification (`plowrt qualify`), not carried as compiler
+Versioned endpoints, checked at qualification (`plowc qualify`), not carried as compiler
 receipts (details: [`lean-correctness-inventory.md`](lean-correctness-inventory.md) §10–13):
 
 | ID | Proves | Input derived by | Backing theorems |
@@ -225,8 +225,8 @@ Debug aids: `PLOW_VERIFY_DUMP=<dir>` writes every request to a file for replay;
 
 - `cd lean-plow && lake build plow_verify proof_audit && lake exe proof_audit`
   completes clean; `scripts/lean_correctness_ci.sh` passes.
-- `plowrt qualify --assets <dir>` lists no gap you cannot name (the strict
-  policy, `PLOW_LEAN_QUALIFY=strict`, refuses any gap at load).
+- `plowc qualify <dir>` lists no gap you cannot name (a
+  `--lean-qualify strict` emit refuses any gap).
 - No `sorry` and no vacuous/tautological proofs anywhere in `lean-plow/`
   (`grep -rn 'sorry' lean-plow --include='*.lean'` returns nothing outside
   comments; every `rule_*` theorem is a real equality that closes by `rfl`).
@@ -271,7 +271,7 @@ Debug aids: `PLOW_VERIFY_DUMP=<dir>` writes every request to a file for replay;
   [`ProofAudit.lean`](../../lean-plow/ProofAudit.lean) +
   [`proof-manifest.json`](../../lean-plow/proof-manifest.json).
 - Qualification: `plow_asset::certificates` (`qualify_packet`, `qualify_sidecar`),
-  `plowrt::certificate_checks` (`qualify_dir`, `plowrt qualify`).
+  `plowc::qualify` (`qualify_dir`, `plowc qualify`).
 - Handlers `checkA`…`checkG`:
   [`lean-plow/Plow/CLI/Checkpoints.lean`](../../lean-plow/Plow/CLI/Checkpoints.lean);
   stack-safe D/F twin

@@ -264,40 +264,11 @@ static __device__ void d_gemv_fp8_tc(__nv_bfloat16* C, const __nv_bfloat16* x, c
 /* Claim-ahead L2 prefetch (the FP8 twin of PLOW_GEMV_PREFETCH): issued between claim and gate, it
  * asks L2 for the head of every row the first round of the walk above starts on, so HBM works
  * while the block waits on the previous op's tail. Bytes per CTA; 0 = off. Hints only. */
-#ifndef PLOW_FP8TC_PF
-#define PLOW_FP8TC_PF 0
-#endif
-#if PLOW_FP8TC_PF
-__device__ __forceinline__ void fp8tc_pf(const uint8_t* W, const uint8_t* Wu, unsigned N, unsigned K,
-                                         unsigned slice, unsigned nblk) {
-    const unsigned per = (N + nblk - 1u) / nblk;
-    const unsigned n0 = slice * per, n1 = min(n0 + per, N);
-    if (n1 <= n0) return;
-    const unsigned nw = blockDim.x >> 5;
-    const unsigned ks = fp8tc_ksplit((n1 - n0 + 15u) / 16u, nw);
-    const unsigned rows = min(n1 - n0, (nw / ks) * 16u), mats = Wu ? 2u : 1u;
-    unsigned b = PLOW_FP8TC_PF / (rows * mats);
-    if (b > K) b = K;
-    b &= ~127u;
-    if (!b) return;
-    for (unsigned p = threadIdx.x; p < rows * mats; p += blockDim.x) {
-        const uint8_t* r = (p < rows ? W : Wu) + (size_t)(n0 + p % rows) * K;
-        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(r), "r"(b) : "memory");
-    }
-}
-#endif
 
 /* M > 8 runs out of line: its deeper, hoisted instantiation inlined beside the M <= 8 path cost
- * that path ~0.14 ms/step (12B B=1) with the code never executed. PLOW_FP8TC_NOINLINE2=0 inlines. */
-#ifndef PLOW_FP8TC_NOINLINE2
-#define PLOW_FP8TC_NOINLINE2 1
-#endif
+ * that path ~0.14 ms/step (12B B=1) with the code never executed. */
 template <bool Glu>
-#if PLOW_FP8TC_NOINLINE2
 static __device__ __noinline__
-#else
-static __device__ __forceinline__
-#endif
 void d_gemv_fp8_tc2(__nv_bfloat16* C, const __nv_bfloat16* x, const uint8_t* W, const uint8_t* Wu,
                     const float* sg, const float* su, unsigned M, unsigned N, unsigned K,
                     unsigned slice, unsigned nblk, float* red) {
@@ -306,11 +277,7 @@ void d_gemv_fp8_tc2(__nv_bfloat16* C, const __nv_bfloat16* x, const uint8_t* W, 
 
 /* 16 < M <= 32: four token groups, one pass over the weights. Out of line for the same reason. */
 template <bool Glu>
-#if PLOW_FP8TC_NOINLINE2
 static __device__ __noinline__
-#else
-static __device__ __forceinline__
-#endif
 void d_gemv_fp8_tc4(__nv_bfloat16* C, const __nv_bfloat16* x, const uint8_t* W, const uint8_t* Wu,
                     const float* sg, const float* su, unsigned M, unsigned N, unsigned K,
                     unsigned slice, unsigned nblk, float* red) {

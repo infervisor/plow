@@ -30,7 +30,7 @@
 # from 1 row (one role layout across the routed rungs).
 #
 # Single block (layers 2..4, GDN + full attention, ctx 1K, H100 2026-10-30, nv-block-ab four frozen
-# arms, ceilings 3094 GB/s / 1407 FP8 TFLOP/s; evidence /opt/dlami/nvme/lava-tts/docs-review/fp8hub)
+# arms, ceilings 3094 GB/s / 1407 FP8 TFLOP/s; evidence <lab scratch>/docs-review/fp8hub)
 # vs the previous canonical packet (plow per-row re-quantization of the BF16 checkpoint, OUTER_VEC
 # Lt from 2 rows, M1 TMA GEMV at 1 row): decode B1/2/4/8/16/32/48 0.722/0.720/0.724/0.735/0.751/0.798/
 # 0.872 ms = -10.5/-25.5/-22.7/-21.9/-23.2/-22.8/-20.2 % (34-49 % of the block floor); prefill
@@ -38,7 +38,7 @@
 # output vs the BF16 block on one synthetic input: rel 0.033 (re-quantized 0.037).
 #
 # FP32-reference gate peers: vLLM 0.29.0 serving this checkpoint (captures 2026-10-25,
-# /opt/dlami/nvme/lava-tts/qwen38/fp32gate/vllm029-fp8-c{1,8,32}.json; server log
+# <lab scratch>/qwen38/fp32gate/vllm029-fp8-c{1,8,32}.json; server log
 # vllm029-fp8-server.log): Fp8LinearMethod = FlashInferFp8DeepGEMMDynamicBlockScaledKernel with
 # DeepGEMM E8M0 scales (vLLM rounds the published scales to powers of two on Hopper), FLASH_ATTN v3,
 # --max-model-len 16384, gdn_prefill_backend triton.
@@ -48,7 +48,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1-fp8"
 status = "emits"
-plow_git = "4e152f9cb805a46a6f7ee58a6f6a204d47413e64"
+plow_git = "6a4ccff51e729669e8acb480b3ba6323459435d5"
 network = "qwen3.5"
 
 [target]
@@ -165,7 +165,7 @@ gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one sh
 
 # Production mix (2026-10-30, plowrt fb618c6c6 on branch qwen-fp8-hub, packet 7af35fe6fee0, [serve.env]
 # below, cuBLASLt 13.4; llm_grid.sh --prod, 0.45 sessions/s, 2 repeats, --prod-fidelity; evidence
-# /opt/dlami/nvme/lava-tts/docs-review/fp8hub/qual/run/qwenfp8). FP32 gate PASS at c1/c8/c32 at the
+# <lab scratch>/docs-review/fp8hub/qual/run/qwenfp8). FP32 gate PASS at c1/c8/c32 at the
 # default thresholds, every criterion ahead of the vLLM 0.29 hub-FP8 peer. campaign.py report against
 # vLLM 0.29 serving the same checkpoint (MATCHED, EQUIVALENT; report/comparison.md): total tok/s 9812 vs
 # 9920 (0.99x), TTFT P99 1556 vs 846 ms (1.84x), TPOT P99 88.1 vs 44.0 ms (2.00x; all P99s spread-
@@ -185,7 +185,7 @@ nprompt = 32
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py): QWEN38_FP32_REF = the BF16 recipe's
 # reference; QWEN38_FP8_FP32_VLLM{,_C8,_C32} = vLLM 0.29 serving the hub FP8 checkpoint
 # (Qwen/Qwen3.8-27B-FP8, --max-model-len 16384, gdn_prefill_backend triton) captured at c1, c8
-# and c32 (this box: /opt/dlami/nvme/lava-tts/qwen38/fp32gate/vllm029-fp8-c*.json). Each plow
+# and c32 (this box: <lab scratch>/qwen38/fp32gate/vllm029-fp8-c*.json). Each plow
 # concurrency scores against the peer at the same concurrency; thresholds are the gate's
 # defaults (the slack the BF16 peers needed is gone with them).
 [gates]

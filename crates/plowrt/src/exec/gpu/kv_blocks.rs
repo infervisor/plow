@@ -620,11 +620,15 @@ impl SnapBlocks for BlockServe {
                     queued += 1;
                 }
             }
+            let us = t0.elapsed().as_micros() as u64;
             if queued > 0 {
                 let mut st = self.stats.lock();
                 st.restores += 1;
                 st.restore_blocks += queued;
-                st.restore_us += t0.elapsed().as_micros() as u64;
+                st.restore_us += us;
+            }
+            if queued > 0 && crate::config::RuntimeConfig::get().pf_packlog {
+                eprintln!("PACKLOG RESTORE handle={handle} queued={queued} us={us}");
             }
             return Ok(());
         }
@@ -639,7 +643,15 @@ impl SnapBlocks for BlockServe {
             Some(h) => h.iter().map(|&(_, _, id)| id).collect(),
             None => return false,
         };
-        self.store.off_device_any(&ids)
+        let pending = self.store.off_device_any(&ids);
+        if pending && crate::config::RuntimeConfig::get().pf_packlog {
+            let [host, restoring, held] = self.store.off_device_detail(&ids);
+            eprintln!(
+                "PACKLOG PENDING handle={handle} blocks={} host={host} restoring={restoring} held={held}",
+                ids.len()
+            );
+        }
+        pending
     }
 
     fn reap(&self) {

@@ -537,6 +537,9 @@ impl SharedAsr {
                 round: 0,
                 cached: None,
                 mm: None,
+                export: None,
+                import: None,
+                prompt_logprobs: false,
             },
         };
         // Released once the job is on the channel: the dispatcher drains it, not closes on it.
@@ -771,10 +774,10 @@ pub(super) async fn route(
         attempts += 1;
         let (key, mux) = match dp.as_deref() {
             Some(set) => {
-                if let Err(e) = state.dp_admit(set).await {
+                if let Err(e) = state.dp_admit(set, false).await {
                     return Err(e.with_retry_after(failure(StatusCode::SERVICE_UNAVAILABLE, &e)));
                 }
-                match state.dp_route(set, session, None, exclude) {
+                match state.dp_route(set, session, None, exclude, false) {
                     Some((rank, mux, _, _)) => {
                         exclude |= 1 << rank;
                         (set.ranks[rank].key.clone(), Some(mux))

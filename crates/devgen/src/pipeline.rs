@@ -232,6 +232,20 @@ pub struct DenseF32ProgramStage<'a> {
     /// Otherwise run 3xTF32 tensor cores (FP32-accurate) instead of FP32 FFMA.
     pub tf32x3: bool,
     pub layer_norm: Option<DenseLayerNorm<'a>>,
+    /// Split K over the shared split-K scratch when the tiles leave CUs idle. The program must
+    /// order every split dense after the previous one completes (they share the scratch).
+    pub split_k: bool,
+    /// Elementwise chain after the rounding (no LayerNorm prologue).
+    pub post: Option<DensePost>,
+}
+
+/// DenseGemmF32 post chain: `table` = f32 `[lo0, hi0, lo1, hi1]`.
+#[derive(Clone, Copy)]
+pub struct DensePost {
+    pub table: u32,
+    pub clamp: bool,
+    pub silu_round: bool,
+    pub clamp_next: bool,
 }
 
 pub struct InitializedAddF32Stage<'a> {
@@ -933,12 +947,7 @@ impl PacketPrefix {
         }
         // Declared under either split, so both lowerings share one tensor table.
         let splitk = if tensor_cores {
-            builder.tensor(
-                DENSE_SPLITK_SCRATCH,
-                (u64::from(DENSE_SPLITK_TICKETS)
-                    + u64::from(self.model.n_cu) * DENSE_SPLITK_SLOTS_PER_CU * 64 * 64)
-                    * 4,
-            )
+            builder.tensor(DENSE_SPLITK_SCRATCH, dense_splitk_bytes(self.model.n_cu))
         } else {
             packet::dev::TENSOR_NONE
         };
@@ -2514,6 +2523,12 @@ impl StageProgram {
             f32_bytes(product(&[stage.rows, stage.output_width])?)?,
             "dense output",
         )?;
+        if let Some(post) = stage.post {
+            if stage.layer_norm.is_some() {
+                return Err("dense post chain with a layer-norm prologue".into());
+            }
+            self.input(post.table, 16, "dense post table")?;
+        }
         let ln_round = stage.layer_norm.is_some_and(|ln| ln.round_bf16);
         let tensor_cores =
             stage.operands_bf16_exact || (ln_round && stage.weight_type == DenseWeight::Bf16);
@@ -2523,15 +2538,41 @@ impl StageProgram {
             | (u32::from(tensor_cores) << 3)
             | (u32::from(!tensor_cores && stage.tf32x3) << 4)
             | (u32::from(stage.layer_norm.is_some()) << 5)
-            | (u32::from(ln_round) << 6);
-        let units = if tensor_cores || stage.tf32x3 {
+            | (u32::from(ln_round) << 6)
+            | stage.post.map_or(0, |p| {
+                u32::from(p.clamp) << 8
+                    | u32::from(p.silu_round) << 9
+                    | u32::from(p.clamp_next) << 10
+            });
+        let split_k = stage.split_k && tensor_cores;
+        let units = if split_k {
+            u64::from(dense_blocks(
+                stage.rows,
+                stage.output_width,
+                stage.input_width,
+                true,
+                true,
+                self.builder.n_cu(),
+            ))
+        } else if tensor_cores || stage.tf32x3 {
             u64::from(stage.rows.div_ceil(64)) * u64::from(stage.output_width.div_ceil(64))
         } else {
             u64::from(stage.rows.div_ceil(128)) * u64::from(stage.output_width.div_ceil(128))
         };
+        let scratch = if split_k {
+            self.builder.tensor(
+                DENSE_SPLITK_SCRATCH,
+                dense_splitk_bytes(self.builder.n_cu()),
+            )
+        } else {
+            packet::dev::TENSOR_NONE
+        };
         self.emit(DevOp::DenseGemmF32, units, deps, output, |d| {
-            d.t[..4].copy_from_slice(&[output, x, weight, bias]);
+            d.t[..5].copy_from_slice(&[output, x, weight, bias, scratch]);
             d.t[5..8].copy_from_slice(&prologue);
+            if let Some(post) = stage.post {
+                d.t[5] = post.table;
+            }
             d.i[..4].copy_from_slice(&[
                 stage.rows,
                 stage.output_width,
@@ -2824,6 +2865,10 @@ fn conv1d_units(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32, n_cu
 const DENSE_SPLITK_SCRATCH: &str = "scratch.dense_f32_splitk";
 const DENSE_SPLITK_TICKETS: u32 = 1024;
 const DENSE_SPLITK_SLOTS_PER_CU: u64 = 8;
+
+fn dense_splitk_bytes(n_cu: u32) -> u64 {
+    (u64::from(DENSE_SPLITK_TICKETS) + u64::from(n_cu) * DENSE_SPLITK_SLOTS_PER_CU * 64 * 64) * 4
+}
 
 /// DenseGemmF32 slices, mirroring the interpreter's decomposition (op_speech_f32.cuh): FP32 FFMA
 /// uses 128x128 tiles; the tensor-core path 64x64 tiles, split over K (BK = 64) until the tiles

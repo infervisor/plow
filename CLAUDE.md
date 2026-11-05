@@ -102,6 +102,10 @@ kept writing throwaway probes and re-hitting the same environment failures on le
 * Reuse validated tuning evidence across commits when source and object hashes, compiler flags,
   kernel geometry, hardware and correctness match. Record the commit for traceability, but do not
   make identical commit hashes a qualification requirement.
+* Emits run CPU-only outside GPU leases; leases are for probes, gates and benches only.
+* A distribution bundle carries only plow-produced data (packets, objects, plow-derived tensors);
+  HF weights and HF files come from the recipe's HF pin. Every release asset passes push → load
+  into a clean home → `plowrt serve --model` → its accuracy gate. Details: `agent-tools.md` §9.
 
 ## Core Rules
 

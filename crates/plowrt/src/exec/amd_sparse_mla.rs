@@ -24,45 +24,6 @@ fn window_launches(rows: u32, fp8: bool, single_pack: bool, csr: bool) -> usize 
     }
 }
 
-/// `PLOW_NATIVE_LAUNCH_TIMING`: drain after each launch of a native route and report the split.
-pub(super) struct SplitTimer {
-    laps: Option<(std::time::Instant, Vec<(&'static str, f64)>)>,
-}
-
-impl SplitTimer {
-    pub fn start(be: &HsaBackend) -> Result<Self> {
-        let on = crate::config::RuntimeConfig::get().amd.native_launch_timing;
-        if on {
-            be.synchronize_native_lap()?;
-        }
-        Ok(Self {
-            laps: on.then(|| (std::time::Instant::now(), Vec::new())),
-        })
-    }
-
-    pub fn lap(&mut self, be: &HsaBackend, name: &'static str) -> Result<()> {
-        if let Some((t, laps)) = &mut self.laps {
-            be.synchronize_native_lap()?;
-            laps.push((name, t.elapsed().as_secs_f64() * 1e6));
-            *t = std::time::Instant::now();
-        }
-        Ok(())
-    }
-
-    pub fn report(&self, route: &str, rows: u32) {
-        if let Some((_, laps)) = &self.laps {
-            let parts: Vec<String> = laps
-                .iter()
-                .map(|(n, us)| format!("{n}_us={us:.1}"))
-                .collect();
-            eprintln!(
-                "PLOW_NATIVE_LAUNCH_TIMING route={route} rows={rows} {}",
-                parts.join(" ")
-            );
-        }
-    }
-}
-
 const OBJECT_HASH: &str = "cd8fa62e18abada15beeeedd49357bcc1e9e2eee7353d038533f30cac93c3607";
 const OBJECT: &str = "mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co";
 
@@ -1517,29 +1478,19 @@ mod rowsplit_scratch_tests {
 
 impl SparseMla {
     pub fn needs_prepare(&self, route: Route, rank: u32) -> Result<bool> {
-        let clear = route.active
-            && route.is_rowsplit()
-            && crate::config::RuntimeConfig::get().amd.rowband_clear_ws;
-        let missing = match route.csr_key(rank)? {
+        Ok(match route.csr_key(rank)? {
             Some((prior, rows)) => !self
                 .lo
                 .as_ref()
                 .ok_or_else(|| RuntimeError::Rejected("sparse CSR allocation missing".into()))?
                 .matches(prior, rows),
             None => false,
-        };
-        Ok(clear || missing)
+        })
     }
 
     pub fn prepare_quiescent(&self, be: &HsaBackend, route: Route, rank: u32) -> Result<()> {
         be.require_quiescent()?;
         let key = route.csr_key(rank)?;
-        if route.active
-            && route.is_rowsplit()
-            && crate::config::RuntimeConfig::get().amd.rowband_clear_ws
-        {
-            self.clear_workspace_quiescent(be)?;
-        }
         if let Some((prior, rows)) = key {
             self.lo
                 .as_ref()
@@ -1664,43 +1615,6 @@ impl SparseMla {
             splits,
             lo,
         })
-    }
-
-    /// DIAGNOSTIC (`PLOW_ROWBAND_CLEAR_WS`). Zero every byte of the sparse workspace and the
-    /// lower-half CSR, and forget the CSR's staged key, so a row-band dispatch sees exactly the
-    /// device state a freshly loaded server would give it.
-    ///
-    /// It exists to decide ONE question. The row-band wrong-answer defect is triggered by any
-    /// ordinary (program 3) execution in the 8192 bucket: run one first on a fresh server and
-    /// every later row-band chunk is wrong, permanently; run the row-band program first and
-    /// everything after is right (`rbfault13`/`14`/`15`). This workspace is the only device
-    /// memory the two paths share that no per-sequence state clear covers -- it is allocated in
-    /// [`SparseMla::load`], not in the packet's tensor table. If clearing it here makes the
-    /// poisoned sequence correct, the carrier is in this allocation and the next step is to
-    /// bisect its regions; if it does not, the whole allocation is exonerated in one run and the
-    /// carrier is elsewhere (interpreter activations, KV, or the peer slots).
-    ///
-    /// Deliberately slow and deliberately off by default: a full zero of a workspace sized for
-    /// the packet's max rows is hundreds of MB of H2D per dispatch.
-    fn clear_workspace_quiescent(&self, be: &HsaBackend) -> Result<()> {
-        be.require_quiescent()?;
-        if let Some(lo) = self.lo.as_ref() {
-            lo.forget();
-        }
-        const CHUNK: usize = 4 << 20;
-        let zeros = vec![0u8; CHUNK];
-        for mem in std::iter::once(&self._scratch).chain(self.lo.as_ref().map(|l| &l.mem)) {
-            let mut off = 0u64;
-            while off < mem.len {
-                let n = CHUNK.min((mem.len - off) as usize);
-                EngineDevice::upload(be, mem, off, &zeros[..n])?;
-                off += n as u64;
-            }
-        }
-        if let Some(lo) = self.lo.as_ref() {
-            lo.forget();
-        }
-        Ok(())
     }
 
     pub fn enqueue(
@@ -1860,7 +1774,6 @@ impl SparseMla {
         let t = route.inst.t;
         let fp8 = route.scale.is_some();
         let row0 = u64::from(w.row0);
-        let mut timer = SplitTimer::start(be)?;
         let single =
             window_launches(w.rows, fp8, self.pack_fp8_single.is_some(), csr.is_some()) == 2;
         if csr.is_some() && !single {
@@ -1910,7 +1823,6 @@ impl SparseMla {
         } else {
             be.launch(self.pack, 304, 256, 0, bytemuck::bytes_of(&pack))?;
         }
-        timer.lap(be, "pack")?;
         let mut args = [0u64; 40];
         args[0] = if single {
             addr(t[0]) + row0 * 8 * 512 * 4
@@ -1937,16 +1849,7 @@ impl SparseMla {
             256,
             bytemuck::cast_slice(&args),
         )?;
-        timer.lap(be, "attention")?;
         if single {
-            timer.report(
-                if csr.is_some() {
-                    "sparse_mla_lo"
-                } else {
-                    "sparse_mla_single"
-                },
-                w.rows,
-            );
             return Ok(2);
         }
         let reduce = ReduceArgs {
@@ -1958,8 +1861,6 @@ impl SparseMla {
             pad: 0,
         };
         be.launch(self.reduce, 304, 256, 0, bytemuck::bytes_of(&reduce))?;
-        timer.lap(be, "reduce")?;
-        timer.report("sparse_mla", w.rows);
         Ok(3)
     }
 
@@ -2009,7 +1910,6 @@ impl SparseMla {
             u64::from_le_bytes(tensor_table[at..at + 8].try_into().unwrap())
         };
         let t = route.inst.t;
-        let mut timer = SplitTimer::start(be)?;
         let args = PackSingleArgs {
             base: PackFp8Args {
                 base: PackArgs {
@@ -2031,7 +1931,6 @@ impl SparseMla {
             ml: addr(t[1]),
         };
         be.launch(pack, 304, 256, 0, bytemuck::bytes_of(&args))?;
-        timer.lap(be, "pack")?;
         let index_row0 = if route.local_index {
             0
         } else {
@@ -2104,8 +2003,6 @@ impl SparseMla {
                 bytemuck::cast_slice(&args),
             )?;
         }
-        timer.lap(be, "attention16")?;
-        timer.report("sparse_mla_rowsplit", w.rows);
         Ok(1 + GROUPS as usize)
     }
 }

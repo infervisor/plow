@@ -35,7 +35,7 @@
 # vs vLLM 0.1242, top1_decisive 0.9622, cont 0.5375, needle 1). With the tier off the same mix wins
 # every latency row (docs/bringup/results/gemma26b-h100-20261023/comparison.md); the tier costs
 # at 10 s think and wins at production's 45 s think (hit 71.7% vs 58.3%, lower TTFT and TPOT), so
-# it stays auto. Evidence: /opt/dlami/nvme/lava-tts/kvstore-scratch/strict-g26-tier23.
+# it stays auto. Evidence: <lab scratch>/kvstore-scratch/strict-g26-tier23.
 # The re-emit from the plow_git below (packet faaebced1d4a) keeps Kit 2's `union`, `tuning` and
 # weights.json byte for byte; its manifest drops the removed snapshot knobs from the serve defaults
 # and excludes the new speech opcodes from every object. c16 FP32 gate PASS on it (kl_mean 0.2081
@@ -53,7 +53,7 @@ namespace = "infervisor"
 name = "gemma-4-26b-a4b"
 label = "sm90a-h100-tp1-fp8"
 status = "validated"
-plow_git = "2dabbe2b3f82129d4f905707080b0d2061d768f1"
+plow_git = "6a4ccff51e729669e8acb480b3ba6323459435d5"
 network = "gemma4"
 
 [target]
@@ -122,7 +122,7 @@ PLOW_EMIT_DECODE_CUBLASLT = "1"
 # 0.783/0.826/0.783 (1 of 3 PASS). Every KL and top-1 criterion passes on all variant runs; the c32
 # failures are cont_decisive (one case = 0.0217 under this recipe's c16-calibrated 0.045 margin) and
 # hit the production packet too: no clear regression vs production, but no c32 PASS either. Held until a
-# c32 gate policy (margin or baseline-relative acceptance) is decided. Evidence: /opt/dlami/nvme/lava-tts/route-sweep (B/g26fp8-lt64,
+# c32 gate policy (margin or baseline-relative acceptance) is decided. Evidence: <lab scratch>/route-sweep (B/g26fp8-lt64,
 # B/g26fp8-lt8, B/g26fp8-lt128, gates/g26fp8-lt64, gates/g26fp8-long, gates/g26fp8-c32, gates/g26fp8-c32r, peer32).
 # 2026-10-28, perf-for-accuracy rule (docs/bringup/agent-tools.md "Gate relaxation for significant
 # perf gains") at c32 vs the c32 peer: gain qualifies (rung 32 -9..-14%), accuracy does not. Bounds
@@ -137,7 +137,6 @@ PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_PF_LADDER_APPEND = "256,1088,1152,2112,4160,4224"
 PLOW_FUSE_ARGMAX = "1"
-PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # Emit-time on purpose: plowc compiles the decode interpreters (interp_sm90a{,_fp8kv,_gw}.cubin,
 # whose hashes change with it) and nvcc appends this; the [objects] script builds no op_moe object.
 # step_bench decode with vs without: B4/B8/B16 6.74/8.21/12.25 vs 7.15/9.36/16.24 ms, B1/B2 +1.5%.
@@ -145,7 +144,7 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # FP32 KL tail. 2026-10-16 g26-attr2 on the 9641938b plowrt, all five serve knobs, 8 + 4 runs per arm, one scorer:
 # P1-only vs P1+WPR kl_p95 median 0.958 vs 1.105 (Mann-Whitney p 0.005), kl_trim_mean 0.123 vs 0.144 (p 0.001),
 # kl_mean p 0.011; P1+WPR failed 6 of 12. RG8 replaces the FP8-KV decode attention body WPR tuned.
-# Evidence: /opt/dlami/nvme/lava-tts/g26next/er/attr2/ATTR2.txt.
+# Evidence: <lab scratch>/g26next/er/attr2/ATTR2.txt.
 # -DPLOW_NV_FA_RG8=2: FP8-KV row-group decode item at hd256 (8 rows/warp) and hd512 (4 rows/warp) replaces those
 # bodies (qualified 2026-10-15): decode step vs the WPR packet at ctx 1024/5600/16000 B1 -8..-11%, B16 -12/-16/-25%,
 # B32 -12/-20/-31% (B32 ctx16000 25.95 -> 17.99 ms), VMM kv_len 4094/4095/8191 clean; probe relL2 vs FP64 identical to
@@ -160,13 +159,13 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 # -DPLOW_NV_ROUTER_V9=1: one-round router score body at B<=16 (2026-10-18, bit-exact): step_bench ctx 6144 vs the
 # same recipe build without it B1 4.392/4.389, B4 6.066/5.934, B8 7.132/7.031, B16 9.617/9.473 ms, digests identical on
 # B1..B128 and ctx 4094/4095/8191; replay A/B (2 interleaved rounds) TPOT p50 9.85 -> 9.79 ms, 0 errors.
-# Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-router (runs/gb*, replay.txt).
+# Evidence: <lab scratch>/g26-perf-push/g26-router (runs/gb*, replay.txt).
 # -DPLOW_NV_FA_RG8S=1: the RG8 decode body streams each iteration's K/V rows and scales through a warp-private
 # two-stage cp.async smem ring (launch arena 40960 -> 82560 B); same lane map and arithmetic, bit-identical.
 # Qualified 2026-10-18 (g26-attn): step_bench ctx 6144 B1/B2/B4/B8/B16 4.38/5.07/6.08/7.11/9.59 -> 4.37/5.01/5.89/6.86/
 # 9.02 ms (with the RG8 word-convert commit), TOK_STREAM digests identical on every rung and at VMM kv_len
 # 4094/4095/4096/8191/8192 x B1/B4/B16; prod-fidelity replay 1.8/s TPOT p50/p99 10.02/20.71 -> 9.47/19.18 ms, TTFT
-# p50/p99 45.2/249.3 -> 42.8/227.7 ms, 0 errors. Evidence: /opt/dlami/nvme/lava-tts/g26-perf-push/g26-attn.
+# p50/p99 45.2/249.3 -> 42.8/227.7 ms, 0 errors. Evidence: <lab scratch>/g26-perf-push/g26-attn.
 NVCC_APPEND_FLAGS = "-DPLOW_MOE_FP8_DEDUP=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_ROUTER_V8=1 -DPLOW_NV_TOPK_V4=1 -DPLOW_NV_ROUTER_V9=1 -DPLOW_NV_FA_RG8S=1"
 PLOW_EMIT_MOE_PF_LT = "1"
 # Dense gate|up as two FP8 cuBLASLt GEMMs + Glu/Quant (qualified 2026-10-15, packet bd9c0722e368, plowrt 2dff2171):
@@ -202,7 +201,7 @@ PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 # native on the same binary 3 of 3 PASS kl_p95 1.051/0.985/0.981, kl_trim 0.151/0.145/0.153 (the
 # miss is the c32 re-roll, thresholds unchanged). Prod-fidelity replay 1.8/s, 2 reps, vs the vLLM
 # 0.29 arm: TTFT P99 260.7 ms (0.71x), TPOT P99 22.3 ms (0.69x), throughput 1.00x, SLO 100%.
-# Evidence: /opt/dlami/nvme/lava-tts/lib-attn/promo (gate-g26, ctl, prod-g26-lib).
+# Evidence: <lab scratch>/lib-attn/promo (gate-g26, ctl, prod-g26-lib).
 PLOW_BUILD_FA4_HD512 = "1"
 
 [emit_roles.env]
@@ -228,7 +227,7 @@ PLOW_PF_INTERLEAVE = "0"
 # after load 26 -> 52 GiB for the KV admission budget and the prefix cache. Production chat (no
 # session ids, 2.2 req/s, ~5.7K-token prompts, human think times; replay --think-median-s 45) with
 # the prompt-end-only publish: cached tokens 32.7% -> 47.4%, TTFT p50 246 -> 192 ms (2026-10-13,
-# /opt/dlami/nvme/lava-tts/g26-churn/ab-*). Costs per-admission ring mapping: -6% tok/s under
+# <lab scratch>/g26-churn/ab-*). Costs per-admission ring mapping: -6% tok/s under
 # prefill overload (4.5 req/s), nothing at production concurrency (0-4 running).
 PLOW_VMM_LIVE_RINGS = "1"
 PLOW_MULTISTEP = "0"
@@ -238,11 +237,11 @@ PLOW_LT_FP8_FAST_ACCUM_MAX_K = "8192"
 # algorithm). 2026-10-16 g26-attr3 on the 9641938b plowrt, c16 FP32 gate, all five serve knobs, 6 runs per arm vs
 # production (P1 bd9c0722 on plowrt 4386a5c2, 23 runs): this packet with the terminal on Lt failed 3 of 6
 # (kl_p95 1.153), with PLOW_TERMINAL_LT=0 passed 6 of 6 (kl_p95 median 0.856; top1_decisive 0.960-0.961 vs
-# production 0.957-0.964, Mann-Whitney p 0.27; trim p 0.49). Evidence: /opt/dlami/nvme/lava-tts/g26next/er/attr3/ATTR3.txt.
+# production 0.957-0.964, Mann-Whitney p 0.27; trim p 0.49). Evidence: <lab scratch>/g26next/er/attr3/ATTR3.txt.
 PLOW_TERMINAL_LT = "0"
 PLOW_LT_RUNG_ALGOS = "true"
 # Production-fidelity replay A/B on H100, 2026-10-17 (agentic_turns --open-loop --prod-fidelity --rate 1.8, 300 s,
-# same packet cf7aadf783bf; /opt/dlami/nvme/lava-tts/g26-opt-v2-validate): budget 60 + force 0 + interleave 0 +
+# same packet cf7aadf783bf; <lab scratch>/g26-opt-v2-validate): budget 60 + force 0 + interleave 0 +
 # strict publish = production (TTFT p50/p99 45/242 ms, TPOT 10.4/20.5 ms, cached 79.8%, goodput 100%).
 # Budget 12 + PF_ITL_FORCE=1 + interleave 1024 + strict 0: TTFT p50 12.7 s, goodput 5.4%. Budget 12 alone (force 0):
 # TTFT p50/p99 109/1637 ms, TPOT 20.5/31.3 ms. Strict publish off: cache-hit greedy output differed from cold on
@@ -265,7 +264,7 @@ PLOW_KV_POOL_MIB = "2048"
 # verify (decode objects plus their `_rs` row-slot twins) and the draft programs into the packet, the drafter reads the
 # published BF16 assistant weights (no FP8 twins since 2026-10-30), serve = true makes PLOW_SPEC=1 the
 # packet's serve default. Spec runs on pure decode ticks (no prefill, nothing queued) of <= 16 verify rows.
-# Qualified 2026-10-20 (g26-mtp P3, plowrt e41abda0; evidence /opt/dlami/nvme/lava-tts/g26-mtp/P3-DESIGN.md "Results",
+# Qualified 2026-10-20 (g26-mtp P3, plowrt e41abda0; evidence <lab scratch>/g26-mtp/P3-DESIGN.md "Results",
 # p3/{g1,ga,gb,gc,s1}): plain decode on the twin packet = Kit 1 (ctx 6144 B1..B128 within noise, TOK_STREAM digests
 # identical); FP32 gate spec on vs off, same packet + binary: c1 kl_trim_mean 0.140-0.141 vs 0.144, c16 0.152-0.161 vs
 # 0.154-0.168, long c4 PASS 3/4 vs 3/3 (one cont_decisive 13/20 vs 13.5), trimmed KL 0.090-0.098 vs 0.102-0.111;
@@ -297,7 +296,7 @@ gate_prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one sh
 [rung_choices.PLOW_EMIT_ATTN_LIBRARY]
 # Library vs declared native role, every prefill rung (see the PLOW_BUILD_FA4_* comment above).
 label = "qualified"
-evidence = ["lib-attn 2026-10-29 bin3 4b261f8a, packet caf6c4a47ba6: chunk 128/512/1024/2048 2.32/0.74/0.51/0.42 -> 1.99/0.68/0.46/0.37 s; FP32 gate c1/c8/c16 PASS, c32 2 of 3", "/opt/dlami/nvme/lava-tts/lib-attn/promo (gate-g26, ctl, prod-g26-lib)", "docs/arch/28-library-attention.md"]
+evidence = ["lib-attn 2026-10-29 bin3 4b261f8a, packet caf6c4a47ba6: chunk 128/512/1024/2048 2.32/0.74/0.51/0.42 -> 1.99/0.68/0.46/0.37 s; FP32 gate c1/c8/c16 PASS, c32 2 of 3", "<lab scratch>/lib-attn/promo (gate-g26, ctl, prod-g26-lib)", "docs/arch/28-library-attention.md"]
 
 [rung_choices.PLOW_NO_GLU_FUSE]
 # Lt gate|up vs fused GLU role per prefill rung (see the PLOW_NO_GLU_FUSE comment above).

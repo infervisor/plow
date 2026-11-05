@@ -204,10 +204,10 @@ fn take<T: Copy>(buf: &[u8], off: &mut usize, n: usize, what: &str) -> Result<Ve
 /// * `hidden` — `i[0] / program.t` for every collective. Both one-shot and
 ///   two-shot packets carry `t·width`; the maximum width is the model hidden
 ///   size when narrower latent collectives are also present.
-/// * `slot_bytes` — `max(i[2])`, because slot A carries 0 and slot B carries the
-///   offset. `devgen` derives it from the LARGEST prefill chunk and bakes the
-///   same value into every program, so the max over all of them is that one
-///   value and not a per-program quantity.
+/// * `slot_bytes` — the smallest nonzero `i[2]`: slot A carries 0, slot B the
+///   offset and slot C (a tensor-parallel MoE layer's routed partial) twice it.
+///   `devgen` derives it from the LARGEST prefill chunk and bakes the same value
+///   into every program, so it is one value and not a per-program quantity.
 fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
     let (mut n_gpu, mut hidden, mut slot_bytes) = (0u32, 0u32, 0u64);
     for p in progs {
@@ -217,7 +217,9 @@ fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
             }
             n_gpu = n_gpu.max(d.i[1]);
             hidden = hidden.max(d.i[0] / p.t.max(1));
-            slot_bytes = slot_bytes.max(d.i[2] as u64);
+            if d.i[2] != 0 && (slot_bytes == 0 || (d.i[2] as u64) < slot_bytes) {
+                slot_bytes = d.i[2] as u64;
+            }
         }
     }
     // A tp==1 blob emits no collective at all, so "no collective" and "not
@@ -1008,6 +1010,7 @@ impl DevBlob {
             .collect();
         f(&Packet {
             n_cu: self.n_cu,
+            target: self.target,
             tp: self.tp.is_some(),
             prefill_count: self.decode_rung_lo(),
             tensors: &tensors,
@@ -1344,6 +1347,17 @@ impl DevProg {
         let seg_q8 = seg_v2 || v2_env == Some("q8");
         const FP8_OPS: [DevOp; 3] = [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8];
         const BF16_OPS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed];
+        // Compiled out of the lean GEMM object (interp_sm120.cu `!PLOW_NV_SEG_GEMM`): a segment
+        // carrying the native grouped-MoE prefill must run on the fat object, or it traps.
+        const LEAN_GEMM_EXCLUDED: [DevOp; 7] = [
+            DevOp::MoeRouterGemmaPf,
+            DevOp::MoeAlignGemmaPf,
+            DevOp::MoeGroupGluGemmaPf,
+            DevOp::MoeGroupDownGemmaPf,
+            DevOp::MoeCombineNormGemmaPf,
+            DevOp::MoeGroupGluGemmaPfW8a8,
+            DevOp::MoeGroupDownGemmaPfW8a8,
+        ];
         let mut class = vec![8u8; n_seg as usize];
         let mut exact_fa256 = vec![false; n_seg as usize];
         let mut other_in_exact_segment = vec![false; n_seg as usize];
@@ -1405,7 +1419,11 @@ impl DevProg {
                         && inst.i[6] != 0
                         && inst.i[7] != 0)
                 }
-                _ => op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16,
+                _ => {
+                    op == DevOp::FlashPrefill as u16
+                        || op == DevOp::FlashPrefillFp8 as u16
+                        || LEAN_GEMM_EXCLUDED.iter().any(|g| *g as u16 == op)
+                }
             };
             if flashy {
                 class[e.seg as usize] = 4;
@@ -1667,6 +1685,48 @@ mod tests {
             }
         );
         assert_eq!(program.seg_classes_with(policy).unwrap(), [4, 8]);
+    }
+
+    /// The lean GEMM object compiles out the native grouped-MoE prefill arms, so a segment that
+    /// carries one runs on the fat object under the default policy (26B BF16 on sm_120 trapped).
+    #[test]
+    fn native_moe_prefill_segment_is_fat_class() {
+        let inst = |op: DevOp| DevInst64 {
+            op: op as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [0; 8],
+            i: [0; 8],
+        };
+        let ent = |inst: u32, seg: u16| StreamEnt {
+            inst,
+            seg,
+            ..StreamEnt::default()
+        };
+        let program = DevProg {
+            t: 128,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 0 },
+            n_counter: 0,
+            insts: vec![
+                inst(DevOp::Gemm),
+                inst(DevOp::MoeGroupGluGemmaPf),
+                inst(DevOp::Gemm),
+            ],
+            stream: vec![ent(0, 0), ent(1, 0), ent(2, 1)],
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        assert_eq!(
+            program
+                .seg_classes_with(SegmentClassPolicy::default())
+                .unwrap(),
+            [4, 8]
+        );
     }
 
     /// `PLOW_TEST_BLOB=<model.pkt>` of a Gemma-4 H100 BF16 recipe: the classing the recipes used

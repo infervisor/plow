@@ -15,7 +15,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "nemotron-3.5-asr"
 label = "sm90a-h100-tp1"
-plow_git = "3e2fb6efc3f3d67f5b11649a5bdc057e5ab489da"
+plow_git = "6a4ccff51e729669e8acb480b3ba6323459435d5"
 network = "fastconformer-rnnt"
 doc = "docs/runtime/asr.md"
 
@@ -27,6 +27,8 @@ toolchain = "cuda-12.9-nix"
 units = 132
 num_gpus = 1
 parallel = "tp"
+# Largest offline encoder bucket, in feature frames (30 s); streams run past it.
+max_ctx = 3000
 
 [checkpoint]
 source = "hf:nvidia/nemotron-3.5-asr-streaming-0.6b"
@@ -35,6 +37,7 @@ file = "nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"
 
 [build]
 script = "scripts/asr/nvidia/nemotron_l4_build.sh"
+output = "nemotron.pkt"
 compiler = "crates/plowrt/examples/asr/nemotron_pipeline_compile.rs"
 feature_frames = "200,400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800,3000"
 joint_batch = 16

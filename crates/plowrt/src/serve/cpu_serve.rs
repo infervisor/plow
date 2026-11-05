@@ -1,6 +1,5 @@
 //! The CPU engine behind a served slug: `batch` sequence slots, prefill into a
-//! slot (whole prompt by default; `PLOW_CPU_PF_CHUNK=n` caps a tick to one
-//! compiled bucket of <= n rows), one batched greedy decode step per tick —
+//! slot (whole prompt), one batched greedy decode step per tick —
 //! the same shape as the single-GPU AMD engine, so it rides the mux's
 //! [`SeqEngine`] tick unchanged. Slot `i` of the mux IS engine slot `i`.
 
@@ -110,12 +109,6 @@ pub struct CpuServe {
     pf_pos: Vec<u32>,
     /// Compiled prefill buckets `(program, rows)`.
     buckets: Vec<(usize, u32)>,
-    /// Largest chunk one tick may prefill while other slots decode (`PLOW_CPU_PF_CHUNK`;
-    /// 0 = whole prompt, the default). MEASURED OFF: at 256 the summarize c=8 cell went from
-    /// TTFT 32 s / TPOT 1005 ms to 48 s / 1268 — every chunk re-streams all weights and a
-    /// rung-8 decode step (~400 ms) runs between chunks, while live slots still stall for a
-    /// whole chunk. Only faster prefill or packing slots into one program helps here.
-    pf_chunk: u32,
     /// The logits row holding each slot's latest token (prefill: 0, decode: the slot).
     lp_row: Vec<usize>,
     /// Rows a released slot still holds (its last sequence's `pos`): a session resume keeps
@@ -173,7 +166,6 @@ impl CpuServe {
                 "CPU serve blob has no prefill program".into(),
             ));
         }
-        let pf_chunk = crate::config::RuntimeConfig::get().cpu.prefill_chunk;
         // No manifest: only an exact continuation resumes.
         let ring_slack = eng
             .model()
@@ -205,7 +197,6 @@ impl CpuServe {
             token_batch = pack.is_some(),
             rungs = ?decode_rungs,
             prefill_buckets = ?buckets,
-            pf_chunk,
             engine = %eng.describe(),
             stop_ids = ?ids,
             "slot serve engine ready"
@@ -224,7 +215,6 @@ impl CpuServe {
             max_ctx,
             pf_pos: vec![0; batch],
             buckets,
-            pf_chunk,
             lp_row: (0..batch).collect(),
             kept: vec![0; batch],
             resumed: vec![0; batch],
@@ -835,9 +825,8 @@ impl SeqEngine for CpuServe {
     }
 
     /// `tick_max_bucket` is the mux's interleave budget (u32::MAX when no slot decodes, so a
-    /// lone prompt still prefills in one tick); `pf_chunk` caps it further on the CPU, where a
-    /// 1105-token whole-prompt prefill stalled every live decode ~7 s (measured: c=8
-    /// summarize TPOT 933 ms vs 250 at c=1).
+    /// lone prompt still prefills in one tick); outside round-robin co-scheduling the whole
+    /// prompt prefills in one tick.
     fn prefill_chunked_at_most(
         &mut self,
         slot: usize,
@@ -845,15 +834,9 @@ impl SeqEngine for CpuServe {
         tick_max_bucket: u32,
     ) -> Result<Option<u32>> {
         let cap = if crate::serve::policy::installed_co_sched() == super::cosched::CoSched::Rr {
-            tick_max_bucket.min(if self.pf_chunk == 0 {
-                u32::MAX
-            } else {
-                self.pf_chunk
-            })
-        } else if tick_max_bucket == u32::MAX || self.pf_chunk == 0 {
-            u32::MAX
+            tick_max_bucket
         } else {
-            tick_max_bucket.min(self.pf_chunk)
+            u32::MAX
         };
         self.prefill_chunk(slot, prompt, cap)
     }
