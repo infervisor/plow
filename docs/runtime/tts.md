@@ -45,7 +45,9 @@ conditioning. A changed speaker, incomplete upload or failed device step require
 Compatible depth prompts share packed prefill and their first predictor launch. A fully cached
 prefix can feed its terminal row straight into batched decode. Terminal overlay rows keep serial
 prefill because decode does not read those overlays. Host-controlled predictors bind each new
-request's controller and speaker memory before its first batched launch. Unified token-batch
+request's controller and speaker memory before its first batched launch. First-frame codes for
+completed prompts are staged together: adjacent slots share an upload, and all uploads share
+one synchronization before per-slot history resets. Unified token-batch
 programs still require per-row frame-code and overlay input support; enabling the flag alone is
 not sufficient. These paths require numerical and latency qualification before promotion.
 

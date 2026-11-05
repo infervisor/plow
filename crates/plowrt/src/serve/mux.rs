@@ -4132,6 +4132,25 @@ fn run_one_tick(
                         );
                     }
                     if !compact {
+                        if e.has_depth_stage() {
+                            let failed = {
+                                let seeds =
+                                    depth_seed_rows(&slots, cap, |i| e.packed_slot_ready(i));
+                                e.fish_seed_slots(&seeds).err().map(|err| {
+                                    let owners: smallvec::SmallVec<[usize; 32]> =
+                                        seeds.iter().map(|s| s.0).collect();
+                                    (err, owners)
+                                })
+                            };
+                            if let Some((err, owners)) = failed {
+                                note_fault(&mut tick_fault, &err);
+                                let msg = err.to_string();
+                                for i in owners {
+                                    fail_slot(&mut slots[i], &arena, fanout_err(&err, &msg));
+                                    e.retire_slot(i, false);
+                                }
+                            }
+                        }
                         for i in 0..slots.len().min(cap) {
                             let Some(s) = slots[i].as_ref() else { continue };
                             if s.step != 0 {
@@ -4180,13 +4199,10 @@ fn run_one_tick(
                             // A depth row's decode embeds the withheld row from `in.fish.dcodes`.
                             if s.speech.as_ref().is_some_and(|sp| sp.depth.is_some()) {
                                 let sp = s.speech.as_deref().expect("checked Some");
-                                let k = sp.frame_codes_per_row.max(1);
-                                let codes = sp.frame_codes.get((n - 1) * k..n * k).unwrap_or(&[]);
-                                let initialized = e.fish_seed_slot(i, codes).and_then(|()| {
+                                let initialized =
                                     sp.depth.and_then(|d| d.maya2).map_or(Ok(()), |plan| {
                                         e.maya2_bind(i, plan, sp.maya2_memory.as_ref())
-                                    })
-                                });
+                                    });
                                 if let Err(err) = initialized {
                                     note_fault(&mut tick_fault, &err);
                                     fail_slot(&mut slots[i], &arena, err);
@@ -8048,6 +8064,36 @@ fn depth_prompt_can_pack(s: &Slot) -> bool {
                     .iter()
                     .all(|&p| p as usize + 1 < s.prompt_ids.len())
         })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn depth_seed_rows(
+    slots: &[Option<Slot>],
+    cap: usize,
+    ready: impl Fn(usize) -> bool,
+) -> smallvec::SmallVec<[(usize, &[u32]); 32]> {
+    slots
+        .iter()
+        .enumerate()
+        .take(cap)
+        .filter_map(|(i, s)| {
+            let s = s.as_ref()?;
+            let sp = s.speech.as_ref().filter(|sp| sp.depth.is_some())?;
+            let n = s.prompt_ids.len();
+            if s.step != 0
+                || s.respond.is_closed()
+                || n == 0
+                || !ready(i)
+                || s.pf_pos + 1 != n
+                || !packed_prompt_done(slots, i, 1)
+            {
+                return None;
+            }
+            let k = sp.frame_codes_per_row.max(1);
+            let codes = sp.frame_codes.get((n - 1) * k..n * k).unwrap_or(&[]);
+            Some((i, codes))
+        })
+        .collect()
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -13886,6 +13932,33 @@ mod tests {
         assert!(depth_prompt_can_pack(s));
         s.speech.as_mut().unwrap().overlay_pos = vec![2];
         assert!(!depth_prompt_can_pack(s));
+    }
+
+    #[test]
+    fn depth_seed_rows_include_only_live_completed_prompt_tails_in_slot_order() {
+        let mut slots = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..6 {
+            let (mut slot, rx) = prefill_test_slot();
+            slot.as_mut().unwrap().speech = Some(Box::new(prefix_test_speech()));
+            slots.push(slot);
+            receivers.push(rx);
+        }
+        slots[0].as_mut().unwrap().pf_pos = 1;
+        slots[2].as_mut().unwrap().step = 1;
+        receivers[3].close();
+        slots[4]
+            .as_mut()
+            .unwrap()
+            .speech
+            .as_mut()
+            .unwrap()
+            .frame_codes
+            .clear();
+        let rows = depth_seed_rows(&slots, 6, |i| i != 5);
+        assert_eq!(rows.as_slice(), [(1, &[30, 31][..]), (4, &[][..])]);
+        assert!(depth_seed_rows(&slots, 1, |_| true).is_empty());
+        assert!(depth_seed_rows(&slots, 6, |_| false).is_empty());
     }
 
     #[cfg(feature = "cuda")]

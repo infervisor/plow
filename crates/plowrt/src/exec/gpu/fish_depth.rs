@@ -11,6 +11,8 @@ use crate::{Result, RuntimeError};
 
 use super::{DevProgram, GpuEngine, BLOCK};
 
+const STAGE_CONTROL_BYTES: usize = 8 + 16 + 8 + 4 + 4;
+
 struct Loaded {
     rows: u32,
     arg: DevProgram,
@@ -178,6 +180,35 @@ fn reject(e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Rejected(format!("fish depth: {e}"))
 }
 
+fn seed_frame_codes(
+    staging: &mut [u8],
+    seeds: &[(usize, &[u32])],
+    batch: usize,
+    codebooks: usize,
+) -> Result<usize> {
+    let bytes = seeds
+        .len()
+        .checked_mul(codebooks)
+        .and_then(|n| n.checked_mul(4))
+        .filter(|&n| n <= staging.len())
+        .ok_or_else(|| reject("seed staging capacity exceeded"))?;
+    if codebooks == 0
+        || codebooks > 64
+        || seeds
+            .iter()
+            .any(|&(slot, codes)| slot >= batch || codes.len() > codebooks)
+        || seeds.windows(2).any(|s| s[0].0 >= s[1].0)
+    {
+        return Err(reject("seed slots must be ordered, distinct and in range"));
+    }
+    staging[..bytes].fill(0);
+    for (row, &(_, codes)) in seeds.iter().enumerate() {
+        let start = row * codebooks * 4;
+        staging[start..start + codes.len() * 4].copy_from_slice(bytemuck::cast_slice(codes));
+    }
+    Ok(bytes)
+}
+
 impl FishDepth {
     /// The packet's depth stage, `None` when it carries none; read from the engine's own blob.
     pub(super) fn load_if_present(
@@ -261,7 +292,7 @@ impl FishDepth {
             })
             .collect::<Result<Vec<_>>>()?;
         let stage =
-            e.be.host_alloc_pinned(rows * (16 + 16 + 8) + e.batch * k * 4)?;
+            e.be.host_alloc_pinned(rows * STAGE_CONTROL_BYTES + e.batch * k * 4)?;
         let maya2 = match (maya2, manifest.depth_sampling) {
             (true, Some([t, k])) => Some(Maya2 {
                 slots: vec![None; e.batch],
@@ -709,7 +740,7 @@ impl GpuEngine {
             &mut args,
             Some(&self.stream),
         )?;
-        let codes_at = d.rows * 40;
+        let codes_at = d.rows * STAGE_CONTROL_BYTES;
         // SAFETY: as the uploads.
         unsafe {
             self.be.memcpy_dtoh_async(
@@ -757,32 +788,53 @@ impl GpuEngine {
     /// Seed `slot`'s decode frame input (`in.fish.dcodes[slot]`) with a withheld prompt row's
     /// codes (`codebooks` entries; missing = 0) and start its sampling history.
     pub fn fish_seed_slot(&mut self, slot: usize, codes: &[u32]) -> Result<()> {
-        let d = self.fish.as_ref().ok_or_else(|| reject("not enabled"))?;
+        self.fish_seed_slots(&[(slot, codes)])
+    }
+
+    pub fn fish_seed_slots(&mut self, seeds: &[(usize, &[u32])]) -> Result<()> {
+        if seeds.is_empty() {
+            return Ok(());
+        }
+        let result = self.fish_seed_slots_inner(seeds);
+        self.note_step_result(result.is_err());
+        result
+    }
+
+    fn fish_seed_slots_inner(&mut self, seeds: &[(usize, &[u32])]) -> Result<()> {
+        let d = self.fish.as_mut().ok_or_else(|| reject("not enabled"))?;
         let k = d.manifest.codebooks as usize;
-        if codes.len() > k {
-            return Err(reject("prompt row has more codes than the depth stage"));
-        }
-        let mut row = [0u32; 64];
-        let row = row
-            .get_mut(..k)
-            .ok_or_else(|| reject("too many codebooks"))?;
-        row[..codes.len()].copy_from_slice(codes);
+        let at = d.rows * STAGE_CONTROL_BYTES;
+        let stage = d
+            .stage
+            .as_mut_slice()
+            .get_mut(at..)
+            .ok_or_else(|| reject("seed staging missing"))?;
+        let bytes = seed_frame_codes(stage, seeds, self.batch, k)?;
         let h = usize::from(d.manifest.tensors.frame_codes);
-        let off = (slot * k * 4) as u64;
-        if off + (k * 4) as u64 > self.devp[h].len {
-            return Err(reject("slot out of range"));
+        if self.devp[h].len < (self.batch * k * 4) as u64 {
+            return Err(reject("seed tensor smaller than its slots"));
         }
-        // SAFETY: the range is inside the allocation (checked above) and `row` outlives the
-        // stream synchronize below.
-        unsafe {
-            self.be.memcpy_htod_async(
-                self.devp[h].base + off,
-                bytemuck::cast_slice(row),
-                &self.stream,
-            )?
-        };
+        let stage = &d.stage.as_slice()[at..at + bytes];
+        let mut row = 0;
+        for run in seeds.chunk_by(|a, b| b.0 == a.0 + 1) {
+            let slot = run[0].0;
+            let end = row + run.len();
+            // SAFETY: validated slot ranges; pinned staging survives errors and is unchanged
+            // until every upload completes at the shared stream synchronization.
+            unsafe {
+                self.be.memcpy_htod_async(
+                    self.devp[h].base + (slot * k * 4) as u64,
+                    &stage[row * k * 4..end * k * 4],
+                    &self.stream,
+                )?;
+            }
+            row = end;
+        }
         self.be.stream_synchronize(&self.stream)?;
-        self.fish_reset_slot(slot)
+        for &(slot, _) in seeds {
+            self.fish_reset_slot(slot)?;
+        }
+        Ok(())
     }
 
     /// The row of `act.hn` holding the last serial prefill's terminal hidden.
@@ -803,7 +855,7 @@ impl GpuEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::SpeakerMemory;
+    use super::{seed_frame_codes, SpeakerMemory};
     use std::sync::Arc;
 
     #[test]
@@ -821,5 +873,40 @@ mod tests {
         bound = SpeakerMemory::Null;
         assert!(bound.matches(None));
         assert!(!bound.matches(Some(&same)));
+    }
+
+    #[test]
+    fn frame_seed_staging_preserves_sparse_slot_order_and_zero_pads_short_rows() {
+        let mut stage = [0xff; 48];
+        let seeds: [(usize, &[u32]); 3] = [(0, &[11, 12]), (3, &[]), (7, &[71])];
+        let bytes = seed_frame_codes(&mut stage, &seeds, 8, 2).unwrap();
+        assert_eq!(bytes, 24);
+        let words: Vec<_> = stage[..bytes]
+            .chunks_exact(4)
+            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, [11, 12, 0, 0, 71, 0]);
+        assert_eq!(stage[bytes..], [0xff; 24]);
+        assert_eq!(seed_frame_codes(&mut stage, &[], 8, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn frame_seed_staging_rejects_invalid_batches_before_writing() {
+        let cases: &[&[(usize, &[u32])]] = &[
+            &[(0, &[1, 2, 3])],
+            &[(8, &[1])],
+            &[(1, &[1]), (1, &[2])],
+            &[(2, &[1]), (0, &[2])],
+        ];
+        for seeds in cases {
+            let mut stage = [0xaa; 32];
+            assert!(seed_frame_codes(&mut stage, seeds, 8, 2).is_err());
+            assert_eq!(stage, [0xaa; 32]);
+        }
+        let mut stage = [0xaa; 4];
+        assert!(seed_frame_codes(&mut stage, &[(0, &[1])], 8, 2).is_err());
+        assert_eq!(stage, [0xaa; 4]);
+        assert!(seed_frame_codes(&mut stage, &[(0, &[])], 8, 0).is_err());
+        assert!(seed_frame_codes(&mut stage, &[], 8, 65).is_err());
     }
 }
