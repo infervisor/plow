@@ -1,6 +1,6 @@
 //! Qwen3-ASR configuration (HuggingFace `config.json`).
 //!
-//! Qwen3-ASR pairs an audio front-end (2D-conv 4x subsampling + transformer encoder +
+//! Qwen3-ASR pairs an audio front-end (three strided 2D convolutions + transformer encoder +
 //! projection) with a Qwen3 text thinker decoder. Checkpoints typically nest them
 //! under `thinker_config`.
 
@@ -43,7 +43,7 @@ impl Default for Qwen3AudioConfig {
             output_dim: 2048,
             num_mel_bins: 128,
             downsample_hidden_size: 480,
-            downsample_rate: 4,
+            downsample_rate: 8,
             max_source_positions: 1500,
             torch_dtype: None,
         }

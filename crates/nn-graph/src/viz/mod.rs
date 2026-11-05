@@ -616,10 +616,7 @@ fn networks_for(
                     stage(
                         "audio_tower_conv",
                         "Audio tower: conv",
-                        format!(
-                            "2 strided Conv2d + GELU, {}x time subsampling",
-                            a.downsample_rate
-                        ),
+                        "3 strided Conv2d + GELU, 8x padded-time subsampling",
                     ),
                     stage(
                         "audio_tower_layers",
@@ -632,7 +629,7 @@ fn networks_for(
                     stage(
                         "audio_tower_proj",
                         "Audio tower: proj",
-                        "Projects audio features to the text hidden size",
+                        "LayerNorm, proj1 + GELU, proj2 to the text hidden size",
                     ),
                     stage(
                         "thinker",
