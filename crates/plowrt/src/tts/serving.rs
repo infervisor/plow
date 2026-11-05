@@ -2250,13 +2250,10 @@ async fn stream_task(
                     loop {
                         match rx.recv().await {
                             Some(StreamChunk::Token { id, frame, .. }) => {
-                                if c.push_codes(&mut codes, id, frame.as_deref()) {
+                                if let Some(frame) = c.take_frame(&mut codes, id, frame) {
                                     frames += 1;
                                     lm.frame();
-                                    if ftx
-                                        .send(SegMsg::Frame(codes[codes.len() - fc..].to_vec()))
-                                        .is_err()
-                                    {
+                                    if ftx.send(SegMsg::Frame(frame)).is_err() {
                                         return;
                                     }
                                 }

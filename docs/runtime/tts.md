@@ -50,6 +50,8 @@ completed prompts are staged together: adjacent slots share an upload, and all u
 one synchronization before per-slot history resets. Unified token-batch
 programs still require per-row frame-code and overlay input support; enabling the flag alone is
 not sufficient. These paths require numerical and latency qualification before promotion.
+The streaming LM drain hands off each complete frame as an owned buffer and retains only an
+incomplete token frame, rather than another copy of the utterance's code history.
 
 Reproduced 2026-09-27 at 7c0a7f7e into fresh directories (H100): every packet
 (`model.pkt`, `encoder.pkt`, `codec.pkt`, `s3gen.pkt`) byte-identical to the working assets,

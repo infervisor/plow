@@ -443,6 +443,22 @@ impl SpeechContract {
         }
     }
 
+    fn take_frame(
+        &self,
+        partial: &mut Vec<i32>,
+        id: u32,
+        frame: Option<Box<[u32]>>,
+    ) -> Option<Vec<i32>> {
+        if self.depth {
+            frame
+                .filter(|f| f.len() == self.frame_codes)
+                .map(|f| f.into_vec().into_iter().map(|x| x as i32).collect())
+        } else {
+            self.push_codes(partial, id, None)
+                .then(|| std::mem::take(partial))
+        }
+    }
+
     /// Codebook id of the `n`-th kept audio token, or `None` when `tok` is not the code its frame
     /// position expects (dropped, as the reference decoder drops out-of-range ids).
     pub fn code_of(&self, n: usize, tok: u32) -> Option<i32> {
@@ -1110,6 +1126,59 @@ mod tests {
         assert_eq!(c.code_of(1, 128266 + 7), None);
         assert_eq!(c.code_of(6, 128266 + 6 * 4096 + 4095), Some(4095));
         assert_eq!(c.code_of(0, 128258), None);
+    }
+
+    #[test]
+    fn stream_frames_match_accumulated_codes_without_retaining_history() {
+        let c = SpeechContract::from_pipeline(&pipeline()).unwrap();
+        let (mut history, mut partial, mut received) = (Vec::new(), Vec::new(), Vec::new());
+        for frame in 0..64 {
+            for book in 0..c.frame_codes {
+                assert!(!c.push_codes(&mut history, c.stops[0], None));
+                assert!(c.take_frame(&mut partial, c.stops[0], None).is_none());
+                let id = c.audio_token_base
+                    + book as u32 * c.codebook
+                    + (frame + book) as u32 % c.codebook;
+                let complete = c.push_codes(&mut history, id, None);
+                let next = c.take_frame(&mut partial, id, None);
+                assert_eq!(next.is_some(), complete);
+                if let Some(codes) = next {
+                    assert_eq!(codes.len(), c.frame_codes);
+                    received.extend(codes);
+                }
+                assert!(partial.len() < c.frame_codes);
+            }
+            assert!(partial.is_empty());
+            assert_eq!(received, history);
+        }
+    }
+
+    #[test]
+    fn depth_stream_frames_preserve_codes_and_reject_incomplete_rows() {
+        let mut c = SpeechContract::from_pipeline(&pipeline()).unwrap();
+        c.depth = true;
+        let mut partial = Vec::new();
+        for width in [16, 32] {
+            c.frame_codes = width;
+            for n in [0, width - 1, width + 1] {
+                assert!(c
+                    .take_frame(&mut partial, 0, Some(vec![1; n].into_boxed_slice()))
+                    .is_none());
+            }
+            assert!(c.take_frame(&mut partial, 0, None).is_none());
+            let codes: Vec<u32> = [0, 1, 2047, i32::MAX as u32, 1 << 31, u32::MAX]
+                .into_iter()
+                .cycle()
+                .take(width)
+                .collect();
+            let mut expected = Vec::new();
+            assert!(c.push_codes(&mut expected, 0, Some(&codes)));
+            assert_eq!(
+                c.take_frame(&mut partial, 0, Some(codes.into_boxed_slice())),
+                Some(expected)
+            );
+            assert!(partial.is_empty());
+        }
     }
 
     #[test]
