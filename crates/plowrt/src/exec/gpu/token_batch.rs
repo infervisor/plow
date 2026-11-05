@@ -68,6 +68,7 @@ impl CudaTokenBatch {
             && e.mixed_step.is_none()
             // Depth codes and predictor outputs still use physical slots, not packed rows.
             && !e.has_depth_stage()
+            && e.handle_of("in.frame_codes").is_none()
             // Host rows spliced by launch row (overlay) or a decode-only embedding (position
             // base): the batch embeds decode rows through the prefill program, in its own order.
             && e.handle_of("in.encoder_overlay").is_none()
