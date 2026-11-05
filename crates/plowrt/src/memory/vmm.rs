@@ -5573,6 +5573,13 @@ impl HostTierGrant {
     pub(crate) fn bytes(&self) -> u64 {
         self.0
     }
+
+    /// Return what the engine will never pin to the shared budget.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        let give_back = self.0.saturating_sub(bytes);
+        HOST_TIER_GRANTED.fetch_sub(give_back, Ordering::AcqRel);
+        self.0 -= give_back;
+    }
 }
 
 impl Drop for HostTierGrant {
@@ -5615,13 +5622,21 @@ fn co_served_engines_share_one_host_tier_budget() {
     drop(first);
     let third = host_tier_grant(16 * G);
     assert_eq!(third.bytes(), 16 * G);
-    let fourth = host_tier_grant(64 * G);
+    let mut fourth = host_tier_grant(64 * G);
     assert_eq!(
         fourth.bytes(),
         48 * G,
         "what the others left of the largest request"
     );
-    drop((second, third, fourth));
+    drop((second, third));
+    fourth.shrink_to(8 * G);
+    let fifth = host_tier_grant(64 * G);
+    assert_eq!(
+        fifth.bytes(),
+        56 * G,
+        "a shrunk grant returns what it will not pin"
+    );
+    drop((fourth, fifth));
     assert_eq!(HOST_TIER_GRANTED.load(Ordering::Acquire), 0);
 }
 
