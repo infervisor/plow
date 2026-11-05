@@ -147,14 +147,13 @@ pub mod voice_cond;
 //
 // * opcode-changing, but every op has an AMD arm: `PLOW_NO_FUSE_QKV`, `PLOW_FP8_HEAD`,
 //   `PLOW_MX4_HEAD`, `PLOW_FP8_KV`, `PLOW_FP8_KV_FULL`, `PLOW_MXFP4`, `PLOW_MLA_PREFILL`,
-//   `PLOW_MOE_PREFILL`, `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_ROUTER_OLD` (GLM arm), `GLM_GROUP`;
+//   `PLOW_MOE_PREFILL`, `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_GROUP`;
 // * tuning constants carried in an existing instruction field, read identically by both
 //   interpreters: `PLOW_NS_MUL`, `PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_GLM_GF`, `PLOW_MLA_NS`,
 //   `PLOW_MAX_CHUNK`, `PLOW_DECODE_BATCH`. (`PLOW_NS_FULL_ABS`'s comment cites an sm_120 part —
 //   that records where it was MEASURED, not a target dependence.)
 // * structure, but geometry-driven rather than ISA-driven: `GLM_EP`, `GLM_MOE_CORESIDENT`,
-//   `PLOW_XR_CUS`, `PLOW_SEG_CLASS_SLICE`, `PLOW_FINE_FORCE`, `PLOW_NO_XREDUCE` (which is
-//   numerically wrong on BOTH targets and says so);
+//   `PLOW_XR_CUS`, `PLOW_SEG_CLASS_SLICE`;
 // * compiler-side only, never in the packet: `PLOW_ROOT`, `PLOW_BLOCK`, `PLOW_SKIP_COVERAGE`,
 //   `GLM_FULL`, `GLM_LAYER`, `GLM_NLAYERS`.
 //
@@ -3778,29 +3777,6 @@ fn flash_merge_map(
         .collect()
 }
 
-/// How many D-chunks each `(row, head)` merge item is split into.
-///
-/// **This was the L1 decode lever and it is MEASURED DEAD. Default 1; do not change it.**
-///
-/// The premise was sound on paper: `flash_merge` is 32 workgroups on a 256-CU machine at
-/// Gemma-31B decode (`n_bh = t*heads = 32`), holds the machine for 0.928 ms/token with a
-/// measured-EMPTY ready queue behind it, and is embarrassingly parallel over D — so `dsplit=8`
-/// takes it to 256 workgroups with no new reduction and no new gate, which an ideal-schedule
-/// simulation on the real DAG priced at **−0.805 ms/token**, the largest single decode lever.
-///
-/// Measured (MI355X, Gemma-4-31B bf16, ctx 1024, interleaved, same code object in every arm):
-/// **+0.555 ms/token at dsplit=8**, monotone in width (+0.243 at 2, +0.348 at 4), n=28 per arm
-/// over three independent sets, every arm token-identical. Wrong sign, and not marginally.
-/// `d_flash_merge` in `runtime/amd/op_attention.h` carries the numbers and the mechanism
-/// (widening an op widens its COARSE consumer's gate: o_proj then waits on a max over 256
-/// stragglers instead of 32).
-///
-/// The knob survives as the reproduction vehicle only. At 1 the emitted blob is byte-identical
-/// to the pre-change emitter's, so nothing ships differently.
-fn flash_merge_dsplit() -> u32 {
-    emit_config::active().flash_merge_dsplit.unwrap_or(1).max(1)
-}
-
 #[cfg(test)]
 #[path = "lib_tests/flash_merge_map.rs"]
 mod flash_merge_map_tests;
@@ -4117,14 +4093,7 @@ fn emit_xreduce_gather(
     let xr2_gather = !decode
         && emit_config::active().xr2_gather
         && gather.is_some_and(|(_, gcols, row_w)| row_w == tp.saturating_mul(gcols));
-    // PLOW_XR_DEC_TWOSHOT_MIN: a batched decode rung's [rows, hidden] message is bandwidth-bound
-    // like prefill's (B=128: 1 MB, every rank reading all 7 peers' copies in the one-shot).
-    let dec_twoshot = decode
-        && gather.is_none()
-        && emit_config::active()
-            .xr_dec_twoshot_min
-            .is_some_and(|m| xr_elems >= m.max(1));
-    if (decode && !dec_twoshot) || (gather.is_some() && !xr2_gather) {
+    if decode || (gather.is_some() && !xr2_gather) {
         let gate = *xgate;
         *xgate += 1;
         let (gslot, gcols, row_w) = gather.unwrap_or((0, 0, 0));
@@ -4208,12 +4177,7 @@ fn gemma_moe_router_split_plan(n_cu: u32, n_exp: u32, nrow: u32) -> Option<(u32,
         .gemma_moe_router_blocks
         .unwrap_or(max_useful)
         .clamp(1, max_useful);
-    let op = if emit_config::active().gemma_moe_router_exact {
-        DevOp::MoeRouterGemmaScore
-    } else {
-        DevOp::MoeRouterGemmaScoreFast
-    };
-    Some((blocks, op))
+    Some((blocks, DevOp::MoeRouterGemmaScoreFast))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5657,40 +5621,6 @@ fn emit_phase(
         // head->wave map, which cannot be done at hd=256 without breaking pair locality.
         let hn_cus: Vec<u32> = (0..((t * heads).div_ceil(8)).min(n_cu).max(1)).collect();
         let nhn = hn_cus.len() as u32;
-        // q/k/v HEADNORM ON DISJOINT CU SETS. The three are mutually INDEPENDENT -- each depends
-        // only on its own projection, never on the others -- but all three were emitted on the
-        // SAME `hn_cus`, so a workgroup had to finish q before it could start k. At decode
-        // (t=1, heads=16) `nhn` is 2, so three 8.9 us packets ran back to back on 2 of 304 CUs.
-        //
-        // This is NOT the widening the note above refuses. Each op keeps its own `nhn`
-        // workgroups and its own head->wave map; only their PLACEMENT moves apart, which is what
-        // `Builder::split` exists for ("so independent ops overlap"). Guarded on 3*nhn fitting,
-        // because at prefill `nhn` is already the whole machine and there is nothing to separate.
-        // OFF BY DEFAULT, and NOW MEASURED: it is a NO-OP UNDER THE GLOBAL QUEUE.
-        //
-        // The premise -- "three 8.9 us packets ran back to back on 2 of 304 CUs" -- is a property
-        // of the STATIC per-CU stream, where a workgroup executes its own fixed packet list and so
-        // must finish q before it starts k. Under PLOW_GLOBAL_QUEUE the three packets are claimed
-        // by whichever workgroups are free, so they spread on their own. TRACED on MI300X
-        // (gfx942, 304 CU, Gemma-4-12B decode, PLOW_TRACE_RAW), layer 1, hn_split OFF:
-        //
-        //     inst 18 (q)  cus [65, 120]   starts 257.28 / 257.23 us
-        //     inst 19 (k)  cus [41, 272]   starts 257.44 / 257.23
-        //     inst 20 (v)  cus [40, 233]   starts 257.16 / 257.15
-        //
-        // SIX DISTINCT CUs, all three within 0.3 us of each other -- already fully concurrent, so
-        // there is nothing for the split to recover. It may still be worth something on the static
-        // path, which is where the original observation came from; it is dead weight on the
-        // global-queue path that every AMD decode object ships today.
-        // Enable with PLOW_HN_SPLIT=1 if you are on the static scheduler.
-        let hn_split = 3 * nhn <= n_cu && emit_config::active().hn_split;
-        let hn_set = |i: u32| -> Vec<u32> {
-            if hn_split {
-                (i * nhn..(i + 1) * nhn).collect()
-            } else {
-                hn_cus.clone()
-            }
-        };
 
         // gemv -> headnorm. headnorm workgroup j owns whole HEADS, and head h is the 256 (or
         // 512) consecutive output columns [h*hd, h*hd+hd) of the projection — so it needs only
@@ -5798,7 +5728,7 @@ fn emit_phase(
         } else {
             b.emit_dep(
                 DevOp::HeadNormRope,
-                hn_set(0),
+                hn_cus.clone(),
                 hn_dep(c_q, nq, heads),
                 |d| {
                     d.t[0] = n.q;
@@ -5831,8 +5761,7 @@ fn emit_phase(
         // two did, and the chain loses one coarse gate per layer. A live coarse-gated op costs
         // 3.01 us on this packet (measured by injection: 30 and 90 duplicate live ops, slope
         // 3.01 us/op), so 30 layers is 0.090 ms of a 5.378 ms B=1 step.
-        // t6 carries the fp8 per-row scale, so this needs bf16 KV; hn_split would put the two
-        // on DIFFERENT CU sets, so it needs the default placement too.
+        // t6 carries the fp8 per-row scale, so this needs bf16 KV.
         let span_kv = decode && n.rowslot != TENSOR_NONE;
         assert!(
             !span_kv || (fp8_kv && gemv_family && !fuse_hnr && !shared),
@@ -5842,7 +5771,6 @@ fn emit_phase(
             && !fuse_hnr
             && !shared
             && !fp8_kv
-            && !hn_split
             && (fuse_qkv || fuse_qkv_fp8)
             && c_k == c_v
             && qk_skip == v_skip
@@ -5850,7 +5778,7 @@ fn emit_phase(
         let c_kn = if fuse_hnr || shared || hnr_fold {
             0
         } else {
-            b.emit_dep(hn_op, hn_set(1), hn_dep(c_k, nk, kvh), |d| {
+            b.emit_dep(hn_op, hn_cus.clone(), hn_dep(c_k, nk, kvh), |d| {
                 d.t[0] = n.kc[l];
                 d.t[1] = n.kg;
                 d.t[2] = w.kn;
@@ -5910,7 +5838,7 @@ fn emit_phase(
         } else if fuse_hnr || shared || hnr_fold {
             0
         } else {
-            b.emit_dep(hn_op, hn_set(2), vn_dep, |d| {
+            b.emit_dep(hn_op, hn_cus.clone(), vn_dep, |d| {
                 d.t[0] = n.vc[l];
                 d.t[1] = v_src;
                 d.t[5] = n.pos;
@@ -6284,12 +6212,10 @@ fn emit_phase(
         let attn_deps = if fused || fuse_merge || dec_fused {
             vec![c_fa]
         } else {
-            // L1: fold a D-chunk axis into the merge's work id so it can occupy more than
-            // `t*heads` (= 32 at Gemma-31B decode) of 256 CUs. `flash_merge_map` and
-            // `d_flash_merge` both RE-DERIVE dsplit from this length, so this is the single
-            // input. Default 1 => `(t*heads).min(n_cu)`, exactly as before.
-            let mg_cus: Vec<u32> =
-                (0..(t * heads * flash_merge_dsplit()).min(n_cu).max(1)).collect();
+            // `flash_merge_map` and `d_flash_merge` both RE-DERIVE the D-chunk split from this
+            // length. Widening past `t*heads` (dsplit > 1) MEASURED SLOWER on MI355X Gemma-4-31B
+            // decode (+0.555 ms/token at dsplit=8): it widens o_proj's coarse gate.
+            let mg_cus: Vec<u32> = (0..(t * heads).min(n_cu).max(1)).collect();
             let fill = |d: &mut DevInst| {
                 d.t[0] = n.at;
                 d.t[1] = n.opart;
@@ -7139,34 +7065,11 @@ fn emit_phase(
                     moe_fused_tail = Some(ct);
                     ct
                 } else {
-                    // BATCH B>1: one CTA per row (the body is a per-row block loop).
-                    //
-                    // ONE ROW: the body is a SINGLE CTA moving k*H f32 partials (90 KiB at the
-                    // 26B) while every other CU gates on it, and this op sits on the B=1 decode
-                    // critical path once per layer. op_moe.cuh's PLOW_MOE_COMBINE_ALLBLK arm has
-                    // each block redundantly recompute the reduction and write only its own
-                    // disjoint slice -- it needs blocks > 1 HERE to do anything, since it slices
-                    // on `slice`/`nblk`. The f32[H] it stages through is the per-block dynamic
-                    // smem arena, so the redundant writes cannot race.
-                    //
-                    // MEASURED NEGATIVE 2026-09-24, and left at 1 because of it. With
-                    // -DPLOW_MOE_COMBINE_ALLBLK=1 on sm_90a, 26B B=1 ctx128 step_bench:
-                    //     1 blk 5.3693 | 8 blk 5.5017 (+0.1323) | 32 blk 5.5097 (+0.1403)
-                    // i.e. +4.4 us per layer, not the saving the kernel comment's "0.317 ms of a
-                    // 6.12 ms step" suggests. Widening does not help because the consumer then
-                    // waits the MAX over N blocks instead of one, and every extra block pays the
-                    // coarse-gate machinery on the very gate that was the serialization point.
-                    // Fusing these narrow spine ops is a null too (PLOW_FUSE_KV_HNR, +0.0127 ms
-                    // for 25 ops removed), so neither widening nor merging is the lever here.
-                    let comb_cus: Vec<u32> = if t == 1 {
-                        let n = emit_config::active()
-                            .moe_combine_blocks
-                            .unwrap_or(1)
-                            .clamp(1, n_cu);
-                        (0..n).collect()
-                    } else {
-                        (0..t).collect()
-                    };
+                    // BATCH B>1: one CTA per row (the body is a per-row block loop). ONE ROW: a
+                    // single CTA. An all-block combine MEASURED NEGATIVE 2026-09-24 (26B B=1
+                    // ctx128 step_bench, +4.4 us per layer at 8 or 32 blocks): the consumer then
+                    // waits the MAX over N blocks and every extra block pays the coarse gate.
+                    let comb_cus: Vec<u32> = if t == 1 { vec![0] } else { (0..t).collect() };
                     b.emit(DevOp::MoeCombineNormGemma, comb_cus, &comb_deps, |d| {
                         d.t[0] = n.moe_comb;
                         d.t[1] = n.moe_part;
@@ -10773,10 +10676,10 @@ fn emit_dense_gqa(
     // So the axes get names. `PLOW_FP8` stays an alias for the weight axis — every existing script
     // and every line of the README keeps working, and unset means unset:
     //
-    //   weight      PLOW_W8A16=1 | PLOW_W8A8=1 | PLOW_W4A16=1   (alias: PLOW_FP8=1 -> w8a16)
+    //   weight      PLOW_W8A16=1 | PLOW_W8A8=1 | PLOW_MXFP4=1   (alias: PLOW_FP8=1 -> w8a16)
     //   activation  implied by the weight axis (w8a8 quantizes activations; the others do not)
     //   kv          PLOW_KV_FP8=1                               (alias: PLOW_FP8_KV=1)
-    //   experts     PLOW_MOE_ENC=bf16|fp8blk|mxfp4              (MLA family; see mla::MoeEnc)
+    //   experts     derived from the weight axis                (MLA family; see mla::MoeEnc)
     //
     // The activation axis is deliberately NOT a separate flag: w8a8 is one profile, not a free
     // cross-product with w8a16, and the kernels instantiate exactly those. Naming it separately
@@ -10875,16 +10778,10 @@ fn emit_dense_gqa(
     const LADDER_BM: u32 = 128;
     const LADDER_BN: u32 = 128;
     let cap = rung_cap(c.window, ctx);
-    // SUB-128 PREFILL RUNGS (32, 64), AMD only and OFF BY DEFAULT — see `PLOW_PF_FLOOR`, which
-    // carries the measurement that withdrew them. The short version: sublinear saving because
-    // `GM_BM=192` means the GEMM does not shrink below t=192 at all, zero in two serving
-    // campaigns, and they cap the decode ladder at 16 because prefill and decode rungs share one
-    // width-ordered space.
-    let floor: &[u32] = if amd && ecfg.pf_floor { &[32, 64] } else { &[] };
-    let shipped: Vec<u32> = floor
-        .iter()
-        .copied()
-        .chain([128u32, 512, 1024, 2048, 4096, 8192, 16384])
+    // No sub-128 prefill rungs: they shipped on AMD and were withdrawn on measurement (zero in
+    // two serving campaigns, +30.9% blob, and a 32 prefill rung collides with a 32 decode rung).
+    let shipped: Vec<u32> = [128u32, 512, 1024, 2048, 4096, 8192, 16384]
+        .into_iter()
         .filter(|&x| x <= cap)
         .collect();
     // PLOW_PF_LADDER is sm_120-only, and its own comment above says why: the rungs are derived from

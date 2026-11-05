@@ -437,7 +437,7 @@ const SEG_GRAPH_BYTES_PER_SEGMENT_SLOT: u64 = 12 << 10;
 /// bulk of a CUDA engine's non-tensor overhead.
 fn seg_graph_bound(blob: &DevBlob) -> u64 {
     let nv = &crate::config::RuntimeConfig::get().nv;
-    if !nv.pf_seg_graph || nv.pf_seg_time || nv.pf_seg_fatonly {
+    if !nv.pf_seg_graph || nv.pf_seg_time {
         return 0;
     }
     let slots = blob.decode_prog().map_or(0, |g| u64::from(g.t));
@@ -1984,47 +1984,9 @@ impl ModelManager {
             ))));
         }
 
-        // `PLOW_PF_SEG_NONCOOP=1` drops the driver's co-residency admission on
-        // an explicitly stated premise: "the grid equals the module's queried
-        // resident capacity AND THE STREAM IS OTHERWISE IDLE, so all blocks
-        // schedule together" (`exec/gpu.rs`). A co-tenant on the same device
-        // makes the second half false, and the documented consequence is a
-        // spin "on counters owned by blocks that were never resident" — a hang,
-        // not an error, with no launch failure to catch it.
-        //
-        // So this is a refusal, not a warning: a diagnostic knob must not be
-        // able to deadlock a device by being left set.
         // This bundle's own knobs: every step of its load below runs under them.
         let cfg = crate::config::bundle_config(&m.dir).map_err(EnsureError::Load)?;
         state.set_engine_config(&m.slug, cfg);
-        // Either side running non-cooperative launches is the hazard: per-engine configs let
-        // one model set it and its co-tenant not.
-        {
-            let co_tenants: Vec<String> = self
-                .models
-                .read()
-                .iter()
-                .filter(|o| o.slug != m.slug)
-                .map(|o| o.slug.clone())
-                .filter(|slug| self.is_resident(slug))
-                .collect();
-            let noncoop = |c: Option<&crate::config::RuntimeConfig>| {
-                c.unwrap_or_else(|| crate::config::RuntimeConfig::get())
-                    .nv
-                    .pf_seg_noncoop
-            };
-            if !co_tenants.is_empty()
-                && (cfg.nv.pf_seg_noncoop
-                    || co_tenants.iter().any(|s| noncoop(state.engine_config(s))))
-            {
-                return Err(EnsureError::Load(RuntimeError::Rejected(format!(
-                    "refusing to make {} co-resident with {:?} while PLOW_PF_SEG_NONCOOP is set: \
-                     non-cooperative launch assumes the device is otherwise idle, and a co-tenant \
-                     turns that assumption into a counter spin-hang. Unset it to share a device.",
-                    m.slug, co_tenants
-                ))));
-            }
-        }
 
         // Turns are installed from the startup tenant count: a model loaded later beside another
         // raises its group's turn from `Free` (CUDA); an HSA group not started round-robin is

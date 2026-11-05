@@ -383,19 +383,6 @@ extern "C" __device__ unsigned plow_xr_sched_nwg_sag = PLOW_XR_SCHED_NWG_SAG;
  * must reproduce the control's output exactly. That is the instrument's self-check.
  * The relaxed poll between fences is what stops LLVM folding k adjacent identical fences
  * into one; it compares against a value the counter cannot hold, so nothing else changes. */
-#ifndef PLOW_XR_ACQ_N
-#define PLOW_XR_ACQ_N 1
-#endif
-#if PLOW_XR_ACQ_N > 1
-#define PLOW_XR_EXTRA_ACQ(gw)                                        \
-    do {                                                             \
-        const uint32_t* _g = (gw);                                   \
-        for (int _a = 1; _a < (PLOW_XR_ACQ_N); _a++) {               \
-            if (xctr_poll(_g) == 0xFFFFFFFFu) bailed = 1;            \
-            xctr_acquire();                                          \
-        }                                                            \
-    } while (0)
-#endif
 
 /* ---- cross-GPU counter helpers (SYSTEM scope) ---------------------------------
  * Mirror interp.hip's agent-scope ctr_poll/ctr_acquire/ctr_signal, widened to
@@ -680,9 +667,6 @@ __device__ __forceinline__ void d_xreduce_mega(
         if (xr_trace) xr_trace->pc = xr_sat32(__builtin_amdgcn_s_memrealtime() - xr_entry);
 #endif
         if (!bailed) xctr_acquire();
-#if PLOW_XR_ACQ_N > 1
-        PLOW_XR_EXTRA_ACQ(lg); /* marginal-acquire instrument; see the knob's comment */
-#endif
     }
     __syncthreads();
 #if PLOW_XR_TRACE_PHASES
@@ -1392,9 +1376,6 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         /* The acquire STAYS in the ceiling arm — the instrument prices the WAIT, not the
          * fence. Same discipline as d_xreduce_mega's PLOW_XR_NOWAIT. */
         if (!bailed) xctr_acquire();
-#if PLOW_XR_ACQ_N > 1
-        PLOW_XR_EXTRA_ACQ(PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_rs));
-#endif
     }
     __syncthreads();
     if (bailed) return;
@@ -1555,9 +1536,6 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         }
 #endif
         if (!bailed) xctr_acquire();
-#if PLOW_XR_ACQ_N > 1
-        PLOW_XR_EXTRA_ACQ(PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_ag));
-#endif
     }
     __syncthreads();
     if (bailed) return;
@@ -1728,9 +1706,6 @@ __device__ __forceinline__ bool xr_rendezvous_one_wg(const void* const* peer_scr
             __builtin_amdgcn_s_sleep(2);
         }
         if (!*bailed) xctr_acquire();
-#if PLOW_XR_ACQ_N > 1
-        PLOW_XR_EXTRA_ACQ(PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate));
-#endif
     }
     __syncthreads();
     return !*bailed;

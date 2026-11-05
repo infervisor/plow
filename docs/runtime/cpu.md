@@ -116,12 +116,9 @@ the CLI wins over the environment. `plowrt serve --help` prints them under the
 | `--cpu-huge-pages=B` | `PLOW_CPU_HUGE_PAGES` | unset | Override transparent-huge-page *advice*: by default ordinary pages for interleaved tensors, huge-page advice for single-node or OS placement. Changes advice, not the system THP setting. |
 | `--cpu-spin-us N` | `PLOW_CPU_SPIN_US` | `2000` | Spin budget (µs) before a blocked worker yields and parks. Decode packets are 100–500 µs apart; parking on every gap measured **+17% TPOT** at 50 µs versus 1000. |
 | `--cpu-combine G` | `PLOW_CPU_COMBINE` | `0` | Combining-tree completion counters. A counter bumped by at least `2G` static executors gets one sub-counter per group of `G` executors on the same node; the group's last arrival adds the group's share to the real counter, so consumers and thresholds are unchanged. Off, every slice of a full-width op bumps one shared line and the last bump measured 2 µs median, up to 16 µs. `G=16` measured TPOT p50 −7 to −10% at c1 (E2B, E4B; ISL 1000-15900) on the Xeon 6975P-C, outputs identical (`docs/bringup/results/xeon6-l2r-bf16-20261008/p5_serving_report.md`). |
-| `--cpu-prefill-chunk N` | `PLOW_CPU_PF_CHUNK` | `0` | Largest prefill chunk (rows) one tick may run while other slots decode; `0` = whole prompt. Measured **negative** at concurrency ≥ 4, so it stays off. |
 | `--cpu-pack-prefill=B` | `PLOW_CPU_PACK_PREFILL` | `true` | Prefill the prompts waiting in one serve tick together, in one launch, bit-identical to prefilling each alone (see *Packed prefill*). |
 | `--cpu-mxfp4-dir DIR` | `PLOW_MXFP4_DIR` | unset | Directory holding the MXFP4 weight twin (`mxfp4/<name>` plus `_scale` rows, from `perf-data/tools/quantize_mxfp4.py`). |
 | `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | The fp8 weight twin. Runtime-wide rather than CPU-specific, but this is how a CPU bundle gets W8A16/W8A8 weights. |
-| `--cpu-global-queue=B` | `PLOW_CPU_GQ` | `false` | Take the blob's op-major global work queue, windowed per segment and locality domain, instead of static per-cu streams. **Measured ~2x slower** on the EPYC 9654; kept for A/B where the static partition is a poor fit. |
-| `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | `false` | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **Measured 1.5x slower** and never faster (placement report in the `perf-data/cpu-numa-placement` campaign, kept out of source control). Inert on a blob carrying no domains, and the balance guard declines a losing plan even when this is on. |
 
 The last two default to off because they were measured worse, not because they are
 unfinished. Both are safe to flip for an A/B on a different host; neither changes
@@ -234,9 +231,8 @@ at a width that divides the largest core count you intend to serve; the emitter
 caps `n_cu` at 256, because the per-domain slice count is a nine-bit field.
 
 Executors are placed on node `cu % nodes`. Placing them by the packet's L2
-locality domains instead is implemented behind `--cpu-l2-place` and is **off**,
-because it measured 1.5x slower and never faster (placement report in the
-`perf-data/cpu-numa-placement` campaign, kept out of source control).
+locality domains instead measured 1.5x slower and never faster (placement report
+in the `perf-data/cpu-numa-placement` campaign, kept out of source control).
 
 The reason is worth keeping, because the idea is superficially attractive and the
 obvious rescue does not work. An L2 domain says which slices share a *GPU* cache.

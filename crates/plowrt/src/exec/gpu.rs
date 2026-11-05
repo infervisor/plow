@@ -2878,8 +2878,6 @@ pub struct GpuEngine {
     pf_seg_window: Option<std::ops::Range<usize>>,
     /// The next packed body stops at its bucket's KV-shared tail boundary.
     pf_seg_prefix: bool,
-    /// `PLOW_PF_ENTRY_TRACE`: per-(segment, block) stamps of a `-DPLOW_NV_ENTRY_TRACE=1` object.
-    entry_trace: Option<DeviceMem>,
     attention_gemm: Option<attention_gemm::AttentionGemm>,
     lib_attention: Option<lib_attention::LibAttention>,
     /// Whether the launch being enqueued runs its library attention sites (`begin_launch`).
@@ -3811,17 +3809,11 @@ struct Sampler {
     threads: u32,
     #[allow(dead_code)]
     batch: usize,
-    /// `plow_sample_cfg` (absent on older objects: CFG pairs keep the host draw).
-    f_cfg: Option<KernelFn>,
     /// `plow_logprob_stats` and its `[3 + 2 * MAX_TOP_LOGPROBS]` f32 output (absent on older
     /// objects: logprob rows download the whole logits row).
     lp: Option<(KernelFn, DeviceMem)>,
     /// `plow_logprob_stats_rows` (absent on older objects: one `lp` launch per row).
     lp_rows: Option<LpRows>,
-    /// Guided-draw buffers, allocated on the first CFG pair.
-    cfg: Option<CfgSlab>,
-    /// Steps of guided draws staged by [`GpuEngine::stage_cfg`] for the next decode call.
-    cfg_staged: usize,
     /// `plow_penalize` + `plow_count` (absent on older objects: repetition-penalty rows keep the
     /// host draw).
     pen: Option<PenSlab>,
@@ -3845,25 +3837,6 @@ struct LpRows {
     d_req: DeviceMem,
     out: PinnedHost,
     d_out: DeviceMem,
-}
-
-/// `plow_sample_cfg` inputs: `[6][batch]` f32 params (flag, weight, penalty, temperature, top_p,
-/// min_p) then `[SAMPLE_RNG_STEPS][batch]` uniforms, and the `[batch][vocab]` u32 history counts.
-struct CfgSlab {
-    host: PinnedHost,
-    dev: DeviceMem,
-    counts: DeviceMem,
-}
-
-/// One CFG owner's guided sampling chain (the device form of `text::sample::CfgParams`;
-/// `temp <= 0` = greedy).
-#[derive(Clone, Copy, Debug)]
-pub struct DevCfg {
-    pub weight: f32,
-    pub penalty: f32,
-    pub temp: f32,
-    pub top_p: f32,
-    pub min_p: f32,
 }
 
 /// Bounded device multi-step state (plan stage 5: `PLOW_MULTISTEP=K`). The
@@ -7847,7 +7820,6 @@ impl GpuEngine {
             shared_tail: None,
             pf_seg_window: None,
             pf_seg_prefix: false,
-            entry_trace: None,
             attention_gemm,
             lib_attention,
             lib_attention_routed: false,
@@ -7945,11 +7917,7 @@ impl GpuEngine {
         if engine.cublaslt_decode_capture {
             engine.capture_decode_graph()?;
         }
-        if !engine.prefill.is_empty()
-            && config.nv.pf_seg_graph
-            && !config.nv.pf_seg_time
-            && !config.nv.pf_seg_fatonly
-        {
+        if !engine.prefill.is_empty() && config.nv.pf_seg_graph && !config.nv.pf_seg_time {
             let tables: Vec<u64> = std::iter::once(engine.d_tens.base)
                 .chain(engine.d_tens_pf.as_ref().map(|m| m.base))
                 .collect();
@@ -8141,12 +8109,7 @@ impl GpuEngine {
             source,
         })?;
         let module = be.module_load(&image)?;
-        let kname = rt
-            .nv
-            .kernel_sample
-            .clone()
-            .unwrap_or_else(|| "plow_sample".into());
-        let f = be.get_function(&module, &kname)?;
+        let f = be.get_function(&module, "plow_sample")?;
         let threads = be
             .module_global_u32(&module, "plow_sample_threads")?
             .unwrap_or(256);
@@ -8154,7 +8117,6 @@ impl GpuEngine {
         let params = be.host_alloc_pinned(slab)?;
         let d_params = be.alloc(0, slab as u64)?;
         let d_escratch = be.alloc(0, (batch * vocab * 4) as u64)?;
-        let f_cfg = be.get_function(&module, "plow_sample_cfg").ok();
         let pen = match (
             be.get_function(&module, "plow_penalize"),
             be.get_function(&module, "plow_count"),
@@ -8182,7 +8144,7 @@ impl GpuEngine {
             }),
             Err(_) => None,
         };
-        tracing::info!(cubin = %cubin.display(), cfg = f_cfg.is_some(), penalty = pen.is_some(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
+        tracing::info!(cubin = %cubin.display(), penalty = pen.is_some(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
         Ok(Some(Sampler {
             f,
             _module: module,
@@ -8191,11 +8153,8 @@ impl GpuEngine {
             d_escratch,
             threads,
             batch,
-            f_cfg,
             lp,
             lp_rows,
-            cfg: None,
-            cfg_staged: 0,
             pen,
         }))
     }
@@ -9117,7 +9076,6 @@ impl GpuEngine {
         toks: &mut Vec<u32>,
     ) -> Result<()> {
         toks.clear();
-        let cfg_steps = self.take_cfg_staged();
         if feeds.is_empty() {
             return Ok(());
         }
@@ -9331,9 +9289,6 @@ impl GpuEngine {
             if penalized {
                 self.launch_penalty(true, bsz)?;
             }
-        }
-        if cfg_steps > 0 {
-            self.launch_cfg(0)?;
         }
 
         // Token readback: `in.ids` (rewritten by `ARGMAX_FIN`, or by the
@@ -9740,7 +9695,6 @@ impl GpuEngine {
         out: &mut Vec<u32>,
     ) -> Result<usize> {
         out.clear();
-        let cfg_steps = self.take_cfg_staged();
         let sample = sample.filter(|(specs, _)| specs.iter().any(|s| s.temp > 0.0));
         if sample.is_some() && self.sampler.is_none() {
             return Err(RuntimeError::Rejected(
@@ -9755,11 +9709,7 @@ impl GpuEngine {
             feeds.iter().map(|&(slot, _)| slot),
             &self.pos,
             self.max_ctx,
-            if cfg_steps > 0 {
-                requested.min(cfg_steps)
-            } else {
-                requested
-            },
+            requested,
             if sample.is_some() {
                 ms.quantum.min(SAMPLE_RNG_STEPS)
             } else {
@@ -9883,7 +9833,7 @@ impl GpuEngine {
 
         // Enqueue [memset → decode → (sample) → advance] × K on the stream — no sync.
         let advance_grid = (bsz as u32).div_ceil(256);
-        let cut = cut.filter(|_| cfg_steps == 0 && k > 1);
+        let cut = cut.filter(|_| k > 1);
         let mut done = k;
         for step in 0..k {
             self.reset_selected_decode_counters(rung)?;
@@ -9915,9 +9865,6 @@ impl GpuEngine {
                 if penalized {
                     self.launch_penalty(true, bsz)?;
                 }
-            }
-            if cfg_steps > 0 {
-                self.launch_cfg(step)?;
             }
             let mut a_ids = self.devp[self.t_ids].base;
             let mut a_pos = self.devp[self.t_pos].base;
@@ -10376,11 +10323,6 @@ impl GpuEngine {
         self.sampler.is_some()
     }
 
-    /// Whether CFG pairs (conditional row b, unconditional row b + 1) can draw on the device.
-    pub fn cfg_sampling(&self) -> bool {
-        self.sampler.as_ref().is_some_and(|s| s.f_cfg.is_some())
-    }
-
     /// Whether rows with a repetition penalty can draw on the device ([`DevSample::penalty`]).
     pub fn dev_penalty(&self) -> bool {
         self.sampler.as_ref().is_some_and(|s| s.pen.is_some())
@@ -10503,98 +10445,6 @@ impl GpuEngine {
             .launch_kernel(f, grid, block, 0, &mut a, Some(&self.stream))
     }
 
-    fn cfg_slab(&mut self) -> Result<&mut CfgSlab> {
-        let (bsz, vocab) = (self.batch, self.vocab);
-        let smp = self
-            .sampler
-            .as_mut()
-            .filter(|s| s.f_cfg.is_some())
-            .ok_or_else(|| RuntimeError::Rejected("no device CFG sampler".into()))?;
-        if smp.cfg.is_none() {
-            let bytes = (6 + SAMPLE_RNG_STEPS) * bsz * 4;
-            smp.cfg = Some(CfgSlab {
-                host: self.be.host_alloc_pinned(bytes)?,
-                dev: self.be.alloc(0, bytes as u64)?,
-                counts: self.be.alloc(0, (bsz * vocab * 4) as u64)?,
-            });
-        }
-        Ok(smp.cfg.as_mut().expect("allocated"))
-    }
-
-    /// Reset CFG owner `slot`'s device penalty history to the occurrence counts of `history`.
-    pub fn cfg_seed_history(
-        &mut self,
-        slot: usize,
-        history: impl IntoIterator<Item = u32>,
-    ) -> Result<()> {
-        let vocab = self.vocab;
-        if slot >= self.batch {
-            return Err(RuntimeError::Rejected(format!(
-                "CFG slot {slot} out of range"
-            )));
-        }
-        let mut row = vec![0u32; vocab];
-        for t in history {
-            if let Some(c) = row.get_mut(t as usize) {
-                *c += 1;
-            }
-        }
-        let base = self.cfg_slab()?.counts.base + (slot * vocab * 4) as u64;
-        // On the engine stream: a context-wide synchronize also waits for every co-tenant's work.
-        // SAFETY: `row` outlives the stream synchronize below; `base` spans `vocab` u32 counts.
-        unsafe {
-            self.be
-                .memcpy_htod_async(base, bytemuck::cast_slice(&row), &self.stream)?;
-        }
-        self.be.stream_synchronize(&self.stream)
-    }
-
-    /// Stage guided draws for the next [`Self::step_slots_sampled`] (`steps == 1`) or
-    /// [`Self::multi_step_sampled_at_most`] (up to `steps` tokens): `rows` are the CFG owners, and
-    /// `draws[r * steps + k]` is owner `r`'s uniform for its k-th token. After the decode (and
-    /// `plow_sample`), `plow_sample_cfg` writes each owner's token to both members' `in.ids`.
-    pub fn stage_cfg(
-        &mut self,
-        rows: &[(usize, DevCfg)],
-        draws: &[f32],
-        steps: usize,
-    ) -> Result<()> {
-        let bsz = self.batch;
-        if steps == 0 || steps > SAMPLE_RNG_STEPS || draws.len() != rows.len() * steps {
-            return Err(RuntimeError::Rejected("stage_cfg: bad draw extent".into()));
-        }
-        if rows.iter().any(|&(b, _)| b + 1 >= bsz) {
-            return Err(RuntimeError::Rejected(
-                "stage_cfg: CFG owner without a partner row".into(),
-            ));
-        }
-        self.cfg_slab()?;
-        let smp = self.sampler.as_mut().expect("cfg_slab checked");
-        let slab = smp.cfg.as_mut().expect("allocated");
-        let raw: &mut [f32] = bytemuck::cast_slice_mut(slab.host.as_mut_slice());
-        let (prm, rng) = raw.split_at_mut(6 * bsz);
-        prm[..bsz].fill(0.0);
-        for (r, &(b, c)) in rows.iter().enumerate() {
-            for (j, v) in [1.0, c.weight, c.penalty, c.temp, c.top_p, c.min_p]
-                .into_iter()
-                .enumerate()
-            {
-                prm[j * bsz + b] = v;
-            }
-            for k in 0..steps {
-                rng[k * bsz + b] = draws[r * steps + k];
-            }
-        }
-        let n = (6 + steps) * bsz * 4;
-        // SAFETY: the pinned slab lives on self past the step's synchronize.
-        unsafe {
-            self.be
-                .memcpy_htod_async(slab.dev.base, &slab.host.as_slice()[..n], &self.stream)?;
-        }
-        smp.cfg_staged = steps;
-        Ok(())
-    }
-
     /// Enqueue `plow_sample` over the first `specs.len()` rows of `act.logits`, overwriting those
     /// `in.ids` entries (the compact terminal's layout: sample row r at logits row r). Row r's
     /// repetition-penalty history is slot `slots[r]`'s. The caller reads `in.ids` back after it,
@@ -10685,43 +10535,6 @@ impl GpuEngine {
             *o = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
         }
         Ok(())
-    }
-
-    /// Steps of guided draws staged for this decode call (consumed: the next call stages anew).
-    fn take_cfg_staged(&mut self) -> usize {
-        self.sampler
-            .as_mut()
-            .map_or(0, |s| std::mem::take(&mut s.cfg_staged))
-    }
-
-    /// Launch the staged guided draw for quantum step `step`.
-    fn launch_cfg(&mut self, step: usize) -> Result<()> {
-        let bsz = self.batch;
-        let smp = self.sampler.as_ref().expect("staged");
-        let (Some(f), Some(slab)) = (smp.f_cfg, smp.cfg.as_ref()) else {
-            return Err(RuntimeError::Rejected(
-                "CFG draw staged without the device CFG sampler".into(),
-            ));
-        };
-        let mut a_logits = self.devp[self.t_logits].base;
-        let mut a_ids = self.devp[self.t_ids].base;
-        let mut a_prm = slab.dev.base;
-        let mut a_rng = slab.dev.base + ((6 + step) * bsz * 4) as u64;
-        let mut a_cnt = slab.counts.base;
-        let mut a_es = smp.d_escratch.base;
-        let (mut a_v, mut a_b) = (self.vocab as u32, bsz as u32);
-        let mut a = [
-            &mut a_logits as *mut u64 as *mut std::ffi::c_void,
-            &mut a_ids as *mut u64 as *mut std::ffi::c_void,
-            &mut a_prm as *mut u64 as *mut std::ffi::c_void,
-            &mut a_rng as *mut u64 as *mut std::ffi::c_void,
-            &mut a_cnt as *mut u64 as *mut std::ffi::c_void,
-            &mut a_es as *mut u64 as *mut std::ffi::c_void,
-            &mut a_v as *mut u32 as *mut std::ffi::c_void,
-            &mut a_b as *mut u32 as *mut std::ffi::c_void,
-        ];
-        self.be
-            .launch_kernel(f, bsz as u32, smp.threads, 0, &mut a, Some(&self.stream))
     }
 
     /// Whether packet-selected or legacy opt-in cross-request prefill is active.
@@ -11254,7 +11067,7 @@ impl GpuEngine {
                 } else {
                     None
                 };
-                let mut sp = SegPf {
+                let sp = SegPf {
                     glu_quant_cached,
                     glu_quant_cached_q,
                     glu_quant_any_width: glu_quant_abi == Some(2),
@@ -11279,55 +11092,6 @@ impl GpuEngine {
                     _m_fa512: m_fa,
                     _m_fa256_gqa2: m_fa256_gqa2,
                 };
-                // PLOW_PF_SEG_EQSMEM=1 (T18): launch every object with the SAME dynamic-smem
-                // request (the max of the three). Alternating smem sizes between back-to-back
-                // launches forces an SM shared-memory carveout reconfig each time — measured
-                // ~150-300us per transition at ~480 segments/chunk. A uniform request makes
-                // every launch reuse the standing carveout. Occupancy re-derives from the max
-                // (the fat object drops to occ-1 — measured neutral on its latency-bound rows).
-                if crate::config::RuntimeConfig::get().nv.pf_seg_eqsmem {
-                    let mut mx = sp.smem_flash.max(sp.smem_gemm);
-                    if let Some(small) = &sp.small_gemm {
-                        mx = mx.max(small.smem);
-                    }
-                    if let Some((_, s3, _)) = sp.fa512 {
-                        mx = mx.max(s3);
-                    }
-                    if let Some((_, s3, _)) = sp.fa256_gqa2 {
-                        mx = mx.max(s3);
-                    }
-                    // Occupancy is per (function, BLOCK SIZE): the ws384 GEMM object
-                    // launches at `block_gemm`, so re-querying it at BLOCK over-reports
-                    // its grid (384-thread blocks cap at 5/SM vs 8/SM at 256) and the
-                    // cooperative launch then fails — or, non-cooperative, spins on
-                    // counters owned by blocks that were never resident.
-                    let requery = |f: KernelFn, block: u32| -> Result<u32> {
-                        be.set_max_dynamic_smem(f, mx)?;
-                        Ok(be.occupancy_blocks_per_sm(f, block, mx as usize)? * be.sm_count())
-                    };
-                    sp.grid_flash = requery(sp.f_flash, BLOCK)?;
-                    sp.smem_flash = mx;
-                    sp.grid_gemm = requery(sp.f_gemm, sp.block_gemm)?;
-                    sp.smem_gemm = mx;
-                    if let Some(small) = &mut sp.small_gemm {
-                        small.grid = requery(small.function, small.block)?;
-                        small.smem = mx;
-                    }
-                    if let Some((f3, _, _)) = sp.fa512 {
-                        let g3 = requery(f3, BLOCK)?;
-                        sp.fa512 = Some((f3, mx, g3));
-                    }
-                    if let Some((f3, _, _)) = sp.fa256_gqa2 {
-                        let g3 = requery(f3, BLOCK)?;
-                        sp.fa256_gqa2 = Some((f3, mx, g3));
-                    }
-                    tracing::info!(
-                        smem = mx,
-                        grid_flash = sp.grid_flash,
-                        grid_gemm = sp.grid_gemm,
-                        "seg pair smem equalized"
-                    );
-                }
                 Some(sp)
             }
             _ => None,
@@ -12666,7 +12430,6 @@ impl GpuEngine {
         bi: usize,
         seg: usize,
         class: u8,
-        fat_only: bool,
     ) -> Result<(KernelFn, u32, u32, u32)> {
         let sp = self.seg_pf.as_ref().expect("segmented prefill loaded");
         if let Some(index) = packet_role_index(&self.prefill[bi].packet_segment_roles, seg) {
@@ -12675,7 +12438,7 @@ impl GpuEngine {
                 .expect("validated packet role object");
             return Ok((role.function, role.grid, role.block, role.smem));
         }
-        if fat_only || class == 4 {
+        if class == 4 {
             return Ok((sp.f_flash, sp.grid_flash, BLOCK, sp.smem_flash));
         }
         if class == 2 {
@@ -13067,22 +12830,6 @@ impl GpuEngine {
             return Ok(());
         }
         let seg_class = self.prefill[bi].seg_class[range.clone()].to_vec();
-        let mut arg = *arg;
-        if crate::config::RuntimeConfig::get().nv.pf_entry_trace {
-            if self.entry_trace.is_none() {
-                let segments = self
-                    .prefill
-                    .iter()
-                    .map(|b| b.seg_class.len())
-                    .max()
-                    .unwrap_or(1);
-                let mem = self.be.alloc(0, segments as u64 * 528 * 64)?;
-                self.be.memset_d8(mem.base, 0, mem.len as usize)?;
-                self.entry_trace = Some(mem);
-            }
-            arg.trace = self.entry_trace.as_ref().expect("allocated").base;
-        }
-        let arg = &arg;
         let has_external = self.prefill[bi]
             .cublaslt_segments
             .iter()
@@ -13108,8 +12855,7 @@ impl GpuEngine {
             // Interpreter segments never touch cuBLASLt's workspace, so the workspace memset a
             // library call captures may run beside the segment that precedes it.
             for (seg, &class) in seg_class.iter().enumerate() {
-                let (function, ..) =
-                    self.prefill_segment_kernel(bi, seg + range.start, class, false)?;
+                let (function, ..) = self.prefill_segment_kernel(bi, seg + range.start, class)?;
                 if !untouched.contains(&function) {
                     untouched.push(function);
                 }
@@ -13135,7 +12881,7 @@ impl GpuEngine {
                             continue;
                         }
                         let (function, grid, block, smem) =
-                            self.prefill_segment_kernel(bi, seg, class, false)?;
+                            self.prefill_segment_kernel(bi, seg, class)?;
                         if let Some((direct, mut direct_arg)) =
                             self.direct_packet_segment(bi, seg, arg)?
                         {
@@ -13177,9 +12923,7 @@ impl GpuEngine {
             let nodes: Vec<_> = seg_class
                 .iter()
                 .enumerate()
-                .map(|(seg, &class)| {
-                    self.prefill_segment_kernel(bi, seg + range.start, class, false)
-                })
+                .map(|(seg, &class)| self.prefill_segment_kernel(bi, seg + range.start, class))
                 .collect::<Result<Vec<_>>>()?;
             let mut ptrs: Vec<*mut std::ffi::c_void> = blobs
                 .iter_mut()
@@ -13195,64 +12939,6 @@ impl GpuEngine {
             bucket = bi,
             "seg graph built"
         );
-        Ok(())
-    }
-
-    /// Summarize and clear the `PLOW_PF_ENTRY_TRACE` stamps of the chain just launched: per
-    /// interpreter segment, the launch span and the median of each entry stage over its blocks.
-    fn log_entry_trace(&mut self, bi: usize) -> Result<()> {
-        let Some(mem) = &self.entry_trace else {
-            return Ok(());
-        };
-        self.be.stream_synchronize(&self.stream)?;
-        let mut raw = vec![0u8; mem.len as usize];
-        self.be.download(mem, 0, &mut raw)?;
-        let words: Vec<u64> = raw
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
-            .collect();
-        let segments = self.prefill[bi].seg_class.len();
-        let blocks = 528;
-        let mut lines = Vec::new();
-        for seg in 0..segments {
-            let recs: Vec<&[u64]> = (0..blocks)
-                .map(|b| &words[(seg * blocks + b) * 8..(seg * blocks + b + 1) * 8])
-                .filter(|r| r[0] != 0 && r[6] != 0)
-                .collect();
-            if recs.is_empty() {
-                continue;
-            }
-            let start = recs.iter().map(|r| r[0]).min().unwrap_or(0);
-            let end = recs.iter().map(|r| r[6]).max().unwrap_or(0);
-            let median = |a: usize, b: usize| {
-                let mut v: Vec<u64> = recs
-                    .iter()
-                    .filter(|r| r[a] != 0 && r[b] != 0)
-                    .map(|r| r[b].saturating_sub(r[a]))
-                    .collect();
-                v.sort_unstable();
-                v.get(v.len() / 2).copied().unwrap_or(0)
-            };
-            let last_start = recs.iter().map(|r| r[0]).max().unwrap_or(0) - start;
-            let worked = recs.iter().filter(|r| r[5] != 0).count();
-            lines.push(format!(
-                "seg {seg} op {} waits {} blocks {}/{} span {} ramp {} wait {} claim {} ent {} gate {} body {} exit {}",
-                recs[0][7] & 0xffff,
-                recs[0][7] >> 32,
-                worked,
-                recs.len(),
-                end - start,
-                last_start,
-                median(0, 1),
-                median(1, 2),
-                median(2, 3),
-                median(3, 4),
-                median(4, 5),
-                median(5, 6),
-            ));
-        }
-        self.be.memset_d8(mem.base, 0, mem.len as usize)?;
-        tracing::info!(bucket = bi, "entry trace (ns)\n{}", lines.join("\n"));
         Ok(())
     }
 
@@ -13978,10 +13664,9 @@ impl GpuEngine {
             // T35 (PLOW_PF_SEG_GRAPH=1): submit the whole per-chunk segment chain as ONE
             // CUDA graph. Per-node kernargs (cur_seg baked per node) are copied at build;
             // everything else in `arg` is constant per (bucket, slot tensor table), which
-            // keys the cache. Falls through to the loop under the timing/fatonly diags.
+            // keys the cache. Falls through to the loop under the timing diagnostic.
             let rt = crate::config::RuntimeConfig::get();
             let seg_time_probe = rt.nv.pf_seg_time;
-            let fat_only_probe = rt.nv.pf_seg_fatonly;
             // The route's GEMM shapes follow each launch's KV lengths: not capturable. A routed
             // launch runs the graph pieces between its attention segments; a pack of short
             // slices keeps the whole graph and the native kernel.
@@ -14022,7 +13707,7 @@ impl GpuEngine {
                 false
             };
             let mut routed_index = 0;
-            if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph {
+            if !seg_time_probe && rt.nv.pf_seg_graph {
                 let tensors = arg.tensors as u64;
                 if riding && !routed && self.pf_seg_window.is_none() {
                     let segments = seg_class.len();
@@ -14078,9 +13763,6 @@ impl GpuEngine {
                 }
                 let rest = next..seg_class.len();
                 self.run_routed_segments(bi, rest, grouped, rows, &mut routed_index, gemm_routed)?;
-                if rt.nv.pf_entry_trace {
-                    self.log_entry_trace(bi)?;
-                }
                 if synchronize {
                     if let Err(e) = self.be.stream_synchronize(&self.stream) {
                         tracing::warn!(
@@ -14107,18 +13789,6 @@ impl GpuEngine {
             // PLOW_PF_SEG_TIME=1: per-CLASS wall attribution via one event pair per segment
             // (diagnostic; events cost ~us each — never on by default).
             let seg_time = seg_time_probe;
-            // Both diagnostics are resolved ONCE per chunk, not per segment: a
-            // `std::env::var` inside the ~480-iteration launch loop takes the
-            // process-global env lock and allocates a String every time.
-            // PLOW_PF_SEG_FATONLY=1: every segment on the fat object, isolating
-            // the launch-serialization cost from the occ-2 effect.
-            let fat_only = fat_only_probe;
-            // PLOW_PF_SEG_NONCOOP=1 (T14b): plain cuLaunchKernel per segment. The
-            // cooperative wrapper's only guarantee — co-residency — already holds: the
-            // grid equals the module's queried resident capacity and the stream is
-            // otherwise idle, so all blocks schedule together. Diagnostic-grade knob to
-            // price the cooperative-launch overhead (241 fat launches/chunk).
-            let noncoop = rt.nv.pf_seg_noncoop;
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             let window = self.pf_seg_window.clone().unwrap_or(0..seg_class.len());
             for (seg, &cls) in seg_class.iter().enumerate() {
@@ -14213,16 +13883,12 @@ impl GpuEngine {
                             .as_ref()
                             .expect("validated packet role object")
                     });
-                let (f, gr, blk, sm) = self.prefill_segment_kernel(bi, seg, cls, fat_only)?;
+                let (f, gr, blk, sm) = self.prefill_segment_kernel(bi, seg, cls)?;
                 let direct = self.direct_packet_segment(bi, seg, &arg)?;
                 let go = |f: KernelFn, params: &mut [*mut std::ffi::c_void]| -> Result<()> {
-                    let launched = if noncoop {
+                    let launched =
                         self.be
-                            .launch_kernel(f, gr, blk, sm, params, Some(&self.stream))
-                    } else {
-                        self.be
-                            .launch_cooperative(f, gr, blk, sm, params, Some(&self.stream))
-                    };
+                            .launch_cooperative(f, gr, blk, sm, params, Some(&self.stream));
                     // Under CUDA_LAUNCH_BLOCKING a device fault surfaces here: name the segment.
                     launched.map_err(|e| {
                         tracing::warn!(seg, cls, error = %e, "prefill segment launch failed");
@@ -14264,21 +13930,6 @@ impl GpuEngine {
             }
             if seg_time {
                 self.be.stream_synchronize(&self.stream)?;
-                if let Some(route) = self.attention_gemm.as_mut() {
-                    let phases = route.phase_report()?;
-                    if !phases.is_empty() {
-                        let sum = phases.iter().fold([0f32; 3], |acc, p| {
-                            [acc[0] + p[0], acc[1] + p[1], acc[2] + p[2]]
-                        });
-                        tracing::info!(
-                            waves = phases.len(),
-                            qk_ms = format!("{:.3}", sum[0]).as_str(),
-                            softmax_ms = format!("{:.3}", sum[1]).as_str(),
-                            pv_ms = format!("{:.3}", sum[2]).as_str(),
-                            "attention route phases (chunk)"
-                        );
-                    }
-                }
                 let mut by_class = [0f64; 3]; // [gemm(8), flash-fat(4), fa512(2)]
                 let mut n_by = [0u32; 3];
                 for (_, cls, e0, e1) in &evs {

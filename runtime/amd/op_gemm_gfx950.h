@@ -29,9 +29,6 @@
 #if defined(GV_UNROLL_M4) || defined(GV_UNROLL_M8)
 #error "GV_UNROLL_M4 / GV_UNROLL_M8 are gfx942 knobs: CDNA4 has the packed bf16 dot, its M buckets never reached the AGPRs, and it keeps the flat GV_UNROLL (op_gemm_gfx942.h has the measured table)"
 #endif
-#if defined(PLOW_GV_UN_BIG) || defined(PLOW_GV_UN_LEGACY)
-#error "PLOW_GV_UN_BIG / PLOW_GV_UN_LEGACY probe the K-divisor fp8 unroll rule, which gfx950 does not run (PLOW_GV_UN_FP8_KDIV 0): dead code here"
-#endif
 
 /* ---- arch POLICY. Fixed facts about this silicon, not tunables: bare defines with no `#ifndef`,
  * so a -D for one would be a redefinition the header wins (and the recipe compiles -w). Refused. */

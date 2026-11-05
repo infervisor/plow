@@ -92,11 +92,7 @@ __device__ __forceinline__ bf16v8 ld_glob8_nt(const PLOW_GLOB bf16* p) {
  * NOT volume-proportional, which the arithmetic already said (a GEMV dirties ~43 KB, writable
  * back in ~43 ns at HBM rate, against the ~0.8 us/packet the buffer_wbl2 actually costs), and
  * evicting activations early is a straight loss because they ARE re-read -- the residual stream
- * a norm writes is the very thing the next op loads. Do not re-try this. Kept as the knob that
- * records the measurement. */
-#ifndef PLOW_ACT_NT
-#define PLOW_ACT_NT 0
-#endif
+ * a norm writes is the very thing the next op loads. Do not re-try this. */
 
 /* PLOW_GATE_SC1: DEVICE-SCOPE ACTIVATION STORES, so the release fence can go away.
  *
@@ -207,24 +203,8 @@ __device__ __forceinline__ bf16v8 ld_glob8_nt(const PLOW_GLOB bf16* p) {
 #endif
 
 /* The scope every activation store carries under PLOW_GATE_SC1. See the note above for why this
- * is SYSTEM and not AGENT.
- *
- * PLOW_ACT_SCOPE_AGENT is a CEILING INSTRUMENT and MUST NOT SHIP. It narrows every activation
- * store to AGENT (`sc1`, device scope), which is what a LOCAL activation actually needs and is
- * cheaper than SYSTEM (`sc0 sc1`) because it publishes into the device-wide Infinity Cache
- * instead of write-through past it. It is WRONG UNDER TP by exactly the mechanism the note
- * above records: the GEMV epilogue's write into `peer_scratch` never crosses XGMI, so XReduce
- * sums stale slots. Its only job is to PRICE the two-class split (local `sc1` / peer `sc0 sc1`)
- * before anyone builds the emitter plumbing that split needs — if the agent-scope arm is not
- * meaningfully faster than the system-scope one, the split is not worth building. */
-#ifndef PLOW_ACT_SCOPE_AGENT
-#define PLOW_ACT_SCOPE_AGENT 0
-#endif
-#if PLOW_ACT_SCOPE_AGENT
-#define PLOW_ACT_SCOPE __HIP_MEMORY_SCOPE_AGENT /* UNSAFE UNDER TP — measurement only */
-#else
+ * is SYSTEM and not AGENT. */
 #define PLOW_ACT_SCOPE __HIP_MEMORY_SCOPE_SYSTEM
-#endif
 
 /* ONE SCALAR ACTIVATION ELEMENT, scoped under PLOW_GATE_SC1 and a plain store otherwise.
  *
@@ -265,8 +245,6 @@ __device__ __forceinline__ void st_act(PLOW_GLOB T* p, T v) {
 __device__ __forceinline__ void st_glob8(bf16* p, bf16v8 v) {
 #if PLOW_GATE_SC1
     asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(v) : "memory");
-#elif PLOW_ACT_NT
-    __builtin_nontemporal_store(v, (PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p);
 #else
     *(PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p = v;
 #endif
@@ -274,8 +252,6 @@ __device__ __forceinline__ void st_glob8(bf16* p, bf16v8 v) {
 __device__ __forceinline__ void st_glob8(PLOW_GLOB bf16* p, bf16v8 v) {
 #if PLOW_GATE_SC1
     asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(v) : "memory");
-#elif PLOW_ACT_NT
-    __builtin_nontemporal_store(v, (PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p);
 #else
     *(PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p = v;
 #endif

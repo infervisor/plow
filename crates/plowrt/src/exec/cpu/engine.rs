@@ -1717,14 +1717,10 @@ pub fn cu_domains(progs: &[DevProg], n_cu: u32) -> Option<(Vec<u32>, u32)> {
 ///
 /// The decode penalty tracks the idle count — 240 idle is 8.3x, 48 idle is 2.9x, 0 is baseline.
 ///
-/// The global queue is exempt: there every worker claims from the shared window, so workers past
-/// `n_cu` do useful work rather than idling. An explicit `--cpu-threads` is always honoured.
-fn worker_width(explicit: usize, want: usize, n_cu: u32, gq: bool) -> usize {
+/// An explicit `--cpu-threads` is always honoured.
+fn worker_width(explicit: usize, want: usize, n_cu: u32) -> usize {
     if explicit != 0 {
         return explicit;
-    }
-    if gq {
-        return want.max(1);
     }
     want.min(n_cu as usize).max(1)
 }
@@ -1994,27 +1990,18 @@ mod placement_tests {
     }
 
     /// A worker past `n_cu` owns nothing in any program and only costs its spin, so the auto width
-    /// is capped. Measured 8.3x on decode; the explicit override and the global queue are exempt.
+    /// is capped. Measured 8.3x on decode; the explicit override is exempt.
     #[test]
     fn worker_width_never_exceeds_the_packet() {
-        assert_eq!(worker_width(0, 384, 144, false), 144, "capped at n_cu");
+        assert_eq!(worker_width(0, 384, 144), 144, "capped at n_cu");
+        assert_eq!(worker_width(0, 96, 144), 96, "no cap needed below n_cu");
         assert_eq!(
-            worker_width(0, 96, 144, false),
-            96,
-            "no cap needed below n_cu"
-        );
-        assert_eq!(
-            worker_width(0, 384, 144, true),
-            384,
-            "global queue uses every worker"
-        );
-        assert_eq!(
-            worker_width(192, 384, 144, false),
+            worker_width(192, 384, 144),
             192,
             "explicit --cpu-threads wins"
         );
-        assert_eq!(worker_width(512, 384, 144, false), 512, "even above n_cu");
-        assert_eq!(worker_width(0, 8, 0, false), 1, "never zero workers");
+        assert_eq!(worker_width(512, 384, 144), 512, "even above n_cu");
+        assert_eq!(worker_width(0, 8, 0), 1, "never zero workers");
     }
 
     /// `cu_work` keeps one row per program rather than collapsing them.
@@ -2046,37 +2033,12 @@ fn loaded(
     } else {
         None
     };
-    // Global-queue mode (opt-in, `PLOW_CPU_GQ=1`): the blob's op-major `GQ01` stream windowed by
-    // `[segment][l2 domain]`; workers claim from their domain's window and steal from the others,
-    // so a slow slice no longer stalls its whole static stream. Static streams stay the default
-    // until it measures faster.
-    let gq_on = crate::config::RuntimeConfig::get().cpu.gq_opt_in;
-    let gq = if gq_on && !p.gq_stream.is_empty() {
-        let domains = p.l2_domains.max(1);
-        if p.gq_seg_ofs.len() as u32 == n_seg * domains + 1 && p.gq_stream.len() == p.stream.len() {
-            Some(crate::exec::cpu::interp::GlobalQueue {
-                stream: p.gq_stream.clone(),
-                seg_ofs: p.gq_seg_ofs.clone(),
-                domains,
-            })
-        } else {
-            tracing::warn!(
-                windows = p.gq_seg_ofs.len(),
-                n_seg,
-                domains,
-                "PLOW_CPU_GQ: blob GQ appendix does not match the program; using static streams"
-            );
-            None
-        }
-    } else {
-        None
-    };
     // No per-program narrowing: an idle worker still polls on the SMT sibling of a busy core, which
     // cost more than the narrowing gained (see the module note on worker width). The pool is sized
     // once for the model and every program uses all of it.
     let _ = (per_node, physical, logical);
     let g = crate::config::RuntimeConfig::get().cpu.combine;
-    let (comb_ofs, comb, n_cells) = if g > 0 && gq.is_none() {
+    let (comb_ofs, comb, n_cells) = if g > 0 {
         crate::exec::cpu::interp::combine_tables(
             &p.stream,
             &p.stream_ofs,
@@ -2103,7 +2065,7 @@ fn loaded(
         n_cu,
         n_seg,
         seg_ofs,
-        gq,
+        gq: None,
     }
 }
 
@@ -2458,7 +2420,6 @@ impl CpuEngine {
             opts.threads,
             threads.max(if wants_logical { logical_w } else { physical_w }),
             n_cu,
-            crate::config::RuntimeConfig::get().cpu.gq_opt_in,
         );
         tracing::info!(
             threads,
@@ -2491,38 +2452,7 @@ impl CpuEngine {
                 }
             }
         }
-        // The packet's locality hint, mapped onto this host's nodes. Absent for an unplaced blob,
-        // one node, or domains that do not divide over the nodes: placement stays cu % nodes.
-        let cu_dom = crate::config::RuntimeConfig::get()
-            .cpu
-            .l2_place
-            .then(|| cu_domains(&model.blob.progs, n_cu))
-            .flatten();
-        let plan = cu_dom.as_ref().and_then(|(d, n)| {
-            let work = cu_work(&model.blob.progs, n_cu);
-            node_plan(d, *n, nodes.len(), &work).map(|p| (p, *n))
-        });
-        match &plan {
-            Some((_, domains)) => tracing::info!(
-                domains,
-                nodes = nodes.len(),
-                "CPU NUMA placement follows the packet's L2 locality domains"
-            ),
-            None => tracing::debug!(
-                nodes = nodes.len(),
-                l2_domains = cu_dom.as_ref().map(|(_, n)| *n).unwrap_or(0),
-                "CPU NUMA placement is round-robin; no usable packet locality plan"
-            ),
-        }
-        let pool = WorkerPool::spawn(
-            &topo,
-            threads,
-            &opts.numa,
-            opts.spin_us,
-            n_cu,
-            plan.as_ref().map(|(p, n)| (p.as_slice(), *n)),
-            exec,
-        );
+        let pool = WorkerPool::spawn(&topo, threads, &opts.numa, opts.spin_us, n_cu, None, exec);
         let progs: Vec<Arc<LoadedProgram>> = model
             .blob
             .progs

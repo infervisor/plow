@@ -1722,11 +1722,7 @@ __device__ __noinline__ void fa_decode_rgt_item(
  * prefill bodies do); scores, m, l and O stay f32. Same (Opart, mlpart) / fold contract. */
 /* Stages per warp ring: ~128 KiB in flight per SM either way (4 x 4.3 KiB at hd128, 2 x 8.4 KiB at
  * hd256); a third hd256 stage does not fit next to the interpreter's static smem. */
-#ifndef PLOW_NV_FA_RGM_STAGES
 #define FA_RGM_NSTG(D) ((D) <= 128 ? 4u : 2u)
-#else
-#define FA_RGM_NSTG(D) ((unsigned)PLOW_NV_FA_RGM_STAGES)
-#endif
 #define FA_RGM_RB(D) ((unsigned)(D) * 2u + 16u)          /* padded smem row bytes */
 #define FA_RGM_STAGE_BYTES(D) (16u * FA_RGM_RB(D))        /* 8 K rows + 8 V rows */
 #define FA_RGM_FOLD_FLOATS(D) (((PLOW_NV_WARPS * ((D) + 2u)) + 31u) / 32u * 32u)
@@ -3403,9 +3399,6 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
  * nonzero bits break numerics on purpose to attribute the fp8mma arm's per-tile cost):
  * bit0 skip dequantV+barrier; bit1 skip the per-q-tile Q quant; bit2 skip QK mma+store;
  * bit3 skip scale staging + vsc fold. */
-#ifndef PLOW_NV_FA_FP8ABL
-#define PLOW_NV_FA_FP8ABL 0
-#endif
 #if PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV)
 #if PLOW_NV_FA_TMA
 #error "PLOW_NV_FA_FP8MMA is cp.async-staging only (the TMA arm stages bf16 Ks)"
@@ -4043,7 +4036,6 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
          * of the e4m3 dot exactly as the decode/GEMM w8a8 scales do). Zero rows (pad) => qinv 0 =>
          * stored bytes 0, scale 0 — masked columns aside, a zero Q row yields zero scores. */
         if constexpr (FP8KV) {
-#if !(PLOW_NV_FA_FP8ABL & 2)
             __syncthreads(); /* Qs staged by ALL threads visible before the quant read */
             const int qr = warp * 4 + (lane >> 3);
             const int le = lane & 7;
@@ -4080,7 +4072,6 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                         make_uint2(u0, u1);
                 }
             }
-#endif /* !(PLOW_NV_FA_FP8ABL & 2) */
         }
 #endif
 #if PLOW_NV_FA_TMA
@@ -4278,14 +4269,12 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
              * their P is 0; 0 avoids NaN from uninitialized ring rows). The WAIT_K
              * __syncthreads below orders the STS before every consumer. */
             if constexpr (FP8KV) {
-#if !(PLOW_NV_FA_FP8ABL & 8)
                 if (tid < 2 * BKV) {
                     ((tid < BKV) ? ksc_s : vsc_s)[tid & (BKV - 1)] = sc_pf;
                     const unsigned kvn = kv0 + BKV + (unsigned)(tid & (BKV - 1));
                     sc_pf = 0.0f;
                     if (kvn < hi) sc_pf = (tid < BKV) ? ksc[kvn & kv_mask] : vsc[kvn & kv_mask];
                 }
-#endif /* !(PLOW_NV_FA_FP8ABL & 8) */
             }
 #endif
             FA_PX4_WAIT_K();
@@ -4313,7 +4302,6 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                      * the operands are PLAIN u32 reads (no ldmatrix for 8-bit; layout per
                      * fa_mma_fp8_k32's note, validated in experiments/fp8_verify.cu). */
                     constexpr int KSTEPS8_H = HD / 2 / 32; /* 8 k32 steps per hd half */
-#if !(PLOW_NV_FA_FP8ABL & 4)
                     const int nn = qk_wn * 8 + (lane >> 2);
                     const int kb0 = khoff + 8 * (lane & 3);
                     /* A: ONE conflict-free LDS.128 per kf from the fragment-order Qs8 (see the
@@ -4343,7 +4331,6 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                     }
 #pragma unroll
                     for (int e = 0; e < 4; e++) acc[e] += accB[e] + (accC[e] + accD[e]);
-#endif /* !(PLOW_NV_FA_FP8ABL & 4) */
                 } else
 #endif
                 {
@@ -4417,7 +4404,6 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
              * stageK/commit above kept counts symmetric), exactly as the old post-softmax wait. */
             if constexpr (FP8KV) {
                 FA_PX4_WAIT_V();
-#if !(PLOW_NV_FA_FP8ABL & 1)
                 /* OWN-BYTES dequant to FP16 (one cvt.f16x2.e4m3x2 per byte-pair — no f32/bf16
                  * round-trip) with the per-row V-scale FOLDED INTO V (|V*vsc| is the actual
                  * activation magnitude, comfortably fp16; P then stays UNSCALED in [0,1] and
@@ -4450,7 +4436,6 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                     *(uint4*)&Vs[r * (HD + PAD) + c16 + 8] = out0;
 #undef FA_CVT8
                 }
-#endif
             }
 #endif
 
@@ -4560,14 +4545,7 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
                  * 1.0 (ex2(0)) is bitwise identical. The bf16 arm keeps the unconditional
                  * rescale (its compute is mma-hidden; the ballot only added overhead there,
                  * and the bf16 object must stay byte-identical). */
-#ifndef PLOW_NV_FA_CORRSKIP
-#define PLOW_NV_FA_CORRSKIP 0 /* measured SLOWER (the ballot defeats the mma scheduler) */
-#endif
-#if PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV) && PLOW_NV_FA_CORRSKIP
-                constexpr bool FA_CORR_SKIP = FP8KV;
-#else
                 constexpr bool FA_CORR_SKIP = false;
-#endif
                 if (!FA_CORR_SKIP ||
                     __ballot_sync(0xffffffffu, corr[0] != 1.0f || corr[1] != 1.0f) != 0u) {
 #pragma unroll
@@ -5497,15 +5475,6 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
             return;
         }
     }
-#if defined(PLOW_NV_HOPPER) && 0
-    /* (folded into the branch above) */
-    if constexpr (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV)) {
-        d_flash_prefill_sm90<HD, BQ, BKV>(Opart, mlpart, Q, K, V, O, seq_q, seq_kv, n_head,
-                                          n_kv_head, q_pos0, window, nsplit, kv_stride, kv_mask,
-                                          scale, slice, nblk, lds, req, mapkv);
-        return;
-    }
-#endif
     /* T21: the shared mma.sync body must not INSTANTIATE for wgmma-claimed shapes —
      * <256,64,64>'s BKV breaks its lane-per-kv softmax static_assert. The asserts below are
      * template-dependent, so the discarded branch stays uninstantiated. */

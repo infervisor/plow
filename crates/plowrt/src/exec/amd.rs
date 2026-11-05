@@ -806,25 +806,6 @@ fn validate_decode_dispatch<'a>(
     Ok(())
 }
 
-/// `PLOW_AMD_LT_OVERLAP`: a native decode GEMM may start without waiting for the run of
-/// native GEMMs directly before it when it shares no tensor with any of them as a written
-/// operand (it reads none of their outputs and writes none of their operands).
-fn lt_overlaps_run(before: &[DecodeSegmentRoute], inst: &packet::dev::DevInst64) -> bool {
-    let (out, x) = (inst.t[0], inst.t[1]);
-    let mut any = false;
-    for r in before.iter().rev() {
-        let DecodeSegmentRoute::GemmLt(prev) = r else {
-            break;
-        };
-        let pi = prev.inst();
-        if pi.t[0] == x || pi.t[0] == out || pi.t[1] == out || pi.t[2] == out {
-            return false;
-        }
-        any = true;
-    }
-    any
-}
-
 /// `plow_glm_inproj_*` kernargs (runtime/amd/glm_inproj.hip `InprojArgs`).
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -9800,8 +9781,8 @@ impl AmdEngine {
         // Task-13: the low-rung decode tier ladder. Each tier's pairing checks
         // run with ITS need (the widest rung it will serve), not the blob-wide
         // max — an MM=4 object legitimately serves rungs 1-2 of a B=32 blob.
-        // `PLOW_HSACO_LOWRUNG` is either `<dir>` (max = PLOW_LOWRUNG_MAX,
-        // default 2) or `dir:max[,dir:max]...`; selection takes the narrowest
+        // `PLOW_HSACO_LOWRUNG` is either `<dir>` (max 2) or
+        // `dir:max[,dir:max]...`; selection takes the narrowest
         // tier that fits, so the list is sorted ascending here.
         let mut decode_tiers: Vec<(u32, HsaKernel)> = Vec::new();
         if let Some(spec) = &lowrung_dir {
@@ -9821,8 +9802,7 @@ impl AmdEngine {
                     tiers.push((d.to_string(), m));
                 }
             } else {
-                let max = crate::config::RuntimeConfig::get().amd.lowrung_max;
-                tiers.push((spec.clone(), max));
+                tiers.push((spec.clone(), 2));
             }
             tiers.sort_by_key(|&(_, m)| m);
             for (d, max) in tiers {
@@ -11202,7 +11182,7 @@ impl AmdEngine {
         };
         let mut k_kda_spans = KdaSpansKernels::default();
         let amd_cfg = &crate::config::RuntimeConfig::get().amd;
-        if (amd_cfg.packed_lean_kda_batch || amd_cfg.mixed_ride_trim) && arch == "gfx950" {
+        if amd_cfg.packed_lean_kda_batch && arch == "gfx950" {
             let mut load_spans = |name: &str, symbol: &str, base: u32| -> Option<HsaKernel> {
                 let path = hsaco_dir.join(name);
                 let loaded = (|| -> Result<(Module, HsaKernel)> {
@@ -15203,74 +15183,6 @@ impl AmdEngine {
             .map(|i| self.devp[i].len)
     }
 
-    /// DIAGNOSTIC (`PLOW_TB_DUMP=<dir>`): after a token-batch body step, write the plan and the
-    /// per-slot device state the step produced — `in.kvlen`/`in.ids`/`in.pos`, every active band
-    /// slot's KV rows (see [`Self::dump_slot_kv`]) and its logits row — as raw files under
-    /// `dir/<tag>.*`.
-    pub fn token_batch_dump(
-        &self,
-        dir: &Path,
-        tag: &str,
-        plan: &plow_asset::mixed_step::Plan,
-    ) -> Result<()> {
-        use std::fmt::Write as _;
-        let io = |e: std::io::Error| RuntimeError::Device(format!("token-batch dump: {e}"));
-        std::fs::create_dir_all(dir).map_err(io)?;
-        let fetch = |i: usize, off: u64, len: usize| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; len];
-            EngineDevice::download(&*self.be, &self.devp[i], off, &mut buf)?;
-            Ok(buf)
-        };
-        let write = |name: String, bytes: &[u8]| -> Result<()> {
-            std::fs::write(dir.join(format!("{tag}.{name}")), bytes).map_err(io)
-        };
-        let mut text = String::new();
-        let _ = writeln!(
-            text,
-            "cover={:?} decode_rows={} real_rows={} decode_slots={:?}",
-            plan.cover, plan.decode_rows, plan.real_rows, plan.decode_slots
-        );
-        for (r, row) in plan.rows.iter().enumerate().take(plan.real_rows as usize) {
-            let _ = writeln!(
-                text,
-                "row {r}: token={} slot={} pos={} kv_len={} phase={:?} parked={}",
-                row.token, row.slot, row.position, row.kv_len, row.phase, plan.parked[r]
-            );
-        }
-        for (s, span) in plan.prefill_spans.iter().enumerate() {
-            let _ = writeln!(text, "span {s}: {span:?}");
-        }
-        let _ = writeln!(
-            text,
-            "commits={:?} mapped_ends={:?}",
-            plan.commits, plan.mapped_ends
-        );
-        write("plan.txt".into(), text.as_bytes())?;
-        let band = plan.decode_rows as usize;
-        if let Some(t) = self.t_kvlen {
-            write("in.kvlen.bin".into(), &fetch(t, 0, self.batch * 4)?)?;
-        }
-        if let Some(t) = self.t_ids {
-            write("in.ids.bin".into(), &fetch(t, 0, plan.rows.len() * 4)?)?;
-        }
-        if let Some(t) = self.t_pos {
-            write("in.pos.bin".into(), &fetch(t, 0, plan.rows.len() * 4)?)?;
-        }
-        let logits = self.tensor_names.iter().position(|n| n == "act.logits");
-        for slot in 0..band.min(plan.rows.len()) {
-            if plan.parked[slot] != 0 {
-                continue;
-            }
-            self.dump_slot_kv(dir, tag, slot, plan.rows[slot].kv_len)?;
-            if let Some(i) = logits {
-                let row_bytes = self.devp[i].len / band as u64;
-                let bytes = fetch(i, slot as u64 * row_bytes, row_bytes as usize)?;
-                write(format!("slot{slot}.logits.bin"), &bytes)?;
-            }
-        }
-        Ok(())
-    }
-
     /// DIAGNOSTIC: one slot's KV rows `[0, kv_len)` on the first and last layer (latent, rope,
     /// FP8 scale, index keys) as raw files `dir/<tag>.slot<slot>.kv.<layer>.<kind>.bin`.
     pub fn dump_slot_kv(&self, dir: &Path, tag: &str, slot: usize, kv_len: u32) -> Result<()> {
@@ -16532,10 +16444,7 @@ impl AmdEngine {
                 if self.k_router_fused.is_some() {
                     1
                 } else {
-                    2 + crate::config::RuntimeConfig::get()
-                        .amd
-                        .router_repeat
-                        .unwrap_or(0) as usize
+                    2
                 }
             }
             Some(DecodeSegmentRoute::LtFused(_)) => 2,
@@ -16639,7 +16548,7 @@ impl AmdEngine {
                 .packed_prefill
                 .is_some_and(|b| b.prog == p && !b.token_batch)
             || self.kda_spans(p).is_empty()
-            || (self.kda_spans(p).iter().any(|s| s.n_rows < 512) && !self.lean_kda_spans_short())
+            || self.kda_spans(p).iter().any(|s| s.n_rows < 512)
         {
             return false;
         }
@@ -16785,23 +16694,10 @@ impl AmdEngine {
         flush(&mut m)
     }
 
-    /// `PLOW_AMD_MIXED_RIDE_TRIM`: short spans (decode riders, trimmed tails) stay on the lean KDA
-    /// route only if EVERY loaded lean object has its all-spans twin, which runs spans of any
-    /// length; the single-span objects return early below 512 rows.
-    fn lean_kda_spans_short(&self) -> bool {
-        let k = &self.k_kda_spans;
-        crate::config::RuntimeConfig::get().amd.mixed_ride_trim
-            && (self.k_kda_chunk_intra_wave_items.is_none() || k.intra_wave_items.is_some())
-            && (self.k_kda_chunk_wu_lean.is_none() || k.wu_lean.is_some())
-            && (self.k_kda_chunk_wu_lean_keys.is_none() || k.wu_lean_keys.is_some())
-            && (self.k_kda_chunk_carry_keyfeed.is_none() || k.carry_keyfeed.is_some())
-            && (self.k_kda_chunk_carry_regstate.is_none() || k.carry_regstate.is_some())
-    }
-
     /// `PLOW_AMD_PACKED_LEAN_KDA_BATCH`: the all-spans object for this lean KDA segment.
     fn packed_lean_kda_spans_kernel(&self, p: usize, seg: usize) -> Option<HsaKernel> {
         let cfg = &crate::config::RuntimeConfig::get().amd;
-        if !(cfg.packed_lean_kda_batch || cfg.mixed_ride_trim) {
+        if !cfg.packed_lean_kda_batch {
             return None;
         }
         let k = &self.k_kda_spans;
@@ -17237,9 +17133,6 @@ impl AmdEngine {
     }
 
     pub(crate) fn replay_without_prepare(&self, p: usize) -> Result<bool> {
-        if crate::config::RuntimeConfig::get().amd.native_launch_timing {
-            return Ok(false);
-        }
         for seg in 0..self.prog_dispatch(p).launches() {
             if self.segment_needs_prepare(p, seg)? {
                 return Ok(false);
@@ -17369,11 +17262,6 @@ impl AmdEngine {
                         self.lt_group.1.clear();
                     }
                     self.lt_group.1.push((out, x));
-                } else if !is_last_seg
-                    && crate::config::RuntimeConfig::get().amd.lt_overlap
-                    && lt_overlaps_run(&self.progs[p].decode_routes[..seg], route.inst())
-                {
-                    self.be.skip_next_barrier();
                 }
                 if let Err(err) = kernel.enqueue(&self.be, route, &self.tens_table) {
                     self.be.clear_skip_barrier();
@@ -17497,24 +17385,16 @@ impl AmdEngine {
                     as_bytes(std::slice::from_ref(&ga)),
                     None,
                 )?;
-                // PLOW_AMD_ROUTER_REPEAT (diagnostic): the idempotent top-k launched again, to
-                // price one more launch of it.
-                let reps = 1 + crate::config::RuntimeConfig::get()
-                    .amd
-                    .router_repeat
-                    .unwrap_or(0);
-                for _ in 0..reps {
-                    EngineDevice::launch_kernel(
-                        &*self.be,
-                        kt,
-                        topk.i[4].div_ceil(4),
-                        256,
-                        0,
-                        as_bytes(std::slice::from_ref(&ta)),
-                        None,
-                    )?;
-                }
-                self.seg_launches += u64::from(reps);
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kt,
+                    topk.i[4].div_ceil(4),
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&ta)),
+                    None,
+                )?;
+                self.seg_launches += 1;
             }
             DecodeSegmentRoute::XrNative(inst) => self.launch_xr_native(&inst)?,
             DecodeSegmentRoute::DenseNative(r) => {
@@ -18513,21 +18393,6 @@ impl AmdEngine {
         // an error. A MODEL without one is, because the sampled logits would
         // then come from whatever row the compiler baked in.
         match (lm, self.t_logits) {
-            // DIAGNOSTIC: `--amd-lm-row0` / `PLOW_LM_ROW0=1` leaves a_row0 at
-            // 0 instead of the
-            // chunk's last real row. It samples the WRONG row, so it is not a
-            // serving mode — it exists to answer one question. The lm_head is
-            // the ONLY op whose a_row0 the host patches to a non-zero value at
-            // runtime, so a bug in the a_row0 path is invisible to any check
-            // that inspects the packet statically (where all fp8 GEMMs carry
-            // a_row0 == 0) and shows up only here.
-            (Some(lm), _) if crate::config::RuntimeConfig::get().amd.lm_row0 => {
-                tracing::warn!(
-                    lm,
-                    "PLOW_LM_ROW0=1: a_row0 left at 0 — DIAGNOSTIC, wrong row"
-                );
-                insts[lm].i[4] = 0;
-            }
             // A token-batch body samples its whole slot band `[0, band)` through a tiled
             // GEMM; there is no last-row a_row0 to place and `i[4]` is not that field there.
             (Some(_), _) if self.progs[prog].role.is_token_batch_body() => {}

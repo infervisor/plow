@@ -49,7 +49,7 @@ __global__ void k_score(float* score, const bf16* resid, const bf16* proj, const
                              blockIdx.x, gridDim.x, nrow);
 }
 
-/* The emit default (ScoreFast); the recipe's PLOW_GEMMA_MOE_ROUTER_EXACT=1 selects k_score. */
+/* The emit default (ScoreFast). */
 __global__ void k_score_fast(float* score, const bf16* resid, const bf16* proj, const bf16* scale,
                              unsigned H, unsigned n_exp, float root, float eps, unsigned nrow) {
     d_moe_router_gemma_score_fast(score, resid, proj, scale, H, n_exp, root, eps,
