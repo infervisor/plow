@@ -72,7 +72,7 @@ fn draw(e: &mut GpuEngine, outputs: &[(u32, u32)], step: u32) {
 }
 
 #[test]
-#[ignore = "GPU correctness only; SPEECH_BATCH_TEST_ASSETS, PLOW_VMM_PREFIX=1; run through gpuq"]
+#[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, PLOW_VMM_PREFIX=1, RUST_MIN_STACK=67108864; run through gpuq"]
 fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
     let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
     let be = Arc::new(CudaBackend::new(0).unwrap());
@@ -132,8 +132,12 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
     assert_eq!(original, logits);
     e.fish = Some(d);
 
-    let mut a = vec![contract.input_vocab - 1; 41];
-    let mut b = vec![contract.input_vocab - 2; 37];
+    let mut a: Vec<_> = (0..41)
+        .map(|i| (31 + i * 7919) % contract.input_vocab)
+        .collect();
+    let mut b: Vec<_> = (0..37)
+        .map(|i| (97 + i * 7919) % contract.input_vocab)
+        .collect();
     if let Some(token) = contract.decode_token {
         a[3] = token;
         b[3] = token;
@@ -183,6 +187,9 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
     .unwrap();
     assert_eq!(outputs.len(), 2);
     assert_eq!((e.pos[3], e.pos[0]), (41, 37));
+    let mut fresh_prompt_logits = Vec::new();
+    let row = outputs.iter().position(|o| o.0 == 0).unwrap();
+    e.logits_row(row, &mut fresh_prompt_logits).unwrap();
     if !shared {
         let epoch = e.slot_prefix_epoch();
         e.keep_slot_prefix(3, epoch, keys_a.clone());
@@ -222,6 +229,13 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
         let mut tokens = Vec::new();
         e.step_slots(&[(3, input[0])], &mut tokens).unwrap();
         e.logits_row(3, &mut reference).unwrap();
+        let mut reference_hidden = vec![0u16; pitch as usize / 2];
+        e.be.download(
+            &e.devp[contract.hidden as usize],
+            3 * pitch,
+            bytemuck::cast_slice_mut(&mut reference_hidden),
+        )
+        .unwrap();
         e.rewind_slot(3, a.len() + step as usize - 1).unwrap();
         let requests = [
             Request {
@@ -259,6 +273,34 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
         }
         let mut actual = Vec::new();
         e.logits_row(0, &mut actual).unwrap();
+        let mut actual_hidden = vec![0u16; pitch as usize / 2];
+        e.be.memcpy_dtoh(bytemuck::cast_slice_mut(&mut actual_hidden), src)
+            .unwrap();
+        let (mut dot, mut rr, mut aa, mut dd) = (0f64, 0f64, 0f64, 0f64);
+        for (&r, &a) in reference_hidden.iter().zip(&actual_hidden) {
+            let r = f64::from(f32::from_bits(u32::from(r) << 16));
+            let a = f64::from(f32::from_bits(u32::from(a) << 16));
+            dot += r * a;
+            rr += r * r;
+            aa += a * a;
+            dd += (r - a) * (r - a);
+        }
+        let max_error = actual
+            .iter()
+            .zip(&reference)
+            .map(|(a, r)| (a - r).abs())
+            .fold(0f32, f32::max);
+        let top = |l: &[f32]| {
+            let mut ids: Vec<_> = l.iter().copied().enumerate().collect();
+            ids.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            ids[..4].to_vec()
+        };
+        eprintln!("hidden cosine={} relative RMS={}, logits max_error={max_error}, reference top={:?}, actual top={:?}",
+            dot / (rr * aa).sqrt(), (dd / rr).sqrt(), top(&reference), top(&actual));
+        assert!(
+            dot / (rr * aa).sqrt() > 0.999,
+            "mixed decode hidden state differs"
+        );
         assert!(actual.iter().chain(&reference).all(|v| v.is_finite()));
         let softmax = |values: &[f32]| {
             let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -276,9 +318,28 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
             .sum();
         eprintln!("mixed decode vs ordinary decode full-logit KL = {kl}");
         assert!(kl < 1e-3, "mixed decode differs from ordinary decode");
+        let mut cached_prompt_logits = Vec::new();
+        let row = outputs.iter().position(|o| o.0 == 0).unwrap();
+        e.logits_row(row, &mut cached_prompt_logits).unwrap();
+        let (p, q) = (
+            softmax(&fresh_prompt_logits),
+            softmax(&cached_prompt_logits),
+        );
+        let cached_kl: f64 = p
+            .iter()
+            .zip(q)
+            .filter(|(p, _)| **p > 0.0)
+            .map(|(&p, q)| p * (p / q).ln())
+            .sum();
+        eprintln!("retained prompt vs fresh full-logit KL = {cached_kl}");
+        assert!(
+            cached_kl < 1e-3,
+            "retained prefix changed the prompt output"
+        );
         assert_eq!(
-            crate::text::sample::argmax(&reference),
-            crate::text::sample::argmax(&actual)
+            reference[crate::text::sample::argmax(&reference) as usize],
+            reference[crate::text::sample::argmax(&actual) as usize],
+            "mixed decode must choose a reference maximum, including BF16 ties"
         );
         draw(&mut e, &outputs, step);
     }
