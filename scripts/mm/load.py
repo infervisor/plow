@@ -19,6 +19,12 @@ many requests, so the same bit-31 ids and prefix-cache hits). Unique media are m
 --text-only runs only the text requests of the mix (steps 1-2, DIR/load-text.json): the baseline
 that media TTFT and throughput are read against.
 
+--perf runs no checks and works against any OpenAI-compatible server (plowrt or vLLM, same client):
+per --perf-kinds kind (audio: a unique clip of --manifest per request; text: a unique short prompt)
+and concurrency, --reps repeats of max(16, 3*conc) streamed greedy requests with ignore_eos and
+--max-tokens outputs; TTFT / TPOT p50/p99 and out tok/s per repeat. --wer N first transcribes N
+manifest clips greedily (concurrency 8, eval.py normalization). Writes DIR/perf.json.
+
 Writes DIR/load.json (and prints a summary); exits 1 when a check fails.
 """
 import argparse, base64, http.client, io, json, random, re, struct, sys, time, urllib.parse, wave, zlib
@@ -86,10 +92,10 @@ class Client:
                 vals[key] = vals.get(key, 0.0) + float(m[3])
         return vals
 
-    def chat(self, messages, max_tokens, stream, cancel=None):
+    def chat(self, messages, max_tokens, stream, cancel=None, extra=None):
         """{status, text, tokens[(tok, top)], ttft, latency, prompt_tokens, completion_tokens, retry_after}."""
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": 0,
-                "logprobs": True, "top_logprobs": 2}
+                "logprobs": True, "top_logprobs": 2, **(extra or {})}
         if stream:
             body.update(stream=True, stream_options={"include_usage": True})
         t0 = time.perf_counter()
@@ -153,9 +159,69 @@ def pct(xs, p):
     return xs[min(len(xs) - 1, int(p * len(xs)))] if xs else None
 
 
+def perf(args, cl):
+    """Matched audio/text serving cells (see --perf in the module doc)."""
+    import os
+    import statistics
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "serve_test"))
+    from eval import norm_en
+    clips = json.load(open(args.manifest))
+    audio = lambda path, seed, text: [{"role": "user", "content": [
+        {"type": "input_audio", "input_audio": {"data": b64(perturbed_wav(path, seed)), "format": "wav"}},
+        {"type": "text", "text": text}]}]
+    report = {"model": args.model, "max_tokens": args.max_tokens, "reps": args.reps, "cells": []}
+    if args.wer:
+        import jiwer
+        sub = clips[:args.wer]
+        with ThreadPoolExecutor(8) as ex:
+            rs = list(ex.map(lambda c: cl.chat(audio(c["path"], 0, "Transcribe this audio."), 256, stream=False), sub))
+        bad = [r.get("body") for r in rs if r["status"] != 200]
+        hyps = [norm_en(r["text"]) for r in rs]
+        refs = [norm_en(c["text"]) for c in sub]
+        report["wer"] = {"clips": len(sub), "errors": len(bad), "wer": round(jiwer.wer(refs, hyps), 5),
+                         "hyps": [r["text"] for r in rs]}
+        print(json.dumps({k: v for k, v in report["wer"].items() if k != "hyps"}), flush=True)
+    seed = iter(range(1, 10**9))
+    for kind in args.perf_kinds.split(","):
+        for conc in map(int, args.concs.split(",")):
+            n = max(16, 3 * conc)
+            for rep in range(args.reps):
+                def msg(i):
+                    s = next(seed)
+                    if kind == "audio":
+                        return audio(clips[i % len(clips)]["path"], s, "Listen to the caller and reply helpfully.")
+                    return [{"role": "user", "content": f"Ticket {s}: {TEXTS[i % len(TEXTS)]}"}]
+                msgs = [msg(i) for i in range(n)]
+                before = cl.metrics()
+                t0 = time.perf_counter()
+                with ThreadPoolExecutor(conc) as ex:
+                    rs = list(ex.map(lambda m: cl.chat(m, args.max_tokens, stream=True, extra={"ignore_eos": True}), msgs))
+                wall = time.perf_counter() - t0
+                ok = [r for r in rs if r["status"] == 200 and r["ttft"] is not None]
+                ttft = [r["ttft"] * 1e3 for r in ok]
+                tpot = [(r["latency"] - r["ttft"]) * 1e3 / (r["completion_tokens"] - 1) for r in ok
+                        if (r.get("completion_tokens") or 0) > 1]
+                outn = sum(r.get("completion_tokens") or 0 for r in ok)
+                cell = {"kind": kind, "conc": conc, "rep": rep + 1, "requests": n, "errors": n - len(ok),
+                        "prompt_tokens_mean": round(statistics.mean(r.get("prompt_tokens") or 0 for r in ok), 1) if ok else None,
+                        "out_tokens": outn, "wall_s": round(wall, 3), "out_tok_s": round(outn / wall, 1),
+                        "total_tok_s": round((outn + sum(r.get("prompt_tokens") or 0 for r in ok)) / wall, 1),
+                        "ttft_ms": {"p50": pct(ttft, 0.5), "p99": pct(ttft, 0.99), "mean": statistics.mean(ttft) if ttft else None},
+                        "tpot_ms": {"p50": pct(tpot, 0.5), "p99": pct(tpot, 0.99), "mean": statistics.mean(tpot) if tpot else None}}
+                after = cl.metrics()
+                calls = after.get("plowrt_mm_encode_total:audio", 0) - before.get("plowrt_mm_encode_total:audio", 0)
+                if calls:
+                    secs = after.get("plowrt_mm_encode_seconds_total:audio", 0) - before.get("plowrt_mm_encode_seconds_total:audio", 0)
+                    cell["encode_ms_mean"] = round(secs / calls * 1e3, 2)
+                report["cells"].append(cell)
+                print(json.dumps(cell), flush=True)
+    json.dump(report, open(f"{args.out}/perf.json", "w"), indent=1)
+    return 1 if any(c["errors"] for c in report["cells"]) else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("ref")
+    ap.add_argument("ref", nargs="?")
     ap.add_argument("--base", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
@@ -165,9 +231,16 @@ def main():
     ap.add_argument("--tie-margin", type=float, default=0.25)
     ap.add_argument("--burst", type=int, default=40, help="exhaustion burst size (unique image+audio requests)")
     ap.add_argument("--text-only", action="store_true", help="the text requests of the mix only (a baseline for the cells)")
+    ap.add_argument("--perf", action="store_true", help="matched serving cells only, any OpenAI server (module doc)")
+    ap.add_argument("--manifest", help="--perf: JSON list of {path, text} 16-bit PCM wav clips")
+    ap.add_argument("--perf-kinds", default="audio,text")
+    ap.add_argument("--reps", type=int, default=2)
+    ap.add_argument("--wer", type=int, default=0, help="--perf: transcribe this many manifest clips first")
     args = ap.parse_args()
-    ref = json.load(open(args.ref))
     cl = Client(args.base, args.model)
+    if args.perf:
+        return perf(args, cl)
+    ref = json.load(open(args.ref))
     items = ref["items"]
     image = next((i for i, it in enumerate(items) if it["kind"] == "image"), None)
     audio = next((i for i, it in enumerate(items) if it["kind"] == "audio"), None)
