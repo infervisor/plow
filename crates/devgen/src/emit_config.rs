@@ -526,6 +526,10 @@ pub struct EmitConfig {
     // ──────────────────────────────────────────────────────────────────────────
     // Placement / L2 / counters
     // ──────────────────────────────────────────────────────────────────────────
+    /// Opt-in knob for modular block prefill pipeline and fine-grained ladder decomposition.
+    #[arg(long, env = "PLOW_PF_MODULAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub pf_modular: bool,
+
     /// Cap XReduce participant CUs.
     #[arg(long, env = "PLOW_XR_CUS")]
     pub xr_cus: Option<u32>,
@@ -1976,6 +1980,7 @@ impl EmitConfig {
             pf_ladder_append: env_str("PLOW_PF_LADDER_APPEND"),
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
             block_packets: env_bool_default_true("PLOW_BLOCK_PACKETS"),
+            pf_modular: env_bool_default_true("PLOW_PF_MODULAR"),
             xr_cus: env_u32("PLOW_XR_CUS"),
             glm_pf_small_cus: env_str("PLOW_GLM_PF_SMALL_CUS"),
             xr_dec_cus: env_u32("PLOW_XR_DEC_CUS"),

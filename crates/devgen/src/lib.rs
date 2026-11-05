@@ -11383,7 +11383,7 @@ fn emit_dense_gqa(
         sections.push(write_block_descriptor(&out, &desc));
         eprintln!("  block mode: layers {block:?}");
     }
-    if block_mode || ecfg.block_packets {
+    if block_mode || ecfg.block_packets || ecfg.pf_modular {
         let is_sandwich = c.arch.is_gemma();
         let mut modular_progs = Vec::new();
         let ffn_kind = if c.moe {
