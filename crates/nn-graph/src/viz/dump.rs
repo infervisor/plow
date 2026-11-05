@@ -23,14 +23,19 @@ pub fn dump_assets(
 
     // 2. Pipeline summary JSON
     let pipeline_json = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": bundle.schema,
         "title": bundle.title,
         "source": bundle.source,
         "modality": bundle.modality,
+        "default_network": bundle.default_network,
+        "provenance": bundle.provenance,
+        "notes": bundle.notes,
         "networks": bundle.networks.iter().map(|n| serde_json::json!({
             "id": n.id,
             "title": n.title,
             "stages": n.stages,
             "summary": n.graph.summary,
+            "checkpoint": n.checkpoint,
         })).collect::<Vec<_>>(),
     }))
     .map_err(|e| format!("cannot serialize pipeline summary: {e}"))?;

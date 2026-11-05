@@ -49,13 +49,14 @@ rewrite = { workspace = true }
 packet = { workspace = true }
 schedule = { workspace = true }
 plow-asset = { workspace = true }
+# The cold-path packet visualizer reuses the runtime's checked container reader.
+plowrt = { path = "../plowrt", default-features = false }
 # Optional: JSON-IPC bridge to the Lean verifier CLI. See the `lean-verify`
 # feature below — without it, `--lean-verify` on the CLI returns a build-time
 # error instead of spawning `plow_verify`.
 lean_verify = { workspace = true, optional = true }
 
 [dev-dependencies]
-plowrt = { path = "../plowrt" }
 packet = { workspace = true }
 costmodel = { workspace = true }
 

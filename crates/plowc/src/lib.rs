@@ -51,6 +51,7 @@ pub mod stage_plan;
 pub mod tune;
 #[cfg(feature = "tuner")]
 pub mod tuned;
+pub mod viz_packet;
 
 use std::path::PathBuf;
 

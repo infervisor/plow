@@ -5,6 +5,7 @@
 //! access. Large graphs are never laid out whole on load: the overview collapses repeated blocks
 //! and the detail view shows one block at a time.
 
+mod checkpoint;
 pub mod dump;
 pub mod html;
 pub mod svg;
@@ -14,8 +15,8 @@ pub use dump::dump_assets;
 pub use html::render_html;
 pub use svg::bundle_to_svg;
 pub use types::{
-    ModelModality, OpCategory, VizBlock, VizGraph, VizModelBundle, VizNetwork, VizNode, VizStage,
-    VizSummary, VizTensor,
+    CheckpointTensor, ModelModality, OpCategory, VizBlock, VizCheckpoint, VizGraph, VizModelBundle,
+    VizNetwork, VizNode, VizProvenance, VizStage, VizSummary, VizTensor,
 };
 
 use crate::graph::{Graph, NodeId, Origin, TensorId};
@@ -92,7 +93,7 @@ fn expert_copies(g: &Graph) -> Vec<u32> {
 pub fn graph_to_viz_graph(g: &Graph) -> VizGraph {
     let mut total_params = 0u64;
     let mut total_weight_bytes = 0u64;
-    let mut category_counts = HashMap::new();
+    let mut category_counts = std::collections::BTreeMap::new();
     let mut seen_weights = std::collections::HashSet::new();
 
     let copies = expert_copies(g);
@@ -154,7 +155,7 @@ pub fn graph_to_viz_graph(g: &Graph) -> VizGraph {
                 id: NodeId(i as u32),
                 op: n.op.name(),
                 category,
-                detail: n.op.clone(),
+                detail: serde_json::to_value(&n.op).expect("op serializes"),
                 inputs: n.inputs.clone(),
                 output: n.output,
                 block: n.block.and_then(|b| g.block_label(b)).map(String::from),
@@ -537,10 +538,13 @@ fn network(
     stages: Vec<VizStage>,
 ) -> VizNetwork {
     VizNetwork {
+        kind: "architecture",
         id: id.into(),
         title: title.into(),
         description: description.into(),
         stages,
+        checkpoint: None,
+        metadata: None,
         graph,
     }
 }
@@ -555,6 +559,7 @@ pub fn bundle_from_graph(
     let mut graph = graph_to_viz_graph(g);
     let stages = generic_stages(&mut graph);
     VizModelBundle {
+        schema: "plow.viz.v1",
         title: title.into(),
         source: source.into(),
         modality,
@@ -567,6 +572,7 @@ pub fn bundle_from_graph(
             stages,
         )],
         notes: Vec::new(),
+        provenance: None,
     }
 }
 
@@ -579,13 +585,24 @@ pub fn bundle_from_model_config(
     bind: &crate::Bindings,
 ) -> Result<VizModelBundle, crate::models::BuildError> {
     let (modality, networks) = networks_for(cfg, bind)?;
+    let notes = match cfg {
+        crate::models::ModelConfig::Qwen3Asr(_) => vec![
+            "Architecture view of padded log-mel inputs. Waveform preprocessing, chunk packing, attention-window partitioning and audio-token placement are not represented.".into(),
+        ],
+        crate::models::ModelConfig::Gemma(c) if c.num_kv_shared_layers > 0 => vec![
+            format!("Partial attention dataflow: {} trailing layers reuse KV states in the model; cross-layer KV-sharing edges are not represented here.", c.num_kv_shared_layers),
+        ],
+        _ => Vec::new(),
+    };
     Ok(VizModelBundle {
+        schema: "plow.viz.v1",
         title: title.into(),
         source: source.into(),
         modality,
         default_network: networks[0].id.clone(),
         networks,
-        notes: Vec::new(),
+        notes,
+        provenance: None,
     })
 }
 
@@ -1058,12 +1075,14 @@ pub fn bundle_from_diffusers(
         ));
     };
     Ok(VizModelBundle {
+        schema: "plow.viz.v1",
         title: title.into(),
         source: source.into(),
         modality: ModelModality::Image,
         default_network: first.id.clone(),
         networks,
         notes,
+        provenance: None,
     })
 }
 
@@ -1220,9 +1239,12 @@ mod tests {
         net.graph
             .nodes
             .iter()
-            .filter_map(|n| match n.detail {
-                Op::Attention { head_dim, .. } => Some(head_dim),
-                _ => None,
+            .filter_map(|n| {
+                n.detail
+                    .get("Attention")?
+                    .get("head_dim")?
+                    .as_u64()
+                    .map(|d| d as u32)
             })
             .collect()
     }

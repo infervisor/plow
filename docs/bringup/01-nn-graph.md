@@ -214,8 +214,9 @@ nix develop --command bash -c 'cargo run -q -p plowc -- --model <hf-id> viz --po
 (`--hf-dir <dir>`, `--model <hf-id>`, `--net <file.json>`, or a diffusers repo with
 `model_index.json`), builds every network, runs shape inference (`--batch`/`--seq` bind
 `B`, `S`, `L`), and writes a self-contained viewer (or serves it with `--port <n>`).
-*Overview* shows stages with exact param shares and collapses identical consecutive
-blocks; *Detail* shows one block's ops with checkpoint weight names. Stage
+*Overview* is a compact stage pipeline; selecting a stage reveals its components.
+*Detail* shows bounded sections with ops, checkpoint weight names, search, tracing and tensor
+sizes. Data provenance and scope notes are expandable, not a second dashboard. Stage
 classification lives in `viz::bundle_from_model_config`; add an arm there when a new
 multi-stage model needs named stages (others get Input / Blocks / Output).
 `--dump-assets <dir>` writes `index.html`, `embed.html` (iframe build: `?theme=light|dark`,
@@ -223,6 +224,45 @@ multi-stage model needs named stages (others get Input / Blocks / Output).
 `pipeline.json` and `pipeline.svg`. The graph libraries load from jsdelivr unless
 `--script-base <prefix>` points at self-hosted `cytoscape.min.js`, `dagre.min.js` and
 `cytoscape-dagre.js`.
+
+For catalog exports, pin a revision and check storage against the actual checkpoint:
+
+```bash
+nix develop --command plowc --model Qwen/Qwen3-ASR-0.6B viz \
+  --revision <commit> --validate-checkpoint --port 0 --dump-assets <scratch>/qwen-asr
+```
+
+Only safetensors headers are read, including sharded files via bounded HTTP ranges. Weight
+names and shapes must match; storage dtypes and byte sizes come from the headers. Logical
+parameters count tied names once; checkpoint tensor storage also includes duplicate saved
+tensors, scales and omitted towers. Neither is a runtime memory estimate. The JSON records the
+resolved revision, config hash, generator version and shape bindings. A shape check does not
+prove graph-semantic or numerical equivalence. Config-only exports explicitly label estimates.
+`--task tts` marks a language-model-only speech source as partial rather than a full waveform pipeline.
+
+For end-to-end **compiled speech** (Nemotron/RNNT, Qwen audio-LM, Silero VAD, codec LMs,
+SNAC/Mimi and vocoders), reuse the actual emitted packets:
+
+```bash
+nix develop --command plowc viz --packet <assets>/model.pkt --open false
+nix develop --command plowc viz --packet <assets>/model.pkt \
+  --port 0 --dump-assets <scratch>/speech-architecture
+```
+
+The runtime's container validator and shared ISA disassembler supply the view. Embedded
+contracts identify companion encoder/codec/vocoder packets; missing dependencies and
+disagreeing codec/sample-rate fields fail the export. Directories include all model packets
+(extensions are not standalone models). The overview uses only contract-declared handoffs,
+never filename ordering. Program alternatives and state banks are individually inspectable;
+they are not drawn as sequential network layers. Each detail section contains at most 48
+native instructions. Native edges represent scheduler dependencies, and buffer sizes are exact
+declared capacities. Logical parameter counts and unencoded shapes/dtypes are not guessed.
+Depth decoders (Fish, Breeze and Maya2) use the shared auxiliary-program parser; their programs
+appear beside the backbone's programs, with validated depth manifests and row counts. Companion
+roles name the text and reference-audio encoder stages. SVG handoffs use the same declared edges,
+not packet filename order.
+The same bundle and renderer back the server and all static assets. Asset-only exports do not
+also overwrite an unrelated `graph.html` in the working directory.
 
 **2. Add the config struct + detection + builder** as in the recipe above.
 

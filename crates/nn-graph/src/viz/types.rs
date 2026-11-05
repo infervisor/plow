@@ -5,12 +5,11 @@
 
 use crate::dtype::DType;
 use crate::graph::{NodeId, Origin, TensorId};
-use crate::op::Op;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Op family, used for colour and the composition summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpCategory {
     /// Linear, matmul, embedding lookup.
@@ -70,6 +69,7 @@ impl OpCategory {
 pub enum ModelModality {
     Llm,
     Asr,
+    Vad,
     Tts,
     Multimodal,
     Vision,
@@ -83,6 +83,7 @@ impl ModelModality {
         match self {
             ModelModality::Llm => "LLM",
             ModelModality::Asr => "ASR",
+            ModelModality::Vad => "VAD",
             ModelModality::Tts => "TTS",
             ModelModality::Multimodal => "Multimodal",
             ModelModality::Vision => "Vision",
@@ -133,7 +134,7 @@ pub struct VizNode {
     pub id: NodeId,
     pub op: &'static str,
     pub category: OpCategory,
-    pub detail: Op,
+    pub detail: serde_json::Value,
     pub inputs: Vec<TensorId>,
     pub output: TensorId,
     pub block: Option<String>,
@@ -158,7 +159,7 @@ pub struct VizSummary {
     pub total_params: u64,
     pub total_weight_bytes: u64,
     pub num_blocks: u32,
-    pub category_counts: HashMap<OpCategory, usize>,
+    pub category_counts: BTreeMap<OpCategory, usize>,
     pub total_nodes: usize,
     pub total_tensors: usize,
 }
@@ -166,11 +167,41 @@ pub struct VizSummary {
 /// One graph of the model (the full model, or a part that also runs on its own).
 #[derive(Debug, Clone, Serialize)]
 pub struct VizNetwork {
+    pub kind: &'static str,
     pub id: String,
     pub title: String,
     pub description: String,
     pub stages: Vec<VizStage>,
     pub graph: VizGraph,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<VizCheckpoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointTensor {
+    pub dtype: DType,
+    pub shape: Vec<i64>,
+    pub bytes: u64,
+}
+
+/// Checks tensor storage and shapes, not the graph's numerical semantics.
+#[derive(Debug, Clone, Serialize)]
+pub struct VizCheckpoint {
+    pub tensor_count: usize,
+    pub stored_bytes: u64,
+    pub matched_tensors: usize,
+    pub unrepresented_tensors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VizProvenance {
+    pub revision: Option<String>,
+    pub source_kind: &'static str,
+    pub source_sha256: String,
+    pub generator_version: String,
+    pub bindings: BTreeMap<String, i64>,
 }
 
 /// Op/tensor graph of one network.
@@ -187,6 +218,7 @@ pub struct VizGraph {
 /// Everything the viewer shows for one model. `networks[0]` is the full model.
 #[derive(Debug, Clone, Serialize)]
 pub struct VizModelBundle {
+    pub schema: &'static str,
     pub title: String,
     pub source: String,
     pub modality: ModelModality,
@@ -194,6 +226,8 @@ pub struct VizModelBundle {
     pub networks: Vec<VizNetwork>,
     /// What the viewer cannot show for this model and why.
     pub notes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<VizProvenance>,
 }
 
 impl VizModelBundle {

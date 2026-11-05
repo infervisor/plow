@@ -57,6 +57,13 @@ select.ctl { padding-right: 24px; max-width: 280px; }
 
 .notes { padding: 8px 16px; font-size: 13px; color: var(--ink-2); background: var(--paper-2); border-bottom: 1px solid var(--rule); }
 .notes p + p { margin-top: 2px; }
+.notes summary { cursor: pointer; color: var(--muted); }
+.notes[open] summary { margin-bottom: 8px; }
+.notes p { max-width: 100ch; }
+details.data { margin-top: 16px; }
+details.data summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+.wrap { overflow-wrap: anywhere; }
+pre.wrap { white-space: pre-wrap; font: 11px/1.5 var(--mono); }
 
 /* Stage rail */
 .rail { display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--rule); overflow-x: auto; scrollbar-width: thin; }
@@ -118,7 +125,7 @@ a.link:hover, button.link:hover { text-decoration: underline; }
 @media (max-width: 1180px) { .legend { display: none; } }
 @media (max-width: 900px) {
   main { flex-direction: column; }
-  aside { width: auto; flex: 0 0 40%; border-left: 0; border-top: 1px solid var(--rule); }
+  aside { width: auto; flex: 0 0 30%; border-left: 0; border-top: 1px solid var(--rule); }
   .facts { display: none; }
   .search input { width: 160px; }
 }
@@ -140,7 +147,7 @@ a.link:hover, button.link:hover { text-decoration: underline; }
   </div>
   <button class="ctl icon standalone" id="theme" aria-label="Toggle light/dark" title="Toggle light/dark">◐</button>
 </header>
-<div class="notes" id="notes" hidden></div>
+<details class="notes" id="notes"></details>
 <nav class="rail" id="rail" aria-label="Stages"></nav>
 <main>
   <div class="canvas">
@@ -197,7 +204,7 @@ function setTheme(t) {
   document.documentElement.dataset.theme = t === 'light' ? 'light' : 'dark';
   if (!EMBED) try { localStorage.setItem('plow-viz-theme', document.documentElement.dataset.theme); } catch (e) {}
   colors = null;
-  if (cy) { cy.style(styleSheet()); }
+  if (cy) { cy.style(styleSheet()); renderLegend(); renderPanel(); }
 }
 {
   const q = new URLSearchParams(location.search).get('theme');
@@ -380,10 +387,11 @@ const net = () => BUNDLE.networks.find(n => n.id === S.net) || BUNDLE.networks[0
 
 function readHash() {
   const h = new URLSearchParams(location.hash.slice(1));
-  if (h.get('network') && BUNDLE.networks.some(n => n.id === h.get('network'))) S.net = h.get('network');
-  if (h.get('view') === 'detail') S.view = 'detail';
-  S.stage = h.get('stage');
+  S.net = BUNDLE.networks.some(n => n.id === h.get('network')) ? h.get('network') : BUNDLE.default_network;
+  S.view = h.get('view') === 'detail' ? 'detail' : 'overview';
+  S.stage = net().stages.some(s => s.id === h.get('stage')) ? h.get('stage') : null;
   S.section = h.get('section');
+  S.sel = null;
 }
 function writeHash() {
   const h = new URLSearchParams();
@@ -398,13 +406,13 @@ function writeHash() {
 function renderChrome() {
   const n = net(), s = n.graph.summary;
   $('title').textContent = BUNDLE.title;
-  $('modality').textContent = ({ llm: 'LLM', asr: 'ASR', tts: 'TTS', multimodal: 'Multimodal', vision: 'Vision', audio_codec: 'Codec', image: 'Image' })[BUNDLE.modality] || BUNDLE.modality;
-  $('facts').innerHTML = `<b>${fmtParams(s.total_params)}</b> params · <b>${fmtBytes(s.total_weight_bytes)}</b> · <b>${s.num_blocks}</b> blocks · <b>${s.total_nodes}</b> ops`;
+  $('modality').textContent = ({ llm: 'LLM', asr: 'ASR', vad: 'VAD', tts: 'TTS', multimodal: 'Multimodal', vision: 'Vision', audio_codec: 'Codec', image: 'Image' })[BUNDLE.modality] || BUNDLE.modality;
+  $('facts').innerHTML = n.kind === 'packet' ? `<b>${fmtBytes(s.total_weight_bytes)}</b> declared buffers` : `<b>${fmtParams(s.total_params)}</b> unique params · <b>${fmtBytes(s.total_weight_bytes)}</b> ${n.checkpoint ? 'graph weights' : 'estimated weights'}`;
   const sel = $('network');
-  sel.hidden = BUNDLE.networks.length < 2;
+  sel.hidden = BUNDLE.networks.length < 2 || S.view === 'overview';
   sel.innerHTML = BUNDLE.networks.map(x => `<option value="${esc(x.id)}"${x.id === S.net ? ' selected' : ''}>${esc(x.title)}</option>`).join('');
-  $('notes').hidden = !BUNDLE.notes.length;
-  $('notes').innerHTML = BUNDLE.notes.map(t => `<p>${esc(t)}</p>`).join('');
+  $('notes').innerHTML = `<summary>${n.kind === 'packet' ? 'Compiled packet inspection' : n.checkpoint ? 'Checkpoint weight shapes checked' : 'Config-only view · weight sizes are estimates'}${BUNDLE.notes.length ? ' · scope and limitations' : ' · data details'}</summary>
+    ${BUNDLE.notes.map(t => `<p>${esc(t)}</p>`).join('')}<p>Weight sizes are not runtime memory requirements. KV cache, activations, workspace and quantization overhead are separate. Shape checks do not establish numerical equivalence.</p>`;
   $('v-overview').setAttribute('aria-pressed', S.view === 'overview');
   $('v-detail').setAttribute('aria-pressed', S.view === 'detail');
   $('toolbar').hidden = S.view !== 'detail';
@@ -414,12 +422,12 @@ function renderChrome() {
 
 function renderRail() {
   const n = net(), total = n.graph.summary.total_params || 1;
-  $('rail').hidden = n.stages.length < 2;
+  $('rail').hidden = n.stages.length < 2 || S.view === 'overview';
   $('rail').innerHTML = n.stages.map((st, i) => `
     <button class="stage" data-stage="${esc(st.id)}" aria-pressed="${S.stage === st.id}" title="${esc(st.description)}">
       <div class="top"><span class="n">${i + 1}</span><span class="name">${esc(st.name)}</span></div>
-      <div class="p"><span><b>${fmtParams(st.param_count)}</b> params</span><span>${(100 * st.param_count / total).toFixed(1)}%</span></div>
-      <div class="bar"><i style="width:${Math.max(0.5, 100 * st.param_count / total)}%"></i></div>
+      <div class="p">${n.kind === 'packet' ? '<span>Compiled execution</span>' : `<span><b>${fmtParams(st.param_count)}</b> params</span><span>${(100 * st.param_count / total).toFixed(1)}%</span>`}</div>
+      ${n.kind === 'packet' ? '' : `<div class="bar"><i style="width:${Math.max(0.5, 100 * st.param_count / total)}%"></i></div>`}
     </button>`).join('');
   $('rail').querySelectorAll('.stage').forEach(b => b.onclick = () => selectStage(b.dataset.stage));
 }
@@ -440,7 +448,7 @@ function styleSheet() {
       'color': c.ink, 'font-family': 'IBM Plex Sans, system-ui, sans-serif', 'font-size': 12, 'line-height': 1.35,
       'width': 'label', 'height': 'label', 'padding': 10, 'text-max-width': 260,
     } },
-    { selector: 'node.op', style: { 'border-width': 2, 'border-color': 'data(color)' } },
+    { selector: 'node.op', style: { 'border-width': 2, 'border-color': n => c.cat[n.data('category')] || c.accent } },
     { selector: 'node.group', style: { 'border-width': 2, 'border-color': c.accent, 'font-size': 14, 'font-weight': 500, 'padding': 16, 'background-color': c.paper3 } },
     { selector: 'node.stagebox', style: { 'text-max-width': 320, 'padding': 18 } },
     { selector: 'node.run', style: { 'border-color': c.rule2, 'border-style': 'solid' } },
@@ -466,27 +474,24 @@ const isLarge = P => P.ov.length > LOD_UNITS && P.net.stages.some(s => !GENERIC_
 function stageElements(P) {
   const { g } = P, els = [], edges = new Set(), total = g.summary.total_params || 1;
   for (const st of P.net.stages) {
-    const groups = P.ov.filter(u => u.kind !== 'run' && u.stage === st.id);
-    const lines = groups.slice(0, 3).map(u => blockRange(P, u) + (u.kind === 'pattern' ? ` ×${u.reps} [${u.period.map(x => x.blocks.length).join('+')}]` : u.blocks.length > 1 ? ` ×${u.blocks.length}` : ''));
-    if (groups.length > 3) lines.push(`+${groups.length - 3} more`);
-    els.push({ data: { id: 's:' + st.id, stage: st.id, label: `${st.name}\n${fmtParams(st.param_count)} params · ${(100 * st.param_count / total).toFixed(1)}%${lines.length ? '\n' + lines.join('\n') : ''}` }, classes: 'group stagebox' });
+    els.push({ data: { id: 's:' + st.id, stage: st.id, label: `${st.name}\n${P.net.kind === 'packet' ? 'Compiled execution' : fmtParams(st.param_count) + ' params'}${st.block_count ? ' · ' + plural(st.block_count, P.net.kind === 'packet' ? 'section' : 'block') : ''}` }, classes: 'group stagebox' });
   }
   const link = (a, b) => { const k = a + '>' + b; if (a !== b && !edges.has(k)) { edges.add(k); els.push({ data: { id: k, source: a, target: b } }); } };
   const ins = g.inputs.length, outs = g.outputs.length;
-  els.push({ data: { id: 'in', label: ins === 1 ? `${g.tensors[g.inputs[0]].name}\n${g.tensors[g.inputs[0]].shape}` : `${ins} inputs` }, classes: 'io' });
-  els.push({ data: { id: 'out', label: outs === 1 ? `output\n${g.tensors[g.outputs[0]].shape}` : `${outs} outputs` }, classes: 'io' });
+  if (ins) els.push({ data: { id: 'in', label: ins === 1 ? g.tensors[g.inputs[0]].name || 'input' : `${ins} inputs` }, classes: 'io' });
+  if (outs && P.net.kind !== 'packet') els.push({ data: { id: 'out', label: outs === 1 ? 'output' : `${outs} outputs` }, classes: 'io' });
   for (const n of g.nodes) for (const t of n.inputs) {
     if (P.isWeight(t)) continue;
     const p = P.producer(t);
     link(p === null ? 'in' : 's:' + g.nodes[p].stage, 's:' + n.stage);
   }
-  for (const t of g.outputs) { const p = P.producer(t); if (p !== null) link('s:' + g.nodes[p].stage, 'out'); }
+  if (P.net.kind !== 'packet') for (const t of g.outputs) { const p = P.producer(t); if (p !== null) link('s:' + g.nodes[p].stage, 'out'); }
   return els;
 }
 
 function overviewElements(P) {
-  if (isLarge(P) && !S.stage) return stageElements(P);
-  const keep = isLarge(P) ? u => u.stage === S.stage : () => true;
+  if (P.net.stages.length && !S.stage) return stageElements(P);
+  const keep = S.stage ? u => u.stage === S.stage : () => true;
   const stageName = id => (P.net.stages.find(s => s.id === id) || { name: id }).name;
   const { g } = P, els = [], edges = new Set();
   for (const u of P.ov) {
@@ -498,7 +503,7 @@ function overviewElements(P) {
     } else if (u.kind === 'group') {
       const each = P.g.blocks[u.blocks[0]].param_count;
       const kind = P.mixedKinds ? ` · ${P.blockKind(u.blocks[0])}` : '';
-      label = `${blockRange(P, u)}\n${u.blocks.length > 1 ? `×${u.blocks.length}${kind} · ${fmtParams(each)} params each` : `${fmtParams(each)} params${kind}`}`;
+      label = P.net.kind === 'packet' ? `${blockRange(P, u)}\n${plural(P.g.blocks[u.blocks[0]].node_ids.length, 'instruction')}` : `${blockRange(P, u)}\n${u.blocks.length > 1 ? `×${u.blocks.length}${kind} · ${fmtParams(each)} params each` : `${fmtParams(each)} params${kind}`}`;
       cls = 'group';
     } else {
       const p = unitParams(P, u);
@@ -506,7 +511,8 @@ function overviewElements(P) {
       cls = u.nodes.length === 1 ? 'op' : 'run';
     }
     const color = u.kind === 'run' && u.nodes.length === 1 ? palette().cat[g.nodes[u.nodes[0]].category] : undefined;
-    els.push({ data: { id: u.key, label, color, stage: u.stage }, classes: cls });
+    const category = u.kind === 'run' && u.nodes.length === 1 ? g.nodes[u.nodes[0]].category : undefined;
+    els.push({ data: { id: u.key, label, color, category, stage: u.stage }, classes: cls });
   }
   const link = (a, b) => { const k = a + '>' + b; if (a !== b && !edges.has(k)) { edges.add(k); els.push({ data: { id: k, source: a, target: b } }); } };
   const ghost = (id, label) => { if (!els.some(e => e.data.id === id)) els.push({ data: { id, label }, classes: 'io' }); };
@@ -571,7 +577,7 @@ function detailElements(P, sec) {
   for (const id of sec.nodes) {
     const n = g.nodes[id], mod = P.moduleOf(n);
     const out = g.tensors[n.output].shape;
-    add('n' + id, { label: `${opName(n)}${mod ? '\n' + mod : ''}${S.tensors ? '' : '\n' + out}`, color: palette().cat[n.category], nid: id }, 'op');
+    add('n' + id, { label: `${opName(n)}${mod ? '\n' + mod : ''}${S.tensors || P.net.kind === 'packet' ? '' : '\n' + out}`, category: n.category, nid: id }, 'op');
   }
   for (const id of sec.nodes) {
     const n = g.nodes[id];
@@ -585,7 +591,7 @@ function detailElements(P, sec) {
       }
       const p = P.producer(t);
       const inside = p !== null && inSec.has(p);
-      if (S.tensors) {
+      if (S.tensors && P.net.kind !== 'packet') {
         add('t' + t, { label: tt.shape, tid: t }, inside ? 'tensor' : 'io');
         edge('t' + t, 'n' + id);
         if (inside) edge('n' + p, 't' + t);
@@ -598,6 +604,7 @@ function detailElements(P, sec) {
     }
   }
   for (const id of sec.nodes) {
+    if (P.net.kind === 'packet') continue;
     const t = g.nodes[id].output;
     const leaves = P.consumers[t].some(c => !inSec.has(c)) || g.outputs.includes(t);
     if (!leaves) continue;
@@ -611,6 +618,7 @@ function detailElements(P, sec) {
 let renderToken = 0;
 function render() {
   const P = prepare(net());
+  for (const id of ['t-weights', 't-tensors']) $(id).parentElement.hidden = P.net.kind === 'packet';
   writeHash();
   renderChrome();
   if (S.view === 'detail') {
@@ -629,7 +637,7 @@ function render() {
     if (cy) cy.destroy();
     cy = cytoscape({ container: $('cy'), elements: els, style: styleSheet(), layout: { name: 'preset' }, minZoom: 0.05, maxZoom: 3, wheelSensitivity: 0.25, boxSelectionEnabled: false });
     const flow = S.weights && S.view === 'detail' ? cy.elements().not('.weight').not('.wedge') : cy.elements();
-    const lay = flow.layout({ name: 'dagre', rankDir: 'TB', rankSep: S.view === 'overview' ? 36 : 28, nodeSep: 28, edgeSep: 8 });
+    const lay = flow.layout({ name: 'dagre', rankDir: S.view === 'overview' && !S.stage && cy.width() > 1000 ? 'LR' : 'TB', rankSep: S.view === 'overview' ? 24 : 28, nodeSep: 28, edgeSep: 8 });
     lay.one('layoutstop', () => {
       placeWeights();
       $('status').textContent = '';
@@ -657,31 +665,31 @@ function placeWeights() {
   });
 }
 
-function fit() {
+function fit(all = S.view === 'overview') {
   if (!cy || !cy.elements().length) return;
-  const pad = 40, bottom = 56, bb = cy.elements().boundingBox(), w = cy.width(), h = cy.height() - bottom + pad;
-  const z = Math.min((w - 2 * pad) / bb.w, (h - 2 * pad) / bb.h);
-  if (z >= 0.6) {
+  const pad = 24, bottom = 48, top = $('toolbar').hidden ? pad : $('toolbar').offsetHeight + 24;
+  const bb = cy.elements().boundingBox(), w = cy.width(), h = cy.height();
+  const z = Math.min((w - 2 * pad) / bb.w, Math.max(1, h - top - bottom) / bb.h);
+  if (all || z >= 0.6) {
     const zz = Math.min(z, S.view === 'overview' ? 1 : 1.2);
     cy.zoom(zz);
-    cy.pan({ x: w / 2 - zz * (bb.x1 + bb.x2) / 2, y: (S.view === 'detail' ? 56 : 0) / 2 + h / 2 - zz * (bb.y1 + bb.y2) / 2 });
+    cy.pan({ x: w / 2 - cy.zoom() * (bb.x1 + bb.x2) / 2, y: top + (h - top - bottom) / 2 - cy.zoom() * (bb.y1 + bb.y2) / 2 });
     return;
   }
   // Too tall to read when fitted: keep text legible and start at the top.
   const zz = Math.max(Math.min((w - 2 * pad) / bb.w, 1), 0.6);
   cy.zoom(zz);
-  cy.pan({ x: w / 2 - zz * (bb.x1 + bb.x2) / 2, y: pad + 48 - zz * bb.y1 });
+  cy.pan({ x: w / 2 - zz * (bb.x1 + bb.x2) / 2, y: top - zz * bb.y1 });
 }
 
 function applyStage() {
   if (!cy) return;
   cy.elements().removeClass('dim hl');
-  if (!S.stage || S.view !== 'overview' || isLarge(prepare(net()))) return;
+  if (!S.stage || S.view !== 'overview') return;
   const inStage = cy.nodes().filter(n => n.data('stage') === S.stage);
   if (!inStage.length) return;
   cy.elements().addClass('dim');
   inStage.union(inStage.connectedEdges()).removeClass('dim').addClass('hl');
-  cy.animate({ fit: { eles: inStage, padding: 60 }, duration: 260, easing: 'ease-out-cubic' });
 }
 
 function renderSectionSelect(P) {
@@ -708,7 +716,7 @@ function selectStage(id) {
     const sec = P.sections.find(s => s.stage === S.stage && s.key.startsWith('b:')) || P.sections.find(s => s.stage === S.stage);
     if (sec) { S.section = sec.key; render(); return; }
   }
-  if (S.view === 'overview' && isLarge(prepare(net()))) { render(); return; }
+  if (S.view === 'overview') { render(); return; }
   writeHash(); renderRail(); applyStage(); renderPanel();
 }
 function setView(v) { if (S.view === v) return; S.view = v; S.sel = null; render(); }
@@ -771,24 +779,32 @@ function networkPanel(P) {
   const hf = /^[\w.-]+\/[\w.-]+$/.test(BUNDLE.source) ? `https://huggingface.co/${BUNDLE.source}` : null;
   return `<div class="kicker">Network</div><h2>${esc(n.title)}</h2><p>${esc(n.description)}</p>
     ${hf ? `<p style="margin-top:6px"><a class="link mono" href="${hf}" target="_blank" rel="noopener">${esc(BUNDLE.source)}</a></p>` : ''}
-    <h3>Totals</h3><dl class="kv"><dt>Params</dt><dd>${fmtParams(s.total_params)}</dd><dt>Weight size</dt><dd>${fmtBytes(s.total_weight_bytes)}</dd><dt>Blocks</dt><dd>${s.num_blocks}</dd><dt>Ops</dt><dd>${s.total_nodes}</dd><dt>Tensors</dt><dd>${s.total_tensors}</dd></dl>
-    <h3>Inputs</h3>${tensorList(g, g.inputs, 'input')}
-    <h3>Outputs</h3>${tensorList(g, g.outputs, 'output')}
-    <h3>Ops by category</h3>${composition(P, g.nodes.map(x => x.id))}
-    <p class="muted" style="margin-top:16px">${S.view !== 'overview' ? '' : isLarge(P) ? 'Select a stage to see its blocks.' : 'Select a stage or a node. Double-click a block to open it in Detail.'}</p>`;
+    <h3>At a glance</h3><dl class="kv">${n.kind === 'packet' ? '' : `<dt>Unique graph params</dt><dd>${fmtParams(s.total_params)}</dd>`}<dt>${n.kind === 'packet' ? 'Declared buffers' : n.checkpoint ? 'Graph weight storage' : 'Estimated weights'}</dt><dd>${fmtBytes(s.total_weight_bytes)}</dd><dt>${n.kind === 'packet' ? 'Detail sections' : 'Blocks'}</dt><dd>${s.num_blocks}</dd></dl>
+    ${g.inputs.length ? `<h3>Inputs</h3>${tensorList(g, g.inputs, 'input')}` : ''}
+    ${n.kind !== 'packet' ? `<h3>Outputs</h3>${tensorList(g, g.outputs, 'output')}` : ''}
+    ${S.view === 'detail' ? `<h3>Ops by category</h3>${composition(P, g.nodes.map(x => x.id))}` : '<p class="muted" style="margin-top:16px">Select a stage to explore it. Detail shows operations, tensors and weights.</p>'}
+    ${provenancePanel(n)}`;
+}
+function provenancePanel(n) {
+  const p = BUNDLE.provenance, c = n.checkpoint;
+  return `<details class="data"><summary>Data and provenance</summary>
+    <h3>Validation</h3><p>${n.kind === 'packet' ? 'Read with the runtime container validator and the shared ISA disassembler. Parameter counts and unspecified buffer layouts are not guessed.' : c ? `${c.matched_tensors} graph weight tensors shape-checked against safetensors headers.` : 'Built from config only. Tensor shapes and storage dtypes have not been checked against checkpoint headers.'}</p>
+    ${c ? `<dl class="kv"><dt>All checkpoint tensor bytes</dt><dd>${fmtBytes(c.stored_bytes)}</dd><dt>Checkpoint tensors</dt><dd>${c.tensor_count}</dd><dt>Not represented here</dt><dd>${c.unrepresented_tensors.length}</dd></dl><p class="muted">Checkpoint bytes may include duplicate tied tensors, scales and omitted components.</p>` : ''}
+    ${p ? `<h3>Source</h3><p class="mono wrap">${esc(p.revision || 'Local source · no Hub revision')}</p><h3>${p.source_kind === 'packet_metadata' ? 'Visualization metadata' : 'Config'} SHA-256</h3><p class="mono wrap">${esc(p.source_sha256)}</p><h3>Generator</h3><p>plowc ${esc(p.generator_version)}</p>${Object.keys(p.bindings).length ? `<h3>Shape bindings</h3><p class="mono wrap">${esc(JSON.stringify(p.bindings))}</p>` : ''}` : ''}${n.metadata ? `<h3>Execution metadata</h3><pre class="wrap">${esc(JSON.stringify(n.metadata, null, 2))}</pre>` : ''}</details>`;
 }
 function stagePanel(P, st) {
   const ids = P.g.nodes.filter(n => n.stage === st.id).map(n => n.id);
+  const programs = ids.flatMap(id => P.g.nodes[id].detail.Packet?.programs || []);
+  if (programs.length) return `<div class="kicker">Stage ${P.stageIdx.get(st.id) + 1}</div><h2>${esc(st.name)}</h2><p>${esc(st.description)}</p>${programLinks(programs)}<div class="actions"><button class="ctl" onclick="selectStage(S.stage)">All stages</button></div>`;
   return `<div class="kicker">Stage ${P.stageIdx.get(st.id) + 1}</div><h2>${esc(st.name)}</h2><p>${esc(st.description)}</p>
-    <h3>Totals</h3><dl class="kv"><dt>Params</dt><dd>${fmtParams(st.param_count)}</dd><dt>Blocks</dt><dd>${st.block_count}</dd><dt>Ops</dt><dd>${ids.length}</dd></dl>
-    <h3>Checkpoint modules</h3>${shapes(st.modules)}
-    <h3>Inputs</h3>${shapes(st.input_shapes)}<h3>Outputs</h3>${shapes(st.output_shapes)}
-    <h3>Ops by category</h3>${composition(P, ids)}
-    <div class="actions"><button class="primary" onclick="openStageDetail()">Open in Detail</button>${isLarge(P) && S.view === 'overview' ? '<button class="ctl" onclick="selectStage(S.stage)">All stages</button>' : ''}</div>`;
+    <h3>Totals</h3><dl class="kv">${P.net.kind === 'packet' ? '' : `<dt>Params</dt><dd>${fmtParams(st.param_count)}</dd>`}<dt>Detail sections</dt><dd>${st.block_count}</dd><dt>Ops</dt><dd>${ids.length}</dd></dl>
+    <div class="actions"><button class="primary" onclick="openStageDetail()">Explore operations</button>${S.view === 'overview' ? '<button class="ctl" onclick="selectStage(S.stage)">All stages</button>' : ''}</div>
+    <details class="data"><summary>Modules and boundary shapes</summary><h3>Checkpoint modules</h3>${shapes(st.modules)}<h3>Inputs</h3>${shapes(st.input_shapes)}<h3>Outputs</h3>${shapes(st.output_shapes)}</details>`;
 }
 window.openStageDetail = () => { S.view = 'detail'; S.section = null; S.sel = null; render(); };
 function unitPanel(P, u) {
   const stage = P.net.stages.find(s => s.id === u.stage);
+  if (P.net.kind === 'packet' && u.kind !== 'run') return `<div class="kicker">Compiled operations</div><h2>${esc(blockRange(P, u))}</h2><p>Bounded detail sections of the packet's scheduler dependency graph.</p><div class="actions"><button class="primary" onclick="openUnit('${u.key}')">Explore instructions</button></div>`;
   if (u.kind === 'pattern') {
     return `<div class="kicker">Repeating pattern · ${u.blocks.length} blocks</div><h2 class="mono">${esc(blockRange(P, u))}</h2>
       <p>${esc(stage ? stage.name : '')}: ${u.reps} repetitions of</p>
@@ -813,11 +829,12 @@ function sectionPanel(P, sec) {
   const params = sec.nodes.reduce((s, id) => s + P.ownParams[id], 0);
   const st = P.net.stages.find(s => s.id === sec.stage);
   return `<div class="kicker">${sec.key.startsWith('b:') ? 'Block' : 'Ops outside blocks'}</div><h2 class="mono">${esc(sec.label)}</h2><p>${esc(st ? st.name : '')}</p>
-    <h3>Totals</h3><dl class="kv"><dt>Params</dt><dd>${fmtParams(params)}</dd><dt>Ops</dt><dd>${sec.nodes.length}</dd></dl>
+    <h3>Totals</h3><dl class="kv">${P.net.kind === 'packet' ? '' : `<dt>Params</dt><dd>${fmtParams(params)}</dd>`}<dt>Ops</dt><dd>${sec.nodes.length}</dd></dl>
     <h3>Ops by category</h3>${composition(P, sec.nodes)}
     <p class="muted" style="margin-top:16px">Select an op to inspect it. ← → steps through sections.</p>`;
 }
 function opPanel(P, n) {
+  if (P.net.kind === 'packet') return packetPanel(n);
   const g = P.g, out = g.tensors[n.output];
   const weights = n.inputs.filter(P.isWeight);
   const acts = n.inputs.filter(t => !P.isWeight(t));
@@ -835,6 +852,17 @@ function opPanel(P, n) {
     <h3>Output</h3><dl class="kv"><dt>Shape</dt><dd>${esc(out.shape)}</dd><dt>Dtype</dt><dd>${esc(out.dtype)}</dd><dt>Size</dt><dd>${fmtBytes(out.bytes)}</dd></dl>
     <h3>Used by</h3><ul class="list">${P.consumers[n.output].slice(0, 8).map(c => `<li><span><button class="link" onclick="jumpOp(${c})">${esc(g.nodes[c].op)} #${c}</button></span><span>${esc(P.moduleOf(g.nodes[c]))}</span></li>`).join('') || '<li><span class="muted">network output</span></li>'}</ul>
     <div class="actions"><button class="ctl" onclick="trace('up')">Trace inputs</button><button class="ctl" onclick="trace('down')">Trace outputs</button></div>`;
+}
+function packetPanel(n) {
+  const d = n.detail.Packet || {};
+  return `<div class="kicker">Compiled execution</div><h2>${esc(n.op)}</h2>
+    ${d.programs ? programLinks(d.programs) : ''}
+    ${d.attributes ? `<h3>ISA attributes</h3><dl class="kv">${Object.entries(d.attributes).map(([k,v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>` : ''}
+    ${d.buffers ? `<h3>Referenced buffers</h3><ul class="list">${d.buffers.map(b => `<li><span>${esc(b.role || 'slot ' + b.slot)} · ${esc(b.name)}</span><span>${fmtBytes(b.bytes)}</span></li>${b.shape ? `<li><span class="muted">${esc(JSON.stringify(b.shape))} · ${esc(b.dtype)}</span></li>` : ''}`).join('')}</ul><p class="muted">Byte counts are declared capacities. Read/write directions and unencoded layouts are not inferred.</p>` : ''}
+    ${d.raw ? `<details class="data"><summary>Raw instruction</summary><pre class="wrap">${esc(JSON.stringify(d.raw, null, 2))}</pre></details>` : ''}`;
+}
+function programLinks(programs) {
+  return `<h3>Explore operations</h3><ul class="list">${programs.map(p => `<li><button class="link" data-network="${esc(p.id)}">${esc(p.label)}</button></li>`).join('')}</ul>`;
 }
 function tensorPanel(P, t) {
   const tt = P.g.tensors[t], p = P.producer(t);
@@ -858,7 +886,7 @@ function search(q) {
   hits = [];
   for (const n of P.g.nodes) {
     const w = n.inputs.filter(P.isWeight).map(t => P.g.tensors[t].name).join(' ');
-    const hay = `${n.op} ${w} ${n.block || ''}`.toLowerCase();
+    const hay = `${opName(n)} ${n.op} ${w} ${n.block || ''}`.toLowerCase();
     if (hay.includes(q)) hits.push(n);
     if (hits.length >= 40) break;
   }
@@ -871,8 +899,14 @@ function pick(i) { const n = hits[i]; if (!n) return; $('results').classList.rem
 
 // ---------- wiring ----------
 $('v-overview').onclick = () => setView('overview');
+$('panel').addEventListener('click', e => {
+  const target = e.target.closest('[data-network]');
+  if (target && BUNDLE.networks.some(n => n.id === target.dataset.network)) {
+    S.net = target.dataset.network; S.view = 'detail'; S.stage = null; S.section = null; S.sel = null; render();
+  }
+});
 $('v-detail').onclick = () => setView('detail');
-$('network').onchange = e => { S.net = e.target.value; S.stage = null; S.section = null; S.sel = null; render(); };
+$('network').onchange = e => { S.net = e.target.value; S.stage = null; S.section = null; S.sel = null; hits = []; $('q').value = ''; $('results').classList.remove('open'); render(); };
 $('section').onchange = e => { const P = prepare(net()); S.section = e.target.value; const s = P.sections.find(x => x.key === S.section); S.stage = s ? s.stage : null; S.sel = null; render(); };
 $('prev').onclick = () => step(-1);
 $('next').onclick = () => step(1);
@@ -880,7 +914,7 @@ $('t-weights').onchange = e => { S.weights = e.target.checked; render(); };
 $('t-tensors').onchange = e => { S.tensors = e.target.checked; render(); };
 $('z-in').onclick = () => cy && cy.animate({ zoom: { level: cy.zoom() * 1.3, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } }, duration: 120 });
 $('z-out').onclick = () => cy && cy.animate({ zoom: { level: cy.zoom() / 1.3, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } }, duration: 120 });
-$('z-fit').onclick = fit;
+$('z-fit').onclick = () => fit(true);
 $('theme').onclick = () => setTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
 $('q').oninput = e => search(e.target.value);
 $('q').onblur = () => setTimeout(() => $('results').classList.remove('open'), 100);
@@ -896,12 +930,13 @@ document.addEventListener('keydown', e => {
   if (e.key === '/') { e.preventDefault(); if (S.view !== 'detail') setView('detail'); setTimeout(() => $('q').focus(), 30); }
   else if (e.key === 'ArrowLeft' && S.view === 'detail') step(-1);
   else if (e.key === 'ArrowRight' && S.view === 'detail') step(1);
-  else if (e.key === 'f' || e.key === 'F') fit();
+  else if (e.key === 'f' || e.key === 'F') fit(true);
   else if (e.key === '1') setView('overview');
   else if (e.key === '2') setView('detail');
   else if (e.key === 'Escape') { S.sel = null; if (cy) { cy.$(':selected').unselect(); cy.elements().removeClass('dim hl'); } applyStage(); renderPanel(); }
 });
-window.addEventListener('resize', () => cy && cy.resize());
+new ResizeObserver(() => { if (cy) { cy.resize(); if (S.view === 'overview') fit(true); } }).observe($('cy'));
+window.addEventListener('hashchange', () => { readHash(); render(); });
 
 // `?back=/models/<name>`: same-site paths only, so the link cannot point off-site.
 {

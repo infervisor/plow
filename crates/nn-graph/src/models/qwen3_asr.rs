@@ -34,7 +34,18 @@ pub fn build_audio_encoder(cfg: &Qwen3AsrConfig) -> Graph {
 
 /// Build the standalone Qwen3 text thinker decoder.
 pub fn build_text_decoder(cfg: &Qwen3AsrConfig) -> Graph {
-    super::qwen3::build(&cfg.text_config)
+    let mut g = super::qwen3::build(&cfg.text_config);
+    for t in &mut g.tensors {
+        if matches!(t.origin, crate::Origin::Weight) {
+            if let Some(name) = &mut t.name {
+                *name = format!("thinker.{name}");
+            }
+        }
+    }
+    for block in &mut g.blocks {
+        *block = format!("thinker.{block}");
+    }
+    g
 }
 
 /// Build the end-to-end composite graph:

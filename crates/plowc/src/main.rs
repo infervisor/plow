@@ -755,13 +755,16 @@ fn run_knob_scope(k: &KnobScopeCli) -> Result<PathBuf, String> {
 /// `plowc viz` — serve or dump the nn-graph visualization.
 #[derive(Args, Debug)]
 struct VizCli {
+    /// Inspect a compiled packet or an asset directory (ASR, TTS, codec, or VAD).
+    #[arg(long)]
+    packet: Option<PathBuf>,
     /// Port to serve the viewer on (0 = write to file instead of serving).
     #[arg(long, default_value_t = 8384)]
     port: u16,
 
-    /// Output file path. When `--port 0`, write the self-contained HTML here.
-    #[arg(long, default_value = "graph.html")]
-    out: PathBuf,
+    /// Output HTML path (`graph.html` when no asset directory or SVG export is requested).
+    #[arg(long)]
+    out: Option<PathBuf>,
 
     /// Open the browser automatically after starting the server (`--open false` to disable).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -791,6 +794,18 @@ struct VizCli {
     /// Network to open first (`full` by default; Qwen3-ASR also has `audio_tower`, `thinker`; diffusers repos use component names).
     #[arg(long)]
     network: Option<String>,
+
+    /// Hugging Face revision (resolved to an immutable commit before reading components).
+    #[arg(long)]
+    revision: Option<String>,
+
+    /// Check every graph weight against safetensors headers and use actual storage dtypes/sizes.
+    #[arg(long)]
+    validate_checkpoint: bool,
+
+    /// Catalog task. TTS language-model-only sources are labelled as partial speech pipelines.
+    #[arg(long, value_parser = ["text", "asr", "tts", "vad"])]
+    task: Option<String>,
 }
 
 /// `gpu:0.7,cpu:0.3,ane:0` -> unit weights; unknown unit names and non-numbers are errors.
@@ -2998,22 +3013,62 @@ fn viz_strip_vision(json: &str) -> String {
 
 /// Build a complete `VizModelBundle` for visualization from a model source:
 /// a checkpoint directory, a config JSON, or an HF model id.
-fn viz_build_bundle(
-    src: &str,
+#[derive(Default)]
+struct VizBuildOptions<'a> {
+    packet: bool,
     batch: Option<i64>,
     seq: Option<i64>,
-    network_override: Option<&str>,
+    network: Option<&'a str>,
+    revision: Option<&'a str>,
+    validate_checkpoint: bool,
+    task: Option<&'a str>,
+}
+
+fn viz_build_bundle(
+    src: &str,
+    options: &VizBuildOptions<'_>,
 ) -> Result<nn_graph::viz::VizModelBundle, String> {
-    let mut bind = nn_graph::Bindings::new();
-    if let Some(v) = batch {
-        bind.insert("B", v);
+    if options.packet
+        || std::path::Path::new(src)
+            .extension()
+            .is_some_and(|e| e == "pkt")
+    {
+        if options.validate_checkpoint || options.revision.is_some() {
+            return Err("--packet reads compiled metadata; --revision and --validate-checkpoint apply to checkpoint/config sources".into());
+        }
+        let mut bundle = plowc::viz_packet::bundle_from_path(std::path::Path::new(src))?;
+        let metadata = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
+        bundle.provenance = Some(nn_graph::viz::VizProvenance {
+            revision: None,
+            source_kind: "packet_metadata",
+            source_sha256: plow_asset::knob::sha256_hex(&metadata),
+            generator_version: env!("CARGO_PKG_VERSION").into(),
+            bindings: Default::default(),
+        });
+        return viz_pick_network(bundle, options.network);
     }
-    if let Some(v) = seq {
+    let mut bind = nn_graph::Bindings::new();
+    let mut bindings = std::collections::BTreeMap::new();
+    if let Some(v) = options.batch {
+        bind.insert("B", v);
+        bindings.insert("B".into(), v);
+    }
+    if let Some(v) = options.seq {
         bind.insert("S", v);
         bind.insert("L", v);
+        bindings.insert("S".into(), v);
+        bindings.insert("L".into(), v);
     }
 
     let p = std::path::Path::new(src);
+    let revision = if p.exists() {
+        if options.revision.is_some() {
+            return Err("--revision is for Hugging Face sources; use a pinned local snapshot directory instead".into());
+        }
+        None
+    } else {
+        Some(nn_graph::hub::resolve_revision(src, options.revision).map_err(|e| e.to_string())?)
+    };
     // `…/models--org--name/snapshots/<sha>` (the HF cache) is titled `name`.
     let name = |p: &std::path::Path| {
         let file = |p: &std::path::Path| p.file_name().map(|s| s.to_string_lossy().into_owned());
@@ -3025,45 +3080,90 @@ fn viz_build_bundle(
             .and_then(|r| r.rsplit("--").next().map(String::from));
         repo.or_else(|| file(p)).unwrap_or_else(|| src.to_string())
     };
-    let (json, title) = if p.is_dir() {
+    let (json, title, pipeline) = if p.is_dir() {
         if p.join("model_index.json").is_file() && !p.join("config.json").is_file() {
             let index = std::fs::read_to_string(p.join("model_index.json"))
                 .map_err(|e| format!("cannot read model_index.json in {src:?}: {e}"))?;
-            let read = |f: &str| std::fs::read_to_string(p.join(f)).map_err(|e| e.to_string());
-            let bundle = nn_graph::viz::bundle_from_diffusers(&index, read, &name(p), src, &bind)?;
-            return viz_pick_network(bundle, network_override);
+            (index, name(p), true)
+        } else {
+            let json = std::fs::read_to_string(p.join("config.json"))
+                .map_err(|e| format!("cannot read config.json in {src:?}: {e}"))?;
+            (json, name(p), false)
         }
-        let json = std::fs::read_to_string(p.join("config.json"))
-            .map_err(|e| format!("cannot read config.json in {src:?}: {e}"))?;
-        (json, name(p))
     } else if p.is_file() {
         let json = std::fs::read_to_string(p).map_err(|e| format!("cannot read {src:?}: {e}"))?;
         let title = p
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "network".into());
-        (json, title)
+        (json, title, false)
     } else {
         info!(model = %src, "resolving model config from HuggingFace hub");
         let title = src.rsplit('/').next().unwrap_or(src).to_string();
-        match nn_graph::hub::fetch_config(src) {
-            Ok(json) => (json, title),
+        match nn_graph::hub::fetch_file_at_revision(src, "config.json", revision.as_deref()) {
+            Ok(json) => (json, title, false),
             Err(config_err) => {
-                let Ok(index) = nn_graph::hub::fetch_file(src, "model_index.json") else {
+                let Ok(index) = nn_graph::hub::fetch_file_at_revision(
+                    src,
+                    "model_index.json",
+                    revision.as_deref(),
+                ) else {
                     return Err(format!("hub fetch failed for {src:?}: {config_err}"));
                 };
-                let read = |f: &str| nn_graph::hub::fetch_file(src, f).map_err(|e| e.to_string());
-                let bundle =
-                    nn_graph::viz::bundle_from_diffusers(&index, read, &title, src, &bind)?;
-                return viz_pick_network(bundle, network_override);
+                (index, title, true)
             }
         }
     };
 
-    let json = viz_strip_vision(&json);
-    let bundle = nn_graph::viz::bundle_from_config_json(&json, &title, src, &bind)
-        .map_err(|e| format!("viz build failed for {src:?}: {e}"))?;
-    viz_pick_network(bundle, network_override)
+    let source = if p.exists() { title.as_str() } else { src };
+    let mut bundle = if pipeline {
+        let read = |f: &str| {
+            nn_graph::hub::fetch_file_at_revision(src, f, revision.as_deref())
+                .map_err(|e| e.to_string())
+        };
+        nn_graph::viz::bundle_from_diffusers(&json, read, &title, source, &bind)?
+    } else {
+        nn_graph::viz::bundle_from_config_json(&viz_strip_vision(&json), &title, source, &bind)
+            .map_err(|e| format!("viz build failed for {src:?}: {e}"))?
+    };
+    if options.task == Some("tts") && bundle.modality == nn_graph::viz::ModelModality::Llm {
+        bundle.modality = nn_graph::viz::ModelModality::Tts;
+        bundle.networks[0].title = "Codec language model".into();
+        bundle.networks[0].description = "Text to codec tokens; audio decoder not included".into();
+        bundle.notes.push("Partial speech pipeline: the codec language model is shown, but the audio codec / waveform decoder is not supplied by this source.".into());
+    }
+    if options.validate_checkpoint {
+        let root = if p.is_file() {
+            p.parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            src.to_string()
+        };
+        if pipeline {
+            for net in &mut bundle.networks {
+                let tensors =
+                    nn_graph::hub::checkpoint_tensors(&root, revision.as_deref(), Some(&net.id))
+                        .map_err(|e| e.to_string())?;
+                net.validate_checkpoint(&tensors)?;
+            }
+        } else {
+            let tensors = nn_graph::hub::checkpoint_tensors(&root, revision.as_deref(), None)
+                .map_err(|e| e.to_string())?;
+            for net in &mut bundle.networks {
+                net.validate_checkpoint(&tensors)?;
+            }
+        }
+    }
+    bundle.provenance = Some(nn_graph::viz::VizProvenance {
+        revision,
+        source_kind: "config",
+        source_sha256: plow_asset::knob::sha256_hex(json.as_bytes()),
+        generator_version: env!("CARGO_PKG_VERSION").into(),
+        bindings,
+    });
+    viz_pick_network(bundle, options.network)
 }
 
 fn viz_pick_network(
@@ -3182,7 +3282,9 @@ fn run_stage_plan(p: &StagePlanCli, cli: &Cli) -> Result<(), Box<dyn std::error:
 }
 
 fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let source = if let Some(ref dir) = cli.hf_dir {
+    let source = if let Some(ref packet) = v.packet {
+        packet.to_string_lossy().into_owned()
+    } else if let Some(ref dir) = cli.hf_dir {
         dir.to_string_lossy().into_owned()
     } else if let Some(ref model_id) = cli.model {
         model_id.clone()
@@ -3197,9 +3299,15 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut bundle = viz_build_bundle(
         &source,
-        cli.batch.first().copied(),
-        cli.seq.first().copied(),
-        v.network.as_deref(),
+        &VizBuildOptions {
+            packet: v.packet.is_some(),
+            batch: cli.batch.first().copied(),
+            seq: cli.seq.first().copied(),
+            network: v.network.as_deref(),
+            revision: v.revision.as_deref(),
+            validate_checkpoint: v.validate_checkpoint,
+            task: v.task.as_deref(),
+        },
     )?;
     if let Some(title) = &v.title {
         bundle.title = title.clone();
@@ -3228,9 +3336,12 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Port 0: file-dump mode (standalone or embed HTML)
     if v.port == 0 {
-        let html = nn_graph::viz::render_html(&bundle, v.embed, v.script_base.as_deref());
-        std::fs::write(&v.out, &html)?;
-        info!(path = %v.out.display(), embed = v.embed, "wrote graph visualization HTML");
+        if v.out.is_some() || (v.dump_assets.is_none() && v.export_svg.is_none()) {
+            let out = v.out.clone().unwrap_or_else(|| PathBuf::from("graph.html"));
+            let html = nn_graph::viz::render_html(&bundle, v.embed, v.script_base.as_deref());
+            std::fs::write(&out, &html)?;
+            info!(path = %out.display(), embed = v.embed, "wrote graph visualization HTML");
+        }
         return Ok(());
     }
 
@@ -3301,9 +3412,24 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 model
             };
-            let json = match viz_build_bundle(&src, batch, seq, net.as_deref()) {
-                Ok(b) => serde_json::to_value(&b).unwrap_or_default(),
-                Err(e) => serde_json::json!({ "error": e }),
+            let json = if query.is_empty() {
+                serde_json::to_value(&bundle).unwrap_or_default()
+            } else {
+                match viz_build_bundle(
+                    &src,
+                    &VizBuildOptions {
+                        packet: v.packet.is_some(),
+                        batch,
+                        seq,
+                        network: net.as_deref(),
+                        revision: v.revision.as_deref(),
+                        validate_checkpoint: v.validate_checkpoint,
+                        task: v.task.as_deref(),
+                    },
+                ) {
+                    Ok(b) => serde_json::to_value(&b).unwrap_or_default(),
+                    Err(e) => serde_json::json!({ "error": e }),
+                }
             };
             ("application/json", json.to_string().into_bytes())
         } else {
@@ -3551,6 +3677,29 @@ mod cli_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    #[test]
+    fn viewer_options_are_scoped_to_viz() {
+        for option in [
+            vec!["--embed"],
+            vec!["--open", "false"],
+            vec!["--dump-assets", "assets"],
+            vec!["--export-svg", "pipeline.svg"],
+            vec!["--script-base", "/viz/lib"],
+            vec!["--packet", "model.pkt"],
+            vec!["--port", "0"],
+        ] {
+            let mut argv = vec!["plowc", "viz"];
+            argv.extend_from_slice(&option);
+            assert!(matches!(try_parse(&argv).unwrap().cmd, Some(Cmd::Viz(_))));
+            let mut compile = vec!["plowc", "--hf-dir", "checkpoint"];
+            compile.extend_from_slice(&option);
+            assert_eq!(
+                try_parse(&compile).unwrap_err().kind(),
+                clap::error::ErrorKind::UnknownArgument
+            );
+        }
     }
 
     #[test]
