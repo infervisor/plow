@@ -255,6 +255,9 @@ struct Job {
     seed: u64,
     voice: u32,
     urgency: Urgency,
+    /// When the stream's playback reaches the end of the audio already sent: a step may wait
+    /// for a batch until shortly before it.
+    due: Option<std::time::Instant>,
     window: Option<Window>,
     step: Option<Step>,
     clone: Option<std::sync::Arc<SlotVoice>>,
@@ -263,6 +266,9 @@ struct Job {
     reply: tokio::sync::oneshot::Sender<Result<Decoded, String>>,
     /// Backlog charged to the feeding model's mux until this job is answered.
     _work: Option<crate::sched::admission::DownstreamWork>,
+    /// A first audio holds the feeding model's next tick until it is answered: both stages'
+    /// kernels take the whole device, so a tick launched ahead of it delays the first audio.
+    _urgent: Option<crate::sched::admission::DownstreamUrgent>,
 }
 
 impl Job {
@@ -567,20 +573,21 @@ impl Codec {
     }
 
     /// The next `frames` frames (at most [`Self::step_frames`]) of `slot`'s stream ->
-    /// `frames * frame_samples` samples continuing its audio.
+    /// `frames * frame_samples` samples continuing its audio. `due`: see [`Job::due`].
     pub async fn step(
         &self,
         slot: &mut StreamSlot,
         codes: Vec<i32>,
         frames: usize,
         urgency: Urgency,
+        due: Option<std::time::Instant>,
     ) -> Result<Vec<f32>, String> {
         let step = Step {
             slot: slot.id,
             pos: slot.pos,
         };
         let pcm = self
-            .submit(codes, frames, 0, 0, urgency, None, Some(step), None)
+            .submit(codes, frames, 0, 0, (urgency, due), None, Some(step), None)
             .await?
             .pcm;
         slot.pos += frames;
@@ -640,7 +647,7 @@ impl Codec {
             frames,
             seed,
             0,
-            Urgency::Stream,
+            (Urgency::Stream, None),
             None,
             None,
             Some(voice),
@@ -663,7 +670,7 @@ impl Codec {
             frames,
             seed,
             0,
-            Urgency::Stream,
+            (Urgency::Stream, None),
             Some(window),
             None,
             Some(voice),
@@ -693,8 +700,17 @@ impl Codec {
         urgency: Urgency,
         window: Option<Window>,
     ) -> Result<Decoded, String> {
-        self.submit(codes, frames, seed, voice, urgency, window, None, None)
-            .await
+        self.submit(
+            codes,
+            frames,
+            seed,
+            voice,
+            (urgency, None),
+            window,
+            None,
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -704,13 +720,18 @@ impl Codec {
         frames: usize,
         seed: u64,
         voice: u32,
-        urgency: Urgency,
+        (urgency, due): (Urgency, Option<std::time::Instant>),
         window: Option<Window>,
         step: Option<Step>,
         clone: Option<std::sync::Arc<SlotVoice>>,
     ) -> Result<Decoded, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _work = self.credit.as_ref().map(|c| c.work());
+        let _urgent = self
+            .credit
+            .as_ref()
+            .filter(|_| urgency == Urgency::First)
+            .map(|c| c.urgent_work());
         self.tx
             .lock()
             .send(Msg::Job(Job {
@@ -719,12 +740,14 @@ impl Codec {
                 seed,
                 voice,
                 urgency,
+                due,
                 window,
                 step,
                 clone,
                 cached: false,
                 reply,
                 _work,
+                _urgent,
             }))
             .map_err(|_| "codec worker stopped".to_string())?;
         rx.await
@@ -1028,13 +1051,15 @@ fn smallest(family: &[Capacity], batch: usize, frames: usize) -> Option<&Capacit
 }
 
 /// Indices into `pending` (most urgent first) of one launch: the first job's family, then each
-/// later job of that family while `fits(family, batch, frames)`, never a stream slot twice.
+/// later job of that family while `fits(family, batch, frames)`, never a stream slot twice. A
+/// first-audio head takes no job longer than itself: a longer one would delay its first audio.
 fn pack(
     pending: &[Job],
     max_batch: usize,
     fits: impl Fn(Family, usize, usize) -> bool,
 ) -> Vec<usize> {
     let family = pending[0].family();
+    let first = pending[0].urgency == Urgency::First;
     let mut frames = pending[0].frames;
     let mut take = vec![0];
     for (k, j) in pending.iter().enumerate().skip(1) {
@@ -1042,6 +1067,7 @@ fn pack(
             break;
         }
         if j.family() != family
+            || (first && j.frames > frames)
             || j.step.is_some_and(|s| {
                 take.iter().any(|&t| {
                     pending[t]
@@ -1509,9 +1535,31 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         .map(|c| c.0)
         .max()
         .unwrap_or(1);
+    let hold_guard = std::time::Duration::from_millis(
+        crate::config::RuntimeConfig::get().tts_codec_hold_ms as u64,
+    );
     let mut pending: Vec<Job> = Vec::new();
-    while let Ok(first) = rx.recv() {
-        for m in std::iter::once(first).chain(rx.try_iter()) {
+    let mut hold = None;
+    let mut open = true;
+    while open || !pending.is_empty() {
+        let got = if !open || (!pending.is_empty() && hold.is_none()) {
+            None
+        } else if let Some(wait) = hold {
+            match rx.recv_timeout(wait) {
+                Ok(m) => Some(m),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    open = false;
+                    None
+                }
+            }
+        } else {
+            match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => break,
+            }
+        };
+        for m in got.into_iter().chain(rx.try_iter()) {
             match m {
                 Msg::Job(j) => pending.push(j),
                 // The stream is gone and no launch holds its slot: drop its queued step.
@@ -1527,37 +1575,67 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         // set by its first job.
         pending.sort_by_key(|j| (j.urgency, std::cmp::Reverse(j.frames)));
         codec.place_caches(&mut pending);
-        while !pending.is_empty() {
-            // A failed launch or a committed step can turn a queued job unlaunchable.
-            let mut k = 0;
-            while k < pending.len() {
-                match codec.check(&pending[k]) {
-                    Ok(()) => k += 1,
-                    Err(e) => drop(pending.remove(k).reply.send(Err(e.into()))),
+        // A failed launch or a committed step can turn a queued job unlaunchable.
+        let mut k = 0;
+        while k < pending.len() {
+            match codec.check(&pending[k]) {
+                Ok(()) => k += 1,
+                Err(e) => drop(pending.remove(k).reply.send(Err(e.into()))),
+            }
+        }
+        hold = if open {
+            hold_for(&pending, hold_guard, std::time::Instant::now())
+        } else {
+            None
+        };
+        if pending.is_empty() || hold.is_some() {
+            continue;
+        }
+        let take = pack(&pending, max_batch, |f, b, n| {
+            codec.capacity(f, b, n).is_some()
+        });
+        let mut batch: Vec<Job> = take.iter().rev().map(|&k| pending.remove(k)).collect();
+        batch.reverse();
+        match codec.launch(&batch) {
+            Ok(pcm) => {
+                for (j, p) in batch.into_iter().zip(pcm) {
+                    let _ = j.reply.send(Ok(p));
                 }
             }
-            if pending.is_empty() {
-                break;
-            }
-            let take = pack(&pending, max_batch, |f, b, n| {
-                codec.capacity(f, b, n).is_some()
-            });
-            let mut batch: Vec<Job> = take.iter().rev().map(|&k| pending.remove(k)).collect();
-            batch.reverse();
-            match codec.launch(&batch) {
-                Ok(pcm) => {
-                    for (j, p) in batch.into_iter().zip(pcm) {
-                        let _ = j.reply.send(Ok(p));
-                    }
-                }
-                Err(e) => {
-                    for j in batch {
-                        let _ = j.reply.send(Err(e.clone()));
-                    }
+            Err(e) => {
+                for j in batch {
+                    let _ = j.reply.send(Err(e.clone()));
                 }
             }
         }
     }
+}
+
+/// Stream steps that wait together for one launch: fewer than this many pending hold.
+const HOLD_BATCH: usize = 8;
+
+/// How long the worker waits for more stream steps before launching `pending`: while every
+/// pending job is a stream step with a `due`, there are fewer than [`HOLD_BATCH`], and the
+/// soonest is due later than `guard` from `now` (a zero `guard` never holds).
+fn hold_for(
+    pending: &[Job],
+    guard: std::time::Duration,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    if guard.is_zero() || pending.is_empty() || pending.len() >= HOLD_BATCH {
+        return None;
+    }
+    let mut soonest = None::<std::time::Instant>;
+    for j in pending {
+        if j.urgency != Urgency::Stream || j.step.is_none() {
+            return None;
+        }
+        let due = j.due?;
+        soonest = Some(soonest.map_or(due, |s| s.min(due)));
+    }
+    soonest?
+        .checked_duration_since(now + guard)
+        .filter(|w| !w.is_zero())
 }
 
 #[cfg(test)]
@@ -1571,6 +1649,7 @@ mod tests {
             seed: 0,
             voice: 0,
             urgency: Urgency::Stream,
+            due: None,
             window: window.then(Window::default),
             step: slot.map(|index| Step {
                 slot: SlotId { index, gen: 0 },
@@ -1580,6 +1659,7 @@ mod tests {
             cached: false,
             reply: tokio::sync::oneshot::channel().0,
             _work: None,
+            _urgent: None,
         }
     }
 
@@ -1674,6 +1754,35 @@ mod tests {
             vec![0]
         );
         assert_eq!(pack(&pending[1..], 32, |_, _, _| true), vec![0]);
+    }
+
+    #[test]
+    fn first_audio_launches_without_longer_steps_and_later_steps_hold() {
+        let mut first = job(false, 2, Some(1));
+        first.urgency = Urgency::First;
+        let pending = [first, job(false, 17, Some(2)), job(false, 2, Some(3))];
+        assert_eq!(pack(&pending, 32, |_, _, _| true), vec![0, 2]);
+
+        let now = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let step = |due_ms: Option<u64>| {
+            let mut j = job(false, 17, Some(4));
+            j.due = due_ms.map(|d| now + ms(d));
+            j
+        };
+        let g = ms(300);
+        assert_eq!(
+            hold_for(&[step(Some(1000)), step(Some(700))], g, now),
+            Some(ms(400))
+        );
+        assert_eq!(hold_for(&[step(Some(1000)), step(Some(200))], g, now), None);
+        assert_eq!(hold_for(&[step(Some(1000)), step(None)], g, now), None);
+        assert_eq!(hold_for(&[step(Some(1000))], ms(0), now), None);
+        let full: Vec<Job> = (0..HOLD_BATCH).map(|_| step(Some(1000))).collect();
+        assert_eq!(hold_for(&full, g, now), None);
+        let mut w = step(Some(1000));
+        w.urgency = Urgency::First;
+        assert_eq!(hold_for(&[w], g, now), None);
     }
     use crate::serve::cosched::{Band, Due};
     use std::time::{Duration, Instant};

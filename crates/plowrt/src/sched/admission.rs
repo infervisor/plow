@@ -195,6 +195,12 @@ pub struct DownstreamCredit {
     /// The stage is rendering latency-critical work and wants the device: the model's
     /// dispatcher holds its next tick until this clears.
     urgent: std::sync::atomic::AtomicBool,
+    /// First outputs handed to the stage and not yet rendered ([`DownstreamCredit::urgent_work`]).
+    urgent_jobs: std::sync::atomic::AtomicUsize,
+    /// Bumped whenever the stage turns urgent: the dispatcher, having just produced a stream's
+    /// first-output tokens, waits for it before its next tick ([`DownstreamCredit::engaged_to`]).
+    engaged: std::sync::atomic::AtomicU64,
+    engaged_wake: tokio::sync::Notify,
     released: tokio::sync::Notify,
     /// The serving model's device turn under `--co-sched deadline`: the stage's launches take it.
     turn: std::sync::OnceLock<std::sync::Arc<crate::serve::cosched::DeviceTurn>>,
@@ -208,6 +214,18 @@ impl Drop for DownstreamWork {
         self.0
             .backlog
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.released.notify_one();
+    }
+}
+
+/// A first output handed to the stage and not yet rendered: the stage is urgent while one lives.
+pub struct DownstreamUrgent(std::sync::Arc<DownstreamCredit>);
+
+impl Drop for DownstreamUrgent {
+    fn drop(&mut self) {
+        self.0
+            .urgent_jobs
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         self.0.released.notify_one();
     }
 }
@@ -237,13 +255,51 @@ impl DownstreamCredit {
     pub fn set_urgent(&self, urgent: bool) {
         self.urgent
             .store(urgent, std::sync::atomic::Ordering::Release);
-        if !urgent {
+        if urgent {
+            self.engage();
+        } else {
             self.released.notify_one();
         }
     }
 
+    pub fn urgent_work(self: &std::sync::Arc<Self>) -> DownstreamUrgent {
+        self.urgent_jobs
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.engage();
+        DownstreamUrgent(std::sync::Arc::clone(self))
+    }
+
+    fn engage(&self) {
+        self.engaged
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.engaged_wake.notify_waiters();
+    }
+
     pub fn urgent(&self) -> bool {
         self.urgent.load(std::sync::atomic::Ordering::Acquire)
+            || self.urgent_jobs.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// Engagements so far, the base of [`DownstreamCredit::engaged_to`].
+    pub fn engaged(&self) -> u64 {
+        self.engaged.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Resolves once the stage has engaged `want` times in all ([`DownstreamCredit::engaged`]),
+    /// or after `limit`: best effort, as another stream's first output counts too.
+    pub async fn engaged_to(&self, want: u64, limit: std::time::Duration) {
+        let _ = tokio::time::timeout(limit, async {
+            loop {
+                let wake = self.engaged_wake.notified();
+                tokio::pin!(wake);
+                wake.as_mut().enable();
+                if self.engaged().wrapping_sub(want) as i64 >= 0 {
+                    return;
+                }
+                wake.await;
+            }
+        })
+        .await;
     }
 
     pub fn set_device_turn(&self, turn: std::sync::Arc<crate::serve::cosched::DeviceTurn>) {
@@ -507,6 +563,51 @@ mod seat_tests {
         assert!(credit.full());
         drop(w);
         assert!(!credit.full());
+    }
+
+    /// A first output handed downstream makes the stage urgent until it renders, and wakes a
+    /// dispatcher waiting on the engagement it read before its tick.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_first_output_engages_the_stage_until_it_renders() {
+        let credit = std::sync::Arc::new(DownstreamCredit::default());
+        let want = credit.engaged() + 1;
+        let t0 = std::time::Instant::now();
+        credit
+            .engaged_to(want, std::time::Duration::from_millis(5))
+            .await;
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(5),
+            "nothing engaged: limit"
+        );
+        let u = credit.urgent_work();
+        assert!(credit.urgent());
+        let t0 = std::time::Instant::now();
+        credit
+            .engaged_to(want, std::time::Duration::from_secs(5))
+            .await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "engaged before the wait"
+        );
+        drop(u);
+        assert!(!credit.urgent());
+        let want = credit.engaged() + 2;
+        let c = std::sync::Arc::clone(&credit);
+        let h = tokio::spawn(async move {
+            c.set_urgent(true);
+            tokio::task::yield_now().await;
+            drop(c.urgent_work());
+        });
+        let t0 = std::time::Instant::now();
+        credit
+            .engaged_to(want, std::time::Duration::from_secs(5))
+            .await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "two engagements"
+        );
+        h.await.unwrap();
+        assert!(credit.urgent());
     }
 
     /// Without a budget the seat decision is slots alone — the pre-KV-admission behaviour.

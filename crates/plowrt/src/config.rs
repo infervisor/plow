@@ -206,14 +206,29 @@ pub struct RuntimeConfig {
 
     /// New frames a speech stream's FIRST stateful codec step waits for (stateful `codec.pkt`
     /// only); each later step waits for as many new frames as were already emitted, up to
-    /// `stream.step_frames`.
+    /// `stream.step_frames`. Unset: the packet's `stream.first_frames`, else 1.
     #[arg(
         long = "tts-stream-first-frames",
         env = "PLOW_TTS_STREAM_FIRST_FRAMES",
-        default_value_t = 1,
         global = true
     )]
-    pub tts_stream_first_frames: usize,
+    pub tts_stream_first_frames: Option<usize>,
+
+    /// A later stateful codec step of a stream waits up to this long before its playback
+    /// would reach the end of the audio already sent, so steps of several streams share one
+    /// launch (0: every step launches at once).
+    #[arg(
+        long = "tts-codec-hold-ms",
+        env = "PLOW_TTS_CODEC_HOLD_MS",
+        default_value_t = 0,
+        global = true
+    )]
+    pub tts_codec_hold_ms: usize,
+
+    /// Apply a speech packet's declared leading-silence trim to streamed replies
+    /// (`stream.onset_trim_*`); `false` streams every sample (first-byte latency runs).
+    #[arg(long = "tts-onset-trim", env = "PLOW_TTS_ONSET_TRIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_onset_trim: bool,
 
     /// Real-time admission of codec-LM speech (`tts::realtime`): a request starts only while the
     /// decode step projected at one more request keeps every playing stream ahead of playback.

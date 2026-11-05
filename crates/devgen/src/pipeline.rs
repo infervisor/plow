@@ -768,6 +768,9 @@ pub struct StageProgram {
     prefix: PacketPrefix,
     builder: Builder,
     output: Option<u32>,
+    /// The last split-K conv's completion: the next one depends on it, so no two ops share the
+    /// split-K tickets and partials at once.
+    splitk_last: Option<u32>,
 }
 
 impl PacketPrefix {
@@ -1789,11 +1792,14 @@ impl StageProgram {
         stage: Conv1dF32Stage<'_>,
         row_scale: u32,
     ) -> Result<Emitted, String> {
+        // The flag fields are 4 bits wide (pre 4..8, post 8..12): a wider code would alias
+        // another kind and spill into the next field.
         let valid_activation = |a: Activation| {
-            !matches!(
-                a,
-                Activation::Clamp | Activation::ScaleShift | Activation::Log
-            )
+            a.code() <= 15
+                && !matches!(
+                    a,
+                    Activation::Clamp | Activation::ScaleShift | Activation::Log
+                )
         };
         if stage.batch == 0
             || stage.kernel == 0
@@ -1888,14 +1894,34 @@ impl StageProgram {
             | (u32::from(stage.weight_tap_major) << 15)
             | (u32::from(stage.wgmma && stage.split_bf16) << 17)
             | (u32::from(stage.weight_split) << 18)
-            | (u32::from(stage.dual_alpha) << 19);
+            | (u32::from(stage.dual_alpha) << 19)
+            | (u32::from(conv1d_warp(&stage, transpose, out_rows).is_some()) << 16);
         let op = if transpose {
             DevOp::ConvTranspose1dF32
         } else {
             DevOp::Conv1dF32
         };
-        let units = conv1d_units(&stage, transpose, out_rows, self.builder.n_cu());
-        self.emit(op, units, deps, output, |d| {
+        let n_cu = self.builder.n_cu();
+        let splitk = (row_scale == packet::dev::TENSOR_NONE)
+            .then(|| conv1d_splitk(&stage, transpose, out_rows, n_cu))
+            .flatten();
+        let units = splitk.unwrap_or_else(|| conv1d_units(&stage, transpose, out_rows, n_cu));
+        let flags = flags | (u32::from(splitk.is_some()) << 20);
+        let row_scale = if splitk.is_some() {
+            self.builder.tensor(
+                DENSE_SPLITK_SCRATCH,
+                (u64::from(DENSE_SPLITK_TICKETS)
+                    + u64::from(n_cu) * DENSE_SPLITK_SLOTS_PER_CU * 64 * 64)
+                    * 4,
+            )
+        } else {
+            row_scale
+        };
+        let mut chained = deps.to_vec();
+        if splitk.is_some() {
+            chained.extend(self.splitk_last);
+        }
+        let emitted = self.emit(op, units, &chained, output, |d| {
             d.t[..7].copy_from_slice(&[
                 output,
                 x,
@@ -1918,7 +1944,11 @@ impl StageProgram {
             ];
             d.f[0] = stage.slope;
             d.j = [stage.pad_before | (stage.pad_after << 16), flags];
-        })
+        })?;
+        if splitk.is_some() {
+            self.splitk_last = Some(emitted.done);
+        }
+        Ok(emitted)
     }
 
     /// In place when `output` is `TensorRef::Handle(x)`.
@@ -2587,6 +2617,7 @@ impl PacketPrefix {
             prefix: self,
             builder,
             output: None,
+            splitk_last: None,
         }
     }
 
@@ -2661,11 +2692,144 @@ fn tensor_bytes(rows: u32, columns: u32, element_bytes: u32) -> Result<u64, Stri
         .ok_or_else(|| "tensor size overflows".into())
 }
 
+/// SP_ARENA_FLOATS of the sm_90a speech object; SPV_ROWS and SPV_KC of `sp_conv1d_rows`
+/// (op_speech_f32.cuh).
+const SPV_ARENA_FLOATS: u64 = 25856;
+const SPV_ROWS: u64 = 32;
+const SPV_KC: u64 = 512;
+
+/// Conv1dF32 flag bit 16 arms (wgmma convs, one group), chosen per conv shape by measurement
+/// (`PLOW_EMIT_CODEC_CONV_ARMS`): `Rows` = at most 32 output rows of a zero-padded conv in
+/// `sp_conv1d_rows` (im2col K-chunks staged in smem, one warp per output channel sharing each
+/// weight across the rows); `Warp` = at most 4 output channels, one warp per output element
+/// (`sp_conv1d_warp`). Unlisted shapes keep the GEMM tiles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConvWarp {
+    Rows,
+    Warp,
+    /// Not a bit-16 arm: the wgmma tile with split-K (flags bit 20, `conv1d_splitk`).
+    SplitK,
+}
+
+/// (batch, in_rows, in_channels, out_channels, kernel, stride, dilation, pad_before, pad_after)
+type ConvShape = [u32; 9];
+
+fn conv_shape(stage: &Conv1dF32Stage<'_>) -> ConvShape {
+    [
+        stage.batch,
+        stage.in_rows,
+        stage.in_channels,
+        stage.out_channels,
+        stage.kernel,
+        stage.stride,
+        stage.dilation_or_output_padding,
+        stage.pad_before,
+        stage.pad_after,
+    ]
+}
+
+/// The measured arm table: one JSON object per line with `shape` (a [`ConvShape`]) and `arm`
+/// (`rows`, `warp` or `tile`); a later line for the same shape wins.
+fn conv_arms() -> &'static std::collections::HashMap<ConvShape, ConvWarp> {
+    static ARMS: std::sync::OnceLock<std::collections::HashMap<ConvShape, ConvWarp>> =
+        std::sync::OnceLock::new();
+    ARMS.get_or_init(|| {
+        let mut arms = std::collections::HashMap::new();
+        let Some(path) = crate::emit_config::active().codec_conv_arms.clone() else {
+            return arms;
+        };
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("codec conv arms {}: {e}", path.display()));
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("codec conv arms {}: {e}", path.display()));
+            let shape: ConvShape = serde_json::from_value(v["shape"].clone())
+                .unwrap_or_else(|e| panic!("codec conv arms shape: {e}"));
+            match v["arm"].as_str() {
+                Some("rows") => arms.insert(shape, ConvWarp::Rows),
+                Some("warp") => arms.insert(shape, ConvWarp::Warp),
+                Some("splitk") => arms.insert(shape, ConvWarp::SplitK),
+                _ => arms.remove(&shape),
+            };
+        }
+        arms
+    })
+}
+
+fn conv1d_warp(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32) -> Option<ConvWarp> {
+    if !stage.wgmma || transpose || stage.groups != 1 {
+        return None;
+    }
+    let arm = *conv_arms().get(&conv_shape(stage))?;
+    if arm == ConvWarp::SplitK {
+        return None;
+    }
+    let k = u64::from(stage.in_channels) * u64::from(stage.kernel);
+    let rows = u64::from(stage.batch) * u64::from(out_rows);
+    // The runtime tries Rows first under bit 16, so a Warp choice that also fits Rows runs Rows.
+    if rows <= SPV_ROWS
+        && stage.pad_mode == PadMode::Zero
+        && k % 4 == 0
+        && !stage.weight_f16
+        && rows * SPV_KC <= SPV_ARENA_FLOATS
+    {
+        return Some(ConvWarp::Rows);
+    }
+    (arm == ConvWarp::Warp && stage.out_channels <= 4).then_some(ConvWarp::Warp)
+}
+
+/// Units of a wgmma conv listed `splitk` in the arm table: 128x64 tiles times the parts
+/// `sp_tc_splits` takes at that many blocks (op_speech_f32.cuh sp_wg_gemm), when the tiles leave
+/// at least half the machine idle and K spans two k-tiles. No output activation (the runtime's
+/// split instantiations are post 0 only).
+fn conv1d_splitk(
+    stage: &Conv1dF32Stage<'_>,
+    transpose: bool,
+    out_rows: u32,
+    n_cu: u32,
+) -> Option<u64> {
+    if transpose
+        || stage.groups != 1
+        || !matches!(stage.output_activation, Activation::None)
+        || !(stage.wgmma && stage.split_bf16 && stage.weight_split)
+        || conv_arms().get(&conv_shape(stage)) != Some(&ConvWarp::SplitK)
+    {
+        return None;
+    }
+    let tiles = (u64::from(stage.batch) * u64::from(out_rows)).div_ceil(128)
+        * u64::from(stage.out_channels).div_ceil(64);
+    let nk = (u64::from(stage.in_channels) * u64::from(stage.kernel)).div_ceil(64);
+    let n_cu = u64::from(n_cu);
+    if tiles == 0 || tiles > u64::from(DENSE_SPLITK_TICKETS) || tiles * 2 > n_cu || nk < 2 {
+        return None;
+    }
+    // sp_tc_splits(tiles, nk, nblk): the kernel recomputes the parts from the units it gets.
+    let parts = |nblk: u64| {
+        let s = (nblk / tiles).clamp(1, nk);
+        let chunk = nk.div_ceil(s);
+        nk.div_ceil(chunk)
+    };
+    let mut s = parts(n_cu);
+    while parts(tiles * s) != s {
+        s = parts(tiles * s);
+    }
+    (s > 1).then_some(tiles * s)
+}
+
 /// Conv1dF32 / ConvTranspose1dF32 slices, mirroring the interpreter's paths (op_speech_f32.cuh
-/// d_conv1d_f32): depthwise 64-row x 64-channel tiles; the direct form per 256 outputs; the GEMM
-/// form 64x64 tiles per (group, phase). `slices` caps the result at the machine.
+/// d_conv1d_f32): bit 16 one warp per output; depthwise 64-row x 64-channel tiles; the direct
+/// form per 256 outputs; the GEMM form 64x64 tiles per (group, phase). `slices` caps the result at the machine.
 fn conv1d_units(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32, n_cu: u32) -> u64 {
     let (batch, cout) = (u64::from(stage.batch), u64::from(stage.out_channels));
+    match conv1d_warp(stage, transpose, out_rows) {
+        Some(ConvWarp::Rows) => return cout.div_ceil(8).min(u64::from(n_cu)),
+        Some(ConvWarp::Warp) => {
+            return (batch * u64::from(out_rows) * cout)
+                .div_ceil(8)
+                .min(u64::from(n_cu))
+        }
+        Some(ConvWarp::SplitK) | None => {}
+    }
     let cg = stage.in_channels / stage.groups;
     let ng = stage.out_channels / stage.groups;
     if !transpose && cg == 1 && ng == 1 {
@@ -3045,6 +3209,54 @@ mod tests {
             input_shape: vec![],
         };
         (prefix, handles)
+    }
+
+    #[test]
+    fn conv_rejects_activations_wider_than_the_flag_field() {
+        for (pre, post) in [
+            (Activation::SnakeBeta, Activation::None),
+            (Activation::None, Activation::SnakeBeta),
+        ] {
+            let (prefix, h) = prefix_with(&[("x", 100 * 64 * 4)]);
+            let mut p = prefix.program();
+            let r = p.conv1d_f32(
+                h[0],
+                false,
+                &[],
+                Conv1dF32Stage {
+                    output: TensorRef::Named("y"),
+                    weight: TensorRef::Named("w"),
+                    bias: None,
+                    alpha: Some(TensorRef::Named("alpha")),
+                    residual: None,
+                    lengths: None,
+                    batch: 1,
+                    in_rows: 100,
+                    in_channels: 64,
+                    out_channels: 64,
+                    kernel: 7,
+                    stride: 1,
+                    dilation_or_output_padding: 1,
+                    groups: 1,
+                    pad_before: 6,
+                    pad_after: 0,
+                    pad_mode: PadMode::Zero,
+                    input_activation: pre,
+                    output_activation: post,
+                    slope: 0.0,
+                    weight_f16: false,
+                    split_bf16: false,
+                    weight_tap_major: false,
+                    wgmma: false,
+                    weight_split: false,
+                    dual_alpha: false,
+                },
+            );
+            assert!(
+                r.is_err(),
+                "SnakeBeta (code 19) must not be packed into a 4-bit conv activation field"
+            );
+        }
     }
 
     #[test]

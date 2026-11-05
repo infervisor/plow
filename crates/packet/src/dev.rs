@@ -2508,7 +2508,8 @@ pub enum DevOp {
     /// x, f16 W, K <= 1024) LayerNorms each x row first, `(x - mean) * rsqrt(var + eps) * gamma +
     /// beta`, fp32 two-pass statistics; bit 9 reads `bias(f32[M / i3, N])`, one row per `i3` rows;
     /// bit 10 (f32 x, f16 W, K % 64 == 0) rounds x to f16 and multiplies on tensor cores (fp32
-    /// accumulation, any summation order), streaming W once per 64 rows.
+    /// accumulation, any summation order), streaming W once per 64 rows. Bit 11 alone (no other
+    /// bit) rounds each `C` to bf16 (a reference whose linear outputs bf16).
     /// `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K]) t3=bias? t4=residual? t5=gamma? t6=beta?` ·
     /// `i0=M i1=N i2=K i3=bias_group i7=flags` · `f0=eps` (K % 8 == 0).
     GemvF32Out = 220,
@@ -2522,10 +2523,11 @@ pub enum DevOp {
     /// value other than `u32::MAX` replaces the draw (teacher forcing). The class sets its bitmap
     /// bit, lands in `out[r*i2 + i3]`, and `eidx[r] = class + j0` (an embedding row). `ctl[r][0]
     /// == 0` skips the row.
+    /// HF `min_new_tokens`: while `ctl[r][1] < i6` the last class (the stop) is `-inf` first.
     /// `t0=out(u32) t1=logits(f32[rows][i7 or vocab]) t2=params(f32[rows][4]: T, top_p, penalty, -)
     /// t3=ctl(u32[rows][2]: top_k, step) t4=seed(u64[rows]) t5=bitmap(u32[rows][i5])?
     /// t6=force(u32, out's layout)? t7=eidx(u32[rows])?` · `i0=rows i1=vocab i2=out_stride
-    /// i3=out_col0 i4=coord i5=bitmap_words i7=logit_stride` · `j0=eidx_offset`.
+    /// i3=out_col0 i4=coord i5=bitmap_words i6=min_step i7=logit_stride` · `j0=eidx_offset`.
     SampleSmallF32 = 221,
     /// FP32 stream tail: the last `L` rows a streaming stage carries between chunks, per slot.
     /// Gather (mode 0) builds `z(f32[B][L+N][Cz])`: rows `[0, L)` hold `state[slot[b]]` in

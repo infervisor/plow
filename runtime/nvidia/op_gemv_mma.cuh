@@ -382,6 +382,14 @@ __device__ __forceinline__ gvmma_red_t<MT>* gvmma_red2() {
 }
 /* Bytes the relocated slots claim past the offset: one set plus the pair's two. */
 #define GVMMA_RED_DYN_BYTES (3u * sizeof(gvmma_red_t<GVMMA_MT_MAX>))
+#else
+/* Keyed on MT alone, like gvmma_red: per-instantiation slots in the walk itself (each BIAS / ONE /
+ * FOLD arm its own pair) pushed a linear-bias Hopper decode entry past the 48 KiB static limit. */
+template <int MT>
+__device__ __forceinline__ gvmma_red_t<MT>* gvmma_red2() {
+    __shared__ gvmma_red_t<MT> red2[2];
+    return red2;
+}
 #endif
 
 template <bool BIAS, int MT, typename Output = __nv_bfloat16>
@@ -608,12 +616,10 @@ __device__ __forceinline__ void gemv_rows_mma(Output* __restrict__ C,
         /* Narrow N: the pairs of this block split K over S warps each, as the unpaired split-K
          * below does per row block — taken only when S divides the k-steps, else that one runs. */
         if (per != 0u && gpow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / gpow)) == 0u) {
-#if GVMMA_RED_DYN
-            gvmma_red_t<MT>* const red2 = gvmma_red2<MT>();
-#elif PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && !GVMMA_RED_DYN
             gvmma_red_t<MT>* const red2 = gvmma_tp_red2<BIAS, MT, ONE, FOLD>();
 #else
-            __shared__ gvmma_red_t<MT> red2[2];
+            gvmma_red_t<MT>* const red2 = gvmma_red2<MT>();
 #endif
             const unsigned S = PLOW_NV_WARPS / gpow;
             const unsigned grp = warp / S, part = warp % S;

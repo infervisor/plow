@@ -1,0 +1,93 @@
+# Qwen3-TTS 12Hz 1.7B CustomVoice (Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) on H100, BF16 as published:
+# a 28-layer Qwen3 talker whose every row is a text token (text_projection folded into the token
+# table) plus a 16-code codec frame (`plow_frame_embed` over the whole vocabulary), a 2049-class
+# head (cb0 codes + EOS), the 5-layer code predictor sampling codebooks 1..15 inside one aux program
+# per decode rung (SampleSmallF32: penalty, top-k, min frames), and the Qwen3-TTS-Tokenizer-12Hz
+# decoder lowered to codec.pkt (the same codec as Breeze TTS 2). Served through the standard speech
+# API (`qwen3_tts` speech profile, dual-stream prompt: the 9 preset voices, 10 languages + auto,
+# instructions; `non_streaming_mode` puts the whole text in the prompt).
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) PYREF=<python with torch + safetensors + transformers> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3-tts-1.7b-customvoice/sm90a-h100-tp1-bf16.toml --out <fresh dir>
+#
+# Gates: talker/predictor codes and logits vs the HF reference loop (scripts/tts/qwen3_tts_ref.py,
+# equal to the official `generate` greedy), Whisper CER of served speech, Seed-TTS-eval WER.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3-tts-1.7b-customvoice"
+label = "sm90a-h100-tp1-bf16"
+plow_git = "027c44abb373558807347d83139b5b07a20782ce"
+network = "qwen3"
+doc = "docs/runtime/tts.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+toolchain = "cuda-12.9-nix"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+revision = "0c0e3051f131929182e2c023b9537f8b1c68adfe"
+
+[cell]
+name = "qwen3-tts-1.7b-customvoice-h100"
+hf_dir = "{out}/prep/talker"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+[[prep]]
+name = "talker-checkpoint"
+script = "scripts/tts/qwen3_tts_prep.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/talker", "0c0e3051f131929182e2c023b9537f8b1c68adfe"]
+
+[[prep]]
+name = "codec-export"
+script = "scripts/tts/breeze_codec_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec", "0c0e3051f131929182e2c023b9537f8b1c68adfe", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "speech_tokenizer"]
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "qwen3-tts-1.7b-customvoice"]
+[emit.env]
+PLOW_TTS_PROFILE = "qwen3_tts"
+PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
+# Prompts are 10 rows + the text (streaming) or + the text again (non-streaming).
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
+# The 64-row prefill rung's projections as cuBLASLt segments: prefill 16.3 -> 8.5 ms, c1 TTFA p95
+# 28.5 -> 20.4 ms; greedy output bit-identical to the interpreter GEMM (16 prompts).
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NV_FA_FOLD = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_FUSE_KV_HNR = "1"
+PLOW_NV_DENSE_TUNE = "1"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice ryan", "--conc 8 --stream --n 32 --prompt-set chatterbox --voice ryan", "--conc 32 --stream --n 64 --prompt-set chatterbox --voice ryan", "--conc 64 --stream --n 128 --prompt-set chatterbox --voice ryan"]
+
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice ryan", "--conc 32 --stream --wav --n 64 --prompt-set chatterbox --voice ryan"]
+cer_median_max = 0.05
+
+[serve]
+env = { PLOW_VMM_PREFIX = "1" }

@@ -91,6 +91,9 @@ pub struct SpeechRequest {
     /// (default `default_language`). Models without languages reject it.
     #[serde(default)]
     pub language: Option<String>,
+    /// Dual-stream models: the whole text in the prompt instead of one token per frame.
+    #[serde(default)]
+    pub non_streaming_mode: bool,
     /// Routing (OpenRouter-compatible): see [`crate::serve::session::RequestIds::apply_body`].
     #[serde(default)]
     pub session_id: Option<String>,
@@ -970,6 +973,7 @@ async fn speech_with(
         Err(e) => return crate::serve::json_rejection(e),
     };
     let t_arrive = Instant::now();
+    crate::obs::ttft::reset();
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
     }
@@ -1163,6 +1167,9 @@ async fn speech_with(
         Ok(o) => o,
         Err(e) => return server_error(e),
     };
+    if req.stream && crate::config::RuntimeConfig::get().tts_onset_trim {
+        out_pcm.trim_onset(c.onset_trim, c.sample_rate);
+    }
     let reference = match (&req.ref_audio, &req.ref_text, &model.ref_encoder) {
         (Some(audio), Some(text), Some(enc)) => {
             match ref_clip(&model, tok, &voice, enc, audio, text) {
@@ -1229,6 +1236,7 @@ async fn speech_with(
         repetition_penalty: checked.sampling.repetition_penalty,
         top_k: checked.sampling.top_k.unwrap_or(0),
         seed: checked.seed,
+        streaming: !req.non_streaming_mode,
     };
     let mut segs: Vec<Segment> = Vec::new();
     for t in super::segments(&input, c.segment_chars()) {
@@ -1258,10 +1266,16 @@ async fn speech_with(
         crate::serve::mux::JobClass::Normal
     };
     let first = segs[0].clone();
-    let speech = match maker.speech(&first) {
+    let mut speech = match maker.speech(&first) {
         Ok(s) => s,
         Err(e) => return server_error(e),
     };
+    if let Some(sp) = speech
+        .as_mut()
+        .filter(|_| req.stream && model.codec.step_frames > 0)
+    {
+        sp.first_tokens = model.contract.first_frames();
+    }
     let (tx, rx) = stream_mod::channel();
     let opts = crate::serve::mux::JobOpts {
         session_end: false,
@@ -1533,6 +1547,8 @@ struct Segment {
     chars: usize,
     /// Index of the segment in its request.
     k: usize,
+    /// A dual-stream prompt's frames and text feed (`Err`: the text has no rows).
+    dual: Option<Result<plow_asset::dual_stream::Layout, String>>,
 }
 
 /// The voice a Maya 2 clone renders as: the plain prompt (`icl` names no speaker).
@@ -1602,6 +1618,8 @@ struct SegmentMaker {
     top_k: usize,
     /// The request's seed; segment `k` samples with `seed + k`.
     seed: u64,
+    /// Dual-stream: the text rides the decode steps.
+    streaming: bool,
 }
 
 impl SegmentMaker {
@@ -1634,7 +1652,23 @@ impl SegmentMaker {
             ids.extend_from_slice(&c.suffix);
             ids
         };
-        let mut prompt_ids = ids(self.instructions.as_deref());
+        let dual = c.dual_stream.as_ref().map(|d| {
+            let text_ids =
+                tok.encode_with_special_tokens(&d.text_template.replace("{input}", text), false);
+            let ins_ids = match (&d.instructions_template, self.instructions.as_deref()) {
+                (Some(t), Some(i)) => {
+                    tok.encode_with_special_tokens(&t.replace("{instructions}", i), false)
+                }
+                _ => Vec::new(),
+            };
+            let language = self.language.as_deref().unwrap_or("auto");
+            d.layout(&text_ids, &ins_ids, &self.voice, language, self.streaming)
+        });
+        let mut prompt_ids = match &dual {
+            Some(Ok(l)) => l.ids.clone(),
+            Some(Err(_)) => Vec::new(),
+            None => ids(self.instructions.as_deref()),
+        };
         let uncond_ids = (self.cfg_weight > 0.0 && self.encoder.is_some()).then(|| ids(None));
         let enc_ids = self.encoder.is_some().then(|| {
             let ids = prompt_ids.clone();
@@ -1681,6 +1715,7 @@ impl SegmentMaker {
             gen,
             chars: text.chars().count(),
             k,
+            dual,
         }
     }
 }
@@ -1744,6 +1779,7 @@ impl SegmentMaker {
         if !c.depth {
             return Ok(None);
         }
+        let dual = s.dual.clone().transpose()?;
         // With a reference, the text's segment follows its rows; with a text encoder, the
         // transcript's rows are overlay rows too.
         let (head, ref_ids) = match (&s.reference, &self.encoder) {
@@ -1847,8 +1883,9 @@ impl SegmentMaker {
                 overlay,
                 overlay_pos,
                 encode,
-                frame_codes: Vec::new(),
+                frame_codes: dual.as_ref().map_or(Vec::new(), |l| l.codes.clone()),
                 frame_codes_per_row: c.frame_codes,
+                feed: dual.as_ref().map(|l| (l.feed.clone(), l.tail)),
                 depth: Some(crate::serve::mux::DepthJob {
                     seed: s.gen.seed.unwrap_or(self.seed),
                     temperature: if greedy { 1.0 } else { param(self.temperature) },
@@ -2282,6 +2319,7 @@ async fn stream_task(
         (0usize, 0usize, 0usize, Vec::new(), false);
     // Samples sent and when the first went out (the client's playback clock).
     let (mut sent, mut playing): (usize, Option<Instant>) = (0, None);
+    let mut reported = 0usize;
     let mut joiner = super::Joins::new(model.contract.sample_rate);
     // Dropping the rest of the current attempt (cut short).
     let mut skipping = false;
@@ -2290,9 +2328,7 @@ async fn stream_task(
     // the stream decodes windows.
     let mut slot: Option<super::codec::StreamSlot> = None;
     let mut windowed = model.codec.step_frames == 0;
-    let first_frames = crate::config::RuntimeConfig::get()
-        .tts_stream_first_frames
-        .max(1);
+    let first_frames = model.contract.first_frames();
     loop {
         let mut done = false;
         let msg = frx.recv().await;
@@ -2404,11 +2440,14 @@ async fn stream_task(
         }
         // Windowed: one window per message. Stateful: steps until every committed frame is out.
         while !skipping {
-            let urgency = if first.is_none() && emitted == 0 {
+            // Until audio is heard: a step whose output the onset trim drops leaves the next one
+            // the stream's first audio.
+            let urgency = if first.is_none() {
                 Urgency::First
             } else {
                 Urgency::Stream
             };
+            let due = playing.map(|t| t + std::time::Duration::from_secs_f64(sent as f64 / sr));
             // (PCM, its first fresh frame, frames emitted after it, frames decoded)
             let decoded = if let Some(slot) = slot.as_mut() {
                 let Some(k) = step_plan(n, emitted, done, first_frames, model.codec.step_frames)
@@ -2416,11 +2455,17 @@ async fn stream_task(
                     break;
                 };
                 let codes = frames[emitted * fc..(emitted + k) * fc].to_vec();
-                model
-                    .codec
-                    .step(slot, codes, k, urgency)
-                    .await
-                    .map(|pcm| (pcm, 0, emitted + k, k))
+                let t_codec = (crate::obs::ttft::on() && emitted == 0).then(|| {
+                    if let Some(t) = first_frame_at {
+                        crate::obs::ttft::SPEECH_FRAMES.add(t.elapsed().as_nanos() as u64);
+                    }
+                    Instant::now()
+                });
+                let r = model.codec.step(slot, codes, k, urgency, due).await;
+                if let Some(t) = t_codec {
+                    crate::obs::ttft::SPEECH_CODEC.add(t.elapsed().as_nanos() as u64);
+                }
+                r.map(|pcm| (pcm, 0, emitted + k, k))
             } else {
                 let Some((s, e, upto)) =
                     stream_step(n, emitted, done, model.codec.window, lookahead, chunk)
@@ -2460,17 +2505,25 @@ async fn stream_task(
                         &joined[..]
                     };
                     emitted = upto;
+                    let mut bytes = Vec::new();
                     if !fresh.is_empty() {
-                        let mut bytes = Vec::new();
+                        let trimmed = out_pcm.trimmed();
                         out_pcm.push(fresh, &mut bytes);
+                        // Trimmed leading silence is never played: it neither starts playback
+                        // nor counts as audio ahead of it (held samples count once sent).
+                        sent += fresh.len();
+                        sent -= out_pcm.trimmed() - trimmed;
+                    }
+                    if !bytes.is_empty() {
                         if first.is_none() {
                             ticket.first_audio();
+                            crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, 0);
                         }
                         first.get_or_insert_with(|| t_arrive.elapsed());
                         playing.get_or_insert_with(Instant::now);
-                        sent += fresh.len();
                         ticket.sent(sent as f64 / sr);
-                        run.audio(fresh.len(), sr);
+                        run.audio(sent - reported, sr);
+                        reported = sent;
                         if let Some(h) = head.take() {
                             let _ = h.send(run.headers());
                         }
@@ -2515,8 +2568,19 @@ async fn stream_task(
     }
     let mut tail = Vec::new();
     out_pcm.finish(&mut tail);
-    if !tail.is_empty() && out.send(Ok(tail)).await.is_err() {
-        return;
+    if !tail.is_empty() {
+        // A reply shorter than the onset trim's window: its held samples are its first audio.
+        if first.is_none() {
+            ticket.first_audio();
+            first = Some(t_arrive.elapsed());
+        }
+        run.audio(sent - reported, sr);
+        if let Some(h) = head.take() {
+            let _ = h.send(run.headers());
+        }
+        if out.send(Ok(tail)).await.is_err() {
+            return;
+        }
     }
     run.done();
     tracing::info!(

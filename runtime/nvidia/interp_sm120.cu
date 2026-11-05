@@ -2150,7 +2150,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_GEMV_F32_OUT:
         /* Flag modes: Maya 2 depth programs, speech object only (inlined elsewhere they grew every entry
          * frame). Mode 0 stays ungated: fish_depth programs run it here, outside the arm inventory. */
-        if (in->i[7])
+        if (in->i[7] & ~2048u)
 #if PLOW_NV_SPEECH
             d_gemv_f32out_mode((float*)TEN(0), TEN(1), TEN(2), (in->i[7] & 4u) ? (const float*)TEN(3) : nullptr,
                                (in->i[7] & 8u) ? (const float*)TEN(4) : nullptr,
@@ -2166,14 +2166,14 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                          in->i[1], in->i[2], slice, nblk);
 #else
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
-                          in->i[1], in->i[2], slice, nblk);
+                          in->i[1], in->i[2], in->i[7] != 0u, slice, nblk);
 #endif
         break;
     case PLOW_DOP_SAMPLE_SMALL_F32:
         d_sample_small((unsigned*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const unsigned*)TEN(3),
                        (const unsigned long long*)TEN(4), (unsigned*)TEN(5), (const unsigned*)TEN(6),
                        (unsigned*)TEN(7), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7],
-                       in->fj[1].u, slice, nblk, arena);
+                       in->fj[1].u, in->i[6], slice, nblk, arena);
         break;
 #if !defined(PLOW_HAS_EMBED_FRAME_BF16) || PLOW_HAS_EMBED_FRAME_BF16
     case PLOW_DOP_EMBED_FRAME_BF16:
@@ -2381,6 +2381,16 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                   slice, nblk, arena))
             break;
 #endif
+#if PLOW_PACKET_LINEAR_BIAS
+        /* Ahead of the bias-less Hopper fast paths (M16 MMA, k-panel, XREG). */
+        if (TEN(7)) {
+            d_gemv_bias((__nv_bfloat16*)TEN(0),
+                        (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                        (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(7),
+                        in->i[0], in->i[1], in->i[2], slice, nblk);
+            break;
+        }
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA
         static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_GEMV_M16_ARENA_BYTES);
         if (in->i[0] == 16 && in->i[1] >= 1024 && in->i[2] && !(in->i[2] % 64)) {
@@ -2434,15 +2444,6 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             case 8192: if (PLOW_NV_XREG_K(8192)) d_gemv_sm90_xreg<8192>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
             default: break;
             }
-            break;
-        }
-#endif
-#if PLOW_PACKET_LINEAR_BIAS
-        if (TEN(7)) {
-            d_gemv_bias((__nv_bfloat16*)TEN(0),
-                        (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
-                        (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(7),
-                        in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
         }
 #endif

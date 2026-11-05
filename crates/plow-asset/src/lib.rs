@@ -755,6 +755,7 @@ pub mod speech_contract;
 pub mod speech_fusion;
 
 pub mod derived_weights;
+pub mod dual_stream;
 pub mod hetero;
 pub mod hetero_channel;
 pub mod modular;

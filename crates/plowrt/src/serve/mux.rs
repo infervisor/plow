@@ -330,6 +330,10 @@ const CRITICAL_SPAN: std::time::Duration = std::time::Duration::from_millis(1000
 /// first chunks. Past both this and [`CRITICAL_SPAN`] it is throughput.
 const CRITICAL_TOKENS: usize = 48;
 
+/// How long a tick waits for a downstream stage to take a stream's just-produced first-output
+/// tokens (stream task, then stage worker: ~0.1-0.3 ms measured) before it goes anyway.
+const FIRST_HANDOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// The class of one job's work, for [`crate::serve::cosched::CoSched::Deadline`] outside a voice
 /// turn: an ASR final first; then a prompt still owed its first token, or a speech stream's start,
 /// is a deadline; decode is throughput; bulk work (partial transcripts) waits.
@@ -569,6 +573,9 @@ pub struct SpeechJob {
     /// members; empty = no frame rows. Past its end every row's codes are zero.
     pub frame_codes: Vec<u32>,
     pub frame_codes_per_row: usize,
+    /// Dual-stream rows: decode step `s` feeds text token `.0[s]` (then `.1`) instead of its last
+    /// output; the frame's codes come from the depth stage.
+    pub feed: Option<(Vec<u32>, u32)>,
     /// Maya 2: a cloned speaker's depth memory, `[layers][hidden]` (`None`: the null speaker's).
     pub maya2_memory: Option<std::sync::Arc<[f32]>>,
 }
@@ -1109,6 +1116,9 @@ struct Slot {
     turn: Option<crate::serve::turns::TurnTimes>,
     turn_key: Option<crate::serve::turns::TurnKey>,
     speech: Option<Box<SpeechJob>>,
+    /// Its downstream first output has not been handed off yet: set while `speech.first_tokens`
+    /// tokens are still to come.
+    first_out: bool,
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
     cfg: Option<Box<CfgRun>>,
@@ -1180,6 +1190,18 @@ impl Slot {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn plain_decode(&self) -> bool {
         self.speech.is_some()
+    }
+
+    /// The token the next decode step feeds: the last output, or a dual-stream speech job's text
+    /// for that step (its codes ride beside it).
+    fn feed(&self) -> Option<u32> {
+        let last = *self.out_ids.last()?;
+        Some(
+            match self.speech.as_deref().and_then(|sp| sp.feed.as_ref()) {
+                Some((text, tail)) => text.get(self.out_ids.len() - 1).copied().unwrap_or(*tail),
+                None => last,
+            },
+        )
     }
 
     /// Tokens a chained decode path may produce for this row before the host must see one
@@ -1460,6 +1482,11 @@ fn spawn_scoped(
             rung_widths.as_deref().unwrap_or(&[]),
         );
         let mut freed_last_tick = false;
+        // Downstream engagements the next tick waits for: the count read before a tick plus the
+        // streams whose first-output tokens it produced (the stage takes them first).
+        let mut await_first: Option<u64> = None;
+        let mut engaged_before = 0u64;
+        let mut first_before = 0usize;
         let mut load = LoadEstimator::default();
         let mut host_window = crate::obs::host::Window::default();
         let mut host_last_return: Option<Instant> = None;
@@ -2102,6 +2129,15 @@ fn spawn_scoped(
                 Vec::new()
             };
 
+            // A stream's first-output tokens just came out: its downstream launch, a few hundred
+            // microseconds of host handoff away, goes ahead of this tick (both take the device).
+            if let Some(want) = await_first.take() {
+                // A render takes this turn before it engages.
+                if turn.held() {
+                    turn.release();
+                }
+                downstream.engaged_to(want, FIRST_HANDOFF).await;
+            }
             // A downstream stage rendering a first chunk has the device to itself.
             while downstream.urgent() && !preempt_seen.load(Ordering::Acquire) {
                 tokio::select! {
@@ -2127,6 +2163,8 @@ fn spawn_scoped(
                 .filter(|s| s.step == 0)
                 .map(|s| s.prompt_ids.len().saturating_sub(s.pf_pos))
                 .sum();
+            engaged_before = downstream.engaged();
+            first_before = slots.iter().flatten().filter(|s| s.first_out).count();
             let taken_slots = std::mem::take(&mut slots);
             #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
             let mut taken_obs = obs.take().unwrap_or_else(|| {
@@ -2290,6 +2328,20 @@ fn spawn_scoped(
                     }
                     freed_last_tick = returned_slots.iter().flatten().count() < live;
                     slots = returned_slots;
+                    // Crossed or retired this tick (a retired one may have ended on its first
+                    // output).
+                    let mut first_after = 0;
+                    for s in slots.iter_mut().flatten().filter(|s| s.first_out) {
+                        s.first_out = s
+                            .speech
+                            .as_ref()
+                            .is_some_and(|sp| s.out_ids.len() < sp.first_tokens);
+                        first_after += s.first_out as usize;
+                    }
+                    let crossed = first_before.saturating_sub(first_after) as u64;
+                    if crossed > 0 {
+                        await_first = Some(engaged_before.wrapping_add(crossed));
+                    }
                     if let Some(b) = returned_bufs {
                         bufs_cache.insert(b.key, b);
                     }
@@ -3008,7 +3060,14 @@ fn admit_session(
                 .table
                 .lookup(&t.session, &t.keys, pair, lim, Instant::now())
         })
-        .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()));
+        .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()))
+        // Frame rows are not keyed by their ids: a retained sequence cannot vouch for them.
+        .filter(|_| {
+            job.opts
+                .speech
+                .as_ref()
+                .is_none_or(|s| s.frame_codes.is_empty())
+        });
     let find_free = |slots: &[Option<Slot>], table: &crate::serve::session::RetainTable| {
         if pair {
             (0..lim.saturating_sub(1)).step_by(2).find(|&i| {
@@ -3247,6 +3306,7 @@ fn admit_session(
                 uncond_hidden: Vec::new(),
             })
         }),
+        first_out: job.opts.speech.as_ref().is_some_and(|s| s.first_tokens > 0),
         speech: job.opts.speech,
         held: Vec::new(),
         held_finish: None,
@@ -4834,7 +4894,7 @@ fn run_one_tick(
                             return None;
                         }
                         let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                        slot.out_ids.last().map(|&token| (i, token))
+                        slot.feed().map(|token| (i, token))
                     })
                     .collect();
                 let result = {
@@ -4930,7 +4990,7 @@ fn run_one_tick(
                     .take(b)
                     .filter_map(|(i, slot)| {
                         let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                        (slot.step > 0).then(|| (i, *slot.out_ids.last().expect("decode output")))
+                        (slot.step > 0).then(|| (i, slot.feed().expect("decode output")))
                     })
                     .collect();
                 // A body can only pack a slot that already has a cursor, and a fresh request
@@ -5242,8 +5302,7 @@ fn run_one_tick(
                             .take(b)
                             .filter_map(|(i, slot)| {
                                 let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                                (slot.step > 0)
-                                    .then(|| (i, *slot.out_ids.last().expect("decode output")))
+                                (slot.step > 0).then(|| (i, slot.feed().expect("decode output")))
                             })
                             .collect();
                         let mut tokens = std::mem::take(&mut obs.host.slot_tokens);
@@ -5575,7 +5634,7 @@ fn run_one_tick(
                                 .enumerate()
                                 .filter_map(|(i, slot)| {
                                     let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                                    Some((i, *slot.out_ids.last()?))
+                                    Some((i, slot.feed()?))
                                 })
                                 .collect()
                         } else {
@@ -5932,7 +5991,7 @@ fn run_one_tick(
             let feeds: Vec<(usize, u32)> = (0..b.min(slots.len()))
                 .filter_map(|i| {
                     let s = slots[i].as_ref().filter(|s| s.parked_at.is_none())?;
-                    Some((i, *s.out_ids.last()?))
+                    Some((i, s.feed()?))
                 })
                 .collect();
             let mut decode_progress = None;
@@ -6292,7 +6351,7 @@ fn gpu_decode_feeds(slots: &[Option<Slot>], cap: usize) -> Vec<(usize, u32)> {
         if s.step == 0 || s.parked_at.is_some() {
             continue;
         }
-        let last = *s.out_ids.last().expect("step > 0 implies output");
+        let last = s.feed().expect("step > 0 implies output");
         feeds.push((i, last));
         // The CFG partner steps on the same token.
         if s.cfg.is_some() && i + 1 < cap {
@@ -13383,6 +13442,7 @@ mod tests {
                 turn: None,
                 turn_key: None,
                 speech: None,
+                first_out: false,
                 mm: None,
                 export: None,
                 import: None,

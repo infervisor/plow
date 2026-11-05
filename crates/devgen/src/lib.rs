@@ -12142,6 +12142,15 @@ fn emit_dense_gqa(
     if !arch.is_empty() {
         write_lean_receipts(std::path::Path::new(&out), &lean);
         let mut man = manifest::build_for_packet(&m, &arch, &lean, &sections);
+        // A depth stage's projection bias rides a plain Gemv's t7 in auxiliary programs, which
+        // `m` (the manifest's source) does not hold.
+        if c.frame
+            .as_ref()
+            .and_then(|f| f.depth.as_ref())
+            .is_some_and(|d| d.proj_bias)
+        {
+            man["features"]["linear_bias"] = true.into();
+        }
         if speech.ops != 0 {
             man["speech_ops"] = speech.ops.into();
             man["speech_conv_posts"] = speech.conv_posts.into();

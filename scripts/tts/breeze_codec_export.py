@@ -15,7 +15,10 @@ the fish_dac export's naming (crates/devgen/src/fish_codec.rs), model_type qwen3
   dec.blk{i}.snake / .up.{w,b} / .ru{j}.{a1, c1.w, c1.b, a2, c2.w, c2.b}; dec.out.snake / dec.out.{w,b}
                      every snake is SnakeBeta as [exp(alpha) | 1 / (exp(beta) + 1e-9)]; then clamp
 
-  HF_HOME=... python scripts/tts/breeze_codec_export.py OUT_DIR REVISION
+  HF_HOME=... python scripts/tts/breeze_codec_export.py OUT_DIR REVISION [REPO SUBDIR]
+
+The same tokenizer ships as `speech_tokenizer/` in Qwen/Qwen3-TTS-12Hz-* (byte-identical weights):
+pass REPO = Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice, SUBDIR = speech_tokenizer.
 """
 import json
 import os
@@ -28,13 +31,15 @@ REPO = "models--BreezeBlue--Breeze-TTS-2"
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 5):
         sys.exit(__doc__)
+    repo, sub = (REPO, "audio_tokenizer") if len(sys.argv) == 3 else (
+        "models--" + sys.argv[3].replace("/", "--"), sys.argv[4])
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
     hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
         os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
-    src = os.path.join(hub, REPO, "snapshots", sys.argv[2], "audio_tokenizer")
+    src = os.path.join(hub, repo, "snapshots", sys.argv[2], sub)
     sd = {k[len("decoder."):]: v for k, v in load_file(f"{src}/model.safetensors").items() if k.startswith("decoder.")}
     dc = json.load(open(f"{src}/config.json"))["decoder_config"]
     T = {}

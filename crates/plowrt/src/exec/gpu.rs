@@ -8947,6 +8947,8 @@ impl GpuEngine {
                 tracing::info!("decode {s}");
             }
         }
+        // Rows not keyed by their ids (speech frame rows) are never published.
+        let cache_output = cache_output && !self.prefix_attach_off[b];
         self.staged_prefix[b] = None;
         self.prefix_attach_off[b] = false;
         if let Some(p) = self.pipe.as_mut() {

@@ -7,6 +7,8 @@
 //! with `--seq` the whole sequence is timed as one CUDA graph.
 //! `PB_PRE=ROLE,..` runs those programs once first (e.g. the encoder, so a CFM program sees real
 //! key lengths instead of zeroed inputs).
+//! `PB_STEP_FRAMES=N` fills every `stream.n.K` with N * `lengths.K.rows_per_frame` (a stateful
+//! codec step of N frames per item instead of zero-length items). `--sweep` lines carry the op.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -41,7 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iters: usize = pos.get(3).map_or(Ok(50), |s| s.parse())?;
     let mut rt = CudaPacketRuntime::load(path, 0)?;
     let asset = PacketAsset::load(path)?;
-    let pipeline = asset.bind(pos[1], &rt)?;
+    // PIPELINE is a pipeline name or its driver (`codec.v1`).
+    let pipeline = asset
+        .bind(pos[1], &rt)
+        .or_else(|_| asset.bind_driver(pos[1], &rt))?;
     if each {
         for (n, program) in pipeline.program_sequence(pos[2])?.into_iter().enumerate() {
             for _ in 0..3 {
@@ -78,6 +83,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let program = pipeline.program(pos[2])?;
+    if let Ok(n) = std::env::var("PB_STEP_FRAMES") {
+        let n: u32 = n.parse()?;
+        for k in 0..pipeline.parameter("lengths.count")? {
+            let rpf = pipeline.parameter(&format!("lengths.{k}.rows_per_frame"))? as u32;
+            let t = pipeline.tensor(&format!("stream.n.{k}"))?;
+            rt.write_tensor(t, bytemuck::cast_slice(&vec![n * rpf; t.bytes / 4]))?;
+        }
+    }
     if let Ok(pre) = std::env::var("PB_PRE") {
         for role in pre.split(',') {
             rt.run(pipeline.program(role)?)?;
@@ -101,13 +114,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::mem::take(&mut plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program].insts);
         for cap in 0..=caps.map_or(insts.len(), |c| c.min(insts.len())) {
             rt.set_debug_max_inst(cap as u32)?;
-            let (op, blocks) = cap.checked_sub(1).map_or((String::new(), 0), |i| {
-                let op = insts[i].op;
-                let name = packet::dev::DevOp::from_u16(op).map(|o| format!("{o:?}"));
-                (name.unwrap_or_else(|| op.to_string()), insts[i].blocks)
-            });
+            let (op, blocks, i, j) =
+                cap.checked_sub(1)
+                    .map_or((String::new(), 0, [0; 8], [0; 3]), |k| {
+                        let op = insts[k].op;
+                        let name = packet::dev::DevOp::from_u16(op).map(|o| format!("{o:?}"));
+                        (
+                            name.unwrap_or_else(|| op.to_string()),
+                            insts[k].blocks,
+                            insts[k].i,
+                            insts[k].fj,
+                        )
+                    });
             println!(
-                "{{\"cap\":{cap},\"op\":\"{op}\",\"blocks\":{blocks},\"us\":{:.2}}}",
+                "{{\"cap\":{cap},\"op\":\"{op}\",\"blocks\":{blocks},\"i\":{i:?},\"fj\":{j:?},\"us\":{:.2}}}",
                 time(&mut rt)?
             );
         }
