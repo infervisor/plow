@@ -583,7 +583,6 @@ impl GpuEngine {
         out: &mut Vec<u32>,
     ) -> Result<()> {
         let mut d = self.fish.take().ok_or_else(|| reject("not enabled"))?;
-        out.clear();
         let r = (|| {
             let outputs = if let Some(owners) = owners {
                 if rows.iter().any(|r| {

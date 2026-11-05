@@ -56,12 +56,17 @@ fn draw(e: &mut GpuEngine, outputs: &[(u32, u32)], step: u32) {
         })
         .collect();
     let owners: Vec<_> = outputs.iter().map(|o| o.0).collect();
-    let mut codes = Vec::new();
+    let mut codes = vec![u32::MAX];
     e.fish_depth_step_compact(&rows, &owners, &mut codes)
         .unwrap();
     let m = &e.fish.as_ref().unwrap().manifest;
-    assert_eq!(codes.len(), rows.len() * m.codebooks as usize);
-    assert!(codes
+    assert_eq!(
+        codes[0],
+        u32::MAX,
+        "depth output must append to the caller's buffer"
+    );
+    assert_eq!(codes.len(), 1 + rows.len() * m.codebooks as usize);
+    assert!(codes[1..]
         .chunks_exact(m.codebooks as usize)
         .all(|c| c[0] <= m.stop_class));
 }
@@ -174,86 +179,89 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
     draw(&mut e, &outputs, 0);
 
     // A continuing decode row rides beside a new prompt, through the hd128 split-attention arm.
-    e.retire_slot(0, false);
-    assert!(e.stage_speech_prefix(0, &keys_b));
-    let frontier = e.admit_packed_slot(0, &b, b.len() + 8).unwrap().unwrap();
-    assert!(
-        frontier >= 32 && frontier < b.len(),
-        "matching VMM content did not attach"
-    );
-    e.fish_reset_slot(0).unwrap();
-    if m.sampler == Sampler::Maya2 {
-        let text =
-            std::fs::read_to_string(assets.join("checkpoint/maya2_controller.json")).unwrap();
-        let ctl = crate::tts::maya2::Controller::parse(&text).unwrap();
-        e.maya2_bind(
-            0,
-            ctl.plan("A short correctness check.", "en", Some(8), ctl.cb0, 193),
-            None,
-        )
+    for step in 1..=2 {
+        e.retire_slot(0, false);
+        assert!(e.stage_speech_prefix(0, &keys_b));
+        let frontier = e.admit_packed_slot(0, &b, b.len() + 8).unwrap().unwrap();
+        assert!(
+            frontier >= 32 && frontier < b.len(),
+            "matching VMM content did not attach"
+        );
+        e.fish_reset_slot(0).unwrap();
+        if m.sampler == Sampler::Maya2 {
+            let text =
+                std::fs::read_to_string(assets.join("checkpoint/maya2_controller.json")).unwrap();
+            let ctl = crate::tts::maya2::Controller::parse(&text).unwrap();
+            e.maya2_bind(
+                0,
+                ctl.plan("A short correctness check.", "en", Some(8), ctl.cb0, 193),
+                None,
+            )
+            .unwrap();
+        }
+        let input = [contract.input_vocab - 3];
+        let mut reference = Vec::new();
+        let mut tokens = Vec::new();
+        e.step_slots(&[(3, input[0])], &mut tokens).unwrap();
+        e.logits_row(3, &mut reference).unwrap();
+        e.rewind_slot(3, a.len() + step as usize - 1).unwrap();
+        let requests = [
+            Request {
+                id: 0,
+                slot: 0,
+                state_slot: 0,
+                generation: e.slot_generation(0).unwrap(),
+                phase: Phase::Prefill,
+                tokens: &b[frontier..],
+                prompt_len: b.len() as u32,
+                selection: Selection::default(),
+            },
+            Request {
+                id: 3,
+                slot: 3,
+                state_slot: 3,
+                generation: e.slot_generation(3).unwrap(),
+                phase: Phase::Decode,
+                tokens: &input,
+                prompt_len: a.len() as u32,
+                selection: Selection::default(),
+            },
+        ];
+        e.token_batch_step_staged(&requests, &mut outputs, None, &mut |_| {}, &mut |e, p| {
+            upload_inputs(e, &m, p)
+        })
         .unwrap();
+        assert_eq!(
+            outputs[0].0, 3,
+            "the planner must put decode before prefill"
+        );
+        assert_eq!((e.pos[3], e.pos[0]), (41 + step, 37));
+        let mut actual = Vec::new();
+        e.logits_row(0, &mut actual).unwrap();
+        assert!(actual.iter().chain(&reference).all(|v| v.is_finite()));
+        let softmax = |values: &[f32]| {
+            let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut p: Vec<f64> = values.iter().map(|&v| f64::from(v - max).exp()).collect();
+            let sum = p.iter().sum::<f64>();
+            p.iter_mut().for_each(|p| *p /= sum);
+            p
+        };
+        let (p, q) = (softmax(&reference), softmax(&actual));
+        let kl: f64 = p
+            .iter()
+            .zip(q)
+            .filter(|(p, _)| **p > 0.0)
+            .map(|(&p, q)| p * (p / q).ln())
+            .sum();
+        eprintln!("mixed decode vs ordinary decode full-logit KL = {kl}");
+        assert!(kl < 1e-3, "mixed decode differs from ordinary decode");
+        assert_eq!(
+            crate::text::sample::argmax(&reference),
+            crate::text::sample::argmax(&actual)
+        );
+        draw(&mut e, &outputs, step);
     }
-    let input = [contract.input_vocab - 3];
-    let mut reference = Vec::new();
-    let mut tokens = Vec::new();
-    e.step_slots(&[(3, input[0])], &mut tokens).unwrap();
-    e.logits_row(3, &mut reference).unwrap();
-    e.rewind_slot(3, a.len()).unwrap();
-    let requests = [
-        Request {
-            id: 0,
-            slot: 0,
-            state_slot: 0,
-            generation: e.slot_generation(0).unwrap(),
-            phase: Phase::Prefill,
-            tokens: &b[frontier..],
-            prompt_len: b.len() as u32,
-            selection: Selection::default(),
-        },
-        Request {
-            id: 3,
-            slot: 3,
-            state_slot: 3,
-            generation: e.slot_generation(3).unwrap(),
-            phase: Phase::Decode,
-            tokens: &input,
-            prompt_len: a.len() as u32,
-            selection: Selection::default(),
-        },
-    ];
-    e.token_batch_step_staged(&requests, &mut outputs, None, &mut |_| {}, &mut |e, p| {
-        upload_inputs(e, &m, p)
-    })
-    .unwrap();
-    assert_eq!(
-        outputs[0].0, 3,
-        "the planner must put decode before prefill"
-    );
-    assert_eq!((e.pos[3], e.pos[0]), (42, 37));
-    let mut actual = Vec::new();
-    e.logits_row(0, &mut actual).unwrap();
-    assert!(actual.iter().chain(&reference).all(|v| v.is_finite()));
-    let softmax = |values: &[f32]| {
-        let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut p: Vec<f64> = values.iter().map(|&v| f64::from(v - max).exp()).collect();
-        let sum = p.iter().sum::<f64>();
-        p.iter_mut().for_each(|p| *p /= sum);
-        p
-    };
-    let (p, q) = (softmax(&reference), softmax(&actual));
-    let kl: f64 = p
-        .iter()
-        .zip(q)
-        .filter(|(p, _)| **p > 0.0)
-        .map(|(&p, q)| p * (p / q).ln())
-        .sum();
-    eprintln!("mixed decode vs ordinary decode full-logit KL = {kl}");
-    assert!(kl < 1e-3, "mixed decode differs from ordinary decode");
-    assert_eq!(
-        crate::text::sample::argmax(&reference),
-        crate::text::sample::argmax(&actual)
-    );
-    draw(&mut e, &outputs, 1);
+
     e.retire_slot(0, false);
     let mut changed = keys_b.clone();
     changed[0] ^= 1;
@@ -267,6 +275,17 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
         0,
         "raw tokens aliased speech identities"
     );
+    let input = [contract.input_vocab - 3];
+    let requests = [Request {
+        id: 3,
+        slot: 3,
+        state_slot: 3,
+        generation: e.slot_generation(3).unwrap(),
+        phase: Phase::Decode,
+        tokens: &input,
+        prompt_len: a.len() as u32,
+        selection: Selection::default(),
+    }];
     let before = e.pos.clone();
     assert!(
         e.token_batch_step(&requests, &mut outputs).is_err(),
