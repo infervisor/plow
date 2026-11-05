@@ -41,6 +41,10 @@ With a packed depth contract, live VMM uses bounded engine-local identities for 
 content keys, outside the packet's input-token vocabulary. Identities are never recycled while
 cache entries can refer to them; exhaustion declines caching. Prompt lookup, boundary storage
 and publication use the same identities. Generated frame rows are not published as token prefixes.
+Short-context live KV may instead commit whole private slots. Those slots can retain a prefix
+within the existing released-memory cap. A residency generation invalidates keys and staged
+resumes after reclamation or reassignment; idle lanes write beyond the retained prefix. Sliding
+and recurrent caches remain excluded from this slot reuse route.
 
 Depth speaker-conditioning inputs also stay resident per slot. Rebinding the same immutable
 speaker allocation (or null speaker) resets the request's controller while reusing its uploaded

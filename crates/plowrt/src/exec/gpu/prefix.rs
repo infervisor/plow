@@ -48,6 +48,7 @@ impl SpeechIdentities {
 
 pub(super) struct SlotPrefixes {
     rows: Vec<Vec<u64>>,
+    backing: Vec<Option<u64>>,
     pub(super) epoch: u64,
 }
 
@@ -55,12 +56,16 @@ impl SlotPrefixes {
     pub(super) fn new(slots: usize) -> Self {
         Self {
             rows: vec![Vec::new(); slots],
+            backing: vec![None; slots],
             epoch: 0,
         }
     }
 
-    pub(super) fn take(&mut self, slot: usize, keys: &[u64]) -> usize {
+    pub(super) fn take(&mut self, slot: usize, keys: &[u64], backing: Option<u64>) -> usize {
         let old = std::mem::take(&mut self.rows[slot]);
+        if !self.backing_matches(slot, backing) {
+            return 0;
+        }
         old.iter()
             .zip(keys)
             .take(keys.len().saturating_sub(1))
@@ -68,13 +73,27 @@ impl SlotPrefixes {
             .count()
     }
 
-    pub(super) fn publish(&mut self, slot: usize, mut keys: Vec<u64>) {
+    pub(super) fn publish(&mut self, slot: usize, mut keys: Vec<u64>, backing: Option<u64>) {
         keys.truncate(keys.len().saturating_sub(1));
         self.rows[slot] = keys;
+        self.backing[slot] = backing;
+    }
+
+    pub(super) fn backing_matches(&self, slot: usize, backing: Option<u64>) -> bool {
+        self.backing[slot] == backing
+    }
+
+    pub(super) fn retained_rows(&self, slot: usize, backing: Option<u64>) -> usize {
+        if self.backing_matches(slot, backing) {
+            self.rows[slot].len()
+        } else {
+            0
+        }
     }
 
     pub(super) fn clear(&mut self, slot: usize) {
         self.rows[slot].clear();
+        self.backing[slot] = None;
     }
 
     pub(super) fn clear_all(&mut self) {
@@ -82,6 +101,7 @@ impl SlotPrefixes {
         for keys in &mut self.rows {
             keys.clear();
         }
+        self.backing.fill(None);
     }
 }
 
@@ -1234,6 +1254,24 @@ mod slot_prefix_tests {
     use super::{SlotPrefixes, SpeechIdentities};
 
     #[test]
+    fn reclaimed_slot_prefix_is_refused_even_after_the_slot_is_mapped_again() {
+        let mut cache = SlotPrefixes::new(1);
+        cache.publish(0, vec![1, 2, 3], Some(10));
+        assert_eq!(cache.retained_rows(0, Some(10)), 2);
+        assert_eq!(cache.retained_rows(0, None), 0);
+        assert_eq!(cache.take(0, &[1, 2, 3], Some(11)), 0);
+        cache.publish(0, vec![1, 2, 3], Some(12));
+        assert_eq!(cache.take(0, &[1, 2, 3], Some(12)), 2);
+        assert!(cache.backing_matches(0, Some(12)));
+        assert!(
+            !cache.backing_matches(0, Some(13)),
+            "a staged resume also needs its original backing"
+        );
+        cache.clear_all();
+        assert!(!cache.backing_matches(0, Some(12)));
+    }
+
+    #[test]
     fn speech_identities_preserve_content_and_never_alias_token_ids() {
         let mut ids = SpeechIdentities::new(8194);
         let a = ids.encode(&[10, 20, 30, 20]).unwrap();
@@ -1252,25 +1290,25 @@ mod slot_prefix_tests {
     #[test]
     fn slot_prefix_keeps_only_matching_prompt_rows_and_always_replays_the_last() {
         let mut cache = SlotPrefixes::new(2);
-        cache.publish(0, vec![10, 20, 30, 40]);
-        assert_eq!(cache.take(1, &[10, 20, 30, 50]), 0);
-        assert_eq!(cache.take(0, &[10, 20, 30, 50]), 3);
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(cache.take(1, &[10, 20, 30, 50], None), 0);
+        assert_eq!(cache.take(0, &[10, 20, 30, 50], None), 3);
         assert_eq!(
-            cache.take(0, &[10, 20, 30, 50]),
+            cache.take(0, &[10, 20, 30, 50], None),
             0,
             "lookup consumes provenance"
         );
-        cache.publish(0, vec![10, 20, 30, 40]);
+        cache.publish(0, vec![10, 20, 30, 40], None);
         assert_eq!(
-            cache.take(0, &[10, 20]),
+            cache.take(0, &[10, 20], None),
             1,
             "the new prompt keeps a terminal row"
         );
-        cache.publish(0, vec![10, 20, 30, 40]);
-        assert_eq!(cache.take(0, &[10, 99, 30, 40]), 1);
-        cache.publish(0, vec![10, 20, 30, 40]);
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(cache.take(0, &[10, 99, 30, 40], None), 1);
+        cache.publish(0, vec![10, 20, 30, 40], None);
         assert_eq!(
-            cache.take(0, &[10, 20, 30, 40, 50]),
+            cache.take(0, &[10, 20, 30, 40, 50], None),
             3,
             "decode-written rows are excluded"
         );
@@ -1280,15 +1318,15 @@ mod slot_prefix_tests {
     fn slot_prefix_requires_explicit_successful_publication_after_reseating() {
         let mut cache = SlotPrefixes::new(2);
         for slot in 0..2 {
-            cache.publish(slot, vec![1, 2, 3]);
+            cache.publish(slot, vec![1, 2, 3], None);
         }
         cache.clear(0);
-        assert_eq!(cache.take(0, &[1, 2, 3]), 0);
-        assert_eq!(cache.take(1, &[1, 2, 3]), 2);
+        assert_eq!(cache.take(0, &[1, 2, 3], None), 0);
+        assert_eq!(cache.take(1, &[1, 2, 3], None), 2);
         // Refused resume or failed/cancelled prefill publishes nothing.
-        assert_eq!(cache.take(1, &[1, 2, 3]), 0);
+        assert_eq!(cache.take(1, &[1, 2, 3], None), 0);
         for slot in 0..2 {
-            cache.publish(slot, vec![1, 2, 3]);
+            cache.publish(slot, vec![1, 2, 3], None);
         }
         let epoch = cache.epoch;
         cache.clear_all();
@@ -1297,9 +1335,9 @@ mod slot_prefix_tests {
             "a fault also invalidates pending publication"
         );
         for slot in 0..2 {
-            assert_eq!(cache.take(slot, &[1, 2, 3]), 0);
+            assert_eq!(cache.take(slot, &[1, 2, 3], None), 0);
         }
-        cache.publish(0, vec![1]);
-        assert_eq!(cache.take(0, &[1, 2]), 0);
+        cache.publish(0, vec![1], None);
+        assert_eq!(cache.take(0, &[1, 2], None), 0);
     }
 }

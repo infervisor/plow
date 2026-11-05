@@ -624,6 +624,8 @@ impl GpuEngine {
             Ok(())
         })();
         if result.is_err() {
+            self.pf_riders = 0;
+            self.pf_seg_prefix = false;
             self.tb_verdicts.truncate(verdicts_before);
             self.spec_hidden_commit(false);
             if body_enqueued {

@@ -8763,7 +8763,7 @@ impl GpuEngine {
     /// reset — `in.kvlen` bounds what the attention reads, so rewinding
     /// `pos[b]` to 0 makes the slot's old cache rows unreachable.
     pub fn begin_slot(&mut self, b: usize, total: usize) -> Result<()> {
-        let keep = self.resume_rows.get_mut(b).map_or(0, std::mem::take);
+        let mut keep = self.resume_rows.get_mut(b).map_or(0, std::mem::take);
         if b >= self.batch {
             return Err(RuntimeError::Rejected(format!(
                 "slot {b} out of range (engine batch {})",
@@ -8775,6 +8775,9 @@ impl GpuEngine {
                 "prompt + max_tokens = {total} exceeds the compiled context {}",
                 self.max_ctx
             )));
+        }
+        if keep > 0 && !self.can_resume_slot(b, keep as usize) {
+            keep = 0;
         }
         let attach_off = self.prefix_attach_off[b];
         self.slot_prefixes.clear(b);
@@ -8905,8 +8908,21 @@ impl GpuEngine {
         self.vmm.is_none() && self.recurrent.is_none()
     }
 
+    fn live_slot_prefix_supported(&self) -> bool {
+        self.resume_ring_slack.is_none()
+            && self
+                .vmm
+                .as_ref()
+                .is_some_and(|v| v.kv.is_none() && v.rings.is_some())
+    }
+
+    fn slot_prefix_backing(&self, b: usize) -> Option<u64> {
+        self.vmm.as_ref()?.rings.as_ref()?.residency(b)
+    }
+
     pub fn reuse_slot_prefix(&mut self, b: usize, keys: &[u64]) -> usize {
-        let rows = self.slot_prefixes.take(b, keys);
+        let backing = self.slot_prefix_backing(b);
+        let rows = self.slot_prefixes.take(b, keys, backing);
         if !self.slot_prefix_reuse_supported() {
             return 0;
         }
@@ -8922,7 +8938,18 @@ impl GpuEngine {
             && self.slot_prefix_reuse_supported()
             && self.pos[b] as usize >= keys.len().saturating_sub(1)
         {
-            self.slot_prefixes.publish(b, keys);
+            let backing = self.slot_prefix_backing(b);
+            if self.live_slot_prefix_supported() {
+                if backing.is_none() {
+                    return;
+                }
+                let rings = self.vmm.as_mut().unwrap().rings.as_mut().unwrap();
+                let (recycle, bounded, cap) = rings.retention();
+                if recycle && !bounded {
+                    rings.enable_bounded_park(cap);
+                }
+            }
+            self.slot_prefixes.publish(b, keys, backing);
         }
     }
 
@@ -8935,7 +8962,10 @@ impl GpuEngine {
     }
 
     pub fn slot_prefix_reuse_supported(&self) -> bool {
-        self.slot_resume_supported() && self.resume_ring_slack.is_none() && !self.drain_before_unmap
+        (self.slot_resume_supported()
+            || (self.recurrent.is_none() && self.live_slot_prefix_supported()))
+            && self.resume_ring_slack.is_none()
+            && !self.drain_before_unmap
     }
 
     /// Make the next `begin_slot(b, ..)` keep slot `b`'s first `rows` cache rows (a retained
@@ -8954,8 +8984,13 @@ impl GpuEngine {
     }
 
     fn can_resume_slot(&self, b: usize, rows: usize) -> bool {
-        self.slot_resume_supported()
+        (self.slot_resume_supported()
+            || (self.recurrent.is_none() && self.live_slot_prefix_supported()))
             && b < self.batch
+            && (!self.live_slot_prefix_supported() || self.slot_prefix_backing(b).is_some())
+            && self
+                .slot_prefixes
+                .backing_matches(b, self.slot_prefix_backing(b))
             && rows <= self.pos[b] as usize
             && rows < self.max_ctx
             && self
@@ -9058,7 +9093,13 @@ impl GpuEngine {
             kv.demote_session(b, signal);
         }
         self.trace_finish(b);
-        self.pos[b] = 0;
+        // Idle decode lanes must write past the retained prefix, including parked live slots.
+        self.pos[b] = if self.live_slot_prefix_supported() && self.slot_prefix_reuse_supported() {
+            self.slot_prefixes
+                .retained_rows(b, self.slot_prefix_backing(b)) as u32
+        } else {
+            0
+        };
         self.vmm_attached[b] = 0;
         // A retired row decodes as an idle lane from position 0: a stale learned-position base
         // above it traps `EmbedPosBf16` (`in.pos_base`, speech packets). The mux writes bases in

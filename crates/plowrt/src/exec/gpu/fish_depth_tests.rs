@@ -78,7 +78,12 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
     let be = Arc::new(CudaBackend::new(0).unwrap());
     let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).unwrap();
     assert!(e.token_batch_enabled() && e.packed_depth_enabled());
-    assert!(e.vmm_prefix_enabled());
+    let shared = e.vmm_prefix_enabled();
+    assert!(shared || e.slot_prefix_reuse_supported());
+    eprintln!(
+        "cache mode: shared VMM={shared}, slot prefix={}",
+        e.slot_prefix_reuse_supported()
+    );
     assert!(e.batch >= 4);
     let m = e.fish.as_ref().unwrap().manifest.clone();
     let contract = m.packed.as_ref().unwrap();
@@ -136,7 +141,9 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
     let keys_a: Vec<u64> = (0..a.len()).map(|i| i as u64 + 900).collect();
     let keys_b: Vec<u64> = (0..b.len()).map(|i| i as u64 + 1900).collect();
     for (slot, prompt, keys) in [(3, &a, &keys_a), (0, &b, &keys_b)] {
-        assert!(e.stage_speech_prefix(slot, keys));
+        if shared {
+            assert!(e.stage_speech_prefix(slot, keys));
+        }
         assert_eq!(
             e.admit_packed_slot(slot, prompt, prompt.len() + 8).unwrap(),
             Some(0)
@@ -176,12 +183,23 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
     .unwrap();
     assert_eq!(outputs.len(), 2);
     assert_eq!((e.pos[3], e.pos[0]), (41, 37));
+    if !shared {
+        let epoch = e.slot_prefix_epoch();
+        e.keep_slot_prefix(3, epoch, keys_a.clone());
+        e.keep_slot_prefix(0, epoch, keys_b.clone());
+    }
     draw(&mut e, &outputs, 0);
 
     // A continuing decode row rides beside a new prompt, through the hd128 split-attention arm.
     for step in 1..=2 {
         e.retire_slot(0, false);
-        assert!(e.stage_speech_prefix(0, &keys_b));
+        if shared {
+            assert!(e.stage_speech_prefix(0, &keys_b));
+        } else {
+            let cached = e.reuse_slot_prefix(0, &keys_b);
+            assert_eq!(cached, b.len() - 1);
+            assert_eq!(e.resume_slot(0, cached), cached);
+        }
         let frontier = e.admit_packed_slot(0, &b, b.len() + 8).unwrap().unwrap();
         assert!(
             frontier >= 32 && frontier < b.len(),
@@ -236,6 +254,9 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
             "the planner must put decode before prefill"
         );
         assert_eq!((e.pos[3], e.pos[0]), (41 + step, 37));
+        if !shared {
+            e.keep_slot_prefix(0, e.slot_prefix_epoch(), keys_b.clone());
+        }
         let mut actual = Vec::new();
         e.logits_row(0, &mut actual).unwrap();
         assert!(actual.iter().chain(&reference).all(|v| v.is_finite()));
@@ -265,7 +286,11 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
     e.retire_slot(0, false);
     let mut changed = keys_b.clone();
     changed[0] ^= 1;
-    assert!(e.stage_speech_prefix(0, &changed));
+    if shared {
+        assert!(e.stage_speech_prefix(0, &changed));
+    } else {
+        assert_eq!(e.reuse_slot_prefix(0, &changed), 0);
+    }
     assert_eq!(e.admit_packed_slot(0, &b, b.len() + 8).unwrap(), Some(0));
     e.retire_slot(0, false);
     e.begin_slot(0, b.len() + 8).unwrap();
