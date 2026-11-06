@@ -12,7 +12,7 @@ language, punctuation / symbols (Unicode P*, S*) are dropped instead of non-word
 would split Indic words at their vowel signs), zh / ja compare without spaces, and a per-language
 median is printed.
 """
-import argparse, glob, json, os, re, statistics, sys, unicodedata
+import argparse, glob, json, math, os, re, statistics, sys, unicodedata
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -27,6 +27,15 @@ def norm_lang(s, lang):
     s = unicodedata.normalize("NFKC", s).lower()
     s = "".join(" " if unicodedata.category(c)[0] in "PS" else c for c in s)
     return "".join(s.split()) if lang in ("zh", "ja") else " ".join(s.split())
+
+
+def cer_report(rows, model, limit):
+    values = sorted(r["cer"] for r in rows)
+    med = statistics.median(values)
+    return dict(model=model, n=len(values), median_cer=med, mean_cer=sum(values) / len(values),
+                p95_cer=values[math.ceil(0.95 * len(values)) - 1], max_cer=values[-1],
+                over_limit_count=sum(c > limit for c in values),
+                median_gate=dict(limit=limit, passed=med <= limit), rows=rows)
 
 
 def main():
@@ -65,9 +74,7 @@ def main():
     print(f"MEDIAN_CER={med:.3f} n={len(cers)}")
     if args.out:
         with open(args.out, "w") as f:
-            json.dump(dict(model=args.model, median_cer=med, mean_cer=sum(cers) / len(cers),
-                           max_cer=args.max_cer, passed=med <= args.max_cer, rows=rows),
-                      f, ensure_ascii=False, indent=2)
+            json.dump(cer_report(rows, args.model, args.max_cer), f, ensure_ascii=False, indent=2)
     sys.exit(0 if med <= args.max_cer else 1)
 
 
