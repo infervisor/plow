@@ -500,13 +500,42 @@ impl Seq {
         w: &str,
         b: Option<&str>,
     ) -> Result<u32, String> {
+        self.dense_with_math(
+            splits,
+            x,
+            out,
+            rows,
+            k,
+            n,
+            w,
+            b,
+            crate::pipeline::Conv1dMath::Tf32x3,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dense_with_math(
+        &mut self,
+        splits: Splits<'_>,
+        x: u32,
+        out: &str,
+        rows: u32,
+        k: u32,
+        n: u32,
+        w: &str,
+        b: Option<&str>,
+        math: crate::pipeline::Conv1dMath,
+    ) -> Result<u32, String> {
+        if math == crate::pipeline::Conv1dMath::F32 && splits.is_some() {
+            return Err("FP32 dense math requires unsplit FP32 weights".into());
+        }
         let split = splits.is_some_and(|s| {
             s.borrow_mut()
                 .insert(w.trim_start_matches("w.").to_string(), (n, k, 1));
             true
         });
         let dep = self.last;
-        let e = self.p().conv1d_f32(
+        let e = self.p().conv1d_f32_math(
             x,
             false,
             &[dep],
@@ -538,6 +567,7 @@ impl Seq {
                 weight_split: split,
                 dual_alpha: false,
             },
+            math,
         )?;
         Ok(self.done(e))
     }

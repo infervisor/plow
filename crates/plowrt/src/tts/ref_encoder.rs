@@ -1,17 +1,15 @@
-//! A codec-encoder packet (`ref_encoder.pkt`, driver `codec.encode.v1`) beside a speech LM: one
-//! reference clip in, its codes out, for voice cloning prompts. One launch per clip: the PCM is
-//! zero-padded to the smallest capacity `encode.f{F}` that holds it.
+//! A codec-encoder packet beside a speech LM: one reference clip in, its codes out.
+//! `codec.encode.v2` carries actual sample lengths; v1 pads PCM to the selected capacity.
 
 use std::path::Path;
 
 use parking_lot::Mutex;
 
 use crate::exec::packet_runtime::{
-    load_packet_runtime_on, PacketAsset, PacketRuntime, PacketTensor,
+    load_packet_runtime_on, PacketAsset, PacketData, PacketRuntime, PacketTensor, PacketWrite,
 };
 
 pub const PACKET: &str = "ref_encoder.pkt";
-const DRIVER: &str = "codec.encode.v1";
 /// Recent clips' codes, by exact PCM: a repeated reference skips the launch.
 const CACHE: usize = 16;
 
@@ -22,6 +20,7 @@ pub struct RefEncoder {
     /// (frames, program), ascending.
     capacities: Vec<(usize, usize)>,
     pcm: PacketTensor,
+    samples: Option<PacketTensor>,
     codes: PacketTensor,
     pub sample_rate: u32,
     pub frame_samples: usize,
@@ -163,7 +162,7 @@ mod tests {
         assert!(all_pass, "speaker frontend numerical gate failed");
     }
 
-    fn install_speaker_verifier() {
+    fn install_sidecar_verifier() {
         devgen::install_sidecar_verifier(Box::new(|requests| {
             let (certs, hash) =
                 lean_verify::call_batch_bound(requests).map_err(|e| e.to_string())?;
@@ -189,9 +188,227 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "REF_CODEC_CHECKPOINT, REF_CODEC_PACKET, optional REF_CODEC_GPU/REF_CODEC_ROUTE; CPU-only codec emit with approved Lean verifier"]
+    fn emit_trained_reference_codec() {
+        install_sidecar_verifier();
+        let dir = std::env::var("REF_CODEC_CHECKPOINT").unwrap();
+        let out = std::path::PathBuf::from(std::env::var("REF_CODEC_PACKET").unwrap());
+        let gpu = std::env::var("REF_CODEC_GPU").unwrap_or_else(|_| "H100 SXM5".into());
+        let (mut model, section) = devgen::mimi_encoder::lower_mimi_encoder(
+            Path::new(&dir),
+            132,
+            packet::devbuild::gpu_fingerprint(&gpu),
+        )
+        .unwrap();
+        let route = std::env::var("REF_CODEC_ROUTE").unwrap_or_else(|_| "emitted".into());
+        assert!(matches!(
+            route.as_str(),
+            "emitted" | "fp32_rvq" | "fp32_projection" | "fp32_classifier"
+        ));
+        for p in &mut model.progs {
+            for d in &mut p.insts {
+                if d.op != packet::dev::DevOp::Conv1dF32 as u16 {
+                    continue;
+                }
+                let name = &model.tensors[d.t[2] as usize].name;
+                let projection = matches!(name.as_str(), "w.sem.proj" | "w.ac.proj");
+                let classifier = name.starts_with("w.sem.E") || name.starts_with("w.ac.E");
+                if (route == "fp32_rvq" && (projection || classifier))
+                    || (route == "fp32_projection" && projection)
+                    || (route == "fp32_classifier" && classifier)
+                {
+                    assert_eq!((d.i[4], d.i[7]), (1, 1));
+                    d.j[1] &= !(1 << 13);
+                }
+            }
+        }
+        println!(
+            "codec object requires ops mask 0x{:x}",
+            devgen::manifest::speech_ops(&model)
+        );
+        let mut plans = Vec::new();
+        let weight = model
+            .tensors
+            .iter()
+            .position(|t| t.name == "w.down.w")
+            .unwrap() as u32;
+        for (program, p) in model.progs.iter().enumerate() {
+            let down = p
+                .insts
+                .iter()
+                .find(|d| d.op == packet::dev::DevOp::Conv1dF32 as u16 && d.t[2] == weight)
+                .unwrap();
+            plans.push(serde_json::json!({"program": program, "frames": model.prog_t[program],
+                "xf": model.tensors[down.t[1] as usize].name, "down": model.tensors[down.t[0] as usize].name}));
+        }
+        devgen::write_sidecar_packet(&out, &model, &[section]);
+        let receipts: plow_asset::certificates::SidecarCheckReceipts = serde_json::from_slice(
+            &std::fs::read(plow_asset::certificates::sidecar_checks_file(&out)).unwrap(),
+        )
+        .unwrap();
+        receipts
+            .validate_packet(&plow_asset::decode_objects::image_sha256(
+                &std::fs::read(&out).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(receipts.program_checks.len(), model.progs.len());
+        assert!(receipts.program_checks.iter().all(Option::is_some));
+        std::fs::write(
+            out.with_extension("plan.json"),
+            serde_json::to_vec_pretty(&plans).unwrap(),
+        )
+        .unwrap();
+        println!(
+            "all {} codec programs have approved receipts",
+            model.progs.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "REF_CODEC_PACKET, REF_CODEC_REFERENCE, REF_CODEC_RESULT_JSON and optional REF_CODEC_BACKEND; saved-input correctness only"]
+    fn reference_codec_matches_saved_reference() {
+        let path = std::path::PathBuf::from(std::env::var("REF_CODEC_PACKET").unwrap());
+        let backend = std::env::var("REF_CODEC_BACKEND").unwrap_or_else(|_| "cpu".into());
+        let runtime = load_packet_runtime_on(&path, &backend, 0).unwrap().runtime;
+        let encoder = RefEncoder::bind(&path, runtime).unwrap();
+        let fixture: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("REF_CODEC_REFERENCE").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let plans: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(path.with_extension("plan.json")).unwrap())
+                .unwrap();
+        assert!(
+            encoder.samples.is_some(),
+            "actual-length gate requires codec.encode.v2"
+        );
+        assert_eq!(
+            u64::from(encoder.sample_rate),
+            fixture["sample_rate"].as_u64().unwrap()
+        );
+        assert_eq!(
+            encoder.frame_samples as u64,
+            fixture["frame_samples"].as_u64().unwrap()
+        );
+        assert_eq!(
+            encoder.frame_codes as u64,
+            fixture["frame_codes"].as_u64().unwrap()
+        );
+        assert!(encoder.encode(&[]).is_err());
+        assert!(encoder
+            .encode(&vec![0.; encoder.max_samples() + 1])
+            .is_err());
+        let decode_f32 = |bytes: &[u8]| -> Vec<f32> {
+            assert_eq!(bytes.len() % 4, 0);
+            bytes
+                .chunks_exact(4)
+                .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+                .collect()
+        };
+        let mut checks = Vec::new();
+        let mut output_data = Vec::new();
+        let mut all_pass = true;
+        for case in fixture["cases"].as_array().unwrap() {
+            let pcm = decode_f32(&std::fs::read(case["pcm"].as_str().unwrap()).unwrap());
+            assert_eq!(pcm.len() as u64, case["samples"].as_u64().unwrap());
+            let frames = pcm.len().div_ceil(encoder.frame_samples);
+            assert_eq!(frames as u64, case["frames"].as_u64().unwrap());
+            let reference = std::fs::read(case["codes"].as_str().unwrap()).unwrap();
+            assert_eq!(reference.len(), frames * encoder.frame_codes * 4);
+            let first = encoder.encode(&pcm).unwrap();
+            let api_exact = bytemuck::cast_slice::<u32, u8>(&first) == reference;
+            assert_eq!(first, encoder.encode(&pcm).unwrap(), "cached codes changed");
+            all_pass &= api_exact;
+            let mut previous = None;
+            for &(cap, program) in encoder
+                .capacities
+                .iter()
+                .filter(|&&(cap, _)| cap >= frames)
+                .take(2)
+            {
+                let mut rt = encoder.runtime.lock();
+                let poison = vec![f32::NAN; cap * encoder.frame_samples];
+                let count = (pcm.len() as u32).to_le_bytes();
+                rt.write_tensors(&[
+                    PacketWrite {
+                        tensor: encoder.pcm,
+                        offset: 0,
+                        data: PacketData::Host(bytemuck::cast_slice(&poison)),
+                    },
+                    PacketWrite {
+                        tensor: encoder.pcm,
+                        offset: 0,
+                        data: PacketData::Host(bytemuck::cast_slice(&pcm)),
+                    },
+                    PacketWrite {
+                        tensor: encoder.samples.unwrap(),
+                        offset: 0,
+                        data: PacketData::Host(&count),
+                    },
+                ])
+                .unwrap();
+                rt.run(program).unwrap();
+                let mut codes = vec![0u8; reference.len()];
+                rt.read_tensor_at(encoder.codes, 0, &mut codes).unwrap();
+                let changed = codes
+                    .chunks_exact(4)
+                    .zip(reference.chunks_exact(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let capacity_equal = previous.as_ref().is_none_or(|old| old == &codes);
+                let codes_offset = output_data.len();
+                output_data.extend_from_slice(&codes);
+                previous = Some(codes);
+                let mut stages = Vec::new();
+                let plan = plans.iter().find(|p| p["program"] == program).unwrap();
+                for name in ["xf", "down"] {
+                    let reference = &case[name];
+                    let expected =
+                        decode_f32(&std::fs::read(reference["path"].as_str().unwrap()).unwrap());
+                    assert_eq!(
+                        expected.len() as u64,
+                        reference["rows"].as_u64().unwrap() * reference["width"].as_u64().unwrap()
+                    );
+                    let tensor = rt.tensor(plan[name].as_str().unwrap()).unwrap();
+                    let mut bytes = vec![0; expected.len() * 4];
+                    rt.read_tensor_at(tensor, 0, &mut bytes).unwrap();
+                    let output_offset = output_data.len();
+                    output_data.extend_from_slice(&bytes);
+                    let got = decode_f32(&bytes);
+                    let finite = got.iter().all(|x| x.is_finite());
+                    let max_abs = got
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    let rms = (expected.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>()
+                        / expected.len() as f64)
+                        .sqrt();
+                    all_pass &= finite;
+                    stages.push(serde_json::json!({"stage":name,"finite":finite,"max_abs":max_abs,"max_abs_over_rms":f64::from(max_abs)/rms.max(1e-30),
+                        "output_offset_bytes":output_offset,"rows":reference["rows"],"width":reference["width"]}));
+                }
+                let pass = api_exact && changed == 0 && capacity_equal;
+                all_pass &= pass;
+                let result = serde_json::json!({"case":case["case"],"samples":pcm.len(),"frames":frames,"capacity":cap,
+                    "api_exact":api_exact,"changed_codes":changed,"capacity_equal":capacity_equal,"pass":pass,"stages":stages,"codes_offset_bytes":codes_offset});
+                println!("{result}");
+                checks.push(result);
+            }
+        }
+        let result_path = std::path::PathBuf::from(std::env::var("REF_CODEC_RESULT_JSON").unwrap());
+        let output_path = result_path.with_extension("bin");
+        std::fs::write(&output_path, output_data).unwrap();
+        std::fs::write(result_path, serde_json::to_vec_pretty(&serde_json::json!({
+            "scope":"native codec saved-input correctness; discrete codes strict; floating stage errors diagnostic; no timings",
+            "backend":backend,"pass":all_pass,"checks":checks,"output_data":output_path})).unwrap()).unwrap();
+        assert!(all_pass, "native codec differs from the saved reference");
+    }
+
+    #[test]
     #[ignore = "SPEAKER_CHECKPOINT and SPEAKER_PACKET_OUT; trained CPU-only sidecar emit with approved Lean verifier"]
     fn emit_trained_speaker_packet() {
-        install_speaker_verifier();
+        install_sidecar_verifier();
         let dir = std::env::var("SPEAKER_CHECKPOINT").unwrap();
         let out = std::env::var("SPEAKER_PACKET_OUT").unwrap();
         let (model, section) =
@@ -362,7 +579,7 @@ mod tests {
     #[test]
     #[ignore = "SPEAKER_CHECKPOINT, SPEAKER_PACKET_OUT, SPEAKER_REFERENCE_JSON, SPEAKER_LAYER_PLAN; CPU-only layer replay emit"]
     fn emit_trained_speaker_layers() {
-        install_speaker_verifier();
+        install_sidecar_verifier();
         let dir = std::env::var("SPEAKER_CHECKPOINT").unwrap();
         let out = std::env::var("SPEAKER_PACKET_OUT").unwrap();
         let route = std::env::var("SPEAKER_LAYER_ROUTE").unwrap_or_else(|_| "emitted".into());
@@ -768,8 +985,31 @@ impl RefEncoder {
         let runtime = load_packet_runtime_on(path, "cuda", device)
             .map_err(e)?
             .runtime;
+        Self::bind(path, runtime)
+    }
+
+    fn bind(path: &Path, mut runtime: Box<dyn PacketRuntime>) -> Result<Self, String> {
+        let e = |x: crate::RuntimeError| format!("{}: {x}", path.display());
         let asset = PacketAsset::load(path).map_err(e)?;
-        let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;
+        let mut encoders = asset
+            .pipelines()
+            .iter()
+            .filter(|p| matches!(p.driver.as_str(), "codec.encode.v1" | "codec.encode.v2"));
+        let descriptor = encoders.next().ok_or("codec encoder pipeline is missing")?;
+        if encoders.next().is_some() {
+            return Err("codec encoder pipeline is ambiguous".into());
+        }
+        let has_samples = descriptor.codec_sample_input()?;
+        let pipeline = asset.bind(&descriptor.name, runtime.as_ref()).map_err(e)?;
+        let samples = has_samples
+            .then(|| pipeline.tensor("samples"))
+            .transpose()
+            .map_err(e)?;
+        if let Some(samples) = samples {
+            runtime
+                .prepare_writes(&[pipeline.tensor("pcm").map_err(e)?, samples])
+                .map_err(e)?;
+        }
         let param = |k: &str| pipeline.parameter(k).map_err(e);
         let mut capacities: Vec<(usize, usize)> = pipeline
             .programs()
@@ -783,6 +1023,7 @@ impl RefEncoder {
         }
         Ok(RefEncoder {
             pcm: pipeline.tensor("pcm").map_err(e)?,
+            samples,
             codes: pipeline.tensor("codes").map_err(e)?,
             sample_rate: param("audio.sample_rate")? as u32,
             frame_samples: param("codec.frame_samples")? as usize,
@@ -823,13 +1064,32 @@ impl RefEncoder {
                     self.max_samples()
                 )
             })?;
-        let mut padded = vec![0f32; cap * self.frame_samples];
-        padded[..pcm.len()].copy_from_slice(pcm);
         let mut codes = vec![0u32; frames * self.frame_codes];
         let mut rt = self.runtime.lock();
         let e = |x: crate::RuntimeError| format!("reference encoder: {x}");
-        rt.write_tensor_at(self.pcm, 0, bytemuck::cast_slice(&padded))
+        if let Some(samples) = self.samples {
+            let count = u32::try_from(pcm.len())
+                .map_err(|_| "reference sample count overflows")?
+                .to_le_bytes();
+            rt.write_tensors(&[
+                PacketWrite {
+                    tensor: self.pcm,
+                    offset: 0,
+                    data: PacketData::Host(bytemuck::cast_slice(pcm)),
+                },
+                PacketWrite {
+                    tensor: samples,
+                    offset: 0,
+                    data: PacketData::Host(&count),
+                },
+            ])
             .map_err(e)?;
+        } else {
+            let mut padded = vec![0f32; cap * self.frame_samples];
+            padded[..pcm.len()].copy_from_slice(pcm);
+            rt.write_tensor_at(self.pcm, 0, bytemuck::cast_slice(&padded))
+                .map_err(e)?;
+        }
         rt.run(program).map_err(e)?;
         rt.read_tensor_at(self.codes, 0, bytemuck::cast_slice_mut(&mut codes))
             .map_err(e)?;

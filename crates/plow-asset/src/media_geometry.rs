@@ -113,8 +113,9 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
     }
     if p.strings.contains_key("clone.encoder") {
         let e = sidecar(p, "clone.encoder", sidecars, |e| {
-            e.driver == "codec.encode.v1"
+            matches!(e.driver.as_str(), "codec.encode.v1" | "codec.encode.v2")
         })?;
+        e.codec_sample_input()?;
         let frames: Vec<u64> = e
             .programs
             .keys()
@@ -470,7 +471,7 @@ mod tests {
             &[("pcm", vec![131072]), ("codes", vec![64, 7])],
         );
         enc.programs = BTreeMap::from([("encode.f32".into(), 0), ("encode.f64".into(), 1)]);
-        let enc = vec![enc];
+        let mut enc = vec![enc];
         let sidecars = [packet("codec.pkt", &codec), packet("ref_encoder.pkt", &enc)];
         let family = &request(&packet("model.pkt", &lm), &sidecars)
             .unwrap()
@@ -482,6 +483,23 @@ mod tests {
             request(&packet("model.pkt", &lm), &sidecars[..1]).is_err(),
             "declared encoder absent"
         );
+        enc[0].driver = "codec.encode.v2".into();
+        let sidecars = [packet("codec.pkt", &codec), packet("ref_encoder.pkt", &enc)];
+        assert!(request(&packet("model.pkt", &lm), &sidecars).is_err());
+        enc[0].tensors.insert(
+            "samples".into(),
+            PipelineTensor {
+                name: "in.samples".into(),
+                dtype: PipelineDType::U32,
+                shape: vec![1],
+            },
+        );
+        let sidecars = [packet("codec.pkt", &codec), packet("ref_encoder.pkt", &enc)];
+        let family = &request(&packet("model.pkt", &lm), &sidecars)
+            .unwrap()
+            .unwrap()["families"][0];
+        assert_eq!(family["clone_frames"], serde_json::json!([32, 64]));
+        assert_eq!(family["clone_codes_capacity"], 448);
     }
 
     #[test]

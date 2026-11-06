@@ -742,6 +742,15 @@ every other voice is refused as unknown; a model sharing no voice with the list 
 | `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
 | `ref_audio` + `ref_text` | voice cloning (Breeze, Fish S2): base64 or `data:` URL audio (wav, mp3, flac, ogg) of at most 20.48 s (Breeze) / 23.78 s (Fish) and its exact transcript; the reference encoder (`ref_encoder.pkt`) runs once per request on the engine thread before the first prefill chunk (the codes of the 16 most recent clips are kept by exact PCM, so a repeated clip skips the launch), and every segment's prompt opens with the contract's clone layout: transcript, reference frames, then an end frame (Breeze) or the system turn's close (Fish). The Fish encoder is FP32 and matches the official server's codes exactly (9.3 s clip: 200/200 frames, 105 ms on H100); the request never takes a session (its frame rows are placeholders until encoded) |
 
+Reference encoder driver `codec.encode.v2` requires a `samples` tensor role of type `u32[1]`,
+alongside `pcm`, `codes`, the `encode.f{F}` capacity programs and the existing audio/codec
+parameters. The host writes the actual PCM prefix and its sample count in one batch. Programs
+derive each layer's valid length, including ceil division at strided convolutions, and bound
+attention and final padding by those lengths. Unused PCM capacity need not be uploaded.
+Driver `codec.encode.v1` retains whole-capacity zero padding. Unsupported drivers or a missing
+or incorrectly typed v2 sample-count binding are rejected. This contract alone does not enable
+a model's cloning capability or establish numerical/performance qualification.
+
 A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
 A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is
 cond + w (cond - uncond); a model trained with `cfg_scale` s of uncond + s (cond - uncond) takes

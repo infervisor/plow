@@ -1141,6 +1141,12 @@ fastconformer RNNT, fish-s2.
   scalar accumulation; neither matching arithmetic nor performance is qualified there.
   Numerical qualification remains required; no native performance win is implied.
   AMD lacks these speech arms. A speaker packet alone does not bind a live cloning request.
+- **Codec encoder lengths**: `codec.encode.v2` carries actual PCM sample counts through
+  convolution ceil lengths, attention key bounds and final replicate padding with existing
+  packet ops. The compiler selects F32 quantizer projections through the existing convolution
+  arithmetic flag; legacy v1 lowering is unchanged. CUDA numerical gates cover whole and partial
+  frames with poisoned capacity tails. CPU and AMD numerical parity remain unqualified; AMD
+  also lacks the speech attention and rotary arms. This does not qualify live cloning or timing.
 - **Static speech slot-prefix reuse**: CUDA implements the experimental
   `prompt.slot_prefix_version = 1` capability, keyed by tokens, overlays and frame codes, with
   fault-epoch invalidation. AMD and CPU lack this cache and the batched depth-stage completion;

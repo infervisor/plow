@@ -534,6 +534,12 @@ pub struct StreamTailF32Stage<'a> {
     pub z_col0: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conv1dMath {
+    Tf32x3,
+    F32,
+}
+
 /// [`DevOp::Conv1dF32`] (`transpose == false`) or [`DevOp::ConvTranspose1dF32`]. For the
 /// transpose, `dilation_or_output_padding` is the output padding and the pads are crops.
 #[derive(Clone, Copy)]
@@ -1853,7 +1859,18 @@ impl StageProgram {
         deps: &[u32],
         stage: Conv1dF32Stage<'_>,
     ) -> Result<Emitted, String> {
-        self.conv1d_f32_with(x, transpose, deps, stage, packet::dev::TENSOR_NONE)
+        self.conv1d_f32_math(x, transpose, deps, stage, Conv1dMath::Tf32x3)
+    }
+
+    pub fn conv1d_f32_math(
+        &mut self,
+        x: u32,
+        transpose: bool,
+        deps: &[u32],
+        stage: Conv1dF32Stage<'_>,
+        math: Conv1dMath,
+    ) -> Result<Emitted, String> {
+        self.conv1d_f32_with(x, transpose, deps, stage, packet::dev::TENSOR_NONE, math)
     }
 
     fn conv1d_f32_with(
@@ -1863,7 +1880,13 @@ impl StageProgram {
         deps: &[u32],
         stage: Conv1dF32Stage<'_>,
         row_scale: u32,
+        math: Conv1dMath,
     ) -> Result<Emitted, String> {
+        if math == Conv1dMath::F32
+            && (stage.weight_f16 || stage.split_bf16 || stage.wgmma || stage.weight_split)
+        {
+            return Err("FP32 convolution math requires unsplit FP32 weights".into());
+        }
         // The flag fields are 4 bits wide (pre 4..8, post 8..12): a wider code would alias
         // another kind and spill into the next field.
         let valid_activation = |a: Activation| {
@@ -1963,7 +1986,7 @@ impl StageProgram {
             | (stage.input_activation.code() << 4)
             | (stage.output_activation.code() << 8)
             | (u32::from(stage.weight_f16) << 12)
-            | (1 << 13)
+            | (u32::from(math == Conv1dMath::Tf32x3) << 13)
             | (u32::from(stage.split_bf16) << 14)
             | (u32::from(stage.weight_tap_major) << 15)
             | (u32::from(stage.wgmma && stage.split_bf16) << 17)
@@ -2681,7 +2704,7 @@ impl StageProgram {
             f32_bytes(product(&[stage.batch, out_rows])?)?,
             "convolution row scale",
         )?;
-        self.conv1d_f32_with(x, false, deps, stage, row_scale)
+        self.conv1d_f32_with(x, false, deps, stage, row_scale, Conv1dMath::Tf32x3)
     }
 }
 
@@ -2977,6 +3000,59 @@ fn repeated(n_cu: u32, blocks: u32) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fp32_convolution_math_rejects_split_storage() {
+        for (f16, split, wgmma, packed) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            let (prefix, h) = prefix_with(&[("x", 2 * 16 * 4)]);
+            let mut p = prefix.program();
+            let stage = Conv1dF32Stage {
+                output: TensorRef::Named("y"),
+                weight: TensorRef::Named("w"),
+                bias: None,
+                alpha: None,
+                residual: None,
+                lengths: None,
+                batch: 1,
+                in_rows: 2,
+                in_channels: 16,
+                out_channels: 16,
+                kernel: 1,
+                stride: 1,
+                dilation_or_output_padding: 1,
+                groups: 1,
+                pad_before: 0,
+                pad_after: 0,
+                pad_mode: PadMode::Zero,
+                input_activation: Activation::None,
+                output_activation: Activation::None,
+                slope: 0.,
+                weight_f16: f16,
+                split_bf16: split,
+                weight_tap_major: false,
+                wgmma,
+                weight_split: packed,
+                dual_alpha: false,
+            };
+            let result = p.conv1d_f32_math(h[0], false, &[], stage, Conv1dMath::F32);
+            if f16 || split || wgmma || packed {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+                assert_eq!(p.finish(2).model.progs[0].insts[0].j[1] & (1 << 13), 0);
+                let (prefix, h) = prefix_with(&[("x", 2 * 16 * 4)]);
+                let mut p = prefix.program();
+                p.conv1d_f32(h[0], false, &[], stage).unwrap();
+                assert_ne!(p.finish(2).model.progs[0].insts[0].j[1] & (1 << 13), 0);
+            }
+        }
+    }
 
     #[test]
     fn continuous_dense_requires_exact_bf16_storage() {

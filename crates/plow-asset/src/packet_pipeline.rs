@@ -27,6 +27,22 @@ pub struct PacketPipeline {
     pub strings: BTreeMap<String, String>,
 }
 
+impl PacketPipeline {
+    pub fn codec_sample_input(&self) -> Result<bool, String> {
+        match self.driver.as_str() {
+            "codec.encode.v1" => Ok(false),
+            "codec.encode.v2" => match self.tensors.get("samples") {
+                Some(t) if t.dtype == PipelineDType::U32 && t.shape == [1] => Ok(true),
+                _ => Err("codec.encode.v2 requires samples: u32[1]".into()),
+            },
+            _ => Err(format!(
+                "unsupported codec encoder driver {:?}",
+                self.driver
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineTensor {
@@ -125,6 +141,39 @@ fn identifier(value: &str, limit: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_sample_count_requires_versioned_scalar_u32() {
+        let mut p = PacketPipeline {
+            name: "codec.encode".into(),
+            driver: "codec.encode.v1".into(),
+            programs: BTreeMap::new(),
+            tensors: BTreeMap::new(),
+            parameters: BTreeMap::new(),
+            strings: BTreeMap::new(),
+        };
+        assert_eq!(p.codec_sample_input(), Ok(false));
+        p.driver = "codec.encode.v2".into();
+        assert!(p.codec_sample_input().is_err());
+        for (dtype, shape, valid) in [
+            (PipelineDType::U32, vec![1], true),
+            (PipelineDType::F32, vec![1], false),
+            (PipelineDType::U32, vec![2], false),
+            (PipelineDType::U32, vec![1, 1], false),
+        ] {
+            p.tensors.insert(
+                "samples".into(),
+                PipelineTensor {
+                    name: "in.samples".into(),
+                    dtype,
+                    shape,
+                },
+            );
+            assert_eq!(p.codec_sample_input().is_ok(), valid);
+        }
+        p.driver = "codec.encode.v3".into();
+        assert!(p.codec_sample_input().is_err());
+    }
 
     #[test]
     fn validates_programs_and_tensor_geometry() {
