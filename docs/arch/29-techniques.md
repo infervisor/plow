@@ -1141,6 +1141,11 @@ fastconformer RNNT, fish-s2.
   scalar accumulation; neither matching arithmetic nor performance is qualified there.
   Numerical qualification remains required; no native performance win is implied.
   AMD lacks these speech arms. A speaker packet alone does not bind a live cloning request.
+- **Speaker packet binding**: host validation checks feature/output tensor geometry and complete
+  capacity or exact-row program coverage. The packet-defined frontend produces features; CUDA
+  batches their valid prefix, required reflection and actual row count before execution. The
+  host contract is backend-neutral, but the production loader currently selects CUDA. CPU and
+  AMD numerical parity remain unqualified. This binding does not enable live cloning by itself.
 - **Codec encoder lengths**: `codec.encode.v2` carries actual PCM sample counts through
   convolution ceil lengths, attention key bounds and final replicate padding with existing
   packet ops. The compiler selects F32 quantizer projections through the existing convolution

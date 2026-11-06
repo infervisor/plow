@@ -755,6 +755,15 @@ Concurrent reference-encoder cache misses reuse a completed encoding published w
 wait for the encoder, provided it remains in the recent-clip cache. Failed encodings are not
 cached. A cache hit does not wait for an unrelated encoding.
 
+Speaker sidecars bind through `speaker.encode.v1` capacity programs (`encode.r{R}`) or
+`speaker.encode.v2` / `v3` exact-row programs (`encode.r{R}.n{N}`). Every declared input row
+count must have a program; execution selects the smallest fitting capacity. Required tensor
+roles are `mel: f32[max_rows + 2 * reflect_pad, input_width]`, `length: u32[1]` and
+`embedding: f32[output_width]`, with bounds and widths from the pipeline parameters.
+Only v3 requires `input.reflect_pad`; older drivers reject it. The binding extracts the
+packet-defined frontend, batches valid feature rows and their length, and rejects nonfinite
+embeddings. This binding alone does not enable a live cloning endpoint or qualify performance.
+
 A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
 A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is
 cond + w (cond - uncond); a model trained with `cfg_scale` s of uncond + s (cond - uncond) takes

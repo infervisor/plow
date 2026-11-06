@@ -1,4 +1,4 @@
-//! A codec-encoder packet beside a speech LM: one reference clip in, its codes out.
+//! Packet-bound reference audio encoders for codec codes and speaker embeddings.
 //! `codec.encode.v2` carries actual sample lengths; v1 pads PCM to the selected capacity.
 
 use std::path::Path;
@@ -25,6 +25,144 @@ pub struct RefEncoder {
     pub sample_rate: u32,
     pub frame_samples: usize,
     pub frame_codes: usize,
+}
+
+pub struct SpeakerEncoder {
+    runtime: Mutex<Box<dyn PacketRuntime>>,
+    frontend: crate::asr::frontend::PacketLogMelFrontend,
+    plan: plow_asset::packet_pipeline::SpeakerEncoderPlan,
+    mel: PacketTensor,
+    length: PacketTensor,
+    embedding: PacketTensor,
+    pub sample_rate: u32,
+    pub min_samples: usize,
+    pub max_samples: usize,
+}
+
+impl SpeakerEncoder {
+    pub fn load(path: &Path, device: u8) -> Result<Self, String> {
+        let runtime = load_packet_runtime_on(path, "cuda", device)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .runtime;
+        Self::bind(path, runtime)
+    }
+
+    fn bind(path: &Path, mut runtime: Box<dyn PacketRuntime>) -> Result<Self, String> {
+        let e = |x: crate::RuntimeError| format!("{}: {x}", path.display());
+        let asset = PacketAsset::load(path).map_err(e)?;
+        let descriptor = asset
+            .pipelines()
+            .iter()
+            .find(|p| p.name == "speaker.encode")
+            .ok_or("speaker encoder pipeline is missing")?;
+        let plan = descriptor.speaker_encoder_plan()?;
+        let pipeline = asset.bind(&descriptor.name, runtime.as_ref()).map_err(e)?;
+        if pipeline.parameter("audio.frontend.bins").map_err(e)? != plan.input_width as u64 {
+            return Err("speaker frontend width disagrees with encoder input".into());
+        }
+        let frontend =
+            crate::asr::frontend::PacketLogMelFrontend::bind(&pipeline, runtime.as_ref())
+                .map_err(e)?;
+        let min_samples = usize::try_from(pipeline.parameter("audio.min_samples").map_err(e)?)
+            .map_err(|_| "speaker minimum sample count overflows")?;
+        let max_samples = usize::try_from(pipeline.parameter("audio.max_samples").map_err(e)?)
+            .map_err(|_| "speaker maximum sample count overflows")?;
+        let sample_rate =
+            u32::try_from(frontend.sample_rate()).map_err(|_| "speaker sample rate overflows")?;
+        let mel = pipeline.tensor("mel").map_err(e)?;
+        let length = pipeline.tensor("length").map_err(e)?;
+        let embedding = pipeline.tensor("embedding").map_err(e)?;
+        runtime.prepare_writes(&[mel, length]).map_err(e)?;
+        Ok(Self {
+            runtime: Mutex::new(runtime),
+            frontend,
+            plan,
+            mel,
+            length,
+            embedding,
+            sample_rate,
+            min_samples,
+            max_samples,
+        })
+    }
+
+    pub fn encode(&self, pcm: &[f32]) -> Result<Vec<f32>, String> {
+        let features = self
+            .frontend
+            .extract(pcm)
+            .map_err(|e| format!("speaker frontend: {e}"))?;
+        self.encode_features(&features.values, features.frames, features.bins)
+    }
+
+    fn encode_features(
+        &self,
+        values: &[f32],
+        rows: usize,
+        width: usize,
+    ) -> Result<Vec<f32>, String> {
+        let program = self
+            .plan
+            .program(rows)
+            .ok_or("speaker feature row count is outside packet bounds")?;
+        if width != self.plan.input_width
+            || rows.checked_mul(width) != Some(values.len())
+            || values.iter().any(|v| !v.is_finite())
+        {
+            return Err("invalid speaker features".into());
+        }
+        let padded;
+        let values = if self.plan.reflect_pad == 0 {
+            values
+        } else {
+            padded = reflect_features(values, width, self.plan.reflect_pad);
+            &padded
+        };
+        let count = (rows as u32).to_le_bytes();
+        let mut output = vec![0f32; self.plan.output_width];
+        let mut runtime = self.runtime.lock();
+        let e = |x: crate::RuntimeError| format!("speaker encoder: {x}");
+        runtime
+            .write_tensors(&[
+                PacketWrite {
+                    tensor: self.mel,
+                    offset: 0,
+                    data: PacketData::Host(bytemuck::cast_slice(values)),
+                },
+                PacketWrite {
+                    tensor: self.length,
+                    offset: 0,
+                    data: PacketData::Host(&count),
+                },
+            ])
+            .map_err(e)?;
+        runtime.run(program).map_err(e)?;
+        runtime
+            .read_tensor(self.embedding, bytemuck::cast_slice_mut(&mut output))
+            .map_err(e)?;
+        drop(runtime);
+        if output.iter().any(|v| !v.is_finite()) {
+            return Err("speaker encoder returned nonfinite embedding".into());
+        }
+        Ok(output)
+    }
+}
+
+fn reflect_features(values: &[f32], width: usize, pad: usize) -> Vec<f32> {
+    let rows = values.len() / width;
+    assert_eq!(values.len(), rows * width);
+    assert!(rows > pad);
+    let mut out = Vec::with_capacity((rows + 2 * pad) * width);
+    for i in 0..rows + 2 * pad {
+        let mut row = i as isize - pad as isize;
+        if row < 0 {
+            row = -row;
+        }
+        if row >= rows as isize {
+            row = 2 * rows as isize - 2 - row;
+        }
+        out.extend_from_slice(&values[row as usize * width..(row as usize + 1) * width]);
+    }
+    out
 }
 
 #[cfg(all(test, feature = "cpu"))]
@@ -176,24 +314,6 @@ mod tests {
         driver
     }
 
-    fn reflect_features(values: &[f32], width: usize, pad: usize) -> Vec<f32> {
-        let rows = values.len() / width;
-        assert_eq!(values.len(), rows * width);
-        assert!(rows > pad);
-        let mut out = Vec::with_capacity((rows + 2 * pad) * width);
-        for i in 0..rows + 2 * pad {
-            let mut row = i as isize - pad as isize;
-            if row < 0 {
-                row = -row;
-            }
-            if row >= rows as isize {
-                row = 2 * rows as isize - 2 - row;
-            }
-            out.extend_from_slice(&values[row as usize * width..(row as usize + 1) * width]);
-        }
-        out
-    }
-
     #[test]
     fn reflected_feature_input_preserves_rows_and_boundaries() {
         let values = [0., 1., 2., 3., 4., 5.];
@@ -202,6 +322,95 @@ mod tests {
             [2., 3., 0., 1., 2., 3., 4., 5., 2., 3.]
         );
         assert_eq!(reflect_features(&values, 2, 0), values);
+    }
+
+    #[test]
+    #[ignore = "SPEAKER_PACKET, SPEAKER_REFERENCE_JSON, SPEAKER_RESULT_JSON and optional SPEAKER_BACKEND; saved PCM through production binding, no benchmark"]
+    fn speaker_binding_matches_saved_pcm_reference() {
+        let path = std::path::PathBuf::from(std::env::var("SPEAKER_PACKET").unwrap());
+        let backend = std::env::var("SPEAKER_BACKEND").unwrap_or_else(|_| "cpu".into());
+        let encoder = if backend == "cuda" {
+            SpeakerEncoder::load(&path, 0)
+        } else {
+            SpeakerEncoder::bind(
+                &path,
+                load_packet_runtime_on(&path, &backend, 0).unwrap().runtime,
+            )
+        }
+        .unwrap();
+        let fixture: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("SPEAKER_REFERENCE_JSON").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 4);
+        assert_eq!(encoder.sample_rate, 24000);
+        assert!(encoder.encode(&[]).is_err());
+        assert!(encoder.encode(&vec![0.; encoder.min_samples - 1]).is_err());
+        assert!(encoder.encode(&vec![0.; encoder.max_samples + 1]).is_err());
+        assert!(encoder
+            .encode(&vec![f32::NAN; encoder.min_samples])
+            .is_err());
+        let mut all_pass = true;
+        let mut checks = Vec::new();
+        let mut outputs = Vec::new();
+        for (iteration, case) in cases.iter().chain(cases.iter().rev()).enumerate() {
+            let bytes = std::fs::read(case["path"].as_str().unwrap()).unwrap();
+            let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+            let pcm = tensors.tensor("pcm").unwrap();
+            assert_eq!(pcm.dtype(), safetensors::Dtype::F32);
+            let pcm: Vec<f32> = pcm
+                .data()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            let expected = tensors.tensor("embedding").unwrap();
+            assert_eq!(expected.dtype(), safetensors::Dtype::BF16);
+            let expected: Vec<f32> = expected
+                .data()
+                .chunks_exact(2)
+                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(b.try_into().unwrap())) << 16))
+                .collect();
+            assert_eq!(expected.len(), encoder.plan.output_width);
+            encoder
+                .runtime
+                .lock()
+                .write_tensor(
+                    encoder.mel,
+                    bytemuck::cast_slice(&vec![f32::NAN; encoder.mel.bytes / 4]),
+                )
+                .unwrap();
+            let actual = encoder.encode(&pcm).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            let max_abs = actual
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let norm = |v: &[f32]| v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+            let dot: f64 = actual
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum();
+            let cosine = dot / (norm(&actual) * norm(&expected)).max(1e-30);
+            let finite = actual.iter().all(|v| v.is_finite());
+            let pass = finite && max_abs <= 0.002 && cosine >= 0.9999;
+            all_pass &= pass;
+            let offset = outputs.len();
+            outputs.extend_from_slice(&actual);
+            checks.push(serde_json::json!({"case":case["case"],"iteration":iteration,"samples":pcm.len(),
+                "max_abs":max_abs,"cosine":cosine,"finite":finite,"pass":pass,"output_offset_f32":offset}));
+        }
+        let result = std::path::PathBuf::from(std::env::var("SPEAKER_RESULT_JSON").unwrap());
+        std::fs::write(result.with_extension("f32"), bytemuck::cast_slice(&outputs)).unwrap();
+        std::fs::write(result, serde_json::to_vec_pretty(&serde_json::json!({
+            "scope":"saved PCM through production speaker binding/frontend; no serving or timing qualification",
+            "backend":backend,"max_abs_limit":0.002,"cosine_min":0.9999,"pass":all_pass,"checks":checks})).unwrap()).unwrap();
+        assert!(
+            all_pass,
+            "production speaker binding differs from saved reference"
+        );
     }
 
     #[test]
