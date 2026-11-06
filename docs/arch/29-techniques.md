@@ -1137,6 +1137,11 @@ fastconformer RNNT, fish-s2.
   Other packet backends use the sequential `PacketRuntime::write_tensors` fallback; batching
   their transfers needs the same source-lifetime and completion guarantees. No timing win is
   qualified for this path.
+- **Owned packet buffers**: CUDA snapshots retain an independent allocation, its completed
+  copy, backend and residency owner. Same-context consumers copy device bytes directly; host
+  buffers and other packet backends use host staging. Live speech frame transport still needs
+  bounded snapshot reuse and batched consumer copies; these APIs alone do not enable it or
+  establish a timing win.
 
 ### NVIDIA → AMD candidates
 

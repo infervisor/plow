@@ -14,7 +14,8 @@ use crate::asset::devblob::DevBlob;
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, GraphExec, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
 use crate::exec::packet_runtime::{
-    check_copy, check_transfer, PacketRuntime, PacketTensor, PacketWrite,
+    check_copy, check_region, check_transfer, write_buffer_host, PacketBuffer, PacketRuntime,
+    PacketTensor, PacketWrite,
 };
 use crate::{Result, RuntimeError};
 
@@ -432,6 +433,27 @@ impl CudaPacketRuntime {
         }
         Ok(())
     }
+
+    fn abandon_transfers(
+        &mut self,
+        tensors: impl IntoIterator<Item = PacketTensor>,
+        error: RuntimeError,
+    ) -> RuntimeError {
+        self.input_failed = true;
+        std::mem::forget(self.be.clone());
+        std::mem::forget(self._resident.clone());
+        for tensor in tensors {
+            self.tensors[tensor.handle].quarantine();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.be.quarantine_staging(&error)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            error
+        }
+    }
 }
 
 fn input_size(mut sizes: impl Iterator<Item = usize>) -> Result<usize> {
@@ -462,6 +484,64 @@ fn submit_writes(
 mod write_tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS; run through gpuq"]
+    fn packet_snapshot_survives_producer_reuse_and_runtime_drop() {
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let mut producer = CudaPacketRuntime::load(&assets.join("codec.pkt"), 0).unwrap();
+        let resident = Arc::downgrade(&producer._resident);
+        let input = producer.create_tensor(64).unwrap();
+        let bytes: Vec<u8> = (0..64).map(|i| (i * 37) as u8).collect();
+        producer.write_tensor(input, &bytes).unwrap();
+        let snapshot = producer.snapshot_tensor(input, 7, 41).unwrap();
+        let view = snapshot.slice(3..35).unwrap();
+        producer.write_tensor(input, &[0x55; 64]).unwrap();
+        drop(producer);
+        drop(snapshot);
+        assert!(resident.upgrade().is_some());
+        let mut output = [0u8; 32];
+        view.read(&mut output).unwrap();
+        assert_eq!(&output, &bytes[10..42]);
+        let mut consumer = CudaPacketRuntime::load(&assets.join("codec.pkt"), 0).unwrap();
+        let target = consumer.create_tensor(64).unwrap();
+        consumer.write_tensor(target, &[0xa5; 64]).unwrap();
+        assert!(consumer.input_stage.is_none());
+        consumer.write_tensor_from(target, 5, &view).unwrap();
+        assert!(
+            consumer.input_stage.is_none(),
+            "same-context copy fell back to host staging"
+        );
+        let mut actual = [0u8; 64];
+        consumer.read_tensor(target, &mut actual).unwrap();
+        let mut expected = [0xa5; 64];
+        expected[5..37].copy_from_slice(&bytes[10..42]);
+        assert_eq!(actual, expected);
+        for offset in [63, usize::MAX] {
+            assert!(consumer.write_tensor_from(target, offset, &view).is_err());
+            consumer.read_tensor(target, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert!(consumer.snapshot_tensor(target, 60, 5).is_err());
+        assert!(consumer
+            .write_tensor_from(
+                PacketTensor {
+                    bytes: 63,
+                    ..target
+                },
+                0,
+                &view
+            )
+            .is_err());
+        let host: PacketBuffer = vec![9, 8, 7].into();
+        consumer.write_tensor_from(target, 1, &host).unwrap();
+        assert!(consumer.input_stage.is_some());
+        expected[1..4].copy_from_slice(&[9, 8, 7]);
+        consumer.read_tensor(target, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        drop(view);
+        assert!(resident.upgrade().is_none());
+    }
 
     #[test]
     fn input_writes_drain_after_success_or_any_enqueue_failure() {
@@ -630,17 +710,11 @@ impl PacketRuntime for CudaPacketRuntime {
             || failed = true,
         );
         if failed {
-            self.input_failed = true;
             // Unproven completion must retain buffers and the backend's small-copy kernel.
             std::mem::forget(self.input_stage.take().unwrap());
-            std::mem::forget(self.be.clone());
-            for w in writes {
-                self.tensors[w.tensor.handle].quarantine();
-            }
-            #[cfg(target_os = "linux")]
-            if let Err(error) = &result {
-                return Err(self.be.quarantine_staging(error));
-            }
+            return Err(
+                self.abandon_transfers(writes.iter().map(|w| w.tensor), result.unwrap_err())
+            );
         }
         result
     }
@@ -652,6 +726,89 @@ impl PacketRuntime for CudaPacketRuntime {
             check_transfer(t, t.handle, mem.len as usize, mem.len as usize)?;
         }
         self.reserve_inputs(input_size(tensors.iter().map(|t| t.bytes))?)
+    }
+
+    fn snapshot_tensor(
+        &mut self,
+        tensor: PacketTensor,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<PacketBuffer> {
+        let source = self.mem(tensor)?;
+        check_transfer(
+            tensor,
+            tensor.handle,
+            source.len as usize,
+            source.len as usize,
+        )?;
+        check_region(tensor, offset, bytes)?;
+        if bytes == 0 {
+            return Ok(Vec::new().into());
+        }
+        let address = source.base + offset as u64;
+        let mut snapshot = self.be.alloc(0, bytes as u64)?;
+        let mut failed = false;
+        let result = submit_writes(
+            1,
+            |_| {
+                self.be
+                    .memcpy_dtod_async(snapshot.base, address, bytes as u64, &self.stream)
+            },
+            || self.be.stream_synchronize(&self.stream),
+            || failed = true,
+        );
+        if failed {
+            snapshot.quarantine();
+            return Err(self.abandon_transfers([tensor], result.unwrap_err()));
+        }
+        result?;
+        Ok(PacketBuffer::completed_cuda(
+            snapshot,
+            self.be.clone(),
+            bytes,
+            self._resident.clone(),
+        ))
+    }
+
+    fn write_tensor_from(
+        &mut self,
+        tensor: PacketTensor,
+        offset: usize,
+        source: &PacketBuffer,
+    ) -> Result<()> {
+        let target = self.mem(tensor)?;
+        check_transfer(
+            tensor,
+            tensor.handle,
+            target.len as usize,
+            target.len as usize,
+        )?;
+        check_region(tensor, offset, source.len())?;
+        let Some((_, address)) = source
+            .cuda_source()
+            .filter(|(b, _)| self.be.shares_context(b))
+        else {
+            return write_buffer_host(self, tensor, offset, source);
+        };
+        if source.is_empty() {
+            return Ok(());
+        }
+        let target = target.base + offset as u64;
+        let mut failed = false;
+        let result = submit_writes(
+            1,
+            |_| {
+                self.be
+                    .memcpy_dtod_async(target, address, source.len() as u64, &self.stream)
+            },
+            || self.be.stream_synchronize(&self.stream),
+            || failed = true,
+        );
+        if failed {
+            std::mem::forget(source.clone());
+            return Err(self.abandon_transfers([tensor], result.unwrap_err()));
+        }
+        result
     }
 
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()> {

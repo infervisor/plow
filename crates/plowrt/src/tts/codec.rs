@@ -1812,7 +1812,18 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    struct SerialWrites(Box<dyn crate::exec::packet_runtime::PacketRuntime>);
+    struct SerialWrites(
+        Box<dyn crate::exec::packet_runtime::PacketRuntime>,
+        Option<SnapshotSource>,
+    );
+
+    #[cfg(feature = "cuda")]
+    struct SnapshotSource {
+        runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>,
+        staging: PacketTensor,
+        codes: PacketTensor,
+        copies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
 
     #[cfg(feature = "cuda")]
     impl crate::exec::packet_runtime::PacketRuntime for SerialWrites {
@@ -1821,6 +1832,37 @@ mod tests {
         }
         fn write_tensor(&mut self, t: PacketTensor, bytes: &[u8]) -> crate::Result<()> {
             self.0.write_tensor(t, bytes)
+        }
+        fn write_tensors(&mut self, writes: &[PacketWrite<'_>]) -> crate::Result<()> {
+            for w in writes {
+                w.check()?;
+            }
+            for w in writes {
+                if let Some(source) = self.1.as_mut().filter(|s| s.codes == w.tensor) {
+                    source
+                        .runtime
+                        .write_tensor_at(source.staging, w.offset, w.bytes)?;
+                    let snapshot =
+                        source
+                            .runtime
+                            .snapshot_tensor(source.staging, w.offset, w.bytes.len())?;
+                    assert!(snapshot.cuda_source().is_some());
+                    source.runtime.write_tensor_at(
+                        source.staging,
+                        w.offset,
+                        &vec![0xdd; w.bytes.len()],
+                    )?;
+                    self.0.write_tensor_from(w.tensor, w.offset, &snapshot)?;
+                    source
+                        .copies
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else if w.offset == 0 && w.bytes.len() == w.tensor.bytes {
+                    self.0.write_tensor(w.tensor, w.bytes)?;
+                } else {
+                    self.0.write_tensor_at(w.tensor, w.offset, w.bytes)?;
+                }
+            }
+            Ok(())
         }
         fn write_tensor_at(
             &mut self,
@@ -1866,11 +1908,38 @@ mod tests {
     #[test]
     #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, RUST_MIN_STACK=67108864; run through gpuq"]
     fn codec_bulk_inputs_preserve_pcm_for_decode_and_stream_steps() {
+        check_codec_input_paths(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, RUST_MIN_STACK=67108864; run through gpuq"]
+    fn codec_owned_inputs_preserve_pcm_after_producer_overwrite() {
+        check_codec_input_paths(true);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn check_codec_input_paths(device: bool) {
         let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
         let path = assets.join("codec.pkt");
         let mut control = bind(&path, 0).unwrap();
         let mut treatment = bind(&path, 0).unwrap();
-        control.runtime = Box::new(SerialWrites(control.runtime));
+        control.runtime = Box::new(SerialWrites(control.runtime, None));
+        let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if device {
+            let mut producer = load_packet_runtime_on(&path, "cuda", 0).unwrap().runtime;
+            let staging = producer.create_tensor(treatment.codes.bytes).unwrap();
+            treatment.runtime = Box::new(SerialWrites(
+                treatment.runtime,
+                Some(SnapshotSource {
+                    runtime: producer,
+                    staging,
+                    codes: treatment.codes,
+                    copies: copies.clone(),
+                }),
+            ));
+        }
+        let method = if device { "owned" } else { "bulk" };
         let maximum = control.capacities.iter().map(|c| c.0).max().unwrap();
         let equal = |a: Vec<Decoded>, b: Vec<Decoded>| {
             assert_eq!(a.len(), b.len());
@@ -1902,7 +1971,7 @@ mod tests {
                     control.decode(&jobs).unwrap(),
                     treatment.decode(&jobs).unwrap(),
                 );
-                eprintln!("codec bulk inputs: decode width={width} frames={frames}, PCM exact");
+                eprintln!("codec {method} inputs: decode width={width} frames={frames}, PCM exact");
             }
         }
         let maximum = control.steps.iter().map(|c| c.0).max().unwrap_or(0);
@@ -1920,11 +1989,15 @@ mod tests {
                     })
                     .collect();
                 equal(control.step(&jobs).unwrap(), treatment.step(&jobs).unwrap());
-                eprintln!("codec bulk inputs: stream width={width} position={position} frames={frames}, PCM exact");
+                eprintln!("codec {method} inputs: stream width={width} position={position} frames={frames}, PCM exact");
                 position += frames;
             }
         }
         assert!(treatment.runtime.last_run_us().is_finite());
+        assert_eq!(
+            copies.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            device
+        );
     }
 
     #[test]

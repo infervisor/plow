@@ -13,6 +13,131 @@ pub struct PacketTensor {
     pub bytes: usize,
 }
 
+enum BufferStorage {
+    Host(Vec<u8>),
+    #[cfg(feature = "cuda")]
+    Cuda {
+        memory: crate::device::DeviceMem,
+        backend: std::sync::Arc<crate::device::cuda::CudaBackend>,
+        _resident: std::sync::Arc<()>,
+    },
+}
+
+/// Immutable bytes whose producing work has completed, independent of the source runtime.
+#[derive(Clone)]
+pub struct PacketBuffer {
+    storage: std::sync::Arc<BufferStorage>,
+    offset: usize,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for PacketBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketBuffer")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+impl From<Vec<u8>> for PacketBuffer {
+    fn from(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        Self {
+            storage: std::sync::Arc::new(BufferStorage::Host(bytes)),
+            offset: 0,
+            bytes: len,
+        }
+    }
+}
+
+impl PacketBuffer {
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Result<Self> {
+        if range.start > range.end || range.end > self.bytes {
+            return Err(RuntimeError::Device(
+                "packet buffer slice is outside its bounds".into(),
+            ));
+        }
+        Ok(Self {
+            storage: self.storage.clone(),
+            offset: self.offset + range.start,
+            bytes: range.end - range.start,
+        })
+    }
+
+    pub fn read(&self, output: &mut [u8]) -> Result<()> {
+        if output.len() != self.bytes {
+            return Err(RuntimeError::Device(
+                "packet buffer read size changed".into(),
+            ));
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+        match self.storage.as_ref() {
+            BufferStorage::Host(data) => {
+                output.copy_from_slice(&data[self.offset..self.offset + self.bytes])
+            }
+            #[cfg(feature = "cuda")]
+            BufferStorage::Cuda {
+                memory, backend, ..
+            } => {
+                use crate::device::Backend;
+                backend.download(memory, self.offset as u64, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn completed_cuda(
+        memory: crate::device::DeviceMem,
+        backend: std::sync::Arc<crate::device::cuda::CudaBackend>,
+        bytes: usize,
+        resident: std::sync::Arc<()>,
+    ) -> Self {
+        assert!(memory.len >= bytes as u64);
+        Self {
+            storage: std::sync::Arc::new(BufferStorage::Cuda {
+                memory,
+                backend,
+                _resident: resident,
+            }),
+            offset: 0,
+            bytes,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn cuda_source(&self) -> Option<(&crate::device::cuda::CudaBackend, u64)> {
+        match self.storage.as_ref() {
+            BufferStorage::Cuda {
+                memory, backend, ..
+            } => Some((backend, memory.base + self.offset as u64)),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn check_region(tensor: PacketTensor, offset: usize, bytes: usize) -> Result<()> {
+    if offset
+        .checked_add(bytes)
+        .is_none_or(|end| end > tensor.bytes)
+    {
+        return Err(RuntimeError::Device(
+            "packet tensor transfer is outside its bounds".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct PacketWrite<'a> {
     pub tensor: PacketTensor,
     pub offset: usize,
@@ -21,16 +146,7 @@ pub struct PacketWrite<'a> {
 
 impl PacketWrite<'_> {
     pub(crate) fn check(&self) -> Result<()> {
-        if self
-            .offset
-            .checked_add(self.bytes.len())
-            .is_none_or(|end| end > self.tensor.bytes)
-        {
-            return Err(RuntimeError::Device(
-                "packet tensor write is outside its bounds".into(),
-            ));
-        }
-        Ok(())
+        check_region(self.tensor, self.offset, self.bytes.len())
     }
 }
 
@@ -66,6 +182,25 @@ pub trait PacketRuntime: Send {
         Ok(())
     }
     fn read_tensor(&self, tensor: PacketTensor, bytes: &mut [u8]) -> Result<()>;
+    fn snapshot_tensor(
+        &mut self,
+        tensor: PacketTensor,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<PacketBuffer> {
+        check_region(tensor, offset, bytes)?;
+        let mut data = vec![0; bytes];
+        self.read_tensor_at(tensor, offset, &mut data)?;
+        Ok(data.into())
+    }
+    fn write_tensor_from(
+        &mut self,
+        tensor: PacketTensor,
+        offset: usize,
+        source: &PacketBuffer,
+    ) -> Result<()> {
+        write_buffer_host(self, tensor, offset, source)
+    }
     /// Write `bytes` at byte `offset` of `tensor`; the rest keeps its contents.
     fn write_tensor_at(&mut self, tensor: PacketTensor, offset: usize, bytes: &[u8]) -> Result<()> {
         let mut all = vec![0; tensor.bytes];
@@ -113,6 +248,22 @@ pub trait PacketRuntime: Send {
         Ok(())
     }
     fn last_run_us(&self) -> f64;
+}
+
+pub(crate) fn write_buffer_host<R: PacketRuntime + ?Sized>(
+    runtime: &mut R,
+    tensor: PacketTensor,
+    offset: usize,
+    source: &PacketBuffer,
+) -> Result<()> {
+    check_region(tensor, offset, source.len())?;
+    let mut bytes = vec![0; source.len()];
+    source.read(&mut bytes)?;
+    runtime.write_tensors(&[PacketWrite {
+        tensor,
+        offset,
+        bytes: &bytes,
+    }])
 }
 
 pub struct PacketAsset {
@@ -799,6 +950,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packet_buffer_views_keep_storage_and_validate_before_reading() {
+        let buffer: PacketBuffer = (0..16).collect::<Vec<u8>>().into();
+        let owner = std::sync::Arc::downgrade(&buffer.storage);
+        let view = buffer.slice(2..10).unwrap().slice(3..6).unwrap();
+        assert!(buffer.slice(9..8).is_err());
+        assert!(buffer.slice(0..usize::MAX).is_err());
+        drop(buffer);
+        assert!(owner.upgrade().is_some());
+        let mut bytes = [0; 3];
+        view.read(&mut bytes).unwrap();
+        assert_eq!(bytes, [5, 6, 7]);
+        let mut guard = [0xa5; 2];
+        assert!(view.read(&mut guard).is_err());
+        assert_eq!(guard, [0xa5; 2]);
+        assert!(view.slice(3..3).unwrap().is_empty());
+        drop(view);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
     fn bulk_write_fallback_preserves_order_and_validates_ranges_before_writing() {
         struct Memory([u8; 16], usize);
         impl PacketRuntime for Memory {
@@ -878,6 +1049,23 @@ mod tests {
             assert_eq!(rt.0, expected);
             assert_eq!(rt.1, 3);
         }
+        let snapshot = rt.snapshot_tensor(t, 3, 4).unwrap();
+        rt.write_tensor(t, &[0; 16]).unwrap();
+        let mut expected = [0; 4];
+        snapshot.read(&mut expected).unwrap();
+        assert_eq!(expected, [1, 2, 5, 6]);
+        let mut consumer = Memory([0xa5; 16], 0);
+        consumer
+            .write_tensor_from(t, 8, &snapshot.slice(1..3).unwrap())
+            .unwrap();
+        assert_eq!(&consumer.0[8..10], &[2, 5]);
+        assert_eq!(consumer.0[..8], [0xa5; 8]);
+        assert_eq!(consumer.0[10..], [0xa5; 6]);
+        assert!(consumer
+            .write_tensor_from(t, usize::MAX, &snapshot)
+            .is_err());
+        assert_eq!(consumer.1, 1);
+        assert!(rt.snapshot_tensor(t, 15, 2).is_err());
     }
 
     struct FakeRuntime;
