@@ -32,6 +32,49 @@ pub struct RefEncoder {
 mod tests {
     use super::*;
 
+    fn speaker_driver(asset: &PacketAsset) -> &str {
+        let drivers: Vec<_> = asset
+            .pipelines()
+            .iter()
+            .filter(|p| p.name == "speaker.encode")
+            .collect();
+        assert_eq!(drivers.len(), 1);
+        let driver = drivers[0].driver.as_str();
+        assert!(matches!(
+            driver,
+            "speaker.encode.v1" | "speaker.encode.v2" | "speaker.encode.v3"
+        ));
+        driver
+    }
+
+    fn reflect_features(values: &[f32], width: usize, pad: usize) -> Vec<f32> {
+        let rows = values.len() / width;
+        assert_eq!(values.len(), rows * width);
+        assert!(rows > pad);
+        let mut out = Vec::with_capacity((rows + 2 * pad) * width);
+        for i in 0..rows + 2 * pad {
+            let mut row = i as isize - pad as isize;
+            if row < 0 {
+                row = -row;
+            }
+            if row >= rows as isize {
+                row = 2 * rows as isize - 2 - row;
+            }
+            out.extend_from_slice(&values[row as usize * width..(row as usize + 1) * width]);
+        }
+        out
+    }
+
+    #[test]
+    fn reflected_feature_input_preserves_rows_and_boundaries() {
+        let values = [0., 1., 2., 3., 4., 5.];
+        assert_eq!(
+            reflect_features(&values, 2, 1),
+            [2., 3., 0., 1., 2., 3., 4., 5., 2., 3.]
+        );
+        assert_eq!(reflect_features(&values, 2, 0), values);
+    }
+
     #[test]
     #[ignore = "SPEAKER_PACKET, SPEAKER_REFERENCE_JSON, SPEAKER_FRONTEND_RESULT_JSON and RUST_MIN_STACK=67108864; saved PCM frontend parity, CPU only"]
     fn speaker_frontend_matches_trained_reference() {
@@ -47,7 +90,7 @@ mod tests {
         )
         .unwrap();
         let asset = PacketAsset::load(Path::new(&path)).unwrap();
-        let pipeline = asset.bind_driver("speaker.encode.v1", &runtime).unwrap();
+        let pipeline = asset.bind_driver(speaker_driver(&asset), &runtime).unwrap();
         let frontend =
             crate::asr::frontend::PacketLogMelFrontend::bind(&pipeline, &runtime).unwrap();
         assert_eq!(frontend.sample_rate(), 24_000);
@@ -149,6 +192,11 @@ mod tests {
         let out = std::env::var("SPEAKER_PACKET_OUT").unwrap();
         let (model, section) =
             devgen::speaker_encoder::lower_speaker_encoder(Path::new(&dir), 132, 90).unwrap();
+        let programs = model.progs.len();
+        println!(
+            "speaker object requires ops mask 0x{:x}",
+            devgen::manifest::speech_ops(&model)
+        );
         devgen::write_sidecar_packet(Path::new(&out), &model, &[section]);
         let receipts: plow_asset::certificates::SidecarCheckReceipts = serde_json::from_slice(
             &std::fs::read(plow_asset::certificates::sidecar_checks_file(Path::new(
@@ -162,9 +210,9 @@ mod tests {
                 &std::fs::read(out).unwrap(),
             ))
             .unwrap();
-        assert_eq!(receipts.program_checks.len(), 5);
+        assert_eq!(receipts.program_checks.len(), programs);
         assert!(receipts.program_checks.iter().all(Option::is_some));
-        println!("all five speaker programs have approved Lean logical-effect receipts");
+        println!("all {programs} speaker programs have approved Lean logical-effect receipts");
     }
 
     #[test]
@@ -190,8 +238,15 @@ mod tests {
         };
         let asset = PacketAsset::load(Path::new(&path)).unwrap();
         let pipeline = asset
-            .bind_driver("speaker.encode.v1", runtime.as_ref())
+            .bind_driver(speaker_driver(&asset), runtime.as_ref())
             .unwrap();
+        let input_pad = pipeline
+            .optional_parameter("input.reflect_pad")
+            .unwrap_or(0) as usize;
+        assert_eq!(
+            pipeline.optional_parameter("input.reflect_pad").is_some(),
+            pipeline.driver() == "speaker.encode.v3"
+        );
         let data: serde_json::Value =
             serde_json::from_slice(&std::fs::read(reference).unwrap()).unwrap();
         let mut results = Vec::new();
@@ -210,20 +265,32 @@ mod tests {
             let mel: Vec<f32> = (0..rows * 128)
                 .map(|i| raw_mel[(i % 128) * rows + i / 128])
                 .collect();
+            let padded_mel = reflect_features(&mel, 128, input_pad);
             let mut first_output = None;
             let mut capacities: Vec<_> = pipeline
                 .programs()
                 .filter_map(|(role, program)| {
-                    Some((
-                        role.strip_prefix("encode.r")?.parse::<usize>().ok()?,
-                        program,
-                    ))
+                    let suffix = role.strip_prefix("encode.r")?;
+                    let cap = match suffix.split_once(".n") {
+                        Some((cap, n)) if n.parse::<usize>().ok() == Some(rows) => cap,
+                        Some(_) => return None,
+                        None => suffix,
+                    };
+                    Some((cap.parse::<usize>().ok()?, program))
                 })
                 .filter(|&(cap, _)| cap >= rows)
                 .collect();
             capacities.sort_unstable();
+            assert_eq!(
+                capacities.len(),
+                [128, 256, 512, 1024, 2048]
+                    .into_iter()
+                    .filter(|&cap| cap >= rows)
+                    .count(),
+                "missing speaker row/capacity binding"
+            );
             for &(cap, program) in capacities.iter().take(2) {
-                let poisoned = vec![f32::NAN; cap * 128];
+                let poisoned = vec![f32::NAN; (cap + 2 * input_pad) * 128];
                 runtime
                     .write_tensor_at(
                         pipeline.tensor("mel").unwrap(),
@@ -235,7 +302,7 @@ mod tests {
                     .write_tensor_at(
                         pipeline.tensor("mel").unwrap(),
                         0,
-                        bytemuck::cast_slice(&mel),
+                        bytemuck::cast_slice(&padded_mel),
                     )
                     .unwrap();
                 runtime
@@ -320,7 +387,7 @@ mod tests {
         std::fs::write(
             result_path,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "backend": backend, "scope": "trained speaker numerical parity, no benchmark",
+                "backend": backend, "scope": "trained speaker numerical parity, no benchmark", "input_reflect_pad": input_pad,
                 "max_abs_limit": 0.002, "cosine_min": 0.9999,
                 "pass": all_pass, "results": results,
             }))

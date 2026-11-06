@@ -7,13 +7,40 @@ use std::path::Path;
 
 use crate::fish_codec::Seq;
 use crate::pipeline::{
-    Activation, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, GatherRowsF32Stage,
-    PacketPrefix, PadMode, ReduceRowsF32Stage, ReduceRowsOp, TensorRef, UnaryF32Stage,
+    Activation, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, DenseActivation,
+    DenseF32ProgramStage, DenseWeight, GatherRowsF32Stage, LengthAffineU32Stage, PacketPrefix,
+    PadMode, ReduceRowsF32Stage, ReduceRowsOp, TensorRef, UnaryF32Stage,
 };
 
 pub const PACKET: &str = "speaker_encoder.pkt";
 pub const DRIVER: &str = "speaker.encode.v1";
+pub const PARTITIONED_DRIVER: &str = "speaker.encode.v2";
+pub const PADDED_DRIVER: &str = "speaker.encode.v3";
 const CAPACITIES: &[u32] = &[128, 256, 512, 1024, 2048];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PointwiseReduction {
+    FullF32,
+    ParallelBf16,
+    SerialBf16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PointwisePlan {
+    input_width: u32,
+    output_width: u32,
+    span: u32,
+    reduction: PointwiseReduction,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PointwiseRow {
+    rows: u32,
+    kernels: Vec<PointwisePlan>,
+}
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +61,8 @@ struct Cfg {
     conv_bias_round: String,
     weight_layout: String,
     frontend: serde_json::Value,
+    #[serde(default)]
+    pointwise_arithmetic: Option<Vec<PointwiseRow>>,
 }
 
 impl Cfg {
@@ -48,7 +77,7 @@ impl Cfg {
             "log_floor": 1e-5, "sentence_normalize": false
         });
         if c.model_type != "ecapa_tdnn"
-            || c.version != 1
+            || !matches!(c.version, 1 | 2 | 3)
             || n < 3
             || c.kernel_sizes.len() != n
             || c.dilations.len() != n
@@ -84,7 +113,50 @@ impl Cfg {
             return Err("unsupported speaker encoder configuration".into());
         }
         c.min_rows()?;
+        c.validate_arithmetic()?;
         Ok(c)
+    }
+
+    fn validate_arithmetic(&self) -> Result<(), String> {
+        let bad = || "invalid speaker pointwise arithmetic table".to_string();
+        if self.version == 1 {
+            return if self.pointwise_arithmetic.is_none() {
+                Ok(())
+            } else {
+                Err(bad())
+            };
+        }
+        let rows = self.pointwise_arithmetic.as_ref().ok_or_else(bad)?;
+        let min = self.min_rows()?;
+        let max = *CAPACITIES.last().unwrap();
+        if min > max || rows.len() != (max - min + 1) as usize {
+            return Err(bad());
+        }
+        let expected = std::collections::BTreeSet::from([
+            (self.channels[0], self.channels[0]),
+            (self.width(), self.width()),
+            (self.width() * 3, self.attention_channels),
+            (self.attention_channels, self.width()),
+        ]);
+        for (i, row) in rows.iter().enumerate() {
+            if row.rows != min + i as u32
+                || row.kernels.len() != expected.len()
+                || row
+                    .kernels
+                    .iter()
+                    .map(|p| (p.input_width, p.output_width))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    != expected
+                || row.kernels.iter().any(|p| {
+                    p.span == 0
+                        || p.span > p.input_width
+                        || (p.reduction == PointwiseReduction::FullF32 && p.span != p.input_width)
+                })
+            {
+                return Err(bad());
+            }
+        }
+        Ok(())
     }
 
     fn min_rows(&self) -> Result<u32, String> {
@@ -100,6 +172,22 @@ impl Cfg {
     fn width(&self) -> u32 {
         *self.channels.last().unwrap()
     }
+
+    fn input_pad(&self) -> u32 {
+        if self.version == 3 {
+            (self.kernel_sizes[0] - 1) * self.dilations[0] / 2
+        } else {
+            0
+        }
+    }
+
+    fn driver(&self) -> &'static str {
+        match self.version {
+            1 => DRIVER,
+            2 => PARTITIONED_DRIVER,
+            _ => PADDED_DRIVER,
+        }
+    }
 }
 
 pub fn lower_speaker_encoder(
@@ -114,7 +202,8 @@ pub fn lower_speaker_encoder(
     }
     let mut b = packet::devbuild::Builder::new(n_cu);
     b.set_tensor_dedup(true);
-    let mel = b.tensor("in.spk.mel", u64::from(max) * 128 * 4);
+    let input_rows = max + 2 * cfg.input_pad();
+    let mel = b.tensor("in.spk.mel", u64::from(input_rows) * 128 * 4);
     let length = b.tensor("in.spk.length", 4);
     let output = b.tensor("act.spk.embedding", u64::from(cfg.embedding_dim) * 4);
     let reciprocal = b.tensor("c.spk.reciprocal", u64::from(max + 1) * 4);
@@ -133,13 +222,34 @@ pub fn lower_speaker_encoder(
         programs: Vec::new(),
         input: mel,
         output,
-        input_shape: vec![u64::from(max), 128],
+        input_shape: vec![u64::from(input_rows), 128],
     };
     let mut roles = BTreeMap::new();
-    for &rows in CAPACITIES {
-        let index = prefix.model.progs.len() as u32;
-        prefix = program(prefix, &cfg, rows, length, reciprocal)?;
-        roles.insert(format!("encode.r{rows}"), index);
+    if let Some(table) = &cfg.pointwise_arithmetic {
+        let mut variants = BTreeMap::new();
+        for row in table {
+            let mut plans = row.kernels.clone();
+            plans.sort_unstable();
+            for &capacity in CAPACITIES.iter().filter(|&&cap| cap >= row.rows) {
+                let key = (capacity, plans.clone());
+                let index = match variants.get(&key) {
+                    Some(&index) => index,
+                    None => {
+                        let index = prefix.model.progs.len() as u32;
+                        prefix = program(prefix, &cfg, capacity, length, reciprocal, &plans)?;
+                        variants.insert(key, index);
+                        index
+                    }
+                };
+                roles.insert(format!("encode.r{capacity}.n{}", row.rows), index);
+            }
+        }
+    } else {
+        for &rows in CAPACITIES {
+            let index = prefix.model.progs.len() as u32;
+            prefix = program(prefix, &cfg, rows, length, reciprocal, &[])?;
+            roles.insert(format!("encode.r{rows}"), index);
+        }
     }
     let reader = crate::checkpoint::TensorReader::open(dir)?;
     for (h, tensor) in prefix.model.tensors.iter_mut().enumerate() {
@@ -158,8 +268,14 @@ pub fn lower_speaker_encoder(
             );
         } else if let Some(name) = tensor.name.strip_prefix("w.") {
             let (dtype, bytes) = reader.read(name)?;
+            let split = cfg.version == 3 && name == "blocks.0.conv.weight";
+            let expected = if split {
+                u64::from(cfg.channels[0]) * 128 * u64::from(cfg.kernel_sizes[0]) * 4
+            } else {
+                tensor.bytes
+            };
             if dtype != "F32"
-                || bytes.len() as u64 != tensor.bytes
+                || bytes.len() as u64 != expected
                 || bytes.chunks_exact(4).any(|b| {
                     let value = f32::from_le_bytes(b.try_into().unwrap());
                     !value.is_finite()
@@ -171,20 +287,81 @@ pub fn lower_speaker_encoder(
                     tensor.bytes
                 ));
             }
+            let bytes = if split {
+                crate::pipeline::wgmma_weight_split(
+                    &bytes,
+                    cfg.channels[0],
+                    128 * cfg.kernel_sizes[0],
+                )
+            } else {
+                bytes
+            };
+            if bytes.len() as u64 != tensor.bytes {
+                return Err("speaker split weight size mismatch".into());
+            }
             tensor.init = Some(bytes);
         }
     }
+    pack_pointwise_weights(&mut prefix.model)?;
     let section = section(&prefix, &cfg, roles, length, max)?;
     Ok((prefix.model, section))
 }
 
-struct Encoder {
+fn pack_pointwise_weights(model: &mut packet::devbuild::Model) -> Result<(), String> {
+    for i in 0..model.tensors.len() {
+        let Some(name) = model.tensors[i].name.strip_prefix("part.") else {
+            continue;
+        };
+        let bad = || "invalid packed speaker weight slice".to_string();
+        let (name, width) = name.rsplit_once('.').ok_or_else(bad)?;
+        let (name, lo) = name.rsplit_once('.').ok_or_else(bad)?;
+        let width: usize = width.parse().map_err(|_| bad())?;
+        let lo: usize = lo.parse().map_err(|_| bad())?;
+        let bytes = usize::try_from(model.tensors[i].bytes).map_err(|_| bad())?;
+        let row_bytes = width.checked_mul(2).filter(|&n| n > 0).ok_or_else(bad)?;
+        if !bytes.is_multiple_of(row_bytes) || bytes == 0 {
+            return Err(bad());
+        }
+        let rows = bytes / row_bytes;
+        let source = model
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(bad)?;
+        let source = source.init.as_deref().ok_or_else(bad)?;
+        let source_row_bytes = rows.checked_mul(4).ok_or_else(bad)?;
+        if !source.len().is_multiple_of(source_row_bytes) {
+            return Err(bad());
+        }
+        let stride = source.len() / source_row_bytes;
+        if lo.checked_add(width).is_none_or(|end| end > stride) {
+            return Err(bad());
+        }
+        let mut packed = Vec::with_capacity(bytes);
+        for row in 0..rows {
+            for col in lo..lo + width {
+                let at = (row * stride + col) * 4;
+                if source[at..at + 2] != [0, 0] {
+                    return Err(bad());
+                }
+                packed.extend_from_slice(&source[at + 2..at + 4]);
+            }
+        }
+        model.tensors[i].init = Some(packed);
+    }
+    Ok(())
+}
+
+struct Encoder<'a> {
     seq: Seq,
     rows: u32,
     length: u32,
+    arithmetic: &'a [PointwisePlan],
+    input_pad: u32,
+    padded_length: Option<u32>,
 }
 
-impl Encoder {
+impl Encoder<'_> {
     fn unary(&mut self, x: u32, rows: u32, width: u32, kind: Activation) -> Result<u32, String> {
         self.seq.unary(x, kind, rows, width)
     }
@@ -297,6 +474,84 @@ impl Encoder {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn partitioned_pointwise(
+        &mut self,
+        x: u32,
+        out_name: &str,
+        weight_name: &str,
+        rows: u32,
+        plan: PointwisePlan,
+    ) -> Result<u32, String> {
+        let bytes = u64::from(plan.input_width)
+            .checked_mul(u64::from(plan.output_width))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or("speaker weight size overflows")?;
+        self.seq.p().declare(weight_name, bytes);
+        let mut out = None;
+        for lo in (0..plan.input_width).step_by(plan.span as usize) {
+            let width = plan.span.min(plan.input_width - lo);
+            let input = self.copy(
+                x,
+                "act.spk.partition.input",
+                rows,
+                width,
+                plan.input_width,
+                lo,
+                width,
+                0,
+            )?;
+            let bytes = u64::from(plan.output_width)
+                .checked_mul(u64::from(width))
+                .and_then(|n| n.checked_mul(2))
+                .ok_or("speaker weight slice overflows")?;
+            let packed_weight = self
+                .seq
+                .p()
+                .declare(&format!("part.{weight_name}.{lo}.{width}"), bytes);
+            let dep = self.seq.last;
+            let stage = self.seq.p().dense_f32(
+                input,
+                &[dep],
+                DenseF32ProgramStage {
+                    output: TensorRef::Named(if out.is_none() {
+                        out_name
+                    } else {
+                        "act.spk.partition.output"
+                    }),
+                    weight: TensorRef::Handle(packed_weight),
+                    bias: None,
+                    rows,
+                    input_width: width,
+                    output_width: plan.output_width,
+                    activation: DenseActivation::None,
+                    round_bf16: out.is_none() || plan.reduction == PointwiseReduction::ParallelBf16,
+                    weight_type: DenseWeight::Bf16,
+                    operands_bf16_exact: true,
+                    tf32x3: false,
+                    layer_norm: None,
+                    split_k: false,
+                    post: None,
+                },
+            )?;
+            let part = self.seq.done(stage);
+            out = Some(match out {
+                Some(acc) => self.binary(
+                    acc,
+                    part,
+                    out_name,
+                    rows,
+                    plan.output_width,
+                    BinaryOp::Add,
+                    plan.output_width,
+                    1,
+                    plan.reduction == PointwiseReduction::SerialBf16,
+                )?,
+                None => part,
+            });
+        }
+        Ok(out.unwrap())
+    }
+
     fn conv(
         &mut self,
         x: u32,
@@ -312,42 +567,63 @@ impl Encoder {
         let dep = self.seq.last;
         let weight_name = format!("w.{weight}.weight");
         let bias_name = format!("w.{weight}.bias");
-        let length = (rows != 1).then_some(self.length);
+        let padded = self.padded_length.is_some() && weight == "blocks.0.conv";
+        let length = if padded {
+            self.padded_length
+        } else {
+            (rows != 1).then_some(self.length)
+        };
         let pad = (kernel - 1) * dilation / 2;
-        let e = self.seq.p().conv1d_f32(
-            x,
-            false,
-            &[dep],
-            Conv1dF32Stage {
-                output: TensorRef::Named(out_name),
-                weight: TensorRef::Named(&weight_name),
-                bias: None,
-                alpha: None,
-                residual: None,
-                lengths: length,
-                batch: 1,
-                in_rows: rows,
-                in_channels: cin,
-                out_channels: cout,
-                kernel,
-                stride: 1,
-                dilation_or_output_padding: dilation,
-                groups: 1,
-                pad_before: pad,
-                pad_after: pad,
-                pad_mode: PadMode::Reflect,
-                input_activation: Activation::None,
-                output_activation: Activation::None,
-                slope: 0.0,
-                weight_f16: false,
-                split_bf16: false,
-                weight_tap_major: true,
-                wgmma: false,
-                weight_split: false,
-                dual_alpha: false,
-            },
-        )?;
-        let out = self.seq.done(e);
+        let plan = (!padded && rows != 1 && kernel == 1)
+            .then(|| {
+                self.arithmetic
+                    .iter()
+                    .find(|p| p.input_width == cin && p.output_width == cout)
+            })
+            .flatten()
+            .copied();
+        let out = if let Some(plan) = plan.filter(|p| p.reduction != PointwiseReduction::FullF32) {
+            self.partitioned_pointwise(x, out_name, &weight_name, rows, plan)?
+        } else {
+            let e = self.seq.p().conv1d_f32(
+                x,
+                false,
+                &[dep],
+                Conv1dF32Stage {
+                    output: TensorRef::Named(out_name),
+                    weight: TensorRef::Named(&weight_name),
+                    bias: None,
+                    alpha: None,
+                    residual: None,
+                    lengths: length,
+                    batch: 1,
+                    in_rows: rows + if padded { 2 * self.input_pad } else { 0 },
+                    in_channels: cin,
+                    out_channels: cout,
+                    kernel,
+                    stride: 1,
+                    dilation_or_output_padding: dilation,
+                    groups: 1,
+                    pad_before: if padded { 0 } else { pad },
+                    pad_after: if padded { 0 } else { pad },
+                    pad_mode: if padded {
+                        PadMode::Zero
+                    } else {
+                        PadMode::Reflect
+                    },
+                    input_activation: Activation::None,
+                    output_activation: Activation::None,
+                    slope: 0.0,
+                    weight_f16: false,
+                    split_bf16: padded,
+                    weight_tap_major: true,
+                    wgmma: padded,
+                    weight_split: padded,
+                    dual_alpha: false,
+                },
+            )?;
+            self.seq.done(e)
+        };
         self.round(out, rows, cout)?;
         let bias = self.seq.p().declare(&bias_name, u64::from(cout) * 4);
         self.binary(out, bias, out_name, rows, cout, BinaryOp::Add, 0, 1, true)?;
@@ -441,16 +717,35 @@ fn program(
     rows: u32,
     length: u32,
     reciprocal: u32,
+    arithmetic: &[PointwisePlan],
 ) -> Result<PacketPrefix, String> {
     let input = prefix.input;
     let mut p = prefix.program();
+    let padded_length = if cfg.version == 3 {
+        Some(p.length_affine_u32(
+            length,
+            &[],
+            LengthAffineU32Stage {
+                output: TensorRef::Named("act.spk.padded_length"),
+                min_with: None,
+                items: 1,
+                mul: 1,
+                add: (2 * cfg.input_pad()) as i32,
+                div: 1,
+                lo: 0,
+                hi: rows + 2 * cfg.input_pad(),
+            },
+        )?)
+    } else {
+        None
+    };
     let e = p.unary_f32(
         input,
-        &[],
+        &padded_length.map_or_else(Vec::new, |p| vec![p.done]),
         UnaryF32Stage {
             output: TensorRef::Named("act.spk.input"),
             param: None,
-            rows,
+            rows: rows + 2 * cfg.input_pad(),
             width: 128,
             stride: 0,
             col0: 0,
@@ -467,6 +762,9 @@ fn program(
         },
         rows,
         length,
+        arithmetic,
+        input_pad: cfg.input_pad(),
+        padded_length: padded_length.map(|p| p.output),
     };
     let c = cfg.channels[0];
     let mut h = enc.conv(
@@ -719,12 +1017,16 @@ fn section(
         version: VERSION,
         pipelines: vec![PacketPipeline {
             name: "speaker.encode".into(),
-            driver: DRIVER.into(),
+            driver: cfg.driver().into(),
             programs: roles,
             tensors: BTreeMap::from([
                 (
                     "mel".into(),
-                    tensor(prefix.input, PipelineDType::F32, vec![u64::from(max), 128]),
+                    tensor(
+                        prefix.input,
+                        PipelineDType::F32,
+                        vec![u64::from(max + 2 * cfg.input_pad()), 128],
+                    ),
                 ),
                 ("length".into(), tensor(length, PipelineDType::U32, vec![1])),
                 (
@@ -744,44 +1046,50 @@ fn section(
                     named("w.frontend.window", vec![1024]),
                 ),
             ]),
-            parameters: BTreeMap::from([
-                ("input.min_rows".into(), u64::from(cfg.min_rows()?)),
-                ("input.max_rows".into(), u64::from(max)),
-                ("input.width".into(), 128),
-                ("output.width".into(), u64::from(cfg.embedding_dim)),
-                ("audio.frontend.kind".into(), 2),
-                ("audio.sample_rate".into(), 24_000),
-                ("audio.frontend.fft".into(), 1024),
-                ("audio.frontend.window".into(), 1024),
-                ("audio.frontend.hop".into(), 256),
-                ("audio.frontend.bins".into(), 128),
-                ("audio.frontend.preemphasis_f32".into(), 0),
-                ("audio.frontend.center_window".into(), 0),
-                ("audio.frontend.periodic_hann".into(), 1),
-                ("audio.frontend.normalize_per_feature".into(), 0),
-                ("audio.frontend.mask_invalid_frames".into(), 0),
-                (
-                    "audio.frontend.log_guard_f32".into(),
-                    u64::from(1e-5f32.to_bits()),
-                ),
-                ("audio.frontend.pad_reflect".into(), 1),
-                ("audio.frontend.drop_last_frame".into(), 0),
-                ("audio.frontend.log10".into(), 0),
-                ("audio.frontend.log_floor".into(), 1),
-                ("audio.frontend.dynamic_range_f32".into(), 0),
-                ("audio.frontend.scale_f32".into(), u64::from(1f32.to_bits())),
-                ("audio.frontend.shift_f32".into(), 0),
-                ("audio.frontend.pad_samples".into(), 384),
-                (
-                    "audio.frontend.magnitude_guard_f32".into(),
-                    u64::from(1e-9f32.to_bits()),
-                ),
-                (
-                    "audio.min_samples".into(),
-                    (u64::from(cfg.min_rows()?) * 256).max(385),
-                ),
-                ("audio.max_samples".into(), (u64::from(max) + 1) * 256 - 1),
-            ]),
+            parameters: {
+                let mut parameters = BTreeMap::from([
+                    ("input.min_rows".into(), u64::from(cfg.min_rows()?)),
+                    ("input.max_rows".into(), u64::from(max)),
+                    ("input.width".into(), 128),
+                    ("output.width".into(), u64::from(cfg.embedding_dim)),
+                    ("audio.frontend.kind".into(), 2),
+                    ("audio.sample_rate".into(), 24_000),
+                    ("audio.frontend.fft".into(), 1024),
+                    ("audio.frontend.window".into(), 1024),
+                    ("audio.frontend.hop".into(), 256),
+                    ("audio.frontend.bins".into(), 128),
+                    ("audio.frontend.preemphasis_f32".into(), 0),
+                    ("audio.frontend.center_window".into(), 0),
+                    ("audio.frontend.periodic_hann".into(), 1),
+                    ("audio.frontend.normalize_per_feature".into(), 0),
+                    ("audio.frontend.mask_invalid_frames".into(), 0),
+                    (
+                        "audio.frontend.log_guard_f32".into(),
+                        u64::from(1e-5f32.to_bits()),
+                    ),
+                    ("audio.frontend.pad_reflect".into(), 1),
+                    ("audio.frontend.drop_last_frame".into(), 0),
+                    ("audio.frontend.log10".into(), 0),
+                    ("audio.frontend.log_floor".into(), 1),
+                    ("audio.frontend.dynamic_range_f32".into(), 0),
+                    ("audio.frontend.scale_f32".into(), u64::from(1f32.to_bits())),
+                    ("audio.frontend.shift_f32".into(), 0),
+                    ("audio.frontend.pad_samples".into(), 384),
+                    (
+                        "audio.frontend.magnitude_guard_f32".into(),
+                        u64::from(1e-9f32.to_bits()),
+                    ),
+                    (
+                        "audio.min_samples".into(),
+                        (u64::from(cfg.min_rows()?) * 256).max(385),
+                    ),
+                    ("audio.max_samples".into(), (u64::from(max) + 1) * 256 - 1),
+                ]);
+                if cfg.version == 3 {
+                    parameters.insert("input.reflect_pad".into(), u64::from(cfg.input_pad()));
+                }
+                parameters
+            },
             strings: BTreeMap::from([("audio.frontend".into(), cfg.frontend.to_string())]),
         }],
     };
@@ -846,9 +1154,45 @@ mod tests {
     }
 
     #[test]
-    fn emitted_encoder_keeps_lengths_rounding_and_effects() {
-        use packet::dev::DevOp;
-        let cfg = Cfg::parse(&serde_json::to_vec(&config()).unwrap()).unwrap();
+    fn partition_table_requires_complete_rows_and_geometry() {
+        let mut v = config();
+        v["version"] = 2.into();
+        let kernels: Vec<_> = [(8,8), (16,16), (48,4), (4,16)].into_iter().map(|(input,output)| {
+            serde_json::json!({"input_width":input,"output_width":output,"span":input,"reduction":"full_f32"})
+        }).collect();
+        v["pointwise_arithmetic"] = (4..=2048)
+            .map(|rows| serde_json::json!({"rows":rows,"kernels":kernels}))
+            .collect::<Vec<_>>()
+            .into();
+        let parse = |v: &serde_json::Value| Cfg::parse(&serde_json::to_vec(v).unwrap());
+        assert!(parse(&v).is_ok());
+        let mut bad = v.clone();
+        bad["version"] = 1.into();
+        assert!(parse(&bad).is_err());
+        let mut bad = v.clone();
+        bad["pointwise_arithmetic"].as_array_mut().unwrap().pop();
+        assert!(parse(&bad).is_err());
+        for (key, value) in [
+            ("span", serde_json::json!(0)),
+            ("span", serde_json::json!(9)),
+            ("span", serde_json::json!(4)),
+            ("input_width", serde_json::json!(16)),
+            ("reduction", serde_json::json!("unknown")),
+        ] {
+            let mut bad = v.clone();
+            bad["pointwise_arithmetic"][0]["kernels"][0][key] = value;
+            assert!(parse(&bad).is_err(), "{key}");
+        }
+        let mut bad = v.clone();
+        bad["pointwise_arithmetic"][0]["rows"] = 5.into();
+        assert!(parse(&bad).is_err());
+        let mut bad = v;
+        bad["pointwise_arithmetic"][0]["kernels"][1] =
+            bad["pointwise_arithmetic"][0]["kernels"][0].clone();
+        assert!(parse(&bad).is_err());
+    }
+
+    fn prefix() -> (PacketPrefix, u32, u32) {
         let mut b = packet::devbuild::Builder::new(1);
         b.set_tensor_dedup(true);
         let input = b.tensor("in.spk.mel", 128 * 128 * 4);
@@ -856,22 +1200,162 @@ mod tests {
         let reciprocal = b.tensor("c.spk.reciprocal", 2049 * 4);
         b.tensor("w.frontend.mel", 128 * 513 * 4);
         b.tensor("w.frontend.window", 1024 * 4);
-        let prefix = PacketPrefix {
-            model: packet::devbuild::Model {
-                n_cu: 1,
-                target: 90,
-                tensors: b.tensors(),
-                progs: Vec::new(),
-                kv_row_insts: Vec::new(),
-                prog_t: Vec::new(),
-                gen: Vec::new(),
+        (
+            PacketPrefix {
+                model: packet::devbuild::Model {
+                    n_cu: 1,
+                    target: 90,
+                    tensors: b.tensors(),
+                    progs: Vec::new(),
+                    kv_row_insts: Vec::new(),
+                    prog_t: Vec::new(),
+                    gen: Vec::new(),
+                },
+                programs: Vec::new(),
+                input,
+                output: input,
+                input_shape: vec![128, 128],
             },
-            programs: Vec::new(),
-            input,
-            output: input,
-            input_shape: vec![128, 128],
-        };
-        let prefix = program(prefix, &cfg, 128, length, reciprocal).unwrap();
+            length,
+            reciprocal,
+        )
+    }
+
+    #[test]
+    fn padded_input_uses_actual_length_and_existing_weight_split() {
+        use packet::dev::DevOp;
+        let mut cfg = Cfg::parse(&serde_json::to_vec(&config()).unwrap()).unwrap();
+        cfg.version = 3;
+        let (mut p, length, reciprocal) = prefix();
+        p.model.tensors[p.input as usize].bytes = 132 * 128 * 4;
+        p.input_shape = vec![132, 128];
+        let p = program(p, &cfg, 128, length, reciprocal, &[]).unwrap();
+        plow_asset::program::with_model(&p.model, |packet| {
+            plow_asset::logical_effects::obligation(packet, 0).unwrap();
+        });
+        let insts = &p.model.progs[0].insts;
+        assert_eq!(insts[0].op, DevOp::LengthAffineU32 as u16);
+        assert_eq!(insts[0].i[2], 4);
+        let first = insts
+            .iter()
+            .find(|i| i.op == DevOp::Conv1dF32 as u16)
+            .unwrap();
+        assert_eq!(first.i[1], 132);
+        assert_eq!(first.j[0], 0);
+        assert_eq!(first.j[1] & 3, 0);
+        assert_eq!(
+            first.j[1] & ((1 << 14) | (1 << 17) | (1 << 18)),
+            (1 << 14) | (1 << 17) | (1 << 18)
+        );
+        assert_eq!(first.t[6], insts[0].t[0]);
+        let metadata = section(
+            &p,
+            &cfg,
+            BTreeMap::from([("encode.r128.n5".into(), 0)]),
+            length,
+            128,
+        )
+        .unwrap();
+        let metadata: plow_asset::packet_pipeline::PacketPipelines =
+            serde_json::from_slice(&metadata.data).unwrap();
+        assert_eq!(metadata.pipelines[0].driver, PADDED_DRIVER);
+        assert_eq!(metadata.pipelines[0].parameters["input.reflect_pad"], 2);
+        assert_eq!(metadata.pipelines[0].tensors["mel"].shape, [132, 128]);
+    }
+
+    #[test]
+    fn pointwise_weight_slices_preserve_bf16_values_and_bounds() {
+        let (mut p, _, _) = prefix();
+        let mut b = packet::devbuild::Builder::new(1);
+        b.set_tensor_dedup(true);
+        b.adopt_tensors(p.model.tensors);
+        let source = b.tensor("w.slice.weight", 2 * 5 * 4) as usize;
+        let packed = b.tensor("part.w.slice.weight.1.3", 2 * 3 * 2) as usize;
+        p.model.tensors = b.tensors();
+        p.model.tensors[source].init =
+            Some((0..10).flat_map(|i| (i as f32).to_le_bytes()).collect());
+        pack_pointwise_weights(&mut p.model).unwrap();
+        let actual: Vec<_> = p.model.tensors[packed]
+            .init
+            .as_ref()
+            .unwrap()
+            .chunks_exact(2)
+            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(b.try_into().unwrap())) << 16))
+            .collect();
+        assert_eq!(actual, [1., 2., 3., 6., 7., 8.]);
+        for name in [
+            "part.w.slice.weight.4.3",
+            "part.w.slice.weight.0.0",
+            "part.w.missing.weight.1.3",
+        ] {
+            p.model.tensors[packed].name = name.into();
+            assert!(pack_pointwise_weights(&mut p.model).is_err());
+        }
+        p.model.tensors[packed].name = "part.w.slice.weight.1.3".into();
+        p.model.tensors[source].init = None;
+        assert!(pack_pointwise_weights(&mut p.model).is_err());
+    }
+
+    #[test]
+    fn partitioned_pointwise_preserves_partial_and_accumulator_rounding() {
+        use packet::dev::DevOp;
+        let cfg = Cfg::parse(&serde_json::to_vec(&config()).unwrap()).unwrap();
+        for reduction in [
+            PointwiseReduction::ParallelBf16,
+            PointwiseReduction::SerialBf16,
+        ] {
+            let (p, length, reciprocal) = prefix();
+            let p = program(
+                p,
+                &cfg,
+                128,
+                length,
+                reciprocal,
+                &[PointwisePlan {
+                    input_width: 8,
+                    output_width: 8,
+                    span: 3,
+                    reduction,
+                }],
+            )
+            .unwrap();
+            plow_asset::program::with_model(&p.model, |packet| {
+                plow_asset::logical_effects::obligation(packet, 0).unwrap();
+            });
+            let dense: Vec<_> = p.model.progs[0]
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::DenseGemmF32 as u16)
+                .collect();
+            assert_eq!(dense.len(), 12);
+            for parts in dense.chunks_exact(3) {
+                assert_eq!(parts.iter().map(|i| i.i[2]).collect::<Vec<_>>(), [3, 3, 2]);
+                assert_eq!(
+                    parts.iter().map(|i| i.i[7] & 1).collect::<Vec<_>>(),
+                    if reduction == PointwiseReduction::ParallelBf16 {
+                        vec![1, 1, 1]
+                    } else {
+                        vec![1, 0, 0]
+                    }
+                );
+                assert!(parts.iter().all(|i| i.i[7] & 12 == 12
+                    && i.t[3] == packet::dev::TENSOR_NONE
+                    && i.t[4] == packet::dev::TENSOR_NONE));
+            }
+            assert!(!p
+                .model
+                .tensors
+                .iter()
+                .any(|t| t.name == "act.spk.partition.weight"));
+        }
+    }
+
+    #[test]
+    fn emitted_encoder_keeps_lengths_rounding_and_effects() {
+        use packet::dev::DevOp;
+        let cfg = Cfg::parse(&serde_json::to_vec(&config()).unwrap()).unwrap();
+        let (prefix, length, reciprocal) = prefix();
+        let prefix = program(prefix, &cfg, 128, length, reciprocal, &[]).unwrap();
         plow_asset::program::with_model(&prefix.model, |packet| {
             plow_asset::logical_effects::obligation(packet, 0).unwrap();
         });

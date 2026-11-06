@@ -659,6 +659,32 @@ Emitting this packet does not enable voice cloning in the speech API: conditioni
 request binding and codec priming remain separate requirements.
 The speaker and PCM-frontend numerical gates are not yet met.
 
+Prepared checkpoint version 2 requires a complete `pointwise_arithmetic` table for every
+accepted actual row count. Each row lists the pointwise geometries (`input_width`,
+`output_width`), their K `span`, and `reduction`: `full_f32`, `parallel_bf16` or `serial_bf16`.
+Missing rows, duplicate/missing geometries, zero/oversized spans and inconsistent full-F32
+spans are rejected. Parallel BF16 rounds each partial before its F32 sum and final rounding;
+serial BF16 rounds the accumulator after each partial addition. Bias remains separate.
+
+The compiler packs immutable BF16 weight slices and lowers activation partitions to existing
+copy, dense, binary and unary operations. It reuses
+one program per distinct arithmetic plan and capacity, binding actual rows through roles
+`encode.r{capacity}.n{rows}` under driver `speaker.encode.v2`. Choose the smallest capacity
+that holds the input and its exact row role; do not fall back to a different row's arithmetic.
+Old v1 consumers reject this driver. Version 1 retains its original programs and bindings.
+This changes metadata and program composition, without adding a device opcode. These
+arithmetic candidates still require native numerical and serving qualification.
+
+Prepared checkpoint version 3 uses the same arithmetic table and exact-row roles under
+`speaker.encode.v3`. Its `input.reflect_pad` parameter requires the caller to reflect that many
+feature rows on each side of the actual input before upload. The mel tensor holds
+`input.max_rows + 2 * input.reflect_pad` rows; `length` and capacity selection still count only
+the original rows. Padding follows the actual clip boundary, never the capacity boundary.
+The compiler derives the padded length with the existing length-affine operation and lowers
+the first convolution with zero padding and the existing split-weight convolution flags.
+Older drivers retain their original unpadded input contract. This candidate is not bound to
+live cloning requests and still requires numerical qualification.
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt

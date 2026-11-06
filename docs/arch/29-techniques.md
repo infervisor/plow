@@ -1129,6 +1129,11 @@ fastconformer RNNT, fish-s2.
   `TRIM_SILENCE_F32`; missing `CHUNK_ATTENTION_F32`, `RMSNORM_F32`, `ROPE_AXIAL_F32`.
 - **ECAPA speaker packets**: lowering uses existing convolution, unary, binary, copy, gather
   and reduction ops on CUDA and the scalar CPU tier, including explicit BF16 rounding.
+  Versioned arithmetic tables can additionally lower pointwise BF16 partials and serial or
+  parallel accumulation through existing dense/copy/add/round ops, selected by actual rows.
+  Explicit reflected feature rows and a derived padded length can reuse the existing
+  zero-padding convolution route without changing device instructions.
+  Numerical qualification remains required; no native performance win is implied.
   AMD lacks these speech arms. A speaker packet alone does not bind a live cloning request.
 - **Static speech slot-prefix reuse**: CUDA implements the experimental
   `prompt.slot_prefix_version = 1` capability, keyed by tokens, overlays and frame codes, with
