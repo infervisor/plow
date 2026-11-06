@@ -1826,6 +1826,81 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
+    struct SharedRuntime(
+        std::sync::Arc<Mutex<Box<dyn crate::exec::packet_runtime::PacketRuntime>>>,
+    );
+
+    #[cfg(feature = "cuda")]
+    impl crate::exec::packet_runtime::PacketRuntime for SharedRuntime {
+        fn tensor(&self, name: &str) -> Option<PacketTensor> {
+            self.0.lock().tensor(name)
+        }
+        fn write_tensor(&mut self, t: PacketTensor, bytes: &[u8]) -> crate::Result<()> {
+            self.0.lock().write_tensor(t, bytes)
+        }
+        fn write_tensors(&mut self, writes: &[PacketWrite<'_>]) -> crate::Result<()> {
+            self.0.lock().write_tensors(writes)
+        }
+        fn write_tensor_at(
+            &mut self,
+            t: PacketTensor,
+            at: usize,
+            bytes: &[u8],
+        ) -> crate::Result<()> {
+            self.0.lock().write_tensor_at(t, at, bytes)
+        }
+        fn read_tensor(&self, t: PacketTensor, bytes: &mut [u8]) -> crate::Result<()> {
+            self.0.lock().read_tensor(t, bytes)
+        }
+        fn read_tensor_at(
+            &self,
+            t: PacketTensor,
+            at: usize,
+            bytes: &mut [u8],
+        ) -> crate::Result<()> {
+            self.0.lock().read_tensor_at(t, at, bytes)
+        }
+        fn snapshot_tensor(
+            &mut self,
+            t: PacketTensor,
+            at: usize,
+            bytes: usize,
+        ) -> crate::Result<crate::exec::packet_runtime::PacketBuffer> {
+            self.0.lock().snapshot_tensor(t, at, bytes)
+        }
+        fn write_tensor_from(
+            &mut self,
+            t: PacketTensor,
+            at: usize,
+            source: &crate::exec::packet_runtime::PacketBuffer,
+        ) -> crate::Result<()> {
+            self.0.lock().write_tensor_from(t, at, source)
+        }
+        fn copy_tensor(
+            &mut self,
+            s: PacketTensor,
+            so: usize,
+            t: PacketTensor,
+            to: usize,
+            bytes: usize,
+        ) -> crate::Result<()> {
+            self.0.lock().copy_tensor(s, so, t, to, bytes)
+        }
+        fn create_tensor(&mut self, bytes: usize) -> crate::Result<PacketTensor> {
+            self.0.lock().create_tensor(bytes)
+        }
+        fn run(&mut self, p: usize) -> crate::Result<()> {
+            self.0.lock().run(p)
+        }
+        fn run_sequence(&mut self, p: &[usize]) -> crate::Result<()> {
+            self.0.lock().run_sequence(p)
+        }
+        fn last_run_us(&self) -> f64 {
+            self.0.lock().last_run_us()
+        }
+    }
+
+    #[cfg(feature = "cuda")]
     impl crate::exec::packet_runtime::PacketRuntime for SerialWrites {
         fn tensor(&self, name: &str) -> Option<PacketTensor> {
             self.0.tensor(name)
@@ -1924,21 +1999,25 @@ mod tests {
         let path = assets.join("codec.pkt");
         let mut control = bind(&path, 0).unwrap();
         let mut treatment = bind(&path, 0).unwrap();
-        control.runtime = Box::new(SerialWrites(control.runtime, None));
         let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         if device {
-            let mut producer = load_packet_runtime_on(&path, "cuda", 0).unwrap().runtime;
-            let staging = producer.create_tensor(treatment.codes.bytes).unwrap();
+            let producer = std::sync::Arc::new(Mutex::new(control.runtime));
+            let staging = producer
+                .lock()
+                .create_tensor(treatment.codes.bytes)
+                .unwrap();
+            control.runtime = Box::new(SharedRuntime(producer.clone()));
             treatment.runtime = Box::new(SerialWrites(
                 treatment.runtime,
                 Some(SnapshotSource {
-                    runtime: producer,
+                    runtime: Box::new(SharedRuntime(producer)),
                     staging,
                     codes: treatment.codes,
                     copies: copies.clone(),
                 }),
             ));
         }
+        control.runtime = Box::new(SerialWrites(control.runtime, None));
         let method = if device { "owned" } else { "bulk" };
         let maximum = control.capacities.iter().map(|c| c.0).max().unwrap();
         let equal = |a: Vec<Decoded>, b: Vec<Decoded>| {

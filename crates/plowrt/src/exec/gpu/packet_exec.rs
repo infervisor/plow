@@ -503,44 +503,48 @@ mod write_tests {
         let mut output = [0u8; 32];
         view.read(&mut output).unwrap();
         assert_eq!(&output, &bytes[10..42]);
-        let mut consumer = CudaPacketRuntime::load(&assets.join("codec.pkt"), 0).unwrap();
-        let target = consumer.create_tensor(64).unwrap();
-        consumer.write_tensor(target, &[0xa5; 64]).unwrap();
-        assert!(consumer.input_stage.is_none());
-        consumer.write_tensor_from(target, 5, &view).unwrap();
-        assert!(
-            consumer.input_stage.is_none(),
-            "same-context copy fell back to host staging"
-        );
-        let mut actual = [0u8; 64];
-        consumer.read_tensor(target, &mut actual).unwrap();
-        let mut expected = [0xa5; 64];
-        expected[5..37].copy_from_slice(&bytes[10..42]);
-        assert_eq!(actual, expected);
-        for offset in [63, usize::MAX] {
-            assert!(consumer.write_tensor_from(target, offset, &view).is_err());
+        std::thread::spawn(move || {
+            let mut consumer = CudaPacketRuntime::load(&assets.join("codec.pkt"), 0).unwrap();
+            let target = consumer.create_tensor(64).unwrap();
+            consumer.write_tensor(target, &[0xa5; 64]).unwrap();
+            assert!(consumer.input_stage.is_none());
+            consumer.write_tensor_from(target, 5, &view).unwrap();
+            assert!(
+                consumer.input_stage.is_none(),
+                "same-context copy fell back to host staging"
+            );
+            let mut actual = [0u8; 64];
+            consumer.read_tensor(target, &mut actual).unwrap();
+            let mut expected = [0xa5; 64];
+            expected[5..37].copy_from_slice(&bytes[10..42]);
+            assert_eq!(actual, expected);
+            for offset in [63, usize::MAX] {
+                assert!(consumer.write_tensor_from(target, offset, &view).is_err());
+                consumer.read_tensor(target, &mut actual).unwrap();
+                assert_eq!(actual, expected);
+            }
+            assert!(consumer.snapshot_tensor(target, 60, 5).is_err());
+            assert!(consumer
+                .write_tensor_from(
+                    PacketTensor {
+                        bytes: 63,
+                        ..target
+                    },
+                    0,
+                    &view
+                )
+                .is_err());
+            let host: PacketBuffer = vec![9, 8, 7].into();
+            consumer.write_tensor_from(target, 1, &host).unwrap();
+            assert!(consumer.input_stage.is_some());
+            expected[1..4].copy_from_slice(&[9, 8, 7]);
             consumer.read_tensor(target, &mut actual).unwrap();
             assert_eq!(actual, expected);
-        }
-        assert!(consumer.snapshot_tensor(target, 60, 5).is_err());
-        assert!(consumer
-            .write_tensor_from(
-                PacketTensor {
-                    bytes: 63,
-                    ..target
-                },
-                0,
-                &view
-            )
-            .is_err());
-        let host: PacketBuffer = vec![9, 8, 7].into();
-        consumer.write_tensor_from(target, 1, &host).unwrap();
-        assert!(consumer.input_stage.is_some());
-        expected[1..4].copy_from_slice(&[9, 8, 7]);
-        consumer.read_tensor(target, &mut actual).unwrap();
-        assert_eq!(actual, expected);
-        drop(view);
-        assert!(resident.upgrade().is_none());
+            drop(view);
+            assert!(resident.upgrade().is_none());
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
