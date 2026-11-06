@@ -1131,8 +1131,9 @@ fastconformer RNNT, fish-s2.
   `prompt.slot_prefix_version = 1` capability, keyed by tokens, overlays and frame codes, with
   fault-epoch invalidation. AMD and CPU lack this cache and the batched depth-stage completion;
   they need the same accepted-frontier and input-identity checks before honoring the capability.
-- **Packet input writes**: CUDA stages a batch of ordered tensor writes in reusable pinned
-  memory and drains once before returning. Failed completion quarantines the affected buffers.
+- **Packet input writes**: CUDA batches host bytes, completed device buffers and zero fills
+  on one stream and drains once before returning. Only host inputs need reusable pinned
+  staging. Failed completion retains every source owner and quarantines affected destinations.
   Codec loading reserves staging from its declared input sizes before serving begins.
   Other packet backends use the sequential `PacketRuntime::write_tensors` fallback; batching
   their transfers needs the same source-lifetime and completion guarantees. No timing win is
@@ -1140,7 +1141,7 @@ fastconformer RNNT, fish-s2.
 - **Owned packet buffers**: CUDA snapshots retain an independent allocation, its completed
   copy, backend and residency owner. Same-context consumers copy device bytes directly; host
   buffers and other packet backends use host staging. Live speech frame transport still needs
-  bounded snapshot reuse and batched consumer copies; these APIs alone do not enable it or
+  bounded snapshot reuse and channel ownership; these APIs alone do not enable it or
   establish a timing win.
 
 ### NVIDIA → AMD candidates

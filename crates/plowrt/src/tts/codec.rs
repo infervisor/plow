@@ -9,7 +9,9 @@ use std::sync::mpsc;
 
 use parking_lot::Mutex;
 
-use crate::exec::packet_runtime::{load_packet_runtime_on, PacketAsset, PacketTensor, PacketWrite};
+use crate::exec::packet_runtime::{
+    load_packet_runtime_on, PacketAsset, PacketData, PacketTensor, PacketWrite,
+};
 
 pub const PACKET: &str = "codec.pkt";
 const DRIVER: &str = "codec.v1";
@@ -1314,29 +1316,29 @@ impl Bound {
             PacketWrite {
                 tensor: self.codes,
                 offset: 0,
-                bytes: bytemuck::cast_slice(&io.codes_buf)
+                data: PacketData::Host(bytemuck::cast_slice(&io.codes_buf)),
             },
             PacketWrite {
                 tensor: io.slot,
                 offset: 0,
-                bytes: bytemuck::cast_slice(&io.slot_buf)
+                data: PacketData::Host(bytemuck::cast_slice(&io.slot_buf)),
             },
             PacketWrite {
                 tensor: io.pos,
                 offset: 0,
-                bytes: bytemuck::cast_slice(&io.pos_buf)
+                data: PacketData::Host(bytemuck::cast_slice(&io.pos_buf)),
             },
             PacketWrite {
                 tensor: io.rope,
                 offset: 0,
-                bytes: bytemuck::cast_slice(&io.rope_buf)
+                data: PacketData::Host(bytemuck::cast_slice(&io.rope_buf)),
             },
         ];
         if let Some(t) = io.row_pos {
             writes.push(PacketWrite {
                 tensor: t,
                 offset: 0,
-                bytes: bytemuck::cast_slice(&io.row_buf),
+                data: PacketData::Host(bytemuck::cast_slice(&io.row_buf)),
             });
         }
         for ((&t, &(_, per_frame)), values) in io.n.iter().zip(&self.lengths).zip(&mut io.len_buf) {
@@ -1347,7 +1349,7 @@ impl Bound {
             writes.push(PacketWrite {
                 tensor: t,
                 offset: 0,
-                bytes: bytemuck::cast_slice(values),
+                data: PacketData::Host(bytemuck::cast_slice(values)),
             });
         }
         rt.write_tensors(&writes).map_err(e)?;
@@ -1426,17 +1428,17 @@ impl Bound {
             smallvec::smallvec![PacketWrite {
                 tensor: self.codes,
                 offset: 0,
-                bytes: bytemuck::cast_slice(&codes)
+                data: PacketData::Host(bytemuck::cast_slice(&codes)),
             },];
         writes.extend(lengths.iter().map(|(tensor, len)| PacketWrite {
             tensor: *tensor,
             offset: 0,
-            bytes: bytemuck::cast_slice(len),
+            data: PacketData::Host(bytemuck::cast_slice(len)),
         }));
         writes.push(PacketWrite {
             tensor: self.seed,
             offset: 0,
-            bytes: bytemuck::cast_slice(&seeds),
+            data: PacketData::Host(bytemuck::cast_slice(&seeds)),
         });
         self.runtime.write_tensors(&writes).map_err(e)?;
         let slotted = matches!(family, Family::Slot | Family::SlotCached);
@@ -1912,29 +1914,53 @@ mod tests {
             for w in writes {
                 w.check()?;
             }
-            for w in writes {
-                if let Some(source) = self.1.as_mut().filter(|s| s.codes == w.tensor) {
-                    source
-                        .runtime
-                        .write_tensor_at(source.staging, w.offset, w.bytes)?;
-                    let snapshot =
+            if let Some(source) = self.1.as_mut() {
+                let mut snapshots = Vec::with_capacity(writes.len());
+                for w in writes {
+                    let snapshot = if source.codes == w.tensor {
+                        let mut bytes = vec![0; w.data.len()];
+                        w.data.read(&mut bytes)?;
                         source
                             .runtime
-                            .snapshot_tensor(source.staging, w.offset, w.bytes.len())?;
-                    assert!(snapshot.cuda_source().is_some());
-                    source.runtime.write_tensor_at(
-                        source.staging,
-                        w.offset,
-                        &vec![0xdd; w.bytes.len()],
-                    )?;
-                    self.0.write_tensor_from(w.tensor, w.offset, &snapshot)?;
-                    source
-                        .copies
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                } else if w.offset == 0 && w.bytes.len() == w.tensor.bytes {
-                    self.0.write_tensor(w.tensor, w.bytes)?;
+                            .write_tensor_at(source.staging, w.offset, &bytes)?;
+                        let snapshot = source.runtime.snapshot_tensor(
+                            source.staging,
+                            w.offset,
+                            bytes.len(),
+                        )?;
+                        assert!(snapshot.cuda_source().is_some());
+                        bytes.fill(0xdd);
+                        source
+                            .runtime
+                            .write_tensor_at(source.staging, w.offset, &bytes)?;
+                        source
+                            .copies
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Some(snapshot)
+                    } else {
+                        None
+                    };
+                    snapshots.push(snapshot);
+                }
+                let batch: Vec<_> = writes
+                    .iter()
+                    .zip(&snapshots)
+                    .map(|(w, source)| PacketWrite {
+                        tensor: w.tensor,
+                        offset: w.offset,
+                        data: source.as_ref().map_or(w.data, PacketData::Buffer),
+                    })
+                    .collect();
+                return self.0.write_tensors(&batch);
+            }
+            for w in writes {
+                let PacketData::Host(bytes) = w.data else {
+                    panic!("serial control expects host writes");
+                };
+                if w.offset == 0 && bytes.len() == w.tensor.bytes {
+                    self.0.write_tensor(w.tensor, bytes)?;
                 } else {
-                    self.0.write_tensor_at(w.tensor, w.offset, w.bytes)?;
+                    self.0.write_tensor_at(w.tensor, w.offset, bytes)?;
                 }
             }
             Ok(())

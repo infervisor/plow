@@ -14,7 +14,7 @@ use crate::asset::devblob::DevBlob;
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, GraphExec, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
 use crate::exec::packet_runtime::{
-    check_copy, check_region, check_transfer, write_buffer_host, PacketBuffer, PacketRuntime,
+    check_copy, check_region, check_transfer, PacketBuffer, PacketData, PacketRuntime,
     PacketTensor, PacketWrite,
 };
 use crate::{Result, RuntimeError};
@@ -466,6 +466,24 @@ fn input_size(mut sizes: impl Iterator<Item = usize>) -> Result<usize> {
     })
 }
 
+fn device_input_source(be: &CudaBackend, data: PacketData<'_>) -> Option<u64> {
+    match data {
+        PacketData::Buffer(source) => source
+            .cuda_source()
+            .filter(|(b, _)| be.shares_context(b))
+            .map(|(_, address)| address),
+        _ => None,
+    }
+}
+
+fn host_input_size(be: &CudaBackend, data: PacketData<'_>) -> usize {
+    match data {
+        PacketData::Zero(_) => 0,
+        _ if device_input_source(be, data).is_some() => 0,
+        _ => data.len(),
+    }
+}
+
 fn submit_writes(
     count: usize,
     mut enqueue: impl FnMut(usize) -> Result<()>,
@@ -518,6 +536,59 @@ mod write_tests {
             let mut expected = [0xa5; 64];
             expected[5..37].copy_from_slice(&bytes[10..42]);
             assert_eq!(actual, expected);
+            let first = view.slice(0..11).unwrap();
+            let second = view.slice(7..24).unwrap();
+            consumer
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: target,
+                        offset: 2,
+                        data: PacketData::Zero(46),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 3,
+                        data: PacketData::Buffer(&first),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 9,
+                        data: PacketData::Buffer(&second),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 64,
+                        data: PacketData::Zero(0),
+                    },
+                ])
+                .unwrap();
+            assert!(
+                consumer.input_stage.is_none(),
+                "device-only batch staged on host"
+            );
+            expected[2..48].fill(0);
+            expected[3..14].copy_from_slice(&bytes[10..21]);
+            expected[9..26].copy_from_slice(&bytes[17..34]);
+            consumer.read_tensor(target, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            for data in [PacketData::Zero(usize::MAX), PacketData::Buffer(&view)] {
+                assert!(consumer
+                    .write_tensors(&[
+                        PacketWrite {
+                            tensor: target,
+                            offset: 0,
+                            data: PacketData::Zero(64)
+                        },
+                        PacketWrite {
+                            tensor: target,
+                            offset: 63,
+                            data
+                        },
+                    ])
+                    .is_err());
+                consumer.read_tensor(target, &mut actual).unwrap();
+                assert_eq!(actual, expected);
+            }
             for offset in [63, usize::MAX] {
                 assert!(consumer.write_tensor_from(target, offset, &view).is_err());
                 consumer.read_tensor(target, &mut actual).unwrap();
@@ -535,11 +606,40 @@ mod write_tests {
                 )
                 .is_err());
             let host: PacketBuffer = vec![9, 8, 7].into();
-            consumer.write_tensor_from(target, 1, &host).unwrap();
+            consumer
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: target,
+                        offset: 1,
+                        data: PacketData::Buffer(&host),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 6,
+                        data: PacketData::Buffer(&first),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 12,
+                        data: PacketData::Zero(2),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 15,
+                        data: PacketData::Host(&[5, 4, 3, 2, 1]),
+                    },
+                ])
+                .unwrap();
             assert!(consumer.input_stage.is_some());
+            assert_eq!(consumer.input_stage.as_ref().unwrap().len(), 16);
             expected[1..4].copy_from_slice(&[9, 8, 7]);
+            expected[6..17].copy_from_slice(&bytes[10..21]);
+            expected[12..14].fill(0);
+            expected[15..20].copy_from_slice(&[5, 4, 3, 2, 1]);
             consumer.read_tensor(target, &mut actual).unwrap();
             assert_eq!(actual, expected);
+            drop(first);
+            drop(second);
             drop(view);
             assert!(resident.upgrade().is_none());
         })
@@ -596,17 +696,17 @@ mod write_tests {
                 PacketWrite {
                     tensor: t,
                     offset: 5,
-                    bytes: &first,
+                    data: PacketData::Host(&first),
                 },
                 PacketWrite {
                     tensor: t,
                     offset: 9,
-                    bytes: &[1, 2, 3, 4],
+                    data: PacketData::Host(&[1, 2, 3, 4]),
                 },
                 PacketWrite {
                     tensor: t,
                     offset: 64,
-                    bytes: &[],
+                    data: PacketData::Host(&[]),
                 },
             ];
             rt.write_tensors(&writes).unwrap();
@@ -621,12 +721,12 @@ mod write_tests {
                     PacketWrite {
                         tensor: t,
                         offset: 0,
-                        bytes: &[0xff]
+                        data: PacketData::Host(&[0xff]),
                     },
                     PacketWrite {
                         tensor: t,
                         offset: usize::MAX,
-                        bytes: &[1]
+                        data: PacketData::Host(&[1]),
                     },
                 ])
                 .is_err());
@@ -636,7 +736,7 @@ mod write_tests {
                 .write_tensors(&[PacketWrite {
                     tensor: PacketTensor { bytes: 63, ..t },
                     offset: 0,
-                    bytes: &[1],
+                    data: PacketData::Host(&[1]),
                 }])
                 .is_err());
         }
@@ -645,7 +745,7 @@ mod write_tests {
         rt.write_tensors(&[PacketWrite {
             tensor: t,
             offset: 0,
-            bytes: &[0xa5; 64],
+            data: PacketData::Host(&[0xa5; 64]),
         }])
         .unwrap();
         assert_eq!(
@@ -678,44 +778,59 @@ impl PacketRuntime for CudaPacketRuntime {
             )?;
             w.check()?;
         }
-        let size = input_size(writes.iter().map(|w| w.bytes.len()))?;
-        if size == 0 {
+        if writes.iter().all(|w| w.data.is_empty()) {
             return Ok(());
         }
+        let size = input_size(writes.iter().map(|w| host_input_size(&self.be, w.data)))?;
         self.reserve_inputs(size)?;
-        let stage = self.input_stage.as_mut().unwrap();
         let mut offset = 0;
         for w in writes {
-            stage.as_mut_slice()[offset..offset + w.bytes.len()].copy_from_slice(w.bytes);
-            offset = (offset + w.bytes.len() + 7) & !7;
+            let len = host_input_size(&self.be, w.data);
+            if len > 0 {
+                let stage = self.input_stage.as_mut().unwrap();
+                w.data
+                    .read(&mut stage.as_mut_slice()[offset..offset + len])?;
+                offset = (offset + len + 7) & !7;
+            }
         }
-        let stage = self.input_stage.as_ref().unwrap();
         let mut offset = 0;
         let mut failed = false;
         let result = submit_writes(
             writes.len(),
             |i| {
                 let w = &writes[i];
-                let source = &stage.as_slice()[offset..offset + w.bytes.len()];
-                offset = (offset + w.bytes.len() + 7) & !7;
-                if source.is_empty() {
+                let len = w.data.len();
+                if len == 0 {
                     return Ok(());
                 }
-                // SAFETY: validated ranges, owned pinned source, and the batch drains below.
-                unsafe {
-                    self.be.memcpy_htod_async(
-                        self.tensors[w.tensor.handle].base + w.offset as u64,
-                        source,
-                        &self.stream,
-                    )
+                let target = self.tensors[w.tensor.handle].base + w.offset as u64;
+                if let PacketData::Zero(_) = w.data {
+                    return self.be.memset_d8_async(target, 0, len, &self.stream);
                 }
+                if let Some(source) = device_input_source(&self.be, w.data) {
+                    return self
+                        .be
+                        .memcpy_dtod_async(target, source, len as u64, &self.stream);
+                }
+                let stage = self.input_stage.as_ref().unwrap();
+                let source = &stage.as_slice()[offset..offset + len];
+                offset = (offset + len + 7) & !7;
+                // SAFETY: validated ranges, owned pinned source, and the batch drains below.
+                unsafe { self.be.memcpy_htod_async(target, source, &self.stream) }
             },
             || self.be.stream_synchronize(&self.stream),
             || failed = true,
         );
         if failed {
             // Unproven completion must retain buffers and the backend's small-copy kernel.
-            std::mem::forget(self.input_stage.take().unwrap());
+            if let Some(stage) = self.input_stage.take() {
+                std::mem::forget(stage);
+            }
+            for w in writes {
+                if let PacketData::Buffer(source) = w.data {
+                    std::mem::forget(source.clone());
+                }
+            }
             return Err(
                 self.abandon_transfers(writes.iter().map(|w| w.tensor), result.unwrap_err())
             );
@@ -772,47 +887,6 @@ impl PacketRuntime for CudaPacketRuntime {
             bytes,
             self._resident.clone(),
         ))
-    }
-
-    fn write_tensor_from(
-        &mut self,
-        tensor: PacketTensor,
-        offset: usize,
-        source: &PacketBuffer,
-    ) -> Result<()> {
-        let target = self.mem(tensor)?;
-        check_transfer(
-            tensor,
-            tensor.handle,
-            target.len as usize,
-            target.len as usize,
-        )?;
-        check_region(tensor, offset, source.len())?;
-        let Some((_, address)) = source
-            .cuda_source()
-            .filter(|(b, _)| self.be.shares_context(b))
-        else {
-            return write_buffer_host(self, tensor, offset, source);
-        };
-        if source.is_empty() {
-            return Ok(());
-        }
-        let target = target.base + offset as u64;
-        let mut failed = false;
-        let result = submit_writes(
-            1,
-            |_| {
-                self.be
-                    .memcpy_dtod_async(target, address, source.len() as u64, &self.stream)
-            },
-            || self.be.stream_synchronize(&self.stream),
-            || failed = true,
-        );
-        if failed {
-            std::mem::forget(source.clone());
-            return Err(self.abandon_transfers([tensor], result.unwrap_err()));
-        }
-        result
     }
 
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()> {

@@ -138,15 +138,48 @@ pub(crate) fn check_region(tensor: PacketTensor, offset: usize, bytes: usize) ->
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum PacketData<'a> {
+    Host(&'a [u8]),
+    Buffer(&'a PacketBuffer),
+    Zero(usize),
+}
+
+impl PacketData<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Host(bytes) => bytes.len(),
+            Self::Buffer(buffer) => buffer.len(),
+            Self::Zero(bytes) => *bytes,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn read(&self, output: &mut [u8]) -> Result<()> {
+        if output.len() != self.len() {
+            return Err(RuntimeError::Device("packet input size changed".into()));
+        }
+        match self {
+            Self::Host(bytes) => output.copy_from_slice(bytes),
+            Self::Buffer(buffer) => buffer.read(output)?,
+            Self::Zero(_) => output.fill(0),
+        }
+        Ok(())
+    }
+}
+
 pub struct PacketWrite<'a> {
     pub tensor: PacketTensor,
     pub offset: usize,
-    pub bytes: &'a [u8],
+    pub data: PacketData<'a>,
 }
 
 impl PacketWrite<'_> {
     pub(crate) fn check(&self) -> Result<()> {
-        check_region(self.tensor, self.offset, self.bytes.len())
+        check_region(self.tensor, self.offset, self.data.len())
     }
 }
 
@@ -173,10 +206,21 @@ pub trait PacketRuntime: Send {
             w.check()?;
         }
         for w in writes {
-            if w.offset == 0 && w.bytes.len() == w.tensor.bytes {
-                self.write_tensor(w.tensor, w.bytes)?;
+            let owned;
+            let bytes = if let PacketData::Host(bytes) = w.data {
+                bytes
             } else {
-                self.write_tensor_at(w.tensor, w.offset, w.bytes)?;
+                owned = {
+                    let mut bytes = vec![0; w.data.len()];
+                    w.data.read(&mut bytes)?;
+                    bytes
+                };
+                &owned
+            };
+            if w.offset == 0 && bytes.len() == w.tensor.bytes {
+                self.write_tensor(w.tensor, bytes)?;
+            } else {
+                self.write_tensor_at(w.tensor, w.offset, bytes)?;
             }
         }
         Ok(())
@@ -199,7 +243,11 @@ pub trait PacketRuntime: Send {
         offset: usize,
         source: &PacketBuffer,
     ) -> Result<()> {
-        write_buffer_host(self, tensor, offset, source)
+        self.write_tensors(&[PacketWrite {
+            tensor,
+            offset,
+            data: PacketData::Buffer(source),
+        }])
     }
     /// Write `bytes` at byte `offset` of `tensor`; the rest keeps its contents.
     fn write_tensor_at(&mut self, tensor: PacketTensor, offset: usize, bytes: &[u8]) -> Result<()> {
@@ -248,22 +296,6 @@ pub trait PacketRuntime: Send {
         Ok(())
     }
     fn last_run_us(&self) -> f64;
-}
-
-pub(crate) fn write_buffer_host<R: PacketRuntime + ?Sized>(
-    runtime: &mut R,
-    tensor: PacketTensor,
-    offset: usize,
-    source: &PacketBuffer,
-) -> Result<()> {
-    check_region(tensor, offset, source.len())?;
-    let mut bytes = vec![0; source.len()];
-    source.read(&mut bytes)?;
-    runtime.write_tensors(&[PacketWrite {
-        tensor,
-        offset,
-        bytes: &bytes,
-    }])
 }
 
 pub struct PacketAsset {
@@ -1013,17 +1045,17 @@ mod tests {
             PacketWrite {
                 tensor: t,
                 offset: 0,
-                bytes: &[0xa5; 16],
+                data: PacketData::Host(&[0xa5; 16]),
             },
             PacketWrite {
                 tensor: t,
                 offset: 3,
-                bytes: &[1, 2, 3, 4],
+                data: PacketData::Host(&[1, 2, 3, 4]),
             },
             PacketWrite {
                 tensor: t,
                 offset: 5,
-                bytes: &[5, 6],
+                data: PacketData::Host(&[5, 6]),
             },
         ])
         .unwrap();
@@ -1037,12 +1069,12 @@ mod tests {
                     PacketWrite {
                         tensor: t,
                         offset: 0,
-                        bytes: &[0xff]
+                        data: PacketData::Host(&[0xff]),
                     },
                     PacketWrite {
                         tensor: t,
                         offset,
-                        bytes: &[1]
+                        data: PacketData::Host(&[1]),
                     },
                 ])
                 .is_err());
@@ -1066,6 +1098,44 @@ mod tests {
             .is_err());
         assert_eq!(consumer.1, 1);
         assert!(rt.snapshot_tensor(t, 15, 2).is_err());
+        consumer
+            .write_tensors(&[
+                PacketWrite {
+                    tensor: t,
+                    offset: 2,
+                    data: PacketData::Zero(12),
+                },
+                PacketWrite {
+                    tensor: t,
+                    offset: 3,
+                    data: PacketData::Buffer(&snapshot),
+                },
+                PacketWrite {
+                    tensor: t,
+                    offset: 5,
+                    data: PacketData::Host(&[9, 8]),
+                },
+            ])
+            .unwrap();
+        let expected = [0xa5, 0xa5, 0, 1, 2, 9, 8, 0, 0, 0, 0, 0, 0, 0, 0xa5, 0xa5];
+        assert_eq!(consumer.0, expected);
+        for data in [PacketData::Zero(usize::MAX), PacketData::Buffer(&snapshot)] {
+            assert!(consumer
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: t,
+                        offset: 0,
+                        data: PacketData::Zero(16),
+                    },
+                    PacketWrite {
+                        tensor: t,
+                        offset: 15,
+                        data,
+                    },
+                ])
+                .is_err());
+            assert_eq!(consumer.0, expected);
+        }
     }
 
     struct FakeRuntime;
