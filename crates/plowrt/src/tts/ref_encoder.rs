@@ -60,8 +60,10 @@ mod tests {
             let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
             let pcm = tensors.tensor("pcm").unwrap();
             let mel = tensors.tensor("mel").unwrap();
+            let input = tensors.tensor("input").unwrap();
             assert_eq!(pcm.dtype(), safetensors::Dtype::F32);
             assert_eq!(mel.dtype(), safetensors::Dtype::F32);
+            assert_eq!(input.dtype(), safetensors::Dtype::BF16);
             assert_eq!(pcm.shape()[0], 1);
             assert_eq!(&mel.shape()[..2], &[1, 128]);
             let floats = |t: &safetensors::tensor::TensorView<'_>| -> Vec<f32> {
@@ -74,6 +76,7 @@ mod tests {
             let expected = floats(&mel);
             let got = frontend.extract(&samples).unwrap();
             let rows = mel.shape()[2];
+            assert_eq!(input.shape(), &[1, rows, 128]);
             assert_eq!(got.frames, rows, "{}", case["case"]);
             assert_eq!(got.bins, 128);
             assert_eq!(got.values.len(), expected.len());
@@ -82,18 +85,29 @@ mod tests {
             let mut max_abs = 0f32;
             let mut error = 0f64;
             let mut norm = 0f64;
+            let mut bf16_changed = 0usize;
+            let mut bf16_max_abs = 0f32;
             for (i, &v) in got.values.iter().enumerate() {
                 let target = expected[(i % 128) * rows + i / 128];
                 max_abs = max_abs.max((v - target).abs());
                 error += (f64::from(v) - f64::from(target)).powi(2);
                 norm += f64::from(target).powi(2);
+                let target = u16::from_le_bytes(input.data()[i * 2..i * 2 + 2].try_into().unwrap());
+                let bits = v.to_bits();
+                let actual =
+                    f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000);
+                bf16_changed += usize::from(actual.to_bits() >> 16 != u32::from(target));
+                bf16_max_abs =
+                    bf16_max_abs.max((actual - f32::from_bits(u32::from(target) << 16)).abs());
             }
             let relative_l2 = (error / norm).sqrt();
             let pass =
                 got.values.iter().all(|v| v.is_finite()) && max_abs <= 2e-4 && relative_l2 <= 1e-5;
             all_pass &= pass;
             let row = serde_json::json!({"case": case["case"], "samples": samples.len(),
-                "frames": rows, "max_abs": max_abs, "relative_l2": relative_l2, "pass": pass});
+                "frames": rows, "max_abs": max_abs, "relative_l2": relative_l2, "pass": pass,
+                "bf16_input_changed": bf16_changed, "bf16_input_elements": got.values.len(),
+                "bf16_input_max_abs": bf16_max_abs});
             println!("{row}");
             results.push(row);
         }
