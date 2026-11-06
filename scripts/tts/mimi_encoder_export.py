@@ -16,7 +16,8 @@ model_type mimi_encoder:
   {sem,ac}.E{k} / .nb{k}       centroids embed_sum / clamp(cluster_usage, 1e-5) and -|e|^2 / 2: the
                                nearest centroid is the argmax of x . e - |e|^2 / 2
 
-  HF_HOME=... python scripts/tts/mimi_encoder_export.py OUT_DIR REVISION [REPO]   (REPO kyutai/mimi)
+  HF_HOME=... python scripts/tts/mimi_encoder_export.py OUT_DIR REVISION [REPO [SUBDIR]]
+  REPO alone selects an unwrapped Mimi checkpoint; REPO SUBDIR selects a tokenizer's encoder.
 """
 import json
 import os
@@ -29,7 +30,7 @@ REPO = "models--BreezeBlue--Breeze-TTS-2"
 
 
 def main():
-    if len(sys.argv) not in (3, 4):
+    if len(sys.argv) not in (3, 4, 5):
         sys.exit(__doc__)
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
@@ -42,7 +43,9 @@ def main():
         top = dict(encoder_config=ec, encoder_valid_num_quantizers=ec.get("num_quantizers", 32),
                    encode_downsample_rate=int(ec["sampling_rate"] / ec["frame_rate"]))
     else:
-        src = os.path.join(hub, REPO, "snapshots", sys.argv[2], "audio_tokenizer")
+        repo, sub = (REPO, "audio_tokenizer") if len(sys.argv) == 3 else (
+            "models--" + sys.argv[3].replace("/", "--"), sys.argv[4])
+        src = os.path.join(hub, repo, "snapshots", sys.argv[2], sub)
         sd = {k[len("encoder."):]: v for k, v in load_file(f"{src}/model.safetensors").items()
               if k.startswith("encoder.")}
         top = json.load(open(f"{src}/config.json"))
