@@ -13358,7 +13358,7 @@ impl GpuEngine {
                 .graph_capture_hoisting(&capture_stream, &untouched, || {
                     for (seg, &class) in seg_class.iter().enumerate() {
                         let seg = seg + range.start;
-                        if let Some(r) = rider_route {
+                        if let Some(r) = rider_route.filter(|_| seg > range.start) {
                             r.launch_captured(&self.be, bi, seg, &capture_stream)?;
                         }
                         if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
@@ -13401,6 +13401,10 @@ impl GpuEngine {
                             &mut params,
                             Some(&capture_stream),
                         )?;
+                    }
+                    // A window ending at attention must include that segment's rider.
+                    if let Some(r) = rider_route.filter(|_| !range.is_empty()) {
+                        r.launch_captured(&self.be, bi, range.end, &capture_stream)?;
                     }
                     Ok(())
                 })?
@@ -14205,10 +14209,10 @@ impl GpuEngine {
             let mut routed_index = 0;
             if !seg_time_probe && rt.nv.pf_seg_graph {
                 let tensors = arg.tensors as u64;
-                if riding && !routed && self.pf_seg_window.is_none() {
-                    let segments = seg_class.len();
-                    self.ensure_seg_graph_with(bi, &arg, 0..segments, true)?;
-                    let key = (bi, tensors, 0, segments | (1 << 31));
+                if riding && !routed {
+                    let range = self.pf_seg_window.clone().unwrap_or(0..seg_class.len());
+                    let key = (bi, tensors, range.start, range.end | (1 << 31));
+                    self.ensure_seg_graph_with(bi, &arg, range, true)?;
                     let graph = self.seg_graphs.get(&key).expect("built");
                     self.be.graph_launch(graph, &self.stream)?;
                     if synchronize {
@@ -14288,7 +14292,7 @@ impl GpuEngine {
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             let window = self.pf_seg_window.clone().unwrap_or(0..seg_class.len());
             for (seg, &cls) in seg_class.iter().enumerate() {
-                if riding {
+                if riding && seg > window.start && seg <= window.end {
                     let riders = self.riders.as_ref().expect("riding");
                     riders.launch_after(&self.be, bi, seg, &self.stream)?;
                 }
@@ -15365,6 +15369,7 @@ impl GpuEngine {
     /// DIAGNOSTIC (`PLOW_NV_DUMP_ACT`, see the knob): partial chains `0..=seg(pc)` of a packed
     /// launch, each followed by a dump of the matching request's activation rows. Every partial
     /// chain restarts at the embedding, so the full chain that follows recomputes the same state.
+    /// Prompt lengths may be comma-separated; dumps include all real rows and their request spans.
     #[allow(clippy::too_many_arguments)]
     fn dump_prefill_acts(
         &mut self,
@@ -15385,17 +15390,28 @@ impl GpuEngine {
         let Some((len, pcs)) = spec.split_once(':') else {
             return Ok(());
         };
-        let Ok(len) = len.parse::<usize>() else {
+        let Some(lengths) = len
+            .split(',')
+            .map(|s| s.trim().parse::<usize>().ok())
+            .collect::<Option<Vec<_>>>()
+        else {
             return Ok(());
         };
         let mut q0 = 0usize;
         let Some(r) = reqs.iter().find(|r| {
             q0 += r.tokens.len();
-            r.prompt_len == len
+            lengths.contains(&r.prompt_len)
         }) else {
             return Ok(());
         };
+        let len = r.prompt_len;
         let (row0, rows) = (q0 - r.tokens.len(), r.tokens.len());
+        let mut packed_row = 0;
+        let requests: Vec<_> = reqs.iter().map(|r| {
+            let row = packed_row;
+            packed_row += r.tokens.len();
+            serde_json::json!({"slot": r.slot, "row0": row, "rows": r.tokens.len(), "c0": r.c0, "prompt_len": r.prompt_len})
+        }).collect();
         let max_t = self.prefill.iter().map(|b| b.t as u64).max().unwrap_or(1);
         for pc in pcs.split(',').filter_map(|p| p.parse::<usize>().ok()) {
             let Some(seg) = self.prefill[bi]
@@ -15435,10 +15451,10 @@ impl GpuEngine {
                 let Some(i) = self.handle_of(name) else {
                     continue;
                 };
-                // Rows `[0, row0 + rows)` at the tensor's widest stride: a layer narrower than
+                // All real rows at the tensor's widest stride: a layer narrower than
                 // the tensor's row width packs its rows densely.
                 let row_bytes = self.devp[i].len / max_t;
-                let mut buf = vec![0u8; (row_bytes * (row0 + rows) as u64) as usize];
+                let mut buf = vec![0u8; (row_bytes * total as u64) as usize];
                 self.be.download(&self.devp[i], 0, &mut buf)?;
                 index.push(serde_json::json!({
                     "name": name, "offset": data.len(), "row_bytes": row_bytes, "rows": rows,
@@ -15451,6 +15467,7 @@ impl GpuEngine {
             let meta = serde_json::json!({
                 "prompt_len": len, "pc": pc, "segment": seg, "segment_sites": self.prefill[bi].segment_sites[seg],
                 "bucket_t": self.prefill[bi].t, "c0": r.c0, "rows": rows, "row0": row0, "tensors": index,
+                "capture_rows": total, "packed_requests": &requests,
             });
             std::fs::write(stem.with_extension("json"), meta.to_string())
                 .map_err(|e| RuntimeError::Rejected(e.to_string()))?;

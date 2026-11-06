@@ -1,4 +1,5 @@
 use super::*;
+use crate::asset::devblob::DevBlob;
 use crate::device::cuda::CudaBackend;
 use plow_asset::token_batch::{Phase, Request, Selection};
 use std::sync::Arc;
@@ -469,10 +470,99 @@ fn logit_kl(reference: &[f32], actual: &[f32]) -> f64 {
         .sum()
 }
 
+fn kv_vectors(
+    e: &GpuEngine,
+    blob: &DevBlob,
+    positions: &[(usize, usize)],
+) -> Vec<(String, Vec<u16>)> {
+    let layout = crate::exec::gpu::packet_kv_layout(blob);
+    assert!(matches!(
+        layout,
+        plow_asset::live_kv::LAYOUT_HEAD_MAJOR | plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED
+    ));
+    let mut tensors = Vec::new();
+    for instruction in e
+        .h_inst
+        .iter()
+        .filter(|i| i.op == DevOp::FlashDecode as u16)
+    {
+        let (heads, stride, width) = (
+            instruction.i[2] as usize,
+            instruction.i[3] as usize,
+            instruction.i[6] as usize,
+        );
+        for &handle in &instruction.t[3..5] {
+            let name = &blob.tensors[handle as usize].name;
+            assert!(
+                e.handle_of(&format!("{name}_scale")).is_none(),
+                "KV capture requires BF16 caches"
+            );
+            let mut values = vec![0u16; positions.len() * heads * width];
+            for (request, &(slot, position)) in positions.iter().enumerate() {
+                let row = (position as u32 & instruction.i[7]) as usize;
+                assert!(row < stride);
+                for head in 0..heads {
+                    let offset = if layout == plow_asset::live_kv::LAYOUT_HEAD_MAJOR {
+                        ((slot * heads + head) * stride + row) * width
+                    } else {
+                        ((slot * stride + row) * heads + head) * width
+                    };
+                    let begin = (request * heads + head) * width;
+                    e.read_tensor_range(
+                        name,
+                        offset as u64 * 2,
+                        bytemuck::cast_slice_mut(&mut values[begin..begin + width]),
+                    )
+                    .unwrap();
+                }
+            }
+            tensors.push((name.clone(), values));
+        }
+    }
+    assert!(!tensors.is_empty());
+    tensors
+}
+
+fn kv_difference(reference: &[u16], actual: &[u16]) -> (f64, f64) {
+    assert_eq!(reference.len(), actual.len());
+    let (mut error, mut norm, mut maximum) = (0.0, 0.0, 0f64);
+    for (&a, &b) in reference.iter().zip(actual) {
+        let (a, b) = (
+            f64::from(f32::from_bits(u32::from(a) << 16)),
+            f64::from(f32::from_bits(u32::from(b) << 16)),
+        );
+        assert!(a.is_finite() && b.is_finite());
+        error += (a - b) * (a - b);
+        norm += a * a;
+        maximum = maximum.max((a - b).abs());
+    }
+    ((error / norm.max(1e-30)).sqrt(), maximum)
+}
+
+fn archive_activations(e: &GpuEngine, n: usize, stage: &str, slot: Option<usize>) {
+    let Some(directory) = crate::config::RuntimeConfig::get().nv.nv_dump_kv.as_ref() else {
+        return;
+    };
+    if let Some(slot) = slot {
+        e.dump_slot_kv(slot, &format!("c{n}-{stage}"), e.pos[slot]);
+    }
+    let destination = directory.join(format!("c{n}-{stage}"));
+    std::fs::create_dir_all(&destination).unwrap();
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with("act-p")
+            && entry.file_type().unwrap().is_file()
+        {
+            std::fs::rename(entry.path(), destination.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
 #[test]
 #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, RUST_MIN_STACK=67108864; run through gpuq"]
 fn speech_mixed_batch_preserves_logits_at_serving_concurrencies() {
     let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+    let blob = DevBlob::parse(&std::fs::read(assets.join("model.pkt")).unwrap()).unwrap();
     let be = Arc::new(CudaBackend::new(0).unwrap());
     let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).unwrap();
     assert!(e.token_batch_enabled() && e.packed_depth_enabled() && e.batch >= 32);
@@ -534,6 +624,11 @@ fn speech_mixed_batch_preserves_logits_at_serving_concurrencies() {
         })
         .unwrap();
         assert_eq!(outputs.len(), n);
+        let diagnostic_slot = requests
+            .iter()
+            .find(|r| r.prompt_len == 7)
+            .map(|r| r.slot as usize);
+        archive_activations(&e, n, "prompt", diagnostic_slot);
         let fresh_slot = (n > 1).then_some(n - 1);
         let mut fresh_logits = Vec::new();
         if let Some(slot) = fresh_slot {
@@ -555,6 +650,12 @@ fn speech_mixed_batch_preserves_logits_at_serving_concurrencies() {
                 .unwrap();
         }
         e.step_slots(&feeds, &mut Vec::new()).unwrap();
+        archive_activations(&e, n, "ordinary", diagnostic_slot);
+        let positions: Vec<_> = feeds
+            .iter()
+            .map(|&(slot, _)| (slot, prompts[slot].len()))
+            .collect();
+        let ordinary_kv = kv_vectors(&e, &blob, &positions);
         let mut reference = vec![Vec::new(); n];
         for &(slot, _) in &feeds {
             e.logits_row(slot, &mut reference[slot]).unwrap();
@@ -579,6 +680,8 @@ fn speech_mixed_batch_preserves_logits_at_serving_concurrencies() {
             upload_inputs(e, &m, p)
         })
         .unwrap();
+        archive_activations(&e, n, "control", diagnostic_slot);
+        let control_kv = kv_vectors(&e, &blob, &positions);
         let mut packed_reference = vec![Vec::new(); n];
         for (row, &(slot, _)) in outputs.iter().enumerate() {
             e.logits_row(row, &mut packed_reference[slot as usize])
@@ -621,9 +724,20 @@ fn speech_mixed_batch_preserves_logits_at_serving_concurrencies() {
         })
         .unwrap();
         assert_eq!(outputs.len(), n);
+        archive_activations(&e, n, "mixed", diagnostic_slot);
+        let mixed_kv = kv_vectors(&e, &blob, &positions);
+        for (((name, ordinary), (control_name, control)), (mixed_name, mixed)) in
+            ordinary_kv.iter().zip(&control_kv).zip(&mixed_kv)
+        {
+            assert_eq!((name, name), (control_name, mixed_name));
+            let (ordinary_rel, ordinary_max) = kv_difference(ordinary, mixed);
+            let (control_rel, control_max) = kv_difference(control, mixed);
+            eprintln!("KV c{n} {name}: ordinary rel={ordinary_rel:.8} max={ordinary_max:.8}, prefill-control rel={control_rel:.8} max={control_max:.8}");
+        }
         let mut seen = vec![false; n];
         let mut max_kl = 0f64;
         let mut max_packed_kl = 0f64;
+        let mut mixed_logits = Vec::new();
         for (row, &(owner, _)) in outputs.iter().enumerate() {
             let slot = owner as usize;
             assert!(slot < n && !std::mem::replace(&mut seen[slot], true));
@@ -655,6 +769,17 @@ fn speech_mixed_batch_preserves_logits_at_serving_concurrencies() {
                 eprintln!("concurrency {n}, slot {slot}: KL={kl}, fresh={is_fresh}, top1 reference={reference_top} actual={actual_top}, reference gap={}", reference[reference_top] - reference[actual_top]);
                 discrepancies.push(("ordinary", n, slot, kl));
             }
+            mixed_logits.push((slot, actual));
+        }
+        if let Some(directory) = crate::config::RuntimeConfig::get().nv.nv_dump_kv.as_ref() {
+            let data = serde_json::json!({"concurrency": n, "prompt_ids": &prompts,
+                "ordinary": &reference, "control": &packed_reference, "mixed": &mixed_logits,
+                "fresh_slot": fresh_slot, "fresh_prompt": &fresh_logits});
+            serde_json::to_writer(
+                std::fs::File::create(directory.join(format!("c{n}-logits.json"))).unwrap(),
+                &data,
+            )
+            .unwrap();
         }
         eprintln!(
             "concurrency {n}: all physical owners/frontiers correct, max ordinary KL={max_kl}, max packed-control KL={max_packed_kl}"
