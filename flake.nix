@@ -726,7 +726,7 @@
             in
             self.devShells.${system}.default.overrideAttrs (old: {
               name = "plow-speech-eval";
-              nativeBuildInputs = old.nativeBuildInputs ++ [ scoringPython ];
+              # Keep the reference interpreter and its vendor-library loader.
               shellHook = old.shellHook + ''
                 export PYTHONPATH="${scoringPython}/${pkgs.python3.sitePackages}''${PYTHONPATH:+:$PYTHONPATH}"
               '';
