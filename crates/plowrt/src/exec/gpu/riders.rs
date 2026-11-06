@@ -782,4 +782,205 @@ mod tests {
         assert_eq!(std::mem::size_of::<super::RiderArgs>(), 11 * 8 + 10 * 4);
         assert_eq!(std::mem::size_of::<super::GenDecodeArgs>(), 9 * 8 + 10 * 4);
     }
+
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS; run through gpuq"]
+    fn hd128_rider_matches_fp64_attention_and_replays_dynamic_counts() {
+        use crate::device::{cuda::CudaBackend, Backend};
+
+        const HD: usize = 128;
+        const HEADS: usize = 16;
+        const KV_HEADS: usize = 8;
+        const STRIDE: usize = 2048;
+        let be = CudaBackend::new(0).unwrap();
+        assert_eq!(be.compute_capability(), (9, 0));
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let module = be
+            .module_load(&std::fs::read(assets.join("interp_sm90a.cubin")).unwrap())
+            .unwrap();
+        let functions = super::rider_functions(&be, &module, "sm90a", false).unwrap();
+        let (flash, smem) = functions.flash128.unwrap();
+        let interleaved = be
+            .module_global_u32(&module, "plow_kv_layout")
+            .unwrap()
+            .unwrap_or(0)
+            == 1;
+        let stream = be.stream_create().unwrap();
+        let upload = |bytes: &[u8]| {
+            let memory = be.alloc(0, bytes.len() as u64).unwrap();
+            be.upload(&memory, 0, bytes).unwrap();
+            memory
+        };
+        let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
+        let scalar_k = |slot: usize, h: usize, p: usize| {
+            ((p * 13 + slot * 7 + h) % 31) as f64 / 32.0 - 15.0 / 32.0
+        };
+        let scalar_v = |slot: usize, h: usize, p: usize| {
+            ((p * 11 + slot * 5 + h * 3) % 29) as f64 / 32.0 - 14.0 / 32.0
+        };
+        for (rows, context, splits) in [
+            (1usize, 1usize, 1u32),
+            (1, 2040, 8),
+            (8, 257, 2),
+            (32, 2040, 3),
+        ] {
+            let slots: Vec<i32> = (0..rows).map(|r| (rows + 2 - r) as i32).collect();
+            let lengths: Vec<i32> = (0..rows)
+                .map(|r| context.saturating_sub(r % 7).max(1) as i32)
+                .collect();
+            let mut slot_lengths = vec![0; rows + 3];
+            for (&slot, &len) in slots.iter().zip(&lengths) {
+                slot_lengths[slot as usize] = len as usize;
+            }
+            let mut q = vec![0u16; rows * HEADS * HD];
+            for r in 0..rows {
+                for h in 0..HEADS {
+                    for d in 0..HD {
+                        let v = ((d + r * 3 + h * 5) % 17) as f32 / 16.0 - 0.5
+                            + ((r + h) % 5) as f32 / 8.0
+                            - 0.25;
+                        q[(r * HEADS + h) * HD + d] = bf16(v);
+                    }
+                }
+            }
+            let mut k = vec![0x7fc0u16; (rows + 3) * KV_HEADS * STRIDE * HD];
+            let mut v = k.clone();
+            for (slot, &length) in slot_lengths.iter().enumerate() {
+                for h in 0..KV_HEADS {
+                    for p in 0..length {
+                        for d in 0..HD {
+                            let i = if interleaved {
+                                ((slot * STRIDE + p) * KV_HEADS + h) * HD + d
+                            } else {
+                                ((slot * KV_HEADS + h) * STRIDE + p) * HD + d
+                            };
+                            k[i] = bf16(scalar_k(slot, h, p) as f32);
+                            v[i] = bf16((scalar_v(slot, h, p) + (d as f64 - 64.0) / 256.0) as f32);
+                        }
+                    }
+                }
+            }
+            let scale = 1.0 / (HD as f32).sqrt();
+            let mut reference = vec![0f64; q.len()];
+            // K is constant across dimensions; V is a token scalar plus an exact BF16 dimension offset.
+            for r in 0..rows {
+                for h in 0..HEADS {
+                    let sum_q: f64 = q[(r * HEADS + h) * HD..(r * HEADS + h + 1) * HD]
+                        .iter()
+                        .map(|&x| f64::from(f32::from_bits(u32::from(x) << 16)))
+                        .sum();
+                    let slot = slots[r] as usize;
+                    let scores: Vec<_> = (0..lengths[r] as usize)
+                        .map(|p| sum_q * scalar_k(slot, h / 2, p) * f64::from(scale))
+                        .collect();
+                    let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let (mut sum, mut weighted) = (0.0, 0.0);
+                    for (p, score) in scores.iter().enumerate() {
+                        let weight = (score - maximum).exp();
+                        sum += weight;
+                        weighted += weight * scalar_v(slot, h / 2, p);
+                    }
+                    for d in 0..HD {
+                        reference[(r * HEADS + h) * HD + d] =
+                            weighted / sum + (d as f64 - 64.0) / 256.0;
+                    }
+                }
+            }
+            let dq = upload(bytemuck::cast_slice(&q));
+            let dk = upload(bytemuck::cast_slice(&k));
+            let dv = upload(bytemuck::cast_slice(&v));
+            let dl = upload(bytemuck::cast_slice(&lengths));
+            let ds = upload(bytemuck::cast_slice(&slots));
+            let dynamic = upload(bytemuck::cast_slice(&[rows as u32, 16, 32, splits]));
+            let output_poison = vec![0x7fc0u16; (rows + 2) * HEADS * HD];
+            let output = upload(bytemuck::cast_slice(&output_poison));
+            let partial = be
+                .alloc(0, (rows * HEADS * splits as usize * HD * 4) as u64)
+                .unwrap();
+            let stats = be
+                .alloc(0, (rows * HEADS * splits as usize * 2 * 4) as u64)
+                .unwrap();
+            let mut args = RiderArgs {
+                opart: partial.base,
+                mlpart: stats.base,
+                q: dq.base,
+                k: dk.base,
+                v: dv.base,
+                kv_len: dl.base,
+                slot: ds.base,
+                out: output.base,
+                dynamic: dynamic.base,
+                rows: 1,
+                n_head: HEADS as u32,
+                n_kv_head: KV_HEADS as u32,
+                kv_stride: STRIDE as u32,
+                kv_mask: STRIDE as u32 - 1,
+                nsplit: 1,
+                hd: HD as u32,
+                scale,
+                ..Default::default()
+            };
+            let enqueue = |args: &mut RiderArgs| {
+                let mut params = [args as *mut RiderArgs as *mut std::ffi::c_void];
+                let grid = (rows as u32 * (HEADS as u32 / 2) * splits).min(be.sm_count() * 4);
+                be.launch_kernel(flash, grid, super::BLOCK, smem, &mut params, Some(&stream))?;
+                be.launch_kernel(
+                    functions.merge,
+                    (rows as u32 * HEADS as u32).min(be.sm_count() * 4),
+                    super::BLOCK,
+                    0,
+                    &mut params,
+                    Some(&stream),
+                )
+            };
+            enqueue(&mut args).unwrap();
+            be.stream_synchronize(&stream).unwrap();
+            let graph = be.graph_capture(&stream, || enqueue(&mut args)).unwrap();
+            for mode in 0..3 {
+                let active = if mode == 2 { (rows / 2).max(1) } else { rows };
+                if mode > 0 {
+                    be.upload(&output, 0, bytemuck::cast_slice(&output_poison))
+                        .unwrap();
+                    let s = if mode == 2 {
+                        splits.saturating_sub(1).max(1)
+                    } else {
+                        splits
+                    };
+                    be.upload(
+                        &dynamic,
+                        0,
+                        bytemuck::cast_slice(&[active as u32, 16, 32, s]),
+                    )
+                    .unwrap();
+                    be.graph_launch(&graph, &stream).unwrap();
+                    be.stream_synchronize(&stream).unwrap();
+                }
+                let mut actual = output_poison.clone();
+                be.download(&output, 0, bytemuck::cast_slice_mut(&mut actual))
+                    .unwrap();
+                let mut max_error = 0f64;
+                for (i, &bits) in actual[..active * HEADS * HD].iter().enumerate() {
+                    let value = f32::from_bits(u32::from(bits) << 16);
+                    assert!(
+                        value.is_finite(),
+                        "rows={rows} context={context} mode={mode} index={i}"
+                    );
+                    let error = (f64::from(value) - reference[i]).abs();
+                    max_error = max_error.max(error);
+                    let f = (reference[i] as f32).to_bits();
+                    let expected = (f.wrapping_add(0x7fff + ((f >> 16) & 1)) >> 16) as u16;
+                    let ordered = |b: u16| if b & 0x8000 == 0 { b | 0x8000 } else { !b };
+                    assert!(error <= 1e-5 || ordered(bits).abs_diff(ordered(expected)) <= 1,
+                        "rows={rows} context={context} mode={mode} index={i} actual={value} reference={} error={error}", reference[i]);
+                }
+                assert!(
+                    actual[active * HEADS * HD..].iter().all(|&x| x == 0x7fc0),
+                    "rider wrote outside active rows"
+                );
+                eprintln!("hd128 attention: rows={rows} active={active} context={context} splits={splits} mode={mode} max_abs_error={max_error}");
+            }
+            be.graph_destroy(graph);
+        }
+        be.module_unload(&module).unwrap();
+    }
 }
