@@ -691,7 +691,8 @@ static uint16_t bf16_rn(float f) {
 /* Appends the wgmma pre-split image (Conv1dF32 flags bit 18) of f32 weights [n][k]: at the next
  * 1024-byte boundary, per 64-column k-tile the hi then lo bf16 halves of n rows padded to 128,
  * each row's 16-byte chunk c at chunk c ^ (row & 7). */
-static void append_wsplit(std::vector<uint8_t>& w, unsigned n, unsigned k) {
+static void append_wsplit(std::vector<uint8_t>& w, unsigned n, unsigned k, unsigned channel_kernel = 0) {
+    if (channel_kernel && (k % channel_kernel || (k / channel_kernel) % 64u)) exit(2);
     const size_t base = (w.size() + 1023) & ~(size_t)1023, np = (n + 127) & ~127u, kt = (k + 63) / 64;
     std::vector<float> f(w.size() / 4);
     memcpy(f.data(), w.data(), f.size() * 4);
@@ -699,7 +700,9 @@ static void append_wsplit(std::vector<uint8_t>& w, unsigned n, unsigned k) {
     for (size_t t = 0; t < kt; t++)
         for (size_t r = 0; r < n; r++)
             for (size_t j = 0; j < 64 && t * 64 + j < k; j++) {
-                const float v = f[r * k + t * 64 + j];
+                const size_t col = channel_kernel ? ((t / channel_kernel) * 64u + j) * channel_kernel + t % channel_kernel
+                                                   : t * 64 + j;
+                const float v = f[r * k + col];
                 const uint16_t hi = bf16_rn(v);
                 const uint32_t hb = (uint32_t)hi << 16;
                 float hf;
@@ -738,7 +741,8 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     /* ConvTranspose: the merged-phase image [stride*cout][2*cin] of phase-major weights. */
     const bool wsplit = s.wg && s.groups == 1 && !s.f16 && (!transpose || (s.tapmajor && s.kernel == 2 * s.stride));
     if (wsplit && transpose) append_wsplit(c.host[w], s.stride * s.cout, 2 * s.cin);
-    else if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel);
+    else if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel,
+        !s.tapmajor && s.kernel > 1u && s.cin % 64u == 0u ? s.kernel : 0u);
     unsigned b = s.bias ? c.f32(s.cout, 0.2f) : PLOW_TENSOR_NONE;
     unsigned a = s.alpha ? c.f32(s.dual ? s.cin + s.cout : std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
@@ -800,6 +804,29 @@ static void t_conv_padding() {
                 printf("  %-34s finite -> %s\n", name, finite ? "PASS" : "FAIL");
                 if (!finite) g_fail = 1;
             }
+    for (unsigned cin : {64u, 128u})
+        for (unsigned kernel : {3u, 5u}) {
+            const unsigned pad = kernel - 1u;
+            ConvSpec s{5, 129, cin, 96, kernel, 1, 2, 1, pad, pad,
+                       0, 0, 0, false, true, false, true, {129, 93, 17, 1, 0}, 0.f, true};
+            s.wide = s.wg = true;
+            Case c; unsigned o;
+            build_conv(c, s, false, o);
+            float* x = (float*)c.host[c.in.t[1]].data();
+            for (unsigned b = 0; b < s.batch; b++)
+                for (unsigned t = s.lengths[b]; t < s.in_rows; t++)
+                    for (unsigned ch = 0; ch < cin; ch++) x[((size_t)b * s.in_rows + t) * cin + ch] = NAN;
+            char name[96];
+            snprintf(name, sizeof(name), "Conv1dF32 channel64 c%u k%u poison", cin, kernel);
+            run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
+            std::vector<float> got(c.host[o].size() / 4);
+            CK(cudaMemcpy(got.data(), c.dev[o], c.host[o].size(), cudaMemcpyDeviceToHost));
+            const float* ref = (const float*)c.host[o].data();
+            bool finite = true;
+            for (size_t i = 0; i < got.size(); i++) finite &= std::isfinite(got[i]) && std::isfinite(ref[i]);
+            printf("  %-34s finite -> %s\n", name, finite ? "PASS" : "FAIL");
+            if (!finite) g_fail = 1;
+        }
 }
 
 static void t_unary() {
@@ -1869,7 +1896,40 @@ __global__ void k_bf16_mma_replay(const float* x, const float* w, const float* b
     }
 }
 
-static int t_bf16_mma_replay(const char* input, const char* output) {
+static void native_bf16_dense_replay(const std::vector<float>& x, const std::vector<float>& w,
+                                     const std::vector<float>& bias, std::vector<float>& actual,
+                                     unsigned M, unsigned N, unsigned K, unsigned span, unsigned mode, unsigned step) {
+    std::vector<float> total((size_t)M * N, 0.f), partial(total.size());
+    for (unsigned lo = 0; lo < K; lo += span) {
+        const unsigned width = std::min(span, K - lo), padded = (width + 7u) & ~7u;
+        Case c;
+        const unsigned a = c.add((size_t)M * padded * 4u), b = c.add((size_t)N * padded * 2u), o = c.out(total.size());
+        for (unsigned row = 0; row < M; row++)
+            memcpy(c.host[a].data() + (size_t)row * padded * 4u, x.data() + (size_t)row * K + lo, width * 4u);
+        auto* wb = (uint16_t*)c.host[b].data();
+        for (unsigned row = 0; row < N; row++) for (unsigned col = 0; col < width; col++)
+            wb[(size_t)row * padded + col] = f2bf(w[(size_t)row * K + lo + col]);
+        c.in.op = PLOW_DOP_DENSE_GEMM_F32;
+        c.in.t[0] = o; c.in.t[1] = a; c.in.t[2] = b;
+        c.in.i[0] = M; c.in.i[1] = N; c.in.i[2] = padded;
+        const bool round = mode == 1u || (mode == 2u && lo == 0u);
+        c.in.i[7] = 4u | 8u | 0x800u | (step == 8u ? 0x1000u : 0u) | (unsigned)round;
+        c.upload();
+        void** table = upload_table(c.dev);
+        k_speech<<<g_nblk, 256, kSmem>>>(c.in, table);
+        CK(cudaGetLastError());
+        CK(cudaMemcpy(partial.data(), c.dev[o], partial.size() * 4u, cudaMemcpyDeviceToHost));
+        CK(cudaFree(table));
+        for (size_t i = 0; i < total.size(); i++) {
+            total[i] += partial[i];
+            if (mode == 2u) total[i] = plow_bf2f(f2bf(total[i]));
+        }
+    }
+    for (size_t i = 0; i < actual.size(); i++)
+        actual[i] = plow_bf2f(f2bf(plow_bf2f(f2bf(total[i])) + bias[i % N]));
+}
+
+static int t_bf16_mma_replay(const char* input, const char* output, bool native = false) {
     FILE* in = fopen(input, "rb");
     FILE* out = fopen(output, "wb");
     if (!in || !out) { perror("BF16 MMA fixture"); return 2; }
@@ -1902,20 +1962,25 @@ static int t_bf16_mma_replay(const char* input, const char* output) {
             uint32_t bits; memcpy(&bits, &v, 4);
             if (!std::isfinite(v) || (bits & 0xffffu)) return 2;
         }
-        float *dx, *dw, *db, *dy;
-        CK(cudaMalloc(&dx, x.size() * 4u)); CK(cudaMalloc(&dw, w.size() * 4u));
-        CK(cudaMalloc(&db, bias.size() * 4u)); CK(cudaMalloc(&dy, actual.size() * 4u));
-        CK(cudaMemcpy(dx, x.data(), x.size() * 4u, cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(dw, w.data(), w.size() * 4u, cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(db, bias.data(), bias.size() * 4u, cudaMemcpyHostToDevice));
+        float *dx = nullptr, *dw = nullptr, *db = nullptr, *dy = nullptr;
+        if (!native) {
+            CK(cudaMalloc(&dx, x.size() * 4u)); CK(cudaMalloc(&dw, w.size() * 4u));
+            CK(cudaMalloc(&db, bias.size() * 4u)); CK(cudaMalloc(&dy, actual.size() * 4u));
+            CK(cudaMemcpy(dx, x.data(), x.size() * 4u, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dw, w.data(), w.size() * 4u, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(db, bias.data(), bias.size() * 4u, cudaMemcpyHostToDevice));
+        }
         write(shape, sizeof(shape));
         const unsigned blocks = ((((M + 15u) / 16u) * ((N + 7u) / 8u)) + 7u) / 8u;
         for (unsigned variant = 0; variant < 2u; variant++) {
-            CK(cudaMemset(dy, 0xff, actual.size() * 4u));
-            if (variant == 0u) k_bf16_mma_replay<8><<<blocks, 256>>>(dx, dw, db, dy, M, N, K, span, mode);
-            else k_bf16_mma_replay<16><<<blocks, 256>>>(dx, dw, db, dy, M, N, K, span, mode);
-            CK(cudaGetLastError());
-            CK(cudaMemcpy(actual.data(), dy, actual.size() * 4u, cudaMemcpyDeviceToHost));
+            if (native) native_bf16_dense_replay(x, w, bias, actual, M, N, K, span, mode, variant == 0u ? 8u : 16u);
+            else {
+                CK(cudaMemset(dy, 0xff, actual.size() * 4u));
+                if (variant == 0u) k_bf16_mma_replay<8><<<blocks, 256>>>(dx, dw, db, dy, M, N, K, span, mode);
+                else k_bf16_mma_replay<16><<<blocks, 256>>>(dx, dw, db, dy, M, N, K, span, mode);
+                CK(cudaGetLastError());
+                CK(cudaMemcpy(actual.data(), dy, actual.size() * 4u, cudaMemcpyDeviceToHost));
+            }
             size_t changed = 0;
             for (size_t i = 0; i < actual.size(); i++) {
                 finite = finite && std::isfinite(actual[i]);
@@ -1924,10 +1989,10 @@ static int t_bf16_mma_replay(const char* input, const char* output) {
             differences[variant] += changed;
             exact[variant] += changed == 0;
             write(actual.data(), actual.size() * 4u);
-            printf("mma_replay case=%u kstep=%u rows=%u width=%u k=%u span=%u mode=%u changed=%zu\n",
-                   item, variant == 0u ? 8u : 16u, M, N, K, span, mode, changed);
+            printf("mma_replay case=%u backend=%s kstep=%u rows=%u width=%u k=%u span=%u mode=%u changed=%zu\n",
+                   item, native ? "native_dense_cpu_reduce" : "intrinsic", variant == 0u ? 8u : 16u, M, N, K, span, mode, changed);
         }
-        CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(db)); CK(cudaFree(dy));
+        if (!native) { CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(db)); CK(cudaFree(dy)); }
     }
     if (fgetc(in) != EOF || ferror(in) || fclose(in) != 0 || fclose(out) != 0) return 2;
     printf("mma_replay cases=%u k8_exact=%zu k16_exact=%zu k8_differences=%zu k16_differences=%zu finite=%u\n",
@@ -1946,6 +2011,7 @@ int main(int argc, char** argv) {
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
 
     if (argc == 4 && !strcmp(argv[1], "--bf16-mma-replay")) return t_bf16_mma_replay(argv[2], argv[3]);
+    if (argc == 4 && !strcmp(argv[1], "--bf16-native-replay")) return t_bf16_mma_replay(argv[2], argv[3], true);
 
     if (argc > 1 && !strcmp(argv[1], "--conv-padding-only")) {
         t_conv_padding();

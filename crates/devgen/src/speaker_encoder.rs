@@ -7,9 +7,9 @@ use std::path::Path;
 
 use crate::fish_codec::Seq;
 use crate::pipeline::{
-    Activation, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, DenseActivation,
-    DenseF32ProgramStage, DenseWeight, GatherRowsF32Stage, LengthAffineU32Stage, PacketPrefix,
-    PadMode, ReduceRowsF32Stage, ReduceRowsOp, TensorRef, UnaryF32Stage,
+    Activation, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, DenseAccumulation,
+    DenseActivation, DenseF32ProgramStage, DenseWeight, GatherRowsF32Stage, LengthAffineU32Stage,
+    PacketPrefix, PadMode, ReduceRowsF32Stage, ReduceRowsOp, TensorRef, UnaryF32Stage,
 };
 
 pub const PACKET: &str = "speaker_encoder.pkt";
@@ -22,6 +22,7 @@ const CAPACITIES: &[u32] = &[128, 256, 512, 1024, 2048];
 #[serde(rename_all = "snake_case")]
 enum PointwiseReduction {
     FullF32,
+    ParallelF32,
     ParallelBf16,
     SerialBf16,
 }
@@ -33,6 +34,8 @@ struct PointwisePlan {
     output_width: u32,
     span: u32,
     reduction: PointwiseReduction,
+    #[serde(default)]
+    accumulation: DenseAccumulation,
 }
 
 #[derive(serde::Deserialize)]
@@ -63,6 +66,8 @@ struct Cfg {
     frontend: serde_json::Value,
     #[serde(default)]
     pointwise_arithmetic: Option<Vec<PointwiseRow>>,
+    #[serde(default)]
+    first_conv_channel_tile: u32,
 }
 
 impl Cfg {
@@ -77,7 +82,8 @@ impl Cfg {
             "log_floor": 1e-5, "sentence_normalize": false
         });
         if c.model_type != "ecapa_tdnn"
-            || !matches!(c.version, 1 | 2 | 3)
+            || !matches!(c.version, 1 | 2 | 3 | 4)
+            || c.first_conv_channel_tile != if c.version == 4 { 64 } else { 0 }
             || n < 3
             || c.kernel_sizes.len() != n
             || c.dilations.len() != n
@@ -132,12 +138,15 @@ impl Cfg {
         if min > max || rows.len() != (max - min + 1) as usize {
             return Err(bad());
         }
-        let expected = std::collections::BTreeSet::from([
+        let mut expected = std::collections::BTreeSet::from([
             (self.channels[0], self.channels[0]),
             (self.width(), self.width()),
             (self.width() * 3, self.attention_channels),
             (self.attention_channels, self.width()),
         ]);
+        if self.version == 4 {
+            expected.insert((self.width() * 2, self.embedding_dim));
+        }
         for (i, row) in rows.iter().enumerate() {
             if row.rows != min + i as u32
                 || row.kernels.len() != expected.len()
@@ -151,6 +160,11 @@ impl Cfg {
                     p.span == 0
                         || p.span > p.input_width
                         || (p.reduction == PointwiseReduction::FullF32 && p.span != p.input_width)
+                        || (self.version < 4
+                            && (p.reduction == PointwiseReduction::ParallelF32
+                                || p.accumulation != DenseAccumulation::Native))
+                        || (p.accumulation != DenseAccumulation::Native
+                            && (!p.span.is_multiple_of(8) || !p.input_width.is_multiple_of(8)))
                 })
             {
                 return Err(bad());
@@ -174,7 +188,7 @@ impl Cfg {
     }
 
     fn input_pad(&self) -> u32 {
-        if self.version == 3 {
+        if self.version >= 3 {
             (self.kernel_sizes[0] - 1) * self.dilations[0] / 2
         } else {
             0
@@ -267,8 +281,8 @@ pub fn lower_speaker_encoder(
                     .collect(),
             );
         } else if let Some(name) = tensor.name.strip_prefix("w.") {
-            let (dtype, bytes) = reader.read(name)?;
-            let split = cfg.version == 3 && name == "blocks.0.conv.weight";
+            let (dtype, mut bytes) = reader.read(name)?;
+            let split = cfg.version >= 3 && name == "blocks.0.conv.weight";
             let expected = if split {
                 u64::from(cfg.channels[0]) * 128 * u64::from(cfg.kernel_sizes[0]) * 4
             } else {
@@ -287,7 +301,26 @@ pub fn lower_speaker_encoder(
                     tensor.bytes
                 ));
             }
-            let bytes = if split {
+            let bytes = if split && cfg.version == 4 {
+                let kernel = cfg.kernel_sizes[0] as usize;
+                let mut reordered = vec![0; bytes.len()];
+                for out in 0..cfg.channels[0] as usize {
+                    for channel in 0..128 {
+                        for tap in 0..kernel {
+                            let src = (out * 128 * kernel + tap * 128 + channel) * 4;
+                            let dst = (out * 128 * kernel + channel * kernel + tap) * 4;
+                            reordered[dst..dst + 4].copy_from_slice(&bytes[src..src + 4]);
+                        }
+                    }
+                }
+                bytes = reordered;
+                crate::pipeline::wgmma_weight_split_channel_tiled(
+                    &bytes,
+                    cfg.channels[0],
+                    128,
+                    cfg.kernel_sizes[0],
+                )
+            } else if split {
                 crate::pipeline::wgmma_weight_split(
                     &bytes,
                     cfg.channels[0],
@@ -360,6 +393,7 @@ struct Encoder<'a> {
     input_pad: u32,
     padded_length: Option<u32>,
     reflected_bf16: bool,
+    version: u32,
 }
 
 impl Encoder<'_> {
@@ -525,9 +559,11 @@ impl Encoder<'_> {
                     input_width: width,
                     output_width: plan.output_width,
                     activation: DenseActivation::None,
-                    round_bf16: out.is_none() || plan.reduction == PointwiseReduction::ParallelBf16,
+                    round_bf16: plan.reduction == PointwiseReduction::ParallelBf16
+                        || (out.is_none() && plan.reduction == PointwiseReduction::SerialBf16),
                     weight_type: DenseWeight::Bf16,
                     operands_bf16_exact: true,
+                    accumulation: plan.accumulation,
                     tf32x3: false,
                     layer_norm: None,
                     split_k: false,
@@ -575,7 +611,7 @@ impl Encoder<'_> {
             (rows != 1).then_some(self.length)
         };
         let pad = (kernel - 1) * dilation / 2;
-        let plan = (!padded && rows != 1 && kernel == 1)
+        let plan = (!padded && (rows != 1 || self.version == 4) && kernel == 1)
             .then(|| {
                 self.arithmetic
                     .iter()
@@ -583,7 +619,10 @@ impl Encoder<'_> {
             })
             .flatten()
             .copied();
-        let out = if let Some(plan) = plan.filter(|p| p.reduction != PointwiseReduction::FullF32) {
+        let out = if let Some(plan) = plan.filter(|p| {
+            p.reduction != PointwiseReduction::FullF32
+                || p.accumulation != DenseAccumulation::Native
+        }) {
             self.partitioned_pointwise(x, out_name, &weight_name, rows, plan)?
         } else {
             let e = self.seq.p().conv1d_f32(
@@ -617,7 +656,7 @@ impl Encoder<'_> {
                     slope: 0.0,
                     weight_f16: false,
                     split_bf16: padded || (self.reflected_bf16 && kernel > 1),
-                    weight_tap_major: true,
+                    weight_tap_major: !(padded && self.version == 4),
                     wgmma: padded,
                     weight_split: padded,
                     dual_alpha: false,
@@ -722,7 +761,7 @@ fn program(
 ) -> Result<PacketPrefix, String> {
     let input = prefix.input;
     let mut p = prefix.program();
-    let padded_length = if cfg.version == 3 {
+    let padded_length = if cfg.version >= 3 {
         Some(p.length_affine_u32(
             length,
             &[],
@@ -766,7 +805,8 @@ fn program(
         arithmetic,
         input_pad: cfg.input_pad(),
         padded_length: padded_length.map(|p| p.output),
-        reflected_bf16: cfg.version == 3,
+        reflected_bf16: cfg.version >= 3,
+        version: cfg.version,
     };
     let c = cfg.channels[0];
     let mut h = enc.conv(
@@ -1087,7 +1127,7 @@ fn section(
                     ),
                     ("audio.max_samples".into(), (u64::from(max) + 1) * 256 - 1),
                 ]);
-                if cfg.version == 3 {
+                if cfg.version >= 3 {
                     parameters.insert("input.reflect_pad".into(), u64::from(cfg.input_pad()));
                 }
                 parameters
@@ -1191,6 +1231,95 @@ mod tests {
         let mut bad = v;
         bad["pointwise_arithmetic"][0]["kernels"][1] =
             bad["pointwise_arithmetic"][0]["kernels"][0].clone();
+        assert!(parse(&bad).is_err());
+    }
+
+    #[test]
+    fn explicit_f32_partitions_keep_projection_and_reflected_input_contracts() {
+        use packet::dev::DevOp;
+        let mut v = config();
+        v["version"] = 4.into();
+        v["first_conv_channel_tile"] = 64.into();
+        v["attention_channels"] = 8.into();
+        let kernels: Vec<_> = [(8, 8, 8), (16, 16, 8), (48, 8, 16), (8, 16, 8), (32, 6, 16)]
+            .into_iter()
+            .map(|(input, output, span)| {
+                serde_json::json!({
+                    "input_width":input,"output_width":output,"span":span,
+                    "reduction":if span == input { "full_f32" } else { "parallel_f32" },
+                    "accumulation":if output == 6 { "continuous16" } else { "continuous8" }
+                })
+            })
+            .collect();
+        v["pointwise_arithmetic"] = (4..=2048)
+            .map(|rows| serde_json::json!({"rows":rows,"kernels":kernels}))
+            .collect::<Vec<_>>()
+            .into();
+        let parse = |v: &serde_json::Value| Cfg::parse(&serde_json::to_vec(v).unwrap());
+        let cfg = parse(&v).unwrap();
+        let (mut prefix, length, reciprocal) = prefix();
+        prefix.model.tensors[prefix.input as usize].bytes = 132 * 128 * 4;
+        prefix.input_shape = vec![132, 128];
+        let p = program(
+            prefix,
+            &cfg,
+            128,
+            length,
+            reciprocal,
+            &cfg.pointwise_arithmetic.as_ref().unwrap()[0].kernels,
+        )
+        .unwrap();
+        plow_asset::program::with_model(&p.model, |packet| {
+            plow_asset::logical_effects::obligation(packet, 0).unwrap();
+        });
+        let first = p.model.progs[0]
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::Conv1dF32 as u16)
+            .unwrap();
+        assert_eq!(first.i[1], 132);
+        assert_eq!(first.j[1] & (1 << 15), 0);
+        assert_eq!(
+            first.j[1] & ((1 << 14) | (1 << 17) | (1 << 18)),
+            (1 << 14) | (1 << 17) | (1 << 18)
+        );
+        let dense: Vec<_> = p.model.progs[0]
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::DenseGemmF32 as u16)
+            .collect();
+        assert!(!dense.is_empty());
+        assert!(dense.iter().all(|d| d.i[7] & 1 == 0));
+        let projection: Vec<_> = dense
+            .iter()
+            .filter(|d| d.i[0] == 1 && d.i[1] == 6)
+            .collect();
+        assert_eq!(projection.len(), 2);
+        assert!(projection
+            .iter()
+            .all(|d| d.i[2] == 16 && d.i[7] & 0x1800 == 0x800));
+        let metadata = section(
+            &p,
+            &cfg,
+            BTreeMap::from([("encode.r128.n4".into(), 0)]),
+            length,
+            128,
+        )
+        .unwrap();
+        let metadata: plow_asset::packet_pipeline::PacketPipelines =
+            serde_json::from_slice(&metadata.data).unwrap();
+        assert_eq!(metadata.pipelines[0].driver, PADDED_DRIVER);
+        assert_eq!(metadata.pipelines[0].parameters["input.reflect_pad"], 2);
+        for (key, value) in [
+            ("first_conv_channel_tile", serde_json::json!(32)),
+            ("version", serde_json::json!(3)),
+        ] {
+            let mut bad = v.clone();
+            bad[key] = value;
+            assert!(parse(&bad).is_err());
+        }
+        let mut bad = v;
+        bad["pointwise_arithmetic"][0]["kernels"][0]["span"] = 3.into();
         assert!(parse(&bad).is_err());
     }
 
@@ -1318,6 +1447,7 @@ mod tests {
                     output_width: 8,
                     span: 3,
                     reduction,
+                    accumulation: DenseAccumulation::Native,
                 }],
             )
             .unwrap();

@@ -215,6 +215,26 @@ pub struct RowStatsF32Stage<'a> {
     pub ordered_statistics: bool,
 }
 
+/// Accumulation hint for exact BF16 dense operands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenseAccumulation {
+    #[default]
+    Native,
+    Continuous8,
+    Continuous16,
+}
+
+impl DenseAccumulation {
+    fn flags(self) -> u32 {
+        match self {
+            Self::Native => 0,
+            Self::Continuous8 => (1 << 11) | (1 << 12),
+            Self::Continuous16 => 1 << 11,
+        }
+    }
+}
+
 /// DenseGemmF32 inside a [`StageProgram`] (no split-K: ops of one program may overlap).
 #[derive(Clone, Copy)]
 pub struct DenseF32ProgramStage<'a> {
@@ -229,6 +249,7 @@ pub struct DenseF32ProgramStage<'a> {
     pub weight_type: DenseWeight,
     /// Input (after any prologue) and f32 weights are bf16-representable: bf16 tensor cores.
     pub operands_bf16_exact: bool,
+    pub accumulation: DenseAccumulation,
     /// Otherwise run 3xTF32 tensor cores (FP32-accurate) instead of FP32 FFMA.
     pub tf32x3: bool,
     pub layer_norm: Option<DenseLayerNorm<'a>>,
@@ -564,6 +585,33 @@ pub struct Conv1dF32Stage<'a> {
 /// k-tile the bf16 hi halves then the lo halves (`lo = bf16(v - hi)`, both round-to-nearest-even)
 /// of `n` rows padded to 128, each row 128 bytes whose 16-byte chunk `c` sits at `c ^ (row & 7)`.
 pub fn wgmma_weight_split(weights: &[u8], n: u32, k: u32) -> Vec<u8> {
+    wgmma_weight_split_order(weights, n, k, |j| j)
+}
+
+/// Channel-major raw weights with the WGMMA image ordered by channel tile, tap, channel.
+pub fn wgmma_weight_split_channel_tiled(
+    weights: &[u8],
+    n: u32,
+    channels: u32,
+    kernel: u32,
+) -> Vec<u8> {
+    assert!(channels.is_multiple_of(64) && kernel > 1);
+    let k = channels
+        .checked_mul(kernel)
+        .expect("convolution K overflows");
+    assert_eq!(weights.len() as u64, u64::from(n) * u64::from(k) * 4);
+    wgmma_weight_split_order(weights, n, k, |j| {
+        let (channel, tap) = (j / kernel as usize, j % kernel as usize);
+        (channel / 64 * kernel as usize + tap) * 64 + channel % 64
+    })
+}
+
+fn wgmma_weight_split_order(
+    weights: &[u8],
+    n: u32,
+    k: u32,
+    order: impl Fn(usize) -> usize,
+) -> Vec<u8> {
     let (n, k) = (n as usize, k as usize);
     let (base, np, tiles) = (
         weights.len().next_multiple_of(1024),
@@ -574,6 +622,7 @@ pub fn wgmma_weight_split(weights: &[u8], n: u32, k: u32) -> Vec<u8> {
     out.resize(base + tiles * 2 * np * 128, 0);
     for (r, row) in weights.chunks_exact(4 * k).enumerate().take(n) {
         for (j, v) in row.chunks_exact(4).enumerate() {
+            let j = order(j);
             let v = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
             let hi = crate::config::bf16_round(v);
             let lo = crate::config::bf16_round(v - hi);
@@ -596,6 +645,23 @@ fn wgmma_weight_split_bytes(f32_bytes: u64, n: u32, k: u32) -> u64 {
 }
 
 impl Conv1dF32Stage<'_> {
+    pub fn channel_tiled_wgmma_ok(&self) -> bool {
+        self.wgmma
+            && self.split_bf16
+            && self.weight_split
+            && !self.weight_tap_major
+            && !self.weight_f16
+            && self.groups == 1
+            && self.kernel > 1
+            && self.stride == 1
+            && self.pad_mode == PadMode::Zero
+            && self.in_channels.is_multiple_of(64)
+            && self.out_channels.is_multiple_of(4)
+            && self.input_activation == Activation::None
+            && self.output_activation == Activation::None
+            && self.alpha.is_none()
+    }
+
     /// A transposed conv the merged-phase wgmma path takes (flag bits 17 | 18; op_speech_f32.cuh
     /// `spg_ct_eligible`).
     pub fn convt_wgmma_ok(&self) -> bool {
@@ -1834,7 +1900,9 @@ impl StageProgram {
                 && (stage.groups != 1
                     || stage.weight_f16
                     || !(stage.wgmma && stage.split_bf16)
-                    || !(stage.kernel == 1 || stage.weight_tap_major)))
+                    || !(stage.kernel == 1
+                        || stage.weight_tap_major
+                        || stage.channel_tiled_wgmma_ok())))
         {
             return Err("invalid convolution geometry".into());
         }
@@ -2486,6 +2554,14 @@ impl StageProgram {
         if stage.rows == 0 || stage.input_width == 0 || stage.output_width == 0 {
             return Err("invalid dense geometry".into());
         }
+        if stage.accumulation != DenseAccumulation::Native
+            && (stage.weight_type != DenseWeight::Bf16
+                || !stage.operands_bf16_exact
+                || stage.layer_norm.is_some()
+                || !stage.input_width.is_multiple_of(8))
+        {
+            return Err("continuous dense accumulation requires plain exact BF16 operands".into());
+        }
         self.input(
             x,
             f32_bytes(product(&[stage.rows, stage.input_width])?)?,
@@ -2545,6 +2621,7 @@ impl StageProgram {
             | (u32::from(!tensor_cores && stage.tf32x3) << 4)
             | (u32::from(stage.layer_norm.is_some()) << 5)
             | (u32::from(ln_round) << 6)
+            | stage.accumulation.flags()
             | stage.post.map_or(0, |p| {
                 u32::from(p.clamp) << 8
                     | u32::from(p.silu_round) << 9
@@ -2795,6 +2872,7 @@ fn conv1d_splitk(
     n_cu: u32,
 ) -> Option<u64> {
     if transpose
+        || stage.channel_tiled_wgmma_ok()
         || stage.groups != 1
         || !matches!(stage.output_activation, Activation::None)
         || !(stage.wgmma && stage.split_bf16 && stage.weight_split)
@@ -2899,6 +2977,84 @@ fn repeated(n_cu: u32, blocks: u32) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_dense_requires_exact_bf16_storage() {
+        for (accumulation, bits) in [
+            (DenseAccumulation::Native, 0),
+            (DenseAccumulation::Continuous8, 0x1800),
+            (DenseAccumulation::Continuous16, 0x800),
+        ] {
+            for weight_type in [DenseWeight::F32, DenseWeight::Bf16] {
+                for exact in [false, true] {
+                    let (prefix, h) = prefix_with(&[("x", 3 * 16 * 4)]);
+                    let mut p = prefix.program();
+                    let stage = DenseF32ProgramStage {
+                        output: TensorRef::Named("y"),
+                        weight: TensorRef::Named("w"),
+                        bias: None,
+                        rows: 3,
+                        input_width: 16,
+                        output_width: 5,
+                        activation: DenseActivation::None,
+                        round_bf16: false,
+                        weight_type,
+                        operands_bf16_exact: exact,
+                        accumulation,
+                        tf32x3: false,
+                        layer_norm: None,
+                        split_k: false,
+                        post: None,
+                    };
+                    let result = p.dense_f32(h[0], &[], stage);
+                    if accumulation != DenseAccumulation::Native
+                        && (weight_type != DenseWeight::Bf16 || !exact)
+                    {
+                        assert!(result.is_err());
+                    } else {
+                        result.unwrap();
+                        let model = p.finish(3);
+                        assert_eq!(model.model.progs[0].insts[0].i[7] & 0x1800, bits);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn channel_tiled_split_image_preserves_raw_weights_and_zero_tails() {
+        let (n, channels, kernel) = (3usize, 128usize, 3usize);
+        let k = channels * kernel;
+        let raw: Vec<u8> = (0..n * k)
+            .flat_map(|i| (((0x3b00u32 + i as u32) << 16).to_le_bytes()))
+            .collect();
+        let packed =
+            wgmma_weight_split_channel_tiled(&raw, n as u32, channels as u32, kernel as u32);
+        assert_eq!(&packed[..raw.len()], &raw);
+        let base = raw.len().next_multiple_of(1024);
+        assert_eq!(packed.len(), base + k / 64 * 2 * 128 * 128);
+        for row in 0..128 {
+            for col in 0..k {
+                let channel = col / (kernel * 64) * 64 + col % 64;
+                let tap = col / 64 % kernel;
+                let at = base
+                    + (col / 64) * 2 * 128 * 128
+                    + row * 128
+                    + ((col % 64 / 8) ^ (row & 7)) * 16
+                    + col % 8 * 2;
+                let want = if row < n {
+                    (0x3b00 + row * k + channel * kernel + tap) as u16
+                } else {
+                    0
+                };
+                assert_eq!(
+                    u16::from_le_bytes(packed[at..at + 2].try_into().unwrap()),
+                    want
+                );
+                assert_eq!(&packed[at + 128 * 128..at + 128 * 128 + 2], &[0, 0]);
+            }
+        }
+    }
 
     #[test]
     fn convt_wgmma_split_geometry() {

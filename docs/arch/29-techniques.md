@@ -1135,6 +1135,10 @@ fastconformer RNNT, fish-s2.
   zero-padding convolution route without changing device instructions.
   The CUDA wide convolution path also supports reflection and replication against actual
   lengths; its zero-padding specialization keeps the original operand-load expressions.
+  CUDA dense hints select continuous K8/K16 BF16 matrix accumulation, including unrounded
+  F32 partial reductions. Channel-major wide convolution can consume a channel-tile64 split
+  image while preserving the raw weight prefix for other implementations. CPU retains its
+  scalar accumulation; neither matching arithmetic nor performance is qualified there.
   Numerical qualification remains required; no native performance win is implied.
   AMD lacks these speech arms. A speaker packet alone does not bind a live cloning request.
 - **Static speech slot-prefix reuse**: CUDA implements the experimental
