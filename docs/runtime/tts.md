@@ -649,10 +649,15 @@ temporal reductions use the actual length. The F32 `embedding` output holds BF16
 The checkpoint declares BF16 tensor boundaries, including rounding a convolution result before
 the separate bias addition. Population statistics preserve the rounded weighting, products,
 subtractions, squares and sums. Batch normalization and output L2 normalization are absent.
-The packet carries frontend mel/window tables and its `audio.frontend` description; its input
-still requires the frontend to have run. Emitting this packet does not enable voice cloning in
-the speech API: frontend, conditioning metadata and request binding remain separate requirements.
-Numerical qualification of the speaker packet is still incomplete.
+The packet binds the shared [log-mel frontend](asr-packet-contract.md#shared-log-mel-frontend)
+through `audio.frontend.kind = 2`, `audio.frontend.filterbank` and
+`audio.frontend.window_values`: 24 kHz PCM, FFT/window 1024, hop 256, reflect padding 384,
+`sqrt(power + 1e-9)`, then filterbank projection and natural log with floor `1e-5`.
+It emits `floor(samples / 256)` rows, without sentence normalization. The `audio.frontend`
+string records the source description; the typed parameters and tensor bindings drive execution.
+Emitting this packet does not enable voice cloning in the speech API: conditioning metadata,
+request binding and codec priming remain separate requirements.
+The speaker and PCM-frontend numerical gates are not yet met.
 
 ## Concurrency
 

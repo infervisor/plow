@@ -736,11 +736,11 @@ fn section(
                     ),
                 ),
                 (
-                    "frontend.mel".into(),
+                    "audio.frontend.filterbank".into(),
                     named("w.frontend.mel", vec![128, 513]),
                 ),
                 (
-                    "frontend.window".into(),
+                    "audio.frontend.window_values".into(),
                     named("w.frontend.window", vec![1024]),
                 ),
             ]),
@@ -749,6 +749,38 @@ fn section(
                 ("input.max_rows".into(), u64::from(max)),
                 ("input.width".into(), 128),
                 ("output.width".into(), u64::from(cfg.embedding_dim)),
+                ("audio.frontend.kind".into(), 2),
+                ("audio.sample_rate".into(), 24_000),
+                ("audio.frontend.fft".into(), 1024),
+                ("audio.frontend.window".into(), 1024),
+                ("audio.frontend.hop".into(), 256),
+                ("audio.frontend.bins".into(), 128),
+                ("audio.frontend.preemphasis_f32".into(), 0),
+                ("audio.frontend.center_window".into(), 0),
+                ("audio.frontend.periodic_hann".into(), 1),
+                ("audio.frontend.normalize_per_feature".into(), 0),
+                ("audio.frontend.mask_invalid_frames".into(), 0),
+                (
+                    "audio.frontend.log_guard_f32".into(),
+                    u64::from(1e-5f32.to_bits()),
+                ),
+                ("audio.frontend.pad_reflect".into(), 1),
+                ("audio.frontend.drop_last_frame".into(), 0),
+                ("audio.frontend.log10".into(), 0),
+                ("audio.frontend.log_floor".into(), 1),
+                ("audio.frontend.dynamic_range_f32".into(), 0),
+                ("audio.frontend.scale_f32".into(), u64::from(1f32.to_bits())),
+                ("audio.frontend.shift_f32".into(), 0),
+                ("audio.frontend.pad_samples".into(), 384),
+                (
+                    "audio.frontend.magnitude_guard_f32".into(),
+                    u64::from(1e-9f32.to_bits()),
+                ),
+                (
+                    "audio.min_samples".into(),
+                    (u64::from(cfg.min_rows()?) * 256).max(385),
+                ),
+                ("audio.max_samples".into(), (u64::from(max) + 1) * 256 - 1),
             ]),
             strings: BTreeMap::from([("audio.frontend".into(), cfg.frontend.to_string())]),
         }],
@@ -822,6 +854,8 @@ mod tests {
         let input = b.tensor("in.spk.mel", 128 * 128 * 4);
         let length = b.tensor("in.spk.length", 4);
         let reciprocal = b.tensor("c.spk.reciprocal", 2049 * 4);
+        b.tensor("w.frontend.mel", 128 * 513 * 4);
+        b.tensor("w.frontend.window", 1024 * 4);
         let prefix = PacketPrefix {
             model: packet::devbuild::Model {
                 n_cu: 1,
@@ -878,6 +912,29 @@ mod tests {
         assert_eq!(
             prefix.model.tensors[prefix.output as usize].name,
             "act.spk.embedding"
+        );
+        let metadata = section(
+            &prefix,
+            &cfg,
+            BTreeMap::from([("encode.r128".into(), 0)]),
+            length,
+            128,
+        )
+        .unwrap();
+        let metadata: plow_asset::packet_pipeline::PacketPipelines =
+            serde_json::from_slice(&metadata.data).unwrap();
+        let pipeline = &metadata.pipelines[0];
+        assert_eq!(pipeline.parameters["audio.frontend.kind"], 2);
+        assert_eq!(pipeline.parameters["audio.frontend.pad_samples"], 384);
+        assert_eq!(pipeline.parameters["audio.min_samples"], 1024);
+        assert_eq!(pipeline.parameters["audio.max_samples"], 129 * 256 - 1);
+        assert_eq!(
+            pipeline.tensors["audio.frontend.filterbank"].shape,
+            [128, 513]
+        );
+        assert_eq!(
+            pipeline.tensors["audio.frontend.window_values"].shape,
+            [1024]
         );
     }
 }

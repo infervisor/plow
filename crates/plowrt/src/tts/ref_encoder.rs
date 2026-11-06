@@ -33,6 +33,80 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "SPEAKER_PACKET, SPEAKER_REFERENCE_JSON, SPEAKER_FRONTEND_RESULT_JSON and RUST_MIN_STACK=67108864; saved PCM frontend parity, CPU only"]
+    fn speaker_frontend_matches_trained_reference() {
+        let path = std::env::var("SPEAKER_PACKET").unwrap();
+        let reference = std::env::var("SPEAKER_REFERENCE_JSON").unwrap();
+        let result_path = std::env::var("SPEAKER_FRONTEND_RESULT_JSON").unwrap();
+        let runtime = crate::exec::cpu::engine::CpuEngine::load_packet(
+            Path::new(&path),
+            &crate::exec::cpu::engine::CpuEngineOpts {
+                threads: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let asset = PacketAsset::load(Path::new(&path)).unwrap();
+        let pipeline = asset.bind_driver("speaker.encode.v1", &runtime).unwrap();
+        let frontend =
+            crate::asr::frontend::PacketLogMelFrontend::bind(&pipeline, &runtime).unwrap();
+        assert_eq!(frontend.sample_rate(), 24_000);
+        let data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(reference).unwrap()).unwrap();
+        let mut results = Vec::new();
+        let mut all_pass = true;
+        for case in data["cases"].as_array().unwrap() {
+            let bytes = std::fs::read(case["path"].as_str().unwrap()).unwrap();
+            let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+            let pcm = tensors.tensor("pcm").unwrap();
+            let mel = tensors.tensor("mel").unwrap();
+            assert_eq!(pcm.dtype(), safetensors::Dtype::F32);
+            assert_eq!(mel.dtype(), safetensors::Dtype::F32);
+            assert_eq!(pcm.shape()[0], 1);
+            assert_eq!(&mel.shape()[..2], &[1, 128]);
+            let floats = |t: &safetensors::tensor::TensorView<'_>| -> Vec<f32> {
+                t.data()
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .collect()
+            };
+            let samples = floats(&pcm);
+            let expected = floats(&mel);
+            let got = frontend.extract(&samples).unwrap();
+            let rows = mel.shape()[2];
+            assert_eq!(got.frames, rows, "{}", case["case"]);
+            assert_eq!(got.bins, 128);
+            assert_eq!(got.values.len(), expected.len());
+            assert!(got.frames as u64 >= pipeline.parameter("input.min_rows").unwrap());
+            assert!(got.frames as u64 <= pipeline.parameter("input.max_rows").unwrap());
+            let mut max_abs = 0f32;
+            let mut error = 0f64;
+            let mut norm = 0f64;
+            for (i, &v) in got.values.iter().enumerate() {
+                let target = expected[(i % 128) * rows + i / 128];
+                max_abs = max_abs.max((v - target).abs());
+                error += (f64::from(v) - f64::from(target)).powi(2);
+                norm += f64::from(target).powi(2);
+            }
+            let relative_l2 = (error / norm).sqrt();
+            let pass =
+                got.values.iter().all(|v| v.is_finite()) && max_abs <= 2e-4 && relative_l2 <= 1e-5;
+            all_pass &= pass;
+            let row = serde_json::json!({"case": case["case"], "samples": samples.len(),
+                "frames": rows, "max_abs": max_abs, "relative_l2": relative_l2, "pass": pass});
+            println!("{row}");
+            results.push(row);
+        }
+        assert_eq!(results.len(), 4);
+        std::fs::write(result_path, serde_json::to_vec_pretty(&serde_json::json!({
+            "scope": "packet-bound F32 frontend vs saved trained reference, CPU only; no benchmark",
+            "max_abs_limit": 2e-4, "relative_l2_limit": 1e-5,
+            "pass": all_pass, "results": results,
+        })).unwrap()).unwrap();
+        assert!(all_pass, "speaker frontend numerical gate failed");
+    }
+
+    #[test]
     #[ignore = "SPEAKER_CHECKPOINT and SPEAKER_PACKET_OUT; trained CPU-only sidecar emit with approved Lean verifier"]
     fn emit_trained_speaker_packet() {
         devgen::install_sidecar_verifier(Box::new(|requests| {
