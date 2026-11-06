@@ -677,7 +677,11 @@ def load_fp32(hf, device="cuda", compact=None, headroom_gib=40.0):
     cfg.dtype = torch.float32
     torch.set_default_dtype(torch.float32)
     with torch.device(device):
-        model = model_class(cfg).eval()
+        model = model_class(cfg)
+        head_rows = getattr(cfg, "plow_head_rows", cfg.vocab_size)
+        if head_rows != cfg.vocab_size:
+            model.lm_head = torch.nn.Linear(cfg.hidden_size, head_rows, bias=False)
+        model.eval()
     params = dict(model.named_parameters())
     weights_of = set(params)
     params.update(dict(model.named_buffers()))
