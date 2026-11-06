@@ -38,7 +38,7 @@ pub(super) struct FishDepth {
     /// Staging for the widest program: seed u64 (first, so aligned), params `[rows][4]` f32, then
     /// top_k, step, hidden_row u32 (Maya 2: `[rows][2]` control, hidden_row, cb0), then the
     /// read-back codes `[rows][codebooks]`.
-    stage: PinnedHost,
+    stage: Arc<PinnedHost>,
     rows: usize,
     maya2: Option<Maya2>,
     compact: Option<CompactDepth>,
@@ -372,7 +372,20 @@ fn seed_frame_codes(
     Ok(bytes)
 }
 
+fn depth_stage(stage: &mut Arc<PinnedHost>) -> Result<&mut [u8]> {
+    Arc::get_mut(stage)
+        .map(PinnedHost::as_mut_slice)
+        .ok_or_else(|| reject("depth staging transfer did not retire"))
+}
+
 impl FishDepth {
+    fn quarantine(&self) {
+        std::mem::forget(self.stage.clone());
+        if let Some(source) = &self.source {
+            std::mem::forget(source.clone());
+        }
+    }
+
     /// The packet's depth stage, `None` when it carries none; read from the engine's own blob.
     pub(super) fn load_if_present(
         e: &mut GpuEngine,
@@ -510,7 +523,7 @@ impl FishDepth {
         Ok(Self {
             manifest,
             programs,
-            stage,
+            stage: Arc::new(stage),
             rows,
             maya2,
             compact,
@@ -524,9 +537,10 @@ impl FishDepth {
 
 impl GpuEngine {
     pub(super) fn quarantine_depth_source(&self) {
-        if let Some(source) = self.fish.as_ref().and_then(|d| d.source.as_ref()) {
-            std::mem::forget(source.clone());
+        if let Some(d) = &self.fish {
+            d.quarantine();
         }
+        std::mem::forget(self.be.clone());
     }
 
     /// The loaded depth stage's frame layout (a depth-stage packet).
@@ -655,7 +669,7 @@ impl GpuEngine {
         let mut d = self.fish.take().ok_or_else(|| reject("not enabled"))?;
         d.captured = None;
         d.retain_output = retain;
-        let r = (|| {
+        let mut r = (|| {
             let outputs = if let Some(owners) = owners {
                 if rows.iter().any(|r| {
                     r.cfg.is_some()
@@ -686,7 +700,13 @@ impl GpuEngine {
             }
         })();
         if r.is_err() {
-            let _ = self.be.stream_synchronize(&self.stream);
+            if let Err(error) = self.be.stream_synchronize(&self.stream) {
+                d.quarantine();
+                std::mem::forget(self.be.clone());
+                #[cfg(target_os = "linux")]
+                let error = self.be.quarantine_staging(&error);
+                r = Err(error);
+            }
         }
         let captured = d.captured.take();
         self.fish = Some(d);
@@ -711,7 +731,7 @@ impl GpuEngine {
             // SAFETY: the persistent host buffer and device source outlive the drain below.
             unsafe {
                 self.be.memcpy_dtoh_async(
-                    &mut d.stage.as_mut_slice()[codes_at..codes_at + bytes],
+                    &mut depth_stage(&mut d.stage)?[codes_at..codes_at + bytes],
                     address,
                     &self.stream,
                 )
@@ -766,7 +786,7 @@ impl GpuEngine {
         let n = p.rows as usize;
         let k = d.manifest.codebooks as usize;
         {
-            let s = d.stage.as_mut_slice();
+            let s = depth_stage(&mut d.stage)?;
             let (seeds, rest) = s.split_at_mut(d.rows * 8);
             let (params, rest) = rest.split_at_mut(d.rows * 16);
             let words = &mut rest[..d.rows * 12];
@@ -917,7 +937,7 @@ impl GpuEngine {
             (0, d.rows * 8, d.rows * 24, d.rows * 32, d.rows * 36);
         let _ = seeds;
         {
-            let s = d.stage.as_mut_slice();
+            let s = depth_stage(&mut d.stage)?;
             for r in 0..n {
                 let last = m.slots[r].as_ref().map_or(0, |s| s.last);
                 s[ctl + r * 8..ctl + r * 8 + 8].fill(0);
@@ -1128,7 +1148,15 @@ impl GpuEngine {
         if seeds.is_empty() {
             return Ok(());
         }
-        let result = self.fish_seed_slots_inner(seeds);
+        let mut result = self.fish_seed_slots_inner(seeds);
+        if result.is_err() {
+            if let Err(error) = self.be.stream_synchronize(&self.stream) {
+                self.quarantine_depth_source();
+                #[cfg(target_os = "linux")]
+                let error = self.be.quarantine_staging(&error);
+                result = Err(error);
+            }
+        }
         self.note_step_result(result.is_err());
         result
     }
@@ -1137,9 +1165,7 @@ impl GpuEngine {
         let d = self.fish.as_mut().ok_or_else(|| reject("not enabled"))?;
         let k = d.manifest.codebooks as usize;
         let at = d.rows * STAGE_CONTROL_BYTES;
-        let stage = d
-            .stage
-            .as_mut_slice()
+        let stage = depth_stage(&mut d.stage)?
             .get_mut(at..)
             .ok_or_else(|| reject("seed staging missing"))?;
         let bytes = seed_frame_codes(stage, seeds, self.batch, k)?;
