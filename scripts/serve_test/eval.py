@@ -15,7 +15,9 @@ is transcribed at concurrency 16; WER uses the release-gate normalization (lower
 TTS: the gate prompt set of the repo harnesses (scripts/tts/{mtl_prompts,veena_ref,chatterbox_ref}.py;
 --tts-prompts, default by model name) is synthesized as WAV, then transcribed by Whisper
 large-v3-turbo (needs torch, transformers, jiwer); CER after Unicode punctuation stripping, without
-spaces for zh/ja.
+spaces for zh/ja. --tts-concurrency and --tts-stream exercise concurrent streamed audio;
+--tts-manifest supplies fixed texts/seeds. --tts-capture-only saves WAVs and texts.json without
+loading ASR, for scoring after the server stops. TTS capture records no latency/throughput.
 LLM: deterministic answers, chat template, streaming, stop strings, logprobs, raw <bos> completions,
 the context limit (from the card's max_model_len), and error envelopes.
 Thresholds are the recipes' [gates] (campaign.py gate): this reports numbers, and exits 1 only on
@@ -24,6 +26,8 @@ request errors or a failed LLM check.
 import argparse
 import concurrent.futures as cf
 import io
+import hashlib
+import http.client
 import json
 import math
 import os
@@ -159,50 +163,118 @@ def prompt_set(model, kind="auto", voice=None):
     return [(voice or "default", t, None) for t in CBX_TEXTS]
 
 
-def eval_tts(a, models, outdir):
-    import numpy as np
-    import jiwer
-    import torch
-    from transformers import pipeline
-    dev = a.whisper_device or ("cuda" if torch.cuda.is_available() else "cpu")
-    asr = pipeline("automatic-speech-recognition", model=a.whisper, device=dev,
-                   torch_dtype=torch.float16 if dev == "cuda" else torch.float32)
-    results = {}
-    for m in models:
-        rows = []
-        wavdir = os.path.join(outdir, f"tts-{m}")
-        os.makedirs(wavdir, exist_ok=True)
-        for i, (voice, text, lang) in enumerate(prompt_set(m, a.tts_prompts, a.voice)):
-            body = {"model": m, "input": text, "voice": voice, "response_format": "wav", "seed": 1 + i}
-            if lang:
-                body["language"] = lang
-            st, b = call("POST", "/v1/audio/speech", body)
+def tts_cases(a, model):
+    if a.tts_manifest:
+        with open(a.tts_manifest) as f:
+            cases = json.load(f)
+        if not isinstance(cases, list) or not cases:
+            raise ValueError("TTS manifest must be a nonempty list of requests")
+        for i, case in enumerate(cases):
+            if not isinstance(case, dict) or not isinstance(case.get("text"), str) or not case["text"].strip():
+                raise ValueError(f"TTS manifest row {i} has no text")
+        cases = [dict(i=i, case_id=c.get("id", str(i)), text=c["text"],
+                      voice=a.voice or c.get("voice", "default"), lang=c.get("language"),
+                      seed=c.get("seed", 1 + i)) for i, c in enumerate(cases)]
+    else:
+        cases = [dict(i=i, case_id=str(i), voice=v, text=t, lang=l, seed=1 + i)
+                 for i, (v, t, l) in enumerate(prompt_set(model, a.tts_prompts, a.voice))]
+    return cases[:a.limit or None]
+
+
+def capture_tts(a, model, outdir):
+    wavdir = os.path.join(outdir, f"tts-{model}")
+    os.makedirs(wavdir, exist_ok=True)
+
+    def one(case):
+        row = dict(case, stream=a.tts_stream)
+        body = dict(model=model, input=case["text"], voice=case["voice"],
+                    response_format="wav", seed=case["seed"], stream=a.tts_stream)
+        if case["lang"]:
+            body["language"] = case["lang"]
+        try:
+            st, data = call("POST", "/v1/audio/speech", body)
+            row["status"] = st
             if st != 200:
-                rows.append(dict(i=i, lang=lang, error=f"{st} {b[:200]!r}"))
-                continue
-            path = os.path.join(wavdir, f"{i:02d}_{lang or voice}.wav")
-            open(path, "wb").write(b)
-            with wave.open(io.BytesIO(b)) as w:
-                sr, pcm = w.getframerate(), np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
-            x = pcm.astype(np.float32) / 32768.0
-            n16 = int(len(x) * 16000 / sr)
-            x16 = np.interp(np.linspace(0, len(x) - 1, n16), np.arange(len(x)), x).astype(np.float32)
-            kw = dict(generate_kwargs=dict(language=lang, task="transcribe")) if lang else {}
-            hyp = asr({"raw": x16, "sampling_rate": 16000}, **kw)["text"]
-            cer = jiwer.cer(norm_lang(text, lang), norm_lang(hyp, lang))
-            rows.append(dict(i=i, lang=lang, voice=voice, audio_s=round(len(pcm) / sr, 2), cer=round(cer, 4), text=text, hyp=hyp.strip()))
+                row["error"] = f"{st} {data[:200]!r}"
+                return row
+            with wave.open(io.BytesIO(data)) as w:
+                if w.getnchannels() != 1 or w.getsampwidth() != 2 or w.getframerate() <= 0:
+                    raise ValueError("expected mono PCM16 WAV")
+                sr = w.getframerate()
+                pcm = w.readframes(w.getnframes())
+            if not pcm or len(pcm) % 2:
+                raise ValueError("empty or partial PCM16 audio")
+            name = f"{case['i']:04d}.wav"
+            path = os.path.join(wavdir, name)
+            # Streaming WAV headers need not carry the final sample count.
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                w.writeframes(pcm)
+            row.update(wav=name, sample_rate=sr, samples=len(pcm) // 2,
+                       audio_s=len(pcm) / 2 / sr, response_sha256=hashlib.sha256(data).hexdigest(),
+                       pcm_sha256=hashlib.sha256(pcm).hexdigest())
+        except (OSError, ValueError, EOFError, wave.Error, http.client.HTTPException) as error:
+            row["error"] = f"{type(error).__name__}: {error}"
+        return row
+
+    with cf.ThreadPoolExecutor(a.tts_concurrency) as ex:
+        rows = list(ex.map(one, tts_cases(a, model)))
+    with open(os.path.join(wavdir, "capture.json"), "w") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=1)
+    texts = {r["wav"]: {"text": r["text"], "language": r["lang"]} if r["lang"] else r["text"]
+             for r in rows if "wav" in r}
+    with open(os.path.join(wavdir, "texts.json"), "w") as f:
+        json.dump(texts, f, ensure_ascii=False, indent=1)
+    return wavdir, rows
+
+
+def eval_tts(a, models, outdir):
+    if not models:
+        raise ValueError("no requested TTS model is advertised by the server")
+    captures = [(m, *capture_tts(a, m, outdir)) for m in models]
+    if not a.tts_capture_only:
+        import numpy as np
+        import jiwer
+        import torch
+        from transformers import pipeline
+        dev = a.whisper_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        asr = pipeline("automatic-speech-recognition", model=a.whisper, device=dev,
+                       torch_dtype=torch.float16 if dev == "cuda" else torch.float32)
+    results = {}
+    for m, wavdir, rows in captures:
+        if not a.tts_capture_only:
+            for row in rows:
+                if "error" in row:
+                    continue
+                with wave.open(os.path.join(wavdir, row["wav"])) as w:
+                    pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+                x = pcm.astype(np.float32) / 32768.0
+                n16 = int(len(x) * 16000 / row["sample_rate"])
+                x16 = np.interp(np.linspace(0, len(x) - 1, n16), np.arange(len(x)), x).astype(np.float32)
+                kw = dict(generate_kwargs=dict(language=row["lang"], task="transcribe")) if row["lang"] else {}
+                if len(x16) > 30 * 16000:
+                    kw["return_timestamps"] = True
+                hyp = asr({"raw": x16, "sampling_rate": 16000}, **kw)["text"]
+                cer = jiwer.cer(norm_lang(row["text"], row["lang"]), norm_lang(hyp, row["lang"]))
+                row.update(cer=round(cer, 4), hyp=hyp.strip())
         ok = [r for r in rows if "cer" in r]
         by_lang = {}
         for r in ok:
             by_lang.setdefault(r["lang"] or "default", []).append(r["cer"])
-        res = dict(n=len(rows), errors=len(rows) - len(ok), cer_median=round(statistics.median(r["cer"] for r in ok), 4) if ok else None,
+        res = dict(n=len(rows), errors=sum("error" in r for r in rows),
+                   capture_only=a.tts_capture_only, concurrency=a.tts_concurrency, stream=a.tts_stream,
+                   cer_median=round(statistics.median(r["cer"] for r in ok), 4) if ok else None,
                    cer_mean=round(sum(r["cer"] for r in ok) / len(ok), 4) if ok else None,
                    cer_by_language={k: round(statistics.median(v), 4) for k, v in sorted(by_lang.items())},
                    wavs=wavdir, rows=rows)
-        json.dump(rows, open(os.path.join(wavdir, "cer.json"), "w"), ensure_ascii=False, indent=1)
+        with open(os.path.join(wavdir, "cer.json"), "w") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=1)
         results[m] = res
-        print(f"TTS {m}: Whisper CER median {res['cer_median']} mean {res['cer_mean']} over {len(ok)} prompts "
-              f"({res['errors']} errors); by language {res['cer_by_language']}", flush=True)
+        print(f"TTS {m}: n={res['n']} errors={res['errors']} concurrency={a.tts_concurrency} "
+              f"stream={a.tts_stream} capture_only={a.tts_capture_only} "
+              f"CER median={res['cer_median']} mean={res['cer_mean']}", flush=True)
     return results
 
 
@@ -278,11 +350,17 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="first N clips only")
     ap.add_argument("--language-hint", action="store_true", help="send language=en with each clip")
     ap.add_argument("--tts-prompts", default="auto", choices=["auto", "mtl", "veena", "orpheus", "cbx"])
+    ap.add_argument("--tts-concurrency", type=int, default=1, help="bounded concurrent TTS quality requests")
+    ap.add_argument("--tts-stream", action="store_true", help="synthesize through the streaming endpoint")
+    ap.add_argument("--tts-capture-only", action="store_true", help="save WAVs/texts without loading an ASR model")
+    ap.add_argument("--tts-manifest", help="JSON list of {text, voice?, language?, seed?, id?} requests")
     ap.add_argument("--voice", default=None, help="TTS voice for every prompt (default: the prompt set's)")
     ap.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
     ap.add_argument("--whisper-device", default=None)
     ap.add_argument("--out", default="results/eval")
     a = ap.parse_args()
+    if a.tts_concurrency < 1:
+        ap.error("--tts-concurrency must be positive")
     os.makedirs(a.out, exist_ok=True)
     asr, tts, llm, max_len = models_by_kind()
     pick = lambda found: [m for m in a.models.split(",") if m in found] if a.models else found  # noqa: E731

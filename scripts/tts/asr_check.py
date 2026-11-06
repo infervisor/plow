@@ -35,12 +35,13 @@ def main():
     ap.add_argument("--texts", required=True, help="json: {basename: text}")
     ap.add_argument("--max-cer", type=float, default=0.15)
     ap.add_argument("--model", default="openai/whisper-large-v3-turbo")
+    ap.add_argument("--out", help="write full transcripts and exact CER results as JSON")
     args = ap.parse_args()
     import torch, jiwer, soundfile as sf, librosa
     from transformers import pipeline
     asr = pipeline("automatic-speech-recognition", model=args.model, torch_dtype=torch.float16, device="cuda")
     texts = json.load(open(args.texts))
-    cers, by_lang = [], {}
+    cers, by_lang, rows = [], {}, []
     for w in sorted(args.wavs):
         ref = texts[os.path.basename(w)]
         lang = ref.get("language") if isinstance(ref, dict) else None
@@ -55,12 +56,18 @@ def main():
         c = jiwer.cer(norm_lang(ref, lang), norm_lang(hyp, lang)) if lang else jiwer.cer(norm(ref), norm(hyp))
         cers.append(c)
         by_lang.setdefault(lang, []).append(c)
+        rows.append(dict(wav=w, text=ref, language=lang, hyp=hyp.strip(), cer=c))
         print(f"{os.path.basename(w)}\tCER={c:.3f}\t{hyp.strip()[:90]}")
     if len(by_lang) > 1 or None not in by_lang:
         for lang, cs in sorted(by_lang.items(), key=lambda kv: str(kv[0])):
             print(f"LANG {lang} median_CER={statistics.median(cs):.3f} mean_CER={sum(cs) / len(cs):.3f} n={len(cs)}")
     med = statistics.median(cers)
     print(f"MEDIAN_CER={med:.3f} n={len(cers)}")
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(dict(model=args.model, median_cer=med, mean_cer=sum(cers) / len(cers),
+                           max_cer=args.max_cer, passed=med <= args.max_cer, rows=rows),
+                      f, ensure_ascii=False, indent=2)
     sys.exit(0 if med <= args.max_cer else 1)
 
 
