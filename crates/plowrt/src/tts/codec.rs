@@ -1409,7 +1409,8 @@ impl Bound {
             }
         }
         let e = |x: crate::RuntimeError| x.to_string();
-        let mut lengths = Vec::with_capacity(self.lengths.len());
+        let mut lengths: smallvec::SmallVec<[(PacketTensor, Vec<u32>); 16]> =
+            smallvec::SmallVec::new();
         for &(tensor, per_frame) in &self.lengths {
             let mut len = vec![0u32; tensor.bytes / 4];
             for (i, j) in jobs.iter().enumerate() {

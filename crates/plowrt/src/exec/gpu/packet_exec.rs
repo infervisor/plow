@@ -631,7 +631,7 @@ impl PacketRuntime for CudaPacketRuntime {
         );
         if failed {
             self.input_failed = true;
-            // An unretired copy may still use either allocation after this runtime is dropped.
+            // Unproven completion must retain buffers and the backend's small-copy kernel.
             std::mem::forget(self.input_stage.take().unwrap());
             std::mem::forget(self.be.clone());
             for w in writes {
