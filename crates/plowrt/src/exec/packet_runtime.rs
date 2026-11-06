@@ -17,7 +17,7 @@ enum BufferStorage {
     Host(Vec<u8>),
     #[cfg(feature = "cuda")]
     Cuda {
-        memory: crate::device::DeviceMem,
+        memory: std::sync::Arc<crate::device::DeviceMem>,
         backend: std::sync::Arc<crate::device::cuda::CudaBackend>,
         _resident: std::sync::Arc<()>,
     },
@@ -106,7 +106,7 @@ impl PacketBuffer {
         assert!(memory.len >= bytes as u64);
         Self {
             storage: std::sync::Arc::new(BufferStorage::Cuda {
-                memory,
+                memory: std::sync::Arc::new(memory),
                 backend,
                 _resident: resident,
             }),
@@ -122,6 +122,94 @@ impl PacketBuffer {
                 memory, backend, ..
             } => Some((backend, memory.base + self.offset as u64)),
             _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct PacketBufferPool {
+    slots: Vec<PacketBuffer>,
+    next: usize,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct PendingPacketBuffer {
+    buffer: Option<PacketBuffer>,
+    source: Option<std::sync::Arc<dyn Send + Sync>>,
+}
+
+#[cfg(feature = "cuda")]
+impl PacketBufferPool {
+    pub(crate) fn cuda(
+        backend: std::sync::Arc<crate::device::cuda::CudaBackend>,
+        slot_bytes: usize,
+        slots: usize,
+    ) -> Result<Self> {
+        use crate::device::Backend;
+        let bytes = slot_bytes
+            .checked_mul(slots)
+            .filter(|&n| n > 0)
+            .ok_or_else(|| RuntimeError::Device("packet buffer pool size overflow".into()))?;
+        let memory = std::sync::Arc::new(backend.alloc(0, bytes as u64)?);
+        let resident = std::sync::Arc::new(());
+        Ok(Self {
+            slots: (0..slots)
+                .map(|i| PacketBuffer {
+                    storage: std::sync::Arc::new(BufferStorage::Cuda {
+                        memory: memory.clone(),
+                        backend: backend.clone(),
+                        _resident: resident.clone(),
+                    }),
+                    offset: i * slot_bytes,
+                    bytes: slot_bytes,
+                })
+                .collect(),
+            next: 0,
+        })
+    }
+
+    pub(crate) fn acquire(
+        &mut self,
+        bytes: usize,
+        source: std::sync::Arc<dyn Send + Sync>,
+    ) -> Option<PendingPacketBuffer> {
+        for _ in 0..self.slots.len() {
+            let i = self.next;
+            self.next = (i + 1) % self.slots.len();
+            let slot = &self.slots[i];
+            if bytes <= slot.bytes && std::sync::Arc::strong_count(&slot.storage) == 1 {
+                let mut buffer = slot.clone();
+                buffer.bytes = bytes;
+                return Some(PendingPacketBuffer {
+                    buffer: Some(buffer),
+                    source: Some(source),
+                });
+            }
+        }
+        None
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PendingPacketBuffer {
+    pub(crate) fn address(&self) -> u64 {
+        self.buffer.as_ref().unwrap().cuda_source().unwrap().1
+    }
+
+    /// Safety: all work addressing this slot and its source has completed successfully.
+    pub(crate) unsafe fn retire(mut self) -> PacketBuffer {
+        self.source.take();
+        self.buffer.take().unwrap()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PendingPacketBuffer {
+    fn drop(&mut self) {
+        // Dropping an unretired copy cannot authorize freeing either DMA endpoint.
+        if let Some(buffer) = self.buffer.take() {
+            std::mem::forget(buffer);
+            std::mem::forget(self.source.take());
         }
     }
 }
@@ -980,6 +1068,40 @@ pub(crate) fn check_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pool_views_prevent_reuse_and_unretired_copies_retain_both_owners() {
+        use std::sync::Arc;
+        let mut pool = PacketBufferPool {
+            slots: vec![vec![1; 32].into(), vec![2; 32].into()],
+            next: 0,
+        };
+        let source = Arc::new(());
+        let weak = Arc::downgrade(&source);
+        let a = pool.acquire(17, source.clone()).unwrap();
+        let b = pool.acquire(32, source.clone()).unwrap();
+        assert!(pool.acquire(1, source.clone()).is_none());
+        // SAFETY: host-only fixtures have no queued device work.
+        let a = unsafe { a.retire() };
+        let view = a.slice(3..11).unwrap();
+        drop(a);
+        assert!(pool.acquire(1, source.clone()).is_none());
+        drop(view);
+        assert!(pool.acquire(33, source.clone()).is_none());
+        let pending = pool.acquire(32, source.clone()).unwrap();
+        let destination = Arc::downgrade(&pending.buffer.as_ref().unwrap().storage);
+        drop(source);
+        drop(pending);
+        // SAFETY: host-only fixtures have no queued device work.
+        drop(unsafe { b.retire() });
+        drop(pool);
+        assert!(weak.upgrade().is_some(), "unretired copy freed its source");
+        assert!(
+            destination.upgrade().is_some(),
+            "unretired copy freed its destination"
+        );
+    }
 
     #[test]
     fn packet_buffer_views_keep_storage_and_validate_before_reading() {

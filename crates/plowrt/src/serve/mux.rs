@@ -53,7 +53,7 @@ use crate::sched::batching::{cold_start_hold_ms, select_bucket};
 use crate::sched::multistep::MultiStep;
 use crate::sched::rungs::{DecodeRungs, RungController, RungLoad};
 use crate::serve::session::{Retention, Seat, SessionTicket};
-use crate::serve::stream::{ChunkSender, FinishReason, StreamChunk};
+use crate::serve::stream::{ChunkSender, FinishReason, SpeechFrame, StreamChunk};
 use crate::serve::{
     bucket_has_sample_batch, reference_logits_row, sample_vocab, AppState, GenParams, RunObserver,
 };
@@ -532,7 +532,7 @@ type HeldToken = (
     u32,
     String,
     Option<Box<crate::text::logprobs::TokenLogprobs>>,
-    Option<Box<[u32]>>,
+    Option<SpeechFrame>,
 );
 
 /// A request whose prefill splices host rows over prompt positions (`EmbedOverlayBf16`: the
@@ -548,6 +548,8 @@ type HeldToken = (
 /// must be the token whose decode embedding the overlay row is.
 #[derive(Default)]
 pub struct SpeechJob {
+    /// Retain completed depth outputs for a downstream streaming packet stage.
+    pub device_frames: bool,
     /// Packet-declared v1: prompt inputs are token IDs, finalized overlays and frame codes.
     pub slot_prefix_reuse: bool,
     /// `[rows][hidden]` f32, one row per entry of `overlay_pos`.
@@ -633,11 +635,14 @@ impl DepthJob {
     }
 
     /// The step's token and, unless it stops, the frame's codes.
-    fn token(&self, codes: &[u32]) -> (u32, Option<Box<[u32]>>) {
+    fn token(&self, codes: &[u32]) -> (u32, Option<SpeechFrame>) {
         if codes[0] >= self.stop_class {
             (self.stop_token, None)
         } else {
-            (self.semantic_base + codes[0], Some(codes.into()))
+            (
+                self.semantic_base + codes[0],
+                Some(SpeechFrame::from(Box::<[u32]>::from(codes))),
+            )
         }
     }
 }
@@ -1141,7 +1146,7 @@ struct Slot {
     /// The next token's OpenAI logprobs, set by the sampler when the request asked for them.
     lp: Option<Box<crate::text::logprobs::TokenLogprobs>>,
     /// The next token's frame codes (depth-stage packets).
-    frame: Option<Box<[u32]>>,
+    frame: Option<SpeechFrame>,
     /// Emitted tokens the engine's device repetition-penalty history for this slot counts
     /// (`usize::MAX`: unknown, reseeded before the next device draw).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -8681,8 +8686,15 @@ fn gpu_prefill_advance(
             None => None,
         };
         let mut codes = Vec::new();
-        e.fish_depth_step(&[job.row(slot_idx, cond_row, 0, uncond_row)], &mut codes)?;
-        let (tok, frame) = job.token(&codes);
+        let rows = [job.row(slot_idx, cond_row, 0, uncond_row)];
+        let retained = if slot.speech.as_ref().is_some_and(|sp| sp.device_frames) {
+            e.fish_depth_step_retained(&rows, None, &mut codes)?
+        } else {
+            e.fish_depth_step(&rows, &mut codes)?;
+            None
+        };
+        let (tok, mut frame) = job.token(&codes);
+        attach_device_frame(&mut frame, retained.as_ref(), slot_idx)?;
         slot.frame = frame;
         return Ok(Some(tok));
     }
@@ -9426,17 +9438,44 @@ fn gpu_compact_depth_frames(
             return Ok(());
         }
         codes.clear();
-        e.fish_depth_step_compact(fish, owners, codes)?;
+        let retain = rows.iter().any(|&(k, _)| {
+            slots[completed[k].0]
+                .as_ref()
+                .and_then(|s| s.speech.as_ref())
+                .is_some_and(|s| s.device_frames)
+        });
+        let retained = if retain {
+            e.fish_depth_step_retained(fish, Some(owners), codes)?
+        } else {
+            e.fish_depth_step_compact(fish, owners, codes)?;
+            None
+        };
         let n = codes.len() / rows.len();
         for (r, &(k, job)) in rows.iter().enumerate() {
-            let (token, frame) = job.token(&codes[r * n..(r + 1) * n]);
+            let (token, mut frame) = job.token(&codes[r * n..(r + 1) * n]);
             completed[k].1 = token;
             if let Some(slot) = slots[completed[k].0].as_mut() {
+                if slot.speech.as_ref().is_some_and(|s| s.device_frames) {
+                    attach_device_frame(&mut frame, retained.as_ref(), completed[k].0)?;
+                }
                 slot.frame = frame;
             }
         }
         Ok(())
     })
+}
+
+#[cfg(feature = "cuda")]
+fn attach_device_frame(
+    frame: &mut Option<SpeechFrame>,
+    retained: Option<&crate::exec::packet_runtime::PacketBuffer>,
+    slot: usize,
+) -> crate::Result<()> {
+    if let (Some(frame), Some(buffer)) = (frame, retained) {
+        let bytes = frame.len() * 4;
+        frame.device = Some(buffer.slice(slot * bytes..(slot + 1) * bytes)?);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -9473,7 +9512,18 @@ fn gpu_depth_frames(
         }));
         codes.clear();
         let t = crate::obs::host::on().then(Instant::now);
-        e.fish_depth_step(fish, codes)?;
+        let retain = rows.iter().any(|&(k, _)| {
+            slots[feeds[k].0]
+                .as_ref()
+                .and_then(|s| s.speech.as_ref())
+                .is_some_and(|s| s.device_frames)
+        });
+        let retained = if retain {
+            e.fish_depth_step_retained(fish, None, codes)?
+        } else {
+            e.fish_depth_step(fish, codes)?;
+            None
+        };
         if let Some(t) = t {
             let width = fish
                 .iter()
@@ -9483,9 +9533,12 @@ fn gpu_depth_frames(
         }
         let n = codes.len() / rows.len();
         for (r, &(k, job)) in rows.iter().enumerate() {
-            let (tok, frame) = job.token(&codes[r * n..(r + 1) * n]);
+            let (tok, mut frame) = job.token(&codes[r * n..(r + 1) * n]);
             toks[k] = tok;
             if let Some(slot) = slots[feeds[k].0].as_mut() {
+                if slot.speech.as_ref().is_some_and(|s| s.device_frames) {
+                    attach_device_frame(&mut frame, retained.as_ref(), feeds[k].0)?;
+                }
                 slot.frame = frame;
             }
         }

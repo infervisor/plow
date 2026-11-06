@@ -1237,6 +1237,7 @@ async fn speech_with(
         top_k: checked.sampling.top_k.unwrap_or(0),
         seed: checked.seed,
         streaming: !req.non_streaming_mode,
+        device_frames: req.stream,
     };
     let mut segs: Vec<Segment> = Vec::new();
     for t in super::segments(&input, c.segment_chars()) {
@@ -1620,6 +1621,7 @@ struct SegmentMaker {
     seed: u64,
     /// Dual-stream: the text rides the decode steps.
     streaming: bool,
+    device_frames: bool,
 }
 
 impl SegmentMaker {
@@ -1879,6 +1881,7 @@ impl SegmentMaker {
             // The depth samplers divide by temperature: greedy is top-k 1 at temperature 1.
             let greedy = self.temperature <= 0.0;
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
+                device_frames: self.device_frames,
                 cfg,
                 slot_prefix_reuse: c.slot_prefix_reuse,
                 overlay,
@@ -2133,7 +2136,7 @@ fn step_plan(n: usize, emitted: usize, done: bool, first: usize, cap: usize) -> 
 }
 
 enum SegMsg {
-    Frame(Vec<i32>),
+    Frame(super::codec::Codes),
     /// The current segment attempt generated its last frame. A multi-segment drain then waits for
     /// the emitter's verdict on it before it starts anything else.
     End,
@@ -2310,7 +2313,7 @@ async fn stream_task(
         drain.await;
         lm.lm_done();
     });
-    let (mut frames, mut emitted, mut first) = (Vec::<i32>::new(), 0usize, None);
+    let (mut frames, mut emitted, mut first) = (super::codec::Codes::default(), 0usize, None);
     // Segment and attempt, frames the earlier segments emitted, and whether this attempt's verdict
     // is out (the next message is a retry, the next segment, or the end).
     let (mut seg, mut attempt, mut total, mut joins, mut judged) =
@@ -2341,7 +2344,7 @@ async fn stream_task(
                             .watchdog_recovers
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    (frames, emitted, skipping) = (Vec::new(), 0, false);
+                    (frames, emitted, skipping) = (super::codec::Codes::default(), 0, false);
                     attempt += 1;
                     joiner.next_segment();
                     if let Some(s) = slot.as_mut() {
@@ -2354,7 +2357,7 @@ async fn stream_task(
                     total += emitted;
                     joins.push(sent);
                     joiner.next_segment();
-                    (frames, emitted, skipping) = (Vec::new(), 0, false);
+                    (frames, emitted, skipping) = (super::codec::Codes::default(), 0, false);
                     (seg, attempt) = (seg + 1, 0);
                     if let Some(s) = slot.as_mut() {
                         s.restart();
@@ -2376,10 +2379,10 @@ async fn stream_task(
             }
             Some(SegMsg::Retry) => {}
             Some(SegMsg::Frame(f)) => {
-                frames.extend(f);
+                frames.extend(f, fc);
                 while let Ok(m) = frx.try_recv() {
                     match m {
-                        SegMsg::Frame(f) => frames.extend(f),
+                        SegMsg::Frame(f) => frames.extend(f, fc),
                         SegMsg::End => {
                             done = true;
                             break;
@@ -2452,14 +2455,14 @@ async fn stream_task(
                 else {
                     break;
                 };
-                let codes = frames[emitted * fc..(emitted + k) * fc].to_vec();
+                let codes = frames.slice(emitted * fc..(emitted + k) * fc, fc);
                 let t_codec = (crate::obs::ttft::on() && emitted == 0).then(|| {
                     if let Some(t) = first_frame_at {
                         crate::obs::ttft::SPEECH_FRAMES.add(t.elapsed().as_nanos() as u64);
                     }
                     Instant::now()
                 });
-                let r = model.codec.step(slot, codes, k, urgency, due).await;
+                let r = model.codec.step_codes(slot, codes, k, urgency, due).await;
                 if let Some(t) = t_codec {
                     crate::obs::ttft::SPEECH_CODEC.add(t.elapsed().as_nanos() as u64);
                 }
@@ -2470,11 +2473,11 @@ async fn stream_task(
                 else {
                     break;
                 };
-                let window = frames[s * fc..e * fc].to_vec();
+                let window = frames.slice(s * fc..e * fc, fc);
                 let wseed = seed ^ segment_salt(seg) ^ (emitted as u64).wrapping_mul(0x9E37_79B9);
                 model
                     .codec
-                    .decode(window, e - s, wseed, urgency)
+                    .decode_codes(window, e - s, wseed, urgency)
                     .await
                     .map(|pcm| (pcm, emitted - s, upto, e - s))
             };
@@ -2502,6 +2505,9 @@ async fn stream_task(
                         joined = v;
                         &joined[..]
                     };
+                    if slot.is_some() {
+                        frames.release(emitted..upto);
+                    }
                     emitted = upto;
                     let mut bytes = Vec::new();
                     if !fresh.is_empty() {

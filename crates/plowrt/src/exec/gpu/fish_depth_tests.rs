@@ -60,8 +60,10 @@ fn draw(e: &mut GpuEngine, outputs: &[(u32, u32)], step: u32) {
         .collect();
     let owners: Vec<_> = outputs.iter().map(|o| o.0).collect();
     let mut codes = vec![u32::MAX];
-    e.fish_depth_step_compact(&rows, &owners, &mut codes)
-        .unwrap();
+    let captured = e
+        .fish_depth_step_retained(&rows, Some(&owners), &mut codes)
+        .unwrap()
+        .expect("validated depth outputs must support retained frames");
     let m = &e.fish.as_ref().unwrap().manifest;
     assert_eq!(
         codes[0],
@@ -72,6 +74,17 @@ fn draw(e: &mut GpuEngine, outputs: &[(u32, u32)], step: u32) {
     assert!(codes[1..]
         .chunks_exact(m.codebooks as usize)
         .all(|c| c[0] <= m.stop_class));
+    let k = m.codebooks as usize;
+    for (&slot, frame) in owners.iter().zip(codes[1..].chunks_exact(k)) {
+        if frame[0] < m.stop_class {
+            let view = captured
+                .slice(slot as usize * k * 4..(slot as usize + 1) * k * 4)
+                .unwrap();
+            let mut actual = vec![0u32; k];
+            view.read(bytemuck::cast_slice_mut(&mut actual)).unwrap();
+            assert_eq!(actual, frame, "retained physical slot mapping changed");
+        }
+    }
 }
 
 #[test]

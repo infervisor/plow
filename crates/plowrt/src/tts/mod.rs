@@ -52,6 +52,90 @@ pub(crate) mod stretch;
 
 use std::path::Path;
 
+#[derive(Default, Debug)]
+pub(crate) struct Codes {
+    pub(crate) host: Vec<i32>,
+    sources: smallvec::SmallVec<[Option<crate::exec::packet_runtime::PacketBuffer>; 1]>,
+}
+
+impl From<Vec<i32>> for Codes {
+    fn from(host: Vec<i32>) -> Self {
+        Self {
+            host,
+            sources: smallvec::SmallVec::new(),
+        }
+    }
+}
+
+impl FromIterator<i32> for Codes {
+    fn from_iter<T: IntoIterator<Item = i32>>(iter: T) -> Self {
+        Vec::from_iter(iter).into()
+    }
+}
+
+impl std::ops::Deref for Codes {
+    type Target = [i32];
+    fn deref(&self) -> &[i32] {
+        &self.host
+    }
+}
+
+impl Codes {
+    pub(crate) fn frame(
+        host: Vec<i32>,
+        source: Option<crate::exec::packet_runtime::PacketBuffer>,
+    ) -> Self {
+        Self {
+            host,
+            sources: source.into_iter().map(Some).collect(),
+        }
+    }
+
+    pub(crate) fn extend(&mut self, other: Self, fc: usize) {
+        if !self.sources.is_empty() || !other.sources.is_empty() {
+            self.sources.resize_with(self.host.len() / fc, || None);
+            if other.sources.is_empty() {
+                self.sources
+                    .resize_with((self.host.len() + other.host.len()) / fc, || None);
+            } else {
+                self.sources.extend(other.sources);
+            }
+        }
+        self.host.extend(other.host);
+    }
+
+    pub(crate) fn slice(&self, range: std::ops::Range<usize>, fc: usize) -> Self {
+        Self {
+            host: self.host[range.clone()].to_vec(),
+            sources: if self.sources.is_empty() {
+                smallvec::SmallVec::new()
+            } else {
+                self.sources[range.start / fc..range.end / fc]
+                    .iter()
+                    .cloned()
+                    .collect()
+            },
+        }
+    }
+
+    pub(crate) fn release(&mut self, frames: std::ops::Range<usize>) {
+        if let Some(sources) = self.sources.get_mut(frames) {
+            sources.fill(None);
+        }
+    }
+
+    fn split_off(&mut self, words: usize, fc: usize) -> Self {
+        Self {
+            host: self.host.split_off(words),
+            sources: if self.sources.is_empty() {
+                smallvec::SmallVec::new()
+            } else {
+                self.sources.drain(words / fc..).collect()
+            },
+        }
+    }
+}
+
 use plow_asset::packet_pipeline::PacketPipeline;
 
 use crate::{Result, RuntimeError};
@@ -447,15 +531,18 @@ impl SpeechContract {
         &self,
         partial: &mut Vec<i32>,
         id: u32,
-        frame: Option<Box<[u32]>>,
-    ) -> Option<Vec<i32>> {
+        frame: Option<crate::serve::stream::SpeechFrame>,
+    ) -> Option<Codes> {
         if self.depth {
-            frame
-                .filter(|f| f.len() == self.frame_codes)
-                .map(|f| f.into_vec().into_iter().map(|x| x as i32).collect())
+            frame.filter(|f| f.len() == self.frame_codes).map(|f| {
+                Codes::frame(
+                    f.codes.into_vec().into_iter().map(|x| x as i32).collect(),
+                    f.device,
+                )
+            })
         } else {
             self.push_codes(partial, id, None)
-                .then(|| std::mem::take(partial))
+                .then(|| std::mem::take(partial).into())
         }
     }
 
@@ -1144,7 +1231,7 @@ mod tests {
                 assert_eq!(next.is_some(), complete);
                 if let Some(codes) = next {
                     assert_eq!(codes.len(), c.frame_codes);
-                    received.extend(codes);
+                    received.extend(codes.host);
                 }
                 assert!(partial.len() < c.frame_codes);
             }
@@ -1162,7 +1249,7 @@ mod tests {
             c.frame_codes = width;
             for n in [0, width - 1, width + 1] {
                 assert!(c
-                    .take_frame(&mut partial, 0, Some(vec![1; n].into_boxed_slice()))
+                    .take_frame(&mut partial, 0, Some(vec![1; n].into_boxed_slice().into()))
                     .is_none());
             }
             assert!(c.take_frame(&mut partial, 0, None).is_none());
@@ -1174,7 +1261,8 @@ mod tests {
             let mut expected = Vec::new();
             assert!(c.push_codes(&mut expected, 0, Some(&codes)));
             assert_eq!(
-                c.take_frame(&mut partial, 0, Some(codes.into_boxed_slice())),
+                c.take_frame(&mut partial, 0, Some(codes.into_boxed_slice().into()))
+                    .map(|c| c.host),
                 Some(expected)
             );
             assert!(partial.is_empty());

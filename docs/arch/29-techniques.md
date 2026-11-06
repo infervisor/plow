@@ -1140,9 +1140,13 @@ fastconformer RNNT, fish-s2.
   qualified for this path.
 - **Owned packet buffers**: CUDA snapshots retain an independent allocation, its completed
   copy, backend and residency owner. Same-context consumers copy device bytes directly; host
-  buffers and other packet backends use host staging. Live speech frame transport still needs
-  bounded snapshot reuse and channel ownership; these APIs alone do not enable it or
-  establish a timing win.
+  buffers and other packet backends use host staging. Streaming depth outputs use a bounded
+  arena sized from context, rung width and codebooks. A rung copy shares the predictor's existing
+  completion wait; frame views survive channel transfer, windows, retries and split codec steps.
+  Stateful decoding releases consumed views. A held slot cannot be reused, and unavailable slots
+  or unretainable producer storage use host frames. Unproven completion retains both DMA owners.
+  Other backends need their own producer retention/pool implementation. This establishes no
+  timing win or whole-model quality qualification.
 
 ### NVIDIA → AMD candidates
 

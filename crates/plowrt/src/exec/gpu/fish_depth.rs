@@ -7,7 +7,9 @@ use plow_asset::fish_depth::{Manifest, Sampler};
 use crate::asset::devblob::DevBlob;
 use crate::device::cuda::{KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
+use crate::exec::packet_runtime::{PacketBuffer, PacketBufferPool};
 use crate::{Result, RuntimeError};
+use std::sync::Arc;
 
 use super::{DevInst64, DevOp, DevProgram, GpuEngine, BLOCK, TENSOR_NONE16};
 
@@ -40,6 +42,10 @@ pub(super) struct FishDepth {
     rows: usize,
     maya2: Option<Maya2>,
     compact: Option<CompactDepth>,
+    source: Option<Arc<dyn Send + Sync>>,
+    pool: Option<PacketBufferPool>,
+    retain_output: bool,
+    captured: Option<PacketBuffer>,
 }
 
 struct CompactDepth {
@@ -369,7 +375,7 @@ fn seed_frame_codes(
 impl FishDepth {
     /// The packet's depth stage, `None` when it carries none; read from the engine's own blob.
     pub(super) fn load_if_present(
-        e: &GpuEngine,
+        e: &mut GpuEngine,
         blob: &DevBlob,
         raw: &[u8],
         assets: &std::path::Path,
@@ -385,7 +391,7 @@ impl FishDepth {
     }
 
     fn load(
-        e: &GpuEngine,
+        e: &mut GpuEngine,
         manifest: Manifest,
         bytes: &[u8],
         assets: &std::path::Path,
@@ -463,6 +469,38 @@ impl FishDepth {
             _ => None,
         };
         let compact = CompactDepth::load(e, &manifest)?;
+        let h = manifest.tensors.frame_codes as usize;
+        let mem = &e.devp[h];
+        let contains = |base: u64, bytes: u64| {
+            mem.base >= base
+                && mem
+                    .base
+                    .checked_add(mem.len)
+                    .is_some_and(|end| base.checked_add(bytes).is_some_and(|limit| end <= limit))
+        };
+        let source: Option<Arc<dyn Send + Sync>> = if mem.owns_storage() {
+            let view = mem.subview(0, mem.len)?;
+            Some(Arc::new(std::mem::replace(&mut e.devp[h], view)))
+        } else if match e._weight_slab.as_ref() {
+            super::WeightSlab::Flat(slab) => contains(slab.base, slab.len),
+            super::WeightSlab::Vmm(slab) => contains(slab.base(), slab.len()),
+            super::WeightSlab::PerTensor => false,
+        } {
+            Some(e._weight_slab.clone())
+        } else {
+            None
+        };
+        let pool = if source.is_some() {
+            match PacketBufferPool::cuda(e.be.clone(), e.batch * k * 4, e.max_ctx) {
+                Ok(pool) => Some(pool),
+                Err(error) => {
+                    tracing::warn!(%error, "depth output pool unavailable; using host frames");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         tracing::info!(
             programs = programs.len(),
             rows,
@@ -476,11 +514,21 @@ impl FishDepth {
             rows,
             maya2,
             compact,
+            source,
+            pool,
+            retain_output: false,
+            captured: None,
         })
     }
 }
 
 impl GpuEngine {
+    pub(super) fn quarantine_depth_source(&self) {
+        if let Some(source) = self.fish.as_ref().and_then(|d| d.source.as_ref()) {
+            std::mem::forget(source.clone());
+        }
+    }
+
     /// The loaded depth stage's frame layout (a depth-stage packet).
     pub fn fish_info(&self) -> Result<FishInfo> {
         let m = &self
@@ -574,7 +622,8 @@ impl GpuEngine {
     /// Sample one frame for each of `rows` (distinct slots) and append its codes
     /// (`codebooks` per row, column 0 the backbone class) to `out`.
     pub fn fish_depth_step(&mut self, rows: &[FishRow], out: &mut Vec<u32>) -> Result<()> {
-        self.fish_depth_step_inner(rows, None, out)
+        self.fish_depth_step_inner(rows, None, false, out)
+            .map(|_| ())
     }
 
     pub fn fish_depth_step_compact(
@@ -583,16 +632,29 @@ impl GpuEngine {
         owners: &[u32],
         out: &mut Vec<u32>,
     ) -> Result<()> {
-        self.fish_depth_step_inner(rows, Some(owners), out)
+        self.fish_depth_step_inner(rows, Some(owners), false, out)
+            .map(|_| ())
+    }
+
+    pub fn fish_depth_step_retained(
+        &mut self,
+        rows: &[FishRow],
+        owners: Option<&[u32]>,
+        out: &mut Vec<u32>,
+    ) -> Result<Option<PacketBuffer>> {
+        self.fish_depth_step_inner(rows, owners, true, out)
     }
 
     fn fish_depth_step_inner(
         &mut self,
         rows: &[FishRow],
         owners: Option<&[u32]>,
+        retain: bool,
         out: &mut Vec<u32>,
-    ) -> Result<()> {
+    ) -> Result<Option<PacketBuffer>> {
         let mut d = self.fish.take().ok_or_else(|| reject("not enabled"))?;
+        d.captured = None;
+        d.retain_output = retain;
         let r = (|| {
             let outputs = if let Some(owners) = owners {
                 if rows.iter().any(|r| {
@@ -626,9 +688,41 @@ impl GpuEngine {
         if r.is_err() {
             let _ = self.be.stream_synchronize(&self.stream);
         }
+        let captured = d.captured.take();
         self.fish = Some(d);
         self.note_step_result(r.is_err());
-        r
+        r.map(|()| captured)
+    }
+
+    fn depth_read_codes(&self, d: &mut FishDepth, codes_at: usize, bytes: usize) -> Result<()> {
+        let pending = if d.retain_output {
+            d.source
+                .as_ref()
+                .and_then(|owner| d.pool.as_mut()?.acquire(bytes, owner.clone()))
+        } else {
+            None
+        };
+        let address = self.devp[d.manifest.tensors.frame_codes as usize].base;
+        let queued = (|| {
+            if let Some(copy) = &pending {
+                self.be
+                    .memcpy_dtod_async(copy.address(), address, bytes as u64, &self.stream)?;
+            }
+            // SAFETY: the persistent host buffer and device source outlive the drain below.
+            unsafe {
+                self.be.memcpy_dtoh_async(
+                    &mut d.stage.as_mut_slice()[codes_at..codes_at + bytes],
+                    address,
+                    &self.stream,
+                )
+            }
+        })();
+        self.be.stream_synchronize(&self.stream)?;
+        // SAFETY: even an enqueue error is drained before either endpoint is released.
+        let captured = pending.map(|copy| unsafe { copy.retire() });
+        queued?;
+        d.captured = captured;
+        Ok(())
     }
 
     fn fish_launch(
@@ -765,15 +859,7 @@ impl GpuEngine {
             Some(&self.stream),
         )?;
         let codes_at = sw + pw + ww;
-        // SAFETY: as the uploads.
-        unsafe {
-            self.be.memcpy_dtoh_async(
-                &mut d.stage.as_mut_slice()[codes_at..codes_at + n * k * 4],
-                self.devp[usize::from(t.frame_codes)].base,
-                &self.stream,
-            )?;
-        }
-        self.be.stream_synchronize(&self.stream)?;
+        self.depth_read_codes(d, codes_at, n * k * 4)?;
         let codes: &[u32] =
             bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + n * k * 4]);
         for row in rows {
@@ -954,15 +1040,8 @@ impl GpuEngine {
             Some(&self.stream),
         )?;
         let codes_at = d.rows * STAGE_CONTROL_BYTES;
-        // SAFETY: as the uploads.
-        unsafe {
-            self.be.memcpy_dtoh_async(
-                &mut d.stage.as_mut_slice()[codes_at..codes_at + n * k * 4],
-                self.devp[usize::from(t.frame_codes)].base,
-                &self.stream,
-            )?;
-        }
-        self.be.stream_synchronize(&self.stream)?;
+        self.depth_read_codes(d, codes_at, n * k * 4)?;
+        let m = d.maya2.as_mut().unwrap();
         let codes: &[u32] =
             bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + n * k * 4]);
         for (row, &stop) in rows.iter().zip(&stops) {

@@ -251,8 +251,58 @@ enum Msg {
     Release(SlotId),
 }
 
+pub(crate) use super::Codes;
+
+fn code_writes<'a>(
+    tensor: PacketTensor,
+    host: &'a [u32],
+    jobs: &'a [Job],
+    capacity_frames: usize,
+    fc: usize,
+) -> smallvec::SmallVec<[PacketWrite<'a>; 64]> {
+    if jobs
+        .iter()
+        .all(|j| j.codes.sources.iter().all(Option::is_none))
+    {
+        return smallvec::smallvec![PacketWrite {
+            tensor,
+            offset: 0,
+            data: PacketData::Host(bytemuck::cast_slice(host)),
+        }];
+    }
+    let mut writes = smallvec::smallvec![PacketWrite {
+        tensor,
+        offset: 0,
+        data: PacketData::Zero(std::mem::size_of_val(host)),
+    }];
+    for frame in 0..capacity_frames {
+        for (b, job) in jobs.iter().enumerate().filter(|(_, j)| frame < j.frames) {
+            let words = (b * capacity_frames + frame) * fc;
+            let source = job
+                .codes
+                .sources
+                .get(frame)
+                .and_then(Option::as_ref)
+                .filter(|_| {
+                    job.codes[frame * fc..(frame + 1) * fc]
+                        .iter()
+                        .all(|&c| c >= 0)
+                });
+            writes.push(PacketWrite {
+                tensor,
+                offset: words * 4,
+                data: source.map_or_else(
+                    || PacketData::Host(bytemuck::cast_slice(&host[words..words + fc])),
+                    PacketData::Buffer,
+                ),
+            });
+        }
+    }
+    writes
+}
+
 struct Job {
-    codes: Vec<i32>,
+    codes: Codes,
     frames: usize,
     seed: u64,
     voice: u32,
@@ -586,6 +636,18 @@ impl Codec {
         urgency: Urgency,
         due: Option<std::time::Instant>,
     ) -> Result<Vec<f32>, String> {
+        self.step_codes(slot, codes.into(), frames, urgency, due)
+            .await
+    }
+
+    pub(crate) async fn step_codes(
+        &self,
+        slot: &mut StreamSlot,
+        codes: Codes,
+        frames: usize,
+        urgency: Urgency,
+        due: Option<std::time::Instant>,
+    ) -> Result<Vec<f32>, String> {
         let step = Step {
             slot: slot.id,
             pos: slot.pos,
@@ -621,6 +683,18 @@ impl Codec {
         urgency: Urgency,
     ) -> Result<Vec<f32>, String> {
         self.decode_as(codes, frames, seed, 0, urgency, None)
+            .await
+            .map(|d| d.pcm)
+    }
+
+    pub(crate) async fn decode_codes(
+        &self,
+        codes: Codes,
+        frames: usize,
+        seed: u64,
+        urgency: Urgency,
+    ) -> Result<Vec<f32>, String> {
+        self.submit(codes, frames, seed, 0, (urgency, None), None, None, None)
             .await
             .map(|d| d.pcm)
     }
@@ -720,7 +794,7 @@ impl Codec {
     #[allow(clippy::too_many_arguments)]
     async fn submit(
         &self,
-        codes: Vec<i32>,
+        codes: impl Into<Codes>,
         frames: usize,
         seed: u64,
         voice: u32,
@@ -739,7 +813,7 @@ impl Codec {
         self.tx
             .lock()
             .send(Msg::Job(Job {
-                codes,
+                codes: codes.into(),
                 frames,
                 seed,
                 voice,
@@ -1120,6 +1194,16 @@ impl Bound {
         if j.frames == 0 || j.codes.len() != j.frames * self.frame_codes {
             return Err("codec job has no frames or a partial frame");
         }
+        if !j.codes.sources.is_empty()
+            && (j.codes.sources.len() != j.frames
+                || j.codes
+                    .sources
+                    .iter()
+                    .flatten()
+                    .any(|s| s.len() != self.frame_codes * 4))
+        {
+            return Err("codec device frames disagree with the code shape");
+        }
         if let Some(v) = &j.clone {
             let pm = self.voice_slots.as_ref().map_or(0, |s| s.prompt_max);
             let p = v.prompt_token.len();
@@ -1293,7 +1377,7 @@ impl Bound {
             let (slot, pos, n) = match jobs.get(b) {
                 Some(j) => {
                     let st = j.step.expect("one family per launch");
-                    for (d, &c) in io.codes_buf[b * cn * fc..].iter_mut().zip(&j.codes) {
+                    for (d, &c) in io.codes_buf[b * cn * fc..].iter_mut().zip(j.codes.iter()) {
                         *d = c.clamp(0, i32::MAX) as u32;
                     }
                     (st.slot.index, st.pos as u32, j.frames as u32)
@@ -1312,12 +1396,8 @@ impl Bound {
         }
         let e = |x: crate::RuntimeError| x.to_string();
         let rt = &mut self.runtime;
-        let mut writes: smallvec::SmallVec<[PacketWrite<'_>; 16]> = smallvec::smallvec![
-            PacketWrite {
-                tensor: self.codes,
-                offset: 0,
-                data: PacketData::Host(bytemuck::cast_slice(&io.codes_buf)),
-            },
+        let mut writes = code_writes(self.codes, &io.codes_buf, jobs, cn, fc);
+        writes.extend([
             PacketWrite {
                 tensor: io.slot,
                 offset: 0,
@@ -1333,7 +1413,7 @@ impl Bound {
                 offset: 0,
                 data: PacketData::Host(bytemuck::cast_slice(&io.rope_buf)),
             },
-        ];
+        ]);
         if let Some(t) = io.row_pos {
             writes.push(PacketWrite {
                 tensor: t,
@@ -1424,12 +1504,7 @@ impl Bound {
         for (i, j) in jobs.iter().enumerate() {
             seeds[i] = j.seed;
         }
-        let mut writes: smallvec::SmallVec<[PacketWrite<'_>; 16]> =
-            smallvec::smallvec![PacketWrite {
-                tensor: self.codes,
-                offset: 0,
-                data: PacketData::Host(bytemuck::cast_slice(&codes)),
-            },];
+        let mut writes = code_writes(self.codes, &codes, jobs, cf, fc);
         writes.extend(lengths.iter().map(|(tensor, len)| PacketWrite {
             tensor: *tensor,
             offset: 0,
@@ -1649,7 +1724,7 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         // capacity under it that decodes the most frames per second; the jobs it leaves out stay
         // queued and the frames it cuts decode as the same steps' next pieces, after anything
         // more urgent that arrived meanwhile.
-        let mut rests: Vec<Option<(Vec<i32>, usize)>> = Vec::new();
+        let mut rests: Vec<Option<(Codes, usize)>> = Vec::new();
         if bound_us > 0.0 && batch[0].step.is_some() {
             let frames: Vec<usize> = batch.iter().map(|j| j.frames).collect();
             if let Some((keep, cap)) = bound_step(&codec.steps, &costs, &frames, bound_us) {
@@ -1661,7 +1736,7 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
                     .iter_mut()
                     .map(|j| {
                         (j.frames > cap).then(|| {
-                            let rest = j.codes.split_off(cap * fc);
+                            let rest = j.codes.split_off(cap * fc, fc);
                             let n = j.frames - cap;
                             j.frames = cap;
                             (rest, n)
@@ -1791,9 +1866,86 @@ fn hold_for(
 mod tests {
     use super::*;
 
+    #[test]
+    fn retained_history_keeps_frame_alignment_across_windows_and_split_steps() {
+        let source = |v: &[u32]| {
+            crate::exec::packet_runtime::PacketBuffer::from(bytemuck::cast_slice(v).to_vec())
+        };
+        let mut history = Codes::from(vec![9, 10]);
+        history.extend(Codes::frame(vec![1, 2], Some(source(&[1, 2]))), 2);
+        history.extend(vec![3, 4].into(), 2);
+        history.extend(Codes::frame(vec![5, 6], Some(source(&[5, 6]))), 2);
+        assert_eq!(
+            history
+                .sources
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            [false, true, false, true]
+        );
+        let mut window = history.slice(2..8, 2);
+        drop(history);
+        let mut rest = window.split_off(2, 2);
+        assert_eq!(window.host, [1, 2]);
+        assert_eq!(rest.host, [3, 4, 5, 6]);
+        assert!(rest.sources[0].is_none());
+        for (codes, frame) in [(&window, 0), (&rest, 1)] {
+            let mut values = [0u32; 2];
+            codes.sources[frame]
+                .as_ref()
+                .unwrap()
+                .read(bytemuck::cast_slice_mut(&mut values))
+                .unwrap();
+            assert_eq!(
+                bytemuck::cast_slice::<u32, i32>(&values),
+                &codes[frame * 2..(frame + 1) * 2]
+            );
+        }
+        rest.release(0..2);
+        assert!(rest.sources.iter().all(Option::is_none));
+        assert_eq!(rest.host, [3, 4, 5, 6]);
+        drop(window);
+        drop(rest);
+    }
+
+    #[test]
+    fn retained_code_rows_preserve_padding_and_signed_code_clamping() {
+        let source = |v: &[u32]| {
+            crate::exec::packet_runtime::PacketBuffer::from(bytemuck::cast_slice(v).to_vec())
+        };
+        let mut a = job(false, 2, None);
+        a.codes = Codes::frame(vec![1, 2], Some(source(&[1, 2])));
+        a.codes
+            .extend(Codes::frame(vec![-1, 4], Some(source(&[u32::MAX, 4]))), 2);
+        let mut b = job(false, 1, None);
+        b.codes = vec![5, 6].into();
+        let mut jobs = [a, b];
+        let dense = [1u32, 2, 0, 4, 0, 0, 5, 6, 0, 0, 0, 0];
+        let tensor = PacketTensor {
+            handle: 0,
+            bytes: std::mem::size_of_val(&dense),
+        };
+        let writes = code_writes(tensor, &dense, &jobs, 3, 2);
+        assert!(matches!(writes[0].data, PacketData::Zero(48)));
+        assert!(matches!(writes[1].data, PacketData::Buffer(_)));
+        assert!(matches!(writes.last().unwrap().data, PacketData::Host(_)));
+        let mut actual = vec![0xa5; tensor.bytes];
+        for w in writes {
+            w.check().unwrap();
+            w.data
+                .read(&mut actual[w.offset..w.offset + w.data.len()])
+                .unwrap();
+        }
+        assert_eq!(actual, bytemuck::cast_slice::<u32, u8>(&dense));
+        jobs[0].codes.release(0..2);
+        let writes = code_writes(tensor, &dense, &jobs, 3, 2);
+        assert_eq!(writes.len(), 1);
+        assert!(matches!(writes[0].data, PacketData::Host(_)));
+    }
+
     fn job(window: bool, frames: usize, slot: Option<u32>) -> Job {
         Job {
-            codes: Vec::new(),
+            codes: Codes::default(),
             frames,
             seed: 0,
             voice: 0,
@@ -1814,18 +1966,7 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    struct SerialWrites(
-        Box<dyn crate::exec::packet_runtime::PacketRuntime>,
-        Option<SnapshotSource>,
-    );
-
-    #[cfg(feature = "cuda")]
-    struct SnapshotSource {
-        runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>,
-        staging: PacketTensor,
-        codes: PacketTensor,
-        copies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
+    struct SerialWrites(Box<dyn crate::exec::packet_runtime::PacketRuntime>);
 
     #[cfg(feature = "cuda")]
     struct SharedRuntime(
@@ -1914,45 +2055,6 @@ mod tests {
             for w in writes {
                 w.check()?;
             }
-            if let Some(source) = self.1.as_mut() {
-                let mut snapshots = Vec::with_capacity(writes.len());
-                for w in writes {
-                    let snapshot = if source.codes == w.tensor {
-                        let mut bytes = vec![0; w.data.len()];
-                        w.data.read(&mut bytes)?;
-                        source
-                            .runtime
-                            .write_tensor_at(source.staging, w.offset, &bytes)?;
-                        let snapshot = source.runtime.snapshot_tensor(
-                            source.staging,
-                            w.offset,
-                            bytes.len(),
-                        )?;
-                        assert!(snapshot.cuda_source().is_some());
-                        bytes.fill(0xdd);
-                        source
-                            .runtime
-                            .write_tensor_at(source.staging, w.offset, &bytes)?;
-                        source
-                            .copies
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Some(snapshot)
-                    } else {
-                        None
-                    };
-                    snapshots.push(snapshot);
-                }
-                let batch: Vec<_> = writes
-                    .iter()
-                    .zip(&snapshots)
-                    .map(|(w, source)| PacketWrite {
-                        tensor: w.tensor,
-                        offset: w.offset,
-                        data: source.as_ref().map_or(w.data, PacketData::Buffer),
-                    })
-                    .collect();
-                return self.0.write_tensors(&batch);
-            }
             for w in writes {
                 let PacketData::Host(bytes) = w.data else {
                     panic!("serial control expects host writes");
@@ -2026,24 +2128,38 @@ mod tests {
         let mut control = bind(&path, 0).unwrap();
         let mut treatment = bind(&path, 0).unwrap();
         let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut producer = None;
         if device {
-            let producer = std::sync::Arc::new(Mutex::new(control.runtime));
-            let staging = producer
-                .lock()
-                .create_tensor(treatment.codes.bytes)
-                .unwrap();
-            control.runtime = Box::new(SharedRuntime(producer.clone()));
-            treatment.runtime = Box::new(SerialWrites(
-                treatment.runtime,
-                Some(SnapshotSource {
-                    runtime: Box::new(SharedRuntime(producer)),
-                    staging,
-                    codes: treatment.codes,
-                    copies: copies.clone(),
-                }),
-            ));
+            let runtime = std::sync::Arc::new(Mutex::new(control.runtime));
+            let staging = runtime.lock().create_tensor(treatment.codes.bytes).unwrap();
+            control.runtime = Box::new(SharedRuntime(runtime.clone()));
+            producer = Some((runtime, staging));
         }
-        control.runtime = Box::new(SerialWrites(control.runtime, None));
+        control.runtime = Box::new(SerialWrites(control.runtime));
+        let fc = control.frame_codes;
+        let own = |jobs: &mut [Job]| {
+            let Some((runtime, staging)) = &producer else {
+                return;
+            };
+            let mut runtime = runtime.lock();
+            for (b, j) in jobs.iter_mut().enumerate() {
+                if b % 3 == 1 {
+                    continue;
+                }
+                let mut bytes = bytemuck::cast_slice::<i32, u8>(&j.codes.host).to_vec();
+                runtime.write_tensor_at(*staging, 0, &bytes).unwrap();
+                let snapshot = runtime.snapshot_tensor(*staging, 0, bytes.len()).unwrap();
+                assert!(snapshot.cuda_source().is_some());
+                bytes.fill(0xdd);
+                runtime.write_tensor_at(*staging, 0, &bytes).unwrap();
+                j.codes.sources = (0..j.frames)
+                    .map(|f| {
+                        (f % 2 == 0).then(|| snapshot.slice(f * fc * 4..(f + 1) * fc * 4).unwrap())
+                    })
+                    .collect();
+                copies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
         let method = if device { "owned" } else { "bulk" };
         let maximum = control.capacities.iter().map(|c| c.0).max().unwrap();
         let equal = |a: Vec<Decoded>, b: Vec<Decoded>| {
@@ -2062,7 +2178,7 @@ mod tests {
         };
         for width in [1, 8, 32].into_iter().filter(|&n| n <= maximum) {
             for frames in [1, 2, 5] {
-                let jobs: Vec<_> = (0..width)
+                let mut jobs: Vec<_> = (0..width)
                     .map(|b| {
                         let mut j = job(false, frames, None);
                         j.seed = 77 + b as u64;
@@ -2072,10 +2188,9 @@ mod tests {
                         j
                     })
                     .collect();
-                equal(
-                    control.decode(&jobs).unwrap(),
-                    treatment.decode(&jobs).unwrap(),
-                );
+                let expected = control.decode(&jobs).unwrap();
+                own(&mut jobs);
+                equal(expected, treatment.decode(&jobs).unwrap());
                 eprintln!("codec {method} inputs: decode width={width} frames={frames}, PCM exact");
             }
         }
@@ -2083,7 +2198,7 @@ mod tests {
         for width in [1, 8, 32].into_iter().filter(|&n| n <= maximum) {
             let mut position = 0;
             for frames in [1, 2, 5] {
-                let jobs: Vec<_> = (0..width)
+                let mut jobs: Vec<_> = (0..width)
                     .map(|b| {
                         let mut j = job(false, frames, Some(b as u32));
                         j.step.as_mut().unwrap().pos = position;
@@ -2093,7 +2208,9 @@ mod tests {
                         j
                     })
                     .collect();
-                equal(control.step(&jobs).unwrap(), treatment.step(&jobs).unwrap());
+                let expected = control.step(&jobs).unwrap();
+                own(&mut jobs);
+                equal(expected, treatment.step(&jobs).unwrap());
                 eprintln!("codec {method} inputs: stream width={width} position={position} frames={frames}, PCM exact");
                 position += frames;
             }

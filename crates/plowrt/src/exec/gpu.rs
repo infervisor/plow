@@ -2819,7 +2819,7 @@ pub struct GpuEngine {
     /// Views never free, so this owner must outlive them; both live here, and a
     /// `View`'s Drop is a no-op, so field drop order cannot matter. The Vmm
     /// arm's Drop unmaps and releases its physical chunks.
-    _weight_slab: WeightSlab,
+    _weight_slab: Arc<WeightSlab>,
     d_inst: DeviceMem,
     /// Owner of the decode counter+cursor allocation. `d_ctr` and the decode
     /// GQ cursor are aliased **views** into it (never freed by their own
@@ -8021,7 +8021,7 @@ impl GpuEngine {
             ctr_bytes,
             cursor_bytes,
             devp,
-            _weight_slab: weight_slab,
+            _weight_slab: Arc::new(weight_slab),
             d_inst,
             _ctr_block: ctr_block,
             d_ctr,
@@ -8148,7 +8148,7 @@ impl GpuEngine {
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
-        engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw, assets_dir)?;
+        engine.fish = fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
         engine.speech_identities = prefix::SpeechIdentities::new(engine.token_input_vocab());
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;

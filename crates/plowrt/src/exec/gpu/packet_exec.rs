@@ -504,6 +504,56 @@ mod write_tests {
     use std::cell::{Cell, RefCell};
 
     #[test]
+    #[ignore = "GPU correctness; run through gpuq"]
+    fn packet_pool_reuses_released_slots_and_preserves_held_views() {
+        use crate::exec::packet_runtime::PacketBufferPool;
+        let backend = Arc::new(CudaBackend::new(0).unwrap());
+        let stream = backend.stream_create().unwrap();
+        let source = Arc::new(backend.alloc(0, 64).unwrap());
+        let bytes: Vec<u8> = (0..64).map(|i| (i * 37) as u8).collect();
+        backend.upload(&source, 0, &bytes).unwrap();
+        let mut pool = PacketBufferPool::cuda(backend.clone(), 48, 2).unwrap();
+        let first = pool.acquire(37, source.clone()).unwrap();
+        let first_address = first.address();
+        let second = pool.acquire(41, source.clone()).unwrap();
+        assert_eq!(second.address() - first_address, 48);
+        assert!(pool.acquire(1, source.clone()).is_none());
+        backend
+            .memcpy_dtod_async(first.address(), source.base + 3, 37, &stream)
+            .unwrap();
+        backend
+            .memcpy_dtod_async(second.address(), source.base + 7, 41, &stream)
+            .unwrap();
+        backend.stream_synchronize(&stream).unwrap();
+        // SAFETY: both pending copies were drained above.
+        let (first, second) = unsafe { (first.retire(), second.retire()) };
+        let view = first.slice(5..29).unwrap();
+        drop(first);
+        assert!(pool.acquire(1, source.clone()).is_none());
+        let mut actual = [0; 24];
+        view.read(&mut actual).unwrap();
+        assert_eq!(actual, bytes[8..32]);
+        drop(view);
+        let reused = pool.acquire(48, source.clone()).unwrap();
+        assert_eq!(reused.address(), first_address);
+        backend.upload(&source, 0, &[0xdd; 64]).unwrap();
+        backend
+            .memcpy_dtod_async(reused.address(), source.base, 48, &stream)
+            .unwrap();
+        drop(source);
+        backend.stream_synchronize(&stream).unwrap();
+        // SAFETY: the reused slot and its retained producer have completed.
+        let reused = unsafe { reused.retire() };
+        drop(pool);
+        let mut old = [0; 41];
+        second.read(&mut old).unwrap();
+        assert_eq!(old, bytes[7..48]);
+        let mut new = [0; 48];
+        reused.read(&mut new).unwrap();
+        assert_eq!(new, [0xdd; 48]);
+    }
+
+    #[test]
     #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS; run through gpuq"]
     fn packet_snapshot_survives_producer_reuse_and_runtime_drop() {
         let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
