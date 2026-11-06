@@ -1034,7 +1034,7 @@ fn speech_autoregressive_paths_trace_packet_sampling() {
                 .position(|(x, y)| x != y)
                 .map(|j| (f, j))
         });
-    if let Some((frame, codebook)) = first.filter(|&(_, j)| j > 0) {
+    if let Some((frame, codebook)) = first {
         let section = plow_asset::aux_program::parse(
             blob.reserved_metadata(&raw, plow_asset::fish_depth::PROGRAMS_SECTION)
                 .unwrap()
@@ -1054,6 +1054,11 @@ fn speech_autoregressive_paths_trace_packet_sampling() {
         assert_eq!(samples.len(), k);
         let &(pc, sample) = &samples[codebook];
         assert_eq!(sample.i[3] as usize, codebook);
+        let head = program.insts[..pc]
+            .iter()
+            .rfind(|i| i.op == DevOp::GemvF32Out as u16 && i.t[0] == sample.t[1])
+            .unwrap();
+        assert!(matches!(head.i[7], 0 | 2048));
         let logits_name = &blob.tensors[usize::from(sample.t[1])].name;
         let prefix = super::super::packed_terminal::chain(program.insts[..=pc].to_vec(), e.grid, 1);
         plow_asset::aux_program::Section {
@@ -1123,6 +1128,9 @@ fn speech_autoregressive_paths_trace_packet_sampling() {
             e.read_tensor_range(logits_name, 0, bytemuck::cast_slice_mut(&mut logits))
                 .unwrap();
             assert!(logits.iter().all(|v| v.is_finite()));
+            if head.i[7] == 2048 {
+                assert!(logits.iter().all(|v| v.to_bits() & 0xffff == 0));
+            }
             cases.push(serde_json::json!({"id":arm["arm"],"hidden_bf16":current.hidden_bf16,
                 "prefix_codes":current.codes[..codebook],"selected":selected[codebook],"logits":logits}));
         }
@@ -1130,7 +1138,7 @@ fn speech_autoregressive_paths_trace_packet_sampling() {
         serde_json::to_writer(
             std::fs::File::create(path.with_extension("predictor.json")).unwrap(),
             &serde_json::json!({"version":1,"frame":frame,"codebook":codebook,"sampler_pc":pc,
-                "sampler_i":sample.i,"cases":cases,"prefix_selection_matches_full":true}),
+                "sampler_i":sample.i,"head_flags":head.i[7],"cases":cases,"prefix_selection_matches_full":true}),
         )
         .unwrap();
     }
