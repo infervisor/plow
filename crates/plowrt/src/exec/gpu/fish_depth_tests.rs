@@ -22,8 +22,10 @@ fn upload_inputs(
                     codes[at + c] = (span.slot + span.kv_row0 + r as u32 + c as u32) % 16;
                 }
                 if span.kv_row0 + r as u32 == 1 && e.handle_of("in.encoder_overlay").is_some() {
-                    index[span.row0 as usize + r] = (overlays.len() / hidden) as u32;
-                    overlays.extend((0..hidden).map(|j| ((j % 17) as f32 - 8.0) * 0.001));
+                    index[span.row0 as usize + r] = 0;
+                    if overlays.is_empty() {
+                        overlays.extend((0..hidden).map(|j| ((j % 17) as f32 - 8.0) * 0.001));
+                    }
                 }
             }
         }
@@ -80,8 +82,15 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
     assert!(e.token_batch_enabled() && e.packed_depth_enabled());
     let shared = e.vmm_prefix_enabled();
     assert!(shared || e.slot_prefix_reuse_supported());
+    let live = e.live_slot_prefix_supported();
+    if crate::config::RuntimeConfig::get().nv.vmm_live {
+        assert!(
+            live,
+            "explicit live KV must exercise private live prefix reuse"
+        );
+    }
     eprintln!(
-        "cache mode: shared VMM={shared}, slot prefix={}",
+        "cache mode: shared VMM={shared}, private live={live}, slot prefix={}",
         e.slot_prefix_reuse_supported()
     );
     assert!(e.batch >= 4);
@@ -440,4 +449,246 @@ fn speech_mixed_batch_maps_frames_and_reuses_only_matching_content() {
         "unstaged speech was accepted"
     );
     assert_eq!(e.pos, before);
+}
+
+fn logit_kl(reference: &[f32], actual: &[f32]) -> f64 {
+    assert_eq!(reference.len(), actual.len());
+    assert!(reference.iter().chain(actual).all(|v| v.is_finite()));
+    let softmax = |values: &[f32]| {
+        let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut p: Vec<f64> = values.iter().map(|&v| f64::from(v - max).exp()).collect();
+        let sum = p.iter().sum::<f64>();
+        p.iter_mut().for_each(|p| *p /= sum);
+        p
+    };
+    softmax(reference)
+        .into_iter()
+        .zip(softmax(actual))
+        .filter(|(p, _)| *p > 0.0)
+        .map(|(p, q)| p * (p / q).ln())
+        .sum()
+}
+
+#[test]
+#[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, RUST_MIN_STACK=67108864; run through gpuq"]
+fn speech_mixed_batch_preserves_logits_at_serving_concurrencies() {
+    let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).unwrap();
+    assert!(e.token_batch_enabled() && e.packed_depth_enabled() && e.batch >= 32);
+    let m = e.fish.as_ref().unwrap().manifest.clone();
+    let contract = m.packed.as_ref().unwrap();
+    let controller = (m.sampler == Sampler::Maya2).then(|| {
+        let text =
+            std::fs::read_to_string(assets.join("checkpoint/maya2_controller.json")).unwrap();
+        crate::tts::maya2::Controller::parse(&text).unwrap()
+    });
+    let bind = |e: &mut GpuEngine, slot: usize| {
+        e.fish_reset_slot(slot).unwrap();
+        if let Some(ctl) = &controller {
+            let plan = ctl.plan(
+                "A short correctness check.",
+                "en",
+                Some(8),
+                ctl.cb0,
+                193 + slot as u64,
+            );
+            e.maya2_bind(slot, plan, None).unwrap();
+        }
+    };
+    let mut discrepancies = Vec::new();
+    for n in [1, 8, 32] {
+        let prompts: Vec<Vec<u32>> = (0..n)
+            .map(|slot| {
+                let mut ids: Vec<_> = (0..7 + slot % 3)
+                    .map(|i| (31 + slot as u32 * 101 + i as u32 * 7919) % contract.input_vocab)
+                    .collect();
+                if let Some(token) = contract.decode_token {
+                    ids[3] = token;
+                }
+                ids
+            })
+            .collect();
+        for (slot, prompt) in prompts.iter().enumerate() {
+            e.admit_packed_slot(slot, prompt, prompt.len() + 8)
+                .unwrap()
+                .unwrap();
+            bind(&mut e, slot);
+        }
+        let requests: Vec<_> = (0..n)
+            .rev()
+            .map(|slot| Request {
+                id: slot as u32,
+                slot: slot as u32,
+                state_slot: slot as u32,
+                generation: e.slot_generation(slot).unwrap(),
+                phase: Phase::Prefill,
+                tokens: &prompts[slot],
+                prompt_len: prompts[slot].len() as u32,
+                selection: Selection::default(),
+            })
+            .collect();
+        let mut outputs = Vec::new();
+        e.token_batch_step_staged(&requests, &mut outputs, None, &mut |_| {}, &mut |e, p| {
+            upload_inputs(e, &m, p)
+        })
+        .unwrap();
+        assert_eq!(outputs.len(), n);
+        let fresh_slot = (n > 1).then_some(n - 1);
+        let mut fresh_logits = Vec::new();
+        if let Some(slot) = fresh_slot {
+            let row = outputs.iter().position(|o| o.0 as usize == slot).unwrap();
+            e.logits_row(row, &mut fresh_logits).unwrap();
+        }
+        draw(&mut e, &outputs, 0);
+        let inputs: Vec<_> = (0..n)
+            .map(|slot| [contract.input_vocab - 3 - slot as u32])
+            .collect();
+        let feeds: Vec<_> = (0..n)
+            .rev()
+            .filter(|&slot| Some(slot) != fresh_slot)
+            .map(|slot| (slot, inputs[slot][0]))
+            .collect();
+        if e.handle_of("in.encoder_overlay_index").is_some() {
+            let keep = vec![u32::MAX - 1; e.pf_max_rows()];
+            e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&keep))
+                .unwrap();
+        }
+        e.step_slots(&feeds, &mut Vec::new()).unwrap();
+        let mut reference = vec![Vec::new(); n];
+        for &(slot, _) in &feeds {
+            e.logits_row(slot, &mut reference[slot]).unwrap();
+            e.rewind_slot(slot, prompts[slot].len()).unwrap();
+        }
+        // All-decode batches use prefill attention; mixed batches arm the decode riders.
+        // Keep the terminal row count fixed so the control uses the same head geometry.
+        let control: Vec<_> = (0..n)
+            .rev()
+            .map(|slot| Request {
+                id: slot as u32,
+                slot: slot as u32,
+                state_slot: slot as u32,
+                generation: e.slot_generation(slot).unwrap(),
+                phase: Phase::Decode,
+                tokens: &inputs[slot],
+                prompt_len: prompts[slot].len() as u32,
+                selection: Selection::default(),
+            })
+            .collect();
+        e.token_batch_step_staged(&control, &mut outputs, None, &mut |_| {}, &mut |e, p| {
+            upload_inputs(e, &m, p)
+        })
+        .unwrap();
+        let mut packed_reference = vec![Vec::new(); n];
+        for (row, &(slot, _)) in outputs.iter().enumerate() {
+            e.logits_row(row, &mut packed_reference[slot as usize])
+                .unwrap();
+            e.rewind_slot(slot as usize, prompts[slot as usize].len())
+                .unwrap();
+        }
+        if let Some(slot) = fresh_slot {
+            e.retire_slot(slot, false);
+            assert_eq!(
+                e.admit_packed_slot(slot, &prompts[slot], prompts[slot].len() + 8)
+                    .unwrap(),
+                Some(0)
+            );
+            bind(&mut e, slot);
+        }
+        let requests: Vec<_> = (0..n)
+            .rev()
+            .map(|slot| Request {
+                id: slot as u32,
+                slot: slot as u32,
+                state_slot: slot as u32,
+                generation: e.slot_generation(slot).unwrap(),
+                phase: if Some(slot) == fresh_slot {
+                    Phase::Prefill
+                } else {
+                    Phase::Decode
+                },
+                tokens: if Some(slot) == fresh_slot {
+                    &prompts[slot]
+                } else {
+                    &inputs[slot]
+                },
+                prompt_len: prompts[slot].len() as u32,
+                selection: Selection::default(),
+            })
+            .collect();
+        e.token_batch_step_staged(&requests, &mut outputs, None, &mut |_| {}, &mut |e, p| {
+            upload_inputs(e, &m, p)
+        })
+        .unwrap();
+        assert_eq!(outputs.len(), n);
+        let mut seen = vec![false; n];
+        let mut max_kl = 0f64;
+        let mut max_packed_kl = 0f64;
+        for (row, &(owner, _)) in outputs.iter().enumerate() {
+            let slot = owner as usize;
+            assert!(slot < n && !std::mem::replace(&mut seen[slot], true));
+            let is_fresh = Some(slot) == fresh_slot;
+            assert_eq!(
+                e.pos[slot] as usize,
+                prompts[slot].len() + usize::from(!is_fresh)
+            );
+            let mut actual = Vec::new();
+            e.logits_row(row, &mut actual).unwrap();
+            let reference = if is_fresh {
+                &fresh_logits
+            } else {
+                &reference[slot]
+            };
+            let kl = logit_kl(reference, &actual);
+            max_kl = max_kl.max(kl);
+            if !is_fresh {
+                let packed_kl = logit_kl(&packed_reference[slot], &actual);
+                max_packed_kl = max_packed_kl.max(packed_kl);
+                if packed_kl >= 1e-3 {
+                    eprintln!("concurrency {n}, slot {slot}: packed-control KL={packed_kl}");
+                    discrepancies.push(("packed", n, slot, packed_kl));
+                }
+            }
+            if kl >= 1e-3 {
+                let reference_top = crate::text::sample::argmax(reference) as usize;
+                let actual_top = crate::text::sample::argmax(&actual) as usize;
+                eprintln!("concurrency {n}, slot {slot}: KL={kl}, fresh={is_fresh}, top1 reference={reference_top} actual={actual_top}, reference gap={}", reference[reference_top] - reference[actual_top]);
+                discrepancies.push(("ordinary", n, slot, kl));
+            }
+        }
+        eprintln!(
+            "concurrency {n}: all physical owners/frontiers correct, max ordinary KL={max_kl}, max packed-control KL={max_packed_kl}"
+        );
+        let rows: Vec<_> = outputs
+            .iter()
+            .map(|&(owner, _)| FishRow {
+                slot: owner as usize,
+                hidden_row: owner,
+                seed: 193 + u64::from(owner),
+                step: u32::from(Some(owner as usize) != fresh_slot),
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 1,
+                ras_temperature: 1.0,
+                ras_top_p: 1.0,
+                repetition_penalty: 1.0,
+                cfg: None,
+            })
+            .collect();
+        let owners: Vec<_> = outputs.iter().map(|o| o.0).collect();
+        let mut codes = Vec::new();
+        e.fish_depth_step_compact(&rows, &owners, &mut codes)
+            .unwrap();
+        assert_eq!(codes.len(), n * m.codebooks as usize);
+        assert!(codes
+            .chunks_exact(m.codebooks as usize)
+            .all(|c| c[0] <= m.stop_class));
+        for slot in 0..n {
+            e.retire_slot(slot, false);
+        }
+    }
+    assert!(
+        discrepancies.is_empty(),
+        "ordinary vs packed decode KL >= 1e-3: {discrepancies:?}"
+    );
 }
