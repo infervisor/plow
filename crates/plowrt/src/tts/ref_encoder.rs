@@ -163,9 +163,7 @@ mod tests {
         assert!(all_pass, "speaker frontend numerical gate failed");
     }
 
-    #[test]
-    #[ignore = "SPEAKER_CHECKPOINT and SPEAKER_PACKET_OUT; trained CPU-only sidecar emit with approved Lean verifier"]
-    fn emit_trained_speaker_packet() {
+    fn install_speaker_verifier() {
         devgen::install_sidecar_verifier(Box::new(|requests| {
             let (certs, hash) =
                 lean_verify::call_batch_bound(requests).map_err(|e| e.to_string())?;
@@ -188,6 +186,12 @@ mod tests {
                 .map_err(|e| e.to_string())?;
             Ok(Some((certs, hash)))
         }));
+    }
+
+    #[test]
+    #[ignore = "SPEAKER_CHECKPOINT and SPEAKER_PACKET_OUT; trained CPU-only sidecar emit with approved Lean verifier"]
+    fn emit_trained_speaker_packet() {
+        install_speaker_verifier();
         let dir = std::env::var("SPEAKER_CHECKPOINT").unwrap();
         let out = std::env::var("SPEAKER_PACKET_OUT").unwrap();
         let (model, section) =
@@ -213,6 +217,281 @@ mod tests {
         assert_eq!(receipts.program_checks.len(), programs);
         assert!(receipts.program_checks.iter().all(Option::is_some));
         println!("all {programs} speaker programs have approved Lean logical-effect receipts");
+    }
+
+    fn speaker_layer_slice(
+        model: &packet::devbuild::Model,
+        program: usize,
+        key: &str,
+    ) -> (packet::devbuild::Program, u32, u32, usize) {
+        use packet::dev::{DevOp, ACT_ROUND_BF16};
+        let insts = &model.progs[program].insts;
+        let weight = format!("w.{key}.weight");
+        let packed = format!("part.{weight}.");
+        let bias = model
+            .tensors
+            .iter()
+            .position(|t| t.name == format!("w.{key}.bias"))
+            .unwrap() as u32;
+        let first = insts
+            .iter()
+            .position(|d| {
+                matches!(d.op, x if x == DevOp::Conv1dF32 as u16 || x == DevOp::DenseGemmF32 as u16)
+                    && model
+                        .tensors
+                        .get(d.t[2] as usize)
+                        .is_some_and(|t| t.name == weight || t.name.starts_with(&packed))
+            })
+            .unwrap();
+        let start = if insts[first].op == DevOp::DenseGemmF32 as u16 {
+            assert_eq!(insts[first - 1].op, DevOp::CopyColsF32 as u16);
+            first - 1
+        } else {
+            first
+        };
+        let add = insts
+            .iter()
+            .enumerate()
+            .skip(first)
+            .find(|(_, d)| d.op == DevOp::BinaryF32 as u16 && d.t[2] == bias && d.i[3] == 0)
+            .unwrap()
+            .0;
+        assert_eq!(insts[add + 1].op, DevOp::UnaryF32 as u16);
+        assert_eq!(insts[add + 1].i[2], ACT_ROUND_BF16);
+        let input = insts[start].t[1];
+        let output = insts[add].t[0];
+        assert_eq!(insts[add + 1].t[..2], [output, output]);
+        let mut builder = packet::devbuild::Builder::new(model.n_cu);
+        builder.adopt_tensors(
+            model
+                .tensors
+                .iter()
+                .map(|t| packet::devbuild::TensorDecl {
+                    name: t.name.clone(),
+                    bytes: t.bytes,
+                    init: None,
+                })
+                .collect(),
+        );
+        let mut previous = None;
+        let padded = insts[first].op == DevOp::Conv1dF32 as u16
+            && insts[first].t[6] != packet::dev::TENSOR_NONE
+            && model.tensors[insts[first].t[6] as usize].name == "act.spk.padded_length";
+        let mut selected = Vec::new();
+        if padded {
+            assert_eq!(insts[0].op, DevOp::LengthAffineU32 as u16);
+            selected.push(&insts[0]);
+        }
+        selected.extend(&insts[start..=add + 1]);
+        for source in selected {
+            let op = *DevOp::ALL
+                .iter()
+                .find(|&&op| op as u16 == source.op)
+                .unwrap();
+            let cus = (0..u32::from(source.blocks))
+                .map(|cu| cu % model.n_cu)
+                .collect();
+            previous =
+                Some(
+                    builder.emit(op, cus, &previous.into_iter().collect::<Vec<_>>(), |d| {
+                        d.t = source.t;
+                        d.i = source.i;
+                        d.f = source.f;
+                        d.j = source.j;
+                    }),
+                );
+        }
+        let pad = if padded {
+            (insts[first].i[4] - 1) * insts[first].i[6] / 2
+        } else {
+            0
+        };
+        (builder.finish(), input, output, pad as usize)
+    }
+
+    #[test]
+    #[ignore = "SPEAKER_CHECKPOINT, SPEAKER_PACKET_OUT, SPEAKER_REFERENCE_JSON, SPEAKER_LAYER_PLAN; CPU-only layer replay emit"]
+    fn emit_trained_speaker_layers() {
+        install_speaker_verifier();
+        let dir = std::env::var("SPEAKER_CHECKPOINT").unwrap();
+        let out = std::env::var("SPEAKER_PACKET_OUT").unwrap();
+        let reference: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("SPEAKER_REFERENCE_JSON").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let (mut model, section) =
+            devgen::speaker_encoder::lower_speaker_encoder(Path::new(&dir), 132, 90).unwrap();
+        let metadata: plow_asset::packet_pipeline::PacketPipelines =
+            serde_json::from_slice(&section.data).unwrap();
+        let mut programs = Vec::new();
+        let mut plans = Vec::new();
+        let mut rows: Vec<_> = reference["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["mel_rows"].as_u64().unwrap() as usize)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        for rows in rows {
+            let cap = [128, 256, 512, 1024, 2048]
+                .into_iter()
+                .find(|&cap| cap >= rows)
+                .unwrap();
+            let source = metadata.pipelines[0].programs[&format!("encode.r{cap}.n{rows}")] as usize;
+            for name in reference["convolutions"].as_object().unwrap().keys() {
+                let key = name
+                    .replace(".res2net_block.blocks.", ".res2net.")
+                    .replace(".se_block.", ".se.");
+                let (program, input, output, pad) = speaker_layer_slice(&model, source, &key);
+                let index = programs.len();
+                programs.push(program);
+                plans.push(
+                    serde_json::json!({"rows": rows, "capacity": cap, "layer": name,
+                    "program": index, "input": model.tensors[input as usize].name,
+                    "output": model.tensors[output as usize].name, "reflect_pad": pad}),
+                );
+            }
+        }
+        model.progs = programs;
+        model.prog_t = plans
+            .iter()
+            .map(|p| p["capacity"].as_u64().unwrap() as u32)
+            .collect();
+        devgen::write_sidecar_packet(Path::new(&out), &model, &[]);
+        let receipts: plow_asset::certificates::SidecarCheckReceipts = serde_json::from_slice(
+            &std::fs::read(plow_asset::certificates::sidecar_checks_file(Path::new(
+                &out,
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipts.program_checks.len(), plans.len());
+        assert!(receipts.program_checks.iter().all(Option::is_some));
+        std::fs::write(
+            std::env::var("SPEAKER_LAYER_PLAN").unwrap(),
+            serde_json::to_vec_pretty(&plans).unwrap(),
+        )
+        .unwrap();
+        println!(
+            "{} isolated convolution programs emitted with approved receipts",
+            plans.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "SPEAKER_PACKET, SPEAKER_REFERENCE_JSON, SPEAKER_LAYER_PLAN, SPEAKER_RESULT_JSON, SPEAKER_BACKEND; layer arithmetic diagnosis, no benchmark"]
+    fn speaker_layers_match_trained_reference() {
+        let packet = std::env::var("SPEAKER_PACKET").unwrap();
+        let backend = std::env::var("SPEAKER_BACKEND").unwrap();
+        let result = std::path::PathBuf::from(std::env::var("SPEAKER_RESULT_JSON").unwrap());
+        let reference: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("SPEAKER_REFERENCE_JSON").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let plans: Vec<serde_json::Value> = serde_json::from_slice(
+            &std::fs::read(std::env::var("SPEAKER_LAYER_PLAN").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut runtime = load_packet_runtime_on(Path::new(&packet), &backend, 0)
+            .unwrap()
+            .runtime;
+        let mut checks = Vec::new();
+        let mut outputs = Vec::new();
+        for case in reference["cases"].as_array().unwrap() {
+            let bytes = std::fs::read(case["path"].as_str().unwrap()).unwrap();
+            let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+            for plan in plans.iter().filter(|p| p["rows"] == case["mel_rows"]) {
+                let name = plan["layer"].as_str().unwrap();
+                let x = tensors.tensor(&format!("conv.{name}.input")).unwrap();
+                let y = tensors.tensor(&format!("conv.{name}.output")).unwrap();
+                assert_eq!(x.dtype(), safetensors::Dtype::BF16);
+                assert_eq!(y.dtype(), safetensors::Dtype::BF16);
+                assert_eq!(x.shape()[0], 1);
+                assert_eq!(y.shape()[0], 1);
+                assert_eq!(x.shape()[2], y.shape()[2]);
+                let rows = x.shape()[2];
+                let decode = |t: &safetensors::tensor::TensorView<'_>| -> Vec<f32> {
+                    let cols = t.shape()[1];
+                    (0..rows * cols)
+                        .map(|i| {
+                            let at = ((i % cols) * rows + i / cols) * 2;
+                            f32::from_bits(
+                                u32::from(u16::from_le_bytes(
+                                    t.data()[at..at + 2].try_into().unwrap(),
+                                )) << 16,
+                            )
+                        })
+                        .collect()
+                };
+                let values = reflect_features(
+                    &decode(&x),
+                    x.shape()[1],
+                    plan["reflect_pad"].as_u64().unwrap() as usize,
+                );
+                let input = runtime.tensor(plan["input"].as_str().unwrap()).unwrap();
+                let poison = vec![f32::NAN; input.bytes / 4];
+                runtime
+                    .write_tensor_at(input, 0, bytemuck::cast_slice(&poison))
+                    .unwrap();
+                runtime
+                    .write_tensor_at(input, 0, bytemuck::cast_slice(&values))
+                    .unwrap();
+                let length = runtime.tensor("in.spk.length").unwrap();
+                runtime
+                    .write_tensor_at(
+                        length,
+                        0,
+                        &(case["mel_rows"].as_u64().unwrap() as u32).to_le_bytes(),
+                    )
+                    .unwrap();
+                runtime
+                    .run(plan["program"].as_u64().unwrap() as usize)
+                    .unwrap();
+                let expected = decode(&y);
+                let mut actual = vec![0f32; expected.len()];
+                let output = runtime.tensor(plan["output"].as_str().unwrap()).unwrap();
+                runtime
+                    .read_tensor_at(output, 0, bytemuck::cast_slice_mut(&mut actual))
+                    .unwrap();
+                let finite = actual.iter().all(|v| v.is_finite());
+                let changed = actual
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let max_abs = actual
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                let offset = outputs.len();
+                outputs.extend_from_slice(bytemuck::cast_slice(&actual));
+                let check = serde_json::json!({"case":case["case"], "layer":name,"rows":rows,
+                    "width":y.shape()[1],"elements":actual.len(),"changed":changed,"max_abs":max_abs,"finite":finite,
+                    "output_offset_bytes":offset,"program":plan["program"]});
+                println!("{check}");
+                checks.push(check);
+            }
+        }
+        assert_eq!(
+            checks.len(),
+            reference["cases"].as_array().unwrap().len()
+                * reference["convolutions"].as_object().unwrap().len()
+        );
+        let exact = checks.iter().filter(|c| c["changed"] == 0).count();
+        let output_path = result.with_extension("f32");
+        std::fs::write(&output_path, outputs).unwrap();
+        std::fs::write(&result, serde_json::to_vec_pretty(&serde_json::json!({
+            "scope":"native isolated convolution arithmetic diagnosis; no timings", "backend":backend,
+            "calls":checks.len(),"exact":exact,"all_finite":checks.iter().all(|c| c["finite"] == true),
+            "output_f32_le":output_path,"checks":checks})).unwrap()).unwrap();
+        assert!(checks.iter().all(|c| c["finite"] == true));
+        assert_eq!(
+            exact,
+            checks.len(),
+            "isolated native convolutions differ from captured reference"
+        );
     }
 
     #[test]
