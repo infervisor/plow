@@ -31,6 +31,136 @@ pub struct RefEncoder {
 mod tests {
     use super::*;
 
+    struct CountedRuntime {
+        tensors: [Vec<u8>; 3],
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_first: bool,
+    }
+
+    impl PacketRuntime for CountedRuntime {
+        fn tensor(&self, _: &str) -> Option<PacketTensor> {
+            None
+        }
+
+        fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> crate::Result<()> {
+            self.tensors[tensor.handle].copy_from_slice(bytes);
+            Ok(())
+        }
+
+        fn read_tensor(&self, tensor: PacketTensor, bytes: &mut [u8]) -> crate::Result<()> {
+            bytes.copy_from_slice(&self.tensors[tensor.handle]);
+            Ok(())
+        }
+
+        fn copy_tensor(
+            &mut self,
+            _: PacketTensor,
+            _: usize,
+            _: PacketTensor,
+            _: usize,
+            _: usize,
+        ) -> crate::Result<()> {
+            unreachable!()
+        }
+
+        fn run(&mut self, program: usize) -> crate::Result<()> {
+            assert_eq!(program, 0);
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_first && call == 0 {
+                return Err(crate::RuntimeError::Device(
+                    "injected encoder failure".into(),
+                ));
+            }
+            let code: [u8; 4] = self.tensors[0][..4].try_into().unwrap();
+            for dst in self.tensors[2].chunks_exact_mut(4) {
+                dst.copy_from_slice(&code);
+            }
+            Ok(())
+        }
+
+        fn last_run_us(&self) -> f64 {
+            0.
+        }
+    }
+
+    fn counted_encoder(
+        samples: bool,
+        fail_first: bool,
+    ) -> (RefEncoder, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let encoder = RefEncoder {
+            runtime: Mutex::new(Box::new(CountedRuntime {
+                tensors: [vec![0; 16], vec![0; 4], vec![0; 16]],
+                calls: calls.clone(),
+                fail_first,
+            })),
+            capacities: vec![(2, 0)],
+            pcm: PacketTensor {
+                handle: 0,
+                bytes: 16,
+            },
+            samples: samples.then_some(PacketTensor {
+                handle: 1,
+                bytes: 4,
+            }),
+            codes: PacketTensor {
+                handle: 2,
+                bytes: 16,
+            },
+            sample_rate: 24000,
+            frame_samples: 2,
+            frame_codes: 2,
+            cache: Mutex::new(Vec::new()),
+        };
+        (encoder, calls)
+    }
+
+    #[test]
+    fn concurrent_reference_cache_misses_share_one_execution() {
+        for samples in [false, true] {
+            let (encoder, calls) = counted_encoder(samples, false);
+            let start = std::sync::Barrier::new(32);
+            let pcm = [0.25, 0.5, 0.75];
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..32)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            assert!(encoder.cached(&pcm).is_none());
+                            start.wait();
+                            encoder.encode_miss(&pcm).unwrap()
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    assert_eq!(handle.join().unwrap(), [0.25f32.to_bits(); 4]);
+                }
+            });
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                encoder.encode(&[0.5, 0.5, 0.75]).unwrap(),
+                [0.5f32.to_bits(); 4]
+            );
+            assert_eq!(encoder.encode(&pcm).unwrap(), [0.25f32.to_bits(); 4]);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn failed_reference_encoding_is_not_cached() {
+        for samples in [false, true] {
+            let (encoder, calls) = counted_encoder(samples, true);
+            let pcm = [0.25, 0.5, 0.75];
+            assert!(encoder.encode(&pcm).is_err());
+            assert!(encoder.cache.lock().is_empty());
+            assert_eq!(encoder.encode(&pcm).unwrap(), [0.25f32.to_bits(); 4]);
+            assert_eq!(encoder.encode(&pcm).unwrap(), [0.25f32.to_bits(); 4]);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(encoder.encode(&[]).is_err());
+            assert!(encoder.encode(&[0.; 5]).is_err());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+
     fn speaker_driver(asset: &PacketAsset) -> &str {
         let drivers: Vec<_> = asset
             .pipelines()
@@ -1043,15 +1173,19 @@ impl RefEncoder {
 
     /// `[ceil(n / frame_samples)][frame_codes]` codes of `pcm` (mono, at `sample_rate`).
     pub fn encode(&self, pcm: &[f32]) -> Result<Vec<u32>, String> {
-        {
-            let mut cache = self.cache.lock();
-            if let Some(i) = cache.iter().position(|(clip, _)| clip.as_slice() == pcm) {
-                let hit = cache.remove(i);
-                let codes = hit.1.clone();
-                cache.push(hit);
-                return Ok(codes);
-            }
-        }
+        self.cached(pcm).map_or_else(|| self.encode_miss(pcm), Ok)
+    }
+
+    fn cached(&self, pcm: &[f32]) -> Option<Vec<u32>> {
+        let mut cache = self.cache.lock();
+        let i = cache.iter().position(|(clip, _)| clip.as_slice() == pcm)?;
+        let hit = cache.remove(i);
+        let codes = hit.1.clone();
+        cache.push(hit);
+        Some(codes)
+    }
+
+    fn encode_miss(&self, pcm: &[f32]) -> Result<Vec<u32>, String> {
         let frames = pcm.len().div_ceil(self.frame_samples);
         let &(cap, program) = self
             .capacities
@@ -1064,8 +1198,11 @@ impl RefEncoder {
                     self.max_samples()
                 )
             })?;
-        let mut codes = vec![0u32; frames * self.frame_codes];
         let mut rt = self.runtime.lock();
+        if let Some(codes) = self.cached(pcm) {
+            return Ok(codes);
+        }
+        let mut codes = vec![0u32; frames * self.frame_codes];
         let e = |x: crate::RuntimeError| format!("reference encoder: {x}");
         if let Some(samples) = self.samples {
             let count = u32::try_from(pcm.len())
@@ -1093,7 +1230,7 @@ impl RefEncoder {
         rt.run(program).map_err(e)?;
         rt.read_tensor_at(self.codes, 0, bytemuck::cast_slice_mut(&mut codes))
             .map_err(e)?;
-        drop(rt);
+        // Publish before releasing the runtime so waiting misses reuse this execution.
         let mut cache = self.cache.lock();
         if cache.len() == CACHE {
             cache.remove(0);

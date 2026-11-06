@@ -751,6 +751,10 @@ Driver `codec.encode.v1` retains whole-capacity zero padding. Unsupported driver
 or incorrectly typed v2 sample-count binding are rejected. This contract alone does not enable
 a model's cloning capability or establish numerical/performance qualification.
 
+Concurrent reference-encoder cache misses reuse a completed encoding published while they
+wait for the encoder, provided it remains in the recent-clip cache. Failed encodings are not
+cached. A cache hit does not wait for an unrelated encoding.
+
 A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
 A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is
 cond + w (cond - uncond); a model trained with `cfg_scale` s of uncond + s (cond - uncond) takes
