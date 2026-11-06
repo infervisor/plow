@@ -224,6 +224,7 @@ mod tests {
         program: usize,
         key: &str,
         split_bf16: bool,
+        continuous_weights: &std::collections::BTreeMap<u32, u32>,
     ) -> (packet::devbuild::Program, u32, u32, usize) {
         use packet::dev::{DevOp, ACT_ROUND_BF16};
         let insts = &model.progs[program].insts;
@@ -292,6 +293,23 @@ mod tests {
         };
         for original in selected {
             let mut source = *original;
+            let mut round = None;
+            if source.op == DevOp::DenseGemmF32 as u16 {
+                if let Some(&weight) = continuous_weights.get(&source.t[2]) {
+                    assert_eq!(source.i[7] & !1, 4 | 8);
+                    assert_eq!(&source.i[3..7], &[0; 4]);
+                    assert!(source.t[3..].iter().all(|&h| h == packet::dev::TENSOR_NONE));
+                    let (rows, width, k) = (source.i[0], source.i[1], source.i[2]);
+                    assert_eq!(k % 4, 0);
+                    if source.i[7] & 1 != 0 {
+                        round = Some((rows, width));
+                    }
+                    source.op = DevOp::Conv1dF32 as u16;
+                    source.t[2] = weight;
+                    source.i = [1, rows, k, width, 1, 1, 1, 1];
+                    source.j = [0, (1 << 13) | (1 << 14) | (1 << 15)];
+                }
+            }
             if split_bf16 && source.op == DevOp::Conv1dF32 as u16 {
                 if !padded {
                     source.i[1] += 2 * pad;
@@ -326,6 +344,17 @@ mod tests {
                         d.j = source.j;
                     }),
                 );
+            if let Some((rows, width)) = round {
+                let cus = (0..u32::from(source.blocks))
+                    .map(|cu| cu % model.n_cu)
+                    .collect();
+                previous = Some(
+                    builder.emit(DevOp::UnaryF32, cus, &[previous.unwrap()], |d| {
+                        d.t[..2].copy_from_slice(&[source.t[0], source.t[0]]);
+                        d.i[..3].copy_from_slice(&[rows, width, ACT_ROUND_BF16]);
+                    }),
+                );
+            }
         }
         (builder.finish(), input, output, pad as usize)
     }
@@ -337,7 +366,10 @@ mod tests {
         let dir = std::env::var("SPEAKER_CHECKPOINT").unwrap();
         let out = std::env::var("SPEAKER_PACKET_OUT").unwrap();
         let route = std::env::var("SPEAKER_LAYER_ROUTE").unwrap_or_else(|_| "emitted".into());
-        assert!(matches!(route.as_str(), "emitted" | "split_bf16"));
+        assert!(matches!(
+            route.as_str(),
+            "emitted" | "split_bf16" | "continuous_bf16"
+        ));
         let split_bf16 = route == "split_bf16";
         let reference: serde_json::Value = serde_json::from_slice(
             &std::fs::read(std::env::var("SPEAKER_REFERENCE_JSON").unwrap()).unwrap(),
@@ -345,6 +377,30 @@ mod tests {
         .unwrap();
         let (mut model, section) =
             devgen::speaker_encoder::lower_speaker_encoder(Path::new(&dir), 132, 90).unwrap();
+        let mut continuous_weights = std::collections::BTreeMap::new();
+        if route == "continuous_bf16" {
+            for index in 0..model.tensors.len() {
+                let t = &model.tensors[index];
+                if !t.name.starts_with("part.") {
+                    continue;
+                }
+                let source = t.init.as_ref().unwrap();
+                assert_eq!(source.len() as u64, t.bytes);
+                assert_eq!(source.len() % 2, 0);
+                let bytes: Vec<_> = source
+                    .chunks_exact(2)
+                    .flat_map(|p| [0, 0, p[0], p[1]])
+                    .collect();
+                let tensor = packet::devbuild::TensorDecl {
+                    name: format!("wide.{}", t.name),
+                    bytes: bytes.len() as u64,
+                    init: Some(bytes),
+                };
+                continuous_weights.insert(index as u32, model.tensors.len() as u32);
+                model.tensors.push(tensor);
+            }
+            assert!(!continuous_weights.is_empty());
+        }
         let metadata: plow_asset::packet_pipeline::PacketPipelines =
             serde_json::from_slice(&section.data).unwrap();
         let mut programs = Vec::new();
@@ -368,7 +424,7 @@ mod tests {
                     .replace(".res2net_block.blocks.", ".res2net.")
                     .replace(".se_block.", ".se.");
                 let (program, input, output, pad) =
-                    speaker_layer_slice(&model, source, &key, split_bf16);
+                    speaker_layer_slice(&model, source, &key, split_bf16, &continuous_weights);
                 let index = programs.len();
                 programs.push(program);
                 plans.push(

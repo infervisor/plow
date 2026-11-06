@@ -1814,6 +1814,127 @@ static void t_format_group() {
 }
 #endif
 
+template <unsigned STEP>
+__global__ void k_bf16_mma_replay(const float* x, const float* w, const float* bias, float* y,
+                                 unsigned M, unsigned N, unsigned K, unsigned span, unsigned mode) {
+    const unsigned lane = threadIdx.x & 31u, g = lane >> 2, p = 2u * (lane & 3u);
+    const unsigned tile = blockIdx.x * 8u + threadIdx.x / 32u, tn = (N + 7u) / 8u;
+    if (tile >= ((M + 15u) / 16u) * tn) return;
+    const unsigned r = (tile / tn) * 16u + g, c = (tile % tn) * 8u;
+    float total[4] = {};
+    for (unsigned lo = 0; lo < K; lo += span) {
+        const unsigned end = min(K, lo + span);
+        float d[4] = {};
+        for (unsigned k = lo; k < end; k += STEP) {
+            unsigned a[4] = {}, b[2] = {};
+#pragma unroll
+            for (unsigned h = 0; h < STEP / 8u; h++) {
+#pragma unroll
+                for (unsigned j = 0; j < 2u; j++) {
+                    const unsigned ci = k + p + h * 8u + j;
+#pragma unroll
+                    for (unsigned hi = 0; hi < 2u; hi++) {
+                        const unsigned ri = r + hi * 8u;
+                        const float v = ri < M && ci < end ? x[(size_t)ri * K + ci] : 0.f;
+                        a[2u * h + hi] |= (unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(v)) << (16u * j);
+                    }
+                    const float v = c + g < N && ci < end ? w[(size_t)(c + g) * K + ci] : 0.f;
+                    b[h] |= (unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(v)) << (16u * j);
+                }
+            }
+            if constexpr (STEP == 8u) {
+                asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                    : "r"(a[0]), "r"(a[1]), "r"(b[0]));
+            } else {
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+            }
+        }
+#pragma unroll
+        for (unsigned j = 0; j < 4u; j++) {
+            const float part = mode == 1u || (mode == 2u && lo == 0u) ? sp_bf16(d[j]) : d[j];
+            total[j] = __fadd_rn(total[j], part);
+            if (mode == 2u) total[j] = sp_bf16(total[j]);
+        }
+    }
+#pragma unroll
+    for (unsigned j = 0; j < 4u; j++) {
+        const unsigned ri = r + (j / 2u) * 8u, ci = c + p + (j & 1u);
+        if (ri < M && ci < N)
+            y[(size_t)ri * N + ci] = sp_bf16(__fadd_rn(sp_bf16(total[j]), bias[ci]));
+    }
+}
+
+static int t_bf16_mma_replay(const char* input, const char* output) {
+    FILE* in = fopen(input, "rb");
+    FILE* out = fopen(output, "wb");
+    if (!in || !out) { perror("BF16 MMA fixture"); return 2; }
+    auto read = [&](void* p, size_t bytes) {
+        if (fread(p, 1, bytes, in) != bytes) { fprintf(stderr, "truncated BF16 MMA fixture\n"); exit(2); }
+    };
+    auto write = [&](const void* p, size_t bytes) {
+        if (fwrite(p, 1, bytes, out) != bytes) { perror("BF16 MMA output"); exit(2); }
+    };
+    uint32_t header[2];
+    read(header, sizeof(header));
+    if (header[0] != 0x31464d42u || !header[1] || header[1] > 4096u) return 2;
+    write(header, sizeof(header));
+    size_t differences[2] = {}, exact[2] = {};
+    bool finite = true;
+    for (unsigned item = 0; item < header[1]; item++) {
+        // BMF1: rows, columns, K, span, reduction (0 full F32, 1 parallel BF16, 2 serial BF16, 3 partitioned F32).
+        uint32_t shape[5];
+        read(shape, sizeof(shape));
+        const unsigned M = shape[0], N = shape[1], K = shape[2], span = shape[3], mode = shape[4];
+        if (!M || !N || !K || !span || span > K || mode > 3u || (mode == 0u && span != K) ||
+            (uint64_t)M * K > (1u << 27) || (uint64_t)N * K > (1u << 27) ||
+            (uint64_t)M * N > (1u << 27)) return 2;
+        std::vector<float> x((size_t)M * K), w((size_t)N * K), bias(N), expected((size_t)M * N), actual(expected.size());
+        read(x.data(), x.size() * 4u);
+        read(w.data(), w.size() * 4u);
+        read(bias.data(), bias.size() * 4u);
+        read(expected.data(), expected.size() * 4u);
+        for (const auto* values : {&x, &w, &bias}) for (float v : *values) {
+            uint32_t bits; memcpy(&bits, &v, 4);
+            if (!std::isfinite(v) || (bits & 0xffffu)) return 2;
+        }
+        float *dx, *dw, *db, *dy;
+        CK(cudaMalloc(&dx, x.size() * 4u)); CK(cudaMalloc(&dw, w.size() * 4u));
+        CK(cudaMalloc(&db, bias.size() * 4u)); CK(cudaMalloc(&dy, actual.size() * 4u));
+        CK(cudaMemcpy(dx, x.data(), x.size() * 4u, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dw, w.data(), w.size() * 4u, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(db, bias.data(), bias.size() * 4u, cudaMemcpyHostToDevice));
+        write(shape, sizeof(shape));
+        const unsigned blocks = ((((M + 15u) / 16u) * ((N + 7u) / 8u)) + 7u) / 8u;
+        for (unsigned variant = 0; variant < 2u; variant++) {
+            CK(cudaMemset(dy, 0xff, actual.size() * 4u));
+            if (variant == 0u) k_bf16_mma_replay<8><<<blocks, 256>>>(dx, dw, db, dy, M, N, K, span, mode);
+            else k_bf16_mma_replay<16><<<blocks, 256>>>(dx, dw, db, dy, M, N, K, span, mode);
+            CK(cudaGetLastError());
+            CK(cudaMemcpy(actual.data(), dy, actual.size() * 4u, cudaMemcpyDeviceToHost));
+            size_t changed = 0;
+            for (size_t i = 0; i < actual.size(); i++) {
+                finite = finite && std::isfinite(actual[i]);
+                changed += memcmp(&actual[i], &expected[i], 4) != 0;
+            }
+            differences[variant] += changed;
+            exact[variant] += changed == 0;
+            write(actual.data(), actual.size() * 4u);
+            printf("mma_replay case=%u kstep=%u rows=%u width=%u k=%u span=%u mode=%u changed=%zu\n",
+                   item, variant == 0u ? 8u : 16u, M, N, K, span, mode, changed);
+        }
+        CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(db)); CK(cudaFree(dy));
+    }
+    if (fgetc(in) != EOF || ferror(in) || fclose(in) != 0 || fclose(out) != 0) return 2;
+    printf("mma_replay cases=%u k8_exact=%zu k16_exact=%zu k8_differences=%zu k16_differences=%zu finite=%u\n",
+           header[1], exact[0], exact[1], differences[0], differences[1], (unsigned)finite);
+    return finite && !differences[0] && !differences[1] ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
@@ -1823,6 +1944,8 @@ int main(int argc, char** argv) {
     kSmem = (size_t)arena_floats * sizeof(float);
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
+
+    if (argc == 4 && !strcmp(argv[1], "--bf16-mma-replay")) return t_bf16_mma_replay(argv[2], argv[3]);
 
     if (argc > 1 && !strcmp(argv[1], "--conv-padding-only")) {
         t_conv_padding();
