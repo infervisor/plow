@@ -13,6 +13,27 @@ pub struct PacketTensor {
     pub bytes: usize,
 }
 
+pub struct PacketWrite<'a> {
+    pub tensor: PacketTensor,
+    pub offset: usize,
+    pub bytes: &'a [u8],
+}
+
+impl PacketWrite<'_> {
+    pub(crate) fn check(&self) -> Result<()> {
+        if self
+            .offset
+            .checked_add(self.bytes.len())
+            .is_none_or(|end| end > self.tensor.bytes)
+        {
+            return Err(RuntimeError::Device(
+                "packet tensor write is outside its bounds".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Runtime surface used by packetized pipelines.
 ///
 /// Model import, graph lowering and tensor-name conventions stay outside this interface. The
@@ -26,6 +47,24 @@ pub trait PacketRuntime: Send {
     }
     fn tensor(&self, name: &str) -> Option<PacketTensor>;
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()>;
+    /// Reserve transfer staging for full writes of these tensors before serving.
+    fn prepare_writes(&mut self, _tensors: &[PacketTensor]) -> Result<()> {
+        Ok(())
+    }
+    /// Ordered writes, completed before return. Overlapping writes retain slice order.
+    fn write_tensors(&mut self, writes: &[PacketWrite<'_>]) -> Result<()> {
+        for w in writes {
+            w.check()?;
+        }
+        for w in writes {
+            if w.offset == 0 && w.bytes.len() == w.tensor.bytes {
+                self.write_tensor(w.tensor, w.bytes)?;
+            } else {
+                self.write_tensor_at(w.tensor, w.offset, w.bytes)?;
+            }
+        }
+        Ok(())
+    }
     fn read_tensor(&self, tensor: PacketTensor, bytes: &mut [u8]) -> Result<()>;
     /// Write `bytes` at byte `offset` of `tensor`; the rest keeps its contents.
     fn write_tensor_at(&mut self, tensor: PacketTensor, offset: usize, bytes: &[u8]) -> Result<()> {
@@ -758,6 +797,88 @@ pub(crate) fn check_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_write_fallback_preserves_order_and_validates_ranges_before_writing() {
+        struct Memory([u8; 16], usize);
+        impl PacketRuntime for Memory {
+            fn tensor(&self, _: &str) -> Option<PacketTensor> {
+                None
+            }
+            fn write_tensor(&mut self, t: PacketTensor, bytes: &[u8]) -> Result<()> {
+                check_transfer(t, 0, 16, bytes.len())?;
+                self.0.copy_from_slice(bytes);
+                self.1 += 1;
+                Ok(())
+            }
+            fn read_tensor(&self, t: PacketTensor, bytes: &mut [u8]) -> Result<()> {
+                check_transfer(t, 0, 16, bytes.len())?;
+                bytes.copy_from_slice(&self.0);
+                Ok(())
+            }
+            fn copy_tensor(
+                &mut self,
+                _: PacketTensor,
+                _: usize,
+                _: PacketTensor,
+                _: usize,
+                _: usize,
+            ) -> Result<()> {
+                unreachable!()
+            }
+            fn run(&mut self, _: usize) -> Result<()> {
+                unreachable!()
+            }
+            fn last_run_us(&self) -> f64 {
+                0.0
+            }
+        }
+        let t = PacketTensor {
+            handle: 0,
+            bytes: 16,
+        };
+        let mut rt = Memory([0; 16], 0);
+        rt.write_tensors(&[
+            PacketWrite {
+                tensor: t,
+                offset: 0,
+                bytes: &[0xa5; 16],
+            },
+            PacketWrite {
+                tensor: t,
+                offset: 3,
+                bytes: &[1, 2, 3, 4],
+            },
+            PacketWrite {
+                tensor: t,
+                offset: 5,
+                bytes: &[5, 6],
+            },
+        ])
+        .unwrap();
+        let mut expected = [0xa5; 16];
+        expected[3..7].copy_from_slice(&[1, 2, 5, 6]);
+        assert_eq!(rt.0, expected);
+        assert_eq!(rt.1, 3);
+        for offset in [16, usize::MAX] {
+            assert!(rt
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: t,
+                        offset: 0,
+                        bytes: &[0xff]
+                    },
+                    PacketWrite {
+                        tensor: t,
+                        offset,
+                        bytes: &[1]
+                    },
+                ])
+                .is_err());
+            assert_eq!(rt.0, expected);
+            assert_eq!(rt.1, 3);
+        }
+    }
 
     struct FakeRuntime;
 

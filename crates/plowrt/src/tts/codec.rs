@@ -9,7 +9,7 @@ use std::sync::mpsc;
 
 use parking_lot::Mutex;
 
-use crate::exec::packet_runtime::{load_packet_runtime_on, PacketAsset, PacketTensor};
+use crate::exec::packet_runtime::{load_packet_runtime_on, PacketAsset, PacketTensor, PacketWrite};
 
 pub const PACKET: &str = "codec.pkt";
 const DRIVER: &str = "codec.v1";
@@ -335,7 +335,7 @@ struct StepIo {
     rope_buf: Vec<u32>,
     row_buf: Vec<u32>,
     n_buf: Vec<u32>,
-    len_buf: Vec<u32>,
+    len_buf: Vec<Vec<u32>>,
     pcm_buf: Vec<f32>,
 }
 
@@ -881,6 +881,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         let n = (0..param("lengths.count")?)
             .map(|k| pipeline.tensor(&format!("stream.n.{k}")).map_err(e))
             .collect::<Result<Vec<_>, String>>()?;
+        let len_buf = n.iter().map(|t| vec![0u32; t.bytes / 4]).collect();
         Some(StepIo {
             pos_buf: elems(pos),
             rope_buf: elems(rope),
@@ -894,7 +895,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             xf_rpf,
             row_pos,
             codes_buf: Vec::new(),
-            len_buf: Vec::new(),
+            len_buf,
             slot_buf,
             pcm_buf: Vec::new(),
         })
@@ -1003,7 +1004,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     if !(cached.is_empty() && slot_caps.is_empty()) && phase.is_none() {
         return Err("cached codec capacities without the window phase tensors".into());
     }
-    Ok(Bound {
+    let mut bound = Bound {
         slots: step_io
             .as_ref()
             .map(|io| std::sync::Arc::new(Mutex::new(SlotPool::new(io.slots)))),
@@ -1045,7 +1046,17 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             .parameter("render.yield_programs")
             .map(|v| v as usize)
             .unwrap_or(0),
-    })
+    };
+    let mut inputs: smallvec::SmallVec<[PacketTensor; 16]> =
+        smallvec::smallvec![bound.codes, bound.seed];
+    inputs.extend(bound.lengths.iter().map(|&(t, _)| t));
+    if let Some(io) = &bound.step_io {
+        inputs.extend([io.slot, io.pos, io.rope]);
+        inputs.extend(io.row_pos);
+        inputs.extend(io.n.iter().copied());
+    }
+    bound.runtime.prepare_writes(&inputs).map_err(e)?;
+    Ok(bound)
 }
 
 /// The smallest of `family` (ascending by batch * frames) holding `batch` items of `frames`.
@@ -1299,27 +1310,47 @@ impl Bound {
         }
         let e = |x: crate::RuntimeError| x.to_string();
         let rt = &mut self.runtime;
-        rt.write_tensor_at(self.codes, 0, bytemuck::cast_slice(&io.codes_buf))
-            .map_err(e)?;
-        rt.write_tensor(io.slot, bytemuck::cast_slice(&io.slot_buf))
-            .map_err(e)?;
-        rt.write_tensor(io.pos, bytemuck::cast_slice(&io.pos_buf))
-            .map_err(e)?;
-        rt.write_tensor(io.rope, bytemuck::cast_slice(&io.rope_buf))
-            .map_err(e)?;
+        let mut writes: smallvec::SmallVec<[PacketWrite<'_>; 16]> = smallvec::smallvec![
+            PacketWrite {
+                tensor: self.codes,
+                offset: 0,
+                bytes: bytemuck::cast_slice(&io.codes_buf)
+            },
+            PacketWrite {
+                tensor: io.slot,
+                offset: 0,
+                bytes: bytemuck::cast_slice(&io.slot_buf)
+            },
+            PacketWrite {
+                tensor: io.pos,
+                offset: 0,
+                bytes: bytemuck::cast_slice(&io.pos_buf)
+            },
+            PacketWrite {
+                tensor: io.rope,
+                offset: 0,
+                bytes: bytemuck::cast_slice(&io.rope_buf)
+            },
+        ];
         if let Some(t) = io.row_pos {
-            rt.write_tensor(t, bytemuck::cast_slice(&io.row_buf))
-                .map_err(e)?;
+            writes.push(PacketWrite {
+                tensor: t,
+                offset: 0,
+                bytes: bytemuck::cast_slice(&io.row_buf),
+            });
         }
-        for (&t, &(_, per_frame)) in io.n.iter().zip(&self.lengths) {
-            io.len_buf.clear();
-            io.len_buf.resize(t.bytes / 4, 0);
-            for (l, &n) in io.len_buf.iter_mut().zip(&io.n_buf[..cb]) {
+        for ((&t, &(_, per_frame)), values) in io.n.iter().zip(&self.lengths).zip(&mut io.len_buf) {
+            values.fill(0);
+            for (l, &n) in values.iter_mut().zip(&io.n_buf[..cb]) {
                 *l = n * per_frame as u32;
             }
-            rt.write_tensor(t, bytemuck::cast_slice(&io.len_buf))
-                .map_err(e)?;
+            writes.push(PacketWrite {
+                tensor: t,
+                offset: 0,
+                bytes: bytemuck::cast_slice(values),
+            });
         }
+        rt.write_tensors(&writes).map_err(e)?;
         let t1 = std::time::Instant::now();
         rt.run_sequence(&programs).map_err(e)?;
         let gpu_us = rt.last_run_us();
@@ -1378,25 +1409,35 @@ impl Bound {
             }
         }
         let e = |x: crate::RuntimeError| x.to_string();
-        self.runtime
-            .write_tensor_at(self.codes, 0, bytemuck::cast_slice(&codes))
-            .map_err(e)?;
+        let mut lengths = Vec::with_capacity(self.lengths.len());
         for &(tensor, per_frame) in &self.lengths {
             let mut len = vec![0u32; tensor.bytes / 4];
             for (i, j) in jobs.iter().enumerate() {
                 len[i] = (j.frames * per_frame) as u32;
             }
-            self.runtime
-                .write_tensor(tensor, bytemuck::cast_slice(&len))
-                .map_err(e)?;
+            lengths.push((tensor, len));
         }
         let mut seeds = vec![0u64; self.seed.bytes / 8];
         for (i, j) in jobs.iter().enumerate() {
             seeds[i] = j.seed;
         }
-        self.runtime
-            .write_tensor(self.seed, bytemuck::cast_slice(&seeds))
-            .map_err(e)?;
+        let mut writes: smallvec::SmallVec<[PacketWrite<'_>; 16]> =
+            smallvec::smallvec![PacketWrite {
+                tensor: self.codes,
+                offset: 0,
+                bytes: bytemuck::cast_slice(&codes)
+            },];
+        writes.extend(lengths.iter().map(|(tensor, len)| PacketWrite {
+            tensor: *tensor,
+            offset: 0,
+            bytes: bytemuck::cast_slice(len),
+        }));
+        writes.push(PacketWrite {
+            tensor: self.seed,
+            offset: 0,
+            bytes: bytemuck::cast_slice(&seeds),
+        });
+        self.runtime.write_tensors(&writes).map_err(e)?;
         let slotted = matches!(family, Family::Slot | Family::SlotCached);
         let slots = match (slotted, self.voice_slots.as_mut()) {
             (true, Some(vs)) => {
@@ -1767,6 +1808,122 @@ mod tests {
             _urgent: None,
             carry: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    struct SerialWrites(Box<dyn crate::exec::packet_runtime::PacketRuntime>);
+
+    #[cfg(feature = "cuda")]
+    impl crate::exec::packet_runtime::PacketRuntime for SerialWrites {
+        fn tensor(&self, name: &str) -> Option<PacketTensor> {
+            self.0.tensor(name)
+        }
+        fn write_tensor(&mut self, t: PacketTensor, bytes: &[u8]) -> crate::Result<()> {
+            self.0.write_tensor(t, bytes)
+        }
+        fn write_tensor_at(
+            &mut self,
+            t: PacketTensor,
+            at: usize,
+            bytes: &[u8],
+        ) -> crate::Result<()> {
+            self.0.write_tensor_at(t, at, bytes)
+        }
+        fn read_tensor(&self, t: PacketTensor, bytes: &mut [u8]) -> crate::Result<()> {
+            self.0.read_tensor(t, bytes)
+        }
+        fn read_tensor_at(
+            &self,
+            t: PacketTensor,
+            at: usize,
+            bytes: &mut [u8],
+        ) -> crate::Result<()> {
+            self.0.read_tensor_at(t, at, bytes)
+        }
+        fn copy_tensor(
+            &mut self,
+            s: PacketTensor,
+            so: usize,
+            t: PacketTensor,
+            to: usize,
+            n: usize,
+        ) -> crate::Result<()> {
+            self.0.copy_tensor(s, so, t, to, n)
+        }
+        fn run(&mut self, p: usize) -> crate::Result<()> {
+            self.0.run(p)
+        }
+        fn run_sequence(&mut self, p: &[usize]) -> crate::Result<()> {
+            self.0.run_sequence(p)
+        }
+        fn last_run_us(&self) -> f64 {
+            self.0.last_run_us()
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, RUST_MIN_STACK=67108864; run through gpuq"]
+    fn codec_bulk_inputs_preserve_pcm_for_decode_and_stream_steps() {
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let path = assets.join("codec.pkt");
+        let mut control = bind(&path, 0).unwrap();
+        let mut treatment = bind(&path, 0).unwrap();
+        control.runtime = Box::new(SerialWrites(control.runtime));
+        let maximum = control.capacities.iter().map(|c| c.0).max().unwrap();
+        let equal = |a: Vec<Decoded>, b: Vec<Decoded>| {
+            assert_eq!(a.len(), b.len());
+            for (a, b) in a.iter().zip(&b) {
+                assert!(a.pcm.iter().chain(&b.pcm).all(|v| v.is_finite()));
+                assert_eq!(a.pcm.len(), b.pcm.len());
+                assert!(
+                    a.pcm
+                        .iter()
+                        .zip(&b.pcm)
+                        .all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "bulk writes changed decoded PCM"
+                );
+            }
+        };
+        for width in [1, 8, 32].into_iter().filter(|&n| n <= maximum) {
+            for frames in [1, 2, 5] {
+                let jobs: Vec<_> = (0..width)
+                    .map(|b| {
+                        let mut j = job(false, frames, None);
+                        j.seed = 77 + b as u64;
+                        j.codes = (0..frames * control.frame_codes)
+                            .map(|i| ((i * 37 + b * 17) % 512) as i32)
+                            .collect();
+                        j
+                    })
+                    .collect();
+                equal(
+                    control.decode(&jobs).unwrap(),
+                    treatment.decode(&jobs).unwrap(),
+                );
+                eprintln!("codec bulk inputs: decode width={width} frames={frames}, PCM exact");
+            }
+        }
+        let maximum = control.steps.iter().map(|c| c.0).max().unwrap_or(0);
+        for width in [1, 8, 32].into_iter().filter(|&n| n <= maximum) {
+            let mut position = 0;
+            for frames in [1, 2, 5] {
+                let jobs: Vec<_> = (0..width)
+                    .map(|b| {
+                        let mut j = job(false, frames, Some(b as u32));
+                        j.step.as_mut().unwrap().pos = position;
+                        j.codes = (0..frames * control.frame_codes)
+                            .map(|i| ((i * 37 + b * 17 + position * 13) % 512) as i32)
+                            .collect();
+                        j
+                    })
+                    .collect();
+                equal(control.step(&jobs).unwrap(), treatment.step(&jobs).unwrap());
+                eprintln!("codec bulk inputs: stream width={width} position={position} frames={frames}, PCM exact");
+                position += frames;
+            }
+        }
+        assert!(treatment.runtime.last_run_us().is_finite());
     }
 
     #[test]

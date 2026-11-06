@@ -11,9 +11,11 @@ use packet::dev::{DevProgram, CTR_STRIDE};
 
 use super::{pod_bytes, BLOCK};
 use crate::asset::devblob::DevBlob;
-use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, GraphExec, KernelFn};
+use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, GraphExec, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
-use crate::exec::packet_runtime::{check_copy, check_transfer, PacketRuntime, PacketTensor};
+use crate::exec::packet_runtime::{
+    check_copy, check_transfer, PacketRuntime, PacketTensor, PacketWrite,
+};
 use crate::{Result, RuntimeError};
 
 /// The speech object and its entry symbol for a compute capability.
@@ -117,6 +119,8 @@ pub struct CudaPacketRuntime {
     /// valid); `None` once capture failed for that sequence.
     graphs: std::collections::HashMap<Vec<usize>, Option<GraphExec>>,
     last_us: f64,
+    input_stage: Option<PinnedHost>,
+    input_failed: bool,
     /// Last field: dropped after every allocation above, so [`resident_in`] turns false only once
     /// the device memory is back.
     _resident: Arc<()>,
@@ -324,6 +328,8 @@ impl CudaPacketRuntime {
             programs,
             graphs: std::collections::HashMap::new(),
             last_us: 0.0,
+            input_stage: None,
+            input_failed: false,
             _resident: {
                 let token = Arc::new(());
                 residents()
@@ -405,9 +411,165 @@ impl CudaPacketRuntime {
     }
 
     fn mem(&self, t: PacketTensor) -> Result<&DeviceMem> {
+        self.check_inputs()?;
         self.tensors.get(t.handle).ok_or_else(|| {
             RuntimeError::Device(format!("packet tensor handle {} is missing", t.handle))
         })
+    }
+
+    fn check_inputs(&self) -> Result<()> {
+        if self.input_failed {
+            return Err(RuntimeError::Device(
+                "packet input copies did not retire".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve_inputs(&mut self, size: usize) -> Result<()> {
+        if size > 0 && self.input_stage.as_ref().is_none_or(|s| s.len() < size) {
+            self.input_stage = Some(self.be.host_alloc_pinned(size)?);
+        }
+        Ok(())
+    }
+}
+
+fn input_size(mut sizes: impl Iterator<Item = usize>) -> Result<usize> {
+    sizes.try_fold(0usize, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .and_then(|n| n.checked_add(7))
+            .map(|n| n & !7)
+            .ok_or_else(|| RuntimeError::Device("packet input size overflow".into()))
+    })
+}
+
+fn submit_writes(
+    count: usize,
+    mut enqueue: impl FnMut(usize) -> Result<()>,
+    drain: impl FnOnce() -> Result<()>,
+    quarantine: impl FnOnce(),
+) -> Result<()> {
+    let status = (0..count).try_for_each(&mut enqueue);
+    if let Err(error) = drain() {
+        quarantine();
+        return Err(error);
+    }
+    status
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn input_writes_drain_after_success_or_any_enqueue_failure() {
+        for failure in [None, Some(0), Some(1), Some(2)] {
+            for drain_fails in [false, true] {
+                let seen = RefCell::new(Vec::new());
+                let quarantined = Cell::new(false);
+                let result = submit_writes(
+                    3,
+                    |i| {
+                        seen.borrow_mut().push(i);
+                        if failure == Some(i) {
+                            Err(RuntimeError::Device("enqueue".into()))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || {
+                        seen.borrow_mut().push(3);
+                        if drain_fails {
+                            Err(RuntimeError::Device("drain".into()))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || quarantined.set(true),
+                );
+                let mut expected: Vec<_> = (0..failure.map_or(3, |i| i + 1)).collect();
+                expected.push(3);
+                assert_eq!(*seen.borrow(), expected);
+                assert_eq!(quarantined.get(), drain_fails);
+                assert_eq!(result.is_err(), failure.is_some() || drain_fails);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS; run through gpuq"]
+    fn packet_bulk_writes_preserve_ranges_order_and_reuse() {
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let mut rt = CudaPacketRuntime::load(&assets.join("codec.pkt"), 0).unwrap();
+        let t = rt.create_tensor(64).unwrap();
+        for size in [7, 23, 3, 47, 7] {
+            let initial = [0xa5; 64];
+            rt.write_tensor(t, &initial).unwrap();
+            let first = vec![0x37; size];
+            let writes = [
+                PacketWrite {
+                    tensor: t,
+                    offset: 5,
+                    bytes: &first,
+                },
+                PacketWrite {
+                    tensor: t,
+                    offset: 9,
+                    bytes: &[1, 2, 3, 4],
+                },
+                PacketWrite {
+                    tensor: t,
+                    offset: 64,
+                    bytes: &[],
+                },
+            ];
+            rt.write_tensors(&writes).unwrap();
+            let mut expected = initial;
+            expected[5..5 + size].copy_from_slice(&first);
+            expected[9..13].copy_from_slice(&[1, 2, 3, 4]);
+            let mut actual = [0; 64];
+            rt.read_tensor(t, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            assert!(rt
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: t,
+                        offset: 0,
+                        bytes: &[0xff]
+                    },
+                    PacketWrite {
+                        tensor: t,
+                        offset: usize::MAX,
+                        bytes: &[1]
+                    },
+                ])
+                .is_err());
+            rt.read_tensor(t, &mut actual).unwrap();
+            assert_eq!(actual, expected, "validation must precede all transfers");
+            assert!(rt
+                .write_tensors(&[PacketWrite {
+                    tensor: PacketTensor { bytes: 63, ..t },
+                    offset: 0,
+                    bytes: &[1],
+                }])
+                .is_err());
+        }
+        rt.prepare_writes(&[t, t, t]).unwrap();
+        let pointer = rt.input_stage.as_ref().unwrap().as_ptr();
+        rt.write_tensors(&[PacketWrite {
+            tensor: t,
+            offset: 0,
+            bytes: &[0xa5; 64],
+        }])
+        .unwrap();
+        assert_eq!(
+            pointer,
+            rt.input_stage.as_ref().unwrap().as_ptr(),
+            "prepared input staging grew"
+        );
+        assert!(input_size([usize::MAX].into_iter()).is_err());
     }
 }
 
@@ -418,6 +580,78 @@ impl PacketRuntime for CudaPacketRuntime {
             handle,
             bytes: self.tensors[handle].len as usize,
         })
+    }
+
+    fn write_tensors(&mut self, writes: &[PacketWrite<'_>]) -> Result<()> {
+        self.check_inputs()?;
+        for w in writes {
+            let mem = self.mem(w.tensor)?;
+            check_transfer(
+                w.tensor,
+                w.tensor.handle,
+                mem.len as usize,
+                mem.len as usize,
+            )?;
+            w.check()?;
+        }
+        let size = input_size(writes.iter().map(|w| w.bytes.len()))?;
+        if size == 0 {
+            return Ok(());
+        }
+        self.reserve_inputs(size)?;
+        let stage = self.input_stage.as_mut().unwrap();
+        let mut offset = 0;
+        for w in writes {
+            stage.as_mut_slice()[offset..offset + w.bytes.len()].copy_from_slice(w.bytes);
+            offset = (offset + w.bytes.len() + 7) & !7;
+        }
+        let stage = self.input_stage.as_ref().unwrap();
+        let mut offset = 0;
+        let mut failed = false;
+        let result = submit_writes(
+            writes.len(),
+            |i| {
+                let w = &writes[i];
+                let source = &stage.as_slice()[offset..offset + w.bytes.len()];
+                offset = (offset + w.bytes.len() + 7) & !7;
+                if source.is_empty() {
+                    return Ok(());
+                }
+                // SAFETY: validated ranges, owned pinned source, and the batch drains below.
+                unsafe {
+                    self.be.memcpy_htod_async(
+                        self.tensors[w.tensor.handle].base + w.offset as u64,
+                        source,
+                        &self.stream,
+                    )
+                }
+            },
+            || self.be.stream_synchronize(&self.stream),
+            || failed = true,
+        );
+        if failed {
+            self.input_failed = true;
+            // An unretired copy may still use either allocation after this runtime is dropped.
+            std::mem::forget(self.input_stage.take().unwrap());
+            std::mem::forget(self.be.clone());
+            for w in writes {
+                self.tensors[w.tensor.handle].quarantine();
+            }
+            #[cfg(target_os = "linux")]
+            if let Err(error) = &result {
+                return Err(self.be.quarantine_staging(error));
+            }
+        }
+        result
+    }
+
+    fn prepare_writes(&mut self, tensors: &[PacketTensor]) -> Result<()> {
+        self.check_inputs()?;
+        for &t in tensors {
+            let mem = self.mem(t)?;
+            check_transfer(t, t.handle, mem.len as usize, mem.len as usize)?;
+        }
+        self.reserve_inputs(input_size(tensors.iter().map(|t| t.bytes))?)
     }
 
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()> {
@@ -491,6 +725,7 @@ impl PacketRuntime for CudaPacketRuntime {
     /// Every program is enqueued on the one stream (stream order is the dependency), as one
     /// CUDA graph after the first run of a sequence; one sync.
     fn run_sequence(&mut self, programs: &[usize]) -> Result<()> {
+        self.check_inputs()?;
         if let Some(&bad) = programs.iter().find(|&&p| p >= self.programs.len()) {
             return Err(RuntimeError::Rejected(format!(
                 "packet program {bad} is missing"
