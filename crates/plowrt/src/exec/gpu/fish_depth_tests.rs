@@ -470,6 +470,354 @@ fn logit_kl(reference: &[f32], actual: &[f32]) -> f64 {
         .sum()
 }
 
+#[derive(serde::Deserialize)]
+struct SpeechTeacherCase {
+    id: String,
+    text: String,
+    ids: Vec<u32>,
+    voice: String,
+    language: String,
+    codes: Vec<Vec<u32>>,
+}
+
+#[derive(serde::Deserialize)]
+struct SpeechTeacherInputs {
+    version: u32,
+    frames: usize,
+    dual_stream: plow_asset::dual_stream::DualStream,
+    cases: Vec<SpeechTeacherCase>,
+}
+
+fn teacher_codes(
+    e: &mut GpuEngine,
+    layouts: &[plow_asset::dual_stream::Layout],
+    cases: &[&SpeechTeacherCase],
+    k: usize,
+    plan: &plow_asset::token_batch::Plan,
+) -> Result<()> {
+    let mut codes = vec![0u32; e.pf_max_rows() * k];
+    for span in &plan.spans {
+        let slot = span.slot as usize;
+        let layout = &layouts[slot];
+        for row in 0..span.n_rows as usize {
+            let pos = span.kv_row0 as usize + row;
+            let source = if pos < layout.ids.len() {
+                &layout.codes[pos * k..(pos + 1) * k]
+            } else {
+                &cases[slot].codes[pos - layout.ids.len()]
+            };
+            let start = (span.row0 as usize + row) * k;
+            codes[start..start + k].copy_from_slice(source);
+        }
+    }
+    e.write_tensor("in.frame_codes", 0, bytemuck::cast_slice(&codes))?;
+    e.stage_depth_decode_codes(plan)
+}
+
+#[test]
+#[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, SPEECH_BATCH_TEST_CASES, RUST_MIN_STACK=67108864; run through gpuq"]
+fn speech_teacher_forced_backbone_preserves_logits_at_serving_concurrencies() {
+    let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+    let path = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_CASES").unwrap());
+    let inputs: SpeechTeacherInputs =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(inputs.version, 1);
+    assert!(inputs.cases.len() >= 16 && inputs.frames >= 16);
+    let dual = plow_asset::dual_stream::DualStream::parse(
+        &std::fs::read_to_string(assets.join("checkpoint/dual_stream.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dual, inputs.dual_stream);
+    let mut e = GpuEngine::load(
+        Arc::new(CudaBackend::new(0).unwrap()),
+        &assets,
+        &assets.join("checkpoint"),
+    )
+    .unwrap();
+    assert!(e.token_batch_enabled() && e.packed_depth_enabled() && e.batch >= 32);
+    let m = e.fish.as_ref().unwrap().manifest.clone();
+    assert!(m.packed.as_ref().unwrap().decode_token.is_none());
+    let raw = std::fs::read(assets.join("model.pkt")).unwrap();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let pipelines: plow_asset::packet_pipeline::PacketPipelines = serde_json::from_slice(
+        blob.reserved_metadata(&raw, plow_asset::packet_pipeline::SECTION)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let speech = crate::tts::SpeechContract::from_pipeline(
+        pipelines
+            .pipelines
+            .iter()
+            .find(|p| p.driver == crate::tts::DRIVER)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(speech.dual_stream.as_ref(), Some(&dual));
+    let sample_row = |slot: usize, hidden_row: u32| FishRow {
+        slot,
+        hidden_row,
+        seed: 1,
+        step: 0,
+        temperature: speech.temperature,
+        top_p: speech.top_p,
+        top_k: speech.top_k as u32,
+        ras_temperature: 1.0,
+        ras_top_p: 1.0,
+        repetition_penalty: speech.repetition_penalty,
+        cfg: None,
+    };
+    let k = m.codebooks as usize;
+    assert_eq!(k, dual.frame_codes);
+    for case in &inputs.cases {
+        assert!(case.codes.len() >= inputs.frames);
+        assert!(case
+            .codes
+            .iter()
+            .all(|c| { c.len() == k && c.iter().all(|&v| v < m.semantic_tokens) }));
+    }
+    if e.handle_of("in.encoder_overlay_index").is_some() {
+        let keep = vec![u32::MAX - 1; e.pf_max_rows()];
+        e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&keep))
+            .unwrap();
+    }
+    let mut groups = Vec::new();
+    let mut failures = Vec::new();
+    for n in [1, 8, 32] {
+        for offset in (0..inputs.cases.len()).step_by(n) {
+            let cases: Vec<_> = (0..n)
+                .map(|slot| &inputs.cases[(offset + slot) % inputs.cases.len()])
+                .collect();
+            let layouts: Vec<_> = cases
+                .iter()
+                .map(|c| {
+                    dual.layout(&c.ids, &[], &c.voice, &c.language, true)
+                        .unwrap()
+                })
+                .collect();
+            let admit = |e: &mut GpuEngine| {
+                for (slot, layout) in layouts.iter().enumerate() {
+                    assert_eq!(
+                        e.admit_packed_slot(
+                            slot,
+                            &layout.ids,
+                            layout.ids.len() + inputs.frames + 1
+                        )
+                        .unwrap(),
+                        Some(0)
+                    );
+                    e.set_prefix_attach(slot, false);
+                }
+            };
+            let feed_ids = |step: usize| -> Vec<[u32; 1]> {
+                layouts
+                    .iter()
+                    .map(|l| [l.feed.get(step).copied().unwrap_or(l.tail)])
+                    .collect()
+            };
+            let seed = |e: &mut GpuEngine, step: usize| {
+                let seeds: Vec<_> = cases
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, case)| (slot, case.codes[step].as_slice()))
+                    .collect();
+                e.fish_seed_slots(&seeds).unwrap();
+            };
+            let read_native = |e: &mut GpuEngine| -> Vec<Vec<f32>> {
+                (0..n)
+                    .map(|slot| {
+                        let mut row = Vec::new();
+                        e.logits_row(slot, &mut row).unwrap();
+                        row
+                    })
+                    .collect()
+            };
+            let mut compare =
+                |arm: &str, step: usize, reference: &[Vec<f32>], actual: &[Vec<f32>]| {
+                    for slot in 0..n {
+                        let kl = logit_kl(&reference[slot], &actual[slot]);
+                        if kl >= 1e-3 {
+                            eprintln!(
+                                "teacher c{n} offset{offset} {} {arm} step{step}: KL={kl}",
+                                cases[slot].id
+                            );
+                            failures.push(serde_json::json!({"concurrency":n,"offset":offset,
+                            "case":cases[slot].id,"slot":slot,"arm":arm,"step":step,"kl":kl}));
+                        }
+                    }
+                };
+            admit(&mut e);
+            let mut first = vec![Vec::new(); n];
+            let mut cold_codes = vec![Vec::new(); n];
+            for (slot, layout) in layouts.iter().enumerate() {
+                e.write_tensor("in.frame_codes", 0, bytemuck::cast_slice(&layout.codes))
+                    .unwrap();
+                e.prefill_slot(slot, &layout.ids).unwrap();
+                e.logits_row(0, &mut first[slot]).unwrap();
+                e.fish_reset_slot(slot).unwrap();
+                e.fish_logits_to_slot(slot).unwrap();
+                e.fish_depth_step(
+                    &[sample_row(slot, e.prefill_terminal_row())],
+                    &mut cold_codes[slot],
+                )
+                .unwrap();
+                assert_eq!(cold_codes[slot].len(), k);
+            }
+            let mut ordinary = vec![first];
+            for step in 0..inputs.frames {
+                seed(&mut e, step);
+                let ids = feed_ids(step);
+                let feeds: Vec<_> = (0..n).rev().map(|s| (s, ids[s][0])).collect();
+                e.step_slots(&feeds, &mut Vec::new()).unwrap();
+                ordinary.push(read_native(&mut e));
+            }
+            for (slot, layout) in layouts.iter().enumerate() {
+                e.rewind_slot(slot, layout.ids.len() - 1).unwrap();
+            }
+            let seeds: Vec<_> = layouts
+                .iter()
+                .enumerate()
+                .map(|(s, l)| (s, &l.codes[l.codes.len() - k..]))
+                .collect();
+            e.fish_seed_slots(&seeds).unwrap();
+            let feeds: Vec<_> = (0..n)
+                .rev()
+                .map(|s| (s, *layouts[s].ids.last().unwrap()))
+                .collect();
+            e.step_slots(&feeds, &mut Vec::new()).unwrap();
+            let warm = read_native(&mut e);
+            compare("warm-tail", 0, &ordinary[0], &warm);
+            let rows: Vec<_> = (0..n).map(|s| sample_row(s, s as u32)).collect();
+            let mut warm_codes = Vec::new();
+            e.fish_depth_step(&rows, &mut warm_codes).unwrap();
+            assert_eq!(warm_codes.len(), n * k);
+            for slot in 0..n {
+                e.retire_slot(slot, false);
+            }
+            admit(&mut e);
+            let requests: Vec<_> = (0..n)
+                .rev()
+                .map(|s| Request {
+                    id: s as u32,
+                    slot: s as u32,
+                    state_slot: s as u32,
+                    generation: e.slot_generation(s).unwrap(),
+                    phase: Phase::Prefill,
+                    tokens: &layouts[s].ids,
+                    prompt_len: layouts[s].ids.len() as u32,
+                    selection: Selection::default(),
+                })
+                .collect();
+            let mut outputs = Vec::new();
+            e.token_batch_step_staged(&requests, &mut outputs, None, &mut |_| {}, &mut |e, p| {
+                teacher_codes(e, &layouts, &cases, k, p)
+            })
+            .unwrap();
+            archive_activations(&e, n, &format!("teacher-o{offset}-prefill"), None);
+            let read_compact = |e: &mut GpuEngine, outputs: &[(u32, u32)]| -> Vec<Vec<f32>> {
+                assert_eq!(outputs.len(), n);
+                let mut rows = vec![Vec::new(); n];
+                let mut seen = vec![false; n];
+                for (row, &(slot, _)) in outputs.iter().enumerate() {
+                    assert!(!std::mem::replace(&mut seen[slot as usize], true));
+                    e.logits_row(row, &mut rows[slot as usize]).unwrap();
+                }
+                assert!(seen.iter().all(|&v| v));
+                rows
+            };
+            let mut packed = vec![read_compact(&mut e, &outputs)];
+            compare("packed-prefill", 0, &ordinary[0], &packed[0]);
+            for slot in 0..n {
+                e.fish_reset_slot(slot).unwrap();
+            }
+            let owners: Vec<_> = outputs.iter().map(|o| o.0).collect();
+            let rows: Vec<_> = owners.iter().map(|&s| sample_row(s as usize, s)).collect();
+            let mut sampled = Vec::new();
+            e.fish_depth_step_compact(&rows, &owners, &mut sampled)
+                .unwrap();
+            assert_eq!(sampled.len(), n * k);
+            let mut packed_codes = vec![Vec::new(); n];
+            for (&slot, codes) in owners.iter().zip(sampled.chunks_exact(k)) {
+                packed_codes[slot as usize] = codes.to_vec();
+            }
+            let mut conditional = Vec::new();
+            for step in 0..inputs.frames {
+                seed(&mut e, step);
+                let ids = feed_ids(step);
+                let feeds: Vec<_> = (0..n).rev().map(|s| (s, ids[s][0])).collect();
+                e.step_slots(&feeds, &mut Vec::new()).unwrap();
+                let reference = read_native(&mut e);
+                let actual = if n == 1 {
+                    reference.clone()
+                } else {
+                    for (s, layout) in layouts.iter().enumerate() {
+                        e.rewind_slot(s, layout.ids.len() + step).unwrap();
+                    }
+                    let requests: Vec<_> = (0..n)
+                        .rev()
+                        .map(|s| Request {
+                            id: s as u32,
+                            slot: s as u32,
+                            state_slot: s as u32,
+                            generation: e.slot_generation(s).unwrap(),
+                            phase: if s + 1 == n {
+                                Phase::Prefill
+                            } else {
+                                Phase::Decode
+                            },
+                            tokens: &ids[s],
+                            prompt_len: (layouts[s].ids.len()
+                                + if s + 1 == n { step + 1 } else { 0 })
+                                as u32,
+                            selection: Selection::default(),
+                        })
+                        .collect();
+                    e.token_batch_step_staged(
+                        &requests,
+                        &mut outputs,
+                        None,
+                        &mut |_| {},
+                        &mut |e, p| teacher_codes(e, &layouts, &cases, k, p),
+                    )
+                    .unwrap();
+                    archive_activations(&e, n, &format!("teacher-o{offset}-f{step}"), None);
+                    read_compact(&mut e, &outputs)
+                };
+                compare("same-prefix-native", step + 1, &reference, &actual);
+                compare(
+                    "ordinary-trajectory",
+                    step + 1,
+                    &ordinary[step + 1],
+                    &actual,
+                );
+                conditional.push(reference);
+                packed.push(actual);
+            }
+            groups.push(serde_json::json!({"concurrency":n,"offset":offset,
+                "case_ids": cases.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                "texts":cases.iter().map(|c| &c.text).collect::<Vec<_>>(),
+                "layouts": layouts.iter().map(|l| serde_json::json!({"ids":l.ids,"codes":l.codes,"feed":l.feed,"tail":l.tail})).collect::<Vec<_>>(),
+                "ordinary":ordinary,"warm":warm,"packed":packed,"conditional_native":conditional,
+                "cold_first_codes":cold_codes,"warm_first_codes":warm_codes.chunks_exact(k).collect::<Vec<_>>(),
+                "packed_first_codes":packed_codes}));
+            for slot in 0..n {
+                e.retire_slot(slot, false);
+            }
+        }
+    }
+    serde_json::to_writer(
+        std::fs::File::create(path.with_extension("logits.json")).unwrap(),
+        &serde_json::json!({"version":1,"frames":inputs.frames,"groups":groups,"failures":failures}),
+    )
+    .unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} teacher-forced KL outliers; full records in {}",
+        failures.len(),
+        path.with_extension("logits.json").display()
+    );
+}
+
 fn kv_vectors(
     e: &GpuEngine,
     blob: &DevBlob,
