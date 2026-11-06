@@ -15,17 +15,117 @@ package's own `generate` with the same settings and records whether its codes eq
 --force teacher-forces every frame to CODES_DIR/<id>.codes.npy (then EOS), so logits of two runs
 (dtypes, or plow) compare position by position; the logits then also hold `cb0_raw`, the head's
 3072 logits before suppression and penalty.
+--prepared-predictor --dtype fp32 takes a prepared checkpoint and packet predictor capture JSON;
+it writes conditional FP32 logits and comparison diagnostics without loading the audio model.
 """
 import argparse
 import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 import torch
 
 EOS, CODES, VOCAB = 2150, 2048, 3072
+
+
+def load_prepared_predictor(path, codebook, device):
+    from safetensors import safe_open
+    from transformers import Qwen3Config, Qwen3Model
+    from transformers.modeling_utils import AttentionInterface
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "llm"))
+    from fp32_ref_gate import fp32_attention
+
+    AttentionInterface.register("sdpa", fp32_attention)
+    path = Path(path)
+    meta = json.loads((path / "config.json").read_text())["plow_frame_embed"]
+    d = meta["depth"]
+    assert d["qk_norm"] and 0 < codebook < meta["codebooks"]
+    cfg = Qwen3Config(vocab_size=1, hidden_size=d["hidden"], intermediate_size=d["intermediate"],
+                      num_hidden_layers=d["layers"], num_attention_heads=d["heads"],
+                      num_key_value_heads=d["kv_heads"], head_dim=d["head_dim"],
+                      rms_norm_eps=d["eps"], rope_theta=d["rope_theta"],
+                      rope_scaling=d["rope_scaling"], max_position_embeddings=d["positions"],
+                      tie_word_embeddings=False)
+    cfg._attn_implementation = "sdpa"
+    model = Qwen3Model(cfg).float().eval().to(device)
+    prefix = meta["prefix"]
+    weights = {}
+    with safe_open(path / "model.safetensors", framework="pt", device="cpu") as f:
+        state = {name: (torch.zeros_like(value) if name == "embed_tokens.weight" else
+                        f.get_tensor(f"{prefix}.{name}").float().to(device))
+                 for name, value in model.state_dict().items()}
+        model.load_state_dict(state, strict=True)
+        for name, key in (("projection", f"{prefix}.proj.weight"),
+                          ("head", f"{prefix}.head.{codebook - 1}.weight"),
+                          ("embeddings", meta["table"])):
+            weights[name] = f.get_tensor(key).float().to(device)
+        weights["bias"] = f.get_tensor(f"{prefix}.proj.bias").float().to(device) if d["proj_bias"] else None
+    assert weights["embeddings"].shape == (meta["codebooks"] * meta["codebook_size"],
+                                             weights["projection"].shape[1])
+    assert weights["head"].shape == (meta["classes"], d["hidden"])
+    return model, weights, meta
+
+
+@torch.inference_mode()
+def prepared_predictor_logits(model, weights, meta, case, codebook):
+    device = weights["projection"].device
+    codes = case["prefix_codes"]
+    assert len(codes) == codebook and all(0 <= c < meta["classes"] for c in codes)
+    words = np.asarray(case["hidden_bf16"], dtype=np.uint16).astype(np.uint32) << 16
+    hidden = torch.from_numpy(words.view(np.float32).copy()).to(device)
+    assert hidden.shape == (weights["projection"].shape[1],) and hidden.isfinite().all()
+    ids = torch.tensor([j * meta["codebook_size"] + c for j, c in enumerate(codes)], device=device)
+    x = torch.cat((hidden[None], weights["embeddings"][ids]), dim=0)[None]
+    x = torch.nn.functional.linear(x, weights["projection"], weights["bias"])
+    out = model(inputs_embeds=x, use_cache=False).last_hidden_state[:, -1]
+    return torch.nn.functional.linear(out, weights["head"])[0]
+
+
+def prepared_predictor_reference(a):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "llm"))
+    from fp32_ref_gate import file_sha, kl_top
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    torch.use_deterministic_algorithms(True)
+    data = json.loads(Path(a.texts).read_text())
+    assert data["version"] == 1 and data["prefix_selection_matches_full"]
+    codebook = data["codebook"]
+    model, weights, meta = load_prepared_predictor(a.model, codebook, a.device)
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    records = []
+    for index, case in enumerate(data["cases"]):
+        logits = prepared_predictor_logits(model, weights, meta, case, codebook)
+        repeat = prepared_predictor_logits(model, weights, meta, case, codebook)
+        assert logits.isfinite().all() and torch.equal(logits, repeat)
+        actual = torch.tensor(case["logits"], dtype=torch.float32, device=a.device)
+        assert actual.shape == logits.shape and actual.isfinite().all()
+        def logprobs(x):
+            return list(enumerate(torch.log_softmax(x.double(), -1).cpu().tolist()))
+        delta = actual.double() - logits.double()
+        np.savez_compressed(out / f"case-{index}.npz", reference=logits.cpu().numpy(),
+                            packet=actual.cpu().numpy())
+        top = torch.topk(logits, 5)
+        records.append(dict(id=case["id"], selected=case["selected"],
+                            kl=kl_top(logprobs(logits), logprobs(actual)),
+                            max_abs=delta.abs().max().item(),
+                            rel_l2=(delta.norm() / logits.double().norm().clamp_min(1e-30)).item(),
+                            reference_top=list(zip(top.indices.cpu().tolist(), top.values.cpu().tolist())),
+                            repeat_exact=True))
+    report = dict(version=1, scope="conditional FP32 predictor at captured packet hidden/prefix inputs",
+                  full_model_qualified=False, frame=data["frame"], codebook=codebook, cases=records,
+                  hashes={str(p): file_sha(p) for p in [Path(a.texts), Path(a.model) / "config.json",
+                          Path(a.model) / "model.safetensors", Path(__file__),
+                          Path(__file__).resolve().parents[1] / "llm/fp32_ref_gate.py"]},
+                  torch=torch.__version__, device=a.device)
+    (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(records), flush=True)
 
 
 def onset_ms(pcm):
@@ -156,7 +256,15 @@ def main():
     ap.add_argument("--official", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--force", default=None)
+    ap.add_argument("--prepared-predictor", action="store_true",
+                    help="FP32 conditional predictor: MODEL=prepared checkpoint, TEXTS=packet predictor capture")
     a = ap.parse_args()
+    if a.prepared_predictor:
+        if a.dtype != "fp32":
+            ap.error("--prepared-predictor requires --dtype fp32")
+        prepared_predictor_reference(a)
+        return
+    import soundfile as sf
     from qwen_tts import Qwen3TTSModel
     dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
     w = Qwen3TTSModel.from_pretrained(a.model, dtype=dt, device_map=a.device)

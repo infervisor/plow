@@ -537,22 +537,7 @@ fn speech_teacher_forced_backbone_preserves_logits_at_serving_concurrencies() {
     assert!(e.token_batch_enabled() && e.packed_depth_enabled() && e.batch >= 32);
     let m = e.fish.as_ref().unwrap().manifest.clone();
     assert!(m.packed.as_ref().unwrap().decode_token.is_none());
-    let raw = std::fs::read(assets.join("model.pkt")).unwrap();
-    let blob = DevBlob::parse(&raw).unwrap();
-    let pipelines: plow_asset::packet_pipeline::PacketPipelines = serde_json::from_slice(
-        blob.reserved_metadata(&raw, plow_asset::packet_pipeline::SECTION)
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    let speech = crate::tts::SpeechContract::from_pipeline(
-        pipelines
-            .pipelines
-            .iter()
-            .find(|p| p.driver == crate::tts::DRIVER)
-            .unwrap(),
-    )
-    .unwrap();
+    let speech = crate::tts::SpeechContract::load(&assets).unwrap().unwrap();
     assert_eq!(speech.dual_stream.as_ref(), Some(&dual));
     let sample_row = |slot: usize, hidden_row: u32| FishRow {
         slot,
@@ -816,6 +801,330 @@ fn speech_teacher_forced_backbone_preserves_logits_at_serving_concurrencies() {
         failures.len(),
         path.with_extension("logits.json").display()
     );
+}
+
+#[derive(serde::Deserialize)]
+struct SpeechFrameTrace {
+    step: usize,
+    codes: Vec<u32>,
+    logits: Vec<f32>,
+    hidden_bf16: Vec<u16>,
+}
+
+#[test]
+#[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, SPEECH_BATCH_TEST_CASES, RUST_MIN_STACK=67108864; run through gpuq"]
+fn speech_autoregressive_paths_trace_packet_sampling() {
+    let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+    let path = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_CASES").unwrap());
+    let req: crate::tts::serving::SpeechRequest =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(req.seed.is_some());
+    let speech = crate::tts::SpeechContract::load(&assets).unwrap().unwrap();
+    let tok = crate::text::tokenizer::load_tokenizer(&assets);
+    let checked = speech.spec(&*tok).check(&req).unwrap();
+    assert_eq!(
+        crate::tts::segments(&req.input, speech.segment_chars()),
+        [&req.input]
+    );
+    let dual = speech.dual_stream.as_ref().unwrap();
+    let ids =
+        tok.encode_with_special_tokens(&dual.text_template.replace("{input}", &req.input), false);
+    let instructions = match (&dual.instructions_template, &req.instructions) {
+        (Some(t), Some(s)) => {
+            tok.encode_with_special_tokens(&t.replace("{instructions}", s), false)
+        }
+        _ => Vec::new(),
+    };
+    let layout = dual
+        .layout(
+            &ids,
+            &instructions,
+            &checked.voice,
+            checked.language.as_deref().unwrap_or("auto"),
+            !req.non_streaming_mode,
+        )
+        .unwrap();
+    let mut e = GpuEngine::load(
+        Arc::new(CudaBackend::new(0).unwrap()),
+        &assets,
+        &assets.join("checkpoint"),
+    )
+    .unwrap();
+    assert!(e.recurrent.is_none() && e.resume_ring_slack.is_none());
+    assert!(e.token_batch_enabled() && e.packed_depth_enabled());
+    let m = e.fish.as_ref().unwrap().manifest.clone();
+    assert_eq!(m.sampler, Sampler::Breeze);
+    let k = m.codebooks as usize;
+    assert_eq!(k, dual.frame_codes);
+    let budget = checked
+        .sampling
+        .max_tokens
+        .unwrap_or_else(|| speech.max_new_tokens(&req.input))
+        .min(e.max_ctx - layout.ids.len());
+    assert!(budget > 0);
+    assert_eq!(
+        e.admit_packed_slot(0, &layout.ids, layout.ids.len() + budget)
+            .unwrap(),
+        Some(0)
+    );
+    e.set_prefix_attach(0, false);
+    if e.handle_of("in.encoder_overlay_index").is_some() {
+        let keep = vec![u32::MAX - 1; e.pf_max_rows()];
+        e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&keep))
+            .unwrap();
+    }
+    let row = |hidden_row, step| FishRow {
+        slot: 0,
+        hidden_row,
+        seed: checked.seed,
+        step,
+        temperature: if checked.sampling.temperature <= 0.0 {
+            1.0
+        } else {
+            checked.sampling.temperature
+        },
+        top_p: checked.sampling.top_p,
+        top_k: if checked.sampling.temperature <= 0.0 {
+            1
+        } else {
+            checked
+                .sampling
+                .top_k
+                .filter(|&k| k > 0)
+                .unwrap_or(speech.top_k) as u32
+        },
+        ras_temperature: 1.0,
+        ras_top_p: 1.0,
+        repetition_penalty: checked.sampling.repetition_penalty,
+        cfg: None,
+    };
+    let raw = std::fs::read(assets.join("model.pkt")).unwrap();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let hidden_name = &blob.tensors[usize::from(m.packed.as_ref().unwrap().hidden)].name;
+    let (compact_hidden, pitch) = e.packed_terminal.as_ref().unwrap().hidden_rows();
+    let mut arms = Vec::new();
+    for arm in ["cold", "warm-prefill", "warm-native"] {
+        let hidden_row = match arm {
+            "cold" => {
+                e.write_tensor("in.frame_codes", 0, bytemuck::cast_slice(&layout.codes))
+                    .unwrap();
+                e.prefill_slot(0, &layout.ids).unwrap();
+                e.fish_reset_slot(0).unwrap();
+                e.fish_logits_to_slot(0).unwrap();
+                e.prefill_terminal_row()
+            }
+            "warm-prefill" => {
+                e.rewind_slot(0, layout.ids.len() - 1).unwrap();
+                e.fish_reset_slot(0).unwrap();
+                let requests = [Request {
+                    id: 0,
+                    slot: 0,
+                    state_slot: 0,
+                    generation: e.slot_generation(0).unwrap(),
+                    phase: Phase::Prefill,
+                    tokens: &layout.ids[layout.ids.len() - 1..],
+                    prompt_len: layout.ids.len() as u32,
+                    selection: Selection::default(),
+                }];
+                let mut outputs = Vec::new();
+                e.token_batch_step_staged(
+                    &requests,
+                    &mut outputs,
+                    None,
+                    &mut |_| {},
+                    &mut |e, plan| {
+                        assert_eq!(plan.spans.len(), 1);
+                        let span = &plan.spans[0];
+                        assert_eq!((span.slot, span.row0, span.n_rows), (0, 0, 1));
+                        let at = span.kv_row0 as usize * k;
+                        e.write_tensor(
+                            "in.frame_codes",
+                            0,
+                            bytemuck::cast_slice(&layout.codes[at..at + k]),
+                        )
+                    },
+                )
+                .unwrap();
+                assert_eq!(outputs.len(), 1);
+                0
+            }
+            _ => {
+                e.rewind_slot(0, layout.ids.len() - 1).unwrap();
+                assert!(e.depth_prompt_tail_can_decode(*layout.ids.last().unwrap()));
+                e.fish_seed_slot(0, &layout.codes[layout.codes.len() - k..])
+                    .unwrap();
+                e.step_slots(&[(0, *layout.ids.last().unwrap())], &mut Vec::new())
+                    .unwrap();
+                0
+            }
+        };
+        let mut trace = Vec::new();
+        let mut stopped = false;
+        for step in 0..budget {
+            if step > 0 {
+                let token = layout.feed.get(step - 1).copied().unwrap_or(layout.tail);
+                e.step_slots(&[(0, token)], &mut Vec::new()).unwrap();
+            }
+            let hidden_row = if step == 0 { hidden_row } else { 0 };
+            let mut logits = Vec::new();
+            e.logits_row(0, &mut logits).unwrap();
+            let mut hidden = vec![0u16; pitch as usize / 2];
+            if arm == "warm-prefill" && step == 0 {
+                e.be.memcpy_dtoh(bytemuck::cast_slice_mut(&mut hidden), compact_hidden)
+                    .unwrap();
+            } else {
+                e.read_tensor_range(
+                    hidden_name,
+                    u64::from(hidden_row) * pitch,
+                    bytemuck::cast_slice_mut(&mut hidden),
+                )
+                .unwrap();
+            }
+            let mut codes = Vec::new();
+            let r = row(hidden_row, step as u32);
+            if arm == "warm-prefill" && step == 0 {
+                e.fish_depth_step_compact(&[r], &[0], &mut codes).unwrap();
+            } else {
+                e.fish_depth_step(&[r], &mut codes).unwrap();
+            }
+            assert_eq!(codes.len(), k);
+            assert!(codes[0] <= m.stop_class);
+            assert!(codes[1..].iter().all(|&c| c < m.semantic_tokens));
+            stopped = codes[0] == m.stop_class;
+            trace.push(
+                serde_json::json!({"step":step,"codes":codes,"logits":logits,"hidden_bf16":hidden}),
+            );
+            if stopped {
+                break;
+            }
+        }
+        assert!(stopped, "{arm} exceeded the smoke request's frame budget");
+        eprintln!(
+            "autoregressive {arm}: {} frames, EOS at frame {}",
+            trace.len() - 1,
+            trace.len() - 1
+        );
+        arms.push(serde_json::json!({"arm":arm,"trace":trace}));
+    }
+    let traces: Vec<Vec<SpeechFrameTrace>> = arms
+        .iter()
+        .map(|a| serde_json::from_value(a["trace"].clone()).unwrap())
+        .collect();
+    let first = traces[0]
+        .iter()
+        .zip(&traces[2])
+        .enumerate()
+        .find_map(|(f, (a, b))| {
+            a.codes
+                .iter()
+                .zip(&b.codes)
+                .position(|(x, y)| x != y)
+                .map(|j| (f, j))
+        });
+    if let Some((frame, codebook)) = first.filter(|&(_, j)| j > 0) {
+        let section = plow_asset::aux_program::parse(
+            blob.reserved_metadata(&raw, plow_asset::fish_depth::PROGRAMS_SECTION)
+                .unwrap()
+                .unwrap(),
+            e.grid,
+            e.devp.len(),
+        )
+        .unwrap();
+        let index = m.rows.iter().position(|&n| n == 1).unwrap();
+        let program = &section.programs[index];
+        let samples: Vec<_> = program
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.op == DevOp::SampleSmallF32 as u16)
+            .collect();
+        assert_eq!(samples.len(), k);
+        let &(pc, sample) = &samples[codebook];
+        assert_eq!(sample.i[3] as usize, codebook);
+        let logits_name = &blob.tensors[usize::from(sample.t[1])].name;
+        let prefix = super::super::packed_terminal::chain(program.insts[..=pc].to_vec(), e.grid, 1);
+        plow_asset::aux_program::Section {
+            n_cu: e.grid,
+            programs: vec![prefix.clone()],
+        }
+        .validate(e.devp.len())
+        .unwrap();
+        let (arg, _, counter_bytes, tables) =
+            super::super::mixed_step::upload_program(&e.be, &prefix, e.d_tens.base, 0, 0).unwrap();
+        let original = std::mem::replace(
+            &mut e.fish.as_mut().unwrap().programs[index],
+            Loaded {
+                rows: 1,
+                arg,
+                counter_bytes,
+                _tables: tables,
+            },
+        );
+        let mut cases = Vec::new();
+        for (arm, trace) in arms.iter().zip(&traces) {
+            let current = &trace[frame];
+            assert_eq!(current.step, frame);
+            let previous = if frame == 0 {
+                &layout.codes[layout.codes.len() - k..]
+            } else {
+                &trace[frame - 1].codes
+            };
+            e.fish_seed_slot(0, previous).unwrap();
+            let mut history = vec![0u32; m.ras_window as usize];
+            assert!(history.len() >= m.semantic_tokens.div_ceil(32) as usize);
+            for previous in &trace[..frame] {
+                let c = previous.codes[0] as usize;
+                history[c / 32] |= 1 << (c % 32);
+            }
+            e.write_tensor(
+                &blob.tensors[usize::from(m.tensors.history)].name,
+                0,
+                bytemuck::cast_slice(&history),
+            )
+            .unwrap();
+            e.write_tensor(hidden_name, 0, bytemuck::cast_slice(&current.hidden_bf16))
+                .unwrap();
+            let logits: Vec<u16> = current
+                .logits
+                .iter()
+                .map(|v| {
+                    assert_eq!(v.to_bits() & 0xffff, 0);
+                    (v.to_bits() >> 16) as u16
+                })
+                .collect();
+            e.write_tensor(
+                &blob.tensors[e.t_logits].name,
+                0,
+                bytemuck::cast_slice(&logits),
+            )
+            .unwrap();
+            let mut selected = Vec::new();
+            e.fish_depth_step(&[row(0, frame as u32)], &mut selected)
+                .unwrap();
+            assert_eq!(
+                &selected[..=codebook],
+                &current.codes[..=codebook],
+                "prefix replay changed already sampled codes"
+            );
+            let mut logits = vec![0f32; sample.i[1] as usize];
+            e.read_tensor_range(logits_name, 0, bytemuck::cast_slice_mut(&mut logits))
+                .unwrap();
+            assert!(logits.iter().all(|v| v.is_finite()));
+            cases.push(serde_json::json!({"id":arm["arm"],"hidden_bf16":current.hidden_bf16,
+                "prefix_codes":current.codes[..codebook],"selected":selected[codebook],"logits":logits}));
+        }
+        e.fish.as_mut().unwrap().programs[index] = original;
+        serde_json::to_writer(
+            std::fs::File::create(path.with_extension("predictor.json")).unwrap(),
+            &serde_json::json!({"version":1,"frame":frame,"codebook":codebook,"sampler_pc":pc,
+                "sampler_i":sample.i,"cases":cases,"prefix_selection_matches_full":true}),
+        )
+        .unwrap();
+    }
+    serde_json::to_writer(std::fs::File::create(path.with_extension("trace.json")).unwrap(),
+        &serde_json::json!({"version":1,"text":req.input,"voice":checked.voice,"language":checked.language,
+            "seed":checked.seed,"budget":budget,"prompt_ids":layout.ids,"prompt_codes":layout.codes,
+            "feed":layout.feed,"tail":layout.tail,"arms":arms})).unwrap();
 }
 
 fn kv_vectors(
