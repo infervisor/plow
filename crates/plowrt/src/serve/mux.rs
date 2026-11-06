@@ -4008,7 +4008,14 @@ fn run_one_tick(
                 if e.pf_batch_enabled()
                     && (!e.has_depth_stage() || gpu_depth_packs(&*e, &slots, cap))
                 {
-                    let compact = e.pf_compact();
+                    let compact = e.pf_compact()
+                        && !(e.packed_depth_enabled()
+                            && depth_cached_tails(
+                                &slots,
+                                cap,
+                                |i| e.packed_slot_ready(i),
+                                |token| e.depth_prompt_tail_can_decode(token),
+                            ));
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                     completed.clear();
                     let mut dev_sampled = false;
@@ -4029,6 +4036,7 @@ fn run_one_tick(
                         cap,
                         &arena,
                         feeds.is_empty(),
+                        compact,
                         co_scheduled,
                         &mut completed,
                         &mut feeds,
@@ -7330,6 +7338,7 @@ fn gpu_prefill_batched_pass(
     cap: usize,
     arena: &Option<SharedKvState>,
     cold: bool,
+    compact: bool,
     bounded_tick: bool,
     completed: &mut Vec<(usize, u32)>,
     feeds: &mut Vec<(usize, u32)>,
@@ -7344,7 +7353,6 @@ fn gpu_prefill_batched_pass(
 
     completed.clear();
     *dev_sampled = false;
-    let compact = e.pf_compact();
     // A CFG pair's partner row has no slot entry of its own, and its uncond logits are read at
     // the owner's row + 1: the unified batch carries neither, so pairs take the ordinary path.
     let mut unified =
@@ -8098,6 +8106,39 @@ fn depth_prompt_can_pack(s: &Slot) -> bool {
                     .iter()
                     .all(|&p| p as usize + 1 < s.prompt_ids.len())
         })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn depth_cached_tails(
+    slots: &[Option<Slot>],
+    cap: usize,
+    ready: impl Fn(usize) -> bool,
+    matches_decode: impl Fn(u32) -> bool,
+) -> bool {
+    let mut pending = false;
+    for (i, s) in slots.iter().enumerate().take(cap) {
+        let Some(s) = s.as_ref().filter(|s| s.step == 0) else {
+            continue;
+        };
+        if !depth_prompt_can_pack(s) || s.respond.is_closed() {
+            return false;
+        }
+        let frontier = if ready(i) {
+            s.pf_pos
+        } else if s.pf_pos == 0 {
+            s.resume
+        } else {
+            return false;
+        };
+        if frontier == 0
+            || s.prompt_ids.len().checked_sub(1) != Some(frontier)
+            || !s.prompt_ids.last().is_some_and(|&t| matches_decode(t))
+        {
+            return false;
+        }
+        pending = true;
+    }
+    pending
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -14031,6 +14072,223 @@ mod tests {
             .unwrap()
             .overlay_pos = vec![2];
         assert!(!depth_prompts_pack(&slots, 2, |_| true));
+    }
+
+    #[test]
+    fn cached_speech_tails_join_native_decode_without_prefilling_cold_peers() {
+        let (mut a, _ra) = prefill_test_slot();
+        let (mut b, _rb) = prefill_test_slot();
+        for s in [&mut a, &mut b].into_iter().flatten() {
+            s.pf_pos = 0;
+            s.resume = s.prompt_ids.len() - 1;
+            s.speech = Some(Box::new(prefix_test_speech()));
+        }
+        let mut slots = vec![a, None];
+        assert!(depth_cached_tails(&slots, 2, |_| false, |_| true));
+        assert!(!depth_cached_tails(&slots, 0, |_| false, |_| true));
+        slots[1] = b;
+        assert!(depth_cached_tails(&slots, 2, |_| false, |_| true));
+        slots[1].as_mut().unwrap().resume = 0;
+        assert!(!depth_cached_tails(&slots, 2, |_| false, |_| true));
+        slots[1].as_mut().unwrap().pf_pos = 2;
+        assert!(!depth_cached_tails(&slots, 2, |_| false, |_| true));
+        assert!(depth_cached_tails(&slots, 2, |i| i == 1, |_| true));
+        slots[1].as_mut().unwrap().pf_pos = 0;
+        slots[1].as_mut().unwrap().step = 1;
+        assert!(depth_cached_tails(&slots, 2, |_| false, |_| true));
+        slots[0].as_mut().unwrap().step = 1;
+        assert!(!depth_cached_tails(&slots, 2, |_| false, |_| true));
+    }
+
+    #[test]
+    fn cached_speech_tails_keep_embedding_and_prefix_safety_guards() {
+        let (mut slot, rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.pf_pos = 0;
+        s.resume = s.prompt_ids.len() - 1;
+        s.speech = Some(Box::new(prefix_test_speech()));
+        let mut slots = vec![slot];
+        assert!(!depth_cached_tails(&slots, 1, |_| false, |_| false));
+        assert!(depth_cached_tails(&slots, 1, |_| false, |_| true));
+        assert!(
+            !depth_cached_tails(&slots, 1, |_| true, |_| true),
+            "admitted cache misses must prefill their actual frontier"
+        );
+        slots[0].as_mut().unwrap().resume = usize::MAX;
+        assert!(!depth_cached_tails(&slots, 1, |_| false, |_| true));
+        let s = slots[0].as_mut().unwrap();
+        s.resume = s.prompt_ids.len() - 1;
+        s.speech.as_mut().unwrap().overlay_pos = vec![2];
+        assert!(!depth_cached_tails(&slots, 1, |_| false, |_| true));
+        slots[0]
+            .as_mut()
+            .unwrap()
+            .speech
+            .as_mut()
+            .unwrap()
+            .overlay_pos
+            .clear();
+        drop(rx);
+        assert!(!depth_cached_tails(&slots, 1, |_| false, |_| true));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, PLOW_VMM_PREFIX=1, RUST_MIN_STACK=67108864; run through gpuq"]
+    fn cached_speech_tail_uses_native_decode_at_serving_widths() {
+        use crate::asset::devblob::DevBlob;
+        use crate::device::cuda::CudaBackend;
+        use crate::exec::gpu::{GpuEngine, PfBatchReq};
+        use plow_asset::fish_depth::Manifest;
+
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let raw = std::fs::read(assets.join("model.pkt")).unwrap();
+        let blob = DevBlob::parse(&raw).unwrap();
+        let m: Manifest = serde_json::from_slice(
+            blob.reserved_metadata(&raw, plow_asset::fish_depth::SECTION)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let contract = m.packed.as_ref().unwrap();
+        let mut e = GpuEngine::load(
+            Arc::new(CudaBackend::new(0).unwrap()),
+            &assets,
+            &assets.join("checkpoint"),
+        )
+        .unwrap();
+        assert!(e.pf_compact() && e.slot_prefix_reuse_supported());
+        let live = crate::config::RuntimeConfig::get().nv.vmm_live;
+        assert_eq!(!e.slot_resume_supported(), live);
+        let k = m.codebooks as usize;
+        for n in [1, 8, 32] {
+            let warm = if live { 1 } else { n };
+            let mut slots = Vec::new();
+            let mut receivers = Vec::new();
+            for i in 0..n {
+                let (mut slot, rx) = prefill_test_slot();
+                let s = slot.as_mut().unwrap();
+                s.prompt_ids = (0..14 + i % 3)
+                    .map(|p| (31 + (i * 17 + p * 7919) as u32) % contract.input_vocab)
+                    .collect();
+                *s.prompt_ids.last_mut().unwrap() = m.semantic_base;
+                assert!(e.depth_prompt_tail_can_decode(m.semantic_base));
+                s.pf_pos = 0;
+                s.gen.max_tokens = 2;
+                let mut speech = prefix_test_speech();
+                speech.frame_codes_per_row = k;
+                speech.frame_codes = (0..s.prompt_ids.len() * k)
+                    .map(|c| (i + c) as u32 % 16)
+                    .collect();
+                s.speech = Some(Box::new(speech));
+                assert_eq!(
+                    e.admit_packed_slot(i, &s.prompt_ids, s.prompt_ids.len() + 2)
+                        .unwrap(),
+                    Some(0)
+                );
+                slots.push(slot);
+                receivers.push(rx);
+            }
+            let pack: Vec<_> = (0..n)
+                .rev()
+                .map(|i| (i, 0, slots[i].as_ref().unwrap().prompt_ids.len() - 1))
+                .collect();
+            if e.tensor_bytes("in.encoder_overlay_index").is_some() {
+                gpu_speech_pack_inputs(&mut e, &slots, &pack).unwrap();
+            }
+            gpu_speech_pack_codes(&mut e, &slots, &pack).unwrap();
+            let reqs: Vec<_> = pack
+                .iter()
+                .map(|&(slot, c0, len)| PfBatchReq {
+                    slot,
+                    prompt: &slots[slot].as_ref().unwrap().prompt_ids,
+                    c0,
+                    len,
+                })
+                .collect();
+            e.prefill_batched(&reqs).unwrap();
+            for s in slots.iter_mut().flatten() {
+                s.pf_pos = s.prompt_ids.len() - 1;
+            }
+            e.fish_seed_slots(&depth_seed_rows(&slots, n, |i| e.packed_slot_ready(i)))
+                .unwrap();
+            let feeds: Vec<_> = (0..n)
+                .rev()
+                .map(|i| (i, *slots[i].as_ref().unwrap().prompt_ids.last().unwrap()))
+                .collect();
+            let mut tokens = Vec::new();
+            e.step_slots(&feeds, &mut tokens).unwrap();
+            let mut reference = vec![Vec::new(); n];
+            for (i, row) in reference.iter_mut().enumerate() {
+                e.logits_row(i, row).unwrap();
+                let s = slots[i].as_mut().unwrap();
+                if i >= warm {
+                    e.rewind_slot(i, s.prompt_ids.len() - 1).unwrap();
+                    s.step = 1;
+                    continue;
+                }
+                let keys = speech_prefix_keys(s).unwrap();
+                e.keep_slot_prefix(i, e.slot_prefix_epoch(), keys.clone());
+                e.retire_slot(i, false);
+                s.pf_pos = 0;
+                s.resume = e.reuse_slot_prefix(i, &keys);
+                assert_eq!(s.resume, s.prompt_ids.len() - 1, "c{n} slot{i}");
+                s.slot_prefix_keys = Some((e.slot_prefix_epoch(), keys));
+            }
+            assert!(gpu_depth_packs(&e, &slots, n));
+            let compact = e.pf_compact()
+                && !depth_cached_tails(
+                    &slots,
+                    n,
+                    |i| e.packed_slot_ready(i),
+                    |token| e.depth_prompt_tail_can_decode(token),
+                );
+            assert!(
+                !compact,
+                "a cached compatible tail must stay on native decode"
+            );
+            let mut completed = Vec::new();
+            let mut pending_feeds: Vec<_> =
+                feeds.iter().copied().filter(|&(i, _)| i >= warm).collect();
+            let cold = pending_feeds.is_empty();
+            let live_feeds = pending_feeds.clone();
+            let mut unified = Vec::new();
+            let mut sampled = false;
+            assert!(gpu_prefill_batched_pass(
+                &mut e,
+                &mut slots,
+                n,
+                &None,
+                cold,
+                compact,
+                false,
+                &mut completed,
+                &mut pending_feeds,
+                &mut unified,
+                &mut sampled,
+                &mut crate::sched::ride::RideCost::default(),
+                std::time::Duration::ZERO,
+                0,
+                &mut Vec::new(),
+            )
+            .is_none());
+            assert!(completed.is_empty() && unified.is_empty());
+            assert_eq!(pending_feeds, live_feeds);
+            let seeds = depth_seed_rows(&slots, n, |i| e.packed_slot_ready(i));
+            assert_eq!(seeds.len(), warm);
+            e.fish_seed_slots(&seeds).unwrap();
+            e.step_slots(&feeds, &mut tokens).unwrap();
+            for (i, expected) in reference.iter().enumerate() {
+                let mut actual = Vec::new();
+                e.logits_row(i, &mut actual).unwrap();
+                assert_eq!(
+                    actual, *expected,
+                    "c{n} slot{i} cached native logits differ"
+                );
+                e.retire_slot(i, false);
+            }
+            eprintln!("c{n}: {warm} cached tails join {} live rows without prefill; native full logits exact", n - warm);
+        }
     }
 
     #[test]

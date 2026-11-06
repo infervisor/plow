@@ -13,6 +13,16 @@ use super::{DevInst64, DevOp, DevProgram, GpuEngine, BLOCK, TENSOR_NONE16};
 
 const STAGE_CONTROL_BYTES: usize = 8 + 16 + 8 + 4 + 4;
 
+fn prompt_token_matches_decode(m: &Manifest, token: u32) -> bool {
+    m.packed.as_ref().is_some_and(|p| {
+        token < p.input_vocab
+            && (p.decode_token.is_none()
+                || token
+                    .checked_sub(m.semantic_base)
+                    .is_some_and(|class| class < m.semantic_tokens))
+    })
+}
+
 struct Loaded {
     rows: u32,
     arg: DevProgram,
@@ -991,6 +1001,12 @@ impl GpuEngine {
         self.fish.as_ref().is_some_and(|d| d.compact.is_some())
     }
 
+    pub fn depth_prompt_tail_can_decode(&self, token: u32) -> bool {
+        self.fish
+            .as_ref()
+            .is_some_and(|d| prompt_token_matches_decode(&d.manifest, token))
+    }
+
     pub(super) fn depth_embedding_token(&self) -> Option<u32> {
         self.fish.as_ref()?.manifest.packed.as_ref()?.decode_token
     }
@@ -1093,8 +1109,36 @@ impl GpuEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{inverse_rows, seed_frame_codes, SpeakerMemory};
+    use super::{
+        inverse_rows, prompt_token_matches_decode, seed_frame_codes, Manifest, SpeakerMemory,
+    };
     use std::sync::Arc;
+
+    #[test]
+    fn native_prompt_tail_requires_the_declared_embedding_semantics() {
+        let mut m: Manifest = serde_json::from_str(
+            r#"{"version":1,"rows":[1],"codebooks":2,"semantic_base":100,
+            "semantic_tokens":10,"stop_class":10,"ras_window":0,
+            "packed":{"version":1,"input_vocab":120,"backbone_logits":true,
+                      "hidden":8,"decode_token":100},
+            "tensors":{"params":0,"top_k":1,"seed":2,"step":3,"history":4,
+                       "hidden_row":5,"frame_codes":6,"prompt_codes":7}}"#,
+        )
+        .unwrap();
+        for token in [0, 99, 110, 119, 120, u32::MAX] {
+            assert!(!prompt_token_matches_decode(&m, token));
+        }
+        for token in [100, 103, 109] {
+            assert!(prompt_token_matches_decode(&m, token));
+        }
+        m.packed.as_mut().unwrap().decode_token = None;
+        for token in [0, 99, 100, 109, 110, 119] {
+            assert!(prompt_token_matches_decode(&m, token));
+        }
+        assert!(!prompt_token_matches_decode(&m, 120));
+        m.packed = None;
+        assert!(!prompt_token_matches_decode(&m, 100));
+    }
 
     #[test]
     fn compact_depth_remap_preserves_permuted_slots_and_source_rows() {
