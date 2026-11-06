@@ -1133,6 +1133,8 @@ fastconformer RNNT, fish-s2.
   parallel accumulation through existing dense/copy/add/round ops, selected by actual rows.
   Explicit reflected feature rows and a derived padded length can reuse the existing
   zero-padding convolution route without changing device instructions.
+  The CUDA wide convolution path also supports reflection and replication against actual
+  lengths; its zero-padding specialization keeps the original operand-load expressions.
   Numerical qualification remains required; no native performance win is implied.
   AMD lacks these speech arms. A speaker packet alone does not bind a live cloning request.
 - **Static speech slot-prefix reuse**: CUDA implements the experimental

@@ -775,6 +775,33 @@ static void t_convt1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
     run(name, c, g_conv_transpose1d_f32, {o}, FP32, tol);
 }
 
+static void t_conv_padding() {
+    for (unsigned mode : {0u, 1u, 2u})
+        for (unsigned kernel : {1u, 3u})
+            for (bool leaky : {false, true}) {
+                const unsigned pad = kernel == 1u ? 2u : 3u;
+                ConvSpec s{5, 129, 64, 96, kernel, 1, kernel == 1u ? 1u : 3u, 1, pad, pad,
+                           mode, leaky ? 9u : 0u, 0, false, true, false, true, {129, 93, 17, 1, 0}, 0.1f, true};
+                s.wide = s.tapmajor = s.row_scale = true;
+                Case c; unsigned o;
+                build_conv(c, s, false, o);
+                float* x = (float*)c.host[c.in.t[1]].data();
+                for (unsigned b = 0; b < s.batch; b++)
+                    for (unsigned t = s.lengths[b]; t < s.in_rows; t++)
+                        for (unsigned ch = 0; ch < s.cin; ch++) x[((size_t)b * s.in_rows + t) * s.cin + ch] = NAN;
+                char name[96];
+                snprintf(name, sizeof(name), "Conv1dF32 wide pad%u k%u leaky%u poison", mode, kernel, leaky);
+                run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
+                std::vector<float> got(c.host[o].size() / 4);
+                CK(cudaMemcpy(got.data(), c.dev[o], c.host[o].size(), cudaMemcpyDeviceToHost));
+                const float* ref = (const float*)c.host[o].data();
+                bool finite = true;
+                for (size_t i = 0; i < got.size(); i++) finite &= std::isfinite(got[i]) && std::isfinite(ref[i]);
+                printf("  %-34s finite -> %s\n", name, finite ? "PASS" : "FAIL");
+                if (!finite) g_fail = 1;
+            }
+}
+
 static void t_unary() {
     static const char* names[16] = {"none", "tanh", "sin", "cos", "exp", "abs", "sigmoid", "silu", "elu",
                                     "leaky", "mish", "gelu_erf", "snake", "clamp", "scale_shift", "relu"};
@@ -1797,6 +1824,11 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
 
+    if (argc > 1 && !strcmp(argv[1], "--conv-padding-only")) {
+        t_conv_padding();
+        return g_fail;
+    }
+
     if (argc > 1 && !strcmp(argv[1], "--bench-cfm")) {
         /* The S3Gen CFM estimator's GEMMs at csynth.b32.t64 (64 CFG items x 136 rows). */
         struct G { const char* name; unsigned rows, cin, cout, k, post; bool res, len; };
@@ -2472,6 +2504,7 @@ int main(int argc, char** argv) {
         bench_dense(104, 1024, 1024);
         bench_conv(30, 64, 50, 480, 480);
     }
+    t_conv_padding();
     printf(g_fail ? "FAIL\n" : "ALL PASS\n");
     return g_fail;
 }

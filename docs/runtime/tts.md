@@ -682,6 +682,11 @@ feature rows on each side of the actual input before upload. The mel tensor hold
 the original rows. Padding follows the actual clip boundary, never the capacity boundary.
 The compiler derives the padded length with the existing length-affine operation and lowers
 the first convolution with zero padding and the existing split-weight convolution flags.
+Later non-pointwise convolutions request the existing split-BF16 wide path, retaining
+device-side reflection around actual length. This requires the object with padded wide
+convolution support; numerical qualification applies to the complete packet/object pair.
+The bounded `speech_f32_op_test --conv-padding-only` check covers zero, reflected and
+replicated padding, mixed actual lengths, poisoned inactive rows and finite outputs.
 Older drivers retain their original unpadded input contract. This candidate is not bound to
 live cloning requests and still requires numerical qualification.
 

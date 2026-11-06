@@ -359,6 +359,7 @@ struct Encoder<'a> {
     arithmetic: &'a [PointwisePlan],
     input_pad: u32,
     padded_length: Option<u32>,
+    reflected_bf16: bool,
 }
 
 impl Encoder<'_> {
@@ -615,7 +616,7 @@ impl Encoder<'_> {
                     output_activation: Activation::None,
                     slope: 0.0,
                     weight_f16: false,
-                    split_bf16: padded,
+                    split_bf16: padded || (self.reflected_bf16 && kernel > 1),
                     weight_tap_major: true,
                     wgmma: padded,
                     weight_split: padded,
@@ -765,6 +766,7 @@ fn program(
         arithmetic,
         input_pad: cfg.input_pad(),
         padded_length: padded_length.map(|p| p.output),
+        reflected_bf16: cfg.version == 3,
     };
     let c = cfg.channels[0];
     let mut h = enc.conv(

@@ -223,6 +223,7 @@ mod tests {
         model: &packet::devbuild::Model,
         program: usize,
         key: &str,
+        split_bf16: bool,
     ) -> (packet::devbuild::Program, u32, u32, usize) {
         use packet::dev::{DevOp, ACT_ROUND_BF16};
         let insts = &model.progs[program].insts;
@@ -274,16 +275,41 @@ mod tests {
                 .collect(),
         );
         let mut previous = None;
-        let padded = insts[first].op == DevOp::Conv1dF32 as u16
+        let convolution = insts[first].op == DevOp::Conv1dF32 as u16;
+        let padded = convolution
             && insts[first].t[6] != packet::dev::TENSOR_NONE
             && model.tensors[insts[first].t[6] as usize].name == "act.spk.padded_length";
         let mut selected = Vec::new();
-        if padded {
+        if padded && !split_bf16 {
             assert_eq!(insts[0].op, DevOp::LengthAffineU32 as u16);
             selected.push(&insts[0]);
         }
         selected.extend(&insts[start..=add + 1]);
-        for source in selected {
+        let pad = if (padded || split_bf16) && convolution {
+            (insts[first].i[4] - 1) * insts[first].i[6] / 2
+        } else {
+            0
+        };
+        for original in selected {
+            let mut source = *original;
+            if split_bf16 && source.op == DevOp::Conv1dF32 as u16 {
+                if !padded {
+                    source.i[1] += 2 * pad;
+                }
+                source.j[0] = 0;
+                source.j[1] = (source.j[1] & !(3 | (1 << 16) | (3 << 17))) | (1 << 14);
+                if source.t[6] != packet::dev::TENSOR_NONE {
+                    source.t[6] = model
+                        .tensors
+                        .iter()
+                        .position(|t| t.name == "in.spk.length")
+                        .unwrap() as u32;
+                }
+                assert!(
+                    u64::from(source.i[1]) * u64::from(source.i[2]) * 4
+                        <= model.tensors[input as usize].bytes
+                );
+            }
             let op = *DevOp::ALL
                 .iter()
                 .find(|&&op| op as u16 == source.op)
@@ -301,11 +327,6 @@ mod tests {
                     }),
                 );
         }
-        let pad = if padded {
-            (insts[first].i[4] - 1) * insts[first].i[6] / 2
-        } else {
-            0
-        };
         (builder.finish(), input, output, pad as usize)
     }
 
@@ -315,6 +336,9 @@ mod tests {
         install_speaker_verifier();
         let dir = std::env::var("SPEAKER_CHECKPOINT").unwrap();
         let out = std::env::var("SPEAKER_PACKET_OUT").unwrap();
+        let route = std::env::var("SPEAKER_LAYER_ROUTE").unwrap_or_else(|_| "emitted".into());
+        assert!(matches!(route.as_str(), "emitted" | "split_bf16"));
+        let split_bf16 = route == "split_bf16";
         let reference: serde_json::Value = serde_json::from_slice(
             &std::fs::read(std::env::var("SPEAKER_REFERENCE_JSON").unwrap()).unwrap(),
         )
@@ -343,13 +367,15 @@ mod tests {
                 let key = name
                     .replace(".res2net_block.blocks.", ".res2net.")
                     .replace(".se_block.", ".se.");
-                let (program, input, output, pad) = speaker_layer_slice(&model, source, &key);
+                let (program, input, output, pad) =
+                    speaker_layer_slice(&model, source, &key, split_bf16);
                 let index = programs.len();
                 programs.push(program);
                 plans.push(
                     serde_json::json!({"rows": rows, "capacity": cap, "layer": name,
                     "program": index, "input": model.tensors[input as usize].name,
-                    "output": model.tensors[output as usize].name, "reflect_pad": pad}),
+                    "output": model.tensors[output as usize].name, "reflect_pad": pad,
+                    "length_add": if split_bf16 { 2 * pad } else { 0 }, "route": route}),
                 );
             }
         }
@@ -442,7 +468,10 @@ mod tests {
                     .write_tensor_at(
                         length,
                         0,
-                        &(case["mel_rows"].as_u64().unwrap() as u32).to_le_bytes(),
+                        &((case["mel_rows"].as_u64().unwrap()
+                            + plan["length_add"].as_u64().unwrap_or(0))
+                            as u32)
+                            .to_le_bytes(),
                     )
                     .unwrap();
                 runtime
@@ -469,7 +498,7 @@ mod tests {
                 outputs.extend_from_slice(bytemuck::cast_slice(&actual));
                 let check = serde_json::json!({"case":case["case"], "layer":name,"rows":rows,
                     "width":y.shape()[1],"elements":actual.len(),"changed":changed,"max_abs":max_abs,"finite":finite,
-                    "output_offset_bytes":offset,"program":plan["program"]});
+                    "output_offset_bytes":offset,"program":plan["program"],"route":plan["route"]});
                 println!("{check}");
                 checks.push(check);
             }

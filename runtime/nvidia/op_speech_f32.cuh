@@ -4474,9 +4474,9 @@ static __device__ __forceinline__ void sp_w_conv_store(unsigned m0, unsigned n0,
 }
 
 /* The wide tile's operands as a few scalars (the generic SpRowConv1/SpRowConvW state, re-read per
- * copy, made the k-loop issue-bound): A is the zero-padded implicit im2col (pointwise: one row),
+ * copy, made the k-loop issue-bound): A is the padded implicit im2col (pointwise: one row),
  * with a leaky-ReLU input activation or none; B the tap-major weight rows. */
-template <bool PW, bool LEAKY>
+template <bool PW, bool LEAKY, bool PADDED>
 struct SpWConvA {
     static constexpr bool PRE = LEAKY;
     struct Row { const float* xb; int u0, len; };
@@ -4488,14 +4488,18 @@ struct SpWConvA {
         if (a->lengths && t >= a->conv_len(b)) return Row{nullptr, 0, 0};
         const int u0 = (int)(t * a->stride) - (int)a->before, len = (int)a->length(b);
         const float* xb = x + (size_t)b * a->in_rows * cin;
-        if (PW) return (unsigned)u0 < (unsigned)len ? Row{xb + (size_t)u0 * cin, 0, 0} : Row{nullptr, 0, 0};
+        if (PW) {
+            const int u = PADDED ? sp_pad_row(u0, len, a->mode) : u0;
+            return (unsigned)u < (unsigned)len ? Row{xb + (size_t)u * cin, 0, 0} : Row{nullptr, 0, 0};
+        }
         return Row{xb, u0, len};
     }
     __device__ const float* seg(const Row& r, unsigned c) const {
         if (!r.xb) return nullptr;
         if (PW) return r.xb + c;
         const unsigned tap = (__umulhi(c, cg_mul) + c) >> cg_shift, ci = c - tap * cin;
-        const int u = r.u0 + (int)(tap * dil);
+        const int raw = r.u0 + (int)(tap * dil);
+        const int u = PADDED ? sp_pad_row(raw, r.len, a->mode) : raw;
         return (unsigned)u < (unsigned)r.len ? r.xb + (size_t)u * cin + ci : nullptr;
     }
     __device__ float4 pre(float4 v, unsigned) const {
@@ -4509,10 +4513,10 @@ struct SpWRowsB {
     __device__ const float* row(unsigned n, unsigned N) const { return n < N ? w + (size_t)n * K : nullptr; }
     __device__ const float* seg(const float* r, unsigned c) const { return r ? r + c : nullptr; }
 };
-template <unsigned BN, bool PW, bool LEAKY>
+template <unsigned BN, bool PW, bool LEAKY, bool PADDED>
 static __device__ __forceinline__ void sp_conv1d_wide_run(const SpConvArgs& a, unsigned slice, unsigned nblk) {
     const unsigned M = a.batch * a.out_rows, K = a.kernel * a.cg;
-    const SpWConvA<PW, LEAKY> la{&a, a.x, a.cin, a.dil, a.cg_mul, a.cg_shift, a.slope};
+    const SpWConvA<PW, LEAKY, PADDED> la{&a, a.x, a.cin, a.dil, a.cg_mul, a.cg_shift, a.slope};
     const SpWRowsB lb{(const float*)a.w, K};
     const bool v4 = a.cout % 2u == 0 && sp_aligned(a.out, 8) && (!a.residual || sp_aligned(a.residual, 8)) &&
                     (!a.bias || sp_aligned(a.bias, 8));
@@ -4933,11 +4937,11 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
 }
 #endif
 /* flags bit 14: the split-bf16 wide tile's width when it applies and fills the machine, else 0.
- * It covers groups == 1, zero padding, f32 16-byte-aligned operands with cin % 4 == 0, tap-major
+ * It covers groups == 1, f32 16-byte-aligned operands with cin % 4 == 0, tap-major
  * weights when kernel > 1, and no input activation but leaky ReLU. */
 __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const SpConvArgs& a, unsigned nblk) {
     if (!((in->fj[2].u >> 14) & 1u) || a.groups != 1u || a.cin % 4u || !sp_aligned(a.x, 16) || a.wf16 ||
-        a.mode != 0u || !(a.pre == 0u || (a.pre == 9u && !a.alpha)) || !(a.kernel == 1u || a.tapmajor) ||
+        !(a.pre == 0u || (a.pre == 9u && !a.alpha)) || !(a.kernel == 1u || a.tapmajor) ||
         !sp_aligned(a.w, 16))
         return 0u;
     return sp_w_width(a.batch * a.out_rows, a.cout, nblk);
@@ -4967,20 +4971,22 @@ __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const*
 }
 #endif
 /* Out of line so d_conv1d_f32's 64x64 paths do not share its register allocation. Callers
- * guarantee groups == 1, zero padding, f32 16-byte-aligned operands
+ * guarantee groups == 1, f32 16-byte-aligned operands
  * with cin % 4 == 0, tap-major weights when kernel > 1, and no input activation but leaky ReLU. */
+template <bool PADDED>
 static __device__ __forceinline__ void sp_conv1d_wide_body(const SpConvArgs& a, unsigned bn, unsigned slice, unsigned nblk) {
     const bool pw = a.kernel == 1u, leaky = a.pre == 9u;
     if (bn == 128u) {
-        if (pw) leaky ? sp_conv1d_wide_run<128, true, true>(a, slice, nblk) : sp_conv1d_wide_run<128, true, false>(a, slice, nblk);
-        else leaky ? sp_conv1d_wide_run<128, false, true>(a, slice, nblk) : sp_conv1d_wide_run<128, false, false>(a, slice, nblk);
+        if (pw) leaky ? sp_conv1d_wide_run<128, true, true, PADDED>(a, slice, nblk) : sp_conv1d_wide_run<128, true, false, PADDED>(a, slice, nblk);
+        else leaky ? sp_conv1d_wide_run<128, false, true, PADDED>(a, slice, nblk) : sp_conv1d_wide_run<128, false, false, PADDED>(a, slice, nblk);
     } else {
-        if (pw) leaky ? sp_conv1d_wide_run<64, true, true>(a, slice, nblk) : sp_conv1d_wide_run<64, true, false>(a, slice, nblk);
-        else leaky ? sp_conv1d_wide_run<64, false, true>(a, slice, nblk) : sp_conv1d_wide_run<64, false, false>(a, slice, nblk);
+        if (pw) leaky ? sp_conv1d_wide_run<64, true, true, PADDED>(a, slice, nblk) : sp_conv1d_wide_run<64, true, false, PADDED>(a, slice, nblk);
+        else leaky ? sp_conv1d_wide_run<64, false, true, PADDED>(a, slice, nblk) : sp_conv1d_wide_run<64, false, false, PADDED>(a, slice, nblk);
     }
 }
 static __device__ __noinline__ void d_conv1d_wide(const SpConvArgs& a, unsigned bn, unsigned slice, unsigned nblk) {
-    sp_conv1d_wide_body(a, bn, slice, nblk);
+    if (a.mode) sp_conv1d_wide_body<true>(a, bn, slice, nblk);
+    else sp_conv1d_wide_body<false>(a, bn, slice, nblk);
 }
 
 /* Conv1d flag bit 16 (row-starved or few-channel convs): one warp per output element, its
