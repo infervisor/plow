@@ -1127,6 +1127,9 @@ fastconformer RNNT, fish-s2.
   `in.encoder_overlay` handling (`exec/gpu/token_batch.rs`, `ctx_bound.rs`) have no AMD arms.
 - **Speech on CPU**: CPU has `LENGTH_AFFINE_U32`, `REDUCE_ROWS_F32`, `STREAM_TAIL_F32`,
   `TRIM_SILENCE_F32`; missing `CHUNK_ATTENTION_F32`, `RMSNORM_F32`, `ROPE_AXIAL_F32`.
+- **ECAPA speaker packets**: lowering uses existing convolution, unary, binary, copy, gather
+  and reduction ops on CUDA and the scalar CPU tier, including explicit BF16 rounding.
+  AMD lacks these speech arms. A speaker packet alone does not bind a live cloning request.
 - **Static speech slot-prefix reuse**: CUDA implements the experimental
   `prompt.slot_prefix_version = 1` capability, keyed by tokens, overlays and frame codes, with
   fault-epoch invalidation. AMD and CPU lack this cache and the batched depth-stage completion;

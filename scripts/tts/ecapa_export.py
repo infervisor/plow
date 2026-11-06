@@ -10,6 +10,7 @@ crates/plowrt/src/tts/ecapa.rs. Layout (C = 1024, M = 3072, A = 128, E = 192):
 
 The Qwen variant exports an `ecapa_tdnn` checkpoint with explicit frontend, precision and
 normalization settings. It requires a separate packet lowering; the Maya host port cannot load it.
+Convolution results round before bias addition, matching the CUDA reference's BF16 boundary.
 
   Conv weights are [Cout, K, Cin] (torch's [Cout, Cin, K] with the tap axis moved before Cin); 1x1 convs are
   [Cout, 1, Cin]. Every TDNN block is conv -> ReLU -> eval BatchNorm, so BN cannot fold into the conv; it is
@@ -87,7 +88,7 @@ def qwen_config(config):
         model_type="ecapa_tdnn", version=1, channels=channels, kernel_sizes=kernels,
         dilations=dilations, res2net_scale=scale, se_channels=se, attention_channels=attention,
         embedding_dim=dim, batch_norm=False, l2_normalize=False, statistics_eps=1e-12,
-        compute_dtype="bfloat16", weight_layout="out_tap_in",
+        compute_dtype="bfloat16", conv_bias_round="before_add", weight_layout="out_tap_in",
         frontend=dict(compute_dtype="float32", sample_rate=24000, n_mels=128,
                       n_fft=1024, hop=256, win_length=1024,
                       pad=384, pad_mode="reflect", center=False, magnitude_eps=1e-9,
@@ -104,10 +105,10 @@ def qwen_tensors(weights, config):
             value = weights[key]
             if tuple(value.shape) != shape or value.dtype not in (torch.float32, torch.bfloat16):
                 raise ValueError(f"{key}: expected floating tensor {shape}")
-            if not torch.isfinite(value).all():
-                raise ValueError(f"{key}: nonfinite speaker weight")
-            used.add(key)
             value = value.to(torch.bfloat16).float()
+            if not torch.isfinite(value).all():
+                raise ValueError(f"{key}: nonfinite BF16 speaker weight")
+            used.add(key)
             out[f"{dst}.{suffix}"] = (conv_w(value) if suffix == "weight" else value).contiguous()
 
     channels, kernels = config["channels"], config["kernel_sizes"]

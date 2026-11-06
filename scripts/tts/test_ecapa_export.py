@@ -47,6 +47,7 @@ class QwenSpeakerExportTests(unittest.TestCase):
         cfg = qwen_config(source)
         self.assertEqual(cfg["channels"], [512, 512, 512, 512, 1536])
         self.assertEqual(cfg["compute_dtype"], "bfloat16")
+        self.assertEqual(cfg["conv_bias_round"], "before_add")
         self.assertEqual(cfg["frontend"]["compute_dtype"], "float32")
         self.assertFalse(cfg["batch_norm"])
         self.assertFalse(cfg["l2_normalize"])
@@ -99,6 +100,7 @@ class QwenSpeakerExportTests(unittest.TestCase):
         variants.append(dict(original, unexpected=torch.zeros(1)))
         variants.append(dict(original, **{"fc.weight": torch.zeros(6, 31, 1)}))
         variants.append(dict(original, **{"fc.bias": torch.full((6,), float("nan"))}))
+        variants.append(dict(original, **{"fc.bias": torch.full((6,), torch.finfo(torch.float32).max)}))
         for state in variants:
             with self.subTest(keys=len(state)), self.assertRaises((ValueError, KeyError)):
                 qwen_tensors(state, qwen_config(checkpoint_config()))

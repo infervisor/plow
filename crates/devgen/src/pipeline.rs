@@ -332,6 +332,10 @@ pub enum Activation {
     SnakeBeta,
     /// [`packet::dev::ACT_LOG`]: unary only.
     Log,
+    /// Unary only.
+    Sqrt,
+    /// Unary only, with round-to-nearest-even.
+    RoundBf16,
 }
 
 impl Activation {
@@ -356,6 +360,8 @@ impl Activation {
             Activation::Relu => ACT_RELU,
             Activation::SnakeBeta => ACT_SNAKE_BETA,
             Activation::Log => ACT_LOG,
+            Activation::Sqrt => ACT_SQRT,
+            Activation::RoundBf16 => ACT_ROUND_BF16,
         }
     }
 }

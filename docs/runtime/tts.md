@@ -637,6 +637,23 @@ other arms trap. ptxas time grows superlinearly with the arms called from the in
 arm the speech cubin took 4-7 h of ptxas (the 3xFP16 attention alone added hours), with one
 packet's set 8 min (Chatterbox), 7 min (Veena), 1.5 min (Qwen3-ASR).
 
+## Speaker encoder packets
+
+An `ecapa_tdnn` checkpoint under the codec directory's `speaker_encoder/` emits
+`speaker_encoder.pkt` alongside the codec, with driver `speaker.encode.v1`. Its programs
+`encode.r128` through `encode.r2048` accept one sequence of unnormalized F32 log-mel rows,
+plus a U32 `length` containing its actual row count. Choose the smallest capacity that holds
+the input and respect `input.min_rows` / `input.max_rows`. Convolution reflection and all
+temporal reductions use the actual length. The F32 `embedding` output holds BF16 values.
+
+The checkpoint declares BF16 tensor boundaries, including rounding a convolution result before
+the separate bias addition. Population statistics preserve the rounded weighting, products,
+subtractions, squares and sums. Batch normalization and output L2 normalization are absent.
+The packet carries frontend mel/window tables and its `audio.frontend` description; its input
+still requires the frontend to have run. Emitting this packet does not enable voice cloning in
+the speech API: frontend, conditioning metadata and request binding remain separate requirements.
+Numerical qualification of the speaker packet is still incomplete.
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt
