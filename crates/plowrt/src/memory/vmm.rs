@@ -1443,6 +1443,15 @@ struct HostTier {
 /// Spill copies in flight before a new boundary spill waits for them to land (the boundary that
 /// crosses it is queued whole).
 pub const SPILL_AHEAD_INFLIGHT_BYTES: u64 = 256 << 20;
+
+/// Whether the spill-ahead thread spills another boundary. While a restore is in flight it keeps
+/// only a quarter of `headroom`: a concurrent device-to-host spill halved the restore copies'
+/// bandwidth (26B BF16 at 1.8 sessions/s: 14 -> 5-7 GB/s), and an attach waits on them.
+fn spill_ahead_wanted(pending: u64, available: u64, headroom: u64, restoring: bool) -> bool {
+    let target = if restoring { headroom / 4 } else { headroom };
+    pending < SPILL_AHEAD_INFLIGHT_BYTES && available + pending < target
+}
+
 /// One pinned allocation per chunk of host tier slots.
 const HOST_CHUNK_BYTES: u64 = 1 << 30;
 /// Spills whose device buffer is still held; at the cap the oldest is waited for.
@@ -3498,7 +3507,12 @@ impl VmmKv {
                     // at c32 on Qwen3.8 BF16, 147 MiB state blocks).
                     let pending = store.pending_spill_bytes();
                     let spilled = pending < SPILL_AHEAD_INFLIGHT_BYTES
-                        && store.device_headroom_bytes() + pending < headroom
+                        && spill_ahead_wanted(
+                            pending,
+                            store.device_headroom_bytes(),
+                            headroom,
+                            store.restores_pending(),
+                        )
                         && spill_ahead_step(&shared);
                     if !spilled {
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -5559,6 +5573,13 @@ impl HostTierGrant {
     pub(crate) fn bytes(&self) -> u64 {
         self.0
     }
+
+    /// Return what the engine will never pin to the shared budget.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        let give_back = self.0.saturating_sub(bytes);
+        HOST_TIER_GRANTED.fetch_sub(give_back, Ordering::AcqRel);
+        self.0 -= give_back;
+    }
 }
 
 impl Drop for HostTierGrant {
@@ -5601,13 +5622,21 @@ fn co_served_engines_share_one_host_tier_budget() {
     drop(first);
     let third = host_tier_grant(16 * G);
     assert_eq!(third.bytes(), 16 * G);
-    let fourth = host_tier_grant(64 * G);
+    let mut fourth = host_tier_grant(64 * G);
     assert_eq!(
         fourth.bytes(),
         48 * G,
         "what the others left of the largest request"
     );
-    drop((second, third, fourth));
+    drop((second, third));
+    fourth.shrink_to(8 * G);
+    let fifth = host_tier_grant(64 * G);
+    assert_eq!(
+        fifth.bytes(),
+        56 * G,
+        "a shrunk grant returns what it will not pin"
+    );
+    drop((fourth, fifth));
     assert_eq!(HOST_TIER_GRANTED.load(Ordering::Acquire), 0);
 }
 
@@ -9042,6 +9071,17 @@ mod tests {
     /// An arrival prefetch of a host-resident block-store boundary restores it through the
     /// store's hook (lock released) and marks it on the device; the attach then finds it there
     /// and a second prefetch does nothing.
+    #[test]
+    fn spill_ahead_keeps_a_quarter_headroom_while_restores_run() {
+        let h = 2u64 << 30;
+        assert!(spill_ahead_wanted(0, h - 1, h, false));
+        assert!(!spill_ahead_wanted(0, h, h, false));
+        assert!(!spill_ahead_wanted(0, h / 4, h, true));
+        assert!(spill_ahead_wanted(0, h / 4 - 1, h, true));
+        assert!(!spill_ahead_wanted(h / 8, h / 8, h, true));
+        assert!(!spill_ahead_wanted(SPILL_AHEAD_INFLIGHT_BYTES, 0, h, false));
+    }
+
     #[test]
     fn prefetch_restores_a_host_block_boundary_through_the_store() {
         #[derive(Default)]

@@ -168,7 +168,18 @@ async fn completions_with(
     {
         use crate::serve::manager::EnsureError;
         let ensured = match state.dp_set(&req.model) {
-            Some(set) => Some(state.dp_admit(set).await),
+            Some(set) => {
+                // The sampling the request resolves to below: a sampled request needs a rank that
+                // applies it resident.
+                let mut params = state
+                    .registry
+                    .get(&req.model)
+                    .map(|b| crate::serve::config::base_sampling(&b))
+                    .unwrap_or_default();
+                req.sampling.apply(&mut params);
+                params.logprobs = logprobs.clone();
+                Some(state.dp_admit(set, params.samples()).await)
+            }
             None => match state.manager_for(&req.model) {
                 Some(mgr) if mgr.manages(&req.model) => Some(mgr.ensure_resident(&req.model).await),
                 _ => None,
@@ -371,7 +382,13 @@ async fn completions_with(
     let mux = match (&direct, dp) {
         (Some(m), _) => m,
         (None, Some(set)) => {
-            match state.dp_route(set, ids.session.as_deref(), Some(&prompt_ids), 0) {
+            match state.dp_route(
+                set,
+                ids.session.as_deref(),
+                Some(&prompt_ids),
+                0,
+                gen.params.samples(),
+            ) {
                 Some((r, m, key, pick)) => {
                     (rank, prefix, _pick) = (r, key, Some(pick));
                     routed = m;
@@ -425,6 +442,7 @@ async fn completions_with(
         arrived: std::time::Instant::now(),
         respond: tx,
         opts: crate::serve::mux::JobOpts {
+            prompt_logprobs: req.sampling.prompt_logprobs.is_some(),
             session,
             turn: run.key(),
             continuing: run.continuing(),
@@ -437,14 +455,17 @@ async fn completions_with(
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
     }
-    if let Err(err) = state.submit_routed(
-        dp.map(|s| (&**s, rank)),
-        ids.session.as_deref(),
-        mux,
-        job,
-        t_arrive,
-        ingress,
-    ) {
+    if let Err(err) = state
+        .submit_routed(
+            dp.map(|s| (&**s, rank)),
+            ids.session.as_deref(),
+            mux,
+            job,
+            t_arrive,
+            ingress,
+        )
+        .await
+    {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 let mut r = crate::serve::api_error(

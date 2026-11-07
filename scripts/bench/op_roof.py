@@ -196,6 +196,25 @@ def cost(op, p, rows, ctx, wb, kvb):
     if op == "QwenGdnPrefill":  # chunked delta rule: state in/out, q/k/v/o rows, ~6 HV K V per token
         hv, k, v, t = g("HV"), g("K"), g("V"), g("T", rows)
         return 8 * hv * k * v + 2 * t * (2 * g("HK") * k + 2 * hv * v), 6 * t * hv * k * v
+    # Encoder sidecars (devgen mm.rs, f32 activations): bf16 or f32 weights, f32 rows in and out.
+    # The matrix floor uses the BF16 peak (an optimistic floor for the tf32x3 conv taps).
+    if op == "DenseGemmF32":
+        n, k = g("N"), g("K")
+        return 2 * n * k + 4 * m * k + 4 * m * n, 2 * m * n * k
+    if op in ("UnaryF32", "GluF32"):
+        return (12 if op == "GluF32" else 8) * g("rows", rows) * g("width"), 0
+    if op == "BinaryF32":
+        return 12 * g("items", 1) * g("rows", rows) * g("width"), 0
+    if op == "RmsNormF32":
+        return 8 * g("rows", rows) * g("groups", 1) * g("group_width"), 0
+    if op == "LayerNormF32":
+        return 8 * g("rows", rows) * g("feat"), 0
+    if op == "GatherRowsF32":
+        return (8 * g("width") + 4) * g("rows", rows), 0
+    if op == "ChunkAttentionF32":
+        t, hh, d = g("rows", rows), g("heads"), g("head_width")
+        keys = g("chunk") + g("left") + g("future", 0)
+        return 16 * t * hh * d, 4 * t * hh * d * keys
     return moe_cost(op, p, rows, wb)
 
 
@@ -261,7 +280,7 @@ class RouterTable:
     def union(self, experts, topk, rows):
         if topk != self.topk or any(e >= experts for r in self.rows for e in r):
             raise ValueError("router table does not match the packet's expert count / top-k")
-        n = len(self.rows)
+        n, rows = len(self.rows), int(rows)
         if rows >= n:
             return float(len(frozenset().union(*self.rows)))
         stride = n // rows

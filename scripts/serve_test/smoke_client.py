@@ -2,7 +2,7 @@
 """Endpoint smoke against a running `plowrt serve`: what the server advertises, a few requests each.
 
   smoke_client.py <url> <outdir> [--asr-manifest M] [--vad-wav W] [--tts MODEL=VOICE[:LANG] ...]
-                  [--models a,b]
+                  [--models a,b] [--llm-repeats N] [--llm-max-tokens N]
 
 /health, /metrics and /v1/models first. Then per model card, by its `x_plow_endpoints`:
   chat/completions      two greedy chats with a checked answer, one streamed chat, raw completions
@@ -73,18 +73,18 @@ def overlap_ok(ref, hyp):
     return len(set(ref) & set(hyp)) >= 0.8 * len(set(ref))
 
 
-def smoke_llm(url, model, rec):
+def smoke_llm(url, model, rec, max_tokens=None):
     for prompt, want in (("What is the capital of France? Answer in one short sentence.", "paris"),
                          ("Write the numbers from one to five in words, separated by commas.", "three")):
         body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
-                           "max_tokens": 64, "temperature": 0}).encode()
+                           "max_tokens": max_tokens or 64, "temperature": 0}).encode()
         st, data, dt = post(url, "/v1/chat/completions", body)
         j = json.loads(data) if st == 200 else {}
         text = (j.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         rec(endpoint="chat/completions", prompt=prompt, status=st, latency_s=round(dt, 3), text=text,
             usage=j.get("usage"), ok=st == 200 and want in text.lower())
     body = json.dumps({"model": model, "messages": [{"role": "user", "content": "Name the largest planet in the solar system in one sentence."}],
-                       "max_tokens": 48, "temperature": 0, "stream": True}).encode()
+                       "max_tokens": max_tokens or 48, "temperature": 0, "stream": True}).encode()
     t0, first, parts = time.perf_counter(), None, []
     for ev in sse(url, "/v1/chat/completions", body):
         d = (ev.get("choices") or [{}])[0].get("delta", {}).get("content")
@@ -230,7 +230,11 @@ def main():
     ap.add_argument("--vad-wav", default=os.environ.get("VAD_WAV"))
     ap.add_argument("--tts", action="append", default=[], metavar="MODEL=VOICE[:LANG]")
     ap.add_argument("--models", default=None, help="comma-separated subset of the served models")
+    ap.add_argument("--llm-repeats", type=int, default=1, help="repeat the five LLM requests per model")
+    ap.add_argument("--llm-max-tokens", type=int, help="chat output budget, including thinking tokens")
     a = ap.parse_args()
+    if a.llm_repeats < 1 or (a.llm_max_tokens is not None and a.llm_max_tokens < 1):
+        ap.error("LLM repeats and max tokens must be positive")
     url = a.url.rstrip("/")
     os.makedirs(a.out, exist_ok=True)
     res = {"url": url, "requests": []}
@@ -271,7 +275,8 @@ def main():
         res.setdefault("models", {})[m] = eps
         try:
             if "chat/completions" in eps:
-                smoke_llm(url, m, rec)
+                for _ in range(a.llm_repeats):
+                    smoke_llm(url, m, rec, a.llm_max_tokens)
             if "audio/transcriptions" in eps:
                 if clips:
                     smoke_asr(url, m, clips, "audio/transcriptions/stream" in eps, rec)

@@ -29,6 +29,8 @@ pub mod runtime;
 pub mod sign;
 pub mod sink;
 pub mod store;
+/// Checkpoint views: a prepared checkpoint carried as only the bytes prep derived.
+pub mod view;
 pub mod weights;
 
 pub use fetch::{transport, Fetch};

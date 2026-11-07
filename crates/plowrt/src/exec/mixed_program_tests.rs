@@ -136,6 +136,19 @@ fn ordinary_asset_synthesis() {
         .collect();
     let kvlen = tensor(&blob, "in.kvlen").unwrap() as usize;
     let batch = (blob.tensors[kvlen].bytes / 4) as usize;
+    let embed = blob.progs[0]
+        .insts
+        .iter()
+        .position(|d| d.op == DevOp::Embed as u16)
+        .unwrap();
+    let flags = blob.progs[0].insts[embed].i[6];
+    blob.progs[0].insts[embed].i[6] = packet::dev::RESIDUAL_F32_FLAG;
+    assert!(synthesize(&blob, batch, false, true)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("FP32 residual state is unsupported"));
+    blob.progs[0].insts[embed].i[6] = flags;
     {
         let mixed = synthesize(&blob, batch, false, false).unwrap();
         assert_eq!(

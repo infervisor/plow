@@ -121,7 +121,8 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
         GpuEngine::select_vmm_prefix_layout(blob, kv.as_ref(), cfg, cc, gran, Some(false)).is_some()
     };
     assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
-    assert!(!selected(&blob, &cfg, (12, 0), 2 << 20));
+    assert!(selected(&blob, &cfg, (12, 0), 2 << 20));
+    assert!(!selected(&blob, &cfg, (8, 9), 2 << 20));
     assert!(!selected(&blob, &cfg, (9, 0), 16 << 20));
     cfg.nv.vmm_live = true;
     assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
@@ -166,6 +167,10 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     }
     blob.tensors.push(tensor("state.qwen.0.gdn", 64));
     assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+    assert!(
+        selected(&blob, &cfg, (12, 0), 2 << 20),
+        "recurrent-state packets take the cache in GB202 auto mode as they do when forced"
+    );
     blob.tensors.pop();
     blob.tensors[3].bytes /= 2;
     assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
@@ -193,5 +198,75 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     )
     .unwrap();
     assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// GB202 auto mode takes the prefix cache for a dense hd128 packet (Qwen3 / SmolLM / ASR
+/// decoders), not only for the hybrid sliding + full geometry.
+#[test]
+fn automatic_prefix_selection_covers_dense_hd128() {
+    let dir = std::env::temp_dir().join(format!("plow-prefix-dense-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "num_hidden_layers": 2, "num_key_value_heads": 8, "head_dim": 128,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let tensor = |name: &str, bytes| DevTensor {
+        name: name.into(),
+        bytes,
+        init: None,
+    };
+    let blob = DevBlob {
+        n_cu: 188,
+        flags: 0,
+        target: 0,
+        tensors: vec![
+            tensor("in.pos", 8192 * 4),
+            tensor("kv.0.k", 16 << 20),
+            tensor("kv.0.v", 16 << 20),
+            tensor("kv.1.k", 16 << 20),
+            tensor("kv.1.v", 16 << 20),
+        ],
+        init: Vec::new(),
+        kvrow: Vec::new(),
+        sections: Vec::new(),
+        gen: Vec::new(),
+        tp: None,
+        parent: None,
+        progs: vec![DevProg {
+            t: 1,
+            role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
+            n_counter: 0,
+            insts: Vec::new(),
+            stream: Vec::new(),
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: vec![0, 0],
+            l2_domains: 0,
+        }],
+    };
+    let mut cfg = RuntimeConfig::get().clone();
+    cfg.nv.vmm_prefix = None;
+    cfg.nv.vmm_live = false;
+    cfg.nv.vmm_live_rings = None;
+    cfg.prefix_cache = true;
+    let kv = plow_asset::serve_manifest::KvGeometry::from_config(&dir);
+    let selected = |cfg: &RuntimeConfig, cc| {
+        GpuEngine::select_vmm_prefix_layout(&blob, kv.as_ref(), cfg, cc, 2 << 20, Some(false))
+            .is_some()
+    };
+    // One head window (8192 rows x 256 B) is one 2 MiB granule.
+    assert!(selected(&cfg, (12, 0)));
+    // Hopper keeps its qualified hybrid-geometry allowlist.
+    assert!(!selected(&cfg, (9, 0)));
+    cfg.prefix_cache = false;
+    assert!(!selected(&cfg, (12, 0)));
     std::fs::remove_dir_all(dir).unwrap();
 }

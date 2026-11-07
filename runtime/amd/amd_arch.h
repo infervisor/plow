@@ -23,6 +23,49 @@
 #define PLOW_CDNA4 0
 #endif
 
+/* RDNA4 (gfx12). Built in wave64 mode (-mwavefrontsize64) so every wave64 fragment, reduction and
+ * lane-mask in the op bodies keeps its meaning; it takes the gfx942 (64 KiB LDS) tile arm. It has
+ * no MFMA: the matrix wrappers below reproduce the MFMA fragment semantics with cross-lane
+ * permutes. Its fp8 converts decode OCP e4m3 natively (CDNA3's decode FNUZ). */
+#if defined(__GFX12__)
+#define PLOW_GFX12 1
+#else
+#define PLOW_GFX12 0
+#endif
+
+/* Constant 100 MHz clock. s_memrealtime is gfx9-only; gfx11/gfx12 return the same counter
+ * through s_sendmsg_rtn (MSG_RTN_GET_REALTIME = 0x83). */
+__device__ __forceinline__ unsigned long long plow_realtime() {
+#if defined(__GFX11__) || defined(__GFX12__)
+    return __builtin_amdgcn_s_sendmsg_rtnl(0x83);
+#else
+    return __builtin_amdgcn_s_memrealtime();
+#endif
+}
+
+
+/* Vector L0/L1 invalidate before reading data another workgroup published (gfx9 `buffer_inv`).
+ * gfx12 has one device-coherent L2; its acquire fence emits the matching `global_inv`. */
+__device__ __forceinline__ void plow_cache_inv() {
+#if PLOW_GFX12
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
+    asm volatile("buffer_inv" ::: "memory");
+#endif
+}
+/* `s_waitcnt vmcnt(N)` / `lgkmcnt(0)`: gfx12 split the counters (loadcnt, dscnt/kmcnt). */
+#if PLOW_GFX12
+#define PLOW_ASM_WAIT_VM(n) "s_wait_loadcnt " #n
+#define PLOW_ASM_WAIT_VM_OP "s_wait_loadcnt %0"
+#define PLOW_ASM_WAIT_LGKM0 "s_wait_dscnt 0\n\ts_wait_kmcnt 0"
+#define PLOW_ASM_BARRIER "s_barrier_signal -1\n\ts_barrier_wait -1"
+#else
+#define PLOW_ASM_WAIT_VM(n) "s_waitcnt vmcnt(" #n ")"
+#define PLOW_ASM_WAIT_VM_OP "s_waitcnt vmcnt(%0)"
+#define PLOW_ASM_WAIT_LGKM0 "s_waitcnt lgkmcnt(0)"
+#define PLOW_ASM_BARRIER "s_barrier"
+#endif
+
 /* MX (microscaling) block-scale converts and the scaled f8f6f4 matrix core are CDNA4 silicon.
  * CDNA3 has no fp4 datatype at all -- see crates/hwspec/src/isa.rs, which already models this
  * as Gfx942 { mx_scale_cvt: false, no MmaDtype::Fp4 }. The mxfp4 / A4W4 op arms are gated on
@@ -63,9 +106,59 @@
 typedef bf16_t plow_bf16x4 __attribute__((ext_vector_type(4)));
 typedef bf16_t bf16x2 __attribute__((ext_vector_type(2)));
 
-__device__ __forceinline__ f32x16 plow_mfma_bf16_32x32(bf16x8 a, bf16x8 b, f32x16 acc) {
+
+typedef float f32x2 __attribute__((ext_vector_type(2)));
+
+#if PLOW_GFX12
+#define PLOW_MMA_FN __device__ __attribute__((noinline))
+#else
+#define PLOW_MMA_FN __device__ __forceinline__
+#endif
+#if PLOW_GFX12
+/* Exact-semantics MFMA emulation for wave64 gfx12. Fragment maps (wrapper level, K split across
+ * lane halves/quarters exactly as the CDNA4 instruction): 32x32: lane l holds A[l%32][8*(l/32)+i]
+ * and B[8*(l/32)+i][l%32]; D register j is row 8*(j/4)+4*(l/32)+j%4, column l%32. 16x16: lane l
+ * holds A[l%16][8*(l/16)+i] and B[8*(l/16)+i][l%16]; D register j is row 4*(l/16)+j, column l%16.
+ * Correct, not fast: one permute per 32-bit operand word per output row. */
+union plow_frag8 {
+    bf16x8 v;
+    int w[4];
+};
+__device__ __forceinline__ float plow_bf_lo(int w) { return __builtin_bit_cast(float, (unsigned)w << 16); }
+__device__ __forceinline__ float plow_bf_hi(int w) { return __builtin_bit_cast(float, (unsigned)w & 0xffff0000u); }
+#endif
+
+PLOW_MMA_FN f32x16 plow_mfma_bf16_32x32(bf16x8 a, bf16x8 b, f32x16 acc) {
 #if PLOW_CDNA4
     return __builtin_amdgcn_mfma_f32_32x32x16_bf16(a, b, acc, 0, 0, 0);
+#elif PLOW_GFX12
+    const int l = (int)(__lane_id() & 63), h = l >> 5;
+    plow_frag8 fa{a}, fb{b};
+    float bs[8], bo[8]; /* own k-half, the other lane half's */
+#pragma unroll
+    for (int w = 0; w < 4; w++) {
+        const int ow = __shfl(fb.w[w], l ^ 32, 64);
+        bs[2 * w] = plow_bf_lo(fb.w[w]);
+        bs[2 * w + 1] = plow_bf_hi(fb.w[w]);
+        bo[2 * w] = plow_bf_lo(ow);
+        bo[2 * w + 1] = plow_bf_hi(ow);
+    }
+#pragma unroll
+    for (int j = 0; j < 16; j++) {
+        const int m = 8 * (j >> 2) + 4 * h + (j & 3);
+        float s = acc[j];
+#pragma unroll
+        for (int w = 0; w < 4; w++) {
+            const int as = __shfl(fa.w[w], m + 32 * h, 64);
+            const int ao = __shfl(fa.w[w], m + 32 * (h ^ 1), 64);
+            s = __builtin_fmaf(plow_bf_lo(as), bs[2 * w], s);
+            s = __builtin_fmaf(plow_bf_hi(as), bs[2 * w + 1], s);
+            s = __builtin_fmaf(plow_bf_lo(ao), bo[2 * w], s);
+            s = __builtin_fmaf(plow_bf_hi(ao), bo[2 * w + 1], s);
+        }
+        acc[j] = s;
+    }
+    return acc;
 #else
     const plow_bf16x4 a0 = {a[0], a[1], a[2], a[3]}, a1 = {a[4], a[5], a[6], a[7]};
     const plow_bf16x4 b0 = {b[0], b[1], b[2], b[3]}, b1 = {b[4], b[5], b[6], b[7]};
@@ -74,9 +167,36 @@ __device__ __forceinline__ f32x16 plow_mfma_bf16_32x32(bf16x8 a, bf16x8 b, f32x1
 #endif
 }
 
-__device__ __forceinline__ f32x4 plow_mfma_bf16_16x16(bf16x8 a, bf16x8 b, f32x4 acc) {
+PLOW_MMA_FN f32x4 plow_mfma_bf16_16x16(bf16x8 a, bf16x8 b, f32x4 acc) {
 #if PLOW_CDNA4
     return __builtin_amdgcn_mfma_f32_16x16x32_bf16(a, b, acc, 0, 0, 0);
+#elif PLOW_GFX12
+    const int l = (int)(__lane_id() & 63), n = l & 15, g = l >> 4;
+    plow_frag8 fa{a}, fb{b};
+    float bk[4][8];
+#pragma unroll
+    for (int q = 0; q < 4; q++)
+#pragma unroll
+        for (int w = 0; w < 4; w++) {
+            const int bw = __shfl(fb.w[w], n + 16 * q, 64);
+            bk[q][2 * w] = plow_bf_lo(bw);
+            bk[q][2 * w + 1] = plow_bf_hi(bw);
+        }
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int m = 4 * g + j;
+        float s = acc[j];
+#pragma unroll
+        for (int q = 0; q < 4; q++)
+#pragma unroll
+            for (int w = 0; w < 4; w++) {
+                const int aw = __shfl(fa.w[w], m + 16 * q, 64);
+                s = __builtin_fmaf(plow_bf_lo(aw), bk[q][2 * w], s);
+                s = __builtin_fmaf(plow_bf_hi(aw), bk[q][2 * w + 1], s);
+            }
+        acc[j] = s;
+    }
+    return acc;
 #else
     const plow_bf16x4 a0 = {a[0], a[1], a[2], a[3]}, a1 = {a[4], a[5], a[6], a[7]};
     const plow_bf16x4 b0 = {b[0], b[1], b[2], b[3]}, b1 = {b[4], b[5], b[6], b[7]};
@@ -115,7 +235,7 @@ __device__ __forceinline__ f32x4 plow_mfma_bf16_16x16(bf16x8 a, bf16x8 b, f32x4 
  * ------------------------------------------------------------------------- */
 /* Epilogue correction for the halved CDNA3 fp8 operands: 2 (A) * 2 (B). Exactly 1.0 on CDNA4,
  * so the multiply folds away there. */
-#if PLOW_CDNA4
+#if PLOW_CDNA4 || PLOW_GFX12
 #define PLOW_FP8_MMA_FIX 1.0f
 #else
 #define PLOW_FP8_MMA_FIX 4.0f
@@ -124,10 +244,44 @@ __device__ __forceinline__ f32x4 plow_mfma_bf16_16x16(bf16x8 a, bf16x8 b, f32x4 
  * include, and the wrapper needs the type here. */
 typedef int mfma_f8f6f4_operand __attribute__((ext_vector_type(8)));
 
-__device__ __forceinline__ f32x16 plow_mfma_fp8_32x32(mfma_f8f6f4_operand a,
+PLOW_MMA_FN f32x16 plow_mfma_fp8_32x32(mfma_f8f6f4_operand a,
                                                       mfma_f8f6f4_operand b, f32x16 acc) {
 #if PLOW_CDNA4
     return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(a, b, acc, 0, 0, 0, 0, 0, 0);
+#elif PLOW_GFX12
+    /* Native OCP decode. Lane l holds 32 k-bytes of row/column l%32; the two lane halves
+     * partition K=64, A and B permuted identically. */
+    const int l = (int)(__lane_id() & 63), h = l >> 5;
+    float bs[32], bo[32];
+#pragma unroll
+    for (int w = 0; w < 8; w++) {
+        const int ow = __shfl(b[w], l ^ 32, 64);
+        const f32x2 s0 = __builtin_amdgcn_cvt_pk_f32_fp8(b[w], false), s1 = __builtin_amdgcn_cvt_pk_f32_fp8(b[w], true);
+        const f32x2 o0 = __builtin_amdgcn_cvt_pk_f32_fp8(ow, false), o1 = __builtin_amdgcn_cvt_pk_f32_fp8(ow, true);
+        bs[4 * w] = s0[0]; bs[4 * w + 1] = s0[1]; bs[4 * w + 2] = s1[0]; bs[4 * w + 3] = s1[1];
+        bo[4 * w] = o0[0]; bo[4 * w + 1] = o0[1]; bo[4 * w + 2] = o1[0]; bo[4 * w + 3] = o1[1];
+    }
+#pragma unroll
+    for (int j = 0; j < 16; j++) {
+        const int m = 8 * (j >> 2) + 4 * h + (j & 3);
+        float s = acc[j];
+#pragma unroll
+        for (int w = 0; w < 8; w++) {
+            const int as = __shfl(a[w], m + 32 * h, 64), ao = __shfl(a[w], m + 32 * (h ^ 1), 64);
+            const f32x2 x0 = __builtin_amdgcn_cvt_pk_f32_fp8(as, false), x1 = __builtin_amdgcn_cvt_pk_f32_fp8(as, true);
+            const f32x2 y0 = __builtin_amdgcn_cvt_pk_f32_fp8(ao, false), y1 = __builtin_amdgcn_cvt_pk_f32_fp8(ao, true);
+            s = __builtin_fmaf(x0[0], bs[4 * w], s);
+            s = __builtin_fmaf(x0[1], bs[4 * w + 1], s);
+            s = __builtin_fmaf(x1[0], bs[4 * w + 2], s);
+            s = __builtin_fmaf(x1[1], bs[4 * w + 3], s);
+            s = __builtin_fmaf(y0[0], bo[4 * w], s);
+            s = __builtin_fmaf(y0[1], bo[4 * w + 1], s);
+            s = __builtin_fmaf(y1[0], bo[4 * w + 2], s);
+            s = __builtin_fmaf(y1[1], bo[4 * w + 3], s);
+        }
+        acc[j] = s;
+    }
+    return acc;
 #else
     union { mfma_f8f6f4_operand v; long q[4]; } ua{a}, ub{b};
 #pragma unroll
@@ -200,7 +354,6 @@ __device__ __forceinline__ float plow_dot2_bf16(bf16x2 a, bf16x2 b, float acc) {
  *   fp4 e2m1 -> bf16 : 8 magnitudes, all exactly representable. The E8M0 block scale is a
  *                      power of two, so folding it is exact too.
  * ------------------------------------------------------------------------- */
-typedef float f32x2 __attribute__((ext_vector_type(2)));
 
 /* Two f32 -> one u32 holding a bf16 pair (lo in bits 0..15). Truncation, not RNE: every caller
  * feeds it values that are already exact in bf16 (see above), so there is nothing to round. */
@@ -270,11 +423,18 @@ __device__ __forceinline__ unsigned plow_fp8_mask_neg0(unsigned w) {
  * Reaching them means a NaN weight in the packet, which is an upstream bug either way; the exact
  * scalar decoder below is kept for anything that must be bit-faithful on those two bytes. */
 __device__ __forceinline__ void plow_fp8x4_ocp_to_bf16(unsigned w, unsigned& lo, unsigned& hi) {
+#if PLOW_GFX12
+    /* gfx12 decodes OCP e4m3 natively: no mask, no doubling. */
+    const f32x2 a = __builtin_amdgcn_cvt_pk_f32_fp8(w, false), c = __builtin_amdgcn_cvt_pk_f32_fp8(w, true);
+    lo = plow_pack_bf16x2(a[0], a[1]);
+    hi = plow_pack_bf16x2(c[0], c[1]);
+#else
     const unsigned m = plow_fp8_mask_neg0(w);
     const f32x2 a = __builtin_amdgcn_cvt_pk_f32_fp8(m, false); /* bytes 0,1 */
     const f32x2 c = __builtin_amdgcn_cvt_pk_f32_fp8(m, true);  /* bytes 2,3 */
     lo = plow_pack_bf16x2(a[0] * 2.0f, a[1] * 2.0f);
     hi = plow_pack_bf16x2(c[0] * 2.0f, c[1] * 2.0f);
+#endif
 }
 
 /* Sixteen OCP e4m3 bytes (one b128 load) -> 16 RAW f32 — no bf16 pack, no x2.

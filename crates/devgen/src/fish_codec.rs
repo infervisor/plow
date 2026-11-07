@@ -50,14 +50,26 @@ pub const CAPACITIES: &[(u32, u32)] = &[
 /// (batch, new frames) of the stateful stream steps `step.b{B}.f{N}`: each decodes only its new
 /// frames, carrying every causal context in per-slot state (`state.codec.*`, [`STREAM_SLOTS`]
 /// streams, shared by all step programs).
+/// Batched launches pad every stream to the launch's largest step, so short steps get their own
+/// widths: a 16-stream launch of 2-frame steps on `(16, 17)` costs ~6x `(16, 1)` (H100, 12 Hz codec).
 pub const STEP_CAPACITIES: &[(u32, u32)] = &[
     (1, 1),
     (4, 1),
+    (8, 1),
     (16, 1),
+    (32, 1),
     (64, 1),
     (128, 1),
     (256, 1),
+    (4, 2),
+    (16, 2),
+    (32, 2),
+    (64, 2),
     (1, 4),
+    (4, 4),
+    (16, 4),
+    (32, 4),
+    (64, 4),
     (1, 17),
     (4, 17),
     (8, 17),
@@ -2112,11 +2124,21 @@ mod tests {
             [
                 (1, 1),
                 (4, 1),
+                (8, 1),
                 (16, 1),
+                (32, 1),
                 (64, 1),
                 (128, 1),
                 (256, 1),
+                (4, 2),
+                (16, 2),
+                (32, 2),
+                (64, 2),
                 (1, 4),
+                (4, 4),
+                (16, 4),
+                (32, 4),
+                (64, 4),
                 (1, 17),
                 (4, 17),
                 (8, 17)

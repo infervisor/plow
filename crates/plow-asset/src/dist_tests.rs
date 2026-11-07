@@ -36,6 +36,7 @@ fn variant(label: &str, gen: u32, t: Target, mode: &str, n: u32) -> Variant {
             plowc: "0.2.0".into(),
             objset_id: "obj0".into(),
             pairing_hash: None,
+            executor: None,
         },
         manifest: format!("manifests/{label}@g{gen}"),
         sha256: "a".repeat(64),
@@ -538,6 +539,7 @@ fn bundle() -> Bundle {
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
             files: vec![],
+            views: vec![],
         },
         objset: Some(BundleObjset {
             objset_id: "obj0".into(),
@@ -559,6 +561,7 @@ fn bundle() -> Bundle {
         pairing_hash: Some("0x9fd0e880fb6fbf09".into()),
         runtime_env: BTreeMap::from([("PLOW_CTR_DBUF".into(), "1".into())]),
         recipe: None,
+        executor: None,
     }
 }
 
@@ -842,7 +845,9 @@ fn objset_rejects_structural_damage() {
         "",
         "../x.elf",
         "/x.elf",
-        "d/x.elf",
+        "d/e/x.elf",
+        "hsaco/x.elf",
+        "checkpoint/x.elf",
         "objects/",
         "objects/../x.elf",
         "objects/d/x.elf",
@@ -860,6 +865,12 @@ fn objset_rejects_structural_damage() {
     let mut o = base.clone();
     o.objects[0].name = format!("{SEGMENT_OBJECTS_DIR}/interp_sm90a_pfseg.cubin");
     assert!(o.validate().is_ok());
+    // A sub-bundle's objects sit beside its packet, in its own tree.
+    for name in ["d/x.elf", "d/objects/x.cubin"] {
+        let mut o = base.clone();
+        o.objects[0].name = name.into();
+        assert!(o.validate().is_ok(), "refused {name}");
+    }
 
     let mut o = base.clone();
     let dup = o.objects[0].clone();
@@ -1145,4 +1156,131 @@ fn on_a_larger_chip_the_nearest_build_wins() {
 fn objects_land_where_each_vendor_serves_them() {
     assert_eq!(objset_root("nvidia"), "");
     assert_eq!(objset_root("amd"), "hsaco");
+}
+
+fn views_bundle() -> Bundle {
+    let mut b = bundle();
+    b.schema = BUNDLE_SCHEMA_VIEWS.into();
+    b.checkpoint.views = vec![CheckpointView {
+        dir: "checkpoint".into(),
+        files: vec![
+            ViewFile {
+                name: "tokenizer.json".into(),
+                sha256: "1".repeat(64),
+                bytes: 9,
+                hf: Some("tokenizer.json".into()),
+                assembled: None,
+            },
+            ViewFile {
+                name: "model.safetensors".into(),
+                sha256: "2".repeat(64),
+                bytes: 100,
+                hf: None,
+                assembled: Some(Assembled {
+                    header: "{}".into(),
+                    parts: vec![
+                        Part {
+                            hf: Some("model-00001-of-00002.safetensors".into()),
+                            tensor: Some("a".into()),
+                            derived: None,
+                        },
+                        Part {
+                            hf: None,
+                            tensor: None,
+                            derived: Some(8),
+                        },
+                    ],
+                    derived: Some(CheckpointFile {
+                        name: "model.safetensors".into(),
+                        sha256: "3".repeat(64),
+                        bytes: 8,
+                    }),
+                }),
+            },
+        ],
+    }];
+    b
+}
+
+/// Views, sub-bundle files and a packet layout are what a v2 reader would drop or misplace:
+/// only v3 carries them, and each is checked for what would escape the bundle or mislead load.
+#[test]
+fn a_v3_bundle_carries_views_sub_bundles_and_packet_layouts_and_only_v3_does() {
+    let b = views_bundle();
+    b.validate().unwrap();
+    let mut v2 = b.clone();
+    v2.schema = BUNDLE_SCHEMA.into();
+    assert!(v2.validate().unwrap_err().contains(BUNDLE_SCHEMA_VIEWS));
+
+    let broken = |f: fn(&mut Bundle)| {
+        let mut b = views_bundle();
+        f(&mut b);
+        b.validate().unwrap_err()
+    };
+    broken(|b| b.checkpoint.views[0].dir = "../x".into());
+    broken(|b| b.checkpoint.views[0].files[0].name = "../tokenizer.json".into());
+    broken(|b| b.checkpoint.views[0].files[0].hf = Some("/etc/passwd".into()));
+    broken(|b| {
+        let a = b.checkpoint.views[0].files[1].assembled.as_mut().unwrap();
+        a.derived.as_mut().unwrap().bytes = 7;
+    });
+    broken(|b| b.checkpoint.views.push(b.checkpoint.views[0].clone()));
+    broken(|b| b.checkpoint.source = DIST_SOURCE.into());
+
+    let mut sub = bundle();
+    sub.schema = BUNDLE_SCHEMA_VIEWS.into();
+    sub.files.push(FileRef {
+        role: "sub_packet".into(),
+        name: "text_encoder/model.pkt".into(),
+        sha256: "e".repeat(64),
+        bytes: 1,
+    });
+    sub.validate().unwrap();
+    for bad in [
+        "objects/model.pkt",
+        "a/b/model.pkt",
+        "../model.pkt",
+        "checkpoint/x",
+    ] {
+        let mut b = sub.clone();
+        b.files[1].name = bad.into();
+        assert!(b.validate().is_err(), "{bad}");
+    }
+}
+
+/// A `[build]` packet carries its weights; a host-executed one also ships no objset, and its
+/// index row says why.
+#[test]
+fn a_host_executed_packet_bundle_ships_no_objset() {
+    let mut b = bundle();
+    b.schema = BUNDLE_SCHEMA_VIEWS.into();
+    b.target = target("sm_90a", "H100 SXM5", 132, 80 << 30);
+    b.target.vendor = "nvidia".into();
+    b.checkpoint = BundleCheckpoint {
+        source: "pip:silero-vad==5.1.2".into(),
+        revision: String::new(),
+        shards: 0,
+        layout: PACKET_LAYOUT.into(),
+        bytes: 0,
+        files: vec![],
+        views: vec![],
+    };
+    b.objset = None;
+    b.pairing_hash = None;
+    assert!(
+        b.validate().unwrap_err().contains("no objset"),
+        "a missing objset never makes a host bundle"
+    );
+    b.executor = Some(HOST_EXECUTOR.into());
+    b.validate().unwrap();
+    assert!(b.host_executed());
+    b.checkpoint.layout = "hf-safetensors".into();
+    assert!(b.validate().unwrap_err().contains("executor"));
+
+    let mut v = variant("sm90a-h100-tp1", 1, b.target.clone(), "tp", 1);
+    v.build.objset_id = String::new();
+    v.build.pairing_hash = None;
+    assert!(v.validate().is_err());
+    v.build.executor = Some(HOST_EXECUTOR.into());
+    v.validate().unwrap();
 }

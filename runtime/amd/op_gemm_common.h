@@ -1379,7 +1379,7 @@ __device__ void d_gemm_small_splitk(bf16* C, const bf16* A, const bf16* B, unsig
         }
         __syncthreads();
         if (!sk_last) continue;
-        asm volatile("buffer_inv" ::: "memory");
+        plow_cache_inv();
         __syncthreads();
         const unsigned tile = gm_remap<GM_SWZ, GM_WGM>(t, nt, tm, tn);
         const unsigned m0 = (tile / tn) * BM, n0 = (tile % tn) * BN;
@@ -2844,23 +2844,8 @@ __device__ __forceinline__ void gemv_norm_lds(bf16* __restrict__ lds, const bf16
  *     the wide shapes (gv_per >= 14)  1.02-1.04x     lm_head 1.00x
  *
  * The tail loop keeps the half-at-a-time form for a ragged `n`; every K3 and Gemma projection has
- * K % 8 == 0 so it runs zero times there. */
-__device__ __forceinline__ void stage_x_lds(bf16* __restrict__ lds, const bf16* __restrict__ x_,
-                                            size_t n) {
-    const auto* const x = as_glob(x_);
-    size_t i0 = 0;
-    /* Wave-uniform, so one scalar branch per packet. The alignment holds for every projection this
-     * tree ships (K is a multiple of 64 and the tensor table is page-aligned), but `gemv_walk`
-     * offsets x by `m0 * K`, so a future K with K % 8 != 0 would silently fault a 16-B load. Fall
-     * back rather than fault. */
-    if (((((uintptr_t)x_) | ((uintptr_t)lds)) & 15u) == 0u) {
-        const size_t nv = n >> 3;
-        for (size_t i = threadIdx.x; i < nv; i += PLOW_THREADS)
-            *(bf16v8*)(lds + i * 8) = ld_glob8(x + i * 8);
-        i0 = nv << 3;
-    }
-    for (size_t i = i0 + threadIdx.x; i < n; i += PLOW_THREADS) lds[i] = x[i];
-}
+ * K % 8 == 0 so it runs zero times there.
+ * (stage_x_lds lives in amd_common.h) */
 
 
 /* XLDS selects where x lives, at COMPILE time, and that is the whole point of the split.
@@ -3199,7 +3184,7 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
 #ifndef GV_RS_WIDE_UN
 #define GV_RS_WIDE_UN 6
 #endif
-template <int MM, bool XLDS, int UN, int R>
+template <int MM, bool XLDS, int UN, int R, bool TAIL = false>
 __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* __restrict__ x_,
                                             const bf16* __restrict__ W_, unsigned M, unsigned N,
                                             unsigned K, unsigned n, unsigned lane,
@@ -3212,7 +3197,7 @@ __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* _
     auto xv8 = [&](unsigned m, unsigned kk) -> bf16v8 {
         const size_t xo = (size_t)m * K + kk;
         if constexpr (XLDS)
-            return ld_lds8(lds + xo);
+            return TAIL ? gemv_lds8(lds + (size_t)m * K, kk, K) : ld_lds8(lds + xo);
         else
             return ld_glob8(x + xo);
     };
@@ -3232,8 +3217,14 @@ __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* _
 #pragma unroll
         for (int r = 0; r < R; r++)
 #pragma unroll
-            for (int u = 0; u < UN; u++)
-                wv[r][u] = buf_ld8(wr[r], ((c + (unsigned)u) * step + lane * 8) * 2u);
+            for (int u = 0; u < UN; u++) {
+                const unsigned k = (c + (unsigned)u) * step + lane * 8;
+                if constexpr (TAIL)
+                    wv[r][u] = gemv_load8(W_ + (size_t)(n + (unsigned)r * PLOW_WAVES) * K,
+                                        wr[r], k, K);
+                else
+                    wv[r][u] = buf_ld8(wr[r], k * 2u);
+            }
 #pragma unroll
         for (int u = 0; u < UN; u++) {
             const unsigned k = (c + (unsigned)u) * step + lane * 8;
@@ -3585,6 +3576,9 @@ __device__ __forceinline__ void gemv_rows_mfma(bf16* __restrict__ C_, const bf16
  * dependency map is unaffected, exactly as for `gemv_rows_rs`. ------------------------------- */
 #ifndef GV_MFMA4
 #define GV_MFMA4 0
+#endif
+#if GV_MFMA4 && PLOW_GFX12
+#error "GV_MFMA4 uses the 4x4 MFMA and ROW_BCAST DPP; gfx12 has neither"
 #endif
 /* Zero leaves the MFMA probe unrestricted. */
 #ifndef GV_MFMA4_MAXK
@@ -4069,14 +4063,6 @@ __device__ __forceinline__ void gemv_glu_rows(bf16* __restrict__ C_, const bf16*
 #ifndef GV_UNROLL_FP8
 #define GV_UNROLL_FP8 3
 #endif
-/* ABLATION LADDER (probe only, 0 = shipped code, results are WRONG at every other level). The
- * decode GEMV packet costs ~33 us before any bytes move, against a 5-10 us floor on the norm
- * packets in the same trace. This strips one phase per level so the fixed term can be attributed
- * instead of guessed: 1 = no wave_sum, 2 = no dequant/dot (loads still issued), 3 = no loads
- * either. Each level is measured in perf-data/plow-gfx942/gemv-mlp-and-tensile.md. */
-#ifndef PLOW_GV_ABL
-#define PLOW_GV_ABL 0
-#endif
 /* PICK UN BY THE CHUNK COUNT, NOT BY K. The rule the comment above states -- UN must DIVIDE the
  * row -- was implemented by hardcoding the K's of ONE model family (2560/4096/9728), so any model
  * whose hidden size is not on that list silently runs dead chunks. Gemma-4 is exactly that case:
@@ -4096,25 +4082,6 @@ __device__ __forceinline__ void gemv_glu_rows(bf16* __restrict__ C_, const bf16*
  * Llama K=4096 moves 3 -> 4, which is the "one free overshoot" that comment already flags). */
 __device__ __forceinline__ unsigned gv_un_fp8(unsigned nchunk) {
 #if !PLOW_GV_UN_FP8_KDIV /* op_gemm_gfx950.h: constant, the switches below fold */
-    (void)nchunk;
-    return GV_UNROLL_FP8;
-#endif
-#ifdef PLOW_GV_UN_BIG
-    /* PROBE: prefer the LARGEST divisor, not the first one found. The rule below tries 4 before
-     * 5, so nchunk=15 (down_proj, K=15360) takes UN=3 -- five sequential loop iterations with
-     * 2*3=6 loads in flight. UN=5 also divides 15 and gives three iterations with 10 in flight.
-     * `down` measures 1519 GB/s against gate|up's 1999 on the SAME kernel, and its distinguishing
-     * feature is exactly this: 1.6 columns per wave vs 6.3, so it has the least other work to
-     * hide a load behind and the most to gain from a deeper unroll. */
-    if (nchunk % 5 == 0) return 5;
-    if (nchunk % 4 == 0) return 4;
-    if (nchunk % 3 == 0) return 3;
-    if (nchunk % 2 == 0) return 2;
-    return GV_UNROLL_FP8;
-#endif
-#ifdef PLOW_GV_UN_LEGACY /* A/B escape hatch: the pre-fix constant, so the counterfactual object
-                          * can be built from THIS tree rather than differenced against an older
-                          * one. Reproduces the old path exactly for any K != 9728. */
     (void)nchunk;
     return GV_UNROLL_FP8;
 #endif
@@ -4262,14 +4229,6 @@ __device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ Cq_, bf16* __re
     const unsigned gv_per = (N + nblk - 1) / nblk;
     const unsigned gv_n0 = slice * gv_per;
     const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
-#if PLOW_GV_ABL >= 4
-    /* ABLATION 4: return IMMEDIATELY. Level 3 still walks the column/chunk loop (address math,
-     * predicates, wave_sum, stores) with fake data, so it does NOT measure "an infinitely fast
-     * GEMV" -- it measures "a GEMV with free memory". This level retires the packet body
-     * entirely, so what remains is the interpreter's per-packet machinery plus the ops the fp8
-     * GEMV does not own. Wrong results by construction. */
-    return;
-#endif
     unsigned n = gv_n0 + wave;
     for (; n + PLOW_WAVES < gv_n1; n += PLOW_WAVES * 2) {
         const unsigned n2 = n + PLOW_WAVES;
@@ -4293,32 +4252,15 @@ __device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ Cq_, bf16* __re
 
         for (unsigned c = 0; c < nchunk; c += UN) {
             fp8v16 wv[UN], wv2[UN];
-#if PLOW_GV_ABL >= 3
-            /* ABLATION 3: delete the weight LOADS as well, leaving only the packet's control flow.
-             * Whatever time survives this is dispatch, gating and loop overhead. */
-#pragma unroll
-            for (int u = 0; u < UN; u++) { wv[u] = (fp8v16)(c + (unsigned)u); wv2[u] = wv[u]; }
-#else
             /* Both columns' loads issued before either is touched: 2*UN in flight per lane. */
 #pragma unroll
             for (int u = 0; u < UN; u++) wv[u] = buf_ld_fp8(wr, (c + (unsigned)u) * step + lane * 16);
 #pragma unroll
             for (int u = 0; u < UN; u++) wv2[u] = buf_ld_fp8(wr2, (c + (unsigned)u) * step + lane * 16);
-#endif
 #pragma unroll
             for (int u = 0; u < UN; u++) {
                 const unsigned k = (c + (unsigned)u) * step + lane * 16;
                 const unsigned kx = (k < K) ? k : 0u; /* keep a NaN out of 0*NaN; wv is 0 anyway */
-#if PLOW_GV_ABL >= 2
-                /* ABLATION 2: keep the LOADS live, delete the dequant and the dots. Prices the
-                 * whole VALU body against pure weight streaming. Wrong results by construction. */
-                (void)kx;
-#pragma unroll
-                for (int m = 0; m < MM; m++) {
-                    acc[m] += __builtin_bit_cast(float, wv[u][0]);
-                    acc2[m] += __builtin_bit_cast(float, wv2[u][0]);
-                }
-#else
                 bf16v8 wlo, whi, wlo2, whi2;
                 fp8_to_bf16v8(wv[u], wlo, whi);
                 fp8_to_bf16v8(wv2[u], wlo2, whi2);
@@ -4330,20 +4272,14 @@ __device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ Cq_, bf16* __re
                     acc[m] += live ? dot8(whi, xhi, dot8(wlo, xlo, 0.0f)) : 0.0f;
                     acc2[m] += live ? dot8(whi2, xhi, dot8(wlo2, xlo, 0.0f)) : 0.0f;
                 }
-#endif
             }
         }
 #pragma unroll
         for (int m = 0; m < MM; m++) {
             /* ABLATION 1: skip the 6-step cross-lane reduction, keep everything else. Prices the
              * wave_sum chain, which runs once per column PAIR. Wrong results by construction. */
-#if PLOW_GV_ABL == 1
-            const float t = acc[m] * Sc[col];
-            const float t2 = acc2[m] * Sc2[col2];
-#else
             const float t = wave_sum(acc[m]) * Sc[col]; /* per-row dequant, once, in the epilogue */
             const float t2 = wave_sum(acc2[m]) * Sc2[col2];
-#endif
             if (lane == 0 && (unsigned)m < M) {
                 st_act1(&Co[(size_t)m * Nout + col], f2bf(t));
                 st_act1(&Co2[(size_t)m * Nout2 + col2], f2bf(t2));
@@ -5568,6 +5504,13 @@ extern "C" __device__ unsigned PLOW_GEMV_CAP_SYM(PLOW_GEMV_MM) = PLOW_GEMV_MM;
 extern "C" __device__ unsigned plow_gemv_walk_1 = 1;
 #endif
 
+#ifndef PLOW_GFX12_WMMA_GEMV
+#define PLOW_GFX12_WMMA_GEMV 0
+#endif
+#if PLOW_GFX12 && PLOW_GFX12_WMMA_GEMV
+#include "op_gemv_gfx12.h"
+#endif
+
 /* Stage x on-chip, then run the fused gate|up GEMV. PRECONDITION: M*K <= GM_LDS_HALVES.
  * plowc checks it and falls back to the unfused (gemv, gemv, glu) triple if it does not hold. */
 __device__ void d_gemv_glu(bf16* C, const bf16* x, const bf16* Wg, const bf16* Wu, unsigned M,
@@ -5600,6 +5543,20 @@ __device__ void d_gemv_glu(bf16* C, const bf16* x, const bf16* Wg, const bf16* W
     if (PLOW_GEMV_WALK) __syncthreads();
   });
 }
+
+#if PLOW_GFX12 && PLOW_GFX12_WMMA_GEMV
+__device__ __forceinline__ void d_gemv_glu_gfx12(bf16* C, const bf16* x, const bf16* Wg, const bf16* Wu, unsigned M,
+                           unsigned N, unsigned K, unsigned act, unsigned slice, unsigned nblk,
+                           bf16* lds, float beta, float lbeta) {
+    if (gv12_fits(M, K, 0)) {
+        const unsigned per = (N + nblk - 1) / nblk;
+        const unsigned n0 = slice * per, n1 = min(n0 + per, N);
+        gemv_gfx12_range<true>(C, x, Wg, Wu, M, N, K, n0, n1, lds, act, beta, lbeta);
+    } else
+        d_gemv_glu(C, x, Wg, Wu, M, N, K, act, slice, nblk, lds, beta, lbeta);
+}
+#define d_gemv_glu d_gemv_glu_gfx12
+#endif
 
 /* Stage x on-chip, then run the fused q|k|v|g GEMV. PRECONDITION: M*K <= GM_LDS_HALVES.
  * UN divides the K sweep with no dead loads: K=2560 (Qwen) -> 5 chunks, K=4096 (Llama) -> 8,
@@ -5661,11 +5618,31 @@ __device__ void d_gemv_qkvg(bf16* Cq, bf16* Ck, bf16* Cv, bf16* Cg, const bf16* 
   });
 }
 
-/* The 3-stream q|k|v form. A forwarder, not a second body: see gemv_qkvg_rows' ONE BODY note. */
-__device__ void d_gemv_qkv(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x, const bf16* Wq,
+/* The legacy three-stream path shares the q|k|v|g body. */
+#if PLOW_GFX12 && PLOW_GFX12_WMMA_GEMV
+__device__ __forceinline__
+#else
+__device__
+#endif
+void d_gemv_qkv(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x, const bf16* Wq,
                           const bf16* Wk, const bf16* Wv, unsigned M, unsigned Nq, unsigned Nk,
                           unsigned Nv, unsigned K, unsigned slice, unsigned nblk, bf16* lds,
                           const bf16* gnorm = nullptr, float eps = 0.0f) {
+#if PLOW_GFX12 && PLOW_GFX12_WMMA_GEMV
+    if (!gnorm && gv12_fits(M, K, 0)) {
+        const unsigned per = (Nq + Nk + Nv + nblk - 1) / nblk;
+        const unsigned begin = slice * per, end = min(begin + per, Nq + Nk + Nv);
+        auto project = [&](bf16* C, const bf16* W, unsigned N, unsigned offset) {
+            const unsigned lo = max(begin, offset), hi = min(end, offset + N);
+            if (lo < hi)
+                gemv_gfx12_range<false>(C, x, W, nullptr, M, N, K, lo - offset, hi - offset, lds);
+        };
+        project(Cq, Wq, Nq, 0);
+        project(Ck, Wk, Nk, Nq);
+        project(Cv, Wv, Nv, Nq + Nk);
+        return;
+    }
+#endif
     d_gemv_qkvg(Cq, Ck, Cv, nullptr, x, Wq, Wk, Wv, nullptr, M, Nq, Nk, Nv, 0u, K, slice, nblk,
                 lds, gnorm, eps);
 }
@@ -5708,6 +5685,9 @@ __device__ void d_gemv_qkv(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x, const bf
 #ifndef GV_UN_K8192
 #define GV_UN_K8192 16
 #endif
+#if PLOW_GFX12 && PLOW_GFX12_WMMA_GEMV
+#define d_gemv d_gemv_legacy
+#endif
 __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
                        const bf16* gamma, unsigned M, unsigned N, unsigned K, int norm,
                        float eps, unsigned slice, unsigned nblk, bf16* lds) {
@@ -5733,6 +5713,94 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
     if (PLOW_GEMV_WALK) __syncthreads();
   });
 }
+
+#if PLOW_GFX12 && PLOW_GFX12_WMMA_GEMV
+#undef d_gemv
+__device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
+                       const bf16* gamma, unsigned M, unsigned N, unsigned K, int norm,
+                       float eps, unsigned slice, unsigned nblk, bf16* lds) {
+    if (gv12_fits(M, K, norm))
+        d_gemv_gfx12(C, x, W, M, N, K, slice, nblk, lds);
+    else
+        d_gemv_legacy(C, x, W, rms, gamma, M, N, K, norm, eps, slice, nblk, lds);
+}
+#endif
+
+/* LM head GEMV with fused greedy-argmax epilogue (PLOW_DOP_GEMV_ARGMAX).
+ * M sequences: x is offset by a_row0, part is [M][nblk]; f0=cap. */
+__device__ __attribute__((noinline)) void d_gemv_argmax(
+    bf16* __restrict__ C_base, const bf16* __restrict__ x_base,
+    const bf16* __restrict__ W, unsigned long long* __restrict__ part_base,
+    unsigned M, unsigned N, unsigned K, float cap, unsigned slice, unsigned nblk,
+    bf16* __restrict__ lds) {
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned gv_n0 = slice * gv_per;
+    const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+    const float inv = cap > 0.0f ? 1.0f / cap : 0.0f;
+    constexpr int UN = 6;
+
+    for (unsigned m = 0; m < M; m++) {
+        const bf16* x_m = x_base + (size_t)m * K;
+        bf16* C_m = C_base + (size_t)m * N;
+        stage_x_lds(lds, x_m, K);
+        __syncthreads();
+
+        unsigned long long best = 0;
+        for (unsigned n = gv_n0 + wave; n < gv_n1; n += PLOW_WAVES) {
+            /* Share GEMV's chunk sums, wave reduction and bf16 store rounding.
+             * TAIL only guards ragged-K loads; it does not change the arithmetic. */
+            gemv_rows_r<1, true, UN, 1, true>(C_m, x_m, W, 1u, N, K, n, lane, lds);
+            if (lane == 0) {
+                const bf16 lg = C_m[n];
+                const bf16 sc = cap > 0.0f ? f2bf(cap * tanhf(bf2f(lg) * inv)) : lg;
+                st_act1(&C_m[n], sc);
+                const unsigned long long key = amax_pack(sc, n);
+                best = key > best ? key : best;
+            }
+        }
+        __syncthreads();
+        best = block_max_u64(best, (unsigned long long*)lds);
+        if (threadIdx.x == 0) {
+            st_act<unsigned long long>(&part_base[(size_t)m * nblk + slice], best);
+        }
+        __syncthreads();
+    }
+}
+
+#if PLOW_GFX12 && PLOW_GFX12_WMMA_GEMV
+__device__ __forceinline__ void d_gemv_argmax_gfx12(
+    bf16* __restrict__ C_base, const bf16* __restrict__ x_base,
+    const bf16* __restrict__ W, unsigned long long* __restrict__ part_base,
+    unsigned M, unsigned N, unsigned K, float cap, unsigned slice, unsigned nblk,
+    bf16* __restrict__ lds) {
+    if (!gv12_fits(M, K, 0)) {
+        d_gemv_argmax(C_base, x_base, W, part_base, M, N, K, cap, slice, nblk, lds);
+        return;
+    }
+    const unsigned per = (N + nblk - 1) / nblk;
+    const unsigned n0 = slice * per, n1 = min(n0 + per, N);
+    const float inv = cap > 0.0f ? 1.0f / cap : 0.0f;
+    d_gemv_gfx12(C_base, x_base, W, M, N, K, slice, nblk, lds);
+    for (unsigned m = 0; m < M; m++) {
+        bf16* C_m = C_base + (size_t)m * N;
+        unsigned long long best = 0;
+        for (unsigned n = n0 + threadIdx.x; n < n1; n += PLOW_THREADS) {
+            const bf16 lg = C_m[n];
+            const bf16 sc = cap > 0.0f ? f2bf(cap * tanhf(bf2f(lg) * inv)) : lg;
+            st_act1(&C_m[n], sc);
+            const unsigned long long key = amax_pack(sc, n);
+            best = key > best ? key : best;
+        }
+        best = block_max_u64(best, (unsigned long long*)lds);
+        if (threadIdx.x == 0)
+            st_act<unsigned long long>(&part_base[(size_t)m * nblk + slice], best);
+        __syncthreads();
+    }
+}
+#define d_gemv_argmax d_gemv_argmax_gfx12
+#endif
 
 /* fp32-OUTPUT GEMV — a small, separate, correctness-first op. NOT a variant of `d_gemv`/
  * `d_gemv_t` above and must never be folded into that machinery: this codebase's decode
@@ -6044,19 +6112,9 @@ __device__ void d_gemv_fp8(bf16* C, const bf16* x, const unsigned char* W, const
      * MEASURED NULL, so the suspect is eliminated: Gemma-4-12B fp8+occ4, ctx 4096, 48 steps,
      * three interleaved pairs -- staged 15.362/15.386/15.406 (mean 15.385) vs NOLDS
      * 15.465/15.394/15.428 (mean 15.429), i.e. +0.29%, no better and if anything worse. Staging
-     * x and its barrier are NOT what the GEMV packet pays. Kept as a probe rather than deleted
-     * so the next reader does not re-run it. */
-#if PLOW_GV_ABL >= 5
-    /* ABLATION 5: retire the ENTIRE op, staging included. Level 4 returns from the row loop but
-     * d_gemv_fp8 has already run stage_x_lds + __syncthreads -- 30 KB of LDS fill at K=15360 --
-     * so level 4 is NOT a zero-cost GEMV either. */
-    return;
-#endif
-#ifdef PLOW_GV_NOLDS
-    const bool lds_ok = false;
-#else
+     * x and its barrier are NOT what the GEMV packet pays. Recorded so the next reader does not
+     * re-run it. */
     const bool lds_ok = (size_t)M * K <= GM_LDS_HALVES;
-#endif
     if (lds_ok)
         stage_x_lds(lds, x, (size_t)M * K);
     if (lds_ok) __syncthreads();
@@ -6493,12 +6551,6 @@ __device__ void d_gemv_glu_fp8(bf16* C, const bf16* x, const unsigned char* Wg,
                               const unsigned char* Wu, const float* gscale, const float* uscale,
                               unsigned M, unsigned N, unsigned K, unsigned act, unsigned slice,
                               unsigned nblk, bf16* lds) {
-#if PLOW_GV_ABL >= 4
-    /* THE GLU ARM IS A SEPARATE FUNCTION, so PLOW_GV_ABL levels 1-3 (which patch gemv_rows_fp8)
-     * never touched it -- and it is the LARGEST op in the decode layer (57-59 us, 27% of it).
-     * Any "GEMV-free floor" measured without this line is not GEMV-free. */
-    return;
-#endif
     stage_x_lds(lds, x, (size_t)M * K);
     __syncthreads();
     /* Same dead-chunk rule as d_gemv_fp8, which this path did not have AT ALL -- it always ran
@@ -6521,11 +6573,7 @@ __device__ void d_gemv_glu_fp8(bf16* C, const bf16* x, const unsigned char* Wg,
      * on zeros -- an independent confirmation of gv_un_fp8 on the op that costs the most. UN=2
      * also divides 4 and halves the weight registers, but its edge is -0.35%/-0.12%, at or below
      * this box's 0.4% run-to-run drift. Left on the rule; probe kept so this is not re-run. */
-#ifdef PLOW_GLU_UN
-    switch (PLOW_GLU_UN) {
-#else
     switch (gv_un_fp8((K + PLOW_WAVE * 16 - 1) / (PLOW_WAVE * 16))) {
-#endif
         case 4:
             gemv_glu_rows_fp8<PLOW_GEMV_MM, 4>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
             break;
@@ -6559,19 +6607,12 @@ __device__ void d_gemv_glu_fp8_nrn(bf16* C, bf16* resid_out, const bf16* a, cons
                                    const float* uscale, unsigned M, unsigned N, unsigned K,
                                    unsigned act, float eps, float scale, unsigned slice,
                                    unsigned nblk, bf16* lds) {
-#if PLOW_GV_ABL >= 4
-    return;
-#endif
     const bool ok = ((size_t)M * K + GV_NORM_SCRATCH <= GM_LDS_HALVES) &&
                     (K <= RN_REG * PLOW_THREADS) && ((K & 7u) == 0);
     if (!ok) __builtin_trap(); /* no packet exists to fall back to */
     float* const nscratch = (float*)(lds + (GM_LDS_HALVES - GV_NORM_SCRATCH));
     gemv_nrn_lds(lds, resid_out, a, b, gb, gn, M, K, eps, scale, slice == 0, nscratch);
-#ifdef PLOW_GLU_UN
-    switch (PLOW_GLU_UN) {
-#else
     switch (gv_un_fp8((K + PLOW_WAVE * 16 - 1) / (PLOW_WAVE * 16))) {
-#endif
         case 4:
             gemv_glu_rows_fp8<PLOW_GEMV_MM, 4>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
             break;

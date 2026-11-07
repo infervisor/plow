@@ -225,7 +225,8 @@ class CampaignBuildTests(unittest.TestCase):
             args = argparse.Namespace(recipe=str(recipe), out=str(out), env=[], no_probe=True,
                                       object_env=["PLOW_GEMV_MFMA4=1"])
             with patch.object(campaign, "REPO", root), patch.object(campaign, "run", run), \
-                    patch.object(campaign, "git", return_value="test"):
+                    patch.object(campaign, "git", return_value="test"), \
+                    patch.dict(campaign.os.environ, {"CARGO_TARGET_DIR": str(root / "target")}):
                 campaign.cmd_build(args)
             self.assertEqual(len(calls), 2)
             record = json.loads((out / "build-record.json").read_text())
@@ -252,6 +253,28 @@ class CampaignBuildTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 campaign.cmd_block_bench(args)
 
+    def test_amd_block_submissions_select_vendor_pool(self):
+        for ab in (False, True):
+            with self.subTest(ab=ab), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                args = argparse.Namespace(out=str(root / "run"), queue=str(root / "queue"),
+                                          control_build="control", treatment_build="candidate",
+                                          routed_reference=None, require_bitwise=False,
+                                          quiet_lock=str(root / "quiet.lock"), note="test")
+                def prepare(a):
+                    out = Path(a.out)
+                    out.mkdir(parents=True)
+                    (out / "run-record.json").write_text("{}")
+                    return {"cell": {"name": "amd-test", "n_gpu": 1}}
+                with patch.object(campaign, "prepare_block_bench", side_effect=prepare), \
+                        patch.object(campaign.subprocess, "run") as run:
+                    run.return_value.stdout = "job-1\n"
+                    (campaign.cmd_block_ab if ab else campaign.cmd_block_bench)(args)
+                command = run.call_args.args[0]
+                self.assertEqual(command[command.index("--vendor") + 1], "amd")
+                self.assertEqual(command[command.index("--root") + 1], args.queue)
+                self.assertEqual(command[command.index("submit") + 2], "1")
+
     def test_block_host_timing_is_explicit_and_recorded(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -262,6 +285,8 @@ class CampaignBuildTests(unittest.TestCase):
             objects = root / "objects"
             objects.mkdir()
             (objects / "decode.elf").write_bytes(b"object")
+            (objects / "lowrung1").mkdir()
+            (objects / "lowrung1/decode.elf").write_bytes(b"narrow-object")
             inputs = root / "inputs"
             inputs.mkdir()
             (inputs / "reference.bf16").write_bytes(b"reference")
@@ -275,6 +300,8 @@ class CampaignBuildTests(unittest.TestCase):
             with patch.object(campaign, "run", return_value=0), \
                     patch.object(campaign, "git", return_value="test"):
                 record = campaign.prepare_block_bench(args)
+            self.assertEqual(record["objects"]["lowrung1/decode.elf"],
+                             campaign.sha(objects / "lowrung1/decode.elf"))
             self.assertEqual(record["env"]["PLOW_DSTEP_LOG"], "1")
             self.assertEqual(record["env"]["PLOW_DSTEP_EVERY"], "32")
             self.assertIn("export PLOW_DSTEP_LOG=1", (root / "run/run.sh").read_text())

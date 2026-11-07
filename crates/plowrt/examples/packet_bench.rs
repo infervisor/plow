@@ -1,11 +1,14 @@
 //! Time one program role of a packet on the CUDA packet runtime (inputs left zeroed):
-//! `packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep]`. With `--sweep` every instruction cap
-//! 0..=n_inst is timed in this process (JSON lines `{"cap":..,"us":..}`): the marginal cost of
-//! instruction i is us(cap = i + 1) - us(cap = i). With `--each` and ROLE a prefix, every program
+//! `packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep[=CAPS]]`. With `--sweep` every instruction
+//! cap 0..=n_inst (or 0..=CAPS) is timed in this process (JSON lines `{"cap":..,"op":..,"blocks":..,
+//! "us":..}`, `op` the instruction cap - 1 adds): the marginal cost of instruction i is
+//! us(cap = i + 1) - us(cap = i). With `--each` and ROLE a prefix, every program
 //! of the role sequence `ROLE.<n>` is timed alone (JSON lines `{"role":..,"program":..,"us":..}`);
 //! with `--seq` the whole sequence is timed as one CUDA graph.
 //! `PB_PRE=ROLE,..` runs those programs once first (e.g. the encoder, so a CFM program sees real
 //! key lengths instead of zeroed inputs).
+//! `PB_STEP_FRAMES=N` fills every `stream.n.K` with N * `lengths.K.rows_per_frame` (a stateful
+//! codec step of N frames per item instead of zero-length items). `--sweep` lines carry the op.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -17,7 +20,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::gpu::packet_exec::CudaPacketRuntime;
     use plowrt::exec::packet_runtime::{PacketAsset, PacketRuntime};
     let args: Vec<String> = std::env::args().collect();
-    let sweep = args.iter().any(|a| a == "--sweep");
+    let sweep = args
+        .iter()
+        .any(|a| a == "--sweep" || a.starts_with("--sweep="));
+    let caps: Option<usize> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--sweep="))
+        .map(str::parse)
+        .transpose()?;
     let each = args.iter().any(|a| a == "--each");
     let pos: Vec<&String> = args
         .iter()
@@ -25,13 +35,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|a| !a.starts_with("--"))
         .collect();
     if !(3..=4).contains(&pos.len()) {
-        return Err("usage: packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep|--each]".into());
+        return Err(
+            "usage: packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep[=CAPS]|--each]".into(),
+        );
     }
     let path = std::path::Path::new(pos[0]);
     let iters: usize = pos.get(3).map_or(Ok(50), |s| s.parse())?;
     let mut rt = CudaPacketRuntime::load(path, 0)?;
     let asset = PacketAsset::load(path)?;
-    let pipeline = asset.bind(pos[1], &rt)?;
+    // PIPELINE is a pipeline name or its driver (`codec.v1`).
+    let pipeline = asset
+        .bind(pos[1], &rt)
+        .or_else(|_| asset.bind_driver(pos[1], &rt))?;
     if each {
         for (n, program) in pipeline.program_sequence(pos[2])?.into_iter().enumerate() {
             for _ in 0..3 {
@@ -68,6 +83,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let program = pipeline.program(pos[2])?;
+    if let Ok(n) = std::env::var("PB_STEP_FRAMES") {
+        let n: u32 = n.parse()?;
+        for k in 0..pipeline.parameter("lengths.count")? {
+            let rpf = pipeline.parameter(&format!("lengths.{k}.rows_per_frame"))? as u32;
+            let t = pipeline.tensor(&format!("stream.n.{k}"))?;
+            rt.write_tensor(t, bytemuck::cast_slice(&vec![n * rpf; t.bytes / 4]))?;
+        }
+    }
     if let Ok(pre) = std::env::var("PB_PRE") {
         for role in pre.split(',') {
             rt.run(pipeline.program(role)?)?;
@@ -87,12 +110,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if sweep {
         let raw = std::fs::read(path)?;
-        let n_inst = plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program]
-            .insts
-            .len();
-        for cap in 0..=n_inst {
+        let insts =
+            std::mem::take(&mut plowrt::asset::devblob::DevBlob::parse(&raw)?.progs[program].insts);
+        for cap in 0..=caps.map_or(insts.len(), |c| c.min(insts.len())) {
             rt.set_debug_max_inst(cap as u32)?;
-            println!("{{\"cap\":{cap},\"us\":{:.2}}}", time(&mut rt)?);
+            let (op, blocks, i, j) =
+                cap.checked_sub(1)
+                    .map_or((String::new(), 0, [0; 8], [0; 3]), |k| {
+                        let op = insts[k].op;
+                        let name = packet::dev::DevOp::from_u16(op).map(|o| format!("{o:?}"));
+                        (
+                            name.unwrap_or_else(|| op.to_string()),
+                            insts[k].blocks,
+                            insts[k].i,
+                            insts[k].fj,
+                        )
+                    });
+            println!(
+                "{{\"cap\":{cap},\"op\":\"{op}\",\"blocks\":{blocks},\"i\":{i:?},\"fj\":{j:?},\"us\":{:.2}}}",
+                time(&mut rt)?
+            );
         }
         rt.set_debug_max_inst(u32::MAX)?;
     }

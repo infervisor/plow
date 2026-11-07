@@ -46,6 +46,15 @@
 #error "op_attention_common.h is the shared body: include op_attention.h, which selects op_attention_gfx942.h or op_attention_gfx950.h and sets the arch defaults this file needs"
 #endif
 
+#ifndef PLOW_FA_PV_F32
+#define PLOW_FA_PV_F32 0
+#endif
+#if PLOW_GFX12 && PLOW_FA_PV_F32
+#define FA_PV_BF16(x) f2bf(pv_pass == 0 ? (x) : (x) - bf2f(f2bf(x)))
+#else
+#define FA_PV_BF16(x) f2bf(x)
+#endif
+
 /* V rows in flight per thread in the flash-decode accumulate. The row loop used to issue one
  * 2-byte load, wait for it, and branch -- no memory-level parallelism at all, in the op that
  * moves 2.8 GB per token at ctx=3326. */
@@ -855,11 +864,15 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 
                     /* P sits in the accumulator layout but MFMA needs it as an A operand
                      * (m = l%32, k = kv). Transpose through LDS — it is only 32x32. */
+#if PLOW_GFX12 && PLOW_FA_PV_F32
+#pragma unroll
+                    for (int pv_pass = 0; pv_pass < 2; pv_pass++) {
+#endif
                     bf16* myP = Psm + wave * FA_BQ * BKV;
                     __syncthreads();
 #pragma unroll
                     for (int i = 0; i < 16; i++)
-                        myP[mfma_acc_m(lane, i) * BKV + accn] = f2bf(p[i]);
+                        myP[mfma_acc_m(lane, i) * BKV + accn] = FA_PV_BF16(p[i]);
                     __syncthreads();
 
                     /* O += P . V */
@@ -888,6 +901,9 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                                 plow_mfma_bf16_32x32(pf, vf, oacc[t]);
                         }
                     }
+#if PLOW_GFX12 && PLOW_FA_PV_F32
+                    }
+#endif
                 } else {
                     /* S = Q . K^T over NKT column-subtiles, each one 32x32 MFMA N-tile
                      * (n = kv-within-subtile = l%32, m = mfma_acc_m(l,i)). The subtiles
@@ -960,13 +976,17 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 
                     /* P -> LDS as MFMA A operand (m = l%32, k = kv), the whole BKV-wide P
                      * in one barrier pair — both subtiles written to adjacent columns. */
+#if PLOW_GFX12 && PLOW_FA_PV_F32
+#pragma unroll
+                    for (int pv_pass = 0; pv_pass < 2; pv_pass++) {
+#endif
                     bf16* myP = Psm + wave * FA_BQ * BKV;
                     __syncthreads();
 #pragma unroll
                     for (int n = 0; n < NKT; n++)
 #pragma unroll
                         for (int i = 0; i < 16; i++)
-                            myP[mfma_acc_m(lane, i) * BKV + n * MFMA_N + accn] = f2bf(p[n][i]);
+                            myP[mfma_acc_m(lane, i) * BKV + n * MFMA_N + accn] = FA_PV_BF16(p[n][i]);
                     __syncthreads();
 
                     /* O += P . V, contracting over all BKV staged rows. */
@@ -992,6 +1012,9 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                                 plow_mfma_bf16_32x32(pf, vf, oacc[t]);
                         }
                     }
+#if PLOW_GFX12 && PLOW_FA_PV_F32
+                    }
+#endif
                 }
             }
 
@@ -5082,9 +5105,9 @@ __device__ void d_flash_mla_decode_hp8(float* __restrict__ Opart, float* __restr
 template <int NS>
 __device__ __forceinline__ void fa_hp8a_wait_tiles(unsigned after) {
     /* vmcnt counts this wave's loads; 4 per tile. */
-    if (NS >= 4 && after >= 2) asm volatile("s_waitcnt vmcnt(8)" ::: "memory");
-    else if (NS >= 3 && after >= 1) asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
-    else asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (NS >= 4 && after >= 2) asm volatile(PLOW_ASM_WAIT_VM(8) ::: "memory");
+    else if (NS >= 3 && after >= 1) asm volatile(PLOW_ASM_WAIT_VM(4) ::: "memory");
+    else asm volatile(PLOW_ASM_WAIT_VM(0) ::: "memory");
 }
 
 template <int DK, int NS>

@@ -730,6 +730,7 @@ pub mod splitk;
 pub mod knob;
 pub mod knob_gen;
 pub mod kv_contract;
+pub mod kv_image;
 pub mod live_kv;
 pub mod mixed_step;
 
@@ -755,6 +756,7 @@ pub mod speech_fusion;
 pub mod structure_only;
 
 pub mod derived_weights;
+pub mod dual_stream;
 pub mod hetero;
 pub mod hetero_channel;
 pub mod modular;

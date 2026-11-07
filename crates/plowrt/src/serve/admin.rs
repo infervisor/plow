@@ -582,12 +582,12 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
         let target = match state.manager_for(&req.model) {
             Some(m) => Some((state.slug_group(&req.model).unwrap_or(0), m.clone())),
             None => {
+                let vendor = assets.as_deref().and_then(crate::asset::target_vendor);
                 let group = match req.device {
-                    Some(d) => match state
-                        .managers()
-                        .iter()
-                        .position(|m| m.ordinals().first() == Some(&d))
-                    {
+                    Some(d) => match state.managers().iter().position(|m| {
+                        m.ordinals().first() == Some(&d)
+                            && (vendor.is_none() || m.vendor().is_none() || m.vendor() == vendor)
+                    }) {
                         Some(g) => Some(g),
                         None => {
                             return err(
@@ -598,7 +598,9 @@ async fn load_inner(state: Arc<AppState>, mut req: LoadRequest) -> Response {
                     },
                     None => None,
                 };
-                state.manager_for_new(group).map(|(g, m)| (g, m.clone()))
+                state
+                    .manager_for_new(group, vendor)
+                    .map(|(g, m)| (g, m.clone()))
             }
         };
         let Some((group, mgr)) = target else {

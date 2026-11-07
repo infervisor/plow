@@ -175,9 +175,7 @@
 //! Concurrency 1 at 1k context is the hardest case for plow and the least
 //! representative, so it is the wrong place to judge this module.
 
-use std::collections::HashSet;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::asset::devblob::{DevBlob, DevProg};
@@ -185,7 +183,8 @@ use crate::device::hsa::HsaBackend;
 use crate::device::Backend;
 use crate::exec::amd::{AmdEngine, ChunkStep, TpBind};
 use crate::exec::tp::{
-    gate_error, is_deadline_status, PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS, XCTR_STRIDE,
+    count_xgates, gate_error, is_deadline_status, PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS,
+    XCTR_STRIDE,
 };
 use crate::{Result, RuntimeError};
 
@@ -265,111 +264,6 @@ use packet::dev::PrefillSpan;
 /// token (submission overhead, not work), so on a model that decodes in ~1.5 ms
 /// rather than ~23 the same microseconds are worth cadencing. Measure first.
 const DEFAULT_AGREE_EVERY: u32 = 1;
-const MAX_PREFILL_CAPTURE_TARGETS: usize = 8;
-const MAX_PREFILL_CAPTURE_BYTES: u64 = 256 << 20;
-
-#[derive(Debug, Eq, PartialEq)]
-struct PrefillCaptureRequest {
-    program_t: u32,
-    chunk_base: Option<u32>,
-    segment: usize,
-    targets: Vec<(String, PathBuf)>,
-}
-
-#[derive(Debug)]
-struct PrefillCapture {
-    program: usize,
-    chunk_base: Option<u32>,
-    segment: usize,
-    targets: Vec<(String, PathBuf)>,
-}
-
-fn parse_prefill_capture(spec: &str) -> Result<PrefillCaptureRequest> {
-    let (program_t, rest) = spec.split_once(':').ok_or_else(|| {
-        RuntimeError::Device(
-            "PLOW_PF_CAPTURE must be T[@C0]:SEG:tensor=path[,tensor=path...]".into(),
-        )
-    })?;
-    let (segment, targets) = rest.split_once(':').ok_or_else(|| {
-        RuntimeError::Device(
-            "PLOW_PF_CAPTURE must be T[@C0]:SEG:tensor=path[,tensor=path...]".into(),
-        )
-    })?;
-    let (program_t, chunk_base) = match program_t.split_once('@') {
-        Some((t, base)) => (
-            t,
-            Some(base.parse::<u32>().map_err(|_| {
-                RuntimeError::Device("PLOW_PF_CAPTURE has an invalid chunk base".into())
-            })?),
-        ),
-        None => (program_t, None),
-    };
-    let program_t = program_t
-        .parse::<u32>()
-        .map_err(|_| RuntimeError::Device("PLOW_PF_CAPTURE has an invalid program T".into()))?;
-    let segment = segment
-        .parse::<usize>()
-        .map_err(|_| RuntimeError::Device("PLOW_PF_CAPTURE has an invalid segment".into()))?;
-    if program_t == 0 {
-        return Err(RuntimeError::Device(
-            "PLOW_PF_CAPTURE program T must be nonzero".into(),
-        ));
-    }
-
-    let mut parsed = Vec::new();
-    let mut tensors = HashSet::new();
-    let mut paths = HashSet::new();
-    for target in targets.split(',') {
-        let (tensor, path) = target.split_once('=').ok_or_else(|| {
-            RuntimeError::Device("PLOW_PF_CAPTURE target must be tensor=path".into())
-        })?;
-        let tensor = tensor.trim();
-        let path = path.trim();
-        if tensor.is_empty() || path.is_empty() {
-            return Err(RuntimeError::Device(
-                "PLOW_PF_CAPTURE tensor and path must be nonempty".into(),
-            ));
-        }
-        if !tensors.insert(tensor.to_owned()) {
-            return Err(RuntimeError::Device(format!(
-                "PLOW_PF_CAPTURE duplicates tensor {tensor:?}"
-            )));
-        }
-        let path = PathBuf::from(path);
-        if !paths.insert(path.clone()) {
-            return Err(RuntimeError::Device(format!(
-                "PLOW_PF_CAPTURE output path {} is used twice",
-                path.display()
-            )));
-        }
-        parsed.push((tensor.to_owned(), path));
-    }
-    if parsed.is_empty() || parsed.len() > MAX_PREFILL_CAPTURE_TARGETS {
-        return Err(RuntimeError::Device(format!(
-            "PLOW_PF_CAPTURE has {} targets; expected 1..={MAX_PREFILL_CAPTURE_TARGETS}",
-            parsed.len()
-        )));
-    }
-    Ok(PrefillCaptureRequest {
-        program_t,
-        chunk_base,
-        segment,
-        targets: parsed,
-    })
-}
-
-fn prefill_capture_due(
-    capture: Option<&PrefillCapture>,
-    program: usize,
-    segment: usize,
-    c0: u32,
-) -> bool {
-    capture.is_some_and(|capture| {
-        capture.program == program
-            && capture.segment == segment
-            && capture.chunk_base.is_none_or(|base| base == c0)
-    })
-}
 
 fn agreement_due(tick: &mut u32, every: u32) -> bool {
     let all = *tick >= every;
@@ -455,7 +349,6 @@ pub struct AmdTpGroup {
     audit_compact: bool,
     /// The last decode submit appended the compact audit to every rank's chain.
     tail_audited: bool,
-    prefill_audit_direct: bool,
     prefill_audit_pinned: bool,
     index_tp_status: bool,
     /// Read EVERY rank's sampled id, rather than just rank 0's, once every this
@@ -473,8 +366,6 @@ pub struct AmdTpGroup {
     /// the program that actually ran, and submit/complete are separate calls by design (the
     /// split is what lets the host do nothing between launch and drain).
     cur_dp: usize,
-    /// Hidden one-shot diagnostic. `None` is the production state and performs no readback.
-    prefill_capture: Option<PrefillCapture>,
 }
 
 impl AmdTpGroup {
@@ -519,7 +410,6 @@ impl AmdTpGroup {
         }
         let prepared = super::chain_admission::prepare_all(
             self.ranks.len(),
-            crate::config::RuntimeConfig::get().amd.native_launch_timing,
             |rank| self.ranks[rank].segment_needs_prepare(prog, seg),
             |rank| self.ranks[rank].drain(),
             |rank| self.ranks[rank].prepare_segment_quiescent(prog, seg),
@@ -756,72 +646,50 @@ impl AmdTpGroup {
         // a fault in a thread nobody is waiting on. The first error is what the
         // caller sees; the group is dropped whole, so no rank survives
         // half-loaded.
-        //
-        // `--amd-tp-serial-load` / `PLOW_TP_SERIAL_LOAD=1` restores the
-        // one-at-a-time loop.
-        let serial = crate::config::RuntimeConfig::get().amd.tp_serial_load;
         let t_bind = std::time::Instant::now();
-        let ranks: Vec<AmdEngine> = if serial {
-            let mut v = Vec::with_capacity(binds.len());
-            for (be, bind, ordinal) in binds {
-                tracing::info!(rank = bind.rank, ordinal, "binding rank");
-                v.push(AmdEngine::load_rank(
-                    be,
-                    blob_path,
-                    hsaco_dir,
-                    checkpoint,
-                    Some(bind),
-                    shared_ckpt.clone(),
-                )?);
-            }
-            v
-        } else {
-            std::thread::scope(|s| {
-                let handles: Vec<_> = binds
-                    .into_iter()
-                    .map(|(be, bind, ordinal)| {
-                        let shared = shared_ckpt.clone();
-                        tracing::info!(rank = bind.rank, ordinal, "binding rank");
-                        s.spawn(crate::config::inherit(move || {
-                            AmdEngine::load_rank(
-                                be,
-                                blob_path,
-                                hsaco_dir,
-                                checkpoint,
-                                Some(bind),
-                                shared,
-                            )
-                        }))
-                    })
-                    .collect();
-                let mut out = Vec::with_capacity(handles.len());
-                let mut first: Option<RuntimeError> = None;
-                for h in handles {
-                    match h.join() {
-                        Ok(Ok(e)) => out.push(e),
-                        Ok(Err(e)) => {
-                            if first.is_none() {
-                                first = Some(e);
-                            }
+        let ranks: Vec<AmdEngine> = std::thread::scope(|s| {
+            let handles: Vec<_> = binds
+                .into_iter()
+                .map(|(be, bind, ordinal)| {
+                    let shared = shared_ckpt.clone();
+                    tracing::info!(rank = bind.rank, ordinal, "binding rank");
+                    s.spawn(crate::config::inherit(move || {
+                        AmdEngine::load_rank(
+                            be,
+                            blob_path,
+                            hsaco_dir,
+                            checkpoint,
+                            Some(bind),
+                            shared,
+                        )
+                    }))
+                })
+                .collect();
+            let mut out = Vec::with_capacity(handles.len());
+            let mut first: Option<RuntimeError> = None;
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(e)) => out.push(e),
+                    Ok(Err(e)) => {
+                        if first.is_none() {
+                            first = Some(e);
                         }
-                        Err(_) => {
-                            if first.is_none() {
-                                first = Some(RuntimeError::Device(
-                                    "a rank's weight load panicked".into(),
-                                ));
-                            }
+                    }
+                    Err(_) => {
+                        if first.is_none() {
+                            first =
+                                Some(RuntimeError::Device("a rank's weight load panicked".into()));
                         }
                     }
                 }
-                match first {
-                    Some(e) => Err(e),
-                    None => Ok(out),
-                }
-            })?
-        };
+            }
+            match first {
+                Some(e) => Err(e),
+                None => Ok(out),
+            }
+        })?;
         tracing::info!(
             n_gpu,
-            serial,
             secs = format!("{:.1}", t_bind.elapsed().as_secs_f64()).as_str(),
             "all ranks bound"
         );
@@ -830,56 +698,6 @@ impl AmdTpGroup {
             0 => DEFAULT_AGREE_EVERY,
             n => n,
         };
-        let prefill_capture = crate::config::RuntimeConfig::get()
-            .amd
-            .pf_capture
-            .as_deref()
-            .map(parse_prefill_capture)
-            .transpose()?
-            .map(|request| {
-                let programs = (0..ranks[0].n_programs())
-                    .filter(|&p| ranks[0].prefill_prog_t(p) == Some(request.program_t))
-                    .collect::<Vec<_>>();
-                if programs.len() != 1 {
-                    return Err(RuntimeError::Device(format!(
-                        "PLOW_PF_CAPTURE T={} matched {} prefill programs, expected exactly one",
-                        request.program_t,
-                        programs.len()
-                    )));
-                }
-                let program = programs[0];
-                let segments = ranks[0].prog_dispatch(program).launches();
-                if request.segment >= segments {
-                    return Err(RuntimeError::Device(format!(
-                        "PLOW_PF_CAPTURE segment {} is outside T={} program's {segments} segments",
-                        request.segment, request.program_t
-                    )));
-                }
-                let mut total = 0u64;
-                for (tensor, _) in &request.targets {
-                    let bytes = ranks[0].tensor_bytes(tensor).ok_or_else(|| {
-                        RuntimeError::Device(format!(
-                            "PLOW_PF_CAPTURE tensor {tensor:?} is not declared"
-                        ))
-                    })?;
-                    total = total.checked_add(bytes).ok_or_else(|| {
-                        RuntimeError::Device("PLOW_PF_CAPTURE byte count overflow".into())
-                    })?;
-                }
-                if total > MAX_PREFILL_CAPTURE_BYTES {
-                    return Err(RuntimeError::Device(format!(
-                        "PLOW_PF_CAPTURE selects {total} bytes; maximum is {MAX_PREFILL_CAPTURE_BYTES}"
-                    )));
-                }
-                Ok(PrefillCapture {
-                    program,
-                    chunk_base: request.chunk_base,
-                    segment: request.segment,
-                    targets: request.targets,
-                })
-            })
-            .transpose()?;
-
         Ok(AmdTpGroup {
             group,
             chain_tickets: vec![None; ranks.len()],
@@ -889,9 +707,6 @@ impl AmdTpGroup {
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
             tail_audited: false,
-            prefill_audit_direct: crate::config::RuntimeConfig::get()
-                .amd
-                .tp_prefill_audit_direct,
             prefill_audit_pinned: crate::config::RuntimeConfig::get()
                 .amd
                 .tp_prefill_audit_pinned,
@@ -901,7 +716,6 @@ impl AmdTpGroup {
             agree_tick: agree_every,
             // Overwritten by the first submit; the widest rung is the safe pre-first-step value.
             cur_dp: 0,
-            prefill_capture,
         })
     }
 
@@ -1914,11 +1728,6 @@ impl AmdTpGroup {
         if self.audit {
             self.group.audit_xctr(&self.gate_expect[prog])?;
         }
-        if let Some(dir) = crate::config::RuntimeConfig::get().amd.tb_dump.as_ref() {
-            static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.ranks[0].token_batch_dump(dir.as_path(), &format!("step{tick:04}"), plan)?;
-        }
         let ids = self.ranks[0].read_sampled_batched(band as usize)?;
         if agreement_due(&mut self.agree_tick, self.agree_every) {
             for rank in 1..self.ranks.len() {
@@ -2216,7 +2025,6 @@ impl AmdTpGroup {
         let segment_major = crate::config::RuntimeConfig::get()
             .amd
             .tp_prefill_segment_major
-            && self.prefill_capture.is_none()
             && !segment_timing;
         if segment_major {
             let t = std::time::Instant::now();
@@ -2361,17 +2169,6 @@ impl AmdTpGroup {
                     ranks.join(","),
                 );
             }
-            if let Some(dir) = crate::config::RuntimeConfig::get().amd.tb_dump.as_ref() {
-                static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let slot = self.ranks[0].kv_slot();
-                self.ranks[0].dump_slot_kv(
-                    dir.as_path(),
-                    &format!("pf{tick:04}"),
-                    slot,
-                    step.c0 + step.clen,
-                )?;
-            }
             return Ok(());
         }
         for seg in 0..launches {
@@ -2401,23 +2198,6 @@ impl AmdTpGroup {
                     (enqueued - submit_begin).as_secs_f64() * 1e6,
                     submit_begin.elapsed().as_secs_f64() * 1e6,
                 );
-            }
-            if prefill_capture_due(self.prefill_capture.as_ref(), step.prog, seg, step.c0) {
-                let capture = self.prefill_capture.take().expect("capture was due");
-                for (tensor, path) in capture.targets {
-                    let bytes = self.ranks[0].snapshot_tensor(&tensor)?;
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                        .and_then(|mut file| file.write_all(&bytes))
-                        .map_err(|e| {
-                            RuntimeError::Device(format!(
-                                "PLOW_PF_CAPTURE write {}: {e}",
-                                path.display()
-                            ))
-                        })?;
-                }
             }
             ttft::PF_DRAIN.add(drain_ns);
             // Per-CHUNK, because the aggregate cannot separate a full bucket
@@ -2449,9 +2229,9 @@ impl AmdTpGroup {
 
     /// The exact counter audit after a prefill dispatch has drained on every rank.
     ///
-    /// With `--amd-tp-prefill-audit-direct` the same gates are compared against the same
-    /// expectations through host loads of the large-BAR mapping, the transport the compact
-    /// decode audit already reads its status word through, instead of one D2H copy per rank.
+    /// Without the pinned read the same gates are compared against the same expectations
+    /// through host loads of the large-BAR mapping, the transport the compact decode audit
+    /// already reads its status word through, instead of one D2H copy per rank.
     /// It cannot move later or be sampled: the next dispatch's `zero_xctr` erases the
     /// counters, and a collective that timed out corrupts KV every later row reads.
     fn audit_prefill_counters(&mut self, prog: usize) -> Result<()> {
@@ -2470,10 +2250,8 @@ impl AmdTpGroup {
                 )?;
             }
             Ok(())
-        } else if self.prefill_audit_direct {
-            self.group.audit_xctr_direct(&self.gate_expect[prog])
         } else {
-            self.group.audit_xctr(&self.gate_expect[prog])
+            self.group.audit_xctr_direct(&self.gate_expect[prog])
         }
     }
 
@@ -2555,9 +2333,7 @@ impl AmdTpGroup {
         crate::obs::tick::trace_rung(rung);
         // PLOW_AMD_PACKED_SEG_MAJOR: every segment on every rank, one drain, as the isolated
         // chunk's segment-major path; each rank's queue keeps its local segment order.
-        if crate::config::RuntimeConfig::get().amd.packed_seg_major
-            && self.prefill_capture.is_none()
-        {
+        if crate::config::RuntimeConfig::get().amd.packed_seg_major {
             let t = std::time::Instant::now();
             for seg in 0..launches {
                 self.enqueue_segment_all(prog, seg)?;
@@ -2900,34 +2676,6 @@ fn check_dcp_gather(blob: &DevBlob, slots: u64, slot_bytes: u64) -> Result<u64> 
     })
 }
 
-fn count_xgates(blob: &DevBlob) -> u32 {
-    use packet::dev::DevOp;
-    let mut top = 0u32;
-    for p in &blob.progs {
-        for d in &p.insts {
-            if d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceAddNorm as u16 {
-                top = top.max(d.i[3] + 1); // one-shot: one gate, i3 (fused AddNorm form included)
-            } else if d.op == DevOp::XReduceTwoShot as u16 {
-                // two-shot: reduce-scatter (i3) and all-gather (i4)
-                top = top.max(d.i[3] + 1).max(d.i[4] + 1);
-            } else if d.op == DevOp::IndexTpPf as u16 {
-                top = top.max(d.i[5] + 1).max(d.i[6] + 1);
-            } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
-                // split seams: one gate each (i3)
-                top = top.max(d.i[3] + 1);
-            } else if d.op == DevOp::XDcpGather as u16 {
-                top = top.max(d.i[6] + 1);
-            } else if d.op == DevOp::XArgmaxFin as u16 {
-                // sharded-head fold: arrival gate (i3), then consecutive value lines at i4
-                top = top
-                    .max(d.i[3] + 1)
-                    .max(d.i[4] + xargmax_value_lines(d.i[1]));
-            }
-        }
-    }
-    top
-}
-
 /// Per-program table of what each cross-GPU gate must read after a dispatch.
 ///
 /// Gate ids are allocated densely from 0 **per program**, so the same id means
@@ -3138,51 +2886,6 @@ mod tests {
         assert!(
             check_xr_tagged_insts(0, &[xr(4096, 0, 0, 0), fold, xr(4096, 1, 0, 0)], 4096).is_ok()
         );
-    }
-
-    #[test]
-    fn prefill_capture_is_exact_one_shot_selection() {
-        assert!(!prefill_capture_due(None, 2, 7, 0));
-        let mut capture = PrefillCapture {
-            program: 2,
-            chunk_base: None,
-            segment: 7,
-            targets: vec![("act.pf.q".into(), "/tmp/q.bin".into())],
-        };
-        assert!(prefill_capture_due(Some(&capture), 2, 7, 0));
-        assert!(!prefill_capture_due(Some(&capture), 1, 7, 0));
-        assert!(!prefill_capture_due(Some(&capture), 2, 6, 0));
-        capture.chunk_base = Some(65536);
-        assert!(!prefill_capture_due(Some(&capture), 2, 7, 0));
-        assert!(prefill_capture_due(Some(&capture), 2, 7, 65536));
-    }
-
-    #[test]
-    fn prefill_capture_parser_rejects_ambiguous_targets() {
-        let request =
-            parse_prefill_capture("8192:17:act.pf.q=/tmp/q.bin,act.pf.o=/tmp/o.bin").unwrap();
-        assert_eq!(request.program_t, 8192);
-        assert_eq!(request.segment, 17);
-        assert_eq!(request.targets.len(), 2);
-        assert_eq!(request.chunk_base, None);
-        assert_eq!(
-            parse_prefill_capture("8192@65536:17:act.q=/tmp/q.bin")
-                .unwrap()
-                .chunk_base,
-            Some(65536)
-        );
-
-        for spec in [
-            "8192:17:act.pf.q=/tmp/q.bin,act.pf.q=/tmp/q2.bin",
-            "8192:17:act.pf.q=/tmp/x.bin,act.pf.o=/tmp/x.bin",
-            "8192:17:act.pf.q=",
-            "8192:17:",
-            "8192:x:act.pf.q=/tmp/q.bin",
-            "0:17:act.pf.q=/tmp/q.bin",
-            "8192@bad:17:act.pf.q=/tmp/q.bin",
-        ] {
-            assert!(parse_prefill_capture(spec).is_err(), "accepted {spec:?}");
-        }
     }
 
     #[test]

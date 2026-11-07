@@ -67,7 +67,7 @@ fn merge_waits_on_the_slice_that_actually_wrote_the_row() {
                 continue; // fused: flash normalizes in its epilogue, no FlashMerge op
             }
             let (n_bh, nblk_f) = (t * heads, n_cu);
-            let nblk_m = (n_bh * flash_merge_dsplit()).min(n_cu).max(1);
+            let nblk_m = n_bh.min(n_cu).max(1);
             let map = flash_merge_map(n_bh, ns, FLASH_Q_TILE_ROWS, heads, nblk_f, nblk_m);
             let dsplit = nblk_m.div_ceil(n_bh.max(1)).max(1);
             for j in 0..nblk_m {
@@ -101,7 +101,7 @@ fn shipped_head_counts_are_unaffected_by_the_tile_correction() {
                 continue;
             }
             let (n_bh, nblk_f) = (t * heads, n_cu);
-            let nblk_m = (n_bh * flash_merge_dsplit()).min(n_cu).max(1);
+            let nblk_m = n_bh.min(n_cu).max(1);
             assert_eq!(
                 flash_merge_map(n_bh, ns, Q_TILE_ROWS, heads, nblk_f, nblk_m),
                 flash_merge_map(n_bh, ns, FLASH_Q_TILE_ROWS, heads, nblk_f, nblk_m),

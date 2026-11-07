@@ -141,6 +141,58 @@ pub fn resolve(asset_dir: &Path, checkpoint_dir: &Path) -> Result<ServeInfo> {
     })
 }
 
+/// Refuse unless `checkpoint_dir` declares every tensor packet `pkt` binds; with no checkpoint,
+/// unless the packet binds none. Reads the packet and the shard headers only, and fails closed:
+/// a packet or header it cannot read is a refusal.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+pub fn check_bound_weights(pkt: &Path, checkpoint_dir: Option<&Path>) -> Result<()> {
+    let raw = std::fs::read(pkt).map_err(|source| RuntimeError::Io {
+        path: pkt.to_path_buf(),
+        source,
+    })?;
+    // Static: whether placement can be dispatched is the serving backend's question.
+    let blob = crate::asset::devblob::DevBlob::parse_unguarded(&raw)?;
+    let missing = crate::asset::checkpoint::missing_weights_in(&blob, &raw, checkpoint_dir)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(match checkpoint_dir {
+        Some(dir) => crate::asset::checkpoint::missing_weights_error(dir, &missing),
+        None => RuntimeError::Rejected(format!(
+            "{} binds {} checkpoint tensor(s) (first {}) but its bundle names no checkpoint",
+            pkt.display(),
+            missing.len(),
+            missing[0]
+        )),
+    })
+}
+
+/// Refuse a packet file that does not parse.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+pub fn check_packet(pkt: &Path) -> Result<()> {
+    let raw = std::fs::read(pkt).map_err(|source| RuntimeError::Io {
+        path: pkt.to_path_buf(),
+        source,
+    })?;
+    crate::asset::devblob::DevBlob::parse_unguarded(&raw)
+        .map(|_| ())
+        .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", pkt.display())))
+}
+
+#[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+pub fn check_packet(pkt: &Path) -> Result<()> {
+    check_bound_weights(pkt, None)
+}
+
+#[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+pub fn check_bound_weights(pkt: &Path, _checkpoint_dir: Option<&Path>) -> Result<()> {
+    Err(RuntimeError::Rejected(format!(
+        "{}: this plowrt has no packet reader (built without cuda, hsa or cpu), so it cannot \
+         check the weights the packet binds",
+        pkt.display()
+    )))
+}
+
 /// The [`crate::asset::checkpoint::missing_weights_error`] for `pkt` against `checkpoint_dir`, when
 /// the checkpoint lacks a tensor the packet binds.
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]

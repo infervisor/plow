@@ -26,6 +26,8 @@ sku = "L4"
 units = 58
 num_gpus = 1
 parallel = "tp"
+# Largest offline encoder bucket, in feature frames (30 s); streams run past it.
+max_ctx = 3000
 
 [checkpoint]
 source = "hf:nvidia/nemotron-3.5-asr-streaming-0.6b"
@@ -34,6 +36,7 @@ file = "nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"
 
 [build]
 script = "scripts/asr/nvidia/nemotron_l4_build.sh"
+output = "nemotron.pkt"
 compiler = "crates/plowrt/examples/asr/nemotron_pipeline_compile.rs"
 feature_frames = "200,400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800,3000"
 joint_batch = 16

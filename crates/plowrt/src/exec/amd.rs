@@ -15,7 +15,7 @@ use packet::devbuild::{lean_attn_res_f32mix_inst64, static_seg_ofs, ProgramRole}
 use serde::Serialize;
 
 use super::kv_layout::kv_tensor_name;
-use crate::asset::devblob::{DevBlob, DevProg};
+use crate::asset::devblob::{DevBlob, DevProg, DevTensor};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
 use crate::exec::amd::packed::validate_rows as validate_amd_packed_rows;
@@ -804,25 +804,6 @@ fn validate_decode_dispatch<'a>(
         }
     }
     Ok(())
-}
-
-/// `PLOW_AMD_LT_OVERLAP`: a native decode GEMM may start without waiting for the run of
-/// native GEMMs directly before it when it shares no tensor with any of them as a written
-/// operand (it reads none of their outputs and writes none of their operands).
-fn lt_overlaps_run(before: &[DecodeSegmentRoute], inst: &packet::dev::DevInst64) -> bool {
-    let (out, x) = (inst.t[0], inst.t[1]);
-    let mut any = false;
-    for r in before.iter().rev() {
-        let DecodeSegmentRoute::GemmLt(prev) = r else {
-            break;
-        };
-        let pi = prev.inst();
-        if pi.t[0] == x || pi.t[0] == out || pi.t[1] == out || pi.t[2] == out {
-            return false;
-        }
-        any = true;
-    }
-    any
 }
 
 /// `plow_glm_inproj_*` kernargs (runtime/amd/glm_inproj.hip `InprojArgs`).
@@ -8501,6 +8482,9 @@ pub struct AmdEngine {
     /// frontier. No block table, no per-block indirection, no kernel change.
     vmm: Option<VmmKv>,
     shared_prefix: Option<shared_prefix::SharedPrefix>,
+    kv_image: Option<plow_asset::live_kv::Manifest>,
+    kv_image_key: Option<String>,
+    kv_image_has_drafter: bool,
     /// `(blocks, i[8])` of the last lm_head found — the fields that differ
     /// between two packets whose op and operands are identical.
     lm_detail: std::cell::RefCell<Option<(u16, [u32; 8], usize, Vec<u16>)>>,
@@ -8571,6 +8555,68 @@ fn discover_lowrung_tiers(hsaco_dir: &Path, object: &str) -> Option<String> {
 
 fn select_vmm_kv(configured: Option<bool>, required: bool) -> bool {
     configured.unwrap_or(required)
+}
+
+struct TensorSlabLayout {
+    offsets: Vec<Option<u64>>,
+    bytes: u64,
+    resident_bytes: u64,
+}
+
+fn tensor_slab_layout(
+    tensors: &[DevTensor],
+    owned: impl Fn(usize, &str) -> bool,
+    weights_only: bool,
+) -> TensorSlabLayout {
+    let mut layout = TensorSlabLayout {
+        offsets: vec![None; tensors.len()],
+        bytes: 0,
+        resident_bytes: 0,
+    };
+    for (id, tensor) in tensors.iter().enumerate() {
+        if !owned(id, &tensor.name) {
+            continue;
+        }
+        let bytes = slab_carve(tensor.bytes);
+        layout.resident_bytes += bytes;
+        if !weights_only || packet::names::is_checkpoint_weight(&tensor.name) {
+            layout.offsets[id] = Some(layout.bytes);
+            layout.bytes += bytes;
+        }
+    }
+    layout
+}
+
+impl TensorSlabLayout {
+    fn check_available(&self, available: u64) -> Result<()> {
+        if self.resident_bytes > available {
+            return Err(RuntimeError::Rejected(format!(
+                "AMD unallocated tensor storage requires {} bytes, but only {available} bytes are available after KV mapping; re-emit with fewer decode slots or a lower max_ctx",
+                self.resident_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_capacity(&self, capacity: u64, committed_kv: u64) -> Result<()> {
+        if capacity == 0 {
+            return Ok(());
+        }
+        let required = self
+            .resident_bytes
+            .checked_add(committed_kv)
+            .ok_or_else(|| {
+                RuntimeError::Rejected(
+                    "AMD resident tensor storage exceeds the address space".into(),
+                )
+            })?;
+        if required > capacity {
+            return Err(RuntimeError::Rejected(format!(
+                "AMD tensor storage requires at least {required} bytes after KV mapping, but device capacity is {capacity} bytes; re-emit with fewer decode slots or a lower max_ctx"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl AmdEngine {
@@ -9800,8 +9846,8 @@ impl AmdEngine {
         // Task-13: the low-rung decode tier ladder. Each tier's pairing checks
         // run with ITS need (the widest rung it will serve), not the blob-wide
         // max — an MM=4 object legitimately serves rungs 1-2 of a B=32 blob.
-        // `PLOW_HSACO_LOWRUNG` is either `<dir>` (max = PLOW_LOWRUNG_MAX,
-        // default 2) or `dir:max[,dir:max]...`; selection takes the narrowest
+        // `PLOW_HSACO_LOWRUNG` is either `<dir>` (max 2) or
+        // `dir:max[,dir:max]...`; selection takes the narrowest
         // tier that fits, so the list is sorted ascending here.
         let mut decode_tiers: Vec<(u32, HsaKernel)> = Vec::new();
         if let Some(spec) = &lowrung_dir {
@@ -9821,8 +9867,7 @@ impl AmdEngine {
                     tiers.push((d.to_string(), m));
                 }
             } else {
-                let max = crate::config::RuntimeConfig::get().amd.lowrung_max;
-                tiers.push((spec.clone(), max));
+                tiers.push((spec.clone(), 2));
             }
             tiers.sort_by_key(|&(_, m)| m);
             for (d, max) in tiers {
@@ -11202,7 +11247,7 @@ impl AmdEngine {
         };
         let mut k_kda_spans = KdaSpansKernels::default();
         let amd_cfg = &crate::config::RuntimeConfig::get().amd;
-        if (amd_cfg.packed_lean_kda_batch || amd_cfg.mixed_ride_trim) && arch == "gfx950" {
+        if amd_cfg.packed_lean_kda_batch && arch == "gfx950" {
             let mut load_spans = |name: &str, symbol: &str, base: u32| -> Option<HsaKernel> {
                 let path = hsaco_dir.join(name);
                 let loaded = (|| -> Result<(Module, HsaKernel)> {
@@ -12323,7 +12368,7 @@ impl AmdEngine {
         };
         prefetch_ahead(&mut pf, depth);
 
-        // ---- one allocation for every tensor that would otherwise get its own
+        // RDNA carves checkpoint weights only; other architectures keep the mixed arena.
         //
         // Both passes below must agree, tensor for tensor, on which tensors are
         // carved and how much each consumes: the sizing pass decides how big the
@@ -12366,22 +12411,23 @@ impl AmdEngine {
         } else {
             vec![None; blob.tensors.len()]
         };
-        let carved = |id: usize, name: &str| {
+        let owned = |id: usize, name: &str| {
             !is_peer_slot(name)
                 && !is_band_view(name)
                 && cache_va[id].is_none()
                 && twins[id].is_none()
                 && (rowband_on || !rb_twin[id])
         };
-        // Slab offset of every carved tensor, so a column shard can view a full twin declared after it.
-        let mut carve_at = vec![None; blob.tensors.len()];
-        let mut slab_bytes: u64 = 0;
-        for (id, td) in blob.tensors.iter().enumerate() {
-            if carved(id, &td.name) {
-                carve_at[id] = Some(slab_bytes);
-                slab_bytes += slab_carve(td.bytes);
+        let weights_only = arch == "gfx1201";
+        let layout = tensor_slab_layout(&blob.tensors, owned, weights_only);
+        if weights_only {
+            layout.check_capacity(be.vram_bytes(), vmm.as_ref().map_or(0, VmmKv::mapped_bytes))?;
+            if let Some(available) = crate::memory::vmm::VmmOps::free_bytes(&*be) {
+                layout.check_available(available)?;
             }
         }
+        let slab_bytes = layout.bytes;
+        let carve_at = layout.offsets;
 
         // ---- EVERY checkpoint weight is RESOLVED before a byte is uploaded
         //
@@ -12474,7 +12520,7 @@ impl AmdEngine {
                 (Some(t), "act.og_tp") => Some(t.scratch_base),
                 (Some(t), "act.dg_tp") => Some(t.scratch_base + t.slot_b),
                 // Slot 2, the GATHER slot: a column-parallel partial the reduce out of
-                // slot 0 folds in (`PARTIAL_SLOTS`). Only K3's LatentMoE declares it.
+                // slot 0 folds in (`PARTIAL_SLOTS`) for K3's LatentMoE; Gemma-4 MoE's routed partial.
                 (Some(t), "act.ug_tp") => Some(t.scratch_base + 2 * t.slot_b),
                 // Slots 3/4/5: the sequence-parallel seams' band results (normed hidden,
                 // latent xe, route table), all-gathered by op 26. K3 declares them only
@@ -12568,7 +12614,7 @@ impl AmdEngine {
                 // gather, memset tail) starts after the carve, so this one
                 // wait point covers them all. The mapper outruns the upload,
                 // so the wait is ~0 after the first chunk.
-                (None, WeightSlab::Vmm(slab)) => {
+                (None, WeightSlab::Vmm(slab)) if carve_at[i].is_some() => {
                     let off = slab_off;
                     slab_off += slab_carve(td.bytes);
                     slab.wait_mapped(slab_off)?;
@@ -12577,12 +12623,12 @@ impl AmdEngine {
                 // Carve from the one allocation, in blob order. The sizing pass
                 // walked this same list with the same filter and the same
                 // `slab_carve`, so the cursor cannot run past the end.
-                (None, WeightSlab::Flat(slab)) => {
+                (None, WeightSlab::Flat(slab)) if carve_at[i].is_some() => {
                     let m = slab.subview(slab_off, td.bytes.max(1))?;
                     slab_off += slab_carve(td.bytes);
                     m
                 }
-                (None, WeightSlab::PerTensor) => {
+                (None, _) => {
                     let t = Instant::now();
                     let m = EngineDevice::alloc(&*be, td.bytes.max(1))?;
                     LoadProf::add(&prof.alloc_ns, t);
@@ -12855,7 +12901,7 @@ impl AmdEngine {
             // saving is read off `MEMORY_AVAIL` by whoever is measuring.
             tracing::info!(
                 slab_mib = slab_bytes / (1 << 20),
-                carved = devp.len() - n_view,
+                carved = carve_at.iter().filter(|offset| offset.is_some()).count(),
                 views = n_view,
                 "weights carved from one allocation"
             );
@@ -14169,6 +14215,33 @@ impl AmdEngine {
         // Flat KV (no pool, no shared prefix: e.g. a DCP packet) is fully backed at load and
         // already absent from `free`, so charging it again would halve the seats for nothing.
         let flat_kv = vmm.is_none() && shared_prefix.is_none();
+        let (kv_image, kv_image_key) = if flat_kv && tp.is_none() {
+            let derived = (|| -> std::result::Result<_, String> {
+                let mut m = match crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(m) => m,
+                    None => blob.with_packet_view(plow_asset::live_kv::emit)?,
+                };
+                blob.with_packet_view(|p| plow_asset::kv_image::canonical_order(p, &mut m))?;
+                let key = blob
+                    .with_packet_view(|p| plow_asset::kv_image::derive(p, &m, String::new()))?
+                    .digest();
+                Ok((m, key))
+            })();
+            match derived {
+                Ok((m, key)) => (Some(m), Some(key)),
+                Err(error) => {
+                    tracing::debug!(%error, "amd: KV image unavailable");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let kv_image_has_drafter = blob
+            .reserved_metadata(&raw, plow_asset::spec_draft::SECTION)?
+            .is_some();
         let kv_admission = free.filter(|_| !flat_kv).and_then(|free| {
             let kv_bytes: u64 = blob
                 .tensors
@@ -14466,6 +14539,9 @@ impl AmdEngine {
             kda_conv_alt_stale: vec![false; batch],
             vmm,
             shared_prefix,
+            kv_image,
+            kv_image_key,
+            kv_image_has_drafter,
             lm_detail: std::cell::RefCell::new(None),
             pf_stream: blob.progs.iter().map(|g| g.stream.clone()).collect(),
             tp,
@@ -15178,6 +15254,139 @@ impl AmdEngine {
         EngineDevice::download(&*self.be, &self.devp[i], 0, dst)
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn kv_image_staging(&self) -> Arc<dyn crate::device::host_region::HostStaging> {
+        self.be.clone()
+    }
+
+    pub fn kv_image_key(&self) -> Option<String> {
+        self.kv_image_key.clone()
+    }
+
+    fn kv_image_manifest(&self) -> Result<&plow_asset::live_kv::Manifest> {
+        self.kv_image.as_ref().ok_or_else(|| {
+            RuntimeError::Rejected("AMD KV image requires supported flat, single-rank KV".into())
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn transfer_kv_image(
+        &mut self,
+        image: &crate::exec::kv_image::KvBytes,
+        spans: &[crate::exec::kv_image::ImageSpan],
+        export: bool,
+    ) -> Result<bool> {
+        match image.transfer(&*self.be, spans, &self.devp, export) {
+            Ok(staged) => Ok(staged),
+            Err(failure) if failure.unretired => {
+                image.quarantine(
+                    &mut self.devp,
+                    &mut self._weight_slab,
+                    &mut self.vmm,
+                    self.be.clone(),
+                );
+                self.kv_image_key = None;
+                Err(self.be.quarantine_staging(&failure.error))
+            }
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    pub fn export_kv_image(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+    ) -> Result<()> {
+        self.export_kv_image_with(slot, n, out, None)
+    }
+
+    pub fn export_kv_image_stream(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+    ) -> Result<()> {
+        self.export_kv_image_with(slot, n, out, Some(publish))
+    }
+
+    fn export_kv_image_with(
+        &mut self,
+        slot: usize,
+        n: u32,
+        out: &mut crate::serve::pd::KvBytes,
+        publish: Option<&mut dyn FnMut(crate::serve::pd::KvBytes)>,
+    ) -> Result<()> {
+        let slot = u32::try_from(slot)
+            .map_err(|_| RuntimeError::Rejected("KV image: slot out of range".into()))?;
+        let (spans, total) = crate::exec::kv_image::plan(self.kv_image_manifest()?, slot, n)?;
+        self.drain()?;
+        out.prepare(total as usize, hwspec::Vendor::Amd);
+        out.export_with(publish, |out| {
+            #[cfg(target_os = "linux")]
+            if self.transfer_kv_image(out, &spans, true)? {
+                return Ok(());
+            }
+            let crate::serve::pd::KvBytes::Pageable(out) = out else {
+                return Err(RuntimeError::Device(
+                    "KV image: unregistered export slab".into(),
+                ));
+            };
+            for s in spans {
+                EngineDevice::download(
+                    &*self.be,
+                    &self.devp[s.handle],
+                    s.native_off,
+                    &mut out[s.image_off as usize..(s.image_off + s.bytes) as usize],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn import_kv_image(
+        &mut self,
+        slot: usize,
+        n: u32,
+        image: &crate::serve::pd::KvBytes,
+    ) -> Result<()> {
+        if !self.carried_slot.is_empty() || self.kv_image_has_drafter {
+            return Err(RuntimeError::Rejected(
+                "KV image import: packets with recurrent state or a drafter are not supported"
+                    .into(),
+            ));
+        }
+        if n as usize >= self.max_ctx {
+            return Err(RuntimeError::ContextLength(
+                "KV image import leaves no room for decode".into(),
+            ));
+        }
+        let slot = u32::try_from(slot)
+            .map_err(|_| RuntimeError::Rejected("KV image: slot out of range".into()))?;
+        let (spans, total) = crate::exec::kv_image::plan(self.kv_image_manifest()?, slot, n)?;
+        if total != image.len() as u64 {
+            return Err(RuntimeError::Rejected(format!(
+                "KV image import: image is {} bytes, this packet's is {total}",
+                image.len()
+            )));
+        }
+        self.drain()?;
+        #[cfg(target_os = "linux")]
+        if self.transfer_kv_image(image, &spans, false)? {
+            return Ok(());
+        }
+        for s in spans {
+            EngineDevice::upload(
+                &*self.be,
+                &self.devp[s.handle],
+                s.native_off,
+                &image[s.image_off as usize..(s.image_off + s.bytes) as usize],
+            )?;
+        }
+        self.drain()
+    }
+
     /// Read `dst.len()` bytes of a named tensor from byte `offset`.
     pub fn read_tensor_range(&self, name: &str, offset: u64, dst: &mut [u8]) -> Result<()> {
         let i = self
@@ -15201,74 +15410,6 @@ impl AmdEngine {
             .iter()
             .position(|x| x == name)
             .map(|i| self.devp[i].len)
-    }
-
-    /// DIAGNOSTIC (`PLOW_TB_DUMP=<dir>`): after a token-batch body step, write the plan and the
-    /// per-slot device state the step produced — `in.kvlen`/`in.ids`/`in.pos`, every active band
-    /// slot's KV rows (see [`Self::dump_slot_kv`]) and its logits row — as raw files under
-    /// `dir/<tag>.*`.
-    pub fn token_batch_dump(
-        &self,
-        dir: &Path,
-        tag: &str,
-        plan: &plow_asset::mixed_step::Plan,
-    ) -> Result<()> {
-        use std::fmt::Write as _;
-        let io = |e: std::io::Error| RuntimeError::Device(format!("token-batch dump: {e}"));
-        std::fs::create_dir_all(dir).map_err(io)?;
-        let fetch = |i: usize, off: u64, len: usize| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; len];
-            EngineDevice::download(&*self.be, &self.devp[i], off, &mut buf)?;
-            Ok(buf)
-        };
-        let write = |name: String, bytes: &[u8]| -> Result<()> {
-            std::fs::write(dir.join(format!("{tag}.{name}")), bytes).map_err(io)
-        };
-        let mut text = String::new();
-        let _ = writeln!(
-            text,
-            "cover={:?} decode_rows={} real_rows={} decode_slots={:?}",
-            plan.cover, plan.decode_rows, plan.real_rows, plan.decode_slots
-        );
-        for (r, row) in plan.rows.iter().enumerate().take(plan.real_rows as usize) {
-            let _ = writeln!(
-                text,
-                "row {r}: token={} slot={} pos={} kv_len={} phase={:?} parked={}",
-                row.token, row.slot, row.position, row.kv_len, row.phase, plan.parked[r]
-            );
-        }
-        for (s, span) in plan.prefill_spans.iter().enumerate() {
-            let _ = writeln!(text, "span {s}: {span:?}");
-        }
-        let _ = writeln!(
-            text,
-            "commits={:?} mapped_ends={:?}",
-            plan.commits, plan.mapped_ends
-        );
-        write("plan.txt".into(), text.as_bytes())?;
-        let band = plan.decode_rows as usize;
-        if let Some(t) = self.t_kvlen {
-            write("in.kvlen.bin".into(), &fetch(t, 0, self.batch * 4)?)?;
-        }
-        if let Some(t) = self.t_ids {
-            write("in.ids.bin".into(), &fetch(t, 0, plan.rows.len() * 4)?)?;
-        }
-        if let Some(t) = self.t_pos {
-            write("in.pos.bin".into(), &fetch(t, 0, plan.rows.len() * 4)?)?;
-        }
-        let logits = self.tensor_names.iter().position(|n| n == "act.logits");
-        for slot in 0..band.min(plan.rows.len()) {
-            if plan.parked[slot] != 0 {
-                continue;
-            }
-            self.dump_slot_kv(dir, tag, slot, plan.rows[slot].kv_len)?;
-            if let Some(i) = logits {
-                let row_bytes = self.devp[i].len / band as u64;
-                let bytes = fetch(i, slot as u64 * row_bytes, row_bytes as usize)?;
-                write(format!("slot{slot}.logits.bin"), &bytes)?;
-            }
-        }
-        Ok(())
     }
 
     /// DIAGNOSTIC: one slot's KV rows `[0, kv_len)` on the first and last layer (latent, rope,
@@ -16532,10 +16673,7 @@ impl AmdEngine {
                 if self.k_router_fused.is_some() {
                     1
                 } else {
-                    2 + crate::config::RuntimeConfig::get()
-                        .amd
-                        .router_repeat
-                        .unwrap_or(0) as usize
+                    2
                 }
             }
             Some(DecodeSegmentRoute::LtFused(_)) => 2,
@@ -16639,7 +16777,7 @@ impl AmdEngine {
                 .packed_prefill
                 .is_some_and(|b| b.prog == p && !b.token_batch)
             || self.kda_spans(p).is_empty()
-            || (self.kda_spans(p).iter().any(|s| s.n_rows < 512) && !self.lean_kda_spans_short())
+            || self.kda_spans(p).iter().any(|s| s.n_rows < 512)
         {
             return false;
         }
@@ -16785,23 +16923,10 @@ impl AmdEngine {
         flush(&mut m)
     }
 
-    /// `PLOW_AMD_MIXED_RIDE_TRIM`: short spans (decode riders, trimmed tails) stay on the lean KDA
-    /// route only if EVERY loaded lean object has its all-spans twin, which runs spans of any
-    /// length; the single-span objects return early below 512 rows.
-    fn lean_kda_spans_short(&self) -> bool {
-        let k = &self.k_kda_spans;
-        crate::config::RuntimeConfig::get().amd.mixed_ride_trim
-            && (self.k_kda_chunk_intra_wave_items.is_none() || k.intra_wave_items.is_some())
-            && (self.k_kda_chunk_wu_lean.is_none() || k.wu_lean.is_some())
-            && (self.k_kda_chunk_wu_lean_keys.is_none() || k.wu_lean_keys.is_some())
-            && (self.k_kda_chunk_carry_keyfeed.is_none() || k.carry_keyfeed.is_some())
-            && (self.k_kda_chunk_carry_regstate.is_none() || k.carry_regstate.is_some())
-    }
-
     /// `PLOW_AMD_PACKED_LEAN_KDA_BATCH`: the all-spans object for this lean KDA segment.
     fn packed_lean_kda_spans_kernel(&self, p: usize, seg: usize) -> Option<HsaKernel> {
         let cfg = &crate::config::RuntimeConfig::get().amd;
-        if !(cfg.packed_lean_kda_batch || cfg.mixed_ride_trim) {
+        if !cfg.packed_lean_kda_batch {
             return None;
         }
         let k = &self.k_kda_spans;
@@ -17237,9 +17362,6 @@ impl AmdEngine {
     }
 
     pub(crate) fn replay_without_prepare(&self, p: usize) -> Result<bool> {
-        if crate::config::RuntimeConfig::get().amd.native_launch_timing {
-            return Ok(false);
-        }
         for seg in 0..self.prog_dispatch(p).launches() {
             if self.segment_needs_prepare(p, seg)? {
                 return Ok(false);
@@ -17369,11 +17491,6 @@ impl AmdEngine {
                         self.lt_group.1.clear();
                     }
                     self.lt_group.1.push((out, x));
-                } else if !is_last_seg
-                    && crate::config::RuntimeConfig::get().amd.lt_overlap
-                    && lt_overlaps_run(&self.progs[p].decode_routes[..seg], route.inst())
-                {
-                    self.be.skip_next_barrier();
                 }
                 if let Err(err) = kernel.enqueue(&self.be, route, &self.tens_table) {
                     self.be.clear_skip_barrier();
@@ -17497,24 +17614,16 @@ impl AmdEngine {
                     as_bytes(std::slice::from_ref(&ga)),
                     None,
                 )?;
-                // PLOW_AMD_ROUTER_REPEAT (diagnostic): the idempotent top-k launched again, to
-                // price one more launch of it.
-                let reps = 1 + crate::config::RuntimeConfig::get()
-                    .amd
-                    .router_repeat
-                    .unwrap_or(0);
-                for _ in 0..reps {
-                    EngineDevice::launch_kernel(
-                        &*self.be,
-                        kt,
-                        topk.i[4].div_ceil(4),
-                        256,
-                        0,
-                        as_bytes(std::slice::from_ref(&ta)),
-                        None,
-                    )?;
-                }
-                self.seg_launches += u64::from(reps);
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kt,
+                    topk.i[4].div_ceil(4),
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&ta)),
+                    None,
+                )?;
+                self.seg_launches += 1;
             }
             DecodeSegmentRoute::XrNative(inst) => self.launch_xr_native(&inst)?,
             DecodeSegmentRoute::DenseNative(r) => {
@@ -18513,21 +18622,6 @@ impl AmdEngine {
         // an error. A MODEL without one is, because the sampled logits would
         // then come from whatever row the compiler baked in.
         match (lm, self.t_logits) {
-            // DIAGNOSTIC: `--amd-lm-row0` / `PLOW_LM_ROW0=1` leaves a_row0 at
-            // 0 instead of the
-            // chunk's last real row. It samples the WRONG row, so it is not a
-            // serving mode — it exists to answer one question. The lm_head is
-            // the ONLY op whose a_row0 the host patches to a non-zero value at
-            // runtime, so a bug in the a_row0 path is invisible to any check
-            // that inspects the packet statically (where all fp8 GEMMs carry
-            // a_row0 == 0) and shows up only here.
-            (Some(lm), _) if crate::config::RuntimeConfig::get().amd.lm_row0 => {
-                tracing::warn!(
-                    lm,
-                    "PLOW_LM_ROW0=1: a_row0 left at 0 — DIAGNOSTIC, wrong row"
-                );
-                insts[lm].i[4] = 0;
-            }
             // A token-batch body samples its whole slot band `[0, band)` through a tiled
             // GEMM; there is no last-row a_row0 to place and `i[4]` is not that field there.
             (Some(_), _) if self.progs[prog].role.is_token_batch_body() => {}
@@ -20371,6 +20465,10 @@ impl AmdEngine {
     /// Segment count for program `p`.
     pub fn prog_segments(&self, p: usize) -> usize {
         self.progs[p].seg_class.len()
+    }
+
+    pub fn prefill_launches(&self, p: usize) -> usize {
+        self.prog_dispatch(p).launches()
     }
 
     /// Ordered host launches and their device-side XCD queue layout.

@@ -99,6 +99,10 @@ impl Layout {
 #[derive(Debug, PartialEq, Eq)]
 pub enum PlacementError {
     NoDevices,
+    InvalidGroups,
+    DuplicateInstance {
+        slug: String,
+    },
     /// A model's TP degree does not divide the visible device count, so no
     /// contiguous run of that width exists.
     NoRunOfWidth {
@@ -144,6 +148,8 @@ impl fmt::Display for PlacementError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlacementError::NoDevices => write!(f, "no visible devices to place models on"),
+            PlacementError::InvalidGroups => write!(f, "device groups must be nonempty and disjoint"),
+            PlacementError::DuplicateInstance { slug } => write!(f, "duplicate model instance {slug}"),
             PlacementError::NoRunOfWidth { slug, tp, visible } => write!(
                 f,
                 "{slug} needs a tensor-parallel run of {tp} device(s), but only {visible} are visible"
@@ -193,6 +199,13 @@ pub fn plan_groups(devices: &[u32], tp: u32, capacity: u64) -> Result<Vec<Group>
     if devices.is_empty() {
         return Err(PlacementError::NoDevices);
     }
+    if devices
+        .iter()
+        .enumerate()
+        .any(|(i, d)| devices[..i].contains(d))
+    {
+        return Err(PlacementError::InvalidGroups);
+    }
     let tp = tp.max(1) as usize;
     Ok(devices
         .chunks_exact(tp)
@@ -216,6 +229,21 @@ pub fn assign(
     if groups.is_empty() {
         return Err(PlacementError::NoDevices);
     }
+    let mut devices = std::collections::HashSet::new();
+    if groups
+        .iter()
+        .any(|g| g.ordinals.is_empty() || g.ordinals.iter().any(|d| !devices.insert(*d)))
+    {
+        return Err(PlacementError::InvalidGroups);
+    }
+    let mut instances = std::collections::HashSet::new();
+    for m in models {
+        if !instances.insert(&m.slug) {
+            return Err(PlacementError::DuplicateInstance {
+                slug: m.slug.clone(),
+            });
+        }
+    }
     for (i, m) in models.iter().enumerate() {
         if models[..i].iter().any(|o| o.model == m.model) {
             continue;
@@ -232,7 +260,9 @@ pub fn assign(
     let mut assignment = vec![usize::MAX; models.len()];
     // Bytes already promised to each group, so `spread` can pick the emptiest
     // and `pack` can tell when one is full.
-    let mut used = vec![0u64; groups.len()];
+    // Every requirement is u64 and a slice has at most usize::MAX entries.
+    // u128 therefore represents even an intentionally oversubscribed sum exactly.
+    let mut used = vec![0u128; groups.len()];
     // A group already holding a rank of this model is not a candidate for another.
     let taken = |assignment: &[usize], model: &str, g: usize| {
         models
@@ -265,7 +295,7 @@ pub fn assign(
             });
         }
         assignment[i] = g;
-        used[g] += m.required;
+        used[g] += u128::from(m.required);
     }
 
     // Pass 2: the policy.
@@ -278,7 +308,11 @@ pub fn assign(
         // against `groups[0]` rejected one that fits a larger card, and let
         // `spread` drop a model onto a card too small to hold it — a startup
         // failure at load time instead of a placement decision.
-        let fits = |g: usize| m.required <= groups[g].capacity && !taken(&assignment, &m.model, g);
+        let fits = |g: usize| {
+            (m.tp.max(1) == 1 || m.tp.max(1) == groups[g].degree())
+                && m.required <= groups[g].capacity
+                && !taken(&assignment, &m.model, g)
+        };
         let biggest = groups.iter().map(|g| g.capacity).max().unwrap_or(0);
         if !(0..groups.len()).any(fits) {
             return Err(PlacementError::WontFitAnywhere {
@@ -287,7 +321,7 @@ pub fn assign(
                 capacity: biggest,
             });
         }
-        let emptiest_that_fits = |used: &[u64]| {
+        let emptiest_that_fits = |used: &[u128]| {
             (0..groups.len())
                 .filter(|&g| fits(g))
                 .min_by_key(|&g| (used[g], g))
@@ -309,11 +343,13 @@ pub fn assign(
             // has spare room, since the manager still switches models in and
             // out of an oversubscribed group.
             Place::Pack => (0..groups.len())
-                .find(|&g| fits(g) && used[g] + m.required <= groups[g].capacity)
+                .find(|&g| {
+                    fits(g) && used[g] + u128::from(m.required) <= u128::from(groups[g].capacity)
+                })
                 .unwrap_or_else(|| emptiest_that_fits(&used)),
         };
         assignment[i] = g;
-        used[g] += m.required;
+        used[g] += u128::from(m.required);
     }
 
     Ok(Layout {
@@ -346,18 +382,41 @@ pub fn requested_ordinals(configured: &[u32], visible_count: u32) -> Vec<u32> {
 /// saying where a model goes, and silently placing it somewhere else is the
 /// one outcome that must not happen.
 pub fn parse_pins(pins: &[String]) -> Result<Vec<(String, u32)>, String> {
+    Ok(parse_dev_pins(pins)?
+        .into_iter()
+        .map(|(slug, _, ord)| (slug, ord))
+        .collect())
+}
+
+/// A device as `--devices` / `--pin` name it: a bare ordinal (`2`, the single-vendor meaning) or
+/// a vendor-qualified one (`nv:2`, `amd:1`; docs/arch/30 §2.1).
+pub fn parse_dev(s: &str) -> Result<(Option<hwspec::Vendor>, u32), String> {
+    let (vendor, n) = match s.split_once(':') {
+        None => (None, s),
+        Some(("nv" | "nvidia" | "cuda", n)) => (Some(hwspec::Vendor::Nvidia), n),
+        Some(("amd" | "hsa", n)) => (Some(hwspec::Vendor::Amd), n),
+        Some((v, _)) => return Err(format!("device {s:?}: unknown vendor {v:?} (nv or amd)")),
+    };
+    let n = n
+        .parse()
+        .map_err(|_| format!("device {s:?}: {n:?} is not a device ordinal"))?;
+    Ok((vendor, n))
+}
+
+/// `--pin slug@ordinal` or `slug@nv:N` / `slug@amd:N`.
+pub fn parse_dev_pins(
+    pins: &[String],
+) -> Result<Vec<(String, Option<hwspec::Vendor>, u32)>, String> {
     let mut out = Vec::with_capacity(pins.len());
     for pin in pins {
-        let (slug, ord) = pin
+        let (slug, dev) = pin
             .rsplit_once('@')
             .ok_or_else(|| format!("--pin {pin:?} is not slug@ordinal"))?;
         if slug.is_empty() {
             return Err(format!("--pin {pin:?} names no model"));
         }
-        let ord: u32 = ord
-            .parse()
-            .map_err(|_| format!("--pin {pin:?}: {ord:?} is not a device ordinal"))?;
-        out.push((slug.to_string(), ord));
+        let (vendor, ord) = parse_dev(dev).map_err(|e| format!("--pin {pin:?}: {e}"))?;
+        out.push((slug.to_string(), vendor, ord));
     }
     Ok(out)
 }
@@ -396,6 +455,192 @@ impl DpSpec {
     pub fn named(&self) -> impl Iterator<Item = &str> {
         self.per_model.iter().map(|(m, _)| m.as_str())
     }
+}
+
+/// CUDA ranks `0..k` of a model served data-parallel over both vendors (docs/arch/30 §4): as many
+/// as the NVIDIA groups take, leaving room for its AMD pins and honouring its NVIDIA ones; the
+/// remaining `n - k` go to AMD groups.
+pub fn mix_split(
+    n: usize,
+    nv_groups: usize,
+    amd_groups: usize,
+    nv_pins: usize,
+    amd_pins: usize,
+) -> Result<usize, String> {
+    if nv_pins + amd_pins > n {
+        return Err(format!(
+            "--dp {n}: {nv_pins} NVIDIA and {amd_pins} AMD pins name more ranks than it has"
+        ));
+    }
+    let k = n.saturating_sub(amd_pins).min(nv_groups).max(nv_pins);
+    if n - k > amd_groups {
+        return Err(format!(
+            "--dp {n} needs {n} device groups; {nv_groups} NVIDIA and {amd_groups} AMD are free"
+        ));
+    }
+    Ok(k)
+}
+
+/// A device as `serve --plan-only` sees it.
+#[derive(Clone, Debug)]
+pub struct PlanDevice {
+    pub id: String,
+    pub vendor: hwspec::Vendor,
+    pub isa: Option<hwspec::isa::IsaLevel>,
+    pub name: String,
+    /// 0 = unknown.
+    pub mem_bytes: u64,
+}
+
+/// A bundle as `serve --plan-only` sees it: `slug` is the served name (variants share one).
+#[derive(Clone, Debug)]
+pub struct PlanModel {
+    pub slug: String,
+    pub dir: String,
+    pub gpu: String,
+    pub vendor: Option<hwspec::Vendor>,
+    pub isa: Option<hwspec::isa::IsaLevel>,
+    pub tp: u32,
+    /// Bytes resident on each rank device, when the blob header gave a plan.
+    pub required: Option<u64>,
+    /// Why this bundle cannot serve beside the slug's first bundle (variant check).
+    pub refused: Option<String>,
+}
+
+/// Why `m` cannot run on `d`, or `None` when it can (TP group size is checked per model).
+pub fn plan_verdict(m: &PlanModel, d: &PlanDevice) -> Option<String> {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    if let Some(why) = &m.refused {
+        return Some(format!("variant refused: {why}"));
+    }
+    let Some(isa) = m.isa else {
+        return Some(format!("packet target {:?} is not a known GPU", m.gpu));
+    };
+    if m.vendor != Some(d.vendor) {
+        return Some(format!(
+            "packet is for {}, device is {}",
+            isa.arch_flag(),
+            d.isa.map_or("an unknown ISA", |i| i.arch_flag())
+        ));
+    }
+    if d.isa != Some(isa) {
+        return Some(format!(
+            "packet ISA {} != device ISA {}",
+            isa.arch_flag(),
+            d.isa.map_or("unknown", |i| i.arch_flag())
+        ));
+    }
+    match m.required {
+        Some(r) if d.mem_bytes > 0 && r > d.mem_bytes => Some(format!(
+            "needs {:.1} GiB per device, {} has {:.1} GiB",
+            gib(r),
+            d.id,
+            gib(d.mem_bytes)
+        )),
+        _ => None,
+    }
+}
+
+/// The device x model support table `serve --plan-only` prints: one row per bundle, one column
+/// per device, every refusal with its reason, and per served model the data-parallel reach over
+/// all of its variants.
+pub fn plan_table(devices: &[PlanDevice], models: &[PlanModel]) -> String {
+    use std::fmt::Write;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let mut out = String::new();
+    let _ = writeln!(out, "devices:");
+    for d in devices {
+        let _ = writeln!(
+            out,
+            "  {:<7} {:<8} {:>6.1} GiB  {}",
+            d.id,
+            d.isa.map_or("?", |i| i.arch_flag()),
+            gib(d.mem_bytes),
+            d.name
+        );
+    }
+    let row = |m: &PlanModel| {
+        format!(
+            "{} [{}]",
+            m.slug,
+            m.isa.map_or(m.gpu.as_str(), |i| i.arch_flag())
+        )
+    };
+    let width = models
+        .iter()
+        .map(|m| row(m).len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let _ = writeln!(out, "matrix (ok / - refused, reasons below):");
+    let _ = write!(out, "  {:<width$}", "model");
+    for d in devices {
+        let _ = write!(out, " {:>6}", d.id);
+    }
+    let _ = writeln!(out);
+    let mut reasons = Vec::new();
+    for m in models {
+        let _ = write!(out, "  {:<width$}", row(m));
+        for d in devices {
+            let cell = match plan_verdict(m, d) {
+                None => "ok",
+                Some(why) => {
+                    reasons.push(format!("{} @ {}: {why}", row(m), d.id));
+                    "-"
+                }
+            };
+            let _ = write!(out, " {cell:>6}");
+        }
+        let _ = writeln!(out);
+    }
+    if !reasons.is_empty() {
+        let _ = writeln!(out, "refusals:");
+        for r in &reasons {
+            let _ = writeln!(out, "  {r}");
+        }
+    }
+    let _ = writeln!(out, "models:");
+    let mut seen: Vec<&str> = Vec::new();
+    for m in models {
+        if seen.contains(&m.slug.as_str()) {
+            continue;
+        }
+        seen.push(&m.slug);
+        let mut reach = Vec::new();
+        let mut ranks = 0usize;
+        for v in models
+            .iter()
+            .filter(|v| v.slug == m.slug && v.refused.is_none())
+        {
+            let ok = devices
+                .iter()
+                .filter(|d| plan_verdict(v, d).is_none())
+                .count();
+            let n = ok / v.tp.max(1) as usize;
+            ranks += n;
+            reach.push(format!(
+                "{} TP{} x{n}",
+                v.isa.map_or(v.gpu.as_str(), |i| i.arch_flag()),
+                v.tp
+            ));
+        }
+        let _ = writeln!(
+            out,
+            "  {}: {}; DP up to {ranks}{}",
+            m.slug,
+            if reach.is_empty() {
+                "no servable bundle".to_string()
+            } else {
+                reach.join(" + ")
+            },
+            if reach.len() > 1 {
+                " across vendors"
+            } else {
+                ""
+            }
+        );
+    }
+    out
 }
 
 /// Parse `--dp 8`, `--dp all`, `--dp gemma=4,asr=all`.
@@ -447,6 +692,83 @@ pub fn grouping_width(models: &[ModelSpec], visible: usize) -> Result<u32, Place
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn invalid_group_and_instance_shapes_are_rejected() {
+        use super::*;
+        let m = ModelSpec {
+            slug: "a".into(),
+            model: "a".into(),
+            tp: 1,
+            required: 1,
+            device: None,
+        };
+        let group = Group {
+            ordinals: vec![0],
+            capacity: 10,
+        };
+        assert!(plan_groups(&[0, 0], 1, 10).is_err());
+        assert!(assign(
+            &[m.clone()],
+            &[Group {
+                ordinals: vec![],
+                capacity: 10
+            }],
+            Place::Spread
+        )
+        .is_err());
+        assert!(assign(&[m.clone()], &[group.clone(), group.clone()], Place::Spread).is_err());
+        assert!(assign(&[m.clone(), m.clone()], &[group.clone()], Place::Spread).is_err());
+        let mut wide = m;
+        wide.tp = 2;
+        assert!(assign(&[wide], &[group], Place::Spread).is_err());
+    }
+
+    #[test]
+    fn oversubscribed_pins_do_not_wrap_the_policy_load_counter() {
+        use super::*;
+        let models = [
+            ModelSpec {
+                slug: "a".into(),
+                model: "a".into(),
+                tp: 1,
+                required: u64::MAX,
+                device: Some(0),
+            },
+            ModelSpec {
+                slug: "b".into(),
+                model: "b".into(),
+                tp: 1,
+                required: u64::MAX,
+                device: Some(0),
+            },
+            ModelSpec {
+                slug: "c".into(),
+                model: "c".into(),
+                tp: 1,
+                required: 1,
+                device: None,
+            },
+        ];
+        let groups = [
+            Group {
+                ordinals: vec![0],
+                capacity: u64::MAX,
+            },
+            Group {
+                ordinals: vec![1],
+                capacity: u64::MAX,
+            },
+        ];
+        assert_eq!(
+            assign(&models, &groups, Place::Pack).unwrap().assignment,
+            [0, 0, 1]
+        );
+        assert_eq!(
+            assign(&models, &groups, Place::Spread).unwrap().assignment,
+            [0, 0, 1]
+        );
+    }
     use super::*;
 
     const GIB: u64 = 1 << 30;
@@ -714,7 +1036,15 @@ mod tests {
             parse_pins(&["org@v1/model@2".to_string()]).unwrap(),
             vec![("org@v1/model".to_string(), 2)]
         );
-        for bad in ["a", "a@", "@2", "a@x", ""] {
+        assert_eq!(
+            parse_dev_pins(&["m@amd:1".to_string(), "m@nv:0".to_string()]).unwrap(),
+            vec![
+                ("m".to_string(), Some(hwspec::Vendor::Amd), 1),
+                ("m".to_string(), Some(hwspec::Vendor::Nvidia), 0)
+            ]
+        );
+        assert_eq!(parse_dev("3").unwrap(), (None, 3));
+        for bad in ["a", "a@", "@2", "a@x", "", "a@gpu:1", "a@amd:"] {
             assert!(
                 parse_pins(&[bad.to_string()]).is_err(),
                 "{bad:?} should be refused"
@@ -792,6 +1122,61 @@ mod tests {
         assert!(l.assignment[4] < 4);
         let l = assign(&m, &groups(5, 48 * GIB), Place::Spread).unwrap();
         assert_eq!(l.assignment[4], 4, "a free group goes to the plain model");
+    }
+
+    #[test]
+    fn plan_table_marks_each_refusal() {
+        use hwspec::isa::IsaLevel;
+        let dev = |id: &str, vendor, isa, gib: u64| PlanDevice {
+            id: id.into(),
+            vendor,
+            isa: Some(isa),
+            name: String::new(),
+            mem_bytes: gib << 30,
+        };
+        let devices = [
+            dev("nv:0", hwspec::Vendor::Nvidia, IsaLevel::Sm120a, 96),
+            dev("amd:0", hwspec::Vendor::Amd, IsaLevel::Gfx1201, 32),
+        ];
+        let model = |gpu: &str, vendor, isa, gib: u64| PlanModel {
+            slug: "m".into(),
+            dir: String::new(),
+            gpu: gpu.into(),
+            vendor: Some(vendor),
+            isa: Some(isa),
+            tp: 1,
+            required: Some(gib << 30),
+            refused: None,
+        };
+        let nv = model("rtxpro6000", hwspec::Vendor::Nvidia, IsaLevel::Sm120a, 40);
+        let amd = model("r9700", hwspec::Vendor::Amd, IsaLevel::Gfx1201, 40);
+        assert_eq!(plan_verdict(&nv, &devices[0]), None);
+        assert!(plan_verdict(&nv, &devices[1])
+            .unwrap()
+            .contains("packet is for"));
+        assert!(plan_verdict(&amd, &devices[1])
+            .unwrap()
+            .contains("needs 40.0 GiB"));
+        let small = PlanModel {
+            required: Some(8 << 30),
+            ..amd
+        };
+        let t = plan_table(&devices, &[nv, small]);
+        assert!(
+            t.contains("m: sm_120a TP1 x1 + gfx1201 TP1 x1; DP up to 2 across vendors"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn mix_split_fills_nvidia_then_amd() {
+        assert_eq!(mix_split(4, 2, 2, 0, 0), Ok(2));
+        assert_eq!(mix_split(3, 2, 2, 0, 0), Ok(2));
+        assert_eq!(mix_split(3, 2, 2, 0, 2), Ok(1));
+        assert_eq!(mix_split(2, 2, 2, 0, 2), Ok(0));
+        assert_eq!(mix_split(1, 2, 2, 0, 0), Ok(1));
+        assert!(mix_split(5, 2, 2, 0, 0).is_err());
+        assert!(mix_split(2, 2, 2, 2, 1).is_err());
     }
 
     #[test]

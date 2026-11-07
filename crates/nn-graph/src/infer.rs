@@ -782,7 +782,9 @@ fn conv2d_dim(
         .add(&Dim::stat(offset))
         .div_static(stride)
         .map(|d| d.add(&Dim::stat(1)))
-        .ok_or_else(|| cx.err("conv2d cannot represent this symbolic output size; bind the input size first"))
+        .ok_or_else(|| {
+            cx.err("conv2d cannot represent this symbolic output size; bind the input size first")
+        })
 }
 
 fn req_static(cx: &Ctx, d: &Dim, what: &str) -> Result<i64, InferError> {

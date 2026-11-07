@@ -18,12 +18,6 @@
 #ifndef PLOW_NV_GEMMA_HNR_BF16
 #define PLOW_NV_GEMMA_HNR_BF16 0
 #endif
-#ifndef PLOW_NV_GEMMA_NRN_BF16
-#define PLOW_NV_GEMMA_NRN_BF16 0
-#endif
-#ifndef PLOW_NV_NRN_WPR
-#define PLOW_NV_NRN_WPR 0
-#endif
 #include "sm120_common.cuh"
 #include <cuda_fp8.h> /* __nv_fp8_e4m3 — the T11 fused activation quant */
 
@@ -64,7 +58,7 @@ static __device__ __forceinline__ float gemma3_bf16_round(float x) {
 }
 
 static __device__ __forceinline__ float gemma_postnorm_round(float x) {
-#if (defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && PLOW_NV_GEMMA_NRN_BF16) || PLOW_NV_GEMMA3
+#if PLOW_NV_GEMMA3
     return __bfloat162float(__float2bfloat16(x));
 #else
     return x;
@@ -485,12 +479,6 @@ static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16
  * dependent load batches per pass and parks half the warps at ~4 rows per block (1024 rows on
  * 264 blocks); here every row is one batch. Reduction order differs from T17 in the last ulp.
  * `resid` may alias `a` (NRN); b/out are distinct. part needs 2 * PLOW_NV_WARPS floats. */
-#ifndef PLOW_NV_PF_ROW_TEAM
-#define PLOW_NV_PF_ROW_TEAM 1
-#endif
-#ifndef PLOW_NV_PF_TEAM_GN_EARLY
-#define PLOW_NV_PF_TEAM_GN_EARLY 1
-#endif
 template <int TEAM>
 static __device__ __forceinline__ float team_sum(float v, float* part) {
     constexpr int TW = TEAM / 32;
@@ -527,26 +515,20 @@ static __device__ void norm_residual_team(__nv_bfloat16* __restrict__ out, __nv_
         const bool live = row < rows;
         const size_t base = (size_t)(live ? row : 0u) * feat;
         bf16v8 av[TV], bv[TV], wv[TV];
-#if PLOW_NV_PF_TEAM_GN_EARLY
         /* gn with the other operands: one load round trip per pass instead of two. */
         bf16v8 gv[TV];
-#endif
 #pragma unroll
         for (int c = 0; c < TV; c++) {
             const unsigned v = tl + (unsigned)c * TEAM;
             av[c] = bf16v8_zero();
             bv[c] = bf16v8_zero();
             wv[c] = bf16v8_zero();
-#if PLOW_NV_PF_TEAM_GN_EARLY
             gv[c] = bf16v8_zero();
-#endif
             if (live && v < nv) {
                 bv[c] = ld_glob8(b + base + v * 8u);
                 av[c] = ld_glob8(a + base + v * 8u);
                 if (gb) wv[c] = ld_glob8(gb + v * 8u);
-#if PLOW_NV_PF_TEAM_GN_EARLY
                 if (NRN && gn) gv[c] = ld_glob8(gn + v * 8u);
-#endif
             }
         }
         float ss = 0.0f;
@@ -574,17 +556,8 @@ static __device__ void norm_residual_team(__nv_bfloat16* __restrict__ out, __nv_
             av[c] = r;
         }
         if constexpr (NRN) {
-#if PLOW_NV_PF_TEAM_GN_EARLY
 #pragma unroll
             for (int c = 0; c < TV; c++) wv[c] = gv[c];
-#else
-#pragma unroll
-            for (int c = 0; c < TV; c++) {
-                const unsigned v = tl + (unsigned)c * TEAM;
-                wv[c] = bf16v8_zero();
-                if (live && v < nv && gn) wv[c] = ld_glob8(gn + v * 8u);
-            }
-#endif
             const float invr = rsqrtf(team_sum<TEAM>(ssr, part + PLOW_NV_WARPS) * inv_feat + eps);
 #pragma unroll
             for (int c = 0; c < TV; c++) {
@@ -617,7 +590,7 @@ static __device__ __forceinline__ bool norm_residual_teams(
     __nv_bfloat16* out, __nv_bfloat16* resid, const __nv_bfloat16* a, const __nv_bfloat16* b,
     const __nv_bfloat16* gb, const __nv_bfloat16* gn, unsigned rows, unsigned feat, float eps,
     float scale, unsigned slice, unsigned nblk, float* part) {
-#if defined(PLOW_NV_PREFILL) && PLOW_NV_PREFILL && PLOW_NV_PF_ROW_TEAM
+#if defined(PLOW_NV_PREFILL) && PLOW_NV_PREFILL
     if (rows < PLOW_NV_T17_MIN_ROWS || (feat & 7u) != 0) return false;
     const unsigned nv = feat >> 3;
     /* TV <= 3: the object's 128-register cap spills a 64-thread TV=5 team. */
@@ -778,8 +751,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
  *     out   = RMSNorm(resid, gn)               (the normed activation the next sublayer reads)
  *
  * Warp32 port of runtime/amd/op_norm.h d_norm_residual_norm. `resid` is rounded to bf16 before
- * the second reduction. PLOW_NV_NRN_WPR matches the prefill pair's warp reduction order;
- * the legacy block reduction can round differently from the prefill pair. `resid`
+ * the second reduction. The block reduction can round differently from the prefill pair. `resid`
  * aliases `a` in the caller; `b`/`out` are distinct. gb/gn == nullptr are the weightless variants. */
 static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16* resid,
                                      const __nv_bfloat16* a, const __nv_bfloat16* __restrict__ b,
@@ -789,56 +761,6 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                                      unsigned nblk, float* part) {
     if (norm_residual_teams<true>(out, resid, a, b, gb, gn, rows, feat, eps, scale, slice, nblk, part))
         return;
-#if PLOW_NV_NRN_WPR
-    if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
-        const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
-        const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
-        for (unsigned k = warp;; k += PLOW_NV_WARPS) {
-            const unsigned row = slice + k * nblk;
-            if (row >= rows) break;
-            const size_t base = (size_t)row * feat;
-            float ssb = 0.0f;
-            for (unsigned i = lane * 8u; i < feat; i += 256u) {
-                const bf16v8 v = ld_glob8(b + base + i);
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const float f = __bfloat162float(v.x[j]);
-                    ssb += f * f;
-                }
-            }
-            const float invb = rsqrtf(warp_sum32(ssb) * __fdividef(1.0f, (float)feat) + eps);
-            float ssr = 0.0f;
-            for (unsigned i = lane * 8u; i < feat; i += 256u) {
-                const bf16v8 v = ld_glob8(b + base + i);
-                const bf16v8 av = ld_glob8(a + base + i);
-                const bf16v8 w = gb ? ld_glob8(gb + i) : bf16v8_zero();
-                bf16v8 r;
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const float g = gb ? norm_weight(__bfloat162float(w.x[j])) : 1.0f;
-                    r.x[j] = __float2bfloat16(
-                        (__bfloat162float(av.x[j]) + gemma_postnorm_round(__bfloat162float(v.x[j]) * invb * g)) * scale);
-                    const float f = __bfloat162float(r.x[j]);
-                    ssr += f * f;
-                }
-                st_glob8(resid + base + i, r);
-            }
-            const float invr = rsqrtf(warp_sum32(ssr) * __fdividef(1.0f, (float)feat) + eps);
-            for (unsigned i = lane * 8u; i < feat; i += 256u) {
-                const bf16v8 r = ld_glob8(resid + base + i);
-                const bf16v8 w = gn ? ld_glob8(gn + i) : bf16v8_zero();
-                bf16v8 o;
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const float g = gn ? norm_weight(__bfloat162float(w.x[j])) : 1.0f;
-                    o.x[j] = __float2bfloat16(__bfloat162float(r.x[j]) * invr * g);
-                }
-                st_glob8(out + base + i, o);
-            }
-        }
-        return;
-    }
-#endif
     PLOW_TL_PH(0);
     const bool fits = (feat <= RN_REG * PLOW_NV_THREADS) && ((feat & 7u) == 0);
 #if PLOW_NV_RAW_NARROW

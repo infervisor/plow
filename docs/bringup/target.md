@@ -52,6 +52,10 @@ Build scripts in the tree today:
 | `sm_120a` | `scripts/build_sm120_cubin.sh` |
 | `sm_90a` | `scripts/build_sm90a_cubin.sh` |
 
+ISA references for kernel authors (instructions, memory movement, sync, flags, measured
+pitfalls, ceilings), one per `$ISA`: [`isa/README.md`](isa/README.md). Read the one for `$ISA`
+before Stage 4.
+
 `IsaLevel::geometry()` returns `Some` only for the AMD levels, deliberately: the
 NVIDIA GEMM tile is one object-wide macro triple that `kernelcaps` probes out of
 the header per build, so there is no second copy for a table to disagree with.

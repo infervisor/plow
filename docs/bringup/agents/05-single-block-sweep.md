@@ -98,7 +98,9 @@ Apply this contract to every CUDA or HIP body exercised by the selected
 single-block harness. CUDA's warp is 32 lanes. CDNA's wavefront is 64 lanes;
 its LDS still has 32 four-byte banks, so a wave64 access is serviced in two
 32-lane phases. Do not copy a CUDA launch or swizzle constant to AMD without
-re-deriving it for that geometry.
+re-deriving it for that geometry. Per-target instruction, layout, sync and pitfall
+facts: [`../isa/README.md`](../isa/README.md) → the file for `$ISA`; read it before editing a
+kernel body.
 
 * Inner-loop branches must be warp- or wave-uniform. Predication at ragged
   boundaries is allowed, but profile it separately from the steady-state tile.

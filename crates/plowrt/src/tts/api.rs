@@ -194,8 +194,18 @@ impl SpeechSpec {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| req.voice.clone())
-        } else {
+        } else if self.voices.contains(&req.voice) {
             req.voice.clone()
+        } else {
+            // `Ryan` names `ryan`: an exact name first, then the one equal ignoring ASCII case.
+            let mut same = self
+                .voices
+                .iter()
+                .filter(|v| v.eq_ignore_ascii_case(&req.voice));
+            match (same.next(), same.next()) {
+                (Some(v), None) => v.clone(),
+                _ => req.voice.clone(),
+            }
         };
         if !self.voices.contains(&voice) {
             return Err(invalid(
@@ -445,6 +455,24 @@ mod tests {
         assert_eq!(c.seed, 7);
         assert_eq!(c.sampling.temperature, 0.0);
         assert_eq!(c.sampling.max_tokens, Some(10));
+    }
+
+    #[test]
+    fn a_voice_matches_ignoring_case_when_unambiguous() {
+        let s = spec(&[]);
+        let voice = |s: &SpeechSpec, v: &str| {
+            s.check(&req(serde_json::json!({ "voice": v })))
+                .map(|c| c.voice)
+        };
+        assert_eq!(voice(&s, "B").unwrap(), "b");
+        let mut two = spec(&[]);
+        two.voices.push("A".into());
+        assert_eq!(voice(&two, "A").unwrap(), "A");
+        assert!(voice(&two, "a").is_ok());
+        two.voices.retain(|v| v != "a" && v != "A");
+        two.voices.extend(["x".into(), "X".into()]);
+        assert!(voice(&two, "x").is_ok());
+        assert!(voice(&two, "x ").is_err());
     }
 
     #[test]

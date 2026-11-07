@@ -254,10 +254,10 @@ static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bflo
 
 /* GemvF32Out (op 220): C[m][n] = sum_k x[m][k] * W[n][k] in fp32 (exact bf16 products, fp32 fma), stored
  * fp32 — a reference that casts both operands to f32 before its matmul. A warp per output row, rows
- * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. */
+ * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. `round_bf16` (flag bit 11): C rounded to bf16. */
 static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N, unsigned K,
-                                     unsigned slice, unsigned nblk) {
+                                     bool round_bf16, unsigned slice, unsigned nblk) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned per = (N + nblk - 1) / nblk;
@@ -278,7 +278,8 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
 #pragma unroll
             for (int m = 0; m < 8; m++) {
                 const float t = warp_sum32(acc[m]);
-                if (lane == 0 && m0 + m < M) C[(size_t)(m0 + m) * N + n] = t;
+                if (lane == 0 && m0 + m < M)
+                    C[(size_t)(m0 + m) * N + n] = round_bf16 ? __bfloat162float(__float2bfloat16_rn(t)) : t;
             }
         }
     }
@@ -658,7 +659,7 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
                                       const unsigned* __restrict__ force, unsigned* __restrict__ eidx,
                                       unsigned rows, unsigned vocab, unsigned out_stride, unsigned out_col0,
                                       unsigned coord, unsigned words, unsigned lstride, unsigned eoff,
-                                      unsigned slice, unsigned nblk, float* arena) {
+                                      unsigned min_step, unsigned slice, unsigned nblk, float* arena) {
     unsigned long long* part = (unsigned long long*)arena;
     float* fpart = (float*)(part + PLOW_NV_WARPS);
     unsigned* sel = (unsigned*)(fpart + PLOW_NV_WARPS);
@@ -678,9 +679,12 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
         const unsigned* bm = bitmap ? bitmap + (size_t)r * words : nullptr;
         const float* lg = logits + (size_t)r * ls;
         const float* lu = guide ? lg + ls : nullptr;
+        /* HF min_new_tokens: the last class (the stop) is masked before step min_step. */
+        const unsigned masked = ctl[2u * r + 1u] < min_step ? vocab - 1u : vocab;
         for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
             float v = lg[i];
             if (lu) v = __fadd_rn(lu[i], __fmul_rn(cs, __fsub_rn(v, lu[i])));
+            if (i == masked) v = -INFINITY;
             if (bm && ((bm[i >> 5] >> (i & 31u)) & 1u)) v = v > 0.f ? __fdiv_rn(v, pen) : v * pen;
             L[i] = t > 0.f ? __fdiv_rn(v, t) : v;
         }
@@ -886,9 +890,6 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
         for (int j = 0; j < 8; j++) {
             const float g = __bfloat162float(vg.x[j]);
             float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh_pf(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-            if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
             vo.x[j] = __float2bfloat16(a * __bfloat162float(vu.x[j]));
         }
         return vo;
@@ -911,9 +912,6 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
             for (unsigned j = i; j < n; j++) {
                 const float g = __bfloat162float(gate[j]);
                 float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-                if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
                 out[j] = __float2bfloat16(a * __bfloat162float(up[j]));
             }
         }
@@ -937,9 +935,6 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
 #if GLU_PITCHED_ARMS
 static __device__ __forceinline__ float glu_pitched_one(float g, float u, unsigned act) {
     float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh_pf(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-    if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
     return a * u;
 }
 static __device__ void d_glu_pitched(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ gu,

@@ -10,7 +10,7 @@ answer is only trustworthy because the harness can be re-run.
 
 | file | question it answers | result |
 |---|---|---|
-| `setmaxnreg_{probe,occ,design}.cu` | Does `setmaxnreg` execute on sm_120a? | YES, but needs `__maxnreg__` (NOT `__launch_bounds__`, which makes ptxas silently drop it). `dec` returns registers to a **CTA-local** pool, so it does NOT raise blocks/SM — measured flat at 2.00. |
+| `setmaxnreg_{probe,occ,design}.cu` | Does `setmaxnreg` execute on sm_120a? | YES, with `__maxnreg__` or `__launch_bounds__(T, minBlocks)`; single-argument `__launch_bounds__(T)` makes ptxas drop it (C7508). `dec` returns registers to a **CTA-local** pool, so it does NOT raise blocks/SM — measured flat at 2.00. |
 | `gemv_transport.cu` | TMA vs `cp.async.cg` vs `__ldg` for decode weight streaming | TMA is **real** (SASS `UTMALDG.2D`/`UBLKCP.S.G`, identical to sm_90a) but the **slowest of 37 configs**. `cp.async.cg` wins. Refuted for 1-D streaming. |
 | `kv_l2.cu` | Does `cudaAccessPolicyWindow` on KV help? | +13-21% on the window, but it fits ~400 tokens of 36-layer KV ⇒ <0.02 ms/tok. Effectively nil. |
 | `warpspec_ab.cu` | Does warp specialization pay on decode GEMV? | NO. Costs +5..+24 regs and 4-33 KB smem, cuts occupancy, never beat uniform except +1.1% on `down` (within noise). |

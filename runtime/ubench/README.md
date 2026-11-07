@@ -9,6 +9,9 @@ Compute Unit (AMD) or Streaming Multiprocessor (NVIDIA), measures hardware
 counters via `rocprof` (or `ncu`), and reports a roofline analysis showing how
 close each kernel is to the theoretical single-unit ceiling.
 
+Per-ISA instruction, memory, sync and ceiling reference for the ops measured here:
+[`docs/bringup/isa/README.md`](../../docs/bringup/isa/README.md).
+
 ## Target Kernels
 
 | Kernel | Family | Bound | Notes |

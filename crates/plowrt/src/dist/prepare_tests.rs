@@ -46,6 +46,7 @@ fn bundle(tokenizer: TokenizerRef, files: Vec<FileRef>) -> Bundle {
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
             files: vec![],
+            views: vec![],
         },
         objset: Some(BundleObjset {
             objset_id: "o".into(),
@@ -56,6 +57,7 @@ fn bundle(tokenizer: TokenizerRef, files: Vec<FileRef>) -> Bundle {
         pairing_hash: None,
         runtime_env: BTreeMap::new(),
         recipe: None,
+        executor: None,
     }
 }
 
@@ -381,4 +383,113 @@ fn second_variant_on_the_farm(hub: bool) {
     for p in [store, snap, blobs, first, second] {
         let _ = std::fs::remove_dir_all(p);
     }
+}
+
+/// The serve contract reads more of the snapshot than shards and tokenizer: a chat template,
+/// a feature extractor's config. The farm is the whole repository.
+#[test]
+fn the_farm_holds_every_snapshot_file() {
+    let store = tmp("store-all");
+    let snap = snapshot(
+        "snap-all",
+        1,
+        &[
+            "tokenizer.json",
+            "chat_template.json",
+            "preprocessor_config.json",
+            "merges.txt",
+        ],
+    );
+    std::fs::write(snap.join(".gitattributes"), b"").unwrap();
+    let bdir = tmp("bundle-all");
+    let mut b = bundle(from_checkpoint(), vec![packet_file()]);
+    b.checkpoint.shards = 1;
+    let farm = build(&store, &b, &bdir, &snap).unwrap();
+    for f in [
+        "chat_template.json",
+        "preprocessor_config.json",
+        "merges.txt",
+    ] {
+        assert!(farm.dir.join(f).is_file(), "{f}");
+    }
+    assert!(!farm.dir.join(".gitattributes").exists());
+}
+
+/// A bundle whose packets bound prep-built checkpoints reaches each as `<dir>/checkpoint`,
+/// rebuilt byte for byte, and never writes into the immutable view.
+#[cfg(feature = "dist")]
+#[test]
+fn a_bundle_with_views_reaches_each_rebuilt_checkpoint() {
+    use super::super::view;
+    let write_st = view::tests::write_st;
+    let snap = tmp("snap-view");
+    write_st(
+        &snap.join("model.safetensors"),
+        &[("hf.a", b"AAAAAAAA"), ("hf.b", b"BBBB")],
+    );
+    std::fs::write(snap.join("tokenizer.json"), b"{\"tok\":1}").unwrap();
+    let lm = tmp("prep-lm");
+    write_st(
+        &lm.join("model.safetensors"),
+        &[("a", b"AAAAAAAA"), ("d", b"derived")],
+    );
+    std::fs::write(lm.join("tokenizer.json"), b"{\"tok\":1}").unwrap();
+    let enc = tmp("prep-enc");
+    write_st(&enc.join("model.safetensors"), &[("b", b"BBBB")]);
+    std::fs::write(enc.join("config.json"), b"{\"enc\":1}").unwrap();
+
+    let views = [
+        view::compute("checkpoint", &lm, &snap).unwrap(),
+        view::compute("text_encoder/checkpoint", &enc, &snap).unwrap(),
+    ];
+    let store_root = tmp("store-view");
+    let store = super::super::Store::open(&store_root).unwrap();
+    let scratch = tmp("blobs-view");
+    for (v, prep) in views.iter().zip([&lm, &enc]) {
+        for (d, _) in view::blobs(v) {
+            let out = scratch.join(&d);
+            view::write_blob(v, prep, &d, &out).unwrap();
+            store
+                .put(
+                    &super::super::Digest::parse(&d).unwrap(),
+                    &std::fs::read(&out).unwrap(),
+                )
+                .unwrap();
+        }
+    }
+    let mut b = bundle(from_checkpoint(), vec![packet_file()]);
+    b.target.vendor = "nvidia".into();
+    b.checkpoint.source = "hf:org/repo".into();
+    b.checkpoint.views = views.to_vec();
+    let bdir = tmp("bundle-view");
+    build(&store_root, &b, &bdir, &snap).unwrap();
+    for (dir, prep) in [("checkpoint", &lm), ("text_encoder/checkpoint", &enc)] {
+        for f in ["model.safetensors", "tokenizer.json", "config.json"] {
+            let want = prep.join(f);
+            if want.exists() {
+                assert_eq!(
+                    std::fs::read(bdir.join(dir).join(f)).unwrap(),
+                    std::fs::read(&want).unwrap(),
+                    "{dir}/{f}"
+                );
+            }
+        }
+    }
+    assert!(
+        bdir.join("tokenizer.json").is_file(),
+        "the runtime reads it from the bundle"
+    );
+    let names = |d: &Path| {
+        let mut n: Vec<_> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        n.sort();
+        n
+    };
+    assert_eq!(
+        names(&bdir.join("checkpoint")),
+        ["model.safetensors", "tokenizer.json"],
+        "the view holds exactly what prep wrote"
+    );
 }

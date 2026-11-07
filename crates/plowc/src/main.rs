@@ -133,9 +133,10 @@ struct Cli {
     ///     streams + manifest, run on the CPU reference interpreter /
     ///     simulator;
     ///   * `devblob+cubin` — as `devblob`, then BUILD the interpreter object
-    ///     from the manifest it just wrote. Opt-in, and only this form needs a
-    ///     CUDA toolkit: `devblob` alone still requires none, so the shipped
-    ///     binaries keep working against prebuilt assets.
+    ///     from the manifest it just wrote (`.cubin`, or `<out>/hsaco/*.elf` for
+    ///     gfx942/gfx1201). Opt-in, and only this form needs a GPU toolkit:
+    ///     `devblob` alone still requires none, so the shipped binaries keep
+    ///     working against prebuilt assets.
     #[arg(long, value_enum)]
     emit: Option<EmitKind>,
 
@@ -2101,11 +2102,6 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // unset, or an unpartitioned GPU such as consumer Blackwell) ⇒ byte-identical blob. The
     // physical-SM dispatch that consumes this is a runtime/interp feature —
     // see the design notes.
-    //
-    // WAS `PLOW_NV_PLACE`, still accepted. The concept is vendor-neutral — an L2 domain is a GPC
-    // on NVIDIA and an XCD on AMD — and the NVIDIA-specific name was reading as "this is an
-    // NVIDIA feature" for something `hwspec` describes on both vendors. The old spelling stays
-    // live so in-flight scripts and recipes do not break.
     let l2_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
     let l2_off = |k: &str| std::env::var(k).ok().as_deref() == Some("0");
     // DEFAULT ON FOR gfx942/gfx950. Per-XCD queues are the shipped CDNA decode/prefill path,
@@ -2117,7 +2113,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Both shipping AMD object recipes carry the checked dispatch marker. Other architectures
     // remain explicit opt-in until their physical-domain mapping is measured.
     let l2_default = matches!(cli.arch.as_str(), "gfx942" | "gfx950") && !l2_off("PLOW_L2_PLACE");
-    let l2_layout = if l2_default || l2_on("PLOW_L2_PLACE") || l2_on("PLOW_NV_PLACE") {
+    let l2_layout = if l2_default || l2_on("PLOW_L2_PLACE") {
         hwspec::registry::lookup(&cli.gpu)
             .and_then(|s| s.l2_partitioning.as_ref())
             // WHICH WORKGROUP LANDS ON WHICH DOMAIN IS VENDOR-SPECIFIC, and getting it from the
@@ -2412,6 +2408,9 @@ fn build_cubin_from_manifest(
     speech: bool,
     t3: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if arch.starts_with("gfx") {
+        return build_hsaco_from_packet(pkt, arch);
+    }
     let mpath = pkt.with_file_name("build.json");
     let man: serde_json::Value = serde_json::from_slice(
         &std::fs::read(&mpath)
@@ -2443,8 +2442,7 @@ fn build_cubin_from_manifest(
     }
 
     // The manifest is arch-agnostic on purpose; picking the backend is this
-    // function's job. hipcc → .hsaco (runtime/amd/) is the same shape and is
-    // deliberately left for a follow-up.
+    // function's job (hipcc → .hsaco is `build_hsaco_from_packet`).
     let flags = man
         .get("backends")
         .and_then(|b| b.get("nvcc"))
@@ -2597,6 +2595,65 @@ fn build_cubin_from_manifest(
     Ok(())
 }
 
+/// `--emit devblob+cubin` on an AMD arch: `scripts/build_gfx942.sh` in its `PLOW_HSACO_CONFIG`
+/// mode, which stamps every row with the packet hash and derives the object set (decode batch,
+/// tiers, opt-in arms) from the packet's `plow_config.h`. Writes `<assets>/hsaco`, where
+/// `plowrt serve` looks by default.
+fn build_hsaco_from_packet(pkt: &Path, arch: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let script = hsaco_build_script(arch)?;
+    let config = pkt.with_file_name("plow_config.h");
+    if !config.is_file() {
+        return Err(format!(
+            "--emit devblob+cubin: packet config {} was not emitted",
+            config.display()
+        )
+        .into());
+    }
+    // Absolute: the script changes into its output directory before reading either.
+    let config = std::fs::canonicalize(&config)?;
+    if std::env::var_os("PLOW_HIPCC").is_none() {
+        return Err(format!(
+            "--emit devblob+cubin --arch {arch} needs the ROCm toolchain from `nix develop` \
+             (PLOW_HIPCC is unset). The packet and {} were written successfully; build the \
+             objects with scripts/{script}, or use --emit devblob.",
+            config.display()
+        )
+        .into());
+    }
+    let root = repo_runtime_dir()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or("--emit devblob+cubin: runtime/ has no parent directory")?;
+    let out = config.with_file_name("hsaco");
+    let status = std::process::Command::new("bash")
+        .arg(root.join("scripts").join(script))
+        .arg(&out)
+        .env("PLOW_HIP_ARCH", arch)
+        .env("PLOW_HSACO_CONFIG", &config)
+        .status()?;
+    if !status.success() {
+        return Err(format!("scripts/{script} failed ({status})").into());
+    }
+    info!(out = %out.display(), "interpreter objects built");
+    Ok(())
+}
+
+fn hsaco_build_script(arch: &str) -> Result<&'static str, String> {
+    match arch {
+        "gfx942" | "gfx1201" => Ok("build_gfx942.sh"),
+        // build_gfx950.sh's config mode does not derive the decode batch from the packet, so
+        // an emitted object could be narrower than the packet and refused at load.
+        "gfx950" => Err("--emit devblob+cubin: gfx950 objects are built by \
+             scripts/build_gfx950.sh with the packet's decode batch set explicitly; \
+             use --emit devblob and run it."
+            .into()),
+        _ => Err(format!(
+            "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
+             supported AMD architectures are gfx942 and gfx1201."
+        )),
+    }
+}
+
 fn effective_uniseg(
     arch: &str,
     cpu: bool,
@@ -2655,10 +2712,6 @@ fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
         _ if devgen::target_is_cpu(arch, "") => Err(format!(
             "--emit devblob+cubin: --arch {arch} is a CPU target; the CPU engine needs no \
              interpreter object, use --emit devblob."
-        )),
-        _ if !arch.starts_with("sm_") => Err(format!(
-            "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
-             need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
         )),
         _ => Err(format!(
             "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
@@ -3877,9 +3930,14 @@ mod cli_tests {
         assert!(cubin_arch_option("sm_100a")
             .unwrap_err()
             .contains("no served interpreter"));
-        assert!(cubin_arch_option("gfx950")
+        assert_eq!(hsaco_build_script("gfx942").unwrap(), "build_gfx942.sh");
+        assert_eq!(hsaco_build_script("gfx1201").unwrap(), "build_gfx942.sh");
+        assert!(hsaco_build_script("gfx950")
             .unwrap_err()
-            .contains("hipcc/.hsaco"));
+            .contains("build_gfx950.sh"));
+        assert!(hsaco_build_script("gfx90a")
+            .unwrap_err()
+            .contains("no served interpreter"));
     }
 
     #[test]

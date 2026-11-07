@@ -49,6 +49,12 @@ pub enum Shard {
     Column,
     /// Input-dim split: `in/N` contiguous elements out of every row.
     Row,
+    /// Gemma's fused routed experts `[E, 2I, …]` (gate rows `[0, I)`, up rows `[I, 2I)`): per
+    /// expert, this rank's intermediate range of the gate half then the same range of the up
+    /// half. Also the per-channel scale `[E, 2I]`.
+    ExpertGateUp,
+    /// Gemma's fused routed down `[E, H, I]`: this rank's intermediate range of every row.
+    ExpertDown,
 }
 
 /// Classify a checkpoint tensor by name.
@@ -203,6 +209,14 @@ pub fn shard_of(name: &str) -> Shard {
         "dt_bias",
         "o_gate_proj.weight",
     ];
+    // Gemma-4's fused routed experts carry no `.weight` suffix and are 3-D, so neither generic
+    // table reaches them; the emitter's declared size still decides whether they slice.
+    if name.ends_with("experts.gate_up_proj") || name.ends_with("experts.gate_up_proj_scale") {
+        return Shard::ExpertGateUp;
+    }
+    if name.ends_with("experts.down_proj") {
+        return Shard::ExpertDown;
+    }
     if K3_REPLICATED.iter().any(|s| name.contains(s)) {
         return Shard::Replicated;
     }
@@ -410,7 +424,11 @@ pub fn slice_for_as<'a>(
     // width from the same `tp.local()` call, "declared whole" and "computed whole"
     // cannot come apart.
     let shard = match shard {
-        Shard::Column | Shard::Row if want != 0 && full == want => Shard::Replicated,
+        Shard::Column | Shard::Row | Shard::ExpertGateUp | Shard::ExpertDown
+            if want != 0 && full == want =>
+        {
+            Shard::Replicated
+        }
         s => s,
     };
 
@@ -485,12 +503,164 @@ pub fn slice_for_as<'a>(
             }
             Ok(Cow::Owned(buf))
         }
+
+        Shard::ExpertGateUp => {
+            let (e, two_i) = match shape {
+                [e, two_i, ..] => (*e as u64, *two_i as u64),
+                _ => return Err(bad(format!("fused gate/up with shape {shape:?}"))),
+            };
+            if e == 0 || two_i == 0 || two_i % (2 * tp as u64) != 0 || full % (e * two_i) != 0 {
+                return Err(bad(format!(
+                    "fused gate/up {shape:?} does not split into {tp} intermediate slices"
+                )));
+            }
+            let row = full / (e * two_i);
+            let (i, i_sh) = (two_i / 2, two_i / 2 / tp as u64);
+            if e * 2 * i_sh * row != want {
+                return Err(bad(format!(
+                    "fused gate/up slice is {} B but the blob declares {want} B",
+                    e * 2 * i_sh * row
+                )));
+            }
+            let mut buf = Vec::with_capacity(want as usize);
+            for x in 0..e {
+                for half in 0..2 {
+                    let r0 = x * two_i + half * i + rank as u64 * i_sh;
+                    buf.extend_from_slice(&src[(r0 * row) as usize..((r0 + i_sh) * row) as usize]);
+                }
+            }
+            Ok(Cow::Owned(buf))
+        }
+
+        Shard::ExpertDown => {
+            let in_full = *shape.last().unwrap_or(&0) as u64;
+            let rows: u64 = shape[..shape.len().saturating_sub(1)]
+                .iter()
+                .map(|&d| d as u64)
+                .product();
+            if shape.len() < 2
+                || rows == 0
+                || in_full == 0
+                || in_full % tp as u64 != 0
+                || full % (rows * in_full) != 0
+            {
+                return Err(bad(format!(
+                    "fused down {shape:?} does not split into {tp} intermediate slices"
+                )));
+            }
+            let esz = full / (rows * in_full);
+            let in_sh = in_full / tp as u64;
+            if rows * in_sh * esz != want {
+                return Err(bad(format!(
+                    "fused down slice is {} B but the blob declares {want} B",
+                    rows * in_sh * esz
+                )));
+            }
+            let (row_src, row_dst) = ((in_full * esz) as usize, (in_sh * esz) as usize);
+            let skip = (rank as u64 * in_sh * esz) as usize;
+            let mut buf = vec![0u8; want as usize];
+            for r in 0..rows as usize {
+                let s = r * row_src + skip;
+                buf[r * row_dst..(r + 1) * row_dst].copy_from_slice(&src[s..s + row_dst]);
+            }
+            Ok(Cow::Owned(buf))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_channel_scales_follow_each_rank_weight_rows() {
+        let (experts, intermediate, hidden) = (3usize, 8usize, 2usize);
+        let rows = experts * 2 * intermediate;
+        let weights: Vec<u8> = (0..rows).flat_map(|row| [row as u8; 2]).collect();
+        let scales: Vec<u8> = (0..rows)
+            .flat_map(|row| (row as f32).to_le_bytes())
+            .collect();
+        let scale_name = "fp8/m.experts.gate_up_proj_scale";
+        for tp in [1u32, 2, 4] {
+            for rank in 0..tp {
+                let weight = slice_for(
+                    "fp8/m.experts.gate_up_proj",
+                    &weights,
+                    &[experts, 2 * intermediate, hidden],
+                    (weights.len() / tp as usize) as u64,
+                    rank,
+                    tp,
+                )
+                .unwrap();
+                let scale = slice_for(
+                    scale_name,
+                    &scales,
+                    &[experts, 2 * intermediate],
+                    (scales.len() / tp as usize) as u64,
+                    rank,
+                    tp,
+                )
+                .unwrap();
+                for (row, channel) in weight.chunks_exact(hidden).zip(scale.chunks_exact(4)) {
+                    assert_eq!(
+                        f32::from_le_bytes(channel.try_into().unwrap()),
+                        row[0] as f32
+                    );
+                }
+            }
+        }
+        assert!(slice_for(
+            scale_name,
+            &scales,
+            &[rows],
+            (scales.len() / 2) as u64,
+            0,
+            2
+        )
+        .is_err());
+        assert_eq!(
+            &*slice_for(scale_name, &scales, &[rows], scales.len() as u64, 0, 1).unwrap(),
+            &scales
+        );
+    }
+
+    /// Rank r of a fused `[E, 2I, H]` gate/up keeps, per expert, gate rows then up rows of its
+    /// intermediate range; the fused down `[E, H, I]` keeps that range of every row.
+    #[test]
+    fn fused_experts_slice_the_intermediate() {
+        let (e, i, h, tp) = (2usize, 4usize, 3usize, 2u32);
+        let gu: Vec<u8> = (0..e * 2 * i * h).map(|x| x as u8).collect();
+        let name = "model.layers.0.experts.gate_up_proj";
+        assert_eq!(shard_of(name), Shard::ExpertGateUp);
+        let want = (gu.len() / tp as usize) as u64;
+        let r1 = slice_for(name, &gu, &[e, 2 * i, h], want, 1, tp).unwrap();
+        let row = |x: usize, r: usize| &gu[(x * 2 * i + r) * h..(x * 2 * i + r + 1) * h];
+        let expect: Vec<u8> = (0..e)
+            .flat_map(|x| [2, 3, i + 2, i + 3].map(|r| row(x, r).to_vec()))
+            .flatten()
+            .collect();
+        assert_eq!(&*r1, &expect[..]);
+
+        let dn: Vec<u8> = (0..e * h * i).map(|x| x as u8).collect();
+        let name = "model.layers.0.experts.down_proj";
+        assert_eq!(shard_of(name), Shard::ExpertDown);
+        let want = (dn.len() / tp as usize) as u64;
+        let r0 = slice_for(name, &dn, &[e, h, i], want, 0, tp).unwrap();
+        let expect: Vec<u8> = dn.chunks(i).flat_map(|r| r[..i / 2].to_vec()).collect();
+        assert_eq!(&*r0, &expect[..]);
+
+        // Declared whole (tp=1 emit): bound whole.
+        assert_eq!(
+            slice_for(name, &dn, &[e, h, i], dn.len() as u64, 0, tp)
+                .unwrap()
+                .len(),
+            dn.len()
+        );
+        assert_eq!(
+            shard_of("model.layers.0.experts.down_proj_scale"),
+            Shard::Replicated
+        );
+    }
 
     /// An unclassified name binds whole unless the packet declares its axis; a declared axis
     /// still slices only when the declared size is a 1/tp share.

@@ -30,7 +30,7 @@
 //! a few tens of nanoseconds, nothing against a multi-millisecond token step.
 
 use std::ffi::{c_char, c_void};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -40,6 +40,7 @@ use crate::device::{Backend, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg
 use crate::{DeviceErrorInfo, Result, RuntimeError};
 
 pub(crate) mod aot;
+pub(crate) mod ipc;
 pub(crate) mod lt;
 pub use lt::library as cublaslt_library;
 pub(crate) mod qwen_gdn;
@@ -288,6 +289,8 @@ driver_api! {
     cuMemAddressReserve: fn(*mut CUdeviceptr, usize, usize, CUdeviceptr, u64) -> CUresult,
     cuMemAddressFree: fn(CUdeviceptr, usize) -> CUresult,
     cuMemCreate: fn(*mut u64, usize, *const CUmemAllocationProp, u64) -> CUresult,
+    cuMemExportToShareableHandle: fn(*mut c_void, u64, i32, u64) -> CUresult,
+    cuMemImportFromShareableHandle: fn(*mut u64, *mut c_void, i32) -> CUresult,
     cuMemRelease: fn(u64) -> CUresult,
     cuMemMap: fn(CUdeviceptr, usize, usize, u64, u64) -> CUresult,
     cuMemUnmap: fn(CUdeviceptr, usize) -> CUresult,
@@ -299,6 +302,7 @@ driver_api! {
     cuStreamCreate: fn(*mut CUstream, u32) -> CUresult,
     cuStreamDestroy_v2: fn(CUstream) -> CUresult,
     cuStreamSynchronize: fn(CUstream) -> CUresult,
+    cuStreamWriteValue32: fn(CUstream, CUdeviceptr, u32, u32) -> CUresult,
     cuMemcpyHtoDAsync_v2: fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
     cuMemcpyDtoHAsync_v2: fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
     cuMemcpyDtoDAsync_v2: fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
@@ -653,6 +657,269 @@ enum CopyDir {
     Restore,
 }
 
+fn record_copy_event<E>(
+    event: E,
+    fence: u64,
+    events: &mut FxHashMap<u64, E>,
+    spare: &mut Vec<E>,
+    failed: &mut rustc_hash::FxHashSet<u64>,
+    record: impl FnOnce(&E) -> Result<()>,
+    drain: impl FnOnce() -> Result<()>,
+    what: &str,
+) -> Result<u64> {
+    if let Err(error) = record(&event) {
+        if drain().is_ok() {
+            spare.push(event);
+            return Err(error);
+        }
+        tracing::error!(error = %error, what, "copy submitted without a fence");
+        failed.insert(fence);
+    }
+    events.insert(fence, event);
+    Ok(fence)
+}
+
+#[cfg(target_os = "linux")]
+fn submit_copy_batch(
+    count: usize,
+    mut enqueue: impl FnMut(usize) -> CUresult,
+    record: impl FnOnce() -> Result<u64>,
+    check: impl FnOnce(CUresult) -> Result<()>,
+) -> (Result<()>, Result<u64>) {
+    let mut status = 0;
+    for i in 0..count {
+        status = enqueue(i);
+        if status != 0 {
+            break;
+        }
+    }
+    // A failed enqueue may report an earlier asynchronous error. Fence even the first
+    // failure, before `check` can poison the context and prevent recording or draining.
+    let fence = record();
+    (check(status), fence)
+}
+
+#[cfg(target_os = "linux")]
+fn staging_copy_rect(
+    copy: super::ImageCopy,
+    export: bool,
+    max_pitch: usize,
+) -> Option<CUDA_MEMCPY3D> {
+    if copy.rows < 2 || copy.pitch > max_pitch || copy.bytes > max_pitch as u64 {
+        return None;
+    }
+    let host = CUDA_MEMCPY3D {
+        src_memory_type: 2,
+        src_device: copy.device,
+        src_pitch: copy.pitch,
+        dst_memory_type: 1,
+        dst_host: copy.host as *mut c_void,
+        dst_pitch: copy.bytes as usize,
+        width_in_bytes: copy.bytes as usize,
+        height: copy.rows as usize,
+        depth: 1,
+        ..Default::default()
+    };
+    Some(if export {
+        host
+    } else {
+        CUDA_MEMCPY3D {
+            src_memory_type: 1,
+            src_host: copy.host as *const c_void,
+            src_pitch: copy.bytes as usize,
+            dst_memory_type: 2,
+            dst_device: copy.device,
+            dst_pitch: copy.pitch,
+            width_in_bytes: host.width_in_bytes,
+            height: host.height,
+            depth: 1,
+            ..Default::default()
+        }
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod staging_batch_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    struct Event(Rc<Cell<usize>>);
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn image_rectangles_preserve_every_span_in_both_directions() {
+        let regular: Vec<_> = (0..56)
+            .flat_map(|plane| {
+                (0..8).map(move |head| {
+                    (
+                        0x1000 + (plane * 8 + head) * 256000,
+                        0x10000000 + plane * 8 * 2097152 + head * 2097152,
+                        256000,
+                    )
+                })
+            })
+            .collect();
+        let copies = crate::device::image_copy_rects(&regular);
+        // Separate planes use different allocations in production; this contiguous fixture
+        // can merge them all and still must expand to exactly the original addresses.
+        for export in [false, true] {
+            let mut expanded = Vec::new();
+            for &copy in &copies {
+                let rect = staging_copy_rect(copy, export, 2097152).unwrap();
+                assert_eq!((rect.width_in_bytes, rect.depth), (256000, 1));
+                assert_eq!(
+                    (rect.src_x_in_bytes, rect.src_y, rect.src_z, rect.src_lod),
+                    (0, 0, 0, 0)
+                );
+                assert_eq!(
+                    (rect.dst_x_in_bytes, rect.dst_y, rect.dst_z, rect.dst_lod),
+                    (0, 0, 0, 0)
+                );
+                assert!(rect.src_array.is_null() && rect.dst_array.is_null());
+                assert!(rect.reserved0.is_null() && rect.reserved1.is_null());
+                let (host, device, host_pitch, device_pitch) = if export {
+                    assert_eq!((rect.src_memory_type, rect.dst_memory_type), (2, 1));
+                    (
+                        rect.dst_host as u64,
+                        rect.src_device,
+                        rect.dst_pitch,
+                        rect.src_pitch,
+                    )
+                } else {
+                    assert_eq!((rect.src_memory_type, rect.dst_memory_type), (1, 2));
+                    (
+                        rect.src_host as u64,
+                        rect.dst_device,
+                        rect.src_pitch,
+                        rect.dst_pitch,
+                    )
+                };
+                for row in 0..rect.height as u64 {
+                    expanded.push((
+                        host + host_pitch as u64 * row,
+                        device + device_pitch as u64 * row,
+                        rect.width_in_bytes as u64,
+                    ));
+                }
+                assert!(staging_copy_rect(copy, export, 2097151).is_none());
+                assert!(staging_copy_rect(copy, export, 0).is_none());
+                let host_too_wide = crate::device::ImageCopy {
+                    bytes: 2097153,
+                    ..copy
+                };
+                assert!(staging_copy_rect(host_too_wide, export, 2097152).is_none());
+            }
+            assert_eq!(expanded, regular);
+            assert!(staging_copy_rect(
+                crate::device::ImageCopy::linear((8, 16, 4)),
+                export,
+                usize::MAX
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn image_rect_descriptor_matches_cuda_header_abi() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<CUDA_MEMCPY3D>(), 200);
+        assert_eq!(align_of::<CUDA_MEMCPY3D>(), 8);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, src_memory_type), 32);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, src_host), 40);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, src_device), 48);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, src_pitch), 72);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, dst_memory_type), 120);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, dst_host), 128);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, dst_device), 136);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, dst_pitch), 160);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, width_in_bytes), 176);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, height), 184);
+        assert_eq!(offset_of!(CUDA_MEMCPY3D, depth), 192);
+    }
+
+    #[test]
+    fn partial_batches_fence_before_checking_errors_and_retain_unretired_events() {
+        for failure in [None, Some(0), Some(1), Some(2)] {
+            for outcome in 0..3 {
+                let trace = RefCell::new(Vec::new());
+                let drops = Rc::new(Cell::new(0));
+                let mut events = FxHashMap::default();
+                let mut spare = Vec::new();
+                let mut failed = rustc_hash::FxHashSet::default();
+                let error = || RuntimeError::Device("injected".into());
+                let (queued, fence) = submit_copy_batch(
+                    3,
+                    |i| {
+                        trace.borrow_mut().push(i);
+                        if failure == Some(i) {
+                            1
+                        } else {
+                            0
+                        }
+                    },
+                    || {
+                        record_copy_event(
+                            Event(Rc::clone(&drops)),
+                            7,
+                            &mut events,
+                            &mut spare,
+                            &mut failed,
+                            |_| {
+                                trace.borrow_mut().push(3);
+                                if outcome == 0 {
+                                    Ok(())
+                                } else {
+                                    Err(error())
+                                }
+                            },
+                            || {
+                                trace.borrow_mut().push(4);
+                                if outcome == 1 {
+                                    Ok(())
+                                } else {
+                                    Err(error())
+                                }
+                            },
+                            "test",
+                        )
+                    },
+                    |rc| {
+                        trace.borrow_mut().push(5);
+                        if rc == 0 {
+                            Ok(())
+                        } else {
+                            Err(error())
+                        }
+                    },
+                );
+                assert_eq!(queued.is_err(), failure.is_some());
+                let mut expected: Vec<usize> = (0..failure.map_or(3, |i| i + 1)).collect();
+                expected.push(3);
+                if outcome != 0 {
+                    expected.push(4);
+                }
+                expected.push(5);
+                assert_eq!(*trace.borrow(), expected);
+                assert_eq!(drops.get(), 0);
+                assert_eq!(fence.is_err(), outcome == 1);
+                assert_eq!(fence.ok(), if outcome == 1 { None } else { Some(7) });
+                assert_eq!(events.contains_key(&7), outcome != 1);
+                assert_eq!(spare.len(), usize::from(outcome == 1));
+                assert_eq!(failed.contains(&7), outcome == 2);
+                drop(events);
+                drop(spare);
+                assert_eq!(drops.get(), 1);
+            }
+        }
+    }
+}
+
 /// `cuTensorMapEncodeTiled` (CUDA 12.0+): out map (128 B, 128-aligned), dtype, rank,
 /// globalAddress, globalDim[rank], globalStrides[rank-1] (bytes), boxDim[rank],
 /// elementStrides[rank], interleave, swizzle, l2Promotion, oobFill.
@@ -676,6 +943,7 @@ type ParamInfoFn = unsafe extern "C" fn(CUfunction, usize, *mut usize, *mut usiz
 
 pub struct CudaBackend {
     api: Arc<Api>,
+    ipc_failed_drain: AtomicBool,
     /// See the resolve site in [`CudaBackend::open`] — `None` on pre-12.0 drivers.
     tmap_encode: Option<TmapEncodeFn>,
     param_info: Option<ParamInfoFn>,
@@ -692,6 +960,8 @@ pub struct CudaBackend {
     name: String,
     sm_count: u32,
     warp_size: u32,
+    #[cfg(target_os = "linux")]
+    max_copy_pitch: usize,
     compute_capability: (u32, u32),
     smem_optin: u32,
     /// Hardware-coherent pageable access (attr 100) — see
@@ -711,6 +981,8 @@ pub struct CudaBackend {
     slab_pool: Mutex<Vec<(u64, u64)>>,
     /// Snapshot spill copies ([`CopyTier`]); `None` until the first spill.
     copy_tier: Mutex<Option<CopyTier>>,
+    #[cfg(target_os = "linux")]
+    stage_fences: super::host_region::StageFences,
     /// `plow_small_copy`: engine copies up to [`SMALL_COPY_MAX`] bytes between device and pinned
     /// host memory run on the SMs, never queued behind bulk copies on a copy engine.
     small_copy: Option<KernelFn>,
@@ -730,6 +1002,60 @@ pub struct CudaBackend {
 // process-global driver objects, and every entry point re-binds the context.
 unsafe impl Send for CudaBackend {}
 unsafe impl Sync for CudaBackend {}
+
+/// libcuda dlopens its PTX JIT by SONAME, and a nix-glibc process does not consult the host ld
+/// cache, so on a non-NixOS host that lookup misses: every PTX load fails with
+/// CUDA_ERROR_JIT_COMPILER_NOT_FOUND and (measured, 2x RTX PRO 6000, driver 595.99) the next
+/// device's `cuDevicePrimaryCtxRetain` then returns CUDA_ERROR_UNKNOWN. Loading the JIT once from
+/// libcuda's own directory, before any context, makes the driver's SONAME lookup find it loaded.
+fn preload_ptx_jit(cuda: &libloading::Library) {
+    static JIT: std::sync::OnceLock<Option<libloading::Library>> = std::sync::OnceLock::new();
+    JIT.get_or_init(|| {
+        // SAFETY: only the symbol's address is used, for dladdr; the function is never called.
+        let Ok(addr) = (unsafe { cuda.get::<*const c_void>(b"cuInit\0") }) else {
+            tracing::warn!("no cuInit symbol: PTX JIT not preloaded");
+            return None;
+        };
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // SAFETY: dladdr writes `info` and returns 0 when the address is in no loaded object.
+        if unsafe { libc::dladdr(*addr, &mut info) } == 0 || info.dli_fname.is_null() {
+            tracing::warn!("dladdr(cuInit) failed: PTX JIT not preloaded");
+            return None;
+        }
+        // SAFETY: dli_fname is a NUL-terminated path owned by the loader.
+        let so = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+        let so = std::path::Path::new(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(so.to_bytes()),
+        );
+        let Some(dir) = so.parent().filter(|d| !d.as_os_str().is_empty()) else {
+            tracing::warn!(libcuda = %so.display(), "no libcuda directory: PTX JIT not preloaded");
+            return None;
+        };
+        const JIT_SO: &str = "libnvidia-ptxjitcompiler.so.1";
+        let mut jit = dir.join(JIT_SO);
+        // A libcuda symlink into another directory (alternatives, a vendor tree) keeps its
+        // companions beside the target.
+        if !jit.exists() {
+            if let Some(d) = std::fs::canonicalize(so)
+                .ok()
+                .and_then(|c| c.parent().map(|d| d.join(JIT_SO)))
+            {
+                jit = d;
+            }
+        }
+        // SAFETY: the driver's own companion library; its constructors are the driver's.
+        match unsafe { libloading::Library::new(&jit) } {
+            Ok(l) => {
+                tracing::debug!(path = %jit.display(), "preloaded PTX JIT");
+                Some(l)
+            }
+            Err(e) => {
+                tracing::warn!(path = %jit.display(), error = %e, "PTX JIT not preloaded");
+                None
+            }
+        }
+    });
+}
 
 impl CudaBackend {
     /// PCI address of this device, when the driver reports it.
@@ -793,6 +1119,7 @@ impl CudaBackend {
             }
         }
         let lib = lib.ok_or_else(|| RuntimeError::Device(format!("dlopen libcuda: {last_err}")))?;
+        preload_ptx_jit(&lib);
         tracing::debug!("resolving CUDA driver API symbols...");
         // Resolved OPTIONALLY, outside driver_api!: cuTensorMapEncodeTiled is CUDA 12.0+,
         // and an eager resolve would make plowrt refuse to open ANY device on an older
@@ -885,6 +1212,11 @@ impl CudaBackend {
             };
             let sm_count = attr(ATTR_MULTIPROCESSOR_COUNT, "attr sm_count")? as u32;
             let warp_size = attr(ATTR_WARP_SIZE, "attr warp_size")? as u32;
+            #[cfg(target_os = "linux")]
+            let max_copy_pitch = attr(11, "attr max pitch")
+                .ok()
+                .filter(|&v| v > 0)
+                .unwrap_or(0) as usize;
             let cc_major = attr(ATTR_COMPUTE_CAPABILITY_MAJOR, "attr cc major")? as u32;
             let cc_minor = attr(ATTR_COMPUTE_CAPABILITY_MINOR, "attr cc minor")? as u32;
             let compute_capability = (cc_major, cc_minor);
@@ -935,6 +1267,7 @@ impl CudaBackend {
             });
             let mut be = CudaBackend {
                 api,
+                ipc_failed_drain: AtomicBool::new(false),
                 tmap_encode,
                 param_info,
                 ctx: ctx as usize,
@@ -945,6 +1278,8 @@ impl CudaBackend {
                 name,
                 sm_count,
                 warp_size,
+                #[cfg(target_os = "linux")]
+                max_copy_pitch,
                 compute_capability,
                 smem_optin,
                 coherent_host_dma,
@@ -954,6 +1289,8 @@ impl CudaBackend {
                 next_module: AtomicU64::new(1),
                 slab_pool: Mutex::new(Vec::new()),
                 copy_tier: Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                stage_fences: Default::default(),
                 vmm_provenance: Mutex::new(super::provenance::VmmProvenance::default()),
                 poisoned,
                 small_copy: None,
@@ -1353,6 +1690,13 @@ impl CudaBackend {
     /// Has a fatal driver status permanently poisoned this context?
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.get().is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn quarantine_staging(&self, error: &RuntimeError) -> RuntimeError {
+        let info = super::host_region::unretired_copy(error);
+        self.mark_poisoned(&info);
+        RuntimeError::DeviceFault { info }
     }
 
     /// Record the fault that killed the context. Logs `error!` exactly once —
@@ -2053,6 +2397,7 @@ impl CudaBackend {
         let _shared = (CAPTURING.get() != Arc::as_ptr(lock) as usize).then(|| lock.read());
         // SAFETY: no arguments.
         self.check(unsafe { (self.api.cuCtxSynchronize)() }, "cuCtxSynchronize")
+            .inspect_err(|_| self.ipc_failed_drain.store(true, Ordering::Relaxed))
     }
 
     /// One ordered execution stream (`CU_STREAM_NON_BLOCKING`) — the engine's
@@ -2080,6 +2425,7 @@ impl CudaBackend {
             unsafe { (self.api.cuStreamSynchronize)(stream.raw as CUstream) },
             "cuStreamSynchronize",
         )
+        .inspect_err(|_| self.ipc_failed_drain.store(true, Ordering::Relaxed))
     }
 
     /// Async H2D on `stream`.
@@ -2454,6 +2800,198 @@ impl CudaBackend {
 /// The VMM driver surface as `crate::memory::vmm` consumes it. Thin, checked
 /// pass-throughs; every entry re-binds the primary context (threads vary —
 /// the pool's pre-mapper thread calls in from its own thread).
+/// `CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED`: a portable registration from another device's
+/// context already covers the range.
+const HOST_MEMORY_ALREADY_REGISTERED: CUresult = 712;
+
+#[cfg(target_os = "linux")]
+impl super::host_region::HostStaging for CudaBackend {
+    fn staging_vendor(&self) -> hwspec::Vendor {
+        hwspec::Vendor::Nvidia
+    }
+
+    unsafe fn host_register(&self, ptr: *mut u8, len: usize) -> Result<u64> {
+        self.bind()?;
+        // SAFETY: the caller keeps the range mapped until `host_unregister`. PORTABLE makes the
+        // registration valid in every context of the process, so one call covers every device.
+        let rc = unsafe {
+            (self.api.cuMemHostRegister_v2)(
+                ptr as *mut c_void,
+                len,
+                MEMHOSTREGISTER_PORTABLE | MEMHOSTREGISTER_DEVICEMAP,
+            )
+        };
+        let ours = rc != HOST_MEMORY_ALREADY_REGISTERED;
+        if ours {
+            self.check(rc, "cuMemHostRegister(host region)")?;
+        }
+        // The alias is the address kernels dereference. The staging copies take the same value
+        // as their host pointer, so it must equal the host address (unified addressing).
+        let mut dp: CUdeviceptr = 0;
+        // SAFETY: `ptr` is registered above (or by an earlier portable registration).
+        let rc = unsafe { (self.api.cuMemHostGetDevicePointer_v2)(&mut dp, ptr as *mut c_void, 0) };
+        let alias = self
+            .check(rc, "cuMemHostGetDevicePointer(host region)")
+            .and_then(|()| {
+                if dp == ptr as u64 {
+                    Ok(dp)
+                } else {
+                    Err(RuntimeError::Device(
+                        "host region: registered memory is not device-addressable at its host \
+                         address"
+                            .into(),
+                    ))
+                }
+            });
+        if alias.is_err() && ours {
+            // SAFETY: registered by this call; nothing has used it.
+            unsafe { self.host_unregister(ptr) };
+        }
+        alias
+    }
+
+    unsafe fn host_unregister(&self, ptr: *mut u8) {
+        // SAFETY: the caller's contract: registered here, no copy in flight.
+        let rc = unsafe {
+            let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
+            (self.api.cuMemHostUnregister)(ptr as *mut c_void)
+        };
+        if rc != 0 {
+            tracing::warn!(rc, "cuMemHostUnregister(host region) failed");
+        }
+    }
+
+    fn stage_d2h(&self, host: u64, src: u64, bytes: u64) -> Result<u64> {
+        self.stage_fences
+            .submit(|_| crate::memory::vmm::VmmOps::copy_dtoh_async(self, host, src, bytes))
+    }
+
+    fn stage_h2d(&self, dst: u64, host: u64, bytes: u64) -> Result<u64> {
+        self.stage_fences.submit(|_| {
+            self.bind()?;
+            let mut tier = self.copy_tier.lock();
+            let tier = self.copy_tier_mut(&mut tier)?;
+            // Staging uses one ordered stream in both directions.
+            self.copy_fenced(
+                tier,
+                CopyDir::Spill,
+                "cuMemcpyHtoDAsync(staging)",
+                |s| unsafe {
+                    (self.api.cuMemcpyHtoDAsync_v2)(dst, host as *const c_void, bytes as usize, s)
+                },
+            )
+        })
+    }
+
+    fn stage_batch(&self, spans: &[(u64, u64, u64)], export: bool) -> (Option<u64>, Result<()>) {
+        if spans.is_empty() {
+            return (None, Ok(()));
+        }
+        let timing = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+        let copies = super::image_copy_rects(spans);
+        let planned = timing.map(|t| t.elapsed());
+        let mut queued = Ok(());
+        let mut previous = None;
+        let fence = self.stage_fences.submit(|dependency| {
+            previous = dependency;
+            self.bind()?;
+            let mut tier = self.copy_tier.lock();
+            self.bind()?;
+            let tier = self.copy_tier_mut(&mut tier)?;
+            let event = self.take_copy_event(tier)?;
+            let stream = tier.stream.raw as CUstream;
+            let setup = timing.map(|t| t.elapsed());
+            let enqueued = std::cell::Cell::new(None);
+            let (result, fence) = submit_copy_batch(
+                copies.len(),
+                |i| {
+                    let copy = copies[i];
+                    if let Some(rect) = staging_copy_rect(copy, export, self.max_copy_pitch) {
+                        // SAFETY: the descriptor covers exactly the planned live spans;
+                        // their owners remain retained through the batch fence.
+                        unsafe { (self.api.cuMemcpy3DAsync_v2)(&rect, stream) }
+                    } else {
+                        // SAFETY: same registered host/device owners as the pitched route.
+                        // Geometry ineligible for one rectangle stays linear and ordered.
+                        for row in 0..copy.rows {
+                            let host = copy.host + copy.bytes * u64::from(row);
+                            let device = copy.device + copy.pitch as u64 * u64::from(row);
+                            let rc = unsafe {
+                                if export {
+                                    (self.api.cuMemcpyDtoHAsync_v2)(
+                                        host as *mut c_void,
+                                        device,
+                                        copy.bytes as usize,
+                                        stream,
+                                    )
+                                } else {
+                                    (self.api.cuMemcpyHtoDAsync_v2)(
+                                        device,
+                                        host as *const c_void,
+                                        copy.bytes as usize,
+                                        stream,
+                                    )
+                                }
+                            };
+                            if rc != 0 {
+                                return rc;
+                            }
+                        }
+                        0
+                    }
+                },
+                || {
+                    enqueued.set(timing.map(|t| t.elapsed()));
+                    self.finish_copy_fence(tier, CopyDir::Spill, event, "CUDA staging batch")
+                },
+                |rc| self.check(rc, "CUDA staging batch enqueue"),
+            );
+            queued = result;
+            if let (Some(start), Some(planned), Some(setup), Some(enqueued)) =
+                (timing, planned, setup, enqueued.get())
+            {
+                tracing::debug!(
+                    export,
+                    plan_ms = planned.as_secs_f64() * 1e3,
+                    setup_ms = (setup - planned).as_secs_f64() * 1e3,
+                    enqueue_ms = (enqueued - setup).as_secs_f64() * 1e3,
+                    fence_ms = (start.elapsed() - enqueued).as_secs_f64() * 1e3,
+                    "CUDA staging submission phases"
+                );
+            }
+            tracing::debug!(
+                spans = spans.len(),
+                export,
+                events = 1,
+                commands = copies
+                    .iter()
+                    .map(
+                        |&c| if staging_copy_rect(c, export, self.max_copy_pitch).is_some() {
+                            1
+                        } else {
+                            c.rows as usize
+                        }
+                    )
+                    .sum::<usize>(),
+                "CUDA staging batch"
+            );
+            fence
+        });
+        match fence {
+            Ok(fence) => (Some(fence), queued),
+            Err(error) => (previous, queued.and(Err(error))),
+        }
+    }
+
+    fn stage_wait(&self, fence: u64) -> Result<()> {
+        self.stage_fences.wait(
+            fence,
+            |f| crate::memory::vmm::VmmOps::fence_wait(self, f),
+            |f| crate::memory::vmm::VmmOps::fence_done(self, f),
+        )
+    }
+}
+
 impl crate::memory::vmm::VmmOps for CudaBackend {
     fn allocation_provenance(
         &self,
@@ -2886,6 +3424,55 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
 }
 
 impl CudaBackend {
+    /// Page-lock a caller-owned, page-aligned host mapping (shared between processes) and map
+    /// it for device access; returns its device address. Pair with [`Self::host_unregister`].
+    ///
+    /// # Safety
+    /// `p..p+len` must stay mapped until `host_unregister(p)`.
+    pub unsafe fn host_register_shared(&self, p: *mut u8, len: usize) -> Result<u64> {
+        self.bind()?;
+        self.check(
+            unsafe {
+                (self.api.cuMemHostRegister_v2)(
+                    p.cast(),
+                    len,
+                    MEMHOSTREGISTER_PORTABLE | MEMHOSTREGISTER_DEVICEMAP,
+                )
+            },
+            "cuMemHostRegister(rank group)",
+        )?;
+        let mut dp: CUdeviceptr = 0;
+        // SAFETY: `p` is registered above; out-pointer for its device address.
+        let rc = unsafe { (self.api.cuMemHostGetDevicePointer_v2)(&mut dp, p.cast(), 0) };
+        if let Err(e) = self.check(rc, "cuMemHostGetDevicePointer(rank group)") {
+            // SAFETY: registered above, released once.
+            unsafe { (self.api.cuMemHostUnregister)(p.cast()) };
+            return Err(e);
+        }
+        Ok(dp)
+    }
+
+    /// Undo [`Self::host_register_shared`].
+    ///
+    /// # Safety
+    /// `p` was registered by `host_register_shared` and no device work still uses it.
+    pub unsafe fn host_unregister(&self, p: *mut u8) {
+        if self.bind().is_ok() {
+            // SAFETY: per the contract.
+            unsafe { (self.api.cuMemHostUnregister)(p.cast()) };
+        }
+    }
+
+    pub(crate) fn prepare_staging(&self) -> Result<()> {
+        self.bind()?;
+        let mut tier = self.copy_tier.lock();
+        let tier = self.copy_tier_mut(&mut tier)?;
+        if tier.spare.is_empty() {
+            tier.spare.push(self.event_create(false)?);
+        }
+        Ok(())
+    }
+
     fn copy_tier_mut<'a>(&self, tier: &'a mut Option<CopyTier>) -> Result<&'a mut CopyTier> {
         if tier.is_none() {
             *tier = Some(CopyTier {
@@ -2910,33 +3497,47 @@ impl CudaBackend {
         submit: impl FnOnce(CUstream) -> CUresult,
     ) -> Result<u64> {
         let stream = match dir {
-            CopyDir::Spill => &tier.stream,
-            CopyDir::Restore => &tier.htod,
+            CopyDir::Spill => tier.stream.raw,
+            CopyDir::Restore => tier.htod.raw,
         };
         // The event first: once the copy is submitted every failure must still name it.
-        let event = match tier.spare.pop() {
-            Some(e) => e,
-            None => self.event_create(false)?,
-        };
-        if let Err(error) = self.check(submit(stream.raw as CUstream), what) {
+        let event = self.take_copy_event(tier)?;
+        if let Err(error) = self.check(submit(stream as CUstream), what) {
             tier.spare.push(event);
             return Err(error);
         }
-        let fence = event.raw as u64;
-        if let Err(error) = self.event_record(&event, stream) {
-            // Submitted but unfenced: a drained stream proves the copy done (the caller may
-            // free both sides); otherwise the fence reports failure and the pool quarantines.
-            if self.stream_synchronize(stream).is_ok() {
-                tier.spare.push(event);
-                return Err(error);
-            }
-            tracing::error!(error = %error, what, "copy submitted without a fence");
-            tier.events.insert(fence, event);
-            tier.failed.insert(fence);
-            return Ok(fence);
+        self.finish_copy_fence(tier, dir, event, what)
+    }
+
+    fn take_copy_event(&self, tier: &mut CopyTier) -> Result<CudaEvent> {
+        match tier.spare.pop() {
+            Some(event) => Ok(event),
+            None => self.event_create(false),
         }
-        tier.events.insert(fence, event);
-        Ok(fence)
+    }
+
+    fn finish_copy_fence(
+        &self,
+        tier: &mut CopyTier,
+        dir: CopyDir,
+        event: CudaEvent,
+        what: &str,
+    ) -> Result<u64> {
+        let stream = match dir {
+            CopyDir::Spill => &tier.stream,
+            CopyDir::Restore => &tier.htod,
+        };
+        let fence = event.raw as u64;
+        record_copy_event(
+            event,
+            fence,
+            &mut tier.events,
+            &mut tier.spare,
+            &mut tier.failed,
+            |event| self.event_record(event, stream),
+            || self.stream_synchronize(stream),
+            what,
+        )
     }
 
     /// Order `stream` after the copy behind `fence` without blocking the host; the fence stays
