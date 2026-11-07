@@ -84,16 +84,35 @@ impl TensorReader {
     }
 
     pub(crate) fn read(&self, name: &str) -> Result<(&str, Vec<u8>), String> {
+        let entry = self
+            .entries
+            .get(name)
+            .ok_or_else(|| format!("checkpoint has no {name}"))?;
+        self.read_range(name, 0..entry.bytes)
+    }
+
+    pub(crate) fn read_range(
+        &self,
+        name: &str,
+        range: std::ops::Range<usize>,
+    ) -> Result<(&str, Vec<u8>), String> {
         use std::io::{Read, Seek, SeekFrom};
         let entry = self
             .entries
             .get(name)
             .ok_or_else(|| format!("checkpoint has no {name}"))?;
+        if range.start > range.end || range.end > entry.bytes {
+            return Err(format!("{name}: checkpoint read is outside the tensor"));
+        }
+        let offset = entry
+            .offset
+            .checked_add(range.start as u64)
+            .ok_or_else(|| format!("{name}: checkpoint offset overflows"))?;
         let mut file = std::fs::File::open(&entry.path)
             .map_err(|error| format!("{}: {error}", entry.path.display()))?;
-        file.seek(SeekFrom::Start(entry.offset))
+        file.seek(SeekFrom::Start(offset))
             .map_err(|error| format!("{}: {error}", entry.path.display()))?;
-        let mut bytes = vec![0; entry.bytes];
+        let mut bytes = vec![0; range.len()];
         file.read_exact(&mut bytes)
             .map_err(|error| format!("{}: {error}", entry.path.display()))?;
         Ok((&entry.dtype, bytes))

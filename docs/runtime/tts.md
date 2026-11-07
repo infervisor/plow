@@ -56,6 +56,10 @@ The `prompt.conditioning` JSON has version 1 and two distinct bundle-relative pa
 `speaker_packet` and `reference_packet`. `conditioning.text_embeddings` binds the existing BF16
 text table; `conditioning.text_pad` selects the row added to the speaker embedding and rounded
 to BF16 before replacing the entire speaker prompt row. At least one overlay row is required.
+New emits also bind `conditioning.text_pad_row`, an initialized BF16 `[hidden]` constant copied
+from that checkpoint row, so the host can read it while the full table remains external.
+Older packets may use the initialized text table. A declared pad constant must be present,
+initialized and finite; it never falls back to a different source when invalid.
 The dual-stream contract declares no preset voices. Checkpoint preparation records this under
 `plow_frame_embed.conditioning` and reserves one overlay row; it preserves CustomVoice's v1
 metadata and rejects unsupported checkpoint modes.

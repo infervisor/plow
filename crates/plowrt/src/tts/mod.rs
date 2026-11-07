@@ -217,6 +217,7 @@ pub struct CloneContract {
 pub struct ConditioningContract {
     pub packets: plow_asset::dual_stream::SpeakerConditioning,
     pub text_embeddings: plow_asset::packet_pipeline::PipelineTensor,
+    pub text_pad_row: Option<plow_asset::packet_pipeline::PipelineTensor>,
     pub text_pad: usize,
 }
 
@@ -392,6 +393,12 @@ impl SpeechContract {
             let overlay = p.tensors.get("overlay").ok_or_else(bad)?;
             let overlay_index = p.tensors.get("overlay_index").ok_or_else(bad)?;
             let text_pad = usize::try_from(get("conditioning.text_pad")?).map_err(|_| bad())?;
+            let text_pad_row = p.tensors.get("conditioning.text_pad_row");
+            if let Some(row) = text_pad_row {
+                if row.dtype != PipelineDType::Bf16 || row.shape != [get("hidden")?] {
+                    return Err(bad());
+                }
+            }
             let dual = c.dual_stream.as_ref().ok_or_else(bad)?;
             if !c.depth
                 || c.clone.is_some()
@@ -419,6 +426,7 @@ impl SpeechContract {
             c.conditioning = Some(ConditioningContract {
                 packets,
                 text_embeddings: table.clone(),
+                text_pad_row: text_pad_row.cloned(),
                 text_pad,
             });
         }
@@ -1298,6 +1306,29 @@ mod tests {
         let c = SpeechContract::from_pipeline(&p).unwrap();
         assert_eq!(c.conditioning.as_ref().unwrap().text_pad, 2);
         assert!(c.clone.is_none() && c.dual_stream.is_some());
+        let mut with_row = p.clone();
+        with_row.tensors.insert(
+            "conditioning.text_pad_row".into(),
+            plow_asset::packet_pipeline::PipelineTensor {
+                name: "pad".into(),
+                dtype: plow_asset::packet_pipeline::PipelineDType::Bf16,
+                shape: vec![4],
+            },
+        );
+        assert!(SpeechContract::from_pipeline(&with_row).is_ok());
+        with_row
+            .tensors
+            .get_mut("conditioning.text_pad_row")
+            .unwrap()
+            .shape = vec![1, 4];
+        assert!(SpeechContract::from_pipeline(&with_row).is_err());
+        let row = with_row
+            .tensors
+            .get_mut("conditioning.text_pad_row")
+            .unwrap();
+        row.shape = vec![4];
+        row.dtype = plow_asset::packet_pipeline::PipelineDType::F32;
+        assert!(SpeechContract::from_pipeline(&with_row).is_err());
         for (key, value) in [
             ("hidden", 8),
             ("overlay_rows", 0),

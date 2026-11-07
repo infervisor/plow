@@ -72,16 +72,6 @@ impl SpeakerEncoder {
     pub fn text_pad(path: &Path, c: &super::ConditioningContract) -> Result<Vec<f32>, String> {
         let image =
             crate::asset::packet_image::PacketImage::open(path).map_err(|e| e.to_string())?;
-        let table = image
-            .blob
-            .tensors
-            .iter()
-            .find(|t| t.name == c.text_embeddings.name)
-            .ok_or("conditioning text table is missing")?;
-        let range = table
-            .init
-            .as_ref()
-            .ok_or("conditioning text table is not initialized")?;
         let width = usize::try_from(
             *c.text_embeddings
                 .shape
@@ -89,8 +79,28 @@ impl SpeakerEncoder {
                 .ok_or("conditioning table shape is missing")?,
         )
         .map_err(|_| "conditioning width overflows")?;
-        let start = c
-            .text_pad
+        let (name, row) = c
+            .text_pad_row
+            .as_ref()
+            .map_or((c.text_embeddings.name.as_str(), c.text_pad), |r| {
+                (r.name.as_str(), 0)
+            });
+        let tensor = image
+            .blob
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or("conditioning text-pad tensor is missing")?;
+        let range = tensor
+            .init
+            .as_ref()
+            .ok_or("conditioning text-pad tensor is not initialized")?;
+        if c.text_pad_row.is_some()
+            && (tensor.bytes != width as u64 * 2 || range.len() != width * 2)
+        {
+            return Err("conditioning text-pad tensor has the wrong size".into());
+        }
+        let start = row
             .checked_mul(width)
             .and_then(|n| n.checked_mul(2))
             .and_then(|n| range.start.checked_add(n))
@@ -531,6 +541,7 @@ pub(crate) mod tests {
                 dtype: PipelineDType::Bf16,
                 shape: vec![3, 4],
             },
+            text_pad_row: None,
             text_pad: 1,
         };
         let path = dir.join("model.pkt");
@@ -546,7 +557,72 @@ pub(crate) mod tests {
         let uninitialized = dir.join("uninitialized.pkt");
         std::fs::write(&uninitialized, model.to_blob()).unwrap();
         assert!(SpeakerEncoder::text_pad(&uninitialized, &contract).is_err());
+        contract.text_pad_row = Some(PipelineTensor {
+            name: "pad".into(),
+            dtype: PipelineDType::Bf16,
+            shape: vec![4],
+        });
+        model.tensors.push(TensorDecl {
+            name: "pad".into(),
+            bytes: 8,
+            init: Some([0x80, 0x3f, 0, 0x40, 0x40, 0x40, 0x80, 0x40].to_vec()),
+        });
+        std::fs::write(&path, model.to_blob()).unwrap();
+        assert_eq!(
+            SpeakerEncoder::text_pad(&path, &contract).unwrap(),
+            [1., 2., 3., 4.]
+        );
+        model.tensors[1].init = None;
+        std::fs::write(&path, model.to_blob()).unwrap();
+        assert!(SpeakerEncoder::text_pad(&path, &contract).is_err());
+        model.tensors[1].init = Some(vec![0; 10]);
+        model.tensors[1].bytes = 10;
+        std::fs::write(&path, model.to_blob()).unwrap();
+        assert!(SpeakerEncoder::text_pad(&path, &contract).is_err());
+        model.tensors[1].init = Some([0x80, 0x7f, 0, 0, 0, 0, 0, 0].to_vec());
+        model.tensors[1].bytes = 8;
+        std::fs::write(&path, model.to_blob()).unwrap();
+        assert!(SpeakerEncoder::text_pad(&path, &contract).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "SPEECH_BATCH_TEST_ASSETS, CONDITIONING_REFERENCE_JSON; CPU-only emitted packet pad binding"]
+    fn emitted_conditioning_pad_matches_saved_checkpoint_row() {
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let fixture: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("CONDITIONING_REFERENCE_JSON").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let expected = std::fs::read(fixture["pad"].as_str().unwrap()).unwrap();
+        let expected: Vec<_> = expected
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let contract = super::super::SpeechContract::load(&assets)
+            .unwrap()
+            .unwrap();
+        let conditioning = contract.conditioning.as_ref().unwrap();
+        assert!(conditioning.text_pad_row.is_some());
+        let path = assets.join("model.pkt");
+        let image = crate::asset::packet_image::PacketImage::open(&path).unwrap();
+        let table = image
+            .blob
+            .tensors
+            .iter()
+            .find(|t| t.name == conditioning.text_embeddings.name)
+            .unwrap();
+        assert!(
+            table.init.is_none(),
+            "fixture must exercise an external text table"
+        );
+        let actual = SpeakerEncoder::text_pad(&path, conditioning).unwrap();
+        assert_eq!(actual.len(), conditioning.text_embeddings.shape[1] as usize);
+        assert!(!expected.is_empty());
+        assert_eq!(
+            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
