@@ -770,6 +770,8 @@ are checked before submission. Priming owns the slot until successful completion
 cancellation releases it, and invalid step output poisons it. Each step preserves its urgency,
 deadline and retained input buffers. A cloning
 driver must explicitly supply its decoder prefix; existing prompt-only cloning is unchanged.
+Decoder rotary coefficients preserve the source precision through existing packet flags. F32
+coefficients must not be rounded to BF16; a source with BF16 tables retains that rounding.
 
 A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
 A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is

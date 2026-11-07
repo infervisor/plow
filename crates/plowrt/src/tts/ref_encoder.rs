@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "REF_CODEC_CHECKPOINT, REF_CODEC_PACKET, optional REF_CODEC_GPU/REF_CODEC_ROUTE/REF_CODEC_STAGE/REF_CODEC_MAX_ROWS; CPU-only codec emit with approved Lean verifier"]
+    #[ignore = "REF_CODEC_CHECKPOINT, REF_CODEC_PACKET, optional REF_CODEC_GPU/REF_CODEC_ROUTE/REF_CODEC_STAGE/REF_CODEC_MAX_ROWS/REF_CODEC_SPLIT_BF16; CPU-only codec emit with approved Lean verifier"]
     fn emit_trained_reference_codec() {
         install_sidecar_verifier();
         let dir = std::env::var("REF_CODEC_CHECKPOINT").unwrap();
@@ -541,7 +541,13 @@ mod tests {
                 Path::new(&dir),
                 132,
                 target,
-                false,
+                std::env::var("REF_CODEC_SPLIT_BF16")
+                    .map(|v| match v.as_str() {
+                        "0" => false,
+                        "1" => true,
+                        _ => panic!("REF_CODEC_SPLIT_BF16 must be 0 or 1"),
+                    })
+                    .unwrap_or(false),
                 std::env::var("REF_CODEC_MAX_ROWS")
                     .ok()
                     .map(|v| v.parse().unwrap()),
@@ -634,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "REF_CODEC_PACKET, REF_CODEC_CONTROL_PACKET, REF_CODEC_RESULT_JSON, optional REF_CODEC_ORIGINAL_PACKET; CPU-only arithmetic variant audit"]
+    #[ignore = "REF_CODEC_PACKET, REF_CODEC_CONTROL_PACKET, REF_CODEC_RESULT_JSON, optional REF_CODEC_ORIGINAL_PACKET/REF_CODEC_AUDIT_ROUTE; CPU-only arithmetic variant audit"]
     fn codec_arithmetic_variant_preserves_weights_and_geometry() {
         use crate::asset::packet_image::PacketImage;
         let control_path =
@@ -642,6 +648,8 @@ mod tests {
         let candidate_path = std::path::PathBuf::from(std::env::var("REF_CODEC_PACKET").unwrap());
         let control = PacketImage::open(&control_path).unwrap();
         let candidate = PacketImage::open(&candidate_path).unwrap();
+        let route = std::env::var("REF_CODEC_AUDIT_ROUTE").unwrap_or_else(|_| "fp32_tiles".into());
+        assert!(matches!(route.as_str(), "fp32_tiles" | "fp32_rope"));
         let (a, b) = (&control.blob, &candidate.blob);
         assert_eq!((a.n_cu, a.flags, a.target), (b.n_cu, b.flags, b.target));
         assert!(
@@ -658,6 +666,7 @@ mod tests {
         );
         assert_eq!(a.progs.len(), b.progs.len());
         let mut changed = 0;
+        let mut rotary_changed = 0;
         for (a, b) in a.progs.iter().zip(&b.progs) {
             assert_eq!((a.t, a.role, a.n_counter), (b.t, b.role, b.n_counter));
             assert!(
@@ -672,16 +681,22 @@ mod tests {
             assert_eq!(a.insts.len(), b.insts.len());
             for (a, b) in a.insts.iter().zip(&b.insts) {
                 let mut normalized = *b;
-                if matches!(a.op, x if x == packet::dev::DevOp::Conv1dF32 as u16 || x == packet::dev::DevOp::ConvTranspose1dF32 as u16)
+                if route == "fp32_tiles"
+                    && matches!(a.op, x if x == packet::dev::DevOp::Conv1dF32 as u16 || x == packet::dev::DevOp::ConvTranspose1dF32 as u16)
                 {
                     assert_eq!(b.fj[2], a.fj[2] & !((1 << 13) | (1 << 16)));
                     changed += usize::from(a.fj[2] != b.fj[2]);
                     normalized.fj[2] = a.fj[2];
                 }
+                if route == "fp32_rope" && a.op == packet::dev::DevOp::RopeAxialF32 as u16 {
+                    assert_eq!((a.i[6], b.i[6]), (2, 0));
+                    rotary_changed += 1;
+                    normalized.i[6] = a.i[6];
+                }
                 assert_eq!(*a, normalized);
             }
         }
-        assert!(changed > 0);
+        assert!(changed + rotary_changed > 0);
         let mut original_weights = None;
         let mut layouts = Vec::new();
         if let Ok(path) = std::env::var("REF_CODEC_ORIGINAL_PACKET") {
@@ -766,6 +781,7 @@ mod tests {
         std::fs::write(std::env::var("REF_CODEC_RESULT_JSON").unwrap(), serde_json::to_vec_pretty(&serde_json::json!({
             "initializer_bytes_exact":b.init.len(),"tensors_exact":b.tensors.len(),"programs":b.progs.len(),
             "only_convolution_math_and_row_arm_flags_changed":changed,"geometry_and_schedule_exact":true,
+            "rotary_precision_flags_changed":rotary_changed,"audit_route":route,
             "original_logical_weight_bits_exact":original_weights,"layout_normalizations":layouts,"benchmark_run":false})).unwrap()).unwrap();
     }
 

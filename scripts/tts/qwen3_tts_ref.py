@@ -17,6 +17,8 @@ package's own `generate` with the same settings and records whether its codes eq
 3072 logits before suppression and penalty.
 --prepared-predictor --dtype fp32 takes a prepared checkpoint and packet predictor capture JSON;
 it writes conditional FP32 logits and comparison diagnostics without loading the audio model.
+--decoder-reference --dtype fp32 takes a tokenizer snapshot and saved encoder-reference JSON;
+--decoder-result PATH (repeatable) compares captured priming PCM against the official decoder.
 """
 import argparse
 import json
@@ -126,6 +128,146 @@ def prepared_predictor_reference(a):
                   torch=torch.__version__, device=a.device)
     (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(records), flush=True)
+
+
+def load_reference_decoder(path, device):
+    import inspect
+    config = json.loads((Path(path) / "config.json").read_text())
+    if config["model_type"] == "qwen3_tts_tokenizer_12hz":
+        import importlib.util
+        import sys
+        package = importlib.util.find_spec("qwen_tts")
+        # Import the installed 12 Hz namespace without the unrelated 25 Hz audio dependencies.
+        sys.path.insert(0, str(Path(next(iter(package.submodule_search_locations))) / "core"))
+        from tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Model
+        model, loading = Qwen3TTSTokenizerV2Model.from_pretrained(
+            path, dtype=torch.float32, attn_implementation="eager", local_files_only=True,
+            output_loading_info=True)
+        assert not any(loading.values()), f"incomplete reference weights: {loading}"
+        model = model.to(device).eval()
+        meta = dict(frame_codes=config["encoder_valid_num_quantizers"],
+                    frame_samples=config["decode_upsample_rate"], sample_rate=config["output_sample_rate"])
+        d = config["decoder_config"]
+        assert meta["frame_codes"] == d["num_quantizers"]
+        meta["codebook_sizes"] = ([d["semantic_codebook_size"]] * d["num_semantic_quantizers"]
+                                  + [d["codebook_size"]] * (d["num_quantizers"] - d["num_semantic_quantizers"]))
+
+        def decode(codes):
+            values = model.decode(audio_codes=torch.from_numpy(codes)[None].to(device),
+                                  return_dict=True).audio_values[0]
+            return values.float().cpu().numpy()
+    elif config["model_type"] == "mimi":
+        from transformers import MimiModel
+        model, loading = MimiModel.from_pretrained(
+            path, dtype=torch.float32, attn_implementation="eager", local_files_only=True,
+            output_loading_info=True)
+        assert not any(loading.values()), f"incomplete reference weights: {loading}"
+        model = model.to(device).eval()
+        model.config.use_cache = model.decoder_transformer.config.use_cache = False
+        meta = dict(frame_codes=model.config.num_quantizers,
+                    frame_samples=round(config["sampling_rate"] / config["frame_rate"]),
+                    sample_rate=config["sampling_rate"])
+        meta["codebook_sizes"] = [config["codebook_size"]] * meta["frame_codes"]
+
+        def decode(codes):
+            values = model.decode(audio_codes=torch.from_numpy(codes.T.copy())[None].to(device),
+                                  return_dict=True).audio_values[0, 0]
+            return values.float().cpu().numpy()
+    else:
+        raise ValueError(f"unsupported reference tokenizer: {config['model_type']}")
+    meta["source_files"] = [inspect.getfile(type(model)), inspect.getfile(type(model.config))]
+    return decode, meta
+
+
+@torch.inference_mode()
+def decoder_reference(a):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "llm"))
+    from fp32_ref_gate import file_sha
+
+    torch.set_num_threads(4)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    torch.use_deterministic_algorithms(True)
+    reference = json.loads(Path(a.texts).read_text())
+    assert {"config.json", "model.safetensors"} <= reference["source_sha256"].keys()
+    inputs = [Path(a.texts), Path(__file__), Path(file_sha.__code__.co_filename)]
+    for name, expected in reference["source_sha256"].items():
+        path = Path(a.model) / name
+        assert file_sha(path) == expected, f"changed tokenizer source: {path}"
+        inputs.append(path)
+    decode, meta = load_reference_decoder(a.model, a.device)
+    for name in ("frame_codes", "frame_samples", "sample_rate"):
+        assert meta[name] == reference[name], f"decoder {name} differs from saved reference"
+    inputs.extend(Path(p) for p in meta["source_files"])
+    sources = {c["case"]: c for c in reference["cases"]}
+    assert len(sources) == len(reference["cases"])
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=False)
+    decoded, records = {}, []
+    for result_path in map(Path, a.decoder_result):
+        native = json.loads(result_path.read_text())
+        assert native["whole_relative_l2_limit"] == 1e-5
+        assert native["checks"], "empty decoder capture"
+        pcm_path = result_path.with_suffix(".f32")
+        assert pcm_path.stat().st_size % 4 == 0
+        pcm = np.fromfile(pcm_path, dtype="<f4")
+        inputs.extend([result_path, pcm_path])
+        offset, checks = 0, []
+        for item in native["checks"]:
+            source, prefix, fresh = item["source"], item["reference_frames"], item["fresh_frames"]
+            case = sources[source]
+            assert prefix >= 0 and fresh > 0 and prefix + fresh <= case["frames"]
+            count = fresh * meta["frame_samples"]
+            assert item["samples"] == count and item["output_offset_f32"] == offset
+            assert offset + 3 * count <= pcm.size, "truncated native PCM"
+            key = (source, prefix + fresh)
+            if key not in decoded:
+                codes_path = Path(case["codes"])
+                assert codes_path.stat().st_size == case["frames"] * meta["frame_codes"] * 4
+                codes = np.fromfile(codes_path, dtype="<u4").reshape(case["frames"], meta["frame_codes"])
+                codes = codes[:prefix + fresh].astype(np.int64)
+                assert np.all(codes < np.asarray(meta["codebook_sizes"])[None]), "invalid reference code"
+                whole = np.asarray(decode(codes), dtype=np.float32)
+                assert whole.shape == ((prefix + fresh) * meta["frame_samples"],)
+                assert np.isfinite(whole).all(), "nonfinite official decoder output"
+                assert np.array_equal(whole, decode(codes)), "nonrepeatable official decoder output"
+                path = out / f"reference-{len(decoded)}.f32"
+                whole.astype("<f4").tofile(path)
+                decoded[key] = (whole, path)
+                inputs.append(codes_path)
+            whole, path = decoded[key]
+            expected = whole[prefix * meta["frame_samples"]:].astype(np.float64)
+            metrics = {}
+            for name in ("whole", "stateful", "primed"):
+                actual = pcm[offset:offset + count].astype(np.float64)
+                finite = bool(np.isfinite(actual).all())
+                error = actual - expected
+                relative = float(np.linalg.norm(error) / max(np.linalg.norm(expected), 1e-30)) if finite else None
+                metrics[name] = dict(finite=finite, relative_l2=relative,
+                                     max_abs=float(np.abs(error).max()) if finite else None,
+                                     passed=finite and relative < native["whole_relative_l2_limit"])
+                offset += count
+            checks.append(dict(width=item["width"], item=item["item"], source=source,
+                               reference_frames=prefix, fresh_frames=fresh, reference_pcm=str(path),
+                               metrics=metrics, passed=all(m["passed"] for m in metrics.values())))
+        assert offset == pcm.size, "unexpected trailing native PCM"
+        records.append(dict(capture=str(result_path), internal_gate_pass=native["pass"], checks=checks,
+                            independent_reference_pass=all(c["passed"] for c in checks)))
+    assert records, "no native decoder captures"
+    import transformers
+    report = dict(scope="saved codes through official FP32 decoder vs captured whole/stateful/primed PCM",
+                  pass_all=all(r["internal_gate_pass"] and r["independent_reference_pass"] for r in records),
+                  relative_l2_limit=1e-5, reference_repeat_exact=True,
+                  full_model_qualified=False, timings_scored=False,
+                  torch=torch.__version__, transformers=transformers.__version__, device=a.device,
+                  decoder=meta, captures=records,
+                  hashes={str(p): file_sha(p) for p in sorted(set(inputs))})
+    (out / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    print(json.dumps(dict(pass_all=report["pass_all"], decoded_inputs=len(decoded),
+                         captures=len(records), report=str(out / "report.json"))), flush=True)
+    return report
 
 
 def onset_ms(pcm):
@@ -258,7 +400,19 @@ def main():
     ap.add_argument("--force", default=None)
     ap.add_argument("--prepared-predictor", action="store_true",
                     help="FP32 conditional predictor: MODEL=prepared checkpoint, TEXTS=packet predictor capture")
+    ap.add_argument("--decoder-reference", action="store_true",
+                    help="official FP32 decoder: MODEL=tokenizer snapshot, TEXTS=saved codec-reference JSON")
+    ap.add_argument("--decoder-result", action="append", default=[],
+                    help="captured priming result JSON with whole/stateful/primed PCM; repeatable")
     a = ap.parse_args()
+    if a.decoder_reference:
+        if a.prepared_predictor or a.dtype != "fp32" or not a.decoder_result:
+            ap.error("--decoder-reference requires --dtype fp32 and --decoder-result, without --prepared-predictor")
+        if not decoder_reference(a)["pass_all"]:
+            raise SystemExit(1)
+        return
+    if a.decoder_result:
+        ap.error("--decoder-result requires --decoder-reference")
     if a.prepared_predictor:
         if a.dtype != "fp32":
             ap.error("--prepared-predictor requires --dtype fp32")
