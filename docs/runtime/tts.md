@@ -41,6 +41,9 @@ With a packed depth contract, live VMM uses bounded engine-local identities for 
 content keys, outside the packet's input-token vocabulary. Identities are never recycled while
 cache entries can refer to them; exhaustion declines caching. Prompt lookup, boundary storage
 and publication use the same identities. Generated frame rows are not published as token prefixes.
+This protocol also permits VMM prefix caching for packets with encoder-overlay rows.
+Those packets require staged row identities for attachment and publication; token IDs alone
+cannot name their cached overlays. Other overlay packets retain their cache exclusion.
 Short-context live KV may instead commit whole private slots. Those slots can retain a prefix
 within the existing released-memory cap. A residency generation invalidates keys and staged
 resumes after reclamation or reassignment; idle lanes write beyond the retained prefix. Sliding

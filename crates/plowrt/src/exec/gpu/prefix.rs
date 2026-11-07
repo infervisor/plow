@@ -315,13 +315,13 @@ impl GpuEngine {
         capability: (u32, u32),
         granularity: u64,
         row_interleaved: Option<bool>,
+        keyed_overlays: bool,
     ) -> Option<VmmPrefixLayout> {
         let declined = |reason: &str| {
             tracing::info!(reason, "VMM prefix cache declined");
             None
         };
-        // Overlay rows (audio, voice conditioning) are not keyed by the prompt ids.
-        if blob.tensors.iter().any(|t| t.name == "in.encoder_overlay") {
+        if !keyed_overlays && blob.tensors.iter().any(|t| t.name == "in.encoder_overlay") {
             return declined("encoder overlay rows are not keyed by the prompt ids");
         }
         let requested = config.nv_vmm_prefix();
@@ -777,6 +777,9 @@ impl GpuEngine {
         prompt: &[u32],
         key: Option<crate::memory::vmm::PrefixKey>,
     ) -> Result<()> {
+        if self.prefix_needs_row_keys && self.speech_prefix[b].is_none() {
+            return Ok(());
+        }
         let staged = self.staged_prefix[b].take();
         let Some((_, kv)) = self.vmm_prefix() else {
             return Ok(());
@@ -952,6 +955,9 @@ impl GpuEngine {
         p_a: u32,
         kind: crate::memory::vmm::Kind,
     ) -> bool {
+        if self.prefix_needs_row_keys && self.speech_prefix[b].is_none() {
+            return false;
+        }
         if self.publish_off[b] {
             return false;
         }
