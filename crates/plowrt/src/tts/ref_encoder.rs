@@ -527,25 +527,46 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "REF_CODEC_CHECKPOINT, REF_CODEC_PACKET, optional REF_CODEC_GPU/REF_CODEC_ROUTE; CPU-only codec emit with approved Lean verifier"]
+    #[ignore = "REF_CODEC_CHECKPOINT, REF_CODEC_PACKET, optional REF_CODEC_GPU/REF_CODEC_ROUTE/REF_CODEC_STAGE/REF_CODEC_MAX_ROWS; CPU-only codec emit with approved Lean verifier"]
     fn emit_trained_reference_codec() {
         install_sidecar_verifier();
         let dir = std::env::var("REF_CODEC_CHECKPOINT").unwrap();
         let out = std::path::PathBuf::from(std::env::var("REF_CODEC_PACKET").unwrap());
         let gpu = std::env::var("REF_CODEC_GPU").unwrap_or_else(|_| "H100 SXM5".into());
-        let (mut model, section) = devgen::mimi_encoder::lower_mimi_encoder(
-            Path::new(&dir),
-            132,
-            packet::devbuild::gpu_fingerprint(&gpu),
-        )
+        let stage = std::env::var("REF_CODEC_STAGE").unwrap_or_else(|_| "encoder".into());
+        let target = packet::devbuild::gpu_fingerprint(&gpu);
+        let (mut model, section) = match stage.as_str() {
+            "encoder" => devgen::mimi_encoder::lower_mimi_encoder(Path::new(&dir), 132, target),
+            "decoder" => devgen::fish_codec::lower_fish_dac(
+                Path::new(&dir),
+                132,
+                target,
+                false,
+                std::env::var("REF_CODEC_MAX_ROWS")
+                    .ok()
+                    .map(|v| v.parse().unwrap()),
+            ),
+            _ => panic!("unsupported codec stage {stage}"),
+        }
         .unwrap();
         let route = std::env::var("REF_CODEC_ROUTE").unwrap_or_else(|_| "emitted".into());
         assert!(matches!(
             route.as_str(),
-            "emitted" | "fp32_rvq" | "fp32_projection" | "fp32_classifier"
+            "emitted" | "fp32_rvq" | "fp32_projection" | "fp32_classifier" | "fp32_tiles"
         ));
         for p in &mut model.progs {
             for d in &mut p.insts {
+                if route == "fp32_tiles"
+                    && matches!(d.op,
+                    x if x == packet::dev::DevOp::Conv1dF32 as u16 || x == packet::dev::DevOp::ConvTranspose1dF32 as u16)
+                {
+                    assert_eq!(
+                        d.j[1] & ((1 << 12) | (1 << 14) | (1 << 17) | (1 << 18) | (1 << 20)),
+                        0,
+                        "FP32 tile identification requires unsplit FP32 storage"
+                    );
+                    d.j[1] &= !((1 << 13) | (1 << 16));
+                }
                 if d.op != packet::dev::DevOp::Conv1dF32 as u16 {
                     continue;
                 }
@@ -566,12 +587,21 @@ mod tests {
             devgen::manifest::speech_ops(&model)
         );
         let mut plans = Vec::new();
-        let weight = model
-            .tensors
-            .iter()
-            .position(|t| t.name == "w.down.w")
-            .unwrap() as u32;
+        let weight = (stage == "encoder").then(|| {
+            model
+                .tensors
+                .iter()
+                .position(|t| t.name == "w.down.w")
+                .unwrap() as u32
+        });
         for (program, p) in model.progs.iter().enumerate() {
+            let Some(weight) = weight else {
+                plans.push(
+                    serde_json::json!({"program":program,"frames":model.prog_t[program],
+                    "route":route,"stage":stage}),
+                );
+                continue;
+            };
             let down = p
                 .insts
                 .iter()
@@ -601,6 +631,142 @@ mod tests {
             "all {} codec programs have approved receipts",
             model.progs.len()
         );
+    }
+
+    #[test]
+    #[ignore = "REF_CODEC_PACKET, REF_CODEC_CONTROL_PACKET, REF_CODEC_RESULT_JSON, optional REF_CODEC_ORIGINAL_PACKET; CPU-only arithmetic variant audit"]
+    fn codec_arithmetic_variant_preserves_weights_and_geometry() {
+        use crate::asset::packet_image::PacketImage;
+        let control_path =
+            std::path::PathBuf::from(std::env::var("REF_CODEC_CONTROL_PACKET").unwrap());
+        let candidate_path = std::path::PathBuf::from(std::env::var("REF_CODEC_PACKET").unwrap());
+        let control = PacketImage::open(&control_path).unwrap();
+        let candidate = PacketImage::open(&candidate_path).unwrap();
+        let (a, b) = (&control.blob, &candidate.blob);
+        assert_eq!((a.n_cu, a.flags, a.target), (b.n_cu, b.flags, b.target));
+        assert!(
+            a.init == b.init,
+            "arithmetic variant changed initializer data"
+        );
+        assert_eq!(a.tensors.len(), b.tensors.len());
+        for (a, b) in a.tensors.iter().zip(&b.tensors) {
+            assert_eq!((&a.name, a.bytes, &a.init), (&b.name, b.bytes, &b.init));
+        }
+        assert_eq!(
+            PacketAsset::load(&control_path).unwrap().pipelines(),
+            PacketAsset::load(&candidate_path).unwrap().pipelines()
+        );
+        assert_eq!(a.progs.len(), b.progs.len());
+        let mut changed = 0;
+        for (a, b) in a.progs.iter().zip(&b.progs) {
+            assert_eq!((a.t, a.role, a.n_counter), (b.t, b.role, b.n_counter));
+            assert!(
+                a.stream == b.stream
+                    && a.stream_ofs == b.stream_ofs
+                    && a.stream_len == b.stream_len
+                    && a.waits == b.waits
+                    && a.succs == b.succs
+                    && a.gq_stream == b.gq_stream,
+                "arithmetic variant changed schedule"
+            );
+            assert_eq!(a.insts.len(), b.insts.len());
+            for (a, b) in a.insts.iter().zip(&b.insts) {
+                let mut normalized = *b;
+                if matches!(a.op, x if x == packet::dev::DevOp::Conv1dF32 as u16 || x == packet::dev::DevOp::ConvTranspose1dF32 as u16)
+                {
+                    assert_eq!(b.fj[2], a.fj[2] & !((1 << 13) | (1 << 16)));
+                    changed += usize::from(a.fj[2] != b.fj[2]);
+                    normalized.fj[2] = a.fj[2];
+                }
+                assert_eq!(*a, normalized);
+            }
+        }
+        assert!(changed > 0);
+        let mut original_weights = None;
+        let mut layouts = Vec::new();
+        if let Ok(path) = std::env::var("REF_CODEC_ORIGINAL_PACKET") {
+            let original = PacketImage::open(Path::new(&path)).unwrap();
+            let mut count = 0;
+            for (index, tensor) in b
+                .tensors
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.name.starts_with("w."))
+            {
+                let data = &b.init[tensor.init.clone().unwrap()];
+                let old = original
+                    .blob
+                    .tensors
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| t.name == tensor.name);
+                if let Some((old_index, old)) = old {
+                    let old_data = &original.blob.init[old.init.clone().unwrap()];
+                    assert!(old_data.len() >= data.len());
+                    let old_data = &old_data[..data.len()];
+                    if old_data != data {
+                        let conv = |op| op == packet::dev::DevOp::Conv1dF32 as u16;
+                        let old_inst = original
+                            .blob
+                            .progs
+                            .iter()
+                            .flat_map(|p| &p.insts)
+                            .find(|d| conv(d.op) && usize::from(d.t[2]) == old_index)
+                            .unwrap();
+                        let new_inst = b
+                            .progs
+                            .iter()
+                            .flat_map(|p| &p.insts)
+                            .find(|d| conv(d.op) && usize::from(d.t[2]) == index)
+                            .unwrap();
+                        assert_eq!(
+                            (old_inst.i[2], old_inst.i[3], old_inst.i[4], old_inst.i[7]),
+                            (new_inst.i[2], new_inst.i[3], new_inst.i[4], new_inst.i[7])
+                        );
+                        assert_ne!(old_inst.fj[2] & (1 << 15), new_inst.fj[2] & (1 << 15));
+                        let old_taps = old_inst.fj[2] & (1 << 15) != 0;
+                        let (channels, outputs, kernel, groups) =
+                            (new_inst.i[2], new_inst.i[3], new_inst.i[4], new_inst.i[7]);
+                        let normalized = devgen::s3gen::to_tap_major(
+                            if old_taps { data } else { old_data },
+                            outputs,
+                            channels / groups,
+                            kernel,
+                        );
+                        assert!(
+                            normalized == if old_taps { old_data } else { data },
+                            "logical weight bits changed: {}",
+                            tensor.name
+                        );
+                        layouts.push(serde_json::json!({"tensor":tensor.name,"normalization":"declared tap-major permutation"}));
+                    }
+                } else {
+                    let unit = tensor.name.strip_suffix(".a12").unwrap();
+                    let mut combined = Vec::new();
+                    for suffix in ["a1", "a2"] {
+                        let old = original
+                            .blob
+                            .tensors
+                            .iter()
+                            .find(|t| t.name == format!("{unit}.{suffix}"))
+                            .unwrap();
+                        combined.extend_from_slice(&original.blob.init[old.init.clone().unwrap()]);
+                    }
+                    assert!(
+                        combined == data,
+                        "combined alpha bits changed: {}",
+                        tensor.name
+                    );
+                    layouts.push(serde_json::json!({"tensor":tensor.name,"normalization":"concatenated input/output alpha vectors"}));
+                }
+                count += 1;
+            }
+            original_weights = Some(count);
+        }
+        std::fs::write(std::env::var("REF_CODEC_RESULT_JSON").unwrap(), serde_json::to_vec_pretty(&serde_json::json!({
+            "initializer_bytes_exact":b.init.len(),"tensors_exact":b.tensors.len(),"programs":b.progs.len(),
+            "only_convolution_math_and_row_arm_flags_changed":changed,"geometry_and_schedule_exact":true,
+            "original_logical_weight_bits_exact":original_weights,"layout_normalizations":layouts,"benchmark_run":false})).unwrap()).unwrap();
     }
 
     #[test]

@@ -764,6 +764,13 @@ Only v3 requires `input.reflect_pad`; older drivers reject it. The binding extra
 packet-defined frontend, batches valid feature rows and their length, and rejects nonfinite
 embeddings. This binding alone does not enable a live cloning endpoint or qualify performance.
 
+Stateful codec priming consumes reference codes on a fresh stream slot in bounded steps and
+discards their PCM. The next step continues at the first new frame. Code shape and slot state
+are checked before submission. Priming owns the slot until successful completion; failure or
+cancellation releases it, and invalid step output poisons it. Each step preserves its urgency,
+deadline and retained input buffers. A cloning
+driver must explicitly supply its decoder prefix; existing prompt-only cloning is unchanged.
+
 A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
 A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is
 cond + w (cond - uncond); a model trained with `cfg_scale` s of uncond + s (cond - uncond) takes

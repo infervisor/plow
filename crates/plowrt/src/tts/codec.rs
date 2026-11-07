@@ -660,6 +660,51 @@ impl Codec {
         Ok(pcm)
     }
 
+    /// Consume a reference prefix without emitting its audio; failure or cancellation releases the slot.
+    pub(crate) async fn prime_codes(
+        &self,
+        mut slot: StreamSlot,
+        codes: Codes,
+        frames: usize,
+        urgency: Urgency,
+        due: Option<std::time::Instant>,
+    ) -> Result<StreamSlot, String> {
+        if self.step_frames == 0 || slot.pos != 0 {
+            return Err("codec priming requires a fresh stateful slot".into());
+        }
+        if frames.checked_mul(self.frame_codes) != Some(codes.len()) {
+            return Err("codec reference prefix has incomplete frames".into());
+        }
+        let pool = self
+            .slots
+            .as_ref()
+            .ok_or("codec has no stateful slot pool")?;
+        pool.lock().check(slot.id, 0).map_err(str::to_owned)?;
+        let mut start = 0;
+        while start < frames {
+            let n = (frames - start).min(self.step_frames);
+            let chunk = codes.slice(
+                start * self.frame_codes..(start + n) * self.frame_codes,
+                self.frame_codes,
+            );
+            let pcm = match self.step_codes(&mut slot, chunk, n, urgency, due).await {
+                Ok(pcm) => pcm,
+                Err(e) => {
+                    pool.lock().fail(slot.id);
+                    return Err(e);
+                }
+            };
+            if n.checked_mul(self.frame_samples) != Some(pcm.len())
+                || pcm.iter().any(|v| !v.is_finite())
+            {
+                pool.lock().fail(slot.id);
+                return Err("codec returned invalid reference-prefix PCM".into());
+            }
+            start += n;
+        }
+        Ok(slot)
+    }
+
     /// Split each launch into segments of `render.yield_programs` programs (a CFM step) and call
     /// `hook` between them, so a co-scheduler can hand the device to another model mid-render.
     /// `None` restores one launch per decode.
@@ -1865,6 +1910,381 @@ fn hold_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued_codec() -> (Codec, mpsc::Receiver<Msg>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Codec {
+                tx: Mutex::new(tx),
+                yield_hook: Default::default(),
+                credit: None,
+                max_batch: 2,
+                max_frames: 8,
+                min_frames: 1,
+                frame_codes: 2,
+                frame_samples: 3,
+                window: 0,
+                lookahead: 0,
+                voices: Vec::new(),
+                max_window: 0,
+                window_capacities: Vec::new(),
+                parameters: Default::default(),
+                step_frames: 2,
+                prompt_max: 0,
+                slots: Some(std::sync::Arc::new(Mutex::new(SlotPool::new(2)))),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn reference_priming_preserves_chunks_positions_sources_and_deadlines() {
+        let (codec, rx) = queued_codec();
+        let slot = codec.acquire_slot().unwrap();
+        let due = Some(std::time::Instant::now());
+        let values: Vec<i32> = (0..10).collect();
+        let source =
+            crate::exec::packet_runtime::PacketBuffer::from(bytemuck::cast_slice(&values).to_vec());
+        let mut prefix = Codes::from(values);
+        prefix.sources = (0..5)
+            .map(|n| Some(source.slice(n * 8..(n + 1) * 8).unwrap()))
+            .collect();
+        drop(source);
+        let worker = std::thread::spawn(move || {
+            for (start, n) in [(0, 2), (2, 2), (4, 1)] {
+                let Msg::Job(j) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+                else {
+                    panic!("expected priming job")
+                };
+                assert_eq!(j.step.unwrap().pos, start);
+                assert_eq!(j.frames, n);
+                assert_eq!((j.urgency, j.due), (Urgency::First, due));
+                assert_eq!(
+                    j.codes.host,
+                    (start as i32 * 2..(start + n) as i32 * 2).collect::<Vec<_>>()
+                );
+                assert_eq!(j.codes.sources.len(), n);
+                for (frame, source) in j.codes.sources.iter().enumerate() {
+                    let mut values = [0i32; 2];
+                    source
+                        .as_ref()
+                        .unwrap()
+                        .read(bytemuck::cast_slice_mut(&mut values))
+                        .unwrap();
+                    assert_eq!(values, j.codes[frame * 2..frame * 2 + 2]);
+                }
+                assert!(j
+                    .reply
+                    .send(Ok(Decoded {
+                        pcm: vec![0.; n * 3],
+                        phase: Vec::new()
+                    }))
+                    .is_ok());
+            }
+            rx
+        });
+        let slot =
+            futures::executor::block_on(codec.prime_codes(slot, prefix, 5, Urgency::First, due))
+                .unwrap();
+        assert_eq!(slot.pos, 5);
+        let rx = worker.join().unwrap();
+        assert!(rx.try_recv().is_err());
+        drop(slot);
+        assert!(matches!(rx.try_recv().unwrap(), Msg::Release(_)));
+    }
+
+    #[test]
+    fn reference_priming_rejects_invalid_inputs_before_submission() {
+        for case in 0..6 {
+            let (mut codec, rx) = queued_codec();
+            let mut slot = codec.acquire_slot().unwrap();
+            let id = slot.id;
+            let (codes, frames) = match case {
+                0 => (vec![1, 2, 3], 2),
+                1 => (vec![], usize::MAX),
+                2 => {
+                    slot.pos = 1;
+                    (vec![1, 2], 1)
+                }
+                3 => {
+                    codec.step_frames = 0;
+                    (vec![1, 2], 1)
+                }
+                4 => {
+                    codec.slots.as_ref().unwrap().lock().fail(id);
+                    (vec![], 0)
+                }
+                _ => {
+                    codec.slots.as_ref().unwrap().lock().release(id);
+                    (vec![], 0)
+                }
+            };
+            assert!(futures::executor::block_on(codec.prime_codes(
+                slot,
+                codes.into(),
+                frames,
+                Urgency::First,
+                None
+            ))
+            .is_err());
+            assert!(matches!(rx.try_recv().unwrap(), Msg::Release(released) if released == id));
+            assert!(rx.try_recv().is_err());
+        }
+        let (codec, rx) = queued_codec();
+        let slot = codec.acquire_slot().unwrap();
+        let slot = futures::executor::block_on(codec.prime_codes(
+            slot,
+            Codes::default(),
+            0,
+            Urgency::First,
+            None,
+        ))
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(slot.pos, 0);
+        drop(slot);
+        assert!(matches!(rx.try_recv().unwrap(), Msg::Release(_)));
+    }
+
+    #[test]
+    fn reference_priming_stops_after_failed_or_invalid_step_output() {
+        for failure in 0..3 {
+            let (codec, rx) = queued_codec();
+            let slot = codec.acquire_slot().unwrap();
+            let id = slot.id;
+            let worker = std::thread::spawn(move || {
+                let Msg::Job(j) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+                else {
+                    panic!("expected priming job")
+                };
+                let result = match failure {
+                    0 => Err("injected codec failure".into()),
+                    1 => Ok(Decoded {
+                        pcm: vec![0.; 5],
+                        phase: Vec::new(),
+                    }),
+                    _ => Ok(Decoded {
+                        pcm: vec![f32::NAN; 6],
+                        phase: Vec::new(),
+                    }),
+                };
+                assert!(j.reply.send(result).is_ok());
+                rx
+            });
+            assert!(futures::executor::block_on(codec.prime_codes(
+                slot,
+                vec![1; 10].into(),
+                5,
+                Urgency::First,
+                None
+            ))
+            .is_err());
+            assert!(codec.slots.as_ref().unwrap().lock().check(id, 0).is_err());
+            let rx = worker.join().unwrap();
+            assert!(matches!(rx.try_recv().unwrap(), Msg::Release(released) if released == id));
+            assert!(rx.try_recv().is_err(), "failure submitted another step");
+        }
+    }
+
+    #[test]
+    fn cancelled_reference_priming_releases_slot_and_retains_queued_input() {
+        use std::future::Future;
+        let (codec, rx) = queued_codec();
+        let slot = codec.acquire_slot().unwrap();
+        let id = slot.id;
+        let source = crate::exec::packet_runtime::PacketBuffer::from(
+            bytemuck::cast_slice(&[3i32, 4]).to_vec(),
+        );
+        let prefix = Codes::frame(vec![3, 4], Some(source));
+        let mut pending = Box::pin(codec.prime_codes(slot, prefix, 1, Urgency::First, None));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        let Msg::Job(job) = rx.try_recv().unwrap() else {
+            panic!("expected queued step")
+        };
+        drop(pending);
+        assert!(matches!(rx.try_recv().unwrap(), Msg::Release(released) if released == id));
+        let mut values = [0i32; 2];
+        job.codes.sources[0]
+            .as_ref()
+            .unwrap()
+            .read(bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [3, 4]);
+        assert!(job
+            .reply
+            .send(Ok(Decoded {
+                pcm: vec![0.; 3],
+                phase: Vec::new()
+            }))
+            .is_err());
+        let mut pool = codec.slots.as_ref().unwrap().lock();
+        pool.release(id);
+        let reused = pool.acquire().unwrap();
+        assert_eq!(reused.index, id.index);
+        assert_ne!(reused.gen, id.gen);
+        assert!(pool.check(id, 0).is_err());
+    }
+
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, REF_CODEC_REFERENCE, CODEC_PRIMING_RESULT_JSON; run through gpuq"]
+    fn reference_priming_preserves_fresh_audio_at_serving_concurrencies() {
+        async fn stream(
+            codec: &Codec,
+            slots: &mut [Option<StreamSlot>],
+            items: &[(String, Vec<i32>, usize)],
+            fresh: usize,
+            prime: bool,
+        ) -> Vec<Vec<f32>> {
+            futures::future::join_all(slots.iter_mut().zip(items).map(
+                |(owner, (_, codes, frames))| async move {
+                    let mut slot = owner.take().unwrap();
+                    slot.restart();
+                    let fc = codec.frame_codes;
+                    if prime {
+                        slot = codec
+                            .prime_codes(
+                                slot,
+                                codes[..frames * fc].to_vec().into(),
+                                *frames,
+                                Urgency::First,
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        let mut start = 0;
+                        while start < *frames {
+                            let n = (*frames - start).min(codec.step_frames);
+                            codec
+                                .step(
+                                    &mut slot,
+                                    codes[start * fc..(start + n) * fc].to_vec(),
+                                    n,
+                                    Urgency::First,
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            start += n;
+                        }
+                    }
+                    assert_eq!(slot.pos, *frames);
+                    let mut output = Vec::new();
+                    let mut start = 0;
+                    for n in [1, 2, fresh.saturating_sub(3)] {
+                        if n == 0 {
+                            continue;
+                        }
+                        let s = frames + start;
+                        output.extend(
+                            codec
+                                .step(
+                                    &mut slot,
+                                    codes[s * fc..(s + n) * fc].to_vec(),
+                                    n,
+                                    Urgency::First,
+                                    None,
+                                )
+                                .await
+                                .unwrap(),
+                        );
+                        start += n;
+                    }
+                    assert_eq!(start, fresh);
+                    assert_eq!(slot.pos, frames + fresh);
+                    *owner = Some(slot);
+                    output
+                },
+            ))
+            .await
+        }
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let reference: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("REF_CODEC_REFERENCE").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let codec = Codec::load_on(&assets, 0).unwrap();
+        assert_eq!(
+            codec.frame_codes as u64,
+            reference["frame_codes"].as_u64().unwrap()
+        );
+        assert!(codec.step_frames >= 5);
+        let fresh = 5;
+        let longest = 2 * codec.step_frames + 3;
+        assert!(codec.max_frames >= longest + fresh);
+        let sources: Vec<_> = reference["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["frames"].as_u64().unwrap() as usize >= longest + fresh)
+            .map(|c| {
+                let bytes = std::fs::read(c["codes"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    bytes.len(),
+                    c["frames"].as_u64().unwrap() as usize * codec.frame_codes * 4
+                );
+                let codes: Vec<i32> = bytes
+                    .chunks_exact(4)
+                    .map(|b| {
+                        let code = u32::from_le_bytes(b.try_into().unwrap());
+                        assert!(code < codec.parameters["codec.codebook"] as u32);
+                        code as i32
+                    })
+                    .collect();
+                (c["case"].as_str().unwrap().to_owned(), codes)
+            })
+            .collect();
+        assert!(!sources.is_empty());
+        let mut slots: Vec<_> = (0..32)
+            .map(|_| Some(codec.acquire_slot().expect("32 stream slots required")))
+            .collect();
+        let mut checks = Vec::new();
+        let mut outputs = Vec::new();
+        let mut all_pass = true;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for width in [1, 8, 32] {
+                let items: Vec<_> = (0..width).map(|b| {
+                    let (name, codes) = &sources[b % sources.len()];
+                    let frames = if width == 1 { codec.step_frames + 1 } else {
+                        [0, 1, codec.step_frames, codec.step_frames + 1, longest][b % 5]
+                    };
+                    (name.clone(), codes[..(frames + fresh) * codec.frame_codes].to_vec(), frames)
+                }).collect();
+                let whole = futures::future::join_all(items.iter().map(|(_, codes, frames)|
+                    codec.decode(codes.clone(), frames + fresh, 0, Urgency::Whole))).await;
+                let control = stream(&codec, &mut slots[..width], &items, fresh, false).await;
+                let actual = stream(&codec, &mut slots[..width], &items, fresh, true).await;
+                for (b, ((name, _, frames), whole)) in items.iter().zip(whole).enumerate() {
+                    let whole = whole.unwrap();
+                    assert_eq!(whole.len(), (frames + fresh) * codec.frame_samples);
+                    let expected = &whole[frames * codec.frame_samples..];
+                    assert_eq!(actual[b].len(), expected.len());
+                    assert_eq!(control[b].len(), expected.len());
+                    let exact = actual[b].iter().zip(&control[b]).all(|(a, b)| a.to_bits() == b.to_bits());
+                    let finite = actual[b].iter().chain(&control[b]).chain(expected).all(|v| v.is_finite());
+                    let error = actual[b].iter().zip(expected).map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2)).sum::<f64>();
+                    let norm = expected.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
+                    let relative_l2 = (error / norm.max(1e-30)).sqrt();
+                    let pass = exact && finite && relative_l2 < 1e-5;
+                    all_pass &= pass;
+                    let offset = outputs.len();
+                    outputs.extend_from_slice(expected);
+                    outputs.extend_from_slice(&control[b]);
+                    outputs.extend_from_slice(&actual[b]);
+                    checks.push(serde_json::json!({"width":width,"item":b,"source":name,"reference_frames":frames,
+                        "fresh_frames":fresh,"samples":expected.len(),"stateful_exact":exact,"finite":finite,
+                        "whole_relative_l2":relative_l2,"pass":pass,"output_offset_f32":offset}));
+                }
+            }
+        });
+        let path = std::path::PathBuf::from(std::env::var("CODEC_PRIMING_RESULT_JSON").unwrap());
+        std::fs::write(path.with_extension("f32"), bytemuck::cast_slice(&outputs)).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&serde_json::json!({
+            "scope":"saved reference codes, stateful priming vs ordinary steps and concatenated decode; no timings",
+            "pass":all_pass,"whole_relative_l2_limit":1e-5,"checks":checks})).unwrap()).unwrap();
+        assert!(all_pass, "reference priming changed fresh audio");
+    }
 
     #[test]
     fn retained_history_keeps_frame_alignment_across_windows_and_split_steps() {

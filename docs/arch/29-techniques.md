@@ -1156,6 +1156,12 @@ fastconformer RNNT, fish-s2.
   `prompt.slot_prefix_version = 1` capability, keyed by tokens, overlays and frame codes, with
   fault-epoch invalidation. AMD and CPU lack this cache and the batched depth-stage completion;
   they need the same accepted-frontier and input-identity checks before honoring the capability.
+- **Codec reference priming**: the CUDA codec worker consumes reference frames through existing
+  stateful steps before returning new audio. Each step preserves its slot position, priority,
+  deadline and input owners; failed execution or invalid PCM poisons affected stream slots.
+  Priming owns the slot through completion, releasing it on failure or cancellation.
+  Other backends need stateful codec slots and the same completion/failure behavior. This host
+  primitive does not by itself enable a cloning driver or establish a performance win.
 - **Packet input writes**: CUDA batches host bytes, completed device buffers and zero fills
   on one stream and drains once before returning. Only host inputs need reusable pinned
   staging. Failed completion retains every source owner and quarantines affected destinations.
