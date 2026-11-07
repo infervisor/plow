@@ -229,6 +229,13 @@ impl SpeechContract {
                 p.name, p.driver
             )));
         }
+        if p.strings
+            .contains_key(plow_asset::dual_stream::CONDITIONING_KEY)
+        {
+            return Err(RuntimeError::Rejected(
+                "speaker conditioning requires a supported versioned speech driver".into(),
+            ));
+        }
         let get = |k: &str| {
             p.parameters.get(k).copied().ok_or_else(|| {
                 RuntimeError::Rejected(format!("speech pipeline lacks parameter {k}"))
@@ -370,7 +377,10 @@ impl SpeechContract {
         let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&pkt)? else {
             return Ok(None);
         };
-        let mut found = asset.pipelines().iter().filter(|p| p.driver == DRIVER);
+        let mut found = asset
+            .pipelines()
+            .iter()
+            .filter(|p| p.driver.starts_with("tts.codec_lm."));
         match (found.next(), found.next()) {
             (None, _) => Ok(None),
             (Some(p), None) => Self::from_pipeline(p).map(Some),
@@ -1166,6 +1176,62 @@ mod tests {
             tensors: BTreeMap::new(),
             parameters: p,
         }
+    }
+
+    #[test]
+    fn rejects_conditioning_on_legacy_and_unsupported_drivers() {
+        let mut p = pipeline();
+        p.strings.insert(
+            plow_asset::dual_stream::CONDITIONING_KEY.into(),
+            "{}".into(),
+        );
+        assert!(SpeechContract::from_pipeline(&p).is_err());
+        p.driver = plow_asset::dual_stream::CONDITIONED_DRIVER.into();
+        assert!(SpeechContract::from_pipeline(&p).is_err());
+    }
+
+    #[test]
+    fn loading_does_not_ignore_unsupported_speech_packets() {
+        use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
+        use plow_asset::packet_pipeline::{PacketPipelines, SECTION, VERSION};
+        let dir = std::env::temp_dir().join(format!("plow-speech-version-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: Vec::new(),
+            progs: vec![Builder::new(1).finish()],
+            kv_row_insts: Vec::new(),
+            prog_t: vec![1],
+            gen: Vec::new(),
+        };
+        for driver in [
+            DRIVER,
+            plow_asset::dual_stream::CONDITIONED_DRIVER,
+            "tts.codec_lm.v99",
+            "causal.v1",
+        ] {
+            let mut p = pipeline();
+            p.driver = driver.into();
+            p.programs.insert("decode.1".into(), 0);
+            let metadata = PacketPipelines {
+                version: VERSION,
+                pipelines: vec![p],
+            };
+            let section = SectionData {
+                kind: SECT_METADATA,
+                name: SECTION.into(),
+                data: serde_json::to_vec(&metadata).unwrap(),
+            };
+            std::fs::write(dir.join("model.pkt"), model.to_blob_v6(&[section])).unwrap();
+            let loaded = SpeechContract::load(&dir);
+            match driver {
+                DRIVER => assert!(loaded.unwrap().is_some()),
+                "causal.v1" => assert!(loaded.unwrap().is_none()),
+                _ => assert!(loaded.is_err(), "unsupported driver {driver} was ignored"),
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

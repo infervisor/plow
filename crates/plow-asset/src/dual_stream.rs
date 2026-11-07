@@ -7,6 +7,78 @@ use std::collections::BTreeMap;
 
 /// Pipeline string holding the [`DualStream`] JSON.
 pub const KEY: &str = "prompt.dual_stream";
+pub const CONDITIONING_KEY: &str = "prompt.conditioning";
+pub const CONDITIONED_DRIVER: &str = "tts.codec_lm.v2";
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakerConditioning {
+    pub version: u32,
+    pub speaker_packet: String,
+    pub reference_packet: String,
+}
+
+impl SpeakerConditioning {
+    pub fn parse(json: &str) -> Result<Self, String> {
+        let c: Self = serde_json::from_str(json).map_err(|e| format!("{CONDITIONING_KEY}: {e}"))?;
+        let sidecar = |s: &str| {
+            s.len() <= 128
+                && s.ends_with(".pkt")
+                && s.len() > 4
+                && !s.starts_with('.')
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        };
+        if c.version != 1
+            || !sidecar(&c.speaker_packet)
+            || !sidecar(&c.reference_packet)
+            || c.speaker_packet == c.reference_packet
+        {
+            return Err(format!("{CONDITIONING_KEY}: invalid version or sidecar"));
+        }
+        Ok(c)
+    }
+}
+
+#[cfg(test)]
+mod conditioning_tests {
+    use super::*;
+
+    #[test]
+    fn conditioning_requires_versioned_portable_sidecars() {
+        let value = serde_json::json!({"version": 1,
+            "speaker_packet": "speaker_encoder.pkt", "reference_packet": "ref_encoder.pkt"});
+        let c = SpeakerConditioning::parse(&value.to_string()).unwrap();
+        assert_eq!(
+            SpeakerConditioning::parse(&serde_json::to_string(&c).unwrap()).unwrap(),
+            c
+        );
+        for path in [
+            "",
+            ".pkt",
+            "../speaker.pkt",
+            "/tmp/speaker.pkt",
+            "sub/speaker.pkt",
+            "speaker.bin",
+            "ref_encoder.pkt",
+        ] {
+            let mut bad = value.clone();
+            bad["speaker_packet"] = path.into();
+            assert!(
+                SpeakerConditioning::parse(&bad.to_string()).is_err(),
+                "{path}"
+            );
+        }
+        for version in [0, 2, u32::MAX] {
+            let mut bad = value.clone();
+            bad["version"] = version.into();
+            assert!(SpeakerConditioning::parse(&bad.to_string()).is_err());
+        }
+        let mut bad = value;
+        bad["ignored_feature"] = true.into();
+        assert!(SpeakerConditioning::parse(&bad.to_string()).is_err());
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

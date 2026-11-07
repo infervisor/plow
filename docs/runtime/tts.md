@@ -51,6 +51,19 @@ Depth speaker-conditioning inputs also stay resident per slot. Rebinding the sam
 speaker allocation (or null speaker) resets the request's controller while reusing its uploaded
 conditioning. A changed speaker, incomplete upload or failed device step requires a fresh upload.
 
+External speaker conditioning uses `tts.codec_lm.v2`; it must never be added to a v1 pipeline.
+The `prompt.conditioning` JSON has version 1 and two distinct bundle-relative packet filenames,
+`speaker_packet` and `reference_packet`. `conditioning.text_embeddings` binds the existing BF16
+text table; `conditioning.text_pad` selects the row added to the speaker embedding and rounded
+to BF16 before replacing the entire speaker prompt row. At least one overlay row is required.
+The dual-stream contract declares no preset voices. Checkpoint preparation records this under
+`plow_frame_embed.conditioning` and reserves one overlay row; it preserves CustomVoice's v1
+metadata and rejects unsupported checkpoint modes.
+
+The conditioned driver is staged for request-path integration. This runtime rejects it, and
+media-geometry qualification also rejects it until its conditioning obligations are supported.
+Preparing or emitting such a checkpoint does not enable Base serving or qualify its accuracy.
+
 Compatible depth prompts share packed prefill and their first predictor launch. A fully cached
 prefix can feed its terminal row straight into batched decode. Terminal overlay rows keep serial
 prefill because decode does not read those overlays. Host-controlled predictors bind each new
