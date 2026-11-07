@@ -635,12 +635,10 @@ impl GpuEngine {
                             device_bytes / 4
                         },
                         host_cap,
+                        auto.map_or(0, |(_, reserve)| reserve),
                         state_tensors,
                     ) {
                         Ok(blocks) => {
-                            if let Some((_, reserve)) = auto {
-                                blocks.set_host_reserve(reserve);
-                            }
                             let kv = serve.kv.as_mut().expect("prefix pool");
                             kv.enable_block_store(
                                 std::sync::Arc::clone(&blocks)
