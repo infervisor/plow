@@ -18,12 +18,15 @@ large-v3-turbo (needs torch, transformers, jiwer); CER after Unicode punctuation
 spaces for zh/ja. --tts-concurrency and --tts-stream exercise concurrent streamed audio;
 --tts-manifest supplies fixed texts/seeds. --tts-capture-only saves WAVs and texts.json without
 loading ASR, for scoring after the server stops. TTS capture records no latency/throughput.
+Manifest requests may include ref_audio_path (relative to the manifest), ref_text and
+non_streaming_mode. Captures record the reference path and hash, not its base64 payload.
 LLM: deterministic answers, chat template, streaming, stop strings, logprobs, raw <bos> completions,
 the context limit (from the card's max_model_len), and error envelopes.
 Thresholds are the recipes' [gates] (campaign.py gate): this reports numbers, and exits 1 only on
 request errors or a failed LLM check.
 """
 import argparse
+import base64
 import concurrent.futures as cf
 import io
 import hashlib
@@ -172,9 +175,25 @@ def tts_cases(a, model):
         for i, case in enumerate(cases):
             if not isinstance(case, dict) or not isinstance(case.get("text"), str) or not case["text"].strip():
                 raise ValueError(f"TTS manifest row {i} has no text")
+            if "ref_text" in case and (not isinstance(case["ref_text"], str) or not case["ref_text"].strip()):
+                raise ValueError(f"TTS manifest row {i} has an empty reference transcript")
+            if "non_streaming_mode" in case and not isinstance(case["non_streaming_mode"], bool):
+                raise ValueError(f"TTS manifest row {i} non_streaming_mode must be boolean")
+            if "ref_audio_path" in case:
+                if not isinstance(case["ref_audio_path"], str) or not case["ref_audio_path"]:
+                    raise ValueError(f"TTS manifest row {i} has no reference audio path")
+                path = os.path.abspath(os.path.join(os.path.dirname(a.tts_manifest), case["ref_audio_path"]))
+                with open(path, "rb") as f:
+                    audio = f.read()
+                if not audio:
+                    raise ValueError(f"TTS manifest row {i} reference audio is empty")
+                case.update(ref_audio_path=path, ref_audio=base64.b64encode(audio).decode(),
+                            ref_audio_sha256=hashlib.sha256(audio).hexdigest())
         cases = [dict(i=i, case_id=c.get("id", str(i)), text=c["text"],
                       voice=a.voice or c.get("voice", "default"), lang=c.get("language"),
-                      seed=c.get("seed", 1 + i)) for i, c in enumerate(cases)]
+                      seed=c.get("seed", 1 + i),
+                      **{k: c[k] for k in ("ref_audio_path", "ref_audio_sha256", "ref_audio", "ref_text", "non_streaming_mode") if k in c})
+                 for i, c in enumerate(cases)]
     else:
         cases = [dict(i=i, case_id=str(i), voice=v, text=t, lang=l, seed=1 + i)
                  for i, (v, t, l) in enumerate(prompt_set(model, a.tts_prompts, a.voice))]
@@ -186,11 +205,13 @@ def capture_tts(a, model, outdir):
     os.makedirs(wavdir, exist_ok=True)
 
     def one(case):
-        row = dict(case, stream=a.tts_stream)
+        row = dict((k, v) for k, v in case.items() if k != "ref_audio")
+        row["stream"] = a.tts_stream
         body = dict(model=model, input=case["text"], voice=case["voice"],
                     response_format="wav", seed=case["seed"], stream=a.tts_stream)
         if case["lang"]:
             body["language"] = case["lang"]
+        body.update({k: case[k] for k in ("ref_audio", "ref_text", "non_streaming_mode") if k in case})
         try:
             st, data = call("POST", "/v1/audio/speech", body)
             row["status"] = st
@@ -353,7 +374,7 @@ def main():
     ap.add_argument("--tts-concurrency", type=int, default=1, help="bounded concurrent TTS quality requests")
     ap.add_argument("--tts-stream", action="store_true", help="synthesize through the streaming endpoint")
     ap.add_argument("--tts-capture-only", action="store_true", help="save WAVs/texts without loading an ASR model")
-    ap.add_argument("--tts-manifest", help="JSON list of {text, voice?, language?, seed?, id?} requests")
+    ap.add_argument("--tts-manifest", help="JSON list of {text, voice?, language?, seed?, id?, ref_audio_path?, ref_text?, non_streaming_mode?} requests")
     ap.add_argument("--voice", default=None, help="TTS voice for every prompt (default: the prompt set's)")
     ap.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
     ap.add_argument("--whisper-device", default=None)
