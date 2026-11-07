@@ -2106,6 +2106,8 @@ struct SegPf {
     glu_quant_cached_q: Option<KernelFn>,
     glu_quant_any_width: bool,
     quant_cached: Option<KernelFn>,
+    /// `plow_quant_cached` ABI 2: also takes 8-aligned rows below 4096 wide.
+    quant_any_width: bool,
     norm_rms_pf: Option<KernelFn>,
     /// `plow_norm_rms_pf` ABI 2: a grid covering the rows runs the RmsNorm one block per row.
     norm_rms_row_grid: bool,
@@ -11384,10 +11386,9 @@ impl GpuEngine {
                 } else {
                     None
                 };
-                let quant_cached = if be
-                    .module_global_u32(&m1, &format!("plow_quant_cached_abi{seg_global_suffix}"))?
-                    == Some(1)
-                {
+                let quant_cached_abi = be
+                    .module_global_u32(&m1, &format!("plow_quant_cached_abi{seg_global_suffix}"))?;
+                let quant_cached = if matches!(quant_cached_abi, Some(1 | 2)) {
                     Some(be.get_function(&m1, &format!("plow_quant_cached{seg_global_suffix}"))?)
                 } else {
                     None
@@ -11412,6 +11413,7 @@ impl GpuEngine {
                     glu_quant_cached_q,
                     glu_quant_any_width: glu_quant_abi == Some(2),
                     quant_cached,
+                    quant_any_width: quant_cached_abi == Some(2),
                     norm_rms_pf,
                     norm_rms_row_grid: norm_rms_abi == Some(2),
                     rope_pf,
@@ -11798,10 +11800,13 @@ impl GpuEngine {
             let plain_quant_function = seg_pf.as_ref().and_then(|sp| sp.quant_cached);
             let plain_quant_segments =
                 if plain_quant_function.is_some() && seg_mode && qwen_segments.is_empty() {
-                    cublaslt::prefill_plain_quant_segments(g)
-                        .into_iter()
-                        .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
-                        .collect::<Vec<_>>()
+                    cublaslt::prefill_plain_quant_segments(
+                        g,
+                        seg_pf.as_ref().is_some_and(|sp| sp.quant_any_width),
+                    )
+                    .into_iter()
+                    .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
+                    .collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 };

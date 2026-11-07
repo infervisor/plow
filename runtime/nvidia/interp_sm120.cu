@@ -5549,9 +5549,11 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_glu_quant_cac
 #endif
 #if PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_GEMMA && PLOW_NV_THREADS == 256 && !PLOW_NV_GEMM_ONLY && \
     !PLOW_NV_FA_ONLY
-/* A plain QuantFp8 (no GLU) of a 4096- or 8192-wide row per CTA (any grid). */
+/* A plain QuantFp8 (no GLU) of a 4096- or 8192-wide row, or (ABI 2) an 8-aligned row below
+ * 4096, per CTA (any grid). */
 #if PLOW_NV_W8A8
-extern "C" __device__ unsigned PLOW_SYM(plow_quant_cached_abi) = 1;
+/* ABI 2: also any 8-aligned width below 4096 (E4B 2048/2560); ABI 1 objects take 4096/8192 only. */
+extern "C" __device__ unsigned PLOW_SYM(plow_quant_cached_abi) = 2;
 extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_quant_cached)(PlowProgram prog,
                                                                              unsigned inst) {
     __shared__ float part[8];
@@ -5563,6 +5565,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_quant_cached)
     else if (in->i[1] == 4096u)
         d_quant_fp8_cached<4096>((uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
                                  (const __nv_bfloat16*)t[in->t[1]], in->i[0], blockIdx.x, gridDim.x, part);
+    else if (in->i[1] < 4096u && !(in->i[1] & 7u))
+        d_quant_fp8_cached_rt<4096>((uint8_t*)t[in->t[0]], (float*)t[in->t[2]],
+                                    (const __nv_bfloat16*)t[in->t[1]], in->i[0], in->i[1], blockIdx.x,
+                                    gridDim.x, part);
     else
         __trap();
 }
