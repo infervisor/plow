@@ -10,21 +10,17 @@
 #   python3 scripts/campaign/campaign.py build scripts/campaign/recipes/gemma4-e4b.h100.fp8-multimodal.toml --out <fresh dir>
 # vLLM peers (FP32-reference gate, serving) serve the hub snapshot itself.
 #
-# NOT QUALIFIED (2026-11-04, H100, plowrt d22eacca4, packet from this recipe; vLLM 0.29 same checkpoint,
-# same client). Gates vs the same-checkpoint vLLM peer: FP32-ref kl_mean c1/c8/c32 0.0109/0.0108/0.0117
-# vs vLLM 0.0134/0.0127/0.0135, kl_over 10/9/12 vs 6/11/12, top1_decisive 0.9985 vs 1 (one natural-text
-# case diverges where FP32 is decisive, at every concurrency: cont_decisive 26/27 vs 27/27), c32
-# cont_frac 0.409 vs 0.471 (-0.05 margin missed). mm_parity vs the HF reference (transformers
-# decompresses to bf16 weights + bf16 activations, not W8A8): 7/10 cases; the vLLM peer on the same
-# reference 8/10 (both fail asr0 and asr1); encoders 22/22 cos >= 0.9996. llm_logit_parity vs that HF
-# reference: top1 0.9733, KL 6.0e-3 (BF16 thresholds). WER 0.1077 (vLLM 0.1003, BF16 0.1032).
-# Serving 1000/128 (strict report, NOT EQUIVALENT on the gate): TPOT p50 c1/c8/c32 5.03/6.10/12.0 ms
-# vs vLLM 4.7/4.84/6.6, total tok/s 0.95x/0.85x/0.66x, TTFT p99 0.58x/1.49x/1.75x. The decode route
-# below (native FP8 GEMV under 48 rows) moved c1/c8/c32 TPOT from 8.17/8.98/13.15 ms and out tok/s
-# from 120/821/2217 to 191/1169/2389. Audio c1/c8/c32 TTFT p50 42.7/163/408 ms vs vLLM 87/241/475.
-# Open: FP8 prefill (1000-token TTFT 28.7 ms vs BF16 17.4) and served c32 decode (12.0 ms vs
-# step_bench 7.9). Evidence: <lab scratch>/e4b-audio/f8-fp8c/{gate,report,grid,voice,audio},
-# f8/{gate,report,grid,voice,audio} (Lt-from-1 baseline + vLLM arms), f8/mm-vllm.
+# NOT QUALIFIED on this recipe's own thresholds (2026-11-07, H100, plowrt c3de5ec38, packet 53b9e1759b8e;
+# vLLM 0.29 same checkpoint, same client). FP32-ref kl_mean c1/c8/c32 0.0101/0.0106/0.0104 vs vLLM
+# 0.0133/0.0132/0.0137, kl_over 8/10/7 vs 6/14/16, top1_decisive 1 and cont_decisive 27/27 vs the same,
+# cont_frac 0.436/0.513/0.447 vs 0.447/0.449/0.471. llm_logit_parity vs the HF reference (transformers
+# decompresses to bf16 weights + bf16 activations, not W8A8): top1 0.9839 (min 0.98), KL 6.0e-3 over the
+# BF16 threshold 2e-3. mm_parity 8/10 vs vLLM 8/10 (plow misses asr0, image_audio; vLLM asr0, asr1);
+# image_audio is a low-confidence first token (top-1 p ~0.3, top-2 margin one bf16 logit step) that re-rolls
+# between cold and cached prefill splits. Encoders 22/22 cos >= 0.9996. WER 0.1062 (vLLM 0.1003, BF16 0.1032).
+# Serving 1000/128 (strict report, MATCHED, EQUIVALENT): total tok/s c1/c8/c32 1.05x/1.00x/0.85x, TTFT P99
+# 0.34x/1.02x/1.15x, TPOT P99 0.98x/1.07x/1.20x, TTFT p50 19.2/54.8/58.8 ms vs vLLM 40.6/132/289.
+# Open: c32 throughput. Decode B=32 7.48 ms vs vLLM ~5.74, prefill 1000 rows 17.3 ms vs ~9.5.
 #
 # Gemma 4 E4B-it (google/gemma-4-E4B-it) on H100: text LLM of the voice-agent server (co-served
 # with Qwen3-ASR and Chatterbox). Per-layer input embeddings (E-series PLE), 5:1 sliding(512):full
@@ -41,7 +37,7 @@ namespace = "infervisor"
 name = "gemma-4-e4b"
 label = "sm90a-h100-tp1-fp8-multimodal"
 status = "emits"
-plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
+plow_git = "c3de5ec386fccc7cab95cbf2bd7d83a66659bf23"
 network = "gemma4"
 doc = "docs/runtime/gemma4-e4b-h100.md"
 tracker = "docs/runtime/h100-speech-recipes.md"
