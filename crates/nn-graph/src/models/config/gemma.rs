@@ -66,6 +66,20 @@ pub struct GemmaConfig {
     pub num_local_experts: u32,
     /// Number of experts activated per token (top-k routing).
     pub num_experts_per_tok: u32,
+
+    // --- Gemma 4 E-models (E2B/E4B) per-layer embeddings ---
+    /// Width of each layer's per-layer input; 0 ⇒ no per-layer embeddings.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub hidden_size_per_layer_input: i64,
+    /// Vocabulary of `embed_tokens_per_layer`; 0 ⇒ `vocab_size`.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub vocab_size_per_layer_input: i64,
+    /// Trailing layers that reuse an earlier layer's KV cache.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub num_kv_shared_layers: u32,
+    /// E2B: the KV-shared layers run a 2x-wide MLP.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub use_double_wide_mlp: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,6 +135,10 @@ impl Default for GemmaConfig {
             rope_parameters: None,
             num_local_experts: 0,
             num_experts_per_tok: 0,
+            hidden_size_per_layer_input: 0,
+            vocab_size_per_layer_input: 0,
+            num_kv_shared_layers: 0,
+            use_double_wide_mlp: false,
         }
     }
 }
@@ -142,6 +160,16 @@ impl GemmaConfig {
     /// contains entries like `"moe_sliding_attention"` or `"moe_full_attention"`
     /// for MoE layers. If `layer_types` doesn't encode MoE info, all layers use
     /// MoE when `num_local_experts > 0`.
+    /// Dense MLP width of `layer`.
+    pub fn intermediate_size_for(&self, layer: u32) -> i64 {
+        let shared = layer + self.num_kv_shared_layers >= self.num_hidden_layers;
+        if self.use_double_wide_mlp && self.num_kv_shared_layers > 0 && shared {
+            2 * self.intermediate_size
+        } else {
+            self.intermediate_size
+        }
+    }
+
     pub fn layer_is_moe(&self, layer: u32) -> bool {
         if !self.is_moe() {
             return false;

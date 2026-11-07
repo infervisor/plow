@@ -146,6 +146,55 @@ pub struct DevBlob {
     pub parent: Option<plow_asset::extension::ParentRef>,
 }
 
+/// Inspection-only metadata. It cannot be bound as an executable packet and owns no weight payloads.
+pub struct DevBlobMetadata {
+    pub n_cu: u32,
+    pub target: u32,
+    pub tensors: Vec<DevTensor>,
+    pub progs: Vec<DevProg>,
+    pub sections: Vec<(u32, String, Vec<u8>)>,
+}
+
+impl DevBlobMetadata {
+    pub fn load(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path).map_err(|source| RuntimeError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        // Compiled packet artifacts are immutable during inspection, as during runtime binding.
+        let map = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|source| {
+            RuntimeError::Io {
+                path: path.to_owned(),
+                source,
+            }
+        })?;
+        Self::parse(&map)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let blob = DevBlob::parse_inner(bytes, Container::Model, false)?;
+        let sections = blob
+            .sections
+            .iter()
+            .filter(|s| s.kind == packet::devbuild::SECT_METADATA)
+            .map(|s| {
+                (
+                    s.kind,
+                    s.name.clone(),
+                    bytes[s.offset..s.offset + s.size].to_vec(),
+                )
+            })
+            .collect();
+        Ok(Self {
+            n_cu: blob.n_cu,
+            target: blob.target,
+            tensors: blob.tensors,
+            progs: blob.progs,
+            sections,
+        })
+    }
+}
+
 /// Which container [`DevBlob::parse_inner`] was asked for. The two are distinct files with
 /// distinct magics, and reading one as the other is the silent failure the extension magic
 /// exists to prevent — so the caller says which it wants and gets a named refusal otherwise.
@@ -444,7 +493,7 @@ impl DevBlob {
     /// [`DevBlob::parse_l2`] without the L2-placement guard, for a parse shared by callers that
     /// each apply [`DevBlob::check_l2_dispatch`] with their own answer.
     pub(crate) fn parse_unguarded(buf: &[u8]) -> Result<DevBlob> {
-        Self::parse_inner(buf, Container::Model)
+        Self::parse_inner(buf, Container::Model, true)
     }
 
     /// Parse an `extension.pkt` (docs/arch/19, phase 2): the same container with the tensor
@@ -453,7 +502,7 @@ impl DevBlob {
     /// This only decodes the container. Whether the extension may be MERGED is the six-rule
     /// contract in `plow_asset::extension`, applied by [`crate::asset::extension`].
     pub fn parse_extension(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
-        let blob = Self::parse_inner(buf, Container::Extension)?;
+        let blob = Self::parse_inner(buf, Container::Extension, true)?;
         blob.check_l2_dispatch(l2_dispatch_ok)?;
         Ok(blob)
     }
@@ -475,7 +524,9 @@ impl DevBlob {
         Ok(())
     }
 
-    fn parse_inner(buf: &[u8], want: Container) -> Result<DevBlob> {
+    /// `copy_init = false` is the inspection-only parse ([`DevBlobMetadata`]): initializer bytes
+    /// are range-checked but not copied, and structure-only packets are accepted.
+    fn parse_inner(buf: &[u8], want: Container, copy_init: bool) -> Result<DevBlob> {
         let mut off = 0usize;
         let hdr: BlobHeader = take::<BlobHeader>(buf, &mut off, 1, "header")?[0];
         let is_ext = packet::ext::is_ext_magic(&hdr.magic);
@@ -513,7 +564,18 @@ impl DevBlob {
         }
 
         let decls = take::<BlobTensor>(buf, &mut off, hdr.n_tensor as usize, "tensor decls")?;
-        let init = take::<u8>(buf, &mut off, hdr.init_bytes as usize, "init section")?;
+        let init_len = usize::try_from(hdr.init_bytes)
+            .map_err(|_| RuntimeError::Device("devblob: init size overflows".into()))?;
+        let init_end = off
+            .checked_add(init_len)
+            .filter(|&end| end <= buf.len())
+            .ok_or_else(|| RuntimeError::Device("devblob: truncated init section".into()))?;
+        let init = if copy_init {
+            buf[off..init_end].to_vec()
+        } else {
+            Vec::new()
+        };
+        off = init_end;
         let tensors = decls
             .iter()
             .map(|d| {
@@ -525,7 +587,7 @@ impl DevBlob {
                     let s = d.init_off as usize;
                     let e = s
                         .checked_add(d.bytes as usize)
-                        .filter(|&e| e <= init.len())
+                        .filter(|&e| e <= init_len)
                         .ok_or_else(|| {
                             RuntimeError::Device(format!(
                                 "devblob: tensor {name} init range out of bounds"
@@ -718,6 +780,17 @@ impl DevBlob {
         } else {
             Vec::new()
         };
+        if copy_init
+            && sections
+                .iter()
+                .any(|s| s.name == plow_asset::structure_only::SECTION)
+        {
+            return Err(RuntimeError::Device(
+                "devblob: structure-only packet (compiled from header-only checkpoints, zero \
+                 weights) is for inspection and cannot be executed"
+                    .into(),
+            ));
+        }
 
         // v7 carries RoPE tables as recipes instead of init bytes. Parse them
         // eagerly (a handful of 72-byte records) so the upload path does not need
@@ -1796,6 +1869,32 @@ mod tests {
         assert_eq!(tp.slot_bytes, 117_440_512);
         // And a blob with no collective at all is not a sharded blob.
         assert!(recover_tp(&[prog(1, vec![])]).is_none());
+    }
+
+    #[test]
+    fn inspection_reuses_container_validation_without_copying_initializers() {
+        let bytes = tiny_model().to_blob();
+        let executable = DevBlob::parse(&bytes).unwrap();
+        let metadata = DevBlobMetadata::parse(&bytes).unwrap();
+        assert_eq!(metadata.tensors.len(), executable.tensors.len());
+        assert_eq!(metadata.progs.len(), executable.progs.len());
+        for (a, b) in metadata.tensors.iter().zip(&executable.tensors) {
+            assert_eq!((&a.name, a.bytes, &a.init), (&b.name, b.bytes, &b.init));
+        }
+        for (a, b) in metadata.progs.iter().zip(&executable.progs) {
+            assert_eq!(a.insts, b.insts);
+        }
+        assert!(DevBlobMetadata::parse(&bytes[..63]).is_err());
+    }
+
+    #[test]
+    fn structure_only_packets_are_inspectable_but_not_executable() {
+        let bytes = tiny_model().to_blob_v6(&[plow_asset::structure_only::section()]);
+        let err = DevBlob::parse(&bytes)
+            .err()
+            .expect("executable parse must refuse");
+        assert!(err.to_string().contains("structure-only"));
+        assert!(DevBlobMetadata::parse(&bytes).is_ok());
     }
 
     /// A tiny two-program model exercised through the REAL writer

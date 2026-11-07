@@ -9,7 +9,7 @@ plans/
 target
 target/
 plow-out/
-models/
+/models/
 build/.claude/worktrees/
 runtime/ubench/build/
 
