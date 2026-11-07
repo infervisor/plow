@@ -49,7 +49,7 @@ rewrite = { workspace = true }
 packet = { workspace = true }
 schedule = { workspace = true }
 plow-asset = { workspace = true }
-# Packet loading for `plowc qualify` and the emit-time qualification.
+# Packet loading for `plowc qualify`, the emit-time qualification and the packet visualizer.
 plowrt = { path = "../plowrt" }
 # Optional: JSON-IPC bridge to the Lean verifier CLI. See the `lean-verify`
 # feature below — without it, `--lean-verify` on the CLI returns a build-time

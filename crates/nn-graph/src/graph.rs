@@ -13,14 +13,20 @@ use std::collections::BTreeSet;
 
 /// Index of a tensor (graph value).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
+#[cfg_attr(feature = "models", serde(transparent))]
 pub struct TensorId(pub u32);
 
 /// Index of a node (operation).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
+#[cfg_attr(feature = "models", serde(transparent))]
 pub struct NodeId(pub u32);
 
 /// Where a tensor comes from.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
+#[cfg_attr(feature = "models", serde(rename_all = "snake_case"))]
 pub enum Origin {
     /// External graph input (activations: token ids, pixel values).
     Input,

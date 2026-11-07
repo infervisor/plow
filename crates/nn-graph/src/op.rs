@@ -7,6 +7,7 @@
 
 /// Pointwise activation functions.
 #[derive(Clone, Copy, PartialEq, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
 pub enum ActKind {
     Silu,
     Gelu,
@@ -29,6 +30,7 @@ pub enum ActKind {
 
 /// Padding fill of [`Op::Conv1d`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
 pub enum PadMode {
     Zero,
     Reflect,
@@ -36,6 +38,7 @@ pub enum PadMode {
 
 /// Binary elementwise operations (numpy broadcasting).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
 pub enum EwKind {
     Add,
     Sub,
@@ -45,6 +48,7 @@ pub enum EwKind {
 
 /// Reductions over a single axis.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
 pub enum ReduceKind {
     Mean,
     Sum,
@@ -54,6 +58,7 @@ pub enum ReduceKind {
 /// The operators of the graph. Each is single-output; multi-output structures
 /// (e.g. separate Q/K/V projections) are expressed as separate nodes.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
 pub enum Op {
     /// `[.., in] · W[out, in] (+ bias[out]) -> [.., out]`.
     /// Inputs: `[x, weight]` or `[x, weight, bias]`.
@@ -365,12 +370,14 @@ pub enum Op {
 /// the identity, and so is `n_group <= 1` — which is why GLM-5.2 (one group)
 /// matches a flat-top-k reference and Kimi-K3 (eight) does not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
 pub struct MoeGroups {
     pub n_group: u32,
     pub topk_group: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
 pub enum MoeScoring {
     Softmax,
     Sigmoid,
@@ -384,6 +391,7 @@ pub enum MoeScoring {
 /// consumer that assumed the wrong one would produce fluent, wrong output —
 /// the failure mode this IR is meant to make impossible to reach by accident.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
 pub enum LinearAttnKind {
     /// Kimi Delta Attention: a gated delta rule with a low-rank forget gate.
     /// `state <- state * decay(gate) + beta * (v - state·k) ⊗ k`.

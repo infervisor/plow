@@ -365,3 +365,10 @@ mod tests {
         assert!(!a.provably_ne(&c));
     }
 }
+
+#[cfg(feature = "models")]
+impl serde::Serialize for Dim {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}

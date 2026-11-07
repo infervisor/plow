@@ -21,6 +21,7 @@ The same tokenizer ships as `speech_tokenizer/` in Qwen/Qwen3-TTS-12Hz-* (byte-i
 pass REPO = Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice, SUBDIR = speech_tokenizer.
 """
 import json
+import math
 import os
 import sys
 
@@ -122,7 +123,7 @@ def main():
     assert dc["num_key_value_heads"] == heads
     config = dict(
         model_type="qwen3_tts_12hz", sampling_rate=24000,
-        frame_samples=2 ** ups * int(torch.tensor(rates).prod()), frame_codes=n_q,
+        frame_samples=2 ** ups * math.prod(rates), frame_codes=n_q,
         codebook_sizes=[dc["codebook_size"]] * n_q, vq_dim=dc["codebook_dim"], latent_dim=dc["latent_dim"],
         pre_kernel=3,
         transformer=dict(layers=dc["num_hidden_layers"], dim=hidden, heads=heads, head_dim=hd,
