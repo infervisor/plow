@@ -236,7 +236,13 @@ def decoder_reference(a):
         assert pcm_path.stat().st_size % 4 == 0
         pcm = np.fromfile(pcm_path, dtype="<f4")
         inputs.extend([result_path, pcm_path])
-        offset, checks = 0, []
+        owned = None
+        if "owned_whole_pcm" in native:
+            owned_path = Path(native["owned_whole_pcm"])
+            assert owned_path.stat().st_size % 4 == 0
+            owned = np.fromfile(owned_path, dtype="<f4")
+            inputs.append(owned_path)
+        offset, owned_offset, checks = 0, 0, []
         for item in native["checks"]:
             source, prefix, fresh = item["source"], item["reference_frames"], item["fresh_frames"]
             case = sources[source]
@@ -271,10 +277,23 @@ def decoder_reference(a):
                                      max_abs=float(np.abs(error).max()) if finite else None,
                                      passed=finite and relative < native["whole_relative_l2_limit"])
                 offset += count
+            if owned is not None:
+                full_count = (prefix + fresh) * meta["frame_samples"]
+                assert item["owned_whole_offset_f32"] == owned_offset and item["owned_whole_samples"] == full_count
+                assert owned_offset + full_count <= owned.size, "truncated owned whole PCM"
+                actual = owned[owned_offset:owned_offset + full_count].astype(np.float64)
+                finite = bool(np.isfinite(actual).all())
+                error = actual - whole.astype(np.float64)
+                relative = float(np.linalg.norm(error) / max(np.linalg.norm(whole.astype(np.float64)), 1e-30)) if finite else None
+                metrics["owned_whole"] = dict(finite=finite, relative_l2=relative,
+                                             max_abs=float(np.abs(error).max()) if finite else None,
+                                             passed=finite and relative < native["whole_relative_l2_limit"])
+                owned_offset += full_count
             checks.append(dict(width=item["width"], item=item["item"], source=source,
                                reference_frames=prefix, fresh_frames=fresh, reference_pcm=str(path),
                                metrics=metrics, passed=all(m["passed"] for m in metrics.values())))
         assert offset == pcm.size, "unexpected trailing native PCM"
+        assert owned is None or owned_offset == owned.size, "unexpected trailing owned whole PCM"
         records.append(dict(capture=str(result_path), internal_gate_pass=native["pass"], checks=checks,
                             independent_reference_pass=all(c["passed"] for c in checks)))
     assert records, "no native decoder captures"

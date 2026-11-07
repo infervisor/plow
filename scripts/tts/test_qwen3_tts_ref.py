@@ -223,6 +223,30 @@ class StaticMimi:
                     with self.assertRaises(AssertionError):
                         decoder_reference(args)
 
+    def test_owned_whole_capture_is_checked_at_original_tolerance(self):
+        for failure in (None, "error", "short", "trailing", "offset", "samples", "nonfinite"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                args, meta, decode, _ = self.fixture(root)
+                capture = json.loads((root / "native.json").read_text())
+                values = np.repeat(np.arange(8).reshape(4, 2).sum(1).astype(np.float32), 3)
+                if failure == "error": values[0] += 1
+                elif failure == "nonfinite": values[0] = np.nan
+                elif failure == "short": values = values[:-1]
+                elif failure == "trailing": values = np.append(values, np.float32(0))
+                values.astype("<f4").tofile(root / "owned.f32")
+                capture["owned_whole_pcm"] = str(root / "owned.f32")
+                capture["checks"][0].update(owned_whole_offset_f32=int(failure == "offset"),
+                                            owned_whole_samples=11 if failure == "samples" else 12)
+                (root / "native.json").write_text(json.dumps(capture))
+                with patch("qwen3_tts_ref.load_reference_decoder", return_value=(decode, meta)):
+                    if failure in ("short", "trailing", "offset", "samples"):
+                        with self.assertRaises(AssertionError): decoder_reference(args)
+                    else:
+                        report = decoder_reference(args)
+                        self.assertEqual(report["pass_all"], failure is None)
+                        self.assertEqual(report["captures"][0]["checks"][0]["metrics"]["owned_whole"]["passed"], failure is None)
+
 
 if __name__ == "__main__":
     unittest.main()

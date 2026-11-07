@@ -705,6 +705,54 @@ impl Codec {
         Ok(slot)
     }
 
+    pub(crate) async fn decode_stateful(
+        &self,
+        mut slot: StreamSlot,
+        codes: Codes,
+        frames: usize,
+        urgency: Urgency,
+    ) -> Result<(StreamSlot, Vec<f32>), String> {
+        if self.step_frames == 0
+            || slot.pos != 0
+            || frames.checked_mul(self.frame_codes) != Some(codes.len())
+        {
+            return Err("stateful decoding requires a fresh slot and complete frames".into());
+        }
+        let pool = self
+            .slots
+            .as_ref()
+            .ok_or("codec has no stateful slot pool")?;
+        pool.lock().check(slot.id, 0).map_err(str::to_owned)?;
+        let samples = frames
+            .checked_mul(self.frame_samples)
+            .ok_or("codec sample count overflows")?;
+        let mut output = Vec::with_capacity(samples);
+        let mut start = 0;
+        while start < frames {
+            let n = (frames - start).min(self.step_frames);
+            let chunk = codes.slice(
+                start * self.frame_codes..(start + n) * self.frame_codes,
+                self.frame_codes,
+            );
+            let pcm = match self.step_codes(&mut slot, chunk, n, urgency, None).await {
+                Ok(pcm) => pcm,
+                Err(e) => {
+                    pool.lock().fail(slot.id);
+                    return Err(e);
+                }
+            };
+            if n.checked_mul(self.frame_samples) != Some(pcm.len())
+                || pcm.iter().any(|v| !v.is_finite())
+            {
+                pool.lock().fail(slot.id);
+                return Err("codec returned invalid stateful PCM".into());
+            }
+            output.extend_from_slice(&pcm);
+            start += n;
+        }
+        Ok((slot, output))
+    }
+
     /// Split each launch into segments of `render.yield_programs` programs (a CFM step) and call
     /// `hook` between them, so a co-scheduler can hand the device to another model mid-render.
     /// `None` restores one launch per decode.
@@ -1938,6 +1986,101 @@ mod tests {
     }
 
     #[test]
+    fn stateful_whole_decoding_preserves_history_and_owned_slot_lifetime() {
+        let (codec, rx) = queued_codec();
+        let slot = codec.acquire_slot().unwrap();
+        let worker = std::thread::spawn(move || {
+            for (start, n) in [(0, 2), (2, 2), (4, 1)] {
+                let Msg::Job(j) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+                else {
+                    panic!("expected stateful decode job")
+                };
+                assert_eq!(j.step.unwrap().pos, start);
+                assert_eq!(j.frames, n);
+                assert_eq!(j.urgency, Urgency::Whole);
+                assert_eq!(
+                    j.codes.host,
+                    (start as i32 * 2..(start + n) as i32 * 2).collect::<Vec<_>>()
+                );
+                assert!(j
+                    .reply
+                    .send(Ok(Decoded {
+                        pcm: (start * 3..(start + n) * 3).map(|v| v as f32).collect(),
+                        phase: Vec::new()
+                    }))
+                    .is_ok());
+            }
+            rx
+        });
+        let (slot, pcm) = futures::executor::block_on(codec.decode_stateful(
+            slot,
+            (0..10).collect::<Vec<_>>().into(),
+            5,
+            Urgency::Whole,
+        ))
+        .unwrap();
+        assert_eq!(slot.pos, 5);
+        assert_eq!(pcm, (0..15).map(|v| v as f32).collect::<Vec<_>>());
+        let rx = worker.join().unwrap();
+        drop(slot);
+        assert!(matches!(rx.try_recv().unwrap(), Msg::Release(_)));
+    }
+
+    #[test]
+    fn stateful_whole_decoding_rejects_bad_pcm_and_releases_cancelled_work() {
+        for bad in [Vec::new(), vec![f32::NAN; 3]] {
+            let (codec, rx) = queued_codec();
+            let slot = codec.acquire_slot().unwrap();
+            let id = slot.id;
+            let worker = std::thread::spawn(move || {
+                let Msg::Job(j) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+                else {
+                    panic!("expected decode job")
+                };
+                assert!(j
+                    .reply
+                    .send(Ok(Decoded {
+                        pcm: bad,
+                        phase: Vec::new()
+                    }))
+                    .is_ok());
+                rx
+            });
+            assert!(futures::executor::block_on(codec.decode_stateful(
+                slot,
+                vec![1, 2].into(),
+                1,
+                Urgency::Whole
+            ))
+            .is_err());
+            assert!(codec.slots.as_ref().unwrap().lock().slots[id.index as usize].failed);
+            assert!(matches!(
+                worker.join().unwrap().try_recv().unwrap(),
+                Msg::Release(_)
+            ));
+        }
+        let (codec, rx) = queued_codec();
+        let slot = codec.acquire_slot().unwrap();
+        let mut future =
+            Box::pin(codec.decode_stateful(slot, vec![1, 2].into(), 1, Urgency::Whole));
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(std::future::Future::poll(future.as_mut(), &mut context).is_pending());
+        let Msg::Job(job) = rx.try_recv().unwrap() else {
+            panic!("expected decode job")
+        };
+        drop(future);
+        assert!(matches!(rx.try_recv().unwrap(), Msg::Release(_)));
+        assert!(job
+            .reply
+            .send(Ok(Decoded {
+                pcm: vec![0.; 3],
+                phase: Vec::new()
+            }))
+            .is_err());
+    }
+
+    #[test]
     fn reference_priming_preserves_chunks_positions_sources_and_deadlines() {
         let (codec, rx) = queued_codec();
         let slot = codec.acquire_slot().unwrap();
@@ -2281,6 +2424,7 @@ mod tests {
             .collect();
         let mut checks = Vec::new();
         let mut outputs = Vec::new();
+        let mut owned_outputs = Vec::new();
         let mut all_pass = true;
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             for history in [false, true] {
@@ -2301,6 +2445,16 @@ mod tests {
                     codec.decode(codes.clone(), frames + fresh, 0, Urgency::Whole))).await;
                 let control = stream(&codec, &mut slots[..width], &items, fresh, false).await;
                 let actual = stream(&codec, &mut slots[..width], &items, fresh, true).await;
+                let owned = futures::future::join_all(slots[..width].iter_mut().zip(&items).map(|(owner, (_, codes, frames))| {
+                    let codec = &codec;
+                    async move {
+                        let mut slot = owner.take().unwrap();
+                        slot.restart();
+                        let (slot, pcm) = codec.decode_stateful(slot, codes.clone().into(), frames + fresh, Urgency::Whole).await.unwrap();
+                        *owner = Some(slot);
+                        pcm
+                    }
+                })).await;
                 for (b, ((name, _, frames), whole)) in items.iter().zip(whole).enumerate() {
                     let whole = whole.unwrap();
                     assert_eq!(whole.len(), (frames + fresh) * codec.frame_samples);
@@ -2312,16 +2466,25 @@ mod tests {
                     let error = actual[b].iter().zip(expected).map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2)).sum::<f64>();
                     let norm = expected.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
                     let relative_l2 = (error / norm.max(1e-30)).sqrt();
-                    let pass = exact && finite && relative_l2 < 1e-5;
+                    assert_eq!(owned[b].len(), whole.len());
+                    let owned_finite = owned[b].iter().all(|v| v.is_finite());
+                    let owned_error = owned[b].iter().zip(&whole).map(|(&a, &b)| (f64::from(a)-f64::from(b)).powi(2)).sum::<f64>();
+                    let owned_norm = whole.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
+                    let owned_relative = (owned_error / owned_norm.max(1e-30)).sqrt();
+                    let pass = exact && finite && relative_l2 < 1e-5 && owned_finite && owned_relative < 1e-5;
                     all_pass &= pass;
                     let offset = outputs.len();
                     outputs.extend_from_slice(expected);
                     outputs.extend_from_slice(&control[b]);
                     outputs.extend_from_slice(&actual[b]);
+                    let owned_offset = owned_outputs.len();
+                    owned_outputs.extend_from_slice(&owned[b]);
                     checks.push(serde_json::json!({"suite":if history {"history"} else {"chunking"},
                         "cohort":cohort,"width":width,"item":b,"source":name,"reference_frames":frames,
                         "fresh_frames":fresh,"samples":expected.len(),"stateful_exact":exact,"finite":finite,
-                        "whole_relative_l2":relative_l2,"pass":pass,"output_offset_f32":offset}));
+                        "whole_relative_l2":relative_l2,"pass":pass,"output_offset_f32":offset,
+                        "owned_whole_offset_f32":owned_offset,"owned_whole_samples":owned[b].len(),
+                        "owned_whole_relative_l2":owned_relative}));
                 }
                }
               }
@@ -2340,11 +2503,13 @@ mod tests {
         }
         let path = std::path::PathBuf::from(std::env::var("CODEC_PRIMING_RESULT_JSON").unwrap());
         std::fs::write(path.with_extension("f32"), bytemuck::cast_slice(&outputs)).unwrap();
+        let owned_path = path.with_extension("owned.f32");
+        std::fs::write(&owned_path, bytemuck::cast_slice(&owned_outputs)).unwrap();
         std::fs::write(path, serde_json::to_vec_pretty(&serde_json::json!({
             "scope":"saved reference codes, chunking and attention-history boundaries; stateful priming vs ordinary steps and concatenated decode; no timings",
             "attention_window_rows":windows,"transformer_rows_per_frame":rows_per_frame,
             "boundary_reference_frames":boundaries,"max_available_frames":available,
-            "pass":all_pass,"whole_relative_l2_limit":1e-5,"checks":checks})).unwrap()).unwrap();
+            "pass":all_pass,"whole_relative_l2_limit":1e-5,"checks":checks,"owned_whole_pcm":owned_path})).unwrap()).unwrap();
         assert!(all_pass, "reference priming changed fresh audio");
     }
 

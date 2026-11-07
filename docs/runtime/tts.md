@@ -60,9 +60,24 @@ The dual-stream contract declares no preset voices. Checkpoint preparation recor
 `plow_frame_embed.conditioning` and reserves one overlay row; it preserves CustomVoice's v1
 metadata and rejects unsupported checkpoint modes.
 
-The conditioned driver is staged for request-path integration. This runtime rejects it, and
-media-geometry qualification also rejects it until its conditioning obligations are supported.
-Preparing or emitting such a checkpoint does not enable Base serving or qualify its accuracy.
+The conditioned driver binds both encoders on the serving device. One bounded cache, keyed by
+the exact normalized PCM bits, owns the shared speaker row and codec codes. Speaker-only requests
+skip codec encoding; a later transcript-conditioned request adds codes without embedding the
+speaker again. Concurrent misses share the encoder execution lock. A deferred engine callback
+finalizes the overlay and reference frame rows before prefix lookup or packed prefill.
+
+Conditioned requests require reference audio and use the default voice. A nonempty reference
+transcript enables codec-frame conditioning; otherwise only the speaker embedding is used.
+Each conditioned request reserves a stateful codec slot before LM submission. Whole-output
+decoding steps through reference and generated codes in order, then uses the source's floating
+ratio and truncation for its crop. Streaming primes its slot with the reference on each segment
+or retry and emits fresh frames. Slot exhaustion returns busy; the
+short-context window fallback cannot preserve the codec's full attention history. The streaming
+frame boundary and whole-output floating crop can differ by one sample.
+
+This request path is an unqualified candidate. Media-geometry qualification rejects v2 until its
+conditioning obligations are supported. Preparing or executing it does not qualify its accuracy,
+resource limits, capacity or latency, and no production recipe enables it.
 
 Compatible depth prompts share packed prefill and their first predictor launch. A fully cached
 prefix can feed its terminal row straight into batched decode. Terminal overlay rows keep serial

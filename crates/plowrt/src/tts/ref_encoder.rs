@@ -2,6 +2,7 @@
 //! `codec.encode.v2` carries actual sample lengths; v1 pads PCM to the selected capacity.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
@@ -15,8 +16,9 @@ const CACHE: usize = 16;
 
 pub struct RefEncoder {
     runtime: Mutex<Box<dyn PacketRuntime>>,
-    /// (pcm, codes), least recently used first.
-    cache: Mutex<Vec<(Vec<f32>, Vec<u32>)>>,
+    /// Exact PCM and shared results, least recently used first.
+    cache: Mutex<Vec<(Vec<f32>, Arc<ReferenceEncoding>)>>,
+    speaker: Option<(SpeakerEncoder, Vec<f32>)>,
     /// (frames, program), ascending.
     capacities: Vec<(usize, usize)>,
     pcm: PacketTensor,
@@ -25,6 +27,33 @@ pub struct RefEncoder {
     pub sample_rate: u32,
     pub frame_samples: usize,
     pub frame_codes: usize,
+    pub codebook: u32,
+}
+
+#[derive(Clone, Default)]
+pub struct ReferenceEncoding {
+    pub codes: Option<Arc<[u32]>>,
+    pub speaker: Option<Arc<[f32]>>,
+}
+
+fn speaker_overlay(pad: &[f32], embedding: &[f32]) -> Result<Vec<f32>, String> {
+    if pad.is_empty() || pad.len() != embedding.len() {
+        return Err("speaker embedding and text-pad widths disagree".into());
+    }
+    pad.iter()
+        .zip(embedding)
+        .map(|(&p, &e)| {
+            let sum = p + e;
+            let bits = sum.to_bits();
+            let rounded =
+                f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000);
+            if p.is_finite() && e.is_finite() && rounded.is_finite() {
+                Ok(rounded)
+            } else {
+                Err("speaker overlay contains a nonfinite value".into())
+            }
+        })
+        .collect()
 }
 
 pub struct SpeakerEncoder {
@@ -40,6 +69,50 @@ pub struct SpeakerEncoder {
 }
 
 impl SpeakerEncoder {
+    pub fn text_pad(path: &Path, c: &super::ConditioningContract) -> Result<Vec<f32>, String> {
+        let image =
+            crate::asset::packet_image::PacketImage::open(path).map_err(|e| e.to_string())?;
+        let table = image
+            .blob
+            .tensors
+            .iter()
+            .find(|t| t.name == c.text_embeddings.name)
+            .ok_or("conditioning text table is missing")?;
+        let range = table
+            .init
+            .as_ref()
+            .ok_or("conditioning text table is not initialized")?;
+        let width = usize::try_from(
+            *c.text_embeddings
+                .shape
+                .get(1)
+                .ok_or("conditioning table shape is missing")?,
+        )
+        .map_err(|_| "conditioning width overflows")?;
+        let start = c
+            .text_pad
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| range.start.checked_add(n))
+            .ok_or("conditioning row offset overflows")?;
+        let end = start
+            .checked_add(width.checked_mul(2).ok_or("conditioning width overflows")?)
+            .filter(|&n| n <= range.end)
+            .ok_or("conditioning row is outside the text table")?;
+        let row: Vec<_> = image
+            .blob
+            .init
+            .get(start..end)
+            .ok_or("conditioning row is missing")?
+            .chunks_exact(2)
+            .map(|v| f32::from_bits(u32::from(u16::from_le_bytes([v[0], v[1]])) << 16))
+            .collect();
+        if row.iter().any(|v| !v.is_finite()) {
+            return Err("conditioning text-pad row is nonfinite".into());
+        }
+        Ok(row)
+    }
+
     pub fn load(path: &Path, device: u8) -> Result<Self, String> {
         let runtime = load_packet_runtime_on(path, "cuda", device)
             .map_err(|e| format!("{}: {e}", path.display()))?
@@ -166,7 +239,7 @@ fn reflect_features(values: &[f32], width: usize, pad: usize) -> Vec<f32> {
 }
 
 #[cfg(all(test, feature = "cpu"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     struct CountedRuntime {
@@ -221,7 +294,7 @@ mod tests {
         }
     }
 
-    fn counted_encoder(
+    pub(crate) fn counted_encoder(
         samples: bool,
         fail_first: bool,
     ) -> (RefEncoder, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -248,7 +321,9 @@ mod tests {
             sample_rate: 24000,
             frame_samples: 2,
             frame_codes: 2,
+            codebook: 2048,
             cache: Mutex::new(Vec::new()),
+            speaker: None,
         };
         (encoder, calls)
     }
@@ -265,7 +340,13 @@ mod tests {
                         scope.spawn(|| {
                             assert!(encoder.cached(&pcm).is_none());
                             start.wait();
-                            encoder.encode_miss(&pcm).unwrap()
+                            encoder
+                                .encode_miss(&pcm)
+                                .unwrap()
+                                .codes
+                                .as_ref()
+                                .unwrap()
+                                .to_vec()
                         })
                     })
                     .collect();
@@ -299,6 +380,192 @@ mod tests {
         }
     }
 
+    #[test]
+    fn joint_cache_upgrades_speaker_only_and_coalesces_concurrent_code_requests() {
+        let (encoder, calls) = counted_encoder(true, false);
+        let speakers = std::sync::atomic::AtomicUsize::new(0);
+        let pcm = [0.25, 0.5, 0.75];
+        let embed = |_: &[f32]| {
+            speakers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![1., 2., 3.])
+        };
+        let first = encoder.encode_cached(&pcm, false, Some(embed)).unwrap();
+        assert!(first.codes.is_none());
+        assert_eq!(first.speaker.as_deref().unwrap(), [1., 2., 3.]);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let start = std::sync::Barrier::new(32);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..32)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        encoder.encode_cached(&pcm, true, Some(embed)).unwrap()
+                    })
+                })
+                .collect();
+            let outputs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            for output in &outputs {
+                assert!(Arc::ptr_eq(&outputs[0], output));
+                assert!(Arc::ptr_eq(
+                    first.speaker.as_ref().unwrap(),
+                    output.speaker.as_ref().unwrap()
+                ));
+                assert_eq!(output.codes.as_deref().unwrap(), [0.25f32.to_bits(); 4]);
+            }
+        });
+        assert_eq!(speakers.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(encoder.cache.lock().len(), 1);
+        let warm = encoder.encode_cached(&pcm, false, Some(embed)).unwrap();
+        assert!(warm.codes.is_some());
+        assert_eq!(speakers.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cold_joint_misses_share_both_encoders_and_failures_remain_retryable() {
+        let (encoder, calls) = counted_encoder(true, false);
+        let speakers = std::sync::atomic::AtomicUsize::new(0);
+        let start = std::sync::Barrier::new(32);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..32)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        encoder
+                            .encode_cached(
+                                &[0.25, 0.5, 0.75],
+                                true,
+                                Some(|_: &[f32]| {
+                                    speakers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    Ok(vec![1.])
+                                }),
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let output = handle.join().unwrap();
+                assert!(output.codes.is_some() && output.speaker.is_some());
+            }
+        });
+        assert_eq!(speakers.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (encoder, calls) = counted_encoder(true, true);
+        assert!(encoder
+            .encode_cached(
+                &[0.25],
+                true,
+                Some(|_: &[f32]| Err("speaker failed".into()))
+            )
+            .is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(encoder
+            .encode_cached(&[0.25], true, Some(|_: &[f32]| Ok(vec![1.])))
+            .is_err());
+        assert!(encoder.cache.lock().is_empty());
+        let output = encoder
+            .encode_cached(&[0.25], true, Some(|_: &[f32]| Ok(vec![1.])))
+            .unwrap();
+        assert!(output.codes.is_some() && output.speaker.is_some());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reference_cache_uses_exact_pcm_bits_and_rejects_invalid_inputs() {
+        let (encoder, calls) = counted_encoder(true, false);
+        assert_eq!(encoder.encode(&[0.0]).unwrap(), [0; 2]);
+        assert_eq!(encoder.encode(&[-0.0]).unwrap(), [(-0.0f32).to_bits(); 2]);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        for pcm in [vec![], vec![0.; 5], vec![f32::NAN], vec![f32::INFINITY]] {
+            assert!(encoder
+                .encode_cached(
+                    &pcm,
+                    false,
+                    Some(|_: &[f32]| panic!("invalid PCM reached speaker"))
+                )
+                .is_err());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        for i in 1..=CACHE + 1 {
+            encoder.encode(&[i as f32]).unwrap();
+        }
+        assert_eq!(encoder.cache.lock().len(), CACHE);
+        assert!(encoder.cached(&[0.0]).is_none());
+    }
+
+    #[test]
+    fn speaker_pad_reads_only_the_declared_initialized_bf16_row() {
+        use packet::devbuild::{Builder, Model, TensorDecl};
+        use plow_asset::packet_pipeline::{PipelineDType, PipelineTensor};
+        let dir = std::env::temp_dir().join(format!("plow-speaker-pad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut data = vec![0u8; 24];
+        for (out, value) in data[8..16]
+            .chunks_exact_mut(2)
+            .zip([0x3f80u16, 0x4000, 0x4040, 0x4080])
+        {
+            out.copy_from_slice(&value.to_le_bytes());
+        }
+        let mut model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: vec![TensorDecl {
+                name: "text_table".into(),
+                bytes: 24,
+                init: Some(data),
+            }],
+            progs: vec![Builder::new(1).finish()],
+            kv_row_insts: Vec::new(),
+            prog_t: vec![1],
+            gen: Vec::new(),
+        };
+        let mut contract = super::super::ConditioningContract {
+            packets: plow_asset::dual_stream::SpeakerConditioning {
+                version: 1,
+                speaker_packet: "speaker.pkt".into(),
+                reference_packet: "ref.pkt".into(),
+            },
+            text_embeddings: PipelineTensor {
+                name: "text_table".into(),
+                dtype: PipelineDType::Bf16,
+                shape: vec![3, 4],
+            },
+            text_pad: 1,
+        };
+        let path = dir.join("model.pkt");
+        std::fs::write(&path, model.to_blob()).unwrap();
+        assert_eq!(
+            SpeakerEncoder::text_pad(&path, &contract).unwrap(),
+            [1., 2., 3., 4.]
+        );
+        contract.text_pad = 3;
+        assert!(SpeakerEncoder::text_pad(&path, &contract).is_err());
+        contract.text_pad = 1;
+        model.tensors[0].init = None;
+        let uninitialized = dir.join("uninitialized.pkt");
+        std::fs::write(&uninitialized, model.to_blob()).unwrap();
+        assert!(SpeakerEncoder::text_pad(&uninitialized, &contract).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn speaker_overlay_rounds_the_complete_row_to_bf16() {
+        assert_eq!(
+            speaker_overlay(
+                &[1., 1., -1., -1.],
+                &[0.00390625, 0.01171875, -0.00390625, -0.01171875]
+            )
+            .unwrap(),
+            [1., 1.015625, -1., -1.015625]
+        );
+        assert!(speaker_overlay(&[], &[]).is_err());
+        assert!(speaker_overlay(&[0.], &[0., 0.]).is_err());
+        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+            assert!(speaker_overlay(&[v], &[v]).is_err());
+        }
+    }
+
     fn speaker_driver(asset: &PacketAsset) -> &str {
         let drivers: Vec<_> = asset
             .pipelines()
@@ -322,6 +589,87 @@ mod tests {
             [2., 3., 0., 1., 2., 3., 4., 5., 2., 3.]
         );
         assert_eq!(reflect_features(&values, 2, 0), values);
+    }
+
+    #[test]
+    #[ignore = "REF_CODEC_PACKET, SPEAKER_PACKET, CONDITIONING_REFERENCE_JSON, CONDITIONING_RESULT_JSON; saved native joint encoder correctness, no timing"]
+    fn joint_conditioning_matches_saved_encoders_at_serving_concurrencies() {
+        let read_f32 = |path: &str| {
+            std::fs::read(path)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let fixture: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("CONDITIONING_REFERENCE_JSON").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let pad = read_f32(fixture["pad"].as_str().unwrap());
+        let encoder = RefEncoder::load(Path::new(&std::env::var("REF_CODEC_PACKET").unwrap()), 0)
+            .unwrap()
+            .with_speaker(
+                SpeakerEncoder::load(Path::new(&std::env::var("SPEAKER_PACKET").unwrap()), 0)
+                    .unwrap(),
+                pad,
+            )
+            .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 4);
+        let mut checks = Vec::new();
+        for (index, case) in cases.iter().enumerate() {
+            let pcm = read_f32(case["pcm"].as_str().unwrap());
+            let expected_row = read_f32(case["speaker_row"].as_str().unwrap());
+            let expected_codes: Vec<_> = std::fs::read(case["codes"].as_str().unwrap())
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            let speaker_only = if index % 2 == 0 {
+                Some(encoder.conditioned(&pcm, false).unwrap())
+            } else {
+                None
+            };
+            if let Some(output) = &speaker_only {
+                assert!(output.codes.is_none());
+            }
+            for width in [32, 8, 1] {
+                let start = std::sync::Barrier::new(width);
+                let results = std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..width)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                start.wait();
+                                encoder.conditioned(&pcm, true).unwrap()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap())
+                        .collect::<Vec<_>>()
+                });
+                for result in &results {
+                    assert!(Arc::ptr_eq(&results[0], result));
+                    assert_eq!(result.codes.as_deref().unwrap(), expected_codes);
+                    assert_eq!(result.speaker.as_deref().unwrap(), expected_row);
+                    if let Some(output) = &speaker_only {
+                        assert!(Arc::ptr_eq(
+                            output.speaker.as_ref().unwrap(),
+                            result.speaker.as_ref().unwrap()
+                        ));
+                    }
+                }
+                let warm = encoder.conditioned(&pcm, false).unwrap();
+                assert!(Arc::ptr_eq(&results[0], &warm));
+                checks.push(serde_json::json!({"case":case["case"],"concurrency":width,"frames":expected_codes.len()/encoder.frame_codes,
+                    "codes_exact":true,"speaker_overlay_exact":true,"shared_result":true,"pass":true}));
+            }
+        }
+        assert_eq!(encoder.cache.lock().len(), 4);
+        std::fs::write(std::env::var("CONDITIONING_RESULT_JSON").unwrap(), serde_json::to_vec_pretty(&serde_json::json!({
+            "scope":"saved encoder inputs, joint cache and complete BF16 overlay; no full model or timing qualification",
+            "pass":true,"benchmark_run":false,"checks":checks})).unwrap()).unwrap();
     }
 
     #[test]
@@ -1549,34 +1897,161 @@ impl RefEncoder {
             sample_rate: param("audio.sample_rate")? as u32,
             frame_samples: param("codec.frame_samples")? as usize,
             frame_codes: param("codec.frame_codes")? as usize,
+            codebook: param("codec.codebook")? as u32,
             capacities,
             runtime: Mutex::new(runtime),
             cache: Mutex::new(Vec::new()),
+            speaker: None,
         })
     }
 
     /// Longest clip one launch takes, in samples.
     pub fn max_samples(&self) -> usize {
-        self.capacities
+        let codec = self
+            .capacities
             .last()
-            .map_or(0, |&(f, _)| f * self.frame_samples)
+            .map_or(0, |&(f, _)| f * self.frame_samples);
+        self.speaker
+            .as_ref()
+            .map_or(codec, |(s, _)| codec.min(s.max_samples))
+    }
+
+    pub fn min_samples(&self) -> usize {
+        self.speaker.as_ref().map_or(1, |(s, _)| s.min_samples)
+    }
+
+    pub fn with_speaker(mut self, speaker: SpeakerEncoder, pad: Vec<f32>) -> Result<Self, String> {
+        if self.speaker.is_some()
+            || !self.cache.lock().is_empty()
+            || self.samples.is_none()
+            || self.sample_rate != speaker.sample_rate
+            || pad.len() != speaker.plan.output_width
+            || pad.is_empty()
+            || pad.iter().any(|v| !v.is_finite())
+            || speaker.min_samples > self.max_samples().min(speaker.max_samples)
+        {
+            return Err("speaker conditioning disagrees with the reference encoder".into());
+        }
+        self.speaker = Some((speaker, pad));
+        Ok(self)
+    }
+
+    pub fn conditioned(
+        &self,
+        pcm: &[f32],
+        include_codes: bool,
+    ) -> Result<Arc<ReferenceEncoding>, String> {
+        let (speaker, pad) = self
+            .speaker
+            .as_ref()
+            .ok_or("reference encoder has no speaker binding")?;
+        self.encode_cached(
+            pcm,
+            include_codes,
+            Some(|pcm: &[f32]| speaker_overlay(pad, &speaker.encode(pcm)?)),
+        )
     }
 
     /// `[ceil(n / frame_samples)][frame_codes]` codes of `pcm` (mono, at `sample_rate`).
     pub fn encode(&self, pcm: &[f32]) -> Result<Vec<u32>, String> {
-        self.cached(pcm).map_or_else(|| self.encode_miss(pcm), Ok)
+        let output = if self.speaker.is_some() {
+            self.conditioned(pcm, true)?
+        } else {
+            self.encode_miss(pcm)?
+        };
+        Ok(output
+            .codes
+            .as_ref()
+            .ok_or("reference encoder returned no codes")?
+            .to_vec())
     }
 
+    #[cfg(test)]
     fn cached(&self, pcm: &[f32]) -> Option<Vec<u32>> {
-        let mut cache = self.cache.lock();
-        let i = cache.iter().position(|(clip, _)| clip.as_slice() == pcm)?;
-        let hit = cache.remove(i);
-        let codes = hit.1.clone();
-        cache.push(hit);
-        Some(codes)
+        self.cached_output(pcm, true, false)?
+            .codes
+            .as_ref()
+            .map(|c| c.to_vec())
     }
 
-    fn encode_miss(&self, pcm: &[f32]) -> Result<Vec<u32>, String> {
+    fn cached_output(
+        &self,
+        pcm: &[f32],
+        codes: bool,
+        speaker: bool,
+    ) -> Option<Arc<ReferenceEncoding>> {
+        let mut cache = self.cache.lock();
+        let i = cache.iter().position(|(clip, output)| {
+            bytemuck::cast_slice::<f32, u8>(clip) == bytemuck::cast_slice::<f32, u8>(pcm)
+                && (!codes || output.codes.is_some())
+                && (!speaker || output.speaker.is_some())
+        })?;
+        let hit = cache.remove(i);
+        let output = hit.1.clone();
+        cache.push(hit);
+        Some(output)
+    }
+
+    fn encode_miss(&self, pcm: &[f32]) -> Result<Arc<ReferenceEncoding>, String> {
+        self.encode_cached(pcm, true, None::<fn(&[f32]) -> Result<Vec<f32>, String>>)
+    }
+
+    fn encode_cached<F>(
+        &self,
+        pcm: &[f32],
+        want_codes: bool,
+        speaker: Option<F>,
+    ) -> Result<Arc<ReferenceEncoding>, String>
+    where
+        F: FnOnce(&[f32]) -> Result<Vec<f32>, String>,
+    {
+        let want_speaker = speaker.is_some();
+        if pcm.len() < self.min_samples()
+            || pcm.len() > self.max_samples()
+            || pcm.iter().any(|v| !v.is_finite())
+            || (!want_codes && !want_speaker)
+        {
+            return Err("reference audio is outside encoder bounds or nonfinite".into());
+        }
+        if let Some(output) = self.cached_output(pcm, want_codes, want_speaker) {
+            return Ok(output);
+        }
+        let mut rt = self.runtime.lock();
+        if let Some(output) = self.cached_output(pcm, want_codes, want_speaker) {
+            return Ok(output);
+        }
+        let mut output = self
+            .cached_output(pcm, false, false)
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
+        if output.speaker.is_none() {
+            if let Some(speaker) = speaker {
+                let row = speaker(pcm)?;
+                if row.is_empty() || row.iter().any(|v| !v.is_finite()) {
+                    return Err("speaker encoder returned an invalid overlay".into());
+                }
+                output.speaker = Some(row.into());
+            }
+        }
+        if want_codes && output.codes.is_none() {
+            output.codes = Some(self.encode_runtime(pcm, rt.as_mut())?.into());
+        }
+        let output = Arc::new(output);
+        let mut cache = self.cache.lock();
+        if let Some(i) = cache.iter().position(|(clip, _)| {
+            bytemuck::cast_slice::<f32, u8>(clip) == bytemuck::cast_slice::<f32, u8>(pcm)
+        }) {
+            cache.remove(i);
+        }
+        if cache.len() == CACHE {
+            cache.remove(0);
+        }
+        cache.push((pcm.to_vec(), output.clone()));
+        Ok(output)
+    }
+
+    fn encode_runtime(&self, pcm: &[f32], rt: &mut dyn PacketRuntime) -> Result<Vec<u32>, String> {
         let frames = pcm.len().div_ceil(self.frame_samples);
         let &(cap, program) = self
             .capacities
@@ -1589,10 +2064,6 @@ impl RefEncoder {
                     self.max_samples()
                 )
             })?;
-        let mut rt = self.runtime.lock();
-        if let Some(codes) = self.cached(pcm) {
-            return Ok(codes);
-        }
         let mut codes = vec![0u32; frames * self.frame_codes];
         let e = |x: crate::RuntimeError| format!("reference encoder: {x}");
         if let Some(samples) = self.samples {
@@ -1621,12 +2092,6 @@ impl RefEncoder {
         rt.run(program).map_err(e)?;
         rt.read_tensor_at(self.codes, 0, bytemuck::cast_slice_mut(&mut codes))
             .map_err(e)?;
-        // Publish before releasing the runtime so waiting misses reuse this execution.
-        let mut cache = self.cache.lock();
-        if cache.len() == CACHE {
-            cache.remove(0);
-        }
-        cache.push((pcm.to_vec(), codes.clone()));
         Ok(codes)
     }
 }
