@@ -64,6 +64,45 @@ class PreparedPredictorTests(unittest.TestCase):
 
 
 class DecoderReferenceTests(unittest.TestCase):
+    def test_streaming_source_receives_frame_major_codes_and_resets_each_decode(self):
+        class Config:
+            num_quantizers = 2
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = Config()
+                self.decoder_transformer = torch.nn.Module()
+                self.decoder_transformer.config = self.config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps(dict(
+                model_type="mimi", sampling_rate=24, frame_rate=12, codebook_size=4)))
+            source = root / "streaming.py"
+            source.write_text('''import torch
+class StaticMimi:
+    def __init__(self, model, max_slots, batch_buckets):
+        assert max_slots == 1 and batch_buckets == (1,)
+        self.window = 250
+    def reset(self, slot, zero_kv):
+        assert slot == 0 and zero_kv
+        self.position = 0
+    def _forward(self, slots, codes):
+        assert slots.tolist() == [0] and tuple(codes.shape) == (1, 2, 1)
+        value = codes.sum().float() + self.position
+        self.position += 1
+        return value.expand(1, 1, 2)
+''')
+            with patch("transformers.MimiModel.from_pretrained", return_value=(Model(), {})):
+                decode, meta = load_reference_decoder(root, "cpu", source)
+            codes = np.array([[1, 2], [2, 3]], dtype=np.int64)
+            for _ in range(2):
+                np.testing.assert_array_equal(decode(codes), [3, 3, 6, 6])
+            self.assertEqual(meta["reference_kind"], "upstream_static_streaming")
+            self.assertEqual(meta["attention_window_rows"], 250)
+            self.assertIn(str(source.resolve()), meta["source_files"])
+
     def test_rejects_incomplete_official_weight_loading(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

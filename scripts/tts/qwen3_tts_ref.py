@@ -19,6 +19,8 @@ package's own `generate` with the same settings and records whether its codes eq
 it writes conditional FP32 logits and comparison diagnostics without loading the audio model.
 --decoder-reference --dtype fp32 takes a tokenizer snapshot and saved encoder-reference JSON;
 --decoder-result PATH (repeatable) compares captured priming PCM against the official decoder.
+--mimi-streaming-source PATH uses the pinned upstream StaticMimi source for the streaming
+reference; the raw HF eager decoder otherwise uses full-history causal attention.
 """
 import argparse
 import json
@@ -130,9 +132,11 @@ def prepared_predictor_reference(a):
     print(json.dumps(records), flush=True)
 
 
-def load_reference_decoder(path, device):
+def load_reference_decoder(path, device, streaming_source=None):
     import inspect
     config = json.loads((Path(path) / "config.json").read_text())
+    assert streaming_source is None or config["model_type"] == "mimi"
+    extra_sources = []
     if config["model_type"] == "qwen3_tts_tokenizer_12hz":
         import importlib.util
         import sys
@@ -169,13 +173,31 @@ def load_reference_decoder(path, device):
                     sample_rate=config["sampling_rate"])
         meta["codebook_sizes"] = [config["codebook_size"]] * meta["frame_codes"]
 
-        def decode(codes):
-            values = model.decode(audio_codes=torch.from_numpy(codes.T.copy())[None].to(device),
-                                  return_dict=True).audio_values[0, 0]
-            return values.float().cpu().numpy()
+        if streaming_source is None:
+            def decode(codes):
+                values = model.decode(audio_codes=torch.from_numpy(codes.T.copy())[None].to(device),
+                                      return_dict=True).audio_values[0, 0]
+                return values.float().cpu().numpy()
+            meta["reference_kind"] = "hf_eager_full_history"
+        else:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("mimi_streaming_reference", streaming_source)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            stream = module.StaticMimi(model, max_slots=1, batch_buckets=(1,))
+            slot = torch.zeros(1, dtype=torch.long, device=device)
+
+            def decode(codes):
+                stream.reset(0, zero_kv=True)
+                frames = [stream._forward(slot, torch.from_numpy(frame.copy())[None, :, None].to(device))[0, 0]
+                          for frame in codes]
+                return torch.cat(frames).float().cpu().numpy()
+            meta["reference_kind"] = "upstream_static_streaming"
+            meta["attention_window_rows"] = stream.window
+            extra_sources.append(str(Path(streaming_source).resolve()))
     else:
         raise ValueError(f"unsupported reference tokenizer: {config['model_type']}")
-    meta["source_files"] = [inspect.getfile(type(model)), inspect.getfile(type(model.config))]
+    meta["source_files"] = [inspect.getfile(type(model)), inspect.getfile(type(model.config)), *extra_sources]
     return decode, meta
 
 
@@ -197,7 +219,7 @@ def decoder_reference(a):
         path = Path(a.model) / name
         assert file_sha(path) == expected, f"changed tokenizer source: {path}"
         inputs.append(path)
-    decode, meta = load_reference_decoder(a.model, a.device)
+    decode, meta = load_reference_decoder(a.model, a.device, getattr(a, "mimi_streaming_source", None))
     for name in ("frame_codes", "frame_samples", "sample_rate"):
         assert meta[name] == reference[name], f"decoder {name} differs from saved reference"
     inputs.extend(Path(p) for p in meta["source_files"])
@@ -404,6 +426,8 @@ def main():
                     help="official FP32 decoder: MODEL=tokenizer snapshot, TEXTS=saved codec-reference JSON")
     ap.add_argument("--decoder-result", action="append", default=[],
                     help="captured priming result JSON with whole/stateful/primed PCM; repeatable")
+    ap.add_argument("--mimi-streaming-source",
+                    help="pinned upstream source defining StaticMimi; explicit sliding-window streaming reference")
     a = ap.parse_args()
     if a.decoder_reference:
         if a.prepared_predictor or a.dtype != "fp32" or not a.decoder_result:
@@ -411,8 +435,8 @@ def main():
         if not decoder_reference(a)["pass_all"]:
             raise SystemExit(1)
         return
-    if a.decoder_result:
-        ap.error("--decoder-result requires --decoder-reference")
+    if a.decoder_result or a.mimi_streaming_source:
+        ap.error("--decoder-result and --mimi-streaming-source require --decoder-reference")
     if a.prepared_predictor:
         if a.dtype != "fp32":
             ap.error("--prepared-predictor requires --dtype fp32")

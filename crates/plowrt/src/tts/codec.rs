@@ -2204,6 +2204,22 @@ mod tests {
             &std::fs::read(std::env::var("REF_CODEC_REFERENCE").unwrap()).unwrap(),
         )
         .unwrap();
+        let path = crate::exec::packet_runtime::stage_packet(
+            &assets.join("model.pkt"),
+            "codec.packet",
+            PACKET,
+        )
+        .unwrap();
+        let image = crate::asset::packet_image::PacketImage::open(&path).unwrap();
+        let windows: std::collections::BTreeSet<usize> = image
+            .blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .filter(|d| d.op == packet::dev::DevOp::AttentionF32 as u16 && d.i[6] & 8 != 0)
+            .map(|d| (d.i[6] >> 16) as usize)
+            .collect();
+        assert!(!windows.is_empty() && !windows.contains(&0));
         let codec = Codec::load_on(&assets, 0).unwrap();
         assert_eq!(
             codec.frame_codes as u64,
@@ -2236,6 +2252,30 @@ mod tests {
             })
             .collect();
         assert!(!sources.is_empty());
+        let rows_per_frame = codec
+            .parameters
+            .get("stream.transformer_rows_per_frame")
+            .copied()
+            .unwrap_or(1) as usize;
+        assert!(rows_per_frame > 0);
+        let available = sources
+            .iter()
+            .map(|(_, codes)| codes.len() / codec.frame_codes)
+            .max()
+            .unwrap()
+            .min(codec.max_frames);
+        let mut boundaries = Vec::new();
+        for &window in &windows {
+            let frames = window.div_ceil(rows_per_frame);
+            assert!(frames > fresh && 2 * frames + fresh <= available);
+            for center in [frames, 2 * frames] {
+                boundaries.extend([center - 1, center, center + 1]);
+            }
+        }
+        boundaries.push(available - fresh);
+        boundaries.retain(|&frames| frames + fresh <= available);
+        boundaries.sort_unstable();
+        boundaries.dedup();
         let mut slots: Vec<_> = (0..32)
             .map(|_| Some(codec.acquire_slot().expect("32 stream slots required")))
             .collect();
@@ -2243,12 +2283,18 @@ mod tests {
         let mut outputs = Vec::new();
         let mut all_pass = true;
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            for width in [1, 8, 32] {
+            for history in [false, true] {
+              for width in [1, 8, 32] {
+               let cohorts = if history { boundaries.len().div_ceil(width) } else { 1 };
+               for cohort in 0..cohorts {
                 let items: Vec<_> = (0..width).map(|b| {
-                    let (name, codes) = &sources[b % sources.len()];
-                    let frames = if width == 1 { codec.step_frames + 1 } else {
+                    let frames = if history { boundaries[(cohort * width + b) % boundaries.len()] }
+                    else if width == 1 { codec.step_frames + 1 } else {
                         [0, 1, codec.step_frames, codec.step_frames + 1, longest][b % 5]
                     };
+                    let eligible: Vec<_> = sources.iter()
+                        .filter(|(_, codes)| codes.len() >= (frames + fresh) * codec.frame_codes).collect();
+                    let (name, codes) = eligible[(cohort * width + b) % eligible.len()];
                     (name.clone(), codes[..(frames + fresh) * codec.frame_codes].to_vec(), frames)
                 }).collect();
                 let whole = futures::future::join_all(items.iter().map(|(_, codes, frames)|
@@ -2272,16 +2318,32 @@ mod tests {
                     outputs.extend_from_slice(expected);
                     outputs.extend_from_slice(&control[b]);
                     outputs.extend_from_slice(&actual[b]);
-                    checks.push(serde_json::json!({"width":width,"item":b,"source":name,"reference_frames":frames,
+                    checks.push(serde_json::json!({"suite":if history {"history"} else {"chunking"},
+                        "cohort":cohort,"width":width,"item":b,"source":name,"reference_frames":frames,
                         "fresh_frames":fresh,"samples":expected.len(),"stateful_exact":exact,"finite":finite,
                         "whole_relative_l2":relative_l2,"pass":pass,"output_offset_f32":offset}));
                 }
+               }
+              }
             }
         });
+        assert_eq!(
+            checks.iter().filter(|c| c["suite"] == "chunking").count(),
+            41
+        );
+        for width in [1, 8, 32] {
+            for &frames in &boundaries {
+                assert!(checks.iter().any(|c| c["suite"] == "history"
+                    && c["width"] == width
+                    && c["reference_frames"] == frames));
+            }
+        }
         let path = std::path::PathBuf::from(std::env::var("CODEC_PRIMING_RESULT_JSON").unwrap());
         std::fs::write(path.with_extension("f32"), bytemuck::cast_slice(&outputs)).unwrap();
         std::fs::write(path, serde_json::to_vec_pretty(&serde_json::json!({
-            "scope":"saved reference codes, stateful priming vs ordinary steps and concatenated decode; no timings",
+            "scope":"saved reference codes, chunking and attention-history boundaries; stateful priming vs ordinary steps and concatenated decode; no timings",
+            "attention_window_rows":windows,"transformer_rows_per_frame":rows_per_frame,
+            "boundary_reference_frames":boundaries,"max_available_frames":available,
             "pass":all_pass,"whole_relative_l2_limit":1e-5,"checks":checks})).unwrap()).unwrap();
         assert!(all_pass, "reference priming changed fresh audio");
     }
