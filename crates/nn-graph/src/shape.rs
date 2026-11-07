@@ -89,3 +89,10 @@ impl fmt::Debug for Shape {
         write!(f, "Shape{}", self)
     }
 }
+
+#[cfg(feature = "models")]
+impl serde::Serialize for Shape {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}

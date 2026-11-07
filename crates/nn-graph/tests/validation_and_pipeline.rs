@@ -15,6 +15,69 @@ fn weight_names(g: &Graph) -> Vec<String> {
 // ---- symbolic validation ----------------------------------------------
 
 #[test]
+fn conv2d_symbolic_sizes_match_bound_inference() {
+    for (factor, shift, kernel, stride, padding) in [
+        (1, 0, 3, 1, 0),
+        (4, 0, 3, 2, 0),
+        (4, 0, 3, 2, 1),
+        (4, 0, 1, 2, 1),
+        (4, 1, 3, 2, 1),
+        (8, 0, 7, 4, 0),
+    ] {
+        let build = || {
+            let mut nn = Nn::new(DType::BF16, DType::BF16);
+            let h = nn.sym("H").mul(&Dim::stat(factor)).add(&Dim::stat(shift));
+            let w = nn.sym("W").mul(&Dim::stat(factor)).add(&Dim::stat(shift));
+            let x = nn.input(
+                "x",
+                nn.shape([Dim::stat(1), Dim::stat(1), h, w]),
+                DType::BF16,
+            );
+            let y = nn.conv2d(
+                "conv",
+                x,
+                1,
+                1,
+                (kernel, kernel),
+                (stride, stride),
+                (padding, padding),
+                false,
+            );
+            (nn.finish(), y)
+        };
+        let bindings = nn_graph::Bindings::new().set("H", 8).set("W", 10);
+        let (mut symbolic, y) = build();
+        infer_shapes(&mut symbolic).unwrap();
+        symbolic.bind(&bindings);
+        let (mut concrete, _) = build();
+        concrete.bind(&bindings);
+        infer_shapes(&mut concrete).unwrap();
+        assert_eq!(
+            symbolic.tensor(y).shape,
+            concrete.tensor(y).shape,
+            "factor={factor}, shift={shift}, kernel={kernel}, stride={stride}, padding={padding}"
+        );
+    }
+}
+
+#[test]
+fn conv2d_rejects_unrepresentable_symbolic_sizes() {
+    let mut nn = Nn::new(DType::BF16, DType::BF16);
+    let h = nn.sym("H");
+    let x = nn.input(
+        "x",
+        nn.shape([Dim::stat(1), Dim::stat(1), h, Dim::stat(8)]),
+        DType::BF16,
+    );
+    nn.conv2d("conv", x, 1, 1, (3, 3), (2, 2), (1, 1), false);
+    let err = infer_shapes(&mut nn.finish()).unwrap_err();
+    assert!(
+        err.to_string().contains("bind the input size first"),
+        "{err}"
+    );
+}
+
+#[test]
 fn reshape_rejects_provably_unequal_symbolic_counts() {
     let mut nn = Nn::new(DType::BF16, DType::BF16);
     let b = nn.sym("B");

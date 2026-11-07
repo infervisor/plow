@@ -971,22 +971,53 @@ pub fn build_from_metadata(
 /// Visualization and architecture inspection do not require a safetensors
 /// index or tokenizer assets. Compilation uses [`resolve_model_metadata`].
 pub fn fetch_config(model_id: &str) -> Result<String, HubError> {
+    fetch_file(model_id, "config.json")
+}
+
+/// Download one repo file (e.g. `model_index.json`, `transformer/config.json`) and return its
+/// contents. `model_id` may also be a local directory.
+pub fn fetch_file(model_id: &str, file: &str) -> Result<String, HubError> {
+    fetch_file_at_revision(model_id, file, None)
+}
+
+pub fn fetch_file_at_revision(
+    model_id: &str,
+    file: &str,
+    revision: Option<&str>,
+) -> Result<String, HubError> {
     let local = Path::new(model_id);
     if local.is_dir() {
-        return read_config(model_id, local.join("config.json"));
+        return read_config(model_id, local.join(file));
     }
 
-    use hf_hub::{api::sync::ApiBuilder, Cache};
+    use hf_hub::{api::sync::ApiBuilder, Cache, Repo, RepoType};
 
-    let cache = Cache::from_env().model(model_id.to_string());
-    let cached = cache.get("config.json");
-    let offline = std::env::var("HF_HUB_OFFLINE").is_ok_and(|value| {
-        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
-    });
-    if offline {
+    let repo = Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        revision.unwrap_or("main").to_string(),
+    );
+    let cache = Cache::from_env();
+    let cached = if is_hub_commit(repo.revision()) {
+        let path = cache
+            .path()
+            .join(repo.folder_name())
+            .join("snapshots")
+            .join(repo.revision())
+            .join(file);
+        path.is_file().then_some(path)
+    } else {
+        cache.repo(repo.clone()).get(file)
+    };
+    if revision.is_some_and(is_hub_commit) {
+        if let Some(path) = &cached {
+            return read_config(model_id, path.clone());
+        }
+    }
+    if offline_enabled() {
         let path = cached.ok_or_else(|| {
             HubError::Hub(format!(
-                "{model_id}: config.json is not available in the Hugging Face cache \
+                "{model_id}: {file} is not available in the Hugging Face cache \
                  (HF_HUB_OFFLINE is set)"
             ))
         })?;
@@ -997,12 +1028,176 @@ pub fn fetch_config(model_id: &str) -> Result<String, HubError> {
         .with_progress(false)
         .build()
         .map_err(|e| HubError::Hub(e.to_string()))?;
-    let path = match api.model(model_id.to_string()).get("config.json") {
+    let path = match api.repo(repo).get(file) {
         Ok(path) => path,
         Err(_) if cached.is_some() => cached.expect("checked above"),
         Err(error) => return Err(HubError::Hub(error.to_string())),
     };
     read_config(model_id, path)
+}
+
+/// Resolve a moving ref once, so config, components and headers use one immutable snapshot.
+pub fn resolve_revision(model_id: &str, revision: Option<&str>) -> Result<String, HubError> {
+    if let Some(revision) = revision.filter(|r| is_hub_commit(r)) {
+        return Ok(revision.to_string());
+    }
+    use hf_hub::{api::sync::ApiBuilder, Cache, Repo, RepoType};
+    let repo = Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        revision.unwrap_or("main").to_string(),
+    );
+    let cached_revision = || {
+        let cached = Cache::from_env().repo(repo.clone());
+        ["config.json", "model_index.json"]
+            .iter()
+            .find_map(|file| cached.get(file))
+            .and_then(|p| p.parent()?.file_name()?.to_str().map(str::to_string))
+    };
+    if !offline_enabled() {
+        let api = ApiBuilder::from_env()
+            .with_progress(false)
+            .build()
+            .map_err(|e| HubError::Hub(e.to_string()))?;
+        match api.repo(repo.clone()).info() {
+            Ok(info) => return Ok(info.sha),
+            Err(e) if cached_revision().is_none() => return Err(HubError::Hub(e.to_string())),
+            Err(_) => {}
+        }
+    }
+    cached_revision().ok_or_else(|| {
+        HubError::Hub(format!(
+            "{model_id}: revision {:?} is not cached",
+            revision.unwrap_or("main")
+        ))
+    })
+}
+
+fn is_hub_commit(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Read only safetensors headers. Sharded checkpoints use bounded HTTP ranges, never Hub
+/// downloads of shard payloads. Components use the same pinned repo revision as their config.
+pub fn checkpoint_tensors(
+    model_id: &str,
+    revision: Option<&str>,
+    component: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, crate::viz::CheckpointTensor>, HubError> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let safe_path = |name: &str| {
+        !name.is_empty()
+            && Path::new(name)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+    };
+    if component.is_some_and(|c| !safe_path(c)) {
+        return Err(HubError::Hub("invalid checkpoint component path".into()));
+    }
+    let path = |name: &str| component.map_or_else(|| name.to_string(), |c| format!("{c}/{name}"));
+    let mut index = None;
+    for stem in ["model", "diffusion_pytorch_model"] {
+        if let Ok(json) = fetch_file_at_revision(
+            model_id,
+            &path(&format!("{stem}.safetensors.index.json")),
+            revision,
+        ) {
+            let value: serde_json::Value =
+                serde_json::from_str(&json).map_err(|e| HubError::Hub(e.to_string()))?;
+            index = Some(value);
+            break;
+        }
+    }
+    let shards = if let Some(index) = &index {
+        index
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| HubError::Hub("safetensors index has no weight_map".into()))?
+            .values()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .filter(|s| safe_path(s) && s.ends_with(".safetensors"))
+                    .ok_or_else(|| HubError::Hub("invalid safetensors shard path".into()))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?
+    } else {
+        BTreeSet::new()
+    };
+    let read_header = |file: &str| -> Result<serde_json::Value, HubError> {
+        let file = path(file);
+        let json = if Path::new(model_id).is_dir() {
+            synthesize_index_from_file(&Path::new(model_id).join(&file))?
+        } else {
+            if offline_enabled() {
+                return Err(HubError::Hub(
+                    "checkpoint validation needs local safetensors files or online header access"
+                        .into(),
+                ));
+            }
+            use hf_hub::{Repo, RepoType};
+            let repo = Repo::with_revision(
+                model_id.to_string(),
+                RepoType::Model,
+                revision.unwrap_or("main").to_string(),
+            );
+            let api = hf_hub::api::sync::ApiBuilder::from_env()
+                .with_progress(false)
+                .build()
+                .map_err(|e| HubError::Hub(e.to_string()))?;
+            fetch_remote_safetensors_index(
+                &api.repo(repo).url(&file),
+                hf_hub::Cache::from_env().token().as_deref(),
+            )?
+        };
+        serde_json::from_str(&json).map_err(|e| HubError::Hub(e.to_string()))
+    };
+    let headers = if shards.is_empty() && index.is_none() {
+        vec![read_header("model.safetensors")
+            .or_else(|_| read_header("diffusion_pytorch_model.safetensors"))?]
+    } else {
+        shards
+            .iter()
+            .map(|s| read_header(s))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut tensors = BTreeMap::new();
+    for header in headers {
+        let metadata = header["plow_tensor_metadata"]
+            .as_object()
+            .ok_or_else(|| HubError::Hub("missing safetensors tensor metadata".into()))?;
+        for (name, t) in metadata {
+            let dtype = t["dtype"]
+                .as_str()
+                .and_then(DType::from_safetensors_name)
+                .ok_or_else(|| HubError::Hub(format!("unsupported storage dtype for {name}")))?;
+            let shape: Vec<i64> = serde_json::from_value(t["shape"].clone())
+                .map_err(|e| HubError::Hub(e.to_string()))?;
+            let elements = shape
+                .iter()
+                .try_fold(1u64, |n, &d| n.checked_mul(u64::try_from(d).ok()?))
+                .ok_or_else(|| HubError::Hub(format!("invalid shape for {name}")))?;
+            if tensors
+                .insert(
+                    name.clone(),
+                    crate::viz::CheckpointTensor {
+                        dtype,
+                        shape,
+                        bytes: dtype.tile_bytes(elements),
+                    },
+                )
+                .is_some()
+            {
+                return Err(HubError::Hub(format!(
+                    "duplicate checkpoint tensor {name} across shards"
+                )));
+            }
+        }
+    }
+    if tensors.is_empty() {
+        return Err(HubError::Hub("checkpoint has no tensors".into()));
+    }
+    Ok(tensors)
 }
 
 fn read_config(model_id: &str, path: PathBuf) -> Result<String, HubError> {
@@ -1019,6 +1214,26 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn viz_checkpoint_headers_check_storage_and_reject_escaping_shards() {
+        let dir = tempdir("viz-header-storage");
+        std::fs::write(dir.join("model.safetensors"), safetensors_fixture()).unwrap();
+        let tensors = checkpoint_tensors(dir.to_str().unwrap(), None, None).unwrap();
+        assert!(!tensors.is_empty());
+        let bytes: u64 = tensors.values().map(|t| t.bytes).sum();
+        assert_eq!(bytes, 12);
+        std::fs::write(
+            dir.join(SAFETENSORS_INDEX),
+            r#"{"weight_map":{"x":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(checkpoint_tensors(dir.to_str().unwrap(), None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid safetensors shard path"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn tempdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

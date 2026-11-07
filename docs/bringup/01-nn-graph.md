@@ -207,13 +207,80 @@ nix develop --command bash -c '
 ```bash
 # Local: you already have config.json.
 # Hub (needs the `hub` feature; downloads config.json via hf-hub 0.4):
-nix develop --command bash -c 'cargo run -q -p plowc -- viz --model <hf-id> --port 0 --out /tmp/graph.html'
+nix develop --command bash -c 'cargo run -q -p plowc -- --model <hf-id> viz --port 0 --out /tmp/graph.html'
 ```
 
 `plowc viz` is the end-to-end Stage-1 driver: it resolves the source
-(`--hf-dir <dir>`, `--model <hf-id>`, or `--net <file.json>`), builds the graph,
-runs inference, and writes a self-contained HTML DAG viewer (or serves it with
-`--port <n>`). Use it to eyeball op order and per-tensor shapes.
+(`--hf-dir <dir>`, `--model <hf-id>`, `--net <file.json>`, or a diffusers repo with
+`model_index.json`), builds every network, runs shape inference (`--batch`/`--seq` bind
+`B`, `S`, `L`), and writes a self-contained viewer (or serves it with `--port <n>`).
+*Overview* is a compact stage pipeline; selecting a stage reveals its components.
+*Detail* shows bounded sections with ops, checkpoint weight names, search, tracing and tensor
+sizes. Data provenance and scope notes are expandable, not a second dashboard. Stage
+classification lives in `viz::bundle_from_model_config`; add an arm there when a new
+multi-stage model needs named stages (others get Input / Blocks / Output).
+`--dump-assets <dir>` writes `index.html`, `embed.html` (iframe build: `?theme=light|dark`,
+`plow-viz:theme` message in, `plow-viz:select` message out), `model.json`,
+`pipeline.json` and `pipeline.svg`. The graph libraries load from jsdelivr unless
+`--script-base <prefix>` points at self-hosted `cytoscape.min.js`, `dagre.min.js` and
+`cytoscape-dagre.js`.
+
+For catalog exports, pin a revision and check storage against the actual checkpoint:
+
+```bash
+nix develop --command plowc --model Qwen/Qwen3-ASR-0.6B viz \
+  --revision <commit> --validate-checkpoint --port 0 --dump-assets <scratch>/qwen-asr
+```
+
+Only safetensors headers are read, including sharded files via bounded HTTP ranges. Weight
+names and shapes must match; storage dtypes and byte sizes come from the headers. Logical
+parameters count tied names once; checkpoint tensor storage also includes duplicate saved
+tensors, scales and omitted towers. Neither is a runtime memory estimate. The JSON records the
+resolved revision, config hash, generator version and shape bindings. A shape check does not
+prove graph-semantic or numerical equivalence. Config-only exports explicitly label estimates.
+`--task tts` marks a language-model-only speech source as partial rather than a full waveform pipeline.
+
+For end-to-end **compiled speech** (Nemotron/RNNT, Qwen audio-LM, Silero VAD, codec LMs,
+SNAC/Mimi and vocoders), reuse the actual emitted packets:
+
+```bash
+nix develop --command plowc viz --packet <assets>/model.pkt --open false
+nix develop --command plowc viz --packet <assets>/model.pkt \
+  --port 0 --dump-assets <scratch>/speech-architecture
+```
+
+The runtime's container validator and shared ISA disassembler supply the view. Embedded
+contracts identify companion encoder/codec/vocoder packets; missing dependencies and
+disagreeing codec/sample-rate fields fail the export. Directories include all model packets
+(extensions are not standalone models). The overview uses only contract-declared handoffs,
+never filename ordering. Program alternatives and state banks are individually inspectable;
+they are not drawn as sequential network layers. Each detail section contains at most 48
+native instructions. Native edges represent scheduler dependencies, and buffer sizes are exact
+declared capacities. Logical parameter counts and unencoded shapes/dtypes are not guessed.
+Depth decoders (Fish, Breeze and Maya2) use the shared auxiliary-program parser; their programs
+appear beside the backbone's programs, with validated depth manifests and row counts. Companion
+roles name the text and reference-audio encoder stages. SVG handoffs use the same declared edges,
+not packet filename order.
+Visualizing a compiled pipeline does not need weights. `scripts/tts/header_only.py` fetches a
+pinned Hub revision with only the safetensors headers (two range reads per file) and the tensor tree
+of `.pth` pickles, then runs the unmodified exporters on shape-only tensors; plowc compiles their
+header-only outputs to zero-filled, structure-only packets:
+
+```bash
+nix develop .#quantize --command python3 scripts/tts/header_only.py fetch fishaudio/s2-pro <rev> <scratch>/hub
+HF_HUB_CACHE=<scratch>/hub nix develop .#quantize --command \
+  python3 scripts/tts/header_only.py run scripts/tts/fish_prep.py <scratch>/prep/slow <rev>
+nix develop --command plowc --hf-dir <scratch>/prep/slow --emit devblob --tts-profile fish \
+  --tts-codec <scratch>/prep/codec ...   # the recipe's emit settings
+```
+
+The header-only marker is explicit (`__metadata__["plow.header_only"]`), so a truncated real
+checkpoint is still an error, never zeros. Every packet built from one carries
+`structure_only.json`: plowrt refuses to execute it and the viewer labels it. Programs, buffer
+capacities, depth stages and contracts are identical to a real-weights build (checked on Breeze).
+Exporters that compute on weight values (Chatterbox's voice export) cannot run header-only.
+The same bundle and renderer back the server and all static assets. Asset-only exports do not
+also overwrite an unrelated `graph.html` in the working directory.
 
 **2. Add the config struct + detection + builder** as in the recipe above.
 
@@ -329,7 +396,7 @@ just dim values) — use `build_from_config_json_at(json, &ShapeBucket::square(N
 | `models::config::ModelConfig::from_json` — `src/models/config/mod.rs` | Config parse + arch detection |
 | `models::config::parse_dtype` — `src/models/config/mod.rs` | torch dtype string → `DType`         |
 | `hub::build_from_pretrained` / `fetch_config` — `src/hub.rs` | Resolve hf-id → config → graph      |
-| `viz::graph_to_html` — `src/viz.rs`; `plowc viz` — `crates/plowc/src/main.rs` | DAG viewer            |
+| `viz::bundle_from_config_json`, `render_html` — `src/viz/`; `plowc viz` — `crates/plowc/src/main.rs` | Network viewer |
 | `tests/build_graphs.rs`, `tests/bind_and_weights.rs`    | Verification patterns to copy           |
 | `models/llama.rs`, `models/qwen3.rs`, `models/deepseek.rs`, `models/gemma.rs`, `models/kimi_k3.rs`, `models/siglip.rs`, `models/qwen_image_*.rs` | Builder templates |
 

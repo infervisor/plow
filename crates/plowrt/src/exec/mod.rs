@@ -99,7 +99,7 @@ pub(crate) mod mixed_program;
 pub mod mixed_step_staging;
 pub mod oob;
 pub mod packet_runtime;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod proc_group;
 pub mod queue;
 #[cfg(feature = "hsa")]
