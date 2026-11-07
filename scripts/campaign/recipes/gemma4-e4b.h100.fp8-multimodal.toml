@@ -78,6 +78,16 @@ args = ["--served-name", "gemma-4-e4b"]
 PLOW_EMIT_MULTIMODAL = "1"
 PLOW_FP8 = "1"
 PLOW_W8A8 = "1"
+# Prefill: GLU folded into the cached down-input quant, attention/feed-forward norm pairs carrying
+# their quant (QNORM_FUSE, light plow_norm_rms_pf) and the light rope route. step_bench prefill
+# 256/1000/2048 rows 19.7/27.2/43.3 -> 10.5/17.3/26.3 ms. Decode objects carry
+# PLOW_NV_FA_GF_FULL=4; BALANCE_GF sizes the full-layer split for it (B=32 hd512 FlashDecode was 64
+# items on 132 SMs). Step B=1/8/32 ctx 1024 5.01/5.40/7.93 -> 4.76/5.13/7.48 ms with the two object
+# defines. PLOW_FUSE_ARGMAX stays off: the fused lm_head loses at B=1 (+0.37 ms) and B=32.
+PLOW_GLU_QUANT_FUSE = "1"
+PLOW_QNORM_FUSE = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_ROPE_PF=1"
 # Prefill projections as the native FP8 segment GEMM (with [serve] PLOW_PF_SEG_PURE), as the 12B/26B/31B
 # FP8 recipes.
 PLOW_SEG_PURE_GEMM = "fp8"
@@ -120,8 +130,6 @@ PLOW_SEG_FA512 = "all"
 PLOW_TMA_GEMM = "1"
 PLOW_SEG_CLASS_SLICE = "1"
 PLOW_SEG_SLICE_ALL = "1"
-# Prefill sandwich seams as one NormResidualNorm (row-team body): 1000 rows 13.9 -> 13.7 ms.
-PLOW_PF_GFUSE = "1"
 
 # base emit -> segment objects (PLOW_NVCC / NVCC_PREPEND_FLAGS pick the toolkit) -> role emit.
 # Only the flash objects (v3 body), the FATLITE light object and the generated prefill attention
@@ -132,6 +140,7 @@ role_files = ["interp_sm90a_pffa.cubin", "interp_sm90a_pfpackedfa.cubin", "inter
               "gen_sm90a_attn_pf_hd256_sliding.cubin", "gen_sm90a_attn_pf_hd512.cubin"]
 [objects.env]
 PLOW_BUILD_W8A8 = "1"
+NVCC_APPEND_FLAGS = "-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_ROPE_PF=1"
 PLOW_BUILD_FA_V3 = "2"
 # GQA-packed short requests (token-batch riders): 64 one-row requests hd512 kv 1024 360 -> 115 us.
 PLOW_BUILD_FA_V3_PACK = "1"
@@ -152,7 +161,7 @@ PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding,attn_pf_hd512"
 # Served: per-rung cuBLASLt algorithms (step_bench B=48/64 7.29/7.52 -> 7.13/7.41 ms; the chosen
 # algorithm, and so the B<128 rung digests, can differ between loads).
 [serve]
-env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_PF_SEG_PURE = "fp8" }
+env = { PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_PF_SEG_PURE = "fp8", PLOW_PF_NORM_ROW_BLOCKS = "1152" }
 
 [bench]
 kind = "chat"
