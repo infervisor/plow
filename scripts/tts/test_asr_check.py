@@ -6,7 +6,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
-from asr_check import cer_report, main, norm_seed_en, seed_wer_report
+from asr_check import cer_report, main, norm_seed_en, seed_en_asr, seed_wer_report
 
 
 class CerReportTests(unittest.TestCase):
@@ -31,6 +31,40 @@ class CerReportTests(unittest.TestCase):
 
 
 class SeedWerTests(unittest.TestCase):
+    def test_seed_asr_rejects_turbo_before_loading_weights(self):
+        torch, transformers = mock.MagicMock(), mock.MagicMock()
+        with mock.patch.dict(sys.modules, torch=torch, transformers=transformers):
+            with self.assertRaisesRegex(ValueError, "requires Whisper large-v3"):
+                seed_en_asr("openai/whisper-large-v3-turbo", "cpu")
+        transformers.WhisperProcessor.from_pretrained.assert_not_called()
+        transformers.WhisperForConditionalGeneration.from_pretrained.assert_not_called()
+
+    def test_seed_asr_keeps_full_model_protocol_and_rejects_local_turbo(self):
+        for decoder_layers in (32, 4):
+            with self.subTest(decoder_layers=decoder_layers):
+                torch, transformers = mock.MagicMock(), mock.MagicMock()
+                torch.__version__, transformers.__version__ = "2", "4"
+                model = transformers.WhisperForConditionalGeneration.from_pretrained.return_value.to.return_value
+                model.config.encoder_layers = 32
+                model.config.decoder_layers = decoder_layers
+                model.config.num_mel_bins = 128
+                model.config.d_model = 1280
+                model.parameters.side_effect = lambda: iter([mock.Mock(dtype="float32", device="cpu")])
+                torch.inference_mode.return_value = lambda f: f
+                with mock.patch.dict(sys.modules, torch=torch, transformers=transformers):
+                    if decoder_layers == 4:
+                        with self.assertRaisesRegex(ValueError, "requires Whisper large-v3"):
+                            seed_en_asr("local-whisper", "cpu")
+                        continue
+                    transcribe, details = seed_en_asr("openai/whisper-large-v3", "cpu")
+                self.assertTrue(callable(transcribe))
+                self.assertEqual(details["dtype"], "float32")
+                self.assertEqual(details["resampling"], "scipy.signal.resample")
+                transformers.WhisperForConditionalGeneration.from_pretrained.assert_called_once_with(
+                    "openai/whisper-large-v3", torch_dtype=torch.float32)
+                transformers.WhisperProcessor.from_pretrained.return_value.get_decoder_prompt_ids.assert_called_once_with(
+                    language="english", task="transcribe")
+
     def test_official_punctuation_removes_without_word_splitting(self):
         self.assertEqual(norm_seed_en("I'M “ready”—now!"), "i'm readynow")
         self.assertEqual(norm_seed_en("doesn’t"), "doesnt")

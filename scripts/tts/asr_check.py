@@ -80,6 +80,8 @@ def seed_wer_report(rows, model, limit=None, scope="saved transcripts; ASR proto
 
 
 def seed_en_asr(model_id, device):
+    if model_id == "openai/whisper-large-v3-turbo":
+        raise ValueError("Seed-TTS English requires Whisper large-v3, not turbo")
     import torch
     import transformers
     from transformers import WhisperProcessor, WhisperForConditionalGeneration
