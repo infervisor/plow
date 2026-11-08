@@ -457,6 +457,11 @@ pub struct EmitConfig {
     /// decode rungs of at least this many rows (1 = every rung). Unset / 0 = off.
     #[arg(long, env = "PLOW_DECODE_HNR_FOLD")]
     pub decode_hnr_fold: Option<u32>,
+    /// Depth stage (fish / breeze): each layer's q / k / v HeadNormRope and FlashMerge fold into
+    /// its FlashDecode (the HeadNormRope fold arm plus the merge fold). Changes the merge's rounding
+    /// (acc / l vs acc * (1 / l)).
+    #[arg(long, env = "PLOW_DEPTH_ATTN_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub depth_attn_fold: bool,
     /// sm_120a decode: the Gemv walk (o_proj / down) splits K over blocks on the rungs of at least
     /// this many rows (64-row units, the group's last block sums the partials in a fixed order).
     /// Changes the f32 summation order. Unset / 0 = off.
@@ -1988,6 +1993,7 @@ impl EmitConfig {
             spec_kind: env_str("PLOW_SPEC_KIND"),
             decode_norm_fold: env_bool("PLOW_DECODE_NORM_FOLD"),
             decode_hnr_fold: env_u32("PLOW_DECODE_HNR_FOLD"),
+            depth_attn_fold: env_bool("PLOW_DEPTH_ATTN_FOLD"),
             decode_gemv_xk: env_u32("PLOW_DECODE_GEMV_XK"),
             decode_gemv_xk_qkv: env_bool("PLOW_DECODE_GEMV_XK_QKV"),
             decode_gemv_w_cs: env_bool("PLOW_DECODE_GEMV_W_CS"),

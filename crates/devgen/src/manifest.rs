@@ -1420,12 +1420,25 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         t.insert("norm_fold".into(), json!(1));
     }
     // * `hnr_fold` (PLOW_DECODE_HNR_FOLD opt-in): the decode object's FlashDecode carries the
-    //   HeadNormRope fold arm the packet's flash packets use.
-    if arch.starts_with("sm_") && crate::emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 {
+    //   HeadNormRope fold arm the packet's flash packets use. PLOW_DEPTH_ATTN_FOLD: the depth
+    //   programs' FlashDecode uses it (any sm_ object; the backbone's flash packets stay unfolded).
+    let ec = crate::emit_config::active();
+    if arch.starts_with("sm_") && ec.decode_hnr_fold.unwrap_or(0) > 0 {
         assert_eq!(
             arch, "sm_120a",
             "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only"
         );
+        t.insert("hnr_fold".into(), json!(1));
+    }
+    if arch.starts_with("sm_") && ec.depth_attn_fold {
+        // The fold arm is the hd128 row-group body's, without its bulk-copy rings or KV interleave.
+        assert!(
+            !["fa_rgt", "fa_rgm", "kv_ilv"]
+                .iter()
+                .any(|k| t.contains_key(*k)),
+            "PLOW_DEPTH_ATTN_FOLD: the row-group body without RGT / RGM / KV interleave"
+        );
+        t.insert("fa_rg".into(), json!(1));
         t.insert("hnr_fold".into(), json!(1));
     }
     // * `gemv_xk` (PLOW_DECODE_GEMV_XK opt-in): the first rung whose Gemv walk splits K over blocks.
@@ -3581,6 +3594,12 @@ pub fn config_header(manifest: &Value) -> String {
                 "#ifndef PLOW_NV_GEMV_PF_OPS\n#define PLOW_NV_GEMV_PF_OPS {v}u\n#endif\n"
             ));
         }
+        // sm_120a (PLOW_DECODE_HNR_FOLD) or any sm_ object (PLOW_DEPTH_ATTN_FOLD).
+        if t.get("hnr_fold").is_some() {
+            out.push_str(
+                "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
+            );
+        }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a") {
             if let Some(v) = t.get("gemv_k8_ops").and_then(Value::as_u64) {
                 out.push_str(&format!(
@@ -3592,11 +3611,6 @@ pub fn config_header(manifest: &Value) -> String {
             if t.get("norm_fold").is_some() {
                 out.push_str(
                     "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_NORM_FOLD\n#define PLOW_NV_NORM_FOLD 1\n#endif\n#endif\n",
-                );
-            }
-            if t.get("hnr_fold").is_some() {
-                out.push_str(
-                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
                 );
             }
             if let Some(v) = t.get("gemv_xk").and_then(Value::as_u64) {
