@@ -1790,15 +1790,12 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
                     .collect();
             }
         }
-        let t = std::time::Instant::now();
+        let t = (bound_us > 0.0 && batch[0].step.is_some()).then(std::time::Instant::now);
         let out = codec.launch(&batch);
-        if batch[0].step.is_some() {
-            let frames = batch.iter().map(|j| j.frames).max().unwrap_or(0);
-            if let Some(&(cb, cn, _)) = codec.capacity(Family::Step, batch.len(), frames) {
-                costs.observe(cb, cn, t.elapsed().as_secs_f64() * 1e6);
-            }
-        }
-        rests.resize_with(batch.len(), || None);
+        costs.observe_launch(bound_us, &codec.steps, &batch, || {
+            t.unwrap().elapsed().as_secs_f64() * 1e6
+        });
+        let rests = drain_rests(&mut rests, batch.len());
         match out {
             Ok(pcm) => {
                 for ((mut j, mut p), rest) in batch.into_iter().zip(pcm).zip(rests) {
@@ -1830,11 +1827,36 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
     }
 }
 
+fn drain_rests(
+    rests: &mut Vec<Option<(Codes, usize)>>,
+    count: usize,
+) -> impl Iterator<Item = Option<(Codes, usize)>> + '_ {
+    rests
+        .drain(..)
+        .chain(std::iter::repeat_with(|| None))
+        .take(count)
+}
+
 /// Measured wall time of each stream-step capacity `(batch, frames)`, µs (moving average).
 #[derive(Default)]
 struct StepCosts(std::collections::HashMap<(usize, usize), f64>);
 
 impl StepCosts {
+    fn observe_launch(
+        &mut self,
+        bound_us: f64,
+        caps: &[Capacity],
+        jobs: &[Job],
+        elapsed: impl FnOnce() -> f64,
+    ) {
+        if bound_us > 0.0 && jobs[0].step.is_some() {
+            let frames = jobs.iter().map(|j| j.frames).max().unwrap_or(0);
+            if let Some(&(cb, cn, _)) = smallest(caps, jobs.len(), frames) {
+                self.observe(cb, cn, elapsed());
+            }
+        }
+    }
+
     fn observe(&mut self, cb: usize, cn: usize, us: f64) {
         let c = self.0.entry((cb, cn)).or_insert(us);
         *c += 0.25 * (us - *c);
@@ -2702,6 +2724,52 @@ mod tests {
             copies.load(std::sync::atomic::Ordering::Relaxed) > 0,
             device
         );
+    }
+
+    #[test]
+    fn disabled_launch_bound_keeps_rests_and_costs_unallocated() {
+        let caps = vec![(1, 4, Vec::new()), (8, 4, Vec::new())];
+        let mut costs = StepCosts::default();
+        let mut rests = Vec::new();
+        for width in [1, 8, 1] {
+            let jobs: Vec<_> = (0..width).map(|n| job(false, 4, Some(n))).collect();
+            assert_eq!(
+                drain_rests(&mut rests, jobs.len())
+                    .filter(Option::is_none)
+                    .count(),
+                jobs.len()
+            );
+            assert_eq!(
+                rests.capacity(),
+                0,
+                "disabled launch allocated remainder storage"
+            );
+            costs.observe_launch(0.0, &caps, &jobs, || panic!("disabled launch read timing"));
+            assert_eq!(costs.0.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_launch_keeps_remainders_and_updates_costs() {
+        let caps = vec![(1, 4, Vec::new()), (2, 8, Vec::new())];
+        let jobs = [job(false, 3, Some(0)), job(false, 7, Some(1))];
+        let mut costs = StepCosts::default();
+        costs.observe_launch(10.0, &caps, &jobs, || 20.0);
+        costs.observe_launch(10.0, &caps, &jobs, || 40.0);
+        assert_eq!(costs.get(2, 8), Some(25.0));
+        let mut rests = vec![Some((vec![11, 12].into(), 1)), None];
+        let mut drained = drain_rests(&mut rests, jobs.len());
+        let (codes, frames) = drained.next().unwrap().unwrap();
+        assert_eq!(codes.host, [11, 12]);
+        assert_eq!(frames, 1);
+        assert!(drained.next().unwrap().is_none());
+        assert!(drained.next().is_none());
+        drop(drained);
+        assert!(rests.is_empty());
+        costs.observe_launch(10.0, &caps, &[job(false, 3, None)], || {
+            panic!("non-step timing")
+        });
+        assert_eq!(costs.get(1, 4), None);
     }
 
     #[test]
