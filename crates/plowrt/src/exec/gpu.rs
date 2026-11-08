@@ -2766,6 +2766,8 @@ pub struct GpuEngine {
     /// Wide-rung object selected for the widest decode chain.
     gemv_wide: Option<Arc<decode_object::BoundDecodeObject>>,
     gemv_wide_modules: [Option<Arc<decode_object::BoundDecodeObject>>; 2],
+    /// The `_gw` object at its full claim for depth programs below its wide-arm rung.
+    depth_gw: Option<(usize, Arc<decode_object::BoundDecodeObject>)>,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, tensor-table base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
@@ -8004,6 +8006,9 @@ impl GpuEngine {
                 gemv_wide.as_ref().map(|(_, (_, full))| Arc::clone(full)),
                 gemv_wide64.as_ref().map(|(_, full)| Arc::clone(full)),
             ],
+            depth_gw: gemv_wide
+                .as_ref()
+                .map(|(min_rows, (_, full))| (*min_rows, Arc::clone(full))),
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,

@@ -11,6 +11,7 @@ use crate::exec::packet_runtime::{PacketBuffer, PacketBufferPool};
 use crate::{Result, RuntimeError};
 use std::sync::Arc;
 
+use super::decode_object::BoundDecodeObject;
 use super::{DevInst64, DevOp, DevProgram, GpuEngine, BLOCK, TENSOR_NONE16};
 
 const STAGE_CONTROL_BYTES: usize = 8 + 16 + 8 + 4 + 4;
@@ -750,6 +751,17 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Depth programs of 8 rows up to the `_gw` sibling's wide-arm rung launch on it (full claim),
+    /// as the backbone's batched rungs do; at and past that rung the depth's projections are below
+    /// the wide arm's size floor and the main object's walk is faster. Qwen3-TTS depth ms, B=16 /
+    /// 32: 5.87 / 7.10 -> 5.29 / 6.58; B=48 / 64 on the `_gw` object: 10.35 / 10.62 -> 10.76 / 11.17.
+    fn depth_object(&self, rows: usize) -> Option<&BoundDecodeObject> {
+        self.depth_gw
+            .as_ref()
+            .filter(|(min_rows, _)| (8..*min_rows).contains(&rows))
+            .map(|(_, o)| &**o)
+    }
+
     fn fish_launch(
         &mut self,
         d: &mut FishDepth,
@@ -875,11 +887,12 @@ impl GpuEngine {
             arg.tensors = outputs.tensors;
         }
         let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+        let object = self.depth_object(n);
         self.be.launch_cooperative(
-            self.f,
-            self.grid,
-            BLOCK,
-            self.smem,
+            object.map_or(self.f, |o| o.function),
+            object.map_or(self.grid, |o| o.grid),
+            object.map_or(BLOCK, |o| o.block),
+            object.map_or(self.smem, |o| o.smem),
             &mut params,
             Some(&self.stream),
         )?;
