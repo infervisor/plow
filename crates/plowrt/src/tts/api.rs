@@ -187,7 +187,9 @@ impl SpeechSpec {
                 ))
             }
         };
-        let voice = if (req.voice == "default" || req.voice.is_empty())
+        let voice = if self.voices.is_empty() {
+            req.voice.clone()
+        } else if (req.voice == "default" || req.voice.is_empty())
             && !self.voices.contains(&req.voice)
         {
             self.voices
@@ -207,7 +209,7 @@ impl SpeechSpec {
                 _ => req.voice.clone(),
             }
         };
-        if !self.voices.contains(&voice) {
+        if !self.voices.is_empty() && !self.voices.contains(&voice) {
             return Err(invalid(
                 format!(
                     "unknown voice {:?}; voices: {}",

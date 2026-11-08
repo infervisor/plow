@@ -135,7 +135,7 @@ pub enum Scaling {
 /// rewritten, and [`residual_ceiling`] would not see it either. Refusing the
 /// whole packet is the only honest answer until the pooled chain is in the test
 /// above; nothing shipping sets `index_kpool`.
-const KV_LINEAR: [&str; 4] = ["ckv", "krot", "scale", "kidx"];
+const KV_LINEAR: [&str; 6] = ["k", "v", "ckv", "krot", "scale", "kidx"];
 
 /// `kv.{l}.` suffixes with a FIXED extent — the pooled indexer's decode ring is
 /// `[index_kpool][di]`, a knob rather than a context.
@@ -145,7 +145,7 @@ const KV_INERT: [&str; 2] = ["kidx_ring", "kidx_ring_score"];
 const ACT_LINEAR: [&str; 5] = ["iscore", "iscore_pf", "iumask", "ibits", "icand"];
 
 const IN_LINEAR: [&str; 2] = ["in.ids", "in.pos"];
-const IN_ROPE: [&str; 8] = [
+const IN_ROPE: [&str; 10] = [
     "in.cos",
     "in.sin",
     "in.icos",
@@ -154,6 +154,8 @@ const IN_ROPE: [&str; 8] = [
     "in.sin_full",
     "in.cos_slide",
     "in.sin_slide",
+    "in.breeze.cos",
+    "in.breeze.sin",
 ];
 
 /// How `name`'s declared bytes move with the emit-time `ctx`.

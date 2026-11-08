@@ -141,8 +141,19 @@ use plow_asset::packet_pipeline::PacketPipeline;
 use crate::{Result, RuntimeError};
 
 pub const DRIVER: &str = "tts.codec_lm.v1";
+pub const DRIVER_V2: &str = plow_asset::dual_stream::CONDITIONED_DRIVER;
 
-/// The numeric contract of one `tts.codec_lm.v1` pipeline, read from packet metadata.
+/// External speaker conditioning for speech pipelines (`tts.codec_lm.v2`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeakerConditioningContract {
+    pub version: u32,
+    pub speaker_packet: String,
+    pub reference_packet: String,
+    pub text_pad: u32,
+    pub text_embeddings: String,
+}
+
+/// The numeric contract of one `tts.codec_lm.v1` or `v2` pipeline, read from packet metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpeechContract {
     pub pipeline: String,
@@ -190,6 +201,8 @@ pub struct SpeechContract {
     pub text_encoder: Option<String>,
     /// Voice cloning through a reference encoder packet beside the LM.
     pub clone: Option<CloneContract>,
+    /// External speaker conditioning (`tts.codec_lm.v2`).
+    pub conditioning: Option<SpeakerConditioningContract>,
     /// Text-plus-codec rows ([`plow_asset::dual_stream`]); its voices, languages and
     /// instructions are the model's.
     pub dual_stream: Option<plow_asset::dual_stream::DualStream>,
@@ -223,19 +236,59 @@ impl SpeechContract {
     }
 
     pub fn from_pipeline(p: &PacketPipeline) -> Result<Self> {
-        if p.driver != DRIVER {
+        if p.driver != DRIVER && p.driver != DRIVER_V2 {
             return Err(RuntimeError::Rejected(format!(
-                "pipeline {} is {}, not {DRIVER}",
+                "pipeline {} is {}, not {DRIVER} or {DRIVER_V2}",
                 p.name, p.driver
             )));
         }
-        if p.strings
-            .contains_key(plow_asset::dual_stream::CONDITIONING_KEY)
+        if p.driver == DRIVER
+            && p.strings
+                .contains_key(plow_asset::dual_stream::CONDITIONING_KEY)
         {
             return Err(RuntimeError::Rejected(
                 "speaker conditioning requires a supported versioned speech driver".into(),
             ));
         }
+        let conditioning = if p.driver == DRIVER_V2 {
+            let json = p
+                .strings
+                .get(plow_asset::dual_stream::CONDITIONING_KEY)
+                .ok_or_else(|| {
+                    RuntimeError::Rejected("tts.codec_lm.v2 requires speaker conditioning".into())
+                })?;
+            let parsed = plow_asset::dual_stream::SpeakerConditioning::parse(json)
+                .map_err(RuntimeError::Rejected)?;
+            let text_pad = p
+                .parameters
+                .get("conditioning.text_pad")
+                .copied()
+                .ok_or_else(|| {
+                    RuntimeError::Rejected(
+                        "speech pipeline lacks parameter conditioning.text_pad".into(),
+                    )
+                })?;
+            let text_pad = u32::try_from(text_pad).map_err(|_| {
+                RuntimeError::Rejected("conditioning.text_pad overflows u32".into())
+            })?;
+            let text_emb = p
+                .tensors
+                .get("conditioning.text_embeddings")
+                .ok_or_else(|| {
+                    RuntimeError::Rejected(
+                        "speech pipeline lacks tensor conditioning.text_embeddings".into(),
+                    )
+                })?;
+            Some(SpeakerConditioningContract {
+                version: parsed.version,
+                speaker_packet: parsed.speaker_packet,
+                reference_packet: parsed.reference_packet,
+                text_pad,
+                text_embeddings: text_emb.name.clone(),
+            })
+        } else {
+            None
+        };
         let get = |k: &str| {
             p.parameters.get(k).copied().ok_or_else(|| {
                 RuntimeError::Rejected(format!("speech pipeline lacks parameter {k}"))
@@ -324,6 +377,7 @@ impl SpeechContract {
                 .get(crate::exec::packet_runtime::TEXT_ENCODER)
                 .cloned(),
             clone: None,
+            conditioning,
             dual_stream: p
                 .strings
                 .get(plow_asset::dual_stream::KEY)
@@ -492,9 +546,9 @@ impl SpeechContract {
                     .dual_stream
                     .as_ref()
                     .is_some_and(|d| d.instructions_template.is_some()),
-            voice_cloning: self.clone.is_some(),
+            voice_cloning: self.clone.is_some() || self.conditioning.is_some(),
             clone_transcript: true,
-            clone_audio_only: self.maya2.is_some(),
+            clone_audio_only: self.maya2.is_some() || self.conditioning.is_some(),
             text_normalization: self.maya2.is_some(),
         };
         spec.narrow_voices(&crate::config::RuntimeConfig::get().tts_voices);
@@ -1188,6 +1242,37 @@ mod tests {
         assert!(SpeechContract::from_pipeline(&p).is_err());
         p.driver = plow_asset::dual_stream::CONDITIONED_DRIVER.into();
         assert!(SpeechContract::from_pipeline(&p).is_err());
+    }
+
+    #[test]
+    fn conditioned_pipeline_binds_conditioning_contract() {
+        let mut p = pipeline();
+        p.driver = plow_asset::dual_stream::CONDITIONED_DRIVER.into();
+        let cond = serde_json::json!({
+            "version": 1,
+            "speaker_packet": "speaker_encoder.pkt",
+            "reference_packet": "ref_encoder.pkt",
+        });
+        p.strings.insert(
+            plow_asset::dual_stream::CONDITIONING_KEY.into(),
+            cond.to_string(),
+        );
+        p.parameters.insert("conditioning.text_pad".into(), 42);
+        p.tensors.insert(
+            "conditioning.text_embeddings".into(),
+            plow_asset::packet_pipeline::PipelineTensor {
+                name: "model.embed_tokens.weight".into(),
+                dtype: plow_asset::packet_pipeline::PipelineDType::Bf16,
+                shape: vec![4096, 2048],
+            },
+        );
+        let c = SpeechContract::from_pipeline(&p).unwrap();
+        let cond = c.conditioning.unwrap();
+        assert_eq!(cond.version, 1);
+        assert_eq!(cond.speaker_packet, "speaker_encoder.pkt");
+        assert_eq!(cond.reference_packet, "ref_encoder.pkt");
+        assert_eq!(cond.text_pad, 42);
+        assert_eq!(cond.text_embeddings, "model.embed_tokens.weight");
     }
 
     #[test]

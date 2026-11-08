@@ -2458,7 +2458,6 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                    (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
         break;
 
-#if PLOW_NV_GEMMA
     /* E5 (rtx-19): fused lm_head GEMV + greedy-argmax epilogue (PLOW_FUSE_ARGMAX).
      * M sequences (M in i0): x is offset by a_row0 (i4), part is [M][nblk]; f0=cap. */
     case PLOW_DOP_GEMV_ARGMAX: {
@@ -2473,7 +2472,6 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         d_gemv_argmax_batch(c_base, x_base, W, part_base, M, N, K, cap, slice, nblk, (__nv_bfloat16*)arena);
         break;
     }
-#endif
 
     /* Kernel arg order is (Nq, Nk, Nv, K): K lives in i2 but is passed LAST. */
     case PLOW_DOP_GEMV_QKV:

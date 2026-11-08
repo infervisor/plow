@@ -88,8 +88,8 @@ def seed_en_asr(model_id, device):
     processor = WhisperProcessor.from_pretrained(model_id)
     model = WhisperForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32).to(device)
     if (model.config.encoder_layers, model.config.decoder_layers,
-            model.config.num_mel_bins, model.config.d_model) != (32, 32, 128, 1280):
-        raise ValueError("Seed-TTS English requires Whisper large-v3")
+            model.config.num_mel_bins, model.config.d_model) not in ((32, 32, 128, 1280), (32, 4, 128, 1280)):
+        raise ValueError("Seed-TTS English requires Whisper large-v3 or large-v3-turbo")
     forced = processor.get_decoder_prompt_ids(language="english", task="transcribe")
 
     @torch.inference_mode()

@@ -44,6 +44,22 @@ fn listed(p: &PacketPipeline, prefix: &str) -> Result<Vec<u64>, String> {
         .collect()
 }
 
+fn sidecar_file<'a>(
+    main: &PacketPipeline,
+    file: &str,
+    sidecars: &'a [MediaPacket<'a>],
+    pick: impl Fn(&PacketPipeline) -> bool,
+) -> Result<&'a PacketPipeline, String> {
+    sidecars
+        .iter()
+        .find(|s| s.file == file)
+        .ok_or_else(|| format!("{}: sidecar {file} is absent", main.name))?
+        .pipelines
+        .iter()
+        .find(|p| pick(p))
+        .ok_or_else(|| format!("{file}: no matching pipeline for {}", main.name))
+}
+
 fn sidecar<'a>(
     main: &PacketPipeline,
     key: &str,
@@ -54,14 +70,7 @@ fn sidecar<'a>(
         .strings
         .get(key)
         .ok_or_else(|| format!("{}: string {key:?} is missing", main.name))?;
-    sidecars
-        .iter()
-        .find(|s| s.file == file)
-        .ok_or_else(|| format!("{}: sidecar {file} is absent", main.name))?
-        .pipelines
-        .iter()
-        .find(|p| pick(p))
-        .ok_or_else(|| format!("{file}: no matching pipeline for {}", main.name))
+    sidecar_file(main, file, sidecars, pick)
 }
 
 fn audio_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, String> {
@@ -79,9 +88,17 @@ fn audio_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
 }
 
 fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, String> {
-    if p.strings.contains_key(crate::dual_stream::CONDITIONING_KEY) {
-        return Err("speaker conditioning cannot use legacy speech media geometry".into());
-    }
+    let conditioning = if let Some(raw) = p.strings.get(crate::dual_stream::CONDITIONING_KEY) {
+        if p.driver != crate::dual_stream::CONDITIONED_DRIVER {
+            return Err("speaker conditioning cannot use legacy speech media geometry".into());
+        }
+        Some(crate::dual_stream::SpeakerConditioning::parse(raw)?)
+    } else {
+        if p.driver == crate::dual_stream::CONDITIONED_DRIVER {
+            return Err("tts.codec_lm.v2 requires speaker conditioning".into());
+        }
+        None
+    };
     let c = sidecar(p, "codec.packet", sidecars, |c| c.driver == "codec.v1")?;
     let prompt = param(p, "prompt.prefix.count")?
         .checked_add(param(p, "prompt.suffix.count")?)
@@ -114,10 +131,23 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
     if c.parameters.get("stream.stateful").copied().unwrap_or(0) != 0 {
         family.as_object_mut().unwrap().extend(stateful_codec(c)?);
     }
-    if p.strings.contains_key("clone.encoder") {
-        let e = sidecar(p, "clone.encoder", sidecars, |e| {
+    let clone_enc = if let Some(cond) = &conditioning {
+        let e = sidecar_file(p, &cond.reference_packet, sidecars, |e| {
             matches!(e.driver.as_str(), "codec.encode.v1" | "codec.encode.v2")
         })?;
+        let spk = sidecar_file(p, &cond.speaker_packet, sidecars, |s| {
+            s.speaker_encoder_plan().is_ok()
+        })?;
+        spk.speaker_encoder_plan()?;
+        Some(e)
+    } else if p.strings.contains_key("clone.encoder") {
+        Some(sidecar(p, "clone.encoder", sidecars, |e| {
+            matches!(e.driver.as_str(), "codec.encode.v1" | "codec.encode.v2")
+        })?)
+    } else {
+        None
+    };
+    if let Some(e) = clone_enc {
         e.codec_sample_input()?;
         let frames: Vec<u64> = e
             .programs
@@ -295,7 +325,7 @@ pub fn request(
             "causal.v1" if p.parameters.get("overlay_rows").is_some_and(|&r| r > 0) => {
                 audio_lm(p, sidecars)?
             }
-            "tts.codec_lm.v1" => codec_lm(p, sidecars)?,
+            "tts.codec_lm.v1" | "tts.codec_lm.v2" => codec_lm(p, sidecars)?,
             driver if driver.starts_with("tts.codec_lm.") => {
                 return Err(format!("unsupported speech media geometry driver {driver}"));
             }
@@ -320,13 +350,7 @@ mod tests {
 
     #[test]
     fn unsupported_speech_drivers_cannot_skip_media_qualification() {
-        let pipes = vec![pipeline(
-            "speech",
-            crate::dual_stream::CONDITIONED_DRIVER,
-            &[],
-            &[],
-            &[],
-        )];
+        let pipes = vec![pipeline("speech", "tts.codec_lm.v99", &[], &[], &[])];
         let main = MediaPacket {
             file: "model.pkt",
             pipelines: &pipes,
@@ -347,6 +371,93 @@ mod tests {
             ..main
         };
         assert!(request(&main, &[]).unwrap_err().contains("legacy speech"));
+    }
+
+    #[test]
+    fn conditioned_speech_requires_valid_speaker_and_reference_sidecars() {
+        let (mut lm, codec) = codec_lm();
+        lm[0].driver = crate::dual_stream::CONDITIONED_DRIVER.into();
+        let main = packet("model.pkt", &lm);
+        let sidecars = [packet("codec.pkt", &codec)];
+        assert!(request(&main, &sidecars)
+            .unwrap_err()
+            .contains("requires speaker conditioning"));
+
+        let cond = serde_json::json!({
+            "version": 1,
+            "speaker_packet": "speaker_encoder.pkt",
+            "reference_packet": "ref_encoder.pkt",
+        });
+        lm[0].strings.insert(
+            crate::dual_stream::CONDITIONING_KEY.into(),
+            cond.to_string(),
+        );
+        let main = packet("model.pkt", &lm);
+        assert!(request(&main, &sidecars)
+            .unwrap_err()
+            .contains("sidecar ref_encoder.pkt is absent"));
+
+        let mut enc = pipeline(
+            "codec.encode",
+            "codec.encode.v1",
+            &[
+                ("audio.sample_rate", 24000),
+                ("codec.frame_samples", 2048),
+                ("codec.frame_codes", 7),
+                ("codec.codebook", 4096),
+            ],
+            &[],
+            &[("pcm", vec![131072]), ("codes", vec![64, 7])],
+        );
+        enc.programs = BTreeMap::from([("encode.f32".into(), 0), ("encode.f64".into(), 1)]);
+        let enc_pipes = vec![enc];
+        let sidecars = [
+            packet("codec.pkt", &codec),
+            packet("ref_encoder.pkt", &enc_pipes),
+        ];
+        assert!(request(&main, &sidecars)
+            .unwrap_err()
+            .contains("sidecar speaker_encoder.pkt is absent"));
+
+        let mut spk = pipeline(
+            "speaker.encode",
+            "speaker.encode.v1",
+            &[
+                ("input.min_rows", 2),
+                ("input.max_rows", 8),
+                ("input.width", 2),
+                ("output.width", 3),
+            ],
+            &[],
+            &[("length", vec![1])],
+        );
+        spk.tensors.insert(
+            "mel".into(),
+            PipelineTensor {
+                name: "t.mel".into(),
+                dtype: PipelineDType::F32,
+                shape: vec![8, 2],
+            },
+        );
+        spk.tensors.insert(
+            "embedding".into(),
+            PipelineTensor {
+                name: "t.embedding".into(),
+                dtype: PipelineDType::F32,
+                shape: vec![3],
+            },
+        );
+        spk.programs = BTreeMap::from([("encode.r4".into(), 0), ("encode.r8".into(), 1)]);
+        let spk_pipes = vec![spk];
+        let sidecars = [
+            packet("codec.pkt", &codec),
+            packet("ref_encoder.pkt", &enc_pipes),
+            packet("speaker_encoder.pkt", &spk_pipes),
+        ];
+        let req = request(&main, &sidecars).unwrap().unwrap();
+        let family = &req["families"][0];
+        assert_eq!(family["clone_frames"], serde_json::json!([32, 64]));
+        assert_eq!(family["clone_codes_capacity"], 448);
     }
 
     fn pipeline(

@@ -117,12 +117,17 @@ pub fn rescale(
                  bound leaves the packet selecting more rows than its cache holds"
             )));
         }
-        let widest = blob.progs.iter().map(|p| p.t).max().unwrap_or(1);
-        if want < widest {
+        let min_chunk = blob
+            .progs
+            .iter()
+            .map(|p| p.t)
+            .min()
+            .unwrap_or(1);
+        if want < min_chunk {
             return Err(err(format!(
-                "PLOW_LIVE_CTX={want} is narrower than this packet's widest prefill bucket \
-                 ({widest} rows). `in.ids`/`in.pos` are staged a whole chunk at a time, so the \
-                 bound cannot be below the largest chunk the packet can run"
+                "PLOW_LIVE_CTX={want} is narrower than this packet's smallest chunk \
+                 ({min_chunk} rows). `in.ids`/`in.pos` are staged a whole chunk at a time, so the \
+                 bound cannot be below the smallest chunk the packet can run"
             )));
         }
     } else {
@@ -294,8 +299,9 @@ pub fn rescale(
         }
     }
 
-    // Nothing may keep the ceiling in an operand the rewrite does not reach.
-    for p in &blob.progs {
+    // Nothing may keep the ceiling in an operand the rewrite does not reach,
+    // among programs reachable under `want`.
+    for p in blob.progs.iter().filter(|p| p.role.is_decode_rung() || p.t <= want) {
         if let Some((k, op, slot)) =
             ctx_bound::residual_ceiling(&p.insts, ceiling, |h| rewritten_caches.contains(&h))
         {
@@ -411,14 +417,21 @@ fn mappable_bound(
     // Both paths need a slot's span in whole granules, so only multiples of `step` can map.
     let step = u32::try_from(granularity / a).unwrap_or(u32::MAX).max(1);
     let mut ctx = want.div_ceil(step).saturating_mul(step);
+    let mut slot_candidate = None;
     while ctx < ceiling.max_ctx {
         g.max_ctx = ctx;
-        if g.block_bytes(granularity, block_hint).is_ok()
-            || (!block_mapped && (u64::from(ctx) * slot_row) % granularity == 0)
-        {
+        if g.block_bytes(granularity, block_hint).is_ok() {
             return ctx;
         }
+        if (u64::from(ctx) * slot_row) % granularity == 0 && slot_candidate.is_none() {
+            slot_candidate = Some(ctx);
+        }
         ctx = ctx.saturating_add(step);
+    }
+    if !block_mapped || slot_candidate.is_some() {
+        if let Some(c) = slot_candidate {
+            return c;
+        }
     }
     ceiling.max_ctx
 }
@@ -958,6 +971,10 @@ mod tests {
             mappable_bound(&geom(1, 128, 24_576), 8192, G, 3 << 20),
             8192
         );
+        // Speech heads (8 x 256 B rows, ceiling 8192): ceiling is block-mapped (2 MiB),
+        // narrowed bound 2048 has 512 KiB head window < 2 MiB, so it maps slot-granular (4 MiB per slot).
+        let speech = geom(8, 128, 8192);
+        assert_eq!(mappable_bound(&speech, 2048, G, G), 2048);
         // Nothing narrower maps: serve the ceiling, never widen.
         assert_eq!(mappable_bound(&geom(1, 128, 1024), 768, G, G), 1024);
     }
@@ -989,5 +1006,50 @@ mod tests {
     fn widen_accepts_unclamped_prefill_ladder() {
         let (mut b, m) = nv_dense_blob(16384);
         assert_eq!(widen(&mut b, 32768, Some(&m)).unwrap(), 32768);
+    }
+
+    #[test]
+    fn narrow_accepts_ladder_with_wider_prefill_buckets() {
+        let (mut b, m) = nv_dense_blob(16384);
+        let inst = |op: DevOp, t0: u16, i: [u32; 8], fj: [u32; 3]| DevInst64 {
+            op: op as u16,
+            blocks: 1,
+            fj,
+            t: [t0, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16, 3, 4, TENSOR_NONE16, TENSOR_NONE16],
+            i,
+        };
+        // Add a prefill bucket equal to the ceiling (16384) and one intermediate (8192)
+        b.progs.push(DevProg {
+            t: 8192,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 8192 },
+            n_counter: 0,
+            insts: vec![inst(DevOp::FlashPrefill, 0, [8192, 0, 0, 0, 0, 0, 0, 0], [0, 16384, u32::MAX])],
+            stream: Vec::new(),
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        });
+        b.progs.push(DevProg {
+            t: 16384,
+            role: packet::devbuild::ProgramRole::PrefillBucket { rows: 16384 },
+            n_counter: 0,
+            insts: vec![inst(DevOp::FlashPrefill, 0, [16384, 0, 0, 0, 0, 0, 0, 0], [0, 16384, u32::MAX])],
+            stream: Vec::new(),
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        });
+        assert_eq!(rescale(&mut b, 4096, Some(&m)).unwrap(), 4096);
+        assert_eq!(declared_ctx(&b), Some(4096));
+        assert_eq!(bytes_of(&b, "in.pos"), 4096 * 4);
+        assert_eq!(bytes_of(&b, "in.ids"), 4096 * 4);
     }
 }

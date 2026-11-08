@@ -1335,7 +1335,7 @@ fn spawn_scoped(
         rung_widths
             .as_deref()
             .and_then(|widths| match DecodeRungs::new(widths, capacity) {
-                Ok(rungs) if rungs.len() > 1 => Some(
+                Ok(rungs) if rungs.len() > 1 && !bundle.is_speech() => Some(
                     RungController::new(rungs).with_fast_probe(crate::serve::policy::fast_probe()),
                 ),
                 Ok(_) => None,
@@ -1345,7 +1345,11 @@ fn spawn_scoped(
                 }
             });
     let ingress_capacity = if cfg.max_queued_requests == 0 {
-        capacity.saturating_mul(4).max(1)
+        if bundle.is_speech() {
+            capacity.saturating_mul(32).max(4096)
+        } else {
+            capacity.saturating_mul(4).max(1)
+        }
     } else {
         cfg.max_queued_requests
     };
@@ -1871,7 +1875,7 @@ fn spawn_scoped(
                 // Only hold when the slot table is empty (cold-start burst);
                 // if any slot is already live, spinning up the tick delivers
                 // TTFT faster than waiting for more arrivals.
-                let hold_ms = if slots.iter().all(Option::is_none) {
+                let hold_ms = if slots.iter().all(Option::is_none) && !bundle.is_speech() {
                     cold_start_hold_ms(
                         lambda,
                         cfg.max_hold_ms,
@@ -3979,7 +3983,8 @@ fn run_one_tick(
                     }
                 }
 
-                if did_prefill && e.has_depth_stage() && e.slot_prefix_reuse_supported() {
+                let speech_active = slots.iter().take(cap).flatten().any(|s| s.speech.is_some());
+                if did_prefill && (e.has_depth_stage() || speech_active) && e.slot_prefix_reuse_supported() {
                     for (i, slot) in slots.iter_mut().enumerate().take(cap) {
                         let Some(s) = slot.as_mut().filter(|s| {
                             s.step == 0 && s.pf_pos == 0 && s.slot_prefix_keys.is_none()
@@ -7468,7 +7473,7 @@ fn gpu_prefill_batched_pass(
                     continue;
                 }
             }
-            if request.pf_pos == 0 && !e.packed_slot_ready(i) && e.has_depth_stage() {
+            if request.pf_pos == 0 && !e.packed_slot_ready(i) && (e.has_depth_stage() || request.speech.is_some()) {
                 let encoded = match request.speech.as_deref_mut() {
                     Some(sp) => {
                         let keyed = sp.encode.take().map_or(Ok(()), |encode| {
@@ -8964,7 +8969,8 @@ fn gpu_speech_pack_codes(
     slots: &[Option<Slot>],
     pack: &[(usize, usize, usize)],
 ) -> Result<()> {
-    if !e.has_depth_stage() {
+    let speech_active = pack.iter().any(|&(i, _, _)| pack_row(slots, i).is_some_and(|(s, _)| s.speech.is_some()));
+    if !e.has_depth_stage() && !speech_active {
         return Ok(());
     }
     let Some(bytes) = e.tensor_bytes("in.frame_codes") else {

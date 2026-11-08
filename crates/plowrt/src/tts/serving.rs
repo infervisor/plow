@@ -557,6 +557,48 @@ pub struct SpeechModel {
     spec: OnceLock<SpeechSpec>,
     /// Maya 2's cloned-speaker conditioning (`spk` / `icl_spk`), when the bundle carries it.
     speaker: Option<Arc<Maya2Speaker>>,
+    /// Dual-stream external speaker conditioning (`tts.codec_lm.v2`).
+    pub(crate) conditioning: Option<Arc<JointConditioning>>,
+}
+
+/// Cloned speaker conditioning and reference codec encoder for `tts.codec_lm.v2`.
+pub struct JointConditioning {
+    pub speaker: Arc<super::ref_encoder::SpeakerEncoder>,
+    pub ref_encoder: Arc<super::ref_encoder::RefEncoder>,
+    pub text_pad_embedding: Vec<f32>,
+    cache: parking_lot::Mutex<std::collections::HashMap<u64, Arc<JointCond>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct JointCond {
+    pub speaker_embedding: Vec<f32>,
+    pub ref_codes: Arc<[u32]>,
+}
+
+impl JointConditioning {
+    const CACHE: usize = 64;
+
+    fn get_or_encode(&self, key: &str, pcm: &[f32]) -> Result<Arc<JointCond>, String> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        let k = h.finish();
+        if let Some(c) = self.cache.lock().get(&k) {
+            return Ok(Arc::clone(c));
+        }
+        let speaker_embedding = self.speaker.encode(pcm)?;
+        let ref_codes = self.ref_encoder.encode(pcm)?;
+        let c = Arc::new(JointCond {
+            speaker_embedding,
+            ref_codes: ref_codes.into(),
+        });
+        let mut cache = self.cache.lock();
+        if cache.len() >= Self::CACHE {
+            cache.clear();
+        }
+        cache.insert(k, Arc::clone(&c));
+        Ok(c)
+    }
 }
 
 /// ECAPA and the speaker tables of a Maya 2 bundle (`checkpoint/ecapa`, `checkpoint/speaker`).
@@ -646,7 +688,8 @@ pub fn speech_model(
         None => None,
         Some(contract) => {
             let mut codec = Codec::load_on(assets, device)?;
-            codec.couple(credit);
+            codec.couple(Arc::clone(&credit));
+            credit.set_limit(0);
             if codec.frame_codes != contract.frame_codes
                 || codec.frame_samples != contract.frame_samples
             {
@@ -689,6 +732,81 @@ pub fn speech_model(
                 .as_ref()
                 .and_then(|_| Maya2Speaker::load(assets))
                 .map(Arc::new);
+            let conditioning = match &contract.conditioning {
+                Some(cond) => {
+                    let speaker = Arc::new(super::ref_encoder::SpeakerEncoder::load(
+                        &assets.join(&cond.speaker_packet),
+                        device,
+                    )?);
+                    let ref_enc = super::ref_encoder::RefEncoder::load(
+                        &assets.join(&cond.reference_packet),
+                        device,
+                    )?;
+                    if ref_enc.frame_codes != contract.frame_codes
+                        || ref_enc.frame_samples != contract.frame_samples
+                        || ref_enc.sample_rate != contract.sample_rate
+                    {
+                        return Err(format!(
+                            "{} frames ({} codes, {} samples at {} Hz) disagree with the speech contract",
+                            cond.reference_packet,
+                            ref_enc.frame_codes,
+                            ref_enc.frame_samples,
+                            ref_enc.sample_rate
+                        ));
+                    }
+                    let ckpt_dir = assets.join("checkpoint");
+                    let dir = if ckpt_dir.is_dir() { &ckpt_dir } else { assets };
+                    let ckpt = crate::memory::container::Safetensors::open_dir(dir)
+                        .map_err(|e| format!("{}: {e}", dir.display()))?;
+                    use crate::memory::container::Container;
+                    let desc = ckpt
+                        .get(&cond.text_embeddings)
+                        .map_err(|e| format!("{}: {e}", dir.display()))?;
+                    if desc.shape.len() != 2 {
+                        return Err(format!(
+                            "text embeddings '{}' shape is not 2D: {:?}",
+                            desc.name, desc.shape
+                        ));
+                    }
+                    let (vocab, hidden) = (desc.shape[0], desc.shape[1]);
+                    let pad_row = cond.text_pad as usize;
+                    if pad_row >= vocab {
+                        return Err(format!("text_pad row {} >= vocab {}", pad_row, vocab));
+                    }
+                    let raw = ckpt
+                        .bytes(desc)
+                        .map_err(|e| format!("{}: {e}", dir.display()))?;
+                    let elem_size = desc.dtype.size();
+                    let start = pad_row * hidden * elem_size;
+                    let end = (pad_row + 1) * hidden * elem_size;
+                    let row_slice = &raw[start..end];
+                    let text_pad_embedding: Vec<f32> = match desc.dtype {
+                        crate::memory::container::DType::Bf16 => row_slice
+                            .chunks_exact(2)
+                            .map(|b| {
+                                f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)
+                            })
+                            .collect(),
+                        crate::memory::container::DType::F32 => row_slice
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect(),
+                        other => {
+                            return Err(format!(
+                                "unsupported dtype {:?} for text embeddings",
+                                other
+                            ))
+                        }
+                    };
+                    Some(Arc::new(JointConditioning {
+                        speaker,
+                        ref_encoder: Arc::new(ref_enc),
+                        text_pad_embedding,
+                        cache: Default::default(),
+                    }))
+                }
+                None => None,
+            };
             Some(Arc::new(SpeechModel {
                 contract,
                 codec,
@@ -697,6 +815,7 @@ pub fn speech_model(
                 realtime,
                 spec: OnceLock::new(),
                 speaker,
+                conditioning,
             }))
         }
     };
@@ -1208,6 +1327,41 @@ async fn speech_with(
         }
         _ => None,
     };
+    let cond_ref = match (&model.conditioning, &req.ref_audio) {
+        (Some(jc), Some(audio)) => {
+            let max_samples = jc.speaker.max_samples.min(jc.ref_encoder.max_samples());
+            let pcm = match reference_pcm(audio, c.sample_rate, max_samples) {
+                Ok(p) => p,
+                Err((msg, param)) => return bad(msg, param),
+            };
+            if pcm.len() < jc.speaker.min_samples {
+                return bad(
+                    format!(
+                        "`ref_audio` must be at least {} samples",
+                        jc.speaker.min_samples
+                    ),
+                    "ref_audio",
+                );
+            }
+            match tokio::task::block_in_place(|| jc.get_or_encode(audio, &pcm)) {
+                Ok(cond) => Some(cond),
+                Err(e) => return bad(format!("reference audio: {e}"), "ref_audio"),
+            }
+        }
+        _ => None,
+    };
+    if c.conditioning.is_some() && cond_ref.is_none() {
+        return bad(
+            "this model clones voice from reference audio; give `ref_audio`",
+            "ref_audio",
+        );
+    }
+    let ref_text_ids = match (&c.dual_stream, &req.ref_text) {
+        (Some(d), Some(t)) => {
+            Some(tok.encode_with_special_tokens(&d.text_template.replace("{input}", t), false))
+        }
+        _ => None,
+    };
     // Maya 2 speaks numbers, dates, currency, ... as its server does: normalised in the language.
     let input = match (&c.maya2, &language) {
         (Some(_), Some(lang)) if req.normalize != Some(false) => {
@@ -1238,6 +1392,9 @@ async fn speech_with(
         seed: checked.seed,
         streaming: !req.non_streaming_mode,
         device_frames: req.stream,
+        conditioning: model.conditioning.clone(),
+        cond_ref,
+        ref_text_ids,
     };
     let mut segs: Vec<Segment> = Vec::new();
     for t in super::segments(&input, c.segment_chars()) {
@@ -1388,15 +1545,9 @@ async fn speech_with(
             let p = if f == 0 {
                 Vec::new()
             } else {
-                match decode_all(
-                    &model,
-                    &codes[..f * c.frame_codes],
-                    f,
-                    seed ^ segment_salt(k),
-                )
-                .await
+                match decode_all(&model, &codes[..f * c.frame_codes], f, seed ^ segment_salt(k)).await
                 {
-                    Ok(p) => p,
+                    Ok(wav) => wav,
                     Err(e) => return server_error(e),
                 }
             };
@@ -1550,6 +1701,7 @@ struct Segment {
     k: usize,
     /// A dual-stream prompt's frames and text feed (`Err`: the text has no rows).
     dual: Option<Result<plow_asset::dual_stream::Layout, String>>,
+    conditioned_speaker_row: Option<usize>,
 }
 
 /// The voice a Maya 2 clone renders as: the plain prompt (`icl` names no speaker).
@@ -1622,6 +1774,9 @@ struct SegmentMaker {
     /// Dual-stream: the text rides the decode steps.
     streaming: bool,
     device_frames: bool,
+    conditioning: Option<Arc<JointConditioning>>,
+    cond_ref: Option<Arc<JointCond>>,
+    ref_text_ids: Option<Vec<u32>>,
 }
 
 impl SegmentMaker {
@@ -1664,13 +1819,29 @@ impl SegmentMaker {
                 _ => Vec::new(),
             };
             let language = self.language.as_deref().unwrap_or("auto");
-            d.layout(&text_ids, &ins_ids, &self.voice, language, self.streaming)
+            if c.conditioning.is_some() {
+                let ref_opt = self.cond_ref.as_ref().and_then(|cond| {
+                    self.ref_text_ids.as_deref().map(|ref_text| {
+                        plow_asset::dual_stream::Reference {
+                            text: ref_text,
+                            codes: &cond.ref_codes,
+                            codebook_size: d.none_code,
+                        }
+                    })
+                });
+                d.layout_conditioned(&text_ids, &ins_ids, language, self.streaming, ref_opt)
+                    .map(|cl| (cl.layout, Some(cl.speaker_row)))
+            } else {
+                d.layout(&text_ids, &ins_ids, &self.voice, language, self.streaming)
+                    .map(|l| (l, None))
+            }
         });
-        let mut prompt_ids = match &dual {
-            Some(Ok(l)) => l.ids.clone(),
-            Some(Err(_)) => Vec::new(),
-            None => ids(self.instructions.as_deref()),
+        let (mut prompt_ids, speaker_row) = match dual.as_ref() {
+            Some(Ok((l, spk))) => (l.ids.clone(), *spk),
+            Some(Err(_)) => (Vec::new(), None),
+            None => (ids(self.instructions.as_deref()), None),
         };
+        let dual_layout = dual.map(|res| res.map(|(l, _)| l));
         let uncond_ids = (self.cfg_weight > 0.0 && self.encoder.is_some()).then(|| ids(None));
         let enc_ids = self.encoder.is_some().then(|| {
             let ids = prompt_ids.clone();
@@ -1717,7 +1888,8 @@ impl SegmentMaker {
             gen,
             chars: text.chars().count(),
             k,
-            dual,
+            dual: dual_layout,
+            conditioned_speaker_row: speaker_row,
         }
     }
 }
@@ -1806,6 +1978,18 @@ impl SegmentMaker {
             overlay_pos.push(s.prompt_ids.len() as u32 - 1);
             for _ in &overlay_pos {
                 overlay.extend_from_slice(&sp.anchor);
+            }
+        }
+        if let (Some(jc), Some(cond)) = (&self.conditioning, &self.cond_ref) {
+            if let Some(speaker_row) = s.conditioned_speaker_row {
+                overlay_pos.push(speaker_row as u32);
+                let bf16 = |x: f32| {
+                    let b = x.to_bits();
+                    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+                };
+                for (&t, &sp) in jc.text_pad_embedding.iter().zip(&cond.speaker_embedding) {
+                    overlay.push(bf16(t + sp));
+                }
             }
         }
         let cfg = s.uncond_ids.as_ref().map(|ids| crate::serve::mux::CfgJob {

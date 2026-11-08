@@ -218,6 +218,11 @@ impl BlobPlan {
         let mut blob = std::borrow::Cow::Borrowed(&image.blob);
         // Plan the bound the engine will load at (`GpuEngine::load` narrows the same way).
         let live_ctx = crate::config::RuntimeConfig::get().live_ctx_for(dir);
+        #[cfg(feature = "cuda")]
+        let mut manifest = match device_vmm {
+            Some(_) => crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?,
+            None => None,
+        };
         // The engine rounds the same way (`GpuEngine::load`).
         #[cfg(feature = "cuda")]
         let live_ctx = match (live_ctx, device_vmm) {
@@ -227,7 +232,7 @@ impl BlobPlan {
                     if config.nv_vmm_live() || config.nv_vmm_prefix() == Some(true) {
                         crate::exec::ctx_bound::vmm_live_bound(
                             &blob,
-                            crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?.as_ref(),
+                            manifest.as_ref(),
                             want,
                             granularity,
                             u64::from(config.vmm_block_mib()) << 20,
@@ -242,6 +247,21 @@ impl BlobPlan {
         let narrowed = match live_ctx {
             Some(want) if crate::exec::ctx_bound::declared_ctx(&blob).is_some_and(|c| want < c) => {
                 crate::exec::ctx_bound::narrow(blob.to_mut(), want)?;
+                #[cfg(feature = "cuda")]
+                if let Some(m) = manifest.as_mut() {
+                    m.max_ctx = want;
+                    for c in &mut m.caches {
+                        if c.window == 0 {
+                            c.stride = want;
+                        }
+                    }
+                    m.programs = blob.with_packet_view(|p| {
+                        p.programs
+                            .iter()
+                            .map(plow_asset::live_kv::program_digest)
+                            .collect()
+                    });
+                }
                 true
             }
             _ => false,
@@ -267,8 +287,8 @@ impl BlobPlan {
             let config = crate::config::RuntimeConfig::get();
             plan.overhead_bound = plan.overhead_bound.saturating_add(seg_graph_bound(&blob));
             let manifest = match narrowed {
-                true => blob.with_packet_view(plow_asset::live_kv::emit).ok(),
-                false => crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?,
+                true => manifest.or_else(|| blob.with_packet_view(plow_asset::live_kv::emit).ok()),
+                false => manifest,
             };
             let packed = blob
                 .reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)?
@@ -457,7 +477,7 @@ fn seg_graph_bound(blob: &DevBlob) -> u64 {
 /// packet runtime (`CudaPacketRuntime::load_on`) that `cuMemAlloc`s every packet tensor
 /// (activation and batch buffers at their compiled capacity), one counter slab and eight
 /// uploads per program, then captures every program sequence as a CUDA graph.
-fn sidecar_bytes(pkt: &Path) -> Result<u64> {
+pub(crate) fn sidecar_bytes(pkt: &Path) -> Result<u64> {
     // Allocations of 1 MiB and up take whole 2 MiB pages.
     let alloc = |bytes: u64| match bytes.max(4) {
         b if b >= 1 << 20 => b.checked_next_multiple_of(2 << 20).unwrap_or(u64::MAX),
@@ -3166,6 +3186,7 @@ mod tests {
         assert_eq!(pick_victim(&residents, &lru).as_deref(), Some("a"));
         assert_eq!(pick_victim(&[], &lru), None);
     }
+
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {

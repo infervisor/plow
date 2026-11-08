@@ -69,7 +69,7 @@ PLOW_EMIT_CODEC_CONV_ARMS = "{repo}/tuning/nvidia/sm_90a/h100-sxm5/codec_conv_ar
 # Prompts are 10 rows + the text (streaming) or + the text again (non-streaming).
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "64,256"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,24,32,48,64,96,128"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
 # The 64-row prefill rung's projections as cuBLASLt segments: prefill 16.3 -> 8.5 ms, c1 TTFA p95

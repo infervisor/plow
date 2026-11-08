@@ -5036,9 +5036,9 @@ static __device__ __forceinline__ void sp_conv1d_wide_body(const SpConvArgs& a, 
         else leaky ? sp_conv1d_wide_run<64, false, true, PADDED>(a, slice, nblk) : sp_conv1d_wide_run<64, false, false, PADDED>(a, slice, nblk);
     }
 }
+template <bool PADDED>
 static __device__ __noinline__ void d_conv1d_wide(const SpConvArgs& a, unsigned bn, unsigned slice, unsigned nblk) {
-    if (a.mode) sp_conv1d_wide_body<true>(a, bn, slice, nblk);
-    else sp_conv1d_wide_body<false>(a, bn, slice, nblk);
+    sp_conv1d_wide_body<PADDED>(a, bn, slice, nblk);
 }
 
 /* Conv1d flag bit 16 (row-starved or few-channel convs): one warp per output element, its
@@ -5180,7 +5180,11 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
         return;
     }
     const bool avec = a.cg % 4u == 0 && a.cin % 4u == 0 && sp_aligned(a.x, 16);
-    if (!transpose && sp_w_conv_width(in, a, nblk)) return d_conv1d_wide(a, sp_w_conv_width(in, a, nblk), slice, nblk);
+    if (!transpose && sp_w_conv_width(in, a, nblk)) {
+        if (a.mode) d_conv1d_wide<true>(a, sp_w_conv_width(in, a, nblk), slice, nblk);
+        else d_conv1d_wide<false>(a, sp_w_conv_width(in, a, nblk), slice, nblk);
+        return;
+    }
     const unsigned phases = transpose ? a.stride : 1u;
     /* flags bit 13: 3xTF32 tensor cores on 64x64 tiles, except when FP32 FFMA's 128x128 tiles
      * already fill the machine for a transposed conv or one with an input activation (FFMA's wider

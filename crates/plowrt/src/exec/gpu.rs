@@ -229,7 +229,10 @@ pub(crate) fn live_kv_mappable(
         None => crate::memory::vmm::LiveKvLayout::from_blob(blob),
     };
     let hint = u64::from(RuntimeConfig::get().vmm_block_mib()) << 20;
-    layout.is_ok_and(|layout| layout.geometry.block_bytes(granularity, hint).is_ok())
+    layout.is_ok_and(|layout| {
+        layout.geometry.block_bytes(granularity, hint).is_ok()
+            || layout.slot_granular_full(blob, granularity, hint).is_some()
+    })
 }
 
 /// Parked ring slots one co-tenant reclaim step returns (under the engine mutex).
@@ -2917,6 +2920,7 @@ pub struct GpuEngine {
     /// this turn's output attaches instead of re-prefilling it.
     seq_tokens: Vec<Vec<u32>>,
     speech_identities: prefix::SpeechIdentities,
+    pub(crate) sidecar_reserve: u64,
     speech_prefix: Vec<Option<Arc<[u32]>>>,
     staged_speech_prefix: Vec<Option<Arc<[u32]>>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
@@ -4432,7 +4436,22 @@ impl GpuEngine {
                 packet_max_ctx = want as usize;
             } else if (want as usize) < packet_max_ctx {
                 crate::exec::ctx_bound::narrow(&mut blob, want)?;
-                live_kv_manifest = blob.with_packet_view(plow_asset::live_kv::emit).ok();
+                if let Some(m) = live_kv_manifest.as_mut() {
+                    m.max_ctx = want;
+                    for c in &mut m.caches {
+                        if c.window == 0 {
+                            c.stride = want;
+                        }
+                    }
+                    m.programs = blob.with_packet_view(|p| {
+                        p.programs
+                            .iter()
+                            .map(plow_asset::live_kv::program_digest)
+                            .collect()
+                    });
+                } else {
+                    live_kv_manifest = blob.with_packet_view(plow_asset::live_kv::emit).ok();
+                }
                 if let Some(pack) = packed_prefill_metadata.as_mut() {
                     blob.with_packet_view(|p| {
                         for (pi, g) in p.programs.iter().enumerate().take(p.prefill_count) {
@@ -8143,6 +8162,7 @@ impl GpuEngine {
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,
             rank_bind,
+            sidecar_reserve: 0,
         };
         engine.spec_upload_identity()?;
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
@@ -8256,8 +8276,12 @@ impl GpuEngine {
         // admission budget and store cap are sized as before, the planner's load measurement
         // includes it: 2 x Gemma-4-E4B (4 GiB each, 128 slots) was admitted on a measurement
         // without it and both engines ran out of device memory on first use.
+        let sidecar_reserve =
+            crate::serve::manager::sidecar_bytes(&assets_dir.join("model.pkt")).unwrap_or(0);
+        engine.sidecar_reserve = sidecar_reserve;
         if let Some(v) = engine.vmm.as_ref().filter(|v| v.prefix_kv().is_some()) {
-            for b in 0..engine.vmm_active.len() {
+            let max_premap = if sidecar_reserve > 0 { 1 } else { engine.vmm_active.len() };
+            for b in 0..max_premap {
                 v.ensure_rows(b, 1)?;
             }
         }
@@ -9257,8 +9281,12 @@ impl GpuEngine {
             if let Some(v) = self.vmm.as_ref().filter(|v| v.prefix_kv().is_some()) {
                 // Wider decode rungs write idle rows too. Reserve those before
                 // one request can consume their remaining physical pages.
-                for slot in 0..self.batch {
-                    v.ensure_rows(slot, 1)?;
+                if self.sidecar_reserve == 0 {
+                    for slot in 0..self.batch {
+                        v.ensure_rows(slot, 1)?;
+                    }
+                } else {
+                    v.ensure_rows(b, 1)?;
                 }
                 if let Some(t) = host_t {
                     marks[2] = t.elapsed().as_nanos() as u64;
@@ -9325,7 +9353,9 @@ impl GpuEngine {
                         || reclaimed
                         || self.packed_admission.contains(&PackedAdmission::Ready))
                 {
-                    self.vmm.as_ref().unwrap().ensure_rows(b, 1)?;
+                    if self.sidecar_reserve == 0 {
+                        self.vmm.as_ref().unwrap().ensure_rows(b, 1)?;
+                    }
                     self.kv_pressure_events += 1;
                     self.packed_admission[b] = PackedAdmission::Waiting(
                         self.kv_admission_epoch,
