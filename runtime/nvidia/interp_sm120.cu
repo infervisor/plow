@@ -2166,7 +2166,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                          in->i[1], in->i[2], slice, nblk);
 #else
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
-                          in->i[1], in->i[2], in->i[7] != 0u, slice, nblk);
+                          in->i[1], in->i[2], in->i[7] != 0u, slice, nblk, arena);
 #endif
         break;
     case PLOW_DOP_SAMPLE_SMALL_F32:

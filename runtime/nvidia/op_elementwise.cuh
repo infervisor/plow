@@ -358,15 +358,25 @@ static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bflo
 
 /* GemvF32Out (op 220): C[m][n] = sum_k x[m][k] * W[n][k] in fp32 (exact bf16 products, fp32 fma), stored
  * fp32 — a reference that casts both operands to f32 before its matmul. A warp per output row, rows
- * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. `round_bf16` (flag bit 11): C rounded to bf16. */
+ * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. `round_bf16` (flag bit 11): C rounded to bf16.
+ * When all of x fits the launch's arena, a block stages it once (every warp re-read it from L2
+ * per output row otherwise); the arithmetic is the same either way. */
 static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N, unsigned K,
-                                     bool round_bf16, unsigned slice, unsigned nblk) {
+                                     bool round_bf16, unsigned slice, unsigned nblk, float* arena) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned per = (N + nblk - 1) / nblk;
     const unsigned n0 = slice * per;
     const unsigned n1 = min(n0 + per, N);
+    if (n0 >= n1) return;
+    __nv_bfloat16* xs = (__nv_bfloat16*)arena;
+    if ((K & 7u) == 0 && ((uintptr_t)x & 15u) == 0 && smem_fits(xs + (size_t)M * K)) {
+        for (size_t i = (size_t)threadIdx.x * 8u; i < (size_t)M * K; i += PLOW_NV_THREADS * 8u)
+            *(uint4*)(xs + i) = *(const uint4*)(x + i);
+        __syncthreads();
+        x = xs;
+    }
     for (unsigned n = n0 + warp; n < n1; n += PLOW_NV_WARPS) {
         const __nv_bfloat16* wr = W + (size_t)n * K;
         for (unsigned m0 = 0; m0 < M; m0 += 8) {
@@ -758,6 +768,25 @@ static __device__ __forceinline__ unsigned long long f32_key(float f, unsigned i
     const unsigned key = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
     return ((unsigned long long)key << 32) | (unsigned long long)(~i);
 }
+/* argmax over i < n of sv[i] + sf_neg_log_exp1(seed, step, coord, 0, i) by one full warp: lanes scan
+ * i = lane, lane + 32, ... with strict >, then (max score, lowest i) across lanes = a serial strict->
+ * scan's pick; nothing above -inf (or NaN) picks 0. */
+static __device__ __forceinline__ unsigned gumbel_pick_warp(const float* sv, unsigned n, unsigned long long seed,
+                                                            unsigned step, unsigned coord) {
+    unsigned best = 0xFFFFFFFFu;
+    float bv = -INFINITY;
+    for (unsigned i = threadIdx.x & 31u; i < n; i += 32u) {
+        const float v = sv[i] + sf_neg_log_exp1(seed, step, coord, 0u, i);
+        if (v > bv) { bv = v; best = i; }
+    }
+#pragma unroll
+    for (unsigned d = 16; d; d >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, d);
+        const unsigned ob = __shfl_xor_sync(0xffffffffu, best, d);
+        if (ov > bv || (ov == bv && ob < best)) { bv = ov; best = ob; }
+    }
+    return best == 0xFFFFFFFFu ? 0u : best;
+}
 static __device__ void d_sample_small(unsigned* __restrict__ out, const float* __restrict__ logits,
                                       const float* __restrict__ params, const unsigned* __restrict__ ctl,
                                       const unsigned long long* __restrict__ seed, unsigned* __restrict__ bitmap,
@@ -819,10 +848,11 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
                 __syncthreads();
             }
         }
-        if (threadIdx.x == 0) {
+        if (threadIdx.x < 32u) {
+            const unsigned lane = threadIdx.x;
             const unsigned step = ctl[2u * r + 1u];
             unsigned n = K;
-            if (p[1] < 1.f) {
+            if (p[1] < 1.f && lane == 0) {
                 float z = 0.f;
                 for (unsigned i = 0; i < K; i++) z += expf(sv[i] - sv[0]);
                 float cum = 0.f;
@@ -831,21 +861,19 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
                     cum += expf(sv[i] - sv[0]) / z;
                 }
             }
-            unsigned best = 0;
-            float bv = -INFINITY;
-            for (unsigned i = 0; i < n; i++) {
-                const float v = sv[i] + sf_neg_log_exp1(seed[r], step, coord, 0u, i);
-                if (v > bv) { bv = v; best = i; }
-            }
-            unsigned c = sel[best];
-            const size_t o = (size_t)r * out_stride + out_col0;
-            if (force && force[o] != 0xFFFFFFFFu) c = force[o];
-            if (bm) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
-            out[o] = c;
-            if (eidx) eidx[r] = c + eoff;
-            if (guide) {
-                out[o + out_stride] = c;
-                if (eidx) eidx[r + 1] = c + eoff;
+            n = __shfl_sync(0xffffffffu, n, 0);
+            const unsigned best = gumbel_pick_warp(sv, n, seed[r], step, coord);
+            if (lane == 0) {
+                unsigned c = sel[best];
+                const size_t o = (size_t)r * out_stride + out_col0;
+                if (force && force[o] != 0xFFFFFFFFu) c = force[o];
+                if (bm) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
+                out[o] = c;
+                if (eidx) eidx[r] = c + eoff;
+                if (guide) {
+                    out[o + out_stride] = c;
+                    if (eidx) eidx[r + 1] = c + eoff;
+                }
             }
         }
         __syncthreads();
