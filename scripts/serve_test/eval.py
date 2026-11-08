@@ -365,12 +365,12 @@ def main():
     asr, tts, llm, max_len = models_by_kind()
     pick = lambda found: [m for m in a.models.split(",") if m in found] if a.models else found  # noqa: E731
     report = {"url": URL, "date": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-    if a.what in ("asr", "all"):
+    if a.what == "asr" or (a.what == "all" and pick(asr)):
         report["asr"] = eval_asr(a, pick(asr))
     if a.what in ("llm", "all") and llm:
         m = pick(llm)[0] if pick(llm) else llm[0]
         report["llm"] = eval_llm(a, m, max_len.get(m))
-    if a.what in ("tts", "all"):
+    if a.what == "tts" or (a.what == "all" and pick(tts)):
         report["tts"] = eval_tts(a, pick(tts), a.out)
     json.dump(report, open(os.path.join(a.out, "eval.json"), "w"), ensure_ascii=False, indent=1)
     md = [f"# plowrt quality evaluation\n\nServer {URL}, {report['date']}.\n"]

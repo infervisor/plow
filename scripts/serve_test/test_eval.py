@@ -119,5 +119,35 @@ class TtsCaptureTests(unittest.TestCase):
             evaluation.eval_tts(self.args, [], self.root)
 
 
+class CapabilityTests(unittest.TestCase):
+    def test_all_skips_unadvertised_capabilities_and_writes_reports(self):
+        for asr, llm in [(["asr"], []), ([], ["llm"]), (["asr"], ["llm"])]:
+            with self.subTest(asr=asr, llm=llm), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch("sys.argv", ["eval.py", "all", "--out", directory]), \
+                    mock.patch.object(evaluation, "models_by_kind", return_value=(asr, [], llm, {})), \
+                    mock.patch.object(evaluation, "eval_asr", return_value={}) as run_asr, \
+                    mock.patch.object(evaluation, "eval_llm", return_value=dict(
+                        model="llm", passed=1, total=1, checks=[])) as run_llm, \
+                    mock.patch.object(evaluation, "capture_tts") as capture:
+                with self.assertRaises(SystemExit) as result:
+                    evaluation.main()
+                self.assertEqual(result.exception.code, 0)
+                self.assertEqual(run_asr.call_count, bool(asr))
+                self.assertEqual(run_llm.call_count, bool(llm))
+                capture.assert_not_called()
+                report = json.loads((Path(directory) / "eval.json").read_text())
+                self.assertEqual("asr" in report, bool(asr))
+                self.assertEqual("llm" in report, bool(llm))
+                self.assertNotIn("tts", report)
+                self.assertTrue((Path(directory) / "eval.md").is_file())
+
+    def test_explicit_tts_still_rejects_missing_models(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("sys.argv", ["eval.py", "tts", "--out", directory]), \
+                mock.patch.object(evaluation, "models_by_kind", return_value=([], [], [], {})):
+            with self.assertRaisesRegex(ValueError, "no requested TTS model"):
+                evaluation.main()
+
+
 if __name__ == "__main__":
     unittest.main()
