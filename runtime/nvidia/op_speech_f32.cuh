@@ -3609,6 +3609,24 @@ static __device__ __noinline__ void d_stream_tail_f32(const PlowDevInst* in, voi
         const unsigned* pos = (const unsigned*)SP_TEN(5);
         const unsigned zr = L + N;
         if ((uint64_t)B * zr * Cz > 0xFFFFFFFFull) { __trap(); return; }
+        /* Quads of columns (zc0, C, Cz and the src stride multiples of 4: a quad is all history,
+         * all zero or all src); coherent loads, the operands are this launch's own. */
+        if (((Cz | C | zc0 | in->i[6]) & 3u) == 0u && sp_aligned(z, 16) && sp_aligned(src, 16) &&
+            sp_aligned(state, 16)) {
+            const unsigned q = Cz / 4u;
+            sp_batched<4>(
+                B * zr * q, slice, nblk,
+                [&](unsigned e) {
+                    const unsigned rr = e / q, c = (e - rr * q) * 4u, b = rr / zr, r = rr - b * zr;
+                    if (r >= L) return __ldcg((const float4*)(src + ((size_t)b * N + (r - L)) * in->i[6] + c));
+                    if (c < zc0 || c - zc0 >= C || pos[b] == 0u) return make_float4(0.f, 0.f, 0.f, 0.f);
+                    const unsigned s = slot[b];
+                    if (s >= slots) __trap();
+                    return __ldcg((const float4*)(state + ((size_t)s * L + r) * C + (c - zc0)));
+                },
+                [&](unsigned e, float4 v) { ((float4*)z)[e] = v; });
+            return;
+        }
         sp_batched<8>(
             B * zr * Cz, slice, nblk,
             [&](unsigned e) {
@@ -3623,6 +3641,22 @@ static __device__ __noinline__ void d_stream_tail_f32(const PlowDevInst* in, voi
         return;
     }
     if ((uint64_t)B * L * C > 0xFFFFFFFFull) { __trap(); return; }
+    if (((Cz | C | zc0) & 3u) == 0u && sp_aligned(src, 16) && sp_aligned(state, 16)) {
+        const unsigned q = C / 4u;
+        sp_batched<4>(
+            B * L * q, slice, nblk,
+            [&](unsigned e) {
+                const unsigned rr = e / q, c = (e - rr * q) * 4u, b = rr / L, i = rr - b * L;
+                const unsigned n = nrows[b];
+                if (n > N || slot[b] >= slots) __trap();
+                return __ldcg((const float4*)(src + ((size_t)b * (L + N) + n + i) * Cz + zc0 + c));
+            },
+            [&](unsigned e, float4 v) {
+                const unsigned rr = e / q, c = (e - rr * q) * 4u, b = rr / L, i = rr - b * L;
+                *(float4*)(state + ((size_t)slot[b] * L + i) * C + c) = v;
+            });
+        return;
+    }
     sp_batched<8>(
         B * L * C, slice, nblk,
         [&](unsigned e) {
@@ -5075,6 +5109,113 @@ static __device__ __noinline__ void sp_conv1d_warp(const SpConvArgs& a, unsigned
     }
 }
 
+/* The lanes arm's 32 lane partials over K for channel-major weights ([o][cg][kernel], kk = ci * KT + tap)
+ * at kernel KT: 32-channel chunks of KT taps each fix every kk's partial (kk mod 32) at compile time. */
+template <unsigned KT>
+static __device__ __forceinline__ void sp_lanes_ci_major(const SpConvArgs& a, const float* xr, const float* wr,
+                                                         unsigned LD, const bool (&ok)[KT], float (&acc)[32]) {
+    for (unsigned ci0 = 0; ci0 < a.cg; ci0 += 32u) {
+#pragma unroll
+        for (unsigned c = 0; c < 32u; c++)
+#pragma unroll
+            for (unsigned tap = 0; tap < KT; tap++)
+                if (ok[tap])
+                    acc[(c * KT + tap) & 31u] = fmaf(xr[(size_t)tap * a.dil * LD + ci0 + c], wr[(ci0 + c) * KT + tap],
+                                                     acc[(c * KT + tap) & 31u]);
+    }
+}
+
+/* Flag bit 16 with cout <= 4, cg % 32 == 0, 16-byte x and tap-major weights or channel-major ones at
+ * kernel 7: sp_conv1d_warp's result bit for bit, from smem. A block stages its tile's padded input
+ * window (input activation applied once per element, padding zero) and the cout weight rows; each
+ * lane then owns one output row and keeps the warp form's 32 lane partials (partial j takes the K
+ * indices = j mod 32, in K order) and folds them in its xor-shuffle order. Row pitch: cin + 4 for
+ * the tap-major float4 reads, cin + 1 for the channel-major scalar ones (conflict-free across
+ * lanes at odd strides either way). False when the shape does not fit (uniform across the block). */
+static __device__ __noinline__ bool sp_conv1d_lanes(const SpConvArgs& a, unsigned slice, unsigned nblk, float* arena) {
+    if (!(a.tapmajor || a.kernel == 7u) || a.cg % 32u || !sp_aligned(a.x, 16) || a.stride > 64u || a.dil > 64u ||
+        a.kernel > 64u || a.cin > (unsigned)SP_ARENA_FLOATS)
+        return false;
+    const unsigned K = a.kernel * a.cg, LD = a.cin + (a.tapmajor ? 4u : 1u), span = (a.kernel - 1u) * a.dil;
+    auto fits = [&](unsigned R) {
+        return (size_t)a.cout * K + ((size_t)(R - 1u) * a.stride + span + 1u) * LD <= (size_t)SP_ARENA_FLOATS;
+    };
+    unsigned R = PLOW_NV_THREADS;
+    while (R > 32u && !fits(R)) R -= 32u;
+    if (!fits(R)) return false;
+    float* ws = arena;
+    float* xs = arena + a.cout * K;
+    const unsigned C4 = a.cin / 4u, rows_in = (R - 1u) * a.stride + span + 1u, tiles = (a.out_rows + R - 1u) / R;
+    const unsigned r = threadIdx.x;
+    if (slice >= a.batch * tiles) return true;
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < a.cout * K; i += PLOW_NV_THREADS) ws[i] = a.w_at(i);
+    for (unsigned tile = slice; tile < a.batch * tiles; tile += nblk) {
+        const unsigned b = tile / tiles, t0 = (tile - b * tiles) * R;
+        const int length = (int)a.length(b), p0 = (int)(t0 * a.stride) - (int)a.before;
+        const float* xb = a.x + (size_t)b * a.in_rows * a.cin;
+        __syncthreads();
+        for (unsigned e = threadIdx.x; e < rows_in * C4; e += PLOW_NV_THREADS) {
+            const unsigned row = e / C4, c = (e - row * C4) * 4u;
+            const int u = sp_pad_row(p0 + (int)row, length, a.mode);
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (u >= 0) {
+                v = __ldcg((const float4*)(xb + (size_t)u * a.cin + c));
+                v.x = a.pre_at(v.x, c); v.y = a.pre_at(v.y, c + 1u); v.z = a.pre_at(v.z, c + 2u); v.w = a.pre_at(v.w, c + 3u);
+            }
+            float* d = xs + (size_t)row * LD + c;
+            if (a.tapmajor) *(float4*)d = v;
+            else { d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w; }
+        }
+        __syncthreads();
+        const unsigned t = t0 + r;
+        if (r >= R || t >= a.out_rows) continue;
+        const size_t m = (size_t)b * a.out_rows + t;
+        if (t >= a.conv_len(b)) {
+            for (unsigned o = 0; o < a.cout; o++) a.out[m * a.cout + o] = 0.f;
+            continue;
+        }
+        const int tp = (int)(t * a.stride) - (int)a.before;
+        for (unsigned o = 0; o < a.cout; o++) {
+            float acc[32];
+#pragma unroll
+            for (unsigned j = 0; j < 32u; j++) acc[j] = 0.f;
+            if (a.tapmajor) {
+                for (unsigned tap = 0; tap < a.kernel; tap++) {
+                    if (sp_pad_row(tp + (int)(tap * a.dil), length, a.mode) < 0) continue;
+                    const float4* xr = (const float4*)(xs + (size_t)(r * a.stride + tap * a.dil) * LD);
+                    const float4* wr = (const float4*)(ws + (size_t)o * K + tap * a.cg);
+                    for (unsigned c8 = 0; c8 < a.cg / 4u; c8 += 8u) {
+#pragma unroll
+                        for (unsigned q = 0; q < 8u; q++) {
+                            const float4 xv = xr[c8 + q], wv = wr[c8 + q];
+                            acc[4 * q] = fmaf(xv.x, wv.x, acc[4 * q]);
+                            acc[4 * q + 1] = fmaf(xv.y, wv.y, acc[4 * q + 1]);
+                            acc[4 * q + 2] = fmaf(xv.z, wv.z, acc[4 * q + 2]);
+                            acc[4 * q + 3] = fmaf(xv.w, wv.w, acc[4 * q + 3]);
+                        }
+                    }
+                }
+            } else {
+                bool ok[7];
+#pragma unroll
+                for (unsigned tap = 0; tap < 7u; tap++) ok[tap] = sp_pad_row(tp + (int)(tap * a.dil), length, a.mode) >= 0;
+                sp_lanes_ci_major<7>(a, xs + (size_t)r * a.stride * LD, ws + (size_t)o * K, LD, ok, acc);
+            }
+#pragma unroll
+            for (unsigned j = 0; j < 16u; j++) acc[j] = __fadd_rn(acc[j], acc[j + 16u]);
+#pragma unroll
+            for (unsigned j = 0; j < 8u; j++) acc[j] = __fadd_rn(acc[j], acc[j + 8u]);
+#pragma unroll
+            for (unsigned j = 0; j < 4u; j++) acc[j] = __fadd_rn(acc[j], acc[j + 4u]);
+            acc[0] = __fadd_rn(acc[0], acc[2]); acc[1] = __fadd_rn(acc[1], acc[3]);
+            acc[0] = __fadd_rn(acc[0], acc[1]);
+            a.store(m * a.cout + o, o, a.bias ? __fadd_rn(acc[0], a.bias[o]) : acc[0]);
+        }
+    }
+    return true;
+}
+
 /* Flag bit 16, at most SPV_ROWS output rows of a zero-padded conv. Each block takes 8 output
  * channels (one per warp) and walks K in SPV_KC chunks: the block stages the chunk's im2col tile
  * X[m][j] (input activation applied, padding zero) in smem, laid out [m][(4q + c) * 32 + lane] so
@@ -5171,7 +5312,10 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
     if (!sp_conv_args(in, T, transpose, a)) return;
     if (!transpose && ((in->fj[2].u >> 16) & 1u) && a.groups == 1u) {
         if (sp_conv1d_rows(a, slice, nblk, arena)) return;
-        if (a.cout <= 4u) return sp_conv1d_warp(a, slice, nblk);
+        if (a.cout <= 4u) {
+            if (sp_conv1d_lanes(a, slice, nblk, arena)) return;
+            return sp_conv1d_warp(a, slice, nblk);
+        }
     }
     if (!transpose && a.cg == 1u && a.ng == 1u && sp_conv1d_depthwise(a, slice, nblk, arena)) return;
     if (a.ng < 16u || a.cg * a.kernel < 16u) {

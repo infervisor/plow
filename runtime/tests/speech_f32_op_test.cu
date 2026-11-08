@@ -617,30 +617,42 @@ static void st_inst(PlowDevInst& in, unsigned z, unsigned src, unsigned state, u
     in.i[0] = B; in.i[1] = L; in.i[2] = N; in.i[3] = C; in.i[4] = Cz; in.i[5] = zc0; in.i[6] = src_stride;
     in.i[7] = mode; in.fj[1].u = slots;
 }
+static const PlowDevInst* g_chain_pre;
+static void g_stream_tail_chain(const PlowDevInst* in, uint32_t b, uint32_t nb, void* const* t, PlowCpuCtx* ctx) {
+    g_stream_tail_f32(g_chain_pre, b, nb, t, ctx);
+    g_stream_tail_f32(in, b, nb, t, ctx);
+}
 static void t_stream_tail() {
-    struct G { const char* name; unsigned L, N, C, Cz, zc0, src_stride; };
-    for (const G& g : {G{"StreamTailF32 gather window zc0=9", 5, 7, 24, 40, 9, 48},
-                       G{"StreamTailF32 gather full width L>N", 8, 3, 32, 32, 0, 32}}) {
-        Case c; const unsigned B = 4, slots = 6;
+    struct G { const char* name; unsigned L, N, C, Cz, zc0, src_stride, B; };
+    for (const G& g : {G{"StreamTailF32 gather window zc0=9", 5, 7, 24, 40, 9, 48, 4},
+                       G{"StreamTailF32 gather window zc0=8", 5, 7, 24, 40, 8, 48, 4},
+                       G{"StreamTailF32 gather full width L>N", 8, 3, 32, 32, 0, 32, 4},
+                       G{"StreamTailF32 gather wide zc0=256", 8, 17, 512, 1024, 256, 1024, 6}}) {
+        Case c; const unsigned B = g.B, slots = 6;
         unsigned z = c.out((size_t)B * (g.L + g.N) * g.Cz);
         unsigned src = c.f32((size_t)(B * g.N - 1) * g.src_stride + g.Cz, 1.f);
         unsigned state = c.f32((size_t)slots * g.L * g.C, 1.f);
-        unsigned slot = c.u32({3, 0, 5, 1}), n = c.u32({g.N, 0, 3, 1}), pos = c.u32({0, 12, 4, 0});
+        std::vector<uint32_t> vs{3, 0, 5, 1, 2, 4}, vn{g.N, 0, 3, 1, g.N, 2}, vp{0, 12, 4, 0, 30, 2};
+        vs.resize(B); vn.resize(B); vp.resize(B);
+        unsigned slot = c.u32(vs), n = c.u32(vn), pos = c.u32(vp);
         st_inst(c.in, z, src, state, slot, n, pos, B, slots, g.L, g.N, g.C, g.Cz, g.zc0, g.src_stride, 0);
-        run(g.name, c, g_stream_tail_f32, {z}, FP32, 0.0);
+        run(g.name, c, g_stream_tail_f32, {z}, INT);
     }
-    {
-        /* n = 0, n < L, n == L, n > L (= N) and a window: state rows read z rows n..n+L. */
-        Case c; const unsigned B = 4, slots = 6, L = 5, N = 7, C = 24, Cz = 40, zc0 = 9;
+    /* n = 0, n < L, n == L, n > L (= N) and a window: state rows read z rows n..n+L. zc0 = 9 takes
+     * the scalar walk, zc0 = 8 the float4 one. */
+    for (unsigned zc0 : {9u, 8u}) {
+        Case c; const unsigned B = 4, slots = 6, L = 5, N = 7, C = 24, Cz = 40;
         unsigned z = c.f32((size_t)B * (L + N) * Cz, 1.f);
         unsigned state = c.f32((size_t)slots * L * C, 1.f);
         unsigned slot = c.u32({2, 5, 0, 4}), n = c.u32({0, 3, 5, 7});
         st_inst(c.in, PLOW_TENSOR_NONE, z, state, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, Cz, zc0, 0, 1);
-        run("StreamTailF32 store n=0,<L,=L,>L zc0=9", c, g_stream_tail_f32, {state}, FP32, 0.0);
+        run(zc0 == 9u ? "StreamTailF32 store n=0,<L,=L,>L zc0=9" : "StreamTailF32 store n=0,<L,=L,>L zc0=8",
+            c, g_stream_tail_f32, {state}, INT);
     }
-    {
-        /* Device gather then store; items with pos = 0 and n = 0 must leave zeros. */
-        Case c; const unsigned B = 5, slots = 5, L = 6, N = 4, C = 16, Cz = 24, zc0 = 4, ss = 24;
+    /* Device gather then store against the chained golden; z starts poisoned. Items with pos = 0
+     * and n = 0 must leave zeros. zc0 = 4 takes the float4 walks, zc0 = 5 the scalar ones. */
+    for (unsigned zc0 : {4u, 5u}) {
+        Case c; const unsigned B = 5, slots = 5, L = 6, N = 4, C = 16, Cz = 24, ss = 24;
         unsigned z = c.out((size_t)B * (L + N) * Cz);
         unsigned src = c.f32((size_t)B * N * ss, 1.f);
         unsigned state = c.f32((size_t)slots * L * C, 1.f);
@@ -650,10 +662,9 @@ static void t_stream_tail() {
         for (auto& t : gather.t) t = PLOW_TENSOR_NONE;
         st_inst(gather, z, src, state, slot, n, pos, B, slots, L, N, C, Cz, zc0, ss, 0);
         st_inst(c.in, PLOW_TENSOR_NONE, z, state, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, Cz, zc0, 0, 1);
-        std::vector<void*> th;
-        for (auto& h : c.host) th.push_back(h.data());
-        g_stream_tail_f32(&gather, 0, 1, th.data(), nullptr);
-        run("StreamTailF32 gather->store chain", c, g_stream_tail_f32, {state}, FP32, 0.0, 0, &gather);
+        g_chain_pre = &gather;
+        run(zc0 == 4u ? "StreamTailF32 chain zc0=4" : "StreamTailF32 chain zc0=5", c, g_stream_tail_chain,
+            {z, state}, INT, 0.0, 0, &gather);
         const float* st = (const float*)c.host[state].data();
         bool zeros = true;
         for (size_t i = 0; i < (size_t)L * C; i++) zeros &= st[(size_t)4 * L * C + i] == 0.f;
@@ -771,6 +782,34 @@ static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
     for (uint32_t t : tk) zero &= t == 0u;
     printf("  %-34s tickets re-armed -> %s\n", name, zero ? "PASS" : "FAIL");
     if (!zero) g_fail = 1;
+}
+
+__global__ void __launch_bounds__(256, 1) k_conv_warp_ref(PlowDevInst in, void* const* T) {
+    SpConvArgs a;
+    if (sp_conv_args(&in, T, false, a)) sp_conv1d_warp(a, blockIdx.x, gridDim.x);
+}
+/* Bit-16 cout <= 4 shapes the lanes arm takes: against the golden, then bit for bit against the
+ * warp arm it replaces. */
+static void t_conv1d_lanes(const char* name, ConvSpec s, bool tapmajor = true) {
+    s.rows = true;
+    s.tapmajor = tapmajor;
+    Case c; unsigned o;
+    build_conv(c, s, false, o);
+    run(name, c, g_conv1d_f32, {o}, FP32, 2e-5);
+    std::vector<void*> ptrs = c.dev;
+    const size_t bytes = c.host[o].size();
+    CK(cudaMalloc(&ptrs[o], bytes));
+    void** td = upload_table(ptrs);
+    k_conv_warp_ref<<<g_nblk, 256>>>(c.in, td);
+    CK(cudaDeviceSynchronize());
+    std::vector<uint8_t> got(bytes), ref(bytes);
+    CK(cudaMemcpy(got.data(), c.dev[o], bytes, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(ref.data(), ptrs[o], bytes, cudaMemcpyDeviceToHost));
+    CK(cudaFree(ptrs[o]));
+    CK(cudaFree(td));
+    const bool same = got == ref;
+    printf("  %-34s vs warp arm bit-identical -> %s\n", name, same ? "PASS" : "FAIL");
+    if (!same) g_fail = 1;
 }
 
 static void t_convt1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -2540,6 +2579,29 @@ int main(int argc, char** argv) {
             t.s.rows = t.s.tapmajor = true;
             t_conv1d(t.name, t.s);
         }
+        /* Lanes arm (bit 16, cout <= 4, tap-major, cg % 32 == 0): multi-tile items, reflect and
+         * replicate padding, short lengths, stride and dilation. */
+        RA las[] = {
+            {"Conv1dF32 lanes k7 snake-in 96->1 reflect len", {3, 700, 96, 1, 7, 1, 1, 1, 3, 3, 1, 12, 0, false, true, true, true, {700, 451, 9}, 0.f}},
+            {"Conv1dF32 lanes k7 d3 s2 leaky 64->3 replicate", {2, 1100, 64, 3, 7, 2, 3, 1, 9, 9, 2, 9, 0, false, true, false, false, {1100, 530}, 0.1f}},
+            {"Conv1dF32 lanes k3 128->4 zero", {1, 520, 128, 4, 3, 1, 1, 1, 1, 1, 0, 0, 0, false, false, false, false, {}, 0.f}},
+        };
+        for (RA& t : las) t_conv1d_lanes(t.name, t.s);
+        const int nblk = g_nblk;
+        g_nblk = 2; /* several tiles per block */
+        t_conv1d_lanes("Conv1dF32 lanes 96->2 asym pad nblk=2",
+                       {4, 900, 96, 2, 7, 1, 1, 1, 6, 0, 0, 12, 0, true, true, true, false, {900, 1, 0, 640}, 0.f});
+        g_nblk = nblk;
+        /* Channel-major weights at kernel 7 (the codec's final 96 -> 1 conv). */
+        RA lcs[] = {
+            {"Conv1dF32 lanes ch-major k7 snake 96->1 len", {3, 700, 96, 1, 7, 1, 1, 1, 3, 3, 0, 12, 0, false, true, true, false, {700, 451, 9}, 0.f}},
+            {"Conv1dF32 lanes ch-major k7 d2 s3 64->4 refl", {2, 900, 64, 4, 7, 3, 2, 1, 6, 6, 1, 9, 0, false, true, false, true, {900, 333}, 0.1f}},
+        };
+        for (RA& t : lcs) t_conv1d_lanes(t.name, t.s, false);
+        g_nblk = 3;
+        t_conv1d_lanes("Conv1dF32 lanes ch-major 96->1 nblk=3",
+                       {2, 1500, 96, 1, 7, 1, 1, 1, 6, 0, 0, 12, 0, true, true, true, false, {1500, 2}, 0.f}, false);
+        g_nblk = nblk;
         ConvSpec w7{2, 300, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, true, {300, 170}, 0.f, true};
         t_conv1d("Conv1dF32 k7 snake-out +res (64x64 tiles)", w7);
         ConvSpec w5{2, 1000, 64, 1, 7, 1, 1, 1, 3, 3, 0, 9, 1, false, true, false, false, {1000, 500}, 0.01f, true};
