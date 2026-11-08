@@ -1276,7 +1276,11 @@ async fn speech_with(
         .filter(|_| req.stream && model.codec.step_frames > 0)
     {
         sp.first_tokens = model.contract.first_frames();
+        sp.first_audio = Some(Arc::new(crate::serve::mux::FirstAudio::new(
+            sp.first_tokens,
+        )));
     }
+    let first_audio = speech.as_ref().and_then(|sp| sp.first_audio.clone());
     let (tx, rx) = stream_mod::channel();
     let opts = crate::serve::mux::JobOpts {
         session_end: false,
@@ -1352,6 +1356,7 @@ async fn speech_with(
             seed,
             t_arrive,
             run,
+            first_audio,
         ));
         return stream_response(out_rx, head_rx, header, in_flight, cache).await;
     }
@@ -2124,15 +2129,19 @@ fn stream_step(
 /// of them sent, decodes: every committed frame up to `cap`; a segment's first step waits for
 /// `first` frames until the segment is done.
 fn step_plan(n: usize, emitted: usize, done: bool, first: usize, cap: usize) -> Option<usize> {
+    let new = n.saturating_sub(emitted);
+    (new > 0 && (done || new >= step_need(emitted, first, cap))).then(|| new.min(cap))
+}
+
+/// New frames [`step_plan`]'s next step waits for (short of the segment's end).
+fn step_need(emitted: usize, first: usize, cap: usize) -> usize {
     // A step costs about the same at 1 frame as at `cap`: after the first, each step waits for as
     // many new frames as were already emitted (their audio covers producing them), up to `cap`.
-    let new = n.saturating_sub(emitted);
-    let need = if emitted == 0 {
+    if emitted == 0 {
         first
     } else {
         emitted.min(cap)
-    };
-    (new > 0 && (done || new >= need)).then(|| new.min(cap))
+    }
 }
 
 enum SegMsg {
@@ -2192,8 +2201,19 @@ async fn stream_task(
     seed: u64,
     t_arrive: Instant,
     mut run: crate::serve::turns::StageRun,
+    first_audio: Option<Arc<crate::serve::mux::FirstAudio>>,
 ) {
     use std::sync::atomic::Ordering::SeqCst;
+    // However the stream ends, the decode loop stops handing it the device.
+    struct Heard(Option<Arc<crate::serve::mux::FirstAudio>>);
+    impl Drop for Heard {
+        fn drop(&mut self) {
+            if let Some(fa) = &self.0 {
+                fa.hear();
+            }
+        }
+    }
+    let audible = Heard(first_audio);
     struct ActiveGuard(Option<Arc<crate::obs::Metrics>>);
     impl Drop for ActiveGuard {
         fn drop(&mut self) {
@@ -2412,6 +2432,12 @@ async fn stream_task(
         if !windowed && slot.is_none() && n > emitted && !skipping {
             slot = model.codec.acquire_slot();
             windowed = slot.is_none();
+            if windowed {
+                // Windows follow their own plan: no per-step handoff.
+                if let Some(fa) = &audible.0 {
+                    fa.hear();
+                }
+            }
         }
         // A short first lookahead buys time to first audio, but the next window needs the full
         // lookahead: hold the first audio until it covers producing those frames at the measured
@@ -2507,6 +2533,11 @@ async fn stream_task(
                     };
                     if slot.is_some() {
                         frames.release(emitted..upto);
+                        if let Some(fa) = &audible.0 {
+                            fa.set_next(
+                                upto + step_need(upto, first_frames, model.codec.step_frames),
+                            );
+                        }
                     }
                     emitted = upto;
                     let mut bytes = Vec::new();
@@ -2520,6 +2551,9 @@ async fn stream_task(
                     }
                     if !bytes.is_empty() {
                         if first.is_none() {
+                            if let Some(fa) = &audible.0 {
+                                fa.hear();
+                            }
                             ticket.first_audio();
                             crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, 0);
                         }
