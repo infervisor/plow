@@ -32,26 +32,26 @@ struct Loaded {
     _tables: Vec<DeviceMem>,
 }
 
-pub(super) struct FishDepth {
+pub(super) struct FishDepth<H = PinnedHost> {
     manifest: Manifest,
     programs: Vec<Loaded>,
     /// Staging for the widest program: seed u64 (first, so aligned), params `[rows][4]` f32, then
     /// top_k, step, hidden_row u32 (Maya 2: `[rows][2]` control, hidden_row, cb0), then the
     /// read-back codes `[rows][codebooks]`.
-    stage: Arc<PinnedHost>,
+    stage: Arc<H>,
     rows: usize,
     maya2: Option<Maya2>,
-    compact: Option<CompactDepth>,
+    compact: Option<CompactDepth<H>>,
     source: Option<Arc<dyn Send + Sync>>,
     pool: Option<PacketBufferPool>,
     retain_output: bool,
     captured: Option<PacketBuffer>,
 }
 
-struct CompactDepth {
+struct CompactDepth<H = PinnedHost> {
     remap: Loaded,
     index: DeviceMem,
-    host_index: PinnedHost,
+    host_index: Arc<H>,
     _remap_tensors: DeviceMem,
     depth_tensors: DeviceMem,
     logits: Option<DeviceMem>,
@@ -153,7 +153,7 @@ impl CompactDepth {
                 _tables: tables,
             },
             index,
-            host_index: e.be.host_alloc_pinned(e.batch * 4)?,
+            host_index: Arc::new(e.be.host_alloc_pinned(e.batch * 4)?),
             _remap_tensors: remap_tensors,
             depth_tensors,
             logits,
@@ -162,7 +162,7 @@ impl CompactDepth {
 
     fn launch(&mut self, e: &GpuEngine, owners: &[u32]) -> Result<()> {
         inverse_rows(
-            bytemuck::cast_slice_mut(self.host_index.as_mut_slice()),
+            bytemuck::cast_slice_mut(depth_stage(&mut self.host_index)?),
             owners,
         )?;
         // The predictor drains the stream before this pinned stage can be reused.
@@ -378,14 +378,19 @@ fn depth_stage(stage: &mut Arc<PinnedHost>) -> Result<&mut [u8]> {
         .ok_or_else(|| reject("depth staging transfer did not retire"))
 }
 
-impl FishDepth {
+impl<H> FishDepth<H> {
     fn quarantine(&self) {
         std::mem::forget(self.stage.clone());
+        if let Some(compact) = &self.compact {
+            std::mem::forget(compact.host_index.clone());
+        }
         if let Some(source) = &self.source {
             std::mem::forget(source.clone());
         }
     }
+}
 
+impl FishDepth {
     /// The packet's depth stage, `None` when it carries none; read from the engine's own blob.
     pub(super) fn load_if_present(
         e: &mut GpuEngine,
@@ -1218,6 +1223,53 @@ mod tests {
         inverse_rows, prompt_token_matches_decode, seed_frame_codes, Manifest, SpeakerMemory,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn failed_depth_transfer_retains_all_host_sources_after_drop() {
+        use super::{CompactDepth, DeviceMem, FishDepth, Loaded};
+        let stage = Arc::new(vec![0u8; 64]);
+        let index = Arc::new(vec![0u8; 16]);
+        let source = Arc::new(vec![0u32; 4]);
+        let owners = [Arc::downgrade(&stage), Arc::downgrade(&index)];
+        let frame_source = Arc::downgrade(&source);
+        let d = FishDepth {
+            manifest: serde_json::from_str(
+                r#"{"version":1,"rows":[1],"codebooks":2,"semantic_base":100,
+                "semantic_tokens":10,"stop_class":10,"ras_window":0,
+                "tensors":{"params":0,"top_k":1,"seed":2,"step":3,"history":4,
+                           "hidden_row":5,"frame_codes":6,"prompt_codes":7}}"#,
+            )
+            .unwrap(),
+            programs: Vec::new(),
+            stage,
+            rows: 1,
+            maya2: None,
+            compact: Some(CompactDepth {
+                remap: Loaded {
+                    rows: 1,
+                    // SAFETY: DevProgram contains only integers; this fixture never launches it.
+                    arg: unsafe { std::mem::zeroed() },
+                    counter_bytes: 0,
+                    _tables: Vec::new(),
+                },
+                index: DeviceMem::view(0, 0),
+                host_index: index,
+                _remap_tensors: DeviceMem::view(0, 0),
+                depth_tensors: DeviceMem::view(0, 0),
+                logits: None,
+            }),
+            source: Some(source),
+            pool: None,
+            retain_output: false,
+            captured: None,
+        };
+        d.quarantine();
+        drop(d);
+        for owner in owners {
+            assert!(owner.upgrade().is_some(), "unretired host source was freed");
+        }
+        assert!(frame_source.upgrade().is_some());
+    }
 
     #[test]
     fn native_prompt_tail_requires_the_declared_embedding_semantics() {
