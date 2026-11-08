@@ -24,6 +24,28 @@ pub const DONE: &str = "[DONE]";
 /// token id.
 pub const TEXT_ONLY: u32 = u32::MAX;
 
+#[derive(Debug)]
+pub struct SpeechFrame {
+    pub codes: Box<[u32]>,
+    pub device: Option<crate::exec::packet_runtime::PacketBuffer>,
+}
+
+impl From<Box<[u32]>> for SpeechFrame {
+    fn from(codes: Box<[u32]>) -> Self {
+        Self {
+            codes,
+            device: None,
+        }
+    }
+}
+
+impl std::ops::Deref for SpeechFrame {
+    type Target = [u32];
+    fn deref(&self) -> &[u32] {
+        &self.codes
+    }
+}
+
 /// One event from the muxer to the request handler.
 #[derive(Debug)]
 pub enum StreamChunk {
@@ -37,7 +59,7 @@ pub enum StreamChunk {
         text: String,
         logprobs: Option<Box<crate::text::logprobs::TokenLogprobs>>,
         /// A depth-stage speech packet's frame codes for this token.
-        frame: Option<Box<[u32]>>,
+        frame: Option<SpeechFrame>,
     },
     /// Terminal event: stop condition met. `executed` is the aggregate packet
     /// count for the whole request (feeds observability, not the wire).

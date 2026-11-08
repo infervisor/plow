@@ -52,6 +52,90 @@ pub(crate) mod stretch;
 
 use std::path::Path;
 
+#[derive(Default, Debug)]
+pub(crate) struct Codes {
+    pub(crate) host: Vec<i32>,
+    sources: smallvec::SmallVec<[Option<crate::exec::packet_runtime::PacketBuffer>; 1]>,
+}
+
+impl From<Vec<i32>> for Codes {
+    fn from(host: Vec<i32>) -> Self {
+        Self {
+            host,
+            sources: smallvec::SmallVec::new(),
+        }
+    }
+}
+
+impl FromIterator<i32> for Codes {
+    fn from_iter<T: IntoIterator<Item = i32>>(iter: T) -> Self {
+        Vec::from_iter(iter).into()
+    }
+}
+
+impl std::ops::Deref for Codes {
+    type Target = [i32];
+    fn deref(&self) -> &[i32] {
+        &self.host
+    }
+}
+
+impl Codes {
+    pub(crate) fn frame(
+        host: Vec<i32>,
+        source: Option<crate::exec::packet_runtime::PacketBuffer>,
+    ) -> Self {
+        Self {
+            host,
+            sources: source.into_iter().map(Some).collect(),
+        }
+    }
+
+    pub(crate) fn extend(&mut self, other: Self, fc: usize) {
+        if !self.sources.is_empty() || !other.sources.is_empty() {
+            self.sources.resize_with(self.host.len() / fc, || None);
+            if other.sources.is_empty() {
+                self.sources
+                    .resize_with((self.host.len() + other.host.len()) / fc, || None);
+            } else {
+                self.sources.extend(other.sources);
+            }
+        }
+        self.host.extend(other.host);
+    }
+
+    pub(crate) fn slice(&self, range: std::ops::Range<usize>, fc: usize) -> Self {
+        Self {
+            host: self.host[range.clone()].to_vec(),
+            sources: if self.sources.is_empty() {
+                smallvec::SmallVec::new()
+            } else {
+                self.sources[range.start / fc..range.end / fc]
+                    .iter()
+                    .cloned()
+                    .collect()
+            },
+        }
+    }
+
+    pub(crate) fn release(&mut self, frames: std::ops::Range<usize>) {
+        if let Some(sources) = self.sources.get_mut(frames) {
+            sources.fill(None);
+        }
+    }
+
+    fn split_off(&mut self, words: usize, fc: usize) -> Self {
+        Self {
+            host: self.host.split_off(words),
+            sources: if self.sources.is_empty() {
+                smallvec::SmallVec::new()
+            } else {
+                self.sources.drain(words / fc..).collect()
+            },
+        }
+    }
+}
+
 use plow_asset::packet_pipeline::PacketPipeline;
 
 use crate::{Result, RuntimeError};
@@ -113,6 +197,7 @@ pub struct SpeechContract {
     pub onset_trim: Option<OnsetTrimPolicy>,
     /// New frames a stream's first stateful codec step waits for (`stream.first_frames`).
     pub stream_first_frames: Option<usize>,
+    pub slot_prefix_reuse: bool,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -144,6 +229,13 @@ impl SpeechContract {
                 p.name, p.driver
             )));
         }
+        if p.strings
+            .contains_key(plow_asset::dual_stream::CONDITIONING_KEY)
+        {
+            return Err(RuntimeError::Rejected(
+                "speaker conditioning requires a supported versioned speech driver".into(),
+            ));
+        }
         let get = |k: &str| {
             p.parameters.get(k).copied().ok_or_else(|| {
                 RuntimeError::Rejected(format!("speech pipeline lacks parameter {k}"))
@@ -155,6 +247,15 @@ impl SpeechContract {
                 .collect()
         };
         let f32p = |k: &str| get(k).map(|v| f32::from_bits(v as u32));
+        let slot_prefix_reuse = match p.parameters.get("prompt.slot_prefix_version") {
+            None | Some(0) => false,
+            Some(1) => true,
+            Some(v) => {
+                return Err(RuntimeError::Rejected(format!(
+                    "unsupported speech slot prefix version {v}"
+                )))
+            }
+        };
         let mut c = SpeechContract {
             pipeline: p.name.clone(),
             prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| {
@@ -234,6 +335,7 @@ impl SpeechContract {
                 max_ms: p.parameters.get(ONSET_TRIM_MAX_MS).map_or(0, |&m| m as u32),
             }),
             stream_first_frames: p.parameters.get("stream.first_frames").map(|&n| n as usize),
+            slot_prefix_reuse,
         };
         if let Some(encoder) = p.strings.get(crate::exec::packet_runtime::CLONE_ENCODER) {
             let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {
@@ -275,7 +377,10 @@ impl SpeechContract {
         let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&pkt)? else {
             return Ok(None);
         };
-        let mut found = asset.pipelines().iter().filter(|p| p.driver == DRIVER);
+        let mut found = asset
+            .pipelines()
+            .iter()
+            .filter(|p| p.driver.starts_with("tts.codec_lm."));
         match (found.next(), found.next()) {
             (None, _) => Ok(None),
             (Some(p), None) => Self::from_pipeline(p).map(Some),
@@ -429,6 +534,25 @@ impl SpeechContract {
                 codes.len() % self.frame_codes == 0
             }
             None => false,
+        }
+    }
+
+    fn take_frame(
+        &self,
+        partial: &mut Vec<i32>,
+        id: u32,
+        frame: Option<crate::serve::stream::SpeechFrame>,
+    ) -> Option<Codes> {
+        if self.depth {
+            frame.filter(|f| f.len() == self.frame_codes).map(|f| {
+                Codes::frame(
+                    f.codes.into_vec().into_iter().map(|x| x as i32).collect(),
+                    f.device,
+                )
+            })
+        } else {
+            self.push_codes(partial, id, None)
+                .then(|| std::mem::take(partial).into())
         }
     }
 
@@ -1055,6 +1179,62 @@ mod tests {
     }
 
     #[test]
+    fn rejects_conditioning_on_legacy_and_unsupported_drivers() {
+        let mut p = pipeline();
+        p.strings.insert(
+            plow_asset::dual_stream::CONDITIONING_KEY.into(),
+            "{}".into(),
+        );
+        assert!(SpeechContract::from_pipeline(&p).is_err());
+        p.driver = plow_asset::dual_stream::CONDITIONED_DRIVER.into();
+        assert!(SpeechContract::from_pipeline(&p).is_err());
+    }
+
+    #[test]
+    fn loading_does_not_ignore_unsupported_speech_packets() {
+        use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
+        use plow_asset::packet_pipeline::{PacketPipelines, SECTION, VERSION};
+        let dir = std::env::temp_dir().join(format!("plow-speech-version-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: Vec::new(),
+            progs: vec![Builder::new(1).finish()],
+            kv_row_insts: Vec::new(),
+            prog_t: vec![1],
+            gen: Vec::new(),
+        };
+        for driver in [
+            DRIVER,
+            plow_asset::dual_stream::CONDITIONED_DRIVER,
+            "tts.codec_lm.v99",
+            "causal.v1",
+        ] {
+            let mut p = pipeline();
+            p.driver = driver.into();
+            p.programs.insert("decode.1".into(), 0);
+            let metadata = PacketPipelines {
+                version: VERSION,
+                pipelines: vec![p],
+            };
+            let section = SectionData {
+                kind: SECT_METADATA,
+                name: SECTION.into(),
+                data: serde_json::to_vec(&metadata).unwrap(),
+            };
+            std::fs::write(dir.join("model.pkt"), model.to_blob_v6(&[section])).unwrap();
+            let loaded = SpeechContract::load(&dir);
+            match driver {
+                DRIVER => assert!(loaded.unwrap().is_some()),
+                "causal.v1" => assert!(loaded.unwrap().is_none()),
+                _ => assert!(loaded.is_err(), "unsupported driver {driver} was ignored"),
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn binds_contract_from_pipeline_parameters() {
         let c = SpeechContract::from_pipeline(&pipeline()).unwrap();
         assert_eq!(c.prefix, [128259]);
@@ -1082,6 +1262,16 @@ mod tests {
     }
 
     #[test]
+    fn slot_prefix_capability_is_versioned_and_absent_on_old_packets() {
+        let mut p = pipeline();
+        assert!(!SpeechContract::from_pipeline(&p).unwrap().slot_prefix_reuse);
+        p.parameters.insert("prompt.slot_prefix_version".into(), 1);
+        assert!(SpeechContract::from_pipeline(&p).unwrap().slot_prefix_reuse);
+        p.parameters.insert("prompt.slot_prefix_version".into(), 2);
+        assert!(SpeechContract::from_pipeline(&p).is_err());
+    }
+
+    #[test]
     fn codes_follow_frame_position() {
         let c = SpeechContract::from_pipeline(&pipeline()).unwrap();
         assert_eq!(c.code_of(0, 128266 + 5), Some(5));
@@ -1089,6 +1279,60 @@ mod tests {
         assert_eq!(c.code_of(1, 128266 + 7), None);
         assert_eq!(c.code_of(6, 128266 + 6 * 4096 + 4095), Some(4095));
         assert_eq!(c.code_of(0, 128258), None);
+    }
+
+    #[test]
+    fn stream_frames_match_accumulated_codes_without_retaining_history() {
+        let c = SpeechContract::from_pipeline(&pipeline()).unwrap();
+        let (mut history, mut partial, mut received) = (Vec::new(), Vec::new(), Vec::new());
+        for frame in 0..64 {
+            for book in 0..c.frame_codes {
+                assert!(!c.push_codes(&mut history, c.stops[0], None));
+                assert!(c.take_frame(&mut partial, c.stops[0], None).is_none());
+                let id = c.audio_token_base
+                    + book as u32 * c.codebook
+                    + (frame + book) as u32 % c.codebook;
+                let complete = c.push_codes(&mut history, id, None);
+                let next = c.take_frame(&mut partial, id, None);
+                assert_eq!(next.is_some(), complete);
+                if let Some(codes) = next {
+                    assert_eq!(codes.len(), c.frame_codes);
+                    received.extend(codes.host);
+                }
+                assert!(partial.len() < c.frame_codes);
+            }
+            assert!(partial.is_empty());
+            assert_eq!(received, history);
+        }
+    }
+
+    #[test]
+    fn depth_stream_frames_preserve_codes_and_reject_incomplete_rows() {
+        let mut c = SpeechContract::from_pipeline(&pipeline()).unwrap();
+        c.depth = true;
+        let mut partial = Vec::new();
+        for width in [16, 32] {
+            c.frame_codes = width;
+            for n in [0, width - 1, width + 1] {
+                assert!(c
+                    .take_frame(&mut partial, 0, Some(vec![1; n].into_boxed_slice().into()))
+                    .is_none());
+            }
+            assert!(c.take_frame(&mut partial, 0, None).is_none());
+            let codes: Vec<u32> = [0, 1, 2047, i32::MAX as u32, 1 << 31, u32::MAX]
+                .into_iter()
+                .cycle()
+                .take(width)
+                .collect();
+            let mut expected = Vec::new();
+            assert!(c.push_codes(&mut expected, 0, Some(&codes)));
+            assert_eq!(
+                c.take_frame(&mut partial, 0, Some(codes.into_boxed_slice().into()))
+                    .map(|c| c.host),
+                Some(expected)
+            );
+            assert!(partial.is_empty());
+        }
     }
 
     #[test]

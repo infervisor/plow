@@ -962,6 +962,7 @@ dependencies = [
  "packet",
  "plow-asset",
  "rewrite",
+ "serde",
  "serde_json",
  "tracing",
  "tunedb",

@@ -665,6 +665,11 @@ __device__ __forceinline__ unsigned sp_pack_bf16(float2 v) {
  * fresh partial, folded in chunk order. Rows packed from several requests then give the bits
  * each request gets alone. */
 struct SpRefSplit { const unsigned* rows; unsigned ncu; };
+__device__ __forceinline__ void sp_mma_bf16_k8(float (&d)[4], unsigned a0, unsigned a1, unsigned b) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a0), "r"(a1), "r"(b));
+}
 __device__ __forceinline__ unsigned sp_ref_chunk(unsigned rows, unsigned N, unsigned K, unsigned ncu) {
     const unsigned steps = (K + 63u) / 64u, tiles = ((rows + 63u) / 64u) * ((N + 63u) / 64u);
     if (!rows || !steps || tiles > SPT_TICKETS || tiles * 2u > ncu) return steps;
@@ -674,11 +679,14 @@ __device__ __forceinline__ unsigned sp_ref_chunk(unsigned rows, unsigned N, unsi
     s = s > steps ? steps : (s ? s : 1u);
     return (steps + s - 1u) / s;
 }
+template <unsigned MMA_K = 0>
 static __device__ __forceinline__ void sp_tc_tile_async(unsigned m0, unsigned n0, unsigned M, unsigned N,
                                                         unsigned kb, unsigned ke, const SpRowF32& la,
                                                         const SpRowBf16& lb, float* arena,
                                                         float (&acc)[2][2][4], const SpLn* ln,
                                                         const SpRefSplit* rs = nullptr) {
+    static_assert(MMA_K == 0u || MMA_K == 8u || MMA_K == 16u, "BF16 accumulation width");
+    if constexpr (MMA_K != 0u) { if (ln || rs) __trap(); }
     char* smem = (char*)arena;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const unsigned wm = (warp & 1u) * 32u, wn = (warp >> 1) * 16u, g = lane >> 2, t = lane & 3u;
@@ -749,7 +757,7 @@ static __device__ __forceinline__ void sp_tc_tile_async(unsigned m0, unsigned n0
 #pragma unroll
             for (int j = 0; j < 2; j++)
 #pragma unroll
-                for (int r = 0; r < 4; r++) part[i][j][r] = 0.f;
+                for (int r = 0; r < 4; r++) if constexpr (MMA_K == 0u) part[i][j][r] = 0.f;
 #pragma unroll
         for (unsigned ks = 0; ks < 64u; ks += 16) {
             unsigned a[2][4], b[4];
@@ -764,8 +772,18 @@ static __device__ __forceinline__ void sp_tc_tile_async(unsigned m0, unsigned n0
             sp_ldsm4(b, bs + (wn + (lane & 7u) + ((lane >> 4) << 3)) * SPA_LDB + ks + ((lane >> 3) & 1u) * 8u);
 #pragma unroll
             for (int i = 0; i < 2; i++) {
-                sp_mma_bf16(part[i][0], a[i], b[0], b[1]);
-                sp_mma_bf16(part[i][1], a[i], b[2], b[3]);
+                if constexpr (MMA_K == 8u) {
+                    sp_mma_bf16_k8(acc[i][0], a[i][0], a[i][1], b[0]);
+                    sp_mma_bf16_k8(acc[i][0], a[i][2], a[i][3], b[1]);
+                    sp_mma_bf16_k8(acc[i][1], a[i][0], a[i][1], b[2]);
+                    sp_mma_bf16_k8(acc[i][1], a[i][2], a[i][3], b[3]);
+                } else if constexpr (MMA_K == 16u) {
+                    sp_mma_bf16(acc[i][0], a[i], b[0], b[1]);
+                    sp_mma_bf16(acc[i][1], a[i], b[2], b[3]);
+                } else {
+                    sp_mma_bf16(part[i][0], a[i], b[0], b[1]);
+                    sp_mma_bf16(part[i][1], a[i], b[2], b[3]);
+                }
             }
         }
 #pragma unroll
@@ -773,7 +791,7 @@ static __device__ __forceinline__ void sp_tc_tile_async(unsigned m0, unsigned n0
 #pragma unroll
             for (int j = 0; j < 2; j++)
 #pragma unroll
-                for (int r = 0; r < 4; r++) acc[i][j][r] = __fadd_rn(acc[i][j][r], part[i][j][r]);
+                for (int r = 0; r < 4; r++) if constexpr (MMA_K == 0u) acc[i][j][r] = __fadd_rn(acc[i][j][r], part[i][j][r]);
         if (rs) {
 #pragma unroll
             for (int i = 0; i < 2; i++)
@@ -1113,7 +1131,7 @@ __device__ __forceinline__ unsigned sp_tc_splits(unsigned tiles, unsigned ksteps
 
 /* scratch: SPT_TICKETS u32 tickets (zero at load; the reducer re-arms its own) then
  * nblk * SPT_BM * SPT_BN float partials. */
-template <bool TF32, bool ASYNC = false, class LA, class LB, class EP>
+template <bool TF32, bool ASYNC = false, unsigned MMA_K = 0, class LA, class LB, class EP>
 static __device__ __forceinline__ void sp_tc_gemm(unsigned M, unsigned N, unsigned K, const LA& la, const LB& lb,
                                                const EP& ep, unsigned slice, unsigned nblk, float* arena,
                                                float* scratch, const SpLn* ln = nullptr,
@@ -1128,7 +1146,7 @@ static __device__ __forceinline__ void sp_tc_gemm(unsigned M, unsigned N, unsign
         const unsigned m0 = (tile / tn) * SPT_BM, n0 = (tile % tn) * SPT_BN;
         const unsigned kb = s * chunk * C::BK, ke = min(K, kb + chunk * C::BK);
         float acc[2][2][4];
-        if constexpr (ASYNC) sp_tc_tile_async(m0, n0, M, N, kb, ke, la, lb, arena, acc, ln, rs);
+        if constexpr (ASYNC) sp_tc_tile_async<MMA_K>(m0, n0, M, N, kb, ke, la, lb, arena, acc, ln, rs);
         else if (sp_async(la) && sp_async(lb)) sp_tcx_tile<TF32>(m0, n0, M, N, kb, ke, la, lb, arena, acc);
         else sp_tc_tile<TF32>(m0, n0, M, N, kb, ke, la, lb, arena, acc);
         if (S == 1u) {
@@ -1805,6 +1823,27 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
         if (ln) sp_dense_run(m, n, k, SpRowLnF32{x, k, la.vec, *ln}, lb, ep, flags, slice, nblk, arena, scratch);
         else sp_dense_run(m, n, k, la, lb, ep, flags, slice, nblk, arena, scratch);
     }
+}
+
+template <unsigned MMA_K>
+static __device__ __noinline__ void d_dense_gemm_f32_cont(float* __restrict__ out, const float* __restrict__ x,
+                                        const void* __restrict__ w, const float* __restrict__ bias,
+                                        unsigned m, unsigned n, unsigned k, unsigned activation,
+                                        unsigned a_row0, unsigned wstride_op, unsigned onehot,
+                                        unsigned flags, unsigned slice, unsigned nblk, float* arena,
+                                        float* scratch, const float* post) {
+    const unsigned stride = wstride_op ? wstride_op : k;
+    if ((flags & 12u) != 12u || (flags & (32u | 64u | 128u)) || !(flags & 0x800u)) __trap();
+    if ((k & 7u) || (stride & 7u) || !sp_aligned(x, 16) || !sp_aligned(w, 16)) __trap();
+    x += (size_t)a_row0 * k;
+    const SpRowF32 la{x, k, true};
+    const SpRowBf16 lb{(const __nv_bfloat16*)w, k, stride, true};
+    SpDenseEpi ep{out, bias, w, n, stride, wstride_op ? onehot : 0xFFFFFFFFu, flags, activation == 1u};
+    if (flags & 0x700u) {
+        if (!post) __trap();
+        ep.lo0 = post[0]; ep.hi0 = post[1]; ep.lo1 = post[2]; ep.hi1 = post[3];
+    }
+    sp_tc_gemm<false, true, MMA_K>(m, n, k, la, lb, ep, slice, nblk, sp_smem, scratch);
 }
 
 /* GemmF32 (180): bf16 x bf16 -> f32. */
@@ -4474,9 +4513,9 @@ static __device__ __forceinline__ void sp_w_conv_store(unsigned m0, unsigned n0,
 }
 
 /* The wide tile's operands as a few scalars (the generic SpRowConv1/SpRowConvW state, re-read per
- * copy, made the k-loop issue-bound): A is the zero-padded implicit im2col (pointwise: one row),
+ * copy, made the k-loop issue-bound): A is the padded implicit im2col (pointwise: one row),
  * with a leaky-ReLU input activation or none; B the tap-major weight rows. */
-template <bool PW, bool LEAKY>
+template <bool PW, bool LEAKY, bool PADDED>
 struct SpWConvA {
     static constexpr bool PRE = LEAKY;
     struct Row { const float* xb; int u0, len; };
@@ -4488,14 +4527,18 @@ struct SpWConvA {
         if (a->lengths && t >= a->conv_len(b)) return Row{nullptr, 0, 0};
         const int u0 = (int)(t * a->stride) - (int)a->before, len = (int)a->length(b);
         const float* xb = x + (size_t)b * a->in_rows * cin;
-        if (PW) return (unsigned)u0 < (unsigned)len ? Row{xb + (size_t)u0 * cin, 0, 0} : Row{nullptr, 0, 0};
+        if (PW) {
+            const int u = PADDED ? sp_pad_row(u0, len, a->mode) : u0;
+            return (unsigned)u < (unsigned)len ? Row{xb + (size_t)u * cin, 0, 0} : Row{nullptr, 0, 0};
+        }
         return Row{xb, u0, len};
     }
     __device__ const float* seg(const Row& r, unsigned c) const {
         if (!r.xb) return nullptr;
         if (PW) return r.xb + c;
         const unsigned tap = (__umulhi(c, cg_mul) + c) >> cg_shift, ci = c - tap * cin;
-        const int u = r.u0 + (int)(tap * dil);
+        const int raw = r.u0 + (int)(tap * dil);
+        const int u = PADDED ? sp_pad_row(raw, r.len, a->mode) : raw;
         return (unsigned)u < (unsigned)r.len ? r.xb + (size_t)u * cin + ci : nullptr;
     }
     __device__ float4 pre(float4 v, unsigned) const {
@@ -4509,10 +4552,10 @@ struct SpWRowsB {
     __device__ const float* row(unsigned n, unsigned N) const { return n < N ? w + (size_t)n * K : nullptr; }
     __device__ const float* seg(const float* r, unsigned c) const { return r ? r + c : nullptr; }
 };
-template <unsigned BN, bool PW, bool LEAKY>
+template <unsigned BN, bool PW, bool LEAKY, bool PADDED>
 static __device__ __forceinline__ void sp_conv1d_wide_run(const SpConvArgs& a, unsigned slice, unsigned nblk) {
     const unsigned M = a.batch * a.out_rows, K = a.kernel * a.cg;
-    const SpWConvA<PW, LEAKY> la{&a, a.x, a.cin, a.dil, a.cg_mul, a.cg_shift, a.slope};
+    const SpWConvA<PW, LEAKY, PADDED> la{&a, a.x, a.cin, a.dil, a.cg_mul, a.cg_shift, a.slope};
     const SpWRowsB lb{(const float*)a.w, K};
     const bool v4 = a.cout % 2u == 0 && sp_aligned(a.out, 8) && (!a.residual || sp_aligned(a.residual, 8)) &&
                     (!a.bias || sp_aligned(a.bias, 8));
@@ -4601,7 +4644,7 @@ __device__ __forceinline__ const float* spwg_wsplit(const SpConvArgs& a) {
  * ep.n_p rows per item, column n = (phase, o), k = (tap, ci) reading input row q - tap; output
  * row t = q*stride + phase - before, stores skipped outside [0, out_rows), zero past convt_len.
  * BN divides cout, so a tile is one phase. */
-template <unsigned BN, bool TAPS, unsigned P, bool GR = false, bool CT = false, bool SK = false>
+template <unsigned BN, bool TAPS, unsigned P, bool GR = false, bool CT = false, bool SK = false, bool CHANNEL_TILED = false>
 static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsigned K, const float* x, const float* w,
                                                   const SpConvEpi1& ep, unsigned slice, unsigned nblk,
                                                   float* splitk = nullptr) {
@@ -4633,6 +4676,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
      * the scratch, the last to take the tile's ticket folds them in part order (deterministic)
      * and runs the epilogue. */
     static_assert(!SK || (BN == 64u && !GR && !CT), "split-K tile");
+    static_assert(!CHANNEL_TILED || (TAPS && !GR && !CT && !SK), "channel-tiled conv");
     unsigned chunk = nk;
     const unsigned S = SK ? sp_tc_splits(tiles, nk, nblk, true, chunk) : 1u;
     unsigned* last_s = (unsigned*)(sm + BIAS_OFF + BN * 4u);
@@ -4676,7 +4720,8 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             const unsigned k = kt * SPWG_BK;
             const bool kin = k + sc < K;
             if constexpr (TAPS) {
-                const unsigned tap = k / a.cin, ci = k - tap * a.cin;
+                const unsigned tap = CHANNEL_TILED ? kt % a.kernel : k / a.cin,
+                               ci = CHANNEL_TILED ? kt / a.kernel * 64u : k - tap * a.cin;
 #pragma unroll
                 for (unsigned p = 0; p < 8; p++) {
                     const int u = CT ? t0[p] - (int)tap : t0[p] + (int)(tap * a.dil);
@@ -4879,9 +4924,9 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
 __device__ __forceinline__ bool spg_post_ok(unsigned post) {
     return sp_post_on(post) && (post == 0u || post == 1u || post == 7u || post == 8u || post == 9u || post == 10u || post == 11u || post == 12u);
 }
-__device__ __forceinline__ bool spg_eligible(const SpConvArgs& a) {
+__device__ __forceinline__ bool spg_eligible(const SpConvArgs& a, bool channel_tiled = false) {
     const bool pw = a.kernel == 1u && a.stride == 1u && a.before == 0u && a.in_rows == a.out_rows && a.cg % 4u == 0 && a.pre == 0u;
-    const bool taps = a.kernel > 1u && a.tapmajor && a.stride == 1u && a.mode == 0u && a.groups == 1u && a.cin % 64u == 0 &&
+    const bool taps = a.kernel > 1u && (a.tapmajor || channel_tiled) && a.stride == 1u && a.mode == 0u && a.groups == 1u && a.cin % 64u == 0 &&
                       (a.pre == 0u || (a.pre == 9u && !a.alpha));
     return (pw || taps) && spg_post_ok(a.post) && a.cout % 4u == 0 && sp_aligned(a.out, 16) &&
            (!a.residual || sp_aligned(a.residual, 8)) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) &&
@@ -4903,6 +4948,7 @@ __device__ __forceinline__ void sp_wg_run_ct(const SpConvArgs& a, unsigned slice
     if (a.cout % 128u == 0 && 20u * r128 <= 13u * r64) sp_wg_gemm<128, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
     else sp_wg_gemm<64, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
 }
+template <bool CHANNEL_TILED = false>
 __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, unsigned nblk) {
     const unsigned M = a.batch * a.out_rows;
     const SpConvEpi1 ep{a, 0u, a.out_rows, 0u, 0u, false, true};
@@ -4913,11 +4959,13 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
     const unsigned K = a.kernel * a.cg;
     const float* w = a.groups > 1u ? (const float*)a.w : spwg_wsplit(a);
     /* Split-K: post 0 only (devgen's conv1d_splitk mirrors it). */
-    float* sk = a.groups > 1u || a.post != 0u ? nullptr : a.splitk;
+    float* sk = CHANNEL_TILED || a.groups > 1u || a.post != 0u ? nullptr : a.splitk;
     const bool wide = !sk && 20u * r128 <= 13u * r64;
     /* The combinations the speech lowerings use: pointwise with none / GELU / other, taps with
      * none / snake / other, grouped pointwise with none. */
-    if (sp_post_on(0u) && a.groups > 1u) {
+    if constexpr (CHANNEL_TILED) {
+        sp_wg_gemm<64, true, 0, false, false, false, true>(M, a.cout, K, a.x, w, ep, slice, nblk);
+    } else if (sp_post_on(0u) && a.groups > 1u) {
         sp_wg_gemm<128, false, 0, true>(M, a.ng, K, a.x, w, ep, slice, nblk);
     } else if (a.kernel == 1u) {
         if (sp_post_on(0u) && sk) sp_wg_gemm<64, false, 0, false, false, true>(M, a.ng, K, a.x, w, ep, slice, nblk, sk);
@@ -4933,11 +4981,11 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
 }
 #endif
 /* flags bit 14: the split-bf16 wide tile's width when it applies and fills the machine, else 0.
- * It covers groups == 1, zero padding, f32 16-byte-aligned operands with cin % 4 == 0, tap-major
+ * It covers groups == 1, f32 16-byte-aligned operands with cin % 4 == 0, tap-major
  * weights when kernel > 1, and no input activation but leaky ReLU. */
 __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const SpConvArgs& a, unsigned nblk) {
     if (!((in->fj[2].u >> 14) & 1u) || a.groups != 1u || a.cin % 4u || !sp_aligned(a.x, 16) || a.wf16 ||
-        a.mode != 0u || !(a.pre == 0u || (a.pre == 9u && !a.alpha)) || !(a.kernel == 1u || a.tapmajor) ||
+        !(a.pre == 0u || (a.pre == 9u && !a.alpha)) || !(a.kernel == 1u || a.tapmajor) ||
         !sp_aligned(a.w, 16))
         return 0u;
     return sp_w_width(a.batch * a.out_rows, a.cout, nblk);
@@ -4957,7 +5005,15 @@ __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const*
         ((in->fj[2].u >> 16) & 1u))
         return false;
     SpConvArgs a;
-    if (!sp_conv_args(in, T, false, a) || !spg_eligible(a)) return false;
+    if (!sp_conv_args(in, T, false, a)) return false;
+    if (!a.tapmajor && a.kernel > 1u) {
+        if (!spg_eligible(a, true) || a.pre != 0u || a.post != 0u || a.wf16 ||
+            ((in->fj[2].u >> 14) & 1u) == 0u || ((in->fj[2].u >> 18) & 1u) == 0u ||
+            ((in->fj[2].u >> 20) & 1u) != 0u) return false;
+        sp_wg_run<true>(a, slice, nblk);
+        return true;
+    }
+    if (!spg_eligible(a)) return false;
     /* Grouped pointwise convs (group widths % 4 == 0) run per group; the rest as the wide tile. */
     const bool grouped = a.groups > 1u && a.kernel == 1u && a.post == 0u && a.ng % 4u == 0 && a.cin % 4u == 0 &&
                          !a.wf16 && ((in->fj[2].u >> 14) & 1u);
@@ -4967,20 +5023,22 @@ __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const*
 }
 #endif
 /* Out of line so d_conv1d_f32's 64x64 paths do not share its register allocation. Callers
- * guarantee groups == 1, zero padding, f32 16-byte-aligned operands
+ * guarantee groups == 1, f32 16-byte-aligned operands
  * with cin % 4 == 0, tap-major weights when kernel > 1, and no input activation but leaky ReLU. */
+template <bool PADDED>
 static __device__ __forceinline__ void sp_conv1d_wide_body(const SpConvArgs& a, unsigned bn, unsigned slice, unsigned nblk) {
     const bool pw = a.kernel == 1u, leaky = a.pre == 9u;
     if (bn == 128u) {
-        if (pw) leaky ? sp_conv1d_wide_run<128, true, true>(a, slice, nblk) : sp_conv1d_wide_run<128, true, false>(a, slice, nblk);
-        else leaky ? sp_conv1d_wide_run<128, false, true>(a, slice, nblk) : sp_conv1d_wide_run<128, false, false>(a, slice, nblk);
+        if (pw) leaky ? sp_conv1d_wide_run<128, true, true, PADDED>(a, slice, nblk) : sp_conv1d_wide_run<128, true, false, PADDED>(a, slice, nblk);
+        else leaky ? sp_conv1d_wide_run<128, false, true, PADDED>(a, slice, nblk) : sp_conv1d_wide_run<128, false, false, PADDED>(a, slice, nblk);
     } else {
-        if (pw) leaky ? sp_conv1d_wide_run<64, true, true>(a, slice, nblk) : sp_conv1d_wide_run<64, true, false>(a, slice, nblk);
-        else leaky ? sp_conv1d_wide_run<64, false, true>(a, slice, nblk) : sp_conv1d_wide_run<64, false, false>(a, slice, nblk);
+        if (pw) leaky ? sp_conv1d_wide_run<64, true, true, PADDED>(a, slice, nblk) : sp_conv1d_wide_run<64, true, false, PADDED>(a, slice, nblk);
+        else leaky ? sp_conv1d_wide_run<64, false, true, PADDED>(a, slice, nblk) : sp_conv1d_wide_run<64, false, false, PADDED>(a, slice, nblk);
     }
 }
 static __device__ __noinline__ void d_conv1d_wide(const SpConvArgs& a, unsigned bn, unsigned slice, unsigned nblk) {
-    sp_conv1d_wide_body(a, bn, slice, nblk);
+    if (a.mode) sp_conv1d_wide_body<true>(a, bn, slice, nblk);
+    else sp_conv1d_wide_body<false>(a, bn, slice, nblk);
 }
 
 /* Conv1d flag bit 16 (row-starved or few-channel convs): one warp per output element, its
@@ -6623,6 +6681,20 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         d_silu_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), in->i[0], slice, nblk);
         break;
     SP_CASE(DENSE_GEMM_F32)
+        if (in->i[7] & 0x1800u) {
+            if ((in->i[7] & 12u) != 12u || (in->i[7] & (32u | 64u | 128u)) || !(in->i[7] & 0x800u)) __trap();
+            const unsigned k = in->i[2], stride = in->i[5] ? in->i[5] : k;
+            const bool aligned = !(k & 7u) && !(stride & 7u) && sp_aligned(SP_TEN(1), 16) && sp_aligned(SP_TEN(2), 16);
+            if (aligned && (in->i[7] & 0x1000u))
+                d_dense_gemm_f32_cont<8>((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3),
+                    in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice, nblk,
+                    arena, (float*)SP_TEN(4), (in->i[7] & 0x700u) ? (const float*)SP_TEN(5) : nullptr);
+            else if (aligned)
+                d_dense_gemm_f32_cont<16>((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3),
+                    in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice, nblk,
+                    arena, (float*)SP_TEN(4), (in->i[7] & 0x700u) ? (const float*)SP_TEN(5) : nullptr);
+            if (aligned) break;
+        }
         if (in->i[7] & 32u) {
             const SpLn ln{(const float*)SP_TEN(5), (const float*)SP_TEN(6), (const float*)SP_TEN(7), in->i[4],
                           (in->i[7] & 64u) != 0u};

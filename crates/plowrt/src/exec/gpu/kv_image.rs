@@ -16,12 +16,13 @@ impl GpuEngine {
         match image.transfer(&*self.be, spans, &self.devp, export) {
             Ok(staged) => Ok(staged),
             Err(failure) if failure.unretired => {
-                image.quarantine(
-                    &mut self.devp,
+                self.quarantine_depth_source();
+                let mut empty = crate::memory::vmm::WeightSlab::PerTensor;
+                std::mem::forget(std::mem::replace(
                     &mut self._weight_slab,
-                    &mut self.vmm,
-                    self.be.clone(),
-                );
+                    std::sync::Arc::new(crate::memory::vmm::WeightSlab::PerTensor),
+                ));
+                image.quarantine(&mut self.devp, &mut empty, &mut self.vmm, self.be.clone());
                 self.kv_image_key = None;
                 Err(self.be.quarantine_staging(&failure.error))
             }

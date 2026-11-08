@@ -414,9 +414,8 @@ done
 rm -f "$TICKET"
 W=$(( $(date +%s) - S ))
 
-# Pin the child to exactly the cards we hold. A partial lease that still saw
-# every device would make the lease meaningless.
-if [ "$NGOT" -lt "$NGPU" ] || [ "$MIXED" = 1 ]; then
+# Full-pool leases must also replace masks inherited from CPU-only submitters.
+if [ "$VENDOR" = nvidia ] || [ "$VENDOR" = amd ]; then
   VIS=$(echo "$GOT" | tr ' ' ',')
   if [ "$VENDOR" = amd ]; then
     # ROCr renumbers its filtered agents. Applying the original physical ids a

@@ -500,13 +500,42 @@ impl Seq {
         w: &str,
         b: Option<&str>,
     ) -> Result<u32, String> {
+        self.dense_with_math(
+            splits,
+            x,
+            out,
+            rows,
+            k,
+            n,
+            w,
+            b,
+            crate::pipeline::Conv1dMath::Tf32x3,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dense_with_math(
+        &mut self,
+        splits: Splits<'_>,
+        x: u32,
+        out: &str,
+        rows: u32,
+        k: u32,
+        n: u32,
+        w: &str,
+        b: Option<&str>,
+        math: crate::pipeline::Conv1dMath,
+    ) -> Result<u32, String> {
+        if math == crate::pipeline::Conv1dMath::F32 && splits.is_some() {
+            return Err("FP32 dense math requires unsplit FP32 weights".into());
+        }
         let split = splits.is_some_and(|s| {
             s.borrow_mut()
                 .insert(w.trim_start_matches("w.").to_string(), (n, k, 1));
             true
         });
         let dep = self.last;
-        let e = self.p().conv1d_f32(
+        let e = self.p().conv1d_f32_math(
             x,
             false,
             &[dep],
@@ -538,6 +567,7 @@ impl Seq {
                 weight_split: split,
                 dual_alpha: false,
             },
+            math,
         )?;
         Ok(self.done(e))
     }
@@ -905,7 +935,15 @@ fn program_for(
             qkv,
             |d| {
                 d.t[..2].copy_from_slice(&[qkv, pos]);
-                d.i[..7].copy_from_slice(&[n, 2 * heads, hd, 3 * aw, 1, 0, 2]);
+                d.i[..7].copy_from_slice(&[
+                    n,
+                    2 * heads,
+                    hd,
+                    3 * aw,
+                    1,
+                    0,
+                    if cfg.breeze { 0 } else { 2 },
+                ]);
                 d.f[0] = cfg.theta;
             },
         )?;
@@ -1509,7 +1547,7 @@ fn mimi_program_for(
             qkv,
             |d| {
                 d.t[..2].copy_from_slice(&[qkv, pos]);
-                d.i[..7].copy_from_slice(&[nt, 2 * heads, hd, 3 * aw, 1, 0, 2]);
+                d.i[..7].copy_from_slice(&[nt, 2 * heads, hd, 3 * aw, 1, 0, 0]);
                 d.f[0] = cfg.theta;
             },
         )?;
@@ -1897,6 +1935,24 @@ mod tests {
             "decoder": {"channels": 1024, "blocks": blocks, "residual_kernel": 3, "out_kernel": 3}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn decoder_rotary_precision_matches_source_contract() {
+        for (cfg, flags) in [(fish(), 2), (breeze(), 0), (mimi(), 0)] {
+            let low = lower_programs(&cfg, 58, 0, None, &[(1, 8)], &[(1, 1)]).unwrap();
+            for program in &low.prefix.model.progs {
+                let rotary: Vec<_> = program
+                    .insts
+                    .iter()
+                    .filter(|d| d.op == DevOp::RopeAxialF32 as u16)
+                    .collect();
+                assert_eq!(rotary.len(), cfg.layers as usize);
+                for inst in rotary {
+                    assert_eq!(inst.i[6], flags);
+                }
+            }
+        }
     }
 
     #[test]

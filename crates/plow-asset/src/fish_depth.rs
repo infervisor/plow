@@ -12,6 +12,19 @@ pub const SECTION: &str = "fish_depth.json";
 pub const PROGRAMS_SECTION: &str = "fish_depth.programs";
 pub const VERSION: u32 = 1;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackedDepth {
+    pub version: u32,
+    pub input_vocab: u32,
+    pub backbone_logits: bool,
+    /// The backbone's normalized hidden rows consumed by the depth programs.
+    pub hidden: u16,
+    /// A frame token used only for decode embeddings that drop the text-token row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_token: Option<u32>,
+}
+
 /// Per-row tensors the runtime stages (handles into the packet's tensor table).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +96,8 @@ pub struct Manifest {
     /// request binds (the null memory's, or its speaker's).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slot_memory: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packed: Option<PackedDepth>,
     pub tensors: Tensors,
 }
 
@@ -118,6 +133,86 @@ impl Manifest {
         if self.codebooks == 0 || self.stop_class != self.semantic_tokens {
             return Err("fish_depth.json: codebooks > 0 and stop class = semantic_tokens".into());
         }
+        if let Some(p) = &self.packed {
+            if p.version != 1
+                || p.input_vocab == 0
+                || usize::from(p.hidden) >= tensor_count
+                || p.decode_token.is_some_and(|token| {
+                    token >= p.input_vocab
+                        || token < self.semantic_base
+                        || token - self.semantic_base >= self.semantic_tokens
+                })
+            {
+                return Err("fish_depth.json: invalid packed depth contract".into());
+            }
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        serde_json::from_str(
+            r#"{
+            "version":1,"rows":[1,8],"codebooks":8,"semantic_base":100,
+            "semantic_tokens":10,"stop_class":10,"ras_window":0,
+            "tensors":{"params":0,"top_k":1,"seed":2,"step":3,"history":4,
+            "hidden_row":5,"frame_codes":6,"prompt_codes":7}
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn packed_depth_contract_is_optional_and_rejects_unknown_or_invalid_mappings() {
+        let mut m = manifest();
+        assert_eq!(m.packed, None);
+        assert!(m.validate(2, 10).is_ok());
+        m.packed = Some(PackedDepth {
+            version: 1,
+            input_vocab: 120,
+            backbone_logits: true,
+            hidden: 8,
+            decode_token: Some(100),
+        });
+        assert!(m.validate(2, 10).is_ok());
+        let encoded = serde_json::to_vec(&m).unwrap();
+        assert_eq!(serde_json::from_slice::<Manifest>(&encoded).unwrap(), m);
+        for p in [
+            PackedDepth {
+                version: 2,
+                input_vocab: 120,
+                backbone_logits: true,
+                hidden: 8,
+                decode_token: None,
+            },
+            PackedDepth {
+                version: 1,
+                input_vocab: 120,
+                backbone_logits: true,
+                hidden: 10,
+                decode_token: None,
+            },
+            PackedDepth {
+                version: 1,
+                input_vocab: 120,
+                backbone_logits: true,
+                hidden: 8,
+                decode_token: Some(99),
+            },
+            PackedDepth {
+                version: 1,
+                input_vocab: 120,
+                backbone_logits: true,
+                hidden: 8,
+                decode_token: Some(110),
+            },
+        ] {
+            m.packed = Some(p);
+            assert!(m.validate(2, 10).is_err());
+        }
     }
 }

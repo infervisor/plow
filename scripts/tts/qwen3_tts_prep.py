@@ -36,6 +36,39 @@ from safetensors.torch import load_file, save_file
 CODES, EOS, CB_ROWS = 2048, 2150, 3073
 
 
+def prompt_contract(cfg):
+    tc = cfg["talker_config"]
+    kind = cfg.get("tts_model_type")
+    voices = tc.get("spk_id") or {}
+    dialects = tc.get("spk_is_dialect") or {}
+    conditioning = None
+    if kind == "base":
+        from ecapa_export import qwen_config
+        qwen_config(cfg)
+        if voices:
+            raise ValueError("Base conditioning cannot declare preset voices")
+        conditioning = dict(version=1, speaker_packet="speaker_encoder.pkt",
+                            reference_packet="ref_encoder.pkt")
+    elif kind != "custom_voice" or not voices:
+        raise ValueError("expected Base or CustomVoice with explicit preset voices")
+    if set(dialects) != set(voices):
+        raise ValueError("speaker dialects must match preset voices")
+    ids = lambda *k: [tc[f"codec_{x}_id"] for x in k]
+    prompt = dict(
+        text_template="<|im_start|>assistant\n{input}<|im_end|>\n<|im_start|>assistant\n",
+        instructions_template=("<|im_start|>user\n{instructions}<|im_end|>\n"
+                               if kind == "custom_voice" else None),
+        lead=3, drop=5, text_pad=cfg["tts_pad_token_id"], text_bos=cfg["tts_bos_token_id"],
+        text_eos=cfg["tts_eos_token_id"], none_code=CB_ROWS - 1,
+        frame_codes=tc["num_code_groups"], codec_language=ids("think", "think_bos", "think_eos"),
+        language_at=2, codec_auto=ids("nothink", "think_bos", "think_eos"),
+        codec_pad=tc["codec_pad_id"], codec_bos=tc["codec_bos_id"],
+        languages=tc["codec_language_id"],
+        voices={k: dict(code=v, dialect=dialects[k] or None) for k, v in voices.items()},
+        dialect_languages=["chinese", "auto"])
+    return prompt, conditioning
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -46,6 +79,7 @@ def main():
         os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
     src = os.path.join(hub, "models--" + a.repo.replace("/", "--"), "snapshots", a.revision)
     cfg = json.load(open(f"{src}/config.json"))
+    prompt, conditioning = prompt_contract(cfg)
     tc = cfg["talker_config"]
     cc = tc["code_predictor_config"]
     sd = load_file(f"{src}/model.safetensors")
@@ -107,6 +141,8 @@ def main():
                        rope_scaling=None, positions=groups, qk_norm=True, proj_bias=True,
                        min_frames=2, bf16_logits=True)),
     )
+    if conditioning is not None:
+        qwen["plow_frame_embed"].update(overlay_rows=1, conditioning=conditioning)
     json.dump(qwen, open(f"{a.out}/config.json", "w"), indent=1)
     json.dump({"eos_token_id": [CODES]}, open(f"{a.out}/generation_config.json", "w"))
     # The reference tokenizer (Qwen2 BPE, vocab.json + merges.txt) as tokenizer.json for plowrt.
@@ -116,18 +152,7 @@ def main():
     tok.save_pretrained(a.out)
     for f in ("vocab.json", "merges.txt"):
         shutil.copy(f"{src}/{f}", f"{a.out}/{f}")
-    # The dual-stream prompt contract (plow_asset::dual_stream; devgen embeds it in the packet).
-    ids = lambda *k: [tc[f"codec_{x}_id"] for x in k]
-    json.dump(dict(
-        text_template="<|im_start|>assistant\n{input}<|im_end|>\n<|im_start|>assistant\n",
-        instructions_template="<|im_start|>user\n{instructions}<|im_end|>\n",
-        lead=3, drop=5, text_pad=cfg["tts_pad_token_id"], text_bos=cfg["tts_bos_token_id"],
-        text_eos=cfg["tts_eos_token_id"], none_code=CB_ROWS - 1, frame_codes=groups,
-        codec_language=ids("think", "think_bos", "think_eos"), language_at=2,
-        codec_auto=ids("nothink", "think_bos", "think_eos"), codec_pad=tc["codec_pad_id"],
-        codec_bos=tc["codec_bos_id"], languages=tc["codec_language_id"],
-        voices={k: dict(code=v, dialect=tc["spk_is_dialect"][k] or None) for k, v in tc["spk_id"].items()},
-        dialect_languages=["chinese", "auto"]), open(f"{a.out}/dual_stream.json", "w"), indent=1)
+    json.dump(prompt, open(f"{a.out}/dual_stream.json", "w"), indent=1)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,31 @@ the turn detector's threshold, the release offset stays the packet's.
 Why the host: a step is ~70 us of FP32 work on one core, every 32 ms per stream; a device launch
 per stream-frame would cost more than the step. `executor` keeps the choice in the packet.
 
+## Shared log-mel frontend
+
+`PacketLogMelFrontend` reads F32 `audio.frontend.filterbank` with shape
+`[audio.frontend.bins, audio.frontend.fft / 2 + 1]`. Geometry, preemphasis,
+normalization, masking and log compression come from `audio.frontend.*`; sample rate and
+accepted PCM lengths come from `audio.sample_rate`, `audio.min_samples`, `audio.max_samples`.
+Output is F32 `[frames, bins]`. This frontend can also bind to a speaker pipeline.
+
+`audio.frontend.kind = 1` retains centered framing, generated Hann windows, power spectra
+and the existing optional shaping defaults. Kind 2 requires these explicit additions:
+
+| kind | name | meaning |
+|---|---|---|
+| tensor | `audio.frontend.window_values` | finite F32 window, length `audio.frontend.window` |
+| param | `audio.frontend.pad_samples` | symmetric padding, at most the FFT size |
+| param | `audio.frontend.magnitude_guard_f32` | finite nonnegative F32 bits; spectrum is `sqrt(re² + im² + guard)` |
+| params | `audio.frontend.pad_reflect`, `audio.frontend.drop_last_frame`, `audio.frontend.log10`, `audio.frontend.log_floor` | required booleans, each 0 or 1 |
+| params | `audio.frontend.dynamic_range_f32`, `audio.frontend.scale_f32`, `audio.frontend.shift_f32` | required finite F32 bits; zero range disables clipping; affine output is `(log_mel + shift) * scale` |
+
+Kind 2 uses complete FFT windows: `floor((samples + 2 * pad_samples - fft) / hop) + 1`,
+then optionally removes the last frame. Reflect padding requires more input samples than
+padding. Missing windows/parameters, invalid values and unsupported kinds fail binding;
+older runtimes that support only kind 1 reject kind 2. Kind 1 packets keep their original
+framing and arithmetic.
+
 ## RNNT / TDT: `rnnt.greedy.v1`
 
 Greedy transducer over packet programs (`asr::rnnt`). Parameters existing before contract 1:

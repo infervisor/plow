@@ -479,5 +479,39 @@ class ScaledTensorTests(unittest.TestCase):
                 self.assertIn(k, str(e.exception))
 
 
+class PreparedHeadTests(unittest.TestCase):
+    def test_restricted_head_keeps_the_full_input_vocabulary(self):
+        try:
+            import torch
+            from safetensors.torch import save_file
+            from transformers import Qwen3Config, Qwen3ForCausalLM
+        except ImportError:
+            self.skipTest("torch + safetensors + transformers required")
+        cfg = Qwen3Config(vocab_size=19, hidden_size=16, intermediate_size=24,
+                          num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+                          head_dim=4, max_position_embeddings=32, tie_word_embeddings=False,
+                          plow_head_rows=3)
+        cfg._attn_implementation = "sdpa"
+        model = Qwen3ForCausalLM(cfg)
+        model.lm_head = torch.nn.Linear(16, 3, bias=False)
+        model.eval()
+        state = {name: value.detach().to(torch.bfloat16).contiguous()
+                 for name, value in model.state_dict().items()}
+        model.load_state_dict(state)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.save_pretrained(tmp)
+            save_file(state, str(Path(tmp) / "model.safetensors"))
+            loaded, _ = g.load_fp32(tmp, device="cpu")
+            self.assertEqual(tuple(loaded.model.embed_tokens.weight.shape), (19, 16))
+            self.assertEqual(tuple(loaded.lm_head.weight.shape), (3, 16))
+            self.assertEqual(loaded.lm_head.weight.dtype, torch.float32)
+            tokens = torch.tensor([[1, 17, 18], [18, 5, 16]])
+            with torch.inference_mode():
+                expected = model(input_ids=tokens, use_cache=False).logits
+                actual = loaded(input_ids=tokens, use_cache=False).logits
+            self.assertEqual(tuple(actual.shape), (2, 3, 3))
+            torch.testing.assert_close(actual, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

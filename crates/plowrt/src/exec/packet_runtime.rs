@@ -13,6 +13,264 @@ pub struct PacketTensor {
     pub bytes: usize,
 }
 
+enum BufferStorage {
+    Host(Vec<u8>),
+    #[cfg(feature = "cuda")]
+    Cuda {
+        memory: std::sync::Arc<crate::device::DeviceMem>,
+        backend: std::sync::Arc<crate::device::cuda::CudaBackend>,
+        _resident: std::sync::Arc<()>,
+    },
+}
+
+/// Immutable bytes whose producing work has completed, independent of the source runtime.
+#[derive(Clone)]
+pub struct PacketBuffer {
+    storage: std::sync::Arc<BufferStorage>,
+    offset: usize,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for PacketBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketBuffer")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+impl From<Vec<u8>> for PacketBuffer {
+    fn from(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        Self {
+            storage: std::sync::Arc::new(BufferStorage::Host(bytes)),
+            offset: 0,
+            bytes: len,
+        }
+    }
+}
+
+impl PacketBuffer {
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Result<Self> {
+        if range.start > range.end || range.end > self.bytes {
+            return Err(RuntimeError::Device(
+                "packet buffer slice is outside its bounds".into(),
+            ));
+        }
+        Ok(Self {
+            storage: self.storage.clone(),
+            offset: self.offset + range.start,
+            bytes: range.end - range.start,
+        })
+    }
+
+    pub fn read(&self, output: &mut [u8]) -> Result<()> {
+        if output.len() != self.bytes {
+            return Err(RuntimeError::Device(
+                "packet buffer read size changed".into(),
+            ));
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+        match self.storage.as_ref() {
+            BufferStorage::Host(data) => {
+                output.copy_from_slice(&data[self.offset..self.offset + self.bytes])
+            }
+            #[cfg(feature = "cuda")]
+            BufferStorage::Cuda {
+                memory, backend, ..
+            } => {
+                use crate::device::Backend;
+                backend.download(memory, self.offset as u64, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn completed_cuda(
+        memory: crate::device::DeviceMem,
+        backend: std::sync::Arc<crate::device::cuda::CudaBackend>,
+        bytes: usize,
+        resident: std::sync::Arc<()>,
+    ) -> Self {
+        assert!(memory.len >= bytes as u64);
+        Self {
+            storage: std::sync::Arc::new(BufferStorage::Cuda {
+                memory: std::sync::Arc::new(memory),
+                backend,
+                _resident: resident,
+            }),
+            offset: 0,
+            bytes,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn cuda_source(&self) -> Option<(&crate::device::cuda::CudaBackend, u64)> {
+        match self.storage.as_ref() {
+            BufferStorage::Cuda {
+                memory, backend, ..
+            } => Some((backend, memory.base + self.offset as u64)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct PacketBufferPool {
+    slots: Vec<PacketBuffer>,
+    next: usize,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct PendingPacketBuffer {
+    buffer: Option<PacketBuffer>,
+    source: Option<std::sync::Arc<dyn Send + Sync>>,
+}
+
+#[cfg(feature = "cuda")]
+impl PacketBufferPool {
+    pub(crate) fn cuda(
+        backend: std::sync::Arc<crate::device::cuda::CudaBackend>,
+        slot_bytes: usize,
+        slots: usize,
+    ) -> Result<Self> {
+        use crate::device::Backend;
+        let bytes = slot_bytes
+            .checked_mul(slots)
+            .filter(|&n| n > 0)
+            .ok_or_else(|| RuntimeError::Device("packet buffer pool size overflow".into()))?;
+        let memory = std::sync::Arc::new(backend.alloc(0, bytes as u64)?);
+        let resident = std::sync::Arc::new(());
+        Ok(Self {
+            slots: (0..slots)
+                .map(|i| PacketBuffer {
+                    storage: std::sync::Arc::new(BufferStorage::Cuda {
+                        memory: memory.clone(),
+                        backend: backend.clone(),
+                        _resident: resident.clone(),
+                    }),
+                    offset: i * slot_bytes,
+                    bytes: slot_bytes,
+                })
+                .collect(),
+            next: 0,
+        })
+    }
+
+    pub(crate) fn acquire(
+        &mut self,
+        bytes: usize,
+        source: std::sync::Arc<dyn Send + Sync>,
+    ) -> Option<PendingPacketBuffer> {
+        for _ in 0..self.slots.len() {
+            let i = self.next;
+            self.next = (i + 1) % self.slots.len();
+            let slot = &self.slots[i];
+            if bytes <= slot.bytes && std::sync::Arc::strong_count(&slot.storage) == 1 {
+                let mut buffer = slot.clone();
+                buffer.bytes = bytes;
+                return Some(PendingPacketBuffer {
+                    buffer: Some(buffer),
+                    source: Some(source),
+                });
+            }
+        }
+        None
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PendingPacketBuffer {
+    pub(crate) fn address(&self) -> u64 {
+        self.buffer.as_ref().unwrap().cuda_source().unwrap().1
+    }
+
+    /// Safety: all work addressing this slot and its source has completed successfully.
+    pub(crate) unsafe fn retire(mut self) -> PacketBuffer {
+        self.source.take();
+        self.buffer.take().unwrap()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PendingPacketBuffer {
+    fn drop(&mut self) {
+        // Dropping an unretired copy cannot authorize freeing either DMA endpoint.
+        if let Some(buffer) = self.buffer.take() {
+            std::mem::forget(buffer);
+            std::mem::forget(self.source.take());
+        }
+    }
+}
+
+pub(crate) fn check_region(tensor: PacketTensor, offset: usize, bytes: usize) -> Result<()> {
+    if offset
+        .checked_add(bytes)
+        .is_none_or(|end| end > tensor.bytes)
+    {
+        return Err(RuntimeError::Device(
+            "packet tensor transfer is outside its bounds".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PacketData<'a> {
+    Host(&'a [u8]),
+    Buffer(&'a PacketBuffer),
+    Zero(usize),
+}
+
+impl PacketData<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Host(bytes) => bytes.len(),
+            Self::Buffer(buffer) => buffer.len(),
+            Self::Zero(bytes) => *bytes,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn read(&self, output: &mut [u8]) -> Result<()> {
+        if output.len() != self.len() {
+            return Err(RuntimeError::Device("packet input size changed".into()));
+        }
+        match self {
+            Self::Host(bytes) => output.copy_from_slice(bytes),
+            Self::Buffer(buffer) => buffer.read(output)?,
+            Self::Zero(_) => output.fill(0),
+        }
+        Ok(())
+    }
+}
+
+pub struct PacketWrite<'a> {
+    pub tensor: PacketTensor,
+    pub offset: usize,
+    pub data: PacketData<'a>,
+}
+
+impl PacketWrite<'_> {
+    pub(crate) fn check(&self) -> Result<()> {
+        check_region(self.tensor, self.offset, self.data.len())
+    }
+}
+
 /// Runtime surface used by packetized pipelines.
 ///
 /// Model import, graph lowering and tensor-name conventions stay outside this interface. The
@@ -26,7 +284,59 @@ pub trait PacketRuntime: Send {
     }
     fn tensor(&self, name: &str) -> Option<PacketTensor>;
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()>;
+    /// Reserve transfer staging for full writes of these tensors before serving.
+    fn prepare_writes(&mut self, _tensors: &[PacketTensor]) -> Result<()> {
+        Ok(())
+    }
+    /// Ordered writes, completed before return. Overlapping writes retain slice order.
+    fn write_tensors(&mut self, writes: &[PacketWrite<'_>]) -> Result<()> {
+        for w in writes {
+            w.check()?;
+        }
+        for w in writes {
+            let owned;
+            let bytes = if let PacketData::Host(bytes) = w.data {
+                bytes
+            } else {
+                owned = {
+                    let mut bytes = vec![0; w.data.len()];
+                    w.data.read(&mut bytes)?;
+                    bytes
+                };
+                &owned
+            };
+            if w.offset == 0 && bytes.len() == w.tensor.bytes {
+                self.write_tensor(w.tensor, bytes)?;
+            } else {
+                self.write_tensor_at(w.tensor, w.offset, bytes)?;
+            }
+        }
+        Ok(())
+    }
     fn read_tensor(&self, tensor: PacketTensor, bytes: &mut [u8]) -> Result<()>;
+    fn snapshot_tensor(
+        &mut self,
+        tensor: PacketTensor,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<PacketBuffer> {
+        check_region(tensor, offset, bytes)?;
+        let mut data = vec![0; bytes];
+        self.read_tensor_at(tensor, offset, &mut data)?;
+        Ok(data.into())
+    }
+    fn write_tensor_from(
+        &mut self,
+        tensor: PacketTensor,
+        offset: usize,
+        source: &PacketBuffer,
+    ) -> Result<()> {
+        self.write_tensors(&[PacketWrite {
+            tensor,
+            offset,
+            data: PacketData::Buffer(source),
+        }])
+    }
     /// Write `bytes` at byte `offset` of `tensor`; the rest keeps its contents.
     fn write_tensor_at(&mut self, tensor: PacketTensor, offset: usize, bytes: &[u8]) -> Result<()> {
         let mut all = vec![0; tensor.bytes];
@@ -422,15 +732,28 @@ impl PacketAsset {
     }
 
     /// Every sibling packet the pipelines declare, by stage: each `*.packet` stage and the
-    /// clone stage's reference encoder ([`CLONE_ENCODER`]), as bare file names beside the
-    /// packet. Each stage binds its own runtime, so two stages naming one file are two entries.
+    /// clone and conditioning encoders, as bare file names beside the packet. Each stage binds
+    /// its own runtime, so two stages naming one file are two entries.
     pub fn stage_files(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        use plow_asset::dual_stream::{SpeakerConditioning, CONDITIONING_KEY};
         let mut out = std::collections::BTreeMap::new();
         for p in self.pipelines() {
             for (key, name) in &p.strings {
                 if key.ends_with(".packet") || key == CLONE_ENCODER {
                     out.insert(key.clone(), beside_packet(key, name)?);
                 }
+            }
+            if let Some(json) = p.strings.get(CONDITIONING_KEY) {
+                let conditioning =
+                    SpeakerConditioning::parse(json).map_err(RuntimeError::Rejected)?;
+                out.insert(
+                    "conditioning.speaker.packet".into(),
+                    conditioning.speaker_packet,
+                );
+                out.insert(
+                    "conditioning.reference.packet".into(),
+                    conditioning.reference_packet,
+                );
             }
         }
         Ok(out)
@@ -758,6 +1081,250 @@ pub(crate) fn check_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_files_include_conditioning_sidecars() {
+        use plow_asset::dual_stream::CONDITIONING_KEY;
+        let mut asset = PacketAsset {
+            pipelines: PacketPipelines {
+                version: 1,
+                pipelines: vec![PacketPipeline {
+                    name: "tts".into(),
+                    driver: plow_asset::dual_stream::CONDITIONED_DRIVER.into(),
+                    strings: BTreeMap::from([
+                        ("codec.packet".into(), "codec.pkt".into()),
+                        (CLONE_ENCODER.into(), "clone.pkt".into()),
+                        (
+                            CONDITIONING_KEY.into(),
+                            serde_json::json!({
+                                "version": 1,
+                                "speaker_packet": "speaker_encoder.pkt",
+                                "reference_packet": "ref_encoder.pkt"
+                            })
+                            .to_string(),
+                        ),
+                    ]),
+                    programs: BTreeMap::new(),
+                    tensors: BTreeMap::new(),
+                    parameters: BTreeMap::new(),
+                }],
+            },
+            sections: BTreeMap::new(),
+        };
+        assert_eq!(
+            asset.stage_files().unwrap(),
+            BTreeMap::from([
+                ("codec.packet".into(), "codec.pkt".into()),
+                (CLONE_ENCODER.into(), "clone.pkt".into()),
+                (
+                    "conditioning.speaker.packet".into(),
+                    "speaker_encoder.pkt".into(),
+                ),
+                (
+                    "conditioning.reference.packet".into(),
+                    "ref_encoder.pkt".into(),
+                ),
+            ])
+        );
+        asset.pipelines.pipelines[0].strings.insert(
+            CONDITIONING_KEY.into(),
+            serde_json::json!({"version": 1, "speaker_packet": "../speaker.pkt",
+                "reference_packet": "ref_encoder.pkt"})
+            .to_string(),
+        );
+        assert!(asset.stage_files().is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pool_views_prevent_reuse_and_unretired_copies_retain_both_owners() {
+        use std::sync::Arc;
+        let mut pool = PacketBufferPool {
+            slots: vec![vec![1; 32].into(), vec![2; 32].into()],
+            next: 0,
+        };
+        let source = Arc::new(());
+        let weak = Arc::downgrade(&source);
+        let a = pool.acquire(17, source.clone()).unwrap();
+        let b = pool.acquire(32, source.clone()).unwrap();
+        assert!(pool.acquire(1, source.clone()).is_none());
+        // SAFETY: host-only fixtures have no queued device work.
+        let a = unsafe { a.retire() };
+        let view = a.slice(3..11).unwrap();
+        drop(a);
+        assert!(pool.acquire(1, source.clone()).is_none());
+        drop(view);
+        assert!(pool.acquire(33, source.clone()).is_none());
+        let pending = pool.acquire(32, source.clone()).unwrap();
+        let destination = Arc::downgrade(&pending.buffer.as_ref().unwrap().storage);
+        drop(source);
+        drop(pending);
+        // SAFETY: host-only fixtures have no queued device work.
+        drop(unsafe { b.retire() });
+        drop(pool);
+        assert!(weak.upgrade().is_some(), "unretired copy freed its source");
+        assert!(
+            destination.upgrade().is_some(),
+            "unretired copy freed its destination"
+        );
+    }
+
+    #[test]
+    fn packet_buffer_views_keep_storage_and_validate_before_reading() {
+        let buffer: PacketBuffer = (0..16).collect::<Vec<u8>>().into();
+        let owner = std::sync::Arc::downgrade(&buffer.storage);
+        let view = buffer.slice(2..10).unwrap().slice(3..6).unwrap();
+        assert!(buffer.slice(9..8).is_err());
+        assert!(buffer.slice(0..usize::MAX).is_err());
+        drop(buffer);
+        assert!(owner.upgrade().is_some());
+        let mut bytes = [0; 3];
+        view.read(&mut bytes).unwrap();
+        assert_eq!(bytes, [5, 6, 7]);
+        let mut guard = [0xa5; 2];
+        assert!(view.read(&mut guard).is_err());
+        assert_eq!(guard, [0xa5; 2]);
+        assert!(view.slice(3..3).unwrap().is_empty());
+        drop(view);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn bulk_write_fallback_preserves_order_and_validates_ranges_before_writing() {
+        struct Memory([u8; 16], usize);
+        impl PacketRuntime for Memory {
+            fn tensor(&self, _: &str) -> Option<PacketTensor> {
+                None
+            }
+            fn write_tensor(&mut self, t: PacketTensor, bytes: &[u8]) -> Result<()> {
+                check_transfer(t, 0, 16, bytes.len())?;
+                self.0.copy_from_slice(bytes);
+                self.1 += 1;
+                Ok(())
+            }
+            fn read_tensor(&self, t: PacketTensor, bytes: &mut [u8]) -> Result<()> {
+                check_transfer(t, 0, 16, bytes.len())?;
+                bytes.copy_from_slice(&self.0);
+                Ok(())
+            }
+            fn copy_tensor(
+                &mut self,
+                _: PacketTensor,
+                _: usize,
+                _: PacketTensor,
+                _: usize,
+                _: usize,
+            ) -> Result<()> {
+                unreachable!()
+            }
+            fn run(&mut self, _: usize) -> Result<()> {
+                unreachable!()
+            }
+            fn last_run_us(&self) -> f64 {
+                0.0
+            }
+        }
+        let t = PacketTensor {
+            handle: 0,
+            bytes: 16,
+        };
+        let mut rt = Memory([0; 16], 0);
+        rt.write_tensors(&[
+            PacketWrite {
+                tensor: t,
+                offset: 0,
+                data: PacketData::Host(&[0xa5; 16]),
+            },
+            PacketWrite {
+                tensor: t,
+                offset: 3,
+                data: PacketData::Host(&[1, 2, 3, 4]),
+            },
+            PacketWrite {
+                tensor: t,
+                offset: 5,
+                data: PacketData::Host(&[5, 6]),
+            },
+        ])
+        .unwrap();
+        let mut expected = [0xa5; 16];
+        expected[3..7].copy_from_slice(&[1, 2, 5, 6]);
+        assert_eq!(rt.0, expected);
+        assert_eq!(rt.1, 3);
+        for offset in [16, usize::MAX] {
+            assert!(rt
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: t,
+                        offset: 0,
+                        data: PacketData::Host(&[0xff]),
+                    },
+                    PacketWrite {
+                        tensor: t,
+                        offset,
+                        data: PacketData::Host(&[1]),
+                    },
+                ])
+                .is_err());
+            assert_eq!(rt.0, expected);
+            assert_eq!(rt.1, 3);
+        }
+        let snapshot = rt.snapshot_tensor(t, 3, 4).unwrap();
+        rt.write_tensor(t, &[0; 16]).unwrap();
+        let mut expected = [0; 4];
+        snapshot.read(&mut expected).unwrap();
+        assert_eq!(expected, [1, 2, 5, 6]);
+        let mut consumer = Memory([0xa5; 16], 0);
+        consumer
+            .write_tensor_from(t, 8, &snapshot.slice(1..3).unwrap())
+            .unwrap();
+        assert_eq!(&consumer.0[8..10], &[2, 5]);
+        assert_eq!(consumer.0[..8], [0xa5; 8]);
+        assert_eq!(consumer.0[10..], [0xa5; 6]);
+        assert!(consumer
+            .write_tensor_from(t, usize::MAX, &snapshot)
+            .is_err());
+        assert_eq!(consumer.1, 1);
+        assert!(rt.snapshot_tensor(t, 15, 2).is_err());
+        consumer
+            .write_tensors(&[
+                PacketWrite {
+                    tensor: t,
+                    offset: 2,
+                    data: PacketData::Zero(12),
+                },
+                PacketWrite {
+                    tensor: t,
+                    offset: 3,
+                    data: PacketData::Buffer(&snapshot),
+                },
+                PacketWrite {
+                    tensor: t,
+                    offset: 5,
+                    data: PacketData::Host(&[9, 8]),
+                },
+            ])
+            .unwrap();
+        let expected = [0xa5, 0xa5, 0, 1, 2, 9, 8, 0, 0, 0, 0, 0, 0, 0, 0xa5, 0xa5];
+        assert_eq!(consumer.0, expected);
+        for data in [PacketData::Zero(usize::MAX), PacketData::Buffer(&snapshot)] {
+            assert!(consumer
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: t,
+                        offset: 0,
+                        data: PacketData::Zero(16),
+                    },
+                    PacketWrite {
+                        tensor: t,
+                        offset: 15,
+                        data,
+                    },
+                ])
+                .is_err());
+            assert_eq!(consumer.0, expected);
+        }
+    }
 
     struct FakeRuntime;
 
