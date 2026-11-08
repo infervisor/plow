@@ -732,15 +732,28 @@ impl PacketAsset {
     }
 
     /// Every sibling packet the pipelines declare, by stage: each `*.packet` stage and the
-    /// clone stage's reference encoder ([`CLONE_ENCODER`]), as bare file names beside the
-    /// packet. Each stage binds its own runtime, so two stages naming one file are two entries.
+    /// clone and conditioning encoders, as bare file names beside the packet. Each stage binds
+    /// its own runtime, so two stages naming one file are two entries.
     pub fn stage_files(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        use plow_asset::dual_stream::{SpeakerConditioning, CONDITIONING_KEY};
         let mut out = std::collections::BTreeMap::new();
         for p in self.pipelines() {
             for (key, name) in &p.strings {
                 if key.ends_with(".packet") || key == CLONE_ENCODER {
                     out.insert(key.clone(), beside_packet(key, name)?);
                 }
+            }
+            if let Some(json) = p.strings.get(CONDITIONING_KEY) {
+                let conditioning =
+                    SpeakerConditioning::parse(json).map_err(RuntimeError::Rejected)?;
+                out.insert(
+                    "conditioning.speaker.packet".into(),
+                    conditioning.speaker_packet,
+                );
+                out.insert(
+                    "conditioning.reference.packet".into(),
+                    conditioning.reference_packet,
+                );
             }
         }
         Ok(out)
@@ -1068,6 +1081,59 @@ pub(crate) fn check_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_files_include_conditioning_sidecars() {
+        use plow_asset::dual_stream::CONDITIONING_KEY;
+        let mut asset = PacketAsset {
+            pipelines: PacketPipelines {
+                version: 1,
+                pipelines: vec![PacketPipeline {
+                    name: "tts".into(),
+                    driver: plow_asset::dual_stream::CONDITIONED_DRIVER.into(),
+                    strings: BTreeMap::from([
+                        ("codec.packet".into(), "codec.pkt".into()),
+                        (CLONE_ENCODER.into(), "clone.pkt".into()),
+                        (
+                            CONDITIONING_KEY.into(),
+                            serde_json::json!({
+                                "version": 1,
+                                "speaker_packet": "speaker_encoder.pkt",
+                                "reference_packet": "ref_encoder.pkt"
+                            })
+                            .to_string(),
+                        ),
+                    ]),
+                    programs: BTreeMap::new(),
+                    tensors: BTreeMap::new(),
+                    parameters: BTreeMap::new(),
+                }],
+            },
+            sections: BTreeMap::new(),
+        };
+        assert_eq!(
+            asset.stage_files().unwrap(),
+            BTreeMap::from([
+                ("codec.packet".into(), "codec.pkt".into()),
+                (CLONE_ENCODER.into(), "clone.pkt".into()),
+                (
+                    "conditioning.speaker.packet".into(),
+                    "speaker_encoder.pkt".into(),
+                ),
+                (
+                    "conditioning.reference.packet".into(),
+                    "ref_encoder.pkt".into(),
+                ),
+            ])
+        );
+        asset.pipelines.pipelines[0].strings.insert(
+            CONDITIONING_KEY.into(),
+            serde_json::json!({"version": 1, "speaker_packet": "../speaker.pkt",
+                "reference_packet": "ref_encoder.pkt"})
+            .to_string(),
+        );
+        assert!(asset.stage_files().is_err());
+    }
 
     #[cfg(feature = "cuda")]
     #[test]
