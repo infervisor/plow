@@ -313,6 +313,7 @@ def onset_ms(pcm):
 class Loop:
     def __init__(self, m, tok, voice, language):
         self.m, self.t, self.cfg = m, m.talker, m.config
+        self.talker, self.sub, self.rp = (50, 0.9), (50, 0.9), 1.05
         tc = self.cfg.talker_config
         self.tok = tok
         self.dev = next(m.parameters()).device
@@ -366,9 +367,9 @@ class Loop:
             if step >= 2:
                 logits[EOS] = self.t.codec_head(h)[0, -1, EOS].float()
             for t_ in set(hist):
-                logits[t_] = logits[t_] * 1.05 if logits[t_] < 0 else logits[t_] / 1.05
+                logits[t_] = logits[t_] * self.rp if logits[t_] < 0 else logits[t_] / self.rp
             l0s.append(logits.cpu())
-            c0 = self.sample(logits, greedy, gen)
+            c0 = self.sample(logits, greedy, gen, *self.talker)
             if force is not None:
                 c0 = int(force[step][0]) if step < len(force) else EOS
             if c0 == EOS:
@@ -382,7 +383,7 @@ class Loop:
                 o = cp.model(inputs_embeds=x, past_key_values=cpc, use_cache=True)
                 lg = cp.lm_head[j](o.last_hidden_state[:, -1]).float()[0]
                 lcp.append(lg.cpu())
-                c = self.sample(lg, greedy, gen)
+                c = self.sample(lg, greedy, gen, *self.sub)
                 if force is not None:
                     c = int(force[step][j + 1])
                 codes.append(c)
@@ -419,6 +420,12 @@ def main():
     ap.add_argument("--logits", action="store_true")
     ap.add_argument("--official", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
+    # Sampling (the published generation config by default; the code predictor takes no penalty).
+    ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--temperature", type=float, default=0.9)
+    ap.add_argument("--sub-top-k", type=int, default=50)
+    ap.add_argument("--sub-temperature", type=float, default=0.9)
+    ap.add_argument("--repetition-penalty", type=float, default=1.05)
     ap.add_argument("--force", default=None)
     ap.add_argument("--prepared-predictor", action="store_true",
                     help="FP32 conditional predictor: MODEL=prepared checkpoint, TEXTS=packet predictor capture")
@@ -448,6 +455,7 @@ def main():
     w = Qwen3TTSModel.from_pretrained(a.model, dtype=dt, device_map=a.device)
     tok = w.processor.tokenizer if hasattr(w.processor, "tokenizer") else w.processor
     loop = Loop(w.model, tok, a.voice, a.language)
+    loop.talker, loop.sub, loop.rp = (a.top_k, a.temperature), (a.sub_top_k, a.sub_temperature), a.repetition_penalty
     os.makedirs(a.out, exist_ok=True)
     rows = [json.loads(l) for l in open(a.texts) if l.strip()]
     if a.limit:
@@ -479,9 +487,10 @@ def main():
             off, _ = w.model.generate(
                 input_ids=[torch.tensor([res["ids"]], device=a.device)], instruct_ids=[None],
                 languages=[a.language], speakers=[a.voice], non_streaming_mode=False,
-                do_sample=not greedy, subtalker_dosample=not greedy, top_k=50, top_p=1.0,
-                temperature=0.9, subtalker_top_k=50, subtalker_top_p=1.0, subtalker_temperature=0.9,
-                repetition_penalty=1.05, max_new_tokens=a.max_frames)
+                do_sample=not greedy, subtalker_dosample=not greedy, top_k=a.top_k, top_p=1.0,
+                temperature=a.temperature, subtalker_top_k=a.sub_top_k, subtalker_top_p=1.0,
+                subtalker_temperature=a.sub_temperature, repetition_penalty=a.repetition_penalty,
+                max_new_tokens=a.max_frames)
             oc = off[0].cpu().numpy().astype(np.int32)
             n = min(len(oc), len(codes))
             rec["official_frames"] = int(len(oc))
