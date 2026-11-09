@@ -1841,9 +1841,10 @@ int main(int argc, char** argv) {
             c.in.i[2] = 10u << 4;
             bench("CFM LayerNormF32 + Mish + row 8704x256", c, 0, 8.0 * rows * feat);
         }
-        for (unsigned rows : {136u, 72u}) {
-            /* CFM self-attention: 64 CFG items, 8 heads x 64, fused QKV, 306-row prompt prefix. */
-            Case c; const unsigned batch = 64, heads = 8, hw = 64, width = heads * hw, stride = 3 * width, pre = 306;
+        /* CFM self-attention: 8 heads x 64, fused QKV, 306-row prompt prefix; (rows, CFG items) =
+         * csynth.b32.t64 (136, 64), the 72-row window at 64 items, and csynth.b64.t32 (72, 128). */
+        for (auto rb : {std::pair<unsigned, unsigned>{136u, 64u}, {72u, 64u}, {72u, 128u}}) {
+            Case c; const unsigned rows = rb.first, batch = rb.second, heads = 8, hw = 64, width = heads * hw, stride = 3 * width, pre = 306;
             std::vector<uint32_t> ix(batch);
             for (unsigned i = 0; i < batch; i++) ix[i] = i % 2;
             unsigned o = c.out((size_t)batch * rows * width), qkv = c.f32((size_t)batch * rows * stride, 1.f);
@@ -1855,7 +1856,7 @@ int main(int argc, char** argv) {
             c.in.i[5] = stride; c.in.i[6] = 2u; c.in.i[7] = pre;
             c.in.fj[0].f = 0.125f; c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
             char name[80];
-            snprintf(name, sizeof(name), "CFM AttentionF32 tc b64 q%u kv%u+306", rows, rows);
+            snprintf(name, sizeof(name), "CFM AttentionF32 tc b%u q%u kv%u+306", batch, rows, rows);
             bench(name, c, 4.0 * batch * heads * hw * rows * (rows + pre), 0);
 #if defined(PLOW_NV_HOPPER)
             /* the same with the prefix pre-formatted (sp_attention_h16) */
@@ -1873,9 +1874,20 @@ int main(int argc, char** argv) {
             f.fj[1].u = pre * 2 * width; f.fj[2].u = heads * npt * SPH_XS;
             h.in.i[6] = 2u | 16u;
             h.in.t[6] = fm;
-            snprintf(name, sizeof(name), "CFM AttentionF32 h16 b64 q%u kv%u+306", rows, rows);
+            snprintf(name, sizeof(name), "CFM AttentionF32 h16 b%u q%u kv%u+306", batch, rows, rows);
             bench(name, h, 4.0 * batch * heads * hw * rows * (rows + pre), 0, 20, &f);
 #endif
+        }
+        /* The transformer-block GEMMs at csynth.b64.t32 (128 CFG items x 72 rows = 9216 rows), wgmma. */
+        for (const G& g : gs) {
+            if (g.len) continue;
+            ConvSpec s{1, 9216, g.cin, g.cout, g.k, 1, 1, 1, g.k - 1u, 0, 0, 0, g.post, false, true, false, g.res, {}, 0.f, true};
+            s.wide = true;
+            s.wg = true;
+            Case c; unsigned o; build_conv(c, s, false, o);
+            char name[96];
+            snprintf(name, sizeof(name), "CFM %s wgmma M9216", g.name);
+            bench(name, c, 2.0 * 9216 * g.cin * g.cout * g.k, 0);
         }
         return 0;
     }
