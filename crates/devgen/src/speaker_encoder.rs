@@ -1380,6 +1380,8 @@ mod tests {
             (1 << 14) | (1 << 17) | (1 << 18)
         );
         assert_eq!(first.t[6], insts[0].t[0]);
+        // Reflect-padded split-BF16 convs keep the padded wide-tile body in the speech object.
+        assert!(crate::manifest::speech_conv_wide_padded(&p.model));
         let metadata = section(
             &p,
             &cfg,
