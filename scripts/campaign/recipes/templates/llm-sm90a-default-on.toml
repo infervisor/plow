@@ -121,7 +121,7 @@ nprompt = 384
 
 # FP32-reference gate (scripts/llm/fp32_ref_gate.py): plow within vLLM's distance to FP32 at c1 AND
 # at the serving concurrencies, each against the vLLM capture taken at the same concurrency
-# (docs/bringup/agent-tools.md §5). Build ref.json once; capture vLLM at 1, 8 and 32 in one lease.
+# (docs/bringup/agent-tools.md "Gates"). Build ref.json once; capture vLLM at 1, 8 and 32 in one lease.
 [gates]
 python = "{env:PYREF}"
 [gates.llm_fp32_ref]

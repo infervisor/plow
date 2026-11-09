@@ -6,7 +6,7 @@
 #
 #   nix develop --command scripts/lean_correctness_ci.sh
 #
-# GPU and artifact tests are not run here (docs/bringup/lean-correctness-inventory.md §6).
+# GPU and artifact tests are not run here (docs/bringup/03-lean-verify.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

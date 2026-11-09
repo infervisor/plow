@@ -41,7 +41,7 @@ be filled is a blocker, not a default.
 ## 1. Harness
 
 No new runner was written. This campaign used the existing harness, per
-[`docs/bringup/agents/README.md`](../bringup/agents/README.md) ("extend an
+[`docs/bringup/05-single-block-sweep.md`](../bringup/05-single-block-sweep.md#select-the-existing-harness) ("extend an
 existing harness when its semantic boundary is incomplete; do not create a
 campaign-specific runner"):
 

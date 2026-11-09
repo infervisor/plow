@@ -1,308 +1,178 @@
-# Stage 3 — Formal Verification with Lean (the checkpoint system)
+# Stage 3 — Lean verification and bundle qualification
 
-> Part of the model bringup playbook. Stage 2 produced fusion rules and a
-> compiled schedule; Stage 3 proves that schedule correct with the Lean 4
-> verifier before Stage 4 (kernel tuning) touches performance.
+Target-independent: a checkpoint that holds on one part only is not a proof.
 
-## Goal
+Goal: every checkpoint the model's emit path calls returns `ok`, and `plowc qualify` finds no gap
+you cannot name. A rejection is a compiler bug, not a warning. Design:
+[`docs/arch/08-formal-verification.md`](../arch/08-formal-verification.md).
 
-Run every compiled bucket of the new model through the `plow_verify` Lean CLI
-and get an `ok` certificate from every checkpoint its pipeline calls, then qualify
-the bundle with `plowc qualify <dir>`: every required obligation present,
-bound to the packet and replayed on an approved verifier. A rejection is a
-real correctness finding, not a warning: it means the compiler produced a
-schedule that the formal model can prove is wrong (a fusion that changes
-semantics, a tiling with a gap, an SRAM overcommit, a counter race, a lossy
-wire encoding, an unsafe allocation, or a staged-GEMV that overruns the LDS
-arena). The bar is a clean `lake build` (warnings are errors), a passing
-`lake exe proof_audit` (no `sorryAx`, no axiom outside propext/Classical.choice/
-Quot.sound in any acceptance theorem), and every checkpoint emitting `ok`.
+New models rarely need new theorems: the universal lemmas are proved once and each checker
+re-checks per-instance data. The exception is Checkpoint A: a new Stage-2 rule adds a `rule_*`
+obligation ([02-egglog-rewrite.md](02-egglog-rewrite.md)).
 
-The proofs are foundational and model-independent. Bringing up a new model does
-**not** normally require writing new theorems — the universal lemmas are proved
-once and applied per-instance by checking preconditions. The one exception is
-Checkpoint A: a new model that adds a **new fusion rule** in Stage 2 adds a new
-proof obligation here (see [Checkpoint A](#checkpoint-a--rewrite-rule-soundness)).
+## Endpoints
 
-Authoritative reference: [`docs/arch/08-formal-verification.md`](../arch/08-formal-verification.md).
+All endpoints dispatch through `Plow.CLI.Dispatch.endpoints` (`lean-plow/Plow/CLI/Dispatch.lean`);
+handlers live in `lean-plow/Plow/CLI/Checkpoints.lean`. `lean-plow/proof-manifest.json` lists the
+acceptance theorems per endpoint (proof roots below).
 
-## What each checkpoint proves
+| ID | Proves | Proof roots (`Plow.` omitted) |
+|---|---|---|
+| A | rewrite rules and bodies expand to their unfused composition | `RewriteBody.check_sound`, `Rewrite.rule_*` |
+| B | tiling covers the GEMM with no gap/overlap, per-tile work ≤ cost bound | `TilePartition.check_sound` |
+| C | SRAM hand-offs never overcommit the page budget | `Sram.occupancy_le_of_temporal_fit` |
+| D | counter schedule enforces every dependency; logical tensor effects conflict-free | `Verify.{verifyDependencies,checkPaths,verifyAddressMapVia,treeBefore}_sound`, `Verify.verifyAddressMap_sound_strict`, `Effects.{checkConflicts,checkAccesses,checkReuse}_sound`, `Effects.cancellation_retired` |
+| E | wire encoding round-trips | `Wire.decodeProgram_encodeProgram` |
+| F | allocation safety (same checker and bundle as D) | `Verify.verifyAddressMap_sound_strict`, `Verify.verifyAddressMapVia_sound` |
+| G | every always-staged GEMV fits the LDS arena | `LdsFit.fits_of_check_ok` |
+| K | knob consistency | `Knobs.checkK_sound` |
+| S | knob scope: a knob change touches only its declared rungs/routes | `Knobs.Scope.{checkS_sound,diff_complete,untouched_rungs,route_untouched}` |
+| P | perf floor ledger | `Knobs.Ledger.checkP_sound` |
+| R | measured / selected GEMM policy | `MeasuredPolicy.check_sound` |
+| L | padded-MLA layout mapping | `MlaLayout.{address_in_bounds,ignored_padding,same_consumer_output}` |
+| `media_geometry.v1` | speech/multimodal capacity and shapes hold for every input up to the declared maxima | `MediaGeometry.check_sound` + per-family `every_*_fits`, `CodecLm.*`, `Multimodal.soft_ids_disjoint` |
+| `kv_ring.v1` | no packed-prefill span writes a sliding-ring row its own queries read | `KvRing.{checkLaunch_sound,launch_safe,launch_safe_masked,slots_distinct,mask_eq_mod}` |
+| `vmm_trace.v1` | VMM traces keep mappings on live handles, disjoint, inside reservations | `KvRing.{traceOk_sound,step_preserves,run_preserves}` |
+| `speech_fusion.v1` | fused LayerNorm-prologue / Conv1dF32 `row_scale` sites meet `Plow.Speech`'s preconditions | `SpeechFusion.{check_sound,ln_site_stats,ln_site_gemm_eq,conv_site_in_bounds,conv_site_eq}` |
+| `page_envelope.v1` | the paged library attention loader reads only its request's padded page-table row | `PageEnvelope.{checkRoute_sound,route_safe,read_in_envelope,padded_entry_own,envelope_tight}` |
 
-Every endpoint is dispatched through the one table `Plow.CLI.Dispatch.endpoints`
-([`lean-plow/Plow/CLI/Dispatch.lean`](../../lean-plow/Plow/CLI/Dispatch.lean)):
-the lettered checkpoints A–G, K, S, P, R, L (handlers in
-[`Plow.CLI.Checkpoints`](../../lean-plow/Plow/CLI/Checkpoints.lean)) and the
-versioned endpoints below. Each id must have its acceptance theorems listed in
-[`lean-plow/proof-manifest.json`](../../lean-plow/proof-manifest.json), which
-`proof_audit` checks in both directions. The IDs
-track the compile-pipeline stages: A Rewrite, B Assemble, C Collapse/Relax, D
-Schedule, E Emit, F Memory. G (staged-LDS fit) is a later addition that
-re-checks an emit-time obligation and has no stage of its own.
+`lake exe proof_audit` checks that manifest ids equal the dispatched ids, every listed theorem
+exists, its statement mentions the named checker, and its axiom closure stays inside
+{propext, Classical.choice, Quot.sound}. D/F acceptance always runs the proven reference checker;
+the stack-safe `FastCheckD` can only reject early.
 
-| ID | Name | Proves | Payload | Backing theorem / symbol |
-|----|------|--------|---------|--------------------------|
-| A | Rewrite rule soundness | Every fired fusion rule preserves semantics | `{"rules": [...]}` | `Plow.Rewrite.soundRules`, `Plow.Rewrite.rule_*` |
-| B | Tile partition validity | Tiling covers the GEMM shape with no gaps/overlaps; per-tile work ≤ cost bound | `{"candidates": [...]}` | `Plow.TilePartition.tile_partition_covers`, `check_sound` |
-| C | SRAM temporal fit | Producer/consumer never co-hold pages across a hand-off; page budget never overcommitted | `{"budget", "handoffs": [...]}` | `Plow.Sram.occupancy_le_of_temporal_fit` |
-| D | Counter protocol correctness | Counter-gated schedule enforces every dependency; deadlock-free | `(TaskGraph, CounterProtocol, AddressMap)` bundle | `Plow.Protocol.protocol_covers_deps`, `happensBefore_acyclic`; `Plow.Memory.AddressMapSound` |
-| E | Wire format round-trip | `decode(encode(f)) = some f` and `encode(f) = raw` — encoding is lossless | `{"frames", "raw"}` | `Plow.Wire.decodeProgram_encodeProgram` |
-| F | Allocation safety | No byte-overlapping address-map entries lack a bridging ordering (reclamation-safe) | same bundle as D | `Plow.Memory.AddressMapSound` (via `Plow.Verify`) |
-| G | Staged-LDS fit | Every always-staged GEMV instance fits the decode object's LDS arena | `{"arena", "ops": [...]}` | `Plow.LdsFit.fits_of_check_ok` |
+## Call paths
 
-Versioned endpoints, checked at qualification (`plowc qualify`), not carried as compiler
-receipts (details: [`lean-correctness-inventory.md`](lean-correctness-inventory.md) §10–13):
+| CP | caller | runs when | persisted |
+|---|---|---|---|
+| A | `devblob_verify_hook` (`crates/plowc/src/main.rs`), whole rule catalog + bodies | every devblob emit (`--lean-verify-devblob`, default on) | `RewriteBodyExpansion` receipt |
+| D coarse | devblob hook, programs with a reduction witness | default | `CoarseDependencyPreservation` |
+| D effects | devblob hook, programs where `logical_effects::obligation` is `Ok` | default; the first unaudited op is a logged gap | `LogicalTensorEffects` |
+| D ordering + G | devblob hook per program (empty address map, topological GQ order, staged-LDS fit) | default | `build.json` `verified`, `lds_fit_verified` |
+| D sidecar | devgen `write_sidecar_packet` (codec, s3gen, encoder, mm towers) | sidecar verifier installed | `<stem>.lean-checks.json` |
+| K | devgen `knob_spec::gate` | every devblob emit unless `--no-knob-verify`; an unusable binary is fatal | `build.json` `knobs.K` |
+| R | devblob hook, measured / GEMM policies | policies recorded | `MeasuredPolicy` / `SelectedGemmPolicy` |
+| L | devblob hook, padded-MLA `FlashMerge` producers | MLA-class packets | `LayoutMapping` |
+| A,B,D,E,F | `run_lean_verify` (`crates/plowc/src/lib.rs`), schedule path | `--lean-verify` (opt-in) | `build.json`; E sends a fixed sample, not the program |
+| S | `plowc knob-scope` (compares via `plowrt knob-scope`), run by `scripts/knob_scope_ci.sh` | CI on a knob change | report file |
+| P | `scripts/perf_cert.py` via `scripts/perf_gate_ci.sh` | CI on a default flip | `perf-certs/*.json` |
+| C | none (tests only) | — | — |
 
-| ID | Proves | Input derived by | Backing theorems |
-|----|--------|------------------|------------------|
-| `media_geometry.v1` | Speech/multimodal capacity and shape contracts hold for every input up to the declared maxima | `plow_asset::media_geometry` | `Plow.MediaGeometry.check_sound`, `*.every_*_fits`, `CodecLm.*`, `Multimodal.soft_ids_disjoint` |
-| `kv_ring.v1` | No packed prefill launch writes a sliding-ring row its own queries read | `plow_asset::kv_ring` (runtime planner) | `Plow.KvRing.checkLaunch_sound`, `launch_safe_masked`, `slots_distinct` |
-| `vmm_trace.v1` | VMM driver traces keep mappings on live handles, disjoint, inside reservations; everything returned | `memory::vmm` mock traces (test) | `Plow.KvRing.traceOk_sound`, `step_preserves` |
-| `speech_fusion.v1` | Fused LayerNorm prologue / Conv1dF32 row_scale sites meet `Plow.Speech`'s preconditions | `plow_asset::speech_fusion` | `Plow.SpeechFusion.ln_site_gemm_eq`, `conv_site_in_bounds`, `conv_site_eq` |
-| `page_envelope.v1` | The paged library attention loader reads only its request's padded page-table row, at every split count up to the cap | `exec::gpu::lib_attention` constants (test) | `Plow.PageEnvelope.checkRoute_sound`, `route_safe`, `envelope_tight` |
+The devblob path therefore runs A/D/G/R/L (+K); the schedule path A/B/D/E/F. No path runs C.
+The D/F verdict cache key includes the checkpoint letter.
 
-Detail per checkpoint:
+## Qualification
 
-### Checkpoint A — Rewrite rule soundness
-Each Stage-2 egglog fusion rule (annotated `; rule: <name>` in
-[`crates/rewrite/src/egl/rules.egg`](../../crates/rewrite/src/egl/rules.egg))
-fuses a composition of base ops into one fused op. In Lean each fused op
-unfolds via `Plow.Rewrite.expand` to exactly its unfused composition, and each
-rule's soundness is a definitional-equality (`rfl`) theorem `Plow.Rewrite.rule_*`
-in [`Plow/Rewrite.lean`](../../lean-plow/Plow/Rewrite.lean). `checkA` submits the
-list of fired rule names and rejects any name not in the closed enumeration
-`Plow.Rewrite.soundRules`. Today that table holds 29 entries, one per `rule_*`
-theorem, mirroring the 29 `; rule:` annotations in `rules.egg`.
+`plow_asset::certificates` derives each packet's required obligations, matches receipts and records
+a `Qualification` (required, satisfied, policy receipts, verifiers, gaps); `plowc::qualify` replays
+them on the current verifier. plowrt does not read or replay receipts; packet integrity at load is
+the dist signatures and digests.
 
-### Checkpoint B — Tile partition validity
-`checkB` runs `checkTileCandidate` over each candidate: positive dims, each tile
-dim ≤ its GEMM dim, and the cost bound `tileCount · bm · bn · bk ≤ cost_bound`.
-Coverage completeness is the universal theorem `tile_partition_covers`; the
-executable check is backed by `check_sound`
-([`Plow/TilePartition.lean`](../../lean-plow/Plow/TilePartition.lean)).
+- Required set:
+  - compiler packet (`model.pkt`, or any packet whose `lean-checks.json` binds its bytes): A once;
+    coarse D and logical-effects D per program; L per padded-MLA producer;
+  - any other packet is a sidecar: logical-effects D per program via `program_checks`;
+  - versioned endpoints where they apply: `media_geometry.v1` on the packet that owns a
+    speech/multimodal pipeline, `kv_ring.v1` on a packet with packed prefill over a sliding ring,
+    `speech_fusion.v1` on a packet with a fused speech site;
+  - policy receipts (R) bind when present, never required.
+- Gaps: absent receipts or a `packet_sha256` mismatch; a receipt that does not rebind from the
+  loaded packet; a wrong/absent program, duplicate or unused receipt, unsupported scope; a `None`,
+  out-of-range or short `program_checks`; an unapproved receipt verifier; an unavailable or
+  unapproved current verifier, a replay rejection, or a changed envelope.
+- Verifier identity: `lean-plow/approved-verifiers.json` pairs each approved `plow_verify` sha256
+  with the Lean-sources digest (`lean_verify::lean_sources_sha256`). A rebuilt verifier needs an
+  entry; `lean_verify` tests fail without one.
+- Replay cache key: (receipts digest, verifier, required-scope-set digest).
+- Entry points:
+  - `plowc qualify <dir|packet>...` replays every `*.pkt` and exits non-zero on any gap
+    (`--no-replay` cannot qualify; `--format json`). A sidecar reads `<stem>.lean-checks.json`.
+  - Every devblob emit qualifies its output: `--lean-qualify report` (default) records
+    `build.json` `lean.bundle_qualification`; `strict` fails the emit. `campaign.py build` passes
+    `strict` for a `recipes/infervisor` recipe.
+  - `scripts/campaign/campaign.py qualify --assets <dir> --strict`.
 
-### Checkpoint C — SRAM temporal fit
-`checkC` re-checks each `Handoff` record (`producer_pages`, `consumer_pages`,
-`producer_release`, `consumer_acquire`, `consumer_release`) against a budget;
-rejection names the first violating hand-off. The Rust `sram_fit` pass already
-filters candidates against this rule — the Lean check closes the promotion story
-with the universal theorem `occupancy_le_of_temporal_fit`
-([`Plow/Sram.lean`](../../lean-plow/Plow/Sram.lean)).
+### Versioned endpoints — inputs
 
-### Checkpoint D — Counter protocol correctness
-`checkD` runs the executable address-map verifier via the stack-safe twin
-`Plow.CLI.FastCheckD` (the reference recursion overflows on real ~590k-task
-schedules) plus a reader/writer disjointness check, together establishing the
-**strict** `AddressMapSound` guarantee. The universal happens-before theory
-(`protocol_covers_deps`, `happensBefore_acyclic`) is proved once in
-[`Plow/Protocol.lean`](../../lean-plow/Plow/Protocol.lean).
+- `media_geometry.v1`: `plow_asset::media_geometry::request` derives one contract per family
+  (audio_lm, rnnt, codec_lm, guided_lm, vad, multimodal) from the packet pipeline sections,
+  `asr_vocabulary.json` and the multimodal contract. A missing parameter, absent sidecar or
+  overflowing shape product rejects; Lean rejects unknown fields and kinds.
+- `kv_ring.v1`: `plow_asset::kv_ring` builds launches `{ring_log, window, capacity, spans}` from
+  the packet's `live_kv` sliding rings and `packed_prefill` limits, using the runtime planner
+  (`plan_with_limit`, `stage_slots`) on boundary mixes (full request at context, staggered wrapping
+  requests, one-row request). Contract: `0 < window`, `ring_log < 32`, every span
+  `window + len ≤ ring + 1` and `start + len ≤ capacity`, distinct non-idle slots. Out of scope:
+  device completion before reuse (covered by D effects), growth beyond the packet `max_ctx`.
+- `vmm_trace.v1`: driver event traces (`reserve`, `address_free`, `create`, `release`, `map`,
+  `unmap`, `access`, `quiesce`) recorded by the mock `VmmOps` in `memory::vmm` ring tests (CPU
+  lane). With `quiesce` everything must be returned.
+- `speech_fusion.v1`: `plow_asset::speech_fusion` derives one site per fused instruction —
+  LayerNorm prologue (`DenseGemmF32` flag bit 5: the last earlier writer of `stats` is
+  `RowStatsF32` over the GEMM's A, nothing rewrites A or stats in between) and Conv1dF32
+  `row_scale` (sizes recomputed from raw fields, no aliasing of output/residual). Assumes programs
+  run in index order.
+- `page_envelope.v1`: runtime constants, not packet data. The ignored test
+  `exec::gpu::lib_attention::tests::paged_table_pad_satisfies_the_lean_envelope` sends page size,
+  split cap and table pad; contract `0 < page`, `kv_tile = page`, `0 < max_splits ≤ pad + 1`.
+  Only the TMA paged route is in scope; a const assert in `lib_attention.rs` repeats the
+  hypothesis.
 
-### Checkpoint E — Wire format round-trip
-`checkE` requires both `encode(frames) = raw` and `decode(raw) = some frames`,
-catching schema drift on either side; rejection names the first diverging byte
-([`Plow/Wire.lean`](../../lean-plow/Plow/Wire.lean)). The Lean model is abstract,
-not byte-identical: it proves the framing invariant every scheme must satisfy;
-the concrete `packet::Program::to_bytes` layout has its own round-trip suite in
-`crates/packet`.
+## Build and run
 
-### Checkpoint F — Allocation safety
-`checkF` runs the **same** verifier and disjointness check as `checkD` on the
-same bundle — F is post-emit re-verification of identical math. The Rust `call`
-helper caches the D/F verdict by payload hash so the second spawn is free
-([`Plow/Memory.lean`](../../lean-plow/Plow/Memory.lean),
-[`Plow/Verify.lean`](../../lean-plow/Plow/Verify.lean)).
-
-### Checkpoint G — Staged-LDS fit
-`checkG` accepts one `StagedOp` record per always-staged GEMV instance (`op`,
-`idx`, `rows`, `k`, `scratch`) plus the arena size in halves (from `hwspec`);
-`fits_of_check_ok` guarantees an accepted list contains no instance whose staged
-demand exceeds the arena ([`Plow/LdsFit.lean`](../../lean-plow/Plow/LdsFit.lean)).
-The always-staged family reads `x` only through LDS, so an over-fit path would
-read garbage and answer fluently-but-wrong; this checkpoint re-checks the
-emitter's fusion gate.
-
-## When a new model triggers new proof obligations
-
-- **New fusion rule (the common case).** If Stage 2 added a `; rule: <name>` to
-  `rules.egg`, Checkpoint A will reject that name until the Lean side covers it.
-  Discharging it soundly requires all four steps in the `Plow.Rewrite` module
-  contract:
-  1. add a fused variant to the `Op` inductive,
-  2. extend `Plow.Rewrite.expand` so the fused op unfolds to its unfused
-     composition,
-  3. write a `rule_<name>` theorem whose statement is
-     `expand (fused …) = <unfused composition>` and prove it (should be `rfl`
-     if `expand` is defined correctly),
-  4. add the exact rule-name string to `Plow.Rewrite.soundRules`.
-
-  The theorem must be a genuine equality between the fused op and its unfused
-  meaning — not `True`, not a tautology, not `sorry`. If it does not close by
-  `rfl`, the `expand` definition and the intended semantics disagree; fix the
-  definition rather than weakening the theorem.
-
-- **New tile shapes, buckets, schedules, allocations, wire frames, staged
-  GEMVs.** No new theorems. The universal lemmas already quantify over all
-  inputs; the per-instance checkers (`checkB`…`checkG`) just re-check the new
-  data against them. If one rejects, the compiler output is wrong — investigate
-  the compiler, not the proof.
-
-- **New op with no fusion.** No Checkpoint-A obligation until a rule fuses it.
-
-## Build Lean and run verification
-
-Requires the Lean toolchain (`elan` + `lake`); the pinned version is in
-[`lean-plow/lean-toolchain`](../../lean-plow/lean-toolchain)
-(`leanprover/lean4:v4.15.0`). Use `nix develop` for a shell that has them.
-
-Build the proofs and the CLI binary:
+Toolchain: `lean-plow/lean-toolchain` via `nix develop`.
 
 ```bash
-cd lean-plow
-lake build plow_verify proof_audit && lake exe proof_audit
-# or the whole required CPU lane (also run in CI):
-scripts/lean_correctness_ci.sh
+nix develop --command bash -c 'cd lean-plow && lake build plow_verify proof_audit && lake exe proof_audit'
+nix develop --command scripts/lean_correctness_ci.sh      # required CPU lane (also CI)
+nix develop --command plowc --hf-dir <checkpoint> --emit devblob --out <scratch>/emit   # A/D/G/R/L/K on
+nix develop --command plowc qualify <scratch>/emit
 ```
 
-A rebuilt verifier needs an entry in
-[`lean-plow/approved-verifiers.json`](../../lean-plow/approved-verifiers.json)
-(binary sha256 + digest of the Lean sources); `lean_verify` tests fail without it,
-and strict qualification refuses receipts from unapproved verifiers.
+- `lake build` is a proof check: `warningAsError := true`, so `sorry` fails the build;
+  `proof_audit` is the axiom gate.
+- `lean-verify` is a default `plowc` feature. `--lean-verify` additionally forces the schedule path.
+- Binary lookup: `PLOW_VERIFY_BIN`, then `lean-plow/.lake/build/bin/plow_verify` relative to the
+  crate, then `plow_verify` on `PATH`.
+- Only `VerifyError::is_binary_unusable` downgrades to a recorded skip; every rejection and
+  spawn/marshal failure is fatal (`PlowcError::LeanVerify`, `LeanVerifySpawn`).
+- Debug: `PLOW_VERIFY_DUMP=<dir>` writes every request; `plow_verify < payload.json` replays one.
 
-A clean `lake build` is itself a proof check: the `Plow` library is the
-`@[default_target]`, so if any theorem fails or contains `sorry` the build
-fails. `lakefile.lean` sets `autoImplicit := false`,
-`relaxedAutoImplicit := false` and `warningAsError := true`, so `sorry` (a
-warning) fails the build; `proof_audit` additionally rejects `sorryAx` or an
-unapproved axiom anywhere in an acceptance theorem's closure. The CLI lands
-at `lean-plow/.lake/build/bin/plow_verify`.
+## Gate (all before Stage 4)
 
-Smoke-test the binary by hand (the JSON-IPC protocol reads one request from
-stdin, writes one `Certificate` to stdout, exits 0 iff `ok`):
-
-```bash
-echo '{"checkpoint":"B","payload":{"candidates":[
-  {"gemm":{"m":2048,"n":4096,"k":512},
-   "tile":{"bm":128,"bn":128,"bk":64},
-   "cost_bound":4294967296}]}}' \
-  | ./.lake/build/bin/plow_verify
-# => {"ok":true,"checkpoint":"B","notes":"tile-partition + cost bound verified: 1 candidates"}
-```
-
-How `plowc` invokes it. The Rust client lives in
-[`crates/lean_verify/`](../../crates/lean_verify/) (entry points `call`,
-`require`, `query` in [`lib.rs`](../../crates/lean_verify/src/lib.rs); typed
-per-checkpoint wrappers under `checkpoints/`), and the payload bridge that turns
-a compiled bucket into a `ScheduleRequest` is
-[`crates/schedule/src/lean_verify.rs`](../../crates/schedule/src/lean_verify.rs).
-The whole bridge is gated behind the `lean-verify` cargo feature.
-
-Compile a model with the schedule-path gate on (opt-in, hard-fail on rejection):
-
-```bash
-cargo build --features lean-verify        # or the workspace-wide equivalent
-plowc <model> --lean-verify               # runs the verifier once per bucket
-```
-
-The binary is located via `PLOW_VERIFY_BIN` if set, else `plow_verify` on
-`PATH`, else `lean-plow/.lake/build/bin/plow_verify` relative to the crate root:
-
-```bash
-export PLOW_VERIFY_BIN="$PWD/lean-plow/.lake/build/bin/plow_verify"
-```
-
-On the JSON-IPC round trip, `plow_verify` returns a `Certificate {ok, notes}`
-(or `ok:false` + `reason`); a rejection surfaces in `plowc` as
-`PlowcError::LeanVerify { bucket, reason }`. A missing/unrunnable binary is a
-distinct failure: only `VerifyError::is_binary_unusable` (no runnable
-`plow_verify`) is downgraded to a warning and recorded as a skip; every
-rejection and every spawn/marshal failure is fatal
-(`PlowcError::LeanVerifySpawn`). Building `plowc` without the feature and asking
-for verification returns `PlowcError::LeanVerifyDisabled`.
-
-Debug aids: `PLOW_VERIFY_DUMP=<dir>` writes every request to a file for replay;
-`cat payload.json | plow_verify` reproduces a single call.
-
-## Success criteria
-
-- `cd lean-plow && lake build plow_verify proof_audit && lake exe proof_audit`
-  completes clean; `scripts/lean_correctness_ci.sh` passes.
-- `plowc qualify <dir>` lists no gap you cannot name (a
-  `--lean-qualify strict` emit refuses any gap).
-- No `sorry` and no vacuous/tautological proofs anywhere in `lean-plow/`
-  (`grep -rn 'sorry' lean-plow --include='*.lean'` returns nothing outside
-  comments; every `rule_*` theorem is a real equality that closes by `rfl`).
-- `soundRules` has exactly one entry per `; rule:` annotation in `rules.egg`,
-  and per `rule_*` theorem — no orphans in either direction.
-- Every bucket of the new model verifies: every checkpoint its path calls emits
-  `ok` (schedule path, opt-in: A/B/D/E/F; devblob path: A/D/G/R/L).
-- No checkpoint is silently skipped: a skip is only acceptable when the binary
-  is genuinely unusable, and it must be logged and recorded, never read as a
-  pass.
+- [ ] `lake build plow_verify proof_audit && lake exe proof_audit` clean;
+      `scripts/lean_correctness_ci.sh` passes.
+- [ ] Every devblob emit of the model returns `ok` from A/D/G/R/L (and K); no rejection.
+- [ ] `plowc qualify` lists no gap you cannot name; a production recipe emits with
+      `--lean-qualify strict`.
+- [ ] No `sorry`, no vacuous theorem (`True`, restating a term as itself); every `rule_*` is a
+      real equality closed by `rfl`; `soundRules` ↔ `; rule:` annotations ↔ `rule_*` one-to-one.
+- [ ] No silent skip: a skip is acceptable only for a genuinely unusable binary, and is reported.
 
 ## Pitfalls
 
-- **The exit-127 trap.** `lean-plow`'s binary links a `/nix/store` ELF
-  interpreter, so outside `nix develop` it can die before `main` with empty
-  stdout. That is an unusable binary (downgraded to a skip), not a rejection.
-  Run inside `nix develop`, or point `PLOW_VERIFY_BIN` at a runnable build.
-- **A skip is not a pass.** If you see "SKIPPED, no runnable plow_verify" the
-  gate did not run. Fix the binary and re-run before claiming Stage 3 passed.
-- **Vacuous Checkpoint-A proofs.** Making `rule_*` prove `True` or restating the
-  fused op as itself certifies nothing. The statement must equate the fused op
-  to its unfused composition via `expand`. If `rfl` does not close it, the
-  semantics are wrong.
-- **Table drift.** Adding a `; rule:` in `rules.egg` without a matching
-  `rule_*` + `soundRules` entry makes `checkA` reject the new model; adding a
-  `soundRules` entry with no theorem is a hole in coverage. Keep all three in
-  lockstep.
-- **D/F cache.** D and F run identical math on the identical bundle and share a
-  cached verdict by payload hash; do not "fix" a D/F discrepancy by editing one
-  handler — they must agree by construction.
-- **Abstract E/wire model.** Checkpoint E proves the framing invariant, not the
-  concrete `packet` byte layout. Byte-level regressions are the job of the
-  `crates/packet` round-trip suite, not this checkpoint.
-- **Stack depth on real schedules.** Checkpoint D uses the stack-safe
-  `FastCheckD` twin because the reference recursion overflows on ~590k-task
-  schedules. If you add a new reference verifier, keep the stack-safe path.
+- Outside `nix develop` the verifier can die before `main` (nix ELF interpreter) with empty stdout:
+  that is a skip, not a pass. Re-run inside the shell or set `PLOW_VERIFY_BIN`.
+- Known silent gaps: non-Linux skips every batch; logical-effect gaps are log-only; some
+  example-built speech packets bypass the emit gates.
+- D and F share a checker by construction; never fix a D/F disagreement in one handler.
+- E proves the framing invariant on an abstract model; byte layout regressions belong to the
+  `crates/packet` round-trip suite.
+- Keep the stack-safe `FastCheckD` path for real schedules; the reference recursion overflows.
 
-## Code and proof pointers
+## Stop and ask
 
-- CLI dispatch: `Plow.CLI.Dispatch.endpoints`
-  ([`Dispatch.lean`](../../lean-plow/Plow/CLI/Dispatch.lean)); proof audit
-  [`ProofAudit.lean`](../../lean-plow/ProofAudit.lean) +
-  [`proof-manifest.json`](../../lean-plow/proof-manifest.json).
+- A checkpoint rejects and the compiler output looks right: report the payload
+  (`PLOW_VERIFY_DUMP`) before touching a proof.
+- A new rule's `rfl` theorem does not close.
+- A change needs a new verifier approval entry.
+
+## Pointers
+
+- Rust client: `crates/lean_verify/src/lib.rs` (`call`, `require`, `query`, `VerifyError`);
+  per-checkpoint wrappers in `crates/lean_verify/src/checkpoints/`.
+- Schedule-path bridge: `crates/schedule/src/lean_verify.rs`.
 - Qualification: `plow_asset::certificates` (`qualify_packet`, `qualify_sidecar`),
-  `plowc::qualify` (`qualify_dir`, `plowc qualify`).
-- Handlers `checkA`…`checkG`:
-  [`lean-plow/Plow/CLI/Checkpoints.lean`](../../lean-plow/Plow/CLI/Checkpoints.lean);
-  stack-safe D/F twin
-  [`FastCheckD.lean`](../../lean-plow/Plow/CLI/FastCheckD.lean);
-  payload/schema types
-  [`Payload.lean`](../../lean-plow/Plow/CLI/Payload.lean),
-  [`Schema.lean`](../../lean-plow/Plow/CLI/Schema.lean).
-- Checkpoint proofs: `Plow.Rewrite.soundRules` / `rule_*`
-  ([`Rewrite.lean`](../../lean-plow/Plow/Rewrite.lean)),
-  `tile_partition_covers` / `check_sound`
-  ([`TilePartition.lean`](../../lean-plow/Plow/TilePartition.lean)),
-  `occupancy_le_of_temporal_fit`
-  ([`Sram.lean`](../../lean-plow/Plow/Sram.lean)),
-  `protocol_covers_deps` / `happensBefore_acyclic`
-  ([`Protocol.lean`](../../lean-plow/Plow/Protocol.lean)),
-  `AddressMapSound`
-  ([`Memory.lean`](../../lean-plow/Plow/Memory.lean),
-  [`Verify.lean`](../../lean-plow/Plow/Verify.lean)),
-  `decodeProgram_encodeProgram`
-  ([`Wire.lean`](../../lean-plow/Plow/Wire.lean)),
-  `fits_of_check_ok`
-  ([`LdsFit.lean`](../../lean-plow/Plow/LdsFit.lean)).
-- Rust client: `call` / `require` / `query`, `Certificate`, `VerifyError`,
-  `is_binary_unusable`, `binary_available`, `locate_binary`
-  ([`crates/lean_verify/src/lib.rs`](../../crates/lean_verify/src/lib.rs)).
-- Payload bridge: `build_schedule_request`, `request_for_bucket`
-  ([`crates/schedule/src/lean_verify.rs`](../../crates/schedule/src/lean_verify.rs)).
-- plowc integration + errors: `PlowcError::LeanVerify` / `LeanVerifySpawn` /
-  `LeanVerifyDisabled`
-  ([`crates/plowc/src/lib.rs`](../../crates/plowc/src/lib.rs)); `--lean-verify`
-  flag ([`crates/plowc/src/main.rs`](../../crates/plowc/src/main.rs)).
-- Fusion rules with `; rule:` annotations:
-  [`crates/rewrite/src/egl/rules.egg`](../../crates/rewrite/src/egl/rules.egg).
-- Full design: [`docs/arch/08-formal-verification.md`](../arch/08-formal-verification.md).
+  `crates/plowc/src/qualify.rs` (`qualify_dir`).
+- Lean: `lean-plow/Plow/CLI/{Dispatch,Checkpoints,FastCheckD,Payload,Schema}.lean`,
+  `lean-plow/ProofAudit.lean`, `lean-plow/proof-manifest.json`.

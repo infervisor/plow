@@ -185,7 +185,7 @@ Kernels and objects:
 - AMD segment and adapter sources: `mla_fold_pf_mfma.h`, `mla_bmm_fp8_pf.h`, `mla_mha_pf.h`,
   `mla_pf_dense_gfx950.hip`, `mla_materialize_pack.hip`, `mla_materialized_opus.hip` (the only
   production body for op 127: a capability-checked gfx950 raw object), and `mla_sparse_adapter.hip`.
-- AMD pinned vendor `.co`: two MLA decode kernels (`agent-tools.md` §4).
+- AMD pinned vendor `.co`: two MLA decode kernels (`agent-tools.md` "AMD / GLM tools").
 - NVIDIA: `runtime/nvidia/op_mla.cuh`, which ports ops 50, 54 and 57 to sm_120a and is dispatched
   only in `interp_sm120.cu`. There is no sm_90a MLA arm.
 
@@ -916,7 +916,7 @@ LM ops in the interpreter object.
 Emitter: `crates/devgen/src/mm.rs`.
 KV / state class: none extra; media rows become ordinary KV rows. Media-derived ids make
 prefix-cache keys distinguish different media with the same text.
-Status: CUDA (gated by `mm_parity`, docs/bringup/agent-tools.md §5).
+Status: CUDA (gated by `mm_parity`, docs/bringup/agent-tools.md "Gates").
 
 ### Encoder overlay rows
 

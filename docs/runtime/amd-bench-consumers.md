@@ -8,49 +8,12 @@ surfaces have production-path replacements.
 The active script inventory is machine-readable in
 [`scripts/amd-bench-consumers.tsv`](../../scripts/amd-bench-consumers.tsv).
 Every entry has one primary class and an explicit binding: `checkpoint` or
-`synthetic`. Unbound zero-weight runs use the distinct `plowrt amd-probe`
-command; every timing line is labeled `SYNTHETIC DIAGNOSTIC` and is never a
-performance result. `amd-bench` now requires a checkpoint. Checkpoint-bound
-diagnostic invocations are unchanged.
+`synthetic`. Unbound zero-weight runs use `plowrt amd-probe`; every timing line
+is labeled `SYNTHETIC DIAGNOSTIC` and is never a performance result.
+`amd-bench` requires a checkpoint.
 Performance entries are legacy packet/object A/B probes, not served-model
 results. They remain only where `plowrt bench` cannot express the same
 compiled-width, separate-object, or per-rank semantics.
-
-The L1 pair is migrated: `l1_ab.sh` uses `amd-probe` for its explicitly
-synthetic packet/kernel timing, while `l1_tokens.sh` uses production
-`bench --token-audit` and verifies the exact packet, object directory,
-checkpoint, prompt, and complete output row before comparing arms.
-
-The batched correctness gates are migrated. `gate_batched.sh` compares exact
-ragged B=4/B=8 rows with their B=1 production streams, while
-`k3_batch_gate.sh` preserves its non-vacuous identical-stream and two-distinct-
-compiled-width checks under the TP8 lease. Both require full-width production
-dispatch diagnostics and verify packet, object-directory, checkpoint, prompt
-order, row count, and complete nonzero output streams before comparing tokens.
-`l2_place_ab.sh` likewise runs each explicitly paired packet/object placement
-arm through `bench --token-audit`, records production TPOT, and refuses missing
-artifact identities, incomplete/non-AMD work, scheduler loss, zero output, or
-any cross-arm token mismatch.
-`glm52_linfp8_stacked_coherence.sh` now forces every-token TP agreement and the
-per-dispatch counter audit through production `bench`. Each emit preserves its
-own `build.json`; the gate verifies that manifest's canonical path and checksum
-alongside prompt, output, packet, object-directory, checkpoint, and TP-width
-evidence. Missing or partial diagnostics are rejected.
-`k3_tp_equivalence.sh` also uses production `bench`: its decode-only prompt walk
-captures full rank-0 `act.logits` after every dispatch. The final prompt tick and
-the following requested decode ticks preserve the former TP1↔TP8 cosine/argmax
-comparison exactly; token audit and diagnostics bind every vector to its
-complete stream, TP policy, and packet/object/checkpoint identities.
-`walk_b16_ab.sh` retains its original device-ceiling boundary through bounded
-`decode_selections[].elapsed_ns`: after four full-width warmup dispatches it
-averages exactly 65 single-step `decode_step_batched_at` calls. Production mux
-reports must also prove the compiled width, exact per-slot prompt/stream classes,
-and hashed packet/build/weights/object/checkpoint identities.
-`sweep_batch_ceiling.sh` uses the same boundary for the B1/B2/B4/B8 context
-grid that anchors Plow/vLLM throughput work. Each row is now genuinely
-prefilled to the requested context before four warmup and N measured
-full-width calls; reports fail closed on partial batches, streams, diagnostics,
-or artifact identities.
 
 Run `scripts/check_amd_bench_consumers.sh` in repository checks. It fails when
 an active shell invocation is unclassified, when a class or binding is invalid,
@@ -58,26 +21,16 @@ when a synthetic consumer does not use `amd-probe`, when a checkpoint-bound
 consumer omits `--checkpoint`, or when a registry entry becomes stale.
 Comment-only references are not consumers.
 
-The current `performance` rows are a frozen grandfathered set. CI rejects a
-new performance row even when it is classified: new performance work must use
-`plowrt bench` or `plowrt serve`. The surviving rows require direct packet,
-object, compiled-width, or TP-identity semantics that production bench does
-not yet express.
+The `performance` rows are a frozen set. CI rejects a new performance row even
+when it is classified: new performance work uses `plowrt bench` or
+`plowrt serve`.
 
 ## Documentation inventory
 
-| document | class | disposition |
+| document | class | content |
 |---|---|---|
-| `docs/arch/06-runtime.md` | correctness | Lists `amd-bench` as diagnostic-only; production performance uses `bench`/`serve`. |
-| `docs/bringup/05-single-block-sweep.md` | correctness | Explains which block assets the diagnostic runner can execute. |
-| `docs/bringup/06-runtime-opt.md` | correctness | Keeps direct-engine sanity, prefill-sweep, and TP-audit guidance; all reported performance uses `bench`/`serve`. |
-| `docs/bringup/07-perf-campaign.md` | performance | Explicitly rejects `amd-bench` for campaign and headline results. |
-| `docs/bringup/agents/05-single-block-sweep.md` | correctness | Routes block numerics to the appropriate diagnostic harness. |
-| `docs/bringup/agents/06-runtime-opt.md` | performance | Defines the staged deprecation and production benchmark authority. |
-| `docs/bringup/agents/07-perf-campaign.md` | performance | Rejects direct-runner output as a correctness or campaign result. |
-
-Historical references under `perf-data/` are evidence records and are not
-rewritten by this migration.
+| `docs/arch/06-runtime.md` | correctness | `amd-bench` is diagnostic-only; performance uses `bench`/`serve`. |
+| `docs/bringup/06-runtime-opt.md` | performance | `plowrt bench` is the authority; `amd-bench` only for dumps and rank-by-rank TP diagnosis. |
 
 ## Production diagnostic coverage
 
