@@ -174,6 +174,12 @@ static __device__ __forceinline__ float sf_neg_log_exp1(unsigned long long seed,
     const float u = ((float)(z >> 40) + 0.5f) * (1.0f / 16777216.0f);
     return -logf(-logf(u));
 }
+/* The samplers' radix top-k (plow_config.h: packets with depth programs). Inlined into every
+ * interpreter it grew the frames of objects that never sample (Gemma 12B FP8 decode 224 -> 240 B,
+ * +2.7% step); 0 keeps the K-round selection alone. */
+#ifndef PLOW_NV_SAMPLE_RADIX
+#define PLOW_NV_SAMPLE_RADIX 1
+#endif
 /* Whether shared bytes up to `end` lie inside this launch's shared allocation (static + dynamic):
  * the radix top-k scratch sits past the row, so a large vocabulary or a narrow launch claim takes
  * the K-round selection instead. */
@@ -277,7 +283,7 @@ static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bflo
     unsigned short* L = (unsigned short*)(sv + 64);
     unsigned long long* tk_buf = (unsigned long long*)(((size_t)(L + vocab) + 15u) & ~(size_t)15u);
     unsigned* tk_ctl = (unsigned*)(tk_buf + 64);
-    const bool radix = smem_fits(tk_ctl + 4 + 256);
+    const bool radix = PLOW_NV_SAMPLE_RADIX && smem_fits(tk_ctl + 4 + 256);
     const unsigned ls = lstride ? lstride : vocab;
     for (unsigned r = slice; r < rows; r += nblk) {
         const unsigned K = min(min(topk[r], 64u), vocab);
@@ -772,7 +778,7 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
     float* L = sv + 64;
     unsigned long long* tk_buf = (unsigned long long*)(((size_t)(L + vocab) + 15u) & ~(size_t)15u);
     unsigned* tk_ctl = (unsigned*)(tk_buf + 64);
-    const bool radix = smem_fits(tk_ctl + 4 + 256);
+    const bool radix = PLOW_NV_SAMPLE_RADIX && smem_fits(tk_ctl + 4 + 256);
     const unsigned ls = lstride ? lstride : vocab;
     for (unsigned r = slice; r < rows; r += nblk) {
         /* A CFG pair (plow_asset::fish_depth GUIDE / FOLLOW bits): the guide row r samples

@@ -2211,6 +2211,11 @@ pub fn build_for_packet(
     });
     let mut manifest = build_with_packed_prefill(m, arch, lean, packed_prefill.is_some());
     manifest["runtime_requires"] = crate::dense_cublaslt::runtime_requires(m, sections);
+    // Only depth programs sample in-program (ops 219 / 221): `PLOW_NV_SAMPLE_RADIX`.
+    manifest["sample_radix"] = json!(sections.iter().any(|section| {
+        section.kind == packet::devbuild::SECT_METADATA
+            && section.name == plow_asset::fish_depth::SECTION
+    }));
     if let Some(section) = packed_prefill {
         let packed: plow_asset::packed_prefill::Manifest =
             serde_json::from_slice(&section.data).expect("emitted packed request manifest");
@@ -3211,6 +3216,12 @@ pub fn config_header(manifest: &Value) -> String {
             "#ifndef PLOW_SPEECH_CONV_POSTS\n#define PLOW_SPEECH_CONV_POSTS 0x{mask:x}ull\n#endif\n\n"
         ));
     }
+    if let Some(radix) = manifest.get("sample_radix").and_then(Value::as_bool) {
+        out.push_str(&format!(
+            "#ifndef PLOW_NV_SAMPLE_RADIX\n#define PLOW_NV_SAMPLE_RADIX {}\n#endif\n\n",
+            u8::from(radix)
+        ));
+    }
     if let Some(padded) = manifest
         .get("speech_conv_wide_padded")
         .and_then(Value::as_bool)
@@ -4126,7 +4137,7 @@ mod tests {
     }
 
     #[test]
-    fn speech_conv_wide_padded_reaches_the_header_only_when_known() {
+    fn speech_conv_wide_padded_and_sample_radix_reach_the_header_only_when_known() {
         let conv = |flags: u32| {
             let mut i = inst(DevOp::Conv1dF32, [0; 8]);
             i.j = [u32::MAX, flags];
@@ -4145,7 +4156,11 @@ mod tests {
         }
         let plain = build(&model(), "sm_90a");
         assert!(!config_header(&plain).contains("PLOW_SPEECH_CONV_WIDE_PADDED"));
-        for (key, define) in [("speech_conv_wide_padded", "PLOW_SPEECH_CONV_WIDE_PADDED")] {
+        assert!(!config_header(&plain).contains("PLOW_NV_SAMPLE_RADIX"));
+        for (key, define) in [
+            ("speech_conv_wide_padded", "PLOW_SPEECH_CONV_WIDE_PADDED"),
+            ("sample_radix", "PLOW_NV_SAMPLE_RADIX"),
+        ] {
             for on in [false, true] {
                 let mut man = plain.clone();
                 man[key] = on.into();
