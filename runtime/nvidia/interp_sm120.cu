@@ -272,12 +272,19 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #define PLOW_NV_GEMV_K8_OPS 7u
 #endif
 /* Widest activation rung the K-split walk takes: the decode object holds rungs <= 4 (1-tile arm
- * only), the _gw object 8..32. */
+ * only), the _gw object 8..32. _MAIN widens the decode object alone (its rungs past GV_MM_MAX). */
 #ifndef PLOW_NV_GEMV_K8_MAX_GW
 #define PLOW_NV_GEMV_K8_MAX_GW 32
 #endif
+#ifndef PLOW_NV_GEMV_K8_MAX_MAIN
+#define PLOW_NV_GEMV_K8_MAX_MAIN 8
+#endif
+#if PLOW_NV_GEMV_K8_MAX_MAIN != 8 && PLOW_NV_GEMV_K8_MAX_MAIN != 16 && PLOW_NV_GEMV_K8_MAX_MAIN != 32 && \
+    PLOW_NV_GEMV_K8_MAX_MAIN != 64
+#error "PLOW_NV_GEMV_K8_MAX_MAIN must be a K8 tile width (8, 16, 32 or 64): the arena is sized from it"
+#endif
 #ifndef PLOW_NV_GEMV_K8_MAX
-#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : 8)
+#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : PLOW_NV_SPEECH ? 8 : PLOW_NV_GEMV_K8_MAX_MAIN)
 #endif
 #ifndef PLOW_NV_GEMV_K8_MIN
 #define PLOW_NV_GEMV_K8_MIN 2

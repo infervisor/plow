@@ -2240,6 +2240,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_GEMV_PF_GLU_BYTES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMV_K8_MIN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMV_K8_MAX_GW", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_GEMV_K8_MAX_MAIN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMV_K8_UNB1", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMV_L2PF_BYTES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA_WPR_RB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
