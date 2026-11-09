@@ -2766,6 +2766,8 @@ pub struct GpuEngine {
     /// Wide-rung object selected for the widest decode chain.
     gemv_wide: Option<Arc<decode_object::BoundDecodeObject>>,
     gemv_wide_modules: [Option<Arc<decode_object::BoundDecodeObject>>; 2],
+    /// The `_gw` object at its full claim for depth programs below its wide-arm rung.
+    depth_gw: Option<(usize, Arc<decode_object::BoundDecodeObject>)>,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, tensor-table base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
@@ -2821,7 +2823,7 @@ pub struct GpuEngine {
     /// Views never free, so this owner must outlive them; both live here, and a
     /// `View`'s Drop is a no-op, so field drop order cannot matter. The Vmm
     /// arm's Drop unmaps and releases its physical chunks.
-    _weight_slab: WeightSlab,
+    _weight_slab: Arc<WeightSlab>,
     d_inst: DeviceMem,
     /// Owner of the decode counter+cursor allocation. `d_ctr` and the decode
     /// GQ cursor are aliased **views** into it (never freed by their own
@@ -2894,6 +2896,7 @@ pub struct GpuEngine {
     vmm_attached: Vec<u32>,
     /// Cache rows the next `begin_slot` keeps (a retained session prefix); 0 = start cold.
     resume_rows: Vec<u32>,
+    slot_prefixes: prefix::SlotPrefixes,
     /// The packet's declared caches: what a KV image of one slot carries (docs/arch/30 §5).
     kv_image: Option<plow_asset::live_kv::Manifest>,
     /// Digest of the caches' semantic header without the checkpoint (`plow_asset::kv_image`):
@@ -2917,11 +2920,15 @@ pub struct GpuEngine {
     /// GENERATED blocks into the prefix cache, so a follow-up turn embedding
     /// this turn's output attaches instead of re-prefilling it.
     seq_tokens: Vec<Vec<u32>>,
+    speech_identities: prefix::SpeechIdentities,
+    speech_prefix: Vec<Option<Arc<[u32]>>>,
+    staged_speech_prefix: Vec<Option<Arc<[u32]>>>,
     /// A prompt's prefix-cache key staged for the next attach of that slot (DP router hashes).
     staged_prefix: Vec<Option<crate::memory::vmm::PrefixKey>>,
     /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
     /// prefill chunk never attaches a cached prefix.
     prefix_attach_off: Vec<bool>,
+    prefix_needs_row_keys: bool,
     /// The slot was seated from a KV image ([`Self::import_kv_image`]): its rings hold only the
     /// image's window, so it publishes no boundary to the prefix cache until `begin_slot`.
     publish_off: Vec<bool>,
@@ -3862,6 +3869,7 @@ struct PackedTokenReq<'a> {
     tokens: &'a [u32],
     c0: usize,
     prompt_len: usize,
+    embedding_token: Option<u32>,
 }
 
 /// Per-row device sampling request (plan stage 4). `temp <= 0` is greedy
@@ -4480,6 +4488,8 @@ impl GpuEngine {
             blob.with_packet_view(|p| pack.validate(p, live))
                 .map_err(RuntimeError::Rejected)?;
         }
+        let keyed_overlays = crate::tts::SpeechContract::load(assets_dir)?
+            .is_some_and(|c| c.depth && c.slot_prefix_reuse);
         let prefix_layout = crate::memory::vmm::VmmOps::granularity(be.as_ref())
             .ok()
             .and_then(|granularity| {
@@ -4492,6 +4502,7 @@ impl GpuEngine {
                     live_kv_manifest
                         .as_ref()
                         .map_or(Some(false), |m| m.full_rows_interleaved()),
+                    keyed_overlays,
                 )
             });
         let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());
@@ -7999,6 +8010,9 @@ impl GpuEngine {
                 gemv_wide.as_ref().map(|(_, (_, full))| Arc::clone(full)),
                 gemv_wide64.as_ref().map(|(_, full)| Arc::clone(full)),
             ],
+            depth_gw: gemv_wide
+                .as_ref()
+                .map(|(min_rows, (_, full))| (*min_rows, Arc::clone(full))),
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
@@ -8018,7 +8032,7 @@ impl GpuEngine {
             ctr_bytes,
             cursor_bytes,
             devp,
-            _weight_slab: weight_slab,
+            _weight_slab: Arc::new(weight_slab),
             d_inst,
             _ctr_block: ctr_block,
             d_ctr,
@@ -8050,6 +8064,7 @@ impl GpuEngine {
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
             resume_rows: vec![0; batch],
+            slot_prefixes: prefix::SlotPrefixes::new(batch),
             kv_image,
             kv_image_key,
             rewind_snapshots: (0..batch).map(|_| None).collect(),
@@ -8059,8 +8074,12 @@ impl GpuEngine {
             kv_admission_epoch: 0,
             kv_pressure_events: 0,
             seq_tokens: vec![Vec::new(); batch],
+            speech_identities: prefix::SpeechIdentities::new(vocab),
+            speech_prefix: vec![None; batch],
+            staged_speech_prefix: vec![None; batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
+            prefix_needs_row_keys: blob.tensors.iter().any(|t| t.name == "in.encoder_overlay"),
             publish_off: vec![false; batch],
             session_end: vec![false; batch],
             disconnected: vec![false; batch],
@@ -8141,12 +8160,16 @@ impl GpuEngine {
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
-        engine.fish = fish_depth::FishDepth::load_if_present(&engine, &blob, &raw, assets_dir)?;
+        engine.fish = fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
+        engine.speech_identities = prefix::SpeechIdentities::new(engine.token_input_vocab());
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
-        engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
-        if engine.token_batch.is_some() {
+        if token_batch::CudaTokenBatch::eligible(&engine) {
             engine.riders = riders::Riders::load(&engine, &blob)?;
+            engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
+            if engine.token_batch.is_none() {
+                engine.riders = None;
+            }
         }
         if engine.recurrent_initstate.is_some() {
             let profile = interpreter_profile(engine.be.compute_capability());
@@ -8752,7 +8775,7 @@ impl GpuEngine {
     /// reset — `in.kvlen` bounds what the attention reads, so rewinding
     /// `pos[b]` to 0 makes the slot's old cache rows unreachable.
     pub fn begin_slot(&mut self, b: usize, total: usize) -> Result<()> {
-        let keep = self.resume_rows.get_mut(b).map_or(0, std::mem::take);
+        let mut keep = self.resume_rows.get_mut(b).map_or(0, std::mem::take);
         if b >= self.batch {
             return Err(RuntimeError::Rejected(format!(
                 "slot {b} out of range (engine batch {})",
@@ -8765,7 +8788,13 @@ impl GpuEngine {
                 self.max_ctx
             )));
         }
+        if keep > 0 && !self.can_resume_slot(b, keep as usize) {
+            keep = 0;
+        }
+        let attach_off = self.prefix_attach_off[b];
+        self.slot_prefixes.clear(b);
         self.reset_packed_admission(b);
+        self.prefix_attach_off[b] = attach_off;
         self.state_drop(b);
         // A retirement deferred behind a step that then failed (queue cleared) must not fire
         // against the request seated here now.
@@ -8801,6 +8830,7 @@ impl GpuEngine {
         let t_publish = t0.map(|t| t.elapsed());
         self.pos[b] = keep;
         self.vmm_attached[b] = 0;
+        self.speech_prefix[b] = self.staged_speech_prefix[b].take();
         if let Some(v) = &self.vmm {
             self.vmm_active[b] = true;
             self.seq_tokens[b].clear();
@@ -8890,18 +8920,75 @@ impl GpuEngine {
         self.vmm.is_none() && self.recurrent.is_none()
     }
 
+    fn live_slot_prefix_supported(&self) -> bool {
+        self.resume_ring_slack.is_none()
+            && self
+                .vmm
+                .as_ref()
+                .is_some_and(|v| v.kv.is_none() && v.rings.is_some())
+    }
+
+    fn slot_prefix_backing(&self, b: usize) -> Option<u64> {
+        self.vmm.as_ref()?.rings.as_ref()?.residency(b)
+    }
+
+    pub fn reuse_slot_prefix(&mut self, b: usize, keys: &[u64]) -> usize {
+        let backing = self.slot_prefix_backing(b);
+        let rows = self.slot_prefixes.take(b, keys, backing);
+        let tail = (self.pf_compact() && self.packed_padding_limit().is_none())
+            .then(|| self.prefill.first().map(|p| p.t as usize))
+            .flatten();
+        let rows = prefix::prefix_with_tail_room(rows, self.max_ctx, tail);
+        if !self.slot_prefix_reuse_supported() {
+            return 0;
+        }
+        if self.can_resume_slot(b, rows) {
+            rows
+        } else {
+            0
+        }
+    }
+
+    pub fn keep_slot_prefix(&mut self, b: usize, epoch: u64, keys: Vec<u64>) {
+        if epoch == self.slot_prefix_epoch()
+            && self.slot_prefix_reuse_supported()
+            && self.pos[b] as usize >= keys.len().saturating_sub(1)
+        {
+            let backing = self.slot_prefix_backing(b);
+            if self.live_slot_prefix_supported() {
+                if backing.is_none() {
+                    return;
+                }
+                let rings = self.vmm.as_mut().unwrap().rings.as_mut().unwrap();
+                let (recycle, bounded, cap) = rings.retention();
+                if recycle && !bounded {
+                    rings.enable_bounded_park(cap);
+                }
+            }
+            self.slot_prefixes.publish(b, keys, backing);
+        }
+    }
+
+    pub fn forget_slot_prefix(&mut self, b: usize) {
+        self.slot_prefixes.clear(b);
+    }
+
+    pub fn slot_prefix_epoch(&self) -> u64 {
+        self.slot_prefixes.epoch
+    }
+
+    pub fn slot_prefix_reuse_supported(&self) -> bool {
+        (self.slot_resume_supported()
+            || (self.recurrent.is_none() && self.live_slot_prefix_supported()))
+            && self.resume_ring_slack.is_none()
+            && !self.drain_before_unmap
+    }
+
     /// Make the next `begin_slot(b, ..)` keep slot `b`'s first `rows` cache rows (a retained
     /// session prefix) and start its sequence there. Returns the rows kept: `rows`, or 0 (the
     /// sequence starts cold) unless the slot still holds that many rows.
     pub fn resume_slot(&mut self, b: usize, rows: usize) -> usize {
-        let ok = self.slot_resume_supported()
-            && b < self.batch
-            && rows <= self.pos[b] as usize
-            && rows < self.max_ctx
-            && self
-                .resume_ring_slack
-                .is_none_or(|s| self.pos[b].max(self.kv_hw[b]) as usize - rows <= s as usize)
-            && self.pipe.as_ref().is_none_or(|p| !p.holds(b));
+        let ok = self.can_resume_slot(b, rows);
         if let Some(r) = self.resume_rows.get_mut(b) {
             *r = if ok { rows as u32 } else { 0 };
         }
@@ -8910,6 +8997,22 @@ impl GpuEngine {
         } else {
             0
         }
+    }
+
+    fn can_resume_slot(&self, b: usize, rows: usize) -> bool {
+        (self.slot_resume_supported()
+            || (self.recurrent.is_none() && self.live_slot_prefix_supported()))
+            && b < self.batch
+            && (!self.live_slot_prefix_supported() || self.slot_prefix_backing(b).is_some())
+            && self
+                .slot_prefixes
+                .backing_matches(b, self.slot_prefix_backing(b))
+            && rows <= self.pos[b] as usize
+            && rows < self.max_ctx
+            && self
+                .resume_ring_slack
+                .is_none_or(|s| self.pos[b].max(self.kv_hw[b]) as usize - rows <= s as usize)
+            && self.pipe.as_ref().is_none_or(|p| !p.holds(b))
     }
 
     /// Slot `b`'s current sequence belongs to a session (`X-Session-Id`): the VMM prefix cache
@@ -8941,6 +9044,10 @@ impl GpuEngine {
     /// Step entry points report their outcome: a failed step may leave kernels queued.
     fn note_step_result(&mut self, failed: bool) {
         self.drain_before_unmap |= failed;
+        if failed {
+            self.slot_prefixes.clear_all();
+            self.forget_depth_memory();
+        }
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
@@ -8952,6 +9059,7 @@ impl GpuEngine {
         // Rows not keyed by their ids (speech frame rows) are never published.
         let cache_output = cache_output && !self.prefix_attach_off[b];
         self.staged_prefix[b] = None;
+        self.staged_speech_prefix[b] = None;
         self.prefix_attach_off[b] = false;
         if let Some(p) = self.pipe.as_mut() {
             if p.queue.defer_retire(b, cache_output) {
@@ -9001,7 +9109,13 @@ impl GpuEngine {
             kv.demote_session(b, signal);
         }
         self.trace_finish(b);
-        self.pos[b] = 0;
+        // Idle decode lanes must write past the retained prefix, including parked live slots.
+        self.pos[b] = if self.live_slot_prefix_supported() && self.slot_prefix_reuse_supported() {
+            self.slot_prefixes
+                .retained_rows(b, self.slot_prefix_backing(b)) as u32
+        } else {
+            0
+        };
         self.vmm_attached[b] = 0;
         // A retired row decodes as an idle lane from position 0: a stale learned-position base
         // above it traps `EmbedPosBf16` (`in.pos_base`, speech packets). The mux writes bases in
@@ -9029,6 +9143,7 @@ impl GpuEngine {
         self.vmm.as_ref().unwrap().begin_seq(b);
         self.seq_tokens[b].clear();
         self.vmm_active[b] = false;
+        self.speech_prefix[b] = None;
     }
 
     fn reset_packed_admission(&mut self, b: usize) {
@@ -9076,10 +9191,17 @@ impl GpuEngine {
             None => return Err(RuntimeError::Rejected(format!("slot {b} out of range"))),
             _ => {}
         }
+        let identities = self.staged_speech_prefix[b].clone();
+        let cache_prompt = identities.as_deref().unwrap_or(prompt);
+        let keyed = !self.prefix_needs_row_keys || identities.is_some();
         // In-flight sharing: another slot is prefilling this prompt's shared prefix. Wait
         // for its whole-block checkpoint (one attach + the tail) instead of recomputing the
         // shared rows beside it; bounded, and released when the owner publishes or retires.
-        if self.vmm_prefix_enabled() && crate::config::RuntimeConfig::get().prefix_inflight_wait() {
+        if self.vmm_prefix_enabled()
+            && keyed
+            && !self.prefix_attach_off[b]
+            && crate::config::RuntimeConfig::get().prefix_inflight_wait()
+        {
             // One deadline for both waits: alternating them must not restart either.
             let since = match self.packed_admission[b] {
                 PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
@@ -9088,7 +9210,7 @@ impl GpuEngine {
                 _ => std::time::Instant::now(),
             };
             if since.elapsed() < INFLIGHT_WAIT_LIMIT {
-                if let Some((owner, rows)) = self.vmm_inflight_prefix(b, prompt) {
+                if let Some((owner, rows)) = self.vmm_inflight_prefix(b, cache_prompt) {
                     if self.packed_admission[b] != PackedAdmission::WaitingPrefix(since) {
                         tracing::info!(
                             slot = b,
@@ -9103,7 +9225,7 @@ impl GpuEngine {
                 }
             }
         }
-        if self.vmm_prefix_enabled() && self.pos[b] == 0 && !self.prefix_attach_off[b] {
+        if self.vmm_prefix_enabled() && keyed && self.pos[b] == 0 && !self.prefix_attach_off[b] {
             let since = match self.packed_admission[b] {
                 PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
                     since
@@ -9113,7 +9235,16 @@ impl GpuEngine {
             let restoring = since.elapsed() < RESTORE_WAIT_LIMIT
                 && self
                     .vmm_prefix()
-                    .and_then(|(_, kv)| kv.attach_handle(prompt, self.staged_prefix[b].as_ref()))
+                    .and_then(|(_, kv)| {
+                        kv.attach_handle(
+                            cache_prompt,
+                            if identities.is_some() {
+                                None
+                            } else {
+                                self.staged_prefix[b].as_ref()
+                            },
+                        )
+                    })
                     .is_some_and(|handle| self.blocks_restoring(handle));
             if restoring {
                 self.packed_admission[b] = PackedAdmission::WaitingRestore(since);
@@ -9125,8 +9256,11 @@ impl GpuEngine {
         // `begin_slot` resets the slot's admission state, staged key included: carry the key
         // across it to the attach (a failed attempt drops it; the mux keeps its own copy).
         let staged = self.staged_prefix[b].take();
+        // So is a refused attach (`set_prefix_attach`): rows not keyed by their ids.
+        let attach_off = self.prefix_attach_off[b];
         let started = (|| {
             self.begin_slot(b, total)?;
+            self.prefix_attach_off[b] = attach_off;
             if let Some(t) = host_t {
                 marks[0] = t.elapsed().as_nanos() as u64;
             }
@@ -9345,9 +9479,24 @@ impl GpuEngine {
         specs: Option<&[DevSample]>,
         toks: &mut Vec<u32>,
     ) -> Result<()> {
-        let r = self.step_slots_sampled_unchecked(feeds, specs, toks);
+        let r = self.step_slots_sampled_unchecked(feeds, specs, toks, true);
         self.note_step_result(r.is_err());
         r
+    }
+
+    /// One decode step whose tokens nobody reads: every fed row's token comes from the depth
+    /// stage launched next on the same stream ([`Self::fish_depth_step`]), whose synchronize is
+    /// the tick's only one. `toks` gets a 0 per feed. Callers must run that depth step (or
+    /// [`Self::sync_stream`]) before the next host write to the step's pinned staging.
+    pub fn step_slots_unread(&mut self, feeds: &[(usize, u32)], toks: &mut Vec<u32>) -> Result<()> {
+        let r = self.step_slots_sampled_unchecked(feeds, None, toks, false);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    /// Wait for the engine stream (after [`Self::step_slots_unread`] when no depth step follows).
+    pub fn sync_stream(&mut self) -> Result<()> {
+        self.be.stream_synchronize(&self.stream)
     }
 
     fn step_slots_sampled_unchecked(
@@ -9355,6 +9504,7 @@ impl GpuEngine {
         feeds: &[(usize, u32)],
         specs: Option<&[DevSample]>,
         toks: &mut Vec<u32>,
+        readback: bool,
     ) -> Result<()> {
         toks.clear();
         if feeds.is_empty() {
@@ -9575,15 +9725,32 @@ impl GpuEngine {
         // Token readback: `in.ids` (rewritten by `ARGMAX_FIN`, or by the
         // device sampler above) round-trips through the pinned ids section.
         // SAFETY: as the uploads — the slab outlives the synchronize.
-        unsafe {
-            let base = self.devp[self.t_ids].base;
-            self.be
-                .memcpy_dtoh_async(self.stage.section_mut(0), base, &self.stream)?;
+        if readback {
+            unsafe {
+                let base = self.devp[self.t_ids].base;
+                self.be
+                    .memcpy_dtoh_async(self.stage.section_mut(0), base, &self.stream)?;
+            }
         }
         if let Some(t) = &self.timing {
             self.be.event_record(&t.ev[3], &self.stream)?;
         }
         let t_submit = timed.then(now);
+        if !readback {
+            toks.resize(feeds.len(), 0);
+            for &(b, tok) in feeds {
+                self.pos[b] += 1;
+                if self.vmm_prefix_enabled() {
+                    self.seq_tokens[b].push(tok);
+                }
+            }
+            if let Some(v) = &self.vmm {
+                for &(b, _) in feeds {
+                    v.advise(b, self.pos[b]);
+                }
+            }
+            return Ok(());
+        }
 
         // The step's single sync point (the whole queue retires in order).
         // A failure here is where an async kernel trap surfaces — capture the
@@ -12463,7 +12630,7 @@ impl GpuEngine {
         // VMM: first chunk of a fresh sequence consults the prefix cache —
         // a hit shares the whole-block prefix and moves the frontier there.
         if self.pos[b] == 0 && self.vmm_prefix_enabled() && !self.prefix_attach_off[b] {
-            self.vmm_attach(b, prompt, None)?;
+            self.attach_prompt(b, prompt)?;
         }
         let c0 = self.pos[b] as usize;
         debug_assert!(c0 < n, "prefill_chunk past the prompt end");
@@ -12475,8 +12642,7 @@ impl GpuEngine {
         let real = self.run_one_prefill_chunk(f_pf, b, prompt, c0, cap)?;
         self.pos[b] = (c0 + real) as u32;
         if self.kv_blocks().is_some_and(|bs| bs.captures_state()) {
-            self.seq_tokens[b].clear();
-            self.seq_tokens[b].extend_from_slice(&prompt[..c0 + real]);
+            self.record_prompt_prefix(b, prompt, c0 + real);
             self.state_capture_publish(b, n);
         }
 
@@ -12488,8 +12654,7 @@ impl GpuEngine {
         // The consumed prompt also seeds the slot's row-token record so the
         // sequence's GENERATED blocks can publish at the next begin_slot.
         if self.vmm_prefix_enabled() {
-            self.seq_tokens[b].clear();
-            self.seq_tokens[b].extend_from_slice(prompt);
+            self.record_prompt_prefix(b, prompt, prompt.len());
             self.vmm_publish(b, n.saturating_sub(1) as u32);
             self.vmm_prefill_done(b);
         }
@@ -13210,7 +13375,7 @@ impl GpuEngine {
                 .graph_capture_hoisting(&capture_stream, &untouched, || {
                     for (seg, &class) in seg_class.iter().enumerate() {
                         let seg = seg + range.start;
-                        if let Some(r) = rider_route {
+                        if let Some(r) = rider_route.filter(|_| seg > range.start) {
                             r.launch_captured(&self.be, bi, seg, &capture_stream)?;
                         }
                         if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
@@ -13253,6 +13418,10 @@ impl GpuEngine {
                             &mut params,
                             Some(&capture_stream),
                         )?;
+                    }
+                    // A window ending at attention must include that segment's rider.
+                    if let Some(r) = rider_route.filter(|_| !range.is_empty()) {
+                        r.launch_captured(&self.be, bi, range.end, &capture_stream)?;
                     }
                     Ok(())
                 })?
@@ -14057,10 +14226,10 @@ impl GpuEngine {
             let mut routed_index = 0;
             if !seg_time_probe && rt.nv.pf_seg_graph {
                 let tensors = arg.tensors as u64;
-                if riding && !routed && self.pf_seg_window.is_none() {
-                    let segments = seg_class.len();
-                    self.ensure_seg_graph_with(bi, &arg, 0..segments, true)?;
-                    let key = (bi, tensors, 0, segments | (1 << 31));
+                if riding && !routed {
+                    let range = self.pf_seg_window.clone().unwrap_or(0..seg_class.len());
+                    let key = (bi, tensors, range.start, range.end | (1 << 31));
+                    self.ensure_seg_graph_with(bi, &arg, range, true)?;
                     let graph = self.seg_graphs.get(&key).expect("built");
                     self.be.graph_launch(graph, &self.stream)?;
                     if synchronize {
@@ -14140,7 +14309,7 @@ impl GpuEngine {
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             let window = self.pf_seg_window.clone().unwrap_or(0..seg_class.len());
             for (seg, &cls) in seg_class.iter().enumerate() {
-                if riding {
+                if riding && seg > window.start && seg <= window.end {
                     let riders = self.riders.as_ref().expect("riding");
                     riders.launch_after(&self.be, bi, seg, &self.stream)?;
                 }
@@ -14501,6 +14670,7 @@ impl GpuEngine {
                         tokens,
                         c0: r.c0,
                         prompt_len: r.prompt.len(),
+                        embedding_token: None,
                     })
                 })
                 .collect::<Result<smallvec::SmallVec<[_; 16]>>>()?;
@@ -14522,8 +14692,7 @@ impl GpuEngine {
             // which checks its frontier against it.
             if self.vmm_prefix_enabled() {
                 let end = r.c0 + r.len;
-                self.seq_tokens[r.slot].clear();
-                self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
+                self.record_prompt_prefix(r.slot, r.prompt, end);
                 self.state_capture_publish(r.slot, r.prompt.len());
             }
             if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
@@ -14703,7 +14872,7 @@ impl GpuEngine {
             let mut cur = 0usize;
             for r in reqs {
                 for (k, &token) in r.tokens.iter().enumerate() {
-                    self.pf_ids[cur + k] = token as i32;
+                    self.pf_ids[cur + k] = r.embedding_token.unwrap_or(token) as i32;
                     self.pf_pos[cur + k] = (r.c0 + k) as i32;
                     pb.slot_buf[cur + k] = r.slot as i32;
                 }
@@ -15217,6 +15386,7 @@ impl GpuEngine {
     /// DIAGNOSTIC (`PLOW_NV_DUMP_ACT`, see the knob): partial chains `0..=seg(pc)` of a packed
     /// launch, each followed by a dump of the matching request's activation rows. Every partial
     /// chain restarts at the embedding, so the full chain that follows recomputes the same state.
+    /// Prompt lengths may be comma-separated; dumps include all real rows and their request spans.
     #[allow(clippy::too_many_arguments)]
     fn dump_prefill_acts(
         &mut self,
@@ -15237,17 +15407,28 @@ impl GpuEngine {
         let Some((len, pcs)) = spec.split_once(':') else {
             return Ok(());
         };
-        let Ok(len) = len.parse::<usize>() else {
+        let Some(lengths) = len
+            .split(',')
+            .map(|s| s.trim().parse::<usize>().ok())
+            .collect::<Option<Vec<_>>>()
+        else {
             return Ok(());
         };
         let mut q0 = 0usize;
         let Some(r) = reqs.iter().find(|r| {
             q0 += r.tokens.len();
-            r.prompt_len == len
+            lengths.contains(&r.prompt_len)
         }) else {
             return Ok(());
         };
+        let len = r.prompt_len;
         let (row0, rows) = (q0 - r.tokens.len(), r.tokens.len());
+        let mut packed_row = 0;
+        let requests: Vec<_> = reqs.iter().map(|r| {
+            let row = packed_row;
+            packed_row += r.tokens.len();
+            serde_json::json!({"slot": r.slot, "row0": row, "rows": r.tokens.len(), "c0": r.c0, "prompt_len": r.prompt_len})
+        }).collect();
         let max_t = self.prefill.iter().map(|b| b.t as u64).max().unwrap_or(1);
         for pc in pcs.split(',').filter_map(|p| p.parse::<usize>().ok()) {
             let Some(seg) = self.prefill[bi]
@@ -15287,10 +15468,10 @@ impl GpuEngine {
                 let Some(i) = self.handle_of(name) else {
                     continue;
                 };
-                // Rows `[0, row0 + rows)` at the tensor's widest stride: a layer narrower than
+                // All real rows at the tensor's widest stride: a layer narrower than
                 // the tensor's row width packs its rows densely.
                 let row_bytes = self.devp[i].len / max_t;
-                let mut buf = vec![0u8; (row_bytes * (row0 + rows) as u64) as usize];
+                let mut buf = vec![0u8; (row_bytes * total as u64) as usize];
                 self.be.download(&self.devp[i], 0, &mut buf)?;
                 index.push(serde_json::json!({
                     "name": name, "offset": data.len(), "row_bytes": row_bytes, "rows": rows,
@@ -15303,6 +15484,7 @@ impl GpuEngine {
             let meta = serde_json::json!({
                 "prompt_len": len, "pc": pc, "segment": seg, "segment_sites": self.prefill[bi].segment_sites[seg],
                 "bucket_t": self.prefill[bi].t, "c0": r.c0, "rows": rows, "row0": row0, "tensors": index,
+                "capture_rows": total, "packed_requests": &requests,
             });
             std::fs::write(stem.with_extension("json"), meta.to_string())
                 .map_err(|e| RuntimeError::Rejected(e.to_string()))?;

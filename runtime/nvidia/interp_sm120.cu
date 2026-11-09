@@ -272,12 +272,19 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #define PLOW_NV_GEMV_K8_OPS 7u
 #endif
 /* Widest activation rung the K-split walk takes: the decode object holds rungs <= 4 (1-tile arm
- * only), the _gw object 8..32. */
+ * only), the _gw object 8..32. _MAIN widens the decode object alone (its rungs past GV_MM_MAX). */
 #ifndef PLOW_NV_GEMV_K8_MAX_GW
 #define PLOW_NV_GEMV_K8_MAX_GW 32
 #endif
+#ifndef PLOW_NV_GEMV_K8_MAX_MAIN
+#define PLOW_NV_GEMV_K8_MAX_MAIN 8
+#endif
+#if PLOW_NV_GEMV_K8_MAX_MAIN != 8 && PLOW_NV_GEMV_K8_MAX_MAIN != 16 && PLOW_NV_GEMV_K8_MAX_MAIN != 32 && \
+    PLOW_NV_GEMV_K8_MAX_MAIN != 64
+#error "PLOW_NV_GEMV_K8_MAX_MAIN must be a K8 tile width (8, 16, 32 or 64): the arena is sized from it"
+#endif
 #ifndef PLOW_NV_GEMV_K8_MAX
-#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : 8)
+#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : PLOW_NV_SPEECH ? 8 : PLOW_NV_GEMV_K8_MAX_MAIN)
 #endif
 #ifndef PLOW_NV_GEMV_K8_MIN
 #define PLOW_NV_GEMV_K8_MIN 2
@@ -1272,6 +1279,11 @@ extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_O
 /* The speech arms a PLOW_SPEECH_OPS object carries (bit op - 163). The mask is not part of the
  * pairing hash, so the loader checks every sidecar's speech ops against it before launching.
  * Absent on an all-arms object (unconstrained), like the pairing stamp. */
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+/* Speech-op semantics beyond the op set (packet_exec::speech_features): bit 0 = conv flag bit 21
+ * (ragged wgmma tiles). A packet relying on a bit is refused by an object without it. */
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 1u;
+#endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SPEECH_OPS >> 32);
@@ -2166,7 +2178,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                          in->i[1], in->i[2], slice, nblk);
 #else
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
-                          in->i[1], in->i[2], in->i[7] != 0u, slice, nblk);
+                          in->i[1], in->i[2], in->i[7] != 0u, slice, nblk, arena);
 #endif
         break;
     case PLOW_DOP_SAMPLE_SMALL_F32:
@@ -5287,7 +5299,7 @@ extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_smem) =
          : PLOW_NV_ARENA_FLOATS) * sizeof(float);
 #endif
 #endif
-#if PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
+#if (PLOW_NV_GEMMA || PLOW_NV_HOPPER) && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
 /* Unified token batch on sm_90a: the decode rows riding a packed prefill launch (rows
  * [0, rows) of its Q/O) attend through split-KV flash decode over a slot map, then merge into
  * O, while the launch's prefill attention runs only the prefill requests. Layout `PlowRiderAttn`
@@ -5303,7 +5315,7 @@ struct PlowRiderAttn {
     const int* kv_len;           /* [rows] */
     const int* slot;             /* [rows] physical KV slot */
     __nv_bfloat16* out;          /* [rows][n_head][hd] */
-    const unsigned* dynamic;     /* non-null (a captured launch): rows, nsplit hd256, nsplit hd512 */
+    const unsigned* dynamic;     /* ABI 2: rows, nsplit hd256, nsplit hd512, nsplit hd128 */
     unsigned rows, n_head, n_kv_head, kv_stride, window, nsplit, kv_mask, hd;
     float scale;
     unsigned pad;
@@ -5312,13 +5324,20 @@ __device__ __forceinline__ unsigned rider_rows(const PlowRiderAttn& a) {
     return a.dynamic ? a.dynamic[0] : a.rows;
 }
 __device__ __forceinline__ unsigned rider_nsplit(const PlowRiderAttn& a) {
-    return a.dynamic ? a.dynamic[a.hd == 512u ? 2 : 1] : a.nsplit;
+    return a.dynamic ? a.dynamic[a.hd == 128u ? 3 : (a.hd == 512u ? 2 : 1)] : a.nsplit;
 }
 #define PLOW_RIDER_FLASH(DD, GG)                                                             \
     d_flash_decode<DD, GG, (bool)PLOW_FP8_KV, false, true, 2>(                                  \
         a.opart, a.mlpart, a.q, (const __nv_bfloat16*)a.k, (const __nv_bfloat16*)a.v, a.kv_len, \
         rider_rows(a), a.n_head, a.n_kv_head, a.kv_stride, a.window, a.scale, rider_nsplit(a),  \
         a.kv_mask, blockIdx.x, gridDim.x, arena, 0u, a.k_scale, a.v_scale, a.slot)
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
+    PLOW_SYM(plow_sm120_rider_flash128)(const __grid_constant__ PlowRiderAttn a) {
+    extern __shared__ float arena[];
+    if (a.hd != 128u || !a.n_kv_head || !a.n_head || a.n_head % a.n_kv_head ||
+        (a.n_head / a.n_kv_head) % 2u) __trap();
+    PLOW_RIDER_FLASH(128, 2);
+}
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
     PLOW_SYM(plow_sm120_rider_flash256)(const __grid_constant__ PlowRiderAttn a) {
     extern __shared__ float arena[];
@@ -5335,7 +5354,9 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_rider_merge)(const __grid_constant__ PlowRiderAttn a) {
     const unsigned rows = rider_rows(a), nsplit = rider_nsplit(a);
-    if (a.hd == 256u)
+    if (a.hd == 128u)
+        d_flash_merge<128>(a.out, a.opart, a.mlpart, rows, a.n_head, nsplit, blockIdx.x, gridDim.x);
+    else if (a.hd == 256u)
         d_flash_merge<256>(a.out, a.opart, a.mlpart, rows, a.n_head, nsplit, blockIdx.x, gridDim.x);
     else if (a.hd == 512u)
         d_flash_merge<512>(a.out, a.opart, a.mlpart, rows, a.n_head, nsplit, blockIdx.x, gridDim.x);
@@ -5347,11 +5368,13 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     ((PLOW_FP8_KV && FA_RG8S_SMEM_FLOATS(D) > (unsigned)FA_DEC_SMEM_FLOATS(D, GF) ? FA_RG8S_SMEM_FLOATS(D) \
                                                                                   : (unsigned)FA_DEC_SMEM_FLOATS(D, GF)) * \
      sizeof(float))
+extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem128) = PLOW_RIDER_SMEM(128, 2);
 extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem256) = PLOW_RIDER_SMEM(256, 2);
 extern "C" __device__ unsigned PLOW_SYM(plow_rider_smem512) = PLOW_RIDER_SMEM(512, PLOW_NV_FA_GF_FULL);
 #undef PLOW_RIDER_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_rider_fp8_kv) = PLOW_FP8_KV;
 extern "C" __device__ unsigned PLOW_SYM(plow_rider_gf512) = PLOW_NV_FA_GF_FULL;
+extern "C" __device__ unsigned PLOW_SYM(plow_rider_abi) = 2;
 #endif
 /* Packed recurrent-state gather / scatter (exec/gpu.rs launch_prefill_chain): request i's slot
  * state (slot = table[tstride * i + tslot], `units` 16-byte units per state) copies to or from

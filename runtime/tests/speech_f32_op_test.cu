@@ -617,30 +617,42 @@ static void st_inst(PlowDevInst& in, unsigned z, unsigned src, unsigned state, u
     in.i[0] = B; in.i[1] = L; in.i[2] = N; in.i[3] = C; in.i[4] = Cz; in.i[5] = zc0; in.i[6] = src_stride;
     in.i[7] = mode; in.fj[1].u = slots;
 }
+static const PlowDevInst* g_chain_pre;
+static void g_stream_tail_chain(const PlowDevInst* in, uint32_t b, uint32_t nb, void* const* t, PlowCpuCtx* ctx) {
+    g_stream_tail_f32(g_chain_pre, b, nb, t, ctx);
+    g_stream_tail_f32(in, b, nb, t, ctx);
+}
 static void t_stream_tail() {
-    struct G { const char* name; unsigned L, N, C, Cz, zc0, src_stride; };
-    for (const G& g : {G{"StreamTailF32 gather window zc0=9", 5, 7, 24, 40, 9, 48},
-                       G{"StreamTailF32 gather full width L>N", 8, 3, 32, 32, 0, 32}}) {
-        Case c; const unsigned B = 4, slots = 6;
+    struct G { const char* name; unsigned L, N, C, Cz, zc0, src_stride, B; };
+    for (const G& g : {G{"StreamTailF32 gather window zc0=9", 5, 7, 24, 40, 9, 48, 4},
+                       G{"StreamTailF32 gather window zc0=8", 5, 7, 24, 40, 8, 48, 4},
+                       G{"StreamTailF32 gather full width L>N", 8, 3, 32, 32, 0, 32, 4},
+                       G{"StreamTailF32 gather wide zc0=256", 8, 17, 512, 1024, 256, 1024, 6}}) {
+        Case c; const unsigned B = g.B, slots = 6;
         unsigned z = c.out((size_t)B * (g.L + g.N) * g.Cz);
         unsigned src = c.f32((size_t)(B * g.N - 1) * g.src_stride + g.Cz, 1.f);
         unsigned state = c.f32((size_t)slots * g.L * g.C, 1.f);
-        unsigned slot = c.u32({3, 0, 5, 1}), n = c.u32({g.N, 0, 3, 1}), pos = c.u32({0, 12, 4, 0});
+        std::vector<uint32_t> vs{3, 0, 5, 1, 2, 4}, vn{g.N, 0, 3, 1, g.N, 2}, vp{0, 12, 4, 0, 30, 2};
+        vs.resize(B); vn.resize(B); vp.resize(B);
+        unsigned slot = c.u32(vs), n = c.u32(vn), pos = c.u32(vp);
         st_inst(c.in, z, src, state, slot, n, pos, B, slots, g.L, g.N, g.C, g.Cz, g.zc0, g.src_stride, 0);
-        run(g.name, c, g_stream_tail_f32, {z}, FP32, 0.0);
+        run(g.name, c, g_stream_tail_f32, {z}, INT);
     }
-    {
-        /* n = 0, n < L, n == L, n > L (= N) and a window: state rows read z rows n..n+L. */
-        Case c; const unsigned B = 4, slots = 6, L = 5, N = 7, C = 24, Cz = 40, zc0 = 9;
+    /* n = 0, n < L, n == L, n > L (= N) and a window: state rows read z rows n..n+L. zc0 = 9 takes
+     * the scalar walk, zc0 = 8 the float4 one. */
+    for (unsigned zc0 : {9u, 8u}) {
+        Case c; const unsigned B = 4, slots = 6, L = 5, N = 7, C = 24, Cz = 40;
         unsigned z = c.f32((size_t)B * (L + N) * Cz, 1.f);
         unsigned state = c.f32((size_t)slots * L * C, 1.f);
         unsigned slot = c.u32({2, 5, 0, 4}), n = c.u32({0, 3, 5, 7});
         st_inst(c.in, PLOW_TENSOR_NONE, z, state, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, Cz, zc0, 0, 1);
-        run("StreamTailF32 store n=0,<L,=L,>L zc0=9", c, g_stream_tail_f32, {state}, FP32, 0.0);
+        run(zc0 == 9u ? "StreamTailF32 store n=0,<L,=L,>L zc0=9" : "StreamTailF32 store n=0,<L,=L,>L zc0=8",
+            c, g_stream_tail_f32, {state}, INT);
     }
-    {
-        /* Device gather then store; items with pos = 0 and n = 0 must leave zeros. */
-        Case c; const unsigned B = 5, slots = 5, L = 6, N = 4, C = 16, Cz = 24, zc0 = 4, ss = 24;
+    /* Device gather then store against the chained golden; z starts poisoned. Items with pos = 0
+     * and n = 0 must leave zeros. zc0 = 4 takes the float4 walks, zc0 = 5 the scalar ones. */
+    for (unsigned zc0 : {4u, 5u}) {
+        Case c; const unsigned B = 5, slots = 5, L = 6, N = 4, C = 16, Cz = 24, ss = 24;
         unsigned z = c.out((size_t)B * (L + N) * Cz);
         unsigned src = c.f32((size_t)B * N * ss, 1.f);
         unsigned state = c.f32((size_t)slots * L * C, 1.f);
@@ -650,10 +662,9 @@ static void t_stream_tail() {
         for (auto& t : gather.t) t = PLOW_TENSOR_NONE;
         st_inst(gather, z, src, state, slot, n, pos, B, slots, L, N, C, Cz, zc0, ss, 0);
         st_inst(c.in, PLOW_TENSOR_NONE, z, state, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, Cz, zc0, 0, 1);
-        std::vector<void*> th;
-        for (auto& h : c.host) th.push_back(h.data());
-        g_stream_tail_f32(&gather, 0, 1, th.data(), nullptr);
-        run("StreamTailF32 gather->store chain", c, g_stream_tail_f32, {state}, FP32, 0.0, 0, &gather);
+        g_chain_pre = &gather;
+        run(zc0 == 4u ? "StreamTailF32 chain zc0=4" : "StreamTailF32 chain zc0=5", c, g_stream_tail_chain,
+            {z, state}, INT, 0.0, 0, &gather);
         const float* st = (const float*)c.host[state].data();
         bool zeros = true;
         for (size_t i = 0; i < (size_t)L * C; i++) zeros &= st[(size_t)4 * L * C + i] == 0.f;
@@ -691,7 +702,8 @@ static uint16_t bf16_rn(float f) {
 /* Appends the wgmma pre-split image (Conv1dF32 flags bit 18) of f32 weights [n][k]: at the next
  * 1024-byte boundary, per 64-column k-tile the hi then lo bf16 halves of n rows padded to 128,
  * each row's 16-byte chunk c at chunk c ^ (row & 7). */
-static void append_wsplit(std::vector<uint8_t>& w, unsigned n, unsigned k) {
+static void append_wsplit(std::vector<uint8_t>& w, unsigned n, unsigned k, unsigned channel_kernel = 0) {
+    if (channel_kernel && (k % channel_kernel || (k / channel_kernel) % 64u)) exit(2);
     const size_t base = (w.size() + 1023) & ~(size_t)1023, np = (n + 127) & ~127u, kt = (k + 63) / 64;
     std::vector<float> f(w.size() / 4);
     memcpy(f.data(), w.data(), f.size() * 4);
@@ -699,7 +711,9 @@ static void append_wsplit(std::vector<uint8_t>& w, unsigned n, unsigned k) {
     for (size_t t = 0; t < kt; t++)
         for (size_t r = 0; r < n; r++)
             for (size_t j = 0; j < 64 && t * 64 + j < k; j++) {
-                const float v = f[r * k + t * 64 + j];
+                const size_t col = channel_kernel ? ((t / channel_kernel) * 64u + j) * channel_kernel + t % channel_kernel
+                                                   : t * 64 + j;
+                const float v = f[r * k + col];
                 const uint16_t hi = bf16_rn(v);
                 const uint32_t hb = (uint32_t)hi << 16;
                 float hf;
@@ -738,7 +752,8 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     /* ConvTranspose: the merged-phase image [stride*cout][2*cin] of phase-major weights. */
     const bool wsplit = s.wg && s.groups == 1 && !s.f16 && (!transpose || (s.tapmajor && s.kernel == 2 * s.stride));
     if (wsplit && transpose) append_wsplit(c.host[w], s.stride * s.cout, 2 * s.cin);
-    else if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel);
+    else if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel,
+        !s.tapmajor && s.kernel > 1u && s.cin % 64u == 0u ? s.kernel : 0u);
     unsigned b = s.bias ? c.f32(s.cout, 0.2f) : PLOW_TENSOR_NONE;
     unsigned a = s.alpha ? c.f32(s.dual ? s.cin + s.cout : std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
@@ -769,10 +784,127 @@ static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
     if (!zero) g_fail = 1;
 }
 
+__global__ void __launch_bounds__(256, 1) k_conv_warp_ref(PlowDevInst in, void* const* T) {
+    SpConvArgs a;
+    if (sp_conv_args(&in, T, false, a)) sp_conv1d_warp(a, blockIdx.x, gridDim.x);
+}
+/* Bit-16 cout <= 4 shapes the lanes arm takes: against the golden, then bit for bit against the
+ * warp arm it replaces. */
+static void t_conv1d_lanes(const char* name, ConvSpec s, bool tapmajor = true) {
+    s.rows = true;
+    s.tapmajor = tapmajor;
+    Case c; unsigned o;
+    build_conv(c, s, false, o);
+    run(name, c, g_conv1d_f32, {o}, FP32, 2e-5);
+    std::vector<void*> ptrs = c.dev;
+    const size_t bytes = c.host[o].size();
+    CK(cudaMalloc(&ptrs[o], bytes));
+    void** td = upload_table(ptrs);
+    k_conv_warp_ref<<<g_nblk, 256>>>(c.in, td);
+    CK(cudaDeviceSynchronize());
+    std::vector<uint8_t> got(bytes), ref(bytes);
+    CK(cudaMemcpy(got.data(), c.dev[o], bytes, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(ref.data(), ptrs[o], bytes, cudaMemcpyDeviceToHost));
+    CK(cudaFree(ptrs[o]));
+    CK(cudaFree(td));
+    const bool same = got == ref;
+    printf("  %-34s vs warp arm bit-identical -> %s\n", name, same ? "PASS" : "FAIL");
+    if (!same) g_fail = 1;
+}
+
+/* Batch invariance of the arm-free codec convs (no rows, warp or split-K arm): item 0's output
+ * bits match whether it runs alone or in a batch, on all blocks or one. Alone and batched pick
+ * different tile widths (64 / 128); per output the k16 MMA chain is the same. On the wgmma tile
+ * the f32 weights are NaN (golden keeps them), so a fallback off it fails. */
+static void t_conv_invariant(const char* name, const ConvSpec& s, bool transpose) {
+    Case c; unsigned o;
+    build_conv(c, s, transpose, o);
+    const PlowDevInst ref = c.in;
+    if (s.wg && (transpose || s.cin % 64u == 0)) {
+        const unsigned w = c.in.t[2], wp = c.add(c.host[w].size());
+        c.host[wp] = c.host[w];
+        const float nan = NAN;
+        const size_t nf = transpose ? (size_t)s.stride * s.cout * 2 * s.cin : (size_t)s.cout * s.cin * s.kernel;
+        for (size_t i = 0; i < nf; i++) memcpy(&c.host[wp][i * 4], &nan, 4);
+        c.in.t[2] = wp;
+    }
+    run(name, c, transpose ? g_conv_transpose1d_f32 : g_conv1d_f32, {o}, FP32, 1e-4, 0, nullptr, &ref);
+    const size_t item = (size_t)conv_out_rows(s, transpose) * s.cout, n = c.host[o].size() / 4;
+    std::vector<uint32_t> full(n), got(n);
+    CK(cudaMemcpy(full.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+    void** td = upload_table(c.dev);
+    struct V { const char* what; unsigned batch, nblk; } vs[] = {
+        {"alone", 1, (unsigned)g_nblk}, {"alone 1 block", 1, 1}, {"batch 1 block", s.batch, 1}};
+    for (const V& v : vs) {
+        PlowDevInst in = c.in;
+        in.i[0] = v.batch;
+        CK(cudaMemset(c.dev[o], 0xff, n * 4));
+        k_speech<<<v.nblk, 256, kSmem>>>(in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(got.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+        const size_t cmp = v.batch == 1u ? item : n;
+        const bool same = !memcmp(got.data(), full.data(), cmp * 4);
+        printf("  %-34s %s bitwise == batch %u -> %s\n", name, v.what, s.batch, same ? "PASS" : "FAIL");
+        if (!same) g_fail = 1;
+    }
+    CK(cudaFree(td));
+}
+
 static void t_convt1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
     Case c; unsigned o;
     build_conv(c, s, true, o);
     run(name, c, g_conv_transpose1d_f32, {o}, FP32, tol);
+}
+
+static void t_conv_padding() {
+    for (unsigned mode : {0u, 1u, 2u})
+        for (unsigned kernel : {1u, 3u})
+            for (bool leaky : {false, true}) {
+                const unsigned pad = kernel == 1u ? 2u : 3u;
+                ConvSpec s{5, 129, 64, 96, kernel, 1, kernel == 1u ? 1u : 3u, 1, pad, pad,
+                           mode, leaky ? 9u : 0u, 0, false, true, false, true, {129, 93, 17, 1, 0}, 0.1f, true};
+                s.wide = s.tapmajor = s.row_scale = true;
+                Case c; unsigned o;
+                build_conv(c, s, false, o);
+                float* x = (float*)c.host[c.in.t[1]].data();
+                for (unsigned b = 0; b < s.batch; b++)
+                    for (unsigned t = s.lengths[b]; t < s.in_rows; t++)
+                        for (unsigned ch = 0; ch < s.cin; ch++) x[((size_t)b * s.in_rows + t) * s.cin + ch] = NAN;
+                char name[96];
+                snprintf(name, sizeof(name), "Conv1dF32 wide pad%u k%u leaky%u poison", mode, kernel, leaky);
+                run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
+                std::vector<float> got(c.host[o].size() / 4);
+                CK(cudaMemcpy(got.data(), c.dev[o], c.host[o].size(), cudaMemcpyDeviceToHost));
+                const float* ref = (const float*)c.host[o].data();
+                bool finite = true;
+                for (size_t i = 0; i < got.size(); i++) finite &= std::isfinite(got[i]) && std::isfinite(ref[i]);
+                printf("  %-34s finite -> %s\n", name, finite ? "PASS" : "FAIL");
+                if (!finite) g_fail = 1;
+            }
+    for (unsigned cin : {64u, 128u})
+        for (unsigned kernel : {3u, 5u}) {
+            const unsigned pad = kernel - 1u;
+            ConvSpec s{5, 129, cin, 96, kernel, 1, 2, 1, pad, pad,
+                       0, 0, 0, false, true, false, true, {129, 93, 17, 1, 0}, 0.f, true};
+            s.wide = s.wg = true;
+            Case c; unsigned o;
+            build_conv(c, s, false, o);
+            float* x = (float*)c.host[c.in.t[1]].data();
+            for (unsigned b = 0; b < s.batch; b++)
+                for (unsigned t = s.lengths[b]; t < s.in_rows; t++)
+                    for (unsigned ch = 0; ch < cin; ch++) x[((size_t)b * s.in_rows + t) * cin + ch] = NAN;
+            char name[96];
+            snprintf(name, sizeof(name), "Conv1dF32 channel64 c%u k%u poison", cin, kernel);
+            run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
+            std::vector<float> got(c.host[o].size() / 4);
+            CK(cudaMemcpy(got.data(), c.dev[o], c.host[o].size(), cudaMemcpyDeviceToHost));
+            const float* ref = (const float*)c.host[o].data();
+            bool finite = true;
+            for (size_t i = 0; i < got.size(); i++) finite &= std::isfinite(got[i]) && std::isfinite(ref[i]);
+            printf("  %-34s finite -> %s\n", name, finite ? "PASS" : "FAIL");
+            if (!finite) g_fail = 1;
+        }
 }
 
 static void t_unary() {
@@ -1787,6 +1919,165 @@ static void t_format_group() {
 }
 #endif
 
+template <unsigned STEP>
+__global__ void k_bf16_mma_replay(const float* x, const float* w, const float* bias, float* y,
+                                 unsigned M, unsigned N, unsigned K, unsigned span, unsigned mode) {
+    const unsigned lane = threadIdx.x & 31u, g = lane >> 2, p = 2u * (lane & 3u);
+    const unsigned tile = blockIdx.x * 8u + threadIdx.x / 32u, tn = (N + 7u) / 8u;
+    if (tile >= ((M + 15u) / 16u) * tn) return;
+    const unsigned r = (tile / tn) * 16u + g, c = (tile % tn) * 8u;
+    float total[4] = {};
+    for (unsigned lo = 0; lo < K; lo += span) {
+        const unsigned end = min(K, lo + span);
+        float d[4] = {};
+        for (unsigned k = lo; k < end; k += STEP) {
+            unsigned a[4] = {}, b[2] = {};
+#pragma unroll
+            for (unsigned h = 0; h < STEP / 8u; h++) {
+#pragma unroll
+                for (unsigned j = 0; j < 2u; j++) {
+                    const unsigned ci = k + p + h * 8u + j;
+#pragma unroll
+                    for (unsigned hi = 0; hi < 2u; hi++) {
+                        const unsigned ri = r + hi * 8u;
+                        const float v = ri < M && ci < end ? x[(size_t)ri * K + ci] : 0.f;
+                        a[2u * h + hi] |= (unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(v)) << (16u * j);
+                    }
+                    const float v = c + g < N && ci < end ? w[(size_t)(c + g) * K + ci] : 0.f;
+                    b[h] |= (unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(v)) << (16u * j);
+                }
+            }
+            if constexpr (STEP == 8u) {
+                asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                    : "r"(a[0]), "r"(a[1]), "r"(b[0]));
+            } else {
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+            }
+        }
+#pragma unroll
+        for (unsigned j = 0; j < 4u; j++) {
+            const float part = mode == 1u || (mode == 2u && lo == 0u) ? sp_bf16(d[j]) : d[j];
+            total[j] = __fadd_rn(total[j], part);
+            if (mode == 2u) total[j] = sp_bf16(total[j]);
+        }
+    }
+#pragma unroll
+    for (unsigned j = 0; j < 4u; j++) {
+        const unsigned ri = r + (j / 2u) * 8u, ci = c + p + (j & 1u);
+        if (ri < M && ci < N)
+            y[(size_t)ri * N + ci] = sp_bf16(__fadd_rn(sp_bf16(total[j]), bias[ci]));
+    }
+}
+
+static void native_bf16_dense_replay(const std::vector<float>& x, const std::vector<float>& w,
+                                     const std::vector<float>& bias, std::vector<float>& actual,
+                                     unsigned M, unsigned N, unsigned K, unsigned span, unsigned mode, unsigned step) {
+    std::vector<float> total((size_t)M * N, 0.f), partial(total.size());
+    for (unsigned lo = 0; lo < K; lo += span) {
+        const unsigned width = std::min(span, K - lo), padded = (width + 7u) & ~7u;
+        Case c;
+        const unsigned a = c.add((size_t)M * padded * 4u), b = c.add((size_t)N * padded * 2u), o = c.out(total.size());
+        for (unsigned row = 0; row < M; row++)
+            memcpy(c.host[a].data() + (size_t)row * padded * 4u, x.data() + (size_t)row * K + lo, width * 4u);
+        auto* wb = (uint16_t*)c.host[b].data();
+        for (unsigned row = 0; row < N; row++) for (unsigned col = 0; col < width; col++)
+            wb[(size_t)row * padded + col] = f2bf(w[(size_t)row * K + lo + col]);
+        c.in.op = PLOW_DOP_DENSE_GEMM_F32;
+        c.in.t[0] = o; c.in.t[1] = a; c.in.t[2] = b;
+        c.in.i[0] = M; c.in.i[1] = N; c.in.i[2] = padded;
+        const bool round = mode == 1u || (mode == 2u && lo == 0u);
+        c.in.i[7] = 4u | 8u | 0x800u | (step == 8u ? 0x1000u : 0u) | (unsigned)round;
+        c.upload();
+        void** table = upload_table(c.dev);
+        k_speech<<<g_nblk, 256, kSmem>>>(c.in, table);
+        CK(cudaGetLastError());
+        CK(cudaMemcpy(partial.data(), c.dev[o], partial.size() * 4u, cudaMemcpyDeviceToHost));
+        CK(cudaFree(table));
+        for (size_t i = 0; i < total.size(); i++) {
+            total[i] += partial[i];
+            if (mode == 2u) total[i] = plow_bf2f(f2bf(total[i]));
+        }
+    }
+    for (size_t i = 0; i < actual.size(); i++)
+        actual[i] = plow_bf2f(f2bf(plow_bf2f(f2bf(total[i])) + bias[i % N]));
+}
+
+static int t_bf16_mma_replay(const char* input, const char* output, bool native = false) {
+    FILE* in = fopen(input, "rb");
+    FILE* out = fopen(output, "wb");
+    if (!in || !out) { perror("BF16 MMA fixture"); return 2; }
+    auto read = [&](void* p, size_t bytes) {
+        if (fread(p, 1, bytes, in) != bytes) { fprintf(stderr, "truncated BF16 MMA fixture\n"); exit(2); }
+    };
+    auto write = [&](const void* p, size_t bytes) {
+        if (fwrite(p, 1, bytes, out) != bytes) { perror("BF16 MMA output"); exit(2); }
+    };
+    uint32_t header[2];
+    read(header, sizeof(header));
+    if (header[0] != 0x31464d42u || !header[1] || header[1] > 4096u) return 2;
+    write(header, sizeof(header));
+    size_t differences[2] = {}, exact[2] = {};
+    bool finite = true;
+    for (unsigned item = 0; item < header[1]; item++) {
+        // BMF1: rows, columns, K, span, reduction (0 full F32, 1 parallel BF16, 2 serial BF16, 3 partitioned F32).
+        uint32_t shape[5];
+        read(shape, sizeof(shape));
+        const unsigned M = shape[0], N = shape[1], K = shape[2], span = shape[3], mode = shape[4];
+        if (!M || !N || !K || !span || span > K || mode > 3u || (mode == 0u && span != K) ||
+            (uint64_t)M * K > (1u << 27) || (uint64_t)N * K > (1u << 27) ||
+            (uint64_t)M * N > (1u << 27)) return 2;
+        std::vector<float> x((size_t)M * K), w((size_t)N * K), bias(N), expected((size_t)M * N), actual(expected.size());
+        read(x.data(), x.size() * 4u);
+        read(w.data(), w.size() * 4u);
+        read(bias.data(), bias.size() * 4u);
+        read(expected.data(), expected.size() * 4u);
+        for (const auto* values : {&x, &w, &bias}) for (float v : *values) {
+            uint32_t bits; memcpy(&bits, &v, 4);
+            if (!std::isfinite(v) || (bits & 0xffffu)) return 2;
+        }
+        float *dx = nullptr, *dw = nullptr, *db = nullptr, *dy = nullptr;
+        if (!native) {
+            CK(cudaMalloc(&dx, x.size() * 4u)); CK(cudaMalloc(&dw, w.size() * 4u));
+            CK(cudaMalloc(&db, bias.size() * 4u)); CK(cudaMalloc(&dy, actual.size() * 4u));
+            CK(cudaMemcpy(dx, x.data(), x.size() * 4u, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dw, w.data(), w.size() * 4u, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(db, bias.data(), bias.size() * 4u, cudaMemcpyHostToDevice));
+        }
+        write(shape, sizeof(shape));
+        const unsigned blocks = ((((M + 15u) / 16u) * ((N + 7u) / 8u)) + 7u) / 8u;
+        for (unsigned variant = 0; variant < 2u; variant++) {
+            if (native) native_bf16_dense_replay(x, w, bias, actual, M, N, K, span, mode, variant == 0u ? 8u : 16u);
+            else {
+                CK(cudaMemset(dy, 0xff, actual.size() * 4u));
+                if (variant == 0u) k_bf16_mma_replay<8><<<blocks, 256>>>(dx, dw, db, dy, M, N, K, span, mode);
+                else k_bf16_mma_replay<16><<<blocks, 256>>>(dx, dw, db, dy, M, N, K, span, mode);
+                CK(cudaGetLastError());
+                CK(cudaMemcpy(actual.data(), dy, actual.size() * 4u, cudaMemcpyDeviceToHost));
+            }
+            size_t changed = 0;
+            for (size_t i = 0; i < actual.size(); i++) {
+                finite = finite && std::isfinite(actual[i]);
+                changed += memcmp(&actual[i], &expected[i], 4) != 0;
+            }
+            differences[variant] += changed;
+            exact[variant] += changed == 0;
+            write(actual.data(), actual.size() * 4u);
+            printf("mma_replay case=%u backend=%s kstep=%u rows=%u width=%u k=%u span=%u mode=%u changed=%zu\n",
+                   item, native ? "native_dense_cpu_reduce" : "intrinsic", variant == 0u ? 8u : 16u, M, N, K, span, mode, changed);
+        }
+        if (!native) { CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(db)); CK(cudaFree(dy)); }
+    }
+    if (fgetc(in) != EOF || ferror(in) || fclose(in) != 0 || fclose(out) != 0) return 2;
+    printf("mma_replay cases=%u k8_exact=%zu k16_exact=%zu k8_differences=%zu k16_differences=%zu finite=%u\n",
+           header[1], exact[0], exact[1], differences[0], differences[1], (unsigned)finite);
+    return finite && !differences[0] && !differences[1] ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
@@ -1796,6 +2087,14 @@ int main(int argc, char** argv) {
     kSmem = (size_t)arena_floats * sizeof(float);
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
+
+    if (argc == 4 && !strcmp(argv[1], "--bf16-mma-replay")) return t_bf16_mma_replay(argv[2], argv[3]);
+    if (argc == 4 && !strcmp(argv[1], "--bf16-native-replay")) return t_bf16_mma_replay(argv[2], argv[3], true);
+
+    if (argc > 1 && !strcmp(argv[1], "--conv-padding-only")) {
+        t_conv_padding();
+        return g_fail;
+    }
 
     if (argc > 1 && !strcmp(argv[1], "--bench-cfm")) {
         /* The S3Gen CFM estimator's GEMMs at csynth.b32.t64 (64 CFG items x 136 rows). */
@@ -2306,6 +2605,33 @@ int main(int argc, char** argv) {
             run(t.name, c, g_conv_transpose1d_f32, {o}, FP32, 1e-4, 0, nullptr, &ref);
         }
 #endif
+        /* Batch invariance of the Qwen3-TTS codec's convs without arms (its recipe drops the
+         * per-size arm table): wgmma taps / pointwise / merged-phase ConvT, the wide tile (96
+         * channels), the direct form (cout 1), 3xTF32 phase-major ConvT; small and large M. */
+        struct BI { const char* name; ConvSpec s; bool transpose; };
+        BI bis[] = {
+            {"Conv1dF32 inv pointwise 4096->1024", {9, 8, 4096, 1024, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true}, false},
+            {"Conv1dF32 inv k7 d3 384 len", {7, 19, 384, 384, 7, 1, 3, 1, 18, 0, 0, 0, 0, false, true, false, false, {19, 4, 19, 1, 19, 19, 7}, 0.f, true}, false},
+            {"Conv1dF32 inv pointwise 512 big M", {40, 500, 512, 512, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true}, false},
+            {"Conv1dF32 inv k3 512->1024 big M", {20, 500, 512, 1024, 3, 1, 1, 1, 2, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true}, false},
+            {"Conv1dF32 inv wide k7 96 +res", {40, 60, 96, 96, 7, 1, 1, 1, 6, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true}, false},
+            {"Conv1dF32 inv direct k7 96->1", {40, 300, 96, 1, 7, 1, 1, 1, 6, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true}, false},
+            {"ConvT inv wgmma s8 1024->512", {12, 9, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 0, 0, false, true, false, false, {}, 0.f, true}, true},
+            {"ConvT inv wgmma s4 256->128 big M", {64, 200, 256, 128, 8, 4, 0, 1, 2, 2, 0, 0, 0, false, true, false, false, {}, 0.f, true}, true},
+            {"ConvT1dF32 inv tc phase-major k6 s3", {40, 300, 192, 96, 6, 3, 0, 1, 3, 3, 0, 0, 0, false, true, false, false, {}, 0.f, true}, true},
+        };
+#if defined(PLOW_NV_HOPPER)
+        const bool hopper = true;
+#else
+        const bool hopper = false;
+#endif
+        for (BI& t : bis) {
+            /* The merged-phase wgmma ConvT needs kernel 2*stride and cout % 64; the k6 s3 one is 3xTF32. */
+            t.s.tapmajor = true;
+            t.s.wg = hopper && t.s.cout > 1u && (!t.transpose || (t.s.kernel == 2u * t.s.stride && t.s.cout % 64u == 0));
+            t.s.wide = t.s.wg || (!t.transpose && t.s.cout > 1u);
+            t_conv_invariant(t.name, t.s, t.transpose);
+        }
         /* Rows arm (bit 16, M <= 32): M=17 and 32, partial 8-channel blocks, K tails past a 512
          * chunk, short lengths, M=1; M=33 and cout <= 4 fall back to the warp arm. */
         struct RA { const char* name; ConvSpec s; };
@@ -2319,6 +2645,29 @@ int main(int argc, char** argv) {
             t.s.rows = t.s.tapmajor = true;
             t_conv1d(t.name, t.s);
         }
+        /* Lanes arm (bit 16, cout <= 4, tap-major, cg % 32 == 0): multi-tile items, reflect and
+         * replicate padding, short lengths, stride and dilation. */
+        RA las[] = {
+            {"Conv1dF32 lanes k7 snake-in 96->1 reflect len", {3, 700, 96, 1, 7, 1, 1, 1, 3, 3, 1, 12, 0, false, true, true, true, {700, 451, 9}, 0.f}},
+            {"Conv1dF32 lanes k7 d3 s2 leaky 64->3 replicate", {2, 1100, 64, 3, 7, 2, 3, 1, 9, 9, 2, 9, 0, false, true, false, false, {1100, 530}, 0.1f}},
+            {"Conv1dF32 lanes k3 128->4 zero", {1, 520, 128, 4, 3, 1, 1, 1, 1, 1, 0, 0, 0, false, false, false, false, {}, 0.f}},
+        };
+        for (RA& t : las) t_conv1d_lanes(t.name, t.s);
+        const int nblk = g_nblk;
+        g_nblk = 2; /* several tiles per block */
+        t_conv1d_lanes("Conv1dF32 lanes 96->2 asym pad nblk=2",
+                       {4, 900, 96, 2, 7, 1, 1, 1, 6, 0, 0, 12, 0, true, true, true, false, {900, 1, 0, 640}, 0.f});
+        g_nblk = nblk;
+        /* Channel-major weights at kernel 7 (the codec's final 96 -> 1 conv). */
+        RA lcs[] = {
+            {"Conv1dF32 lanes ch-major k7 snake 96->1 len", {3, 700, 96, 1, 7, 1, 1, 1, 3, 3, 0, 12, 0, false, true, true, false, {700, 451, 9}, 0.f}},
+            {"Conv1dF32 lanes ch-major k7 d2 s3 64->4 refl", {2, 900, 64, 4, 7, 3, 2, 1, 6, 6, 1, 9, 0, false, true, false, true, {900, 333}, 0.1f}},
+        };
+        for (RA& t : lcs) t_conv1d_lanes(t.name, t.s, false);
+        g_nblk = 3;
+        t_conv1d_lanes("Conv1dF32 lanes ch-major 96->1 nblk=3",
+                       {2, 1500, 96, 1, 7, 1, 1, 1, 6, 0, 0, 12, 0, true, true, true, false, {1500, 2}, 0.f}, false);
+        g_nblk = nblk;
         ConvSpec w7{2, 300, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, true, {300, 170}, 0.f, true};
         t_conv1d("Conv1dF32 k7 snake-out +res (64x64 tiles)", w7);
         ConvSpec w5{2, 1000, 64, 1, 7, 1, 1, 1, 3, 3, 0, 9, 1, false, true, false, false, {1000, 500}, 0.01f, true};
@@ -2472,6 +2821,7 @@ int main(int argc, char** argv) {
         bench_dense(104, 1024, 1024);
         bench_conv(30, 64, 50, 480, 480);
     }
+    t_conv_padding();
     printf(g_fail ? "FAIL\n" : "ALL PASS\n");
     return g_fail;
 }

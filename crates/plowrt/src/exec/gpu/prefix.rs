@@ -10,6 +10,105 @@ use crate::{Result, RuntimeError};
 
 use super::GpuEngine;
 
+const SPEECH_IDENTITIES: usize = 1 << 20;
+
+pub(super) fn prefix_with_tail_room(rows: usize, max_ctx: usize, tail: Option<usize>) -> usize {
+    rows.min(max_ctx.saturating_sub(tail.unwrap_or(0)))
+}
+
+pub(super) struct SpeechIdentities {
+    next: u32,
+    rows: rustc_hash::FxHashMap<u64, u32>,
+}
+
+impl SpeechIdentities {
+    pub(super) fn new(vocab: usize) -> Self {
+        Self {
+            next: u32::try_from(vocab).unwrap_or(u32::MAX),
+            rows: Default::default(),
+        }
+    }
+
+    fn encode(&mut self, keys: &[u64]) -> Option<Arc<[u32]>> {
+        let mut ids = Vec::with_capacity(keys.len());
+        for key in keys {
+            let id = if let Some(&id) = self.rows.get(key) {
+                id
+            } else {
+                if self.rows.len() == SPEECH_IDENTITIES || self.next == u32::MAX {
+                    return None;
+                }
+                let id = self.next;
+                self.next += 1;
+                // Never recycle an identity while a VMM boundary or store block can name it.
+                self.rows.insert(*key, id);
+                id
+            };
+            ids.push(id);
+        }
+        Some(ids.into())
+    }
+}
+
+pub(super) struct SlotPrefixes {
+    rows: Vec<Vec<u64>>,
+    backing: Vec<Option<u64>>,
+    pub(super) epoch: u64,
+}
+
+impl SlotPrefixes {
+    pub(super) fn new(slots: usize) -> Self {
+        Self {
+            rows: vec![Vec::new(); slots],
+            backing: vec![None; slots],
+            epoch: 0,
+        }
+    }
+
+    pub(super) fn take(&mut self, slot: usize, keys: &[u64], backing: Option<u64>) -> usize {
+        let old = std::mem::take(&mut self.rows[slot]);
+        if !self.backing_matches(slot, backing) {
+            return 0;
+        }
+        old.iter()
+            .zip(keys)
+            .take(keys.len().saturating_sub(1))
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
+    pub(super) fn publish(&mut self, slot: usize, mut keys: Vec<u64>, backing: Option<u64>) {
+        keys.truncate(keys.len().saturating_sub(1));
+        self.rows[slot] = keys;
+        self.backing[slot] = backing;
+    }
+
+    pub(super) fn backing_matches(&self, slot: usize, backing: Option<u64>) -> bool {
+        self.backing[slot] == backing
+    }
+
+    pub(super) fn retained_rows(&self, slot: usize, backing: Option<u64>) -> usize {
+        if self.backing_matches(slot, backing) {
+            self.rows[slot].len()
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn clear(&mut self, slot: usize) {
+        self.rows[slot].clear();
+        self.backing[slot] = None;
+    }
+
+    pub(super) fn clear_all(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        for keys in &mut self.rows {
+            keys.clear();
+        }
+        self.backing.fill(None);
+    }
+}
+
 pub(crate) struct VmmPrefixLayout {
     pub(crate) geo: crate::memory::vmm::VmmGeometry,
     pub(super) slide: Vec<(usize, usize, u64)>,
@@ -216,13 +315,13 @@ impl GpuEngine {
         capability: (u32, u32),
         granularity: u64,
         row_interleaved: Option<bool>,
+        keyed_overlays: bool,
     ) -> Option<VmmPrefixLayout> {
         let declined = |reason: &str| {
             tracing::info!(reason, "VMM prefix cache declined");
             None
         };
-        // Overlay rows (audio, voice conditioning) are not keyed by the prompt ids.
-        if blob.tensors.iter().any(|t| t.name == "in.encoder_overlay") {
+        if !keyed_overlays && blob.tensors.iter().any(|t| t.name == "in.encoder_overlay") {
             return declined("encoder overlay rows are not keyed by the prompt ids");
         }
         let requested = config.nv_vmm_prefix();
@@ -676,6 +775,9 @@ impl GpuEngine {
         prompt: &[u32],
         key: Option<crate::memory::vmm::PrefixKey>,
     ) -> Result<()> {
+        if self.prefix_needs_row_keys && self.speech_prefix[b].is_none() {
+            return Ok(());
+        }
         let staged = self.staged_prefix[b].take();
         let Some((_, kv)) = self.vmm_prefix() else {
             return Ok(());
@@ -807,6 +909,24 @@ impl GpuEngine {
     /// none either until retired.
     pub fn set_prefix_attach(&mut self, b: usize, on: bool) {
         self.prefix_attach_off[b] = !on;
+        if !on {
+            self.staged_speech_prefix[b] = None;
+        }
+    }
+
+    pub fn stage_speech_prefix(&mut self, b: usize, keys: &[u64]) -> bool {
+        self.staged_speech_prefix[b] = (self.vmm_prefix_enabled() && self.packed_depth_enabled())
+            .then(|| self.speech_identities.encode(keys))
+            .flatten();
+        let ready = self.staged_speech_prefix[b].is_some();
+        self.set_prefix_attach(b, ready);
+        ready
+    }
+
+    pub(super) fn record_prompt_prefix(&mut self, b: usize, prompt: &[u32], end: usize) {
+        let ids = self.speech_prefix[b].as_deref().unwrap_or(prompt);
+        self.seq_tokens[b].clear();
+        self.seq_tokens[b].extend_from_slice(&ids[..end]);
     }
 
     /// [`Self::attach_prompt`] with the prompt's block hashes already computed.
@@ -817,7 +937,12 @@ impl GpuEngine {
         key: Option<crate::memory::vmm::PrefixKey>,
     ) -> Result<usize> {
         if self.pos[b] == 0 && self.vmm_prefix_enabled() && !self.prefix_attach_off[b] {
-            self.vmm_attach(b, prompt, key)?;
+            let ids = self.speech_prefix[b].clone();
+            if ids.is_some() {
+                self.staged_prefix[b] = None;
+            }
+            let key = if ids.is_some() { None } else { key };
+            self.vmm_attach(b, ids.as_deref().unwrap_or(prompt), key)?;
         }
         Ok(self.pos[b] as usize)
     }
@@ -828,7 +953,16 @@ impl GpuEngine {
         p_a: u32,
         kind: crate::memory::vmm::Kind,
     ) -> bool {
+        if self.prefix_needs_row_keys && self.speech_prefix[b].is_none() {
+            return false;
+        }
         if self.publish_off[b] {
+            return false;
+        }
+        if self.speech_prefix[b]
+            .as_ref()
+            .is_some_and(|ids| p_a as usize >= ids.len())
+        {
             return false;
         }
         let Some((v, kv)) = self.vmm_prefix().filter(|_| !self.prefix_attach_off[b]) else {
@@ -901,6 +1035,9 @@ impl GpuEngine {
         let Some((v, kv)) = self.vmm_prefix() else {
             return;
         };
+        let max_rows = self.speech_prefix[b].as_ref().map_or(max_rows, |ids| {
+            max_rows.min(ids.len().saturating_sub(1) as u32)
+        });
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = kv.geometry();
@@ -1118,4 +1255,122 @@ fn prompt_end_covers_the_withheld_last_token() {
     assert!(!is_prompt_end(2048, 2047, 3000), "chunk end");
     assert!(!is_prompt_end(2999, 2048, 3000), "chunk-capped publish");
     assert!(!is_prompt_end(3100, 3099, 3000), "turn end");
+}
+
+#[cfg(test)]
+mod slot_prefix_tests {
+    use super::{prefix_with_tail_room, SlotPrefixes, SpeechIdentities};
+
+    #[test]
+    fn compact_prefix_leaves_a_physical_bucket_for_unmasked_tail_replay() {
+        use plow_asset::packed_prefill::{plan_with_limit, Request};
+        let start = prefix_with_tail_room(2039, 2048, Some(64));
+        assert_eq!(start, 1984);
+        for (start, masked, ok) in [
+            (2039, None, false),
+            (start, None, true),
+            (2039, Some(64), true),
+        ] {
+            let request = Request {
+                slot: 0,
+                start,
+                len: 2040 - start,
+                prompt: 2040,
+            };
+            assert_eq!(
+                plan_with_limit(&[request], &[start as u32], 64, 2048, masked).is_ok(),
+                ok
+            );
+        }
+        assert_eq!(prefix_with_tail_room(36, 2048, Some(64)), 36);
+        assert_eq!(prefix_with_tail_room(2039, 2048, None), 2039);
+    }
+
+    #[test]
+    fn reclaimed_slot_prefix_is_refused_even_after_the_slot_is_mapped_again() {
+        let mut cache = SlotPrefixes::new(1);
+        cache.publish(0, vec![1, 2, 3], Some(10));
+        assert_eq!(cache.retained_rows(0, Some(10)), 2);
+        assert_eq!(cache.retained_rows(0, None), 0);
+        assert_eq!(cache.take(0, &[1, 2, 3], Some(11)), 0);
+        cache.publish(0, vec![1, 2, 3], Some(12));
+        assert_eq!(cache.take(0, &[1, 2, 3], Some(12)), 2);
+        assert!(cache.backing_matches(0, Some(12)));
+        assert!(
+            !cache.backing_matches(0, Some(13)),
+            "a staged resume also needs its original backing"
+        );
+        cache.clear_all();
+        assert!(!cache.backing_matches(0, Some(12)));
+    }
+
+    #[test]
+    fn speech_identities_preserve_content_and_never_alias_token_ids() {
+        let mut ids = SpeechIdentities::new(8194);
+        let a = ids.encode(&[10, 20, 30, 20]).unwrap();
+        let b = ids.encode(&[10, 21, 30, 20]).unwrap();
+        assert!(a.iter().all(|&id| id >= 8194));
+        assert_eq!(a[0], b[0]);
+        assert_ne!(a[1], b[1]);
+        assert_eq!(a[2..], b[2..]);
+        assert_eq!(a[1], a[3]);
+        assert_eq!(&*a, &*ids.encode(&[10, 20, 30, 20]).unwrap());
+        ids.next = u32::MAX;
+        assert!(ids.encode(&[99]).is_none());
+        assert_eq!(&*a, &*ids.encode(&[10, 20, 30, 20]).unwrap());
+    }
+
+    #[test]
+    fn slot_prefix_keeps_only_matching_prompt_rows_and_always_replays_the_last() {
+        let mut cache = SlotPrefixes::new(2);
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(cache.take(1, &[10, 20, 30, 50], None), 0);
+        assert_eq!(cache.take(0, &[10, 20, 30, 50], None), 3);
+        assert_eq!(
+            cache.take(0, &[10, 20, 30, 50], None),
+            0,
+            "lookup consumes provenance"
+        );
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(
+            cache.take(0, &[10, 20], None),
+            1,
+            "the new prompt keeps a terminal row"
+        );
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(cache.take(0, &[10, 99, 30, 40], None), 1);
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(
+            cache.take(0, &[10, 20, 30, 40, 50], None),
+            3,
+            "decode-written rows are excluded"
+        );
+    }
+
+    #[test]
+    fn slot_prefix_requires_explicit_successful_publication_after_reseating() {
+        let mut cache = SlotPrefixes::new(2);
+        for slot in 0..2 {
+            cache.publish(slot, vec![1, 2, 3], None);
+        }
+        cache.clear(0);
+        assert_eq!(cache.take(0, &[1, 2, 3], None), 0);
+        assert_eq!(cache.take(1, &[1, 2, 3], None), 2);
+        // Refused resume or failed/cancelled prefill publishes nothing.
+        assert_eq!(cache.take(1, &[1, 2, 3], None), 0);
+        for slot in 0..2 {
+            cache.publish(slot, vec![1, 2, 3], None);
+        }
+        let epoch = cache.epoch;
+        cache.clear_all();
+        assert_ne!(
+            cache.epoch, epoch,
+            "a fault also invalidates pending publication"
+        );
+        for slot in 0..2 {
+            assert_eq!(cache.take(slot, &[1, 2, 3], None), 0);
+        }
+        cache.publish(0, vec![1], None);
+        assert_eq!(cache.take(0, &[1, 2], None), 0);
+    }
 }

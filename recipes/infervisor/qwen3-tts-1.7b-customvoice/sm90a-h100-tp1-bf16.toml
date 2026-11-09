@@ -64,6 +64,16 @@ PLOW_TTS_PROFILE = "qwen3_tts"
 PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
+# No per-size codec conv arms (tuning codec_conv_arms.jsonl: rows / warp / split-K picked per
+# batch and rows): a slot's audio must not depend on its batch. Measured off vs on: codec step
+# b1.f4 +15%, b16.f4 +1%, b32.f17 +0%.
+# Codec wgmma tiles spanning taps / transposed-conv phases at widths % 4 (the 96-wide k7
+# residual convs, ConvT 192 -> 96) and the decoder input conv on split-bf16 taps wgmma: codec step
+# b32.f17 65.1 -> 51.0 ms. PCM vs the official FP32 decoder: absolute RMS error <= 3.2e-6 FS on all
+# 16 reference cases, under the int16 output rounding noise 8.8e-6 FS (the codec PCM gate, user
+# decision 2026-11-09).
+PLOW_EMIT_CODEC_WGMMA_RAGGED = "1"
+PLOW_EMIT_CODEC_DEC_IN_WGMMA = "1"
 # Prompts are 10 rows + the text (streaming) or + the text again (non-streaming).
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "64,256"
@@ -73,10 +83,22 @@ PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
 # The 64-row prefill rung's projections as cuBLASLt segments: prefill 16.3 -> 8.5 ms, c1 TTFA p95
 # 28.5 -> 20.4 ms; greedy output bit-identical to the interpreter GEMM (16 prompts).
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
+# Simultaneous prompts prefill in one packed launch (the last prompt row withheld), and their
+# first frames sample in the next decode step's one depth launch.
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_FA_FOLD = "1"
 PLOW_NO_GLU_FUSE = "1"
 PLOW_FUSE_KV_HNR = "1"
 PLOW_NV_DENSE_TUNE = "1"
+# Depth stage: each layer's q / k / v HeadNormRope and FlashMerge fold into its FlashDecode
+# (961 -> 641 depth instructions; depth B=1 / 32 4.60 / 6.48 -> 4.41 / 5.72 ms).
+PLOW_DEPTH_ATTN_FOLD = "1"
+# Decode objects: preloaded instructions and narrow raw stores, and the B=1 / small-batch GEMVs on
+# the tensor-core K-split walk (K8_MIN 1, two k32 steps in flight) with the classic B=1 kernels
+# dropped (MMA_B1; interpreter stack 320 -> 16 B). fish_gen step ms B=1 / 2 / 8 / 48 / 64:
+# 6.36 / 5.84 / 5.88 / 11.62 / 11.69 -> 5.41 / 5.50 / 5.70 / 10.37 / 10.87; teacher-forced cp
+# rel-L2 vs FP32 0.004792 -> 0.004764 (BF16 reference 0.005030).
+NVCC_APPEND_FLAGS = "-DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_GEMV_K8_MIN=1 -DPLOW_NV_GEMV_K8_UNB1=2 -DPLOW_NV_GEMV_MMA_B1=1 -DPLOW_NV_GEMV_K8_MAX_MAIN=64"
 
 [bench]
 kind = "speech"
@@ -90,4 +112,6 @@ arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice ryan", "
 cer_median_max = 0.05
 
 [serve]
-env = { PLOW_VMM_PREFIX = "1" }
+# First audible byte needs the second frame (onset trim); rungs up to 64 rows; the streaming load
+# protocol's server settings (no realtime admission pacing, 1 ms codec launch window).
+env = { PLOW_VMM_PREFIX = "1", PLOW_TTS_STREAM_FIRST_FRAMES = "2", PLOW_DECODE_MAX_RUNG = "64", PLOW_TTS_REALTIME = "0", PLOW_TTS_CODEC_LAUNCH_US = "1000" }

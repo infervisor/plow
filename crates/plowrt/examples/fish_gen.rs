@@ -3,7 +3,7 @@
 //! u32, the stop frame excluded) for the codec gate.
 //!
 //!   fish_gen ASSETS CKPT PROMPT.u32 OUT.u32 [--prompt-codes CODES.u32] [--frames N] [--seed S]
-//!            [--temperature T] [--top-p P] [--top-k K] [--slots N]
+//!            [--temperature T] [--top-p P] [--top-k K] [--slots N [--depth-sweep STRIDE]]
 //!
 //! PROMPT.u32 holds token ids; prompt frame rows (reference audio) take their codes from
 //! `--prompt-codes` (`[prompt rows][codebooks]`). `--top-k 1` is greedy and matches the goldens.
@@ -25,6 +25,70 @@ fn read_u32(p: &str) -> Vec<u32> {
 fn bf16(x: f32) -> f32 {
     let b = x.to_bits();
     f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+}
+
+/// `--depth-sweep STRIDE` (with `--slots N`): the depth program of the width covering N slots
+/// timed at every STRIDE-th instruction cap (median of 20 launches, JSON lines
+/// `{"cap":..,"op":..,"blocks":..,"us":..}`, `op` the instruction cap - 1 adds), so the marginal
+/// cost of instruction i is us(cap = i + 1) - us(cap = i). Library-routed backbone rungs refuse caps.
+fn depth_sweep(
+    e: &mut GpuEngine,
+    assets: &std::path::Path,
+    rows: &[(FishRow, u32)],
+    n: usize,
+    stride: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = std::fs::read(assets.join("model.pkt"))?;
+    let blob = plowrt::asset::devblob::DevBlob::parse(&raw)?;
+    let meta = blob
+        .reserved_metadata(&raw, plow_asset::fish_depth::SECTION)?
+        .ok_or("packet has no depth stage")?;
+    let manifest: plow_asset::fish_depth::Manifest = serde_json::from_slice(meta)?;
+    let bytes = blob
+        .reserved_metadata(&raw, plow_asset::fish_depth::PROGRAMS_SECTION)?
+        .ok_or("depth programs section missing")?;
+    let section = plow_asset::aux_program::parse(bytes, blob.n_cu, blob.tensors.len())?;
+    let (k, _) = manifest
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, &r)| r as usize >= n)
+        .min_by_key(|(_, &r)| r)
+        .ok_or("no depth program covers the slots")?;
+    let insts = &section.programs[k].insts;
+    let step: Vec<FishRow> = rows
+        .iter()
+        .map(|(r, _)| FishRow {
+            hidden_row: r.slot as u32,
+            ..*r
+        })
+        .collect();
+    let mut codes = Vec::new();
+    for cap in (0..=insts.len()).step_by(stride) {
+        e.set_debug_max_inst(cap as u32, n)?;
+        let mut us: Vec<f64> = (0..23)
+            .map(|_| {
+                codes.clear();
+                let t = std::time::Instant::now();
+                e.fish_depth_step(&step, &mut codes)
+                    .map(|_| t.elapsed().as_secs_f64() * 1e6)
+            })
+            .collect::<Result<_, _>>()?;
+        us.drain(..3);
+        us.sort_by(f64::total_cmp);
+        let (op, blocks) = cap.checked_sub(1).map_or((String::new(), 0), |i| {
+            let op = packet::dev::DevOp::from_u16(insts[i].op)
+                .map_or_else(|| insts[i].op.to_string(), |o| format!("{o:?}"));
+            (op, insts[i].blocks)
+        });
+        println!(
+            "{{\"rows\":{},\"cap\":{cap},\"op\":\"{op}\",\"blocks\":{blocks},\"us\":{:.2}}}",
+            manifest.rows[k],
+            us[us.len() / 2]
+        );
+    }
+    e.set_debug_max_inst(u32::MAX, n)?;
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -112,6 +176,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (backbone + depth) * 1e3 / f,
             n as f64 * f / (backbone + depth)
         );
+        if let Some(stride) = opt("--depth-sweep").map(|v| v.parse::<usize>().unwrap().max(1)) {
+            depth_sweep(&mut e, &assets, &rows, n, stride)?;
+        }
         return Ok(());
     }
     e.begin_slot(0, prompt.len() + frames + 1)?;

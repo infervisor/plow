@@ -30,6 +30,85 @@ Hosts without nix: `PLOW_CAMPAIGN_NO_NIX=1`, `CARGO_TARGET_DIR` holding a releas
 `PYREF` (torch + snac) and, for Chatterbox, `CBX_PY` (chatterbox-tts 0.1.7; for the
 multilingual recipe the upstream git package, whose `mtl_tts` loads `t3_mtl23ls_v3`).
 
+Depth-stage packets may declare `prompt.slot_prefix_version = 1` in their speech pipeline.
+The version covers token IDs, finalized host overlay rows and frame codes as prompt inputs.
+On static full-attention KV, a free slot can reuse the matching prefix its previous request
+left there, without reserving the slot. The last prompt row is always replayed. New occupancy
+consumes the old provenance, successful prefill publishes the new prefix, and a failed device
+step invalidates the engine's prefixes. Sessions, CFG pairs, pending encoders, P/D and multimodal
+jobs do not use this cache; packets without the capability retain their current behavior.
+With a packed depth contract, live VMM uses bounded engine-local identities for these same
+content keys, outside the packet's input-token vocabulary. Identities are never recycled while
+cache entries can refer to them; exhaustion declines caching. Prompt lookup, boundary storage
+and publication use the same identities. Generated frame rows are not published as token prefixes.
+This protocol also permits VMM prefix caching for packets with encoder-overlay rows.
+Those packets require staged row identities for attachment and publication; token IDs alone
+cannot name their cached overlays. Other overlay packets retain their cache exclusion.
+Short-context live KV may instead commit whole private slots. Those slots can retain a prefix
+within the existing released-memory cap. A residency generation invalidates keys and staged
+resumes after reclamation or reassignment; idle lanes write beyond the retained prefix. Sliding
+and recurrent caches remain excluded from this slot reuse route.
+Unmasked compact tails leave room for the smallest prefill bucket when choosing a retained prefix.
+
+Depth speaker-conditioning inputs also stay resident per slot. Rebinding the same immutable
+speaker allocation (or null speaker) resets the request's controller while reusing its uploaded
+conditioning. A changed speaker, incomplete upload or failed device step requires a fresh upload.
+
+External speaker conditioning uses `tts.codec_lm.v2`; it must never be added to a v1 pipeline.
+The `prompt.conditioning` JSON has version 1 and two distinct bundle-relative packet filenames,
+`speaker_packet` and `reference_packet`. `conditioning.text_embeddings` binds the existing BF16
+text table; `conditioning.text_pad` selects the row added to the speaker embedding and rounded
+to BF16 before replacing the entire speaker prompt row. At least one overlay row is required.
+New emits also bind `conditioning.text_pad_row`, an initialized BF16 `[hidden]` constant copied
+from that checkpoint row, so the host can read it while the full table remains external.
+Older packets may use the initialized text table. A declared pad constant must be present,
+initialized and finite; it never falls back to a different source when invalid.
+The dual-stream contract declares no preset voices. Checkpoint preparation records this under
+`plow_frame_embed.conditioning` and reserves one overlay row; it preserves CustomVoice's v1
+metadata and rejects unsupported checkpoint modes.
+
+The conditioned driver binds both encoders on the serving device. One bounded cache, keyed by
+the exact normalized PCM bits, owns the shared speaker row and codec codes. Speaker-only requests
+skip codec encoding; a later transcript-conditioned request adds codes without embedding the
+speaker again. Concurrent misses share the encoder execution lock. A deferred engine callback
+finalizes the overlay and reference frame rows before prefix lookup or packed prefill.
+
+Conditioned requests require reference audio and use the default voice. A nonempty reference
+transcript enables codec-frame conditioning; otherwise only the speaker embedding is used.
+Each conditioned request reserves a stateful codec slot before LM submission. Whole-output
+decoding steps through reference and generated codes in order, then uses the source's floating
+ratio and truncation for its crop. Streaming primes its slot with the reference on each segment
+or retry and emits fresh frames. Slot exhaustion returns busy; the
+short-context window fallback cannot preserve the codec's full attention history. The streaming
+frame boundary and whole-output floating crop can differ by one sample.
+
+This request path is an unqualified candidate. Media-geometry qualification rejects v2 until its
+conditioning obligations are supported. Preparing or executing it does not qualify its accuracy,
+resource limits, capacity or latency, and no production recipe enables it.
+
+Compatible depth prompts share packed prefill and their first predictor launch. A fully cached
+prefix can feed its terminal row straight into batched decode. Terminal overlay rows keep serial
+prefill because decode does not read those overlays. Host-controlled predictors bind each new
+request's controller and speaker memory before its first batched launch. First-frame codes for
+completed prompts are staged together: adjacent slots share an upload, and all uploads share
+one synchronization before per-slot history resets. These paths require numerical and latency
+qualification before promotion.
+The streaming LM drain hands off each complete frame as an owned buffer and retains only an
+incomplete token frame, rather than another copy of the utterance's code history.
+
+Hopper objects can carry ABI 2 split-attention riders for head width 128. The runtime requires
+the hd128 function, shared-memory claim and complete bucket coverage before selecting that
+route; older objects keep their existing path.
+
+`fish_depth.json` may carry `packed` version 1: `input_vocab`, normalized `hidden` tensor,
+`backbone_logits` consumption, and an optional `decode_token` for frame-only decode embeddings.
+The emitter declares these choices; runtime dispatch does not inspect model names. The token
+batch stages prompt codes and overlays in planner order and copies continuing slots' latest
+codes into their launch rows. Compact normalized hidden rows are gathered back to physical
+slots. Predictors that consume backbone logits use a separate gathered buffer, preserving the
+compact logits. Requests keep their original token history and sampling coordinates. Packets
+without this contract, CFG pairs and learned decode position bases retain their existing routes.
+
 Reproduced 2026-09-27 at 7c0a7f7e into fresh directories (H100): every packet
 (`model.pkt`, `encoder.pkt`, `codec.pkt`, `s3gen.pkt`) byte-identical to the working assets,
 cubins SASS-identical; Qwen3-ASR WER 3.913% (p50 60.1 ms), SNAC parity rel-L2 ≤ 5.3e-6,
@@ -593,6 +672,59 @@ other arms trap. ptxas time grows superlinearly with the arms called from the in
 arm the speech cubin took 4-7 h of ptxas (the 3xFP16 attention alone added hours), with one
 packet's set 8 min (Chatterbox), 7 min (Veena), 1.5 min (Qwen3-ASR).
 
+## Speaker encoder packets
+
+An `ecapa_tdnn` checkpoint under the codec directory's `speaker_encoder/` emits
+`speaker_encoder.pkt` alongside the codec, with driver `speaker.encode.v1`. Its programs
+`encode.r128` through `encode.r2048` accept one sequence of unnormalized F32 log-mel rows,
+plus a U32 `length` containing its actual row count. Choose the smallest capacity that holds
+the input and respect `input.min_rows` / `input.max_rows`. Convolution reflection and all
+temporal reductions use the actual length. The F32 `embedding` output holds BF16 values.
+
+The checkpoint declares BF16 tensor boundaries, including rounding a convolution result before
+the separate bias addition. Population statistics preserve the rounded weighting, products,
+subtractions, squares and sums. Batch normalization and output L2 normalization are absent.
+The packet binds the shared [log-mel frontend](asr-packet-contract.md#shared-log-mel-frontend)
+through `audio.frontend.kind = 2`, `audio.frontend.filterbank` and
+`audio.frontend.window_values`: 24 kHz PCM, FFT/window 1024, hop 256, reflect padding 384,
+`sqrt(power + 1e-9)`, then filterbank projection and natural log with floor `1e-5`.
+It emits `floor(samples / 256)` rows, without sentence normalization. The `audio.frontend`
+string records the source description; the typed parameters and tensor bindings drive execution.
+Emitting this packet does not enable voice cloning in the speech API: conditioning metadata,
+request binding and codec priming remain separate requirements.
+The speaker and PCM-frontend numerical gates are not yet met.
+
+Prepared checkpoint version 2 requires a complete `pointwise_arithmetic` table for every
+accepted actual row count. Each row lists the pointwise geometries (`input_width`,
+`output_width`), their K `span`, and `reduction`: `full_f32`, `parallel_bf16` or `serial_bf16`.
+Missing rows, duplicate/missing geometries, zero/oversized spans and inconsistent full-F32
+spans are rejected. Parallel BF16 rounds each partial before its F32 sum and final rounding;
+serial BF16 rounds the accumulator after each partial addition. Bias remains separate.
+
+The compiler packs immutable BF16 weight slices and lowers activation partitions to existing
+copy, dense, binary and unary operations. It reuses
+one program per distinct arithmetic plan and capacity, binding actual rows through roles
+`encode.r{capacity}.n{rows}` under driver `speaker.encode.v2`. Choose the smallest capacity
+that holds the input and its exact row role; do not fall back to a different row's arithmetic.
+Old v1 consumers reject this driver. Version 1 retains its original programs and bindings.
+This changes metadata and program composition, without adding a device opcode. These
+arithmetic candidates still require native numerical and serving qualification.
+
+Prepared checkpoint version 3 uses the same arithmetic table and exact-row roles under
+`speaker.encode.v3`. Its `input.reflect_pad` parameter requires the caller to reflect that many
+feature rows on each side of the actual input before upload. The mel tensor holds
+`input.max_rows + 2 * input.reflect_pad` rows; `length` and capacity selection still count only
+the original rows. Padding follows the actual clip boundary, never the capacity boundary.
+The compiler derives the padded length with the existing length-affine operation and lowers
+the first convolution with zero padding and the existing split-weight convolution flags.
+Later non-pointwise convolutions request the existing split-BF16 wide path, retaining
+device-side reflection around actual length. This requires the object with padded wide
+convolution support; numerical qualification applies to the complete packet/object pair.
+The bounded `speech_f32_op_test --conv-padding-only` check covers zero, reflected and
+replicated padding, mixed actual lengths, poisoned inactive rows and finite outputs.
+Older drivers retain their original unpadded input contract. This candidate is not bound to
+live cloning requests and still requires numerical qualification.
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt
@@ -644,6 +776,37 @@ every other voice is refused as unknown; a model sharing no voice with the list 
 | `speed` | 0.5..=2.0 (default 1.0): the reply is time-stretched by waveform-similarity overlap-add, which leaves the pitch where it was. 1.0 is a bypass, bit-identical to no `speed` at all. A stretched reply ends with a half-frame (15 ms) fade, the last frame having no successor to overlap |
 | `top_k`, `repetition_penalty`, `cfg_weight`, `instructions`, `ref_audio` + `ref_text` | optional controls: taken where the card declares them (`defaults.top_k`, `defaults.repetition_penalty`, `defaults.cfg_weight`, `instructions`, `voice_cloning`), else 400 naming the field; a sampler with a bounded top-k (`limits.top_k_max`, Fish S2) takes `top_k` in 1..that bound and cannot turn it off |
 | `ref_audio` + `ref_text` | voice cloning (Breeze, Fish S2): base64 or `data:` URL audio (wav, mp3, flac, ogg) of at most 20.48 s (Breeze) / 23.78 s (Fish) and its exact transcript; the reference encoder (`ref_encoder.pkt`) runs once per request on the engine thread before the first prefill chunk (the codes of the 16 most recent clips are kept by exact PCM, so a repeated clip skips the launch), and every segment's prompt opens with the contract's clone layout: transcript, reference frames, then an end frame (Breeze) or the system turn's close (Fish). The Fish encoder is FP32 and matches the official server's codes exactly (9.3 s clip: 200/200 frames, 105 ms on H100); the request never takes a session (its frame rows are placeholders until encoded) |
+
+Reference encoder driver `codec.encode.v2` requires a `samples` tensor role of type `u32[1]`,
+alongside `pcm`, `codes`, the `encode.f{F}` capacity programs and the existing audio/codec
+parameters. The host writes the actual PCM prefix and its sample count in one batch. Programs
+derive each layer's valid length, including ceil division at strided convolutions, and bound
+attention and final padding by those lengths. Unused PCM capacity need not be uploaded.
+Driver `codec.encode.v1` retains whole-capacity zero padding. Unsupported drivers or a missing
+or incorrectly typed v2 sample-count binding are rejected. This contract alone does not enable
+a model's cloning capability or establish numerical/performance qualification.
+
+Concurrent reference-encoder cache misses reuse a completed encoding published while they
+wait for the encoder, provided it remains in the recent-clip cache. Failed encodings are not
+cached. A cache hit does not wait for an unrelated encoding.
+
+Speaker sidecars bind through `speaker.encode.v1` capacity programs (`encode.r{R}`) or
+`speaker.encode.v2` / `v3` exact-row programs (`encode.r{R}.n{N}`). Every declared input row
+count must have a program; execution selects the smallest fitting capacity. Required tensor
+roles are `mel: f32[max_rows + 2 * reflect_pad, input_width]`, `length: u32[1]` and
+`embedding: f32[output_width]`, with bounds and widths from the pipeline parameters.
+Only v3 requires `input.reflect_pad`; older drivers reject it. The binding extracts the
+packet-defined frontend, batches valid feature rows and their length, and rejects nonfinite
+embeddings. This binding alone does not enable a live cloning endpoint or qualify performance.
+
+Stateful codec priming consumes reference codes on a fresh stream slot in bounded steps and
+discards their PCM. The next step continues at the first new frame. Code shape and slot state
+are checked before submission. Priming owns the slot until successful completion; failure or
+cancellation releases it, and invalid step output poisons it. Each step preserves its urgency,
+deadline and retained input buffers. A cloning
+driver must explicitly supply its decoder prefix; existing prompt-only cloning is unchanged.
+Decoder rotary coefficients preserve the source precision through existing packet flags. F32
+coefficients must not be rounded to BF16; a source with BF16 tables retains that rounding.
 
 A schema error (unknown field, wrong type) is 400 `invalid_json`; every 429 carries `Retry-After`.
 A whole reply carries `x-plow-audio-seconds` and `x-plow-lm-ms`. `cfg_weight` is

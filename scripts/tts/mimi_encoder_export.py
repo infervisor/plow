@@ -15,8 +15,10 @@ model_type mimi_encoder:
   {sem,ac}.proj                [codebook_dim][hidden] input projection of each RVQ
   {sem,ac}.E{k} / .nb{k}       centroids embed_sum / clamp(cluster_usage, 1e-5) and -|e|^2 / 2: the
                                nearest centroid is the argmax of x . e - |e|^2 / 2
+  {sem,ac}.nb_f32{k}           FP32 centroid square-sum, matching the reference distance precision
 
-  HF_HOME=... python scripts/tts/mimi_encoder_export.py OUT_DIR REVISION [REPO]   (REPO kyutai/mimi)
+  HF_HOME=... python scripts/tts/mimi_encoder_export.py OUT_DIR REVISION [REPO [SUBDIR]]
+  REPO alone selects an unwrapped Mimi checkpoint; REPO SUBDIR selects a tokenizer's encoder.
 """
 import json
 import os
@@ -29,7 +31,7 @@ REPO = "models--BreezeBlue--Breeze-TTS-2"
 
 
 def main():
-    if len(sys.argv) not in (3, 4):
+    if len(sys.argv) not in (3, 4, 5):
         sys.exit(__doc__)
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
@@ -42,7 +44,9 @@ def main():
         top = dict(encoder_config=ec, encoder_valid_num_quantizers=ec.get("num_quantizers", 32),
                    encode_downsample_rate=int(ec["sampling_rate"] / ec["frame_rate"]))
     else:
-        src = os.path.join(hub, REPO, "snapshots", sys.argv[2], "audio_tokenizer")
+        repo, sub = (REPO, "audio_tokenizer") if len(sys.argv) == 3 else (
+            "models--" + sys.argv[3].replace("/", "--"), sys.argv[4])
+        src = os.path.join(hub, repo, "snapshots", sys.argv[2], sub)
         sd = {k[len("encoder."):]: v for k, v in load_file(f"{src}/model.safetensors").items()
               if k.startswith("encoder.")}
         top = json.load(open(f"{src}/config.json"))
@@ -53,6 +57,7 @@ def main():
         T[name] = t.detach().double().float().contiguous()
 
     assert ec["use_causal_conv"] and not ec["use_conv_shortcut"] and ec["num_residual_layers"] == 1
+    assert ec.get("pad_mode", "constant") == "constant"
     assert ec["audio_channels"] == 1 and ec["num_key_value_heads"] == ec["num_attention_heads"]
     ratios = list(reversed(ec["upsampling_ratios"]))
     put("enc.c0.w", sd["encoder.layers.0.conv.weight"])
@@ -92,10 +97,11 @@ def main():
             e = sd[f"{cb}.embed_sum"].double() / sd[f"{cb}.cluster_usage"].double().clamp(min=1e-5)[:, None]
             put(f"{g}.E{k}", e)
             put(f"{g}.nb{k}", -0.5 * (e * e).sum(1))
+            put(f"{g}.nb_f32{k}", -0.5 * e.float().square().sum(1))
 
     save_file(T, os.path.join(out, "model.safetensors"))
     config = dict(
-        model_type="mimi_encoder", sampling_rate=ec["sampling_rate"],
+        model_type="mimi_encoder", version=2, sampling_rate=ec["sampling_rate"],
         frame_samples=top["encode_downsample_rate"], filters=ec["num_filters"], ratios=ratios,
         kernel=ec["kernel_size"], last_kernel=ec["last_kernel_size"],
         residual_kernel=ec["residual_kernel_size"], compress=ec["compress"], hidden=ec["hidden_size"],

@@ -79,6 +79,9 @@ fn audio_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
 }
 
 fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, String> {
+    if p.strings.contains_key(crate::dual_stream::CONDITIONING_KEY) {
+        return Err("speaker conditioning cannot use legacy speech media geometry".into());
+    }
     let c = sidecar(p, "codec.packet", sidecars, |c| c.driver == "codec.v1")?;
     let prompt = param(p, "prompt.prefix.count")?
         .checked_add(param(p, "prompt.suffix.count")?)
@@ -113,8 +116,9 @@ fn codec_lm(p: &PacketPipeline, sidecars: &[MediaPacket<'_>]) -> Result<Value, S
     }
     if p.strings.contains_key("clone.encoder") {
         let e = sidecar(p, "clone.encoder", sidecars, |e| {
-            e.driver == "codec.encode.v1"
+            matches!(e.driver.as_str(), "codec.encode.v1" | "codec.encode.v2")
         })?;
+        e.codec_sample_input()?;
         let frames: Vec<u64> = e
             .programs
             .keys()
@@ -292,6 +296,9 @@ pub fn request(
                 audio_lm(p, sidecars)?
             }
             "tts.codec_lm.v1" => codec_lm(p, sidecars)?,
+            driver if driver.starts_with("tts.codec_lm.") => {
+                return Err(format!("unsupported speech media geometry driver {driver}"));
+            }
             "tts.guided_lm.v1" => guided_lm(p, sidecars)?,
             "rnnt.greedy.v1" => rnnt(p, main.vocabulary)?,
             "vad.frame.v1" => vad(p)?,
@@ -310,6 +317,37 @@ mod tests {
     use super::*;
     use crate::packet_pipeline::{PipelineDType, PipelineTensor};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn unsupported_speech_drivers_cannot_skip_media_qualification() {
+        let pipes = vec![pipeline(
+            "speech",
+            crate::dual_stream::CONDITIONED_DRIVER,
+            &[],
+            &[],
+            &[],
+        )];
+        let main = MediaPacket {
+            file: "model.pkt",
+            pipelines: &pipes,
+            vocabulary: None,
+            multimodal: None,
+            mm_tensors: None,
+        };
+        assert!(request(&main, &[])
+            .unwrap_err()
+            .contains("unsupported speech"));
+        let mut legacy = pipes.clone();
+        legacy[0].driver = "tts.codec_lm.v1".into();
+        legacy[0]
+            .strings
+            .insert(crate::dual_stream::CONDITIONING_KEY.into(), "{}".into());
+        let main = MediaPacket {
+            pipelines: &legacy,
+            ..main
+        };
+        assert!(request(&main, &[]).unwrap_err().contains("legacy speech"));
+    }
 
     fn pipeline(
         name: &str,
@@ -470,7 +508,7 @@ mod tests {
             &[("pcm", vec![131072]), ("codes", vec![64, 7])],
         );
         enc.programs = BTreeMap::from([("encode.f32".into(), 0), ("encode.f64".into(), 1)]);
-        let enc = vec![enc];
+        let mut enc = vec![enc];
         let sidecars = [packet("codec.pkt", &codec), packet("ref_encoder.pkt", &enc)];
         let family = &request(&packet("model.pkt", &lm), &sidecars)
             .unwrap()
@@ -482,6 +520,23 @@ mod tests {
             request(&packet("model.pkt", &lm), &sidecars[..1]).is_err(),
             "declared encoder absent"
         );
+        enc[0].driver = "codec.encode.v2".into();
+        let sidecars = [packet("codec.pkt", &codec), packet("ref_encoder.pkt", &enc)];
+        assert!(request(&packet("model.pkt", &lm), &sidecars).is_err());
+        enc[0].tensors.insert(
+            "samples".into(),
+            PipelineTensor {
+                name: "in.samples".into(),
+                dtype: PipelineDType::U32,
+                shape: vec![1],
+            },
+        );
+        let sidecars = [packet("codec.pkt", &codec), packet("ref_encoder.pkt", &enc)];
+        let family = &request(&packet("model.pkt", &lm), &sidecars)
+            .unwrap()
+            .unwrap()["families"][0];
+        assert_eq!(family["clone_frames"], serde_json::json!([32, 64]));
+        assert_eq!(family["clone_codes_capacity"], 448);
     }
 
     #[test]

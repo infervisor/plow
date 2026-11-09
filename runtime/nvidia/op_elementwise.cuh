@@ -159,7 +159,8 @@ static __device__ void d_embed_frame(__nv_bfloat16* __restrict__ out, const __nv
 }
 
 /* SampleFishBf16 (op 219): Fish S2 sampling, one block per row; see dev.rs. Arena: PLOW_NV_WARPS u64
- * + PLOW_NV_WARPS f32 reduction slots, 64 selected classes and logits, then the row as bf16 bits. */
+ * + PLOW_NV_WARPS f32 reduction slots, 64 selected classes and logits, the row as bf16 bits, then the
+ * top-k scratch (block_topk_u64: 64 u64 + 260 u32, 16-byte aligned). */
 static __device__ __forceinline__ unsigned long long sf_mix(unsigned long long z) {
     z += 0x9e3779b97f4a7c15ull;
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -173,6 +174,94 @@ static __device__ __forceinline__ float sf_neg_log_exp1(unsigned long long seed,
     const float u = ((float)(z >> 40) + 0.5f) * (1.0f / 16777216.0f);
     return -logf(-logf(u));
 }
+/* Whether shared bytes up to `end` lie inside this launch's shared allocation (static + dynamic):
+ * the radix top-k scratch sits past the row, so a large vocabulary or a narrow launch claim takes
+ * the K-round selection instead. */
+/* Whether [dynamic arena base, end) lies inside the launch's dynamic shared allocation. */
+static __device__ __forceinline__ bool smem_fits(const void* end) {
+    extern __shared__ __align__(16) unsigned char plow_dyn_base[];
+    unsigned dyn;
+    asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dyn));
+    return (size_t)__cvta_generic_to_shared(end) <= (size_t)__cvta_generic_to_shared(plow_dyn_base) + dyn;
+}
+/* Block-wide top-K (K <= 64, K <= n) of n distinct u64 keys key(i): sel[0..K) = ~(unsigned)key in
+ * descending key order, the set and order K rounds of block_max_u64 pick. MSD radix select over 8-bit
+ * digits from bits [shift0, shift0 + 8) down, then a rank sort of the K survivors. Scratch: ctl[4] and
+ * hist[256] u32, buf[64] u64, pm[2] u64, never __restrict__: other lanes rewrite them between
+ * barriers, and a restrict pm let a lane read back its own older store. Ends synchronized. */
+template <class KeyF>
+static __device__ __forceinline__ void block_topk_u64(KeyF key, unsigned n, unsigned K, int shift0, unsigned* sel,
+                                      unsigned* ctl, unsigned* hist, unsigned long long* buf,
+                                      unsigned long long* pm) {
+    if (threadIdx.x == 0) {
+        pm[0] = 0;
+        pm[1] = 0;
+        ctl[0] = K;
+        ctl[1] = 0;
+        ctl[2] = 0;
+    }
+    for (int shift = shift0; shift >= 0; shift -= 8) {
+        for (unsigned b = threadIdx.x; b < 256u; b += PLOW_NV_THREADS) hist[b] = 0;
+        __syncthreads();
+        const unsigned long long pre = pm[0], msk = pm[1];
+        for (unsigned i = threadIdx.x; i < n; i += PLOW_NV_THREADS) {
+            const unsigned long long q = key(i);
+            if ((q & msk) == pre) atomicAdd(&hist[(unsigned)(q >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x < 32u) {
+            /* lane l holds bins 255 - 8l .. 248 - 8l: an inclusive scan from the top bin finds the
+             * digit holding the need-th largest remaining key. */
+            const unsigned lane = threadIdx.x, need = ctl[0];
+            const unsigned* h = hist + 248u - 8u * lane; /* h[7 - j] = the lane's j-th bin from the top */
+            unsigned sum = 0;
+#pragma unroll
+            for (unsigned j = 0; j < 8u; j++) sum += h[j];
+            unsigned incl = sum;
+#pragma unroll
+            for (unsigned off = 1; off < 32u; off <<= 1) {
+                const unsigned o = __shfl_up_sync(0xffffffffu, incl, off);
+                if (lane >= off) incl += o;
+            }
+            unsigned cum = incl - sum;
+            __syncwarp(); /* every lane has read `need` before the selected lane overwrites ctl[0] */
+            if (cum < need && need <= incl) {
+                for (unsigned j = 0; j < 8u; j++) {
+                    const unsigned c = h[7u - j];
+                    if (cum + c >= need) {
+                        const unsigned left = need - cum;
+                        pm[0] = pre | ((unsigned long long)(255u - 8u * lane - j) << shift);
+                        pm[1] = msk | (0xffull << shift);
+                        ctl[0] = left;
+                        ctl[1] = c == left; /* the whole digit is taken: the threshold is final */
+                        break;
+                    }
+                    cum += c;
+                }
+            }
+        }
+        __syncthreads();
+        if (ctl[1]) break;
+    }
+    /* Exactly K keys reach the threshold: the ones above its prefix and the `left` sharing it. */
+    const unsigned long long T = pm[0];
+    for (unsigned i = threadIdx.x; i < n; i += PLOW_NV_THREADS) {
+        const unsigned long long q = key(i);
+        if (q >= T) {
+            const unsigned at = atomicAdd(&ctl[2], 1u);
+            if (at < 64u) buf[at] = q;
+        }
+    }
+    __syncthreads();
+    for (unsigned t = threadIdx.x; t < K; t += PLOW_NV_THREADS) {
+        const unsigned long long q = buf[t];
+        unsigned rank = 0;
+        for (unsigned j = 0; j < K; j++) rank += buf[j] > q;
+        sel[rank] = ~(unsigned)q;
+    }
+    __syncthreads();
+}
+
 static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bfloat16* __restrict__ logits,
                                      const float* __restrict__ params, const unsigned* __restrict__ topk,
                                      const unsigned long long* __restrict__ seed, const unsigned* __restrict__ step,
@@ -186,6 +275,9 @@ static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bflo
     unsigned* sel = (unsigned*)(fpart + PLOW_NV_WARPS);
     float* sv = (float*)(sel + 64);
     unsigned short* L = (unsigned short*)(sv + 64);
+    unsigned long long* tk_buf = (unsigned long long*)(((size_t)(L + vocab) + 15u) & ~(size_t)15u);
+    unsigned* tk_ctl = (unsigned*)(tk_buf + 64);
+    const bool radix = smem_fits(tk_ctl + 4 + 256);
     const unsigned ls = lstride ? lstride : vocab;
     for (unsigned r = slice; r < rows; r += nblk) {
         const unsigned K = min(min(topk[r], 64u), vocab);
@@ -202,21 +294,33 @@ static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bflo
         for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS)
             z += expf(__uint_as_float((unsigned)L[i] << 16) - m);
         z = block_sum(z, fpart);
-        for (unsigned k = 0; k < K; k++) {
-            unsigned long long best = 0;
-            for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
-                unsigned short b = L[i];
-                const unsigned long long p = amax_pack(*(const __nv_bfloat16*)&b, i);
-                best = p > best ? p : best;
-            }
-            best = block_max_u64(best, part);
-            if (threadIdx.x == 0) {
-                const unsigned idx = ~(unsigned)best;
-                sel[k] = idx;
-                sv[k] = __uint_as_float((unsigned)L[idx] << 16);
-                L[idx] = 0xFF80u;
-            }
+        if (radix) {
+            block_topk_u64(
+                [L](unsigned i) {
+                    const unsigned short b = L[i];
+                    return amax_pack(*(const __nv_bfloat16*)&b, i);
+                },
+                vocab, K, 40, sel, tk_ctl, tk_ctl + 4, tk_buf, part);
+            for (unsigned k = threadIdx.x; k < K; k += PLOW_NV_THREADS)
+                sv[k] = __uint_as_float((unsigned)L[sel[k]] << 16);
             __syncthreads();
+        } else {
+            for (unsigned k = 0; k < K; k++) {
+                unsigned long long best = 0;
+                for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
+                    unsigned short b = L[i];
+                    const unsigned long long p = amax_pack(*(const __nv_bfloat16*)&b, i);
+                    best = p > best ? p : best;
+                }
+                best = block_max_u64(best, part);
+                if (threadIdx.x == 0) {
+                    const unsigned idx = ~(unsigned)best;
+                    sel[k] = idx;
+                    sv[k] = __uint_as_float((unsigned)L[idx] << 16);
+                    L[idx] = 0xFF80u;
+                }
+                __syncthreads();
+            }
         }
         if (threadIdx.x == 0) {
             const float* p = params + (size_t)r * 4u;
@@ -254,15 +358,25 @@ static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bflo
 
 /* GemvF32Out (op 220): C[m][n] = sum_k x[m][k] * W[n][k] in fp32 (exact bf16 products, fp32 fma), stored
  * fp32 — a reference that casts both operands to f32 before its matmul. A warp per output row, rows
- * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. `round_bf16` (flag bit 11): C rounded to bf16. */
+ * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. `round_bf16` (flag bit 11): C rounded to bf16.
+ * When all of x fits the launch's arena, a block stages it once (every warp re-read it from L2
+ * per output row otherwise); the arithmetic is the same either way. */
 static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N, unsigned K,
-                                     bool round_bf16, unsigned slice, unsigned nblk) {
+                                     bool round_bf16, unsigned slice, unsigned nblk, float* arena) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned per = (N + nblk - 1) / nblk;
     const unsigned n0 = slice * per;
     const unsigned n1 = min(n0 + per, N);
+    if (n0 >= n1) return;
+    __nv_bfloat16* xs = (__nv_bfloat16*)arena;
+    if ((K & 7u) == 0 && ((uintptr_t)x & 15u) == 0 && smem_fits(xs + (size_t)M * K)) {
+        for (size_t i = (size_t)threadIdx.x * 8u; i < (size_t)M * K; i += PLOW_NV_THREADS * 8u)
+            *(uint4*)(xs + i) = *(const uint4*)(x + i);
+        __syncthreads();
+        x = xs;
+    }
     for (unsigned n = n0 + warp; n < n1; n += PLOW_NV_WARPS) {
         const __nv_bfloat16* wr = W + (size_t)n * K;
         for (unsigned m0 = 0; m0 < M; m0 += 8) {
@@ -647,11 +761,31 @@ static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W
 }
 
 /* SampleSmallF32 (op 221): one block per row of f32 logits; see dev.rs. Arena: PLOW_NV_WARPS u64 +
- * PLOW_NV_WARPS f32 reduction slots, 64 selected classes and values, then the row (f32). */
+ * PLOW_NV_WARPS f32 reduction slots, 64 selected classes and values, the row (f32), then the top-k
+ * scratch (block_topk_u64). */
 static __device__ __forceinline__ unsigned long long f32_key(float f, unsigned i) {
     const unsigned b = __float_as_uint(f + 0.f); /* -0 ranks as +0 (the golden's comparison) */
     const unsigned key = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
     return ((unsigned long long)key << 32) | (unsigned long long)(~i);
+}
+/* argmax over i < n of sv[i] + sf_neg_log_exp1(seed, step, coord, 0, i) by one full warp: lanes scan
+ * i = lane, lane + 32, ... with strict >, then (max score, lowest i) across lanes = a serial strict->
+ * scan's pick; nothing above -inf (or NaN) picks 0. */
+static __device__ __forceinline__ unsigned gumbel_pick_warp(const float* sv, unsigned n, unsigned long long seed,
+                                                            unsigned step, unsigned coord) {
+    unsigned best = 0xFFFFFFFFu;
+    float bv = -INFINITY;
+    for (unsigned i = threadIdx.x & 31u; i < n; i += 32u) {
+        const float v = sv[i] + sf_neg_log_exp1(seed, step, coord, 0u, i);
+        if (v > bv) { bv = v; best = i; }
+    }
+#pragma unroll
+    for (unsigned d = 16; d; d >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, d);
+        const unsigned ob = __shfl_xor_sync(0xffffffffu, best, d);
+        if (ov > bv || (ov == bv && ob < best)) { bv = ov; best = ob; }
+    }
+    return best == 0xFFFFFFFFu ? 0u : best;
 }
 static __device__ void d_sample_small(unsigned* __restrict__ out, const float* __restrict__ logits,
                                       const float* __restrict__ params, const unsigned* __restrict__ ctl,
@@ -665,6 +799,9 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
     unsigned* sel = (unsigned*)(fpart + PLOW_NV_WARPS);
     float* sv = (float*)(sel + 64);
     float* L = sv + 64;
+    unsigned long long* tk_buf = (unsigned long long*)(((size_t)(L + vocab) + 15u) & ~(size_t)15u);
+    unsigned* tk_ctl = (unsigned*)(tk_buf + 64);
+    const bool radix = smem_fits(tk_ctl + 4 + 256);
     const unsigned ls = lstride ? lstride : vocab;
     for (unsigned r = slice; r < rows; r += nblk) {
         /* A CFG pair (plow_asset::fish_depth GUIDE / FOLLOW bits): the guide row r samples
@@ -689,25 +826,33 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
             L[i] = t > 0.f ? __fdiv_rn(v, t) : v;
         }
         __syncthreads();
-        for (unsigned k = 0; k < K; k++) {
-            unsigned long long best = 0;
-            for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
-                const unsigned long long q = f32_key(L[i], i);
-                best = q > best ? q : best;
-            }
-            best = block_max_u64(best, part);
-            if (threadIdx.x == 0) {
-                const unsigned idx = ~(unsigned)best;
-                sel[k] = idx;
-                sv[k] = L[idx];
-                L[idx] = -INFINITY;
-            }
+        if (radix) {
+            block_topk_u64([L](unsigned i) { return f32_key(L[i], i); }, vocab, K, 56, sel, tk_ctl,
+                           tk_ctl + 4, tk_buf, part);
+            for (unsigned k = threadIdx.x; k < K; k += PLOW_NV_THREADS) sv[k] = L[sel[k]];
             __syncthreads();
+        } else {
+            for (unsigned k = 0; k < K; k++) {
+                unsigned long long best = 0;
+                for (unsigned i = threadIdx.x; i < vocab; i += PLOW_NV_THREADS) {
+                    const unsigned long long q = f32_key(L[i], i);
+                    best = q > best ? q : best;
+                }
+                best = block_max_u64(best, part);
+                if (threadIdx.x == 0) {
+                    const unsigned idx = ~(unsigned)best;
+                    sel[k] = idx;
+                    sv[k] = L[idx];
+                    L[idx] = -INFINITY;
+                }
+                __syncthreads();
+            }
         }
-        if (threadIdx.x == 0) {
+        if (threadIdx.x < 32u) {
+            const unsigned lane = threadIdx.x;
             const unsigned step = ctl[2u * r + 1u];
             unsigned n = K;
-            if (p[1] < 1.f) {
+            if (p[1] < 1.f && lane == 0) {
                 float z = 0.f;
                 for (unsigned i = 0; i < K; i++) z += expf(sv[i] - sv[0]);
                 float cum = 0.f;
@@ -716,21 +861,19 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
                     cum += expf(sv[i] - sv[0]) / z;
                 }
             }
-            unsigned best = 0;
-            float bv = -INFINITY;
-            for (unsigned i = 0; i < n; i++) {
-                const float v = sv[i] + sf_neg_log_exp1(seed[r], step, coord, 0u, i);
-                if (v > bv) { bv = v; best = i; }
-            }
-            unsigned c = sel[best];
-            const size_t o = (size_t)r * out_stride + out_col0;
-            if (force && force[o] != 0xFFFFFFFFu) c = force[o];
-            if (bm) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
-            out[o] = c;
-            if (eidx) eidx[r] = c + eoff;
-            if (guide) {
-                out[o + out_stride] = c;
-                if (eidx) eidx[r + 1] = c + eoff;
+            n = __shfl_sync(0xffffffffu, n, 0);
+            const unsigned best = gumbel_pick_warp(sv, n, seed[r], step, coord);
+            if (lane == 0) {
+                unsigned c = sel[best];
+                const size_t o = (size_t)r * out_stride + out_col0;
+                if (force && force[o] != 0xFFFFFFFFu) c = force[o];
+                if (bm) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
+                out[o] = c;
+                if (eidx) eidx[r] = c + eoff;
+                if (guide) {
+                    out[o + out_stride] = c;
+                    if (eidx) eidx[r + 1] = c + eoff;
+                }
             }
         }
         __syncthreads();

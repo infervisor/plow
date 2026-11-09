@@ -386,6 +386,7 @@ fn snac_program(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        wgmma_ragged: false,
         pad_after: None,
     };
     let z_h = p_handle(&p, "act.codec.a");
@@ -626,6 +627,8 @@ pub(crate) struct Conv {
     /// weights): its input activation runs as its own pass and a dual alpha `{unit}.a12` splits
     /// into that pass's `{unit}.a1` and the conv's output `{unit}.a2`.
     pub(crate) taps_wgmma: bool,
+    /// Wgmma tiles may span taps / transposed-conv phases at widths % 4 (flag bit 21).
+    pub(crate) wgmma_ragged: bool,
 }
 
 /// `c` with the fusions `fuse` decides; an unfused piece runs as its own `UnaryF32` /
@@ -647,7 +650,7 @@ pub(crate) fn fused_conv(
         && c.kernel == 2 * c.stride
         && c.dilation == 0
         && c.cin % 64 == 0
-        && c.cout % 64 == 0
+        && (c.cout % 64 == 0 || (c.wgmma_ragged && c.cout % 4 == 0 && c.cout >= 64))
         && c.act_out == Activation::None
         && c.residual.is_none()
         && c.row_scale.is_none()
@@ -757,6 +760,7 @@ pub(crate) fn fused_conv(
         wgmma: splits.is_some(),
         weight_split: split,
         dual_alpha: dual,
+        wgmma_ragged: c.wgmma_ragged && (ct || taps),
     };
     let e = match c.row_scale {
         Some((scale, _)) => p.conv1d_f32_row_scaled(x, &deps, stage, scale)?,
@@ -976,6 +980,7 @@ mod tests {
             row_scale: None,
             alpha_out: None,
             taps_wgmma: false,
+            wgmma_ragged: false,
         };
         fused_conv(&mut p, ConvFusions(None), Some(&splits), x, first.done, c).unwrap();
         assert_eq!(splits.borrow()["blk0.up.w"], (8 * 512, 2 * 1024, 1));
@@ -1079,6 +1084,7 @@ mod tests {
             row_scale: None,
             alpha_out: Some("w.dec.blk0.ru0.a12".into()),
             taps_wgmma: true,
+            wgmma_ragged: false,
         };
         fused_conv(&mut p, ConvFusions(None), Some(&splits), x, first.done, c).unwrap();
         assert_eq!(splits.borrow()["dec.blk0.ru0.c1.w"], (ch, 7 * ch, 7));

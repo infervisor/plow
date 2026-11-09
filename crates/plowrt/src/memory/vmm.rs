@@ -324,6 +324,7 @@ pub struct VmmRings {
     ops: Arc<dyn VmmOps>,
     windows: Vec<RingWindow>,
     mapped: Vec<bool>,
+    generations: Vec<u64>,
     prefix: usize,
     /// Rows the latest [`Self::ensure_prefix`] mapped for a launch; [`Self::release_idle`] keeps them.
     launch_rows: usize,
@@ -381,6 +382,7 @@ impl VmmRings {
             ops,
             windows: Vec::with_capacity(tensors.len()),
             mapped: vec![false; batch],
+            generations: vec![0; batch],
             prefix: 0,
             launch_rows: 0,
             stats: LiveRingStats {
@@ -495,6 +497,12 @@ impl VmmRings {
         self.mapped.len()
     }
 
+    pub fn residency(&self, slot: usize) -> Option<u64> {
+        (self.mapped.get(slot).copied().unwrap_or(false)
+            || self.parked.get(slot).copied().unwrap_or(false))
+        .then(|| self.generations[slot])
+    }
+
     /// What released units the rings keep: `(recycle, bounded, cap)`.
     pub fn retention(&self) -> (bool, bool, u64) {
         (self.recycle, self.bounded, self.spare_cap)
@@ -525,6 +533,7 @@ impl VmmRings {
 
     /// Hand a parked slot's units to the spare list, its rows back to idle scratch.
     fn unpark(&mut self, slot: usize) {
+        self.generations[slot] = self.generations[slot].wrapping_add(1);
         self.parked[slot] = false;
         self.for_slot_units(slot, |rings, window, unit| rings.release_unit(window, unit));
     }
@@ -635,6 +644,7 @@ impl VmmRings {
             self.mark_mapped(slot);
             return Ok(());
         }
+        self.generations[slot] = self.generations[slot].wrapping_add(1);
         if self.spare.is_empty() {
             if let Some(parked) = self.parked.iter().rposition(|&p| p) {
                 self.unpark(parked);
@@ -688,6 +698,7 @@ impl VmmRings {
         if self.recycle {
             self.parked[slot] = true;
         } else {
+            self.generations[slot] = self.generations[slot].wrapping_add(1);
             self.for_slot_units(slot, |rings, window, unit| rings.release_unit(window, unit));
         }
         self.mapped[slot] = false;
@@ -7897,6 +7908,44 @@ mod tests {
         rings.ensure_slot(0).unwrap();
         assert_eq!(rings.stats().resident_bytes, 640 << 20);
         assert_eq!(ring_ops.creates.load(Ordering::SeqCst), 160);
+    }
+
+    #[test]
+    fn ring_residency_survives_parking_but_not_reassignment_or_pressure() {
+        let ops = Arc::new(MockVmm::default());
+        ops.granularity.store(64, Ordering::SeqCst);
+        let mut rings = VmmRings::new_idle_backed(
+            ops,
+            &[LiveRingTensor {
+                tensor: 0,
+                slot_bytes: 64,
+            }],
+            4,
+        )
+        .unwrap();
+        rings.enable_bounded_park(256);
+        assert_eq!(rings.residency(0), None);
+        rings.ensure_slot(0).unwrap();
+        let first = rings.residency(0).unwrap();
+        rings.release_slot(0);
+        assert_eq!(rings.residency(0), Some(first));
+        rings.ensure_slot(0).unwrap();
+        assert_eq!(rings.residency(0), Some(first));
+        rings.release_slot(0);
+        rings.ensure_slot(1).unwrap();
+        assert_eq!(
+            rings.residency(0),
+            None,
+            "the new slot stole the parked units"
+        );
+        rings.ensure_slot(0).unwrap();
+        let second = rings.residency(0).unwrap();
+        assert_ne!(first, second);
+        rings.release_slot(0);
+        assert!(rings.release_parked());
+        assert_eq!(rings.residency(0), None);
+        rings.ensure_slot(0).unwrap();
+        assert_ne!(rings.residency(0), Some(second));
     }
 
     fn prompt(n: usize) -> Vec<u32> {

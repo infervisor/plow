@@ -52,6 +52,90 @@ pub(crate) mod stretch;
 
 use std::path::Path;
 
+#[derive(Default, Debug)]
+pub(crate) struct Codes {
+    pub(crate) host: Vec<i32>,
+    sources: smallvec::SmallVec<[Option<crate::exec::packet_runtime::PacketBuffer>; 1]>,
+}
+
+impl From<Vec<i32>> for Codes {
+    fn from(host: Vec<i32>) -> Self {
+        Self {
+            host,
+            sources: smallvec::SmallVec::new(),
+        }
+    }
+}
+
+impl FromIterator<i32> for Codes {
+    fn from_iter<T: IntoIterator<Item = i32>>(iter: T) -> Self {
+        Vec::from_iter(iter).into()
+    }
+}
+
+impl std::ops::Deref for Codes {
+    type Target = [i32];
+    fn deref(&self) -> &[i32] {
+        &self.host
+    }
+}
+
+impl Codes {
+    pub(crate) fn frame(
+        host: Vec<i32>,
+        source: Option<crate::exec::packet_runtime::PacketBuffer>,
+    ) -> Self {
+        Self {
+            host,
+            sources: source.into_iter().map(Some).collect(),
+        }
+    }
+
+    pub(crate) fn extend(&mut self, other: Self, fc: usize) {
+        if !self.sources.is_empty() || !other.sources.is_empty() {
+            self.sources.resize_with(self.host.len() / fc, || None);
+            if other.sources.is_empty() {
+                self.sources
+                    .resize_with((self.host.len() + other.host.len()) / fc, || None);
+            } else {
+                self.sources.extend(other.sources);
+            }
+        }
+        self.host.extend(other.host);
+    }
+
+    pub(crate) fn slice(&self, range: std::ops::Range<usize>, fc: usize) -> Self {
+        Self {
+            host: self.host[range.clone()].to_vec(),
+            sources: if self.sources.is_empty() {
+                smallvec::SmallVec::new()
+            } else {
+                self.sources[range.start / fc..range.end / fc]
+                    .iter()
+                    .cloned()
+                    .collect()
+            },
+        }
+    }
+
+    pub(crate) fn release(&mut self, frames: std::ops::Range<usize>) {
+        if let Some(sources) = self.sources.get_mut(frames) {
+            sources.fill(None);
+        }
+    }
+
+    fn split_off(&mut self, words: usize, fc: usize) -> Self {
+        Self {
+            host: self.host.split_off(words),
+            sources: if self.sources.is_empty() {
+                smallvec::SmallVec::new()
+            } else {
+                self.sources.drain(words / fc..).collect()
+            },
+        }
+    }
+}
+
 use plow_asset::packet_pipeline::PacketPipeline;
 
 use crate::{Result, RuntimeError};
@@ -106,6 +190,7 @@ pub struct SpeechContract {
     pub text_encoder: Option<String>,
     /// Voice cloning through a reference encoder packet beside the LM.
     pub clone: Option<CloneContract>,
+    pub conditioning: Option<ConditioningContract>,
     /// Text-plus-codec rows ([`plow_asset::dual_stream`]); its voices, languages and
     /// instructions are the model's.
     pub dual_stream: Option<plow_asset::dual_stream::DualStream>,
@@ -113,6 +198,7 @@ pub struct SpeechContract {
     pub onset_trim: Option<OnsetTrimPolicy>,
     /// New frames a stream's first stateful codec step waits for (`stream.first_frames`).
     pub stream_first_frames: Option<usize>,
+    pub slot_prefix_reuse: bool,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -127,6 +213,14 @@ pub struct CloneContract {
     pub eos_code: Option<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConditioningContract {
+    pub packets: plow_asset::dual_stream::SpeakerConditioning,
+    pub text_embeddings: plow_asset::packet_pipeline::PipelineTensor,
+    pub text_pad_row: Option<plow_asset::packet_pipeline::PipelineTensor>,
+    pub text_pad: usize,
+}
+
 impl SpeechContract {
     /// New frames a stream's first stateful codec step decodes.
     pub fn first_frames(&self) -> usize {
@@ -138,11 +232,20 @@ impl SpeechContract {
     }
 
     pub fn from_pipeline(p: &PacketPipeline) -> Result<Self> {
-        if p.driver != DRIVER {
+        let conditioned = p.driver == plow_asset::dual_stream::CONDITIONED_DRIVER;
+        if p.driver != DRIVER && !conditioned {
             return Err(RuntimeError::Rejected(format!(
                 "pipeline {} is {}, not {DRIVER}",
                 p.name, p.driver
             )));
+        }
+        if !conditioned
+            && p.strings
+                .contains_key(plow_asset::dual_stream::CONDITIONING_KEY)
+        {
+            return Err(RuntimeError::Rejected(
+                "speaker conditioning requires a supported versioned speech driver".into(),
+            ));
         }
         let get = |k: &str| {
             p.parameters.get(k).copied().ok_or_else(|| {
@@ -155,6 +258,15 @@ impl SpeechContract {
                 .collect()
         };
         let f32p = |k: &str| get(k).map(|v| f32::from_bits(v as u32));
+        let slot_prefix_reuse = match p.parameters.get("prompt.slot_prefix_version") {
+            None | Some(0) => false,
+            Some(1) => true,
+            Some(v) => {
+                return Err(RuntimeError::Rejected(format!(
+                    "unsupported speech slot prefix version {v}"
+                )))
+            }
+        };
         let mut c = SpeechContract {
             pipeline: p.name.clone(),
             prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| {
@@ -223,6 +335,7 @@ impl SpeechContract {
                 .get(crate::exec::packet_runtime::TEXT_ENCODER)
                 .cloned(),
             clone: None,
+            conditioning: None,
             dual_stream: p
                 .strings
                 .get(plow_asset::dual_stream::KEY)
@@ -234,6 +347,7 @@ impl SpeechContract {
                 max_ms: p.parameters.get(ONSET_TRIM_MAX_MS).map_or(0, |&m| m as u32),
             }),
             stream_first_frames: p.parameters.get("stream.first_frames").map(|&n| n as usize),
+            slot_prefix_reuse,
         };
         if let Some(encoder) = p.strings.get(crate::exec::packet_runtime::CLONE_ENCODER) {
             let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {
@@ -264,6 +378,58 @@ impl SpeechContract {
                 "speech prompt templates need {input} and {voice}".into(),
             ));
         }
+        if conditioned {
+            use plow_asset::dual_stream::{SpeakerConditioning, CONDITIONING_KEY};
+            use plow_asset::packet_pipeline::PipelineDType;
+            let bad =
+                || RuntimeError::Rejected("invalid external speech conditioning contract".into());
+            let packets =
+                SpeakerConditioning::parse(p.strings.get(CONDITIONING_KEY).ok_or_else(bad)?)
+                    .map_err(RuntimeError::Rejected)?;
+            let table = p
+                .tensors
+                .get("conditioning.text_embeddings")
+                .ok_or_else(bad)?;
+            let overlay = p.tensors.get("overlay").ok_or_else(bad)?;
+            let overlay_index = p.tensors.get("overlay_index").ok_or_else(bad)?;
+            let text_pad = usize::try_from(get("conditioning.text_pad")?).map_err(|_| bad())?;
+            let text_pad_row = p.tensors.get("conditioning.text_pad_row");
+            if let Some(row) = text_pad_row {
+                if row.dtype != PipelineDType::Bf16 || row.shape != [get("hidden")?] {
+                    return Err(bad());
+                }
+            }
+            let dual = c.dual_stream.as_ref().ok_or_else(bad)?;
+            if !c.depth
+                || c.clone.is_some()
+                || c.text_encoder.is_some()
+                || c.maya2.is_some()
+                || !c.voices.is_empty()
+                || !dual.voices.is_empty()
+                || get("overlay_rows")? == 0
+                || overlay.dtype != PipelineDType::F32
+                || overlay.shape != [get("overlay_rows")?, get("hidden")?]
+                || overlay_index.dtype != PipelineDType::U32
+                || overlay_index.shape != [get("max_context")?]
+                || table.dtype != PipelineDType::Bf16
+                || table.shape.len() != 2
+                || table.shape[1] != get("hidden")?
+                || table.shape[1] == 0
+                || text_pad as u64 >= table.shape[0]
+                || text_pad != dual.text_pad as usize
+                || dual.frame_codes != c.frame_codes
+                || c.codebook == 0
+                || c.codebook > dual.none_code
+            {
+                return Err(bad());
+            }
+            c.conditioning = Some(ConditioningContract {
+                packets,
+                text_embeddings: table.clone(),
+                text_pad_row: text_pad_row.cloned(),
+                text_pad,
+            });
+        }
         Ok(c)
     }
 
@@ -275,7 +441,10 @@ impl SpeechContract {
         let Some(asset) = crate::exec::packet_runtime::PacketAsset::load_if_present(&pkt)? else {
             return Ok(None);
         };
-        let mut found = asset.pipelines().iter().filter(|p| p.driver == DRIVER);
+        let mut found = asset
+            .pipelines()
+            .iter()
+            .filter(|p| p.driver.starts_with("tts.codec_lm."));
         match (found.next(), found.next()) {
             (None, _) => Ok(None),
             (Some(p), None) => Self::from_pipeline(p).map(Some),
@@ -341,7 +510,9 @@ impl SpeechContract {
     /// voices are the tokenizer's special tokens that fill `voice_token`.
     #[cfg(feature = "cuda")]
     pub fn spec(&self, tok: &dyn crate::text::tokenizer::Tokenize) -> api::SpeechSpec {
-        let mut voices = if self.voices.is_empty() {
+        let mut voices = if self.conditioning.is_some() {
+            Vec::new()
+        } else if self.voices.is_empty() {
             let (pre, post) = self
                 .voice_token
                 .split_once("{voice}")
@@ -387,9 +558,9 @@ impl SpeechContract {
                     .dual_stream
                     .as_ref()
                     .is_some_and(|d| d.instructions_template.is_some()),
-            voice_cloning: self.clone.is_some(),
+            voice_cloning: self.clone.is_some() || self.conditioning.is_some(),
             clone_transcript: true,
-            clone_audio_only: self.maya2.is_some(),
+            clone_audio_only: self.maya2.is_some() || self.conditioning.is_some(),
             text_normalization: self.maya2.is_some(),
         };
         spec.narrow_voices(&crate::config::RuntimeConfig::get().tts_voices);
@@ -429,6 +600,25 @@ impl SpeechContract {
                 codes.len() % self.frame_codes == 0
             }
             None => false,
+        }
+    }
+
+    fn take_frame(
+        &self,
+        partial: &mut Vec<i32>,
+        id: u32,
+        frame: Option<crate::serve::stream::SpeechFrame>,
+    ) -> Option<Codes> {
+        if self.depth {
+            frame.filter(|f| f.len() == self.frame_codes).map(|f| {
+                Codes::frame(
+                    f.codes.into_vec().into_iter().map(|x| x as i32).collect(),
+                    f.device,
+                )
+            })
+        } else {
+            self.push_codes(partial, id, None)
+                .then(|| std::mem::take(partial).into())
         }
     }
 
@@ -1054,6 +1244,179 @@ mod tests {
         }
     }
 
+    pub(super) fn conditioned_pipeline() -> PacketPipeline {
+        use plow_asset::packet_pipeline::{PipelineDType, PipelineTensor};
+        let mut p = pipeline();
+        p.driver = plow_asset::dual_stream::CONDITIONED_DRIVER.into();
+        for (key, value) in [
+            ("frames.depth", 1),
+            ("frames.depth_sampler", 1),
+            ("codec.frame_codes", 16),
+            ("codec.codebook", 2048),
+            ("codec.frame_samples", 1920),
+            ("hidden", 4),
+            ("overlay_rows", 1),
+            ("conditioning.text_pad", 2),
+            ("max_context", 512),
+        ] {
+            p.parameters.insert(key.into(), value);
+        }
+        p.parameters.insert("prompt.slot_prefix_version".into(), 1);
+        p.strings.insert("prompt.voices".into(), String::new());
+        p.strings.insert(plow_asset::dual_stream::CONDITIONING_KEY.into(), serde_json::json!({
+            "version": 1, "speaker_packet": "speaker_encoder.pkt", "reference_packet": "ref_encoder.pkt"
+        }).to_string());
+        p.strings.insert(plow_asset::dual_stream::KEY.into(), serde_json::json!({
+            "text_template": "abc{input}defgh", "instructions_template": null, "lead": 3, "drop": 5,
+            "text_pad": 2, "text_bos": 3, "text_eos": 4, "none_code": 3072, "frame_codes": 16,
+            "codec_language": [2154, 2156, 2157], "language_at": 2, "codec_auto": [2155, 2156, 2157],
+            "codec_pad": 2148, "codec_bos": 2149, "languages": {"english": 2050}, "voices": {},
+            "dialect_languages": ["chinese", "auto"]
+        }).to_string());
+        p.tensors.insert(
+            "conditioning.text_embeddings".into(),
+            PipelineTensor {
+                name: "model.embed_tokens.weight".into(),
+                dtype: PipelineDType::Bf16,
+                shape: vec![4096, 4],
+            },
+        );
+        p.tensors.insert(
+            "overlay".into(),
+            PipelineTensor {
+                name: "in.encoder".into(),
+                dtype: PipelineDType::F32,
+                shape: vec![1, 4],
+            },
+        );
+        p.tensors.insert(
+            "overlay_index".into(),
+            PipelineTensor {
+                name: "in.encoder_index".into(),
+                dtype: PipelineDType::U32,
+                shape: vec![512],
+            },
+        );
+        p
+    }
+
+    #[test]
+    fn conditioned_contract_requires_complete_and_consistent_bindings() {
+        let p = conditioned_pipeline();
+        let c = SpeechContract::from_pipeline(&p).unwrap();
+        assert_eq!(c.conditioning.as_ref().unwrap().text_pad, 2);
+        assert!(c.clone.is_none() && c.dual_stream.is_some());
+        let mut with_row = p.clone();
+        with_row.tensors.insert(
+            "conditioning.text_pad_row".into(),
+            plow_asset::packet_pipeline::PipelineTensor {
+                name: "pad".into(),
+                dtype: plow_asset::packet_pipeline::PipelineDType::Bf16,
+                shape: vec![4],
+            },
+        );
+        assert!(SpeechContract::from_pipeline(&with_row).is_ok());
+        with_row
+            .tensors
+            .get_mut("conditioning.text_pad_row")
+            .unwrap()
+            .shape = vec![1, 4];
+        assert!(SpeechContract::from_pipeline(&with_row).is_err());
+        let row = with_row
+            .tensors
+            .get_mut("conditioning.text_pad_row")
+            .unwrap();
+        row.shape = vec![4];
+        row.dtype = plow_asset::packet_pipeline::PipelineDType::F32;
+        assert!(SpeechContract::from_pipeline(&with_row).is_err());
+        for (key, value) in [
+            ("hidden", 8),
+            ("overlay_rows", 0),
+            ("conditioning.text_pad", 3),
+            ("codec.frame_codes", 2),
+            ("codec.codebook", 0),
+            ("frames.depth", 0),
+        ] {
+            let mut bad = p.clone();
+            bad.parameters.insert(key.into(), value);
+            assert!(SpeechContract::from_pipeline(&bad).is_err(), "{key}");
+        }
+        for key in [
+            plow_asset::dual_stream::KEY,
+            plow_asset::dual_stream::CONDITIONING_KEY,
+        ] {
+            let mut bad = p.clone();
+            bad.strings.remove(key);
+            assert!(SpeechContract::from_pipeline(&bad).is_err());
+        }
+        let mut bad = p.clone();
+        bad.strings
+            .insert("clone.encoder".into(), "ref_encoder.pkt".into());
+        assert!(SpeechContract::from_pipeline(&bad).is_err());
+        let mut bad = p.clone();
+        bad.strings.insert("prompt.voices".into(), "preset".into());
+        assert!(SpeechContract::from_pipeline(&bad).is_err());
+        let mut bad = p;
+        bad.tensors.clear();
+        assert!(SpeechContract::from_pipeline(&bad).is_err());
+    }
+
+    #[test]
+    fn rejects_conditioning_on_legacy_and_unsupported_drivers() {
+        let mut p = pipeline();
+        p.strings.insert(
+            plow_asset::dual_stream::CONDITIONING_KEY.into(),
+            "{}".into(),
+        );
+        assert!(SpeechContract::from_pipeline(&p).is_err());
+        p.driver = plow_asset::dual_stream::CONDITIONED_DRIVER.into();
+        assert!(SpeechContract::from_pipeline(&p).is_err());
+    }
+
+    #[test]
+    fn loading_does_not_ignore_unsupported_speech_packets() {
+        use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
+        use plow_asset::packet_pipeline::{PacketPipelines, SECTION, VERSION};
+        let dir = std::env::temp_dir().join(format!("plow-speech-version-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: Vec::new(),
+            progs: vec![Builder::new(1).finish()],
+            kv_row_insts: Vec::new(),
+            prog_t: vec![1],
+            gen: Vec::new(),
+        };
+        for driver in [
+            DRIVER,
+            plow_asset::dual_stream::CONDITIONED_DRIVER,
+            "tts.codec_lm.v99",
+            "causal.v1",
+        ] {
+            let mut p = pipeline();
+            p.driver = driver.into();
+            p.programs.insert("decode.1".into(), 0);
+            let metadata = PacketPipelines {
+                version: VERSION,
+                pipelines: vec![p],
+            };
+            let section = SectionData {
+                kind: SECT_METADATA,
+                name: SECTION.into(),
+                data: serde_json::to_vec(&metadata).unwrap(),
+            };
+            std::fs::write(dir.join("model.pkt"), model.to_blob_v6(&[section])).unwrap();
+            let loaded = SpeechContract::load(&dir);
+            match driver {
+                DRIVER => assert!(loaded.unwrap().is_some()),
+                "causal.v1" => assert!(loaded.unwrap().is_none()),
+                _ => assert!(loaded.is_err(), "unsupported driver {driver} was ignored"),
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn binds_contract_from_pipeline_parameters() {
         let c = SpeechContract::from_pipeline(&pipeline()).unwrap();
@@ -1082,6 +1445,16 @@ mod tests {
     }
 
     #[test]
+    fn slot_prefix_capability_is_versioned_and_absent_on_old_packets() {
+        let mut p = pipeline();
+        assert!(!SpeechContract::from_pipeline(&p).unwrap().slot_prefix_reuse);
+        p.parameters.insert("prompt.slot_prefix_version".into(), 1);
+        assert!(SpeechContract::from_pipeline(&p).unwrap().slot_prefix_reuse);
+        p.parameters.insert("prompt.slot_prefix_version".into(), 2);
+        assert!(SpeechContract::from_pipeline(&p).is_err());
+    }
+
+    #[test]
     fn codes_follow_frame_position() {
         let c = SpeechContract::from_pipeline(&pipeline()).unwrap();
         assert_eq!(c.code_of(0, 128266 + 5), Some(5));
@@ -1089,6 +1462,60 @@ mod tests {
         assert_eq!(c.code_of(1, 128266 + 7), None);
         assert_eq!(c.code_of(6, 128266 + 6 * 4096 + 4095), Some(4095));
         assert_eq!(c.code_of(0, 128258), None);
+    }
+
+    #[test]
+    fn stream_frames_match_accumulated_codes_without_retaining_history() {
+        let c = SpeechContract::from_pipeline(&pipeline()).unwrap();
+        let (mut history, mut partial, mut received) = (Vec::new(), Vec::new(), Vec::new());
+        for frame in 0..64 {
+            for book in 0..c.frame_codes {
+                assert!(!c.push_codes(&mut history, c.stops[0], None));
+                assert!(c.take_frame(&mut partial, c.stops[0], None).is_none());
+                let id = c.audio_token_base
+                    + book as u32 * c.codebook
+                    + (frame + book) as u32 % c.codebook;
+                let complete = c.push_codes(&mut history, id, None);
+                let next = c.take_frame(&mut partial, id, None);
+                assert_eq!(next.is_some(), complete);
+                if let Some(codes) = next {
+                    assert_eq!(codes.len(), c.frame_codes);
+                    received.extend(codes.host);
+                }
+                assert!(partial.len() < c.frame_codes);
+            }
+            assert!(partial.is_empty());
+            assert_eq!(received, history);
+        }
+    }
+
+    #[test]
+    fn depth_stream_frames_preserve_codes_and_reject_incomplete_rows() {
+        let mut c = SpeechContract::from_pipeline(&pipeline()).unwrap();
+        c.depth = true;
+        let mut partial = Vec::new();
+        for width in [16, 32] {
+            c.frame_codes = width;
+            for n in [0, width - 1, width + 1] {
+                assert!(c
+                    .take_frame(&mut partial, 0, Some(vec![1; n].into_boxed_slice().into()))
+                    .is_none());
+            }
+            assert!(c.take_frame(&mut partial, 0, None).is_none());
+            let codes: Vec<u32> = [0, 1, 2047, i32::MAX as u32, 1 << 31, u32::MAX]
+                .into_iter()
+                .cycle()
+                .take(width)
+                .collect();
+            let mut expected = Vec::new();
+            assert!(c.push_codes(&mut expected, 0, Some(&codes)));
+            assert_eq!(
+                c.take_frame(&mut partial, 0, Some(codes.into_boxed_slice().into()))
+                    .map(|c| c.host),
+                Some(expected)
+            );
+            assert!(partial.is_empty());
+        }
     }
 
     #[test]
