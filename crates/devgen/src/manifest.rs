@@ -3126,11 +3126,22 @@ pub fn speech_conv_posts(model: &packet::devbuild::Model) -> u64 {
         .fold(0, |mask, i| mask | 1 << ((i.j[1] >> 8) & 15))
 }
 
-/// The speech object's arm masks, accumulated together so every sidecar path feeds both.
+/// Whether a conv that can reach the wide tile (flags bit 14) pads with other than zeros:
+/// `PLOW_SPEECH_CONV_WIDE_PADDED`.
+pub fn speech_conv_wide_padded(model: &packet::devbuild::Model) -> bool {
+    model
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|i| i.op == DevOp::Conv1dF32 as u16 && i.j[1] & (1 << 14) != 0 && i.j[1] & 3 != 0)
+}
+
+/// The speech object's arm masks, accumulated together so every sidecar path feeds all of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpeechMasks {
     pub ops: u64,
     pub conv_posts: u64,
+    pub conv_wide_padded: bool,
 }
 
 impl SpeechMasks {
@@ -3138,11 +3149,13 @@ impl SpeechMasks {
         Self {
             ops: speech_ops(model),
             conv_posts: speech_conv_posts(model),
+            conv_wide_padded: speech_conv_wide_padded(model),
         }
     }
     pub fn add(&mut self, other: Self) {
         self.ops |= other.ops;
         self.conv_posts |= other.conv_posts;
+        self.conv_wide_padded |= other.conv_wide_padded;
     }
 }
 
@@ -3196,6 +3209,15 @@ pub fn config_header(manifest: &Value) -> String {
     if let Some(mask) = manifest.get("speech_conv_posts").and_then(Value::as_u64) {
         out.push_str(&format!(
             "#ifndef PLOW_SPEECH_CONV_POSTS\n#define PLOW_SPEECH_CONV_POSTS 0x{mask:x}ull\n#endif\n\n"
+        ));
+    }
+    if let Some(padded) = manifest
+        .get("speech_conv_wide_padded")
+        .and_then(Value::as_bool)
+    {
+        out.push_str(&format!(
+            "#ifndef PLOW_SPEECH_CONV_WIDE_PADDED\n#define PLOW_SPEECH_CONV_WIDE_PADDED {}\n#endif\n\n",
+            u8::from(padded)
         ));
     }
 
@@ -4101,6 +4123,39 @@ mod tests {
         assert!(!config_header(&plain).contains("PLOW_SPEECH_CONV_POSTS"));
         man["speech_conv_posts"] = 0.into();
         assert!(config_header(&man).contains("#define PLOW_SPEECH_CONV_POSTS 0x0ull\n"));
+    }
+
+    #[test]
+    fn speech_conv_wide_padded_reaches_the_header_only_when_known() {
+        let conv = |flags: u32| {
+            let mut i = inst(DevOp::Conv1dF32, [0; 8]);
+            i.j = [u32::MAX, flags];
+            i
+        };
+        let mut sidecar = model();
+        for (flags, padded) in [
+            (0, false),
+            (1 << 14, false),
+            (1, false),
+            ((1 << 14) | 1, true),
+            ((1 << 14) | 2, true),
+        ] {
+            sidecar.progs = vec![prog(vec![conv(flags)])];
+            assert_eq!(speech_conv_wide_padded(&sidecar), padded);
+        }
+        let plain = build(&model(), "sm_90a");
+        assert!(!config_header(&plain).contains("PLOW_SPEECH_CONV_WIDE_PADDED"));
+        for (key, define) in [("speech_conv_wide_padded", "PLOW_SPEECH_CONV_WIDE_PADDED")] {
+            for on in [false, true] {
+                let mut man = plain.clone();
+                man[key] = on.into();
+                assert_eq!(pairing_hash(&man), pairing_hash(&plain));
+                assert!(config_header(&man).contains(&format!(
+                    "#ifndef {define}\n#define {define} {}\n#endif\n",
+                    u8::from(on)
+                )));
+            }
+        }
     }
 
     /// The opt-in lean MoE body variants are object requests carried by the config header;
