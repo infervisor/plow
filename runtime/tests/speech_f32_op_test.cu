@@ -712,7 +712,17 @@ struct ConvSpec {
     bool rows = false; /* flags bit 16: the small-M rows arm (else the warp arm at cout <= 4) */
     bool splitk = false; /* flags bit 20: t7 is the wgmma tile's split-K scratch */
     unsigned pin = 0; /* flags bits 21..23: 1 pinned arms, 2 FFMA tiles, 4 a 128-wide tile */
+    unsigned sk = 0; /* flags bits 24..31 (pinned): fixed split-K parts; t7 = the conv-own scratch */
 };
+/* Pinned split-K scratch: SPC_TICKETS zeroed tickets, then tiles x parts 128x64 partials. */
+static unsigned splitk_scratch_pinned(Case& c, const ConvSpec& s, unsigned out_rows) {
+    const size_t tiles = ((size_t)s.batch * out_rows + 127) / 128 * ((s.cout + 63) / 64);
+    const size_t nk = ((size_t)s.cin * s.kernel + 63) / 64, chunk = std::max<size_t>(1, (nk + s.sk - 1) / s.sk), parts = (nk + chunk - 1) / chunk;
+    const size_t bytes = (SPC_TICKETS + tiles * parts * 128 * 64) * 4;
+    unsigned id = c.add(bytes);
+    memset(c.host[id].data(), 0, bytes);
+    return id;
+}
 
 static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
     if (transpose) return (s.in_rows - 1) * s.stride + s.kernel + s.dil_or_opad - s.before - s.after;
@@ -781,6 +791,7 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     unsigned l = s.lengths.empty() ? PLOW_TENSOR_NONE : c.u32(s.lengths);
     if (s.row_scale) c.in.t[7] = c.f32((size_t)s.batch * out_rows, 1.f);
     if (s.splitk) c.in.t[7] = splitk_scratch(c);
+    if (s.sk) c.in.t[7] = splitk_scratch_pinned(c, s, out_rows);
     c.in.op = transpose ? PLOW_DOP_CONV_TRANSPOSE1D_F32 : PLOW_DOP_CONV1D_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b; c.in.t[4] = a; c.in.t[5] = r; c.in.t[6] = l;
     c.in.i[0] = s.batch; c.in.i[1] = s.in_rows; c.in.i[2] = s.cin; c.in.i[3] = s.cout;
@@ -788,18 +799,19 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
                    (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u) |
-                   (s.dual ? 1u << 19 : 0u) | (s.rows ? 1u << 16 : 0u) | (s.splitk ? 1u << 20 : 0u) |
-                   (s.pin << 21);
+                   (s.dual ? 1u << 19 : 0u) | (s.rows ? 1u << 16 : 0u) | (s.splitk || s.sk ? 1u << 20 : 0u) |
+                   (s.pin << 21) | (s.sk << 24);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
     Case c; unsigned o;
     build_conv(c, s, false, o);
     run(name, c, g_conv1d_f32, {o}, FP32, tol);
-    if (!s.splitk) return;
+    if (!s.splitk && !s.sk) return;
     /* The reducers re-arm every ticket. */
-    std::vector<uint32_t> tk(SPT_TICKETS);
-    CK(cudaMemcpy(tk.data(), c.dev[c.in.t[7]], SPT_TICKETS * 4, cudaMemcpyDeviceToHost));
+    const unsigned nt = s.sk ? SPC_TICKETS : SPT_TICKETS;
+    std::vector<uint32_t> tk(nt);
+    CK(cudaMemcpy(tk.data(), c.dev[c.in.t[7]], nt * 4, cudaMemcpyDeviceToHost));
     bool zero = true;
     for (uint32_t t : tk) zero &= t == 0u;
     printf("  %-34s tickets re-armed -> %s\n", name, zero ? "PASS" : "FAIL");
@@ -937,6 +949,41 @@ static void t_conv_pinned() {
         cu.pin = 1 | 4;
         t_conv_pair("ConvT pinned wgmma s8 1024->512 bn64 vs bn128", ct, cu, true, true, 1e-4);
         t_conv_invariant("ConvT pinned wgmma s8 1024->512 bn128", cu, true);
+    }
+    {
+        /* Fixed split-K (bits 24..31): the transformer denses at the step's 64 rows (8 tiles of
+         * 1024->512 on 132 blocks), parts that do not divide nk (16 k-tiles: 5 -> chunk 4 -> 4
+         * parts), parts past nk (32 -> 16), a taps k7 conv, a split with the residual epilogue;
+         * every split batch-invariant (alone / 1 block / batched bitwise) and golden-checked. */
+        ConvSpec wo{3, 64, 1024, 512, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+        wo.wide = true; wo.wg = true; wo.pin = 1;
+        for (unsigned P : {2u, 5u, 16u, 32u}) {
+            ConvSpec a = wo;
+            a.sk = P;
+            char name[64];
+            snprintf(name, sizeof(name), "Conv1dF32 pinned splitk P%u 1024->512 M64", P);
+            t_conv1d(name, a, 1e-4);
+            t_conv_invariant(name, a, false);
+        }
+        ConvSpec w1 = wo;
+        w1.cin = 512; w1.cout = 3072; w1.sk = 3; /* nk 8: chunk 3 -> 3 parts (3, 3, 2) */
+        t_conv1d("Conv1dF32 pinned splitk P3 512->3072 M64", w1, 1e-4);
+        t_conv_invariant("Conv1dF32 pinned splitk P3 512->3072 M64", w1, false);
+        ConvSpec res = wo;
+        res.residual = true; res.sk = 8; res.lengths = {64, 10, 0};
+        t_conv1d("Conv1dF32 pinned splitk P8 +res len", res, 1e-4);
+        t_conv_invariant("Conv1dF32 pinned splitk P8 +res len", res, false);
+        ConvSpec one = wo;
+        one.batch = 1; one.sk = 16;
+        t_conv1d("Conv1dF32 pinned splitk P16 one item", one, 1e-4);
+        ConvSpec taps{2, 150, 1024, 1536, 7, 1, 1, 1, 6, 0, 0, 0, 0, false, true, false, false, {150, 77}, 0.f, true};
+        taps.wide = true; taps.wg = true; taps.tapmajor = true; taps.pin = 1; taps.sk = 4;
+        t_conv1d("Conv1dF32 pinned splitk P4 k7 1024->1536", taps, 1e-4);
+        t_conv_invariant("Conv1dF32 pinned splitk P4 k7 1024->1536", taps, false);
+        /* P = 1 is the unsplit tile (bit 20 set, no scratch use beyond the tickets). */
+        ConvSpec p1 = wo;
+        p1.sk = 1;
+        t_conv_pair("Conv1dF32 pinned splitk P1 vs unsplit", p1, wo, false, true, 1e-4);
     }
 #endif
 }
@@ -2082,6 +2129,24 @@ int main(int argc, char** argv) {
             bench(name, h, 4.0 * batch * heads * hw * rows * (rows + pre), 0, 20, &f);
 #endif
         }
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--bench-splitk")) {
+        /* Fixed split-K screen for the 12 Hz codec's transformer/dec.in classes at the served
+         * rows (b1.f1 64, b32.f17 544, b16.f4 1088 rows): parts 1..16, the same data. */
+        struct C { unsigned cin, cout, k; } cls[] = {{1024, 512, 1}, {512, 1024, 1}, {512, 3072, 1}, {4096, 1024, 1},
+                                                    {1024, 4096, 1}, {1024, 1536, 7}, {512, 1024, 3}};
+        for (const C& cl : cls)
+            for (unsigned rows : {64u, 544u, 1088u})
+                for (unsigned P : {1u, 2u, 4u, 8u, 16u}) {
+                    const unsigned r = cl.k == 1 ? rows : (cl.k == 7 ? rows * 4 : rows * 2);
+                    ConvSpec s{1, r, cl.cin, cl.cout, cl.k, 1, 1, 1, cl.k - 1, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+                    s.wide = true; s.wg = true; s.tapmajor = cl.k > 1; s.pin = 1; s.sk = P;
+                    Case c; unsigned o; build_conv(c, s, false, o);
+                    char name[80];
+                    snprintf(name, sizeof(name), "splitk %u->%u k%u rows %u P%u", cl.cin, cl.cout, cl.k, r, P);
+                    bench(name, c, 2.0 * r * cl.cin * cl.cout * cl.k, 0, 50);
+                }
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "--bench-codec")) {

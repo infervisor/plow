@@ -471,6 +471,8 @@ __device__ __forceinline__ bool sp_aligned(const void* p, unsigned bytes) {
 #define SPT_BM 64
 #define SPT_BN 64
 #define SPT_TICKETS 1024
+/* Tickets of the pinned convs' own split-K scratch (scratch.conv_f32_splitk, flags bits 24..31). */
+#define SPC_TICKETS 4096u
 template <bool TF32>
 struct SpTc {
     static constexpr unsigned BK = TF32 ? 32 : 64, LD = TF32 ? BK + 4 : BK + 8, KT = BK / 4;
@@ -3999,12 +4001,14 @@ struct SpConvArgs {
     float* splitk;
     unsigned batch, in_rows, cin, cout, kernel, stride, dil, groups, cg, ng, before, after, mode, pre,
         post, wf16, tapmajor, phasemajor, ptaps, out_rows, opad, cg_mul, cg_shift;
-    /* Flags bits 21..23: bit 0 the emitter pinned this conv's arms per shape class (nothing below
+    /* Flags bits 21..31: bit 0 the emitter pinned this conv's arms per shape class (nothing below
      * may choose by M or nblk), bit 1 FFMA 128x128 tiles instead of 3xTF32, bit 2 a 128-wide
-     * wide / wgmma tile instead of 64. */
+     * wide / wgmma tile instead of 64, bits 3..10 the split-K parts (0: unsplit; with flags bit
+     * 20, t7 is the conv-own scratch of SPC_TICKETS tickets then the partials). */
     unsigned pin;
     __device__ bool pinned() const { return pin & 1u; }
     __device__ unsigned pin_bn() const { return pin & 4u ? 128u : 64u; }
+    __device__ unsigned pin_parts() const { return pin >> 3; }
     float slope;
     /* c / cg for c < 2^31 (Granlund-Montgomery; the tap index of a GEMM column). */
     __device__ unsigned div_cg(unsigned c) const { return (__umulhi(c, cg_mul) + c) >> cg_shift; }
@@ -4059,7 +4063,7 @@ __device__ __forceinline__ bool sp_conv_args(const PlowDevInst* in, void* const*
     const unsigned flags = in->fj[2].u;
     a.mode = transpose ? 0u : flags & 3u;
     a.pre = (flags >> 4) & 15u; a.post = (flags >> 8) & 15u; a.wf16 = (flags >> 12) & 1u;
-    a.pin = (flags >> 21) & 7u;
+    a.pin = flags >> 21;
     a.tapmajor = transpose ? 0u : (flags >> 15) & 1u;
     /* ConvTranspose1d flags bit 15: weights [stride][cout][ceil(kernel/stride)][cg], one phase's
      * (tap, channel) columns contiguous per output channel (taps past the kernel are zero). */
@@ -4680,8 +4684,19 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
      * the scratch, the last to take the tile's ticket folds them in part order (deterministic)
      * and runs the epilogue. */
     static_assert(!SK || (BN == 64u && !GR && !CT), "split-K tile");
-    unsigned chunk = nk;
-    const unsigned S = SK ? sp_tc_splits(tiles, nk, nblk, true, chunk) : 1u;
+    /* Pinned (flags bits 24..31): P parts cut nk into chunks of ceil(nk / P) k-tiles, S =
+     * ceil(nk / chunk) (no empty part), the same at every M and nblk; else the legacy
+     * nblk-derived count over the dense scratch. */
+    unsigned chunk = nk, S = 1u;
+    const bool fixed = SK && a.pinned() && a.pin_parts() != 0u;
+    if (fixed) {
+        chunk = (nk + a.pin_parts() - 1u) / a.pin_parts();
+        if (!chunk) chunk = 1u;
+        S = (nk + chunk - 1u) / chunk;
+    } else if (SK) {
+        S = sp_tc_splits(tiles, nk, nblk, true, chunk);
+    }
+    const unsigned tickets_n = fixed ? SPC_TICKETS : SPT_TICKETS;
     unsigned* last_s = (unsigned*)(sm + BIAS_OFF + BN * 4u);
     bool pending = false; /* bulk stores reading `stage` */
     for (unsigned item = slice; item < tiles * S; item += nblk) {
@@ -4830,7 +4845,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
         }
         if (SK && S > 1u) {
             unsigned* tickets = (unsigned*)splitk;
-            float* parts = splitk + SPT_TICKETS;
+            float* parts = splitk + tickets_n;
             float4* mine = (float4*)(parts + ((size_t)tile * S + part) * (128u * BN) + tid * (BN / 2u));
 #pragma unroll
             for (unsigned q = 0; q < BN / 8u; q++)
