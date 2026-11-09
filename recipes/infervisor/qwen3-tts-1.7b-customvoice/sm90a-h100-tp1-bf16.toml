@@ -64,8 +64,9 @@ PLOW_TTS_PROFILE = "qwen3_tts"
 PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
-# Codec conv arms measured per shape on H100 (rows / warp / deterministic split-K wgmma tiles).
-PLOW_EMIT_CODEC_CONV_ARMS = "{repo}/tuning/nvidia/sm_90a/h100-sxm5/codec_conv_arms.jsonl"
+# No per-size codec conv arms (tuning codec_conv_arms.jsonl: rows / warp / split-K picked per
+# batch and rows): a slot's audio must not depend on its batch. Measured off vs on: codec step
+# b1.f4 +15%, b16.f4 +1%, b32.f17 +0%.
 # Prompts are 10 rows + the text (streaming) or + the text again (non-streaming).
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "64,256"
