@@ -44,6 +44,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut e = GpuEngine::load(be, &assets, &PathBuf::from(&a[2]))?;
     let info = e.fish_info()?;
     let prompt = read_u32(&a[3]);
+    // A Maya 2 depth stage needs its host cb0 controller bound per slot (the checkpoint's
+    // `maya2_controller.json`, as `plowrt serve` binds it); the null speaker's depth memory.
+    let maya2 = std::fs::read_to_string(PathBuf::from(&a[2]).join("maya2_controller.json"))
+        .ok()
+        .map(|s| plowrt::tts::maya2::Controller::parse(&s))
+        .transpose()?
+        .map(|c| c.plan("fish_gen timing prompt", "en", Some(frames), c.cb0, seed));
     if let Some(p) = opt("--prompt-codes") {
         e.fish_prompt_codes(&read_u32(&p))?;
     }
@@ -53,6 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for slot in 0..n {
             e.begin_slot(slot, prompt.len() + frames + 1)?;
             e.fish_reset_slot(slot)?;
+            if let Some(p) = maya2 {
+                e.maya2_bind(slot, p, None)?;
+            }
             e.prefill_slot(slot, &prompt)?;
             e.fish_logits_to_slot(slot)?;
             let row = FishRow {
@@ -116,6 +126,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     e.begin_slot(0, prompt.len() + frames + 1)?;
     e.fish_reset_slot(0)?;
+    if let Some(p) = maya2 {
+        e.maya2_bind(0, p, None)?;
+    }
     let t0 = std::time::Instant::now();
     e.prefill_slot(0, &prompt)?;
     e.fish_logits_to_slot(0)?;

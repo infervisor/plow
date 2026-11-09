@@ -5242,7 +5242,8 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
         const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
         const unsigned kend = causal ? min(klen, qa + SPF_BQ) : klen;
         const unsigned left = stream ? hist - min(pidx[b], hist) : 0u;
-        const unsigned qrow0 = stream ? b * kv_rows + hist : b * q_rows;
+        /* flags bit 6: the query shares the keys' item rows (row i7 + r of item b's [kv_rows]). */
+        const unsigned qrow0 = stream ? b * kv_rows + hist : (in->i[6] & 64u) ? b * kv_rows + in->i[7] : b * q_rows;
         /* Every stage issues all of its loads into registers before the first smem store: with
          * one block per SM, a load-store-load loop exposes the full memory latency per element. */
         {
@@ -5432,11 +5433,13 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
         const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
         const unsigned kend = causal ? min(klen, q0 + SPQ_BQ) : klen;
         const unsigned ra = q0 + warp * 16u + g, rb = ra + 8u;
+        /* flags bit 6: the query shares the keys' item rows (row i7 + r of item b's [kv_rows]). */
+        const size_t qrow0 = (in->i[6] & 64u) ? (size_t)b * kv_rows + in->i[7] : (size_t)b * q_rows;
         unsigned qh[8][4], ql[8][4];
 #pragma unroll
         for (int ks = 0; ks < 8; ks++) {
-            const float* qa = query + ((size_t)b * q_rows + ra) * stride + h * HW + ks * 8 + t;
-            const float* qb = query + ((size_t)b * q_rows + rb) * stride + h * HW + ks * 8 + t;
+            const float* qa = query + (qrow0 + ra) * stride + h * HW + ks * 8 + t;
+            const float* qb = query + (qrow0 + rb) * stride + h * HW + ks * 8 + t;
             const float x[4] = {ra < q_rows ? qa[0] : 0.f, rb < q_rows ? qb[0] : 0.f, ra < q_rows ? qa[4] : 0.f,
                                 rb < q_rows ? qb[4] : 0.f};
 #pragma unroll
@@ -5662,11 +5665,13 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
                       : rel ? bias + ((size_t)row * heads + h) * bias_hs + kv_rows - 1u - row
                             : bias + (size_t)h * bias_hs + (size_t)row * kv_rows;
         }
+        /* flags bit 6: the query shares the keys' item rows (row i7 + r of item b's [kv_rows]). */
+        const size_t qrow0 = (in->i[6] & 64u) ? (size_t)b * kv_rows + in->i[7] : (size_t)b * q_rows;
         unsigned qh[8][4], ql[8][4];
 #pragma unroll
         for (int ks = 0; ks < 8; ks++) {
-            const float* qa = query + ((size_t)b * q_rows + ra) * stride + h * HW + ks * 8 + t;
-            const float* qb = query + ((size_t)b * q_rows + rb) * stride + h * HW + ks * 8 + t;
+            const float* qa = query + (qrow0 + ra) * stride + h * HW + ks * 8 + t;
+            const float* qb = query + (qrow0 + rb) * stride + h * HW + ks * 8 + t;
             const bool oa = live && ra < q_rows, ob = live && rb < q_rows;
             const float x[4] = {oa ? qa[0] : 0.f, ob ? qb[0] : 0.f, oa ? qa[4] : 0.f, ob ? qb[4] : 0.f};
 #pragma unroll
