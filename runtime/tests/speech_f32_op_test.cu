@@ -619,8 +619,13 @@ static void st_inst(PlowDevInst& in, unsigned z, unsigned src, unsigned state, u
 }
 static void t_stream_tail() {
     struct G { const char* name; unsigned L, N, C, Cz, zc0, src_stride; };
+    /* Quad path: C, Cz, zc0 and the source stride multiples of 4 (C96 full width is the 12 Hz
+     * codec's shape); a stride of 100 keeps the state quads but forces the scalar source read. */
     for (const G& g : {G{"StreamTailF32 gather window zc0=9", 5, 7, 24, 40, 9, 48},
-                       G{"StreamTailF32 gather full width L>N", 8, 3, 32, 32, 0, 32}}) {
+                       G{"StreamTailF32 gather full width L>N", 8, 3, 32, 32, 0, 32},
+                       G{"StreamTailF32 gather C96 full width", 6, 17, 96, 96, 0, 96},
+                       G{"StreamTailF32 gather C96 window zc0=8", 6, 17, 96, 112, 8, 112},
+                       G{"StreamTailF32 gather C96 odd src stride", 6, 17, 96, 96, 0, 100}}) {
         Case c; const unsigned B = 4, slots = 6;
         unsigned z = c.out((size_t)B * (g.L + g.N) * g.Cz);
         unsigned src = c.f32((size_t)(B * g.N - 1) * g.src_stride + g.Cz, 1.f);
@@ -637,6 +642,18 @@ static void t_stream_tail() {
         unsigned slot = c.u32({2, 5, 0, 4}), n = c.u32({0, 3, 5, 7});
         st_inst(c.in, PLOW_TENSOR_NONE, z, state, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, Cz, zc0, 0, 1);
         run("StreamTailF32 store n=0,<L,=L,>L zc0=9", c, g_stream_tail_f32, {state}, FP32, 0.0);
+    }
+    {
+        /* Quad store at the codec's C96 (full width) and with an aligned window. */
+        for (unsigned zc0 : {0u, 8u}) {
+            Case c; const unsigned B = 4, slots = 6, L = 6, N = 17, C = 96, Cz = 96 + 2 * zc0;
+            unsigned z = c.f32((size_t)B * (L + N) * Cz, 1.f);
+            unsigned state = c.f32((size_t)slots * L * C, 1.f);
+            unsigned slot = c.u32({2, 5, 0, 4}), n = c.u32({0, 3, 6, 17});
+            st_inst(c.in, PLOW_TENSOR_NONE, z, state, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, Cz, zc0, 0, 1);
+            run(zc0 ? "StreamTailF32 store C96 quads zc0=8" : "StreamTailF32 store C96 quads", c, g_stream_tail_f32,
+                {state}, FP32, 0.0);
+        }
     }
     {
         /* Device gather then store; items with pos = 0 and n = 0 must leave zeros. */
@@ -979,6 +996,17 @@ static void t_vec_elementwise() {
         c.in.op = PLOW_DOP_UNARY_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = p;
         c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = 12; c.in.i[3] = stride; c.in.i[4] = col0;
         run("UnaryF32 snake float4", c, g_unary_f32, {o}, FP32, 1e-5);
+    }
+    /* SnakeBeta (19), param [a | r]: the decoder widths (quad path, 8 quads per thread) and an
+     * unaligned window (scalar path). */
+    for (unsigned width : {96u, 192u, 384u, 768u, 40u}) {
+        Case c; const unsigned rows = width == 40 ? 97 : 61, stride = width == 40 ? 50 : width, col0 = width == 40 ? 7 : 0;
+        unsigned o = c.f32(rows * stride, 1.f), x = c.f32(rows * stride, 4.f), p = c.f32(2 * width, 0.5f, 0.7f);
+        c.in.op = PLOW_DOP_UNARY_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = p;
+        c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = 19; c.in.i[3] = stride; c.in.i[4] = col0;
+        char name[64];
+        snprintf(name, sizeof(name), "UnaryF32 snake_beta %s w%u", width == 40 ? "scalar" : "float4", width);
+        run(name, c, g_unary_f32, {o}, FP32, 1e-5);
     }
     struct B { const char* name; unsigned op, bis, brs, bcs, bn, flags; };
     const unsigned items = 3, rows = 45, width = 36;
