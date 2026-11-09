@@ -36,8 +36,9 @@ __device__ __forceinline__ constexpr bool sp_post_on(unsigned p) {
     return (PLOW_SPEECH_CONV_POSTS >> p) & 1ull;
 }
 
-/* Non-zero padding in the wide conv tile doubles d_conv1d_wide and its ptxas time (Fish 7 min ->
- * hours); 0 sends padded convs to the 64x64 / FFMA paths. */
+/* One wide conv tile body per object (two doubled d_conv1d_wide and its ptxas time, Fish 7 min ->
+ * hours): 1 = the padding-aware body for every conv (mode 0 pads with zeros exactly as the plain
+ * body); 0 = the plain body, padded convs taking the 64x64 / FFMA paths. */
 #ifndef PLOW_SPEECH_CONV_WIDE_PADDED
 #define PLOW_SPEECH_CONV_WIDE_PADDED 1
 #endif
@@ -5101,10 +5102,7 @@ static __device__ __forceinline__ void sp_conv1d_wide_body(const SpConvArgs& a, 
     }
 }
 static __device__ __noinline__ void d_conv1d_wide(const SpConvArgs& a, unsigned bn, unsigned slice, unsigned nblk) {
-#if PLOW_SPEECH_CONV_WIDE_PADDED
-    if (a.mode) return sp_conv1d_wide_body<true>(a, bn, slice, nblk);
-#endif
-    sp_conv1d_wide_body<false>(a, bn, slice, nblk);
+    sp_conv1d_wide_body<(bool)PLOW_SPEECH_CONV_WIDE_PADDED>(a, bn, slice, nblk);
 }
 
 /* Conv1d flag bit 16 (row-starved or few-channel convs): one warp per output element, its
