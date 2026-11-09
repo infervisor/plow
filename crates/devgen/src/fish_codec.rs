@@ -912,7 +912,7 @@ fn program_for(
             input_is_temp: false,
             row_scale: None,
             alpha_out: None,
-            taps_wgmma: false,
+            taps_wgmma: true,
         };
         last = stateful(&mut p, c, last, pre, "state.codec.pre".into(), 0)?.done;
     }
@@ -1171,6 +1171,9 @@ fn program_for(
     );
     let mut c = c;
     c.len = len(cfg.ups.len());
+    // 1024 -> 1536 k7 on the wgmma taps tile (tap-major weights + pre-split image) instead of
+    // the 3xTF32 64x64 tiles.
+    c.taps_wgmma = true;
     cur = stateful(
         &mut p,
         cur.output,
