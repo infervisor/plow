@@ -307,7 +307,8 @@ pub const MAYA2: SpeechProfile = SpeechProfile {
 /// Qwen/Qwen3-TTS-12Hz-*-CustomVoice (`qwen_tts` `generate`, `scripts/tts/qwen3_tts_prep.py`): a
 /// Qwen3 talker whose rows are text plus codec frames; cb0 class 2048 = codec EOS 2150 (the other
 /// control rows suppressed), at least 2 frames; a 5-layer code predictor samples codebooks 1..15.
-/// Talker and predictor: T 0.9, top-k 50, top-p 1; repetition penalty 1.05 on cb0.
+/// Talker and predictor: T 0.7 (the published config's 0.9 babbles on ~0.7% of Seed-TTS EN
+/// prompts; recipe .md), top-k 50, top-p 1; repetition penalty 1.05 on cb0.
 pub const QWEN3_TTS: SpeechProfile = SpeechProfile {
     prompt_template: "{input}",
     voice_token: "{voice}",
@@ -323,7 +324,7 @@ pub const QWEN3_TTS: SpeechProfile = SpeechProfile {
     // As Breeze: ~2.8 frames per Mandarin character, ~0.8 per English one.
     per_char_frames: 3.2,
     max_new_tokens_cap: 1500,
-    temperature: 0.9,
+    temperature: 0.7,
     top_p: 1.0,
     repetition_penalty: 1.05,
     top_k: 50,
