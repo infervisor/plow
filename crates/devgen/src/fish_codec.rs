@@ -500,6 +500,48 @@ impl Seq {
         w: &str,
         b: Option<&str>,
     ) -> Result<u32, String> {
+        self.dense_with(splits, x, TensorRef::Named(out), None, rows, k, n, w, b)
+    }
+
+    /// `res += x @ w^T` in place through the conv's residual epilogue: the same bits as the dense
+    /// into a scratch followed by a BinaryF32 add (`__fadd_rn(y, res)` with y the stored value),
+    /// one op and one tensor pass fewer.
+    pub(crate) fn dense_res(
+        &mut self,
+        splits: Splits<'_>,
+        x: u32,
+        res: u32,
+        rows: u32,
+        k: u32,
+        n: u32,
+        w: &str,
+    ) -> Result<u32, String> {
+        self.dense_with(
+            splits,
+            x,
+            TensorRef::Handle(res),
+            Some(res),
+            rows,
+            k,
+            n,
+            w,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dense_with(
+        &mut self,
+        splits: Splits<'_>,
+        x: u32,
+        output: TensorRef<'_>,
+        residual: Option<u32>,
+        rows: u32,
+        k: u32,
+        n: u32,
+        w: &str,
+        b: Option<&str>,
+    ) -> Result<u32, String> {
         let split = splits.is_some_and(|s| {
             s.borrow_mut()
                 .insert(w.trim_start_matches("w.").to_string(), (n, k, 1));
@@ -511,11 +553,11 @@ impl Seq {
             false,
             &[dep],
             Conv1dF32Stage {
-                output: TensorRef::Named(out),
+                output,
                 weight: TensorRef::Named(w),
                 bias: b.map(TensorRef::Named),
                 alpha: None,
-                residual: None,
+                residual,
                 lengths: None,
                 batch: 1,
                 in_rows: rows,
@@ -967,24 +1009,13 @@ fn program_for(
             },
         )?;
         let at = s.done(e);
-        s.dense(splits, at, "act.codec.b", n, aw, dim, &w("wo_s"), None)?;
-        s.binary(x, h, BinaryOp::Add, n, dim)?;
+        s.dense_res(splits, at, x, n, aw, dim, &w("wo_s"))?;
         s.rms(x, h, n, dim, &w("ffn_norm"), cfg.eps)?;
         let g = s.dense(splits, h, "act.codec.c", n, dim, cfg.inter, &w("w1"), None)?;
         let u = s.dense(splits, h, "act.codec.s", n, dim, cfg.inter, &w("w3"), None)?;
         s.unary(g, Activation::Silu, n, cfg.inter)?;
         s.binary(g, u, BinaryOp::Mul, n, cfg.inter)?;
-        s.dense(
-            splits,
-            g,
-            "act.codec.b",
-            n,
-            cfg.inter,
-            dim,
-            &w("w2_s"),
-            None,
-        )?;
-        s.binary(x, h, BinaryOp::Add, n, dim)?;
+        s.dense_res(splits, g, x, n, cfg.inter, dim, &w("w2_s"))?;
     }
     s.rms(x, x, n, dim, "w.post.norm", cfg.eps)?;
     let stream = if cfg.breeze {
@@ -1571,8 +1602,7 @@ fn mimi_program_for(
             },
         )?;
         let at = s.done(e);
-        s.dense(splits, at, "act.codec.b", nt, aw, dim, &w("wo_s"), None)?;
-        s.binary(x, h, BinaryOp::Add, nt, dim)?;
+        s.dense_res(splits, at, x, nt, aw, dim, &w("wo_s"))?;
         ln(&mut s, w("ln2"))?;
         let g = s.dense(
             splits,
@@ -1585,17 +1615,7 @@ fn mimi_program_for(
             None,
         )?;
         s.unary(g, Activation::GeluErf, nt, cfg.inter)?;
-        s.dense(
-            splits,
-            g,
-            "act.codec.b",
-            nt,
-            cfg.inter,
-            dim,
-            &w("fc2_s"),
-            None,
-        )?;
-        s.binary(x, h, BinaryOp::Add, nt, dim)?;
+        s.dense_res(splits, g, x, nt, cfg.inter, dim, &w("fc2_s"))?;
     }
 
     let mut p = s.p.take().unwrap();
