@@ -2,12 +2,14 @@
 
 One summary per model family: final numbers vs baseline, recipe, plowrt commit, gate status and
 the scratch paths that hold the raw evidence. Raw logs, JSON and captures stay in campaign scratch
-outside the repo (CLAUDE.md, "Performance campaign evidence and promotion").
+outside the repo ([../README.md](../README.md), "Results").
 
 | Family | Summary | Qualified win |
 |---|---|---|
 | Gemma-4 (E4B, 12B, 26B-A4B, 31B) | [gemma4-h100/summary.md](gemma4-h100/summary.md) | 12B FP8 vs vLLM 0.28 FP8 KV: [comparison.md](gemma12b-fp8-20260930/comparison.md), [comparison.csv](gemma12b-fp8-20260930/comparison.csv); 31B FP8: [comparison.md](gemma31b-h100-20261010/comparison.md), [comparison.csv](gemma31b-h100-20261010/comparison.csv) |
 | Gemma-4 26B-A4B (H100) | [gemma4-h100/summary.md](gemma4-h100/summary.md) | BF16 + FP8 16K vs vLLM 0.28: [comparison.md](gemma26b-h100-20261007/comparison.md), [comparison.csv](gemma26b-h100-20261007/comparison.csv); FP8 at max_ctx 131072: [comparison.md](gemma26b-h100-20261009/comparison.md), [comparison.csv](gemma26b-h100-20261009/comparison.csv); KV block store vs vLLM 0.29: production mix TTFT P99 0.68x / 0.71x, TPOT P99 0.55x / 0.64x; agentic16k c32 / c64 throughput 1.46x / 1.40x: [comparison.md](gemma26b-h100-20261023/comparison.md), [comparison.csv](gemma26b-h100-20261023/comparison.csv) |
+| Gemma-4 26B-A4B BF16 (H100) | [comparison.md](gemma26b-h100-bf16-20261027/comparison.md), [comparison.md](gemma26b-h100-bf16-20261029/comparison.md) | none vs vLLM 0.29 (1027: every cell a loss; 1029: TTFT P99 still behind at both rates): [comparison.csv](gemma26b-h100-bf16-20261027/comparison.csv), [comparison.csv](gemma26b-h100-bf16-20261029/comparison.csv) |
+| Gemma-4 E4B (H100) | [comparison.md](gemma4-e4b-h100-20261027/comparison.md) | c32 throughput and P99 latencies vs vLLM 0.29: [comparison.md](gemma4-e4b-h100-20261027/comparison.md), [comparison.csv](gemma4-e4b-h100-20261027/comparison.csv) |
 | Gemma-4 BF16 on Xeon 6975P-C (CPU engine) | [comparison.md](gemma4-xeon6-bf16-20261006/comparison.md) | E2B, E4B, 12B vs vLLM 0.30 CPU: [comparison.md](gemma4-xeon6-bf16-20261006/comparison.md), [comparison.csv](gemma4-xeon6-bf16-20261006/comparison.csv); 26B-A4B gate miss, 31B pending |
 | Xeon 6975P-C L2-resident BF16 experiment | [p0_baseline.md](xeon6-l2r-bf16-20261008/p0_baseline.md), [p1_residency.md](xeon6-l2r-bf16-20261008/p1_residency.md), [p2_real_bf16_layer.md](xeon6-l2r-bf16-20261008/p2_real_bf16_layer.md), [p3_sync.md](xeon6-l2r-bf16-20261008/p3_sync.md), [p4_kv_policy.md](xeon6-l2r-bf16-20261008/p4_kv_policy.md), [p5_serving_report.md](xeon6-l2r-bf16-20261008/p5_serving_report.md), [p6_multimodel_cluster.md](xeon6-l2r-bf16-20261008/p6_multimodel_cluster.md), [TRACKER.md](xeon6-l2r-bf16-20261008/TRACKER.md) | `PLOW_CPU_COMBINE=16` in the E2B / E4B Xeon 6 recipes (P5); go / no-go in the P5 report; P6: E2B-31B socket slices (TP, MoE head / experts) and the projected multi-socket pipeline: GO for a two-server dense pipeline, NO-GO for MoE / long-context full attention |
 | Qwen3-ASR | [qwen3-asr-h100/summary.md](qwen3-asr-h100/summary.md) | none (no recorded baseline) |

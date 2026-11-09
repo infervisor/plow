@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Practical GEMM ceiling on THIS box at YOUR model's exact prefill shapes
-(docs/bringup/07-perf-campaign.md). Torch library dispatch via torch._scaled_mm (fp8) and torch.matmul (bf16).
-
-Knowing the real ceiling is what separates "the kernel is slow" from "the box
-is the wall": on GH200/Gemma-12B it measured fp8 1324-1468 / bf16 804-861 TF/s
-and directly justified the 384-thread warp-specialized object.
+"""Legacy bring-up helper, not a qualification gate (qualification = `campaign.py gate` kind
+llm_fp32_ref + `campaign.py report`; calibrated ceilings = scripts/bench/calibrate_ceilings.py).
+Practical GEMM ceiling at a model's prefill shapes via torch library dispatch:
+torch._scaled_mm (fp8) and torch.matmul (bf16).
 
 Shapes are (M=chunk_rows, N=out_features, K=in_features, name), per RANK: a TP
 rank runs the sharded GEMM, so the ceiling that bounds a served token is the
 sharded one. Pick a model's set with `--model`, and the TP degree with `--tp`:
 
-  perf-data/tools/gpulease -n 1 ceil \\
-    perf-data/tools/bringup_ceiling.py --model glm53 --tp 8
+  scripts/bench/gpuq.py submit ceil 1 \\
+    python3 perf-data/tools/bringup_ceiling.py --model glm53 --tp 8
 
 `--model gemma12b` (the default) reproduces the original hardcoded set at tp=1
 byte for byte, so every number this tool has already reported still stands.

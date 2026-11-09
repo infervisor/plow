@@ -1,544 +1,368 @@
-# Stage 4 — Kernel Tuning to the Roofline
+# Stage 4 — Kernel tuning to the roofline
 
-> Bring each hot kernel family of the new model — prefill GEMM, decode GEMV,
-> attention, MoE — to a stated fraction of its roofline ceiling on the target
-> GPU, and leave the winners recorded where the compiler actually reads them.
-> Stage 3 proved the schedule correct; this stage makes the kernels inside it
-> fast, *before* Stage 5 measures a whole block. The ceiling is defined by the
-> cost model, not by feel: a kernel is "done" when its measured throughput sits
-> against the min(compute, bandwidth) bound for its shape, and "tuned" when the
-> winning tile/knob is a qualified record or a recorded build define.
+Bring each hot kernel family (prefill GEMM, decode GEMV, attention, MoE) to a stated fraction of
+its roofline on `$GPU`, and record the winners where the compiler reads them.
 
-**Precondition:** Stage 3 complete — every bucket verifies, so the schedule
-being timed is the schedule that will ship. This is also the stage where the
-target stops being abstract: fill in the parameter block in
-[`target.md`](target.md) — `$VENDOR $ISA $GPU $NCU $NGPU $PARALLEL $MAXCTX
-$TOOLCHAIN $BUILD $FEATURES $BW_BOUND $COMPUTE_CEIL $RESULTS` — before running
-anything below, and write every command with `--gpu $GPU --arch $ISA` rather
-than a literal part. You also need `$TOOLCHAIN` for probing, `$GPU` itself plus
-`perf-data/tools/gpulease` for measuring, and `nix develop` for all cargo
-builds. Read the ISA reference for `$ISA` ([`isa/README.md`](isa/README.md)) before
-changing any kernel.
+- **Precondition:** Stage 3 passes (the schedule you time is the schedule that ships). The
+  [`target.md`](target.md) block is filled; every command uses `--gpu $GPU --arch $ISA`. Read the
+  ISA reference for `$ISA` ([`isa/README.md`](isa/README.md)) before changing a kernel.
+- **Gate out:** see [Gate](#gate-into-stage-5).
+- **References:** [`docs/arch/11-tuning-coverage.md`](../arch/11-tuning-coverage.md) (what is
+  tunable per family and what blocks it), [`docs/arch/12-using-the-tuner.md`](../arch/12-using-the-tuner.md)
+  (how to take a measurement the store accepts).
+- **Cross-cutting rules:** single-block screening [agent-tools.md](agent-tools.md) "HARD RULE";
+  GPU access [agent-tools.md](agent-tools.md) "Queue"; noise [agent-tools.md](agent-tools.md) "A/B rule";
+  kernel design/diff reviews [agent-tools.md](agent-tools.md) "Working rules".
 
-**Gate out (into Stage 5, single-block sweep):** every demanded hot-kernel
-shape has a measurement census entry (HIT or an explicit, explained MISS), the
-winners are `qualified` records or recorded `-D` defines, `plowc tune --shape`
-reports rationale `measured` on the shapes that have records, and the per-family
-roofline % is written down with a clean (`gpulease` rc=0) provenance.
+## Principles
 
-Authoritative references: [`docs/arch/11-tuning-coverage.md`](../arch/11-tuning-coverage.md)
-(what is tunable per family and what blocks each) and
-[`docs/arch/12-using-the-tuner.md`](../arch/12-using-the-tuner.md) (how to take
-a measurement the database will accept). This stage is those two documents
-turned into a bringup sequence.
+- **`compile` reads, `tune` writes.** `plowc` may consume qualified records; only an explicit
+  tuning run publishes one.
+- **Capability is probed from a built object, never declared.** `plowc tune inventory` answers
+  "which kernels exist, which macros are knobs" with the vendor preprocessor, no GPU.
+- **Correct before fast.** A measurement without a passing oracle is stored `provisional` and is
+  never selected.
 
----
+## Promotion order
 
-## What "tuned" means here
+1. Derive the exact production shape, dtype, scale layout, strides and output contract from the
+   emitted packet and the reference framework's dispatch.
+2. Beat the matching vendor/library kernel in a same-session A/B on the same inputs and oracle. A
+   nearby shape or an unfused vendor fallback is not a comparator.
+3. A fused kernel beats the exact unfused sequence it replaces.
+4. Beat the reference framework at one isolated block ([05](05-single-block-sweep.md)).
+5. Run the full network only as the final correctness and promotion gate.
 
-Two load-bearing properties from the tuner design constrain everything below:
+Harness tiers: a production-header probe proves correctness and rejects gross losers; a
+single-block or truncated-model sweep ranks the grid; only the 2–3 block winners run whole-model
+`step_bench`; only a gated whole-model winner enters serving. Search `runtime/bench/`,
+`runtime/tests/`, `scripts/` and `perf-data/tools/` first and extend the closest harness. Record
+which tier produced each number.
 
-* **`compile` reads, `tune` writes.** `plowc compile` may consume qualified
-  records; only an explicit tuning run publishes one. A build must never
-  calibrate itself against its own output.
-* **Capability is probed from a built object, never declared.** The same
-  interpreter TU becomes different objects under different `-D` sets, so "which
-  kernels exist" and "which macros are knobs" are questions about an object.
-  `plowc tune inventory` answers them with the vendor preprocessor — no GPU
-  needed.
+Rank work by `block op share × measured improvement` from a short- and a long-context block trace.
+A kernel still several times behind its library peer needs a different algorithm, reuse, tiling or
+occupancy, not instruction-level variants.
 
-And one from the store (`crates/tunedb/`): **correct before fast.** A
-measurement without a passing correctness oracle can be stored (`provisional`)
-but never selected. This single rule decides most of what is tunable today —
-see the coverage table below.
+## Step 0 — ceilings
 
-## Campaign-derived experiment funnel
-
-Use the repository's existing harnesses and spend most GPU time at block scope:
-
-1. A standalone production-header probe proves correctness and rejects grossly
-   slow arms. It does not rank close candidates.
-2. A single-block or family-specific truncated-model sweep ranks the broad
-   shape, context, batch, warp, register, and packet-rung grid through the real
-   interpreter.
-3. Only the 2–3 block winners run through whole-model `step_bench`.
-4. Only a numerically gated whole-model winner enters the serving grid.
-
-Before adding a runner, search `runtime/bench/`, `runtime/tests/`, `scripts/`,
-and `perf-data/tools/`. Extend the closest harness when it lacks a required
-field or semantic boundary. Record which harness tier produced each number.
-
-Rank work by measured block impact, not the isolated speedup. Trace a
-representative short- and long-context block, multiply each op's share by the
-candidate's measured improvement, and attack the largest recoverable term.
-When a kernel remains multiple times slower than its library peer, change the
-algorithm, data reuse, tiling, or occupancy before spending runs on small
-instruction-level variants.
-
-## Step 0 — establish the ceiling before measuring anything
-
-The roofline % is meaningless until the denominator is right.
-
-* **The cost model defines the analytic ceiling.** `costmodel::CostModel::new`
-  takes the GPU's `SmSpec`, subtracts `kernel_reservation_bytes(arch)` (2–4 KiB
-  of barriers/TMA descriptors/LDS scratch that tiles cannot use) from
-  `shared_mem`, and enumerates tile candidates under double-buffering. DMA cost
-  comes from `sm_bytes_per_cycle` — the **datasheet** bandwidth divided across
-  SMs, used deliberately for *ranking* (a constant derate cancels in a relative
-  comparison). Anything that reports an **absolute** floor must use the measured
-  `MemorySpec::bandwidth_for_bound()` instead (this is what `plowc
-  --lean-oracle` does).
-* **Use measured machine ceilings for the % you report.** `$COMPUTE_CEIL` is a
-  *sustained* matrix-core figure measured on `$GPU`, and `$BW_BOUND` is
-  `MemorySpec::bandwidth_for_bound()` for `$GPU` — which returns the **datasheet
-  peak** whenever that registry entry has `bandwidth_measured: None`, i.e. on
-  nearly every part. Establish both here, and say which kind of denominator you
-  used in every % you later quote. `gemm_tile_sweep.c` makes its `PEAK_TFLOPS`
-  / HBM constants overridable macros for exactly this reason. The gap is not
-  cosmetic: one part's measured MFMA ceiling sat 28% below its own datasheet
-  peak, and two AMD ISAs in this tree differ from each other by ~1.77× on
-  compute — carrying either number across parts invents a result.
-* **Measuring `$BW_BOUND` is a gate, not advice.** Worked precedent: MI325X
-  shipped with `bandwidth_measured: None`, so `bandwidth_for_bound()` returned
-  its 6000 GB/s datasheet peak. The measured sustained figure is **4164 GB/s —
-  69% of the datasheet** — so every roofline % taken against the peak
-  understated efficiency by ~44%. Measure it with
-  `runtime/tests/decode_bw_probe.hip`, median of three clean leased runs, then
-  **land the number in the registry entry for `$GPU` together with a test that
-  asserts `bandwidth_for_bound()` returns it** (see
-  `measured_bandwidth_governs_a_reported_bound_on_mi325` in
-  `crates/hwspec/src/registry.rs`). That turns a one-off measurement into a
-  standing invariant instead of a note someone has to remember. If you cannot
-  measure it on `$GPU`, every reported % must say in words that its denominator
-  is an unmeasured datasheet peak.
-* **Single-unit rooflines come from `runtime/ubench/`.**
-  `ubench_cu_roofline` runs the *production* op headers (same code, same
-  register pressure) on one CU and prints efficiency vs the single-unit
-  ceiling, with `--decode` switching to M=1 shapes:
+- **Analytic (ranking only).** `costmodel::CostModel::new` takes `SmSpec`, subtracts
+  `kernel_reservation_bytes(arch)` from shared memory and enumerates double-buffered tiles; DMA
+  cost uses datasheet bandwidth. An absolute floor must use `MemorySpec::bandwidth_for_bound()`.
+- **Reported.** `$BW_BOUND` and `$COMPUTE_CEIL` are measured on `$GPU`; name which kind of
+  denominator every % uses. `bandwidth_for_bound()` falls back to the datasheet peak when the
+  registry entry has no `bandwidth_measured`.
+  - NVIDIA: `scripts/bench/calibrate_ceilings.py --out <scratch>/ceilings.json` (HBM read,
+    BF16/FP8 GEMM), via the queue.
+  - AMD: `runtime/tests/decode_bw_probe.hip`, median of three clean runs; land the value in the
+    `$GPU` registry entry with a test asserting `bandwidth_for_bound()` returns it (pattern:
+    `measured_bandwidth_governs_a_reported_bound_on_*` in `crates/hwspec/src/registry.rs`).
+  - `gemm_tile_sweep.c` takes `PEAK_TFLOPS` / HBM constants as overridable macros for this.
+- **Single unit (AMD, evidence only).** `runtime/ubench/` runs the production op headers on one CU:
 
   ```bash
-  cd runtime
-  cmake -B build -DPLOW_ROCM=ON -DPLOW_UBENCH=ON -DPLOW_HIP_ARCH=$ISA   # $VENDOR = amd
+  cd runtime && cmake -B build -DPLOW_ROCM=ON -DPLOW_UBENCH=ON -DPLOW_HIP_ARCH=$ISA
   cmake --build build --target ubench
-  cd ubench && ./run_ubench_cu.sh --timing-only     # or --kernel d_gemm, --json out.json
+  cd ubench && ./run_ubench_cu.sh --timing-only   # --decode for M=1, --kernel <k>, --json <f>
   ```
 
-  The single-CU harness is AMD-side; on `$VENDOR = nvidia` the equivalent
-  evidence comes from the occupancy probes in `runtime/bench/nvidia/`.
+  No oracle → never a record. On NVIDIA use the occupancy probes in `runtime/bench/nvidia/`.
+- **Vendor ceiling (AMD).** Time each hot live shape against hipBLASLt or the matching AITER
+  operator: same ISA, dtype/scale layout, M/N/K, batch/context, head geometry, top-k, expert count,
+  same oracle. Record upstream commit, toolchain and complete shape; another shape or part is a
+  hypothesis. Trace the framework to the kernel it dispatches and include its padding,
+  quantization, sorting, reductions and epilogues so both sides time the same boundary. Record
+  latency plus VGPR/AGPR/LDS/spills of the plow production object.
 
-  These numbers are **evidence, not selectable records** — `runtime/ubench/`
-  has no correctness oracle, so nothing it produces can qualify in `tunedb`.
-  Use it to decide whether a kernel is compute- or bandwidth-bound and how far
-  from the ceiling it sits; use the oracle-bearing harnesses below to publish.
-
-## Step 1 — inventory: what is actually tunable on this object
-
-Do this before spending any GPU time. Three questions decide whether a family
-is tunable at all (see `11-tuning-coverage.md` for the full derivation):
-
-1. does the opcode reach a *distinct* kernel (or is it an alias)?
-2. is there a parameter to vary (an `#ifndef`-guarded macro, not a hard
-   `#define`)?
-3. is there a correctness oracle?
+## Step 1 — inventory
 
 ```bash
-nix develop --command cargo build -p plowc --bin plowc     # `tuner` is a default feature
-plowc --list-gpus                                          # the recognized $GPU names — do not guess
+nix develop --command cargo build -p plowc --bin plowc   # `tuner` is a default feature
+plowc --list-gpus                                          # recognized $GPU names
 plowc tune inventory --gpu "$GPU" --root .                 # executable kernels + aliases
-plowc tune select --gpu "$GPU" --shape 4096,4096,4096      # what would this shape get, and why
-plowc tune status --gpu "$GPU" --db tuning                 # what the store already holds
+plowc tune select --gpu "$GPU" --shape M,N,K               # what a shape gets, and why
+plowc tune status --gpu "$GPU" --db tuning                 # what the store holds
 ```
 
-Read the **aliases** block first: opcodes listed together reach one function
-body, and ranking within such a group measures dispatch noise. On NVIDIA the
-three dense-GEMM opcodes are one body whose tile is an object-wide macro — the
-tuning axis there is *which object is built*, not which opcode is emitted. On
-AMD the same opcodes are separately compiled instantiations and genuinely
-rankable. Before sweeping any macro, confirm it is a knob:
-`kernelcaps::classify_macro(header, "PGM_BN") == Sweepable::Overridable`. A
-`-D` on a hard-defined macro is a redefinition, and the numbers describe a tile
-that was never built.
+Per family decide: distinct kernel (not an alias)? a knob (`#ifndef`-guarded macro)? an oracle?
+Record the verdict per family: tunable, blocked-on-oracle, blocked-on-knob, alias no-op.
 
-### Step 1b — prove the built object actually carries the arms
+- **Aliases first.** Opcodes listed together reach one body; ranking them measures dispatch noise.
+  On NVIDIA the dense-GEMM opcodes alias and the tile is object-wide (`devgen::nvidia_prefill_gemm_op`
+  emits one opcode per dtype; `PGM_*`/`PGM90_*` defines pick the tile), so the axis is which
+  object is built. On AMD the opcodes are separate instantiations and rankable.
+- **Knob check.** `kernelcaps::classify_macro(header, "<MACRO>") == Sweepable::Overridable`. A `-D`
+  on a hard `#define` measures a tile that was never built. NVIDIA attention tiles are template
+  literals: sweeping them is a code edit.
 
-`tune inventory` answers "what does this source compile to under these defines".
-The complementary question is **"does the object I am about to measure contain
-the arms this model's geometry needs"**, and it must be asked of the built
-artifact. A missing arm is rarely a crash: it is a silent fallback to a slower
-correct path, or a feature that disables itself with a warning nobody read. One
-recorded instance — a sampler object missing its multi-step advance entry point
-— silently turned multi-step decode off and cost ~1.7× with no error.
-
-The check is per `$VENDOR` because the object format is:
-
-| `$VENDOR` | entry symbols present | register / spill / instruction mix |
-|---|---|---|
-| nvidia | `cuobjdump -symbols <obj>.cubin \| grep <mangled entry>` (`$BUILD` already fails hard when its own entry is missing) | `cuobjdump -res-usage <obj>.cubin` |
-| amd | `readelf -s <obj>.hsaco` / `.elf` | `scripts/asm_audit.py [--expect scripts/asm_expect_$ISA.json] <obj>` — asserts on the *disassembly*, not just the symbol: which MFMA the backend picked, operand formats, spill to scratch |
-
-`asm_audit.py` has no NVIDIA counterpart, and `cuobjdump -res-usage` has no AMD
-counterpart; each side has the instrument the other lacks. Run whichever `$ISA`
-gives you, and record which class of check went unmade.
-
-**Reading register counts.** Two non-obvious properties, both of which have
-inverted a conclusion in a real campaign:
-
-* **An interpreter object's register count is the MAX over every instantiated
-  arm**, because the megakernel inlines all of them. Adding a wide rung for
-  batching therefore taxes the `B=1` path too — the same coupling
-  `11-tuning-coverage.md` states for `GV_MM_MAX`, visible here as a number.
-* **Spill is not the same as slow.** A latency-bound rung can tolerate spill and
-  measure *faster* than a spill-free variant (recorded on a decode unroll
-  sweep). Do not prune a variant on `ptxas -v` output; measure it.
-
-**The TU-isolation law.** A heavyweight kernel body loses probe-grade register
-allocation when it is compiled into a wide-armed interpreter TU. Recorded three
-times on `$ISA = sm_90a`: a warp-specialized GEMM that deadlocked/spilled in the
-fat TU ran clean in an arm-stripped one; an hd512 flash body was 1.75–2.5×
-*worse* in the fat TU and won 10.5% in a flash-only TU; a 384-thread
-producer/consumer GEMM was only expressible as its own object at all. The
-general form: **when a big kernel underperforms in-model but not standalone,
-suspect the translation unit before the kernel.** The lever is which object gets
-built, which is why the NVIDIA tuning axis in this stage is a build-define set
-rather than a per-op record.
-
-Condensed coverage picture (full table in `11-tuning-coverage.md`):
+Condensed coverage (full table in `11-tuning-coverage.md`):
 
 | family | knob | oracle | verdict |
 |---|---|---|---|
-| prefill GEMM | AMD `GM_BM`/`GM_BN`/`GM_BK`; NV Ampere `PGM_BN`/stages; Hopper `PGM90_STAGES`/`PGM90_FP8_PROMOTE` | AMD yes | **tunable now (AMD)**; NV blocked on oracle merge |
-| decode GEMV | `GV_*` unroll ladder, `GV_MM_MAX`, `PLOW_GEMV_MM`/`WALK` | AMD yes | tunable, high value |
-| MoE | shares dense `PGM_*` tile | weak | blocked (oracle + shared tile) |
-| attention / MLA / DSA | AMD `FA_*`; NV tiles are template literals, not macros | DSA strongest | partial |
-| collectives | `PLOW_XR_CUS` | 2-GPU | park until N≥2 GPUs |
+| prefill GEMM | AMD `GM_BM`/`GM_BN`/`GM_BK`; NV `PGM_*`, `PGM90_*` | AMD yes | tunable (AMD); NV object grid |
+| decode GEMV | `GV_*` unroll, `GV_MM_MAX`, `PLOW_GEMV_MM`/`WALK` | AMD yes | tunable |
+| MoE | shares dense `PGM_*` tile | weak | blocked |
+| attention / MLA / DSA | AMD `FA_*`; NV template literals | DSA strongest | partial |
+| collectives | `PLOW_XR_CUS` | multi-GPU | needs ≥2 GPUs |
 
-## Step 2 — identify the hot shapes from the compiler's own demand
+### Step 1b — audit the built object
 
-Do not hand-author a shape list; that is exactly how GLM-5.2 prefill ended up
-100% unmeasured. The demand comes from the compile itself:
+A missing arm is usually a silent fallback, not a crash. Ask the built artifact:
+
+| `$VENDOR` | entry symbols | resources / instruction mix |
+|---|---|---|
+| nvidia | `cuobjdump -symbols <obj>.cubin` | `cuobjdump -res-usage <obj>.cubin` |
+| amd | `readelf -s <obj>.elf` | `scripts/asm_audit.py [--expect scripts/asm_expect_$ISA.json] <obj>` (MFMA choice, operand format, scratch spill) |
+
+- An interpreter object's register count is the max over every inlined arm: a wide batching arm
+  taxes `B=1` too.
+- Spill is not slow by itself; measure before pruning on `ptxas -v`.
+- A big body that underperforms in-model but not standalone: suspect the translation unit first.
+  The lever is which object is built (an arm-stripped TU), which is why the NVIDIA axis is a
+  define set.
+
+## Step 2 — hot shapes from the compiler's demand
+
+Never hand-author a shape list. Compile flags go before `tune`:
 
 ```bash
-# derive the demanded GEMM shapes from a real emit (the compile flags go BEFORE `tune`):
-plowc --hf-dir <ckpt> --arch $ISA --max-ctx $MAXCTX --n-cu $NCU --num-gpus $NGPU \
-    tune shapes --gpu "$GPU"
-
-# current-source decode campaign: the supplied emit produces the TUNEDUMP_GEMV census
-OBJ="$(mktemp -d /tmp/plow-gemv-obj.XXXXXX)"
-rmdir "$OBJ"
-TUNE_GPU=MI355X scripts/gemv_campaign_lease.sh "$OBJ" OUT.jsonl CAMPAIGN -- \
-    plowc --emit devblob ...
+plowc --hf-dir <ckpt> --arch $ISA --max-ctx $MAXCTX --n-cu $NCU --num-gpus $NGPU tune shapes --gpu "$GPU"
+PLOW_TUNE_DUMP=1 plowc --hf-dir <ckpt> --emit devblob ...   # TUNEDUMP_GEMV census (decode side)
 ```
 
-The current production demand extends through B=128. Campaign objects compile
-at MM<=16 and exercise wider M through the walk. Every demanded BF16 family,
-including QKVG as its harness arm lands concurrently, must produce the complete
-MM=1/2/4/8/16 row, including MM>M coverage. MXFP4 produces only its compiled
-OBJ_MM row and is accepted only when M<=OBJ_MM. The campaign records the
-physically reported MI350X or MI355X name and CU count separately from the
-shared gfx950 cell. Its publication
-gate binds the cell, interpreter, toolchain label, and oracle; it does not claim
-that this identity is a digest of the temporary sweep object.
-The production entrypoint obtains the toolchain label from the repository's
-`nix develop` environment, then binds that exact value through the harness
-build, both interpreter probes, and ingest.
+## Step 3 — sweeps
 
-The hot families for a transformer are known in advance — qkv/o and MLP
-projections (GEMM at prefill, GEMV at decode), flash attention
-(decode/prefill), MoE router/experts/combine — but the *shapes* are per-model
-and per-bucket, and only the emit knows them.
+GPU runs go through the queue ([agent-tools.md](agent-tools.md) "Queue"). `gpulease` exit 76 =
+contended = failed measurement (`tunedb::measurement_is_trustworthy` accepts only 0). Build
+outside the lease. The drivers marked *self-leasing* call `perf-data/tools/gpulease` per GPU command
+themselves; gpulease does not nest, so do not wrap them in `gpuq.py submit`.
 
-## Step 3 — run the sweeps, under the lease
-
-Every timed run goes through `perf-data/tools/gpulease <label> <cmd>`, which
-audits for foreign compute processes and **exits 76 if the GPU was contended**.
-`tunedb::measurement_is_trustworthy` accepts only exit 0 — a 76 is a failed
-measurement, never a result with a caveat. Wrap the run, not the build.
-
-| sweep | `$VENDOR` | harness | ingest / consumer |
+| sweep | `$VENDOR` | harness | consumer |
 |---|---|---|---|
-| prefill GEMM tiles | amd | `plowc … tune gemm` (measure + ingest + verify, one command) or `gemm_tile_sweep <M> <N> <K> [label] [quant]` with `PLOW_GEMM_JSONL=<path>` | `plowc tune ingest --samples <jsonl>`; read back by `devgen::pick_tile` |
-| decode GEMV rungs | amd | `gemv_campaign_lease.sh OBJ JSONL CAMPAIGN -- EMIT_COMMAND...`; requires a fresh OBJ, builds all harness components in `nix develop` outside one leased sweep, then derives/filter-checks the live `TUNEDUMP_GEMV` census | Ingests only passing uncontended samples after physical MI350X/MI355X detection and exact cell/interpreter/toolchain/oracle checks |
-| decode attention split count | both | emit matched packet arms with the model's `nsplit` knob (K3: `PLOW_MLA_NS`) and score with `plowrt serve` + `vllm bench serve`; keep weights and interpreter object fixed | packet/program selection, not the kernel tune store |
-| decode knob grid | nvidia | `scripts/tune_decode_sweep.sh` — joint OBJECT knobs (`PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, `PLOW_MOE_DOWN_SG`) scored by end-to-end step TPOT | `tunedb-decode ingest --db tuning --results <jsonl>` |
-| single-CU roofline (evidence only) | amd | `run_ubench_cu.sh` | none — no oracle, never selectable |
-| dispatch floor (evidence only) | both | `runtime/bench/dispatch/interp_dispatch_floor_nv.cu` / `.hip` | stored `provisional` with `reason_not_qualified` |
+| prefill GEMM tiles | amd | `plowc … tune gemm` (measure + ingest + verify) or `gemm_tile_sweep <M> <N> <K> [label] [quant]` with `PLOW_GEMM_JSONL=<path>` then `plowc tune ingest --samples <path>` | `devgen::pick_tile` |
+| decode GEMV rungs | amd (gfx950) | `TUNE_GPU=$GPU scripts/gemv_campaign_lease.sh <fresh OBJ> <jsonl> <campaign> -- <emit cmd>` (*self-leasing*; builds in `nix develop`, sweeps the census, ingests only clean, oracle-passing samples) | `tunedb-gemv` |
+| decode knob grid | nvidia | `scripts/tune_decode_sweep.sh --block <L> --block-run <block_run>` (*self-leasing*): `PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, MoE knobs; re-run the 2–3 winners without `--block` | `tunedb-decode ingest --db tuning --results <jsonl>` |
+| decode-attention split count | both | matched packet arms (below) | packet/program choice, not the tune store |
+| single-CU roofline | amd | `run_ubench_cu.sh` | none (evidence) |
+| dispatch floor | both | `runtime/bench/dispatch/interp_dispatch_floor.hip` / `_nv.cu` | `provisional` only |
 
-The vendor split here is real, not an accident of coverage: on AMD the dense
-opcodes are separately compiled instantiations with per-op records to publish,
-while on NVIDIA the tile is object-wide, so the sweep axis is the build define
-set. Whichever side `$VENDOR` puts you on, the other column's harness has
-nothing to say about `$GPU`.
-
-The end-to-end prefill-GEMM campaign (`$VENDOR = amd`), in one command (objects
-built first by `scripts/rebench_build_objs.sh` → `test_kernels.elf`):
+Prefill-GEMM campaign (AMD). `$BUILD <objdir>` writes `test_kernels.elf` beside the interpreter
+objects (`PLOW_HSACO_CONFIG=<assets>` builds for one packet):
 
 ```bash
-nix develop --command ./target/release/plowc \
-    --hf-dir <ckpt> --arch $ISA --max-ctx $MAXCTX --n-cu $NCU --num-gpus $NGPU \
-    tune gemm --gpu "$GPU" --root . --obj <objdir> --samples <out.jsonl> --lease
+$BUILD <objdir>
+python3 scripts/bench/gpuq.py submit tune-gemm 1 nix develop --command ./target/release/plowc \
+  --hf-dir <ckpt> --arch $ISA --max-ctx $MAXCTX --n-cu $NCU --num-gpus $NGPU \
+  tune gemm --gpu "$GPU" --root . --obj <objdir> --samples <scratch>/gemm.jsonl
 ```
 
-`--shapes auto` (the default) derives the list from the compile's demand;
-`--lease` wraps every GPU invocation in `gpulease`. Repeat until clean — one
-clean run is still one sample of the run distribution.
+`--shapes auto` (default) derives shapes from the compile; `--dry-run` stops after deriving;
+`--no-ingest` measures without publishing.
 
-Two knob couplings to respect in any sweep design (from `11-tuning-coverage.md`):
-`GV_MM_MAX` moves the register ceiling of **every** arm in the object because
-the interpreter inlines all of them, and MoE grouped GEMM shares the dense
-`PGM_*` tile triple, so sweeping one moves the other. `PGM_BM` is additionally
-packet-layout-visible (the MoE routing histogram pads to it).
+Couplings: `GV_MM_MAX` moves the register ceiling of every arm in the object; MoE grouped GEMM
+shares the dense `PGM_*` tile; `PGM_BM` is packet-layout-visible. Do not sweep them independently.
 
-### Decode-attention packet split sweep
+### Decode-attention split sweep
 
-Treat attention `nsplit` as a packet-decomposition sweep, not a kernel-tile
-sweep. It divides one KV scan into independent ranges and increases the flash
-grid, while the following merge grows linearly with the number of partials.
-The result is context-dependent and U-shaped.
+`nsplit` is a packet decomposition: more splits fill more CUs, the merge grows with the partial
+count, so the curve is U-shaped and context-dependent.
 
-For every arm, re-emit only the packet, reuse the exact weights and interpreter
-object, and prove by disassembly that only the attention and merge packets plus
-their scratch extents changed. Sweep at the shortest and longest served context,
-then add crossover points before choosing thresholds. K3 TP8 uses
-`workgroups = (local_heads / head_group) * PLOW_MLA_NS`; its measured 128K sweep
-was ns16/ns32/ns64/ns128 = 81.400/67.417/60.569/60.683 ms TPOT, so ns64 won and
-ns128 bracketed the merge-cost reversal.
+- Re-emit only the packet per arm; reuse the exact weights and interpreter object. Prove by
+  disassembly that only attention/merge packets and their scratch extents changed.
+- Screen on a truncated real-model asset with one production attention layer plus its
+  merge/output/residual tail (an isolated flash kernel omits the merge). Sweep shortest and longest
+  served context, then crossover points. Only finalists go to whole-model serving.
+- Split boundaries change reduction association: require finite outputs, rank/counter audits and
+  the model quality gate, not byte-identical text.
+- Add a context ladder only when matched crossover wins exceed noise; it selects a pre-emitted
+  program by live KV length, never patches packet instructions or resizes scratch on the hot path.
 
-Screen the full grid with a truncated real-model asset containing one production
-attention layer and its merge/output/residual tail. This retains the interpreter,
-packet counters, FP8 KV layout, and real weights while avoiding a full-model load
-per arm. Use the isolated result to discard losers and locate approximate
-crossovers; only the finalists proceed to whole-model serving. An isolated flash
-kernel alone is insufficient because it omits the growing merge term.
+### AMD iteration loop
 
-For K3, zero-based layer 3 is an MLA layer. Emit the screen with the production
-packet and object settings, changing only the layer set and split count:
+1. Freeze oracle, workload generator, queue wrapper and timing parser before the baseline; if one
+   changes, re-run the baseline.
+2. Write one hypothesis and the expected counter movement before each candidate.
+3. Change one algorithmic lever first; tile/unroll searches only after the bottleneck is measured.
+   Keep runtime-selectable candidates in one object only if production registers and instruction
+   footprint do not grow.
+4. Compile, run the adversarial oracle grid, audit the production object, then same-session A/B.
+   Reject correctness failures, spills, route misses, contended samples and wins below
+   `Stats::beats`.
+5. Record every result, losses included. Promote only the best qualified current-digest candidate;
+   remove dead candidate code.
+
+Precision, scale layout and tolerance are identical across arms. Stop at a decisive win or
+exhausted hypotheses. On AMD collect only the counters the hypothesis names (MFMA utilization,
+memory stalls/TCC traffic, LDS conflicts, achieved occupancy); a resource limiter alone does not
+prove elapsed-time impact.
+
+### Prefill fusion ladder (AMD)
+
+Derive every operator, shape, dtype, consumer count, parallel degree and prompt bucket from the
+emitted artifact and workload; never key a harness on a model name.
+
+- **Seams to audit:** projection + position transform; projections sharing an input; attention input
+  projection + attention (latent/absorbed forms); gate + up + activation; routing/sort/align +
+  grouped experts + deterministic combine; collective + residual + norm; recurrent state update +
+  gate/norm; any producer/consumer pair whose HBM intermediate has one consumer.
+- **Reject before coding** a fusion that duplicates a reduction across consumers, changes required
+  association/order, extends buffer lifetime, crosses workgroups without a valid mechanism, or
+  raises the object's register/LDS ceiling. Absent dispatch arms refuse loudly.
+- **Fast-path audit:** record selected opcode, object, body and fallback reason per live shape.
+  Padding is a candidate only when `fast_path(padded) + pad/unpad` beats the native path. A
+  lower-bit weight/KV format is a system candidate: include pack/quant/dequant, scale traffic,
+  layout, KV headroom and minimum TP degree.
+
+Gates, in order (one row per `(candidate, scope, shape, artifact digest)`; adoption needs every
+scope; never multiply an isolated speedup by layer count):
+
+1. **Kernel** — fused vs the exact unfused sequence, one timing region, identical buffers/inputs;
+   verify every deleted intermediate and the final output.
+2. **Shape** — every bucket, ragged boundaries, shortest/longest context, min/max batch, empty
+   sparse partitions, max top-k, adversarial imbalance; ISA/VGPR/AGPR/LDS/spill/occupancy audit.
+3. **Operator chain** — beside real producers, consumers and collectives; reconcile with packet
+   counts, bytes removed and counters.
+4. **Block** — a real block of each architecture class present.
+5. **Composition** — qualified fusions in pairs, then as a set; re-gate after each addition.
+6. **Network** — full checkpoint, cold and prefix-hit prefill through `plowrt serve`, same client
+   both arms; report collective time separately. A topology change is its own cell.
+
+Rows follow [`docs/schemas/fusion-ladder-row-v1.schema.json`](../schemas/fusion-ladder-row-v1.schema.json):
 
 ```bash
-for ns in 16 32 64 128; do
-  nix develop --command env \
-    K3_FULL=1 PLOW_LAYERS=single:3 PLOW_MLA_NS="$ns" \
-    PLOW_FP8_KV=1 PLOW_MXFP4=1 PLOW_MLA_PF_V2=1 \
-    PLOW_L2_PLACE=1 PLOW_DECODE_BATCH=1 PLOW_GEMV_MM=1 \
-    ./target/release/plowc --hf-dir /home/lava/models/k3_farm \
-      --emit devblob --arch gfx942 --gpu MI325X --num-gpus 8 --parallel tp \
-      --max-ctx 131072 --n-cu 304 --out "build-amd/k3-ns${ns}-layer3"
-done
+python3 perf-data/tools/fusion_ladder_results.py validate rows.jsonl
+python3 perf-data/tools/fusion_ladder_results.py aggregate rows.jsonl --output promotion.json
+python3 perf-data/tools/fusion_ladder_run.py manifest.json --output <scratch>/run-dir   # plow.fusion-ladder.run.v1
 ```
 
-Reuse one matching HSACO tree for every arm. Check that only the 24 decode
-attention packets, their 24 merge packets, and scratch extents differ. The
-single-layer screen ranks candidates; it is not a served-model or quality gate.
+The runner needs ≥3 alternating paired rounds, one entry per scope, and a final
+`plow.fusion-ladder.evidence.v1` JSON line per command; any missing field or non-decisive pair fails
+closed.
 
-Changing split boundaries changes floating-point reduction association. Require
-finite outputs, exact cross-rank/counter audits, the model quality gate, and
-served `vllm bench serve` measurements; byte-identical text across arms is not a
-valid requirement. Add a production context ladder only when matched crossover
-wins exceed noise. It must select a pre-emitted program by live KV length, never
-patch packet instructions or resize scratch in the hot path. K3's measured ns64
-arm tied ns16 at short context and won at every measured context from 4K through
-128K, so the current production choice is one fixed ns64 program, not a ladder.
+### AMD candidate families
+
+1. **Long-sequence recurrence** — chunked parallel scan only when the transition is associative or
+   has an exact chunk composition; sweep chunk/subchunk; boundaries from the host, no blocking D2H;
+   the serial body stays oracle and fallback.
+2. **Ownership-preserving recurrent fusion** — one workgroup owns a full head/state shard and fuses
+   conv/state update, norm and output gate; a partial fusion with a grid rendezvous is a separate
+   candidate.
+3. **Skinny projection split-K** — sweep split count per exact `(arch, CU, object digest, op, M, N,
+   K, dtype, layout)` with the reduction in the timed region; missing rows fall back loudly.
+4. **Grouped sparse work** — tune both expert stages by token bucket and observed distribution
+   (persistent vs not, atomic vs reduction); gate empty, skewed and random bins; deterministic replay.
+5. **Attention split/persistence** — by decode rung and KV bucket; time split + merge together;
+   deterministic table lookup at runtime.
+
+Distinguish `compiled`, `qualified` and `selected` in `build.json` or the runtime result: a compiled
+arm or populated store is not evidence that production selected it.
 
 ## Step 4 — read the roofline %
 
-For each family, compute the % against the bound that binds:
+- **Bandwidth-bound** (decode GEMV, decode attention): bytes moved / time vs `$BW_BOUND`.
+  `gemv_row_sweep` reports per-(arm, MM) samples; the M curve prices `PLOW_GEMV_MM` / `WALK`.
+- **Compute-bound** (prefill GEMM): TF/s vs `$COMPUTE_CEIL`. For small M read `gemm_tile_sweep`'s
+  TILE COUNT / CU FILL: a tile that wins while dropping fill has not won.
+- Records carry `median_ns`/`p10`/`p90`/`min`/`samples`; `Stats::beats` refuses a win inside the noise.
+- Far from the bound: attribute before re-sweeping. Occupancy probes
+  (`runtime/bench/nvidia/occ_probe.cu`, `px16_occ_bench.cu`, `runtime/ubench/gemm_occ1_bench.c`)
+  separate residency from wave quantization; an occupancy delta needs a matched-grid control.
 
-* **Bandwidth-bound (decode GEMV, decode attention):** bytes actually moved
-  (weights + KV + activations) ÷ measured time, as a fraction of `$BW_BOUND`.
-  `gemv_row_sweep` reports per-(arm, MM) samples;
-  decode GEMV should sit near the weight-streaming bound, and the M curve is
-  what prices the object-level choice of `PLOW_GEMV_MM` and `PLOW_GEMV_WALK`.
-* **Compute-bound (prefill GEMM):** achieved TF/s as a fraction of
-  `$COMPUTE_CEIL`. `gemm_tile_sweep` prints TF/s, and — for the
-  small-M shapes — the **TILE COUNT and CU FILL** each tile achieves, because
-  at M=128 the limit is usually fill, not the tile's own efficiency. A tile
-  that "wins" by 3% while dropping CU fill has not won.
-* **Timings are never a single number.** Records carry
-  `median_ns`/`p10`/`p90`/`min`/`samples`, and `Stats::beats` refuses a win
-  inside the noise. A 1 ns edge under 30 ns of spread is not a result.
+## Step 5 — record winners and read them back
 
-When a family is far from its bound, attribute before re-sweeping: the
-occupancy probes (`runtime/bench/nvidia/occ_probe.cu`, `px16_occ_bench.cu`,
-`runtime/ubench/gemm_occ1_bench.c`) separate residency effects from wave
-quantization — see the pitfalls.
-
-## Step 5 — record the winners where the compiler will find them
-
-* **Prefill GEMM (`$VENDOR = amd`):** `plowc tune gemm` ingests as it measures; a manual
-  sweep goes through `plowc tune ingest --samples <jsonl>`. Records are keyed
-  by cell (`tunedb::amd_tuning_cell(spec)` — the ONE rule shared by writer and
-  reader), op case (`gemm_op_case(m,n,k,quant)` — quant is in the key so a bf16
-  timing is never served for an fp8 op), and tile; `gemm_rung_opcode` maps a
-  winning tile back to the opcode that carries it, and returns `None` for
-  calibration-only tiles that must not become selectable facts.
-* **Decode GEMV (`$VENDOR = amd`):** `tunedb-gemv ingest --db tuning --gpu
-  "$GPU" --samples <jsonl>`. `--gpu` is required — it decides the cell.
-* **Decode knobs (`$VENDOR = nvidia`):** the winner is an object, not a record
-  the emitter reads; consume it as build defines through `$BUILD`:
+- **Prefill GEMM (amd):** `plowc tune gemm` ingests as it measures; manual sweeps use
+  `plowc tune ingest --samples <jsonl>`. Keys: cell (`tunedb::amd_tuning_cell`), op case
+  (`gemm_op_case(m,n,k,quant)`), tile; `gemm_rung_opcode` returns `None` for calibration-only tiles.
+- **Decode GEMV (amd):** `tunedb-gemv ingest --db tuning --gpu "$GPU" --samples <jsonl>`; `--gpu`
+  decides the cell.
+- **Decode knobs (nvidia):** the winner is an object; build it with the define string:
 
   ```bash
-  PLOW_EXTRA_DEFINES="$(tunedb-decode best --db tuning \
-      --hardware $VENDOR/$ISA/<sku-slug> --print defines)" \
-    $BUILD out/interp_$ISA.cubin
+  PLOW_EXTRA_DEFINES="$(tunedb-decode best --db tuning --hardware $VENDOR/$ISA/<sku> --print defines)" \
+    $BUILD <out>/interp_$ISA.cubin
   ```
 
-  The `--hardware` path is `<vendor>/<isa>/<sku>`; take the slug from the store
-  layout (`tuning/<vendor>/<isa>/<sku>/`), not from `$GPU`'s display name.
+  Take `<sku>` from `tuning/<vendor>/<isa>/<sku>/`. `--print` refuses when more than one cell matches.
+- Cells are per SKU: two parts at one `$ISA` keep separate stores. Re-sweep on `$GPU`.
+- Read back after every publish (a miss is byte-identical to "never measured"):
 
-  **The cell is per-SKU, so winners do not transfer between two parts at the
-  same `$ISA`.** MI300X and MI325X are the same compute die — same CU count,
-  same LDS, same `IsaLevel` — and still keep separate stores
-  (`tuning/amd/gfx942/mi300x/` and `tuning/amd/gfx942/mi325x/`). They differ in
-  the memory subsystem, which is exactly what a bandwidth-bound decode winner is
-  selected against. Re-sweep on `$GPU`; do not copy a sibling SKU's store
-  forward.
+  ```bash
+  plowc tune status --gpu "$GPU" --db tuning
+  plowc tune select --gpu "$GPU" --shape M,N,K   # expect rationale measured, tier sku-calibrated
+  ```
 
-  `--print` refuses when the filter leaves more than one cell standing: a flag
-  string names ONE object, and the union of two cells' winners is an object
-  nobody measured.
+- Whether a production recipe uses a tuned record is a per-rung recipe decision
+  ([agent-tools.md](agent-tools.md) "Per-rung gate and recipe selection"; the `PLOW_TUNEDB` hazard
+  is in "Measurement hazards").
 
-Then **verify consumption** — a publish that lands in a cell nobody reads is
-silent in both directions:
+## Gate (into Stage 5)
 
-```bash
-plowc tune status --gpu "$GPU" --db tuning      # the cell now holds qualified records
-plowc tune select --gpu "$GPU" --shape M,N,K    # rationale: measured; tier: sku-calibrated
-```
+1. Every demanded hot shape (`tune shapes`, `TUNEDUMP_GEMV`) is HIT, or its MISS is explained (no
+   oracle, no knob, alias group).
+2. Winners are `qualified` records (oracle passed, ≥ `Stats::MIN_SAMPLES`, decisive under
+   `Stats::beats`) or exact `-D` define strings; nothing selectable came from an oracle-less harness.
+3. Published records read back through `plowc tune select` with rationale `measured`.
+4. Per-family roofline % against `$BW_BOUND` / `$COMPUTE_CEIL` for `$GPU`, binding side named,
+   denominator kind stated.
+5. Every timed run was uncontended (rc=0); rc=76 runs were discarded and re-run.
+6. Untunable families are written down as such.
+7. No command named a literal part; every `--gpu`/`--arch`/`--n-cu` came from the target block.
+8. Every changed AMD object passed the resource/ISA audit: no spill regression, expected
+   VGPR/AGPR/LDS and occupancy, the expected MFMA mnemonic for `$ISA`, and a live marker/route proof
+   that the measured arm executed.
 
-If the selection still says `analytical cold start` / tier `portable` for a
-shape you just measured, the campaign published into the wrong cell or under a
-stale digest — a miss is byte-identical to "never measured", so this check is
-the only thing that distinguishes a working campaign from a no-op one.
+## Pitfalls
 
-## Success criteria
+- Body-level aliases (AMD MoE group ops looping over expert ops) do not appear in the aliases block.
+- Standalone kernel numbers do not transfer into the interpreter (different register allocation);
+  measure through it (`runtime/bench/interp/interp_gemm_bench.c` builds a one-instruction program).
+- Publishing into a cell nobody reads is silent; the `tune select` read-back is the only check.
+- Calibration-only tiles are measurements, not selectable facts.
+- Stub kernels (`XFLASH_MERGE`, `XARGMAX_FIN`) time at ~0 ns; rank only what
+  `ProbedObject::executes` lists.
+- On NVIDIA, timing benches and oracle tests live in separate files; NVIDIA GEMM winners stay
+  screening results until merged.
+- If every relevant opcode aliases and the tile is object-wide, the axis is a build define grid,
+  not a per-op record.
+- An exact-shape NVIDIA variant that changes block size, registers, shared memory, cluster or entry
+  point is a new object ABI: expose its globals through a packet role; `plowrt` reads them and asks
+  the driver for blocks/SM at load. On AMD `hwspec::ArchGeometry` gates the LDS tile and `pick_tile`
+  selects only opcodes in the target inventory.
 
-1. **Coverage census is explicit.** Every hot-kernel shape from the compiler's
-   demand (`tune shapes`, `TUNEDUMP_GEMV`) is HIT in the store, or its MISS is
-   explained (no oracle for the family, no knob, alias group).
-2. **Winners are qualified.** Winning records are in state `qualified` — oracle
-   passed, ≥ `Stats::MIN_SAMPLES`, decisive under `Stats::beats` — and object
-   winners are recorded as the exact `-D` define string.
-3. **The compiler sees them.** `plowc tune select` reports rationale `measured`
-   and tier `sku-calibrated` (or better) on covered shapes.
-4. **Roofline % recorded per family** against `$BW_BOUND` / `$COMPUTE_CEIL` as
-   established for `$GPU` in Step 0, with the binding side (compute vs
-   bandwidth) named and the denominator's provenance stated (measured on this
-   part, or an unmeasured datasheet peak). A % whose denominator came from
-   another part fails this criterion.
-5. **Every timed run was uncontended** (`gpulease` rc=0); every rc=76 run was
-   discarded and re-measured.
-6. **Untunable is written down, not skipped over.** Families with no oracle or
-   no knob on this target are recorded as such (they will resurface in
-   Stage 5/6 as build-knob work, not tuner work).
-7. **No command in the campaign names a literal part.** Every `--gpu`/`--arch`/
-   `--n-cu` came from the `target.md` block; a script left pointing at another
-   part's flags is the recurring bring-up failure this block exists to prevent.
+## Stop and ask
 
-## Pitfalls (from real campaigns)
+- A target-block row cannot be filled (`$GPU` not in `plowc --list-gpus`, no `$BUILD` for `$ISA`,
+  ceilings not measurable).
+- The family has no in-tree oracle: build one or proceed provisional?
+- `tune inventory` cannot derive an inventory, or its defines do not match the shipping object.
+- Every knob on the critical path is `Fixed`: the axis is a code change.
+- No uncontended card after repeated attempts.
+- A published winner does not appear in `tune select` and the cell/digest audit does not explain it.
+- Roofline % far below ceiling and flat across all knobs: report the per-kernel table and move to
+  [05](05-single-block-sweep.md)/[06](06-runtime-opt.md).
 
-* **Ranking an alias group measures dispatch noise.** On `$VENDOR = nvidia` the
-  three dense-GEMM opcodes reach one body; a "winner" among them will not
-  reproduce. Read the
-  `aliases` block before designing any sweep. Body-level aliases (AMD MoE group
-  ops are `k`-loops over the expert ops at default flags) do not appear there —
-  known blind spot.
-* **A hard `#define` is not a knob.** `-D` on it is a redefinition and the
-  numbers describe a tile that was never built. `classify_macro` first, always.
-  On `$VENDOR = nvidia` the attention tiles are not macros at all — `BQ`/`BKV`
-  are template literals at the dispatch sites, so sweeping them is a code edit,
-  not a parameter search.
-* **Standalone kernel numbers do not transfer.** A standalone GEMM and the same
-  GEMM inlined into the interpreter get different register allocations — on one
-  AMD part the same tile family measured 212 vs 770 TF/s across that boundary.
-  Measure *through* the interpreter (`interp_gemm_bench.c` builds a
-  one-instruction `PlowProgram`); [Stage 7](07-perf-campaign.md) states the same
-  probe law from the serving side.
-* **Contended runs are quietly ~35% wrong.** The first campaign needed three
-  attempts before the `gpulease` audit came back clean, and the contended runs
-  differed from clean ones by ~35% on the gate term. rc=76 is a failed
-  measurement, full stop.
-* **Publishing into the wrong cell is silent in both directions.** `tunedb-gemv`
-  once hardcoded one AMD ISA's cell while the reader keyed off `--gpu`, so a
-  campaign on the other ISA would publish records nobody could read — the mechanical
-  reason the decode-GEMV census had zero records. The reader finds nothing,
-  falls back to the analytical model, and reports `portable`, which is exactly
-  what it reports when nothing was ever measured. Always re-check
-  `tune select` after ingest.
-* **Calibration-only tiles must not become selectable.** The sweep also
-  compiles tiles (320x128, 384x128, …) that no interpreter arm carries; they
-  are legitimate measurements of a body and NOT selectable facts —
-  `gemm_rung_opcode` returns `None` for them by design.
-* **Stub kernels benchmark at ~0 ns and win.** AMD's `XFLASH_MERGE` /
-  `XARGMAX_FIN` have live `case` labels with empty bodies.
-  `ProbedObject::executes` excludes them; a hand-rolled harness will not.
-* **An occupancy "win" can be wave quantization.** A per-cell occ-2 signal of
-  1.1–1.4× on decode flash collapsed to 1.07× (and negative at the deployed
-  config) once a matched-grid control was run
-  (`perf-data/px16-decode-occupancy.md`). Never accept an occupancy delta
-  without the matched-grid control.
-* **Datasheet denominators flatter the kernel.** On one AMD part, a kernel
-  sitting exactly at the measured MFMA issue ceiling looks 28% "slow" against
-  that part's datasheet peak. Report % of `$COMPUTE_CEIL` and say which kind of
-  ceiling it is — and remember `bandwidth_for_bound()` silently *is* the
-  datasheet peak wherever `bandwidth_measured` is `None`.
-* **No oracle → no record, however fast it runs.** `runtime/ubench/` numbers
-  and the dispatch-floor probes are evidence and stay `provisional`. On
-  `$VENDOR = nvidia` the timing benches and the oracle tests exist in separate
-  files (the interp op tests validate but have no events; the `*_bw_*.cu`
-  timers have no oracle); merging them is the shortest path to a qualifying
-  measurement there — until then, NVIDIA GEMM winners are screening results.
-* **The tuner can be a structural no-op on your path.** If every relevant
-  opcode aliases to one body and the tile is object-wide, the real axis is a
-  build knob (`-D` grid → `tune_decode_sweep.sh`), not a per-op record. Confirm
-  the tuner selects something before reporting the family "tuned" (Stage 5's
-  gate re-checks this).
+## Report
+
+- The filled target block, `$BW_BOUND` / `$COMPUTE_CEIL` labelled measured or datasheet.
+- Per-family verdict; census size, HIT/MISS, explained misses.
+- Roofline table per hot kernel: achieved, ceiling, binding side, denominator kind.
+- Winners: records (cell, op case, tile) or define string, plus the `tune select` read-back.
+- Gate decision, contention retries, provisional-only families, standalone-only numbers.
+
+Per-rung optimization after Stage 6: [08-rung-campaign.md](08-rung-campaign.md).
 
 ## Code pointers
 
 | symbol / path | role |
 |---|---|
-| `plowc tune` — `inventory\|select\|status\|shapes\|gemm\|ingest\|best\|regress` (`crates/plowc/src/main.rs`, `crates/plowc/src/tune/`) | probe, explain, campaign, ingest |
-| `kernelcaps::select_kernel`, `OpSignature`, `KernelSpec`, `MeasuredCosts` (`crates/kernelcaps/src/select.rs`, `spec.rs`) | selection: measured → analytical fallback, alias collapse |
-| `kernelcaps::probe::dispatch_arms`, `ProbedObject::executes` / `::stubs` (`crates/kernelcaps/src/probe.rs`) | derived kernel inventory, alias + stub detection |
-| `kernelcaps::classify_macro`, `Sweepable` (`crates/kernelcaps/src/sweep.rs`) | is this macro a knob |
-| `tunedb::amd_tuning_cell`, `gemm_op_case`, `gemm_rung_opcode`, `GEMM_ORACLE` (`crates/tunedb/src/gemm.rs`) | record keying — cell, op case, tile→opcode |
-| `tunedb::gemv_case` / `gemv_sample_*` (`crates/tunedb/src/gemv.rs`); `rank_by_cell`, `DecodeKnobs` (`decode.rs`) | GEMV and decode-knob record shapes |
-| `tunedb::Stats` (`beats`, `MIN_SAMPLES`), `TuneStore`, `RecordState`, `Digests` (`crates/tunedb/src/`) | noise gate, staleness, state machine |
-| `tunedb::measurement_is_trustworthy`, `GPULEASE_CONTENDED` (`crates/tunedb/src/lib.rs`) | rc=76 is a failed measurement |
-| `tunedb-gemv` / `tunedb-decode` (`crates/tunedb/src/bin/`) | ingest + `best` for the decode-side stores |
-| `costmodel::CostModel::new`, `kernel_reservation_bytes` (`crates/costmodel/src/lib.rs`); `dma_cycles`, `sm_bytes_per_cycle` (`cost.rs`) | the analytic ceiling and SRAM budget |
-| `hwspec::SmSpec`, `MemorySpec::bandwidth_for_bound` (`crates/hwspec/src/spec.rs`) | per-SM resources; measured-bandwidth floor |
-| `devgen::pick_tile` (`crates/devgen/src/lib.rs`) | the emit-side consumer of qualified GEMM records |
-| `runtime/bench/gemm/gemm_tile_sweep.c`, `gemm_bench_8k.c`, `gemv_row_sweep.c` | tile / row-bucket sweeps with oracle + JSONL |
-| `runtime/bench/interp/interp_gemm_bench.c`, `qwen_interp_bench.c`, `dsa_gather_bench.c` | time-and-validate through the interpreter |
-| `runtime/bench/dispatch/interp_dispatch_floor.hip` / `_nv.cu` | dispatch-floor calibration (provisional evidence) |
-| `runtime/ubench/bench_cu_roofline.c`, `run_ubench_cu.sh`, `bench_cu_gfx950.hip` | single-CU roofline vs theoretical ceilings |
-| `scripts/rebench_build_objs.sh`, `rebench_tune_gemm_all.sh`, `gemv_campaign_lease.sh`, `rebench_tune_gemv.sh`, `tune_decode_sweep.sh`, `$BUILD` | campaign orchestration |
-| `scripts/asm_audit.py`, `scripts/asm_expect_<isa>.json` | assert on an AMD object's disassembly (MFMA choice, operand format, spill); NVIDIA's counterpart is `cuobjdump -symbols` / `-res-usage` |
-| `perf-data/tools/gpulease` | the lease (rc=76 = contended = failed measurement) |
-| `hwspec::IsaLevel::geometry` (`crates/hwspec/src/isa.rs`), `docs/arch/14-amd-arch-divergence.md` §3 | which layer owns a per-ISA difference |
-| `tuning/README.md`, `tuning/<vendor>/<isa>/<sku>/` | the record schema and the store itself |
-
-Related context: `docs/arch/11-tuning-coverage.md` (per-family verdicts this
-stage executes against), `docs/arch/12-using-the-tuner.md` (reading inventories,
-tiers, and the record schema), `perf-data/px16-decode-occupancy.md` /
-`perf-data/px19-tile-graph.md` (measured occupancy / tile-granularity results
-worth reading before re-deriving them).
-# Shape-keyed GEMV workgroup tuning
-
-For a measured GEMV shape, pass an emit-time table rather than changing the
-kernel or runtime globally:
-
-```text
-PLOW_GEMV_WG_TUNING='896x7168=224,1536x7168=152' plowc ...
-```
-
-Entries are `N x K = workgroups`; matching is exact and the first matching
-entry wins. Invalid or unrelated entries are ignored. The setting is currently
-consumed by K3's blocked GEMV emitter only; unset output is byte-identical to
-the default. It changes packet workgroup counts, so the corresponding object
-must be rebuilt and audited, while the HSACO does not need a new kernel arm.
-
-Keep tables tied to measured `(arch, model, compiler, object)` provenance. A
-future tuner can emit this table from the existing block-sweep results; do not
-make an unmeasured heuristic the default because workgroup caps trade occupancy
-against bandwidth and can regress wide shapes.
+| `plowc tune inventory\|select\|status\|shapes\|gemm\|ingest\|best\|regress` (`crates/plowc/src/tune/`) | probe, explain, campaign, ingest |
+| `kernelcaps::select_kernel`, `probe::dispatch_arms`, `ProbedObject::executes`, `classify_macro` (`crates/kernelcaps/src/`) | selection, inventory, stub/alias detection, knob check |
+| `tunedb::amd_tuning_cell`, `gemm_op_case`, `gemm_rung_opcode` (`crates/tunedb/src/gemm.rs`) | record keying |
+| `tunedb::Stats`, `measurement_is_trustworthy` (`crates/tunedb/src/`) | noise gate, rc=76 |
+| `tunedb-gemv`, `tunedb-decode` (`crates/tunedb/src/bin/`) | decode-side ingest / best |
+| `costmodel::CostModel::new`, `kernel_reservation_bytes` (`crates/costmodel/src/`) | analytic ceiling |
+| `hwspec::MemorySpec::bandwidth_for_bound` (`crates/hwspec/src/spec.rs`), `IsaLevel::geometry` (`isa.rs`) | measured floor; per-ISA geometry |
+| `devgen::pick_tile` | emit-side consumer of GEMM records |
+| `runtime/bench/gemm/` (`gemm_tile_sweep.c`, `gemv_row_sweep.c`), `runtime/bench/interp/` | sweeps and through-interpreter timing with oracles |
+| `scripts/rebench_tune_gemm_all.sh`, `gemv_campaign_lease.sh`, `rebench_tune_gemv.sh`, `tune_decode_sweep.sh`, `gemma4_h100_kernel_tuner.py` | campaign drivers |
+| `scripts/asm_audit.py`, `scripts/asm_expect_<isa>.json` | AMD disassembly assertions |
+| `tuning/README.md` | record schema and store layout |

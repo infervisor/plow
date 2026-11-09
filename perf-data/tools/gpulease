@@ -22,7 +22,7 @@
 #
 # Env:
 #   GPU_LEASE_DIR      lock/log dir (default: /workspace/gpu, else /tmp/gpulease)
-#   GPU_LEASE_TIMEOUT  seconds to wait for the lease (default 1800)
+#   GPU_LEASE_TIMEOUT  seconds to wait for the lease (default 10800)
 #   GPU_LEASE_NGPU     override detected GPU count
 #   GPU_LEASE_MAX_HOLD seconds a run may hold cards while others wait (default 7200;
 #                      0 = no limit). Past it the run is stopped (rc 124, PREEMPTED).

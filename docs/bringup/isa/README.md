@@ -20,7 +20,7 @@ primary source, treat as a hypothesis.
 | `Sm120a` | `sm_120a` | RTX 5090, RTX PRO 6000 Blackwell | [sm120.md](sm120.md) | `recipes/infervisor/*/sm120a-*` | `runtime/nvidia/*sm120*`, `register_rtx6000.cu` | `scripts/build_sm120_cubin.sh` |
 | `Gfx942` | `gfx942` | MI300X, MI325X | [gfx942.md](gfx942.md) | `recipes/infervisor/*/gfx942-*` | `runtime/amd/` | `scripts/build_gfx942.sh` |
 | `Gfx950` | `gfx950` | MI350X, MI355X | [gfx950.md](gfx950.md) | `recipes/infervisor/*/gfx950-*` | `runtime/amd/*gfx950*` + shared `runtime/amd/` | `scripts/build_gfx950.sh` |
-| (branch `mixbox-bringup`) | `gfx1201` | Radeon AI PRO R9700 | [gfx1201.md](gfx1201.md) | none on `prod-next` | `runtime/amd/` on `mixbox-bringup` | `scripts/build_gfx942.sh` on `mixbox-bringup` |
+| `Gfx1201` | `gfx1201` | Radeon AI PRO R9700 | [gfx1201.md](gfx1201.md) | none | `runtime/amd/` (`PLOW_GFX12` arms) | `PLOW_HIP_ARCH=gfx1201 scripts/build_gfx942.sh` |
 | `Metal3` | `metal3` | Apple M4 Pro | [apple-gpu.md](apple-gpu.md) | `recipes/infervisor/*/metal3-*` | `runtime/apple/*.metal` | MSL source compiled at load by plowrt (no offline step) |
 | `Amx`, `Avx512`, `CpuRef` | `amx`, `avx512`, `cpu` | Xeon 6 (Granite Rapids); avx512 tier also EPYC Zen 4 | [x86-avx512-amx.md](x86-avx512-amx.md) | `recipes/infervisor/*/xeon6-*` | `runtime/cpu/dev/{amx,avx512}` | `crates/plowrt/build.rs` |
 
@@ -46,7 +46,7 @@ instructions.
 1. Fill the parameter block in [target.md](../target.md); `$ISA` names the file to read here.
 2. Before a kernel change, read the target file's checklist and pitfalls, then follow the
    single-block HARD RULE in [agent-tools.md](../agent-tools.md) and the native-kernel inner-loop
-   contract in [agents/05-single-block-sweep.md](../agents/05-single-block-sweep.md).
+   contract in [05-single-block-sweep.md](../05-single-block-sweep.md#native-kernel-inner-loop-contract).
 3. A new pitfall measured in a campaign goes into the target file's pitfall list with its commit
    or doc reference, in the same change that fixes it.
 4. These files describe hardware. Policy (gates, routes, recipes) stays in the bringup docs they
