@@ -2292,7 +2292,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, REF_CODEC_REFERENCE, CODEC_PRIMING_RESULT_JSON; run through gpuq"]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, REF_CODEC_REFERENCE, CODEC_PRIMING_RESULT_JSON, optional CODEC_PCM_GATE=int16_rms; run through gpuq"]
     fn reference_priming_preserves_fresh_audio_at_serving_concurrencies() {
         async fn stream(
             codec: &Codec,
@@ -2448,6 +2448,14 @@ mod tests {
         let mut outputs = Vec::new();
         let mut owned_outputs = Vec::new();
         let mut all_pass = true;
+        // int16_rms: absolute RMS error at or below int16 output rounding noise (Qwen3-TTS, user
+        // decision 2026-11-09); else relative L2 below 1e-5.
+        let int16_rms = match std::env::var("CODEC_PCM_GATE").as_deref() {
+            Ok("int16_rms") => true,
+            Ok("relative_l2") | Err(_) => false,
+            Ok(other) => panic!("unknown CODEC_PCM_GATE {other}"),
+        };
+        let rms_limit = 1.0 / 32768.0 / 12f64.sqrt();
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             for history in [false, true] {
               for width in [1, 8, 32] {
@@ -2493,7 +2501,14 @@ mod tests {
                     let owned_error = owned[b].iter().zip(&whole).map(|(&a, &b)| (f64::from(a)-f64::from(b)).powi(2)).sum::<f64>();
                     let owned_norm = whole.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
                     let owned_relative = (owned_error / owned_norm.max(1e-30)).sqrt();
-                    let pass = exact && finite && relative_l2 < 1e-5 && owned_finite && owned_relative < 1e-5;
+                    let rms = (error / expected.len() as f64).sqrt();
+                    let owned_rms = (owned_error / whole.len() as f64).sqrt();
+                    let close = if int16_rms {
+                        rms <= rms_limit && owned_rms <= rms_limit
+                    } else {
+                        relative_l2 < 1e-5 && owned_relative < 1e-5
+                    };
+                    let pass = exact && finite && owned_finite && close;
                     all_pass &= pass;
                     let offset = outputs.len();
                     outputs.extend_from_slice(expected);
@@ -2506,7 +2521,7 @@ mod tests {
                         "fresh_frames":fresh,"samples":expected.len(),"stateful_exact":exact,"finite":finite,
                         "whole_relative_l2":relative_l2,"pass":pass,"output_offset_f32":offset,
                         "owned_whole_offset_f32":owned_offset,"owned_whole_samples":owned[b].len(),
-                        "owned_whole_relative_l2":owned_relative}));
+                        "owned_whole_relative_l2":owned_relative,"whole_rms":rms,"owned_whole_rms":owned_rms}));
                 }
                }
               }
@@ -2523,7 +2538,26 @@ mod tests {
                     && c["reference_frames"] == frames));
             }
         }
+        // Every reference case decoded whole at its full length, for the replay checker's per-case gate.
+        let mut full_outputs = Vec::new();
+        let mut full_cases = Vec::new();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for c in reference["cases"].as_array().unwrap() {
+                let frames = c["frames"].as_u64().unwrap() as usize;
+                assert!(frames <= codec.max_frames);
+                let codes: Vec<i32> = std::fs::read(c["codes"].as_str().unwrap()).unwrap()
+                    .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as i32).collect();
+                assert_eq!(codes.len(), frames * codec.frame_codes);
+                let pcm = codec.decode(codes, frames, 0, Urgency::Whole).await.unwrap();
+                assert_eq!(pcm.len(), frames * codec.frame_samples);
+                full_cases.push(serde_json::json!({"case":c["case"],"frames":frames,
+                    "samples":pcm.len(),"offset_f32":full_outputs.len()}));
+                full_outputs.extend_from_slice(&pcm);
+            }
+        });
         let path = std::path::PathBuf::from(std::env::var("CODEC_PRIMING_RESULT_JSON").unwrap());
+        let full_path = path.with_extension("full.f32");
+        std::fs::write(&full_path, bytemuck::cast_slice(&full_outputs)).unwrap();
         std::fs::write(path.with_extension("f32"), bytemuck::cast_slice(&outputs)).unwrap();
         let owned_path = path.with_extension("owned.f32");
         std::fs::write(&owned_path, bytemuck::cast_slice(&owned_outputs)).unwrap();
@@ -2531,7 +2565,9 @@ mod tests {
             "scope":"saved reference codes, chunking and attention-history boundaries; stateful priming vs ordinary steps and concatenated decode; no timings",
             "attention_window_rows":windows,"transformer_rows_per_frame":rows_per_frame,
             "boundary_reference_frames":boundaries,"max_available_frames":available,
-            "pass":all_pass,"whole_relative_l2_limit":1e-5,"checks":checks,"owned_whole_pcm":owned_path})).unwrap()).unwrap();
+            "pass":all_pass,"whole_relative_l2_limit":1e-5,
+            "pcm_gate":if int16_rms {"int16_rms"} else {"relative_l2"},"int16_rms_limit":rms_limit,"checks":checks,"owned_whole_pcm":owned_path,
+            "full_cases":full_cases,"full_pcm":full_path})).unwrap()).unwrap();
         assert!(all_pass, "reference priming changed fresh audio");
     }
 

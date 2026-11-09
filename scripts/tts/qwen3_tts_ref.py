@@ -201,6 +201,47 @@ def load_reference_decoder(path, device, streaming_source=None):
     return decode, meta
 
 
+# Absolute RMS error at or below int16 output rounding noise, (1/32768)/sqrt(12) FS: the PCM gate a
+# capture declares with "pcm_gate": "int16_rms" (Qwen3-TTS, user decision 2026-11-09); else relative L2.
+INT16_RMS = 1.0 / 32768.0 / 12.0 ** 0.5
+
+
+def pcm_pass(gate, finite, relative, rms, limit):
+    return bool(finite and (rms <= INT16_RMS if gate == "int16_rms" else relative < limit))
+
+
+def full_case_checks(native, sources, meta, decode, gate, inputs):
+    """Every reference case decoded whole at full length; the int16_rms gate requires all of them."""
+    if gate == "int16_rms":
+        assert "full_cases" in native, "int16_rms capture without full-length cases"
+    if "full_cases" not in native:
+        return []
+    cases = native["full_cases"]
+    assert sorted(c["case"] for c in cases) == sorted(sources), "full-length cases differ from the reference cases"
+    path = Path(native["full_pcm"])
+    pcm = np.fromfile(path, dtype="<f4")
+    inputs.append(path)
+    offset, checks = 0, []
+    for c in cases:
+        case = sources[c["case"]]
+        count = case["frames"] * meta["frame_samples"]
+        assert c["frames"] == case["frames"] and c["samples"] == count and c["offset_f32"] == offset, "full-length case truncated"
+        codes = np.fromfile(case["codes"], dtype="<u4").reshape(case["frames"], meta["frame_codes"]).astype(np.int64)
+        expected = np.asarray(decode(codes), dtype=np.float64)
+        assert expected.shape == (count,)
+        actual = pcm[offset:offset + count].astype(np.float64)
+        finite = bool(np.isfinite(actual).all())
+        error = actual - expected
+        relative = float(np.linalg.norm(error) / max(np.linalg.norm(expected), 1e-30)) if finite else None
+        rms = float(np.sqrt(np.mean(error * error))) if finite else None
+        signal = float(np.sqrt(np.mean(expected * expected)))
+        checks.append(dict(case=c["case"], frames=case["frames"], finite=finite, relative_l2=relative, rms=rms,
+                           signal_rms=signal, passed=pcm_pass(gate, finite, relative, rms, native["whole_relative_l2_limit"])))
+        offset += count
+    assert offset == pcm.size, "unexpected trailing full-length PCM"
+    return checks
+
+
 @torch.inference_mode()
 def decoder_reference(a):
     import sys
@@ -227,10 +268,13 @@ def decoder_reference(a):
     assert len(sources) == len(reference["cases"])
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
-    decoded, records = {}, []
+    decoded, records, gates = {}, [], set()
     for result_path in map(Path, a.decoder_result):
         native = json.loads(result_path.read_text())
         assert native["whole_relative_l2_limit"] == 1e-5
+        gate = native.get("pcm_gate", "relative_l2")
+        assert gate in ("relative_l2", "int16_rms"), f"unknown pcm_gate {gate}"
+        gates.add(gate)
         assert native["checks"], "empty decoder capture"
         pcm_path = result_path.with_suffix(".f32")
         assert pcm_path.stat().st_size % 4 == 0
@@ -273,9 +317,10 @@ def decoder_reference(a):
                 finite = bool(np.isfinite(actual).all())
                 error = actual - expected
                 relative = float(np.linalg.norm(error) / max(np.linalg.norm(expected), 1e-30)) if finite else None
-                metrics[name] = dict(finite=finite, relative_l2=relative,
+                rms = float(np.sqrt(np.mean(error * error))) if finite else None
+                metrics[name] = dict(finite=finite, relative_l2=relative, rms=rms,
                                      max_abs=float(np.abs(error).max()) if finite else None,
-                                     passed=finite and relative < native["whole_relative_l2_limit"])
+                                     passed=pcm_pass(gate, finite, relative, rms, native["whole_relative_l2_limit"]))
                 offset += count
             if owned is not None:
                 full_count = (prefix + fresh) * meta["frame_samples"]
@@ -285,22 +330,25 @@ def decoder_reference(a):
                 finite = bool(np.isfinite(actual).all())
                 error = actual - whole.astype(np.float64)
                 relative = float(np.linalg.norm(error) / max(np.linalg.norm(whole.astype(np.float64)), 1e-30)) if finite else None
-                metrics["owned_whole"] = dict(finite=finite, relative_l2=relative,
+                rms = float(np.sqrt(np.mean(error * error))) if finite else None
+                metrics["owned_whole"] = dict(finite=finite, relative_l2=relative, rms=rms,
                                              max_abs=float(np.abs(error).max()) if finite else None,
-                                             passed=finite and relative < native["whole_relative_l2_limit"])
+                                             passed=pcm_pass(gate, finite, relative, rms, native["whole_relative_l2_limit"]))
                 owned_offset += full_count
             checks.append(dict(width=item["width"], item=item["item"], source=source,
                                reference_frames=prefix, fresh_frames=fresh, reference_pcm=str(path),
                                metrics=metrics, passed=all(m["passed"] for m in metrics.values())))
         assert offset == pcm.size, "unexpected trailing native PCM"
         assert owned is None or owned_offset == owned.size, "unexpected trailing owned whole PCM"
-        records.append(dict(capture=str(result_path), internal_gate_pass=native["pass"], checks=checks,
-                            independent_reference_pass=all(c["passed"] for c in checks)))
+        full = full_case_checks(native, sources, meta, decode, gate, inputs)
+        records.append(dict(capture=str(result_path), internal_gate_pass=native["pass"], checks=checks, full_cases=full,
+                            independent_reference_pass=all(c["passed"] for c in checks + full)))
     assert records, "no native decoder captures"
     import transformers
     report = dict(scope="saved codes through official FP32 decoder vs captured whole/stateful/primed PCM",
                   pass_all=all(r["internal_gate_pass"] and r["independent_reference_pass"] for r in records),
-                  relative_l2_limit=1e-5, reference_repeat_exact=True,
+                  relative_l2_limit=1e-5, pcm_gates=sorted(gates), int16_rms_limit=INT16_RMS,
+                  reference_repeat_exact=True,
                   full_model_qualified=False, timings_scored=False,
                   torch=torch.__version__, transformers=transformers.__version__, device=a.device,
                   decoder=meta, captures=records,

@@ -113,7 +113,7 @@ class StaticMimi:
                     with self.assertRaisesRegex(AssertionError, "incomplete reference weights"):
                         load_reference_decoder(root, "cpu")
 
-    def fixture(self, root):
+    def fixture(self, root, scale=1.0, full=False):
         source = root / "model"
         source.mkdir()
         (source / "config.json").write_text("{}")
@@ -124,10 +124,14 @@ class StaticMimi:
         reference = dict(frame_codes=2, frame_samples=3, sample_rate=24000,
                          source_sha256=hashes, cases=[dict(case="clip", frames=6, codes=str(root / "codes.u32"))])
         (root / "reference.json").write_text(json.dumps(reference))
-        expected = np.repeat(codes.sum(1).astype(np.float32), 3)[6:12]
+        expected = np.repeat(codes.sum(1).astype(np.float32) * np.float32(scale), 3)[6:12]
         item = dict(width=8, item=0, source="clip", reference_frames=2, fresh_frames=2,
                     samples=6, output_offset_f32=0)
         capture = {"pass": True, "whole_relative_l2_limit": 1e-5, "checks": [item]}
+        if full:
+            np.repeat(codes.sum(1).astype(np.float32) * np.float32(scale), 3).astype("<f4").tofile(root / "native.full.f32")
+            capture.update(full_cases=[dict(case="clip", frames=6, samples=18, offset_f32=0)],
+                           full_pcm=str(root / "native.full.f32"))
         (root / "native.json").write_text(json.dumps(capture))
         np.tile(expected, 3).astype("<f4").tofile(root / "native.f32")
         args = SimpleNamespace(model=str(source), texts=str(root / "reference.json"), device="cpu",
@@ -138,7 +142,7 @@ class StaticMimi:
 
         def decode(values):
             calls.append(values.copy())
-            return np.repeat(values.sum(1).astype(np.float32), 3)
+            return np.repeat(values.sum(1).astype(np.float32) * np.float32(scale), 3)
         return args, meta, decode, calls
 
     def test_uses_frame_major_codes_exact_crop_and_caches_repeated_references(self):
@@ -154,6 +158,54 @@ class StaticMimi:
             self.assertEqual(len(report["captures"]), 2)
             self.assertTrue((root / "out/report.json").is_file())
             self.assertEqual(report["captures"][0]["checks"][0]["metrics"]["primed"]["max_abs"], 0)
+
+    def test_int16_rms_gate_is_absolute(self):
+        # 6 samples: one error of e gives RMS e / sqrt(6); passes at or below int16 rounding noise. At scale 1e-6
+        # the signal is ~1e-5 FS, so an error inside the RMS bound still fails relative L2 (the silence case).
+        from qwen3_tts_ref import INT16_RMS
+        for bump, gate, scale, passed in ((2.0 * INT16_RMS, "int16_rms", 1.0, True), (0.95 * 6 ** 0.5 * INT16_RMS, "int16_rms", 1.0, True),
+                                          (3.0 * INT16_RMS, "int16_rms", 1.0, False), (2.0 * INT16_RMS, "int16_rms", 1e-6, True),
+                                          (2.0 * INT16_RMS, "relative_l2", 1e-6, False), (1.0, "relative_l2", 1.0, False),
+                                          (2.0 * INT16_RMS, "relative_l2", 1.0, True), (0.0, "bogus", 1.0, None)):
+            for where in ("primed", "full"):
+                with self.subTest(bump=bump, gate=gate, scale=scale, where=where), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    args, meta, decode, _ = self.fixture(root, scale, full=True)
+                    capture = json.loads((root / "native.json").read_text())
+                    capture["pcm_gate"] = gate
+                    (root / "native.json").write_text(json.dumps(capture))
+                    # The full case has 18 samples: scale the bump so its RMS matches the 6-sample primed case.
+                    name, index, bump_at = ("native.f32", 12, bump) if where == "primed" else ("native.full.f32", 3, bump * 3 ** 0.5)
+                    pcm = np.fromfile(root / name, dtype="<f4")
+                    pcm[index] += np.float32(bump_at)
+                    pcm.tofile(root / name)
+                    with patch("qwen3_tts_ref.load_reference_decoder", return_value=(decode, meta)):
+                        if passed is None:
+                            with self.assertRaisesRegex(AssertionError, "pcm_gate"):
+                                decoder_reference(args)
+                            continue
+                        report = decoder_reference(args)
+                    self.assertEqual(report["pass_all"], passed)
+                    self.assertEqual(report["pcm_gates"], [gate])
+                    self.assertEqual(len(report["captures"][0]["full_cases"]), 1)
+
+    def test_int16_rms_gate_requires_every_full_length_case(self):
+        for change in ("absent", "missing", "short"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                args, meta, decode, _ = self.fixture(root, full=True)
+                capture = json.loads((root / "native.json").read_text())
+                capture["pcm_gate"] = "int16_rms"
+                if change == "absent":
+                    del capture["full_cases"]
+                elif change == "missing":
+                    capture["full_cases"] = []
+                else:
+                    capture["full_cases"][0].update(frames=5, samples=15)
+                (root / "native.json").write_text(json.dumps(capture))
+                with patch("qwen3_tts_ref.load_reference_decoder", return_value=(decode, meta)):
+                    with self.assertRaisesRegex(AssertionError, "full-length"):
+                        decoder_reference(args)
 
     def test_rejects_nonrepeatable_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
