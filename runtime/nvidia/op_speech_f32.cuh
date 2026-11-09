@@ -36,6 +36,12 @@ __device__ __forceinline__ constexpr bool sp_post_on(unsigned p) {
     return (PLOW_SPEECH_CONV_POSTS >> p) & 1ull;
 }
 
+/* Non-zero padding in the wide conv tile doubles d_conv1d_wide and its ptxas time (Fish 7 min ->
+ * hours); 0 sends padded convs to the 64x64 / FFMA paths. */
+#ifndef PLOW_SPEECH_CONV_WIDE_PADDED
+#define PLOW_SPEECH_CONV_WIDE_PADDED 1
+#endif
+
 #define SPG_TM 8
 #define SPG_TN 8
 #define SPG_BK 16
@@ -5043,8 +5049,8 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
  * weights when kernel > 1, and no input activation but leaky ReLU. */
 __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const SpConvArgs& a, unsigned nblk) {
     if (!((in->fj[2].u >> 14) & 1u) || a.groups != 1u || a.cin % 4u || !sp_aligned(a.x, 16) || a.wf16 ||
-        !(a.pre == 0u || (a.pre == 9u && !a.alpha)) || !(a.kernel == 1u || a.tapmajor) ||
-        !sp_aligned(a.w, 16))
+        (!PLOW_SPEECH_CONV_WIDE_PADDED && a.mode != 0u) || !(a.pre == 0u || (a.pre == 9u && !a.alpha)) ||
+        !(a.kernel == 1u || a.tapmajor) || !sp_aligned(a.w, 16))
         return 0u;
     return sp_w_width(a.batch * a.out_rows, a.cout, nblk);
 }
@@ -5095,8 +5101,10 @@ static __device__ __forceinline__ void sp_conv1d_wide_body(const SpConvArgs& a, 
     }
 }
 static __device__ __noinline__ void d_conv1d_wide(const SpConvArgs& a, unsigned bn, unsigned slice, unsigned nblk) {
-    if (a.mode) sp_conv1d_wide_body<true>(a, bn, slice, nblk);
-    else sp_conv1d_wide_body<false>(a, bn, slice, nblk);
+#if PLOW_SPEECH_CONV_WIDE_PADDED
+    if (a.mode) return sp_conv1d_wide_body<true>(a, bn, slice, nblk);
+#endif
+    sp_conv1d_wide_body<false>(a, bn, slice, nblk);
 }
 
 /* Conv1d flag bit 16 (row-starved or few-channel convs): one warp per output element, its
