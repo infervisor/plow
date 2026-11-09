@@ -812,6 +812,45 @@ static void t_conv1d_lanes(const char* name, ConvSpec s, bool tapmajor = true) {
     if (!same) g_fail = 1;
 }
 
+/* Batch invariance of the arm-free codec convs (no rows, warp or split-K arm): item 0's output
+ * bits match whether it runs alone or in a batch, on all blocks or one. Alone and batched pick
+ * different tile widths (64 / 128); per output the k16 MMA chain is the same. On the wgmma tile
+ * the f32 weights are NaN (golden keeps them), so a fallback off it fails. */
+static void t_conv_invariant(const char* name, const ConvSpec& s, bool transpose) {
+    Case c; unsigned o;
+    build_conv(c, s, transpose, o);
+    const PlowDevInst ref = c.in;
+    if (s.wg && (transpose || s.cin % 64u == 0)) {
+        const unsigned w = c.in.t[2], wp = c.add(c.host[w].size());
+        c.host[wp] = c.host[w];
+        const float nan = NAN;
+        const size_t nf = transpose ? (size_t)s.stride * s.cout * 2 * s.cin : (size_t)s.cout * s.cin * s.kernel;
+        for (size_t i = 0; i < nf; i++) memcpy(&c.host[wp][i * 4], &nan, 4);
+        c.in.t[2] = wp;
+    }
+    run(name, c, transpose ? g_conv_transpose1d_f32 : g_conv1d_f32, {o}, FP32, 1e-4, 0, nullptr, &ref);
+    const size_t item = (size_t)conv_out_rows(s, transpose) * s.cout, n = c.host[o].size() / 4;
+    std::vector<uint32_t> full(n), got(n);
+    CK(cudaMemcpy(full.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+    void** td = upload_table(c.dev);
+    struct V { const char* what; unsigned batch, nblk; } vs[] = {
+        {"alone", 1, (unsigned)g_nblk}, {"alone 1 block", 1, 1}, {"batch 1 block", s.batch, 1}};
+    for (const V& v : vs) {
+        PlowDevInst in = c.in;
+        in.i[0] = v.batch;
+        CK(cudaMemset(c.dev[o], 0xff, n * 4));
+        k_speech<<<v.nblk, 256, kSmem>>>(in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(got.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+        const size_t cmp = v.batch == 1u ? item : n;
+        const bool same = !memcmp(got.data(), full.data(), cmp * 4);
+        printf("  %-34s %s bitwise == batch %u -> %s\n", name, v.what, s.batch, same ? "PASS" : "FAIL");
+        if (!same) g_fail = 1;
+    }
+    CK(cudaFree(td));
+}
+
 static void t_convt1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
     Case c; unsigned o;
     build_conv(c, s, true, o);
@@ -2566,6 +2605,33 @@ int main(int argc, char** argv) {
             run(t.name, c, g_conv_transpose1d_f32, {o}, FP32, 1e-4, 0, nullptr, &ref);
         }
 #endif
+        /* Batch invariance of the Qwen3-TTS codec's convs without arms (its recipe drops the
+         * per-size arm table): wgmma taps / pointwise / merged-phase ConvT, the wide tile (96
+         * channels), the direct form (cout 1), 3xTF32 phase-major ConvT; small and large M. */
+        struct BI { const char* name; ConvSpec s; bool transpose; };
+        BI bis[] = {
+            {"Conv1dF32 inv pointwise 4096->1024", {9, 8, 4096, 1024, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true}, false},
+            {"Conv1dF32 inv k7 d3 384 len", {7, 19, 384, 384, 7, 1, 3, 1, 18, 0, 0, 0, 0, false, true, false, false, {19, 4, 19, 1, 19, 19, 7}, 0.f, true}, false},
+            {"Conv1dF32 inv pointwise 512 big M", {40, 500, 512, 512, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true}, false},
+            {"Conv1dF32 inv k3 512->1024 big M", {20, 500, 512, 1024, 3, 1, 1, 1, 2, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true}, false},
+            {"Conv1dF32 inv wide k7 96 +res", {40, 60, 96, 96, 7, 1, 1, 1, 6, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true}, false},
+            {"Conv1dF32 inv direct k7 96->1", {40, 300, 96, 1, 7, 1, 1, 1, 6, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true}, false},
+            {"ConvT inv wgmma s8 1024->512", {12, 9, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 0, 0, false, true, false, false, {}, 0.f, true}, true},
+            {"ConvT inv wgmma s4 256->128 big M", {64, 200, 256, 128, 8, 4, 0, 1, 2, 2, 0, 0, 0, false, true, false, false, {}, 0.f, true}, true},
+            {"ConvT1dF32 inv tc phase-major k6 s3", {40, 300, 192, 96, 6, 3, 0, 1, 3, 3, 0, 0, 0, false, true, false, false, {}, 0.f, true}, true},
+        };
+#if defined(PLOW_NV_HOPPER)
+        const bool hopper = true;
+#else
+        const bool hopper = false;
+#endif
+        for (BI& t : bis) {
+            /* The merged-phase wgmma ConvT needs kernel 2*stride and cout % 64; the k6 s3 one is 3xTF32. */
+            t.s.tapmajor = true;
+            t.s.wg = hopper && t.s.cout > 1u && (!t.transpose || (t.s.kernel == 2u * t.s.stride && t.s.cout % 64u == 0));
+            t.s.wide = t.s.wg || (!t.transpose && t.s.cout > 1u);
+            t_conv_invariant(t.name, t.s, t.transpose);
+        }
         /* Rows arm (bit 16, M <= 32): M=17 and 32, partial 8-channel blocks, K tails past a 512
          * chunk, short lengths, M=1; M=33 and cout <= 4 fall back to the warp arm. */
         struct RA { const char* name; ConvSpec s; };
