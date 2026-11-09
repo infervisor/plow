@@ -236,6 +236,17 @@ pub struct RuntimeConfig {
     )]
     pub tts_codec_launch_us: usize,
 
+    /// Deadline scheduling of the codec stage: launch order by (band, slack) to each job's first
+    /// audio target (`stream.first_audio_target_ms`) or playback due, and the stream-step launch
+    /// in front of a waiting first audio bounded by that job's slack (OPT_IN, screened).
+    #[arg(long = "tts-codec-sched", env = "PLOW_TTS_CODEC_SCHED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_codec_sched: bool,
+
+    /// Windowed codec streams ramp their chunk after the first audio (1, 2, .. the packet's chunk);
+    /// unset: the codec packet's `stream.chunk_ramp`.
+    #[arg(long = "tts-chunk-ramp", env = "PLOW_TTS_CHUNK_RAMP", value_parser = clap::builder::BoolishValueParser::new(), global = true)]
+    pub tts_chunk_ramp: Option<bool>,
+
     /// Apply a speech packet's declared leading-silence trim to streamed replies
     /// (`stream.onset_trim_*`); `false` streams every sample (first-byte latency runs).
     #[arg(long = "tts-onset-trim", env = "PLOW_TTS_ONSET_TRIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
