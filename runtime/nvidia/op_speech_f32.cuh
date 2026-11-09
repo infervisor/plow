@@ -4032,6 +4032,9 @@ struct SpConvArgs {
     float* splitk;
     unsigned batch, in_rows, cin, cout, kernel, stride, dil, groups, cg, ng, before, after, mode, pre,
         post, wf16, tapmajor, phasemajor, ptaps, out_rows, opad, cg_mul, cg_shift;
+    /* flags bit 21: the wgmma tiles may span taps (Conv1d cin % 64 != 0) or phases (ConvTranspose1d
+     * cout % 64 != 0); widths stay % 4, so one thread's float4 never does. */
+    unsigned ragged;
     float slope;
     /* c / cg for c < 2^31 (Granlund-Montgomery; the tap index of a GEMM column). */
     __device__ unsigned div_cg(unsigned c) const { return (__umulhi(c, cg_mul) + c) >> cg_shift; }
@@ -4087,6 +4090,7 @@ __device__ __forceinline__ bool sp_conv_args(const PlowDevInst* in, void* const*
     a.mode = transpose ? 0u : flags & 3u;
     a.pre = (flags >> 4) & 15u; a.post = (flags >> 8) & 15u; a.wf16 = (flags >> 12) & 1u;
     a.tapmajor = transpose ? 0u : (flags >> 15) & 1u;
+    a.ragged = (flags >> 21) & 1u;
     /* ConvTranspose1d flags bit 15: weights [stride][cout][ceil(kernel/stride)][cg], one phase's
      * (tap, channel) columns contiguous per output channel (taps past the kernel are zero). */
     a.phasemajor = transpose ? (flags >> 15) & 1u : 0u;
@@ -4677,7 +4681,8 @@ __device__ __forceinline__ const float* spwg_wsplit(const SpConvArgs& a) {
 /* CT: a merged-phase ConvTranspose1d (kernel 2*stride, phase-major weights): row m = (b, q) of
  * ep.n_p rows per item, column n = (phase, o), k = (tap, ci) reading input row q - tap; output
  * row t = q*stride + phase - before, stores skipped outside [0, out_rows), zero past convt_len.
- * BN divides cout, so a tile is one phase. */
+ * A tile is one phase when BN divides cout, else (flag bit 21, cout % 4 == 0, cout >= BN) it spans at
+ * most two: per-segment liveness, bias and stores. */
 template <unsigned BN, bool TAPS, unsigned P, bool GR = false, bool CT = false, bool SK = false, bool CHANNEL_TILED = false>
 static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsigned K, const float* x, const float* w,
                                                   const SpConvEpi1& ep, unsigned slice, unsigned nblk,
@@ -4718,18 +4723,20 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     for (unsigned item = slice; item < tiles * S; item += nblk) {
         const unsigned tile = item / S, part = item - tile * S, kb = part * chunk, ke = min(nk, kb + chunk);
         const unsigned mg = tile / tn, gi = GR ? mg % G : 0u, m0 = (GR ? mg / G : mg) * 128u, n0 = (tile % tn) * BN,
-                       og = gi * N, ph = CT ? n0 / a.cout : 0u, col = CT ? n0 - ph * a.cout : og + n0;
-        /* CT: row m's output base; geo = inside the output geometry, live = also within convt_len. */
-        auto ct_base = [&](unsigned m, bool& geo, bool& live) {
+                       og = gi * N, ph = CT ? n0 / a.cout : 0u, col = CT ? n0 - ph * a.cout : og + n0,
+                       cb = CT ? min(BN, (ph + 1u) * a.cout - n0) : BN; /* CT: columns >= cb are phase ph + 1 */
+        /* CT: row m's output base in phase q; geo = inside the output geometry, live = also within convt_len. */
+        auto ct_base = [&](unsigned m, unsigned q, bool& geo, bool& live) {
             const unsigned b = m / ep.n_p;
-            const int t = (int)((m - b * ep.n_p) * a.stride + ph) - (int)a.before;
+            const int t = (int)((m - b * ep.n_p) * a.stride + q) - (int)a.before;
             geo = t >= 0 && t < (int)a.out_rows;
             live = geo && t < a.convt_len(b);
             return ((size_t)b * a.out_rows + (geo ? (unsigned)t : 0u)) * a.cout;
         };
         /* B rows (tap-major weights) are contiguous: row n at w + n * K. Pointwise A rows too: row m
-         * at x + m * K. With taps, a k-tile lies in one tap (cin % 64 == 0) and A row m of item b,
-         * output row t, reads input row t + tap * dil - before of b (zero outside its length).
+         * at x + m * K. With taps, A row m of item b, output row t, reads input row t + tap * dil -
+         * before of b (zero outside its length); a k-tile lies in one tap when cin % 64 == 0, else
+         * (flag bit 21, cin % 4 == 0) each float4 resolves its own tap.
          * Rows past M or N read nothing (their outputs are not stored). */
         const float* xa = x + (size_t)(m0 + sr) * lda + gi * K + sc;
         const float* wb = w + (size_t)(og + n0 + sr) * K + sc;
@@ -4754,13 +4761,14 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             const unsigned k = kt * SPWG_BK;
             const bool kin = k + sc < K;
             if constexpr (TAPS) {
-                const unsigned tap = CHANNEL_TILED ? kt % a.kernel : k / a.cin,
-                               ci = CHANNEL_TILED ? kt / a.kernel * 64u : k - tap * a.cin;
+                /* Unless channel-tiled, the tap of this thread's 4 columns (a ragged k-tile spans taps). */
+                const unsigned kk = k + sc, tap = CHANNEL_TILED ? kt % a.kernel : a.div_cg(kk);
+                const ptrdiff_t ci = CHANNEL_TILED ? (ptrdiff_t)(kt / a.kernel * 64u) : (ptrdiff_t)(kk - tap * a.cin) - (ptrdiff_t)sc;
 #pragma unroll
                 for (unsigned p = 0; p < 8; p++) {
                     const int u = CT ? t0[p] - (int)tap : t0[p] + (int)(tap * a.dil);
                     float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-                    if (kin && (unsigned)u < (unsigned)len[p]) v = __ldg((const float4*)(xb[p] + (size_t)u * a.cin + ci));
+                    if (kin && (unsigned)u < (unsigned)len[p]) v = __ldg((const float4*)(xb[p] + (ptrdiff_t)u * a.cin + ci));
                     if (leaky) {
                         v.x = v.x >= 0.0f ? v.x : __fmul_rn(v.x, a.slope); v.y = v.y >= 0.0f ? v.y : __fmul_rn(v.y, a.slope);
                         v.z = v.z >= 0.0f ? v.z : __fmul_rn(v.z, a.slope); v.w = v.w >= 0.0f ? v.w : __fmul_rn(v.w, a.slope);
@@ -4799,7 +4807,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             sm90_cp_commit();
         };
         load(kb);
-        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + col + tid) : 0.f;
+        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + (CT ? (n0 + tid) % a.cout : col + tid)) : 0.f;
         if (pending) {
             asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
             pending = false;
@@ -4895,14 +4903,18 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
          * issued before the first use); the tile staged row-major. */
         const unsigned rw = wg * 64u + (warp & 3u) * 16u + (lane >> 2), cw = 2u * (lane & 3u);
         size_t base[2];
-        bool ok[2];
+        bool ok[2], ok1[2] = {false, false};
 #pragma unroll
         for (unsigned h = 0; h < 2; h++) {
             const unsigned m = m0 + rw + 8u * h;
             if constexpr (CT) {
                 bool geo = false, live = false;
-                base[h] = m < M ? ct_base(m, geo, live) : 0;
+                base[h] = m < M ? ct_base(m, ph, geo, live) : 0;
                 ok[h] = m < M && live;
+                if (cb < BN && m < M) {
+                    ct_base(m, ph + 1u, geo, live);
+                    ok1[h] = live;
+                }
                 continue;
             }
             base[h] = m < M ? ep.row_base(m) : 0;
@@ -4926,7 +4938,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
 #pragma unroll
             for (unsigned h = 0; h < 2; h++) {
                 float2 y = make_float2(0.f, 0.f);
-                if (ok[h] && on) {
+                if ((CT && c >= cb ? ok1[h] : ok[h]) && on) {
                     y.x = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h], bias.x), alpha.x);
                     y.y = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h + 1u], bias.y), alpha.y);
                     if (a.row_scale) {
@@ -4943,9 +4955,19 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
         if (tid < 128u && m0 + tid < M) {
             const unsigned m = m0 + tid, cols = min(BN, N - n0);
             bool geo = true, live;
-            size_t base = CT ? ct_base(m, geo, live) : ep.row_base(m);
-            if ((long long)base < 0) base = ~base;
-            if (geo) spwg_bulk_store(a.out + base + col, stage + tid * LDO, cols * 4u);
+            if constexpr (CT) {
+                const unsigned c0 = min(cb, cols);
+                size_t base = ct_base(m, ph, geo, live);
+                if (geo) spwg_bulk_store(a.out + base + col, stage + tid * LDO, c0 * 4u);
+                if (c0 < cols) {
+                    base = ct_base(m, ph + 1u, geo, live);
+                    if (geo) spwg_bulk_store(a.out + base, stage + tid * LDO + c0, (cols - c0) * 4u);
+                }
+            } else {
+                size_t base = ep.row_base(m);
+                if ((long long)base < 0) base = ~base;
+                if (geo) spwg_bulk_store(a.out + base + col, stage + tid * LDO, cols * 4u);
+            }
             asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
             pending = true;
         }
@@ -4960,7 +4982,8 @@ __device__ __forceinline__ bool spg_post_ok(unsigned post) {
 }
 __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a, bool channel_tiled = false) {
     const bool pw = a.kernel == 1u && a.stride == 1u && a.before == 0u && a.in_rows == a.out_rows && a.cg % 4u == 0 && a.pre == 0u;
-    const bool taps = a.kernel > 1u && (a.tapmajor || channel_tiled) && a.stride == 1u && a.mode == 0u && a.groups == 1u && a.cin % 64u == 0 &&
+    const bool taps = a.kernel > 1u && (a.tapmajor || channel_tiled) && a.stride == 1u && a.mode == 0u && a.groups == 1u &&
+                      (a.cin % 64u == 0 || (a.ragged && !channel_tiled && a.cin % 4u == 0)) &&
                       (a.pre == 0u || (a.pre == 9u && !a.alpha));
     return (pw || taps) && spg_post_ok(a.post) && a.cout % 4u == 0 && sp_aligned(a.out, 16) &&
            (!a.residual || sp_aligned(a.residual, 8)) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) &&
@@ -4970,14 +4993,15 @@ __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a, bool channel_t
  * weights with the pre-split image, no activations, residual or output padding. */
 __device__ __forceinline__ bool spg_ct_eligible(const SpConvArgs& a) {
     return a.phasemajor && a.kernel == 2u * a.stride && a.groups == 1u && a.opad == 0u && a.pre == 0u &&
-           sp_post_on(0u) && a.post == 0u && !a.alpha && !a.residual && !a.wf16 && a.cin % 64u == 0 && a.cout % 64u == 0 &&
+           sp_post_on(0u) && a.post == 0u && !a.alpha && !a.residual && !a.wf16 && a.cin % 64u == 0 &&
+           (a.cout % 64u == 0 || (a.ragged && a.cout % 4u == 0 && a.cout >= 64u)) &&
            sp_aligned(a.out, 16) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) && sp_aligned(a.x, 16);
 }
 __device__ __forceinline__ void sp_wg_run_ct(const SpConvArgs& a, unsigned slice, unsigned nblk) {
     const unsigned Q = (a.out_rows + a.before + a.stride - 1u) / a.stride, M = a.batch * Q, N = a.stride * a.cout;
     const SpConvEpi1 ep{a, 0u, Q, 0u, 0u, true, true};
-    const unsigned mt = (M + 127u) / 128u, r128 = (mt * (N / 128u) + nblk - 1u) / nblk,
-                   r64 = (mt * (N / 64u) + nblk - 1u) / nblk;
+    const unsigned mt = (M + 127u) / 128u, r128 = (mt * ((N + 127u) / 128u) + nblk - 1u) / nblk,
+                   r64 = (mt * ((N + 63u) / 64u) + nblk - 1u) / nblk;
     const float* w = spwg_wsplit(a);
     if (a.cout % 128u == 0 && 20u * r128 <= 13u * r64) sp_wg_gemm<128, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
     else sp_wg_gemm<64, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);

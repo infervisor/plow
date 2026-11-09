@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use packet::dev::{DevProgram, CTR_STRIDE};
+use packet::dev::{DevOp, DevProgram, CTR_STRIDE};
 
 use super::{pod_bytes, BLOCK};
 use crate::asset::devblob::DevBlob;
@@ -58,6 +58,39 @@ fn speech_ops(blob: &DevBlob) -> u64 {
         .fold(0, |mask, op| mask | 1 << (op - SPEECH_OP0))
 }
 
+/// Speech-op semantics a packet needs beyond its op set, as the object's
+/// `plow_speech_features_speech` bits (absent = none): bit 0 = Conv1dF32 / ConvTranspose1dF32
+/// flag bit 21 (wgmma tiles spanning taps / phases at widths % 4).
+pub(super) fn speech_features(insts: impl IntoIterator<Item = (u16, u32)>) -> u32 {
+    insts
+        .into_iter()
+        .filter(|&(op, flags)| {
+            (op == DevOp::Conv1dF32 as u16 || op == DevOp::ConvTranspose1dF32 as u16)
+                && flags >> 21 & 1 != 0
+        })
+        .fold(0, |m, _| m | 1)
+}
+
+/// Rejects an object lacking a feature bit `required` has.
+pub(super) fn check_speech_features(
+    be: &CudaBackend,
+    module: &Module,
+    object: &Path,
+    required: u32,
+) -> Result<()> {
+    let have = be
+        .module_global_u32(module, "plow_speech_features_speech")?
+        .unwrap_or(0);
+    if required & !have != 0 {
+        return Err(RuntimeError::Rejected(format!(
+            "{}: lacks speech features {:#x}; rebuild it for this packet",
+            object.display(),
+            required & !have
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn missing_speech_ops(required: u64, compiled: u64) -> Vec<u32> {
     let missing = required & !compiled;
     (0..64)
@@ -72,6 +105,15 @@ fn a_specialized_speech_object_must_cover_the_packet_ops() {
     assert!(missing_speech_ops(0b1011, 0b1111).is_empty());
     assert_eq!(missing_speech_ops(0b1011, 0b0011), vec![SPEECH_OP0 + 3]);
     assert_eq!(missing_speech_ops(1 << 41, 0), vec![204]);
+}
+
+#[cfg(test)]
+#[test]
+fn ragged_conv_flags_require_the_speech_feature() {
+    let (conv, convt) = (DevOp::Conv1dF32 as u16, DevOp::ConvTranspose1dF32 as u16);
+    assert_eq!(speech_features([(conv, 0x6e000), (convt, 0xa000)]), 0);
+    assert_eq!(speech_features([(conv, 0x6e000), (convt, 0x26e000)]), 1);
+    assert_eq!(speech_features([(DevOp::UnaryF32 as u16, 1 << 21)]), 0);
 }
 
 #[cfg(test)]
@@ -185,6 +227,13 @@ impl CudaPacketRuntime {
                 )));
             }
         }
+        let features = speech_features(
+            blob.progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .map(|d| (d.op, d.fj[2])),
+        );
+        check_speech_features(&be, &module, &object, features)?;
         let smem = be
             .module_global_u32(&module, "plow_arena_bytes_speech")?
             .unwrap_or(49152);

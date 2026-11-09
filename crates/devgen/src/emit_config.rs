@@ -359,6 +359,17 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_SNAC_SPLIT_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub snac_split_bf16: bool,
 
+    /// Qwen3-TTS 12 Hz codec (Breeze layout): wgmma tiles that span taps / transposed-conv
+    /// phases at channel widths % 4 (Conv1dF32 / ConvTranspose1dF32 flag bit 21). Needs
+    /// `PLOW_EMIT_SNAC_SPLIT_BF16`.
+    #[arg(long, env = "PLOW_EMIT_CODEC_WGMMA_RAGGED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub codec_wgmma_ragged: bool,
+
+    /// With `PLOW_EMIT_CODEC_WGMMA_RAGGED`: the decoder input conv leaves 3xTF32 for split-bf16
+    /// taps wgmma (raises PCM error vs the FP32 reference, about 3.3e-5 -> 4.0e-5 relative L2).
+    #[arg(long, env = "PLOW_EMIT_CODEC_DEC_IN_WGMMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub codec_dec_in_wgmma: bool,
+
     /// Measured Conv1dF32 arms per codec conv shape (tuning `codec_conv_arms.jsonl`): a shape
     /// listed with arm `rows` or `warp` takes flag bit 16 (sm_90 speech object); every other
     /// conv keeps the GEMM paths.
@@ -1974,6 +1985,8 @@ impl EmitConfig {
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
             s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
             snac_split_bf16: env_bool("PLOW_EMIT_SNAC_SPLIT_BF16"),
+            codec_wgmma_ragged: env_bool("PLOW_EMIT_CODEC_WGMMA_RAGGED"),
+            codec_dec_in_wgmma: env_bool("PLOW_EMIT_CODEC_DEC_IN_WGMMA"),
             codec_conv_arms: env_str("PLOW_EMIT_CODEC_CONV_ARMS").map(std::path::PathBuf::from),
             fish_codec_max_rows: env_u32("PLOW_EMIT_FISH_CODEC_MAX_ROWS"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),

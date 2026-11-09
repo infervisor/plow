@@ -1279,6 +1279,11 @@ extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_O
 /* The speech arms a PLOW_SPEECH_OPS object carries (bit op - 163). The mask is not part of the
  * pairing hash, so the loader checks every sidecar's speech ops against it before launching.
  * Absent on an all-arms object (unconstrained), like the pairing stamp. */
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+/* Speech-op semantics beyond the op set (packet_exec::speech_features): bit 0 = conv flag bit 21
+ * (ragged wgmma tiles). A packet relying on a bit is refused by an object without it. */
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 1u;
+#endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SPEECH_OPS >> 32);

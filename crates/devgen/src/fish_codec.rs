@@ -566,6 +566,7 @@ impl Seq {
                 wgmma: split,
                 weight_split: split,
                 dual_alpha: false,
+                wgmma_ragged: false,
             },
             math,
         )?;
@@ -900,6 +901,7 @@ fn program_for(
             row_scale: None,
             alpha_out: None,
             taps_wgmma: false,
+            wgmma_ragged: false,
         };
         last = stateful(&mut p, c, last, pre, "state.codec.pre".into(), 0)?.done;
     }
@@ -1040,6 +1042,7 @@ fn program_for(
     };
     let dim = cfg.latent;
 
+    let ragged = cfg.breeze && crate::emit_config::active().codec_wgmma_ragged;
     let conv = |output: &'static str,
                 weight: String,
                 bias: Option<String>,
@@ -1070,6 +1073,7 @@ fn program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        wgmma_ragged: ragged,
     };
     let other = |e: u32| if e == x { "act.codec.b" } else { "act.codec.a" };
     let snake = if cfg.breeze {
@@ -1177,6 +1181,7 @@ fn program_for(
     );
     let mut c = c;
     c.len = len(cfg.ups.len());
+    c.taps_wgmma = ragged && crate::emit_config::active().codec_dec_in_wgmma;
     cur = stateful(
         &mut p,
         cur.output,
@@ -1431,6 +1436,7 @@ fn mimi_program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        wgmma_ragged: false,
     };
     // A causal ConvTranspose k = 2s: (rows - 1) * s + k outputs, the last k - s cropped.
     let convt = |mut c: Conv, stride: u32| {

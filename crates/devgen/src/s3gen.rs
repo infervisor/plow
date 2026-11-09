@@ -807,6 +807,7 @@ impl<'s> Ops<'s> {
                     wgmma: true,
                     weight_split: split,
                     dual_alpha: false,
+                    wgmma_ragged: false,
                 },
             )
         })

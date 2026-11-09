@@ -1172,6 +1172,7 @@ mod tests {
                 wgmma: false,
                 weight_split: false,
                 dual_alpha: false,
+                wgmma_ragged: false,
             },
             h[1],
         )
