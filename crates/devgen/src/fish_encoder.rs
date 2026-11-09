@@ -358,6 +358,7 @@ fn program_for(
             wgmma: false,
             weight_split: false,
             dual_alpha: false,
+            pinned: false,
         },
     )?;
     let mut d = cfg.channels;

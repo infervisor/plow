@@ -420,6 +420,7 @@ impl Chain {
                 wgmma: false,
                 weight_split: false,
                 dual_alpha: false,
+                pinned: false,
             },
         )?;
         Ok(self.done(e))

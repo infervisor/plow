@@ -365,6 +365,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_CODEC_CONV_ARMS")]
     pub codec_conv_arms: Option<std::path::PathBuf>,
 
+    /// Measured arm choices per pinned codec conv shape class (`codec_conv_classes.jsonl`:
+    /// `class`, `tc` tf32|ffma, `bn` 64|128, `arm` tile|warp); unlisted classes take the
+    /// pipeline's batch-independent defaults.
+    #[arg(long, env = "PLOW_EMIT_CODEC_CONV_CLASSES")]
+    pub codec_conv_classes: Option<std::path::PathBuf>,
+
     /// Fish/Breeze codec: skip decode and stream-step capacities over this many rows (batch x
     /// frames); the largest sets the activation arena (PLOW_EMIT_FISH_CODEC_MAX_ROWS).
     #[arg(long, env = "PLOW_EMIT_FISH_CODEC_MAX_ROWS")]
@@ -1975,6 +1981,8 @@ impl EmitConfig {
             s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
             snac_split_bf16: env_bool("PLOW_EMIT_SNAC_SPLIT_BF16"),
             codec_conv_arms: env_str("PLOW_EMIT_CODEC_CONV_ARMS").map(std::path::PathBuf::from),
+            codec_conv_classes: env_str("PLOW_EMIT_CODEC_CONV_CLASSES")
+                .map(std::path::PathBuf::from),
             fish_codec_max_rows: env_u32("PLOW_EMIT_FISH_CODEC_MAX_ROWS"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),

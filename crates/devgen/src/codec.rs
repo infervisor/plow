@@ -757,6 +757,7 @@ pub(crate) fn fused_conv(
         wgmma: splits.is_some(),
         weight_split: split,
         dual_alpha: dual,
+        pinned: true,
     };
     let e = match c.row_scale {
         Some((scale, _)) => p.conv1d_f32_row_scaled(x, &deps, stage, scale)?,
@@ -993,7 +994,11 @@ mod tests {
         assert_eq!((snake.t[0], snake.t[1]), (x, x));
         assert_eq!(ct.t[1], x);
         assert_eq!(ct.t[4], packet::dev::TENSOR_NONE);
-        assert_eq!(ct.j[1], 1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18);
+        // Pinned (bit 21); bit 23 is the tile width the class policy picks for these rows.
+        assert_eq!(
+            ct.j[1] & !(1 << 23),
+            1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18 | 1 << 21
+        );
         assert_eq!(
             prefix.model.tensors[ct.t[2] as usize].bytes,
             crate::pipeline::wgmma_weight_split(&vec![0u8; 512 * 1024 * 16 * 4], 8 * 512, 2 * 1024)
@@ -1098,8 +1103,8 @@ mod tests {
             "w.dec.blk0.ru0.a2"
         );
         assert_eq!(
-            conv.j[1],
-            packet::dev::ACT_SNAKE << 8 | 1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18
+            conv.j[1] & !(1 << 23),
+            packet::dev::ACT_SNAKE << 8 | 1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18 | 1 << 21
         );
     }
 }

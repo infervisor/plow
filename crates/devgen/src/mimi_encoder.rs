@@ -273,6 +273,7 @@ fn program_for(
             wgmma: false,
             weight_split: false,
             dual_alpha: false,
+            pinned: false,
         },
     )?;
     let mut d = cfg.filters;
@@ -427,6 +428,7 @@ fn program_for(
             wgmma: false,
             weight_split: false,
             dual_alpha: false,
+            pinned: false,
         },
     )?;
     let down = s.done(e);

@@ -1233,6 +1233,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.s3gen_attn_h16", Some("PLOW_EMIT_S3GEN_ATTN_H16"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.snac_split_bf16", Some("PLOW_EMIT_SNAC_SPLIT_BF16"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.codec_conv_arms", Some("PLOW_EMIT_CODEC_CONV_ARMS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.codec_conv_classes", Some("PLOW_EMIT_CODEC_CONV_CLASSES"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.fish_codec_max_rows", Some("PLOW_EMIT_FISH_CODEC_MAX_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.nv_fa_mma_hd128", Some("PLOW_NV_FA_MMA_HD128"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_gemv_k8_b1", Some("PLOW_NV_GEMV_K8_B1"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

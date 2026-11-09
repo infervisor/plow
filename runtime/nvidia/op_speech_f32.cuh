@@ -3556,7 +3556,10 @@ static __device__ __noinline__ void d_copy_cols_f32(const PlowDevInst* in, void*
         });
 }
 
-/* StreamTailF32 (222): one element of z (gather) or of the stored tail (store) per index. */
+/* StreamTailF32 (222): one element of z (gather) or of the stored tail (store) per index. Copies
+ * only, so with every row 16-byte aligned (C, Cz, zc0 and the source stride multiples of 4,
+ * aligned bases) the same values move as float4 quads, 8 in flight per thread: a quad never
+ * straddles the state window or a row, so the per-element cases hold per quad. */
 static __device__ __noinline__ void d_stream_tail_f32(const PlowDevInst* in, void* const* T, unsigned slice,
                                                       unsigned nblk) {
     const float* src = (const float*)SP_TEN(1);
@@ -3564,12 +3567,30 @@ static __device__ __noinline__ void d_stream_tail_f32(const PlowDevInst* in, voi
     const unsigned* slot = (const unsigned*)SP_TEN(3);
     const unsigned* nrows = (const unsigned*)SP_TEN(4);
     const unsigned B = in->i[0], L = in->i[1], N = in->i[2], C = in->i[3], Cz = in->i[4], zc0 = in->i[5];
-    const unsigned slots = in->fj[1].u;
+    const unsigned slots = in->fj[1].u, ss = in->i[6];
+    /* Plain loads only: src and the slot state are written earlier in the same persistent
+     * launch, which the non-coherent (ld.global.nc) path may not observe. */
+    const bool quads = C % 4u == 0 && Cz % 4u == 0 && zc0 % 4u == 0 && sp_aligned(state, 16);
     if (in->i[7] == 0u) {
         float* z = (float*)SP_TEN(0);
         const unsigned* pos = (const unsigned*)SP_TEN(5);
         const unsigned zr = L + N;
         if ((uint64_t)B * zr * Cz > 0xFFFFFFFFull) { __trap(); return; }
+        if (quads && ss % 4u == 0 && sp_aligned(z, 16) && sp_aligned(src, 16)) {
+            const unsigned q4 = Cz / 4u;
+            sp_batched<8>(
+                B * zr * q4, slice, nblk,
+                [&](unsigned e) {
+                    const unsigned rr = e / q4, c = (e - rr * q4) * 4u, b = rr / zr, r = rr - b * zr;
+                    if (r >= L) return *(const float4*)(src + ((size_t)b * N + (r - L)) * ss + c);
+                    if (c < zc0 || c - zc0 >= C || pos[b] == 0u) return make_float4(0.f, 0.f, 0.f, 0.f);
+                    const unsigned s = slot[b];
+                    if (s >= slots) __trap();
+                    return *(const float4*)(state + ((size_t)s * L + r) * C + (c - zc0));
+                },
+                [&](unsigned e, float4 v) { ((float4*)z)[e] = v; });
+            return;
+        }
         sp_batched<8>(
             B * zr * Cz, slice, nblk,
             [&](unsigned e) {
@@ -3584,6 +3605,22 @@ static __device__ __noinline__ void d_stream_tail_f32(const PlowDevInst* in, voi
         return;
     }
     if ((uint64_t)B * L * C > 0xFFFFFFFFull) { __trap(); return; }
+    if (quads && sp_aligned(src, 16)) {
+        const unsigned q4 = C / 4u;
+        sp_batched<8>(
+            B * L * q4, slice, nblk,
+            [&](unsigned e) {
+                const unsigned rr = e / q4, c = (e - rr * q4) * 4u, b = rr / L, i = rr - b * L;
+                const unsigned n = nrows[b];
+                if (n > N || slot[b] >= slots) __trap();
+                return *(const float4*)(src + ((size_t)b * (L + N) + n + i) * Cz + zc0 + c);
+            },
+            [&](unsigned e, float4 v) {
+                const unsigned rr = e / q4, c = (e - rr * q4) * 4u, b = rr / L, i = rr - b * L;
+                *(float4*)(state + ((size_t)slot[b] * L + i) * C + c) = v;
+            });
+        return;
+    }
     sp_batched<8>(
         B * L * C, slice, nblk,
         [&](unsigned e) {
@@ -3737,7 +3774,10 @@ static __device__ __noinline__ void d_unary_f32(const PlowDevInst* in, void* con
         if (width % 4u == 0 && stride % 4u == 0 && col0 % 4u == 0 && sp_aligned(x, 16) && sp_aligned(out, 16) &&
             sp_aligned(param, 16)) {
             const unsigned w4 = width / 4u;
-            sp_batched<4>(
+            /* 8 quads in flight per thread: the persistent grid's memory-level parallelism comes
+             * from registers (sp_batched). The [a | r] pair is read per quad: consecutive quads of
+             * one thread are nblk * 256 quads apart, i.e. different columns. */
+            sp_batched<8>(
                 rows * w4, slice, nblk,
                 [&](unsigned e) {
                     const unsigned row = e / w4;
@@ -3816,7 +3856,7 @@ static __device__ __noinline__ void d_binary_f32(const PlowDevInst* in, void* co
     const auto run = [&](auto f) {
         if (vec) {
             const unsigned w4 = width / 4u;
-            sp_batched<2>(
+            sp_batched<4>(
                 items * rows * w4, slice, nblk,
                 [&](unsigned e) {
                     const unsigned rr = e / w4, c = (e - rr * w4) * 4u, item = rr / rows, row = rr - item * rows;
@@ -3959,6 +3999,12 @@ struct SpConvArgs {
     float* splitk;
     unsigned batch, in_rows, cin, cout, kernel, stride, dil, groups, cg, ng, before, after, mode, pre,
         post, wf16, tapmajor, phasemajor, ptaps, out_rows, opad, cg_mul, cg_shift;
+    /* Flags bits 21..23: bit 0 the emitter pinned this conv's arms per shape class (nothing below
+     * may choose by M or nblk), bit 1 FFMA 128x128 tiles instead of 3xTF32, bit 2 a 128-wide
+     * wide / wgmma tile instead of 64. */
+    unsigned pin;
+    __device__ bool pinned() const { return pin & 1u; }
+    __device__ unsigned pin_bn() const { return pin & 4u ? 128u : 64u; }
     float slope;
     /* c / cg for c < 2^31 (Granlund-Montgomery; the tap index of a GEMM column). */
     __device__ unsigned div_cg(unsigned c) const { return (__umulhi(c, cg_mul) + c) >> cg_shift; }
@@ -4013,6 +4059,7 @@ __device__ __forceinline__ bool sp_conv_args(const PlowDevInst* in, void* const*
     const unsigned flags = in->fj[2].u;
     a.mode = transpose ? 0u : flags & 3u;
     a.pre = (flags >> 4) & 15u; a.post = (flags >> 8) & 15u; a.wf16 = (flags >> 12) & 1u;
+    a.pin = (flags >> 21) & 7u;
     a.tapmajor = transpose ? 0u : (flags >> 15) & 1u;
     /* ConvTranspose1d flags bit 15: weights [stride][cout][ceil(kernel/stride)][cg], one phase's
      * (tap, channel) columns contiguous per output channel (taps past the kernel are zero). */
@@ -4900,7 +4947,8 @@ __device__ __forceinline__ void sp_wg_run_ct(const SpConvArgs& a, unsigned slice
     const unsigned mt = (M + 127u) / 128u, r128 = (mt * (N / 128u) + nblk - 1u) / nblk,
                    r64 = (mt * (N / 64u) + nblk - 1u) / nblk;
     const float* w = spwg_wsplit(a);
-    if (a.cout % 128u == 0 && 20u * r128 <= 13u * r64) sp_wg_gemm<128, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
+    const bool w128 = a.cout % 128u == 0 && (a.pinned() ? a.pin_bn() == 128u : 20u * r128 <= 13u * r64);
+    if (w128) sp_wg_gemm<128, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
     else sp_wg_gemm<64, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
 }
 __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, unsigned nblk) {
@@ -4914,7 +4962,7 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
     const float* w = a.groups > 1u ? (const float*)a.w : spwg_wsplit(a);
     /* Split-K: post 0 only (devgen's conv1d_splitk mirrors it). */
     float* sk = a.groups > 1u || a.post != 0u ? nullptr : a.splitk;
-    const bool wide = !sk && 20u * r128 <= 13u * r64;
+    const bool wide = !sk && (a.pinned() ? a.pin_bn() == 128u : 20u * r128 <= 13u * r64);
     /* The combinations the speech lowerings use: pointwise with none / GELU / other, taps with
      * none / snake / other, grouped pointwise with none. */
     if (sp_post_on(0u) && a.groups > 1u) {
@@ -4940,7 +4988,7 @@ __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const
         a.mode != 0u || !(a.pre == 0u || (a.pre == 9u && !a.alpha)) || !(a.kernel == 1u || a.tapmajor) ||
         !sp_aligned(a.w, 16))
         return 0u;
-    return sp_w_width(a.batch * a.out_rows, a.cout, nblk);
+    return a.pinned() ? a.pin_bn() : sp_w_width(a.batch * a.out_rows, a.cout, nblk);
 }
 #if defined(PLOW_NV_HOPPER)
 /* The wgmma arm of Conv1dF32 (flags bit 17), dispatched from the interpreter's inlined body:
@@ -5112,7 +5160,9 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
     SpConvArgs a;
     if (!sp_conv_args(in, T, transpose, a)) return;
     if (!transpose && ((in->fj[2].u >> 16) & 1u) && a.groups == 1u) {
-        if (sp_conv1d_rows(a, slice, nblk, arena)) return;
+        /* Pinned: the warp arm only (the rows arm's M <= 32 gate and its other k order would make
+         * the result depend on the batch); the emitter sets the bit for cout <= 4 alone. */
+        if (!a.pinned() && sp_conv1d_rows(a, slice, nblk, arena)) return;
         if (a.cout <= 4u) return sp_conv1d_warp(a, slice, nblk);
     }
     if (!transpose && a.cg == 1u && a.ng == 1u && sp_conv1d_depthwise(a, slice, nblk, arena)) return;
@@ -5142,7 +5192,8 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
         }
         return total;
     };
-    const bool tc = ((in->fj[2].u >> 13) & 1u) && ((!transpose && !a.pre) || count(SPG_BM, SPG_BN) < nblk || a.phasemajor);
+    const bool tc = ((in->fj[2].u >> 13) & 1u) &&
+                    (a.pinned() ? !(a.pin & 2u) : ((!transpose && !a.pre) || count(SPG_BM, SPG_BN) < nblk || a.phasemajor));
     const unsigned BM = tc ? SPT_BM : SPG_BM, BN = tc ? SPT_BN : SPG_BN;
     const unsigned tn = (a.ng + BN - 1) / BN;
     const unsigned total = count(BM, BN);
