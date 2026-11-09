@@ -26,7 +26,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "maya2-native"
 label = "sm90a-h100-tp1"
-plow_git = "6d527195b4e84c344a6c0a7f3f223aab41784c21"
+plow_git = "ac5cacc5c4fbb1db7a632f48585033755506f11a"
 network = "qwen3"
 doc = "docs/runtime/tts.md"
 
