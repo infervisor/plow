@@ -11433,7 +11433,7 @@ fn emit_dense_gqa(
         );
         sections.push(
             tts::speech_pipeline_section(
-                &m,
+                &mut m,
                 pipeline::CausalPipelineSpec {
                     name: "speech",
                     max_context: ctx,
