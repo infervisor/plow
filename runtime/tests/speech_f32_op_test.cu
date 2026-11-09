@@ -625,7 +625,7 @@ static void t_stream_tail() {
                        G{"StreamTailF32 gather full width L>N", 8, 3, 32, 32, 0, 32},
                        G{"StreamTailF32 gather C96 full width", 6, 17, 96, 96, 0, 96},
                        G{"StreamTailF32 gather C96 window zc0=8", 6, 17, 96, 112, 8, 112},
-                       G{"StreamTailF32 gather C96 odd src stride", 6, 17, 96, 96, 0, 100}}) {
+                       G{"StreamTailF32 gather C96 odd src stride", 6, 17, 96, 96, 0, 98}}) {
         Case c; const unsigned B = 4, slots = 6;
         unsigned z = c.out((size_t)B * (g.L + g.N) * g.Cz);
         unsigned src = c.f32((size_t)(B * g.N - 1) * g.src_stride + g.Cz, 1.f);
@@ -677,6 +677,24 @@ static void t_stream_tail() {
         printf("  %-34s fresh n=0 slot zero -> %s\n", "StreamTailF32 chain", zeros ? "PASS" : "FAIL");
         if (!zeros) g_fail = 1;
     }
+    {
+        /* The 12 Hz codec's shape: C = Cz = 96, 17 frames of 10 rows; gather (quads) then store
+         * (quads) on the device, n = 0 / < L / = L / = N. */
+        Case c; const unsigned B = 4, slots = 5, L = 6, N = 170, C = 96, Cz = 96, zc0 = 0, ss = 96;
+        unsigned z = c.out((size_t)B * (L + N) * Cz);
+        unsigned src = c.f32((size_t)B * N * ss, 1.f);
+        unsigned state = c.f32((size_t)slots * L * C, 1.f);
+        unsigned slot = c.u32({4, 1, 3, 0}), n = c.u32({0, 3, 6, 170}), pos = c.u32({0, 5, 9, 2});
+        PlowDevInst gather;
+        memset(&gather, 0, sizeof(gather));
+        for (auto& t : gather.t) t = PLOW_TENSOR_NONE;
+        st_inst(gather, z, src, state, slot, n, pos, B, slots, L, N, C, Cz, zc0, ss, 0);
+        st_inst(c.in, PLOW_TENSOR_NONE, z, state, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, Cz, zc0, 0, 1);
+        std::vector<void*> th;
+        for (auto& h : c.host) th.push_back(h.data());
+        g_stream_tail_f32(&gather, 0, 1, th.data(), nullptr);
+        run("StreamTailF32 C96 gather->store chain", c, g_stream_tail_f32, {state}, FP32, 0.0, 0, &gather);
+    }
 }
 
 struct ConvSpec {
@@ -693,6 +711,7 @@ struct ConvSpec {
     bool dual = false; /* flags bit 19: alpha [cin | cout], an input then an output snake */
     bool rows = false; /* flags bit 16: the small-M rows arm (else the warp arm at cout <= 4) */
     bool splitk = false; /* flags bit 20: t7 is the wgmma tile's split-K scratch */
+    unsigned pin = 0; /* flags bits 21..23: 1 pinned arms, 2 FFMA tiles, 4 a 128-wide tile */
 };
 
 static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
@@ -769,7 +788,8 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
                    (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u) |
-                   (s.dual ? 1u << 19 : 0u) | (s.rows ? 1u << 16 : 0u) | (s.splitk ? 1u << 20 : 0u);
+                   (s.dual ? 1u << 19 : 0u) | (s.rows ? 1u << 16 : 0u) | (s.splitk ? 1u << 20 : 0u) |
+                   (s.pin << 21);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -790,6 +810,135 @@ static void t_convt1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
     Case c; unsigned o;
     build_conv(c, s, true, o);
     run(name, c, g_conv_transpose1d_f32, {o}, FP32, tol);
+}
+
+/* Batch invariance of a conv: item 0's output bits match whether it runs alone or in the batch,
+ * on all blocks or one. On the wgmma tile the f32 weights are NaN (the golden keeps them), so a
+ * fallback off it fails. */
+static void t_conv_invariant(const char* name, const ConvSpec& s, bool transpose, double tol = 1e-4) {
+    Case c; unsigned o;
+    build_conv(c, s, transpose, o);
+    const PlowDevInst ref = c.in;
+    if (s.wg && (transpose || s.cin % 64u == 0)) {
+        const unsigned w = c.in.t[2], wp = c.add(c.host[w].size());
+        c.host[wp] = c.host[w];
+        const float nan = NAN;
+        const size_t nf = transpose ? (size_t)s.stride * s.cout * 2 * s.cin : (size_t)s.cout * s.cin * s.kernel;
+        for (size_t i = 0; i < nf; i++) memcpy(&c.host[wp][i * 4], &nan, 4);
+        c.in.t[2] = wp;
+    }
+    run(name, c, transpose ? g_conv_transpose1d_f32 : g_conv1d_f32, {o}, FP32, tol, 0, nullptr, &ref);
+    const size_t item = (size_t)conv_out_rows(s, transpose) * s.cout, n = c.host[o].size() / 4;
+    std::vector<uint32_t> full(n), got(n);
+    CK(cudaMemcpy(full.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+    void** td = upload_table(c.dev);
+    struct V { const char* what; unsigned batch, nblk; } vs[] = {
+        {"alone", 1, (unsigned)g_nblk}, {"alone 1 block", 1, 1}, {"batch 7 blocks", s.batch, 7}, {"batch 1 block", s.batch, 1}};
+    for (const V& v : vs) {
+        PlowDevInst in = c.in;
+        in.i[0] = v.batch;
+        CK(cudaMemset(c.dev[o], 0xff, n * 4));
+        k_speech<<<v.nblk, 256, kSmem>>>(in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(got.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+        const size_t cmp = v.batch == 1u ? item : n;
+        const bool same = !memcmp(got.data(), full.data(), cmp * 4);
+        printf("  %-34s %s bitwise == batch %u -> %s\n", name, v.what, s.batch, same ? "PASS" : "FAIL");
+        if (!same) g_fail = 1;
+    }
+    CK(cudaFree(td));
+}
+
+/* Two specs over the same data (same seed): each against the golden, then bitwise against each
+ * other (`same` = expected equal, e.g. the two pinned tile widths; else expected to differ, e.g.
+ * 3xTF32 vs FFMA). */
+static void t_conv_pair(const char* name, const ConvSpec& a, const ConvSpec& b, bool transpose, bool same,
+                        double tol = 2e-5) {
+    std::vector<uint32_t> bits[2];
+    const uint32_t seed = rng_s;
+    for (int i = 0; i < 2; i++) {
+        rng_s = seed;
+        Case c; unsigned o;
+        build_conv(c, i ? b : a, transpose, o);
+        char nm[96];
+        snprintf(nm, sizeof(nm), "%s [%s]", name, i ? "b" : "a");
+        run(nm, c, transpose ? g_conv_transpose1d_f32 : g_conv1d_f32, {o}, FP32, tol);
+        bits[i].resize(c.host[o].size() / 4);
+        CK(cudaMemcpy(bits[i].data(), c.dev[o], bits[i].size() * 4, cudaMemcpyDeviceToHost));
+    }
+    const bool eq = bits[0] == bits[1];
+    if (same) {
+        printf("  %-34s a bitwise == b -> %s\n", name, eq ? "PASS" : "FAIL");
+        if (!eq) g_fail = 1;
+    } else {
+        printf("  %-34s a bitwise == b -> %s (different arms, informational)\n", name, eq ? "yes" : "no");
+    }
+}
+
+/* Pinned arms (flags bit 21): the 3xTF32 / FFMA choice, the tile width and the warp arm come from
+ * the flags, never from the batch. Mimi's ELU-pre k3 convs at both pins; the 12 Hz codec's 96->1
+ * output conv on the warp arm at M 1 / 32 / 33 and batched; the wide and wgmma tiles at both
+ * widths (bit-identical: per output the k order is the tile's). */
+static void t_conv_pinned() {
+    {
+        ConvSpec tc{4, 1024, 512, 256, 3, 1, 1, 1, 1, 1, 0, 8, 0, false, true, false, false, {}, 1.f, true};
+        tc.pin = 1;
+        ConvSpec ff = tc;
+        ff.pin = 1 | 2;
+        t_conv_pair("Conv1dF32 pinned k3 elu tf32 vs ffma", tc, ff, false, false);
+        t_conv_invariant("Conv1dF32 pinned k3 elu tf32", tc, false);
+        t_conv_invariant("Conv1dF32 pinned k3 elu ffma", ff, false);
+        /* 122880 rows per item: the former crossover would have switched to FFMA; pinned it stays. */
+        ConvSpec big = tc;
+        big.batch = 2; big.in_rows = 30720;
+        t_conv_invariant("Conv1dF32 pinned k3 elu tf32 big M", big, false);
+    }
+    {
+        ConvSpec w{3, 300, 96, 1, 7, 1, 1, 1, 6, 0, 0, 0, 0, false, true, false, false, {300, 100, 0}, 0.f, true};
+        w.tapmajor = true; w.rows = true; w.pin = 1;
+        t_conv_invariant("Conv1dF32 pinned warp k7 96->1 len", w, false);
+        ConvSpec d = w;
+        d.rows = false;
+        t_conv_pair("Conv1dF32 pinned 96->1 warp vs direct", w, d, false, false);
+        for (unsigned rows : {7u, 38u, 39u}) {
+            ConvSpec m = w;
+            m.batch = 1; m.in_rows = rows; m.before = 0; m.lengths = {};
+            char name[64];
+            snprintf(name, sizeof(name), "Conv1dF32 pinned warp 96->1 M%u", rows - 6);
+            t_conv1d(name, m);
+        }
+    }
+    {
+        /* Wide tile (split-bf16, no wgmma): both pinned widths over the same data. */
+        ConvSpec a{5, 700, 96, 96, 7, 1, 3, 1, 9, 9, 0, 0, 0, false, true, false, true, {}, 0.f, true};
+        a.wide = true; a.tapmajor = true; a.pin = 1;
+        ConvSpec b = a;
+        b.pin = 1 | 4;
+        t_conv_pair("Conv1dF32 pinned wide k7 96 bn64 vs bn128", a, b, false, true, 1e-4);
+        t_conv_invariant("Conv1dF32 pinned wide k7 96 bn128", b, false);
+    }
+#if defined(PLOW_NV_HOPPER)
+    {
+        ConvSpec a{5, 300, 512, 512, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true};
+        a.wide = true; a.wg = true; a.pin = 1;
+        ConvSpec b = a;
+        b.pin = 1 | 4;
+        t_conv_pair("Conv1dF32 pinned wgmma pointwise bn64 vs bn128", a, b, false, true, 1e-4);
+        ConvSpec t{5, 300, 384, 384, 7, 1, 3, 1, 9, 9, 0, 0, 0, false, true, false, true, {300, 50, 1, 300, 299}, 0.f, true};
+        t.wide = true; t.wg = true; t.tapmajor = true; t.pin = 1;
+        ConvSpec u = t;
+        u.pin = 1 | 4;
+        t_conv_pair("Conv1dF32 pinned wgmma k7 384 bn64 vs bn128", t, u, false, true, 1e-4);
+        t_conv_invariant("Conv1dF32 pinned wgmma k7 384 bn128", u, false);
+        ConvSpec ct{6, 40, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 0, 0, false, true, false, false, {40, 0, 1, 39, 40, 20}, 0.f, true};
+        ct.wide = true; ct.wg = true; ct.tapmajor = true; ct.pin = 1;
+        ConvSpec cu = ct;
+        cu.pin = 1 | 4;
+        t_conv_pair("ConvT pinned wgmma s8 1024->512 bn64 vs bn128", ct, cu, true, true, 1e-4);
+        t_conv_invariant("ConvT pinned wgmma s8 1024->512 bn128", cu, true);
+    }
+#endif
 }
 
 static void t_unary() {
@@ -998,15 +1147,43 @@ static void t_vec_elementwise() {
         run("UnaryF32 snake float4", c, g_unary_f32, {o}, FP32, 1e-5);
     }
     /* SnakeBeta (19), param [a | r]: the decoder widths (quad path, 8 quads per thread) and an
-     * unaligned window (scalar path). */
-    for (unsigned width : {96u, 192u, 384u, 768u, 40u}) {
-        Case c; const unsigned rows = width == 40 ? 97 : 61, stride = width == 40 ? 50 : width, col0 = width == 40 ? 7 : 0;
+     * unaligned window (scalar path); 1500 x 768 runs every thread's batches more than once at
+     * 132 blocks (288000 quads > 33792). */
+    for (unsigned wsel : {96u, 192u, 384u, 768u, 40u, 1768u}) {
+        unsigned width = wsel;
+        Case c; const unsigned rows = width == 40 ? 97 : width == 1768 ? 1500 : 61, stride = width == 40 ? 50 : width == 1768 ? 768 : width, col0 = width == 40 ? 7 : 0;
+        if (width == 1768) width = 768;
         unsigned o = c.f32(rows * stride, 1.f), x = c.f32(rows * stride, 4.f), p = c.f32(2 * width, 0.5f, 0.7f);
         c.in.op = PLOW_DOP_UNARY_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = p;
         c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = 19; c.in.i[3] = stride; c.in.i[4] = col0;
         char name[64];
         snprintf(name, sizeof(name), "UnaryF32 snake_beta %s w%u", width == 40 ? "scalar" : "float4", width);
         run(name, c, g_unary_f32, {o}, FP32, 1e-5);
+    }
+    {
+        /* The SnakeBeta quad and scalar paths over the same values (rows of 96 at stride 96 vs
+         * copied into stride 98): the same bits. */
+        const unsigned rows = 300, width = 96, s2 = 98;
+        Case a;
+        unsigned oa = a.out(rows * width), xa = a.f32(rows * width, 4.f), pa = a.f32(2 * width, 0.5f, 0.7f);
+        a.in.op = PLOW_DOP_UNARY_F32; a.in.t[0] = oa; a.in.t[1] = xa; a.in.t[2] = pa;
+        a.in.i[0] = rows; a.in.i[1] = width; a.in.i[2] = 19; a.in.i[3] = width; a.in.i[4] = 0;
+        run("UnaryF32 snake_beta quad path", a, g_unary_f32, {oa}, FP32, 1e-5);
+        Case b;
+        unsigned ob = b.out(rows * s2), xb = b.f32(rows * s2, 4.f), pb = b.f32(2 * width, 0.5f, 0.7f);
+        b.host[pb] = a.host[pa];
+        for (unsigned r = 0; r < rows; r++)
+            memcpy(&b.host[xb][(size_t)r * s2 * 4], &a.host[xa][(size_t)r * width * 4], width * 4);
+        b.in.op = PLOW_DOP_UNARY_F32; b.in.t[0] = ob; b.in.t[1] = xb; b.in.t[2] = pb;
+        b.in.i[0] = rows; b.in.i[1] = width; b.in.i[2] = 19; b.in.i[3] = s2; b.in.i[4] = 0;
+        run("UnaryF32 snake_beta scalar path", b, g_unary_f32, {ob}, FP32, 1e-5);
+        std::vector<float> ya(rows * width), yb(rows * s2);
+        CK(cudaMemcpy(ya.data(), a.dev[oa], ya.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(yb.data(), b.dev[ob], yb.size() * 4, cudaMemcpyDeviceToHost));
+        bool same = true;
+        for (unsigned r = 0; r < rows && same; r++) same = !memcmp(&ya[(size_t)r * width], &yb[(size_t)r * s2], width * 4);
+        printf("  %-34s quad bitwise == scalar -> %s\n", "UnaryF32 snake_beta paths", same ? "PASS" : "FAIL");
+        if (!same) g_fail = 1;
     }
     struct B { const char* name; unsigned op, bis, brs, bcs, bn, flags; };
     const unsigned items = 3, rows = 45, width = 36;
@@ -2173,6 +2350,7 @@ int main(int argc, char** argv) {
     }
     t_conv1d("Conv1dF32 pointwise 512 16k +res", {2, 8192, 512, 512, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true,
                                                    false, true, {}, 0.f});
+    t_conv_pinned();
     t_conv1d("Conv1dF32 dense k7 reflect leaky->tanh len", {2, 300, 64, 80, 7, 1, 3, 1, 9, 9, 1, 9, 1, true, true,
                                                               false, false, {300, 211}, 0.1f});
     t_conv1d("Conv1dF32 causal k3 mish-out f16 len", {3, 257, 96, 128, 3, 1, 1, 1, 2, 0, 0, 0, 10, true, true,

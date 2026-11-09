@@ -84,8 +84,12 @@ def cost(inst, ctx):
             flops = 2 * b * tin * cin * (cout // groups) * kk
         by = cout * (cin // groups) * kk * 4 + b * tin * cin * 4 + b * tout * cout * 4 * (2 if present(inst, "residual") else 1)
         # Flag bit 14: the split-bf16 tiles run three bf16 passes (hi*lo + lo*hi + hi*hi) per
-        # product, so the arithmetic actually issued is 3x the FLOPs at the bf16 peak.
-        if g("flags") & (1 << 14):
+        # product, so the arithmetic actually issued is 3x the FLOPs at the bf16 peak. Only the
+        # GEMM-shaped convs reach those tiles: depthwise (groups == channels) and the direct form
+        # (fewer than 16 output channels per group or k * cin/groups < 16) dispatch first.
+        cg, ng = cin // groups, cout // groups
+        depthwise = cg == 1 and ng == 1 and op == "Conv1dF32"
+        if g("flags") & (1 << 14) and not depthwise and ng >= 16 and cg * kk >= 16:
             return by, 3 * flops, "bf16"
         return by, flops, ("tf32" if g("flags") & (1 << 13) else "fp32")
     if op == "Conv2dF32":
@@ -121,10 +125,10 @@ def cost(inst, ctx):
         if g("mode") == 0:
             return b * (tail + new) * cz * 4 * 2, 0, "fp32"
         return b * tail * c * 4 * 2, 0, "fp32"
-    if op in ("RmsNormF32", "LayerNormRowsF32"):
-        return g("rows", 1) * g("width", g("feat", 0)) * 4 * 2, 0, "fp32"
+    if op == "RmsNormF32":
+        return g("rows", 1) * g("groups", 1) * g("group_width", 0) * 4 * 2, 0, "fp32"
     if op == "RopeAxialF32":
-        return g("rows", 1) * g("heads", 1) * g("hd", 0) * 4 * 2, 0, "fp32"
+        return g("rows", 1) * g("heads", 1) * g("head_width", 0) * 4 * 2, 0, "fp32"
     if op in ("ScaledAddF32", "Residual"):
         return g("n") * 4 * 3, 0, "fp32"
     if op == "PackNcfwRowsF32":

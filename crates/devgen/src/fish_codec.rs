@@ -537,6 +537,7 @@ impl Seq {
                 wgmma: split,
                 weight_split: split,
                 dual_alpha: false,
+                pinned: true,
             },
         )?;
         Ok(self.done(e))
