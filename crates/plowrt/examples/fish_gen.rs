@@ -128,7 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let period = opt("--same-streams").map(|v| v.parse::<usize>().unwrap().max(1));
         let memories: Vec<std::sync::Arc<[f32]>> = match (period, e.maya2_null_memory()) {
             (Some(p), Some(null)) => (0..p)
-                .map(|j| null.iter().map(|v| v * (1.0 + memory_step * j as f32)).collect())
+                .map(|j| {
+                    null.iter()
+                        .map(|v| v * (1.0 + memory_step * j as f32))
+                        .collect()
+                })
                 .collect(),
             _ => Vec::new(),
         };
@@ -200,7 +204,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 same += (p..n).filter(|&k| row(k) != row(k % p)).count();
                 for k in (p..n).filter(|&k| row(k) != row(k % p)) {
                     off_by_memory[k % p] += 1;
-                    first_off.get_or_insert((frame, k, (0..info.codebooks).find(|&c| row(k)[c] != row(k % p)[c])));
+                    first_off.get_or_insert((
+                        frame,
+                        k,
+                        (0..info.codebooks).find(|&c| row(k)[c] != row(k % p)[c]),
+                    ));
                 }
                 distinct += (1..p.min(n)).filter(|&k| row(k) != row(0)).count();
             }

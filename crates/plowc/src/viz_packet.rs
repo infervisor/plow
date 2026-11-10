@@ -879,6 +879,7 @@ mod tests {
             pair_cfg: true,
             depth_sampling: None,
             packed: None,
+            planned_rows: false,
             slot_memory: Vec::new(),
             tensors: Tensors {
                 params: 0,

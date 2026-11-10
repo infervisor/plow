@@ -631,12 +631,7 @@ impl FishDepth {
             &crate::config::RuntimeConfig::process_get().tts_depth_plan,
         )
         .map_err(reject)?;
-        // Only the Maya 2 launch runs windows; the Fish launch keeps the covering program.
-        let mode = if maya2.is_some() {
-            mode
-        } else {
-            crate::sched::row_plan::Mode::Cover
-        };
+        let mode = plan_mode(mode, maya2.is_some(), manifest.planned_rows);
         let plan = crate::sched::row_plan::RowPlan::new(&manifest.rows, rows as u32, &mode);
         let packed_rows = match &maya2 {
             Some(m) if plan.dynamic() => Some(PackedRows::load(
@@ -1307,10 +1302,7 @@ impl GpuEngine {
         };
         self.depth_read_codes(d, codes_at, end * k * 4)?;
         let us = started.elapsed().as_secs_f32() * 1e6;
-        if passes == 1 {
-            let program = d.plan.windows()[0].program;
-            d.plan.observe(program, us);
-        }
+        observe_plan(&mut d.plan, us);
         {
             use crate::obs::bucket::Family::Depth;
             self.buckets.record_demand(Depth, rows.len());
@@ -1455,11 +1447,25 @@ impl GpuEngine {
             let mut warm = true;
             for program in d.plan.candidates().collect::<Vec<_>>() {
                 let w = crate::sched::row_plan::Window { program, start: 0 };
+                // The cost a launch observes (`observe_plan`): its passes through the codes' read
+                // back.
+                let codes = self.devp[usize::from(d.manifest.tensors.frame_codes)].base;
+                let at = d.stage_rows * STAGE_CONTROL_BYTES;
+                let bytes = d.plan.capacity(program) as usize * d.manifest.codebooks as usize * 4;
                 for _ in 0..1 + usize::from(std::mem::take(&mut warm)) {
                     self.be.stream_synchronize(&self.stream)?;
                     let t = std::time::Instant::now();
                     self.maya2_pass(&d, w, None, false)?;
+                    // SAFETY: the stage buffer and the device codes outlive the drain below.
+                    let read = unsafe {
+                        self.be.memcpy_dtoh_async(
+                            &mut depth_stage(&mut d.stage)?[at..at + bytes],
+                            codes,
+                            &self.stream,
+                        )
+                    };
                     self.be.stream_synchronize(&self.stream)?;
+                    read?;
                     d.plan.observe(program, t.elapsed().as_secs_f32() * 1e6);
                 }
                 tracing::debug!(
@@ -1765,6 +1771,47 @@ mod tests {
         assert_eq!(stage, [0xaa; 4]);
         assert!(seed_frame_codes(&mut stage, &[(0, &[])], 8, 0).is_err());
         assert!(seed_frame_codes(&mut stage, &[], 8, 65).is_err());
+    }
+}
+
+/// The plan mode a packet runs under. Only the Maya 2 launch runs windows (the Fish launch keeps
+/// the covering program), and `auto` plans only over programs emitted to be combined
+/// (`Manifest::planned_rows`): programs of different capacities can take different arithmetic
+/// routes, so an earlier packet keeps the covering program it was qualified with. An explicit
+/// capacity list still applies.
+fn plan_mode(
+    mode: crate::sched::row_plan::Mode,
+    maya2: bool,
+    planned: bool,
+) -> crate::sched::row_plan::Mode {
+    use crate::sched::row_plan::Mode;
+    match mode {
+        Mode::Only(caps) if maya2 => Mode::Only(caps),
+        Mode::Auto if maya2 && planned => Mode::Auto,
+        _ => Mode::Cover,
+    }
+}
+
+/// A launch of `plan`'s windows took `us` from staging done to codes read back: each program's
+/// cost takes its share, in proportion to the estimates, so a plan of several windows corrects
+/// its programs' costs as a single one does.
+fn observe_plan(plan: &mut crate::sched::row_plan::RowPlan, us: f32) {
+    let n = plan.windows().len();
+    let estimate: f32 = plan.windows().iter().map(|w| plan.cost_us(w.program)).sum();
+    let shares: smallvec::SmallVec<[(u16, f32); 8]> = plan
+        .windows()
+        .iter()
+        .map(|w| {
+            let share = if estimate > 0.0 {
+                plan.cost_us(w.program) / estimate
+            } else {
+                1.0 / n as f32
+            };
+            (w.program, us * share)
+        })
+        .collect();
+    for (program, us) in shares {
+        plan.observe(program, us);
     }
 }
 

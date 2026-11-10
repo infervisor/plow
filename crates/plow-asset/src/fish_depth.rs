@@ -98,6 +98,11 @@ pub struct Manifest {
     pub slot_memory: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packed: Option<PackedDepth>,
+    /// The programs were emitted to be combined: a launch may cover its live rows with any of
+    /// the declared capacities, several at once. Unset (packets emitted before it existed): each
+    /// launch runs the one smallest program covering its highest live row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub planned_rows: bool,
     pub tensors: Tensors,
 }
 
@@ -170,6 +175,7 @@ mod tests {
     fn packed_depth_contract_is_optional_and_rejects_unknown_or_invalid_mappings() {
         let mut m = manifest();
         assert_eq!(m.packed, None);
+        assert!(!m.planned_rows, "a packet without the stamp is not planned");
         assert!(m.validate(2, 10).is_ok());
         m.packed = Some(PackedDepth {
             version: 1,

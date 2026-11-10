@@ -1299,6 +1299,7 @@ pub(crate) fn lm_sections(
             decode_token: c.frame.as_ref().filter(|f| f.decode_only).map(|f| f.lo),
         }),
         depth_sampling: Some([d.temperature.to_bits(), d.top_k]),
+        planned_rows: true,
         slot_memory: (0..geo.layers)
             .map(|l| handle(&format!("in.depth.cross.{l}")))
             .collect(),

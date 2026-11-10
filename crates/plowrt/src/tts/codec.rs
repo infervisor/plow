@@ -1819,8 +1819,11 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
             .unwrap_or(URGENT_SLACK_MS),
     );
     let max_wait = crate::serve::cosched::max_wait();
-    // Every stream-step launch is timed: `split` prices launches whatever the bound is.
-    let learn = true;
+    // `PLOW_TTS_CODEC_PLAN=0`: launch on the first job and pad every step to the longest.
+    let plans = cfg.tts_codec_plan;
+    // Planned launches are priced whatever the bound is, so every stream-step launch is timed.
+    let learn = plans || sched || cap_us > 0.0;
+    let mut splits = Splits::default();
     let mut costs = StepCosts::default();
     let mut pending: Vec<Job> = Vec::new();
     // The rest of a split launch: it launches next, whatever arrives meanwhile.
@@ -1879,7 +1882,10 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
             }
             let live = codec.slots.as_ref().map_or(0, |pool| pool.lock().live());
             let left = gather_end.saturating_duration_since(std::time::Instant::now());
-            if !open || !owed.is_empty() || left.is_zero() || !gathers(&pending, live) {
+            if !(plans && open && owed.is_empty())
+                || left.is_zero()
+                || !gathers(&pending, live, std::time::Instant::now())
+            {
                 break;
             }
             match rx.recv_timeout(STEP_GATHER.min(left)) {
@@ -1942,10 +1948,10 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
                 codec.capacity(f, b, n).is_some()
             });
             let mut keep = take.len();
-            if pending[take[0]].step.is_some() {
+            if plans && pending[take[0]].step.is_some() {
                 let family = pending[take[0]].family();
                 let frames: Vec<usize> = take.iter().map(|&k| pending[k].frames).collect();
-                keep = split(&frames, &costs, |b, n| {
+                keep = splits.keep(&frames, &costs, |b, n| {
                     codec.capacity(family, b, n).map(|c| (c.0, c.1))
                 });
             }
@@ -2041,14 +2047,17 @@ const LAUNCH_FLOOR_ROW_FRAMES: f64 = 48.0;
 /// rest costs least, by measured capacity cost (unmeasured capacities are priced from the measured
 /// ones in proportion to their padded row-frames). `capacity(batch, frames)`: the capacity that
 /// launch would run.
+///
+/// Returns the cheapest split's prefix with its cost, and the whole launch's cost; `None` when
+/// every step has the same length.
 fn split(
     frames: &[usize],
     costs: &StepCosts,
     capacity: impl Fn(usize, usize) -> Option<(usize, usize)>,
-) -> usize {
+) -> Option<(usize, f64, f64)> {
     let n = frames.len();
     if frames.iter().all(|&f| f == frames[0]) {
-        return n;
+        return None;
     }
     let model = |(b, f): (usize, usize)| LAUNCH_FLOOR_ROW_FRAMES + (b * f) as f64;
     // Microseconds per modelled row-frame, over what has been measured.
@@ -2064,7 +2073,8 @@ fn split(
     for k in (0..n).rev() {
         rest_longest[k] = rest_longest[k + 1].max(frames[k]);
     }
-    let (mut best, mut best_cost, mut longest) = (n, price(n, rest_longest[0]), 0);
+    let whole = price(n, rest_longest[0]);
+    let (mut best, mut best_cost, mut longest) = (1, f64::INFINITY, 0);
     for k in 1..n {
         longest = longest.max(frames[k - 1]);
         let cost = price(k, longest) + price(n - k, rest_longest[k]);
@@ -2072,16 +2082,71 @@ fn split(
             (best, best_cost) = (k, cost);
         }
     }
-    best
+    Some((best, best_cost, whole))
+}
+
+/// A mixed launch changes between split and whole only for this much of the cost.
+const SPLIT_MARGIN: f64 = 0.9;
+/// Mixed launches between runs of the arm [`Splits`] is not using. Only launches that run are
+/// measured, so without them an arm priced too high (from the model, or under other load) is
+/// never measured again.
+const SPLIT_PROBE: u32 = 32;
+
+/// The split choice over a worker's mixed launches ([`split`]), per capacity the whole launch
+/// would run (so launch shapes that alternate are each explored): it keeps its last choice unless
+/// the other is cheaper by [`SPLIT_MARGIN`], and every [`SPLIT_PROBE`]th such launch runs the
+/// other arm.
+#[derive(Default)]
+struct Splits(std::collections::HashMap<(usize, usize), (bool, u32)>);
+
+impl Splits {
+    /// How many of the launch's steps (`frames`, in launch order) launch now.
+    fn keep(
+        &mut self,
+        frames: &[usize],
+        costs: &StepCosts,
+        capacity: impl Fn(usize, usize) -> Option<(usize, usize)>,
+    ) -> usize {
+        let Some((prefix, parts, whole)) = split(frames, costs, &capacity) else {
+            return frames.len();
+        };
+        let (n, longest) = (frames.len(), frames.iter().copied().max().unwrap_or(0));
+        let (split, mixed) = self
+            .0
+            .entry(capacity(n, longest).unwrap_or((n, longest)))
+            .or_default();
+        *split = if *split {
+            parts * SPLIT_MARGIN < whole
+        } else {
+            parts < whole * SPLIT_MARGIN
+        };
+        *mixed += 1;
+        let probe = *mixed % SPLIT_PROBE == 0;
+        if *split != probe {
+            prefix
+        } else {
+            n
+        }
+    }
 }
 
 /// The gap that ends a burst of stream steps ([`gathers`]).
 const STEP_GATHER: std::time::Duration = std::time::Duration::from_micros(150);
 
-/// Whether the worker waits a moment for more of a burst: only stream steps are queued and
-/// fewer of them than there are live stream slots.
-fn gathers(pending: &[Job], live: usize) -> bool {
-    !pending.is_empty() && pending.len() < live && pending.iter().all(|j| j.step.is_some())
+/// A queued step this close to its playback deadline launches without waiting for a burst.
+const GATHER_SLACK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Whether the worker waits a moment for more of a burst: only later stream steps are queued,
+/// fewer of them than there are live stream slots, and none is a first audio or about to run
+/// its playback dry.
+fn gathers(pending: &[Job], live: usize, now: std::time::Instant) -> bool {
+    !pending.is_empty()
+        && pending.len() < live
+        && pending.iter().all(|j| {
+            j.step.is_some()
+                && j.urgency != Urgency::First
+                && j.due.is_none_or(|due| due > now + GATHER_SLACK)
+        })
 }
 
 fn drain_rests(
@@ -3596,35 +3661,131 @@ mod tests {
             f.extend(std::iter::repeat_n(1, short));
             f
         };
+        let keep = |frames: &[usize], costs: &StepCosts| Splits::default().keep(frames, costs, cap);
         // Unmeasured: priced by padded row-frames.
-        assert_eq!(split(&mixed(1, 2, 127), &costs, cap), 1);
-        assert_eq!(split(&mixed(1, 17, 100), &costs, cap), 1);
-        assert_eq!(split(&mixed(126, 2, 2), &costs, cap), 128);
-        assert_eq!(split(&[1; 128], &costs, cap), 128);
-        assert_eq!(split(&[2], &costs, cap), 1);
+        assert_eq!(keep(&mixed(1, 2, 127), &costs), 1);
+        assert_eq!(keep(&mixed(1, 17, 100), &costs), 1);
+        assert_eq!(keep(&mixed(126, 2, 2), &costs), 128);
+        assert_eq!(keep(&[1; 128], &costs), 128);
+        assert_eq!(keep(&[2], &costs), 1);
         // Measured costs decide: here two frames cost no more than one, so nothing splits.
         for (b, n, us) in [(1, 2, 4_500.0), (128, 1, 16_000.0), (128, 2, 17_000.0)] {
             costs.observe(b, n, us);
         }
-        assert_eq!(split(&mixed(1, 2, 127), &costs, cap), 128);
+        assert_eq!(keep(&mixed(1, 2, 127), &costs), 128);
         costs = StepCosts::default();
         for (b, n, us) in [(1, 2, 4_500.0), (128, 1, 16_000.0), (128, 2, 33_000.0)] {
             costs.observe(b, n, us);
         }
-        assert_eq!(split(&mixed(1, 2, 127), &costs, cap), 1);
+        assert_eq!(keep(&mixed(1, 2, 127), &costs), 1);
+    }
+
+    #[test]
+    fn a_split_priced_too_cheap_is_measured_again_and_corrected() {
+        let caps = [(1, 2), (128, 1), (128, 2)];
+        let cap = |b: usize, n: usize| caps.iter().copied().find(|&(cb, cn)| cb >= b && cn >= n);
+        // What launches really cost: the whole launch (17 ms) beats the split (4.5 + 16 ms),
+        // but unmeasured it is priced by its padded row-frames and loses.
+        let real = |b: usize, n: usize| match (b, n) {
+            (1, 2) => 4_500.0,
+            (128, 1) => 16_000.0,
+            _ => 17_000.0,
+        };
+        let mut frames = vec![2];
+        frames.extend(std::iter::repeat_n(1, 127));
+        let (mut costs, mut splits) = (StepCosts::default(), Splits::default());
+        let launch = |costs: &mut StepCosts, splits: &mut Splits| {
+            let keep = splits.keep(&frames, costs, cap);
+            if keep < frames.len() {
+                costs.observe(1, 2, real(1, 2));
+                costs.observe(128, 1, real(128, 1));
+            } else {
+                costs.observe(128, 2, real(128, 2));
+            }
+            keep
+        };
+        assert_eq!(launch(&mut costs, &mut splits), 1, "the model splits");
+        let mut whole = 0;
+        for _ in 0..4 * SPLIT_PROBE {
+            whole += usize::from(launch(&mut costs, &mut splits) == frames.len());
+        }
+        assert_eq!(
+            costs.get(128, 2),
+            Some(17_000.0),
+            "the whole launch was measured"
+        );
+        assert!(
+            whole >= 2 * SPLIT_PROBE as usize,
+            "the whole launch won after one probe"
+        );
+        // Shapes that alternate are explored separately: interleaving a second launch shape
+        // does not take the first one's probes.
+        let caps2 = [(1, 2), (1, 17), (128, 1), (128, 2), (128, 17)];
+        let cap2 = |b: usize, n: usize| caps2.iter().copied().find(|&(cb, cn)| cb >= b && cn >= n);
+        let mut other = vec![17];
+        other.extend(std::iter::repeat_n(1, 127));
+        let (mut costs, mut splits) = (StepCosts::default(), Splits::default());
+        for _ in 0..2 * SPLIT_PROBE {
+            if splits.keep(&frames, &costs, cap2) < frames.len() {
+                costs.observe(1, 2, 4_500.0);
+                costs.observe(128, 1, 16_000.0);
+            } else {
+                costs.observe(128, 2, 17_000.0);
+            }
+            splits.keep(&other, &costs, cap2);
+        }
+        assert_eq!(
+            costs.get(128, 2),
+            Some(17_000.0),
+            "probed beside the other shape"
+        );
+        // Near a tie the choice does not flap: the other arm must be cheaper by the margin.
+        let (mut costs, mut splits) = (StepCosts::default(), Splits::default());
+        for (b, n, us) in [(1, 2, 4_000.0), (128, 1, 12_500.0), (128, 2, 17_000.0)] {
+            costs.observe(b, n, us);
+        }
+        assert_eq!(
+            splits.keep(&frames, &costs, cap),
+            128,
+            "16.5 vs 17 ms stays whole"
+        );
+        costs.observe(128, 2, 40_000.0);
+        assert_eq!(splits.keep(&frames, &costs, cap), 1);
+        costs = StepCosts::default();
+        for (b, n, us) in [(1, 2, 4_000.0), (128, 1, 12_500.0), (128, 2, 16_000.0)] {
+            costs.observe(b, n, us);
+        }
+        assert_eq!(
+            splits.keep(&frames, &costs, cap),
+            1,
+            "16.5 vs 16 ms stays split"
+        );
     }
 
     #[test]
     fn step_bursts_gather_until_every_live_stream_is_queued() {
+        let now = std::time::Instant::now();
         let step = || job(false, 1, Some(0));
-        assert!(!gathers(&[], 4));
-        assert!(!gathers(&[step()], 1), "a lone stream launches at once");
-        assert!(gathers(&[step()], 2));
-        assert!(!gathers(&[step(), step()], 2));
+        assert!(!gathers(&[], 4, now));
         assert!(
-            !gathers(&[step(), job(false, 1, None)], 4),
+            !gathers(&[step()], 1, now),
+            "a lone stream launches at once"
+        );
+        assert!(gathers(&[step()], 2, now));
+        assert!(!gathers(&[step(), step()], 2, now));
+        assert!(
+            !gathers(&[step(), job(false, 1, None)], 4, now),
             "decodes do not wait"
         );
+        let mut first = step();
+        first.urgency = Urgency::First;
+        assert!(!gathers(&[first], 4, now), "a first audio does not wait");
+        let mut due = step();
+        due.due = Some(now + std::time::Duration::from_millis(5));
+        assert!(!gathers(&[due], 4, now), "nor a step about to run dry");
+        let mut later = step();
+        later.due = Some(now + std::time::Duration::from_millis(60));
+        assert!(gathers(&[later], 4, now));
     }
 
     #[test]

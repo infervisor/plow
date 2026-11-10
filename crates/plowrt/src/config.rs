@@ -247,6 +247,12 @@ pub struct RuntimeConfig {
     #[arg(long = "tts-chunk-ramp", env = "PLOW_TTS_CHUNK_RAMP", value_parser = clap::builder::BoolishValueParser::new(), global = true)]
     pub tts_chunk_ramp: Option<bool>,
 
+    /// Stateful codec steps launch planned: a decode tick's burst of steps is gathered into one
+    /// launch, and a launch of mixed step lengths splits where padding costs more than a second
+    /// launch, by measured cost (`false`: launch on the first job, pad to the longest; rollback).
+    #[arg(long = "tts-codec-plan", env = "PLOW_TTS_CODEC_PLAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_codec_plan: bool,
+
     /// Stateful codec streams step early when the audio ahead of playback is under two frame
     /// periods, instead of waiting for as many new frames as were already emitted (`false`: the
     /// doubling steps only; A/B).

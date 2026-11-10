@@ -562,7 +562,7 @@ pub struct SpeechModel {
     /// Maya 2's cloned-speaker conditioning (`spk` / `icl_spk`), when the bundle carries it.
     speaker: Option<Arc<Maya2Speaker>>,
     /// Running frame period of this model's stateful streams, microseconds (0: none measured).
-    frame_period_us: std::sync::atomic::AtomicU64,
+    frame_period: FramePeriod,
 }
 
 /// ECAPA and the speaker tables of a Maya 2 bundle (`checkpoint/ecapa`, `checkpoint/speaker`).
@@ -625,6 +625,49 @@ impl Maya2Speaker {
     }
 }
 
+/// A model's running frame period over its stateful streams, with when it was last observed:
+/// (ms since process start) << 32 | microseconds. Streams observe it every few frames, so under
+/// load it is always fresh; once the streams that measured it are gone it says nothing about
+/// the next request, and after [`FramePeriod::FRESH_MS`] it is no longer used.
+#[derive(Default)]
+struct FramePeriod(std::sync::atomic::AtomicU64);
+
+impl FramePeriod {
+    const FRESH_MS: u32 = 1_000;
+
+    fn now_ms() -> u32 {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_millis() as u32
+    }
+
+    /// The period in seconds, while an observation is fresh.
+    fn recent(&self, now_ms: u32) -> Option<f64> {
+        let v = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        let (at, us) = ((v >> 32) as u32, v as u32);
+        (us > 0 && now_ms.wrapping_sub(at) <= Self::FRESH_MS).then(|| f64::from(us) * 1e-6)
+    }
+
+    fn observe(&self, seconds: f64, now_ms: u32) {
+        let us = seconds * 1e6;
+        let us = match self.recent(now_ms) {
+            Some(old) => old * 1e6 + 0.1 * (us - old * 1e6),
+            None => us,
+        };
+        let us = us.clamp(1.0, f64::from(u32::MAX)) as u64;
+        self.0.store(
+            u64::from(now_ms) << 32 | us,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Whether a request starting now banks a frame: live streams are producing frames slower
+    /// than half real time (`frame`: one frame's audio, seconds).
+    fn banks(&self, frame: f64, now_ms: u32) -> bool {
+        self.recent(now_ms)
+            .is_some_and(|period| period > 0.5 * frame)
+    }
+}
+
 impl SpeechModel {
     /// Frames a stream's first stateful codec step waits for: the contract's, plus one banked frame
     /// while frames come slower than half real time (a stream then starts with the lead that lets
@@ -632,28 +675,15 @@ impl SpeechModel {
     /// or `PLOW_TTS_STREAM_DEADLINE=0` keeps the contract's.
     fn first_frames(&self) -> usize {
         let cfg = crate::config::RuntimeConfig::get();
-        let first = self.contract.first_frames();
-        let period = self
-            .frame_period_us
-            .load(std::sync::atomic::Ordering::Relaxed) as f64
-            * 1e-6;
         let frame = self.contract.frame_samples as f64 / f64::from(self.contract.sample_rate);
         let bank = cfg.tts_stream_deadline
             && cfg.tts_stream_first_frames.is_none()
-            && period > 0.5 * frame;
-        first + usize::from(bank)
+            && self.frame_period.banks(frame, FramePeriod::now_ms());
+        self.contract.first_frames() + usize::from(bank)
     }
 
     fn observe_frame_period(&self, seconds: f64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let us = seconds * 1e6;
-        let old = self.frame_period_us.load(Relaxed) as f64;
-        let new = if old == 0.0 {
-            us
-        } else {
-            old + 0.1 * (us - old)
-        };
-        self.frame_period_us.store(new as u64, Relaxed);
+        self.frame_period.observe(seconds, FramePeriod::now_ms());
     }
 
     /// The model's [`SpeechSpec`] (its voices may come from the tokenizer: built once).
@@ -757,7 +787,7 @@ pub fn speech_model(
                 realtime,
                 spec: OnceLock::new(),
                 speaker,
-                frame_period_us: Default::default(),
+                frame_period: Default::default(),
             }))
         }
     };
@@ -2400,6 +2430,26 @@ fn step_plan(
 /// (`due` = when the sent audio has played out) is under one measured frame period plus the
 /// codec step that follows it (`step_s`, with margin). Waiting for as many frames as were emitted
 /// only holds while frames come at least twice as fast as they play.
+/// When the frames [`step_urgent`] counts began to arrive. The count restarts with every segment
+/// and retry, so the clock restarts with it: a request-old clock over a fresh count reads as a
+/// frame period of seconds and turns every step urgent.
+#[derive(Default)]
+struct FramePace(Option<Instant>);
+
+impl FramePace {
+    fn frame(&mut self) {
+        self.0.get_or_insert_with(Instant::now);
+    }
+
+    fn restart(&mut self) {
+        self.0 = None;
+    }
+
+    fn since(&self) -> Option<Instant> {
+        self.0
+    }
+}
+
 fn step_urgent(
     due: Option<Instant>,
     first_frame_at: Option<Instant>,
@@ -2414,7 +2464,14 @@ fn step_urgent(
     }
     let per_frame = t0.elapsed().as_secs_f64() / (n - 1) as f64;
     let lead = due.saturating_duration_since(Instant::now()).as_secs_f64();
-    lead < per_frame + 1.5 * step_s + 0.010
+    lead < urgent_lead(per_frame, step_s)
+}
+
+/// The playback lead under which a step is urgent: one frame period plus the codec step that
+/// follows it (with margin), and never more than two frame periods, so a stream whose frames come
+/// fast steps no earlier than that.
+fn urgent_lead(per_frame: f64, step_s: f64) -> f64 {
+    (per_frame + 1.5 * step_s + 0.010).min(2.0 * per_frame)
 }
 
 /// New frames [`step_plan`]'s next step waits for (short of the segment's end).
@@ -2636,6 +2693,8 @@ async fn stream_task(
     // Dropping the rest of the current attempt (cut short).
     let mut skipping = false;
     let mut first_frame_at: Option<Instant> = None;
+    // The deadline rule's clock: restarts with the frame count (segment, retry).
+    let mut pace = FramePace::default();
     // (when, frames seen) of the last frame-period sample fed to the model's estimate.
     let mut period_mark: Option<(Instant, usize)> = None;
     // First-audio trace (`plow::tts::first_audio` at debug): codec steps until audible, the last one's time.
@@ -2668,6 +2727,8 @@ async fn stream_task(
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     (frames, emitted, skipping) = (super::codec::Codes::default(), 0, false);
+                    pace.restart();
+                    period_mark = None;
                     attempt += 1;
                     joiner.next_segment();
                     if let Some(s) = slot.as_mut() {
@@ -2682,6 +2743,8 @@ async fn stream_task(
                     joins.push(sent);
                     joiner.next_segment();
                     (frames, emitted, skipping) = (super::codec::Codes::default(), 0, false);
+                    pace.restart();
+                    period_mark = None;
                     (seg, attempt) = (seg + 1, 0);
                     if let Some(s) = slot.as_mut() {
                         s.restart();
@@ -2719,6 +2782,7 @@ async fn stream_task(
                     }
                 }
                 first_frame_at.get_or_insert_with(Instant::now);
+                pace.frame();
                 if slot.is_some() {
                     let seen = frames.len() / fc.max(1);
                     match period_mark {
@@ -2833,7 +2897,7 @@ async fn stream_task(
             let due = playing.map(|t| t + std::time::Duration::from_secs_f64(sent as f64 / sr));
             // (PCM, its first fresh frame, frames emitted after it, frames decoded)
             let decoded = if let Some(slot) = slot.as_mut() {
-                let urgent = stream_deadline && step_urgent(due, first_frame_at, n, step_s);
+                let urgent = stream_deadline && step_urgent(due, pace.since(), n, step_s);
                 let Some(k) = step_plan(
                     n,
                     emitted,
@@ -3235,6 +3299,53 @@ mod tests {
         assert_eq!(step_plan(30, 21, false, 4, CAP, true), Some(9));
         assert_eq!(step_plan(21, 21, false, 4, CAP, true), None);
         assert_eq!(step_plan(3, 0, false, 4, CAP, true), None);
+        // Fast frames: never urgent with more lead than two frame periods (10 ms frames, a 4 ms
+        // codec step and 23 ms of lead wait for the next frame).
+        assert_eq!(urgent_lead(0.010, 0.004), 0.020);
+        for per_frame in [0.001, 0.010, 0.040, 0.080, 0.200] {
+            for step_s in [0.0, 0.004, 0.020, 0.500] {
+                assert!(urgent_lead(per_frame, step_s) <= 2.0 * per_frame);
+            }
+        }
+        assert!((urgent_lead(0.070, 0.010) - 0.095).abs() < 1e-9);
+        // Banking follows live load only: 32 slow streams, then idle, then one request.
+        let period = FramePeriod::default();
+        assert!(!period.banks(0.080, 0), "nothing measured");
+        for ms in (0..5_000).step_by(50) {
+            period.observe(0.060, ms);
+        }
+        assert!(period.banks(0.080, 5_000), "live streams at RTF 0.75 bank");
+        assert!(
+            !period.banks(0.080, 5_000 + FramePeriod::FRESH_MS + 1),
+            "idle: no extra frame"
+        );
+        // The next load starts from its own measurement, not the stale one.
+        period.observe(0.020, 60_000);
+        assert!((period.recent(60_000).unwrap() - 0.020).abs() < 1e-9);
+        assert!(!period.banks(0.080, 60_000));
+        // The deadline clock restarts with the frame count. Ten seconds into a request, a later
+        // segment (or a retry) has five frames and a second of audio buffered: over the request's
+        // clock that reads as a 2.5 s frame period and is urgent; over the segment's it is not.
+        let now = Instant::now();
+        let (began, due) = (
+            now - std::time::Duration::from_secs(10),
+            now + std::time::Duration::from_secs(1),
+        );
+        assert!(step_urgent(Some(due), Some(began), 5, 0.02));
+        let mut pace = FramePace(Some(began));
+        for _segment_then_retry in 0..2 {
+            pace.restart();
+            assert!(!step_urgent(Some(due), pace.since(), 5, 0.02));
+            pace.frame();
+            let since = pace.since().unwrap();
+            assert!(
+                since >= now,
+                "the clock starts at the segment's first frame"
+            );
+            pace.frame();
+            assert_eq!(pace.since(), Some(since));
+            assert!(!step_urgent(Some(due), pace.since(), 5, 0.02));
+        }
         for total in 1..60 {
             for arrive in 1..20 {
                 let (mut emitted, mut seen, mut n) = (0, Vec::new(), 0);
