@@ -10,36 +10,11 @@ import sys, math, os, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import attn_decode as ad
 from build_catalog import pick_nsplit
+from gen_bench import graph_time as _graph_time
 
 dev = "cuda"
+graph_time = lambda fns: _graph_time(fns, reps=5)
 H, KVH = [int(x) for x in os.environ.get("BENCH_HEADS", "8,2").split(",")]  # q heads, KV heads
-
-
-def graph_time(fns, reps=5):
-    for f in fns:
-        f()
-    torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        with torch.cuda.graph(g, stream=s):
-            for f in fns:
-                f()
-    torch.cuda.synchronize()
-    g.replay()
-    torch.cuda.synchronize()
-    ts = []
-    for _ in range(reps):
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
-        e0.record()
-        g.replay()
-        e1.record()
-        e1.synchronize()
-        ts.append(e0.elapsed_time(e1) * 1000 / len(fns))
-    ts.sort()
-    return ts[len(ts) // 2]
 
 
 def ref_out(q, k, v, lens, slot, b, window, mask):

@@ -7,36 +7,10 @@ Needs torch, tilelang and one leased GPU.
 import sys, os, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import attn_cfm as ac
+from gen_bench import graph_time, rel_err as err
 
 dev = "cuda"
 H, HW, PRE = 8, 64, 306
-
-
-def graph_time(fns, reps=7):
-    for f in fns:
-        f()
-    torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        with torch.cuda.graph(g, stream=s):
-            for f in fns:
-                f()
-    torch.cuda.synchronize()
-    g.replay()
-    torch.cuda.synchronize()
-    ts = []
-    for _ in range(reps):
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
-        e0.record()
-        g.replay()
-        e1.record()
-        e1.synchronize()
-        ts.append(e0.elapsed_time(e1) * 1000 / len(fns))
-    ts.sort()
-    return ts[len(ts) // 2]
 
 
 def inputs(B, Tq, seed=0):
@@ -61,12 +35,6 @@ def reference(qkv, prefix, pidx, klen, scale):
     s = s.masked_fill(j[None, None, None, :] >= klen.long()[:, None, None, None], float("-inf"))
     o = torch.softmax(s, -1) @ v
     return o.transpose(1, 2).reshape(B, Tq, H * HW)
-
-
-def err(out, ref):
-    d = (out.double() - ref)
-    rms = ref.pow(2).mean().sqrt()
-    return (d.abs().max() / rms).item(), (d.norm() / ref.norm()).item()
 
 
 def run(B, Tq, bm, bn, threads, stages, src=False):
