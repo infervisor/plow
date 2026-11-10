@@ -449,12 +449,6 @@ impl GpuEngine {
             self.pf_seg_prefix = false;
             body?;
             body_enqueued = true;
-            self.buckets.record(
-                crate::obs::bucket::Family::Prefill,
-                rows,
-                capacity as usize,
-                None,
-            );
             let (sample_rows, real_rows) = match &tail_rows {
                 Some(rows) => {
                     self.shared_tail_enqueue(rows, real_rows)?;

@@ -15162,6 +15162,8 @@ impl GpuEngine {
             let _ = self.be.stream_synchronize(&self.stream);
             return Err(error);
         }
+        self.buckets
+            .record(crate::obs::bucket::Family::Prefill, total, tc, None);
         if synchronize {
             if let Err(e) = self.be.stream_synchronize(&self.stream) {
                 tracing::warn!(

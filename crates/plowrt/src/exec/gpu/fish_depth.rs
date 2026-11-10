@@ -576,7 +576,9 @@ impl GpuEngine {
         let rungs = self.effective_decode_rungs();
         buckets.declare(Family::Decode, rungs.iter().map(|&w| w as usize));
         if self.spec.is_some() {
-            buckets.declare(Family::Verify, rungs.iter().map(|&w| w as usize));
+            let most = self.spec_max_rows();
+            let verify = rungs.iter().map(|&w| w as usize).filter(|&w| w <= most);
+            buckets.declare(Family::Verify, verify);
         }
         buckets.declare(Family::Prefill, self.prefill.iter().map(|b| b.t as usize));
         if let Some(d) = &self.fish {

@@ -1577,7 +1577,7 @@ impl Bound {
             crate::obs::bucket::Family::Codec,
             jobs.len(),
             cb,
-            Some((t2 - t1).as_micros() as u64),
+            Some(gpu_us as u64),
         );
         io.pcm_buf.resize(cb * cn * fs, 0.0);
         rt.read_tensor_at(
