@@ -72,7 +72,7 @@ def conv_tr_bind(cfg, c, inp, out):
     grid = (triton.cdiv(m, cfg["bm"]), triton.cdiv(c["cout"], cfg["bn"]))
     return lambda: tb.tconv[grid](inp["x"], inp["wt"], inp["bias"], inp["apre"], inp["apost"], out, m, c["T"], c["T"],
                                   c["cin"], c["cout"], kk, c["dil"], c["dil"] * (c["k"] - 1), bool(c.get("pre")),
-                                  bool(c.get("post")), cfg["bm"], cfg["bn"], cfg["bk"],
+                                  bool(c.get("post")), cfg["bm"], cfg["bn"], cfg["bk"], cfg["prec"],
                                   num_warps=cfg["warps"], num_stages=cfg["stages"])
 
 
