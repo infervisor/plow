@@ -10,7 +10,7 @@ lease, then the scorer. `score` (also `nv_block_ab.py score <dir>`, CPU) refuses
 binary or device do not pair up, and per point prints the HARD RULE table (block time = treatment
 mean, roofline floor of the treatment packet, % of floor, delta vs current = control mean) with an
 A/B verdict: PASS (faster) / REGRESSION only when |delta| exceeds max(control drift, treatment
-spread) and the treatment spread is at most 3x the control drift (agent-tools.md §7); otherwise
+spread) and the treatment spread is at most 3x the control drift (agent-tools.md "A/B rule"); otherwise
 NOISE, or UNCONVICTABLE when the spread rule fails.
 """
 import argparse

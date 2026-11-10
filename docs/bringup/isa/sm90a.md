@@ -337,15 +337,15 @@ sm90_wg_commit(); sm90_wg_wait<0>();
 
 **Builds and reproducibility**
 * `interp_sm90a.cubin` is not byte/SASS-reproducible for some configs. Prove "no-op for other
-  packets" with resource usage, a re-gate and step_bench digests [measured in plow: docs/bringup/agent-tools.md §9].
+  packets" with resource usage, a re-gate and step_bench digests [measured in plow: docs/bringup/agent-tools.md "Standing rules"].
 * `PLOW_EXTRA_DEFINES` in the env is ignored by emits; variants must be manifest tuning keys.
   `campaign.py build` never rebuilds plowc. A killed build leaves `make`/`ptxas` writing
-  stale-hash cubins, so use a fresh out dir [measured in plow: docs/bringup/agent-tools.md §9].
+  stale-hash cubins, so use a fresh out dir [measured in plow: docs/bringup/agent-tools.md "Standing rules"].
 * One `interp_sm90a` nvcc takes 22-38 GB RAM, so never compile beside a serving grid
-  [measured in plow: docs/bringup/agent-tools.md §9].
+  [measured in plow: docs/bringup/agent-tools.md "Standing rules"].
 * Build, emit and test inside `nix develop`; `nvcc_cubin.sh` runs nvcc under `env -i` itself. Only
   standalone CUDA-runtime probes are compiled in the plain shell: built in nix they abort at runtime
-  init ("stack smashing detected") [measured in plow: docs/bringup/agent-tools.md §9].
+  init ("stack smashing detected") [measured in plow: docs/bringup/agent-tools.md "Standing rules"].
 * Role objects are hash-pinned to the packet, and the live copy is in `assets/`. A cubin swap in an
   objects dir is silent and inert. A/B a role by re-emitting, with a positive control
   [measured in plow: 9d89adfad].
@@ -353,9 +353,9 @@ sm90_wg_commit(); sm90_wg_wait<0>();
 **Memory / KV / TMA**
 * Under live KV only rows `[0, kv_len)` are mapped (4096-row commits). Never load past `kv_len`,
   masked or not. Run `scripts/bench/step_boundary.sh` (ctx 4094/4095/4096/8191/8192) on any new
-  KV-reading arm [measured in plow: docs/bringup/agent-tools.md §9].
+  KV-reading arm [measured in plow: docs/bringup/agent-tools.md "Standing rules"].
 * The FA4 SM90 producer reads up to `n + splits - 2` page-table entries (and entry -1). Pad the
-  table and verify with a poison table [measured in plow: docs/bringup/agent-tools.md §9].
+  table and verify with a poison table [measured in plow: docs/bringup/agent-tools.md "Standing rules"].
 * TMA for 1-D weight streaming was the slowest of 37 configs; `cp.async.cg` won (measured on
   sm_120a) [measured in plow: experiments/README.md `gemv_transport.cu`]. This covers plain GEMV
   streams only; the swap-AB fp8 block decode object uses TMA + a producer warp.
@@ -378,9 +378,9 @@ sm90_wg_commit(); sm90_wg_wait<0>();
 **Vendor library routes (cuBLASLt, FA4, DeepGEMM)**
 * cuBLASLt algorithm choice is timing-based and re-rolls per server start, so c1 numerics change
   between starts. Pin with `<assets>/cublaslt_algos.jsonl` (`campaign.py probe`) and diff the
-  `algorithm selected` lines before blaming a build [measured in plow: docs/bringup/agent-tools.md §9].
+  `algorithm selected` lines before blaming a build [measured in plow: docs/bringup/agent-tools.md "Standing rules"].
 * G26 / grouped-Lt packets require cuBLASLt >= 13.4. The lab loader's `.so.13` is 13.1, so ship
-  `lib/libcublasLt.so.13` [measured in plow: docs/bringup/agent-tools.md §9].
+  `lib/libcublasLt.so.13` [measured in plow: docs/bringup/agent-tools.md "Standing rules"].
 * FP8 Lt fast accumulation (`PLOW_LT_FP8_FAST_ACCUM_MAX_K`): 12B pf4k 118.5 → 109.4 ms
   [measured in plow: 5b8f11da8].
 * The Qwen3.8 FP8 canonical recipe (status "emits", **not production**: it loses the prod mix to

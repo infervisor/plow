@@ -883,7 +883,7 @@ def store_cell(r: dict) -> str:
 
 def lean_qualify(assets: Path, report: Path, strict: bool) -> bool:
     """`plowc qualify` over a bundle's packets (receipts, approved verifier, replay, media
-    geometry; docs/bringup/lean-correctness-inventory.md §9-10), written to `report`. Recorded,
+    geometry; docs/bringup/03-lean-verify.md "Qualification"), written to `report`. Recorded,
     not fatal, unless `strict`; a missing plowc or verifier is recorded as not checked."""
     plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
     if not plowc.exists():
@@ -1722,7 +1722,7 @@ def cmd_rung_sweep(a: argparse.Namespace) -> None:
 #                     stay within vLLM's distance to FP32. `reference` (ref.json), then `vllm_capture` (cached)
 #                     or `vllm_hf` [+ `vllm_args`, `vllm_python`] to capture vLLM in the same lease:
 #                     kl_ratio_max, kl_slack_max, kl_trim_frac, kl_over_at, kl_over_slack, top1_drop_max,
-#                     cont_drop_max, needle_drop_max, needle_min, tie_margin (docs/bringup/agent-tools.md §5).
+#                     cont_drop_max, needle_drop_max, needle_min, tie_margin (docs/bringup/agent-tools.md "Gates").
 #                     `concurrency` = 1 or a list such as [1, 8, 32]: every concurrency is captured
 #                     (plow-c<N>.json) and must pass against the peer at the same concurrency —
 #                     `vllm_capture` is then a table { c1 = "...", c8 = "...", c32 = "..." } (a string

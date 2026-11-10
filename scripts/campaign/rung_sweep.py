@@ -8,7 +8,7 @@ the compact-terminal logits of the same launches; `score` picks the per-rung win
 recipe snippet. Stdlib only.
 
 Timing metric: host wall ms of one packed prefill launch at exactly the rung's rows (compact
-terminal included), rep 0 (graph capture) dropped, median per block. Scored like agent-tools §7:
+terminal included), rep 0 (graph capture) dropped, median per block. Scored like agent-tools "A/B rule":
 saving against max(control drift, treatment spread); spread > 3x drift is not convictable.
 """
 from __future__ import annotations
@@ -254,7 +254,7 @@ def resources(assets: Path, cuobjdump: str) -> dict[str, dict]:
 
 
 def noise_rule(ctl: list[float], trt: list[float]) -> dict:
-    """agent-tools §7 over every block median: saving against max(control drift, treatment
+    """agent-tools "A/B rule" over every block median: saving against max(control drift, treatment
     spread); spread > 3x drift is not convictable."""
     c, t = statistics.fmean(ctl), statistics.fmean(trt)
     drift = max(ctl) - min(ctl)
