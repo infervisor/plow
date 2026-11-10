@@ -8180,6 +8180,7 @@ impl GpuEngine {
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
         engine.fish = fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
+        engine.depth_calibrate()?;
         engine.speech_identities = prefix::SpeechIdentities::new(engine.token_input_vocab());
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;

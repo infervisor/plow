@@ -26,7 +26,7 @@ pub const PACKET: &str = "depth.pkt";
 pub const DRIVER: &str = "maya2.depth.v1";
 pub const PIPELINE: &str = "maya2.depth";
 /// Streams per launch.
-pub const CAPACITIES: &[u32] = &[1, 2, 4, 8, 16, 32, 64];
+pub const CAPACITIES: &[u32] = &[1, 2, 4, 8, 16, 32, 64, 128];
 
 pub(crate) struct Geo {
     hidden_in: u32,
@@ -168,13 +168,9 @@ pub fn lower_maya2_depth(
     Ok((prefix.model, section))
 }
 
-/// Projections over at most this many rows stream their weights through `GemvF32Out` (f32 x, f16 W);
-/// the tiled Conv1dF32 wastes most of its tile on fewer rows (132 us per 6 MB projection at B=1).
-const GEMV_ROWS: u32 = 256;
 /// The GEMV's LayerNorm prologue normalises a staged row of at most this many columns.
 const GEMV_LN_K: u32 = 1024;
-/// Projections over at least this many rows run on tensor cores (`GemvF32Out` bit 10: f16 x, W
-/// streamed once per 64 rows); the f32-x GEMV re-streams W every 8 rows.
+/// Minimum rows for f16 tensor-core products (`GemvF32Out` bit 10).
 const MMA_ROWS: u32 = 1;
 
 /// What a projection adds after the matmul: `act(acc + bias + residual)`.
@@ -312,8 +308,7 @@ impl Chain {
         )
     }
 
-    /// `act(x @ w^T + bias + residual)`: GEMV-shaped (weight streaming) up to [`GEMV_ROWS`] rows,
-    /// the tiled conv above.
+    /// `act(x @ w^T + bias + residual)` with f16 weights and batched tensor-core projections.
     #[allow(clippy::too_many_arguments)]
     fn dense_ep(
         &mut self,
@@ -326,11 +321,12 @@ impl Chain {
         mut ep: Epilogue<'_>,
     ) -> Result<u32, String> {
         let mut x = x;
-        if self.views
-            || ep.x_bf16
-            || ep.bias_group > 0
-            || (rows <= GEMV_ROWS && (ep.ln.is_none() || k <= GEMV_LN_K))
-        {
+        if rows >= 16 && !self.views && !ep.x_bf16 {
+            if let Some((name, eps)) = ep.ln.take() {
+                x = self.layer_norm(x, "act.depth.h1", rows, k, name, eps)?;
+            }
+        }
+        if self.views || ep.x_bf16 || ep.bias_group > 0 || ep.ln.is_none() || k <= GEMV_LN_K {
             let deps = self.deps();
             let o = p_handle(&self.p, out);
             let wh = self.p.declare(w, u64::from(n) * u64::from(k) * 2);
@@ -1077,6 +1073,24 @@ fn declare_io(b: &mut packet::devbuild::Builder, geo: &Geo, bmax: u32) {
 
 /// DepthV2 as an LM packet's depth stage: one program per decode rung (row `r` = slot `r`), appended
 /// to `m`'s tensors, as the `fish_depth` sections of [`plow_asset::fish_depth::Sampler::Maya2`].
+/// The decode rungs plus the `PLOW_DEPTH_ROWS` capacities below the widest rung (unset: the rungs).
+fn depth_capacities(rungs: &[u32], extra: Option<&str>) -> Vec<u32> {
+    let Some(extra) = extra else {
+        return rungs.to_vec();
+    };
+    let bmax = rungs.iter().copied().max().unwrap_or(0);
+    let mut caps = rungs.to_vec();
+    for v in extra.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        let v: u32 = v.parse().unwrap_or_else(|_| panic!("PLOW_DEPTH_ROWS: {v}"));
+        if v > 0 && v < bmax {
+            caps.push(v);
+        }
+    }
+    caps.sort_unstable();
+    caps.dedup();
+    caps
+}
+
 pub(crate) fn lm_sections(
     m: &mut packet::devbuild::Model,
     c: &crate::config::Cfg,
@@ -1131,6 +1145,8 @@ pub(crate) fn lm_sections(
         hidden_rows,
         codes,
     };
+    let caps = depth_capacities(rungs, crate::emit_config::active().depth_rows.as_deref());
+    let rungs = caps.as_slice();
     for &rows in rungs {
         prefix =
             program_for(prefix, &geo, rows, &io).unwrap_or_else(|e| panic!("maya2 depth: {e}"));
@@ -1180,4 +1196,69 @@ pub(crate) fn lm_sections(
         crate::fish_depth::manifest_sections(&man, rungs.len(), m.tensors.len(), bytes),
         crate::manifest::SpeechMasks::of(&prefix.model),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batched_projections_use_f16_at_large_prefixes() {
+        for rows in [1, 8, 16, 32, 257, 3328] {
+            let mut b = packet::devbuild::Builder::new(132);
+            let x = b.tensor("x", u64::from(rows) * 1024 * 4);
+            let out = b.tensor("out", u64::from(rows) * 3072 * 4);
+            let prefix = PacketPrefix {
+                model: packet::devbuild::Model {
+                    n_cu: 132,
+                    target: 0,
+                    tensors: b.tensors(),
+                    progs: Vec::new(),
+                    kv_row_insts: Vec::new(),
+                    prog_t: Vec::new(),
+                    gen: Vec::new(),
+                },
+                programs: Vec::new(),
+                input: x,
+                output: out,
+                input_shape: vec![u64::from(rows), 1024],
+            };
+            let mut chain = Chain {
+                p: prefix.program(),
+                last: None,
+                n_cu: 132,
+                w: "w.depth",
+                views: false,
+            };
+            chain
+                .dense_ep(
+                    x,
+                    "out",
+                    rows,
+                    1024,
+                    3072,
+                    "w",
+                    Epilogue {
+                        ln: Some(("ln", 1e-5)),
+                        ..Epilogue::NONE
+                    },
+                )
+                .unwrap();
+            let prefix = chain.p.finish(rows);
+            let ops = &prefix.model.progs[0].insts;
+            let projection = ops.last().unwrap();
+            assert_eq!(projection.op, DevOp::GemvF32Out as u16);
+            assert_eq!(projection.i[..3], [rows, 3072, 1024]);
+            assert_ne!(projection.i[7] & 1024, 0);
+            if rows >= 16 {
+                assert_eq!(ops.len(), 2);
+                assert_eq!(ops[0].op, DevOp::LayerNormF32 as u16);
+                assert_eq!(projection.t[1], ops[0].t[0]);
+                assert_eq!(projection.i[7] & 256, 0);
+            } else {
+                assert_eq!(ops.len(), 1);
+                assert_ne!(projection.i[7] & 256, 0);
+            }
+        }
+    }
 }

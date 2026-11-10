@@ -247,10 +247,27 @@ pub struct RuntimeConfig {
     #[arg(long = "tts-chunk-ramp", env = "PLOW_TTS_CHUNK_RAMP", value_parser = clap::builder::BoolishValueParser::new(), global = true)]
     pub tts_chunk_ramp: Option<bool>,
 
+    /// Stateful codec streams step early when the audio ahead of playback is under two frame
+    /// periods, instead of waiting for as many new frames as were already emitted (`false`: the
+    /// doubling steps only; A/B).
+    #[arg(long = "tts-stream-deadline", env = "PLOW_TTS_STREAM_DEADLINE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_stream_deadline: bool,
+
     /// Depth-stage packets may take the packed prefill pass (`false`: every depth prompt prefills
     /// serially; A/B and operational escape hatch).
     #[arg(long = "tts-depth-pack", env = "PLOW_TTS_DEPTH_PACK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tts_depth_pack: bool,
+
+    /// Staged depth programs: `auto` plans each frame's launches over the row capacities the
+    /// packet declares, by measured launch cost; `cover` runs the single smallest program covering
+    /// the highest live row; a capacity list (`16,4`) plans over those capacities only (debugging).
+    #[arg(
+        long = "tts-depth-plan",
+        env = "PLOW_TTS_DEPTH_PLAN",
+        default_value = "auto",
+        global = true
+    )]
+    pub tts_depth_plan: String,
 
     /// Apply a speech packet's declared leading-silence trim to streamed replies
     /// (`stream.onset_trim_*`); `false` streams every sample (first-byte latency runs).

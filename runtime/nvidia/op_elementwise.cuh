@@ -926,6 +926,10 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
     }
 }
 
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+#include "op_gemv_f16_sm90.cuh"
+#endif
+
 static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W, const float* bias,
                                           const float* res, const float* gamma, const float* beta, float eps,
                                           unsigned flags, unsigned bgroup, unsigned M, unsigned N, unsigned K,
@@ -941,6 +945,19 @@ static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W
     res = (flags & 8u) ? res : nullptr;
     if ((flags & 3u) == 3u && (flags & 1024u)) {
         if (K % 64u) { __trap(); return; }
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+        if (M >= 16u && N % 64u == 0u && K >= 192u && K <= 4096u &&
+            ((((size_t)x) | ((size_t)W) | (gamma ? ((size_t)gamma | (size_t)beta) : 0u)) & 15u) == 0u) {
+            if ((size_t)((M + 63u) / 64u) * (N / 64u) >= 96u && (!(flags & 256u) || K <= 1024u)) {
+                gemv_f16w_tiled<64>(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res,
+                                  (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
+            } else {
+                gemv_f16w_tiled<32>(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res,
+                                  (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
+            }
+            return;
+        }
+#endif
         gemv_f16w_mma(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res,
                       (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
         return;

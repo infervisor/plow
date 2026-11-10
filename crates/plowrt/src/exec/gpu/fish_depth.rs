@@ -43,6 +43,11 @@ pub(super) struct FishDepth<H = PinnedHost> {
     rows: usize,
     maya2: Option<Maya2>,
     compact: Option<CompactDepth<H>>,
+    plan: crate::sched::row_plan::RowPlan,
+    /// Control rows the stage holds (twice the widest program where plans pack rows: the last
+    /// window may run past the live rows).
+    stage_rows: usize,
+    packed_rows: Option<PackedRows>,
     source: Option<Arc<dyn Send + Sync>>,
     pool: Option<PacketBufferPool>,
     retain_output: bool,
@@ -186,6 +191,111 @@ impl CompactDepth {
             &mut args,
             Some(&e.stream),
         )
+    }
+}
+
+/// Live rows packed for the plan: row `i` is the `i`-th live slot. The per-slot tensors a program
+/// addresses by row (slot memory in, frame codes out) get packed twins, and each window start a
+/// tensor table over them (`[variant][start]`, variant 1 over the packed outputs' logits).
+struct PackedRows {
+    memory: Vec<DeviceMem>,
+    memory_row: u64,
+    codes: DeviceMem,
+    codes_row: u64,
+    tables: DeviceMem,
+    stride: u64,
+    rows: u64,
+    /// Slot of each packed row whose memory the twins hold, and the bind generation they hold.
+    slots: Vec<u32>,
+    held: u64,
+    generation: u64,
+    /// Scratch: live slots ascending, and each slot's packed row.
+    live: Vec<u32>,
+    rank: Vec<u32>,
+}
+
+impl PackedRows {
+    fn load(
+        e: &GpuEngine,
+        m: &Manifest,
+        rows: usize,
+        memory_row: u64,
+        logits: Option<u64>,
+    ) -> Result<Self> {
+        let codes_row = u64::from(m.codebooks) * 4;
+        let span = 2 * rows as u64;
+        let memory = m
+            .slot_memory
+            .iter()
+            .map(|_| e.be.alloc(0, span * memory_row))
+            .collect::<Result<Vec<_>>>()?;
+        let codes = e.be.alloc(0, span * codes_row)?;
+        for t in memory.iter().chain([&codes]) {
+            e.be.memset_d8_async(t.base, 0, t.len as usize, &e.stream)?;
+        }
+        e.be.stream_synchronize(&e.stream)?;
+        let base: Vec<u64> = e.devp.iter().map(|p| p.base).collect();
+        let mut all = Vec::with_capacity(2 * rows * base.len());
+        for variant in 0..2 {
+            for a in 0..rows as u64 {
+                let at = all.len();
+                all.extend_from_slice(&base);
+                for (&h, t) in m.slot_memory.iter().zip(&memory) {
+                    all[at + usize::from(h)] = t.base + a * memory_row;
+                }
+                all[at + usize::from(m.tensors.frame_codes)] = codes.base + a * codes_row;
+                if let (1, Some(logits)) = (variant, logits) {
+                    all[at + e.t_logits] = logits;
+                }
+            }
+        }
+        let tables = e.be.alloc(0, all.len() as u64 * 8)?;
+        e.be.upload(&tables, 0, super::pod_bytes(&all))?;
+        Ok(Self {
+            memory,
+            memory_row,
+            codes,
+            codes_row,
+            tables,
+            stride: base.len() as u64 * 8,
+            rows: rows as u64,
+            slots: Vec::with_capacity(rows),
+            held: u64::MAX,
+            generation: 0,
+            live: Vec::with_capacity(rows),
+            rank: vec![0; e.batch],
+        })
+    }
+
+    fn table(&self, packed_logits: bool, start: u32) -> u64 {
+        self.tables.base + (u64::from(packed_logits) * self.rows + u64::from(start)) * self.stride
+    }
+
+    /// Sort the frame's slots into `live` and `rank`; whether packed row `i` is slot `i` throughout.
+    fn rank(&mut self, slots: impl Iterator<Item = usize>) -> bool {
+        self.live.clear();
+        self.live.extend(slots.map(|s| s as u32));
+        self.live.sort_unstable();
+        for (i, &s) in self.live.iter().enumerate() {
+            self.rank[s as usize] = i as u32;
+        }
+        self.live
+            .last()
+            .is_some_and(|&s| s as usize + 1 == self.live.len())
+    }
+
+    /// Runs of live slots that sit `slot - row` apart: (packed row, slot, rows).
+    fn runs(live: &[u32]) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        let mut i = 0;
+        std::iter::from_fn(move || {
+            let first = i;
+            let s = *live.get(first)?;
+            i += 1;
+            while live.get(i) == Some(&(s + (i - first) as u32)) {
+                i += 1;
+            }
+            Some((first as u64, u64::from(s), (i - first) as u64))
+        })
     }
 }
 
@@ -500,8 +610,10 @@ impl FishDepth {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        // Maya 2 plans pack rows (unless `cover`): room for a last window past the live rows.
+        let stage_rows = if maya2 { 2 * rows } else { rows };
         let stage =
-            e.be.host_alloc_pinned(rows * STAGE_CONTROL_BYTES + e.batch * k * 4)?;
+            e.be.host_alloc_pinned(stage_rows * STAGE_CONTROL_BYTES + e.batch * k * 4)?;
         let maya2 = match (maya2, manifest.depth_sampling) {
             (true, Some([t, k])) => Some(Maya2 {
                 slots: vec![None; e.batch],
@@ -515,6 +627,30 @@ impl FishDepth {
             _ => None,
         };
         let compact = CompactDepth::load(e, &manifest)?;
+        let mode = crate::sched::row_plan::Mode::parse(
+            &crate::config::RuntimeConfig::process_get().tts_depth_plan,
+        )
+        .map_err(reject)?;
+        // Only the Maya 2 launch runs windows; the Fish launch keeps the covering program.
+        let mode = if maya2.is_some() {
+            mode
+        } else {
+            crate::sched::row_plan::Mode::Cover
+        };
+        let plan = crate::sched::row_plan::RowPlan::new(&manifest.rows, rows as u32, &mode);
+        let packed_rows = match &maya2 {
+            Some(m) if plan.dynamic() => Some(PackedRows::load(
+                e,
+                &manifest,
+                rows,
+                (m.null_memory.len() / manifest.slot_memory.len().max(1) * 4) as u64,
+                compact
+                    .as_ref()
+                    .and_then(|c| c.logits.as_ref())
+                    .map(|l| l.base),
+            )?),
+            _ => None,
+        };
         let h = manifest.tensors.frame_codes as usize;
         let mem = &e.devp[h];
         let contains = |base: u64, bytes: u64| {
@@ -560,6 +696,9 @@ impl FishDepth {
             rows,
             maya2,
             compact,
+            plan,
+            stage_rows,
+            packed_rows,
             source,
             pool,
             retain_output: false,
@@ -672,7 +811,34 @@ impl GpuEngine {
                 .upload(&self.devp[usize::from(h)], (slot * row.len()) as u64, row)?;
         }
         m.memory[slot] = memory.map_or(SpeakerMemory::Null, |m| SpeakerMemory::Voice(m.clone()));
+        if let Some(p) = d.packed_rows.as_mut() {
+            p.generation += 1;
+        }
         Ok(())
+    }
+
+    /// The depth plan's last windows (`rows@start`) and its measured costs (`rows:us`), for tools.
+    pub fn depth_plan_describe(&self) -> Option<String> {
+        let p = &self.fish.as_ref()?.plan;
+        let windows: Vec<String> = p
+            .windows()
+            .iter()
+            .map(|w| format!("{}@{}", p.capacity(w.program), w.start))
+            .collect();
+        let costs: Vec<String> = p
+            .candidates()
+            .map(|c| format!("{}:{:.0}", p.capacity(c), p.cost_us(c)))
+            .collect();
+        Some(format!(
+            "plan [{}] cost_us [{}]",
+            windows.join(" "),
+            costs.join(" ")
+        ))
+    }
+
+    /// The null speaker's depth memory (`[layers][hidden]`), Maya 2 packets.
+    pub fn maya2_null_memory(&self) -> Option<&[f32]> {
+        Some(self.fish.as_ref()?.maya2.as_ref()?.null_memory.as_slice())
     }
 
     pub(super) fn forget_depth_memory(&mut self) {
@@ -976,18 +1142,25 @@ impl GpuEngine {
     ) -> Result<()> {
         use crate::tts::maya2::Tick;
         let width = rows.iter().map(|r| r.slot + 1).max().unwrap_or(0);
-        let p = d
-            .programs
-            .iter()
-            .filter(|p| p.rows as usize >= width)
-            .min_by_key(|p| p.rows)
-            .ok_or_else(|| {
-                reject(format!(
-                    "no program covers slot {}",
-                    width.saturating_sub(1)
-                ))
-            })?;
-        let n = p.rows as usize;
+        if width > d.rows {
+            return Err(reject(format!("no program covers slot {}", width - 1)));
+        }
+        // Packed: row i is the i-th live slot, planned by the live count. Else row = slot.
+        let dense = match d.packed_rows.as_mut() {
+            Some(p) => p.rank(rows.iter().map(|r| r.slot)),
+            None => true,
+        };
+        let passes = match &d.packed_rows {
+            Some(_) => d.plan.plan(rows.len()).len(),
+            None => d.plan.single(width).len(),
+        };
+        let packed = d.packed_rows.is_some() && !(dense && passes == 1);
+        if passes == 0 {
+            return Err(reject(format!(
+                "no program covers slot {}",
+                width.saturating_sub(1)
+            )));
+        }
         let k = d.manifest.codebooks as usize;
         let vocab = self.vocab();
         let m = d.maya2.as_mut().unwrap();
@@ -1001,24 +1174,30 @@ impl GpuEngine {
         // SAFETY: the pinned buffer is read only after this call's synchronize.
         unsafe {
             self.be.memcpy_dtoh_async(
-                &mut m.logits.as_mut_slice()[..n * vocab * 2],
+                &mut m.logits.as_mut_slice()[..width * vocab * 2],
                 outputs.map_or(l.base, |o| o.logits),
                 &self.stream,
             )?;
         }
         self.be.stream_synchronize(&self.stream)?;
-        let logits: &[u16] = bytemuck::cast_slice(&m.logits.as_slice()[..n * vocab * 2]);
+        let logits: &[u16] = bytemuck::cast_slice(&m.logits.as_slice()[..width * vocab * 2]);
         let mut stops = Vec::with_capacity(rows.len());
-        let (seeds, params, ctl, hrow, cb0): (u64, usize, usize, usize, usize) =
-            (0, d.rows * 8, d.rows * 24, d.rows * 32, d.rows * 36);
-        let _ = seeds;
+        let sr = d.stage_rows;
+        let (params, ctl, hrow, cb0) = (sr * 8, sr * 24, sr * 32, sr * 36);
+        let row_of = |slot: usize| match (&d.packed_rows, packed) {
+            (Some(p), true) => p.rank[slot] as usize,
+            _ => slot,
+        };
         {
             let s = depth_stage(&mut d.stage)?;
-            for r in 0..n {
-                let last = m.slots[r].as_ref().map_or(0, |s| s.last);
+            for r in d.plan.windows().iter().flat_map(|w| {
+                let a = w.start as usize;
+                a..a + d.plan.capacity(w.program) as usize
+            }) {
                 s[ctl + r * 8..ctl + r * 8 + 8].fill(0);
-                s[hrow + r * 4..hrow + r * 4 + 4].copy_from_slice(&(r as u32).to_le_bytes());
-                s[cb0 + r * 4..cb0 + r * 4 + 4].copy_from_slice(&last.to_le_bytes());
+                s[hrow + r * 4..hrow + r * 4 + 4]
+                    .copy_from_slice(&((r % d.rows) as u32).to_le_bytes());
+                s[cb0 + r * 4..cb0 + r * 4 + 4].fill(0);
                 s[r * 8..r * 8 + 8].fill(0);
                 for (j, v) in [m.depth.0, 1.0, 1.0, 1.0].iter().enumerate() {
                     let at = params + r * 16 + j * 4;
@@ -1093,7 +1272,7 @@ impl GpuEngine {
             };
 
             for (row, (tick, code)) in rows.iter().zip(tick_code) {
-                let r = row.slot;
+                let r = row_of(row.slot);
                 stops.push(tick == Tick::Stop);
                 s[ctl + r * 8..ctl + r * 8 + 4].copy_from_slice(&m.depth.1.to_le_bytes());
                 s[ctl + r * 8 + 4..ctl + r * 8 + 8].copy_from_slice(&row.step.to_le_bytes());
@@ -1102,16 +1281,108 @@ impl GpuEngine {
                 s[r * 8..r * 8 + 8].copy_from_slice(&row.seed.to_le_bytes());
             }
         }
-        let t = d.manifest.tensors.clone();
+        let started = std::time::Instant::now();
+        if packed {
+            self.pack_slot_memory(d)?;
+        }
+        for i in 0..passes {
+            self.maya2_pass(d, d.plan.windows()[i], outputs, packed)?;
+        }
+        if let (Some(p), true) = (&d.packed_rows, packed) {
+            let codes = self.devp[usize::from(d.manifest.tensors.frame_codes)].base;
+            for (row, slot, n) in PackedRows::runs(&p.live) {
+                self.be.memcpy_dtod_async(
+                    codes + slot * p.codes_row,
+                    p.codes.base + row * p.codes_row,
+                    n * p.codes_row,
+                    &self.stream,
+                )?;
+            }
+        }
+        let codes_at = d.stage_rows * STAGE_CONTROL_BYTES;
+        let end = if packed {
+            width
+        } else {
+            d.plan.capacity(d.plan.windows()[0].program) as usize
+        };
+        self.depth_read_codes(d, codes_at, end * k * 4)?;
+        let us = started.elapsed().as_secs_f32() * 1e6;
+        if passes == 1 {
+            let program = d.plan.windows()[0].program;
+            d.plan.observe(program, us);
+        }
+        {
+            use crate::obs::bucket::Family::Depth;
+            self.buckets.record_demand(Depth, rows.len());
+            for w in d.plan.windows() {
+                let cap = d.plan.capacity(w.program) as usize;
+                let live = rows.len().saturating_sub(w.start as usize).min(cap);
+                self.buckets
+                    .record_launch(Depth, cap, live, (passes == 1).then_some(us as u64));
+            }
+        }
+        let m = d.maya2.as_mut().unwrap();
+        let codes: &[u32] =
+            bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + end * k * 4]);
+        for (row, &stop) in rows.iter().zip(&stops) {
+            let slot = m.slots[row.slot].as_mut().unwrap();
+            if stop {
+                out.push(d.manifest.stop_class);
+                out.extend(std::iter::repeat_n(0, k - 1));
+            } else {
+                let c = &codes[row.slot * k..row.slot * k + k];
+                slot.emitted(c[0]);
+                out.extend_from_slice(c);
+            }
+        }
+        Ok(())
+    }
+
+    /// The packed twins of the slot memory, refreshed when the live slots or a bind changed.
+    fn pack_slot_memory(&self, d: &mut FishDepth) -> Result<()> {
+        let p = d.packed_rows.as_mut().unwrap();
+        if p.held == p.generation && p.slots == p.live {
+            return Ok(());
+        }
+        for (&h, twin) in d.manifest.slot_memory.iter().zip(&p.memory) {
+            let memory = self.devp[usize::from(h)].base;
+            for (row, slot, n) in PackedRows::runs(&p.live) {
+                self.be.memcpy_dtod_async(
+                    twin.base + row * p.memory_row,
+                    memory + slot * p.memory_row,
+                    n * p.memory_row,
+                    &self.stream,
+                )?;
+            }
+        }
+        p.slots.clone_from(&p.live);
+        p.held = p.generation;
+        Ok(())
+    }
+
+    /// Upload one window's staged controls and launch its program; a packed window runs over the
+    /// table of the packed twins at its start row.
+    fn maya2_pass(
+        &self,
+        d: &FishDepth,
+        w: crate::sched::row_plan::Window,
+        outputs: Option<DepthOutputs>,
+        packed: bool,
+    ) -> Result<()> {
+        let p = &d.programs[usize::from(w.program)];
+        let (a, n) = (w.start as usize, p.rows as usize);
+        let sr = d.stage_rows;
+        let (params, ctl, hrow, cb0) = (sr * 8, sr * 24, sr * 32, sr * 36);
+        let t = &d.manifest.tensors;
         let bytes = d.stage.as_slice();
         for (h, at, len) in [
-            (t.seed, 0, n * 8),
-            (t.params, params, n * 16),
-            (t.top_k, ctl, n * 8),
-            (t.hidden_row, hrow, n * 4),
-            (t.history, cb0, n * 4),
+            (t.seed, a * 8, n * 8),
+            (t.params, params + a * 16, n * 16),
+            (t.top_k, ctl + a * 8, n * 8),
+            (t.hidden_row, hrow + a * 4, n * 4),
+            (t.history, cb0 + a * 4, n * 4),
         ] {
-            // SAFETY: the pinned stage is rewritten only after this call's synchronize.
+            // SAFETY: the pinned stage is rewritten only after the launch's synchronize.
             unsafe {
                 self.be.memcpy_htod_async(
                     self.devp[usize::from(h)].base,
@@ -1126,34 +1397,85 @@ impl GpuEngine {
         if let Some(outputs) = outputs {
             arg.tensors = outputs.tensors;
         }
+        if packed {
+            arg.tensors = d
+                .packed_rows
+                .as_ref()
+                .ok_or_else(|| reject("packed depth window without its tables"))?
+                .table(outputs.is_some(), w.start);
+        }
         let mut args = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+        let speech = &d.maya2.as_ref().unwrap().speech;
         self.be.launch_cooperative(
-            m.speech.f,
+            speech.f,
             self.grid,
             BLOCK,
-            m.speech.smem,
+            speech.smem,
             &mut args,
             Some(&self.stream),
-        )?;
-        let codes_at = d.rows * STAGE_CONTROL_BYTES;
-        self.buckets
-            .record(crate::obs::bucket::Family::Depth, width, n, None);
-        self.depth_read_codes(d, codes_at, n * k * 4)?;
-        let m = d.maya2.as_mut().unwrap();
-        let codes: &[u32] =
-            bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + n * k * 4]);
-        for (row, &stop) in rows.iter().zip(&stops) {
-            let slot = m.slots[row.slot].as_mut().unwrap();
-            if stop {
-                out.push(d.manifest.stop_class);
-                out.extend(std::iter::repeat_n(0, k - 1));
-            } else {
-                let c = &codes[row.slot * k..row.slot * k + k];
-                slot.emitted(c[0]);
-                out.extend_from_slice(c);
+        )
+    }
+
+    /// Measure every program the plan may pick, once, on idle rows (zeroed hidden and slot memory,
+    /// the padded rows' controls): the plan's costs before any frame has run.
+    pub(super) fn depth_calibrate(&mut self) -> Result<()> {
+        let Some(mut d) = self.fish.take() else {
+            return Ok(());
+        };
+        let r: Result<()> = (|| {
+            let Some(m) = d.maya2.as_ref().filter(|_| d.plan.dynamic()) else {
+                return Ok(());
+            };
+            let hidden = d.manifest.packed.as_ref().map(|p| usize::from(p.hidden));
+            for h in d
+                .manifest
+                .slot_memory
+                .iter()
+                .map(|&h| usize::from(h))
+                .chain(hidden)
+            {
+                let t = &self.devp[h];
+                self.be
+                    .memset_d8_async(t.base, 0, t.len as usize, &self.stream)?;
             }
-        }
-        Ok(())
+            let depth = m.depth.0;
+            {
+                let s = depth_stage(&mut d.stage)?;
+                let n = d.stage_rows;
+                s[..n * STAGE_CONTROL_BYTES].fill(0);
+                for r in 0..n {
+                    let (params, hrow) = (n * 8 + r * 16, n * 32 + r * 4);
+                    for (j, v) in [depth, 1.0, 1.0, 1.0].iter().enumerate() {
+                        s[params + j * 4..params + j * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    s[hrow..hrow + 4].copy_from_slice(&((r % d.rows) as u32).to_le_bytes());
+                }
+            }
+            let started = std::time::Instant::now();
+            let mut warm = true;
+            for program in d.plan.candidates().collect::<Vec<_>>() {
+                let w = crate::sched::row_plan::Window { program, start: 0 };
+                for _ in 0..1 + usize::from(std::mem::take(&mut warm)) {
+                    self.be.stream_synchronize(&self.stream)?;
+                    let t = std::time::Instant::now();
+                    self.maya2_pass(&d, w, None, false)?;
+                    self.be.stream_synchronize(&self.stream)?;
+                    d.plan.observe(program, t.elapsed().as_secs_f32() * 1e6);
+                }
+                tracing::debug!(
+                    rows = d.plan.capacity(program),
+                    us = d.plan.cost_us(program),
+                    "depth program cost"
+                );
+            }
+            tracing::info!(
+                ms = started.elapsed().as_millis() as u64,
+                "depth plan costs measured"
+            );
+            Ok(())
+        })();
+        self.fish = Some(d);
+        r
     }
 
     /// Whether a depth stage is loaded.
@@ -1242,7 +1564,7 @@ impl GpuEngine {
     fn fish_seed_slots_inner(&mut self, seeds: &[(usize, &[u32])]) -> Result<()> {
         let d = self.fish.as_mut().ok_or_else(|| reject("not enabled"))?;
         let k = d.manifest.codebooks as usize;
-        let at = d.rows * STAGE_CONTROL_BYTES;
+        let at = d.stage_rows * STAGE_CONTROL_BYTES;
         let stage = depth_stage(&mut d.stage)?
             .get_mut(at..)
             .ok_or_else(|| reject("seed staging missing"))?;
@@ -1317,6 +1639,13 @@ mod tests {
             stage,
             rows: 1,
             maya2: None,
+            plan: crate::sched::row_plan::RowPlan::new(
+                &[],
+                0,
+                &crate::sched::row_plan::Mode::Cover,
+            ),
+            stage_rows: 1,
+            packed_rows: None,
             compact: Some(CompactDepth {
                 remap: Loaded {
                     rows: 1,

@@ -2348,10 +2348,34 @@ fn next_window_chunk(n: usize, lookahead: usize, chunk: usize, ramp: bool) -> us
 
 /// New frames the next stateful codec step of a stream holding `n` complete frames, `emitted`
 /// of them sent, decodes: every committed frame up to `cap`; a segment's first step waits for
-/// `first` frames until the segment is done.
-fn step_plan(n: usize, emitted: usize, done: bool, first: usize, cap: usize) -> Option<usize> {
+/// `first` frames until the segment is done. `urgent`: playback runs dry before another frame
+/// and its step can arrive, so a started stream steps with what it has.
+fn step_plan(
+    n: usize,
+    emitted: usize,
+    done: bool,
+    first: usize,
+    cap: usize,
+    urgent: bool,
+) -> Option<usize> {
     let new = n.saturating_sub(emitted);
-    (new > 0 && (done || new >= step_need(emitted, first, cap))).then(|| new.min(cap))
+    let ready = done || (urgent && emitted > 0) || new >= step_need(emitted, first, cap);
+    (new > 0 && ready).then(|| new.min(cap))
+}
+
+/// Whether a playing stream cannot wait for one more frame: the audio it holds ahead of playback
+/// (`due` = when the sent audio has played out) is under two measured frame periods, one for the
+/// frame and one for its codec step. Waiting for as many frames as were emitted only holds while
+/// frames come at least twice as fast as they play.
+fn step_urgent(due: Option<Instant>, first_frame_at: Option<Instant>, n: usize) -> bool {
+    let (Some(due), Some(t0)) = (due, first_frame_at) else {
+        return false;
+    };
+    if n < 2 {
+        return false;
+    }
+    let per_frame = t0.elapsed().as_secs_f64() / (n - 1) as f64;
+    due.saturating_duration_since(Instant::now()).as_secs_f64() < 2.0 * per_frame
 }
 
 /// New frames [`step_plan`]'s next step waits for (short of the segment's end).
@@ -2573,12 +2597,15 @@ async fn stream_task(
     // Dropping the rest of the current attempt (cut short).
     let mut skipping = false;
     let mut first_frame_at: Option<Instant> = None;
+    // First-audio trace (`plow::tts::first_audio` at debug): codec steps until audible, the last one's time.
+    let (mut first_steps, mut first_step_ms) = (0u32, 0.0f64);
     // A stateful codec decodes each new frame once on this stream's slot; without a free slot
     // the stream decodes windows.
     let mut slot = initial_slot;
     let mut primed = false;
     let mut windowed = model.codec.step_frames == 0;
     let first_frames = model.contract.first_frames();
+    let stream_deadline = crate::config::RuntimeConfig::get().tts_stream_deadline;
     loop {
         let mut done = false;
         let msg = frx.recv().await;
@@ -2745,8 +2772,15 @@ async fn stream_task(
             let due = playing.map(|t| t + std::time::Duration::from_secs_f64(sent as f64 / sr));
             // (PCM, its first fresh frame, frames emitted after it, frames decoded)
             let decoded = if let Some(slot) = slot.as_mut() {
-                let Some(k) = step_plan(n, emitted, done, first_frames, model.codec.step_frames)
-                else {
+                let urgent = stream_deadline && step_urgent(due, first_frame_at, n);
+                let Some(k) = step_plan(
+                    n,
+                    emitted,
+                    done,
+                    first_frames,
+                    model.codec.step_frames,
+                    urgent,
+                ) else {
                     break;
                 };
                 let codes = frames.slice(emitted * fc..(emitted + k) * fc, fc);
@@ -2756,7 +2790,12 @@ async fn stream_task(
                     }
                     Instant::now()
                 });
+                let t_step = first.is_none().then(Instant::now);
                 let r = model.codec.step_codes(slot, codes, k, urgency, due).await;
+                if let Some(t) = t_step {
+                    first_step_ms = t.elapsed().as_secs_f64() * 1e3;
+                    first_steps += 1;
+                }
                 if let Some(t) = t_codec {
                     crate::obs::ttft::SPEECH_CODEC.add(t.elapsed().as_nanos() as u64);
                 }
@@ -2824,6 +2863,16 @@ async fn stream_task(
                             }
                             ticket.first_audio();
                             crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, 0);
+                            tracing::debug!(
+                                target: "plow::tts::first_audio",
+                                audio_ms = t_arrive.elapsed().as_secs_f64() * 1e3,
+                                frame_ms = first_frame_at
+                                    .map(|t| t.duration_since(t_arrive).as_secs_f64() * 1e3),
+                                frames = n,
+                                steps = first_steps,
+                                last_step_ms = first_step_ms,
+                                "first audio"
+                            );
                         }
                         first.get_or_insert_with(|| t_arrive.elapsed());
                         playing.get_or_insert_with(Instant::now);
@@ -3110,21 +3159,25 @@ mod tests {
     #[test]
     fn step_plan_covers_each_frame_once() {
         const CAP: usize = 17;
-        assert_eq!(step_plan(3, 0, false, 4, CAP), None);
-        assert_eq!(step_plan(3, 0, true, 4, CAP), Some(3));
-        assert_eq!(step_plan(4, 0, false, 4, CAP), Some(4));
-        assert_eq!(step_plan(5, 4, false, 4, CAP), None);
-        assert_eq!(step_plan(8, 4, false, 4, CAP), Some(4));
-        assert_eq!(step_plan(30, 21, false, 4, CAP), None);
-        assert_eq!(step_plan(38, 21, false, 4, CAP), Some(CAP));
-        assert_eq!(step_plan(40, 4, false, 4, CAP), Some(CAP));
-        assert_eq!(step_plan(4, 4, true, 4, CAP), None);
+        assert_eq!(step_plan(3, 0, false, 4, CAP, false), None);
+        assert_eq!(step_plan(3, 0, true, 4, CAP, false), Some(3));
+        assert_eq!(step_plan(4, 0, false, 4, CAP, false), Some(4));
+        assert_eq!(step_plan(5, 4, false, 4, CAP, false), None);
+        assert_eq!(step_plan(8, 4, false, 4, CAP, false), Some(4));
+        assert_eq!(step_plan(30, 21, false, 4, CAP, false), None);
+        assert_eq!(step_plan(38, 21, false, 4, CAP, false), Some(CAP));
+        assert_eq!(step_plan(40, 4, false, 4, CAP, false), Some(CAP));
+        assert_eq!(step_plan(4, 4, true, 4, CAP, false), None);
+        // Urgent: a started stream steps with what it has; the first step still waits.
+        assert_eq!(step_plan(30, 21, false, 4, CAP, true), Some(9));
+        assert_eq!(step_plan(21, 21, false, 4, CAP, true), None);
+        assert_eq!(step_plan(3, 0, false, 4, CAP, true), None);
         for total in 1..60 {
             for arrive in 1..20 {
                 let (mut emitted, mut seen, mut n) = (0, Vec::new(), 0);
                 while n < total || emitted < total {
                     n = (n + arrive).min(total);
-                    while let Some(k) = step_plan(n, emitted, n == total, 4, CAP) {
+                    while let Some(k) = step_plan(n, emitted, n == total, 4, CAP, false) {
                         assert!(k <= CAP && (emitted > 0 || k >= 4.min(total)));
                         seen.extend(emitted..emitted + k);
                         emitted += k;

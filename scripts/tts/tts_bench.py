@@ -27,22 +27,26 @@ SESSION = None
 PROMPT_SET = None
 # A chunk this late past the end of the audio already received is an underrun (clock jitter).
 GAP_TOLERANCE_S = 0.001
+# A gap longer than this is a stall (the playback buffer stayed dry for more than 100 ms).
+STALL_S = 0.100
 
 
 def underruns(arrivals, sr):
     """Playback underruns of a stream: `arrivals` = [(seconds, pcm16 bytes)] in order. Playback
     starts at the first chunk; a chunk arriving after the audio received so far has played out is
-    a gap, and playback resumes at its arrival. Returns (gaps, total gap seconds)."""
-    gaps, gap_s, end = 0, 0.0, None
+    a gap, and playback resumes at its arrival. Returns (gaps, total gap seconds, stalls): stalls
+    are the gaps longer than STALL_S."""
+    gaps, gap_s, stalls, end = 0, 0.0, 0, None
     for t, nbytes in arrivals:
         dur = nbytes / 2 / sr
         if end is None:
             end = t + dur
         elif t > end + GAP_TOLERANCE_S:
+            stalls += t - end > STALL_S
             gaps, gap_s, end = gaps + 1, gap_s + (t - end), t + dur
         else:
             end += dur
-    return gaps, gap_s
+    return gaps, gap_s, stalls
 
 
 def one(url, model, voice, text, stream, seed, extra):
@@ -74,8 +78,9 @@ def one(url, model, voice, text, stream, seed, extra):
         chunks = []
     total = time.perf_counter() - t0
     pcm = b"".join(chunks)
-    gaps, gap_s = underruns(arrivals if chunks else [], SR)
-    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s)
+    gaps, gap_s, stalls = underruns(arrivals if chunks else [], SR)
+    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s, stalls=stalls,
+                t0=t0, chunks=[(round(t - t0, 4), n) for t, n in arrivals])
 
 
 def one_ws(url, model, voice, text, seed, extra):
@@ -110,8 +115,9 @@ def one_ws(url, model, voice, text, seed, extra):
         chunks = []
     total = time.perf_counter() - t0
     pcm = b"".join(chunks)
-    gaps, gap_s = underruns(arrivals if chunks else [], SR)
-    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s)
+    gaps, gap_s, stalls = underruns(arrivals if chunks else [], SR)
+    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s, stalls=stalls,
+                t0=t0, chunks=[(round(t - t0, 4), n) for t, n in arrivals])
 
 
 def pct(xs, q):
@@ -154,6 +160,7 @@ def main():
                     help="Seed-TTS-eval meta.lst (id|ref_text|ref_wav|text, wav paths relative to it): one request per line, "
                          "each cloned from its own reference; wavs are named <id>.wav (--n caps the lines)")
     ap.add_argument("--seed-offset", type=int, default=0, help="added to every request's seed (repeat runs)")
+    ap.add_argument("--ramp-s", type=float, default=0.0, help="stagger the lanes' first requests over this many seconds")
     ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
     args = ap.parse_args()
     global SESSION, PROMPT_SET, SR
@@ -195,7 +202,12 @@ def main():
         call_one(args.url, args.model, spk, text, args.stream or args.ws, 1000 + i, per(i))
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(args.conc) as ex:
-        res = list(ex.map(lambda j: call_one(args.url, args.model, j[0][0], j[0][1], args.stream or args.ws, j[1] + 1 + args.seed_offset, per(j[1])), jobs))
+        def run(j):
+            # --ramp-s: the lanes' first requests start spread over the ramp instead of all at once.
+            if args.ramp_s and j[1] < args.conc:
+                time.sleep(args.ramp_s * j[1] / args.conc)
+            return call_one(args.url, args.model, j[0][0], j[0][1], args.stream or args.ws, j[1] + 1 + args.seed_offset, per(j[1]))
+        res = list(ex.map(run, jobs))
     wall = time.perf_counter() - t0
     texts = {}
     rows = []
@@ -206,7 +218,9 @@ def main():
             sf.write(f"{args.out}/{name}", np.frombuffer(r["pcm"], dtype="<i2"), SR)
             texts[name] = dict(text=text, language=LANG_OF[text]) if args.prompt_set == "chatterbox-mtl" else text
         rows.append(dict(i=i, speaker=spk, ttfa_s=r["ttfa_s"], latency_s=r["latency_s"], audio_s=r["audio_s"],
-                         gaps=r["gaps"], gap_s=r["gap_s"],
+                         gaps=r["gaps"], gap_s=r["gap_s"], stalls=r.get("stalls", 0),
+                         # request start (client clock) and every chunk as (seconds after it, bytes)
+                         t0=r.get("t0"), chunks=r.get("chunks", []),
                          rtf=r["latency_s"] / r["audio_s"] if r["audio_s"] else None))
     ok = [r for r in rows if r["audio_s"] > 0]
     if not ok:
@@ -223,7 +237,8 @@ def main():
                     p90_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.9),
                     p99_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.99),
                     gaps=sum(r["gaps"] for r in ok), gap_streams=sum(r["gaps"] > 0 for r in ok),
-                    gap_s=sum(r["gap_s"] for r in ok))
+                    gap_s=sum(r["gap_s"] for r in ok), stalls=sum(r["stalls"] for r in ok),
+                    p90_rtf=pct([r["rtf"] for r in ok], 0.9))
         if len(ok) > args.conc:
             steady_ok = [r for r in rows[args.conc:] if r["audio_s"] > 0]
             if steady_ok:

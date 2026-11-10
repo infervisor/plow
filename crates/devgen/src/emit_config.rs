@@ -487,6 +487,10 @@ pub struct EmitConfig {
     /// the last row in place; addressing only, codes bit-identical). Unset / 0 = off.
     #[arg(long, env = "PLOW_DEPTH_FUSE")]
     pub depth_fuse: Option<u32>,
+    /// Staged depth programs: extra row capacities beside the decode rungs (comma list, each below
+    /// the widest rung), so the runtime's per-frame plan has a program near the live row count.
+    #[arg(long, env = "PLOW_DEPTH_ROWS")]
+    pub depth_rows: Option<String>,
     /// Depth stage (fish / breeze): each layer's q / k / v HeadNormRope and FlashMerge fold into
     /// its FlashDecode (the HeadNormRope fold arm plus the merge fold). Changes the merge's rounding
     /// (acc / l vs acc * (1 / l)).
@@ -2029,6 +2033,7 @@ impl EmitConfig {
             decode_norm_fold: env_bool("PLOW_DECODE_NORM_FOLD"),
             decode_hnr_fold: env_u32("PLOW_DECODE_HNR_FOLD"),
             depth_fuse: env_u32("PLOW_DEPTH_FUSE"),
+            depth_rows: env_str("PLOW_DEPTH_ROWS"),
             depth_attn_fold: env_bool("PLOW_DEPTH_ATTN_FOLD"),
             decode_gemv_xk: env_u32("PLOW_DECODE_GEMV_XK"),
             decode_gemv_xk_qkv: env_bool("PLOW_DECODE_GEMV_XK_QKV"),

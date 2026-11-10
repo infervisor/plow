@@ -121,18 +121,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(n) = opt("--slots").map(|v| v.parse::<usize>().unwrap()) {
         let mut rows = Vec::new();
         let mut codes = Vec::new();
-        for slot in 0..n {
+        // `--same-streams P`: every slot runs the same stream, with speaker memory `slot % P`, so
+        // slot `s` must emit slot `s % P`'s codes whatever windows the depth plan runs it in.
+        // `--memory-step F`: speaker memory `j` is the null memory scaled by `1 + F * j`.
+        let memory_step: f32 = opt("--memory-step").map_or(0.25, |v| v.parse().unwrap());
+        let period = opt("--same-streams").map(|v| v.parse::<usize>().unwrap().max(1));
+        let memories: Vec<std::sync::Arc<[f32]>> = match (period, e.maya2_null_memory()) {
+            (Some(p), Some(null)) => (0..p)
+                .map(|j| null.iter().map(|v| v * (1.0 + memory_step * j as f32)).collect())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let (mut same, mut distinct) = (0usize, 0usize);
+        let (mut off_by_memory, mut first_off) = (vec![0usize; period.unwrap_or(0)], None);
+        // `--slot-stride K`: the N streams sit in slots 0, K, 2K, ..
+        let stride = opt("--slot-stride").map_or(1, |v| v.parse::<usize>().unwrap().max(1));
+        for (index, slot) in (0..n).map(|i| (i, i * stride)) {
             e.begin_slot(slot, prompt.len() + frames + 1)?;
             e.fish_reset_slot(slot)?;
             if let Some(p) = maya2 {
-                e.maya2_bind(slot, p, None)?;
+                e.maya2_bind(slot, p, memories.get(index % memories.len().max(1)))?;
             }
             e.prefill_slot(slot, &prompt)?;
             e.fish_logits_to_slot(slot)?;
             let row = FishRow {
                 slot,
                 hidden_row: e.prefill_terminal_row(),
-                seed: seed + slot as u64,
+                seed: seed + if period.is_some() { 0 } else { index as u64 },
                 step: 0,
                 temperature,
                 top_p,
@@ -148,7 +163,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut toks = Vec::new();
         let (mut depth, mut backbone) = (0.0f64, 0.0f64);
-        for _ in 0..frames {
+        // `--codes-out FILE`: every frame's codes of every stream, `[frames][N][codebooks]` u32.
+        let mut all_codes: Vec<u32> = Vec::new();
+        for frame in 0..frames {
             let feeds: Vec<(usize, u32)> = rows
                 .iter()
                 .map(|(r, class)| {
@@ -173,10 +190,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = std::time::Instant::now();
             e.fish_depth_step(&step, &mut codes)?;
             depth += t.elapsed().as_secs_f64();
+            all_codes.extend_from_slice(&codes);
             for (k, (r, class)) in rows.iter_mut().enumerate() {
                 *r = step[k];
                 *class = codes[k * info.codebooks];
             }
+            if let Some(p) = period {
+                let row = |k: usize| &codes[k * info.codebooks..(k + 1) * info.codebooks];
+                same += (p..n).filter(|&k| row(k) != row(k % p)).count();
+                for k in (p..n).filter(|&k| row(k) != row(k % p)) {
+                    off_by_memory[k % p] += 1;
+                    first_off.get_or_insert((frame, k, (0..info.codebooks).find(|&c| row(k)[c] != row(k % p)[c])));
+                }
+                distinct += (1..p.min(n)).filter(|&k| row(k) != row(0)).count();
+            }
+        }
+        if let Some(path) = opt("--codes-out") {
+            std::fs::write(path, bytemuck::cast_slice::<u32, u8>(&all_codes))?;
+        }
+        if let Some(plan) = e.depth_plan_describe() {
+            println!("{plan}");
+        }
+        if let Some(p) = period {
+            println!("same-streams period {p}: rows off their period row {same}, rows differing by memory {distinct}");
+            println!("off by memory {off_by_memory:?} first (frame, row, level) {first_off:?}");
         }
         let f = frames.max(1) as f64;
         println!(
