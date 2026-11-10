@@ -630,6 +630,8 @@ impl Encoder<'_> {
                 false,
                 &[dep],
                 Conv1dF32Stage {
+                    input_split: false,
+                    output_split: false,
                     output: TensorRef::Named(out_name),
                     weight: TensorRef::Named(&weight_name),
                     bias: None,
@@ -660,6 +662,7 @@ impl Encoder<'_> {
                     wgmma: padded,
                     weight_split: padded,
                     dual_alpha: false,
+                    pinned: false,
                     wgmma_ragged: false,
                 },
             )?;

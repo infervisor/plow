@@ -326,6 +326,21 @@ pub(crate) fn prefill_row_field(op: u16) -> Option<RowField> {
 /// alone" is NOT enough — row-banded collectives, where the band `Gemm` would be
 /// skipped by the guard while its `XReduce` partner was rescaled — so the guard
 /// never half-applies in silence.
+/// Whether chunk base `c0` keeps the key-pool alignment every non-packed `DsaPoolCompress`
+/// (`i[6] != 1`, pool size `i[1]`) in `insts` needs. The kernel groups the chunk's rows from
+/// its first row and files them from `chunk_base / pool_size` (op_dsa_pool.h), so a base
+/// that is not a multiple of the pool size writes the chunk's leading rows into the previous
+/// pool's slot. `Err(pool_size)` names the first offended pool. The packed form (`i[6] = 1`)
+/// addresses rows through the span table and is not subject to this.
+pub(crate) fn dsa_pool_chunk_base_aligned(insts: &[DevInst64], c0: u32) -> Result<(), u32> {
+    insts
+        .iter()
+        .filter(|d| d.op == DevOp::DsaPoolCompress as u16 && d.i[6] != 1)
+        .map(|d| d.i[1].max(1))
+        .find(|&pool| c0 % pool != 0)
+        .map_or(Ok(()), Err)
+}
+
 pub(crate) fn rebase_chunk_rows(
     insts: &mut [DevInst64],
     names: &[String],

@@ -1146,6 +1146,8 @@ mod tests {
             h[0],
             &[],
             Conv1dF32Stage {
+                input_split: false,
+                output_split: false,
                 output: TensorRef::Named("y"),
                 weight: TensorRef::Named("w"),
                 bias: Some(TensorRef::Named("b")),
@@ -1172,6 +1174,7 @@ mod tests {
                 wgmma: false,
                 weight_split: false,
                 dual_alpha: false,
+                pinned: false,
                 wgmma_ragged: false,
             },
             h[1],

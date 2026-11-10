@@ -405,14 +405,35 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
     }
 }
 
+/* GemvF32Out view (flag bit 12; descriptor t7 = u32[8] {1, p, xs, xo, cs, co, rs, ro}, in elements):
+ * logical row m = item * p + r reads x at item * xs + xo + r * K, writes C at item * cs + co + r * N and
+ * reads the residual at item * rs + ro + r * N. Without a view p = M and every stride / offset is 0, so
+ * the addresses are the plain m * K / m * N. The bias stays logical ((m / bgroup) * N). */
+struct GemvView {
+    unsigned p, xs, xo, cs, co, rs, ro;
+    __device__ __forceinline__ size_t xrow(unsigned m, unsigned K) const {
+        const unsigned it = m / p, r = m - it * p;
+        return (size_t)it * xs + xo + (size_t)r * K;
+    }
+    __device__ __forceinline__ size_t crow(unsigned m, unsigned N) const {
+        const unsigned it = m / p, r = m - it * p;
+        return (size_t)it * cs + co + (size_t)r * N;
+    }
+    __device__ __forceinline__ size_t rrow(unsigned m, unsigned N) const {
+        const unsigned it = m / p, r = m - it * p;
+        return (size_t)it * rs + ro + (size_t)r * N;
+    }
+};
+
 /* GemvF32Out modes (i7 != 0; Maya 2's depth projections): bit 0 x is f32, bit 1 W is f16, bit 2 adds
  * an f32 bias t3[N] (bit 9: t3[M / bgroup][N], one row per group of bgroup rows), bit 3 adds an f32
  * residual t4[M][N] (may alias C: each element is read then written by the one lane that owns it),
- * bits 4-7 the activation applied last (1 = GELU erf). */
+ * bits 4-7 the activation applied last (1 = GELU erf), bit 12 the row view above. */
 template <bool XF, bool WH>
 static __device__ void gemv_f32out_mode(float* C, const void* xv, const void* Wv, const float* bias,
                                         unsigned bgroup, const float* res, unsigned act, unsigned M,
-                                        unsigned N, unsigned K, unsigned slice, unsigned nblk) {
+                                        unsigned N, unsigned K, unsigned slice, unsigned nblk,
+                                        const GemvView& vw) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned per = (N + nblk - 1) / nblk;
@@ -435,12 +456,12 @@ static __device__ void gemv_f32out_mode(float* C, const void* xv, const void* Wv
                     if (m0 + m >= M) break;
                     float xs[8];
                     if (XF) {
-                        const float4* xp = (const float4*)((const float*)xv + (size_t)(m0 + m) * K + k);
+                        const float4* xp = (const float4*)((const float*)xv + vw.xrow(m0 + m, K) + k);
                         const float4 a = xp[0], b = xp[1];
                         xs[0] = a.x; xs[1] = a.y; xs[2] = a.z; xs[3] = a.w;
                         xs[4] = b.x; xs[5] = b.y; xs[6] = b.z; xs[7] = b.w;
                     } else {
-                        const uint4 xr = *(const uint4*)((const unsigned short*)xv + (size_t)(m0 + m) * K + k);
+                        const uint4 xr = *(const uint4*)((const unsigned short*)xv + vw.xrow(m0 + m, K) + k);
                         const unsigned short* xh = (const unsigned short*)&xr;
 #pragma unroll
                         for (int e = 0; e < 8; e++) xs[e] = __uint_as_float((unsigned)xh[e] << 16);
@@ -453,12 +474,11 @@ static __device__ void gemv_f32out_mode(float* C, const void* xv, const void* Wv
             for (int m = 0; m < 8; m++) {
                 const float t = warp_sum32(acc[m]);
                 if (lane == 0 && m0 + m < M) {
-                    const size_t o = (size_t)(m0 + m) * N + n;
                     float v = t;
                     if (bias) v = __fadd_rn(v, bias[(bgroup ? (m0 + m) / bgroup * N : 0u) + n]);
-                    if (res) v = __fadd_rn(v, res[o]);
+                    if (res) v = __fadd_rn(v, res[vw.rrow(m0 + m, N) + n]);
                     if (act == 1u) v = 0.5f * v * (1.f + erff(v * 0.70710678118654752f));
-                    C[o] = v;
+                    C[vw.crow(m0 + m, N) + n] = v;
                 }
             }
         }
@@ -601,7 +621,7 @@ static __device__ __forceinline__ void mma_16816(float* d, const unsigned* a, un
 static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, const unsigned short* __restrict__ W,
                                      const float* bias, unsigned bgroup, const float* res, const float* gamma,
                                      const float* beta, float eps, unsigned act, unsigned M, unsigned N, unsigned K,
-                                     unsigned slice, unsigned nblk, float* arena) {
+                                     unsigned slice, unsigned nblk, float* arena, const GemvView& vw) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned g = lane >> 2, t = lane & 3u;
@@ -623,7 +643,7 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
         __syncthreads();
         if (gamma) {
             for (unsigned r = warp; r < mr; r += PLOW_NV_WARPS) {
-                const float* xr = x + (size_t)(mc + r) * K;
+                const float* xr = x + vw.xrow(mc + r, K);
                 float s = 0.f;
                 for (unsigned k = lane; k < K; k += 32u) s += xr[k];
                 const float mean = warp_sum32(s) / (float)K;
@@ -649,7 +669,7 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
                 const unsigned r = i / kw, k = i % kw;
                 float v = 0.f;
                 if (r < mr) {
-                    v = x[(size_t)(mc + r) * K + kt + k];
+                    v = x[vw.xrow(mc + r, K) + kt + k];
                     if (gamma) v = __fmaf_rn((v - st[2 * r]) * st[2 * r + 1], gamma[kt + k], beta[kt + k]);
                 }
                 xs[r * MMA_KT + k] = __float2half_rn(v);
@@ -711,12 +731,11 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
                 for (unsigned c = 0; c < 4u; c++) {
                     const unsigned m = j * 8u + 2u * t + (c & 1u), n = (c < 2u) ? na : nb;
                     if (m >= mr || n >= N) continue;
-                    const size_t o = (size_t)(mc + m) * N + n;
                     float v = acc[j][c];
                     if (bias) v = __fadd_rn(v, bias[(bgroup ? (mc + m) / bgroup * N : 0u) + n]);
-                    if (res) v = __fadd_rn(v, res[o]);
+                    if (res) v = __fadd_rn(v, res[vw.rrow(mc + m, N) + n]);
                     if (act == 1u) v = 0.5f * v * (1.f + erff(v * 0.70710678118654752f));
-                    C[o] = v;
+                    C[vw.crow(mc + m, N) + n] = v;
                 }
             }
         }
@@ -726,20 +745,26 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
 static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W, const float* bias,
                                           const float* res, const float* gamma, const float* beta, float eps,
                                           unsigned flags, unsigned bgroup, unsigned M, unsigned N, unsigned K,
-                                          unsigned slice, unsigned nblk, float* arena) {
+                                          unsigned slice, unsigned nblk, float* arena, const unsigned* vd) {
     const unsigned act = (flags >> 4) & 15u;
     bgroup = (flags & 512u) ? bgroup : 0u;
     if ((flags & 512u) && !bgroup) { __trap(); return; }
     bias = (flags & 4u) ? bias : nullptr;
     res = (flags & 8u) ? res : nullptr;
+    GemvView vw = {M, 0u, 0u, 0u, 0u, 0u, 0u};
+    if (flags & 4096u) {
+        if (!vd || vd[0] != 1u || !vd[1]) { __trap(); return; }
+        vw = {vd[1], vd[2], vd[3], vd[4], vd[5], vd[6], vd[7]};
+    }
     if ((flags & 3u) == 3u && (flags & 1024u)) {
         if (K % 64u) { __trap(); return; }
         gemv_f16w_mma(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res,
-                      (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
+                      (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena, vw);
         return;
     }
     if ((flags & 3u) == 3u) {
-        if ((flags & 256u) && K > GEMV_KT) { __trap(); return; }
+        /* The staged arm addresses plain rows. */
+        if ((flags & 4096u) || ((flags & 256u) && K > GEMV_KT)) { __trap(); return; }
         /* The fewest columns per warp that still give every warp of the block its share: a
          * narrow projection (N / blocks <= 8 per warp) keeps all warps streaming W. */
         const unsigned per = (N + nblk - 1) / nblk, need = (per + PLOW_NV_WARPS - 1) / PLOW_NV_WARPS;
@@ -759,10 +784,10 @@ static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W
         return;
     }
     switch (flags & 3u) {
-    case 0: gemv_f32out_mode<false, false>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk); break;
-    case 1: gemv_f32out_mode<true, false>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk); break;
-    case 2: gemv_f32out_mode<false, true>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk); break;
-    default: gemv_f32out_mode<true, true>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk); break;
+    case 0: gemv_f32out_mode<false, false>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk, vw); break;
+    case 1: gemv_f32out_mode<true, false>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk, vw); break;
+    case 2: gemv_f32out_mode<false, true>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk, vw); break;
+    default: gemv_f32out_mode<true, true>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk, vw); break;
     }
 }
 

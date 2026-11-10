@@ -8139,7 +8139,9 @@ fn gpu_prefill_batched_pass(
 /// through serial prefill keeps it serial until done (packed admission restarts a slot).
 #[cfg(feature = "cuda")]
 fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap: usize) -> bool {
-    e.depth_packs() && depth_prompts_pack(slots, cap, |i| e.packed_slot_ready(i))
+    crate::config::RuntimeConfig::get().tts_depth_pack
+        && e.depth_packs()
+        && depth_prompts_pack(slots, cap, |i| e.packed_slot_ready(i))
 }
 
 #[cfg(any(feature = "cuda", test))]

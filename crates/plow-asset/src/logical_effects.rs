@@ -99,6 +99,9 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         DenseGemmF32 if d.t[4] != TENSOR_NONE16 => Ok(&[0, 4]),
         LstmCellF32 => Ok(&[0, 1]),
         TrimSilenceF32 => Ok(&[0, 3]),
+        // Flags bit 20: t7 is the split-K scratch (tickets and partial tiles), written and
+        // re-armed by every split conv sharing it.
+        Conv1dF32 if (d.fj[2] >> 20) & 1 == 1 && d.t[7] != TENSOR_NONE16 => Ok(&[0, 7]),
         Q8GemmF32
         | LayerNormF32
         | ScaledAddF32
