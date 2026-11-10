@@ -1,8 +1,8 @@
 """gen_search block spec: Maya 2 DepthV2 projections (GemvF32Out mma arm: f16 W [N][K], x rounded
 to f16, f32 accumulate) at the depth stage's shapes: qkv / f1 (N 3072, K 1024), f2 (N 1024,
 K 3072), o (1024 x 1024), head (N 2048, K 1024). Row classes: m1 = one stream's cached level,
-m8 / m32 = 8 / 32 streams, m832 = a full level (26 prefix rows) at 32 streams. Generated body:
-gemm_f16.py. Current kernel: recorded in-model per-op time (packet_bench --sweep of the standalone
+m8 / m32 = 8 / 32 streams, m832 = a full level (26 prefix rows) at 32 streams. Generated bodies:
+gemm_f16.py (TileLang), gemm_f16_triton.py (Triton). Current kernel: recorded in-model per-op time (packet_bench --sweep of the standalone
 depth program, RC9 speech object, H100); the generated number is a standalone launch, so the
 comparison is a reference for the schedule, not an in-model gain.
 """
@@ -57,6 +57,11 @@ def _tl_valid(cfg, c):
     return cfg["bm"] >= 64
 
 
+def _tr_bind(cfg, c, inp, out):
+    import gemm_f16_triton
+    return gemm_f16_triton.launcher(cfg, c["M"], c["N"], c["K"], inp["x"], inp["w"], out)
+
+
 SPEC = {
     "name": "maya2_depth_gemv",
     "op": "GemvF32Out depth projection",
@@ -76,6 +81,13 @@ SPEC = {
             "bind": lambda kern, c, inp, out: (lambda: kern(inp["x"], inp["w"], out)),
             "valid": _tl_valid,
             "static_shapes": True,
+        },
+        # Triton compiles at first launch: `build` hands the config through and `bind` jits.
+        "triton": {
+            "grid": {"bm": [16, 32, 64, 128], "bn": [64, 128], "bk": [32, 64], "warps": [4, 8], "stages": [2, 3]},
+            "build": lambda cfg, c: cfg,
+            "bind": _tr_bind,
+            "valid": _tl_valid,
         },
     },
     "current": {

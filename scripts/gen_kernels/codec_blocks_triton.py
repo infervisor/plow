@@ -1,4 +1,4 @@
-"""Triton versions of the 12 Hz codec blocks (codec_blocks.py): tf32x3 dots, the same shapes and semantics as
+"""Triton versions of the 12 Hz codec blocks (codec_blocks.py): tl.dot at input_precision PREC ("tf32x3" = hi/lo split, "tf32"), the same shapes and semantics as
 codec_blocks.py. Batch-invariant: one (BM, BN, BK) per class, the k loop serial."""
 import triton
 import triton.language as tl
@@ -13,7 +13,7 @@ def _snake_beta(v, a, r):
 @triton.jit
 def tconv(x, w, bias, apre, apost, y, M, Tout, Tin, CIN: tl.constexpr, COUT: tl.constexpr, KK: tl.constexpr,
           DIL: tl.constexpr, PAD: tl.constexpr, PRE: tl.constexpr, POST: tl.constexpr,
-          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, PREC: tl.constexpr):
     pm = tl.program_id(0)
     pn = tl.program_id(1)
     rm = pm * BM + tl.arange(0, BM)
@@ -34,7 +34,7 @@ def tconv(x, w, bias, apre, apost, y, M, Tout, Tin, CIN: tl.constexpr, COUT: tl.
             a = _snake_beta(a, al[None, :], rr[None, :])
         wm = (rn[None, :] < COUT) & (kk[:, None] < KK)
         wv = tl.load(w + rn[None, :] * KK + kk[:, None], mask=wm, other=0.0)
-        acc = tl.dot(a, wv, acc, input_precision="tf32x3")
+        acc = tl.dot(a, wv, acc, input_precision=PREC)
     nm = rn < COUT
     v = acc + tl.load(bias + rn, mask=nm, other=0.0)[None, :]
     if POST:
@@ -46,7 +46,7 @@ def tconv(x, w, bias, apre, apost, y, M, Tout, Tin, CIN: tl.constexpr, COUT: tl.
 
 @triton.jit
 def tdense(x, w, part, M, N: tl.constexpr, K: tl.constexpr, CHUNK: tl.constexpr,
-           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, PREC: tl.constexpr):
     pm = tl.program_id(0)
     pn = tl.program_id(1)
     p = tl.program_id(2)
@@ -57,7 +57,7 @@ def tdense(x, w, part, M, N: tl.constexpr, K: tl.constexpr, CHUNK: tl.constexpr,
         kk = p * CHUNK + k0 + tl.arange(0, BK)
         a = tl.load(x + rm[:, None] * K + kk[None, :], mask=(rm[:, None] < M) & (kk[None, :] < K), other=0.0)
         wv = tl.load(w + rn[None, :] * K + kk[:, None], mask=(rn[None, :] < N) & (kk[:, None] < K), other=0.0)
-        acc = tl.dot(a, wv, acc, input_precision="tf32x3")
+        acc = tl.dot(a, wv, acc, input_precision=PREC)
     tl.store(part + (p * M + rm[:, None]) * N + rn[None, :], acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
