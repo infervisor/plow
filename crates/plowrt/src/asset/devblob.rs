@@ -1086,8 +1086,21 @@ impl DevBlob {
         let first = |insts: &mut dyn Iterator<Item = &DevInst64>| {
             layout::first_protected(insts.map(|d| (d.op, d.fj[2], d.i)))
         };
+        let declared = self.abi(buf)?.and_then(|a| a.speech_flag_layout);
+        let required = layout::required_layout(
+            self.progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .chain(&aux)
+                .map(|d| (d.op, d.fj[2], d.i)),
+        );
+        if required == Some(2) && declared.unwrap_or(0) < 2 {
+            return Err(malformed(
+                "speech flag declaration is older than its instruction bits".into(),
+            ));
+        }
         Ok(SpeechFlagLayout {
-            declared: self.abi(buf)?.and_then(|a| a.speech_flag_layout),
+            declared,
             regular: first(&mut self.progs.iter().flat_map(|p| &p.insts)),
             auxiliary: first(&mut aux.iter()),
         })
@@ -2132,6 +2145,34 @@ mod tests {
             blob.speech_flag_layout(&raw).unwrap(),
             found(None, Some(conv), None)
         );
+    }
+
+    #[test]
+    fn half_speech_bits_require_layout_two_declarations() {
+        for (op, slot, flag) in [
+            (DevOp::LayerNormF32, 2, 8),
+            (DevOp::GemvF32Out, 7, 8192),
+            (DevOp::GemvF32Out, 7, 16384),
+        ] {
+            for declared in [None, Some(1), Some(2)] {
+                let mut m = tiny_model();
+                m.progs[0].insts[0].op = op as u16;
+                m.progs[0].insts[0].i[slot] = flag;
+                let abi = plow_asset::abi::Abi {
+                    version: plow_asset::abi::VERSION,
+                    contract: plow_asset::RUNTIME_CONTRACT_BASE,
+                    speech_flag_layout: declared,
+                    ..Default::default()
+                };
+                let raw = m.to_blob_v6(&[packet::devbuild::SectionData {
+                    kind: packet::devbuild::SECT_METADATA,
+                    name: plow_asset::abi::SECTION.into(),
+                    data: serde_json::to_vec(&abi).unwrap(),
+                }]);
+                let b = DevBlob::parse(&raw).unwrap();
+                assert_eq!(b.speech_flag_layout(&raw).is_ok(), declared == Some(2));
+            }
+        }
     }
 
     #[test]

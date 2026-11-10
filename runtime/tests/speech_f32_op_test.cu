@@ -66,10 +66,14 @@ typedef void (*golden_fn)(const PlowDevInst*, uint32_t, uint32_t, void* const*, 
 
 __global__ void __launch_bounds__(256, 1) k_speech(PlowDevInst in, void* const* T) {
     extern __shared__ float arena[];
+#ifdef SPEECH_TEST_SHORT_ATTENTION_ONLY
+    d_attention_f32(&in, T, blockIdx.x, gridDim.x, arena);
+#else
 #if defined(PLOW_NV_HOPPER)
     if (sp_wg_conv1d(&in, T, blockIdx.x, gridDim.x)) return;
 #endif
     d_speech_f32(&in, T, blockIdx.x, gridDim.x, arena);
+#endif
 }
 /* sp_conv1d_direct alone: the reference the staged few-output conv must match bit for bit. */
 __global__ void __launch_bounds__(256, 1) k_conv_direct(PlowDevInst in, void* const* T) {
@@ -1797,6 +1801,38 @@ static void bench(const char* name, Case& c, double flops, double bytes, int rep
     CK(cudaFree(td));
 }
 
+static void t_attention_short(unsigned batch, unsigned qr, unsigned kr, bool causal, bool fused, bool timing) {
+    Case c;
+    constexpr unsigned heads = 16, width = heads * 64;
+    const unsigned stride = fused ? 3 * width : width;
+    const unsigned out = c.out((size_t)batch * qr * width + 16);
+    unsigned q, k, v;
+    if (fused && qr == kr) q = k = v = c.f32((size_t)batch * kr * stride, 1.f);
+    else {
+        q = c.f32((size_t)batch * qr * stride, 1.f);
+        k = v = c.f32((size_t)batch * kr * stride, 1.f);
+    }
+    std::vector<uint32_t> lengths(batch);
+    for (unsigned b = 0; b < batch; b++) lengths[b] = timing ? kr : b % 4 == 0 ? 0 : b % 4 == 1 ? 1 : kr + b % 2;
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = out; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = c.u32(lengths);
+    c.in.i[0] = batch; c.in.i[1] = qr; c.in.i[2] = kr; c.in.i[3] = heads; c.in.i[4] = 64;
+    c.in.i[5] = stride; c.in.i[6] = causal;
+    c.in.fj[0].f = .125f; c.in.fj[1].u = fused ? width : 0; c.in.fj[2].u = fused ? 2 * width : 0;
+    char name[160];
+    snprintf(name, sizeof(name), "AttentionF32 short b%u q%u k%u causal%u fused%u", batch, qr, kr, causal, fused);
+    if (!timing) {
+        run(name, c, g_attention_f32, {out}, FP32, 2e-5);
+        return;
+    }
+    for (unsigned arm : {2u, 0u, 2u, 0u}) {
+        c.in.i[6] = causal | arm;
+        char label[192];
+        snprintf(label, sizeof(label), "%s %s", name, arm ? "tc" : "scalar");
+        bench(label, c, 4.0 * batch * qr * kr * width, 0, 50);
+    }
+}
+
 static void bench_signal() {
     {
         Case c; const unsigned rows = 32 * 16384, width = 64;
@@ -2547,6 +2583,9 @@ static int t_bf16_mma_replay(const char* input, const char* output, bool native 
 }
 
 int main(int argc, char** argv) {
+#ifdef SPEECH_TEST_SHORT_ATTENTION_ONLY
+    if (argc != 2 || (strcmp(argv[1], "--short-attention") && strcmp(argv[1], "--bench-short-attention"))) return 2;
+#endif
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
     g_nblk = prop.multiProcessorCount;
@@ -2555,6 +2594,20 @@ int main(int argc, char** argv) {
     kSmem = (size_t)arena_floats * sizeof(float);
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
+
+    if (argc > 1 && !strcmp(argv[1], "--short-attention")) {
+        for (unsigned b : {3u, 16u, 33u})
+            for (unsigned q : {1u, 2u, 17u, 32u})
+                for (unsigned k : {1u, 7u, 32u})
+                    for (bool causal : {false, true})
+                        for (bool fused : {false, true}) t_attention_short(b, q, k, causal, fused, false);
+        return g_fail;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--bench-short-attention")) {
+        for (unsigned b : {32u, 64u, 128u, 200u, 224u})
+            for (unsigned q : {1u, 2u, 26u}) t_attention_short(b, q, q == 1 ? 32u : q, q != 1, true, true);
+        return g_fail;
+    }
 
     if (argc > 1 && !strcmp(argv[1], "--check-split")) {
 #if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_SPLIT_A

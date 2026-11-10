@@ -45,6 +45,15 @@ extern "C" __device__ unsigned plow_mixed_interpreter
  * `token_batch`; the gather marker says PLOW_DOP_ROW_GATHER has a real dispatch arm. Armed and
  * can-fire are different claims, and only the second licenses a measurement. */
 extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
+#if PLOW_NV_TOKEN_BATCH_BF16
+#if PLOW_FP8_KV || PLOW_MIXED_STEP
+#error "BF16 token-batch decode uses its own descriptor and BF16 KV"
+#endif
+extern "C" __device__ unsigned plow_bf16_token_batch_1 = 1;
+#define BF16_TB_ARG , token_batch
+#define BF16_TB_NRF_ARG , nullptr, token_batch
+#endif
+
 extern "C" __device__ unsigned plow_row_gather_1 = 1;
 #if PLOW_NV_ROW_SLOT
 /* Span-mode decode (speculative verify): HEADNORM_ROPE_FP8 stores and FLASH_DECODE_FP8 reads
@@ -1297,13 +1306,16 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SP
  * loader derives the required set from each program's instructions and refuses an object without
  * them (symbol absent = none). bit 0: GemvF32Out row view (flag bit 12, descriptor in t7) - not
  * offered: the view addressing cost the M >= 40 rungs ~25 % with the view off, so a view packet is refused;
- * bit 1: AttentionF32 query view (flag bit 6). */
+ * bit 1: AttentionF32 query view (flag bit 6); bit 2: f16 LayerNorm / projection operands. */
 #if PLOW_NV_SPEECH
+#if defined(PLOW_NV_HOPPER)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 6u;
+#else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 2u;
+#endif
 /* The speech-op flag layout this object reads (plow_asset::speech_flag_layout::LAYOUT): a packet
- * declaring a layout loads only on an object exporting the same number. Bump both together
- * whenever a speech-op flag bit is reassigned. */
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 1u;
+ * layout 2 preserves layout 1 meanings and also accepts its packets. */
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 2u;
 #endif
 #if PLOW_PACKET_HASH != 0ull
 extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_lo) =
@@ -1352,6 +1364,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                           unsigned nblk, float* arena
 #if PLOW_MIXED_STEP
                                           , const PlowProgram* mixed
+#endif
+#if PLOW_NV_TOKEN_BATCH_BF16
+                                          , const PlowTokenBatch* token_batch
 #endif
                                           ) {
     const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
@@ -1994,8 +2009,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         /* i[7] = 1 is the FUSED k+v form (decode only): t6/t7 hold v's (out, in) and the
          * kernel runs a second, gamma-less rope-less pass over them. It cannot collide with
          * the prefill/mixed pfslot use of t6 above — those programs leave i[7] at 0. */
+#if PLOW_NV_TOKEN_BATCH_BF16
+#define PLOW_HNR_KV2 , (in->i[7] ? (__nv_bfloat16*)TEN(6) : nullptr), \
+                     (in->i[7] ? (const __nv_bfloat16*)TEN(7) : nullptr), 0u, token_batch
+#else
 #define PLOW_HNR_KV2 , (in->i[7] ? (__nv_bfloat16*)TEN(6) : nullptr), \
                      (in->i[7] ? (const __nv_bfloat16*)TEN(7) : nullptr)
+#endif
 #if PLOW_HAS_HEADNORM_HD64
         /* The packet flag selects explicit half-split pairing; other HD64 packets use the
          * pre-existing interleaved pairing. Packet inventory keeps this template out of
@@ -2815,6 +2835,25 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
+#if PLOW_NV_TOKEN_BATCH_BF16
+#define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
+    do {                                                                                       \
+        if (TEN(6))                                                                            \
+            d_flash_decode_slots<DD, GG>(                                                       \
+                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
+                (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
+                (const int*)TEN(6), fold_out, fold_ctr BF16_TB_ARG);                                        \
+        else                                                                                   \
+            d_flash_decode<DD, GG>(                                                            \
+                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
+                (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,     \
+                nullptr, nullptr, fold_out, fold_ctr BF16_TB_NRF_ARG);                                         \
+    } while (0)
+#else
 #define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
     do {                                                                                       \
         if (TEN(6))                                                                            \
@@ -2832,6 +2871,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,     \
                 nullptr, nullptr, fold_out, fold_ctr);                                         \
     } while (0)
+#endif
 #if PLOW_HAS_FLASH_HD64
         if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64) {
             if (gqa != PLOW_PACKET_GQA) { __trap(); break; }
@@ -4090,6 +4130,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #endif
 #if PLOW_MIXED_STEP
                       , &prog
+#endif
+#if PLOW_NV_TOKEN_BATCH_BF16
+                      , prog.token_batch
 #endif
                       );
         }

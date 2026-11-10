@@ -59,15 +59,19 @@ fn speech_ops(blob: &DevBlob) -> u64 {
 }
 
 /// Speech-object capability bits the instructions need (`plow_speech_caps_speech`): bit 0 a
-/// GemvF32Out row view (flag bit 12), bit 1 an AttentionF32 query view (flag bit 6).
+/// GemvF32Out row view (flag bit 12), bit 1 an AttentionF32 query view (flag bit 6),
+/// bit 2 FP16 LayerNorm output / projection operands.
 pub(super) fn speech_caps_required<'a>(
     insts: impl IntoIterator<Item = &'a packet::dev::DevInst64>,
 ) -> u32 {
     use packet::dev::DevOp;
     insts.into_iter().fold(0, |caps, d| {
         caps | match DevOp::from_u16(d.op) {
-            Some(DevOp::GemvF32Out) if d.i[7] & 4096 != 0 => 1,
+            Some(DevOp::GemvF32Out) => {
+                u32::from(d.i[7] & 4096 != 0) | u32::from(d.i[7] & 0x6000 != 0) << 2
+            }
             Some(DevOp::AttentionF32) if d.i[6] & 64 != 0 => 2,
+            Some(DevOp::LayerNormF32) if d.i[2] & 8 != 0 => 4,
             _ => 0,
         }
     })
@@ -175,6 +179,22 @@ fn a_specialized_speech_object_must_cover_the_packet_ops() {
     assert!(missing_speech_ops(0b1011, 0b1111).is_empty());
     assert_eq!(missing_speech_ops(0b1011, 0b0011), vec![SPEECH_OP0 + 3]);
     assert_eq!(missing_speech_ops(1 << 41, 0), vec![204]);
+}
+
+#[cfg(test)]
+#[test]
+fn half_speech_operands_require_the_capability() {
+    let mut i = packet::dev::DevInst64::default();
+    i.op = DevOp::GemvF32Out as u16;
+    for flags in [8192, 16384, 8192 | 16384] {
+        i.i[7] = flags;
+        assert_eq!(speech_caps_required([&i]), 4);
+        assert_eq!(missing_speech_caps(4, Some(2)), 4);
+        assert_eq!(missing_speech_caps(4, Some(6)), 0);
+    }
+    i.op = DevOp::LayerNormF32 as u16;
+    i.i[2] = 8;
+    assert_eq!(speech_caps_required([&i]), 4);
 }
 
 #[cfg(test)]

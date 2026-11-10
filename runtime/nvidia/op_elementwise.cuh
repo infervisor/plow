@@ -943,6 +943,32 @@ static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W
     if ((flags & 512u) && !bgroup) { __trap(); return; }
     bias = (flags & 4u) ? bias : nullptr;
     res = (flags & 8u) ? res : nullptr;
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+    if ((flags & 16384u) && !(flags & 8192u)) { __trap(); return; }
+    if (flags & 8192u) {
+        if ((flags & (3u | 1024u | 256u)) != (3u | 1024u) || M < 16u || N % 64u || K % 64u ||
+            ((((size_t)x) | ((size_t)W)) & 15u) || ((flags & 16384u) && (const void*)C == (const void*)res)) {
+            __trap(); return;
+        }
+        const auto* h = (const unsigned short*)x;
+        if (flags & 16384u) {
+            if (M >= 256u && K % 128u == 0u) gemv_f16w_half<128, true, 128>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if (M >= 256u) gemv_f16w_half<128, true>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if (N <= 1024u) gemv_f16w_half<16, true>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if ((size_t)((M + 63u) / 64u) * (N / 64u) >= 96u)
+                gemv_f16w_half<64, true>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else gemv_f16w_half<32, true>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+        } else {
+            if (M >= 256u && K % 128u == 0u) gemv_f16w_half<128, false, 128>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if (M >= 256u) gemv_f16w_half<128, false>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if (N <= 1024u) gemv_f16w_half<16, false>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if ((size_t)((M + 63u) / 64u) * (N / 64u) >= 96u)
+                gemv_f16w_half<64, false>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else gemv_f16w_half<32, false>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+        }
+        return;
+    }
+#endif
     if ((flags & 3u) == 3u && (flags & 1024u)) {
         if (K % 64u) { __trap(); return; }
 #if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
@@ -1031,6 +1057,9 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
     unsigned* sel = (unsigned*)(fpart + PLOW_NV_WARPS);
     float* sv = (float*)(sel + 64);
     float* L = sv + 64;
+#if !defined(PLOW_HAS_SAMPLE_SMALL_F32) || PLOW_HAS_SAMPLE_SMALL_F32
+    if (!smem_fits(L + vocab)) { asm volatile("trap;"); return; }
+#endif
     unsigned long long* tk_buf = (unsigned long long*)(((size_t)(L + vocab) + 15u) & ~(size_t)15u);
     unsigned* tk_ctl = (unsigned*)(tk_buf + 64);
     const bool radix = PLOW_NV_SAMPLE_RADIX && smem_fits(tk_ctl + 4 + 256);

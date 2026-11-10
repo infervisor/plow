@@ -11270,7 +11270,9 @@ impl GpuEngine {
                     .map(|d| (d.op, d.fj[2], d.i)),
             );
             let have = be.module_global_u32(&module, layout::OBJECT_SYMBOL)?;
-            layout::check(Some(layout::LAYOUT), used, have)
+            let required = layout::required_layout(blob.progs.iter().flat_map(|p| &p.insts)
+                .map(|d| (d.op, d.fj[2], d.i)));
+            layout::check(required, used, have)
                 .map_err(|e| RuntimeError::Rejected(format!("prefill interpreter: {e}")))?;
         }
         if let Some(requirements) = requirements {

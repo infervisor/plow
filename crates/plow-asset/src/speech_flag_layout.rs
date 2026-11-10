@@ -14,8 +14,9 @@ use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 /// The layout this tree emits and compiles: conv flags bit 2 SnakeBeta output, bit 3 ragged
 /// wgmma tiles, 21..29 pinned arms, 30 / 31 split-image input / output; AttentionF32 `i6` bit 6
 /// query view, bit 7 split-image output; LayerNormF32 `i2` bit 2 split-image output; GemvF32Out
-/// `i7` bit 12 row view.
-pub const LAYOUT: u32 = 1;
+/// `i7` bit 12 row view. Layout 2 adds LayerNormF32 bit 3 (f16 output) and GemvF32Out
+/// bits 13 / 14 (f16 input / output), preserving every layout 1 bit's meaning.
+pub const LAYOUT: u32 = 2;
 /// `extern "C" __device__ unsigned` exported by every speech interpreter object.
 pub const OBJECT_SYMBOL: &str = "plow_speech_flag_layout_speech";
 
@@ -24,9 +25,9 @@ pub const CONV_FLAGS: u32 = 0xffe0_000c;
 /// AttentionF32 `i6` bits assigned since layout 0.
 pub const ATTENTION_I6: u32 = 0xc0;
 /// LayerNormF32 `i2` bits assigned since layout 0.
-pub const LAYER_NORM_I2: u32 = 0x4;
+pub const LAYER_NORM_I2: u32 = 0xc;
 /// GemvF32Out `i7` bits assigned since layout 0.
-pub const GEMV_F32_OUT_I7: u32 = 0x1000;
+pub const GEMV_F32_OUT_I7: u32 = 0x7000;
 
 /// Whether an instruction (`j1` = `DevInst::j[1]` = `DevInst64::fj[2]`) sets a flag bit that
 /// layout 0 left clear.
@@ -46,6 +47,23 @@ pub fn first_protected(insts: impl IntoIterator<Item = (u16, u32, [u32; 8])>) ->
         .into_iter()
         .find(|(op, j1, i)| protected(*op, *j1, i))
         .map(|(op, ..)| op)
+}
+
+pub fn required_layout(insts: impl IntoIterator<Item = (u16, u32, [u32; 8])>) -> Option<u32> {
+    insts
+        .into_iter()
+        .filter_map(|(op, j1, i)| {
+            protected(op, j1, &i).then(|| {
+                if (op == DevOp::LayerNormF32 as u16 && i[2] & 8 != 0)
+                    || (op == DevOp::GemvF32Out as u16 && i[7] & 0x6000 != 0)
+                {
+                    2
+                } else {
+                    1
+                }
+            })
+        })
+        .max()
 }
 
 /// Whether a metadata section holds auxiliary programs (`aux_program` wire form).
@@ -82,7 +100,7 @@ pub fn declare(used: Option<u16>) -> Option<u32> {
 /// declaring `declared`, may run on that object, which exports `object` (`None` = no symbol).
 /// Instructions with no protected bit read the same under every layout and run on any object.
 pub fn check(declared: Option<u32>, used: Option<u16>, object: Option<u32>) -> Result<(), String> {
-    if let Some(layout) = declared.filter(|&l| l != LAYOUT) {
+    if let Some(layout) = declared.filter(|&l| l == 0 || l > LAYOUT) {
         return Err(format!(
             "the packet declares speech flag layout {layout}, this runtime reads {LAYOUT}"
         ));
@@ -97,7 +115,7 @@ pub fn check(declared: Option<u32>, used: Option<u16>, object: Option<u32>) -> R
         ));
     };
     match object {
-        Some(have) if have == layout => Ok(()),
+        Some(have) if have >= layout && have <= LAYOUT => Ok(()),
         Some(have) => Err(format!(
             "opcode {op} needs speech flag layout {layout}, the object is compiled for {have}: \
              rebuild the object for this packet"
@@ -167,9 +185,16 @@ mod tests {
             assert_eq!(first_protected([inst(op, 0, 6, 1 << bit)]), Some(op as u16));
         }
         let ln = DevOp::LayerNormF32;
-        assert_eq!(first_protected([inst(ln, 0, 2, 4)]), Some(ln as u16));
+        for bit in [2, 3] {
+            assert_eq!(first_protected([inst(ln, 0, 2, 1 << bit)]), Some(ln as u16));
+        }
         let head = DevOp::GemvF32Out;
-        assert_eq!(first_protected([inst(head, 0, 7, 4096)]), Some(head as u16));
+        for bit in [12, 13, 14] {
+            assert_eq!(
+                first_protected([inst(head, 0, 7, 1 << bit)]),
+                Some(head as u16)
+            );
+        }
         // Found behind unprotected instructions.
         let conv = DevOp::Conv1dF32;
         assert_eq!(
@@ -255,7 +280,7 @@ mod tests {
         assert!(check(Some(LAYOUT), conv, None)
             .unwrap_err()
             .contains("exports none"));
-        for have in [0, LAYOUT + 1, LAYOUT | 2] {
+        for have in [0, 1, LAYOUT + 1] {
             let e = check(Some(LAYOUT), conv, Some(have)).unwrap_err();
             assert!(e.contains("compiled for"), "{e}");
         }
@@ -269,5 +294,25 @@ mod tests {
             let e = check(Some(LAYOUT + 1), used, Some(LAYOUT + 1)).unwrap_err();
             assert!(e.contains("this runtime reads"), "{e}");
         }
+    }
+
+    #[test]
+    fn layout_one_packets_load_on_layout_two_objects() {
+        let op = Some(DevOp::GemvF32Out as u16);
+        assert!(check(Some(1), op, Some(1)).is_ok());
+        assert!(check(Some(1), op, Some(2)).is_ok());
+        assert!(check(Some(2), op, Some(1)).is_err());
+        assert_eq!(
+            required_layout([inst(DevOp::GemvF32Out, 0, 7, 4096)]),
+            Some(1)
+        );
+        assert_eq!(
+            required_layout([inst(DevOp::GemvF32Out, 0, 7, 8192)]),
+            Some(2)
+        );
+        assert_eq!(
+            required_layout([inst(DevOp::LayerNormF32, 0, 2, 8)]),
+            Some(2)
+        );
     }
 }

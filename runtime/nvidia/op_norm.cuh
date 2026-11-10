@@ -15,6 +15,9 @@
  */
 #pragma once
 #include "mixed_step.h"
+#if PLOW_NV_TOKEN_BATCH_BF16
+#include "token_batch.h"
+#endif
 #ifndef PLOW_NV_GEMMA_HNR_BF16
 #define PLOW_NV_GEMMA_HNR_BF16 0
 #endif
@@ -1007,6 +1010,9 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
                                 /* x's row pitch in elements when x is a column slice of a
                                  * wider row (a fused q|k|v projection); 0 = nhead * hd. */
                                 , unsigned x_row = 0
+#if PLOW_NV_TOKEN_BATCH_BF16
+                                , const PlowTokenBatch* row_batch = nullptr
+#endif
                                 ) {
     static_assert(HD % 64 == 0,
                   "head_dim must be a multiple of 64 so the half-split RoPE partner (i, i+HD/2) "
@@ -1041,6 +1047,15 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
             if (!mixed_row.active) continue;
         }
 #endif
+#if PLOW_NV_TOKEN_BATCH_BF16
+        PlowTokenRow token_row{};
+        if (row_batch) {
+            if (row_batch->row_capacity != ntok) { __trap(); return; }
+            token_row = plow_token_row(row_batch, t);
+            if (!token_row.active) continue;
+            if (pos && (unsigned)pos[t] != token_row.position) { __trap(); return; }
+        }
+#endif
         const size_t ibase = x_row ? (size_t)t * x_row + (size_t)hh * hd : ((size_t)t * nhead + hh) * hd;
         /* KV write (out_stride!=0): per-row slot map (batched prefill), per-batch ring when
          * n_batch_kv!=0 (the row index derives from pos[t] — at n_batch_kv==1 this is the
@@ -1050,6 +1065,12 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
         const size_t obase =
             out_stride
                 ? (
+#if PLOW_NV_TOKEN_BATCH_BF16
+                   row_batch
+                       ? ((size_t)(token_row.slot * nhead + hh) * out_stride +
+                          (token_row.position & kv_mask)) * hd
+                       :
+#endif
 #if PLOW_MIXED_STEP
                    mixed
                        ? ((size_t)(mixed_row.slot * nhead + hh) * out_stride +
