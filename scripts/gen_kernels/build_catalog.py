@@ -560,12 +560,16 @@ class DecodeCase:
         self.slot = torch.tensor([(b * 5 + 3) % B for b in range(B)], device="cuda",
                                  dtype=torch.int32)
         if poison:
+            # The slot table can alias (B = 5 maps every sequence to slot 3): a row is dead only
+            # when no sequence of its slot reads it.
+            dead_of = {}
             for b in range(B):
                 n, s = int(self.lens[b]), int(self.slot[b])
                 lo = max(0, n - window) if window else 0
                 live = torch.arange(lo, n, device="cuda") & self.kv_mask
-                dead = torch.ones(self.kv_stride, dtype=torch.bool, device="cuda")
-                dead[live] = False
+                dead_of.setdefault(s, torch.ones(self.kv_stride, dtype=torch.bool,
+                                                 device="cuda"))[live] = False
+            for s, dead in dead_of.items():
                 for t in (self.k, self.v):
                     if ilv:
                         t[s, dead] = float("nan")
@@ -800,6 +804,8 @@ def cmd_bench(a):
         else:
             res = bench_any(drv, name, image, arena, row["config"]["threads"], classes)
         print(name, json.dumps(res, indent=1))
+        if a.poison and any(not v["rel_l2"] < 2e-2 for v in res.values()):
+            sys.exit(f"{name}: a masked K/V row reached the output (rel_l2 above 2e-2 or NaN)")
         if a.px4:
             for r in rows:
                 if r % 64 == 0:
