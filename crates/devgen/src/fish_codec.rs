@@ -277,14 +277,25 @@ pub fn lower_fish_dac(
         let Some(name) = tensor.name.strip_prefix("w.") else {
             continue;
         };
-        let (dtype, mut bytes) = match name.strip_suffix(".a12") {
-            Some(unit) => {
+        let rep_stride = name.strip_suffix(".b_rep").and_then(|base| {
+            cfg.ups
+                .iter()
+                .enumerate()
+                .find(|(u, _)| base == format!("up{u}.convt"))
+                .map(|(_, &(stride, _))| (base, stride))
+        });
+        let (dtype, mut bytes) = match (name.strip_suffix(".a12"), rep_stride) {
+            (Some(unit), _) => {
                 let (d1, mut a) = reader.read(&format!("{unit}.a1"))?;
                 let (_, b) = reader.read(&format!("{unit}.a2"))?;
                 a.extend_from_slice(&b);
                 (d1, a)
             }
-            None => reader.read(name)?,
+            (None, Some((base, stride))) => {
+                let (d, b) = reader.read(&format!("{base}.b"))?;
+                (d, b.repeat(stride as usize))
+            }
+            (None, None) => reader.read(name)?,
         };
         // Every ConvT whose Conv takes phase-major weights (`codec::phase_major`): the decoder
         // blocks' upsamplers and the post-transformer ConvNeXt upsamplers (kernel = stride).
@@ -1130,19 +1141,36 @@ fn program_for(
     let mut rows = frames;
     for (u, &(stride, ln_eps)) in cfg.ups.iter().enumerate() {
         let w = |s: &str| format!("w.up{u}.{s}");
-        let mut c = conv(
-            other(cur.output),
-            w("convt.w"),
-            Some(w("convt.b")),
-            rows,
-            dim,
-            dim,
-            stride,
-        );
-        c.transpose = true;
-        c.stride = stride;
-        c.dilation = 0;
-        c.pad = 0;
+        // Breeze under split-bf16: kernel = stride, so the transposed conv is a pointwise conv to
+        // stride x dim columns over the phase-major weights ([stride][dim][dim]), whose rows read
+        // back as stride output rows each (bias repeated per phase, `.b_rep`).
+        let pointwise = cfg.breeze && splits.is_some() && dim % 4 == 0 && dim >= 16;
+        let mut c = if pointwise {
+            conv(
+                other(cur.output),
+                w("convt.w"),
+                Some(w("convt.b_rep")),
+                rows,
+                dim,
+                stride * dim,
+                1,
+            )
+        } else {
+            let mut c = conv(
+                other(cur.output),
+                w("convt.w"),
+                Some(w("convt.b")),
+                rows,
+                dim,
+                dim,
+                stride,
+            );
+            c.transpose = true;
+            c.stride = stride;
+            c.dilation = 0;
+            c.pad = 0;
+            c
+        };
         c.len = len(u);
         let mut p = s.p.take().unwrap();
         let up = fused_conv(&mut p, fuse, splits, cur.output, cur.done, c)?;
