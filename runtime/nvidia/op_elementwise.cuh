@@ -180,6 +180,29 @@ static __device__ __forceinline__ float sf_neg_log_exp1(unsigned long long seed,
 #ifndef PLOW_NV_SAMPLE_RADIX
 #define PLOW_NV_SAMPLE_RADIX 1
 #endif
+/* The depth stage's arena-staged head GEMV input and per-warp Gumbel pick (plow_config.h: packets
+ * with depth programs; those launch on the decode, _gw and speech objects, never on a prefill
+ * object). Like the radix top-k, inlined everywhere they grew frames of objects that never run
+ * them (Qwen3-TTS prefill 824 -> 840 B, segmented GEMM 1232 -> 1264 B); 0 keeps the RC9 bodies,
+ * same results. */
+#ifndef PLOW_NV_DEPTH_STAGE
+#define PLOW_NV_DEPTH_STAGE 1
+#endif
+#if PLOW_NV_DEPTH_STAGE && !(defined(PLOW_NV_PREFILL) && PLOW_NV_PREFILL)
+#define GV_DEPTH_FAST 1
+#else
+#define GV_DEPTH_FAST 0
+#endif
+/* d_sample_small's Gumbel pick on a full warp instead of one lane: same pick, +16 B on the
+ * Qwen3-TTS decode frame (112 -> 128) and no measured gain yet, so off. */
+#ifndef PLOW_NV_GUMBEL_WARP
+#define PLOW_NV_GUMBEL_WARP 0
+#endif
+#if PLOW_NV_GUMBEL_WARP && GV_DEPTH_FAST
+#define GV_GUMBEL_WARP 1
+#else
+#define GV_GUMBEL_WARP 0
+#endif
 /* Whether shared bytes up to `end` lie inside this launch's shared allocation (static + dynamic):
  * the radix top-k scratch sits past the row, so a large vocabulary or a narrow launch claim takes
  * the K-round selection instead. */
@@ -375,6 +398,7 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
     const unsigned per = (N + nblk - 1) / nblk;
     const unsigned n0 = slice * per;
     const unsigned n1 = min(n0 + per, N);
+#if GV_DEPTH_FAST
     if (n0 >= n1) return;
     __nv_bfloat16* xs = (__nv_bfloat16*)arena;
     if ((K & 7u) == 0 && ((uintptr_t)x & 15u) == 0 && smem_fits(xs + (size_t)M * K)) {
@@ -383,6 +407,9 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
         __syncthreads();
         x = xs;
     }
+#else
+    (void)arena;
+#endif
     for (unsigned n = n0 + warp; n < n1; n += PLOW_NV_WARPS) {
         const __nv_bfloat16* wr = W + (size_t)n * K;
         for (unsigned m0 = 0; m0 < M; m0 += 8) {
@@ -920,6 +947,7 @@ static __device__ __forceinline__ unsigned long long f32_key(float f, unsigned i
     const unsigned key = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
     return ((unsigned long long)key << 32) | (unsigned long long)(~i);
 }
+#if GV_GUMBEL_WARP
 /* argmax over i < n of sv[i] + sf_neg_log_exp1(seed, step, coord, 0, i) by one full warp: lanes scan
  * i = lane, lane + 32, ... with strict >, then (max score, lowest i) across lanes = a serial strict->
  * scan's pick; nothing above -inf (or NaN) picks 0. */
@@ -939,6 +967,7 @@ static __device__ __forceinline__ unsigned gumbel_pick_warp(const float* sv, uns
     }
     return best == 0xFFFFFFFFu ? 0u : best;
 }
+#endif
 static __device__ void d_sample_small(unsigned* __restrict__ out, const float* __restrict__ logits,
                                       const float* __restrict__ params, const unsigned* __restrict__ ctl,
                                       const unsigned long long* __restrict__ seed, unsigned* __restrict__ bitmap,
@@ -1000,8 +1029,13 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
                 __syncthreads();
             }
         }
+#if GV_GUMBEL_WARP
         if (threadIdx.x < 32u) {
             const unsigned lane = threadIdx.x;
+#else
+        if (threadIdx.x == 0) {
+            const unsigned lane = 0;
+#endif
             const unsigned step = ctl[2u * r + 1u];
             unsigned n = K;
             if (p[1] < 1.f && lane == 0) {
@@ -1013,8 +1047,17 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
                     cum += expf(sv[i] - sv[0]) / z;
                 }
             }
+#if GV_GUMBEL_WARP
             n = __shfl_sync(0xffffffffu, n, 0);
             const unsigned best = gumbel_pick_warp(sv, n, seed[r], step, coord);
+#else
+            unsigned best = 0;
+            float bv = -INFINITY;
+            for (unsigned i = 0; i < n; i++) {
+                const float v = sv[i] + sf_neg_log_exp1(seed[r], step, coord, 0u, i);
+                if (v > bv) { bv = v; best = i; }
+            }
+#endif
             if (lane == 0) {
                 unsigned c = sel[best];
                 const size_t o = (size_t)r * out_stride + out_col0;

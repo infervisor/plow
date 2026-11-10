@@ -1024,7 +1024,7 @@ pub(super) fn run(
     };
     std::fs::write(outp, bytes).expect("write gpt_oss blob");
     if !arch.is_empty() {
-        let man = manifest::build(&m, arch, &lean);
+        let man = manifest::build_without_depth(&m, arch, &lean);
         crate::report_dispatch_audit(&man);
         manifest::write_config_header(&outp.with_file_name("plow_config.h"), &man)
             .expect("gpt_oss config header");

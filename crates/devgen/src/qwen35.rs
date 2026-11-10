@@ -1924,7 +1924,7 @@ pub(super) fn run(
         eprintln!("  library prefill attention: {selected} segments");
     }
     let lean = apply_verify_gate(&m, verify);
-    let man = manifest::build(&m, arch, &lean);
+    let man = manifest::build_without_depth(&m, arch, &lean);
     crate::report_dispatch_audit(&man);
     let out = Path::new(out);
     crate::decode_objects::append(

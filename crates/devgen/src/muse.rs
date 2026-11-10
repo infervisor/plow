@@ -1318,7 +1318,7 @@ pub(super) fn run(
     std::fs::write(outp, m.to_blob_v6(&sections)).expect("write muse_spark blob");
     if !arch.is_empty() {
         write_lean_receipts(outp, &lean);
-        let mut man = manifest::build(&m, arch, &lean);
+        let mut man = manifest::build_without_depth(&m, arch, &lean);
         if emit_config::active().fa_gf_64.is_some() {
             man["tuning"]["gf64"] = serde_json::json!(fa_gf(c.heads, c.kv_heads));
             man["pairing"]["hash"] =
