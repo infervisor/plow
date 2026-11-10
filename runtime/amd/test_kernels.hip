@@ -14,6 +14,41 @@
 #include "op_elementwise.h"
 #include "op_norm.h"
 
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+#include "op_gemm.h"
+#include "op_collective.h"
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void gemm_f32_parts_test(
+    float* out, const bf16* a, const bf16* w, unsigned m, unsigned n, unsigned k) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    if(m>32) d_gemm_f32(out,a,w,m,n,k,blockIdx.x,gridDim.x,lds);
+    else d_gemv_bf16_f32(out, a, w, m, n, k, blockIdx.x, gridDim.x);
+}
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void reduce_f32_parts_test(
+    bf16* out, const float* a, const float* b, unsigned n) {
+    const void* peers[2]={a,b};
+    d_xreduce_f32_parts(out,peers,0,2,n,blockIdx.x,gridDim.x);
+}
+#endif
+
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void residual_f32_test(
+    unsigned op, void* out, float* resid, const float* a, const bf16* b,
+    const bf16* gb, const bf16* gn, const int* ids, unsigned rows, unsigned feat,
+    float eps, float scale) {
+    __shared__ float part[PLOW_WAVES];
+    switch (op) {
+        case 0: d_embed_residual_f32((float*)out, b, ids, rows, feat, scale,
+                                    blockIdx.x, gridDim.x); break;
+        case 1: d_rmsnorm_residual_f32((bf16*)out, a, gb, rows, feat, eps,
+                                      blockIdx.x, gridDim.x, part); break;
+        case 2: d_norm_residual_f32((float*)out, a, b, gb, rows, feat, eps, scale,
+                                    blockIdx.x, gridDim.x, part); break;
+        case 3: d_norm_residual_norm_f32((bf16*)out, resid, a, b, gb, gn, rows,
+                                         feat, eps, scale, blockIdx.x, gridDim.x, part); break;
+    }
+}
+#endif
+
 /* PLOW_TK_SAFE_ONLY builds just the wrappers whose op bodies carry no CDNA4-only
  * instruction and no LDS arena over 64 KiB -- i.e. the set a gfx942 (CDNA3) object can
  * hold today. The GEMM / attention / MoE wrappers below stage 144 KiB and issue the
@@ -67,6 +102,10 @@
  * One 1-thread launch at startup closes it. Cheap enough to be unconditional. */
 extern "C" __global__ void plow_probe_wg_threads(unsigned* out) {
     if (threadIdx.x == 0) *out = PLOW_THREADS;
+}
+
+extern "C" __global__ void plow_probe_host_roundtrip(unsigned* value) {
+    if (threadIdx.x == 0) *value += 1;
 }
 
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_rmsnorm_bf16(
@@ -187,6 +226,41 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_logit_softcap_bf16(
     bf16* out, const bf16* x, unsigned n, float cap) {
     d_softcap(out, x, n, cap, blockIdx.x, gridDim.x);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void embed_overlay_bf16_test(
+    bf16* out, const bf16* table, const unsigned* tokens, const float* overlay,
+    const unsigned* overlay_index, unsigned rows, unsigned width, unsigned vocab,
+    unsigned overlay_rows) {
+    d_embed_overlay(out, table, tokens, overlay, overlay_index, rows, width, vocab,
+                    overlay_rows, blockIdx.x, gridDim.x);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void embed_pos_bf16_test(
+    bf16* out, const bf16* table, const unsigned* tokens, const bf16* pos_table,
+    const unsigned* pos, const unsigned* base, unsigned rows, unsigned width,
+    unsigned vocab, unsigned pos_rows) {
+    d_embed_pos(out, table, tokens, pos_table, pos, base, rows, width, vocab,
+                pos_rows, blockIdx.x, gridDim.x);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void embed_frame_bf16_test(
+    bf16* out, const bf16* table, const unsigned* tokens, const bf16* cb,
+    const unsigned* codes, const float* nw, unsigned rows, unsigned width, unsigned vocab,
+    unsigned K, unsigned cb_size, unsigned frame_lo, unsigned frame_rows, unsigned mode,
+    float div, float eps) {
+    __shared__ float arena[PLOW_WAVES];
+    d_embed_frame(out, table, tokens, cb, codes, nw, rows, width, vocab, K, cb_size,
+                  frame_lo, frame_rows, mode, div, eps, blockIdx.x, gridDim.x, arena);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void per_layer_input_test(
+    bf16* x, const bf16* wg, const bf16* wp, const bf16* gamma, const bf16* ple,
+    bf16* hn, const bf16* gnext, unsigned rows, unsigned H, unsigned P, unsigned col0,
+    unsigned stride, float eps, float ls) {
+    __shared__ __align__(16) bf16 lds[32768];
+    d_per_layer_input(x, wg, wp, gamma, ple, hn, gnext, rows, H, P, col0, stride, eps, ls,
+                      blockIdx.x, gridDim.x, lds, 32768);
 }
 
 #if !PLOW_TK_SAFE_ONLY
@@ -707,6 +781,34 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
         d_gemv_t<MM>(C, x, W, rms, gamma, M, N, K, (int)norm, 1e-6f, blockIdx.x, gridDim.x,  \
                      lds);                                                                  \
     }
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemv_argmax_test(
+    bf16* C, const bf16* x, const bf16* W, unsigned long long* part,
+    unsigned M, unsigned N, unsigned K, float cap) {
+    __shared__ __align__(16) bf16 lds[32768];
+    d_gemv_argmax(C, x, W, part, M, N, K, cap, blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemv_unfused_test(
+    bf16* C, const bf16* x, const bf16* W, unsigned M, unsigned N, unsigned K) {
+    __shared__ __align__(16) bf16 lds[GM_LDS_HALVES];
+    for (unsigned m = 0; m < M; m++) {
+        d_gemv(C + (size_t)m * N, x + (size_t)m * K, W, nullptr, nullptr,
+               1u, N, K, 0, 0.0f, blockIdx.x, gridDim.x, lds);
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void argmax_test(
+    unsigned long long* part, const bf16* x, unsigned N, unsigned M) {
+    __shared__ unsigned long long lds[PLOW_WAVES];
+    d_argmax(part, x, N, M, blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void argmax_fin_test(
+    int* ids, const unsigned long long* part, unsigned nparts, unsigned M) {
+    d_argmax_fin(ids, part, nparts, M, blockIdx.x);
+}
 
 /* ACTIVATION QUANT — the w8a8 prefill's activation half, and the piece the GEMM_FP8_VARIANT
  * kernels above cannot test: they take a ready-made ascale, so nothing exercised the per-row

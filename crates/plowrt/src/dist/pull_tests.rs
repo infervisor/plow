@@ -140,6 +140,7 @@ fn bundle(label: &str, gen: u32, pkt_sha: &str, pkt_bytes: u64, objset_id: &str)
             layout: "native-mxfp4".into(),
             bytes: 1_590_000_000_000,
             files: vec![],
+            views: vec![],
         },
         objset: Some(BundleObjset {
             objset_id: objset_id.into(),
@@ -150,6 +151,7 @@ fn bundle(label: &str, gen: u32, pkt_sha: &str, pkt_bytes: u64, objset_id: &str)
         pairing_hash: Some("0x9fd0e880fb6fbf09".into()),
         runtime_env: BTreeMap::from([("PLOW_CTR_DBUF".into(), "1".into())]),
         recipe: None,
+        executor: None,
     }
 }
 
@@ -171,6 +173,7 @@ fn variant(label: &str, gen: u32, manifest_sha: &str, objset_id: &str) -> Varian
             plowc: "0.2.0".into(),
             objset_id: objset_id.into(),
             pairing_hash: Some("0x9fd0e880fb6fbf09".into()),
+            executor: None,
         },
         manifest: format!("manifests/{label}@g{gen}"),
         sha256: manifest_sha.into(),
@@ -392,6 +395,7 @@ fn a_dist_checkpoint_is_pulled_as_blobs_and_linked_into_its_snapshot() {
                 }
             })
             .collect(),
+        views: vec![],
     };
     let manifest_sha = f.write(
         &format!("v1/infervisor/kimi-k3/manifests/{LABEL}@g1"),

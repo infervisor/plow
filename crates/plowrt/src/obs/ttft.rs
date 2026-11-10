@@ -87,6 +87,11 @@ pub static PREFILL: Phase = Phase::new("prefill TOTAL (engine thread)");
 
 /// First token: detokenise + push onto the response channel.
 pub static FIRST_TOK: Phase = Phase::new("first token detok + channel send");
+/// Speech: the first frame reaching the stream -> its first codec step submitted (the frames the
+/// first step waits for: later decode ticks and their depth stages).
+pub static SPEECH_FRAMES: Phase = Phase::new("speech: first frame -> first codec step");
+/// Speech: the first codec step (queue + launch + readback).
+pub static SPEECH_CODEC: Phase = Phase::new("speech: first codec step");
 
 const PHASES: &[&Phase] = &[
     &TEMPLATE,
@@ -103,6 +108,8 @@ const PHASES: &[&Phase] = &[
     &PF_READ,
     &PF_SEGMENTS,
     &FIRST_TOK,
+    &SPEECH_FRAMES,
+    &SPEECH_CODEC,
 ];
 
 /// Zero every phase. Called by the arriving request; safe at concurrency 1 only.

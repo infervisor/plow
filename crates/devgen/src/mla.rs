@@ -4181,8 +4181,7 @@ fn declare_glm_rows_batched_for_prefill(
             && lt.shared
             && !fold
             && tp > 1
-            && emit_config::active().glm_seq_par()
-            && !emit_config::active().no_xreduce;
+            && emit_config::active().glm_seq_par();
         prefill_rows
             .iter()
             .copied()
@@ -5642,8 +5641,7 @@ fn declare_glm_rows_batched_for_prefill(
 /// `Residual` to fold: the `MoeCombine`/dense-down packet writes `x_out = xmid + ffn` itself
 /// (the collective is what forces the partial+Residual split in the first place), so the seam is
 /// a lone `RmsNorm` and folding it would need a norm epilogue inside the combine — a different
-/// change. `PLOW_NO_XREDUCE` takes the same tp==1-shaped branch and is excluded for the same
-/// reason. Both ends of the seam ask this one predicate, so producer and consumer cannot disagree.
+/// change. Both ends of the seam ask this one predicate, so producer and consumer cannot disagree.
 ///
 /// `gin` is the `input_layernorm` the seam's `AddNorm` normalizes with. Under `PLOW_EMIT_REWRITE`
 /// the rewrite's extracted fused graph decides each seam in place of the knob.
@@ -5651,7 +5649,6 @@ fn glm_fuse_seam(b: &Builder, tp: u32, gin: u32) -> bool {
     crate::rewrite_lower::fused(b, crate::rewrite_lower::Lowering::AddNorm, gin)
         .unwrap_or(emit_config::active().glm_fuse_seam)
         && tp > 1
-        && !emit_config::active().no_xreduce
 }
 
 /// The Q-NORM FOLD gate (`PLOW_GLM_FUSE_QNORM`): may `q_a_layernorm` be computed inside fusion
@@ -6952,10 +6949,6 @@ fn emit_glm_mla_ex(
     // 12 o_proj (NH_l*VD -> H)  [row-parallel]: each rank sums its head-shard into a PARTIAL H-vector.
     //   Under TP the partial goes to the peer-mapped og_tp slot and an XReduce all-reduces the N
     //   partials into n.attn; at tp==1 o_proj writes n.attn directly (byte-identical).
-    // PLOW_NO_XREDUCE (diagnostic): drop the 156 all-reduce collectives (o_proj writes n.attn
-    // directly with only this rank's partial) — numerically WRONG but same graph minus the
-    // cross-GPU rendezvous, to isolate the XReduce cost. Never set for a real decode.
-    let no_xr = tp > 1 && emit_config::active().no_xreduce;
     // GLM_LINEAR_FP8: `o_proj` is a whole block-fp8 checkpoint tensor the prep dequantises. On the
     // fp8 arm it goes through GEMV_FP8_BLK (44) reading the checkpoint's own [128,128] grid from
     // t5 — the same opcode/slot the dense-FFN down projection already uses (`dense_down_op`).
@@ -6984,7 +6977,7 @@ fn emit_glm_mla_ex(
     // never materialised on this arm (its only consumer was the seam itself).
     // XReduceAddNorm is a one-row kernel (feat in i[0]); at rows > 1 fall back to the unfused
     // pair, which it is bit-identical to by construction — no numerics change, one packet more.
-    let fuse_xrn = fuse_b1 && tp > 1 && !no_xr && rows == 1 && emit_config::active().glm_fuse_xrn;
+    let fuse_xrn = fuse_b1 && tp > 1 && rows == 1 && emit_config::active().glm_fuse_xrn;
     if fuse_xrn {
         assert!(
             h <= 2 * 8 * 512 && h % 8 == 0,
@@ -7006,7 +6999,7 @@ fn emit_glm_mla_ex(
             d.f[0] = eps;
         });
     }
-    let c_op = if tp > 1 && !no_xr {
+    let c_op = if tp > 1 {
         let c_p = o_gemv(b, n.og_tp, &[c_uv]);
         emit_xreduce(b, xgate, true, xr_cus, c_p, n.attn, rows * h, tp, 0)
     } else {
@@ -7993,7 +7986,6 @@ fn glm_sp(c: &GlmCfg, n: &GlmTn, b: &Builder, t: u32) -> bool {
         && (!b.packed_prefill_segments()
             || b.token_batch_band().is_some()
             || !c.softmax_layers.is_empty())
-        && !emit_config::active().no_xreduce
 }
 
 /// Rank-relative band view `<base>@band<t>`: rows `[rank*t/tp, (rank+1)*t/tp)` of a `[t][row]`
@@ -8211,14 +8203,7 @@ fn xr_band_cus(xr_cus: &[u32]) -> Vec<u32> {
     }
 }
 
-fn xr_band_k(t: u32, seam: &str) -> u32 {
-    // PLOW_GLM_XR_BAND_SEAM=attn|moe restricts banding to one seam — a bisect
-    // instrument for isolating which seam a bad blob's divergence comes from.
-    if let Some(s) = emit_config::active().glm_xr_band_seam.as_deref() {
-        if s != seam {
-            return 1;
-        }
-    }
+fn xr_band_k(t: u32) -> u32 {
     let k = emit_config::active().glm_xr_band.unwrap_or(1);
     if (2..=8).contains(&k) && t % k == 0 && t / k >= 512 {
         k
@@ -10667,7 +10652,6 @@ pub(crate) fn emit_glm_mla_prefill(
             }
         }
     };
-    let no_xr = tp > 1 && emit_config::active().no_xreduce;
     // Banding is bf16-GEMM-only: the five tiled bf16 wrappers carry c_row0 (i[5]); the
     // block-fp8 and MXFP4 GEMM families do not, and banding them would silently overwrite
     // band 0's rows.
@@ -10681,7 +10665,7 @@ pub(crate) fn emit_glm_mla_prefill(
     {
         1
     } else {
-        xr_band_k(t, "attn")
+        xr_band_k(t)
     };
     if sp {
         // Sequence-parallel attention seam: reduce-scatter the o_proj partial in place, residual
@@ -10771,7 +10755,7 @@ pub(crate) fn emit_glm_mla_prefill(
             xr_cus,
         );
     }
-    let xr_deps: Vec<u32> = if tp > 1 && !no_xr && kb > 1 {
+    let xr_deps: Vec<u32> = if tp > 1 && kb > 1 {
         // BANDED TP seam (see emit_xreduce_twoshot_band): K row-band o_proj GEMMs, each
         // feeding its own two-shot — band 0's fabric transfer overlaps bands 1..K-1's
         // compute. a_row0/c_row0 keep the bands inside the ONE og_tp partial, so the
@@ -10813,7 +10797,7 @@ pub(crate) fn emit_glm_mla_prefill(
                 )
             })
             .collect()
-    } else if tp > 1 && !no_xr {
+    } else if tp > 1 {
         let c_p = oproj(b, n.og_tp, &[c_uv]);
         if xr_res_fold() {
             // XR+Residual fold: the all-gather writes xmid = x_in + reduced directly and the
@@ -10859,7 +10843,7 @@ pub(crate) fn emit_glm_mla_prefill(
     //   does — T rows already parallelise the norm, so the fusion buys a gate and costs the
     //   byte-identity that made B1 opt-in in the first place. Under the XR_RES fold the
     //   Residual was folded into the collective above and the norm gates on the XR directly.
-    let folded_attn = tp > 1 && !no_xr && kb == 1 && xr_res_fold();
+    let folded_attn = tp > 1 && kb == 1 && xr_res_fold();
     let rs_deps: Vec<u32> = if folded_attn {
         xr_deps
     } else {
@@ -11434,9 +11418,8 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
         && !det
         && !seed
         && tp > 1
-        && !emit_config::active().no_xreduce
         && glm_sp(c, n, b, t)
-        && xr_band_k(t, "moe") == 1;
+        && xr_band_k(t) == 1;
     let sh_out = if pf_acc { n.dg_tp } else { n.shared };
     // 17 shared expert down — row-parallel (imoe_l input): a PARTIAL [T,H] under TP.
     let c_shd = if shared_pre.is_some() {
@@ -11621,13 +11604,12 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
     //    xmid (XReduce would sum it tp times): it writes the partial with a zero residual, the
     //    two-shot all-reduce folds the ranks, and a Residual then adds the real xmid. tp==1 keeps
     //    the fused xmid combine — the same structure the decode block uses, one phase up.
-    let no_xr = tp > 1 && emit_config::active().no_xreduce;
-    if tp > 1 && !no_xr {
+    if tp > 1 {
         // Banded TP seam (see emit_xreduce_twoshot_band): K row-band combines, each feeding
         // its own two-shot, so a band's fabric transfer overlaps the later bands' combines
         // — and, K>1 aside, the LAST band's transfer is all that stays exposed before the
         // Residual. kb==1 emits the exact pre-banding packets.
-        let kb = xr_band_k(t, "moe");
+        let kb = xr_band_k(t);
         let rows = t / kb;
         // Sequence-parallel FFN seam: reduce-scatter, then the residual on the owned band only;
         // the next layer's input norm (or the tail's final norm) gathers. Under `raw_output`
@@ -11820,8 +11802,7 @@ fn emit_glm_dense_mxfp4_rows(
             d.f[1] = limit;
         })
     };
-    let no_xr = c.tp > 1 && emit_config::active().no_xreduce;
-    let partial = if c.tp > 1 && !no_xr {
+    let partial = if c.tp > 1 {
         n.dg_tp
     } else if raw_output {
         n.attn
@@ -11833,7 +11814,7 @@ fn emit_glm_dense_mxfp4_rows(
         d.t[..4].copy_from_slice(&[partial, n.dfu, w.ddown, w.ddown_s]);
         d.i[..3].copy_from_slice(&[rows, h, di_l]);
     });
-    if c.tp > 1 && !no_xr {
+    if c.tp > 1 {
         if prefill && glm_sp(c, n, b, rows) {
             assert!(
                 !raw_output,
@@ -11999,8 +11980,7 @@ fn emit_glm_dense_block_prefill(
     // Combine. Identical TP structure to the MoE prefill block: under TP the partial is combined
     // with a ZERO residual, two-shot all-reduced, and the real residual added after — folding xmid
     // in before the all-reduce would sum it tp times.
-    let no_xr = tp > 1 && emit_config::active().no_xreduce;
-    if tp > 1 && !no_xr {
+    if tp > 1 {
         let c_cmb = b.emit(DevOp::MoeCombinePf, all.clone(), &[c_d], |d| {
             d.t[0] = n.dg_tp;
             d.t[1] = TENSOR_NONE; // see the MoE twin — a null residual IS the zero residual
@@ -12755,7 +12735,7 @@ fn emit_glm_moe_ffn_rows(
     let routed_w8a8 = emit_config::active().glm_routed_w8a8;
     // gfx950 AITER at TP: BF16 rows straight into the reduce source (mode 4, no combine);
     // otherwise into `part` (mode 2) for the one-partial combine below.
-    let aiter_direct = aiter950 && tp > 1 && !emit_config::active().no_xreduce;
+    let aiter_direct = aiter950 && tp > 1;
     let c_d = if aiter950 {
         let counter = b.emit(DevOp::MoeAiterFp8Pf, one.clone(), &[c_routes, c_rn2], |d| {
             d.t = [
@@ -12884,8 +12864,7 @@ fn emit_glm_moe_ffn_rows(
 
     // Combine + the decode-shaped TP seam: one-shot XReduce over rows*h, then the layer-seam
     // AddNorm (or Residual), exactly as the single-row decode block ends.
-    let no_xr = tp > 1 && emit_config::active().no_xreduce;
-    if tp > 1 && !no_xr {
+    if tp > 1 {
         let c_cmb = if aiter_direct {
             c_d
         } else {
@@ -13084,31 +13063,14 @@ pub(crate) fn emit_glm_moe_ffn(
             (0..n_cu).collect()
         }
     };
-    // GLM_ROUTER_OFF_SHARED=1: keep the router score GEMV OFF the shared expert's slice. The router
-    // is emitted before the shared expert and runs on all 256 CUs, so under cores>=2 the shared
-    // expert — which is gated only on c_rn2 and could start immediately — actually waits for the
-    // router's workgroups on ITS OWN CUs to retire. The router GEMV is N=256 outputs over 2048
-    // waves (7/8 of them idle, 4.4% of the bandwidth ceiling), so narrowing it to the routed-expert
-    // CUs costs nothing it was using and lets the shared expert start ~a router earlier.
-    //
-    // MEASURED: **+0.12 ms, i.e. nothing or slightly worse** (full model, TP4, ctx 1k, median of
-    // 65 — perf-data/glm52-decode-emitter-abs.md §3). Kept as the instrument that priced it. Do not
-    // re-propose this as a lever.
-    let router_cus: Vec<u32> = if cores >= 2 && emit_config::active().glm_router_off_shared {
-        (0..n_cu - shared_w).collect()
-    } else {
-        all.clone()
-    };
+    // The router keeps all CUs: narrowing it off the shared expert's slice MEASURED +0.12 ms
+    // (perf-data/glm52-decode-emitter-abs.md §3).
+    let router_cus: Vec<u32> = all.clone();
 
     // --- MoE ---
     // 15 router. DEFAULT (split): the 256-expert x K=6144 score matmul is the ordinary MULTI-CU
     //   wave-cooperative GEMV (all.clone()) — was the single-CU scalar dot that measured 73% of the
-    //   MoE layer — feeding a cheap 1-CU MoeRouterTopk tail (bit-exact selection). GLM_ROUTER_OLD=1
-    //   emits the fused single-CU d_moe_router for the before/after A/B.
-    assert!(
-        !emit_config::active().glm_router_old,
-        "GLM_ROUTER_OLD cannot represent GLM's FP32 router logits"
-    );
+    //   MoE layer — feeding a cheap 1-CU MoeRouterTopk tail (bit-exact selection).
     let c_router = {
         let score_op = if c.has_dsa || c.quark_mixed {
             DevOp::GemmF32
@@ -13428,8 +13390,7 @@ pub(crate) fn emit_glm_moe_ffn(
     let mut deps = Vec::with_capacity(1 + downs.len());
     deps.push(c_shd);
     deps.extend_from_slice(&downs);
-    let no_xr = tp > 1 && emit_config::active().no_xreduce;
-    if tp > 1 && !no_xr {
+    if tp > 1 {
         let shared_src = if raw_output { n.attn } else { n.shared };
         // PLOW_GLM_XR_COMBINE: the tagged publish sums shared + slots itself (no dg_tp write).
         let c_xr = if emit_config::active().glm_xr_combine && tk <= 16 {
@@ -13473,16 +13434,6 @@ pub(crate) fn emit_glm_moe_ffn(
                 d.f[0] = 1.0;
             })
         }
-    } else if tp > 1 && no_xr {
-        // diagnostic: combine this rank's partials straight onto the residual, no all-reduce
-        b.emit(DevOp::MoeCombine, elem_cus(&all, h), &deps, |d| {
-            d.t[0] = if raw_output { n.attn } else { x_out };
-            d.t[1] = if raw_output { TENSOR_NONE } else { n.xmid };
-            d.t[2] = n.shared;
-            d.t[3] = n.part;
-            d.i[0] = h;
-            d.i[1] = tk;
-        })
     } else {
         b.emit(DevOp::MoeCombine, elem_cus(&all, h), &deps, |d| {
             d.t[0] = if raw_output { n.attn } else { x_out };
@@ -13620,8 +13571,7 @@ pub(crate) fn emit_glm_dense_ffn(
     // dense down (block-fp8 GEMV, op 44) — row-parallel (di_l input). Under TP writes a PARTIAL into
     //   the dg_tp peer slot, XReduce all-reduces into n.attn, then residual; at tp==1 writes n.shared
     //   and the residual reads it directly (byte-identical).
-    let no_xr = tp > 1 && emit_config::active().no_xreduce;
-    if tp > 1 && !no_xr {
+    if tp > 1 {
         let c_down = b.emit(dense_down_op(enc), all.clone(), &[c_glu], |d| {
             d.t[0] = n.dg_tp;
             d.t[1] = n.dfu;
@@ -13658,34 +13608,6 @@ pub(crate) fn emit_glm_dense_ffn(
                 d.t[0] = x_out;
                 d.t[1] = n.xmid;
                 d.t[2] = n.attn;
-                d.i[0] = h;
-                d.f[0] = 1.0;
-            })
-        }
-    } else if tp > 1 && no_xr {
-        let c_down = b.emit(dense_down_op(enc), all.clone(), &[c_glu], |d| {
-            d.t[0] = n.shared;
-            d.t[1] = n.dfu;
-            d.t[2] = w.ddown;
-            // GEMV_FP8_BLK reads its scale from t5; GEMV_MXFP4 reads E8M0 from t3. Different slot,
-            // so bind by encoding rather than assuming the quantized arms agree.
-            if enc == MoeEnc::Mxfp4 {
-                d.t[3] = w.ddown_s;
-            } else {
-                d.t[5] = w.ddown_s;
-            }
-            d.i[0] = 1;
-            d.i[1] = h;
-            d.i[2] = di_l;
-            d.i[4] = 0;
-        });
-        if raw_output {
-            c_down
-        } else {
-            b.emit(DevOp::Residual, spine_cus(b.n_cu()), &[c_down], |d| {
-                d.t[0] = x_out;
-                d.t[1] = n.xmid;
-                d.t[2] = n.shared;
                 d.i[0] = h;
                 d.f[0] = 1.0;
             })
@@ -13838,8 +13760,7 @@ fn emit_glm_dense_ffn_rows(
             d.i[7] = if pf_split { 4 } else { 2 };
         }
     });
-    let no_xr = tp > 1 && emit_config::active().no_xreduce;
-    if tp > 1 && !no_xr {
+    if tp > 1 {
         let c_cmb = b.emit(DevOp::MoeCombinePf, all.clone(), &[c_d], |d| {
             d.t[0] = n.dg_tp;
             d.t[1] = TENSOR_NONE;
@@ -13950,7 +13871,7 @@ fn glm_emit_full(
         MoeEnc::from_flags(use_fp8, false)
     };
     let _expert_shard = c.expert_shard_layout();
-    // --glm-layers cap truncates the model to the first N layers — a single-GPU smoke test of the
+    // --layers cap truncates the model to the first N layers — a single-GPU smoke test of the
     // decode LOOP mechanics (embed/chain/KV-row patch/argmax/multi-step) that fits without TP or
     // all 78 layers' weights. Default = full 0..77 (layer 78 = MTP, skipped).
     let (_full, cap, _single) = emit_config::active().layer_cfg();

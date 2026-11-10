@@ -10,6 +10,105 @@ use crate::{Result, RuntimeError};
 
 use super::GpuEngine;
 
+const SPEECH_IDENTITIES: usize = 1 << 20;
+
+pub(super) fn prefix_with_tail_room(rows: usize, max_ctx: usize, tail: Option<usize>) -> usize {
+    rows.min(max_ctx.saturating_sub(tail.unwrap_or(0)))
+}
+
+pub(super) struct SpeechIdentities {
+    next: u32,
+    rows: rustc_hash::FxHashMap<u64, u32>,
+}
+
+impl SpeechIdentities {
+    pub(super) fn new(vocab: usize) -> Self {
+        Self {
+            next: u32::try_from(vocab).unwrap_or(u32::MAX),
+            rows: Default::default(),
+        }
+    }
+
+    fn encode(&mut self, keys: &[u64]) -> Option<Arc<[u32]>> {
+        let mut ids = Vec::with_capacity(keys.len());
+        for key in keys {
+            let id = if let Some(&id) = self.rows.get(key) {
+                id
+            } else {
+                if self.rows.len() == SPEECH_IDENTITIES || self.next == u32::MAX {
+                    return None;
+                }
+                let id = self.next;
+                self.next += 1;
+                // Never recycle an identity while a VMM boundary or store block can name it.
+                self.rows.insert(*key, id);
+                id
+            };
+            ids.push(id);
+        }
+        Some(ids.into())
+    }
+}
+
+pub(super) struct SlotPrefixes {
+    rows: Vec<Vec<u64>>,
+    backing: Vec<Option<u64>>,
+    pub(super) epoch: u64,
+}
+
+impl SlotPrefixes {
+    pub(super) fn new(slots: usize) -> Self {
+        Self {
+            rows: vec![Vec::new(); slots],
+            backing: vec![None; slots],
+            epoch: 0,
+        }
+    }
+
+    pub(super) fn take(&mut self, slot: usize, keys: &[u64], backing: Option<u64>) -> usize {
+        let old = std::mem::take(&mut self.rows[slot]);
+        if !self.backing_matches(slot, backing) {
+            return 0;
+        }
+        old.iter()
+            .zip(keys)
+            .take(keys.len().saturating_sub(1))
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
+    pub(super) fn publish(&mut self, slot: usize, mut keys: Vec<u64>, backing: Option<u64>) {
+        keys.truncate(keys.len().saturating_sub(1));
+        self.rows[slot] = keys;
+        self.backing[slot] = backing;
+    }
+
+    pub(super) fn backing_matches(&self, slot: usize, backing: Option<u64>) -> bool {
+        self.backing[slot] == backing
+    }
+
+    pub(super) fn retained_rows(&self, slot: usize, backing: Option<u64>) -> usize {
+        if self.backing_matches(slot, backing) {
+            self.rows[slot].len()
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn clear(&mut self, slot: usize) {
+        self.rows[slot].clear();
+        self.backing[slot] = None;
+    }
+
+    pub(super) fn clear_all(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        for keys in &mut self.rows {
+            keys.clear();
+        }
+        self.backing.fill(None);
+    }
+}
+
 pub(crate) struct VmmPrefixLayout {
     pub(crate) geo: crate::memory::vmm::VmmGeometry,
     pub(super) slide: Vec<(usize, usize, u64)>,
@@ -226,12 +325,16 @@ impl GpuEngine {
             return declined("encoder overlay rows are not keyed by the prompt ids");
         }
         let requested = config.nv_vmm_prefix();
+        // GB202 (sm_120) auto-selects the cache for every packet with a layout, rank groups
+        // included. Hopper keeps the geometry allowlist it was qualified on; other targets
+        // need an explicit PLOW_VMM_PREFIX=1.
+        let gb202 = capability == (12, 0);
         if requested == Some(false)
             || (requested.is_none()
-                && (capability != (9, 0)
+                && ((capability != (9, 0) && !gb202)
                     || config.nv_vmm_live()
                     || config.nv_vmm_live_rings() == Some(true)
-                    || blob.tp.is_some()
+                    || (blob.tp.is_some() && !gb202)
                     || blob.sections.iter().any(|section| {
                         matches!(
                             section.name.as_str(),
@@ -244,13 +347,33 @@ impl GpuEngine {
             return declined(if requested == Some(false) {
                 "PLOW_VMM_PREFIX=0"
             } else {
-                "auto mode: not Hopper, live KV/rings, TP, or a mixed-step/decode-object packet"
+                "auto mode: not Hopper/GB202, live KV/rings, TP off GB202, or a mixed-step/decode-object packet"
             });
         }
         let Some(layout) = Self::vmm_prefix_layout(blob, kv, row_interleaved) else {
             return declined("no VMM prefix KV layout for this packet");
         };
-        if requested.is_none() {
+        if gb202 {
+            // KV element widths the snapshot path stores (BF16 rows, FP8 rows with
+            // per-token-head scales); no per-geometry allowlist on this target.
+            let g = &layout.geo;
+            if !matches!(g.elem, 1 | 2) || !matches!(g.elem_slide, 1 | 2) {
+                return declined("KV element width outside the snapshot path (1 or 2 bytes)");
+            }
+            tracing::info!(
+                hd_full = g.hd_full,
+                hd_slide = g.hd_slide,
+                window = g.window,
+                kv_elem = g.elem,
+                kv_elem_slide = g.elem_slide,
+                mode = if requested.is_none() {
+                    "auto"
+                } else {
+                    "explicit"
+                },
+                "vmm prefix layout accepted (PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables)"
+            );
+        } else if requested.is_none() {
             // Auto-selection is an allowlist of the geometry the sliding-ring
             // snapshot path was qualified on (Gemma 4 hybrid KV), not a
             // capability probe; other layouts need an explicit PLOW_VMM_PREFIX=1.
@@ -474,13 +597,17 @@ impl GpuEngine {
     }
 
     /// `state_tensors`: the engine's recurrent state tensors (`(devp index, per-slot bytes)`),
-    /// the block store's `State` class; empty for a model without one.
+    /// the block store's `State` class; empty for a model without one. `rank_group`: a
+    /// tensor-parallel rank, whose cache must decide every attach exactly as its peers do —
+    /// no host tier (sized from this process's view of free host RAM, and refilled by a
+    /// background thread).
     pub(super) fn vmm_bringup(
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
         layout: Option<VmmPrefixLayout>,
         live_rings: bool,
         state_tensors: &[(usize, u64)],
+        rank_group: bool,
     ) -> Result<Option<VmmServe>> {
         let Some(VmmPrefixLayout {
             geo,
@@ -520,11 +647,7 @@ impl GpuEngine {
             // cuMemCreate + map + set_access per unit, serial on the mux tick) cost 26B BF16 at
             // 1.8 sessions/s TTFT P99 1688 ms against 680 ms with every slot parked.
             let park = geo.batch;
-            if crate::config::RuntimeConfig::get().vmm_ring_recycle {
-                rings.enable_handle_recycling(crate::memory::vmm::kv_pool_cap());
-            } else {
-                rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
-            }
+            rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
             tracing::info!(
                 park,
                 slot_mib = rings.slot_charge() >> 20,
@@ -597,6 +720,7 @@ impl GpuEngine {
                     let auto = crate::memory::vmm::host_tier_auto();
                     let host_cap =
                         crate::memory::vmm::host_tier_grant(match rt.host_kvcache_bytes() {
+                            _ if rank_group => 0,
                             None => auto.map_or(0, |(cap, _)| cap),
                             Some(cap) => cap,
                         });
@@ -610,12 +734,10 @@ impl GpuEngine {
                             device_bytes / 4
                         },
                         host_cap,
+                        auto.map_or(0, |(_, reserve)| reserve),
                         state_tensors,
                     ) {
                         Ok(blocks) => {
-                            if let Some((_, reserve)) = auto {
-                                blocks.set_host_reserve(reserve);
-                            }
                             let kv = serve.kv.as_mut().expect("prefix pool");
                             kv.enable_block_store(
                                 std::sync::Arc::clone(&blocks)
@@ -670,6 +792,21 @@ impl GpuEngine {
         let Some(a) = att else {
             return Ok(());
         };
+        // Every prefill bucket writes all its rows: a tail left fewer rows of context than the
+        // narrowest bucket cannot run after the prefix, while the cold prompt (chunked from 0)
+        // can. Serve such a prompt cold.
+        let room = self.max_ctx.saturating_sub(a.rows as usize);
+        let narrowest = self.prefill.iter().map(|p| p.t as usize).min();
+        if prompt.len() > a.rows as usize && narrowest.is_some_and(|t| t > room) {
+            kv.begin_seq(b);
+            tracing::debug!(
+                slot = b,
+                rows = a.rows,
+                room,
+                "vmm: prefix attach declined, tail too near the context limit"
+            );
+            return Ok(());
+        }
         let restored = (|| {
             // The slot's own blocks hold the prefix: map them, then gather every row.
             kv.ensure_rows(b, a.rows + 1)?;
@@ -765,9 +902,28 @@ impl GpuEngine {
     }
 
     /// Whether slot `b`'s next sequence may attach a cached prefix: `false` for prompts whose rows
-    /// are not keyed by their ids alone (speech frame codes staged per chunk).
+    /// are not keyed by their ids alone (speech frame codes staged per chunk), which then publish
+    /// none either until retired.
     pub fn set_prefix_attach(&mut self, b: usize, on: bool) {
         self.prefix_attach_off[b] = !on;
+        if !on {
+            self.staged_speech_prefix[b] = None;
+        }
+    }
+
+    pub fn stage_speech_prefix(&mut self, b: usize, keys: &[u64]) -> bool {
+        self.staged_speech_prefix[b] = (self.vmm_prefix_enabled() && self.packed_depth_enabled())
+            .then(|| self.speech_identities.encode(keys))
+            .flatten();
+        let ready = self.staged_speech_prefix[b].is_some();
+        self.set_prefix_attach(b, ready);
+        ready
+    }
+
+    pub(super) fn record_prompt_prefix(&mut self, b: usize, prompt: &[u32], end: usize) {
+        let ids = self.speech_prefix[b].as_deref().unwrap_or(prompt);
+        self.seq_tokens[b].clear();
+        self.seq_tokens[b].extend_from_slice(&ids[..end]);
     }
 
     /// [`Self::attach_prompt`] with the prompt's block hashes already computed.
@@ -778,7 +934,12 @@ impl GpuEngine {
         key: Option<crate::memory::vmm::PrefixKey>,
     ) -> Result<usize> {
         if self.pos[b] == 0 && self.vmm_prefix_enabled() && !self.prefix_attach_off[b] {
-            self.vmm_attach(b, prompt, key)?;
+            let ids = self.speech_prefix[b].clone();
+            if ids.is_some() {
+                self.staged_prefix[b] = None;
+            }
+            let key = if ids.is_some() { None } else { key };
+            self.vmm_attach(b, ids.as_deref().unwrap_or(prompt), key)?;
         }
         Ok(self.pos[b] as usize)
     }
@@ -789,7 +950,16 @@ impl GpuEngine {
         p_a: u32,
         kind: crate::memory::vmm::Kind,
     ) -> bool {
-        let Some((v, kv)) = self.vmm_prefix() else {
+        if self.publish_off[b] {
+            return false;
+        }
+        if self.speech_prefix[b]
+            .as_ref()
+            .is_some_and(|ids| p_a as usize >= ids.len())
+        {
+            return false;
+        }
+        let Some((v, kv)) = self.vmm_prefix().filter(|_| !self.prefix_attach_off[b]) else {
             return false;
         };
         let rows = self.pos[b];
@@ -859,6 +1029,9 @@ impl GpuEngine {
         let Some((v, kv)) = self.vmm_prefix() else {
             return;
         };
+        let max_rows = self.speech_prefix[b].as_ref().map_or(max_rows, |ids| {
+            max_rows.min(ids.len().saturating_sub(1) as u32)
+        });
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         let g = kv.geometry();
@@ -1076,4 +1249,122 @@ fn prompt_end_covers_the_withheld_last_token() {
     assert!(!is_prompt_end(2048, 2047, 3000), "chunk end");
     assert!(!is_prompt_end(2999, 2048, 3000), "chunk-capped publish");
     assert!(!is_prompt_end(3100, 3099, 3000), "turn end");
+}
+
+#[cfg(test)]
+mod slot_prefix_tests {
+    use super::{prefix_with_tail_room, SlotPrefixes, SpeechIdentities};
+
+    #[test]
+    fn compact_prefix_leaves_a_physical_bucket_for_unmasked_tail_replay() {
+        use plow_asset::packed_prefill::{plan_with_limit, Request};
+        let start = prefix_with_tail_room(2039, 2048, Some(64));
+        assert_eq!(start, 1984);
+        for (start, masked, ok) in [
+            (2039, None, false),
+            (start, None, true),
+            (2039, Some(64), true),
+        ] {
+            let request = Request {
+                slot: 0,
+                start,
+                len: 2040 - start,
+                prompt: 2040,
+            };
+            assert_eq!(
+                plan_with_limit(&[request], &[start as u32], 64, 2048, masked).is_ok(),
+                ok
+            );
+        }
+        assert_eq!(prefix_with_tail_room(36, 2048, Some(64)), 36);
+        assert_eq!(prefix_with_tail_room(2039, 2048, None), 2039);
+    }
+
+    #[test]
+    fn reclaimed_slot_prefix_is_refused_even_after_the_slot_is_mapped_again() {
+        let mut cache = SlotPrefixes::new(1);
+        cache.publish(0, vec![1, 2, 3], Some(10));
+        assert_eq!(cache.retained_rows(0, Some(10)), 2);
+        assert_eq!(cache.retained_rows(0, None), 0);
+        assert_eq!(cache.take(0, &[1, 2, 3], Some(11)), 0);
+        cache.publish(0, vec![1, 2, 3], Some(12));
+        assert_eq!(cache.take(0, &[1, 2, 3], Some(12)), 2);
+        assert!(cache.backing_matches(0, Some(12)));
+        assert!(
+            !cache.backing_matches(0, Some(13)),
+            "a staged resume also needs its original backing"
+        );
+        cache.clear_all();
+        assert!(!cache.backing_matches(0, Some(12)));
+    }
+
+    #[test]
+    fn speech_identities_preserve_content_and_never_alias_token_ids() {
+        let mut ids = SpeechIdentities::new(8194);
+        let a = ids.encode(&[10, 20, 30, 20]).unwrap();
+        let b = ids.encode(&[10, 21, 30, 20]).unwrap();
+        assert!(a.iter().all(|&id| id >= 8194));
+        assert_eq!(a[0], b[0]);
+        assert_ne!(a[1], b[1]);
+        assert_eq!(a[2..], b[2..]);
+        assert_eq!(a[1], a[3]);
+        assert_eq!(&*a, &*ids.encode(&[10, 20, 30, 20]).unwrap());
+        ids.next = u32::MAX;
+        assert!(ids.encode(&[99]).is_none());
+        assert_eq!(&*a, &*ids.encode(&[10, 20, 30, 20]).unwrap());
+    }
+
+    #[test]
+    fn slot_prefix_keeps_only_matching_prompt_rows_and_always_replays_the_last() {
+        let mut cache = SlotPrefixes::new(2);
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(cache.take(1, &[10, 20, 30, 50], None), 0);
+        assert_eq!(cache.take(0, &[10, 20, 30, 50], None), 3);
+        assert_eq!(
+            cache.take(0, &[10, 20, 30, 50], None),
+            0,
+            "lookup consumes provenance"
+        );
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(
+            cache.take(0, &[10, 20], None),
+            1,
+            "the new prompt keeps a terminal row"
+        );
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(cache.take(0, &[10, 99, 30, 40], None), 1);
+        cache.publish(0, vec![10, 20, 30, 40], None);
+        assert_eq!(
+            cache.take(0, &[10, 20, 30, 40, 50], None),
+            3,
+            "decode-written rows are excluded"
+        );
+    }
+
+    #[test]
+    fn slot_prefix_requires_explicit_successful_publication_after_reseating() {
+        let mut cache = SlotPrefixes::new(2);
+        for slot in 0..2 {
+            cache.publish(slot, vec![1, 2, 3], None);
+        }
+        cache.clear(0);
+        assert_eq!(cache.take(0, &[1, 2, 3], None), 0);
+        assert_eq!(cache.take(1, &[1, 2, 3], None), 2);
+        // Refused resume or failed/cancelled prefill publishes nothing.
+        assert_eq!(cache.take(1, &[1, 2, 3], None), 0);
+        for slot in 0..2 {
+            cache.publish(slot, vec![1, 2, 3], None);
+        }
+        let epoch = cache.epoch;
+        cache.clear_all();
+        assert_ne!(
+            cache.epoch, epoch,
+            "a fault also invalidates pending publication"
+        );
+        for slot in 0..2 {
+            assert_eq!(cache.take(slot, &[1, 2, 3], None), 0);
+        }
+        cache.publish(0, vec![1], None);
+        assert_eq!(cache.take(0, &[1, 2], None), 0);
+    }
 }

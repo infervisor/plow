@@ -392,6 +392,17 @@ extern "C" __device__ unsigned plow_packed_prefill_abi_1 = 1;
  * packet-scalar kernel is exactly the silent wrong answer the contract exists to prevent. */
 extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
 extern "C" __device__ unsigned plow_row_gather_1 = 1;
+/* GEMV_ARGMAX, PER_LAYER_INPUT and the EMBED_{OVERLAY,POS,FRAME}_BF16 arms are gfx12-only until
+ * a CDNA object is gated with them: CDNA objects stay as shipped (devgen GFX12_DISPATCHED). */
+#if PLOW_GFX12
+extern "C" __device__ unsigned plow_gemv_argmax_1 = 1;
+extern "C" __device__ unsigned plow_per_layer_input_1 = 1;
+extern "C" __device__ unsigned plow_embed_overlay_bf16_1 = 1;
+extern "C" __device__ unsigned plow_embed_pos_bf16_1 = 1;
+#if !defined(PLOW_HAS_EMBED_FRAME_BF16) || PLOW_HAS_EMBED_FRAME_BF16
+extern "C" __device__ unsigned plow_embed_frame_bf16_1 = 1;
+#endif
+#endif
 #if PLOW_PACKED_PREFILL_DENSE_CONSUMERS
 extern "C" __device__ unsigned plow_packed_prefill_dense_consumers_1 = 1;
 #endif
@@ -580,9 +591,9 @@ __device__ __forceinline__ void d_xreduce_add_norm_mega(
             xctr_signal(PLOW_CTR(base, gate_id));
         }
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(lg) < nranks) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 xrn_bailed = 1;
                 break;
@@ -687,9 +698,9 @@ __device__ __forceinline__ void d_xreduce_hcpost_mega(
             xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_id));
     if (threadIdx.x == 0) {
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
-        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        const uint64_t t0 = plow_realtime();
         while (xctr_poll(lg) < nranks) {
-            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (plow_realtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 xhp_bailed = 1;
                 break;
@@ -787,6 +798,15 @@ extern "C" __device__ unsigned plow_mla_bmm_head_stride_1 = 1;
 extern "C" __device__ unsigned plow_opcode_sum4_bf16_1 = 1;
 #endif
 extern "C" __device__ unsigned plow_glu_silu_bf16_1 = 1;
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+extern "C" __device__ unsigned plow_residual_f32_1 = 1;
+#endif
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+#if PLOW_XR_TAGGED
+#error "FP32 peer partials require the gate one-shot collective"
+#endif
+extern "C" __device__ unsigned plow_xr_partial_f32_1 = 1;
+#endif
 extern "C" __device__ unsigned plow_opcode_zero_f32_1 = 1;
 #if PLOW_CDNA4 && PLOW_HAS_MOE_GLU_FP8_BLOCK128
 extern "C" __device__ unsigned plow_opcode_moe_glu_fp8_block128_1 = 1;
@@ -1230,17 +1250,8 @@ extern "C" __device__ unsigned plow_glm_hc_pre_tail_arm = 1;
 #ifndef PLOW_GEMM_SMALL_SPLITK
 #define PLOW_GEMM_SMALL_SPLITK 0
 #endif
-#ifndef PLOW_DSA_KPOOL_MFMA
-#define PLOW_DSA_KPOOL_MFMA 1
-#endif
 #ifndef PLOW_DSA_KPOOL_ROWWAVE
 #define PLOW_DSA_KPOOL_ROWWAVE 0
-#endif
-#ifndef PLOW_DSA_QQUANT_WAVE
-#define PLOW_DSA_QQUANT_WAVE 1
-#endif
-#ifndef PLOW_GEMM_F32_DEC_TILE
-#define PLOW_GEMM_F32_DEC_TILE 1
 #endif
 #if PLOW_GEMM_SMALL_SPLITK && !PLOW_BUCKET_DECODE
 #undef PLOW_GEMM_SMALL_SPLITK
@@ -2897,6 +2908,31 @@ __device__ __forceinline__ void exec_gemv(CInst in, CTens T,
            (int)in->i[3], in->i[3] >= 3u ? in->fj[1].f : in->fj[0].f, slice, nblk, lds);
 #undef TEN
 }
+__device__ __forceinline__ void exec_gemv_argmax(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                 bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    const unsigned M = in->i[0] ? in->i[0] : 1u;
+    const unsigned N = in->i[1];
+    const unsigned K = in->i[2];
+    if (K > PLOW_GM_ARENA) { __builtin_trap(); return; }
+    const float cap = in->fj[0].f;
+    const bf16* x_base = (const bf16*)TEN(1) + (size_t)in->i[4] * K;
+    bf16* C_base = (bf16*)TEN(0);
+    const bf16* W = (const bf16*)TEN(2);
+    unsigned long long* part_base = (unsigned long long*)TEN(3);
+    d_gemv_argmax(C_base, x_base, W, part_base, M, N, K, cap, slice, nblk, lds);
+#undef TEN
+}
+__device__ __forceinline__ void exec_per_layer_input(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                     unsigned rows, bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    d_per_layer_input((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                      (const bf16*)TEN(3), (const bf16*)TEN(4),
+                      (bf16*)TEN(5), (const bf16*)TEN(6),
+                      rows, in->i[1], in->i[2], in->i[3], in->i[4],
+                      in->fj[0].f, in->fj[1].f, slice, nblk, lds, PLOW_GM_ARENA);
+#undef TEN
+}
 #if PLOW_FP8
 /* t0=C t1=x t2=W(fp8) t5=w_scale(f32[N])   i0=M i1=N i2=K i4=a_row0
  *
@@ -3421,13 +3457,13 @@ __device__ __forceinline__ void exec_hc_pre_tail(CInst in, CTens T, unsigned nbl
     }
     __syncthreads();
     if (!hct_last) return;
-    asm volatile("buffer_inv" ::: "memory");
+    plow_cache_inv();
     __syncthreads();
     if (in->i[4] == 2u) {
         hc_mix_split_reduce((float*)T[in->t[0]], (const float*)T[desc[PLOW_HCT_GPART]],
                             in->i[0] * in->i[1], in->i[2]);
         __syncthreads();
-        asm volatile("buffer_inv" ::: "memory");
+        plow_cache_inv();
         __syncthreads();
     }
     float* post = (float*)T[desc[PLOW_HCT_POST]];
@@ -3446,7 +3482,7 @@ __device__ __forceinline__ void exec_hc_pre_tail(CInst in, CTens T, unsigned nbl
                              0u, 1u);
         if (desc[PLOW_HCT_NORM] == 1u) {
             __syncthreads();
-            asm volatile("buffer_inv" ::: "memory");
+            plow_cache_inv();
             __syncthreads();
             d_rmsnorm((bf16*)T[desc[PLOW_HCT_NOUT]], lin, (const bf16*)T[desc[PLOW_HCT_GAMMA]],
                       1u, hidden, eps, 0u, 0u, 1u, sm->part, nullptr, nullptr
@@ -3487,7 +3523,7 @@ __device__ __forceinline__ void hc_fuse_tail(CInst in, CTens T, unsigned group, 
     }
     __syncthreads();
     if (!hcf_last) return;
-    asm volatile("buffer_inv" ::: "memory");
+    plow_cache_inv();
     __syncthreads();
     const unsigned hidden = desc[PLOW_HCT_HIDDEN], sink = desc[PLOW_HCT_SINK];
     const float eps = __uint_as_float(desc[PLOW_HCT_EPS]);
@@ -3520,7 +3556,7 @@ __device__ __forceinline__ void hc_fuse_tail(CInst in, CTens T, unsigned group, 
                              0u, 1u);
         if (desc[PLOW_HCT_NORM] == 1u) {
             __syncthreads();
-            asm volatile("buffer_inv" ::: "memory");
+            plow_cache_inv();
             __syncthreads();
             d_rmsnorm((bf16*)T[desc[PLOW_HCT_NOUT]] + (size_t)m * hidden,
                       (const bf16*)T[desc[PLOW_HCT_LIN]] + (size_t)m * hidden,
@@ -4161,6 +4197,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_RMSNORM
         case PLOW_DOP_RMSNORM:
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+            if (in->i[6] & PLOW_RESIDUAL_F32_FLAG) {
+                d_rmsnorm_residual_f32((bf16*)TEN(0), (const float*)TEN(1), (const bf16*)TEN(2),
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, slice, nblk, sm->part);
+                break;
+            }
+#endif
             if (in->i[3] == 1) {
 #if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
                 if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
@@ -4373,6 +4416,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_NORM_RESIDUAL
         case PLOW_DOP_NORM_RESIDUAL:
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+            if (in->i[6] & PLOW_RESIDUAL_F32_FLAG) {
+                d_norm_residual_f32((float*)TEN(0), (const float*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), PLOW_RUNTIME_ROWS(in->i[0]), in->i[1],
+                    in->fj[0].f, in->fj[1].f, slice, nblk, sm->part);
+                break;
+            }
+#endif
             d_norm_residual((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                             (const bf16*)TEN(3), PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, in->fj[1].f, slice,
                             nblk, sm->part);
@@ -4408,6 +4459,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_NORM_RESIDUAL_NORM
         case PLOW_DOP_NORM_RESIDUAL_NORM:
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+            if (in->i[6] & PLOW_RESIDUAL_F32_FLAG) {
+                d_norm_residual_norm_f32((bf16*)TEN(0), (float*)TEN(1), (const float*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, in->fj[1].f,
+                    slice, nblk, sm->part);
+                break;
+            }
+#endif
             d_norm_residual_norm((bf16*)TEN(0), (bf16*)TEN(1), (const bf16*)TEN(2),
                                  (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
                                  in->i[0], in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, sm->part);
@@ -4423,9 +4483,40 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_EMBED
         case PLOW_DOP_EMBED:
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_RESIDUAL_F32
+            if (in->i[6] & PLOW_RESIDUAL_F32_FLAG) {
+                d_embed_residual_f32((float*)TEN(0), (const bf16*)TEN(1), (const int*)TEN(2),
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->fj[0].f, slice, nblk);
+                break;
+            }
+#endif
             d_embed((bf16*)TEN(0), (const bf16*)TEN(1), (const int*)TEN(2), PLOW_RUNTIME_ROWS(in->i[0]), in->i[1],
                     in->fj[0].f, slice, nblk);
             break;
+#endif
+#if PLOW_GFX12
+        case PLOW_DOP_EMBED_OVERLAY_BF16:
+            d_embed_overlay((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
+                            (const float*)TEN(3), (const unsigned*)TEN(4),
+                            PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3],
+                            slice, nblk);
+            break;
+        case PLOW_DOP_EMBED_POS_BF16:
+            d_embed_pos((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
+                        (const bf16*)TEN(3), (const unsigned*)TEN(4), (const unsigned*)TEN(5),
+                        PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3],
+                        slice, nblk);
+            break;
+#if !defined(PLOW_HAS_EMBED_FRAME_BF16) || PLOW_HAS_EMBED_FRAME_BF16
+        case PLOW_DOP_EMBED_FRAME_BF16:
+            d_embed_frame((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
+                          (const bf16*)TEN(3), (const unsigned*)TEN(4),
+                          (in->i[7] & 2u) ? (const float*)TEN(5) : nullptr,
+                          PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3],
+                          in->i[4], in->i[5], in->i[6], in->i[7],
+                          in->fj[0].f, in->fj[1].f, slice, nblk, sm->part);
+            break;
+#endif
 #endif
         /* Terminal row selection for the unified token batch. Always dispatched: the arm is
          * a bounds-checked copy with no resource cost worth pruning, and a pruned arm here is
@@ -4434,6 +4525,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_row_gather((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
                          PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
             break;
+#if PLOW_GFX12
+        case PLOW_DOP_GEMV_ARGMAX:
+            exec_gemv_argmax(in, T, slice, nblk, sm->gm);
+            break;
+        case PLOW_DOP_PER_LAYER_INPUT:
+            exec_per_layer_input(in, T, slice, nblk, PLOW_RUNTIME_ROWS(in->i[0]), sm->gm);
+            break;
+#endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_SOFTCAP
         case PLOW_DOP_SOFTCAP:
 #if PLOW_MIXED_STEP
@@ -4618,7 +4717,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (const float*)TEN(5), (const float*)TEN(6), in->i[0],
                                      in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk);
                 __syncthreads();
-                asm volatile("buffer_inv" ::: "memory");
+                plow_cache_inv();
                 __syncthreads();
                 d_rmsnorm((bf16*)T[in->i[5]], (const bf16*)TEN(2), (const bf16*)TEN(7),
                           PLOW_RUNTIME_ROWS(in->i[0]), in->i[2], in->fj[0].f, 0u, slice, nblk,
@@ -4684,7 +4783,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                          (const bf16*)TEN(6), (const bf16*)TEN(7),
                                          (const int*)TEN(5), in->i[1], in->i[2], r);
                         __syncthreads();
-                        asm volatile("buffer_inv" ::: "memory");
+                        plow_cache_inv();
                         __syncthreads();
                     }
                     d_dsa_pool_compress((uint8_t*)TEN(0) + (size_t)r * in->i[5] * in->i[2],
@@ -4759,18 +4858,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              (const int*)TEN(4), in->i[0], in->i[1], in->i[2]);
             break;
         case PLOW_DOP_DSA_Q_QUANT:
-#if PLOW_DSA_QQUANT_WAVE
             if (in->i[1] == 128u) {
                 d_dsa_q_quant_wave((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), in->i[0],
                                    slice, nblk);
                 break;
             }
-#endif
             d_dsa_q_quant((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), in->i[0], in->i[1],
                           slice, nblk, (float*)sm->raw, sm->part);
             break;
         case PLOW_DOP_INDEX_SCORE_KPOOL:
-#if PLOW_DSA_KPOOL_MFMA
             if (in->i[3] == 128u && in->i[1] == 32u) {
                 constexpr int DI_ = 128, HI_ = 32;
                 constexpr int QSTRIDE = DI_ + FA_PAD, KSTRIDE = DI_ + FA_PAD;
@@ -4801,7 +4897,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     slice, nblk, qlds, ktile, wlds, wlds + HI_);
                 break;
             }
-#endif
             /* t6/kv_len is TOKEN-granular (i4=pool_size divides internally) — see
              * d_index_score_kpool's header comment for why this cannot be pool-granular
              * at the packet level (the runtime patches kv_len once per decode step, the
@@ -5165,7 +5260,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             } else
 #endif
             {
-#if PLOW_BUCKET_DECODE && PLOW_GEMV_F32_VEC && PLOW_GEMM_F32_DEC_TILE
+#if PLOW_BUCKET_DECODE && PLOW_GEMV_F32_VEC
                 /* Wide decode rung router: R x CN wave tiles (bit-identical, see
                  * d_gemv_bf16_f32_tile). */
                 const unsigned rows = PLOW_RUNTIME_ROWS(in->i[0]);
@@ -6046,7 +6141,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     /* i6 = 1 (PLOW_GLM_DSA_FUSE): this row's compact expand into t5. */
                     if (in->i[6] == 1u) {
                         __syncthreads();
-                        asm volatile("buffer_inv" ::: "memory");
+                        plow_cache_inv();
                         __syncthreads();
                         dsa_pool_expand_row((int*)TEN(5) + (size_t)r * (in->i[1] * pool_size + pool_size - 1u),
                                             (const int*)TEN(0) + (size_t)r * in->i[1],
@@ -6794,12 +6889,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * The full model can still produce correct tokens under them, which is precisely the trap:
  * the 57 GiB/token weight stream evicts stale activation lines before re-read. That is a
  * hardware accident and it is why these are measurement instruments, not options. */
-#ifndef PLOW_GATE_NOINV
-#define PLOW_GATE_NOINV 0
-#endif
-#ifndef PLOW_GATE_RELAXSIG
-#define PLOW_GATE_RELAXSIG 0
-#endif
 
 /* ---------------------------------------------------------------------------------------
  * PLOW_GATE_HIER_CEIL — TWO-LEVEL CACHE MAINTENANCE, CEILING INSTRUMENT. NEVER SHIP.
@@ -6834,9 +6923,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * Expect the ceiling to be SMALLER than the microbench's 3.8x: that bench is an empty packet in
  * a tight chain with nothing to overlap, and the real per-packet gate is 2.255 us (traced), not
  * 13.16. If this knob does not move the token, the sound version cannot either. */
-#ifndef PLOW_GATE_HIER_CEIL
-#define PLOW_GATE_HIER_CEIL 0
-#endif
 
 /* ---------------------------------------------------------------------------------------
  * PLOW_GATE_HIER — the SOUND two-level cache maintenance. This is the shippable form of what
@@ -6873,18 +6959,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * REQUIRES PLOW_L2_PLACE_DISPATCH and an L2-placed blob. Without per-domain windows `nper` is
  * meaningless (a workgroup claims whatever entry is next, so the count is a run-time property),
  * and the emitter leaves the field zero — which this code reads as "no hierarchy". */
-#if PLOW_GATE_HIER && PLOW_GATE_HIER_CEIL
-#error "PLOW_GATE_HIER (sound) and PLOW_GATE_HIER_CEIL (the unsafe ceiling) are exclusive"
-#endif
 
 /* The two knobs do not compose, and combined they are silently worse than either. The HIER_CEIL
  * follower hand-rolls its relaxed RMW rather than calling `ctr_signal`, so under SC1 it would
  * also skip the `s_waitcnt vmcnt(0)` that arm performs — 248 of 256 workgroups would bump their
  * counter without retiring their stores at all. `perf-data/archive/k3/k3-hier2-ceiling.md` §2 says to drop
  * SC1 anyway; this makes the combination a build error instead of a debugging session. */
-#if PLOW_GATE_HIER_CEIL && PLOW_GATE_SC1
-#error "PLOW_GATE_HIER_CEIL and PLOW_GATE_SC1 are mutually exclusive (see k3-hier2-ceiling.md §2)"
-#endif
 
 /* ELECT THE MAINTENANCE LEADER OFF HW_REG_XCC_ID, NOT blockIdx.x.
  *
@@ -6911,12 +6991,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * it MEASURED 0.43 ms (l2hier 27.849 -> 28.271, ~1.3 ns/workgroup-packet, ~8 sd). The XCD a
  * workgroup runs on cannot change while it is resident, so it is read once. */
 __device__ __forceinline__ bool ctr_maint_leader_init(unsigned xcc) {
-#if PLOW_GATE_HIER_CEIL
-    return blockIdx.x == xcc;
-#else
     (void)xcc;
     return true;
-#endif
 }
 
 __device__ __forceinline__ uint32_t ctr_poll(const uint32_t* p) {
@@ -6937,14 +7013,10 @@ __device__ __forceinline__ uint32_t ctr_poll(const uint32_t* p) {
  * The "memory" clobber is load-bearing: it stops the compiler hoisting the consumer's loads
  * above the invalidate. */
 __device__ __forceinline__ void ctr_acquire_l1(void) {
-    asm volatile("buffer_inv" ::: "memory");
+    plow_cache_inv();
 }
 __device__ __forceinline__ void ctr_acquire(void) {
-#if PLOW_GATE_NOINV
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup"); /* UNSAFE: no buffer_inv */
-#else
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-#endif
 }
 /* A RELEASE atomic RMW, and NOT an explicit release fence followed by relaxed RMWs.
  *
@@ -7006,19 +7078,7 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
      * `scripts/sc1_coverage.sh` fails the build on an unscoped one. Closing it is what proved
      * the defect above is ordering rather than coverage. */
     __builtin_amdgcn_s_waitcnt(/*vmcnt(0)*/ 0x0f70);
-#if PLOW_GATE_SC1_KEEPREL
-    /* DIAGNOSTIC ARM. Scoped stores, but the counter bump KEEPS its release (and therefore its
-     * `buffer_wbl2`). This separates the two halves of PLOW_GATE_SC1 that the plain arm changes
-     * together: it isolates the COST of scoped activation stores from the BENEFIT of dropping
-     * the writeback. If this arm is numerically correct while the plain arm is not, the defect is
-     * the ORDERING (`vmcnt(0)` retires a store when it leaves the CU, not when it is visible at
-     * the scope the consumer reads from), not the store scope. Not a shipping mode either way. */
-    __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#else
     __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-#endif
-#elif PLOW_GATE_RELAXSIG
-    __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); /* UNSAFE: no wbl2 */
 #else
     __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 #endif
@@ -7122,7 +7182,8 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
      * leaving it unconditional put one extra instruction into every object, including gfx950's,
      * and cost the byte-identity that makes "this change did not touch CDNA4" checkable rather
      * than merely asserted. */
-#if PLOW_GATE_HIER || PLOW_GATE_HIER_CEIL || defined(PLOW_L2_PLACE_DISPATCH)
+#if (PLOW_GATE_HIER || defined(PLOW_L2_PLACE_DISPATCH)) && !PLOW_GFX12
+    /* gfx12 has one L2 domain; its hwreg 20 is not XCC_ID. */
     const unsigned plow_xcd =
         __builtin_amdgcn_s_getreg((20 /*HW_REG_XCC_ID*/) | (0 << 6) | ((32 - 1) << 11)) & 0xf;
 #else
@@ -7202,7 +7263,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
 #if PLOW_TRACE_PHASE
         /* T0: BEFORE the claim barrier, so the claim's dependent atomic round trip is inside the
          * measured window rather than in front of it. */
-        const uint64_t t_p0 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_p0 = prog.trace ? plow_realtime() : 0;
 #endif
         /* REQUIRED barrier: the whole workgroup must finish the previous packet — including its
          * designated successor signals — before any thread claims the next. The static loop needs no such barrier
@@ -7242,7 +7303,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         {
 #if PLOW_TRACE_PHASE
             /* Same probe on the static path, so an object built with the knob compiles on both. */
-            const uint64_t t_p0 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+            const uint64_t t_p0 = prog.trace ? plow_realtime() : 0;
 #endif
             const PlowStreamEnt e = my[ix];
             /* Segmented dispatch. With a window, [lo, hi) ALREADY bounds this launch's segment
@@ -7255,7 +7316,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             const CInst in = insts + e.inst;
 #endif
 
-        const uint64_t t_arrive = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_arrive = prog.trace ? plow_realtime() : 0;
 
         /* This packet's gates live on THIS STREAM ENTRY, always — the 64-byte PlowDevInst
          * carries no wait/succ metadata. A coarse entry points at the op's coarse lists
@@ -7363,7 +7424,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         __syncthreads(); /* every counter in the list is now satisfied */
 #if PLOW_TRACE_PHASE
         /* T1: the dependency is met; nothing below here is waiting for a producer. */
-        const uint64_t t_p1 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_p1 = prog.trace ? plow_realtime() : 0;
 #endif
 
         /* ONE acquire for the whole workgroup, and only after the gate clears.
@@ -7418,7 +7479,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         }
 #endif
 
-        const uint64_t t_ready = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_ready = prog.trace ? plow_realtime() : 0;
 
 #if defined(PLOW_BUCKET_XREDUCE)
         if (in->op != PLOW_DOP_XREDUCE2) __builtin_trap();
@@ -7476,6 +7537,18 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             } else
 #endif
             { /* the else-arm is this whole block: the tagged arm opens with its own `if` */
+#if PLOW_GFX12 && PLOW_PACKET_REQUIRES_XR_PARTIAL_F32
+            if (in->fj[0].u == PLOW_XREDUCE_PARTIAL_F32_MARK)
+                d_xreduce_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu, prog.rank,
+                               in->i[0], in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS,
+                               xaudit, e.slice, in->blocks, 0u, 0u, 0u
+#if PLOW_XR_TRACE_PHASES
+                               , prog.trace ? &prog.trace[base + ix] : nullptr
+#endif
+                               , true);
+            else
+#endif
+            {
 #if PLOW_XR_TAGGED
             /* Tagged one-shot (op_collective.h): the arrival signal rides in the data. The
              * region sits right after the compact-audit status line, whose id the TP loader
@@ -7524,6 +7597,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
 #endif
                            );
 #endif
+            }
             }
         } else if (in->op == PLOW_DOP_XREDUCE_ADD_NORM) {
             /* Fused all-reduce + residual + RMSNorm (op 116, one workgroup):
@@ -7668,30 +7742,6 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
              * No-op keeps single-GPU decode bit-identical. */
         } else
 #endif
-#ifdef PLOW_ICACHE_INV_PROBE
-        /* MEASUREMENT INSTRUMENT, never on in a shipped build (guarded by a macro that nothing
-         * defines; with it undefined the preprocessed source — and therefore the tunedb build
-         * digest — is byte-identical).
-         *
-         * Question it answers: this interpreter is a persistent megakernel whose .text is 338 KB
-         * (`interp_decode_fp8kv_k3.elf`), and consecutive packets run DIFFERENT op bodies, so the
-         * instruction stream jumps across a large binary. How much of the runtime is the L1
-         * instruction cache missing on those jumps?
-         *
-         * `s_icache_inv` flushes the SQC instruction cache, so with this on EVERY packet's body is
-         * a GUARANTEED cold instruction fetch from L2 — the worst case a zero-hit-rate I-cache
-         * could produce. The delta (probe - baseline) is therefore an UPPER BOUND on everything
-         * instruction prefetch, body reordering or footprint shrinking could ever recover. It is
-         * an upper bound and not an estimate: the real run already hits in I-cache some of the
-         * time, and this also charges the cost of the s_icache_inv itself.
-         *
-         * gfx950 has no instruction-PREFETCH instruction to test the other direction with:
-         * `s_inst_prefetch` is GFX10/GFX11 only and `s_prefetch_inst` is GFX12 only (verified
-         * against the ROCm 7.2.4 assembler, /opt/rocm/llvm/bin/llvm-mc -mcpu=gfx950). Invalidation
-         * is the only I-cache lever the ISA gives this part, so bounding from above is the only
-         * experiment available. */
-        __asm__ __volatile__("s_icache_inv" ::: "memory");
-#endif
 /* THE DENSE DECODE PROJECTION OPCODES SKIP `plow_exec`.
  *
  * `plow_exec` is one function over every opcode, so its prologue unconditionally saves 112 VGPR
@@ -7721,21 +7771,47 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
  * (PLOW_DECODE_TIER, scripts/build_gfx942.sh) the wide object only ever sees the T=4 program,
  * whose gate/up and q/k/v are PLAIN Gemvs -- `plowrt disasm --program 4` emits no GemvGlu and no
  * GemvQkv at all. */
-#if defined(__gfx942__) && PLOW_GLOBAL_QUEUE && !PLOW_BUCKET_PREFILL && \
+#if (defined(__gfx942__) || (PLOW_GFX12 && PLOW_GFX12_WMMA_GEMV && PLOW_GEMV_MM == 1)) && \
+    PLOW_GLOBAL_QUEUE && !PLOW_BUCKET_PREFILL && \
     !PLOW_BUCKET_FLASH && !PLOW_MIXED_STEP && \
     (PLOW_GEMV_MM == 1 || PLOW_GEMV_MM == 4) && \
     !PLOW_FP8 && !PLOW_FP8_KV && !PLOW_MXFP4 && \
     !PLOW_MLA_PREFILL && !PLOW_K3
+#if PLOW_GFX12
+        {
+        const CInst native_in = plow_scalar_ptr(in);
+#endif
 #define PLOW_DIRECT_TEN(k) (di->t[k] == PLOW_TENSOR_NONE ? nullptr : dt[di->t[k]])
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV
-        if (in->op == PLOW_DOP_GEMV) {
+        if (in->op == PLOW_DOP_GEMV
+#if PLOW_GFX12
+            && gv12_fits(native_in->i[0], native_in->i[2], (int)native_in->i[3])
+#endif
+        ) {
+#if PLOW_GFX12
+            const CInst di = native_in;
+            const CTens dt = plow_scalar_ptr(tens);
+            d_gemv_gfx12((bf16*)PLOW_DIRECT_TEN(0),
+                         (const bf16*)PLOW_DIRECT_TEN(1) + (size_t)di->i[4] * di->i[2],
+                         (const bf16*)PLOW_DIRECT_TEN(2), di->i[0], di->i[1], di->i[2],
+                         e.slice, di->blocks, sm.gm);
+#else
             const CInst gemv_in = plow_scalar_ptr(in);
             exec_gemv(gemv_in, plow_scalar_ptr(tens), e.slice, gemv_in->blocks, sm.gm);
+#endif
         } else
 #endif
 #if PLOW_GEMV_MM == 1 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_GLU)
-            if (in->op == PLOW_DOP_GEMV_GLU) {
+            if (in->op == PLOW_DOP_GEMV_GLU
+#if PLOW_GFX12
+                && gv12_fits(native_in->i[0], native_in->i[2], 0)
+#endif
+            ) {
+#if PLOW_GFX12
+            const CInst di = native_in;
+#else
             const CInst di = plow_scalar_ptr(in);
+#endif
             const CTens dt = plow_scalar_ptr(tens);
             d_gemv_glu((bf16*)PLOW_DIRECT_TEN(0), (const bf16*)PLOW_DIRECT_TEN(1),
                        (const bf16*)PLOW_DIRECT_TEN(2), (const bf16*)PLOW_DIRECT_TEN(5), di->i[0],
@@ -7744,8 +7820,17 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         } else
 #endif
 #if PLOW_GEMV_MM == 1 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_QKV)
-            if (in->op == PLOW_DOP_GEMV_QKV) {
+            if (in->op == PLOW_DOP_GEMV_QKV
+#if PLOW_GFX12
+                && native_in->t[7] == PLOW_TENSOR_NONE
+                && gv12_fits(native_in->i[0], native_in->i[2], 0)
+#endif
+            ) {
+#if PLOW_GFX12
+            const CInst di = native_in;
+#else
             const CInst di = plow_scalar_ptr(in);
+#endif
             const CTens dt = plow_scalar_ptr(tens);
             d_gemv_qkv((bf16*)PLOW_DIRECT_TEN(0), (bf16*)PLOW_DIRECT_TEN(3),
                        (bf16*)PLOW_DIRECT_TEN(5), (const bf16*)PLOW_DIRECT_TEN(1),
@@ -7756,14 +7841,19 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         } else
 #endif
 #undef PLOW_DIRECT_TEN
-#endif
         plow_exec(in, e.slice, tens, &sm, &prog);
+#if PLOW_GFX12
+        }
+#endif
+#else
+        plow_exec(in, e.slice, tens, &sm, &prog);
+#endif
 #endif
 
         __syncthreads();
 #if PLOW_TRACE_PHASE
         /* T3: the op body is retired and its stores are in this XCD's L2. */
-        const uint64_t t_p3 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
+        const uint64_t t_p3 = prog.trace ? plow_realtime() : 0;
 #endif
 
         /* Publish this workgroup's writes, then signal.
@@ -7861,7 +7951,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                 r.t_arrive = t_arrive;
 #endif
                 r.t_ready = t_ready;
-                r.t_end = __builtin_amdgcn_s_memrealtime();
+                r.t_end = plow_realtime();
                 prog.trace[base + ix] = r;
             }
         }

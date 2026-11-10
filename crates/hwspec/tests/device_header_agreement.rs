@@ -273,7 +273,7 @@ fn lds_ceiling_matches_amd_arch_h() {
 /// the check that makes the two fields answerable as one fact rather than two.
 #[test]
 fn every_declared_arena_fits_its_lds_budget() {
-    for isa in [IsaLevel::Gfx942, IsaLevel::Gfx950] {
+    for isa in [IsaLevel::Gfx942, IsaLevel::Gfx950, IsaLevel::Gfx1201] {
         let g = geometry(isa);
         for (what, tile) in [("prefill", g.gemm_tile), ("decode", g.decode_gemm_tile)] {
             let bytes = tile.stage_bytes(g.gemm_stage_buffers);
@@ -289,6 +289,13 @@ fn every_declared_arena_fits_its_lds_budget() {
             );
         }
     }
+}
+
+/// gfx1201 objects are built from the same sources on the `!PLOW_CDNA4` arm, so every gfx942
+/// header check above covers it only while the two geometries are one value.
+#[test]
+fn gfx1201_shares_the_gfx942_header_defaults() {
+    assert_eq!(geometry(IsaLevel::Gfx1201), geometry(IsaLevel::Gfx942));
 }
 
 /// `lds_bytes` is stated per ARCH here and per SKU in the registry. Same fact,

@@ -188,9 +188,6 @@ __device__ void fused_glu_body(bf16* __restrict__ out, const void* map_a, const 
                             __bfloat162float(__float2bfloat16(gate[ai]));
                         const float rounded_up = __bfloat162float(__float2bfloat16(up[ai]));
                         float activated = act_gelu_tanh(rounded_gate);
-#if defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-                        activated = __bfloat162float(__float2bfloat16(activated));
-#endif
                         out[static_cast<size_t>(row) * n + col + pair] =
                             __float2bfloat16(activated * rounded_up);
                     }
@@ -251,9 +248,6 @@ __global__ void combined_glu(bf16* out, const bf16* projections, unsigned rows) 
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             float activated = act_gelu_tanh_pf(__bfloat162float(gate.x[j]));
-#if defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-            activated = __bfloat162float(__float2bfloat16(activated));
-#endif
             result.x[j] = __float2bfloat16(activated * __bfloat162float(up.x[j]));
         }
         return result;

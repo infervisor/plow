@@ -240,6 +240,16 @@ if(PLOW_CUDA)
     set_tests_properties(sm120_unknown_case_fails PROPERTIES WILL_FAIL TRUE)
     endif()
 
+    if(PLOW_SM120_CUBIN)
+        add_executable(gdn_prefill_sm120_test
+            tests/gdn_prefill_sm120_test.cu nvidia/gdn_prefill_sm120.cu)
+        set_target_properties(gdn_prefill_sm120_test PROPERTIES
+            CUDA_ARCHITECTURES "120a" CUDA_STANDARD 17)
+        target_include_directories(gdn_prefill_sm120_test PRIVATE nvidia)
+        target_compile_options(gdn_prefill_sm120_test PRIVATE -O3 -Xptxas=-v -Xcompiler=-ffp-contract=off)
+        add_test(NAME gdn_prefill_sm120 COMMAND gdn_prefill_sm120_test)
+    endif()
+
     # ---- the persistent packet interpreter -------------------------------------------
     # Built as its own object library rather than folded into plow_runtime_cuda: it is a
     # COOPERATIVE-launch megakernel with a 154-register footprint, and it must be compiled
@@ -273,9 +283,19 @@ if(PLOW_CUDA)
     add_executable(speech_f32_op_test tests/speech_f32_op_test.cu cpu/dev/golden/f32_primitives.c)
     set_target_properties(speech_f32_op_test PROPERTIES CUDA_ARCHITECTURES "90a")
     target_include_directories(speech_f32_op_test PRIVATE nvidia common cpu/dev)
+    # sm_90a: the wgmma arms (and their cases) compile only under PLOW_NV_HOPPER.
+    target_compile_definitions(speech_f32_op_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:PLOW_NV_HOPPER=1>)
     target_compile_options(speech_f32_op_test PRIVATE $<$<COMPILE_LANGUAGE:C>:-O2 -ffp-contract=off>)
     target_link_libraries(speech_f32_op_test PRIVATE m)
     add_test(NAME speech_f32_ops COMMAND speech_f32_op_test)
+
+    # Radix top-k vs the K-round block_max selection in d_sample_small / d_sample_fish: bit-identical
+    # codes on synthetic rows (optional args: recorded depth [rows][2048] and backbone [rows][2049]
+    # f32 logits).
+    add_executable(sample_topk_test tests/sample_topk_test.cu)
+    set_target_properties(sample_topk_test PROPERTIES CUDA_ARCHITECTURES "90a")
+    target_include_directories(sample_topk_test PRIVATE nvidia common)
+    add_test(NAME sample_topk COMMAND sample_topk_test)
 
     # NEGATIVE CONTROL AS A BUILD TARGET. The same test compiled with the naively
     # transliterated wave64 reduction offsets (__shfl_xor starting at 32 on a 32-lane warp).
@@ -825,6 +845,20 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
             COMMENT "nvcc sample_sm120.cubin"
             VERBATIM)
         list(APPEND _cubin_outs "${_smp_out}")
+    endif()
+
+    if(PLOW_SM120_CUBIN)
+        set(_gdn_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/gdn_prefill_sm120.cu")
+        set(_gdn_out "${PLOW_CUBIN_DIR}/gdn_prefill_sm120.cubin")
+        add_custom_command(OUTPUT "${_gdn_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_gdn_out}"
+                    gdn_prefill_sm120 required
+                    -arch=${PLOW_CUBIN_ARCH} -O3 -std=c++17 -cubin -Xptxas -v "${_gdn_src}"
+            DEPENDS "${_gdn_src}" "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/gdn_prefill_sm120.h" "${_cubin_run}"
+            COMMENT "nvcc gdn_prefill_sm120.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_gdn_out}")
+        add_custom_target(gdn_prefill_sm120_cubin DEPENDS "${_gdn_out}")
     endif()
 
     # Speech packets (`tts.codec_lm.v1`, codec.kind 1): the native SNAC-24k decoder the speech

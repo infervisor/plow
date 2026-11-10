@@ -175,6 +175,15 @@ pub(crate) fn missing_weights(
     raw: &[u8],
     dir: &Path,
 ) -> Result<Vec<String>> {
+    missing_weights_in(blob, raw, Some(dir))
+}
+
+/// [`missing_weights`]; with no checkpoint directory, every checkpoint tensor `blob` binds.
+pub(crate) fn missing_weights_in(
+    blob: &crate::asset::devblob::DevBlob,
+    raw: &[u8],
+    dir: Option<&Path>,
+) -> Result<Vec<String>> {
     let packed = blob
         .reserved_metadata(raw, plow_asset::packed_prefill::SECTION)?
         .map(|bytes| {
@@ -193,7 +202,7 @@ pub(crate) fn missing_weights(
         .unwrap_or_default();
     let derived = derived_weights(blob, raw)?;
     let mut have = std::collections::HashSet::new();
-    for path in shard_paths(dir)? {
+    for path in dir.map(shard_paths).transpose()?.unwrap_or_default() {
         use std::io::Read;
         let io = |source| RuntimeError::Io {
             path: path.clone(),

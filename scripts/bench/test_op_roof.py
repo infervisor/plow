@@ -34,6 +34,14 @@ class SweepTests(unittest.TestCase):
 
 
 class QuantizedDecodeCostTests(unittest.TestCase):
+    def test_encoder_f32_ops_price_bf16_weights_and_f32_rows(self):
+        self.assertEqual(op_roof.cost("DenseGemmF32", {"M": 250, "N": 4096, "K": 1024}, 250, 0, 2, 2),
+                         (2 * 4096 * 1024 + 4 * 250 * 1024 + 4 * 250 * 4096, 2 * 250 * 4096 * 1024))
+        self.assertEqual(op_roof.cost("UnaryF32", {"rows": 250, "width": 1024}, 250, 0, 2, 2), (8 * 250 * 1024, 0))
+        attn = {"rows": 250, "heads": 8, "head_width": 128, "chunk": 12, "left": 12, "future": 0}
+        self.assertEqual(op_roof.cost("ChunkAttentionF32", attn, 250, 0, 2, 2),
+                         (16 * 250 * 8 * 128, 4 * 250 * 8 * 128 * 24))
+
     def test_fp8_weights_do_not_quantize_activations_or_scales(self):
         shape = {"M": 32, "N": 3840, "K": 8192}
         expected = (31457280 + 15360 + 524288 + 245760, 2013265920)

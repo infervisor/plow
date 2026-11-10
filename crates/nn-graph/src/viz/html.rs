@@ -57,7 +57,7 @@ pub fn render_html(bundle: &VizModelBundle, embed: bool, script_base: Option<&st
             },
         )
         .replace("__SCRIPTS__", &scripts)
-        .replace("__CATEGORIES__",&script_json(&categories))
+        .replace("__CATEGORIES__", &script_json(&categories))
         .replace("__BUNDLE__", &script_json(bundle))
 }
 

@@ -1074,6 +1074,8 @@ impl GuidedSpeech {
                 turn: request.turn_key.clone(),
                 continuing: false,
                 speech: Some(Box::new(SpeechJob {
+                    device_frames: false,
+                    slot_prefix_reuse: false,
                     overlay: cond,
                     overlay_pos,
                     // Decode token k takes speech_pos[k + 1]: base = prefill rows - 1.
@@ -1102,6 +1104,7 @@ impl GuidedSpeech {
                     encode: None,
                     frame_codes: Vec::new(),
                     frame_codes_per_row: 0,
+                    feed: None,
                     maya2_memory: None,
                 })),
                 prefix: None,
@@ -1109,6 +1112,9 @@ impl GuidedSpeech {
                 round: 0,
                 cached: None,
                 mm: None,
+                export: None,
+                import: None,
+                prompt_logprobs: false,
             },
         })
     }

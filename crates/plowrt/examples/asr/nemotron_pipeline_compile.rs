@@ -17,9 +17,9 @@ use plowrt::asset::gguf::GgufFile;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if !(4..=11).contains(&args.len()) {
+    if !(4..=13).contains(&args.len()) {
         return Err(
-            "usage: asr_nemotron_pipeline_compile MODEL_GGUF FEATURE_FRAMES OUTPUT_PACKET [JOINT_BATCH] [N_CU] [TRAILING_ENCODER_FRAMES] [STREAM_ROWS] [DECODE_BATCH] [STREAM_SLOTS] [STREAM_BATCH]"
+            "usage: asr_nemotron_pipeline_compile MODEL_GGUF FEATURE_FRAMES OUTPUT_PACKET [JOINT_BATCH] [N_CU] [TRAILING_ENCODER_FRAMES] [STREAM_ROWS] [DECODE_BATCH] [STREAM_SLOTS] [STREAM_BATCH] [UPLOAD_ROWS] [UPLOAD_BATCH]"
                 .into(),
         );
     }
@@ -200,8 +200,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (default 256, 0 = none), up to STREAM_BATCH (default 128) per launch.
     let stream_slots = args.get(9).map_or(Ok(256), |v| v.parse::<u32>())?;
     let stream_batch = args.get(10).map_or(Ok(128), |v| v.parse::<u32>())?;
+    // Upload streams (whole recordings, in the streams' slots): UPLOAD_ROWS new encoder frames
+    // per step (default 32, 0 = none), up to UPLOAD_BATCH (default 32) per launch.
+    let upload_rows = args.get(11).map_or(Ok(32), |v| v.parse::<u32>())?;
+    let upload_batch = args.get(12).map_or(Ok(32), |v| v.parse::<u32>())?;
     let chunk_items = if stream_rows != 0 && decode_batch != 0 && stream_slots != 0 {
         stream_batch
+    } else {
+        0
+    };
+    let upload_items = if chunk_items != 0 && upload_rows != 0 {
+        upload_batch
     } else {
         0
     };
@@ -238,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 history_input_frames: HISTORY,
                 step_keep_row0: HISTORY / FACTOR,
             },
-            conformer::stream_init(spec, &layers, stream_rows, n_cu)?,
+            conformer::stream_init(spec, &layers, stream_rows, n_cu, conformer::STREAM_POSITION)?,
             stream_prefix(FACTOR * stream_rows, 0)?,
             stream_prefix(FACTOR * stream_rows + HISTORY, HISTORY / FACTOR)?,
             &rnnt_weights,
@@ -247,53 +256,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Cache rows: one per stream, then a scratch row for padding items. The decode's
             // predictor slots and encoder rows for streams follow the recordings'.
             let slots = stream_slots + 1;
-            let staging_rows = 2 * chunk_items * stream_rows;
-            let chunk_rungs = rungs(chunk_items)
-                .into_iter()
-                .map(|items| -> Result<_, Box<dyn std::error::Error>> {
-                    Ok(rnnt::ChunkRung {
-                        items,
-                        first: subsample(FACTOR * stream_rows, items)?,
-                        next: subsample(FACTOR * stream_rows + HISTORY, items)?,
-                        step: conformer::append_chunk_step(
-                            spec,
-                            &layers,
-                            n_cu,
+            let mut add_chunks = |kind: rnnt::ChunkKind,
+                                  rows: u32,
+                                  max_items: u32|
+             -> Result<(), Box<dyn std::error::Error>> {
+                let spec = conformer_spec(rows)?;
+                let staging_rows = 2 * max_items * rows;
+                let chunk_rungs = rungs(max_items)
+                    .into_iter()
+                    .map(|items| -> Result<_, Box<dyn std::error::Error>> {
+                        Ok(rnnt::ChunkRung {
                             items,
-                            stream_rows,
-                            slots,
-                            staging_rows,
-                            rnnt::CHUNK_INPUTS,
-                        )?,
+                            first: subsample(FACTOR * rows, items)?,
+                            next: subsample(FACTOR * rows + HISTORY, items)?,
+                            step: conformer::append_chunk_step(
+                                spec,
+                                &layers,
+                                n_cu,
+                                items,
+                                rows,
+                                slots,
+                                staging_rows,
+                                kind.inputs(),
+                            )?,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            packets.add_chunk_stream(
-                rnnt::ChunkGeometry {
-                    rows: stream_rows,
-                    left_rows: conformer::stream_left_rows(&spec),
-                    slots,
-                    first_input_frames: FACTOR * stream_rows,
-                    step_input_frames: FACTOR * stream_rows + HISTORY,
-                    history_input_frames: HISTORY,
-                    step_keep_row0: HISTORY / FACTOR,
-                    encoder_row0: decode_batch * frames,
-                    predictor_slot0: decode_batch,
-                },
-                conformer::stream_init(spec, &layers, stream_rows, n_cu)?,
-                chunk_rungs,
-                &rnnt_weights,
-            )?;
+                    .collect::<Result<Vec<_>, _>>()?;
+                packets.add_chunk_stream(
+                    kind,
+                    rnnt::ChunkGeometry {
+                        rows,
+                        left_rows: conformer::stream_left_rows(&spec),
+                        slots,
+                        first_input_frames: FACTOR * rows,
+                        step_input_frames: FACTOR * rows + HISTORY,
+                        history_input_frames: HISTORY,
+                        step_keep_row0: HISTORY / FACTOR,
+                        encoder_row0: decode_batch * frames,
+                        predictor_slot0: decode_batch,
+                    },
+                    conformer::stream_init(spec, &layers, rows, n_cu, kind.inputs().position)?,
+                    chunk_rungs,
+                    &rnnt_weights,
+                )?;
+                Ok(())
+            };
+            add_chunks(rnnt::ChunkKind::Live, stream_rows, chunk_items)?;
+            if upload_items != 0 {
+                add_chunks(rnnt::ChunkKind::Upload, upload_rows, upload_items)?;
+            }
         }
     }
     if decode_batch != 0 {
         let streams = if chunk_items != 0 { stream_slots } else { 0 };
+        // The streams' encoder-table rows: the wider step of the two geometries.
+        let step_rows = (chunk_items * stream_rows).max(upload_items * upload_rows);
         packets.add_batched_decode(
             &rnnt_weights,
             decode_batch + streams + 1,
-            decode_batch * frames + chunk_items * stream_rows,
-            &rungs(decode_batch.max(chunk_items)),
-            &rungs((decode_batch * joint_batch).max(chunk_items * stream_rows)),
+            decode_batch * frames + step_rows,
+            &rungs(decode_batch.max(chunk_items).max(upload_items)),
+            &rungs((decode_batch * joint_batch).max(step_rows)),
         )?;
     }
     packets.embed_weights(|name| {

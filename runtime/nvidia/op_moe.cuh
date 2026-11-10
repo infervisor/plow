@@ -107,20 +107,10 @@ __device__ __forceinline__ float plow_warp_dot_fp8_blk(const bf16* __restrict__ 
             p = fmaf(w1.x, x1.x, p);
             p = fmaf(w1.y, x1.y, p);
         }
-#ifdef PLOW_MOE_BAD_SCALE_EPILOGUE
-        /* NEGATIVE CONTROL ONLY (never define this in a shipping build): the per-channel
-         * idiom wrongly transplanted to block scales — accumulate raw, scale once at the
-         * end. This is the exact silent-wrong-answer trap the header warns about; the
-         * validation harness must FAIL when it is enabled, or the harness proves nothing. */
-        acc += live ? p : 0.0f;
-    }
-    return plow_warp_sum(acc) * srow[0];
-#else
         /* per-128-block dequant applied to THIS chunk's partial — see header note. */
         acc += live ? p * srow[kb] : 0.0f;
     }
     return plow_warp_sum(acc);
-#endif
 }
 
 /* --- FUSED gate+up twin of plow_warp_dot_fp8_blk ---------------------------------------
@@ -171,19 +161,10 @@ __device__ __forceinline__ float2 plow_warp_dot2_fp8_blk(
             pu = fmaf(u1.x, x1.x, pu);
             pu = fmaf(u1.y, x1.y, pu);
         }
-#ifdef PLOW_MOE_BAD_SCALE_EPILOGUE
-        /* NEGATIVE CONTROL ONLY — same wrong per-tensor epilogue as the unfused helper, so
-         * the harness still fails when the control build is enabled. */
-        accg += live ? pg : 0.0f;
-        accu += live ? pu : 0.0f;
-    }
-    return make_float2(plow_warp_sum(accg) * sgrow[0], plow_warp_sum(accu) * surow[0]);
-#else
         accg += live ? pg * sgrow[kb] : 0.0f;
         accu += live ? pu * surow[kb] : 0.0f;
     }
     return make_float2(plow_warp_sum(accg), plow_warp_sum(accu));
-#endif
 }
 
 /* --- routing table accessors (identical byte layout to the AMD path: 8B per slot) --- */
@@ -431,9 +412,6 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
  * megakernel REG 177 -> 229; 2 is the wash that keeps the register headroom. */
 #define GV_MOE_RB_DN 2
 #endif
-#ifndef PLOW_MOE_XN_BF16
-#define PLOW_MOE_XN_BF16 0
-#endif
 #ifndef PLOW_NV_ROUTER_V8
 #define PLOW_NV_ROUTER_V8 0
 #endif
@@ -443,18 +421,9 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #ifndef PLOW_NV_ROUTER_V9
 #define PLOW_NV_ROUTER_V9 0
 #endif
-#ifndef PLOW_MOE_ROUTER_WIDE
-#define PLOW_MOE_ROUTER_WIDE 0
-#endif
-#ifndef PLOW_MOE_COMBINE_ALLBLK
-#define PLOW_MOE_COMBINE_ALLBLK 0
-#endif
 /* Decode combine+norm with the k=8 slot loads in flight and an 8-wide pass 2. Bit-exact on the
  * 26B; step_bench (p26dl, ctx 1024) 5.705 -> 5.579 / 8.744 -> 8.615 / 12.590 -> 12.441 ms at
  * B=1/4/16. */
-#ifndef PLOW_MOE_COMBINE_V8
-#define PLOW_MOE_COMBINE_V8 1
-#endif
 /* Lane-split DOWN. Default OFF so sm_120 objects stay byte-identical; the sm_90a build turns
  * it on. MEASURED at 1 block/SM: bf16 7.060 -> 6.766 ms (fp8 neutral -- it runs the fp8 down
  * arm). At 2 blocks/SM: 6.387 -> 6.106. */
@@ -466,10 +435,7 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #endif
 /* Staging fu in the arena MEASURED SLOWER (7.183 vs 7.060 ms): the extra __syncthreads on
  * every MoE-down op (30 per token) costs more than the redundant fu reads it removes, which
- * were L1 hits anyway (fu is 11 KiB). Kept behind the flag as a recorded negative. */
-#ifndef PLOW_MOE_DOWN_STAGE_FU
-#define PLOW_MOE_DOWN_STAGE_FU 0
-#endif
+ * were L1 hits anyway (fu is 11 KiB). */
 /* Chunks pre-issued per stream in the RB-gated MoE arms. MEASURED at 1 block/SM with the
  * lane-split down arm and warp-per-row flash in place: UN=2 gives bf16 6.194 / fp8 5.709 vs
  * UN=4's 6.288 / 5.709 -- the shipped default had been carried over from an earlier round and
@@ -495,19 +461,11 @@ __device__ __forceinline__ float dot8_fx(const bf16v8& w, const float* __restric
 }
 #endif
 
-/* Flat work index -> (slot s in [0,S), channel n in [0,W)).
- * PLOW_MOE_SLOT_MAJOR=1 is the A/B NEGATIVE CONTROL: it forces the legacy slot-major order at
- * B>1 too. Same outputs (a permutation of independent warps), only the weight locality changes,
- * so the TPOT delta between the two builds IS the measured value of the reuse. */
+/* Flat work index -> (slot s in [0,S), channel n in [0,W)). */
 __device__ __forceinline__ void plow_moe_unflat(unsigned f, unsigned S, unsigned W, unsigned nrow,
                                                 unsigned* s, unsigned* n) {
-#if defined(PLOW_MOE_SLOT_MAJOR) && PLOW_MOE_SLOT_MAJOR
-    (void)nrow;
-    *s = f / W; *n = f - *s * W;
-#else
     if (nrow == 1u) { *s = f / W; *n = f - *s * W; }   /* legacy slot-major */
     else            { *n = f / S; *s = f - *n * S; }   /* channel-major: L2 weight reuse */
-#endif
 }
 
 /* One row's inv RMS by ONE warp (H % 8 == 0), replaying plow_moe_row_rms's PLOW_NV_GEMV_RB block
@@ -915,7 +873,7 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
     const unsigned warp = tid >> 5;
     __shared__ float red[32];
     __shared__ float invs[PLOW_MOE_MAXB];
-#if PLOW_NV_GEMV_RB && PLOW_NV_ROUTER_V9 && !PLOW_MOE_XN_BF16 && !PLOW_MOE_ROUTER_WIDE
+#if PLOW_NV_GEMV_RB && PLOW_NV_ROUTER_V9
     /* nrow <= 16: from B=32 a CTA runs 4+ rounds and the per-round barriers lose to the arm
      * below (B=128 +0.30 ms). */
     if (blockDim.x == 256u && (H & 7u) == 0u && H <= PLOW_MOE_XN_MAX && (n_exp & 7u) == 0u &&
@@ -953,11 +911,7 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
      * partition changes (lane-strided -> 8-wide chunks), so the warp-sum rounding of a logit
      * differs; selection is unchanged in practice and gated by gpu_lifecycle. */
     if (nrow == 1u && H <= PLOW_MOE_XN_MAX) {
-#if PLOW_MOE_XN_BF16
-        bf16* h2s = (bf16*)arena;
-#else
         float* h2s = arena; /* dynamic arena, see the note in the expert-GLU arm */
-#endif
         const float invrms = invs[0];
 #if PLOW_NV_ROUTER_V8
         /* 8-wide: both loads of a vector issue together instead of 11 dependent 2-byte rounds;
@@ -967,11 +921,7 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const float v = __bfloat162float(rv.x[j]) * invrms * __bfloat162float(sv.x[j]) * root;
-#if PLOW_MOE_XN_BF16
-                h2s[v8 * 8u + j] = __float2bfloat16(v);
-#else
                 h2s[v8 * 8u + j] = v;
-#endif
             }
         }
         for (unsigned h = (H & ~7u) + tid; h < H; h += blockDim.x) {
@@ -979,55 +929,11 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
         for (unsigned h = tid; h < H; h += blockDim.x) {
 #endif
             const float v = __bfloat162float(resid[h]) * invrms * __bfloat162float(scale[h]) * root;
-#if PLOW_MOE_XN_BF16
-            h2s[h] = __float2bfloat16(v);
-#else
             h2s[h] = v;
-#endif
         }
         __syncthreads();
         PLOW_TL_PH(1);
         const unsigned nchunk = (H + GV_STEP - 1u) / GV_STEP;
-#if PLOW_MOE_ROUTER_WIDE
-        /* ONE EXPERT PER BLOCK, all 8 warps splitting H. The default map below is
-         * `slice*8 + warp`, i.e. 8 experts per block, so with n_exp=128 only 16 blocks get any
-         * work -- 16 of 132 at occ-1 and 16 of 264 at occ-2. The router then sits on the
-         * critical path of every other block: measured 0.424 ms of a 4.61 ms fp8 step at occ-2,
-         * where at occ-1 it had been hidden behind slower arms.
-         * Here block `slice` owns expert `slice`, its warps split the K sweep, and one smem
-         * reduction folds them. That uses 128 blocks instead of 16 and makes each expert's dot
-         * 8x more parallel. Blocks past n_exp skip the loop entirely -- `slice` is block-uniform,
-         * so the __syncthreads below is never divergently reached. */
-        __shared__ float rw_red[PLOW_NV_WARPS];
-        for (unsigned e = slice; e < n_exp; e += nblk) {
-            const bf16* pr = proj + (size_t)e * H;
-            float acc = 0.0f;
-            for (unsigned c = warp * GV_MOE_UN; c < nchunk; c += PLOW_NV_WARPS * GV_MOE_UN) {
-                bf16v8 wv[GV_MOE_UN];
-                unsigned kk[GV_MOE_UN];
-#pragma unroll
-                for (int u = 0; u < GV_MOE_UN; u++) {
-                    kk[u] = (c + (unsigned)u) * GV_STEP + lane * 8u;
-                    wv[u] = (kk[u] < H) ? ld_glob8(pr + kk[u]) : bf16v8_zero();
-                }
-#pragma unroll
-                for (int u = 0; u < GV_MOE_UN; u++) {
-                    if (kk[u] >= H) continue;
-                    acc = dot8_fx(wv[u], h2s + kk[u], acc);
-                }
-            }
-            acc = plow_warp_sum(acc);
-            if (lane == 0) rw_red[warp] = acc;
-            __syncthreads();
-            if (tid == 0) {
-                float t = 0.0f;
-                for (unsigned i = 0; i < PLOW_NV_WARPS; i++) t += rw_red[i];
-                score[e] = t;
-            }
-            __syncthreads();
-        }
-        return;
-#endif
         for (unsigned e = slice * 8u + warp; e < n_exp; e += nblk * 8u) {
             const bf16* pr = proj + (size_t)e * H;
             float acc = 0.0f;
@@ -1042,11 +948,7 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
 #pragma unroll
                 for (int u = 0; u < GV_MOE_UN; u++) {
                     if (kk[u] >= H) continue;
-#if PLOW_MOE_XN_BF16
-                    acc = dot8(wv[u], ld_smem8(h2s + kk[u]), acc);
-#else
                     acc = dot8_fx(wv[u], h2s + kk[u], acc);
-#endif
                 }
             }
             acc = plow_warp_sum(acc);
@@ -1593,13 +1495,6 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
         /* Stage the whole fu row-set (k*I_moe bf16 = 11 KiB at k=8, I_moe=704) in the arena.
          * Every warp otherwise re-reads its slot's 1.4 KiB of fu from global for EVERY one of
          * its output channels -- ~240 KiB of redundant traffic per block per layer. */
-#if PLOW_MOE_DOWN_STAGE_FU
-        bf16* fus = (bf16*)arena;
-        const unsigned fu_n = k * I_moe;
-        if (fu_n > PLOW_MOE_XN_MAX * 2u) goto down_scalar; /* arena too small: unblocked body */
-        for (unsigned i = threadIdx.x; i < fu_n; i += blockDim.x) fus[i] = fu[i];
-        __syncthreads();
-#endif
         const unsigned lane_r = threadIdx.x & (PLOW_NV_WARP - 1u);
         const unsigned nw_r = blockDim.x >> 5;
         const unsigned total_r = k * H;
@@ -1634,11 +1529,7 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
                 live[r] = true;
                 gate[r] = plow_moe_slot_gate(table, slot);
                 wr[r] = (const bf16*)(size_t)db + (size_t)h * I_moe;
-#if PLOW_MOE_DOWN_STAGE_FU
-                xr[r] = fus + (size_t)slot * I_moe;
-#else
                 xr[r] = fu + (size_t)slot * I_moe;
-#endif
             }
             float acc[GV_MOE_RB_DN];
 #pragma unroll
@@ -1662,11 +1553,7 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
 #pragma unroll
                     for (int r = 0; r < GV_MOE_RB_DN; r++) {
                         if (!live[r]) continue;
-#if PLOW_MOE_DOWN_STAGE_FU
-                        acc[r] = dot8(wv[r][u], ld_smem8(xr[r] + kk[u]), acc[r]);
-#else
                         acc[r] = dot8(wv[r][u], ld_glob8(xr[r] + kk[u]), acc[r]);
-#endif
                     }
                 }
             }
@@ -1678,9 +1565,6 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
         }
         return;
     }
-#if PLOW_MOE_DOWN_STAGE_FU
-down_scalar:
-#endif
 #endif
     {
     const unsigned lane = threadIdx.x & (PLOW_NV_WARP - 1u);
@@ -1969,12 +1853,9 @@ static __device__ void d_moe_expert_glu_gemma_fp8_dd(
  * fewer items than warps. The per-slot FFMA walk keeps ~2 KB in flight per warp and is
  * latency-bound (B=4 MoE ~1.8x its byte floor); here a warp holds 16 rows x U chunks. Glu:
  * fu[slot][n] = gelu(g)*u, n < I_moe, K = H. Down: part[slot][h] = gate*(dot*sc), K = I_moe.
- * Numerically equivalent to the FFMA walk, not bit-equal. 0 = off. 26B ms/step vs the FFMA walk:
+ * Numerically equivalent to the FFMA walk, not bit-equal. 26B ms/step vs the FFMA walk:
  * B=1 4.85 -> 4.49, B=4 8.06 -> 6.65, B=16 19.03 -> 14.61. */
-#ifndef PLOW_MOE_FP8_TC
-#define PLOW_MOE_FP8_TC 1
-#endif
-#if PLOW_MOE_FP8_TC && PLOW_NV_FP8_DECODE_TC_ACTIVE
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE
 #define PLOW_MOE_FP8_TC_ACTIVE 1
 __device__ __forceinline__ bool plow_moe_tc_ok(unsigned N, unsigned K) {
     return !(N % 16u) && K && !(K % 64u) && blockDim.x == 256;
@@ -1985,11 +1866,6 @@ __device__ __forceinline__ bool plow_moe_tc_ok(unsigned N, unsigned K) {
  * B=16 14.60 -> 9.26. */
 #ifndef PLOW_MOE_FP8_TC_DD
 #define PLOW_MOE_FP8_TC_DD 4
-#endif
-/* DOWN's K (I_moe = 704 on the 26B) is only 11 chunks: at the dense depth a warp pays three
- * exposed round trips per tile. */
-#ifndef PLOW_MOE_TC_UD
-#define PLOW_MOE_TC_UD PLOW_FP8TC_U1
 #endif
 /* DOWN items of 32 rows: the GLU tile's second row set carries rows +16 instead of the up
  * matrix, so one pointer chase and one x fragment feed twice the weight bytes per round trip.
@@ -2025,7 +1901,7 @@ static __device__ void d_moe_fp8_tc(void* out, const bf16* x, const unsigned cha
     const unsigned tiles_per_round = nw / ks;
     const unsigned nchunk = K / 64u;
     const unsigned my_tile = warp / ks, my_k = warp % ks;
-    constexpr int U = Glu ? PLOW_FP8TC_U : PLOW_MOE_TC_UD;
+    constexpr int U = Glu ? PLOW_FP8TC_U : PLOW_FP8TC_U1;
     auto slot_of = [&](unsigned gi, unsigned gofs, unsigned j) -> unsigned {
 #if PLOW_MOE_FP8_DEDUP
         if constexpr (Dd) return plow_dd_slot[gofs + j];
@@ -2392,62 +2268,6 @@ static __device__ void d_moe_combine_norm_gemma(bf16* __restrict__ out,
     __shared__ float red[32];
     const unsigned stride = nblk ? nblk : 1u;
 
-#if PLOW_MOE_COMBINE_ALLBLK
-    /* ALL-BLOCK COMBINE (H100 round 8). The body below runs on ONE block -- the row loop is
-     * strided by `slice` and decode has nrow==1 -- so every other block gates on a single CTA
-     * moving 90 KiB of f32 partials. Measured 0.317 ms of a 6.12 ms step at 2 blocks/SM, and it
-     * gets WORSE with more blocks because they all wait.
-     * The RMS denominator needs all H, which is why it was never split. So instead every block
-     * recomputes the (L2-resident) reduction redundantly -- identical thread mapping, so every
-     * block derives a bit-identical `inv` with no cross-block gate -- and then each block writes
-     * only ITS OWN slice of the output. No race: the slices are disjoint. Redundant reads cost
-     * L2 bandwidth, which is ~100x cheaper here than serialising 263 blocks behind one. */
-    if (nrow == 1u) {
-        const float* pt = part;
-        const bf16* res = resid;
-        bf16* o = out;
-        float ss = 0.0f;
-        if ((H & 3u) == 0u) {
-            for (unsigned h = tid * 4u; h < H; h += nth * 4u) {
-                float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
-                for (unsigned slot = 0; slot < k; slot++) {
-                    const float4 v = *(const float4*)(pt + (size_t)slot * H + h);
-                    acc4.x += v.x; acc4.y += v.y; acc4.z += v.z; acc4.w += v.w;
-                }
-                *(float4*)(arena + h) = acc4;
-                ss += acc4.x * acc4.x + acc4.y * acc4.y + acc4.z * acc4.z + acc4.w * acc4.w;
-            }
-        } else {
-            for (unsigned h = tid; h < H; h += nth) {
-                float acc = 0.0f;
-                for (unsigned slot = 0; slot < k; slot++) acc += pt[(size_t)slot * H + h];
-                arena[h] = acc;
-                ss += acc * acc;
-            }
-        }
-        ss = plow_warp_sum(ss);
-        if (lane == 0) red[warp] = ss;
-        __syncthreads();
-        if (tid == 0) {
-            float t = 0.0f;
-            const unsigned nw = (nth + 31u) >> 5;
-            for (unsigned i = 0; i < nw; i++) t += red[i];
-            red[0] = rsqrtf(t / (float)H + eps);
-        }
-        __syncthreads();
-        const float inv = red[0];
-        /* each block writes only its own disjoint slice */
-        const unsigned per_h = (H + stride - 1u) / stride;
-        const unsigned h0 = slice * per_h;
-        const unsigned h1 = (h0 + per_h < H) ? (h0 + per_h) : H;
-        for (unsigned h = h0 + tid; h < h1; h += nth) {
-            const float v = arena[h] * inv * __bfloat162float(gamma[h]);
-            o[h] = __float2bfloat16(v + __bfloat162float(res[h]));
-        }
-        __syncthreads();
-        return;
-    }
-#endif
     for (unsigned row = slice; row < nrow; row += stride) {
         const float* pt = part + (size_t)row * k * H;
         const bf16* res = resid + (size_t)row * H;
@@ -2455,7 +2275,7 @@ static __device__ void d_moe_combine_norm_gemma(bf16* __restrict__ out,
 
         /* Pass 1: combine (Σ slots) and accumulate sum-of-squares for RMS. */
         float ss = 0.0f;
-#if PLOW_NV_GEMV_RB && PLOW_MOE_COMBINE_V8
+#if PLOW_NV_GEMV_RB
         /* k=8, H % 8 == 0, H <= 3*4*blockDim: the slot loop is compile-time, so a thread's 8
          * partial loads per h are in flight together instead of one dependent round trip per
          * slot (the runtime-k loop measured ~10 us of the 26B's B=1 layer tail on ONE block),
@@ -2617,7 +2437,7 @@ static __device__ void d_moe_combine_resid_norm_gemma(
         const bf16* __restrict__ g_po, const bf16* __restrict__ gn, unsigned H, unsigned k,
         float eps, float ls, unsigned slice, unsigned nblk, unsigned nrow,
         float* arena) {
-#if PLOW_NV_PREFILL || PLOW_NV_NRN_WPR
+#if PLOW_NV_PREFILL
     /* NormResidualNorm picks a row-count-dependent arm here; the per-row call below would not. */
     __trap();
 #endif
@@ -2671,15 +2491,7 @@ static __device__ void d_moe_expert_glu_norm_gemma_rb(
      * cuOccupancyMaxActiveBlocksPerMultiprocessor to 0. The arena is sized by the largest op
      * claim (34432 B on this packet) and each instruction fully consumes it before the next
      * gate, so H*4 <= PLOW_MOE_XN_MAX*4 = 11264 B of it is free scratch here. */
-#if PLOW_MOE_XN_BF16
-    /* Stage xn as bf16, not f32. dot8_fx reads 32 B of smem per lane per chunk where every
-     * other GEMV arm reads 16 B, and the extra smem traffic showed up as MoE-GLU sitting at
-     * 2243 GB/s while QKV -- same unroll depth, bf16 x -- reaches 2968. Rounding xn to bf16 is
-     * what gemv_rows/gemv_qkv already do with their x, and resid/gamma are bf16 to begin with. */
-    bf16* xn_s = (bf16*)arena;
-#else
     float* xn_s = arena;
-#endif
     plow_moe_row_rms(invs, rms_red, resid, H, 1u, eps);
     if ((H & 7u) == 0u) {
         const float inv = invs[0];
@@ -2688,22 +2500,14 @@ static __device__ void d_moe_expert_glu_norm_gemma_rb(
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const float v = __bfloat162float(xv.x[j]) * inv * __bfloat162float(gv8.x[j]);
-#if PLOW_MOE_XN_BF16
-                xn_s[c * 8u + j] = __float2bfloat16(v);
-#else
                 xn_s[c * 8u + j] = v;
-#endif
             }
         }
     } else {
         const float inv = invs[0];
         for (unsigned h = threadIdx.x; h < H; h += blockDim.x) {
             const float v = __bfloat162float(resid[h]) * inv * __bfloat162float(gamma[h]);
-#if PLOW_MOE_XN_BF16
-            xn_s[h] = __float2bfloat16(v);
-#else
             xn_s[h] = v;
-#endif
         }
     }
     __syncthreads();
@@ -2763,21 +2567,12 @@ static __device__ void d_moe_expert_glu_norm_gemma_rb(
 #pragma unroll
             for (int u = 0; u < GV_MOE_UN; u++) {
                 if (kk[u] >= H) continue;
-#if PLOW_MOE_XN_BF16
-                const bf16v8 xv = ld_smem8(xn_s + kk[u]);
-#pragma unroll
-                for (int r = 0; r < GV_MOE_RB; r++) {
-                    accg[r] = dot8(gv[r][u], xv, accg[r]);
-                    accu[r] = dot8(uv[r][u], xv, accu[r]);
-                }
-#else
                 const float* xp = xn_s + kk[u];
 #pragma unroll
                 for (int r = 0; r < GV_MOE_RB; r++) {
                     accg[r] = dot8_fx(gv[r][u], xp, accg[r]);
                     accu[r] = dot8_fx(uv[r][u], xp, accu[r]);
                 }
-#endif
             }
         }
 #pragma unroll

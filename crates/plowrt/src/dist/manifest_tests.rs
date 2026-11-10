@@ -72,6 +72,9 @@ fn amd() -> Identity {
         checkpoint_bytes: 1590000000000,
         required: Vec::new(),
         recipe: "recipes/infervisor/kimi-k3/gfx942-mi325x-tp8-32k-fp8kv-mxfp4.toml".into(),
+        views: Vec::new(),
+        packet: None,
+        host: false,
     }
 }
 
@@ -239,6 +242,9 @@ fn veena() -> Identity {
         checkpoint_bytes: 0,
         required: Vec::new(),
         recipe: "recipes/infervisor/veena/sm90a-h100-tp1.toml".into(),
+        views: Vec::new(),
+        packet: None,
+        host: false,
     }
 }
 
@@ -1291,9 +1297,7 @@ fn rung_overrides_are_pinned_by_digest_and_sorted() {
 /// Two declarations are the publisher's rather than the recipe's. 24 of the 41
 /// do not record `[target] toolchain`, a build fact with no registry to come
 /// from, so `--toolchain` stands in here exactly as a publisher would pass it;
-/// and 7 declare no `max_ctx` — 3 `refused` builds and 4 ASR/VAD packets, where
-/// a context length is not a property of the model at all. Those must declare
-/// one before they can be published. NOTHING ELSE may refuse: any other
+/// and 3 `refused` builds declare no `max_ctx`. NOTHING ELSE may refuse: any other
 /// message means a recipe the only producer cannot pack.
 ///
 /// Written because the sweep caught two: `[target] mem_bytes` was recorded by
@@ -1695,4 +1699,135 @@ fn an_nvidia_bundle_is_one_a_hsaco_layout_reader_refuses() {
     let mut amd = g.bundle;
     amd.target.vendor = "amd".into();
     assert!(amd.validate().unwrap_err().contains("unsupported schema"));
+}
+
+const HOST_PACKET: &str = r#"
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "silero-vad"
+label = "sm90a-h100-tp1"
+plow_git = "1972fa37ac7a6f632cd5ece0b32fe37ab76eec75"
+network = "silero-vad-v5"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+executor = "host"
+max_ctx = 512
+
+[checkpoint]
+source = "pip:silero-vad==5.1.2"
+
+[build]
+script = "scripts/asr/silero_vad_build.sh"
+output = "silero_vad.pkt"
+"#;
+
+/// A `[build]` packet carries every weight it binds: the bundle names its checkpoint for
+/// provenance only, and a host-executed one ships no objset, which only a v3 reader accepts.
+#[test]
+fn a_host_executed_build_packet_ships_no_objset_and_no_checkpoint() {
+    let assets = tmp("host-packet");
+    std::fs::write(assets.join("silero_vad.pkt"), b"PLOWDEV").unwrap();
+    std::fs::write(assets.join("silero_vad.lean-checks.json"), b"[]").unwrap();
+    let r = write_recipe(&tmp("host-packet-recipe"), HOST_PACKET);
+    let g = generate(
+        &r,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
+    let b = &g.bundle;
+    assert!(g.objset.is_none() && b.objset.is_none() && b.host_executed());
+    assert_eq!(b.checkpoint.layout, plow_asset::dist::PACKET_LAYOUT);
+    assert_eq!(b.schema, plow_asset::dist::BUNDLE_SCHEMA_VIEWS);
+    assert_eq!(b.max_ctx, 512);
+    assert!(b
+        .files
+        .iter()
+        .any(|f| f.name == "silero_vad.pkt" && f.role == "packet"));
+    b.validate().unwrap();
+    let mut v2 = b.clone();
+    v2.schema = plow_asset::dist::BUNDLE_SCHEMA_NVIDIA_TREE.into();
+    assert!(v2.validate().is_err(), "a v2 reader would build a farm");
+
+    std::fs::write(assets.join("interp_sm90a.cubin"), b"ELF-cubin").unwrap();
+    let e = generate(
+        &r,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("ships no device object"), "{e}");
+
+    let cell = write_recipe(
+        &tmp("host-cell-recipe"),
+        &MINIMAL.replace(
+            "parallel = \"tp\"\n",
+            "parallel = \"tp\"\nexecutor = \"host\"\n",
+        ),
+    );
+    let e = read_recipe(&cell, Overrides::default())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("only a `[build]` packet"), "{e}");
+}
+
+/// A sub-bundle (a second packet the model loads from its own directory) ships under its
+/// directory name, and its objects join the objset after the root's.
+#[test]
+fn a_sub_bundle_ships_its_packet_and_objects_under_its_name() {
+    let assets = speech_assets("sub-bundle");
+    std::fs::write(assets.join("interp_sm90a.cubin"), b"ELF-cubin").unwrap();
+    let sub = assets.join("text_encoder");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("model.pkt"), b"PLOWDEV-enc").unwrap();
+    std::fs::write(sub.join("interp_sm90a.cubin"), b"ELF-cubin-enc").unwrap();
+    let r = write_recipe(&tmp("sub-bundle-recipe"), MINIMAL);
+    let g = generate(
+        &r,
+        &assets,
+        None,
+        Overrides::default(),
+        &BundleArgs::default(),
+    )
+    .unwrap();
+    let (objset, _) = g.objset.as_ref().unwrap();
+    let names: Vec<_> = objset.objects.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["interp_sm90a.cubin", "text_encoder/interp_sm90a.cubin"]
+    );
+    assert!(g
+        .bundle
+        .files
+        .iter()
+        .any(|f| f.name == "text_encoder/model.pkt" && f.role == "sub_packet"));
+    assert_eq!(g.bundle.schema, plow_asset::dist::BUNDLE_SCHEMA_VIEWS);
+    g.bundle.validate().unwrap();
+}
+
+/// Only a checkpoint the recipe's prep wrote (`{out}/...`) is published as a view; a recipe
+/// that binds the pinned snapshot, or an operator's local file set, records none.
+#[test]
+fn only_a_prepared_checkpoint_is_recorded_as_a_view() {
+    let with = |hf_dir: &str| {
+        let r = write_recipe(
+            &tmp("view-recipe"),
+            &MINIMAL.replace("[cell]\n", &format!("[cell]\nhf_dir = \"{hf_dir}\"\n")),
+        );
+        read_recipe(&r, Overrides::default()).unwrap().views
+    };
+    assert_eq!(with("{out}/prep/lm"), ["checkpoint"]);
+    assert!(with("{hf:maya-research/Veena}").is_empty());
+    assert!(with("{env:CKPT}").is_empty());
 }

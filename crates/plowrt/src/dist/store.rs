@@ -92,7 +92,12 @@ pub struct Store {
 impl Store {
     /// `--plow-home` / `PLOW_HOME`, else `$HOME/.plow`.
     pub fn open_default() -> Result<Self> {
-        let root = match crate::config::RuntimeConfig::get().plow_home.clone() {
+        Self::open_home(crate::config::RuntimeConfig::get().plow_home.as_deref())
+    }
+
+    /// The store at `plow_home`, else `$HOME/.plow`.
+    pub fn open_home(plow_home: Option<&str>) -> Result<Self> {
+        let root = match plow_home {
             Some(p) => PathBuf::from(p),
             None => {
                 let home = std::env::var_os("HOME").ok_or_else(|| {

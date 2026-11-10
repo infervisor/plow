@@ -44,6 +44,25 @@ pub const WG_THREADS: u32 = WG_WAVES * 64;
 
 pub const TENSOR_NONE: u32 = 0xFFFF_FFFF;
 
+/// i6 bit selecting FP32 residual storage on Embed/RmsNorm/NormResidual/NormResidualNorm.
+/// Normalized operands, branch inputs and norm weights remain BF16. i7 retains existing opcode-specific semantics.
+pub const RESIDUAL_F32_FLAG: u32 = 2;
+
+/// XReduce f0 bit-pattern: FP32 peer partials, one BF16 output store.
+pub const XREDUCE_PARTIAL_F32_MARK: u32 = 0x4633_3250;
+
+pub fn xreduce_partial_f32(op: u16, f0: u32) -> bool {
+    op == DevOp::XReduce as u16 && f0 == XREDUCE_PARTIAL_F32_MARK
+}
+
+pub fn uses_residual_f32(op: u16, flags: u32) -> bool {
+    flags & RESIDUAL_F32_FLAG != 0
+        && matches!(
+            DevOp::from_u16(op),
+            Some(DevOp::Embed | DevOp::RmsNorm | DevOp::NormResidual | DevOp::NormResidualNorm)
+        )
+}
+
 /// `GemmWide.i[7]` tag selecting the gfx950 128x384x64 implementation.
 /// Zero remains the 128x256x64 body, preserving existing packet bytes.
 pub const GEMM_WIDE_C8_TAG: u32 = (128 << 16) | 384;
@@ -2010,8 +2029,10 @@ pub enum DevOp {
     GluF32 = 166,
     /// FP32 causal depthwise convolution with FP16 `[channels,kernel]` weights and zero left pad.
     /// Rows come in items of `rows_per_item` (0 = one item); taps before an item's first row read
-    /// zero.
-    /// `t0=out t1=x t2=weight(f16)` · `i0=rows i1=channels i2=kernel i3=rows_per_item`.
+    /// zero. Taps accumulate in order from the oldest row. Flag bit 0: FP32 weights; bit 1 rounds
+    /// the result to BF16.
+    /// `t0=out t1=x t2=weight(f16|f32)` · `i0=rows i1=channels i2=kernel i3=rows_per_item
+    /// i4=flags`.
     CausalDepthwiseConv1dF32 = 167,
     /// FP32 relative-position attention. Q/K/V/position/context are `[rows,width]`, position has
     /// `2*rows-1` rows, and u/v are `[heads,width/heads]`. `left_chunks = u32::MAX` selects full
@@ -2035,11 +2056,18 @@ pub enum DevOp {
     /// result to BF16; bit 1 applies erf-GELU with BF16 input/output rounding; bit 2 selects
     /// row-major BF16 weights instead of FP32. Precision hints (results stay within FP32
     /// accumulation-order noise): bit 3 asserts A (and FP32 W) hold BF16-representable values,
-    /// allowing BF16 tensor cores; bit 4 allows 3xTF32 tensor cores. `scratch` (optional, the
-    /// NVIDIA split-K workspace) is 1024 zeroed u32 tickets then `blocks` 64x64 f32 partials.
+    /// allowing BF16 tensor cores; bit 4 allows 3xTF32 tensor cores.
+    /// CUDA bit 11 selects continuous BF16 tensor-core FP32 accumulation (K16); bit 12
+    /// selects K8 with bit 11. These hints require bits 2/3, no LayerNorm/reference-row
+    /// prologue, and K divisible by 8. Other backends retain their existing accumulation.
+    /// `scratch` (optional, the NVIDIA split-K workspace) is 1024 zeroed u32 tickets then
+    /// `blocks` 64x64 f32 partials.
     /// Bit 5: LayerNorm prologue, A is read as LayerNormF32 would write it,
     /// `(a - stats[r].0) * stats[r].1 * gamma[k] + beta[k]` (row `r` counted like A, including
     /// `a_row0`; `stats` from RowStatsF32); bit 6 rounds that to bf16 (LayerNormF32 flag bit 0).
+    /// Bits 8-10 (neither the prologue nor bit 7's reference split; `t5` = FP32
+    /// `[lo0, hi0, lo1, hi1]`), after the rounding: bit 8
+    /// clamps to `[lo0, hi0]`, bit 9 applies SiLU then BF16 rounding, bit 10 clamps to `[lo1, hi1]`.
     /// `t0=C t1=A t2=W t3=bias? t4=scratch? t5=stats? t6=gamma? t7=beta?` ·
     /// `i0=M i1=N i2=K i3=activation i4=a_row0 i5=weight_stride? i6=implicit_onehot_col i7=flags`.
     DenseGemmF32 = 170,
@@ -2207,6 +2235,11 @@ pub enum DevOp {
     /// activation (codes [`ACT_TANH`]..[`ACT_RELU`], 13 and 14 invalid here; `f0` is the
     /// leaky-ReLU slope, `alpha[channel]` the snake alpha of the channel it is applied to),
     /// bit 12 FP16 weights, bit 13 allows 3xTF32 tensor cores (FP32-accurate) for the GEMM form.
+    /// CUDA bits 14/17/18 allow wide BF16-split WGMMA and its appended split-weight image.
+    /// With bit 15 clear (channel-major weights), kernel > 1, groups/stride = 1, zero padding,
+    /// input channels divisible by 64, no activations/alpha and no split-K (bit 20), the image
+    /// orders K by channel tile 64, tap, channel within tile. The raw FP32 prefix retains
+    /// `[out_channels,in_channels,kernel]`; other implementations read that prefix.
     /// Optional `row_scale` f32 `[batch][out_rows]` scales each row after the output activation,
     /// before the residual: `out = residual + row_scale[b][t] * post(bias + conv)`.
     /// `t0=out(f32[batch,out_rows,out_channels]) t1=x(f32[batch,in_rows,in_channels])
@@ -2239,7 +2272,8 @@ pub enum DevOp {
     /// FP32 binary op with a strided `b`: `out[i][r][c] = s * (a[i][r][c] op
     /// b[i*b_item_stride + r*b_row_stride + c*b_col_stride])` (full, row vector, column vector,
     /// scalar, per-item: all by strides). `op`: 0 add, 1 sub, 2 mul, 3 div, 4 max, 5 min.
-    /// Flag bit 0 scales the result by `f0` (else `s = 1`). Output may alias `a`.
+    /// Flag bit 0 scales the result by `f0` (else `s = 1`); bit 1 rounds the result to BF16.
+    /// Output may alias `a`.
     /// `t0=out t1=a t2=b` · `i0=items i1=rows i2=width i3=op i4=b_item_stride i5=b_row_stride
     /// i6=b_col_stride i7=flags` · `f0=scale`.
     BinaryF32 = 200,
@@ -2483,7 +2517,8 @@ pub enum DevOp {
     /// x, f16 W, K <= 1024) LayerNorms each x row first, `(x - mean) * rsqrt(var + eps) * gamma +
     /// beta`, fp32 two-pass statistics; bit 9 reads `bias(f32[M / i3, N])`, one row per `i3` rows;
     /// bit 10 (f32 x, f16 W, K % 64 == 0) rounds x to f16 and multiplies on tensor cores (fp32
-    /// accumulation, any summation order), streaming W once per 64 rows.
+    /// accumulation, any summation order), streaming W once per 64 rows. Bit 11 alone (no other
+    /// bit) rounds each `C` to bf16 (a reference whose linear outputs bf16).
     /// `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K]) t3=bias? t4=residual? t5=gamma? t6=beta?` ·
     /// `i0=M i1=N i2=K i3=bias_group i7=flags` · `f0=eps` (K % 8 == 0).
     GemvF32Out = 220,
@@ -2497,10 +2532,11 @@ pub enum DevOp {
     /// value other than `u32::MAX` replaces the draw (teacher forcing). The class sets its bitmap
     /// bit, lands in `out[r*i2 + i3]`, and `eidx[r] = class + j0` (an embedding row). `ctl[r][0]
     /// == 0` skips the row.
+    /// HF `min_new_tokens`: while `ctl[r][1] < i6` the last class (the stop) is `-inf` first.
     /// `t0=out(u32) t1=logits(f32[rows][i7 or vocab]) t2=params(f32[rows][4]: T, top_p, penalty, -)
     /// t3=ctl(u32[rows][2]: top_k, step) t4=seed(u64[rows]) t5=bitmap(u32[rows][i5])?
     /// t6=force(u32, out's layout)? t7=eidx(u32[rows])?` · `i0=rows i1=vocab i2=out_stride
-    /// i3=out_col0 i4=coord i5=bitmap_words i7=logit_stride` · `j0=eidx_offset`.
+    /// i3=out_col0 i4=coord i5=bitmap_words i6=min_step i7=logit_stride` · `j0=eidx_offset`.
     SampleSmallF32 = 221,
     /// FP32 stream tail: the last `L` rows a streaming stage carries between chunks, per slot.
     /// Gather (mode 0) builds `z(f32[B][L+N][Cz])`: rows `[0, L)` hold `state[slot[b]]` in

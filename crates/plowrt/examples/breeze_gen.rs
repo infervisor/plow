@@ -17,6 +17,12 @@
 //! `BREEZE_CFG=S:UNCOND_ENC.f32` runs a CFG pair: slot 1 prefills the unconditional text rows,
 //! each frame samples `u + S (c - u)` in the depth stage, and the logits files carry both rows
 //! (cond, uncond) per frame.
+//!
+//! Dual-stream packets (Qwen3-TTS: every row a token plus a frame): TEXT_ENC.f32 = `-`, every
+//! PROMPT_CODES row's first word is its token, and `GEN_FEED=FEED.u32` (`[tail, text...]`) feeds
+//! decode step `s` text token `s` (then `tail`) beside the frame. `BREEZE_REP` sets the cb0
+//! repetition penalty (default 1.1). `GEN_TIME=1` prints the median wall time of the depth stage
+//! and of the backbone step per frame (both synchronous: each reads its result back).
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -40,7 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let assets = PathBuf::from(&a[1]);
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
     let mut e = GpuEngine::load(be, &assets, &PathBuf::from(&a[2]))?;
-    let enc: Vec<f32> = read(&a[3]);
+    let dual = a[3] == "-";
+    let enc: Vec<f32> = if dual { Vec::new() } else { read(&a[3]) };
+    let feed: Option<Vec<u32>> = std::env::var("GEN_FEED").ok().map(|f| read(&f));
     let free: Option<usize> = a[4].strip_prefix("free:").map(|n| n.parse().unwrap());
     let frames: Vec<u32> = match free {
         Some(n) => vec![u32::MAX; n * CODEBOOKS],
@@ -54,7 +62,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Overlay index per prompt row (text rows in order, frame rows kept) and the prompt codes.
     let (mut index, mut codes, mut next) = (Vec::new(), Vec::new(), 0u32);
     for r in layout.chunks_exact(CODEBOOKS + 1) {
-        if r[0] == 0 {
+        if dual {
+            index.push(r[0]);
+        } else if r[0] == 0 {
             index.push(next);
             next += 1;
         } else {
@@ -62,8 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         codes.extend_from_slice(&r[1..]);
     }
-    assert_eq!(
-        next as usize, text_rows,
+    assert!(
+        dual || next as usize == text_rows,
         "prompt layout text rows != TEXT_ENC rows"
     );
     let n = index.len();
@@ -111,17 +121,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     e.begin_slot(0, n + nf + 1)?;
-    e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(&enc))?;
-    // A frame row's token is its codebook-0 code; text rows embed from the overlay.
-    let ids: Vec<u32> = (0..n).map(|r| codes[r * CODEBOOKS]).collect();
+    // A frame row's token is its codebook-0 code; text rows embed from the overlay. A dual-stream
+    // row's token is its own (`index`).
+    let ids: Vec<u32> = if dual {
+        index.clone()
+    } else {
+        e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(&enc))?;
+        (0..n).map(|r| codes[r * CODEBOOKS]).collect()
+    };
     let mut c0 = 0;
     loop {
         let hi = n.min(c0 + e.pf_max_rows().max(1));
-        e.write_tensor(
-            "in.encoder_overlay_index",
-            0,
-            bytemuck::cast_slice(&index[c0..hi]),
-        )?;
+        if !dual {
+            e.write_tensor(
+                "in.encoder_overlay_index",
+                0,
+                bytemuck::cast_slice(&index[c0..hi]),
+            )?;
+        }
         e.write_tensor(
             "in.frame_codes",
             0,
@@ -166,14 +183,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         top_k: std::env::var("BREEZE_TOP_K").map_or(50, |v| v.parse().unwrap()),
         ras_temperature: 1.0,
         ras_top_p: 1.0,
-        repetition_penalty: 1.1,
+        repetition_penalty: std::env::var("BREEZE_REP").map_or(1.1, |v| v.parse().unwrap()),
         cfg: cfg.as_ref().map(|(s, _)| (*s, uncond_row)),
     };
     let (mut toks, mut codes, mut sampled) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut t_depth, mut t_step) = (Vec::new(), Vec::new());
     for f in frames.chunks_exact(CODEBOOKS) {
         e.write_tensor_ordered("in.breeze.force", 0, bytemuck::cast_slice(f))?;
         codes.clear();
+        let t = std::time::Instant::now();
         e.fish_depth_step(&[row], &mut codes)?;
+        t_depth.push(t.elapsed().as_secs_f64() * 1e3);
         if free.is_none() {
             assert_eq!(&codes[..], f, "forced frame codes");
         }
@@ -190,8 +210,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if codes[0] == info.stop_class {
             break;
         }
-        let feeds: Vec<(usize, u32)> = (0..rows).map(|s| (s, codes[0])).collect();
+        let token = match &feed {
+            Some(f) => *f.get(1 + row.step as usize).unwrap_or(&f[0]),
+            None => codes[0],
+        };
+        let feeds: Vec<(usize, u32)> = (0..rows).map(|s| (s, token)).collect();
+        let t = std::time::Instant::now();
         e.step_slots(&feeds, &mut toks)?;
+        t_step.push(t.elapsed().as_secs_f64() * 1e3);
         hidden_row(&e, 0, &mut out)?;
         row.hidden_row = 0;
         row.cfg = row.cfg.map(|(s, _)| (s, 1));
@@ -207,6 +233,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("{}.frames.u32", a[5]),
         bytemuck::cast_slice(&sampled),
     )?;
+    if std::env::var("GEN_TIME").is_ok_and(|v| v == "1") {
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        println!(
+            "time depth_ms_median={:.3} step_ms_median={:.3} frames={}",
+            med(&mut t_depth),
+            med(&mut t_step),
+            t_depth.len()
+        );
+    }
+    // `GEN_DEPTH_SWEEP=N,S`: median depth-program time with the interpreter capped at every S-th
+    // instruction up to N (per-instruction attribution, as step_bench's sweep for decode).
+    if let Ok(v) = std::env::var("GEN_DEPTH_SWEEP") {
+        let (n, s) = v.split_once(',').unwrap_or((&v, "1"));
+        let (n, s): (u32, usize) = (n.parse()?, s.parse()?);
+        for cap in (0..=n).step_by(s) {
+            if !e.set_debug_max_inst(cap, 1)? {
+                return Err("decode object has no instruction cap".into());
+            }
+            let mut t = Vec::new();
+            for _ in 0..7 {
+                codes.clear();
+                let t0 = std::time::Instant::now();
+                e.fish_depth_step(&[row], &mut codes)?;
+                t.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            t.sort_by(f64::total_cmp);
+            println!("{{\"cap\":{cap},\"ms\":{:.4}}}", t[3]);
+        }
+        e.set_debug_max_inst(u32::MAX, 1)?;
+    }
     println!("prompt rows {n} frames {nf} -> {}", a[5]);
     Ok(())
 }

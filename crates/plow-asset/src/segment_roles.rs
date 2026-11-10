@@ -394,6 +394,11 @@ pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
         && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_GEMMA4_31B_SHAPES.contains(&(n, k))
+            // E4B W8A8 (route matrix, H100 2026-11-05): cuBLASLt OUTER_VEC 1.04-1.8x faster than
+            // the native ws384 FP8 body at 64-8192 rows for every projection but down_proj at
+            // 1024 / 8192 rows (0.070 vs 0.073 ms, 0.333 vs 0.352 ms).
+            || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k))
+                && !((n, k) == (2560, 10240) && (m == 1024 || m == 8192))
             // Qwen3.8 W8A8, only at its measured buckets: the packed prefill 2.5-4.5x faster than
             // the native W8A8 GEMM at 128-8192 rows (H100 route sweep 2026-10-26: 4096 rows
             // 1232 -> 277 ms).
@@ -427,18 +432,14 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
                 || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES.contains(&(n, k)))
         }
-        // Ada has no TMA/wgmma prefill GEMM: the speech LMs (ASR decoders, Llama TTS) and Gemma 4
-        // E4B (L40S cold TTFT at 3944 tokens 1121 ms on the interpreter GEMM) are routed.
-        "sm89" | "sm_89" => {
+        // Ada and GB202 have no TMA/wgmma prefill GEMM: the speech LMs (ASR decoders, Llama TTS)
+        // and Gemma 4 E4B (L40S cold TTFT at 3944 tokens 1121 ms on the interpreter GEMM) are
+        // routed.
+        "sm89" | "sm_89" | "sm120" | "sm_120a" => {
             rows && (CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k)))
-        }
-        // GB202 has Ada's prefill object (no TMA/wgmma); only the ASR decoders are routed so far.
-        "sm120" | "sm_120a" => {
-            rows && (CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k))
-                || CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES.contains(&(n, k)))
         }
         _ => false,
     }
@@ -1154,6 +1155,17 @@ mod tests {
                 let native = (n, k) == (5376, 21504) && (m == 512 || m >= 2048);
                 assert_eq!(super::cublaslt_prefill_fp8("sm90a", m, n, k), !native);
                 assert!(super::cublaslt_prefill_bf16("sm90a", m, n, k));
+            }
+        }
+    }
+
+    #[test]
+    fn fp8_e4b_down_stays_native_where_measured_faster() {
+        for m in [64, 128, 256, 512, 1024, 2048, 4096, 8192] {
+            for (n, k) in super::CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES {
+                let native = (n, k) == (2560, 10240) && (m == 1024 || m == 8192);
+                assert_eq!(super::cublaslt_prefill_fp8("sm90a", m, n, k), !native);
+                assert!(!super::cublaslt_prefill_fp8("sm120", m, n, k));
             }
         }
     }

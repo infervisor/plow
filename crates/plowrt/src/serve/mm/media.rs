@@ -589,6 +589,16 @@ pub fn log_mel(samples: &[f32], p: &MelParams) -> Mel {
         .collect();
     let filters = mel_filters(p);
     let bins = p.fft_length / 2 + 1;
+    // Each triangle is nonzero on one bin run; the sum over it equals the full-row sum bit for
+    // bit (the skipped terms add +0 to a non-negative partial sum).
+    let spans: Vec<(usize, usize)> = (0..p.mel_bins)
+        .map(|m| {
+            let nz = |b: &usize| filters[b * p.mel_bins + m] != 0.0;
+            let lo = (0..bins).find(nz).unwrap_or(0);
+            let hi = (0..bins).rev().find(nz).map_or(0, |b| b + 1);
+            (lo, hi.max(lo))
+        })
+        .collect();
     let fft = rustfft::FftPlanner::<f64>::new().plan_fft_forward(p.fft_length);
     let sample = |i: usize| -> f64 {
         if i < pad_left || i - pad_left >= samples.len() {
@@ -615,9 +625,9 @@ pub fn log_mel(samples: &[f32], p: &MelParams) -> Mel {
         for b in 0..bins {
             mag[b] = buf[b].norm();
         }
-        for m in 0..p.mel_bins {
+        for (m, &(lo, hi)) in spans.iter().enumerate() {
             let mut s = 0f64;
-            for b in 0..bins {
+            for b in lo..hi {
                 s += mag[b] * filters[b * p.mel_bins + m];
             }
             values[f * p.mel_bins + m] = (s + p.mel_floor).ln() as f32;
@@ -758,6 +768,55 @@ mod tests {
         let src = ((16 + 3) * 96 + 32 + 4) * 3 + 1;
         assert!((v - f32::from(data[src]) / 255.0).abs() < 1e-7);
         assert_eq!(pt.positions[k], [2, 1]);
+    }
+
+    #[test]
+    fn log_mel_matches_the_dense_filter_sum() {
+        let p = MelParams {
+            sample_rate: 16_000,
+            frame_length: 320,
+            hop_length: 160,
+            fft_length: 512,
+            mel_bins: 128,
+            min_frequency: 0.0,
+            max_frequency: 8000.0,
+            mel_floor: 1e-3,
+            pad_multiple: 128,
+        };
+        let x: Vec<f32> = (0..8_000u32)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 8) as f32 / 16_777_216.0 - 0.5) * 0.3)
+            .collect();
+        let mel = log_mel(&x, &p);
+        // Dense reference: the full [bins][mel] product.
+        use rustfft::num_complex::Complex;
+        let filters = mel_filters(&p);
+        let bins = p.fft_length / 2 + 1;
+        let fft = rustfft::FftPlanner::<f64>::new().plan_fft_forward(p.fft_length);
+        let padded = x.len().next_multiple_of(p.pad_multiple);
+        let total = p.frame_length / 2 + padded;
+        let frames = (total - (p.frame_length + 1)) / p.hop_length + 1;
+        assert_eq!(mel.frames, frames);
+        for f in 0..frames {
+            let mut buf = vec![Complex::new(0f64, 0f64); p.fft_length];
+            for (i, c) in buf.iter_mut().enumerate().take(p.frame_length) {
+                let j = (f * p.hop_length + i).checked_sub(p.frame_length / 2);
+                let v = j.and_then(|j| x.get(j)).copied().unwrap_or(0.0);
+                let w = 0.5
+                    - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / p.frame_length as f64).cos();
+                *c = Complex::new(f64::from(v * (w as f32)), 0.0);
+            }
+            fft.process(&mut buf);
+            for m in 0..p.mel_bins {
+                let s: f64 =
+                    (0..bins).fold(0.0, |s, b| s + buf[b].norm() * filters[b * p.mel_bins + m]);
+                let want = (s + p.mel_floor).ln() as f32;
+                assert_eq!(
+                    mel.values[f * p.mel_bins + m].to_bits(),
+                    want.to_bits(),
+                    "frame {f} mel {m}"
+                );
+            }
+        }
     }
 
     #[test]

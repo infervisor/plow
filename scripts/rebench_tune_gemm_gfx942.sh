@@ -103,7 +103,7 @@ echo "=== 1/5  building the gfx942 objects + test_kernels.elf into $OBJ (inside 
 # by the object digest. It is also what makes the contract audit pass: a packet build derives
 # its row set from the packet and matched the contract over all 53 objects here, where the
 # generic build still carries f89d3a5c's scratch-budget regressions and the stale geometry
-# profile (both attributed in docs/bringup/tp-bringup-upstream-review-log.md).
+# profile.
 "$NIX" develop "$WT" -c \
   env ${PLOW_TUNE_CONFIG:+PLOW_HSACO_CONFIG="$PLOW_TUNE_CONFIG"} \
       PLOW_L2HIER=1 JOBS="${JOBS:-14}" ./scripts/build_gfx942.sh "$OBJ"

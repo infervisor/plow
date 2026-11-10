@@ -274,7 +274,7 @@ pb_check_objects() {
 
     # AMD target check
     local miss=0 f
-    if [ "$arch" = gfx950 ]; then
+    if [ "$arch" = gfx950 ] || [ "$arch" = gfx1201 ]; then
         for f in interp_decode.elf interp_prefill.elf interp_flash.elf; do
             [ -e "$dir/$f" ] || { pb_bad "object dir lacks $f"; miss=$((miss + 1)); }
         done
@@ -292,7 +292,7 @@ PYEOF
             done
         fi
         [ "$miss" -eq 0 ] || return 1
-        pb_ok "gfx950 interpreter objects in $dir (runtime checks packet pairing and optional routes)"
+        pb_ok "$arch interpreter objects in $dir (runtime checks packet pairing and optional routes)"
         return 0
     fi
     while IFS= read -r f; do

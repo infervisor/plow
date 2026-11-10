@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Token-identity correctness gate (see docs/bringup/07-perf-campaign.md): serve a bundle, run fixed
-# greedy prompts, dump outputs for diffing against the reference arm.
+# Legacy bring-up helper, not a qualification gate (qualification = `campaign.py gate` kind
+# llm_fp32_ref + `campaign.py report`). Serves a bundle, runs fixed greedy prompts and dumps
+# outputs for diffing against another arm.
 #   bringup_gate.sh <assets-dir> <tag> <port> [plowrt-binary]
-# Wrap in gpulease. Compare arms with: diff $BRINGUP_OUT/gate-out/<a>.txt <b>.txt
+# Run through scripts/bench/gpuq.py submit. Compare arms with: diff $BRINGUP_OUT/gate-out/<a>.txt <b>.txt
 set -euo pipefail
 ASSETS="$1"; TAG="$2"; PORT="$3"
 PLOWRT="${4:-$(dirname "$0")/../../target/release/plowrt}"

@@ -1,9 +1,13 @@
 import json
+import io
 import math
+from contextlib import redirect_stdout
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "campaign"))
@@ -27,6 +31,110 @@ def stack(prefer):
             h.append(t)
         return toks, tops, " ".join(map(str, toks))
     return complete
+
+
+class CaptureRequestTraceTests(unittest.TestCase):
+    def capture(self, directory, trace, cases=None, reply=None, warm=False):
+        ref = dict(sha256="same-reference", cases=cases or [
+            dict(id="one", prompt_ids=[4], cont=[5, 6]),
+            dict(id="two", prompt_ids=[10], cont=[11, 12]),
+        ])
+        calls = []
+
+        def complete(_url, body):
+            calls.append(body)
+            tokens = reply(body) if reply else [body["prompt"][-1] + i + 1 for i in range(body["max_tokens"])]
+            return dict(usage=dict(prompt_tokens=len(body["prompt"])), choices=[dict(
+                text="answer", logprobs=dict(tokens=[f"token_id:{t}" for t in tokens],
+                    token_logprobs=[-0.5] * len(tokens),
+                    top_logprobs=[{f"token_id:{t}": -1.0, "token_id:99": -2.0} for t in tokens]))])
+
+        out = Path(directory) / ("trace.json" if trace else "plain.json")
+        requests = Path(directory) / "requests.jsonl"
+        args = SimpleNamespace(url="http://capture.invalid", ref=str(Path(directory)/"ref.json"),
+            arm="test", out=str(out), concurrency=2, warm_turn=warm,
+            requests_out=str(requests) if trace else None)
+        with mock.patch.object(g, "load_ref", return_value=ref), \
+             mock.patch.object(g.urllib.request, "urlopen", return_value=io.StringIO('{"data":[{"id":"test"}]}')), \
+             mock.patch.object(g, "post", side_effect=complete), redirect_stdout(io.StringIO()):
+            g.cmd_capture(args)
+        rows = [json.loads(line) for line in requests.read_text().splitlines()] if trace else []
+        return json.loads(out.read_text()), rows, sorted(calls, key=lambda row: row["prompt"])
+
+    def test_request_trace_preserves_capture_and_http_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain, _, plain_calls = self.capture(tmp, False)
+            traced, rows, traced_calls = self.capture(tmp, True)
+        self.assertEqual(plain["cases"], traced["cases"])
+        self.assertEqual(plain_calls, traced_calls)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["prompt_sha256"] for row in rows}, {g.ids_sha([4]), g.ids_sha([10])})
+        self.assertTrue(all(row["concurrency"] == 2 and row["ref_sha256"] == "same-reference" for row in rows))
+        self.assertEqual({row["case_id"] for row in rows}, {"one", "two"})
+        self.assertTrue(all(not row["warm"] for row in rows))
+
+    def test_request_trace_keeps_actual_chosen_logprob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, rows, _ = self.capture(tmp, True)
+        for row in rows:
+            self.assertEqual(row["first"]["logprob"], -0.5)
+            self.assertEqual(row["first"]["top"][0][1], -1.0)
+            self.assertEqual(row["first"]["token"], row["first"]["top"][0][0])
+
+    def test_request_trace_tracks_teacher_force_restarts(self):
+        cases = [dict(id="flip", prompt_ids=[4], cont=[5, 6, 7])]
+        with tempfile.TemporaryDirectory() as tmp:
+            cap, rows, _ = self.capture(tmp, True, cases,
+                lambda body: [5, 99, 100] if body["prompt"] == [4] else [7])
+        self.assertEqual(cap["cases"]["flip"]["requests"], 2)
+        self.assertEqual([r["prompt_sha256"] for r in rows], [g.ids_sha([4]), g.ids_sha([4, 5, 6])])
+        self.assertTrue(all(r["case_id"] == "flip" and not r["warm"] for r in rows))
+        self.assertEqual(rows[1]["first"]["top"], cap["cases"]["flip"]["pos"]["2"])
+
+    def test_request_trace_keeps_empty_response_and_retry(self):
+        replies = iter([[], [5]])
+        with tempfile.TemporaryDirectory() as tmp:
+            cap, rows, _ = self.capture(tmp, True, [dict(id="empty", prompt_ids=[4], cont=[5])],
+                lambda _body: next(replies))
+        self.assertEqual((cap["cases"]["empty"]["requests"], cap["cases"]["empty"]["empty_replies"]), (2, 1))
+        self.assertIsNone(rows[0]["first"])
+        self.assertEqual(rows[1]["first"]["token"], 5)
+        self.assertTrue(all(r["case_id"] == "empty" for r in rows))
+
+    def test_failed_response_is_an_error_and_not_a_successful_trace(self):
+        def unavailable(_body):
+            raise RuntimeError("offline")
+        with tempfile.TemporaryDirectory() as tmp:
+            cap, rows, _ = self.capture(tmp, True, [dict(id="failed", prompt_ids=[4], cont=[5])], unavailable)
+        self.assertIn("offline", cap["cases"]["failed"]["error"])
+        self.assertEqual(rows, [])
+
+    def test_request_trace_distinguishes_warm_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cap, rows, _ = self.capture(tmp, True,
+                [dict(id="warm", prompt_ids=list(range(1, 9)), cont=[9, 10])], warm=True)
+        self.assertEqual(cap["cases"]["warm"]["requests"], 1)
+        self.assertEqual([r["warm"] for r in rows], [True, False])
+        self.assertTrue(all(r["case_id"] == "warm" for r in rows))
+
+    def test_request_trace_refuses_capture_path_before_http(self):
+        args = SimpleNamespace(ref="ref.json", url="http://capture.invalid", out="cap.json", requests_out="./cap.json")
+        with mock.patch.object(g, "load_ref", return_value={}), mock.patch.object(g.urllib.request, "urlopen") as opened:
+            with self.assertRaisesRegex(ValueError, "different files"):
+                g.cmd_capture(args)
+            opened.assert_not_called()
+
+    def test_request_trace_refuses_existing_hard_link_before_http(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, trace = Path(tmp)/"cap.json", Path(tmp)/"requests.jsonl"
+            out.write_text("preserve")
+            trace.hardlink_to(out)
+            args = SimpleNamespace(ref="ref.json", url="http://capture.invalid", out=str(out), requests_out=str(trace))
+            with mock.patch.object(g, "load_ref", return_value={}), mock.patch.object(g.urllib.request, "urlopen") as opened:
+                with self.assertRaisesRegex(ValueError, "different files"):
+                    g.cmd_capture(args)
+                opened.assert_not_called()
+            self.assertEqual(out.read_text(), "preserve")
 
 
 class KlTests(unittest.TestCase):
@@ -369,6 +477,40 @@ class ScaledTensorTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as e:
                     list(g.scaled_tensors(files, device="cpu"))
                 self.assertIn(k, str(e.exception))
+
+
+class PreparedHeadTests(unittest.TestCase):
+    def test_restricted_head_keeps_the_full_input_vocabulary(self):
+        try:
+            import torch
+            from safetensors.torch import save_file
+            from transformers import Qwen3Config, Qwen3ForCausalLM
+        except ImportError:
+            self.skipTest("torch + safetensors + transformers required")
+        cfg = Qwen3Config(vocab_size=19, hidden_size=16, intermediate_size=24,
+                          num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+                          head_dim=4, max_position_embeddings=32, tie_word_embeddings=False,
+                          plow_head_rows=3)
+        cfg._attn_implementation = "sdpa"
+        model = Qwen3ForCausalLM(cfg)
+        model.lm_head = torch.nn.Linear(16, 3, bias=False)
+        model.eval()
+        state = {name: value.detach().to(torch.bfloat16).contiguous()
+                 for name, value in model.state_dict().items()}
+        model.load_state_dict(state)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.save_pretrained(tmp)
+            save_file(state, str(Path(tmp) / "model.safetensors"))
+            loaded, _ = g.load_fp32(tmp, device="cpu")
+            self.assertEqual(tuple(loaded.model.embed_tokens.weight.shape), (19, 16))
+            self.assertEqual(tuple(loaded.lm_head.weight.shape), (3, 16))
+            self.assertEqual(loaded.lm_head.weight.dtype, torch.float32)
+            tokens = torch.tensor([[1, 17, 18], [18, 5, 16]])
+            with torch.inference_mode():
+                expected = model(input_ids=tokens, use_cache=False).logits
+                actual = loaded(input_ids=tokens, use_cache=False).logits
+            self.assertEqual(tuple(actual.shape), (2, 3, 3))
+            torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

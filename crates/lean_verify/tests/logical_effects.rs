@@ -73,6 +73,68 @@ fn speech_obligation(build: impl FnOnce(&mut Builder)) -> serde_json::Value {
     })
 }
 
+fn frame_embedding(mode: u32, missing: Option<usize>) -> serde_json::Value {
+    speech_obligation(|b| {
+        let out = b.tensor("act.frame", 16);
+        let inputs = [
+            ("in.table", 256),
+            ("in.tokens", 4),
+            ("in.codebooks", 512),
+            ("in.codes", 8),
+            ("in.norm", 32),
+        ];
+        let count = if mode & 2 == 0 { 4 } else { 5 };
+        let mut handles = Vec::new();
+        let mut deps = Vec::new();
+        for (slot, &(name, bytes)) in inputs[..count].iter().enumerate() {
+            let h = b.tensor(name, bytes);
+            handles.push(h);
+            let producer = b.emit(DevOp::ZeroF32, vec![0], &[], |d| {
+                d.t[0] = h;
+                d.i[0] = (bytes / 4) as u32;
+            });
+            if missing != Some(slot) {
+                deps.push(producer);
+            }
+        }
+        let embed = b.emit(DevOp::EmbedFrameBf16, vec![0], &deps, |d| {
+            d.t[0] = out;
+            d.t[1..=count].copy_from_slice(&handles);
+            d.i[..8].copy_from_slice(&[1, 8, 16, 2, 16, 0, 16, mode]);
+            d.f[0] = 1.0;
+            d.f[1] = 1e-6;
+        });
+        let next = b.tensor("act.next", 16);
+        let deps = if missing == Some(count) {
+            vec![]
+        } else {
+            vec![embed]
+        };
+        b.emit(DevOp::Residual, vec![0], &deps, |d| {
+            d.t[..3].copy_from_slice(&[next, out, out]);
+            d.i[0] = 8;
+        });
+    })
+}
+
+#[test]
+#[ignore = "requires built plow_verify; CPU-only"]
+fn frame_embedding_effects_reject_missing_input_and_output_dependencies() {
+    for mode in 0..4 {
+        let cert = lean_verify::call("D", frame_embedding(mode, None)).unwrap();
+        assert!(cert.ok, "mode {mode}: {:?}", cert.reason);
+        let inputs = if mode & 2 == 0 { 4 } else { 5 };
+        for missing in 0..=inputs {
+            let cert = lean_verify::call("D", frame_embedding(mode, Some(missing))).unwrap();
+            assert!(
+                !cert.ok,
+                "mode {mode}, missing dependency {missing}: {:?}",
+                cert.reason
+            );
+        }
+    }
+}
+
 /// The codec's shared noise buffer: the next RandF32 must wait for the previous noise reader
 /// (write-after-read), not just for the previous RandF32.
 fn rand_noise(war_ordered: bool) -> serde_json::Value {
@@ -117,8 +179,8 @@ fn banded_writes(second_col: u32) -> serde_json::Value {
     })
 }
 
-/// Two DenseGemmF32 sharing one split-K workspace (tickets + partials).
-fn shared_splitk_scratch(ordered: bool) -> serde_json::Value {
+/// Two projections sharing one split-K workspace (tickets + partials).
+fn shared_splitk_scratch(op: DevOp, ordered: bool) -> serde_json::Value {
     speech_obligation(|b| {
         let a = b.tensor("act.a", 64);
         let w = b.tensor("w.w", 64);
@@ -126,9 +188,20 @@ fn shared_splitk_scratch(ordered: bool) -> serde_json::Value {
         let c1 = b.tensor("act.c1", 64);
         let scratch = b.tensor("act.splitk", 4096 + 64);
         let gemm = |b: &mut Builder, out: u32, deps: &[u32]| {
-            b.emit(DevOp::DenseGemmF32, vec![0], deps, |d| {
-                d.t[..5].copy_from_slice(&[out, a, w, packet::dev::TENSOR_NONE, scratch]);
-                d.i[..3].copy_from_slice(&[4, 4, 4]);
+            b.emit(op, vec![0], deps, |d| {
+                d.t[..3].copy_from_slice(&[out, a, w]);
+                match op {
+                    DevOp::DenseGemmF32 => {
+                        d.t[4] = scratch;
+                        d.i[..3].copy_from_slice(&[4, 4, 4]);
+                    }
+                    DevOp::Conv1dF32 => {
+                        d.t[7] = scratch;
+                        d.i[..8].copy_from_slice(&[1, 4, 4, 4, 1, 1, 1, 1]);
+                        d.j[1] = 1 << 20;
+                    }
+                    _ => unreachable!(),
+                }
             })
         };
         let first = gemm(b, c0, &[]);
@@ -148,12 +221,18 @@ fn speech_effects_order_noise_war_bands_and_splitk_scratch() {
     check("noise WAR missing", rand_noise(false), false);
     check("disjoint column bands", banded_writes(1), true);
     check("same column band", banded_writes(0), false);
-    check("split-K scratch ordered", shared_splitk_scratch(true), true);
-    check(
-        "split-K scratch shared unordered",
-        shared_splitk_scratch(false),
-        false,
-    );
+    for op in [DevOp::DenseGemmF32, DevOp::Conv1dF32] {
+        check(
+            "split-K scratch ordered",
+            shared_splitk_scratch(op, true),
+            true,
+        );
+        check(
+            "split-K scratch shared unordered",
+            shared_splitk_scratch(op, false),
+            false,
+        );
+    }
     // Forged parent-pointer certificates: a self parent (not decreasing) or a non-edge.
     for forge in [0u64, 1] {
         let mut request = rand_noise(true);

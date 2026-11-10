@@ -78,7 +78,22 @@ pub struct ModelBundle {
     endpoints: Vec<&'static str>,
 }
 
+/// The vendor an assets directory's packet targets, read from its `weights.json` alone.
+pub fn target_vendor(dir: &Path) -> Option<hwspec::Vendor> {
+    hwspec::registry::lookup(&ModelBundle::target_gpu(dir)?).map(|s| s.vendor)
+}
+
 impl ModelBundle {
+    /// The `gpu` a bundle's `weights.json` targets, read without loading the bundle.
+    pub fn target_gpu(dir: &Path) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct Target {
+            gpu: String,
+        }
+        let raw = std::fs::read(dir.join("weights.json")).ok()?;
+        serde_json::from_slice::<Target>(&raw).ok().map(|t| t.gpu)
+    }
+
     /// Load every artifact under `dir`. Validates each address map and packet
     /// stream up front so a bad asset fails loudly at startup, never mid-serve.
     pub fn load(dir: impl AsRef<Path>) -> Result<Self> {

@@ -46,14 +46,14 @@ use crate::exec::indirection::slots as ind_slots;
 use crate::exec::oob::{OobChannel, OobMsg};
 use crate::memory::streamer::{KvArena, SlotHandle};
 use crate::memory::AddressSpace;
-use crate::obs::serving::RequestMetrics;
+use crate::obs::serving::{Leg, RequestMetrics};
 use crate::obs::Metrics;
 use crate::sched::admission::LoadEstimator;
 use crate::sched::batching::{cold_start_hold_ms, select_bucket};
 use crate::sched::multistep::MultiStep;
 use crate::sched::rungs::{DecodeRungs, RungController, RungLoad};
 use crate::serve::session::{Retention, Seat, SessionTicket};
-use crate::serve::stream::{ChunkSender, FinishReason, StreamChunk};
+use crate::serve::stream::{ChunkSender, FinishReason, SpeechFrame, StreamChunk};
 use crate::serve::{
     bucket_has_sample_batch, reference_logits_row, sample_vocab, AppState, GenParams, RunObserver,
 };
@@ -79,8 +79,6 @@ mod packlog {
     static DECODE_ROWS: AtomicU64 = AtomicU64::new(0);
     static TICKS: AtomicU64 = AtomicU64::new(0);
 
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
     /// One line per mux tick: when it ended, what its prefill pass and decode launch cost, and
     /// how many rows decoded. The cumulative summary below hides WHICH ticks carried prefill.
     /// `steps` is the decode quantum the launch ran, `tokens` the tokens the tick emitted, and
@@ -95,7 +93,7 @@ mod packlog {
         live: usize,
         prefilling: usize,
     ) {
-        let t = START.get_or_init(std::time::Instant::now).elapsed();
+        let t = crate::obs::serving::packlog_epoch().elapsed();
         eprintln!(
             "PACKLOG TICK t_ms={:.1} prefill_ms={:.2} decode_ms={:.2} did_prefill={} decode_rows={} \
              steps={} tokens={} live={} prefilling={}",
@@ -129,7 +127,7 @@ mod packlog {
         rows: usize,
     ) {
         if on() {
-            let t = START.get_or_init(std::time::Instant::now).elapsed();
+            let t = crate::obs::serving::packlog_epoch().elapsed();
             eprintln!(
                 "PACKLOG PHASE t_ms={:.1} prefill_ms={:.2} decode_ms={:.2} did_prefill={} did_decode={} decode_rows={}",
                 t.as_secs_f64() * 1e3,
@@ -244,6 +242,7 @@ pub struct Job {
 #[derive(Default)]
 pub struct JobOpts {
     pub class: JobClass,
+    pub prompt_logprobs: bool,
     /// Stream token ids only: no detokenization, and a consumer that falls behind is parked
     /// (not fed) instead of cut, up to [`PARK_TIMEOUT`].
     pub raw_tokens: bool,
@@ -269,6 +268,10 @@ pub struct JobOpts {
     pub prefix: Option<crate::memory::vmm::PrefixKey>,
     /// Multimodal soft-token rows the prompt's bit-31 ids name (`serve::mm`).
     pub mm: Option<Box<crate::serve::mm::MmJob>>,
+    /// P/D prefill job: export the slot's KV image here when it finishes (`serve::pd`).
+    pub export: Option<Arc<crate::serve::pd::KvExport>>,
+    /// P/D decode job: seat the slot from this image instead of prefilling (`serve::pd`).
+    pub import: Option<Box<crate::serve::pd::KvImport>>,
 }
 
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
@@ -326,6 +329,10 @@ const CRITICAL_SPAN: std::time::Duration = std::time::Duration::from_millis(1000
 /// Tokens a critical job keeps deadline urgency for however long it has waited: a speech stream's
 /// first chunks. Past both this and [`CRITICAL_SPAN`] it is throughput.
 const CRITICAL_TOKENS: usize = 48;
+
+/// How long a tick waits for a downstream stage to take a stream's just-produced first-output
+/// tokens (stream task, then stage worker: ~0.1-0.3 ms measured) before it goes anyway.
+const FIRST_HANDOFF: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// The class of one job's work, for [`crate::serve::cosched::CoSched::Deadline`] outside a voice
 /// turn: an ASR final first; then a prompt still owed its first token, or a speech stream's start,
@@ -525,7 +532,7 @@ type HeldToken = (
     u32,
     String,
     Option<Box<crate::text::logprobs::TokenLogprobs>>,
-    Option<Box<[u32]>>,
+    Option<SpeechFrame>,
 );
 
 /// A request whose prefill splices host rows over prompt positions (`EmbedOverlayBf16`: the
@@ -541,6 +548,10 @@ type HeldToken = (
 /// must be the token whose decode embedding the overlay row is.
 #[derive(Default)]
 pub struct SpeechJob {
+    /// Retain completed depth outputs for a downstream streaming packet stage.
+    pub device_frames: bool,
+    /// Packet-declared v1: prompt inputs are token IDs, finalized overlays and frame codes.
+    pub slot_prefix_reuse: bool,
     /// `[rows][hidden]` f32, one row per entry of `overlay_pos`.
     pub overlay: Vec<f32>,
     /// Absolute prompt position each overlay row replaces, strictly increasing.
@@ -566,6 +577,9 @@ pub struct SpeechJob {
     /// members; empty = no frame rows. Past its end every row's codes are zero.
     pub frame_codes: Vec<u32>,
     pub frame_codes_per_row: usize,
+    /// Dual-stream rows: decode step `s` feeds text token `.0[s]` (then `.1`) instead of its last
+    /// output; the frame's codes come from the depth stage.
+    pub feed: Option<(Vec<u32>, u32)>,
     /// Maya 2: a cloned speaker's depth memory, `[layers][hidden]` (`None`: the null speaker's).
     pub maya2_memory: Option<std::sync::Arc<[f32]>>,
 }
@@ -621,11 +635,14 @@ impl DepthJob {
     }
 
     /// The step's token and, unless it stops, the frame's codes.
-    fn token(&self, codes: &[u32]) -> (u32, Option<Box<[u32]>>) {
+    fn token(&self, codes: &[u32]) -> (u32, Option<SpeechFrame>) {
         if codes[0] >= self.stop_class {
             (self.stop_token, None)
         } else {
-            (self.semantic_base + codes[0], Some(codes.into()))
+            (
+                self.semantic_base + codes[0],
+                Some(SpeechFrame::from(Box::<[u32]>::from(codes))),
+            )
         }
     }
 }
@@ -664,6 +681,8 @@ struct CfgRun {
 #[derive(Clone)]
 pub struct ModelMux {
     tx: mpsc::Sender<MuxMsg>,
+    retiring: Arc<std::sync::atomic::AtomicBool>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
     metrics: Arc<Metrics>,
     /// Preempt request flag, checked by the dispatcher at every loop top —
     /// the ONLY signal that reaches it while a full slot table keeps it away
@@ -795,8 +814,7 @@ fn note_fault(tick_fault: &mut Option<crate::DeviceErrorInfo>, err: &crate::Runt
 /// typed device fault stays typed (its fatality drives the 503 mapping);
 /// anything else degrades to the stringified `Msg` as before.
 #[allow(dead_code)]
-#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
-fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
+pub(super) fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
     match err.device_fault() {
         Some(info) => crate::RuntimeError::DeviceFault { info: info.clone() },
         None => crate::RuntimeError::Msg(msg.to_string()),
@@ -823,6 +841,14 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
 }
 
 impl ModelMux {
+    pub(crate) fn retire(&self) {
+        self.retiring.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn retiring(&self) -> bool {
+        self.retiring.load(Ordering::Acquire)
+    }
+
     /// Whether any request is queued, tokenizing or holding an engine slot.
     pub fn in_flight(&self) -> bool {
         self.ingress.pending() > 0
@@ -864,6 +890,10 @@ impl ModelMux {
     }
 
     /// Submit a job. Returns immediately; the caller awaits the stream.
+    pub(crate) fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
     pub fn submit(&self, job: Job) -> std::result::Result<(), SubmitError> {
         let arrived = job.arrived;
         self.submit_arrived(job, arrived, None)
@@ -900,14 +930,17 @@ impl ModelMux {
         arrived: Instant,
         ingress: Option<IngressGuard<'_>>,
     ) -> std::result::Result<(), SubmitError> {
-        Metrics::inc(&self.metrics.requests);
+        // A P/D decode leg continues a request its prefill rank already counted.
+        if job.opts.import.is_none() {
+            Metrics::inc(&self.metrics.requests);
+        }
         if self.shed_queue_depth() {
-            Metrics::inc(&self.metrics.rejected);
+            crate::serve::pd::refuse(&job, &self.metrics.rejected);
             Metrics::inc(&self.metrics.shed_queue);
             return Err(SubmitError::Full(job));
         }
         if !self.reserve_queue() {
-            Metrics::inc(&self.metrics.rejected);
+            crate::serve::pd::refuse(&job, &self.metrics.rejected);
             return Err(if self.tx.is_closed() {
                 SubmitError::Closed(job)
             } else {
@@ -928,58 +961,97 @@ impl ModelMux {
             }
             Err(mpsc::error::TrySendError::Full(MuxMsg::Job(job, _))) => {
                 self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-                Metrics::inc(&self.metrics.rejected);
+                crate::serve::pd::refuse(&job, &self.metrics.rejected);
                 Err(SubmitError::Full(job))
             }
             Err(mpsc::error::TrySendError::Closed(MuxMsg::Job(job, _))) => {
                 self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-                Metrics::inc(&self.metrics.rejected);
+                crate::serve::pd::refuse(&job, &self.metrics.rejected);
                 Err(SubmitError::Closed(job))
             }
             Err(_) => unreachable!(),
         }
     }
 
+    pub(crate) fn wake_import(&self) {
+        self.arrival_notify.notify_one();
+    }
+
     /// As [`Self::submit`], but a full ingress queue waits for room instead of failing: for a front
     /// that bounds its own requests in flight.
     pub async fn submit_wait(&self, job: Job) -> std::result::Result<(), SubmitError> {
-        Metrics::inc(&self.metrics.requests);
-        while !self.reserve_queue() {
+        let arrived = job.arrived;
+        self.submit_wait_arrived(job, arrived, None).await
+    }
+
+    pub(crate) async fn submit_wait_arrived(
+        &self,
+        job: Job,
+        arrived: Instant,
+        ingress: Option<IngressGuard<'_>>,
+    ) -> std::result::Result<(), SubmitError> {
+        if job.opts.import.is_none() {
+            Metrics::inc(&self.metrics.requests);
+        }
+        if self.preempted() || self.tx.is_closed() {
+            crate::serve::pd::refuse(&job, &self.metrics.rejected);
+            return Err(SubmitError::Closed(job));
+        }
+        if (job.opts.export.is_some() || job.opts.import.is_some()) && self.shed_queue_depth() {
+            crate::serve::pd::refuse(&job, &self.metrics.rejected);
+            Metrics::inc(&self.metrics.shed_queue);
+            return Err(SubmitError::Full(job));
+        }
+        let mut job = job;
+        loop {
+            if self.preempted() || self.tx.is_closed() {
+                crate::serve::pd::refuse(&job, &self.metrics.rejected);
+                return Err(SubmitError::Closed(job));
+            }
+            if self.reserve_queue() {
+                let urgent = job.opts.class != JobClass::Bulk;
+                trace_arrival(&job, arrived);
+                match self.tx.try_send(MuxMsg::Job(job, arrived)) {
+                    Ok(()) => {
+                        drop(ingress);
+                        if urgent {
+                            self.arrival_notify.notify_one();
+                        }
+                        return Ok(());
+                    }
+                    Err(mpsc::error::TrySendError::Full(MuxMsg::Job(returned, _))) => {
+                        self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                        job = returned;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(MuxMsg::Job(returned, _))) => {
+                        self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                        crate::serve::pd::refuse(&returned, &self.metrics.rejected);
+                        return Err(SubmitError::Closed(returned));
+                    }
+                    Err(_) => unreachable!(),
+                }
+            }
             tokio::select! {
                 _ = self.tx.closed() => {
-                    Metrics::inc(&self.metrics.rejected);
+                    crate::serve::pd::refuse(&job, &self.metrics.rejected);
                     return Err(SubmitError::Closed(job));
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {}
             }
         }
-        let arrived = job.arrived;
-        let urgent = job.opts.class != JobClass::Bulk;
-        trace_arrival(&job, arrived);
-        self.tx
-            .send(MuxMsg::Job(job, arrived))
-            .await
-            .map_err(|mpsc::error::SendError(msg)| {
-                self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-                Metrics::inc(&self.metrics.rejected);
-                match msg {
-                    MuxMsg::Job(job, _) => SubmitError::Closed(job),
-                    MuxMsg::Drain(_) => unreachable!("sent a job"),
-                }
-            })?;
-        if urgent {
-            self.arrival_notify.notify_one();
-        }
-        Ok(())
     }
 
     /// Initiate graceful drain: no new requests accepted, all live slots run to
     /// completion. Returns when every in-flight slot has finished. Use before
     /// `Registry::unload` to avoid mid-generation errors.
     pub async fn drain(&self) {
+        let _ = self.drain_fenced().await;
+    }
+
+    pub(crate) async fn drain_fenced(&self) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(MuxMsg::Drain(tx)).await;
-        let _ = rx.await;
+        rx.await.is_ok() || self.completed.load(Ordering::Acquire)
     }
 
     /// Preemptive drain: close EVERY live stream now — `Done` with
@@ -989,6 +1061,10 @@ impl ModelMux {
     /// service_ms) — a 2048-token slot at 40 ms/token is an 82 s wait.
     /// Returns when the dispatcher has exited.
     pub async fn preempt(&self) {
+        let _ = self.preempt_fenced().await;
+    }
+
+    pub(crate) async fn preempt_fenced(&self) -> bool {
         self.preempted.store(true, Ordering::Release);
         self.preempt.store(true, Ordering::Release);
         self.preempt_notify.notify_one();
@@ -997,7 +1073,7 @@ impl ModelMux {
         // sees when a full slot table keeps it off the channel.
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(MuxMsg::Drain(tx)).await;
-        let _ = rx.await;
+        rx.await.is_ok() || self.completed.load(Ordering::Acquire)
     }
 }
 
@@ -1024,6 +1100,8 @@ struct Slot {
     /// sequence (GPU path, `PLOW_VMM_PREFIX=1`); 0 = cold. Reported as
     /// OpenAI `usage.prompt_tokens_details.cached_tokens`.
     cached_tokens: usize,
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    slot_prefix_keys: Option<(u64, Vec<u64>)>,
     /// KV arena handle held for this slot's lifetime. `None` when the bundle
     /// has no `KvPaging` (test bundles / models without attention).
     kv: Option<SlotHandle>,
@@ -1047,6 +1125,9 @@ struct Slot {
     turn: Option<crate::serve::turns::TurnTimes>,
     turn_key: Option<crate::serve::turns::TurnKey>,
     speech: Option<Box<SpeechJob>>,
+    /// Its downstream first output has not been handed off yet: set while `speech.first_tokens`
+    /// tokens are still to come.
+    first_out: bool,
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
     cfg: Option<Box<CfgRun>>,
@@ -1065,7 +1146,7 @@ struct Slot {
     /// The next token's OpenAI logprobs, set by the sampler when the request asked for them.
     lp: Option<Box<crate::text::logprobs::TokenLogprobs>>,
     /// The next token's frame codes (depth-stage packets).
-    frame: Option<Box<[u32]>>,
+    frame: Option<SpeechFrame>,
     /// Emitted tokens the engine's device repetition-penalty history for this slot counts
     /// (`usize::MAX`: unknown, reseeded before the next device draw).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -1077,13 +1158,38 @@ struct Slot {
     /// are released when the slot is dropped.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     mm: Option<Box<crate::serve::mm::MmJob>>,
+    /// [`JobOpts::export`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    export: Option<Arc<crate::serve::pd::KvExport>>,
+    /// [`JobOpts::import`], until the slot is seated.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    import: Option<Box<crate::serve::pd::KvImport>>,
 }
 
 impl Slot {
+    fn needs_prefill(&self) -> bool {
+        self.step == 0 && self.import.is_none()
+    }
+
+    fn waiting_import(&self, can_prepare: bool) -> bool {
+        self.step == 0
+            && !self.respond.is_closed()
+            && self
+                .import
+                .as_ref()
+                .is_some_and(|i| i.waiting() && (i.prepared || !can_prepare))
+    }
+
+    fn changes_import(&self) -> bool {
+        self.import
+            .as_ref()
+            .is_some_and(|i| !i.waiting() || self.respond.is_closed())
+    }
+
     /// Rows the mixed-step program cannot carry: it does not stage overlays (see [`SpeechJob`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn serial_prefill(&self) -> bool {
-        self.speech.is_some()
+        self.speech.is_some() || self.import.is_some()
     }
 
     /// Rows that take the plain one-step decode launch: `EmbedPosBf16` reads the position base by
@@ -1093,6 +1199,18 @@ impl Slot {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn plain_decode(&self) -> bool {
         self.speech.is_some()
+    }
+
+    /// The token the next decode step feeds: the last output, or a dual-stream speech job's text
+    /// for that step (its codes ride beside it).
+    fn feed(&self) -> Option<u32> {
+        let last = *self.out_ids.last()?;
+        Some(
+            match self.speech.as_deref().and_then(|sp| sp.feed.as_ref()) {
+                Some((text, tail)) => text.get(self.out_ids.len() - 1).copied().unwrap_or(*tail),
+                None => last,
+            },
+        )
     }
 
     /// Tokens a chained decode path may produce for this row before the host must see one
@@ -1360,6 +1478,8 @@ fn spawn_scoped(
         .filter(|cpus| !cpus.is_empty() && crate::config::RuntimeConfig::get().dp_numa_pin);
     let downstream = state.downstream(&slug);
 
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completed_seen = Arc::clone(&completed);
     let dispatcher_scope = crate::config::current_scope();
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
@@ -1371,6 +1491,11 @@ fn spawn_scoped(
             rung_widths.as_deref().unwrap_or(&[]),
         );
         let mut freed_last_tick = false;
+        // Downstream engagements the next tick waits for: the count read before a tick plus the
+        // streams whose first-output tokens it produced (the stage takes them first).
+        let mut await_first: Option<u64> = None;
+        let mut engaged_before = 0u64;
+        let mut first_before = 0usize;
         let mut load = LoadEstimator::default();
         let mut host_window = crate::obs::host::Window::default();
         let mut host_last_return: Option<Instant> = None;
@@ -1397,6 +1522,10 @@ fn spawn_scoped(
         // scan + bufs machinery on the dispatcher critical path entirely.
         #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         let has_gpu = state.gpu_engine(&slug).is_some();
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+        let can_prepare_import = state.gpu_engine(&slug).is_some_and(|e| e.lock().is_cuda());
+        #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+        let can_prepare_import = false;
         // Whose turn it is on this model's device. `None` when no turns were
         // installed, and a no-op under `--co-sched free` (the default), where
         // whoever is ready goes first and nothing here orders anything.
@@ -1439,7 +1568,9 @@ fn spawn_scoped(
                 retention.table.clear();
                 while let Some((job, _)) = waiting.pop_front() {
                     metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-                    Metrics::inc(&metrics.rejected);
+                    if !crate::serve::pd::refuse(&job, &metrics.rejected) {
+                        continue;
+                    }
                     let _ = job
                         .respond
                         .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
@@ -1501,6 +1632,7 @@ fn spawn_scoped(
             }
             if drained && waiting.is_empty() {
                 turn.release();
+                completed_seen.store(true, Ordering::Release);
                 for done in drain_done.take().into_iter().chain(late_drains.drain(..)) {
                     let _ = done.send(());
                 }
@@ -1523,7 +1655,9 @@ fn spawn_scoped(
                             let _ = done.send(());
                         }
                         MuxMsg::Job(job, _) => {
-                            Metrics::inc(&metrics.rejected);
+                            if !crate::serve::pd::refuse(&job, &metrics.rejected) {
+                                continue;
+                            }
                             let _ = job.respond.try_send(StreamChunk::Err(
                                 crate::RuntimeError::Rejected(
                                     "model preempted for an S1 switch — retry".into(),
@@ -1855,6 +1989,24 @@ fn spawn_scoped(
                 }
                 continue;
             }
+            for slot in slots.iter_mut().flatten() {
+                if let Some(import) = slot.import.as_mut() {
+                    import.poll();
+                }
+            }
+            if slots
+                .iter()
+                .flatten()
+                .all(|s| s.waiting_import(can_prepare_import))
+            {
+                turn.release();
+                tokio::select! {
+                    _ = arrival_wake.notified() => {},
+                    _ = preempt_wake.notified() => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {},
+                }
+                continue;
+            }
             // Every live slot is parked on a slow consumer: nothing to launch.
             if slots.iter().flatten().all(|s| s.parked_at.is_some()) {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -1986,6 +2138,15 @@ fn spawn_scoped(
                 Vec::new()
             };
 
+            // A stream's first-output tokens just came out: its downstream launch, a few hundred
+            // microseconds of host handoff away, goes ahead of this tick (both take the device).
+            if let Some(want) = await_first.take() {
+                // A render takes this turn before it engages.
+                if turn.held() {
+                    turn.release();
+                }
+                downstream.engaged_to(want, FIRST_HANDOFF).await;
+            }
             // A downstream stage rendering a first chunk has the device to itself.
             while downstream.urgent() && !preempt_seen.load(Ordering::Acquire) {
                 tokio::select! {
@@ -2011,6 +2172,8 @@ fn spawn_scoped(
                 .filter(|s| s.step == 0)
                 .map(|s| s.prompt_ids.len().saturating_sub(s.pf_pos))
                 .sum();
+            engaged_before = downstream.engaged();
+            first_before = slots.iter().flatten().filter(|s| s.first_out).count();
             let taken_slots = std::mem::take(&mut slots);
             #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
             let mut taken_obs = obs.take().unwrap_or_else(|| {
@@ -2037,6 +2200,10 @@ fn spawn_scoped(
             let arena_ref = arena.clone();
             let kv_pages_for_tick = kv_pages_range.clone();
 
+            let pending_import_turn = taken_slots
+                .iter()
+                .flatten()
+                .all(|s| s.import.as_ref().is_some_and(|i| i.waiting()));
             metrics.serving.tick_batch.tokens(live);
             let t_service_start = Instant::now();
             let host_timed = crate::obs::host::on();
@@ -2139,8 +2306,21 @@ fn spawn_scoped(
                             service / k,
                         )
                     };
-                    crate::sched::cost::record_id(cost_id, op, took);
-                    let sample = service_sample(ms, did_prefill);
+                    let import_wait = pending_import_turn
+                        && !did_prefill
+                        && decode_progress.is_none()
+                        && tokens_produced == 0
+                        && returned_slots
+                            .iter()
+                            .flatten()
+                            .all(|s| s.import.as_ref().is_some_and(|i| i.waiting()));
+                    let import_overhead = import_wait || returned_obs.pd_import_work;
+                    if !import_overhead {
+                        crate::sched::cost::record_id(cost_id, op, took);
+                    }
+                    let sample = (!import_overhead)
+                        .then(|| service_sample(ms, did_prefill))
+                        .flatten();
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
                     }
@@ -2157,6 +2337,20 @@ fn spawn_scoped(
                     }
                     freed_last_tick = returned_slots.iter().flatten().count() < live;
                     slots = returned_slots;
+                    // Crossed or retired this tick (a retired one may have ended on its first
+                    // output).
+                    let mut first_after = 0;
+                    for s in slots.iter_mut().flatten().filter(|s| s.first_out) {
+                        s.first_out = s
+                            .speech
+                            .as_ref()
+                            .is_some_and(|sp| s.out_ids.len() < sp.first_tokens);
+                        first_after += s.first_out as usize;
+                    }
+                    let crossed = first_before.saturating_sub(first_after) as u64;
+                    if crossed > 0 {
+                        await_first = Some(engaged_before.wrapping_add(crossed));
+                    }
                     if let Some(b) = returned_bufs {
                         bufs_cache.insert(b.key, b);
                     }
@@ -2181,13 +2375,12 @@ fn spawn_scoped(
                                 error_name = %f.name,
                                 "engine dead: fatal device fault — rejecting new requests"
                             );
-                            for s in slots.iter_mut() {
-                                if let Some(slot) = s.take() {
-                                    release_kv(&arena, slot.kv);
-                                    let _ = slot.respond.try_send(StreamChunk::Err(
-                                        crate::RuntimeError::DeviceFault { info: f.clone() },
-                                    ));
-                                }
+                            for slot in slots.iter_mut() {
+                                fail_slot(
+                                    slot,
+                                    &arena,
+                                    crate::RuntimeError::DeviceFault { info: f.clone() },
+                                );
                             }
                         }
                     }
@@ -2265,6 +2458,8 @@ fn spawn_scoped(
     }
 
     ModelMux {
+        retiring: Default::default(),
+        completed,
         tx,
         metrics: handle_metrics,
         preempt: preempt_flag,
@@ -2653,8 +2848,10 @@ fn drain_waiting_session(
                 false
             }
             Queued::Expired => {
-                Metrics::inc(&metrics.admit_shed);
                 metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                if !crate::serve::pd::refuse(job, &metrics.admit_shed) {
+                    return false;
+                }
                 let _ = job
                     .respond
                     .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(format!(
@@ -2742,6 +2939,13 @@ fn drain_waiting_session(
             if waited_ms(now, arrived) < RESTORE_HOLD_MS
                 && p.restore_pending(&job.prompt_ids, job.opts.prefix.as_ref())
             {
+                if packlog::on() {
+                    eprintln!(
+                        "PACKLOG HELD kind=restore waited_ms={:.1} prompt={}",
+                        waited_ms(now, arrived),
+                        job.prompt_ids.len()
+                    );
+                }
                 still.push_back((job, arrived));
                 continue;
             }
@@ -2760,6 +2964,13 @@ fn drain_waiting_session(
             retention,
         ) {
             Some(held) => {
+                if packlog::on() {
+                    eprintln!(
+                        "PACKLOG HELD kind=admit waited_ms={:.1} prompt={}",
+                        waited_ms(now, held.1),
+                        held.0.prompt_ids.len()
+                    );
+                }
                 let blocks = waited_ms(now, held.1) >= aging;
                 still.push_back(held);
                 if blocks {
@@ -2823,7 +3034,7 @@ fn admit_into(
 fn admit_session(
     slots: &mut [Option<Slot>],
     limit: usize,
-    job: Job,
+    mut job: Job,
     arrived: Instant,
     arena: Option<&SharedKvState>,
     metrics: &Arc<Metrics>,
@@ -2834,6 +3045,13 @@ fn admit_session(
 ) -> Option<(Job, Instant)> {
     if job.respond.is_closed() {
         return None;
+    }
+
+    if let Some(import) = job.opts.import.as_mut() {
+        import.poll();
+        if import.abandoned() {
+            return None;
+        }
     }
 
     let pair = job.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
@@ -2851,7 +3069,14 @@ fn admit_session(
                 .table
                 .lookup(&t.session, &t.keys, pair, lim, Instant::now())
         })
-        .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()));
+        .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()))
+        // Frame rows are not keyed by their ids: a retained sequence cannot vouch for them.
+        .filter(|_| {
+            job.opts
+                .speech
+                .as_ref()
+                .is_none_or(|s| s.frame_codes.is_empty())
+        });
     let find_free = |slots: &[Option<Slot>], table: &crate::serve::session::RetainTable| {
         if pair {
             (0..lim.saturating_sub(1)).step_by(2).find(|&i| {
@@ -2979,8 +3204,9 @@ fn admit_session(
             // Counted for every terminal denial. Kept separate from the admission-shed path:
             // both end as a 429, but shedding is the controller dropping live work because
             // predicted wait passed the SLO, while these are arrival meeting a hard limit.
-            Metrics::inc(&metrics.rejected);
-            let _ = job.respond.try_send(StreamChunk::Err(err));
+            if crate::serve::pd::refuse(&job, &metrics.rejected) {
+                let _ = job.respond.try_send(StreamChunk::Err(err));
+            }
             return None;
         }
     };
@@ -2989,7 +3215,9 @@ fn admit_session(
         match arena.lock().arena.allocate_slot(seq_upper) {
             Ok(h) => Some(h),
             Err(e) => {
-                Metrics::inc(&metrics.rejected);
+                if !crate::serve::pd::refuse(&job, &metrics.rejected) {
+                    return None;
+                }
                 tracing::warn!(error = %e, seq_upper, "mux: kv arena OOM — request shed");
                 let _ = job
                     .respond
@@ -3003,13 +3231,41 @@ fn admit_session(
         None
     };
 
-    let telemetry = Some(RequestMetrics::new(
-        Arc::clone(metrics),
-        arrived,
-        job.arrived,
-        job.prompt_ids.len(),
-        job.gen.max_tokens,
-    ));
+    let telemetry = match (&job.opts.export, job.opts.import.as_mut()) {
+        (Some(_), _) => Some(RequestMetrics::leg(
+            Arc::clone(metrics),
+            Leg::Prefill,
+            arrived,
+            job.arrived,
+            job.prompt_ids.len(),
+            job.gen.max_tokens,
+        )),
+        (_, Some(import)) => {
+            if let Some(payload) = import.payload() {
+                let first = payload.first;
+                import.outcome.settle();
+                Some(RequestMetrics::leg(
+                    Arc::clone(metrics),
+                    Leg::Decode { first },
+                    import.arrived,
+                    job.arrived,
+                    job.prompt_ids.len(),
+                    job.gen.max_tokens,
+                ))
+            } else {
+                import.metrics = Some(Arc::clone(metrics));
+                None
+            }
+        }
+        _ => Some(RequestMetrics::leg(
+            Arc::clone(metrics),
+            Leg::Whole,
+            arrived,
+            job.arrived,
+            job.prompt_ids.len(),
+            job.gen.max_tokens,
+        )),
+    };
     if let Some(session) = &session {
         retention.table.forget(session);
     }
@@ -3034,6 +3290,7 @@ fn admit_session(
         step: 0,
         pf_pos: 0,
         cached_tokens: 0,
+        slot_prefix_keys: None,
         kv,
         class: job.opts.class,
         raw_tokens: job.opts.raw_tokens,
@@ -3059,6 +3316,7 @@ fn admit_session(
                 uncond_hidden: Vec::new(),
             })
         }),
+        first_out: job.opts.speech.as_ref().is_some_and(|s| s.first_tokens > 0),
         speech: job.opts.speech,
         held: Vec::new(),
         held_finish: None,
@@ -3067,6 +3325,8 @@ fn admit_session(
         frame: None,
         prefix: job.opts.prefix,
         mm: job.opts.mm,
+        export: job.opts.export,
+        import: job.opts.import,
     });
     None
 }
@@ -3085,10 +3345,17 @@ fn release_kv(arena: &Option<SharedKvState>, handle: Option<SlotHandle>) {
 
 /// Terminate a failing slot: release its KV allocation and notify the client.
 #[allow(dead_code)]
-#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
 fn fail_slot(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>, err: crate::RuntimeError) {
     if let Some(taken) = slot_opt.take() {
         release_kv(arena, taken.kv);
+        if taken.telemetry.is_none()
+            && taken
+                .import
+                .as_ref()
+                .is_some_and(|i| !i.outcome.report_abort())
+        {
+            return;
+        }
         let _ = taken.respond.try_send(StreamChunk::Err(err));
     }
 }
@@ -3120,6 +3387,11 @@ async fn preempt_slots(slots: &mut [Option<Slot>], arena: &Option<SharedKvState>
         };
         if let Some(telemetry) = slot.telemetry.as_mut() {
             telemetry.finish(FinishReason::Preempted, slot.executed);
+        } else if let Some(import) = slot.import.as_mut() {
+            if !import.preempt() {
+                release_kv(arena, slot.kv);
+                continue;
+            }
         }
         let done = StreamChunk::Done {
             executed: slot.executed,
@@ -3259,7 +3531,10 @@ fn run_one_tick(
     steps: u32,
     // `--multi-step` itself, kept apart from `steps` because `steps == 1` is ambiguous: it is
     // both "multi-step is off" and "`MultiStep::for_batch` collapsed at this batch size".
-    #[cfg_attr(not(any(feature = "hsa", feature = "cpu")), allow(unused_variables))]
+    #[cfg_attr(
+        not(any(feature = "hsa", feature = "cpu", feature = "cuda")),
+        allow(unused_variables)
+    )]
     multi_step: bool,
     #[cfg_attr(
         not(any(feature = "cuda", feature = "hsa", feature = "cpu")),
@@ -3282,6 +3557,7 @@ fn run_one_tick(
     // execution, including tokens discarded after a stop within the quantum.
     Option<DecodeProgress>,
 ) {
+    obs.pd_import_work = false;
     let bucket = key.and_then(|k| bundle.bucket(k));
     for slot in slots.iter_mut() {
         if slot.as_ref().is_some_and(|s| s.parked_at.is_some()) {
@@ -3317,6 +3593,12 @@ fn run_one_tick(
         if let crate::serve::engine::ServeEngine::Cuda(e) = &mut *guard {
             let mut disconnected = smallvec::SmallVec::<[bool; 128]>::new();
             disconnected.resize(e.batch(), false);
+            obs.pd_exports.resize(e.batch(), None);
+            for (i, s) in slots.iter().enumerate().take(e.batch()) {
+                if let Some(x) = s.as_ref().and_then(|s| s.export.as_ref()) {
+                    obs.pd_exports[i] = Some(Arc::clone(x));
+                }
+            }
             let result = (|| {
                 let stop = Arc::clone(e.stop_ids());
                 let cap = e.batch();
@@ -3367,7 +3649,7 @@ fn run_one_tick(
                 // Whether this tick does any prefill work — reported to the dispatcher
                 // so prefill tick durations never enter the decode-service EWMA.
                 let did_prefill = (0..cap.min(slots.len()))
-                    .any(|i| slots[i].as_ref().is_some_and(|s| s.step == 0));
+                    .any(|i| slots[i].as_ref().is_some_and(|s| s.needs_prefill()));
 
                 // Decode feeds, gathered BEFORE the prefill pass so a slot prefilled
                 // this tick (which just produced its first token) doesn't also step.
@@ -3382,11 +3664,20 @@ fn run_one_tick(
                     feeds.clear();
                 }
 
+                for s in slots.iter_mut().take(cap).flatten() {
+                    if let Some(import) = s.import.as_mut() {
+                        import.poll();
+                    }
+                }
+                let import_changes = slots.iter().take(cap).flatten().any(Slot::changes_import);
                 // A pipelined decode step may still be in flight from the previous tick. Anything
                 // but its exact continuation (a prefill, a changed row set, a row the device cannot
                 // sample) completes it first, streams its tokens, and re-gathers.
                 if e.pipe_busy()
-                    && (did_prefill || !e.pipe_covers(&feeds) || !gpu_pipe_rows(&feeds, &slots))
+                    && (import_changes
+                        || did_prefill
+                        || !e.pipe_covers(&feeds)
+                        || !gpu_pipe_rows(&feeds, &slots))
                 {
                     let mut done = std::mem::take(&mut obs.host.pipe_tokens);
                     match e.pipe_drain(&mut done) {
@@ -3416,6 +3707,19 @@ fn run_one_tick(
                     }
                 }
 
+                // An empty pipeline makes the next upload include every imported position.
+                if !e.pipe_busy() {
+                    obs.pd_import_work |= gpu_seat_imports(
+                        &mut *e,
+                        &mut slots,
+                        cap,
+                        &arena,
+                        bundle,
+                        stop.as_slice(),
+                        &mut disconnected,
+                        &mut tick_fault,
+                    );
+                }
                 // Speculation census (`plowrt_spec_*`): every decode tick of a speculating engine
                 // counts its draftable rows and, unless it may speculate, its first blocker.
                 let spec_metrics = e
@@ -3675,6 +3979,24 @@ fn run_one_tick(
                     }
                 }
 
+                if did_prefill && e.has_depth_stage() && e.slot_prefix_reuse_supported() {
+                    for (i, slot) in slots.iter_mut().enumerate().take(cap) {
+                        let Some(s) = slot.as_mut().filter(|s| {
+                            s.step == 0 && s.pf_pos == 0 && s.slot_prefix_keys.is_none()
+                        }) else {
+                            continue;
+                        };
+                        if e.packed_slot_ready(i) {
+                            continue;
+                        }
+                        if let Some(keys) = speech_prefix_keys(s) {
+                            s.resume = e.reuse_slot_prefix(i, &keys);
+                            s.slot_prefix_keys = Some((e.slot_prefix_epoch(), keys));
+                        } else {
+                            e.forget_slot_prefix(i);
+                        }
+                    }
+                }
                 let pack_t = packlog::on().then(Instant::now);
                 let (pack_live, pack_prefilling) = if pack_t.is_some() {
                     let live = slots.iter().take(cap).flatten();
@@ -3686,10 +4008,19 @@ fn run_one_tick(
                 // them; the rung controller still owes that step its progress.
                 let feeds_before = decode_feed_extent(&feeds);
                 let mut unified_progress = None;
-                // A depth stage samples each prompt's first frame in serial prefill's tail
-                // (`gpu_prefill_advance`); the packed completions do not run it.
-                if e.pf_batch_enabled() && !e.has_depth_stage() {
-                    let compact = e.has_packed_terminal();
+                // A depth stage that cannot pack samples each prompt's first frame in serial
+                // prefill's tail (`gpu_prefill_advance`).
+                if e.pf_batch_enabled()
+                    && (!e.has_depth_stage() || gpu_depth_packs(&*e, &slots, cap))
+                {
+                    let compact = e.pf_compact()
+                        && !(e.packed_depth_enabled()
+                            && depth_cached_tails(
+                                &slots,
+                                cap,
+                                |i| e.packed_slot_ready(i),
+                                |token| e.depth_prompt_tail_can_decode(token),
+                            ));
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                     completed.clear();
                     let mut dev_sampled = false;
@@ -3710,6 +4041,7 @@ fn run_one_tick(
                         cap,
                         &arena,
                         feeds.is_empty(),
+                        compact,
                         co_scheduled,
                         &mut completed,
                         &mut feeds,
@@ -3813,6 +4145,25 @@ fn run_one_tick(
                         );
                     }
                     if !compact {
+                        if e.has_depth_stage() {
+                            let failed = {
+                                let seeds =
+                                    depth_seed_rows(&slots, cap, |i| e.packed_slot_ready(i));
+                                e.fish_seed_slots(&seeds).err().map(|err| {
+                                    let owners: smallvec::SmallVec<[usize; 32]> =
+                                        seeds.iter().map(|s| s.0).collect();
+                                    (err, owners)
+                                })
+                            };
+                            if let Some((err, owners)) = failed {
+                                note_fault(&mut tick_fault, &err);
+                                let msg = err.to_string();
+                                for i in owners {
+                                    fail_slot(&mut slots[i], &arena, fanout_err(&err, &msg));
+                                    e.retire_slot(i, false);
+                                }
+                            }
+                        }
                         for i in 0..slots.len().min(cap) {
                             let Some(s) = slots[i].as_ref() else { continue };
                             if s.step != 0 {
@@ -3858,6 +4209,24 @@ fn run_one_tick(
                                     continue;
                                 }
                             }
+                            // A depth row's decode embeds the withheld row from `in.fish.dcodes`.
+                            if s.speech.as_ref().is_some_and(|sp| sp.depth.is_some()) {
+                                let sp = s.speech.as_deref().expect("checked Some");
+                                let initialized =
+                                    sp.depth.and_then(|d| d.maya2).map_or(Ok(()), |plan| {
+                                        e.maya2_bind(i, plan, sp.maya2_memory.as_ref())
+                                    });
+                                if let Err(err) = initialized {
+                                    note_fault(&mut tick_fault, &err);
+                                    fail_slot(&mut slots[i], &arena, err);
+                                    continue;
+                                }
+                            }
+                            if let Some((epoch, keys)) =
+                                slots[i].as_mut().and_then(|s| s.slot_prefix_keys.take())
+                            {
+                                e.keep_slot_prefix(i, epoch, keys);
+                            }
                             feeds.push((i, last));
                             if pair {
                                 feeds.push((i + 1, last));
@@ -3883,7 +4252,7 @@ fn run_one_tick(
                     let mut serial_rows = 0usize;
                     loop {
                         let Some(i) = (0..slots.len().min(cap))
-                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
+                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.needs_prefill()))
                             .min_by_key(|&i| slots[i].as_ref().map(|s| (s.class, s.arrived)))
                         else {
                             break;
@@ -4176,8 +4545,7 @@ fn run_one_tick(
                             |b: usize, k: usize| draws.get(b * quantum + k).copied().unwrap_or(0.0);
                         let sample = (!specs.is_empty())
                             .then_some((specs.as_slice(), &rng as &dyn Fn(usize, usize) -> f32));
-                        let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0))
-                            .and_then(|()| gpu_stage_cfg(&mut *e, &feeds, &mut slots, requested));
+                        let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0));
                         let t_call = crate::obs::host::on().then(Instant::now);
                         let t_step = Instant::now();
                         let cut = || quantum_cut.fire();
@@ -4185,7 +4553,7 @@ fn run_one_tick(
                             .turn
                             .is_some()
                             .then_some(&cut as &dyn Fn() -> bool);
-                        let res = staged.and_then(|_| {
+                        let res = staged.and_then(|()| {
                             e.multi_step_sampled_at_most(&feeds, requested, sample, cut, &mut toks)
                         });
                         match res {
@@ -4194,7 +4562,6 @@ fn run_one_tick(
                                     feeds.len(),
                                     t_step.elapsed().as_secs_f64() * 1e3 / k.max(1) as f64,
                                 );
-                                gpu_cfg_advance(&feeds, &mut slots, k);
                                 gpu_pen_counted(&*e, &mut slots, feeds.iter().map(|f| f.0), k);
                                 let t_emit =
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
@@ -4255,23 +4622,37 @@ fn run_one_tick(
                             };
                         let t_call = crate::obs::host::on().then(Instant::now);
                         let t_step = Instant::now();
-                        let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0))
-                            .and_then(|()| gpu_stage_cfg(&mut *e, &feeds, &mut slots, 1));
-                        let (cfg_dev, step_res) = match staged {
-                            Ok(d) => (
-                                d,
-                                e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks),
-                            ),
-                            Err(err) => (false, Err(err)),
-                        };
+                        let staged = gpu_pen_sync(&mut *e, &mut slots, feeds.iter().map(|f| f.0));
+                        // Every fed row's token is its depth stage's draw: the step's own tokens
+                        // stay on the device and the depth launch's synchronize is the tick's one.
+                        let unread = e.depth_packs()
+                            && feeds.iter().all(|&(i, _)| {
+                                slots[i].as_ref().is_some_and(|s| {
+                                    s.cfg.is_none()
+                                        && s.speech.as_ref().is_some_and(|sp| sp.depth.is_some())
+                                })
+                            });
+                        let step_res = staged.and_then(|()| {
+                            if unread {
+                                e.step_slots_unread(&feeds, &mut toks)
+                            } else {
+                                e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks)
+                            }
+                        });
                         match step_res {
                             Ok(()) => {
-                                let ms = t_step.elapsed().as_secs_f64() * 1e3;
-                                obs.host.ride.observe_step(feeds.len(), ms);
-                                if let Some(p) = obs.host.spec.as_mut() {
-                                    p.observe_step(feeds.len(), ms);
+                                // An unread step is timed with its depth launch, below.
+                                let observe =
+                                    |obs: &mut crate::exec::host::HostExecutor, ms: f64| {
+                                        obs.ride.observe_step(feeds.len(), ms);
+                                        if let Some(p) = obs.spec.as_mut() {
+                                            p.observe_step(feeds.len(), ms);
+                                        }
+                                    };
+                                if !unread {
+                                    observe(&mut obs.host, t_step.elapsed().as_secs_f64() * 1e3);
                                 }
-                                if dev_specs.is_some() {
+                                if dev_specs.is_some() && !unread {
                                     gpu_pen_counted(&*e, &mut slots, feeds.iter().map(|f| f.0), 1);
                                 }
                                 let t_emit =
@@ -4284,13 +4665,16 @@ fn run_one_tick(
                                     })
                                     .unwrap_or(Ok(()))
                                 {
+                                    if unread {
+                                        // The unread step's staging is free only once it retires.
+                                        let _ = e.sync_stream();
+                                    }
                                     note_fault(&mut tick_fault, &err);
                                     fail_feeds(&mut slots, &feeds, &arena, &err);
+                                } else if unread {
+                                    observe(&mut obs.host, t_step.elapsed().as_secs_f64() * 1e3);
                                 }
-                                let cfg_drawn = if cfg_dev {
-                                    gpu_cfg_advance(&feeds, &mut slots, 1);
-                                    true
-                                } else {
+                                let cfg_drawn =
                                     match gpu_cfg_draws(&mut *e, &feeds, &mut slots, &mut toks) {
                                         Ok(drawn) => drawn,
                                         Err(err) => {
@@ -4298,8 +4682,7 @@ fn run_one_tick(
                                             fail_feeds(&mut slots, &feeds, &arena, &err);
                                             false
                                         }
-                                    }
-                                };
+                                    };
                                 if let Err(err) = gpu_batch_logprobs(
                                     &mut *e,
                                     feeds.iter().zip(toks.iter()).map(|(&(i, _), &t)| (i, i, t)),
@@ -4388,14 +4771,25 @@ fn run_one_tick(
                     decode_progress,
                 );
             })();
+            let mut result = result;
             for (slot, request) in result.0.iter().enumerate().take(e.batch()) {
                 if request.is_none() && slot_free(&result.0, slot) {
                     if disconnected[slot] {
                         e.note_disconnect(slot);
                     }
+                    // A P/D prefill job just finished: its KV leaves before the slot retires.
+                    if let Some(sink) = result.2.pd_exports.get_mut(slot).and_then(Option::take) {
+                        if result.5.is_none() && sink.wanted() {
+                            if let Err(error) = gpu_export_slot(&mut *e, slot, &sink) {
+                                note_fault(&mut result.5, &error);
+                            }
+                        }
+                    }
                     e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
                 }
             }
+            // Drop the observer clones so a fault that drops a slot also ends its handoff.
+            result.2.pd_exports.clear();
             return result;
         }
 
@@ -4412,11 +4806,25 @@ fn run_one_tick(
         // Single-sequence engines (gfx950, CPU) share one tick body through
         // `SeqEngine`; the packed/multistep branches are AMD-only and the CPU
         // engine declines them (`None`), falling to whole-prompt prefill + step.
-        #[cfg(any(feature = "hsa", feature = "cpu"))]
+        #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
         if let Some(e) = guard.seq_engine_mut() {
             e.bind_engine_thread();
             let stop = Arc::clone(e.stop_ids());
             let b = e.batch();
+            let mut pd_exports = if slots.iter().flatten().any(|s| s.export.is_some()) {
+                slots
+                    .iter()
+                    .take(b)
+                    .map(|s| {
+                        let s = s.as_ref()?;
+                        Some((Arc::clone(s.export.as_ref()?), s.prompt_ids.len() as u32))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            obs.pd_import_work |=
+                seq_seat_imports(e, &mut slots, &arena, bundle, &stop, &mut tick_fault);
 
             // `capacity` is `batch()`, so this is only reachable on a mismatch;
             // a loud rejection beats a hang.
@@ -4444,7 +4852,7 @@ fn run_one_tick(
                     if let Some(taken) = slots[i].take() {
                         release_kv(&arena, taken.kv);
                     }
-                    e.release(i);
+                    seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                 }
             }
 
@@ -4453,17 +4861,18 @@ fn run_one_tick(
             // the device argmax. Say so ONCE rather than let a `temperature`
             // the caller set be silently discarded: greedy output that claims to
             // be sampled is the failure mode worth being loud about.
-            if slots
-                .iter()
-                .flatten()
-                .any(|s| s.gen.params.temperature > 0.0)
+            if !e.host_sampling()
+                && slots
+                    .iter()
+                    .flatten()
+                    .any(|s| s.gen.params.temperature > 0.0)
             {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     tracing::warn!(
-                        "amd: temperature > 0 requested, but the gfx950 engine samples \
-                         greedily on device — serving the argmax. Penalties, top_p, \
-                         top_k and logit_bias are ignored on this backend."
+                        "amd: temperature > 0 requested, but this packet keeps no host logits \
+                         row and the engine samples greedily on device — serving the argmax. \
+                         Penalties, top_p, top_k and logit_bias are ignored."
                     );
                 });
             }
@@ -4513,7 +4922,7 @@ fn run_one_tick(
                 let (waiting, rows) = slots[..b.min(slots.len())]
                     .iter()
                     .flatten()
-                    .filter(|s| s.step == 0)
+                    .filter(|s| s.needs_prefill())
                     .fold((0u32, 0u32), |(n, r), s| {
                         (
                             n + 1,
@@ -4532,7 +4941,7 @@ fn run_one_tick(
             if slots[..b.min(slots.len())]
                 .iter()
                 .flatten()
-                .filter(|slot| slot.step == 0)
+                .filter(|slot| slot.needs_prefill())
                 .take(2)
                 .count()
                 == 2
@@ -4541,7 +4950,7 @@ fn run_one_tick(
                     if e.resume_before_pack() {
                         if let Some(s) = slot_opt
                             .as_mut()
-                            .filter(|s| s.step == 0 && s.pf_pos == 0 && s.resume > 0)
+                            .filter(|s| s.needs_prefill() && s.pf_pos == 0 && s.resume > 0)
                         {
                             s.resume = if s.cfg.is_none() {
                                 e.resume_slot(i, s.resume)
@@ -4552,7 +4961,7 @@ fn run_one_tick(
                             s.cached_tokens = s.resume;
                         }
                     }
-                    let Some(slot) = slot_opt.as_ref().filter(|slot| slot.step == 0) else {
+                    let Some(slot) = slot_opt.as_ref().filter(|slot| slot.needs_prefill()) else {
                         continue;
                     };
                     if let Err(err) = e.prepare_packed_prefill_slot(i, &slot.prompt_ids, tick_max) {
@@ -4561,7 +4970,7 @@ fn run_one_tick(
                             release_kv(&arena, taken.kv);
                             let _ = taken.respond.try_send(StreamChunk::Err(err));
                         }
-                        e.release(i);
+                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                     }
                 }
             }
@@ -4571,7 +4980,8 @@ fn run_one_tick(
                 .take(b)
                 .filter_map(|(i, slot)| {
                     let slot = slot.as_ref()?;
-                    (slot.step == 0 && e.terminal_prefill_ready(i, &slot.prompt_ids)).then_some(i)
+                    (slot.needs_prefill() && e.terminal_prefill_ready(i, &slot.prompt_ids))
+                        .then_some(i)
                 })
                 .collect();
             if !terminal.is_empty() {
@@ -4584,7 +4994,7 @@ fn run_one_tick(
                             return None;
                         }
                         let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                        slot.out_ids.last().map(|&token| (i, token))
+                        slot.feed().map(|token| (i, token))
                     })
                     .collect();
                 let result = {
@@ -4613,10 +5023,11 @@ fn run_one_tick(
                         );
                         for (i, token) in output {
                             if let Some(slot) = slots[i].as_mut() {
-                                if slot.step == 0 {
+                                if slot.needs_prefill() {
                                     slot.pf_pos = slot.prompt_ids.len();
                                 }
                             }
+                            let token = seq_host_token(&*e, i, &mut slots[i], token);
                             handle_produced_token(
                                 &mut slots[i],
                                 &arena,
@@ -4627,7 +5038,7 @@ fn run_one_tick(
                                 Some(stop.as_slice()),
                             );
                             if slots[i].is_none() {
-                                e.release(i);
+                                seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                             }
                         }
                     }
@@ -4641,7 +5052,7 @@ fn run_one_tick(
                                     .respond
                                     .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                             }
-                            e.release(i);
+                            seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                         }
                     }
                 }
@@ -4660,8 +5071,9 @@ fn run_one_tick(
             //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
             //    not hold the last token back, and the sampled ids for prompts that finish
             //    here follow the decode feeds in `output`.
-            // A live request asking for logprobs keeps the ordinary path on an engine whose token
-            // batch keeps no logits row for the tokens it samples.
+            // A live request that needs its logits row on the host (logprobs, host sampling)
+            // keeps the ordinary path on an engine whose token batch keeps no logits row for the
+            // tokens it samples.
             if !rt.pf_defer_decode
                 && !slo_on
                 && e.token_batch_rows(1, 0, 1).is_some()
@@ -4670,7 +5082,7 @@ fn run_one_tick(
                         .iter()
                         .take(b)
                         .flatten()
-                        .any(|s| s.gen.params.logprobs.is_some()))
+                        .any(|s| seq_needs_host_row(&*e, &s.gen.params)))
             {
                 let feeds: Vec<(usize, u32)> = slots
                     .iter()
@@ -4678,7 +5090,7 @@ fn run_one_tick(
                     .take(b)
                     .filter_map(|(i, slot)| {
                         let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                        (slot.step > 0).then(|| (i, *slot.out_ids.last().expect("decode output")))
+                        (slot.step > 0).then(|| (i, slot.feed().expect("decode output")))
                     })
                     .collect();
                 // A body can only pack a slot that already has a cursor, and a fresh request
@@ -4689,7 +5101,7 @@ fn run_one_tick(
                     if e.resume_before_pack() {
                         if let Some(s) = slot_opt
                             .as_mut()
-                            .filter(|s| s.step == 0 && s.pf_pos == 0 && s.resume > 0)
+                            .filter(|s| s.needs_prefill() && s.pf_pos == 0 && s.resume > 0)
                         {
                             s.resume = if s.cfg.is_none() {
                                 e.resume_slot(i, s.resume)
@@ -4702,7 +5114,7 @@ fn run_one_tick(
                     }
                     let Some(slot) = slot_opt
                         .as_ref()
-                        .filter(|slot| slot.step == 0 && !slot.respond.is_closed())
+                        .filter(|slot| slot.needs_prefill() && !slot.respond.is_closed())
                     else {
                         continue;
                     };
@@ -4715,7 +5127,7 @@ fn run_one_tick(
                             release_kv(&arena, taken.kv);
                             let _ = taken.respond.try_send(StreamChunk::Err(err));
                         }
-                        e.release(i);
+                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                     }
                 }
                 // WHOLE CHUNKS ONLY, oldest first. A member's next chunk is taken as planned or
@@ -4734,7 +5146,7 @@ fn run_one_tick(
                     .take(b)
                     .filter_map(|(i, slot)| {
                         let slot = slot.as_ref()?;
-                        if slot.step != 0 || slot.respond.is_closed() {
+                        if !slot.needs_prefill() || slot.respond.is_closed() {
                             return None;
                         }
                         let rows = e.token_batch_prefill_rows(i, &slot.prompt_ids, u32::MAX);
@@ -4890,13 +5302,13 @@ fn run_one_tick(
                                 let slot = id as usize;
                                 if finished.contains(&slot) {
                                     if let Some(s) = slots[slot].as_mut() {
-                                        if s.step == 0 {
+                                        if s.needs_prefill() {
                                             s.pf_pos = s.prompt_ids.len();
                                             s.cached_tokens = e.cached_rows(slot);
                                         }
                                     }
                                 }
-                                seq_host_logprobs(&*e, slot, &mut slots[slot], token);
+                                let token = seq_host_token(&*e, slot, &mut slots[slot], token);
                                 handle_produced_token(
                                     &mut slots[slot],
                                     &arena,
@@ -4907,7 +5319,7 @@ fn run_one_tick(
                                     Some(stop.as_slice()),
                                 );
                                 if slots[slot].is_none() {
-                                    e.release(slot);
+                                    seq_release_slot(e, slot, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                         }
@@ -4934,7 +5346,7 @@ fn run_one_tick(
                                         .respond
                                         .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                                 }
-                                e.release(i);
+                                seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                             }
                         }
                     }
@@ -4944,10 +5356,16 @@ fn run_one_tick(
                     }
                 }
             }
+            // The mixed step leaves no per-slot logits row behind its decode rows.
             if has_decode
                 && !rt.pf_defer_decode
                 && !slo_on
                 && e.mixed_step_rows(decode_rows, 1).is_some()
+                && !slots
+                    .iter()
+                    .take(b)
+                    .flatten()
+                    .any(|s| seq_needs_host_row(&*e, &s.gen.params))
             {
                 let mut candidates: Vec<_> = slots
                     .iter()
@@ -4955,7 +5373,7 @@ fn run_one_tick(
                     .take(b)
                     .filter_map(|(i, slot)| {
                         let slot = slot.as_ref()?;
-                        if slot.step != 0 || slot.respond.is_closed() {
+                        if !slot.needs_prefill() || slot.respond.is_closed() {
                             return None;
                         }
                         let rows = e.mixed_prefill_rows(i, &slot.prompt_ids, tick_max);
@@ -4984,8 +5402,7 @@ fn run_one_tick(
                             .take(b)
                             .filter_map(|(i, slot)| {
                                 let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                                (slot.step > 0)
-                                    .then(|| (i, *slot.out_ids.last().expect("decode output")))
+                                (slot.step > 0).then(|| (i, slot.feed().expect("decode output")))
                             })
                             .collect();
                         let mut tokens = std::mem::take(&mut obs.host.slot_tokens);
@@ -5047,7 +5464,7 @@ fn run_one_tick(
                                         Some(stop.as_slice()),
                                     );
                                     if slots[slot].is_none() {
-                                        e.release(slot);
+                                        seq_release_slot(e, slot, &mut pd_exports, &mut tick_fault);
                                     }
                                 }
                             }
@@ -5066,7 +5483,7 @@ fn run_one_tick(
                                             .respond
                                             .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                                     }
-                                    e.release(slot);
+                                    seq_release_slot(e, slot, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                         }
@@ -5104,7 +5521,7 @@ fn run_one_tick(
                 slots[..cap]
                     .iter()
                     .flatten()
-                    .filter(|s| s.step == 0 && !s.respond.is_closed())
+                    .filter(|s| s.needs_prefill() && !s.respond.is_closed())
                     .map(|s| {
                         (
                             s.prompt_ids.len().saturating_sub(s.pf_pos),
@@ -5132,31 +5549,13 @@ fn run_one_tick(
             let mut ride_filled = false;
             while hold != PfHold::Held {
                 let now = Instant::now();
-                // PLOW_AMD_MIXED_RIDE_TRIM: the first pass also initializes fresh cursors until the
-                // pending rows fill the tick budget, so a trimmed member's tail packs with fresh
-                // prompts instead of running as its own lone launch.
-                let prep_rounds = if b2b_pass > 0 {
-                    1
-                } else if rt.amd.mixed_ride_trim && mixed_pack && b2b {
-                    cap
-                } else {
-                    0
-                };
+                let prep_rounds = usize::from(b2b_pass > 0);
                 let mut prep_failed = false;
                 for _ in 0..prep_rounds {
-                    if b2b_pass == 0 {
-                        let pending: u32 = (0..cap)
-                            .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
-                            .filter_map(|i| e.next_prefill_rows(i))
-                            .sum();
-                        if pending >= full_budget {
-                            break;
-                        }
-                    }
                     let fresh = (0..cap)
                         .filter(|&i| {
                             slots[i].as_ref().is_some_and(|s| {
-                                s.step == 0
+                                s.needs_prefill()
                                     && s.pf_pos == 0
                                     && s.resume == 0
                                     && !s.respond.is_closed()
@@ -5173,7 +5572,7 @@ fn run_one_tick(
                             release_kv(&arena, taken.kv);
                             let _ = taken.respond.try_send(StreamChunk::Err(err));
                         }
-                        e.release(i);
+                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                         prep_failed = true;
                         break;
                     }
@@ -5185,7 +5584,7 @@ fn run_one_tick(
                     .filter_map(|i| {
                         let slot = slots[i]
                             .as_ref()
-                            .filter(|s| s.step == 0 && !s.respond.is_closed())?;
+                            .filter(|s| s.needs_prefill() && !s.respond.is_closed())?;
                         let arrival = arrival_key(slot.arrived, now);
                         if let Some(span) = pf_batch
                             .then(|| e.packable_prefill_span(i, full_budget))
@@ -5320,21 +5719,14 @@ fn run_one_tick(
                     // launch as one-row spans. A lone chunk stays on its isolated program, whose
                     // lean KDA objects the packed siblings lack: as a pack of one carrying the
                     // decode rows it measured 5-7% slower at isl4096 c32/c128.
-                    // PLOW_AMD_MIXED_RIDE_LONE: a lone chunk whose cursor is already packable (a
-                    // long prompt's later chunks) runs as a pack of one so the riders come along.
-                    let lone_ride = rt.amd.mixed_ride_lone
-                        && !launch.is_pack()
-                        && !slo_on
-                        && e.packable_prefill_span(launch.spans[0].slot as usize, full_budget)
-                            .is_some_and(|span| span.n_rows == launch.spans[0].n_rows);
                     let ride = mixed_pack
                         && !decoded_in_pack
-                        && (launch.is_pack() || lone_ride)
+                        && launch.is_pack()
                         && slots[..cap].iter().any(|s| {
                             s.as_ref()
                                 .is_some_and(|s| s.parked_at.is_none() && !s.out_ids.is_empty())
                         });
-                    if launch.is_pack() || (lone_ride && ride) {
+                    if launch.is_pack() {
                         let packed = launch.spans.clone();
                         let feeds: Vec<(usize, u32)> = if ride {
                             slots[..cap]
@@ -5342,7 +5734,7 @@ fn run_one_tick(
                                 .enumerate()
                                 .filter_map(|(i, slot)| {
                                     let slot = slot.as_ref().filter(|s| s.parked_at.is_none())?;
-                                    Some((i, *slot.out_ids.last()?))
+                                    Some((i, slot.feed()?))
                                 })
                                 .collect()
                         } else {
@@ -5443,18 +5835,24 @@ fn run_one_tick(
                                 if rode_now {
                                     decoded_in_pack = true;
                                     for (row, &(i, _)) in feeds.iter().enumerate() {
-                                        seq_host_logprobs(&*e, i, &mut slots[i], ride_tokens[row]);
+                                        let token =
+                                            seq_host_token(&*e, i, &mut slots[i], ride_tokens[row]);
                                         handle_produced_token(
                                             &mut slots[i],
                                             &arena,
                                             bundle,
-                                            ride_tokens[row],
+                                            token,
                                             1,
                                             &mut tokens_this_tick,
                                             Some(stop.as_slice()),
                                         );
                                         if slots[i].is_none() {
-                                            e.release(i);
+                                            seq_release_slot(
+                                                e,
+                                                i,
+                                                &mut pd_exports,
+                                                &mut tick_fault,
+                                            );
                                         }
                                     }
                                 }
@@ -5469,7 +5867,7 @@ fn run_one_tick(
                                         s.pf_pos = s.prompt_ids.len();
                                     }
                                     let t_tok = std::time::Instant::now();
-                                    seq_host_logprobs(&*e, i, &mut slots[i], token);
+                                    let token = seq_host_token(&*e, i, &mut slots[i], token);
                                     handle_produced_token(
                                         &mut slots[i],
                                         &arena,
@@ -5482,7 +5880,7 @@ fn run_one_tick(
                                     crate::obs::ttft::FIRST_TOK
                                         .add(t_tok.elapsed().as_nanos() as u64);
                                     if slots[i].is_none() {
-                                        e.release(i);
+                                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                                     }
                                 }
                             }
@@ -5512,7 +5910,7 @@ fn run_one_tick(
                                             .respond
                                             .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                                     }
-                                    e.release(i);
+                                    seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                             Err(err) => {
@@ -5537,7 +5935,7 @@ fn run_one_tick(
                                             .respond
                                             .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                                     }
-                                    e.release(i);
+                                    seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                         }
@@ -5620,7 +6018,7 @@ fn run_one_tick(
                                 }
                                 tracing::debug!(token, slot = i, "amd: prefill token");
                                 let t_tok = std::time::Instant::now();
-                                seq_host_logprobs(&*e, i, &mut slots[i], token);
+                                let token = seq_host_token(&*e, i, &mut slots[i], token);
                                 handle_produced_token(
                                     &mut slots[i],
                                     &arena,
@@ -5632,7 +6030,7 @@ fn run_one_tick(
                                 );
                                 crate::obs::ttft::FIRST_TOK.add(t_tok.elapsed().as_nanos() as u64);
                                 if slots[i].is_none() {
-                                    e.release(i);
+                                    seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                                 }
                             }
                             Err(err) => {
@@ -5650,7 +6048,7 @@ fn run_one_tick(
                                     release_kv(&arena, taken.kv);
                                     let _ = taken.respond.try_send(StreamChunk::Err(err));
                                 }
-                                e.release(i);
+                                seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                             }
                         }
                         if let Some(t) = pk_t {
@@ -5672,7 +6070,7 @@ fn run_one_tick(
             if did_prefill {
                 let prefill_remains = slots[..b.min(slots.len())]
                     .iter()
-                    .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
+                    .any(|s| s.as_ref().is_some_and(|s| s.needs_prefill()));
                 if amd_defer_decode(rt.pf_defer_decode, prefill_remains) {
                     tracing::debug!("amd: decode deferred while prefill remains");
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
@@ -5682,7 +6080,7 @@ fn run_one_tick(
             if did_prefill
                 && slots.iter().enumerate().take(b).any(|(i, slot)| {
                     slot.as_ref().is_some_and(|slot| {
-                        slot.step == 0 && e.terminal_prefill_ready(i, &slot.prompt_ids)
+                        slot.needs_prefill() && e.terminal_prefill_ready(i, &slot.prompt_ids)
                     })
                 })
             {
@@ -5693,7 +6091,7 @@ fn run_one_tick(
             let feeds: Vec<(usize, u32)> = (0..b.min(slots.len()))
                 .filter_map(|i| {
                     let s = slots[i].as_ref().filter(|s| s.parked_at.is_none())?;
-                    Some((i, *s.out_ids.last()?))
+                    Some((i, s.feed()?))
                 })
                 .collect();
             let mut decode_progress = None;
@@ -5725,9 +6123,16 @@ fn run_one_tick(
                 })
                 .min()
                 .unwrap_or(1);
+            // A device quantum feeds its own argmax and keeps no per-token logits row, so a row
+            // that needs the host (sampling, penalties, logprobs) steps one token at a time.
+            let host_rows = feeds.iter().any(|&(i, _)| {
+                slots[i]
+                    .as_ref()
+                    .is_some_and(|s| seq_needs_host_row(&*e, &s.gen.params))
+            });
             let requested = amd_multistep_requested(
                 remaining,
-                multi_step,
+                multi_step && !host_rows,
                 crate::serve::policy::decode_k(true, 1) as usize,
             );
             let multi = e.multistep_quantum(&feeds, requested);
@@ -5758,7 +6163,7 @@ fn run_one_tick(
                             );
                         }
                         if slots[i].is_none() {
-                            e.release(i);
+                            seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                         }
                     }
                     Ok(quantum)
@@ -5773,7 +6178,7 @@ fn run_one_tick(
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
-                        seq_host_logprobs(&*e, i, &mut slots[i], token);
+                        let token = seq_host_token(&*e, i, &mut slots[i], token);
                         handle_produced_token(
                             &mut slots[i],
                             &arena,
@@ -5787,7 +6192,7 @@ fn run_one_tick(
                             crate::obs::dstep::STREAM.add(t.elapsed().as_nanos() as u64);
                         }
                         if slots[i].is_none() {
-                            e.release(i);
+                            seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                         }
                     }
                     1
@@ -5835,7 +6240,7 @@ fn run_one_tick(
                                 .respond
                                 .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                         }
-                        e.release(i);
+                        seq_release_slot(e, i, &mut pd_exports, &mut tick_fault);
                     }
                 }
             }
@@ -6046,7 +6451,7 @@ fn gpu_decode_feeds(slots: &[Option<Slot>], cap: usize) -> Vec<(usize, u32)> {
         if s.step == 0 || s.parked_at.is_some() {
             continue;
         }
-        let last = *s.out_ids.last().expect("step > 0 implies output");
+        let last = s.feed().expect("step > 0 implies output");
         feeds.push((i, last));
         // The CFG partner steps on the same token.
         if s.cfg.is_some() && i + 1 < cap {
@@ -6331,7 +6736,7 @@ fn gpu_prefill_should_yield(has_feeds: bool, defer_decode: bool, slot: Option<&S
     has_feeds || (!defer_decode && slot.is_some_and(|s| s.step > 0 && !s.respond.is_closed()))
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -> u32 {
     if !has_decode || defer_decode || interleave == 0 {
         u32::MAX
@@ -6340,7 +6745,7 @@ fn amd_prefill_tick_cap(has_decode: bool, defer_decode: bool, interleave: u32) -
     }
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PfHold {
     Off,
@@ -6355,7 +6760,7 @@ enum PfHold {
 /// quarters of `rows` are pending (a pack that fills most of a `rows`-wide rung, with room left
 /// for the decode riders) or the oldest has waited `ms`; the release tick may then pack `rows`.
 /// A prompt already started (chunks run or prefix rows resumed) is never held.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_pf_hold(
     spec: Option<(u32, f64, usize)>,
     decode_rows: usize,
@@ -6377,7 +6782,7 @@ fn amd_pf_hold(
     }
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
     enabled && prefill_remains
 }
@@ -6415,7 +6820,7 @@ fn multistep_requested(remaining: usize, scheduler_steps: usize, configured: usi
 ///
 /// What remains are the bounds that mean something: the client's own remaining output, the
 /// configured knob, and (applied downstream by `decode_quantum`) `DEFERRED_TOKEN_MAX_STEPS`.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_multistep_requested(remaining: usize, enabled: bool, configured: usize) -> usize {
     if !enabled {
         return 1;
@@ -6423,7 +6828,7 @@ fn amd_multistep_requested(remaining: usize, enabled: bool, configured: usize) -
     remaining.min(configured.max(1))
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_prefill_pick(
     candidates: impl IntoIterator<Item = (usize, Instant)>,
     fair: bool,
@@ -6446,7 +6851,7 @@ fn amd_prefill_pick(
 
 /// The step plan under `PLOW_TBT_SLO_MS` / `PLOW_TTFT_SLO_MS` (`crate::sched::slo`): isolated
 /// launches only, each chunk sized in milliseconds against the online tick cost model.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_slo_plan(
     e: &dyn crate::serve::engine::SeqEngine,
     slots: &[Option<Slot>],
@@ -6468,7 +6873,7 @@ fn amd_slo_plan(
         .filter_map(|i| {
             let slot = slots[i]
                 .as_ref()
-                .filter(|s| s.step == 0 && !s.respond.is_closed())?;
+                .filter(|s| s.needs_prefill() && !s.respond.is_closed())?;
             let planned = e.next_prefill_rows(i);
             let rows = planned.unwrap_or(u32::MAX);
             let prior = u32::try_from(e.prefill_frontier(i).unwrap_or(0)).unwrap_or(u32::MAX);
@@ -6544,7 +6949,7 @@ fn amd_slo_plan(
 /// Members of one token-batch body from an ordered candidate pool: every candidate whose whole
 /// next chunk fits what is left of `capacity`, in pool order, none of them cut. A chunk that
 /// does not fit is skipped, not sliced — the planner's whole-span rule.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_token_batch_pack(candidates: &[(usize, Instant, u32)], capacity: u32) -> Vec<(usize, u32)> {
     let mut budget = capacity;
     let mut selected = Vec::new();
@@ -6557,7 +6962,7 @@ fn amd_token_batch_pack(candidates: &[(usize, Instant, u32)], capacity: u32) -> 
     selected
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_mixed_prefill_pack(
     mut candidates: Vec<(usize, Instant, u32)>,
     mut budget: u32,
@@ -6595,7 +7000,7 @@ fn amd_mixed_prefill_pack(
 /// All members use the first selected span's compiled program. Rows are packed
 /// densely under `row_budget`; KV and recurrent coordinates remain request-local.
 /// Invalid descriptors are excluded so the caller can retain the isolated path.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_prefill_pack(
     candidates: impl IntoIterator<Item = packet::dev::PrefillSpan>,
     row_budget: u32,
@@ -6621,7 +7026,7 @@ fn amd_prefill_pack(
     pack.spans().to_vec()
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_packed_frontier_updates(
     members: impl IntoIterator<Item = usize>,
     mut frontier: impl FnMut(usize) -> Option<usize>,
@@ -6635,7 +7040,7 @@ fn amd_packed_frontier_updates(
 /// Slots a failed packed launch terminates: its prefill members and every decode feed offered
 /// to ride it, since the launch may have advanced a rider's KV and recurrent state before its
 /// position or sampled token reached the host.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn amd_failed_pack_slots(
     members: impl IntoIterator<Item = usize>,
     feeds: &[(usize, u32)],
@@ -6646,7 +7051,7 @@ fn amd_failed_pack_slots(
         .collect()
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn rejected_pack_slot(reason: &str) -> Option<usize> {
     let (_, after) = reason.split_once("slot ")?;
     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -6675,7 +7080,7 @@ fn itl_owed_rows(slots: &[Option<Slot>], cap: usize, withheld: usize, queued_row
     itl_backlog_rows(
         (0..cap.min(slots.len())).filter_map(|i| {
             let (s, pf_pos) = pack_row(slots, i)?;
-            (s.step == 0).then(|| s.prompt_ids.len().saturating_sub(withheld + pf_pos))
+            (s.needs_prefill()).then(|| s.prompt_ids.len().saturating_sub(withheld + pf_pos))
         }),
         queued_rows,
     )
@@ -6938,6 +7343,7 @@ fn gpu_prefill_batched_pass(
     cap: usize,
     arena: &Option<SharedKvState>,
     cold: bool,
+    compact: bool,
     bounded_tick: bool,
     completed: &mut Vec<(usize, u32)>,
     feeds: &mut Vec<(usize, u32)>,
@@ -6952,7 +7358,6 @@ fn gpu_prefill_batched_pass(
 
     completed.clear();
     *dev_sampled = false;
-    let compact = e.has_packed_terminal();
     // A CFG pair's partner row has no slot entry of its own, and its uncond logits are read at
     // the owner's row + 1: the unified batch carries neither, so pairs take the ordinary path.
     let mut unified =
@@ -6998,7 +7403,7 @@ fn gpu_prefill_batched_pass(
                 .filter_map(|i| {
                     let (s, pf_pos) = pack_row(slots, i)?;
                     let n = s.prompt_ids.len();
-                    (e.packed_slot_ready(i) && s.step == 0 && pf_pos + withheld < n)
+                    (e.packed_slot_ready(i) && s.needs_prefill() && pf_pos + withheld < n)
                         .then(|| (n - withheld - pf_pos).min(chunk_cap))
                 })
                 .sum();
@@ -7018,7 +7423,8 @@ fn gpu_prefill_batched_pass(
             AdmitRoom::new(ready, admit_launch_rows(launch_cap, rung), decode_rows)
         });
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
-            let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
+            // A P/D decode job is seated from its image (`gpu_seat_imports`), never prefilled.
+            let Some(request) = slot.as_mut().filter(|s| s.needs_prefill()) else {
                 continue;
             };
             if request.respond.is_closed() {
@@ -7062,7 +7468,27 @@ fn gpu_prefill_batched_pass(
                     continue;
                 }
             }
+            if request.pf_pos == 0 && !e.packed_slot_ready(i) && e.has_depth_stage() {
+                let encoded = match request.speech.as_deref_mut() {
+                    Some(sp) => {
+                        let keyed = sp.encode.take().map_or(Ok(()), |encode| {
+                            encode(sp, &mut request.prompt_ids)
+                                .map_err(crate::RuntimeError::Rejected)
+                        });
+                        // Frame rows' embeddings come from their staged codes, not their ids.
+                        keyed
+                    }
+                    None => Ok(()),
+                };
+                if let Err(err) = encoded {
+                    note_fault(&mut tick_fault, &err);
+                    fail_slot(slot, arena, err);
+                    continue;
+                }
+                configure_speech_prefix(e, i, request);
+            }
             let admitted = (|| -> Result<()> {
+                reconcile_slot_prefix(request, e.slot_prefix_epoch());
                 for row in [i, i + 1].into_iter().take(1 + pair as usize) {
                     let fresh = !e.packed_slot_ready(row);
                     if fresh && request.resume > 0 {
@@ -7142,7 +7568,8 @@ fn gpu_prefill_batched_pass(
             .filter_map(|i| {
                 let (s, pf_pos) = pack_row(slots, i)?;
                 let n = s.prompt_ids.len();
-                if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
+                if !e.packed_slot_ready(i) || !s.needs_prefill() || n == 0 || pf_pos + withheld >= n
+                {
                     return None;
                 }
                 let publish =
@@ -7401,6 +7828,34 @@ fn gpu_prefill_batched_pass(
             let stepped = pen_synced.is_ok();
             let result = if let Err(err) = pen_synced {
                 Err(err)
+            } else if e.packed_depth_enabled() {
+                let sampled = e.dev_sample_enabled();
+                *dev_sampled = sampled;
+                let spec = |slot: u32, j: u32| ride_row_spec(slots, feeds, spans, pen, slot, j);
+                e.token_batch_step_staged(
+                    &requests,
+                    unified_output,
+                    sampled.then_some(
+                        &spec as &dyn Fn(u32, u32) -> Option<crate::exec::gpu::DevSample>,
+                    ),
+                    &mut |e| {
+                        if !window.is_empty() {
+                            window_time = Some(admit_window(e, &mut window, true));
+                        }
+                    },
+                    &mut |e, plan| {
+                        let pack: smallvec::SmallVec<[_; 16]> = plan
+                            .spans
+                            .iter()
+                            .map(|s| (s.slot as usize, s.kv_row0 as usize, s.n_rows as usize))
+                            .collect();
+                        if overlay_rows.is_some() {
+                            gpu_speech_pack_inputs(e, slots, &pack)?;
+                        }
+                        gpu_speech_pack_codes(e, slots, &pack)?;
+                        e.stage_depth_decode_codes(plan)
+                    },
+                )
             } else if !window.is_empty() {
                 let sampled = e.dev_sample_enabled();
                 *dev_sampled = sampled;
@@ -7436,10 +7891,12 @@ fn gpu_prefill_batched_pass(
             }
             result
         } else {
-            let staged = pen_synced.and_then(|()| match overlay_rows {
-                Some(_) => gpu_speech_pack_inputs(e, slots, &pack),
-                None => Ok(()),
-            });
+            let staged = pen_synced
+                .and_then(|()| match overlay_rows {
+                    Some(_) => gpu_speech_pack_inputs(e, slots, &pack),
+                    None => Ok(()),
+                })
+                .and_then(|()| gpu_speech_pack_codes(e, slots, &pack));
             let reqs: Vec<PfBatchReq> = pack
                 .iter()
                 .map(|&(i, c0, len)| PfBatchReq {
@@ -7485,7 +7942,13 @@ fn gpu_prefill_batched_pass(
                     *dev_sampled = true;
                     Ok(())
                 })
-        };
+        }
+        .and_then(|()| {
+            if e.packed_depth_enabled() && !completed.is_empty() {
+                gpu_compact_depth_frames(e, slots, completed)?;
+            }
+            Ok(())
+        });
         if !window.is_empty() {
             // A launch without a host window (the decode rows left it) admits them now.
             if window.iter().all(|job| job.outcome.is_none()) && !unified {
@@ -7585,7 +8048,7 @@ fn gpu_prefill_batched_pass(
         let any_ready = pack.iter().any(|&(i, _, _)| {
             slots[i].as_ref().is_some_and(|s| {
                 e.packed_slot_ready(i)
-                    && s.step == 0
+                    && s.needs_prefill()
                     && !s.prompt_ids.is_empty()
                     && packed_prompt_done(slots, i, withheld)
             })
@@ -7593,6 +8056,179 @@ fn gpu_prefill_batched_pass(
         if any_ready {
             return tick_fault;
         }
+    }
+}
+
+/// Whether this tick's depth-packet prompts take the packed pass: two or more prompts to prefill
+/// (one launch, and their first frames in one depth launch), or a prompt already admitted to it.
+/// A lone prompt prefills serially: its first frame then needs no extra decode step (c1 TTFA,
+/// Qwen3-TTS H100: 19.6 vs 21.4 ms). A live CFG pair keeps the tick serial, and a prompt part way
+/// through serial prefill keeps it serial until done (packed admission restarts a slot).
+#[cfg(feature = "cuda")]
+fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap: usize) -> bool {
+    e.depth_packs() && depth_prompts_pack(slots, cap, |i| e.packed_slot_ready(i))
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn depth_prompts_pack(slots: &[Option<Slot>], cap: usize, ready: impl Fn(usize) -> bool) -> bool {
+    if slots.iter().take(cap).flatten().any(|s| s.cfg.is_some()) {
+        return false;
+    }
+    let (mut prompts, mut admitted) = (0, false);
+    for (i, s) in slots.iter().enumerate().take(cap) {
+        let Some(s) = s.as_ref().filter(|s| s.step == 0) else {
+            continue;
+        };
+        if !depth_prompt_can_pack(s) {
+            return false;
+        }
+        if ready(i) {
+            admitted = true;
+        } else if s.pf_pos > 0 {
+            return false;
+        } else {
+            prompts += 1;
+            admitted |= s.resume > 0 && s.resume + 1 == s.prompt_ids.len();
+        }
+    }
+    admitted || prompts >= 2
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn depth_prompt_can_pack(s: &Slot) -> bool {
+    s.cfg.is_none()
+        && s.mm.is_none()
+        && s.import.is_none()
+        && s.speech.as_ref().is_some_and(|sp| {
+            sp.depth.is_some()
+                && sp.cfg.is_none()
+                && sp.encode.is_none()
+                && sp
+                    .depth
+                    .is_none_or(|d| d.maya2.is_none() || sp.slot_prefix_reuse)
+                && sp
+                    .overlay_pos
+                    .iter()
+                    .all(|&p| p as usize + 1 < s.prompt_ids.len())
+        })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn depth_cached_tails(
+    slots: &[Option<Slot>],
+    cap: usize,
+    ready: impl Fn(usize) -> bool,
+    matches_decode: impl Fn(u32) -> bool,
+) -> bool {
+    let mut pending = false;
+    for (i, s) in slots.iter().enumerate().take(cap) {
+        let Some(s) = s.as_ref().filter(|s| s.step == 0) else {
+            continue;
+        };
+        if !depth_prompt_can_pack(s) || s.respond.is_closed() {
+            return false;
+        }
+        let frontier = if ready(i) {
+            s.pf_pos
+        } else if s.pf_pos == 0 {
+            s.resume
+        } else {
+            return false;
+        };
+        if frontier == 0
+            || s.prompt_ids.len().checked_sub(1) != Some(frontier)
+            || !s.prompt_ids.last().is_some_and(|&t| matches_decode(t))
+        {
+            return false;
+        }
+        pending = true;
+    }
+    pending
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn depth_seed_rows(
+    slots: &[Option<Slot>],
+    cap: usize,
+    ready: impl Fn(usize) -> bool,
+) -> smallvec::SmallVec<[(usize, &[u32]); 32]> {
+    slots
+        .iter()
+        .enumerate()
+        .take(cap)
+        .filter_map(|(i, s)| {
+            let s = s.as_ref()?;
+            let sp = s.speech.as_ref().filter(|sp| sp.depth.is_some())?;
+            let n = s.prompt_ids.len();
+            if s.step != 0
+                || s.respond.is_closed()
+                || n == 0
+                || !ready(i)
+                || s.pf_pos + 1 != n
+                || !packed_prompt_done(slots, i, 1)
+            {
+                return None;
+            }
+            let k = sp.frame_codes_per_row.max(1);
+            let codes = sp.frame_codes.get((n - 1) * k..n * k).unwrap_or(&[]);
+            Some((i, codes))
+        })
+        .collect()
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn speech_prefix_keys(s: &Slot) -> Option<Vec<u64>> {
+    let sp = s.speech.as_ref()?;
+    if !sp.slot_prefix_reuse
+        || sp.depth.is_none()
+        || sp.encode.is_some()
+        || sp.cfg.is_some()
+        || s.cfg.is_some()
+        || s.session.is_some()
+        || s.import.is_some()
+        || s.export.is_some()
+        || s.mm.is_some()
+        || s.prompt_ids.len() < 2
+        || (sp.overlay_pos.is_empty() != sp.overlay.is_empty())
+        || (!sp.overlay_pos.is_empty()
+            && (sp.overlay.len() % sp.overlay_pos.len() != 0
+                || sp
+                    .overlay_pos
+                    .iter()
+                    .any(|&p| p as usize >= s.prompt_ids.len())
+                || sp.overlay_pos.windows(2).any(|p| p[0] >= p[1])))
+    {
+        return None;
+    }
+    let mut keys = crate::serve::session::row_keys(&s.prompt_ids, &sp.overlay_pos, &[&sp.overlay]);
+    if !sp.frame_codes.is_empty()
+        && !crate::serve::session::frame_row_keys(
+            &mut keys,
+            &sp.frame_codes,
+            sp.frame_codes_per_row,
+        )
+    {
+        return None;
+    }
+    Some(keys)
+}
+
+#[cfg(feature = "cuda")]
+fn configure_speech_prefix(e: &mut crate::exec::gpu::GpuEngine, i: usize, s: &Slot) {
+    if s.speech.is_some() {
+        let ready = speech_prefix_keys(s).is_some_and(|keys| e.stage_speech_prefix(i, &keys));
+        e.set_prefix_attach(i, ready);
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn reconcile_slot_prefix(s: &mut Slot, epoch: u64) {
+    if s.slot_prefix_keys
+        .as_ref()
+        .is_some_and(|(at, _)| *at != epoch)
+    {
+        s.slot_prefix_keys = None;
+        s.resume = 0;
     }
 }
 
@@ -7605,6 +8241,251 @@ fn fit_speech_budget(slot: &mut Slot, max_ctx: usize) {
         let room = max_ctx.saturating_sub(slot.prompt_ids.len()).max(1);
         slot.gen.max_tokens = slot.gen.max_tokens.min(room);
     }
+}
+
+/// Seat every waiting P/D decode job from its KV image: the slot then stands where its own
+/// prefill would leave it, and the prefill rank's first token is produced here.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_seat_imports(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    cap: usize,
+    arena: &Option<SharedKvState>,
+    bundle: &ModelBundle,
+    stop: &[u32],
+    disconnected: &mut [bool],
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+) -> bool {
+    let mut worked = false;
+    // Import states were snapshotted before draining: a later arrival waits for the next turn.
+    for i in 0..slots.len().min(cap) {
+        let Some(s) = slots[i]
+            .as_mut()
+            .filter(|s| s.step == 0 && s.import.is_some())
+        else {
+            continue;
+        };
+        if s.respond.is_closed() {
+            disconnected[i] = true;
+            if let Some(taken) = slots[i].take() {
+                release_kv(arena, taken.kv);
+            }
+            continue;
+        }
+        let import = s.import.as_mut().expect("filtered on import");
+        if import.waiting() {
+            continue;
+        }
+        if import.abandoned() {
+            disconnected[i] = true;
+            if let Some(taken) = slots[i].take() {
+                release_kv(arena, taken.kv);
+            }
+            continue;
+        }
+        if let Some(telemetry) = import.start_metrics(s.prompt_ids.len(), s.gen.max_tokens) {
+            s.telemetry = Some(telemetry);
+        }
+        let prepared = import.prepared;
+        worked = true;
+        let total = s.prompt_ids.len() + s.gen.max_tokens.max(1);
+        if let Err(err) = if prepared {
+            Ok(())
+        } else {
+            e.begin_slot(i, total)
+        } {
+            // Out of device memory for live KV: wait, as a prefill would.
+            let short = matches!(err, crate::RuntimeError::Oom(_)) || err.device_code() == Some(2);
+            if short && !err.is_fatal() {
+                e.retire_slot(i, false);
+                e.note_kv_pressure();
+            } else {
+                note_fault(tick_fault, &err);
+                fail_slot(&mut slots[i], arena, err);
+            }
+            continue;
+        }
+        let import = s.import.take().expect("filtered on import").take_ready();
+        let seated = match e.kv_image_key() {
+            Some(key)
+                if key == import.image.key && s.prompt_ids.len() == import.image.rows as usize =>
+            {
+                e.import_kv_image(i, &s.prompt_ids, &import.image.bytes)
+            }
+            _ => Err(crate::RuntimeError::Rejected(
+                "P/D: the prefill rank's KV image does not fit this packet".into(),
+            )),
+        };
+        if let Err(err) = seated {
+            e.retire_slot(i, false);
+            note_fault(tick_fault, &err);
+            fail_slot(&mut slots[i], arena, err);
+            continue;
+        }
+        s.pf_pos = s.prompt_ids.len();
+        s.cached_tokens = import.cached_tokens;
+        s.lp = import.logprobs;
+        let pd_handoff_ms = import.image.handoff_ms();
+        tracing::debug!(slot = i, pd_handoff_ms, "cuda: P/D image seated");
+        disconnected[i] |= handle_produced_token(
+            &mut slots[i],
+            arena,
+            bundle,
+            import.token,
+            1,
+            // The prefill rank produced (and counted) this token.
+            &mut 0,
+            Some(stop),
+        );
+    }
+    if slots
+        .iter()
+        .flatten()
+        .any(|s| s.step > 0 || s.import.as_ref().is_none_or(|i| !i.waiting()))
+    {
+        return worked;
+    }
+    for i in 0..slots.len().min(cap) {
+        let Some(s) = slots[i]
+            .as_mut()
+            .filter(|s| s.step == 0 && !s.respond.is_closed())
+        else {
+            continue;
+        };
+        let Some(import) = s.import.as_mut().filter(|i| i.waiting() && !i.prepared) else {
+            continue;
+        };
+        let rows = s.prompt_ids.len();
+        let total = rows + s.gen.max_tokens.max(1);
+        worked = true;
+        if let Err(err) = import.prepare_with(|| e.prepare_kv_import(i, rows, total)) {
+            let short = matches!(err, crate::RuntimeError::Oom(_)) || err.device_code() == Some(2);
+            if short && !err.is_fatal() {
+                e.retire_slot(i, false);
+                e.note_kv_pressure();
+            } else {
+                note_fault(tick_fault, &err);
+                fail_slot(&mut slots[i], arena, err);
+            }
+        }
+        break;
+    }
+    worked
+}
+
+/// The KV image of engine slot `slot`, whose P/D prefill job has produced its first token.
+#[cfg(feature = "cuda")]
+fn gpu_export_slot(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slot: usize,
+    sink: &crate::serve::pd::KvExport,
+) -> Result<()> {
+    let handoff_started = Instant::now();
+    let key = e.kv_image_key();
+    let rows = e.slot_pos(slot) as u32;
+    sink.produce(key, rows, handoff_started, |bytes, publish| {
+        e.export_kv_image_stream(slot, rows, bytes, publish)
+    })
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+fn seq_release_slot(
+    e: &mut dyn crate::serve::engine::SeqEngine,
+    slot: usize,
+    exports: &mut [Option<(Arc<crate::serve::pd::KvExport>, u32)>],
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+) {
+    if let Some((sink, rows)) = exports.get_mut(slot).and_then(Option::take) {
+        if sink.wanted() {
+            let handoff_started = Instant::now();
+            let key = e.kv_image_key();
+            let result = sink.produce(key, rows, handoff_started, |bytes, publish| {
+                e.export_kv_image_stream(slot, rows, bytes, publish)
+            });
+            if let Err(error) = &result {
+                note_fault(tick_fault, error);
+            }
+            e.release(slot);
+            return;
+        }
+    }
+    e.release(slot);
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+fn seq_seat_imports(
+    e: &mut dyn crate::serve::engine::SeqEngine,
+    slots: &mut [Option<Slot>],
+    arena: &Option<SharedKvState>,
+    bundle: &ModelBundle,
+    stop: &[u32],
+    tick_fault: &mut Option<crate::DeviceErrorInfo>,
+) -> bool {
+    let mut worked = false;
+    for i in 0..slots.len().min(e.batch()) {
+        let Some(s) = slots[i]
+            .as_mut()
+            .filter(|s| s.step == 0 && s.import.is_some())
+        else {
+            continue;
+        };
+        if s.respond.is_closed() {
+            // The tick's disconnect pass releases this slot.
+            continue;
+        }
+        let import = s.import.as_mut().expect("filtered on import");
+        import.poll();
+        if import.waiting() {
+            continue;
+        }
+        if import.abandoned() {
+            e.release(i);
+            if let Some(taken) = slots[i].take() {
+                release_kv(arena, taken.kv);
+            }
+            continue;
+        }
+        if let Some(telemetry) = import.start_metrics(s.prompt_ids.len(), s.gen.max_tokens) {
+            s.telemetry = Some(telemetry);
+        }
+        worked = true;
+        let import = s.import.take().expect("filtered on import").take_ready();
+        let seated = match e.kv_image_key() {
+            Some(key)
+                if key == import.image.key && s.prompt_ids.len() == import.image.rows as usize =>
+            {
+                e.import_kv_image(i, &s.prompt_ids, &import.image.bytes, import.token)
+            }
+            _ => Err(crate::RuntimeError::Rejected(
+                "P/D: the prefill rank's KV image does not fit this packet".into(),
+            )),
+        };
+        if let Err(err) = seated {
+            e.release(i);
+            note_fault(tick_fault, &err);
+            fail_slot(&mut slots[i], arena, err);
+            continue;
+        }
+        s.pf_pos = s.prompt_ids.len();
+        s.cached_tokens = import.cached_tokens;
+        s.lp = import.logprobs;
+        let pd_handoff_ms = import.image.handoff_ms();
+        tracing::debug!(slot = i, pd_handoff_ms, "seq: P/D image seated");
+        handle_produced_token(
+            &mut slots[i],
+            arena,
+            bundle,
+            import.token,
+            1,
+            &mut 0,
+            Some(stop),
+        );
+        if slots[i].is_none() {
+            e.release(i);
+        }
+    }
+    worked
 }
 
 /// Advance a prefilling slot: one prompt chunk through the prefill bucket
@@ -7628,8 +8509,15 @@ fn gpu_prefill_advance(
         return Err(crate::RuntimeError::Rejected("empty prompt".into()));
     }
     fit_speech_budget(slot, e.max_ctx());
+    if let Some(sp) = slot.speech.as_deref_mut() {
+        if let Some(encode) = sp.encode.take() {
+            encode(sp, &mut slot.prompt_ids).map_err(crate::RuntimeError::Rejected)?;
+        }
+    }
     let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
+        configure_speech_prefix(e, slot_idx, slot);
+        reconcile_slot_prefix(slot, e.slot_prefix_epoch());
         let kept = if slot.resume > 0 && slot.cfg.is_none() {
             e.resume_slot(slot_idx, slot.resume)
         } else {
@@ -7656,8 +8544,8 @@ fn gpu_prefill_advance(
             e.note_kv_pressure();
             return Ok(None);
         }
+        slot.resume = kept;
         if kept > 0 {
-            slot.resume = kept;
             slot.pf_pos = kept;
             slot.cached_tokens = kept;
         }
@@ -7666,26 +8554,12 @@ fn gpu_prefill_advance(
         }
         e.set_session_end(slot_idx, slot.session_end);
     }
-    if let Some(sp) = slot.speech.as_deref_mut() {
-        if let Some(encode) = sp.encode.take() {
-            encode(sp, &mut slot.prompt_ids).map_err(crate::RuntimeError::Rejected)?;
-        }
-    }
-    if slot.pf_pos == 0 {
-        // Frame rows' embeddings come from their staged codes, not their ids: a cached prefix
-        // keyed by the ids would misplace them.
-        let keyed = slot
-            .speech
-            .as_deref()
-            .is_none_or(|sp| sp.frame_codes.is_empty());
-        e.set_prefix_attach(slot_idx, keyed);
-    }
     if let Some(sp) = slot.speech.as_deref() {
         // The pair prefills as one unit: the unconditional member to completion on the partner
         // first, its last-row logits stashed before the owner's prefill overwrites row 0.
         if let (0, Some(cfg), Some(run)) = (slot.pf_pos, sp.cfg.as_ref(), slot.cfg.as_mut()) {
             let partner = slot_idx + 1;
-            e.set_prefix_attach(partner, sp.frame_codes.is_empty());
+            e.set_prefix_attach(partner, false);
             let (ids, pos) = if cfg.uncond_ids.is_empty() {
                 (&slot.prompt_ids, &sp.overlay_pos)
             } else {
@@ -7728,12 +8602,14 @@ fn gpu_prefill_advance(
             PrefillStep::Progress(frontier) => {
                 slot.pf_pos = frontier;
                 // First chunk consulted the prefix cache — record the hit.
-                slot.cached_tokens = e.attached_rows(slot_idx) as usize;
+                slot.cached_tokens =
+                    (e.attached_rows(slot_idx) as usize).max(slot.resume.min(frontier));
                 return Ok(None);
             }
             PrefillStep::Done(tok) => {
                 slot.pf_pos = slot.prompt_ids.len();
-                slot.cached_tokens = e.attached_rows(slot_idx) as usize;
+                slot.cached_tokens =
+                    (e.attached_rows(slot_idx) as usize).max(slot.resume.min(slot.pf_pos));
                 tok
             }
         }
@@ -7769,6 +8645,9 @@ fn gpu_prefill_advance(
         }
         tok
     };
+    if let Some((epoch, keys)) = slot.slot_prefix_keys.take() {
+        e.keep_slot_prefix(slot_idx, epoch, keys);
+    }
     // Parity artifact: these ids + the per-step tokens are what the
     // standalone gemma4_sm120_chat harness is diffed against.
     tracing::debug!(
@@ -7784,7 +8663,7 @@ fn gpu_prefill_advance(
         e.fish_reset_slot(slot_idx)?;
         if let Some(plan) = job.maya2 {
             let memory = slot.speech.as_ref().and_then(|s| s.maya2_memory.clone());
-            e.maya2_bind(slot_idx, plan, memory.as_deref())?;
+            e.maya2_bind(slot_idx, plan, memory.as_ref())?;
         }
         e.fish_logits_to_slot(slot_idx)?;
         let cond_row = e.prefill_terminal_row();
@@ -7807,8 +8686,15 @@ fn gpu_prefill_advance(
             None => None,
         };
         let mut codes = Vec::new();
-        e.fish_depth_step(&[job.row(slot_idx, cond_row, 0, uncond_row)], &mut codes)?;
-        let (tok, frame) = job.token(&codes);
+        let rows = [job.row(slot_idx, cond_row, 0, uncond_row)];
+        let retained = if slot.speech.as_ref().is_some_and(|sp| sp.device_frames) {
+            e.fish_depth_step_retained(&rows, None, &mut codes)?
+        } else {
+            e.fish_depth_step(&rows, &mut codes)?;
+            None
+        };
+        let (tok, mut frame) = job.token(&codes);
+        attach_device_frame(&mut frame, retained.as_ref(), slot_idx)?;
         slot.frame = frame;
         return Ok(Some(tok));
     }
@@ -7837,7 +8723,10 @@ pub fn check_speech_packet(e: &crate::exec::gpu::GpuEngine) -> Result<()> {
     if !overlay && e.tensor_bytes("in.pos_base").is_none() {
         return Ok(());
     }
-    if e.token_batch_enabled() || e.mixed_step_rows(1, 1).is_some() {
+    if (e.token_batch_enabled() && !e.packed_depth_enabled())
+        || e.mixed_step_rows(1, 1).is_some()
+        || (e.token_batch_enabled() && e.tensor_bytes("in.pos_base").is_some())
+    {
         return Err(crate::RuntimeError::Rejected(
             "packet has per-row host inputs (overlay / position base) and a mixed-step or \
              token-batch program, which do not stage them per row"
@@ -8020,6 +8909,10 @@ fn speech_pack_overlay(
     for &(i, c0, len) in pack {
         let partner = slots[i].is_none();
         if let Some(sp) = pack_row(slots, i).and_then(|(s, _)| s.speech.as_deref()) {
+            if sp.depth.is_some() || !sp.frame_codes.is_empty() {
+                let end = (launch_row + len).min(index.len());
+                index[launch_row..end].fill(OVERLAY_KEEP);
+            }
             let src = match (partner, sp.cfg.as_ref()) {
                 (true, Some(cfg)) => &cfg.uncond_overlay,
                 _ => &sp.overlay,
@@ -8057,9 +8950,62 @@ fn gpu_speech_pack_inputs(
     STAGE.with_borrow_mut(|(rows, index)| {
         speech_pack_overlay(slots, pack, window, rows, index);
         if !rows.is_empty() {
-            e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(rows))?;
+            e.write_tensor_ordered("in.encoder_overlay", 0, bytemuck::cast_slice(rows))?;
         }
-        e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(index))
+        e.write_tensor_ordered("in.encoder_overlay_index", 0, bytemuck::cast_slice(index))
+    })
+}
+
+/// Each member's prompt frame codes (`in.frame_codes`, `[launch row][codes]`) at its chunk's launch
+/// offset, zeros elsewhere. Written for every launch of a depth packet: the tensor is shared.
+#[cfg(feature = "cuda")]
+fn gpu_speech_pack_codes(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &[Option<Slot>],
+    pack: &[(usize, usize, usize)],
+) -> Result<()> {
+    if !e.has_depth_stage() {
+        return Ok(());
+    }
+    let Some(bytes) = e.tensor_bytes("in.frame_codes") else {
+        return Ok(());
+    };
+    let Some(k) = pack
+        .iter()
+        .filter_map(|&(i, _, _)| pack_row(slots, i)?.0.speech.as_deref())
+        .map(|sp| sp.frame_codes_per_row)
+        .find(|&k| k > 0)
+    else {
+        return Ok(());
+    };
+    thread_local! {
+        static CODES: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let window = (bytes as usize / 4 / k).min(e.pf_max_rows().max(1));
+    CODES.with_borrow_mut(|codes| {
+        codes.clear();
+        codes.resize(window * k, 0);
+        let mut launch_row = 0usize;
+        for &(i, c0, len) in pack {
+            if let Some(sp) = pack_row(slots, i).and_then(|(s, _)| s.speech.as_deref()) {
+                if sp.frame_codes_per_row != k && !sp.frame_codes.is_empty() {
+                    return Err(crate::RuntimeError::Rejected(
+                        "packed prompts disagree on codes per frame row".into(),
+                    ));
+                }
+                let src = sp.frame_codes.get(c0 * k..).unwrap_or(&[]);
+                let n = src.len().min(len * k);
+                let dst = launch_row * k;
+                if dst + n > codes.len() {
+                    return Err(crate::RuntimeError::Rejected(
+                        "packed launch exceeds in.frame_codes".into(),
+                    ));
+                }
+                codes[dst..dst + n].copy_from_slice(&src[..n]);
+            }
+            launch_row += len;
+        }
+        e.write_tensor_ordered("in.frame_codes", 0, bytemuck::cast_slice(codes))
     })
 }
 
@@ -8154,6 +9100,9 @@ fn dev_sample_spec(slot: &Slot, pen: bool) -> Option<crate::exec::gpu::DevSample
 /// no host logits. `None` keeps the argmax and the host path.
 #[cfg(feature = "cuda")]
 fn dev_row_spec(slot: &Slot, pen: bool) -> Option<crate::exec::gpu::DevSample> {
+    if slot.speech.as_ref().is_some_and(|s| s.depth.is_some()) {
+        return None;
+    }
     slot.cfg
         .is_none()
         .then(|| dev_sample_spec(slot, pen))
@@ -8291,24 +9240,72 @@ fn gpu_finish_token(
     Ok(argmax_tok)
 }
 
-/// OpenAI logprobs for a single-sequence engine that exposes its logits to the host (CPU): only
-/// rows that asked for them pay the vocab read. The served token stays the engine's argmax.
-#[cfg(any(feature = "hsa", feature = "cpu"))]
-fn seq_host_logprobs(
+/// The served token for a single-sequence engine (AMD, CPU, CUDA rank group) whose step returned `token` (the
+/// device argmax). Only rows that asked for logprobs or host sampling pay the vocab read. When
+/// the engine exposes every sampled row (`host_sampling`), a non-greedy or penalised request is
+/// drawn by the same host sampler the CUDA path uses; otherwise the argmax is served.
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+fn seq_host_token(
     e: &dyn super::engine::SeqEngine,
     i: usize,
     slot: &mut Option<Slot>,
     token: u32,
-) {
-    let Some(s) = slot.as_mut() else { return };
-    let Some(req) = s.gen.params.logprobs else {
-        return;
+) -> u32 {
+    let Some(s) = slot.as_mut() else {
+        return token;
     };
-    let mut logits = Vec::new();
-    if e.logits_row(i, &mut logits) && (token as usize) < logits.len() {
-        let stats = crate::text::logprobs::RowStats::of(&logits, req);
-        s.lp = Some(Box::new(stats.finish(logits[token as usize])));
+    if !seq_needs_host_row(e, &s.gen.params) {
+        return token;
     }
+    let p = &s.gen.params;
+    let adjusted = sampling_adjusted(p);
+    let sample = (!p.is_greedy() || adjusted) && e.host_sampling();
+    let mut logits = Vec::new();
+    if !e.logits_row(i, &mut logits) || (token as usize) >= logits.len() {
+        if sample {
+            tracing::warn!(
+                slot = i,
+                "host sampling: no logits row for this token; serving the device argmax"
+            );
+        }
+        return token;
+    }
+    let stats = p
+        .logprobs
+        .map(|r| crate::text::logprobs::RowStats::of(&logits, r));
+    let tok = if sample {
+        let raw = (stats.is_some() && adjusted).then(|| logits.clone());
+        crate::text::sample::apply_penalties(&mut logits, &s.out_ids, &s.gen.params);
+        let tok = crate::text::sample::sample(&logits, &s.gen.params, None, slot_rng01(s));
+        if let Some(raw) = raw {
+            logits = raw;
+        }
+        tok
+    } else {
+        token
+    };
+    if let Some(stats) = stats {
+        s.lp = Some(Box::new(stats.finish(logits[tok as usize])));
+    }
+    tok
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+fn sampling_adjusted(p: &crate::text::sample::SamplingParams) -> bool {
+    p.repetition_penalty != 1.0
+        || p.presence_penalty != 0.0
+        || p.frequency_penalty != 0.0
+        || !p.logit_bias.is_empty()
+}
+
+/// Whether a seq-engine row's token needs its logits row on the host: logprobs, or a
+/// non-greedy / penalised request on an engine that samples on the host.
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+fn seq_needs_host_row(
+    e: &dyn super::engine::SeqEngine,
+    p: &crate::text::sample::SamplingParams,
+) -> bool {
+    p.logprobs.is_some() || ((!p.is_greedy() || sampling_adjusted(p)) && e.host_sampling())
 }
 
 /// The top-k a greedy, unadjusted logprobs row asks the device stats kernel for; `None` when the
@@ -8393,8 +9390,94 @@ fn greedy_device_logprobs(
     Ok(Some(stats_logprobs(&out, k as usize, req.raw_logits)))
 }
 
-/// Depth-stage packets: sample every fed depth slot's frame after the backbone step (decode row
-/// = slot) and put its token in `toks`, its codes on the slot.
+/// Sample compact backbone outputs through the packet's physical-slot depth interface.
+#[cfg(feature = "cuda")]
+fn gpu_compact_depth_frames(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    completed: &mut [(usize, u32)],
+) -> Result<()> {
+    type Bufs = (
+        Vec<u32>,
+        Vec<(usize, DepthJob)>,
+        Vec<crate::exec::gpu::FishRow>,
+        Vec<u32>,
+    );
+    thread_local! {
+        static BUFS: std::cell::RefCell<Bufs> = const {
+            std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new()))
+        };
+    }
+    BUFS.with_borrow_mut(|(owners, rows, fish, codes)| {
+        owners.clear();
+        owners.extend(completed.iter().map(|c| c.0 as u32));
+        rows.clear();
+        fish.clear();
+        for (k, &(i, _)) in completed.iter().enumerate() {
+            let Some(s) = slots[i].as_mut() else { continue };
+            let Some(job) = s.speech.as_ref().and_then(|sp| sp.depth) else {
+                continue;
+            };
+            if s.step == 0 {
+                e.fish_reset_slot(i)?;
+                if let Some(plan) = job.maya2 {
+                    e.maya2_bind(
+                        i,
+                        plan,
+                        s.speech.as_ref().and_then(|sp| sp.maya2_memory.as_ref()),
+                    )?;
+                }
+                if let Some((epoch, keys)) = s.slot_prefix_keys.take() {
+                    e.keep_slot_prefix(i, epoch, keys);
+                }
+            }
+            rows.push((k, job));
+            fish.push(job.row(i, i as u32, s.step, None));
+        }
+        if fish.is_empty() {
+            return Ok(());
+        }
+        codes.clear();
+        let retain = rows.iter().any(|&(k, _)| {
+            slots[completed[k].0]
+                .as_ref()
+                .and_then(|s| s.speech.as_ref())
+                .is_some_and(|s| s.device_frames)
+        });
+        let retained = if retain {
+            e.fish_depth_step_retained(fish, Some(owners), codes)?
+        } else {
+            e.fish_depth_step_compact(fish, owners, codes)?;
+            None
+        };
+        let n = codes.len() / rows.len();
+        for (r, &(k, job)) in rows.iter().enumerate() {
+            let (token, mut frame) = job.token(&codes[r * n..(r + 1) * n]);
+            completed[k].1 = token;
+            if let Some(slot) = slots[completed[k].0].as_mut() {
+                if slot.speech.as_ref().is_some_and(|s| s.device_frames) {
+                    attach_device_frame(&mut frame, retained.as_ref(), completed[k].0)?;
+                }
+                slot.frame = frame;
+            }
+        }
+        Ok(())
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn attach_device_frame(
+    frame: &mut Option<SpeechFrame>,
+    retained: Option<&crate::exec::packet_runtime::PacketBuffer>,
+    slot: usize,
+) -> crate::Result<()> {
+    if let (Some(frame), Some(buffer)) = (frame, retained) {
+        let bytes = frame.len() * 4;
+        frame.device = Some(buffer.slice(slot * bytes..(slot + 1) * bytes)?);
+    }
+    Ok(())
+}
+
 #[cfg(feature = "cuda")]
 fn gpu_depth_frames(
     e: &mut crate::exec::gpu::GpuEngine,
@@ -8429,7 +9512,18 @@ fn gpu_depth_frames(
         }));
         codes.clear();
         let t = crate::obs::host::on().then(Instant::now);
-        e.fish_depth_step(fish, codes)?;
+        let retain = rows.iter().any(|&(k, _)| {
+            slots[feeds[k].0]
+                .as_ref()
+                .and_then(|s| s.speech.as_ref())
+                .is_some_and(|s| s.device_frames)
+        });
+        let retained = if retain {
+            e.fish_depth_step_retained(fish, None, codes)?
+        } else {
+            e.fish_depth_step(fish, codes)?;
+            None
+        };
         if let Some(t) = t {
             let width = fish
                 .iter()
@@ -8439,9 +9533,12 @@ fn gpu_depth_frames(
         }
         let n = codes.len() / rows.len();
         for (r, &(k, job)) in rows.iter().enumerate() {
-            let (tok, frame) = job.token(&codes[r * n..(r + 1) * n]);
+            let (tok, mut frame) = job.token(&codes[r * n..(r + 1) * n]);
             toks[k] = tok;
             if let Some(slot) = slots[feeds[k].0].as_mut() {
+                if slot.speech.as_ref().is_some_and(|s| s.device_frames) {
+                    attach_device_frame(&mut frame, retained.as_ref(), feeds[k].0)?;
+                }
                 slot.frame = frame;
             }
         }
@@ -8501,62 +9598,6 @@ fn gpu_cfg_draws(
     })
 }
 
-/// Stage every fed CFG owner's next `steps` guided draws on the device (`plow_sample_cfg`),
-/// seeding its penalty history on the first. `Ok(false)` = no owner fed or no device CFG sampler
-/// (the host draws). The uniforms are the owner's next `steps` SplitMix draws, the host path's.
-#[cfg(feature = "cuda")]
-fn gpu_stage_cfg(
-    e: &mut crate::exec::gpu::GpuEngine,
-    feeds: &[(usize, u32)],
-    slots: &mut [Option<Slot>],
-    steps: usize,
-) -> Result<bool> {
-    if !gpu_cfg_device(e) {
-        return Ok(false);
-    }
-    let mut rows = Vec::new();
-    let mut draws = Vec::new();
-    for &(i, _) in feeds {
-        let Some(slot) = slots[i].as_mut().filter(|s| host_cfg(s)) else {
-            continue;
-        };
-        let (Some(run), Some(cfg)) = (
-            slot.cfg.as_mut(),
-            slot.speech.as_ref().and_then(|s| s.cfg.as_ref()),
-        ) else {
-            continue;
-        };
-        if !run.dev_seeded {
-            e.cfg_seed_history(i, cfg.history.iter().chain(&slot.out_ids).copied())?;
-            run.dev_seeded = true;
-        }
-        let p = &cfg.params;
-        let mut rng = run.rng.clone();
-        rows.push((
-            i,
-            crate::exec::gpu::DevCfg {
-                weight: p.cfg_weight,
-                penalty: p.repetition_penalty,
-                temp: if rng.is_some() { p.temperature } else { 0.0 },
-                top_p: p.top_p,
-                min_p: p.min_p,
-            },
-        ));
-        draws.extend((0..steps).map(|_| rng.as_mut().map_or(0.0, |r| r.unit())));
-    }
-    if rows.is_empty() {
-        return Ok(false);
-    }
-    e.stage_cfg(&rows, &draws, steps)?;
-    Ok(true)
-}
-
-/// CFG pairs draw on the device: the sampler object has `plow_sample_cfg` and `--cfg-device`.
-#[cfg(feature = "cuda")]
-fn gpu_cfg_device(e: &crate::exec::gpu::GpuEngine) -> bool {
-    e.cfg_sampling() && crate::config::RuntimeConfig::get().nv.cfg_device
-}
-
 /// A CFG owner whose draws are the generic sampler's (not a depth-stage pair's).
 #[cfg(feature = "cuda")]
 fn host_cfg(s: &Slot) -> bool {
@@ -8566,18 +9607,6 @@ fn host_cfg(s: &Slot) -> bool {
             .as_ref()
             .and_then(|sp| sp.depth)
             .is_some_and(|d| d.cfg_scale.is_some())
-}
-
-/// Advance every fed CFG owner's SplitMix past the `k` device draws it consumed.
-#[cfg(feature = "cuda")]
-fn gpu_cfg_advance(feeds: &[(usize, u32)], slots: &mut [Option<Slot>], k: usize) {
-    for &(i, _) in feeds {
-        if let Some(rng) = slots[i].as_mut().and_then(|s| s.cfg.as_mut()?.rng.as_mut()) {
-            for _ in 0..k {
-                rng.unit();
-            }
-        }
-    }
 }
 
 /// A CFG owner's next token from its (cond, uncond) rows of the step's bf16 logits.
@@ -9284,7 +10313,7 @@ fn incremental_delta(
     })
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
+#[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
 fn set_cached(slot: &mut Slot, rows: usize) {
     crate::obs::tick::trace_hit(rows.saturating_sub(slot.cached_tokens));
     slot.cached_tokens = rows;
@@ -9747,6 +10776,8 @@ pub(crate) fn scripted_mux(
         }
     });
     ModelMux {
+        retiring: Default::default(),
+        completed: Default::default(),
         tx,
         metrics: Arc::new(Metrics::default()),
         preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10464,21 +11495,120 @@ mod tests {
         assert_eq!(multistep_requested(0, 8, 4), 0);
     }
 
-    #[test]
-    fn bounded_ingress_reports_full_closed_and_depth() {
-        let metrics = Arc::new(Metrics::default());
-        let (tx, mut rx) = mpsc::channel(1 + CONTROL_SLACK);
-        let mux = ModelMux {
-            tx,
-            metrics: Arc::clone(&metrics),
-            preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            preempt_notify: Arc::new(tokio::sync::Notify::new()),
-            arrival_notify: Arc::new(tokio::sync::Notify::new()),
-            ingress: Arc::default(),
-            preempted: Arc::default(),
-            queue_cap: 1,
-            prefix_block_rows: 0,
+    fn queued_test_mux(
+        metrics: Arc<Metrics>,
+        capacity: usize,
+    ) -> (ModelMux, mpsc::Receiver<MuxMsg>) {
+        let (tx, rx) = mpsc::channel(capacity + CONTROL_SLACK);
+        (
+            ModelMux {
+                retiring: Default::default(),
+                completed: Default::default(),
+                tx,
+                metrics,
+                preempt: Arc::default(),
+                preempt_notify: Arc::default(),
+                arrival_notify: Arc::default(),
+                ingress: Arc::default(),
+                preempted: Arc::default(),
+                queue_cap: capacity,
+                prefix_block_rows: 0,
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn pd_source_handoff_completes_while_actual_decode_admission_is_blocked() {
+        use crate::serve::pd::{KvImage, Outcome};
+        let now = Instant::now();
+        let source = Arc::new(Metrics::default());
+        let decode = Arc::new(Metrics::default());
+        let (mux, mut rx) = queued_test_mux(decode.clone(), 1);
+        assert!(mux.submit(test_job()).is_ok());
+        mux.arrival_notify.notified().await;
+        let (respond, mut client) = crate::serve::stream::channel();
+        let mut job = test_job();
+        job.respond = respond;
+        job.prompt_ids = vec![1, 2, 3];
+        job.gen.params.logprobs = Some(crate::text::logprobs::LogprobRequest {
+            top: 1,
+            raw_logits: false,
+        });
+        let (ptx, prx) = crate::serve::stream::channel();
+        let expected = crate::text::logprobs::TokenLogprobs {
+            logprob: -0.125,
+            top: vec![(120, -0.125)],
         };
+        ptx.try_send(StreamChunk::Token {
+            id: 120,
+            text: String::new(),
+            logprobs: Some(Box::new(expected.clone())),
+            frame: None,
+        })
+        .unwrap();
+        ptx.try_send(StreamChunk::Done {
+            executed: 1,
+            reason: FinishReason::Length,
+            usage: crate::serve::stream::TokenUsage {
+                cached_tokens: 2,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+        drop(ptx);
+        let (image_tx, image_rx) = tokio::sync::oneshot::channel();
+        assert!(image_tx
+            .send(Ok(KvImage {
+                key: "key".into(),
+                rows: 3,
+                bytes: vec![42].into(),
+                handoff_started: now
+            }))
+            .is_ok());
+        let mut worker = Box::pin(crate::serve::pd::drive_handoff(
+            &mux,
+            job,
+            now,
+            prx,
+            image_rx,
+            Outcome::new(source.clone(), now),
+            None,
+        ));
+        tokio::select! {
+            _ = &mut worker => panic!("decode queue must still be full"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(1), mux.arrival_notify.notified()) => result.unwrap(),
+        }
+        // Only the completed handoff notifies while admission is blocked.
+        assert_eq!(decode.queued_requests.load(Ordering::Relaxed), 1);
+        let before_room = Instant::now();
+        let filler = rx.try_recv().unwrap();
+        note_dequeued(&filler, &decode);
+        tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+            .await
+            .unwrap();
+        let msg = rx.try_recv().unwrap();
+        note_dequeued(&msg, &decode);
+        let MuxMsg::Job(mut queued, _) = msg else {
+            panic!("missing decode job");
+        };
+        let import = queued.opts.import.as_mut().unwrap();
+        import.poll();
+        let payload = import.payload().unwrap();
+        assert!(payload.first >= now && payload.first <= before_room);
+        assert_eq!((payload.token, payload.cached_tokens), (120, 2));
+        assert_eq!(payload.logprobs.as_deref(), Some(&expected));
+        import.outcome.settle();
+        assert!(client.try_recv().is_err());
+        assert_eq!(decode.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(decode.queued_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_ingress_reports_full_closed_and_depth() {
+        let metrics = Arc::new(Metrics::default());
+        let (mux, mut rx) = queued_test_mux(metrics.clone(), 1);
 
         let (a, b) = (mux.ingress(), mux.ingress());
         assert_eq!(mux.ingress.pending(), 2);
@@ -10492,9 +11622,95 @@ mod tests {
         assert!(matches!(mux.submit(test_job()), Err(SubmitError::Full(_))));
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
 
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            mux.submit_wait_arrived(test_job(), Instant::now(), Some(mux.ingress())),
+        )
+        .await
+        .is_err());
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(mux.ingress.pending(), 0);
+        let submissions: Vec<_> = (0..16)
+            .map(|_| {
+                let mux = mux.clone();
+                tokio::spawn(async move { mux.submit_wait(test_job()).await })
+            })
+            .collect();
         let msg = rx.try_recv().unwrap();
         note_dequeued(&msg, &metrics);
+        for _ in 0..16 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
+            note_dequeued(&msg, &metrics);
+        }
+        for task in submissions {
+            assert!(task.await.unwrap().is_ok());
+        }
+        assert_eq!(metrics.requests.load(Ordering::Relaxed), 19);
+        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+
+        let now = Instant::now();
+        let import_job = |prefill, respond| {
+            let mut job = test_job();
+            job.respond = respond;
+            job.opts.import = Some(Box::new(crate::serve::pd::KvImport::ready(
+                crate::serve::pd::ReadyImport {
+                    image: crate::serve::pd::KvImage {
+                        key: "key".into(),
+                        rows: 1,
+                        bytes: vec![0].into(),
+                        handoff_started: now,
+                    },
+                    token: 1,
+                    logprobs: None,
+
+                    first: now,
+
+                    cached_tokens: 0,
+                },
+                now,
+                crate::serve::pd::Outcome::new(prefill, now),
+            )));
+            job
+        };
+        let imported = import_job(metrics.clone(), crate::serve::stream::channel().0);
+        imported.opts.import.as_ref().unwrap().outcome.settle();
+        assert!(mux.submit_wait_arrived(imported, now, None).await.is_ok());
+        assert_eq!(metrics.requests.load(Ordering::Relaxed), 19);
+        note_dequeued(&rx.try_recv().unwrap(), &metrics);
+
+        assert!(mux.submit(test_job()).is_ok());
+        let prefill = Arc::new(Metrics::default());
+        let (respond, receiver) = crate::serve::stream::channel();
+        let imported = import_job(prefill.clone(), respond);
+        let outcome = Arc::downgrade(&imported.opts.import.as_ref().unwrap().outcome);
+        let mut waiting = Box::pin(crate::serve::pd::submit_decode(&mux, imported, now));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), waiting.as_mut())
+                .await
+                .is_err()
+        );
+        drop(receiver);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(outcome.upgrade().is_none());
+        assert_eq!(prefill.serving.aborted.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            prefill.serving.aborted_before_first.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.requests.load(Ordering::Relaxed), 20);
+        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 1);
+        note_dequeued(&rx.try_recv().unwrap(), &metrics);
         drop(rx);
         assert!(matches!(
             mux.submit(test_job()),
@@ -10508,18 +11724,7 @@ mod tests {
     #[test]
     fn the_queue_bound_counts_jobs_off_the_channel_too() {
         let metrics = Arc::new(Metrics::default());
-        let (tx, mut rx) = mpsc::channel(3 + CONTROL_SLACK);
-        let mux = ModelMux {
-            tx,
-            metrics: Arc::clone(&metrics),
-            preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            preempt_notify: Arc::new(tokio::sync::Notify::new()),
-            arrival_notify: Arc::new(tokio::sync::Notify::new()),
-            ingress: Arc::default(),
-            preempted: Arc::default(),
-            queue_cap: 3,
-            prefix_block_rows: 0,
-        };
+        let (mux, mut rx) = queued_test_mux(metrics.clone(), 3);
         let (mut waiting, mut load) = (std::collections::VecDeque::new(), LoadEstimator::default());
         let (mut draining, mut drain_done, mut late) = (false, None, Vec::new());
         for _ in 0..3 {
@@ -10609,7 +11814,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cpu"))]
     fn idle_test_mux(name: &str) -> ModelMux {
         let backend: Arc<dyn crate::device::Backend> =
             Arc::new(crate::device::cpu::CpuBackend::new(1));
@@ -10621,6 +11826,69 @@ mod tests {
             state,
             MuxConfig::default(),
         )
+    }
+
+    #[cfg(feature = "cpu")]
+    #[tokio::test]
+    async fn fenced_drain_survives_a_cancelled_waiter_and_can_be_retried() {
+        let mux = idle_test_mux("fenced-drain-retry");
+        let held = mux.ingress_owned();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), mux.drain_fenced())
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), mux.drain_fenced())
+                .await
+                .unwrap()
+        );
+        assert!(
+            mux.drain_fenced().await,
+            "successful completion persists after channel close"
+        );
+        assert!(
+            mux.preempt_fenced().await,
+            "a later preempt observes the same completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_acknowledgement_is_not_a_completion_fence() {
+        let mut mux = scripted_mux(|_| Vec::new());
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        mux.tx = tx;
+        assert!(!mux.drain_fenced().await);
+        assert!(!mux.preempt_fenced().await);
+    }
+
+    #[cfg(feature = "cpu")]
+    #[tokio::test]
+    async fn retiring_mux_leaves_routing_but_survives_cancelled_eviction() {
+        let backend: Arc<dyn crate::device::Backend> =
+            Arc::new(crate::device::cpu::CpuBackend::new(1));
+        let execset = Arc::new(crate::exec::ExecutorSet::bringup(backend).unwrap());
+        let state = Arc::new(AppState::new(crate::orch::Registry::new(), execset));
+        let mux = idle_test_mux("retiring-routing");
+        state.install_mux("m".into(), mux.clone());
+        let held = mux.ingress_owned();
+        let retiring = state.mux_for_retirement("m").unwrap();
+        assert!(state.mux("m").is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), retiring.drain_fenced())
+                .await
+                .is_err()
+        );
+        drop(retiring);
+        drop(held);
+        let resumed = state
+            .mux_for_retirement("m")
+            .expect("cancellation must retain the fence handle");
+        assert!(resumed.drain_fenced().await);
+        assert!(state.remove_mux("m").is_some());
+        assert!(state.remove_mux("m").is_none());
     }
 
     /// A DP rank taken out mid-burst: the router stops choosing it the moment its dispatcher leaves
@@ -10655,7 +11923,9 @@ mod tests {
         let set = Arc::clone(state.dp_set("m").unwrap());
         let mut seen = [0usize; 2];
         for _ in 0..6 {
-            let (rank, mux, _, _pick) = state.dp_route(&set, None, Some(&[1, 2, 3]), 0).unwrap();
+            let (rank, mux, _, _pick) = state
+                .dp_route(&set, None, Some(&[1, 2, 3]), 0, false)
+                .unwrap();
             seen[rank] += 1;
             assert!(state
                 .submit_routed(
@@ -10666,6 +11936,7 @@ mod tests {
                     Instant::now(),
                     None
                 )
+                .await
                 .is_ok());
         }
         assert!(
@@ -10678,7 +11949,7 @@ mod tests {
         removed.drain().await;
         assert!(stale.is_closed());
         for _ in 0..16 {
-            let (rank, _, _, _) = state.dp_route(&set, Some("s"), None, 0).unwrap();
+            let (rank, _, _, _) = state.dp_route(&set, Some("s"), None, 0, false).unwrap();
             assert_eq!(rank, 1, "a removed rank is never routed to");
         }
         assert!(state
@@ -10690,19 +11961,22 @@ mod tests {
                 Instant::now(),
                 None
             )
+            .await
             .is_ok());
         assert_eq!(set.stats.retries.load(Ordering::Relaxed), 1);
         state.remove_mux("m#1");
-        assert!(state.dp_route(&set, None, None, 0).is_none());
+        assert!(state.dp_route(&set, None, None, 0, false).is_none());
         assert!(matches!(
-            state.submit_routed(
-                Some((&set, 0)),
-                None,
-                &stale,
-                test_job(),
-                Instant::now(),
-                None
-            ),
+            state
+                .submit_routed(
+                    Some((&set, 0)),
+                    None,
+                    &stale,
+                    test_job(),
+                    Instant::now(),
+                    None
+                )
+                .await,
             Err(SubmitError::Closed(_))
         ));
     }
@@ -11423,6 +12697,25 @@ mod tests {
         assert!(pack_row(&slots, 1).is_none());
     }
 
+    #[test]
+    fn packed_speech_keeps_prompt_and_decode_frame_embeddings_between_overlays() {
+        let (mut a, _rx) = prefill_test_slot();
+        a.as_mut().unwrap().speech = Some(Box::new(prefix_test_speech()));
+        let (mut b, _rx_b) = prefill_test_slot();
+        b.as_mut().unwrap().speech = Some(Box::new(SpeechJob {
+            overlay: vec![9.0, 8.0],
+            overlay_pos: vec![0],
+            ..prefix_test_speech()
+        }));
+        let slots = [a, None, b];
+        let mut rows = Vec::new();
+        let mut index = Vec::new();
+        // Decode slot 0 at a position past all prompt overlays, then a new prompt on slot 2.
+        speech_pack_overlay(&slots, &[(0, 100, 1), (2, 0, 2)], 5, &mut rows, &mut index);
+        assert_eq!(index, [OVERLAY_KEEP, 0, OVERLAY_KEEP, u32::MAX, u32::MAX]);
+        assert_eq!(rows, [9.0, 8.0]);
+    }
+
     /// A full downstream stage keeps a request queued, answered with nothing.
     #[test]
     fn a_full_downstream_keeps_the_request_queued() {
@@ -11733,6 +13026,696 @@ mod tests {
         bundle
     }
 
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
+    mod seq_pd {
+        use super::*;
+        use crate::serve::engine::SeqEngine;
+        use crate::serve::pd::{KvExport, KvImage, KvImport, Outcome, ReadyImport};
+
+        #[derive(Default)]
+        struct Engine {
+            stop: Arc<Vec<u32>>,
+            live: bool,
+            exports: usize,
+            imports: usize,
+            capacity: usize,
+            seed: Option<u32>,
+            logits: Vec<f32>,
+            export_fault: bool,
+            on_export: Option<Arc<dyn Fn() + Send + Sync>>,
+        }
+
+        impl SeqEngine for Engine {
+            fn logits_row(&self, _: usize, out: &mut Vec<f32>) -> bool {
+                out.extend_from_slice(&self.logits);
+                !self.logits.is_empty()
+            }
+            fn stop_ids(&self) -> &Arc<Vec<u32>> {
+                &self.stop
+            }
+            fn batch(&self) -> usize {
+                self.capacity.max(1)
+            }
+            fn release(&mut self, _: usize) {
+                self.live = false;
+            }
+            fn kv_image_key(&self) -> Option<String> {
+                Some("key".into())
+            }
+            fn export_kv_image(
+                &mut self,
+                _: usize,
+                n: u32,
+                out: &mut crate::serve::pd::KvBytes,
+            ) -> Result<()> {
+                assert!(self.live, "export must precede release");
+                assert_eq!(n, 3);
+                if self.export_fault {
+                    return Err(crate::RuntimeError::DeviceFault { info: fault(true) });
+                }
+                self.exports += 1;
+                *out = vec![42].into();
+                Ok(())
+            }
+            fn export_kv_image_stream(
+                &mut self,
+                slot: usize,
+                n: u32,
+                out: &mut crate::serve::pd::KvBytes,
+                publish: &mut dyn FnMut(crate::serve::pd::KvBytes),
+            ) -> Result<()> {
+                self.export_kv_image(slot, n, out)?;
+                if let Some(hook) = &self.on_export {
+                    publish(vec![42].into());
+                    hook();
+                    assert!(self.live, "publication precedes source release");
+                }
+                Ok(())
+            }
+            fn import_kv_image(
+                &mut self,
+                _: usize,
+                prompt: &[u32],
+                image: &crate::serve::pd::KvBytes,
+                first: u32,
+            ) -> Result<()> {
+                assert_eq!(prompt, [1, 2, 3]);
+                assert_eq!(&**image, [42]);
+                self.live = true;
+                self.imports += 1;
+                self.seed = Some(first);
+                Ok(())
+            }
+            fn prefill_turn(&self) -> usize {
+                0
+            }
+            fn advance_prefill_turn(&mut self, _: usize) {
+                unreachable!()
+            }
+            fn prefill_prog_t(&self, _: usize) -> Option<u32> {
+                None
+            }
+            fn packable_prefill_span(&self, _: usize, _: u32) -> Option<packet::dev::PrefillSpan> {
+                None
+            }
+            fn advance_packed_prefill(&mut self, _: &[(usize, &[u32])]) -> Result<()> {
+                unreachable!()
+            }
+            fn prefill_frontier(&self, _: usize) -> Option<usize> {
+                None
+            }
+            fn prefill_chunked_at_most(
+                &mut self,
+                _: usize,
+                _: &[u32],
+                _: u32,
+            ) -> Result<Option<u32>> {
+                unreachable!("import must skip prefill")
+            }
+            fn multistep_quantum(&self, _: &[(usize, u32)], _: usize) -> Option<usize> {
+                None
+            }
+            fn multi_step(
+                &mut self,
+                _: &[(usize, u32)],
+                _: usize,
+                _: &mut Vec<u32>,
+            ) -> Result<usize> {
+                unreachable!()
+            }
+            fn step_batch(&mut self, _: &[(usize, u32)]) -> Result<Vec<(usize, u32)>> {
+                unreachable!()
+            }
+        }
+
+        #[test]
+        fn every_import_state_is_excluded_from_prefill_and_parks_only_when_safe() {
+            let now = Instant::now();
+            let (mut slot, client) = prefill_test_slot();
+            let s = slot.as_mut().unwrap();
+            assert!(s.needs_prefill());
+            let (import, deliver) = KvImport::pending(now, Outcome::new(Arc::default(), now));
+            s.import = Some(Box::new(import));
+            assert!(!s.needs_prefill() && s.waiting_import(false) && !s.waiting_import(true));
+            assert!(!s.changes_import());
+            s.import.as_mut().unwrap().prepare_with(|| Ok(())).unwrap();
+            assert!(s.waiting_import(true) && !s.changes_import());
+            assert!(deliver
+                .send(ReadyImport {
+                    image: KvImage {
+                        key: "key".into(),
+                        rows: 3,
+                        bytes: vec![42].into(),
+                        handoff_started: now
+                    },
+                    token: 120,
+                    logprobs: None,
+                    first: now,
+                    cached_tokens: 0,
+                })
+                .is_ok());
+            assert!(
+                !s.changes_import(),
+                "the channel is snapshotted before pipeline drain"
+            );
+            s.import.as_mut().unwrap().poll();
+            assert!(s.changes_import() && !s.waiting_import(true) && !s.needs_prefill());
+            let (import, deliver) = KvImport::pending(now, Outcome::new(Arc::default(), now));
+            s.import = Some(Box::new(import));
+            drop(deliver);
+            s.import.as_mut().unwrap().poll();
+            assert!(s.changes_import() && !s.waiting_import(false) && !s.needs_prefill());
+            let (mut import, _deliver) = KvImport::pending(now, Outcome::new(Arc::default(), now));
+            import.prepare_with(|| Ok(())).unwrap();
+            s.import = Some(Box::new(import));
+            drop(client);
+            assert!(s.changes_import() && !s.waiting_import(true) && !s.needs_prefill());
+        }
+
+        #[test]
+        fn the_sequential_slo_planner_never_prefills_a_pending_ready_or_abandoned_import() {
+            let now = Instant::now();
+            for state in ["pending", "prepared", "ready", "abandoned"] {
+                let (slot, _client) = prefill_test_slot();
+                let (mut active, _active_client) = prefill_test_slot();
+                active.as_mut().unwrap().step = 1;
+                active.as_mut().unwrap().out_ids.push(120);
+                let mut slots = vec![slot, active];
+                let (import, deliver) = KvImport::pending(now, Outcome::new(Arc::default(), now));
+                slots[0].as_mut().unwrap().import = Some(Box::new(import));
+                if state == "prepared" {
+                    slots[0]
+                        .as_mut()
+                        .unwrap()
+                        .import
+                        .as_mut()
+                        .unwrap()
+                        .prepare_with(|| Ok(()))
+                        .unwrap();
+                }
+                if state == "ready" {
+                    assert!(deliver
+                        .send(ReadyImport {
+                            image: KvImage {
+                                key: "key".into(),
+                                rows: 3,
+                                bytes: vec![42].into(),
+                                handoff_started: now
+                            },
+                            token: 120,
+                            logprobs: None,
+                            first: now,
+                            cached_tokens: 0,
+                        })
+                        .is_ok());
+                    slots[0].as_mut().unwrap().import.as_mut().unwrap().poll();
+                } else if state == "abandoned" {
+                    drop(deliver);
+                    slots[0].as_mut().unwrap().import.as_mut().unwrap().poll();
+                }
+                #[cfg(feature = "cuda")]
+                assert_eq!(gpu_decode_feeds(&slots, 2), [(1, 120)]);
+                let plan = amd_slo_plan(
+                    &Engine {
+                        capacity: 2,
+                        ..Default::default()
+                    },
+                    &slots,
+                    Default::default(),
+                    crate::sched::step::Tick {
+                        cap_rows: 128,
+                        packing: false,
+                        rotate: false,
+                        turn: 0,
+                        slots: 2,
+                    },
+                    crate::sched::slo::Targets {
+                        ttft_ms: Some(100.),
+                        tbt_ms: Some(10.),
+                    },
+                    &mut Default::default(),
+                    now,
+                );
+                assert!(
+                    plan.launches
+                        .iter()
+                        .all(|l| l.spans.iter().all(|s| s.slot != 0))
+                        && plan.decodes == [1],
+                    "{state}: {plan:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn engine_dead_pending_fanout_preserves_one_typed_terminal_and_abort() {
+            for source_first in [false, true] {
+                let now = Instant::now();
+                let source = Arc::new(Metrics::default());
+                let decode = Arc::new(Metrics::default());
+                let outcome = Outcome::new(source.clone(), now);
+                let (mut slot, mut client) = prefill_test_slot();
+                let (mut import, _deliver) = KvImport::pending(now, outcome.clone());
+                import.metrics = Some(decode.clone());
+                slot.as_mut().unwrap().import = Some(Box::new(import));
+                if source_first {
+                    assert!(outcome.report_abort());
+                    slot.as_ref()
+                        .unwrap()
+                        .respond
+                        .try_send(StreamChunk::Err(crate::RuntimeError::Unavailable(
+                            "source failed".into(),
+                        )))
+                        .unwrap();
+                }
+                fail_slot(
+                    &mut slot,
+                    &None,
+                    crate::RuntimeError::DeviceFault { info: fault(true) },
+                );
+                assert!(slot.is_none());
+                let StreamChunk::Err(error) = client.try_recv().unwrap() else {
+                    panic!("missing failure");
+                };
+                assert_eq!(error.is_fatal(), !source_first);
+                assert!(client.try_recv().is_err());
+                drop(outcome);
+                assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 1);
+                assert_eq!(decode.serving.aborted.load(Ordering::Relaxed), 0);
+            }
+        }
+
+        #[test]
+        fn pending_import_waits_without_prefill_then_seats_and_counts_decode_once() {
+            let now = Instant::now();
+            let source = Arc::new(Metrics::default());
+            let decode = Arc::new(Metrics::default());
+            let bundle = prefill_test_bundle("seq-pending-import");
+            let (slot, mut rx) = prefill_test_slot();
+            let mut slots = vec![slot];
+            let s = slots[0].as_mut().unwrap();
+            s.gen.max_tokens = 2;
+            s.raw_tokens = true;
+            let (mut import, deliver) = KvImport::pending(now, Outcome::new(source.clone(), now));
+            import.metrics = Some(decode.clone());
+            s.import = Some(Box::new(import));
+            let mut e = Engine::default();
+            assert!(!seq_seat_imports(
+                &mut e,
+                &mut slots,
+                &None,
+                &bundle,
+                &[],
+                &mut None
+            ));
+            assert_eq!(e.imports, 0);
+            assert!(slots[0].as_ref().unwrap().telemetry.is_none());
+            assert_eq!(decode.serving.running.load(Ordering::Relaxed), 0);
+            assert!(rx.try_recv().is_err());
+            assert!(deliver
+                .send(ReadyImport {
+                    image: KvImage {
+                        key: "key".into(),
+                        rows: 3,
+                        bytes: vec![42].into(),
+                        handoff_started: now
+                    },
+                    token: 120,
+                    logprobs: None,
+                    first: now,
+                    cached_tokens: 2,
+                })
+                .is_ok());
+            let import_work = seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
+            assert!(import_work && service_sample(12.0, import_work).is_none());
+            assert_eq!(e.imports, 1);
+            assert_eq!(e.seed, Some(120));
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                StreamChunk::Token { id: 120, .. }
+            ));
+            assert!(slots[0].as_ref().unwrap().telemetry.is_some());
+            handle_produced_token(&mut slots[0], &None, &bundle, 121, 1, &mut 0, Some(&[]));
+            assert!(slots[0].is_none());
+            let snapshot = crate::obs::serving::snapshot(&[("m".into(), decode, true)]);
+            let m = &snapshot.models[0];
+            assert_eq!(
+                (
+                    m.completed,
+                    m.generated_tokens,
+                    m.running,
+                    m.aborted,
+                    m.e2e.count
+                ),
+                (1, 2, 0, 0, 1)
+            );
+            assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn a_source_failure_closes_the_pending_decode_without_a_second_error_or_abort() {
+            let now = Instant::now();
+            let source = Arc::new(Metrics::default());
+            let decode = Arc::new(Metrics::default());
+            let bundle = prefill_test_bundle("seq-abandoned-import");
+            let (slot, mut rx) = prefill_test_slot();
+            let mut slots = vec![slot];
+            let outcome = Outcome::new(source.clone(), now);
+            let (mut import, deliver) = KvImport::pending(now, outcome.clone());
+            import.metrics = Some(decode.clone());
+            slots[0].as_mut().unwrap().import = Some(Box::new(import));
+            outcome.settle();
+            Metrics::inc(&source.rejected);
+            slots[0]
+                .as_ref()
+                .unwrap()
+                .respond
+                .try_send(StreamChunk::Err(crate::RuntimeError::Unavailable(
+                    "source failed".into(),
+                )))
+                .unwrap();
+            drop(deliver);
+            let mut e = Engine::default();
+            seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
+            assert!(slots[0].is_none());
+            assert_eq!(e.imports, 0);
+            assert!(matches!(rx.try_recv().unwrap(), StreamChunk::Err(_)));
+            assert!(rx.try_recv().is_err());
+            drop(outcome);
+            assert_eq!(source.rejected.load(Ordering::Relaxed), 1);
+            assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+            assert_eq!(decode.serving.aborted.load(Ordering::Relaxed), 0);
+            assert_eq!(decode.serving.running.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
+        async fn preempting_an_admitted_pending_leg_counts_once_and_cancels_its_source() {
+            let now = Instant::now();
+            let source = Arc::new(Metrics::default());
+            let decode = Arc::new(Metrics::default());
+            let (slot, mut rx) = prefill_test_slot();
+            let mut slots = vec![slot];
+            let (mut import, mut deliver) =
+                KvImport::pending(now, Outcome::new(source.clone(), now));
+            import.metrics = Some(decode.clone());
+            slots[0].as_mut().unwrap().import = Some(Box::new(import));
+            preempt_slots(&mut slots, &None).await;
+            assert!(slots[0].is_none());
+            tokio::time::timeout(std::time::Duration::from_secs(1), deliver.closed())
+                .await
+                .unwrap();
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                StreamChunk::Done {
+                    reason: FinishReason::Preempted,
+                    ..
+                }
+            ));
+            assert!(rx.try_recv().is_err());
+            assert_eq!(decode.serving.preempted.load(Ordering::Relaxed), 1);
+            assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+            assert_eq!(decode.serving.aborted.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn fatal_export_fault_reaches_tick_and_handoff() {
+            let outcome = Outcome::new(Arc::default(), Instant::now());
+            let (sink, mut image) = KvExport::new(outcome);
+            let mut e = Engine {
+                live: true,
+                export_fault: true,
+                ..Default::default()
+            };
+            let mut tick_fault = None;
+            seq_release_slot(&mut e, 0, &mut [Some((sink, 3))], &mut tick_fault);
+            assert!(tick_fault.unwrap().fatal);
+            assert!(matches!(image.try_recv().unwrap(), Err(error) if error.is_fatal()));
+            assert!(!e.live);
+        }
+
+        #[test]
+        fn source_done_and_usage_are_closed_before_early_image_publication() {
+            let now = Instant::now();
+            let outcome = Outcome::new(Arc::default(), now);
+            let (sink, image) = KvExport::new(outcome);
+            let (mut prefill, prx) = prefill_test_slot();
+            let s = prefill.as_mut().unwrap();
+            s.gen.max_tokens = 1;
+            s.cached_tokens = 2;
+            s.raw_tokens = true;
+            s.export = Some(sink.clone());
+            handle_produced_token(
+                &mut prefill,
+                &None,
+                &prefill_test_bundle("source-stream-closed"),
+                120,
+                1,
+                &mut 0,
+                Some(&[]),
+            );
+            assert!(prefill.is_none());
+            let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = observed.clone();
+            let channels = parking_lot::Mutex::new((prx, image));
+            let mut engine = Engine {
+                live: true,
+                on_export: Some(Arc::new(move || {
+                    let mut channels = channels.lock();
+                    assert!(matches!(
+                        channels.0.try_recv().unwrap(),
+                        StreamChunk::Token { id: 120, .. }
+                    ));
+                    assert!(
+                        matches!(channels.0.try_recv().unwrap(), StreamChunk::Done { usage, .. } if usage.cached_tokens == 2)
+                    );
+                    assert!(matches!(
+                        channels.0.try_recv(),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+                    ));
+                    let image = channels.1.try_recv().unwrap().unwrap();
+                    assert_eq!((image.rows, &*image.bytes), (3, &[42][..]));
+                    flag.store(true, Ordering::Release);
+                })),
+                ..Default::default()
+            };
+            seq_release_slot(&mut engine, 0, &mut [Some((sink, 3))], &mut None);
+            assert!(observed.load(Ordering::Acquire) && !engine.live);
+        }
+
+        #[test]
+        fn handoff_preserves_prefill_logprobs_then_uses_decode_rows() {
+            use crate::text::logprobs::{LogprobRequest, RowStats};
+
+            let bundle = prefill_test_bundle("seq-pd-logprobs");
+            let now = Instant::now();
+            let outcome = Outcome::new(Arc::default(), now);
+            let (sink, mut image) = KvExport::new(outcome.clone());
+            let request = LogprobRequest {
+                top: 20,
+                raw_logits: false,
+            };
+            let mut e = Engine {
+                live: true,
+                logits: vec![0.0; 128],
+                ..Default::default()
+            };
+            e.logits[120] = 3.0;
+            let expected_first = RowStats::of(&e.logits, request).finish(e.logits[120]);
+            let (mut prefill, mut prx) = prefill_test_slot();
+            let s = prefill.as_mut().unwrap();
+            s.gen.max_tokens = 1;
+            s.gen.params.logprobs = Some(request);
+            s.raw_tokens = true;
+            s.export = Some(sink.clone());
+            let token = seq_host_token(&e, 0, &mut prefill, 120);
+            handle_produced_token(&mut prefill, &None, &bundle, token, 1, &mut 0, Some(&[]));
+            seq_release_slot(&mut e, 0, &mut [Some((sink, 3))], &mut None);
+            let StreamChunk::Token { id, logprobs, .. } = prx.try_recv().unwrap() else {
+                panic!("prefill token missing");
+            };
+            assert_eq!(logprobs.as_deref(), Some(&expected_first));
+
+            let (decode, mut drx) = prefill_test_slot();
+            let mut slots = vec![decode];
+            let s = slots[0].as_mut().unwrap();
+            s.gen.max_tokens = 3;
+            s.gen.params.logprobs = Some(request);
+            s.raw_tokens = true;
+            s.import = Some(Box::new(KvImport::ready(
+                ReadyImport {
+                    image: image.try_recv().unwrap().unwrap(),
+                    token: id,
+                    logprobs,
+
+                    first: now,
+
+                    cached_tokens: 0,
+                },
+                now,
+                outcome,
+            )));
+            // The importing rank has no logits for token 1.
+            e.logits.clear();
+            seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
+            let StreamChunk::Token { id, logprobs, .. } = drx.try_recv().unwrap() else {
+                panic!("imported token missing");
+            };
+            assert_eq!(id, 120);
+            assert_eq!(logprobs.as_deref(), Some(&expected_first));
+            assert!(slots[0].as_ref().unwrap().lp.is_none());
+            for id in [121, 122] {
+                e.logits = vec![0.0; 128];
+                e.logits[id as usize] = 5.0;
+                let expected = RowStats::of(&e.logits, request).finish(e.logits[id as usize]);
+                let token = seq_host_token(&e, 0, &mut slots[0], id);
+                handle_produced_token(&mut slots[0], &None, &bundle, token, 1, &mut 0, Some(&[]));
+                let StreamChunk::Token {
+                    id: got, logprobs, ..
+                } = drx.try_recv().unwrap()
+                else {
+                    panic!("decode token missing");
+                };
+                assert_eq!(got, id);
+                assert_eq!(logprobs.as_deref(), Some(&expected));
+                assert_ne!(logprobs.as_deref(), Some(&expected_first));
+            }
+            assert!(slots[0].is_none());
+        }
+
+        #[test]
+        fn handoff_streams_the_prefill_token_and_counts_one_request() {
+            let bundle = prefill_test_bundle("seq-pd");
+            let (p, d) = (Arc::new(Metrics::default()), Arc::new(Metrics::default()));
+            let now = Instant::now();
+            let outcome = Outcome::new(p.clone(), now);
+            let (sink, mut image) = KvExport::new(outcome.clone());
+            let mut exports = vec![Some((sink.clone(), 3))];
+            let (mut prefill, mut prx) = prefill_test_slot();
+            let s = prefill.as_mut().unwrap();
+            s.gen.max_tokens = 1;
+            s.raw_tokens = true;
+            s.export = Some(sink);
+            s.telemetry = Some(RequestMetrics::leg(p.clone(), Leg::Prefill, now, now, 3, 1));
+            let mut e = Engine {
+                live: true,
+                ..Default::default()
+            };
+            let mut tokens = 0;
+            handle_produced_token(&mut prefill, &None, &bundle, 120, 1, &mut tokens, Some(&[]));
+            assert!(prefill.is_none());
+            seq_release_slot(&mut e, 0, &mut exports, &mut None);
+            assert_eq!(e.exports, 1);
+            assert!(!e.live);
+            assert!(matches!(
+                prx.try_recv().unwrap(),
+                StreamChunk::Token { id: 120, .. }
+            ));
+            let image = image.try_recv().unwrap().unwrap();
+
+            let (decode, mut drx) = prefill_test_slot();
+            let mut slots = vec![decode];
+            let s = slots[0].as_mut().unwrap();
+            s.gen.max_tokens = 2;
+            s.raw_tokens = true;
+            outcome.settle();
+            s.telemetry = Some(RequestMetrics::leg(
+                d.clone(),
+                Leg::Decode { first: now },
+                now,
+                now,
+                3,
+                2,
+            ));
+            s.import = Some(Box::new(KvImport::ready(
+                ReadyImport {
+                    image,
+                    token: 120,
+                    logprobs: None,
+
+                    first: now,
+
+                    cached_tokens: 2,
+                },
+                now,
+                outcome,
+            )));
+            let mut fault = None;
+            seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut fault);
+            let s = slots[0].as_ref().unwrap();
+            assert_eq!((s.step, s.pf_pos, s.cached_tokens), (1, 3, 2));
+            assert_eq!(s.out_ids, [120]);
+            assert!(s.import.is_none());
+            assert_eq!(e.seed, Some(120));
+            assert!(fault.is_none());
+            assert!(matches!(
+                drx.try_recv().unwrap(),
+                StreamChunk::Token { id: 120, .. }
+            ));
+            handle_produced_token(
+                &mut slots[0],
+                &None,
+                &bundle,
+                121,
+                1,
+                &mut tokens,
+                Some(&[]),
+            );
+            assert!(slots[0].is_none());
+            seq_release_slot(&mut e, 0, &mut exports, &mut None);
+            assert_eq!(e.exports, 1);
+            assert_eq!(tokens, 2);
+            let snap =
+                crate::obs::serving::snapshot(&[("m#0".into(), p, true), ("m#1".into(), d, true)]);
+            let m = &snap.models[0];
+            assert_eq!(
+                (m.completed, m.running, m.ttft.count, m.e2e.count),
+                (1, 0, 1, 1)
+            );
+        }
+
+        #[test]
+        fn incompatible_images_fail_without_seeding_and_cancelled_exports_are_skipped() {
+            let bundle = prefill_test_bundle("seq-pd-refuse");
+            for (key, rows) in [("wrong", 3), ("key", 2)] {
+                let (slot, mut rx) = prefill_test_slot();
+                let mut slots = vec![slot];
+                let now = Instant::now();
+                slots[0].as_mut().unwrap().import = Some(Box::new(KvImport::ready(
+                    ReadyImport {
+                        image: KvImage {
+                            key: key.into(),
+                            rows,
+                            bytes: vec![42].into(),
+                            handoff_started: now,
+                        },
+                        token: 120,
+                        logprobs: None,
+
+                        first: now,
+
+                        cached_tokens: 0,
+                    },
+                    now,
+                    Outcome::new(Arc::default(), now),
+                )));
+                let mut e = Engine::default();
+                seq_seat_imports(&mut e, &mut slots, &None, &bundle, &[], &mut None);
+                assert!(slots[0].is_none());
+                assert!(e.seed.is_none());
+                assert!(!e.live);
+                assert!(matches!(rx.try_recv().unwrap(), StreamChunk::Err(_)));
+            }
+            let (sink, rx) = KvExport::new(Outcome::new(Arc::default(), Instant::now()));
+            drop(rx);
+            let mut e = Engine {
+                live: true,
+                ..Default::default()
+            };
+            seq_release_slot(&mut e, 0, &mut [Some((sink, 3))], &mut None);
+            assert_eq!(e.exports, 0);
+            assert!(!e.live);
+        }
+    }
+
     /// Thinking control on committed ids: a spent budget commits the forced end in place of the
     /// sampled tokens, and the reply cap ends the request as `ReplyCap` with the controller's report.
     #[test]
@@ -11966,6 +13949,7 @@ mod tests {
                 step: 0,
                 pf_pos: 2,
                 cached_tokens: 0,
+                slot_prefix_keys: None,
                 kv: None,
                 arrived: Instant::now(),
                 stop_tail: String::new(),
@@ -11975,7 +13959,10 @@ mod tests {
                 turn: None,
                 turn_key: None,
                 speech: None,
+                first_out: false,
                 mm: None,
+                export: None,
+                import: None,
                 cfg: None,
                 held: Vec::new(),
                 held_finish: None,
@@ -11988,6 +13975,423 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    fn prefix_test_speech() -> SpeechJob {
+        SpeechJob {
+            slot_prefix_reuse: true,
+            frame_codes: vec![10, 11, 20, 21, 30, 31],
+            frame_codes_per_row: 2,
+            depth: Some(DepthJob {
+                seed: 1,
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 1,
+                ras_temperature: 1.0,
+                ras_top_p: 1.0,
+                repetition_penalty: 1.0,
+                cfg_scale: None,
+                semantic_base: 0,
+                stop_class: 2048,
+                stop_token: 2048,
+                maya2: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn speech_prefix_keys_cover_tokens_frames_and_speaker_overlays() {
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.speech = Some(Box::new(prefix_test_speech()));
+        let a = speech_prefix_keys(s).unwrap();
+        s.speech.as_mut().unwrap().frame_codes[3] += 1;
+        let b = speech_prefix_keys(s).unwrap();
+        assert_eq!(a[0], b[0]);
+        assert_ne!(a[1], b[1]);
+        s.prompt_ids[0] += 1;
+        let c = speech_prefix_keys(s).unwrap();
+        assert_ne!(b[0], c[0]);
+        assert_eq!(b[1..], c[1..]);
+        let sp = s.speech.as_mut().unwrap();
+        sp.overlay_pos = vec![1];
+        sp.overlay = vec![0.5, 0.75];
+        let d = speech_prefix_keys(s).unwrap();
+        assert_eq!(c[0], d[0]);
+        assert_ne!(c[1], d[1]);
+        s.speech.as_mut().unwrap().overlay[1] += 1.0;
+        assert_ne!(d[1], speech_prefix_keys(s).unwrap()[1]);
+    }
+
+    #[test]
+    fn speech_prefix_reuse_rejects_unfinalized_or_unkeyed_inputs() {
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.speech = Some(Box::new(prefix_test_speech()));
+        s.speech.as_mut().unwrap().slot_prefix_reuse = false;
+        assert!(speech_prefix_keys(s).is_none());
+        s.speech.as_mut().unwrap().slot_prefix_reuse = true;
+        s.speech.as_mut().unwrap().encode = Some(Box::new(|_, _| Ok(())));
+        assert!(speech_prefix_keys(s).is_none());
+        s.speech.as_mut().unwrap().encode = None;
+        s.speech.as_mut().unwrap().frame_codes.pop();
+        assert!(speech_prefix_keys(s).is_none());
+        s.speech.as_mut().unwrap().frame_codes.clear();
+        assert!(
+            speech_prefix_keys(s).is_some(),
+            "plain token prompts are keyed too"
+        );
+        s.speech.as_mut().unwrap().overlay_pos = vec![1];
+        assert!(speech_prefix_keys(s).is_none());
+        s.speech.as_mut().unwrap().overlay = vec![0.5];
+        assert!(speech_prefix_keys(s).is_some());
+        s.speech.as_mut().unwrap().overlay_pos = vec![3];
+        assert!(speech_prefix_keys(s).is_none());
+    }
+
+    #[test]
+    fn slot_prefix_fault_epoch_cancels_a_prepared_resume() {
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.resume = 2;
+        s.slot_prefix_keys = Some((7, vec![1, 2, 3]));
+        reconcile_slot_prefix(s, 7);
+        assert_eq!(s.resume, 2);
+        reconcile_slot_prefix(s, 8);
+        assert_eq!(s.resume, 0);
+        assert!(s.slot_prefix_keys.is_none());
+        s.resume = 2;
+        reconcile_slot_prefix(s, 9);
+        assert_eq!(s.resume, 2, "session retention has separate provenance");
+    }
+
+    #[test]
+    fn depth_packing_requires_the_terminal_decode_embedding_to_match_prefill() {
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.speech = Some(Box::new(prefix_test_speech()));
+        assert!(depth_prompt_can_pack(s));
+        s.speech.as_mut().unwrap().overlay_pos = vec![2];
+        assert!(
+            !depth_prompt_can_pack(s),
+            "terminal speaker anchor must be prefilled"
+        );
+        s.speech.as_mut().unwrap().overlay_pos = vec![1];
+        assert!(
+            depth_prompt_can_pack(s),
+            "earlier overlays are staged by packed prefill"
+        );
+        s.speech.as_mut().unwrap().encode = Some(Box::new(|_, _| Ok(())));
+        assert!(
+            !depth_prompt_can_pack(s),
+            "pending encoders may create terminal overlays"
+        );
+        s.speech.as_mut().unwrap().encode = None;
+        s.speech.as_mut().unwrap().depth = None;
+        assert!(!depth_prompt_can_pack(s));
+    }
+
+    #[test]
+    fn depth_packing_admits_a_warm_single_prompt_without_waiting_for_a_peer() {
+        let (mut a, _ra) = prefill_test_slot();
+        let (mut b, _rb) = prefill_test_slot();
+        for s in [&mut a, &mut b].into_iter().flatten() {
+            s.pf_pos = 0;
+            s.speech = Some(Box::new(prefix_test_speech()));
+        }
+        let mut slots = vec![a, None];
+        assert!(
+            !depth_prompts_pack(&slots, 2, |_| false),
+            "a cold single prompt stays serial"
+        );
+        slots[0].as_mut().unwrap().resume = 2;
+        assert!(depth_prompts_pack(&slots, 2, |_| false));
+        slots[0].as_mut().unwrap().resume = 1;
+        assert!(!depth_prompts_pack(&slots, 2, |_| false));
+        slots[1] = b;
+        assert!(depth_prompts_pack(&slots, 2, |_| false));
+        slots[0].as_mut().unwrap().pf_pos = 1;
+        assert!(
+            !depth_prompts_pack(&slots, 2, |_| false),
+            "serial work cannot change routes mid-prompt"
+        );
+        assert!(depth_prompts_pack(&slots, 2, |i| i == 0));
+        slots[1]
+            .as_mut()
+            .unwrap()
+            .speech
+            .as_mut()
+            .unwrap()
+            .overlay_pos = vec![2];
+        assert!(!depth_prompts_pack(&slots, 2, |_| true));
+    }
+
+    #[test]
+    fn cached_speech_tails_join_native_decode_without_prefilling_cold_peers() {
+        let (mut a, _ra) = prefill_test_slot();
+        let (mut b, _rb) = prefill_test_slot();
+        for s in [&mut a, &mut b].into_iter().flatten() {
+            s.pf_pos = 0;
+            s.resume = s.prompt_ids.len() - 1;
+            s.speech = Some(Box::new(prefix_test_speech()));
+        }
+        let mut slots = vec![a, None];
+        assert!(depth_cached_tails(&slots, 2, |_| false, |_| true));
+        assert!(!depth_cached_tails(&slots, 0, |_| false, |_| true));
+        slots[1] = b;
+        assert!(depth_cached_tails(&slots, 2, |_| false, |_| true));
+        slots[1].as_mut().unwrap().resume = 0;
+        assert!(!depth_cached_tails(&slots, 2, |_| false, |_| true));
+        slots[1].as_mut().unwrap().pf_pos = 2;
+        assert!(!depth_cached_tails(&slots, 2, |_| false, |_| true));
+        assert!(depth_cached_tails(&slots, 2, |i| i == 1, |_| true));
+        slots[1].as_mut().unwrap().pf_pos = 0;
+        slots[1].as_mut().unwrap().step = 1;
+        assert!(depth_cached_tails(&slots, 2, |_| false, |_| true));
+        slots[0].as_mut().unwrap().step = 1;
+        assert!(!depth_cached_tails(&slots, 2, |_| false, |_| true));
+    }
+
+    #[test]
+    fn cached_speech_tails_keep_embedding_and_prefix_safety_guards() {
+        let (mut slot, rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.pf_pos = 0;
+        s.resume = s.prompt_ids.len() - 1;
+        s.speech = Some(Box::new(prefix_test_speech()));
+        let mut slots = vec![slot];
+        assert!(!depth_cached_tails(&slots, 1, |_| false, |_| false));
+        assert!(depth_cached_tails(&slots, 1, |_| false, |_| true));
+        assert!(
+            !depth_cached_tails(&slots, 1, |_| true, |_| true),
+            "admitted cache misses must prefill their actual frontier"
+        );
+        slots[0].as_mut().unwrap().resume = usize::MAX;
+        assert!(!depth_cached_tails(&slots, 1, |_| false, |_| true));
+        let s = slots[0].as_mut().unwrap();
+        s.resume = s.prompt_ids.len() - 1;
+        s.speech.as_mut().unwrap().overlay_pos = vec![2];
+        assert!(!depth_cached_tails(&slots, 1, |_| false, |_| true));
+        slots[0]
+            .as_mut()
+            .unwrap()
+            .speech
+            .as_mut()
+            .unwrap()
+            .overlay_pos
+            .clear();
+        drop(rx);
+        assert!(!depth_cached_tails(&slots, 1, |_| false, |_| true));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, PLOW_VMM_PREFIX=1, RUST_MIN_STACK=67108864; run through gpuq"]
+    fn cached_speech_tail_uses_native_decode_at_serving_widths() {
+        use crate::asset::devblob::DevBlob;
+        use crate::device::cuda::CudaBackend;
+        use crate::exec::gpu::{GpuEngine, PfBatchReq};
+        use plow_asset::fish_depth::Manifest;
+
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let raw = std::fs::read(assets.join("model.pkt")).unwrap();
+        let blob = DevBlob::parse(&raw).unwrap();
+        let m: Manifest = serde_json::from_slice(
+            blob.reserved_metadata(&raw, plow_asset::fish_depth::SECTION)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let contract = m.packed.as_ref().unwrap();
+        let mut e = GpuEngine::load(
+            Arc::new(CudaBackend::new(0).unwrap()),
+            &assets,
+            &assets.join("checkpoint"),
+        )
+        .unwrap();
+        assert!(e.pf_compact() && e.slot_prefix_reuse_supported());
+        let live = crate::config::RuntimeConfig::get().nv.vmm_live;
+        assert_eq!(!e.slot_resume_supported(), live);
+        let k = m.codebooks as usize;
+        for n in [1, 8, 32] {
+            let warm = if live { 1 } else { n };
+            let mut slots = Vec::new();
+            let mut receivers = Vec::new();
+            for i in 0..n {
+                let (mut slot, rx) = prefill_test_slot();
+                let s = slot.as_mut().unwrap();
+                s.prompt_ids = (0..14 + i % 3)
+                    .map(|p| (31 + (i * 17 + p * 7919) as u32) % contract.input_vocab)
+                    .collect();
+                *s.prompt_ids.last_mut().unwrap() = m.semantic_base;
+                assert!(e.depth_prompt_tail_can_decode(m.semantic_base));
+                s.pf_pos = 0;
+                s.gen.max_tokens = 2;
+                let mut speech = prefix_test_speech();
+                speech.frame_codes_per_row = k;
+                speech.frame_codes = (0..s.prompt_ids.len() * k)
+                    .map(|c| (i + c) as u32 % 16)
+                    .collect();
+                s.speech = Some(Box::new(speech));
+                assert_eq!(
+                    e.admit_packed_slot(i, &s.prompt_ids, s.prompt_ids.len() + 2)
+                        .unwrap(),
+                    Some(0)
+                );
+                slots.push(slot);
+                receivers.push(rx);
+            }
+            let pack: Vec<_> = (0..n)
+                .rev()
+                .map(|i| (i, 0, slots[i].as_ref().unwrap().prompt_ids.len() - 1))
+                .collect();
+            if e.tensor_bytes("in.encoder_overlay_index").is_some() {
+                gpu_speech_pack_inputs(&mut e, &slots, &pack).unwrap();
+            }
+            gpu_speech_pack_codes(&mut e, &slots, &pack).unwrap();
+            let reqs: Vec<_> = pack
+                .iter()
+                .map(|&(slot, c0, len)| PfBatchReq {
+                    slot,
+                    prompt: &slots[slot].as_ref().unwrap().prompt_ids,
+                    c0,
+                    len,
+                })
+                .collect();
+            e.prefill_batched(&reqs).unwrap();
+            for s in slots.iter_mut().flatten() {
+                s.pf_pos = s.prompt_ids.len() - 1;
+            }
+            e.fish_seed_slots(&depth_seed_rows(&slots, n, |i| e.packed_slot_ready(i)))
+                .unwrap();
+            let feeds: Vec<_> = (0..n)
+                .rev()
+                .map(|i| (i, *slots[i].as_ref().unwrap().prompt_ids.last().unwrap()))
+                .collect();
+            let mut tokens = Vec::new();
+            e.step_slots(&feeds, &mut tokens).unwrap();
+            let mut reference = vec![Vec::new(); n];
+            for (i, row) in reference.iter_mut().enumerate() {
+                e.logits_row(i, row).unwrap();
+                let s = slots[i].as_mut().unwrap();
+                if i >= warm {
+                    e.rewind_slot(i, s.prompt_ids.len() - 1).unwrap();
+                    s.step = 1;
+                    continue;
+                }
+                let keys = speech_prefix_keys(s).unwrap();
+                e.keep_slot_prefix(i, e.slot_prefix_epoch(), keys.clone());
+                e.retire_slot(i, false);
+                s.pf_pos = 0;
+                s.resume = e.reuse_slot_prefix(i, &keys);
+                assert_eq!(s.resume, s.prompt_ids.len() - 1, "c{n} slot{i}");
+                s.slot_prefix_keys = Some((e.slot_prefix_epoch(), keys));
+            }
+            assert!(gpu_depth_packs(&e, &slots, n));
+            let compact = e.pf_compact()
+                && !depth_cached_tails(
+                    &slots,
+                    n,
+                    |i| e.packed_slot_ready(i),
+                    |token| e.depth_prompt_tail_can_decode(token),
+                );
+            assert!(
+                !compact,
+                "a cached compatible tail must stay on native decode"
+            );
+            let mut completed = Vec::new();
+            let mut pending_feeds: Vec<_> =
+                feeds.iter().copied().filter(|&(i, _)| i >= warm).collect();
+            let cold = pending_feeds.is_empty();
+            let live_feeds = pending_feeds.clone();
+            let mut unified = Vec::new();
+            let mut sampled = false;
+            assert!(gpu_prefill_batched_pass(
+                &mut e,
+                &mut slots,
+                n,
+                &None,
+                cold,
+                compact,
+                false,
+                &mut completed,
+                &mut pending_feeds,
+                &mut unified,
+                &mut sampled,
+                &mut crate::sched::ride::RideCost::default(),
+                std::time::Duration::ZERO,
+                0,
+                &mut Vec::new(),
+            )
+            .is_none());
+            assert!(completed.is_empty() && unified.is_empty());
+            assert_eq!(pending_feeds, live_feeds);
+            let seeds = depth_seed_rows(&slots, n, |i| e.packed_slot_ready(i));
+            assert_eq!(seeds.len(), warm);
+            e.fish_seed_slots(&seeds).unwrap();
+            e.step_slots(&feeds, &mut tokens).unwrap();
+            for (i, expected) in reference.iter().enumerate() {
+                let mut actual = Vec::new();
+                e.logits_row(i, &mut actual).unwrap();
+                assert_eq!(
+                    actual, *expected,
+                    "c{n} slot{i} cached native logits differ"
+                );
+                e.retire_slot(i, false);
+            }
+            eprintln!("c{n}: {warm} cached tails join {} live rows without prefill; native full logits exact", n - warm);
+        }
+    }
+
+    #[test]
+    fn depth_packing_host_controller_requires_the_packet_capability() {
+        let controller = crate::tts::maya2::Controller::parse(
+            r#"{"cb0":{"temperature":0.9,"top_k":64,"top_p":1.0,"presence_penalty":0.8,
+            "penalty_window":12,"stop_p":0.35,"stop_hazard":0.6,"min_frames_floor":4},
+            "guard":{"dur_k":2.2,"dur_margin_s":1.2,"stall":32,"period_win":64,"period_thr":0.7,
+            "pmin":2,"pmax":16,"start":32,"every":2,"boost":4.0,"backstop":24,"hist":96,"hard_cap":1500},
+            "frame_s":0.08,"chunk_s":20.0,"gap_s":0.15,"frames_prior":{},"duration_prior":{}}"#,
+        ).unwrap();
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        let mut sp = prefix_test_speech();
+        sp.depth.as_mut().unwrap().maya2 =
+            Some(controller.plan("Hello.", "en", None, controller.cb0, 1));
+        sp.slot_prefix_reuse = false;
+        s.speech = Some(Box::new(sp));
+        assert!(!depth_prompt_can_pack(s));
+        s.speech.as_mut().unwrap().slot_prefix_reuse = true;
+        assert!(depth_prompt_can_pack(s));
+        s.speech.as_mut().unwrap().overlay_pos = vec![2];
+        assert!(!depth_prompt_can_pack(s));
+    }
+
+    #[test]
+    fn depth_seed_rows_include_only_live_completed_prompt_tails_in_slot_order() {
+        let mut slots = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..6 {
+            let (mut slot, rx) = prefill_test_slot();
+            slot.as_mut().unwrap().speech = Some(Box::new(prefix_test_speech()));
+            slots.push(slot);
+            receivers.push(rx);
+        }
+        slots[0].as_mut().unwrap().pf_pos = 1;
+        slots[2].as_mut().unwrap().step = 1;
+        receivers[3].close();
+        slots[4]
+            .as_mut()
+            .unwrap()
+            .speech
+            .as_mut()
+            .unwrap()
+            .frame_codes
+            .clear();
+        let rows = depth_seed_rows(&slots, 6, |i| i != 5);
+        assert_eq!(rows.as_slice(), [(1, &[30, 31][..]), (4, &[][..])]);
+        assert!(depth_seed_rows(&slots, 1, |_| true).is_empty());
+        assert!(depth_seed_rows(&slots, 6, |_| false).is_empty());
     }
 
     #[cfg(feature = "cuda")]
@@ -12280,7 +14684,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn amd_mixed_admission_obeys_rotation_age_and_total_prefill_budget() {
         let now = Instant::now();
@@ -12300,7 +14704,7 @@ mod tests {
         assert!(amd_mixed_prefill_pack(candidates, 0, true, 0, 4).is_empty());
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn amd_token_batch_pack_takes_whole_chunks_in_pool_order_and_never_cuts() {
         let now = Instant::now();
@@ -12325,7 +14729,7 @@ mod tests {
         assert!(amd_token_batch_pack(&[], 4096).is_empty());
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn pf_hold_waits_for_rows_or_age_and_only_under_decode() {
         use super::{amd_pf_hold, PfHold};
@@ -12365,7 +14769,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
     #[test]
     fn amd_prefill_scheduler_controls_are_bounded() {
         assert_eq!(amd_prefill_tick_cap(false, false, 2048), u32::MAX);

@@ -47,6 +47,9 @@ struct LayerW {
     k: u32,
     v: u32,
     o: u32,
+    /// Per-head q / k RMS norm weights (`qk_norm`), else `TENSOR_NONE` (no norm).
+    qn: u32,
+    kn: u32,
     post_ln: u32,
     gate: u32,
     up: u32,
@@ -70,6 +73,7 @@ pub(crate) struct Tensors {
     /// position's embedding row, forced classes and the depth RoPE tables.
     xin: u32,
     proj: u32,
+    proj_b: u32,
     heads: Vec<u32>,
     blogits: u32,
     dlogits: Vec<u32>,
@@ -124,11 +128,7 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
         u64::from(d.kv_heads * d.head_dim),
     );
     let classes = c.out_vocab();
-    let pre = if d.breeze {
-        "breeze.depth"
-    } else {
-        "fish.depth"
-    };
+    let pre = d.prefix.as_str();
     let w = |b: &mut Builder, s: &str, n: u64| b.tensor(&format!("{pre}.{s}"), n * BF16);
     let a = |b: &mut Builder, s: &str, n: u64| b.tensor(&format!("act.fish.{s}"), n);
     let konst = |b: &mut Builder, name: String, v: u32| {
@@ -168,6 +168,11 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
         xin: opt(b, "xin", r * u64::from(c.hidden) * BF16),
         proj: if d.breeze {
             w(b, "proj.weight", h * u64::from(c.hidden))
+        } else {
+            TENSOR_NONE
+        },
+        proj_b: if d.breeze && d.proj_bias {
+            w(b, "proj.bias", h)
         } else {
             TENSOR_NONE
         },
@@ -280,6 +285,24 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
                     k: mat(b, &format!("{p}self_attn.k_proj.weight"), kd * h),
                     v: mat(b, &format!("{p}self_attn.v_proj.weight"), kd * h),
                     o: mat(b, &format!("{p}self_attn.o_proj.weight"), h * qd),
+                    qn: if d.qk_norm {
+                        w(
+                            b,
+                            &format!("{p}self_attn.q_norm.weight"),
+                            u64::from(d.head_dim),
+                        )
+                    } else {
+                        TENSOR_NONE
+                    },
+                    kn: if d.qk_norm {
+                        w(
+                            b,
+                            &format!("{p}self_attn.k_norm.weight"),
+                            u64::from(d.head_dim),
+                        )
+                    } else {
+                        TENSOR_NONE
+                    },
                     post_ln: w(b, &format!("{p}post_attention_layernorm.weight"), h),
                     gate: mat(b, &format!("{p}mlp.gate_proj.weight"), i * h),
                     up: mat(b, &format!("{p}mlp.up_proj.weight"), i * h),
@@ -295,7 +318,7 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
 /// reference masks the rest).
 fn d_classes(f: &crate::config::FrameEmbed) -> u32 {
     if f.depth.as_ref().is_some_and(|d| d.breeze) {
-        f.rows
+        f.classes
     } else {
         f.cb_size
     }
@@ -315,7 +338,10 @@ fn program(
     let mut b = Builder::new(n_cu);
     b.adopt_tensors(tensors.to_vec());
     b.force_uniseg();
-    let all: Vec<u32> = (0..n_cu).collect();
+    let units = crate::emit_config::active()
+        .depth_units
+        .map_or(n_cu, |u| u.clamp(1, n_cu));
+    let all: Vec<u32> = (0..units).collect();
     let span = |units: u32| -> Vec<u32> { (0..units.clamp(1, n_cu)).collect() };
     let rset = span(rows);
     let (qd, kd) = (d.heads * d.head_dim, d.kv_heads * d.head_dim);
@@ -370,7 +396,7 @@ fn program(
         })
     };
     let sample_small =
-        |b: &mut Builder, dep: &[u32], logits: u32, vocab: u32, j: u32, penalty: bool| {
+        |b: &mut Builder, dep: &[u32], logits: u32, vocab: u32, j: u32, penalty: bool, min: u32| {
             b.emit(DevOp::SampleSmallF32, rset.clone(), dep, |i| {
                 i.t = [
                     n.frame_dcodes,
@@ -389,7 +415,7 @@ fn program(
                     j,
                     j,
                     bitmap_words(t.classes),
-                    0,
+                    min,
                     0,
                 ];
                 i.j[0] = j * f.cb_size;
@@ -403,6 +429,7 @@ fn program(
             i.i[0] = rows;
             i.i[1] = nout;
             i.i[2] = kin;
+            i.i[7] = if d.bf16_logits { 2048 } else { 0 };
         })
     };
     let g = b.emit(DevOp::RowGather, rset.clone(), &[], |i| {
@@ -415,7 +442,7 @@ fn program(
     });
     let c0 = if d.breeze {
         let bl = gemv_f32(&mut b, &[g], t.blogits, t.xin, n.head, t.classes, c.hidden);
-        sample_small(&mut b, &[bl], t.blogits, t.classes, 0, true)
+        sample_small(&mut b, &[bl], t.blogits, t.classes, 0, true, d.min_frames)
     } else {
         sample(&mut b, &[], n.logits, t.classes, 0, true)
     };
@@ -441,7 +468,11 @@ fn program(
             })];
         }
         if d.breeze {
-            prev = vec![gemv(&mut b, &prev, t.x, t.xin, t.proj, d.hidden, c.hidden)];
+            let g = gemv(&mut b, &prev, t.x, t.xin, t.proj, d.hidden, c.hidden);
+            if t.proj_b != TENSOR_NONE {
+                b.patch(g, |i| i.t[7] = t.proj_b);
+            }
+            prev = vec![g];
         }
         let mut dep = b.emit(DevOp::RmsNorm, rset.clone(), &prev, |i| {
             i.t[0] = t.xn;
@@ -466,7 +497,13 @@ fn program(
                     i.i[..5].copy_from_slice(&[rows, qd, d.hidden, kd, kd]);
                 }),
             };
-            let hnr = |b: &mut Builder, out: u32, x: u32, heads: u32, rope: bool, kv: bool| {
+            let hnr = |b: &mut Builder,
+                       out: u32,
+                       x: u32,
+                       heads: u32,
+                       rope: bool,
+                       kv: bool,
+                       gamma: u32| {
                 b.emit(
                     DevOp::HeadNormRope,
                     span((rows * heads).div_ceil(8)),
@@ -474,6 +511,7 @@ fn program(
                     |i| {
                         i.t[0] = out;
                         i.t[1] = x;
+                        i.t[2] = gamma;
                         if rope {
                             i.t[3] = cos;
                             i.t[4] = sin;
@@ -484,7 +522,7 @@ fn program(
                             heads,
                             d.head_dim,
                             0,
-                            1,
+                            u32::from(gamma == TENSOR_NONE),
                             0,
                             if kv { rows } else { 0 },
                         ]);
@@ -498,9 +536,9 @@ fn program(
                     },
                 )
             };
-            let c_q = hnr(&mut b, t.q, t.qg, d.heads, true, false);
-            let c_k = hnr(&mut b, t.kc[l], t.kg, d.kv_heads, true, true);
-            let c_v = hnr(&mut b, t.vc[l], t.vg, d.kv_heads, false, true);
+            let c_q = hnr(&mut b, t.q, t.qg, d.heads, true, false, w.qn);
+            let c_k = hnr(&mut b, t.kc[l], t.kg, d.kv_heads, true, true, w.kn);
+            let c_v = hnr(&mut b, t.vc[l], t.vg, d.kv_heads, false, true, TENSOR_NONE);
             let c_fa = b.emit(DevOp::FlashDecode, all.clone(), &[c_q, c_k, c_v], |i| {
                 i.t[..6].copy_from_slice(&[
                     t.opart,
@@ -586,7 +624,7 @@ fn program(
                 d_classes(f),
                 d.hidden,
             );
-            code_dep = sample_small(&mut b, &[c_lm], lg, d_classes(f), j, false);
+            code_dep = sample_small(&mut b, &[c_lm], lg, d_classes(f), j, false, 0);
         } else if j > 0 {
             let c_lm = gemv(
                 &mut b,
@@ -627,7 +665,7 @@ pub(crate) fn sections(
         rows: rungs.to_vec(),
         codebooks: f.codebooks,
         semantic_base: f.lo,
-        semantic_tokens: f.rows,
+        semantic_tokens: f.classes,
         stop_class: t.classes - 1,
         ras_window: if t.d.breeze {
             bitmap_words(t.classes)
@@ -642,6 +680,13 @@ pub(crate) fn sections(
         pair_cfg: t.d.breeze,
         depth_sampling: None,
         slot_memory: Vec::new(),
+        packed: Some(manifest::PackedDepth {
+            version: 1,
+            input_vocab: c.vocab,
+            backbone_logits: !t.d.breeze,
+            hidden: h(n.hn),
+            decode_token: f.decode_only.then_some(f.lo),
+        }),
         tensors: manifest::Tensors {
             params: h(t.params),
             top_k: h(t.top_k),
@@ -708,4 +753,89 @@ pub(crate) fn encode(n_cu: u32, tensors: usize, programs: &[Program], rungs: &[u
         .collect();
     plow_asset::aux_program::encode(n_cu, tensors, &views)
         .unwrap_or_else(|e| panic!("depth programs: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projected_depth_heads_honor_logit_precision_at_every_rung() {
+        let dir = std::env::temp_dir().join(format!("plow-depth-heads-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = serde_json::json!({
+            "model_type": "qwen3", "hidden_size": 32, "intermediate_size": 64,
+            "num_hidden_layers": 1, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "head_dim": 8, "vocab_size": 17, "rms_norm_eps": 0.000001,
+            "rope_theta": 10000.0,
+            "plow_frame_embed": {
+                "table": "frame.weight", "codebooks": 16, "codebook_size": 16,
+                "lo": 0, "rows": 17, "classes": 16,
+                "depth": {
+                    "layers": 1, "hidden": 16, "heads": 2, "kv_heads": 1,
+                    "head_dim": 8, "intermediate": 32, "eps": 0.000001,
+                    "rope_theta": 10000.0, "positions": 16, "proj_bias": true,
+                    "min_frames": 2
+                }
+            }
+        });
+        for round in [false, true] {
+            config["plow_frame_embed"]["depth"]["bf16_logits"] = round.into();
+            std::fs::write(
+                dir.join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let c = crate::config::cfg_from(&dir);
+            let mut b = Builder::new(4);
+            let n = crate::declare(
+                &mut b,
+                &c,
+                32,
+                1,
+                false,
+                false,
+                false,
+                false,
+                32,
+                false,
+                0..1,
+                false,
+                false,
+            );
+            let t = n.fish.as_ref().unwrap();
+            let tensors = b.finish().tensors;
+            for rows in [1, 8, 32] {
+                let p = program(&c, &n, t, &tensors, 4, rows, 32);
+                let heads: Vec<_> = p
+                    .insts
+                    .iter()
+                    .filter(|i| i.op == DevOp::GemvF32Out as u16)
+                    .collect();
+                assert_eq!(heads.len(), 16);
+                assert_eq!(heads[0].t[0], t.blogits);
+                assert_eq!(heads[0].t[2], n.head);
+                for (j, head) in heads.iter().enumerate() {
+                    assert_eq!(head.i[0], rows);
+                    assert_eq!(head.i[7], if round { 2048 } else { 0 });
+                    if j > 0 {
+                        assert_eq!(head.t[0], t.dlogits[j - 1]);
+                        assert_eq!(head.t[2], t.heads[j - 1]);
+                    }
+                    assert!(p
+                        .insts
+                        .iter()
+                        .any(|i| { i.op == DevOp::SampleSmallF32 as u16 && i.t[1] == head.t[0] }));
+                }
+                let projections: Vec<_> = p
+                    .insts
+                    .iter()
+                    .filter(|i| i.op == DevOp::Gemv as u16)
+                    .collect();
+                assert!(!projections.is_empty());
+                assert!(projections.iter().all(|i| i.i[7] == 0));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

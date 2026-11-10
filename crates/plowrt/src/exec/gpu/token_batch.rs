@@ -55,8 +55,8 @@ pub(super) struct CudaTokenBatch {
 }
 
 impl CudaTokenBatch {
-    pub(super) fn load(e: &GpuEngine) -> Option<Self> {
-        (!RuntimeConfig::get().fusion
+    pub(super) fn eligible(e: &GpuEngine) -> bool {
+        !RuntimeConfig::get().fusion
             && e.be.compute_capability() == (9, 0)
             && e.packed_prefill.is_some()
             && e.has_packed_terminal()
@@ -66,22 +66,34 @@ impl CudaTokenBatch {
             // prefill attention's request table.
             && (e.recurrent.is_none() || e.recurrent_packs)
             && e.mixed_step.is_none()
-            // Host rows spliced by launch row (overlay) or a decode-only embedding (position
-            // base): the batch embeds decode rows through the prefill program, in its own order.
-            && e.handle_of("in.encoder_overlay").is_none()
+            && ((!e.has_depth_stage() && e.handle_of("in.frame_codes").is_none()
+                && e.handle_of("in.encoder_overlay").is_none()) || e.packed_depth_enabled())
+            // Learned decode positions need a separate embedding contract.
             && e.handle_of("in.pos_base").is_none()
-            // Decode rows ride as one-row requests of the packed prefill attention, which is
-            // qualified only on the hd256/512 attention arms. At hd128 (Veena, H100, c64) its
-            // ticks carried ~77 one-row requests and served 27.1 audio s/s against 33.8 for
-            // packed prefill plus the ordinary decode launch.
-            && e.prefill.iter().all(|b| {
-                b.flash_sites.iter().all(|&pc| matches!(b.h_inst[pc].i[6], 256 | 512))
+    }
+
+    pub(super) fn load(e: &GpuEngine) -> Option<Self> {
+        (Self::eligible(e)
+            && e.prefill.iter().enumerate().all(|(i, b)| {
+                attention_supported(
+                    b.flash_sites.iter().map(|&pc| b.h_inst[pc].i[6]),
+                    e.riders.as_ref().is_some_and(|r| r.serves(i)),
+                )
             }))
         .then(|| Self {
             staging: TokenBatchStaging::with_capacity(e.pf_max_rows(), e.batch),
             fired: false,
         })
     }
+}
+
+fn attention_supported(widths: impl Iterator<Item = u32>, split_attention: bool) -> bool {
+    widths.into_iter().all(|hd| match hd {
+        // hd128 one-row prefill attention regressed serving; require the separate decode route.
+        128 => split_attention,
+        256 | 512 => true,
+        _ => false,
+    })
 }
 
 /// `PLOW_PF_PACKLOG=1`: one `PACKLOG STEP` line per unified token-batch launch. `enq` is the host
@@ -162,7 +174,7 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
-        let r = self.token_batch_step_inner(requests, output, None, None);
+        let r = self.token_batch_step_inner(requests, output, None, None, None);
         self.note_step_result(r.is_err());
         r
     }
@@ -176,7 +188,7 @@ impl GpuEngine {
         output: &mut Vec<(u32, u32)>,
         spec: &dyn Fn(u32, u32) -> Option<DevSample>,
     ) -> Result<()> {
-        let r = self.token_batch_step_inner(requests, output, Some(spec), None);
+        let r = self.token_batch_step_inner(requests, output, Some(spec), None, None);
         self.note_step_result(r.is_err());
         r
     }
@@ -192,7 +204,20 @@ impl GpuEngine {
         spec: Option<&dyn Fn(u32, u32) -> Option<DevSample>>,
         window: &mut dyn FnMut(&mut GpuEngine),
     ) -> Result<()> {
-        let r = self.token_batch_step_inner(requests, output, spec, Some(window));
+        let r = self.token_batch_step_inner(requests, output, spec, Some(window), None);
+        self.note_step_result(r.is_err());
+        r
+    }
+
+    pub fn token_batch_step_staged(
+        &mut self,
+        requests: &[Request<'_>],
+        output: &mut Vec<(u32, u32)>,
+        spec: Option<&dyn Fn(u32, u32) -> Option<DevSample>>,
+        window: &mut dyn FnMut(&mut GpuEngine),
+        prepare: &mut dyn FnMut(&mut GpuEngine, &plow_asset::token_batch::Plan) -> Result<()>,
+    ) -> Result<()> {
+        let r = self.token_batch_step_inner(requests, output, spec, Some(window), Some(prepare));
         self.note_step_result(r.is_err());
         r
     }
@@ -203,6 +228,9 @@ impl GpuEngine {
         output: &mut Vec<(u32, u32)>,
         spec: Option<&dyn Fn(u32, u32) -> Option<DevSample>>,
         mut window: Option<&mut dyn FnMut(&mut GpuEngine)>,
+        mut prepare: Option<
+            &mut dyn FnMut(&mut GpuEngine, &plow_asset::token_batch::Plan) -> Result<()>,
+        >,
     ) -> Result<()> {
         output.clear();
         self.tb_launched = false;
@@ -217,6 +245,13 @@ impl GpuEngine {
             .handle_of(plow_asset::multimodal::TABLE_TENSOR)
             .is_some();
         let result = (|| {
+            if self.has_depth_stage()
+                && (prepare.is_none() || requests.iter().any(|r| r.phase == Phase::Verify))
+            {
+                return Err(RuntimeError::Rejected(
+                    "speech token batch requires staged inputs and no verification spans".into(),
+                ));
+            }
             // A verify span's rejected drafts roll back by frontier only: a recurrent state the
             // scan advanced past them cannot be taken back (`spec_enable` refuses such packets).
             if self.recurrent.is_some() && requests.iter().any(|r| r.phase == Phase::Verify) {
@@ -233,7 +268,7 @@ impl GpuEngine {
                 request.state_slot != request.slot
                     || request.selection != Selection::default()
                     || request.tokens.iter().any(|&token| {
-                        token as usize >= self.vocab
+                        token as usize >= self.token_input_vocab()
                             && !(mm_rows && token & plow_asset::multimodal::ROW_ID_BIT != 0)
                     })
             }) {
@@ -288,6 +323,9 @@ impl GpuEngine {
                         // KV pre-map hint can look one bucket ahead of this chunk.
                         prompt_len: (pending.new_frontier as usize)
                             .max(request.prompt_len as usize),
+                        embedding_token: (request.phase == Phase::Decode)
+                            .then(|| self.depth_embedding_token())
+                            .flatten(),
                     }
                 })
                 .collect();
@@ -395,6 +433,9 @@ impl GpuEngine {
             self.pf_seg_prefix = tail_rows.is_some();
             // Leading decode rows ride as split-attention riders (`riders.rs`); a final prefill
             // chunk of one row is not one, whatever its length.
+            if let Some(prepare) = prepare.as_mut() {
+                prepare(self, plan)?;
+            }
             self.pf_riders = plan
                 .phases
                 .iter()
@@ -535,7 +576,11 @@ impl GpuEngine {
             if self.vmm_prefix_enabled() {
                 for chunk in &chunks {
                     let n = (self.pos[chunk.slot] as usize - chunk.c0).min(chunk.tokens.len());
-                    self.seq_tokens[chunk.slot].extend_from_slice(&chunk.tokens[..n]);
+                    let ids = self.speech_prefix[chunk.slot]
+                        .as_deref()
+                        .and_then(|ids| ids.get(chunk.c0..chunk.c0 + n))
+                        .unwrap_or(&chunk.tokens[..n]);
+                    self.seq_tokens[chunk.slot].extend_from_slice(ids);
                 }
                 for &(slot, prompt_len) in &prefill_members {
                     self.state_capture_publish(slot, prompt_len);
@@ -579,6 +624,8 @@ impl GpuEngine {
             Ok(())
         })();
         if result.is_err() {
+            self.pf_riders = 0;
+            self.pf_seg_prefix = false;
             self.tb_verdicts.truncate(verdicts_before);
             self.spec_hidden_commit(false);
             if body_enqueued {
@@ -630,6 +677,22 @@ impl GpuEngine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hd128_token_batch_requires_split_attention_for_the_whole_bucket() {
+        assert!(!super::attention_supported([128].into_iter(), false));
+        assert!(super::attention_supported([128].into_iter(), true));
+        assert!(!super::attention_supported(
+            [256, 128, 512].into_iter(),
+            false
+        ));
+        assert!(super::attention_supported(
+            [256, 128, 512].into_iter(),
+            true
+        ));
+        assert!(super::attention_supported([256, 512].into_iter(), false));
+        assert!(!super::attention_supported([64, 128].into_iter(), true));
+    }
+
     use super::*;
 
     fn request<'a>(

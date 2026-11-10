@@ -50,8 +50,7 @@ use crate::rope::GenTensor;
 /// Nothing installed means "read the environment", exactly the old behaviour, so a caller
 /// that never configures anything (the packet crate's own tests) is unchanged.
 ///
-/// Field semantics are the old parses verbatim: a `bool` is `== "1"` (`tr_quiet` is
-/// "set at all"); an `Option<String>` is the raw value the site matches on; `mla_pf_v2` is
+/// Field semantics are the old parses verbatim: a `bool` is `== "1"`; an `Option<String>` is the raw value the site matches on; `mla_pf_v2` is
 /// `Some(true)`/`Some(false)` for `"1"`/`"0"` and `None` otherwise.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SegKnobs {
@@ -59,10 +58,8 @@ pub struct SegKnobs {
     /// `PLOW_GQ_ORDER`: unset or anything else = ASAP gate order within segment order,
     /// `"asap"` = ASAP program-wide, `"emit"` = emit order.
     pub gq_order: Option<String>,
-    pub fine_force: bool,
     pub fuse_xr_attnres: bool,
     pub chain_bypass: Option<String>,
-    pub tr_quiet: bool,
     pub uniseg: bool,
     pub mla_pf_v2: Option<bool>,
     pub mla_pf_aiter: bool,
@@ -74,8 +71,6 @@ pub struct SegKnobs {
     pub seg_fa256_gqa2: bool,
     pub seg_v2: Option<String>,
     pub seg_per_op: bool,
-    pub seg_dump: bool,
-    pub place_report: bool,
     pub seg_class_slice: Option<String>,
     pub seg_slice_all: bool,
 }
@@ -87,10 +82,8 @@ impl SegKnobs {
         SegKnobs {
             tune_dump: std::env::var("PLOW_TUNE_DUMP").ok().as_deref() == Some("1"),
             gq_order: std::env::var("PLOW_GQ_ORDER").ok(),
-            fine_force: std::env::var("PLOW_FINE_FORCE").ok().as_deref() == Some("1"),
             fuse_xr_attnres: std::env::var("PLOW_FUSE_XR_ATTNRES").ok().as_deref() == Some("1"),
             chain_bypass: std::env::var("PLOW_CHAIN_BYPASS").ok(),
-            tr_quiet: std::env::var_os("PLOW_TR_QUIET").is_some(),
             uniseg: std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"),
             mla_pf_v2: match std::env::var("PLOW_MLA_PF_V2").ok().as_deref() {
                 Some("0") => Some(false),
@@ -107,8 +100,6 @@ impl SegKnobs {
             seg_fa256_gqa2: std::env::var("PLOW_SEG_FA256_GQA2").ok().as_deref() == Some("1"),
             seg_v2: std::env::var("PLOW_SEG_V2").ok(),
             seg_per_op: std::env::var("PLOW_SEG_PER_OP").ok().as_deref() == Some("1"),
-            seg_dump: std::env::var("PLOW_SEG_DUMP").ok().as_deref() == Some("1"),
-            place_report: std::env::var("PLOW_PLACE_REPORT").ok().as_deref() == Some("1"),
             seg_class_slice: std::env::var("PLOW_SEG_CLASS_SLICE").ok(),
             seg_slice_all: std::env::var("PLOW_SEG_SLICE_ALL").ok().as_deref() == Some("1"),
         }
@@ -288,28 +279,6 @@ impl Dep {
             Dep::Fine { producer, .. } => *producer,
         }
     }
-}
-
-/// Slice-level locality census — see [`Builder::locality_census_stats`].
-#[derive(Clone, Debug)]
-struct LocalityCensus {
-    ops: usize,
-    slices: u64,
-    domains: usize,
-    map_name: &'static str,
-    /// Slice-level producer→consumer pairs in the whole program.
-    pairs: u64,
-    /// Of those, the ones on an edge where the consumer slice reads EVERY producer slice.
-    all_to_all_pairs: u64,
-    /// Same-domain pairs under the emitted mapping (`L2Layout::domain_of`).
-    same_current: u64,
-    /// Same-domain pairs under a greedy predecessor-affinity pass under a balance cap.
-    same_greedy: u64,
-    /// Same-domain pairs if each consumer slice could pick its own best domain with producers
-    /// pinned and balance ignored — an unachievable upper bound, useful as a ceiling.
-    same_ceiling: u64,
-    moved_slices: u64,
-    moved_ops: u64,
 }
 
 /// One op, before flattening.
@@ -1580,26 +1549,12 @@ impl Builder {
         // Downgrade the fine gates in every homogeneous region — they are provably free of
         // benefit there, and they are NOT free of cost (an extra counter per producer slice,
         // an extra atomic per producer, and a wider wait list per consumer).
-        //
-        // SE_FINE straggler-recovery lever (PLOW_FINE_FORCE=1). The `collapse` theorem downgrades
-        // every homogeneous region because per-slice work is MODELLED uniform, so on real hardware
-        // the diffuse-straggler wait (dev.rs "Per-slice gates") is never recovered — the model is
-        // right about the MODEL. This lever overrides that to MEASURE the real-hardware delta. It
-        // keeps a fine edge iff it is genuinely SPARSE (some consumer slice waits on strictly fewer
-        // than all producer slices); an all-to-all "fine" edge (e.g. a GEMV whose column map
-        // collapses to full fan-in under wave-interleaving) is still downgraded, so the test
-        // isolates the recoverable gates (headnorm->flash, flash->merge) and never pays the
-        // 256x256-atomic all-to-all cost the Dep doc warns about. Default (unset) = byte-identical.
-        let force = knobs().fine_force;
-        let blocks: Vec<usize> = self.ops.iter().map(|o| o.cus.len()).collect();
         let (mut kept, mut downgraded) = (0, 0);
         for i in 0..n {
             let r = find(&mut uf, i);
-            let hetero_keep = hetero[r];
+            let keep = hetero[r];
             for d in self.ops[i].deps.iter_mut() {
-                if let Dep::Fine { producer, map } = d {
-                    let sparse = map.iter().any(|s| s.len() < blocks[*producer as usize]);
-                    let keep = hetero_keep || (force && sparse);
+                if let Dep::Fine { producer, .. } = d {
                     if keep {
                         kept += 1;
                     } else {
@@ -1610,197 +1565,6 @@ impl Builder {
             }
         }
         (kept, downgraded)
-    }
-
-    /// Slice-level locality census (`PLOW_PLACE_REPORT=1`). Diagnostic; changes nothing.
-    ///
-    /// **The question a locality-aware placement pass has to answer before it is written.**
-    /// A same-domain placement can only pay where a consumer slice's producer set is SPARSE. If
-    /// a consumer slice reads EVERY producer slice — which is what a surviving `Dep::Coarse`
-    /// means, and what a reduction like a GEMV reading the whole activation vector *is* — then
-    /// its reads are spread across every domain by construction, and no assignment beats the
-    /// uniform `1/domains`. Concentrating the producer instead just moves the imbalance.
-    ///
-    /// Run after `select_granularity`, so the fine/coarse decisions are the final ones.
-    ///
-    /// Reported:
-    /// * the slice-pair census split by all-to-all vs sparse edges — **placement-independent**,
-    ///   so it bounds every possible pass, not just the one simulated here;
-    /// * same-domain pairs under the CURRENT mapping (`L2Layout::domain_of(cus[slice])`);
-    /// * same-domain pairs under a greedy predecessor-affinity pass — `passes.rs`'s
-    ///   `pred_locality_hint` rule (majority domain over already-placed predecessors), under the
-    ///   balance cap every dispatcher is subject to (`ceil(slices/domains)` per domain, because
-    ///   each XCD runs its own fixed share of the grid and an unbalanced pass idles hardware);
-    /// * how many slices and ops that pass MOVES.
-    fn locality_census(&self, l2: Option<L2Layout>) {
-        let c = self.locality_census_stats(l2);
-        let pairs = c.pairs;
-        let pct = |x: u64| {
-            if pairs == 0 {
-                0.0
-            } else {
-                100.0 * x as f64 / pairs as f64
-            }
-        };
-        eprintln!(
-            "  locality census ({} ops, {} slices, {} domains, map {}):",
-            c.ops, c.slices, c.domains, c.map_name
-        );
-        eprintln!(
-            "    slice-level producer->consumer pairs: {pairs}  \
-             ({:.1}% on ALL-TO-ALL edges, where 1/{} = {:.1}% is the ceiling for ANY placement)",
-            pct(c.all_to_all_pairs),
-            c.domains,
-            100.0 / c.domains as f64
-        );
-        eprintln!(
-            "    same-domain pairs: current {:.2}%  |  greedy pred-affinity {:.2}%  |  \
-             per-slice argmax ceiling {:.2}% (producers pinned as-is, balance ignored)",
-            pct(c.same_current),
-            pct(c.same_greedy),
-            pct(c.same_ceiling)
-        );
-        eprintln!(
-            "    greedy moves {}/{} slices in {}/{} ops",
-            c.moved_slices, c.slices, c.moved_ops, c.ops
-        );
-    }
-
-    /// The numbers behind [`Builder::locality_census`]. Split out so the invariant the census
-    /// exists to expose is a unit test rather than a line of stderr.
-    fn locality_census_stats(&self, l2: Option<L2Layout>) -> LocalityCensus {
-        let layout = l2.unwrap_or(L2Layout {
-            sms: 32,
-            domains: 8,
-            map: L2Map::RoundRobin,
-        });
-        let dc = layout.domains.max(1) as usize;
-        let n = self.ops.len();
-
-        // Current per-slice domain — what `finish` writes into `StreamEnt::seg`.
-        let cur: Vec<Vec<usize>> = self
-            .ops
-            .iter()
-            .map(|o| {
-                o.cus
-                    .iter()
-                    .map(|&c| layout.domain_of(c) as usize)
-                    .collect()
-            })
-            .collect();
-
-        // Greedy predecessor-affinity, ops in emission order (which is topological).
-        let mut greedy: Vec<Vec<usize>> = Vec::with_capacity(n);
-        for op in &self.ops {
-            let ns = op.cus.len();
-            let cap = ns.div_ceil(dc);
-            let mut load = vec![0usize; dc];
-            let mut asg = vec![0usize; ns];
-            let mut pref: Vec<Vec<u32>> = Vec::with_capacity(ns);
-            for s in 0..ns {
-                let mut counts = vec![0u32; dc];
-                for dep in &op.deps {
-                    let p = dep.producer() as usize;
-                    match dep {
-                        Dep::Coarse(_) => {
-                            for &d in &greedy[p] {
-                                counts[d] += 1;
-                            }
-                        }
-                        Dep::Fine { map, .. } => {
-                            for &ps in &map[s] {
-                                counts[greedy[p][ps as usize]] += 1;
-                            }
-                        }
-                    }
-                }
-                pref.push(counts);
-            }
-            // Strongest preference first, so a slice that really wants one domain claims it
-            // before the cap fills with slices that were indifferent anyway.
-            let mut order: Vec<usize> = (0..ns).collect();
-            order.sort_by_key(|&s| {
-                let c = &pref[s];
-                let mx = c.iter().copied().max().unwrap_or(0) as u64;
-                let tot: u64 = c.iter().map(|&x| x as u64).sum();
-                (
-                    std::cmp::Reverse(mx * dc as u64 - tot.min(mx * dc as u64)),
-                    s,
-                )
-            });
-            for s in order {
-                let c = &pref[s];
-                let best = (0..dc)
-                    .filter(|&d| load[d] < cap)
-                    .max_by_key(|&d| (c[d], std::cmp::Reverse(d)))
-                    .unwrap_or(0);
-                asg[s] = best;
-                load[best] += 1;
-            }
-            greedy.push(asg);
-        }
-
-        let (mut pairs, mut a2a) = (0u64, 0u64);
-        let (mut same_cur, mut same_greedy, mut ceil_pairs) = (0u64, 0u64, 0u64);
-        let (mut moved_slices, mut moved_ops, mut slices) = (0u64, 0u64, 0u64);
-        for (i, op) in self.ops.iter().enumerate() {
-            slices += op.cus.len() as u64;
-            let mut op_moved = false;
-            for s in 0..op.cus.len() {
-                if greedy[i][s] != cur[i][s] {
-                    moved_slices += 1;
-                    op_moved = true;
-                }
-                // Best a consumer slice could do with its producers held where they are.
-                let mut by_dom = vec![0u64; dc];
-                for dep in &op.deps {
-                    let p = dep.producer() as usize;
-                    let pn = self.ops[p].cus.len();
-                    let sparse = match dep {
-                        Dep::Coarse(_) => false,
-                        Dep::Fine { map, .. } => map[s].len() < pn,
-                    };
-                    let plist: Vec<u32> = match dep {
-                        Dep::Coarse(_) => (0..pn as u32).collect(),
-                        Dep::Fine { map, .. } => map[s].clone(),
-                    };
-                    pairs += plist.len() as u64;
-                    if !sparse {
-                        a2a += plist.len() as u64;
-                    }
-                    for &ps in &plist {
-                        by_dom[cur[p][ps as usize]] += 1;
-                        if cur[p][ps as usize] == cur[i][s] {
-                            same_cur += 1;
-                        }
-                        if greedy[p][ps as usize] == greedy[i][s] {
-                            same_greedy += 1;
-                        }
-                    }
-                }
-                ceil_pairs += by_dom.iter().copied().max().unwrap_or(0);
-            }
-            if op_moved {
-                moved_ops += 1;
-            }
-        }
-
-        LocalityCensus {
-            ops: n,
-            slices,
-            domains: dc,
-            map_name: match layout.map {
-                L2Map::Block => "block",
-                L2Map::RoundRobin => "round-robin",
-            },
-            pairs,
-            all_to_all_pairs: a2a,
-            same_current: same_cur,
-            same_greedy,
-            same_ceiling: ceil_pairs,
-            moved_slices,
-            moved_ops,
-        }
     }
 
     /// Flatten into the tables the interpreter walks.
@@ -2528,7 +2292,7 @@ impl Builder {
                 dup += before - op.deps.len();
             }
             self.tr_dropped = dropped;
-            if (dropped > 0 || dup > dropped) && !knobs.tr_quiet {
+            if dropped > 0 || dup > dropped {
                 eprintln!(
                     "  counter-graph reduction: {} of {} distinct coarse edges implied by a path, \
                      {} duplicate waits; {} wait entries removed",
@@ -3062,45 +2826,6 @@ impl Builder {
             }
         }
 
-        // PLOW_SEG_DUMP=1: report the segmentation this program actually got.
-        //
-        // The wave class is decided here, re-derived independently by the host (`exec/amd.rs`
-        // `derive_segments`), and never written to the build manifest — so "what occupancy does
-        // this model launch at?" was answerable only by reading two files and simulating the loop
-        // in one's head. It is also the field whose corruption produces the all-zero-logits
-        // failure described directly below, which is the strongest argument for being able to
-        // print it. Diagnostic only: no packet bytes depend on this.
-        if !seg_per_op && knobs.seg_dump {
-            let mut counts: Vec<(u8, usize)> = Vec::new();
-            for i in 0..self.ops.len() {
-                let cls = wave_class(i); // signature changed to index-based (T24/T37 classing)
-                match counts.last_mut() {
-                    Some((c, n)) if *c == cls && seg_of[i] == seg_of[i.saturating_sub(1)] => {
-                        *n += 1
-                    }
-                    _ => counts.push((cls, 1)),
-                }
-            }
-            let summary: Vec<String> = counts
-                .iter()
-                .enumerate()
-                .map(|(s, (cls, n))| format!("seg{s}={cls}w x{n}"))
-                .collect();
-            eprintln!(
-                "  wave-class segments: {} segment(s) over {} ops -- {}",
-                cur_seg as usize + 1,
-                self.ops.len(),
-                summary.join(", ")
-            );
-        }
-
-        // Locality census (`PLOW_PLACE_REPORT=1`). Diagnostic only — reads the op DAG, writes
-        // nothing. Answers the question a locality-aware placement pass has to answer FIRST:
-        // how much of this program's slice-level dataflow could same-domain placement capture?
-        if knobs.place_report {
-            self.locality_census(l2_place);
-        }
-
         // SEGMENT-CLASS RE-SLICING (PLOW_SEG_CLASS_SLICE=1, T10). occ-2 makes 2 blocks/SM
         // resident = 2*n_cu resident blocks. A GEMM-class (wave-class-8) segment's
         // machine-filling ops must be sliced to 2*n_cu so BOTH resident blocks per SM get
@@ -3591,7 +3316,7 @@ impl Builder {
 ///
 /// # Why it is DERIVED from the entries rather than from the wave-class shape
 ///
-/// Under L2-domain placement (`PLOW_NV_PLACE`) `seg` is `cu / sms` — a per-slice
+/// Under L2-domain placement (`PLOW_L2_PLACE`) `seg` is `cu / sms` — a per-slice
 /// L2 domain, not a wave class — so every entry in one CU's stream carries the
 /// SAME `seg`. Windowing stays correct (one full run, empty windows elsewhere)
 /// only because this reads the entries. Deriving it from "one segment per
@@ -5162,101 +4887,6 @@ mod whole_graph_fusion_tests {
             .iter()
             .filter(|e| e.seg == seg(1))
             .all(|e| e.inst == 1));
-    }
-}
-
-#[cfg(test)]
-mod locality_census_tests {
-    use super::*;
-
-    const D: u32 = 8;
-    const LAYOUT: L2Layout = L2Layout {
-        sms: 32,
-        domains: D,
-        map: L2Map::RoundRobin,
-    };
-
-    /// A chain of full-width ops joined by COARSE edges — the shape every dense decode and
-    /// prefill program collapses to, because `select_granularity` downgrades a homogeneous
-    /// region's fine edges (`CounterGranularity.collapse`) and a downgraded edge is all-to-all.
-    fn coarse_chain(n_cu: u32, len: usize) -> Builder {
-        let mut b = Builder::new(n_cu);
-        let all: Vec<u32> = (0..n_cu).collect();
-        let mut prev = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
-        for _ in 1..len {
-            prev = b.emit(DevOp::Nop, all.clone(), &[prev], |_| {});
-        }
-        b
-    }
-
-    /// **The result that kills the lever.** On an all-to-all edge a consumer slice reads every
-    /// producer slice, so its reads are spread over the producer's domains by construction: under
-    /// ANY assignment that keeps the producer balanced, exactly `1/domains` of the pairs are
-    /// same-domain. The emitted mapping already sits on that number, so a predecessor-affinity
-    /// pass has nothing to add — it can only move slices around, which is what it does.
-    #[test]
-    fn an_all_to_all_edge_pins_same_domain_locality_at_one_over_domains() {
-        let c = coarse_chain(256, 6).locality_census_stats(Some(LAYOUT));
-        assert_eq!(c.pairs, c.all_to_all_pairs, "coarse edges are all-to-all");
-        assert!(c.pairs > 0);
-        let want = c.pairs / D as u64;
-        assert_eq!(c.same_current, want, "emitted mapping = 1/{D} of pairs");
-        assert_eq!(
-            c.same_greedy, want,
-            "greedy pred-affinity = the same 1/{D}, exactly"
-        );
-        assert_eq!(
-            c.same_ceiling, want,
-            "even the balance-free per-slice argmax cannot beat it"
-        );
-    }
-
-    /// And it is not that the greedy pass is a no-op: it relocates most of the program and still
-    /// gains nothing. That is the diff worth reporting — large in placement, zero in locality.
-    #[test]
-    fn the_greedy_pass_moves_most_slices_and_buys_nothing() {
-        let c = coarse_chain(256, 6).locality_census_stats(Some(LAYOUT));
-        assert!(
-            c.moved_slices * 2 > c.slices,
-            "greedy moved {}/{} slices — expected a majority",
-            c.moved_slices,
-            c.slices
-        );
-        assert_eq!(
-            c.same_greedy, c.same_current,
-            "…and changed the locality by zero"
-        );
-    }
-
-    /// A SPARSE edge is the only place placement can pay: give each consumer slice exactly one
-    /// producer slice and the greedy pass reaches 100%, well past the `1/domains` floor. This is
-    /// the control that proves the census measures something real — without it the two tests
-    /// above would also pass on a census that always returned `1/domains`.
-    #[test]
-    fn a_sparse_edge_is_where_placement_can_actually_pay() {
-        let n_cu = 256u32;
-        let mut b = Builder::new(n_cu);
-        let all: Vec<u32> = (0..n_cu).collect();
-        let p = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
-        // Slice s reads producer slice s, and the work is non-uniform so `select_granularity`
-        // keeps the fine edge (`hetero_can_win`) instead of collapsing it.
-        let map: Vec<Vec<u32>> = (0..n_cu).map(|s| vec![s]).collect();
-        let work: Vec<u32> = (0..n_cu).map(|s| 1 + s).collect();
-        b.emit_dep_work(
-            DevOp::Nop,
-            all,
-            vec![Dep::Fine { producer: p, map }],
-            work,
-            |_| {},
-        );
-        b.select_granularity();
-        let c = b.locality_census_stats(Some(LAYOUT));
-        assert_eq!(c.all_to_all_pairs, 0, "a 1:1 map is sparse");
-        assert_eq!(
-            c.same_current, c.pairs,
-            "slice s and slice s are the same workgroup index"
-        );
-        assert_eq!(c.same_greedy, c.pairs, "greedy holds it");
     }
 }
 

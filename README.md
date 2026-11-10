@@ -132,7 +132,7 @@ See the [build guide](docs/BUILD.md) for Nix packages and release builds.
 | [Text to speech](docs/runtime/tts.md) | Speech generation |
 | [CPU execution](docs/runtime/cpu.md) | CPU setup and tuning |
 | [Architecture](docs/arch/00-overview.md) | Compiler, packets, scheduling, and runtime |
-| [Model bring-up](docs/bringup/00-overview.md) | Add and validate a model |
+| [Model bring-up](docs/bringup/README.md) | Add and validate a model |
 
 ## Contributing
 

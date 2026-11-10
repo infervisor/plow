@@ -22,7 +22,8 @@ use std::io::Read;
 use std::path::Path;
 
 use plow_asset::dist::{
-    Build, Bundle, Delta, Measured, ModelIndex, ObjSet, Status, Variant, INDEX_SCHEMA,
+    Build, Bundle, Delta, Measured, ModelIndex, ObjSet, Status, Variant, HOST_EXECUTOR,
+    INDEX_SCHEMA,
 };
 
 use super::sign::{SecretKey, Trust};
@@ -175,6 +176,9 @@ fn inventory(bundle: &Bundle, objset: Option<&ObjSet>) -> BTreeMap<String, u64> 
     for c in &bundle.checkpoint.files {
         inv.insert(c.sha256.clone(), c.bytes);
     }
+    for v in &bundle.checkpoint.views {
+        inv.extend(super::view::blobs(v));
+    }
     inv
 }
 
@@ -184,6 +188,7 @@ fn source_path(
     bundle: &Bundle,
     objset: Option<&ObjSet>,
     src: &Sources<'_>,
+    staging: &Path,
 ) -> Result<std::path::PathBuf> {
     if let Some(f) = bundle.files.iter().find(|f| f.sha256 == digest) {
         return Ok(src.assets.join(&f.name));
@@ -203,6 +208,17 @@ fn source_path(
             ))
         })?;
         return Ok(dir.join(&c.name));
+    }
+    // A view's blob is cut from the prepared checkpoint the build bound, `<assets>/<view dir>`.
+    if let Some(v) = bundle
+        .checkpoint
+        .views
+        .iter()
+        .find(|v| super::view::blobs(v).iter().any(|(d, _)| d == digest))
+    {
+        let out = staging.join(format!("{digest}.view"));
+        super::view::write_blob(v, &src.assets.join(&v.dir), digest, &out)?;
+        return Ok(out);
     }
     Err(dist(format!("no source file for blob {digest}")))
 }
@@ -566,10 +582,10 @@ pub fn push(
                     .as_ref()
                     .map(|p| inventory(p, prior_objset.as_ref()))
                     .unwrap_or_default();
-                let packet_changed = bundle
-                    .files
-                    .iter()
-                    .any(|f| f.role == "packet" && !prior_inv.contains_key(&f.sha256));
+                let packet_changed = bundle.files.iter().any(|f| {
+                    matches!(f.role.as_str(), "packet" | "sub_packet")
+                        && !prior_inv.contains_key(&f.sha256)
+                });
                 (
                     Some(prev.variant_id.clone()),
                     Some(if packet_changed {
@@ -614,8 +630,11 @@ pub fn push(
         let uploaded = (|| -> Result<(usize, u64)> {
             let (mut n, mut bytes) = (0usize, 0u64);
             for (d, len) in &missing {
-                let path = source_path(d, &bundle, objset.as_ref(), src)?;
+                let path = source_path(d, &bundle, objset.as_ref(), src, &staging)?;
                 let (staged, staged_len, compressed) = stage_blob(&path, d, **len, &staging)?;
+                if path.starts_with(&staging) && path != staged {
+                    let _ = std::fs::remove_file(&path);
+                }
                 let key = if compressed {
                     format!("v1/blobs/sha256/{d}.zst")
                 } else {
@@ -742,6 +761,7 @@ pub fn push(
                     .map(|o| o.objset_id.clone())
                     .unwrap_or_default(),
                 pairing_hash: bundle.pairing_hash.clone(),
+                executor: bundle.host_executed().then(|| HOST_EXECUTOR.to_string()),
             },
             manifest: manifest_rel.clone(),
             sha256: Digest::of(&bundle_bytes).as_str().to_string(),

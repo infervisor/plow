@@ -126,6 +126,67 @@ pub fn build(
             bundle.checkpoint.revision
         )));
     }
+    if bundle.checkpoint.views.is_empty() {
+        let farm = build_farm(store_root, bundle, bundle_dir, snapshot)?;
+        link(&farm.dir, &bundle_dir.join("checkpoint"))?;
+        return Ok(farm);
+    }
+    // The packets bound checkpoints the recipe's prep built: each is rebuilt from the snapshot
+    // and the bundle's blobs, and replaces the snapshot for its bundle (or sub-bundle).
+    let store = super::Store::open(store_root)?;
+    let mut root = None;
+    for v in &bundle.checkpoint.views {
+        let dir = super::view::materialize(&store, bundle, v, snapshot)?;
+        let sub = bundle_dir.join(&v.dir);
+        let parent = sub.parent().unwrap_or(bundle_dir);
+        std::fs::create_dir_all(parent).map_err(|source| RuntimeError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        if v.dir == "checkpoint" {
+            root = Some(dir.clone());
+        } else {
+            // What plowc copied beside a sub-bundle's packet from the checkpoint it bound.
+            let tok = parent.join("tokenizer.json");
+            if !tok.exists() && dir.join("tokenizer.json").is_file() {
+                link(&dir.join("tokenizer.json"), &tok)?;
+            }
+        }
+        link(&dir, &sub)?;
+    }
+    let farm = match root {
+        Some(dir) => {
+            link_tokenizer(bundle, bundle_dir, &dir, None)?;
+            let shards = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+                        .count()
+                })
+                .unwrap_or(0);
+            Farm {
+                dir,
+                shards,
+                derived: None,
+            }
+        }
+        None => {
+            let farm = build_farm(store_root, bundle, bundle_dir, snapshot)?;
+            link(&farm.dir, &bundle_dir.join("checkpoint"))?;
+            farm
+        }
+    };
+    Ok(farm)
+}
+
+/// The snapshot's farm: every snapshot entry linked, the bundle's derived sidecar after the
+/// shards, and the tokenizer whichever side owns it. The caller links it in as `checkpoint`.
+fn build_farm(
+    store_root: &Path,
+    bundle: &Bundle,
+    bundle_dir: &Path,
+    snapshot: &Path,
+) -> Result<Farm> {
     let dir = farm_path(store_root, bundle);
     let bundles = store_root.join("bundles");
     // The farm passed as its own snapshot (a second variant of this checkpoint finds the farm
@@ -191,11 +252,19 @@ pub fn build(
         link(src, &dir.join(name))?;
     }
 
-    for f in SIDECAR_FILES {
-        let src = snapshot.join(f);
-        if src.is_file() {
-            link(&src, &dir.join(f))?;
+    // Every other snapshot entry: the gated build served from the whole snapshot, and the serve
+    // contract reads more of it than any fixed list names (`chat_template.json`,
+    // `preprocessor_config.json`, `vocab.json`, ...).
+    let rd = std::fs::read_dir(snapshot).map_err(|source| RuntimeError::Io {
+        path: snapshot.to_path_buf(),
+        source,
+    })?;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".safetensors") || name.starts_with('.') {
+            continue;
         }
+        link(&e.path(), &dir.join(&name))?;
     }
 
     // The derived sidecar is a compiled asset and travels in the bundle; it must
@@ -223,9 +292,36 @@ pub fn build(
         }
     }
 
-    // The tokenizer: a real file either way, because the AMD and CPU engines
-    // refuse a byte-fallback tokenizer and that refusal is what stands between a
-    // mispackaged bundle and fluent wrong output.
+    link_tokenizer(bundle, bundle_dir, snapshot, Some(&dir))?;
+
+    // The engines resolve weights as `<assets>/checkpoint` unless
+    // `--rt-checkpoint` overrides it (`main.rs`, `serve/manager.rs`), so the
+    // farm has to be reachable under that name from inside the bundle.
+    // Without this link `load` reports success and `serve` then fails with a
+    // bare NotFound on a path the operator never chose.
+    Ok(Farm {
+        dir,
+        shards,
+        derived,
+    })
+}
+
+/// The tokenizer: a real file either way, because the AMD and CPU engines
+/// refuse a byte-fallback tokenizer and that refusal is what stands between a
+/// mispackaged bundle and fluent wrong output. `source` is the checkpoint the
+/// packets bound (the snapshot, or the bundle's view of it); `farm` the farm to
+/// link it into, `None` for a view, which already holds what the packets bound.
+fn link_tokenizer(
+    bundle: &Bundle,
+    bundle_dir: &Path,
+    source: &Path,
+    farm: Option<&Path>,
+) -> Result<()> {
+    let snapshot = source;
+    let into_farm = |src: &Path, name: &str| match farm {
+        Some(dir) => link(src, &dir.join(name)),
+        None => Ok(()),
+    };
     let tok = &bundle.tokenizer;
     match tok.source {
         Provenance::Derived => {
@@ -236,7 +332,7 @@ pub fn build(
                     tok.file
                 )));
             }
-            link(&src, &dir.join(&tok.file))?;
+            into_farm(&src, &tok.file)?;
         }
         Provenance::Checkpoint => {
             let src = snapshot.join(&tok.file);
@@ -248,7 +344,7 @@ pub fn build(
             let qwen2 = ["vocab.json", "merges.txt", "tokenizer_config.json"];
             if !src.is_file() && qwen2.iter().all(|f| snapshot.join(f).is_file()) {
                 for f in &qwen2[..2] {
-                    link(&snapshot.join(f), &dir.join(f))?;
+                    into_farm(&snapshot.join(f), f)?;
                     link(&snapshot.join(f), &bundle_dir.join(f))?;
                 }
             } else {
@@ -263,7 +359,7 @@ pub fn build(
                     snapshot.display()
                 )));
                 }
-                link(&src, &dir.join(&tok.file))?;
+                into_farm(&src, &tok.file)?;
                 // The runtime reads the tokenizer from the ASSETS dir, so the
                 // bundle needs it too.
                 link(&src, &bundle_dir.join(&tok.file))?;
@@ -277,18 +373,7 @@ pub fn build(
         }
     }
 
-    // The engines resolve weights as `<assets>/checkpoint` unless
-    // `--rt-checkpoint` overrides it (`main.rs`, `serve/manager.rs`), so the
-    // farm has to be reachable under that name from inside the bundle.
-    // Without this link `load` reports success and `serve` then fails with a
-    // bare NotFound on a path the operator never chose.
-    link(&dir, &bundle_dir.join("checkpoint"))?;
-
-    Ok(Farm {
-        dir,
-        shards,
-        derived,
-    })
+    Ok(())
 }
 
 #[cfg(test)]

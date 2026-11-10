@@ -237,7 +237,8 @@ def prepare_block_bench(a: argparse.Namespace) -> dict:
                   cell=cell, commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")),
                   command=command, env=env, packet_sha256=sha(assets / "model.pkt"),
                   runtime_sha256=sha(private),
-                  objects={p.name: sha(p) for p in sorted((out / "objects").iterdir()) if p.is_file()},
+                  objects={str(p.relative_to(out / "objects")): sha(p)
+                           for p in sorted((out / "objects").rglob("*")) if p.is_file()},
                   inputs={p.name: sha(p) for p in sorted((out / "inputs").iterdir()) if p.is_file()})
     # The queue exports visibility inside gpulease; never capture a parent's GPU mask.
     wrapper = out / "run.sh"
@@ -255,7 +256,7 @@ def cmd_block_bench(a: argparse.Namespace) -> None:
     out = Path(a.out).resolve()
     cell = record["cell"]
     submitted = subprocess.run([sys.executable, str(REPO / "scripts/bench/gpuq.py"),
-                               "--root", str(Path(a.queue).resolve()), "submit", cell["name"],
+                               "--vendor", "amd", "--root", str(Path(a.queue).resolve()), "submit", cell["name"],
                                str(cell["n_gpu"]), "bash", str(out / "run.sh")], check=True, capture_output=True, text=True)
     record.update(queue=str(Path(a.queue).resolve()), job=submitted.stdout.strip())
     (out / "run-record.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -305,7 +306,7 @@ def cmd_block_ab(a: argparse.Namespace) -> None:
         score_command.append("--require-bitwise")
     lines += [shlex.join(score_command)]
     wrapper.write_text("\n".join(lines) + "\n")
-    command = [sys.executable, str(REPO / "scripts/bench/gpuq.py"), "--root", a.queue,
+    command = [sys.executable, str(REPO / "scripts/bench/gpuq.py"), "--vendor", "amd", "--root", a.queue,
                "submit", arms["ctl"]["cell"]["name"] + "-ab", str(arms["ctl"]["cell"]["n_gpu"]),
                "bash", str(REPO / "scripts/bench/quietx.sh"), str(Path(a.quiet_lock).resolve()),
                "bash", str(wrapper)]
@@ -459,7 +460,8 @@ def cmd_serve_bench(a: argparse.Namespace) -> None:
                   image=image, env=env, reference_env=reference_env, contexts=in_lens, concurrencies=concs, prompts=prompts,
                   output_len=output_len, raw_index_sha256=sha(raw / "model.safetensors.index.json"),
                   runtime_sha256=sha(out / "plowrt"), packet_sha256=sha(out / "assets/model.pkt"),
-                  objects={p.name: sha(p) for p in sorted((out / "objects").iterdir()) if p.is_file()},
+                  objects={str(p.relative_to(out / "objects")): sha(p)
+                           for p in sorted((out / "objects").rglob("*")) if p.is_file()},
                   status="prepared", numerics_qualified=False, precision_qualified=False,
                   comparison_scope="diagnostic; per-operation dtype parity and numerics not qualified")
     manifest = out / "assets/build.json"
@@ -881,7 +883,7 @@ def store_cell(r: dict) -> str:
 
 def lean_qualify(assets: Path, report: Path, strict: bool) -> bool:
     """`plowc qualify` over a bundle's packets (receipts, approved verifier, replay, media
-    geometry; docs/bringup/lean-correctness-inventory.md §9-10), written to `report`. Recorded,
+    geometry; docs/bringup/03-lean-verify.md "Qualification"), written to `report`. Recorded,
     not fatal, unless `strict`; a missing plowc or verifier is recorded as not checked."""
     plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
     if not plowc.exists():
@@ -1720,7 +1722,7 @@ def cmd_rung_sweep(a: argparse.Namespace) -> None:
 #                     stay within vLLM's distance to FP32. `reference` (ref.json), then `vllm_capture` (cached)
 #                     or `vllm_hf` [+ `vllm_args`, `vllm_python`] to capture vLLM in the same lease:
 #                     kl_ratio_max, kl_slack_max, kl_trim_frac, kl_over_at, kl_over_slack, top1_drop_max,
-#                     cont_drop_max, needle_drop_max, needle_min, tie_margin (docs/bringup/agent-tools.md §5).
+#                     cont_drop_max, needle_drop_max, needle_min, tie_margin (docs/bringup/agent-tools.md "Gates").
 #                     `concurrency` = 1 or a list such as [1, 8, 32]: every concurrency is captured
 #                     (plow-c<N>.json) and must pass against the peer at the same concurrency —
 #                     `vllm_capture` is then a table { c1 = "...", c8 = "...", c32 = "..." } (a string

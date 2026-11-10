@@ -53,6 +53,15 @@ pub struct SpeechProfile {
     pub text_encoder: Option<&'static str>,
     /// Voice cloning through the reference encoder packet.
     pub clone: Option<CloneLayout>,
+    /// Every row is a text token plus a codec frame (`plow_asset::dual_stream`, read from
+    /// [`DUAL_STREAM`] beside the checkpoint): its voices and languages replace the profile's.
+    pub dual_stream: bool,
+    /// Streaming-output policy: leading samples quieter than `.0` dBFS before the first audible
+    /// frame are not streamed, at most `.1` ms (`stream.onset_trim_*`).
+    pub onset_trim: Option<(f32, u64)>,
+    /// New frames a stream's first stateful codec step waits for (`stream.first_frames`; 0:
+    /// undeclared, one frame).
+    pub stream_first_frames: u64,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -95,6 +104,9 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     clone: None,
     languages: &[],
     segment_frames: 0,
+    dual_stream: false,
+    onset_trim: None,
+    stream_first_frames: 0,
 };
 
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
@@ -128,6 +140,9 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     clone: None,
     languages: &[],
     segment_frames: 0,
+    dual_stream: false,
+    onset_trim: None,
+    stream_first_frames: 0,
 };
 
 /// fishaudio/s2-pro (fish-speech `inference.py`, no reference): system "convert the provided text
@@ -173,6 +188,9 @@ pub const FISH: SpeechProfile = SpeechProfile {
     }),
     languages: &[],
     segment_frames: 0,
+    dual_stream: false,
+    onset_trim: None,
+    stream_first_frames: 0,
 };
 
 /// BreezeBlue/Breeze-TTS-2 (`breeze_infer/templates.py`): each text segment `<bos>[S0]text` (voice
@@ -214,6 +232,9 @@ pub const BREEZE: SpeechProfile = SpeechProfile {
     }),
     languages: &[],
     segment_frames: 0,
+    dual_stream: false,
+    onset_trim: None,
+    stream_first_frames: 0,
 };
 
 /// maya-research/maya2-native (`maya3` prompt.py, engine.py): `<|lang:xx|>`, `{Name}: ` (the plain
@@ -278,7 +299,50 @@ pub const MAYA2: SpeechProfile = SpeechProfile {
         "en", "as", "bn", "gu", "hi", "kn", "ml", "mr", "or", "pa", "ta", "te",
     ],
     segment_frames: 250,
+    dual_stream: false,
+    onset_trim: None,
+    stream_first_frames: 0,
 };
+
+/// Qwen/Qwen3-TTS-12Hz-*-CustomVoice (`qwen_tts` `generate`, `scripts/tts/qwen3_tts_prep.py`): a
+/// Qwen3 talker whose rows are text plus codec frames; cb0 class 2048 = codec EOS 2150 (the other
+/// control rows suppressed), at least 2 frames; a 5-layer code predictor samples codebooks 1..15.
+/// Talker and predictor: T 0.9, top-k 50, top-p 1; repetition penalty 1.05 on cb0.
+pub const QWEN3_TTS: SpeechProfile = SpeechProfile {
+    prompt_template: "{input}",
+    voice_token: "{voice}",
+    voices: &[],
+    prefix: &[],
+    suffix: &[],
+    stops: &[2048],
+    sample_rate: 24000,
+    frame_codes: 16,
+    codebook: 2048,
+    frame_samples: 1920,
+    audio_token_base: 0,
+    // As Breeze: ~2.8 frames per Mandarin character, ~0.8 per English one.
+    per_char_frames: 3.2,
+    max_new_tokens_cap: 1500,
+    temperature: 0.9,
+    top_p: 1.0,
+    repetition_penalty: 1.05,
+    top_k: 50,
+    depth: true,
+    depth_sampler: 1,
+    instructions: None,
+    text_encoder: None,
+    clone: None,
+    languages: &[],
+    segment_frames: 0,
+    dual_stream: true,
+    // The model opens every reply with ~70 ms below -45 dBFS (the tts-bench onset level).
+    onset_trim: Some((-45.0, 500)),
+    // That trim drops the first frame, so the first audible chunk needs two.
+    stream_first_frames: 2,
+};
+
+/// `dual_stream.json` beside a dual-stream checkpoint (`plow_asset::dual_stream::DualStream`).
+pub const DUAL_STREAM: &str = "dual_stream.json";
 
 /// `maya2_controller.json` beside a Maya 2 checkpoint (`scripts/tts/maya2_prep.py`): the cb0
 /// controller, guard constants and per-language frame / duration priors.
@@ -390,8 +454,9 @@ pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
         "fish" => Ok(&FISH),
         "breeze" => Ok(&BREEZE),
         "maya2" => Ok(&MAYA2),
+        "qwen3_tts" => Ok(&QWEN3_TTS),
         other => Err(format!(
-            "unknown tts profile {other:?} (known: veena, orpheus, fish, breeze, maya2)"
+            "unknown tts profile {other:?} (known: veena, orpheus, fish, breeze, maya2, qwen3_tts)"
         )),
     }
 }
@@ -440,6 +505,76 @@ pub fn speech_pipeline_section(
         serde_json::from_str::<serde_json::Value>(&text)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         pipe.strings.insert("maya2.controller".into(), text);
+    }
+    if p.dual_stream {
+        use plow_asset::dual_stream::{
+            DualStream, SpeakerConditioning, CONDITIONED_DRIVER, CONDITIONING_KEY, KEY,
+        };
+        let path = dir.join(DUAL_STREAM);
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let d = DualStream::parse(&text)?;
+        if d.frame_codes as u64 != p.frame_codes {
+            return Err(format!("{}: frame_codes != the profile's", path.display()));
+        }
+        let config_path = dir.join("config.json");
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&config_path).map_err(|e| format!("{}: {e}", config_path.display()))?,
+        )
+        .map_err(|e| format!("{}: {e}", config_path.display()))?;
+        if let Some(value) = config["plow_frame_embed"].get("conditioning") {
+            let conditioning = SpeakerConditioning::parse(&value.to_string())?;
+            if !d.voices.is_empty()
+                || !p.depth
+                || p.clone.is_some()
+                || p.text_encoder.is_some()
+                || spec.overlay_rows == 0
+                || d.text_pad >= vocab
+                || p.codebook > u64::from(d.none_code)
+            {
+                return Err("speaker conditioning requires an external speaker, frame depth and overlay rows".into());
+            }
+            let table = model
+                .tensors
+                .iter()
+                .find(|t| t.name == "model.embed_tokens.weight")
+                .filter(|t| t.bytes == u64::from(vocab) * u64::from(spec.hidden) * 2)
+                .ok_or("speaker conditioning requires the BF16 text embedding table")?;
+            pipe.tensors.insert(
+                "conditioning.text_embeddings".into(),
+                plow_asset::packet_pipeline::PipelineTensor {
+                    name: table.name.clone(),
+                    dtype: plow_asset::packet_pipeline::PipelineDType::Bf16,
+                    shape: vec![u64::from(vocab), u64::from(spec.hidden)],
+                },
+            );
+            pipe.parameters
+                .insert("conditioning.text_pad".into(), u64::from(d.text_pad));
+            pipe.strings.insert(
+                CONDITIONING_KEY.into(),
+                serde_json::to_string(&conditioning).map_err(|e| e.to_string())?,
+            );
+            pipe.driver = CONDITIONED_DRIVER.into();
+        } else if d.voices.is_empty() {
+            return Err(
+                "dual-stream checkpoint without preset voices needs explicit speaker conditioning"
+                    .into(),
+            );
+        }
+        let voices: Vec<&str> = d.voices.keys().map(String::as_str).collect();
+        pipe.strings
+            .insert("prompt.voices".into(), voices.join("\n"));
+        let languages: Vec<&str> = std::iter::once("auto")
+            .chain(d.languages.keys().map(String::as_str))
+            .collect();
+        pipe.strings
+            .insert("prompt.languages".into(), languages.join(" "));
+        let json = serde_json::to_string(&d).map_err(|e| e.to_string())?;
+        pipe.strings.insert(KEY.into(), json);
+    }
+    if p.dual_stream || p.depth_sampler == 2 {
+        pipe.parameters
+            .insert("prompt.slot_prefix_version".into(), 1);
     }
     if let Some(t) = p.text_encoder {
         pipe.strings.insert("text.encoder".into(), t.into());
@@ -495,6 +630,16 @@ pub fn speech_pipeline_section(
     put("sampling.top_p_f32".into(), u64::from(p.top_p.to_bits()));
     put("sampling.top_k".into(), p.top_k);
     put("frames.depth".into(), u64::from(p.depth));
+    if let Some((dbfs, max_ms)) = p.onset_trim {
+        put(
+            "stream.onset_trim_dbfs_f32".into(),
+            u64::from(dbfs.to_bits()),
+        );
+        put("stream.onset_trim_max_ms".into(), max_ms);
+    }
+    if p.stream_first_frames > 0 {
+        put("stream.first_frames".into(), p.stream_first_frames);
+    }
     put("frames.depth_sampler".into(), p.depth_sampler);
     put(
         "sampling.repetition_penalty_f32".into(),
@@ -512,6 +657,100 @@ pub fn speech_pipeline_section(
         name: SECTION.into(),
         data: serde_json::to_vec(&meta).map_err(|e| e.to_string())?,
     })
+}
+
+#[cfg(test)]
+mod speech_tests {
+    use super::*;
+    use crate::pipeline::CausalPipelineTensors;
+    use packet::devbuild::Builder;
+    use plow_asset::dual_stream::{CONDITIONED_DRIVER, CONDITIONING_KEY};
+
+    #[test]
+    fn external_speaker_metadata_requires_a_new_driver_and_overlay() {
+        let dir =
+            std::env::temp_dir().join(format!("plow-speaker-contract-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt = serde_json::json!({
+            "text_template": "{input}", "instructions_template": null, "lead": 3, "drop": 5,
+            "text_pad": 2, "text_bos": 3, "text_eos": 4, "none_code": 3072,
+            "frame_codes": 16, "codec_language": [2154, 2156, 2157], "language_at": 2,
+            "codec_auto": [2155, 2156, 2157], "codec_pad": 2148, "codec_bos": 2149,
+            "languages": {"english": 2050}, "voices": {}, "dialect_languages": ["chinese", "auto"]
+        });
+        std::fs::write(dir.join(DUAL_STREAM), prompt.to_string()).unwrap();
+        let config = serde_json::json!({"plow_frame_embed": {"conditioning": {
+            "version": 1, "speaker_packet": "speaker_encoder.pkt", "reference_packet": "ref_encoder.pkt"
+        }}});
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let mut tensors = Builder::new(2);
+        let tokens = tensors.tensor("in.ids", 512 * 4);
+        let positions = tensors.tensor("in.pos", 512 * 4);
+        let kv_lengths = tensors.tensor("in.kvlen", 4);
+        let overlay = tensors.tensor("in.encoder", 4 * 4);
+        let overlay_index = tensors.tensor("in.encoder_index", 512 * 4);
+        tensors.tensor("model.embed_tokens.weight", 4096 * 4 * 2);
+        let model = Model {
+            n_cu: 2,
+            target: 0,
+            tensors: tensors.tensors(),
+            progs: (0..2).map(|_| Builder::new(2).finish()).collect(),
+            kv_row_insts: Vec::new(),
+            prog_t: vec![512, 1],
+            gen: Vec::new(),
+        };
+        let spec = CausalPipelineSpec {
+            name: "speech",
+            max_context: 512,
+            hidden: 4,
+            decode_capacity: 1,
+            overlay_rows: 1,
+            ordered_dispatch: false,
+            tensors: CausalPipelineTensors {
+                tokens,
+                positions,
+                kv_lengths,
+                overlay: Some(overlay),
+                overlay_index: Some(overlay_index),
+            },
+        };
+        let emit = |spec| speech_pipeline_section(&model, spec, &QWEN3_TTS, 4096, &dir);
+        let meta: PacketPipelines = serde_json::from_slice(&emit(spec).unwrap().data).unwrap();
+        let pipe = &meta.pipelines[0];
+        assert_eq!(pipe.driver, CONDITIONED_DRIVER);
+        assert_eq!(pipe.parameters["conditioning.text_pad"], 2);
+        assert_eq!(
+            pipe.tensors["conditioning.text_embeddings"].name,
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(
+            pipe.tensors["conditioning.text_embeddings"].shape,
+            [4096, 4]
+        );
+        assert_eq!(pipe.strings["prompt.voices"], "");
+        assert!(pipe.strings.contains_key(CONDITIONING_KEY));
+        let mut no_overlay = spec;
+        no_overlay.overlay_rows = 0;
+        assert!(emit(no_overlay).is_err());
+        let mut invalid = config.clone();
+        invalid["plow_frame_embed"]["conditioning"]["version"] = 2.into();
+        std::fs::write(dir.join("config.json"), invalid.to_string()).unwrap();
+        assert!(emit(spec).is_err());
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        assert!(emit(spec).is_err());
+        let mut preset = prompt;
+        preset["voices"] = serde_json::json!({"ryan": {"code": 3061, "dialect": null}});
+        std::fs::write(dir.join(DUAL_STREAM), preset.to_string()).unwrap();
+        let legacy: PacketPipelines = serde_json::from_slice(&emit(spec).unwrap().data).unwrap();
+        assert_eq!(legacy.pipelines[0].driver, DRIVER);
+        assert!(!legacy.pipelines[0].strings.contains_key(CONDITIONING_KEY));
+        assert!(!legacy.pipelines[0]
+            .tensors
+            .contains_key("conditioning.text_embeddings"));
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        assert!(emit(spec).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 /// Host-side tables of a guided speech LM whose prefill rows are embeddings (T3): text token

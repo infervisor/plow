@@ -1,7 +1,9 @@
 import os
+import json
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 
 import pytest
@@ -17,6 +19,34 @@ def env(tmp_path):
 
 def lease(env, *args, **kw):
     return subprocess.Popen([str(LEASE), *args], env=env, start_new_session=True, **kw)
+
+
+@pytest.mark.parametrize("vendor", ["nvidia", "amd"])
+@pytest.mark.parametrize("total,wanted", [(1, 1), (3, 3), (3, 1)])
+@pytest.mark.parametrize("inherited", ["", "-1"])
+def test_visibility_comes_from_the_lease_not_cpu_masks(env, tmp_path, vendor, total, wanted, inherited):
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    for name in ("nvidia-smi", "amd-smi"):
+        stub = tools / name
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+    run_env = dict(env, PATH=f"{tools}:{env['PATH']}", GPU_LEASE_VENDOR=vendor,
+                   GPU_LEASE_NGPU=str(total), CUDA_VISIBLE_DEVICES=inherited,
+                   HIP_VISIBLE_DEVICES=inherited, ROCR_VISIBLE_DEVICES=inherited)
+    code = "import json,os; print(json.dumps({k:os.environ.get(k) for k in ['CUDA_VISIBLE_DEVICES','HIP_VISIBLE_DEVICES','ROCR_VISIBLE_DEVICES']}))"
+    result = subprocess.run([str(LEASE), "-n", str(wanted), "masks", sys.executable, "-c", code],
+                            env=run_env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    masks = json.loads(result.stdout)
+    visible = ",".join(map(str, range(wanted)))
+    if vendor == "nvidia":
+        assert masks["CUDA_VISIBLE_DEVICES"] == visible
+    else:
+        assert masks["ROCR_VISIBLE_DEVICES"] == visible
+        mixed = Path("/dev/nvidiactl").exists() and Path("/dev/kfd").exists()
+        assert masks["CUDA_VISIBLE_DEVICES"] == ("-1" if mixed else None)
+        assert masks["HIP_VISIBLE_DEVICES"] == (visible if mixed else None)
 
 
 def wait_for(predicate, timeout=20):
@@ -113,6 +143,8 @@ def test_status_word_is_not_a_label_and_a_label_needs_a_command(env):
     out = subprocess.run([str(LEASE), "status"], env=env, capture_output=True, text=True, timeout=30)
     assert out.returncode == 0 and "queue" in out.stdout
     assert not (Path(env["GPU_LEASE_DIR"]) / "lease.log").exists()
+    pooled = subprocess.run([str(LEASE), "--vendor", "none", "status"], env=env, capture_output=True, text=True, timeout=30)
+    assert pooled.returncode == 0 and "vendor=none" in pooled.stdout
     bare = subprocess.run([str(LEASE), "-n", "1", "job"], env=env, capture_output=True, text=True, timeout=30)
     assert bare.returncode == 2 and "no command" in bare.stderr
 

@@ -214,6 +214,8 @@ struct ChunkIx(u32);
 struct Chunk<T> {
     va: u64,
     bytes: u64,
+    /// Carved out of a [`HostArena`] region: the region, not the chunk, is freed.
+    carved: bool,
     _tier: PhantomData<T>,
 }
 
@@ -222,6 +224,7 @@ impl<T> Chunk<T> {
         Chunk {
             va,
             bytes,
+            carved: false,
             _tier: PhantomData,
         }
     }
@@ -235,7 +238,38 @@ impl Chunk<Dev> {
 
 impl Chunk<Host> {
     fn free(self, ops: &dyn StoreOps) {
-        ops.host_free(self.va, self.bytes);
+        if !self.carved {
+            ops.host_free(self.va, self.bytes);
+        }
+    }
+}
+
+/// Host memory pinned once at arm time ([`KvStore::host_prepin`]). The grower carves its
+/// chunks out of these regions, so serving never registers host memory: a registration holds
+/// the driver's context lock, and on a host whose page cache has to give way (long-term pinning
+/// migrates pages) one chunk held it for seconds while every CUDA call of the engine waited
+/// (26B BF16 replay: a 19 s ring map, TTFT P99 20 s).
+#[derive(Default)]
+struct HostArena {
+    regions: Vec<(u64, u64)>,
+    /// The region carving continues in, and the bytes of it already carved.
+    cur: usize,
+    used: u64,
+    /// Pre-pinned: growth only carves (an empty arena means the tier pinned nothing).
+    frozen: bool,
+}
+
+impl HostArena {
+    fn carve(&mut self, bytes: u64) -> Option<u64> {
+        while let Some(&(va, len)) = self.regions.get(self.cur) {
+            if len - self.used >= bytes {
+                self.used += bytes;
+                return Some(va + self.used - bytes);
+            }
+            self.cur += 1;
+            self.used = 0;
+        }
+        None
     }
 }
 
@@ -523,6 +557,7 @@ struct Inner {
     /// Pinned chunks per class allocated ahead by [`KvStore::host_grow_step`] (a pinned
     /// allocation costs ~4 ms per 8 MiB; under the pool lock it was the host tier's TTFT tail).
     host_spare: Vec<Vec<Chunk<Host>>>,
+    host_arena: HostArena,
     tick: u64,
     stats: StoreStats,
 }
@@ -711,6 +746,7 @@ impl KvStore {
                 refilling: FxHashMap::default(),
                 quarantined: 0,
                 host_spare: (0..n_classes).map(|_| Vec::new()).collect(),
+                host_arena: HostArena::default(),
                 tick: 0,
                 stats,
             }),
@@ -1184,6 +1220,32 @@ impl KvStore {
                 })
             )
         })
+    }
+
+    /// Restores not yet retired (copies in flight, or landed under a gather's hold).
+    pub fn restores_pending(&self) -> bool {
+        !self.inner.lock().restoring.is_empty()
+    }
+
+    /// Diagnostics: `[host-resident, restoring, restoring under a hold]` among `ids`.
+    pub fn off_device_detail(&self, ids: &[BlockId]) -> [usize; 3] {
+        let inner = self.inner.lock();
+        let mut out = [0; 3];
+        for &id in ids {
+            match inner.block(id) {
+                Some(Block {
+                    place: Where::Host(_),
+                    ..
+                }) => out[0] += 1,
+                Some(Block {
+                    place: Where::Restoring { .. },
+                    holds,
+                    ..
+                }) => out[if *holds > 0 { 2 } else { 1 }] += 1,
+                _ => {}
+            }
+        }
+        out
     }
 
     pub fn ensure_device(&self, id: BlockId) -> Result<u64> {
@@ -1711,7 +1773,15 @@ impl KvStore {
         frees: &mut Vec<Chunk<Dev>>,
     ) -> u64 {
         let mut released = 0u64;
-        for ci in 0..inner.classes.len() {
+        // The class holding the most free bytes gives first. Class order evicted the window
+        // class while the tail class kept its holes; growth then stays under the floor, so that
+        // mix persists and the window class refuses publishes for the rest of the run.
+        let mut order: Vec<usize> = (0..inner.classes.len()).collect();
+        order.sort_by_key(|&ci| {
+            let device = &inner.classes[ci].device;
+            std::cmp::Reverse(device.free_slots * device.slot_bytes)
+        });
+        for ci in order {
             for chunk in inner.classes[ci].device.release_candidates() {
                 if released >= bytes {
                     break;
@@ -1915,6 +1985,19 @@ impl KvStore {
             let Some((_, class, chunk)) = pick else {
                 return false;
             };
+            if inner.host_arena.frozen {
+                // Pre-pinned: carve, and never pin while serving (a full arena is the cap).
+                let Some(va) = inner.host_arena.carve(chunk) else {
+                    inner.host_cap -= budget;
+                    return false;
+                };
+                inner.stats.host_grows += 1;
+                inner.host_spare[class].push(Chunk {
+                    carved: true,
+                    ..Chunk::new(va, chunk)
+                });
+                return true;
+            }
             if inner.host_reserve > 0 && inner.stats.host_grows % HOST_FLOOR_EVERY == 0 {
                 if let Some((avail, _)) = crate::memory::vmm::host_mem_available() {
                     if avail
@@ -1955,6 +2038,61 @@ impl KvStore {
                 false
             }
         }
+    }
+
+    /// Pin the host tier up front in `region_bytes` regions, up to its cap or the host reserve,
+    /// for [`Self::host_grow_step`] to carve from (call before the grower runs). A tier pinned
+    /// short of its cap is capped at what it holds. Returns the bytes pinned.
+    pub fn host_prepin(&self, region_bytes: u64) -> u64 {
+        let (cap, reserve, region_bytes) = {
+            let inner = self.inner.lock();
+            // A region holds at least one chunk of every class (a State chunk is a whole state).
+            let largest = inner
+                .classes
+                .iter()
+                .map(|c| c.host.chunk_bytes())
+                .max()
+                .unwrap_or(0);
+            (
+                inner.host_cap,
+                inner.host_reserve,
+                region_bytes.max(largest),
+            )
+        };
+        let mut regions = Vec::new();
+        let mut pinned = 0u64;
+        while pinned < cap {
+            let want = (cap - pinned).min(region_bytes);
+            if reserve > 0 {
+                if let Some((avail, _)) = crate::memory::vmm::host_mem_available() {
+                    if avail < want.saturating_add(reserve) {
+                        tracing::warn!(
+                            available_mib = avail >> 20,
+                            reserve_mib = reserve >> 20,
+                            pinned_mib = pinned >> 20,
+                            "kv store: host tier pre-pin stopped at the host reserve"
+                        );
+                        break;
+                    }
+                }
+            }
+            match self.ops.host_alloc(want) {
+                Ok(va) => {
+                    regions.push((va, want));
+                    pinned += want;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, pinned_mib = pinned >> 20, "kv store: host tier pre-pin stopped");
+                    break;
+                }
+            }
+        }
+        // Zero pinned freezes the tier: the grower never pins while serving.
+        let mut inner = self.inner.lock();
+        inner.host_cap = inner.host_cap.min(pinned);
+        inner.host_arena.regions = regions;
+        inner.host_arena.frozen = true;
+        pinned
     }
 
     /// The host tier's cap now (0 = none; frozen caps are lower than the one armed).
@@ -2072,6 +2210,9 @@ impl Drop for KvStore {
         for chunk in inner.host_spare.drain(..).flatten() {
             chunk.free(ops);
         }
+        for (va, bytes) in inner.host_arena.regions.drain(..) {
+            ops.host_free(va, bytes);
+        }
     }
 }
 
@@ -2108,6 +2249,9 @@ mod tests {
         dev_alloc: AtomicU64,
         freed: AtomicU64,
         host_alloc: AtomicU64,
+        /// `host_alloc` fails past this many bytes.
+        host_limit: AtomicU64,
+        host_freed: AtomicU64,
         htod: AtomicU64,
         htod_async: AtomicU64,
         dtod: AtomicU64,
@@ -2128,6 +2272,8 @@ mod tests {
                 dev_alloc: AtomicU64::new(0),
                 freed: AtomicU64::new(0),
                 host_alloc: AtomicU64::new(0),
+                host_limit: AtomicU64::new(u64::MAX),
+                host_freed: AtomicU64::new(0),
                 htod: AtomicU64::new(0),
                 htod_async: AtomicU64::new(0),
                 dtod: AtomicU64::new(0),
@@ -2156,10 +2302,16 @@ mod tests {
             self.freed.fetch_add(1, Ordering::SeqCst);
         }
         fn host_alloc(&self, bytes: u64) -> Result<u64> {
+            let limit = self.host_limit.load(Ordering::SeqCst);
+            if self.host_alloc.load(Ordering::SeqCst) + bytes > limit {
+                return Err(RuntimeError::Rejected("mock host pin refused".into()));
+            }
             self.host_alloc.fetch_add(bytes, Ordering::SeqCst);
             Ok(self.next.fetch_add(bytes + 4096, Ordering::SeqCst))
         }
-        fn host_free(&self, _ptr: u64, _bytes: u64) {}
+        fn host_free(&self, _ptr: u64, bytes: u64) {
+            self.host_freed.fetch_add(bytes, Ordering::SeqCst);
+        }
         fn copy_dtoh_async(&self, host: u64, va: u64, _bytes: u64) -> Result<u64> {
             self.mv(host, va);
             Ok(self.next_fence.fetch_add(1, Ordering::SeqCst))
@@ -2215,6 +2367,178 @@ mod tests {
         );
         while s.host_grow_step() {}
         (ops, Arc::new(s))
+    }
+
+    #[test]
+    fn shrink_takes_the_class_with_the_most_holes_first() {
+        let ops = MockOps::new();
+        let s = KvStore::new(
+            ops.clone(),
+            vec![
+                ClassSpec {
+                    name: "window",
+                    row_bytes: 8,
+                    rows_per_block: 4,
+                },
+                ClassSpec {
+                    name: "tail",
+                    row_bytes: 2,
+                    rows_per_block: 4,
+                },
+            ],
+            32,
+            4096,
+            0,
+        );
+        let window = acquire_sealed(&s, 0, key(1)).id;
+        let tail = acquire_sealed(&s, 1, key(2)).id;
+        s.release(&[window, tail]);
+        let chunk = {
+            let mut inner = s.inner.lock();
+            s.drop_block(&mut inner, tail);
+            inner.classes[1].device.chunk_bytes()
+        };
+        assert_eq!(s.shrink(chunk), chunk);
+        let inner = s.inner.lock();
+        assert_eq!(
+            inner.classes[0].device.live_chunks, 1,
+            "the window block stayed"
+        );
+        assert_eq!(
+            inner.classes[1].device.live_chunks, 0,
+            "the empty tail chunk went back"
+        );
+    }
+
+    #[test]
+    fn a_pre_pinned_tier_carves_its_chunks_and_never_pins_again() {
+        let ops = MockOps::new();
+        let s = KvStore::new(
+            ops.clone(),
+            vec![
+                ClassSpec {
+                    name: "window",
+                    row_bytes: 8,
+                    rows_per_block: 4,
+                },
+                ClassSpec {
+                    name: "prefix",
+                    row_bytes: 2,
+                    rows_per_block: 4,
+                },
+            ],
+            32,
+            0,
+            1000,
+        );
+        // 1000 bytes in 96-byte regions: 10 regions (960 B), the cap drops to what is pinned.
+        assert_eq!(s.host_prepin(96), 1000);
+        let pinned = ops.host_alloc.load(Ordering::SeqCst);
+        assert_eq!(pinned, 1000);
+        let mut grows = 0;
+        while s.host_grow_step() {
+            grows += 1;
+        }
+        assert!(grows > 0);
+        assert_eq!(
+            ops.host_alloc.load(Ordering::SeqCst),
+            pinned,
+            "growth after a pre-pin carves, it never allocates"
+        );
+        let inner = s.inner.lock();
+        let spare: u64 = inner
+            .classes
+            .iter()
+            .zip(&inner.host_spare)
+            .map(|(c, sp)| sp.len() as u64 * c.host.chunk_bytes())
+            .sum();
+        assert!(spare <= inner.host_cap && inner.host_cap <= 1000);
+        for (va, bytes) in inner.host_spare.iter().flatten().map(|c| (c.va, c.bytes)) {
+            assert!(inner
+                .host_arena
+                .regions
+                .iter()
+                .any(|&(r, len)| va >= r && va + bytes <= r + len));
+        }
+    }
+
+    fn two_class_store(ops: &Arc<MockOps>, host_cap: u64) -> KvStore {
+        KvStore::new(
+            ops.clone(),
+            vec![
+                ClassSpec {
+                    name: "window",
+                    row_bytes: 8,
+                    rows_per_block: 4,
+                },
+                ClassSpec {
+                    name: "prefix",
+                    row_bytes: 2,
+                    rows_per_block: 4,
+                },
+            ],
+            32,
+            0,
+            host_cap,
+        )
+    }
+
+    #[test]
+    fn a_failed_pre_pin_freezes_the_tier_at_what_it_pinned() {
+        let ops = MockOps::new();
+        ops.host_limit.store(0, Ordering::SeqCst);
+        let s = two_class_store(&ops, 1000);
+        assert_eq!(s.host_prepin(96), 0);
+        assert_eq!(s.host_cap(), 0);
+        ops.host_limit.store(u64::MAX, Ordering::SeqCst);
+        assert!(
+            !s.host_grow_step(),
+            "nothing pinned: never pins while serving"
+        );
+        assert_eq!(ops.host_alloc.load(Ordering::SeqCst), 0);
+
+        let ops = MockOps::new();
+        ops.host_limit.store(300, Ordering::SeqCst);
+        let s = two_class_store(&ops, 1000);
+        assert_eq!(s.host_prepin(96), 288);
+        assert_eq!(s.host_cap(), 288);
+        ops.host_limit.store(u64::MAX, Ordering::SeqCst);
+        while s.host_grow_step() {}
+        assert_eq!(ops.host_alloc.load(Ordering::SeqCst), 288);
+    }
+
+    #[test]
+    fn pre_pin_regions_fit_the_largest_chunk_and_free_once() {
+        let ops = MockOps::new();
+        let s = two_class_store(&ops, 1000);
+        let largest = {
+            let inner = s.inner.lock();
+            inner
+                .classes
+                .iter()
+                .map(|c| c.host.chunk_bytes())
+                .max()
+                .unwrap()
+        };
+        assert!(largest > 1);
+        let pinned = s.host_prepin(1);
+        assert!(pinned > 0);
+        {
+            let inner = s.inner.lock();
+            let r = &inner.host_arena.regions;
+            assert!(r[..r.len() - 1].iter().all(|&(_, len)| len >= largest));
+        }
+        let mut grows = 0;
+        while s.host_grow_step() {
+            grows += 1;
+        }
+        assert!(grows >= 2, "every class carves its chunks");
+        drop(s);
+        assert_eq!(
+            ops.host_freed.load(Ordering::SeqCst),
+            pinned,
+            "regions free once; carved chunks never free on their own"
+        );
     }
 
     fn seal(a: &mut Acquired<'_>) {
@@ -3014,7 +3338,9 @@ mod tests {
         s.reap();
         assert_eq!(s.location(a.id), Some(Location::Host));
         ops.pending.store(true, Ordering::SeqCst);
+        assert!(!s.restores_pending());
         assert!(s.restore_async(a.id).unwrap(), "queued");
+        assert!(s.restores_pending());
         assert_eq!(
             (
                 ops.htod_async.load(Ordering::SeqCst),
@@ -3056,8 +3382,10 @@ mod tests {
             s.restoring_any(&[a.id]),
             "held: still in flight for admission"
         );
+        assert!(s.restores_pending(), "landed under a hold: not retired");
         drop(hold);
         assert!(!s.restoring_any(&[a.id]), "retired by the query itself");
+        assert!(!s.restores_pending());
         s.reap();
         let st = s.stats();
         assert_eq!(

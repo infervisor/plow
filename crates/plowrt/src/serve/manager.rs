@@ -64,6 +64,7 @@ use crate::asset::packet_image::PacketImage;
 use crate::device::cuda::CudaBackend;
 use crate::memory::vmm::VmmOps;
 use crate::serve::mux::{self, MuxConfig};
+use crate::serve::residency_contract::{self, sum_bytes};
 use crate::serve::AppState;
 use crate::{Result, RuntimeError};
 
@@ -150,13 +151,18 @@ pub struct BlobPlan {
 impl BlobPlan {
     /// Sum of the planned tensor bytes.
     pub fn tensor_total(&self) -> u64 {
-        self.weights_bytes + self.kv_bytes + self.other_bytes + self.sidecar_bytes
+        sum_bytes([
+            self.weights_bytes,
+            self.kv_bytes,
+            self.other_bytes,
+            self.sidecar_bytes,
+        ])
     }
 
     /// What a resident engine of this plan holds: its tensors, `overhead` and one full-context
     /// sequence's KV.
     pub fn required(&self, overhead: u64) -> u64 {
-        self.tensor_total() + overhead + self.min_kv_bytes
+        sum_bytes([self.tensor_total(), overhead, self.min_kv_bytes])
     }
 
     /// Bytes of this model's load the weight slab can satisfy from pooled
@@ -165,7 +171,7 @@ impl BlobPlan {
     /// cache off, KV rides the slab too — this then under-credits, which only
     /// costs reuse, never correctness.)
     pub fn slab_reusable(&self) -> u64 {
-        self.weights_bytes + self.other_bytes
+        sum_bytes([self.weights_bytes, self.other_bytes])
     }
 
     /// Classify one blob tensor into the plan. Free-standing so it is
@@ -178,11 +184,11 @@ impl BlobPlan {
     /// tower (Kimi-K3's `language_model.model.…`) as zero weight bytes.
     fn add(&mut self, name: &str, bytes: u64) {
         if name.starts_with("kv.") {
-            self.kv_bytes += bytes;
+            self.kv_bytes = self.kv_bytes.saturating_add(bytes);
         } else if packet::names::is_checkpoint_weight(name) {
-            self.weights_bytes += bytes;
+            self.weights_bytes = self.weights_bytes.saturating_add(bytes);
         } else {
-            self.other_bytes += bytes;
+            self.other_bytes = self.other_bytes.saturating_add(bytes);
         }
     }
 
@@ -251,10 +257,15 @@ impl BlobPlan {
         for t in &blob.tensors {
             plan.add(&t.name, t.bytes);
         }
+        if plan.tensor_total() == u64::MAX {
+            return Err(RuntimeError::Rejected(
+                "model byte accounting overflow".into(),
+            ));
+        }
         #[cfg(feature = "cuda")]
         if let Some((granularity, capability)) = device_vmm {
             let config = crate::config::RuntimeConfig::get();
-            plan.overhead_bound += seg_graph_bound(&blob);
+            plan.overhead_bound = plan.overhead_bound.saturating_add(seg_graph_bound(&blob));
             let manifest = match narrowed {
                 true => blob.with_packet_view(plow_asset::live_kv::emit).ok(),
                 false => crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?,
@@ -295,30 +306,36 @@ impl BlobPlan {
                     .iter()
                     .flatten()
                     .map(|&id| blob.tensors[id].bytes)
-                    .sum();
+                    .fold(0, u64::saturating_add);
                 let geo = &layout.geometry;
                 let hint = u64::from(config.vmm_block_mib()) << 20;
                 if let Some(full) = layout.slot_granular_full(&blob, granularity, hint) {
                     // Slots commit on admission (`kv_row_charge`); plan the shared idle backing,
                     // one admitted slot and the recycled-unit pool.
                     let tensors: Vec<_> = full.into_iter().chain(layout.ring_tensors).collect();
-                    let virtual_bytes: u64 =
-                        tensors.iter().map(|t| blob.tensors[t.tensor].bytes).sum();
+                    let virtual_bytes: u64 = tensors
+                        .iter()
+                        .map(|t| blob.tensors[t.tensor].bytes)
+                        .fold(0, u64::saturating_add);
                     let slot: u64 = tensors
                         .iter()
                         .filter(|t| t.slot_bytes % granularity == 0)
                         .map(|t| t.slot_bytes)
-                        .sum();
+                        .fold(0, u64::saturating_add);
                     let startup = crate::memory::vmm::VmmRings::idle_backed_startup_bytes(
                         &tensors,
                         geo.batch as usize,
                         granularity,
                     );
-                    plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
-                        RuntimeError::Rejected("live KV plan tensor classification".into())
-                    })? + startup
-                        + slot
-                        + crate::memory::vmm::kv_pool_cap();
+                    plan.kv_bytes = plan
+                        .kv_bytes
+                        .checked_sub(virtual_bytes)
+                        .ok_or_else(|| {
+                            RuntimeError::Rejected("live KV plan tensor classification".into())
+                        })?
+                        .saturating_add(startup)
+                        .saturating_add(slot)
+                        .saturating_add(crate::memory::vmm::kv_pool_cap());
                     return Ok(plan);
                 }
                 let live_rings = crate::exec::gpu::live_rings_for_capacity(
@@ -333,30 +350,30 @@ impl BlobPlan {
                             .ring_tensors
                             .iter()
                             .map(|ring| blob.tensors[ring.tensor].bytes)
-                            .sum()
+                            .fold(0, u64::saturating_add)
                     })
                     .unwrap_or(0);
                 let block =
                     geo.block_bytes(granularity, u64::from(config.vmm_block_mib()) << 20)?;
                 // Load maps row zero for every slot, including idle decode lanes.
                 let resident = block
-                    * u64::from(geo.batch)
-                    * u64::from(geo.kvh_full)
-                    * layout.full_tensors.len() as u64
-                    * 2;
+                    .saturating_mul(u64::from(geo.batch))
+                    .saturating_mul(u64::from(geo.kvh_full))
+                    .saturating_mul(layout.full_tensors.len() as u64)
+                    .saturating_mul(2);
                 let demand_virtual_bytes = virtual_bytes
                     .checked_add(ring_virtual_bytes)
                     .ok_or_else(|| {
                         RuntimeError::Rejected("live KV virtual byte overflow".into())
                     })?;
-                plan.kv_bytes =
-                    plan.kv_bytes
-                        .checked_sub(demand_virtual_bytes)
-                        .ok_or_else(|| {
-                            RuntimeError::Rejected("live KV plan tensor classification".into())
-                        })?
-                        + resident
-                        + crate::memory::vmm::kv_pool_cap();
+                plan.kv_bytes = plan
+                    .kv_bytes
+                    .checked_sub(demand_virtual_bytes)
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected("live KV plan tensor classification".into())
+                    })?
+                    .saturating_add(resident)
+                    .saturating_add(crate::memory::vmm::kv_pool_cap());
                 plan.min_kv_bytes = demand_virtual_bytes / u64::from(geo.batch.max(1));
             } else if let Some(layout) = prefix_layout {
                 let geo = &layout.geo;
@@ -376,15 +393,22 @@ impl BlobPlan {
                 } else {
                     (0, 0)
                 };
-                let virtual_bytes = geo.full_tensor_bytes() * tracks + ring_bytes;
+                let virtual_bytes = geo
+                    .full_tensor_bytes()
+                    .saturating_mul(tracks)
+                    .saturating_add(ring_bytes);
                 // Prefix slots start unmapped (`VmmKv::new`) and map on admission against the KV
                 // budget; at load only the block pool's precreated columns commit, inside
                 // `kv_pool_cap`. Charging a block per slot and head (4 GiB on Gemma-4 E4B, which
                 // measures 3.6 GiB under that plan) kept E4B from fitting beside ASR and TTS.
-                plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
-                    RuntimeError::Rejected("prefix KV plan tensor classification".into())
-                })? + ring_idle
-                    + crate::memory::vmm::kv_pool_cap();
+                plan.kv_bytes = plan
+                    .kv_bytes
+                    .checked_sub(virtual_bytes)
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected("prefix KV plan tensor classification".into())
+                    })?
+                    .saturating_add(ring_idle)
+                    .saturating_add(crate::memory::vmm::kv_pool_cap());
                 plan.min_kv_bytes = virtual_bytes / u64::from(geo.batch.max(1));
             }
         }
@@ -413,7 +437,7 @@ const SEG_GRAPH_BYTES_PER_SEGMENT_SLOT: u64 = 12 << 10;
 /// bulk of a CUDA engine's non-tensor overhead.
 fn seg_graph_bound(blob: &DevBlob) -> u64 {
     let nv = &crate::config::RuntimeConfig::get().nv;
-    if !nv.pf_seg_graph || nv.pf_seg_time || nv.pf_seg_fatonly {
+    if !nv.pf_seg_graph || nv.pf_seg_time {
         return 0;
     }
     let slots = blob.decode_prog().map_or(0, |g| u64::from(g.t));
@@ -422,8 +446,10 @@ fn seg_graph_bound(blob: &DevBlob) -> u64 {
         .iter()
         .map(|p| p.stream.iter().map(|e| e.seg as u64 + 1).max().unwrap_or(1))
         .filter(|&n| n > 1)
-        .sum();
-    segments * slots * SEG_GRAPH_BYTES_PER_SEGMENT_SLOT
+        .fold(0, u64::saturating_add);
+    segments
+        .saturating_mul(slots)
+        .saturating_mul(SEG_GRAPH_BYTES_PER_SEGMENT_SLOT)
 }
 
 /// Device bytes of the speech pipeline's sibling packets beside `pkt` ([`sidecar_files`]),
@@ -434,8 +460,8 @@ fn seg_graph_bound(blob: &DevBlob) -> u64 {
 fn sidecar_bytes(pkt: &Path) -> Result<u64> {
     // Allocations of 1 MiB and up take whole 2 MiB pages.
     let alloc = |bytes: u64| match bytes.max(4) {
-        b if b >= 1 << 20 => b.next_multiple_of(2 << 20),
-        b => b.next_multiple_of(512),
+        b if b >= 1 << 20 => b.checked_next_multiple_of(2 << 20).unwrap_or(u64::MAX),
+        b => b.checked_next_multiple_of(512).unwrap_or(u64::MAX),
     };
     let asset = crate::exec::packet_runtime::PacketAsset::load_if_present(pkt)?;
     let mut total = 0u64;
@@ -448,7 +474,11 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
     {
         // Plus an engine's non-tensor overhead: the parent's calibration runs before sidecars
         // bind and never sees it.
-        total += BlobPlan::from_dir(&pkt.with_file_name(sub))?.tensor_total() + DEFAULT_OVERHEAD;
+        total = sum_bytes([
+            total,
+            BlobPlan::from_dir(&pkt.with_file_name(sub))?.tensor_total(),
+            DEFAULT_OVERHEAD,
+        ]);
     }
     for name in sidecar_files(asset.as_ref())? {
         let path = pkt.with_file_name(name);
@@ -461,9 +491,12 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
         let mut counters = 0u64;
         for p in &blob.progs {
             let segments = p.gq_seg_ofs.len().saturating_sub(1) as u64;
-            counters +=
-                (u64::from(p.n_counter) * ctr).max(4).next_multiple_of(256) + segments * ctr;
-            total += [
+            counters = sum_bytes([
+                counters,
+                (u64::from(p.n_counter) * ctr).max(4).next_multiple_of(256),
+                segments.saturating_mul(ctr),
+            ]);
+            total = [
                 std::mem::size_of_val(&p.insts[..]),
                 std::mem::size_of_val(&p.stream[..]),
                 std::mem::size_of_val(&p.stream_ofs[..]),
@@ -475,14 +508,17 @@ fn sidecar_bytes(pkt: &Path) -> Result<u64> {
             ]
             .into_iter()
             .map(|b| alloc(b as u64))
-            .sum::<u64>();
+            .fold(total, u64::saturating_add);
         }
         // Graph capture at bind: S3Gen 602 MiB over 1931 programs, Qwen3-ASR encoder ~65 MiB
         // over 460 (L40S).
-        total += blob.progs.len() as u64 * GRAPH_BYTES_PER_PROGRAM;
-        total += blob.tensors.iter().map(|t| alloc(t.bytes)).sum::<u64>()
-            + alloc(blob.tensors.len() as u64 * 8)
-            + alloc(counters);
+        total = sum_bytes([
+            total,
+            (blob.progs.len() as u64).saturating_mul(GRAPH_BYTES_PER_PROGRAM),
+            sum_bytes(blob.tensors.iter().map(|t| alloc(t.bytes))),
+            alloc((blob.tensors.len() as u64).saturating_mul(8)),
+            alloc(counters),
+        ]);
     }
     Ok(total)
 }
@@ -652,6 +688,10 @@ pub trait ManagerDevice: Send + Sync {
     fn pool_bytes(&self) -> u64;
     /// Trim chunk pool to `keep_bytes`.
     fn pool_trim(&self, keep_bytes: u64) -> u64;
+    /// The vendor whose packets this device runs; `None` for the host device.
+    fn vendor(&self) -> Option<hwspec::Vendor> {
+        None
+    }
     /// Load an engine for `dir` and `ckpt`.
     fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine>;
     /// Check whether sibling packets are resident.
@@ -692,6 +732,9 @@ impl ManagerDevice for CudaManagerDevice {
     fn device_ordinal(&self) -> u8 {
         self.be.device_ordinal
     }
+    fn vendor(&self) -> Option<hwspec::Vendor> {
+        Some(hwspec::Vendor::Nvidia)
+    }
     fn mem_info(&self) -> Result<(u64, u64)> {
         self.be.mem_info()
     }
@@ -709,6 +752,13 @@ impl ManagerDevice for CudaManagerDevice {
     }
     fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
         let be = Arc::clone(&self.be);
+        if tp_degree(dir)? > 1 {
+            let devices = &crate::config::RuntimeConfig::get().group_devices;
+            let group = self.be.unload_modules_on_err(|| {
+                crate::serve::cuda_group::CudaGroupServe::load(be, dir, ckpt, devices)
+            })?;
+            return Ok(crate::serve::engine::ServeEngine::CudaGroup(group));
+        }
         let mut engine = self
             .be
             .unload_modules_on_err(|| crate::exec::gpu::GpuEngine::load(be, dir, ckpt))?;
@@ -727,6 +777,14 @@ impl ManagerDevice for CudaManagerDevice {
     }
     fn live_modules(&self) -> Option<usize> {
         Some(self.be.live_modules())
+    }
+    /// A process rank group (`PLOW_GROUP_DEVICES`) serves tensor-parallel packets: this
+    /// device is rank 0, each other group device runs a worker process.
+    fn supports_tp(&self) -> bool {
+        crate::config::RuntimeConfig::get().group_devices.len() > 1
+    }
+    fn group_width(&self) -> u32 {
+        (crate::config::RuntimeConfig::get().group_devices.len() as u32).max(1)
     }
 }
 
@@ -748,6 +806,9 @@ impl HsaManagerDevice {
 impl ManagerDevice for HsaManagerDevice {
     fn device_ordinal(&self) -> u8 {
         self.be.device_ordinal
+    }
+    fn vendor(&self) -> Option<hwspec::Vendor> {
+        Some(hwspec::Vendor::Amd)
     }
     fn mem_info(&self) -> Result<(u64, u64)> {
         let free = self.be.free_bytes().unwrap_or(0);
@@ -1144,6 +1205,10 @@ impl ModelManager {
 
     /// The device ordinals this manager's group covers. One today (a manager
     /// owns one backend); a tensor-parallel group would report its whole run.
+    pub fn vendor(&self) -> Option<hwspec::Vendor> {
+        self.device.vendor()
+    }
+
     pub fn ordinals(&self) -> Vec<u32> {
         vec![u32::from(self.device.device_ordinal())]
     }
@@ -1280,13 +1345,16 @@ impl ModelManager {
     /// residents need free to keep admitting ([`Self::kv_claims`]), but never what resident
     /// models are planned to still commit (live KV slots, KV pools).
     fn fit_capacity(&self, credit: u64) -> Result<u64> {
-        Ok((self.free_vram()? + credit)
-            .saturating_sub(self.kv_claimed())
-            .min(self.planned_headroom()?))
+        Ok(residency_contract::available(
+            self.free_vram()?,
+            credit,
+            self.kv_claimed(),
+            self.planned_headroom()?,
+        ))
     }
 
     fn kv_claimed(&self) -> u64 {
-        self.kv_claims.lock().values().sum()
+        sum_bytes(self.kv_claims.lock().values().copied())
     }
 
     /// The device (or budget) less every resident model's planned requirement.
@@ -1300,7 +1368,7 @@ impl ModelManager {
             .iter()
             .filter(|m| self.is_resident(&m.slug))
             .map(|m| Self::charge(m, &overhead))
-            .sum();
+            .fold(0, u64::saturating_add);
         Ok(cap.saturating_sub(planned))
     }
 
@@ -1331,9 +1399,9 @@ impl ModelManager {
         let mut loaded = 0usize;
         let pinned = crate::config::RuntimeConfig::get().nv.pin_resident;
         for m in self.models.read().clone() {
-            let need = self.required(&m.slug).expect("managed") + RESERVE;
+            let need = sum_bytes([self.required(&m.slug).expect("managed"), RESERVE]);
             let free = self.fit_capacity(0)?;
-            if free < need {
+            if !residency_contract::admits(need, free) {
                 if pinned {
                     return Err(RuntimeError::Msg(pinned_misfit(&m.slug, need, free)));
                 }
@@ -1433,7 +1501,7 @@ impl ModelManager {
             .managed(slug)
             .ok_or_else(|| EnsureError::Load(RuntimeError::UnknownModel(slug.into())))?;
         self.load_backoff(&m)?;
-        let need = self.required(slug).expect("managed") + RESERVE;
+        let need = sum_bytes([self.required(slug).expect("managed"), RESERVE]);
         let mut report = SwitchReport {
             target: slug.to_string(),
             ..SwitchReport::default()
@@ -1462,10 +1530,10 @@ impl ModelManager {
                 let mut avail = self
                     .fit_capacity(self.device.pool_bytes())
                     .map_err(EnsureError::Load)?;
-                if avail < need {
+                if !residency_contract::admits(need, avail) {
                     avail = self.reclaim_caches(need, avail).await?;
                 }
-                if avail >= need {
+                if residency_contract::admits(need, avail) {
                     break;
                 }
                 let Some(victim) = self.lru_victim(slug) else {
@@ -1686,17 +1754,17 @@ impl ModelManager {
         let m = self
             .managed(slug)
             .ok_or_else(|| EnsureError::Load(RuntimeError::UnknownModel(slug.into())))?;
-        let need = self.required(slug).expect("managed") + RESERVE;
+        let need = sum_bytes([self.required(slug).expect("managed"), RESERVE]);
         // Same accounting as the switch path: chunks the incoming slab cannot
         // consume have to be real free memory before the load.
         self.device.pool_trim(m.plan.slab_reusable());
         let mut avail = self
             .fit_capacity(self.device.pool_bytes())
             .map_err(EnsureError::Load)?;
-        if avail < need {
+        if !residency_contract::admits(need, avail) {
             avail = self.reclaim_caches(need, avail).await?;
         }
-        if avail < need {
+        if !residency_contract::admits(need, avail) {
             return Err(EnsureError::WontFit { need, free: avail });
         }
         let t0 = Instant::now();
@@ -1758,7 +1826,10 @@ impl ModelManager {
             .filter(|m| {
                 let credit = pool.min(m.plan.slab_reusable());
                 self.required(&m.slug).is_some_and(|need| {
-                    need + RESERVE <= (free + credit).saturating_sub(claimed).min(headroom)
+                    residency_contract::admits(
+                        sum_bytes([need, RESERVE]),
+                        residency_contract::available(free, credit, claimed, headroom),
+                    )
                 })
             })
             .map(|m| m.slug.clone())
@@ -1780,34 +1851,43 @@ impl ModelManager {
     async fn evict(&self, slug: &str, stop: Stop) -> std::result::Result<(f64, f64), EnsureError> {
         let state = self.state()?;
         let t0 = Instant::now();
-        if let Some(mux) = state.remove_mux(slug) {
+        let mut release = residency_contract::ReleaseGate::default();
+        let completed = if let Some(mux) = state.mux_for_retirement(slug) {
+            // Keep the closed mux installed until its acknowledgement. Cancellation
+            // or channel failure must not turn a later eviction into an unfenced drop.
             match stop {
                 // Control-plane unload: an admin call must not block on
                 // `max_tokens`. Live generations stop at the next tick top and
                 // close with what they produced.
-                Stop::Now => mux.preempt().await,
+                Stop::Now => mux.preempt_fenced().await,
                 Stop::Bounded(bound) => {
-                    if tokio::time::timeout(bound, mux.drain()).await.is_err() {
-                        tracing::info!(%slug, bound_ms = bound.as_millis() as u64, "rank drain bound passed — preempting");
-                        mux.preempt().await;
+                    match tokio::time::timeout(bound, mux.drain_fenced()).await {
+                        Ok(ack) => ack,
+                        Err(_) => mux.preempt_fenced().await,
                     }
                 }
                 Stop::Graceful => match drain_timeout_ms() {
-                    None => mux.drain().await,
+                    None => mux.drain_fenced().await,
                     Some(ms) => {
                         let deadline = std::time::Duration::from_millis(ms);
-                        if tokio::time::timeout(deadline, mux.drain()).await.is_err() {
-                            tracing::info!(
-                                %slug,
-                                timeout_ms = ms,
-                                "drain deadline passed — preempting live generations"
-                            );
-                            mux.preempt().await;
+                        match tokio::time::timeout(deadline, mux.drain_fenced()).await {
+                            Ok(ack) => ack,
+                            Err(_) => mux.preempt_fenced().await,
                         }
                     }
                 },
             }
+        } else {
+            // A partially loaded engine has never acquired a dispatcher.
+            true
+        };
+        release.complete(completed);
+        if !release.claim_return() {
+            return Err(EnsureError::Load(RuntimeError::Msg(format!(
+                "{slug}: dispatcher completion was not acknowledged"
+            ))));
         }
+        state.remove_mux(slug);
         let drain_ms = ms(t0);
 
         let t1 = Instant::now();
@@ -1829,7 +1909,10 @@ impl ModelManager {
         .await
         .map_err(EnsureError::Load)?;
         let engine_ms = ms(t1);
-        if let Ok(bundle) = state.registry.get(state.model_of(slug)) {
+        if let Ok(bundle) = state
+            .registry
+            .bundle_for(state.model_of(slug), self.vendor())
+        {
             let device = self.ordinal();
             crate::asr::serving::release(&bundle.dir, device);
             crate::tts::serving::release(&bundle.dir, device);
@@ -1923,7 +2006,7 @@ impl ModelManager {
         let state = self.state()?;
         let bundle = state
             .registry
-            .get(state.model_of(&m.slug))
+            .bundle_for(state.model_of(&m.slug), self.vendor())
             .map_err(EnsureError::Load)?;
         if bundle.tokenizer().is_byte_fallback() {
             return Err(EnsureError::Load(RuntimeError::Msg(format!(
@@ -1933,47 +2016,9 @@ impl ModelManager {
             ))));
         }
 
-        // `PLOW_PF_SEG_NONCOOP=1` drops the driver's co-residency admission on
-        // an explicitly stated premise: "the grid equals the module's queried
-        // resident capacity AND THE STREAM IS OTHERWISE IDLE, so all blocks
-        // schedule together" (`exec/gpu.rs`). A co-tenant on the same device
-        // makes the second half false, and the documented consequence is a
-        // spin "on counters owned by blocks that were never resident" — a hang,
-        // not an error, with no launch failure to catch it.
-        //
-        // So this is a refusal, not a warning: a diagnostic knob must not be
-        // able to deadlock a device by being left set.
         // This bundle's own knobs: every step of its load below runs under them.
         let cfg = crate::config::bundle_config(&m.dir).map_err(EnsureError::Load)?;
         state.set_engine_config(&m.slug, cfg);
-        // Either side running non-cooperative launches is the hazard: per-engine configs let
-        // one model set it and its co-tenant not.
-        {
-            let co_tenants: Vec<String> = self
-                .models
-                .read()
-                .iter()
-                .filter(|o| o.slug != m.slug)
-                .map(|o| o.slug.clone())
-                .filter(|slug| self.is_resident(slug))
-                .collect();
-            let noncoop = |c: Option<&crate::config::RuntimeConfig>| {
-                c.unwrap_or_else(|| crate::config::RuntimeConfig::get())
-                    .nv
-                    .pf_seg_noncoop
-            };
-            if !co_tenants.is_empty()
-                && (cfg.nv.pf_seg_noncoop
-                    || co_tenants.iter().any(|s| noncoop(state.engine_config(s))))
-            {
-                return Err(EnsureError::Load(RuntimeError::Rejected(format!(
-                    "refusing to make {} co-resident with {:?} while PLOW_PF_SEG_NONCOOP is set: \
-                     non-cooperative launch assumes the device is otherwise idle, and a co-tenant \
-                     turns that assumption into a counter spin-hang. Unset it to share a device.",
-                    m.slug, co_tenants
-                ))));
-            }
-        }
 
         // Turns are installed from the startup tenant count: a model loaded later beside another
         // raises its group's turn from `Free` (CUDA); an HSA group not started round-robin is
@@ -2021,7 +2066,15 @@ impl ModelManager {
         // chunks the slab consumed moved from the pool ledger into the engine
         // without touching `free` — count both ledgers or reused chunks make
         // the model look smaller than it is.
-        let used = (free_before + pool_before).saturating_sub(free_after + pool_after);
+        let accounting_error =
+            || EnsureError::Load(RuntimeError::Msg("device byte accounting overflow".into()));
+        let before = free_before
+            .checked_add(pool_before)
+            .ok_or_else(accounting_error)?;
+        let after = free_after
+            .checked_add(pool_after)
+            .ok_or_else(accounting_error)?;
+        let used = before.saturating_sub(after);
         // Sibling packets bind later, outside this measurement.
         let measured = used.saturating_sub(m.plan.tensor_total() - m.plan.sidecar_bytes);
         // Co-residents keep allocating KV and cache during the load and land in the same delta,
@@ -2122,7 +2175,12 @@ impl ModelManager {
                 ));
                 return Err((e, 0));
             }
-            claim = Some(reserve + need);
+            claim = Some(reserve.checked_add(need).ok_or_else(|| {
+                (
+                    EnsureError::NoKvRoom(format!("{slug}: KV claim overflows u64")),
+                    0,
+                )
+            })?);
         }
         let free = self.free_vram().map_err(|e| (EnsureError::Load(e), 0))?;
         let mut claims = self.kv_claims.lock();
@@ -2130,7 +2188,7 @@ impl ModelManager {
             .iter()
             .filter(|(s, _)| s.as_str() != slug)
             .map(|(_, &c)| c)
-            .sum();
+            .fold(0, u64::saturating_add);
         check_co_tenant_claims(slug, free, others)?;
         if let Some(claim) = claim {
             claims.insert(slug.to_string(), claim);
@@ -2179,10 +2237,11 @@ impl ModelManager {
             cell.cap = Some(cap);
         }
         drop(cells);
-        let total: u64 = caps.iter().sum();
+        let total: u64 = caps.iter().copied().fold(0, u64::saturating_add);
         let reserve = shares.iter().map(|s| s.reserve).max().unwrap_or(0);
         for ((slug, e), &cap) in engines.iter().zip(&caps) {
-            e.lock().set_co_tenant(Some(cap), reserve + (total - cap));
+            e.lock()
+                .set_co_tenant(Some(cap), reserve.saturating_add(total - cap));
             tracing::info!(%slug, cap_mib = cap >> 20, reserve_mib = reserve >> 20, room_mib = room >> 20, "planner: co-resident KV budget capped");
         }
         Ok(())
@@ -2218,7 +2277,9 @@ impl ModelManager {
         let mut held = 0u64;
         let mut shares = Vec::with_capacity(engines.len());
         for ((slug, _), (_, e)) in engines.iter().zip(&guards) {
-            held += e.kv_live_held();
+            held = held
+                .checked_add(e.kv_live_held())
+                .ok_or_else(|| EnsureError::NoKvRoom("resident KV byte overflow".into()))?;
             let seq = e
                 .kv_admission_budget()
                 .map_or(0, |b| b.bytes_for_rows(e.max_ctx() as u64));
@@ -2231,7 +2292,11 @@ impl ModelManager {
         }
         let free = self.free_vram().map_err(EnsureError::Load)?;
         drop(guards);
-        Ok((free + held, shares))
+        Ok((
+            free.checked_add(held)
+                .ok_or_else(|| EnsureError::NoKvRoom("resident KV room overflow".into()))?,
+            shares,
+        ))
     }
 
     /// A load that does not fit `avail`: resident caches give memory back ([`Self::reclaim_from`])
@@ -2335,10 +2400,12 @@ struct KvShare {
 fn kv_shares(room: u64, shares: &[KvShare]) -> std::result::Result<Vec<u64>, KvRefusal> {
     let reserve = shares.iter().map(|s| s.reserve).max().unwrap_or(0);
     let floor = |s: &KvShare| s.seq.max(s.committed);
-    let need: u64 = shares.iter().map(floor).sum();
-    let short = (need + reserve).saturating_sub(room);
+    let need = sum_bytes(shares.iter().map(floor));
+    let required = sum_bytes([need, reserve]);
+    let short = required.saturating_sub(room);
+    let fits = residency_contract::admits(required, room);
     let room = room.saturating_sub(reserve);
-    if short > 0 {
+    if !fits {
         let e = EnsureError::NoKvRoom(format!(
             "co-resident models need {} MiB to keep their admitted sequences and one \
              full-context sequence each, and the device backs {} MiB beside a {} MiB reserve",
@@ -2362,14 +2429,14 @@ fn check_co_tenant_claims(
     free: u64,
     claimed: u64,
 ) -> std::result::Result<(), KvRefusal> {
-    if free < claimed {
+    if !residency_contract::admits(claimed, free) {
         let e = EnsureError::NoKvRoom(format!(
             "loading {slug} leaves {} MiB free and the co-resident models need {} MiB to keep \
              admitting one full-context sequence each",
             free >> 20,
             claimed >> 20
         ));
-        return Err((e, claimed - free));
+        return Err((e, claimed.saturating_sub(free)));
     }
     Ok(())
 }
@@ -2394,7 +2461,7 @@ fn check_tp(device: &dyn ManagerDevice, slug: &str, tp: u32) -> Result<()> {
         return Err(RuntimeError::Rejected(format!(
             "{slug} declares tensor-parallel degree {tp}, and this model manager device is \
              single-device (one backend per engine). Serving it here would load one shard \
-             and answer with it. Compile a TP1 bundle, or serve it on a backend supporting TP (e.g. AMD HSA)."
+             and answer with it. Compile a TP1 bundle, or serve it on AMD HSA, or on CUDA with one PLOW_GROUP_DEVICES entry per rank."
         )));
     }
     // The engine spans `tp` devices from the group's first: past the group they belong to other
@@ -2541,6 +2608,44 @@ mod tests {
     }
 
     struct Group(u32);
+
+    #[tokio::test]
+    async fn overflowing_plan_is_refused_before_any_engine_load() {
+        let plan = BlobPlan {
+            weights_bytes: u64::MAX,
+            kv_bytes: 1,
+            other_bytes: 0,
+            sidecar_bytes: 0,
+            overhead_bound: 0,
+            min_kv_bytes: 0,
+        };
+        assert_eq!(plan.tensor_total(), u64::MAX);
+        assert_eq!(plan.required(1), u64::MAX);
+        let (_state, mgr) = manager_over(
+            Arc::new(Mem {
+                free: u64::MAX,
+                total: u64::MAX,
+            }),
+            &[("m", Path::new("/nonexistent-formal-fixture"), plan)],
+        );
+        assert!(matches!(
+            mgr.load("m", false).await,
+            Err(EnsureError::WontFit { .. })
+        ));
+        assert!(mgr.load_initial().await.is_err());
+    }
+
+    #[test]
+    fn overflowing_resident_claims_and_share_floors_are_refused() {
+        assert!(check_co_tenant_claims("m", u64::MAX, u64::MAX).is_err());
+        let shares = [KvShare {
+            slug: "m".into(),
+            seq: u64::MAX,
+            committed: 0,
+            reserve: 1,
+        }];
+        assert!(kv_shares(u64::MAX, &shares).is_err());
+    }
 
     impl ManagerDevice for Group {
         fn device_ordinal(&self) -> u8 {
