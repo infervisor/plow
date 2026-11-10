@@ -13,6 +13,10 @@ launched rows over the observed demand (exact dynamic program; every frame runs 
 capacity holding it), and where neighbouring capacities carry a measured launch time, the time
 that saves (cost interpolated linearly between measured capacities).
 
+Rows are in the unit of the family's capacities: batch items for most, a length (prompt rows,
+feature frames, samples) for prefill, encoder, reference, mm_audio and text_encoder. Families whose
+capacities have a second dimension (codec windows, stream steps) are counted on the batch only.
+
 It only recommends: capacities are added to the packet's ladder at the next emit.
 """
 import argparse
@@ -209,7 +213,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("metrics", nargs="+", help="/metrics URL or saved text; two = the window between them")
     ap.add_argument("--model", help="only this model_name")
-    ap.add_argument("--family", help="only this family (decode, prefill, depth, codec)")
+    ap.add_argument("--family", help="only this family (decode, prefill, depth, codec, encoder_pack, ...: the family label)")
     ap.add_argument("--add", type=int, default=3, help="largest number of capacities to add (default 3)")
     ap.add_argument("--top", type=int, default=12, help="demand rows to print (default 12)")
     ap.add_argument("--per-engine", action="store_true", help="do not sum a model's engines")

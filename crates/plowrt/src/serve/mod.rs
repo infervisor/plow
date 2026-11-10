@@ -892,7 +892,10 @@ impl AppState {
     ) {
         self.mm.write().insert(
             key.to_string(),
-            Arc::new(mm::MmModel::new(dir, contract, device)),
+            Arc::new(
+                mm::MmModel::new(dir, contract, device)
+                    .observing(Arc::clone(&self.model_metrics(key).buckets)),
+            ),
         );
     }
 

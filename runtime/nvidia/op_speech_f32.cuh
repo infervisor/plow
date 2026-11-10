@@ -4572,7 +4572,7 @@ static __device__ __forceinline__ void sp_w_conv_rows(unsigned m0, unsigned n0, 
             for (unsigned j = 0; j < 4; j++) {
                 const unsigned o = nb + j * 8u;
                 res[h][j] = a.residual && m < M && (long long)rb[h] >= 0 && o < N
-                                ? __ldg((const float2*)(a.residual + rb[h] + o))
+                                ? *(const float2*)(a.residual + rb[h] + o)
                                 : make_float2(0.f, 0.f);
             }
         }
@@ -5041,7 +5041,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
 #pragma unroll
             for (unsigned g = 0; g < NG; g++) {
                 const unsigned o = n0 + 8u * g + cw;
-                res[h][g] = a.residual && ok[h] && o < N ? __ldg((const float2*)(a.residual + base[h] + og + o)) : make_float2(0.f, 0.f);
+                res[h][g] = a.residual && ok[h] && o < N ? *(const float2*)(a.residual + base[h] + og + o) : make_float2(0.f, 0.f);
             }
 #pragma unroll
         for (unsigned g = 0; g < NG; g++) {
@@ -5203,7 +5203,7 @@ static __device__ __forceinline__ void sp_wgi_gemm(unsigned M, unsigned N, unsig
 #pragma unroll
             for (unsigned g = 0; g < NG; g++) {
                 const unsigned o = n0 + 8u * g + cw;
-                res[h][g] = a.residual && ok[h] && o < N ? __ldg((const float2*)(a.residual + base[h] + o)) : make_float2(0.f, 0.f);
+                res[h][g] = a.residual && ok[h] && o < N ? *(const float2*)(a.residual + base[h] + o) : make_float2(0.f, 0.f);
             }
 #pragma unroll
         for (unsigned g = 0; g < NG; g++) {

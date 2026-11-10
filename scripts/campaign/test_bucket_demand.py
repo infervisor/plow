@@ -105,6 +105,21 @@ class BucketDemandTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("no plowrt_bucket_* series", out)
 
+    def test_any_family_label_is_reported_asr_and_llm_included(self):
+        text = (metrics({24: 300, 4: 50}, {32: 300, 4: 50}, {32: 2400}, model="asr", family="encoder_pack",
+                        caps=(4, 8, 16, 32, 64, 192), seconds={4: (0.5, 50), 16: (3.0, 100), 32: (15.0, 300)})
+                + metrics({7: 40}, {8: 40}, {8: 40}, model="llm", family="verify", caps=(1, 4, 8))
+                + TWENTY)
+        code, out = run(self.file("m.prom", text))
+        self.assertEqual(code, 0, out)
+        for group in ("model=asr family=encoder_pack", "model=llm family=verify", "model=maya2 family=depth"):
+            self.assertIn(group, out)
+        # 16 -> 30 ms and 32 -> 50 ms: a 24-chunk launch is priced 40 ms, 300 * 10 ms saved.
+        self.assertIn("add 1: [24]  launched rows -24.5 %, padding 0.0 %, launch time -19.4 % (3.0 of 15.5 s)", out)
+        code, out = run(self.file("m.prom", text), "--family", "verify")
+        self.assertIn("add 1: [7]", out)
+        self.assertNotIn("encoder_pack", out)
+
     def test_cost_interpolates_only_between_measured_capacities(self):
         seconds = bd.cost_model({"launch_seconds_sum": {16: 6.0, 32: 108.0, 64: 0.0},
                                  "launch_seconds_count": {16: 100, 32: 900, 64: 0}})

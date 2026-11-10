@@ -246,6 +246,20 @@ enum Family {
     SlotCached,
 }
 
+impl Family {
+    /// The bucket-demand family of this capacity list (its batch dimension).
+    fn bucket(self) -> crate::obs::bucket::Family {
+        use crate::obs::bucket::Family as B;
+        match self {
+            Family::Decode => B::CodecDecode,
+            Family::Window => B::CodecWindow,
+            Family::Step => B::Codec,
+            Family::Slot => B::CodecSlot,
+            Family::SlotCached => B::CodecSlotWindow,
+        }
+    }
+}
+
 enum Msg {
     Job(Job),
     Release(SlotId),
@@ -1297,15 +1311,18 @@ fn pack(
 }
 
 impl Bound {
-    fn capacity(&self, family: Family, batch: usize, frames: usize) -> Option<&Capacity> {
-        let caps = match family {
+    fn capacities_of(&self, family: Family) -> &[Capacity] {
+        match family {
             Family::Decode => &self.capacities,
             Family::Window => &self.cached,
             Family::Step => &self.steps,
             Family::Slot => &self.slot_caps,
             Family::SlotCached => &self.cslot_caps,
-        };
-        smallest(caps, batch, frames)
+        }
+    }
+
+    fn capacity(&self, family: Family, batch: usize, frames: usize) -> Option<&Capacity> {
+        smallest(self.capacities_of(family), batch, frames)
     }
 
     /// Why `j` cannot launch, if it cannot.
@@ -1560,7 +1577,7 @@ impl Bound {
             crate::obs::bucket::Family::Codec,
             jobs.len(),
             cb,
-            Some((t2 - t1).as_micros() as u64),
+            Some(gpu_us as u64),
         );
         io.pcm_buf.resize(cb * cn * fs, 0.0);
         rt.read_tensor_at(
@@ -1730,6 +1747,8 @@ impl Bound {
             }
         }
         let t2 = std::time::Instant::now();
+        self.buckets
+            .record(family.bucket(), jobs.len(), cb, Some(gpu_us as u64));
         let mut pcm = vec![0f32; cb * cf * self.frame_samples];
         self.runtime
             .read_tensor_at(self.pcm, 0, bytemuck::cast_slice_mut(&mut pcm))
@@ -1830,10 +1849,16 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
                     }
                 }
                 Msg::Observe(buckets) => {
-                    buckets.declare(
-                        crate::obs::bucket::Family::Codec,
-                        codec.steps.iter().map(|c| c.0),
-                    );
+                    for family in [
+                        Family::Decode,
+                        Family::Window,
+                        Family::Step,
+                        Family::Slot,
+                        Family::SlotCached,
+                    ] {
+                        let caps = codec.capacities_of(family);
+                        buckets.declare(family.bucket(), caps.iter().map(|c| c.0));
+                    }
                     codec.buckets = buckets;
                 }
             }

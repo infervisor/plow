@@ -127,6 +127,7 @@ fn guided_models() -> &'static Bound<super::guided_speech::GuidedSpeech> {
 fn guided_model(
     assets: &Path,
     credit: Arc<crate::sched::admission::DownstreamCredit>,
+    buckets: &Arc<crate::obs::bucket::BucketDemand>,
     device: u8,
 ) -> Result<Option<Arc<super::guided_speech::GuidedSpeech>>, String> {
     let at = (assets.to_path_buf(), device);
@@ -137,7 +138,7 @@ fn guided_model(
         .map_err(|e| e.to_string())?
         .is_some()
     {
-        let g = super::guided_speech::GuidedSpeech::start(assets, credit, device)
+        let g = super::guided_speech::GuidedSpeech::start(assets, credit, buckets, device)
             .map_err(|e| e.to_string())?;
         tracing::info!(dir = %assets.display(), device, "tts: guided speech pipeline bound to the serve mux");
         Some(Arc::new(g))
@@ -166,15 +167,11 @@ pub fn bind(state: &AppState, slug: &str) -> Result<(), String> {
         .get(state.model_of(slug))
         .map_err(|e| e.to_string())?;
     let device = state.ordinal_of(slug);
-    let bound = guided_model(&bundle.dir, state.downstream(slug), device).and_then(|g| match g {
+    let buckets = &state.model_metrics(slug).buckets;
+    let credit = state.downstream(slug);
+    let bound = guided_model(&bundle.dir, credit, buckets, device).and_then(|g| match g {
         Some(_) => Ok(()),
-        None => speech_model(
-            &bundle.dir,
-            state.downstream(slug),
-            &state.model_metrics(slug).buckets,
-            device,
-        )
-        .map(drop),
+        None => speech_model(&bundle.dir, state.downstream(slug), buckets, device).map(drop),
     });
     bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))
 }
@@ -215,7 +212,7 @@ fn bind_pipeline(
     buckets: &Arc<crate::obs::bucket::BucketDemand>,
     device: u8,
 ) -> Result<Pipeline, String> {
-    if let Some(g) = guided_model(dir, Arc::clone(&credit), device)? {
+    if let Some(g) = guided_model(dir, Arc::clone(&credit), buckets, device)? {
         return Ok(Pipeline::Guided(g));
     }
     Ok(match speech_model(dir, credit, buckets, device)? {
@@ -700,10 +697,11 @@ pub fn speech_model(
                 return Err("external speech conditioning requires a stateful codec".into());
             }
             let encoder = match &contract.text_encoder {
-                Some(sub) => Some(Arc::new(super::text_encoder::TextEncoder::load(
-                    &assets.join(sub),
-                    device,
-                )?)),
+                Some(sub) => {
+                    let e = super::text_encoder::TextEncoder::load(&assets.join(sub), device)?;
+                    e.observe_buckets(buckets);
+                    Some(Arc::new(e))
+                }
                 None => None,
             };
             let reference_file = contract.clone.as_ref().map(|c| &c.encoder).or_else(|| {
@@ -715,6 +713,7 @@ pub fn speech_model(
             let ref_encoder = match reference_file {
                 Some(file) => {
                     let mut e = super::ref_encoder::RefEncoder::load(&assets.join(file), device)?;
+                    e.observe_buckets(buckets);
                     if e.frame_codes != contract.frame_codes
                         || e.frame_samples != contract.frame_samples
                         || e.sample_rate != contract.sample_rate

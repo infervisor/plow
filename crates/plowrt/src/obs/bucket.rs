@@ -13,28 +13,95 @@ use std::sync::{Arc, OnceLock};
 use super::serving::family as metric_family;
 use super::Metrics;
 
-/// A launch kind whose capacities the packet declares.
+/// A launch kind whose capacities the packet declares. `rows` is what the launch must hold in
+/// the unit of its capacities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Family {
-    /// Decode token batch: rows = occupied slot extent, capacities = the decode rungs.
+    /// Plain decode launch: slot extent against the decode rungs.
     Decode,
-    /// Packed prefill launch: rows = prompt rows plus riders, capacities = the prefill buckets.
+    /// Prefill launch (packed token batch, or one chunk of a serial prefill): rows against the
+    /// prefill buckets.
     Prefill,
-    /// Speech depth program: rows = slot extent of the frame, capacities = the depth programs.
+    /// Speculative verify launch: verify rows (span tokens + 1 per span) against the decode rungs.
+    Verify,
+    /// Speech depth program: slot extent of the frame against the depth programs.
     Depth,
-    /// Stateful codec step: rows = streams in the launch, capacities = the step batches.
+    /// Stateful codec step: streams against the step batches.
     Codec,
+    /// Whole-utterance codec decode: items against the decode batches.
+    CodecDecode,
+    /// Codec streaming window: items against the cached-window batches.
+    CodecWindow,
+    /// Voice-slot synthesis: items against the slot batches.
+    CodecSlot,
+    /// Cloned-voice window on the slot caches: items against their batches.
+    CodecSlotWindow,
+    /// Speech text encoder launch: segment tokens against its prefill buckets.
+    TextEncoder,
+    /// Reference-audio encoder (voice cloning): clip length against the encoder lengths.
+    Reference,
+    /// Multimodal image encoder launch: images against the encoder batches.
+    MmImage,
+    /// Multimodal audio encoder launch: clip frames against the encoder lengths.
+    MmAudio,
+    /// One utterance's audio encoder launch: input feature frames against the encoder lengths.
+    Encoder,
+    /// Packed audio encoder launch: chunks of every utterance against the packed chunk counts.
+    EncoderPack,
+    /// Batched live stream step: streams against the step batches.
+    Stream,
+    /// Batched upload stream step: streams against the upload step batches.
+    Upload,
+    /// Batched transducer predictor: lanes against the predictor batches.
+    Predict,
+    /// Batched transducer joint: rows against the joint batches.
+    Joint,
 }
 
 impl Family {
-    pub const ALL: [Self; 4] = [Self::Decode, Self::Prefill, Self::Depth, Self::Codec];
+    pub const ALL: [Self; 19] = [
+        Self::Decode,
+        Self::Prefill,
+        Self::Verify,
+        Self::Depth,
+        Self::Codec,
+        Self::CodecDecode,
+        Self::CodecWindow,
+        Self::CodecSlot,
+        Self::CodecSlotWindow,
+        Self::TextEncoder,
+        Self::Reference,
+        Self::MmImage,
+        Self::MmAudio,
+        Self::Encoder,
+        Self::EncoderPack,
+        Self::Stream,
+        Self::Upload,
+        Self::Predict,
+        Self::Joint,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Decode => "decode",
             Self::Prefill => "prefill",
+            Self::Verify => "verify",
             Self::Depth => "depth",
             Self::Codec => "codec",
+            Self::CodecDecode => "codec_decode",
+            Self::CodecWindow => "codec_window",
+            Self::CodecSlot => "codec_slot",
+            Self::CodecSlotWindow => "codec_slot_window",
+            Self::TextEncoder => "text_encoder",
+            Self::Reference => "reference",
+            Self::MmImage => "mm_image",
+            Self::MmAudio => "mm_audio",
+            Self::Encoder => "encoder",
+            Self::EncoderPack => "encoder_pack",
+            Self::Stream => "stream",
+            Self::Upload => "upload",
+            Self::Predict => "predict",
+            Self::Joint => "joint",
         }
     }
 }
@@ -690,6 +757,17 @@ mod tests {
             b.log_lines().is_empty(),
             "an undeclared family records nothing"
         );
+    }
+
+    #[test]
+    fn families_index_their_own_ladder_and_have_distinct_labels() {
+        let mut labels: Vec<_> = Family::ALL.iter().map(|f| f.label()).collect();
+        for (i, f) in Family::ALL.into_iter().enumerate() {
+            assert_eq!(f as usize, i);
+        }
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), Family::ALL.len());
     }
 
     #[test]

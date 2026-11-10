@@ -489,14 +489,19 @@ impl ServeEngine {
         }
     }
 
-    /// Count the engine's launches into the model's bucket-demand counters; `false` when the
-    /// engine counts none itself.
+    /// Count the engine's launches into the model's bucket-demand counters; `true` when the
+    /// engine counts its own decode launches (the dispatcher then adds only their time).
     pub fn observe_buckets(&mut self, buckets: &Arc<crate::obs::bucket::BucketDemand>) -> bool {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(e) => {
                 e.observe_buckets(Arc::clone(buckets));
                 true
+            }
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => {
+                e.observe_buckets(Arc::clone(buckets));
+                false
             }
             #[allow(unreachable_patterns)]
             _ => {
@@ -1888,6 +1893,13 @@ mod amd_serve {
     }
 
     impl AmdServe {
+        /// Count a single-rank engine's prefill launches into `buckets` (a TP group counts none).
+        pub fn observe_buckets(&mut self, buckets: Arc<crate::obs::bucket::BucketDemand>) {
+            if let Ranks::One(e) = &mut self.ranks {
+                e.observe_buckets(buckets);
+            }
+        }
+
         /// Bring up every rank of `blob`.
         ///
         /// The TP degree is read off the PACKET (`DevBlob::tp`), not off a host

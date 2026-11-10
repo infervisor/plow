@@ -212,6 +212,10 @@ fn window_start(w: &StreamWindows, steps: usize) -> usize {
 }
 
 impl Transcriber for PacketRnntTranscriber {
+    fn observe_buckets(&mut self, buckets: &std::sync::Arc<crate::obs::bucket::BucketDemand>) {
+        self.execution.observe_buckets(buckets)
+    }
+
     fn stream_open(&mut self) -> Result<Option<u64>> {
         if self.execution.stream_windows().is_none() {
             return Ok(None);

@@ -63,6 +63,11 @@ impl AudioLmExecution for CudaAudioLmExecution {
         self.decoder.max_ctx()
     }
 
+    fn observe_buckets(&mut self, buckets: &Arc<crate::obs::bucket::BucketDemand>) {
+        self.encoder.observe_buckets(buckets);
+        self.decoder.observe_buckets(Arc::clone(buckets));
+    }
+
     fn prefill(&mut self, slot: usize, input: AudioLmPrefill<'_>) -> Result<AudioLmPrefilled> {
         let started = std::time::Instant::now();
         let audio = self.encoder.encode(input.features)?;

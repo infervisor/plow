@@ -310,7 +310,12 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn(path: PathBuf, device: u8, processor: Processor) -> crate::Result<Self> {
+    fn spawn(
+        path: PathBuf,
+        device: u8,
+        processor: Processor,
+        buckets: Arc<crate::obs::bucket::BucketDemand>,
+    ) -> crate::Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel::<Work>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
@@ -331,7 +336,7 @@ impl Worker {
                 let mut enc = match loaded {
                     Ok(e) => {
                         let _ = ready_tx.send(Ok(()));
-                        e
+                        e.observing(buckets)
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -367,6 +372,7 @@ pub struct MmModel {
     device: u8,
     slab: Arc<Slab>,
     workers: Mutex<HashMap<String, Arc<Mutex<Option<Worker>>>>>,
+    buckets: Arc<crate::obs::bucket::BucketDemand>,
     pub stats: MmStats,
 }
 
@@ -395,8 +401,15 @@ impl MmStats {
 }
 
 impl MmModel {
+    /// Count the encoders' launches into `buckets`.
+    pub fn observing(mut self, buckets: Arc<crate::obs::bucket::BucketDemand>) -> Self {
+        self.buckets = buckets;
+        self
+    }
+
     pub fn new(dir: &Path, contract: &MmContract, device: u8) -> Self {
         Self {
+            buckets: Default::default(),
             contract: contract.clone(),
             dir: dir.to_path_buf(),
             device,
@@ -423,10 +436,11 @@ impl MmModel {
         // lock serialises concurrent first users there too.
         let processor = m.processor().map_err(crate::RuntimeError::Rejected)?;
         let (path, device) = (self.dir.join(&m.packet), self.device);
+        let buckets = Arc::clone(&self.buckets);
         tokio::task::spawn_blocking(move || {
             let mut w = cell.lock();
             if w.is_none() {
-                *w = Some(Worker::spawn(path, device, processor)?);
+                *w = Some(Worker::spawn(path, device, processor, buckets)?);
             }
             Ok(w.as_ref().unwrap().tx.clone())
         })
