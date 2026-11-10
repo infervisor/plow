@@ -520,6 +520,7 @@ impl SharedAsr {
                 turn: opts.ids.as_ref().and_then(|i| i.turn_key.clone()),
                 continuing: false,
                 speech: Some(Box::new(SpeechJob {
+                    device_frames: false,
                     overlay,
                     overlay_pos,
                     pos_base: None,
@@ -531,6 +532,7 @@ impl SharedAsr {
                     frame_codes_per_row: 0,
                     feed: None,
                     maya2_memory: None,
+                    slot_prefix_reuse: false,
                 })),
                 prefix: None,
                 tenant: None,

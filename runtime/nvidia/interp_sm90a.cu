@@ -52,6 +52,7 @@
 #define plow_sm120_light_quant plow_sm90a_light_quant
 #define plow_sm120_light_quant_norm plow_sm90a_light_quant_norm
 #define plow_sm120_light_router plow_sm90a_light_router
+#define plow_sm120_rider_flash128 plow_sm90a_rider_flash128
 #define plow_sm120_rider_flash256 plow_sm90a_rider_flash256
 #define plow_sm120_rider_flash512 plow_sm90a_rider_flash512
 #define plow_sm120_rider_merge plow_sm90a_rider_merge

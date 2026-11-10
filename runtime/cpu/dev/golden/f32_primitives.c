@@ -965,6 +965,7 @@ static float g_act_f32(uint32_t kind, float x, float p0, float p1) {
     case 14: return x * p0 + p1;
     case 15: return x > 0.0f ? x : 0.0f;
     case 16: return sqrtf(x);
+    case 18: return plow_bf2f(plow_f2bf(x));
     case 20: return logf(x);
     default: return x;
     }

@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 
 use crate::program::{Packet, Program};
 
+pub(crate) const CONV1D_SPLITK: u32 = 1 << 20;
+
 pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
     use DevOp::*;
     let op = DevOp::from_u16(d.op).ok_or("unknown kernel effects")?;
@@ -23,6 +25,13 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
             return Err("missing required effect operand".into());
         }
         return Ok(writes);
+    }
+    if op == Conv1dF32 && d.fj[2] & CONV1D_SPLITK != 0 {
+        // SpConvArgs::splitk uses t7 for tickets and partials, rather than a row scale.
+        if [0, 1, 2, 7].iter().any(|&slot| d.t[slot] == TENSOR_NONE16) {
+            return Err("split-K convolution missing required effect operand".into());
+        }
+        return Ok(&[0, 7]);
     }
     if let Some(writes) = llm_outputs(op, d) {
         return writes;
@@ -139,6 +148,15 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
     let handle = |h: u32| h != 0 && h < TENSOR_NONE_I;
     let writes: Option<&'static [usize]> = match op {
         Embed if all(&[0, 1, 2]) => Some(&[0]),
+        // op_elementwise.cuh d_embed_frame writes out only, including its in-place RMS norm.
+        EmbedFrameBf16
+            if all(&[0, 1, 2, 3, 4])
+                && none(&[6, 7])
+                && d.i[7] & !3 == 0
+                && (d.i[7] & 2 == 0 || has(5)) =>
+        {
+            Some(&[0])
+        }
         SoftCap | Argmax | ArgmaxFin if all(&[0, 1]) => Some(&[0]),
         GemvArgmax if all(&[0, 1, 2, 3]) => Some(&[0, 3]),
         FlashDecode if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
@@ -240,6 +258,7 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         }
         QwenSigmoidGate if all(&[0, 1, 2]) && none(&[4, 5, 6, 7]) => Some(&[0]),
         Embed
+        | EmbedFrameBf16
         | SoftCap
         | Argmax
         | ArgmaxFin
@@ -914,6 +933,67 @@ mod tests {
         assert_eq!(outputs(&d).unwrap(), &[0]);
         d.i[7] = 8 | 4;
         assert_eq!(outputs(&d).unwrap(), &[0, 4]);
+    }
+
+    #[test]
+    fn frame_embedding_effects_require_each_input_and_the_norm_weight_when_used() {
+        for mode in 0..4 {
+            let mut d = DevInst64 {
+                op: DevOp::EmbedFrameBf16 as u16,
+                blocks: 1,
+                fj: [0; 3],
+                t: [0, 1, 2, 3, 4, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],
+                i: [1, 8, 16, 2, 16, 0, 16, mode],
+            };
+            if mode & 2 != 0 {
+                assert!(outputs(&d).is_err());
+                d.t[5] = 5;
+            }
+            assert_eq!(outputs(&d).unwrap(), &[0]);
+            for slot in 0..5 {
+                let mut missing = d;
+                missing.t[slot] = TENSOR_NONE16;
+                assert!(outputs(&missing).is_err());
+            }
+            for slot in [6, 7] {
+                let mut extra = d;
+                extra.t[slot] = 6;
+                assert!(outputs(&extra).is_err());
+            }
+            for unknown in [4, 8, u32::MAX] {
+                let mut extra = d;
+                extra.i[7] = unknown;
+                assert!(outputs(&extra).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn splitk_convolution_writes_scratch_while_row_scale_is_read_only() {
+        let mut d = DevInst64 {
+            op: DevOp::Conv1dF32 as u16,
+            blocks: 1,
+            fj: [0, 0, CONV1D_SPLITK],
+            t: [
+                0,
+                1,
+                2,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                TENSOR_NONE16,
+                3,
+            ],
+            i: [1, 8, 4, 4, 1, 1, 1, 1],
+        };
+        assert_eq!(outputs(&d).unwrap(), &[0, 7]);
+        for slot in [0, 1, 2, 7] {
+            let mut missing = d;
+            missing.t[slot] = TENSOR_NONE16;
+            assert!(outputs(&missing).is_err());
+        }
+        d.fj[2] = 0;
+        assert_eq!(outputs(&d).unwrap(), &[0]);
     }
 
     /// One audited LLM entry: op, present t-slots, `i` overrides, `fj[2]`, the expected write set
