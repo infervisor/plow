@@ -370,8 +370,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_CODEC_WGMMA_RAGGED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub codec_wgmma_ragged: bool,
 
-    /// With `PLOW_EMIT_CODEC_WGMMA_RAGGED`: the decoder input conv leaves 3xTF32 for split-bf16
-    /// taps wgmma (raises PCM error vs the FP32 reference, about 3.3e-5 -> 4.0e-5 relative L2).
+    /// The codec's decoder input conv and the Breeze-layout pre conv leave 3xTF32 for split-bf16
+    /// taps wgmma (any layout; needs `PLOW_EMIT_SNAC_SPLIT_BF16`). Changes PCM (Qwen3-TTS: about
+    /// 3.3e-5 -> 4.0e-5 relative L2 vs the FP32 reference): a recipe sets it once its int16-RMS PCM
+    /// gate passes on this route. A class-table split-K pin on either conv needs it.
     #[arg(long, env = "PLOW_EMIT_CODEC_DEC_IN_WGMMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub codec_dec_in_wgmma: bool,
 

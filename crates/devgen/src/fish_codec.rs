@@ -970,7 +970,7 @@ fn program_for(
             input_is_temp: false,
             row_scale: None,
             alpha_out: None,
-            taps_wgmma: true,
+            taps_wgmma: crate::emit_config::active().codec_dec_in_wgmma,
             wgmma_ragged: false,
         };
         last = stateful(&mut p, c, last, pre, "state.codec.pre".into(), 0)?.done;
@@ -1258,7 +1258,7 @@ fn program_for(
     );
     let mut c = c;
     c.len = len(cfg.ups.len());
-    c.taps_wgmma = ragged && crate::emit_config::active().codec_dec_in_wgmma;
+    c.taps_wgmma = crate::emit_config::active().codec_dec_in_wgmma;
     cur = stateful(
         &mut p,
         cur.output,
