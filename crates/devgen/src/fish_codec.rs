@@ -1149,8 +1149,13 @@ fn program_for(
         let w = |s: &str| format!("w.up{u}.{s}");
         // Breeze under split-bf16: kernel = stride, so the transposed conv is a pointwise conv to
         // stride x dim columns over the phase-major weights ([stride][dim][dim]), whose rows read
-        // back as stride output rows each (bias repeated per phase, `.b_rep`).
-        let pointwise = cfg.breeze && splits.is_some() && dim % 4 == 0 && dim >= 16;
+        // back as stride output rows each (bias repeated per phase, `.b_rep`). It leaves 3xTF32
+        // for the split-bf16 wgmma tile, so it shares the knob of the other PCM-changing routes.
+        let pointwise = cfg.breeze
+            && splits.is_some()
+            && crate::emit_config::active().codec_dec_in_wgmma
+            && dim % 4 == 0
+            && dim >= 16;
         let mut c = if pointwise {
             conv(
                 other(cur.output),
