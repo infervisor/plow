@@ -149,6 +149,88 @@ Single-pass is ruled out:
 - 1-pass tf32 rel-L2 is 5e-4.
 - A single bf16 pass moved mel by 3e-3 (`tts.md`).
 
+## Generator search per block (`gen_search.py`)
+
+`scripts/gen_kernels/gen_search.py` is the standing form of the probes above: one driver, one
+small spec file per block. It is a bring-up step (agent-tools.md, HARD RULE section), run on a
+block that sits far from its roofline before another round of hand-tuning. The policy above is
+unchanged: the output is a reference row; a schedule that wins is hand-ported, or shipped as a
+role object when the in-model gain exceeds about 5% of the step.
+
+- **Spec:** `scripts/gen_kernels/spec_<name>.py` exports `SPEC`. Fields (`SPEC_FIELDS` in the
+  driver is the authority; `spec_s3gen_cfm_attn.py` is the worked example):
+  - `name`, `op`, `dtype`: identity and table text.
+  - `classes`: `{class: shape dict}`, the served batch classes. An optional
+    `"step": {"us", "calls"}` (full step time, this block's calls in it) turns the verdict into
+    an in-model one.
+  - `cost(cls)`: `{"bytes", "flops", "peak", "passes"}`. Floor = max(bytes / HBM read,
+    passes x flops / peak), `peak` one of `bf16`, `fp8` (calibrated: 3094 GB/s, 771.3 / 1407 TF
+    on the H100; `--ceilings` takes another box's `calibrate_ceilings.py` JSON), `tf32`, `fp32`
+    (`speech_roofline.py`'s measured peaks).
+  - `inputs(cls, seed)`, `rotate`, `out(cls)`, `reference(cls, inputs)`: device tensors, the
+    names regenerated per cold set, the output buffer, and an fp64 reference.
+  - `tol`: `{"rel_l2": bound}`; `"pcm": True` adds the int16-RMS PCM bound for a codec output
+    (per-case RMS error <= 1/32768/sqrt(12) of full scale).
+  - `generators`: per generator (`tilelang`, `triton`) a `grid` (cartesian) or `sweep` (list)
+    of configs, `build(cfg, cls)` and `bind(kernel, cls, inputs, out)` returning a launch
+    closure; optional `valid(cfg, cls)` and `static_shapes`.
+  - `current` (optional): the plow kernel, either a standalone probe library
+    (`lib: {src, flags}` + `bind`, measured in the same lease) or `measured_us` per class
+    recorded from the block harness (printed as "(recorded)").
+  - Specs import torch and the generators inside their functions, so `list`, `plan`, `report`
+    and `test_gen_search.py` run on a CPU-only box.
+- **Run:**
+  1. `gen_search.py plan <name>`: grid, run count and floors (CPU).
+  2. `gen_search.py build-current <name> --out <scratch>`: compiles the probe library with
+     `PLOW_NVCC` (CPU; on the lab box in the plain shell, a host binary built inside the queue's
+     shell aborts at CUDA init).
+  3. `gen_search.py submit <name> --out <scratch> [--classes a,b] [--gens tilelang]`: queues
+     `run` through `scripts/bench/gpuq.py` under a 15 min bound, one job per spec at a time. It
+     runs `PYREF` (the catalog's interpreter: torch + TileLang 0.1.12 / Triton 3.7.1) and
+     replaces the queue runner's `PATH`, `CUDA_HOME`, `NVCC_PREPEND_FLAGS`, `LD_LIBRARY_PATH`
+     and `TL_*` with the submitter's, because the runner outlives submitters. TileLang needs
+     nvcc 12.9 with a gcc <= 14 host compiler (`NVCC_PREPEND_FLAGS='-ccbin <g++-14>'`); inside
+     the dev shell use the `.#tilelang` toolchain as for `build_catalog.py`.
+  4. `gen_search.py report <name> --out <scratch> [--all]`: the table (CPU). `--all` lists
+     every candidate.
+- **Method:** as the probes above. Each arm runs once on seed-0 inputs for numerics, then is
+  timed as a CUDA graph over rotating cold input sets (> 160 MB in sum, at most 64 sets),
+  median of 7 replays. A class whose `rotate` inputs cannot reach that is timed cache-warm and
+  the report says so: put the operands the served kernel streams from HBM in `rotate`. A
+  candidate over `tol`, or one that fails to build or launch, is recorded and never selected.
+  Rows append to `<scratch>/<name>.results.jsonl`; a rerun resumes, so a grid larger than one
+  job's budget (`--budget-s`, TileLang compiles take about 10 s each) is a second `submit`. A
+  row counts only while its class geometry, tolerance and config are still the spec's; after
+  changing a generator body or the probe, use a fresh directory or `--force`.
+- **Output:** the block-vs-roofline table with current plow kernel, best generated candidate and
+  its config, floor, % of floor for both, gap, rel-L2 and the policy verdict.
+
+### First spec: S3Gen CFM attention (`spec_s3gen_cfm_attn`, 2026-11-10)
+
+H100, one queue job (about 6 min: 24 TileLang configs x 4 classes + the current kernel), torch
+2.13 / TileLang 0.1.12, default lowering (cp.async, f32 `T.gemm`, no warp specialisation). Times
+in µs.
+
+| block (op, class) | current plow | best generated | generated config | roofline floor | % of floor (current) | % of floor (generated) | gap (generated vs current) | rel-L2 | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| AttentionF32 prefix306 h8x64, b64_q136 | 269.2 | 804.7 | tilelang bm64 bn32 threads128 stages1 | 30.6 | 11% | 4% | +198.9% | 3.2e-06 | leave: plow kernel ahead |
+| AttentionF32 prefix306 h8x64, b128_q136 | 478.5 | 1590.0 | tilelang bm64 bn32 threads128 stages2 | 61.3 | 13% | 4% | +232.3% | 3.2e-06 | leave: plow kernel ahead |
+| AttentionF32 prefix306 h8x64, b64_q72 | 146.4 | 403.0 | tilelang bm32 bn32 threads256 stages2 | 13.9 | 9% | 3% | +175.3% | 2.7e-06 | leave: plow kernel ahead |
+| AttentionF32 prefix306 h8x64, b128_q72 | 238.7 | 793.3 | tilelang bm32 bn32 threads256 stages1 | 27.7 | 12% | 3% | +232.3% | 2.7e-06 | leave: plow kernel ahead |
+
+- Current = the interpreter path of the standalone probe `cfm_attn.cu` (which 0, 132 blocks),
+  measured in the same lease; it reproduces the probe header's 268 / 474 / 146 / 236 µs.
+- Floor: three split products per GEMM priced at the calibrated 16-bit tensor peak
+  (771.3 TF/s) and 3094 GB/s; the floor is compute-bound at every class.
+- 22 of 24 configs pass the 1e-5 rel-L2 bound at every class; `bm16 bn32 threads256` does not
+  build (TileLang warp-partition assertion).
+- With `TL_TF=1` (tfloat32 shared operands, so the products run on tensor cores; second job,
+  classes b64_q136 and b128_q72) the best config is `bm64 bn32 threads256 stages2` at 535.0 /
+  579.0 µs against 268.6 / 238.4 µs, rel-L2 3.2e-6 / 2.7e-6: still 2.0-2.4x slower.
+- No config of this body comes within 2x of the hand-written kernel, so there is no schedule
+  to port from it. The block stays at 9-13% of its floor. `TL_WG` (wgmma) and a Triton body
+  were not run.
+
 ## AMD
 
 - **Generators:** CuTe DSL and FlashInfer are NVIDIA-only, and the TileLang ROCm backend is
