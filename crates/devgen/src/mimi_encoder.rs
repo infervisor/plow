@@ -283,6 +283,8 @@ fn program_for(
             dual_alpha: false,
             pinned: false,
             wgmma_ragged: false,
+            input_split: false,
+            output_split: false,
         },
     )?;
     let mut d = cfg.filters;
@@ -378,6 +380,7 @@ fn program_for(
                 epsilon: cfg.eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         Ok(s.done(e))
@@ -481,6 +484,8 @@ fn program_for(
             dual_alpha: false,
             pinned: false,
             wgmma_ragged: false,
+            input_split: false,
+            output_split: false,
         },
     )?;
     let down = s.done(e);

@@ -355,6 +355,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_S3GEN_ATTN_H16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub s3gen_attn_h16: bool,
 
+    /// S3Gen CFM transformer-block activations handed between LayerNorm / attention / GEMMs as
+    /// split-bf16 images (sm_90a speech object, `PLOW_SPEECH_SPLIT_A`): bit-identical outputs.
+    #[arg(long, env = "PLOW_EMIT_S3GEN_SPLIT_A", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub s3gen_split_a: bool,
+
     /// SNAC pointwise convs on split-bf16 warpgroup MMA with pre-split weights (sm_90 speech object).
     #[arg(long, env = "PLOW_EMIT_SNAC_SPLIT_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub snac_split_bf16: bool,
@@ -1995,6 +2000,7 @@ impl EmitConfig {
             nv_gemv_rem_split: env_bool("PLOW_NV_GEMV_REM_SPLIT"),
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
             s3gen_attn_h16: env_bool("PLOW_EMIT_S3GEN_ATTN_H16"),
+            s3gen_split_a: env_bool("PLOW_EMIT_S3GEN_SPLIT_A"),
             snac_split_bf16: env_bool("PLOW_EMIT_SNAC_SPLIT_BF16"),
             codec_wgmma_ragged: env_bool("PLOW_EMIT_CODEC_WGMMA_RAGGED"),
             codec_dec_in_wgmma: env_bool("PLOW_EMIT_CODEC_DEC_IN_WGMMA"),

@@ -361,6 +361,8 @@ fn program_for(
             dual_alpha: false,
             pinned: false,
             wgmma_ragged: false,
+            input_split: false,
+            output_split: false,
         },
     )?;
     let mut d = cfg.channels;
@@ -449,6 +451,7 @@ fn program_for(
                 epsilon: cfg.ln_eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         let mut s = Seq {

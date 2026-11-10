@@ -635,6 +635,8 @@ impl Seq {
                 dual_alpha: false,
                 pinned: true,
                 wgmma_ragged: false,
+                input_split: false,
+                output_split: false,
             },
             math,
         )?;
@@ -1210,6 +1212,7 @@ fn program_for(
                 epsilon: ln_eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s = Seq {
@@ -1618,6 +1621,7 @@ fn mimi_program_for(
                 epsilon: cfg.eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s.done(e);

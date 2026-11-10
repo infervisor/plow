@@ -763,6 +763,8 @@ pub(crate) fn fused_conv(
         dual_alpha: dual,
         pinned: true,
         wgmma_ragged: c.wgmma_ragged && (ct || taps),
+        input_split: false,
+        output_split: false,
     };
     let e = match c.row_scale {
         Some((scale, _)) => p.conv1d_f32_row_scaled(x, &deps, stage, scale)?,
