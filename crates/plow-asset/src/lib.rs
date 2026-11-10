@@ -743,6 +743,7 @@ pub mod object_requirements;
 pub mod packed_prefill;
 pub mod spec_context;
 pub mod spec_draft;
+pub mod speech_flag_layout;
 
 pub mod fish_depth;
 pub mod kv_ring;

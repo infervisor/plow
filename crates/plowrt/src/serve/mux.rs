@@ -8139,9 +8139,26 @@ fn gpu_prefill_batched_pass(
 /// through serial prefill keeps it serial until done (packed admission restarts a slot).
 #[cfg(feature = "cuda")]
 fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap: usize) -> bool {
-    crate::config::RuntimeConfig::get().tts_depth_pack
-        && e.depth_packs()
-        && depth_prompts_pack(slots, cap, |i| e.packed_slot_ready(i))
+    depth_route_packs(
+        crate::config::RuntimeConfig::get().tts_depth_pack,
+        e.depth_packs(),
+        slots,
+        cap,
+        |i| e.packed_slot_ready(i),
+    )
+}
+
+/// `enabled` (`PLOW_TTS_DEPTH_PACK`) off keeps every depth prompt on serial prefill, warm or cold:
+/// no slot is ever admitted to the packed pass, so none is part way through it.
+#[cfg(any(feature = "cuda", test))]
+fn depth_route_packs(
+    enabled: bool,
+    engine_packs: bool,
+    slots: &[Option<Slot>],
+    cap: usize,
+    ready: impl Fn(usize) -> bool,
+) -> bool {
+    enabled && engine_packs && depth_prompts_pack(slots, cap, ready)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -14166,6 +14183,30 @@ mod tests {
         s.speech.as_mut().unwrap().encode = None;
         s.speech.as_mut().unwrap().depth = None;
         assert!(!depth_prompt_can_pack(s));
+    }
+
+    #[test]
+    fn depth_pack_opt_out_keeps_warm_and_simultaneous_prompts_serial() {
+        let (mut a, _ra) = prefill_test_slot();
+        let (mut b, _rb) = prefill_test_slot();
+        for s in [&mut a, &mut b].into_iter().flatten() {
+            s.pf_pos = 0;
+            s.speech = Some(Box::new(prefix_test_speech()));
+        }
+        // Two simultaneous prompts, one resuming a reused prefix: the packed route's best case.
+        a.as_mut().unwrap().resume = 2;
+        let mut slots = vec![a, b];
+        assert!(depth_route_packs(true, true, &slots, 2, |_| false));
+        assert!(!depth_route_packs(false, true, &slots, 2, |_| false));
+        assert!(!depth_route_packs(true, false, &slots, 2, |_| false));
+        // Serial prefill then advances each prompt to completion without a route change.
+        for done in 1..=2 {
+            slots[0].as_mut().unwrap().pf_pos = done;
+            assert!(!depth_route_packs(false, true, &slots, 2, |_| false));
+        }
+        slots[0].as_mut().unwrap().step = 1;
+        slots[1].as_mut().unwrap().step = 1;
+        assert!(!depth_route_packs(false, true, &slots, 2, |_| false));
     }
 
     #[test]
