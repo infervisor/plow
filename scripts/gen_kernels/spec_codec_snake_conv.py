@@ -1,6 +1,6 @@
 """gen_search block spec: SnakeBeta + causal pad + Conv1dF32 k7 fused (the 12 Hz residual unit:
 input SnakeBeta over the stream-tail window, conv, output SnakeBeta) at the served b8 shapes.
-Current plow: UnaryF32 kind 19 + conv (+ UnaryF32), recorded per unit.
+Current plow: UnaryF32 kind 19 + the conv with its SnakeBeta epilogue, as emitted (codec_conv.cu).
 """
 import codec_spec_common as cc
 
@@ -28,8 +28,8 @@ SPEC = {
         {"bm": [128], "bn": [96, 128], "bk": [32], "threads": [256], "stages": [2]},
         {"prec": ["tf32x3", "tf32"], "bm": [64, 128], "bn": [64, 128], "bk": [32], "warps": [4], "stages": [3]}),
     "current": {
-        "label": "UnaryF32 SnakeBeta + conv tile (+ UnaryF32), packet_bench --sweep per unit",
-        "measured_us": {n: c["us"] for n, c in CLASSES.items()},
-        "source": "tts-perf/tp-codec/verify/l7a (qwen3-tts codec step, tp-codec 14759885b)",
+        "label": "UnaryF32 SnakeBeta + sp_wg_gemm taps tile with the SnakeBeta epilogue as emitted (flags 0x26ec0c; _in classes 0x26e008), 132 blocks",
+        "lib": cc.CURRENT_LIB,
+        "bind": cc.conv_current_bind,
     },
 }

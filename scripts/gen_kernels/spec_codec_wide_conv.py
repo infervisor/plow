@@ -1,6 +1,6 @@
 """gen_search block spec: the 12 Hz codec's residual-unit conv (causal Conv1dF32 k7, dilation 1/3/9,
 96..768 channels) at the served step shapes. Generated bodies: codec_blocks.py (TileLang) and
-codec_blocks_triton.py; current plow kernel: the wide tile (96) / wgmma taps tile (192+), recorded.
+codec_blocks_triton.py; current plow kernel: the emitted wgmma taps tile via codec_conv.cu.
 """
 import codec_spec_common as cc
 
@@ -29,8 +29,8 @@ SPEC = {
         {"bm": [128], "bn": [64, 96, 128], "bk": [32], "threads": [256], "stages": [2, 3]},
         {"prec": ["tf32x3", "tf32"], "bm": [64, 128], "bn": [64, 128], "bk": [32], "warps": [4, 8], "stages": [3]}),
     "current": {
-        "label": "sp_conv1d_wide (96) / sp_wg_gemm taps (192+), packet_bench --sweep per call",
-        "measured_us": {n: c["us"] for n, c in CLASSES.items()},
-        "source": "tts-perf/tp-codec/verify/l7a (qwen3-tts codec step, tp-codec 14759885b)",
+        "label": "sp_wg_gemm taps tile as emitted (pinned, ragged, split-bf16, 64-wide, no output activation; flags 0x26e008), 132 blocks",
+        "lib": cc.CURRENT_LIB,
+        "bind": cc.conv_current_bind,
     },
 }
