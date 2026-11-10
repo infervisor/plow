@@ -45,6 +45,7 @@ pub struct VoiceCond {
     runtime: Mutex<Box<dyn PacketRuntime>>,
     /// (samples, program sequence), ascending.
     capacities: Vec<(usize, Vec<usize>)>,
+    buckets: std::sync::Arc<crate::obs::bucket::BucketDemand>,
     io: Io,
     pub sample_rate: u32,
 }
@@ -90,9 +91,17 @@ impl VoiceCond {
         Ok(VoiceCond {
             runtime: Mutex::new(runtime),
             capacities,
+            buckets: Default::default(),
             io,
             sample_rate,
         })
+    }
+
+    /// Count encoder launches (clip samples against the encoder lengths) into `buckets`.
+    pub fn observe_buckets(&mut self, buckets: &std::sync::Arc<crate::obs::bucket::BucketDemand>) {
+        let lengths = self.capacities.iter().map(|c| c.0);
+        buckets.declare(crate::obs::bucket::Family::Reference, lengths);
+        self.buckets = buckets.clone();
     }
 
     /// Longest clip one launch takes, in samples.
@@ -125,6 +134,12 @@ impl VoiceCond {
         rt.write_tensor(io.exaggeration, &exaggeration.to_le_bytes())
             .map_err(e)?;
         rt.run_sequence(programs).map_err(e)?;
+        self.buckets.record(
+            crate::obs::bucket::Family::Reference,
+            pcm.len(),
+            *cap,
+            Some(rt.last_run_us() as u64),
+        );
         let read_f32 = |rt: &Box<dyn PacketRuntime>, t: PacketTensor, n: usize| {
             let mut v = vec![0f32; n];
             rt.read_tensor_at(t, 0, bytemuck::cast_slice_mut(&mut v))

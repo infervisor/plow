@@ -21,6 +21,7 @@ pub struct RefEncoder {
     speaker: Option<(SpeakerEncoder, Vec<f32>)>,
     /// (frames, program), ascending.
     capacities: Vec<(usize, usize)>,
+    buckets: Arc<crate::obs::bucket::BucketDemand>,
     pcm: PacketTensor,
     samples: Option<PacketTensor>,
     codes: PacketTensor,
@@ -316,6 +317,7 @@ pub(crate) mod tests {
                 fail_first,
             })),
             capacities: vec![(2, 0)],
+            buckets: Default::default(),
             pcm: PacketTensor {
                 handle: 0,
                 bytes: 16,
@@ -1975,10 +1977,18 @@ impl RefEncoder {
             frame_codes: param("codec.frame_codes")? as usize,
             codebook: param("codec.codebook")? as u32,
             capacities,
+            buckets: Default::default(),
             runtime: Mutex::new(runtime),
             cache: Mutex::new(Vec::new()),
             speaker: None,
         })
+    }
+
+    /// Count encoder launches (clip frames against the encoder lengths) into `buckets`.
+    pub fn observe_buckets(&mut self, buckets: &Arc<crate::obs::bucket::BucketDemand>) {
+        let lengths = self.capacities.iter().map(|c| c.0);
+        buckets.declare(crate::obs::bucket::Family::Reference, lengths);
+        self.buckets = Arc::clone(buckets);
     }
 
     /// Longest clip one launch takes, in samples.
@@ -2166,6 +2176,12 @@ impl RefEncoder {
                 .map_err(e)?;
         }
         rt.run(program).map_err(e)?;
+        self.buckets.record(
+            crate::obs::bucket::Family::Reference,
+            frames,
+            cap,
+            Some(rt.last_run_us() as u64),
+        );
         rt.read_tensor_at(self.codes, 0, bytemuck::cast_slice_mut(&mut codes))
             .map_err(e)?;
         Ok(codes)

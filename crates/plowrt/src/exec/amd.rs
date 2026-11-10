@@ -8189,6 +8189,8 @@ pub struct AmdEngine {
     /// `--rowband` as read at engine build. Serve-start only: with it off the packet's
     /// full-width twins were never bound, so the siblings must never be dispatched either.
     rowband_on: bool,
+    /// The serving model's bucket-demand counters (unobserved until `observe_buckets`).
+    buckets: Arc<crate::obs::bucket::BucketDemand>,
     devp: Vec<DeviceMem>,
     /// Owner of the one allocation the ordinarily-allocated tensors are carved
     /// out of; `devp` then holds **views** into it. Unlike the CUDA side, this
@@ -14404,6 +14406,7 @@ impl AmdEngine {
             rowband_sibling,
             a2a_sibling,
             rowband_on,
+            buckets: Default::default(),
             devp,
             _weight_slab: weight_slab,
             d_tens,
@@ -18978,10 +18981,27 @@ impl AmdEngine {
         plan_chunks_capped(&buckets, n_prompt, max_bucket)
     }
 
+    /// Declare the prefill buckets to `buckets` and count prefill launches into it.
+    pub fn observe_buckets(&mut self, buckets: Arc<crate::obs::bucket::BucketDemand>) {
+        let rungs = self.prefill_rungs().map(|(_, rows)| rows as usize);
+        buckets.declare(crate::obs::bucket::Family::Prefill, rungs);
+        self.buckets = buckets;
+    }
+
+    fn record_prefill(&self, bucket: usize, rows: usize) {
+        if let Some(t) = self.prefill_prog_t(bucket) {
+            self.buckets
+                .record(crate::obs::bucket::Family::Prefill, rows, t as usize, None);
+        }
+    }
+
     pub(crate) fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+        let bucket = step.prog;
         let step = self.chunk_program(step);
         self.prefill_prepare(prompt, step)?;
-        self.run_segmented(step.prog)
+        self.run_segmented(step.prog)?;
+        self.record_prefill(bucket, step.clen as usize);
+        Ok(())
     }
 
     pub(crate) fn prefill_packed_chunk(
@@ -19010,7 +19030,10 @@ impl AmdEngine {
                 span.program = prog as u32;
             }
             self.packed_prefill_prepare(prog, &routed, prompts, parked)?;
-            self.run_segmented(prog)
+            self.run_segmented(prog)?;
+            let rows = spans.iter().map(|s| s.n_rows as usize).sum();
+            self.record_prefill(first.program as usize, rows);
+            Ok(())
         })();
         self.clear_packed_prefill();
         result
@@ -19052,11 +19075,13 @@ impl AmdEngine {
         );
 
         for step in steps {
+            let bucket = step.prog;
             let step = self.chunk_program(step);
             let t = std::time::Instant::now();
             self.prefill_prepare(prompt, step)?;
             crate::obs::ttft::PF_PREPARE.add(t.elapsed().as_nanos() as u64);
             self.run_segmented(step.prog)?;
+            self.record_prefill(bucket, step.clen as usize);
         }
 
         // The device sampled into in.ids itself; the first decode step will

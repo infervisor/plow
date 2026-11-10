@@ -647,6 +647,7 @@ impl AsrMux {
         min_queue: usize,
     ) -> (Self, usize, FinalizationPolicy) {
         metrics.serving.asr.cohort.store(true, Ordering::Relaxed);
+        engine.observe_buckets(&metrics.buckets);
         let _ = crate::obs::serving::started_at_unix_ms();
         let batch_capacity = engine.batch_capacity().max(1);
         let finalization = engine.finalization_policy();

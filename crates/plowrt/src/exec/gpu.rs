@@ -3050,6 +3050,8 @@ pub struct GpuEngine {
     buckets: Arc<crate::obs::bucket::BucketDemand>,
     /// Slot extent of the last decode selection (highest fed slot + 1).
     decode_extent: usize,
+    /// The family this engine's serial prefill launches count as.
+    prefill_family: crate::obs::bucket::Family,
     /// The serial prefill's last chunk's terminal row (its lm_head row of `act.hn`).
     pf_terminal_row: u32,
     /// Span-mode verify (`in.rowslot` packets); see [`spec`].
@@ -8160,6 +8162,7 @@ impl GpuEngine {
             fish: None,
             buckets: Default::default(),
             decode_extent: 0,
+            prefill_family: crate::obs::bucket::Family::Prefill,
             pf_terminal_row: 0,
             spec,
             spec_draft: None,
@@ -12976,6 +12979,7 @@ impl GpuEngine {
         // All uploads/memsets are enqueued on the engine stream — the launch
         // follows them in stream order (no context sync needed).
         self.launch_prefill_chain(bi, arg, f_pf, b, c0, n, tc, true)?;
+        self.buckets.record(self.prefill_family, real, tc, None);
         Ok(real)
     }
 

@@ -575,10 +575,24 @@ impl GpuEngine {
         use crate::obs::bucket::Family;
         let rungs = self.effective_decode_rungs();
         buckets.declare(Family::Decode, rungs.iter().map(|&w| w as usize));
+        if self.spec.is_some() {
+            buckets.declare(Family::Verify, rungs.iter().map(|&w| w as usize));
+        }
         buckets.declare(Family::Prefill, self.prefill.iter().map(|b| b.t as usize));
         if let Some(d) = &self.fish {
             buckets.declare(Family::Depth, d.programs.iter().map(|p| p.rows as usize));
         }
+        self.buckets = buckets;
+    }
+
+    /// An auxiliary engine (a speech text encoder): count only its prefill launches, as `family`.
+    pub fn observe_prefill_as(
+        &mut self,
+        buckets: Arc<crate::obs::bucket::BucketDemand>,
+        family: crate::obs::bucket::Family,
+    ) {
+        buckets.declare(family, self.prefill.iter().map(|b| b.t as usize));
+        self.prefill_family = family;
         self.buckets = buckets;
     }
 

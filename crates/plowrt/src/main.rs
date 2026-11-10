@@ -5836,6 +5836,7 @@ async fn serve(
             if let Some(path) = shutdown_socket {
                 let _ = std::fs::remove_file(path);
             }
+            plowrt::serve::log_bucket_demand(&shutdown_state);
             log_library_attention_launches();
             plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
             std::process::exit(1);

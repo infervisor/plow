@@ -69,6 +69,7 @@ pub struct PacketRnnt {
     upload: Option<ChunkBinding>,
     /// Cache rows no open batched stream holds.
     free: Vec<u32>,
+    buckets: std::sync::Arc<crate::obs::bucket::BucketDemand>,
     /// Vocabulary, detokenizer and language (ASR contract >= 1).
     output: Option<TokenOutput>,
 }
@@ -564,6 +565,7 @@ impl PacketRnnt {
             chunk,
             upload,
             free,
+            buckets: Default::default(),
             output,
         })
     }
@@ -861,6 +863,16 @@ impl PacketRnnt {
         self.runtime.run_sequence(&programs)?;
         let encoder_us = self.runtime.last_run_us();
         let encoder_wall = started.elapsed();
+        self.buckets.record(
+            if steps.first().is_some_and(|s| s.0.upload) {
+                crate::obs::bucket::Family::Upload
+            } else {
+                crate::obs::bucket::Family::Stream
+            },
+            steps.len(),
+            lanes,
+            Some(encoder_us as u64),
+        );
         let mut items: Vec<_> = steps
             .iter()
             .enumerate()
@@ -879,6 +891,7 @@ impl PacketRnnt {
         let mut execution = PacketBatchExecution {
             runtime: &mut *self.runtime,
             batch,
+            buckets: &self.buckets,
             blank_id: self.blank_id,
             lanes: Vec::new(),
             ids: Vec::new(),
@@ -1010,10 +1023,13 @@ impl PacketRnnt {
     }
 
     pub fn transcribe_input(&mut self, input: &[f32]) -> Result<Vec<u32>> {
+        let encoder = self.encoder_programs.len() - 1;
+        let capacity = self.encoder_programs[encoder].0;
         self.transcribe_input_with_encoder_frames(
             input,
+            capacity,
             self.frames,
-            self.encoder_programs.len() - 1,
+            encoder,
             &mut |_| {},
         )
     }
@@ -1034,7 +1050,13 @@ impl PacketRnnt {
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         let (encoder, frames) = self.encoder_for(valid_input_frames)?;
-        self.transcribe_input_with_encoder_frames(input, frames, encoder, on_emit)
+        self.transcribe_input_with_encoder_frames(
+            input,
+            valid_input_frames,
+            frames,
+            encoder,
+            on_emit,
+        )
     }
 
     /// Recordings one [`Self::transcribe_batch_input_frames`] call takes; 0 without the packet's
@@ -1076,7 +1098,7 @@ impl PacketRnnt {
         let mut items = Vec::with_capacity(inputs.len());
         for (index, &(input, valid_input_frames)) in inputs.iter().enumerate() {
             let (encoder, frames) = self.encoder_for(valid_input_frames)?;
-            self.encode(input, frames, encoder)?;
+            self.encode(input, valid_input_frames, frames, encoder)?;
             let base = index * self.frames;
             self.runtime.copy_tensor(
                 self.encoder_joint,
@@ -1090,6 +1112,7 @@ impl PacketRnnt {
         let mut execution = PacketBatchExecution {
             runtime: &mut *self.runtime,
             batch,
+            buckets: &self.buckets,
             blank_id: self.blank_id,
             lanes: Vec::new(),
             ids: Vec::new(),
@@ -1125,7 +1148,13 @@ impl PacketRnnt {
     }
 
     /// Run encoder `encoder` on `input`, leaving its rows in `encoder.joint`.
-    fn encode(&mut self, input: &[f32], frames: usize, encoder: usize) -> Result<()> {
+    fn encode(
+        &mut self,
+        input: &[f32],
+        valid_input_frames: usize,
+        frames: usize,
+        encoder: usize,
+    ) -> Result<()> {
         if input.len() != self.input_elements() {
             return Err(RuntimeError::Rejected(format!(
                 "packet RNNT input has {} elements, expected {}",
@@ -1141,18 +1170,46 @@ impl PacketRnnt {
             self.runtime
                 .write_tensor(valid_rows, &valid.to_ne_bytes())?;
         }
-        self.runtime.run_sequence(&self.encoder_programs[encoder].1)
+        self.runtime
+            .run_sequence(&self.encoder_programs[encoder].1)?;
+        self.buckets.record(
+            crate::obs::bucket::Family::Encoder,
+            valid_input_frames,
+            self.encoder_programs[encoder].0,
+            Some(self.runtime.last_run_us() as u64),
+        );
+        Ok(())
+    }
+
+    /// Count launches into `buckets`: an utterance's input frames against the encoder lengths,
+    /// stream steps against the stream batches, predictor lanes and joint rows against theirs.
+    pub fn observe_buckets(&mut self, buckets: &std::sync::Arc<crate::obs::bucket::BucketDemand>) {
+        use crate::obs::bucket::Family;
+        buckets.declare(Family::Encoder, self.encoder_programs.iter().map(|e| e.0));
+        for (family, binding) in [
+            (Family::Stream, &self.chunk),
+            (Family::Upload, &self.upload),
+        ] {
+            let rungs = binding.iter().flat_map(|c| c.rungs.iter().map(|r| r.0));
+            buckets.declare(family, rungs);
+        }
+        if let Some(batch) = &self.batch {
+            buckets.declare(Family::Predict, batch.predict.iter().map(|r| r.0));
+            buckets.declare(Family::Joint, batch.joint.iter().map(|r| r.0));
+        }
+        self.buckets = buckets.clone();
     }
 
     fn transcribe_input_with_encoder_frames(
         &mut self,
         input: &[f32],
+        valid_input_frames: usize,
         frames: usize,
         encoder: usize,
         on_emit: &mut dyn FnMut(&[u32]),
     ) -> Result<Vec<u32>> {
         self.runtime.begin_execution()?;
-        let result = self.transcribe_active(input, frames, encoder, on_emit);
+        let result = self.transcribe_active(input, valid_input_frames, frames, encoder, on_emit);
         let ended = self.runtime.end_execution();
         result.and_then(|tokens| ended.map(|()| tokens))
     }
@@ -1160,6 +1217,7 @@ impl PacketRnnt {
     fn transcribe_active(
         &mut self,
         input: &[f32],
+        valid_input_frames: usize,
         frames: usize,
         encoder: usize,
         on_emit: &mut dyn FnMut(&[u32]),
@@ -1168,7 +1226,7 @@ impl PacketRnnt {
             self.runtime
                 .write_tensor(state, &self.state_zeros[..state.bytes])?;
         }
-        self.encode(input, frames, encoder)?;
+        self.encode(input, valid_input_frames, frames, encoder)?;
         let mut profile = self.profiling.then(|| RnntProfile {
             encoder_runtime_us: self.runtime.last_run_us(),
             ..RnntProfile::default()
@@ -1459,6 +1517,7 @@ pub fn decode_batch(
 struct PacketBatchExecution<'a> {
     runtime: &'a mut dyn PacketRuntime,
     batch: &'a BatchBinding,
+    buckets: &'a crate::obs::bucket::BucketDemand,
     blank_id: u32,
     lanes: Vec<u32>,
     ids: Vec<u32>,
@@ -1531,6 +1590,14 @@ impl BatchedRnntExecution for PacketBatchExecution<'_> {
         self.write(batch.row_slot, rows.iter().map(|r| r.0), batch.slots, count)?;
         programs.push(program);
         self.runtime.run_sequence(&programs)?;
+        if let Some(&(lanes, _)) = batch.predict.iter().find(|r| r.0 >= predict.len()) {
+            if !predict.is_empty() {
+                let family = crate::obs::bucket::Family::Predict;
+                self.buckets.record(family, predict.len(), lanes, None);
+            }
+        }
+        self.buckets
+            .record(crate::obs::bucket::Family::Joint, rows.len(), count, None);
         self.ids.resize(count, 0);
         self.runtime
             .read_tensor_at(batch.ids, 0, bytemuck::cast_slice_mut(&mut self.ids))?;

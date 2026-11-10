@@ -44,15 +44,34 @@ scheduling decision.
 | family | rows | capacities | launch time |
 |---|---|---|---|
 | `decode` | slot extent of a plain decode launch | decode rungs | decode-only tick, at the rung covering its extent |
-| `prefill` | rows of a packed token-batch launch (prompt rows + riders) | prefill buckets | not timed |
+| `prefill` | rows of a prefill launch: a packed token batch (prompt rows + riders) or one chunk of a serial prefill | prefill buckets | not timed |
+| `verify` | rows of a speculative verify launch (span tokens + 1 per span) | decode rungs | not timed |
+| `mm_image`, `mm_audio` | images in a multimodal image encoder launch; frames of an audio clip | encoder rungs | device run |
 | `depth` | slot extent of a speech depth frame | depth programs | not timed |
-| `codec` | streams in a stateful codec step | step batches | device run of the step |
+| `codec` | streams in a stateful codec step | step batches | device run |
+| `codec_decode`, `codec_window`, `codec_slot`, `codec_slot_window` | items in a whole-utterance decode, a streaming window, a voice-slot synthesis, a cloned-voice window (vocoders included) | the batch of each (batch, frames) capacity | device run |
+| `text_encoder` | tokens of a speech text-encoder segment | its prefill buckets | not timed |
+| `reference` | length of a voice-cloning reference clip (frames, or samples for a voice-conditioning packet) | encoder lengths | device run |
+| `encoder` | input feature frames of one utterance's audio encoder launch | encoder lengths | device run |
+| `encoder_pack` | chunks of every utterance in a packed audio encoder launch | packed chunk counts | device run |
+| `stream`, `upload` | streams in a batched live / upload stream step | step batches | device run of the encoder step |
+| `predict`, `joint` | lanes of a batched transducer predictor launch; rows of its joint launch | their batches | not timed |
 
-Rows are slot extents where the launch addresses slots (decode, depth): a capacity must cover the
-highest live slot, not only the live count. A launch is counted once it is enqueued. On CUDA the
-engine counts decode launches where it selects the rung; decode rows that ride a prefill launch
-count in `prefill`, and speculative verify launches are not counted. Other backends count one
-decode launch per completed step from the dispatcher and no prefill or depth.
+A model exports only the families its packets declare. Rows are slot extents where the launch
+addresses slots (decode, depth): a capacity must cover the highest live slot, not only the live
+count. A launch is counted once it is enqueued. Limits:
+
+* Capacities with two dimensions (codec and vocoder `(batch, frames)`, stream steps with first and
+  later windows) are counted on the batch dimension only: a launch pushed to a larger batch by its
+  frame count shows as padding on that batch, and frame padding is not counted.
+* Length ladders (`prefill`, `encoder`, `reference`, `mm_audio`, `text_encoder`) count each
+  launch: a prompt longer than a bucket appears as full buckets and a tail, not as one long row
+  count.
+* On CUDA the engine counts decode launches where it selects the rung; decode rows that ride a
+  prefill launch count in `prefill`. Other backends count one decode launch per completed step
+  from the dispatcher. A single-rank AMD engine counts its prefill chunks; tensor-parallel groups
+  and the CPU reference engine count decode only.
+* Depth launches are not timed (their path reads no clock unless `PLOW_HOST_TIMING` is on).
 
 `/metrics`, labels `model_name`, `engine`, `family`:
 
