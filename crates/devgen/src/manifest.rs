@@ -3128,7 +3128,16 @@ pub fn speech_conv_posts(model: &packet::devbuild::Model) -> u64 {
                     && (flags >> 8) & 15 == 0
             }
         })
-        .fold(0, |mask, i| mask | 1 << ((i.j[1] >> 8) & 15))
+        .fold(0, |mask, i| {
+            let post = (i.j[1] >> 8) & 15;
+            // A SnakeBeta output (snake with flags bit 2) has its own epilogue: bit 19.
+            let beta = if post == 12 && (i.j[1] >> 2) & 1 == 1 {
+                1 << 19
+            } else {
+                0
+            };
+            mask | 1 << post | beta
+        })
 }
 
 /// Whether a conv that can reach the wide tile (flags bit 14) pads with other than zeros:
@@ -4099,6 +4108,13 @@ mod tests {
             (DevOp::Conv1dF32, 9, 1 << 13, 0),
             (DevOp::Conv1dF32, 9, 1 << 14, 1 << 9),
             (DevOp::Conv1dF32, 11, 1 << 17, 1 << 11),
+            (DevOp::Conv1dF32, 12, 1 << 17, 1 << 12),
+            (
+                DevOp::Conv1dF32,
+                12,
+                (1 << 17) | (1 << 2),
+                1 << 12 | 1 << 19,
+            ),
             (DevOp::ConvTranspose1dF32, 0, 0, 0),
             (DevOp::ConvTranspose1dF32, 0, 1 << 14, 0),
             (DevOp::ConvTranspose1dF32, 0, 1 << 17, 0),

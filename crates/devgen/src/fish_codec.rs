@@ -1283,11 +1283,17 @@ fn program_for(
             c.dilation = d;
             c.pad = 6 * d;
             c.len = len_out;
-            if cfg.breeze {
+            // Breeze under split-bf16: the output SnakeBeta (`a2`) fuses into the taps epilogue.
+            let beta_fused = cfg.breeze && splits.is_some();
+            if cfg.breeze && !beta_fused {
                 c.alpha = Some(format!("{pre}.a1"));
             } else {
                 c.alpha_out = Some(format!("{pre}.a12"));
-                c.act_out = Activation::Snake;
+                c.act_out = if cfg.breeze {
+                    Activation::SnakeBeta
+                } else {
+                    Activation::Snake
+                };
             }
             let mut h = stateful(
                 &mut p,
@@ -1297,7 +1303,7 @@ fn program_for(
                 format!("state.codec.blk{i}.ru{j}"),
                 k_out,
             )?;
-            if cfg.breeze {
+            if cfg.breeze && !beta_fused {
                 h = snake_beta(&mut p, h, &format!("{pre}.a2"), batch * rows, b.cout)?;
             }
             let mut c = conv(

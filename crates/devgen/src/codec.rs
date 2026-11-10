@@ -666,14 +666,15 @@ pub(crate) fn fused_conv(
         None => (c.alpha.clone(), None),
     };
     let dual = dual && !taps;
-    // SnakeBeta (two parameter arrays) only runs as its own unary pass.
+    // An input SnakeBeta (two parameter arrays) only runs as its own unary pass.
     let fuse_in = act_in
         && c.act_in != Activation::SnakeBeta
         && !ct
         && !taps
         && (dual || fuse.input_act(&c.weight, c.kernel, true));
+    // A SnakeBeta output fuses only with its own [a | r] tensor (the taps unit's `a2`).
     let fuse_out = c.act_out != Activation::None
-        && c.act_out != Activation::SnakeBeta
+        && (c.act_out != Activation::SnakeBeta || out_alpha.is_some())
         && (dual || taps || fuse.output_act(&c.weight, true));
     let fuse_res =
         c.residual.is_some() && (c.row_scale.is_some() || fuse.residual(&c.weight, true));

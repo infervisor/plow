@@ -718,6 +718,7 @@ struct ConvSpec {
     bool splitk = false; /* flags bit 20: t7 is the wgmma tile's split-K scratch */
     unsigned pin = 0; /* flags bits 21..23: 1 pinned arms, 2 FFMA tiles, 4 a 128-wide tile */
     unsigned sk = 0; /* flags bits 24..31 (pinned): fixed split-K parts; t7 = the conv-own scratch */
+    bool beta = false; /* flags bit 2 (post snake): SnakeBeta output, alpha [a | r] of 2 * cout */
 };
 /* Pinned split-K scratch: SPC_TICKETS zeroed tickets, then tiles x parts 128x64 partials. */
 static unsigned splitk_scratch_pinned(Case& c, const ConvSpec& s, unsigned out_rows) {
@@ -795,7 +796,8 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     else if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel,
         !s.tapmajor && s.kernel > 1u && s.cin % 64u == 0u ? s.kernel : 0u);
     unsigned b = s.bias ? c.f32(s.cout, 0.2f) : PLOW_TENSOR_NONE;
-    unsigned a = s.alpha ? c.f32(s.dual ? s.cin + s.cout : std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
+    unsigned a = s.alpha ? c.f32(s.beta ? 2 * s.cout : s.dual ? s.cin + s.cout : std::max(s.cin, s.cout), 0.4f, 0.6f)
+                         : PLOW_TENSOR_NONE;
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
     unsigned l = s.lengths.empty() ? PLOW_TENSOR_NONE : c.u32(s.lengths);
     if (s.row_scale) c.in.t[7] = c.f32((size_t)s.batch * out_rows, 1.f);
@@ -809,7 +811,7 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
                    (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u) |
                    (s.dual ? 1u << 19 : 0u) | (s.rows ? 1u << 16 : 0u) | (s.splitk || s.sk ? 1u << 20 : 0u) |
-                   (s.pin << 21) | (s.sk << 24);
+                   (s.pin << 21) | (s.sk << 24) | (s.beta ? 1u << 2 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -868,6 +870,38 @@ static void t_conv_invariant(const char* name, const ConvSpec& s, bool transpose
         printf("  %-34s %s bitwise == batch %u -> %s\n", name, v.what, s.batch, same ? "PASS" : "FAIL");
         if (!same) g_fail = 1;
     }
+    CK(cudaFree(td));
+}
+
+/* A SnakeBeta output (post snake + flags bit 2, no residual / row scale): against the golden, batch-
+ * invariant, and bitwise equal to the plain conv followed by UnaryF32 SnakeBeta (kind 19) over the
+ * same [a | r]. */
+static void t_conv_beta(const char* name, const ConvSpec& s) {
+    t_conv_invariant(name, s, false);
+    Case c; unsigned o;
+    build_conv(c, s, false, o);
+    run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
+    const size_t n = c.host[o].size() / 4;
+    std::vector<uint32_t> fused(n), two(n);
+    CK(cudaMemcpy(fused.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+    const unsigned u = c.add(n * 4);
+    void** td = upload_table(c.dev);
+    PlowDevInst conv = c.in;
+    conv.fj[2].u &= ~(4u | (15u << 8));
+    k_speech<<<g_nblk, 256, kSmem>>>(conv, td);
+    PlowDevInst un{};
+    un.op = PLOW_DOP_UNARY_F32; un.t[0] = u; un.t[1] = o; un.t[2] = c.in.t[4];
+    for (unsigned i = 3; i < 8; i++) un.t[i] = PLOW_TENSOR_NONE;
+    un.i[0] = (unsigned)(n / s.cout); un.i[1] = s.cout; un.i[2] = 19;
+    CK(cudaDeviceSynchronize());
+    k_speech<<<g_nblk, 256, kSmem>>>(un, td);
+    CK(cudaGetLastError());
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(two.data(), c.dev[u], n * 4, cudaMemcpyDeviceToHost));
+    /* Masked rows: the conv stores 0, the unary maps 0 to 0. */
+    const bool same = !memcmp(fused.data(), two.data(), n * 4);
+    printf("  %-34s fused bitwise == conv + unary -> %s\n", name, same ? "PASS" : "FAIL");
+    if (!same) g_fail = 1;
     CK(cudaFree(td));
 }
 
@@ -960,6 +994,33 @@ static void t_conv_pinned() {
             snprintf(name, sizeof(name), "Conv1dF32 pinned warp 96->1 M%u", rows - 6);
             t_conv1d(name, m);
         }
+    }
+    {
+        /* SnakeBeta output on every arm the 12 Hz c1 convs (and others) can take. */
+        ConvSpec t{3, 300, 192, 192, 7, 1, 3, 1, 18, 0, 0, 0, 12, false, true, true, false, {300, 50, 1}, 0.f, true};
+        t.wide = true; t.wg = true; t.tapmajor = true; t.pin = 1; t.beta = true;
+        t_conv_beta("Conv1dF32 beta wgmma taps 192 d3", t);
+        ConvSpec t128 = t;
+        t128.pin = 1 | 4; t128.cin = t128.cout = 384;
+        t_conv_beta("Conv1dF32 beta wgmma taps 384 bn128", t128);
+        ConvSpec w = t;
+        w.cin = w.cout = 96; w.wg = false;
+        t_conv_beta("Conv1dF32 beta wide 96 d3", w);
+        ConvSpec w128 = w;
+        w128.pin = 1 | 4;
+        t_conv_beta("Conv1dF32 beta wide 96 bn128", w128);
+        ConvSpec tc = t;
+        tc.wide = tc.wg = false; tc.tapmajor = false;
+        t_conv_beta("Conv1dF32 beta 3xTF32 192", tc);
+        ConvSpec ff = tc;
+        ff.pin = 1 | 2;
+        t_conv_beta("Conv1dF32 beta FFMA 192", ff);
+        ConvSpec st = t;
+        st.cin = 96; st.cout = 3; st.wide = st.wg = false;
+        t_conv_beta("Conv1dF32 beta staged 96->3", st);
+        ConvSpec pw = t;
+        pw.kernel = 1; pw.dil_or_opad = 1; pw.before = 0;
+        t_conv_beta("Conv1dF32 beta wgmma pointwise (wide)", pw);
     }
     {
         /* Wide tile (split-bf16, no wgmma): both pinned widths over the same data. */

@@ -1894,6 +1894,7 @@ impl StageProgram {
         }
         // The flag fields are 4 bits wide (pre 4..8, post 8..12): a wider code would alias
         // another kind and spill into the next field.
+        let beta_out = stage.output_activation == Activation::SnakeBeta;
         let valid_activation = |a: Activation| {
             a.code() <= 15
                 && !matches!(
@@ -1912,12 +1913,14 @@ impl StageProgram {
             || stage.pad_after > 0xFFFF
             || (transpose && stage.pad_mode != PadMode::Zero)
             || !valid_activation(stage.input_activation)
-            || !valid_activation(stage.output_activation)
+            || !(valid_activation(stage.output_activation) || beta_out)
             // One alpha tensor: a snake output activation reads it per output channel, so the
             // input takes no activation unless bit 19 splits the tensor between two snakes.
-            || (stage.output_activation == Activation::Snake
+            || (matches!(stage.output_activation, Activation::Snake | Activation::SnakeBeta)
                 && stage.input_activation != Activation::None
                 && !stage.dual_alpha)
+            // SnakeBeta output (flags bit 2, post code snake): alpha = [a | r] per output channel.
+            || (beta_out && (transpose || stage.dual_alpha || stage.alpha.is_none()))
             || (stage.dual_alpha
                 && !(stage.input_activation == Activation::Snake
                     && stage.output_activation == Activation::Snake
@@ -1965,6 +1968,8 @@ impl StageProgram {
         };
         let alpha_channels = if stage.dual_alpha {
             stage.in_channels + stage.out_channels
+        } else if beta_out {
+            2 * stage.out_channels
         } else {
             stage.in_channels.max(stage.out_channels)
         };
@@ -1989,7 +1994,14 @@ impl StageProgram {
         // Bit 13: the GEMM-shaped cases run 3xTF32 tensor cores (FP32-accurate) on 64x64 tiles.
         let flags = pad_mode
             | (stage.input_activation.code() << 4)
-            | (stage.output_activation.code() << 8)
+            | (u32::from(beta_out) << 2)
+            | (if beta_out {
+                Activation::Snake
+            } else {
+                stage.output_activation
+            }
+            .code()
+                << 8)
             | (u32::from(stage.weight_f16) << 12)
             | (u32::from(math == Conv1dMath::Tf32x3) << 13)
             | (u32::from(stage.split_bf16) << 14)
@@ -3869,12 +3881,16 @@ mod tests {
     }
 
     #[test]
-    fn conv_rejects_activations_wider_than_the_flag_field() {
-        for (pre, post) in [
-            (Activation::SnakeBeta, Activation::None),
-            (Activation::None, Activation::SnakeBeta),
+    fn conv_snake_beta_only_as_output_with_its_parameter_pair() {
+        // (pre, post, alpha, ok): SnakeBeta's code 19 does not fit the 4-bit fields; as an output
+        // it is snake (12) with flags bit 2 and alpha [a | r].
+        for (pre, post, alpha, ok) in [
+            (Activation::SnakeBeta, Activation::None, true, false),
+            (Activation::None, Activation::SnakeBeta, false, false),
+            (Activation::LeakyRelu, Activation::SnakeBeta, true, false),
+            (Activation::None, Activation::SnakeBeta, true, true),
         ] {
-            let (prefix, h) = prefix_with(&[("x", 100 * 64 * 4)]);
+            let (prefix, h) = prefix_with(&[("x", 100 * 64 * 4), ("alpha", 2 * 64 * 4)]);
             let mut p = prefix.program();
             let r = p.conv1d_f32(
                 h[0],
@@ -3884,7 +3900,7 @@ mod tests {
                     output: TensorRef::Named("y"),
                     weight: TensorRef::Named("w"),
                     bias: None,
-                    alpha: Some(TensorRef::Named("alpha")),
+                    alpha: alpha.then_some(TensorRef::Handle(h[1])),
                     residual: None,
                     lengths: None,
                     batch: 1,
@@ -3910,10 +3926,22 @@ mod tests {
                     pinned: false,
                 },
             );
-            assert!(
-                r.is_err(),
-                "SnakeBeta (code 19) must not be packed into a 4-bit conv activation field"
-            );
+            assert_eq!(r.is_ok(), ok, "{pre:?} -> {post:?} alpha {alpha}");
+            if ok {
+                let prefix = p.finish(0);
+                let flags = prefix
+                    .model
+                    .progs
+                    .last()
+                    .unwrap()
+                    .insts
+                    .iter()
+                    .find(|i| i.op == DevOp::Conv1dF32 as u16)
+                    .unwrap()
+                    .j[1];
+                assert_eq!((flags >> 2) & 1, 1);
+                assert_eq!((flags >> 8) & 15, packet::dev::ACT_SNAKE);
+            }
         }
     }
 

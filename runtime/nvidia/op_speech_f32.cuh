@@ -3453,6 +3453,8 @@ __device__ __forceinline__ float sp_sin2(float y) {
     return s * s;
 }
 __device__ __forceinline__ float sp_snake(float x, float a) { return fmaf(__frcp_rn(a + 1e-9f), sp_sin2(x * a), x); }
+/* SnakeBeta with its precomputed reciprocal r (UnaryF32 kind 19's arithmetic). */
+__device__ __forceinline__ float sp_snake_beta(float x, float a, float r) { return fmaf(r, sp_sin2(x * a), x); }
 
 /* Calls body(f) once with the activation `kind` as a functor f(x, p0) (packet::dev::ACT_*), so a
  * loop dispatches once instead of switching per element. */
@@ -4042,6 +4044,8 @@ struct SpConvArgs {
     /* The output activation's per-channel parameter: `alpha`, or `alpha + cin` with flags bit 19
      * (one tensor [cin | cout] carrying an input and an output snake). */
     const float* post_alpha;
+    /* Flags bit 2 (post snake): the output is SnakeBeta, alpha = [a | r] per output channel. */
+    const float* post_beta;
     const float* residual; const unsigned* lengths; const float* row_scale;
     /* Conv1dF32 flags bit 20: t[7] is the split-K scratch (sp_wg_gemm), not a row scale. */
     float* splitk;
@@ -4077,7 +4081,9 @@ struct SpConvArgs {
     }
     /* oi = row * cout + o. Conv1d's optional row_scale multiplies after the output activation. */
     __device__ void store(size_t oi, unsigned o, float acc) const {
-        float v = post ? sp_act_call(post, acc, post_alpha ? post_alpha[o] : slope) : acc;
+        float v = post_beta ? sp_snake_beta(acc, post_alpha[o], post_beta[o])
+                  : post    ? sp_act_call(post, acc, post_alpha ? post_alpha[o] : slope)
+                            : acc;
         if (row_scale) v = __fmul_rn(row_scale[oi / cout], v);
         out[oi] = residual ? __fadd_rn(v, residual[oi]) : v;
     }
@@ -4118,9 +4124,12 @@ __device__ __forceinline__ bool sp_conv_args(const PlowDevInst* in, void* const*
     a.slope = in->fj[0].f;
     const bool dual = (flags >> 19) & 1u;
     a.post_alpha = dual && a.alpha ? a.alpha + a.cin : a.alpha;
+    const bool beta = !transpose && ((flags >> 2) & 1u);
+    a.post_beta = beta && a.alpha ? a.alpha + a.cout : nullptr;
     /* One alpha serves a snake output only without an input activation, unless bit 19 splits it
      * (then both activations are snakes). */
-    const bool alpha_ok = dual ? a.pre == 12u && a.post == 12u && a.alpha : !(a.post == 12u && a.pre != 0u);
+    const bool alpha_ok = dual ? a.pre == 12u && a.post == 12u && a.alpha && !beta
+                               : !(a.post == 12u && a.pre != 0u) && (!beta || (a.post == 12u && a.alpha));
     if (!a.kernel || !a.stride || !a.dil || !a.groups || a.cin % a.groups || a.cout % a.groups ||
         a.mode > 2u || !sp_act_conv_ok(a.pre) || !sp_act_conv_ok(a.post) || !alpha_ok || !a.in_rows)
         return false;
@@ -4260,7 +4269,7 @@ static __device__ __forceinline__ bool sp_conv1d_depthwise(const SpConvArgs& a, 
         }
         /* A plain snake output (SNAC's snake before the next pointwise conv) inlines: the generic
          * store's out-of-line activation call would keep every accumulator on the stack. */
-        if (a.post == 12u && !a.row_scale && !a.residual) {
+        if (a.post == 12u && !a.post_beta && !a.row_scale && !a.residual) {
             const float pa = a.post_alpha ? a.post_alpha[ch] : a.slope;
 #pragma unroll
             for (unsigned r = 0; r < RPT; r++) {
@@ -4464,7 +4473,9 @@ __device__ __forceinline__ void sp_ep4(const SpConvEpi1& ep, unsigned m, unsigne
         const unsigned o = ep.n0 + n + q;
         if (!ok) { ep.a.out[base + o] = 0.f; continue; }
         const float acc = ep.a.bias ? __fadd_rn(v[q], ep.a.bias[o]) : v[q];
-        float y = ep.a.post ? sp_act_call(ep.a.post, acc, ep.a.post_alpha ? ep.a.post_alpha[o] : ep.a.slope) : acc;
+        float y = ep.a.post_beta ? sp_snake_beta(acc, ep.a.post_alpha[o], ep.a.post_beta[o])
+                  : ep.a.post    ? sp_act_call(ep.a.post, acc, ep.a.post_alpha ? ep.a.post_alpha[o] : ep.a.slope)
+                                 : acc;
         if (ep.a.row_scale) y = __fmul_rn(ep.a.row_scale[base / ep.a.cout], y);
         ep.a.out[base + o] = ep.a.residual ? __fadd_rn(y, rr[q]) : y;
     }
@@ -4472,7 +4483,7 @@ __device__ __forceinline__ void sp_ep4(const SpConvEpi1& ep, unsigned m, unsigne
 
 /* The wide tile's Conv1d epilogue straight from the fragments (no smem stage, no barrier): float2
  * bias / residual / output per fragment row, the output activation dispatched once per tile. */
-template <unsigned BN, class F>
+template <unsigned BN, class F, bool BETA = false>
 static __device__ __forceinline__ void sp_w_conv_rows(unsigned m0, unsigned n0, unsigned M, unsigned N,
                                                       const SpConvEpi1& ep, const float (&acc)[SpB<BN>::MI][4][4],
                                                       F f) {
@@ -4481,12 +4492,13 @@ static __device__ __forceinline__ void sp_w_conv_rows(unsigned m0, unsigned n0, 
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned mb = m0 + (warp % W::WMW) * (W::MI * 16u) + (lane >> 2);
     const unsigned nb = n0 + (warp / W::WMW) * 32u + (lane & 3u) * 2u;
-    float2 bias[4], alpha[4];
+    float2 bias[4], alpha[4], beta[4];
 #pragma unroll
     for (unsigned j = 0; j < 4; j++) {
         const unsigned o = nb + j * 8u;
         bias[j] = a.bias && o < N ? __ldg((const float2*)(a.bias + o)) : make_float2(0.f, 0.f);
         alpha[j] = a.post_alpha && o < N ? make_float2(a.post_alpha[o], a.post_alpha[o + 1]) : make_float2(a.slope, a.slope);
+        if constexpr (BETA) beta[j] = o < N ? make_float2(a.post_beta[o], a.post_beta[o + 1]) : make_float2(0.f, 0.f);
     }
     /* Per fragment row pair: row bases and residual loads before the stores (out may alias
      * residual, so later loads cannot move above earlier stores). */
@@ -4519,8 +4531,13 @@ static __device__ __forceinline__ void sp_w_conv_rows(unsigned m0, unsigned n0, 
                 if (o >= N) continue;
                 float2 y = make_float2(0.f, 0.f);
                 if (ok) {
-                    y.x = f(__fadd_rn(acc[i][j][2 * h], bias[j].x), alpha[j].x);
-                    y.y = f(__fadd_rn(acc[i][j][2 * h + 1], bias[j].y), alpha[j].y);
+                    if constexpr (BETA) {
+                        y.x = sp_snake_beta(__fadd_rn(acc[i][j][2 * h], bias[j].x), alpha[j].x, beta[j].x);
+                        y.y = sp_snake_beta(__fadd_rn(acc[i][j][2 * h + 1], bias[j].y), alpha[j].y, beta[j].y);
+                    } else {
+                        y.x = f(__fadd_rn(acc[i][j][2 * h], bias[j].x), alpha[j].x);
+                        y.y = f(__fadd_rn(acc[i][j][2 * h + 1], bias[j].y), alpha[j].y);
+                    }
                     if (a.row_scale) {
                         const float sc = a.row_scale[base / a.cout];
                         y.x = __fmul_rn(sc, y.x); y.y = __fmul_rn(sc, y.y);
@@ -4564,7 +4581,15 @@ static __device__ __forceinline__ void sp_w_conv_store(unsigned m0, unsigned n0,
     case 11: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(11u, x, p, 0.f); }); break;
 #endif
 #if (PLOW_SPEECH_CONV_POSTS & (1ull << 12))
-    case 12: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_snake(x, p); }); break;
+    case 12:
+#if (PLOW_SPEECH_CONV_POSTS & (1ull << 19))
+        if (ep.a.post_beta) {
+            sp_w_conv_rows<BN, float (*)(float, float), true>(m0, n0, M, N, ep, acc, nullptr);
+            break;
+        }
+#endif
+        sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_snake(x, p); });
+        break;
 #endif
     default: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [post](float x, float p) { return sp_act_call(post, x, p); }); break;
     }
@@ -4958,12 +4983,19 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             const bool on = o < N;
             const float2 bias = *(const float2*)(bias_s + c);
             const float2 alpha = a.post_alpha && on ? make_float2(a.post_alpha[og + o], a.post_alpha[og + o + 1]) : make_float2(a.slope, a.slope);
+            float2 beta = make_float2(0.f, 0.f);
+            if constexpr (P == 4u) beta = on ? make_float2(a.post_beta[og + o], a.post_beta[og + o + 1]) : beta;
 #pragma unroll
             for (unsigned h = 0; h < 2; h++) {
                 float2 y = make_float2(0.f, 0.f);
                 if (ok[h] && on) {
-                    y.x = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h], bias.x), alpha.x);
-                    y.y = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h + 1u], bias.y), alpha.y);
+                    if constexpr (P == 4u) {
+                        y.x = sp_snake_beta(__fadd_rn(acc[4u * g + 2u * h], bias.x), alpha.x, beta.x);
+                        y.y = sp_snake_beta(__fadd_rn(acc[4u * g + 2u * h + 1u], bias.y), alpha.y, beta.y);
+                    } else {
+                        y.x = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h], bias.x), alpha.x);
+                        y.y = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h + 1u], bias.y), alpha.y);
+                    }
                     if (a.row_scale) {
                         const float rs = a.row_scale[base[h] / a.cout];
                         y.x = __fmul_rn(rs, y.x); y.y = __fmul_rn(rs, y.y);
@@ -4997,7 +5029,9 @@ __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a, bool channel_t
     const bool pw = a.kernel == 1u && a.stride == 1u && a.before == 0u && a.in_rows == a.out_rows && a.cg % 4u == 0 && a.pre == 0u;
     const bool taps = a.kernel > 1u && (a.tapmajor || channel_tiled) && a.stride == 1u && a.mode == 0u && a.groups == 1u && a.cin % 64u == 0 &&
                       (a.pre == 0u || (a.pre == 9u && !a.alpha));
-    return (pw || taps) && spg_post_ok(a.post) && a.cout % 4u == 0 && sp_aligned(a.out, 16) &&
+    /* A SnakeBeta output has the taps tile's P = 4 epilogue only. */
+    return (pw || taps) && spg_post_ok(a.post) && (!a.post_beta || (taps && sp_post_on(19u))) && a.cout % 4u == 0 &&
+           sp_aligned(a.out, 16) &&
            (!a.residual || sp_aligned(a.residual, 8)) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) &&
            sp_aligned(a.x, 16);
 }
@@ -5045,6 +5079,7 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
     } else {
         if (sp_post_on(0u) && sk) sp_wg_gemm<64, true, 0, false, false, true>(M, a.cout, K, a.x, w, ep, slice, nblk, sk);
         else if (sp_post_on(0u) && a.post == 0u) wide ? sp_wg_gemm<128, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk);
+        else if (sp_post_on(19u) && a.post_beta) wide ? sp_wg_gemm<128, true, 4>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 4>(M, a.cout, K, a.x, w, ep, slice, nblk);
         else if (sp_post_on(12u) && a.post == 12u) wide ? sp_wg_gemm<128, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk);
         else wide ? sp_wg_gemm<128, true, 3>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 3>(M, a.cout, K, a.x, w, ep, slice, nblk);
     }
