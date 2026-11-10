@@ -264,9 +264,10 @@ def report(spec, rows, ceil, classes=None, gens=None, every=False):
     return "\n".join(lines)
 
 
-def versions(gens):
+def versions(arm):
+    """Package versions a row depends on: torch and the row's own generator."""
     out = {}
-    for name in ("torch", *gens):
+    for name in ("torch", arm):
         try:
             out[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -347,9 +348,9 @@ def run(spec, a):
     if keep is not None:  # the queue runner's own TL_* toggles are not the submitter's
         for k in [k for k in os.environ if k.startswith("TL_") and k not in keep.split(",")]:
             del os.environ[k]
-    stamp = {"spec": spec["name"], "device": torch.cuda.get_device_name(),
-             "versions": versions(gens), "tl_env": tl_env(os.environ)}
-    same = lambda r: all(r.get(k) == v for k, v in stamp.items())
+    stamp = {"spec": spec["name"], "device": torch.cuda.get_device_name(), "tl_env": tl_env(os.environ)}
+    same = lambda r: (all(r.get(k) == v for k, v in stamp.items())
+                      and r.get("versions") == versions(r["arm"]))
     if a.force and path.is_file():
         # drop the selection's recorded rows, so a forced sweep cut short by the budget cannot
         # leave the old measurements selectable or resumable
@@ -360,7 +361,8 @@ def run(spec, a):
     t0 = time.monotonic()
 
     def emit(name, arm, cfg, extra, fn=None, err=None):
-        row = dict(stamp, **{"class": name, "arm": arm, "cfg": cfg, "fp": class_fp(spec, name)}, **extra)
+        row = dict(stamp, **{"class": name, "arm": arm, "cfg": cfg, "fp": class_fp(spec, name),
+                             "versions": versions(arm)}, **extra)
         fatal = False
         if err is None:
             try:
