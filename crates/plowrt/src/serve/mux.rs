@@ -8171,8 +8171,9 @@ fn gpu_prefill_batched_pass(
 
 /// Whether this tick's depth-packet prompts take the packed pass: two or more prompts to prefill
 /// (one launch, and their first frames in one depth launch), or a prompt already admitted to it.
-/// A lone prompt prefills serially: its first frame then needs no extra decode step (c1 TTFA,
-/// Qwen3-TTS H100: 19.6 vs 21.4 ms). A live CFG pair keeps the tick serial, and a prompt part way
+/// A lone prompt with nothing decoding prefills serially: its first frame then needs no extra
+/// decode step (c1 TTFA, Qwen3-TTS H100: 19.6 vs 21.4 ms). Beside decoding rows it packs, so those
+/// rows share its launch instead of waiting out a serial prefill. A live CFG pair keeps the tick serial, and a prompt part way
 /// through serial prefill keeps it serial until done (packed admission restarts a slot).
 #[cfg(feature = "cuda")]
 fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap: usize) -> bool {
@@ -8203,11 +8204,15 @@ fn depth_prompts_pack(slots: &[Option<Slot>], cap: usize, ready: impl Fn(usize) 
     if slots.iter().take(cap).flatten().any(|s| s.cfg.is_some()) {
         return false;
     }
-    let (mut prompts, mut admitted) = (0, false);
+    let (mut prompts, mut admitted, mut decoding) = (0, false, false);
     for (i, s) in slots.iter().enumerate().take(cap) {
-        let Some(s) = s.as_ref().filter(|s| s.step == 0) else {
+        let Some(s) = s.as_ref() else {
             continue;
         };
+        if s.step > 0 {
+            decoding = true;
+            continue;
+        }
         if !depth_prompt_can_pack(s) {
             return false;
         }
@@ -8220,7 +8225,7 @@ fn depth_prompts_pack(slots: &[Option<Slot>], cap: usize, ready: impl Fn(usize) 
             admitted |= s.resume > 0 && s.resume + 1 == s.prompt_ids.len();
         }
     }
-    admitted || prompts >= 2
+    admitted || prompts >= 2 || (prompts == 1 && decoding)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -14259,6 +14264,14 @@ mod tests {
             !depth_prompts_pack(&slots, 2, |_| false),
             "a cold single prompt stays serial"
         );
+        let (mut live, _rl) = prefill_test_slot();
+        live.as_mut().unwrap().step = 1;
+        slots[1] = live;
+        assert!(
+            depth_prompts_pack(&slots, 2, |_| false),
+            "a single prompt beside a decoding row packs"
+        );
+        slots[1] = None;
         slots[0].as_mut().unwrap().resume = 2;
         assert!(depth_prompts_pack(&slots, 2, |_| false));
         slots[0].as_mut().unwrap().resume = 1;
