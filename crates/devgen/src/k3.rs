@@ -3726,7 +3726,11 @@ mod tests {
             shared_inter: 6144,
             n_exp: 896,
             top_k: 16,
-            route_flags: 3,
+            // sigmoid | renormalize | bias bound, as `kimi_k3.rs` emits it (the oracle fixture
+            // writes the same 1|2|4).
+            route_flags: crate::mla::router_flag::SIGMOID
+                | crate::mla::router_flag::NORM_TOPK
+                | crate::mla::router_flag::BIAS,
             route_scale: 2.5,
             n_group: 1,
             topk_group: 1,
@@ -3964,6 +3968,19 @@ mod tests {
             .unwrap();
         assert_eq!(rl.i[1], 896);
         assert_eq!(rl.i[2], 16);
+        // The selection bias is bound AND announced: the dispatch passes t[3] to the router
+        // only under bit 2 (`(in->i[3] & 4u) ? TEN(3) : nullptr`). A packet that binds the
+        // tensor without the bit routes unbiased while the oracle selects on scores + bias.
+        assert_ne!(
+            rl.t[3],
+            packet::dev::TENSOR_NONE,
+            "e_score_correction_bias bound"
+        );
+        assert_eq!(
+            rl.i[3] & crate::mla::router_flag::BIAS,
+            crate::mla::router_flag::BIAS,
+            "router_flag::BIAS set when the bias tensor is bound"
+        );
     }
 
     /// A snapshot layer RESTARTS the prefix — no residual add — and layer 0
@@ -4432,6 +4449,15 @@ mod tests {
             .filter(|i| i.op == DevOp::MoeRouterTopkPf as u16)
         {
             assert_eq!(i.i[4], band);
+            assert_ne!(
+                i.t[3],
+                packet::dev::TENSOR_NONE,
+                "prefill router binds the bias"
+            );
+            assert_eq!(
+                i.i[3] & crate::mla::router_flag::BIAS,
+                crate::mla::router_flag::BIAS
+            );
         }
         for i in p.insts.iter().filter(|i| i.op == DevOp::MoeAlignPf as u16) {
             assert_eq!(i.i[0], t);

@@ -1420,12 +1420,25 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         t.insert("norm_fold".into(), json!(1));
     }
     // * `hnr_fold` (PLOW_DECODE_HNR_FOLD opt-in): the decode object's FlashDecode carries the
-    //   HeadNormRope fold arm the packet's flash packets use.
-    if arch.starts_with("sm_") && crate::emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 {
+    //   HeadNormRope fold arm the packet's flash packets use. PLOW_DEPTH_ATTN_FOLD: the depth
+    //   programs' FlashDecode uses it (any sm_ object; the backbone's flash packets stay unfolded).
+    let ec = crate::emit_config::active();
+    if arch.starts_with("sm_") && ec.decode_hnr_fold.unwrap_or(0) > 0 {
         assert_eq!(
             arch, "sm_120a",
             "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only"
         );
+        t.insert("hnr_fold".into(), json!(1));
+    }
+    if arch.starts_with("sm_") && ec.depth_attn_fold {
+        // The fold arm is the hd128 row-group body's, without its bulk-copy rings or KV interleave.
+        assert!(
+            !["fa_rgt", "fa_rgm", "kv_ilv"]
+                .iter()
+                .any(|k| t.contains_key(*k)),
+            "PLOW_DEPTH_ATTN_FOLD: the row-group body without RGT / RGM / KV interleave"
+        );
+        t.insert("fa_rg".into(), json!(1));
         t.insert("hnr_fold".into(), json!(1));
     }
     // * `gemv_xk` (PLOW_DECODE_GEMV_XK opt-in): the first rung whose Gemv walk splits K over blocks.
@@ -3071,6 +3084,11 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
     if let Some(objects) = manifest.get("objects") {
         feed(&objects.to_string());
     }
+    // The split-image arm (PLOW_SPEECH_SPLIT_A) is compiled into the speech object only for a
+    // packet that uses it; an object without it would trap on the packet's bit-21 convs.
+    if manifest.get("speech_split_a").and_then(Value::as_bool) == Some(true) {
+        feed("\x1espeech_split_a");
+    }
     feed("\x1e");
     if let Some(o) = manifest.get("tuning").and_then(Value::as_object) {
         for (k, v) in o {
@@ -3128,7 +3146,16 @@ pub fn speech_conv_posts(model: &packet::devbuild::Model) -> u64 {
                     && (flags >> 8) & 15 == 0
             }
         })
-        .fold(0, |mask, i| mask | 1 << ((i.j[1] >> 8) & 15))
+        .fold(0, |mask, i| {
+            let post = (i.j[1] >> 8) & 15;
+            // A SnakeBeta output (snake with flags bit 2) has its own epilogue: bit 19.
+            let beta = if post == 12 && (i.j[1] >> 2) & 1 == 1 {
+                1 << 19
+            } else {
+                0
+            };
+            mask | 1 << post | beta
+        })
 }
 
 /// Whether a conv that can reach the wide tile (flags bit 14) pads with other than zeros:
@@ -3146,6 +3173,9 @@ pub fn speech_conv_wide_padded(model: &packet::devbuild::Model) -> bool {
 pub struct SpeechMasks {
     pub ops: u64,
     pub conv_posts: u64,
+    /// A conv reads a split-image activation (Conv1dF32 flags bit 30): `PLOW_SPEECH_SPLIT_A`
+    /// compiles the image GEMM arm and its larger launch arena into the speech object.
+    pub split_a: bool,
     pub conv_wide_padded: bool,
 }
 
@@ -3154,12 +3184,18 @@ impl SpeechMasks {
         Self {
             ops: speech_ops(model),
             conv_posts: speech_conv_posts(model),
+            split_a: model
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .any(|i| i.op == DevOp::Conv1dF32 as u16 && i.j[1] & (1 << 30) != 0),
             conv_wide_padded: speech_conv_wide_padded(model),
         }
     }
     pub fn add(&mut self, other: Self) {
         self.ops |= other.ops;
         self.conv_posts |= other.conv_posts;
+        self.split_a |= other.split_a;
         self.conv_wide_padded |= other.conv_wide_padded;
     }
 }
@@ -3215,6 +3251,12 @@ pub fn config_header(manifest: &Value) -> String {
         out.push_str(&format!(
             "#ifndef PLOW_SPEECH_CONV_POSTS\n#define PLOW_SPEECH_CONV_POSTS 0x{mask:x}ull\n#endif\n\n"
         ));
+    }
+    if manifest.get("speech_split_a").and_then(Value::as_bool) == Some(true) {
+        out.push_str(
+            "/* A conv reads split-image activations: the image GEMM arm and its launch arena. */\n\
+             #ifndef PLOW_SPEECH_SPLIT_A\n#define PLOW_SPEECH_SPLIT_A 1\n#endif\n\n",
+        );
     }
     if let Some(radix) = manifest.get("sample_radix").and_then(Value::as_bool) {
         out.push_str(&format!(
@@ -3614,6 +3656,12 @@ pub fn config_header(manifest: &Value) -> String {
                 "#ifndef PLOW_NV_GEMV_PF_OPS\n#define PLOW_NV_GEMV_PF_OPS {v}u\n#endif\n"
             ));
         }
+        // sm_120a (PLOW_DECODE_HNR_FOLD) or any sm_ object (PLOW_DEPTH_ATTN_FOLD).
+        if t.get("hnr_fold").is_some() {
+            out.push_str(
+                "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
+            );
+        }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a") {
             if let Some(v) = t.get("gemv_k8_ops").and_then(Value::as_u64) {
                 out.push_str(&format!(
@@ -3625,11 +3673,6 @@ pub fn config_header(manifest: &Value) -> String {
             if t.get("norm_fold").is_some() {
                 out.push_str(
                     "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_NORM_FOLD\n#define PLOW_NV_NORM_FOLD 1\n#endif\n#endif\n",
-                );
-            }
-            if t.get("hnr_fold").is_some() {
-                out.push_str(
-                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
                 );
             }
             if let Some(v) = t.get("gemv_xk").and_then(Value::as_u64) {
@@ -4099,6 +4142,13 @@ mod tests {
             (DevOp::Conv1dF32, 9, 1 << 13, 0),
             (DevOp::Conv1dF32, 9, 1 << 14, 1 << 9),
             (DevOp::Conv1dF32, 11, 1 << 17, 1 << 11),
+            (DevOp::Conv1dF32, 12, 1 << 17, 1 << 12),
+            (
+                DevOp::Conv1dF32,
+                12,
+                (1 << 17) | (1 << 2),
+                1 << 12 | 1 << 19,
+            ),
             (DevOp::ConvTranspose1dF32, 0, 0, 0),
             (DevOp::ConvTranspose1dF32, 0, 1 << 14, 0),
             (DevOp::ConvTranspose1dF32, 0, 1 << 17, 0),
@@ -4558,6 +4608,11 @@ mod tests {
         assert_eq!(pairing_hash(&a), pairing_hash(&b));
         b["union"] = json!(["Gemv"]);
         assert_ne!(pairing_hash(&a), pairing_hash(&b));
+        let mut c = a.clone();
+        c["speech_split_a"] = json!(false);
+        assert_eq!(pairing_hash(&a), pairing_hash(&c));
+        c["speech_split_a"] = json!(true);
+        assert_ne!(pairing_hash(&a), pairing_hash(&c));
     }
 
     #[test]

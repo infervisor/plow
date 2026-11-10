@@ -1,0 +1,125 @@
+# EXPERIMENTAL: Qwen3-TTS 12Hz 1.7B Base (Qwen/Qwen3-TTS-12Hz-1.7B-Base) voice cloning on H100,
+# BF16 as published. Same talker / code predictor / codec lowering and emit env as the CustomVoice
+# production recipe (recipes/infervisor/qwen3-tts-1.7b-customvoice/sm90a-h100-tp1-bf16.toml); the
+# Base checkpoint has no preset voices: requests carry reference audio (and optionally its
+# transcript), encoded by speaker_encoder.pkt (the checkpoint's ECAPA-TDNN speaker encoder) and
+# ref_encoder.pkt (the tokenizer's Mimi encoder, reference codec frames). Promote to
+# recipes/infervisor only once its gates qualify (cloning WER <= 1.44% by the spec method).
+#
+#   PYREF=<python with torch + safetensors + transformers + librosa> \
+#   python3 scripts/campaign/campaign.py build scripts/campaign/recipes/qwen3-tts-1.7b-base.h100.bf16-clone.toml --out <fresh dir>
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3-tts-1.7b-base"
+label = "sm90a-h100-tp1-bf16"
+plow_git = "6d527195b4e84c344a6c0a7f3f223aab41784c21"
+network = "qwen3"
+doc = "docs/runtime/tts.md"
+tracker = "docs/runtime/h100-speech-recipes.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+toolchain = "cuda-12.9-nix"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+revision = "fd4b254389122332181a7c3db7f27e918eec64e3"
+
+[cell]
+name = "qwen3-tts-1.7b-base-h100"
+hf_dir = "{out}/prep/talker"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+[[prep]]
+name = "talker-checkpoint"
+script = "scripts/tts/qwen3_tts_prep.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/talker", "fd4b254389122332181a7c3db7f27e918eec64e3", "--repo", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"]
+
+[[prep]]
+name = "codec-export"
+script = "scripts/tts/breeze_codec_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec", "fd4b254389122332181a7c3db7f27e918eec64e3", "Qwen/Qwen3-TTS-12Hz-1.7B-Base", "speech_tokenizer"]
+
+# Reference codec frames: the tokenizer's Mimi encoder, lowered to ref_encoder.pkt beside codec.pkt.
+[[prep]]
+name = "ref-encoder-export"
+script = "scripts/tts/mimi_encoder_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec/encoder", "fd4b254389122332181a7c3db7f27e918eec64e3", "Qwen/Qwen3-TTS-12Hz-1.7B-Base", "speech_tokenizer"]
+
+# Speaker embedding: the checkpoint's ECAPA-TDNN speaker encoder, lowered to speaker_encoder.pkt.
+[[prep]]
+name = "speaker-encoder-export"
+script = "scripts/tts/ecapa_export.py"
+python = "{env:PYREF}"
+args = ["{out}/prep/codec/speaker_encoder", "--qwen-checkpoint", "{hf:Qwen/Qwen3-TTS-12Hz-1.7B-Base@fd4b254389122332181a7c3db7f27e918eec64e3}"]
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "qwen3-tts-1.7b-base"]
+[emit.env]
+PLOW_TTS_PROFILE = "qwen3_tts"
+PLOW_TTS_CODEC_DIR = "{out}/prep/codec"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
+# No per-size codec conv arms: a slot's audio must not depend on its batch.
+# Codec wgmma tiles spanning taps / transposed-conv phases at widths % 4 (the 96-wide k7
+# residual convs, ConvT 192 -> 96) and the decoder input conv on split-bf16 taps wgmma: codec step
+# b32.f17 65.1 -> 51.0 ms. PCM vs the official FP32 decoder: absolute RMS error <= 3.2e-6 FS on all
+# 16 reference cases, under the int16 output rounding noise 8.8e-6 FS (the codec PCM gate, user
+# decision 2026-11-09).
+PLOW_EMIT_CODEC_WGMMA_RAGGED = "1"
+PLOW_EMIT_CODEC_DEC_IN_WGMMA = "1"
+# Prompts are 10 rows + the text (streaming) or + the text again (non-streaming).
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64"
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
+# The 64-row prefill rung's projections as cuBLASLt segments: prefill 16.3 -> 8.5 ms, c1 TTFA p95
+# 28.5 -> 20.4 ms; greedy output bit-identical to the interpreter GEMM (16 prompts).
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+# Simultaneous prompts prefill in one packed launch (the last prompt row withheld), and their
+# first frames sample in the next decode step's one depth launch.
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+PLOW_NV_FA_FOLD = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_FUSE_KV_HNR = "1"
+PLOW_NV_DENSE_TUNE = "1"
+# Depth stage: each layer's q / k / v HeadNormRope and FlashMerge fold into its FlashDecode
+# (961 -> 641 depth instructions; depth B=1 / 32 4.60 / 6.48 -> 4.41 / 5.72 ms).
+PLOW_DEPTH_ATTN_FOLD = "1"
+# Decode objects: preloaded instructions and narrow raw stores, and the B=1 / small-batch GEMVs on
+# the tensor-core K-split walk (K8_MIN 1, two k32 steps in flight) with the classic B=1 kernels
+# dropped (MMA_B1; interpreter stack 320 -> 16 B). fish_gen step ms B=1 / 2 / 8 / 48 / 64:
+# 6.36 / 5.84 / 5.88 / 11.62 / 11.69 -> 5.41 / 5.50 / 5.70 / 10.37 / 10.87; teacher-forced cp
+# rel-L2 vs FP32 0.004792 -> 0.004764 (BF16 reference 0.005030).
+NVCC_APPEND_FLAGS = "-DPLOW_NV_INST_PRELOAD=1 -DPLOW_NV_RAW_NARROW=1 -DPLOW_NV_GEMV_K8_MIN=1 -DPLOW_NV_GEMV_K8_UNB1=2 -DPLOW_NV_GEMV_MMA_B1=1 -DPLOW_NV_GEMV_K8_MAX_MAIN=64"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice ryan", "--conc 8 --stream --n 32 --prompt-set chatterbox --voice ryan", "--conc 32 --stream --n 64 --prompt-set chatterbox --voice ryan", "--conc 64 --stream --n 128 --prompt-set chatterbox --voice ryan"]
+
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice ryan", "--conc 32 --stream --wav --n 64 --prompt-set chatterbox --voice ryan"]
+cer_median_max = 0.05
+
+[serve]
+# First audible byte needs the second frame (onset trim); rungs up to 64 rows; the streaming load
+# protocol's server settings (no realtime admission pacing, 1 ms codec launch window).
+env = { PLOW_VMM_PREFIX = "1", PLOW_TTS_STREAM_FIRST_FRAMES = "2", PLOW_DECODE_MAX_RUNG = "64", PLOW_TTS_REALTIME = "0", PLOW_TTS_CODEC_LAUNCH_US = "1000" }

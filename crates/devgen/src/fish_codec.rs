@@ -277,14 +277,25 @@ pub fn lower_fish_dac(
         let Some(name) = tensor.name.strip_prefix("w.") else {
             continue;
         };
-        let (dtype, mut bytes) = match name.strip_suffix(".a12") {
-            Some(unit) => {
+        let rep_stride = name.strip_suffix(".b_rep").and_then(|base| {
+            cfg.ups
+                .iter()
+                .enumerate()
+                .find(|(u, _)| base == format!("up{u}.convt"))
+                .map(|(_, &(stride, _))| (base, stride))
+        });
+        let (dtype, mut bytes) = match (name.strip_suffix(".a12"), rep_stride) {
+            (Some(unit), _) => {
                 let (d1, mut a) = reader.read(&format!("{unit}.a1"))?;
                 let (_, b) = reader.read(&format!("{unit}.a2"))?;
                 a.extend_from_slice(&b);
                 (d1, a)
             }
-            None => reader.read(name)?,
+            (None, Some((base, stride))) => {
+                let (d, b) = reader.read(&format!("{base}.b"))?;
+                (d, b.repeat(stride as usize))
+            }
+            (None, None) => reader.read(name)?,
         };
         // Every ConvT whose Conv takes phase-major weights (`codec::phase_major`): the decoder
         // blocks' upsamplers and the post-transformer ConvNeXt upsamplers (kernel = stride).
@@ -554,7 +565,18 @@ impl Seq {
         b: Option<&str>,
         math: crate::pipeline::Conv1dMath,
     ) -> Result<u32, String> {
-        self.dense_with(splits, x, TensorRef::Named(out), None, rows, k, n, w, b, math)
+        self.dense_with(
+            splits,
+            x,
+            TensorRef::Named(out),
+            None,
+            rows,
+            k,
+            n,
+            w,
+            b,
+            math,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -612,6 +634,9 @@ impl Seq {
                 weight_split: split,
                 dual_alpha: false,
                 pinned: true,
+                wgmma_ragged: false,
+                input_split: false,
+                output_split: false,
             },
             math,
         )?;
@@ -946,6 +971,7 @@ fn program_for(
             row_scale: None,
             alpha_out: None,
             taps_wgmma: true,
+            wgmma_ragged: false,
         };
         last = stateful(&mut p, c, last, pre, "state.codec.pre".into(), 0)?.done;
     }
@@ -1075,6 +1101,7 @@ fn program_for(
     };
     let dim = cfg.latent;
 
+    let ragged = cfg.breeze && crate::emit_config::active().codec_wgmma_ragged;
     let conv = |output: &'static str,
                 weight: String,
                 bias: Option<String>,
@@ -1105,6 +1132,7 @@ fn program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        wgmma_ragged: ragged,
     };
     let other = |e: u32| if e == x { "act.codec.b" } else { "act.codec.a" };
     let snake = if cfg.breeze {
@@ -1119,19 +1147,36 @@ fn program_for(
     let mut rows = frames;
     for (u, &(stride, ln_eps)) in cfg.ups.iter().enumerate() {
         let w = |s: &str| format!("w.up{u}.{s}");
-        let mut c = conv(
-            other(cur.output),
-            w("convt.w"),
-            Some(w("convt.b")),
-            rows,
-            dim,
-            dim,
-            stride,
-        );
-        c.transpose = true;
-        c.stride = stride;
-        c.dilation = 0;
-        c.pad = 0;
+        // Breeze under split-bf16: kernel = stride, so the transposed conv is a pointwise conv to
+        // stride x dim columns over the phase-major weights ([stride][dim][dim]), whose rows read
+        // back as stride output rows each (bias repeated per phase, `.b_rep`).
+        let pointwise = cfg.breeze && splits.is_some() && dim % 4 == 0 && dim >= 16;
+        let mut c = if pointwise {
+            conv(
+                other(cur.output),
+                w("convt.w"),
+                Some(w("convt.b_rep")),
+                rows,
+                dim,
+                stride * dim,
+                1,
+            )
+        } else {
+            let mut c = conv(
+                other(cur.output),
+                w("convt.w"),
+                Some(w("convt.b")),
+                rows,
+                dim,
+                dim,
+                stride,
+            );
+            c.transpose = true;
+            c.stride = stride;
+            c.dilation = 0;
+            c.pad = 0;
+            c
+        };
         c.len = len(u);
         let mut p = s.p.take().unwrap();
         let up = fused_conv(&mut p, fuse, splits, cur.output, cur.done, c)?;
@@ -1167,6 +1212,7 @@ fn program_for(
                 epsilon: ln_eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s = Seq {
@@ -1212,9 +1258,7 @@ fn program_for(
     );
     let mut c = c;
     c.len = len(cfg.ups.len());
-    // 1024 -> 1536 k7 on the wgmma taps tile (tap-major weights + pre-split image) instead of
-    // the 3xTF32 64x64 tiles.
-    c.taps_wgmma = true;
+    c.taps_wgmma = ragged && crate::emit_config::active().codec_dec_in_wgmma;
     cur = stateful(
         &mut p,
         cur.output,
@@ -1272,11 +1316,17 @@ fn program_for(
             c.dilation = d;
             c.pad = 6 * d;
             c.len = len_out;
-            if cfg.breeze {
+            // Breeze under split-bf16: the output SnakeBeta (`a2`) fuses into the taps epilogue.
+            let beta_fused = cfg.breeze && splits.is_some();
+            if cfg.breeze && !beta_fused {
                 c.alpha = Some(format!("{pre}.a1"));
             } else {
                 c.alpha_out = Some(format!("{pre}.a12"));
-                c.act_out = Activation::Snake;
+                c.act_out = if cfg.breeze {
+                    Activation::SnakeBeta
+                } else {
+                    Activation::Snake
+                };
             }
             let mut h = stateful(
                 &mut p,
@@ -1286,7 +1336,7 @@ fn program_for(
                 format!("state.codec.blk{i}.ru{j}"),
                 k_out,
             )?;
-            if cfg.breeze {
+            if cfg.breeze && !beta_fused {
                 h = snake_beta(&mut p, h, &format!("{pre}.a2"), batch * rows, b.cout)?;
             }
             let mut c = conv(
@@ -1469,6 +1519,7 @@ fn mimi_program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        wgmma_ragged: false,
     };
     // A causal ConvTranspose k = 2s: (rows - 1) * s + k outputs, the last k - s cropped.
     let convt = |mut c: Conv, stride: u32| {
@@ -1570,6 +1621,7 @@ fn mimi_program_for(
                 epsilon: cfg.eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s.done(e);

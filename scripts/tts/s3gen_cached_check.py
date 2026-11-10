@@ -65,7 +65,7 @@ def main():
     ap.add_argument("--packet", required=True)
     ap.add_argument("--runner", required=True)
     ap.add_argument("--mtl", action="store_true", help="Multilingual V3 weights (s3gen_v3.safetensors)")
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--out", default=None, help="keep the packet outputs (mel/pcm/phase_out .bin + sha256) for A/B digests")
     args = ap.parse_args()
     import torch
     import torch.nn.functional as F
@@ -192,6 +192,12 @@ def main():
             raise SystemExit(r.stderr[-4000:])
         res = {k: np.fromfile(os.path.join(d, k + ".out"), np.float32) for k in outs}
         print(r.stdout.strip().splitlines()[-1])
+    if args.out:
+        import hashlib
+        os.makedirs(args.out, exist_ok=True)
+        for k, a in res.items():
+            a.tofile(os.path.join(args.out, k + ".bin"))
+            print(f"digest {k} ({cb}, {cn}) sha256={hashlib.sha256(a.tobytes()).hexdigest()[:16]}")
     for i, (tok, seed, phase, seam, next_seam) in enumerate(batch):
         n = len(tok)
         mel = res["act.s3gen.mel"][i * 2 * cn * 80:][: 2 * n * 80].reshape(2 * n, 80)

@@ -1100,6 +1100,7 @@ impl GuidedSpeech {
                     } else {
                         0
                     },
+                    first_audio: None,
                     depth: None,
                     encode: None,
                     frame_codes: Vec::new(),

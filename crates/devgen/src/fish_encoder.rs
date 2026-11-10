@@ -310,6 +310,7 @@ fn program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        wgmma_ragged: false,
     };
     // Causal: `(k - 1) * d + 1 - s` zero rows on the left, none on the right at whole frames.
     let causal = |mut c: Conv, kernel: u32, stride: u32, dilation: u32| {
@@ -359,6 +360,9 @@ fn program_for(
             weight_split: false,
             dual_alpha: false,
             pinned: false,
+            wgmma_ragged: false,
+            input_split: false,
+            output_split: false,
         },
     )?;
     let mut d = cfg.channels;
@@ -447,6 +451,7 @@ fn program_for(
                 epsilon: cfg.ln_eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         let mut s = Seq {

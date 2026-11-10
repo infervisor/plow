@@ -1789,6 +1789,11 @@ impl AmdTpGroup {
         self.ranks.iter().all(|e| e.has_snapshot(slot))
     }
 
+    /// Every rank runs the same programs; rank 0 answers for the group.
+    pub fn dsa_pool_align(&self) -> u32 {
+        self.rank(0).dsa_pool_align()
+    }
+
     /// Point every rank's KV pointer table at sequence slot `slot`.
     ///
     /// Exposed for the CHUNK-AT-A-TIME server path: `prefill_slot` holds the rebase across a

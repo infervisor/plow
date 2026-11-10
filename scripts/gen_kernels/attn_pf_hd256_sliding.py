@@ -192,7 +192,10 @@ class Case:
     at ring row p & kv_mask; requests (q0, qlen, slot, kvlen) packed in order."""
 
     def __init__(self, drv, H, KVH, window, requests, seq_q=None, kv_stride=None, ring=True,
-                 slots=None, seed=0, qscale=None, fp8=False, spans=None, ilv=False):
+                 slots=None, seed=0, qscale=None, fp8=False, spans=None, ilv=False, poison=()):
+        """`poison`: (slot, lo, hi) position ranges whose K/V rows hold NaN. They must lie under
+        every query row's window floor (so the reference never reads them); the kernel's output
+        then proves its staging zero-fills or skips masked rows instead of multiplying them."""
         torch = drv.torch
         self.drv, self.H, self.KVH, self.window, self.requests = drv, H, KVH, window, requests
         # Media spans per request, absolute [start, end) positions: rows of one span also attend
@@ -244,6 +247,15 @@ class Case:
                 self.k[slot][:, :kvlen] = kl.transpose(0, 1).to(bf)
                 self.v[slot][:, :kvlen] = vl.transpose(0, 1).to(bf)
             self.lin.append((kl, vl))
+        for slot, lo, hi in poison:
+            assert not fp8, "poison rows are a bf16 check"
+            for q0, qlen, rslot, kvlen in requests:
+                floor = kvlen - qlen - window + 1 if window else 0
+                assert rslot != slot or hi <= floor, "poisoned rows reach a query window"
+            pos = torch.arange(lo, hi, device="cuda")
+            rows = pos & self.kv_mask if ring else pos
+            self.k[slot][:, rows] = float("nan")
+            self.v[slot][:, rows] = float("nan")
         assert not (ilv and fp8), "the head-interleaved KV twin is bf16 only"
         self.ilv = ilv
         if ilv:
@@ -429,6 +441,10 @@ def check_cases():
         ("12B w1024 chunk wraps ring", 16, 8, 1024, [(0, 2048, 0, 9000)],
          {"kv_stride": 4096}),
         ("12B window > prompt", 16, 8, 1024, [(0, 300, 0, 300), (300, 513, 1, 513)], {}),
+        # A restored window whose floor (33) is not tile-aligned: tile 0 covers rows 0..63, the
+        # first 33 of which are below the floor and hold NaN (an unrestored ring under a prefix
+        # boundary at 1056). The TMA path must not stage such a tile whole.
+        ("w1024 floor 33 under NaN rows", 16, 8, 1024, [(0, 64, 0, 1120)], {"poison": [(0, 0, 33)]}),
         ("E4B w512 1000", 8, 2, 512, [(0, 1000, 0, 1000)], {}),
         ("E4B w512 packed 2 + pad", 8, 2, 512, [(0, 700, 1, 700), (700, 1301, 0, 1301)],
          {"seq_q": 2048}),

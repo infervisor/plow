@@ -5,8 +5,10 @@
 //! own slot, joining one launch apart (different positions), each with its own chunk sizes.
 //! CODES.i32 = [items][FRAMES][frame_codes] little-endian i32 (else random codes).
 //! Prints per-stream rel-L2 / max |d| of the streamed PCM vs `decode.b1.f*` and sample counts.
-//! `CSC_DUMP=PREFIX` writes stream 0's PCM (raw f32) to PREFIX.stream.f32 (alone), PREFIX.whole.f32
-//! and PREFIX.mixed.f32 (embedded in the shared launches).
+//! Phase 2's stream 0 is then compared bit for bit with phase 1's (batch invariance: same codes and
+//! chunk sizes, another slot, wider launches).
+//! `CSC_DUMP=PREFIX` writes stream 0's PCM (raw f32) to PREFIX.stream.f32, PREFIX.whole.f32 and
+//! PREFIX.mixed.f32.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -200,19 +202,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Phase 1: stream 0 alone on slot 0.
-    let (mut got, mut t) = (Vec::new(), 0);
+    let (mut single, mut t) = (Vec::new(), 0);
     let mut ms = Vec::new();
+    let mut single_steps = Vec::new();
     while t < frames {
         let k = size(frames - t);
         let t0 = std::time::Instant::now();
-        got.extend(launch(&[(0, 0, t, k)])?.remove(0));
+        single.extend(launch(&[(0, 0, t, k)])?.remove(0));
         ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        single_steps.push((t, k));
         t += k;
     }
-    report("single", 0, &got);
-    if let Ok(dir) = std::env::var("CSC_DUMP") {
+    report("single", 0, &single);
+    let dump = std::env::var("CSC_DUMP").ok();
+    if let Some(dir) = &dump {
         // Raw f32 PCM of stream 0, streamed and whole, for cross-packet comparison.
-        std::fs::write(format!("{dir}.stream.f32"), bytemuck::cast_slice(&got))?;
+        std::fs::write(format!("{dir}.stream.f32"), bytemuck::cast_slice(&single))?;
         std::fs::write(format!("{dir}.whole.f32"), bytemuck::cast_slice(&whole[0]))?;
     }
     let med = |v: &mut Vec<f64>| {
@@ -249,9 +254,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (s, g) in got.iter().enumerate() {
         report("mixed", s, g);
     }
-    if let Ok(dir) = std::env::var("CSC_DUMP") {
-        // Stream 0 again, this time embedded in launches of 1..=STREAMS items.
-        std::fs::write(format!("{dir}.mixed.f32"), bytemuck::cast_slice(&got[0]))?;
+    // Batch invariance: stream 0's bits alone (phase 1, slot 0, b1 launches) vs in the mix (phase 2,
+    // another slot, launches of up to `streams` items). Same codes, same chunk sizes.
+    let mixed = &got[0];
+    match single.iter().zip(mixed).position(|(a, b)| a.to_bits() != b.to_bits()) {
+        None if single.len() == mixed.len() => {
+            println!("invariance stream 0: bit-identical ({} samples, {} steps)", single.len(), single_steps.len());
+        }
+        at => {
+            let i = at.unwrap_or(single.len().min(mixed.len()));
+            let max = single
+                .iter()
+                .zip(mixed)
+                .map(|(a, b)| f64::from((a - b).abs()))
+                .fold(0f64, f64::max);
+            let step = single_steps
+                .iter()
+                .position(|&(t, k)| i < (t + k) * fs)
+                .map_or(String::new(), |j| format!(" (step {j}: frames {}..{})", single_steps[j].0, single_steps[j].0 + single_steps[j].1));
+            println!(
+                "invariance stream 0: DIFFERS first at sample {i}{step}, max |d| {max:.3e}, lengths {} vs {}",
+                single.len(),
+                mixed.len()
+            );
+        }
+    }
+    if let Some(dir) = &dump {
+        std::fs::write(format!("{dir}.mixed.f32"), bytemuck::cast_slice(mixed))?;
     }
     println!(
         "time mixed streams {streams} median_ms {:.3}",

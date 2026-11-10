@@ -201,6 +201,47 @@ def load_reference_decoder(path, device, streaming_source=None):
     return decode, meta
 
 
+# Absolute RMS error at or below int16 output rounding noise, (1/32768)/sqrt(12) FS: the PCM gate a
+# capture declares with "pcm_gate": "int16_rms" (Qwen3-TTS, user decision 2026-11-09); else relative L2.
+INT16_RMS = 1.0 / 32768.0 / 12.0 ** 0.5
+
+
+def pcm_pass(gate, finite, relative, rms, limit):
+    return bool(finite and (rms <= INT16_RMS if gate == "int16_rms" else relative < limit))
+
+
+def full_case_checks(native, sources, meta, decode, gate, inputs):
+    """Every reference case decoded whole at full length; the int16_rms gate requires all of them."""
+    if gate == "int16_rms":
+        assert "full_cases" in native, "int16_rms capture without full-length cases"
+    if "full_cases" not in native:
+        return []
+    cases = native["full_cases"]
+    assert sorted(c["case"] for c in cases) == sorted(sources), "full-length cases differ from the reference cases"
+    path = Path(native["full_pcm"])
+    pcm = np.fromfile(path, dtype="<f4")
+    inputs.append(path)
+    offset, checks = 0, []
+    for c in cases:
+        case = sources[c["case"]]
+        count = case["frames"] * meta["frame_samples"]
+        assert c["frames"] == case["frames"] and c["samples"] == count and c["offset_f32"] == offset, "full-length case truncated"
+        codes = np.fromfile(case["codes"], dtype="<u4").reshape(case["frames"], meta["frame_codes"]).astype(np.int64)
+        expected = np.asarray(decode(codes), dtype=np.float64)
+        assert expected.shape == (count,)
+        actual = pcm[offset:offset + count].astype(np.float64)
+        finite = bool(np.isfinite(actual).all())
+        error = actual - expected
+        relative = float(np.linalg.norm(error) / max(np.linalg.norm(expected), 1e-30)) if finite else None
+        rms = float(np.sqrt(np.mean(error * error))) if finite else None
+        signal = float(np.sqrt(np.mean(expected * expected)))
+        checks.append(dict(case=c["case"], frames=case["frames"], finite=finite, relative_l2=relative, rms=rms,
+                           signal_rms=signal, passed=pcm_pass(gate, finite, relative, rms, native["whole_relative_l2_limit"])))
+        offset += count
+    assert offset == pcm.size, "unexpected trailing full-length PCM"
+    return checks
+
+
 @torch.inference_mode()
 def decoder_reference(a):
     import sys
@@ -227,16 +268,25 @@ def decoder_reference(a):
     assert len(sources) == len(reference["cases"])
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
-    decoded, records = {}, []
+    decoded, records, gates = {}, [], set()
     for result_path in map(Path, a.decoder_result):
         native = json.loads(result_path.read_text())
         assert native["whole_relative_l2_limit"] == 1e-5
+        gate = native.get("pcm_gate", "relative_l2")
+        assert gate in ("relative_l2", "int16_rms"), f"unknown pcm_gate {gate}"
+        gates.add(gate)
         assert native["checks"], "empty decoder capture"
         pcm_path = result_path.with_suffix(".f32")
         assert pcm_path.stat().st_size % 4 == 0
         pcm = np.fromfile(pcm_path, dtype="<f4")
         inputs.extend([result_path, pcm_path])
-        offset, checks = 0, []
+        owned = None
+        if "owned_whole_pcm" in native:
+            owned_path = Path(native["owned_whole_pcm"])
+            assert owned_path.stat().st_size % 4 == 0
+            owned = np.fromfile(owned_path, dtype="<f4")
+            inputs.append(owned_path)
+        offset, owned_offset, checks = 0, 0, []
         for item in native["checks"]:
             source, prefix, fresh = item["source"], item["reference_frames"], item["fresh_frames"]
             case = sources[source]
@@ -267,21 +317,38 @@ def decoder_reference(a):
                 finite = bool(np.isfinite(actual).all())
                 error = actual - expected
                 relative = float(np.linalg.norm(error) / max(np.linalg.norm(expected), 1e-30)) if finite else None
-                metrics[name] = dict(finite=finite, relative_l2=relative,
+                rms = float(np.sqrt(np.mean(error * error))) if finite else None
+                metrics[name] = dict(finite=finite, relative_l2=relative, rms=rms,
                                      max_abs=float(np.abs(error).max()) if finite else None,
-                                     passed=finite and relative < native["whole_relative_l2_limit"])
+                                     passed=pcm_pass(gate, finite, relative, rms, native["whole_relative_l2_limit"]))
                 offset += count
+            if owned is not None:
+                full_count = (prefix + fresh) * meta["frame_samples"]
+                assert item["owned_whole_offset_f32"] == owned_offset and item["owned_whole_samples"] == full_count
+                assert owned_offset + full_count <= owned.size, "truncated owned whole PCM"
+                actual = owned[owned_offset:owned_offset + full_count].astype(np.float64)
+                finite = bool(np.isfinite(actual).all())
+                error = actual - whole.astype(np.float64)
+                relative = float(np.linalg.norm(error) / max(np.linalg.norm(whole.astype(np.float64)), 1e-30)) if finite else None
+                rms = float(np.sqrt(np.mean(error * error))) if finite else None
+                metrics["owned_whole"] = dict(finite=finite, relative_l2=relative, rms=rms,
+                                             max_abs=float(np.abs(error).max()) if finite else None,
+                                             passed=pcm_pass(gate, finite, relative, rms, native["whole_relative_l2_limit"]))
+                owned_offset += full_count
             checks.append(dict(width=item["width"], item=item["item"], source=source,
                                reference_frames=prefix, fresh_frames=fresh, reference_pcm=str(path),
                                metrics=metrics, passed=all(m["passed"] for m in metrics.values())))
         assert offset == pcm.size, "unexpected trailing native PCM"
-        records.append(dict(capture=str(result_path), internal_gate_pass=native["pass"], checks=checks,
-                            independent_reference_pass=all(c["passed"] for c in checks)))
+        assert owned is None or owned_offset == owned.size, "unexpected trailing owned whole PCM"
+        full = full_case_checks(native, sources, meta, decode, gate, inputs)
+        records.append(dict(capture=str(result_path), internal_gate_pass=native["pass"], checks=checks, full_cases=full,
+                            independent_reference_pass=all(c["passed"] for c in checks + full)))
     assert records, "no native decoder captures"
     import transformers
     report = dict(scope="saved codes through official FP32 decoder vs captured whole/stateful/primed PCM",
                   pass_all=all(r["internal_gate_pass"] and r["independent_reference_pass"] for r in records),
-                  relative_l2_limit=1e-5, reference_repeat_exact=True,
+                  relative_l2_limit=1e-5, pcm_gates=sorted(gates), int16_rms_limit=INT16_RMS,
+                  reference_repeat_exact=True,
                   full_model_qualified=False, timings_scored=False,
                   torch=torch.__version__, transformers=transformers.__version__, device=a.device,
                   decoder=meta, captures=records,
@@ -313,6 +380,7 @@ def onset_ms(pcm):
 class Loop:
     def __init__(self, m, tok, voice, language):
         self.m, self.t, self.cfg = m, m.talker, m.config
+        self.talker, self.sub, self.rp = (50, 0.9), (50, 0.9), 1.05
         tc = self.cfg.talker_config
         self.tok = tok
         self.dev = next(m.parameters()).device
@@ -366,9 +434,9 @@ class Loop:
             if step >= 2:
                 logits[EOS] = self.t.codec_head(h)[0, -1, EOS].float()
             for t_ in set(hist):
-                logits[t_] = logits[t_] * 1.05 if logits[t_] < 0 else logits[t_] / 1.05
+                logits[t_] = logits[t_] * self.rp if logits[t_] < 0 else logits[t_] / self.rp
             l0s.append(logits.cpu())
-            c0 = self.sample(logits, greedy, gen)
+            c0 = self.sample(logits, greedy, gen, *self.talker)
             if force is not None:
                 c0 = int(force[step][0]) if step < len(force) else EOS
             if c0 == EOS:
@@ -382,7 +450,7 @@ class Loop:
                 o = cp.model(inputs_embeds=x, past_key_values=cpc, use_cache=True)
                 lg = cp.lm_head[j](o.last_hidden_state[:, -1]).float()[0]
                 lcp.append(lg.cpu())
-                c = self.sample(lg, greedy, gen)
+                c = self.sample(lg, greedy, gen, *self.sub)
                 if force is not None:
                     c = int(force[step][j + 1])
                 codes.append(c)
@@ -419,6 +487,12 @@ def main():
     ap.add_argument("--logits", action="store_true")
     ap.add_argument("--official", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
+    # Sampling (the published generation config by default; the code predictor takes no penalty).
+    ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--temperature", type=float, default=0.9)
+    ap.add_argument("--sub-top-k", type=int, default=50)
+    ap.add_argument("--sub-temperature", type=float, default=0.9)
+    ap.add_argument("--repetition-penalty", type=float, default=1.05)
     ap.add_argument("--force", default=None)
     ap.add_argument("--prepared-predictor", action="store_true",
                     help="FP32 conditional predictor: MODEL=prepared checkpoint, TEXTS=packet predictor capture")
@@ -448,6 +522,7 @@ def main():
     w = Qwen3TTSModel.from_pretrained(a.model, dtype=dt, device_map=a.device)
     tok = w.processor.tokenizer if hasattr(w.processor, "tokenizer") else w.processor
     loop = Loop(w.model, tok, a.voice, a.language)
+    loop.talker, loop.sub, loop.rp = (a.top_k, a.temperature), (a.sub_top_k, a.sub_temperature), a.repetition_penalty
     os.makedirs(a.out, exist_ok=True)
     rows = [json.loads(l) for l in open(a.texts) if l.strip()]
     if a.limit:
@@ -479,9 +554,10 @@ def main():
             off, _ = w.model.generate(
                 input_ids=[torch.tensor([res["ids"]], device=a.device)], instruct_ids=[None],
                 languages=[a.language], speakers=[a.voice], non_streaming_mode=False,
-                do_sample=not greedy, subtalker_dosample=not greedy, top_k=50, top_p=1.0,
-                temperature=0.9, subtalker_top_k=50, subtalker_top_p=1.0, subtalker_temperature=0.9,
-                repetition_penalty=1.05, max_new_tokens=a.max_frames)
+                do_sample=not greedy, subtalker_dosample=not greedy, top_k=a.top_k, top_p=1.0,
+                temperature=a.temperature, subtalker_top_k=a.sub_top_k, subtalker_top_p=1.0,
+                subtalker_temperature=a.sub_temperature, repetition_penalty=a.repetition_penalty,
+                max_new_tokens=a.max_frames)
             oc = off[0].cpu().numpy().astype(np.int32)
             n = min(len(oc), len(codes))
             rec["official_frames"] = int(len(oc))
