@@ -239,6 +239,7 @@ impl SpeechFn {
         e: &GpuEngine,
         assets: &std::path::Path,
         programs: &[plow_asset::aux_program::Program],
+        (blob, raw): (&DevBlob, &[u8]),
     ) -> Result<Self> {
         let (file, symbol) = super::packet_exec::speech_object(e.be.compute_capability());
         let path = assets.join(file);
@@ -267,6 +268,7 @@ impl SpeechFn {
                 )));
             }
         }
+        super::packet_exec::check_speech_flag_layout(&e.be, &module, &path, blob, raw)?;
         let caps = super::packet_exec::missing_speech_caps(
             super::packet_exec::speech_caps_required(programs.iter().flat_map(|p| &p.insts)),
             e.be.module_global_u32(&module, "plow_speech_caps_speech")?,
@@ -416,7 +418,7 @@ impl FishDepth {
         let bytes = blob
             .reserved_metadata(raw, plow_asset::fish_depth::PROGRAMS_SECTION)?
             .ok_or_else(|| reject("depth programs section missing"))?;
-        Self::load(e, manifest, bytes, assets).map(Some)
+        Self::load(e, manifest, bytes, assets, (blob, raw)).map(Some)
     }
 
     fn load(
@@ -424,6 +426,7 @@ impl FishDepth {
         manifest: Manifest,
         bytes: &[u8],
         assets: &std::path::Path,
+        packet: (&DevBlob, &[u8]),
     ) -> Result<Self> {
         let section =
             plow_asset::aux_program::parse(bytes, e.grid, e.devp.len()).map_err(reject)?;
@@ -492,7 +495,7 @@ impl FishDepth {
                 logits: e.be.host_alloc_pinned(rows * e.vocab() * 2)?,
                 scratch: Vec::new(),
                 depth: (f32::from_bits(t), k),
-                speech: SpeechFn::load(e, assets, &section.programs)?,
+                speech: SpeechFn::load(e, assets, &section.programs, packet)?,
                 null_memory: null_memory(e, &manifest)?,
             }),
             _ => None,

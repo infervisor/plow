@@ -1045,6 +1045,38 @@ impl DevBlob {
         read_abi(buf, &self.sections)
     }
 
+    /// The packet's side of `plow_asset::speech_flag_layout::check`: the layout `abi.json`
+    /// declares and the opcode of the first instruction, in the regular programs or any
+    /// auxiliary-program section, that sets a flag bit assigned since layout 0.
+    pub fn speech_flag_layout(&self, buf: &[u8]) -> Result<(Option<u32>, Option<u16>)> {
+        use plow_asset::speech_flag_layout as layout;
+        let mut aux = Vec::new();
+        for s in &self.sections {
+            if s.kind != packet::devbuild::SECT_METADATA {
+                continue;
+            }
+            let data = s
+                .offset
+                .checked_add(s.size)
+                .and_then(|end| buf.get(s.offset..end))
+                .ok_or_else(|| malformed(format!("{} outside the packet", s.name)))?;
+            if layout::is_aux_programs(data) {
+                aux.extend(
+                    layout::aux_insts(data, self.n_cu)
+                        .map_err(|e| malformed(format!("{}: {e}", s.name)))?,
+                );
+            }
+        }
+        let used = layout::first_protected(
+            self.progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .chain(&aux)
+                .map(|d| (d.op, d.fj[2], d.i)),
+        );
+        Ok((self.abi(buf)?.and_then(|a| a.speech_flag_layout), used))
+    }
+
     pub fn section_data<'a>(&self, buf: &'a [u8], kind: u32) -> Option<&'a [u8]> {
         self.sections
             .iter()
@@ -1983,6 +2015,51 @@ mod tests {
     }
 
     #[test]
+    fn speech_flag_layout_reads_the_declaration_and_every_program() {
+        use plow_asset::speech_flag_layout as layout;
+        let conv = DevOp::Conv1dF32 as u16;
+        let scan = |ragged: bool, declared: Option<u32>| {
+            let mut m = tiny_model();
+            let d = &mut m.progs[0].insts[0];
+            d.op = conv;
+            d.j[1] = 0x6e000 | u32::from(ragged) << 3;
+            let abi = plow_asset::abi::Abi {
+                version: plow_asset::abi::VERSION,
+                contract: plow_asset::RUNTIME_CONTRACT_BASE,
+                speech_flag_layout: declared,
+                ..Default::default()
+            };
+            let raw = m.to_blob_v6(&[packet::devbuild::SectionData {
+                kind: packet::devbuild::SECT_METADATA,
+                name: plow_asset::abi::SECTION.into(),
+                data: serde_json::to_vec(&abi).unwrap(),
+            }]);
+            DevBlob::parse(&raw)
+                .unwrap()
+                .speech_flag_layout(&raw)
+                .unwrap()
+        };
+        // The layout-0 subset: undeclared, loads on any object.
+        assert_eq!(scan(false, None), (None, None));
+        assert!(layout::check(None, None, None).is_ok());
+        // A protected bit without a declaration is what a pre-layout packet looks like.
+        let stale = scan(true, None);
+        assert_eq!(stale, (None, Some(conv)));
+        assert!(layout::check(stale.0, stale.1, Some(layout::LAYOUT)).is_err());
+        let declared = scan(true, Some(layout::LAYOUT));
+        assert_eq!(declared, (Some(layout::LAYOUT), Some(conv)));
+        assert!(layout::check(declared.0, declared.1, Some(layout::LAYOUT)).is_ok());
+        assert!(layout::check(declared.0, declared.1, None).is_err());
+        // No abi.json at all is undeclared.
+        let mut m = tiny_model();
+        m.progs[0].insts[0].op = conv;
+        m.progs[0].insts[0].j[1] = 1 << 21;
+        let raw = m.to_blob();
+        let blob = DevBlob::parse(&raw).unwrap();
+        assert_eq!(blob.speech_flag_layout(&raw).unwrap(), (None, Some(conv)));
+    }
+
+    #[test]
     fn abi_section_is_checked_at_parse() {
         use plow_asset::abi::{Abi, Bindings, Target};
         let m = tiny_model();
@@ -2004,6 +2081,7 @@ mod tests {
                 tuned_on: Some("H100 SXM5".into()),
             }),
             bindings: Some(derived),
+            speech_flag_layout: None,
         };
         let blob = |abi: &Abi| {
             m.to_blob_v6(&[packet::devbuild::SectionData {

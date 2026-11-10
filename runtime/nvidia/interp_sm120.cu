@@ -1299,6 +1299,10 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SP
  * bit 1: AttentionF32 query view (flag bit 6). */
 #if PLOW_NV_SPEECH
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 3u;
+/* The speech-op flag layout this object reads (plow_asset::speech_flag_layout::LAYOUT): a packet
+ * declaring a layout loads only on an object exporting the same number. Bump both together
+ * whenever a speech-op flag bit is reassigned. */
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 1u;
 #endif
 #if PLOW_PACKET_HASH != 0ull
 extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_lo) =
