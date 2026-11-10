@@ -181,10 +181,10 @@ use prefix::VmmServe;
 mod decode_context;
 mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
+mod codec_tick;
+mod control_sample;
 mod decode_rung;
 mod fish_depth;
-mod control_sample;
-mod codec_tick;
 pub use codec_tick::{CodecTick, CodecTickState};
 pub use fish_depth::{FishInfo, FishRow};
 mod fp8_block;
@@ -11273,8 +11273,12 @@ impl GpuEngine {
                     .map(|d| (d.op, d.fj[2], d.i)),
             );
             let have = be.module_global_u32(&module, layout::OBJECT_SYMBOL)?;
-            let required = layout::required_layout(blob.progs.iter().flat_map(|p| &p.insts)
-                .map(|d| (d.op, d.fj[2], d.i)));
+            let required = layout::required_layout(
+                blob.progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .map(|d| (d.op, d.fj[2], d.i)),
+            );
             layout::check(required, used, have)
                 .map_err(|e| RuntimeError::Rejected(format!("prefill interpreter: {e}")))?;
         }
