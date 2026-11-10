@@ -257,9 +257,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Batch invariance: stream 0's bits alone (phase 1, slot 0, b1 launches) vs in the mix (phase 2,
     // another slot, launches of up to `streams` items). Same codes, same chunk sizes.
     let mixed = &got[0];
-    match single.iter().zip(mixed).position(|(a, b)| a.to_bits() != b.to_bits()) {
+    match single
+        .iter()
+        .zip(mixed)
+        .position(|(a, b)| a.to_bits() != b.to_bits())
+    {
         None if single.len() == mixed.len() => {
-            println!("invariance stream 0: bit-identical ({} samples, {} steps)", single.len(), single_steps.len());
+            println!(
+                "invariance stream 0: bit-identical ({} samples, {} steps)",
+                single.len(),
+                single_steps.len()
+            );
         }
         at => {
             let i = at.unwrap_or(single.len().min(mixed.len()));
@@ -271,7 +279,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let step = single_steps
                 .iter()
                 .position(|&(t, k)| i < (t + k) * fs)
-                .map_or(String::new(), |j| format!(" (step {j}: frames {}..{})", single_steps[j].0, single_steps[j].0 + single_steps[j].1));
+                .map_or(String::new(), |j| {
+                    format!(
+                        " (step {j}: frames {}..{})",
+                        single_steps[j].0,
+                        single_steps[j].0 + single_steps[j].1
+                    )
+                });
             println!(
                 "invariance stream 0: DIFFERS first at sample {i}{step}, max |d| {max:.3e}, lengths {} vs {}",
                 single.len(),

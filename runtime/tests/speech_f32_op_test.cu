@@ -730,6 +730,7 @@ struct ConvSpec {
     unsigned pin = 0; /* flags bits 21..23: 1 pinned arms, 2 FFMA tiles, 4 a 128-wide tile */
     unsigned sk = 0; /* flags bits 24..29 (pinned): fixed split-K parts; t7 = the conv-own scratch */
     bool beta = false; /* flags bit 2 (post snake): SnakeBeta output, alpha [a | r] of 2 * cout */
+    bool ragged = false; /* flags bit 3: wgmma tiles may span taps (widths % 4, not % 64) */
 };
 /* Pinned split-K scratch: SPC_TICKETS zeroed tickets, then tiles x parts 128x64 partials. */
 static unsigned splitk_scratch_pinned(Case& c, const ConvSpec& s, unsigned out_rows) {
@@ -822,7 +823,7 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
                    (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u) |
                    (s.dual ? 1u << 19 : 0u) | (s.rows ? 1u << 16 : 0u) | (s.splitk || s.sk ? 1u << 20 : 0u) |
-                   (s.pin << 21) | (s.sk << 24) | (s.beta ? 1u << 2 : 0u);
+                   (s.pin << 21) | (s.sk << 24) | (s.beta ? 1u << 2 : 0u) | (s.ragged ? 1u << 3 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -919,11 +920,11 @@ static void t_conv_beta(const char* name, const ConvSpec& s) {
     t_conv_invariant(name, s, false);
     Case c; unsigned o;
     build_conv(c, s, false, o);
-    run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
     const size_t n = c.host[o].size() / 4;
+    const unsigned u = c.add(n * 4);
+    run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
     std::vector<uint32_t> fused(n), two(n);
     CK(cudaMemcpy(fused.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
-    const unsigned u = c.add(n * 4);
     void** td = upload_table(c.dev);
     PlowDevInst conv = c.in;
     conv.fj[2].u &= ~(4u | (15u << 8));
@@ -1060,6 +1061,34 @@ static void t_conv_pinned() {
         ConvSpec pw = t;
         pw.kernel = 1; pw.dil_or_opad = 1; pw.before = 0;
         t_conv_beta("Conv1dF32 beta wgmma pointwise (wide)", pw);
+    }
+    {
+        /* Arms first combined by the integration: pinned widths and the SnakeBeta epilogue on
+         * ragged wgmma tiles (96 channels: k-tiles span taps, the N tile is partial), the lanes
+         * arm under a pinned bit-16 class, and the widest parts field beside the split-image
+         * bits (30 / 31 stay clear). */
+        ConvSpec r{3, 300, 96, 96, 7, 1, 3, 1, 18, 0, 0, 0, 0, false, true, false, true, {300, 50, 1}, 0.f, true};
+        r.wide = true; r.wg = true; r.tapmajor = true; r.pin = 1; r.ragged = true;
+        ConvSpec r128 = r;
+        r128.pin = 1 | 4;
+        t_conv_pair("Conv1dF32 pinned ragged 96 bn64 vs bn128", r, r128, false, true, 1e-4);
+        t_conv_invariant("Conv1dF32 pinned ragged 96 bn64", r, false);
+        t_conv_invariant("Conv1dF32 pinned ragged 96 bn128", r128, false);
+        ConvSpec rb = r;
+        rb.residual = false; rb.alpha = true; rb.post = 12; rb.beta = true;
+        t_conv_beta("Conv1dF32 beta ragged 96 d3", rb);
+        ConvSpec rb128 = rb;
+        rb128.pin = 1 | 4;
+        t_conv_beta("Conv1dF32 beta ragged 96 bn128", rb128);
+        ConvSpec ln{3, 300, 96, 1, 7, 1, 1, 1, 6, 0, 0, 0, 0, false, true, false, false, {300, 100, 0}, 0.f, true};
+        ln.pin = 1;
+        t_conv1d_lanes("Conv1dF32 pinned lanes 96->1", ln);
+        ln.rows = true; ln.tapmajor = true;
+        t_conv_invariant("Conv1dF32 pinned lanes 96->1", ln, false);
+        ConvSpec p63{1, 64, 4096, 1024, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+        p63.wide = true; p63.wg = true; p63.pin = 1; p63.sk = 63;
+        t_conv1d("Conv1dF32 pinned splitk P63 4096->1024", p63, 1e-4);
+        t_conv_invariant("Conv1dF32 pinned splitk P63 4096->1024", p63, false);
     }
     {
         /* Wide tile (split-bf16, no wgmma): both pinned widths over the same data. */
@@ -2539,6 +2568,10 @@ int main(int argc, char** argv) {
 
     if (argc > 1 && !strcmp(argv[1], "--conv-padding-only")) {
         t_conv_padding();
+        return g_fail;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--conv-pinned-only")) {
+        t_conv_pinned();
         return g_fail;
     }
 
