@@ -2029,7 +2029,8 @@ impl StageProgram {
         } else {
             None
         };
-        let splitk = (row_scale == packet::dev::TENSOR_NONE && fixed.is_none())
+        // Pinned convs split only by their class's fixed parts: the legacy table is per size.
+        let splitk = (row_scale == packet::dev::TENSOR_NONE && fixed.is_none() && !stage.pinned)
             .then(|| conv1d_splitk(&stage, transpose, out_rows, n_cu))
             .flatten();
         let units = fixed
