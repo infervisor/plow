@@ -9,7 +9,8 @@ Current kernel: the standalone probe depth_gemv.cu, which launches the interpret
 the same lease and on the same cold weight sets as the generators. The arm does more than the
 generated GEMM: it reads f32 x, standardizes it (LayerNorm flag) and rounds it to f16, and adds a
 bias / residual (zeros here, so the result is the plain product). The generators get the already
-standardized f16 x. `IN_MODEL_US` keeps the in-situ per-op times for reference.
+standardized f16 x. At M >= 16 the current arm receives the materialized f32 LayerNorm output;
+that separate op is timed by the depth-block harness. `IN_MODEL_US` keeps the in-situ per-op times for reference.
 """
 
 # flags i[7] and blocks as emitted (packet_bench --sweep of the production depth program)
@@ -23,7 +24,7 @@ IN_MODEL_US = {"qkv_m1": 15.1, "f2_m1": 28.6, "o_m1": 12.7, "head_m1": 18.2, "qk
 def _classes():
     out = {}
     for s, (n, k) in SHAPES.items():
-        for m in (1, 8, 32, 832):
+        for m in (1, 8, 20, 32, 64, 128, 832):
             if s == "head" and m == 832:
                 continue  # the head reads the last prefix row only
             c = {"shape": s, "M": m, "N": n, "K": k}
@@ -45,6 +46,8 @@ def _inputs(c, seed):
     if EMIT[c["shape"]][0] & 256:
         # what the arm's LayerNorm prologue (gamma 1, beta 0) feeds the product
         xn = (x32 - x32.mean(1, keepdim=True)) * torch.rsqrt(x32.var(1, unbiased=False, keepdim=True) + 1e-5)
+        if c["M"] >= 16:
+            x32 = xn  # materialized LayerNorm output, as emitted for batched projections
     else:
         x32 = x32.half().float()
         xn = x32
@@ -60,6 +63,8 @@ def _cur_bind(lib, c, inp, out):
     import ctypes
     import torch
     flags, nblk = EMIT[c["shape"]]
+    if c["M"] >= 16:
+        flags &= ~256
     lib.dg_make.restype = ctypes.c_void_p
     lib.dg_make.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_uint] * 4
     lib.dg_run.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
@@ -123,9 +128,9 @@ SPEC = {
         },
     },
     "current": {
-        "label": "d_gemv_f32out_mode / gemv_f16w_mma as emitted (depth_gemv.cu, emitted flags and blocks)",
+        "label": "d_gemv_f32out_mode as emitted (batched inputs after the separate LayerNorm)",
         "lib": {"src": "scripts/gen_kernels/depth_gemv.cu",
-                "flags": ["-arch=sm_90a", "-O3", "-I", "runtime/common", "-I", "runtime/nvidia"]},
+                "flags": ["-gencode", "arch=compute_90a,code=sm_90a", "-O3", "-DPLOW_NV_HOPPER=1", "-I", "runtime/common", "-I", "runtime/nvidia"]},
         "bind": _cur_bind,
     },
 }
