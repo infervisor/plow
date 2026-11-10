@@ -541,6 +541,14 @@ pub(crate) fn emit_is_apple() -> bool {
     EMIT_IS_APPLE.with(|c| c.get())
 }
 
+/// `PLOW_FUSE_KV_HNR` (HeadNormRope `i[7] = 1`: the K op also writes the V cache from t7) has a
+/// device arm only in the NVIDIA interpreters (interp_sm120.cu, included by sm89/sm90a). The
+/// AMD, Metal and CPU-golden ops never read `i[7]`, so an emit for them keeps the separate V
+/// writer. The CPU target installs the AMD inventory guard, so it is excluded here too.
+pub(crate) fn fuse_kv_hnr_target_supported() -> bool {
+    !emit_is_amd() && !emit_is_apple()
+}
+
 /// Scoped "the target is an Apple GPU (metal3)" flag, as [`EmitAmdGuard`] for AMD.
 struct EmitAppleGuard {
     prev: bool,
@@ -5881,6 +5889,9 @@ fn emit_phase(
             !span_kv || (fp8_kv && gemv_family && !fuse_hnr && !shared),
             "PLOW_EMIT_SPAN_VERIFY needs the FP8-KV GEMV decode family"
         );
+        // The fused-V arm (`i[7] = 1`, t6/t7) exists only in interp_sm120.cu, which the sm89
+        // and sm90a interpreters include; the AMD, Metal and CPU-golden HeadNormRope ignore
+        // i[7], so there the V cache would never be written.
         let fuse_kv = decode
             && !fuse_hnr
             && !shared
@@ -5888,7 +5899,8 @@ fn emit_phase(
             && (fuse_qkv || fuse_qkv_fp8)
             && c_k == c_v
             && qk_skip == v_skip
-            && emit_config::active().fuse_kv_hnr;
+            && emit_config::active().fuse_kv_hnr
+            && fuse_kv_hnr_target_supported();
         let c_kn = if fuse_hnr || shared || hnr_fold {
             0
         } else {
