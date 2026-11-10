@@ -1256,6 +1256,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.decode_norm_fold", Some("PLOW_DECODE_NORM_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_hnr_fold", Some("PLOW_DECODE_HNR_FOLD"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.depth_fuse", Some("PLOW_DEPTH_FUSE"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.depth_rows", Some("PLOW_DEPTH_ROWS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.depth_attn_fold", Some("PLOW_DEPTH_ATTN_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_gemv_xk", Some("PLOW_DECODE_GEMV_XK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.decode_gemv_xk_qkv", Some("PLOW_DECODE_GEMV_XK_QKV"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

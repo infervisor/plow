@@ -1077,6 +1077,24 @@ fn declare_io(b: &mut packet::devbuild::Builder, geo: &Geo, bmax: u32) {
 
 /// DepthV2 as an LM packet's depth stage: one program per decode rung (row `r` = slot `r`), appended
 /// to `m`'s tensors, as the `fish_depth` sections of [`plow_asset::fish_depth::Sampler::Maya2`].
+/// The decode rungs plus the `PLOW_DEPTH_ROWS` capacities below the widest rung (unset: the rungs).
+fn depth_capacities(rungs: &[u32], extra: Option<&str>) -> Vec<u32> {
+    let Some(extra) = extra else {
+        return rungs.to_vec();
+    };
+    let bmax = rungs.iter().copied().max().unwrap_or(0);
+    let mut caps = rungs.to_vec();
+    for v in extra.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        let v: u32 = v.parse().unwrap_or_else(|_| panic!("PLOW_DEPTH_ROWS: {v}"));
+        if v > 0 && v < bmax {
+            caps.push(v);
+        }
+    }
+    caps.sort_unstable();
+    caps.dedup();
+    caps
+}
+
 pub(crate) fn lm_sections(
     m: &mut packet::devbuild::Model,
     c: &crate::config::Cfg,
@@ -1131,6 +1149,8 @@ pub(crate) fn lm_sections(
         hidden_rows,
         codes,
     };
+    let caps = depth_capacities(rungs, crate::emit_config::active().depth_rows.as_deref());
+    let rungs = caps.as_slice();
     for &rows in rungs {
         prefix =
             program_for(prefix, &geo, rows, &io).unwrap_or_else(|e| panic!("maya2 depth: {e}"));
