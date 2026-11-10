@@ -26,7 +26,8 @@ int main() {
     unsigned rng = 1701;
     auto next = [&] { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
                      return (float)((int)(rng % 2001) - 1000) / 997.f; };
-    unsigned cases = 0;
+    unsigned cases = 0, small = 0, small_differs = 0;
+    double small_rel = 0;
     for (unsigned k : {192u, 256u, 448u, 1024u, 3072u, 4096u}) {
         const unsigned n = (k == 192 || k == 3072) ? 3072 : 128, max_m = 129;
         std::vector<float> x(max_m * k), bias(max_m * n), residual(max_m * n), gamma(k), beta(k);
@@ -94,7 +95,22 @@ int main() {
                         unsigned bits; memcpy(&bits, &got[j], 4); bad |= bits != 0x7f7f7f7fu;
                     }
                     if (m == max_m && !alias) widest = got;
-                    if (m >= 16) bad |= memcmp(got.data(), widest.data(), m * n * 4) != 0;
+                    if (m >= 16) {
+                        bad |= memcmp(got.data(), widest.data(), m * n * 4) != 0;
+                    } else {
+                        /* Under 16 rows the split-K MMA arm runs: another accumulation order, so the
+                         * same row differs from its wider-capacity bits by rounding. Bounded, not equal. */
+                        double d = 0, w2 = 0;
+                        for (unsigned j = 0; j < m * n; j++) {
+                            d += ((double)got[j] - widest[j]) * ((double)got[j] - widest[j]);
+                            w2 += (double)widest[j] * widest[j];
+                        }
+                        const double across = sqrt(d / w2);
+                        small++;
+                        small_differs += memcmp(got.data(), widest.data(), m * n * 4) != 0;
+                        small_rel = fmax(small_rel, across);
+                        bad |= !std::isfinite(across) || across > 4e-4;
+                    }
                     if (bad) { fprintf(stderr, "FAIL K=%u M=%u mode=%u alias=%u relL2=%g\n", k, m, mode, alias, rel); return 1; }
                     cases++;
                 }
@@ -103,5 +119,7 @@ int main() {
         CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(db)); CK(cudaFree(dr));
         CK(cudaFree(dg)); CK(cudaFree(dt)); CK(cudaFree(dc));
     }
-    printf("PASS %u projection cases: oracle, row tails, grouped bias, residual alias, GELU, capacity invariance\n", cases);
+    printf("PASS %u projection cases: oracle, row tails, grouped bias, residual alias, GELU, capacity invariance from 16 rows\n", cases);
+    printf("below 16 rows vs the same rows at 129: %u of %u cases differ in bits, max relL2 %.3g (bound 4e-4)\n",
+           small_differs, small, small_rel);
 }
