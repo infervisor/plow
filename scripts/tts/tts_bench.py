@@ -27,22 +27,26 @@ SESSION = None
 PROMPT_SET = None
 # A chunk this late past the end of the audio already received is an underrun (clock jitter).
 GAP_TOLERANCE_S = 0.001
+# A gap longer than this is a stall (the playback buffer stayed dry for more than 100 ms).
+STALL_S = 0.100
 
 
 def underruns(arrivals, sr):
     """Playback underruns of a stream: `arrivals` = [(seconds, pcm16 bytes)] in order. Playback
     starts at the first chunk; a chunk arriving after the audio received so far has played out is
-    a gap, and playback resumes at its arrival. Returns (gaps, total gap seconds)."""
-    gaps, gap_s, end = 0, 0.0, None
+    a gap, and playback resumes at its arrival. Returns (gaps, total gap seconds, stalls): stalls
+    are the gaps longer than STALL_S."""
+    gaps, gap_s, stalls, end = 0, 0.0, 0, None
     for t, nbytes in arrivals:
         dur = nbytes / 2 / sr
         if end is None:
             end = t + dur
         elif t > end + GAP_TOLERANCE_S:
+            stalls += t - end > STALL_S
             gaps, gap_s, end = gaps + 1, gap_s + (t - end), t + dur
         else:
             end += dur
-    return gaps, gap_s
+    return gaps, gap_s, stalls
 
 
 def one(url, model, voice, text, stream, seed, extra):
@@ -74,8 +78,8 @@ def one(url, model, voice, text, stream, seed, extra):
         chunks = []
     total = time.perf_counter() - t0
     pcm = b"".join(chunks)
-    gaps, gap_s = underruns(arrivals if chunks else [], SR)
-    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s)
+    gaps, gap_s, stalls = underruns(arrivals if chunks else [], SR)
+    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s, stalls=stalls)
 
 
 def one_ws(url, model, voice, text, seed, extra):
@@ -110,8 +114,8 @@ def one_ws(url, model, voice, text, seed, extra):
         chunks = []
     total = time.perf_counter() - t0
     pcm = b"".join(chunks)
-    gaps, gap_s = underruns(arrivals if chunks else [], SR)
-    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s)
+    gaps, gap_s, stalls = underruns(arrivals if chunks else [], SR)
+    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s, stalls=stalls)
 
 
 def pct(xs, q):
@@ -206,7 +210,7 @@ def main():
             sf.write(f"{args.out}/{name}", np.frombuffer(r["pcm"], dtype="<i2"), SR)
             texts[name] = dict(text=text, language=LANG_OF[text]) if args.prompt_set == "chatterbox-mtl" else text
         rows.append(dict(i=i, speaker=spk, ttfa_s=r["ttfa_s"], latency_s=r["latency_s"], audio_s=r["audio_s"],
-                         gaps=r["gaps"], gap_s=r["gap_s"],
+                         gaps=r["gaps"], gap_s=r["gap_s"], stalls=r.get("stalls", 0),
                          rtf=r["latency_s"] / r["audio_s"] if r["audio_s"] else None))
     ok = [r for r in rows if r["audio_s"] > 0]
     if not ok:
@@ -223,7 +227,8 @@ def main():
                     p90_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.9),
                     p99_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.99),
                     gaps=sum(r["gaps"] for r in ok), gap_streams=sum(r["gaps"] > 0 for r in ok),
-                    gap_s=sum(r["gap_s"] for r in ok))
+                    gap_s=sum(r["gap_s"] for r in ok), stalls=sum(r["stalls"] for r in ok),
+                    p90_rtf=pct([r["rtf"] for r in ok], 0.9))
         if len(ok) > args.conc:
             steady_ok = [r for r in rows[args.conc:] if r["audio_s"] > 0]
             if steady_ok:
