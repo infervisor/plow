@@ -304,7 +304,9 @@ static std::vector<float> load(const char* path, unsigned vocab, unsigned* rows)
 }
 
 /* gumbel_pick_warp against the serial strict-> scan it replaced: one block per case, scores with
- * ties (a 1/16 grid), -inf and NaN runs, n = 0..64. */
+ * ties (a 1/16 grid), -inf and NaN runs, n = 0..64. The arm compiles only with
+ * -DPLOW_NV_GUMBEL_WARP=1 (default off), and so does this case. */
+#if PLOW_NV_GUMBEL_WARP
 __global__ void gumbel_kernel(const float* sv, const unsigned* n, unsigned* got, unsigned* ref) {
     const float* s = sv + (size_t)blockIdx.x * 64u;
     const unsigned step = blockIdx.x * 7u, coord = 3u;
@@ -358,6 +360,7 @@ static int gumbel_case() {
     CK(cudaFree(d_sv)); CK(cudaFree(d_n)); CK(cudaFree(d_got)); CK(cudaFree(d_ref));
     return bad;
 }
+#endif
 
 /* d_gemv_f32out with x staged in the arena (room for it) vs read from global (no arena): the same
  * bits. Shapes: depth heads M = 1..32 x 2048 x 1024, a narrow N that leaves blocks empty, both
@@ -432,9 +435,11 @@ int main(int argc, char** argv) {
             small_case(name, v, rows, vocab);
             fish_case(name, v, rows, vocab);
         }
+#if PLOW_NV_GUMBEL_WARP
     if (gumbel_case()) failures++;
+#endif
     if (gemv_case()) failures++;
-    cases += 2;
+    cases += PLOW_NV_GUMBEL_WARP ? 2 : 1;
     if (bench)
         printf("bench (recorded depth rows, us/launch): SampleSmallF32 radix %.1f K-round %.1f; SampleFishBf16 radix "
                "%.1f K-round %.1f\n",
