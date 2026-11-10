@@ -26,7 +26,7 @@ pub const PACKET: &str = "depth.pkt";
 pub const DRIVER: &str = "maya2.depth.v1";
 pub const PIPELINE: &str = "maya2.depth";
 /// Streams per launch.
-pub const CAPACITIES: &[u32] = &[1, 2, 4, 8, 16];
+pub const CAPACITIES: &[u32] = &[1, 2, 4, 8, 16, 32, 64];
 
 pub(crate) struct Geo {
     hidden_in: u32,

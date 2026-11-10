@@ -814,14 +814,31 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
         for (unsigned kt = 0; kt < K; kt += MMA_KT) {
             const unsigned kw = min(MMA_KT, K - kt);
             __syncthreads();
-            for (unsigned i = threadIdx.x; i < nt8 * 8u * kw; i += PLOW_NV_THREADS) {
-                const unsigned r = i / kw, k = i % kw;
-                float v = 0.f;
-                if (r < mr) {
-                    v = x[(size_t)(mc + r) * K + kt + k];
-                    if (gamma) v = __fmaf_rn((v - st[2 * r]) * st[2 * r + 1], gamma[kt + k], beta[kt + k]);
+            /* Thread (rg, c) stages the quad c of rows rg, rg + 4, ..: float4 loads, several rows in flight.
+             * (One element per thread and trip left the M >= 32 rungs bound by this loop's load latency.) */
+            {
+                const unsigned c = threadIdx.x & 63u, k = 4u * c;
+                if (k < kw) {
+                    const float4 gq = gamma ? *(const float4*)(gamma + kt + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+                    const float4 bq = gamma ? *(const float4*)(beta + kt + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll 4
+                    for (unsigned r = threadIdx.x >> 6; r < nt8 * 8u; r += PLOW_NV_THREADS / 64u) {
+                        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                        if (r < mr) {
+                            v = *(const float4*)(x + (size_t)(mc + r) * K + kt + k);
+                            if (gamma) {
+                                const float mu = st[2 * r], rs = st[2 * r + 1];
+                                v.x = __fmaf_rn((v.x - mu) * rs, gq.x, bq.x);
+                                v.y = __fmaf_rn((v.y - mu) * rs, gq.y, bq.y);
+                                v.z = __fmaf_rn((v.z - mu) * rs, gq.z, bq.z);
+                                v.w = __fmaf_rn((v.w - mu) * rs, gq.w, bq.w);
+                            }
+                        }
+                        __half2* d = (__half2*)(xs + r * MMA_KT + k);
+                        d[0] = __floats2half2_rn(v.x, v.y);
+                        d[1] = __floats2half2_rn(v.z, v.w);
+                    }
                 }
-                xs[r * MMA_KT + k] = __float2half_rn(v);
             }
             __syncthreads();
             if (!active) continue;
