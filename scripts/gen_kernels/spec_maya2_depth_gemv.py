@@ -10,7 +10,9 @@ the same lease and on the same cold weight sets as the generators. The arm does 
 generated GEMM: it reads f32 x, standardizes it (LayerNorm flag) and rounds it to f16, and adds a
 bias / residual (zeros here, so the result is the plain product). The generators get the already
 standardized f16 x. At M >= 16 the current arm receives the materialized f32 LayerNorm output;
-that separate op is timed by the depth-block harness. `IN_MODEL_US` keeps the in-situ per-op times for reference.
+that separate op is timed by the depth-block harness. The current batched route receives f16 operands
+except for o, writes f1's GELU output as f16, and uses f2's per-stream grouped bias. `IN_MODEL_US`
+keeps older in-situ per-op times for reference.
 """
 
 # flags i[7] and blocks as emitted (packet_bench --sweep of the production depth program)
@@ -24,10 +26,10 @@ IN_MODEL_US = {"qkv_m1": 15.1, "f2_m1": 28.6, "o_m1": 12.7, "head_m1": 18.2, "qk
 def _classes():
     out = {}
     for s, (n, k) in SHAPES.items():
-        for m in (1, 8, 20, 32, 64, 128, 200, 224, 832, 5200, 5824):
+        for m in (1, 8, 20, 32, 64, 128, 200, 224, 832, 1664, 3328, 5200, 5824):
             if s == "head" and m > 224:
                 continue  # the head reads the last prefix row only
-            c = {"shape": s, "M": m, "N": n, "K": k}
+            c = {"shape": s, "M": m, "N": n, "K": k, "prefix_rows": 26 if m >= 832 else 1}
             if m == 1:
                 c["step"] = {"us": 16730.0, "calls": STEP_B1[s]}
             out[f"{s}_m{m}"] = c
@@ -36,7 +38,13 @@ def _classes():
 
 def _cost(c):
     m, n, k = c["M"], c["N"], c["K"]
-    return {"bytes": n * k * 2 + m * k * 2 + m * n * 4, "flops": 2 * m * n * k, "peak": "bf16", "passes": 1}
+    output_bytes = 2 if c["shape"] == "f1" and m >= 16 else 4
+    input_bytes = 4 if m < 16 or c["shape"] == "o" else 2
+    epilogue_bytes = m * n * 4 if c["shape"] in ("o", "f2") else 0
+    if c["shape"] == "f2":
+        epilogue_bytes += m // c.get("prefix_rows", 1) * n * 4
+    return {"bytes": n * k * 2 + m * k * input_bytes + m * n * output_bytes + epilogue_bytes,
+            "flops": 2 * m * n * k, "peak": "bf16", "passes": 1}
 
 
 def _inputs(c, seed):
@@ -60,24 +68,33 @@ def _reference(c, inp):
     if c["shape"] == "f1":
         import torch
         value = torch.nn.functional.gelu(value, approximate="none")
+        if c["M"] >= 16:
+            value = value.half().double()
     return value
 
 
-def _cur_bind(lib, c, inp, out, input_f16=False):
+def _cur_bind(lib, c, inp, out, input_f16=None):
     import ctypes
     import torch
     flags, nblk = EMIT[c["shape"]]
+    if input_f16 is None:
+        input_f16 = c["M"] >= 16 and c["shape"] != "o"
     if c["M"] >= 16:
         flags &= ~256
+        if c["shape"] == "f1":
+            flags |= 16384
     if input_f16:
         flags |= 8192
-    lib.dg_make.restype = ctypes.c_void_p
-    lib.dg_make.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_uint] * 4
+    group = c.get("prefix_rows", 1) if c["shape"] == "f2" else 0
+    if group:
+        flags |= 512
+    lib.dg_make_grouped.restype = ctypes.c_void_p
+    lib.dg_make_grouped.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_uint] * 5
     lib.dg_run.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
     zeros = torch.zeros(max(c["M"] * c["N"], c["K"]), device="cuda")
     ones = torch.ones(c["K"], device="cuda")
-    h = lib.dg_make(out.data_ptr(), inp["x" if input_f16 else "x32"].data_ptr(), inp["w"].data_ptr(), zeros.data_ptr(), zeros.data_ptr(),
-                    ones.data_ptr(), zeros.data_ptr(), flags, c["M"], c["N"], c["K"])
+    h = lib.dg_make_grouped(out.data_ptr(), inp["x" if input_f16 else "x32"].data_ptr(), inp["w"].data_ptr(), zeros.data_ptr(), zeros.data_ptr(),
+                            ones.data_ptr(), zeros.data_ptr(), flags, c["M"], c["N"], c["K"], group)
 
     def call(keep=(zeros, ones, inp)):
         rc = lib.dg_run(h, nblk, torch.cuda.current_stream().cuda_stream)
@@ -109,24 +126,28 @@ def _generated_bind(c, out, bind):
     if c["shape"] != "f1":
         return bind(out)
     import torch
-    tmp = torch.empty_like(out)
+    tmp = torch.empty(out.shape, device=out.device, dtype=torch.float32)
     product = bind(tmp)
 
     def call():
         product()
-        torch.ops.aten.gelu.out(tmp, approximate="none", out=out)
+        if out.dtype == torch.float32:
+            torch.ops.aten.gelu.out(tmp, approximate="none", out=out)
+        else:
+            torch.ops.aten.gelu.out(tmp, approximate="none", out=tmp)
+            out.copy_(tmp)
     return call
 
 
 SPEC = {
     "name": "maya2_depth_gemv",
     "op": "GemvF32Out depth projection",
-    "dtype": "f16 W x f16 x -> f32 (mma)",
+    "dtype": "f16 W, served f16/f32 operands, f32 accumulate; f1 GELU output f16 at M>=16",
     "classes": _classes(),
     "cost": _cost,
     "inputs": _inputs,
     "rotate": ["w"],
-    "out": lambda c: ((c["M"], c["N"]), "float32"),
+    "out": lambda c: ((c["M"], c["N"]), "float16" if c["shape"] == "f1" and c["M"] >= 16 else "float32"),
     "reference": _reference,
     # the arm standardizes in f32 with its own summation order: an x element can land one f16 ulp off
     "tol": {"rel_l2": 2e-4},
@@ -148,7 +169,7 @@ SPEC = {
         },
     },
     "current": {
-        "label": "d_gemv_f32out_mode as emitted (batched inputs after the separate LayerNorm)",
+        "label": "d_gemv_f32out_mode native half operands/GELU and per-stream bias (LayerNorm excluded)",
         "lib": {"src": "scripts/gen_kernels/depth_gemv.cu",
                 "flags": ["-gencode", "arch=compute_90a,code=sm_90a", "-O3", "-DPLOW_NV_HOPPER=1", "-I", "runtime/common", "-I", "runtime/nvidia"]},
         "bind": _cur_bind,
