@@ -219,7 +219,7 @@ H100, torch 2.13, TileLang 0.1.12, Triton 3.7.1. Times in µs; % of floor in bra
 - **plow production** is the 3xFP16 attention over a pre-formatted prefix that the production
   recipes select (`PLOW_EMIT_S3GEN_ATTN_H16=1`, `sp_attention_h16`), timed as its copy in the
   standalone probe `cfm_attn.cu` (which 23, 132 blocks), rel-L2 2.7e-7. It and the Triton
-  column are one queue job (144 Triton configs x 4 classes, about 2.5 min of lease).
+  column are one queue job (144 Triton configs x 4 classes, about 1 min of lease).
   - An earlier version of this table used probe which 0 as "current": the 3xTF32 path of a
     packet emitted without that option (269.2 / 478.5 / 146.4 / 238.7 µs). Against that path
     Triton reads -6% / +4% / -8% / +11%, which is not a comparison with what ships.
