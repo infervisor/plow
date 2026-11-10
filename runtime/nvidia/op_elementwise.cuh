@@ -432,8 +432,6 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
     }
 }
 
-/* Only the speech object dispatches these modes (interp_sm120.cu, PLOW_DOP_GEMV_F32_OUT). */
-#if PLOW_NV_SPEECH
 /* GemvF32Out modes (i7 != 0; Maya 2's depth projections): bit 0 x is f32, bit 1 W is f16, bit 2 adds
  * an f32 bias t3[N] (bit 9: t3[M / bgroup][N], one row per group of bgroup rows), bit 3 adds an f32
  * residual t4[M][N] (may alias C: each element is read then written by the one lane that owns it),
@@ -789,6 +787,12 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
     float* st = arena + MMA_ROWS * MMA_KT / 2u;
     float* red = st + 2u * MMA_ROWS;
     const unsigned na = (t0 + my_tile) * 16u + g, nb = na + 8u;
+#if PLOW_NV_SPEECH
+    /* The quad staging loads float4s: x, gamma and beta bases must be 16-byte aligned (row and chunk offsets keep
+     * it); else one element per trip. Speech objects only: every other object keeps its staging text. */
+    const bool vec_ok =
+        ((((size_t)x) | (gamma ? ((size_t)gamma | (size_t)beta) : (size_t)0)) & (size_t)15) == 0;
+#endif
     for (unsigned mc = 0; mc < M; mc += MMA_ROWS) {
         const unsigned mr = min(MMA_ROWS, M - mc), nt8 = (mr + 7u) / 8u;
         __syncthreads();
@@ -816,9 +820,10 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
         for (unsigned kt = 0; kt < K; kt += MMA_KT) {
             const unsigned kw = min(MMA_KT, K - kt);
             __syncthreads();
+#if PLOW_NV_SPEECH
             /* Thread (rg, c) stages the quad c of rows rg, rg + 4, ..: float4 loads, several rows in flight.
              * (One element per thread and trip left the M >= 32 rungs bound by this loop's load latency.) */
-            {
+            if (vec_ok) {
                 const unsigned c = threadIdx.x & 63u, k = 4u * c;
                 if (k < kw) {
                     const float4 gq = gamma ? *(const float4*)(gamma + kt + k) : make_float4(0.f, 0.f, 0.f, 0.f);
@@ -841,6 +846,16 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
                         d[1] = __floats2half2_rn(v.z, v.w);
                     }
                 }
+            } else
+#endif
+            for (unsigned i = threadIdx.x; i < nt8 * 8u * kw; i += PLOW_NV_THREADS) {
+                const unsigned r = i / kw, k = i % kw;
+                float v = 0.f;
+                if (r < mr) {
+                    v = x[(size_t)(mc + r) * K + kt + k];
+                    if (gamma) v = __fmaf_rn((v - st[2 * r]) * st[2 * r + 1], gamma[kt + k], beta[kt + k]);
+                }
+                xs[r * MMA_KT + k] = __float2half_rn(v);
             }
             __syncthreads();
             if (!active) continue;
@@ -957,7 +972,6 @@ static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W
     default: gemv_f32out_mode<true, true>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk); break;
     }
 }
-#endif /* PLOW_NV_SPEECH */
 
 /* SampleSmallF32 (op 221): one block per row of f32 logits; see dev.rs. Arena: PLOW_NV_WARPS u64 +
  * PLOW_NV_WARPS f32 reduction slots, 64 selected classes and values, the row (f32), then the top-k
