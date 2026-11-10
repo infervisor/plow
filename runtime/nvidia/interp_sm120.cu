@@ -5730,3 +5730,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_norm_rms_pf)(
 #undef NRP_TEN
 }
 #endif
+
+#if PLOW_NV_SPEECH && defined(PLOW_NV_DEVICE_CONTROL) && PLOW_NV_DEVICE_CONTROL
+#include "op_control_sample.cuh"
+#endif

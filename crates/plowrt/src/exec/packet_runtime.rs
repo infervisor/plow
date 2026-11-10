@@ -276,6 +276,10 @@ impl PacketWrite<'_> {
 /// Model import, graph lowering and tensor-name conventions stay outside this interface. The
 /// executor only resolves tensors from the compiled asset and dispatches a numbered program.
 pub trait PacketRuntime: Send {
+    #[cfg(feature = "cuda")]
+    fn cuda_runtime(&mut self) -> Option<&mut crate::exec::gpu::packet_exec::CudaPacketRuntime> {
+        None
+    }
     fn begin_execution(&mut self) -> Result<()> {
         Ok(())
     }

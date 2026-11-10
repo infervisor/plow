@@ -269,6 +269,10 @@ pub struct RuntimeConfig {
     )]
     pub tts_depth_plan: String,
 
+    /// Keep a packet's controlled sampler and state on the GPU between depth frames.
+    #[arg(long = "tts-device-control", env = "PLOW_TTS_DEVICE_CONTROL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_device_control: bool,
+
     /// Apply a speech packet's declared leading-silence trim to streamed replies
     /// (`stream.onset_trim_*`); `false` streams every sample (first-byte latency runs).
     #[arg(long = "tts-onset-trim", env = "PLOW_TTS_ONSET_TRIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
