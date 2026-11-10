@@ -5,7 +5,8 @@
 //! own slot, joining one launch apart (different positions), each with its own chunk sizes.
 //! CODES.i32 = [items][FRAMES][frame_codes] little-endian i32 (else random codes).
 //! Prints per-stream rel-L2 / max |d| of the streamed PCM vs `decode.b1.f*` and sample counts.
-//! `CSC_DUMP=PREFIX` writes stream 0's PCM (raw f32) to PREFIX.stream.f32 and PREFIX.whole.f32.
+//! `CSC_DUMP=PREFIX` writes stream 0's PCM (raw f32) to PREFIX.stream.f32 (alone), PREFIX.whole.f32
+//! and PREFIX.mixed.f32 (embedded in the shared launches).
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -247,6 +248,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for (s, g) in got.iter().enumerate() {
         report("mixed", s, g);
+    }
+    if let Ok(dir) = std::env::var("CSC_DUMP") {
+        // Stream 0 again, this time embedded in launches of 1..=STREAMS items.
+        std::fs::write(format!("{dir}.mixed.f32"), bytemuck::cast_slice(&got[0]))?;
     }
     println!(
         "time mixed streams {streams} median_ms {:.3}",

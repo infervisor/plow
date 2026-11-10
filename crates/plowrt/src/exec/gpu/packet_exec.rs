@@ -58,6 +58,26 @@ fn speech_ops(blob: &DevBlob) -> u64 {
         .fold(0, |mask, op| mask | 1 << (op - SPEECH_OP0))
 }
 
+/// Speech-object capability bits the instructions need (`plow_speech_caps_speech`): bit 0 a
+/// GemvF32Out row view (flag bit 12), bit 1 an AttentionF32 query view (flag bit 6).
+pub(super) fn speech_caps_required<'a>(
+    insts: impl IntoIterator<Item = &'a packet::dev::DevInst64>,
+) -> u32 {
+    use packet::dev::DevOp;
+    insts.into_iter().fold(0, |caps, d| {
+        caps | match DevOp::from_u16(d.op) {
+            Some(DevOp::GemvF32Out) if d.i[7] & 4096 != 0 => 1,
+            Some(DevOp::AttentionF32) if d.i[6] & 64 != 0 => 2,
+            _ => 0,
+        }
+    })
+}
+
+/// The capability bits `required` that an object reporting `compiled` (`None` = no symbol) lacks.
+pub(super) fn missing_speech_caps(required: u32, compiled: Option<u32>) -> u32 {
+    required & !compiled.unwrap_or(0)
+}
+
 pub(super) fn missing_speech_ops(required: u64, compiled: u64) -> Vec<u32> {
     let missing = required & !compiled;
     (0..64)
@@ -184,6 +204,17 @@ impl CudaPacketRuntime {
                     object.display()
                 )));
             }
+        }
+        let caps = missing_speech_caps(
+            speech_caps_required(blob.progs.iter().flat_map(|p| &p.insts)),
+            be.module_global_u32(&module, "plow_speech_caps_speech")?,
+        );
+        if caps != 0 {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: {} lacks speech capabilities {caps:#x}; rebuild it for this packet",
+                path.display(),
+                object.display()
+            )));
         }
         let smem = be
             .module_global_u32(&module, "plow_arena_bytes_speech")?

@@ -1422,6 +1422,12 @@ impl StageProgram {
         self.builder.tensor(name, bytes)
     }
 
+    /// A constant tensor by name (a descriptor an op reads), declared once.
+    pub(crate) fn declare_init(&mut self, name: &str, init: Vec<u8>) -> u32 {
+        self.handle_of(name)
+            .unwrap_or_else(|| self.builder.tensor_init(name, init))
+    }
+
     /// Handle of an already-declared tensor.
     pub fn handle_of(&self, name: &str) -> Option<u32> {
         (0..self.builder.n_tensors() as u32).find(|&h| self.builder.tensor_name(h) == name)

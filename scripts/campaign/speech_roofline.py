@@ -100,6 +100,16 @@ def cost(inst, ctx):
         return cout * cin * kk * kk * 4 + max(b, 1) * (f * w * cin + of * ow * cout) * 4, flops, "fp32"
     if op in ("LayerNormF32",):
         return g("rows") * g("feat") * 4 * 2, 0, "fp32"
+    if op == "GemvF32Out":
+        # Maya 2 depth projections: fp16/bf16 W [N][K]; x f32 (flag bit 0) or bf16; f32 out (+ residual read);
+        # bit 10 = tensor cores (m16n8k16 f16), else FP32 FFMA.
+        m, n, k, f = g("M", 1), g("N"), g("K"), g("flags")
+        by = n * k * 2 + m * k * (4 if f & 1 else 2) + m * n * 4 * (2 if f & 8 else 1)
+        return by, 2 * m * n * k, ("bf16" if f & 1024 else "fp32")
+    if op == "SampleSmallF32":
+        return g("rows") * g("vocab") * 4, 0, "fp32"
+    if op == "RowGather":
+        return g("S") * g("H") * 2 * 2, 0, "fp32"
     if op == "AttentionF32":
         b, q, kv, h, hw = g("batch", 1), g("q_rows"), g("kv_rows"), g("heads"), g("head_width")
         return b * (q * 2 + kv * 2) * h * hw * 4, 4 * b * h * q * kv * hw, "fp32"

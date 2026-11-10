@@ -266,6 +266,16 @@ impl SpeechFn {
                 )));
             }
         }
+        let caps = super::packet_exec::missing_speech_caps(
+            super::packet_exec::speech_caps_required(programs.iter().flat_map(|p| &p.insts)),
+            e.be.module_global_u32(&module, "plow_speech_caps_speech")?,
+        );
+        if caps != 0 {
+            return Err(reject(format!(
+                "{} lacks speech capabilities {caps:#x}",
+                path.display()
+            )));
+        }
         let smem =
             e.be.module_global_u32(&module, "plow_arena_bytes_speech")?
                 .unwrap_or(49152);
