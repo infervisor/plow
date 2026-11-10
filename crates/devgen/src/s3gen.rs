@@ -878,7 +878,17 @@ impl<'s> Ops<'s> {
         width: u32,
         epsilon: f32,
     ) -> Result<u32, String> {
-        self.layer_norm_act(x, out, w, rows, width, epsilon, Activation::None, None, false)
+        self.layer_norm_act(
+            x,
+            out,
+            w,
+            rows,
+            width,
+            epsilon,
+            Activation::None,
+            None,
+            false,
+        )
     }
 
     /// `layer_norm`, then `act`, then `+ add` (a `[width]` weight row), in one op.
