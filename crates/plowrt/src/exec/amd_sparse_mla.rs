@@ -2715,7 +2715,10 @@ mod decode_tests {
                             m.is_finite() && l == 1.0,
                             "rows={rows} b={b} h={h} s={s}: ml=({m},{l})"
                         );
-                        let w = f64::from(l) * f64::from((m - gm).exp());
+                        // `ml[.., 0]` is the exp2-domain LSE the adapter stores (`lse * log2e`,
+                        // mla_sparse_adapter.hip), merged by `d_mla_merge_fold` with
+                        // `FA_EXP = exp2` under `FA_USE_EXP2`.
+                        let w = f64::from(l) * f64::from((m - gm).exp2());
                         gl += w;
                         for d in 0..512 {
                             merged[d] += f64::from(op[(base + s) * 512 + d]) * w;

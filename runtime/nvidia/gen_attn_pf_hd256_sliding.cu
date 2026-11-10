@@ -372,7 +372,10 @@ __device__ __forceinline__ void produce(const PlowGenFlashPrefill& a, uint32_t b
                 const uint32_t full = which ? b.fullV(s) : b.fullK(s);
                 const uint32_t tile = base + (which ? OFF_V : OFF_K) + s * KV_BYTES;
                 bar_wait(which ? b.emptyV(s) : b.emptyK(s), ph ^ 1);
-                if (TMA && (t + 1) * BN <= it.kvlen) {
+                // TMA stages whole tiles: only one inside [lo, kvlen). A tile below the window
+                // floor takes the cp.async path, whose predicate zero-fills the rows under `lo`
+                // (P is 0 there, but an unrestored ring row may hold NaN, and 0 * NaN poisons O).
+                if (TMA && t * BN >= it.lo && (t + 1) * BN <= it.kvlen) {
                     if (tid == 0) {
                         bar_expect_tx(full, KV_BYTES);
                         const char* m = map + (which ? 128 : 0);

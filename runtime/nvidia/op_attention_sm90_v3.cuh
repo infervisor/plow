@@ -285,9 +285,13 @@ __device__ FA3_INLINE void fa3_v3_body(
         const long item_lo_q = (long)qp0 + q0;
         const long item_hi_q = pk ? item_lo_q + (long)sq - 1 : item_lo_q + ROWS - 1;
         unsigned eff_lo = 0;
+        unsigned floor_lo = 0; /* unrounded: rows below it are masked for every row of the item */
         if (window) {
             const long wfloor = item_lo_q - (long)window + 1;
-            if (wfloor > 0) eff_lo = ((unsigned)wfloor / BKV) * (unsigned)BKV;
+            if (wfloor > 0) {
+                floor_lo = (unsigned)wfloor;
+                eff_lo = ((unsigned)wfloor / BKV) * (unsigned)BKV;
+            }
         }
         long cap = (long)hi - 1;
         if (item_hi_q < cap) cap = item_hi_q;
@@ -519,12 +523,15 @@ __device__ FA3_INLINE void fa3_v3_body(
         auto pv_issue = [&](int t) {
             __nv_bfloat16* const vbuf = Vs + (size_t)(t & 1) * NSUB_KV * KT;
             const unsigned kv0 = eff_lo + (unsigned)t * BKV;
-            if (kv0 + BKV > hi) {
-                /* V rows past hi were loaded from beyond the live cache: zero them. */
-                const int live = (int)(hi - kv0);
+            /* Rows below the unrounded window floor (tile 0 of a rounded-down eff_lo) may be
+             * unrestored ring rows; rows past hi come from beyond the live cache. Both are
+             * masked to P = 0 and must not carry NaN into P.V: zero them. */
+            const int below = kv0 < floor_lo ? (int)(floor_lo - kv0) : 0;
+            if (kv0 + BKV > hi || below > 0) {
+                const int live = kv0 + BKV > hi ? (int)(hi - kv0) : BKV;
                 for (int i = lt; i < BKV * NSUB_W * 8; i += 128) {
                     const int c = i & 7, sub = (i >> 3) & (NSUB_W - 1), r = i >> 5;
-                    if (r >= live)
+                    if (r >= live || r < below)
                         *(uint4*)(vbuf + ((SPLIT ? 4 * wg : 0) + sub) * KT +
                                   sm90_swz_off<64, 8>(r, c)) = make_uint4(0, 0, 0, 0);
                 }
