@@ -4770,6 +4770,16 @@ impl GpuEngine {
                 let image_len = image.len();
                 let dec_source = dec.source.clone();
                 let module = DecodeModule::load(&be, &image)?;
+                // The regular programs run on this object, whatever was selected (a speech
+                // object can be: its entry is a decode entry too).
+                let layout = blob.speech_flag_layout(&raw)?;
+                packet_exec::check_speech_flag_layout(
+                    &be,
+                    &module,
+                    Path::new(&dec_source.to_string()),
+                    layout.declared,
+                    layout.regular,
+                )?;
                 check_norm_weight_offset(&be, &module, &blob)?;
                 if be
                     .module_global_u32(&module, "plow_kv_layout")?

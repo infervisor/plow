@@ -20,7 +20,8 @@ fn speech_layout() -> i32 {
     for path in std::env::args().skip(1).filter(|a| !a.starts_with("--")) {
         let buf = std::fs::read(&path).expect("read blob");
         let blob = DevBlob::parse_l2(&buf, true).expect("parse blob");
-        let (declared, used) = blob.speech_flag_layout(&buf).expect("scan blob");
+        let scan = blob.speech_flag_layout(&buf).expect("scan blob");
+        let (declared, used) = (scan.declared, scan.any());
         let verdict = match layout::check(declared, used, Some(layout::LAYOUT)) {
             Ok(()) => "loads".to_string(),
             Err(e) => {

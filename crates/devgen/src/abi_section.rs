@@ -117,7 +117,11 @@ mod tests {
     fn speech_flag_layout_is_declared_only_when_a_protected_bit_is_set() {
         let key = "speech_flag_layout";
         let base = abi_json(0x6e000, None);
-        assert!(!base.contains(key), "{base}");
+        // The bytes the serializer wrote for this model before the field existed.
+        assert_eq!(
+            base,
+            r#"{"version":1,"contract":2,"must_understand":[],"target":{"isa":"sm_90a","n_cu":4},"bindings":{"roles":{},"kv_writes":[]}}"#
+        );
         assert_eq!(abi_json(0x6e000, Some(false)), base);
         let declared = format!(
             "{},\"{key}\":{}}}",

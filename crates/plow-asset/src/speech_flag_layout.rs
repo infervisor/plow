@@ -105,24 +105,25 @@ mod tests {
         (op as u16, j1, i)
     }
 
+    /// Every bit the layout-0 (RC9, 45e1da259) emitters could set stays unprotected. The values
+    /// are those emitters' fields, not the masks' complements: conv pad 0..1, activations 4..11,
+    /// routes 12..20; attention options 0..5, key-length groups 8..15, window 16..31; LayerNorm
+    /// rounding / statistics 0..1 and activation from bit 4; GemvF32Out modes through bit 11.
     #[test]
     fn layout_zero_bits_are_not_protected() {
-        // Every bit a layout-0 emitter sets: pad 0..1, activations 4..11, routes 12..20.
-        let base = !CONV_FLAGS;
-        assert_eq!(base, 0x001f_fff3);
         for op in [DevOp::Conv1dF32, DevOp::ConvTranspose1dF32] {
-            assert_eq!(first_protected([inst(op, base, 0, 0)]), None);
+            assert_eq!(first_protected([inst(op, 0x001f_fff3, 0, 0)]), None);
         }
         assert_eq!(
-            first_protected([inst(DevOp::AttentionF32, 0, 6, !ATTENTION_I6)]),
+            first_protected([inst(DevOp::AttentionF32, 0, 6, 0xffff_ff3f)]),
             None
         );
         assert_eq!(
-            first_protected([inst(DevOp::LayerNormF32, 0, 2, !LAYER_NORM_I2)]),
+            first_protected([inst(DevOp::LayerNormF32, 0, 2, 0xffff_fff3)]),
             None
         );
         assert_eq!(
-            first_protected([inst(DevOp::GemvF32Out, 0, 7, 2048 | 1024)]),
+            first_protected([inst(DevOp::GemvF32Out, 0, 7, 0x0fff)]),
             None
         );
         // The same bit patterns on other ops are not flags.
@@ -138,7 +139,7 @@ mod tests {
 
     #[test]
     fn each_reassigned_bit_is_protected() {
-        for bit in [2, 3, 21, 22, 23, 24, 29, 30, 31] {
+        for bit in (2..=3).chain(21..=31) {
             for op in [DevOp::Conv1dF32, DevOp::ConvTranspose1dF32] {
                 assert_eq!(
                     first_protected([inst(op, 1 << bit, 0, 0)]),
