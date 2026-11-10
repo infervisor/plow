@@ -12083,6 +12083,10 @@ fn emit_dense_gqa(
     std::fs::write(&out, blob).unwrap();
     let mut speech = aux_speech;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
+        assert!(
+            !ecfg.codec_ring_kv || arch == "sm_90a",
+            "codec ring KV needs sm_90a"
+        );
         let sites = whole_graph_audio_sites().0;
         let fish = std::fs::read(dir.join("config.json"))
             .ok()
@@ -12229,6 +12233,9 @@ fn emit_dense_gqa(
             man["speech_conv_posts"] = speech.conv_posts.into();
             man["speech_split_a"] = speech.split_a.into();
             man["speech_conv_wide_padded"] = speech.conv_wide_padded.into();
+            if speech.ring_kv {
+                man["speech_ring_kv"] = true.into();
+            }
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes

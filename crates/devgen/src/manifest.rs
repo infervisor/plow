@@ -3099,6 +3099,9 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
     if manifest.get("speech_split_a").and_then(Value::as_bool) == Some(true) {
         feed("\x1espeech_split_a");
     }
+    if manifest.get("speech_ring_kv").and_then(Value::as_bool) == Some(true) {
+        feed("\x1espeech_ring_kv");
+    }
     feed("\x1e");
     if let Some(o) = manifest.get("tuning").and_then(Value::as_object) {
         for (k, v) in o {
@@ -3187,6 +3190,7 @@ pub struct SpeechMasks {
     /// compiles the image GEMM arm and its larger launch arena into the speech object.
     pub split_a: bool,
     pub conv_wide_padded: bool,
+    pub ring_kv: bool,
 }
 
 impl SpeechMasks {
@@ -3200,6 +3204,11 @@ impl SpeechMasks {
                 .flat_map(|p| &p.insts)
                 .any(|i| i.op == DevOp::Conv1dF32 as u16 && i.j[1] & (1 << 30) != 0),
             conv_wide_padded: speech_conv_wide_padded(model),
+            ring_kv: model
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .any(|d| plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)),
         }
     }
     pub fn add(&mut self, other: Self) {
@@ -3207,6 +3216,7 @@ impl SpeechMasks {
         self.conv_posts |= other.conv_posts;
         self.split_a |= other.split_a;
         self.conv_wide_padded |= other.conv_wide_padded;
+        self.ring_kv |= other.ring_kv;
     }
 }
 
@@ -3288,6 +3298,10 @@ pub fn config_header(manifest: &Value) -> String {
             "#ifndef PLOW_SPEECH_CONV_WIDE_PADDED\n#define PLOW_SPEECH_CONV_WIDE_PADDED {}\n#endif\n\n",
             u8::from(padded)
         ));
+    }
+
+    if manifest.get("speech_ring_kv").and_then(Value::as_bool) == Some(true) {
+        out.push_str("#define PLOW_SPEECH_RING_KV 1\n\n");
     }
 
     // Presence macros, one per opcode in the union. Named from the `dev_isa.h`

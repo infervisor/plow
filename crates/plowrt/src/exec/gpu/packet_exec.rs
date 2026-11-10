@@ -70,7 +70,11 @@ pub(super) fn speech_caps_required<'a>(
             Some(DevOp::GemvF32Out) => {
                 u32::from(d.i[7] & 4096 != 0) | u32::from(d.i[7] & 0x6000 != 0) << 2
             }
-            Some(DevOp::AttentionF32) if d.i[6] & 64 != 0 => 2,
+            Some(DevOp::AttentionF32) => {
+                u32::from(d.i[6] & 64 != 0) << 1
+                    | u32::from(plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)) << 3
+            }
+            Some(DevOp::StreamTailF32) if plow_asset::speech_flag_layout::ring_kv(d.op, &d.i) => 8,
             Some(DevOp::LayerNormF32) if d.i[2] & 8 != 0 => 4,
             _ => 0,
         }
@@ -199,6 +203,24 @@ fn half_speech_operands_require_the_capability() {
 
 #[cfg(test)]
 #[test]
+fn ring_speech_operands_require_layout_capability() {
+    let mut d = packet::dev::DevInst64::default();
+    d.op = DevOp::AttentionF32 as u16;
+    d.i[6] = 9 | (250 << 16);
+    assert_eq!(speech_caps_required([&d]), 0);
+    d.i[6] |= 0x100;
+    assert_eq!(speech_caps_required([&d]), 8);
+    assert_eq!(missing_speech_caps(8, Some(6)), 8);
+    assert_eq!(missing_speech_caps(8, Some(14)), 0);
+    d.op = DevOp::StreamTailF32 as u16;
+    for mode in [2, 3] {
+        d.i[7] = mode;
+        assert_eq!(speech_caps_required([&d]), 8);
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn ragged_conv_flags_require_the_speech_feature() {
     let (conv, convt) = (DevOp::Conv1dF32 as u16, DevOp::ConvTranspose1dF32 as u16);
     assert_eq!(speech_features([(conv, 0x6e000), (convt, 0xa000)]), 0);
@@ -278,6 +300,207 @@ pub struct CudaPacketRuntime {
 }
 
 type Residents = parking_lot::Mutex<Vec<(std::path::PathBuf, u8, std::sync::Weak<()>)>>;
+
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; CODEC_RING_TEST_ASSETS holds the layout-3 speech object; run through gpuq"]
+fn ring_attention_matches_chronological_single_block() {
+    use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
+    let dir = std::path::PathBuf::from(std::env::var("CODEC_RING_TEST_ASSETS").unwrap());
+    let make = |active: usize, cap: usize, ring: bool| {
+        let (history, width, rows, slots) = (249usize, 512usize, 2usize, cap.max(256));
+        let mut b = Builder::new(132);
+        b.force_uniseg();
+        let out = b.tensor("out", (cap * rows * width * 4) as u64);
+        let qkv = b.tensor("qkv", (cap * rows * width * 3 * 4) as u64);
+        let state = b.tensor("state", (slots * history * width * 2 * 4) as u64);
+        let slot = b.tensor("slot", (cap * 4) as u64);
+        let length = b.tensor("length", (cap * 4) as u64);
+        let pos = b.tensor("pos", (cap * 4) as u64);
+        let z = b.tensor("z", (cap * (history + rows) * width * 3 * 4) as u64);
+        let tail = |b: &mut Builder, mode, deps: &[u32]| {
+            let units = if mode == 2 {
+                (cap * rows * width * 2).div_ceil(2048)
+            } else {
+                132
+            };
+            b.emit(
+                DevOp::StreamTailF32,
+                (0..units.clamp(1, 132) as u32).collect(),
+                deps,
+                |d| {
+                    d.t[0] = if mode == 0 {
+                        z
+                    } else {
+                        packet::dev::TENSOR_NONE
+                    };
+                    d.t[1..6].copy_from_slice(&[
+                        if mode == 1 { z } else { qkv },
+                        state,
+                        slot,
+                        length,
+                        pos,
+                    ]);
+                    d.i = [
+                        cap as u32,
+                        history as u32,
+                        rows as u32,
+                        (2 * width) as u32,
+                        (3 * width) as u32,
+                        width as u32,
+                        if mode == 1 { 0 } else { (3 * width) as u32 },
+                        mode,
+                    ];
+                    d.j = [slots as u32, 0];
+                },
+            )
+        };
+        let dep = if ring {
+            None
+        } else {
+            let gather = tail(&mut b, 0, &[]);
+            Some(tail(&mut b, 1, &[gather]))
+        };
+        let attention = b.emit(
+            DevOp::AttentionF32,
+            b.all(),
+            &dep.into_iter().collect::<Vec<_>>(),
+            |d| {
+                if ring {
+                    d.t[..6].copy_from_slice(&[out, qkv, state, slot, length, pos]);
+                } else {
+                    d.t[..4].copy_from_slice(&[out, z, z, z]);
+                    d.t[7] = pos;
+                }
+                d.i = [
+                    cap as u32,
+                    rows as u32,
+                    (if ring { history } else { history + rows }) as u32,
+                    8,
+                    64,
+                    (3 * width) as u32,
+                    (if ring { 0x109 } else { 9 }) | (250 << 16),
+                    (if ring { slots } else { history }) as u32,
+                ];
+                d.f[0] = 0.125;
+                d.j = [width as u32, (2 * width) as u32];
+            },
+        );
+        if ring {
+            tail(&mut b, 2, &[attention]);
+        }
+        let tensors = b.tensors();
+        let model = Model {
+            n_cu: 132,
+            target: 0,
+            tensors,
+            progs: vec![b.finish()],
+            prog_t: vec![1],
+            kv_row_insts: vec![],
+            gen: vec![],
+        };
+        let abi = plow_asset::abi::Abi {
+            version: 1,
+            contract: 2,
+            must_understand: vec![],
+            target: None,
+            bindings: None,
+            speech_flag_layout: Some(3),
+        };
+        let path = dir.join(format!("attention.b{active}.c{cap}.ring{ring}.pkt"));
+        std::fs::write(
+            &path,
+            model.to_blob_v6(&[SectionData {
+                kind: SECT_METADATA,
+                name: plow_asset::abi::SECTION.into(),
+                data: serde_json::to_vec(&abi).unwrap(),
+            }]),
+        )
+        .unwrap();
+        path
+    };
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let sanitize = std::env::var_os("CODEC_RING_SANITIZE").is_some();
+    let cases: &[(usize, usize)] = if sanitize {
+        &[(33, 64)]
+    } else {
+        &[
+            (32, 32),
+            (64, 64),
+            (128, 128),
+            (200, 256),
+            (224, 256),
+            (300, 320),
+        ]
+    };
+    for &(active, cap) in cases {
+        let slots = cap.max(256);
+        let mut runtimes = [
+            CudaPacketRuntime::load_on(be.clone(), &make(active, cap, false)).unwrap(),
+            CudaPacketRuntime::load_on(be.clone(), &make(active, cap, true)).unwrap(),
+        ];
+        let qkv: Vec<f32> = (0..cap * 2 * 1536)
+            .map(|i| {
+                if i / (2 * 1536) < active {
+                    ((i * 37 % 101) as f32 - 50.) * 0.003
+                } else {
+                    0.
+                }
+            })
+            .collect();
+        let slot: Vec<u32> = (0..cap).map(|r| ((r * 73) % slots) as u32).collect();
+        let length: Vec<u32> = (0..cap).map(|r| if r < active { 2 } else { 0 }).collect();
+        let pos: Vec<u32> = (0..cap).map(|r| if r < active { 256 } else { 0 }).collect();
+        for rt in &mut runtimes {
+            for (name, data) in [
+                ("qkv", bytemuck::cast_slice(&qkv)),
+                ("slot", bytemuck::cast_slice(&slot)),
+                ("length", bytemuck::cast_slice(&length)),
+                ("pos", bytemuck::cast_slice(&pos)),
+            ] {
+                let tensor = rt.tensor(name).unwrap();
+                rt.write_tensor(tensor, data).unwrap();
+            }
+        }
+        let mut output = [vec![0f32; cap * 2 * 512], vec![0f32; cap * 2 * 512]];
+        let mut timing = Vec::new();
+        for arm in [0, 1, 0, 1] {
+            let rt = &mut runtimes[arm];
+            let state = rt.tensor("state").unwrap();
+            let mut times = Vec::new();
+            for repeat in 0..if sanitize { 1 } else { 15 } {
+                rt.write_tensors(&[PacketWrite {
+                    tensor: state,
+                    offset: 0,
+                    data: PacketData::Zero(state.bytes),
+                }])
+                .unwrap();
+                rt.run_sequence(&[0]).unwrap();
+                if repeat >= 3 || sanitize {
+                    times.push(rt.last_run_us());
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            timing.push((arm, times[times.len() / 2]));
+            rt.read_tensor_at(
+                rt.tensor("out").unwrap(),
+                0,
+                bytemuck::cast_slice_mut(&mut output[arm]),
+            )
+            .unwrap();
+        }
+        let error = output[0]
+            .iter()
+            .zip(&output[1])
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum::<f64>();
+        let norm = output[0].iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
+        let relative = (error / norm.max(1.0e-30)).sqrt();
+        assert!(relative < 1.0e-5, "{active}/{cap}: {relative}");
+        assert!(output[1][active * 2 * 512..].iter().all(|&v| v == 0.));
+        println!("ring-interpreter active={active} capacity={cap} rel_l2={relative:e} abab_us={timing:?}");
+    }
+}
 
 /// Live runtimes by the asset directory their packet sits in and their device.
 fn residents() -> &'static Residents {
