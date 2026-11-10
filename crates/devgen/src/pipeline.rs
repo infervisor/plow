@@ -465,7 +465,20 @@ pub enum StreamTailF32Mode<'a> {
         src_stride: u32,
     },
     /// The state takes `z` rows `[n[b], n[b] + tail)`.
-    Store { z: u32 },
+    Store {
+        z: u32,
+    },
+    RingGather {
+        output: TensorRef<'a>,
+        src: u32,
+        pos: u32,
+        src_stride: u32,
+    },
+    RingStore {
+        src: u32,
+        pos: u32,
+        src_stride: u32,
+    },
 }
 
 /// [`DevOp::ReduceRowsF32`] reduction.
@@ -856,6 +869,21 @@ pub struct AttentionF32Stage<'a> {
 pub struct AttentionStream {
     pub pos: u32,
     pub history: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct RingAttentionF32Stage<'a> {
+    pub output: TensorRef<'a>,
+    pub state: TensorRef<'a>,
+    pub slot: u32,
+    pub lengths: u32,
+    pub positions: u32,
+    pub batch: u32,
+    pub rows: u32,
+    pub heads: u32,
+    pub history: u32,
+    pub slots: u32,
+    pub scale: f32,
 }
 
 /// A key prefix for [`AttentionF32Stage`]: item `b` first attends to the `rows` rows of block
@@ -1710,18 +1738,37 @@ impl StageProgram {
                 mode,
             ]
         };
+        let ring = matches!(
+            stage.mode,
+            StreamTailF32Mode::RingGather { .. } | StreamTailF32Mode::RingStore { .. }
+        );
+        if ring && (stage.cols % 4 != 0 || stage.z_cols % 4 != 0 || stage.z_col0 % 4 != 0) {
+            return Err("ring-tail columns must be multiples of four".into());
+        }
         match stage.mode {
             StreamTailF32Mode::Gather {
                 output,
                 src,
                 pos,
                 src_stride,
+            }
+            | StreamTailF32Mode::RingGather {
+                output,
+                src,
+                pos,
+                src_stride,
             } => {
+                if ring && (src_stride < stage.z_cols || src_stride % 4 != 0 || src == state) {
+                    return Err("invalid ring-tail source".into());
+                }
                 self.input(pos, per_item, "stream-tail positions")?;
                 let span = (product(&[stage.items, stage.rows])? - 1) * u64::from(src_stride)
                     + u64::from(stage.z_cols);
                 self.input(src, f32_bytes(span)?, "stream-tail source")?;
                 let z = self.resolve(output, z_bytes, "stream-tail output")?;
+                if ring && (z == src || z == state) {
+                    return Err("ring-tail gather aliases its input".into());
+                }
                 let elements = u32_elements(z_elements, "stream-tail gather")?;
                 self.emit(
                     DevOp::StreamTailF32,
@@ -1730,7 +1777,7 @@ impl StageProgram {
                     z,
                     |d| {
                         d.t[..6].copy_from_slice(&[z, src, state, stage.slot, stage.n, pos]);
-                        d.i = ints(src_stride, 0);
+                        d.i = ints(src_stride, if ring { 3 } else { 0 });
                         d.j = [stage.slots, 0];
                     },
                 )
@@ -1747,6 +1794,32 @@ impl StageProgram {
                     |d| {
                         d.t[1..5].copy_from_slice(&[z, state, stage.slot, stage.n]);
                         d.i = ints(0, 1);
+                        d.j = [stage.slots, 0];
+                    },
+                )
+            }
+            StreamTailF32Mode::RingStore {
+                src,
+                pos,
+                src_stride,
+            } => {
+                if src_stride < stage.z_cols || src_stride % 4 != 0 || src == state {
+                    return Err("invalid ring-tail source".into());
+                }
+                self.input(pos, per_item, "ring-tail positions")?;
+                let span = (product(&[stage.items, stage.rows])? - 1) * u64::from(src_stride)
+                    + u64::from(stage.z_cols);
+                self.input(src, f32_bytes(span)?, "ring-tail source")?;
+                let elements = product(&[stage.items, stage.rows.min(stage.tail), stage.cols])?;
+                u32_elements(z_elements, "ring-tail geometry")?;
+                self.emit(
+                    DevOp::StreamTailF32,
+                    elements.div_ceil(2048),
+                    deps,
+                    state,
+                    |d| {
+                        d.t[1..6].copy_from_slice(&[src, state, stage.slot, stage.n, pos]);
+                        d.i = ints(src_stride, 2);
                         d.j = [stage.slots, 0];
                     },
                 )
@@ -2372,6 +2445,86 @@ impl StageProgram {
             d.f = [stage.scale, stage.offset];
             d.j[1] = flags;
         })
+    }
+
+    pub fn ring_attention_f32(
+        &mut self,
+        qkv: u32,
+        deps: &[u32],
+        stage: RingAttentionF32Stage<'_>,
+    ) -> Result<Emitted, String> {
+        if stage.batch == 0
+            || stage.rows == 0
+            || stage.rows > 4
+            || stage.heads == 0
+            || stage.history == 0
+            || stage.history > 255
+            || stage.slots == 0
+            || !stage.scale.is_finite()
+            || stage.scale <= 0.0
+        {
+            return Err("invalid ring-attention geometry".into());
+        }
+        let width = stage
+            .heads
+            .checked_mul(64)
+            .ok_or("ring-attention width overflow")?;
+        let stride = width
+            .checked_mul(3)
+            .ok_or("ring-attention stride overflow")?;
+        u32_elements(
+            product(&[stage.batch, stage.rows, stage.heads])?,
+            "ring-attention work",
+        )?;
+        self.input(
+            qkv,
+            f32_bytes(product(&[stage.batch, stage.rows, stride])?)?,
+            "ring-attention QKV",
+        )?;
+        for tensor in [stage.slot, stage.lengths, stage.positions] {
+            self.input(tensor, u64::from(stage.batch) * 4, "ring-attention control")?;
+        }
+        let state = self.resolve(
+            stage.state,
+            f32_bytes(product(&[stage.slots, stage.history, width, 2])?)?,
+            "ring-attention state",
+        )?;
+        let output = self.resolve(
+            stage.output,
+            f32_bytes(product(&[stage.batch, stage.rows, width])?)?,
+            "ring-attention output",
+        )?;
+        if output == state || output == qkv || state == qkv {
+            return Err("ring-attention aliases its inputs".into());
+        }
+        self.emit(
+            DevOp::AttentionF32,
+            u64::from(stage.batch) * u64::from(stage.rows) * u64::from(stage.heads),
+            deps,
+            output,
+            |d| {
+                d.t[..6].copy_from_slice(&[
+                    output,
+                    qkv,
+                    state,
+                    stage.slot,
+                    stage.lengths,
+                    stage.positions,
+                ]);
+                d.i = [
+                    stage.batch,
+                    stage.rows,
+                    stage.history,
+                    stage.heads,
+                    64,
+                    stride,
+                    0x109 | ((stage.history + 1) << 16),
+                    stage.slots,
+                ];
+                d.f[0] = stage.scale;
+                d.j = [width, 2 * width];
+            },
+        )
     }
 
     pub fn attention_f32(

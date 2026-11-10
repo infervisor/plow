@@ -11,6 +11,31 @@ use crate::program::{Packet, Program};
 
 pub(crate) const CONV1D_SPLITK: u32 = 1 << 20;
 
+#[cfg(test)]
+#[test]
+fn ring_effects_require_positions_and_write_only_the_declared_destination() {
+    let mut d = DevInst64 {
+        op: DevOp::StreamTailF32 as u16,
+        t: [0; 8],
+        ..Default::default()
+    };
+    for (mode, written) in [(2, &[2][..]), (3, &[0][..])] {
+        d.i[7] = mode;
+        assert_eq!(outputs(&d).unwrap(), written);
+        d.t[5] = TENSOR_NONE16;
+        assert!(outputs(&d).is_err());
+        d.t[5] = 0;
+    }
+    d.op = DevOp::AttentionF32 as u16;
+    d.i[6] = 0x109 | (250 << 16);
+    assert_eq!(outputs(&d).unwrap(), &[0]);
+    for slot in 0..6 {
+        d.t[slot] = TENSOR_NONE16;
+        assert!(outputs(&d).is_err());
+        d.t[slot] = 0;
+    }
+}
+
 pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
     use DevOp::*;
     let op = DevOp::from_u16(d.op).ok_or("unknown kernel effects")?;
@@ -19,12 +44,20 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         let (required, writes): (&[usize], &'static [usize]) = match d.i[7] {
             0 => (&[0, 1, 2, 3, 4, 5], &[0]),
             1 => (&[1, 2, 3, 4], &[2]),
+            2 => (&[1, 2, 3, 4, 5], &[2]),
+            3 => (&[0, 1, 2, 3, 4, 5], &[0]),
             _ => return Err("unknown stream-tail mode".into()),
         };
         if required.iter().any(|&slot| d.t[slot] == TENSOR_NONE16) {
             return Err("missing required effect operand".into());
         }
         return Ok(writes);
+    }
+    if op == AttentionF32 && crate::speech_flag_layout::is_ring_attention(d.i[6]) {
+        if d.t[..6].contains(&TENSOR_NONE16) {
+            return Err("missing ring-attention operand".into());
+        }
+        return Ok(&[0]);
     }
     if op == Conv1dF32 && d.fj[2] & CONV1D_SPLITK != 0 {
         // SpConvArgs::splitk uses t7 for tickets and partials, rather than a row scale.

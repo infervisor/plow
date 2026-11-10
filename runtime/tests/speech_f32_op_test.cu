@@ -66,7 +66,10 @@ typedef void (*golden_fn)(const PlowDevInst*, uint32_t, uint32_t, void* const*, 
 
 __global__ void __launch_bounds__(256, 1) k_speech(PlowDevInst in, void* const* T) {
     extern __shared__ float arena[];
-#ifdef SPEECH_TEST_SHORT_ATTENTION_ONLY
+#ifdef SPEECH_TEST_RING_ONLY
+    if (in.op == PLOW_DOP_STREAM_TAIL_F32) d_stream_tail_f32(&in, T, blockIdx.x, gridDim.x);
+    else d_attention_f32(&in, T, blockIdx.x, gridDim.x, arena);
+#elif defined(SPEECH_TEST_SHORT_ATTENTION_ONLY)
     d_attention_f32(&in, T, blockIdx.x, gridDim.x, arena);
 #else
 #if defined(PLOW_NV_HOPPER)
@@ -1690,6 +1693,54 @@ static void t_attention(const char* name, unsigned batch, unsigned rows, unsigne
 
 /* Stream mode: fused QKV item rows [hist carried | n new]; positions mask absent history, and the
  * TC flag must fall back to the fp32 kernel. */
+static void t_ring_kv() {
+    const unsigned L = 249, slots = 512;
+    for (unsigned B : {7u, 33u}) {
+        std::vector<uint32_t> vs(B), vn(B), vp(B);
+        const uint32_t positions[] = {0, 1, 248, 249, 250, 10000, 256};
+        for (unsigned N : {1u, 2u, 3u, 4u}) {
+            Case c;
+            const unsigned H = 2, width = H * 64u, stride = 3 * width;
+            unsigned out = c.out((size_t)B * N * width);
+            unsigned qkv = c.f32((size_t)B * N * stride, .2f);
+            unsigned state = c.f32((size_t)slots * L * 2 * width, .2f);
+            for (unsigned b = 0; b < B; b++) {
+                vn[b] = b % 7 == 3 ? 0 : b % 7 == 2 ? N - 1 : N;
+                vs[b] = vn[b] ? (b * 13 + 5) % slots : slots + 99;
+                vp[b] = vn[b] ? positions[b % 7] : UINT32_MAX;
+            }
+            unsigned slot = c.u32(vs), n = c.u32(vn), pos = c.u32(vp);
+            c.in.op = PLOW_DOP_ATTENTION_F32;
+            const unsigned ts[] = {out, qkv, state, slot, n, pos};
+            for (unsigned k = 0; k < 6; k++) c.in.t[k] = ts[k];
+            const unsigned is[] = {B, N, L, H, 64, stride, 0x109u | (250u << 16), slots};
+            for (unsigned k = 0; k < 8; k++) c.in.i[k] = is[k];
+            c.in.fj[0].f = .125f;
+            c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
+            char name[80]; snprintf(name, sizeof(name), "ring attention B%u N%u sparse/zero/wrap", B, N);
+            run(name, c, g_attention_f32, {out}, FP32);
+        }
+        for (unsigned N : {1u, 2u, 17u, 34u, 300u}) {
+            for (unsigned mode : {2u, 3u}) {
+                Case c;
+                const unsigned C = 128, Cz = 192, zc0 = 64;
+                unsigned z = mode == 3 ? c.out((size_t)B * (L + N) * Cz) : PLOW_TENSOR_NONE;
+                unsigned src = c.f32((size_t)B * N * Cz, .2f);
+                unsigned state = c.f32((size_t)slots * L * C, .2f);
+                for (unsigned b = 0; b < B; b++) {
+                    vn[b] = b % 7 == 3 ? 0 : b % 7 == 2 ? N / 2 : N;
+                    vs[b] = vn[b] ? (b * 13 + 5) % slots : slots + 99;
+                    vp[b] = vn[b] ? positions[b % 7] : UINT32_MAX;
+                }
+                unsigned slot = c.u32(vs), n = c.u32(vn), pos = c.u32(vp);
+                st_inst(c.in, z, src, state, slot, n, pos, B, slots, L, N, C, Cz, zc0, Cz, mode);
+                char name[80]; snprintf(name, sizeof(name), "ring tail B%u N%u mode%u sparse/zero/wrap", B, N, mode);
+                run(name, c, g_stream_tail_f32, {mode == 3 ? z : state}, INT);
+            }
+        }
+    }
+}
+
 static void t_attention_stream(const char* name, unsigned batch, unsigned hist, unsigned n, unsigned win,
                                std::vector<uint32_t> pos, std::vector<uint32_t> lengths, bool tc) {
     Case c;
@@ -2594,6 +2645,12 @@ int main(int argc, char** argv) {
     kSmem = (size_t)arena_floats * sizeof(float);
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
+
+#ifdef SPEECH_TEST_RING_ONLY
+    t_ring_kv();
+    printf(g_fail ? "FAIL\n" : "ALL PASS\n");
+    return g_fail;
+#endif
 
     if (argc > 1 && !strcmp(argv[1], "--short-attention")) {
         for (unsigned b : {3u, 16u, 33u})
