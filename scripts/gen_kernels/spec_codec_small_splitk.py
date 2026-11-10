@@ -1,6 +1,6 @@
 """gen_search block spec: the 12 Hz codec transformer's small-M pointwise convs (y = x W^T + b,
 1024->512 x17 and 4096->1024 x2 per step) with fixed split-K parts (P partial tiles, ordered fold:
-the reduction order depends on P alone, never on rows). Current plow: wgmma pointwise tile, unsplit.
+the reduction order depends on P alone, never on rows). Current plow: the emitted wgmma pointwise tile, unsplit (codec_conv.cu).
 """
 import codec_spec_common as cc
 
@@ -99,8 +99,8 @@ SPEC = {
                    "build": lambda cfg, c: cfg, "bind": _tr_bind},
     },
     "current": {
-        "label": "sp_wg_gemm pointwise tile (unsplit), packet_bench --sweep per call",
-        "measured_us": {n: c["us"] for n, c in CLASSES.items()},
-        "source": "tts-perf/tp-codec/verify/l7a (qwen3-tts codec step, tp-codec 14759885b)",
+        "label": "sp_wg_gemm pointwise tile as emitted (pinned, split-bf16, 64-wide, unsplit; flags 0x266000), 132 blocks",
+        "lib": cc.CURRENT_LIB,
+        "bind": cc.dense_current_bind,
     },
 }
