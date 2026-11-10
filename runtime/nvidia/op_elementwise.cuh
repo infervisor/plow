@@ -787,6 +787,12 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
     float* st = arena + MMA_ROWS * MMA_KT / 2u;
     float* red = st + 2u * MMA_ROWS;
     const unsigned na = (t0 + my_tile) * 16u + g, nb = na + 8u;
+#if PLOW_NV_SPEECH
+    /* The quad staging loads float4s: x, gamma and beta bases must be 16-byte aligned (row and chunk offsets keep
+     * it); else one element per trip. Speech objects only: every other object keeps its staging text. */
+    const bool vec_ok =
+        ((((size_t)x) | (gamma ? ((size_t)gamma | (size_t)beta) : (size_t)0)) & (size_t)15) == 0;
+#endif
     for (unsigned mc = 0; mc < M; mc += MMA_ROWS) {
         const unsigned mr = min(MMA_ROWS, M - mc), nt8 = (mr + 7u) / 8u;
         __syncthreads();
@@ -814,6 +820,34 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
         for (unsigned kt = 0; kt < K; kt += MMA_KT) {
             const unsigned kw = min(MMA_KT, K - kt);
             __syncthreads();
+#if PLOW_NV_SPEECH
+            /* Thread (rg, c) stages the quad c of rows rg, rg + 4, ..: float4 loads, several rows in flight.
+             * (One element per thread and trip left the M >= 32 rungs bound by this loop's load latency.) */
+            if (vec_ok) {
+                const unsigned c = threadIdx.x & 63u, k = 4u * c;
+                if (k < kw) {
+                    const float4 gq = gamma ? *(const float4*)(gamma + kt + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+                    const float4 bq = gamma ? *(const float4*)(beta + kt + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll 4
+                    for (unsigned r = threadIdx.x >> 6; r < nt8 * 8u; r += PLOW_NV_THREADS / 64u) {
+                        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                        if (r < mr) {
+                            v = *(const float4*)(x + (size_t)(mc + r) * K + kt + k);
+                            if (gamma) {
+                                const float mu = st[2 * r], rs = st[2 * r + 1];
+                                v.x = __fmaf_rn((v.x - mu) * rs, gq.x, bq.x);
+                                v.y = __fmaf_rn((v.y - mu) * rs, gq.y, bq.y);
+                                v.z = __fmaf_rn((v.z - mu) * rs, gq.z, bq.z);
+                                v.w = __fmaf_rn((v.w - mu) * rs, gq.w, bq.w);
+                            }
+                        }
+                        __half2* d = (__half2*)(xs + r * MMA_KT + k);
+                        d[0] = __floats2half2_rn(v.x, v.y);
+                        d[1] = __floats2half2_rn(v.z, v.w);
+                    }
+                }
+            } else
+#endif
             for (unsigned i = threadIdx.x; i < nt8 * 8u * kw; i += PLOW_NV_THREADS) {
                 const unsigned r = i / kw, k = i % kw;
                 float v = 0.f;
