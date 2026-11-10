@@ -5,11 +5,11 @@ Current plow: UnaryF32 kind 19 + the conv with its SnakeBeta epilogue, as emitte
 import codec_spec_common as cc
 
 CLASSES = {
-    "c96_b8_in": cc.conv_class("b8", 96, 4081, 1, 178.0 + 1013.0, pre=True),
-    "c96_b8_inout": cc.conv_class("b8", 96, 4081, 1, 2 * 178.0 + 1013.0, pre=True, post=True),
-    "c192_b8_in": cc.conv_class("b8", 192, 1362, 3, 120.0 + 522.0, pre=True),
-    "c192_b8_inout": cc.conv_class("b8", 192, 1362, 3, 2 * 120.0 + 522.0, pre=True, post=True),
-    "c384_b8_inout": cc.conv_class("b8", 384, 341, 1, 2 * 55.0 + 364.0, pre=True, post=True),
+    "c96_b8_in": cc.conv_class("b8", 96, 32646, 1, 178.0 + 1013.0, pre=True),
+    "c96_b8_inout": cc.conv_class("b8", 96, 32646, 1, 2 * 178.0 + 1013.0, pre=True, post=True),
+    "c192_b8_in": cc.conv_class("b8", 192, 10898, 3, 120.0 + 522.0, pre=True),
+    "c192_b8_inout": cc.conv_class("b8", 192, 10898, 3, 2 * 120.0 + 522.0, pre=True, post=True),
+    "c384_b8_inout": cc.conv_class("b8", 384, 2726, 1, 2 * 55.0 + 364.0, pre=True, post=True),
 }
 
 SPEC = {

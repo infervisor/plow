@@ -6,10 +6,10 @@ import codec_spec_common as cc
 
 CLASSES = {
     "c96_b1": cc.conv_class("b1", 96, 1926, 1, 75.0),
-    "c96_b8": cc.conv_class("b8", 96, 4081, 1, 1013.0),
-    "c192_b8": cc.conv_class("b8", 192, 1362, 3, 522.0),
-    "c384_b8": cc.conv_class("b8", 384, 341, 1, 364.0),
-    "c768_b8": cc.conv_class("b8", 768, 69, 1, 350.0),
+    "c96_b8": cc.conv_class("b8", 96, 32646, 1, 1013.0),
+    "c192_b8": cc.conv_class("b8", 192, 10898, 3, 522.0),
+    "c384_b8": cc.conv_class("b8", 384, 2726, 1, 364.0),
+    "c768_b8": cc.conv_class("b8", 768, 550, 1, 350.0),
     "c768_b1": cc.conv_class("b1", 768, 38, 1, 179.0),
 }
 

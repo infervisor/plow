@@ -87,6 +87,7 @@ def conv_generators(tl_grid, tr_grid):
 
 
 def conv_class(role, cin, t, dil, us, pre=False, post=False):
+    """`t` = rows per item as the step program carries them (b8.f17: 17 frames + the stream tail)."""
     batch = {"b1": 1, "b8": 8, "b32": 32}[role]
     return {"B": batch, "T": t, "cin": cin, "cout": cin, "k": 7, "dil": dil, "pre": pre, "post": post,
             "step": {"us": STEP_US[role], "calls": 3}, "us": us}
