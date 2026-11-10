@@ -92,13 +92,16 @@ __device__ void xrn_twoshot(const XrNativeArgs& a) {
     /* One remote arrival per peer instead of one per workgroup (eight peers' workgroups on one
      * counter line serialise): workgroups count themselves on this rank's own gate_rs, which every
      * peer has already finished bumping, and the last one publishes `nblk` arrivals per peer and
-     * restores gate_rs, so both counters end at the audited values. */
+     * restores gate_rs, so both counters end at the audited values. SYSTEM scope on both
+     * RMWs: the peers bump this word with system-scope signals, and an agent-scope RMW would
+     * execute in this XCD's L2 and dirty the line they update at memory (op_collective.h,
+     * the two-shot arrival note). */
     if (threadIdx.x == 0) {
         uint32_t* rs = PLOW_CTR(gate[a.rank], a.gate_rs);
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-        const uint32_t seen = __hip_atomic_fetch_add(rs, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        const uint32_t seen = __hip_atomic_fetch_add(rs, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
         if (seen == 8u + gridDim.x - 1u) {
-            __hip_atomic_fetch_sub(rs, gridDim.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_fetch_sub(rs, gridDim.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             for (unsigned r = 0; r < 8u; r++)
                 __hip_atomic_fetch_add(PLOW_CTR(gate[r], a.gate_ag), a.ag_count, __ATOMIC_RELEASE,
                                        __HIP_MEMORY_SCOPE_SYSTEM);
