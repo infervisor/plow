@@ -7,7 +7,7 @@
 //!                              [--dump-tensors name,name --dump-dir dir]
 //!   block_run <asset-dir> bench --batch 1,2,4,8 --ctx 128,512,1024,4096
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
-//!                              [--pf-chunk N] [--pf-cap ROWS]
+//!                              [--pf-chunk N] [--pf-cap ROWS] [--fixed-ctx 1]
 //!   block_run <asset-dir> decode-check [--batch B --ctx T --steps N | --batch-seq 48,1,8]
 //!                              [--out y.npy] [--poison name,name]
 //!                              [--dump-tensors name,name --dump-dir dir]
@@ -1190,6 +1190,11 @@ mod cuda {
             .unwrap_or_else(|| vec![128, 512, 1024, 4096]);
         let iters: usize = flag("--iters").and_then(|s| s.parse().ok()).unwrap_or(100);
         let warmup: usize = flag("--warmup").and_then(|s| s.parse().ok()).unwrap_or(10);
+        let fixed_ctx = match flag("--fixed-ctx").as_deref() {
+            None | Some("0" | "false") => false,
+            Some("1" | "true") => true,
+            _ => return Err("--fixed-ctx expects 0 or 1".into()),
+        };
         // Prefill is far more expensive per pass than a decode step, so it gets
         // its own (smaller) iteration count.
         let pf_iters: usize = flag("--prefill-iters")
@@ -1275,9 +1280,21 @@ mod cuda {
                     last.iter().enumerate().map(|(b, &tk)| (b, tk)).collect()
                 };
                 let mut toks = Vec::new();
+                if fixed_ctx {
+                    for b in 0..bsz {
+                        e.snapshot_slot(b)?;
+                    }
+                    e.sync_stream()?;
+                }
                 for _ in 0..warmup {
                     e.step_slots(&feeds(&last), &mut toks)?;
                     last.copy_from_slice(&toks);
+                    if fixed_ctx {
+                        for b in 0..bsz {
+                            e.rewind_slot(b, t)?;
+                        }
+                        e.sync_stream()?;
+                    }
                 }
                 e.trace_reset()?;
                 let mut us: Vec<f64> = Vec::with_capacity(iters);
@@ -1286,6 +1303,12 @@ mod cuda {
                     e.step_slots(&feeds(&last), &mut toks)?;
                     us.push(t0.elapsed().as_secs_f64() * 1e6);
                     last.copy_from_slice(&toks);
+                    if fixed_ctx {
+                        for b in 0..bsz {
+                            e.rewind_slot(b, t)?;
+                        }
+                        e.sync_stream()?;
+                    }
                 }
                 us.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let median = us[us.len() / 2];
@@ -1297,7 +1320,9 @@ mod cuda {
                 );
                 rows.push(serde_json::json!({
                     "batch": bsz,
-                    "ctx": t,
+                    "ctx": if fixed_ctx { t + 1 } else { t },
+                    "prefix_ctx": t,
+                    "context_mode": if fixed_ctx { "fixed" } else { "growing" },
                     "latency_us_median": (median * 100.0).round() / 100.0,
                     "latency_us_p95": (p95 * 100.0).round() / 100.0,
                     "tok_s": (tok_s * 10.0).round() / 10.0,

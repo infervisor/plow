@@ -14,18 +14,18 @@ that separate op is timed by the depth-block harness. `IN_MODEL_US` keeps the in
 """
 
 # flags i[7] and blocks as emitted (packet_bench --sweep of the production depth program)
-EMIT = {"qkv": (1283, 132), "f2": (1039, 128), "o": (1035, 128), "head": (1283, 132)}
-SHAPES = {"qkv": (3072, 1024), "f2": (1024, 3072), "o": (1024, 1024), "head": (2048, 1024)}
+EMIT = {"qkv": (1283, 132), "f1": (1299, 132), "f2": (1039, 128), "o": (1035, 128), "head": (1283, 132)}
+SHAPES = {"qkv": (3072, 1024), "f1": (3072, 1024), "f2": (1024, 3072), "o": (1024, 1024), "head": (2048, 1024)}
 # B=1 frame: 16.73 ms; qkv + f1 share the shape (4 layers x 20 cached levels x 2), f2 and o 80, head 31.
-STEP_B1 = {"qkv": 160, "f2": 80, "o": 80, "head": 31}
+STEP_B1 = {"qkv": 80, "f1": 80, "f2": 80, "o": 80, "head": 31}
 IN_MODEL_US = {"qkv_m1": 15.1, "f2_m1": 28.6, "o_m1": 12.7, "head_m1": 18.2, "qkv_m8": 20.7, "f2_m8": 43.4}
 
 
 def _classes():
     out = {}
     for s, (n, k) in SHAPES.items():
-        for m in (1, 8, 20, 32, 64, 128, 832):
-            if s == "head" and m == 832:
+        for m in (1, 8, 20, 32, 64, 128, 200, 224, 832, 5200, 5824):
+            if s == "head" and m > 224:
                 continue  # the head reads the last prefix row only
             c = {"shape": s, "M": m, "N": n, "K": k}
             if m == 1:
@@ -56,21 +56,27 @@ def _inputs(c, seed):
 
 
 def _reference(c, inp):
-    return inp["x"].double() @ inp["w"].double().T
+    value = inp["x"].double() @ inp["w"].double().T
+    if c["shape"] == "f1":
+        import torch
+        value = torch.nn.functional.gelu(value, approximate="none")
+    return value
 
 
-def _cur_bind(lib, c, inp, out):
+def _cur_bind(lib, c, inp, out, input_f16=False):
     import ctypes
     import torch
     flags, nblk = EMIT[c["shape"]]
     if c["M"] >= 16:
         flags &= ~256
+    if input_f16:
+        flags |= 8192
     lib.dg_make.restype = ctypes.c_void_p
     lib.dg_make.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_uint] * 4
     lib.dg_run.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
     zeros = torch.zeros(max(c["M"] * c["N"], c["K"]), device="cuda")
     ones = torch.ones(c["K"], device="cuda")
-    h = lib.dg_make(out.data_ptr(), inp["x32"].data_ptr(), inp["w"].data_ptr(), zeros.data_ptr(), zeros.data_ptr(),
+    h = lib.dg_make(out.data_ptr(), inp["x" if input_f16 else "x32"].data_ptr(), inp["w"].data_ptr(), zeros.data_ptr(), zeros.data_ptr(),
                     ones.data_ptr(), zeros.data_ptr(), flags, c["M"], c["N"], c["K"])
 
     def call(keep=(zeros, ones, inp)):
@@ -95,7 +101,21 @@ def _tl_valid(cfg, c):
 
 def _tr_bind(cfg, c, inp, out):
     import gemm_f16_triton
-    return gemm_f16_triton.launcher(cfg, c["M"], c["N"], c["K"], inp["x"], inp["w"], out)
+    return _generated_bind(c, out, lambda dest: gemm_f16_triton.launcher(
+        cfg, c["M"], c["N"], c["K"], inp["x"], inp["w"], dest))
+
+
+def _generated_bind(c, out, bind):
+    if c["shape"] != "f1":
+        return bind(out)
+    import torch
+    tmp = torch.empty_like(out)
+    product = bind(tmp)
+
+    def call():
+        product()
+        torch.ops.aten.gelu.out(tmp, approximate="none", out=out)
+    return call
 
 
 SPEC = {
@@ -115,7 +135,7 @@ SPEC = {
             "grid": {"bm": [16, 32, 64, 128], "bn": [64, 128], "bk": [32, 64], "threads": [128, 256],
                      "stages": [2, 3]},
             "build": _tl_build,
-            "bind": lambda kern, c, inp, out: (lambda: kern(inp["x"], inp["w"], out)),
+            "bind": lambda kern, c, inp, out: _generated_bind(c, out, lambda dest: lambda: kern(inp["x"], inp["w"], dest)),
             "valid": _tl_valid,
             "static_shapes": True,
         },

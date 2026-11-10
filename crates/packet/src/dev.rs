@@ -2018,6 +2018,8 @@ pub enum DevOp {
     /// Numerical flag `i2` bit 0 rounds each output to BF16; bit 1 computes mean and variance
     /// with ordered FP32 accumulation; bits 4-7 apply a parameterless activation (`ACT_*`) after
     /// the affine, then `add` (a `[feat]` row) is added, both before the BF16 rounding.
+    /// Bit 3 stores FP16 with FP64 statistics; requires all other flags clear and no `add`,
+    /// and the output must not alias the input (speech flag layout 2).
     /// `t0=out t1=x t2=gamma? t3=beta? t4=add?` · `i0=rows i1=feat i2=flags` · `f0=eps`.
     LayerNormF32 = 164,
     /// FP32 scaled residual update: `out = a + scale * b`; output may alias either input.
@@ -2519,6 +2521,9 @@ pub enum DevOp {
     /// bit 10 (f32 x, f16 W, K % 64 == 0) rounds x to f16 and multiplies on tensor cores (fp32
     /// accumulation, any summation order), streaming W once per 64 rows. Bit 11 alone (no other
     /// bit) rounds each `C` to bf16 (a reference whose linear outputs bf16).
+    /// Bit 13 reads FP16 `x` (requires bits 0, 1, 10, M >= 16, N/K divisible by64 and 16-byte
+    /// aligned operands; excludes the LayerNorm prologue and row views). With it, bit 14 stores
+    /// FP16 `C`, which must not alias the FP32 residual. Both require speech flag layout 2.
     /// `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K]) t3=bias? t4=residual? t5=gamma? t6=beta?` ·
     /// `i0=M i1=N i2=K i3=bias_group i7=flags` · `f0=eps` (K % 8 == 0).
     GemvF32Out = 220,

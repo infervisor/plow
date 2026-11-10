@@ -11679,14 +11679,22 @@ fn emit_dense_gqa(
     }
     // Speech ops of auxiliary programs (not in `m.progs`), for the speech object's arm mask.
     let mut aux_speech = manifest::SpeechMasks::default();
-    if c.frame
-        .as_ref()
-        .and_then(|f| f.depth.as_ref())
-        .is_some_and(|d| d.maya2.is_some())
+    if !block_mode
+        && c.frame
+            .as_ref()
+            .and_then(|f| f.depth.as_ref())
+            .is_some_and(|d| d.maya2.is_some())
     {
         let n = &emitter.tn;
-        let (depth, speech) =
-            maya2_depth::lm_sections(&mut m, &c, n.hn, n.frame_dcodes, n.frame_codes, &rungs);
+        let (depth, speech) = maya2_depth::lm_sections(
+            &mut m,
+            &c,
+            n.hn,
+            n.frame_dcodes,
+            n.frame_codes,
+            &rungs,
+            arch == "sm_90a",
+        );
         sections.extend(depth);
         aux_speech.add(speech);
     }

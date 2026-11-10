@@ -2667,6 +2667,62 @@ static __device__ __forceinline__ float sp_chain_sum(const float* s, unsigned n,
  * per warp is latency-bound). */
 __device__ __forceinline__ float sp_act(unsigned kind, float x, float p0, float p1);
 static __device__ __noinline__ float sp_act_call(unsigned kind, float x, float p0);
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+static __device__ __noinline__ void sp_layernorm_half(void* out, const float* __restrict__ x,
+    const float* __restrict__ gamma, const float* __restrict__ beta, unsigned rows, unsigned feat,
+    float eps, unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    if (feat == 1024) {
+        for (unsigned row = slice * PLOW_NV_WARPS + warp; row < rows; row += nblk * PLOW_NV_WARPS) {
+            float v[32];
+#pragma unroll
+            for (unsigned j = 0; j < 32; j++) v[j] = x[(size_t)row * 1024 + lane + 32 * j];
+            double sum = 0;
+#pragma unroll
+            for (unsigned j = 0; j < 32; j++) sum += v[j];
+            const float mean = (float)(sp_warp_sum_d(sum) / 1024);
+            double sq = 0;
+#pragma unroll
+            for (unsigned j = 0; j < 32; j++) { const double d = __fsub_rn(v[j], mean); sq += d * d; }
+            const float inv = __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn((float)(sp_warp_sum_d(sq) / 1024), eps)));
+#pragma unroll
+            for (unsigned j0 = 0; j0 < 32; j0 += 8) {
+                float g[8], b[8];
+#pragma unroll
+                for (unsigned j = 0; j < 8; j++) {
+                    const unsigned i = lane + 32 * (j0 + j);
+                    g[j] = gamma ? gamma[i] : 1.f;
+                    b[j] = beta ? beta[i] : 0.f;
+                }
+#pragma unroll
+                for (unsigned j = 0; j < 8; j++) {
+                    float z = __fmul_rn(__fsub_rn(v[j0 + j], mean), inv);
+                    z = __fadd_rn(__fmul_rn(z, g[j]), b[j]);
+                    ((__half*)out)[(size_t)row * 1024 + lane + 32 * (j0 + j)] = __float2half_rn(z);
+                }
+            }
+        }
+        return;
+    }
+    for (unsigned row = slice * PLOW_NV_WARPS + warp; row < rows; row += nblk * PLOW_NV_WARPS) {
+        const float* xr = x + (size_t)row * feat;
+        double sum = 0.0;
+        for (unsigned i = lane; i < feat; i += 32u) sum += xr[i];
+        const float mean = (float)(sp_warp_sum_d(sum) / feat);
+        double sq = 0.0;
+        for (unsigned i = lane; i < feat; i += 32u) {
+            const double v = __fsub_rn(xr[i], mean);
+            sq += v * v;
+        }
+        const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn((float)(sp_warp_sum_d(sq) / feat), eps)));
+        for (unsigned i = lane; i < feat; i += 32u) {
+            float v = __fmul_rn(__fsub_rn(xr[i], mean), inv);
+            v = __fadd_rn(__fmul_rn(v, gamma ? gamma[i] : 1.0f), beta ? beta[i] : 0.0f);
+            ((__half*)out)[(size_t)row * feat + i] = __float2half_rn(v);
+        }
+    }
+}
+#endif
 template <unsigned ACT>
 static __device__ __noinline__ void sp_layernorm_rows(float* __restrict__ out, const float* __restrict__ x,
                                                       const float* __restrict__ gamma, const float* __restrict__ beta,
@@ -2752,6 +2808,13 @@ static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, con
                                        unsigned rows, unsigned feat, unsigned flags, float eps,
                                        unsigned slice, unsigned nblk, float* arena, float* stats = nullptr,
                                        const float* add = nullptr) {
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+    if (flags & 8u) {
+        if (flags != 8u || stats || add || (const void*)out == (const void*)x) { __trap(); return; }
+        sp_layernorm_half(out, x, gamma, beta, rows, feat, eps, slice, nblk);
+        return;
+    }
+#endif
     arena = sp_smem;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     if (flags & 2u) {
@@ -6977,9 +7040,61 @@ static __device__ __noinline__ void sp_attention_w256(const PlowDevInst* in, voi
     }
 }
 
+#if PLOW_NV_SPEECH
+static __device__ __noinline__ void sp_attention_short(const PlowDevInst* in, void* const* T,
+                                                     unsigned slice, unsigned nblk) {
+    auto* out = (float*)SP_TEN(0);
+    const auto* query = (const float*)SP_TEN(1);
+    const auto* key = (const float*)SP_TEN(2);
+    const auto* value = (const float*)SP_TEN(3);
+    const auto* lengths = (const unsigned*)SP_TEN(4);
+    const unsigned batch = in->i[0], qr = in->i[1], kr = in->i[2], heads = in->i[3];
+    const unsigned width = heads * 64u, stride = in->i[5] ? in->i[5] : width;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    for (unsigned u = slice * PLOW_NV_WARPS + warp; u < batch * qr * heads; u += nblk * PLOW_NV_WARPS) {
+        const unsigned h = u % heads, r = u / heads % qr, b = u / (heads * qr);
+        unsigned len = lengths ? min(lengths[b], kr) : kr;
+        if (in->i[6] & 1u) len = min(len, r + 1u);
+        const size_t qoff = ((size_t)b * qr + r) * stride + h * 64u + lane;
+        const float q0 = query[qoff], q1 = query[qoff + 32u];
+        float score = -INFINITY;
+        for (unsigned j = 0; j < len; j++) {
+            const size_t off = ((size_t)b * kr + j) * stride + h * 64u + lane + in->fj[1].u;
+            float dot = __fmaf_rn(q1, key[off + 32u], __fmul_rn(q0, key[off]));
+#pragma unroll
+            for (unsigned d = 16; d; d >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, d);
+            if (lane == j) score = dot * in->fj[0].f;
+        }
+        const float mx = sp_warp_max(score);
+        float p = lane < len ? expf(score - mx) : 0.f;
+        float sum = p;
+#pragma unroll
+        for (unsigned d = 16; d; d >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, d);
+        p = sum > 0.f ? p / sum : 0.f;
+        float v0 = 0.f, v1 = 0.f;
+        for (unsigned j = 0; j < len; j++) {
+            const float w = __shfl_sync(0xffffffffu, p, j);
+            const size_t off = ((size_t)b * kr + j) * stride + h * 64u + lane + in->fj[2].u;
+            v0 = __fmaf_rn(w, value[off], v0);
+            v1 = __fmaf_rn(w, value[off + 32u], v1);
+        }
+        const size_t off = ((size_t)b * qr + r) * width + h * 64u + lane;
+        out[off] = v0;
+        out[off + 32u] = v1;
+    }
+}
+#endif
+
 static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk,
                                        float* arena) {
     arena = sp_smem;
+#if PLOW_NV_SPEECH
+    if (in->i[4] == 64u && in->i[1] <= 32u && in->i[2] <= 32u &&
+        !(in->i[6] & ~1u) && !SP_TEN(5) && !SP_TEN(6)) {
+        sp_attention_short(in, T, slice, nblk);
+        return;
+    }
+#endif
     /* flags bit 5: per-item prefix rows in t5 (requires a prefix) */
     if ((in->i[6] & 32u) && (!SP_TEN(6) || !SP_TEN(5))) __trap();
     /* flags bit 4: the prefix is pre-formatted (sp_attention_h16) */

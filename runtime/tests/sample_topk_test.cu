@@ -9,7 +9,7 @@
  * Sampling: temperatures, top_k 1..64, top_p, repetition-penalty bitmap, min-step stop mask, CFG
  * guide rows, seeds and steps.
  *
- * Build: nvcc -arch=sm_90a -O3 -I runtime/common -I runtime/nvidia runtime/tests/sample_topk_test.cu
+ * Build: nvcc -arch=sm_90a -DPLOW_NV_GUMBEL_WARP=1 -O3 -I runtime/common -I runtime/nvidia runtime/tests/sample_topk_test.cu
  *   -o sample_topk_test;  sample_topk_test [depth.f32 backbone.f32] [--bench]
  */
 #include <cuda_runtime.h>
@@ -401,6 +401,22 @@ static int gemv_case() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && !strcmp(argv[1], "--undersized-arena")) {
+        SmallArgs a{};
+        a.rows = 1;
+        a.vocab = 2048;
+        int* marker;
+        CK(cudaMalloc(&marker, sizeof(int)));
+        small_kernel<<<1, 256, row_arena(a.vocab, sizeof(float)) - 16>>>(a, marker);
+        const auto error = cudaDeviceSynchronize();
+        if (error != cudaErrorIllegalInstruction && error != cudaErrorLaunchFailure) {
+            fprintf(stderr, "FAIL undersized arena: %s\n", cudaGetErrorString(error));
+            return 1;
+        }
+        printf("PASS undersized sampler arena refused before operand access\n");
+        return 0;
+    }
+
     bool bench = false;
     std::vector<const char*> files;
     for (int i = 1; i < argc; i++) {

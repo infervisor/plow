@@ -3380,6 +3380,19 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn decode_projection_bounds_cover_wide_rungs() {
+        for rows in [160, 192, 200, 224, 256] {
+            let (g, mut tensors) = fixture(rows);
+            let s = decode_segments(&g, &tensors, &roles()).unwrap()[1].unwrap();
+            assert_eq!(s.m, rows);
+            tensors[0].bytes -= 1;
+            assert!(decode_segments(&g, &tensors, &roles()).is_err());
+        }
+        let (g, tensors) = fixture(257);
+        assert!(decode_segments(&g, &tensors, &roles()).is_err());
+    }
+
     fn prefill_fixture(rows: u32, n: u32, k: u32) -> (DevProg, Vec<DevTensor>) {
         let (mut program, mut tensors) = fixture(rows);
         let op = &mut program.insts[1];

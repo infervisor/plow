@@ -2,6 +2,9 @@
 #define PLOW_NV_PACKED_REQUEST 0
 #endif
 #include "mixed_step.h"
+#if PLOW_NV_TOKEN_BATCH_BF16
+#include "token_batch.h"
+#endif
 /* sm_120 (RTX 5090 / GB202) flash DECODE + MERGE.
  *
  * Port of runtime/amd/op_attention.h d_flash_decode / d_flash_merge to a 32-lane warp.
@@ -2356,7 +2359,12 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
                                     const int* __restrict__ decode_slot,
                                     __nv_bfloat16* __restrict__ out,
                                     unsigned* __restrict__ merge_ctr,
+#if PLOW_NV_TOKEN_BATCH_BF16
+                                    const FaNrf* __restrict__ nrf = nullptr,
+                                    const PlowTokenBatch* row_batch = nullptr) {
+#else
                                     const FaNrf* __restrict__ nrf = nullptr) {
+#endif
     constexpr bool RG = PLOW_NV_FA_RG && (D == 128 || (PLOW_NV_FA_RG_WIDE && (D == 256 || D == 512))) &&
                         GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
     /* The RG fold's [NGRP][D] + 2 * NGRP floats (fa_decode_rg_item: NGRP = warps * 32 / lanes
@@ -2405,6 +2413,14 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
         const unsigned hg = (w / nsplit) % n_grp;
         const unsigned b = w / (nsplit * n_grp);
         unsigned slot = b;
+#if PLOW_NV_TOKEN_BATCH_BF16
+        PlowTokenRow token_row{};
+        if (row_batch) {
+            if (FP8KV || SZKV || NRF || row_batch->row_capacity != n_batch) { __trap(); return; }
+            token_row = plow_token_row(row_batch, b);
+            slot = token_row.slot;
+        } else
+#endif
         if constexpr (SLOTMAP) {
             const int physical = decode_slot[b];
             if (physical < 0) __trap();
@@ -2419,7 +2435,11 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
         const unsigned h0 = hg * GF;
         const unsigned hkv = h0 / gqa;
 
+#if PLOW_NV_TOKEN_BATCH_BF16
+        const unsigned len = row_batch ? (token_row.active ? token_row.position + 1u : 0u) : (unsigned)kv_len[b];
+#else
         const unsigned len = (unsigned)kv_len[b];
+#endif
         const unsigned qpos = len - 1; /* decode: the query token is the newest one */
 
         /* This split's KV range, already clamped to the window so a sliding layer's work does
@@ -2497,7 +2517,16 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
 #if PLOW_NV_ROW_SLOT
                     else if (decode_slot) slot2 = (unsigned)decode_slot[b2] & 0x7FFFFFFFu;
 #endif
+#if PLOW_NV_TOKEN_BATCH_BF16
+                    PlowTokenRow next_row{};
+                    if (row_batch) {
+                        next_row = plow_token_row(row_batch, b2);
+                        slot2 = next_row.slot;
+                    }
+                    const unsigned len2 = row_batch ? (next_row.active ? next_row.position + 1u : 0u) : (unsigned)kv_len[b2];
+#else
                     const unsigned len2 = (unsigned)kv_len[b2];
+#endif
                     const unsigned first2 = (window && len2 > window) ? (len2 - window) : 0u;
                     const unsigned per2 = (len2 - first2 + nsplit - 1) / nsplit;
                     nlo = first2 + sp2 * per2;
@@ -3167,7 +3196,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                                const int* __restrict__ decode_slot = nullptr,
                                                __nv_bfloat16* __restrict__ out = nullptr,
                                                unsigned* __restrict__ merge_ctr = nullptr,
+#if PLOW_NV_TOKEN_BATCH_BF16
+                                               const FaNrf* __restrict__ nrf = nullptr,
+                                               const PlowTokenBatch* row_batch = nullptr) {
+#else
                                                const FaNrf* __restrict__ nrf = nullptr) {
+#endif
 #if PLOW_NV_FA_TC16
     if constexpr (FA_TC16_TAKES(D, GF, FP8KV, SZKV)) {
         static_assert(FA_TC16_SMEM_FLOATS <= (unsigned)FA_DEC_SMEM_FLOATS(512, 16),
@@ -3184,7 +3218,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
     {
         d_flash_decode_body<D, GF, FP8KV, SZKV, SLOTMAP, CLONE, NRF>(
             Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
+#if PLOW_NV_TOKEN_BATCH_BF16
+            nsplit, kv_mask, slice, nblk, lds, kv_cap, k_scale, v_scale, decode_slot, out, merge_ctr, nrf, row_batch);
+#else
             nsplit, kv_mask, slice, nblk, lds, kv_cap, k_scale, v_scale, decode_slot, out, merge_ctr, nrf);
+#endif
     }
 }
 
@@ -3194,10 +3232,19 @@ __device__ __noinline__ void d_flash_decode_slots(
     const __nv_bfloat16* V, const int* kv_len, unsigned n_batch, unsigned n_head,
     unsigned n_kv_head, unsigned kv_stride, unsigned window, float scale, unsigned nsplit,
     unsigned kv_mask, unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
+#if PLOW_NV_TOKEN_BATCH_BF16
+    const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr,
+    const PlowTokenBatch* row_batch = nullptr) {
+#else
     const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr) {
+#endif
     d_flash_decode<D, GF, false, false, true, CLONE>(
         Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
+#if PLOW_NV_TOKEN_BATCH_BF16
+        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr, nullptr, row_batch);
+#else
         nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr);
+#endif
 }
 
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).

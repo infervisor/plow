@@ -560,6 +560,7 @@ option(PLOW_CUBIN_GEMV_WIDE "Also emit the _gw decode cubin carrying the wide-ru
 # costs plain decode ~1%, so the decode objects get a `_rs` twin carrying it and plain launches keep
 # the object without it.
 option(PLOW_CUBIN_ROW_SLOT_TWIN "Also emit _rs twins of the decode cubins with PLOW_NV_ROW_SLOT=1" OFF)
+option(PLOW_CUBIN_TOKEN_BATCH_BF16 "Emit a BF16 token-batch decode object" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -658,6 +659,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     set(_ax_speech -DPLOW_NV_SPEECH=1 -DPLOW_NV_MAMBA=0)
     set(_ax_gw -DPLOW_NV_GW_OBJECT=1)
     set(_ax_rs -DPLOW_NV_ROW_SLOT=1)
+    set(_ax_token_batch_bf16 -DPLOW_NV_TOKEN_BATCH_BF16=1)
     set(_ax_gw_rs ${_ax_gw} ${_ax_rs})
     set(_ax_gw64 ${_ax_gw} -DPLOW_FP8TC_U8=2 -DPLOW_FP8TC_U8G=2)
     if(PLOW_NV_PF_GEMV_HEAD)
@@ -727,6 +729,9 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
         set(_cubin_rows
             "${_vstem}|${_ksym_dec}|_ax_decode|"
             "${_vstem}_pf|${_ksym_pf}|_ax_prefill|")
+        if(PLOW_CUBIN_TOKEN_BATCH_BF16)
+            list(APPEND _cubin_rows "${_vstem}_tb|${_ksym_dec}|_ax_decode|_ax_token_batch_bf16")
+        endif()
         if(PLOW_CUBIN_ROUTED_DECODE)
             string(LENGTH "${_vstem}_routed" _len_routed)
             list(APPEND _cubin_rows
