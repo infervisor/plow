@@ -1182,7 +1182,12 @@ fn k3_build_model(
             shared_inter: c.shared_exp * c.moe_inter,
             n_exp: c.n_exp,
             top_k: c.top_k,
-            route_flags: u32::from(c.router_sigmoid) | (u32::from(c.renormalize) << 1),
+            // `declare_k3_moe_weights` always binds `gate.e_score_correction_bias` to t[3]; the
+            // dispatch reads it only under `router_flag::BIAS` (op_moe.h bit 2), and the model
+            // selects its experts on `sigmoid(score) + bias` (the K3 oracle's `sel_key`).
+            route_flags: u32::from(c.router_sigmoid)
+                | (u32::from(c.renormalize) << 1)
+                | crate::mla::router_flag::BIAS,
             route_scale: c.route_scale,
             n_group: c.n_group,
             topk_group: c.topk_group,

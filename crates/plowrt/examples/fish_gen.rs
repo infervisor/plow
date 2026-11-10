@@ -3,7 +3,7 @@
 //! u32, the stop frame excluded) for the codec gate.
 //!
 //!   fish_gen ASSETS CKPT PROMPT.u32 OUT.u32 [--prompt-codes CODES.u32] [--frames N] [--seed S]
-//!            [--temperature T] [--top-p P] [--top-k K] [--slots N]
+//!            [--temperature T] [--top-p P] [--top-k K] [--slots N [--depth-sweep STRIDE]]
 //!
 //! PROMPT.u32 holds token ids; prompt frame rows (reference audio) take their codes from
 //! `--prompt-codes` (`[prompt rows][codebooks]`). `--top-k 1` is greedy and matches the goldens.
@@ -27,6 +27,70 @@ fn bf16(x: f32) -> f32 {
     f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
 }
 
+/// `--depth-sweep STRIDE` (with `--slots N`): the depth program of the width covering N slots
+/// timed at every STRIDE-th instruction cap (median of 20 launches, JSON lines
+/// `{"cap":..,"op":..,"blocks":..,"us":..}`, `op` the instruction cap - 1 adds), so the marginal
+/// cost of instruction i is us(cap = i + 1) - us(cap = i). Library-routed backbone rungs refuse caps.
+fn depth_sweep(
+    e: &mut GpuEngine,
+    assets: &std::path::Path,
+    rows: &[(FishRow, u32)],
+    n: usize,
+    stride: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = std::fs::read(assets.join("model.pkt"))?;
+    let blob = plowrt::asset::devblob::DevBlob::parse(&raw)?;
+    let meta = blob
+        .reserved_metadata(&raw, plow_asset::fish_depth::SECTION)?
+        .ok_or("packet has no depth stage")?;
+    let manifest: plow_asset::fish_depth::Manifest = serde_json::from_slice(meta)?;
+    let bytes = blob
+        .reserved_metadata(&raw, plow_asset::fish_depth::PROGRAMS_SECTION)?
+        .ok_or("depth programs section missing")?;
+    let section = plow_asset::aux_program::parse(bytes, blob.n_cu, blob.tensors.len())?;
+    let (k, _) = manifest
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, &r)| r as usize >= n)
+        .min_by_key(|(_, &r)| r)
+        .ok_or("no depth program covers the slots")?;
+    let insts = &section.programs[k].insts;
+    let step: Vec<FishRow> = rows
+        .iter()
+        .map(|(r, _)| FishRow {
+            hidden_row: r.slot as u32,
+            ..*r
+        })
+        .collect();
+    let mut codes = Vec::new();
+    for cap in (0..=insts.len()).step_by(stride) {
+        e.set_debug_max_inst(cap as u32, n)?;
+        let mut us: Vec<f64> = (0..23)
+            .map(|_| {
+                codes.clear();
+                let t = std::time::Instant::now();
+                e.fish_depth_step(&step, &mut codes)
+                    .map(|_| t.elapsed().as_secs_f64() * 1e6)
+            })
+            .collect::<Result<_, _>>()?;
+        us.drain(..3);
+        us.sort_by(f64::total_cmp);
+        let (op, blocks) = cap.checked_sub(1).map_or((String::new(), 0), |i| {
+            let op = packet::dev::DevOp::from_u16(insts[i].op)
+                .map_or_else(|| insts[i].op.to_string(), |o| format!("{o:?}"));
+            (op, insts[i].blocks)
+        });
+        println!(
+            "{{\"rows\":{},\"cap\":{cap},\"op\":\"{op}\",\"blocks\":{blocks},\"us\":{:.2}}}",
+            manifest.rows[k],
+            us[us.len() / 2]
+        );
+    }
+    e.set_debug_max_inst(u32::MAX, n)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 5 {
@@ -44,6 +108,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut e = GpuEngine::load(be, &assets, &PathBuf::from(&a[2]))?;
     let info = e.fish_info()?;
     let prompt = read_u32(&a[3]);
+    // A Maya 2 depth stage needs its host cb0 controller bound per slot (the checkpoint's
+    // `maya2_controller.json`, as `plowrt serve` binds it); the null speaker's depth memory.
+    let maya2 = std::fs::read_to_string(PathBuf::from(&a[2]).join("maya2_controller.json"))
+        .ok()
+        .map(|s| plowrt::tts::maya2::Controller::parse(&s))
+        .transpose()?
+        .map(|c| c.plan("fish_gen timing prompt", "en", Some(frames), c.cb0, seed));
     if let Some(p) = opt("--prompt-codes") {
         e.fish_prompt_codes(&read_u32(&p))?;
     }
@@ -53,6 +124,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for slot in 0..n {
             e.begin_slot(slot, prompt.len() + frames + 1)?;
             e.fish_reset_slot(slot)?;
+            if let Some(p) = maya2 {
+                e.maya2_bind(slot, p, None)?;
+            }
             e.prefill_slot(slot, &prompt)?;
             e.fish_logits_to_slot(slot)?;
             let row = FishRow {
@@ -112,10 +186,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (backbone + depth) * 1e3 / f,
             n as f64 * f / (backbone + depth)
         );
+        if let Some(stride) = opt("--depth-sweep").map(|v| v.parse::<usize>().unwrap().max(1)) {
+            if maya2.is_some() {
+                // Its depth programs launch from the speech module, which the cap does not reach.
+                return Err(
+                    "--depth-sweep: the instruction cap does not reach Maya 2 depth programs"
+                        .into(),
+                );
+            }
+            depth_sweep(&mut e, &assets, &rows, n, stride)?;
+        }
         return Ok(());
     }
     e.begin_slot(0, prompt.len() + frames + 1)?;
     e.fish_reset_slot(0)?;
+    if let Some(p) = maya2 {
+        e.maya2_bind(0, p, None)?;
+    }
     let t0 = std::time::Instant::now();
     e.prefill_slot(0, &prompt)?;
     e.fish_logits_to_slot(0)?;

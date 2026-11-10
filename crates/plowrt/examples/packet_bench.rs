@@ -5,6 +5,7 @@
 //! us(cap = i + 1) - us(cap = i). With `--each` and ROLE a prefix, every program
 //! of the role sequence `ROLE.<n>` is timed alone (JSON lines `{"role":..,"program":..,"us":..}`);
 //! with `--seq` the whole sequence is timed as one CUDA graph.
+//! `PB_IN=NAME=FILE,..` writes raw little-endian inputs (zero-padded) before timing.
 //! `PB_PRE=ROLE,..` runs those programs once first (e.g. the encoder, so a CFM program sees real
 //! key lengths instead of zeroed inputs).
 //! `PB_STEP_FRAMES=N` fills every `stream.n.K` with N * `lengths.K.rows_per_frame` (a stateful
@@ -89,6 +90,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rpf = pipeline.parameter(&format!("lengths.{k}.rows_per_frame"))? as u32;
             let t = pipeline.tensor(&format!("stream.n.{k}"))?;
             rt.write_tensor(t, bytemuck::cast_slice(&vec![n * rpf; t.bytes / 4]))?;
+        }
+    }
+    // `PB_IN=NAME=FILE,..`: representative inputs (a sampler with zeroed controls skips its draw).
+    if let Ok(list) = std::env::var("PB_IN") {
+        for spec in list.split(',').filter(|s| !s.is_empty()) {
+            let (name, file) = spec
+                .split_once('=')
+                .ok_or(format!("PB_IN {spec}: expected NAME=FILE"))?;
+            let t = match pipeline.tensor(name) {
+                Ok(t) => t,
+                Err(_) => rt.tensor(name).ok_or(format!("no tensor {name}"))?,
+            };
+            let mut bytes = std::fs::read(file)?;
+            if bytes.len() > t.bytes {
+                return Err(format!(
+                    "{file}: {} bytes exceed the tensor ({})",
+                    bytes.len(),
+                    t.bytes
+                )
+                .into());
+            }
+            bytes.resize(t.bytes, 0);
+            rt.write_tensor(t, &bytes)?;
         }
     }
     if let Ok(pre) = std::env::var("PB_PRE") {

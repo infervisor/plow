@@ -2,6 +2,33 @@ use super::*;
 use crate::asset::devblob::{DevProg, DevSection, DevTensor};
 
 #[test]
+#[ignore = "SPEECH_BATCH_TEST_ASSETS; CPU-only saved 80GB device plan, no context narrowing"]
+fn content_keyed_overlay_plan_keeps_the_8k_rung_within_saved_device_capacity() {
+    let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+    let image = crate::asset::packet_image::PacketImage::open_in_dir(&assets)
+        .unwrap()
+        .unwrap();
+    assert!(image.blob.prefill_progs().iter().any(|p| p.t == 8192));
+    let mut config = RuntimeConfig::get().clone();
+    config.prefix_cache = true;
+    config.nv.vmm_prefix = Some(true);
+    config.nv.vmm_live = true;
+    let config = Box::leak(Box::new(config));
+    crate::config::scoped(Some(config), || {
+        let raw = crate::serve::manager::BlobPlan::from_dir(&assets).unwrap();
+        let plan = crate::serve::manager::BlobPlan::from_dir_with_device(
+            &assets,
+            Some((64 << 10, (9, 0))),
+            Some(&assets.join("checkpoint")),
+        )
+        .unwrap();
+        eprintln!("compiled={raw:?} mapped={plan:?}");
+        assert!(plan.kv_bytes < raw.kv_bytes);
+        assert!(plan.required(plan.overhead_bound) + crate::serve::manager::RESERVE <= 81081 << 20);
+    });
+}
+
+#[test]
 fn long_context_live_kv_uses_reserved_ring_windows() {
     assert!(!live_rings_for_capacity(None, true, Some(65_536), Some(32)));
     assert!(live_rings_for_capacity(None, true, Some(131_072), Some(16)));
@@ -118,7 +145,8 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     cfg.prefix_cache = true;
     let selected = |blob: &DevBlob, cfg: &RuntimeConfig, cc, gran| {
         let kv = plow_asset::serve_manifest::KvGeometry::from_config(&dir);
-        GpuEngine::select_vmm_prefix_layout(blob, kv.as_ref(), cfg, cc, gran, Some(false)).is_some()
+        GpuEngine::select_vmm_prefix_layout(blob, kv.as_ref(), cfg, cc, gran, Some(false), false)
+            .is_some()
     };
     assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
     assert!(selected(&blob, &cfg, (12, 0), 2 << 20));
@@ -189,6 +217,20 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     blob.tensors.push(tensor("kv.1.v_scale", 4096 * 4));
     cfg.nv.vmm_prefix = Some(true);
     assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
+    blob.tensors.push(tensor("in.encoder_overlay", 4));
+    assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+    let kv = plow_asset::serve_manifest::KvGeometry::from_config(&dir);
+    assert!(GpuEngine::select_vmm_prefix_layout(
+        &blob,
+        kv.as_ref(),
+        &cfg,
+        (9, 0),
+        2 << 20,
+        Some(false),
+        true,
+    )
+    .is_some());
+    blob.tensors.pop();
     let mut geometry: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
     geometry["num_key_value_heads"] = 0.into();
@@ -259,8 +301,16 @@ fn automatic_prefix_selection_covers_dense_hd128() {
     cfg.prefix_cache = true;
     let kv = plow_asset::serve_manifest::KvGeometry::from_config(&dir);
     let selected = |cfg: &RuntimeConfig, cc| {
-        GpuEngine::select_vmm_prefix_layout(&blob, kv.as_ref(), cfg, cc, 2 << 20, Some(false))
-            .is_some()
+        GpuEngine::select_vmm_prefix_layout(
+            &blob,
+            kv.as_ref(),
+            cfg,
+            cc,
+            2 << 20,
+            Some(false),
+            false,
+        )
+        .is_some()
     };
     // One head window (8192 rows x 256 B) is one 2 MiB granule.
     assert!(selected(&cfg, (12, 0)));

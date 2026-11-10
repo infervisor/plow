@@ -2766,6 +2766,8 @@ pub struct GpuEngine {
     /// Wide-rung object selected for the widest decode chain.
     gemv_wide: Option<Arc<decode_object::BoundDecodeObject>>,
     gemv_wide_modules: [Option<Arc<decode_object::BoundDecodeObject>>; 2],
+    /// The `_gw` object at its full claim for depth programs below its wide-arm rung.
+    depth_gw: Option<(usize, Arc<decode_object::BoundDecodeObject>)>,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, tensor-table base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
@@ -2926,6 +2928,7 @@ pub struct GpuEngine {
     /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
     /// prefill chunk never attaches a cached prefix.
     prefix_attach_off: Vec<bool>,
+    prefix_needs_row_keys: bool,
     /// The slot was seated from a KV image ([`Self::import_kv_image`]): its rings hold only the
     /// image's window, so it publishes no boundary to the prefix cache until `begin_slot`.
     publish_off: Vec<bool>,
@@ -4485,6 +4488,8 @@ impl GpuEngine {
             blob.with_packet_view(|p| pack.validate(p, live))
                 .map_err(RuntimeError::Rejected)?;
         }
+        let keyed_overlays = crate::tts::SpeechContract::load(assets_dir)?
+            .is_some_and(|c| c.depth && c.slot_prefix_reuse);
         let prefix_layout = crate::memory::vmm::VmmOps::granularity(be.as_ref())
             .ok()
             .and_then(|granularity| {
@@ -4497,6 +4502,7 @@ impl GpuEngine {
                     live_kv_manifest
                         .as_ref()
                         .map_or(Some(false), |m| m.full_rows_interleaved()),
+                    keyed_overlays,
                 )
             });
         let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());
@@ -8004,6 +8010,9 @@ impl GpuEngine {
                 gemv_wide.as_ref().map(|(_, (_, full))| Arc::clone(full)),
                 gemv_wide64.as_ref().map(|(_, full)| Arc::clone(full)),
             ],
+            depth_gw: gemv_wide
+                .as_ref()
+                .map(|(min_rows, (_, full))| (*min_rows, Arc::clone(full))),
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
@@ -8070,6 +8079,7 @@ impl GpuEngine {
             staged_speech_prefix: vec![None; batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
+            prefix_needs_row_keys: blob.tensors.iter().any(|t| t.name == "in.encoder_overlay"),
             publish_off: vec![false; batch],
             session_end: vec![false; batch],
             disconnected: vec![false; batch],
@@ -9183,10 +9193,12 @@ impl GpuEngine {
         }
         let identities = self.staged_speech_prefix[b].clone();
         let cache_prompt = identities.as_deref().unwrap_or(prompt);
+        let keyed = !self.prefix_needs_row_keys || identities.is_some();
         // In-flight sharing: another slot is prefilling this prompt's shared prefix. Wait
         // for its whole-block checkpoint (one attach + the tail) instead of recomputing the
         // shared rows beside it; bounded, and released when the owner publishes or retires.
         if self.vmm_prefix_enabled()
+            && keyed
             && !self.prefix_attach_off[b]
             && crate::config::RuntimeConfig::get().prefix_inflight_wait()
         {
@@ -9213,7 +9225,7 @@ impl GpuEngine {
                 }
             }
         }
-        if self.vmm_prefix_enabled() && self.pos[b] == 0 && !self.prefix_attach_off[b] {
+        if self.vmm_prefix_enabled() && keyed && self.pos[b] == 0 && !self.prefix_attach_off[b] {
             let since = match self.packed_admission[b] {
                 PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
                     since

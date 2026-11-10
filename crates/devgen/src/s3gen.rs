@@ -166,6 +166,10 @@ struct Config {
     audio_limit: f32,
     /// Voice caches pre-formatted for the 3xFP16 cached attention (`PLOW_EMIT_S3GEN_ATTN_H16`).
     attn_h16: bool,
+    /// CFM transformer-block activations handed to their GEMMs as split-bf16 images
+    /// (`PLOW_EMIT_S3GEN_SPLIT_A`, sm_90a): LayerNorm -> qkv / ff1, attention -> out (cached
+    /// h16 path), ff1 -> ff2. Same products and order: bit-identical.
+    split_a: bool,
     /// Voice slots' prompt capacity (tokens) and count; 0 slots = none.
     prompt_max: u32,
     clone_slots: u32,
@@ -246,6 +250,7 @@ impl Config {
             trim: u(v, "trim")?,
             audio_limit: f("audio_limit")?,
             attn_h16: false,
+            split_a: false,
             prompt_max: v["prompt_max"].as_u64().unwrap_or(0) as u32,
             clone_slots: v["clone_slots"].as_u64().unwrap_or(0) as u32,
             cache_slots: v["cache_slots"].as_u64().unwrap_or(0) as u32,
@@ -308,6 +313,7 @@ pub fn lower_s3gen(
     target: u32,
     sites: Option<&RewriteSites>,
     attn_h16: bool,
+    split_a: bool,
 ) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
     let mut cfg = Config::parse(
         &serde_json::from_slice(
@@ -332,6 +338,7 @@ pub fn lower_s3gen(
         return Err("unsupported S3Gen export".into());
     }
     cfg.attn_h16 = attn_h16;
+    cfg.split_a = split_a;
     let caps: Vec<(u32, u32)> = S3GEN_CAPACITIES
         .iter()
         .copied()
@@ -808,9 +815,38 @@ impl<'s> Ops<'s> {
                     weight_split: split,
                     dual_alpha: false,
                     pinned: false,
+                    wgmma_ragged: false,
+                    input_split: c.in_split,
+                    output_split: c.out_split,
                 },
             )
         })
+    }
+
+    /// `linear` whose input is a split-bf16 image (`in_split`) and whose output leaves as one
+    /// (`out_split`), for the CFM transformer block under `Config::split_a`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_split(
+        &mut self,
+        x: u32,
+        out: &str,
+        w: &str,
+        rows: u32,
+        cin: u32,
+        cout: u32,
+        bias: bool,
+        act: Activation,
+        residual: Option<u32>,
+        in_split: bool,
+        out_split: bool,
+    ) -> Result<u32, String> {
+        let mut c = Conv::new(w, 1, rows, cin, cout, 1);
+        c.bias = bias;
+        c.act_out = act;
+        c.residual = residual;
+        c.in_split = in_split;
+        c.out_split = out_split;
+        self.conv(x, out, c)
     }
 
     /// Row-wise linear layer `out = x W^T (+ b) (+ residual)` over `rows` rows.
@@ -842,7 +878,7 @@ impl<'s> Ops<'s> {
         width: u32,
         epsilon: f32,
     ) -> Result<u32, String> {
-        self.layer_norm_act(x, out, w, rows, width, epsilon, Activation::None, None)
+        self.layer_norm_act(x, out, w, rows, width, epsilon, Activation::None, None, false)
     }
 
     /// `layer_norm`, then `act`, then `+ add` (a `[width]` weight row), in one op.
@@ -856,6 +892,7 @@ impl<'s> Ops<'s> {
         epsilon: f32,
         act: Activation,
         add: Option<&str>,
+        split: bool,
     ) -> Result<u32, String> {
         let (g, b) = (format!("w.{w}.g"), format!("w.{w}.b"));
         let add = add.map(|a| format!("w.{a}"));
@@ -872,6 +909,7 @@ impl<'s> Ops<'s> {
                     epsilon,
                     activation: act,
                     add_row: add.as_deref().map(TensorRef::Named),
+                    output_split: split,
                 },
             )
         })
@@ -1167,6 +1205,9 @@ struct Conv<'a> {
     transpose: bool,
     /// `x` is dead after this conv, so an unfused input activation may overwrite it.
     input_is_temp: bool,
+    /// `x` is a split-bf16 image (Conv1dF32 flag bit 30); the output leaves as one (bit 31).
+    in_split: bool,
+    out_split: bool,
 }
 
 impl<'a> Conv<'a> {
@@ -1193,6 +1234,8 @@ impl<'a> Conv<'a> {
             residual: None,
             transpose: false,
             input_is_temp: false,
+            in_split: false,
+            out_split: false,
         }
     }
 }
@@ -2050,6 +2093,7 @@ impl Lowering<'_> {
             1e-5,
             Activation::Mish,
             Some(&tv),
+            false,
         )?;
         let mut c = Conv::new(&c2, b2, t1, D_CFM, D_CFM, 3);
         c.pad = (2, 0);
@@ -2064,6 +2108,7 @@ impl Lowering<'_> {
             1e-5,
             Activation::Mish,
             None,
+            false,
         )?;
         let mut c = Conv::new(&res, b2, t1, cin, D_CFM, 1);
         c.lengths = Some(len2);
@@ -2078,8 +2123,22 @@ impl Lowering<'_> {
         let inner = HEADS * 64;
         let p = format!("cfm.tb{k}");
         let hn = o.name_of(h);
-        let a = o.layer_norm(h, "act.s3gen.a", &format!("{p}.ln1"), r, D_CFM, 1e-5)?;
-        let qkv = o.linear(
+        // Split-image hand-offs (Config::split_a): LN1 -> qkv, LN3 -> ff1, ff1 -> ff2 everywhere;
+        // attention -> out only on the pre-formatted (h16) cached path, which writes the image.
+        let split = self.cfg.split_a;
+        let att_split = split && self.cfg.attn_h16 && self.mode.cached();
+        let a = o.layer_norm_act(
+            h,
+            "act.s3gen.a",
+            &format!("{p}.ln1"),
+            r,
+            D_CFM,
+            1e-5,
+            Activation::None,
+            None,
+            split,
+        )?;
+        let qkv = o.linear_split(
             a,
             "act.s3gen.qkv",
             &format!("{p}.qkv"),
@@ -2089,6 +2148,8 @@ impl Lowering<'_> {
             false,
             Activation::None,
             None,
+            split,
+            false,
         )?;
         let pp = self.cached_rows();
         let (cache, nv2) = self.cache(step, k);
@@ -2195,13 +2256,14 @@ impl Lowering<'_> {
                             rows: pp,
                             h16: self.cfg.attn_h16,
                             rows_per_item: pre,
+                            split_out: att_split,
                         }),
                         window: 0,
                         stream: None,
                     },
                 )
             })?;
-            return self.tblock_tail(o, &p, att, h, &hn, r);
+            return self.tblock_tail(o, &p, att, h, &hn, r, att_split);
         }
         let att = o.op(&[qkv, len2], "act.s3gen.att", |pp, output, deps| {
             pp.attention_f32(
@@ -2232,10 +2294,12 @@ impl Lowering<'_> {
                 },
             )
         })?;
-        self.tblock_tail(o, &p, att, h, &hn, r)
+        self.tblock_tail(o, &p, att, h, &hn, r, false)
     }
 
-    /// Attention output projection and feed-forward of block `p`, in place on `h`.
+    /// Attention output projection and feed-forward of block `p`, in place on `h`; `att_split`:
+    /// the attention wrote its output as a split image.
+    #[allow(clippy::too_many_arguments)]
     fn tblock_tail(
         &self,
         o: &mut Ops,
@@ -2244,9 +2308,11 @@ impl Lowering<'_> {
         h: u32,
         hn: &str,
         r: u32,
+        att_split: bool,
     ) -> Result<(), String> {
         let inner = HEADS * 64;
-        o.linear(
+        let split = self.cfg.split_a;
+        o.linear_split(
             att,
             hn,
             &format!("{p}.out"),
@@ -2256,9 +2322,21 @@ impl Lowering<'_> {
             true,
             Activation::None,
             Some(h),
+            att_split,
+            false,
         )?;
-        let a = o.layer_norm(h, "act.s3gen.a", &format!("{p}.ln3"), r, D_CFM, 1e-5)?;
-        let f = o.linear(
+        let a = o.layer_norm_act(
+            h,
+            "act.s3gen.a",
+            &format!("{p}.ln3"),
+            r,
+            D_CFM,
+            1e-5,
+            Activation::None,
+            None,
+            split,
+        )?;
+        let f = o.linear_split(
             a,
             "act.s3gen.ff",
             &format!("{p}.ff1"),
@@ -2268,8 +2346,10 @@ impl Lowering<'_> {
             true,
             Activation::GeluErf,
             None,
+            split,
+            split,
         )?;
-        o.linear(
+        o.linear_split(
             f,
             hn,
             &format!("{p}.ff2"),
@@ -2279,6 +2359,8 @@ impl Lowering<'_> {
             true,
             Activation::None,
             Some(h),
+            split,
+            false,
         )?;
         Ok(())
     }

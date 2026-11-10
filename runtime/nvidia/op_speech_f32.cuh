@@ -65,6 +65,18 @@ __device__ __forceinline__ constexpr bool sp_post_on(unsigned p) {
 #define SPF_HD128 1
 #endif
 static_assert(SP_ARENA_FLOATS >= SPG_SMEM_FLOATS, "speech arena");
+/* The speech object's dynamic claim. A packet whose convs read split-image activations
+ * (PLOW_SPEECH_SPLIT_A, sp_wgi_gemm) needs a two-stage [A | B] ring of 128x128 tiles (2 x 64 KiB)
+ * plus bias and alignment; the other arms keep deciding their staging on SP_ARENA_FLOATS, so only
+ * the launch claims more (one block per SM either way at 255 registers). */
+#ifndef PLOW_SPEECH_SPLIT_A
+#define PLOW_SPEECH_SPLIT_A 0
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_SPLIT_A
+#define SP_LAUNCH_ARENA_FLOATS 33280
+#else
+#define SP_LAUNCH_ARENA_FLOATS SP_ARENA_FLOATS
+#endif
 
 /* The arena is the dynamic shared memory base (interp_sm120.cu's `arena`, the test kernel's). The
  * op functions are __noinline__ and receive it as a generic pointer; rebinding it to this symbol
@@ -478,7 +490,7 @@ __device__ __forceinline__ bool sp_aligned(const void* p, unsigned bytes) {
 #define SPT_BM 64
 #define SPT_BN 64
 #define SPT_TICKETS 1024
-/* Tickets of the pinned convs' own split-K scratch (scratch.conv_f32_splitk, flags bits 24..31). */
+/* Tickets of the pinned convs' own split-K scratch (scratch.conv_f32_splitk, flags bits 24..29). */
 #define SPC_TICKETS 4096u
 template <bool TF32>
 struct SpTc {
@@ -1240,6 +1252,41 @@ __device__ __forceinline__ void sp_split4(__nv_bfloat16* hi, __nv_bfloat16* lo, 
 __device__ __forceinline__ float4 sp_ldg4z(const float* p) {
     return p ? __ldg((const float4*)p) : make_float4(0.f, 0.f, 0.f, 0.f);
 }
+#if PLOW_SPEECH_SPLIT_A
+/* The split image of an activation [M rows][K] (Conv1dF32 flags bit 30 reads one, bit 31 writes
+ * one; LayerNormF32 flags bit 2 and AttentionF32 flags bit 7 write one): the layout of the
+ * wgmma weight image (devgen `wgmma_weight_split`) over rows instead of weights. Per 64-column
+ * k-tile the bf16 hi halves then the lo halves of all M rows, each row 128 bytes whose 16-byte
+ * chunk c sits at c ^ (row & 7); the same bytes as the f32 tensor. Column c of row m: */
+__device__ __forceinline__ char* spwg_img_at(char* img, unsigned M, unsigned m, unsigned c) {
+    return img + (size_t)(c >> 6) * (2u * (size_t)M * 128u) + (size_t)m * 128u + ((((c >> 3) & 7u) ^ (m & 7u)) << 4) +
+           (c & 7u) * 2u;
+}
+/* Columns c..c+3 (c % 4 == 0) of row m, split as sp_split4 splits a loaded f32 operand. The
+ * low half is an explicit rn subtraction: v comes from registers here, and a contraction of the
+ * producer's last multiply into this subtraction would differ from splitting the stored f32. */
+__device__ __forceinline__ void spwg_img_store4(char* img, unsigned M, unsigned m, unsigned c, float4 v) {
+    __nv_bfloat16* hi = (__nv_bfloat16*)spwg_img_at(img, M, m, c);
+    const __nv_bfloat162 h0 = __floats2bfloat162_rn(v.x, v.y), h1 = __floats2bfloat162_rn(v.z, v.w);
+    const float2 f0 = __bfloat1622float2(h0), f1 = __bfloat1622float2(h1);
+    const __nv_bfloat162 l0 = __floats2bfloat162_rn(__fsub_rn(v.x, f0.x), __fsub_rn(v.y, f0.y));
+    const __nv_bfloat162 l1 = __floats2bfloat162_rn(__fsub_rn(v.z, f1.x), __fsub_rn(v.w, f1.y));
+    uint2 uh, ul;
+    uh.x = *(const unsigned*)&h0; uh.y = *(const unsigned*)&h1;
+    ul.x = *(const unsigned*)&l0; ul.y = *(const unsigned*)&l1;
+    *(uint2*)hi = uh;
+    *(uint2*)(hi + (size_t)M * 64u) = ul;
+}
+/* Columns c, c + 1 (c even) of row m: the same per-element split. */
+__device__ __forceinline__ void spwg_img_store2(char* img, unsigned M, unsigned m, unsigned c, float2 v) {
+    const __nv_bfloat162 h = __floats2bfloat162_rn(v.x, v.y);
+    const float2 f = __bfloat1622float2(h);
+    const __nv_bfloat162 l = __floats2bfloat162_rn(__fsub_rn(v.x, f.x), __fsub_rn(v.y, f.y));
+    char* p = spwg_img_at(img, M, m, c);
+    *(__nv_bfloat162*)p = h;
+    *(__nv_bfloat162*)(p + (size_t)M * 128u) = l;
+}
+#endif
 template <unsigned BN, class LA, class LB>
 static __device__ __forceinline__ void sp_w_tile(unsigned m0, unsigned n0, unsigned M, unsigned N, unsigned K,
                                                  const LA& la, const LB& lb, float* arena,
@@ -2685,6 +2732,13 @@ static __device__ __noinline__ void sp_layernorm_rows(float* __restrict__ out, c
                     if (add) t = __fadd_rn(t, aa[q]);
                     y[q] = flags & 1u ? sp_bf16(t) : t;
                 }
+#if PLOW_SPEECH_SPLIT_A
+                /* flags bit 2: the output is the split image of these rows (feat % 64 == 0). */
+                if (flags & 4u) {
+                    spwg_img_store4((char*)out, rows, row0 + r, c, make_float4(y[0], y[1], y[2], y[3]));
+                    continue;
+                }
+#endif
                 *(float4*)(out + (size_t)(row0 + r) * feat + c) = make_float4(y[0], y[1], y[2], y[3]);
             }
         }
@@ -4051,14 +4105,17 @@ struct SpConvArgs {
     float* splitk;
     unsigned batch, in_rows, cin, cout, kernel, stride, dil, groups, cg, ng, before, after, mode, pre,
         post, wf16, tapmajor, phasemajor, ptaps, out_rows, opad, cg_mul, cg_shift;
-    /* Flags bits 21..31: bit 0 the emitter pinned this conv's arms per shape class (nothing below
+    /* Flags bits 21..29: bit 0 the emitter pinned this conv's arms per shape class (nothing below
      * may choose by M or nblk), bit 1 FFMA 128x128 tiles instead of 3xTF32, bit 2 a 128-wide
-     * wide / wgmma tile instead of 64, bits 3..10 the split-K parts (0: unsplit; with flags bit
+     * wide / wgmma tile instead of 64, bits 3..8 the split-K parts (0: unsplit; with flags bit
      * 20, t7 is the conv-own scratch of SPC_TICKETS tickets then the partials). */
     unsigned pin;
     __device__ bool pinned() const { return pin & 1u; }
     __device__ unsigned pin_bn() const { return pin & 4u ? 128u : 64u; }
-    __device__ unsigned pin_parts() const { return pin >> 3; }
+    __device__ unsigned pin_parts() const { return (pin >> 3) & 63u; }
+    /* flags bit 3: the wgmma tiles may span taps (Conv1d cin % 64 != 0) or phases (ConvTranspose1d
+     * cout % 64 != 0); widths stay % 4, so one thread's float4 never does. */
+    unsigned ragged;
     float slope;
     /* c / cg for c < 2^31 (Granlund-Montgomery; the tap index of a GEMM column). */
     __device__ unsigned div_cg(unsigned c) const { return (__umulhi(c, cg_mul) + c) >> cg_shift; }
@@ -4115,8 +4172,9 @@ __device__ __forceinline__ bool sp_conv_args(const PlowDevInst* in, void* const*
     const unsigned flags = in->fj[2].u;
     a.mode = transpose ? 0u : flags & 3u;
     a.pre = (flags >> 4) & 15u; a.post = (flags >> 8) & 15u; a.wf16 = (flags >> 12) & 1u;
-    a.pin = flags >> 21;
+    a.pin = (flags >> 21) & 0x1FFu;
     a.tapmajor = transpose ? 0u : (flags >> 15) & 1u;
+    a.ragged = (flags >> 3) & 1u;
     /* ConvTranspose1d flags bit 15: weights [stride][cout][ceil(kernel/stride)][cg], one phase's
      * (tap, channel) columns contiguous per output channel (taps past the kernel are zero). */
     a.phasemajor = transpose ? (flags >> 15) & 1u : 0u;
@@ -4726,7 +4784,8 @@ __device__ __forceinline__ const float* spwg_wsplit(const SpConvArgs& a) {
 /* CT: a merged-phase ConvTranspose1d (kernel 2*stride, phase-major weights): row m = (b, q) of
  * ep.n_p rows per item, column n = (phase, o), k = (tap, ci) reading input row q - tap; output
  * row t = q*stride + phase - before, stores skipped outside [0, out_rows), zero past convt_len.
- * BN divides cout, so a tile is one phase. */
+ * A tile is one phase when BN divides cout, else (flag bit 3, cout % 4 == 0, cout >= BN) it spans at
+ * most two: per-segment liveness, bias and stores. */
 template <unsigned BN, bool TAPS, unsigned P, bool GR = false, bool CT = false, bool SK = false, bool CHANNEL_TILED = false>
 static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsigned K, const float* x, const float* w,
                                                   const SpConvEpi1& ep, unsigned slice, unsigned nblk,
@@ -4760,7 +4819,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
      * and runs the epilogue. */
     static_assert(!SK || (BN == 64u && !GR && !CT), "split-K tile");
     static_assert(!CHANNEL_TILED || (TAPS && !GR && !CT && !SK), "channel-tiled conv");
-    /* Pinned (flags bits 24..31): P parts cut nk into chunks of ceil(nk / P) k-tiles, S =
+    /* Pinned (flags bits 24..29): P parts cut nk into chunks of ceil(nk / P) k-tiles, S =
      * ceil(nk / chunk) (no empty part), the same at every M and nblk; else the legacy
      * nblk-derived count over the dense scratch. */
     unsigned chunk = nk, S = 1u;
@@ -4778,18 +4837,20 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     for (unsigned item = slice; item < tiles * S; item += nblk) {
         const unsigned tile = item / S, part = item - tile * S, kb = part * chunk, ke = min(nk, kb + chunk);
         const unsigned mg = tile / tn, gi = GR ? mg % G : 0u, m0 = (GR ? mg / G : mg) * 128u, n0 = (tile % tn) * BN,
-                       og = gi * N, ph = CT ? n0 / a.cout : 0u, col = CT ? n0 - ph * a.cout : og + n0;
-        /* CT: row m's output base; geo = inside the output geometry, live = also within convt_len. */
-        auto ct_base = [&](unsigned m, bool& geo, bool& live) {
+                       og = gi * N, ph = CT ? n0 / a.cout : 0u, col = CT ? n0 - ph * a.cout : og + n0,
+                       cb = CT ? min(BN, (ph + 1u) * a.cout - n0) : BN; /* CT: columns >= cb are phase ph + 1 */
+        /* CT: row m's output base in phase q; geo = inside the output geometry, live = also within convt_len. */
+        auto ct_base = [&](unsigned m, unsigned q, bool& geo, bool& live) {
             const unsigned b = m / ep.n_p;
-            const int t = (int)((m - b * ep.n_p) * a.stride + ph) - (int)a.before;
+            const int t = (int)((m - b * ep.n_p) * a.stride + q) - (int)a.before;
             geo = t >= 0 && t < (int)a.out_rows;
             live = geo && t < a.convt_len(b);
             return ((size_t)b * a.out_rows + (geo ? (unsigned)t : 0u)) * a.cout;
         };
         /* B rows (tap-major weights) are contiguous: row n at w + n * K. Pointwise A rows too: row m
-         * at x + m * K. With taps, a k-tile lies in one tap (cin % 64 == 0) and A row m of item b,
-         * output row t, reads input row t + tap * dil - before of b (zero outside its length).
+         * at x + m * K. With taps, A row m of item b, output row t, reads input row t + tap * dil -
+         * before of b (zero outside its length); a k-tile lies in one tap when cin % 64 == 0, else
+         * (flag bit 3, cin % 4 == 0) each float4 resolves its own tap.
          * Rows past M or N read nothing (their outputs are not stored). */
         const float* xa = x + (size_t)(m0 + sr) * lda + gi * K + sc;
         const float* wb = w + (size_t)(og + n0 + sr) * K + sc;
@@ -4814,13 +4875,14 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             const unsigned k = kt * SPWG_BK;
             const bool kin = k + sc < K;
             if constexpr (TAPS) {
-                const unsigned tap = CHANNEL_TILED ? kt % a.kernel : k / a.cin,
-                               ci = CHANNEL_TILED ? kt / a.kernel * 64u : k - tap * a.cin;
+                /* Unless channel-tiled, the tap of this thread's 4 columns (a ragged k-tile spans taps). */
+                const unsigned kk = k + sc, tap = CHANNEL_TILED ? kt % a.kernel : a.div_cg(kk);
+                const ptrdiff_t ci = CHANNEL_TILED ? (ptrdiff_t)(kt / a.kernel * 64u) : (ptrdiff_t)(kk - tap * a.cin) - (ptrdiff_t)sc;
 #pragma unroll
                 for (unsigned p = 0; p < 8; p++) {
                     const int u = CT ? t0[p] - (int)tap : t0[p] + (int)(tap * a.dil);
                     float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-                    if (kin && (unsigned)u < (unsigned)len[p]) v = __ldg((const float4*)(xb[p] + (size_t)u * a.cin + ci));
+                    if (kin && (unsigned)u < (unsigned)len[p]) v = __ldg((const float4*)(xb[p] + (ptrdiff_t)u * a.cin + ci));
                     if (leaky) {
                         v.x = v.x >= 0.0f ? v.x : __fmul_rn(v.x, a.slope); v.y = v.y >= 0.0f ? v.y : __fmul_rn(v.y, a.slope);
                         v.z = v.z >= 0.0f ? v.z : __fmul_rn(v.z, a.slope); v.w = v.w >= 0.0f ? v.w : __fmul_rn(v.w, a.slope);
@@ -4859,7 +4921,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             sm90_cp_commit();
         };
         load(kb);
-        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + col + tid) : 0.f;
+        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + (CT ? (n0 + tid) % a.cout : col + tid)) : 0.f;
         if (pending) {
             asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
             pending = false;
@@ -4955,14 +5017,18 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
          * issued before the first use); the tile staged row-major. */
         const unsigned rw = wg * 64u + (warp & 3u) * 16u + (lane >> 2), cw = 2u * (lane & 3u);
         size_t base[2];
-        bool ok[2];
+        bool ok[2], ok1[2] = {false, false};
 #pragma unroll
         for (unsigned h = 0; h < 2; h++) {
             const unsigned m = m0 + rw + 8u * h;
             if constexpr (CT) {
                 bool geo = false, live = false;
-                base[h] = m < M ? ct_base(m, geo, live) : 0;
+                base[h] = m < M ? ct_base(m, ph, geo, live) : 0;
                 ok[h] = m < M && live;
+                if (cb < BN && m < M) {
+                    ct_base(m, ph + 1u, geo, live);
+                    ok1[h] = live;
+                }
                 continue;
             }
             base[h] = m < M ? ep.row_base(m) : 0;
@@ -4988,7 +5054,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
 #pragma unroll
             for (unsigned h = 0; h < 2; h++) {
                 float2 y = make_float2(0.f, 0.f);
-                if (ok[h] && on) {
+                if ((CT && c >= cb ? ok1[h] : ok[h]) && on) {
                     if constexpr (P == 4u) {
                         y.x = sp_snake_beta(__fadd_rn(acc[4u * g + 2u * h], bias.x), alpha.x, beta.x);
                         y.y = sp_snake_beta(__fadd_rn(acc[4u * g + 2u * h + 1u], bias.y), alpha.y, beta.y);
@@ -5010,9 +5076,19 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
         if (tid < 128u && m0 + tid < M) {
             const unsigned m = m0 + tid, cols = min(BN, N - n0);
             bool geo = true, live;
-            size_t base = CT ? ct_base(m, geo, live) : ep.row_base(m);
-            if ((long long)base < 0) base = ~base;
-            if (geo) spwg_bulk_store(a.out + base + col, stage + tid * LDO, cols * 4u);
+            if constexpr (CT) {
+                const unsigned c0 = min(cb, cols);
+                size_t base = ct_base(m, ph, geo, live);
+                if (geo) spwg_bulk_store(a.out + base + col, stage + tid * LDO, c0 * 4u);
+                if (c0 < cols) {
+                    base = ct_base(m, ph + 1u, geo, live);
+                    if (geo) spwg_bulk_store(a.out + base, stage + tid * LDO + c0, (cols - c0) * 4u);
+                }
+            } else {
+                size_t base = ep.row_base(m);
+                if ((long long)base < 0) base = ~base;
+                if (geo) spwg_bulk_store(a.out + base + col, stage + tid * LDO, cols * 4u);
+            }
             asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
             pending = true;
         }
@@ -5022,12 +5098,188 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     __threadfence();
     __syncthreads();
 }
+#if PLOW_SPEECH_SPLIT_A
+/* Pointwise GEMM on a split-image A (Conv1dF32 flags bit 30): x is the activation's image (the
+ * weight image's layout over the M rows, written by the producer's split-output flag), so both
+ * operands arrive by cp.async into a two-stage [Ahi | Alo | Bhi | Blo] ring and the k-loop issues
+ * copies and MMAs only: no f32 loads, no register split, no shared stores. Rows past M zero-fill
+ * (src-size 0); K % 64 == 0. AO (flags bit 31): the tile leaves as the same image (cout % 64 == 0),
+ * one bulk copy per half and 64-column group. Same split, products and accumulation order as
+ * sp_wg_gemm: bit-identical outputs. */
+template <unsigned BN, unsigned P, bool AO>
+static __device__ __forceinline__ void sp_wgi_gemm(unsigned M, unsigned N, unsigned K, const char* x, const float* w,
+                                                   const SpConvEpi1& ep, unsigned slice, unsigned nblk) {
+    char* sm = (char*)sm90_align1024(sp_smem);
+    constexpr unsigned BOP = BN * SPWG_BK * 2u, LDO = BN + 8u, NG = BN / 8u, SZ = 2u * SPWG_OP + 2u * BOP;
+    constexpr unsigned BIAS_OFF = 2u * SZ > 128u * LDO * 4u ? 2u * SZ : 128u * LDO * 4u;
+    static_assert(BIAS_OFF + BN * 4u + 1024u <= SP_LAUNCH_ARENA_FLOATS * 4u, "image GEMM ring");
+    static_assert(!AO || (BN / 64u) * 2u * SPWG_OP <= 2u * SZ, "image output stage");
+    auto aoff = [&](unsigned b) { return sm + b * SZ; };
+    auto boff = [&](unsigned b) { return sm + b * SZ + 2u * SPWG_OP; };
+    float* stage = (float*)sm; /* the output tile, after the last k-tile's MMAs */
+    float* bias_s = (float*)(sm + BIAS_OFF);
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, wg = warp >> 2;
+    const SpConvArgs& a = ep.a;
+    const unsigned tn = (N + BN - 1u) / BN, tiles = ((M + 127u) / 128u) * tn, nk = K / SPWG_BK;
+    const unsigned wsn = ((N + 127u) & ~127u) * 128u, xsn = M * 128u; /* bytes of one half per k-tile: B, A */
+    const unsigned ar = tid >> 3, ac = (tid & 7u) * 16u;               /* A: chunk ac of rows ar + 32 j */
+    bool pending = false;                                                /* bulk stores reading `stage` */
+    for (unsigned item = slice; item < tiles; item += nblk) {
+        const unsigned m0 = (item / tn) * 128u, n0 = (item % tn) * BN;
+        const char* asrc = x + (size_t)(m0 + ar) * 128u + ac;
+        const char* bsrc = (const char*)w + (size_t)n0 * 128u + tid * 16u;
+        /* k-tile kt's A and B halves into stage b (rows of 128 bytes keep their chunk order: m0 % 8 == 0). */
+        auto copy = [&](unsigned kt, unsigned b) {
+            const char* sa = asrc + (size_t)kt * 2u * xsn;
+            char* da = aoff(b) + ar * 128u + ac;
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                const bool in = m0 + ar + 32u * j < M;
+                const unsigned o = j * 32u * 128u;
+                sm90_cp16(da + o, in ? sa + o : x, in ? 16 : 0);
+                sm90_cp16(da + SPWG_OP + o, in ? sa + xsn + o : x, in ? 16 : 0);
+            }
+            const char* sb = bsrc + (size_t)kt * 2u * wsn;
+            char* db = boff(b) + tid * 16u;
+#pragma unroll
+            for (unsigned j = 0; j < BN / 32u; j++) {
+                sm90_cp16(db + j * 4096u, sb + j * 4096u, 16);
+                sm90_cp16(db + BOP + j * 4096u, sb + wsn + j * 4096u, 16);
+            }
+            sm90_cp_commit();
+        };
+        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + n0 + tid) : 0.f;
+        if (pending) {
+            asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+            pending = false;
+        }
+        __syncthreads();
+        copy(0u, 0u);
+        if (nk > 1u) copy(1u, 1u);
+        if (tid < BN) bias_s[tid] = bpre;
+        float acc[BN / 2u];
+        for (unsigned kt = 0; kt < nk; kt++) {
+            const unsigned b = kt & 1u;
+            if (kt + 1u < nk) sm90_cp_wait<1>();
+            else sm90_cp_wait<0>();
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            __syncthreads();
+            const uint64_t dah = sm90_desc(aoff(b) + wg * 64u * 128u), dal = sm90_desc(aoff(b) + SPWG_OP + wg * 64u * 128u);
+            const uint64_t dbh = sm90_desc(boff(b)), dbl = sm90_desc(boff(b) + BOP);
+            sm90_wg_fence();
+#pragma unroll
+            for (unsigned s = 0; s < SPWG_BK / 16u; s++) {
+                const uint64_t o = (s * 32u) >> 4; /* +32 B per k16 in the start-address field */
+                if constexpr (BN == 128u) {
+                    wgmma_m64n128k16(acc, dal + o, dbh + o, kt || s ? 1 : 0);
+                    wgmma_m64n128k16(acc, dah + o, dbl + o, 1);
+                    wgmma_m64n128k16(acc, dah + o, dbh + o, 1);
+                } else {
+                    spwg_m64n64k16(acc, dal + o, dbh + o, kt || s ? 1 : 0);
+                    spwg_m64n64k16(acc, dah + o, dbl + o, 1);
+                    spwg_m64n64k16(acc, dah + o, dbh + o, 1);
+                }
+            }
+            sm90_wg_commit();
+            sm90_wg_wait<0>();
+            __syncthreads(); /* both warpgroups are done reading stage b */
+            if (kt + 2u < nk) copy(kt + 2u, b);
+        }
+        /* Epilogue as sp_wg_gemm's: bias, activation, row scale, residual in registers; the tile
+         * staged as f32 rows, or (AO) as the image's hi / lo blocks per 64-column group. */
+        const unsigned rw = wg * 64u + (warp & 3u) * 16u + (lane >> 2), cw = 2u * (lane & 3u);
+        size_t base[2];
+        bool ok[2];
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++) {
+            const unsigned m = m0 + rw + 8u * h;
+            base[h] = m < M ? ep.row_base(m) : 0;
+            ok[h] = m < M && (long long)base[h] >= 0;
+            if (!ok[h]) base[h] = ~base[h];
+        }
+        float2 res[2][NG];
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++)
+#pragma unroll
+            for (unsigned g = 0; g < NG; g++) {
+                const unsigned o = n0 + 8u * g + cw;
+                res[h][g] = a.residual && ok[h] && o < N ? __ldg((const float2*)(a.residual + base[h] + o)) : make_float2(0.f, 0.f);
+            }
+#pragma unroll
+        for (unsigned g = 0; g < NG; g++) {
+            const unsigned c = 8u * g + cw, o = n0 + c;
+            const bool on = o < N;
+            const float2 bias = *(const float2*)(bias_s + c);
+            const float2 alpha = a.post_alpha && on ? make_float2(a.post_alpha[o], a.post_alpha[o + 1]) : make_float2(a.slope, a.slope);
+#pragma unroll
+            for (unsigned h = 0; h < 2; h++) {
+                float2 y = make_float2(0.f, 0.f);
+                if (ok[h] && on) {
+                    y.x = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h], bias.x), alpha.x);
+                    y.y = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h + 1u], bias.y), alpha.y);
+                    if (a.row_scale) {
+                        const float rs = a.row_scale[base[h] / a.cout];
+                        y.x = __fmul_rn(rs, y.x); y.y = __fmul_rn(rs, y.y);
+                    }
+                    y.x = __fadd_rn(y.x, res[h][g].x); y.y = __fadd_rn(y.y, res[h][g].y);
+                }
+                if constexpr (AO) spwg_img_store2((char*)stage, 128u, rw + 8u * h, c, y);
+                else *(float2*)(stage + (rw + 8u * h) * LDO + c) = y;
+            }
+        }
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        __syncthreads();
+        if constexpr (AO) {
+            /* Group g's hi then lo rows [m0, m0 + rows) of the output image, contiguous runs. */
+            const unsigned rows = min(128u, M - m0), g = tid >> 1, half = tid & 1u;
+            if (tid < 2u * (BN / 64u) && n0 + 64u * g < N) {
+                char* dst = (char*)a.out + ((size_t)(n0 / 64u + g) * 2u + half) * xsn + (size_t)m0 * 128u;
+                spwg_bulk_store((float*)dst, (const float*)((const char*)stage + g * 2u * SPWG_OP + half * SPWG_OP), rows * 128u);
+                asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+                pending = true;
+            }
+        } else if (tid < 128u && m0 + tid < M) {
+            const unsigned m = m0 + tid, cols = min(BN, N - n0);
+            size_t base = ep.row_base(m);
+            if ((long long)base < 0) base = ~base;
+            spwg_bulk_store(a.out + base + n0, stage + tid * LDO, cols * 4u);
+            asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+            pending = true;
+        }
+    }
+    if (pending) asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+    asm volatile("fence.proxy.async.global;\n" ::: "memory");
+    __threadfence();
+    __syncthreads();
+}
+/* The image-A arm's instantiations: the CFM transformer block's qkv / out / ff2 (no activation,
+ * f32 rows out) and ff1 (GELU, image out). Other (post, AO) pairs are devgen errors: trap. */
+__device__ __forceinline__ void sp_wgi_run(const SpConvArgs& a, bool ao, unsigned slice, unsigned nblk) {
+    const unsigned M = a.batch * a.out_rows;
+    const SpConvEpi1 ep{a, 0u, a.out_rows, 0u, 0u, false, true};
+    const unsigned mt = (M + 127u) / 128u, r128 = (mt * ((a.cout + 127u) / 128u) + nblk - 1u) / nblk,
+                   r64 = (mt * ((a.cout + 63u) / 64u) + nblk - 1u) / nblk;
+    const bool wide = 20u * r128 <= 13u * r64;
+    const char* x = (const char*)a.x;
+    const float* w = spwg_wsplit(a);
+    if (!ao && a.post == 0u && sp_post_on(0u)) {
+        if (wide) sp_wgi_gemm<128, 0, false>(M, a.cout, a.cin, x, w, ep, slice, nblk);
+        else sp_wgi_gemm<64, 0, false>(M, a.cout, a.cin, x, w, ep, slice, nblk);
+    } else if (ao && a.post == 11u && sp_post_on(11u)) {
+        if (wide) sp_wgi_gemm<128, 1, true>(M, a.cout, a.cin, x, w, ep, slice, nblk);
+        else sp_wgi_gemm<64, 1, true>(M, a.cout, a.cin, x, w, ep, slice, nblk);
+    } else {
+        __trap();
+    }
+}
+#endif
 __device__ __forceinline__ bool spg_post_ok(unsigned post) {
     return sp_post_on(post) && (post == 0u || post == 1u || post == 7u || post == 8u || post == 9u || post == 10u || post == 11u || post == 12u);
 }
 __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a, bool channel_tiled = false) {
     const bool pw = a.kernel == 1u && a.stride == 1u && a.before == 0u && a.in_rows == a.out_rows && a.cg % 4u == 0 && a.pre == 0u;
-    const bool taps = a.kernel > 1u && (a.tapmajor || channel_tiled) && a.stride == 1u && a.mode == 0u && a.groups == 1u && a.cin % 64u == 0 &&
+    const bool taps = a.kernel > 1u && (a.tapmajor || channel_tiled) && a.stride == 1u && a.mode == 0u && a.groups == 1u &&
+                      (a.cin % 64u == 0 || (a.ragged && !channel_tiled && a.cin % 4u == 0)) &&
                       (a.pre == 0u || (a.pre == 9u && !a.alpha));
     /* A SnakeBeta output has the taps tile's P = 4 epilogue only. */
     return (pw || taps) && spg_post_ok(a.post) && (!a.post_beta || (taps && sp_post_on(19u))) && a.cout % 4u == 0 &&
@@ -5039,14 +5291,15 @@ __device__ __forceinline__ bool spg_eligible(const SpConvArgs& a, bool channel_t
  * weights with the pre-split image, no activations, residual or output padding. */
 __device__ __forceinline__ bool spg_ct_eligible(const SpConvArgs& a) {
     return a.phasemajor && a.kernel == 2u * a.stride && a.groups == 1u && a.opad == 0u && a.pre == 0u &&
-           sp_post_on(0u) && a.post == 0u && !a.alpha && !a.residual && !a.wf16 && a.cin % 64u == 0 && a.cout % 64u == 0 &&
+           sp_post_on(0u) && a.post == 0u && !a.alpha && !a.residual && !a.wf16 && a.cin % 64u == 0 &&
+           (a.cout % 64u == 0 || (a.ragged && a.cout % 4u == 0 && a.cout >= 64u)) &&
            sp_aligned(a.out, 16) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) && sp_aligned(a.x, 16);
 }
 __device__ __forceinline__ void sp_wg_run_ct(const SpConvArgs& a, unsigned slice, unsigned nblk) {
     const unsigned Q = (a.out_rows + a.before + a.stride - 1u) / a.stride, M = a.batch * Q, N = a.stride * a.cout;
     const SpConvEpi1 ep{a, 0u, Q, 0u, 0u, true, true};
-    const unsigned mt = (M + 127u) / 128u, r128 = (mt * (N / 128u) + nblk - 1u) / nblk,
-                   r64 = (mt * (N / 64u) + nblk - 1u) / nblk;
+    const unsigned mt = (M + 127u) / 128u, r128 = (mt * ((N + 127u) / 128u) + nblk - 1u) / nblk,
+                   r64 = (mt * ((N + 63u) / 64u) + nblk - 1u) / nblk;
     const float* w = spwg_wsplit(a);
     const bool w128 = a.cout % 128u == 0 && (a.pinned() ? a.pin_bn() == 128u : 20u * r128 <= 13u * r64);
     if (w128) sp_wg_gemm<128, true, 0, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
@@ -5106,10 +5359,26 @@ __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const*
         sp_wg_run_ct(a, slice, nblk);
         return true;
     }
-    if (!sp_op_on(PLOW_DOP_CONV1D_F32) || in->op != PLOW_DOP_CONV1D_F32 || !((in->fj[2].u >> 17) & 1u) ||
-        ((in->fj[2].u >> 16) & 1u))
+    if (!sp_op_on(PLOW_DOP_CONV1D_F32) || in->op != PLOW_DOP_CONV1D_F32 || !((in->fj[2].u >> 17) & 1u))
         return false;
     SpConvArgs a;
+    if ((in->fj[2].u >> 30) & 1u) {
+#if PLOW_SPEECH_SPLIT_A
+        /* Bit 30: x is a split image; checked before the bit-16 warp-arm fallback so no f32 path
+         * ever reads image bytes. Devgen sets it only on ungrouped pointwise pre-split wgmma convs
+         * over 64-channel multiples without input activation, warp arm, split-K or row scale, and
+         * bit 31 (image out) only with cout % 64 == 0: anything else is a lowering error (fail closed). */
+        if (((in->fj[2].u >> 16) & 1u) || !sp_conv_args(in, T, false, a) || !spg_eligible(a) || a.kernel != 1u ||
+            a.groups != 1u || a.cin % 64u || !((in->fj[2].u >> 18) & 1u) || a.splitk || a.row_scale ||
+            (((in->fj[2].u >> 31) & 1u) && a.cout % 64u))
+            __trap();
+        sp_wgi_run(a, (in->fj[2].u >> 31) & 1u, slice, nblk);
+        return true;
+#else
+        __trap();
+#endif
+    }
+    if ((in->fj[2].u >> 16) & 1u) return false;
     if (!sp_conv_args(in, T, false, a)) return false;
     if (!a.tapmajor && a.kernel > 1u) {
         if (!spg_eligible(a, true) || a.pre != 0u || a.post != 0u || a.wf16 ||
@@ -5177,6 +5446,113 @@ static __device__ __noinline__ void sp_conv1d_warp(const SpConvArgs& a, unsigned
         for (unsigned d = 16; d; d >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, d);
         if (lane == 0) a.store(e, o, a.bias ? __fadd_rn(acc, a.bias[o]) : acc);
     }
+}
+
+/* The lanes arm's 32 lane partials over K for channel-major weights ([o][cg][kernel], kk = ci * KT + tap)
+ * at kernel KT: 32-channel chunks of KT taps each fix every kk's partial (kk mod 32) at compile time. */
+template <unsigned KT>
+static __device__ __forceinline__ void sp_lanes_ci_major(const SpConvArgs& a, const float* xr, const float* wr,
+                                                         unsigned LD, const bool (&ok)[KT], float (&acc)[32]) {
+    for (unsigned ci0 = 0; ci0 < a.cg; ci0 += 32u) {
+#pragma unroll
+        for (unsigned c = 0; c < 32u; c++)
+#pragma unroll
+            for (unsigned tap = 0; tap < KT; tap++)
+                if (ok[tap])
+                    acc[(c * KT + tap) & 31u] = fmaf(xr[(size_t)tap * a.dil * LD + ci0 + c], wr[(ci0 + c) * KT + tap],
+                                                     acc[(c * KT + tap) & 31u]);
+    }
+}
+
+/* Flag bit 16 with cout <= 4, cg % 32 == 0, 16-byte x and tap-major weights or channel-major ones at
+ * kernel 7: sp_conv1d_warp's result bit for bit, from smem. A block stages its tile's padded input
+ * window (input activation applied once per element, padding zero) and the cout weight rows; each
+ * lane then owns one output row and keeps the warp form's 32 lane partials (partial j takes the K
+ * indices = j mod 32, in K order) and folds them in its xor-shuffle order. Row pitch: cin + 4 for
+ * the tap-major float4 reads, cin + 1 for the channel-major scalar ones (conflict-free across
+ * lanes at odd strides either way). False when the shape does not fit (uniform across the block). */
+static __device__ __noinline__ bool sp_conv1d_lanes(const SpConvArgs& a, unsigned slice, unsigned nblk, float* arena) {
+    if (!(a.tapmajor || a.kernel == 7u) || a.cg % 32u || !sp_aligned(a.x, 16) || a.stride > 64u || a.dil > 64u ||
+        a.kernel > 64u || a.cin > (unsigned)SP_ARENA_FLOATS)
+        return false;
+    const unsigned K = a.kernel * a.cg, LD = a.cin + (a.tapmajor ? 4u : 1u), span = (a.kernel - 1u) * a.dil;
+    auto fits = [&](unsigned R) {
+        return (size_t)a.cout * K + ((size_t)(R - 1u) * a.stride + span + 1u) * LD <= (size_t)SP_ARENA_FLOATS;
+    };
+    unsigned R = PLOW_NV_THREADS;
+    while (R > 32u && !fits(R)) R -= 32u;
+    if (!fits(R)) return false;
+    float* ws = arena;
+    float* xs = arena + a.cout * K;
+    const unsigned C4 = a.cin / 4u, rows_in = (R - 1u) * a.stride + span + 1u, tiles = (a.out_rows + R - 1u) / R;
+    const unsigned r = threadIdx.x;
+    if (slice >= a.batch * tiles) return true;
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < a.cout * K; i += PLOW_NV_THREADS) ws[i] = a.w_at(i);
+    for (unsigned tile = slice; tile < a.batch * tiles; tile += nblk) {
+        const unsigned b = tile / tiles, t0 = (tile - b * tiles) * R;
+        const int length = (int)a.length(b), p0 = (int)(t0 * a.stride) - (int)a.before;
+        const float* xb = a.x + (size_t)b * a.in_rows * a.cin;
+        __syncthreads();
+        for (unsigned e = threadIdx.x; e < rows_in * C4; e += PLOW_NV_THREADS) {
+            const unsigned row = e / C4, c = (e - row * C4) * 4u;
+            const int u = sp_pad_row(p0 + (int)row, length, a.mode);
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (u >= 0) {
+                v = __ldcg((const float4*)(xb + (size_t)u * a.cin + c));
+                v.x = a.pre_at(v.x, c); v.y = a.pre_at(v.y, c + 1u); v.z = a.pre_at(v.z, c + 2u); v.w = a.pre_at(v.w, c + 3u);
+            }
+            float* d = xs + (size_t)row * LD + c;
+            if (a.tapmajor) *(float4*)d = v;
+            else { d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w; }
+        }
+        __syncthreads();
+        const unsigned t = t0 + r;
+        if (r >= R || t >= a.out_rows) continue;
+        const size_t m = (size_t)b * a.out_rows + t;
+        if (t >= a.conv_len(b)) {
+            for (unsigned o = 0; o < a.cout; o++) a.out[m * a.cout + o] = 0.f;
+            continue;
+        }
+        const int tp = (int)(t * a.stride) - (int)a.before;
+        for (unsigned o = 0; o < a.cout; o++) {
+            float acc[32];
+#pragma unroll
+            for (unsigned j = 0; j < 32u; j++) acc[j] = 0.f;
+            if (a.tapmajor) {
+                for (unsigned tap = 0; tap < a.kernel; tap++) {
+                    if (sp_pad_row(tp + (int)(tap * a.dil), length, a.mode) < 0) continue;
+                    const float4* xr = (const float4*)(xs + (size_t)(r * a.stride + tap * a.dil) * LD);
+                    const float4* wr = (const float4*)(ws + (size_t)o * K + tap * a.cg);
+                    for (unsigned c8 = 0; c8 < a.cg / 4u; c8 += 8u) {
+#pragma unroll
+                        for (unsigned q = 0; q < 8u; q++) {
+                            const float4 xv = xr[c8 + q], wv = wr[c8 + q];
+                            acc[4 * q] = fmaf(xv.x, wv.x, acc[4 * q]);
+                            acc[4 * q + 1] = fmaf(xv.y, wv.y, acc[4 * q + 1]);
+                            acc[4 * q + 2] = fmaf(xv.z, wv.z, acc[4 * q + 2]);
+                            acc[4 * q + 3] = fmaf(xv.w, wv.w, acc[4 * q + 3]);
+                        }
+                    }
+                }
+            } else {
+                bool ok[7];
+#pragma unroll
+                for (unsigned tap = 0; tap < 7u; tap++) ok[tap] = sp_pad_row(tp + (int)(tap * a.dil), length, a.mode) >= 0;
+                sp_lanes_ci_major<7>(a, xs + (size_t)r * a.stride * LD, ws + (size_t)o * K, LD, ok, acc);
+            }
+#pragma unroll
+            for (unsigned j = 0; j < 16u; j++) acc[j] = __fadd_rn(acc[j], acc[j + 16u]);
+#pragma unroll
+            for (unsigned j = 0; j < 8u; j++) acc[j] = __fadd_rn(acc[j], acc[j + 8u]);
+#pragma unroll
+            for (unsigned j = 0; j < 4u; j++) acc[j] = __fadd_rn(acc[j], acc[j + 4u]);
+            acc[0] = __fadd_rn(acc[0], acc[2]); acc[1] = __fadd_rn(acc[1], acc[3]);
+            acc[0] = __fadd_rn(acc[0], acc[1]);
+            a.store(m * a.cout + o, o, a.bias ? __fadd_rn(acc[0], a.bias[o]) : acc[0]);
+        }
+    }
+    return true;
 }
 
 /* Flag bit 16, at most SPV_ROWS output rows of a zero-padded conv. Each block takes 8 output
@@ -5325,9 +5701,13 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
     if (!sp_conv_args(in, T, transpose, a)) return;
     if (!transpose && ((in->fj[2].u >> 16) & 1u) && a.groups == 1u) {
         /* Pinned: the warp arm only (the rows arm's M <= 32 gate and its other k order would make
-         * the result depend on the batch); the emitter sets the bit for cout <= 4 alone. */
+         * the result depend on the batch); the emitter sets the bit for cout <= 4 alone. The lanes
+         * form is the warp arm's result bit for bit, taken by shape alone. */
         if (!a.pinned() && sp_conv1d_rows(a, slice, nblk, arena)) return;
-        if (a.cout <= 4u) return sp_conv1d_warp(a, slice, nblk);
+        if (a.cout <= 4u) {
+            if (sp_conv1d_lanes(a, slice, nblk, arena)) return;
+            return sp_conv1d_warp(a, slice, nblk);
+        }
     }
     if (!transpose && a.cg == 1u && a.ng == 1u && sp_conv1d_depthwise(a, slice, nblk, arena)) return;
     if (a.ng < 16u || a.cg * a.kernel < 16u) {
@@ -5458,7 +5838,8 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
         const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
         const unsigned kend = causal ? min(klen, qa + SPF_BQ) : klen;
         const unsigned left = stream ? hist - min(pidx[b], hist) : 0u;
-        const unsigned qrow0 = stream ? b * kv_rows + hist : b * q_rows;
+        /* flags bit 6: the query shares the keys' item rows (row i7 + r of item b's [kv_rows]). */
+        const unsigned qrow0 = stream ? b * kv_rows + hist : (in->i[6] & 64u) ? b * kv_rows + in->i[7] : b * q_rows;
         /* Every stage issues all of its loads into registers before the first smem store: with
          * one block per SM, a load-store-load loop exposes the full memory latency per element. */
         {
@@ -5648,11 +6029,13 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
         const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
         const unsigned kend = causal ? min(klen, q0 + SPQ_BQ) : klen;
         const unsigned ra = q0 + warp * 16u + g, rb = ra + 8u;
+        /* flags bit 6: the query shares the keys' item rows (row i7 + r of item b's [kv_rows]). */
+        const size_t qrow0 = (in->i[6] & 64u) ? (size_t)b * kv_rows + in->i[7] : (size_t)b * q_rows;
         unsigned qh[8][4], ql[8][4];
 #pragma unroll
         for (int ks = 0; ks < 8; ks++) {
-            const float* qa = query + ((size_t)b * q_rows + ra) * stride + h * HW + ks * 8 + t;
-            const float* qb = query + ((size_t)b * q_rows + rb) * stride + h * HW + ks * 8 + t;
+            const float* qa = query + (qrow0 + ra) * stride + h * HW + ks * 8 + t;
+            const float* qb = query + (qrow0 + rb) * stride + h * HW + ks * 8 + t;
             const float x[4] = {ra < q_rows ? qa[0] : 0.f, rb < q_rows ? qb[0] : 0.f, ra < q_rows ? qa[4] : 0.f,
                                 rb < q_rows ? qb[4] : 0.f};
 #pragma unroll
@@ -5848,6 +6231,9 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
         const unsigned b = item / runs, u0 = (item % runs) * 8u, u = u0 + warp;
         const bool live = u < tiles;
         const unsigned h0 = u0 / n16, nh = min(u0 + 7u, tiles - 1u) / n16 - h0 + 1u;
+        /* A run spans at most HS heads only when n16 >= 8 / HS (devgen: q_rows > 112 for HS 2);
+         * the stage carve below is sized for HS. Block-uniform (nh is a function of the item). */
+        if (nh > (unsigned)HS) __trap();
         const unsigned h = live ? u / n16 : h0, q0 = live ? (u % n16) * 16u : 0u;
         const unsigned pre = prows ? min(prows[b], pstride) : pstride;
         auto visible = [&](unsigned hh) {
@@ -5878,11 +6264,13 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
                       : rel ? bias + ((size_t)row * heads + h) * bias_hs + kv_rows - 1u - row
                             : bias + (size_t)h * bias_hs + (size_t)row * kv_rows;
         }
+        /* flags bit 6: the query shares the keys' item rows (row i7 + r of item b's [kv_rows]). */
+        const size_t qrow0 = (in->i[6] & 64u) ? (size_t)b * kv_rows + in->i[7] : (size_t)b * q_rows;
         unsigned qh[8][4], ql[8][4];
 #pragma unroll
         for (int ks = 0; ks < 8; ks++) {
-            const float* qa = query + ((size_t)b * q_rows + ra) * stride + h * HW + ks * 8 + t;
-            const float* qb = query + ((size_t)b * q_rows + rb) * stride + h * HW + ks * 8 + t;
+            const float* qa = query + (qrow0 + ra) * stride + h * HW + ks * 8 + t;
+            const float* qb = query + (qrow0 + rb) * stride + h * HW + ks * 8 + t;
             const bool oa = live && ra < q_rows, ob = live && rb < q_rows;
             const float x[4] = {oa ? qa[0] : 0.f, ob ? qb[0] : 0.f, oa ? qa[4] : 0.f, ob ? qb[4] : 0.f};
 #pragma unroll
@@ -6431,6 +6819,16 @@ static __device__ __noinline__ void sp_attention_h16(const PlowDevInst* in, void
             if (r >= q_rows) continue;
             const float inv = lrow[i] > 0.f ? 1.0f / lrow[i] : 0.f;
             float* orow = out + ((size_t)b * q_rows + r) * width + h * HW;
+#if PLOW_SPEECH_SPLIT_A
+            /* flags bit 7: the output is the split image of [batch * q_rows][width] (head = k-tile). */
+            if (in->i[6] & 128u) {
+#pragma unroll
+                for (int n = 0; n < 8; n++)
+                    spwg_img_store2((char*)out, batch * q_rows, b * q_rows + r, h * HW + n * 8 + 2 * t,
+                                    make_float2(__fmul_rn(o[n][2 * i], inv), __fmul_rn(o[n][2 * i + 1], inv)));
+                continue;
+            }
+#endif
 #pragma unroll
             for (int n = 0; n < 8; n++)
                 *(float2*)(orow + n * 8 + 2 * t) = make_float2(o[n][2 * i] * inv, o[n][2 * i + 1] * inv);

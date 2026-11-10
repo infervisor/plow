@@ -41,6 +41,9 @@ With a packed depth contract, live VMM uses bounded engine-local identities for 
 content keys, outside the packet's input-token vocabulary. Identities are never recycled while
 cache entries can refer to them; exhaustion declines caching. Prompt lookup, boundary storage
 and publication use the same identities. Generated frame rows are not published as token prefixes.
+This protocol also permits VMM prefix caching for packets with encoder-overlay rows.
+Those packets require staged row identities for attachment and publication; token IDs alone
+cannot name their cached overlays. Other overlay packets retain their cache exclusion.
 Short-context live KV may instead commit whole private slots. Those slots can retain a prefix
 within the existing released-memory cap. A residency generation invalidates keys and staged
 resumes after reclamation or reassignment; idle lanes write beyond the retained prefix. Sliding
@@ -56,13 +59,32 @@ The `prompt.conditioning` JSON has version 1 and two distinct bundle-relative pa
 `speaker_packet` and `reference_packet`. `conditioning.text_embeddings` binds the existing BF16
 text table; `conditioning.text_pad` selects the row added to the speaker embedding and rounded
 to BF16 before replacing the entire speaker prompt row. At least one overlay row is required.
+New emits also bind `conditioning.text_pad_row`, an initialized BF16 `[hidden]` constant copied
+from that checkpoint row, so the host can read it while the full table remains external.
+Older packets may use the initialized text table. A declared pad constant must be present,
+initialized and finite; it never falls back to a different source when invalid.
 The dual-stream contract declares no preset voices. Checkpoint preparation records this under
 `plow_frame_embed.conditioning` and reserves one overlay row; it preserves CustomVoice's v1
 metadata and rejects unsupported checkpoint modes.
 
-The conditioned driver is staged for request-path integration. This runtime rejects it, and
-media-geometry qualification also rejects it until its conditioning obligations are supported.
-Preparing or emitting such a checkpoint does not enable Base serving or qualify its accuracy.
+The conditioned driver binds both encoders on the serving device. One bounded cache, keyed by
+the exact normalized PCM bits, owns the shared speaker row and codec codes. Speaker-only requests
+skip codec encoding; a later transcript-conditioned request adds codes without embedding the
+speaker again. Concurrent misses share the encoder execution lock. A deferred engine callback
+finalizes the overlay and reference frame rows before prefix lookup or packed prefill.
+
+Conditioned requests require reference audio and use the default voice. A nonempty reference
+transcript enables codec-frame conditioning; otherwise only the speaker embedding is used.
+Each conditioned request reserves a stateful codec slot before LM submission. Whole-output
+decoding steps through reference and generated codes in order, then uses the source's floating
+ratio and truncation for its crop. Streaming primes its slot with the reference on each segment
+or retry and emits fresh frames. Slot exhaustion returns busy; the
+short-context window fallback cannot preserve the codec's full attention history. The streaming
+frame boundary and whole-output floating crop can differ by one sample.
+
+This request path is an unqualified candidate. Media-geometry qualification rejects v2 until its
+conditioning obligations are supported. Preparing or executing it does not qualify its accuracy,
+resource limits, capacity or latency, and no production recipe enables it.
 
 Compatible depth prompts share packed prefill and their first predictor launch. A fully cached
 prefix can feed its terminal row straight into batched decode. Terminal overlay rows keep serial

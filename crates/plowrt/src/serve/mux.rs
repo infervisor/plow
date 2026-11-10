@@ -564,6 +564,11 @@ pub struct SpeechJob {
     /// A voice turn's stream: tokens its first audio renders from. Its ticks are the turn's first
     /// audio until then and stream decode after, so the first render outranks them (0: unknown).
     pub first_tokens: usize,
+    /// A stateful-codec stream's first audible audio (`None`: `first_tokens` only). Until it is
+    /// heard, the tick that brings the job to the frame count its next downstream step waits for
+    /// hands the device to that step, as crossing `first_tokens` does once: the first steps can
+    /// render onset silence only.
+    pub first_audio: Option<Arc<FirstAudio>>,
     /// A depth-stage packet (`tts.depth_lm.v1`): each step's token comes from the packet's depth
     /// stage, which also samples the frame's codes ([`StreamChunk::Token::frame`]).
     pub depth: Option<DepthJob>,
@@ -582,6 +587,70 @@ pub struct SpeechJob {
     pub feed: Option<(Vec<u32>, u32)>,
     /// Maya 2: a cloned speaker's depth memory, `[layers][hidden]` (`None`: the null speaker's).
     pub maya2_memory: Option<std::sync::Arc<[f32]>>,
+}
+
+/// Written by a speech stream's task, read by the decode loop: see [`SpeechJob::first_audio`].
+#[derive(Debug)]
+pub struct FirstAudio {
+    heard: std::sync::atomic::AtomicBool,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl FirstAudio {
+    /// Its first downstream step waits for `next` frames.
+    pub fn new(next: usize) -> Self {
+        Self {
+            heard: false.into(),
+            next: next.into(),
+        }
+    }
+
+    pub fn heard(&self) -> bool {
+        self.heard.load(Ordering::Acquire)
+    }
+
+    /// Audible audio is out (or the stream stopped stepping): no more handoffs.
+    pub fn hear(&self) {
+        self.heard.store(true, Ordering::Release);
+    }
+
+    pub fn next(&self) -> usize {
+        self.next.load(Ordering::Acquire)
+    }
+
+    pub fn set_next(&self, frames: usize) {
+        self.next.store(frames, Ordering::Release);
+    }
+}
+
+/// After a tick that left a first-output slot with `n` tokens: whether its downstream first
+/// output is due now (the decode loop then hands it the device), updating `first_out` and the
+/// tokens at its last handoff.
+fn first_handoff(
+    speech: Option<&SpeechJob>,
+    n: usize,
+    first_out: &mut bool,
+    last: &mut usize,
+) -> bool {
+    match speech {
+        Some(SpeechJob {
+            first_audio: Some(fa),
+            ..
+        }) => {
+            *first_out = !fa.heard();
+            // Once per codec-step boundary: a delayed stream task does not re-hand at every tick.
+            let next = fa.next();
+            let due = *first_out && n >= next && next > *last;
+            if due {
+                *last = next;
+            }
+            due
+        }
+        sp => {
+            *first_out = sp.is_some_and(|sp| n < sp.first_tokens);
+            !*first_out
+        }
+    }
 }
 
 pub type SpeechEncode =
@@ -1126,8 +1195,10 @@ struct Slot {
     turn_key: Option<crate::serve::turns::TurnKey>,
     speech: Option<Box<SpeechJob>>,
     /// Its downstream first output has not been handed off yet: set while `speech.first_tokens`
-    /// tokens are still to come.
+    /// tokens are still to come, or until `speech.first_audio` is heard.
     first_out: bool,
+    /// Tokens out at its last first-audio handoff.
+    first_handoff: usize,
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
     cfg: Option<Box<CfgRun>>,
@@ -2337,17 +2408,18 @@ fn spawn_scoped(
                     }
                     freed_last_tick = returned_slots.iter().flatten().count() < live;
                     slots = returned_slots;
-                    // Crossed or retired this tick (a retired one may have ended on its first
-                    // output).
-                    let mut first_after = 0;
+                    // Retired this tick (one may have ended on its first output), crossed its
+                    // first tokens, or at the frame its next first-audio step waits for.
+                    let present = slots.iter().flatten().filter(|s| s.first_out).count();
+                    let mut crossed = first_before.saturating_sub(present) as u64;
                     for s in slots.iter_mut().flatten().filter(|s| s.first_out) {
-                        s.first_out = s
-                            .speech
-                            .as_ref()
-                            .is_some_and(|sp| s.out_ids.len() < sp.first_tokens);
-                        first_after += s.first_out as usize;
+                        crossed += u64::from(first_handoff(
+                            s.speech.as_deref(),
+                            s.out_ids.len(),
+                            &mut s.first_out,
+                            &mut s.first_handoff,
+                        ));
                     }
-                    let crossed = first_before.saturating_sub(first_after) as u64;
                     if crossed > 0 {
                         await_first = Some(engaged_before.wrapping_add(crossed));
                     }
@@ -3317,6 +3389,7 @@ fn admit_session(
             })
         }),
         first_out: job.opts.speech.as_ref().is_some_and(|s| s.first_tokens > 0),
+        first_handoff: 0,
         speech: job.opts.speech,
         held: Vec::new(),
         held_finish: None,
@@ -8066,7 +8139,9 @@ fn gpu_prefill_batched_pass(
 /// through serial prefill keeps it serial until done (packed admission restarts a slot).
 #[cfg(feature = "cuda")]
 fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap: usize) -> bool {
-    e.depth_packs() && depth_prompts_pack(slots, cap, |i| e.packed_slot_ready(i))
+    crate::config::RuntimeConfig::get().tts_depth_pack
+        && e.depth_packs()
+        && depth_prompts_pack(slots, cap, |i| e.packed_slot_ready(i))
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -13960,6 +14035,7 @@ mod tests {
                 turn_key: None,
                 speech: None,
                 first_out: false,
+                first_handoff: 0,
                 mm: None,
                 export: None,
                 import: None,
@@ -14465,6 +14541,40 @@ mod tests {
             slots[0].as_ref().unwrap().turn.unwrap().tts_first_audio,
             Some(now)
         );
+    }
+
+    /// A stateful-codec stream hands its downstream step the device at each frame count that
+    /// step waits for until audio is heard; a plain one once, at its first tokens.
+    #[test]
+    fn first_audio_hands_off_at_each_step_until_heard() {
+        let fa = Arc::new(FirstAudio::new(2));
+        let job = SpeechJob {
+            first_tokens: 2,
+            first_audio: Some(fa.clone()),
+            ..Default::default()
+        };
+        let (mut out, mut last) = (true, 0);
+        let mut due = |n| first_handoff(Some(&job), n, &mut out, &mut last);
+        assert!(!due(1));
+        assert!(due(2));
+        assert!(!due(2), "one handoff per boundary");
+        assert!(!due(3), "a growing count at the same boundary");
+        fa.set_next(4);
+        assert!(!due(3));
+        assert!(due(4));
+        fa.hear();
+        fa.set_next(5);
+        assert!(!due(5));
+        assert!(!out);
+        let plain = SpeechJob {
+            first_tokens: 2,
+            ..Default::default()
+        };
+        let (mut out, mut last) = (true, 0);
+        assert!(!first_handoff(Some(&plain), 1, &mut out, &mut last));
+        assert!(out);
+        assert!(first_handoff(Some(&plain), 2, &mut out, &mut last));
+        assert!(!out);
     }
 
     /// A turn's speech stream is its first audio only until the tokens that audio renders from;

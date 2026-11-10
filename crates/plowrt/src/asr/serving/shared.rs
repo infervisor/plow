@@ -526,6 +526,7 @@ impl SharedAsr {
                     pos_base: None,
                     cfg: None,
                     first_tokens: 0,
+                    first_audio: None,
                     depth: None,
                     encode: None,
                     frame_codes: Vec::new(),

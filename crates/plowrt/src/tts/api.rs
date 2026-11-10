@@ -207,7 +207,16 @@ impl SpeechSpec {
                 _ => req.voice.clone(),
             }
         };
-        if !self.voices.contains(&voice) {
+        let external_voice = self.voices.is_empty() && self.voice_cloning;
+        if external_voice && req.ref_audio.is_none() {
+            return Err(invalid(
+                "this model requires `ref_audio` to condition its voice",
+                "ref_audio",
+            ));
+        }
+        if !self.voices.contains(&voice)
+            && !(external_voice && (voice.is_empty() || voice == "default"))
+        {
             return Err(invalid(
                 format!(
                     "unknown voice {:?}; voices: {}",
@@ -252,6 +261,12 @@ impl SpeechSpec {
             if !self.clone_transcript && req.ref_text.is_some() {
                 return Err(invalid(
                     "this model clones from `ref_audio` alone; omit `ref_text`",
+                    "ref_text",
+                ));
+            }
+            if external_voice && req.ref_text.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                return Err(invalid(
+                    "`ref_text` must contain the reference transcript",
                     "ref_text",
                 ));
             }
@@ -427,6 +442,43 @@ mod tests {
             .unwrap()
             .extend(json.as_object().unwrap().clone());
         serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn external_voice_requires_audio_and_accepts_optional_nonempty_transcript() {
+        let mut s = spec(&[]);
+        s.voices.clear();
+        s.voice_cloning = true;
+        s.clone_audio_only = true;
+        assert_eq!(
+            s.check(&req(serde_json::json!({"voice":"default"})))
+                .unwrap_err()
+                .param,
+            "ref_audio"
+        );
+        for voice in ["", "default"] {
+            for transcript in [None, Some("reference words")] {
+                let mut r = req(serde_json::json!({"voice":voice,"ref_audio":"YQ=="}));
+                r.ref_text = transcript.map(str::to_owned);
+                assert!(s.check(&r).is_ok());
+            }
+        }
+        assert_eq!(
+            s.check(&req(
+                serde_json::json!({"voice":"preset","ref_audio":"YQ=="})
+            ))
+            .unwrap_err()
+            .param,
+            "voice"
+        );
+        assert_eq!(
+            s.check(&req(
+                serde_json::json!({"voice":"default","ref_audio":"YQ==","ref_text":" "})
+            ))
+            .unwrap_err()
+            .param,
+            "ref_text"
+        );
     }
 
     #[test]
