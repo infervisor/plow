@@ -236,6 +236,18 @@ def report(spec, rows, ceil, classes=None, gens=None, every=False):
              "candidates passing numerics / tried: "
              + ", ".join(f"{s['class']} {s['passed']}/{s['tried']}" for s in summary),
              "measured on: " + ("; ".join(where) or "nothing measured")]
+    if len(gens) > 1:
+        lines += ["", "| class | generator | best us | config | rel-L2 | passing / tried |",
+                  "|---|---|---|---|---|---|"]
+        for name in classes:
+            for gen in gens:
+                mine = [r for r in last.values() if r["class"] == name and r["arm"] == gen]
+                ok = [r for r in mine if r.get("ok")]
+                best = min(ok, key=lambda r: r["us"]) if ok else None
+                lines.append(f"| {name} | {gen} | " + (f"{best['us']:.1f} | {cfg_label(best['cfg'])} | "
+                             f"{best['rel_l2']:.1e}" if best else "— | — | —")
+                             + f" | {len(ok)} / {len(mine)} |")
+        lines.append("")
     warm = [s["class"] for s in summary if s["warm"]]
     if warm:
         lines.append(f"cache-warm timing (rotating inputs under {gen_bench.COLD_BYTES / 1e6:.0f} MB "

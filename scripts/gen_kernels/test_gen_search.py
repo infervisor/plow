@@ -205,6 +205,15 @@ class TableTests(unittest.TestCase):
         self.assertIn("| b8 | tilelang | bm16 stages1 | 16.0 |", text)
         self.assertNotIn("cache-warm", gen_search.report(spec(), [row("b8", "tilelang", T16, 16.0)], CEIL))
 
+    def test_report_lists_the_best_candidate_of_each_generator(self):
+        rows = [row("b8", "tilelang", T16, 16.0), row("b8", "tilelang", T32, 12.0, ok=False),
+                row("b8", "triton", TR, 14.0)]
+        text = gen_search.report(spec(), rows, CEIL)
+        self.assertIn("| b8 | tilelang | 16.0 | bm16 stages1 | 1.0e-05 | 1 / 2 |", text)
+        self.assertIn("| b8 | triton | 14.0 | bk64 | 1.0e-05 | 1 / 1 |", text)
+        self.assertIn("| b1 | triton | — | — | — | 0 / 0 |", text)
+        self.assertNotIn("| generator |", gen_search.report(spec(), rows, CEIL, gens=["triton"]))
+
 
 class CliTests(unittest.TestCase):
     def test_submit_command_is_a_bounded_queue_job_with_the_compiler_env(self):
