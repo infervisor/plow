@@ -5744,6 +5744,36 @@ fn dsa_pool_tail_seed_shrinks_compress_and_rebases_exactly_the_real_remainder() 
     );
 }
 
+/// A chunk resumed from an end-armed prefix snapshot at 4098 rows (pool 4) would file rows
+/// 4098..4101 under pool 1024, which holds 4096..4099: only the aligned base passes, at every
+/// residue. The packed form addresses rows through the span table and is exempt.
+#[test]
+fn dsa_pool_chunk_base_must_sit_on_a_pool_boundary() {
+    use crate::exec::kvrow::dsa_pool_chunk_base_aligned;
+    const POOL_SIZE: u32 = 4;
+    let compress = DevInst64 {
+        op: DevOp::DsaPoolCompress as u16,
+        i: [128 / POOL_SIZE, POOL_SIZE, 128, 0, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    for c0 in 4096..4096 + POOL_SIZE {
+        let want = if c0 % POOL_SIZE == 0 {
+            Ok(())
+        } else {
+            Err(POOL_SIZE)
+        };
+        assert_eq!(
+            dsa_pool_chunk_base_aligned(&[compress], c0),
+            want,
+            "c0 {c0}"
+        );
+    }
+    let mut packed = compress;
+    packed.i[6] = 1;
+    assert_eq!(dsa_pool_chunk_base_aligned(&[packed], 4098), Ok(()));
+    assert_eq!(dsa_pool_chunk_base_aligned(&[], 4098), Ok(()));
+}
+
 /// A full/aligned chunk (`clen == t`, `t` always a multiple of `pool_size`) must
 /// `Nop` every tail-seed stash: `complete == clen`, so every baked row is `<
 /// complete` by construction — `DsaPoolCompress` itself already compressed the

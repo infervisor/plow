@@ -18506,6 +18506,14 @@ impl AmdEngine {
         let insts: &mut [DevInst64] = unsafe {
             std::slice::from_raw_parts_mut(self.h_pf_inst.as_mut_ptr() as *mut DevInst64, n)
         };
+        if let Err(pool) = crate::exec::kvrow::dsa_pool_chunk_base_aligned(insts, c0) {
+            return Err(RuntimeError::Device(format!(
+                "DSA chunk base {c0} is not a multiple of the key-pool size {pool}: \
+                 DsaPoolCompress files rows under chunk_base / pool_size (op_dsa_pool.h), so \
+                 this chunk's leading rows would land in the previous pool. Prefix snapshots \
+                 and chunk boundaries must stay pool-aligned (serve::engine::prefix_plan)."
+            )));
+        }
 
         rebase_chunk_rows(
             insts,
@@ -19511,6 +19519,19 @@ impl AmdEngine {
     /// Bytes one slot's carried recurrent state occupies.
     pub fn carried_bytes(&self) -> u64 {
         self.carried_slot.iter().map(|&(_, n)| n).sum()
+    }
+
+    /// The DSA key-pool size the prefill programs group rows by (non-packed `DsaPoolCompress`,
+    /// `i[6] != 1`, pool size `i[1]`), or 1. Every chunk base and prefix snapshot keeps this
+    /// alignment (`serve::engine::prefix_plan`, [`crate::exec::kvrow::dsa_pool_chunk_base_aligned`]).
+    pub fn dsa_pool_align(&self) -> u32 {
+        self.pf_src
+            .iter()
+            .flatten()
+            .filter(|d| d.op == DevOp::DsaPoolCompress as u16 && d.i[6] != 1)
+            .map(|d| d.i[1].max(1))
+            .max()
+            .unwrap_or(1)
     }
 
     /// Has slot `slot` got a prefix snapshot armed?
