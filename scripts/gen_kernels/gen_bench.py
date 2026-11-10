@@ -54,10 +54,12 @@ def graph_time(fns, reps=7):
 
 
 def rel_err(out, ref):
-    """(max|d| / rms(ref), rel. L2) of `out` against an fp64 reference."""
+    """(max|d| / rms(ref), rel. L2) of `out` against an fp64 reference; an all-zero reference
+    gives 0 for an exact output and inf otherwise."""
     d = out.double() - ref.double()
-    rms = ref.double().pow(2).mean().sqrt()
-    return (d.abs().max() / rms).item(), (d.norm() / ref.double().norm()).item()
+    ratio = lambda num, den: num / den if den > 0 else (0.0 if num == 0 else math.inf)
+    return (ratio(d.abs().max().item(), ref.double().pow(2).mean().sqrt().item()),
+            ratio(d.norm().item(), ref.double().norm().item()))
 
 
 def pcm_rms(out, ref):
@@ -66,9 +68,14 @@ def pcm_rms(out, ref):
     return d.pow(2).mean(1).sqrt().max().item()
 
 
+COLD_SETS_MAX = 64
+
+
 def cold_sets(rotating_bytes):
-    """Number of rotating input sets whose total exceeds L2."""
-    return max(2, min(16, math.ceil(COLD_BYTES / max(1, rotating_bytes))))
+    """Number of rotating input sets whose total exceeds L2, capped at COLD_SETS_MAX graph nodes;
+    under the cap's reach (sets x bytes < COLD_BYTES) the timing is cache-warm and the caller
+    says so."""
+    return max(2, min(COLD_SETS_MAX, math.ceil(COLD_BYTES / max(1, rotating_bytes))))
 
 
 def load_ceilings(path=None):
