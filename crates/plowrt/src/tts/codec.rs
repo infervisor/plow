@@ -2044,7 +2044,11 @@ fn rank(
     let band = match j.urgency {
         _ if aged => BAND_URGENT,
         Urgency::First => BAND_FIRST,
-        Urgency::Stream if j.due.is_some() && slack <= urgent_slack.as_nanos() as i64 => {
+        // Only a step that can still make its deadline: a late one is a stall already, and
+        // late steps ahead of first audios starve every arrival once a server falls behind.
+        Urgency::Stream
+            if j.due.is_some() && (0..=urgent_slack.as_nanos() as i64).contains(&slack) =>
+        {
             BAND_URGENT
         }
         Urgency::Stream => BAND_STREAM,
@@ -2075,20 +2079,24 @@ fn launch_bound(
             let Some(d) = j.deadline() else { continue };
             let slack =
                 d.saturating_duration_since(now).as_secs_f64() * 1e6 - job_cost(caps, costs, j);
-            if j.urgency == Urgency::First || slack <= urgent_slack.as_secs_f64() * 1e6 {
+            // A waiter already past its deadline does not tighten the launch ahead of it: the
+            // miss is sunk, and bounding every launch for it collapses the frame rate.
+            if slack >= 0.0
+                && (j.urgency == Urgency::First || slack <= urgent_slack.as_secs_f64() * 1e6)
+            {
                 bound = Some(bound.map_or(slack, |b: f64| b.min(slack)));
             }
         }
     }
-    bound.map(|b| b.max(0.0))
+    bound
 }
 
 /// A bounded launch of stream steps of `frames` (launch order): `(jobs kept, frames per job)`
 /// on the measured capacity at most `bound_us` that decodes the most frames per µs, when the
 /// capacity `frames` would take is measured above the bound. `None` launches as packed: under
 /// the bound, not yet measured, or (without `progress`) no measured capacity fits the bound.
-/// With `progress`, nothing fitting runs the cheapest measured launch of these jobs instead (priced
-/// by the capacity it selects): a bound under
+/// With `progress`, nothing fitting runs the fastest launch within [`PROGRESS_SPAN`] of the cheapest
+/// measured one of these jobs instead: a bound under
 /// the smallest legal piece is a miss to record, never permission to run the whole cohort.
 fn bound_step(
     caps: &[Capacity],
@@ -2102,37 +2110,36 @@ fn bound_step(
     if costs.get(cb, cn)? <= bound_us {
         return None;
     }
-    let mut best: Option<(f64, usize, usize, usize)> = None;
-    let mut cheapest: Option<(f64, usize, usize)> = None;
-    for &(cb, cn, _) in caps {
+    // (µs, jobs kept, frames per job, frames decoded), priced by the capacity the launch of
+    // these pieces selects, not the candidate's.
+    let pieces = caps.iter().filter_map(|&(cb, cn, _)| {
         let keep = cb.min(frames.len());
         let longest = frames[..keep].iter().map(|&f| f.min(cn)).max().unwrap_or(0);
-        // Priced by the capacity the launch of these pieces selects, not the candidate's.
-        let Some(&(lb, ln, _)) = smallest(caps, keep, longest) else {
-            continue;
-        };
-        let Some(us) = costs.get(lb, ln) else {
-            continue;
-        };
-        if cheapest.is_none_or(|(c, ..)| us < c) {
-            cheapest = Some((us, keep, cn));
-        }
-        if us > bound_us {
-            continue;
-        }
+        let &(lb, ln, _) = smallest(caps, keep, longest)?;
         let decoded: usize = frames[..keep].iter().map(|&f| f.min(cn)).sum();
-        let rate = decoded as f64 / us;
-        if best.is_none_or(|(r, d, ..)| rate > r || (rate == r && decoded > d)) {
-            best = Some((rate, decoded, keep, cn));
+        Some((costs.get(lb, ln)?, keep, cn, decoded))
+    });
+    let fastest = |limit: f64| {
+        let mut best: Option<(f64, usize, usize, usize)> = None;
+        for (us, keep, cn, decoded) in pieces.clone().filter(|p| p.0 <= limit) {
+            let rate = decoded as f64 / us;
+            if best.is_none_or(|(r, d, ..)| rate > r || (rate == r && decoded > d)) {
+                best = Some((rate, decoded, keep, cn));
+            }
         }
-    }
-    if let Some((_, _, keep, cap)) = best {
-        return Some((keep, cap));
-    }
-    cheapest
-        .filter(|_| progress)
-        .map(|(_, keep, cap)| (keep, cap))
+        best.map(|(_, _, keep, cap)| (keep, cap))
+    };
+    fastest(bound_us).or_else(|| {
+        let cheapest = pieces.clone().map(|p| p.0).min_by(f64::total_cmp)?;
+        progress
+            .then(|| fastest(PROGRESS_SPAN * cheapest))
+            .flatten()
+    })
 }
+
+/// The progress piece of a bound nothing fits: the fastest launch within this factor of the
+/// cheapest one's time (b1.f1 alone decodes a tenth of what b8.f1 does in 1.3x the time).
+const PROGRESS_SPAN: f64 = 2.0;
 
 /// Stream steps that wait together for one launch: fewer than this many pending hold.
 const HOLD_BATCH: usize = 8;
@@ -3266,7 +3273,8 @@ mod tests {
             None
         );
         // The fallback is priced by the capacity its launch selects: two 2-frame jobs under a
-        // 1 ms bound run b1.f1 (6 ms), not b2.f2 on the 20 ms b4 capacity.
+        // 1 ms bound run b1.f1 (6 ms), not b2.f2 on the 20 ms b4 capacity; and it takes the
+        // fastest piece near the cheapest, not the cheapest (b8.f1 over b1.f1).
         let caps: Vec<Capacity> = [(1, 1), (4, 2), (16, 2)]
             .into_iter()
             .map(|(b, f)| (b, f, Vec::new()))
@@ -3279,6 +3287,15 @@ mod tests {
             bound_step(&caps, &costs, &[2, 2], 1_000.0, true),
             Some((1, 1))
         );
+        let caps: Vec<Capacity> = [(1, 1), (8, 1), (8, 17)]
+            .into_iter()
+            .map(|(b, f)| (b, f, Vec::new()))
+            .collect();
+        let mut costs = StepCosts::default();
+        costs.observe(1, 1, 4_700.0);
+        costs.observe(8, 1, 6_100.0);
+        costs.observe(8, 17, 23_700.0);
+        assert_eq!(bound_step(&caps, &costs, &[17; 8], 0.0, true), Some((8, 1)));
     }
 
     #[test]
@@ -3380,9 +3397,16 @@ mod tests {
         assert_eq!(h(&mk(Urgency::Stream, None, Some(84), 10)), Some(ms(50)));
         assert_eq!(h(&mk(Urgency::Stream, None, Some(30), 10)), None);
         assert_eq!(h(&mk(Urgency::Stream, None, Some(900), 1990)), Some(ms(10)));
-        // A deadline already passed bounds at zero (the cheapest piece then runs: progress rule).
+        // A deadline already passed does not tighten the bound (the miss is sunk); the cap stays.
         let late = mk(Urgency::First, Some(0), None, 100);
-        assert_eq!(b(0.0, true, &[late]), Some(0.0));
+        assert_eq!(b(0.0, true, &[late.clone_for_test()]), None);
+        assert_eq!(b(10_000.0, true, &[late]), Some(10_000.0));
+        // A late step is no longer urgent: it leads the stream band, behind first audios.
+        let stalled = mk(Urgency::Stream, None, Some(2), 10);
+        assert_eq!(r(&stalled, 4_000.0).0, BAND_STREAM);
+        assert!(r(&first, 0.0) < r(&stalled, 4_000.0));
+        assert!(r(&stalled, 4_000.0) < r(&stream, 0.0));
+        assert_eq!(b(0.0, true, &[stalled]), None);
     }
 
     #[test]
