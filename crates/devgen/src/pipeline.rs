@@ -3330,11 +3330,12 @@ fn conv1d_splitk(
 /// Conv1dF32 / ConvTranspose1dF32 slices, mirroring the interpreter's paths (op_speech_f32.cuh
 /// d_conv1d_f32): bit 16 one warp per output; depthwise 64-row x 64-channel tiles; the direct
 /// form per 256 outputs; the GEMM form 64x64 tiles per (group, phase). `slices` caps the result at the machine.
-/// Rows per tile of the interpreter's staged few-output conv (sp_conv1d_staged): the widest of
+/// Rows per tile of the interpreter's staged few-output conv (sp_conv1d_staged; pinned codec
+/// convs only, every other lowering keeps the direct form and its units): the widest of
 /// 256..32 whose input window (row stride `cin | 1`) and weights fit the speech arena.
 fn conv1d_staged_rows(stage: &Conv1dF32Stage<'_>, transpose: bool) -> Option<u64> {
     const SP_ARENA_FLOATS: u64 = 25856;
-    if transpose || stage.groups != 1 || stage.out_channels > 4 {
+    if !stage.pinned || transpose || stage.groups != 1 || stage.out_channels > 4 {
         return None;
     }
     let (cin, k) = (u64::from(stage.in_channels), u64::from(stage.kernel));

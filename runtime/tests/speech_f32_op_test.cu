@@ -1024,6 +1024,7 @@ static void t_conv_pinned() {
         big.batch = 2; big.in_rows = 9000; big.lengths = {9000, 4321};
         t_conv_staged("Conv1dF32 staged 96->1 9k rows", big);
         ConvSpec st{3, 301, 96, 3, 5, 2, 3, 1, 4, 4, 1, 9, 11, false, true, false, true, {301, 150, 7}, 0.2f, true};
+        st.pin = 1;
         t_conv_staged("Conv1dF32 staged 96->3 s2 d3 reflect pre/post/res", st);
         ConvSpec rp = st;
         rp.mode = 2; rp.cin = 256; rp.cout = 4; rp.kernel = 7; rp.stride = 1; rp.dil_or_opad = 1; rp.f16 = true;

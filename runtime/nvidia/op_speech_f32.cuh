@@ -5711,7 +5711,8 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
     }
     if (!transpose && a.cg == 1u && a.ng == 1u && sp_conv1d_depthwise(a, slice, nblk, arena)) return;
     if (a.ng < 16u || a.cg * a.kernel < 16u) {
-        if (!transpose && a.groups == 1u && a.cout <= 4u && sp_conv1d_staged(a, slice, nblk, arena)) return;
+        /* Pinned (codec) convs only: the emitter sizes the launch for the staged tiles there. */
+        if (!transpose && a.pinned() && a.groups == 1u && a.cout <= 4u && sp_conv1d_staged(a, slice, nblk, arena)) return;
         if (transpose) sp_convt1d_direct(a, slice, nblk);
         else sp_conv1d_direct(a, slice, nblk);
         return;
