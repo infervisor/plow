@@ -127,6 +127,10 @@ def main():
     ap.add_argument("--voice", default=None, help="override every prompt's voice")
     ap.add_argument("--ref-audio", default=None, help="clone every request's voice from this wav (a comma list: cycled)")
     ap.add_argument("--ref-text", default=None, help="transcripts of --ref-audio ('|' list, same order; Fish / Breeze)")
+    ap.add_argument("--clone-list", default=None,
+                    help="Seed-TTS-eval meta.lst (id|ref_text|ref_wav|text, wav paths relative to it): one request per line, "
+                         "each cloned from its own reference; wavs are named <id>.wav (--n caps the lines)")
+    ap.add_argument("--seed-offset", type=int, default=0, help="added to every request's seed (repeat runs)")
     ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
     args = ap.parse_args()
     global SESSION, PROMPT_SET, SR
@@ -145,9 +149,21 @@ def main():
             for r, t in zip(refs, args.ref_text.split("|"), strict=True):
                 r["ref_text"] = t
     per = lambda i: dict(extra, **refs[i % len(refs)]) if refs else extra
+    names = None
+    if args.clone_list:
+        import base64
+        base = os.path.dirname(os.path.abspath(args.clone_list))
+        lines = [l.rstrip("\n").split("|") for l in open(args.clone_list) if l.strip()][: args.n]
+        names = [f"{i}.wav" for i, *_ in lines]
+        clone = [dict(ref_audio=base64.b64encode(open(os.path.join(base, w), "rb").read()).decode(), ref_text=rt)
+                 for _, rt, w, _ in lines]
+        per = lambda i: dict(extra, **clone[i])
+        args.n = len(lines)
     prompts = VEENA_PROMPTS if args.prompt_set == "veena" else [("default", t) for t in CBX_TEXTS]
     if args.prompt_set == "chatterbox-mtl":
         prompts = [("default", t) for _, t in MTL_PROMPTS]
+    if names is not None:
+        prompts = [("default", l[3]) for l in lines]
     if args.voice:
         prompts = [(args.voice, t) for _, t in prompts]
     jobs = [(prompts[i % len(prompts)], i) for i in range(args.n)]
@@ -156,14 +172,14 @@ def main():
         call_one(args.url, args.model, spk, text, args.stream or args.ws, 1000 + i, per(i))
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(args.conc) as ex:
-        res = list(ex.map(lambda j: call_one(args.url, args.model, j[0][0], j[0][1], args.stream or args.ws, j[1] + 1, per(j[1])), jobs))
+        res = list(ex.map(lambda j: call_one(args.url, args.model, j[0][0], j[0][1], args.stream or args.ws, j[1] + 1 + args.seed_offset, per(j[1])), jobs))
     wall = time.perf_counter() - t0
     texts = {}
     rows = []
     for ((spk, text), i), r in zip(jobs, res):
         if args.wav and r["audio_s"] > 0:
             import numpy as np, soundfile as sf
-            name = f"{tag}_{i:02d}_{spk}.wav"
+            name = names[i] if names is not None else f"{tag}_{i:02d}_{spk}.wav"
             sf.write(f"{args.out}/{name}", np.frombuffer(r["pcm"], dtype="<i2"), SR)
             texts[name] = dict(text=text, language=LANG_OF[text]) if args.prompt_set == "chatterbox-mtl" else text
         rows.append(dict(i=i, speaker=spk, ttfa_s=r["ttfa_s"], latency_s=r["latency_s"], audio_s=r["audio_s"],

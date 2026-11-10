@@ -53,6 +53,10 @@ fn conv<'a>(
         wgmma: false,
         weight_split: false,
         dual_alpha: false,
+        pinned: false,
+        wgmma_ragged: false,
+        input_split: false,
+        output_split: false,
     }
 }
 
@@ -85,6 +89,7 @@ impl Seq {
                 epsilon: 1e-5,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         Ok(self.done(e))

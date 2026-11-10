@@ -541,6 +541,37 @@ pub(crate) fn emit_is_apple() -> bool {
     EMIT_IS_APPLE.with(|c| c.get())
 }
 
+/// `PLOW_FUSE_KV_HNR` (HeadNormRope `i[7] = 1`: the K op also writes the V cache from t7) has a
+/// device arm only in the NVIDIA interpreters (interp_sm120.cu, included by sm89/sm90a). The
+/// AMD, Metal and CPU-golden ops never read `i[7]`, so an emit for them keeps the separate V
+/// writer.
+pub(crate) fn fuse_kv_hnr_target_supported() -> bool {
+    !emit_is_amd() && !emit_is_apple() && !EMIT_IS_CPU.with(|c| c.get())
+}
+
+thread_local! {
+    static EMIT_IS_CPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scoped "the target is the plowrt CPU engine" flag ([`target_is_cpu`]). A CPU target takes the
+/// NVIDIA emit decisions, so neither of the other two guards marks it.
+struct EmitCpuGuard {
+    prev: bool,
+}
+
+impl EmitCpuGuard {
+    fn set(cpu: bool) -> Self {
+        let prev = EMIT_IS_CPU.with(|c| c.replace(cpu));
+        Self { prev }
+    }
+}
+
+impl Drop for EmitCpuGuard {
+    fn drop(&mut self) {
+        EMIT_IS_CPU.with(|c| c.set(self.prev));
+    }
+}
+
 /// Scoped "the target is an Apple GPU (metal3)" flag, as [`EmitAmdGuard`] for AMD.
 struct EmitAppleGuard {
     prev: bool,
@@ -5881,6 +5912,9 @@ fn emit_phase(
             !span_kv || (fp8_kv && gemv_family && !fuse_hnr && !shared),
             "PLOW_EMIT_SPAN_VERIFY needs the FP8-KV GEMV decode family"
         );
+        // The fused-V arm (`i[7] = 1`, t6/t7) exists only in interp_sm120.cu, which the sm89
+        // and sm90a interpreters include; the AMD, Metal and CPU-golden HeadNormRope ignore
+        // i[7], so there the V cache would never be written.
         let fuse_kv = decode
             && !fuse_hnr
             && !shared
@@ -5888,7 +5922,8 @@ fn emit_phase(
             && (fuse_qkv || fuse_qkv_fp8)
             && c_k == c_v
             && qk_skip == v_skip
-            && emit_config::active().fuse_kv_hnr;
+            && emit_config::active().fuse_kv_hnr
+            && fuse_kv_hnr_target_supported();
         let c_kn = if fuse_hnr || shared || hnr_fold {
             0
         } else {
@@ -10796,6 +10831,7 @@ fn emit_dense_gqa(
     // Same no-target rule as run_verified's guard: legacy (golden) emission stays AMD.
     let _emit_target = EmitAmdGuard::set(amd || (arch.is_empty() && gpu.is_empty()));
     let _apple_target = EmitAppleGuard::set(arch == "metal3");
+    let _cpu_target = EmitCpuGuard::set(target_is_cpu(&arch, &gpu));
     // Same reason as the other entry: the tile selector must cost against THIS part, and
     // `--arch` is the fallback when --gpu cannot answer.
     if amd {
@@ -11433,7 +11469,7 @@ fn emit_dense_gqa(
         );
         sections.push(
             tts::speech_pipeline_section(
-                &m,
+                &mut m,
                 pipeline::CausalPipelineSpec {
                     name: "speech",
                     max_context: ctx,
@@ -12094,8 +12130,20 @@ fn emit_dense_gqa(
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().1;
-        let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16)
-            .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
+        // The split-image GEMM arm exists only in the sm_90a speech object (PLOW_NV_HOPPER).
+        assert!(
+            !ecfg.s3gen_split_a || arch == "sm_90a",
+            "s3gen packet: PLOW_EMIT_S3GEN_SPLIT_A needs the sm_90a speech object, not {arch}"
+        );
+        let (model, section) = s3gen::lower_s3gen(
+            dir,
+            n_cu,
+            m.target,
+            sites,
+            ecfg.s3gen_attn_h16,
+            ecfg.s3gen_split_a,
+        )
+        .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
         speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
@@ -12171,6 +12219,7 @@ fn emit_dense_gqa(
         if speech.ops != 0 {
             man["speech_ops"] = speech.ops.into();
             man["speech_conv_posts"] = speech.conv_posts.into();
+            man["speech_split_a"] = speech.split_a.into();
             man["speech_conv_wide_padded"] = speech.conv_wide_padded.into();
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the

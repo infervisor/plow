@@ -200,8 +200,20 @@ struct SparseDecodeRelayoutArgs {
 };
 static_assert(sizeof(SparseDecodeRelayoutArgs) == 40);
 
-// AITER writes [row][split][head][512] normalized partials with one LSE each; the merge reads
-// [row][head][split] with (m, l). (m, l) = (lse, 1) makes l*exp(m - M) the exact LSE weight.
+// AITER writes [row][split][head][512] normalized partials with one natural-log LSE each; the
+// merge reads [row][head][split] with (m, l). (m, l) = (lse, 1) makes l*exp(m - M) the exact LSE
+// weight. The consumer (`d_mla_merge_fold`) weights partials with FA_EXP(m - M): exp2 under
+// FA_USE_EXP2 (the default), so the LSE is stored in log2 units there,
+// exp2((lse - L) * log2e) = exp(lse - L), and unchanged under FA_USE_EXP2=0. This TU does not
+// include the attention header; its default and constant are mirrored here.
+#ifndef FA_USE_EXP2
+#define FA_USE_EXP2 1
+#endif
+#if FA_USE_EXP2
+#define PLOW_MLA_SPARSE_LSE_UNIT 1.4426950408889634f
+#else
+#define PLOW_MLA_SPARSE_LSE_UNIT 1.0f
+#endif
 extern "C" __global__ void plow_mla_sparse_decode_relayout(SparseDecodeRelayoutArgs a) {
     const unsigned ns = a.nsplit;
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < a.rows * 8u * ns * 128u;
@@ -211,7 +223,7 @@ extern "C" __global__ void plow_mla_sparse_decode_relayout(SparseDecodeRelayoutA
         const unsigned src = (hrow / 8u * ns + s) * 8u + hrow % 8u;
         ((float4*)a.opart)[unit * 128u + col] = ((const float4*)a.part)[src * 128u + col];
         if (col == 0) {
-            a.ml[unit * 2u] = a.lse[src];
+            a.ml[unit * 2u] = a.lse[src] * PLOW_MLA_SPARSE_LSE_UNIT;
             a.ml[unit * 2u + 1u] = 1.0f;
         }
     }

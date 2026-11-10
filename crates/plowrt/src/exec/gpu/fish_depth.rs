@@ -11,6 +11,7 @@ use crate::exec::packet_runtime::{PacketBuffer, PacketBufferPool};
 use crate::{Result, RuntimeError};
 use std::sync::Arc;
 
+use super::decode_object::BoundDecodeObject;
 use super::{DevInst64, DevOp, DevProgram, GpuEngine, BLOCK, TENSOR_NONE16};
 
 const STAGE_CONTROL_BYTES: usize = 8 + 16 + 8 + 4 + 4;
@@ -238,6 +239,7 @@ impl SpeechFn {
         e: &GpuEngine,
         assets: &std::path::Path,
         programs: &[plow_asset::aux_program::Program],
+        (blob, raw): (&DevBlob, &[u8]),
     ) -> Result<Self> {
         let (file, symbol) = super::packet_exec::speech_object(e.be.compute_capability());
         let path = assets.join(file);
@@ -247,6 +249,14 @@ impl SpeechFn {
         })?;
         let module = e.be.module_load(&image)?;
         let f = e.be.get_function(&module, symbol)?;
+        let layout = blob.speech_flag_layout(raw)?;
+        super::packet_exec::check_speech_flag_layout(
+            &e.be,
+            &module,
+            &path,
+            layout.declared,
+            layout.any(),
+        )?;
         let need = programs
             .iter()
             .flat_map(|p| p.insts.iter())
@@ -265,6 +275,16 @@ impl SpeechFn {
                     path.display()
                 )));
             }
+        }
+        let caps = super::packet_exec::missing_speech_caps(
+            super::packet_exec::speech_caps_required(programs.iter().flat_map(|p| &p.insts)),
+            e.be.module_global_u32(&module, "plow_speech_caps_speech")?,
+        );
+        if caps != 0 {
+            return Err(reject(format!(
+                "{} lacks speech capabilities {caps:#x}",
+                path.display()
+            )));
         }
         let smem =
             e.be.module_global_u32(&module, "plow_arena_bytes_speech")?
@@ -405,7 +425,7 @@ impl FishDepth {
         let bytes = blob
             .reserved_metadata(raw, plow_asset::fish_depth::PROGRAMS_SECTION)?
             .ok_or_else(|| reject("depth programs section missing"))?;
-        Self::load(e, manifest, bytes, assets).map(Some)
+        Self::load(e, manifest, bytes, assets, (blob, raw)).map(Some)
     }
 
     fn load(
@@ -413,6 +433,7 @@ impl FishDepth {
         manifest: Manifest,
         bytes: &[u8],
         assets: &std::path::Path,
+        packet: (&DevBlob, &[u8]),
     ) -> Result<Self> {
         let section =
             plow_asset::aux_program::parse(bytes, e.grid, e.devp.len()).map_err(reject)?;
@@ -424,6 +445,13 @@ impl FishDepth {
         let k = manifest.codebooks as usize;
         let need = |h: u16, bytes: usize| e.devp[usize::from(h)].len >= bytes as u64;
         let maya2 = manifest.sampler == Sampler::Maya2;
+        // Only the speech object (the Maya 2 path) reads the flag bits assigned since layout 0.
+        if !maya2 {
+            plow_asset::speech_flag_layout::refuse_on_decode_objects(
+                section.programs.iter().flat_map(|p| &p.insts),
+            )
+            .map_err(reject)?;
+        }
         if maya2
             && (rows > e.batch
                 || !need(t.params, rows * 16)
@@ -481,7 +509,7 @@ impl FishDepth {
                 logits: e.be.host_alloc_pinned(rows * e.vocab() * 2)?,
                 scratch: Vec::new(),
                 depth: (f32::from_bits(t), k),
-                speech: SpeechFn::load(e, assets, &section.programs)?,
+                speech: SpeechFn::load(e, assets, &section.programs, packet)?,
                 null_memory: null_memory(e, &manifest)?,
             }),
             _ => None,
@@ -750,6 +778,17 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Depth programs of 8 rows up to the `_gw` sibling's wide-arm rung launch on it (full claim),
+    /// as the backbone's batched rungs do; at and past that rung the depth's projections are below
+    /// the wide arm's size floor and the main object's walk is faster. Qwen3-TTS depth ms, B=16 /
+    /// 32: 5.87 / 7.10 -> 5.29 / 6.58; B=48 / 64 on the `_gw` object: 10.35 / 10.62 -> 10.76 / 11.17.
+    fn depth_object(&self, rows: usize) -> Option<&BoundDecodeObject> {
+        self.depth_gw
+            .as_ref()
+            .filter(|(min_rows, _)| (8..*min_rows).contains(&rows))
+            .map(|(_, o)| &**o)
+    }
+
     fn fish_launch(
         &mut self,
         d: &mut FishDepth,
@@ -875,11 +914,12 @@ impl GpuEngine {
             arg.tensors = outputs.tensors;
         }
         let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+        let object = self.depth_object(n);
         self.be.launch_cooperative(
-            self.f,
-            self.grid,
-            BLOCK,
-            self.smem,
+            object.map_or(self.f, |o| o.function),
+            object.map_or(self.grid, |o| o.grid),
+            object.map_or(BLOCK, |o| o.block),
+            object.map_or(self.smem, |o| o.smem),
             &mut params,
             Some(&self.stream),
         )?;

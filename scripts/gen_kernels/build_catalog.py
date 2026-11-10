@@ -537,7 +537,11 @@ class DecodeCase:
     the other layout), kv_len and a slot table (a permutation, so the table is exercised),
     split-KV scratch at NSPLIT_MAX."""
 
-    def __init__(self, drv, H, KVH, D, B, ctx, ns_max, seed=0, window=0, ring=False, ilv=False):
+    def __init__(self, drv, H, KVH, D, B, ctx, ns_max, seed=0, window=0, ring=False, ilv=False,
+                 poison=False):
+        """`poison`: K/V rows outside every sequence's [lo, kv_len) hold NaN (rows past kv_len
+        are never written under live KV; a body that lets a masked row's value into P.V fails
+        the reference)."""
         torch = drv.torch
         g = torch.Generator(device="cuda").manual_seed(seed)
         self.H, self.KVH, self.D, self.B, self.window, self.ilv = H, KVH, D, B, window, ilv
@@ -555,6 +559,22 @@ class DecodeCase:
                                  dtype=torch.int32)
         self.slot = torch.tensor([(b * 5 + 3) % B for b in range(B)], device="cuda",
                                  dtype=torch.int32)
+        if poison:
+            # The slot table can alias (B = 5 maps every sequence to slot 3): a row is dead only
+            # when no sequence of its slot reads it.
+            dead_of = {}
+            for b in range(B):
+                n, s = int(self.lens[b]), int(self.slot[b])
+                lo = max(0, n - window) if window else 0
+                live = torch.arange(lo, n, device="cuda") & self.kv_mask
+                dead_of.setdefault(s, torch.ones(self.kv_stride, dtype=torch.bool,
+                                                 device="cuda"))[live] = False
+            for s, dead in dead_of.items():
+                for t in (self.k, self.v):
+                    if ilv:
+                        t[s, dead] = float("nan")
+                    else:
+                        t[s, :, dead] = float("nan")
         self.o = torch.full((B, H, D), float("nan"), device="cuda", dtype=bf)
         self.opart = torch.zeros(B, H, ns_max, D, device="cuda", dtype=torch.float32)
         self.ml = torch.zeros(B, H, ns_max, 2, device="cuda", dtype=torch.float32)
@@ -587,9 +607,10 @@ class DecodeCase:
         return ((o - r).norm() / r.norm()).item()
 
 
-def bench_decode_entry(drv, name, image, arena, block, classes, check_pack=True):
+def bench_decode_entry(drv, name, image, arena, block, classes, check_pack=True, poison=False):
     """Flash-decode entries: us per launch at each (heads, kv heads, rows, context) class with
-    the runtime's split policy; `packed_check` = a ring KV with a window at a permuted slot table."""
+    the runtime's split policy; `packed_check` = a ring KV with a window at a permuted slot table.
+    `poison`: NaN in every K/V row outside [lo, kv_len) (see DecodeCase)."""
     torch = drv.torch
     _, fn = drv.function(image, "plow_gen_flash_decode", arena)
     sig = ENTRIES[name]["signature"]
@@ -600,7 +621,8 @@ def bench_decode_entry(drv, name, image, arena, block, classes, check_pack=True)
     for H, KVH, B, ctx in classes:
         per = B * KVH * ctx * D * 2 * 2
         n = max(2, min(8, math.ceil(160e6 / per)))
-        cases = [DecodeCase(drv, H, KVH, D, B, ctx, ns_max, seed=s, ilv=ilv) for s in range(n)]
+        cases = [DecodeCase(drv, H, KVH, D, B, ctx, ns_max, seed=s, ilv=ilv, poison=poison)
+                 for s in range(n)]
         nsplit = pick_nsplit(B, KVH, -(-ctx // 64), ns_max)
         launch = lambda c, ns=nsplit: drv.launch(fn, (KVH * ns, B), block, arena, c.args(ns))
         launch(cases[0])
@@ -614,7 +636,8 @@ def bench_decode_entry(drv, name, image, arena, block, classes, check_pack=True)
         torch.cuda.empty_cache()
     if check_pack:
         H, KVH = classes[0][:2]
-        c = DecodeCase(drv, H, KVH, D, 5, 3000, ns_max, seed=7, window=1024, ring=True, ilv=ilv)
+        c = DecodeCase(drv, H, KVH, D, 5, 3000, ns_max, seed=7, window=1024, ring=True, ilv=ilv,
+                       poison=poison)
         drv.launch(fn, (KVH * ns_max, 5), block, arena, c.args(ns_max))
         torch.cuda.synchronize()
         res["packed_check"] = {"rel_l2": float(f"{c.reference():.2e}"),
@@ -775,8 +798,14 @@ def cmd_bench(a):
         if entry_op(name) != "flash_decode":
             classes = classes + [(H, KVH, int(x)) for x in a.rows]
         rows = [c[2] for c in classes]
-        print(name, json.dumps(bench_any(drv, name, image, arena, row["config"]["threads"],
-                                         classes), indent=1))
+        if entry_op(name) == "flash_decode":
+            res = bench_decode_entry(drv, name, image, arena, row["config"]["threads"], classes,
+                                     poison=a.poison)
+        else:
+            res = bench_any(drv, name, image, arena, row["config"]["threads"], classes)
+        print(name, json.dumps(res, indent=1))
+        if a.poison and any(not v["rel_l2"] < 2e-2 for v in res.values()):
+            sys.exit(f"{name}: a masked K/V row reached the output (rel_l2 above 2e-2 or NaN)")
         if a.px4:
             for r in rows:
                 if r % 64 == 0:
@@ -793,6 +822,8 @@ def main():
     be.add_argument("objdir")
     be.add_argument("--px4")
     be.add_argument("--rows", nargs="*", default=[])
+    be.add_argument("--poison", action="store_true",
+                    help="flash-decode entries: NaN in every K/V row outside [lo, kv_len)")
     c = sub.add_parser("check")
     for p in (b, t, be, c):
         p.add_argument("--entries", default=",".join(ENTRIES),

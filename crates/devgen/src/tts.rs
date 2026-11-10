@@ -307,7 +307,8 @@ pub const MAYA2: SpeechProfile = SpeechProfile {
 /// Qwen/Qwen3-TTS-12Hz-*-CustomVoice (`qwen_tts` `generate`, `scripts/tts/qwen3_tts_prep.py`): a
 /// Qwen3 talker whose rows are text plus codec frames; cb0 class 2048 = codec EOS 2150 (the other
 /// control rows suppressed), at least 2 frames; a 5-layer code predictor samples codebooks 1..15.
-/// Talker and predictor: T 0.9, top-k 50, top-p 1; repetition penalty 1.05 on cb0.
+/// Talker and predictor: T 0.7 (the published config's 0.9 babbles on ~0.7% of Seed-TTS EN
+/// prompts; recipe .md), top-k 50, top-p 1; repetition penalty 1.05 on cb0.
 pub const QWEN3_TTS: SpeechProfile = SpeechProfile {
     prompt_template: "{input}",
     voice_token: "{voice}",
@@ -323,7 +324,7 @@ pub const QWEN3_TTS: SpeechProfile = SpeechProfile {
     // As Breeze: ~2.8 frames per Mandarin character, ~0.8 per English one.
     per_char_frames: 3.2,
     max_new_tokens_cap: 1500,
-    temperature: 0.9,
+    temperature: 0.7,
     top_p: 1.0,
     repetition_penalty: 1.05,
     top_k: 50,
@@ -462,7 +463,7 @@ pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
 }
 
 pub fn speech_pipeline_section(
-    model: &Model,
+    model: &mut Model,
     spec: CausalPipelineSpec<'_>,
     p: &SpeechProfile,
     vocab: u32,
@@ -546,6 +547,33 @@ pub fn speech_pipeline_section(
                     name: table.name.clone(),
                     dtype: plow_asset::packet_pipeline::PipelineDType::Bf16,
                     shape: vec![u64::from(vocab), u64::from(spec.hidden)],
+                },
+            );
+            let width = spec.hidden as usize * 2;
+            let start = d.text_pad as usize * width;
+            let reader = crate::checkpoint::TensorReader::open(dir)?;
+            let (dtype, row) = reader.read_range(&table.name, start..start + width)?;
+            if dtype != "BF16" {
+                return Err("speaker conditioning requires a BF16 text-pad row".into());
+            }
+            let name = "in.prompt.text_pad";
+            if let Some(tensor) = model.tensors.iter().find(|t| t.name == name) {
+                if tensor.init.as_ref() != Some(&row) || tensor.bytes != width as u64 {
+                    return Err("speaker conditioning text-pad initializer disagrees".into());
+                }
+            } else {
+                model.tensors.push(packet::devbuild::TensorDecl {
+                    name: name.into(),
+                    bytes: width as u64,
+                    init: Some(row),
+                });
+            }
+            pipe.tensors.insert(
+                "conditioning.text_pad_row".into(),
+                plow_asset::packet_pipeline::PipelineTensor {
+                    name: name.into(),
+                    dtype: plow_asset::packet_pipeline::PipelineDType::Bf16,
+                    shape: vec![u64::from(spec.hidden)],
                 },
             );
             pipe.parameters
@@ -690,7 +718,7 @@ mod speech_tests {
         let overlay = tensors.tensor("in.encoder", 4 * 4);
         let overlay_index = tensors.tensor("in.encoder_index", 512 * 4);
         tensors.tensor("model.embed_tokens.weight", 4096 * 4 * 2);
-        let model = Model {
+        let mut model = Model {
             n_cu: 2,
             target: 0,
             tensors: tensors.tensors(),
@@ -714,7 +742,18 @@ mod speech_tests {
                 overlay_index: Some(overlay_index),
             },
         };
-        let emit = |spec| speech_pipeline_section(&model, spec, &QWEN3_TTS, 4096, &dir);
+        let header = serde_json::json!({"model.embed_tokens.weight": {
+            "dtype": "BF16", "shape": [4096, 4], "data_offsets": [0, 4096 * 4 * 2]
+        }})
+        .to_string()
+        .into_bytes();
+        let mut checkpoint = (header.len() as u64).to_le_bytes().to_vec();
+        checkpoint.extend(header);
+        let mut values = vec![0; 4096 * 4 * 2];
+        values[16..24].copy_from_slice(&[0x80, 0x3f, 0, 0x40, 0x40, 0x40, 0x80, 0x40]);
+        checkpoint.extend(values);
+        std::fs::write(dir.join("model.safetensors"), checkpoint).unwrap();
+        let mut emit = |spec| speech_pipeline_section(&mut model, spec, &QWEN3_TTS, 4096, &dir);
         let meta: PacketPipelines = serde_json::from_slice(&emit(spec).unwrap().data).unwrap();
         let pipe = &meta.pipelines[0];
         assert_eq!(pipe.driver, CONDITIONED_DRIVER);
@@ -728,6 +767,7 @@ mod speech_tests {
             [4096, 4]
         );
         assert_eq!(pipe.strings["prompt.voices"], "");
+        assert_eq!(pipe.tensors["conditioning.text_pad_row"].shape, [4]);
         assert!(pipe.strings.contains_key(CONDITIONING_KEY));
         let mut no_overlay = spec;
         no_overlay.overlay_rows = 0;
@@ -749,6 +789,23 @@ mod speech_tests {
             .contains_key("conditioning.text_embeddings"));
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
         assert!(emit(spec).is_err());
+        assert!(model
+            .tensors
+            .iter()
+            .find(|t| t.name == "model.embed_tokens.weight")
+            .unwrap()
+            .init
+            .is_none());
+        assert_eq!(
+            model
+                .tensors
+                .iter()
+                .find(|t| t.name == "in.prompt.text_pad")
+                .unwrap()
+                .init
+                .as_deref(),
+            Some([0x80, 0x3f, 0, 0x40, 0x40, 0x40, 0x80, 0x40].as_slice())
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
