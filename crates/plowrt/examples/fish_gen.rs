@@ -163,6 +163,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut toks = Vec::new();
         let (mut depth, mut backbone) = (0.0f64, 0.0f64);
+        // `--codes-out FILE`: every frame's codes of every stream, `[frames][N][codebooks]` u32.
+        let mut all_codes: Vec<u32> = Vec::new();
         for frame in 0..frames {
             let feeds: Vec<(usize, u32)> = rows
                 .iter()
@@ -188,6 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = std::time::Instant::now();
             e.fish_depth_step(&step, &mut codes)?;
             depth += t.elapsed().as_secs_f64();
+            all_codes.extend_from_slice(&codes);
             for (k, (r, class)) in rows.iter_mut().enumerate() {
                 *r = step[k];
                 *class = codes[k * info.codebooks];
@@ -201,6 +204,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 distinct += (1..p.min(n)).filter(|&k| row(k) != row(0)).count();
             }
+        }
+        if let Some(path) = opt("--codes-out") {
+            std::fs::write(path, bytemuck::cast_slice::<u32, u8>(&all_codes))?;
         }
         if let Some(plan) = e.depth_plan_describe() {
             println!("{plan}");
