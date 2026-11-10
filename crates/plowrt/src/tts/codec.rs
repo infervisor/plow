@@ -167,6 +167,10 @@ impl SlotPool {
         }
     }
 
+    fn live(&self) -> usize {
+        self.slots.len() - self.free.len()
+    }
+
     fn acquire(&mut self) -> Option<SlotId> {
         let index = self.free.pop()?;
         let s = &mut self.slots[index as usize];
@@ -1815,13 +1819,16 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
             .unwrap_or(URGENT_SLACK_MS),
     );
     let max_wait = crate::serve::cosched::max_wait();
-    let learn = sched || cap_us > 0.0;
+    // Every stream-step launch is timed: `split` prices launches whatever the bound is.
+    let learn = true;
     let mut costs = StepCosts::default();
     let mut pending: Vec<Job> = Vec::new();
+    // The rest of a split launch: it launches next, whatever arrives meanwhile.
+    let mut owed: Vec<Job> = Vec::new();
     let mut hold = None;
     let mut open = true;
-    while open || !pending.is_empty() {
-        let got = if !open || (!pending.is_empty() && hold.is_none()) {
+    while open || !pending.is_empty() || !owed.is_empty() {
+        let got = if !open || !owed.is_empty() || (!pending.is_empty() && hold.is_none()) {
             None
         } else if let Some(wait) = hold {
             match rx.recv_timeout(wait) {
@@ -1838,28 +1845,49 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
                 Err(_) => break,
             }
         };
-        for m in got.into_iter().chain(rx.try_iter()) {
-            match m {
-                Msg::Job(j) => pending.push(j),
-                // The stream is gone and no launch holds its slot: drop its queued step.
-                Msg::Release(id) => {
-                    pending.retain(|j| j.step.is_none_or(|s| s.slot != id));
-                    if let Some(pool) = &codec.slots {
-                        pool.lock().release(id);
+        // A decode tick hands its frames to every stream at once, so their steps arrive as one
+        // burst: take the burst as one launch rather than launching on its first job. The wait
+        // ends at the first gap, or once every live stream has a step queued.
+        let gather_end = std::time::Instant::now() + 4 * STEP_GATHER;
+        let mut burst = got;
+        loop {
+            for m in burst.take().into_iter().chain(rx.try_iter()) {
+                match m {
+                    Msg::Job(j) => pending.push(j),
+                    // The stream is gone and no launch holds its slot: drop its queued step.
+                    Msg::Release(id) => {
+                        pending.retain(|j| j.step.is_none_or(|s| s.slot != id));
+                        owed.retain(|j| j.step.is_none_or(|s| s.slot != id));
+                        if let Some(pool) = &codec.slots {
+                            pool.lock().release(id);
+                        }
+                    }
+                    Msg::Observe(buckets) => {
+                        for family in [
+                            Family::Decode,
+                            Family::Window,
+                            Family::Step,
+                            Family::Slot,
+                            Family::SlotCached,
+                        ] {
+                            let caps = codec.capacities_of(family);
+                            buckets.declare(family.bucket(), caps.iter().map(|c| c.0));
+                        }
+                        codec.buckets = buckets;
                     }
                 }
-                Msg::Observe(buckets) => {
-                    for family in [
-                        Family::Decode,
-                        Family::Window,
-                        Family::Step,
-                        Family::Slot,
-                        Family::SlotCached,
-                    ] {
-                        let caps = codec.capacities_of(family);
-                        buckets.declare(family.bucket(), caps.iter().map(|c| c.0));
-                    }
-                    codec.buckets = buckets;
+            }
+            let live = codec.slots.as_ref().map_or(0, |pool| pool.lock().live());
+            let left = gather_end.saturating_duration_since(std::time::Instant::now());
+            if !open || !owed.is_empty() || left.is_zero() || !gathers(&pending, live) {
+                break;
+            }
+            match rx.recv_timeout(STEP_GATHER.min(left)) {
+                Ok(m) => burst = Some(m),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    open = false;
+                    break;
                 }
             }
         }
@@ -1876,14 +1904,16 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         }
         codec.place_caches(&mut pending);
         // A failed launch or a committed step can turn a queued job unlaunchable.
-        let mut k = 0;
-        while k < pending.len() {
-            match codec.check(&pending[k]) {
-                Ok(()) => k += 1,
-                Err(e) => drop(pending.remove(k).reply.send(Err(e.into()))),
+        for queue in [&mut pending, &mut owed] {
+            let mut k = 0;
+            while k < queue.len() {
+                match codec.check(&queue[k]) {
+                    Ok(()) => k += 1,
+                    Err(e) => drop(queue.remove(k).reply.send(Err(e.into()))),
+                }
             }
         }
-        hold = if open {
+        hold = if open && owed.is_empty() {
             let now = std::time::Instant::now();
             hold_for(&pending, hold_guard, now).and_then(|w| {
                 if sched {
@@ -1903,14 +1933,26 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         } else {
             None
         };
-        if pending.is_empty() || hold.is_some() {
+        if owed.is_empty() && (pending.is_empty() || hold.is_some()) {
             continue;
         }
-        let take = pack(&pending, max_batch, |f, b, n| {
-            codec.capacity(f, b, n).is_some()
-        });
-        let mut batch: Vec<Job> = take.iter().rev().map(|&k| pending.remove(k)).collect();
-        batch.reverse();
+        let mut batch = std::mem::take(&mut owed);
+        if batch.is_empty() {
+            let take = pack(&pending, max_batch, |f, b, n| {
+                codec.capacity(f, b, n).is_some()
+            });
+            let mut keep = take.len();
+            if pending[take[0]].step.is_some() {
+                let family = pending[take[0]].family();
+                let frames: Vec<usize> = take.iter().map(|&k| pending[k].frames).collect();
+                keep = split(&frames, &costs, |b, n| {
+                    codec.capacity(family, b, n).map(|c| (c.0, c.1))
+                });
+            }
+            batch = take.iter().rev().map(|&k| pending.remove(k)).collect();
+            batch.reverse();
+            owed = batch.split_off(keep);
+        }
         // Bounded stream steps: a launch whose measured time exceeds the bound runs the measured
         // capacity under it that decodes the most frames per second; the jobs it leaves out stay
         // queued and the frames it cuts decode as the same steps' next pieces, after anything
@@ -1987,6 +2029,59 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
             }
         }
     }
+}
+
+/// A launch's fixed cost in padded row-frames, for capacities not yet measured (Mimi on H100:
+/// 4.3 ms at one row, 16.2 ms at 128 rows x 1 frame).
+const LAUNCH_FLOOR_ROW_FRAMES: f64 = 48.0;
+
+/// How many of a packed launch's steps (`frames`, in launch order) launch now. A launch pads every
+/// step to its longest, so it costs about rows x longest: a few long steps would set the frames of
+/// many short ones. The prefix that launches is the one whose launch plus one more launch for the
+/// rest costs least, by measured capacity cost (unmeasured capacities are priced from the measured
+/// ones in proportion to their padded row-frames). `capacity(batch, frames)`: the capacity that
+/// launch would run.
+fn split(
+    frames: &[usize],
+    costs: &StepCosts,
+    capacity: impl Fn(usize, usize) -> Option<(usize, usize)>,
+) -> usize {
+    let n = frames.len();
+    if frames.iter().all(|&f| f == frames[0]) {
+        return n;
+    }
+    let model = |(b, f): (usize, usize)| LAUNCH_FLOOR_ROW_FRAMES + (b * f) as f64;
+    // Microseconds per modelled row-frame, over what has been measured.
+    let (us, units) = costs.0.iter().fold((0.0, 0.0), |(us, units), (&cap, &c)| {
+        (us + c, units + model(cap))
+    });
+    let scale = if units > 0.0 { us / units } else { 1.0 };
+    let price = |batch: usize, longest: usize| {
+        let cap = capacity(batch, longest).unwrap_or((batch, longest));
+        costs.get(cap.0, cap.1).unwrap_or(scale * model(cap))
+    };
+    let mut rest_longest = vec![0; n + 1];
+    for k in (0..n).rev() {
+        rest_longest[k] = rest_longest[k + 1].max(frames[k]);
+    }
+    let (mut best, mut best_cost, mut longest) = (n, price(n, rest_longest[0]), 0);
+    for k in 1..n {
+        longest = longest.max(frames[k - 1]);
+        let cost = price(k, longest) + price(n - k, rest_longest[k]);
+        if cost < best_cost {
+            (best, best_cost) = (k, cost);
+        }
+    }
+    best
+}
+
+/// The gap that ends a burst of stream steps ([`gathers`]).
+const STEP_GATHER: std::time::Duration = std::time::Duration::from_micros(150);
+
+/// Whether the worker waits a moment for more of a burst: only stream steps are queued and
+/// fewer of them than there are live stream slots.
+fn gathers(pending: &[Job], live: usize) -> bool {
+    !pending.is_empty() && pending.len() < live && pending.iter().all(|j| j.step.is_some())
 }
 
 fn drain_rests(
@@ -3480,6 +3575,55 @@ mod tests {
                 0x0, 0xbffbbefa, 0x3e1a7124, 0xbf9c05b2, 0xc006eb65, 0x3fbae945, 0xbffb37cd,
                 0xc0259018, 0x3ec18d7f
             ]
+        );
+    }
+
+    #[test]
+    fn launches_split_where_padding_costs_more_than_a_second_launch() {
+        let caps = [
+            (1, 1),
+            (1, 2),
+            (1, 17),
+            (4, 2),
+            (128, 1),
+            (128, 2),
+            (128, 17),
+        ];
+        let cap = |b: usize, n: usize| caps.iter().copied().find(|&(cb, cn)| cb >= b && cn >= n);
+        let mut costs = StepCosts::default();
+        let mixed = |long: usize, long_frames: usize, short: usize| {
+            let mut f = vec![long_frames; long];
+            f.extend(std::iter::repeat_n(1, short));
+            f
+        };
+        // Unmeasured: priced by padded row-frames.
+        assert_eq!(split(&mixed(1, 2, 127), &costs, cap), 1);
+        assert_eq!(split(&mixed(1, 17, 100), &costs, cap), 1);
+        assert_eq!(split(&mixed(126, 2, 2), &costs, cap), 128);
+        assert_eq!(split(&[1; 128], &costs, cap), 128);
+        assert_eq!(split(&[2], &costs, cap), 1);
+        // Measured costs decide: here two frames cost no more than one, so nothing splits.
+        for (b, n, us) in [(1, 2, 4_500.0), (128, 1, 16_000.0), (128, 2, 17_000.0)] {
+            costs.observe(b, n, us);
+        }
+        assert_eq!(split(&mixed(1, 2, 127), &costs, cap), 128);
+        costs = StepCosts::default();
+        for (b, n, us) in [(1, 2, 4_500.0), (128, 1, 16_000.0), (128, 2, 33_000.0)] {
+            costs.observe(b, n, us);
+        }
+        assert_eq!(split(&mixed(1, 2, 127), &costs, cap), 1);
+    }
+
+    #[test]
+    fn step_bursts_gather_until_every_live_stream_is_queued() {
+        let step = || job(false, 1, Some(0));
+        assert!(!gathers(&[], 4));
+        assert!(!gathers(&[step()], 1), "a lone stream launches at once");
+        assert!(gathers(&[step()], 2));
+        assert!(!gathers(&[step(), step()], 2));
+        assert!(
+            !gathers(&[step(), job(false, 1, None)], 4),
+            "decodes do not wait"
         );
     }
 
