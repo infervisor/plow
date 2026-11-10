@@ -589,6 +589,9 @@ pub struct Conv1dF32Stage<'a> {
     /// ([`conv_class_policy`]) and carried in bits 16, 22 and 23, so a row's result never
     /// depends on the batch it runs in. Codec lowerings set it.
     pub pinned: bool,
+    /// Flag bit 3: the wgmma tiles may span taps (tap-major, `in_channels % 64 != 0`) or a
+    /// transposed conv's phases (`out_channels % 64 != 0`, at least 64); widths stay % 4.
+    pub wgmma_ragged: bool,
 }
 
 /// The pre-split B operand of an ungrouped wgmma conv (flag bit 18), appended to its f32 weights
@@ -688,7 +691,8 @@ impl Conv1dF32Stage<'_> {
             && self.alpha.is_none()
             && self.residual.is_none()
             && self.in_channels % 64 == 0
-            && self.out_channels % 64 == 0
+            && (self.out_channels % 64 == 0
+                || (self.wgmma_ragged && self.out_channels % 4 == 0 && self.out_channels >= 64))
     }
 
     /// `(n, k)` of the pre-split wgmma B operand: `[out][kernel * in]`, or a transposed conv's
@@ -2014,7 +2018,8 @@ impl StageProgram {
             | (u32::from(stage.weight_tap_major) << 15)
             | (u32::from(stage.wgmma && stage.split_bf16) << 17)
             | (u32::from(stage.weight_split) << 18)
-            | (u32::from(stage.dual_alpha) << 19);
+            | (u32::from(stage.dual_alpha) << 19)
+            | (u32::from(stage.wgmma_ragged) << 3);
         let n_cu = self.builder.n_cu();
         let policy = conv_class_policy(&stage, transpose, out_rows, n_cu)?;
         let flags = flags
@@ -3371,6 +3376,7 @@ mod tests {
                 weight_split: packed,
                 dual_alpha: false,
                 pinned: false,
+                wgmma_ragged: false,
             };
             let result = p.conv1d_f32_math(h[0], false, &[], stage, Conv1dMath::F32);
             if f16 || split || wgmma || packed {
@@ -3494,6 +3500,7 @@ mod tests {
             weight_split: true,
             dual_alpha: false,
             pinned: false,
+            wgmma_ragged: false,
         };
         assert!(s.convt_wgmma_ok());
         assert_eq!(s.split_geometry(true), (8 * 512, 2 * 1024));
@@ -3816,6 +3823,7 @@ mod tests {
                 weight_split: wgmma,
                 dual_alpha: false,
                 pinned: true,
+                wgmma_ragged: false,
             };
         // Mimi's ELU-pre k3 512->256: the same policy (3xTF32 by default) at every batch and
         // every program role (rows), where the interpreter's crossover used to flip to FFMA at
@@ -3931,6 +3939,7 @@ mod tests {
                     weight_split: false,
                     dual_alpha: false,
                     pinned: false,
+                    wgmma_ragged: false,
                 },
             );
             assert_eq!(r.is_ok(), ok, "{pre:?} -> {post:?} alpha {alpha}");
@@ -3985,6 +3994,7 @@ mod tests {
             weight_split: false,
             dual_alpha: false,
             pinned: false,
+            wgmma_ragged: false,
         };
         let mut p = prefix.program();
         let a = p

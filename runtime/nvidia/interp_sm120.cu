@@ -272,12 +272,19 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #define PLOW_NV_GEMV_K8_OPS 7u
 #endif
 /* Widest activation rung the K-split walk takes: the decode object holds rungs <= 4 (1-tile arm
- * only), the _gw object 8..32. */
+ * only), the _gw object 8..32. _MAIN widens the decode object alone (its rungs past GV_MM_MAX). */
 #ifndef PLOW_NV_GEMV_K8_MAX_GW
 #define PLOW_NV_GEMV_K8_MAX_GW 32
 #endif
+#ifndef PLOW_NV_GEMV_K8_MAX_MAIN
+#define PLOW_NV_GEMV_K8_MAX_MAIN 8
+#endif
+#if PLOW_NV_GEMV_K8_MAX_MAIN != 8 && PLOW_NV_GEMV_K8_MAX_MAIN != 16 && PLOW_NV_GEMV_K8_MAX_MAIN != 32 && \
+    PLOW_NV_GEMV_K8_MAX_MAIN != 64
+#error "PLOW_NV_GEMV_K8_MAX_MAIN must be a K8 tile width (8, 16, 32 or 64): the arena is sized from it"
+#endif
 #ifndef PLOW_NV_GEMV_K8_MAX
-#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : 8)
+#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : PLOW_NV_SPEECH ? 8 : PLOW_NV_GEMV_K8_MAX_MAIN)
 #endif
 #ifndef PLOW_NV_GEMV_K8_MIN
 #define PLOW_NV_GEMV_K8_MIN 2
@@ -1272,6 +1279,12 @@ extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_O
 /* The speech arms a PLOW_SPEECH_OPS object carries (bit op - 163). The mask is not part of the
  * pairing hash, so the loader checks every sidecar's speech ops against it before launching.
  * Absent on an all-arms object (unconstrained), like the pairing stamp. */
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+/* Speech-op semantics beyond the op set (packet_exec::speech_features): bit 1 = conv flag bit 3
+ * (ragged wgmma tiles; bit 0 is retired). A packet relying on a bit is refused by an object
+ * without it. */
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u;
+#endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SPEECH_OPS >> 32);
@@ -2174,7 +2187,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                          in->i[1], in->i[2], slice, nblk);
 #else
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
-                          in->i[1], in->i[2], in->i[7] != 0u, slice, nblk);
+                          in->i[1], in->i[2], in->i[7] != 0u, slice, nblk, arena);
 #endif
         break;
     case PLOW_DOP_SAMPLE_SMALL_F32:

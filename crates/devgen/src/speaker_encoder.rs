@@ -661,6 +661,7 @@ impl Encoder<'_> {
                     weight_split: padded,
                     dual_alpha: false,
                     pinned: false,
+                    wgmma_ragged: false,
                 },
             )?;
             self.seq.done(e)

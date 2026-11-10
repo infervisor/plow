@@ -280,6 +280,8 @@ impl BlobPlan {
                 Some(path) => crate::asset::serve::resolve(dir, path)?.manifest.kv,
                 None => None,
             };
+            let keyed_overlays = crate::tts::SpeechContract::load(dir)?
+                .is_some_and(|c| c.depth && c.slot_prefix_reuse);
             let prefix_layout = checkpoint.and_then(|_| {
                 crate::exec::gpu::GpuEngine::select_vmm_prefix_layout(
                     &blob,
@@ -290,6 +292,7 @@ impl BlobPlan {
                     manifest
                         .as_ref()
                         .map_or(Some(false), |m| m.full_rows_interleaved()),
+                    keyed_overlays,
                 )
             });
             let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());

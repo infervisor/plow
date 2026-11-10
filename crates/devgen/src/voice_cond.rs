@@ -54,6 +54,7 @@ fn conv<'a>(
         weight_split: false,
         dual_alpha: false,
         pinned: false,
+        wgmma_ragged: false,
     }
 }
 
