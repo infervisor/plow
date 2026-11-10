@@ -900,6 +900,8 @@ fn decode_feed_extent(feeds: &[(usize, u32)]) -> Option<usize> {
 struct DecodeProgress {
     extent: usize,
     steps: std::num::NonZeroUsize,
+    /// The rows rode a prefill launch: no decode program ran.
+    rode: bool,
 }
 
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
@@ -907,6 +909,7 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
     Some(DecodeProgress {
         extent: decode_feed_extent(feeds)?,
         steps: std::num::NonZeroUsize::new(steps)?,
+        rode: false,
     })
 }
 
@@ -2411,7 +2414,7 @@ fn spawn_scoped(
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
                     }
-                    if let Some(p) = decode_progress {
+                    if let Some(p) = decode_progress.filter(|p| !p.rode) {
                         let cap = decode_caps.iter().find(|&&c| c >= p.extent);
                         metrics.buckets.record_n(
                             BucketFamily::Decode,
@@ -4165,6 +4168,7 @@ fn run_one_tick(
                             Some(DecodeProgress {
                                 extent,
                                 steps: std::num::NonZeroUsize::new(1)?,
+                                rode: true,
                             })
                         });
                     }
