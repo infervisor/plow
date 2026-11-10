@@ -5,8 +5,9 @@ baseline in scripts/tts/vllm_speech_server.py): same prompts, same client, two b
   python scripts/tts/tts_bench.py --url http://127.0.0.1:PORT --model M --conc 8 --n 32 \
       --stream --out DIR [--wav]
 
-Per request: ttfa_s (first audio byte, streaming) or latency_s, audio_s, rtf. Summary: medians,
-p90 TTFA, aggregate audio seconds per wall second. Writes DIR/<tag>.json and optional wavs
+Per request: ttfa_s (first audio byte, streaming) or latency_s, audio_s, rtf, and for streams the
+playback underruns after the first chunk (gaps, gap_s). Summary: medians, p90 TTFA, gap totals,
+aggregate audio seconds per wall second. Writes DIR/<tag>.json and optional wavs
 plus texts.json for scripts/tts/asr_check.py.
 """
 import argparse, concurrent.futures as cf, http.client, json, os, statistics, sys, threading, time, urllib.error, urllib.request
@@ -24,6 +25,24 @@ SR = 24000
 
 SESSION = None
 PROMPT_SET = None
+# A chunk this late past the end of the audio already received is an underrun (clock jitter).
+GAP_TOLERANCE_S = 0.001
+
+
+def underruns(arrivals, sr):
+    """Playback underruns of a stream: `arrivals` = [(seconds, pcm16 bytes)] in order. Playback
+    starts at the first chunk; a chunk arriving after the audio received so far has played out is
+    a gap, and playback resumes at its arrival. Returns (gaps, total gap seconds)."""
+    gaps, gap_s, end = 0, 0.0, None
+    for t, nbytes in arrivals:
+        dur = nbytes / 2 / sr
+        if end is None:
+            end = t + dur
+        elif t > end + GAP_TOLERANCE_S:
+            gaps, gap_s, end = gaps + 1, gap_s + (t - end), t + dur
+        else:
+            end += dur
+    return gaps, gap_s
 
 
 def one(url, model, voice, text, stream, seed, extra):
@@ -36,7 +55,7 @@ def one(url, model, voice, text, stream, seed, extra):
         headers["X-Session-Id"] = f"{SESSION}-{threading.get_ident()}"
     req = urllib.request.Request(f"{url}/v1/audio/speech", data=json.dumps(body).encode(), headers=headers)
     t0 = time.perf_counter()
-    ttfa, chunks = None, []
+    ttfa, chunks, arrivals = None, [], []
     try:
         with urllib.request.urlopen(req, timeout=900) as r:
             while True:
@@ -46,6 +65,7 @@ def one(url, model, voice, text, stream, seed, extra):
                 if ttfa is None:
                     ttfa = time.perf_counter() - t0
                 chunks.append(b)
+                arrivals.append((time.perf_counter(), len(b)))
                 if not stream:
                     break
     except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
@@ -54,7 +74,8 @@ def one(url, model, voice, text, stream, seed, extra):
         chunks = []
     total = time.perf_counter() - t0
     pcm = b"".join(chunks)
-    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm)
+    gaps, gap_s = underruns(arrivals if chunks else [], SR)
+    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s)
 
 
 def one_ws(url, model, voice, text, seed, extra):
@@ -67,7 +88,7 @@ def one_ws(url, model, voice, text, seed, extra):
     if SESSION:
         headers["X-Session-Id"] = f"{SESSION}-{threading.get_ident()}"
     t0 = time.perf_counter()
-    ttfa, chunks = None, []
+    ttfa, chunks, arrivals = None, [], []
     try:
         with connect(ws_url, additional_headers=headers, open_timeout=900, close_timeout=30, ping_interval=None, ping_timeout=None) as ws:
             ws.send(json.dumps(body))
@@ -76,6 +97,7 @@ def one_ws(url, model, voice, text, seed, extra):
                     if ttfa is None:
                         ttfa = time.perf_counter() - t0
                     chunks.append(message)
+                    arrivals.append((time.perf_counter(), len(message)))
                 elif isinstance(message, str):
                     data = json.loads(message)
                     if "error" in data:
@@ -88,7 +110,8 @@ def one_ws(url, model, voice, text, seed, extra):
         chunks = []
     total = time.perf_counter() - t0
     pcm = b"".join(chunks)
-    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm)
+    gaps, gap_s = underruns(arrivals if chunks else [], SR)
+    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s)
 
 
 def pct(xs, q):
@@ -183,6 +206,7 @@ def main():
             sf.write(f"{args.out}/{name}", np.frombuffer(r["pcm"], dtype="<i2"), SR)
             texts[name] = dict(text=text, language=LANG_OF[text]) if args.prompt_set == "chatterbox-mtl" else text
         rows.append(dict(i=i, speaker=spk, ttfa_s=r["ttfa_s"], latency_s=r["latency_s"], audio_s=r["audio_s"],
+                         gaps=r["gaps"], gap_s=r["gap_s"],
                          rtf=r["latency_s"] / r["audio_s"] if r["audio_s"] else None))
     ok = [r for r in rows if r["audio_s"] > 0]
     if not ok:
@@ -197,7 +221,9 @@ def main():
     if args.stream or args.ws:
         summ.update(med_ttfa_ms=1e3 * statistics.median(r["ttfa_s"] for r in ok),
                     p90_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.9),
-                    p99_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.99))
+                    p99_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in ok], 0.99),
+                    gaps=sum(r["gaps"] for r in ok), gap_streams=sum(r["gaps"] > 0 for r in ok),
+                    gap_s=sum(r["gap_s"] for r in ok))
         if len(ok) > args.conc:
             steady_ok = [r for r in rows[args.conc:] if r["audio_s"] > 0]
             if steady_ok:
