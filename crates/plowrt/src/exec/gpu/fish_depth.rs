@@ -447,17 +447,10 @@ impl FishDepth {
         let maya2 = manifest.sampler == Sampler::Maya2;
         // Only the speech object (the Maya 2 path) reads the flag bits assigned since layout 0.
         if !maya2 {
-            if let Some(op) = plow_asset::speech_flag_layout::first_protected(
-                section
-                    .programs
-                    .iter()
-                    .flat_map(|p| &p.insts)
-                    .map(|d| (d.op, d.fj[2], d.i)),
-            ) {
-                return Err(reject(format!(
-                    "opcode {op} sets a speech flag bit the decode objects do not read"
-                )));
-            }
+            plow_asset::speech_flag_layout::refuse_on_decode_objects(
+                section.programs.iter().flat_map(|p| &p.insts),
+            )
+            .map_err(reject)?;
         }
         if maya2
             && (rows > e.batch

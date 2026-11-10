@@ -60,6 +60,19 @@ pub fn aux_insts(section: &[u8], n_cu: u32) -> Result<Vec<DevInst64>, String> {
     Ok(parsed.programs.into_iter().flat_map(|p| p.insts).collect())
 }
 
+/// Refuses auxiliary programs bound for an object that is not a speech object (the decode
+/// objects read no flag bit assigned since layout 0) when one of them sets a protected bit.
+pub fn refuse_on_decode_objects<'a>(
+    insts: impl IntoIterator<Item = &'a DevInst64>,
+) -> Result<(), String> {
+    match first_protected(insts.into_iter().map(|d| (d.op, d.fj[2], d.i))) {
+        None => Ok(()),
+        Some(op) => Err(format!(
+            "opcode {op} sets a speech flag bit the decode objects do not read"
+        )),
+    }
+}
+
 /// What an emit declares: [`LAYOUT`] when an instruction sets a protected bit, else nothing.
 pub fn declare(used: Option<u16>) -> Option<u32> {
     used.map(|_| LAYOUT)
@@ -206,6 +219,21 @@ mod tests {
         assert_eq!(scan(&section(true)), Some(DevOp::GemvF32Out as u16));
         assert!(!is_aux_programs(b"{\"version\":1}"));
         assert!(aux_insts(&section(true), 5).is_err());
+    }
+
+    #[test]
+    fn decode_objects_refuse_protected_auxiliary_instructions() {
+        let wire = |i7: u32| {
+            let mut d = DevInst64 {
+                op: DevOp::GemvF32Out as u16,
+                ..Default::default()
+            };
+            d.i[7] = i7;
+            d
+        };
+        assert!(refuse_on_decode_objects(&[wire(0), wire(2048)]).is_ok());
+        let e = refuse_on_decode_objects(&[wire(2048), wire(2048 | 4096)]).unwrap_err();
+        assert!(e.contains("do not read"), "{e}");
     }
 
     #[test]

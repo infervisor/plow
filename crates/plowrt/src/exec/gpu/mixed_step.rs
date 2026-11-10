@@ -222,6 +222,8 @@ impl MixedCudaStep {
                     "mixed CUDA decode-slot tensor mismatch".into(),
                 ));
             }
+            plow_asset::speech_flag_layout::refuse_on_decode_objects(&selected.program().insts)
+                .map_err(|e| RuntimeError::Rejected(format!("mixed CUDA program: {e}")))?;
             let (kernarg, counter_base, counter_bytes, tables) =
                 upload_program(be, selected.program(), tensor_table, span_base, parked_base)?;
             programs.push(MixedProgram {

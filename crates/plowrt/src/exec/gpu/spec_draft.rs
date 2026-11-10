@@ -215,17 +215,10 @@ impl SpecDraft {
         }
         // The draft programs run on the decode objects, which read no flag bit assigned since
         // speech flag layout 0.
-        if let Some(op) = plow_asset::speech_flag_layout::first_protected(
-            section
-                .programs
-                .iter()
-                .flat_map(|p| &p.insts)
-                .map(|d| (d.op, d.fj[2], d.i)),
-        ) {
-            return Err(reject(format!(
-                "opcode {op} sets a speech flag bit the decode objects do not read"
-            )));
-        }
+        plow_asset::speech_flag_layout::refuse_on_decode_objects(
+            section.programs.iter().flat_map(|p| &p.insts),
+        )
+        .map_err(reject)?;
         let programs = section
             .programs
             .iter()
