@@ -1254,7 +1254,7 @@ __device__ __forceinline__ float4 sp_ldg4z(const float* p) {
 }
 #if PLOW_SPEECH_SPLIT_A
 /* The split image of an activation [M rows][K] (Conv1dF32 flags bit 30 reads one, bit 31 writes
- * one; LayerNormF32 flags bit 2 and AttentionF32 flags bit 6 write one): the layout of the
+ * one; LayerNormF32 flags bit 2 and AttentionF32 flags bit 7 write one): the layout of the
  * wgmma weight image (devgen `wgmma_weight_split`) over rows instead of weights. Per 64-column
  * k-tile the bf16 hi halves then the lo halves of all M rows, each row 128 bytes whose 16-byte
  * chunk c sits at c ^ (row & 7); the same bytes as the f32 tensor. Column c of row m: */
@@ -6820,8 +6820,8 @@ static __device__ __noinline__ void sp_attention_h16(const PlowDevInst* in, void
             const float inv = lrow[i] > 0.f ? 1.0f / lrow[i] : 0.f;
             float* orow = out + ((size_t)b * q_rows + r) * width + h * HW;
 #if PLOW_SPEECH_SPLIT_A
-            /* flags bit 6: the output is the split image of [batch * q_rows][width] (head = k-tile). */
-            if (in->i[6] & 64u) {
+            /* flags bit 7: the output is the split image of [batch * q_rows][width] (head = k-tile). */
+            if (in->i[6] & 128u) {
 #pragma unroll
                 for (int n = 0; n < 8; n++)
                     spwg_img_store2((char*)out, batch * q_rows, b * q_rows + r, h * HW + n * 8 + 2 * t,

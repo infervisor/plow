@@ -607,7 +607,7 @@ pub struct Conv1dF32Stage<'a> {
 /// [`wgmma_weight_split`] over rows, per 64-column k-tile the bf16 hi halves then the lo halves of
 /// all `rows` rows (no row padding; the consumer zero-fills past them), each row 128 bytes whose
 /// 16-byte chunk `c` sits at `c ^ (row & 7)`: the same byte count as the f32 tensor. Producers:
-/// `LayerNormF32` flag bit 2, `AttentionF32` (pre-formatted prefix path) flag bit 6, `Conv1dF32`
+/// `LayerNormF32` flag bit 2, `AttentionF32` (pre-formatted prefix path) flag bit 7, `Conv1dF32`
 /// flag bit 31; consumer: `Conv1dF32` flag bit 30.
 pub fn split_image(x: &[f32], rows: usize, width: usize) -> Vec<u8> {
     let mut out = vec![0u8; rows * width * 4];
@@ -871,7 +871,7 @@ pub struct AttentionPrefix {
     /// u32[batch] (flag bit 5): item `b` reads only the first `min(rows_per_item[b], rows)` rows
     /// of its block; its own keys follow them directly.
     pub rows_per_item: Option<u32>,
-    /// Flag bit 6 (pre-formatted path only): the output `[batch * q_rows][heads * 64]` is written
+    /// Flag bit 7 (pre-formatted path only): the output `[batch * q_rows][heads * 64]` is written
     /// as its [`split_image`] for a `Conv1dF32` with `input_split`.
     pub split_out: bool,
 }
@@ -2579,7 +2579,7 @@ impl StageProgram {
                     | (u32::from(stage.stream.is_some()) << 3)
                     | (u32::from(stage.prefix.is_some_and(|p| p.h16)) << 4)
                     | (u32::from(stage.prefix.is_some_and(|p| p.rows_per_item.is_some())) << 5)
-                    | (u32::from(stage.prefix.is_some_and(|p| p.split_out)) << 6)
+                    | (u32::from(stage.prefix.is_some_and(|p| p.split_out)) << 7)
                     | (stage.key_length_heads << 8)
                     | (stage.window << 16),
                 stage.prefix.map_or(

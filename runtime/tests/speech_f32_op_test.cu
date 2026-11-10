@@ -2320,7 +2320,7 @@ static void t_split_image() {
         CK(cudaFree(td));
     }
     {
-        /* AttentionF32 h16 flag bit 6 vs its f32 rows: 4 CFG items x 72 rows, 306-row prefix. */
+        /* AttentionF32 h16 flag bit 7 vs its f32 rows: 4 CFG items x 72 rows, 306-row prefix. */
         const unsigned batch = 4, q = 72, heads = 8, hw = 64, width = heads * hw, stride = 3 * width, pre = 306;
         std::vector<uint32_t> ix(batch);
         for (unsigned i = 0; i < batch; i++) ix[i] = i % 2;
@@ -2342,7 +2342,7 @@ static void t_split_image() {
         c.in.i[5] = stride; c.in.i[6] = 2u | 16u; c.in.i[7] = pre;
         c.in.fj[0].f = 0.125f; c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
         PlowDevInst ai = c.in;
-        ai.t[0] = img; ai.i[6] |= 64u;
+        ai.t[0] = img; ai.i[6] |= 128u;
         c.upload();
         void** td = upload_table(c.dev);
         k_speech<<<g_nblk, 256, kSmem>>>(f, td);

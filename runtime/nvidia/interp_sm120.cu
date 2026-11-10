@@ -1281,9 +1281,13 @@ extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_O
  * Absent on an all-arms object (unconstrained), like the pairing stamp. */
 #if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
 /* Speech-op semantics beyond the op set (packet_exec::speech_features): bit 1 = conv flag bit 3
- * (ragged wgmma tiles; bit 0 is retired). A packet relying on a bit is refused by an object
- * without it. */
+ * (ragged wgmma tiles; bit 0 is retired), bit 2 = conv flag bit 30 (split-image input,
+ * PLOW_SPEECH_SPLIT_A). A packet relying on a bit is refused by an object without it. */
+#if defined(PLOW_SPEECH_SPLIT_A) && PLOW_SPEECH_SPLIT_A
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u | 4u;
+#else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u;
+#endif
 #endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);

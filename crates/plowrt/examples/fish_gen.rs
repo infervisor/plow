@@ -187,6 +187,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n as f64 * f / (backbone + depth)
         );
         if let Some(stride) = opt("--depth-sweep").map(|v| v.parse::<usize>().unwrap().max(1)) {
+            if maya2.is_some() {
+                // Its depth programs launch from the speech module, which the cap does not reach.
+                return Err(
+                    "--depth-sweep: the instruction cap does not reach Maya 2 depth programs"
+                        .into(),
+                );
+            }
             depth_sweep(&mut e, &assets, &rows, n, stride)?;
         }
         return Ok(());
