@@ -2212,6 +2212,13 @@ pub fn build(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     build_with_packed_prefill(m, arch, lean, false)
 }
 
+/// [`build`] for the emitters whose packets never carry depth programs: `PLOW_NV_DEPTH_STAGE` 0.
+pub fn build_without_depth(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
+    let mut manifest = build(m, arch, lean);
+    manifest["depth_stage"] = json!(false);
+    manifest
+}
+
 pub fn build_for_packet(
     m: &Model,
     arch: &str,
@@ -2224,11 +2231,14 @@ pub fn build_for_packet(
     });
     let mut manifest = build_with_packed_prefill(m, arch, lean, packed_prefill.is_some());
     manifest["runtime_requires"] = crate::dense_cublaslt::runtime_requires(m, sections);
-    // Only depth programs sample in-program (ops 219 / 221): `PLOW_NV_SAMPLE_RADIX`.
-    manifest["sample_radix"] = json!(sections.iter().any(|section| {
+    // Only depth programs sample in-program (ops 219 / 221) and run the staged head GEMV:
+    // `PLOW_NV_SAMPLE_RADIX`, `PLOW_NV_DEPTH_STAGE`.
+    let depth = sections.iter().any(|section| {
         section.kind == packet::devbuild::SECT_METADATA
             && section.name == plow_asset::fish_depth::SECTION
-    }));
+    });
+    manifest["sample_radix"] = json!(depth);
+    manifest["depth_stage"] = json!(depth);
     if let Some(section) = packed_prefill {
         let packed: plow_asset::packed_prefill::Manifest =
             serde_json::from_slice(&section.data).expect("emitted packed request manifest");
@@ -3264,6 +3274,12 @@ pub fn config_header(manifest: &Value) -> String {
             u8::from(radix)
         ));
     }
+    if let Some(depth) = manifest.get("depth_stage").and_then(Value::as_bool) {
+        out.push_str(&format!(
+            "#ifndef PLOW_NV_DEPTH_STAGE\n#define PLOW_NV_DEPTH_STAGE {}\n#endif\n\n",
+            u8::from(depth)
+        ));
+    }
     if let Some(padded) = manifest
         .get("speech_conv_wide_padded")
         .and_then(Value::as_bool)
@@ -4207,9 +4223,11 @@ mod tests {
         let plain = build(&model(), "sm_90a");
         assert!(!config_header(&plain).contains("PLOW_SPEECH_CONV_WIDE_PADDED"));
         assert!(!config_header(&plain).contains("PLOW_NV_SAMPLE_RADIX"));
+        assert!(!config_header(&plain).contains("PLOW_NV_DEPTH_STAGE"));
         for (key, define) in [
             ("speech_conv_wide_padded", "PLOW_SPEECH_CONV_WIDE_PADDED"),
             ("sample_radix", "PLOW_NV_SAMPLE_RADIX"),
+            ("depth_stage", "PLOW_NV_DEPTH_STAGE"),
         ] {
             for on in [false, true] {
                 let mut man = plain.clone();
