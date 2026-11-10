@@ -58,6 +58,14 @@ as a standalone role object only when its in-model gain exceeds about 5% of the 
 generated code inlined into the interpreter. A block with no spec gets one (a small file beside the
 driver), not a one-off probe.
 
+A spec's `current` is the arm the **production recipe emits** for that block (check the recipe's
+emit options and the interpreter's dispatch for the served shape, not the probe's default path),
+measured standalone in the same lease as the generators. An in-situ per-op number (`packet_bench`
+or `step_bench` sweeps, a marginal time inside the interpreter) is not comparable with a standalone
+candidate; a recorded `measured_us` current only ranks candidates and never supports a "generated
+is faster" verdict. The CFM attention search first compared against the path of a packet without
+`PLOW_EMIT_S3GEN_ATTN_H16` and read a generated win that the production kernel reverses by 19-49%.
+
 **ISA reference.** Before writing or changing a kernel, inline asm, intrinsics or low-level
 C/CUDA/HIP/Metal for target `$ISA`, read `docs/bringup/isa/<target>.md` (index:
 [isa/README.md](isa/README.md)): matrix instructions, memory movement, sync rules, the flags our

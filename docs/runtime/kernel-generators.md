@@ -207,29 +207,43 @@ role object when the in-model gain exceeds about 5% of the step.
 
 ### First spec: S3Gen CFM attention (`spec_s3gen_cfm_attn`, 2026-11-10)
 
-H100, one queue job (about 6 min: 24 TileLang configs x 4 classes + the current kernel), torch
-2.13 / TileLang 0.1.12, default lowering (cp.async, f32 `T.gemm`, no warp specialisation). Times
-in µs.
+H100, torch 2.13, TileLang 0.1.12, Triton 3.7.1. Times in µs; % of floor in brackets.
 
-| block (op, class) | current plow | best generated | generated config | roofline floor | % of floor (current) | % of floor (generated) | gap (generated vs current) | rel-L2 | verdict |
-|---|---|---|---|---|---|---|---|---|---|
-| AttentionF32 prefix306 h8x64, b64_q136 | 269.2 | 804.7 | tilelang bm64 bn32 threads128 stages1 | 30.6 | 11% | 4% | +198.9% | 3.2e-06 | leave: plow kernel ahead |
-| AttentionF32 prefix306 h8x64, b128_q136 | 478.5 | 1590.0 | tilelang bm64 bn32 threads128 stages2 | 61.3 | 13% | 4% | +232.3% | 3.2e-06 | leave: plow kernel ahead |
-| AttentionF32 prefix306 h8x64, b64_q72 | 146.4 | 403.0 | tilelang bm32 bn32 threads256 stages2 | 13.9 | 9% | 3% | +175.3% | 2.7e-06 | leave: plow kernel ahead |
-| AttentionF32 prefix306 h8x64, b128_q72 | 238.7 | 793.3 | tilelang bm32 bn32 threads256 stages1 | 27.7 | 12% | 3% | +232.3% | 2.7e-06 | leave: plow kernel ahead |
+| block (op, class) | plow production | best TileLang | best Triton (passing) | roofline floor | Triton vs plow | verdict |
+|---|---|---|---|---|---|---|
+| AttentionF32 prefix306 h8x64, b64_q136 | 188.4 (16%) | 534.9 (6%) | 251.2 (12%) | 30.6 | +33.4% | leave: plow kernel ahead |
+| AttentionF32 prefix306 h8x64, b128_q136 | 334.5 (18%) | 1057.1 (6%) | 497.5 (12%) | 61.3 | +48.7% | leave: plow kernel ahead |
+| AttentionF32 prefix306 h8x64, b64_q72 | 112.6 (12%) | 403.0 (3%) | 134.0 (10%) | 13.9 | +19.0% | leave: plow kernel ahead |
+| AttentionF32 prefix306 h8x64, b128_q72 | 184.9 (15%) | 579.0 (5%) | 264.5 (10%) | 27.7 | +43.0% | leave: plow kernel ahead |
 
-- Current = the interpreter path of the standalone probe `cfm_attn.cu` (which 0, 132 blocks),
-  measured in the same lease; it reproduces the probe header's 268 / 474 / 146 / 236 µs.
-- Floor: three split products per GEMM priced at the calibrated 16-bit tensor peak
-  (771.3 TF/s) and 3094 GB/s; the floor is compute-bound at every class.
-- 22 of 24 configs pass the 1e-5 rel-L2 bound at every class; `bm16 bn32 threads256` does not
-  build (TileLang warp-partition assertion).
-- With `TL_TF=1` (tfloat32 shared operands, so the products run on tensor cores; second job,
-  classes b64_q136 and b128_q72) the best config is `bm64 bn32 threads256 stages2` at 535.0 /
-  579.0 µs against 268.6 / 238.4 µs, rel-L2 3.2e-6 / 2.7e-6: still 2.0-2.4x slower.
-- No config of this body comes within 2x of the hand-written kernel, so there is no schedule
-  to port from it. The block stays at 9-13% of its floor. `TL_WG` (wgmma) and a Triton body
-  were not run.
+- **plow production** is the 3xFP16 attention over a pre-formatted prefix that the production
+  recipes select (`PLOW_EMIT_S3GEN_ATTN_H16=1`, `sp_attention_h16`), timed as its copy in the
+  standalone probe `cfm_attn.cu` (which 23, 132 blocks), rel-L2 2.7e-7. It and the Triton
+  column are one queue job (144 Triton configs x 4 classes, about 2.5 min of lease).
+  - An earlier version of this table used probe which 0 as "current": the 3xTF32 path of a
+    packet emitted without that option (269.2 / 478.5 / 146.4 / 238.7 µs). Against that path
+    Triton reads -6% / +4% / -8% / +11%, which is not a comparison with what ships.
+- **Floor:** three split products per GEMM priced at the calibrated 16-bit tensor peak
+  (771.3 TF/s) and 3094 GB/s; compute-bound at every class.
+- **Triton** (`attn_cfm_triton.py`; `tl.dot` `input_precision` x BM {16, 32, 64, 128} x BN
+  {32, 64} x warps {2, 4, 8} x stages {1, 3}): the best passing config is the same at every
+  class, `tf32x3 bm32 bn32 warps2 stages3`, rel-L2 3.5e-7.
+  - `tf32x3` (the hi/lo split, three tensor-core products) passes the 1e-5 bound in 48 of 48
+    configs per class. It is what passes at speed.
+  - `tf32` (one truncated product) is the fastest at 107.5 / 206.5 / 63.3 / 122.3 µs and
+    fails in 48 of 48: rel-L2 1.5e-3.
+  - `ieee` (FP32 FMA) passes at 869.0 / 1727.1 / 431.3 / 834.4 µs.
+- **TileLang** (`attn_cfm.py`, BM {16, 32, 64} x BN {32, 64} x threads {128, 256} x stages
+  {1, 2}), earlier jobs, so not same-lease with the production column:
+  - default lowering (f32 `T.gemm`), four classes: 804.7 / 1590.0 / 403.0 / 793.3 µs, rel-L2
+    2.7-3.2e-6; 22 of 24 configs pass, `bm16 bn32 threads256` does not build.
+  - `TL_TF=1` (tfloat32 operands): `bm64 bn32 threads256` at 534.9 (b64_q136), 1057.1
+    (b128_q136), 579.0 (b128_q72); b64_q72 was not run with it, its entry above is the default
+    lowering. At BM 64 the generated source already uses wgmma; `TL_WG=1` changes nothing
+    there (534.9 vs 535.0) and does not build below BM 64.
+- No generated schedule reaches the production kernel at any class (Triton 1.19-1.49x,
+  TileLang 2.8-3.6x), so there is nothing to port. The production kernel is at 12-18% of its
+  floor.
 
 ## AMD
 
