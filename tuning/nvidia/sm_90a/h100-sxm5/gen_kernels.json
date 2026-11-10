@@ -326,7 +326,7 @@
    "spill_bytes": 0
   },
   "attn_pf_hd256_causal": {
-   "body_sha256": "0474900ee1d54109f57cb292b2b00ab15de5213da9e5d922d9484bd13dc2e648",
+   "body_sha256": "a3ead5e664d7b7f2a9c839bbfa8a62dabefa0f09714e4548111405584fdebfc0",
    "classes": {},
    "config": {
     "bn": 64,
@@ -354,7 +354,7 @@
    "spill_bytes": 0
   },
   "attn_pf_hd256_causal_ilv": {
-   "body_sha256": "183333a0f8a6a0daf1d6680d7a5bd5ff0c1596920a4b0f5486603872f7d18992",
+   "body_sha256": "0f18282bac100e1521867203b06c3c9631df0d92532e15cb36e860552fcd8b06",
    "classes": {},
    "config": {
     "bn": 64,
@@ -383,7 +383,7 @@
    "spill_bytes": 0
   },
   "attn_pf_hd256_sliding": {
-   "body_sha256": "0474900ee1d54109f57cb292b2b00ab15de5213da9e5d922d9484bd13dc2e648",
+   "body_sha256": "a3ead5e664d7b7f2a9c839bbfa8a62dabefa0f09714e4548111405584fdebfc0",
    "classes": {
     "h16kv8_w1024_rows1024": {
      "best": {

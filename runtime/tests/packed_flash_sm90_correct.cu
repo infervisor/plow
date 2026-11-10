@@ -42,6 +42,10 @@ static bool json_output = false;
 static bool mapped_only = false;
 static unsigned test_seed = 0;
 static unsigned test_requests = 1;
+// --poison-below N: K/V positions [0, N) of every slot hold NaN. They sit under every checked
+// row's window floor, so a finite, reference-matching output proves the staging never lets a
+// masked row's value into P.V (the tile-rounded floor reads them; the unrounded one must not).
+static unsigned poison_below = 0;
 
 #ifndef PLOW_TEST_FA_ROWS
 #define PLOW_TEST_FA_ROWS 0
@@ -94,7 +98,19 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
     const unsigned slots = PLOW_TEST_FA_ROWS ? test_requests : 3;
     const auto k = values(size_t(slots) * kv_heads * stride * HD,
                           456u ^ (test_seed * 0x85ebca6bu));
-    const auto v = values(k.size(), 789u ^ (test_seed * 0xc2b2ae35u));
+    auto v = values(k.size(), 789u ^ (test_seed * 0xc2b2ae35u));
+    auto kp = k;
+    if (poison_below) {
+        const bf16 nan = __float2bfloat16(NAN);
+        for (unsigned slot = 0; slot < slots; ++slot)
+            for (unsigned h = 0; h < kv_heads; ++h)
+                for (unsigned pos = 0; pos < poison_below && pos < stride; ++pos)
+                    for (unsigned d = 0; d < HD; ++d) {
+                        const size_t i = ((size_t(slot) * kv_heads + h) * stride + pos) * HD + d;
+                        kp[i] = nan;
+                        v[i] = nan;
+                    }
+    }
     // Two ragged requests use reversed, noncontiguous slots; the last 30 rows are padding.
     std::vector<int> req = PLOW_TEST_FA_ROWS
         ? std::vector<int>(1 + 4 * test_requests)
@@ -114,7 +130,7 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
             row0 += qlen;
         }
     }
-    bf16* dq = upload(q), *dk = upload(k), *dv = upload(v), *out;
+    bf16* dq = upload(q), *dk = upload(kp), *dv = upload(v), *out;
     unsigned* trash = nullptr;
     constexpr size_t eviction_bytes = 256ull << 20;
     if (campaign_timing) {
@@ -284,6 +300,7 @@ template<int HD, int BKV> static bool check(unsigned kv_heads, unsigned stride,
         for (unsigned row : {0u, len/2, len-1}) for (unsigned h : {0u, 7u, 15u}) {
             const unsigned end = kvlen-len+row+1;
             const unsigned begin = window && end > window ? end-window : 0;
+            if (begin < poison_below) { std::fprintf(stderr, "--poison-below %u reaches a checked window (begin %u)\n", poison_below, begin); return false; }
             const size_t qi=(size_t(row0+row)*heads+h)*HD;
             const size_t base=(size_t(slot)*kv_heads+h/(heads/kv_heads))*stride*HD;
             std::vector<double> scores(end-begin);
@@ -404,6 +421,12 @@ int main(int argc, char** argv) {
             const auto value = std::strtoul(argv[++i], &end, 10);
             if (*end || value > 1000000) return 2;
             test_seed = unsigned(value);
+        }
+        else if (std::strcmp(argv[i], "--poison-below") == 0 && i + 1 < argc) {
+            char* end;
+            const auto value = std::strtoul(argv[++i], &end, 10);
+            if (*end || value > 16384) return 2;
+            poison_below = unsigned(value);
         }
         else return 2;
     }
