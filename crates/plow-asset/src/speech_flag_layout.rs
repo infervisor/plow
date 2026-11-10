@@ -65,32 +65,33 @@ pub fn declare(used: Option<u16>) -> Option<u32> {
     used.map(|_| LAYOUT)
 }
 
-/// Whether instructions whose first protected use is `used`, from a packet declaring `declared`,
-/// may run on a speech object exporting `object` (`None` = no symbol).
+/// Whether the instructions an object runs, whose first protected use is `used`, from a packet
+/// declaring `declared`, may run on that object, which exports `object` (`None` = no symbol).
+/// Instructions with no protected bit read the same under every layout and run on any object.
 pub fn check(declared: Option<u32>, used: Option<u16>, object: Option<u32>) -> Result<(), String> {
-    let Some(layout) = declared else {
-        return match used {
-            None => Ok(()),
-            Some(op) => Err(format!(
-                "opcode {op} sets a speech flag bit assigned after the packet's undeclared flag \
-                 layout: re-emit the packet"
-            )),
-        };
-    };
-    if layout != LAYOUT {
+    if let Some(layout) = declared.filter(|&l| l != LAYOUT) {
         return Err(format!(
             "the packet declares speech flag layout {layout}, this runtime reads {LAYOUT}"
         ));
     }
+    let Some(op) = used else {
+        return Ok(());
+    };
+    let Some(layout) = declared else {
+        return Err(format!(
+            "opcode {op} sets a speech flag bit assigned after the packet's undeclared flag \
+             layout: re-emit the packet"
+        ));
+    };
     match object {
         Some(have) if have == layout => Ok(()),
         Some(have) => Err(format!(
-            "the packet declares speech flag layout {layout}, the speech object is compiled for \
-             {have}: rebuild the object for this packet"
+            "opcode {op} needs speech flag layout {layout}, the object is compiled for {have}: \
+             rebuild the object for this packet"
         )),
         None => Err(format!(
-            "the packet declares speech flag layout {layout}, the speech object exports none: \
-             rebuild the object for this packet"
+            "opcode {op} needs speech flag layout {layout}, the object exports none: it is not a \
+             speech object of this layout"
         )),
     }
 }
@@ -222,16 +223,21 @@ mod tests {
     #[test]
     fn declared_packets_need_the_same_object_layout() {
         let conv = Some(DevOp::Conv1dF32 as u16);
+        assert!(check(Some(LAYOUT), conv, Some(LAYOUT)).is_ok());
+        assert!(check(Some(LAYOUT), conv, None)
+            .unwrap_err()
+            .contains("exports none"));
+        for have in [0, LAYOUT + 1, LAYOUT | 2] {
+            let e = check(Some(LAYOUT), conv, Some(have)).unwrap_err();
+            assert!(e.contains("compiled for"), "{e}");
+        }
+        // An object that runs none of the protected instructions (a Maya 2 packet's backbone
+        // decode object, its depth programs being the speech object's) is not constrained.
+        for object in [None, Some(0), Some(LAYOUT), Some(LAYOUT + 1)] {
+            assert!(check(Some(LAYOUT), None, object).is_ok());
+        }
+        // A layout this runtime does not read is refused on every object.
         for used in [None, conv] {
-            assert!(check(Some(LAYOUT), used, Some(LAYOUT)).is_ok());
-            assert!(check(Some(LAYOUT), used, None)
-                .unwrap_err()
-                .contains("exports none"));
-            for have in [0, LAYOUT + 1, LAYOUT | 2] {
-                let e = check(Some(LAYOUT), used, Some(have)).unwrap_err();
-                assert!(e.contains("compiled for"), "{e}");
-            }
-            // A layout this runtime does not read is refused even on a matching object.
             let e = check(Some(LAYOUT + 1), used, Some(LAYOUT + 1)).unwrap_err();
             assert!(e.contains("this runtime reads"), "{e}");
         }

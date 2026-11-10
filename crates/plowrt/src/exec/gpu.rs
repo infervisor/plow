@@ -11235,6 +11235,20 @@ impl GpuEngine {
             inferred_policy.fa256_gqa2 = true;
         }
         let module = be.module_load(&pf.image)?;
+        // The decode site checked the packet's declaration; this object runs the same regular
+        // programs and must read their flag layout too.
+        {
+            use plow_asset::speech_flag_layout as layout;
+            let used = layout::first_protected(
+                blob.progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .map(|d| (d.op, d.fj[2], d.i)),
+            );
+            let have = be.module_global_u32(&module, layout::OBJECT_SYMBOL)?;
+            layout::check(Some(layout::LAYOUT), used, have)
+                .map_err(|e| RuntimeError::Rejected(format!("prefill interpreter: {e}")))?;
+        }
         if let Some(requirements) = requirements {
             check_object_requirements(be, &module, &requirements.prefill, "prefill interpreter")?;
         }

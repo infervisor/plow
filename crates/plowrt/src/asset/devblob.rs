@@ -2117,6 +2117,10 @@ mod tests {
             assert_eq!(declared.declared, l);
             assert!(layout::check(l, declared.any(), l).is_ok());
             assert!(layout::check(l, declared.any(), None).is_err());
+            // The unstamped backbone decode object runs the regular programs only: it takes a
+            // packet whose protected bits are all in auxiliary (speech-object) programs.
+            let main = layout::check(l, declared.regular, None);
+            assert_eq!(main.is_ok(), at == At::Auxiliary);
         }
         // No abi.json at all is undeclared.
         let mut m = tiny_model();
