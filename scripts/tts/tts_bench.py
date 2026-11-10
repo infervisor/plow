@@ -160,6 +160,7 @@ def main():
                     help="Seed-TTS-eval meta.lst (id|ref_text|ref_wav|text, wav paths relative to it): one request per line, "
                          "each cloned from its own reference; wavs are named <id>.wav (--n caps the lines)")
     ap.add_argument("--seed-offset", type=int, default=0, help="added to every request's seed (repeat runs)")
+    ap.add_argument("--ramp-s", type=float, default=0.0, help="stagger the lanes' first requests over this many seconds")
     ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
     args = ap.parse_args()
     global SESSION, PROMPT_SET, SR
@@ -201,7 +202,12 @@ def main():
         call_one(args.url, args.model, spk, text, args.stream or args.ws, 1000 + i, per(i))
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(args.conc) as ex:
-        res = list(ex.map(lambda j: call_one(args.url, args.model, j[0][0], j[0][1], args.stream or args.ws, j[1] + 1 + args.seed_offset, per(j[1])), jobs))
+        def run(j):
+            # --ramp-s: the lanes' first requests start spread over the ramp instead of all at once.
+            if args.ramp_s and j[1] < args.conc:
+                time.sleep(args.ramp_s * j[1] / args.conc)
+            return call_one(args.url, args.model, j[0][0], j[0][1], args.stream or args.ws, j[1] + 1 + args.seed_offset, per(j[1]))
+        res = list(ex.map(run, jobs))
     wall = time.perf_counter() - t0
     texts = {}
     rows = []
