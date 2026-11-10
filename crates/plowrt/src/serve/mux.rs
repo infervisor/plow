@@ -900,8 +900,8 @@ fn decode_feed_extent(feeds: &[(usize, u32)]) -> Option<usize> {
 struct DecodeProgress {
     extent: usize,
     steps: std::num::NonZeroUsize,
-    /// The rows rode a prefill launch: no decode program ran.
-    rode: bool,
+    /// A plain decode launch ran them (not a prefill launch they rode, nor a speculative verify).
+    plain: bool,
 }
 
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
@@ -909,7 +909,7 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
     Some(DecodeProgress {
         extent: decode_feed_extent(feeds)?,
         steps: std::num::NonZeroUsize::new(steps)?,
-        rode: false,
+        plain: true,
     })
 }
 
@@ -2413,7 +2413,7 @@ fn spawn_scoped(
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
                     }
-                    if let Some(p) = decode_progress.filter(|p| !p.rode) {
+                    if let Some(p) = decode_progress.filter(|p| p.plain) {
                         let cap = decode_caps.iter().find(|&&c| c >= p.extent);
                         let cap = cap.copied().unwrap_or(0);
                         let steps = p.steps.get() as u64;
@@ -4168,7 +4168,7 @@ fn run_one_tick(
                             Some(DecodeProgress {
                                 extent,
                                 steps: std::num::NonZeroUsize::new(1)?,
-                                rode: true,
+                                plain: false,
                             })
                         });
                     }
@@ -4530,7 +4530,8 @@ fn run_one_tick(
                                 &mut disconnected,
                             );
                             if spec_ran {
-                                decode_progress = completed_decode(&feeds, 1);
+                                decode_progress = completed_decode(&feeds, 1)
+                                    .map(|p| DecodeProgress { plain: false, ..p });
                             }
                         } else {
                             spec_ran = true;

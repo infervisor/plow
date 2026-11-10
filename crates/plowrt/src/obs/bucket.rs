@@ -75,7 +75,7 @@ struct CapStat {
     us: AtomicU64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Counts {
     live: Vec<u64>,
     launches: Vec<u64>,
@@ -239,8 +239,13 @@ impl Ladder {
     /// The interval's line, when it launched anything and padded past the threshold or
     /// overflowed the ladder.
     fn log_line(&self, family: Family) -> Option<String> {
-        let now = self.counts();
-        let d = now.since(&std::mem::replace(&mut *self.logged.lock(), now.clone()));
+        let d = {
+            let mut logged = self.logged.lock();
+            let now = self.counts();
+            let d = now.since(&logged);
+            *logged = now;
+            d
+        };
         let launches: u64 = d.launches.iter().sum();
         let launched: u64 = d
             .launches
