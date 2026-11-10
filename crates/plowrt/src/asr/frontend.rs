@@ -344,6 +344,10 @@ pub struct LogMelConfig {
 /// `samples / hop + 1` of them, `ln(energy + guard)`).
 #[derive(Clone, Copy, Debug)]
 pub struct LogMelShaping {
+    /// Explicit symmetric padding and complete FFT windows; `None` keeps legacy framing.
+    pub frame_padding: Option<usize>,
+    /// Use `sqrt(power + guard)` before the filterbank instead of power.
+    pub magnitude_guard: Option<f32>,
     pub pad_reflect: bool,
     pub drop_last_frame: bool,
     pub log10: bool,
@@ -358,6 +362,8 @@ pub struct LogMelShaping {
 impl Default for LogMelShaping {
     fn default() -> Self {
         Self {
+            frame_padding: None,
+            magnitude_guard: None,
             pad_reflect: false,
             drop_last_frame: false,
             log10: false,
@@ -395,7 +401,19 @@ impl PacketLogMelFrontend {
         let tensor = pipeline.tensor("audio.frontend.filterbank")?;
         let mut bytes = vec![0; tensor.bytes];
         runtime.read_tensor(tensor, &mut bytes)?;
-        Self::from_parameters(|name| pipeline.optional_parameter(name), &bytes)
+        let window = if pipeline.optional_parameter("audio.frontend.kind") == Some(2) {
+            let tensor = pipeline.tensor("audio.frontend.window_values")?;
+            let mut bytes = vec![0; tensor.bytes];
+            runtime.read_tensor(tensor, &mut bytes)?;
+            Some(bytes)
+        } else {
+            None
+        };
+        Self::from_parts(
+            |name| pipeline.optional_parameter(name),
+            &bytes,
+            window.as_deref(),
+        )
     }
 
     /// From packet parameters and the raw FP32 filterbank bytes.
@@ -403,11 +421,23 @@ impl PacketLogMelFrontend {
         parameter: impl Fn(&str) -> Option<u64>,
         filterbank: &[u8],
     ) -> Result<Self> {
+        Self::from_parts(parameter, filterbank, None)
+    }
+
+    fn from_parts(
+        parameter: impl Fn(&str) -> Option<u64>,
+        filterbank: &[u8],
+        window: Option<&[u8]>,
+    ) -> Result<Self> {
         let required = |name: &str| {
             parameter(name).ok_or_else(|| invalid(format!("packet parameter {name:?} is missing")))
         };
-        if required("audio.frontend.kind")? != 1 {
+        let kind = required("audio.frontend.kind")?;
+        if !matches!(kind, 1 | 2) {
             return Err(invalid("packet audio frontend kind is unsupported"));
+        }
+        if kind == 2 && window.is_none() {
+            return Err(invalid("packet explicit frontend window is missing"));
         }
         let usize_param = |name| {
             usize::try_from(required(name)?)
@@ -440,14 +470,31 @@ impl PacketLogMelFrontend {
             mask_invalid_frames: bool_param("audio.frontend.mask_invalid_frames")?,
             log_guard: f32_param("audio.frontend.log_guard_f32")?,
             shaping: {
-                let flag = |name| parameter(name).unwrap_or(0) == 1;
-                let float =
-                    |name, default: f32| parameter(name).map_or(Ok(default), |_| f32_param(name));
+                let flag = |name| {
+                    if kind == 2 {
+                        bool_param(name)
+                    } else {
+                        Ok(parameter(name).unwrap_or(0) == 1)
+                    }
+                };
+                let float = |name, default: f32| {
+                    if kind == 2 {
+                        f32_param(name)
+                    } else {
+                        parameter(name).map_or(Ok(default), |_| f32_param(name))
+                    }
+                };
                 LogMelShaping {
-                    pad_reflect: flag("audio.frontend.pad_reflect"),
-                    drop_last_frame: flag("audio.frontend.drop_last_frame"),
-                    log10: flag("audio.frontend.log10"),
-                    log_floor: flag("audio.frontend.log_floor"),
+                    frame_padding: (kind == 2)
+                        .then(|| usize_param("audio.frontend.pad_samples"))
+                        .transpose()?,
+                    magnitude_guard: (kind == 2)
+                        .then(|| f32_param("audio.frontend.magnitude_guard_f32"))
+                        .transpose()?,
+                    pad_reflect: flag("audio.frontend.pad_reflect")?,
+                    drop_last_frame: flag("audio.frontend.drop_last_frame")?,
+                    log10: flag("audio.frontend.log10")?,
+                    log_floor: flag("audio.frontend.log_floor")?,
                     dynamic_range: float("audio.frontend.dynamic_range_f32", 0.0)?,
                     scale: float("audio.frontend.scale_f32", 1.0)?,
                     shift: float("audio.frontend.shift_f32", 0.0)?,
@@ -466,8 +513,19 @@ impl PacketLogMelFrontend {
         if min_samples == 0 || min_samples > max_samples {
             return Err(invalid("packet audio sample limits are invalid"));
         }
+        let window = window
+            .map(|bytes| {
+                if !bytes.len().is_multiple_of(4) {
+                    return Err(invalid("packet log-mel window is not FP32"));
+                }
+                Ok(bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .collect())
+            })
+            .transpose()?;
         Ok(Self {
-            inner: LogMelFrontend::new(config, filters)?,
+            inner: LogMelFrontend::new_with_window(config, filters, window)?,
             sample_rate: config.sample_rate,
             min_samples,
             max_samples,
@@ -486,7 +544,12 @@ impl PacketLogMelFrontend {
     /// Frames past a frame its analysis window reaches (centred, `fft / 2` samples), plus two of
     /// slack: earlier frames no longer change as audio arrives.
     pub fn reach_frames(&self) -> usize {
-        (self.inner.config.fft / 2).div_ceil(self.inner.config.hop) + 2
+        let config = self.inner.config;
+        let reach = config
+            .shaping
+            .frame_padding
+            .map_or(config.fft / 2, |pad| config.fft - pad);
+        reach.div_ceil(config.hop) + 2
     }
 
     pub fn extract(&self, samples: &[f32]) -> Result<LogMelFeatures> {
@@ -518,7 +581,7 @@ impl PacketLogMelFrontend {
             0
         };
         let reach = window_offset + config.window;
-        let pad = config.fft / 2;
+        let pad = config.shaping.frame_padding.unwrap_or(config.fft / 2);
         if samples.len() > self.max_samples
             || config.normalize_per_feature
             || pad > MARGIN * config.hop + window_offset
@@ -545,6 +608,14 @@ impl PacketLogMelFrontend {
 
 impl LogMelFrontend {
     pub fn new(config: LogMelConfig, filters: Vec<f32>) -> Result<Self> {
+        Self::new_with_window(config, filters, None)
+    }
+
+    fn new_with_window(
+        config: LogMelConfig,
+        filters: Vec<f32>,
+        window: Option<Vec<f32>>,
+    ) -> Result<Self> {
         if config.sample_rate == 0
             || config.fft < 2
             || config.window < 2
@@ -554,6 +625,14 @@ impl LogMelFrontend {
             || !config.preemphasis.is_finite()
             || !config.log_guard.is_finite()
             || config.log_guard <= 0.0
+            || config
+                .shaping
+                .frame_padding
+                .is_some_and(|pad| pad > config.fft)
+            || config
+                .shaping
+                .magnitude_guard
+                .is_some_and(|eps| !eps.is_finite() || eps < 0.0)
         {
             return Err(invalid("invalid log-mel configuration"));
         }
@@ -570,12 +649,20 @@ impl LogMelFrontend {
         } else {
             config.window - 1
         } as f64;
-        let window = (0..config.window)
-            .map(|index| {
-                (0.5 * (1.0 - (2.0 * std::f64::consts::PI * index as f64 / denominator).cos()))
-                    as f32
-            })
-            .collect();
+        let window = match window {
+            Some(window)
+                if window.len() == config.window && window.iter().all(|v| v.is_finite()) =>
+            {
+                window
+            }
+            Some(_) => return Err(invalid("invalid log-mel window")),
+            None => (0..config.window)
+                .map(|index| {
+                    (0.5 * (1.0 - (2.0 * std::f64::consts::PI * index as f64 / denominator).cos()))
+                        as f32
+                })
+                .collect(),
+        };
         let filter_ranges = filters
             .chunks_exact(spectrum_bins)
             .map(|filter| {
@@ -602,8 +689,37 @@ impl LogMelFrontend {
         }
         let config = self.config;
         let shaping = config.shaping;
-        let frames = samples.len() / config.hop + usize::from(!shaping.drop_last_frame);
-        let valid_frames = (samples.len() / config.hop).min(frames);
+        let center_pad = shaping.frame_padding.unwrap_or(config.fft / 2);
+        let frames = if shaping.frame_padding.is_some() {
+            if shaping.pad_reflect && samples.len() <= center_pad {
+                return Err(invalid("audio is shorter than its reflection padding"));
+            }
+            center_pad
+                .checked_mul(2)
+                .and_then(|pad| samples.len().checked_add(pad))
+                .and_then(|n| n.checked_sub(config.fft))
+                .map(|n| n / config.hop + 1)
+                .and_then(|n| n.checked_sub(usize::from(shaping.drop_last_frame)))
+                .filter(|&n| n > 0)
+                .ok_or_else(|| invalid("audio has no complete FFT window"))?
+        } else {
+            samples.len() / config.hop + usize::from(!shaping.drop_last_frame)
+        };
+        let window_offset = if config.center_window {
+            (config.fft - config.window) / 2
+        } else {
+            0
+        };
+        let valid_frames = if shaping.frame_padding.is_some() {
+            samples
+                .len()
+                .checked_add(center_pad)
+                .and_then(|n| n.checked_sub(window_offset + config.window))
+                .map_or(0, |n| n / config.hop + 1)
+                .min(frames)
+        } else {
+            (samples.len() / config.hop).min(frames)
+        };
         let spectrum_bins = config.fft / 2 + 1;
         let mut preemphasized = samples.to_vec();
         if config.preemphasis != 0.0 {
@@ -612,12 +728,6 @@ impl LogMelFrontend {
             }
         }
         let mut values = vec![0.0; frames * config.bins];
-        let window_offset = if config.center_window {
-            (config.fft - config.window) / 2
-        } else {
-            0
-        };
-        let center_pad = config.fft / 2;
         let buffers = || {
             (
                 vec![Complex32::default(); config.fft],
@@ -652,8 +762,14 @@ impl LogMelFrontend {
                     spectrum[window_offset + index].re = sample * self.window[index];
                 }
                 self.fft.process_with_scratch(spectrum, scratch);
-                for (power, value) in power.iter_mut().zip(spectrum.iter()) {
-                    *power = value.norm_sqr();
+                if let Some(guard) = shaping.magnitude_guard {
+                    for (power, value) in power.iter_mut().zip(spectrum.iter()) {
+                        *power = (value.norm_sqr() + guard).sqrt();
+                    }
+                } else {
+                    for (power, value) in power.iter_mut().zip(spectrum.iter()) {
+                        *power = value.norm_sqr();
+                    }
                 }
                 for (bin, out) in out.iter_mut().enumerate() {
                     let range = self.filter_ranges[bin].clone();
@@ -868,6 +984,165 @@ impl QwenFrontend {
 mod tests {
     use super::*;
 
+    fn explicit_frontend_parameters() -> std::collections::BTreeMap<&'static str, u64> {
+        std::collections::BTreeMap::from([
+            ("audio.frontend.kind", 2),
+            ("audio.sample_rate", 24_000),
+            ("audio.frontend.fft", 8),
+            ("audio.frontend.window", 8),
+            ("audio.frontend.hop", 2),
+            ("audio.frontend.bins", 2),
+            ("audio.frontend.preemphasis_f32", 0),
+            ("audio.frontend.center_window", 0),
+            ("audio.frontend.periodic_hann", 1),
+            ("audio.frontend.normalize_per_feature", 0),
+            ("audio.frontend.mask_invalid_frames", 0),
+            ("audio.frontend.log_guard_f32", 0.125f32.to_bits().into()),
+            ("audio.frontend.pad_reflect", 1),
+            ("audio.frontend.drop_last_frame", 0),
+            ("audio.frontend.log10", 0),
+            ("audio.frontend.log_floor", 1),
+            ("audio.frontend.dynamic_range_f32", 0),
+            ("audio.frontend.scale_f32", 1f32.to_bits().into()),
+            ("audio.frontend.shift_f32", 0),
+            ("audio.frontend.pad_samples", 3),
+            (
+                "audio.frontend.magnitude_guard_f32",
+                0.25f32.to_bits().into(),
+            ),
+            ("audio.min_samples", 4),
+            ("audio.max_samples", 100),
+        ])
+    }
+
+    #[test]
+    fn explicit_frontend_matches_scalar_dft_and_partial_frames() {
+        let params = explicit_frontend_parameters();
+        let filters = [0f32, 0.5, 1., 0., 0., 1., 0., 0., 0., 0.25];
+        let window = [0.25f32, 0.5, 0.75, 1., 0.75, 0.5, 0.25, 0.];
+        let frontend = PacketLogMelFrontend::from_parts(
+            |name| params.get(name).copied(),
+            bytemuck::cast_slice(&filters),
+            Some(bytemuck::cast_slice(&window)),
+        )
+        .unwrap();
+        let samples: Vec<f32> = (0..81).map(|i| ((i * 17 % 23) as f32 - 11.) / 8.).collect();
+        let got = frontend.extract(&samples).unwrap();
+        assert_eq!(got.frames, 40);
+        for frame in 0..got.frames {
+            let spectrum: Vec<f64> = (0..5)
+                .map(|k| {
+                    let mut real = 0.;
+                    let mut imag = 0.;
+                    for (j, &w) in window.iter().enumerate() {
+                        let mut i = (frame * 2 + j) as isize - 3;
+                        if i < 0 {
+                            i = -i;
+                        }
+                        if i >= samples.len() as isize {
+                            i = 2 * samples.len() as isize - 2 - i;
+                        }
+                        let x = f64::from(samples[i as usize] * w);
+                        let phase = -2. * std::f64::consts::PI * (j * k) as f64 / 8.;
+                        real += x * phase.cos();
+                        imag += x * phase.sin();
+                    }
+                    (real * real + imag * imag + 0.25).sqrt()
+                })
+                .collect();
+            for bin in 0..2 {
+                let expected = spectrum
+                    .iter()
+                    .zip(&filters[bin * 5..bin * 5 + 5])
+                    .map(|(v, &w)| v * f64::from(w))
+                    .sum::<f64>()
+                    .max(0.125)
+                    .ln();
+                assert!((f64::from(got.values[frame * 2 + bin]) - expected).abs() < 2e-6);
+            }
+        }
+        assert_eq!(frontend.reach_frames(), 5);
+        for from in [0, 1, 2, 10, 38] {
+            let (partial, complete) = frontend.extract_partial(&samples, from).unwrap();
+            assert_eq!(complete, 39);
+            assert_eq!(partial.values, got.values[from * 2..]);
+            assert_eq!(partial.frames, got.frames - from);
+        }
+        let short = frontend.extract(&samples[..21]).unwrap();
+        let (_, complete) = frontend.extract_partial(&samples[..21], 0).unwrap();
+        assert_eq!(short.frames, 10);
+        assert_eq!(complete, 9);
+        assert_eq!(&short.values[..complete * 2], &got.values[..complete * 2]);
+        assert!(frontend.extract(&samples[..3]).is_err());
+        assert!(frontend.inner.extract(&samples[..3], true).is_err());
+        assert!(frontend.inner.extract(&[f32::NAN; 8], true).is_err());
+
+        let zero_window = [0f32; 8];
+        let zero = PacketLogMelFrontend::from_parts(
+            |name| params.get(name).copied(),
+            bytemuck::cast_slice(&filters),
+            Some(bytemuck::cast_slice(&zero_window)),
+        )
+        .unwrap()
+        .extract(&samples)
+        .unwrap();
+        for row in zero.values.chunks_exact(2) {
+            assert_eq!(row, &[0.75f32.ln(), 0.625f32.ln()]);
+        }
+    }
+
+    #[test]
+    fn explicit_frontend_refuses_missing_or_invalid_contract() {
+        let params = explicit_frontend_parameters();
+        let filters = [1f32; 10];
+        let window = [1f32; 8];
+        let parse = |p: &std::collections::BTreeMap<&str, u64>, w: Option<&[u8]>| {
+            PacketLogMelFrontend::from_parts(
+                |name| p.get(name).copied(),
+                bytemuck::cast_slice(&filters),
+                w,
+            )
+        };
+        let bytes = Some(bytemuck::cast_slice(&window));
+        assert!(parse(&params, bytes).is_ok());
+        assert!(parse(&params, None).is_err());
+        assert!(parse(&params, Some(&[0; 3])).is_err());
+        assert!(parse(&params, Some(bytemuck::cast_slice(&window[..7]))).is_err());
+        assert!(parse(&params, Some(bytemuck::cast_slice(&[f32::NAN; 8]))).is_err());
+        for name in params.keys() {
+            let mut p = params.clone();
+            p.remove(name);
+            assert!(parse(&p, bytes).is_err(), "missing {name}");
+        }
+        for (name, value) in [
+            ("audio.frontend.kind", 3),
+            ("audio.frontend.pad_samples", 9),
+            ("audio.frontend.pad_reflect", 2),
+            (
+                "audio.frontend.magnitude_guard_f32",
+                u64::from((-1f32).to_bits()),
+            ),
+            (
+                "audio.frontend.magnitude_guard_f32",
+                u64::from(f32::NAN.to_bits()),
+            ),
+            (
+                "audio.frontend.scale_f32",
+                u64::from(f32::INFINITY.to_bits()),
+            ),
+        ] {
+            let mut p = params.clone();
+            p.insert(name, value);
+            assert!(parse(&p, bytes).is_err(), "invalid {name}");
+        }
+        let mut legacy = params.clone();
+        legacy.insert("audio.frontend.kind", 1);
+        legacy.remove("audio.frontend.pad_samples");
+        legacy.remove("audio.frontend.magnitude_guard_f32");
+        legacy.remove("audio.frontend.pad_reflect");
+        assert!(parse(&legacy, None).is_ok());
+    }
+
     fn resample(rate: u32, input: &[f32]) -> Vec<f32> {
         let mut r = Resampler::new(rate).unwrap();
         let mut out = r.push(input);
@@ -1053,6 +1328,7 @@ mod tests {
                 dynamic_range: 8.0,
                 scale: 0.25,
                 shift: 4.0,
+                ..Default::default()
             },
         };
         let generic = LogMelFrontend::new(config, reference.filters.clone()).unwrap();

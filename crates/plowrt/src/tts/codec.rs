@@ -9,7 +9,9 @@ use std::sync::mpsc;
 
 use parking_lot::Mutex;
 
-use crate::exec::packet_runtime::{load_packet_runtime_on, PacketAsset, PacketTensor};
+use crate::exec::packet_runtime::{
+    load_packet_runtime_on, PacketAsset, PacketData, PacketTensor, PacketWrite,
+};
 
 pub const PACKET: &str = "codec.pkt";
 const DRIVER: &str = "codec.v1";
@@ -249,8 +251,58 @@ enum Msg {
     Release(SlotId),
 }
 
+pub(crate) use super::Codes;
+
+fn code_writes<'a>(
+    tensor: PacketTensor,
+    host: &'a [u32],
+    jobs: &'a [Job],
+    capacity_frames: usize,
+    fc: usize,
+) -> smallvec::SmallVec<[PacketWrite<'a>; 64]> {
+    if jobs
+        .iter()
+        .all(|j| j.codes.sources.iter().all(Option::is_none))
+    {
+        return smallvec::smallvec![PacketWrite {
+            tensor,
+            offset: 0,
+            data: PacketData::Host(bytemuck::cast_slice(host)),
+        }];
+    }
+    let mut writes = smallvec::smallvec![PacketWrite {
+        tensor,
+        offset: 0,
+        data: PacketData::Zero(std::mem::size_of_val(host)),
+    }];
+    for frame in 0..capacity_frames {
+        for (b, job) in jobs.iter().enumerate().filter(|(_, j)| frame < j.frames) {
+            let words = (b * capacity_frames + frame) * fc;
+            let source = job
+                .codes
+                .sources
+                .get(frame)
+                .and_then(Option::as_ref)
+                .filter(|_| {
+                    job.codes[frame * fc..(frame + 1) * fc]
+                        .iter()
+                        .all(|&c| c >= 0)
+                });
+            writes.push(PacketWrite {
+                tensor,
+                offset: words * 4,
+                data: source.map_or_else(
+                    || PacketData::Host(bytemuck::cast_slice(&host[words..words + fc])),
+                    PacketData::Buffer,
+                ),
+            });
+        }
+    }
+    writes
+}
+
 struct Job {
-    codes: Vec<i32>,
+    codes: Codes,
     frames: usize,
     seed: u64,
     voice: u32,
@@ -269,6 +321,8 @@ struct Job {
     /// A first audio holds the feeding model's next tick until it is answered: both stages'
     /// kernels take the whole device, so a tick launched ahead of it delays the first audio.
     _urgent: Option<crate::sched::admission::DownstreamUrgent>,
+    /// PCM of this step's frames already decoded by earlier pieces of a bounded launch.
+    carry: Vec<f32>,
 }
 
 impl Job {
@@ -333,7 +387,7 @@ struct StepIo {
     rope_buf: Vec<u32>,
     row_buf: Vec<u32>,
     n_buf: Vec<u32>,
-    len_buf: Vec<u32>,
+    len_buf: Vec<Vec<u32>>,
     pcm_buf: Vec<f32>,
 }
 
@@ -582,6 +636,18 @@ impl Codec {
         urgency: Urgency,
         due: Option<std::time::Instant>,
     ) -> Result<Vec<f32>, String> {
+        self.step_codes(slot, codes.into(), frames, urgency, due)
+            .await
+    }
+
+    pub(crate) async fn step_codes(
+        &self,
+        slot: &mut StreamSlot,
+        codes: Codes,
+        frames: usize,
+        urgency: Urgency,
+        due: Option<std::time::Instant>,
+    ) -> Result<Vec<f32>, String> {
         let step = Step {
             slot: slot.id,
             pos: slot.pos,
@@ -592,6 +658,51 @@ impl Codec {
             .pcm;
         slot.pos += frames;
         Ok(pcm)
+    }
+
+    /// Consume a reference prefix without emitting its audio; failure or cancellation releases the slot.
+    pub(crate) async fn prime_codes(
+        &self,
+        mut slot: StreamSlot,
+        codes: Codes,
+        frames: usize,
+        urgency: Urgency,
+        due: Option<std::time::Instant>,
+    ) -> Result<StreamSlot, String> {
+        if self.step_frames == 0 || slot.pos != 0 {
+            return Err("codec priming requires a fresh stateful slot".into());
+        }
+        if frames.checked_mul(self.frame_codes) != Some(codes.len()) {
+            return Err("codec reference prefix has incomplete frames".into());
+        }
+        let pool = self
+            .slots
+            .as_ref()
+            .ok_or("codec has no stateful slot pool")?;
+        pool.lock().check(slot.id, 0).map_err(str::to_owned)?;
+        let mut start = 0;
+        while start < frames {
+            let n = (frames - start).min(self.step_frames);
+            let chunk = codes.slice(
+                start * self.frame_codes..(start + n) * self.frame_codes,
+                self.frame_codes,
+            );
+            let pcm = match self.step_codes(&mut slot, chunk, n, urgency, due).await {
+                Ok(pcm) => pcm,
+                Err(e) => {
+                    pool.lock().fail(slot.id);
+                    return Err(e);
+                }
+            };
+            if n.checked_mul(self.frame_samples) != Some(pcm.len())
+                || pcm.iter().any(|v| !v.is_finite())
+            {
+                pool.lock().fail(slot.id);
+                return Err("codec returned invalid reference-prefix PCM".into());
+            }
+            start += n;
+        }
+        Ok(slot)
     }
 
     /// Split each launch into segments of `render.yield_programs` programs (a CFM step) and call
@@ -617,6 +728,18 @@ impl Codec {
         urgency: Urgency,
     ) -> Result<Vec<f32>, String> {
         self.decode_as(codes, frames, seed, 0, urgency, None)
+            .await
+            .map(|d| d.pcm)
+    }
+
+    pub(crate) async fn decode_codes(
+        &self,
+        codes: Codes,
+        frames: usize,
+        seed: u64,
+        urgency: Urgency,
+    ) -> Result<Vec<f32>, String> {
+        self.submit(codes, frames, seed, 0, (urgency, None), None, None, None)
             .await
             .map(|d| d.pcm)
     }
@@ -716,7 +839,7 @@ impl Codec {
     #[allow(clippy::too_many_arguments)]
     async fn submit(
         &self,
-        codes: Vec<i32>,
+        codes: impl Into<Codes>,
         frames: usize,
         seed: u64,
         voice: u32,
@@ -735,7 +858,7 @@ impl Codec {
         self.tx
             .lock()
             .send(Msg::Job(Job {
-                codes,
+                codes: codes.into(),
                 frames,
                 seed,
                 voice,
@@ -748,6 +871,7 @@ impl Codec {
                 reply,
                 _work,
                 _urgent,
+                carry: Vec::new(),
             }))
             .map_err(|_| "codec worker stopped".to_string())?;
         rx.await
@@ -878,6 +1002,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         let n = (0..param("lengths.count")?)
             .map(|k| pipeline.tensor(&format!("stream.n.{k}")).map_err(e))
             .collect::<Result<Vec<_>, String>>()?;
+        let len_buf = n.iter().map(|t| vec![0u32; t.bytes / 4]).collect();
         Some(StepIo {
             pos_buf: elems(pos),
             rope_buf: elems(rope),
@@ -891,7 +1016,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             xf_rpf,
             row_pos,
             codes_buf: Vec::new(),
-            len_buf: Vec::new(),
+            len_buf,
             slot_buf,
             pcm_buf: Vec::new(),
         })
@@ -1000,7 +1125,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     if !(cached.is_empty() && slot_caps.is_empty()) && phase.is_none() {
         return Err("cached codec capacities without the window phase tensors".into());
     }
-    Ok(Bound {
+    let mut bound = Bound {
         slots: step_io
             .as_ref()
             .map(|io| std::sync::Arc::new(Mutex::new(SlotPool::new(io.slots)))),
@@ -1042,7 +1167,17 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             .parameter("render.yield_programs")
             .map(|v| v as usize)
             .unwrap_or(0),
-    })
+    };
+    let mut inputs: smallvec::SmallVec<[PacketTensor; 16]> =
+        smallvec::smallvec![bound.codes, bound.seed];
+    inputs.extend(bound.lengths.iter().map(|&(t, _)| t));
+    if let Some(io) = &bound.step_io {
+        inputs.extend([io.slot, io.pos, io.rope]);
+        inputs.extend(io.row_pos);
+        inputs.extend(io.n.iter().copied());
+    }
+    bound.runtime.prepare_writes(&inputs).map_err(e)?;
+    Ok(bound)
 }
 
 /// The smallest of `family` (ascending by batch * frames) holding `batch` items of `frames`.
@@ -1103,6 +1238,16 @@ impl Bound {
     fn check(&self, j: &Job) -> Result<(), &'static str> {
         if j.frames == 0 || j.codes.len() != j.frames * self.frame_codes {
             return Err("codec job has no frames or a partial frame");
+        }
+        if !j.codes.sources.is_empty()
+            && (j.codes.sources.len() != j.frames
+                || j.codes
+                    .sources
+                    .iter()
+                    .flatten()
+                    .any(|s| s.len() != self.frame_codes * 4))
+        {
+            return Err("codec device frames disagree with the code shape");
         }
         if let Some(v) = &j.clone {
             let pm = self.voice_slots.as_ref().map_or(0, |s| s.prompt_max);
@@ -1277,7 +1422,7 @@ impl Bound {
             let (slot, pos, n) = match jobs.get(b) {
                 Some(j) => {
                     let st = j.step.expect("one family per launch");
-                    for (d, &c) in io.codes_buf[b * cn * fc..].iter_mut().zip(&j.codes) {
+                    for (d, &c) in io.codes_buf[b * cn * fc..].iter_mut().zip(j.codes.iter()) {
                         *d = c.clamp(0, i32::MAX) as u32;
                     }
                     (st.slot.index, st.pos as u32, j.frames as u32)
@@ -1296,27 +1441,43 @@ impl Bound {
         }
         let e = |x: crate::RuntimeError| x.to_string();
         let rt = &mut self.runtime;
-        rt.write_tensor_at(self.codes, 0, bytemuck::cast_slice(&io.codes_buf))
-            .map_err(e)?;
-        rt.write_tensor(io.slot, bytemuck::cast_slice(&io.slot_buf))
-            .map_err(e)?;
-        rt.write_tensor(io.pos, bytemuck::cast_slice(&io.pos_buf))
-            .map_err(e)?;
-        rt.write_tensor(io.rope, bytemuck::cast_slice(&io.rope_buf))
-            .map_err(e)?;
+        let mut writes = code_writes(self.codes, &io.codes_buf, jobs, cn, fc);
+        writes.extend([
+            PacketWrite {
+                tensor: io.slot,
+                offset: 0,
+                data: PacketData::Host(bytemuck::cast_slice(&io.slot_buf)),
+            },
+            PacketWrite {
+                tensor: io.pos,
+                offset: 0,
+                data: PacketData::Host(bytemuck::cast_slice(&io.pos_buf)),
+            },
+            PacketWrite {
+                tensor: io.rope,
+                offset: 0,
+                data: PacketData::Host(bytemuck::cast_slice(&io.rope_buf)),
+            },
+        ]);
         if let Some(t) = io.row_pos {
-            rt.write_tensor(t, bytemuck::cast_slice(&io.row_buf))
-                .map_err(e)?;
+            writes.push(PacketWrite {
+                tensor: t,
+                offset: 0,
+                data: PacketData::Host(bytemuck::cast_slice(&io.row_buf)),
+            });
         }
-        for (&t, &(_, per_frame)) in io.n.iter().zip(&self.lengths) {
-            io.len_buf.clear();
-            io.len_buf.resize(t.bytes / 4, 0);
-            for (l, &n) in io.len_buf.iter_mut().zip(&io.n_buf[..cb]) {
+        for ((&t, &(_, per_frame)), values) in io.n.iter().zip(&self.lengths).zip(&mut io.len_buf) {
+            values.fill(0);
+            for (l, &n) in values.iter_mut().zip(&io.n_buf[..cb]) {
                 *l = n * per_frame as u32;
             }
-            rt.write_tensor(t, bytemuck::cast_slice(&io.len_buf))
-                .map_err(e)?;
+            writes.push(PacketWrite {
+                tensor: t,
+                offset: 0,
+                data: PacketData::Host(bytemuck::cast_slice(values)),
+            });
         }
+        rt.write_tensors(&writes).map_err(e)?;
         let t1 = std::time::Instant::now();
         rt.run_sequence(&programs).map_err(e)?;
         let gpu_us = rt.last_run_us();
@@ -1375,25 +1536,31 @@ impl Bound {
             }
         }
         let e = |x: crate::RuntimeError| x.to_string();
-        self.runtime
-            .write_tensor_at(self.codes, 0, bytemuck::cast_slice(&codes))
-            .map_err(e)?;
+        let mut lengths: smallvec::SmallVec<[(PacketTensor, Vec<u32>); 16]> =
+            smallvec::SmallVec::new();
         for &(tensor, per_frame) in &self.lengths {
             let mut len = vec![0u32; tensor.bytes / 4];
             for (i, j) in jobs.iter().enumerate() {
                 len[i] = (j.frames * per_frame) as u32;
             }
-            self.runtime
-                .write_tensor(tensor, bytemuck::cast_slice(&len))
-                .map_err(e)?;
+            lengths.push((tensor, len));
         }
         let mut seeds = vec![0u64; self.seed.bytes / 8];
         for (i, j) in jobs.iter().enumerate() {
             seeds[i] = j.seed;
         }
-        self.runtime
-            .write_tensor(self.seed, bytemuck::cast_slice(&seeds))
-            .map_err(e)?;
+        let mut writes = code_writes(self.codes, &codes, jobs, cf, fc);
+        writes.extend(lengths.iter().map(|(tensor, len)| PacketWrite {
+            tensor: *tensor,
+            offset: 0,
+            data: PacketData::Host(bytemuck::cast_slice(len)),
+        }));
+        writes.push(PacketWrite {
+            tensor: self.seed,
+            offset: 0,
+            data: PacketData::Host(bytemuck::cast_slice(&seeds)),
+        });
+        self.runtime.write_tensors(&writes).map_err(e)?;
         let slotted = matches!(family, Family::Slot | Family::SlotCached);
         let slots = match (slotted, self.voice_slots.as_mut()) {
             (true, Some(vs)) => {
@@ -1538,6 +1705,8 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
     let hold_guard = std::time::Duration::from_millis(
         crate::config::RuntimeConfig::get().tts_codec_hold_ms as u64,
     );
+    let bound_us = crate::config::RuntimeConfig::get().tts_codec_launch_us as f64;
+    let mut costs = StepCosts::default();
     let mut pending: Vec<Job> = Vec::new();
     let mut hold = None;
     let mut open = true;
@@ -1596,10 +1765,57 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         });
         let mut batch: Vec<Job> = take.iter().rev().map(|&k| pending.remove(k)).collect();
         batch.reverse();
-        match codec.launch(&batch) {
+        // Bounded stream steps: a launch whose measured time exceeds the bound runs the measured
+        // capacity under it that decodes the most frames per second; the jobs it leaves out stay
+        // queued and the frames it cuts decode as the same steps' next pieces, after anything
+        // more urgent that arrived meanwhile.
+        let mut rests: Vec<Option<(Codes, usize)>> = Vec::new();
+        if bound_us > 0.0 && batch[0].step.is_some() {
+            let frames: Vec<usize> = batch.iter().map(|j| j.frames).collect();
+            if let Some((keep, cap)) = bound_step(&codec.steps, &costs, &frames, bound_us) {
+                for j in batch.drain(keep..).rev() {
+                    pending.insert(0, j);
+                }
+                let fc = codec.frame_codes;
+                rests = batch
+                    .iter_mut()
+                    .map(|j| {
+                        (j.frames > cap).then(|| {
+                            let rest = j.codes.split_off(cap * fc, fc);
+                            let n = j.frames - cap;
+                            j.frames = cap;
+                            (rest, n)
+                        })
+                    })
+                    .collect();
+            }
+        }
+        let t = (bound_us > 0.0 && batch[0].step.is_some()).then(std::time::Instant::now);
+        let out = codec.launch(&batch);
+        costs.observe_launch(bound_us, &codec.steps, &batch, || {
+            t.unwrap().elapsed().as_secs_f64() * 1e6
+        });
+        let rests = drain_rests(&mut rests, batch.len());
+        match out {
             Ok(pcm) => {
-                for (j, p) in batch.into_iter().zip(pcm) {
-                    let _ = j.reply.send(Ok(p));
+                for ((mut j, mut p), rest) in batch.into_iter().zip(pcm).zip(rests) {
+                    match rest {
+                        Some((codes, n)) => {
+                            j.carry.extend_from_slice(&p.pcm);
+                            if let Some(st) = j.step.as_mut() {
+                                st.pos += j.frames;
+                            }
+                            (j.codes, j.frames) = (codes, n);
+                            pending.push(j);
+                        }
+                        None => {
+                            if !j.carry.is_empty() {
+                                j.carry.extend_from_slice(&p.pcm);
+                                p.pcm = std::mem::take(&mut j.carry);
+                            }
+                            let _ = j.reply.send(Ok(p));
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -1609,6 +1825,81 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
             }
         }
     }
+}
+
+fn drain_rests(
+    rests: &mut Vec<Option<(Codes, usize)>>,
+    count: usize,
+) -> impl Iterator<Item = Option<(Codes, usize)>> + '_ {
+    rests
+        .drain(..)
+        .chain(std::iter::repeat_with(|| None))
+        .take(count)
+}
+
+/// Measured wall time of each stream-step capacity `(batch, frames)`, µs (moving average).
+#[derive(Default)]
+struct StepCosts(std::collections::HashMap<(usize, usize), f64>);
+
+impl StepCosts {
+    fn observe_launch(
+        &mut self,
+        bound_us: f64,
+        caps: &[Capacity],
+        jobs: &[Job],
+        elapsed: impl FnOnce() -> f64,
+    ) {
+        if bound_us > 0.0 && jobs[0].step.is_some() {
+            let frames = jobs.iter().map(|j| j.frames).max().unwrap_or(0);
+            if let Some(&(cb, cn, _)) = smallest(caps, jobs.len(), frames) {
+                self.observe(cb, cn, elapsed());
+            }
+        }
+    }
+
+    fn observe(&mut self, cb: usize, cn: usize, us: f64) {
+        let c = self.0.entry((cb, cn)).or_insert(us);
+        *c += 0.25 * (us - *c);
+    }
+
+    fn get(&self, cb: usize, cn: usize) -> Option<f64> {
+        self.0.get(&(cb, cn)).copied()
+    }
+}
+
+/// A bounded launch of stream steps of `frames` (launch order): `(jobs kept, frames per job)`
+/// on the measured capacity at most `bound_us` that decodes the most frames per µs, when the
+/// capacity `frames` would take is measured above the bound. `None` launches as packed: under
+/// the bound, not yet measured, or no measured capacity fits the bound.
+fn bound_step(
+    caps: &[Capacity],
+    costs: &StepCosts,
+    frames: &[usize],
+    bound_us: f64,
+) -> Option<(usize, usize)> {
+    let longest = frames.iter().copied().max()?;
+    let &(cb, cn, _) = smallest(caps, frames.len(), longest)?;
+    if costs.get(cb, cn)? <= bound_us {
+        return None;
+    }
+    let mut best: Option<(f64, usize, usize, usize)> = None;
+    for &(cb, cn, _) in caps {
+        let keep = cb.min(frames.len());
+        let longest = frames[..keep].iter().map(|&f| f.min(cn)).max().unwrap_or(0);
+        // Priced by the capacity the launch of these pieces selects, not the candidate's.
+        let Some(&(lb, ln, _)) = smallest(caps, keep, longest) else {
+            continue;
+        };
+        let Some(us) = costs.get(lb, ln).filter(|&us| us <= bound_us) else {
+            continue;
+        };
+        let decoded: usize = frames[..keep].iter().map(|&f| f.min(cn)).sum();
+        let rate = decoded as f64 / us;
+        if best.is_none_or(|(r, d, ..)| rate > r || (rate == r && decoded > d)) {
+            best = Some((rate, decoded, keep, cn));
+        }
+    }
+    best.map(|(_, _, keep, cap)| (keep, cap))
 }
 
 /// Stream steps that wait together for one launch: fewer than this many pending hold.
@@ -1642,9 +1933,523 @@ fn hold_for(
 mod tests {
     use super::*;
 
+    fn queued_codec() -> (Codec, mpsc::Receiver<Msg>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Codec {
+                tx: Mutex::new(tx),
+                yield_hook: Default::default(),
+                credit: None,
+                max_batch: 2,
+                max_frames: 8,
+                min_frames: 1,
+                frame_codes: 2,
+                frame_samples: 3,
+                window: 0,
+                lookahead: 0,
+                voices: Vec::new(),
+                max_window: 0,
+                window_capacities: Vec::new(),
+                parameters: Default::default(),
+                step_frames: 2,
+                prompt_max: 0,
+                slots: Some(std::sync::Arc::new(Mutex::new(SlotPool::new(2)))),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn reference_priming_preserves_chunks_positions_sources_and_deadlines() {
+        let (codec, rx) = queued_codec();
+        let slot = codec.acquire_slot().unwrap();
+        let due = Some(std::time::Instant::now());
+        let values: Vec<i32> = (0..10).collect();
+        let source =
+            crate::exec::packet_runtime::PacketBuffer::from(bytemuck::cast_slice(&values).to_vec());
+        let mut prefix = Codes::from(values);
+        prefix.sources = (0..5)
+            .map(|n| Some(source.slice(n * 8..(n + 1) * 8).unwrap()))
+            .collect();
+        drop(source);
+        let worker = std::thread::spawn(move || {
+            for (start, n) in [(0, 2), (2, 2), (4, 1)] {
+                let Msg::Job(j) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+                else {
+                    panic!("expected priming job")
+                };
+                assert_eq!(j.step.unwrap().pos, start);
+                assert_eq!(j.frames, n);
+                assert_eq!((j.urgency, j.due), (Urgency::First, due));
+                assert_eq!(
+                    j.codes.host,
+                    (start as i32 * 2..(start + n) as i32 * 2).collect::<Vec<_>>()
+                );
+                assert_eq!(j.codes.sources.len(), n);
+                for (frame, source) in j.codes.sources.iter().enumerate() {
+                    let mut values = [0i32; 2];
+                    source
+                        .as_ref()
+                        .unwrap()
+                        .read(bytemuck::cast_slice_mut(&mut values))
+                        .unwrap();
+                    assert_eq!(values, j.codes[frame * 2..frame * 2 + 2]);
+                }
+                assert!(j
+                    .reply
+                    .send(Ok(Decoded {
+                        pcm: vec![0.; n * 3],
+                        phase: Vec::new()
+                    }))
+                    .is_ok());
+            }
+            rx
+        });
+        let slot =
+            futures::executor::block_on(codec.prime_codes(slot, prefix, 5, Urgency::First, due))
+                .unwrap();
+        assert_eq!(slot.pos, 5);
+        let rx = worker.join().unwrap();
+        assert!(rx.try_recv().is_err());
+        drop(slot);
+        assert!(matches!(rx.try_recv().unwrap(), Msg::Release(_)));
+    }
+
+    #[test]
+    fn reference_priming_rejects_invalid_inputs_before_submission() {
+        for case in 0..6 {
+            let (mut codec, rx) = queued_codec();
+            let mut slot = codec.acquire_slot().unwrap();
+            let id = slot.id;
+            let (codes, frames) = match case {
+                0 => (vec![1, 2, 3], 2),
+                1 => (vec![], usize::MAX),
+                2 => {
+                    slot.pos = 1;
+                    (vec![1, 2], 1)
+                }
+                3 => {
+                    codec.step_frames = 0;
+                    (vec![1, 2], 1)
+                }
+                4 => {
+                    codec.slots.as_ref().unwrap().lock().fail(id);
+                    (vec![], 0)
+                }
+                _ => {
+                    codec.slots.as_ref().unwrap().lock().release(id);
+                    (vec![], 0)
+                }
+            };
+            assert!(futures::executor::block_on(codec.prime_codes(
+                slot,
+                codes.into(),
+                frames,
+                Urgency::First,
+                None
+            ))
+            .is_err());
+            assert!(matches!(rx.try_recv().unwrap(), Msg::Release(released) if released == id));
+            assert!(rx.try_recv().is_err());
+        }
+        let (codec, rx) = queued_codec();
+        let slot = codec.acquire_slot().unwrap();
+        let slot = futures::executor::block_on(codec.prime_codes(
+            slot,
+            Codes::default(),
+            0,
+            Urgency::First,
+            None,
+        ))
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(slot.pos, 0);
+        drop(slot);
+        assert!(matches!(rx.try_recv().unwrap(), Msg::Release(_)));
+    }
+
+    #[test]
+    fn reference_priming_stops_after_failed_or_invalid_step_output() {
+        for failure in 0..3 {
+            let (codec, rx) = queued_codec();
+            let slot = codec.acquire_slot().unwrap();
+            let id = slot.id;
+            let worker = std::thread::spawn(move || {
+                let Msg::Job(j) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+                else {
+                    panic!("expected priming job")
+                };
+                let result = match failure {
+                    0 => Err("injected codec failure".into()),
+                    1 => Ok(Decoded {
+                        pcm: vec![0.; 5],
+                        phase: Vec::new(),
+                    }),
+                    _ => Ok(Decoded {
+                        pcm: vec![f32::NAN; 6],
+                        phase: Vec::new(),
+                    }),
+                };
+                assert!(j.reply.send(result).is_ok());
+                rx
+            });
+            assert!(futures::executor::block_on(codec.prime_codes(
+                slot,
+                vec![1; 10].into(),
+                5,
+                Urgency::First,
+                None
+            ))
+            .is_err());
+            assert!(codec.slots.as_ref().unwrap().lock().check(id, 0).is_err());
+            let rx = worker.join().unwrap();
+            assert!(matches!(rx.try_recv().unwrap(), Msg::Release(released) if released == id));
+            assert!(rx.try_recv().is_err(), "failure submitted another step");
+        }
+    }
+
+    #[test]
+    fn cancelled_reference_priming_releases_slot_and_retains_queued_input() {
+        use std::future::Future;
+        let (codec, rx) = queued_codec();
+        let slot = codec.acquire_slot().unwrap();
+        let id = slot.id;
+        let source = crate::exec::packet_runtime::PacketBuffer::from(
+            bytemuck::cast_slice(&[3i32, 4]).to_vec(),
+        );
+        let prefix = Codes::frame(vec![3, 4], Some(source));
+        let mut pending = Box::pin(codec.prime_codes(slot, prefix, 1, Urgency::First, None));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        let Msg::Job(job) = rx.try_recv().unwrap() else {
+            panic!("expected queued step")
+        };
+        drop(pending);
+        assert!(matches!(rx.try_recv().unwrap(), Msg::Release(released) if released == id));
+        let mut values = [0i32; 2];
+        job.codes.sources[0]
+            .as_ref()
+            .unwrap()
+            .read(bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [3, 4]);
+        assert!(job
+            .reply
+            .send(Ok(Decoded {
+                pcm: vec![0.; 3],
+                phase: Vec::new()
+            }))
+            .is_err());
+        let mut pool = codec.slots.as_ref().unwrap().lock();
+        pool.release(id);
+        let reused = pool.acquire().unwrap();
+        assert_eq!(reused.index, id.index);
+        assert_ne!(reused.gen, id.gen);
+        assert!(pool.check(id, 0).is_err());
+    }
+
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, REF_CODEC_REFERENCE, CODEC_PRIMING_RESULT_JSON; run through gpuq"]
+    fn reference_priming_preserves_fresh_audio_at_serving_concurrencies() {
+        async fn stream(
+            codec: &Codec,
+            slots: &mut [Option<StreamSlot>],
+            items: &[(String, Vec<i32>, usize)],
+            fresh: usize,
+            prime: bool,
+        ) -> Vec<Vec<f32>> {
+            futures::future::join_all(slots.iter_mut().zip(items).map(
+                |(owner, (_, codes, frames))| async move {
+                    let mut slot = owner.take().unwrap();
+                    slot.restart();
+                    let fc = codec.frame_codes;
+                    if prime {
+                        slot = codec
+                            .prime_codes(
+                                slot,
+                                codes[..frames * fc].to_vec().into(),
+                                *frames,
+                                Urgency::First,
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        let mut start = 0;
+                        while start < *frames {
+                            let n = (*frames - start).min(codec.step_frames);
+                            codec
+                                .step(
+                                    &mut slot,
+                                    codes[start * fc..(start + n) * fc].to_vec(),
+                                    n,
+                                    Urgency::First,
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            start += n;
+                        }
+                    }
+                    assert_eq!(slot.pos, *frames);
+                    let mut output = Vec::new();
+                    let mut start = 0;
+                    for n in [1, 2, fresh.saturating_sub(3)] {
+                        if n == 0 {
+                            continue;
+                        }
+                        let s = frames + start;
+                        output.extend(
+                            codec
+                                .step(
+                                    &mut slot,
+                                    codes[s * fc..(s + n) * fc].to_vec(),
+                                    n,
+                                    Urgency::First,
+                                    None,
+                                )
+                                .await
+                                .unwrap(),
+                        );
+                        start += n;
+                    }
+                    assert_eq!(start, fresh);
+                    assert_eq!(slot.pos, frames + fresh);
+                    *owner = Some(slot);
+                    output
+                },
+            ))
+            .await
+        }
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let reference: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("REF_CODEC_REFERENCE").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let path = crate::exec::packet_runtime::stage_packet(
+            &assets.join("model.pkt"),
+            "codec.packet",
+            PACKET,
+        )
+        .unwrap();
+        let image = crate::asset::packet_image::PacketImage::open(&path).unwrap();
+        let windows: std::collections::BTreeSet<usize> = image
+            .blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .filter(|d| d.op == packet::dev::DevOp::AttentionF32 as u16 && d.i[6] & 8 != 0)
+            .map(|d| (d.i[6] >> 16) as usize)
+            .collect();
+        assert!(!windows.is_empty() && !windows.contains(&0));
+        let codec = Codec::load_on(&assets, 0).unwrap();
+        assert_eq!(
+            codec.frame_codes as u64,
+            reference["frame_codes"].as_u64().unwrap()
+        );
+        assert!(codec.step_frames >= 5);
+        let fresh = 5;
+        let longest = 2 * codec.step_frames + 3;
+        assert!(codec.max_frames >= longest + fresh);
+        let sources: Vec<_> = reference["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["frames"].as_u64().unwrap() as usize >= longest + fresh)
+            .map(|c| {
+                let bytes = std::fs::read(c["codes"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    bytes.len(),
+                    c["frames"].as_u64().unwrap() as usize * codec.frame_codes * 4
+                );
+                let codes: Vec<i32> = bytes
+                    .chunks_exact(4)
+                    .map(|b| {
+                        let code = u32::from_le_bytes(b.try_into().unwrap());
+                        assert!(code < codec.parameters["codec.codebook"] as u32);
+                        code as i32
+                    })
+                    .collect();
+                (c["case"].as_str().unwrap().to_owned(), codes)
+            })
+            .collect();
+        assert!(!sources.is_empty());
+        let rows_per_frame = codec
+            .parameters
+            .get("stream.transformer_rows_per_frame")
+            .copied()
+            .unwrap_or(1) as usize;
+        assert!(rows_per_frame > 0);
+        let available = sources
+            .iter()
+            .map(|(_, codes)| codes.len() / codec.frame_codes)
+            .max()
+            .unwrap()
+            .min(codec.max_frames);
+        let mut boundaries = Vec::new();
+        for &window in &windows {
+            let frames = window.div_ceil(rows_per_frame);
+            assert!(frames > fresh && 2 * frames + fresh <= available);
+            for center in [frames, 2 * frames] {
+                boundaries.extend([center - 1, center, center + 1]);
+            }
+        }
+        boundaries.push(available - fresh);
+        boundaries.retain(|&frames| frames + fresh <= available);
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let mut slots: Vec<_> = (0..32)
+            .map(|_| Some(codec.acquire_slot().expect("32 stream slots required")))
+            .collect();
+        let mut checks = Vec::new();
+        let mut outputs = Vec::new();
+        let mut all_pass = true;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for history in [false, true] {
+              for width in [1, 8, 32] {
+               let cohorts = if history { boundaries.len().div_ceil(width) } else { 1 };
+               for cohort in 0..cohorts {
+                let items: Vec<_> = (0..width).map(|b| {
+                    let frames = if history { boundaries[(cohort * width + b) % boundaries.len()] }
+                    else if width == 1 { codec.step_frames + 1 } else {
+                        [0, 1, codec.step_frames, codec.step_frames + 1, longest][b % 5]
+                    };
+                    let eligible: Vec<_> = sources.iter()
+                        .filter(|(_, codes)| codes.len() >= (frames + fresh) * codec.frame_codes).collect();
+                    let (name, codes) = eligible[(cohort * width + b) % eligible.len()];
+                    (name.clone(), codes[..(frames + fresh) * codec.frame_codes].to_vec(), frames)
+                }).collect();
+                let whole = futures::future::join_all(items.iter().map(|(_, codes, frames)|
+                    codec.decode(codes.clone(), frames + fresh, 0, Urgency::Whole))).await;
+                let control = stream(&codec, &mut slots[..width], &items, fresh, false).await;
+                let actual = stream(&codec, &mut slots[..width], &items, fresh, true).await;
+                for (b, ((name, _, frames), whole)) in items.iter().zip(whole).enumerate() {
+                    let whole = whole.unwrap();
+                    assert_eq!(whole.len(), (frames + fresh) * codec.frame_samples);
+                    let expected = &whole[frames * codec.frame_samples..];
+                    assert_eq!(actual[b].len(), expected.len());
+                    assert_eq!(control[b].len(), expected.len());
+                    let exact = actual[b].iter().zip(&control[b]).all(|(a, b)| a.to_bits() == b.to_bits());
+                    let finite = actual[b].iter().chain(&control[b]).chain(expected).all(|v| v.is_finite());
+                    let error = actual[b].iter().zip(expected).map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2)).sum::<f64>();
+                    let norm = expected.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
+                    let relative_l2 = (error / norm.max(1e-30)).sqrt();
+                    let pass = exact && finite && relative_l2 < 1e-5;
+                    all_pass &= pass;
+                    let offset = outputs.len();
+                    outputs.extend_from_slice(expected);
+                    outputs.extend_from_slice(&control[b]);
+                    outputs.extend_from_slice(&actual[b]);
+                    checks.push(serde_json::json!({"suite":if history {"history"} else {"chunking"},
+                        "cohort":cohort,"width":width,"item":b,"source":name,"reference_frames":frames,
+                        "fresh_frames":fresh,"samples":expected.len(),"stateful_exact":exact,"finite":finite,
+                        "whole_relative_l2":relative_l2,"pass":pass,"output_offset_f32":offset}));
+                }
+               }
+              }
+            }
+        });
+        assert_eq!(
+            checks.iter().filter(|c| c["suite"] == "chunking").count(),
+            41
+        );
+        for width in [1, 8, 32] {
+            for &frames in &boundaries {
+                assert!(checks.iter().any(|c| c["suite"] == "history"
+                    && c["width"] == width
+                    && c["reference_frames"] == frames));
+            }
+        }
+        let path = std::path::PathBuf::from(std::env::var("CODEC_PRIMING_RESULT_JSON").unwrap());
+        std::fs::write(path.with_extension("f32"), bytemuck::cast_slice(&outputs)).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&serde_json::json!({
+            "scope":"saved reference codes, chunking and attention-history boundaries; stateful priming vs ordinary steps and concatenated decode; no timings",
+            "attention_window_rows":windows,"transformer_rows_per_frame":rows_per_frame,
+            "boundary_reference_frames":boundaries,"max_available_frames":available,
+            "pass":all_pass,"whole_relative_l2_limit":1e-5,"checks":checks})).unwrap()).unwrap();
+        assert!(all_pass, "reference priming changed fresh audio");
+    }
+
+    #[test]
+    fn retained_history_keeps_frame_alignment_across_windows_and_split_steps() {
+        let source = |v: &[u32]| {
+            crate::exec::packet_runtime::PacketBuffer::from(bytemuck::cast_slice(v).to_vec())
+        };
+        let mut history = Codes::from(vec![9, 10]);
+        history.extend(Codes::frame(vec![1, 2], Some(source(&[1, 2]))), 2);
+        history.extend(vec![3, 4].into(), 2);
+        history.extend(Codes::frame(vec![5, 6], Some(source(&[5, 6]))), 2);
+        assert_eq!(
+            history
+                .sources
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            [false, true, false, true]
+        );
+        let mut window = history.slice(2..8, 2);
+        drop(history);
+        let mut rest = window.split_off(2, 2);
+        assert_eq!(window.host, [1, 2]);
+        assert_eq!(rest.host, [3, 4, 5, 6]);
+        assert!(rest.sources[0].is_none());
+        for (codes, frame) in [(&window, 0), (&rest, 1)] {
+            let mut values = [0u32; 2];
+            codes.sources[frame]
+                .as_ref()
+                .unwrap()
+                .read(bytemuck::cast_slice_mut(&mut values))
+                .unwrap();
+            assert_eq!(
+                bytemuck::cast_slice::<u32, i32>(&values),
+                &codes[frame * 2..(frame + 1) * 2]
+            );
+        }
+        rest.release(0..2);
+        assert!(rest.sources.iter().all(Option::is_none));
+        assert_eq!(rest.host, [3, 4, 5, 6]);
+        drop(window);
+        drop(rest);
+    }
+
+    #[test]
+    fn retained_code_rows_preserve_padding_and_signed_code_clamping() {
+        let source = |v: &[u32]| {
+            crate::exec::packet_runtime::PacketBuffer::from(bytemuck::cast_slice(v).to_vec())
+        };
+        let mut a = job(false, 2, None);
+        a.codes = Codes::frame(vec![1, 2], Some(source(&[1, 2])));
+        a.codes
+            .extend(Codes::frame(vec![-1, 4], Some(source(&[u32::MAX, 4]))), 2);
+        let mut b = job(false, 1, None);
+        b.codes = vec![5, 6].into();
+        let mut jobs = [a, b];
+        let dense = [1u32, 2, 0, 4, 0, 0, 5, 6, 0, 0, 0, 0];
+        let tensor = PacketTensor {
+            handle: 0,
+            bytes: std::mem::size_of_val(&dense),
+        };
+        let writes = code_writes(tensor, &dense, &jobs, 3, 2);
+        assert!(matches!(writes[0].data, PacketData::Zero(48)));
+        assert!(matches!(writes[1].data, PacketData::Buffer(_)));
+        assert!(matches!(writes.last().unwrap().data, PacketData::Host(_)));
+        let mut actual = vec![0xa5; tensor.bytes];
+        for w in writes {
+            w.check().unwrap();
+            w.data
+                .read(&mut actual[w.offset..w.offset + w.data.len()])
+                .unwrap();
+        }
+        assert_eq!(actual, bytemuck::cast_slice::<u32, u8>(&dense));
+        jobs[0].codes.release(0..2);
+        let writes = code_writes(tensor, &dense, &jobs, 3, 2);
+        assert_eq!(writes.len(), 1);
+        assert!(matches!(writes[0].data, PacketData::Host(_)));
+    }
+
     fn job(window: bool, frames: usize, slot: Option<u32>) -> Job {
         Job {
-            codes: Vec::new(),
+            codes: Codes::default(),
             frames,
             seed: 0,
             voice: 0,
@@ -1660,7 +2465,345 @@ mod tests {
             reply: tokio::sync::oneshot::channel().0,
             _work: None,
             _urgent: None,
+            carry: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    struct SerialWrites(Box<dyn crate::exec::packet_runtime::PacketRuntime>);
+
+    #[cfg(feature = "cuda")]
+    struct SharedRuntime(
+        std::sync::Arc<Mutex<Box<dyn crate::exec::packet_runtime::PacketRuntime>>>,
+    );
+
+    #[cfg(feature = "cuda")]
+    impl crate::exec::packet_runtime::PacketRuntime for SharedRuntime {
+        fn tensor(&self, name: &str) -> Option<PacketTensor> {
+            self.0.lock().tensor(name)
+        }
+        fn write_tensor(&mut self, t: PacketTensor, bytes: &[u8]) -> crate::Result<()> {
+            self.0.lock().write_tensor(t, bytes)
+        }
+        fn write_tensors(&mut self, writes: &[PacketWrite<'_>]) -> crate::Result<()> {
+            self.0.lock().write_tensors(writes)
+        }
+        fn write_tensor_at(
+            &mut self,
+            t: PacketTensor,
+            at: usize,
+            bytes: &[u8],
+        ) -> crate::Result<()> {
+            self.0.lock().write_tensor_at(t, at, bytes)
+        }
+        fn read_tensor(&self, t: PacketTensor, bytes: &mut [u8]) -> crate::Result<()> {
+            self.0.lock().read_tensor(t, bytes)
+        }
+        fn read_tensor_at(
+            &self,
+            t: PacketTensor,
+            at: usize,
+            bytes: &mut [u8],
+        ) -> crate::Result<()> {
+            self.0.lock().read_tensor_at(t, at, bytes)
+        }
+        fn snapshot_tensor(
+            &mut self,
+            t: PacketTensor,
+            at: usize,
+            bytes: usize,
+        ) -> crate::Result<crate::exec::packet_runtime::PacketBuffer> {
+            self.0.lock().snapshot_tensor(t, at, bytes)
+        }
+        fn write_tensor_from(
+            &mut self,
+            t: PacketTensor,
+            at: usize,
+            source: &crate::exec::packet_runtime::PacketBuffer,
+        ) -> crate::Result<()> {
+            self.0.lock().write_tensor_from(t, at, source)
+        }
+        fn copy_tensor(
+            &mut self,
+            s: PacketTensor,
+            so: usize,
+            t: PacketTensor,
+            to: usize,
+            bytes: usize,
+        ) -> crate::Result<()> {
+            self.0.lock().copy_tensor(s, so, t, to, bytes)
+        }
+        fn create_tensor(&mut self, bytes: usize) -> crate::Result<PacketTensor> {
+            self.0.lock().create_tensor(bytes)
+        }
+        fn run(&mut self, p: usize) -> crate::Result<()> {
+            self.0.lock().run(p)
+        }
+        fn run_sequence(&mut self, p: &[usize]) -> crate::Result<()> {
+            self.0.lock().run_sequence(p)
+        }
+        fn last_run_us(&self) -> f64 {
+            self.0.lock().last_run_us()
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    impl crate::exec::packet_runtime::PacketRuntime for SerialWrites {
+        fn tensor(&self, name: &str) -> Option<PacketTensor> {
+            self.0.tensor(name)
+        }
+        fn write_tensor(&mut self, t: PacketTensor, bytes: &[u8]) -> crate::Result<()> {
+            self.0.write_tensor(t, bytes)
+        }
+        fn write_tensors(&mut self, writes: &[PacketWrite<'_>]) -> crate::Result<()> {
+            for w in writes {
+                w.check()?;
+            }
+            for w in writes {
+                let PacketData::Host(bytes) = w.data else {
+                    panic!("serial control expects host writes");
+                };
+                if w.offset == 0 && bytes.len() == w.tensor.bytes {
+                    self.0.write_tensor(w.tensor, bytes)?;
+                } else {
+                    self.0.write_tensor_at(w.tensor, w.offset, bytes)?;
+                }
+            }
+            Ok(())
+        }
+        fn write_tensor_at(
+            &mut self,
+            t: PacketTensor,
+            at: usize,
+            bytes: &[u8],
+        ) -> crate::Result<()> {
+            self.0.write_tensor_at(t, at, bytes)
+        }
+        fn read_tensor(&self, t: PacketTensor, bytes: &mut [u8]) -> crate::Result<()> {
+            self.0.read_tensor(t, bytes)
+        }
+        fn read_tensor_at(
+            &self,
+            t: PacketTensor,
+            at: usize,
+            bytes: &mut [u8],
+        ) -> crate::Result<()> {
+            self.0.read_tensor_at(t, at, bytes)
+        }
+        fn copy_tensor(
+            &mut self,
+            s: PacketTensor,
+            so: usize,
+            t: PacketTensor,
+            to: usize,
+            n: usize,
+        ) -> crate::Result<()> {
+            self.0.copy_tensor(s, so, t, to, n)
+        }
+        fn run(&mut self, p: usize) -> crate::Result<()> {
+            self.0.run(p)
+        }
+        fn run_sequence(&mut self, p: &[usize]) -> crate::Result<()> {
+            self.0.run_sequence(p)
+        }
+        fn last_run_us(&self) -> f64 {
+            self.0.last_run_us()
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, RUST_MIN_STACK=67108864; run through gpuq"]
+    fn codec_bulk_inputs_preserve_pcm_for_decode_and_stream_steps() {
+        check_codec_input_paths(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS, RUST_MIN_STACK=67108864; run through gpuq"]
+    fn codec_owned_inputs_preserve_pcm_after_producer_overwrite() {
+        check_codec_input_paths(true);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn check_codec_input_paths(device: bool) {
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let path = assets.join("codec.pkt");
+        let mut control = bind(&path, 0).unwrap();
+        let mut treatment = bind(&path, 0).unwrap();
+        let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut producer = None;
+        if device {
+            let runtime = std::sync::Arc::new(Mutex::new(control.runtime));
+            let staging = runtime.lock().create_tensor(treatment.codes.bytes).unwrap();
+            control.runtime = Box::new(SharedRuntime(runtime.clone()));
+            producer = Some((runtime, staging));
+        }
+        control.runtime = Box::new(SerialWrites(control.runtime));
+        let fc = control.frame_codes;
+        let own = |jobs: &mut [Job]| {
+            let Some((runtime, staging)) = &producer else {
+                return;
+            };
+            let mut runtime = runtime.lock();
+            for (b, j) in jobs.iter_mut().enumerate() {
+                if b % 3 == 1 {
+                    continue;
+                }
+                let mut bytes = bytemuck::cast_slice::<i32, u8>(&j.codes.host).to_vec();
+                runtime.write_tensor_at(*staging, 0, &bytes).unwrap();
+                let snapshot = runtime.snapshot_tensor(*staging, 0, bytes.len()).unwrap();
+                assert!(snapshot.cuda_source().is_some());
+                bytes.fill(0xdd);
+                runtime.write_tensor_at(*staging, 0, &bytes).unwrap();
+                j.codes.sources = (0..j.frames)
+                    .map(|f| {
+                        (f % 2 == 0).then(|| snapshot.slice(f * fc * 4..(f + 1) * fc * 4).unwrap())
+                    })
+                    .collect();
+                copies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let method = if device { "owned" } else { "bulk" };
+        let maximum = control.capacities.iter().map(|c| c.0).max().unwrap();
+        let equal = |a: Vec<Decoded>, b: Vec<Decoded>| {
+            assert_eq!(a.len(), b.len());
+            for (a, b) in a.iter().zip(&b) {
+                assert!(a.pcm.iter().chain(&b.pcm).all(|v| v.is_finite()));
+                assert_eq!(a.pcm.len(), b.pcm.len());
+                assert!(
+                    a.pcm
+                        .iter()
+                        .zip(&b.pcm)
+                        .all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "bulk writes changed decoded PCM"
+                );
+            }
+        };
+        for width in [1, 8, 32].into_iter().filter(|&n| n <= maximum) {
+            for frames in [1, 2, 5] {
+                let mut jobs: Vec<_> = (0..width)
+                    .map(|b| {
+                        let mut j = job(false, frames, None);
+                        j.seed = 77 + b as u64;
+                        j.codes = (0..frames * control.frame_codes)
+                            .map(|i| ((i * 37 + b * 17) % 512) as i32)
+                            .collect();
+                        j
+                    })
+                    .collect();
+                let expected = control.decode(&jobs).unwrap();
+                own(&mut jobs);
+                equal(expected, treatment.decode(&jobs).unwrap());
+                eprintln!("codec {method} inputs: decode width={width} frames={frames}, PCM exact");
+            }
+        }
+        let maximum = control.steps.iter().map(|c| c.0).max().unwrap_or(0);
+        for width in [1, 8, 32].into_iter().filter(|&n| n <= maximum) {
+            let mut position = 0;
+            for frames in [1, 2, 5] {
+                let mut jobs: Vec<_> = (0..width)
+                    .map(|b| {
+                        let mut j = job(false, frames, Some(b as u32));
+                        j.step.as_mut().unwrap().pos = position;
+                        j.codes = (0..frames * control.frame_codes)
+                            .map(|i| ((i * 37 + b * 17 + position * 13) % 512) as i32)
+                            .collect();
+                        j
+                    })
+                    .collect();
+                let expected = control.step(&jobs).unwrap();
+                own(&mut jobs);
+                equal(expected, treatment.step(&jobs).unwrap());
+                eprintln!("codec {method} inputs: stream width={width} position={position} frames={frames}, PCM exact");
+                position += frames;
+            }
+        }
+        assert!(treatment.runtime.last_run_us().is_finite());
+        assert_eq!(
+            copies.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            device
+        );
+    }
+
+    #[test]
+    fn disabled_launch_bound_keeps_rests_and_costs_unallocated() {
+        let caps = vec![(1, 4, Vec::new()), (8, 4, Vec::new())];
+        let mut costs = StepCosts::default();
+        let mut rests = Vec::new();
+        for width in [1, 8, 1] {
+            let jobs: Vec<_> = (0..width).map(|n| job(false, 4, Some(n))).collect();
+            assert_eq!(
+                drain_rests(&mut rests, jobs.len())
+                    .filter(Option::is_none)
+                    .count(),
+                jobs.len()
+            );
+            assert_eq!(
+                rests.capacity(),
+                0,
+                "disabled launch allocated remainder storage"
+            );
+            costs.observe_launch(0.0, &caps, &jobs, || panic!("disabled launch read timing"));
+            assert_eq!(costs.0.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_launch_keeps_remainders_and_updates_costs() {
+        let caps = vec![(1, 4, Vec::new()), (2, 8, Vec::new())];
+        let jobs = [job(false, 3, Some(0)), job(false, 7, Some(1))];
+        let mut costs = StepCosts::default();
+        costs.observe_launch(10.0, &caps, &jobs, || 20.0);
+        costs.observe_launch(10.0, &caps, &jobs, || 40.0);
+        assert_eq!(costs.get(2, 8), Some(25.0));
+        let mut rests = vec![Some((vec![11, 12].into(), 1)), None];
+        let mut drained = drain_rests(&mut rests, jobs.len());
+        let (codes, frames) = drained.next().unwrap().unwrap();
+        assert_eq!(codes.host, [11, 12]);
+        assert_eq!(frames, 1);
+        assert!(drained.next().unwrap().is_none());
+        assert!(drained.next().is_none());
+        drop(drained);
+        assert!(rests.is_empty());
+        costs.observe_launch(10.0, &caps, &[job(false, 3, None)], || {
+            panic!("non-step timing")
+        });
+        assert_eq!(costs.get(1, 4), None);
+    }
+
+    #[test]
+    fn bounded_steps_take_the_fastest_measured_capacity_under_the_bound() {
+        let caps: Vec<Capacity> = [(1, 1), (1, 17), (4, 4), (4, 17), (8, 1), (8, 17)]
+            .into_iter()
+            .map(|(b, f)| (b, f, Vec::new()))
+            .collect();
+        let mut costs = StepCosts::default();
+        let frames = [17; 8];
+        // Unmeasured: launch as packed.
+        assert_eq!(bound_step(&caps, &costs, &frames, 17_500.0), None);
+        for (b, f, us) in [
+            (1, 1, 4000.0),
+            (1, 17, 7400.0),
+            (4, 4, 7500.0),
+            (4, 17, 16900.0),
+        ] {
+            costs.observe(b, f, us);
+        }
+        costs.observe(8, 17, 29900.0);
+        // b4.f17: 68 frames in 16.9 ms beats b1.f17 (17 in 7.4) and b4.f4 (16 in 7.5).
+        assert_eq!(bound_step(&caps, &costs, &frames, 17_500.0), Some((4, 17)));
+        assert_eq!(bound_step(&caps, &costs, &frames, 8_000.0), Some((1, 17)));
+        // Under the bound, or nothing measured fits it: as packed.
+        assert_eq!(bound_step(&caps, &costs, &frames, 30_000.0), None);
+        assert_eq!(bound_step(&caps, &costs, &frames, 3_000.0), None);
+        assert_eq!(bound_step(&caps, &costs, &[2], 3_000.0), None);
+        // A cheap wider capacity the cut launch would not select does not qualify it.
+        let caps: Vec<Capacity> = vec![(4, 2, Vec::new()), (16, 2, Vec::new())];
+        let mut costs = StepCosts::default();
+        costs.observe(4, 2, 20_000.0);
+        costs.observe(16, 2, 5_000.0);
+        assert_eq!(bound_step(&caps, &costs, &[2, 2], 10_000.0), None);
     }
 
     #[test]

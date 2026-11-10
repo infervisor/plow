@@ -680,6 +680,13 @@ pub(crate) fn sections(
         pair_cfg: t.d.breeze,
         depth_sampling: None,
         slot_memory: Vec::new(),
+        packed: Some(manifest::PackedDepth {
+            version: 1,
+            input_vocab: c.vocab,
+            backbone_logits: !t.d.breeze,
+            hidden: h(n.hn),
+            decode_token: f.decode_only.then_some(f.lo),
+        }),
         tensors: manifest::Tensors {
             params: h(t.params),
             top_k: h(t.top_k),
@@ -746,4 +753,89 @@ pub(crate) fn encode(n_cu: u32, tensors: usize, programs: &[Program], rungs: &[u
         .collect();
     plow_asset::aux_program::encode(n_cu, tensors, &views)
         .unwrap_or_else(|e| panic!("depth programs: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projected_depth_heads_honor_logit_precision_at_every_rung() {
+        let dir = std::env::temp_dir().join(format!("plow-depth-heads-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = serde_json::json!({
+            "model_type": "qwen3", "hidden_size": 32, "intermediate_size": 64,
+            "num_hidden_layers": 1, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "head_dim": 8, "vocab_size": 17, "rms_norm_eps": 0.000001,
+            "rope_theta": 10000.0,
+            "plow_frame_embed": {
+                "table": "frame.weight", "codebooks": 16, "codebook_size": 16,
+                "lo": 0, "rows": 17, "classes": 16,
+                "depth": {
+                    "layers": 1, "hidden": 16, "heads": 2, "kv_heads": 1,
+                    "head_dim": 8, "intermediate": 32, "eps": 0.000001,
+                    "rope_theta": 10000.0, "positions": 16, "proj_bias": true,
+                    "min_frames": 2
+                }
+            }
+        });
+        for round in [false, true] {
+            config["plow_frame_embed"]["depth"]["bf16_logits"] = round.into();
+            std::fs::write(
+                dir.join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let c = crate::config::cfg_from(&dir);
+            let mut b = Builder::new(4);
+            let n = crate::declare(
+                &mut b,
+                &c,
+                32,
+                1,
+                false,
+                false,
+                false,
+                false,
+                32,
+                false,
+                0..1,
+                false,
+                false,
+            );
+            let t = n.fish.as_ref().unwrap();
+            let tensors = b.finish().tensors;
+            for rows in [1, 8, 32] {
+                let p = program(&c, &n, t, &tensors, 4, rows, 32);
+                let heads: Vec<_> = p
+                    .insts
+                    .iter()
+                    .filter(|i| i.op == DevOp::GemvF32Out as u16)
+                    .collect();
+                assert_eq!(heads.len(), 16);
+                assert_eq!(heads[0].t[0], t.blogits);
+                assert_eq!(heads[0].t[2], n.head);
+                for (j, head) in heads.iter().enumerate() {
+                    assert_eq!(head.i[0], rows);
+                    assert_eq!(head.i[7], if round { 2048 } else { 0 });
+                    if j > 0 {
+                        assert_eq!(head.t[0], t.dlogits[j - 1]);
+                        assert_eq!(head.t[2], t.heads[j - 1]);
+                    }
+                    assert!(p
+                        .insts
+                        .iter()
+                        .any(|i| { i.op == DevOp::SampleSmallF32 as u16 && i.t[1] == head.t[0] }));
+                }
+                let projections: Vec<_> = p
+                    .insts
+                    .iter()
+                    .filter(|i| i.op == DevOp::Gemv as u16)
+                    .collect();
+                assert!(!projections.is_empty());
+                assert!(projections.iter().all(|i| i.i[7] == 0));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

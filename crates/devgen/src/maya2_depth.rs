@@ -1147,6 +1147,13 @@ pub(crate) fn lm_sections(
         ras_window: 0,
         sampler: manifest::Sampler::Maya2,
         pair_cfg: false,
+        packed: Some(manifest::PackedDepth {
+            version: 1,
+            input_vocab: c.vocab,
+            backbone_logits: true,
+            hidden: u16::try_from(hn).unwrap(),
+            decode_token: c.frame.as_ref().filter(|f| f.decode_only).map(|f| f.lo),
+        }),
         depth_sampling: Some([d.temperature.to_bits(), d.top_k]),
         slot_memory: (0..geo.layers)
             .map(|l| handle(&format!("in.depth.cross.{l}")))

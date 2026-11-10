@@ -1074,6 +1074,8 @@ impl GuidedSpeech {
                 turn: request.turn_key.clone(),
                 continuing: false,
                 speech: Some(Box::new(SpeechJob {
+                    device_frames: false,
+                    slot_prefix_reuse: false,
                     overlay: cond,
                     overlay_pos,
                     // Decode token k takes speech_pos[k + 1]: base = prefill rows - 1.
