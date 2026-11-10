@@ -7,6 +7,7 @@
  * 256 LayerNorm prologue, 1024 mma arm. */
 #include <cuda_runtime.h>
 #include <cstring>
+#define PLOW_NV_SPEECH 1
 #include "op_speech_f32.cuh"
 #include "op_elementwise.cuh"
 
