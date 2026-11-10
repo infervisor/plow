@@ -248,6 +248,11 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 gen_search.main(["report", "s3gen_cfm_attn", "--out", str(inside)])
 
+    def test_row_versions_do_not_depend_on_the_selected_generators(self):
+        # a row measured in a --gens triton run must still resume in a run of every generator
+        self.assertEqual(set(gen_search.versions("no-such-generator")), set(gen_search.versions("current")))
+        self.assertNotIn("triton", gen_search.versions("tilelang"))
+
     def test_plan_and_list_run_without_a_gpu(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

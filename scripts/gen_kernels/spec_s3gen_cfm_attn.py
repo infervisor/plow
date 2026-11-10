@@ -1,11 +1,14 @@
 """gen_search block spec: S3Gen CFM attention (AttentionF32, 3xTF32, 306-row key prefix, 8 heads
 x 64) at the cached-prompt `csynth` shapes. Generated bodies: attn_cfm.py (TileLang),
-attn_cfm_triton.py (Triton); current plow kernel:
-the interpreter path of the standalone probe cfm_attn.cu (which 0, 132 blocks); inputs and the
-fp64 reference are bench_cfm.py's.
+attn_cfm_triton.py (Triton). Current plow kernel: the 3xFP16 attention over a pre-formatted
+prefix that the production recipes select (PLOW_EMIT_S3GEN_ATTN_H16=1 -> sp_attention_h16),
+timed as its copy in the standalone probe cfm_attn.cu (which 23, 132 blocks; the prefix is
+formatted once in cfm_make, as the emit does for a voice cache). Probe which 0 is the 3xTF32
+path of a packet without that option. Inputs and the fp64 reference are bench_cfm.py's.
 """
 
 SCALE = 0.125
+WHICH_H16 = 23
 H, HW, PRE = 8, 64, 306
 
 
@@ -58,7 +61,7 @@ def _cur_bind(lib, c, inp, out):
                      inp["pidx"].data_ptr(), inp["klen"].data_ptr(), c["B"], c["Tq"], PRE)
 
     def call():
-        rc = lib.cfm_run(h, 0, 132, torch.cuda.current_stream().cuda_stream)
+        rc = lib.cfm_run(h, WHICH_H16, 132, torch.cuda.current_stream().cuda_stream)
         assert rc == 0, f"cfm_run rc {rc}"
     return call
 
@@ -66,7 +69,7 @@ def _cur_bind(lib, c, inp, out):
 SPEC = {
     "name": "s3gen_cfm_attn",
     "op": "AttentionF32 prefix306 h8x64",
-    "dtype": "f32 (3xTF32)",
+    "dtype": "f32 (split 3-product)",
     # csynth.b32.t64 is 64 CFG items x 136 rows; b64.t32 is 128 x 72.
     "classes": {
         "b64_q136": {"B": 64, "Tq": 136},
@@ -96,7 +99,8 @@ SPEC = {
         },
     },
     "current": {
-        "label": "sp_attention interpreter path (cfm_attn.cu which 0, 132 blocks)",
+        "label": "3xFP16 pre-formatted-prefix attention, the production sp_attention_h16 "
+                 "(probe copy: cfm_attn.cu which 23, 132 blocks)",
         "lib": {"src": "scripts/gen_kernels/cfm_attn.cu",
                 "flags": ["-arch=sm_90a", "-O3", "-I", "runtime/common", "-I", "runtime/nvidia"]},
         "bind": _cur_bind,
