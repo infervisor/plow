@@ -1208,7 +1208,10 @@ G_K(g_conv1d_f32) {
     /* flags bit 19: alpha is [cin | cout], the output snake's parameters after the input's. */
     const uint32_t dual = (flags >> 19) & 1u;
     const float* post_alpha = dual && alpha ? alpha + cin : alpha;
-    const int alpha_ok = dual ? pre == 12u && post == 12u && alpha : !(post == 12u && pre != 0u);
+    /* flags bit 2 (post snake): the output is SnakeBeta, alpha = [a | r] per output channel. */
+    const uint32_t beta = (flags >> 2) & 1u;
+    const int alpha_ok = dual ? pre == 12u && post == 12u && alpha && !beta
+                              : !(post == 12u && pre != 0u) && (!beta || (post == 12u && alpha));
     if (!kernel || !stride || !dilation || !groups || cin % groups || cout % groups ||
         mode > 2u || !g_act_valid_conv(pre) || !g_act_valid_conv(post) || !alpha_ok)
         return;
@@ -1242,7 +1245,13 @@ G_K(g_conv1d_f32) {
                     sum += (double)v * g_weight(weight, (flags >> 12) & 1u, wi);
                 }
             }
-            float value = g_act_f32(post, (float)sum, post_alpha ? post_alpha[o] : slope, 0.0f);
+            float value;
+            if (beta) {
+                const float s = sinf((float)sum * alpha[o]);
+                value = fmaf(alpha[cout + o], s * s, (float)sum);
+            } else {
+                value = g_act_f32(post, (float)sum, post_alpha ? post_alpha[o] : slope, 0.0f);
+            }
             if (row_scale) value = row_scale[m] * value;
             out[oi] = residual ? value + residual[oi] : value;
         }

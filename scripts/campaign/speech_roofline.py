@@ -83,6 +83,14 @@ def cost(inst, ctx):
             tout = (tin - 1) * s + kk + g("output_padding") - cb - ca
             flops = 2 * b * tin * cin * (cout // groups) * kk
         by = cout * (cin // groups) * kk * 4 + b * tin * cin * 4 + b * tout * cout * 4 * (2 if present(inst, "residual") else 1)
+        # Flag bit 14: the split-bf16 tiles run three bf16 passes (hi*lo + lo*hi + hi*hi) per
+        # product, so the arithmetic actually issued is 3x the FLOPs at the bf16 peak. Only the
+        # GEMM-shaped convs reach those tiles: depthwise (groups == channels) and the direct form
+        # (fewer than 16 output channels per group or k * cin/groups < 16) dispatch first.
+        cg, ng = cin // groups, cout // groups
+        depthwise = cg == 1 and ng == 1 and op == "Conv1dF32"
+        if g("flags") & (1 << 14) and not depthwise and ng >= 16 and cg * kk >= 16:
+            return by, 3 * flops, "bf16"
         return by, flops, ("tf32" if g("flags") & (1 << 13) else "fp32")
     if op == "Conv2dF32":
         b, f, w, cin, cout, kk, s = g("batch", 1), g("in_frames"), g("in_width"), g("in_channels"), g("out_channels"), g("kernel"), max(g("stride", 1), 1)
@@ -110,6 +118,17 @@ def cost(inst, ctx):
         return g("items", 1) * g("rows") * g("width") * 4, 0, "fp32"
     if op == "CumSumF64":
         return g("items", 1) * g("rows") * g("width") * 4 * 2, 0, "fp32"
+    if op == "StreamTailF32":
+        # Gather (mode 0): z = [state tail | new rows], B * (L + N) * Cz read and written;
+        # store (mode 1): the last L valid rows of z into the slot state, B * L * C both ways.
+        b, tail, new, c, cz = g("B", 1), g("L"), g("N"), g("C"), g("Cz")
+        if g("mode") == 0:
+            return b * (tail + new) * cz * 4 * 2, 0, "fp32"
+        return b * tail * c * 4 * 2, 0, "fp32"
+    if op == "RmsNormF32":
+        return g("rows", 1) * g("groups", 1) * g("group_width", 0) * 4 * 2, 0, "fp32"
+    if op == "RopeAxialF32":
+        return g("rows", 1) * g("heads", 1) * g("head_width", 0) * 4 * 2, 0, "fp32"
     if op in ("ScaledAddF32", "Residual"):
         return g("n") * 4 * 3, 0, "fp32"
     if op == "PackNcfwRowsF32":

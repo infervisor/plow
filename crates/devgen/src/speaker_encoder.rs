@@ -660,6 +660,7 @@ impl Encoder<'_> {
                     wgmma: padded,
                     weight_split: padded,
                     dual_alpha: false,
+                    pinned: false,
                 },
             )?;
             self.seq.done(e)
