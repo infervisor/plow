@@ -288,6 +288,8 @@ impl GpuEngine {
                 .find(|(_, bucket)| bucket.t as usize >= rows)
                 .map(|(index, bucket)| (index, bucket.t))
                 .ok_or_else(|| {
+                    self.buckets
+                        .record_demand(crate::obs::bucket::Family::Prefill, rows);
                     RuntimeError::Rejected("CUDA token-batch capacity exceeded".into())
                 })?;
             let plan = state
@@ -447,6 +449,12 @@ impl GpuEngine {
             self.pf_seg_prefix = false;
             body?;
             body_enqueued = true;
+            self.buckets.record(
+                crate::obs::bucket::Family::Prefill,
+                rows,
+                capacity as usize,
+                None,
+            );
             let (sample_rows, real_rows) = match &tail_rows {
                 Some(rows) => {
                     self.shared_tail_enqueue(rows, real_rows)?;

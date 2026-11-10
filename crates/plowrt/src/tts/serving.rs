@@ -168,7 +168,13 @@ pub fn bind(state: &AppState, slug: &str) -> Result<(), String> {
     let device = state.ordinal_of(slug);
     let bound = guided_model(&bundle.dir, state.downstream(slug), device).and_then(|g| match g {
         Some(_) => Ok(()),
-        None => speech_model(&bundle.dir, state.downstream(slug), device).map(drop),
+        None => speech_model(
+            &bundle.dir,
+            state.downstream(slug),
+            &state.model_metrics(slug).buckets,
+            device,
+        )
+        .map(drop),
     });
     bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))
 }
@@ -206,12 +212,13 @@ fn bound_pipeline(dir: &Path, device: u8) -> Option<Pipeline> {
 fn bind_pipeline(
     dir: &Path,
     credit: Arc<crate::sched::admission::DownstreamCredit>,
+    buckets: &Arc<crate::obs::bucket::BucketDemand>,
     device: u8,
 ) -> Result<Pipeline, String> {
     if let Some(g) = guided_model(dir, Arc::clone(&credit), device)? {
         return Ok(Pipeline::Guided(g));
     }
-    Ok(match speech_model(dir, credit, device)? {
+    Ok(match speech_model(dir, credit, buckets, device)? {
         Some(m) => Pipeline::Speech(m),
         None => Pipeline::None,
     })
@@ -636,6 +643,7 @@ fn speech_models() -> &'static Bound<SpeechModel> {
 pub fn speech_model(
     assets: &Path,
     credit: Arc<crate::sched::admission::DownstreamCredit>,
+    buckets: &Arc<crate::obs::bucket::BucketDemand>,
     device: u8,
 ) -> Result<Option<Arc<SpeechModel>>, String> {
     let at = (assets.to_path_buf(), device);
@@ -647,6 +655,7 @@ pub fn speech_model(
         Some(contract) => {
             let mut codec = Codec::load_on(assets, device)?;
             codec.couple(credit);
+            codec.observe_buckets(buckets);
             if codec.frame_codes != contract.frame_codes
                 || codec.frame_samples != contract.frame_samples
             {
@@ -1122,6 +1131,7 @@ async fn speech_with(
             bind_pipeline(
                 &bundle.dir,
                 state.downstream(&req.model),
+                &state.model_metrics(&req.model).buckets,
                 state.ordinal_of(&req.model),
             )
         }) {

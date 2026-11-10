@@ -489,6 +489,23 @@ impl ServeEngine {
         }
     }
 
+    /// Count the engine's launches into the model's bucket-demand counters; `false` when the
+    /// engine counts none itself.
+    pub fn observe_buckets(&mut self, buckets: &Arc<crate::obs::bucket::BucketDemand>) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => {
+                e.observe_buckets(Arc::clone(buckets));
+                true
+            }
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = buckets;
+                false
+            }
+        }
+    }
+
     /// Packed prefill launch widths `(per-request cap, widest launch)`; `None` without packed
     /// CUDA prefill.
     pub fn pf_launch_rungs(&self) -> Option<(usize, usize)> {

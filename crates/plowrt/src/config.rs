@@ -1056,6 +1056,17 @@ pub struct RuntimeConfig {
     #[arg(long = "host-timing", env = "PLOW_HOST_TIMING", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub host_timing: bool,
 
+    /// Seconds between `bucket demand:` log lines (launch rows the packet's capacities pad;
+    /// `obs::bucket`). 0 = no log; the `plowrt_bucket_*` metrics are always on.
+    #[arg(
+        long = "bucket-log-s",
+        env = "PLOW_BUCKET_LOG_S",
+        default_value_t = 300,
+        hide = true,
+        global = true
+    )]
+    pub bucket_log_s: u32,
+
     /// Prefix-cache timing (`PLOW_PFX_LOG=1`).
     #[arg(long = "pfx-log", env = "PLOW_PFX_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pfx_log: bool,

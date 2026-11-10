@@ -31,6 +31,72 @@ reaches the step time.
 | `PLOW_TTFT_LOG=1` | TTFT phases. |
 | `frontend_microbench` (asr, ignored) | Resampler and mel cost per audio second. |
 
+## Bucket demand
+
+A packet declares a fixed set of launch capacities per launch family. A launch whose live rows
+match no capacity runs the next larger one and computes the padded rows too: 20 concurrent speech
+streams on a 1, 2, 4, 8, 16, 32, 64 ladder run the 32-row program every frame. plowrt counts, per
+model and family, how many frames asked for each row count and what each capacity launched, so the
+row counts production traffic sits at can get capacities of their own at the next emit. The
+counters are always on (relaxed atomic adds on the launch path, nothing else) and change no
+scheduling decision.
+
+| family | rows | capacities | launch time |
+|---|---|---|---|
+| `decode` | slot extent of a plain decode launch | decode rungs | decode-only tick, at the rung covering its extent |
+| `prefill` | rows of a packed token-batch launch (prompt rows + riders) | prefill buckets | not timed |
+| `depth` | slot extent of a speech depth frame | depth programs | not timed |
+| `codec` | streams in a stateful codec step | step batches | device run of the step |
+
+Rows are slot extents where the launch addresses slots (decode, depth): a capacity must cover the
+highest live slot, not only the live count. A launch is counted once it is enqueued. On CUDA the
+engine counts decode launches where it selects the rung; decode rows that ride a prefill launch
+count in `prefill`, and speculative verify launches are not counted. Other backends count one
+decode launch per completed step from the dispatcher and no prefill or depth.
+
+`/metrics`, labels `model_name`, `engine`, `family`:
+
+| series | meaning |
+|---|---|
+| `plowrt_bucket_capacity_info{capacity}` | 1 per capacity the loaded packet declares |
+| `plowrt_bucket_demand_total{rows}` | frames whose live row count was `rows`; non-zero entries only |
+| `plowrt_bucket_launches_total{capacity}`, `plowrt_bucket_padded_rows_total{capacity}` | launches at the capacity and their rows beyond the live ones |
+| `plowrt_bucket_launch_seconds_sum{capacity}`, `_count{capacity}` | time and number of the timed launches (families whose path already times itself) |
+| `plowrt_bucket_overflow_total`, `plowrt_bucket_demand_max` | frames above the widest capacity; largest row count seen |
+| `plowrt_bucket_missing_score{rows}` | top 8 undeclared row counts: `frames(rows) * (cover(rows) - rows) / sum(frames * cover)`, the share of all launched rows that was this row count's padding since start, with `cover` the smallest capacity holding the rows. Alert on this |
+
+A ladder up to 256 rows wide keeps one `rows` value per row count. A wider one (prefill) keeps
+exact counts up to 64 rows and 8 equal bins per octave above (`rows` = the bin's largest count:
+72, 80, .. 128, 144, .. 256, 288, ..), split at every declared capacity so no bin spans one: 120
+values for an 8192-row ladder plus its capacities off that grid. Scores and recommendations there
+are per bin. A frame served by several launches counts its demand once and
+each launch's padding separately, so `padded_rows_total` is what ran while `missing_score` is what
+a single covering launch would pad.
+
+The log names the same thing without a scraper. Every `PLOW_BUCKET_LOG_S` seconds (default 300,
+`0` = off), at shutdown and when a model's dispatcher stops, each family that padded at least 5 %
+of the rows it launched in the interval, or overflowed its ladder, writes one INFO line with the
+interval's numbers and its top 4 missing row counts. One process task writes it; no dispatcher or
+launch path does.
+
+```
+bucket demand: family=depth declared=[1,2,4,8,16,32,64] launches=1000 padded_frac=0.37 overflow=0 missing=[20:0.36,12:0.01]
+```
+
+Workflow: let production run, then
+
+```
+python3 scripts/campaign/bucket_demand.py http://<host>:<port>/metrics
+python3 scripts/campaign/bucket_demand.py before.prom after.prom --model <model> --family depth
+```
+
+prints per model and family the declared ladder, the demand, the padded fraction, and for 1 to 3
+added capacities the set that minimises launched rows over the observed demand (with the launch
+time it saves where the neighbouring capacities are timed). Add the chosen capacities to the
+packet's ladder in the recipe, emit, pass the rung and accuracy gates for the new capacities, and
+release the packet. Capacities of a model already loaded do not change; a reloaded model with a
+different ladder keeps reporting against the first one until the process restarts.
+
 ## What changed
 
 | Change | Effect |

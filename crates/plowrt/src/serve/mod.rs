@@ -1947,6 +1947,34 @@ fn mm_metrics(out: &mut String, state: &AppState) {
     }
 }
 
+/// Write every model's `bucket demand:` lines for the interval since the last call
+/// (`obs::bucket`; nothing with `PLOW_BUCKET_LOG_S=0`).
+pub fn log_bucket_demand(state: &AppState) {
+    if crate::config::RuntimeConfig::process_get().bucket_log_s == 0 {
+        return;
+    }
+    for (slug, metrics, _) in metrics_models(state) {
+        metrics.buckets.log(&slug);
+    }
+}
+
+/// The periodic `bucket demand:` log: one process task, off every dispatcher.
+pub fn spawn_bucket_demand_log(state: Arc<AppState>) {
+    let every = crate::config::RuntimeConfig::process_get().bucket_log_s;
+    if every == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(u64::from(every)));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let state = Arc::clone(&state);
+            let _ = tokio::task::spawn_blocking(move || log_bucket_demand(&state)).await;
+        }
+    });
+}
+
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::response::Response {

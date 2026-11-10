@@ -46,6 +46,7 @@ use crate::exec::indirection::slots as ind_slots;
 use crate::exec::oob::{OobChannel, OobMsg};
 use crate::memory::streamer::{KvArena, SlotHandle};
 use crate::memory::AddressSpace;
+use crate::obs::bucket::Family as BucketFamily;
 use crate::obs::serving::{Leg, RequestMetrics};
 use crate::obs::Metrics;
 use crate::sched::admission::LoadEstimator;
@@ -899,6 +900,8 @@ fn decode_feed_extent(feeds: &[(usize, u32)]) -> Option<usize> {
 struct DecodeProgress {
     extent: usize,
     steps: std::num::NonZeroUsize,
+    /// A plain decode launch ran them (not a prefill launch they rode, nor a speculative verify).
+    plain: bool,
 }
 
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
@@ -906,6 +909,7 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
     Some(DecodeProgress {
         extent: decode_feed_extent(feeds)?,
         steps: std::num::NonZeroUsize::new(steps)?,
+        plain: true,
     })
 }
 
@@ -1440,6 +1444,20 @@ fn spawn_scoped(
     let pf_rungs = state
         .gpu_engine(&slug)
         .and_then(|e| e.lock().pf_launch_rungs());
+    let decode_caps: Box<[usize]> = rung_widths
+        .iter()
+        .flat_map(|w| w.iter().map(|&w| w as usize))
+        .collect();
+    // An engine that counts its own decode launches leaves the dispatcher only their time.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    let engine_counts_decode = state
+        .gpu_engine(&slug)
+        .is_some_and(|e| e.lock().observe_buckets(&metrics.buckets));
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    let engine_counts_decode = false;
+    metrics
+        .buckets
+        .declare(BucketFamily::Decode, decode_caps.iter().copied());
     #[cfg(any(feature = "cuda", feature = "hsa"))]
     let prefix_probe = state
         .gpu_engine(&slug)
@@ -2395,6 +2413,20 @@ fn spawn_scoped(
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
                     }
+                    if let Some(p) = decode_progress.filter(|p| p.plain) {
+                        let cap = decode_caps.iter().find(|&&c| c >= p.extent);
+                        let cap = cap.copied().unwrap_or(0);
+                        let steps = p.steps.get() as u64;
+                        let us = (!did_prefill).then(|| service.as_micros() as u64);
+                        let b = &metrics.buckets;
+                        match (engine_counts_decode, us) {
+                            (false, _) => {
+                                b.record_n(BucketFamily::Decode, p.extent, cap, steps, us)
+                            }
+                            (true, Some(us)) => b.record_time(BucketFamily::Decode, cap, steps, us),
+                            (true, None) => {}
+                        }
+                    }
                     if let (Some(controller), Some(progress), Some(sample)) =
                         (rung_controller.as_mut(), decode_progress, sample)
                     {
@@ -2503,6 +2535,9 @@ fn spawn_scoped(
         metrics.decode_rung_actual.store(0, Ordering::Relaxed);
         metrics.decode_rung_admission.store(0, Ordering::Relaxed);
         metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
+        if crate::config::RuntimeConfig::process_get().bucket_log_s > 0 {
+            metrics.buckets.log(&slug);
+        }
     };
     let dispatcher = crate::config::Scoped::new(dispatcher_scope, dispatcher);
     if inline_tick {
@@ -4133,6 +4168,7 @@ fn run_one_tick(
                             Some(DecodeProgress {
                                 extent,
                                 steps: std::num::NonZeroUsize::new(1)?,
+                                plain: false,
                             })
                         });
                     }
@@ -4494,7 +4530,8 @@ fn run_one_tick(
                                 &mut disconnected,
                             );
                             if spec_ran {
-                                decode_progress = completed_decode(&feeds, 1);
+                                decode_progress = completed_decode(&feeds, 1)
+                                    .map(|p| DecodeProgress { plain: false, ..p });
                             }
                         } else {
                             spec_ran = true;

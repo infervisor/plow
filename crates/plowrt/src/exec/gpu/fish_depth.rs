@@ -708,6 +708,19 @@ impl FishDepth {
 }
 
 impl GpuEngine {
+    /// Declare the decode rungs, prefill buckets and depth programs to `buckets` and count their
+    /// launches into it.
+    pub fn observe_buckets(&mut self, buckets: Arc<crate::obs::bucket::BucketDemand>) {
+        use crate::obs::bucket::Family;
+        let rungs = self.effective_decode_rungs();
+        buckets.declare(Family::Decode, rungs.iter().map(|&w| w as usize));
+        buckets.declare(Family::Prefill, self.prefill.iter().map(|b| b.t as usize));
+        if let Some(d) = &self.fish {
+            buckets.declare(Family::Depth, d.programs.iter().map(|p| p.rows as usize));
+        }
+        self.buckets = buckets;
+    }
+
     pub(super) fn quarantine_depth_source(&self) {
         if let Some(d) = &self.fish {
             d.quarantine();
@@ -1090,6 +1103,8 @@ impl GpuEngine {
             Some(&self.stream),
         )?;
         let codes_at = sw + pw + ww;
+        self.buckets
+            .record(crate::obs::bucket::Family::Depth, width, n, None);
         self.depth_read_codes(d, codes_at, n * k * 4)?;
         let codes: &[u32] =
             bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + n * k * 4]);
@@ -1275,10 +1290,20 @@ impl GpuEngine {
             d.plan.capacity(d.plan.windows()[0].program) as usize
         };
         self.depth_read_codes(d, codes_at, end * k * 4)?;
+        let us = started.elapsed().as_secs_f32() * 1e6;
         if passes == 1 {
             let program = d.plan.windows()[0].program;
-            d.plan
-                .observe(program, started.elapsed().as_secs_f32() * 1e6);
+            d.plan.observe(program, us);
+        }
+        {
+            use crate::obs::bucket::Family::Depth;
+            self.buckets.record_demand(Depth, rows.len());
+            for w in d.plan.windows() {
+                let cap = d.plan.capacity(w.program) as usize;
+                let live = rows.len().saturating_sub(w.start as usize).min(cap);
+                self.buckets
+                    .record_launch(Depth, cap, live, (passes == 1).then_some(us as u64));
+            }
         }
         let m = d.maya2.as_mut().unwrap();
         let codes: &[u32] =

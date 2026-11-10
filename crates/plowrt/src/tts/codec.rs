@@ -249,6 +249,7 @@ enum Family {
 enum Msg {
     Job(Job),
     Release(SlotId),
+    Observe(std::sync::Arc<crate::obs::bucket::BucketDemand>),
 }
 
 pub(crate) use super::Codes;
@@ -510,6 +511,7 @@ struct Bound {
     voices: Vec<String>,
     parameters: std::collections::BTreeMap<String, u64>,
     yield_hook: std::sync::Arc<Mutex<Option<YieldHook>>>,
+    buckets: std::sync::Arc<crate::obs::bucket::BucketDemand>,
     /// Programs per segment between yield points (0: one segment).
     yield_programs: usize,
 }
@@ -772,6 +774,11 @@ impl Codec {
     /// `None` restores one launch per decode.
     pub fn set_yield(&self, hook: Option<YieldHook>) {
         *self.yield_hook.lock() = hook;
+    }
+
+    /// Count stream-step launches into the serving model's bucket-demand counters.
+    pub fn observe_buckets(&self, buckets: &std::sync::Arc<crate::obs::bucket::BucketDemand>) {
+        let _ = self.tx.lock().send(Msg::Observe(buckets.clone()));
     }
 
     /// Charge this stage's backlog to the feeding model's admission: past two full launches of
@@ -1229,6 +1236,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         capacities,
         runtime,
         yield_hook: Default::default(),
+        buckets: Default::default(),
         yield_programs: pipeline
             .parameter("render.yield_programs")
             .map(|v| v as usize)
@@ -1548,6 +1556,12 @@ impl Bound {
         rt.run_sequence(&programs).map_err(e)?;
         let gpu_us = rt.last_run_us();
         let t2 = std::time::Instant::now();
+        self.buckets.record(
+            crate::obs::bucket::Family::Codec,
+            jobs.len(),
+            cb,
+            Some((t2 - t1).as_micros() as u64),
+        );
         io.pcm_buf.resize(cb * cn * fs, 0.0);
         rt.read_tensor_at(
             self.pcm,
@@ -1814,6 +1828,13 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
                     if let Some(pool) = &codec.slots {
                         pool.lock().release(id);
                     }
+                }
+                Msg::Observe(buckets) => {
+                    buckets.declare(
+                        crate::obs::bucket::Family::Codec,
+                        codec.steps.iter().map(|c| c.0),
+                    );
+                    codec.buckets = buckets;
                 }
             }
         }
