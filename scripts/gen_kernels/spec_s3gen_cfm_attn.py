@@ -1,5 +1,6 @@
 """gen_search block spec: S3Gen CFM attention (AttentionF32, 3xTF32, 306-row key prefix, 8 heads
-x 64) at the cached-prompt `csynth` shapes. Generated body: attn_cfm.py; current plow kernel:
+x 64) at the cached-prompt `csynth` shapes. Generated bodies: attn_cfm.py (TileLang),
+attn_cfm_triton.py (Triton); current plow kernel:
 the interpreter path of the standalone probe cfm_attn.cu (which 0, 132 blocks); inputs and the
 fp64 reference are bench_cfm.py's.
 """
@@ -41,6 +42,12 @@ def _tl_bind(kern, c, inp, out):
     return lambda: kern(inp["qkv"], inp["prefix"], inp["pidx"], inp["klen"], out, SCALE)
 
 
+def _tr_build(cfg, c):
+    import attn_cfm_triton
+    return attn_cfm_triton.launcher(cfg["bm"], cfg["bn"], cfg["warps"], cfg["stages"], cfg["prec"],
+                                    H, HW, PRE)
+
+
 def _cur_bind(lib, c, inp, out):
     import ctypes
     import torch
@@ -77,6 +84,14 @@ SPEC = {
         "tilelang": {
             "grid": {"bm": [16, 32, 64], "bn": [32, 64], "threads": [128, 256], "stages": [1, 2]},
             "build": _tl_build,
+            "bind": _tl_bind,
+        },
+        # prec is tl.dot's input_precision: tf32x3 = the plow kernel's hi/lo split, tf32 = one
+        # truncated tensor-core product, ieee = FP32 FMA.
+        "triton": {
+            "grid": {"prec": ["tf32x3", "tf32", "ieee"], "bm": [16, 32, 64, 128], "bn": [32, 64],
+                     "warps": [2, 4, 8], "stages": [1, 3]},
+            "build": _tr_build,
             "bind": _tl_bind,
         },
     },
