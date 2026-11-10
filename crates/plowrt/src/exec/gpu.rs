@@ -3048,6 +3048,8 @@ pub struct GpuEngine {
     fish: Option<fish_depth::FishDepth>,
     /// The serving model's bucket-demand counters (unobserved until `observe_buckets`).
     buckets: Arc<crate::obs::bucket::BucketDemand>,
+    /// Slot extent of the last decode selection (highest fed slot + 1).
+    decode_extent: usize,
     /// The serial prefill's last chunk's terminal row (its lm_head row of `act.hn`).
     pf_terminal_row: u32,
     /// Span-mode verify (`in.rowslot` packets); see [`spec`].
@@ -8157,6 +8159,7 @@ impl GpuEngine {
             slot_generations: vec![0; batch],
             fish: None,
             buckets: Default::default(),
+            decode_extent: 0,
             pf_terminal_row: 0,
             spec,
             spec_draft: None,
@@ -9959,11 +9962,15 @@ impl GpuEngine {
         decode_rung_index(self.decode_rungs.iter().map(|r| r.rows), highest_slot)
     }
 
-    fn select_decode(&self, slots: impl Iterator<Item = usize> + Clone) -> Result<DecodeSelection> {
+    fn select_decode(
+        &mut self,
+        slots: impl Iterator<Item = usize> + Clone,
+    ) -> Result<DecodeSelection> {
         let highest = slots
             .clone()
             .max()
             .ok_or_else(|| RuntimeError::Rejected("empty decode selection".into()))?;
+        self.decode_extent = highest + 1;
         let band = self
             .decode_contexts
             .as_ref()
@@ -10009,7 +10016,17 @@ impl GpuEngine {
             plan.extend(self.pos.iter().map(|&p| u64::from(p)));
             self.rank_arm(&plan)?;
         }
-        self.launch_decode_program(selection)
+        self.launch_decode_program(selection)?;
+        let cap = self
+            .selected_decode(selection)
+            .map_or(self.batch, |r| r.rows);
+        self.buckets.record(
+            crate::obs::bucket::Family::Decode,
+            self.decode_extent,
+            cap,
+            None,
+        );
+        Ok(())
     }
 
     /// Start a tensor-parallel launch unit: the previous unit has retired (stream drained),

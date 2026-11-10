@@ -9,7 +9,6 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
 use super::serving::family as metric_family;
 use super::Metrics;
@@ -43,7 +42,8 @@ impl Family {
 /// A ladder whose widest capacity is at most this keeps one demand bin per row count.
 const EXACT_MAX: usize = 256;
 /// Wider ladders keep exact bins up to this row count and [`OCTAVE_BINS`] equal bins per octave
-/// above it: bin upper edges `2^e * (1 + j/8)`, `e >= 6`, `j = 1..=8` (72, 80, .. 128, 144, ..).
+/// above it, split at every declared capacity: bin upper edges `2^e * (1 + j/8)`, `e >= 6`,
+/// `j = 1..=8` (72, 80, .. 128, 144, ..) and the capacities.
 const FINE_MAX: usize = 64;
 const OCTAVE_BINS: usize = 8;
 /// Undeclared row counts exported as `plowrt_bucket_missing_score`, and named in a log line.
@@ -52,24 +52,19 @@ const MISSING_LOGGED: usize = 4;
 /// A log line is written when at least this fraction of the interval's launched rows was padding.
 pub const LOG_PADDED_FRAC: f64 = 0.05;
 
-#[inline]
-fn bin(rows: usize, exact: usize) -> usize {
-    if rows <= exact {
-        return rows;
-    }
-    let e = (rows - 1).ilog2() as usize;
-    let j = (rows - (1 << e) + (1 << (e - 3)) - 1) >> (e - 3);
-    FINE_MAX + (e - 6) * OCTAVE_BINS + j
-}
-
-/// The largest row count of bin `index` (its `rows` label).
-fn bin_rows(index: usize, exact: usize) -> usize {
-    if index <= exact {
-        return index;
-    }
-    let k = index - FINE_MAX - 1;
-    let e = 6 + k / OCTAVE_BINS;
-    (1 << e) + (k % OCTAVE_BINS + 1) * (1 << (e - 3))
+/// The largest row count of every bin above [`FINE_MAX`] for a ladder `caps` (ascending) wider
+/// than [`EXACT_MAX`]: no bin spans a capacity, so a bin's frames all run the same capacity.
+fn wide_edges(caps: &[usize]) -> Box<[usize]> {
+    let widest = caps[caps.len() - 1];
+    let grid = (6..usize::BITS as usize - 1)
+        .flat_map(|e| (1..=OCTAVE_BINS).map(move |j| (1usize << e) + j * (1 << (e - 3))))
+        .take_while(|&rows| rows < widest);
+    let mut edges: Vec<usize> = grid
+        .chain(caps.iter().copied().filter(|&c| c > FINE_MAX))
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+    edges.into()
 }
 
 #[derive(Default)]
@@ -109,7 +104,10 @@ struct Ladder {
     /// Ascending, distinct, non-zero.
     caps: Box<[usize]>,
     widest: usize,
+    /// Row counts up to this have a bin each.
     exact: usize,
+    /// The largest row count of each bin above `exact`, ascending, ending at `widest`.
+    edges: Box<[usize]>,
     live: Box<[AtomicU64]>,
     stats: Box<[CapStat]>,
     overflow: AtomicU64,
@@ -124,23 +122,34 @@ impl Ladder {
         caps.sort_unstable();
         caps.dedup();
         let widest = *caps.last()?;
-        let exact = if widest <= EXACT_MAX {
-            widest
+        let (exact, edges) = if widest <= EXACT_MAX {
+            (widest, Box::default())
         } else {
-            FINE_MAX
+            (FINE_MAX, wide_edges(&caps))
         };
         Some(Self {
-            live: (0..=bin(widest, exact))
+            live: (0..=exact + edges.len())
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             stats: caps.iter().map(|_| CapStat::default()).collect(),
             caps: caps.into(),
             widest,
             exact,
+            edges,
             overflow: AtomicU64::new(0),
             max: AtomicU64::new(0),
             logged: Default::default(),
         })
+    }
+
+    /// The bin of `live <= widest` rows.
+    #[inline]
+    fn bin(&self, live: usize) -> usize {
+        if live <= self.exact {
+            live
+        } else {
+            self.exact + 1 + self.edges.partition_point(|&e| e < live)
+        }
     }
 
     #[inline]
@@ -151,7 +160,7 @@ impl Ladder {
         if live > self.widest {
             self.overflow.fetch_add(n, Relaxed);
         } else {
-            self.live[bin(live, self.exact)].fetch_add(n, Relaxed);
+            self.live[self.bin(live)].fetch_add(n, Relaxed);
         }
     }
 
@@ -170,6 +179,14 @@ impl Ladder {
         }
     }
 
+    #[inline]
+    fn time(&self, cap: usize, n: u64, us: u64) {
+        if let Some(at) = self.caps.iter().position(|&c| c == cap) {
+            self.stats[at].timed.fetch_add(n, Relaxed);
+            self.stats[at].us.fetch_add(us, Relaxed);
+        }
+    }
+
     fn counts(&self) -> Counts {
         let load = |a: &AtomicU64| a.load(Relaxed);
         Counts {
@@ -180,8 +197,12 @@ impl Ladder {
         }
     }
 
+    /// The largest row count of bin `index` (its `rows` label).
     fn rows(&self, index: usize) -> usize {
-        bin_rows(index, self.exact).min(self.widest)
+        match index.checked_sub(self.exact + 1) {
+            Some(wide) => self.edges[wide],
+            None => index,
+        }
     }
 
     fn cover(&self, rows: usize) -> usize {
@@ -233,7 +254,7 @@ impl Ladder {
         } else {
             padded as f64 / launched as f64
         };
-        if launches == 0 || (frac < LOG_PADDED_FRAC && d.overflow == 0) {
+        if d.overflow == 0 && (launches == 0 || frac < LOG_PADDED_FRAC) {
             return None;
         }
         let list = |items: Vec<String>| items.join(",");
@@ -286,6 +307,14 @@ impl BucketDemand {
         }
     }
 
+    /// `us` measured over `n` launches of `cap` that another call site counts.
+    #[inline]
+    pub fn record_time(&self, family: Family, cap: usize, n: u64, us: u64) {
+        if let Some(l) = self.families[family as usize].get() {
+            l.time(cap, n, us);
+        }
+    }
+
     /// A frame served by one launch.
     #[inline]
     pub fn record(&self, family: Family, live: usize, cap: usize, us: Option<u64>) {
@@ -315,38 +344,6 @@ impl BucketDemand {
     pub fn log(&self, slug: &str) {
         for line in self.log_lines() {
             tracing::info!(%slug, "{line}");
-        }
-    }
-}
-
-/// When the next interval line is due (`PLOW_BUCKET_LOG_S`; 0 = never). Fed the dispatcher's own
-/// timestamps, so it reads no clock.
-pub struct LogTicker {
-    every: Option<Duration>,
-    next: Instant,
-}
-
-impl LogTicker {
-    pub fn new(every_s: u32, now: Instant) -> Self {
-        let every = (every_s > 0).then(|| Duration::from_secs(u64::from(every_s)));
-        Self {
-            every,
-            next: now + every.unwrap_or_default(),
-        }
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.every.is_some()
-    }
-
-    #[inline]
-    pub fn due(&mut self, now: Instant) -> bool {
-        match self.every {
-            Some(every) if now >= self.next => {
-                self.next = now + every;
-                true
-            }
-            _ => false,
         }
     }
 }
@@ -584,46 +581,46 @@ mod tests {
     }
 
     #[test]
-    fn wide_ladders_bin_rows_above_64_and_stay_under_the_series_bound() {
-        for rows in 1..=70_000 {
-            let i = bin(rows, FINE_MAX);
-            let upper = bin_rows(i, FINE_MAX);
-            assert!(rows <= upper && (i == 0 || bin_rows(i - 1, FINE_MAX) < rows));
+    fn wide_ladders_bin_rows_above_64_without_spanning_a_capacity() {
+        let grid = Ladder::new(vec![8192]).unwrap();
+        assert_eq!(grid.edges[..9], [72, 80, 88, 96, 104, 112, 120, 128, 144]);
+        assert_eq!((grid.edges.len(), grid.live.len()), (56, 121));
+        for rows in 1..=8192 {
+            let (at, upper) = (grid.bin(rows), grid.rows(grid.bin(rows)));
+            assert!(rows <= upper && grid.rows(at - 1) < rows);
             assert!(
                 rows <= 64 || (upper - rows) * 8 < upper,
                 "{rows} in {upper}"
             );
         }
-        assert_eq!(
-            (65..=73).map(|i| bin_rows(i, FINE_MAX)).collect::<Vec<_>>(),
-            [72, 80, 88, 96, 104, 112, 120, 128, 144]
-        );
+
         let b = BucketDemand::default();
         b.declare(Family::Prefill, [512, 1024, 4160, 8192]);
         let l = b.families[Family::Prefill as usize].get().unwrap();
-        assert_eq!(l.live.len(), 65 + 7 * 8);
-        b.record(Family::Prefill, 4100, 4160, None);
-        b.record(Family::Prefill, 8192, 8192, None);
-        b.record(Family::Prefill, 300, 512, None);
+        assert_eq!(l.live.len(), 122, "the grid and 4160");
+        for (rows, cap) in [
+            (4100, 4160),
+            (4160, 4160),
+            (4200, 8192),
+            (8192, 8192),
+            (300, 512),
+        ] {
+            assert_eq!(l.cover(l.rows(l.bin(rows))), cap, "{rows}");
+            b.record(Family::Prefill, rows, cap, None);
+        }
         b.record_demand(Family::Prefill, 9000);
         let out = text(b);
-        for rows in [320, 4608, 8192] {
-            assert!(
-                out.contains(&format!("family=\"prefill\",rows=\"{rows}\"}} 1")),
-                "{out}"
-            );
+        let l = r#"model_name="tts",engine="0",family="prefill""#;
+        for (rows, n) in [(320, 1), (4160, 2), (4608, 1), (8192, 1)] {
+            let line = format!("plowrt_bucket_demand_total{{{l},rows=\"{rows}\"}} {n}");
+            assert!(out.lines().any(|x| x == line), "missing {line}\n{out}");
         }
-        assert!(out.contains(
-            "plowrt_bucket_overflow_total{model_name=\"tts\",engine=\"0\",family=\"prefill\"} 1"
-        ));
-        assert!(out.contains(
-            "plowrt_bucket_demand_max{model_name=\"tts\",engine=\"0\",family=\"prefill\"} 9000"
-        ));
+        assert!(!out.contains(&format!("plowrt_bucket_missing_score{{{l},rows=\"4160\"")));
+        assert!(out.contains(&format!("plowrt_bucket_overflow_total{{{l}}} 1")));
+        assert!(out.contains(&format!("plowrt_bucket_demand_max{{{l}}} 9000")));
 
-        let narrow = BucketDemand::default();
-        narrow.declare(Family::Decode, [256]);
-        let l = narrow.families[Family::Decode as usize].get().unwrap();
-        assert_eq!((l.exact, l.live.len()), (256, 257));
+        let narrow = Ladder::new(vec![256]).unwrap();
+        assert_eq!((narrow.exact, narrow.live.len()), (256, 257));
     }
 
     #[test]
@@ -635,6 +632,7 @@ mod tests {
         b.record_launch(Family::Depth, 4, 4, Some(1_000));
         b.record_n(Family::Depth, 3, 4, 5, Some(10_000));
         b.record_launch(Family::Depth, 24, 20, None);
+        b.record_time(Family::Depth, 32, 2, 9_000);
         let out = text(b);
         let l = r#"model_name="tts",engine="0",family="depth""#;
         for line in [
@@ -646,10 +644,12 @@ mod tests {
             format!("plowrt_bucket_launch_seconds_sum{{{l},capacity=\"4\"}} 0.011"),
             format!("plowrt_bucket_launch_seconds_count{{{l},capacity=\"4\"}} 6"),
             format!("plowrt_bucket_launch_seconds_sum{{{l},capacity=\"16\"}} 0.003"),
+            format!("plowrt_bucket_launch_seconds_count{{{l},capacity=\"32\"}} 2"),
+            format!("plowrt_bucket_launches_total{{{l},capacity=\"32\"}} 0"),
         ] {
             assert!(out.lines().any(|x| x == line), "missing {line}\n{out}");
         }
-        assert_eq!(out.matches("launch_seconds_sum{").count(), 2);
+        assert_eq!(out.matches("launch_seconds_sum{").count(), 3);
     }
 
     #[test]
@@ -675,23 +675,16 @@ mod tests {
             b.log_lines(),
             ["bucket demand: family=codec declared=[1,2,4,8] launches=1 padded_frac=0.00 overflow=1 missing=[]"]
         );
+        b.record_demand(Family::Codec, 11);
+        assert_eq!(
+            b.log_lines(),
+            ["bucket demand: family=codec declared=[1,2,4,8] launches=0 padded_frac=0.00 overflow=1 missing=[]"]
+        );
         b.record(Family::Prefill, 5, 8, None);
         assert!(
             b.log_lines().is_empty(),
             "an undeclared family records nothing"
         );
-    }
-
-    #[test]
-    fn the_ticker_fires_once_per_interval_and_never_when_off() {
-        let t0 = Instant::now();
-        let mut t = LogTicker::new(300, t0);
-        assert!(t.enabled() && !t.due(t0 + Duration::from_secs(299)));
-        assert!(t.due(t0 + Duration::from_secs(300)));
-        assert!(!t.due(t0 + Duration::from_secs(301)));
-        assert!(t.due(t0 + Duration::from_secs(600)));
-        let mut off = LogTicker::new(0, t0);
-        assert!(!off.enabled() && !off.due(t0 + Duration::from_secs(86_400)));
     }
 
     #[test]

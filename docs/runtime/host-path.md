@@ -43,13 +43,16 @@ scheduling decision.
 
 | family | rows | capacities | launch time |
 |---|---|---|---|
-| `decode` | occupied slot extent of a decode step | decode rungs | decode-only tick, all its steps |
+| `decode` | slot extent of a plain decode launch | decode rungs | decode-only tick, at the rung covering its extent |
 | `prefill` | rows of a packed token-batch launch (prompt rows + riders) | prefill buckets | not timed |
 | `depth` | slot extent of a speech depth frame | depth programs | not timed |
 | `codec` | streams in a stateful codec step | step batches | device run of the step |
 
 Rows are slot extents where the launch addresses slots (decode, depth): a capacity must cover the
-highest live slot, not only the live count.
+highest live slot, not only the live count. A launch is counted once it is enqueued. On CUDA the
+engine counts decode launches where it selects the rung; decode rows that ride a prefill launch
+count in `prefill`, and speculative verify launches are not counted. Other backends count one
+decode launch per completed step from the dispatcher and no prefill or depth.
 
 `/metrics`, labels `model_name`, `engine`, `family`:
 
@@ -64,22 +67,21 @@ highest live slot, not only the live count.
 
 A ladder up to 256 rows wide keeps one `rows` value per row count. A wider one (prefill) keeps
 exact counts up to 64 rows and 8 equal bins per octave above (`rows` = the bin's largest count:
-72, 80, .. 128, 144, .. 256, 288, ..), at most 121 values for an 8192-row ladder; scores and
-recommendations there are per bin. A frame served by several launches counts its demand once and
+72, 80, .. 128, 144, .. 256, 288, ..), split at every declared capacity so no bin spans one: 120
+values for an 8192-row ladder plus its capacities off that grid. Scores and recommendations there
+are per bin. A frame served by several launches counts its demand once and
 each launch's padding separately, so `padded_rows_total` is what ran while `missing_score` is what
 a single covering launch would pad.
 
 The log names the same thing without a scraper. Every `PLOW_BUCKET_LOG_S` seconds (default 300,
-`0` = off) and when the model's dispatcher stops, each family that launched in the interval and
-padded at least 5 % of its launched rows, or overflowed its ladder, writes one INFO line with the
-interval's numbers and its top 4 missing row counts:
+`0` = off), at shutdown and when a model's dispatcher stops, each family that padded at least 5 %
+of the rows it launched in the interval, or overflowed its ladder, writes one INFO line with the
+interval's numbers and its top 4 missing row counts. One process task writes it; no dispatcher or
+launch path does.
 
 ```
 bucket demand: family=depth declared=[1,2,4,8,16,32,64] launches=1000 padded_frac=0.37 overflow=0 missing=[20:0.36,12:0.01]
 ```
-
-The dispatcher writes it after a tick, so an interval that ends idle is reported at the next
-request or at shutdown.
 
 Workflow: let production run, then
 

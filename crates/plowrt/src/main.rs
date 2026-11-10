@@ -5686,6 +5686,7 @@ async fn serve(
         .await??;
     }
 
+    plowrt::serve::spawn_bucket_demand_log(Arc::clone(&state));
     let router = app(Arc::clone(&state));
     let shutdown_state = Arc::clone(&state);
     let shutdown_socket = socket.clone();
@@ -5852,6 +5853,7 @@ async fn serve(
                 let _ = std::fs::remove_file(path);
             }
             tracing::info!("shutdown: drained");
+            plowrt::serve::log_bucket_demand(&shutdown_state);
             log_library_attention_launches();
             plowrt::obs::logwriter::flush(LOG_FLUSH_TIMEOUT);
             // Engine threads and blocking tick tasks never finish on their own; the runtime's

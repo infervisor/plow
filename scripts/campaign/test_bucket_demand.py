@@ -87,6 +87,11 @@ class BucketDemandTests(unittest.TestCase):
         self.assertIn("model=maya2#1 family=depth", split)
         with self.assertRaisesRegex(SystemExit, "went backwards"):
             run(self.file("b.prom", after), self.file("a.prom", before))
+        # One engine restarted while the other grew: the model's sum still rose.
+        reset = (metrics({20: 10}, {32: 10}, {32: 120})
+                 + metrics({40: 2000}, {64: 2000}, {64: 48000}, engine=1))
+        with self.assertRaisesRegex(SystemExit, "maya2#0.*went backwards"):
+            run(self.file("b.prom", after), self.file("c.prom", reset))
 
     def test_filters_overflow_and_binned_rows(self):
         text = TWENTY + metrics({320: 10, 4608: 5, 8192: 1}, {512: 10, 8192: 6}, {512: 1920, 8192: 17920},

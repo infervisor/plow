@@ -569,9 +569,12 @@ impl FishDepth {
 }
 
 impl GpuEngine {
-    /// Declare the prefill buckets and depth programs to `buckets` and count launches into it.
+    /// Declare the decode rungs, prefill buckets and depth programs to `buckets` and count their
+    /// launches into it.
     pub fn observe_buckets(&mut self, buckets: Arc<crate::obs::bucket::BucketDemand>) {
         use crate::obs::bucket::Family;
+        let rungs = self.effective_decode_rungs();
+        buckets.declare(Family::Decode, rungs.iter().map(|&w| w as usize));
         buckets.declare(Family::Prefill, self.prefill.iter().map(|b| b.t as usize));
         if let Some(d) = &self.fish {
             buckets.declare(Family::Depth, d.programs.iter().map(|p| p.rows as usize));
@@ -838,8 +841,6 @@ impl GpuEngine {
             ));
         }
         let n = p.rows as usize;
-        self.buckets
-            .record(crate::obs::bucket::Family::Depth, width, n, None);
         let k = d.manifest.codebooks as usize;
         {
             let s = depth_stage(&mut d.stage)?;
@@ -936,6 +937,8 @@ impl GpuEngine {
             Some(&self.stream),
         )?;
         let codes_at = sw + pw + ww;
+        self.buckets
+            .record(crate::obs::bucket::Family::Depth, width, n, None);
         self.depth_read_codes(d, codes_at, n * k * 4)?;
         let codes: &[u32] =
             bytemuck::cast_slice(&d.stage.as_slice()[codes_at..codes_at + n * k * 4]);
@@ -969,8 +972,6 @@ impl GpuEngine {
                 ))
             })?;
         let n = p.rows as usize;
-        self.buckets
-            .record(crate::obs::bucket::Family::Depth, width, n, None);
         let k = d.manifest.codebooks as usize;
         let vocab = self.vocab();
         let m = d.maya2.as_mut().unwrap();
@@ -1119,6 +1120,8 @@ impl GpuEngine {
             Some(&self.stream),
         )?;
         let codes_at = d.rows * STAGE_CONTROL_BYTES;
+        self.buckets
+            .record(crate::obs::bucket::Family::Depth, width, n, None);
         self.depth_read_codes(d, codes_at, n * k * 4)?;
         let m = d.maya2.as_mut().unwrap();
         let codes: &[u32] =

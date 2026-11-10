@@ -1448,13 +1448,16 @@ fn spawn_scoped(
         .iter()
         .flat_map(|w| w.iter().map(|&w| w as usize))
         .collect();
+    // An engine that counts its own decode launches leaves the dispatcher only their time.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    let engine_counts_decode = state
+        .gpu_engine(&slug)
+        .is_some_and(|e| e.lock().observe_buckets(&metrics.buckets));
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    let engine_counts_decode = false;
     metrics
         .buckets
         .declare(BucketFamily::Decode, decode_caps.iter().copied());
-    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    if let Some(e) = state.gpu_engine(&slug) {
-        e.lock().observe_buckets(&metrics.buckets);
-    }
     #[cfg(any(feature = "cuda", feature = "hsa"))]
     let prefix_probe = state
         .gpu_engine(&slug)
@@ -1584,10 +1587,6 @@ fn spawn_scoped(
         let mut first_before = 0usize;
         let mut load = LoadEstimator::default();
         let mut host_window = crate::obs::host::Window::default();
-        let mut bucket_log = crate::obs::bucket::LogTicker::new(
-            crate::config::RuntimeConfig::process_get().bucket_log_s,
-            Instant::now(),
-        );
         let mut host_last_return: Option<Instant> = None;
         // Cache one BucketBufs per BucketKey — rung swaps are a swap-in, not
         // a rebuild. The dispatcher owns the map; each tick takes the entry
@@ -2416,16 +2415,17 @@ fn spawn_scoped(
                     }
                     if let Some(p) = decode_progress.filter(|p| !p.rode) {
                         let cap = decode_caps.iter().find(|&&c| c >= p.extent);
-                        metrics.buckets.record_n(
-                            BucketFamily::Decode,
-                            p.extent,
-                            cap.copied().unwrap_or(0),
-                            p.steps.get() as u64,
-                            (!did_prefill).then(|| service.as_micros() as u64),
-                        );
-                    }
-                    if bucket_log.due(t_returned) {
-                        metrics.buckets.log(&slug);
+                        let cap = cap.copied().unwrap_or(0);
+                        let steps = p.steps.get() as u64;
+                        let us = (!did_prefill).then(|| service.as_micros() as u64);
+                        let b = &metrics.buckets;
+                        match (engine_counts_decode, us) {
+                            (false, _) => {
+                                b.record_n(BucketFamily::Decode, p.extent, cap, steps, us)
+                            }
+                            (true, Some(us)) => b.record_time(BucketFamily::Decode, cap, steps, us),
+                            (true, None) => {}
+                        }
                     }
                     if let (Some(controller), Some(progress), Some(sample)) =
                         (rung_controller.as_mut(), decode_progress, sample)
@@ -2535,7 +2535,7 @@ fn spawn_scoped(
         metrics.decode_rung_actual.store(0, Ordering::Relaxed);
         metrics.decode_rung_admission.store(0, Ordering::Relaxed);
         metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
-        if bucket_log.enabled() {
+        if crate::config::RuntimeConfig::process_get().bucket_log_s > 0 {
             metrics.buckets.log(&slug);
         }
     };

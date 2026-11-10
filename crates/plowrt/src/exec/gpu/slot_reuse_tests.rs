@@ -37,9 +37,8 @@ fn reseated_slot_decodes_like_a_fresh_one() {
         e.logits_row(0, &mut logits).unwrap();
         let mut hashes = vec![fnv(&logits)];
         let mut tokens = vec![token];
-        let rows = e
-            .selected_decode(e.select_decode(std::iter::once(slot)).unwrap())
-            .map_or(e.batch, |r| r.rows);
+        let selection = e.select_decode(std::iter::once(slot)).unwrap();
+        let rows = e.selected_decode(selection).map_or(e.batch, |r| r.rows);
         for _ in 0..steps {
             let mut next = Vec::new();
             e.step_slots(&[(slot, token)], &mut next).unwrap();

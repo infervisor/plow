@@ -36,29 +36,37 @@ def read(source):
         return f.read()
 
 
-def parse(text, per_engine=False):
-    """{(model, family): {series: {key: value}}}; engines of one model sum unless per_engine."""
-    out = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+def table():
+    return defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+
+
+def parse(text):
+    """{(model#engine, family): {series: {key: value}}}."""
+    out = table()
     for line in text.splitlines():
         m = LINE.match(line.strip())
         if not m:
             continue
         series, labels, value = m.group(1), dict(LABEL.findall(m.group(2))), float(m.group(3))
-        model = labels.get("model_name", "")
-        if per_engine:
-            model += "#" + labels.get("engine", "0")
+        model = labels.get("model_name", "") + "#" + labels.get("engine", "0")
         key = labels.get("rows") or labels.get("capacity")
-        cell = out[(model, labels.get("family", ""))][series]
-        key = int(key) if key is not None else None
-        if series in ("capacity_info", "demand_max"):
-            cell[key] = max(cell[key], value)
-        else:
-            cell[key] += value
+        out[(model, labels.get("family", ""))][series][int(key) if key is not None else None] = value
+    return out
+
+
+def merge_engines(data):
+    """Sum each model's engines (the ladder and the maximum are shared, not summed)."""
+    out = table()
+    for (model, family), series in data.items():
+        for name, cells in series.items():
+            cell = out[(model.split("#")[0], family)][name]
+            for key, value in cells.items():
+                cell[key] = max(cell[key], value) if name in ("capacity_info", "demand_max") else cell[key] + value
     return out
 
 
 def window(first, second):
-    """`second - first` on the counters; a counter that went backwards means a restart."""
+    """`second - first` on each engine's counters; one that went backwards means a restart."""
     for group, series in first.items():
         for name in COUNTERS:
             for key, before in series.get(name, {}).items():
@@ -208,8 +216,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if len(args.metrics) > 2:
         ap.error("one snapshot, or two for a window")
-    snaps = [parse(read(s), args.per_engine) for s in args.metrics]
+    snaps = [parse(read(s)) for s in args.metrics]
     data = window(*snaps) if len(snaps) == 2 else snaps[0]
+    if not args.per_engine:
+        data = merge_engines(data)
     lines = []
     for group in sorted(data):
         if args.model and group[0].split("#")[0] != args.model:
