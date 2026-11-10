@@ -46,26 +46,27 @@ use object::{
     build_requires, check_attn_res_f32mix_symbols, check_compiled_opcode_marker_set,
     check_compiled_opcode_markers, check_dec_stage_capacity, check_decode_object,
     check_dsa_decode_batch, check_dsa_pf_arm, check_dsa_select_local, check_fp8_weight_arms,
-    check_gate_hier_object, check_gemv_capacity, check_interpreter_waves, check_k3_arms,
-    check_kda_carry_regstate_symbols, check_kda_chunk, check_kda_conv_step_db,
-    check_kda_intra_wave_items_symbols, check_kv_encoding, check_materialized_residual_input,
-    check_mla_nope_arm, check_mla_v2_sv_raw_symbols, check_moe_ep_symbols, check_moe_gemma_arms,
-    check_moe_pf_a4w4, check_packed_family_kv_encoding, check_packed_prefill_abi,
-    check_packet_pairing_stamp, check_prefill_geometry, check_prefill_object, check_qwen_gdn_arms,
-    check_sparse_fp8_object, check_sparse_fp8_packet, check_xalltoall_heads,
-    check_xargmax_capacity, elf_symbol_u32, first_op_in, graph_phase_xreduce_segments,
-    l2_pairing_refusal, log_gate_hier_status, packet_decode_arm_requirements,
-    packet_prefill_arm_requirements, read_attn_res_f32mix_object, read_kda_carry_regstate_object,
-    read_kda_intra_wave_items_object, required_gemv_m, required_k3_op, required_kda_chunk,
-    required_kda_conv_step_db, required_kv_op, required_moe_pf_a4w4, required_moe_pf_accum,
-    required_qwen_gdn_op, resolve_flash_object_load, sparse_fp8, BF16_KV_OPS, FP8_KV_OPS,
-    FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM, GEMM_GROUP_LDS, KDA_CARRY_KEYFEED_MARKERS,
-    KDA_CARRY_REGSTATE_LDS, KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM,
-    KDA_WU_LEAN_LDS, KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM,
-    MOE_ENC_MXFP4, MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM,
-    PACKED_PREFILL_BAND_SYM, PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM,
-    PACKED_PREFILL_MLA_FLASH_SEG_SYM, PACKED_PREFILL_MLA_NOPE_SYM, PACKED_PREFILL_MLA_NORM_SEG_SYM,
-    XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
+    check_fused_gemv_capacity, check_gate_hier_object, check_gemv_capacity,
+    check_interpreter_waves, check_k3_arms, check_kda_carry_regstate_symbols, check_kda_chunk,
+    check_kda_conv_step_db, check_kda_intra_wave_items_symbols, check_kv_encoding,
+    check_materialized_residual_input, check_mla_nope_arm, check_mla_v2_sv_raw_symbols,
+    check_moe_ep_symbols, check_moe_gemma_arms, check_moe_pf_a4w4, check_packed_family_kv_encoding,
+    check_packed_prefill_abi, check_packet_pairing_stamp, check_prefill_geometry,
+    check_prefill_object, check_qwen_gdn_arms, check_sparse_fp8_object, check_sparse_fp8_packet,
+    check_xalltoall_heads, check_xargmax_capacity, elf_symbol_u32, first_op_in,
+    graph_phase_xreduce_segments, l2_pairing_refusal, log_gate_hier_status,
+    packet_decode_arm_requirements, packet_prefill_arm_requirements, read_attn_res_f32mix_object,
+    read_kda_carry_regstate_object, read_kda_intra_wave_items_object, required_gemv_m,
+    required_k3_op, required_kda_chunk, required_kda_conv_step_db, required_kv_op,
+    required_moe_pf_a4w4, required_moe_pf_accum, required_qwen_gdn_op, resolve_flash_object_load,
+    sparse_fp8, BF16_KV_OPS, FP8_KV_OPS, FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM, GEMM_GROUP_LDS,
+    KDA_CARRY_KEYFEED_MARKERS, KDA_CARRY_REGSTATE_LDS, KDA_CHUNK_QPRE_SYM,
+    KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM, KDA_WU_LEAN_LDS, KDA_WU_LEAN_MARKERS,
+    L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM, MOE_ENC_MXFP4, MOE_GEMMA_OPS,
+    MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
+    PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM, PACKED_PREFILL_MLA_FLASH_SEG_SYM,
+    PACKED_PREFILL_MLA_NOPE_SYM, PACKED_PREFILL_MLA_NORM_SEG_SYM, XR_ATTNRES_RESOURCE_SYM,
+    XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
 };
 pub use object::{mla_pf_v2_enabled, object_name, symbol_name, Phase, PrefillArm, Sched, Variant};
 
@@ -9676,6 +9677,16 @@ impl AmdEngine {
                     Phase::Flash => unreachable!(),
                 };
                 check_gemv_capacity(&syms, &path, need)?;
+                // A decode tier (`gemv_need = Some(w)`) serves only the rungs up to `w`.
+                let fused: Vec<&DevProg> = match phase {
+                    Phase::Decode => blob.decode_progs(),
+                    Phase::Prefill => blob.prefill_progs(),
+                    Phase::Flash => unreachable!(),
+                }
+                .into_iter()
+                .filter(|p| gemv_need.is_none_or(|w| p.t <= w))
+                .collect();
+                check_fused_gemv_capacity(&syms, &path, fused)?;
             }
             if phase == Phase::Decode {
                 check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;

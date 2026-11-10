@@ -4861,6 +4861,52 @@ fn the_walk_marker_lifts_the_capacity_refusal() {
     assert!(check_gemv_capacity(&[], p, 2).is_err());
 }
 
+/// The walk marker lifts the capacity refusal only for the bodies `gemv_walk` wraps. The fused
+/// fp8/mxfp4 bodies run `gemv_rows_*<MM>` directly, so an MM=4 walking object must still refuse
+/// their M=8 — and keep serving a walking `GemvGlu` at M=8 beside them.
+#[test]
+fn fused_fp8_gemvs_keep_the_capacity_refusal_under_the_walk_marker() {
+    let p = Path::new("/tmp/interp_decode.elf");
+    let walk4 = ["plow_gemv_mm_cap_4", GEMV_WALK_SYM];
+    let prog = |op: DevOp, m: u32| DevProg {
+        t: m,
+        insts: vec![DevInst64 {
+            op: op as u16,
+            i: [m, 0, 4096, 0, 0, 0, 0, 0],
+            ..Default::default()
+        }],
+        ..gate_hier_probe(0, 0)
+    };
+    for &op in GEMV_NO_WALK_OPS {
+        assert!(
+            check_fused_gemv_capacity(&walk4, p, [&prog(op, 4)]).is_ok(),
+            "{op:?} M=4 fits MM=4"
+        );
+        assert!(
+            check_fused_gemv_capacity(&walk4, p, [&prog(op, 8)]).is_err(),
+            "{op:?} M=8 on a walking MM=4 object leaves rows 4..7 stale"
+        );
+        assert!(
+            check_fused_gemv_capacity(&[], p, [&prog(op, 1)]).is_ok(),
+            "{op:?} M=1 never refuses"
+        );
+        assert!(
+            check_fused_gemv_capacity(&[GEMV_WALK_SYM], p, [&prog(op, 2)]).is_err(),
+            "{op:?}: an unmarked capacity is not consent"
+        );
+    }
+    // The walking bf16 GLU keeps the blanket acceptance beside them.
+    assert!(check_fused_gemv_capacity(&walk4, p, [&prog(DevOp::GemvGlu, 8)]).is_ok());
+    assert!(check_gemv_capacity(&walk4, p, 8).is_ok());
+    // A tier only sees the rungs it serves: the widest fused M over the given programs.
+    assert!(check_fused_gemv_capacity(
+        &walk4,
+        p,
+        [&prog(DevOp::GemvGluFp8, 1), &prog(DevOp::GemvGluFp8, 4)]
+    )
+    .is_ok());
+}
+
 #[test]
 fn fused_qkv_walk_hint_requires_the_exact_object_width() {
     let path = Path::new("/tmp/interp_decode.elf");
