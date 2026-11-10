@@ -520,6 +520,127 @@ impl CudaPacketRuntime {
         })
     }
 
+    pub(crate) fn tick_kernels(&self) -> Result<(KernelFn, KernelFn, KernelFn)> {
+        Ok((
+            self.be.get_function(&self.module, "tick_codec_codes")?,
+            self.be.get_function(&self.module, "tick_pack_pcm16")?,
+            self.be.get_function(&self.module, "tick_codec_lengths")?,
+        ))
+    }
+
+    pub(crate) fn check_sequence(&self, programs: &[usize]) -> Result<()> {
+        self.check_inputs()?;
+        if programs.is_empty() || programs.iter().any(|&p| p >= self.programs.len()) {
+            return Err(RuntimeError::Rejected(
+                "invalid chained packet sequence".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_chained_writes(&self, writes: &[PacketWrite<'_>]) -> Result<()> {
+        self.check_inputs()?;
+        for w in writes {
+            let mem = self.mem(w.tensor)?;
+            check_transfer(
+                w.tensor,
+                w.tensor.handle,
+                mem.len as usize,
+                mem.len as usize,
+            )?;
+            w.check()?;
+            if matches!(w.data, PacketData::Buffer(_)) {
+                return Err(RuntimeError::Rejected(
+                    "chained controls require host or zero inputs".into(),
+                ));
+            }
+        }
+        let size = input_size(writes.iter().map(|w| host_input_size(&self.be, w.data)))?;
+        if size > self.input_stage.as_ref().map_or(0, |s| s.len()) {
+            return Err(RuntimeError::Rejected(
+                "prepare packet writes before chaining".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    // Caller keeps this runtime borrowed and drains `stream` before reuse or release.
+    pub(crate) unsafe fn enqueue_chained(
+        &mut self,
+        stream: &CudaStream,
+        programs: &[usize],
+        writes: &[PacketWrite<'_>],
+    ) -> Result<()> {
+        self.check_sequence(programs)?;
+        self.check_chained_writes(writes)?;
+        let mut offset = 0;
+        for w in writes {
+            let len = host_input_size(&self.be, w.data);
+            if len != 0 {
+                w.data.read(
+                    &mut self.input_stage.as_mut().unwrap().as_mut_slice()[offset..offset + len],
+                )?;
+                offset = (offset + len + 7) & !7;
+            }
+        }
+        offset = 0;
+        for w in writes {
+            let len = w.data.len();
+            if len == 0 {
+                continue;
+            }
+            let target = self.tensors[w.tensor.handle].base + w.offset as u64;
+            if matches!(w.data, PacketData::Zero(_)) {
+                self.be.memset_d8_async(target, 0, len, stream)?;
+            } else {
+                let source = &self.input_stage.as_ref().unwrap().as_slice()[offset..offset + len];
+                offset = (offset + len + 7) & !7;
+                // SAFETY: the chain owns pinned staging until its final drain.
+                unsafe {
+                    self.be.memcpy_htod_async(target, source, stream)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn enqueue_chained_programs(
+        &self,
+        stream: &CudaStream,
+        programs: &[usize],
+    ) -> Result<()> {
+        self.check_sequence(programs)?;
+        match self.graphs.get(programs).and_then(Option::as_ref) {
+            Some(graph) => self.be.graph_launch(graph, stream),
+            None => self.enqueue_on(programs, stream),
+        }
+    }
+
+    pub(crate) fn checked_device_ptr(&self, tensor: PacketTensor) -> Result<u64> {
+        let mem = self.mem(tensor)?;
+        check_transfer(tensor, tensor.handle, mem.len as usize, mem.len as usize)?;
+        Ok(mem.base)
+    }
+
+    pub(crate) fn quarantine_chain(&mut self) {
+        self.input_failed = true;
+        if let Some(stage) = self.input_stage.take() {
+            std::mem::forget(stage);
+        }
+        for tensor in &mut self.tensors {
+            tensor.quarantine();
+        }
+        self._table.quarantine();
+        self._counters.quarantine();
+        for p in &mut self.programs {
+            for table in &mut p._tables {
+                table.quarantine();
+            }
+        }
+        std::mem::forget(self.be.clone());
+        std::mem::forget(self._resident.clone());
+    }
+
     /// Skip every instruction at or past `limit` (per-instruction cost by caps).
     pub fn set_debug_max_inst(&self, limit: u32) -> Result<bool> {
         self.be
@@ -536,19 +657,22 @@ impl CudaPacketRuntime {
     }
 
     fn enqueue(&self, programs: &[usize]) -> Result<()> {
+        self.enqueue_on(programs, &self.stream)
+    }
+
+    fn enqueue_on(&self, programs: &[usize], stream: &CudaStream) -> Result<()> {
         let consecutive = programs.windows(2).all(|w| w[1] == w[0] + 1);
         if let (true, Some(&first), Some(&last)) = (consecutive, programs.first(), programs.last())
         {
             let (first, last) = (&self.programs[first], &self.programs[last]);
             let bytes = (last.counters + last.counter_bytes as u64 - first.counters) as usize;
-            self.be
-                .memset_d8_async(first.counters, 0, bytes, &self.stream)?;
+            self.be.memset_d8_async(first.counters, 0, bytes, stream)?;
         }
         for &program in programs {
             let p = &self.programs[program];
             if !consecutive {
                 self.be
-                    .memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
+                    .memset_d8_async(p.counters, 0, p.counter_bytes, stream)?;
             }
             for seg in 0..p.segments {
                 let mut arg = p.kernarg;
@@ -561,7 +685,7 @@ impl CudaPacketRuntime {
                     BLOCK,
                     self.smem,
                     &mut params,
-                    Some(&self.stream),
+                    Some(stream),
                 )?;
             }
         }
@@ -987,6 +1111,10 @@ mod write_tests {
 }
 
 impl PacketRuntime for CudaPacketRuntime {
+    fn cuda_runtime(&mut self) -> Option<&mut CudaPacketRuntime> {
+        Some(self)
+    }
+
     fn tensor(&self, name: &str) -> Option<PacketTensor> {
         let handle = self.names.iter().position(|n| n == name)?;
         Some(PacketTensor {

@@ -1,5 +1,11 @@
 # Configuration
 
+`PLOW_TTS_DEVICE_CONTROL=1` opts into device sampling for packets declaring the
+controlled speech-depth protocol. It defaults to off and requires a speech object
+built with `PLOW_CUBIN_DEVICE_CONTROL=ON` (`PLOW_NV_DEVICE_CONTROL=1`). The optional
+exports also support the shared codec enqueue API; caller integration is required.
+Default speech objects exclude these exports and preserve the native path.
+
 Start with the defaults and a matching [model recipe](../recipes/infervisor/).
 Most deployments only need a model, a checkpoint, and a listening address.
 

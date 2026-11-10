@@ -554,6 +554,7 @@ option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2)
 option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented prefill pairs" OFF)
 option(PLOW_CUBIN_ROUTED_DECODE "Also emit the _routed decode cubin for cuBLASLt-routed MoE rungs" OFF)
 option(PLOW_CUBIN_SPEECH "Also emit the _speech decode cubin carrying the FP32 speech arms (ASR encoder)" OFF)
+option(PLOW_CUBIN_DEVICE_CONTROL "Include optional device sampling and chained codec entrypoints in speech objects" OFF)
 option(PLOW_CUBIN_FP8_TC64_DEPTH2 "Emit a separate depth-2 FP8 TC64 decode cubin" OFF)
 option(PLOW_CUBIN_GEMV_WIDE "Also emit the _gw decode cubin carrying the wide-rung wgmma GEMV (sm_90a)" OFF)
 # Speculative-decode verify/draft launches need the row -> KV slot map (-DPLOW_NV_ROW_SLOT=1); it
@@ -657,6 +658,9 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     # the frame: sm_120a speech stack 2112 -> 1080 B, encoder digests unchanged, rtx-5090 packed
     # encoder launch at 10/20 chunks 0.3-0.4% faster.
     set(_ax_speech -DPLOW_NV_SPEECH=1 -DPLOW_NV_MAMBA=0)
+    if(PLOW_CUBIN_DEVICE_CONTROL)
+        list(APPEND _ax_speech -DPLOW_NV_DEVICE_CONTROL=1)
+    endif()
     set(_ax_gw -DPLOW_NV_GW_OBJECT=1)
     set(_ax_rs -DPLOW_NV_ROW_SLOT=1)
     set(_ax_token_batch_bf16 -DPLOW_NV_TOKEN_BATCH_BF16=1)

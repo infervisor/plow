@@ -929,6 +929,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tts_stream_deadline", Some("PLOW_TTS_STREAM_DEADLINE"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("rt.tts_codec_plan", Some("PLOW_TTS_CODEC_PLAN"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("rt.tts_depth_pack", Some("PLOW_TTS_DEPTH_PACK"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("rt.tts_device_control", Some("PLOW_TTS_DEVICE_CONTROL"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tts_depth_plan", Some("PLOW_TTS_DEPTH_PLAN"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("auto")), DIAG),
     KnobSpec::new("rt.tts_onset_trim", Some("PLOW_TTS_ONSET_TRIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_realtime", Some("PLOW_TTS_REALTIME"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
