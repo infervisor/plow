@@ -5233,6 +5233,56 @@ static __device__ __noinline__ bool sp_conv1d_rows(const SpConvArgs& a, unsigned
     return true;
 }
 
+/* Few-output Conv1d (ungrouped, cout <= 4) that would run sp_conv1d_direct: the same per-output
+ * fmaf chain (bias, then tap by tap, channel by channel, skipping padded taps), so the same bits,
+ * with the input window and the weights staged through smem. A tile is TB consecutive output rows
+ * of one item; TB (the widest of 256..32 whose window fits) depends on the shape alone. The input
+ * activation is applied once per staged element. False when no TB fits (uniform per launch). */
+static __device__ __noinline__ bool sp_conv1d_staged(const SpConvArgs& a, unsigned slice, unsigned nblk, float* arena) {
+    const unsigned ld = a.cin | 1u, K = a.kernel * a.cin, span = a.dil * (a.kernel - 1u);
+    unsigned TB = 256u;
+    while (TB >= 32u && (size_t)((TB - 1u) * a.stride + span + 1u) * ld + (size_t)a.cout * K > SP_ARENA_FLOATS) TB >>= 1;
+    if (TB < 32u) return false;
+    const unsigned window = (TB - 1u) * a.stride + span + 1u, tpb = (a.out_rows + TB - 1u) / TB;
+    float* xs = arena;
+    float* ws = arena + (size_t)window * ld;
+    for (unsigned tile = slice; tile < a.batch * tpb; tile += nblk) {
+        const unsigned b = tile / tpb, t0 = (tile - b * tpb) * TB;
+        const int length = (int)a.length(b), lo = (int)(t0 * a.stride) - (int)a.before;
+        const float* xb = a.x + (size_t)b * a.in_rows * a.cin;
+        __syncthreads();
+        for (unsigned e = threadIdx.x; e < window * a.cin; e += PLOW_NV_THREADS) {
+            const unsigned r = e / a.cin, i = e - r * a.cin;
+            const int u = sp_pad_row(lo + (int)r, length, a.mode);
+            xs[r * ld + i] = u >= 0 ? a.pre_at(xb[(size_t)u * a.cin + i], i) : 0.f;
+        }
+        for (unsigned e = threadIdx.x; e < a.cout * K; e += PLOW_NV_THREADS) {
+            const unsigned o = e / K, j = e - o * K, k = j / a.cin, i = j - k * a.cin;
+            ws[e] = a.w_at(a.widx(o, i, k));
+        }
+        __syncthreads();
+        const unsigned conv_len = a.conv_len(b);
+        for (unsigned p = threadIdx.x; p < TB * a.cout; p += PLOW_NV_THREADS) {
+            const unsigned o = p / TB, r = p - o * TB, t = t0 + r;
+            if (t >= a.out_rows) continue;
+            const size_t e = ((size_t)b * a.out_rows + t) * a.cout + o;
+            if (t >= conv_len) { a.out[e] = 0.f; continue; }
+            float acc = a.bias ? a.bias[o] : 0.f;
+            const float* wo = ws + (size_t)o * K;
+            for (unsigned k = 0; k < a.kernel; k++) {
+                const int raw = lo + (int)(r * a.stride + k * a.dil);
+                if (sp_pad_row(raw, length, a.mode) < 0) continue;
+                const float* xr = xs + (size_t)(r * a.stride + k * a.dil) * ld;
+                const float* wk = wo + k * a.cin;
+#pragma unroll 8
+                for (unsigned i = 0; i < a.cin; i++) acc = fmaf(xr[i], wk[i], acc);
+            }
+            a.store(e, o, acc);
+        }
+    }
+    return true;
+}
+
 static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* const* T, bool transpose, unsigned slice,
                                     unsigned nblk, float* arena) {
     arena = sp_smem;
@@ -5246,6 +5296,7 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
     }
     if (!transpose && a.cg == 1u && a.ng == 1u && sp_conv1d_depthwise(a, slice, nblk, arena)) return;
     if (a.ng < 16u || a.cg * a.kernel < 16u) {
+        if (!transpose && a.groups == 1u && a.cout <= 4u && sp_conv1d_staged(a, slice, nblk, arena)) return;
         if (transpose) sp_convt1d_direct(a, slice, nblk);
         else sp_conv1d_direct(a, slice, nblk);
         return;

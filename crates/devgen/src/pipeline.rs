@@ -3137,15 +3137,10 @@ const CONV_SPLITK_TICKETS: u32 = 4096;
 /// sp_w_width, sp_wg_run, sp_wg_run_ct) settle on once the rows fill the machine; a function of
 /// the class alone, so every program of a codec carries the same flags for the same conv. A
 /// 64-wide pin (the class table) buys parallelism for small-row programs where measured.
+/// 64-wide tiles unless the class table pins 128 (measured on the 12 Hz codec: 128 loses at b1
+/// on most classes, wins only on some 192-channel ones at b8+); grouped wgmma takes 128 only.
 fn conv_bn128_default(stage: &Conv1dF32Stage<'_>, transpose: bool) -> bool {
-    let wgmma = stage.wgmma && stage.split_bf16;
-    if wgmma && transpose {
-        return stage.out_channels % 128 == 0;
-    }
-    if wgmma && stage.groups > 1 {
-        return true;
-    }
-    stage.split_bf16 && stage.out_channels / stage.groups > 64
+    stage.wgmma && stage.split_bf16 && !transpose && stage.groups > 1
 }
 
 fn conv1d_warp(
@@ -3220,6 +3215,22 @@ fn conv1d_splitk(
 /// Conv1dF32 / ConvTranspose1dF32 slices, mirroring the interpreter's paths (op_speech_f32.cuh
 /// d_conv1d_f32): bit 16 one warp per output; depthwise 64-row x 64-channel tiles; the direct
 /// form per 256 outputs; the GEMM form 64x64 tiles per (group, phase). `slices` caps the result at the machine.
+/// Rows per tile of the interpreter's staged few-output conv (sp_conv1d_staged): the widest of
+/// 256..32 whose input window (row stride `cin | 1`) and weights fit the speech arena.
+fn conv1d_staged_rows(stage: &Conv1dF32Stage<'_>, transpose: bool) -> Option<u64> {
+    const SP_ARENA_FLOATS: u64 = 25856;
+    if transpose || stage.groups != 1 || stage.out_channels > 4 {
+        return None;
+    }
+    let (cin, k) = (u64::from(stage.in_channels), u64::from(stage.kernel));
+    let span = u64::from(stage.dilation_or_output_padding) * (k - 1);
+    [256u64, 128, 64, 32].into_iter().find(|tb| {
+        ((tb - 1) * u64::from(stage.stride) + span + 1) * (cin | 1)
+            + u64::from(stage.out_channels) * k * cin
+            <= SP_ARENA_FLOATS
+    })
+}
+
 fn conv1d_units(
     stage: &Conv1dF32Stage<'_>,
     transpose: bool,
@@ -3243,6 +3254,9 @@ fn conv1d_units(
         return batch * u64::from(out_rows).div_ceil(64) * cout.div_ceil(64);
     }
     if ng < 16 || cg * stage.kernel < 16 {
+        if let Some(tb) = conv1d_staged_rows(stage, transpose) {
+            return batch * u64::from(out_rows).div_ceil(tb);
+        }
         return (batch * u64::from(out_rows) * cout).div_ceil(256);
     }
     let tiles = |tile: u64| conv_tiles(stage, transpose, out_rows, batch, tile);

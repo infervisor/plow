@@ -71,6 +71,11 @@ __global__ void __launch_bounds__(256, 1) k_speech(PlowDevInst in, void* const* 
 #endif
     d_speech_f32(&in, T, blockIdx.x, gridDim.x, arena);
 }
+/* sp_conv1d_direct alone: the reference the staged few-output conv must match bit for bit. */
+__global__ void __launch_bounds__(256, 1) k_conv_direct(PlowDevInst in, void* const* T) {
+    SpConvArgs a;
+    if (sp_conv_args(&in, T, false, a)) sp_conv1d_direct(a, blockIdx.x, gridDim.x);
+}
 
 static uint32_t rng_s = 0x13572468u;
 static float rnd() {
@@ -866,6 +871,28 @@ static void t_conv_invariant(const char* name, const ConvSpec& s, bool transpose
     CK(cudaFree(td));
 }
 
+/* The staged few-output conv (cout <= 4, ungrouped) against sp_conv1d_direct: bitwise equal, and
+ * batch-invariant. */
+static void t_conv_staged(const char* name, const ConvSpec& s) {
+    t_conv_invariant(name, s, false);
+    Case c; unsigned o;
+    build_conv(c, s, false, o);
+    run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
+    const size_t n = c.host[o].size() / 4;
+    std::vector<uint32_t> got(n), ref(n);
+    CK(cudaMemcpy(got.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+    void** td = upload_table(c.dev);
+    CK(cudaMemset(c.dev[o], 0xff, n * 4));
+    k_conv_direct<<<g_nblk, 256>>>(c.in, td);
+    CK(cudaGetLastError());
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(ref.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+    const bool same = !memcmp(got.data(), ref.data(), n * 4);
+    printf("  %-34s staged bitwise == direct -> %s\n", name, same ? "PASS" : "FAIL");
+    if (!same) g_fail = 1;
+    CK(cudaFree(td));
+}
+
 /* Two specs over the same data (same seed): each against the golden, then bitwise against each
  * other (`same` = expected equal, e.g. the two pinned tile widths; else expected to differ, e.g.
  * 3xTF32 vs FFMA). */
@@ -917,6 +944,15 @@ static void t_conv_pinned() {
         ConvSpec d = w;
         d.rows = false;
         t_conv_pair("Conv1dF32 pinned 96->1 warp vs direct", w, d, false, false);
+        t_conv_staged("Conv1dF32 staged 96->1 k7 len", d);
+        ConvSpec big = d;
+        big.batch = 2; big.in_rows = 9000; big.lengths = {9000, 4321};
+        t_conv_staged("Conv1dF32 staged 96->1 9k rows", big);
+        ConvSpec st{3, 301, 96, 3, 5, 2, 3, 1, 4, 4, 1, 9, 11, false, true, false, true, {301, 150, 7}, 0.2f, true};
+        t_conv_staged("Conv1dF32 staged 96->3 s2 d3 reflect pre/post/res", st);
+        ConvSpec rp = st;
+        rp.mode = 2; rp.cin = 256; rp.cout = 4; rp.kernel = 7; rp.stride = 1; rp.dil_or_opad = 1; rp.f16 = true;
+        t_conv_staged("Conv1dF32 staged 256->4 k7 replicate f16", rp);
         for (unsigned rows : {7u, 38u, 39u}) {
             ConvSpec m = w;
             m.batch = 1; m.in_rows = rows; m.before = 0; m.lengths = {};

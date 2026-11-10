@@ -554,7 +554,18 @@ impl Seq {
         b: Option<&str>,
         math: crate::pipeline::Conv1dMath,
     ) -> Result<u32, String> {
-        self.dense_with(splits, x, TensorRef::Named(out), None, rows, k, n, w, b, math)
+        self.dense_with(
+            splits,
+            x,
+            TensorRef::Named(out),
+            None,
+            rows,
+            k,
+            n,
+            w,
+            b,
+            math,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
