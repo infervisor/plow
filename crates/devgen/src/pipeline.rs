@@ -551,6 +551,35 @@ pub struct Conv1dF32Stage<'a> {
     /// Flag bit 19: `alpha` is `[in_channels | out_channels]`, a snake input activation's
     /// parameters then a snake output activation's (one conv applying both).
     pub dual_alpha: bool,
+    /// Flag bit 21: the input is the activation's split image ([`split_image`]), written by its
+    /// producer's split-output flag; the wgmma arm copies it as its A operand. Only an ungrouped
+    /// pointwise `wgmma && weight_split` conv over 64-channel multiples without input activation
+    /// takes it (`PLOW_SPEECH_SPLIT_A` objects; the interpreter traps on anything else).
+    pub input_split: bool,
+    /// Flag bit 22: the output is written as the split image (`out_channels % 64 == 0`), for a
+    /// consumer with `input_split`.
+    pub output_split: bool,
+}
+
+/// The split image of an f32 activation `[rows][width]` (`width % 64 == 0`): the layout of
+/// [`wgmma_weight_split`] over rows, per 64-column k-tile the bf16 hi halves then the lo halves of
+/// all `rows` rows (no row padding; the consumer zero-fills past them), each row 128 bytes whose
+/// 16-byte chunk `c` sits at `c ^ (row & 7)`: the same byte count as the f32 tensor. Producers:
+/// `LayerNormF32` flag bit 2, `AttentionF32` (pre-formatted prefix path) flag bit 6, `Conv1dF32`
+/// flag bit 22; consumer: `Conv1dF32` flag bit 21.
+pub fn split_image(x: &[f32], rows: usize, width: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rows * width * 4];
+    for (r, row) in x.chunks_exact(width).enumerate().take(rows) {
+        for (j, &v) in row.iter().enumerate() {
+            let hi = crate::config::bf16_round(v);
+            let lo = crate::config::bf16_round(v - hi);
+            let at = (j / 64) * 2 * rows * 128 + r * 128 + ((j % 64 / 8) ^ (r & 7)) * 16 + j % 8 * 2;
+            out[at..at + 2].copy_from_slice(&((hi.to_bits() >> 16) as u16).to_le_bytes());
+            let at = at + rows * 128;
+            out[at..at + 2].copy_from_slice(&((lo.to_bits() >> 16) as u16).to_le_bytes());
+        }
+    }
+    out
 }
 
 /// The pre-split B operand of an ungrouped wgmma conv (flag bit 18), appended to its f32 weights
@@ -753,6 +782,9 @@ pub struct AttentionPrefix {
     /// u32[batch] (flag bit 5): item `b` reads only the first `min(rows_per_item[b], rows)` rows
     /// of its block; its own keys follow them directly.
     pub rows_per_item: Option<u32>,
+    /// Flag bit 6 (pre-formatted path only): the output `[batch * q_rows][heads * 64]` is written
+    /// as its [`split_image`] for a `Conv1dF32` with `input_split`.
+    pub split_out: bool,
 }
 
 /// Floats of one block of a pre-formatted attention prefix (`AttentionF32` flag bit 4): per
@@ -1895,14 +1927,49 @@ impl StageProgram {
             | (u32::from(stage.wgmma && stage.split_bf16) << 17)
             | (u32::from(stage.weight_split) << 18)
             | (u32::from(stage.dual_alpha) << 19)
-            | (u32::from(conv1d_warp(&stage, transpose, out_rows).is_some()) << 16);
+            | (u32::from(conv1d_warp(&stage, transpose, out_rows).is_some()) << 16)
+            | (u32::from(stage.input_split) << 21)
+            | (u32::from(stage.output_split) << 22);
+        // The split-image arm (op_speech_f32.cuh sp_wgi_run) is one instantiation set: ungrouped
+        // pointwise pre-split wgmma GEMMs over 64-channel multiples, no input activation, split-K
+        // or row scale; f32 rows out with no output activation, or the image out with GELU.
+        if stage.input_split
+            && (transpose
+                || !(stage.wgmma && stage.split_bf16 && stage.weight_split)
+                || stage.kernel != 1
+                || stage.stride != 1
+                || stage.pad_before != 0
+                || stage.pad_after != 0
+                || stage.groups != 1
+                || stage.in_channels % 64 != 0
+                || stage.out_channels % 4 != 0
+                || stage.input_activation != Activation::None
+                || row_scale != packet::dev::TENSOR_NONE
+                || (stage.output_split
+                    && (stage.out_channels % 64 != 0
+                        || stage.output_activation != Activation::GeluErf))
+                || (!stage.output_split && stage.output_activation != Activation::None))
+        {
+            return Err("split-image conv: unpadded unit-stride pointwise pre-split wgmma GEMM over 64-channel multiples, no input activation / row scale; f32 rows out without activation or image out with GELU".into());
+        }
+        if stage.output_split && !stage.input_split {
+            return Err("split-image conv output needs the split-image GEMM".into());
+        }
+        // The image arm replaces the 3-pass wgmma route bit for bit; a shape the arm table sends
+        // to a warp arm or split-K would have computed something else, so it keeps its f32 input.
+        if stage.input_split
+            && (conv1d_warp(&stage, transpose, out_rows).is_some()
+                || conv1d_splitk(&stage, transpose, out_rows, self.builder.n_cu()).is_some())
+        {
+            return Err("split-image conv: this shape's route is a warp arm or split-K, not the 3-pass wgmma GEMM".into());
+        }
         let op = if transpose {
             DevOp::ConvTranspose1dF32
         } else {
             DevOp::Conv1dF32
         };
         let n_cu = self.builder.n_cu();
-        let splitk = (row_scale == packet::dev::TENSOR_NONE)
+        let splitk = (row_scale == packet::dev::TENSOR_NONE && !stage.input_split)
             .then(|| conv1d_splitk(&stage, transpose, out_rows, n_cu))
             .flatten();
         let units = splitk.unwrap_or_else(|| conv1d_units(&stage, transpose, out_rows, n_cu));
@@ -2273,6 +2340,9 @@ impl StageProgram {
                     "attention prefix rows per item",
                 )?;
             }
+            if p.split_out && !p.h16 {
+                return Err("split-image attention output: pre-formatted prefix path only".into());
+            }
             if p.h16 && (stage.head_width != 64 || stage.q_rows.div_ceil(16) < 4) {
                 return Err(
                     "pre-formatted attention prefix: head_width 64 and at least 4 query tiles"
@@ -2353,6 +2423,7 @@ impl StageProgram {
                     | (u32::from(stage.stream.is_some()) << 3)
                     | (u32::from(stage.prefix.is_some_and(|p| p.h16)) << 4)
                     | (u32::from(stage.prefix.is_some_and(|p| p.rows_per_item.is_some())) << 5)
+                    | (u32::from(stage.prefix.is_some_and(|p| p.split_out)) << 6)
                     | (stage.key_length_heads << 8)
                     | (stage.window << 16),
                 stage.prefix.map_or(
@@ -2379,6 +2450,9 @@ pub struct LayerNormRowsF32Stage<'a> {
     pub activation: Activation,
     /// A `[width]` row added after the activation.
     pub add_row: Option<TensorRef<'a>>,
+    /// Flag bit 2: the output is the rows' [`split_image`] (`width % 64 == 0`) for a `Conv1dF32`
+    /// with `input_split`.
+    pub output_split: bool,
 }
 
 impl StageProgram {
@@ -2405,6 +2479,11 @@ impl StageProgram {
         {
             return Err("invalid layer-normalization stage".into());
         }
+        // Only the 128-column-vector path (sp_layernorm_rows: width % 128 == 0, <= 512) writes
+        // the image; the generic fallback would store f32 rows under the flag.
+        if stage.output_split && (stage.width % 128 != 0 || stage.width > 512) {
+            return Err("split-image layer-norm output needs width % 128 == 0 and width <= 512".into());
+        }
         let bytes = f32_bytes(product(&[stage.rows, stage.width])?)?;
         self.input(x, bytes, "layer-norm input")?;
         let output = self.resolve(stage.output, bytes, "layer-norm output")?;
@@ -2423,7 +2502,11 @@ impl StageProgram {
             output,
             |d| {
                 d.t[..5].copy_from_slice(&[output, x, gamma, beta, add]);
-                d.i[..3].copy_from_slice(&[stage.rows, stage.width, stage.activation.code() << 4]);
+                d.i[..3].copy_from_slice(&[
+                    stage.rows,
+                    stage.width,
+                    stage.activation.code() << 4 | u32::from(stage.output_split) << 2,
+                ]);
                 d.f[0] = stage.epsilon;
             },
         )
@@ -2923,6 +3006,8 @@ mod tests {
             wgmma: true,
             weight_split: true,
             dual_alpha: false,
+            input_split: false,
+            output_split: false,
         };
         assert!(s.convt_wgmma_ok());
         assert_eq!(s.split_geometry(true), (8 * 512, 2 * 1024));
@@ -3250,6 +3335,8 @@ mod tests {
                     wgmma: false,
                     weight_split: false,
                     dual_alpha: false,
+                    input_split: false,
+                    output_split: false,
                 },
             );
             assert!(
@@ -3291,6 +3378,8 @@ mod tests {
             wgmma: false,
             weight_split: false,
             dual_alpha: false,
+            input_split: false,
+            output_split: false,
         };
         let mut p = prefix.program();
         let a = p
@@ -3463,6 +3552,7 @@ mod tests {
                 rows: pre,
                 h16,
                 rows_per_item: None,
+                split_out: false,
             }),
             window: 0,
             stream: None,
@@ -3546,6 +3636,7 @@ mod tests {
                 rows: pre,
                 h16: false,
                 rows_per_item,
+                split_out: false,
             }),
             window: 0,
             stream: None,

@@ -372,6 +372,8 @@ impl Chain {
                 wgmma: false,
                 weight_split: false,
                 dual_alpha: false,
+                input_split: false,
+                output_split: false,
             },
         )?;
         Ok(self.done(e))
@@ -399,6 +401,7 @@ impl Chain {
                 epsilon: eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         Ok(self.done(e))

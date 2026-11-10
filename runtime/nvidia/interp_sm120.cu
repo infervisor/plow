@@ -1143,7 +1143,7 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #define PLOW_NV_ARENA_FLOATS1                                                                 \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
 #define PLOW_NV_ARENA_FLOATS                                                                  \
-    (PLOW_NV_ARENA_FLOATS1 > SP_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS1 : SP_ARENA_FLOATS)
+    (PLOW_NV_ARENA_FLOATS1 > SP_LAUNCH_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS1 : SP_LAUNCH_ARENA_FLOATS)
 #else
 #define PLOW_NV_ARENA_FLOATS                                                                  \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)

@@ -537,6 +537,8 @@ impl Seq {
                 wgmma: split,
                 weight_split: split,
                 dual_alpha: false,
+                input_split: false,
+                output_split: false,
             },
         )?;
         Ok(self.done(e))
@@ -1094,6 +1096,7 @@ fn program_for(
                 epsilon: ln_eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s = Seq {
@@ -1494,6 +1497,7 @@ fn mimi_program_for(
                 epsilon: cfg.eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s.done(e);

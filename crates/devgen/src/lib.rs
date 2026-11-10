@@ -12084,8 +12084,20 @@ fn emit_dense_gqa(
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().1;
-        let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16)
-            .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
+        // The split-image GEMM arm exists only in the sm_90a speech object (PLOW_NV_HOPPER).
+        assert!(
+            !ecfg.s3gen_split_a || arch == "sm_90a",
+            "s3gen packet: PLOW_EMIT_S3GEN_SPLIT_A needs the sm_90a speech object, not {arch}"
+        );
+        let (model, section) = s3gen::lower_s3gen(
+            dir,
+            n_cu,
+            m.target,
+            sites,
+            ecfg.s3gen_attn_h16,
+            ecfg.s3gen_split_a,
+        )
+        .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
         speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
@@ -12161,6 +12173,7 @@ fn emit_dense_gqa(
         if speech.ops != 0 {
             man["speech_ops"] = speech.ops.into();
             man["speech_conv_posts"] = speech.conv_posts.into();
+            man["speech_split_a"] = speech.split_a.into();
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes

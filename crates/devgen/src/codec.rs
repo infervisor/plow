@@ -757,6 +757,8 @@ pub(crate) fn fused_conv(
         wgmma: splits.is_some(),
         weight_split: split,
         dual_alpha: dual,
+        input_split: false,
+        output_split: false,
     };
     let e = match c.row_scale {
         Some((scale, _)) => p.conv1d_f32_row_scaled(x, &deps, stage, scale)?,

@@ -140,7 +140,7 @@ static void** upload_table(const std::vector<void*>& ptrs) {
 static int g_nblk = 132, g_fail = 0;
 /* SP_ARENA_FLOATS depends on __CUDA_ARCH__ (sm_89/sm_120: 99 KiB blocks), which the host pass
  * does not see: main() reads the device's value. */
-__device__ unsigned k_arena_floats = SP_ARENA_FLOATS;
+__device__ unsigned k_arena_floats = SP_LAUNCH_ARENA_FLOATS;
 static size_t kSmem;
 
 enum Mode { FP32, BF16, INT, F64 };
@@ -1787,6 +1787,133 @@ static void t_format_group() {
 }
 #endif
 
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_SPLIT_A
+/* The split image of an f32 activation [rows][width] (devgen `split_image`): per 64-column k-tile
+ * the bf16 hi then lo halves of all rows, 128-byte rows, chunk c at c ^ (row & 7). */
+static std::vector<uint8_t> host_split_image(const float* x, unsigned rows, unsigned width) {
+    std::vector<uint8_t> img((size_t)rows * width * 4, 0);
+    for (size_t r = 0; r < rows; r++)
+        for (size_t j = 0; j < width; j++) {
+            const float v = x[r * width + j];
+            const uint16_t hi = bf16_rn(v);
+            const uint32_t hb = (uint32_t)hi << 16;
+            float hf;
+            memcpy(&hf, &hb, 4);
+            const uint16_t lo = bf16_rn(v - hf);
+            const size_t off = (j / 64) * 2 * (size_t)rows * 128 + r * 128 + (((j % 64 / 8) ^ (r & 7)) * 16) + (j % 8) * 2;
+            memcpy(&img[off], &hi, 2);
+            memcpy(&img[off + (size_t)rows * 128], &lo, 2);
+        }
+    return img;
+}
+static void split_verdict(const char* name, const char* what, bool ok) {
+    printf("  %-34s %-40s -> %s\n", name, what, ok ? "PASS" : "FAIL");
+    if (!ok) g_fail = 1;
+}
+static std::vector<uint8_t> download(void* d, size_t bytes) {
+    std::vector<uint8_t> h(bytes);
+    CK(cudaMemcpy(h.data(), d, bytes, cudaMemcpyDeviceToHost));
+    return h;
+}
+/* Split-image hand-offs between the CFM transformer block's ops: a producer's image equals the
+ * host split of its f32 output byte for byte, and a GEMM reading the image equals the f32-input
+ * GEMM bit for bit (same split, products and accumulation order). Rows 300: a 128-row tail. */
+static void t_split_image() {
+    const unsigned rows = 300, feat = 256;
+    {
+        /* LayerNormF32 flag bit 2 vs the f32 rows. */
+        Case c;
+        unsigned y = c.out((size_t)rows * feat), img = c.out((size_t)rows * feat), x = c.f32((size_t)rows * feat, 2.f, 0.5f);
+        unsigned g = c.f32(feat, 0.5f, 1.f), b = c.f32(feat, 0.2f);
+        c.in.op = PLOW_DOP_LAYERNORM_F32;
+        c.in.t[0] = y; c.in.t[1] = x; c.in.t[2] = g; c.in.t[3] = b;
+        c.in.i[0] = rows; c.in.i[1] = feat; c.in.i[2] = 0; c.in.fj[0].f = 1e-5f;
+        PlowDevInst li = c.in;
+        li.t[0] = img; li.i[2] = 4u;
+        c.upload();
+        void** td = upload_table(c.dev);
+        k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
+        k_speech<<<g_nblk, 256, kSmem>>>(li, td);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        const std::vector<uint8_t> yh = download(c.dev[y], (size_t)rows * feat * 4), ih = download(c.dev[img], (size_t)rows * feat * 4);
+        split_verdict("LayerNormF32 split image", "== host split of the f32 rows", ih == host_split_image((const float*)yh.data(), rows, feat));
+        CK(cudaFree(td));
+    }
+    struct G { const char* name; unsigned cin, cout, post; bool res, ao; unsigned nblk; };
+    /* The served shapes, then: a 128-wide tile with a column tail (N 320), one k-tile (K 64), and
+     * one-block launches (every CTA walks many tiles: output-stage reuse behind the bulk stores). */
+    const G gs[] = {
+        {"qkv 256->1536", 256, 1536, 0, false, false, 0},
+        {"out 512->256 +res", 512, 256, 0, true, false, 0},
+        {"ff1 256->1024 gelu -> image", 256, 1024, 11, false, true, 0},
+        {"ff2 1024->256 +res", 1024, 256, 0, true, false, 0},
+        {"256->320 (BN 128, column tail)", 256, 320, 0, false, false, 0},
+        {"64->256 (one k-tile)", 64, 256, 0, false, false, 0},
+        {"ff2 1024->256 +res, 1 block", 1024, 256, 0, true, false, 1},
+        {"ff1 256->1024 gelu -> image, 1 block", 256, 1024, 11, false, true, 1},
+    };
+    for (const G& g : gs) {
+        /* Conv1dF32 flags bit 21 (A image) [| bit 22 (image out)] vs the f32 path, one Case. */
+        const unsigned nblk = g.nblk ? g.nblk : g_nblk;
+        ConvSpec s{1, rows, g.cin, g.cout, 1, 1, 1, 1, 0, 0, 0, 0, g.post, false, true, false, g.res, {}, 0.f, true};
+        s.wide = true;
+        s.wg = true;
+        Case c; unsigned o;
+        build_conv(c, s, false, o);
+        const unsigned x = c.in.t[1];
+        const unsigned xi = c.add(c.host[x].size()), o2 = c.out((size_t)rows * g.cout);
+        c.host[xi] = host_split_image((const float*)c.host[x].data(), rows, g.cin);
+        PlowDevInst in2 = c.in;
+        in2.t[0] = o2; in2.t[1] = xi; in2.fj[2].u |= (1u << 21) | (g.ao ? 1u << 22 : 0u);
+        c.upload();
+        void** td = upload_table(c.dev);
+        k_speech<<<nblk, 256, kSmem>>>(c.in, td);
+        k_speech<<<nblk, 256, kSmem>>>(in2, td);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        const std::vector<uint8_t> a = download(c.dev[o], (size_t)rows * g.cout * 4), b = download(c.dev[o2], (size_t)rows * g.cout * 4);
+        char name[96];
+        snprintf(name, sizeof(name), "Conv1dF32 image A %s", g.name);
+        if (g.ao) split_verdict(name, "image out == host split of f32 out", b == host_split_image((const float*)a.data(), rows, g.cout));
+        else split_verdict(name, "== f32-input wgmma GEMM, bit for bit", a == b);
+        CK(cudaFree(td));
+    }
+    {
+        /* AttentionF32 h16 flag bit 6 vs its f32 rows: 4 CFG items x 72 rows, 306-row prefix. */
+        const unsigned batch = 4, q = 72, heads = 8, hw = 64, width = heads * hw, stride = 3 * width, pre = 306;
+        std::vector<uint32_t> ix(batch);
+        for (unsigned i = 0; i < batch; i++) ix[i] = i % 2;
+        Case c;
+        unsigned o = c.out((size_t)batch * q * width), img = c.out((size_t)batch * q * width), qkv = c.f32((size_t)batch * q * stride, 1.f);
+        unsigned pf = c.f32((size_t)2 * pre * 2 * width, 1.f), x = c.u32(ix);
+        const unsigned npt = (pre + SPH_KT - 1) / SPH_KT, fm = c.out((size_t)2 * heads * npt * SPH_XS);
+        PlowDevInst f;
+        memset(&f, 0, sizeof(f));
+        for (auto& t : f.t) t = PLOW_TENSOR_NONE;
+        f.op = PLOW_DOP_COPY_COLS_F32;
+        f.t[0] = fm; f.t[1] = pf;
+        f.i[0] = 2; f.i[1] = pre; f.i[2] = 2 * width; f.i[3] = 2 * width; f.i[7] = 1;
+        f.fj[1].u = pre * 2 * width; f.fj[2].u = heads * npt * SPH_XS;
+        c.in.op = PLOW_DOP_ATTENTION_F32;
+        c.in.t[0] = o; c.in.t[1] = qkv; c.in.t[2] = qkv; c.in.t[3] = qkv; c.in.t[4] = PLOW_TENSOR_NONE;
+        c.in.t[5] = PLOW_TENSOR_NONE; c.in.t[6] = fm; c.in.t[7] = x;
+        c.in.i[0] = batch; c.in.i[1] = q; c.in.i[2] = q; c.in.i[3] = heads; c.in.i[4] = hw;
+        c.in.i[5] = stride; c.in.i[6] = 2u | 16u; c.in.i[7] = pre;
+        c.in.fj[0].f = 0.125f; c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
+        PlowDevInst ai = c.in;
+        ai.t[0] = img; ai.i[6] |= 64u;
+        c.upload();
+        void** td = upload_table(c.dev);
+        k_speech<<<g_nblk, 256, kSmem>>>(f, td);
+        k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
+        k_speech<<<g_nblk, 256, kSmem>>>(ai, td);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        const std::vector<uint8_t> a = download(c.dev[o], (size_t)batch * q * width * 4), b = download(c.dev[img], (size_t)batch * q * width * 4);
+        split_verdict("AttentionF32 h16 split image", "== host split of the f32 rows", b == host_split_image((const float*)a.data(), batch * q, width));
+        CK(cudaFree(td));
+    }
+}
+#endif
+
 int main(int argc, char** argv) {
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
@@ -1797,6 +1924,16 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
 
+    if (argc > 1 && !strcmp(argv[1], "--check-split")) {
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_SPLIT_A
+        t_split_image();
+#else
+        printf("  FAIL split-image arms not compiled (PLOW_NV_HOPPER && PLOW_SPEECH_SPLIT_A)\n");
+        g_fail = true;
+#endif
+        printf(g_fail ? "FAIL\n" : "ALL PASS\n");
+        return g_fail;
+    }
     if (argc > 1 && !strcmp(argv[1], "--bench-cfm")) {
         /* The S3Gen CFM estimator's GEMMs at csynth.b32.t64 (64 CFG items x 136 rows). */
         struct G { const char* name; unsigned rows, cin, cout, k, post; bool res, len; };
@@ -1889,6 +2026,25 @@ int main(int argc, char** argv) {
             snprintf(name, sizeof(name), "CFM %s wgmma M9216", g.name);
             bench(name, c, 2.0 * 9216 * g.cin * g.cout * g.k, 0);
         }
+#if PLOW_SPEECH_SPLIT_A
+        /* The same four GEMMs reading the split image of their input (flags bit 21; ff1 also
+         * writing one, bit 22), at both c200 capacities. */
+        for (unsigned M : {8704u, 9216u})
+            for (const G& g : gs) {
+                if (g.len) continue;
+                ConvSpec s{1, M, g.cin, g.cout, g.k, 1, 1, 1, g.k - 1u, 0, 0, 0, g.post, false, true, false, g.res, {}, 0.f, true};
+                s.wide = true;
+                s.wg = true;
+                Case c; unsigned o; build_conv(c, s, false, o);
+                const unsigned x = c.in.t[1], xi = c.add(c.host[x].size());
+                c.host[xi] = host_split_image((const float*)c.host[x].data(), M, g.cin);
+                c.in.t[1] = xi;
+                c.in.fj[2].u |= (1u << 21) | (g.post == 11u ? 1u << 22 : 0u);
+                char name[96];
+                snprintf(name, sizeof(name), "CFM %s image-A M%u", g.name, M);
+                bench(name, c, 2.0 * M * g.cin * g.cout * g.k, 0);
+            }
+#endif
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "--bench-codec")) {
@@ -2418,6 +2574,9 @@ int main(int argc, char** argv) {
     /* Voice-conditioning extensions (after the fixed-seed cases, so their data is unchanged). */
     t_lstm_rows();
     t_trim_silence();
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_SPLIT_A
+    t_split_image();
+#endif
     t_attention_w256("AttentionF32 w256 4x256 q32 kv150 lengths", 3, 32, 150, 4, {150, 97, 1}, false, false, 0);
     t_attention_w256("AttentionF32 w256 q70 kv150 unaligned", 2, 70, 150, 4, {}, false, false, 1);
     t_attention_w256("AttentionF32 w256 causal bias", 2, 100, 100, 2, {100, 61}, true, true, 0);

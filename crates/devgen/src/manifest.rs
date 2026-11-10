@@ -3066,6 +3066,11 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
     if let Some(objects) = manifest.get("objects") {
         feed(&objects.to_string());
     }
+    // The split-image arm (PLOW_SPEECH_SPLIT_A) is compiled into the speech object only for a
+    // packet that uses it; an object without it would trap on the packet's bit-21 convs.
+    if manifest.get("speech_split_a").and_then(Value::as_bool) == Some(true) {
+        feed("\x1espeech_split_a");
+    }
     feed("\x1e");
     if let Some(o) = manifest.get("tuning").and_then(Value::as_object) {
         for (k, v) in o {
@@ -3131,6 +3136,9 @@ pub fn speech_conv_posts(model: &packet::devbuild::Model) -> u64 {
 pub struct SpeechMasks {
     pub ops: u64,
     pub conv_posts: u64,
+    /// A conv reads a split-image activation (Conv1dF32 flags bit 21): `PLOW_SPEECH_SPLIT_A`
+    /// compiles the image GEMM arm and its larger launch arena into the speech object.
+    pub split_a: bool,
 }
 
 impl SpeechMasks {
@@ -3138,11 +3146,17 @@ impl SpeechMasks {
         Self {
             ops: speech_ops(model),
             conv_posts: speech_conv_posts(model),
+            split_a: model
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .any(|i| i.op == DevOp::Conv1dF32 as u16 && i.j[1] & (1 << 21) != 0),
         }
     }
     pub fn add(&mut self, other: Self) {
         self.ops |= other.ops;
         self.conv_posts |= other.conv_posts;
+        self.split_a |= other.split_a;
     }
 }
 
@@ -3197,6 +3211,12 @@ pub fn config_header(manifest: &Value) -> String {
         out.push_str(&format!(
             "#ifndef PLOW_SPEECH_CONV_POSTS\n#define PLOW_SPEECH_CONV_POSTS 0x{mask:x}ull\n#endif\n\n"
         ));
+    }
+    if manifest.get("speech_split_a").and_then(Value::as_bool) == Some(true) {
+        out.push_str(
+            "/* A conv reads split-image activations: the image GEMM arm and its launch arena. */\n\
+             #ifndef PLOW_SPEECH_SPLIT_A\n#define PLOW_SPEECH_SPLIT_A 1\n#endif\n\n",
+        );
     }
 
     // Presence macros, one per opcode in the union. Named from the `dev_isa.h`
@@ -4488,6 +4508,11 @@ mod tests {
         assert_eq!(pairing_hash(&a), pairing_hash(&b));
         b["union"] = json!(["Gemv"]);
         assert_ne!(pairing_hash(&a), pairing_hash(&b));
+        let mut c = a.clone();
+        c["speech_split_a"] = json!(false);
+        assert_eq!(pairing_hash(&a), pairing_hash(&c));
+        c["speech_split_a"] = json!(true);
+        assert_ne!(pairing_hash(&a), pairing_hash(&c));
     }
 
     #[test]

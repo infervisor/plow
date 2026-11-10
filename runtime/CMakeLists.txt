@@ -284,7 +284,7 @@ if(PLOW_CUDA)
     set_target_properties(speech_f32_op_test PROPERTIES CUDA_ARCHITECTURES "90a")
     target_include_directories(speech_f32_op_test PRIVATE nvidia common cpu/dev)
     # sm_90a: the wgmma arms (and their cases) compile only under PLOW_NV_HOPPER.
-    target_compile_definitions(speech_f32_op_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:PLOW_NV_HOPPER=1>)
+    target_compile_definitions(speech_f32_op_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:PLOW_NV_HOPPER=1> $<$<COMPILE_LANGUAGE:CUDA>:PLOW_SPEECH_SPLIT_A=1>)
     target_compile_options(speech_f32_op_test PRIVATE $<$<COMPILE_LANGUAGE:C>:-O2 -ffp-contract=off>)
     target_link_libraries(speech_f32_op_test PRIVATE m)
     add_test(NAME speech_f32_ops COMMAND speech_f32_op_test)
