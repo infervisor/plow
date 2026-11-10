@@ -2326,6 +2326,17 @@ fn stream_step(
     })
 }
 
+/// Frames the window after a first audio over `n` frames waits for: `chunk`, or ramped what the
+/// first window emits (`n - lookahead`, however many frames arrived together), at most `chunk`:
+/// [`stream_step`]'s chunk at that `emitted`.
+fn next_window_chunk(n: usize, lookahead: usize, chunk: usize, ramp: bool) -> usize {
+    if ramp {
+        n.saturating_sub(lookahead).clamp(1, chunk)
+    } else {
+        chunk
+    }
+}
+
 /// New frames the next stateful codec step of a stream holding `n` complete frames, `emitted`
 /// of them sent, decodes: every committed frame up to `cap`; a segment's first step waits for
 /// `first` frames until the segment is done.
@@ -2695,11 +2706,7 @@ async fn stream_task(
             let audio_per_frame = fs as f64 / sr;
             // Frames the next window waits for: its chunk (ramped: what this one emits, at most
             // `chunk`) plus the lookahead this window lacks.
-            let next_chunk = if ramp {
-                n.saturating_sub(lookahead).clamp(1, chunk)
-            } else {
-                chunk
-            };
+            let next_chunk = next_window_chunk(n, lookahead, chunk, ramp);
             let gap = (next_chunk + model.codec.lookahead - lookahead) as f64;
             let need = ((gap * per_frame * 1.1) / audio_per_frame).ceil() as usize;
             let mut need = need.clamp(1, chunk + model.codec.lookahead);
@@ -2755,7 +2762,7 @@ async fn stream_task(
                 let wseed = seed ^ segment_salt(seg) ^ (emitted as u64).wrapping_mul(0x9E37_79B9);
                 model
                     .codec
-                    .decode_codes(window, e - s, wseed, urgency)
+                    .decode_codes(window, e - s, wseed, urgency, due)
                     .await
                     .map(|pcm| (pcm, emitted - s, upto, e - s))
             };
@@ -3063,6 +3070,34 @@ mod tests {
 
     /// Stateful steps decode every committed frame once, in order, at most CAP per step; a
     /// segment's first step waits for FIRST frames unless the segment is done.
+    #[test]
+    fn first_audio_guard_prices_the_window_stream_step_takes_next() {
+        const WINDOW: usize = 6;
+        for (first_la, full_la) in [(1, 2), (0, 2), (2, 2)] {
+            for chunk in 1..=4 {
+                // n frames arrive together (coalesced) before the first audio.
+                for n in first_la + 1..=first_la + 6 {
+                    let (_, _, emitted) =
+                        stream_step(n, 0, false, WINDOW, first_la, chunk, true).unwrap();
+                    assert_eq!(emitted, n - first_la);
+                    let want = next_window_chunk(n, first_la, chunk, true);
+                    // The second window (full lookahead) fires at exactly emitted + want + la.
+                    let fire = (n..n + 16)
+                        .find(|&m| {
+                            stream_step(m, emitted, false, WINDOW, full_la, chunk, true).is_some()
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        fire,
+                        (emitted + want + full_la).max(n),
+                        "la {first_la} chunk {chunk} n {n}"
+                    );
+                    assert_eq!(next_window_chunk(n, first_la, chunk, false), chunk);
+                }
+            }
+        }
+    }
+
     #[test]
     fn step_plan_covers_each_frame_once() {
         const CAP: usize = 17;

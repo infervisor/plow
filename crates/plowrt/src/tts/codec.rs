@@ -800,8 +800,9 @@ impl Codec {
         frames: usize,
         seed: u64,
         urgency: Urgency,
+        due: Option<std::time::Instant>,
     ) -> Result<Vec<f32>, String> {
-        self.submit(codes, frames, seed, 0, (urgency, None), None, None, None)
+        self.submit(codes, frames, seed, 0, (urgency, due), None, None, None)
             .await
             .map(|d| d.pcm)
     }
@@ -1781,6 +1782,7 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
             .unwrap_or(URGENT_SLACK_MS),
     );
     let max_wait = crate::serve::cosched::max_wait();
+    let learn = sched || cap_us > 0.0;
     let mut costs = StepCosts::default();
     let mut pending: Vec<Job> = Vec::new();
     let mut hold = None;
@@ -1836,7 +1838,22 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
             }
         }
         hold = if open {
-            hold_for(&pending, hold_guard, std::time::Instant::now())
+            let now = std::time::Instant::now();
+            hold_for(&pending, hold_guard, now).and_then(|w| {
+                if sched {
+                    sched_hold(
+                        w,
+                        &pending,
+                        now,
+                        urgent_slack,
+                        max_wait,
+                        &codec.steps,
+                        &costs,
+                    )
+                } else {
+                    Some(w)
+                }
+            })
         } else {
             None
         };
@@ -1853,17 +1870,25 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
         // queued and the frames it cuts decode as the same steps' next pieces, after anything
         // more urgent that arrived meanwhile.
         let mut rests: Vec<Option<(Codes, usize)>> = Vec::new();
-        let bound = launch_bound(
-            cap_us,
-            sched,
-            &pending,
-            &codec.steps,
-            &costs,
-            std::time::Instant::now(),
-        );
-        if let Some(bound_us) = bound.filter(|_| batch[0].step.is_some()) {
+        let now = std::time::Instant::now();
+        let waiting = |jobs: &[Job]| {
+            launch_bound(cap_us, sched, jobs, &codec.steps, &costs, urgent_slack, now)
+        };
+        if let Some(mut bound_us) = waiting(&pending).filter(|_| batch[0].step.is_some()) {
             let frames: Vec<usize> = batch.iter().map(|j| j.frames).collect();
-            if let Some((keep, cap)) = bound_step(&codec.steps, &costs, &frames, bound_us, sched) {
+            let mut cut = bound_step(&codec.steps, &costs, &frames, bound_us, sched);
+            // A job the cut defers waits behind this launch too: its slack bounds it. The bound
+            // only tightens, over the batch's finitely many slacks.
+            while let Some((keep, _)) = cut {
+                match waiting(&batch[keep..]) {
+                    Some(t) if t < bound_us => {
+                        bound_us = t;
+                        cut = bound_step(&codec.steps, &costs, &frames, t, sched).or(cut);
+                    }
+                    _ => break,
+                }
+            }
+            if let Some((keep, cap)) = cut {
                 for j in batch.drain(keep..).rev() {
                     pending.insert(0, j);
                 }
@@ -1881,9 +1906,9 @@ fn run(rx: mpsc::Receiver<Msg>, mut codec: Bound) {
                     .collect();
             }
         }
-        let t = batch[0].step.is_some().then(std::time::Instant::now);
+        let t = (learn && batch[0].step.is_some()).then(std::time::Instant::now);
         let out = codec.launch(&batch);
-        costs.observe_launch(&codec.steps, &batch, || {
+        costs.observe_launch(learn, &codec.steps, &batch, || {
             t.unwrap().elapsed().as_secs_f64() * 1e6
         });
         let rests = drain_rests(&mut rests, batch.len());
@@ -1933,8 +1958,15 @@ fn drain_rests(
 struct StepCosts(std::collections::HashMap<(usize, usize), f64>);
 
 impl StepCosts {
-    fn observe_launch(&mut self, caps: &[Capacity], jobs: &[Job], elapsed: impl FnOnce() -> f64) {
-        if jobs[0].step.is_some() {
+    /// `learn`: a fixed cap or the deadline scheduler prices launches; otherwise nothing is timed.
+    fn observe_launch(
+        &mut self,
+        learn: bool,
+        caps: &[Capacity],
+        jobs: &[Job],
+        elapsed: impl FnOnce() -> f64,
+    ) {
+        if learn && jobs[0].step.is_some() {
             let frames = jobs.iter().map(|j| j.frames).max().unwrap_or(0);
             if let Some(&(cb, cn, _)) = smallest(caps, jobs.len(), frames) {
                 self.observe(cb, cn, elapsed());
@@ -1949,14 +1981,6 @@ impl StepCosts {
 
     fn get(&self, cb: usize, cn: usize) -> Option<f64> {
         self.0.get(&(cb, cn)).copied()
-    }
-
-    /// The cheapest measured capacity: the smallest legal piece of progress.
-    fn cheapest(&self) -> Option<(usize, usize, f64)> {
-        self.0
-            .iter()
-            .map(|(&(cb, cn), &us)| (cb, cn, us))
-            .min_by(|a, b| a.2.total_cmp(&b.2))
     }
 }
 
@@ -1993,7 +2017,7 @@ fn job_cost(caps: &[Capacity], costs: &StepCosts, j: &Job) -> f64 {
 /// Launch order key `(band, slack ns, enqueued)`: first audios in [`BAND_FIRST`] by slack to their
 /// target; stream steps in [`BAND_STREAM`] by slack to playback, lifted to [`BAND_URGENT`] within
 /// `urgent_slack` of it (after `cost_us`); whole decodes last. A job queued `max_wait` is urgent
-/// whatever its deadline (the starvation bound); ties by enqueue time, so pieces of a cut launch
+/// whatever its deadline, ranked by how long past it (the starvation bound); ties by enqueue time, so pieces of a cut launch
 /// keep their place.
 fn rank(
     j: &Job,
@@ -2008,7 +2032,15 @@ fn rank(
         None => i64::MAX / 2,
     };
     let slack = ns(j.deadline()).saturating_sub((cost_us * 1e3) as i64);
-    let aged = now.saturating_duration_since(j.since) >= max_wait;
+    let age = now.saturating_duration_since(j.since);
+    let aged = age >= max_wait;
+    // An aged job's deadline is its starvation bound: the longest overdue first, ahead of any
+    // step that only now turns urgent.
+    let slack = if aged {
+        slack.min(-((age - max_wait).as_nanos() as i64))
+    } else {
+        slack
+    };
     let band = match j.urgency {
         _ if aged => BAND_URGENT,
         Urgency::First => BAND_FIRST,
@@ -2031,6 +2063,7 @@ fn launch_bound(
     pending: &[Job],
     caps: &[Capacity],
     costs: &StepCosts,
+    urgent_slack: std::time::Duration,
     now: std::time::Instant,
 ) -> Option<f64> {
     let mut bound = (cap_us > 0.0).then_some(cap_us);
@@ -2042,7 +2075,7 @@ fn launch_bound(
             let Some(d) = j.deadline() else { continue };
             let slack =
                 d.saturating_duration_since(now).as_secs_f64() * 1e6 - job_cost(caps, costs, j);
-            if j.urgency == Urgency::First || slack <= URGENT_SLACK_MS as f64 * 1e3 {
+            if j.urgency == Urgency::First || slack <= urgent_slack.as_secs_f64() * 1e6 {
                 bound = Some(bound.map_or(slack, |b: f64| b.min(slack)));
             }
         }
@@ -2054,7 +2087,8 @@ fn launch_bound(
 /// on the measured capacity at most `bound_us` that decodes the most frames per µs, when the
 /// capacity `frames` would take is measured above the bound. `None` launches as packed: under
 /// the bound, not yet measured, or (without `progress`) no measured capacity fits the bound.
-/// With `progress`, nothing fitting runs the cheapest measured capacity instead: a bound under
+/// With `progress`, nothing fitting runs the cheapest measured launch of these jobs instead (priced
+/// by the capacity it selects): a bound under
 /// the smallest legal piece is a miss to record, never permission to run the whole cohort.
 fn bound_step(
     caps: &[Capacity],
@@ -2069,6 +2103,7 @@ fn bound_step(
         return None;
     }
     let mut best: Option<(f64, usize, usize, usize)> = None;
+    let mut cheapest: Option<(f64, usize, usize)> = None;
     for &(cb, cn, _) in caps {
         let keep = cb.min(frames.len());
         let longest = frames[..keep].iter().map(|&f| f.min(cn)).max().unwrap_or(0);
@@ -2076,9 +2111,15 @@ fn bound_step(
         let Some(&(lb, ln, _)) = smallest(caps, keep, longest) else {
             continue;
         };
-        let Some(us) = costs.get(lb, ln).filter(|&us| us <= bound_us) else {
+        let Some(us) = costs.get(lb, ln) else {
             continue;
         };
+        if cheapest.is_none_or(|(c, ..)| us < c) {
+            cheapest = Some((us, keep, cn));
+        }
+        if us > bound_us {
+            continue;
+        }
         let decoded: usize = frames[..keep].iter().map(|&f| f.min(cn)).sum();
         let rate = decoded as f64 / us;
         if best.is_none_or(|(r, d, ..)| rate > r || (rate == r && decoded > d)) {
@@ -2088,11 +2129,9 @@ fn bound_step(
     if let Some((_, _, keep, cap)) = best {
         return Some((keep, cap));
     }
-    if !progress {
-        return None;
-    }
-    let (cb, cn, _) = costs.cheapest()?;
-    Some((cb.min(frames.len()).max(1), cn))
+    cheapest
+        .filter(|_| progress)
+        .map(|(_, keep, cap)| (keep, cap))
 }
 
 /// Stream steps that wait together for one launch: fewer than this many pending hold.
@@ -2120,6 +2159,29 @@ fn hold_for(
     soonest?
         .checked_duration_since(now + guard)
         .filter(|w| !w.is_zero())
+}
+
+/// Under deadline scheduling a hold of `wait` ends when a held step turns urgent (its own launch
+/// counted) or ages past `max_wait`. `None`: launch now.
+fn sched_hold(
+    wait: std::time::Duration,
+    pending: &[Job],
+    now: std::time::Instant,
+    urgent_slack: std::time::Duration,
+    max_wait: std::time::Duration,
+    caps: &[Capacity],
+    costs: &StepCosts,
+) -> Option<std::time::Duration> {
+    let mut wait = wait;
+    for j in pending {
+        let cost = std::time::Duration::from_secs_f64(job_cost(caps, costs, j) * 1e-6);
+        let urgent = j.due.map_or(std::time::Duration::MAX, |d| {
+            d.saturating_duration_since(now + cost + urgent_slack)
+        });
+        let ages = (j.since + max_wait).saturating_duration_since(now);
+        wait = wait.min(urgent).min(ages);
+    }
+    (!wait.is_zero()).then_some(wait)
 }
 
 #[cfg(test)]
@@ -2687,20 +2749,30 @@ mod tests {
         // Every reference case decoded whole at its full length, for the replay checker's per-case gate.
         let mut full_outputs = Vec::new();
         let mut full_cases = Vec::new();
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            for c in reference["cases"].as_array().unwrap() {
-                let frames = c["frames"].as_u64().unwrap() as usize;
-                assert!(frames <= codec.max_frames);
-                let codes: Vec<i32> = std::fs::read(c["codes"].as_str().unwrap()).unwrap()
-                    .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as i32).collect();
-                assert_eq!(codes.len(), frames * codec.frame_codes);
-                let pcm = codec.decode(codes, frames, 0, Urgency::Whole).await.unwrap();
-                assert_eq!(pcm.len(), frames * codec.frame_samples);
-                full_cases.push(serde_json::json!({"case":c["case"],"frames":frames,
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for c in reference["cases"].as_array().unwrap() {
+                    let frames = c["frames"].as_u64().unwrap() as usize;
+                    assert!(frames <= codec.max_frames);
+                    let codes: Vec<i32> = std::fs::read(c["codes"].as_str().unwrap())
+                        .unwrap()
+                        .chunks_exact(4)
+                        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as i32)
+                        .collect();
+                    assert_eq!(codes.len(), frames * codec.frame_codes);
+                    let pcm = codec
+                        .decode(codes, frames, 0, Urgency::Whole)
+                        .await
+                        .unwrap();
+                    assert_eq!(pcm.len(), frames * codec.frame_samples);
+                    full_cases.push(serde_json::json!({"case":c["case"],"frames":frames,
                     "samples":pcm.len(),"offset_f32":full_outputs.len()}));
-                full_outputs.extend_from_slice(&pcm);
-            }
-        });
+                    full_outputs.extend_from_slice(&pcm);
+                }
+            });
         let path = std::path::PathBuf::from(std::env::var("CODEC_PRIMING_RESULT_JSON").unwrap());
         let full_path = path.with_extension("full.f32");
         std::fs::write(&full_path, bytemuck::cast_slice(&full_outputs)).unwrap();
@@ -2796,7 +2868,11 @@ mod tests {
 
     impl Job {
         fn clone_for_test(&self) -> Job {
-            let mut j = job(self.window.is_some(), self.frames, self.step.map(|s| s.slot.index));
+            let mut j = job(
+                self.window.is_some(),
+                self.frames,
+                self.step.map(|s| s.slot.index),
+            );
             j.urgency = self.urgency;
             j.due = self.due;
             j.deadline = self.deadline;
@@ -3104,9 +3180,11 @@ mod tests {
                 0,
                 "disabled launch allocated remainder storage"
             );
-            // Costs are learned whether or not a bound is set, so a bound enabled later (or the
-            // deadline scheduler's dynamic one) prices launches from the first one.
-            costs.observe_launch(&caps, &jobs, || 1_000.0 * width as f64);
+            // Nothing is timed without a cap or the scheduler; either prices every launch.
+            costs.observe_launch(false, &caps, &jobs, || {
+                panic!("disabled launch read timing")
+            });
+            costs.observe_launch(true, &caps, &jobs, || 1_000.0 * width as f64);
         }
         assert_eq!(costs.get(1, 4), Some(1_000.0));
         assert_eq!(costs.get(8, 4), Some(8_000.0));
@@ -3117,8 +3195,8 @@ mod tests {
         let caps = vec![(1, 4, Vec::new()), (2, 8, Vec::new())];
         let jobs = [job(false, 3, Some(0)), job(false, 7, Some(1))];
         let mut costs = StepCosts::default();
-        costs.observe_launch(&caps, &jobs, || 20.0);
-        costs.observe_launch(&caps, &jobs, || 40.0);
+        costs.observe_launch(true, &caps, &jobs, || 20.0);
+        costs.observe_launch(true, &caps, &jobs, || 40.0);
         assert_eq!(costs.get(2, 8), Some(25.0));
         let mut rests = vec![Some((vec![11, 12].into(), 1)), None];
         let mut drained = drain_rests(&mut rests, jobs.len());
@@ -3129,7 +3207,9 @@ mod tests {
         assert!(drained.next().is_none());
         drop(drained);
         assert!(rests.is_empty());
-        costs.observe_launch(&caps, &[job(false, 3, None)], || panic!("non-step timing"));
+        costs.observe_launch(true, &caps, &[job(false, 3, None)], || {
+            panic!("non-step timing")
+        });
         assert_eq!(costs.get(1, 4), None);
     }
 
@@ -3185,6 +3265,20 @@ mod tests {
             bound_step(&caps, &StepCosts::default(), &[2, 2], 10.0, true),
             None
         );
+        // The fallback is priced by the capacity its launch selects: two 2-frame jobs under a
+        // 1 ms bound run b1.f1 (6 ms), not b2.f2 on the 20 ms b4 capacity.
+        let caps: Vec<Capacity> = [(1, 1), (4, 2), (16, 2)]
+            .into_iter()
+            .map(|(b, f)| (b, f, Vec::new()))
+            .collect();
+        let mut costs = StepCosts::default();
+        costs.observe(1, 1, 6_000.0);
+        costs.observe(4, 2, 20_000.0);
+        costs.observe(16, 2, 5_000.0);
+        assert_eq!(
+            bound_step(&caps, &costs, &[2, 2], 1_000.0, true),
+            Some((1, 1))
+        );
     }
 
     #[test]
@@ -3232,7 +3326,7 @@ mod tests {
         let mut costs = StepCosts::default();
         costs.observe(1, 4, 4_000.0);
         let b = |cap: f64, sched: bool, pending: &[Job]| {
-            launch_bound(cap, sched, pending, &caps, &costs, now)
+            launch_bound(cap, sched, pending, &caps, &costs, slack, now)
         };
         assert_eq!(b(0.0, false, &[first.clone_for_test()]), None);
         assert_eq!(
@@ -3248,6 +3342,44 @@ mod tests {
             b(0.0, true, &[near.clone_for_test()]).map(|v| v.round()),
             Some(16_000.0)
         );
+        // The packet's urgent threshold is the bound's too.
+        assert_eq!(
+            launch_bound(
+                0.0,
+                true,
+                &[stream.clone_for_test()],
+                &caps,
+                &costs,
+                ms(500),
+                now
+            )
+            .map(|v| v.round()),
+            Some(396_000.0)
+        );
+        // Aged jobs rank by how long past the starvation bound, ahead of a step turning urgent:
+        // sustained urgent streams cannot keep an aged whole decode or window waiting.
+        let old_whole = mk(Urgency::Whole, None, None, 2600);
+        let old_window = mk(Urgency::Stream, None, None, 2300);
+        assert!(r(&old_whole, 0.0) < r(&old, 0.0));
+        assert!(r(&old, 0.0) < r(&old_window, 0.0));
+        let overdue = mk(Urgency::Stream, None, Some(0), 10);
+        assert!(r(&old_window, 0.0) < r(&overdue, 0.0));
+        // A hold ends when a held step turns urgent after its own launch, or ages.
+        let h = |j: &Job| {
+            sched_hold(
+                ms(70),
+                std::slice::from_ref(j),
+                now,
+                slack,
+                wait,
+                &caps,
+                &costs,
+            )
+        };
+        assert_eq!(h(&mk(Urgency::Stream, None, Some(400), 10)), Some(ms(70)));
+        assert_eq!(h(&mk(Urgency::Stream, None, Some(84), 10)), Some(ms(50)));
+        assert_eq!(h(&mk(Urgency::Stream, None, Some(30), 10)), None);
+        assert_eq!(h(&mk(Urgency::Stream, None, Some(900), 1990)), Some(ms(10)));
         // A deadline already passed bounds at zero (the cheapest piece then runs: progress rule).
         let late = mk(Urgency::First, Some(0), None, 100);
         assert_eq!(b(0.0, true, &[late]), Some(0.0));
