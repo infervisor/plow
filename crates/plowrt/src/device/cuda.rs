@@ -1766,6 +1766,10 @@ impl CudaBackend {
         &self.name
     }
 
+    pub(crate) fn shares_context(&self, other: &Self) -> bool {
+        self.ctx == other.ctx && self.device_ordinal == other.device_ordinal
+    }
+
     /// Resolve a kernel by (possibly mangled) name in a loaded module.
     pub fn get_function(&self, module: &Module, name: &str) -> Result<KernelFn> {
         self.bind()?;

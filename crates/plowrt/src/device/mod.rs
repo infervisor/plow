@@ -572,6 +572,11 @@ enum Backing {
 }
 
 impl DeviceMem {
+    #[cfg(feature = "cuda")]
+    pub(crate) fn owns_storage(&self) -> bool {
+        !matches!(self.backing, Backing::View)
+    }
+
     pub(crate) fn quarantine(&mut self) {
         // Unretired DMA may still address this allocation after its engine is dropped.
         std::mem::forget(std::mem::replace(&mut self.backing, Backing::View));

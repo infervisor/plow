@@ -13,7 +13,7 @@
 use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 use serde_json::{json, Value};
 
-use crate::logical_effects::outputs;
+use crate::logical_effects::{outputs, CONV1D_SPLITK};
 use crate::program::Packet;
 
 pub const ENDPOINT: &str = "speech_fusion.v1";
@@ -104,10 +104,61 @@ pub fn request(p: &Packet<'_>) -> Result<Option<Value>, String> {
                 Some(DevOp::DenseGemmF32) if d.i[7] & LN_PROLOGUE != 0 => {
                     sites.push(ln_site(p, gp, pc)?)
                 }
-                Some(DevOp::Conv1dF32) if d.t[7] != TENSOR_NONE16 => sites.push(conv_site(p, d)?),
+                Some(DevOp::Conv1dF32)
+                    if d.t[7] != TENSOR_NONE16 && d.fj[2] & CONV1D_SPLITK == 0 =>
+                {
+                    sites.push(conv_site(p, d)?)
+                }
                 _ => {}
             }
         }
     }
     Ok((!sites.is_empty()).then(|| json!({"schema": 1, "sites": sites})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use packet::devbuild::{Builder, Model};
+
+    #[test]
+    fn conv_splitk_scratch_is_not_a_row_scale_fusion_site() {
+        for splitk in [false, true] {
+            let mut b = Builder::new(1);
+            let out = b.tensor("act.out", 64);
+            let x = b.tensor("in.x", 64);
+            let w = b.tensor("w.w", 64);
+            let residual = b.tensor("in.residual", 64);
+            let arg = b.tensor("in.arg", 4096);
+            b.emit(DevOp::Conv1dF32, vec![0], &[], |d| {
+                d.t[..3].copy_from_slice(&[out, x, w]);
+                d.t[5] = residual;
+                d.t[7] = arg;
+                d.i[..8].copy_from_slice(&[1, 4, 4, 4, 1, 1, 1, 1]);
+                d.j[1] = if splitk { CONV1D_SPLITK } else { 0 };
+            });
+            let p = b.finish();
+            let model = Model {
+                n_cu: 1,
+                target: 0,
+                tensors: p.tensors.clone(),
+                progs: vec![p],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
+            };
+            crate::program::with_model(&model, |packet| {
+                let site = request(packet).unwrap();
+                if splitk {
+                    assert!(site.is_none());
+                } else {
+                    let site = site.unwrap();
+                    let sites = site["sites"].as_array().unwrap();
+                    assert_eq!(sites.len(), 1);
+                    assert_eq!(sites[0]["kind"], "conv_row_scale");
+                    assert_eq!(sites[0]["residual_bytes"], 64);
+                }
+            });
+        }
+    }
 }

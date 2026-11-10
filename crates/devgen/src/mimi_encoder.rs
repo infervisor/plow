@@ -1,14 +1,13 @@
 //! Breeze TTS 2's reference-audio encoder (Qwen3-TTS-Tokenizer-12Hz encoder = HF Mimi,
-//! `scripts/tts/mimi_encoder_export.py`) lowered to a `codec.encode.v1` packet: 24 kHz PCM in,
+//! `scripts/tts/mimi_encoder_export.py`) lowered to a codec encoder packet: 24 kHz PCM in,
 //! `semantic + acoustic` codes per 1920-sample frame out.
 //!
 //! causal conv k7 -> 4 SEANet stages (ELU residual unit, ELU strided causal conv) -> ELU, conv k3
 //! -> 8-layer causal transformer (LayerNorm, half-split RoPE, GELU MLP, LayerScale folded into
 //! wo / fc2; the reference's eager attention ignores the 250 window) -> causal conv k4 s2
 //! (replicate pad) -> split RVQ: each codebook's nearest centroid is the argmax of
-//! `x . e - |e|^2 / 2`. The PCM is zero-padded to whole frames, so every full frame equals the
-//! reference (`scripts/tts/mimi_encoder_ref.py`); a trailing partial frame may differ, as the
-//! reference pads each layer instead.
+//! `x . e - |e|^2 / 2`. Version 2 carries actual sample lengths through each layer, including
+//! the trailing partial frame. Legacy exports retain whole-capacity PCM padding.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +17,7 @@ use crate::codec::{fused_conv, p_handle, Conv};
 use crate::fish_codec::Seq;
 use crate::pipeline::{
     Activation, AttentionF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, GatherRowsF32Stage,
-    LayerNormRowsF32Stage, PacketPrefix, PadMode, TensorRef,
+    LayerNormRowsF32Stage, LengthAffineU32Stage, PacketPrefix, PadMode, TensorRef,
 };
 use crate::rewrite_lower::ConvFusions;
 
@@ -30,6 +29,7 @@ pub const PIPELINE: &str = "codec.encode";
 pub const CAPACITIES: &[u32] = &[32, 64, 128, 256];
 
 struct Cfg {
+    version: u32,
     sampling_rate: u32,
     frame_samples: u32,
     filters: u32,
@@ -66,6 +66,10 @@ impl Cfg {
                 .ok_or(format!("mimi encoder config: {k}"))
         };
         let cfg = Cfg {
+            version: match v.get("version") {
+                Some(_) => u(v, "version")?,
+                None => 1,
+            },
             sampling_rate: u(v, "sampling_rate")?,
             frame_samples: u(v, "frame_samples")?,
             filters: u(v, "filters")?,
@@ -99,6 +103,7 @@ impl Cfg {
         };
         let down: u32 = cfg.ratios.iter().product::<u32>() * cfg.down_stride;
         if v["model_type"] != "mimi_encoder"
+            || !matches!(cfg.version, 1 | 2)
             || down != cfg.frame_samples
             || cfg.heads * cfg.head_dim != cfg.hidden
             || cfg.semantic == 0
@@ -148,6 +153,7 @@ pub fn lower_mimi_encoder(
     }
     builder.tensor("act.enc.ids", u64::from(fmax) * 4);
     let codes = builder.tensor("act.enc.codes", u64::from(fmax * cfg.codebooks()) * 4);
+    let sample_input = (cfg.version == 2).then(|| builder.tensor("in.enc.samples", 4));
     let model = packet::devbuild::Model {
         n_cu,
         target,
@@ -168,7 +174,7 @@ pub fn lower_mimi_encoder(
     let mut positions = Vec::new();
     for &frames in CAPACITIES {
         let program = prefix.model.progs.len();
-        let (p, pos) = program_for(prefix, &cfg, frames, pcm)?;
+        let (p, pos) = program_for(prefix, &cfg, frames, pcm, sample_input)?;
         prefix = p;
         positions.push((pos, frames * cfg.rows_per_frame()));
         roles.insert(format!("encode.f{frames}"), program as u32);
@@ -202,6 +208,7 @@ fn program_for(
     cfg: &Cfg,
     frames: u32,
     pcm: u32,
+    mut length: Option<u32>,
 ) -> Result<(PacketPrefix, u32), String> {
     let mut p = prefix.program();
     let t = frames * cfg.rows_per_frame();
@@ -213,7 +220,8 @@ fn program_for(
                 cin: u32,
                 cout: u32,
                 kernel: u32,
-                stride: u32| Conv {
+                stride: u32,
+                length: Option<u32>| Conv {
         output,
         bias: Some(weight.replace(".w", ".b")),
         weight,
@@ -226,10 +234,9 @@ fn program_for(
         stride,
         dilation: 1,
         groups: 1,
-        // Mimi's causal pad: kernel - stride rows on the left; whole frames need none on the right.
         pad: kernel - stride,
-        pad_after: Some(0),
-        len: packet::dev::TENSOR_NONE,
+        pad_after: Some(if cfg.version == 2 { stride - 1 } else { 0 }),
+        len: length.unwrap_or(packet::dev::TENSOR_NONE),
         act_in: Activation::Elu,
         act_out: Activation::None,
         residual: None,
@@ -252,7 +259,7 @@ fn program_for(
             bias: Some(TensorRef::Named("w.enc.c0.b")),
             alpha: None,
             residual: None,
-            lengths: None,
+            lengths: length,
             batch: 1,
             in_rows: rows,
             in_channels: 1,
@@ -288,6 +295,7 @@ fn program_for(
             d / cfg.compress,
             cfg.residual_kernel,
             1,
+            length,
         );
         c.input_is_temp = false;
         let h = fused_conv(&mut p, fuse, None, cur.output, cur.done, c)?;
@@ -299,12 +307,40 @@ fn program_for(
             d,
             1,
             1,
+            length,
         );
         c.residual = Some(cur.output);
         cur = fused_conv(&mut p, fuse, None, h.output, h.done, c)?;
-        let c = conv(other(cur.output), w("down.w"), rows, d, 2 * d, 2 * r, r);
+        let c = conv(
+            other(cur.output),
+            w("down.w"),
+            rows,
+            d,
+            2 * d,
+            2 * r,
+            r,
+            length,
+        );
         cur = fused_conv(&mut p, fuse, None, cur.output, cur.done, c)?;
         rows /= r;
+        if let Some(input) = length {
+            let e = p.length_affine_u32(
+                input,
+                &[cur.done],
+                LengthAffineU32Stage {
+                    output: TensorRef::Named(&format!("act.enc.length.s{i}")),
+                    min_with: None,
+                    items: 1,
+                    mul: 1,
+                    add: (r - 1) as i32,
+                    div: r,
+                    lo: 0,
+                    hi: rows,
+                },
+            )?;
+            length = Some(e.output);
+            cur.done = e.done;
+        }
         d *= 2;
     }
     let c = conv(
@@ -315,6 +351,7 @@ fn program_for(
         cfg.hidden,
         cfg.last_kernel,
         1,
+        length,
     );
     cur = fused_conv(&mut p, fuse, None, cur.output, cur.done, c)?;
     debug_assert_eq!(rows, t);
@@ -355,7 +392,15 @@ fn program_for(
             qkv,
             |d| {
                 d.t[..2].copy_from_slice(&[qkv, pos]);
-                d.i[..7].copy_from_slice(&[t, 2 * heads, hd, 3 * dim, 1, 0, 2]);
+                d.i[..7].copy_from_slice(&[
+                    t,
+                    2 * heads,
+                    hd,
+                    3 * dim,
+                    1,
+                    0,
+                    if cfg.version == 2 { 0 } else { 2 },
+                ]);
                 d.f[0] = cfg.theta;
             },
         )?;
@@ -367,7 +412,7 @@ fn program_for(
             &[dep],
             AttentionF32Stage {
                 output: TensorRef::Named("act.codec.s"),
-                key_lengths: None,
+                key_lengths: length,
                 bias: None,
                 batch: 1,
                 q_rows: t,
@@ -409,7 +454,7 @@ fn program_for(
             bias: None,
             alpha: None,
             residual: None,
-            lengths: None,
+            lengths: length,
             batch: 1,
             in_rows: t,
             in_channels: dim,
@@ -419,7 +464,11 @@ fn program_for(
             dilation_or_output_padding: 1,
             groups: 1,
             pad_before: cfg.down_kernel - cfg.down_stride,
-            pad_after: 0,
+            pad_after: if cfg.version == 2 {
+                cfg.down_stride - 1
+            } else {
+                0
+            },
             pad_mode: PadMode::Replicate,
             input_activation: Activation::None,
             output_activation: Activation::None,
@@ -442,7 +491,7 @@ fn program_for(
     let fc = cfg.codebooks();
     let mut col = 0;
     for (g, n) in [("sem", cfg.semantic), ("ac", cfg.acoustic)] {
-        let r = s.dense(
+        let r = s.dense_with_math(
             None,
             down,
             "act.codec.c",
@@ -451,6 +500,11 @@ fn program_for(
             cfg.cb_dim,
             &format!("w.{g}.proj"),
             None,
+            if cfg.version == 2 {
+                crate::pipeline::Conv1dMath::F32
+            } else {
+                crate::pipeline::Conv1dMath::Tf32x3
+            },
         )?;
         for k in 0..n {
             let logits = s.dense(
@@ -461,7 +515,10 @@ fn program_for(
                 cfg.cb_dim,
                 cfg.cb_size,
                 &format!("w.{g}.E{k}"),
-                Some(&format!("w.{g}.nb{k}")),
+                Some(&format!(
+                    "w.{g}.{}{k}",
+                    if cfg.version == 2 { "nb_f32" } else { "nb" }
+                )),
             )?;
             s.raw(DevOp::ArgmaxF32, u64::from(frames), ids, |d| {
                 d.t[..2].copy_from_slice(&[ids, logits]);
@@ -529,30 +586,46 @@ fn section(
         PacketPipeline, PacketPipelines, PipelineDType, PipelineTensor, SECTION, VERSION,
     };
     let t = |h: u32| prefix.model.tensors[h as usize].name.clone();
+    let mut tensors = BTreeMap::from([
+        (
+            "pcm".into(),
+            PipelineTensor {
+                name: t(prefix.input),
+                dtype: PipelineDType::F32,
+                shape: vec![u64::from(fmax * cfg.frame_samples)],
+            },
+        ),
+        (
+            "codes".into(),
+            PipelineTensor {
+                name: t(prefix.output),
+                dtype: PipelineDType::U32,
+                shape: vec![u64::from(fmax), u64::from(cfg.codebooks())],
+            },
+        ),
+    ]);
+    if cfg.version == 2 {
+        tensors.insert(
+            "samples".into(),
+            PipelineTensor {
+                name: "in.enc.samples".into(),
+                dtype: PipelineDType::U32,
+                shape: vec![1],
+            },
+        );
+    }
     let metadata = PacketPipelines {
         version: VERSION,
         pipelines: vec![PacketPipeline {
             name: PIPELINE.into(),
-            driver: DRIVER.into(),
+            driver: if cfg.version == 2 {
+                "codec.encode.v2"
+            } else {
+                DRIVER
+            }
+            .into(),
             programs: roles,
-            tensors: BTreeMap::from([
-                (
-                    "pcm".into(),
-                    PipelineTensor {
-                        name: t(prefix.input),
-                        dtype: PipelineDType::F32,
-                        shape: vec![u64::from(fmax * cfg.frame_samples)],
-                    },
-                ),
-                (
-                    "codes".into(),
-                    PipelineTensor {
-                        name: t(prefix.output),
-                        dtype: PipelineDType::U32,
-                        shape: vec![u64::from(fmax), u64::from(cfg.codebooks())],
-                    },
-                ),
-            ]),
+            tensors,
             parameters: BTreeMap::from([
                 ("audio.sample_rate".into(), u64::from(cfg.sampling_rate)),
                 ("codec.frame_samples".into(), u64::from(cfg.frame_samples)),

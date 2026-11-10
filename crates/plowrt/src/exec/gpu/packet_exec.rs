@@ -11,9 +11,12 @@ use packet::dev::{DevProgram, CTR_STRIDE};
 
 use super::{pod_bytes, BLOCK};
 use crate::asset::devblob::DevBlob;
-use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, GraphExec, KernelFn};
+use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, GraphExec, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
-use crate::exec::packet_runtime::{check_copy, check_transfer, PacketRuntime, PacketTensor};
+use crate::exec::packet_runtime::{
+    check_copy, check_region, check_transfer, PacketBuffer, PacketData, PacketRuntime,
+    PacketTensor, PacketWrite,
+};
 use crate::{Result, RuntimeError};
 
 /// The speech object and its entry symbol for a compute capability.
@@ -117,6 +120,8 @@ pub struct CudaPacketRuntime {
     /// valid); `None` once capture failed for that sequence.
     graphs: std::collections::HashMap<Vec<usize>, Option<GraphExec>>,
     last_us: f64,
+    input_stage: Option<PinnedHost>,
+    input_failed: bool,
     /// Last field: dropped after every allocation above, so [`resident_in`] turns false only once
     /// the device memory is back.
     _resident: Arc<()>,
@@ -324,6 +329,8 @@ impl CudaPacketRuntime {
             programs,
             graphs: std::collections::HashMap::new(),
             last_us: 0.0,
+            input_stage: None,
+            input_failed: false,
             _resident: {
                 let token = Arc::new(());
                 residents()
@@ -405,9 +412,398 @@ impl CudaPacketRuntime {
     }
 
     fn mem(&self, t: PacketTensor) -> Result<&DeviceMem> {
+        self.check_inputs()?;
         self.tensors.get(t.handle).ok_or_else(|| {
             RuntimeError::Device(format!("packet tensor handle {} is missing", t.handle))
         })
+    }
+
+    fn check_inputs(&self) -> Result<()> {
+        if self.input_failed {
+            return Err(RuntimeError::Device(
+                "packet input copies did not retire".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve_inputs(&mut self, size: usize) -> Result<()> {
+        if size > 0 && self.input_stage.as_ref().is_none_or(|s| s.len() < size) {
+            self.input_stage = Some(self.be.host_alloc_pinned(size)?);
+        }
+        Ok(())
+    }
+
+    fn abandon_transfers(
+        &mut self,
+        tensors: impl IntoIterator<Item = PacketTensor>,
+        error: RuntimeError,
+    ) -> RuntimeError {
+        self.input_failed = true;
+        std::mem::forget(self.be.clone());
+        std::mem::forget(self._resident.clone());
+        for tensor in tensors {
+            self.tensors[tensor.handle].quarantine();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.be.quarantine_staging(&error)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            error
+        }
+    }
+}
+
+fn input_size(mut sizes: impl Iterator<Item = usize>) -> Result<usize> {
+    sizes.try_fold(0usize, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .and_then(|n| n.checked_add(7))
+            .map(|n| n & !7)
+            .ok_or_else(|| RuntimeError::Device("packet input size overflow".into()))
+    })
+}
+
+fn device_input_source(be: &CudaBackend, data: PacketData<'_>) -> Option<u64> {
+    match data {
+        PacketData::Buffer(source) => source
+            .cuda_source()
+            .filter(|(b, _)| be.shares_context(b))
+            .map(|(_, address)| address),
+        _ => None,
+    }
+}
+
+fn host_input_size(be: &CudaBackend, data: PacketData<'_>) -> usize {
+    match data {
+        PacketData::Zero(_) => 0,
+        _ if device_input_source(be, data).is_some() => 0,
+        _ => data.len(),
+    }
+}
+
+fn submit_writes(
+    count: usize,
+    mut enqueue: impl FnMut(usize) -> Result<()>,
+    drain: impl FnOnce() -> Result<()>,
+    quarantine: impl FnOnce(),
+) -> Result<()> {
+    let status = (0..count).try_for_each(&mut enqueue);
+    if let Err(error) = drain() {
+        quarantine();
+        return Err(error);
+    }
+    status
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    #[ignore = "GPU correctness; run through gpuq"]
+    fn packet_pool_reuses_released_slots_and_preserves_held_views() {
+        use crate::exec::packet_runtime::PacketBufferPool;
+        let backend = Arc::new(CudaBackend::new(0).unwrap());
+        let stream = backend.stream_create().unwrap();
+        let source = Arc::new(backend.alloc(0, 64).unwrap());
+        let bytes: Vec<u8> = (0..64).map(|i| (i * 37) as u8).collect();
+        backend.upload(&source, 0, &bytes).unwrap();
+        let mut pool = PacketBufferPool::cuda(backend.clone(), 48, 2).unwrap();
+        let first = pool.acquire(37, source.clone()).unwrap();
+        let first_address = first.address();
+        let second = pool.acquire(41, source.clone()).unwrap();
+        assert_eq!(second.address() - first_address, 48);
+        assert!(pool.acquire(1, source.clone()).is_none());
+        backend
+            .memcpy_dtod_async(first.address(), source.base + 3, 37, &stream)
+            .unwrap();
+        backend
+            .memcpy_dtod_async(second.address(), source.base + 7, 41, &stream)
+            .unwrap();
+        backend.stream_synchronize(&stream).unwrap();
+        // SAFETY: both pending copies were drained above.
+        let (first, second) = unsafe { (first.retire(), second.retire()) };
+        let view = first.slice(5..29).unwrap();
+        drop(first);
+        assert!(pool.acquire(1, source.clone()).is_none());
+        let mut actual = [0; 24];
+        view.read(&mut actual).unwrap();
+        assert_eq!(actual, bytes[8..32]);
+        drop(view);
+        let reused = pool.acquire(48, source.clone()).unwrap();
+        assert_eq!(reused.address(), first_address);
+        backend.upload(&source, 0, &[0xdd; 64]).unwrap();
+        backend
+            .memcpy_dtod_async(reused.address(), source.base, 48, &stream)
+            .unwrap();
+        drop(source);
+        backend.stream_synchronize(&stream).unwrap();
+        // SAFETY: the reused slot and its retained producer have completed.
+        let reused = unsafe { reused.retire() };
+        drop(pool);
+        let mut old = [0; 41];
+        second.read(&mut old).unwrap();
+        assert_eq!(old, bytes[7..48]);
+        let mut new = [0; 48];
+        reused.read(&mut new).unwrap();
+        assert_eq!(new, [0xdd; 48]);
+    }
+
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS; run through gpuq"]
+    fn packet_snapshot_survives_producer_reuse_and_runtime_drop() {
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let mut producer = CudaPacketRuntime::load(&assets.join("codec.pkt"), 0).unwrap();
+        let resident = Arc::downgrade(&producer._resident);
+        let input = producer.create_tensor(64).unwrap();
+        let bytes: Vec<u8> = (0..64).map(|i| (i * 37) as u8).collect();
+        producer.write_tensor(input, &bytes).unwrap();
+        let snapshot = producer.snapshot_tensor(input, 7, 41).unwrap();
+        let view = snapshot.slice(3..35).unwrap();
+        producer.write_tensor(input, &[0x55; 64]).unwrap();
+        drop(producer);
+        drop(snapshot);
+        assert!(resident.upgrade().is_some());
+        let mut output = [0u8; 32];
+        view.read(&mut output).unwrap();
+        assert_eq!(&output, &bytes[10..42]);
+        std::thread::spawn(move || {
+            let mut consumer = CudaPacketRuntime::load(&assets.join("codec.pkt"), 0).unwrap();
+            let target = consumer.create_tensor(64).unwrap();
+            consumer.write_tensor(target, &[0xa5; 64]).unwrap();
+            assert!(consumer.input_stage.is_none());
+            consumer.write_tensor_from(target, 5, &view).unwrap();
+            assert!(
+                consumer.input_stage.is_none(),
+                "same-context copy fell back to host staging"
+            );
+            let mut actual = [0u8; 64];
+            consumer.read_tensor(target, &mut actual).unwrap();
+            let mut expected = [0xa5; 64];
+            expected[5..37].copy_from_slice(&bytes[10..42]);
+            assert_eq!(actual, expected);
+            let first = view.slice(0..11).unwrap();
+            let second = view.slice(7..24).unwrap();
+            consumer
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: target,
+                        offset: 2,
+                        data: PacketData::Zero(46),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 3,
+                        data: PacketData::Buffer(&first),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 9,
+                        data: PacketData::Buffer(&second),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 64,
+                        data: PacketData::Zero(0),
+                    },
+                ])
+                .unwrap();
+            assert!(
+                consumer.input_stage.is_none(),
+                "device-only batch staged on host"
+            );
+            expected[2..48].fill(0);
+            expected[3..14].copy_from_slice(&bytes[10..21]);
+            expected[9..26].copy_from_slice(&bytes[17..34]);
+            consumer.read_tensor(target, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            for data in [PacketData::Zero(usize::MAX), PacketData::Buffer(&view)] {
+                assert!(consumer
+                    .write_tensors(&[
+                        PacketWrite {
+                            tensor: target,
+                            offset: 0,
+                            data: PacketData::Zero(64)
+                        },
+                        PacketWrite {
+                            tensor: target,
+                            offset: 63,
+                            data
+                        },
+                    ])
+                    .is_err());
+                consumer.read_tensor(target, &mut actual).unwrap();
+                assert_eq!(actual, expected);
+            }
+            for offset in [63, usize::MAX] {
+                assert!(consumer.write_tensor_from(target, offset, &view).is_err());
+                consumer.read_tensor(target, &mut actual).unwrap();
+                assert_eq!(actual, expected);
+            }
+            assert!(consumer.snapshot_tensor(target, 60, 5).is_err());
+            assert!(consumer
+                .write_tensor_from(
+                    PacketTensor {
+                        bytes: 63,
+                        ..target
+                    },
+                    0,
+                    &view
+                )
+                .is_err());
+            let host: PacketBuffer = vec![9, 8, 7].into();
+            consumer
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: target,
+                        offset: 1,
+                        data: PacketData::Buffer(&host),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 6,
+                        data: PacketData::Buffer(&first),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 12,
+                        data: PacketData::Zero(2),
+                    },
+                    PacketWrite {
+                        tensor: target,
+                        offset: 15,
+                        data: PacketData::Host(&[5, 4, 3, 2, 1]),
+                    },
+                ])
+                .unwrap();
+            assert!(consumer.input_stage.is_some());
+            assert_eq!(consumer.input_stage.as_ref().unwrap().len(), 16);
+            expected[1..4].copy_from_slice(&[9, 8, 7]);
+            expected[6..17].copy_from_slice(&bytes[10..21]);
+            expected[12..14].fill(0);
+            expected[15..20].copy_from_slice(&[5, 4, 3, 2, 1]);
+            consumer.read_tensor(target, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            drop(first);
+            drop(second);
+            drop(view);
+            assert!(resident.upgrade().is_none());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn input_writes_drain_after_success_or_any_enqueue_failure() {
+        for failure in [None, Some(0), Some(1), Some(2)] {
+            for drain_fails in [false, true] {
+                let seen = RefCell::new(Vec::new());
+                let quarantined = Cell::new(false);
+                let result = submit_writes(
+                    3,
+                    |i| {
+                        seen.borrow_mut().push(i);
+                        if failure == Some(i) {
+                            Err(RuntimeError::Device("enqueue".into()))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || {
+                        seen.borrow_mut().push(3);
+                        if drain_fails {
+                            Err(RuntimeError::Device("drain".into()))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || quarantined.set(true),
+                );
+                let mut expected: Vec<_> = (0..failure.map_or(3, |i| i + 1)).collect();
+                expected.push(3);
+                assert_eq!(*seen.borrow(), expected);
+                assert_eq!(quarantined.get(), drain_fails);
+                assert_eq!(result.is_err(), failure.is_some() || drain_fails);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU correctness; SPEECH_BATCH_TEST_ASSETS; run through gpuq"]
+    fn packet_bulk_writes_preserve_ranges_order_and_reuse() {
+        let assets = std::path::PathBuf::from(std::env::var("SPEECH_BATCH_TEST_ASSETS").unwrap());
+        let mut rt = CudaPacketRuntime::load(&assets.join("codec.pkt"), 0).unwrap();
+        let t = rt.create_tensor(64).unwrap();
+        for size in [7, 23, 3, 47, 7] {
+            let initial = [0xa5; 64];
+            rt.write_tensor(t, &initial).unwrap();
+            let first = vec![0x37; size];
+            let writes = [
+                PacketWrite {
+                    tensor: t,
+                    offset: 5,
+                    data: PacketData::Host(&first),
+                },
+                PacketWrite {
+                    tensor: t,
+                    offset: 9,
+                    data: PacketData::Host(&[1, 2, 3, 4]),
+                },
+                PacketWrite {
+                    tensor: t,
+                    offset: 64,
+                    data: PacketData::Host(&[]),
+                },
+            ];
+            rt.write_tensors(&writes).unwrap();
+            let mut expected = initial;
+            expected[5..5 + size].copy_from_slice(&first);
+            expected[9..13].copy_from_slice(&[1, 2, 3, 4]);
+            let mut actual = [0; 64];
+            rt.read_tensor(t, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            assert!(rt
+                .write_tensors(&[
+                    PacketWrite {
+                        tensor: t,
+                        offset: 0,
+                        data: PacketData::Host(&[0xff]),
+                    },
+                    PacketWrite {
+                        tensor: t,
+                        offset: usize::MAX,
+                        data: PacketData::Host(&[1]),
+                    },
+                ])
+                .is_err());
+            rt.read_tensor(t, &mut actual).unwrap();
+            assert_eq!(actual, expected, "validation must precede all transfers");
+            assert!(rt
+                .write_tensors(&[PacketWrite {
+                    tensor: PacketTensor { bytes: 63, ..t },
+                    offset: 0,
+                    data: PacketData::Host(&[1]),
+                }])
+                .is_err());
+        }
+        rt.prepare_writes(&[t, t, t]).unwrap();
+        let pointer = rt.input_stage.as_ref().unwrap().as_ptr();
+        rt.write_tensors(&[PacketWrite {
+            tensor: t,
+            offset: 0,
+            data: PacketData::Host(&[0xa5; 64]),
+        }])
+        .unwrap();
+        assert_eq!(
+            pointer,
+            rt.input_stage.as_ref().unwrap().as_ptr(),
+            "prepared input staging grew"
+        );
+        assert!(input_size([usize::MAX].into_iter()).is_err());
     }
 }
 
@@ -418,6 +814,129 @@ impl PacketRuntime for CudaPacketRuntime {
             handle,
             bytes: self.tensors[handle].len as usize,
         })
+    }
+
+    fn write_tensors(&mut self, writes: &[PacketWrite<'_>]) -> Result<()> {
+        self.check_inputs()?;
+        for w in writes {
+            let mem = self.mem(w.tensor)?;
+            check_transfer(
+                w.tensor,
+                w.tensor.handle,
+                mem.len as usize,
+                mem.len as usize,
+            )?;
+            w.check()?;
+        }
+        if writes.iter().all(|w| w.data.is_empty()) {
+            return Ok(());
+        }
+        let size = input_size(writes.iter().map(|w| host_input_size(&self.be, w.data)))?;
+        self.reserve_inputs(size)?;
+        let mut offset = 0;
+        for w in writes {
+            let len = host_input_size(&self.be, w.data);
+            if len > 0 {
+                let stage = self.input_stage.as_mut().unwrap();
+                w.data
+                    .read(&mut stage.as_mut_slice()[offset..offset + len])?;
+                offset = (offset + len + 7) & !7;
+            }
+        }
+        let mut offset = 0;
+        let mut failed = false;
+        let result = submit_writes(
+            writes.len(),
+            |i| {
+                let w = &writes[i];
+                let len = w.data.len();
+                if len == 0 {
+                    return Ok(());
+                }
+                let target = self.tensors[w.tensor.handle].base + w.offset as u64;
+                if let PacketData::Zero(_) = w.data {
+                    return self.be.memset_d8_async(target, 0, len, &self.stream);
+                }
+                if let Some(source) = device_input_source(&self.be, w.data) {
+                    return self
+                        .be
+                        .memcpy_dtod_async(target, source, len as u64, &self.stream);
+                }
+                let stage = self.input_stage.as_ref().unwrap();
+                let source = &stage.as_slice()[offset..offset + len];
+                offset = (offset + len + 7) & !7;
+                // SAFETY: validated ranges, owned pinned source, and the batch drains below.
+                unsafe { self.be.memcpy_htod_async(target, source, &self.stream) }
+            },
+            || self.be.stream_synchronize(&self.stream),
+            || failed = true,
+        );
+        if failed {
+            // Unproven completion must retain buffers and the backend's small-copy kernel.
+            if let Some(stage) = self.input_stage.take() {
+                std::mem::forget(stage);
+            }
+            for w in writes {
+                if let PacketData::Buffer(source) = w.data {
+                    std::mem::forget(source.clone());
+                }
+            }
+            return Err(
+                self.abandon_transfers(writes.iter().map(|w| w.tensor), result.unwrap_err())
+            );
+        }
+        result
+    }
+
+    fn prepare_writes(&mut self, tensors: &[PacketTensor]) -> Result<()> {
+        self.check_inputs()?;
+        for &t in tensors {
+            let mem = self.mem(t)?;
+            check_transfer(t, t.handle, mem.len as usize, mem.len as usize)?;
+        }
+        self.reserve_inputs(input_size(tensors.iter().map(|t| t.bytes))?)
+    }
+
+    fn snapshot_tensor(
+        &mut self,
+        tensor: PacketTensor,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<PacketBuffer> {
+        let source = self.mem(tensor)?;
+        check_transfer(
+            tensor,
+            tensor.handle,
+            source.len as usize,
+            source.len as usize,
+        )?;
+        check_region(tensor, offset, bytes)?;
+        if bytes == 0 {
+            return Ok(Vec::new().into());
+        }
+        let address = source.base + offset as u64;
+        let mut snapshot = self.be.alloc(0, bytes as u64)?;
+        let mut failed = false;
+        let result = submit_writes(
+            1,
+            |_| {
+                self.be
+                    .memcpy_dtod_async(snapshot.base, address, bytes as u64, &self.stream)
+            },
+            || self.be.stream_synchronize(&self.stream),
+            || failed = true,
+        );
+        if failed {
+            snapshot.quarantine();
+            return Err(self.abandon_transfers([tensor], result.unwrap_err()));
+        }
+        result?;
+        Ok(PacketBuffer::completed_cuda(
+            snapshot,
+            self.be.clone(),
+            bytes,
+            self._resident.clone(),
+        ))
     }
 
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()> {
@@ -491,6 +1010,7 @@ impl PacketRuntime for CudaPacketRuntime {
     /// Every program is enqueued on the one stream (stream order is the dependency), as one
     /// CUDA graph after the first run of a sequence; one sync.
     fn run_sequence(&mut self, programs: &[usize]) -> Result<()> {
+        self.check_inputs()?;
         if let Some(&bad) = programs.iter().find(|&&p| p >= self.programs.len()) {
             return Err(RuntimeError::Rejected(format!(
                 "packet program {bad} is missing"

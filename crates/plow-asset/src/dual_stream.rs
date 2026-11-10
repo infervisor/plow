@@ -7,6 +7,78 @@ use std::collections::BTreeMap;
 
 /// Pipeline string holding the [`DualStream`] JSON.
 pub const KEY: &str = "prompt.dual_stream";
+pub const CONDITIONING_KEY: &str = "prompt.conditioning";
+pub const CONDITIONED_DRIVER: &str = "tts.codec_lm.v2";
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakerConditioning {
+    pub version: u32,
+    pub speaker_packet: String,
+    pub reference_packet: String,
+}
+
+impl SpeakerConditioning {
+    pub fn parse(json: &str) -> Result<Self, String> {
+        let c: Self = serde_json::from_str(json).map_err(|e| format!("{CONDITIONING_KEY}: {e}"))?;
+        let sidecar = |s: &str| {
+            s.len() <= 128
+                && s.ends_with(".pkt")
+                && s.len() > 4
+                && !s.starts_with('.')
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        };
+        if c.version != 1
+            || !sidecar(&c.speaker_packet)
+            || !sidecar(&c.reference_packet)
+            || c.speaker_packet == c.reference_packet
+        {
+            return Err(format!("{CONDITIONING_KEY}: invalid version or sidecar"));
+        }
+        Ok(c)
+    }
+}
+
+#[cfg(test)]
+mod conditioning_tests {
+    use super::*;
+
+    #[test]
+    fn conditioning_requires_versioned_portable_sidecars() {
+        let value = serde_json::json!({"version": 1,
+            "speaker_packet": "speaker_encoder.pkt", "reference_packet": "ref_encoder.pkt"});
+        let c = SpeakerConditioning::parse(&value.to_string()).unwrap();
+        assert_eq!(
+            SpeakerConditioning::parse(&serde_json::to_string(&c).unwrap()).unwrap(),
+            c
+        );
+        for path in [
+            "",
+            ".pkt",
+            "../speaker.pkt",
+            "/tmp/speaker.pkt",
+            "sub/speaker.pkt",
+            "speaker.bin",
+            "ref_encoder.pkt",
+        ] {
+            let mut bad = value.clone();
+            bad["speaker_packet"] = path.into();
+            assert!(
+                SpeakerConditioning::parse(&bad.to_string()).is_err(),
+                "{path}"
+            );
+        }
+        for version in [0, 2, u32::MAX] {
+            let mut bad = value.clone();
+            bad["version"] = version.into();
+            assert!(SpeakerConditioning::parse(&bad.to_string()).is_err());
+        }
+        let mut bad = value;
+        bad["ignored_feature"] = true.into();
+        assert!(SpeakerConditioning::parse(&bad.to_string()).is_err());
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +130,21 @@ pub struct Layout {
     pub tail: u32,
 }
 
+pub struct Reference<'a> {
+    /// Reference transcript tokenized with `text_template`, including its lead/drop wrappers.
+    pub text: &'a [u32],
+    /// Complete row-major codec frames, without control or padding codes.
+    pub codes: &'a [u32],
+    pub codebook_size: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConditionedLayout {
+    pub layout: Layout,
+    /// An overlay must replace this entire row with `bf16(text_pad + speaker_embedding)`.
+    pub speaker_row: usize,
+}
+
 impl DualStream {
     pub fn parse(json: &str) -> Result<Self, String> {
         let d: Self = serde_json::from_str(json).map_err(|e| format!("{KEY}: {e}"))?;
@@ -71,11 +158,10 @@ impl DualStream {
     }
 
     /// The codec id of `language` (`None` = `auto`) as `voice` speaks it.
-    fn language(&self, language: &str, voice: &Voice) -> Result<Option<u32>, String> {
+    fn language(&self, language: &str, voice: Option<&Voice>) -> Result<Option<u32>, String> {
         let language = language.to_lowercase();
         if let Some(d) = voice
-            .dialect
-            .as_ref()
+            .and_then(|v| v.dialect.as_ref())
             .filter(|_| self.dialect_languages.contains(&language))
         {
             return self
@@ -111,10 +197,118 @@ impl DualStream {
         let v = self
             .voice(voice)
             .ok_or_else(|| format!("unknown voice {voice:?}"))?;
-        if text.len() < self.lead + self.drop + 1 {
+        let body = self.body(text)?;
+        let (mut out, _) = self.start(text, instructions, language, Some(v))?;
+        self.append_text(&mut out, body, streaming);
+        Ok(out)
+    }
+
+    pub fn layout_conditioned(
+        &self,
+        text: &[u32],
+        instructions: &[u32],
+        language: &str,
+        streaming: bool,
+        reference: Option<Reference<'_>>,
+    ) -> Result<ConditionedLayout, String> {
+        if self.frame_codes == 0 {
+            return Err("zero frame width".into());
+        }
+        let body = self.body(text)?;
+        let (mut out, speaker_row) = self.start(text, instructions, language, None)?;
+        let Some(reference) = reference else {
+            self.append_text(&mut out, body, streaming);
+            return Ok(ConditionedLayout {
+                layout: out,
+                speaker_row,
+            });
+        };
+        let ref_body = self.body(reference.text)?;
+        if reference.codebook_size == 0
+            || reference.codebook_size > self.none_code
+            || reference.codes.is_empty()
+            || reference.codes.len() % self.frame_codes != 0
+            || reference
+                .codes
+                .iter()
+                .any(|&c| c >= reference.codebook_size)
+        {
+            return Err("invalid reference codec frames".into());
+        }
+        let words: Vec<u32> = ref_body
+            .iter()
+            .chain(body)
+            .chain([&self.text_eos])
+            .copied()
+            .collect();
+        if !streaming {
+            for &t in &words {
+                self.row(&mut out, t, &[self.codec_pad]);
+            }
+        }
+        self.row(
+            &mut out,
+            if streaming { words[0] } else { self.text_pad },
+            &[self.codec_bos],
+        );
+        let frames = reference.codes.len() / self.frame_codes;
+        for (i, codes) in reference.codes.chunks_exact(self.frame_codes).enumerate() {
+            let id = if streaming {
+                words.get(i + 1).copied().unwrap_or(self.text_pad)
+            } else {
+                self.text_pad
+            };
+            self.row(&mut out, id, codes);
+        }
+        if streaming && words.len() > frames + 1 {
+            out.feed.extend_from_slice(&words[frames + 1..]);
+        }
+        Ok(ConditionedLayout {
+            layout: out,
+            speaker_row,
+        })
+    }
+
+    fn body<'a>(&self, text: &'a [u32]) -> Result<&'a [u32], String> {
+        if self.lead >= text.len() || self.drop >= text.len() - self.lead {
             return Err("empty input".into());
         }
-        let mut codec = match self.language(language, v)? {
+        Ok(&text[self.lead..text.len() - self.drop])
+    }
+
+    fn row(&self, out: &mut Layout, id: u32, codes: &[u32]) {
+        out.ids.push(id);
+        out.codes.extend_from_slice(codes);
+        out.codes.extend(std::iter::repeat_n(
+            self.none_code,
+            self.frame_codes - codes.len(),
+        ));
+    }
+
+    fn append_text(&self, out: &mut Layout, body: &[u32], streaming: bool) {
+        if streaming {
+            self.row(out, body[0], &[self.codec_bos]);
+            out.feed.extend_from_slice(&body[1..]);
+            out.feed.push(self.text_eos);
+        } else {
+            for &t in body.iter().chain([&self.text_eos]) {
+                self.row(out, t, &[self.codec_pad]);
+            }
+            self.row(out, self.text_pad, &[self.codec_bos]);
+        }
+    }
+
+    fn start(
+        &self,
+        text: &[u32],
+        instructions: &[u32],
+        language: &str,
+        voice: Option<&Voice>,
+    ) -> Result<(Layout, usize), String> {
+        if self.frame_codes == 0 || self.language_at > self.codec_language.len() {
+            return Err("inconsistent layout".into());
+        }
+        let codec = match self.language(language, voice)? {
             Some(l) => {
                 let mut c = self.codec_language.clone();
                 c.insert(self.language_at, l);
@@ -122,45 +316,26 @@ impl DualStream {
             }
             None => self.codec_auto.clone(),
         };
-        codec.extend([v.code, self.codec_pad, self.codec_bos]);
         let mut out = Layout {
             ids: Vec::new(),
             codes: Vec::new(),
             feed: Vec::new(),
             tail: self.text_pad,
         };
-        let mut row = |id: u32, code: u32| {
-            out.ids.push(id);
-            out.codes.push(code);
-            out.codes
-                .extend(std::iter::repeat_n(self.none_code, self.frame_codes - 1));
-        };
         for &t in instructions.iter().chain(&text[..self.lead]) {
-            row(t, self.none_code);
+            self.row(&mut out, t, &[]);
         }
-        let n = codec.len();
-        for (i, &c) in codec[..n - 1].iter().enumerate() {
-            row(
-                if i + 2 < n {
-                    self.text_pad
-                } else {
-                    self.text_bos
-                },
-                c,
-            );
+        for code in codec {
+            self.row(&mut out, self.text_pad, &[code]);
         }
-        let body = &text[self.lead..text.len() - self.drop];
-        if streaming {
-            row(body[0], self.codec_bos);
-            out.feed = body[1..].to_vec();
-            out.feed.push(self.text_eos);
-        } else {
-            for &t in body.iter().chain([&self.text_eos]) {
-                row(t, self.codec_pad);
-            }
-            row(self.text_pad, self.codec_bos);
-        }
-        Ok(out)
+        let speaker_row = out.ids.len();
+        self.row(
+            &mut out,
+            self.text_pad,
+            &[voice.map_or(self.none_code, |v| v.code)],
+        );
+        self.row(&mut out, self.text_bos, &[self.codec_pad]);
+        Ok((out, speaker_row))
     }
 }
 
@@ -245,5 +420,231 @@ mod tests {
         assert!(d.layout(&TEXT[..8], &[], "ryan", "english", true).is_err());
         assert!(d.layout(&TEXT, &[], "nobody", "english", true).is_err());
         assert!(d.layout(&TEXT, &[], "ryan", "klingon", true).is_err());
+    }
+
+    const REF: [u32; 10] = [1, 2, 3, 20, 21, 4, 5, 1, 2, 3];
+
+    fn reference(codes: &[u32]) -> Reference<'_> {
+        Reference {
+            text: &REF,
+            codes,
+            codebook_size: 16,
+        }
+    }
+
+    #[test]
+    fn reference_text_longer_than_audio_continues_on_decode() {
+        let d = qwen();
+        let c = d
+            .layout_conditioned(
+                &TEXT,
+                &[7, 8],
+                "english",
+                true,
+                Some(reference(&[0, 1, 2, 3])),
+            )
+            .unwrap();
+        assert_eq!(c.speaker_row, 9);
+        assert_eq!(c.layout.ids[11..], [20, 21, 10]);
+        assert_eq!(c.layout.codes[22..], [2149, N, 0, 1, 2, 3]);
+        assert_eq!(c.layout.feed, [11, 12, 151673]);
+        assert_eq!(c.layout.codes[18..20], [N, N]);
+    }
+
+    #[test]
+    fn reference_audio_at_least_as_long_as_text_uses_pad_tail() {
+        for codes in [
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9][..],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11][..],
+        ] {
+            let c = qwen()
+                .layout_conditioned(&TEXT, &[], "english", true, Some(reference(codes)))
+                .unwrap();
+            assert_eq!(&c.layout.ids[9..15], [20, 21, 10, 11, 12, 151673]);
+            assert!(c.layout.ids[15..].iter().all(|&id| id == 151671));
+            assert!(c.layout.feed.is_empty());
+            assert_eq!(c.layout.tail, 151671);
+            assert_eq!(c.layout.codes[20..], *codes);
+        }
+    }
+
+    #[test]
+    fn non_streaming_reference_keeps_text_and_audio_spans_separate() {
+        let d = qwen();
+        let c = d
+            .layout_conditioned(&TEXT, &[], "auto", false, Some(reference(&[0, 1, 2, 3])))
+            .unwrap();
+        assert_eq!(c.speaker_row, 6);
+        assert_eq!(
+            c.layout.ids[8..],
+            [20, 21, 10, 11, 12, 151673, 151671, 151671, 151671]
+        );
+        assert!(c.layout.feed.is_empty());
+        assert_eq!(
+            c.layout.codes[16..],
+            [2148, N, 2148, N, 2148, N, 2148, N, 2148, N, 2148, N, 2149, N, 0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn audio_only_conditioning_changes_only_the_speaker_row() {
+        let d = qwen();
+        for language in ["auto", "english", "chinese"] {
+            for streaming in [false, true] {
+                let c = d
+                    .layout_conditioned(&TEXT, &[7], language, streaming, None)
+                    .unwrap();
+                let mut expected = d.layout(&TEXT, &[7], "ryan", language, streaming).unwrap();
+                expected.codes[c.speaker_row * d.frame_codes] = N;
+                assert_eq!(c.layout, expected);
+            }
+        }
+        let mut base = qwen();
+        base.voices.clear();
+        assert!(base
+            .layout_conditioned(&TEXT, &[], "english", true, None)
+            .is_ok());
+    }
+
+    #[test]
+    fn malformed_reference_frames_and_text_are_rejected() {
+        let d = qwen();
+        for codes in [&[][..], &[1][..], &[16, 0][..], &[u32::MAX, 0][..]] {
+            assert!(d
+                .layout_conditioned(&TEXT, &[], "english", true, Some(reference(codes)))
+                .is_err());
+        }
+        for size in [0, N + 1] {
+            let r = Reference {
+                codebook_size: size,
+                ..reference(&[0, 1])
+            };
+            assert!(d
+                .layout_conditioned(&TEXT, &[], "english", true, Some(r))
+                .is_err());
+        }
+        let r = Reference {
+            text: &REF[..8],
+            ..reference(&[0, 1])
+        };
+        assert!(d
+            .layout_conditioned(&TEXT, &[], "english", true, Some(r))
+            .is_err());
+        assert!(d
+            .layout_conditioned(&TEXT[..8], &[], "english", true, None)
+            .is_err());
+        assert!(d
+            .layout_conditioned(&TEXT, &[], "unknown", true, None)
+            .is_err());
+    }
+
+    #[test]
+    fn malformed_layout_geometry_is_rejected_without_panicking() {
+        let mut d = qwen();
+        d.frame_codes = 0;
+        assert!(d
+            .layout_conditioned(&TEXT, &[], "auto", true, None)
+            .is_err());
+        d = qwen();
+        d.lead = usize::MAX;
+        assert!(d
+            .layout_conditioned(&TEXT, &[], "auto", true, None)
+            .is_err());
+        d = qwen();
+        d.drop = usize::MAX;
+        assert!(d
+            .layout_conditioned(&TEXT, &[], "auto", true, None)
+            .is_err());
+    }
+
+    #[test]
+    #[ignore = "CPU reference tensors; DUAL_STREAM_REFERENCE_CASES JSON, generated from installed reference"]
+    fn conditioned_layout_matches_reference_tensors() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            contract: DualStream,
+            text: Vec<u32>,
+            instructions: Vec<u32>,
+            language: String,
+            streaming: bool,
+            voice: Option<String>,
+            reference_text: Option<Vec<u32>>,
+            reference_codes: Vec<u32>,
+            codebook_size: u32,
+            rows: Vec<Vec<f32>>,
+            feed: Vec<Vec<f32>>,
+            speaker_row: Option<usize>,
+            speaker_overlay: Vec<f32>,
+        }
+        let path = std::env::var("DUAL_STREAM_REFERENCE_CASES").unwrap();
+        let cases: Vec<Case> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(cases.len() >= 300);
+        for (index, case) in cases.iter().enumerate() {
+            let d = &case.contract;
+            let reference = case.reference_text.as_ref().map(|text| Reference {
+                text,
+                codes: &case.reference_codes,
+                codebook_size: case.codebook_size,
+            });
+            let (layout, speaker) = match &case.voice {
+                Some(voice) => (
+                    d.layout(
+                        &case.text,
+                        &case.instructions,
+                        voice,
+                        &case.language,
+                        case.streaming,
+                    )
+                    .unwrap(),
+                    None,
+                ),
+                None => {
+                    let c = d
+                        .layout_conditioned(
+                            &case.text,
+                            &case.instructions,
+                            &case.language,
+                            case.streaming,
+                            reference,
+                        )
+                        .unwrap();
+                    (c.layout, Some(c.speaker_row))
+                }
+            };
+            assert_eq!(speaker, case.speaker_row, "case {index}");
+            assert_eq!(layout.codes.len(), layout.ids.len() * d.frame_codes);
+            let render_text = |id| {
+                let mut row = vec![0f32; d.frame_codes + 2];
+                row[0] = id as f32;
+                row
+            };
+            let rows: Vec<_> = layout
+                .ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    if speaker == Some(i) {
+                        return case.speaker_overlay.clone();
+                    }
+                    let mut row = render_text(id);
+                    for (k, &code) in layout.codes[i * d.frame_codes..(i + 1) * d.frame_codes]
+                        .iter()
+                        .enumerate()
+                    {
+                        if code != d.none_code {
+                            row[k + 1] = (code + 1) as f32;
+                        }
+                    }
+                    row
+                })
+                .collect();
+            assert_eq!(rows, case.rows, "prompt rows case {index}");
+            let feed: Vec<_> = if layout.feed.is_empty() {
+                vec![render_text(layout.tail)]
+            } else {
+                layout.feed.iter().map(|&id| render_text(id)).collect()
+            };
+            assert_eq!(feed, case.feed, "decode feed case {index}");
+        }
     }
 }

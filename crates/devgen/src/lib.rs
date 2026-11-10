@@ -104,6 +104,7 @@ mod rewrite_lower;
 pub mod rnnt;
 pub mod s3gen;
 pub mod segment_resource;
+pub mod speaker_encoder;
 mod tp_precision;
 pub mod tts;
 pub mod tune_demand;
@@ -12081,6 +12082,15 @@ fn emit_dense_gqa(
             write_sidecar_packet(&path, &model, &[section]);
             eprintln!("  reference encoder packet -> {}", path.display());
         }
+        let speaker = dir.join("speaker_encoder");
+        if speaker.join("config.json").is_file() {
+            let (model, section) = speaker_encoder::lower_speaker_encoder(&speaker, n_cu, m.target)
+                .unwrap_or_else(|error| panic!("speaker encoder packet: {error}"));
+            let path = std::path::Path::new(&out).with_file_name(speaker_encoder::PACKET);
+            speech.add(manifest::SpeechMasks::of(&model));
+            write_sidecar_packet(&path, &model, &[section]);
+            eprintln!("  speaker encoder packet -> {}", path.display());
+        }
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().1;
@@ -12174,6 +12184,7 @@ fn emit_dense_gqa(
             man["speech_ops"] = speech.ops.into();
             man["speech_conv_posts"] = speech.conv_posts.into();
             man["speech_split_a"] = speech.split_a.into();
+            man["speech_conv_wide_padded"] = speech.conv_wide_padded.into();
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes

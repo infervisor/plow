@@ -520,6 +520,21 @@ pub fn row_keys(prompt_ids: &[u32], overlay_pos: &[u32], overlays: &[&[f32]]) ->
     keys
 }
 
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn frame_row_keys(keys: &mut [u64], codes: &[u32], width: usize) -> bool {
+    if width == 0 || keys.len().checked_mul(width) != Some(codes.len()) {
+        return false;
+    }
+    for (key, row) in keys.iter_mut().zip(codes.chunks_exact(width)) {
+        let mut h = fold(0x6672_616d_655f_7631, width as u64);
+        for &code in row {
+            h = fold(h, u64::from(code));
+        }
+        *key = fold(*key, mix(h));
+    }
+    true
+}
+
 /// A session request's retention contract, carried on its mux job.
 #[derive(Debug)]
 pub struct SessionTicket {
@@ -1135,6 +1150,26 @@ mod tests {
             row_keys(&ids, &[1, 2], &[&a, &a])[2],
             row_keys(&ids, &[1, 2], &[&a, &b])[2]
         );
+    }
+
+    #[test]
+    fn frame_rows_key_every_code_and_the_frame_width() {
+        let base = row_keys(&[5, 6, 7], &[], &[]);
+        let mut a = base.clone();
+        let mut b = base.clone();
+        assert!(frame_row_keys(&mut a, &[1, 2, 3, 4, 5, 6], 2));
+        assert!(frame_row_keys(&mut b, &[1, 2, 3, 99, 5, 6], 2));
+        assert_eq!(a[0], b[0]);
+        assert_ne!(a[1], b[1]);
+        assert_eq!(a[2], b[2]);
+        assert_ne!(a, base);
+        let mut short = base.clone();
+        assert!(!frame_row_keys(&mut short, &[1, 2], 2));
+        assert_eq!(short, base);
+        assert!(!frame_row_keys(&mut short, &[], 0));
+        assert_eq!(short, base);
+        assert!(frame_row_keys(&mut short, &[1, 3, 5], 1));
+        assert_ne!(short[0], a[0]);
     }
 
     #[test]

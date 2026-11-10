@@ -1,0 +1,344 @@
+/* sample_topk_test.cu — SampleSmallF32 / SampleFishBf16 (op_elementwise.cuh d_sample_small /
+ * d_sample_fish): the radix top-k selection against the K-round block_max selection it replaced,
+ * which the same functions still run when the radix scratch does not fit the launch's shared
+ * memory. Each case runs twice on identical inputs: once with room for the scratch (radix) and once
+ * with exactly the row's arena (the fallback), and every sampled code must be bit-identical.
+ *
+ * Inputs: recorded Qwen3-TTS logits when given (argv[1] = depth logits `[rows][2048]` f32, argv[2]
+ * = backbone logits `[rows][2049]` f32), plus synthetic rows (ties, -inf runs, vocab 64..16384).
+ * Sampling: temperatures, top_k 1..64, top_p, repetition-penalty bitmap, min-step stop mask, CFG
+ * guide rows, seeds and steps.
+ *
+ * Build: nvcc -arch=sm_90a -O3 -I runtime/common -I runtime/nvidia runtime/tests/sample_topk_test.cu
+ *   -o sample_topk_test;  sample_topk_test [depth.f32 backbone.f32] [--bench]
+ */
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cmath>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include "sm120_common.cuh"
+#include "op_elementwise.cuh"
+
+#define CK(x)                                                                       \
+    do {                                                                            \
+        cudaError_t e_ = (x);                                                       \
+        if (e_ != cudaSuccess) {                                                    \
+            fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); \
+            exit(2);                                                                \
+        }                                                                           \
+    } while (0)
+
+struct SmallArgs {
+    unsigned* out;
+    const float* logits;
+    const float* params;
+    const unsigned* ctl;
+    const unsigned long long* seed;
+    unsigned* bitmap;
+    unsigned rows, vocab, words, min_step;
+};
+
+__global__ void small_kernel(SmallArgs a, int* radix_used) {
+    extern __shared__ float arena[];
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        float* L = arena + 3 * PLOW_NV_WARPS + 128;
+        unsigned long long* b = (unsigned long long*)(((size_t)(L + a.vocab) + 15u) & ~(size_t)15u);
+        *radix_used = smem_fits((unsigned*)(b + 64) + 4 + 256);
+    }
+    d_sample_small(a.out, a.logits, a.params, a.ctl, a.seed, a.bitmap, nullptr, nullptr, a.rows, a.vocab, 16u, 0u,
+                   3u, a.words, 0u, 0u, a.min_step, blockIdx.x, gridDim.x, arena);
+}
+
+struct FishArgs {
+    unsigned* out;
+    const __nv_bfloat16* logits;
+    const float* params;
+    const unsigned* topk;
+    const unsigned long long* seed;
+    const unsigned* step;
+    unsigned* hist;
+    unsigned rows, vocab, window, ras_limit;
+};
+
+__global__ void fish_kernel(FishArgs a, int* radix_used) {
+    extern __shared__ float arena[];
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        unsigned short* L = (unsigned short*)(arena + 3 * PLOW_NV_WARPS + 128);
+        unsigned long long* b = (unsigned long long*)(((size_t)(L + a.vocab) + 15u) & ~(size_t)15u);
+        *radix_used = smem_fits((unsigned*)(b + 64) + 4 + 256);
+    }
+    d_sample_fish(a.out, a.logits, a.params, a.topk, a.seed, a.step, a.hist, nullptr, a.rows, a.vocab, 16u, 0u, 0u,
+                  a.window, a.window ? 1u : 0u, 0u, a.ras_limit, blockIdx.x, gridDim.x, arena);
+}
+
+/* Shared bytes the K-round selection needs: reduction slots, 64 classes + values, the row. */
+static size_t row_arena(unsigned vocab, size_t elem) {
+    return (3 * PLOW_NV_WARPS + 128) * 4 + vocab * elem;
+}
+static size_t radix_arena(unsigned vocab, size_t elem) {
+    return ((row_arena(vocab, elem) + 15) & ~(size_t)15) + 64 * 8 + 260 * 4;
+}
+
+static uint64_t rng_state = 0x2545F4914F6CDD1Dull;
+static uint32_t rnd() {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    return (uint32_t)(rng_state >> 11);
+}
+static float frand() { return (rnd() & 0xffffff) / 16777216.0f; }
+
+template <class T>
+static T* dev(const std::vector<T>& h) {
+    T* d;
+    CK(cudaMalloc(&d, h.size() * sizeof(T) + 16));
+    CK(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
+    return d;
+}
+
+static int failures = 0, cases = 0, rows_checked = 0;
+static float bench_ms[2][2];
+
+/* One SampleSmallF32 case on `rows` rows of `vocab` logits: radix vs fallback, bit-exact codes. */
+static void small_case(const char* name, const std::vector<float>& logits, unsigned rows, unsigned vocab,
+                       bool bench = false) {
+    const unsigned words = (vocab + 31) / 32;
+    std::vector<float> params(rows * 4);
+    std::vector<unsigned> ctl(rows * 2);
+    std::vector<unsigned long long> seed(rows);
+    std::vector<unsigned> bitmap(rows * words);
+    const unsigned min_step = 2;
+    for (unsigned r = 0; r < rows; r++) {
+        const float temps[] = {0.f, 0.3f, 0.9f, 1.0f, 1.7f};
+        const float tops[] = {1.0f, 0.95f, 0.8f, 0.3f};
+        const unsigned ks[] = {1, 2, 30, 50, 63, 64};
+        params[r * 4 + 0] = temps[rnd() % 5];
+        params[r * 4 + 1] = tops[rnd() % 4];
+        params[r * 4 + 2] = 1.0f + 0.25f * frand();
+        params[r * 4 + 3] = 1.0f + 2.0f * frand();
+        unsigned k = ks[rnd() % 6];
+        /* Every 7th row a CFG guide over (r, r + 1); its follower then skips. */
+        if (r % 7 == 0 && r + 1 < rows) {
+            ctl[2 * r] = k | (1u << 31);
+            ctl[2 * (r + 1)] = k | (1u << 30);
+        } else if (ctl[2 * r] == 0) {
+            ctl[2 * r] = k;
+        }
+        ctl[2 * r + 1] = rnd() % 4; /* steps 0..3: rows below min_step mask the stop class */
+        seed[r] = ((unsigned long long)rnd() << 32) | rnd();
+        for (unsigned w = 0; w < words; w++) bitmap[r * words + w] = (r % 3 == 0) ? (rnd() & rnd()) : 0u;
+    }
+    float* d_logits = dev(logits);
+    float* d_params = dev(params);
+    unsigned* d_ctl = dev(ctl);
+    unsigned long long* d_seed = dev(seed);
+    std::vector<unsigned> outs[2];
+    int* d_used;
+    CK(cudaMalloc(&d_used, 4));
+    int used[2];
+    for (int mode = 0; mode < 2; mode++) {
+        unsigned* d_bitmap = dev(bitmap);
+        std::vector<unsigned> init(rows * 16, 0xdeadbeefu);
+        unsigned* d_out = dev(init);
+        const size_t smem = mode == 0 ? radix_arena(vocab, 4) : row_arena(vocab, 4);
+        CK(cudaFuncSetAttribute(small_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+        SmallArgs a{d_out, d_logits, d_params, d_ctl, d_seed, d_bitmap, rows, vocab, words, min_step};
+        small_kernel<<<132, PLOW_NV_THREADS, smem>>>(a, d_used);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(&used[mode], d_used, 4, cudaMemcpyDeviceToHost));
+        outs[mode].resize(rows * 16);
+        CK(cudaMemcpy(outs[mode].data(), d_out, rows * 16 * 4, cudaMemcpyDeviceToHost));
+        if (bench) {
+            cudaEvent_t e0, e1;
+            CK(cudaEventCreate(&e0));
+            CK(cudaEventCreate(&e1));
+            CK(cudaEventRecord(e0));
+            for (int it = 0; it < 50; it++) small_kernel<<<132, PLOW_NV_THREADS, smem>>>(a, d_used);
+            CK(cudaEventRecord(e1));
+            CK(cudaEventSynchronize(e1));
+            float ms;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            bench_ms[0][mode] = ms / 50;
+        }
+        CK(cudaFree(d_bitmap));
+        CK(cudaFree(d_out));
+    }
+    cases++;
+    rows_checked += rows;
+    int bad = 0;
+    for (unsigned r = 0; r < rows; r++) {
+        if (outs[0][r * 16] != outs[1][r * 16]) {
+            if (bad < 4)
+                printf("  MISMATCH %s row %u: radix %u fallback %u (k %u t %.2f p %.2f)\n", name, r, outs[0][r * 16],
+                       outs[1][r * 16], ctl[2 * r] & 0x3fffffffu, params[r * 4], params[r * 4 + 1]);
+            bad++;
+        }
+    }
+    if (used[0] != 1 || used[1] != 0) {
+        printf("  %s: radix path not exercised as intended (radix run %d, fallback run %d)\n", name, used[0], used[1]);
+        bad++;
+    }
+    printf("%-34s SampleSmallF32 rows %4u vocab %5u : %s\n", name, rows, vocab, bad ? "FAIL" : "ok");
+    failures += bad != 0;
+    CK(cudaFree(d_logits));
+    CK(cudaFree(d_params));
+    CK(cudaFree(d_ctl));
+    CK(cudaFree(d_seed));
+    CK(cudaFree(d_used));
+}
+
+static void fish_case(const char* name, const std::vector<float>& logits, unsigned rows, unsigned vocab,
+                      bool bench = false) {
+    std::vector<__nv_bfloat16> lb(logits.size());
+    for (size_t i = 0; i < logits.size(); i++) lb[i] = __float2bfloat16_rn(logits[i]);
+    std::vector<float> params(rows * 4);
+    std::vector<unsigned> topk(rows), step(rows);
+    std::vector<unsigned long long> seed(rows);
+    const unsigned window = 10;
+    std::vector<unsigned> hist(rows * window);
+    for (unsigned r = 0; r < rows; r++) {
+        const unsigned ks[] = {1, 2, 30, 50, 63, 64};
+        params[r * 4 + 0] = 0.2f + frand();
+        params[r * 4 + 1] = (r & 1) ? 1.0f : 0.7f + 0.3f * frand();
+        params[r * 4 + 2] = 0.2f + frand();
+        params[r * 4 + 3] = 0.9f;
+        topk[r] = ks[rnd() % 6];
+        step[r] = rnd() % 20;
+        seed[r] = ((unsigned long long)rnd() << 32) | rnd();
+        for (unsigned w = 0; w < window; w++) hist[r * window + w] = (rnd() % 3 == 0) ? 1 + rnd() % 40 : 0;
+    }
+    __nv_bfloat16* d_logits = dev(lb);
+    float* d_params = dev(params);
+    unsigned* d_topk = dev(topk);
+    unsigned* d_step = dev(step);
+    unsigned long long* d_seed = dev(seed);
+    std::vector<unsigned> outs[2];
+    int* d_used;
+    CK(cudaMalloc(&d_used, 4));
+    int used[2];
+    for (int mode = 0; mode < 2; mode++) {
+        unsigned* d_hist = dev(hist);
+        std::vector<unsigned> init(rows * 16, 0xdeadbeefu);
+        unsigned* d_out = dev(init);
+        const size_t smem = mode == 0 ? radix_arena(vocab, 2) : row_arena(vocab, 2);
+        CK(cudaFuncSetAttribute(fish_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+        FishArgs a{d_out, d_logits, d_params, d_topk, d_seed, d_step, d_hist, rows, vocab, window, vocab};
+        fish_kernel<<<132, PLOW_NV_THREADS, smem>>>(a, d_used);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(&used[mode], d_used, 4, cudaMemcpyDeviceToHost));
+        outs[mode].resize(rows * 16);
+        CK(cudaMemcpy(outs[mode].data(), d_out, rows * 16 * 4, cudaMemcpyDeviceToHost));
+        if (bench) {
+            cudaEvent_t e0, e1;
+            CK(cudaEventCreate(&e0));
+            CK(cudaEventCreate(&e1));
+            CK(cudaEventRecord(e0));
+            for (int it = 0; it < 50; it++) fish_kernel<<<132, PLOW_NV_THREADS, smem>>>(a, d_used);
+            CK(cudaEventRecord(e1));
+            CK(cudaEventSynchronize(e1));
+            float ms;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            bench_ms[1][mode] = ms / 50;
+        }
+        CK(cudaFree(d_hist));
+        CK(cudaFree(d_out));
+    }
+    cases++;
+    rows_checked += rows;
+    int bad = 0;
+    for (unsigned r = 0; r < rows; r++)
+        if (outs[0][r * 16] != outs[1][r * 16]) {
+            if (bad < 4)
+                printf("  MISMATCH %s row %u: radix %u fallback %u (k %u)\n", name, r, outs[0][r * 16],
+                       outs[1][r * 16], topk[r]);
+            bad++;
+        }
+    if (used[0] != 1 || used[1] != 0) {
+        printf("  %s: radix path not exercised as intended (radix run %d, fallback run %d)\n", name, used[0], used[1]);
+        bad++;
+    }
+    printf("%-34s SampleFishBf16 rows %4u vocab %5u : %s\n", name, rows, vocab, bad ? "FAIL" : "ok");
+    failures += bad != 0;
+    CK(cudaFree(d_logits));
+    CK(cudaFree(d_params));
+    CK(cudaFree(d_topk));
+    CK(cudaFree(d_step));
+    CK(cudaFree(d_seed));
+    CK(cudaFree(d_used));
+}
+
+static std::vector<float> synthetic(unsigned rows, unsigned vocab, int kind) {
+    std::vector<float> v(size_t(rows) * vocab);
+    for (unsigned r = 0; r < rows; r++)
+        for (unsigned i = 0; i < vocab; i++) {
+            float x = 6.0f * frand() - 3.0f;
+            if (kind == 1) x = (float)(rnd() % 5) * 0.5f;              /* heavy ties */
+            if (kind == 2 && (i % 3)) x = -INFINITY;                     /* mostly masked */
+            if (kind == 3 && i >= 20) x = -INFINITY;                     /* fewer finite than top_k */
+            if (kind == 4 && i == r % vocab) x = 40.0f;                  /* one dominant class */
+            if (kind == 5) x = (i & 1) ? -0.0f : 0.0f;                   /* signed zeros */
+            v[size_t(r) * vocab + i] = x;
+        }
+    return v;
+}
+
+static std::vector<float> load(const char* path, unsigned vocab, unsigned* rows) {
+    std::vector<float> v;
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "cannot open %s\n", path);
+        exit(2);
+    }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f) / 4;
+    fseek(f, 0, SEEK_SET);
+    *rows = (unsigned)(n / vocab);
+    v.resize(size_t(*rows) * vocab);
+    if (fread(v.data(), 4, v.size(), f) != v.size()) exit(2);
+    fclose(f);
+    return v;
+}
+
+int main(int argc, char** argv) {
+    bool bench = false;
+    std::vector<const char*> files;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--bench"))
+            bench = true;
+        else
+            files.push_back(argv[i]);
+    }
+    if (files.size() >= 1) {
+        unsigned rows;
+        std::vector<float> d = load(files[0], 2048, &rows);
+        for (int rep = 0; rep < 4; rep++) {
+            small_case("recorded depth logits (2048)", d, rows, 2048, bench && rep == 0);
+            fish_case("recorded depth logits (2048)", d, rows, 2048, bench && rep == 0);
+        }
+    }
+    if (files.size() >= 2) {
+        unsigned rows;
+        std::vector<float> b = load(files[1], 2049, &rows);
+        for (int rep = 0; rep < 8; rep++) small_case("recorded backbone logits (2049)", b, rows, 2049);
+    }
+    const unsigned vocabs[] = {64, 100, 2048, 2049, 3076, 4097, 8192, 16384};
+    for (unsigned vocab : vocabs)
+        for (int kind = 0; kind < 6; kind++) {
+            char name[64];
+            snprintf(name, sizeof name, "synthetic kind %d", kind);
+            const unsigned rows = vocab >= 8192 ? 64 : 256;
+            std::vector<float> v = synthetic(rows, vocab, kind);
+            small_case(name, v, rows, vocab);
+            fish_case(name, v, rows, vocab);
+        }
+    if (bench)
+        printf("bench (recorded depth rows, us/launch): SampleSmallF32 radix %.1f K-round %.1f; SampleFishBf16 radix "
+               "%.1f K-round %.1f\n",
+               bench_ms[0][0] * 1e3, bench_ms[0][1] * 1e3, bench_ms[1][0] * 1e3, bench_ms[1][1] * 1e3);
+    printf("%s: %d cases, %d rows, %d failing\n", failures ? "FAIL" : "PASS", cases, rows_checked, failures);
+    return failures != 0;
+}

@@ -2056,8 +2056,12 @@ pub enum DevOp {
     /// result to BF16; bit 1 applies erf-GELU with BF16 input/output rounding; bit 2 selects
     /// row-major BF16 weights instead of FP32. Precision hints (results stay within FP32
     /// accumulation-order noise): bit 3 asserts A (and FP32 W) hold BF16-representable values,
-    /// allowing BF16 tensor cores; bit 4 allows 3xTF32 tensor cores. `scratch` (optional, the
-    /// NVIDIA split-K workspace) is 1024 zeroed u32 tickets then `blocks` 64x64 f32 partials.
+    /// allowing BF16 tensor cores; bit 4 allows 3xTF32 tensor cores.
+    /// CUDA bit 11 selects continuous BF16 tensor-core FP32 accumulation (K16); bit 12
+    /// selects K8 with bit 11. These hints require bits 2/3, no LayerNorm/reference-row
+    /// prologue, and K divisible by 8. Other backends retain their existing accumulation.
+    /// `scratch` (optional, the NVIDIA split-K workspace) is 1024 zeroed u32 tickets then
+    /// `blocks` 64x64 f32 partials.
     /// Bit 5: LayerNorm prologue, A is read as LayerNormF32 would write it,
     /// `(a - stats[r].0) * stats[r].1 * gamma[k] + beta[k]` (row `r` counted like A, including
     /// `a_row0`; `stats` from RowStatsF32); bit 6 rounds that to bf16 (LayerNormF32 flag bit 0).
@@ -2231,6 +2235,11 @@ pub enum DevOp {
     /// activation (codes [`ACT_TANH`]..[`ACT_RELU`], 13 and 14 invalid here; `f0` is the
     /// leaky-ReLU slope, `alpha[channel]` the snake alpha of the channel it is applied to),
     /// bit 12 FP16 weights, bit 13 allows 3xTF32 tensor cores (FP32-accurate) for the GEMM form.
+    /// CUDA bits 14/17/18 allow wide BF16-split WGMMA and its appended split-weight image.
+    /// With bit 15 clear (channel-major weights), kernel > 1, groups/stride = 1, zero padding,
+    /// input channels divisible by 64, no activations/alpha and no split-K (bit 20), the image
+    /// orders K by channel tile 64, tap, channel within tile. The raw FP32 prefix retains
+    /// `[out_channels,in_channels,kernel]`; other implementations read that prefix.
     /// Optional `row_scale` f32 `[batch][out_rows]` scales each row after the output activation,
     /// before the residual: `out = residual + row_scale[b][t] * post(bias + conv)`.
     /// `t0=out(f32[batch,out_rows,out_channels]) t1=x(f32[batch,in_rows,in_channels])

@@ -719,6 +719,19 @@
             '';
           });
         }
+        // {
+          speech-eval =
+            let
+              scoringPython = pkgs.python3.withPackages (ps: [ ps.jiwer ps.zhon ]);
+            in
+            self.devShells.${system}.default.overrideAttrs (old: {
+              name = "plow-speech-eval";
+              # Keep the reference interpreter and its vendor-library loader.
+              shellHook = old.shellHook + ''
+                export PYTHONPATH="${scoringPython}/${pkgs.python3.sitePackages}''${PYTHONPATH:+:$PYTHONPATH}"
+              '';
+            });
+        }
         # Weight quantization: everywhere except legacy x86_64-darwin, where
         # nixpkgs' torch/arrow stack is marked broken and even *evaluating* the
         # shell fails `nix flake check --all-systems`.

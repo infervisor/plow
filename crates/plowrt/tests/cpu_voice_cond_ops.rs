@@ -7,7 +7,7 @@
 
 use std::ffi::c_void;
 
-use packet::dev::{DevOp, ACT_LOG, TENSOR_NONE16};
+use packet::dev::{DevOp, ACT_LOG, ACT_ROUND_BF16, TENSOR_NONE16};
 use plowrt::exec::cpu::ffi::{self, DevInst64, Isa, PlowCpuCtx};
 
 fn op(op: DevOp, t: &[u16], i: &[u32]) -> DevInst64 {
@@ -80,6 +80,71 @@ fn unary_log_window() {
                     "[{r}][{c}] {} vs {want}",
                     out[i]
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn unary_bf16_rounding_ties_special_values_and_windows() {
+    let cases: &[(u32, u32)] = &[
+        (0x3f80_8000, 0x3f80_0000),
+        (0x3f81_8000, 0x3f82_0000),
+        (0xbf80_8000, 0xbf80_0000),
+        (0xbf81_8000, 0xbf82_0000),
+        (0x0000_8000, 0),
+        (0x0001_8000, 0x0002_0000),
+        (0x8000_8000, 0x8000_0000),
+        (0x8001_8000, 0x8002_0000),
+        (0x7f7f_8000, 0x7f80_0000),
+        (0xff7f_8000, 0xff80_0000),
+        (0x7f80_0000, 0x7f80_0000),
+        (0xff80_0000, 0xff80_0000),
+        (0, 0),
+        (0x8000_0000, 0x8000_0000),
+        (0x7f80_0001, 0x7fc0_0000),
+        (0xff80_0001, 0xffc0_0000),
+    ];
+    let (rows, width, col0) = (2, cases.len(), 1);
+    let stride = width + 3;
+    for inplace in [false, true] {
+        let mut input = vec![9.0f32; rows * stride];
+        for r in 0..rows {
+            for (c, &(bits, _)) in cases.iter().enumerate() {
+                input[r * stride + col0 + c] = f32::from_bits(bits);
+            }
+        }
+        let mut output = vec![-7.0f32; rows * stride];
+        let d = op(
+            DevOp::UnaryF32,
+            &[0, if inplace { 0 } else { 1 }],
+            &[
+                rows as u32,
+                width as u32,
+                ACT_ROUND_BF16,
+                stride as u32,
+                col0 as u32,
+            ],
+        );
+        if inplace {
+            run(&d, &[ptr(&mut input)]);
+        } else {
+            run(&d, &[ptr(&mut output), ptr(&mut input)]);
+        }
+        let actual = if inplace { &input } else { &output };
+        for r in 0..rows {
+            for c in 0..stride {
+                let value = actual[r * stride + c];
+                if c < col0 || c >= col0 + width {
+                    assert_eq!(value, if inplace { 9.0 } else { -7.0 });
+                } else {
+                    let want = cases[c - col0].1;
+                    if f32::from_bits(want).is_nan() {
+                        assert!(value.is_nan());
+                    } else {
+                        assert_eq!(value.to_bits(), want, "row{r} col{c} inplace{inplace}");
+                    }
+                }
             }
         }
     }
