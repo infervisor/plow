@@ -224,8 +224,12 @@ in µs.
   (771.3 TF/s) and 3094 GB/s; the floor is compute-bound at every class.
 - 22 of 24 configs pass the 1e-5 rel-L2 bound at every class; `bm16 bn32 threads256` does not
   build (TileLang warp-partition assertion).
-- No config of this body comes within 2.7x of the hand-written kernel, so there is no schedule
-  to port from it. The block stays at 9-13% of its floor.
+- With `TL_TF=1` (tfloat32 shared operands, so the products run on tensor cores; second job,
+  classes b64_q136 and b128_q72) the best config is `bm64 bn32 threads256 stages2` at 535.0 /
+  579.0 µs against 268.6 / 238.4 µs, rel-L2 3.2e-6 / 2.7e-6: still 2.0-2.4x slower.
+- No config of this body comes within 2x of the hand-written kernel, so there is no schedule
+  to port from it. The block stays at 9-13% of its floor. `TL_WG` (wgmma) and a Triton body
+  were not run.
 
 ## AMD
 
