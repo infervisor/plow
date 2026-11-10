@@ -412,15 +412,15 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
 struct GemvView {
     unsigned p, xs, xo, cs, co, rs, ro;
     __device__ __forceinline__ size_t xrow(unsigned m, unsigned K) const {
-        const unsigned it = m / p, r = m - it * p;
+        const unsigned it = m < p ? 0u : m / p, r = m - it * p;
         return (size_t)it * xs + xo + (size_t)r * K;
     }
     __device__ __forceinline__ size_t crow(unsigned m, unsigned N) const {
-        const unsigned it = m / p, r = m - it * p;
+        const unsigned it = m < p ? 0u : m / p, r = m - it * p;
         return (size_t)it * cs + co + (size_t)r * N;
     }
     __device__ __forceinline__ size_t rrow(unsigned m, unsigned N) const {
-        const unsigned it = m / p, r = m - it * p;
+        const unsigned it = m < p ? 0u : m / p, r = m - it * p;
         return (size_t)it * rs + ro + (size_t)r * N;
     }
 };
@@ -618,6 +618,140 @@ static __device__ __forceinline__ void mma_16816(float* d, const unsigned* a, un
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+/* Small-M arm of gemv_f16w_mma (M <= 8 * NT rows, round_up(M, 8) * K <= MMA_SMALL_X halves, K % 256 == 0):
+ * every x row is staged once (LN applied, f16), and a warp streams its K pieces over the whole K with
+ * up to three pieces of W in flight instead of one piece per 256-wide chunk behind a block barrier.
+ * The piece -> warp chain and the cross-warp reduction are those of the chunked arm (piece p of 64
+ * belongs to warp my_ks iff p % min(ks, 4) == my_ks, pieces in increasing order), so the result is
+ * bit-identical to it. Arena: MMA_SMALL_X halves of x, 128 floats of statistics, 8 x 32 x 4 NT floats
+ * of partials. */
+#define MMA_SMALL_X 24576u
+template <unsigned NT>
+static __device__ void gemv_f16w_mma_small(float* C, const float* __restrict__ x,
+                                           const unsigned short* __restrict__ W, const float* bias,
+                                           unsigned bgroup, const float* res, const float* gamma,
+                                           const float* beta, float eps, unsigned act, unsigned M, unsigned N,
+                                           unsigned K, unsigned t0, unsigned tiles, unsigned ks, float* arena,
+                                           const GemvView& vw) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned g = lane >> 2, t = lane & 3u;
+    const unsigned my_tile = warp / ks, my_ks = warp % ks;
+    const unsigned step = min(ks, 4u);
+    const bool active = my_tile < tiles, compute = active && my_ks < step;
+    __half* xs = (__half*)arena;
+    float* st = arena + MMA_SMALL_X / 2u;
+    float* red = st + 2u * MMA_ROWS;
+    const unsigned na = (t0 + my_tile) * 16u + g, nb = na + 8u;
+    __syncthreads();
+    if (gamma) {
+        for (unsigned r = warp; r < M; r += PLOW_NV_WARPS) {
+            const float* xr = x + vw.xrow(r, K);
+            float s = 0.f;
+            for (unsigned k = lane; k < K; k += 32u) s += xr[k];
+            const float mean = warp_sum32(s) / (float)K;
+            float v = 0.f;
+            for (unsigned k = lane; k < K; k += 32u) {
+                const float d = xr[k] - mean;
+                v = __fmaf_rn(d, d, v);
+            }
+            const float var = warp_sum32(v) / (float)K;
+            if (lane == 0) {
+                st[2 * r] = mean;
+                st[2 * r + 1] = rsqrtf(var + eps);
+            }
+        }
+        __syncthreads();
+    }
+    for (unsigned r = 0; r < NT * 8u; r++) {
+        const float* xr = r < M ? x + vw.xrow(r, K) : nullptr;
+        for (unsigned k = threadIdx.x; k < K; k += PLOW_NV_THREADS) {
+            float v = 0.f;
+            if (xr) {
+                v = xr[k];
+                if (gamma) v = __fmaf_rn((v - st[2 * r]) * st[2 * r + 1], gamma[k], beta[k]);
+            }
+            xs[r * K + k] = __float2half_rn(v);
+        }
+    }
+    __syncthreads();
+    float acc[NT][4];
+#pragma unroll
+    for (unsigned j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    if (compute) {
+        const unsigned npieces = K / 64u;
+        for (unsigned p0 = my_ks; p0 < npieces; p0 += 3u * step) {
+            uint4 w[3][4];
+#pragma unroll
+            for (unsigned q = 0; q < 3u; q++) {
+                const unsigned p = p0 + q * step;
+                const unsigned k0 = p * 64u + 16u * t;
+                if (p < npieces && na < N) {
+                    w[q][0] = *(const uint4*)(W + (size_t)na * K + k0);
+                    w[q][1] = *(const uint4*)(W + (size_t)na * K + k0 + 8u);
+                } else {
+                    w[q][0] = w[q][1] = make_uint4(0u, 0u, 0u, 0u);
+                }
+                if (p < npieces && nb < N) {
+                    w[q][2] = *(const uint4*)(W + (size_t)nb * K + k0);
+                    w[q][3] = *(const uint4*)(W + (size_t)nb * K + k0 + 8u);
+                } else {
+                    w[q][2] = w[q][3] = make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+#pragma unroll
+            for (unsigned q = 0; q < 3u; q++) {
+                const unsigned p = p0 + q * step;
+                if (p >= npieces) break;
+                const unsigned* pa = (const unsigned*)&w[q][0];
+                const unsigned* pb = (const unsigned*)&w[q][2];
+#pragma unroll
+                for (unsigned s = 0; s < 4u; s++) {
+                    const unsigned a[4] = {pa[2 * s], pb[2 * s], pa[2 * s + 1], pb[2 * s + 1]};
+#pragma unroll
+                    for (unsigned j = 0; j < NT; j++) {
+                        const unsigned* xr = (const unsigned*)(xs + (j * 8u + g) * K + p * 64u + 16u * t + 4u * s);
+                        mma_16816(acc[j], a, xr[0], xr[1]);
+                    }
+                }
+            }
+        }
+    }
+    if (ks > 1u) {
+        __syncthreads();
+        if (active && my_ks) {
+#pragma unroll
+            for (unsigned j = 0; j < NT; j++)
+#pragma unroll
+                for (unsigned c = 0; c < 4u; c++) red[(warp * 32u + lane) * (4u * NT) + j * 4u + c] = acc[j][c];
+        }
+        __syncthreads();
+        if (active && !my_ks) {
+            for (unsigned q = 1; q < ks; q++)
+#pragma unroll
+                for (unsigned j = 0; j < NT; j++)
+#pragma unroll
+                    for (unsigned c = 0; c < 4u; c++)
+                        acc[j][c] += red[((warp + q) * 32u + lane) * (4u * NT) + j * 4u + c];
+        }
+    }
+    if (active && !my_ks) {
+#pragma unroll
+        for (unsigned j = 0; j < NT; j++) {
+#pragma unroll
+            for (unsigned c = 0; c < 4u; c++) {
+                const unsigned m = j * 8u + 2u * t + (c & 1u), n = (c < 2u) ? na : nb;
+                if (m >= M || n >= N) continue;
+                float v = acc[j][c];
+                if (bias) v = __fadd_rn(v, bias[(bgroup ? m / bgroup * N : 0u) + n]);
+                if (res) v = __fadd_rn(v, res[vw.rrow(m, N) + n]);
+                if (act == 1u) v = 0.5f * v * (1.f + erff(v * 0.70710678118654752f));
+                C[vw.crow(m, N) + n] = v;
+            }
+        }
+    }
+}
+
 static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, const unsigned short* __restrict__ W,
                                      const float* bias, unsigned bgroup, const float* res, const float* gamma,
                                      const float* beta, float eps, unsigned act, unsigned M, unsigned N, unsigned K,
@@ -632,6 +766,15 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
     if (!tiles) return;
     unsigned ks = max(1u, PLOW_NV_WARPS / tiles);
     ks = min(ks, K / 64u);
+    if (M && M <= 24u && K % 256u == 0u && (size_t)((M + 7u) / 8u) * 8u * K <= MMA_SMALL_X) {
+        if (M <= 8u)
+            gemv_f16w_mma_small<1>(C, x, W, bias, bgroup, res, gamma, beta, eps, act, M, N, K, t0, tiles, ks, arena, vw);
+        else if (M <= 16u)
+            gemv_f16w_mma_small<2>(C, x, W, bias, bgroup, res, gamma, beta, eps, act, M, N, K, t0, tiles, ks, arena, vw);
+        else
+            gemv_f16w_mma_small<3>(C, x, W, bias, bgroup, res, gamma, beta, eps, act, M, N, K, t0, tiles, ks, arena, vw);
+        return;
+    }
     const unsigned my_tile = warp / ks, my_ks = warp % ks;
     const bool active = my_tile < tiles;
     __half* xs = (__half*)arena;
@@ -665,14 +808,16 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
         for (unsigned kt = 0; kt < K; kt += MMA_KT) {
             const unsigned kw = min(MMA_KT, K - kt);
             __syncthreads();
-            for (unsigned i = threadIdx.x; i < nt8 * 8u * kw; i += PLOW_NV_THREADS) {
-                const unsigned r = i / kw, k = i % kw;
-                float v = 0.f;
-                if (r < mr) {
-                    v = x[vw.xrow(mc + r, K) + kt + k];
-                    if (gamma) v = __fmaf_rn((v - st[2 * r]) * st[2 * r + 1], gamma[kt + k], beta[kt + k]);
+            for (unsigned r = 0; r < nt8 * 8u; r++) {
+                const float* xr = r < mr ? x + vw.xrow(mc + r, K) + kt : nullptr;
+                for (unsigned k = threadIdx.x; k < kw; k += PLOW_NV_THREADS) {
+                    float v = 0.f;
+                    if (xr) {
+                        v = xr[k];
+                        if (gamma) v = __fmaf_rn((v - st[2 * r]) * st[2 * r + 1], gamma[kt + k], beta[kt + k]);
+                    }
+                    xs[r * MMA_KT + k] = __float2half_rn(v);
                 }
-                xs[r * MMA_KT + k] = __float2half_rn(v);
             }
             __syncthreads();
             if (!active) continue;
