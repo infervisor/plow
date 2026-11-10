@@ -1,16 +1,23 @@
 """gen_search block spec: Maya 2 DepthV2 projections (GemvF32Out mma arm: f16 W [N][K], x rounded
-to f16, f32 accumulate) at the depth stage's shapes: qkv / f1 (N 3072, K 1024), f2 (N 1024,
-K 3072), o (1024 x 1024), head (N 2048, K 1024). Row classes: m1 = one stream's cached level,
-m8 / m32 = 8 / 32 streams, m832 = a full level (26 prefix rows) at 32 streams. Generated bodies:
-gemm_f16.py (TileLang), gemm_f16_triton.py (Triton). Current kernel: recorded in-model per-op time (packet_bench --sweep of the standalone
-depth program, RC9 speech object, H100); the generated number is a standalone launch, so the
-comparison is a reference for the schedule, not an in-model gain.
+to f16, f32 accumulate) at the depth stage's shapes: qkv (N 3072, K 1024, LayerNorm prologue), f2
+(N 1024, K 3072, bias + residual), o (1024 x 1024, residual), head (N 2048, K 1024, LayerNorm).
+Row classes: m1 = one stream's cached level, m8 / m32 = 8 / 32 streams, m832 = a full level (26
+prefix rows) at 32 streams. Generated bodies: gemm_f16.py (TileLang), gemm_f16_triton.py (Triton).
+
+Current kernel: the standalone probe depth_gemv.cu, which launches the interpreter's own arm
+(d_gemv_f32out_mode) with the flags and block count maya2_depth.rs emits for that projection, in
+the same lease and on the same cold weight sets as the generators. The arm does more than the
+generated GEMM: it reads f32 x, standardizes it (LayerNorm flag) and rounds it to f16, and adds a
+bias / residual (zeros here, so the result is the plain product). The generators get the already
+standardized f16 x. `IN_MODEL_US` keeps the in-situ per-op times for reference.
 """
 
+# flags i[7] and blocks as emitted (packet_bench --sweep of the production depth program)
+EMIT = {"qkv": (1283, 132), "f2": (1039, 128), "o": (1035, 128), "head": (1283, 132)}
 SHAPES = {"qkv": (3072, 1024), "f2": (1024, 3072), "o": (1024, 1024), "head": (2048, 1024)}
 # B=1 frame: 16.73 ms; qkv + f1 share the shape (4 layers x 20 cached levels x 2), f2 and o 80, head 31.
 STEP_B1 = {"qkv": 160, "f2": 80, "o": 80, "head": 31}
-CURRENT_US = {"qkv_m1": 15.1, "f2_m1": 28.6, "o_m1": 12.7, "head_m1": 18.2, "qkv_m8": 20.7, "f2_m8": 43.4}
+IN_MODEL_US = {"qkv_m1": 15.1, "f2_m1": 28.6, "o_m1": 12.7, "head_m1": 18.2, "qkv_m8": 20.7, "f2_m8": 43.4}
 
 
 def _classes():
@@ -34,13 +41,37 @@ def _cost(c):
 def _inputs(c, seed):
     import torch
     g = torch.Generator(device="cuda").manual_seed(seed)
-    x = torch.randn(c["M"], c["K"], device="cuda", generator=g).half()
+    x32 = torch.randn(c["M"], c["K"], device="cuda", generator=g)
+    if EMIT[c["shape"]][0] & 256:
+        # what the arm's LayerNorm prologue (gamma 1, beta 0) feeds the product
+        xn = (x32 - x32.mean(1, keepdim=True)) * torch.rsqrt(x32.var(1, unbiased=False, keepdim=True) + 1e-5)
+    else:
+        x32 = x32.half().float()
+        xn = x32
     w = (torch.randn(c["N"], c["K"], device="cuda", generator=g) * 0.05).half()
-    return {"x": x, "w": w}
+    return {"x": xn.half(), "w": w, "x32": x32}
 
 
 def _reference(c, inp):
     return inp["x"].double() @ inp["w"].double().T
+
+
+def _cur_bind(lib, c, inp, out):
+    import ctypes
+    import torch
+    flags, nblk = EMIT[c["shape"]]
+    lib.dg_make.restype = ctypes.c_void_p
+    lib.dg_make.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_uint] * 4
+    lib.dg_run.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    zeros = torch.zeros(max(c["M"] * c["N"], c["K"]), device="cuda")
+    ones = torch.ones(c["K"], device="cuda")
+    h = lib.dg_make(out.data_ptr(), inp["x32"].data_ptr(), inp["w"].data_ptr(), zeros.data_ptr(), zeros.data_ptr(),
+                    ones.data_ptr(), zeros.data_ptr(), flags, c["M"], c["N"], c["K"])
+
+    def call(keep=(zeros, ones, inp)):
+        rc = lib.dg_run(h, nblk, torch.cuda.current_stream().cuda_stream)
+        assert rc == 0, f"dg_run rc {rc}"
+    return call
 
 
 def _tl_build(cfg, c):
@@ -72,7 +103,8 @@ SPEC = {
     "rotate": ["w"],
     "out": lambda c: ((c["M"], c["N"]), "float32"),
     "reference": _reference,
-    "tol": {"rel_l2": 1e-5},
+    # the arm standardizes in f32 with its own summation order: an x element can land one f16 ulp off
+    "tol": {"rel_l2": 2e-4},
     "generators": {
         "tilelang": {
             "grid": {"bm": [16, 32, 64, 128], "bn": [64, 128], "bk": [32, 64], "threads": [128, 256],
@@ -91,8 +123,9 @@ SPEC = {
         },
     },
     "current": {
-        "label": "gemv_f16w_mma in the persistent interpreter (per-op delta of packet_bench --sweep)",
-        "measured_us": CURRENT_US,
-        "source": "tts-perf/tp-maya2-depth/baseline/sweep.b1.jsonl (lease tp-maya2-depth-baseline, RC9 speech object)",
+        "label": "d_gemv_f32out_mode / gemv_f16w_mma as emitted (depth_gemv.cu, emitted flags and blocks)",
+        "lib": {"src": "scripts/gen_kernels/depth_gemv.cu",
+                "flags": ["-arch=sm_90a", "-O3", "-I", "runtime/common", "-I", "runtime/nvidia"]},
+        "bind": _cur_bind,
     },
 }
