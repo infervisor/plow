@@ -26,7 +26,7 @@ SPEC = {
     "tol": {"rel_l2": 1e-4},
     "generators": cc.conv_generators(
         {"bm": [128], "bn": [96, 128], "bk": [32], "threads": [256], "stages": [2]},
-        {"bm": [128], "bn": [64, 128], "bk": [32], "warps": [4], "stages": [3]}),
+        {"prec": ["tf32x3", "tf32"], "bm": [64, 128], "bn": [64, 128], "bk": [32], "warps": [4], "stages": [3]}),
     "current": {
         "label": "UnaryF32 SnakeBeta + conv tile (+ UnaryF32), packet_bench --sweep per unit",
         "measured_us": {n: c["us"] for n, c in CLASSES.items()},
