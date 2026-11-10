@@ -5696,6 +5696,9 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
         const unsigned b = item / runs, u0 = (item % runs) * 8u, u = u0 + warp;
         const bool live = u < tiles;
         const unsigned h0 = u0 / n16, nh = min(u0 + 7u, tiles - 1u) / n16 - h0 + 1u;
+        /* A run spans at most HS heads only when n16 >= 8 / HS (devgen: q_rows > 112 for HS 2);
+         * the stage carve below is sized for HS. Block-uniform (nh is a function of the item). */
+        if (nh > (unsigned)HS) __trap();
         const unsigned h = live ? u / n16 : h0, q0 = live ? (u % n16) * 16u : 0u;
         const unsigned pre = prows ? min(prows[b], pstride) : pstride;
         auto visible = [&](unsigned hh) {
