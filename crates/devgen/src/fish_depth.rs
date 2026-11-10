@@ -754,6 +754,7 @@ pub(crate) fn sections(
         },
         pair_cfg: t.d.breeze,
         depth_sampling: None,
+        planned_rows: false,
         slot_memory: Vec::new(),
         packed: Some(manifest::PackedDepth {
             version: 1,

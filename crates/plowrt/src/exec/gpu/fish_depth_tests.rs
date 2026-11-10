@@ -1495,3 +1495,60 @@ fn speech_mixed_batch_preserves_logits_at_serving_concurrencies() {
         "ordinary vs packed decode KL >= 1e-3: {discrepancies:?}"
     );
 }
+
+#[test]
+fn auto_plans_only_packets_emitted_for_planned_rows() {
+    use crate::sched::row_plan::{Mode, RowPlan};
+    assert_eq!(plan_mode(Mode::Auto, true, true), Mode::Auto);
+    assert_eq!(plan_mode(Mode::Auto, true, false), Mode::Cover);
+    assert_eq!(plan_mode(Mode::Auto, false, true), Mode::Cover);
+    assert_eq!(plan_mode(Mode::Cover, true, true), Mode::Cover);
+    assert_eq!(
+        plan_mode(Mode::Only(vec![16, 4]), true, false),
+        Mode::Only(vec![16, 4])
+    );
+    assert_eq!(plan_mode(Mode::Only(vec![16, 4]), false, true), Mode::Cover);
+    // An earlier packet's ladder, with costs under which 16 + 4 is cheaper than 32.
+    let ladder = [1, 2, 4, 8, 16, 32];
+    let costs = [1_000.0, 1_100.0, 1_200.0, 1_500.0, 2_000.0, 9_000.0];
+    let plan_20 = |planned: bool| {
+        let mut plan = RowPlan::new(&ladder, 32, &plan_mode(Mode::Auto, true, planned));
+        for (p, us) in costs.iter().enumerate() {
+            plan.observe(p as u16, *us);
+        }
+        let dynamic = plan.dynamic();
+        let windows = if dynamic {
+            plan.plan(20)
+        } else {
+            plan.single(20)
+        };
+        (
+            dynamic,
+            windows
+                .iter()
+                .map(|w| ladder[usize::from(w.program)])
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(plan_20(false), (false, vec![32]));
+    assert_eq!(plan_20(true), (true, vec![16, 4]));
+}
+
+#[test]
+fn launch_times_correct_a_split_plan_that_was_measured_too_cheap() {
+    use crate::sched::row_plan::{Mode, RowPlan};
+    let mut plan = RowPlan::new(&[16, 32], 32, &Mode::Auto);
+    plan.observe(0, 4_000.0);
+    plan.observe(1, 10_000.0);
+    assert_eq!(plan.plan(32).len(), 2, "16 + 16 looks cheaper than 32");
+    // The split really takes 17 ms, the single program 10 ms.
+    let mut launches = 0;
+    while plan.plan(32).len() == 2 {
+        observe_plan(&mut plan, 17_000.0);
+        launches += 1;
+        assert!(launches < 20, "the split plan never corrected");
+    }
+    assert_eq!(plan.plan(32).len(), 1);
+    observe_plan(&mut plan, 10_000.0);
+    assert_eq!(plan.cost_us(1), 10_000.0);
+}
