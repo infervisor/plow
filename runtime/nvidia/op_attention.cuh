@@ -2359,6 +2359,12 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
                                     const FaNrf* __restrict__ nrf = nullptr) {
     constexpr bool RG = PLOW_NV_FA_RG && (D == 128 || (PLOW_NV_FA_RG_WIDE && (D == 256 || D == 512))) &&
                         GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
+    /* The RG fold's [NGRP][D] + 2 * NGRP floats (fa_decode_rg_item: NGRP = warps * 32 / lanes
+     * per row) must fit the op's arena claim; hd512 GF2 wide RG needs 4112 of a 3088 claim. The
+     * FP8 twin guards this at its call site. */
+    static_assert(!RG || PLOW_NV_WARPS * (32u / (D / (8u * (D > 256 ? D / 256 : 1)))) * (D + 2u) <=
+                             (unsigned)FA_DEC_SMEM_FLOATS(D, GF),
+                  "row-group fold scratch exceeds the flash-decode arena claim for this (D, GF)");
     if constexpr (!RG) {
         if (out) __trap(); /* a merge-folded packet needs the row-group body */
         if constexpr (NRF) __trap();

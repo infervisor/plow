@@ -1150,7 +1150,7 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #define PLOW_NV_ARENA_FLOATS1                                                                 \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
 #define PLOW_NV_ARENA_FLOATS                                                                  \
-    (PLOW_NV_ARENA_FLOATS1 > SP_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS1 : SP_ARENA_FLOATS)
+    (PLOW_NV_ARENA_FLOATS1 > SP_LAUNCH_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS1 : SP_LAUNCH_ARENA_FLOATS)
 #else
 #define PLOW_NV_ARENA_FLOATS                                                                  \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
@@ -1280,13 +1280,25 @@ extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_O
  * pairing hash, so the loader checks every sidecar's speech ops against it before launching.
  * Absent on an all-arms object (unconstrained), like the pairing stamp. */
 #if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
-/* Speech-op semantics beyond the op set (packet_exec::speech_features): bit 0 = conv flag bit 21
- * (ragged wgmma tiles). A packet relying on a bit is refused by an object without it. */
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 1u;
+/* Speech-op semantics beyond the op set (packet_exec::speech_features): bit 1 = conv flag bit 3
+ * (ragged wgmma tiles; bit 0 is retired), bit 2 = conv flag bit 30 (split-image input,
+ * PLOW_SPEECH_SPLIT_A). A packet relying on a bit is refused by an object without it. */
+#if defined(PLOW_SPEECH_SPLIT_A) && PLOW_SPEECH_SPLIT_A
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u | 4u;
+#else
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u;
+#endif
 #endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SPEECH_OPS >> 32);
+#endif
+/* Speech-object capabilities behind instruction flag bits (the op mask cannot see a flag): the
+ * loader derives the required set from each program's instructions and refuses an object without
+ * them (symbol absent = none). bit 0: GemvF32Out row view (flag bit 12, descriptor in t7);
+ * bit 1: AttentionF32 query view (flag bit 6). */
+#if PLOW_NV_SPEECH
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 3u;
 #endif
 #if PLOW_PACKET_HASH != 0ull
 extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_lo) =
@@ -2168,7 +2180,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                (in->i[7] & 8u) ? (const float*)TEN(4) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(5) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(6) : nullptr, in->fj[0].f, in->i[7],
-                               in->i[3], in->i[0], in->i[1], in->i[2], slice, nblk, arena);
+                               in->i[3], in->i[0], in->i[1], in->i[2], slice, nblk, arena,
+                               (in->i[7] & 4096u) ? (const unsigned*)TEN(7) : nullptr);
 #else
             __trap();
 #endif

@@ -627,7 +627,7 @@ pub(crate) struct Conv {
     /// weights): its input activation runs as its own pass and a dual alpha `{unit}.a12` splits
     /// into that pass's `{unit}.a1` and the conv's output `{unit}.a2`.
     pub(crate) taps_wgmma: bool,
-    /// Wgmma tiles may span taps / transposed-conv phases at widths % 4 (flag bit 21).
+    /// Wgmma tiles may span taps / transposed-conv phases at widths % 4 (flag bit 3).
     pub(crate) wgmma_ragged: bool,
 }
 
@@ -669,14 +669,15 @@ pub(crate) fn fused_conv(
         None => (c.alpha.clone(), None),
     };
     let dual = dual && !taps;
-    // SnakeBeta (two parameter arrays) only runs as its own unary pass.
+    // An input SnakeBeta (two parameter arrays) only runs as its own unary pass.
     let fuse_in = act_in
         && c.act_in != Activation::SnakeBeta
         && !ct
         && !taps
         && (dual || fuse.input_act(&c.weight, c.kernel, true));
+    // A SnakeBeta output fuses only with its own [a | r] tensor (the taps unit's `a2`).
     let fuse_out = c.act_out != Activation::None
-        && c.act_out != Activation::SnakeBeta
+        && (c.act_out != Activation::SnakeBeta || out_alpha.is_some())
         && (dual || taps || fuse.output_act(&c.weight, true));
     let fuse_res =
         c.residual.is_some() && (c.row_scale.is_some() || fuse.residual(&c.weight, true));
@@ -760,7 +761,10 @@ pub(crate) fn fused_conv(
         wgmma: splits.is_some(),
         weight_split: split,
         dual_alpha: dual,
+        pinned: true,
         wgmma_ragged: c.wgmma_ragged && (ct || taps),
+        input_split: false,
+        output_split: false,
     };
     let e = match c.row_scale {
         Some((scale, _)) => p.conv1d_f32_row_scaled(x, &deps, stage, scale)?,
@@ -998,7 +1002,11 @@ mod tests {
         assert_eq!((snake.t[0], snake.t[1]), (x, x));
         assert_eq!(ct.t[1], x);
         assert_eq!(ct.t[4], packet::dev::TENSOR_NONE);
-        assert_eq!(ct.j[1], 1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18);
+        // Pinned (bit 21); bit 23 is the tile width the class policy picks for these rows.
+        assert_eq!(
+            ct.j[1] & !(1 << 23),
+            1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18 | 1 << 21
+        );
         assert_eq!(
             prefix.model.tensors[ct.t[2] as usize].bytes,
             crate::pipeline::wgmma_weight_split(&vec![0u8; 512 * 1024 * 16 * 4], 8 * 512, 2 * 1024)
@@ -1104,8 +1112,8 @@ mod tests {
             "w.dec.blk0.ru0.a2"
         );
         assert_eq!(
-            conv.j[1],
-            packet::dev::ACT_SNAKE << 8 | 1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18
+            conv.j[1] & !(1 << 23),
+            packet::dev::ACT_SNAKE << 8 | 1 << 13 | 1 << 14 | 1 << 15 | 1 << 17 | 1 << 18 | 1 << 21
         );
     }
 }

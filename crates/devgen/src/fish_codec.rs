@@ -277,14 +277,25 @@ pub fn lower_fish_dac(
         let Some(name) = tensor.name.strip_prefix("w.") else {
             continue;
         };
-        let (dtype, mut bytes) = match name.strip_suffix(".a12") {
-            Some(unit) => {
+        let rep_stride = name.strip_suffix(".b_rep").and_then(|base| {
+            cfg.ups
+                .iter()
+                .enumerate()
+                .find(|(u, _)| base == format!("up{u}.convt"))
+                .map(|(_, &(stride, _))| (base, stride))
+        });
+        let (dtype, mut bytes) = match (name.strip_suffix(".a12"), rep_stride) {
+            (Some(unit), _) => {
                 let (d1, mut a) = reader.read(&format!("{unit}.a1"))?;
                 let (_, b) = reader.read(&format!("{unit}.a2"))?;
                 a.extend_from_slice(&b);
                 (d1, a)
             }
-            None => reader.read(name)?,
+            (None, Some((base, stride))) => {
+                let (d, b) = reader.read(&format!("{base}.b"))?;
+                (d, b.repeat(stride as usize))
+            }
+            (None, None) => reader.read(name)?,
         };
         // Every ConvT whose Conv takes phase-major weights (`codec::phase_major`): the decoder
         // blocks' upsamplers and the post-transformer ConvNeXt upsamplers (kernel = stride).
@@ -500,15 +511,43 @@ impl Seq {
         w: &str,
         b: Option<&str>,
     ) -> Result<u32, String> {
-        self.dense_with_math(
+        self.dense_with(
             splits,
             x,
-            out,
+            TensorRef::Named(out),
+            None,
             rows,
             k,
             n,
             w,
             b,
+            crate::pipeline::Conv1dMath::Tf32x3,
+        )
+    }
+
+    /// `res += x @ w^T` in place through the conv's residual epilogue: the same bits as the dense
+    /// into a scratch followed by a BinaryF32 add (`__fadd_rn(y, res)` with y the stored value),
+    /// one op and one tensor pass fewer.
+    pub(crate) fn dense_res(
+        &mut self,
+        splits: Splits<'_>,
+        x: u32,
+        res: u32,
+        rows: u32,
+        k: u32,
+        n: u32,
+        w: &str,
+    ) -> Result<u32, String> {
+        self.dense_with(
+            splits,
+            x,
+            TensorRef::Handle(res),
+            Some(res),
+            rows,
+            k,
+            n,
+            w,
+            None,
             crate::pipeline::Conv1dMath::Tf32x3,
         )
     }
@@ -519,6 +558,34 @@ impl Seq {
         splits: Splits<'_>,
         x: u32,
         out: &str,
+        rows: u32,
+        k: u32,
+        n: u32,
+        w: &str,
+        b: Option<&str>,
+        math: crate::pipeline::Conv1dMath,
+    ) -> Result<u32, String> {
+        self.dense_with(
+            splits,
+            x,
+            TensorRef::Named(out),
+            None,
+            rows,
+            k,
+            n,
+            w,
+            b,
+            math,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dense_with(
+        &mut self,
+        splits: Splits<'_>,
+        x: u32,
+        output: TensorRef<'_>,
+        residual: Option<u32>,
         rows: u32,
         k: u32,
         n: u32,
@@ -540,11 +607,11 @@ impl Seq {
             false,
             &[dep],
             Conv1dF32Stage {
-                output: TensorRef::Named(out),
+                output,
                 weight: TensorRef::Named(w),
                 bias: b.map(TensorRef::Named),
                 alpha: None,
-                residual: None,
+                residual,
                 lengths: None,
                 batch: 1,
                 in_rows: rows,
@@ -566,7 +633,10 @@ impl Seq {
                 wgmma: split,
                 weight_split: split,
                 dual_alpha: false,
+                pinned: true,
                 wgmma_ragged: false,
+                input_split: false,
+                output_split: false,
             },
             math,
         )?;
@@ -900,7 +970,7 @@ fn program_for(
             input_is_temp: false,
             row_scale: None,
             alpha_out: None,
-            taps_wgmma: false,
+            taps_wgmma: true,
             wgmma_ragged: false,
         };
         last = stateful(&mut p, c, last, pre, "state.codec.pre".into(), 0)?.done;
@@ -1006,24 +1076,13 @@ fn program_for(
             },
         )?;
         let at = s.done(e);
-        s.dense(splits, at, "act.codec.b", n, aw, dim, &w("wo_s"), None)?;
-        s.binary(x, h, BinaryOp::Add, n, dim)?;
+        s.dense_res(splits, at, x, n, aw, dim, &w("wo_s"))?;
         s.rms(x, h, n, dim, &w("ffn_norm"), cfg.eps)?;
         let g = s.dense(splits, h, "act.codec.c", n, dim, cfg.inter, &w("w1"), None)?;
         let u = s.dense(splits, h, "act.codec.s", n, dim, cfg.inter, &w("w3"), None)?;
         s.unary(g, Activation::Silu, n, cfg.inter)?;
         s.binary(g, u, BinaryOp::Mul, n, cfg.inter)?;
-        s.dense(
-            splits,
-            g,
-            "act.codec.b",
-            n,
-            cfg.inter,
-            dim,
-            &w("w2_s"),
-            None,
-        )?;
-        s.binary(x, h, BinaryOp::Add, n, dim)?;
+        s.dense_res(splits, g, x, n, cfg.inter, dim, &w("w2_s"))?;
     }
     s.rms(x, x, n, dim, "w.post.norm", cfg.eps)?;
     let stream = if cfg.breeze {
@@ -1088,19 +1147,36 @@ fn program_for(
     let mut rows = frames;
     for (u, &(stride, ln_eps)) in cfg.ups.iter().enumerate() {
         let w = |s: &str| format!("w.up{u}.{s}");
-        let mut c = conv(
-            other(cur.output),
-            w("convt.w"),
-            Some(w("convt.b")),
-            rows,
-            dim,
-            dim,
-            stride,
-        );
-        c.transpose = true;
-        c.stride = stride;
-        c.dilation = 0;
-        c.pad = 0;
+        // Breeze under split-bf16: kernel = stride, so the transposed conv is a pointwise conv to
+        // stride x dim columns over the phase-major weights ([stride][dim][dim]), whose rows read
+        // back as stride output rows each (bias repeated per phase, `.b_rep`).
+        let pointwise = cfg.breeze && splits.is_some() && dim % 4 == 0 && dim >= 16;
+        let mut c = if pointwise {
+            conv(
+                other(cur.output),
+                w("convt.w"),
+                Some(w("convt.b_rep")),
+                rows,
+                dim,
+                stride * dim,
+                1,
+            )
+        } else {
+            let mut c = conv(
+                other(cur.output),
+                w("convt.w"),
+                Some(w("convt.b")),
+                rows,
+                dim,
+                dim,
+                stride,
+            );
+            c.transpose = true;
+            c.stride = stride;
+            c.dilation = 0;
+            c.pad = 0;
+            c
+        };
         c.len = len(u);
         let mut p = s.p.take().unwrap();
         let up = fused_conv(&mut p, fuse, splits, cur.output, cur.done, c)?;
@@ -1136,6 +1212,7 @@ fn program_for(
                 epsilon: ln_eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s = Seq {
@@ -1239,11 +1316,17 @@ fn program_for(
             c.dilation = d;
             c.pad = 6 * d;
             c.len = len_out;
-            if cfg.breeze {
+            // Breeze under split-bf16: the output SnakeBeta (`a2`) fuses into the taps epilogue.
+            let beta_fused = cfg.breeze && splits.is_some();
+            if cfg.breeze && !beta_fused {
                 c.alpha = Some(format!("{pre}.a1"));
             } else {
                 c.alpha_out = Some(format!("{pre}.a12"));
-                c.act_out = Activation::Snake;
+                c.act_out = if cfg.breeze {
+                    Activation::SnakeBeta
+                } else {
+                    Activation::Snake
+                };
             }
             let mut h = stateful(
                 &mut p,
@@ -1253,7 +1336,7 @@ fn program_for(
                 format!("state.codec.blk{i}.ru{j}"),
                 k_out,
             )?;
-            if cfg.breeze {
+            if cfg.breeze && !beta_fused {
                 h = snake_beta(&mut p, h, &format!("{pre}.a2"), batch * rows, b.cout)?;
             }
             let mut c = conv(
@@ -1538,6 +1621,7 @@ fn mimi_program_for(
                 epsilon: cfg.eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s.done(e);
@@ -1614,8 +1698,7 @@ fn mimi_program_for(
             },
         )?;
         let at = s.done(e);
-        s.dense(splits, at, "act.codec.b", nt, aw, dim, &w("wo_s"), None)?;
-        s.binary(x, h, BinaryOp::Add, nt, dim)?;
+        s.dense_res(splits, at, x, nt, aw, dim, &w("wo_s"))?;
         ln(&mut s, w("ln2"))?;
         let g = s.dense(
             splits,
@@ -1628,17 +1711,7 @@ fn mimi_program_for(
             None,
         )?;
         s.unary(g, Activation::GeluErf, nt, cfg.inter)?;
-        s.dense(
-            splits,
-            g,
-            "act.codec.b",
-            nt,
-            cfg.inter,
-            dim,
-            &w("fc2_s"),
-            None,
-        )?;
-        s.binary(x, h, BinaryOp::Add, nt, dim)?;
+        s.dense_res(splits, g, x, nt, cfg.inter, dim, &w("fc2_s"))?;
     }
 
     let mut p = s.p.take().unwrap();

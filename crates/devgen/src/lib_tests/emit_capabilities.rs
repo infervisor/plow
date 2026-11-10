@@ -610,3 +610,38 @@ fn gemma4_hopper_defaults_follow_config_caps() {
         assert_eq!(cfg.seg_fa256_gqa2, None);
     }
 }
+
+/// The fused-V HeadNormRope arm (`i[7] = 1`, the K op writing the V cache from t7) is dispatched
+/// only by the NVIDIA interpreters (interp_sm120.cu, included by sm89/sm90a). AMD's op_norm.h,
+/// Metal and the CPU golden never read `i[7]`: an emit for them must keep the separate V writer,
+/// or the V cache is never written.
+#[test]
+fn fused_kv_headnormrope_is_an_nvidia_only_arm() {
+    {
+        let _nv = EmitAmdGuard::set(false);
+        assert!(
+            fuse_kv_hnr_target_supported(),
+            "sm89/sm90a/sm120 carry PLOW_HNR_KV2"
+        );
+        let _apple = EmitAppleGuard::set(true);
+        assert!(
+            !fuse_kv_hnr_target_supported(),
+            "Metal HeadNormRope ignores i[7]"
+        );
+    }
+    for arch in ["cpu", "amx", "avx512"] {
+        assert!(target_is_cpu(arch, ""), "{arch}");
+        let _nv = EmitAmdGuard::set(target_is_amd(arch, ""));
+        let _cpu = EmitCpuGuard::set(target_is_cpu(arch, ""));
+        assert!(
+            !fuse_kv_hnr_target_supported(),
+            "the CPU golden HeadNormRope ignores i[7] ({arch})"
+        );
+    }
+    assert!(!target_is_cpu("sm_90a", ""));
+    let _amd = EmitAmdGuard::set(true);
+    assert!(
+        !fuse_kv_hnr_target_supported(),
+        "AMD HeadNormRope ignores i[7]"
+    );
+}

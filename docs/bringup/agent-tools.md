@@ -43,7 +43,20 @@ Harness (read [05-single-block-sweep.md](05-single-block-sweep.md) and the scrip
 | A/B | `campaign.py nv-block-ab --control <prod block> --treatment <candidate block> --verb bench\|prefill-bench --args ".." --ceilings ..`: four frozen arms in one lease, `comparison.md` = the table + per-point verdict (§7 spread rule) | `campaign.py block-ab` |
 | real MoE routing | serve the full packet with `PLOW_NV_DUMP_KV=<dir> PLOW_NV_DUMP_ACT=<len>:<pc>`, then `scripts/bench/router_table.py <dump>.json --out t.bin` | AMD capture `rank0.act.tab.bin` |
 | reference block | `scripts/block_layer_bench.py` (vLLM's own decoder layer; joined with `--vllm`) + `scripts/block_compare.py` | `runtime/tests/*_block_*_test.c` oracles |
+| generator search | `scripts/gen_kernels/gen_search.py submit <block spec> --out <scratch>` then `report`: generator candidates (TileLang, Triton) over a schedule grid vs the current kernel vs the floor, numerics-checked (LLM and speech blocks; one `spec_<name>.py` per block) | — |
 | block parity | `block_run packed-check` / `mixed-check` (packed / mixed vs serial on the block) | `amd-block --dump`, C oracle harnesses |
+
+**Generator search before more hand-tuning.** When a block (or one op of it) still sits far from
+its roofline after the first hand pass and another hand-tuning round is being planned, run the
+generator search on it first:
+`gen_search.py plan|build-current|submit|report <spec>` ([kernel-generators.md](../runtime/kernel-generators.md)
+"Generator search per block"). It costs one ≤15 min queue job per grid and answers whether a
+different schedule (tile, stages, warp policy, split) closes the gap. Record its table under the
+block-vs-roofline table as the **best-generated reference row** (config, time, % of floor, rel-L2)
+even when the plow kernel wins. A faster generated schedule is a reference to hand-port; it ships
+as a standalone role object only when its in-model gain exceeds about 5% of the step, never as
+generated code inlined into the interpreter. A block with no spec gets one (a small file beside the
+driver), not a one-off probe.
 
 **ISA reference.** Before writing or changing a kernel, inline asm, intrinsics or low-level
 C/CUDA/HIP/Metal for target `$ISA`, read `docs/bringup/isa/<target>.md` (index:
