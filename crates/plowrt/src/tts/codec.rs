@@ -2076,9 +2076,11 @@ fn launch_bound(
             if j.urgency == Urgency::Whole {
                 continue;
             }
-            let Some(d) = j.deadline() else { continue };
-            let slack =
-                d.saturating_duration_since(now).as_secs_f64() * 1e6 - job_cost(caps, costs, j);
+            // Past its deadline whatever its (possibly unmeasured) cost: see below.
+            let Some(d) = j.deadline().filter(|&d| d > now) else {
+                continue;
+            };
+            let slack = (d - now).as_secs_f64() * 1e6 - job_cost(caps, costs, j);
             // A waiter already past its deadline does not tighten the launch ahead of it: the
             // miss is sunk, and bounding every launch for it collapses the frame rate.
             if slack >= 0.0
@@ -2097,7 +2099,7 @@ fn launch_bound(
 /// the bound, not yet measured, or (without `progress`) no measured capacity fits the bound.
 /// With `progress`, nothing fitting runs the fastest launch within [`PROGRESS_SPAN`] of the cheapest
 /// measured one of these jobs instead: a bound under
-/// the smallest legal piece is a miss to record, never permission to run the whole cohort.
+/// the smallest legal piece is a miss to record.
 fn bound_step(
     caps: &[Capacity],
     costs: &StepCosts,
@@ -3400,6 +3402,19 @@ mod tests {
         // A deadline already passed does not tighten the bound (the miss is sunk); the cap stays.
         let late = mk(Urgency::First, Some(0), None, 100);
         assert_eq!(b(0.0, true, &[late.clone_for_test()]), None);
+        // Also with nothing measured (cost 0): expiry is checked apart from the estimate.
+        assert_eq!(
+            launch_bound(
+                0.0,
+                true,
+                &[late.clone_for_test()],
+                &caps,
+                &StepCosts::default(),
+                slack,
+                now
+            ),
+            None
+        );
         assert_eq!(b(10_000.0, true, &[late]), Some(10_000.0));
         // A late step is no longer urgent: it leads the stream band, behind first audios.
         let stalled = mk(Urgency::Stream, None, Some(2), 10);
