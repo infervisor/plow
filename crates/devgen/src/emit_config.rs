@@ -216,6 +216,9 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-objects")]
     pub decode_objects: Option<std::path::PathBuf>,
 
+    #[arg(long = "emit-row-decode-object")]
+    pub row_decode_object: Option<std::path::PathBuf>,
+
     #[arg(long = "emit-decode-projection-tuning", default_value_t = false)]
     pub decode_projection_tuning: bool,
 
@@ -2302,6 +2305,7 @@ impl EmitConfig {
             attention_pf_isolate: env_bool("PLOW_ATTENTION_PF_ISOLATE"),
             gemv_decode_role: env_bool("PLOW_GEMV_DECODE_ROLE"),
             decode_objects: None,
+            row_decode_object: None,
             decode_projection_tuning: false,
             fp8_block_concat: env_bool("PLOW_FP8_BLOCK_CONCAT"),
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),

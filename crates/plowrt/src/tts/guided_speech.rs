@@ -1083,6 +1083,7 @@ impl GuidedSpeech {
                 turn: request.turn_key.clone(),
                 continuing: false,
                 speech: Some(Box::new(SpeechJob {
+                    batch_delivery: false,
                     device_frames: false,
                     slot_prefix_reuse: false,
                     overlay: cond,

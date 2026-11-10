@@ -733,6 +733,7 @@ pub mod kv_contract;
 pub mod kv_image;
 pub mod live_kv;
 pub mod mixed_step;
+pub mod row_decode;
 
 pub mod fp8_m1_role;
 

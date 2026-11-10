@@ -361,6 +361,13 @@ The table above is before streaming windows and the codec readback fix (2026-09-
 
 ### Stateful stream codec (Fish S2, Breeze)
 
+With `PLOW_TICK_DELIVERY=1`, speech pipelines declaring `stream.delivery_version = 1`
+hand engine outputs to delivery once per tick. Each output reserves an entry in its request's bounded channel;
+audio, completion and error events retain their order when a request finishes or disconnects.
+Resampling and encoding run outside the engine thread. The socket drains audio bytes that
+are already queued without waiting; the first audio and its headers keep their usual timing.
+The switch defaults off. An absent or zero version keeps direct delivery; unknown versions are rejected.
+
 A codec packet with `stream.stateful` = 1 carries step programs `step.b{B}.f{N}` that decode only
 a stream's new frames and keep every causal context (conv tails, attention K/V rings) in per-slot
 state, `stream.slots` (32) slots. Stream output then equals a whole decode (rel-L2 1.2-1.8e-5 vs

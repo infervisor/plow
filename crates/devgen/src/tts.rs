@@ -604,6 +604,9 @@ pub fn speech_pipeline_section(
         pipe.parameters
             .insert("prompt.slot_prefix_version".into(), 1);
     }
+    if p.depth_sampler == 2 {
+        pipe.parameters.insert("stream.delivery_version".into(), 1);
+    }
     if let Some(t) = p.text_encoder {
         pipe.strings.insert("text.encoder".into(), t.into());
     }

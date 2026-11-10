@@ -16,6 +16,31 @@ pub fn on() -> bool {
     crate::config::RuntimeConfig::get().host_timing
 }
 
+thread_local! {
+    static WAIT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn waited_ns() -> u64 {
+    WAIT_NS.with(std::cell::Cell::get)
+}
+
+pub(crate) struct DriverWait(Option<std::time::Instant>);
+
+impl DriverWait {
+    pub(crate) fn begin() -> Self {
+        Self(on().then(std::time::Instant::now))
+    }
+}
+
+impl Drop for DriverWait {
+    fn drop(&mut self) {
+        if let Some(start) = self.0 {
+            let ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            WAIT_NS.with(|total| total.set(total.get().saturating_add(ns)));
+        }
+    }
+}
+
 /// Decode ticks per summary line.
 const WINDOW: u64 = 256;
 

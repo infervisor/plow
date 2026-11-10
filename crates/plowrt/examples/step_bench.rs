@@ -450,6 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut spread = false;
     let mut multistep = false;
     let mut packed_prefill = false;
+    let mut kv_residency = false;
     let mut pf_chunk = usize::MAX;
     let mut pf_reps = 1usize;
     let mut warmup = 16usize;
@@ -467,6 +468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prompt_file = None::<String>;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--kv-residency" => kv_residency = true,
             // `--spec oracle|adversarial|ngram`: speculative verify identity gate (see spec_bench).
             "--spec" => spec.mode = Some(args.next().ok_or("--spec MODE")?),
             "--spec-k" => spec.k = args.next().ok_or("--spec-k K")?.parse()?,
@@ -621,6 +623,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| assets.join("checkpoint"));
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
     let mut e = plowrt::exec::gpu::GpuEngine::load(be, &assets, &ckpt)?;
+    if kv_residency {
+        println!(
+            "KV_RESIDENCY phase=loaded rings={:?} blocks={:?}",
+            e.live_ring_stats(),
+            e.vmm_stats()
+        );
+    }
     let slots = want_slots.min(e.batch());
     if prefill_logits_dir.is_some() && !e.has_prefill() {
         return Err("prefill logit capture requires GPU prefill".into());
@@ -786,6 +795,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    if kv_residency {
+        println!(
+            "KV_RESIDENCY phase=prefilled rings={:?} blocks={:?}",
+            e.live_ring_stats(),
+            e.vmm_stats()
+        );
+    }
     if kv_image {
         // Slots 1.. take slot 0's KV through an exported image instead of their own prefill:
         // re-exporting each must give the same bytes, and SLOTS_AGREE then compares the decodes.
@@ -842,6 +858,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             widths,
             ride_prefix,
             ride_salt,
+            pf_chunk,
             ride_dump.as_deref(),
         );
     }
@@ -1092,6 +1109,7 @@ fn ride_bench(
     widths: &[usize],
     prefix: usize,
     salt: u32,
+    request_chunk: usize,
     dump: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plow_asset::token_batch::{Phase, Request, Selection};
@@ -1101,6 +1119,7 @@ fn ride_bench(
     let chunk = e
         .pf_request_max_rows()
         .min(e.pf_max_rows())
+        .min(request_chunk)
         .min(rows)
         .max(1);
     let fills: Vec<usize> = (0..rows.div_ceil(chunk))
@@ -1140,7 +1159,7 @@ fn ride_bench(
                     selection: Selection::default(),
                 })
                 .collect();
-            e.token_batch_step(&reqs, &mut out)?;
+            ride_token_batch(e, &reqs, &mut out)?;
         }
     }
     // A recurrent chain rewinds through the state snapshot taken at the rewind position: the
@@ -1208,14 +1227,14 @@ fn ride_bench(
         for it in 0..warm + iters {
             reset(e)?;
             let t = Instant::now();
-            e.token_batch_step(&requests(0), &mut output)?;
+            ride_token_batch(e, &requests(0), &mut output)?;
             if it >= warm {
                 pure.push(t.elapsed().as_secs_f64() * 1e3);
             }
             reset(e)?;
             let reqs = requests(w);
             let t = Instant::now();
-            e.token_batch_step(&reqs, &mut output)?;
+            ride_token_batch(e, &reqs, &mut output)?;
             let ms = t.elapsed().as_secs_f64() * 1e3;
             let ride_ids: Vec<u32> = output.iter().map(|&(_, t)| t).collect();
             if output.iter().map(|&(id, _)| id as usize).ne(0..w) {
@@ -1284,6 +1303,18 @@ fn ride_bench(
         );
     }
     Ok(())
+}
+
+fn ride_token_batch(
+    e: &mut plowrt::exec::gpu::GpuEngine,
+    requests: &[plow_asset::token_batch::Request<'_>],
+    output: &mut Vec<(u32, u32)>,
+) -> plowrt::Result<()> {
+    if e.has_depth_stage() {
+        e.token_batch_step_staged(requests, output, None, &mut |_| {}, &mut |_, _| Ok(()))
+    } else {
+        e.token_batch_step(requests, output)
+    }
 }
 
 #[cfg(test)]

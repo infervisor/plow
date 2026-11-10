@@ -95,6 +95,30 @@ impl SlotPrefixes {
         }
     }
 
+    fn best_source(
+        &self,
+        destination: usize,
+        keys: &[u64],
+        backing: impl Fn(usize) -> Option<u64>,
+    ) -> Option<(usize, usize)> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, prefix)| {
+                if slot == destination || self.backing[slot] != Some(backing(slot)?) {
+                    return None;
+                }
+                let rows = prefix
+                    .iter()
+                    .zip(keys)
+                    .take(keys.len().saturating_sub(1))
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                (rows > 0).then_some((slot, rows))
+            })
+            .max_by_key(|&(_, rows)| rows)
+    }
+
     pub(super) fn clear(&mut self, slot: usize) {
         self.rows[slot].clear();
         self.backing[slot] = None;
@@ -198,6 +222,89 @@ impl VmmPrefixLayout {
 }
 
 impl GpuEngine {
+    pub fn reuse_shared_slot_prefix(&mut self, destination: usize, keys: &[u64]) -> Result<usize> {
+        if destination >= self.batch {
+            return Err(RuntimeError::Rejected(
+                "prefix destination outside slot capacity".into(),
+            ));
+        }
+        let own = self.reuse_slot_prefix(destination, keys);
+        if own > 0
+            || self.row_decode.is_none()
+            || !self.live_slot_prefix_supported()
+            || !self.slot_prefix_reuse_supported()
+            || self.pipe_busy()
+            || keys.len() < 2
+        {
+            return Ok(own);
+        }
+        let Some(manifest) = self
+            .kv_image
+            .as_ref()
+            .filter(|m| m.caches.iter().all(|c| c.window == 0 && c.scales.is_none()))
+        else {
+            return Ok(0);
+        };
+        // Claiming the destination can recycle a parked source's backing.
+        self.vmm
+            .as_mut()
+            .and_then(|v| v.rings.as_mut())
+            .expect("full-slot rings")
+            .ensure_slot(destination)?;
+        let Some((source, rows)) = self
+            .slot_prefixes
+            .best_source(destination, keys, |slot| self.slot_prefix_backing(slot))
+        else {
+            return Ok(0);
+        };
+        let rows = rows.min(self.max_ctx.saturating_sub(1));
+        let copy = (|| -> Result<()> {
+            for cache in &manifest.caches {
+                let head_row = u64::from(cache.hd) * 2;
+                let head_bytes = u64::from(cache.stride) * head_row;
+                let slot_bytes = u64::from(cache.heads) * head_bytes;
+                for &handle in &cache.pair {
+                    let tensor = &self.devp[handle as usize];
+                    let src = tensor.base + source as u64 * slot_bytes;
+                    let dst = tensor.base + destination as u64 * slot_bytes;
+                    match cache.layout {
+                        plow_asset::live_kv::LAYOUT_HEAD_MAJOR => {
+                            self.be.memcpy_dtod_pitched_async(
+                                (dst, head_bytes),
+                                (src, head_bytes),
+                                rows as u64 * head_row,
+                                cache.heads,
+                                &self.stream,
+                            )?
+                        }
+                        plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED => self.be.memcpy_dtod_async(
+                            dst,
+                            src,
+                            rows as u64 * head_row * u64::from(cache.heads),
+                            &self.stream,
+                        )?,
+                        _ => {
+                            return Err(RuntimeError::Rejected(
+                                "unsupported prefix cache layout".into(),
+                            ))
+                        }
+                    }
+                }
+            }
+            self.be.stream_synchronize(&self.stream)
+        })();
+        if let Err(error) = copy {
+            self.be.stream_synchronize(&self.stream)?;
+            return Err(error);
+        }
+        self.pos[destination] = rows as u32;
+        self.kv_hw[destination] = rows as u32;
+        let backing = self.slot_prefix_backing(destination);
+        self.slot_prefixes
+            .publish(destination, keys[..rows + 1].to_vec(), backing);
+        Ok(rows)
+    }
+
     pub(super) fn vmm_live_bringup(
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
@@ -1302,6 +1409,107 @@ mod slot_prefix_tests {
         );
         cache.clear_all();
         assert!(!cache.backing_matches(0, Some(12)));
+    }
+
+    #[test]
+    fn shared_prefix_source_requires_current_backing_and_matching_identity() {
+        let mut cache = SlotPrefixes::new(3);
+        cache.publish(0, vec![1, 2, 3, 4], Some(10));
+        cache.publish(1, vec![1, 2, 9, 4], Some(20));
+        let keys = [1, 2, 3, 8];
+        assert_eq!(
+            cache.best_source(2, &keys, |s| [Some(10), Some(20), None][s]),
+            Some((0, 3))
+        );
+        assert_eq!(
+            cache.best_source(2, &keys, |s| [Some(11), Some(20), None][s]),
+            Some((1, 2))
+        );
+        assert_eq!(cache.best_source(2, &keys, |_| None), None);
+        assert_eq!(
+            cache.best_source(0, &keys, |s| [Some(10), Some(20), None][s]),
+            Some((1, 2))
+        );
+        assert_eq!(
+            cache
+                .best_source(2, &[1, 2], |s| [Some(10), Some(20), None][s])
+                .unwrap()
+                .1,
+            1
+        );
+        assert_eq!(
+            cache.best_source(2, &[7, 2, 3], |s| [Some(10), Some(20), None][s]),
+            None
+        );
+        cache.clear_all();
+        assert_eq!(
+            cache.best_source(2, &keys, |s| [Some(10), Some(20), None][s]),
+            None
+        );
+    }
+
+    #[test]
+    #[ignore = "requires TEST_ROW_DECODE_ASSETS; run through gpuq after the row launch gate"]
+    fn shared_prefix_copy_replaces_poisoned_kv_and_preserves_source() {
+        use crate::device::cuda::CudaBackend;
+        use crate::exec::gpu::GpuEngine;
+        use std::sync::Arc;
+        fn snapshot(e: &GpuEngine, slot: u32, rows: u32) -> Vec<u8> {
+            let (spans, bytes) =
+                crate::exec::kv_image::plan(e.kv_image.as_ref().unwrap(), slot, rows).unwrap();
+            let mut image = vec![0; bytes as usize];
+            for span in spans {
+                e.be.memcpy_dtoh(
+                    &mut image[span.image_off as usize..(span.image_off + span.bytes) as usize],
+                    e.devp[span.handle].base + span.native_off,
+                )
+                .unwrap();
+            }
+            image
+        }
+        let assets = std::path::PathBuf::from(std::env::var("TEST_ROW_DECODE_ASSETS").unwrap());
+        let backend = Arc::new(CudaBackend::new(0).unwrap());
+        let mut e = GpuEngine::load(backend, &assets, &assets.join("checkpoint")).unwrap();
+        assert!(e.row_decode.is_some() && e.live_slot_prefix_supported());
+        let desc: plow_asset::BlockDescriptor =
+            serde_json::from_slice(&std::fs::read(assets.join("block.json")).unwrap()).unwrap();
+        let prompt: Vec<u32> = (100..228).collect();
+        let keys: Vec<u64> = prompt.iter().copied().map(u64::from).collect();
+        let input: Vec<f32> = (0..prompt.len() * desc.hidden as usize)
+            .map(|i| ((i * 17 % 101) as f32 - 50.) / 50.)
+            .collect();
+        for slot in 0..2 {
+            e.begin_slot(slot, prompt.len() + 4).unwrap();
+            e.upload_activation("act.x", &input).unwrap();
+            e.prefill_slot(slot, &prompt).unwrap();
+        }
+        e.keep_slot_prefix(0, e.slot_prefix_epoch(), keys.clone());
+        let rows = prompt.len() as u32 - 1;
+        let expected = snapshot(&e, 0, rows);
+        assert!(expected.iter().any(|&byte| byte != 0));
+        let (spans, _) =
+            crate::exec::kv_image::plan(e.kv_image.as_ref().unwrap(), 1, rows).unwrap();
+        for span in spans {
+            e.be.memset_d8_async(
+                e.devp[span.handle].base + span.native_off,
+                0xab,
+                span.bytes as usize,
+                &e.stream,
+            )
+            .unwrap();
+        }
+        e.be.stream_synchronize(&e.stream).unwrap();
+        assert_ne!(snapshot(&e, 1, rows), expected);
+        e.rewind_slot(1, 0).unwrap();
+        assert_eq!(e.reuse_shared_slot_prefix(1, &keys).unwrap(), rows as usize);
+        assert_eq!(snapshot(&e, 1, rows), expected);
+        assert_eq!(snapshot(&e, 0, rows), expected);
+        assert_eq!(e.resume_slot(1, rows as usize), rows as usize);
+        e.begin_slot(1, prompt.len() + 4).unwrap();
+        e.prefill_slot(1, &prompt).unwrap();
+        assert_eq!(snapshot(&e, 1, rows), expected);
+        assert_eq!(snapshot(&e, 0, rows), expected);
+        println!("SHARED_PREFIX_COPY rows={rows} bytes={} exact=true source_unchanged=true tail_preserves_prefix=true", expected.len());
     }
 
     #[test]

@@ -3598,13 +3598,24 @@ pub const ROWSPLIT_PREFILL_PROG: u32 = 1 << 27;
 /// (e.g. `DenseAttentionBlock`, `DenseFfnBlock`, `EmbeddingBlock`, `FinalNormVocabBlock`).
 /// Allows decoupled, layer-reusable block execution and fine-grained rungs.
 pub const MODULAR_BLOCK_PROG: u32 = 1 << 26;
+pub const ROW_DECODE_PROG: u32 = 1 << 25;
 
 const PROGRAM_ROLE_BITS: u32 = PACKED_PREFILL_PROG
     | TOKEN_BATCH_PROG
     | DECODE_RUNG_PROG
     | DENSE_EXACT_PROG
     | ROWSPLIT_PREFILL_PROG
-    | MODULAR_BLOCK_PROG;
+    | MODULAR_BLOCK_PROG
+    | ROW_DECODE_PROG;
+
+pub fn row_decode_program_t(rows: u32) -> u32 {
+    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "invalid row-decode capacity");
+    rows | ROW_DECODE_PROG
+}
+
+pub fn is_row_decode_program(t: u32) -> bool {
+    t & ROW_DECODE_PROG != 0
+}
 
 pub fn program_rows(t: u32) -> u32 {
     t & !PROGRAM_ROLE_BITS
@@ -3722,25 +3733,43 @@ pub fn decode_rung_lo(prog_t: &[u32]) -> usize {
 /// sibling and a token-batch body — which is the property the two booleans did not have.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProgramRole {
+    RowDecodeBody {
+        rows: u32,
+    },
     /// An ordinary prefill bucket: one rung of the chunk ladder, `rows` tokens wide.
-    PrefillBucket { rows: u32 },
+    PrefillBucket {
+        rows: u32,
+    },
     /// One rung of the decode batch ladder, advancing up to `rows` sequence slots.
-    DecodeRung { rows: u32 },
+    DecodeRung {
+        rows: u32,
+    },
     /// A packed-dispatch-only topology for the prefill bucket of the same width
     /// ([`PACKED_PREFILL_PROG`]). Never selected as a rung of its own.
-    PackedSibling { of_rows: u32 },
+    PackedSibling {
+        of_rows: u32,
+    },
     /// A token-batch body ([`TOKEN_BATCH_PROG`]): `rows` of prefill width carrying a
     /// slot-indexed decode band of `band` rows ahead of its prefill spans. Neither ladder
     /// offers it; only the token-batch route selects it, by rows.
-    TokenBatchBody { band: u32, rows: u32 },
+    TokenBatchBody {
+        band: u32,
+        rows: u32,
+    },
     /// A dense-exact decode rung ([`DENSE_EXACT_PROG`]): the decode rung of the same width
     /// without top-k selection. Decode-side, but not a rung of the width ladder.
-    DenseExactRung { rows: u32 },
+    DenseExactRung {
+        rows: u32,
+    },
     /// The row-split attention topology of the prefill bucket of the same width
     /// ([`ROWSPLIT_PREFILL_PROG`]). Never selected as a rung of its own.
-    RowSplitSibling { of_rows: u32 },
+    RowSplitSibling {
+        of_rows: u32,
+    },
     /// A modular building-block program ([`MODULAR_BLOCK_PROG`]) for fine-grained rungs or single-block execution.
-    ModularBlock { rows: u32 },
+    ModularBlock {
+        rows: u32,
+    },
 }
 
 impl ProgramRole {
@@ -3753,12 +3782,17 @@ impl ProgramRole {
             | Self::TokenBatchBody { rows, .. }
             | Self::DenseExactRung { rows }
             | Self::RowSplitSibling { of_rows: rows }
-            | Self::ModularBlock { rows } => rows,
+            | Self::ModularBlock { rows }
+            | Self::RowDecodeBody { rows } => rows,
         }
     }
 
     pub fn is_modular_block(self) -> bool {
         matches!(self, Self::ModularBlock { .. })
+    }
+
+    pub fn is_row_decode_body(self) -> bool {
+        matches!(self, Self::RowDecodeBody { .. })
     }
 
     pub fn is_prefill_bucket(self) -> bool {
@@ -3797,7 +3831,7 @@ impl ProgramRole {
     /// Prefill-side: exactly the programs the positional code found below `decode_rung_lo` —
     /// buckets, their packed siblings and the token-batch bodies.
     pub fn is_prefill_side(self) -> bool {
-        !self.is_decode_rung() && !self.is_modular_block()
+        !self.is_decode_rung() && !self.is_modular_block() && !self.is_row_decode_body()
     }
 
     /// The role's name, for a refusal message.
@@ -3810,6 +3844,7 @@ impl ProgramRole {
             Self::DenseExactRung { .. } => "dense-exact decode rung",
             Self::RowSplitSibling { .. } => "row-split sibling",
             Self::ModularBlock { .. } => "modular block",
+            Self::RowDecodeBody { .. } => "row-decode body",
         }
     }
 }
@@ -3864,7 +3899,9 @@ pub fn derive_roles(
         .enumerate()
         .map(|(i, &t)| {
             let rows = program_rows(t);
-            if is_token_batch_program(t) {
+            if is_row_decode_program(t) {
+                ProgramRole::RowDecodeBody { rows }
+            } else if is_token_batch_program(t) {
                 ProgramRole::TokenBatchBody {
                     band: band(i),
                     rows,
@@ -7002,6 +7039,37 @@ mod v6_tests {
         assert_eq!(
             derive_roles(&table, RoleSource::Stated, |_| 0)[side..lo],
             roles[side..lo]
+        );
+    }
+
+    #[test]
+    fn row_bodies_are_outside_both_execution_ladders() {
+        let table = [
+            128,
+            512,
+            row_decode_program_t(1),
+            row_decode_program_t(256),
+            1,
+            8,
+            256,
+        ];
+        assert_eq!(decode_rung_lo(&table), 4);
+        let roles = derive_roles(&table, RoleSource::Positional, |_| 0);
+        for index in [2, 3] {
+            let role = roles[index];
+            assert!(role.is_row_decode_body());
+            assert!(!role.is_prefill_side());
+            assert!(!role.is_decode_rung());
+            assert_eq!(role.rows(), program_rows(table[index]));
+        }
+        assert_eq!(
+            roles.iter().filter(|role| role.is_prefill_bucket()).count(),
+            2
+        );
+        assert_eq!(roles.iter().filter(|role| role.is_decode_rung()).count(), 3);
+        assert_eq!(
+            derive_roles(&table[2..4], RoleSource::Stated, |_| 0),
+            roles[2..4]
         );
     }
 

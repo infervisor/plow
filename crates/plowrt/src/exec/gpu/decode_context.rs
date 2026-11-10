@@ -32,7 +32,7 @@ pub(super) fn metadata(blob: &DevBlob, raw: &[u8]) -> Result<Option<ContextTable
         .progs
         .iter()
         .enumerate()
-        .skip(blob.decode_rung_lo())
+        .filter(|(_, g)| g.role.is_decode_rung())
         .map(|(i, p)| (i, p.t))
         .collect();
     plow_asset::decode_context::parse_sections(
@@ -214,7 +214,13 @@ fn auxiliary_program(
         "context requires qualified dense decode ladders",
     )?;
     require(
-        band.base_program >= base.decode_rung_lo() && band.program.index >= aux.decode_rung_lo(),
+        base.progs
+            .get(band.base_program)
+            .is_some_and(|g| g.role.is_decode_rung())
+            && aux
+                .progs
+                .get(band.program.index)
+                .is_some_and(|g| g.role.is_decode_rung()),
         "context alternative points into prefill",
     )?;
     let a = base

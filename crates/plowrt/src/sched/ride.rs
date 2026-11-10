@@ -49,6 +49,8 @@ pub struct RideCost {
     ladder: Vec<usize>,
     /// [`RideCost::rows_within`] calls since the measured rung above the cap last re-ran.
     since_reprobe: u32,
+    frame_costs: bool,
+    frames: Vec<(usize, usize, Ewma)>,
 }
 
 impl RideCost {
@@ -72,6 +74,10 @@ impl RideCost {
 
     pub fn needs_ladder(&self) -> bool {
         self.ladder.is_empty()
+    }
+
+    pub fn enable_frame_costs(&mut self) {
+        self.frame_costs = true;
     }
 
     fn bucket(&mut self, rows: usize) -> &mut Bucket {
@@ -115,7 +121,75 @@ impl RideCost {
     pub fn observe_step(&mut self, rows: usize, ms: f64) {
         if let Some(i) = self.widths.iter().position(|&w| w >= rows) {
             self.steps[i].1.add(ms);
+            if self.frame_costs {
+                self.observe_frame(self.widths[i], rows, ms);
+            }
         }
+    }
+
+    pub fn observe_frame(&mut self, body_rows: usize, samples: usize, ms: f64) {
+        if body_rows == 0 || samples == 0 || !ms.is_finite() || ms <= 0.0 {
+            return;
+        }
+        if let Some((_, _, cost)) = self
+            .frames
+            .iter_mut()
+            .find(|(b, s, _)| *b == body_rows && *s == samples)
+        {
+            cost.add(ms);
+        } else {
+            self.frames.push((body_rows, samples, Ewma(Some(ms))));
+        }
+    }
+
+    pub fn frame_ms(&self, body_rows: usize, samples: usize) -> Option<f64> {
+        let covering = self
+            .frames
+            .iter()
+            .filter(|(b, s, _)| *b >= body_rows && *s >= samples)
+            .filter_map(|(_, _, cost)| cost.0)
+            .min_by(f64::total_cmp);
+        covering.or_else(|| {
+            self.frames
+                .iter()
+                .filter_map(|(b, s, cost)| {
+                    let scale = (body_rows as f64 / *b as f64)
+                        .max(samples as f64 / *s as f64)
+                        .max(1.0);
+                    cost.0.map(|ms| ms * scale)
+                })
+                .min_by(f64::total_cmp)
+        })
+    }
+
+    pub fn frame_rows_within(
+        &self,
+        rungs: impl DoubleEndedIterator<Item = usize>,
+        decode: usize,
+        spans: &[(usize, bool)],
+        budget_ms: f64,
+    ) -> usize {
+        let rows: usize = spans.iter().map(|span| span.0).sum();
+        rungs
+            .rev()
+            .filter(|&r| r > decode)
+            .find_map(|rung| {
+                let take = rows.min(rung - decode);
+                let mut left = take;
+                let samples = decode
+                    + spans
+                        .iter()
+                        .filter(|&&(n, completes)| {
+                            let taken = left.min(n);
+                            left -= taken;
+                            completes && taken == n
+                        })
+                        .count();
+                self.frame_ms(rung, samples)
+                    .filter(|&ms| ms <= budget_ms)
+                    .map(|_| take)
+            })
+            .unwrap_or(0)
     }
 
     /// `(any rung measured, index of the widest measured rung within budget_ms)`.
@@ -203,6 +277,37 @@ impl RideCost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_deadline_prices_all_arrivals_and_their_terminal_rows() {
+        let mut cost = RideCost::default();
+        let rungs = [128, 160, 192, 256];
+        let prompts = [(24, true), (24, true)];
+        assert_eq!(
+            cost.frame_rows_within(rungs.into_iter(), 128, &prompts, 70.0),
+            0
+        );
+        cost.observe_frame(128, 128, 64.0);
+        cost.observe_frame(192, 130, 68.0);
+        assert_eq!(
+            cost.frame_rows_within(rungs.into_iter(), 128, &prompts, 70.0),
+            48
+        );
+        assert_eq!(
+            cost.frame_rows_within(rungs.into_iter(), 128, &prompts, 63.0),
+            0
+        );
+        assert_eq!(
+            cost.frame_rows_within(rungs.into_iter(), 128, &[(8, true); 6], 80.0),
+            48
+        );
+        assert_eq!(
+            cost.frame_rows_within(rungs.into_iter(), 128, &[(48, true)], 70.0),
+            48
+        );
+        cost.observe_frame(192, 130, f64::NAN);
+        assert_eq!(cost.frame_ms(192, 130), Some(68.0));
+    }
 
     fn warm(c: &mut RideCost, pure: f64, per_row: f64, step: f64) {
         c.set_widths(&[32, 64, 128]);
