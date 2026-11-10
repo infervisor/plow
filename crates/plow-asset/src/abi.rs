@@ -12,6 +12,8 @@
 //! * `bindings` — the runtime role of each fixed binding tensor and every KV-cache write site the
 //!   write-row rule ([`kv_write_row_field`]) finds.
 //!   A reader checks them against the tensor names they are derived from today.
+//! * `speech_flag_layout` — see [`crate::speech_flag_layout`]; checked by the loaders of speech
+//!   interpreter objects.
 use std::collections::BTreeMap;
 
 use packet::dev::DevOp;
@@ -60,6 +62,11 @@ pub struct Abi {
     pub target: Option<Target>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bindings: Option<Bindings>,
+    /// The speech-op flag layout the instructions were emitted for
+    /// ([`crate::speech_flag_layout`]); absent when no instruction sets a bit assigned since
+    /// layout 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_flag_layout: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

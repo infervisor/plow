@@ -213,6 +213,12 @@ impl SpecDraft {
                 return Err(reject(format!("tensor {h} holds fewer than {n} entries")));
             }
         }
+        // The draft programs run on the decode objects, which read no flag bit assigned since
+        // speech flag layout 0.
+        plow_asset::speech_flag_layout::refuse_on_decode_objects(
+            section.programs.iter().flat_map(|p| &p.insts),
+        )
+        .map_err(reject)?;
         let programs = section
             .programs
             .iter()

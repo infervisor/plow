@@ -3,13 +3,44 @@
 //!
 //! `cargo run --example blob_ops -- model.pkt [--l2]`
 //! (`--l2` accepts an L2-domain-placed blob, as `PLOW_L2_PLACE_DISPATCH=1` does.)
+//!
+//! `blob_ops PACKET... --speech-layout` prints one line per packet instead: the speech flag
+//! layout it declares, its first instruction using a bit assigned since layout 0, and what a
+//! loader of a speech object decides (`plow_asset::speech_flag_layout`); exit 1 on a refusal.
 
 use std::collections::BTreeMap;
 
 use packet::dev::DevOp;
 use plowrt::asset::devblob::DevBlob;
 
+/// Each packet against a speech object of this tree's layout; 1 if any is refused.
+fn speech_layout() -> i32 {
+    use plow_asset::speech_flag_layout as layout;
+    let mut rc = 0;
+    for path in std::env::args().skip(1).filter(|a| !a.starts_with("--")) {
+        let buf = std::fs::read(&path).expect("read blob");
+        let blob = DevBlob::parse_l2(&buf, true).expect("parse blob");
+        let scan = blob.speech_flag_layout(&buf).expect("scan blob");
+        let (declared, used) = (scan.declared, scan.any());
+        let verdict = match layout::check(declared, used, Some(layout::LAYOUT)) {
+            Ok(()) => "loads".to_string(),
+            Err(e) => {
+                rc = 1;
+                format!("REFUSED: {e}")
+            }
+        };
+        println!(
+            "{path}: declared {declared:?} first protected {} -> {verdict}",
+            used.map_or("none", name)
+        );
+    }
+    rc
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--speech-layout") {
+        std::process::exit(speech_layout());
+    }
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("usage: blob_ops <model.pkt> [--l2]");
     let l2 = args.any(|a| a == "--l2");
