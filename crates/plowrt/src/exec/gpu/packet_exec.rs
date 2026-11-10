@@ -117,6 +117,22 @@ pub(super) fn stale_speech_layout(
     None
 }
 
+/// Refuses `object` (a loaded interpreter `module`) for instructions whose first protected use
+/// is `used`, from a packet declaring `declared`, when their speech-op flag layouts disagree
+/// (`plow_asset::speech_flag_layout`).
+pub(in crate::exec) fn check_speech_flag_layout(
+    be: &CudaBackend,
+    module: &Module,
+    object: &Path,
+    declared: Option<u32>,
+    used: Option<u16>,
+) -> Result<()> {
+    use plow_asset::speech_flag_layout as layout;
+    let have = be.module_global_u32(module, layout::OBJECT_SYMBOL)?;
+    layout::check(declared, used, have)
+        .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", object.display())))
+}
+
 /// Rejects an object lacking a feature bit `required` has, or one whose conv flag layout
 /// `stale` (see [`stale_speech_layout`]) rules out.
 pub(super) fn check_speech_features(
@@ -270,7 +286,7 @@ impl CudaPacketRuntime {
         let ordinal = be.device_ordinal;
         let image = crate::asset::packet_image::PacketImage::open(path)?;
         image.blob.check_l2_dispatch(false)?;
-        let blob = &image.blob;
+        let (blob, raw) = (&image.blob, &image.raw);
         if !blob.gen.is_empty() || blob.tp.is_some() {
             return Err(RuntimeError::Rejected(format!(
                 "{}: generated tensors or TP are not supported by the CUDA packet runtime",
@@ -286,6 +302,9 @@ impl CudaPacketRuntime {
         })?;
         let module = be.module_load(&image)?;
         let function = be.get_function(&module, symbol)?;
+        // Before the op / capability checks: rebuilding the object cannot repair a stale packet.
+        let layout = blob.speech_flag_layout(raw)?;
+        check_speech_flag_layout(&be, &module, &object, layout.declared, layout.any())?;
         if let (Some(lo), Some(hi)) = (
             be.module_global_u32(&module, "plow_speech_ops_lo_speech")?,
             be.module_global_u32(&module, "plow_speech_ops_hi_speech")?,

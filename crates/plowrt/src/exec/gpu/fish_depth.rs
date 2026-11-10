@@ -239,6 +239,7 @@ impl SpeechFn {
         e: &GpuEngine,
         assets: &std::path::Path,
         programs: &[plow_asset::aux_program::Program],
+        (blob, raw): (&DevBlob, &[u8]),
     ) -> Result<Self> {
         let (file, symbol) = super::packet_exec::speech_object(e.be.compute_capability());
         let path = assets.join(file);
@@ -248,6 +249,14 @@ impl SpeechFn {
         })?;
         let module = e.be.module_load(&image)?;
         let f = e.be.get_function(&module, symbol)?;
+        let layout = blob.speech_flag_layout(raw)?;
+        super::packet_exec::check_speech_flag_layout(
+            &e.be,
+            &module,
+            &path,
+            layout.declared,
+            layout.any(),
+        )?;
         let need = programs
             .iter()
             .flat_map(|p| p.insts.iter())
@@ -416,7 +425,7 @@ impl FishDepth {
         let bytes = blob
             .reserved_metadata(raw, plow_asset::fish_depth::PROGRAMS_SECTION)?
             .ok_or_else(|| reject("depth programs section missing"))?;
-        Self::load(e, manifest, bytes, assets).map(Some)
+        Self::load(e, manifest, bytes, assets, (blob, raw)).map(Some)
     }
 
     fn load(
@@ -424,6 +433,7 @@ impl FishDepth {
         manifest: Manifest,
         bytes: &[u8],
         assets: &std::path::Path,
+        packet: (&DevBlob, &[u8]),
     ) -> Result<Self> {
         let section =
             plow_asset::aux_program::parse(bytes, e.grid, e.devp.len()).map_err(reject)?;
@@ -435,6 +445,13 @@ impl FishDepth {
         let k = manifest.codebooks as usize;
         let need = |h: u16, bytes: usize| e.devp[usize::from(h)].len >= bytes as u64;
         let maya2 = manifest.sampler == Sampler::Maya2;
+        // Only the speech object (the Maya 2 path) reads the flag bits assigned since layout 0.
+        if !maya2 {
+            plow_asset::speech_flag_layout::refuse_on_decode_objects(
+                section.programs.iter().flat_map(|p| &p.insts),
+            )
+            .map_err(reject)?;
+        }
         if maya2
             && (rows > e.batch
                 || !need(t.params, rows * 16)
@@ -492,7 +509,7 @@ impl FishDepth {
                 logits: e.be.host_alloc_pinned(rows * e.vocab() * 2)?,
                 scratch: Vec::new(),
                 depth: (f32::from_bits(t), k),
-                speech: SpeechFn::load(e, assets, &section.programs)?,
+                speech: SpeechFn::load(e, assets, &section.programs, packet)?,
                 null_memory: null_memory(e, &manifest)?,
             }),
             _ => None,

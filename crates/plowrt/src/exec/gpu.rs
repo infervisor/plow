@@ -4770,6 +4770,16 @@ impl GpuEngine {
                 let image_len = image.len();
                 let dec_source = dec.source.clone();
                 let module = DecodeModule::load(&be, &image)?;
+                // The regular programs run on this object, whatever was selected (a speech
+                // object can be: its entry is a decode entry too).
+                let layout = blob.speech_flag_layout(&raw)?;
+                packet_exec::check_speech_flag_layout(
+                    &be,
+                    &module,
+                    Path::new(&dec_source.to_string()),
+                    layout.declared,
+                    layout.regular,
+                )?;
                 check_norm_weight_offset(&be, &module, &blob)?;
                 if be
                     .module_global_u32(&module, "plow_kv_layout")?
@@ -11225,6 +11235,20 @@ impl GpuEngine {
             inferred_policy.fa256_gqa2 = true;
         }
         let module = be.module_load(&pf.image)?;
+        // The decode site checked the packet's declaration; this object runs the same regular
+        // programs and must read their flag layout too.
+        {
+            use plow_asset::speech_flag_layout as layout;
+            let used = layout::first_protected(
+                blob.progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .map(|d| (d.op, d.fj[2], d.i)),
+            );
+            let have = be.module_global_u32(&module, layout::OBJECT_SYMBOL)?;
+            layout::check(Some(layout::LAYOUT), used, have)
+                .map_err(|e| RuntimeError::Rejected(format!("prefill interpreter: {e}")))?;
+        }
         if let Some(requirements) = requirements {
             check_object_requirements(be, &module, &requirements.prefill, "prefill interpreter")?;
         }
