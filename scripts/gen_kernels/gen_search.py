@@ -11,18 +11,23 @@ below, example: spec_s3gen_cfm_attn.py). SPEC arguments take the name or a path.
   gen_search.py plan SPEC [--classes a,b] [--gens tilelang,triton]       CPU: grid, floors
   gen_search.py build-current SPEC --out DIR                             CPU: the plow probe lib
   gen_search.py submit SPEC --out DIR [run options]                      queues `run` (gpuq.py)
-  gen_search.py run SPEC --out DIR [--classes ..] [--gens ..] [--budget-s 780] [--force]
+  gen_search.py run SPEC --out DIR [--classes ..] [--gens ..] [--budget-s 720] [--force]
   gen_search.py report SPEC --out DIR [--ceilings ceilings.json] [--all] CPU: the table
 
 `run` needs one leased GPU and a Python with torch and the spec's generators (`PYREF`, the
 catalog's interpreter); go through `submit`, which queues it under a 15 min timeout and forwards
 the compiler environment (PATH, CUDA_HOME, NVCC_PREPEND_FLAGS, LD_LIBRARY_PATH, TL_*). Rows land
 in DIR/<name>.results.jsonl as they are measured; a rerun resumes after the rows already there,
-so a grid larger than one job's budget is a second `submit`. DIR is campaign scratch, never the
-repo. Timing: a CUDA graph over rotating cold inputs larger than L2, median us per call.
+so a grid larger than one job's budget is a second `submit`. A row counts while its class
+geometry, tolerance and config are still the spec's (and, for resume, device, generator versions
+and TL_* match); after changing a kernel body use a fresh DIR or --force. DIR is campaign
+scratch, never the repo. Timing: a CUDA graph over rotating cold inputs larger than L2, median us
+per call; a class whose rotating inputs stay under that at the set cap is reported cache-warm.
 """
 import argparse
 import ast
+import fcntl
+import hashlib
 import importlib.metadata
 import importlib.util
 import itertools
@@ -31,6 +36,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -62,7 +68,9 @@ SPEC_FIELDS = {
                        "'measured_us': {class: us}, 'source'}"),
 }
 FORWARD_ENV = ("PATH", "CUDA_HOME", "NVCC_PREPEND_FLAGS", "LD_LIBRARY_PATH")
-JOB_SECONDS = 900
+# A queue job is 15 min: TERM at JOB_TERM_S, KILL JOB_KILL_S later, and `run` stops starting
+# candidates BUDGET_MARGIN_S before the TERM.
+JOB_TERM_S, JOB_KILL_S, BUDGET_MARGIN_S = 840, 30, 120
 
 
 def load_spec(ref):
@@ -158,13 +166,33 @@ def row_key(r):
     return (r["class"], r["arm"], json.dumps(r["cfg"], sort_keys=True))
 
 
-def summarize(spec, rows, ceil, classes=None):
-    """One table row per class: current, best passing generated candidate, floor, verdict. A later
-    row for the same (class, arm, cfg) replaces an earlier one."""
-    last = {row_key(r): r for r in rows}
+def class_fp(spec, name):
+    """Identity of what a row measured: the class geometry and the tolerance it was judged by."""
+    cls = {k: v for k, v in spec["classes"][name].items() if k != "step"}
+    text = json.dumps([cls, spec["tol"]], sort_keys=True, default=str)
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def live_rows(spec, rows, classes, gens):
+    """Latest row per (class, arm, cfg), restricted to the spec as it is now: known class with
+    the recorded geometry and tolerance, and a config still in the selected generators' grids."""
+    keep = {(n, "current", "{}") for n in classes}
+    for gen, cfg, names in candidates(spec, classes, gens):
+        keep |= {(n, gen, json.dumps(cfg, sort_keys=True)) for n in names}
+    last = {}
+    for r in rows:
+        if row_key(r) in keep and r.get("fp") == class_fp(spec, r["class"]):
+            last[row_key(r)] = r
+    return last
+
+
+def summarize(spec, rows, ceil, classes=None, gens=None):
+    """One table row per class: current, best passing generated candidate, floor, verdict."""
+    classes = classes or list(spec["classes"])
+    last = live_rows(spec, rows, classes, gens or list(spec["generators"]))
     cur = spec.get("current") or {}
     out = []
-    for name in classes or spec["classes"]:
+    for name in classes:
         cls = spec["classes"][name]
         mine = [r for r in last.values() if r["class"] == name]
         cur_us, note = None, ""
@@ -176,6 +204,7 @@ def summarize(spec, rows, ceil, classes=None):
         ok = [r for r in mine if r["arm"] != "current" and r.get("ok")]
         best = min(ok, key=lambda r: r["us"]) if ok else None
         out.append({
+            "class": name,
             "block": f"{spec['op']}, {name}",
             "floor_us": gen_bench.floor_us(spec["cost"](cls), ceil),
             "cur_us": cur_us, "cur_note": note if cur_us is not None else "",
@@ -185,13 +214,19 @@ def summarize(spec, rows, ceil, classes=None):
             "verdict": gen_bench.verdict(cur_us, best and best["us"], cls.get("step")),
             "tried": len([r for r in mine if r["arm"] != "current"]),
             "passed": len(ok),
+            "warm": any(r.get("cold") is False for r in mine),
         })
     return out
 
 
-def report(spec, rows, ceil, classes=None, every=False):
-    summary = summarize(spec, rows, ceil, classes)
+def report(spec, rows, ceil, classes=None, gens=None, every=False):
+    classes = classes or list(spec["classes"])
+    gens = gens or list(spec["generators"])
+    summary = summarize(spec, rows, ceil, classes, gens)
+    last = live_rows(spec, rows, classes, gens)
     cur = spec.get("current") or {}
+    where = sorted({f"{r.get('device')} {r.get('versions')} {r.get('tl_env') or ''}".strip()
+                    for r in last.values()})
     lines = [f"{spec['name']}: {spec['op']}, {spec['dtype']}", "", gen_bench.table(summary), "",
              f"floor = max(bytes / {ceil['bw'] / 1e9:.0f} GB/s, passes x FLOPs / peak); peaks TF/s "
              + ", ".join(f"{k} {v / 1e12:g}" for k, v in sorted(ceil["peak"].items()))
@@ -199,13 +234,16 @@ def report(spec, rows, ceil, classes=None, every=False):
              f"current: {cur.get('label', 'none declared')}"
              + (f"; recorded, not same-lease: {cur['source']}" if "measured_us" in cur else ""),
              "candidates passing numerics / tried: "
-             + ", ".join(f"{s['block'].rsplit(', ', 1)[1]} {s['passed']}/{s['tried']}"
-                         for s in summary)]
+             + ", ".join(f"{s['class']} {s['passed']}/{s['tried']}" for s in summary),
+             "measured on: " + ("; ".join(where) or "nothing measured")]
+    warm = [s["class"] for s in summary if s["warm"]]
+    if warm:
+        lines.append(f"cache-warm timing (rotating inputs under {gen_bench.COLD_BYTES / 1e6:.0f} MB "
+                     f"at the set cap): {', '.join(warm)}")
     if every:
         lines += ["", "| class | arm | config | us | rel-L2 | max/rms | pcm rms | status |",
                   "|---|---|---|---|---|---|---|---|"]
-        for r in sorted({row_key(r): r for r in rows}.values(),
-                        key=lambda r: (r["class"], r.get("us") or 1e30)):
+        for r in sorted(last.values(), key=lambda r: (r["class"], r.get("us") or 1e30)):
             f = lambda v, p: "—" if v is None else format(v, p)
             lines.append(f"| {r['class']} | {r['arm']} | {cfg_label(r['cfg'])} | "
                          f"{f(r.get('us'), '.1f')} | {f(r.get('rel_l2'), '.1e')} | "
@@ -245,88 +283,117 @@ def measure(spec, cls, bind, base, sets, out):
     return row
 
 
+def error_text(e):
+    return f"{type(e).__name__}: {e}".splitlines()[0][:200]
+
+
+def tl_env(env):
+    return {k: v for k, v in sorted(env.items()) if k.startswith("TL_")}
+
+
+def run_class(spec, name, arms, kernels, lib, emit, expired):
+    """Measure `arms` ((arm, cfg) pairs) on one class; its inputs live only in this scope.
+    Returns how many arms the budget left unmeasured."""
+    import torch
+    cls = spec["classes"][name]
+    base = spec["inputs"](cls, 0)
+    nbytes = sum(base[k].numel() * base[k].element_size() for k in spec["rotate"])
+    nsets = gen_bench.cold_sets(nbytes)
+    sets = [dict(base, **{k: v for k, v in spec["inputs"](cls, s + 1).items() if k in spec["rotate"]})
+            for s in range(nsets)]
+    shape, dtype = spec["out"](cls)
+    out = torch.empty(shape, device="cuda", dtype=getattr(torch, dtype))
+    extra = {"cold": nbytes * nsets >= gen_bench.COLD_BYTES}
+    for i, (arm, cfg) in enumerate(arms):
+        if expired():
+            return len(arms) - i
+        if arm == "current":
+            bind = lambda inp, o: spec["current"]["bind"](lib, cls, inp, o)
+        else:
+            g = spec["generators"][arm]
+            key = (arm, json.dumps(cfg, sort_keys=True), name if g.get("static_shapes") else None)
+            if key not in kernels:
+                try:
+                    kernels[key] = (g["build"](cfg, cls), None)
+                except Exception as e:  # recorded for every class that would have used it
+                    kernels[key] = (None, error_text(e))
+            kern, err = kernels[key]
+            if err is not None:
+                emit(name, arm, cfg, extra, err=err)
+                continue
+            bind = lambda inp, o, g=g, kern=kern: g["bind"](kern, cls, inp, o)
+        emit(name, arm, cfg, extra, lambda: measure(spec, cls, bind, base, sets, out))
+    return 0
+
+
 def run(spec, a):
     import torch
     classes, gens = pick(spec, a)
     path = results_path(spec, a.out)
     path.parent.mkdir(parents=True, exist_ok=True)
-    done = set() if a.force else {row_key(r) for r in read_rows(path)}
+    keep = os.environ.get("GEN_SEARCH_TL")
+    if keep is not None:  # the queue runner's own TL_* toggles are not the submitter's
+        for k in [k for k in os.environ if k.startswith("TL_") and k not in keep.split(",")]:
+            del os.environ[k]
+    stamp = {"spec": spec["name"], "device": torch.cuda.get_device_name(),
+             "versions": versions(gens), "tl_env": tl_env(os.environ)}
+    same = lambda r: all(r.get(k) == v for k, v in stamp.items())
+    if a.force and path.is_file():
+        # drop the selection's recorded rows, so a forced sweep cut short by the budget cannot
+        # leave the old measurements selectable or resumable
+        arms = {"current", *gens}
+        kept = [r for r in read_rows(path) if not (r["class"] in classes and r["arm"] in arms)]
+        path.write_text("".join(json.dumps(r) + "\n" for r in kept))
+    done = {k for k, r in live_rows(spec, read_rows(path), classes, gens).items() if same(r)}
     t0 = time.monotonic()
-    stamp = {"spec": spec["name"], "device": torch.cuda.get_device_name(), "versions": versions(gens)}
-    data = {}
 
-    def class_data(name):
-        if name not in data:
-            data.clear()  # one class's cold sets on the device at a time
-            torch.cuda.empty_cache()
-            cls = spec["classes"][name]
-            base = spec["inputs"](cls, 0)
-            nbytes = sum(base[k].numel() * base[k].element_size() for k in spec["rotate"])
-            sets = [dict(base, **{k: v for k, v in spec["inputs"](cls, s + 1).items()
-                                  if k in spec["rotate"]})
-                    for s in range(gen_bench.cold_sets(nbytes))]
-            shape, dtype = spec["out"](cls)
-            data[name] = (base, sets, torch.empty(shape, device="cuda", dtype=getattr(torch, dtype)))
-        return data[name]
-
-    def emit(name, arm, cfg, fn=None, err=None):
-        row = dict(stamp, **{"class": name, "arm": arm, "cfg": cfg})
-        try:
-            if err is not None:
-                raise err
-            row.update(fn())
-        except Exception as e:  # a candidate that does not build or launch is a result
-            row.update(ok=False, error=f"{type(e).__name__}: {e}".splitlines()[0][:200])
+    def emit(name, arm, cfg, extra, fn=None, err=None):
+        row = dict(stamp, **{"class": name, "arm": arm, "cfg": cfg, "fp": class_fp(spec, name)}, **extra)
+        fatal = False
+        if err is None:
+            try:
+                row.update(fn())
+            except Exception as e:  # a candidate that does not launch is a result
+                err = error_text(e)
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    fatal = True
+        if err is not None:
+            row.update(ok=False, error=err)
         with path.open("a") as f:
             f.write(json.dumps(row) + "\n")
         print(json.dumps(row), flush=True)
+        if fatal:  # a device fault poisons the context: the remaining arms need a new process
+            raise SystemExit(f"{arm} {cfg_label(cfg)} on {name} left the CUDA context unusable; "
+                             f"the remaining arms are pending, submit again")
 
-    todo = []
-    cur = spec.get("current") or {}
-    if "lib" in cur:
-        names = [n for n in classes if (n, "current", "{}") not in done]
-        if names:
-            todo.append(("current", {}, names))
-    for gen, cfg, names in candidates(spec, classes, gens):
-        names = [n for n in names if (n, gen, json.dumps(cfg, sort_keys=True)) not in done]
-        if names:
-            todo.append((gen, cfg, names))
-    left = 0
-    for i, (arm, cfg, names) in enumerate(todo):
-        if time.monotonic() - t0 > a.budget_s:
-            left = len(todo) - i
-            break
-        if arm == "current":
-            import ctypes
-            lib_path = a.current_lib or Path(a.out) / f"{spec['name']}.current.so"
-            if not Path(lib_path).is_file():
-                raise SystemExit(f"{lib_path}: run build-current first (CPU, outside the queue)")
-            lib = ctypes.CDLL(str(lib_path))
-            for name in names:
-                cls = spec["classes"][name]
-                base, sets, out = class_data(name)
-                bind = lambda inp, o, cls=cls: cur["bind"](lib, cls, inp, o)
-                emit(name, arm, cfg, lambda: measure(spec, cls, bind, base, sets, out))
+    lib = None
+    if "lib" in (spec.get("current") or {}):
+        import ctypes
+        lib_path = Path(a.current_lib or Path(a.out) / f"{spec['name']}.current.so").resolve()
+        if not lib_path.is_file():
+            raise SystemExit(f"{lib_path}: run build-current first (CPU, outside the queue)")
+        lib = ctypes.CDLL(str(lib_path))
+    cands = candidates(spec, classes, gens)
+    kernels, left, total = {}, 0, 0
+    for name in classes:
+        arms = [("current", {})] if lib is not None else []
+        arms += [(gen, cfg) for gen, cfg, names in cands if name in names]
+        arms = [(arm, cfg) for arm, cfg in arms if (name, arm, json.dumps(cfg, sort_keys=True)) not in done]
+        total += len(arms)
+        if not arms:
             continue
-        g = spec["generators"][arm]
-        kern, kern_err = None, None
-        for name in names:
-            cls = spec["classes"][name]
-            if g.get("static_shapes") or (kern is None and kern_err is None):
-                try:
-                    kern, kern_err = g["build"](cfg, cls), None
-                except Exception as e:
-                    kern, kern_err = None, e
-            if kern_err is not None:
-                emit(name, arm, cfg, err=kern_err)
-                continue
-            base, sets, out = class_data(name)
-            bind = lambda inp, o, cls=cls, kern=kern: g["bind"](kern, cls, inp, o)
-            emit(name, arm, cfg, lambda: measure(spec, cls, bind, base, sets, out))
+        if time.monotonic() - t0 > a.budget_s:
+            left += len(arms)
+            continue
+        torch.cuda.empty_cache()
+        left += run_class(spec, name, arms, kernels, lib, emit,
+                          lambda: time.monotonic() - t0 > a.budget_s)
     print()
-    print(report(spec, read_rows(path), gen_bench.load_ceilings(a.ceilings), classes))
+    print(report(spec, read_rows(path), gen_bench.load_ceilings(a.ceilings), classes, gens))
     if left:
-        print(f"\nbudget {a.budget_s}s reached: {left} of {len(todo)} configs not run; "
+        print(f"\nbudget {a.budget_s:g}s reached: {left} of {total} runs not measured; "
               f"submit again to resume")
 
 
@@ -362,37 +429,45 @@ def build_current(spec, a):
     print(out)
 
 
-def queued_search_jobs(gpuq):
-    """Labels of gen_search jobs still queued or running (one job at a time per the GPU budget)."""
+def queued_jobs(gpuq, label):
+    """Queue ids of this spec's search jobs still queued or running. The guard is per spec:
+    workstreams own different specs, and the one-queued-lease-per-agent rule is the agent's."""
     text = subprocess.run([sys.executable, str(gpuq), "status"], capture_output=True, text=True,
                           check=True).stdout
     busy = []
     for line in text.splitlines():
-        job = ast.literal_eval(line.split(" ", 1)[1])
-        if job["state"] in ("queued", "running") and job["label"].startswith("gs-"):
-            busy.append(job["label"])
+        job_id, job = line.split(" ", 1)
+        job = ast.literal_eval(job)
+        if job["state"] in ("queued", "running") and job["label"] == label:
+            busy.append(job_id)
     return busy
 
 
-def submit_command(spec, a, env, argv):
-    """The queued command: timeout + forwarded compiler env + the same arguments as `run`."""
-    fwd = [f"{k}={env[k]}" for k in FORWARD_ENV if env.get(k)]
-    fwd += [f"{k}={v}" for k, v in sorted(env.items()) if k.startswith("TL_")]
-    return ["timeout", "--kill-after=60s", str(JOB_SECONDS), "env", *fwd,
+def submit_command(env, argv):
+    """The queued command: a 15 min bound, the submitter's compiler environment in place of the
+    queue runner's (set or explicitly unset), then the same arguments as `run`."""
+    tl = tl_env(env)
+    fwd = [x for k in FORWARD_ENV if not env.get(k) for x in ("-u", k)]
+    fwd += [f"{k}={env[k]}" for k in FORWARD_ENV if env.get(k)]
+    fwd += [f"{k}={v}" for k, v in tl.items()] + ["GEN_SEARCH_TL=" + ",".join(tl)]
+    return ["timeout", f"--kill-after={JOB_KILL_S}s", str(JOB_TERM_S), "env", *fwd,
             env.get("PYREF", "python3"), str(HERE / "gen_search.py"), "run", *argv]
 
 
 def submit(spec, a, argv):
-    if a.budget_s > JOB_SECONDS - 120:
-        raise SystemExit(f"--budget-s over {JOB_SECONDS - 120}: a queue job is 15 min")
+    if a.budget_s > JOB_TERM_S - BUDGET_MARGIN_S:
+        raise SystemExit(f"--budget-s over {JOB_TERM_S - BUDGET_MARGIN_S}: a queue job is 15 min")
     gpuq = REPO / "scripts" / "bench" / "gpuq.py"
-    busy = queued_search_jobs(gpuq)
-    if busy:
-        raise SystemExit(f"gen_search job already in the queue: {', '.join(busy)}")
-    cmd = submit_command(spec, a, os.environ, argv)
     label = "gs-" + spec["name"].replace("_", "-")
     Path(a.out).mkdir(parents=True, exist_ok=True)
-    subprocess.run([sys.executable, str(gpuq), "submit", label, "1", *cmd], check=True)
+    with open(Path(tempfile.gettempdir()) / "plow-gen-search.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        busy = queued_jobs(gpuq, label)
+        if busy:
+            raise SystemExit(f"{label} is already in the queue ({', '.join(busy)}); it resumes "
+                             f"from the recorded rows, wait for it")
+        subprocess.run([sys.executable, str(gpuq), "submit", label, "1",
+                        *submit_command(os.environ, argv)], check=True)
     print(f"queued {label}; rows -> {results_path(spec, a.out)}; job log in the queue root")
 
 
@@ -410,7 +485,7 @@ def main(argv=None):
         if name != "plan":
             p.add_argument("--out", required=True, help="campaign scratch directory")
         if name in ("submit", "run"):
-            p.add_argument("--budget-s", type=float, default=780.0)
+            p.add_argument("--budget-s", type=float, default=float(JOB_TERM_S - BUDGET_MARGIN_S))
             p.add_argument("--current-lib")
             p.add_argument("--force", action="store_true", help="re-measure rows already recorded")
         if name == "report":
@@ -423,7 +498,7 @@ def main(argv=None):
                   f"generators {', '.join(spec['generators'])}")
         return
     spec = load_spec(a.spec)
-    if a.cmd != "plan" and REPO in Path(a.out).resolve().parents:
+    if a.cmd != "plan" and Path(a.out).resolve().is_relative_to(REPO):
         raise SystemExit("--out is campaign scratch outside the repo")
     if a.cmd == "plan":
         plan(spec, a)
@@ -434,9 +509,9 @@ def main(argv=None):
     elif a.cmd == "run":
         run(spec, a)
     else:
-        classes, _ = pick(spec, a)
+        classes, gens = pick(spec, a)
         print(report(spec, read_rows(results_path(spec, a.out)), gen_bench.load_ceilings(a.ceilings),
-                     classes, a.all))
+                     classes, gens, a.all))
 
 
 if __name__ == "__main__":

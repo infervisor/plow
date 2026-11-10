@@ -1,6 +1,8 @@
 import contextlib
 import io
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,8 +39,12 @@ def spec(**over):
     return s
 
 
-def row(cls, arm, cfg, us, ok=True, l2=1e-5):
-    return {"class": cls, "arm": arm, "cfg": cfg, "us": us, "ok": ok, "rel_l2": l2}
+T16, T32, TR = {"bm": 16, "stages": 1}, {"bm": 32, "stages": 1}, {"bk": 64}
+
+
+def row(cls, arm, cfg, us, ok=True, l2=1e-5, **over):
+    over.setdefault("fp", None) or over.update(fp=gen_search.class_fp(spec(), cls))
+    return {"class": cls, "arm": arm, "cfg": cfg, "us": us, "ok": ok, "rel_l2": l2, **over}
 
 
 class SpecTests(unittest.TestCase):
@@ -110,7 +116,21 @@ class RooflineTests(unittest.TestCase):
     def test_cold_sets_exceed_l2(self):
         self.assertEqual(gen_bench.cold_sets(53e6), 4)
         self.assertEqual(gen_bench.cold_sets(1e9), 2)
-        self.assertEqual(gen_bench.cold_sets(1e3), 16)
+        for nbytes in (53e6, 3e6, 1e9):
+            self.assertGreaterEqual(gen_bench.cold_sets(nbytes) * nbytes, gen_bench.COLD_BYTES)
+        # under the cap's reach the caller flags the class cache-warm
+        self.assertEqual(gen_bench.cold_sets(1e3), gen_bench.COLD_SETS_MAX)
+
+    def test_error_ratio_of_a_zero_reference(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("no torch")
+        z, one = torch.zeros(2, 4), torch.ones(2, 4)
+        self.assertEqual(gen_bench.rel_err(z, z.double()), (0.0, 0.0))
+        self.assertEqual(gen_bench.rel_err(one, z.double())[1], float("inf"))
+        self.assertAlmostEqual(gen_bench.rel_err(one * 1.5, one.double())[1], 0.5)
+        self.assertAlmostEqual(gen_bench.pcm_rms(one * 0.5, torch.cat([one[:1], one[:1] * 0.5])), 0.5)
 
     def test_pcm_bound(self):
         self.assertAlmostEqual(gen_bench.PCM_RMS_BOUND, 8.81e-6, delta=1e-8)
@@ -127,20 +147,37 @@ class RooflineTests(unittest.TestCase):
 
 class TableTests(unittest.TestCase):
     def test_summary_picks_the_fastest_passing_candidate(self):
-        rows = [row("b8", "tilelang", {"bm": 16}, 16.0), row("b8", "tilelang", {"bm": 32}, 12.0, ok=False),
-                row("b8", "triton", {"bk": 64}, 14.0), row("b8", "triton", {"bk": 64}, 14.5),
-                row("b1", "tilelang", {"bm": 16}, 5.0)]
+        rows = [row("b8", "tilelang", T16, 16.0), row("b8", "tilelang", T32, 12.0, ok=False),
+                row("b8", "triton", TR, 14.0), row("b8", "triton", TR, 14.5),
+                row("b1", "tilelang", T16, 5.0)]
         b1, b8 = gen_search.summarize(spec(), rows, CEIL)
         self.assertEqual((b8["gen_us"], b8["gen_label"], b8["tried"], b8["passed"]),
                          (14.5, "triton bk64", 3, 2))
+        only = gen_search.summarize(spec(), rows, CEIL, ["b8"], ["tilelang"])
+        self.assertEqual((len(only), only[0]["gen_label"], only[0]["tried"]),
+                         (1, "tilelang bm16 stages1", 2))
         self.assertAlmostEqual(b8["floor_us"], 8.0)
         self.assertEqual(b8["verdict"], "role-object candidate (5.5% of step)")
         self.assertEqual((b1["cur_us"], b1["verdict"]), (4.0, "leave: plow kernel ahead"))
 
+    def test_stale_and_obsolete_rows_never_count(self):
+        rows = [row("b8", "tilelang", T16, 16.0),
+                row("b8", "tilelang", T32, 9.0, fp="0" * 12),         # another geometry / tol
+                row("b8", "tilelang", {"bm": 64, "stages": 1}, 8.0),  # config left the grid
+                row("b1", "tilelang", {"bm": 16, "stages": 3}, 1.0),  # no longer valid for b1
+                row("b9", "tilelang", T16, 1.0, fp="x")]              # class left the spec
+        b1, b8 = gen_search.summarize(spec(), rows, CEIL)
+        self.assertEqual((b8["gen_us"], b8["tried"], b1["gen_us"], b1["tried"]), (16.0, 1, None, 0))
+        self.assertNotEqual(gen_search.class_fp(spec(), "b8"), gen_search.class_fp(spec(), "b1"))
+        self.assertNotEqual(gen_search.class_fp(spec(), "b8"),
+                            gen_search.class_fp(spec(tol={"rel_l2": 1e-4}), "b8"))
+        stepless = spec(classes={"b1": {"B": 1}, "b8": {"B": 8}})
+        self.assertEqual(gen_search.class_fp(spec(), "b8"), gen_search.class_fp(stepless, "b8"))
+
     def test_measured_current_rows_and_missing_arms(self):
         s = spec(current={"label": "probe", "lib": {"src": "x.cu", "flags": []},
                           "bind": lambda *a: None})
-        rows = [row("b8", "current", {}, 30.0), row("b8", "tilelang", {"bm": 16}, 24.0)]
+        rows = [row("b8", "current", {}, 30.0), row("b8", "tilelang", T16, 24.0)]
         b1, b8 = gen_search.summarize(s, rows, CEIL)
         self.assertEqual((b8["cur_us"], b8["cur_note"]), (30.0, ""))
         self.assertEqual((b1["cur_us"], b1["gen_us"], b1["verdict"]), (None, None, "no valid candidate"))
@@ -158,22 +195,37 @@ class TableTests(unittest.TestCase):
         self.assertEqual(lines[3], "| Gemm, b1 | — | — | — | 1.0 | — | — | — | — | w |")
 
     def test_report_names_ceilings_and_recorded_current(self):
-        text = gen_search.report(spec(), [row("b8", "tilelang", {"bm": 16}, 16.0)], CEIL, every=True)
+        rows = [row("b8", "tilelang", T16, 16.0, cold=False, device="H100")]
+        text = gen_search.report(spec(), rows, CEIL, every=True)
         self.assertIn("floor = max(bytes / 3000 GB/s", text)
         self.assertIn("recorded, not same-lease: sweep", text)
         self.assertIn("b1 0/0, b8 1/1", text)
-        self.assertIn("| b8 | tilelang | bm16 | 16.0 |", text)
+        self.assertIn("measured on: H100", text)
+        self.assertIn("cache-warm timing (rotating inputs under 160 MB at the set cap): b8", text)
+        self.assertIn("| b8 | tilelang | bm16 stages1 | 16.0 |", text)
+        self.assertNotIn("cache-warm", gen_search.report(spec(), [row("b8", "tilelang", T16, 16.0)], CEIL))
 
 
 class CliTests(unittest.TestCase):
     def test_submit_command_is_a_bounded_queue_job_with_the_compiler_env(self):
         env = {"PATH": "/x/bin", "NVCC_PREPEND_FLAGS": "-ccbin g++-14", "TL_WG": "1", "PYREF": "/py",
                "PLOW_NVCC": "nvcc", "HOME": "/h"}
-        cmd = gen_search.submit_command(spec(), None, env, ["toy", "--out", "/s"])
-        self.assertEqual(cmd[:4], ["timeout", "--kill-after=60s", "900", "env"])
-        self.assertEqual(cmd[4:7], ["PATH=/x/bin", "NVCC_PREPEND_FLAGS=-ccbin g++-14", "TL_WG=1"])
-        self.assertEqual(cmd[7], "/py")
-        self.assertEqual(cmd[8:], [str(gen_search.HERE / "gen_search.py"), "run", "toy", "--out", "/s"])
+        cmd = gen_search.submit_command(env, ["toy", "--out", "/s"])
+        self.assertEqual(cmd[:4], ["timeout", "--kill-after=30s", "840", "env"])
+        self.assertLessEqual(gen_search.JOB_TERM_S + gen_search.JOB_KILL_S, 900)
+        # set what the submitter has, unset what it lacks: the runner's environment is another's
+        # (env takes its -u options before any assignment)
+        self.assertEqual(cmd[4:12], ["-u", "CUDA_HOME", "-u", "LD_LIBRARY_PATH", "PATH=/x/bin",
+                                     "NVCC_PREPEND_FLAGS=-ccbin g++-14", "TL_WG=1", "GEN_SEARCH_TL=TL_WG"])
+        real = gen_search.submit_command({"PATH": os.environ["PATH"], "TL_WG": "1"}, [])
+        probe = subprocess.run([*real[3:real.index("python3")], "sh", "-c",
+                                "echo ${CUDA_HOME-unset} $TL_WG $GEN_SEARCH_TL"],
+                               env={"CUDA_HOME": "/stale", "PATH": os.environ["PATH"]},
+                               capture_output=True, text=True)
+        self.assertEqual(probe.stdout.split(), ["unset", "1", "TL_WG"])
+        self.assertEqual(cmd[12], "/py")
+        self.assertEqual(cmd[13:], [str(gen_search.HERE / "gen_search.py"), "run", "toy", "--out", "/s"])
+        self.assertIn("GEN_SEARCH_TL=", gen_search.submit_command({}, []))
 
     def test_results_resume_key_and_repo_guard(self):
         with tempfile.TemporaryDirectory() as d:
@@ -183,8 +235,9 @@ class CliTests(unittest.TestCase):
             path.write_text(json.dumps(row("b8", "triton", {"b": 1, "a": 2}, 1.0)) + "\n")
             self.assertEqual(gen_search.row_key(gen_search.read_rows(path)[0]),
                              ("b8", "triton", '{"a": 2, "b": 1}'))
-        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            gen_search.main(["report", "s3gen_cfm_attn", "--out", str(gen_search.HERE)])
+        for inside in (gen_search.HERE, gen_search.REPO):
+            with self.assertRaises(SystemExit):
+                gen_search.main(["report", "s3gen_cfm_attn", "--out", str(inside)])
 
     def test_plan_and_list_run_without_a_gpu(self):
         buf = io.StringIO()
