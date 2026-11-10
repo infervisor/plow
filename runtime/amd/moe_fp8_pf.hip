@@ -733,16 +733,19 @@ __device__ __forceinline__ void mfp_vmwait() {
  * fragment reads wait for the k-step just issued, i.e. no lookahead at all. The waits are the
  * explicit mfp_vmwait ones. Sound because no compiler-tracked global load is in flight across
  * the k-loop (its only vector-memory ops are these and the epilogue stores).
+ * CDNA3/CDNA4 require one wait state between an SALU write of M0 and an LDS-DMA load that
+ * reads it (ISA 4.5, LLVM ReadM0LdsDmaHazard); the compiler cannot see inside the asm string,
+ * so the `s_nop 0` is spelled here.
  * Lane l writes LDS [dst + W l, +W), dst wave-uniform. */
 template <int W>
 __device__ __forceinline__ void mfp_dma(const void* src, void* dst) {
 #ifdef __HIP_DEVICE_COMPILE__
     const unsigned m0 = __builtin_amdgcn_readfirstlane((unsigned)(size_t)dst);
     if constexpr (W == 16)
-        asm volatile("s_mov_b32 m0, %1\n\tglobal_load_lds_dwordx4 %0, off" ::"v"(src), "s"(m0)
+        asm volatile("s_mov_b32 m0, %1\n\ts_nop 0\n\tglobal_load_lds_dwordx4 %0, off" ::"v"(src), "s"(m0)
                      : "memory", "m0");
     else
-        asm volatile("s_mov_b32 m0, %1\n\tglobal_load_lds_dword %0, off" ::"v"(src), "s"(m0)
+        asm volatile("s_mov_b32 m0, %1\n\ts_nop 0\n\tglobal_load_lds_dword %0, off" ::"v"(src), "s"(m0)
                      : "memory", "m0");
 #else
     (void)src;
