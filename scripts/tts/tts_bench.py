@@ -79,7 +79,8 @@ def one(url, model, voice, text, stream, seed, extra):
     total = time.perf_counter() - t0
     pcm = b"".join(chunks)
     gaps, gap_s, stalls = underruns(arrivals if chunks else [], SR)
-    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s, stalls=stalls)
+    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s, stalls=stalls,
+                t0=t0, chunks=[(round(t - t0, 4), n) for t, n in arrivals])
 
 
 def one_ws(url, model, voice, text, seed, extra):
@@ -115,7 +116,8 @@ def one_ws(url, model, voice, text, seed, extra):
     total = time.perf_counter() - t0
     pcm = b"".join(chunks)
     gaps, gap_s, stalls = underruns(arrivals if chunks else [], SR)
-    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s, stalls=stalls)
+    return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm, gaps=gaps, gap_s=gap_s, stalls=stalls,
+                t0=t0, chunks=[(round(t - t0, 4), n) for t, n in arrivals])
 
 
 def pct(xs, q):
@@ -211,6 +213,8 @@ def main():
             texts[name] = dict(text=text, language=LANG_OF[text]) if args.prompt_set == "chatterbox-mtl" else text
         rows.append(dict(i=i, speaker=spk, ttfa_s=r["ttfa_s"], latency_s=r["latency_s"], audio_s=r["audio_s"],
                          gaps=r["gaps"], gap_s=r["gap_s"], stalls=r.get("stalls", 0),
+                         # request start (client clock) and every chunk as (seconds after it, bytes)
+                         t0=r.get("t0"), chunks=r.get("chunks", []),
                          rtf=r["latency_s"] / r["audio_s"] if r["audio_s"] else None))
     ok = [r for r in rows if r["audio_s"] > 0]
     if not ok:
