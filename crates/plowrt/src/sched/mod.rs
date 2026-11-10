@@ -17,6 +17,7 @@ pub mod mdq;
 pub mod multistep;
 pub mod prefill;
 pub mod ride;
+pub mod row_plan;
 pub mod rungs;
 pub mod slo;
 pub mod spec;
