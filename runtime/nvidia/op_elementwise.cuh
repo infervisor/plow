@@ -432,6 +432,8 @@ static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16*
     }
 }
 
+/* Only the speech object dispatches these modes (interp_sm120.cu, PLOW_DOP_GEMV_F32_OUT). */
+#if PLOW_NV_SPEECH
 /* GemvF32Out modes (i7 != 0; Maya 2's depth projections): bit 0 x is f32, bit 1 W is f16, bit 2 adds
  * an f32 bias t3[N] (bit 9: t3[M / bgroup][N], one row per group of bgroup rows), bit 3 adds an f32
  * residual t4[M][N] (may alias C: each element is read then written by the one lane that owns it),
@@ -955,6 +957,7 @@ static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W
     default: gemv_f32out_mode<true, true>(C, x, W, bias, bgroup, res, act, M, N, K, slice, nblk); break;
     }
 }
+#endif /* PLOW_NV_SPEECH */
 
 /* SampleSmallF32 (op 221): one block per row of f32 logits; see dev.rs. Arena: PLOW_NV_WARPS u64 +
  * PLOW_NV_WARPS f32 reduction slots, 64 selected classes and values, the row (f32), then the top-k
