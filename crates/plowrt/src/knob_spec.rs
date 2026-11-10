@@ -763,6 +763,7 @@ const PROCESS_FAMILIES: &[&str] = &[
 const PROCESS_KNOBS: &[&str] = &[
     "PLOW_ANE",
     "PLOW_BACKEND",
+    "PLOW_BUCKET_LOG_S",
     "PLOW_CHECKPOINT",
     "PLOW_CTR_SNAP",
     "PLOW_DEFAULT_CHAT_TEMPLATE_KWARGS",
@@ -1021,6 +1022,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.host_timing", Some("PLOW_HOST_TIMING"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.bucket_log_s", Some("PLOW_BUCKET_LOG_S"), Layer::Runtime, U32, Default::Static(Val::Nat(300)), DIAG),
     KnobSpec::new("rt.pfx_log", Some("PLOW_PFX_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pfx_trace", Some("PLOW_PFX_TRACE"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.chat_defaults", Some("PLOW_CHAT_DEFAULTS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),

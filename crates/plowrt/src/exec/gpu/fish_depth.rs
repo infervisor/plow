@@ -569,6 +569,16 @@ impl FishDepth {
 }
 
 impl GpuEngine {
+    /// Declare the prefill buckets and depth programs to `buckets` and count launches into it.
+    pub fn observe_buckets(&mut self, buckets: Arc<crate::obs::bucket::BucketDemand>) {
+        use crate::obs::bucket::Family;
+        buckets.declare(Family::Prefill, self.prefill.iter().map(|b| b.t as usize));
+        if let Some(d) = &self.fish {
+            buckets.declare(Family::Depth, d.programs.iter().map(|p| p.rows as usize));
+        }
+        self.buckets = buckets;
+    }
+
     pub(super) fn quarantine_depth_source(&self) {
         if let Some(d) = &self.fish {
             d.quarantine();
@@ -828,6 +838,8 @@ impl GpuEngine {
             ));
         }
         let n = p.rows as usize;
+        self.buckets
+            .record(crate::obs::bucket::Family::Depth, width, n, None);
         let k = d.manifest.codebooks as usize;
         {
             let s = depth_stage(&mut d.stage)?;
@@ -957,6 +969,8 @@ impl GpuEngine {
                 ))
             })?;
         let n = p.rows as usize;
+        self.buckets
+            .record(crate::obs::bucket::Family::Depth, width, n, None);
         let k = d.manifest.codebooks as usize;
         let vocab = self.vocab();
         let m = d.maya2.as_mut().unwrap();

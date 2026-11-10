@@ -288,8 +288,16 @@ impl GpuEngine {
                 .find(|(_, bucket)| bucket.t as usize >= rows)
                 .map(|(index, bucket)| (index, bucket.t))
                 .ok_or_else(|| {
+                    self.buckets
+                        .record_demand(crate::obs::bucket::Family::Prefill, rows);
                     RuntimeError::Rejected("CUDA token-batch capacity exceeded".into())
                 })?;
+            self.buckets.record(
+                crate::obs::bucket::Family::Prefill,
+                rows,
+                capacity as usize,
+                None,
+            );
             let plan = state
                 .staging
                 .stage(

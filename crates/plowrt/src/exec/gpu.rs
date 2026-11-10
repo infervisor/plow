@@ -3046,6 +3046,8 @@ pub struct GpuEngine {
     slot_generations: Vec<u32>,
     /// Fish S2 depth stage ([`fish_depth`]); `None` for every other packet.
     fish: Option<fish_depth::FishDepth>,
+    /// The serving model's bucket-demand counters (unobserved until `observe_buckets`).
+    buckets: Arc<crate::obs::bucket::BucketDemand>,
     /// The serial prefill's last chunk's terminal row (its lm_head row of `act.hn`).
     pf_terminal_row: u32,
     /// Span-mode verify (`in.rowslot` packets); see [`spec`].
@@ -8154,6 +8156,7 @@ impl GpuEngine {
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
             fish: None,
+            buckets: Default::default(),
             pf_terminal_row: 0,
             spec,
             spec_draft: None,

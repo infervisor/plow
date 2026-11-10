@@ -144,6 +144,13 @@ campaign.py rung-sweep ... --stage verify      # mixed packet; per-rung program 
   rungs and the mixed packet's own full gates (`campaign.py gate`, llm_fp32_ref included); then the
   snippet goes into the canonical recipe.
 
+## Production bucket demand
+
+`bucket_demand.py <metrics URL or file> [<later file>]` reads a serving plowrt's `plowrt_bucket_*`
+series (`docs/runtime/host-path.md` "Bucket demand") and prints, per model and launch family, the
+declared capacities, the row counts live traffic launched with, the padded fraction, and the 1 to
+3 capacities whose addition removes the most padded rows. CPU only; it changes no recipe.
+
 ## AMD
 
 AMD (GLM) block harness and matched ROCm serving: [docs/bringup/05-single-block-sweep.md](../../docs/bringup/05-single-block-sweep.md)

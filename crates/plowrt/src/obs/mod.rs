@@ -1,5 +1,6 @@
 //! §K Profiling & telemetry — per-SM/per-task timing + aggregate metrics.
 
+pub mod bucket;
 pub mod dstep;
 pub mod host;
 pub mod logwriter;
@@ -17,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Default)]
 pub struct Metrics {
     pub serving: serving::ServingMetrics,
+    /// Launch row demand against the packet's capacities; shared with the engine and the codec.
+    pub buckets: std::sync::Arc<bucket::BucketDemand>,
     pub requests: AtomicU64,
     pub tokens: AtomicU64,
     /// Requests refused before or during service: capacity (no free slot),

@@ -1283,6 +1283,7 @@ impl ServingMetrics {
                 }
             }
         }
+        super::bucket::write(out, models, &labels);
         crate::serve::turns::write_metrics(out);
         family(out, "plowrt_overload_level", "gauge", "Overload level: 0 normal, 1 ASR partials stretched, 2 TTS render-ahead capped, 3 new sessions shed.");
         let _ = writeln!(
