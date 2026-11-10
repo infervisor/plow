@@ -629,6 +629,16 @@ fn fused_kv_headnormrope_is_an_nvidia_only_arm() {
             "Metal HeadNormRope ignores i[7]"
         );
     }
+    for arch in ["cpu", "amx", "avx512"] {
+        assert!(target_is_cpu(arch, ""), "{arch}");
+        let _nv = EmitAmdGuard::set(target_is_amd(arch, ""));
+        let _cpu = EmitCpuGuard::set(target_is_cpu(arch, ""));
+        assert!(
+            !fuse_kv_hnr_target_supported(),
+            "the CPU golden HeadNormRope ignores i[7] ({arch})"
+        );
+    }
+    assert!(!target_is_cpu("sm_90a", ""));
     let _amd = EmitAmdGuard::set(true);
     assert!(
         !fuse_kv_hnr_target_supported(),

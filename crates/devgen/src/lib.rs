@@ -544,9 +544,32 @@ pub(crate) fn emit_is_apple() -> bool {
 /// `PLOW_FUSE_KV_HNR` (HeadNormRope `i[7] = 1`: the K op also writes the V cache from t7) has a
 /// device arm only in the NVIDIA interpreters (interp_sm120.cu, included by sm89/sm90a). The
 /// AMD, Metal and CPU-golden ops never read `i[7]`, so an emit for them keeps the separate V
-/// writer. The CPU target installs the AMD inventory guard, so it is excluded here too.
+/// writer.
 pub(crate) fn fuse_kv_hnr_target_supported() -> bool {
-    !emit_is_amd() && !emit_is_apple()
+    !emit_is_amd() && !emit_is_apple() && !EMIT_IS_CPU.with(|c| c.get())
+}
+
+thread_local! {
+    static EMIT_IS_CPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scoped "the target is the plowrt CPU engine" flag ([`target_is_cpu`]). A CPU target takes the
+/// NVIDIA emit decisions, so neither of the other two guards marks it.
+struct EmitCpuGuard {
+    prev: bool,
+}
+
+impl EmitCpuGuard {
+    fn set(cpu: bool) -> Self {
+        let prev = EMIT_IS_CPU.with(|c| c.replace(cpu));
+        Self { prev }
+    }
+}
+
+impl Drop for EmitCpuGuard {
+    fn drop(&mut self) {
+        EMIT_IS_CPU.with(|c| c.set(self.prev));
+    }
 }
 
 /// Scoped "the target is an Apple GPU (metal3)" flag, as [`EmitAmdGuard`] for AMD.
@@ -10808,6 +10831,7 @@ fn emit_dense_gqa(
     // Same no-target rule as run_verified's guard: legacy (golden) emission stays AMD.
     let _emit_target = EmitAmdGuard::set(amd || (arch.is_empty() && gpu.is_empty()));
     let _apple_target = EmitAppleGuard::set(arch == "metal3");
+    let _cpu_target = EmitCpuGuard::set(target_is_cpu(&arch, &gpu));
     // Same reason as the other entry: the tile selector must cost against THIS part, and
     // `--arch` is the fallback when --gpu cannot answer.
     if amd {
