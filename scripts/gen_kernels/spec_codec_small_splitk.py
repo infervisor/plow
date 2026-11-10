@@ -90,7 +90,8 @@ SPEC = {
     "rotate": ["x"],
     "out": lambda c: ((c["M"], c["N"]), "float32"),
     "reference": _reference,
-    "tol": {"rel_l2": 1e-5},
+    # the served split-bf16 tiles are gated at 1e-4 against the golden (speech_f32_op_test)
+    "tol": {"rel_l2": 1e-4},
     "generators": {
         "tilelang": {"grid": {"bm": [64], "bn": [64], "threads": [128], "stages": [3], "parts": [1, 2, 4]},
                      "build": _tl_build_tracked, "bind": _tl_bind, "static_shapes": True},

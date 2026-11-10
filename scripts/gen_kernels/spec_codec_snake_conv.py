@@ -22,7 +22,8 @@ SPEC = {
     "rotate": ["x"],
     "out": lambda c: ((c["B"], c["T"], c["cout"]), "float32"),
     "reference": cc.conv_reference,
-    "tol": {"rel_l2": 1e-5},
+    # the served split-bf16 tiles are gated at 1e-4 against the golden (speech_f32_op_test)
+    "tol": {"rel_l2": 1e-4},
     "generators": cc.conv_generators(
         {"bm": [128], "bn": [96, 128], "bk": [32], "threads": [256], "stages": [2]},
         {"bm": [128], "bn": [64, 128], "bk": [32], "warps": [4], "stages": [3]}),

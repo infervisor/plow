@@ -880,11 +880,11 @@ static void t_conv_beta(const char* name, const ConvSpec& s) {
     t_conv_invariant(name, s, false);
     Case c; unsigned o;
     build_conv(c, s, false, o);
-    run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
     const size_t n = c.host[o].size() / 4;
+    const unsigned u = c.add(n * 4);
+    run(name, c, g_conv1d_f32, {o}, FP32, 1e-4);
     std::vector<uint32_t> fused(n), two(n);
     CK(cudaMemcpy(fused.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
-    const unsigned u = c.add(n * 4);
     void** td = upload_table(c.dev);
     PlowDevInst conv = c.in;
     conv.fj[2].u &= ~(4u | (15u << 8));
