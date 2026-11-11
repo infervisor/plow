@@ -1106,7 +1106,8 @@ The default is 400 ms; durations above 3000 ms are clamped. Native tags remain a
 segments; mappings marked `carry` are repeated on later segments.
 Responses report canonical names in `x-plow-tags-applied` and `x-plow-tags-dropped`
 (up to 32 distinct names each). WebSocket speech sends one `{"type":"tags","applied":...,"dropped":...}`
-text message before its binary audio when tags were applied or dropped.
+text message before its binary audio when tag processing is active. Both lists can be empty
+when processing only markup or preserved literal forms. `tags: "off"` sends no tag report.
 
 For existing packets without tag metadata, `PLOW_TTS_TAGS_DEFAULT=strip`
 (`--tts-tags-default strip`) enables the shared strip-and-silence policy at load.
