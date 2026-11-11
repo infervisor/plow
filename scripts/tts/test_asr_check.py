@@ -6,7 +6,85 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
-from asr_check import cer_report, main, norm_seed_en, seed_en_asr, seed_wer_report
+from asr_check import (cer_report, forbid_hits, main, norm_seed_en, relative_cer,
+                       seed_en_asr, seed_wer_report, signal_report, tag_gates, validate_signal)
+
+
+class TagGateTests(unittest.TestCase):
+    def test_forbid_word_boundaries_unicode_and_phrases(self):
+        self.assertEqual(forbid_hits("Laughing at a style, equals six.", ["laugh", "style", "equals six"], "en"),
+                         ["style", "equals six"])
+        self.assertEqual(forbid_hits("यह हिंदी शैली है", ["हिंदी", "शैल", "शैली"], "hi"), ["हिंदी", "शैली"])
+        self.assertEqual(forbid_hits("你好笑声", ["笑"], "zh"), ["笑"])
+        for bad in (["!"], "style", [""]):
+            with self.assertRaises(ValueError):
+                forbid_hits("", bad)
+
+    def test_signal_requires_pause_at_correct_join_and_duration_delta(self):
+        import wave
+        with tempfile.TemporaryDirectory() as directory:
+            with wave.open(str(Path(directory) / "control.wav"), "wb") as wav:
+                wav.setparams((1, 2, 1000, 0, "NONE", "not compressed"))
+                wav.writeframes(b"\1\0" * 200)
+            samples = [0.2] * 100 + [0.0] * 600 + [0.2] * 100
+            meta = dict(pauses=[dict(ms=600, window_ms=[90, 110])],
+                        duration_delta=dict(baseline="control.wav", ms=600))
+            report = signal_report(samples, 1000, meta, directory)
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["pauses"][0]["error_ms"], 0)
+            meta["pauses"][0]["window_ms"] = [200, 300]
+            self.assertFalse(signal_report(samples, 1000, meta, directory)["passed"])
+            meta["pauses"] = [dict(ms=500, window_ms=[90, 110])]
+            self.assertFalse(signal_report(samples, 1000, meta, directory)["passed"])
+            meta["pauses"] = [dict(ms=600, window_ms=[90, 110])] * 2
+            self.assertFalse(signal_report(samples, 1000, meta, directory)["passed"])
+
+    def test_signal_edges_tolerance_and_invalid_metadata(self):
+        for position, samples in [("leading", [0.] * 600 + [.2] * 100),
+                                  ("trailing", [.2] * 100 + [0.] * 600)]:
+            self.assertTrue(signal_report(samples, 1000, dict(pauses=[dict(ms=680, position=position)]), ".")["passed"])
+            self.assertFalse(signal_report(samples, 1000, dict(pauses=[dict(ms=681, position=position)]), ".")["passed"])
+        for meta in (dict(pauses=[dict(ms=400)]), dict(pauses=[None]),
+                     dict(pauses=[dict(ms=float("nan"))]), dict(duration_delta=[])):
+            with self.assertRaises(ValueError):
+                validate_signal(meta)
+        with self.assertRaises(ValueError):
+            signal_report([float("nan")], 1000, {}, ".")
+        with self.assertRaises(ValueError):
+            signal_report([0.], 0, {}, ".")
+
+    def test_relative_gate_rejects_ambiguity_and_does_not_hide_one_failure(self):
+        baseline = dict(rows=[dict(case_id="base", text="plain", language="en", cer=.1)])
+        rows = [dict(text="plain", hyp="style plain", language="en", baseline="base", cer=.2, forbid=["style"])]
+        report = tag_gates(rows, baseline, .05)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["forbid_hits"], 1)
+        self.assertFalse(rows[0]["relative_cer"]["passed"])
+        baseline["rows"] *= 2
+        with self.assertRaises(ValueError):
+            relative_cer(rows[0], baseline, .05)
+
+    def test_neutral_fixture_has_all_shapes_in_both_languages(self):
+        cases = json.loads(Path(__file__).with_name("tag_cases.json").read_text())
+        self.assertEqual(len(cases), 74)
+        for lang in ("en", "hi"):
+            rows = [r for r in cases if r["language"] == lang]
+            self.assertEqual(len(rows), 37)
+            self.assertEqual(len({r["id"] for r in rows}), 37)
+            self.assertEqual(sum(r.get("expected_status") == 400 for r in rows), 2)
+
+    def test_invalid_forbid_and_relative_configuration_stop_before_asr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            texts, forbidden, baseline = (root / name for name in ("texts.json", "forbid.json", "baseline.json"))
+            texts.write_text(json.dumps({"input.wav": dict(text="plain", language="en")}))
+            forbidden.write_text(json.dumps({"other.wav": ["style"]}))
+            baseline.write_text(json.dumps(dict(model="other-model", rows=[])))
+            for extra in (["--forbid", str(forbidden)], ["--baseline-report", str(baseline), "--cer-margin", ".05"]):
+                args = ["asr_check.py", "input.wav", "--texts", str(texts), *extra]
+                with self.subTest(extra=extra), mock.patch.object(sys, "argv", args), \
+                        mock.patch.dict(sys.modules, torch=None, transformers=None), self.assertRaises(ValueError):
+                    main()
 
 
 class CerReportTests(unittest.TestCase):

@@ -151,6 +151,35 @@ class TtsCaptureTests(unittest.TestCase):
                     evaluation.capture_tts(self.args, "model", self.root)
                 call.assert_not_called()
 
+    def test_tag_controls_clean_reference_and_expected_errors(self):
+        self.args.voice = "override"
+        cases = self.cases(2)
+        cases[0].update(text="[laughs] Speak phrase.", reference="Speak phrase.", tags="auto",
+                        forbid=["laughs"], baseline="base", pauses=[], speed=1.14, sample_rate=8000)
+        cases[1].update(voice=None, expected_status=400)
+        self.manifest.write_text(json.dumps(cases))
+
+        def call(method, endpoint, body):
+            if body["seed"] == 2:
+                self.assertNotIn("voice", body)
+                return 400, b"missing voice"
+            self.assertEqual(body["tags"], "auto")
+            self.assertEqual(body["sample_rate"], 8000)
+            self.assertNotIn("reference", body)
+            return 200, wav(b"\0\0" * 4)
+
+        with mock.patch.object(evaluation, "call", side_effect=call):
+            directory, rows = evaluation.capture_tts(self.args, "model", self.root)
+        self.assertFalse(any("error" in r for r in rows))
+        self.assertTrue(rows[1]["expected_error"])
+        text = json.loads((Path(directory) / "texts.json").read_text())["0000.wav"]
+        self.assertEqual(text["text"], "Speak phrase.")
+        self.assertEqual(text["forbid"], ["laughs"])
+        self.assertEqual(text["baseline"], "base")
+        with mock.patch.object(evaluation, "call", return_value=(200, wav(b"\0\0" * 4))):
+            _, rows = evaluation.capture_tts(self.args, "model", self.root)
+        self.assertIn("error", rows[1])
+
     def test_empty_or_malformed_cases_fail_before_requests(self):
         for cases in [[], {}, [dict(text="")], [None]]:
             self.manifest.write_text(json.dumps(cases))

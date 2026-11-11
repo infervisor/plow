@@ -1,15 +1,30 @@
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
-from tts_bench import underruns
+from tts_bench import main, underruns
 
 SR = 24000
 B = 2 * SR  # bytes of one second of pcm16
 
 
 class UnderrunTests(unittest.TestCase):
+    def test_tag_policy_reaches_requests_without_changing_default(self):
+        for mode in (None, "auto", "off"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                args = ["tts_bench.py", "--url", "http://unused", "--model", "model", "--n", "1",
+                        "--warmup", "0", "--out", directory]
+                if mode:
+                    args += ["--tags", mode]
+                result = dict(audio_s=1, ttfa_s=.1, latency_s=.2, gaps=0, gap_s=0, pcm=b"", stalls=0)
+                with mock.patch.object(sys, "argv", args), mock.patch("tts_bench.card_sample_rate", return_value=24000), \
+                        mock.patch("tts_bench.one", return_value=result) as one:
+                    main()
+                self.assertEqual(one.call_args.args[-1], {} if mode is None else dict(tags=mode))
+
     def test_chunks_ahead_of_playback_have_no_gap(self):
         # 1 s chunks every 0.5 s: always ahead.
         self.assertEqual(underruns([(0.0, B), (0.5, B), (1.0, B)], SR), (0, 0.0, 0))
