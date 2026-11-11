@@ -1037,6 +1037,33 @@ G_K(g_stream_tail_f32) {
     uint32_t lo, hi;
     g_range(in->i[0], slice, nblk, &lo, &hi);
     for (uint32_t b = lo; b < hi; b++) {
+        if (in->i[7] == 2u || in->i[7] == 3u) {
+            const uint32_t* pos = PLOW_CPU_TEN(in, T, 5);
+            const uint32_t n = nrows[b], mode = in->i[7];
+            if (!L || n > N || (n && slot[b] >= slots)) continue;
+            if (mode == 3u) {
+                float* z = (float*)PLOW_CPU_TEN(in, T, 0) + (size_t)b * (L + N) * Cz;
+                memset(z, 0, (size_t)(L + N) * Cz * sizeof(float));
+                if (!n) continue;
+                const uint32_t kept = pos[b] < L ? pos[b] : L;
+                for (uint32_t r = L - kept; r < L; r++) {
+                    const uint32_t index = (uint32_t)(((uint64_t)pos[b] + r) % L);
+                    memcpy(z + (size_t)r * Cz + zc0,
+                        state + ((size_t)slot[b] * L + index) * C, (size_t)C * sizeof(float));
+                }
+                for (uint32_t r = 0; r < N; r++)
+                    memcpy(z + (size_t)(L + r) * Cz,
+                        src + ((size_t)b * N + r) * in->i[6], (size_t)Cz * sizeof(float));
+            } else {
+                const uint32_t kept = n < L ? n : L;
+                for (uint32_t r = n - kept; r < n; r++) {
+                    const uint32_t index = (uint32_t)(((uint64_t)pos[b] + r) % L);
+                    memcpy(state + ((size_t)slot[b] * L + index) * C,
+                        src + ((size_t)b * N + r) * in->i[6] + zc0, (size_t)C * sizeof(float));
+                }
+            }
+            continue;
+        }
         if (slot[b] >= slots || nrows[b] > N) continue;
         float* tail = state + (size_t)slot[b] * L * C;
         if (in->i[7] == 0u) {
@@ -1208,7 +1235,10 @@ G_K(g_conv1d_f32) {
     /* flags bit 19: alpha is [cin | cout], the output snake's parameters after the input's. */
     const uint32_t dual = (flags >> 19) & 1u;
     const float* post_alpha = dual && alpha ? alpha + cin : alpha;
-    const int alpha_ok = dual ? pre == 12u && post == 12u && alpha : !(post == 12u && pre != 0u);
+    /* flags bit 2 (post snake): the output is SnakeBeta, alpha = [a | r] per output channel. */
+    const uint32_t beta = (flags >> 2) & 1u;
+    const int alpha_ok = dual ? pre == 12u && post == 12u && alpha && !beta
+                              : !(post == 12u && pre != 0u) && (!beta || (post == 12u && alpha));
     if (!kernel || !stride || !dilation || !groups || cin % groups || cout % groups ||
         mode > 2u || !g_act_valid_conv(pre) || !g_act_valid_conv(post) || !alpha_ok)
         return;
@@ -1242,7 +1272,13 @@ G_K(g_conv1d_f32) {
                     sum += (double)v * g_weight(weight, (flags >> 12) & 1u, wi);
                 }
             }
-            float value = g_act_f32(post, (float)sum, post_alpha ? post_alpha[o] : slope, 0.0f);
+            float value;
+            if (beta) {
+                const float s = sinf((float)sum * alpha[o]);
+                value = fmaf(alpha[cout + o], s * s, (float)sum);
+            } else {
+                value = g_act_f32(post, (float)sum, post_alpha ? post_alpha[o] : slope, 0.0f);
+            }
             if (row_scale) value = row_scale[m] * value;
             out[oi] = residual ? value + residual[oi] : value;
         }
@@ -1424,7 +1460,61 @@ G_K(g_rand_f32) {
     }
 }
 
+static void g_attention_ring_f32(const PlowDevInst* in, uint32_t slice, uint32_t nblk,
+                                 void* const* T) {
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* qkv = PLOW_CPU_TEN(in, T, 1);
+    const float* state = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t* slots = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t* lengths = PLOW_CPU_TEN(in, T, 4);
+    const uint32_t* positions = PLOW_CPU_TEN(in, T, 5);
+    const uint32_t B = in->i[0], N = in->i[1], L = in->i[2], H = in->i[3];
+    const uint32_t stride = in->i[5], window = in->i[6] >> 16, width = H * 64u;
+    if (!N || N > 4 || !L || L > 255 || !H || in->i[4] != 64 || window != L + 1 ||
+        (uint64_t)B * N * H > UINT32_MAX) return;
+    uint32_t lo, hi;
+    g_range(B * N * H, slice, nblk, &lo, &hi);
+    for (uint32_t item = lo; item < hi; item++) {
+        const uint32_t h = item % H, r = item / H % N, b = item / (H * N), n = lengths[b];
+        float* output = out + ((size_t)b * N + r) * width + h * 64u;
+        if (n > N) continue;
+        if (r >= n) { memset(output, 0, 64 * sizeof(float)); continue; }
+        if (slots[b] >= in->i[7]) continue;
+        const uint32_t pos = positions[b];
+        const uint64_t end = (uint64_t)pos + r + 1, first = end > window ? end - window : 0;
+        const float* q = qkv + ((size_t)b * N + r) * stride + h * 64u;
+        double scores[256], maximum = -INFINITY, sum = 0.0;
+        for (uint64_t a = first; a < end; a++) {
+            const float* key = a < pos ?
+                state + ((size_t)slots[b] * L + a % L) * (2u * width) + h * 64u :
+                qkv + ((size_t)b * N + a - pos) * stride + width + h * 64u;
+            double score = 0.0;
+            for (uint32_t d = 0; d < 64; d++) score += (double)q[d] * key[d];
+            scores[a - first] = score * in->fj[0].f;
+            if (scores[a - first] > maximum) maximum = scores[a - first];
+        }
+        for (uint64_t a = first; a < end; a++) {
+            scores[a - first] = exp(scores[a - first] - maximum);
+            sum += scores[a - first];
+        }
+        for (uint32_t d = 0; d < 64; d++) {
+            double value = 0.0;
+            for (uint64_t a = first; a < end; a++) {
+                const float* v = a < pos ?
+                    state + ((size_t)slots[b] * L + a % L) * (2u * width) + width + h * 64u :
+                    qkv + ((size_t)b * N + a - pos) * stride + 2u * width + h * 64u;
+                value += scores[a - first] / sum * v[d];
+            }
+            output[d] = (float)value;
+        }
+    }
+}
+
 G_K(g_attention_f32) {
+    if ((in->i[6] & 0xff08u) == 0x108u) {
+        g_attention_ring_f32(in, slice, nblk, T);
+        return;
+    }
     (void)ctx;
     float* out = PLOW_CPU_TEN(in, T, 0);
     const float* query = PLOW_CPU_TEN(in, T, 1);

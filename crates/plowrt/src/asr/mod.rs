@@ -71,6 +71,9 @@ pub trait Transcriber: Send {
     fn batch_capacity(&self) -> usize {
         1
     }
+    /// Count the engine's launches against its packet's capacities into `buckets`
+    /// (`obs::bucket`).
+    fn observe_buckets(&mut self, _buckets: &std::sync::Arc<crate::obs::bucket::BucketDemand>) {}
     fn transcribe(
         &mut self,
         samples: &[f32],
@@ -237,6 +240,10 @@ impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
 
     fn batch_capacity(&self) -> usize {
         (**self).batch_capacity()
+    }
+
+    fn observe_buckets(&mut self, buckets: &std::sync::Arc<crate::obs::bucket::BucketDemand>) {
+        (**self).observe_buckets(buckets)
     }
 
     fn finalization_policy(&self) -> FinalizationPolicy {

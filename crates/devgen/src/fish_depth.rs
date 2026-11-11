@@ -100,6 +100,11 @@ pub(crate) struct Tensors {
     vc: Vec<u32>,
     opart: u32,
     mlpart: u32,
+    /// The attention fold (PLOW_EMIT_DEPTH_ATTN_FOLD): per (layer, position) the u32 descriptor
+    /// FlashDecode's t7 reads ({qg, kg, vg, gamma_q, gamma_k, cos, sin, pos, eps bits, qk_skip,
+    /// v_skip}) and its merge counters; empty / TENSOR_NONE otherwise.
+    hnrd: Vec<u32>,
+    mrgc: u32,
     at: u32,
     og: u32,
     fu: u32,
@@ -163,6 +168,96 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
     let opt = |b: &mut Builder, s: &str, n: u64| if d.breeze { a(b, s, n) } else { TENSOR_NONE };
     // W8A16 (`--w8a16`): the depth layers' projections stream e4m3, as the backbone's do.
     let fp8 = !d.breeze && crate::emit_config::active().w8a16;
+    let fold = attn_fold(&d);
+    let (qg, kg, vg) = (
+        a(b, "qg", r * qd * BF16),
+        a(b, "kg", r * kd * BF16),
+        a(b, "vg", r * kd * BF16),
+    );
+    let pos: Vec<u32> = (0..d.positions)
+        .map(|j| konst(b, format!("c.fish.pos.{j}"), j))
+        .collect();
+    let layers: Vec<LayerW> = (0..d.layers)
+        .map(|l| {
+            let p = format!("layers.{l}.");
+            let i = u64::from(d.inter);
+            let mat = |b: &mut Builder, s: &str, n: u64| if fp8 { TENSOR_NONE } else { w(b, s, n) };
+            LayerW {
+                fp8: fp8.then(|| {
+                    let mut t8 = |s: &str, out: u64, k: u64| {
+                        let name = format!("fp8/{pre}.{p}{s}.weight");
+                        (
+                            b.tensor(&name, out * k),
+                            b.tensor(&format!("{name}_scale"), out * F32),
+                        )
+                    };
+                    LayerW8 {
+                        q: t8("self_attn.q_proj", qd, h),
+                        k: t8("self_attn.k_proj", kd, h),
+                        v: t8("self_attn.v_proj", kd, h),
+                        o: t8("self_attn.o_proj", h, qd),
+                        gate: t8("mlp.gate_proj", i, h),
+                        up: t8("mlp.up_proj", i, h),
+                        down: t8("mlp.down_proj", h, i),
+                    }
+                }),
+                in_ln: w(b, &format!("{p}input_layernorm.weight"), h),
+                q: mat(b, &format!("{p}self_attn.q_proj.weight"), qd * h),
+                k: mat(b, &format!("{p}self_attn.k_proj.weight"), kd * h),
+                v: mat(b, &format!("{p}self_attn.v_proj.weight"), kd * h),
+                o: mat(b, &format!("{p}self_attn.o_proj.weight"), h * qd),
+                qn: if d.qk_norm {
+                    w(
+                        b,
+                        &format!("{p}self_attn.q_norm.weight"),
+                        u64::from(d.head_dim),
+                    )
+                } else {
+                    TENSOR_NONE
+                },
+                kn: if d.qk_norm {
+                    w(
+                        b,
+                        &format!("{p}self_attn.k_norm.weight"),
+                        u64::from(d.head_dim),
+                    )
+                } else {
+                    TENSOR_NONE
+                },
+                post_ln: w(b, &format!("{p}post_attention_layernorm.weight"), h),
+                gate: mat(b, &format!("{p}mlp.gate_proj.weight"), i * h),
+                up: mat(b, &format!("{p}mlp.up_proj.weight"), i * h),
+                down: mat(b, &format!("{p}mlp.down_proj.weight"), h * i),
+            }
+        })
+        .collect();
+    let hnrd = if fold {
+        let skip = u32::from(!d.qk_norm);
+        layers
+            .iter()
+            .enumerate()
+            .flat_map(|(l, lw)| (0..d.positions).map(move |j| (l, lw.qn, lw.kn, j)))
+            .map(|(l, qn, kn, j)| {
+                let words = [
+                    qg,
+                    kg,
+                    vg,
+                    qn,
+                    kn,
+                    cos,
+                    sin,
+                    pos[j as usize],
+                    d.eps.to_bits(),
+                    skip,
+                    1,
+                ];
+                let desc = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                b.tensor_init(&format!("c.fish.hnr_fold.{l}.{j}"), desc)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Tensors {
         classes,
         xin: opt(b, "xin", r * u64::from(c.hidden) * BF16),
@@ -215,9 +310,7 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
             b.tensor("in.fish.hist", r * u64::from(RAS_WINDOW) * I32)
         },
         hrow: b.tensor("in.fish.hrow", r * I32),
-        pos: (0..d.positions)
-            .map(|j| konst(b, format!("c.fish.pos.{j}"), j))
-            .collect(),
+        pos,
         len: (0..d.positions)
             .map(|j| konst(b, format!("c.fish.len.{j}"), j + 1))
             .collect(),
@@ -226,14 +319,21 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
             .collect(),
         x: a(b, "x", r * h * BF16),
         xn: a(b, "xn", r * h * BF16),
-        qg: a(b, "qg", r * qd * BF16),
+        qg,
         q: a(b, "q", r * qd * BF16),
-        kg: a(b, "kg", r * kd * BF16),
-        vg: a(b, "vg", r * kd * BF16),
+        kg,
+        vg,
         kc: (0..d.layers).map(|l| a(b, &format!("k.{l}"), kv)).collect(),
         vc: (0..d.layers).map(|l| a(b, &format!("v.{l}"), kv)).collect(),
         opart: a(b, "opart", r * qd * F32),
         mlpart: a(b, "mlpart", r * u64::from(d.heads) * 2 * F32),
+        hnrd,
+        // Self-cleaning (the last split re-zeroes it); one split per item never touches it.
+        mrgc: if fold {
+            a(b, "mrgc", r * u64::from(d.heads) * I32)
+        } else {
+            TENSOR_NONE
+        },
         at: a(b, "at", r * qd * BF16),
         og: a(b, "og", r * h * BF16),
         fu: a(b, "fu", r * u64::from(d.inter) * BF16),
@@ -255,61 +355,7 @@ pub(crate) fn declare(b: &mut Builder, c: &Cfg, dbatch: u32) -> Tensors {
             w(b, "head.weight", dc * h)
         },
         norm: w(b, "norm.weight", h),
-        layers: (0..d.layers)
-            .map(|l| {
-                let p = format!("layers.{l}.");
-                let i = u64::from(d.inter);
-                let mat =
-                    |b: &mut Builder, s: &str, n: u64| if fp8 { TENSOR_NONE } else { w(b, s, n) };
-                LayerW {
-                    fp8: fp8.then(|| {
-                        let mut t8 = |s: &str, out: u64, k: u64| {
-                            let name = format!("fp8/{pre}.{p}{s}.weight");
-                            (
-                                b.tensor(&name, out * k),
-                                b.tensor(&format!("{name}_scale"), out * F32),
-                            )
-                        };
-                        LayerW8 {
-                            q: t8("self_attn.q_proj", qd, h),
-                            k: t8("self_attn.k_proj", kd, h),
-                            v: t8("self_attn.v_proj", kd, h),
-                            o: t8("self_attn.o_proj", h, qd),
-                            gate: t8("mlp.gate_proj", i, h),
-                            up: t8("mlp.up_proj", i, h),
-                            down: t8("mlp.down_proj", h, i),
-                        }
-                    }),
-                    in_ln: w(b, &format!("{p}input_layernorm.weight"), h),
-                    q: mat(b, &format!("{p}self_attn.q_proj.weight"), qd * h),
-                    k: mat(b, &format!("{p}self_attn.k_proj.weight"), kd * h),
-                    v: mat(b, &format!("{p}self_attn.v_proj.weight"), kd * h),
-                    o: mat(b, &format!("{p}self_attn.o_proj.weight"), h * qd),
-                    qn: if d.qk_norm {
-                        w(
-                            b,
-                            &format!("{p}self_attn.q_norm.weight"),
-                            u64::from(d.head_dim),
-                        )
-                    } else {
-                        TENSOR_NONE
-                    },
-                    kn: if d.qk_norm {
-                        w(
-                            b,
-                            &format!("{p}self_attn.k_norm.weight"),
-                            u64::from(d.head_dim),
-                        )
-                    } else {
-                        TENSOR_NONE
-                    },
-                    post_ln: w(b, &format!("{p}post_attention_layernorm.weight"), h),
-                    gate: mat(b, &format!("{p}mlp.gate_proj.weight"), i * h),
-                    up: mat(b, &format!("{p}mlp.up_proj.weight"), i * h),
-                    down: mat(b, &format!("{p}mlp.down_proj.weight"), h * i),
-                }
-            })
-            .collect(),
+        layers,
         d,
     }
 }
@@ -322,6 +368,21 @@ fn d_classes(f: &crate::config::FrameEmbed) -> u32 {
     } else {
         f.cb_size
     }
+}
+
+/// PLOW_DEPTH_ATTN_FOLD on an NVIDIA object whose fold arm fits: a Breeze depth (its own rope
+/// tables, declared here), hd 128, gqa == the decode FA_GF.
+fn attn_fold(d: &FishDepth) -> bool {
+    let on = crate::emit_config::active().depth_attn_fold
+        && !crate::emit_is_amd()
+        && !crate::emit_is_apple();
+    if on {
+        assert!(
+            d.breeze && d.head_dim == 128 && d.heads / d.kv_heads == crate::fa_gf_full(),
+            "PLOW_DEPTH_ATTN_FOLD: a Breeze depth, head_dim 128, gqa == the decode FA_GF"
+        );
+    }
+    on
 }
 
 fn program(
@@ -536,10 +597,16 @@ fn program(
                     },
                 )
             };
-            let c_q = hnr(&mut b, t.q, t.qg, d.heads, true, false, w.qn);
-            let c_k = hnr(&mut b, t.kc[l], t.kg, d.kv_heads, true, true, w.kn);
-            let c_v = hnr(&mut b, t.vc[l], t.vg, d.kv_heads, false, true, TENSOR_NONE);
-            let c_fa = b.emit(DevOp::FlashDecode, all.clone(), &[c_q, c_k, c_v], |i| {
+            let fold = t.hnrd.get(l * d.positions as usize + j as usize).copied();
+            let deps = match fold {
+                Some(_) => vec![c_qkv],
+                None => vec![
+                    hnr(&mut b, t.q, t.qg, d.heads, true, false, w.qn),
+                    hnr(&mut b, t.kc[l], t.kg, d.kv_heads, true, true, w.kn),
+                    hnr(&mut b, t.vc[l], t.vg, d.kv_heads, false, true, TENSOR_NONE),
+                ],
+            };
+            let c_fa = b.emit(DevOp::FlashDecode, all.clone(), &deps, |i| {
                 i.t[..6].copy_from_slice(&[
                     t.opart,
                     t.mlpart,
@@ -562,11 +629,19 @@ fn program(
                 if rows > 1 {
                     i.j[0] = rows * d.kv_heads * d.positions;
                 }
+                if let Some(desc) = fold {
+                    assert!(t.at < 1 << 16 && t.mrgc < 1 << 16, "depth fold: j1 handles");
+                    i.t[7] = desc;
+                    i.j[1] = t.at | t.mrgc << 16;
+                }
             });
-            let c_mg = b.emit(DevOp::FlashMerge, span(rows * d.heads), &[c_fa], |i| {
-                i.t[..3].copy_from_slice(&[t.at, t.opart, t.mlpart]);
-                i.i[..4].copy_from_slice(&[rows, d.heads, 1, d.head_dim]);
-            });
+            let c_mg = match fold {
+                Some(_) => c_fa,
+                None => b.emit(DevOp::FlashMerge, span(rows * d.heads), &[c_fa], |i| {
+                    i.t[..3].copy_from_slice(&[t.at, t.opart, t.mlpart]);
+                    i.i[..4].copy_from_slice(&[rows, d.heads, 1, d.head_dim]);
+                }),
+            };
             let c_o = match &w.fp8 {
                 Some(w8) => gemv8(&mut b, &[c_mg], t.og, t.at, w8.o, d.hidden, qd),
                 None => gemv(&mut b, &[c_mg], t.og, t.at, w.o, d.hidden, qd),
@@ -679,6 +754,7 @@ pub(crate) fn sections(
         },
         pair_cfg: t.d.breeze,
         depth_sampling: None,
+        planned_rows: false,
         slot_memory: Vec::new(),
         packed: Some(manifest::PackedDepth {
             version: 1,

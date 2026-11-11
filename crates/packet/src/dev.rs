@@ -2018,6 +2018,8 @@ pub enum DevOp {
     /// Numerical flag `i2` bit 0 rounds each output to BF16; bit 1 computes mean and variance
     /// with ordered FP32 accumulation; bits 4-7 apply a parameterless activation (`ACT_*`) after
     /// the affine, then `add` (a `[feat]` row) is added, both before the BF16 rounding.
+    /// Bit 3 stores FP16 with FP64 statistics; requires all other flags clear and no `add`,
+    /// and the output must not alias the input (speech flag layout 2).
     /// `t0=out t1=x t2=gamma? t3=beta? t4=add?` · `i0=rows i1=feat i2=flags` · `f0=eps`.
     LayerNormF32 = 164,
     /// FP32 scaled residual update: `out = a + scale * b`; output may alias either input.
@@ -2314,6 +2316,12 @@ pub enum DevOp {
     /// and the attention runs 3xFP16; with bit 5 the formatted rows of the last read tile past
     /// `pre_b` must be finite and not dominate its 8-column V blocks (the format writes zeros past
     /// its `rows`).
+    /// Ring mode (`flags & 0xff08 == 0x108`, layout 3): `t1=QKV[B][q_rows][in_stride]`,
+    /// `t2=ring[slots][history][2*heads*64]`, `t3=slot`, `t4=new_rows`, `t5=absolute_position`;
+    /// `i2=history`, `i7=slots`, head width 64, q_rows <= 4, window = history + 1 <= 256.
+    /// Old keys are at absolute_position modulo history; current QKV supplies new keys.
+    /// Zero-length items produce zero without reading their slot or position. Ring stores
+    /// must depend on every attention producer, before any current key overwrites history.
     /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias|prefix_rows? t6=prefix?
     /// t7=prefix_index(u32[batch])?` ·
     /// `i0=batch i1=q_rows i2=kv_rows i3=heads i4=head_width i5=in_stride i6=flags
@@ -2519,6 +2527,9 @@ pub enum DevOp {
     /// bit 10 (f32 x, f16 W, K % 64 == 0) rounds x to f16 and multiplies on tensor cores (fp32
     /// accumulation, any summation order), streaming W once per 64 rows. Bit 11 alone (no other
     /// bit) rounds each `C` to bf16 (a reference whose linear outputs bf16).
+    /// Bit 13 reads FP16 `x` (requires bits 0, 1, 10, M >= 16, N/K divisible by64 and 16-byte
+    /// aligned operands; excludes the LayerNorm prologue and row views). With it, bit 14 stores
+    /// FP16 `C`, which must not alias the FP32 residual. Both require speech flag layout 2.
     /// `t0=C(f32[M,N]) t1=x(bf16[M,K]) t2=W(bf16[N,K]) t3=bias? t4=residual? t5=gamma? t6=beta?` ·
     /// `i0=M i1=N i2=K i3=bias_group i7=flags` · `f0=eps` (K % 8 == 0).
     GemvF32Out = 220,
@@ -2545,6 +2556,10 @@ pub enum DevOp {
     /// `state[slot[b]][i] = z[b][n[b] + i][zc0..zc0+C]` for `i < L`, the tail after `n[b]` new rows.
     /// `slot[b] >= slots` or `n[b] > N` traps.
     /// Store takes no `z` output or `pos`; its `src` is `z`.
+    /// Ring modes (layout 3): mode 3 gathers chronological history from positions modulo L
+    /// plus current src into z; mode 2 writes only the last min(n,L) current rows to
+    /// state[(pos+r) modulo L]. Both require pos. Zero n skips state reads/writes; ring gather
+    /// produces zero. Mode 2 follows every attention reader of that state.
     /// `t0=z(f32)|NONE t1=src(f32) t2=state(f32[slots][L][C]) t3=slot(u32[B]) t4=n(u32[B])
     /// t5=pos(u32[B])?` ·
     /// `i0=B i1=L i2=N i3=C i4=Cz i5=zc0 i6=src_stride i7=mode` · `j0=slots`.

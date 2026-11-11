@@ -173,6 +173,8 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
             "modular"
         } else if pi >= dec_lo || dense_exact {
             "decode"
+        } else if packet::devbuild::is_row_decode_program(encoded_t) {
+            "row_decode"
         } else if packet::devbuild::is_token_batch_program(encoded_t) {
             "token_batch"
         } else {
@@ -1420,12 +1422,25 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         t.insert("norm_fold".into(), json!(1));
     }
     // * `hnr_fold` (PLOW_DECODE_HNR_FOLD opt-in): the decode object's FlashDecode carries the
-    //   HeadNormRope fold arm the packet's flash packets use.
-    if arch.starts_with("sm_") && crate::emit_config::active().decode_hnr_fold.unwrap_or(0) > 0 {
+    //   HeadNormRope fold arm the packet's flash packets use. PLOW_DEPTH_ATTN_FOLD: the depth
+    //   programs' FlashDecode uses it (any sm_ object; the backbone's flash packets stay unfolded).
+    let ec = crate::emit_config::active();
+    if arch.starts_with("sm_") && ec.decode_hnr_fold.unwrap_or(0) > 0 {
         assert_eq!(
             arch, "sm_120a",
             "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only"
         );
+        t.insert("hnr_fold".into(), json!(1));
+    }
+    if arch.starts_with("sm_") && ec.depth_attn_fold {
+        // The fold arm is the hd128 row-group body's, without its bulk-copy rings or KV interleave.
+        assert!(
+            !["fa_rgt", "fa_rgm", "kv_ilv"]
+                .iter()
+                .any(|k| t.contains_key(*k)),
+            "PLOW_DEPTH_ATTN_FOLD: the row-group body without RGT / RGM / KV interleave"
+        );
+        t.insert("fa_rg".into(), json!(1));
         t.insert("hnr_fold".into(), json!(1));
     }
     // * `gemv_xk` (PLOW_DECODE_GEMV_XK opt-in): the first rung whose Gemv walk splits K over blocks.
@@ -2199,6 +2214,13 @@ pub fn build(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     build_with_packed_prefill(m, arch, lean, false)
 }
 
+/// [`build`] for the emitters whose packets never carry depth programs: `PLOW_NV_DEPTH_STAGE` 0.
+pub fn build_without_depth(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
+    let mut manifest = build(m, arch, lean);
+    manifest["depth_stage"] = json!(false);
+    manifest
+}
+
 pub fn build_for_packet(
     m: &Model,
     arch: &str,
@@ -2211,11 +2233,14 @@ pub fn build_for_packet(
     });
     let mut manifest = build_with_packed_prefill(m, arch, lean, packed_prefill.is_some());
     manifest["runtime_requires"] = crate::dense_cublaslt::runtime_requires(m, sections);
-    // Only depth programs sample in-program (ops 219 / 221): `PLOW_NV_SAMPLE_RADIX`.
-    manifest["sample_radix"] = json!(sections.iter().any(|section| {
+    // Only depth programs sample in-program (ops 219 / 221) and run the staged head GEMV:
+    // `PLOW_NV_SAMPLE_RADIX`, `PLOW_NV_DEPTH_STAGE`.
+    let depth = sections.iter().any(|section| {
         section.kind == packet::devbuild::SECT_METADATA
             && section.name == plow_asset::fish_depth::SECTION
-    }));
+    });
+    manifest["sample_radix"] = json!(depth);
+    manifest["depth_stage"] = json!(depth);
     if let Some(section) = packed_prefill {
         let packed: plow_asset::packed_prefill::Manifest =
             serde_json::from_slice(&section.data).expect("emitted packed request manifest");
@@ -2536,6 +2561,17 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
             },
         },
     });
+    let row_decode = phase("row_decode");
+    if !row_decode.is_empty() {
+        objects["ordinary"]["row_decode"] = json!({
+            "arms": keys(&row_decode),
+            "families": families(&row_decode),
+            "excluded_opcodes": excluded(&row_decode),
+            "resource_contract": resource_contract(false),
+            "inventory_prune_capable": true,
+            "capability": { "symbol": plow_asset::row_decode::CAPABILITY, "value": 1 },
+        });
+    }
     if packed_prefill.iter().any(|a| a.op == "FlashPrefillFp8") {
         objects["packed_prefill"]["fp8_capability"] = json!({
             "symbol": plow_asset::packed_prefill::FP8_CAPABILITY,
@@ -3071,6 +3107,14 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
     if let Some(objects) = manifest.get("objects") {
         feed(&objects.to_string());
     }
+    // The split-image arm (PLOW_SPEECH_SPLIT_A) is compiled into the speech object only for a
+    // packet that uses it; an object without it would trap on the packet's bit-21 convs.
+    if manifest.get("speech_split_a").and_then(Value::as_bool) == Some(true) {
+        feed("\x1espeech_split_a");
+    }
+    if manifest.get("speech_ring_kv").and_then(Value::as_bool) == Some(true) {
+        feed("\x1espeech_ring_kv");
+    }
     feed("\x1e");
     if let Some(o) = manifest.get("tuning").and_then(Value::as_object) {
         for (k, v) in o {
@@ -3128,7 +3172,16 @@ pub fn speech_conv_posts(model: &packet::devbuild::Model) -> u64 {
                     && (flags >> 8) & 15 == 0
             }
         })
-        .fold(0, |mask, i| mask | 1 << ((i.j[1] >> 8) & 15))
+        .fold(0, |mask, i| {
+            let post = (i.j[1] >> 8) & 15;
+            // A SnakeBeta output (snake with flags bit 2) has its own epilogue: bit 19.
+            let beta = if post == 12 && (i.j[1] >> 2) & 1 == 1 {
+                1 << 19
+            } else {
+                0
+            };
+            mask | 1 << post | beta
+        })
 }
 
 /// Whether a conv that can reach the wide tile (flags bit 14) pads with other than zeros:
@@ -3146,7 +3199,11 @@ pub fn speech_conv_wide_padded(model: &packet::devbuild::Model) -> bool {
 pub struct SpeechMasks {
     pub ops: u64,
     pub conv_posts: u64,
+    /// A conv reads a split-image activation (Conv1dF32 flags bit 30): `PLOW_SPEECH_SPLIT_A`
+    /// compiles the image GEMM arm and its larger launch arena into the speech object.
+    pub split_a: bool,
     pub conv_wide_padded: bool,
+    pub ring_kv: bool,
 }
 
 impl SpeechMasks {
@@ -3154,13 +3211,25 @@ impl SpeechMasks {
         Self {
             ops: speech_ops(model),
             conv_posts: speech_conv_posts(model),
+            split_a: model
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .any(|i| i.op == DevOp::Conv1dF32 as u16 && i.j[1] & (1 << 30) != 0),
             conv_wide_padded: speech_conv_wide_padded(model),
+            ring_kv: model
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .any(|d| plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)),
         }
     }
     pub fn add(&mut self, other: Self) {
         self.ops |= other.ops;
         self.conv_posts |= other.conv_posts;
+        self.split_a |= other.split_a;
         self.conv_wide_padded |= other.conv_wide_padded;
+        self.ring_kv |= other.ring_kv;
     }
 }
 
@@ -3216,10 +3285,22 @@ pub fn config_header(manifest: &Value) -> String {
             "#ifndef PLOW_SPEECH_CONV_POSTS\n#define PLOW_SPEECH_CONV_POSTS 0x{mask:x}ull\n#endif\n\n"
         ));
     }
+    if manifest.get("speech_split_a").and_then(Value::as_bool) == Some(true) {
+        out.push_str(
+            "/* A conv reads split-image activations: the image GEMM arm and its launch arena. */\n\
+             #ifndef PLOW_SPEECH_SPLIT_A\n#define PLOW_SPEECH_SPLIT_A 1\n#endif\n\n",
+        );
+    }
     if let Some(radix) = manifest.get("sample_radix").and_then(Value::as_bool) {
         out.push_str(&format!(
             "#ifndef PLOW_NV_SAMPLE_RADIX\n#define PLOW_NV_SAMPLE_RADIX {}\n#endif\n\n",
             u8::from(radix)
+        ));
+    }
+    if let Some(depth) = manifest.get("depth_stage").and_then(Value::as_bool) {
+        out.push_str(&format!(
+            "#ifndef PLOW_NV_DEPTH_STAGE\n#define PLOW_NV_DEPTH_STAGE {}\n#endif\n\n",
+            u8::from(depth)
         ));
     }
     if let Some(padded) = manifest
@@ -3230,6 +3311,10 @@ pub fn config_header(manifest: &Value) -> String {
             "#ifndef PLOW_SPEECH_CONV_WIDE_PADDED\n#define PLOW_SPEECH_CONV_WIDE_PADDED {}\n#endif\n\n",
             u8::from(padded)
         ));
+    }
+
+    if manifest.get("speech_ring_kv").and_then(Value::as_bool) == Some(true) {
+        out.push_str("#define PLOW_SPEECH_RING_KV 1\n\n");
     }
 
     // Presence macros, one per opcode in the union. Named from the `dev_isa.h`
@@ -3256,6 +3341,7 @@ pub fn config_header(manifest: &Value) -> String {
     let prefill_ops = object_ops("prefill");
     let token_batch_ops = object_ops("token_batch");
     let decode_ops = object_ops("decode");
+    let row_decode_ops = object_ops("row_decode");
     let flash_ops = object_ops("flash");
     let decode_mla_ops = object_ops("decode_mla");
     let decode_mla_required = manifest
@@ -3388,8 +3474,17 @@ pub fn config_header(manifest: &Value) -> String {
             "#define {packet_m} {}\n",
             if present { 1 } else { 0 }
         ));
+        out.push_str(&format!("#ifndef {m}\n"));
+        if !row_decode_ops.is_empty() {
+            out.push_str(&format!(
+                "#if PLOW_NV_TOKEN_BATCH_BF16\n#define {m} {}\n#elif defined(PLOW_BUCKET_FLASH)\n",
+                u8::from(row_decode_ops.contains(&name))
+            ));
+        } else {
+            out.push_str("#if defined(PLOW_BUCKET_FLASH)\n");
+        }
         out.push_str(&format!(
-            "#ifndef {m}\n#if defined(PLOW_BUCKET_FLASH)\n#define {m} {}\n#elif defined(PLOW_BUCKET_DECODE_MLA)\n#define {m} {}\n#elif PLOW_TOKEN_BATCH\n#define {m} {}\n#elif PLOW_BUCKET_DECODE\n#define {m} {}\n#else\n#define {m} {}\n#endif\n#endif\n",
+            "#define {m} {}\n#elif defined(PLOW_BUCKET_DECODE_MLA)\n#define {m} {}\n#elif PLOW_TOKEN_BATCH\n#define {m} {}\n#elif PLOW_BUCKET_DECODE\n#define {m} {}\n#else\n#define {m} {}\n#endif\n#endif\n",
             if flash_ops.contains(&name) { 1 } else { 0 },
             if decode_mla_ops.contains(&name) { 1 } else { 0 },
             if token_batch_ops.contains(&name) { 1 } else { 0 },
@@ -3614,6 +3709,12 @@ pub fn config_header(manifest: &Value) -> String {
                 "#ifndef PLOW_NV_GEMV_PF_OPS\n#define PLOW_NV_GEMV_PF_OPS {v}u\n#endif\n"
             ));
         }
+        // sm_120a (PLOW_DECODE_HNR_FOLD) or any sm_ object (PLOW_DEPTH_ATTN_FOLD).
+        if t.get("hnr_fold").is_some() {
+            out.push_str(
+                "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
+            );
+        }
         if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a") {
             if let Some(v) = t.get("gemv_k8_ops").and_then(Value::as_u64) {
                 out.push_str(&format!(
@@ -3625,11 +3726,6 @@ pub fn config_header(manifest: &Value) -> String {
             if t.get("norm_fold").is_some() {
                 out.push_str(
                     "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_NORM_FOLD\n#define PLOW_NV_NORM_FOLD 1\n#endif\n#endif\n",
-                );
-            }
-            if t.get("hnr_fold").is_some() {
-                out.push_str(
-                    "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
                 );
             }
             if let Some(v) = t.get("gemv_xk").and_then(Value::as_u64) {
@@ -4099,6 +4195,13 @@ mod tests {
             (DevOp::Conv1dF32, 9, 1 << 13, 0),
             (DevOp::Conv1dF32, 9, 1 << 14, 1 << 9),
             (DevOp::Conv1dF32, 11, 1 << 17, 1 << 11),
+            (DevOp::Conv1dF32, 12, 1 << 17, 1 << 12),
+            (
+                DevOp::Conv1dF32,
+                12,
+                (1 << 17) | (1 << 2),
+                1 << 12 | 1 << 19,
+            ),
             (DevOp::ConvTranspose1dF32, 0, 0, 0),
             (DevOp::ConvTranspose1dF32, 0, 1 << 14, 0),
             (DevOp::ConvTranspose1dF32, 0, 1 << 17, 0),
@@ -4157,9 +4260,11 @@ mod tests {
         let plain = build(&model(), "sm_90a");
         assert!(!config_header(&plain).contains("PLOW_SPEECH_CONV_WIDE_PADDED"));
         assert!(!config_header(&plain).contains("PLOW_NV_SAMPLE_RADIX"));
+        assert!(!config_header(&plain).contains("PLOW_NV_DEPTH_STAGE"));
         for (key, define) in [
             ("speech_conv_wide_padded", "PLOW_SPEECH_CONV_WIDE_PADDED"),
             ("sample_radix", "PLOW_NV_SAMPLE_RADIX"),
+            ("depth_stage", "PLOW_NV_DEPTH_STAGE"),
         ] {
             for on in [false, true] {
                 let mut man = plain.clone();
@@ -4456,6 +4561,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn row_decode_has_an_independent_object_inventory() {
+        let mut m = model();
+        m.progs.insert(
+            1,
+            prog(vec![inst(DevOp::FlashMerge, [8, 8, 1, 128, 0, 0, 0, 0])]),
+        );
+        m.prog_t
+            .insert(1, packet::devbuild::row_decode_program_t(8));
+        let manifest = build(&m, "sm_90a");
+        assert_eq!(manifest["programs"][1]["kind"], "row_decode");
+        assert!(manifest["objects"]["ordinary"]["row_decode"]["arms"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("FlashMerge/hd128")));
+        assert!(!manifest["objects"]["ordinary"]["decode"]["arms"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("FlashMerge/hd128")));
+        let header = config_header(&manifest);
+        assert!(header.contains("#if PLOW_NV_TOKEN_BATCH_BF16\n#define PLOW_HAS_FLASH_MERGE 1\n"));
+        assert!(!config_header(&build(&model(), "sm_90a")).contains("PLOW_NV_TOKEN_BATCH_BF16"));
+    }
+
     /// cuBLASLt-routed decode rungs ask the object build for the routed decode object, and the
     /// request is part of the pairing.
     #[test]
@@ -4558,6 +4687,11 @@ mod tests {
         assert_eq!(pairing_hash(&a), pairing_hash(&b));
         b["union"] = json!(["Gemv"]);
         assert_ne!(pairing_hash(&a), pairing_hash(&b));
+        let mut c = a.clone();
+        c["speech_split_a"] = json!(false);
+        assert_eq!(pairing_hash(&a), pairing_hash(&c));
+        c["speech_split_a"] = json!(true);
+        assert_ne!(pairing_hash(&a), pairing_hash(&c));
     }
 
     #[test]

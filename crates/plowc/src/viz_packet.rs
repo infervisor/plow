@@ -662,7 +662,7 @@ mod tests {
             )
         } else {
             devgen::tts::speech_pipeline_section(
-                &model,
+                &mut model,
                 spec,
                 devgen::tts::profile(profile).unwrap(),
                 200_000,
@@ -878,6 +878,8 @@ mod tests {
             sampler: plow_asset::fish_depth::Sampler::Breeze,
             pair_cfg: true,
             depth_sampling: None,
+            packed: None,
+            planned_rows: false,
             slot_memory: Vec::new(),
             tensors: Tensors {
                 params: 0,

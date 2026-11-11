@@ -391,7 +391,7 @@ impl Manifest {
         }
         require(generated_maps == maps, "missing generated KV map")?;
         for (pi, p) in packet.programs.iter().enumerate() {
-            let prefill = pi < packet.prefill_count;
+            let prefill = p.role.is_prefill_side();
             require(
                 !p.role.is_packed_sibling() && p.rows > 0 && p.rows <= self.max_ctx,
                 "program row contract",

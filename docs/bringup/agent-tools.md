@@ -43,7 +43,28 @@ Harness (read [05-single-block-sweep.md](05-single-block-sweep.md) and the scrip
 | A/B | `campaign.py nv-block-ab --control <prod block> --treatment <candidate block> --verb bench\|prefill-bench --args ".." --ceilings ..`: four frozen arms in one lease, `comparison.md` = the table + per-point verdict (§7 spread rule) | `campaign.py block-ab` |
 | real MoE routing | serve the full packet with `PLOW_NV_DUMP_KV=<dir> PLOW_NV_DUMP_ACT=<len>:<pc>`, then `scripts/bench/router_table.py <dump>.json --out t.bin` | AMD capture `rank0.act.tab.bin` |
 | reference block | `scripts/block_layer_bench.py` (vLLM's own decoder layer; joined with `--vllm`) + `scripts/block_compare.py` | `runtime/tests/*_block_*_test.c` oracles |
+| generator search | `scripts/gen_kernels/gen_search.py submit <block spec> --out <scratch>` then `report`: generator candidates (TileLang, Triton) over a schedule grid vs the current kernel vs the floor, numerics-checked (LLM and speech blocks; one `spec_<name>.py` per block) | — |
 | block parity | `block_run packed-check` / `mixed-check` (packed / mixed vs serial on the block) | `amd-block --dump`, C oracle harnesses |
+
+**Generator search before more hand-tuning.** When a block (or one op of it) still sits far from
+its roofline after the first hand pass and another hand-tuning round is being planned, run the
+generator search on it first:
+`gen_search.py plan|build-current|submit|report <spec>` ([kernel-generators.md](../runtime/kernel-generators.md)
+"Generator search per block"). It costs one ≤15 min queue job per grid and answers whether a
+different schedule (tile, stages, warp policy, split) closes the gap. Record its table under the
+block-vs-roofline table as the **best-generated reference row** (config, time, % of floor, rel-L2)
+even when the plow kernel wins. A faster generated schedule is a reference to hand-port; it ships
+as a standalone role object only when its in-model gain exceeds about 5% of the step, never as
+generated code inlined into the interpreter. A block with no spec gets one (a small file beside the
+driver), not a one-off probe.
+
+A spec's `current` is the arm the **production recipe emits** for that block (check the recipe's
+emit options and the interpreter's dispatch for the served shape, not the probe's default path),
+measured standalone in the same lease as the generators. An in-situ per-op number (`packet_bench`
+or `step_bench` sweeps, a marginal time inside the interpreter) is not comparable with a standalone
+candidate; a recorded `measured_us` current only ranks candidates and never supports a "generated
+is faster" verdict. The CFM attention search first compared against the path of a packet without
+`PLOW_EMIT_S3GEN_ATTN_H16` and read a generated win that the production kernel reverses by 19-49%.
 
 **ISA reference.** Before writing or changing a kernel, inline asm, intrinsics or low-level
 C/CUDA/HIP/Metal for target `$ISA`, read `docs/bringup/isa/<target>.md` (index:
@@ -490,6 +511,7 @@ Knobs it reads: `PLOW_CKPT` (the **prepped** checkpoint — a raw-HF dir will re
 | `scripts/bench/thinking_gates.sh <assets> <objdir> <out>` | thinking-control soundness gates (F1 byte-identical output across pipelined / speculative / multistep / plain decode under a forced trace end, F2 penalties recorded, F4 seeded reproducibility, F3 no-budget TPOT vs `PLOWRT_BASE_BIN`); one server per arm, run as one `gpuq.py` job with the recipe's serve env on the command. |
 | `scripts/bench/thinking_stress.py --endpoint name=url … --model M [--arm name=JSON] [--prompts convs.jsonl] --out <scratch>` | thinking-control stress report per endpoint and request variant (the S0–S4 ladder, bridge A/B): strict and judged leaks, `finish=length` %, longest reply, p50/p90 first answer, forced %, answer-reasoning %; every leak and cut-off reply printed. Point plow and the vLLM reference at the same conversations. |
 | `scripts/bench/thinking_leaks.py --url URL --name N --model M --raw format\|URL\|FILE --out <scratch> [--temperature T --seeds K]` | thinking/answer separation audit: markers in the answer or trace, the split against the raw generation, deliberation in the answer, streamed vs buffered, empty answers, trace/reply/total budgets; `--record-raw` captures a parser-less server's raw text when one GPU fits one server. |
+| `scripts/campaign/bucket_demand.py <metrics URL\|file> [<later file>] [--model M --family decode\|prefill\|depth\|codec --add K]` | which launch capacities production traffic is missing: reads the `plowrt_bucket_*` series of a serving plowrt (one snapshot, or the window between two), prints the declared ladder, the live-row demand, the padded fraction and the 1..K capacities to add that minimise launched rows (exact DP; time saved where capacities are timed). CPU only, no lease; recommends, never edits a recipe. `docs/runtime/host-path.md` "Bucket demand". |
 | `scripts/bench/plowbench.sh` | **source** this in any new probe. Gives `pb_free_port`, `pb_serve_start <plowrt> <assets> <objdir> <port> <log> [timeout]`, `pb_serve_wait [secs]`, `pb_serve_stop`, `pb_bench <resdir> <tag> <model> <conc> <nprompts> <isl> <osl> [extra…]`, `pb_cell` (pb_bench + cells.log markers), `pb_metrics_start/stop` (reference `/metrics`), `pb_result <resdir> <tag>`, `pb_model_id`, `pb_detect_arch`, and the artifact checks (`pb_require_nix`, `pb_hazard_env`, `pb_check_plowrt/assets/objects/vllm`). Do not re-implement the readiness poll or the result parsing again. |
 
 ### The result-path trap

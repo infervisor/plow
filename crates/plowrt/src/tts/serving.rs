@@ -127,6 +127,7 @@ fn guided_models() -> &'static Bound<super::guided_speech::GuidedSpeech> {
 fn guided_model(
     assets: &Path,
     credit: Arc<crate::sched::admission::DownstreamCredit>,
+    buckets: &Arc<crate::obs::bucket::BucketDemand>,
     device: u8,
 ) -> Result<Option<Arc<super::guided_speech::GuidedSpeech>>, String> {
     let at = (assets.to_path_buf(), device);
@@ -137,7 +138,7 @@ fn guided_model(
         .map_err(|e| e.to_string())?
         .is_some()
     {
-        let g = super::guided_speech::GuidedSpeech::start(assets, credit, device)
+        let g = super::guided_speech::GuidedSpeech::start(assets, credit, buckets, device)
             .map_err(|e| e.to_string())?;
         tracing::info!(dir = %assets.display(), device, "tts: guided speech pipeline bound to the serve mux");
         Some(Arc::new(g))
@@ -166,9 +167,11 @@ pub fn bind(state: &AppState, slug: &str) -> Result<(), String> {
         .get(state.model_of(slug))
         .map_err(|e| e.to_string())?;
     let device = state.ordinal_of(slug);
-    let bound = guided_model(&bundle.dir, state.downstream(slug), device).and_then(|g| match g {
+    let buckets = &state.model_metrics(slug).buckets;
+    let credit = state.downstream(slug);
+    let bound = guided_model(&bundle.dir, credit, buckets, device).and_then(|g| match g {
         Some(_) => Ok(()),
-        None => speech_model(&bundle.dir, state.downstream(slug), device).map(drop),
+        None => speech_model(&bundle.dir, state.downstream(slug), buckets, device).map(drop),
     });
     bound.map_err(|e| format!("{slug}: speech pipeline failed to bind: {e}"))
 }
@@ -206,12 +209,13 @@ fn bound_pipeline(dir: &Path, device: u8) -> Option<Pipeline> {
 fn bind_pipeline(
     dir: &Path,
     credit: Arc<crate::sched::admission::DownstreamCredit>,
+    buckets: &Arc<crate::obs::bucket::BucketDemand>,
     device: u8,
 ) -> Result<Pipeline, String> {
-    if let Some(g) = guided_model(dir, Arc::clone(&credit), device)? {
+    if let Some(g) = guided_model(dir, Arc::clone(&credit), buckets, device)? {
         return Ok(Pipeline::Guided(g));
     }
-    Ok(match speech_model(dir, credit, device)? {
+    Ok(match speech_model(dir, credit, buckets, device)? {
         Some(m) => Pipeline::Speech(m),
         None => Pipeline::None,
     })
@@ -316,7 +320,7 @@ async fn speech_on_guided(
         tokio::spawn(guided_stream_task(
             w, mux, voice, segs, checked, out_pcm, later_ids, first, out_tx, head_tx, t_arrive, run,
         ));
-        return stream_response(out_rx, head_rx, header, in_flight, cache).await;
+        return stream_response(out_rx, head_rx, header, in_flight, cache, false).await;
     }
     let (mut pcm, mut joiner) = (Vec::new(), super::Joins::new(w.sample_rate));
     let (mut tokens, mut t3_ms, mut s3gen_ms) = (0, 0.0, 0.0);
@@ -490,6 +494,7 @@ async fn stream_response(
     wav: Option<Vec<u8>>,
     in_flight: InFlight,
     cache: Option<crate::serve::session::CacheOutcome>,
+    coalesce: bool,
 ) -> Response {
     use futures::StreamExt;
     let first = match out_rx.recv().await {
@@ -504,9 +509,14 @@ async fn stream_response(
         "audio/pcm"
     };
     let lead = futures::stream::iter(wav.into_iter().chain([first]).map(Ok));
+    let mut pending_error = None;
     let rest = futures::stream::poll_fn(move |cx| {
         let _held = &in_flight;
-        out_rx.poll_recv(cx)
+        if coalesce {
+            poll_audio(&mut out_rx, &mut pending_error, cx)
+        } else {
+            out_rx.poll_recv(cx)
+        }
     });
     let mut response = (
         [(header::CONTENT_TYPE, content_type)],
@@ -518,6 +528,32 @@ async fn stream_response(
         cache.stamp(&mut response);
     }
     response
+}
+
+fn poll_audio(
+    rx: &mut tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    pending_error: &mut Option<std::io::Error>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Option<Result<Vec<u8>, std::io::Error>>> {
+    use std::task::Poll;
+    if let Some(error) = pending_error.take() {
+        return Poll::Ready(Some(Err(error)));
+    }
+    let mut bytes = match rx.poll_recv(cx) {
+        Poll::Ready(Some(Ok(bytes))) => bytes,
+        other => return other,
+    };
+    for _ in 0..rx.len() {
+        match rx.try_recv() {
+            Ok(Ok(next)) => bytes.extend_from_slice(&next),
+            Ok(Err(error)) => {
+                *pending_error = Some(error);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    Poll::Ready(Some(Ok(bytes)))
 }
 
 /// A whole reply: the audio and the same headers on every model.
@@ -557,6 +593,8 @@ pub struct SpeechModel {
     spec: OnceLock<SpeechSpec>,
     /// Maya 2's cloned-speaker conditioning (`spk` / `icl_spk`), when the bundle carries it.
     speaker: Option<Arc<Maya2Speaker>>,
+    /// Running frame period of this model's stateful streams, microseconds (0: none measured).
+    frame_period: FramePeriod,
 }
 
 /// ECAPA and the speaker tables of a Maya 2 bundle (`checkpoint/ecapa`, `checkpoint/speaker`).
@@ -619,7 +657,67 @@ impl Maya2Speaker {
     }
 }
 
+/// A model's running frame period over its stateful streams, with when it was last observed:
+/// (ms since process start) << 32 | microseconds. Streams observe it every few frames, so under
+/// load it is always fresh; once the streams that measured it are gone it says nothing about
+/// the next request, and after [`FramePeriod::FRESH_MS`] it is no longer used.
+#[derive(Default)]
+struct FramePeriod(std::sync::atomic::AtomicU64);
+
+impl FramePeriod {
+    const FRESH_MS: u32 = 1_000;
+
+    fn now_ms() -> u32 {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_millis() as u32
+    }
+
+    /// The period in seconds, while an observation is fresh.
+    fn recent(&self, now_ms: u32) -> Option<f64> {
+        let v = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        let (at, us) = ((v >> 32) as u32, v as u32);
+        (us > 0 && now_ms.wrapping_sub(at) <= Self::FRESH_MS).then(|| f64::from(us) * 1e-6)
+    }
+
+    fn observe(&self, seconds: f64, now_ms: u32) {
+        let us = seconds * 1e6;
+        let us = match self.recent(now_ms) {
+            Some(old) => old * 1e6 + 0.1 * (us - old * 1e6),
+            None => us,
+        };
+        let us = us.clamp(1.0, f64::from(u32::MAX)) as u64;
+        self.0.store(
+            u64::from(now_ms) << 32 | us,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Whether a request starting now banks a frame: live streams are producing frames slower
+    /// than half real time (`frame`: one frame's audio, seconds).
+    fn banks(&self, frame: f64, now_ms: u32) -> bool {
+        self.recent(now_ms)
+            .is_some_and(|period| period > 0.5 * frame)
+    }
+}
+
 impl SpeechModel {
+    /// Frames a stream's first stateful codec step waits for: the contract's, plus one banked frame
+    /// while frames come slower than half real time (a stream then starts with the lead that lets
+    /// its later steps wait for more than one frame). An explicit `PLOW_TTS_STREAM_FIRST_FRAMES`
+    /// or `PLOW_TTS_STREAM_DEADLINE=0` keeps the contract's.
+    fn first_frames(&self) -> usize {
+        let cfg = crate::config::RuntimeConfig::get();
+        let frame = self.contract.frame_samples as f64 / f64::from(self.contract.sample_rate);
+        let bank = cfg.tts_stream_deadline
+            && cfg.tts_stream_first_frames.is_none()
+            && self.frame_period.banks(frame, FramePeriod::now_ms());
+        self.contract.first_frames() + usize::from(bank)
+    }
+
+    fn observe_frame_period(&self, seconds: f64) {
+        self.frame_period.observe(seconds, FramePeriod::now_ms());
+    }
+
     /// The model's [`SpeechSpec`] (its voices may come from the tokenizer: built once).
     pub fn spec(&self, tok: &dyn crate::text::tokenizer::Tokenize) -> &SpeechSpec {
         self.spec.get_or_init(|| self.contract.spec(tok))
@@ -636,6 +734,7 @@ fn speech_models() -> &'static Bound<SpeechModel> {
 pub fn speech_model(
     assets: &Path,
     credit: Arc<crate::sched::admission::DownstreamCredit>,
+    buckets: &Arc<crate::obs::bucket::BucketDemand>,
     device: u8,
 ) -> Result<Option<Arc<SpeechModel>>, String> {
     let at = (assets.to_path_buf(), device);
@@ -647,6 +746,7 @@ pub fn speech_model(
         Some(contract) => {
             let mut codec = Codec::load_on(assets, device)?;
             codec.couple(credit);
+            codec.observe_buckets(buckets);
             if codec.frame_codes != contract.frame_codes
                 || codec.frame_samples != contract.frame_samples
             {
@@ -655,25 +755,47 @@ pub fn speech_model(
                     codec.frame_codes, codec.frame_samples, contract.frame_codes, contract.frame_samples
                 ));
             }
+            if contract.conditioning.is_some() && codec.step_frames == 0 {
+                return Err("external speech conditioning requires a stateful codec".into());
+            }
             let encoder = match &contract.text_encoder {
-                Some(sub) => Some(Arc::new(super::text_encoder::TextEncoder::load(
-                    &assets.join(sub),
-                    device,
-                )?)),
+                Some(sub) => {
+                    let e = super::text_encoder::TextEncoder::load(&assets.join(sub), device)?;
+                    e.observe_buckets(buckets);
+                    Some(Arc::new(e))
+                }
                 None => None,
             };
-            let ref_encoder = match &contract.clone {
-                Some(clone) => {
-                    let file = &clone.encoder;
-                    let e = super::ref_encoder::RefEncoder::load(&assets.join(file), device)?;
+            let reference_file = contract.clone.as_ref().map(|c| &c.encoder).or_else(|| {
+                contract
+                    .conditioning
+                    .as_ref()
+                    .map(|c| &c.packets.reference_packet)
+            });
+            let ref_encoder = match reference_file {
+                Some(file) => {
+                    let mut e = super::ref_encoder::RefEncoder::load(&assets.join(file), device)?;
+                    e.observe_buckets(buckets);
                     if e.frame_codes != contract.frame_codes
                         || e.frame_samples != contract.frame_samples
                         || e.sample_rate != contract.sample_rate
+                        || e.codebook != contract.codebook
                     {
                         return Err(format!(
                             "{file} frames ({} codes, {} samples at {} Hz) disagree with the speech contract",
                             e.frame_codes, e.frame_samples, e.sample_rate
                         ));
+                    }
+                    if let Some(c) = &contract.conditioning {
+                        let main = crate::asset::devblob::DevBlob::find_in_dir(assets)
+                            .map_err(|e| e.to_string())?
+                            .ok_or("speech packet is missing")?;
+                        let pad = super::ref_encoder::SpeakerEncoder::text_pad(&main, c)?;
+                        let speaker = super::ref_encoder::SpeakerEncoder::load(
+                            &assets.join(&c.packets.speaker_packet),
+                            device,
+                        )?;
+                        e = e.with_speaker(speaker, pad)?;
                     }
                     Some(Arc::new(e))
                 }
@@ -697,6 +819,7 @@ pub fn speech_model(
                 realtime,
                 spec: OnceLock::new(),
                 speaker,
+                frame_period: Default::default(),
             }))
         }
     };
@@ -1102,6 +1225,7 @@ async fn speech_with(
             bind_pipeline(
                 &bundle.dir,
                 state.downstream(&req.model),
+                &state.model_metrics(&req.model).buckets,
                 state.ordinal_of(&req.model),
             )
         }) {
@@ -1171,8 +1295,8 @@ async fn speech_with(
         out_pcm.trim_onset(c.onset_trim, c.sample_rate);
     }
     let reference = match (&req.ref_audio, &req.ref_text, &model.ref_encoder) {
-        (Some(audio), Some(text), Some(enc)) => {
-            match ref_clip(&model, tok, &voice, enc, audio, text) {
+        (Some(audio), text, Some(enc)) if text.is_some() || c.conditioning.is_some() => {
+            match ref_clip(&model, tok, &voice, enc, audio, text.as_deref()) {
                 Ok(r) => Some(Arc::new(r)),
                 Err((msg, param)) => return bad(msg, param),
             }
@@ -1266,6 +1390,14 @@ async fn speech_with(
     } else {
         crate::serve::mux::JobClass::Normal
     };
+    let mut conditioned_slot = if c.conditioning.is_some() {
+        match model.codec.acquire_slot() {
+            Some(slot) => Some(slot),
+            None => return busy(std::time::Duration::from_millis(100)),
+        }
+    } else {
+        None
+    };
     let first = segs[0].clone();
     let mut speech = match maker.speech(&first) {
         Ok(s) => s,
@@ -1275,8 +1407,17 @@ async fn speech_with(
         .as_mut()
         .filter(|_| req.stream && model.codec.step_frames > 0)
     {
-        sp.first_tokens = model.contract.first_frames();
+        sp.first_tokens = model.first_frames();
+        sp.first_audio = Some(Arc::new(crate::serve::mux::FirstAudio::new(
+            sp.first_tokens,
+        )));
+        if let Some(fa) = sp.first_audio.as_ref() {
+            fa.set_frame_period(std::time::Duration::from_secs_f64(
+                model.contract.frame_samples as f64 / model.contract.sample_rate as f64,
+            ));
+        }
     }
+    let first_audio = speech.as_ref().and_then(|sp| sp.first_audio.clone());
     let (tx, rx) = stream_mod::channel();
     let opts = crate::serve::mux::JobOpts {
         session_end: false,
@@ -1350,10 +1491,20 @@ async fn speech_with(
             out_tx,
             head_tx,
             seed,
+            conditioned_slot,
             t_arrive,
             run,
+            first_audio,
         ));
-        return stream_response(out_rx, head_rx, header, in_flight, cache).await;
+        return stream_response(
+            out_rx,
+            head_rx,
+            header,
+            in_flight,
+            cache,
+            c.batch_delivery && crate::config::RuntimeConfig::process_get().tick_delivery,
+        )
+        .await;
     }
     let (mut pcm, mut n_tokens, mut frames, mut t_lm) =
         (Vec::new(), 0, 0, std::time::Duration::ZERO);
@@ -1393,6 +1544,8 @@ async fn speech_with(
                     &codes[..f * c.frame_codes],
                     f,
                     seed ^ segment_salt(k),
+                    later.maker.reference.as_deref(),
+                    &mut conditioned_slot,
                 )
                 .await
                 {
@@ -1493,11 +1646,45 @@ fn ref_clip(
     voice: &str,
     enc: &Arc<super::ref_encoder::RefEncoder>,
     audio: &str,
-    text: &str,
+    text: Option<&str>,
 ) -> Result<RefClip, (String, &'static str)> {
     let bad = |m: String| (m, "ref_audio");
     let pcm = reference_pcm(audio, enc.sample_rate, enc.max_samples())?;
+    if pcm.len() < enc.min_samples() {
+        return Err(bad(
+            "`ref_audio` is too short for the speaker encoder".into()
+        ));
+    }
     let c = &model.contract;
+    if c.conditioning.is_some() {
+        let dual = c
+            .dual_stream
+            .as_ref()
+            .ok_or_else(|| bad("conditioning needs a dual-stream prompt".into()))?;
+        let ids = text
+            .map(|text| {
+                tok.encode_with_special_tokens(
+                    &dual.text_template.replace("{input}", text.trim()),
+                    false,
+                )
+            })
+            .unwrap_or_default();
+        return Ok(RefClip {
+            ids,
+            lang: None,
+            frames: if text.is_some() {
+                pcm.len().div_ceil(enc.frame_samples)
+            } else {
+                0
+            },
+            eos: None,
+            pcm,
+            encoder: Arc::clone(enc),
+            conditioned: true,
+            encoding: OnceLock::new(),
+        });
+    }
+    let text = text.ok_or_else(|| ("voice cloning needs `ref_text`".into(), "ref_text"))?;
     let Some(clone) = &c.clone else {
         return Err(bad("this model has no voice cloning".into()));
     };
@@ -1527,7 +1714,8 @@ fn ref_clip(
         eos: clone.eos_code,
         pcm,
         encoder: Arc::clone(enc),
-        codes: OnceLock::new(),
+        conditioned: false,
+        encoding: OnceLock::new(),
     })
 }
 
@@ -1550,6 +1738,7 @@ struct Segment {
     k: usize,
     /// A dual-stream prompt's frames and text feed (`Err`: the text has no rows).
     dual: Option<Result<plow_asset::dual_stream::Layout, String>>,
+    speaker_row: Option<usize>,
 }
 
 /// The voice a Maya 2 clone renders as: the plain prompt (`icl` names no speaker).
@@ -1569,7 +1758,8 @@ struct RefClip {
     eos: Option<u32>,
     encoder: Arc<super::ref_encoder::RefEncoder>,
     /// `[frames][frame_codes]`, encoded on the engine thread by the first segment to prefill.
-    codes: OnceLock<Result<Vec<u32>, String>>,
+    conditioned: bool,
+    encoding: OnceLock<Result<Arc<super::ref_encoder::ReferenceEncoding>, String>>,
 }
 
 impl RefClip {
@@ -1579,8 +1769,24 @@ impl RefClip {
     }
 
     fn codes(&self) -> Result<&[u32], String> {
-        self.codes
-            .get_or_init(|| self.encoder.encode(&self.pcm))
+        self.encoded()?
+            .codes
+            .as_deref()
+            .ok_or_else(|| "reference has no codec frames".into())
+    }
+
+    fn encoded(&self) -> Result<&super::ref_encoder::ReferenceEncoding, String> {
+        self.encoding
+            .get_or_init(|| {
+                if self.conditioned {
+                    self.encoder.conditioned(&self.pcm, self.frames > 0)
+                } else {
+                    Ok(Arc::new(super::ref_encoder::ReferenceEncoding {
+                        codes: Some(self.encoder.encode(&self.pcm)?.into()),
+                        speaker: None,
+                    }))
+                }
+            })
             .as_deref()
             .map_err(Clone::clone)
     }
@@ -1664,8 +1870,25 @@ impl SegmentMaker {
                 _ => Vec::new(),
             };
             let language = self.language.as_deref().unwrap_or("auto");
-            d.layout(&text_ids, &ins_ids, &self.voice, language, self.streaming)
+            if let Some(r) = self.reference.as_ref().filter(|r| r.conditioned) {
+                let placeholders = vec![0; r.frames * c.frame_codes];
+                let reference = (r.frames > 0).then_some(plow_asset::dual_stream::Reference {
+                    text: &r.ids,
+                    codes: &placeholders,
+                    codebook_size: c.codebook,
+                });
+                d.layout_conditioned(&text_ids, &ins_ids, language, self.streaming, reference)
+                    .map(|l| (l.layout, Some(l.speaker_row)))
+            } else {
+                d.layout(&text_ids, &ins_ids, &self.voice, language, self.streaming)
+                    .map(|l| (l, None))
+            }
         });
+        let speaker_row = dual
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|(_, row)| *row);
+        let dual = dual.map(|r| r.map(|(layout, _)| layout));
         let mut prompt_ids = match &dual {
             Some(Ok(l)) => l.ids.clone(),
             Some(Err(_)) => Vec::new(),
@@ -1677,7 +1900,7 @@ impl SegmentMaker {
             prompt_ids.fill(0);
             ids
         });
-        if let Some(r) = &self.reference {
+        if let Some(r) = self.reference.as_ref().filter(|r| !r.conditioned) {
             let mut head = if self.encoder.is_some() {
                 vec![0; r.ids.len()]
             } else {
@@ -1718,6 +1941,7 @@ impl SegmentMaker {
             chars: text.chars().count(),
             k,
             dual,
+            speaker_row,
         }
     }
 }
@@ -1784,7 +2008,10 @@ impl SegmentMaker {
         let dual = s.dual.clone().transpose()?;
         // With a reference, the text's segment follows its rows; with a text encoder, the
         // transcript's rows are overlay rows too.
-        let (head, ref_ids) = match (&s.reference, &self.encoder) {
+        let (head, ref_ids) = match (
+            s.reference.as_ref().filter(|r| !r.conditioned),
+            &self.encoder,
+        ) {
             (Some(r), Some(_)) => (r.rows(), Some(r.ids.clone())),
             (Some(r), None) => (r.rows(), None),
             (None, _) => (0, None),
@@ -1799,6 +2026,9 @@ impl SegmentMaker {
         // Maya 2's cloned speaker: its anchor row at the reference's and the text's `<|audio|>`
         // sentinels (each the last row of its prompt span).
         let mut overlay = Vec::new();
+        if let Some(row) = s.speaker_row {
+            overlay_pos.push(u32::try_from(row).map_err(|_| "speaker row overflows")?);
+        }
         if let (Some(sp), Some(_)) = (&self.speaker, &c.maya2) {
             if let Some(r) = &s.reference {
                 overlay_pos.push(r.ids.len() as u32 - 1);
@@ -1829,46 +2059,75 @@ impl SegmentMaker {
         if s.enc_ids.is_some() && self.encoder.is_none() {
             return Err("no text encoder".into());
         }
-        let encode: Option<crate::serve::mux::SpeechEncode> =
-            (s.enc_ids.is_some() || s.reference.is_some()).then(|| {
-                let (e, ids, uncond) = (
-                    self.encoder.clone(),
-                    s.enc_ids.clone(),
-                    s.uncond_ids.clone(),
-                );
-                let reference = s.reference.clone();
-                let (k, base) = (c.frame_codes, c.audio_token_base);
-                Box::new(
-                    move |sp: &mut crate::serve::mux::SpeechJob, prompt: &mut [u32]| {
-                        if let Some(r) = &reference {
-                            let (codes, first) = r.frame_codes(k)?;
-                            let rows = r.ids.len()..r.ids.len() + r.frames;
-                            for (t, &c0) in prompt[rows.clone()].iter_mut().zip(&first) {
+        let encode: Option<crate::serve::mux::SpeechEncode> = (s.enc_ids.is_some()
+            || s.reference.is_some())
+        .then(|| {
+            let (e, ids, uncond) = (
+                self.encoder.clone(),
+                s.enc_ids.clone(),
+                s.uncond_ids.clone(),
+            );
+            let reference = s.reference.clone();
+            let (k, base, codebook) = (c.frame_codes, c.audio_token_base, c.codebook);
+            Box::new(
+                move |sp: &mut crate::serve::mux::SpeechJob, prompt: &mut [u32]| {
+                    if let Some(r) = &reference {
+                        if r.conditioned {
+                            let encoded = r.encoded()?;
+                            sp.overlay = encoded
+                                .speaker
+                                .as_deref()
+                                .ok_or("reference has no speaker overlay")?
+                                .to_vec();
+                            if r.frames > 0 {
+                                let codes = encoded
+                                    .codes
+                                    .as_deref()
+                                    .ok_or("reference has no codec frames")?;
+                                let start = prompt
+                                    .len()
+                                    .checked_sub(r.frames)
+                                    .ok_or("reference prompt is too short")?;
+                                if codes.len() != r.frames * k
+                                    || sp.frame_codes.len() != prompt.len() * k
+                                    || codes.iter().any(|&v| v >= codebook)
+                                {
+                                    return Err(
+                                        "reference code layout disagrees with the prompt".into()
+                                    );
+                                }
+                                sp.frame_codes[start * k..].copy_from_slice(codes);
+                            }
+                            return Ok(());
+                        }
+                        let (codes, first) = r.frame_codes(k)?;
+                        let rows = r.ids.len()..r.ids.len() + r.frames;
+                        for (t, &c0) in prompt[rows.clone()].iter_mut().zip(&first) {
+                            *t = base + c0;
+                        }
+                        if let Some(cfg) = sp.cfg.as_mut() {
+                            for (t, &c0) in cfg.uncond_ids[rows].iter_mut().zip(&first) {
                                 *t = base + c0;
                             }
-                            if let Some(cfg) = sp.cfg.as_mut() {
-                                for (t, &c0) in cfg.uncond_ids[rows].iter_mut().zip(&first) {
-                                    *t = base + c0;
-                                }
-                            }
-                            sp.frame_codes = codes;
                         }
-                        let (Some(e), Some(ids)) = (e, ids) else {
-                            return Ok(());
-                        };
-                        // Each text segment is its own encoder launch (positions from 0).
-                        let lead = match &ref_ids {
-                            Some(r) => e.encode(r)?,
-                            None => Vec::new(),
-                        };
-                        sp.overlay = [lead.as_slice(), &e.encode(&ids)?].concat();
-                        if let (Some(ids), Some(cfg)) = (uncond, sp.cfg.as_mut()) {
-                            cfg.uncond_overlay = [lead.as_slice(), &e.encode(&ids)?].concat();
-                        }
-                        Ok(())
-                    },
-                ) as crate::serve::mux::SpeechEncode
-            });
+                        sp.frame_codes = codes;
+                    }
+                    let (Some(e), Some(ids)) = (e, ids) else {
+                        return Ok(());
+                    };
+                    // Each text segment is its own encoder launch (positions from 0).
+                    let lead = match &ref_ids {
+                        Some(r) => e.encode(r)?,
+                        None => Vec::new(),
+                    };
+                    sp.overlay = [lead.as_slice(), &e.encode(&ids)?].concat();
+                    if let (Some(ids), Some(cfg)) = (uncond, sp.cfg.as_mut()) {
+                        cfg.uncond_overlay = [lead.as_slice(), &e.encode(&ids)?].concat();
+                    }
+                    Ok(())
+                },
+            ) as crate::serve::mux::SpeechEncode
+        });
         let cfg_scale = cfg.as_ref().map(|_| 1.0 + self.cfg_weight);
         {
             // The reference keeps temperature and top-p as bf16 tensors (0.7 -> 0.69921875).
@@ -1882,6 +2141,9 @@ impl SegmentMaker {
             let greedy = self.temperature <= 0.0;
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
                 device_frames: self.device_frames,
+                batch_delivery: c.batch_delivery
+                    && self.streaming
+                    && crate::config::RuntimeConfig::process_get().tick_delivery,
                 cfg,
                 slot_prefix_reuse: c.slot_prefix_reuse,
                 overlay,
@@ -2031,6 +2293,63 @@ async fn decode_all(
     codes: &[i32],
     frames: usize,
     seed: u64,
+    reference: Option<&RefClip>,
+    reserved: &mut Option<super::codec::StreamSlot>,
+) -> Result<Vec<f32>, String> {
+    if model.contract.conditioning.is_none() {
+        return decode_plain(model, codes, frames, seed).await;
+    }
+    let reference = reference
+        .filter(|r| r.conditioned)
+        .ok_or("conditioned request has no reference")?;
+    let input = if reference.frames > 0 {
+        let prefix = reference.codes()?;
+        let mut joined = Vec::with_capacity(prefix.len() + codes.len());
+        for &v in prefix {
+            joined.push(i32::try_from(v).map_err(|_| "reference code overflows")?);
+        }
+        joined.extend_from_slice(codes);
+        joined
+    } else {
+        codes.to_vec()
+    };
+    let total = frames
+        .checked_add(reference.frames)
+        .ok_or("codec frame count overflows")?;
+    let mut slot = reserved
+        .take()
+        .ok_or("conditioned request lost its codec slot")?;
+    slot.restart();
+    let (slot, mut pcm) = model
+        .codec
+        .decode_stateful(slot, input.into(), total, Urgency::Whole)
+        .await?;
+    *reserved = Some(slot);
+    if reference.frames > 0 {
+        let crop = reference_crop(reference.frames, total, pcm.len())?;
+        pcm.copy_within(crop.., 0);
+        pcm.truncate(pcm.len() - crop);
+    }
+    Ok(pcm)
+}
+
+fn reference_crop(
+    reference_frames: usize,
+    total_frames: usize,
+    samples: usize,
+) -> Result<usize, String> {
+    if total_frames == 0 || reference_frames > total_frames {
+        return Err("invalid codec reference crop".into());
+    }
+    // Preserve the source's floating division, multiplication and truncation (including one-sample rounding).
+    Ok((reference_frames as f64 / total_frames as f64 * samples as f64) as usize)
+}
+
+async fn decode_plain(
+    model: &SpeechModel,
+    codes: &[i32],
+    frames: usize,
+    seed: u64,
 ) -> Result<Vec<f32>, String> {
     let (fc, fs, max) = (
         model.contract.frame_codes,
@@ -2098,7 +2417,8 @@ async fn collect_codes(
 /// `Some((window_start, window_end, emit_to))`, or `None` when nothing new is ready.
 ///
 /// Every window carries `window - lookahead - 1` frames of left context and `lookahead` of right
-/// context (the one-frame window's shape). After the first audio, frames go out `chunk` at a time:
+/// context (the one-frame window's shape). After the first audio, frames go out `chunk` at a time
+/// (`ramp`: `min(emitted, chunk)`, so the windows right after the first audio wait for fewer frames):
 /// a window costs its codec capacity whatever it emits, and one frame per window made streaming
 /// Veena c64 36% slower than whole-utterance decoding.
 fn stream_step(
@@ -2108,8 +2428,14 @@ fn stream_step(
     window: usize,
     lookahead: usize,
     chunk: usize,
+    ramp: bool,
 ) -> Option<(usize, usize, usize)> {
     let upto = if done { n } else { n.saturating_sub(lookahead) };
+    let chunk = if ramp {
+        chunk.min(emitted.max(1))
+    } else {
+        chunk
+    };
     let ready = upto > emitted && (done || emitted == 0 || upto - emitted >= chunk);
     ready.then(|| {
         (
@@ -2120,19 +2446,91 @@ fn stream_step(
     })
 }
 
+/// Frames the window after a first audio over `n` frames waits for: `chunk`, or ramped what the
+/// first window emits (`n - lookahead`, however many frames arrived together), at most `chunk`:
+/// [`stream_step`]'s chunk at that `emitted`.
+fn next_window_chunk(n: usize, lookahead: usize, chunk: usize, ramp: bool) -> usize {
+    if ramp {
+        n.saturating_sub(lookahead).clamp(1, chunk)
+    } else {
+        chunk
+    }
+}
+
 /// New frames the next stateful codec step of a stream holding `n` complete frames, `emitted`
 /// of them sent, decodes: every committed frame up to `cap`; a segment's first step waits for
-/// `first` frames until the segment is done.
-fn step_plan(n: usize, emitted: usize, done: bool, first: usize, cap: usize) -> Option<usize> {
+/// `first` frames until the segment is done. `urgent`: playback runs dry before another frame
+/// and its step can arrive, so a started stream steps with what it has.
+fn step_plan(
+    n: usize,
+    emitted: usize,
+    done: bool,
+    first: usize,
+    cap: usize,
+    urgent: bool,
+) -> Option<usize> {
+    let new = n.saturating_sub(emitted);
+    let ready = done || (urgent && emitted > 0) || new >= step_need(emitted, first, cap);
+    (new > 0 && ready).then(|| new.min(cap))
+}
+
+/// Whether a playing stream cannot wait for one more frame: the audio it holds ahead of playback
+/// (`due` = when the sent audio has played out) is under one measured frame period plus the
+/// codec step that follows it (`step_s`, with margin). Waiting for as many frames as were emitted
+/// only holds while frames come at least twice as fast as they play.
+/// When the frames [`step_urgent`] counts began to arrive. The count restarts with every segment
+/// and retry, so the clock restarts with it: a request-old clock over a fresh count reads as a
+/// frame period of seconds and turns every step urgent.
+#[derive(Default)]
+struct FramePace(Option<Instant>);
+
+impl FramePace {
+    fn frame(&mut self) {
+        self.0.get_or_insert_with(Instant::now);
+    }
+
+    fn restart(&mut self) {
+        self.0 = None;
+    }
+
+    fn since(&self) -> Option<Instant> {
+        self.0
+    }
+}
+
+fn step_urgent(
+    due: Option<Instant>,
+    first_frame_at: Option<Instant>,
+    n: usize,
+    step_s: f64,
+) -> bool {
+    let (Some(due), Some(t0)) = (due, first_frame_at) else {
+        return false;
+    };
+    if n < 2 {
+        return false;
+    }
+    let per_frame = t0.elapsed().as_secs_f64() / (n - 1) as f64;
+    let lead = due.saturating_duration_since(Instant::now()).as_secs_f64();
+    lead < urgent_lead(per_frame, step_s)
+}
+
+/// The playback lead under which a step is urgent: one frame period plus the codec step that
+/// follows it (with margin), and never more than two frame periods, so a stream whose frames come
+/// fast steps no earlier than that.
+fn urgent_lead(per_frame: f64, step_s: f64) -> f64 {
+    (per_frame + 1.5 * step_s + 0.010).min(2.0 * per_frame)
+}
+
+/// New frames [`step_plan`]'s next step waits for (short of the segment's end).
+fn step_need(emitted: usize, first: usize, cap: usize) -> usize {
     // A step costs about the same at 1 frame as at `cap`: after the first, each step waits for as
     // many new frames as were already emitted (their audio covers producing them), up to `cap`.
-    let new = n.saturating_sub(emitted);
-    let need = if emitted == 0 {
+    if emitted == 0 {
         first
     } else {
         emitted.min(cap)
-    };
-    (new > 0 && (done || new >= need)).then(|| new.min(cap))
+    }
 }
 
 enum SegMsg {
@@ -2190,10 +2588,22 @@ async fn stream_task(
     out: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     head: tokio::sync::oneshot::Sender<axum::http::HeaderMap>,
     seed: u64,
+    initial_slot: Option<super::codec::StreamSlot>,
     t_arrive: Instant,
     mut run: crate::serve::turns::StageRun,
+    first_audio: Option<Arc<crate::serve::mux::FirstAudio>>,
 ) {
     use std::sync::atomic::Ordering::SeqCst;
+    // However the stream ends, the decode loop stops handing it the device.
+    struct Heard(Option<Arc<crate::serve::mux::FirstAudio>>);
+    impl Drop for Heard {
+        fn drop(&mut self) {
+            if let Some(fa) = &self.0 {
+                fa.hear();
+            }
+        }
+    }
+    let audible = Heard(first_audio);
     struct ActiveGuard(Option<Arc<crate::obs::Metrics>>);
     impl Drop for ActiveGuard {
         fn drop(&mut self) {
@@ -2222,6 +2632,12 @@ async fn stream_task(
     let sr = f64::from(c.sample_rate) * f64::from(out_pcm.speed());
     let (fc, fs) = (c.frame_codes, c.frame_samples);
     let n_segs = later.segs.len();
+    let reference = later
+        .maker
+        .reference
+        .as_ref()
+        .filter(|r| r.conditioned && r.frames > 0)
+        .cloned();
     let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<SegMsg>();
     // The emitter's verdict per segment attempt (multi-segment only), tagged by `attempt_tag`.
     let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
@@ -2325,11 +2741,25 @@ async fn stream_task(
     // Dropping the rest of the current attempt (cut short).
     let mut skipping = false;
     let mut first_frame_at: Option<Instant> = None;
+    // The deadline rule's clock: restarts with the frame count (segment, retry).
+    let mut pace = FramePace::default();
+    // (when, frames seen) of the last frame-period sample fed to the model's estimate.
+    let mut period_mark: Option<(Instant, usize)> = None;
+    // First-audio trace (`plow::tts::first_audio` at debug): codec steps until audible, the last one's time.
+    let (mut first_steps, mut first_step_ms) = (0u32, 0.0f64);
     // A stateful codec decodes each new frame once on this stream's slot; without a free slot
     // the stream decodes windows.
-    let mut slot: Option<super::codec::StreamSlot> = None;
+    let mut slot = initial_slot;
+    let mut primed = false;
     let mut windowed = model.codec.step_frames == 0;
-    let first_frames = model.contract.first_frames();
+    // The request's first step size, as its first-audio handoff was told (`SpeechModel::first_frames`).
+    let first_frames = audible
+        .0
+        .as_ref()
+        .map_or_else(|| model.contract.first_frames(), |fa| fa.next().max(1));
+    let stream_deadline = crate::config::RuntimeConfig::get().tts_stream_deadline;
+    // This stream's codec step time (seconds, running average): what an urgent step still costs.
+    let mut step_s = 0.02f64;
     loop {
         let mut done = false;
         let msg = frx.recv().await;
@@ -2345,11 +2775,14 @@ async fn stream_task(
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     (frames, emitted, skipping) = (super::codec::Codes::default(), 0, false);
+                    pace.restart();
+                    period_mark = None;
                     attempt += 1;
                     joiner.next_segment();
                     if let Some(s) = slot.as_mut() {
                         s.restart();
                     }
+                    primed = false;
                     continue;
                 }
                 Some(SegMsg::Err(_)) => {}
@@ -2358,10 +2791,13 @@ async fn stream_task(
                     joins.push(sent);
                     joiner.next_segment();
                     (frames, emitted, skipping) = (super::codec::Codes::default(), 0, false);
+                    pace.restart();
+                    period_mark = None;
                     (seg, attempt) = (seg + 1, 0);
                     if let Some(s) = slot.as_mut() {
                         s.restart();
                     }
+                    primed = false;
                 }
             }
         }
@@ -2394,6 +2830,21 @@ async fn stream_task(
                     }
                 }
                 first_frame_at.get_or_insert_with(Instant::now);
+                pace.frame();
+                if slot.is_some() {
+                    let seen = frames.len() / fc.max(1);
+                    match period_mark {
+                        Some((t, at)) if seen >= at + 8 => {
+                            model.observe_frame_period(
+                                t.elapsed().as_secs_f64() / (seen - at) as f64,
+                            );
+                            period_mark = Some((Instant::now(), seen));
+                        }
+                        // A new segment restarts the frame count.
+                        Some((_, at)) if seen >= at => {}
+                        _ => period_mark = Some((Instant::now(), seen)),
+                    }
+                }
             }
         }
         let first_audio = first.is_none() && emitted == 0;
@@ -2408,10 +2859,50 @@ async fn stream_task(
         } else {
             model.codec.lookahead
         };
+        // Windowed streams ramp their chunk after the first audio (1, 2, .. `chunk` frames: the
+        // packet's `stream.chunk_ramp`, `PLOW_TTS_CHUNK_RAMP` overrides), so the second window
+        // needs fewer frames and the first audio is held for fewer.
+        let ramp = crate::config::RuntimeConfig::get()
+            .tts_chunk_ramp
+            .unwrap_or_else(|| model.codec.parameters.get("stream.chunk_ramp") == Some(&1));
         let n = frames.len() / fc;
         if !windowed && slot.is_none() && n > emitted && !skipping {
             slot = model.codec.acquire_slot();
             windowed = slot.is_none();
+            if windowed {
+                // Windows follow their own plan: no per-step handoff.
+                if let Some(fa) = &audible.0 {
+                    fa.hear();
+                }
+            }
+        }
+        if !primed && slot.is_some() && n > emitted && !skipping {
+            if let Some(reference) = &reference {
+                let prefix = match reference.codes().and_then(|codes| {
+                    codes
+                        .iter()
+                        .map(|&v| i32::try_from(v).map_err(|_| "reference code overflows".into()))
+                        .collect::<Result<Vec<_>, String>>()
+                }) {
+                    Ok(prefix) => prefix,
+                    Err(e) => return drop(out.send(Err(std::io::Error::other(e))).await),
+                };
+                match model
+                    .codec
+                    .prime_codes(
+                        slot.take().unwrap(),
+                        prefix.into(),
+                        reference.frames,
+                        Urgency::First,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(ready) => slot = Some(ready),
+                    Err(e) => return drop(out.send(Err(std::io::Error::other(e))).await),
+                }
+            }
+            primed = true;
         }
         // A short first lookahead buys time to first audio, but the next window needs the full
         // lookahead: hold the first audio until it covers producing those frames at the measured
@@ -2422,7 +2913,10 @@ async fn stream_task(
             };
             let per_frame = t0.elapsed().as_secs_f64() / (n - 1) as f64;
             let audio_per_frame = fs as f64 / sr;
-            let gap = (chunk + model.codec.lookahead - lookahead) as f64;
+            // Frames the next window waits for: its chunk (ramped: what this one emits, at most
+            // `chunk`) plus the lookahead this window lacks.
+            let next_chunk = next_window_chunk(n, lookahead, chunk, ramp);
+            let gap = (next_chunk + model.codec.lookahead - lookahead) as f64;
             let need = ((gap * per_frame * 1.1) / audio_per_frame).ceil() as usize;
             let mut need = need.clamp(1, chunk + model.codec.lookahead);
             // A later segment's first window waits for its prefill and frames: bank that too.
@@ -2451,8 +2945,15 @@ async fn stream_task(
             let due = playing.map(|t| t + std::time::Duration::from_secs_f64(sent as f64 / sr));
             // (PCM, its first fresh frame, frames emitted after it, frames decoded)
             let decoded = if let Some(slot) = slot.as_mut() {
-                let Some(k) = step_plan(n, emitted, done, first_frames, model.codec.step_frames)
-                else {
+                let urgent = stream_deadline && step_urgent(due, pace.since(), n, step_s);
+                let Some(k) = step_plan(
+                    n,
+                    emitted,
+                    done,
+                    first_frames,
+                    model.codec.step_frames,
+                    urgent,
+                ) else {
                     break;
                 };
                 let codes = frames.slice(emitted * fc..(emitted + k) * fc, fc);
@@ -2462,14 +2963,21 @@ async fn stream_task(
                     }
                     Instant::now()
                 });
+                let t_step = Instant::now();
                 let r = model.codec.step_codes(slot, codes, k, urgency, due).await;
+                let took = t_step.elapsed().as_secs_f64();
+                step_s += 0.25 * (took - step_s);
+                if first.is_none() {
+                    first_step_ms = took * 1e3;
+                    first_steps += 1;
+                }
                 if let Some(t) = t_codec {
                     crate::obs::ttft::SPEECH_CODEC.add(t.elapsed().as_nanos() as u64);
                 }
                 r.map(|pcm| (pcm, 0, emitted + k, k))
             } else {
                 let Some((s, e, upto)) =
-                    stream_step(n, emitted, done, model.codec.window, lookahead, chunk)
+                    stream_step(n, emitted, done, model.codec.window, lookahead, chunk, ramp)
                 else {
                     break;
                 };
@@ -2477,7 +2985,7 @@ async fn stream_task(
                 let wseed = seed ^ segment_salt(seg) ^ (emitted as u64).wrapping_mul(0x9E37_79B9);
                 model
                     .codec
-                    .decode_codes(window, e - s, wseed, urgency)
+                    .decode_codes(window, e - s, wseed, urgency, due)
                     .await
                     .map(|pcm| (pcm, emitted - s, upto, e - s))
             };
@@ -2507,6 +3015,11 @@ async fn stream_task(
                     };
                     if slot.is_some() {
                         frames.release(emitted..upto);
+                        if let Some(fa) = &audible.0 {
+                            fa.set_next(
+                                upto + step_need(upto, first_frames, model.codec.step_frames),
+                            );
+                        }
                     }
                     emitted = upto;
                     let mut bytes = Vec::new();
@@ -2520,8 +3033,21 @@ async fn stream_task(
                     }
                     if !bytes.is_empty() {
                         if first.is_none() {
+                            if let Some(fa) = &audible.0 {
+                                fa.hear();
+                            }
                             ticket.first_audio();
                             crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, 0);
+                            tracing::debug!(
+                                target: "plow::tts::first_audio",
+                                audio_ms = t_arrive.elapsed().as_secs_f64() * 1e3,
+                                frame_ms = first_frame_at
+                                    .map(|t| t.duration_since(t_arrive).as_secs_f64() * 1e3),
+                                frames = n,
+                                steps = first_steps,
+                                last_step_ms = first_step_ms,
+                                "first audio"
+                            );
                         }
                         first.get_or_insert_with(|| t_arrive.elapsed());
                         playing.get_or_insert_with(Instant::now);
@@ -2539,6 +3065,12 @@ async fn stream_task(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             return; // client gone: dropping frx ends the drain, which cancels the slot
+                        }
+                        if let (Some(fa), Some(started)) = (audible.0.as_ref(), playing) {
+                            fa.set_playback_deadline(
+                                started + std::time::Duration::from_secs_f64(sent as f64 / sr),
+                                std::time::Duration::from_secs_f64(step_s),
+                            );
                         }
                     }
                 }
@@ -2599,7 +3131,136 @@ async fn stream_task(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delivery_audio_coalesces_ready_bytes_and_preserves_a_following_error() {
+        use std::task::{Context, Poll};
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut error = None;
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(super::poll_audio(&mut rx, &mut error, &mut cx).is_pending());
+        tx.try_send(Ok(vec![1, 2])).unwrap();
+        tx.try_send(Ok(vec![3, 4])).unwrap();
+        tx.try_send(Err(std::io::Error::other("broken"))).unwrap();
+        tx.try_send(Ok(vec![5])).unwrap();
+        assert!(matches!(super::poll_audio(&mut rx, &mut error, &mut cx),
+            Poll::Ready(Some(Ok(bytes))) if bytes == [1, 2, 3, 4]));
+        assert!(matches!(super::poll_audio(&mut rx, &mut error, &mut cx),
+            Poll::Ready(Some(Err(e))) if e.to_string() == "broken"));
+        assert!(matches!(super::poll_audio(&mut rx, &mut error, &mut cx),
+            Poll::Ready(Some(Ok(bytes))) if bytes == [5]));
+        drop(tx);
+        assert!(matches!(
+            super::poll_audio(&mut rx, &mut error, &mut cx),
+            Poll::Ready(None)
+        ));
+    }
     use super::*;
+
+    #[test]
+    fn whole_reference_crop_keeps_source_floating_rounding() {
+        assert!(reference_crop(1, 0, 0).is_err());
+        assert!(reference_crop(2, 1, 1920).is_err());
+        let mut rounded = 0;
+        for reference in 1..=256 {
+            for fresh in 1..=512 {
+                let total = reference + fresh;
+                let got = reference_crop(reference, total, total * 1920).unwrap();
+                assert!(got == reference * 1920 || got + 1 == reference * 1920);
+                rounded += usize::from(got != reference * 1920);
+            }
+        }
+        assert!(rounded > 0);
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn conditioned_prompts_finalize_overlay_and_reference_codes_on_the_engine_path() {
+        use crate::text::tokenizer::{ByteTokenizer, Tokenize};
+        let c =
+            SpeechContract::from_pipeline(&super::super::tests::conditioned_pipeline()).unwrap();
+        let tok: Arc<dyn Tokenize> = Arc::new(ByteTokenizer);
+        let d = c.dual_stream.as_ref().unwrap();
+        for transcript in [false, true] {
+            for streaming in [false, true] {
+                let (encoder, calls) =
+                    super::super::ref_encoder::tests::counted_encoder(true, false);
+                let codes: Vec<_> = (0..32).map(|v| v + 10).collect();
+                let row: Arc<[f32]> = vec![0.25, 0.5, -1., 2.].into();
+                let reference = Arc::new(RefClip {
+                    lang: None,
+                    ids: if transcript {
+                        tok.encode("abcrefdefgh")
+                    } else {
+                        Vec::new()
+                    },
+                    pcm: vec![0.25, 0.5, 0.75],
+                    frames: if transcript { 2 } else { 0 },
+                    eos: None,
+                    encoder: Arc::new(encoder),
+                    conditioned: true,
+                    encoding: OnceLock::from(Ok(Arc::new(
+                        super::super::ref_encoder::ReferenceEncoding {
+                            codes: transcript.then(|| codes.clone().into()),
+                            speaker: Some(row.clone()),
+                        },
+                    ))),
+                });
+                let maker = SegmentMaker {
+                    tok: tok.clone(),
+                    contract: c.clone(),
+                    voice: "default".into(),
+                    language: Some("english".into()),
+                    speaker: None,
+                    instructions: None,
+                    encoder: None,
+                    reference: Some(reference.clone()),
+                    cfg_weight: 0.,
+                    max_tokens: None,
+                    temperature: 0.9,
+                    top_p: 1.,
+                    repetition_penalty: 1.05,
+                    top_k: 50,
+                    seed: 17,
+                    streaming,
+                    device_frames: true,
+                };
+                for width in [1, 8, 32] {
+                    for k in 0..width {
+                        let text = format!("words{k}");
+                        let segment = maker.make(k, &text);
+                        let original_ids = segment.prompt_ids.clone();
+                        let mut speech = maker.speech(&segment).unwrap().unwrap();
+                        assert!(speech.slot_prefix_reuse && speech.overlay.is_empty());
+                        let mut prompt = segment.prompt_ids.clone();
+                        speech.encode.take().unwrap()(&mut speech, &mut prompt).unwrap();
+                        assert_eq!(prompt, original_ids, "conditioning overwrote text ids");
+                        assert_eq!(speech.overlay, &*row);
+                        let expected = d
+                            .layout_conditioned(
+                                &tok.encode(&format!("abc{text}defgh")),
+                                &[],
+                                "english",
+                                streaming,
+                                transcript.then_some(plow_asset::dual_stream::Reference {
+                                    text: &reference.ids,
+                                    codes: &codes,
+                                    codebook_size: c.codebook,
+                                }),
+                            )
+                            .unwrap();
+                        assert_eq!(prompt, expected.layout.ids);
+                        assert_eq!(speech.overlay_pos, [expected.speaker_row as u32]);
+                        assert_eq!(speech.frame_codes, expected.layout.codes);
+                        assert_eq!(
+                            speech.feed,
+                            Some((expected.layout.feed, expected.layout.tail))
+                        );
+                    }
+                }
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
 
     const WINDOW: usize = 6;
     const LOOKAHEAD: usize = 2;
@@ -2672,23 +3333,102 @@ mod tests {
     /// Stateful steps decode every committed frame once, in order, at most CAP per step; a
     /// segment's first step waits for FIRST frames unless the segment is done.
     #[test]
+    fn first_audio_guard_prices_the_window_stream_step_takes_next() {
+        const WINDOW: usize = 6;
+        for (first_la, full_la) in [(1, 2), (0, 2), (2, 2)] {
+            for chunk in 1..=4 {
+                // n frames arrive together (coalesced) before the first audio.
+                for n in first_la + 1..=first_la + 6 {
+                    let (_, _, emitted) =
+                        stream_step(n, 0, false, WINDOW, first_la, chunk, true).unwrap();
+                    assert_eq!(emitted, n - first_la);
+                    let want = next_window_chunk(n, first_la, chunk, true);
+                    // The second window (full lookahead) fires at exactly emitted + want + la.
+                    let fire = (n..n + 16)
+                        .find(|&m| {
+                            stream_step(m, emitted, false, WINDOW, full_la, chunk, true).is_some()
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        fire,
+                        (emitted + want + full_la).max(n),
+                        "la {first_la} chunk {chunk} n {n}"
+                    );
+                    assert_eq!(next_window_chunk(n, first_la, chunk, false), chunk);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn step_plan_covers_each_frame_once() {
         const CAP: usize = 17;
-        assert_eq!(step_plan(3, 0, false, 4, CAP), None);
-        assert_eq!(step_plan(3, 0, true, 4, CAP), Some(3));
-        assert_eq!(step_plan(4, 0, false, 4, CAP), Some(4));
-        assert_eq!(step_plan(5, 4, false, 4, CAP), None);
-        assert_eq!(step_plan(8, 4, false, 4, CAP), Some(4));
-        assert_eq!(step_plan(30, 21, false, 4, CAP), None);
-        assert_eq!(step_plan(38, 21, false, 4, CAP), Some(CAP));
-        assert_eq!(step_plan(40, 4, false, 4, CAP), Some(CAP));
-        assert_eq!(step_plan(4, 4, true, 4, CAP), None);
+        assert_eq!(step_plan(3, 0, false, 4, CAP, false), None);
+        assert_eq!(step_plan(3, 0, true, 4, CAP, false), Some(3));
+        assert_eq!(step_plan(4, 0, false, 4, CAP, false), Some(4));
+        assert_eq!(step_plan(5, 4, false, 4, CAP, false), None);
+        assert_eq!(step_plan(8, 4, false, 4, CAP, false), Some(4));
+        assert_eq!(step_plan(30, 21, false, 4, CAP, false), None);
+        assert_eq!(step_plan(38, 21, false, 4, CAP, false), Some(CAP));
+        assert_eq!(step_plan(40, 4, false, 4, CAP, false), Some(CAP));
+        assert_eq!(step_plan(4, 4, true, 4, CAP, false), None);
+        // Urgent: a started stream steps with what it has; the first step still waits.
+        assert_eq!(step_plan(30, 21, false, 4, CAP, true), Some(9));
+        assert_eq!(step_plan(21, 21, false, 4, CAP, true), None);
+        assert_eq!(step_plan(3, 0, false, 4, CAP, true), None);
+        // Fast frames: never urgent with more lead than two frame periods (10 ms frames, a 4 ms
+        // codec step and 23 ms of lead wait for the next frame).
+        assert_eq!(urgent_lead(0.010, 0.004), 0.020);
+        for per_frame in [0.001, 0.010, 0.040, 0.080, 0.200] {
+            for step_s in [0.0, 0.004, 0.020, 0.500] {
+                assert!(urgent_lead(per_frame, step_s) <= 2.0 * per_frame);
+            }
+        }
+        assert!((urgent_lead(0.070, 0.010) - 0.095).abs() < 1e-9);
+        // Banking follows live load only: 32 slow streams, then idle, then one request.
+        let period = FramePeriod::default();
+        assert!(!period.banks(0.080, 0), "nothing measured");
+        for ms in (0..5_000).step_by(50) {
+            period.observe(0.060, ms);
+        }
+        assert!(period.banks(0.080, 5_000), "live streams at RTF 0.75 bank");
+        assert!(
+            !period.banks(0.080, 5_000 + FramePeriod::FRESH_MS + 1),
+            "idle: no extra frame"
+        );
+        // The next load starts from its own measurement, not the stale one.
+        period.observe(0.020, 60_000);
+        assert!((period.recent(60_000).unwrap() - 0.020).abs() < 1e-9);
+        assert!(!period.banks(0.080, 60_000));
+        // The deadline clock restarts with the frame count. Ten seconds into a request, a later
+        // segment (or a retry) has five frames and a second of audio buffered: over the request's
+        // clock that reads as a 2.5 s frame period and is urgent; over the segment's it is not.
+        let now = Instant::now();
+        let (began, due) = (
+            now - std::time::Duration::from_secs(10),
+            now + std::time::Duration::from_secs(1),
+        );
+        assert!(step_urgent(Some(due), Some(began), 5, 0.02));
+        let mut pace = FramePace(Some(began));
+        for _segment_then_retry in 0..2 {
+            pace.restart();
+            assert!(!step_urgent(Some(due), pace.since(), 5, 0.02));
+            pace.frame();
+            let since = pace.since().unwrap();
+            assert!(
+                since >= now,
+                "the clock starts at the segment's first frame"
+            );
+            pace.frame();
+            assert_eq!(pace.since(), Some(since));
+            assert!(!step_urgent(Some(due), pace.since(), 5, 0.02));
+        }
         for total in 1..60 {
             for arrive in 1..20 {
                 let (mut emitted, mut seen, mut n) = (0, Vec::new(), 0);
                 while n < total || emitted < total {
                     n = (n + arrive).min(total);
-                    while let Some(k) = step_plan(n, emitted, n == total, 4, CAP) {
+                    while let Some(k) = step_plan(n, emitted, n == total, 4, CAP, false) {
                         assert!(k <= CAP && (emitted > 0 || k >= 4.min(total)));
                         seen.extend(emitted..emitted + k);
                         emitted += k;
@@ -2704,30 +3444,45 @@ mod tests {
     /// and fit the smallest capacity (WINDOW + CHUNK - 1 frames).
     #[test]
     fn stream_plan_covers_each_frame_once() {
-        for chunk in 1..=3 {
-            for total in 1..20 {
-                let (mut emitted, mut seen) = (0, Vec::new());
-                for n in 1..=total {
-                    if let Some((s, e, upto)) =
-                        stream_step(n, emitted, false, WINDOW, LOOKAHEAD, chunk)
-                    {
-                        assert!(s <= emitted && upto <= e && e <= n && e - s <= WINDOW + chunk - 1);
-                        assert!(emitted - s == emitted.min(WINDOW - LOOKAHEAD - 1));
-                        assert!(e - upto >= LOOKAHEAD.min(n - upto));
-                        assert!(emitted == 0 || upto - emitted == chunk);
-                        seen.extend(emitted..upto);
-                        emitted = upto;
+        for ramp in [false, true] {
+            for chunk in 1..=3 {
+                for total in 1..20 {
+                    let (mut emitted, mut seen) = (0, Vec::new());
+                    for n in 1..=total {
+                        if let Some((s, e, upto)) =
+                            stream_step(n, emitted, false, WINDOW, LOOKAHEAD, chunk, ramp)
+                        {
+                            assert!(
+                                s <= emitted && upto <= e && e <= n && e - s <= WINDOW + chunk - 1
+                            );
+                            assert!(emitted - s == emitted.min(WINDOW - LOOKAHEAD - 1));
+                            assert!(e - upto >= LOOKAHEAD.min(n - upto));
+                            let want = if ramp { chunk.min(emitted) } else { chunk };
+                            assert!(emitted == 0 || upto - emitted == want);
+                            seen.extend(emitted..upto);
+                            emitted = upto;
+                        }
                     }
+                    if let Some((_, e, upto)) =
+                        stream_step(total, emitted, true, WINDOW, LOOKAHEAD, chunk, ramp)
+                    {
+                        assert_eq!((e, upto), (total, total));
+                        seen.extend(emitted..upto);
+                    }
+                    assert_eq!(seen, (0..total).collect::<Vec<_>>());
                 }
-                if let Some((_, e, upto)) =
-                    stream_step(total, emitted, true, WINDOW, LOOKAHEAD, chunk)
-                {
-                    assert_eq!((e, upto), (total, total));
-                    seen.extend(emitted..upto);
-                }
-                assert_eq!(seen, (0..total).collect::<Vec<_>>());
             }
         }
+        // Ramped: after a one-frame first chunk the next windows emit 1, 2, then `chunk` frames.
+        let mut emitted = 0;
+        let mut sizes = Vec::new();
+        for n in 1..=14 {
+            if let Some((_, _, upto)) = stream_step(n, emitted, false, WINDOW, 1, 3, true) {
+                sizes.push(upto - emitted);
+                emitted = upto;
+            }
+        }
+        assert_eq!(sizes, [1, 1, 2, 3, 3, 3]);
     }
 
     /// Request identity is reset per WebSocket message: turns and budgets do not leak across

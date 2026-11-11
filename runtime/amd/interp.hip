@@ -6952,9 +6952,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * `ctr_poll`'s comment already records as the reason a workgroup-scope acquire is a race even
  * same-XCD. The leader's `buffer_inv sc1` invalidates the XCD's L2 and the LEADER's L1; a
  * follower on another CU keeps its own stale lines. The microbench cannot see this because its
- * body is empty and it reads no data. So followers issue `buffer_inv` with NO SC bits, which on
- * CDNA4 leaves L2 alone (SC1 is what selects L2) and costs a per-CU L1 invalidate — cheap, and
- * not the per-L2 serialising op the whole exercise exists to remove.
+ * body is empty and it reads no data. So followers invalidate too (`ctr_acquire_l1`): the
+ * agent-scope `buffer_inv sc1`, because a bare `buffer_inv` is a NOP on CDNA3/CDNA4 (see that
+ * function). What the hierarchy saves is the followers' polling of the global counter.
  *
  * REQUIRES PLOW_L2_PLACE_DISPATCH and an L2-placed blob. Without per-domain windows `nper` is
  * meaningless (a workgroup claims whatever entry is next, so the count is a run-time property),
@@ -6999,21 +6999,22 @@ __device__ __forceinline__ uint32_t ctr_poll(const uint32_t* p) {
     return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-/* L1-ONLY invalidate, for a PLOW_GATE_HIER follower whose XCD leader has already done the L2.
+/* The PLOW_GATE_HIER follower's acquire, after its XCD leader has done the L2.
  *
- * There is no HIP fence scope that emits this: workgroup-scope acquire emits NO cache
- * maintenance at all (verified on the emitted ISA), and agent-scope emits `buffer_inv sc1`,
- * which is the L1+L2 form and the very thing being amortised. On CDNA4 SC1 is what selects L2
- * for BUFFER_INV, so the bare opcode is the L1 half. Verified to assemble distinctly on gfx950:
+ * This WAS a bare `buffer_inv` (no SC bits), on the reading that SC1 selects L2 and the bare
+ * opcode is "the L1 half". The ISA says otherwise: with no SC bits BUFFER_INV is a
+ * cache-maintenance NOP on CDNA3 (ISA Tables 50-51) and CDNA4 (9.1.10 Table 52), and the
+ * compiler's memory model never emits it (docs/bringup/isa/gfx942.md, gfx950.md). The three
+ * encodings assemble distinctly (E0A40000 / E0A44000 / E0A48000), which proves the encoding,
+ * not the effect: a follower CU's per-CU L1 kept its stale lines, and the plain `ld_glob8`
+ * activation loads behind this gate (d_residual, d_norm_residual) could read them.
  *
- *     buffer_inv       E0A40000     <- this, L1 only
- *     buffer_inv sc0   E0A44000
- *     buffer_inv sc1   E0A48000     <- what ctr_acquire() emits
- *
- * The "memory" clobber is load-bearing: it stops the compiler hoisting the consumer's loads
- * above the invalidate. */
+ * The cheapest form that invalidates L1 is the agent-scope acquire (`buffer_inv sc1`): `sc0`
+ * alone invalidates only under TG-split mode, which these objects do not use. The leader's
+ * `sc1` already made this XCD's L2 fresh, so the follower's repeats the L2 half; what HIER still
+ * saves is every follower's poll of the global counter. */
 __device__ __forceinline__ void ctr_acquire_l1(void) {
-    plow_cache_inv();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 }
 __device__ __forceinline__ void ctr_acquire(void) {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -7456,7 +7457,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                 } else {
                     while (ctr_poll(PLOW_CTR(prog.counters, h_b + 2u)) < 1u)
                         __builtin_amdgcn_s_sleep(8);
-                    /* L1 only — the leader already did this XCD's L2, but L1 is per-CU. */
+                    /* The leader did this XCD's L2, but L1 is per-CU: every follower invalidates. */
                     ctr_acquire_l1();
                 }
             }

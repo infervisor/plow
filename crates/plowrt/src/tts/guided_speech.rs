@@ -879,7 +879,12 @@ impl GuidedSpeech {
     /// Bind the packet's prompt tables and start the render thread. `credit` is the serving
     /// model's downstream credit: the vocoder's backlog gates the model's admission, and a render
     /// holding a first chunk holds its ticks.
-    pub fn start(assets: &Path, credit: Arc<DownstreamCredit>, device: u8) -> Result<Self> {
+    pub fn start(
+        assets: &Path,
+        credit: Arc<DownstreamCredit>,
+        buckets: &Arc<crate::obs::bucket::BucketDemand>,
+        device: u8,
+    ) -> Result<Self> {
         let c = GuidedLmContract::load(assets)?.ok_or_else(|| {
             RuntimeError::Rejected(format!(
                 "{} declares no guided LM pipeline",
@@ -895,6 +900,7 @@ impl GuidedSpeech {
             "vocoder.packet",
             VOCODER,
         )?;
+        let vocoder_buckets = Arc::clone(buckets);
         std::thread::Builder::new()
             .name("plow-tts-render".into())
             .spawn(move || {
@@ -903,6 +909,7 @@ impl GuidedSpeech {
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Device(e)))),
                 };
                 vocoder.couple(Arc::clone(&credit));
+                vocoder.observe_buckets(&vocoder_buckets);
                 let sc = match Schedule::from_codec(&vocoder, trim_tail) {
                     Ok(sc) => sc,
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Rejected(e)))),
@@ -938,7 +945,9 @@ impl GuidedSpeech {
                 super::voice_cond::PACKET,
             )?;
             if path.is_file() {
-                Some(VoiceCond::load(&path, device).map_err(RuntimeError::Device)?)
+                let mut cond = VoiceCond::load(&path, device).map_err(RuntimeError::Device)?;
+                cond.observe_buckets(buckets);
+                Some(cond)
             } else {
                 None
             }
@@ -1074,6 +1083,7 @@ impl GuidedSpeech {
                 turn: request.turn_key.clone(),
                 continuing: false,
                 speech: Some(Box::new(SpeechJob {
+                    batch_delivery: false,
                     device_frames: false,
                     slot_prefix_reuse: false,
                     overlay: cond,
@@ -1100,6 +1110,7 @@ impl GuidedSpeech {
                     } else {
                         0
                     },
+                    first_audio: None,
                     depth: None,
                     encode: None,
                     frame_codes: Vec::new(),

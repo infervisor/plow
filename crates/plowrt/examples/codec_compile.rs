@@ -1,7 +1,8 @@
 //! A codec-LM codec export (`fish_dac`, `qwen3_tts_12hz` or `mimi_dac` `config.json` +
 //! `model.safetensors`) to a standalone `codec.pkt`, for `codec_check` parity runs before the codec
 //! rides an LM emit: `codec_compile CODEC_DIR GPU N_CU MAX_ROWS OUT.pkt` (MAX_ROWS 0 = every
-//! capacity).
+//! capacity). The emit environment applies as in `plowc` (`PLOW_EMIT_SNAC_SPLIT_BF16`,
+//! `PLOW_EMIT_CODEC_CONV_ARMS`), so the same environment rebuilds an emitted `codec.pkt`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
@@ -14,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::path::Path::new(&args[1]),
         n_cu,
         packet::devbuild::gpu_fingerprint(&args[2]),
-        false,
+        devgen::emit_config::active().snac_split_bf16,
         (max_rows > 0).then_some(max_rows),
     )?;
     devgen::write_sidecar_packet(std::path::Path::new(&args[5]), &model, &[section]);

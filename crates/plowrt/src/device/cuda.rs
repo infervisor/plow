@@ -2399,6 +2399,7 @@ impl CudaBackend {
         self.bind()?;
         let lock = &self.capture_exclusion;
         let _shared = (CAPTURING.get() != Arc::as_ptr(lock) as usize).then(|| lock.read());
+        let _wait = crate::obs::host::DriverWait::begin();
         // SAFETY: no arguments.
         self.check(unsafe { (self.api.cuCtxSynchronize)() }, "cuCtxSynchronize")
             .inspect_err(|_| self.ipc_failed_drain.store(true, Ordering::Relaxed))
@@ -2424,6 +2425,7 @@ impl CudaBackend {
     /// steady-state serving sync point — narrower than [`Self::synchronize`].
     pub fn stream_synchronize(&self, stream: &CudaStream) -> Result<()> {
         self.bind()?;
+        let _wait = crate::obs::host::DriverWait::begin();
         // SAFETY: live stream handle.
         self.check(
             unsafe { (self.api.cuStreamSynchronize)(stream.raw as CUstream) },
@@ -2624,6 +2626,7 @@ impl CudaBackend {
     /// Block until the event's recorded point has retired.
     pub fn event_synchronize(&self, event: &CudaEvent) -> Result<()> {
         self.bind()?;
+        let _wait = crate::obs::host::DriverWait::begin();
         // SAFETY: live event handle.
         self.check(
             unsafe { (self.api.cuEventSynchronize)(event.raw as CUevent) },
@@ -2664,6 +2667,7 @@ impl CudaBackend {
     /// own allocations; `Backend::upload` wraps this for `DeviceMem`).
     pub fn memcpy_htod(&self, dptr: u64, src: &[u8]) -> Result<()> {
         self.bind()?;
+        let _wait = crate::obs::host::DriverWait::begin();
         // SAFETY: dptr from cuMemAlloc with at least src.len() bytes (caller
         // contract); src outlives the synchronous copy.
         self.check(
@@ -2675,6 +2679,7 @@ impl CudaBackend {
     /// D2H copy from a raw device pointer.
     pub fn memcpy_dtoh(&self, dst: &mut [u8], dptr: u64) -> Result<()> {
         self.bind()?;
+        let _wait = crate::obs::host::DriverWait::begin();
         // SAFETY: as memcpy_htod, reversed.
         self.check(
             unsafe { (self.api.cuMemcpyDtoH_v2)(dst.as_mut_ptr() as *mut c_void, dptr, dst.len()) },
@@ -2793,6 +2798,7 @@ impl CudaBackend {
 
     pub fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
         self.bind()?;
+        let _wait = crate::obs::host::DriverWait::begin();
         // SAFETY: both ranges inside live (mapped) allocations — caller contract.
         self.check(
             unsafe { (self.api.cuMemcpyDtoD_v2)(dst, src, bytes as usize) },

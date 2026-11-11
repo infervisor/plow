@@ -26,7 +26,7 @@ pub const PACKET: &str = "depth.pkt";
 pub const DRIVER: &str = "maya2.depth.v1";
 pub const PIPELINE: &str = "maya2.depth";
 /// Streams per launch.
-pub const CAPACITIES: &[u32] = &[1, 2, 4, 8, 16];
+pub const CAPACITIES: &[u32] = &[1, 2, 4, 8, 16, 32, 64, 128, 160, 192, 200, 224, 256];
 
 pub(crate) struct Geo {
     hidden_in: u32,
@@ -106,6 +106,7 @@ pub fn lower_maya2_depth(
     dir: &std::path::Path,
     n_cu: u32,
     target: u32,
+    half: bool,
 ) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
     let geo = Geo::parse(
         &serde_json::from_slice(
@@ -145,7 +146,7 @@ pub fn lower_maya2_depth(
     let mut roles = BTreeMap::new();
     for &batch in CAPACITIES {
         let program = prefix.model.progs.len();
-        prefix = program_for(prefix, &geo, batch, &Io::Standalone)?;
+        prefix = program_for(prefix, &geo, batch, &Io::Standalone, half)?;
         roles.insert(format!("depth.b{batch}.0"), program as u32);
     }
     prefix.output = codes;
@@ -168,13 +169,9 @@ pub fn lower_maya2_depth(
     Ok((prefix.model, section))
 }
 
-/// Projections over at most this many rows stream their weights through `GemvF32Out` (f32 x, f16 W);
-/// the tiled Conv1dF32 wastes most of its tile on fewer rows (132 us per 6 MB projection at B=1).
-const GEMV_ROWS: u32 = 256;
 /// The GEMV's LayerNorm prologue normalises a staged row of at most this many columns.
 const GEMV_LN_K: u32 = 1024;
-/// Projections over at least this many rows run on tensor cores (`GemvF32Out` bit 10: f16 x, W
-/// streamed once per 64 rows); the f32-x GEMV re-streams W every 8 rows.
+/// Minimum rows for f16 tensor-core products (`GemvF32Out` bit 10).
 const MMA_ROWS: u32 = 1;
 
 /// What a projection adds after the matmul: `act(acc + bias + residual)`.
@@ -188,8 +185,11 @@ struct Epilogue<'a> {
     ln: Option<(&'a str, f32)>,
     /// x is bf16 (the LM's gathered final hidden), not f32.
     x_bf16: bool,
+    x_half: bool,
     /// The bias has a row per this many rows (per stream: the slot's depth memory); 0 broadcasts.
     bias_group: u32,
+    /// Row addressing of x, the output and the residual (`GemvF32Out` flag bit 12).
+    view: Option<View>,
 }
 
 impl Epilogue<'_> {
@@ -199,8 +199,46 @@ impl Epilogue<'_> {
         gelu: false,
         ln: None,
         x_bf16: false,
+        x_half: false,
         bias_group: 0,
+        view: None,
     };
+}
+
+/// `GemvF32Out` row view (`PLOW_DEPTH_FUSE` bit 1): logical row `item * p + r` reads x at
+/// `item * xs + xo + r * K`, writes the output at `item * cs + co + r * N` and reads the residual at
+/// `item * rs + ro + r * N` (elements). Lets the projections address the persistent prefix rows
+/// (`act.depth.xin`), the K|V cache and a prefix's last row in place, without copies.
+#[derive(Clone, Copy)]
+struct View {
+    p: u32,
+    xs: u32,
+    xo: u32,
+    cs: u32,
+    co: u32,
+    rs: u32,
+    ro: u32,
+}
+
+impl View {
+    fn descriptor(&self) -> (String, Vec<u8>) {
+        let w = [
+            1, self.p, self.xs, self.xo, self.cs, self.co, self.rs, self.ro,
+        ];
+        (
+            format!(
+                "c.depth.view.{}.{}.{}.{}.{}.{}.{}",
+                self.p, self.xs, self.xo, self.cs, self.co, self.rs, self.ro
+            ),
+            w.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        )
+    }
+}
+
+/// `PLOW_DEPTH_FUSE` bit 1: row views instead of the prefix gathers and K|V / last-row copies; every
+/// projection takes the GEMV path (the tiled conv addresses plain rows).
+fn views_on() -> bool {
+    crate::emit_config::active().depth_fuse.unwrap_or(0) & 1 != 0
 }
 
 /// An op chain inside one program: each op depends on the previous.
@@ -210,6 +248,9 @@ struct Chain {
     n_cu: u32,
     /// Weight-name prefix.
     w: &'static str,
+    /// [`views_on`].
+    views: bool,
+    half: bool,
 }
 
 /// Where a depth program reads `h` and writes its codes.
@@ -271,8 +312,7 @@ impl Chain {
         )
     }
 
-    /// `act(x @ w^T + bias + residual)`: GEMV-shaped (weight streaming) up to [`GEMV_ROWS`] rows,
-    /// the tiled conv above.
+    /// `act(x @ w^T + bias + residual)` with f16 weights and batched tensor-core projections.
     #[allow(clippy::too_many_arguments)]
     fn dense_ep(
         &mut self,
@@ -285,10 +325,14 @@ impl Chain {
         mut ep: Epilogue<'_>,
     ) -> Result<u32, String> {
         let mut x = x;
-        if ep.x_bf16
-            || ep.bias_group > 0
-            || (rows <= GEMV_ROWS && (ep.ln.is_none() || k <= GEMV_LN_K))
-        {
+        let mut x_half = ep.x_half;
+        if rows >= 16 && !self.views && !ep.x_bf16 {
+            if let Some((name, eps)) = ep.ln.take() {
+                x = self.layer_norm(x, "act.depth.h1", rows, k, name, eps, self.half)?;
+                x_half = self.half;
+            }
+        }
+        if self.views || ep.x_bf16 || ep.bias_group > 0 || ep.ln.is_none() || k <= GEMV_LN_K {
             let deps = self.deps();
             let o = p_handle(&self.p, out);
             let wh = self.p.declare(w, u64::from(n) * u64::from(k) * 2);
@@ -296,6 +340,10 @@ impl Chain {
             let ln = ep.ln.map(|(name, eps)| {
                 let mut wd = |s: &str| self.p.declare(&format!("{name}.{s}"), u64::from(k) * 4);
                 (wd("weight"), wd("bias"), eps)
+            });
+            let view = ep.view.map(|v| {
+                let (name, bytes) = v.descriptor();
+                self.p.declare_init(&name, bytes)
             });
             let flags = u32::from(!ep.x_bf16)
                 | 2
@@ -308,7 +356,11 @@ impl Chain {
                     1 << 10
                 } else {
                     0
-                };
+                }
+                | if view.is_some() { 1 << 12 } else { 0 };
+            let flags = flags
+                | if x_half { 1 << 13 } else { 0 }
+                | if self.half && ep.gelu { 1 << 14 } else { 0 };
             let none = packet::dev::TENSOR_NONE;
             let e = self.p.raw(
                 DevOp::GemvF32Out,
@@ -316,7 +368,7 @@ impl Chain {
                 &deps,
                 o,
                 |i| {
-                    i.t[..7].copy_from_slice(&[
+                    i.t = [
                         o,
                         x,
                         wh,
@@ -324,7 +376,8 @@ impl Chain {
                         ep.residual.unwrap_or(none),
                         ln.map_or(none, |l| l.0),
                         ln.map_or(none, |l| l.1),
-                    ]);
+                        view.unwrap_or(none),
+                    ];
                     i.i[..4].copy_from_slice(&[rows, n, k, ep.bias_group]);
                     i.i[7] = flags;
                     i.f[0] = ln.map_or(0.0, |l| l.2);
@@ -334,7 +387,7 @@ impl Chain {
         }
         assert!(ep.bias_group == 0, "per-stream bias needs the GEMV path");
         if let Some((name, eps)) = ep.ln.take() {
-            x = self.layer_norm(x, "act.depth.h1", rows, k, name, eps)?;
+            x = self.layer_norm(x, "act.depth.h1", rows, k, name, eps, false)?;
         }
         let deps = self.deps();
         let e = self.p.conv1d_f32(
@@ -372,6 +425,10 @@ impl Chain {
                 wgmma: false,
                 weight_split: false,
                 dual_alpha: false,
+                pinned: false,
+                wgmma_ragged: false,
+                input_split: false,
+                output_split: false,
             },
         )?;
         Ok(self.done(e))
@@ -385,8 +442,27 @@ impl Chain {
         width: u32,
         w: &str,
         eps: f32,
+        half: bool,
     ) -> Result<u32, String> {
         let deps = self.deps();
+        if half {
+            let out = self.p.declare(out, u64::from(rows) * u64::from(width) * 2);
+            let gamma = self.p.declare(&format!("{w}.weight"), u64::from(width) * 4);
+            let beta = self.p.declare(&format!("{w}.bias"), u64::from(width) * 4);
+            let e = self.p.raw(
+                DevOp::LayerNormF32,
+                u64::from(rows).div_ceil(8),
+                &deps,
+                out,
+                |i| {
+                    let none = packet::dev::TENSOR_NONE;
+                    i.t = [out, x, gamma, beta, none, none, none, none];
+                    i.i[..3].copy_from_slice(&[rows, width, 8]);
+                    i.f[0] = eps;
+                },
+            )?;
+            return Ok(self.done(e));
+        }
         let e = self.p.layer_norm_f32(
             x,
             &deps,
@@ -399,6 +475,7 @@ impl Chain {
                 epsilon: eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         Ok(self.done(e))
@@ -489,15 +566,24 @@ fn program_for(
     geo: &Geo,
     batch: u32,
     io: &Io,
+    half: bool,
 ) -> Result<PacketPrefix, String> {
     let (dim, qkv_w, np) = (geo.dim, 3 * geo.dim, geo.positions());
     let n_cu = prefix.model.n_cu;
     let wp = io.weights();
+    let views = views_on();
     let mut c = Chain {
         p: prefix.program(),
         last: None,
         n_cu,
         w: wp,
+        views,
+        half: half
+            && !views
+            && batch >= 16
+            && dim % 64 == 0
+            && geo.inter % 64 == 0
+            && geo.codes % 64 == 0,
     };
     let x = p_handle(&c.p, "act.depth.x");
     let (h, codes, x_bf16) = match *io {
@@ -544,9 +630,17 @@ fn program_for(
         }
     };
     let pos0 = format!("{wp}.pos0");
+    let emb_rows = geo.levels * geo.codes;
+    // Views: the prefix rows persist in `act.depth.xin` [B][np][dim] (row 0 = in_proj(h) + pos0,
+    // row k = emb[eidx_{k-1}], written as each code is drawn); a level's first layer reads them in
+    // place and adds its attention output over them.
     let p0 = c.dense_ep(
         h,
-        "act.depth.p0",
+        if views {
+            "act.depth.xin"
+        } else {
+            "act.depth.p0"
+        },
         batch,
         geo.hidden_in,
         dim,
@@ -554,10 +648,23 @@ fn program_for(
         Epilogue {
             bias: Some(&pos0),
             x_bf16,
+            view: views.then_some(View {
+                p: 1,
+                xs: geo.hidden_in,
+                xo: 0,
+                cs: np * dim,
+                co: 0,
+                rs: 0,
+                ro: 0,
+            }),
             ..Epilogue::NONE
         },
     )?;
-    let emb_rows = geo.levels * geo.codes;
+    let xin = p0;
+    if views {
+        let idx = p_handle(&c.p, "act.depth.eidx.0");
+        c.gather(idx, "act.depth.xin", batch, dim, emb_rows, np * dim, dim)?;
+    }
     for level in 1..=geo.levels {
         let g = geo.group_of_level[level as usize - 1];
         let prev = (level > 1).then(|| geo.group_of_level[level as usize - 2]);
@@ -566,7 +673,12 @@ fn program_for(
         let keep = next == Some(g);
         let p = if full { level + 1 } else { 1 };
         let rows = batch * p;
-        if full {
+        let compact_last = !views && batch >= 16 && full;
+        // Row of the prefix a one-row level reads and caches (a full level starts at row 0).
+        let off = if full { 0 } else { level };
+        if views {
+            // The prefix rows are already in xin.
+        } else if full {
             c.copy(
                 p0,
                 "act.depth.x",
@@ -592,6 +704,8 @@ fn program_for(
             c.gather(idx, "act.depth.x", batch, dim, emb_rows, dim, 0)?;
         }
         for l in 0..geo.layers {
+            let last_only = compact_last && l + 1 == geo.layers;
+            let rows = if last_only { batch } else { rows };
             let w = |s: &str| format!("{wp}.groups.{g}.{l}.{s}");
             let cache = format!("act.depth.cache.{l}");
             let n1 = w("n1");
@@ -599,82 +713,239 @@ fn program_for(
                 ln: Some((&n1, geo.eps)),
                 ..Epilogue::NONE
             };
-            let qkv = c.dense_ep(x, "act.depth.qkv", rows, dim, qkv_w, &w("qkv.weight"), pre)?;
-            let (k, kv_rows, key_lengths) = if full {
-                if keep {
-                    c.copy(
+            if views {
+                // qkv straight into the cache rows [off, off + p) of each stream; the attention
+                // reads q, k and v there (query view, flag bit 6); the first layer's residual is xin.
+                let first = l == 0;
+                let qkv_view = View {
+                    p,
+                    xs: if first { np * dim } else { p * dim },
+                    xo: if first { off * dim } else { 0 },
+                    cs: np * qkv_w,
+                    co: off * qkv_w,
+                    rs: 0,
+                    ro: 0,
+                };
+                let kc = c.dense_ep(
+                    if first { xin } else { x },
+                    &cache,
+                    rows,
+                    dim,
+                    qkv_w,
+                    &w("qkv.weight"),
+                    Epilogue {
+                        view: Some(qkv_view),
+                        ..pre
+                    },
+                )?;
+                let len = p_handle(&c.p, &format!("c.depth.len.{level}"));
+                let at = p_handle(&c.p, "act.depth.at");
+                let n16 = p.div_ceil(16);
+                let units = u64::from(batch)
+                    * if n16 >= 2 {
+                        u64::from((geo.heads * n16).div_ceil(8))
+                    } else {
+                        u64::from(geo.heads)
+                    };
+                let deps = c.deps();
+                let none = packet::dev::TENSOR_NONE;
+                let e = c.p.raw(DevOp::AttentionF32, units, &deps, at, |i| {
+                    i.t = [at, kc, kc, kc, len, none, none, none];
+                    i.i = [
+                        batch,
+                        p,
+                        np,
+                        geo.heads,
+                        geo.head_dim,
+                        qkv_w,
+                        u32::from(full) | 2 | 64,
+                        off,
+                    ];
+                    i.f[0] = 1.0 / (geo.head_dim as f32).sqrt();
+                    i.j = [dim, 2 * dim];
+                })?;
+                c.done(e);
+                let o_view = View {
+                    p,
+                    xs: p * dim,
+                    xo: 0,
+                    cs: p * dim,
+                    co: 0,
+                    rs: np * dim,
+                    ro: off * dim,
+                };
+                let res = Epilogue {
+                    residual: Some(if first { xin } else { x }),
+                    view: first.then_some(o_view),
+                    ..Epilogue::NONE
+                };
+                c.dense_ep(at, "act.depth.x", rows, dim, dim, &w("o.weight"), res)?;
+            } else {
+                let qkv = c.dense_ep(
+                    x,
+                    "act.depth.qkv",
+                    batch * p,
+                    dim,
+                    qkv_w,
+                    &w("qkv.weight"),
+                    pre,
+                )?;
+                let (k, kv_rows, key_lengths) = if full {
+                    if keep {
+                        c.copy(
+                            qkv,
+                            &cache,
+                            CopyColsF32Stage {
+                                output: TensorRef::Named(&cache),
+                                items: batch,
+                                rows: p,
+                                cols: qkv_w,
+                                in_item_stride: p * qkv_w,
+                                in_stride: qkv_w,
+                                in_offset: 0,
+                                out_item_stride: np * qkv_w,
+                                out_stride: qkv_w,
+                                out_offset: 0,
+                            },
+                        )?;
+                    }
+                    (qkv, p, None)
+                } else {
+                    let kc = c.copy(
                         qkv,
                         &cache,
                         CopyColsF32Stage {
                             output: TensorRef::Named(&cache),
                             items: batch,
-                            rows: p,
+                            rows: 1,
                             cols: qkv_w,
-                            in_item_stride: p * qkv_w,
+                            in_item_stride: qkv_w,
                             in_stride: qkv_w,
                             in_offset: 0,
                             out_item_stride: np * qkv_w,
                             out_stride: qkv_w,
-                            out_offset: 0,
+                            out_offset: level * qkv_w,
                         },
                     )?;
-                }
-                (qkv, p, None)
-            } else {
-                let kc = c.copy(
-                    qkv,
-                    &cache,
-                    CopyColsF32Stage {
-                        output: TensorRef::Named(&cache),
-                        items: batch,
-                        rows: 1,
-                        cols: qkv_w,
-                        in_item_stride: qkv_w,
-                        in_stride: qkv_w,
-                        in_offset: 0,
-                        out_item_stride: np * qkv_w,
-                        out_stride: qkv_w,
-                        out_offset: level * qkv_w,
-                    },
-                )?;
-                let len = p_handle(&c.p, &format!("c.depth.len.{level}"));
-                (kc, np, Some(len))
-            };
-            let deps = c.deps();
-            let e = c.p.attention_f32(
-                qkv,
-                k,
-                k,
-                &deps,
-                AttentionF32Stage {
-                    output: TensorRef::Named("act.depth.at"),
-                    key_lengths,
-                    bias: None,
-                    batch,
-                    q_rows: p,
-                    kv_rows,
-                    heads: geo.heads,
-                    head_width: geo.head_dim,
-                    in_stride: qkv_w,
-                    k_col0: dim,
-                    v_col0: 2 * dim,
-                    causal: full,
-                    scale: 1.0 / (geo.head_dim as f32).sqrt(),
-                    bias_head_stride: 0,
-                    relative: false,
-                    key_length_heads: 0,
-                    prefix: None,
-                    window: 0,
-                    stream: None,
-                },
-            )?;
-            let at = c.done(e);
-            // x += o(attn); x += f2(gelu(f1(LN(x)))) + cross_l (the one-token cross-attention).
+                    let len = p_handle(&c.p, &format!("c.depth.len.{level}"));
+                    (kc, np, Some(len))
+                };
+                let query = if last_only {
+                    c.copy(
+                        qkv,
+                        "act.depth.qlast",
+                        CopyColsF32Stage {
+                            output: TensorRef::Named("act.depth.qlast"),
+                            items: batch,
+                            rows: 1,
+                            cols: qkv_w,
+                            in_item_stride: p * qkv_w,
+                            in_stride: qkv_w,
+                            in_offset: (p - 1) * qkv_w,
+                            out_item_stride: qkv_w,
+                            out_stride: qkv_w,
+                            out_offset: 0,
+                        },
+                    )?
+                } else {
+                    qkv
+                };
+                let residual = if last_only {
+                    c.copy(
+                        x,
+                        "act.depth.y",
+                        CopyColsF32Stage {
+                            output: TensorRef::Named("act.depth.y"),
+                            items: batch,
+                            rows: 1,
+                            cols: dim,
+                            in_item_stride: p * dim,
+                            in_stride: dim,
+                            in_offset: (p - 1) * dim,
+                            out_item_stride: dim,
+                            out_stride: dim,
+                            out_offset: 0,
+                        },
+                    )?
+                } else {
+                    x
+                };
+                let query_rows = if last_only { 1 } else { p };
+                let deps = c.deps();
+                let e = if batch >= 16 && geo.head_dim == 64 && query_rows <= 16 && kv_rows <= 32 {
+                    let at = p_handle(&c.p, "act.depth.at");
+                    let none = packet::dev::TENSOR_NONE;
+                    c.p.raw(
+                        DevOp::AttentionF32,
+                        u64::from(batch * query_rows * geo.heads).div_ceil(8),
+                        &deps,
+                        at,
+                        |i| {
+                            i.t = [
+                                at,
+                                query,
+                                k,
+                                k,
+                                key_lengths.unwrap_or(none),
+                                none,
+                                none,
+                                none,
+                            ];
+                            i.i = [
+                                batch,
+                                query_rows,
+                                kv_rows,
+                                geo.heads,
+                                geo.head_dim,
+                                qkv_w,
+                                u32::from(full && !last_only),
+                                0,
+                            ];
+                            i.f[0] = 1.0 / (geo.head_dim as f32).sqrt();
+                            i.j = [dim, 2 * dim];
+                        },
+                    )?
+                } else {
+                    c.p.attention_f32(
+                        query,
+                        k,
+                        k,
+                        &deps,
+                        AttentionF32Stage {
+                            output: TensorRef::Named("act.depth.at"),
+                            key_lengths,
+                            bias: None,
+                            batch,
+                            q_rows: query_rows,
+                            kv_rows,
+                            heads: geo.heads,
+                            head_width: geo.head_dim,
+                            in_stride: qkv_w,
+                            k_col0: dim,
+                            v_col0: 2 * dim,
+                            causal: full && !last_only,
+                            scale: 1.0 / (geo.head_dim as f32).sqrt(),
+                            bias_head_stride: 0,
+                            relative: false,
+                            key_length_heads: 0,
+                            prefix: None,
+                            window: 0,
+                            stream: None,
+                        },
+                    )?
+                };
+                let at = c.done(e);
+                // x += o(attn); x += f2(gelu(f1(LN(x)))) + cross_l (the one-token cross-attention).
+                let res = Epilogue {
+                    residual: Some(residual),
+                    ..Epilogue::NONE
+                };
+                c.dense_ep(at, "act.depth.x", rows, dim, dim, &w("o.weight"), res)?;
+            }
             let res = Epilogue {
                 residual: Some(x),
                 ..Epilogue::NONE
             };
-            c.dense_ep(at, "act.depth.x", rows, dim, dim, &w("o.weight"), res)?;
             let n2 = w("n2");
             let gelu = Epilogue {
                 gelu: true,
@@ -693,16 +964,19 @@ fn program_for(
             // Inside an LM packet each slot has its own depth memory (the speaker's, or the null one).
             let (cross, bias_group) = match io {
                 Io::Standalone => (format!("{wp}.cross.{l}"), 0),
-                Io::Lm { .. } => (format!("in.depth.cross.{l}"), p),
+                Io::Lm { .. } => (format!("in.depth.cross.{l}"), if last_only { 1 } else { p }),
             };
             let out = Epilogue {
                 bias: Some(&cross),
                 bias_group,
+                x_half: c.half,
                 ..res
             };
             c.dense_ep(f, "act.depth.x", rows, geo.inter, dim, &w("f2.weight"), out)?;
         }
-        let last = if p > 1 {
+        let last = if views || p == 1 || compact_last {
+            x
+        } else {
             c.copy(
                 x,
                 "act.depth.y",
@@ -719,12 +993,20 @@ fn program_for(
                     out_offset: 0,
                 },
             )?
-        } else {
-            x
         };
         let norm = format!("{wp}.norm");
         let final_norm = Epilogue {
             ln: Some((&norm, geo.eps)),
+            // The prefix's last row in place.
+            view: (views && p > 1).then_some(View {
+                p: 1,
+                xs: p * dim,
+                xo: (p - 1) * dim,
+                cs: geo.codes,
+                co: 0,
+                rs: 0,
+                ro: 0,
+            }),
             ..Epilogue::NONE
         };
         let logits = c.dense_ep(
@@ -779,6 +1061,18 @@ fn program_for(
                 i.j[0] = level * geo.codes;
             })?;
         c.done(e);
+        if views && level < geo.levels {
+            // The drawn code's embedding row becomes prefix row `level + 1`.
+            c.gather(
+                eidx,
+                "act.depth.xin",
+                batch,
+                dim,
+                emb_rows,
+                np * dim,
+                (level + 1) * dim,
+            )?;
+        }
     }
     Ok(c.p.finish(batch))
 }
@@ -872,6 +1166,7 @@ fn declare_io(b: &mut packet::devbuild::Builder, geo: &Geo, bmax: u32) {
         ("act.depth.y", d),
         ("act.depth.yn", d),
         ("act.depth.logits", u64::from(geo.codes)),
+        ("act.depth.qlast", 3 * d),
     ] {
         b.tensor(name, b64 * width * 4);
     }
@@ -884,6 +1179,9 @@ fn declare_io(b: &mut packet::devbuild::Builder, geo: &Geo, bmax: u32) {
         ("act.depth.f", u64::from(geo.inter)),
     ] {
         b.tensor(name, b64 * np * width * 4);
+    }
+    if views_on() {
+        b.tensor("act.depth.xin", b64 * np * d * 4);
     }
     for l in 0..geo.layers {
         b.tensor(&format!("act.depth.cache.{l}"), b64 * np * qkv_w * 4);
@@ -898,6 +1196,24 @@ fn declare_io(b: &mut packet::devbuild::Builder, geo: &Geo, bmax: u32) {
 
 /// DepthV2 as an LM packet's depth stage: one program per decode rung (row `r` = slot `r`), appended
 /// to `m`'s tensors, as the `fish_depth` sections of [`plow_asset::fish_depth::Sampler::Maya2`].
+/// The decode rungs plus the `PLOW_DEPTH_ROWS` capacities below the widest rung (unset: the rungs).
+fn depth_capacities(rungs: &[u32], extra: Option<&str>) -> Vec<u32> {
+    let Some(extra) = extra else {
+        return rungs.to_vec();
+    };
+    let bmax = rungs.iter().copied().max().unwrap_or(0);
+    let mut caps = rungs.to_vec();
+    for v in extra.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        let v: u32 = v.parse().unwrap_or_else(|_| panic!("PLOW_DEPTH_ROWS: {v}"));
+        if v > 0 && v < bmax {
+            caps.push(v);
+        }
+    }
+    caps.sort_unstable();
+    caps.dedup();
+    caps
+}
+
 pub(crate) fn lm_sections(
     m: &mut packet::devbuild::Model,
     c: &crate::config::Cfg,
@@ -905,6 +1221,7 @@ pub(crate) fn lm_sections(
     codes: u32,
     prompt_codes: u32,
     rungs: &[u32],
+    half: bool,
 ) -> (
     Vec<packet::devbuild::SectionData>,
     crate::manifest::SpeechMasks,
@@ -952,9 +1269,11 @@ pub(crate) fn lm_sections(
         hidden_rows,
         codes,
     };
+    let caps = depth_capacities(rungs, crate::emit_config::active().depth_rows.as_deref());
+    let rungs = caps.as_slice();
     for &rows in rungs {
-        prefix =
-            program_for(prefix, &geo, rows, &io).unwrap_or_else(|e| panic!("maya2 depth: {e}"));
+        prefix = program_for(prefix, &geo, rows, &io, half)
+            .unwrap_or_else(|e| panic!("maya2 depth: {e}"));
     }
     m.tensors = std::mem::take(&mut prefix.model.tensors);
     let handle = |name: &str| {
@@ -980,6 +1299,7 @@ pub(crate) fn lm_sections(
             decode_token: c.frame.as_ref().filter(|f| f.decode_only).map(|f| f.lo),
         }),
         depth_sampling: Some([d.temperature.to_bits(), d.top_k]),
+        planned_rows: true,
         slot_memory: (0..geo.layers)
             .map(|l| handle(&format!("in.depth.cross.{l}")))
             .collect(),
@@ -1001,4 +1321,144 @@ pub(crate) fn lm_sections(
         crate::fish_depth::manifest_sections(&man, rungs.len(), m.tensors.len(), bytes),
         crate::manifest::SpeechMasks::of(&prefix.model),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_levels_keep_all_keys_and_compact_the_final_layer() {
+        let geo = Geo {
+            hidden_in: 2048,
+            dim: 1024,
+            heads: 16,
+            head_dim: 64,
+            inter: 3072,
+            layers: 4,
+            levels: 2,
+            codes: 2048,
+            eps: 1e-5,
+            group_of_level: vec![0, 0],
+        };
+        for batch in [1, 8, 16, 64, 200, 224] {
+            let mut b = packet::devbuild::Builder::new(132);
+            b.set_tensor_dedup(true);
+            declare_io(&mut b, &geo, batch);
+            let h = b.tensor("in.depth.h", u64::from(batch) * 2048 * 4);
+            let codes = b.tensor("out.depth.codes", u64::from(batch) * 3 * 4);
+            b.tensor("out.depth.logits", u64::from(batch) * 2 * 2048 * 4);
+            let prefix = PacketPrefix {
+                model: packet::devbuild::Model {
+                    n_cu: 132,
+                    target: 0,
+                    tensors: b.tensors(),
+                    progs: Vec::new(),
+                    kv_row_insts: Vec::new(),
+                    prog_t: Vec::new(),
+                    gen: Vec::new(),
+                },
+                programs: Vec::new(),
+                input: h,
+                output: codes,
+                input_shape: Vec::new(),
+            };
+            let p = program_for(prefix, &geo, batch, &Io::Standalone, false).unwrap();
+            let ops = &p.model.progs[0].insts;
+            let attn: Vec<_> = ops
+                .iter()
+                .filter(|i| i.op == DevOp::AttentionF32 as u16)
+                .collect();
+            assert_eq!(attn.len(), 8);
+            for (l, i) in attn[..4].iter().enumerate() {
+                assert_eq!(i.i[2], 2);
+                assert_eq!(i.i[1], if batch >= 16 && l == 3 { 1 } else { 2 });
+                assert_eq!(i.i[6] & 2, if batch >= 16 { 0 } else { 2 });
+            }
+            let qkv: Vec<_> = ops
+                .iter()
+                .filter(|i| {
+                    i.op == DevOp::GemvF32Out as u16
+                        && i.i[1] == 3072
+                        && i.i[2] == 1024
+                        && i.i[7] & 16 == 0
+                })
+                .collect();
+            assert_eq!(qkv.len(), 8);
+            assert!(qkv[..4].iter().all(|i| i.i[0] == batch * 2));
+            assert!(qkv[4..].iter().all(|i| i.i[0] == batch));
+            let f2: Vec<_> = ops
+                .iter()
+                .filter(|i| i.op == DevOp::GemvF32Out as u16 && i.i[2] == 3072)
+                .collect();
+            assert_eq!(f2.len(), 8);
+            assert_eq!(f2[3].i[0], if batch >= 16 { batch } else { batch * 2 });
+        }
+    }
+
+    #[test]
+    fn batched_projections_use_f16_at_large_prefixes() {
+        for half in [false, true] {
+            for rows in [1, 8, 16, 32, 257, 3328] {
+                let mut b = packet::devbuild::Builder::new(132);
+                let x = b.tensor("x", u64::from(rows) * 1024 * 4);
+                let out = b.tensor("out", u64::from(rows) * 3072 * 4);
+                let prefix = PacketPrefix {
+                    model: packet::devbuild::Model {
+                        n_cu: 132,
+                        target: 0,
+                        tensors: b.tensors(),
+                        progs: Vec::new(),
+                        kv_row_insts: Vec::new(),
+                        prog_t: Vec::new(),
+                        gen: Vec::new(),
+                    },
+                    programs: Vec::new(),
+                    input: x,
+                    output: out,
+                    input_shape: vec![u64::from(rows), 1024],
+                };
+                let mut chain = Chain {
+                    p: prefix.program(),
+                    last: None,
+                    n_cu: 132,
+                    w: "w.depth",
+                    views: false,
+                    half: half && rows >= 16,
+                };
+                chain
+                    .dense_ep(
+                        x,
+                        "out",
+                        rows,
+                        1024,
+                        3072,
+                        "w",
+                        Epilogue {
+                            ln: Some(("ln", 1e-5)),
+                            gelu: half,
+                            ..Epilogue::NONE
+                        },
+                    )
+                    .unwrap();
+                let prefix = chain.p.finish(rows);
+                let ops = &prefix.model.progs[0].insts;
+                let projection = ops.last().unwrap();
+                assert_eq!(projection.op, DevOp::GemvF32Out as u16);
+                assert_eq!(projection.i[..3], [rows, 3072, 1024]);
+                assert_ne!(projection.i[7] & 1024, 0);
+                if rows >= 16 {
+                    assert_eq!(ops.len(), 2);
+                    assert_eq!(ops[0].op, DevOp::LayerNormF32 as u16);
+                    assert_eq!(projection.t[1], ops[0].t[0]);
+                    assert_eq!(projection.i[7] & 256, 0);
+                    assert_eq!(ops[0].i[2] & 8, if half { 8 } else { 0 });
+                    assert_eq!(projection.i[7] & 0x6000, if half { 0x6000 } else { 0 });
+                } else {
+                    assert_eq!(ops.len(), 1);
+                    assert_ne!(projection.i[7] & 256, 0);
+                }
+            }
+        }
+    }
 }

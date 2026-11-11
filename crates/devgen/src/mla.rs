@@ -15103,7 +15103,7 @@ fn write_mla_manifest(
         return; // legacy CLI path: output unchanged
     }
     crate::write_lean_receipts(std::path::Path::new(out), lean);
-    let mut man = crate::manifest::build(m, target, lean);
+    let mut man = crate::manifest::build_without_depth(m, target, lean);
     crate::report_dispatch_audit(&man);
     // The MXFP4 exception list, stated in the artifact a comparison reads rather than left to a
     // code comment. "all-MXFP4" with one derived 4M-value tensor in bf16 is a fact a dtype

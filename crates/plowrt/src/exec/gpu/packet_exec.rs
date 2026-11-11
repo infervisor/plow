@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use packet::dev::{DevProgram, CTR_STRIDE};
+use packet::dev::{DevOp, DevProgram, CTR_STRIDE};
 
 use super::{pod_bytes, BLOCK};
 use crate::asset::devblob::DevBlob;
@@ -58,6 +58,117 @@ fn speech_ops(blob: &DevBlob) -> u64 {
         .fold(0, |mask, op| mask | 1 << (op - SPEECH_OP0))
 }
 
+/// Speech-object capability bits the instructions need (`plow_speech_caps_speech`): bit 0 a
+/// GemvF32Out row view (flag bit 12), bit 1 an AttentionF32 query view (flag bit 6),
+/// bit 2 FP16 LayerNorm output / projection operands.
+pub(super) fn speech_caps_required<'a>(
+    insts: impl IntoIterator<Item = &'a packet::dev::DevInst64>,
+) -> u32 {
+    use packet::dev::DevOp;
+    insts.into_iter().fold(0, |caps, d| {
+        caps | match DevOp::from_u16(d.op) {
+            Some(DevOp::GemvF32Out) => {
+                u32::from(d.i[7] & 4096 != 0) | u32::from(d.i[7] & 0x6000 != 0) << 2
+            }
+            Some(DevOp::AttentionF32) => {
+                u32::from(d.i[6] & 64 != 0) << 1
+                    | u32::from(plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)) << 3
+            }
+            Some(DevOp::StreamTailF32) if plow_asset::speech_flag_layout::ring_kv(d.op, &d.i) => 8,
+            Some(DevOp::LayerNormF32) if d.i[2] & 8 != 0 => 4,
+            _ => 0,
+        }
+    })
+}
+
+/// The capability bits `required` that an object reporting `compiled` (`None` = no symbol) lacks.
+pub(super) fn missing_speech_caps(required: u32, compiled: Option<u32>) -> u32 {
+    required & !compiled.unwrap_or(0)
+}
+
+/// Speech-op semantics a packet needs beyond its op set, as the object's
+/// `plow_speech_features_speech` bits (absent = none): bit 1 = Conv1dF32 / ConvTranspose1dF32
+/// flag bit 3 (wgmma tiles spanning taps / phases at widths % 4), bit 2 = Conv1dF32 flag bit 30
+/// (a split-image input). Bit 0 is retired: it named the ragged semantics on flag bit 21, which
+/// now carries the pinned-arms field.
+pub(super) fn speech_features(insts: impl IntoIterator<Item = (u16, u32)>) -> u32 {
+    insts.into_iter().fold(0, |m, (op, flags)| {
+        let conv = op == DevOp::Conv1dF32 as u16;
+        let ragged = (conv || op == DevOp::ConvTranspose1dF32 as u16) && flags >> 3 & 1 != 0;
+        let split = conv && flags >> 30 & 1 != 0;
+        m | u32::from(ragged) << 1 | u32::from(split) << 2
+    })
+}
+
+/// Why `(op, conv flags, i2)` instructions cannot run on an object reporting features `have`,
+/// when no missing feature bit says so: the conv flag bits 21 / 22 had other meanings before the
+/// pinned-arms field took them.
+pub(super) fn stale_speech_layout(
+    insts: impl IntoIterator<Item = (u16, u32, u32)>,
+    have: u32,
+) -> Option<&'static str> {
+    let (mut pinned, mut image_out, mut image_in) = (false, false, false);
+    for (op, flags, i2) in insts {
+        let conv = op == DevOp::Conv1dF32 as u16;
+        pinned |= (conv || op == DevOp::ConvTranspose1dF32 as u16) && flags >> 21 & 1 != 0;
+        image_in |= conv && flags >> 30 & 1 != 0;
+        image_out |= op == DevOp::LayerNormF32 as u16 && i2 & 4 != 0;
+    }
+    if pinned && have & 1 != 0 {
+        return Some(
+            "the object reads conv flag bit 21 as ragged tiles, the packet as pinned arms",
+        );
+    }
+    if image_out && !image_in {
+        return Some("split-image outputs without a conv flag bit 30 reader: re-emit the packet");
+    }
+    None
+}
+
+/// Refuses `object` (a loaded interpreter `module`) for instructions whose first protected use
+/// is `used`, from a packet declaring `declared`, when their speech-op flag layouts disagree
+/// (`plow_asset::speech_flag_layout`).
+pub(in crate::exec) fn check_speech_flag_layout(
+    be: &CudaBackend,
+    module: &Module,
+    object: &Path,
+    declared: Option<u32>,
+    used: Option<u16>,
+) -> Result<()> {
+    use plow_asset::speech_flag_layout as layout;
+    let have = be.module_global_u32(module, layout::OBJECT_SYMBOL)?;
+    layout::check(declared, used, have)
+        .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", object.display())))
+}
+
+/// Rejects an object lacking a feature bit `required` has, or one whose conv flag layout
+/// `stale` (see [`stale_speech_layout`]) rules out.
+pub(super) fn check_speech_features(
+    be: &CudaBackend,
+    module: &Module,
+    object: &Path,
+    required: u32,
+    stale: impl FnOnce(u32) -> Option<&'static str>,
+) -> Result<()> {
+    let have = be
+        .module_global_u32(module, "plow_speech_features_speech")?
+        .unwrap_or(0);
+    if let Some(why) = stale(have) {
+        return Err(RuntimeError::Rejected(format!(
+            "{}: {why}",
+            object.display()
+        )));
+    }
+    if required & !have != 0 {
+        return Err(RuntimeError::Rejected(format!(
+            "{}: lacks speech features {:#x}; rebuild it for this packet",
+            object.display(),
+            required & !have
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn missing_speech_ops(required: u64, compiled: u64) -> Vec<u32> {
     let missing = required & !compiled;
     (0..64)
@@ -72,6 +183,67 @@ fn a_specialized_speech_object_must_cover_the_packet_ops() {
     assert!(missing_speech_ops(0b1011, 0b1111).is_empty());
     assert_eq!(missing_speech_ops(0b1011, 0b0011), vec![SPEECH_OP0 + 3]);
     assert_eq!(missing_speech_ops(1 << 41, 0), vec![204]);
+}
+
+#[cfg(test)]
+#[test]
+fn half_speech_operands_require_the_capability() {
+    let mut i = packet::dev::DevInst64::default();
+    i.op = DevOp::GemvF32Out as u16;
+    for flags in [8192, 16384, 8192 | 16384] {
+        i.i[7] = flags;
+        assert_eq!(speech_caps_required([&i]), 4);
+        assert_eq!(missing_speech_caps(4, Some(2)), 4);
+        assert_eq!(missing_speech_caps(4, Some(6)), 0);
+    }
+    i.op = DevOp::LayerNormF32 as u16;
+    i.i[2] = 8;
+    assert_eq!(speech_caps_required([&i]), 4);
+}
+
+#[cfg(test)]
+#[test]
+fn ring_speech_operands_require_layout_capability() {
+    let mut d = packet::dev::DevInst64::default();
+    d.op = DevOp::AttentionF32 as u16;
+    d.i[6] = 9 | (250 << 16);
+    assert_eq!(speech_caps_required([&d]), 0);
+    d.i[6] |= 0x100;
+    assert_eq!(speech_caps_required([&d]), 8);
+    assert_eq!(missing_speech_caps(8, Some(6)), 8);
+    assert_eq!(missing_speech_caps(8, Some(14)), 0);
+    d.op = DevOp::StreamTailF32 as u16;
+    for mode in [2, 3] {
+        d.i[7] = mode;
+        assert_eq!(speech_caps_required([&d]), 8);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn ragged_conv_flags_require_the_speech_feature() {
+    let (conv, convt) = (DevOp::Conv1dF32 as u16, DevOp::ConvTranspose1dF32 as u16);
+    assert_eq!(speech_features([(conv, 0x6e000), (convt, 0xa000)]), 0);
+    assert_eq!(speech_features([(conv, 0x6e000), (convt, 0xa008)]), 2);
+    assert_eq!(speech_features([(conv, 0x6e000 | 1 << 21)]), 0);
+    assert_eq!(speech_features([(DevOp::UnaryF32 as u16, 1 << 3)]), 0);
+    assert_eq!(speech_features([(conv, 0x6e000 | 1 << 30)]), 4);
+    assert_eq!(speech_features([(convt, 0xa000 | 1 << 30)]), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn pre_integration_conv_flag_layouts_are_refused() {
+    let (conv, ln) = (DevOp::Conv1dF32 as u16, DevOp::LayerNormF32 as u16);
+    let pinned = [(conv, 0x6e000 | 1 << 21, 0)];
+    assert!(stale_speech_layout(pinned, 1).is_some());
+    assert!(stale_speech_layout(pinned, 0).is_none());
+    assert!(stale_speech_layout(pinned, 2).is_none());
+    assert!(stale_speech_layout([(conv, 0x6e000, 0)], 1).is_none());
+    // A LayerNorm writing the image needs a bit-30 conv: bit 21 was the reader before.
+    assert!(stale_speech_layout([(ln, 0, 4), (conv, 0x6e000 | 1 << 21, 0)], 6).is_some());
+    assert!(stale_speech_layout([(ln, 0, 4), (conv, 0x6e000 | 1 << 30, 0)], 6).is_none());
+    assert!(stale_speech_layout([(ln, 0, 3), (conv, 0x6e000, 4)], 6).is_none());
 }
 
 #[cfg(test)]
@@ -129,6 +301,207 @@ pub struct CudaPacketRuntime {
 
 type Residents = parking_lot::Mutex<Vec<(std::path::PathBuf, u8, std::sync::Weak<()>)>>;
 
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; CODEC_RING_TEST_ASSETS holds the layout-3 speech object; run through gpuq"]
+fn ring_attention_matches_chronological_single_block() {
+    use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
+    let dir = std::path::PathBuf::from(std::env::var("CODEC_RING_TEST_ASSETS").unwrap());
+    let make = |active: usize, cap: usize, ring: bool| {
+        let (history, width, rows, slots) = (249usize, 512usize, 2usize, cap.max(256));
+        let mut b = Builder::new(132);
+        b.force_uniseg();
+        let out = b.tensor("out", (cap * rows * width * 4) as u64);
+        let qkv = b.tensor("qkv", (cap * rows * width * 3 * 4) as u64);
+        let state = b.tensor("state", (slots * history * width * 2 * 4) as u64);
+        let slot = b.tensor("slot", (cap * 4) as u64);
+        let length = b.tensor("length", (cap * 4) as u64);
+        let pos = b.tensor("pos", (cap * 4) as u64);
+        let z = b.tensor("z", (cap * (history + rows) * width * 3 * 4) as u64);
+        let tail = |b: &mut Builder, mode, deps: &[u32]| {
+            let units = if mode == 2 {
+                (cap * rows * width * 2).div_ceil(2048)
+            } else {
+                132
+            };
+            b.emit(
+                DevOp::StreamTailF32,
+                (0..units.clamp(1, 132) as u32).collect(),
+                deps,
+                |d| {
+                    d.t[0] = if mode == 0 {
+                        z
+                    } else {
+                        packet::dev::TENSOR_NONE
+                    };
+                    d.t[1..6].copy_from_slice(&[
+                        if mode == 1 { z } else { qkv },
+                        state,
+                        slot,
+                        length,
+                        pos,
+                    ]);
+                    d.i = [
+                        cap as u32,
+                        history as u32,
+                        rows as u32,
+                        (2 * width) as u32,
+                        (3 * width) as u32,
+                        width as u32,
+                        if mode == 1 { 0 } else { (3 * width) as u32 },
+                        mode,
+                    ];
+                    d.j = [slots as u32, 0];
+                },
+            )
+        };
+        let dep = if ring {
+            None
+        } else {
+            let gather = tail(&mut b, 0, &[]);
+            Some(tail(&mut b, 1, &[gather]))
+        };
+        let attention = b.emit(
+            DevOp::AttentionF32,
+            b.all(),
+            &dep.into_iter().collect::<Vec<_>>(),
+            |d| {
+                if ring {
+                    d.t[..6].copy_from_slice(&[out, qkv, state, slot, length, pos]);
+                } else {
+                    d.t[..4].copy_from_slice(&[out, z, z, z]);
+                    d.t[7] = pos;
+                }
+                d.i = [
+                    cap as u32,
+                    rows as u32,
+                    (if ring { history } else { history + rows }) as u32,
+                    8,
+                    64,
+                    (3 * width) as u32,
+                    (if ring { 0x109 } else { 9 }) | (250 << 16),
+                    (if ring { slots } else { history }) as u32,
+                ];
+                d.f[0] = 0.125;
+                d.j = [width as u32, (2 * width) as u32];
+            },
+        );
+        if ring {
+            tail(&mut b, 2, &[attention]);
+        }
+        let tensors = b.tensors();
+        let model = Model {
+            n_cu: 132,
+            target: 0,
+            tensors,
+            progs: vec![b.finish()],
+            prog_t: vec![1],
+            kv_row_insts: vec![],
+            gen: vec![],
+        };
+        let abi = plow_asset::abi::Abi {
+            version: 1,
+            contract: 2,
+            must_understand: vec![],
+            target: None,
+            bindings: None,
+            speech_flag_layout: Some(3),
+        };
+        let path = dir.join(format!("attention.b{active}.c{cap}.ring{ring}.pkt"));
+        std::fs::write(
+            &path,
+            model.to_blob_v6(&[SectionData {
+                kind: SECT_METADATA,
+                name: plow_asset::abi::SECTION.into(),
+                data: serde_json::to_vec(&abi).unwrap(),
+            }]),
+        )
+        .unwrap();
+        path
+    };
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let sanitize = std::env::var_os("CODEC_RING_SANITIZE").is_some();
+    let cases: &[(usize, usize)] = if sanitize {
+        &[(33, 64)]
+    } else {
+        &[
+            (32, 32),
+            (64, 64),
+            (128, 128),
+            (200, 256),
+            (224, 256),
+            (300, 320),
+        ]
+    };
+    for &(active, cap) in cases {
+        let slots = cap.max(256);
+        let mut runtimes = [
+            CudaPacketRuntime::load_on(be.clone(), &make(active, cap, false)).unwrap(),
+            CudaPacketRuntime::load_on(be.clone(), &make(active, cap, true)).unwrap(),
+        ];
+        let qkv: Vec<f32> = (0..cap * 2 * 1536)
+            .map(|i| {
+                if i / (2 * 1536) < active {
+                    ((i * 37 % 101) as f32 - 50.) * 0.003
+                } else {
+                    0.
+                }
+            })
+            .collect();
+        let slot: Vec<u32> = (0..cap).map(|r| ((r * 73) % slots) as u32).collect();
+        let length: Vec<u32> = (0..cap).map(|r| if r < active { 2 } else { 0 }).collect();
+        let pos: Vec<u32> = (0..cap).map(|r| if r < active { 256 } else { 0 }).collect();
+        for rt in &mut runtimes {
+            for (name, data) in [
+                ("qkv", bytemuck::cast_slice(&qkv)),
+                ("slot", bytemuck::cast_slice(&slot)),
+                ("length", bytemuck::cast_slice(&length)),
+                ("pos", bytemuck::cast_slice(&pos)),
+            ] {
+                let tensor = rt.tensor(name).unwrap();
+                rt.write_tensor(tensor, data).unwrap();
+            }
+        }
+        let mut output = [vec![0f32; cap * 2 * 512], vec![0f32; cap * 2 * 512]];
+        let mut timing = Vec::new();
+        for arm in [0, 1, 0, 1] {
+            let rt = &mut runtimes[arm];
+            let state = rt.tensor("state").unwrap();
+            let mut times = Vec::new();
+            for repeat in 0..if sanitize { 1 } else { 15 } {
+                rt.write_tensors(&[PacketWrite {
+                    tensor: state,
+                    offset: 0,
+                    data: PacketData::Zero(state.bytes),
+                }])
+                .unwrap();
+                rt.run_sequence(&[0]).unwrap();
+                if repeat >= 3 || sanitize {
+                    times.push(rt.last_run_us());
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            timing.push((arm, times[times.len() / 2]));
+            rt.read_tensor_at(
+                rt.tensor("out").unwrap(),
+                0,
+                bytemuck::cast_slice_mut(&mut output[arm]),
+            )
+            .unwrap();
+        }
+        let error = output[0]
+            .iter()
+            .zip(&output[1])
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum::<f64>();
+        let norm = output[0].iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
+        let relative = (error / norm.max(1.0e-30)).sqrt();
+        assert!(relative < 1.0e-5, "{active}/{cap}: {relative}");
+        assert!(output[1][active * 2 * 512..].iter().all(|&v| v == 0.));
+        println!("ring-interpreter active={active} capacity={cap} rel_l2={relative:e} abab_us={timing:?}");
+    }
+}
+
 /// Live runtimes by the asset directory their packet sits in and their device.
 fn residents() -> &'static Residents {
     static R: std::sync::OnceLock<Residents> = std::sync::OnceLock::new();
@@ -156,7 +529,7 @@ impl CudaPacketRuntime {
         let ordinal = be.device_ordinal;
         let image = crate::asset::packet_image::PacketImage::open(path)?;
         image.blob.check_l2_dispatch(false)?;
-        let blob = &image.blob;
+        let (blob, raw) = (&image.blob, &image.raw);
         if !blob.gen.is_empty() || blob.tp.is_some() {
             return Err(RuntimeError::Rejected(format!(
                 "{}: generated tensors or TP are not supported by the CUDA packet runtime",
@@ -172,6 +545,9 @@ impl CudaPacketRuntime {
         })?;
         let module = be.module_load(&image)?;
         let function = be.get_function(&module, symbol)?;
+        // Before the op / capability checks: rebuilding the object cannot repair a stale packet.
+        let layout = blob.speech_flag_layout(raw)?;
+        check_speech_flag_layout(&be, &module, &object, layout.declared, layout.any())?;
         if let (Some(lo), Some(hi)) = (
             be.module_global_u32(&module, "plow_speech_ops_lo_speech")?,
             be.module_global_u32(&module, "plow_speech_ops_hi_speech")?,
@@ -185,6 +561,32 @@ impl CudaPacketRuntime {
                 )));
             }
         }
+        let caps = missing_speech_caps(
+            speech_caps_required(blob.progs.iter().flat_map(|p| &p.insts)),
+            be.module_global_u32(&module, "plow_speech_caps_speech")?,
+        );
+        if caps != 0 {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: {} lacks speech capabilities {caps:#x}; rebuild it for this packet",
+                path.display(),
+                object.display()
+            )));
+        }
+        let features = speech_features(
+            blob.progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .map(|d| (d.op, d.fj[2])),
+        );
+        check_speech_features(&be, &module, &object, features, |have| {
+            stale_speech_layout(
+                blob.progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .map(|d| (d.op, d.fj[2], d.i[2])),
+                have,
+            )
+        })?;
         let smem = be
             .module_global_u32(&module, "plow_arena_bytes_speech")?
             .unwrap_or(49152);
@@ -341,6 +743,127 @@ impl CudaPacketRuntime {
         })
     }
 
+    pub(crate) fn tick_kernels(&self) -> Result<(KernelFn, KernelFn, KernelFn)> {
+        Ok((
+            self.be.get_function(&self.module, "tick_codec_codes")?,
+            self.be.get_function(&self.module, "tick_pack_pcm16")?,
+            self.be.get_function(&self.module, "tick_codec_lengths")?,
+        ))
+    }
+
+    pub(crate) fn check_sequence(&self, programs: &[usize]) -> Result<()> {
+        self.check_inputs()?;
+        if programs.is_empty() || programs.iter().any(|&p| p >= self.programs.len()) {
+            return Err(RuntimeError::Rejected(
+                "invalid chained packet sequence".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_chained_writes(&self, writes: &[PacketWrite<'_>]) -> Result<()> {
+        self.check_inputs()?;
+        for w in writes {
+            let mem = self.mem(w.tensor)?;
+            check_transfer(
+                w.tensor,
+                w.tensor.handle,
+                mem.len as usize,
+                mem.len as usize,
+            )?;
+            w.check()?;
+            if matches!(w.data, PacketData::Buffer(_)) {
+                return Err(RuntimeError::Rejected(
+                    "chained controls require host or zero inputs".into(),
+                ));
+            }
+        }
+        let size = input_size(writes.iter().map(|w| host_input_size(&self.be, w.data)))?;
+        if size > self.input_stage.as_ref().map_or(0, |s| s.len()) {
+            return Err(RuntimeError::Rejected(
+                "prepare packet writes before chaining".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    // Caller keeps this runtime borrowed and drains `stream` before reuse or release.
+    pub(crate) unsafe fn enqueue_chained(
+        &mut self,
+        stream: &CudaStream,
+        programs: &[usize],
+        writes: &[PacketWrite<'_>],
+    ) -> Result<()> {
+        self.check_sequence(programs)?;
+        self.check_chained_writes(writes)?;
+        let mut offset = 0;
+        for w in writes {
+            let len = host_input_size(&self.be, w.data);
+            if len != 0 {
+                w.data.read(
+                    &mut self.input_stage.as_mut().unwrap().as_mut_slice()[offset..offset + len],
+                )?;
+                offset = (offset + len + 7) & !7;
+            }
+        }
+        offset = 0;
+        for w in writes {
+            let len = w.data.len();
+            if len == 0 {
+                continue;
+            }
+            let target = self.tensors[w.tensor.handle].base + w.offset as u64;
+            if matches!(w.data, PacketData::Zero(_)) {
+                self.be.memset_d8_async(target, 0, len, stream)?;
+            } else {
+                let source = &self.input_stage.as_ref().unwrap().as_slice()[offset..offset + len];
+                offset = (offset + len + 7) & !7;
+                // SAFETY: the chain owns pinned staging until its final drain.
+                unsafe {
+                    self.be.memcpy_htod_async(target, source, stream)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn enqueue_chained_programs(
+        &self,
+        stream: &CudaStream,
+        programs: &[usize],
+    ) -> Result<()> {
+        self.check_sequence(programs)?;
+        match self.graphs.get(programs).and_then(Option::as_ref) {
+            Some(graph) => self.be.graph_launch(graph, stream),
+            None => self.enqueue_on(programs, stream),
+        }
+    }
+
+    pub(crate) fn checked_device_ptr(&self, tensor: PacketTensor) -> Result<u64> {
+        let mem = self.mem(tensor)?;
+        check_transfer(tensor, tensor.handle, mem.len as usize, mem.len as usize)?;
+        Ok(mem.base)
+    }
+
+    pub(crate) fn quarantine_chain(&mut self) {
+        self.input_failed = true;
+        if let Some(stage) = self.input_stage.take() {
+            std::mem::forget(stage);
+        }
+        for tensor in &mut self.tensors {
+            tensor.quarantine();
+        }
+        self._table.quarantine();
+        self._counters.quarantine();
+        for p in &mut self.programs {
+            for table in &mut p._tables {
+                table.quarantine();
+            }
+        }
+        std::mem::forget(self.be.clone());
+        std::mem::forget(self._resident.clone());
+    }
+
     /// Skip every instruction at or past `limit` (per-instruction cost by caps).
     pub fn set_debug_max_inst(&self, limit: u32) -> Result<bool> {
         self.be
@@ -357,19 +880,22 @@ impl CudaPacketRuntime {
     }
 
     fn enqueue(&self, programs: &[usize]) -> Result<()> {
+        self.enqueue_on(programs, &self.stream)
+    }
+
+    fn enqueue_on(&self, programs: &[usize], stream: &CudaStream) -> Result<()> {
         let consecutive = programs.windows(2).all(|w| w[1] == w[0] + 1);
         if let (true, Some(&first), Some(&last)) = (consecutive, programs.first(), programs.last())
         {
             let (first, last) = (&self.programs[first], &self.programs[last]);
             let bytes = (last.counters + last.counter_bytes as u64 - first.counters) as usize;
-            self.be
-                .memset_d8_async(first.counters, 0, bytes, &self.stream)?;
+            self.be.memset_d8_async(first.counters, 0, bytes, stream)?;
         }
         for &program in programs {
             let p = &self.programs[program];
             if !consecutive {
                 self.be
-                    .memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
+                    .memset_d8_async(p.counters, 0, p.counter_bytes, stream)?;
             }
             for seg in 0..p.segments {
                 let mut arg = p.kernarg;
@@ -382,7 +908,7 @@ impl CudaPacketRuntime {
                     BLOCK,
                     self.smem,
                     &mut params,
-                    Some(&self.stream),
+                    Some(stream),
                 )?;
             }
         }
@@ -808,6 +1334,10 @@ mod write_tests {
 }
 
 impl PacketRuntime for CudaPacketRuntime {
+    fn cuda_runtime(&mut self) -> Option<&mut CudaPacketRuntime> {
+        Some(self)
+    }
+
     fn tensor(&self, name: &str) -> Option<PacketTensor> {
         let handle = self.names.iter().position(|n| n == name)?;
         Some(PacketTensor {

@@ -46,6 +46,7 @@ use crate::exec::indirection::slots as ind_slots;
 use crate::exec::oob::{OobChannel, OobMsg};
 use crate::memory::streamer::{KvArena, SlotHandle};
 use crate::memory::AddressSpace;
+use crate::obs::bucket::Family as BucketFamily;
 use crate::obs::serving::{Leg, RequestMetrics};
 use crate::obs::Metrics;
 use crate::sched::admission::LoadEstimator;
@@ -54,10 +55,286 @@ use crate::sched::multistep::MultiStep;
 use crate::sched::rungs::{DecodeRungs, RungController, RungLoad};
 use crate::serve::session::{Retention, Seat, SessionTicket};
 use crate::serve::stream::{ChunkSender, FinishReason, SpeechFrame, StreamChunk};
+
 use crate::serve::{
     bucket_has_sample_batch, reference_logits_row, sample_vocab, AppState, GenParams, RunObserver,
 };
 use crate::Result;
+
+type DeliveryEntry = (mpsc::OwnedPermit<StreamChunk>, StreamChunk);
+
+thread_local! {
+    static TICK_DELIVERY: std::cell::RefCell<Option<Vec<DeliveryEntry>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+fn delivery_worker() -> &'static std::sync::mpsc::Sender<Vec<DeliveryEntry>> {
+    static WORKER: std::sync::OnceLock<std::sync::mpsc::Sender<Vec<DeliveryEntry>>> =
+        std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<DeliveryEntry>>();
+        std::thread::Builder::new()
+            .name("plow-delivery".into())
+            .spawn(move || {
+                while let Ok(batch) = rx.recv() {
+                    for (permit, chunk) in batch {
+                        permit.send(chunk);
+                    }
+                }
+            })
+            .expect("spawn speech delivery thread");
+        tx
+    })
+}
+
+struct TickDelivery;
+
+impl TickDelivery {
+    fn run<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+        if !enabled {
+            return f();
+        }
+        TICK_DELIVERY.with(|batch| {
+            assert!(batch.borrow().is_none(), "nested delivery batch");
+            *batch.borrow_mut() = Some(Vec::new());
+        });
+        let _flush = Self;
+        f()
+    }
+}
+
+impl Drop for TickDelivery {
+    fn drop(&mut self) {
+        if let Some(batch) = TICK_DELIVERY.with(|batch| batch.borrow_mut().take()) {
+            if !batch.is_empty() {
+                let _ = delivery_worker().send(batch);
+            }
+        }
+    }
+}
+
+struct TickSender {
+    inner: ChunkSender,
+    batched: bool,
+}
+
+impl TickSender {
+    fn new(inner: ChunkSender, batched: bool) -> Self {
+        if batched {
+            delivery_worker();
+        }
+        Self { inner, batched }
+    }
+
+    fn try_send(
+        &self,
+        chunk: StreamChunk,
+    ) -> std::result::Result<(), mpsc::error::TrySendError<StreamChunk>> {
+        if !self.batched {
+            return self.inner.try_send(chunk);
+        }
+        let permit = match self.inner.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err(mpsc::error::TrySendError::Full(chunk))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(mpsc::error::TrySendError::Closed(chunk))
+            }
+        };
+        TICK_DELIVERY.with(|batch| {
+            let mut batch = batch.borrow_mut();
+            if let Some(batch) = batch.as_mut() {
+                batch.push((permit, chunk));
+                Ok(())
+            } else {
+                delivery_worker().send(vec![(permit, chunk)]).map_err(|e| {
+                    let (_, chunk) = e.0.into_iter().next().expect("one delivery entry");
+                    mpsc::error::TrySendError::Closed(chunk)
+                })
+            }
+        })
+    }
+
+    async fn send(
+        &self,
+        chunk: StreamChunk,
+    ) -> std::result::Result<(), mpsc::error::SendError<StreamChunk>> {
+        if !self.batched {
+            return self.inner.send(chunk).await;
+        }
+        let permit = self.inner.clone().reserve_owned().await.map_err(|_| ());
+        let Ok(permit) = permit else {
+            return Err(mpsc::error::SendError(chunk));
+        };
+        delivery_worker().send(vec![(permit, chunk)]).map_err(|e| {
+            let (_, chunk) = e.0.into_iter().next().expect("one delivery entry");
+            mpsc::error::SendError(chunk)
+        })
+    }
+}
+
+impl From<ChunkSender> for TickSender {
+    fn from(inner: ChunkSender) -> Self {
+        Self::new(inner, false)
+    }
+}
+
+impl std::ops::Deref for TickSender {
+    type Target = ChunkSender;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    fn token(id: u32) -> StreamChunk {
+        StreamChunk::Token {
+            id,
+            text: String::new(),
+            logprobs: None,
+            frame: None,
+        }
+    }
+
+    async fn next(rx: &mut mpsc::Receiver<StreamChunk>) -> StreamChunk {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tick_delivery_reserves_capacity_and_keeps_terminal_order() {
+        let (tx, mut rx) = mpsc::channel(3);
+        let tx = TickSender::new(tx, true);
+        TickDelivery::run(true, || {
+            tx.try_send(token(1)).unwrap();
+            tx.try_send(token(2)).unwrap();
+            tx.try_send(StreamChunk::Done {
+                executed: 2,
+                reason: FinishReason::Stop,
+                usage: Default::default(),
+            })
+            .unwrap();
+            assert_eq!(tx.capacity(), 0);
+            assert!(matches!(
+                tx.try_send(token(3)),
+                Err(mpsc::error::TrySendError::Full(_))
+            ));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        });
+        for expected in [1, 2] {
+            assert!(matches!(next(&mut rx).await, StreamChunk::Token {id, ..} if id == expected));
+        }
+        assert!(matches!(next(&mut rx).await, StreamChunk::Done { .. }));
+        assert_eq!(tx.capacity(), 3);
+    }
+
+    #[tokio::test]
+    async fn tick_delivery_unwind_and_out_of_tick_messages_preserve_order() {
+        let (tx, mut rx) = mpsc::channel(3);
+        let tx = TickSender::new(tx, true);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            TickDelivery::run(true, || {
+                tx.try_send(token(1)).unwrap();
+                panic!("failed tick");
+            });
+        }))
+        .is_err());
+        tx.send(token(2)).await.unwrap();
+        TickDelivery::run(true, || tx.try_send(token(3)).unwrap());
+        for expected in [1, 2, 3] {
+            assert!(matches!(next(&mut rx).await, StreamChunk::Token {id, ..} if id == expected));
+        }
+        drop(rx);
+        assert!(matches!(
+            tx.try_send(token(4)),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_delivery_remains_immediate_inside_a_batch() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tx = TickSender::new(tx, false);
+        TickDelivery::run(true, || {
+            tx.try_send(token(7)).unwrap();
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                StreamChunk::Token { id: 7, .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn frame_budget_tracks_playback_and_reserves_downstream_work() {
+        let audio = FirstAudio::new(1);
+        assert_eq!(audio.frame_budget_ms(), None);
+        audio.set_frame_period(std::time::Duration::from_millis(80));
+        assert_eq!(audio.frame_budget_ms(), Some(80.0));
+        audio.set_playback_deadline(
+            Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(20),
+        );
+        assert!(audio.frame_budget_ms().unwrap() > 900.0);
+        audio.set_playback_deadline(audio.clock, std::time::Duration::from_millis(20));
+        assert!(audio.frame_budget_ms().unwrap() < 0.001);
+    }
+
+    #[test]
+    #[ignore = "CPU delivery performance replay; run through gpuq"]
+    fn tick_delivery_replay_200() {
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..200 {
+            let (tx, rx) = mpsc::channel(33);
+            senders.push(TickSender::new(tx, true));
+            receivers.push(rx);
+        }
+        let mut times = Vec::new();
+        for tick in 0..1100 {
+            let chunks: Vec<_> = (0..200)
+                .map(|slot| StreamChunk::Token {
+                    id: slot,
+                    text: String::new(),
+                    logprobs: None,
+                    frame: Some(vec![tick; 960].into_boxed_slice().into()),
+                })
+                .collect();
+            let start = Instant::now();
+            TickDelivery::run(true, || {
+                for (tx, chunk) in senders.iter().zip(chunks) {
+                    tx.try_send(chunk).unwrap();
+                }
+            });
+            if tick >= 100 {
+                times.push(start.elapsed().as_secs_f64() * 1e3);
+            }
+            for rx in &mut receivers {
+                assert!(matches!(
+                    rx.blocking_recv(),
+                    Some(StreamChunk::Token { .. })
+                ));
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        let p99 = times[990];
+        println!(
+            "DELIVERY_REPLAY streams=200 samples={} p50_ms={:.6} p99_ms={p99:.6}",
+            times.len(),
+            times[500]
+        );
+        assert!(p99 < 1.5, "engine handoff p99 {p99}ms exceeds 1.5ms");
+    }
+}
 
 // The `PLOW_PF_PACKLOG=1` tick accumulator. It is a DIFFERENT measurement from
 // `exec/gpu.rs:3319`, which writes the per-launch `PACKLOG R=... rows=... bucket=...
@@ -548,6 +825,7 @@ type HeldToken = (
 /// must be the token whose decode embedding the overlay row is.
 #[derive(Default)]
 pub struct SpeechJob {
+    pub batch_delivery: bool,
     /// Retain completed depth outputs for a downstream streaming packet stage.
     pub device_frames: bool,
     /// Packet-declared v1: prompt inputs are token IDs, finalized overlays and frame codes.
@@ -564,6 +842,11 @@ pub struct SpeechJob {
     /// A voice turn's stream: tokens its first audio renders from. Its ticks are the turn's first
     /// audio until then and stream decode after, so the first render outranks them (0: unknown).
     pub first_tokens: usize,
+    /// A stateful-codec stream's first audible audio (`None`: `first_tokens` only). Until it is
+    /// heard, the tick that brings the job to the frame count its next downstream step waits for
+    /// hands the device to that step, as crossing `first_tokens` does once: the first steps can
+    /// render onset silence only.
+    pub first_audio: Option<Arc<FirstAudio>>,
     /// A depth-stage packet (`tts.depth_lm.v1`): each step's token comes from the packet's depth
     /// stage, which also samples the frame's codes ([`StreamChunk::Token::frame`]).
     pub depth: Option<DepthJob>,
@@ -582,6 +865,106 @@ pub struct SpeechJob {
     pub feed: Option<(Vec<u32>, u32)>,
     /// Maya 2: a cloned speaker's depth memory, `[layers][hidden]` (`None`: the null speaker's).
     pub maya2_memory: Option<std::sync::Arc<[f32]>>,
+}
+
+/// Written by a speech stream's task, read by the decode loop: see [`SpeechJob::first_audio`].
+#[derive(Debug)]
+pub struct FirstAudio {
+    heard: std::sync::atomic::AtomicBool,
+    next: std::sync::atomic::AtomicUsize,
+    clock: Instant,
+    period_ns: std::sync::atomic::AtomicU64,
+    deadline_ns: std::sync::atomic::AtomicU64,
+}
+
+impl FirstAudio {
+    /// Its first downstream step waits for `next` frames.
+    pub fn new(next: usize) -> Self {
+        Self {
+            heard: false.into(),
+            next: next.into(),
+            clock: Instant::now(),
+            period_ns: 0.into(),
+            deadline_ns: 0.into(),
+        }
+    }
+
+    pub fn heard(&self) -> bool {
+        self.heard.load(Ordering::Acquire)
+    }
+
+    /// Audible audio is out (or the stream stopped stepping): no more handoffs.
+    pub fn hear(&self) {
+        self.heard.store(true, Ordering::Release);
+    }
+
+    pub fn next(&self) -> usize {
+        self.next.load(Ordering::Acquire)
+    }
+
+    pub fn set_next(&self, frames: usize) {
+        self.next.store(frames, Ordering::Release);
+    }
+
+    pub fn set_frame_period(&self, period: std::time::Duration) {
+        self.period_ns.store(
+            period.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Release,
+        );
+    }
+
+    pub fn set_playback_deadline(&self, end: Instant, reserve: std::time::Duration) {
+        let at = end.checked_sub(reserve).unwrap_or(self.clock);
+        let ns = at
+            .saturating_duration_since(self.clock)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        self.deadline_ns.store(ns.max(1), Ordering::Release);
+    }
+
+    fn frame_budget_ms(&self) -> Option<f64> {
+        let period = self.period_ns.load(Ordering::Acquire);
+        if period == 0 {
+            return None;
+        }
+        let deadline = self.deadline_ns.load(Ordering::Acquire);
+        let ns = if deadline == 0 {
+            period
+        } else {
+            deadline.saturating_sub(self.clock.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+        };
+        Some(ns as f64 / 1e6)
+    }
+}
+
+/// After a tick that left a first-output slot with `n` tokens: whether its downstream first
+/// output is due now (the decode loop then hands it the device), updating `first_out` and the
+/// tokens at its last handoff.
+fn first_handoff(
+    speech: Option<&SpeechJob>,
+    n: usize,
+    first_out: &mut bool,
+    last: &mut usize,
+) -> bool {
+    match speech {
+        Some(SpeechJob {
+            first_audio: Some(fa),
+            ..
+        }) => {
+            *first_out = !fa.heard();
+            // Once per codec-step boundary: a delayed stream task does not re-hand at every tick.
+            let next = fa.next();
+            let due = *first_out && n >= next && next > *last;
+            if due {
+                *last = next;
+            }
+            due
+        }
+        sp => {
+            *first_out = sp.is_some_and(|sp| n < sp.first_tokens);
+            !*first_out
+        }
+    }
 }
 
 pub type SpeechEncode =
@@ -830,6 +1213,8 @@ fn decode_feed_extent(feeds: &[(usize, u32)]) -> Option<usize> {
 struct DecodeProgress {
     extent: usize,
     steps: std::num::NonZeroUsize,
+    /// A plain decode launch ran them (not a prefill launch they rode, nor a speculative verify).
+    plain: bool,
 }
 
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
@@ -837,6 +1222,7 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
     Some(DecodeProgress {
         extent: decode_feed_extent(feeds)?,
         steps: std::num::NonZeroUsize::new(steps)?,
+        plain: true,
     })
 }
 
@@ -1083,7 +1469,7 @@ struct Slot {
     prompt_ids: Vec<u32>,
     out_ids: Vec<u32>,
     gen: GenParams,
-    respond: ChunkSender,
+    respond: TickSender,
     /// Incremental-detokenize window (TGI scheme): `prefix_offset..read_offset`
     /// is the last emitted token span; each new token decodes only
     /// `out_ids[prefix_offset..]` (O(window), not O(total)) and streams the
@@ -1126,8 +1512,10 @@ struct Slot {
     turn_key: Option<crate::serve::turns::TurnKey>,
     speech: Option<Box<SpeechJob>>,
     /// Its downstream first output has not been handed off yet: set while `speech.first_tokens`
-    /// tokens are still to come.
+    /// tokens are still to come, or until `speech.first_audio` is heard.
     first_out: bool,
+    /// Tokens out at its last first-audio handoff.
+    first_handoff: usize,
     /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
     /// and is reserved while the owner lives (see [`slot_free`]).
     cfg: Option<Box<CfgRun>>,
@@ -1369,6 +1757,20 @@ fn spawn_scoped(
     let pf_rungs = state
         .gpu_engine(&slug)
         .and_then(|e| e.lock().pf_launch_rungs());
+    let decode_caps: Box<[usize]> = rung_widths
+        .iter()
+        .flat_map(|w| w.iter().map(|&w| w as usize))
+        .collect();
+    // An engine that counts its own decode launches leaves the dispatcher only their time.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    let engine_counts_decode = state
+        .gpu_engine(&slug)
+        .is_some_and(|e| e.lock().observe_buckets(&metrics.buckets));
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    let engine_counts_decode = false;
+    metrics
+        .buckets
+        .declare(BucketFamily::Decode, decode_caps.iter().copied());
     #[cfg(any(feature = "cuda", feature = "hsa"))]
     let prefix_probe = state
         .gpu_engine(&slug)
@@ -2207,26 +2609,37 @@ fn spawn_scoped(
             metrics.serving.tick_batch.tokens(live);
             let t_service_start = Instant::now();
             let host_timed = crate::obs::host::on();
+            let batch_delivery = crate::config::RuntimeConfig::process_get().tick_delivery;
             let tick = move || {
-                let t_body = host_timed.then(Instant::now);
-                let out = run_one_tick(
-                    &state_ref,
-                    &slug_for_tick,
-                    &bundle_ref,
-                    key_for_tick,
-                    vocab_for_tick,
-                    taken_slots,
-                    taken_bufs,
-                    taken_obs,
-                    arena_ref,
-                    kv_pages_for_tick,
-                    steps,
-                    cfg.multi_step,
-                    co_scheduled,
-                    quantum_cut,
-                    std::time::Duration::from_secs_f64(queue_aging_ms(cfg.slo_ms) / 1e3),
-                );
-                (out, t_body.map_or(0, |t| t.elapsed().as_nanos() as u64))
+                let t_body = host_timed.then(|| (Instant::now(), crate::obs::host::waited_ns()));
+                let out = TickDelivery::run(batch_delivery, || {
+                    run_one_tick(
+                        &state_ref,
+                        &slug_for_tick,
+                        &bundle_ref,
+                        key_for_tick,
+                        vocab_for_tick,
+                        taken_slots,
+                        taken_bufs,
+                        taken_obs,
+                        arena_ref,
+                        kv_pages_for_tick,
+                        steps,
+                        cfg.multi_step,
+                        co_scheduled,
+                        quantum_cut,
+                        std::time::Duration::from_secs_f64(queue_aging_ms(cfg.slo_ms) / 1e3),
+                    )
+                });
+                let elapsed = t_body.map_or(0, |(t, waits)| {
+                    let ns = t.elapsed().as_nanos() as u64;
+                    let waited = crate::obs::host::waited_ns().saturating_sub(waits);
+                    let line = format!("HOSTT TICK live_rows={live} prefill_rows={pf_rows} tick_us={} driver_wait_us={} host_us={} fault={}",
+                        ns / 1000, waited / 1000, ns.saturating_sub(waited) / 1000, out.5.is_some());
+                    eprintln!("{line}");
+                    ns
+                });
+                (out, elapsed)
             };
             // GPU models tick on the dedicated engine thread (or inline on
             // this dispatcher's own thread); the dispatcher task stays hot for
@@ -2324,6 +2737,20 @@ fn spawn_scoped(
                     if let Some(sample) = sample {
                         load.service_ms.update(sample);
                     }
+                    if let Some(p) = decode_progress.filter(|p| p.plain) {
+                        let cap = decode_caps.iter().find(|&&c| c >= p.extent);
+                        let cap = cap.copied().unwrap_or(0);
+                        let steps = p.steps.get() as u64;
+                        let us = (!did_prefill).then(|| service.as_micros() as u64);
+                        let b = &metrics.buckets;
+                        match (engine_counts_decode, us) {
+                            (false, _) => {
+                                b.record_n(BucketFamily::Decode, p.extent, cap, steps, us)
+                            }
+                            (true, Some(us)) => b.record_time(BucketFamily::Decode, cap, steps, us),
+                            (true, None) => {}
+                        }
+                    }
                     if let (Some(controller), Some(progress), Some(sample)) =
                         (rung_controller.as_mut(), decode_progress, sample)
                     {
@@ -2337,17 +2764,18 @@ fn spawn_scoped(
                     }
                     freed_last_tick = returned_slots.iter().flatten().count() < live;
                     slots = returned_slots;
-                    // Crossed or retired this tick (a retired one may have ended on its first
-                    // output).
-                    let mut first_after = 0;
+                    // Retired this tick (one may have ended on its first output), crossed its
+                    // first tokens, or at the frame its next first-audio step waits for.
+                    let present = slots.iter().flatten().filter(|s| s.first_out).count();
+                    let mut crossed = first_before.saturating_sub(present) as u64;
                     for s in slots.iter_mut().flatten().filter(|s| s.first_out) {
-                        s.first_out = s
-                            .speech
-                            .as_ref()
-                            .is_some_and(|sp| s.out_ids.len() < sp.first_tokens);
-                        first_after += s.first_out as usize;
+                        crossed += u64::from(first_handoff(
+                            s.speech.as_deref(),
+                            s.out_ids.len(),
+                            &mut s.first_out,
+                            &mut s.first_handoff,
+                        ));
                     }
-                    let crossed = first_before.saturating_sub(first_after) as u64;
                     if crossed > 0 {
                         await_first = Some(engaged_before.wrapping_add(crossed));
                     }
@@ -2431,6 +2859,9 @@ fn spawn_scoped(
         metrics.decode_rung_actual.store(0, Ordering::Relaxed);
         metrics.decode_rung_admission.store(0, Ordering::Relaxed);
         metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
+        if crate::config::RuntimeConfig::process_get().bucket_log_s > 0 {
+            metrics.buckets.log(&slug);
+        }
     };
     let dispatcher = crate::config::Scoped::new(dispatcher_scope, dispatcher);
     if inline_tick {
@@ -3283,7 +3714,10 @@ fn admit_session(
         arrived: job.arrived,
         stop_tail: String::new(),
         stop_pending: String::new(),
-        respond: job.respond,
+        respond: TickSender::new(
+            job.respond,
+            job.opts.speech.as_ref().is_some_and(|s| s.batch_delivery),
+        ),
         prefix_offset: 0,
         read_offset: 0,
         executed: 0,
@@ -3317,6 +3751,7 @@ fn admit_session(
             })
         }),
         first_out: job.opts.speech.as_ref().is_some_and(|s| s.first_tokens > 0),
+        first_handoff: 0,
         speech: job.opts.speech,
         held: Vec::new(),
         held_finish: None,
@@ -3990,8 +4425,17 @@ fn run_one_tick(
                             continue;
                         }
                         if let Some(keys) = speech_prefix_keys(s) {
-                            s.resume = e.reuse_slot_prefix(i, &keys);
-                            s.slot_prefix_keys = Some((e.slot_prefix_epoch(), keys));
+                            match e.reuse_shared_slot_prefix(i, &keys) {
+                                Ok(rows) => {
+                                    s.resume = rows;
+                                    s.slot_prefix_keys = Some((e.slot_prefix_epoch(), keys));
+                                }
+                                Err(error) => {
+                                    note_fault(&mut tick_fault, &error);
+                                    fail_slot(slot, &arena, error);
+                                    e.retire_slot(i, false);
+                                }
+                            }
                         } else {
                             e.forget_slot_prefix(i);
                         }
@@ -4014,13 +4458,14 @@ fn run_one_tick(
                     && (!e.has_depth_stage() || gpu_depth_packs(&*e, &slots, cap))
                 {
                     let compact = e.pf_compact()
-                        && !(e.packed_depth_enabled()
-                            && depth_cached_tails(
-                                &slots,
-                                cap,
-                                |i| e.packed_slot_ready(i),
-                                |token| e.depth_prompt_tail_can_decode(token),
-                            ));
+                        && (e.row_decode_rungs().next().is_some()
+                            || !(e.packed_depth_enabled()
+                                && depth_cached_tails(
+                                    &slots,
+                                    cap,
+                                    |i| e.packed_slot_ready(i),
+                                    |token| e.depth_prompt_tail_can_decode(token),
+                                )));
                     let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                     completed.clear();
                     let mut dev_sampled = false;
@@ -4060,6 +4505,7 @@ fn run_one_tick(
                             Some(DecodeProgress {
                                 extent,
                                 steps: std::num::NonZeroUsize::new(1)?,
+                                plain: false,
                             })
                         });
                     }
@@ -4421,7 +4867,8 @@ fn run_one_tick(
                                 &mut disconnected,
                             );
                             if spec_ran {
-                                decode_progress = completed_decode(&feeds, 1);
+                                decode_progress = completed_decode(&feeds, 1)
+                                    .map(|p| DecodeProgress { plain: false, ..p });
                             }
                         } else {
                             spec_ran = true;
@@ -7362,14 +7809,18 @@ fn gpu_prefill_batched_pass(
     // the owner's row + 1: the unified batch carries neither, so pairs take the ordinary path.
     let mut unified =
         e.token_batch_enabled() && !slots.iter().take(cap).flatten().any(|s| s.cfg.is_some());
+    let row_body_max = unified.then(|| e.row_decode_rungs().next_back()).flatten();
+    if row_body_max.is_some() {
+        ride.enable_frame_costs();
+    }
     // Whether this tick's decode rows may still leave the launch for their own step
     // (`sched::ride`): decided once, when the launch's bucket is known.
-    let mut ride_open = unified && !feeds.is_empty();
+    let mut ride_open = unified && !feeds.is_empty() && row_body_max.is_none();
     let withheld = usize::from(!compact);
     spans.clear();
     let mut decode_rows = if unified { feeds.len() } else { 0 };
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
-    let budget_max = e.pf_max_rows();
+    let budget_max = row_body_max.unwrap_or_else(|| e.pf_max_rows());
     if budget_max == 0 {
         return tick_fault;
     }
@@ -7383,7 +7834,7 @@ fn gpu_prefill_batched_pass(
             .map_or(1, |sp| sp.overlay.len() / sp.overlay_pos.len());
         bytes as usize / 4 / hidden.max(1)
     });
-    let (launch_cap, launch_max) = if cold && !bounded_tick {
+    let (launch_cap, launch_max) = if row_body_max.is_some() || (cold && !bounded_tick) {
         (budget_max, budget_max)
     } else {
         pf_launch_rows(e.pf_request_max_rows(), budget_max)
@@ -7631,7 +8082,8 @@ fn gpu_prefill_batched_pass(
         // A backlog wider than one full launch means prefill is the bottleneck: every extra launch
         // costs its fixed overhead in capacity (H100 26B: ~24 ms; at 2.2 sess/s the cap cost 18% of
         // prefill rows/s), so the budget yields to throughput until the backlog drains.
-        let budget_on = decode_rows > 0
+        let budget_on = row_body_max.is_none()
+            && decode_rows > 0
             && pf_itl_budget_ms() > 0
             && (pf_itl_force() || itl_owed_rows(slots, cap, withheld, queued_rows) <= budget_max);
         let media_spans = candidates.iter().any(|c| {
@@ -7660,6 +8112,9 @@ fn gpu_prefill_batched_pass(
             decode_rows = 0;
         }
         let per_launch = launch_cap.min(launch_max.saturating_sub(decode_rows));
+        if row_body_max.is_some() && per_launch == 0 {
+            return tick_fault;
+        }
         // Every overlay row of a launch is staged at once: bound its rows by the overlay's.
         let per_launch = per_launch.min(overlay_rows.unwrap_or(usize::MAX)).max(1);
         let per_launch = if adaptive {
@@ -7678,7 +8133,8 @@ fn gpu_prefill_batched_pass(
         // Under the unified token batch the decode rows ride in this launch, and the batch takes the
         // smallest bucket holding every row.
         // An indivisible media span cut by a trim would leave the launch empty: it spills instead.
-        let trim = !media_spans
+        let trim = row_body_max.is_none()
+            && !media_spans
             && trim_for_riders(
                 bucket,
                 e.pf_cover_rows(rows.min(bucket) + decode_rows),
@@ -7734,7 +8190,7 @@ fn gpu_prefill_batched_pass(
                 (len > 0).then_some((i, c0, len))
             })
             .collect();
-        if unified && decode_rows > 0 && !media_spans {
+        if row_body_max.is_none() && unified && decode_rows > 0 && !media_spans {
             let rows: usize = pack.iter().map(|p| p.2).sum();
             let cut = rider_cut(
                 rows,
@@ -7744,6 +8200,36 @@ fn gpu_prefill_batched_pass(
                 |r| ride.rung_ms(e.pf_cover_rows(r)),
             );
             cut_pack_tail(&mut pack, cut);
+        }
+        if row_body_max.is_some() && !feeds.is_empty() {
+            let budget = feeds
+                .iter()
+                .filter_map(|(i, _)| {
+                    slots[*i]
+                        .as_ref()?
+                        .speech
+                        .as_ref()?
+                        .first_audio
+                        .as_ref()?
+                        .frame_budget_ms()
+                })
+                .min_by(f64::total_cmp);
+            if let Some(budget) = budget {
+                let rows: usize = pack.iter().map(|p| p.2).sum();
+                let spans: smallvec::SmallVec<[_; 16]> = pack
+                    .iter()
+                    .map(|&(i, c0, n)| {
+                        (
+                            n,
+                            slots[i]
+                                .as_ref()
+                                .is_some_and(|s| c0 + n == s.prompt_ids.len()),
+                        )
+                    })
+                    .collect();
+                let fit = ride.frame_rows_within(e.row_decode_rungs(), decode_rows, &spans, budget);
+                cut_pack_tail(&mut pack, rows - fit);
+            }
         }
         if pack.is_empty() {
             if !window.is_empty() {
@@ -7766,7 +8252,7 @@ fn gpu_prefill_batched_pass(
         // Riders' drafts fill the rows the launch's bucket pads anyway, within the terminal's
         // sample rows (one per rider and per packed prompt). Drafted before the launch's clock:
         // the ride costs price launches, not drafts.
-        if unified && compact && !feeds.is_empty() {
+        if row_body_max.is_none() && unified && compact && !feeds.is_empty() {
             let rows = pack.iter().map(|p| p.2).sum::<usize>() + feeds.len();
             let slack = e
                 .pf_cover_rows(rows)
@@ -7966,6 +8452,12 @@ fn gpu_prefill_batched_pass(
             // `rows_within` (the ITL budget) and `trim_for_riders` read it.
             let rung = e.pf_cover_rows(pack.iter().map(|p| p.2).sum::<usize>() + riders);
             ride.observe_rung(rung, ms);
+            if row_body_max.is_some() {
+                let rows = pack.iter().map(|p| p.2).sum::<usize>() + riders;
+                if let Some(rung) = e.row_decode_rungs().find(|&r| r >= rows) {
+                    ride.observe_frame(rung, completed.len(), ms);
+                }
+            }
             if packlog::on() {
                 eprintln!(
                     "PACKLOG RIDE rung={rung} riders={riders} ms={ms:.2} window={}",
@@ -7999,7 +8491,7 @@ fn gpu_prefill_batched_pass(
                     e.advance_prefill_turn(last_slot);
                 }
             }
-            Err(err) if refused => {
+            Err(err) if refused && row_body_max.is_none() => {
                 tracing::warn!(
                     error = %err,
                     riders = feeds.len(),
@@ -8040,7 +8532,7 @@ fn gpu_prefill_batched_pass(
                 return tick_fault;
             }
         }
-        if !completed.is_empty() || !cold || bounded_tick {
+        if row_body_max.is_some() || !completed.is_empty() || !cold || bounded_tick {
             return tick_fault; // bounded stall: decode now, next pack next tick
         }
         // Cold path: stop as soon as any request is ready so its first token
@@ -8061,12 +8553,41 @@ fn gpu_prefill_batched_pass(
 
 /// Whether this tick's depth-packet prompts take the packed pass: two or more prompts to prefill
 /// (one launch, and their first frames in one depth launch), or a prompt already admitted to it.
-/// A lone prompt prefills serially: its first frame then needs no extra decode step (c1 TTFA,
-/// Qwen3-TTS H100: 19.6 vs 21.4 ms). A live CFG pair keeps the tick serial, and a prompt part way
+/// A lone prompt with nothing decoding prefills serially: its first frame then needs no extra
+/// decode step (c1 TTFA, Qwen3-TTS H100: 19.6 vs 21.4 ms). Beside decoding rows it packs, so those
+/// rows share its launch instead of waiting out a serial prefill. A live CFG pair keeps the tick serial, and a prompt part way
 /// through serial prefill keeps it serial until done (packed admission restarts a slot).
 #[cfg(feature = "cuda")]
 fn gpu_depth_packs(e: &crate::exec::gpu::GpuEngine, slots: &[Option<Slot>], cap: usize) -> bool {
-    e.depth_packs() && depth_prompts_pack(slots, cap, |i| e.packed_slot_ready(i))
+    if e.row_decode_rungs().next().is_some() {
+        return crate::config::RuntimeConfig::get().tts_depth_pack
+            && e.depth_packs()
+            && slots
+                .iter()
+                .take(cap)
+                .flatten()
+                .all(|slot| depth_prompt_can_pack(slot));
+    }
+    depth_route_packs(
+        crate::config::RuntimeConfig::get().tts_depth_pack,
+        e.depth_packs(),
+        slots,
+        cap,
+        |i| e.packed_slot_ready(i),
+    )
+}
+
+/// `enabled` (`PLOW_TTS_DEPTH_PACK`) off keeps every depth prompt on serial prefill, warm or cold:
+/// no slot is ever admitted to the packed pass, so none is part way through it.
+#[cfg(any(feature = "cuda", test))]
+fn depth_route_packs(
+    enabled: bool,
+    engine_packs: bool,
+    slots: &[Option<Slot>],
+    cap: usize,
+    ready: impl Fn(usize) -> bool,
+) -> bool {
+    enabled && engine_packs && depth_prompts_pack(slots, cap, ready)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -8074,11 +8595,15 @@ fn depth_prompts_pack(slots: &[Option<Slot>], cap: usize, ready: impl Fn(usize) 
     if slots.iter().take(cap).flatten().any(|s| s.cfg.is_some()) {
         return false;
     }
-    let (mut prompts, mut admitted) = (0, false);
+    let (mut prompts, mut admitted, mut decoding) = (0, false, false);
     for (i, s) in slots.iter().enumerate().take(cap) {
-        let Some(s) = s.as_ref().filter(|s| s.step == 0) else {
+        let Some(s) = s.as_ref() else {
             continue;
         };
+        if s.step > 0 {
+            decoding = true;
+            continue;
+        }
         if !depth_prompt_can_pack(s) {
             return false;
         }
@@ -8091,7 +8616,7 @@ fn depth_prompts_pack(slots: &[Option<Slot>], cap: usize, ready: impl Fn(usize) 
             admitted |= s.resume > 0 && s.resume + 1 == s.prompt_ids.len();
         }
     }
-    admitted || prompts >= 2
+    admitted || prompts >= 2 || (prompts == 1 && decoding)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -13942,7 +14467,7 @@ mod tests {
                 out_ids: Vec::new(),
                 dev_pen_counted: usize::MAX,
                 gen: GenParams::default(),
-                respond,
+                respond: respond.into(),
                 prefix_offset: 0,
                 read_offset: 0,
                 executed: 0,
@@ -13960,6 +14485,7 @@ mod tests {
                 turn_key: None,
                 speech: None,
                 first_out: false,
+                first_handoff: 0,
                 mm: None,
                 export: None,
                 import: None,
@@ -14093,6 +14619,30 @@ mod tests {
     }
 
     #[test]
+    fn depth_pack_opt_out_keeps_warm_and_simultaneous_prompts_serial() {
+        let (mut a, _ra) = prefill_test_slot();
+        let (mut b, _rb) = prefill_test_slot();
+        for s in [&mut a, &mut b].into_iter().flatten() {
+            s.pf_pos = 0;
+            s.speech = Some(Box::new(prefix_test_speech()));
+        }
+        // Two simultaneous prompts, one resuming a reused prefix: the packed route's best case.
+        a.as_mut().unwrap().resume = 2;
+        let mut slots = vec![a, b];
+        assert!(depth_route_packs(true, true, &slots, 2, |_| false));
+        assert!(!depth_route_packs(false, true, &slots, 2, |_| false));
+        assert!(!depth_route_packs(true, false, &slots, 2, |_| false));
+        // Serial prefill then advances each prompt to completion without a route change.
+        for done in 1..=2 {
+            slots[0].as_mut().unwrap().pf_pos = done;
+            assert!(!depth_route_packs(false, true, &slots, 2, |_| false));
+        }
+        slots[0].as_mut().unwrap().step = 1;
+        slots[1].as_mut().unwrap().step = 1;
+        assert!(!depth_route_packs(false, true, &slots, 2, |_| false));
+    }
+
+    #[test]
     fn depth_packing_admits_a_warm_single_prompt_without_waiting_for_a_peer() {
         let (mut a, _ra) = prefill_test_slot();
         let (mut b, _rb) = prefill_test_slot();
@@ -14105,6 +14655,14 @@ mod tests {
             !depth_prompts_pack(&slots, 2, |_| false),
             "a cold single prompt stays serial"
         );
+        let (mut live, _rl) = prefill_test_slot();
+        live.as_mut().unwrap().step = 1;
+        slots[1] = live;
+        assert!(
+            depth_prompts_pack(&slots, 2, |_| false),
+            "a single prompt beside a decoding row packs"
+        );
+        slots[1] = None;
         slots[0].as_mut().unwrap().resume = 2;
         assert!(depth_prompts_pack(&slots, 2, |_| false));
         slots[0].as_mut().unwrap().resume = 1;
@@ -14465,6 +15023,40 @@ mod tests {
             slots[0].as_ref().unwrap().turn.unwrap().tts_first_audio,
             Some(now)
         );
+    }
+
+    /// A stateful-codec stream hands its downstream step the device at each frame count that
+    /// step waits for until audio is heard; a plain one once, at its first tokens.
+    #[test]
+    fn first_audio_hands_off_at_each_step_until_heard() {
+        let fa = Arc::new(FirstAudio::new(2));
+        let job = SpeechJob {
+            first_tokens: 2,
+            first_audio: Some(fa.clone()),
+            ..Default::default()
+        };
+        let (mut out, mut last) = (true, 0);
+        let mut due = |n| first_handoff(Some(&job), n, &mut out, &mut last);
+        assert!(!due(1));
+        assert!(due(2));
+        assert!(!due(2), "one handoff per boundary");
+        assert!(!due(3), "a growing count at the same boundary");
+        fa.set_next(4);
+        assert!(!due(3));
+        assert!(due(4));
+        fa.hear();
+        fa.set_next(5);
+        assert!(!due(5));
+        assert!(!out);
+        let plain = SpeechJob {
+            first_tokens: 2,
+            ..Default::default()
+        };
+        let (mut out, mut last) = (true, 0);
+        assert!(!first_handoff(Some(&plain), 1, &mut out, &mut last));
+        assert!(out);
+        assert!(first_handoff(Some(&plain), 2, &mut out, &mut last));
+        assert!(!out);
     }
 
     /// A turn's speech stream is its first audio only until the tokens that audio renders from;

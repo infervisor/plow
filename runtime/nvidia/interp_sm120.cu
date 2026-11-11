@@ -45,6 +45,15 @@ extern "C" __device__ unsigned plow_mixed_interpreter
  * `token_batch`; the gather marker says PLOW_DOP_ROW_GATHER has a real dispatch arm. Armed and
  * can-fire are different claims, and only the second licenses a measurement. */
 extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
+#if PLOW_NV_TOKEN_BATCH_BF16
+#if PLOW_FP8_KV || PLOW_MIXED_STEP
+#error "BF16 token-batch decode uses its own descriptor and BF16 KV"
+#endif
+extern "C" __device__ unsigned plow_bf16_token_batch_1 = 1;
+#define BF16_TB_ARG , token_batch
+#define BF16_TB_NRF_ARG , nullptr, token_batch
+#endif
+
 extern "C" __device__ unsigned plow_row_gather_1 = 1;
 #if PLOW_NV_ROW_SLOT
 /* Span-mode decode (speculative verify): HEADNORM_ROPE_FP8 stores and FLASH_DECODE_FP8 reads
@@ -272,12 +281,19 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #define PLOW_NV_GEMV_K8_OPS 7u
 #endif
 /* Widest activation rung the K-split walk takes: the decode object holds rungs <= 4 (1-tile arm
- * only), the _gw object 8..32. */
+ * only), the _gw object 8..32. _MAIN widens the decode object alone (its rungs past GV_MM_MAX). */
 #ifndef PLOW_NV_GEMV_K8_MAX_GW
 #define PLOW_NV_GEMV_K8_MAX_GW 32
 #endif
+#ifndef PLOW_NV_GEMV_K8_MAX_MAIN
+#define PLOW_NV_GEMV_K8_MAX_MAIN 8
+#endif
+#if PLOW_NV_GEMV_K8_MAX_MAIN != 8 && PLOW_NV_GEMV_K8_MAX_MAIN != 16 && PLOW_NV_GEMV_K8_MAX_MAIN != 32 && \
+    PLOW_NV_GEMV_K8_MAX_MAIN != 64
+#error "PLOW_NV_GEMV_K8_MAX_MAIN must be a K8 tile width (8, 16, 32 or 64): the arena is sized from it"
+#endif
 #ifndef PLOW_NV_GEMV_K8_MAX
-#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : 8)
+#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : PLOW_NV_SPEECH ? 8 : PLOW_NV_GEMV_K8_MAX_MAIN)
 #endif
 #ifndef PLOW_NV_GEMV_K8_MIN
 #define PLOW_NV_GEMV_K8_MIN 2
@@ -1143,7 +1159,7 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #define PLOW_NV_ARENA_FLOATS1                                                                 \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
 #define PLOW_NV_ARENA_FLOATS                                                                  \
-    (PLOW_NV_ARENA_FLOATS1 > SP_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS1 : SP_ARENA_FLOATS)
+    (PLOW_NV_ARENA_FLOATS1 > SP_LAUNCH_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS1 : SP_LAUNCH_ARENA_FLOATS)
 #else
 #define PLOW_NV_ARENA_FLOATS                                                                  \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
@@ -1272,9 +1288,43 @@ extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_O
 /* The speech arms a PLOW_SPEECH_OPS object carries (bit op - 163). The mask is not part of the
  * pairing hash, so the loader checks every sidecar's speech ops against it before launching.
  * Absent on an all-arms object (unconstrained), like the pairing stamp. */
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+/* Speech-op semantics beyond the op set (packet_exec::speech_features): bit 1 = conv flag bit 3
+ * (ragged wgmma tiles; bit 0 is retired), bit 2 = conv flag bit 30 (split-image input,
+ * PLOW_SPEECH_SPLIT_A). A packet relying on a bit is refused by an object without it. */
+#if defined(PLOW_SPEECH_SPLIT_A) && PLOW_SPEECH_SPLIT_A
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u | 4u;
+#else
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u;
+#endif
+#endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SPEECH_OPS >> 32);
+#endif
+/* Speech-object capabilities behind instruction flag bits (the op mask cannot see a flag): the
+ * loader derives the required set from each program's instructions and refuses an object without
+ * them (symbol absent = none). bit 0: GemvF32Out row view (flag bit 12, descriptor in t7) - not
+ * offered: the view addressing cost the M >= 40 rungs ~25 % with the view off, so a view packet is refused;
+ * bit 1: AttentionF32 query view (flag bit 6); bit 2: f16 LayerNorm / projection operands. */
+#if PLOW_NV_SPEECH
+#if defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
+#if defined(PLOW_NV_HOPPER)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 14u;
+#else
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 10u;
+#endif
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 3u;
+#else
+#if defined(PLOW_NV_HOPPER)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 6u;
+#else
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 2u;
+#endif
+/* The speech-op flag layout this object reads (plow_asset::speech_flag_layout::LAYOUT): a packet
+ * layout 2 preserves layout 1 meanings and also accepts its packets. */
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 2u;
+#endif
 #endif
 #if PLOW_PACKET_HASH != 0ull
 extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_lo) =
@@ -1323,6 +1373,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                           unsigned nblk, float* arena
 #if PLOW_MIXED_STEP
                                           , const PlowProgram* mixed
+#endif
+#if PLOW_NV_TOKEN_BATCH_BF16
+                                          , const PlowTokenBatch* token_batch
 #endif
                                           ) {
     const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
@@ -1965,8 +2018,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         /* i[7] = 1 is the FUSED k+v form (decode only): t6/t7 hold v's (out, in) and the
          * kernel runs a second, gamma-less rope-less pass over them. It cannot collide with
          * the prefill/mixed pfslot use of t6 above — those programs leave i[7] at 0. */
+#if PLOW_NV_TOKEN_BATCH_BF16
+#define PLOW_HNR_KV2 , (in->i[7] ? (__nv_bfloat16*)TEN(6) : nullptr), \
+                     (in->i[7] ? (const __nv_bfloat16*)TEN(7) : nullptr), 0u, token_batch
+#else
 #define PLOW_HNR_KV2 , (in->i[7] ? (__nv_bfloat16*)TEN(6) : nullptr), \
                      (in->i[7] ? (const __nv_bfloat16*)TEN(7) : nullptr)
+#endif
 #if PLOW_HAS_HEADNORM_HD64
         /* The packet flag selects explicit half-split pairing; other HD64 packets use the
          * pre-existing interleaved pairing. Packet inventory keeps this template out of
@@ -2156,7 +2214,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                (in->i[7] & 8u) ? (const float*)TEN(4) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(5) : nullptr,
                                (in->i[7] & 256u) ? (const float*)TEN(6) : nullptr, in->fj[0].f, in->i[7],
-                               in->i[3], in->i[0], in->i[1], in->i[2], slice, nblk, arena);
+                               in->i[3], in->i[0], in->i[1], in->i[2], slice, nblk, arena,
+                               (in->i[7] & 4096u) ? (const unsigned*)TEN(7) : nullptr);
 #else
             __trap();
 #endif
@@ -2166,7 +2225,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                          in->i[1], in->i[2], slice, nblk);
 #else
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
-                          in->i[1], in->i[2], in->i[7] != 0u, slice, nblk);
+                          in->i[1], in->i[2], in->i[7] != 0u, slice, nblk, arena);
 #endif
         break;
     case PLOW_DOP_SAMPLE_SMALL_F32:
@@ -2785,6 +2844,25 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
+#if PLOW_NV_TOKEN_BATCH_BF16
+#define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
+    do {                                                                                       \
+        if (TEN(6))                                                                            \
+            d_flash_decode_slots<DD, GG>(                                                       \
+                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
+                (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
+                (const int*)TEN(6), fold_out, fold_ctr BF16_TB_ARG);                                        \
+        else                                                                                   \
+            d_flash_decode<DD, GG>(                                                            \
+                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
+                (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,     \
+                nullptr, nullptr, fold_out, fold_ctr BF16_TB_NRF_ARG);                                         \
+    } while (0)
+#else
 #define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
     do {                                                                                       \
         if (TEN(6))                                                                            \
@@ -2802,6 +2880,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,     \
                 nullptr, nullptr, fold_out, fold_ctr);                                         \
     } while (0)
+#endif
 #if PLOW_HAS_FLASH_HD64
         if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64) {
             if (gqa != PLOW_PACKET_GQA) { __trap(); break; }
@@ -4060,6 +4139,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #endif
 #if PLOW_MIXED_STEP
                       , &prog
+#endif
+#if PLOW_NV_TOKEN_BATCH_BF16
+                      , prog.token_batch
 #endif
                       );
         }
@@ -5656,4 +5738,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) PLOW_SYM(plow_norm_rms_pf)(
               gridDim.x >= rn->i[0] ? 0u : PLOW_NV_T17_MIN_ROWS);
 #undef NRP_TEN
 }
+#endif
+
+#if PLOW_NV_SPEECH && defined(PLOW_NV_DEVICE_CONTROL) && PLOW_NV_DEVICE_CONTROL
+#include "op_control_sample.cuh"
 #endif

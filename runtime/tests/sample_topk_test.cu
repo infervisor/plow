@@ -9,7 +9,7 @@
  * Sampling: temperatures, top_k 1..64, top_p, repetition-penalty bitmap, min-step stop mask, CFG
  * guide rows, seeds and steps.
  *
- * Build: nvcc -arch=sm_90a -O3 -I runtime/common -I runtime/nvidia runtime/tests/sample_topk_test.cu
+ * Build: nvcc -arch=sm_90a -DPLOW_NV_GUMBEL_WARP=1 -O3 -I runtime/common -I runtime/nvidia runtime/tests/sample_topk_test.cu
  *   -o sample_topk_test;  sample_topk_test [depth.f32 backbone.f32] [--bench]
  */
 #include <cuda_runtime.h>
@@ -303,7 +303,123 @@ static std::vector<float> load(const char* path, unsigned vocab, unsigned* rows)
     return v;
 }
 
+/* gumbel_pick_warp against the serial strict-> scan it replaced: one block per case, scores with
+ * ties (a 1/16 grid), -inf and NaN runs, n = 0..64. The arm compiles only with
+ * -DPLOW_NV_GUMBEL_WARP=1 (default off), and so does this case. */
+#if PLOW_NV_GUMBEL_WARP
+__global__ void gumbel_kernel(const float* sv, const unsigned* n, unsigned* got, unsigned* ref) {
+    const float* s = sv + (size_t)blockIdx.x * 64u;
+    const unsigned step = blockIdx.x * 7u, coord = 3u;
+    const unsigned long long seed = 0x9e3779b97f4a7c15ull ^ blockIdx.x;
+    if (threadIdx.x < 32u) {
+        const unsigned g = gumbel_pick_warp(s, n[blockIdx.x], seed, step, coord);
+        if (threadIdx.x == 0) got[blockIdx.x] = g;
+    }
+    if (threadIdx.x == 0) {
+        unsigned best = 0;
+        float bv = -INFINITY;
+        for (unsigned i = 0; i < n[blockIdx.x]; i++) {
+            const float v = s[i] + sf_neg_log_exp1(seed, step, coord, 0u, i);
+            if (v > bv) { bv = v; best = i; }
+        }
+        ref[blockIdx.x] = best;
+    }
+}
+static int gumbel_case() {
+    const unsigned cases = 4096;
+    std::vector<float> sv((size_t)cases * 64);
+    std::vector<unsigned> n(cases);
+    unsigned rng = 0x2468ace1u;
+    auto next = [&] { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; };
+    for (unsigned c = 0; c < cases; c++) {
+        n[c] = c % 65u;
+        const unsigned kind = (c / 65u) % 5u;
+        for (unsigned i = 0; i < 64; i++) {
+            float v = (float)(int)(next() % 64u) / 16.f - 2.f;
+            if (kind == 1) v = next() % 2u ? 1e30f : 0.f;           /* ties: the noise vanishes at 1e30 */
+            if (kind == 2 && next() % 3u == 0) v = -INFINITY;
+            if (kind == 3) v = -INFINITY;
+            if (kind == 4 && next() % 4u == 0) v = NAN;
+            sv[(size_t)c * 64 + i] = v;
+        }
+    }
+    float* d_sv; unsigned *d_n, *d_got, *d_ref;
+    CK(cudaMalloc(&d_sv, sv.size() * 4)); CK(cudaMalloc(&d_n, cases * 4));
+    CK(cudaMalloc(&d_got, cases * 4)); CK(cudaMalloc(&d_ref, cases * 4));
+    CK(cudaMemcpy(d_sv, sv.data(), sv.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_n, n.data(), cases * 4, cudaMemcpyHostToDevice));
+    gumbel_kernel<<<cases, 64>>>(d_sv, d_n, d_got, d_ref);
+    CK(cudaDeviceSynchronize());
+    std::vector<unsigned> got(cases), ref(cases);
+    CK(cudaMemcpy(got.data(), d_got, cases * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(ref.data(), d_ref, cases * 4, cudaMemcpyDeviceToHost));
+    int bad = 0;
+    for (unsigned c = 0; c < cases; c++) bad += got[c] != ref[c];
+    printf("%-34s gumbel_pick_warp vs serial scan, %u cases : %s\n", "ties / -inf / NaN, n 0..64", cases,
+           bad ? "FAIL" : "ok");
+    CK(cudaFree(d_sv)); CK(cudaFree(d_n)); CK(cudaFree(d_got)); CK(cudaFree(d_ref));
+    return bad;
+}
+#endif
+
+/* d_gemv_f32out with x staged in the arena (room for it) vs read from global (no arena): the same
+ * bits. Shapes: depth heads M = 1..32 x 2048 x 1024, a narrow N that leaves blocks empty, both
+ * roundings, and an arena one row short of x (falls back). */
+__global__ void gemv_kernel(float* C, const __nv_bfloat16* x, const __nv_bfloat16* W, unsigned M, unsigned N,
+                            unsigned K, bool round_bf16) {
+    extern __shared__ float arena[];
+    d_gemv_f32out(C, x, W, M, N, K, round_bf16, blockIdx.x, gridDim.x, arena);
+}
+static int gemv_case() {
+    struct G { unsigned M, N, K; bool rnd; size_t smem_rows; };
+    const G gs[] = {{1, 2048, 1024, false, 1}, {7, 2048, 1024, false, 7}, {16, 2048, 1024, false, 16},
+                    {32, 2048, 1024, false, 32}, {16, 2048, 1024, true, 16}, {9, 100, 1024, false, 9},
+                    {16, 2048, 1024, false, 15}};
+    CK(cudaFuncSetAttribute(gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
+    int bad_total = 0;
+    unsigned rng = 0x1234567u;
+    auto next = [&] { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; };
+    for (const G& g : gs) {
+        std::vector<__nv_bfloat16> x((size_t)g.M * g.K), w((size_t)g.N * g.K);
+        for (auto& v : x) v = __float2bfloat16((float)(int)(next() % 2001u - 1000u) / 997.f);
+        for (auto& v : w) v = __float2bfloat16((float)(int)(next() % 2001u - 1000u) / 31337.f);
+        __nv_bfloat16 *dx, *dw; float *c0, *c1;
+        CK(cudaMalloc(&dx, x.size() * 2)); CK(cudaMalloc(&dw, w.size() * 2));
+        CK(cudaMalloc(&c0, (size_t)g.M * g.N * 4)); CK(cudaMalloc(&c1, (size_t)g.M * g.N * 4));
+        CK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
+        gemv_kernel<<<132, PLOW_NV_THREADS, g.smem_rows * g.K * 2>>>(c0, dx, dw, g.M, g.N, g.K, g.rnd);
+        gemv_kernel<<<132, PLOW_NV_THREADS, 0>>>(c1, dx, dw, g.M, g.N, g.K, g.rnd);
+        CK(cudaDeviceSynchronize());
+        std::vector<uint32_t> a((size_t)g.M * g.N), b(a.size());
+        CK(cudaMemcpy(a.data(), c0, a.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(b.data(), c1, b.size() * 4, cudaMemcpyDeviceToHost));
+        const int bad = a != b;
+        printf("%-34s GemvF32Out M %2u N %4u arena rows %2zu : %s\n", g.rnd ? "staged vs global, bf16-rounded"
+               : "staged vs global", g.M, g.N, g.smem_rows, bad ? "FAIL" : "ok");
+        bad_total += bad;
+        CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(c0)); CK(cudaFree(c1));
+    }
+    return bad_total;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && !strcmp(argv[1], "--undersized-arena")) {
+        SmallArgs a{};
+        a.rows = 1;
+        a.vocab = 2048;
+        int* marker;
+        CK(cudaMalloc(&marker, sizeof(int)));
+        small_kernel<<<1, 256, row_arena(a.vocab, sizeof(float)) - 16>>>(a, marker);
+        const auto error = cudaDeviceSynchronize();
+        if (error != cudaErrorIllegalInstruction && error != cudaErrorLaunchFailure) {
+            fprintf(stderr, "FAIL undersized arena: %s\n", cudaGetErrorString(error));
+            return 1;
+        }
+        printf("PASS undersized sampler arena refused before operand access\n");
+        return 0;
+    }
+
     bool bench = false;
     std::vector<const char*> files;
     for (int i = 1; i < argc; i++) {
@@ -335,6 +451,11 @@ int main(int argc, char** argv) {
             small_case(name, v, rows, vocab);
             fish_case(name, v, rows, vocab);
         }
+#if PLOW_NV_GUMBEL_WARP
+    if (gumbel_case()) failures++;
+#endif
+    if (gemv_case()) failures++;
+    cases += PLOW_NV_GUMBEL_WARP ? 2 : 1;
     if (bench)
         printf("bench (recorded depth rows, us/launch): SampleSmallF32 radix %.1f K-round %.1f; SampleFishBf16 radix "
                "%.1f K-round %.1f\n",

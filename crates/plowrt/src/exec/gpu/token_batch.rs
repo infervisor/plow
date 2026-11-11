@@ -77,7 +77,7 @@ impl CudaTokenBatch {
             && e.prefill.iter().enumerate().all(|(i, b)| {
                 attention_supported(
                     b.flash_sites.iter().map(|&pc| b.h_inst[pc].i[6]),
-                    e.riders.as_ref().is_some_and(|r| r.serves(i)),
+                    e.row_decode.is_some() || e.riders.as_ref().is_some_and(|r| r.serves(i)),
                 )
             }))
         .then(|| Self {
@@ -244,7 +244,7 @@ impl GpuEngine {
         let mm_rows = self
             .handle_of(plow_asset::multimodal::TABLE_TENSOR)
             .is_some();
-        let result = (|| {
+        let mut result = (|| {
             if self.has_depth_stage()
                 && (prepare.is_none() || requests.iter().any(|r| r.phase == Phase::Verify))
             {
@@ -281,15 +281,24 @@ impl GpuEngine {
                 rows.checked_add(request.tokens.len())
                     .ok_or_else(|| RuntimeError::Rejected("CUDA token-batch row overflow".into()))
             })?;
-            let (bucket, capacity) = self
+            let fallback = self
                 .prefill
                 .iter()
                 .enumerate()
                 .find(|(_, bucket)| bucket.t as usize >= rows)
                 .map(|(index, bucket)| (index, bucket.t))
                 .ok_or_else(|| {
+                    self.buckets
+                        .record_demand(crate::obs::bucket::Family::Prefill, rows);
                     RuntimeError::Rejected("CUDA token-batch capacity exceeded".into())
                 })?;
+            let row_decode = self.row_decode_covering(rows);
+            if self.row_decode.is_some() && row_decode.is_none() {
+                return Err(RuntimeError::Rejected(
+                    "row-decode capacity exceeded".into(),
+                ));
+            }
+            let (bucket, capacity) = row_decode.unwrap_or(fallback);
             let plan = state
                 .staging
                 .stage(
@@ -442,7 +451,11 @@ impl GpuEngine {
                 .zip(&chunks)
                 .take_while(|(phase, chunk)| **phase == Phase::Decode && chunk.tokens.len() == 1)
                 .count();
-            let body = self.packed_token_body_enqueue(&chunks);
+            let body = if row_decode.is_some() {
+                self.enqueue_row_decode(plan, &chunks)
+            } else {
+                self.packed_token_body_enqueue(&chunks)
+            };
             self.pf_riders = 0;
             self.pf_seg_prefix = false;
             body?;
@@ -629,7 +642,11 @@ impl GpuEngine {
             self.tb_verdicts.truncate(verdicts_before);
             self.spec_hidden_commit(false);
             if body_enqueued {
-                let _ = self.be.stream_synchronize(&self.stream);
+                if let Err(error) = self.be.stream_synchronize(&self.stream) {
+                    if self.row_decode.is_some() {
+                        result = Err(self.quarantine_row_decode(error));
+                    }
+                }
             }
             state.staging.discard();
             output.clear();

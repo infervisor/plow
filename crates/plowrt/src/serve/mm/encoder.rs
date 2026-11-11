@@ -55,6 +55,7 @@ pub struct Encoder {
     output_width: usize,
     round_input: bool,
     inputs: Inputs,
+    buckets: std::sync::Arc<crate::obs::bucket::BucketDemand>,
 }
 
 impl Encoder {
@@ -112,7 +113,27 @@ impl Encoder {
             output_width,
             round_input,
             inputs,
+            buckets: Default::default(),
         })
+    }
+
+    fn family(&self) -> crate::obs::bucket::Family {
+        match self.inputs {
+            Inputs::Vision { .. } => crate::obs::bucket::Family::MmImage,
+            Inputs::Audio { .. } | Inputs::Frames { .. } => crate::obs::bucket::Family::MmAudio,
+        }
+    }
+
+    /// Count launches into `buckets`: images, or clip frames, against the rungs.
+    pub fn observing(mut self, buckets: std::sync::Arc<crate::obs::bucket::BucketDemand>) -> Self {
+        buckets.declare(self.family(), self.rungs.iter().map(|r| r.0 as usize));
+        self.buckets = buckets;
+        self
+    }
+
+    fn record(&self, rows: usize, capacity: usize) {
+        let us = self.packet.runtime().last_run_us() as u64;
+        self.buckets.record(self.family(), rows, capacity, Some(us));
     }
 
     /// The host processor whose output this encoder's inputs take.
@@ -238,6 +259,7 @@ impl Encoder {
             }
             let rows_out = cap * item_tokens;
             let flat = self.run(&programs, &writes, rows_out)?;
+            self.record(chunk.len(), cap);
             for (i, p) in chunk.iter().enumerate() {
                 let start = i * item_tokens * self.output_width;
                 out.push(flat[start..start + p.soft_tokens as usize * self.output_width].to_vec());
@@ -284,6 +306,7 @@ impl Encoder {
         ];
         let rows = cap / 4;
         let mut flat = self.run(&programs, &writes, rows)?;
+        self.record(need, cap);
         flat.truncate(tokens * self.output_width);
         Ok(flat)
     }
@@ -308,6 +331,7 @@ impl Encoder {
             &[(self.input, bytemuck::cast_slice(&input).to_vec())],
             cap,
         )?;
+        self.record(tokens, cap);
         flat.truncate(tokens * self.output_width);
         Ok(flat)
     }

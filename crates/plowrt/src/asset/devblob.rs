@@ -114,6 +114,22 @@ pub struct DevSection {
     pub size: usize,
 }
 
+/// [`DevBlob::speech_flag_layout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpeechFlagLayout {
+    pub declared: Option<u32>,
+    /// First protected use in the regular programs.
+    pub regular: Option<u16>,
+    /// First protected use in the auxiliary-program sections.
+    pub auxiliary: Option<u16>,
+}
+
+impl SpeechFlagLayout {
+    pub fn any(&self) -> Option<u16> {
+        self.regular.or(self.auxiliary)
+    }
+}
+
 /// A parsed device blob.
 #[derive(Clone)]
 pub struct DevBlob {
@@ -1045,6 +1061,51 @@ impl DevBlob {
         read_abi(buf, &self.sections)
     }
 
+    /// The packet's side of `plow_asset::speech_flag_layout::check`: the layout `abi.json`
+    /// declares and, for the regular programs and for the auxiliary-program sections, the opcode
+    /// of the first instruction that sets a flag bit assigned since layout 0.
+    pub fn speech_flag_layout(&self, buf: &[u8]) -> Result<SpeechFlagLayout> {
+        use plow_asset::speech_flag_layout as layout;
+        let mut aux = Vec::new();
+        for s in &self.sections {
+            if s.kind != packet::devbuild::SECT_METADATA {
+                continue;
+            }
+            let data = s
+                .offset
+                .checked_add(s.size)
+                .and_then(|end| buf.get(s.offset..end))
+                .ok_or_else(|| malformed(format!("{} outside the packet", s.name)))?;
+            if layout::is_aux_programs(data) {
+                aux.extend(
+                    layout::aux_insts(data, self.n_cu)
+                        .map_err(|e| malformed(format!("{}: {e}", s.name)))?,
+                );
+            }
+        }
+        let first = |insts: &mut dyn Iterator<Item = &DevInst64>| {
+            layout::first_protected(insts.map(|d| (d.op, d.fj[2], d.i)))
+        };
+        let declared = self.abi(buf)?.and_then(|a| a.speech_flag_layout);
+        let required = layout::required_layout(
+            self.progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .chain(&aux)
+                .map(|d| (d.op, d.fj[2], d.i)),
+        );
+        if required.is_some_and(|minimum| minimum >= 2 && declared.unwrap_or(0) < minimum) {
+            return Err(malformed(
+                "speech flag declaration is older than its instruction bits".into(),
+            ));
+        }
+        Ok(SpeechFlagLayout {
+            declared,
+            regular: first(&mut self.progs.iter().flat_map(|p| &p.insts)),
+            auxiliary: first(&mut aux.iter()),
+        })
+    }
+
     pub fn section_data<'a>(&self, buf: &'a [u8], kind: u32) -> Option<&'a [u8]> {
         self.sections
             .iter()
@@ -1108,6 +1169,7 @@ impl DevBlob {
                     packet::devbuild::packed_prefill_program_t(p.t)
                 }
                 ProgramRole::TokenBatchBody { .. } => packet::devbuild::token_batch_program_t(p.t),
+                ProgramRole::RowDecodeBody { .. } => packet::devbuild::row_decode_program_t(p.t),
                 ProgramRole::DenseExactRung { .. } => packet::devbuild::dense_exact_program_t(p.t),
                 ProgramRole::RowSplitSibling { .. } => {
                     packet::devbuild::rowsplit_prefill_program_t(p.t)
@@ -1983,6 +2045,149 @@ mod tests {
     }
 
     #[test]
+    fn speech_flag_layout_reads_the_declaration_and_every_program() {
+        use plow_asset::speech_flag_layout as layout;
+        let (conv, head) = (DevOp::Conv1dF32 as u16, DevOp::GemvF32Out as u16);
+        // Where the protected bit sits: nowhere, the last instruction of the last regular
+        // program, or an auxiliary-program section.
+        #[derive(Clone, Copy, PartialEq)]
+        enum At {
+            Nowhere,
+            Regular,
+            Auxiliary,
+        }
+        let scan = |at: At, declared: Option<u32>| {
+            let mut m = tiny_model();
+            let more = tiny_model();
+            m.progs.extend(more.progs);
+            m.prog_t.extend(more.prog_t);
+            let d = m.progs.last_mut().unwrap().insts.last_mut().unwrap();
+            d.op = conv;
+            d.j[1] = 0x6e000 | u32::from(at == At::Regular) << 3;
+            let mut b = packet::devbuild::Builder::new(m.n_cu);
+            b.force_uniseg();
+            b.emit(DevOp::GemvF32Out, b.all(), &[], |i| {
+                i.t = [0; 8];
+                i.i[7] = 2048 | u32::from(at == At::Auxiliary) << 12;
+            });
+            let aux = Model {
+                n_cu: m.n_cu,
+                target: 0,
+                tensors: vec![TensorDecl {
+                    name: "x".into(),
+                    bytes: 8,
+                    init: None,
+                }],
+                progs: vec![b.finish()],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
+            };
+            let abi = plow_asset::abi::Abi {
+                version: plow_asset::abi::VERSION,
+                contract: plow_asset::RUNTIME_CONTRACT_BASE,
+                speech_flag_layout: declared,
+                ..Default::default()
+            };
+            let meta = |name: &str, data| packet::devbuild::SectionData {
+                kind: packet::devbuild::SECT_METADATA,
+                name: name.into(),
+                data,
+            };
+            let raw = m.to_blob_v6(&[
+                meta(
+                    plow_asset::fish_depth::PROGRAMS_SECTION,
+                    plow_asset::program::with_model(&aux, |p| {
+                        plow_asset::aux_program::encode(aux.n_cu, 1, p.programs).unwrap()
+                    }),
+                ),
+                meta("notes.json", b"{}".to_vec()),
+                meta(plow_asset::abi::SECTION, serde_json::to_vec(&abi).unwrap()),
+            ]);
+            DevBlob::parse(&raw)
+                .unwrap()
+                .speech_flag_layout(&raw)
+                .unwrap()
+        };
+        let found = |declared, regular, auxiliary| SpeechFlagLayout {
+            declared,
+            regular,
+            auxiliary,
+        };
+        // The layout-0 subset: undeclared, loads on any object.
+        assert_eq!(scan(At::Nowhere, None), found(None, None, None));
+        // A protected bit without a declaration is what a pre-layout packet looks like.
+        let stale = scan(At::Regular, None);
+        assert_eq!(stale, found(None, Some(conv), None));
+        assert!(layout::check(stale.declared, stale.any(), Some(layout::LAYOUT)).is_err());
+        let stale = scan(At::Auxiliary, None);
+        assert_eq!(stale, found(None, None, Some(head)));
+        assert!(layout::check(stale.declared, stale.any(), Some(layout::LAYOUT)).is_err());
+        // The main decode object runs the regular programs only.
+        assert!(layout::check(stale.declared, stale.regular, None).is_ok());
+        let l = Some(layout::LAYOUT);
+        for at in [At::Regular, At::Auxiliary] {
+            let declared = scan(at, l);
+            assert_eq!(declared.declared, l);
+            assert!(layout::check(l, declared.any(), l).is_ok());
+            assert!(layout::check(l, declared.any(), None).is_err());
+            // The unstamped backbone decode object runs the regular programs only: it takes a
+            // packet whose protected bits are all in auxiliary (speech-object) programs.
+            let main = layout::check(l, declared.regular, None);
+            assert_eq!(main.is_ok(), at == At::Auxiliary);
+        }
+        // No abi.json at all is undeclared.
+        let mut m = tiny_model();
+        m.progs[0].insts[0].op = conv;
+        m.progs[0].insts[0].j[1] = 1 << 21;
+        let raw = m.to_blob();
+        let blob = DevBlob::parse(&raw).unwrap();
+        assert_eq!(
+            blob.speech_flag_layout(&raw).unwrap(),
+            found(None, Some(conv), None)
+        );
+    }
+
+    #[test]
+    fn speech_bits_require_their_minimum_layout_declarations() {
+        for (op, slot, flag) in [
+            (DevOp::LayerNormF32, 2, 8),
+            (DevOp::GemvF32Out, 7, 8192),
+            (DevOp::GemvF32Out, 7, 16384),
+            (DevOp::StreamTailF32, 7, 2),
+            (DevOp::StreamTailF32, 7, 3),
+            (DevOp::AttentionF32, 6, 0x109 | (250 << 16)),
+        ] {
+            for declared in [None, Some(1), Some(2), Some(3)] {
+                let mut m = tiny_model();
+                m.progs[0].insts[0].op = op as u16;
+                m.progs[0].insts[0].i[slot] = flag;
+                let abi = plow_asset::abi::Abi {
+                    version: plow_asset::abi::VERSION,
+                    contract: plow_asset::RUNTIME_CONTRACT_BASE,
+                    speech_flag_layout: declared,
+                    ..Default::default()
+                };
+                let raw = m.to_blob_v6(&[packet::devbuild::SectionData {
+                    kind: packet::devbuild::SECT_METADATA,
+                    name: plow_asset::abi::SECTION.into(),
+                    data: serde_json::to_vec(&abi).unwrap(),
+                }]);
+                let b = DevBlob::parse(&raw).unwrap();
+                let minimum = if matches!(op, DevOp::StreamTailF32 | DevOp::AttentionF32) {
+                    3
+                } else {
+                    2
+                };
+                assert_eq!(
+                    b.speech_flag_layout(&raw).is_ok(),
+                    declared.is_some_and(|d| d >= minimum)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn abi_section_is_checked_at_parse() {
         use plow_asset::abi::{Abi, Bindings, Target};
         let m = tiny_model();
@@ -2004,6 +2209,7 @@ mod tests {
                 tuned_on: Some("H100 SXM5".into()),
             }),
             bindings: Some(derived),
+            speech_flag_layout: None,
         };
         let blob = |abi: &Abi| {
             m.to_blob_v6(&[packet::devbuild::SectionData {

@@ -387,9 +387,15 @@ __device__ void d_flash_prefill_sm90_wgitem(
 
         const int qabs_max = (int)(qp0 + q0 + BQ - 1);
         unsigned eff_lo = lo;
+        /* The unrounded floor: rows below it are masked for every query row of the tile and are
+         * zero-filled by the staging (a ring row under a restored window may be unrestored). */
+        unsigned floor_lo = lo;
         if (window) {
             const long wfloor = (long)qp0 + q0 - (long)window + 1;
-            if (wfloor > (long)lo) eff_lo = ((unsigned)wfloor / BKV) * (unsigned)BKV;
+            if (wfloor > (long)lo) {
+                floor_lo = (unsigned)wfloor;
+                eff_lo = ((unsigned)wfloor / BKV) * (unsigned)BKV;
+            }
         }
         long cap = (long)hi - 1;
         if ((long)qabs_max < cap) cap = (long)qabs_max;
@@ -399,7 +405,7 @@ __device__ void d_flash_prefill_sm90_wgitem(
         auto stageKV = [&](unsigned kv0, int buf) {
             __nv_bfloat16* kd = Ks + (size_t)buf * NSUB * KT;
             __nv_bfloat16* vd = Vs + (size_t)buf * NSUB * KT;
-            const bool full = use_tma && (kv0 + (unsigned)BKV <= hi);
+            const bool full = use_tma && kv0 >= floor_lo && (kv0 + (unsigned)BKV <= hi);
             fa90_tma = (fa90_tma & ~(1u << buf)) | (unsigned(full) << buf);
             if (full) {
                 if (GQA2_PAIR ? tid == 0 : lt == 0) {
@@ -422,7 +428,7 @@ __device__ void d_flash_prefill_sm90_wgitem(
             for (int i = worker; i < BKV * NSUB * 8; i += workers) {
                 const int c = i & 7, sub = (i >> 3) % NSUB, r = i / (8 * NSUB);
                 const unsigned kv = kv0 + (unsigned)r;
-                const bool in = (kv < hi);
+                const bool in = kv >= floor_lo && kv < hi;
                 const size_t row = (size_t)(kv & kv_mask);
                 const int soff = sub * KT + sm90_swz_off<64, 8>(r, c);
                 const size_t goff = in ? row * HD + (size_t)sub * 64 + (size_t)c * 8 : 0;
@@ -755,9 +761,15 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
          * change the flop count; separate commit). */
         const int qabs_max = (int)(qp0 + q0 + BQ - 1);
         unsigned eff_lo = lo;
+        /* The unrounded floor: rows below it are masked for every query row of the tile and are
+         * zero-filled by the staging (a ring row under a restored window may be unrestored). */
+        unsigned floor_lo = lo;
         if (window) {
             const long wfloor = (long)qp0 + q0 - (long)window + 1;
-            if (wfloor > (long)lo) eff_lo = ((unsigned)wfloor / BKV) * (unsigned)BKV;
+            if (wfloor > (long)lo) {
+                floor_lo = (unsigned)wfloor;
+                eff_lo = ((unsigned)wfloor / BKV) * (unsigned)BKV;
+            }
         }
         long cap = (long)hi - 1;
         if ((long)qabs_max < cap) cap = (long)qabs_max;
@@ -776,7 +788,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
         auto stageKV = [&](unsigned kv0, int buf) {
             __nv_bfloat16* kd = Ks + (size_t)buf * NSUB * KT;
             __nv_bfloat16* vd = Vs + (size_t)buf * NSUB * KT;
-            const bool full = use_tma && (kv0 + (unsigned)BKV <= hi);
+            const bool full = use_tma && kv0 >= floor_lo && (kv0 + (unsigned)BKV <= hi);
             fa90_tma = (fa90_tma & ~(1u << buf)) | (unsigned(full) << buf);
             if (full) {
                 if (tid == 0) {
@@ -800,7 +812,7 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
                 /* 32 consecutive threads sweep one KV row's HD*2 contiguous bytes. */
                 const int c = i & 7, sub = (i >> 3) % NSUB, r = i / (8 * NSUB);
                 const unsigned kv = kv0 + (unsigned)r;
-                const bool in = (kv < hi);
+                const bool in = kv >= floor_lo && kv < hi;
                 const size_t row = (size_t)(kv & kv_mask);
                 const int soff = sub * KT + sm90_swz_off<64, 8>(r, c);
                 const size_t goff = in ? row * HD + (size_t)sub * 64 + (size_t)c * 8 : 0;

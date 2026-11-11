@@ -236,6 +236,49 @@ pub struct RuntimeConfig {
     )]
     pub tts_codec_launch_us: usize,
 
+    /// Deadline scheduling of the codec stage: launch order by (band, slack) to each job's first
+    /// audio target (`stream.first_audio_target_ms`) or playback due, and the stream-step launch
+    /// in front of a waiting first audio bounded by that job's slack (OPT_IN, screened).
+    #[arg(long = "tts-codec-sched", env = "PLOW_TTS_CODEC_SCHED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_codec_sched: bool,
+
+    /// Windowed codec streams ramp their chunk after the first audio (1, 2, .. the packet's chunk);
+    /// unset: the codec packet's `stream.chunk_ramp`.
+    #[arg(long = "tts-chunk-ramp", env = "PLOW_TTS_CHUNK_RAMP", value_parser = clap::builder::BoolishValueParser::new(), global = true)]
+    pub tts_chunk_ramp: Option<bool>,
+
+    /// Stateful codec steps launch planned: a decode tick's burst of steps is gathered into one
+    /// launch, and a launch of mixed step lengths splits where padding costs more than a second
+    /// launch, by measured cost (`false`: launch on the first job, pad to the longest; rollback).
+    #[arg(long = "tts-codec-plan", env = "PLOW_TTS_CODEC_PLAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_codec_plan: bool,
+
+    /// Stateful codec streams step early when the audio ahead of playback is under two frame
+    /// periods, instead of waiting for as many new frames as were already emitted (`false`: the
+    /// doubling steps only; A/B).
+    #[arg(long = "tts-stream-deadline", env = "PLOW_TTS_STREAM_DEADLINE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_stream_deadline: bool,
+
+    /// Depth-stage packets may take the packed prefill pass (`false`: every depth prompt prefills
+    /// serially; A/B and operational escape hatch).
+    #[arg(long = "tts-depth-pack", env = "PLOW_TTS_DEPTH_PACK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_depth_pack: bool,
+
+    /// Staged depth programs: `auto` plans each frame's launches over the row capacities the
+    /// packet declares, by measured launch cost; `cover` runs the single smallest program covering
+    /// the highest live row; a capacity list (`16,4`) plans over those capacities only (debugging).
+    #[arg(
+        long = "tts-depth-plan",
+        env = "PLOW_TTS_DEPTH_PLAN",
+        default_value = "auto",
+        global = true
+    )]
+    pub tts_depth_plan: String,
+
+    /// Keep a packet's controlled sampler and state on the GPU between depth frames.
+    #[arg(long = "tts-device-control", env = "PLOW_TTS_DEVICE_CONTROL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_device_control: bool,
+
     /// Apply a speech packet's declared leading-silence trim to streamed replies
     /// (`stream.onset_trim_*`); `false` streams every sample (first-byte latency runs).
     #[arg(long = "tts-onset-trim", env = "PLOW_TTS_ONSET_TRIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -1008,6 +1051,12 @@ pub struct RuntimeConfig {
     /// carries the siblings costs only their program records.
     #[arg(long = "rowband", env = "PLOW_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub rowband: bool,
+    /// Enable packet-declared mapped decode bodies.
+    #[arg(long = "row-decode", env = "PLOW_ROW_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub row_decode: bool,
+    /// Enable packet-declared batched speech delivery.
+    #[arg(long = "tick-delivery", env = "PLOW_TICK_DELIVERY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tick_delivery: bool,
     /// Expert: widest decode rung a serving engine admits; unset = no ceiling.
     #[arg(
         long = "decode-max-rung",
@@ -1028,6 +1077,17 @@ pub struct RuntimeConfig {
     /// per-window decode-tick split (engine call, token emit, handoff, dispatcher).
     #[arg(long = "host-timing", env = "PLOW_HOST_TIMING", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub host_timing: bool,
+
+    /// Seconds between `bucket demand:` log lines (launch rows the packet's capacities pad;
+    /// `obs::bucket`). 0 = no log; the `plowrt_bucket_*` metrics are always on.
+    #[arg(
+        long = "bucket-log-s",
+        env = "PLOW_BUCKET_LOG_S",
+        default_value_t = 300,
+        hide = true,
+        global = true
+    )]
+    pub bucket_log_s: u32,
 
     /// Prefix-cache timing (`PLOW_PFX_LOG=1`).
     #[arg(long = "pfx-log", env = "PLOW_PFX_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

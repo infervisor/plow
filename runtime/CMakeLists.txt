@@ -284,7 +284,7 @@ if(PLOW_CUDA)
     set_target_properties(speech_f32_op_test PROPERTIES CUDA_ARCHITECTURES "90a")
     target_include_directories(speech_f32_op_test PRIVATE nvidia common cpu/dev)
     # sm_90a: the wgmma arms (and their cases) compile only under PLOW_NV_HOPPER.
-    target_compile_definitions(speech_f32_op_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:PLOW_NV_HOPPER=1>)
+    target_compile_definitions(speech_f32_op_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:PLOW_NV_HOPPER=1> $<$<COMPILE_LANGUAGE:CUDA>:PLOW_SPEECH_SPLIT_A=1>)
     target_compile_options(speech_f32_op_test PRIVATE $<$<COMPILE_LANGUAGE:C>:-O2 -ffp-contract=off>)
     target_link_libraries(speech_f32_op_test PRIVATE m)
     add_test(NAME speech_f32_ops COMMAND speech_f32_op_test)
@@ -554,12 +554,14 @@ option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2)
 option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented prefill pairs" OFF)
 option(PLOW_CUBIN_ROUTED_DECODE "Also emit the _routed decode cubin for cuBLASLt-routed MoE rungs" OFF)
 option(PLOW_CUBIN_SPEECH "Also emit the _speech decode cubin carrying the FP32 speech arms (ASR encoder)" OFF)
+option(PLOW_CUBIN_DEVICE_CONTROL "Include optional device sampling and chained codec entrypoints in speech objects" OFF)
 option(PLOW_CUBIN_FP8_TC64_DEPTH2 "Emit a separate depth-2 FP8 TC64 decode cubin" OFF)
 option(PLOW_CUBIN_GEMV_WIDE "Also emit the _gw decode cubin carrying the wide-rung wgmma GEMV (sm_90a)" OFF)
 # Speculative-decode verify/draft launches need the row -> KV slot map (-DPLOW_NV_ROW_SLOT=1); it
 # costs plain decode ~1%, so the decode objects get a `_rs` twin carrying it and plain launches keep
 # the object without it.
 option(PLOW_CUBIN_ROW_SLOT_TWIN "Also emit _rs twins of the decode cubins with PLOW_NV_ROW_SLOT=1" OFF)
+option(PLOW_CUBIN_TOKEN_BATCH_BF16 "Emit a BF16 token-batch decode object" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -656,8 +658,12 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     # the frame: sm_120a speech stack 2112 -> 1080 B, encoder digests unchanged, rtx-5090 packed
     # encoder launch at 10/20 chunks 0.3-0.4% faster.
     set(_ax_speech -DPLOW_NV_SPEECH=1 -DPLOW_NV_MAMBA=0)
+    if(PLOW_CUBIN_DEVICE_CONTROL)
+        list(APPEND _ax_speech -DPLOW_NV_DEVICE_CONTROL=1)
+    endif()
     set(_ax_gw -DPLOW_NV_GW_OBJECT=1)
     set(_ax_rs -DPLOW_NV_ROW_SLOT=1)
+    set(_ax_token_batch_bf16 -DPLOW_NV_TOKEN_BATCH_BF16=1)
     set(_ax_gw_rs ${_ax_gw} ${_ax_rs})
     set(_ax_gw64 ${_ax_gw} -DPLOW_FP8TC_U8=2 -DPLOW_FP8TC_U8G=2)
     if(PLOW_NV_PF_GEMV_HEAD)
@@ -727,6 +733,9 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
         set(_cubin_rows
             "${_vstem}|${_ksym_dec}|_ax_decode|"
             "${_vstem}_pf|${_ksym_pf}|_ax_prefill|")
+        if(PLOW_CUBIN_TOKEN_BATCH_BF16)
+            list(APPEND _cubin_rows "${_vstem}_tb|${_ksym_dec}|_ax_decode|_ax_token_batch_bf16")
+        endif()
         if(PLOW_CUBIN_ROUTED_DECODE)
             string(LENGTH "${_vstem}_routed" _len_routed)
             list(APPEND _cubin_rows

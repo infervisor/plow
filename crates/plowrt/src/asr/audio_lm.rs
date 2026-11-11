@@ -51,6 +51,7 @@ pub(crate) struct PacketAudioEncoder {
     split_rows: Option<PacketTensor>,
     /// Attention window of the packed programs, in rows.
     window_rows: usize,
+    buckets: std::sync::Arc<crate::obs::bucket::BucketDemand>,
 }
 
 /// How features map to encoder rows: fixed-size frame chunks, each producing
@@ -157,7 +158,26 @@ impl PacketAudioEncoder {
             groups,
             split_rows,
             window_rows,
+            buckets: Default::default(),
         })
+    }
+
+    /// Count launches into `buckets`: one utterance's feature frames against the single
+    /// capacities, a packed launch's chunks against the packed ones.
+    pub(crate) fn observe_buckets(
+        &mut self,
+        buckets: &std::sync::Arc<crate::obs::bucket::BucketDemand>,
+    ) {
+        use crate::obs::bucket::Family;
+        let frames = self.single.iter().map(|c| c.0 as usize);
+        buckets.declare(Family::Encoder, frames);
+        buckets.declare(Family::EncoderPack, self.packed.iter().map(|c| c.0));
+        self.buckets = buckets.clone();
+    }
+
+    fn record(&self, family: crate::obs::bucket::Family, rows: usize, capacity: usize) {
+        let us = self.packet.runtime().last_run_us() as u64;
+        self.buckets.record(family, rows, capacity, Some(us));
     }
 
     pub(crate) fn accepts(&self, frames: usize) -> bool {
@@ -249,6 +269,11 @@ impl PacketAudioEncoder {
             (self.valid_rows, &valid_rows_u32.to_le_bytes()[..]),
         ];
         self.launch(&programs, &writes, bytemuck::cast_slice_mut(&mut output))?;
+        self.record(
+            crate::obs::bucket::Family::Encoder,
+            features.frames,
+            capacity,
+        );
         Ok(output)
     }
 
@@ -315,6 +340,7 @@ impl PacketAudioEncoder {
             (split_rows, bytemuck::cast_slice(&reference)),
         ];
         self.launch(&programs, &writes, bytemuck::cast_slice_mut(&mut output))?;
+        self.record(crate::obs::bucket::Family::EncoderPack, total, bucket);
         let width = self.output_width;
         Ok(spans
             .into_iter()
@@ -365,6 +391,7 @@ pub(crate) trait AudioLmExecution: Send {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     fn batch_capacity(&self) -> usize;
     fn max_context(&self) -> usize;
+    fn observe_buckets(&mut self, _buckets: &std::sync::Arc<crate::obs::bucket::BucketDemand>) {}
     fn prefill(&mut self, slot: usize, input: AudioLmPrefill<'_>) -> Result<AudioLmPrefilled>;
     fn decode(
         &mut self,
@@ -601,6 +628,10 @@ impl super::Transcriber for AudioLmAsr {
     }
     fn batch_capacity(&self) -> usize {
         self.execution.batch_capacity()
+    }
+
+    fn observe_buckets(&mut self, buckets: &std::sync::Arc<crate::obs::bucket::BucketDemand>) {
+        self.execution.observe_buckets(buckets)
     }
 
     fn finalization_policy(&self) -> super::FinalizationPolicy {

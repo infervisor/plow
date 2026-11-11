@@ -1127,6 +1127,11 @@ fastconformer RNNT, fish-s2.
   `in.encoder_overlay` handling (`exec/gpu/token_batch.rs`, `ctx_bound.rs`) have no AMD arms.
 - **Speech on CPU**: CPU has `LENGTH_AFFINE_U32`, `REDUCE_ROWS_F32`, `STREAM_TAIL_F32`,
   `TRIM_SILENCE_F32`; missing `CHUNK_ATTENTION_F32`, `RMSNORM_F32`, `ROPE_AXIAL_F32`.
+- **Batched F16 speech projections**: Hopper has a shared-memory K ring and WGMMA
+  `GemvF32Out` route for F32 inputs and F16 weights, with fixed K16 accumulation across
+  32- and 64-row tiles. Packets can materialize `LayerNormF32` once per row before the
+  projection. Other CUDA ISAs retain the row-chunked MMA route; AMD and CPU numerical
+  and performance qualification remain absent. The packet uses existing ops and flags.
 - **ECAPA speaker packets**: lowering uses existing convolution, unary, binary, copy, gather
   and reduction ops on CUDA and the scalar CPU tier, including explicit BF16 rounding.
   Versioned arithmetic tables can additionally lower pointwise BF16 partials and serial or

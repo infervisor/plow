@@ -733,6 +733,7 @@ pub mod kv_contract;
 pub mod kv_image;
 pub mod live_kv;
 pub mod mixed_step;
+pub mod row_decode;
 
 pub mod fp8_m1_role;
 
@@ -743,6 +744,7 @@ pub mod object_requirements;
 pub mod packed_prefill;
 pub mod spec_context;
 pub mod spec_draft;
+pub mod speech_flag_layout;
 
 pub mod fish_depth;
 pub mod kv_ring;

@@ -3170,6 +3170,61 @@ pub(super) fn check_fp8_weight_arms(syms: &[&str], path: &Path, need: Option<Dev
     )))
 }
 
+/// The GEMV-family ops whose bodies instantiate `gemv_rows_*<PLOW_GEMV_MM>` OUTSIDE
+/// `gemv_walk` (op_gemm_common.h: `d_gemv_fp8[_nrn]`, `d_gemv_qkv_fp8`, `d_gemv_glu_fp8[_nrn]`,
+/// `d_gemv_glu_mxfp4`). For them the bucket is a hard capacity on EVERY object, walking or
+/// not: the row loop runs `m < MM` with `live = m < M`, so rows `MM..M` are never written.
+/// The bf16 bodies and `d_gemv_qkv_mxfp4` walk; `d_gemv_fp8_blk` and `d_gemv_mxfp4` carry
+/// their own outer loop over `M`.
+pub(super) const GEMV_NO_WALK_OPS: &[DevOp] = &[
+    DevOp::GemvFp8,
+    DevOp::GemvQkvFp8,
+    DevOp::GemvGluFp8,
+    DevOp::GemvGluMxfp4,
+];
+
+/// Refuse an object whose compiled row bucket is narrower than the widest
+/// [`GEMV_NO_WALK_OPS`] instruction in `progs`, walk marker or not.
+///
+/// [`check_gemv_capacity`] lets `plow_gemv_walk_1` stand in for capacity, which is right for
+/// the bodies `gemv_walk` wraps and wrong for these: a walking MM=4 object handed a fused fp8
+/// GLU at M=8 writes rows 0..3 and completes with rows 4..7 STALE (the loader's staging check
+/// catches only the `M*K > arena` half of that). Per-op, not a blanket WALK refusal: the same
+/// object still serves every walking op at any M. `need <= 1` never refuses (MM >= 1).
+pub(super) fn check_fused_gemv_capacity<'a>(
+    syms: &[&str],
+    path: &Path,
+    progs: impl IntoIterator<Item = &'a DevProg>,
+) -> Result<()> {
+    let need = progs
+        .into_iter()
+        .flat_map(|p| p.insts.iter())
+        .filter(|i| GEMV_NO_WALK_OPS.iter().any(|&o| o as u16 == i.op))
+        .map(|i| i.i[0])
+        .max()
+        .unwrap_or(0);
+    if need <= 1 {
+        return Ok(());
+    }
+    match object_gemv_cap(syms) {
+        Some(cap) if cap >= need => Ok(()),
+        cap => Err(RuntimeError::Device(format!(
+            "packet/object GEMV MISMATCH: a fused fp8/mxfp4 GEMV in this packet asks for M={need} \
+             rows, but {} {}. These bodies (`d_gemv_fp8`, `d_gemv_qkv_fp8`, `d_gemv_glu_fp8`, \
+             `d_gemv_glu_mxfp4`) run outside `gemv_walk`, so the bucket is a \
+             hard capacity even on a `{GEMV_WALK_SYM}` object: rows {}..{need} would never be \
+             written. Rebuild the object at PLOW_GEMV_MM >= {need} or serve a packet emitted at \
+             a smaller decode batch.",
+            path.display(),
+            match cap {
+                Some(cap) => format!("was compiled PLOW_GEMV_MM={cap}"),
+                None => format!("carries no `{GEMV_CAP_SYM_PREFIX}<N>` symbol"),
+            },
+            cap.unwrap_or(1)
+        ))),
+    }
+}
+
 /// The `PLOW_GEMV_MM` an object advertises, or `None` when it advertises
 /// nothing (built before the marker existed, or unparseable).
 pub(super) fn object_gemv_cap(syms: &[&str]) -> Option<u32> {

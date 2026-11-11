@@ -102,6 +102,7 @@ mod projection_rewrite;
 mod residual_precision;
 mod rewrite_lower;
 pub mod rnnt;
+mod row_decode;
 pub mod s3gen;
 pub mod segment_resource;
 pub mod speaker_encoder;
@@ -539,6 +540,37 @@ thread_local! {
 
 pub(crate) fn emit_is_apple() -> bool {
     EMIT_IS_APPLE.with(|c| c.get())
+}
+
+/// `PLOW_FUSE_KV_HNR` (HeadNormRope `i[7] = 1`: the K op also writes the V cache from t7) has a
+/// device arm only in the NVIDIA interpreters (interp_sm120.cu, included by sm89/sm90a). The
+/// AMD, Metal and CPU-golden ops never read `i[7]`, so an emit for them keeps the separate V
+/// writer.
+pub(crate) fn fuse_kv_hnr_target_supported() -> bool {
+    !emit_is_amd() && !emit_is_apple() && !EMIT_IS_CPU.with(|c| c.get())
+}
+
+thread_local! {
+    static EMIT_IS_CPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scoped "the target is the plowrt CPU engine" flag ([`target_is_cpu`]). A CPU target takes the
+/// NVIDIA emit decisions, so neither of the other two guards marks it.
+struct EmitCpuGuard {
+    prev: bool,
+}
+
+impl EmitCpuGuard {
+    fn set(cpu: bool) -> Self {
+        let prev = EMIT_IS_CPU.with(|c| c.replace(cpu));
+        Self { prev }
+    }
+}
+
+impl Drop for EmitCpuGuard {
+    fn drop(&mut self) {
+        EMIT_IS_CPU.with(|c| c.set(self.prev));
+    }
 }
 
 /// Scoped "the target is an Apple GPU (metal3)" flag, as [`EmitAmdGuard`] for AMD.
@@ -4256,6 +4288,7 @@ fn emit_xreduce_gather(
 enum Mode {
     Prefill,
     Decode,
+    RowDecode,
     /// Decode shape, prefill kernels: tiled GEMM + FlashPrefill at one query row. Targets long
     /// context, where GEMV does not scale with batch (its split is over N, not M) and FlashDecode
     /// caps at n_cu. **Requires prefill opcodes in the interpreter** — the sm_120 build traps on
@@ -4266,11 +4299,11 @@ enum Mode {
 impl Mode {
     /// One query row, KV append + ring mask, decode's nsplit and one-shot all-reduce.
     fn decode_shape(self) -> bool {
-        matches!(self, Mode::Decode | Mode::DecodeTiled)
+        matches!(self, Mode::Decode | Mode::DecodeTiled | Mode::RowDecode)
     }
     /// The GEMV opcode family and every fusion that exists only to serve it, plus flash-decode.
     fn gemv(self) -> bool {
-        self == Mode::Decode
+        matches!(self, Mode::Decode | Mode::RowDecode)
     }
 }
 
@@ -4387,6 +4420,8 @@ fn emit_phase(
     // now one or the other: `decode` for shape, `gemv_family` for kernel family. (Not `gemv` —
     // the `hn_dep` closure below already binds a `gemv: u32` parameter that would shadow it.)
     let decode = mode.decode_shape();
+    let row_decode = mode == Mode::RowDecode;
+    let input_decode = decode && !row_decode;
     let gemv_family = mode.gemv();
     let fp8_lt_decode = gemv_family && fp8 && emit_config::active().decode_cublaslt_at(t);
     // The mixed AMD object has one GEMM tile, shared with its four-wave attention body.
@@ -4501,7 +4536,7 @@ fn emit_phase(
     let emit_frame = |b: &mut Builder, f: &FrameEmbed| {
         assert!(escale == 1.0, "a frame embedding has its own divisor");
         b.emit(DevOp::EmbedFrameBf16, rows.clone(), &[], |d| {
-            let codes = if decode {
+            let codes = if input_decode {
                 n.frame_dcodes
             } else {
                 n.frame_codes
@@ -4509,7 +4544,7 @@ fn emit_phase(
             // Maya 2: every decode row is a frame (token row dropped); prefill frame rows are the
             // reference's, marked by their token.
             let norm = if f.norm.is_some() { 2 } else { 0 };
-            let (lo, frame_rows, mode) = match (f.decode_only, decode) {
+            let (lo, frame_rows, mode) = match (f.decode_only, input_decode) {
                 (false, _) => (f.lo, f.rows, 0),
                 (true, false) => (f.lo, f.rows, 1 | norm),
                 (true, true) => (0, c.vocab, 1 | norm),
@@ -4534,7 +4569,7 @@ fn emit_phase(
     // layer's RmsNorm reads `act.x` directly (its dep is `&[]`; see below).
     let mut dep = if block_mode {
         0u32
-    } else if !decode && c.encoder_overlay_rows > 0 {
+    } else if !input_decode && c.encoder_overlay_rows > 0 {
         // A frame-embedding prompt embeds its frame rows first; their overlay index keeps them.
         let frame: Vec<u32> = c.frame.iter().map(|f| emit_frame(b, f)).collect();
         b.emit(DevOp::EmbedOverlayBf16, rows.clone(), &frame, |d| {
@@ -5827,6 +5862,7 @@ fn emit_phase(
         // whose split holds the new row writes k/v into the cache first. One item per KV head
         // (gqa == GF) and pos[]-addressed writes (n_batch_kv armed) are kernel preconditions.
         let hnr_fold = decode
+            && !row_decode
             && fuse_qkv
             && l < n.hnrd.len()
             && emit_config::active()
@@ -5881,6 +5917,9 @@ fn emit_phase(
             !span_kv || (fp8_kv && gemv_family && !fuse_hnr && !shared),
             "PLOW_EMIT_SPAN_VERIFY needs the FP8-KV GEMV decode family"
         );
+        // The fused-V arm (`i[7] = 1`, t6/t7) exists only in interp_sm120.cu, which the sm89
+        // and sm90a interpreters include; the AMD, Metal and CPU-golden HeadNormRope ignore
+        // i[7], so there the V cache would never be written.
         let fuse_kv = decode
             && !fuse_hnr
             && !shared
@@ -5888,7 +5927,8 @@ fn emit_phase(
             && (fuse_qkv || fuse_qkv_fp8)
             && c_k == c_v
             && qk_skip == v_skip
-            && emit_config::active().fuse_kv_hnr;
+            && emit_config::active().fuse_kv_hnr
+            && fuse_kv_hnr_target_supported();
         let c_kn = if fuse_hnr || shared || hnr_fold {
             0
         } else {
@@ -5995,7 +6035,7 @@ fn emit_phase(
             if shared {
                 return vec![Dep::Coarse(c_qn)];
             }
-            if !gemv_family {
+            if !gemv_family || row_decode {
                 return vec![Dep::Coarse(c_qn), Dep::Coarse(c_kn), Dep::Coarse(c_vn)];
             }
             let nblk_f = all.len() as u32;
@@ -6025,7 +6065,7 @@ fn emit_phase(
             // Span mode: rows of one sequence read each other's K/V rows written in this launch,
             // so the K/V edges wait for every row's store (all heads' items, scales included).
             let kv_edge = |producer: u32| {
-                if span_kv {
+                if span_kv || row_decode {
                     Dep::Coarse(producer)
                 } else {
                     Dep::Fine {
@@ -6054,7 +6094,7 @@ fn emit_phase(
         // just re-points its dep at the flash op with no threshold change.
         let fuse_merge = fuse_hnr && n.mrgc != TENSOR_NONE;
         // See nv_decode_merge_fold: flash writes `n.at` itself, j[1] = at | mrgc << 16.
-        let dec_fused = nv_fold;
+        let dec_fused = nv_fold && !row_decode;
         let mut c_fa = if fuse_hnr {
             // NRF fold packet: flash depends on the three RAW projections directly (the hnr
             // level is gone). Operands per the exec's unpacking map; kv_rows gets nothing —
@@ -6189,6 +6229,9 @@ fn emit_phase(
                 // only for B>1 so the B=1 packet stays byte-identical (j[0] default 0 => no check).
                 if t > 1 {
                     d.j[0] = t * kvh * kvr;
+                }
+                if row_decode {
+                    d.j[0] = n.rowslot_rows * kvh * kvr;
                 }
                 if span_kv {
                     // A row's slot is any engine slot, not a row of this rung.
@@ -10796,6 +10839,7 @@ fn emit_dense_gqa(
     // Same no-target rule as run_verified's guard: legacy (golden) emission stays AMD.
     let _emit_target = EmitAmdGuard::set(amd || (arch.is_empty() && gpu.is_empty()));
     let _apple_target = EmitAppleGuard::set(arch == "metal3");
+    let _cpu_target = EmitCpuGuard::set(target_is_cpu(&arch, &gpu));
     // Same reason as the other entry: the tile selector must cost against THIS part, and
     // `--arch` is the fallback when --gpu cannot answer.
     if amd {
@@ -11228,6 +11272,24 @@ fn emit_dense_gqa(
             t
         });
     }
+    if ecfg.row_decode_object.is_some() {
+        assert!(
+            !amd && !fp8 && !w8a8 && !fp8_kv && !c.moe && c.tp == 1,
+            "row-decode bodies require single-GPU dense BF16"
+        );
+        for &rows in &rungs {
+            let mut body = Builder::new(n_cu);
+            body.adopt_tensors(tensors.clone());
+            body.force_uniseg();
+            let mut unused = Vec::new();
+            emit_config::rung::with_rung(emit_config::rung::Rung::decode(rows), || {
+                emitter.emit_decode(&mut body, rows, Mode::RowDecode, &mut unused)
+            });
+            shared_tail_marks.push(body.shared_tail_mark());
+            progs.push(body.finish());
+            tlist.push(packet::devbuild::row_decode_program_t(rows));
+        }
+    }
     let mut kv_rows = Vec::new();
     // `dbatch` is the SAME clamped(1,32) value used by declare() above — emission and
     // allocation must agree, so we reuse it here rather than re-reading the env (an unclamped
@@ -11433,7 +11495,7 @@ fn emit_dense_gqa(
         );
         sections.push(
             tts::speech_pipeline_section(
-                &m,
+                &mut m,
                 pipeline::CausalPipelineSpec {
                     name: "speech",
                     max_context: ctx,
@@ -11643,14 +11705,22 @@ fn emit_dense_gqa(
     }
     // Speech ops of auxiliary programs (not in `m.progs`), for the speech object's arm mask.
     let mut aux_speech = manifest::SpeechMasks::default();
-    if c.frame
-        .as_ref()
-        .and_then(|f| f.depth.as_ref())
-        .is_some_and(|d| d.maya2.is_some())
+    if !block_mode
+        && c.frame
+            .as_ref()
+            .and_then(|f| f.depth.as_ref())
+            .is_some_and(|d| d.maya2.is_some())
     {
         let n = &emitter.tn;
-        let (depth, speech) =
-            maya2_depth::lm_sections(&mut m, &c, n.hn, n.frame_dcodes, n.frame_codes, &rungs);
+        let (depth, speech) = maya2_depth::lm_sections(
+            &mut m,
+            &c,
+            n.hn,
+            n.frame_dcodes,
+            n.frame_codes,
+            &rungs,
+            arch == "sm_90a",
+        );
         sections.extend(depth);
         aux_speech.add(speech);
     }
@@ -11692,6 +11762,7 @@ fn emit_dense_gqa(
         let max_rows = m.prog_t[..packet::devbuild::decode_rung_lo(&m.prog_t)]
             .iter()
             .copied()
+            .filter(|&rows| !packet::devbuild::is_row_decode_program(rows))
             .max()
             .expect("prefill buckets");
         let batch = *m.prog_t.last().unwrap();
@@ -11768,7 +11839,8 @@ fn emit_dense_gqa(
             }
             Err(error)
                 if (ecfg.emit_packed_prefill.is_none() || ecfg.packed_prefill_fp8kv_default)
-                    && ecfg.max_request_chunk.is_none() =>
+                    && ecfg.max_request_chunk.is_none()
+                    && ecfg.row_decode_object.is_none() =>
             {
                 m.tensors.truncate(packed_tensor_base);
                 eprintln!("  packed prefill not selected: {error}");
@@ -11814,6 +11886,14 @@ fn emit_dense_gqa(
         )
     }
     .unwrap_or_else(|error| panic!("decode objects: {error}"));
+    row_decode::append(
+        &m,
+        &mut sections,
+        ecfg.row_decode_object.as_deref(),
+        &arch,
+        std::path::Path::new(&out),
+    )
+    .unwrap_or_else(|error| panic!("row-decode objects: {error}"));
     if fp8 && !ecfg.w8a8 && c.arch == Arch::Gemma4 {
         w8a16_prefill_role::apply_output_object(
             &m,
@@ -12039,6 +12119,10 @@ fn emit_dense_gqa(
     std::fs::write(&out, blob).unwrap();
     let mut speech = aux_speech;
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
+        assert!(
+            !ecfg.codec_ring_kv || arch == "sm_90a",
+            "codec ring KV needs sm_90a"
+        );
         let sites = whole_graph_audio_sites().0;
         let fish = std::fs::read(dir.join("config.json"))
             .ok()
@@ -12094,8 +12178,20 @@ fn emit_dense_gqa(
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().1;
-        let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites, ecfg.s3gen_attn_h16)
-            .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
+        // The split-image GEMM arm exists only in the sm_90a speech object (PLOW_NV_HOPPER).
+        assert!(
+            !ecfg.s3gen_split_a || arch == "sm_90a",
+            "s3gen packet: PLOW_EMIT_S3GEN_SPLIT_A needs the sm_90a speech object, not {arch}"
+        );
+        let (model, section) = s3gen::lower_s3gen(
+            dir,
+            n_cu,
+            m.target,
+            sites,
+            ecfg.s3gen_attn_h16,
+            ecfg.s3gen_split_a,
+        )
+        .unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
         speech.add(manifest::SpeechMasks::of(&model));
         write_sidecar_packet(&path, &model, &[section]);
@@ -12171,7 +12267,11 @@ fn emit_dense_gqa(
         if speech.ops != 0 {
             man["speech_ops"] = speech.ops.into();
             man["speech_conv_posts"] = speech.conv_posts.into();
+            man["speech_split_a"] = speech.split_a.into();
             man["speech_conv_wide_padded"] = speech.conv_wide_padded.into();
+            if speech.ring_kv {
+                man["speech_ring_kv"] = true.into();
+            }
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes

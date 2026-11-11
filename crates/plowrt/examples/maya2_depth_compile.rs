@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::path::Path::new(&args[1]),
         args[3].parse()?,
         packet::devbuild::gpu_fingerprint(&args[2]),
+        hwspec::registry::lookup(&args[2]).is_some_and(|gpu| gpu.arch == hwspec::Arch::Hopper),
     )?;
     devgen::write_sidecar_packet(std::path::Path::new(&args[4]), &model, &[section]);
     Ok(())

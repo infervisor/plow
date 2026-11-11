@@ -489,6 +489,28 @@ impl ServeEngine {
         }
     }
 
+    /// Count the engine's launches into the model's bucket-demand counters; `true` when the
+    /// engine counts its own decode launches (the dispatcher then adds only their time).
+    pub fn observe_buckets(&mut self, buckets: &Arc<crate::obs::bucket::BucketDemand>) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => {
+                e.observe_buckets(Arc::clone(buckets));
+                true
+            }
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => {
+                e.observe_buckets(Arc::clone(buckets));
+                false
+            }
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = buckets;
+                false
+            }
+        }
+    }
+
     /// Packed prefill launch widths `(per-request cap, widest launch)`; `None` without packed
     /// CUDA prefill.
     pub fn pf_launch_rungs(&self) -> Option<(usize, usize)> {
@@ -827,6 +849,13 @@ mod amd_serve {
             }
         }
 
+        fn dsa_pool_align(&self) -> u32 {
+            match self {
+                Self::One(e) => e.dsa_pool_align(),
+                Self::Tp(g) => g.dsa_pool_align(),
+            }
+        }
+
         fn plan_span_at_most(
             &self,
             from: u32,
@@ -1135,6 +1164,9 @@ mod amd_serve {
         prefix_cache: bool,
         /// Per-slot snapshots can move between slots ([`Self::adopt_prefix`]).
         prefix_clone: bool,
+        /// Row alignment every snapshot and arm keeps: the packet's DSA key-pool size, else 1
+        /// (`AmdEngine::dsa_pool_align`; see `prefix_plan`).
+        prefix_align: u32,
         cached_prompt: Vec<Vec<u32>>,
         snap_at: Vec<u32>,
         /// Under an end arm (`PLOW_PREFIX_ARM_END`) the snapshot sits after the prompt's last
@@ -1768,6 +1800,12 @@ mod amd_serve {
         a.iter().zip(b).take_while(|(x, y)| x == y).count()
     }
 
+    /// `align`: the packet's DSA key-pool size (1 without one). `DsaPoolCompress` files a
+    /// chunk's rows under `chunk_base / pool_size` (op_dsa_pool.h), so a chunk that starts at a
+    /// row that is not a multiple of the pool size puts its leading rows in the PREVIOUS pool's
+    /// slot. Every arm is therefore rounded down to the alignment, and a snapshot that sits
+    /// unaligned (taken before this rule) is a miss: it is never rounded down, because the
+    /// carried recurrent state was snapshotted at `snap` and cannot rewind.
     fn prefix_plan(
         cached: &[u32],
         snap: u32,
@@ -1775,28 +1813,28 @@ mod amd_serve {
         prompt: &[u32],
         arm_end: bool,
         end_hit: bool,
+        align: u32,
     ) -> (u32, u32) {
+        let align = align.max(1);
         let cap = prompt.len().saturating_sub(1) as u32;
         let full = common_prefix_len(cached, prompt) as u32;
         let lcp = full.min(cap);
         // `end_hit`: the snapshot is an end arm with its first token kept, so a prompt equal to
         // `cached[..snap]` resumes at its last row and runs no chunk.
         let whole = end_hit && snap as usize == prompt.len() && full == snap;
-        if armed && snap > 0 && (snap <= lcp || whole) {
+        if armed && snap > 0 && snap % align == 0 && (snap <= lcp || whole) {
             (snap, 0)
         } else if cap >= MIN_PREFIX {
-            (
-                0,
-                // Under an end arm, a prompt the cached one covers up to its last token is a
-                // re-send: it runs cold and unsplit again, so a repeat streams what the first did.
-                if lcp >= MIN_PREFIX && !(arm_end && lcp == cap) {
-                    lcp
-                } else if arm_end {
-                    prompt.len() as u32
-                } else {
-                    cap / 32 * 32
-                },
-            )
+            // Under an end arm, a prompt the cached one covers up to its last token is a
+            // re-send: it runs cold and unsplit again, so a repeat streams what the first did.
+            let arm = if lcp >= MIN_PREFIX && !(arm_end && lcp == cap) {
+                lcp
+            } else if arm_end {
+                prompt.len() as u32
+            } else {
+                cap / 32 * 32
+            };
+            (0, arm / align * align)
         } else {
             (0, 0)
         }
@@ -1855,6 +1893,13 @@ mod amd_serve {
     }
 
     impl AmdServe {
+        /// Count a single-rank engine's prefill launches into `buckets` (a TP group counts none).
+        pub fn observe_buckets(&mut self, buckets: Arc<crate::obs::bucket::BucketDemand>) {
+            if let Ranks::One(e) = &mut self.ranks {
+                e.observe_buckets(buckets);
+            }
+        }
+
         /// Bring up every rank of `blob`.
         ///
         /// The TP degree is read off the PACKET (`DevBlob::tp`), not off a host
@@ -1995,6 +2040,7 @@ mod amd_serve {
                 && ranks.prefix_cache_capable()
                 && has_prefill;
             let prefix_clone = prefix_cache && ranks.prefix_clone_capable();
+            let prefix_align = ranks.dsa_pool_align();
             tracing::info!(
                 requested = crate::config::RuntimeConfig::get().prefix_cache,
                 selected = prefix_cache,
@@ -2054,6 +2100,7 @@ mod amd_serve {
                 max_ctx,
                 prefix_cache,
                 prefix_clone,
+                prefix_align,
                 cached_prompt: vec![Vec::new(); batch],
                 snap_at: vec![0; batch],
                 end_tok: vec![None; batch],
@@ -2436,6 +2483,7 @@ mod amd_serve {
                 prompt,
                 crate::config::RuntimeConfig::get().prefix_arm_end,
                 end_resume && self.end_tok[slot].is_some(),
+                self.prefix_align,
             )
         }
 
@@ -5260,80 +5308,129 @@ mod amd_serve {
             ));
         }
 
+        /// A DSA packet (key pool 4) snapshots and arms only on pool boundaries, and a snapshot
+        /// that already sits off one is a miss rather than a rounded-down resume: the carried
+        /// state was taken at that row. Residues 0..4 of a 4096-row prompt all arm at 4096.
+        #[test]
+        fn prefix_plan_keeps_arms_on_the_dsa_pool_and_never_rounds_a_resume_down() {
+            let p: Vec<u32> = (0..4098).collect();
+            let next: Vec<u32> = (0..4104).collect();
+            // Cold end arm over 4098 rows: the arm lands on 4096, the straddlers run as a tail.
+            assert_eq!(
+                super::prefix_plan(&[], 0, false, &p, true, false, 4),
+                (0, 4096)
+            );
+            // A legacy snapshot at 4098 never resumes there; the prompt re-arms aligned.
+            assert_eq!(
+                super::prefix_plan(&p, 4098, true, &next, true, false, 4),
+                (0, 4096)
+            );
+            assert_eq!(
+                super::prefix_plan(&p, 4098, true, &p, true, true, 4),
+                (0, 4096)
+            );
+            // The aligned snapshot resumes, including a whole-prompt end hit.
+            assert_eq!(
+                super::prefix_plan(&p, 4096, true, &next, true, false, 4),
+                (4096, 0)
+            );
+            let q: Vec<u32> = (0..4096).collect();
+            assert_eq!(
+                super::prefix_plan(&q, 4096, true, &q, true, true, 4),
+                (4096, 0)
+            );
+            for r in 0..4u32 {
+                let pr: Vec<u32> = (0..4096 + r).collect();
+                assert_eq!(
+                    super::prefix_plan(&[], 0, false, &pr, true, false, 4),
+                    (0, 4096)
+                );
+                assert_eq!(
+                    super::prefix_plan(&[], 0, false, &pr, false, false, 4),
+                    (0, (4095 + r) / 32 * 32)
+                );
+            }
+            // Alignment 1 is the identity on the end arm.
+            assert_eq!(
+                super::prefix_plan(&[], 0, false, &p, true, false, 1),
+                (0, 4098)
+            );
+        }
+
         #[test]
         fn prefix_admission_preserves_replay_row_and_rejects_evicted_or_changed_state() {
             let prompt: Vec<u32> = (0..1024).collect();
             assert_eq!(
-                super::prefix_plan(&[], 0, false, &prompt, false, false),
+                super::prefix_plan(&[], 0, false, &prompt, false, false, 1),
                 (0, 992)
             );
             assert_eq!(
-                super::prefix_plan(&prompt, 992, true, &prompt, false, false),
+                super::prefix_plan(&prompt, 992, true, &prompt, false, false, 1),
                 (992, 0)
             );
             assert_eq!(
-                super::prefix_plan(&prompt, 992, false, &prompt, false, false),
+                super::prefix_plan(&prompt, 992, false, &prompt, false, false, 1),
                 (0, 1023)
             );
             let mut changed = prompt.clone();
             changed[0] = 9999;
             assert_eq!(
-                super::prefix_plan(&prompt, 992, true, &changed, false, false),
+                super::prefix_plan(&prompt, 992, true, &changed, false, false, 1),
                 (0, 992)
             );
             assert_eq!(
-                super::prefix_plan(&prompt, 992, true, &prompt[..128], false, false),
+                super::prefix_plan(&prompt, 992, true, &prompt[..128], false, false, 1),
                 (0, 0)
             );
             assert_eq!(
-                super::prefix_plan(&[], 0, false, &prompt[..1], false, false),
+                super::prefix_plan(&[], 0, false, &prompt[..1], false, false, 1),
                 (0, 0)
             );
             assert_eq!(
-                super::prefix_plan(&[], 0, false, &prompt, true, false),
+                super::prefix_plan(&[], 0, false, &prompt, true, false, 1),
                 (0, 1024)
             );
             let next: Vec<u32> = (0..1030).collect();
             assert_eq!(
-                super::prefix_plan(&prompt, 1024, true, &next, true, false),
+                super::prefix_plan(&prompt, 1024, true, &next, true, false, 1),
                 (1024, 0)
             );
             assert_eq!(
-                super::prefix_plan(&prompt, 1024, true, &prompt, true, false),
+                super::prefix_plan(&prompt, 1024, true, &prompt, true, false, 1),
                 (0, 1024)
             );
             assert_eq!(
-                super::prefix_plan(&next, 1030, true, &prompt, true, false),
+                super::prefix_plan(&next, 1030, true, &prompt, true, false, 1),
                 (0, 1024)
             );
             assert_eq!(
-                super::prefix_plan(&next, 1030, true, &next[..600], true, false),
+                super::prefix_plan(&next, 1030, true, &next[..600], true, false, 1),
                 (0, 600)
             );
             // An end arm that kept its first token: the identical prompt resumes at its end, a
             // continuation still resumes there, a shorter prefix still runs cold.
             assert_eq!(
-                super::prefix_plan(&prompt, 1024, true, &prompt, true, true),
+                super::prefix_plan(&prompt, 1024, true, &prompt, true, true, 1),
                 (1024, 0)
             );
             assert_eq!(
-                super::prefix_plan(&prompt, 1024, true, &next, true, true),
+                super::prefix_plan(&prompt, 1024, true, &next, true, true, 1),
                 (1024, 0)
             );
             assert_eq!(
-                super::prefix_plan(&next, 1024, true, &prompt, true, true),
+                super::prefix_plan(&next, 1024, true, &prompt, true, true, 1),
                 (1024, 0)
             );
             assert_eq!(
-                super::prefix_plan(&prompt, 1024, false, &prompt, true, true),
+                super::prefix_plan(&prompt, 1024, false, &prompt, true, true, 1),
                 (0, 1024)
             );
             assert_eq!(
-                super::prefix_plan(&prompt, 1024, true, &prompt[..1000], true, true),
+                super::prefix_plan(&prompt, 1024, true, &prompt[..1000], true, true, 1),
                 (0, 1000)
             );
             assert_eq!(
-                super::prefix_plan(&prompt, 1024, true, &changed, true, true),
+                super::prefix_plan(&prompt, 1024, true, &changed, true, true, 1),
                 (0, 1024)
             );
         }

@@ -27,6 +27,7 @@ shift 4
 # the caller). NVCC_PREPEND_FLAGS/NVCC_APPEND_FLAGS pass through for the same
 # reason: nix's nvcc gets its -ccbin that way, and `env -i` would strip it.
 CLEAN=(env -i PATH="${PLOW_NVCC_PATH:-/usr/local/cuda/bin:/usr/bin:/bin}")
+[ -n "${TMPDIR:-}" ] && CLEAN+=(TMPDIR="$TMPDIR")
 [ -n "${NVCC_PREPEND_FLAGS:-}" ] && CLEAN+=(NVCC_PREPEND_FLAGS="$NVCC_PREPEND_FLAGS")
 [ -n "${NVCC_APPEND_FLAGS:-}" ] && CLEAN+=(NVCC_APPEND_FLAGS="$NVCC_APPEND_FLAGS")
 CUOBJDUMP="$(dirname "$NVCC")/cuobjdump"

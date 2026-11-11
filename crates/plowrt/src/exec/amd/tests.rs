@@ -4861,6 +4861,52 @@ fn the_walk_marker_lifts_the_capacity_refusal() {
     assert!(check_gemv_capacity(&[], p, 2).is_err());
 }
 
+/// The walk marker lifts the capacity refusal only for the bodies `gemv_walk` wraps. The fused
+/// fp8/mxfp4 bodies run `gemv_rows_*<MM>` directly, so an MM=4 walking object must still refuse
+/// their M=8 — and keep serving a walking `GemvGlu` at M=8 beside them.
+#[test]
+fn fused_fp8_gemvs_keep_the_capacity_refusal_under_the_walk_marker() {
+    let p = Path::new("/tmp/interp_decode.elf");
+    let walk4 = ["plow_gemv_mm_cap_4", GEMV_WALK_SYM];
+    let prog = |op: DevOp, m: u32| DevProg {
+        t: m,
+        insts: vec![DevInst64 {
+            op: op as u16,
+            i: [m, 0, 4096, 0, 0, 0, 0, 0],
+            ..Default::default()
+        }],
+        ..gate_hier_probe(0, 0)
+    };
+    for &op in GEMV_NO_WALK_OPS {
+        assert!(
+            check_fused_gemv_capacity(&walk4, p, [&prog(op, 4)]).is_ok(),
+            "{op:?} M=4 fits MM=4"
+        );
+        assert!(
+            check_fused_gemv_capacity(&walk4, p, [&prog(op, 8)]).is_err(),
+            "{op:?} M=8 on a walking MM=4 object leaves rows 4..7 stale"
+        );
+        assert!(
+            check_fused_gemv_capacity(&[], p, [&prog(op, 1)]).is_ok(),
+            "{op:?} M=1 never refuses"
+        );
+        assert!(
+            check_fused_gemv_capacity(&[GEMV_WALK_SYM], p, [&prog(op, 2)]).is_err(),
+            "{op:?}: an unmarked capacity is not consent"
+        );
+    }
+    // The walking bf16 GLU keeps the blanket acceptance beside them.
+    assert!(check_fused_gemv_capacity(&walk4, p, [&prog(DevOp::GemvGlu, 8)]).is_ok());
+    assert!(check_gemv_capacity(&walk4, p, 8).is_ok());
+    // A tier only sees the rungs it serves: the widest fused M over the given programs.
+    assert!(check_fused_gemv_capacity(
+        &walk4,
+        p,
+        [&prog(DevOp::GemvGluFp8, 1), &prog(DevOp::GemvGluFp8, 4)]
+    )
+    .is_ok());
+}
+
 #[test]
 fn fused_qkv_walk_hint_requires_the_exact_object_width() {
     let path = Path::new("/tmp/interp_decode.elf");
@@ -5696,6 +5742,36 @@ fn dsa_pool_tail_seed_shrinks_compress_and_rebases_exactly_the_real_remainder() 
          genuine trailing write for the same ring slot (pos % pool_size repeats every \
          pool_size rows) and clobber it with stale already-cached data"
     );
+}
+
+/// A chunk resumed from an end-armed prefix snapshot at 4098 rows (pool 4) would file rows
+/// 4098..4101 under pool 1024, which holds 4096..4099: only the aligned base passes, at every
+/// residue. The packed form addresses rows through the span table and is exempt.
+#[test]
+fn dsa_pool_chunk_base_must_sit_on_a_pool_boundary() {
+    use crate::exec::kvrow::dsa_pool_chunk_base_aligned;
+    const POOL_SIZE: u32 = 4;
+    let compress = DevInst64 {
+        op: DevOp::DsaPoolCompress as u16,
+        i: [128 / POOL_SIZE, POOL_SIZE, 128, 0, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    for c0 in 4096..4096 + POOL_SIZE {
+        let want = if c0 % POOL_SIZE == 0 {
+            Ok(())
+        } else {
+            Err(POOL_SIZE)
+        };
+        assert_eq!(
+            dsa_pool_chunk_base_aligned(&[compress], c0),
+            want,
+            "c0 {c0}"
+        );
+    }
+    let mut packed = compress;
+    packed.i[6] = 1;
+    assert_eq!(dsa_pool_chunk_base_aligned(&[packed], 4098), Ok(()));
+    assert_eq!(dsa_pool_chunk_base_aligned(&[], 4098), Ok(()));
 }
 
 /// A full/aligned chunk (`clen == t`, `t` always a multiple of `pool_size`) must

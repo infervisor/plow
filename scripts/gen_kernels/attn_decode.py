@@ -83,11 +83,16 @@ def build(hd, gqa, block_n, stages, threads=128, ilv=False):
             T.fill(m, -T.infinity(acc))
             for t in T.Pipelined(T.max(tb - ta, 0), num_stages=stages):
                 ls = (ta + t) * block_n
-                ph = ls & kv_mask
+                # Every staged row is a live one: positions outside [lo, n) read the nearest
+                # live row instead (they are masked to P = 0 below, so the value never counts,
+                # but a never-written row past kv_len may hold NaN, and 0 * NaN poisons O).
+                # A plain load per element keeps this a pipelined cp.async copy stage.
                 if ilv:
-                    T.copy(K[s, ph:ph + block_n, hk, :], K_s)
+                    for j, d in T.Parallel(block_n, hd):
+                        K_s[j, d] = K[s, T.max(T.min(ls + j, n - 1), lo) & kv_mask, hk, d]
                 else:
-                    T.copy(K[s, hk, ph:ph + block_n, :], K_s)
+                    for j, d in T.Parallel(block_n, hd):
+                        K_s[j, d] = K[s, hk, T.max(T.min(ls + j, n - 1), lo) & kv_mask, d]
                 T.gemm(Q_s, K_s, S, transpose_B=True, clear_accum=True,
                        policy=T.GemmWarpPolicy.FullCol)
                 for i, j in T.Parallel(mp, block_n):
@@ -106,9 +111,11 @@ def build(hd, gqa, block_n, stages, threads=128, ilv=False):
                     Oacc[i, j] *= corr[i]
                 T.copy(S, P)
                 if ilv:
-                    T.copy(V[s, ph:ph + block_n, hk, :], V_s)
+                    for j, d in T.Parallel(block_n, hd):
+                        V_s[j, d] = V[s, T.max(T.min(ls + j, n - 1), lo) & kv_mask, hk, d]
                 else:
-                    T.copy(V[s, hk, ph:ph + block_n, :], V_s)
+                    for j, d in T.Parallel(block_n, hd):
+                        V_s[j, d] = V[s, hk, T.max(T.min(ls + j, n - 1), lo) & kv_mask, d]
                 T.gemm(P, V_s, Oacc, policy=T.GemmWarpPolicy.FullCol)
             if nsplit == 1:
                 for i, j in T.Parallel(mp, hd):

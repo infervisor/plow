@@ -180,6 +180,29 @@ static __device__ __forceinline__ float sf_neg_log_exp1(unsigned long long seed,
 #ifndef PLOW_NV_SAMPLE_RADIX
 #define PLOW_NV_SAMPLE_RADIX 1
 #endif
+/* The depth stage's arena-staged head GEMV input and per-warp Gumbel pick (plow_config.h: packets
+ * with depth programs; those launch on the decode, _gw and speech objects, never on a prefill
+ * object). Like the radix top-k, inlined everywhere they grew frames of objects that never run
+ * them (Qwen3-TTS prefill 824 -> 840 B, segmented GEMM 1232 -> 1264 B); 0 keeps the RC9 bodies,
+ * same results. */
+#ifndef PLOW_NV_DEPTH_STAGE
+#define PLOW_NV_DEPTH_STAGE 1
+#endif
+#if PLOW_NV_DEPTH_STAGE && !(defined(PLOW_NV_PREFILL) && PLOW_NV_PREFILL)
+#define GV_DEPTH_FAST 1
+#else
+#define GV_DEPTH_FAST 0
+#endif
+/* d_sample_small's Gumbel pick on a full warp instead of one lane: same pick, +16 B on the
+ * Qwen3-TTS decode frame (112 -> 128) and no measured gain yet, so off. */
+#ifndef PLOW_NV_GUMBEL_WARP
+#define PLOW_NV_GUMBEL_WARP 0
+#endif
+#if PLOW_NV_GUMBEL_WARP && GV_DEPTH_FAST
+#define GV_GUMBEL_WARP 1
+#else
+#define GV_GUMBEL_WARP 0
+#endif
 /* Whether shared bytes up to `end` lie inside this launch's shared allocation (static + dynamic):
  * the radix top-k scratch sits past the row, so a large vocabulary or a narrow launch claim takes
  * the K-round selection instead. */
@@ -364,15 +387,29 @@ static __device__ void d_sample_fish(unsigned* __restrict__ out, const __nv_bflo
 
 /* GemvF32Out (op 220): C[m][n] = sum_k x[m][k] * W[n][k] in fp32 (exact bf16 products, fp32 fma), stored
  * fp32 — a reference that casts both operands to f32 before its matmul. A warp per output row, rows
- * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. `round_bf16` (flag bit 11): C rounded to bf16. */
+ * in blocks of 8 (W re-read once per block of rows). K % 8 == 0. `round_bf16` (flag bit 11): C rounded to bf16.
+ * When all of x fits the launch's arena, a block stages it once (every warp re-read it from L2
+ * per output row otherwise); the arithmetic is the same either way. */
 static __device__ void d_gemv_f32out(float* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N, unsigned K,
-                                     bool round_bf16, unsigned slice, unsigned nblk) {
+                                     bool round_bf16, unsigned slice, unsigned nblk, float* arena) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned per = (N + nblk - 1) / nblk;
     const unsigned n0 = slice * per;
     const unsigned n1 = min(n0 + per, N);
+#if GV_DEPTH_FAST
+    if (n0 >= n1) return;
+    __nv_bfloat16* xs = (__nv_bfloat16*)arena;
+    if ((K & 7u) == 0 && ((uintptr_t)x & 15u) == 0 && smem_fits(xs + (size_t)M * K)) {
+        for (size_t i = (size_t)threadIdx.x * 8u; i < (size_t)M * K; i += PLOW_NV_THREADS * 8u)
+            *(uint4*)(xs + i) = *(const uint4*)(x + i);
+        __syncthreads();
+        x = xs;
+    }
+#else
+    (void)arena;
+#endif
     for (unsigned n = n0 + warp; n < n1; n += PLOW_NV_WARPS) {
         const __nv_bfloat16* wr = W + (size_t)n * K;
         for (unsigned m0 = 0; m0 < M; m0 += 8) {
@@ -588,6 +625,139 @@ static __device__ __forceinline__ void mma_16816(float* d, const unsigned* a, un
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+/* Small-M arm of gemv_f16w_mma (M <= 8 * NT rows, round_up(M, 8) * K <= MMA_SMALL_X halves, K % 256 == 0):
+ * every x row is staged once (LN applied, f16), and a warp streams its K pieces over the whole K with
+ * up to three pieces of W in flight instead of one piece per 256-wide chunk behind a block barrier.
+ * The piece -> warp chain and the cross-warp reduction are those of the chunked arm (piece p of 64
+ * belongs to warp my_ks iff p % min(ks, 4) == my_ks, pieces in increasing order), so the result is
+ * bit-identical to it. Arena: MMA_SMALL_X halves of x, 128 floats of statistics, 8 x 32 x 4 NT floats
+ * of partials. */
+#define MMA_SMALL_X 24576u
+template <unsigned NT>
+static __device__ void gemv_f16w_mma_small(float* C, const float* __restrict__ x,
+                                           const unsigned short* __restrict__ W, const float* bias,
+                                           unsigned bgroup, const float* res, const float* gamma,
+                                           const float* beta, float eps, unsigned act, unsigned M, unsigned N,
+                                           unsigned K, unsigned t0, unsigned tiles, unsigned ks, float* arena) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned g = lane >> 2, t = lane & 3u;
+    const unsigned my_tile = warp / ks, my_ks = warp % ks;
+    const unsigned step = min(ks, 4u);
+    const bool active = my_tile < tiles, compute = active && my_ks < step;
+    __half* xs = (__half*)arena;
+    float* st = arena + MMA_SMALL_X / 2u;
+    float* red = st + 2u * MMA_ROWS;
+    const unsigned na = (t0 + my_tile) * 16u + g, nb = na + 8u;
+    __syncthreads();
+    if (gamma) {
+        for (unsigned r = warp; r < M; r += PLOW_NV_WARPS) {
+            const float* xr = x + (size_t)(r) * K;
+            float s = 0.f;
+            for (unsigned k = lane; k < K; k += 32u) s += xr[k];
+            const float mean = warp_sum32(s) / (float)K;
+            float v = 0.f;
+            for (unsigned k = lane; k < K; k += 32u) {
+                const float d = xr[k] - mean;
+                v = __fmaf_rn(d, d, v);
+            }
+            const float var = warp_sum32(v) / (float)K;
+            if (lane == 0) {
+                st[2 * r] = mean;
+                st[2 * r + 1] = rsqrtf(var + eps);
+            }
+        }
+        __syncthreads();
+    }
+    for (unsigned r = 0; r < NT * 8u; r++) {
+        const float* xr = r < M ? x + (size_t)(r) * K : nullptr;
+        for (unsigned k = threadIdx.x; k < K; k += PLOW_NV_THREADS) {
+            float v = 0.f;
+            if (xr) {
+                v = xr[k];
+                if (gamma) v = __fmaf_rn((v - st[2 * r]) * st[2 * r + 1], gamma[k], beta[k]);
+            }
+            xs[r * K + k] = __float2half_rn(v);
+        }
+    }
+    __syncthreads();
+    float acc[NT][4];
+#pragma unroll
+    for (unsigned j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    if (compute) {
+        const unsigned npieces = K / 64u;
+        for (unsigned p0 = my_ks; p0 < npieces; p0 += 3u * step) {
+            uint4 w[3][4];
+#pragma unroll
+            for (unsigned q = 0; q < 3u; q++) {
+                const unsigned p = p0 + q * step;
+                const unsigned k0 = p * 64u + 16u * t;
+                if (p < npieces && na < N) {
+                    w[q][0] = *(const uint4*)(W + (size_t)na * K + k0);
+                    w[q][1] = *(const uint4*)(W + (size_t)na * K + k0 + 8u);
+                } else {
+                    w[q][0] = w[q][1] = make_uint4(0u, 0u, 0u, 0u);
+                }
+                if (p < npieces && nb < N) {
+                    w[q][2] = *(const uint4*)(W + (size_t)nb * K + k0);
+                    w[q][3] = *(const uint4*)(W + (size_t)nb * K + k0 + 8u);
+                } else {
+                    w[q][2] = w[q][3] = make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+#pragma unroll
+            for (unsigned q = 0; q < 3u; q++) {
+                const unsigned p = p0 + q * step;
+                if (p >= npieces) break;
+                const unsigned* pa = (const unsigned*)&w[q][0];
+                const unsigned* pb = (const unsigned*)&w[q][2];
+#pragma unroll
+                for (unsigned s = 0; s < 4u; s++) {
+                    const unsigned a[4] = {pa[2 * s], pb[2 * s], pa[2 * s + 1], pb[2 * s + 1]};
+#pragma unroll
+                    for (unsigned j = 0; j < NT; j++) {
+                        const unsigned* xr = (const unsigned*)(xs + (j * 8u + g) * K + p * 64u + 16u * t + 4u * s);
+                        mma_16816(acc[j], a, xr[0], xr[1]);
+                    }
+                }
+            }
+        }
+    }
+    if (ks > 1u) {
+        __syncthreads();
+        if (active && my_ks) {
+#pragma unroll
+            for (unsigned j = 0; j < NT; j++)
+#pragma unroll
+                for (unsigned c = 0; c < 4u; c++) red[(warp * 32u + lane) * (4u * NT) + j * 4u + c] = acc[j][c];
+        }
+        __syncthreads();
+        if (active && !my_ks) {
+            for (unsigned q = 1; q < ks; q++)
+#pragma unroll
+                for (unsigned j = 0; j < NT; j++)
+#pragma unroll
+                    for (unsigned c = 0; c < 4u; c++)
+                        acc[j][c] += red[((warp + q) * 32u + lane) * (4u * NT) + j * 4u + c];
+        }
+    }
+    if (active && !my_ks) {
+#pragma unroll
+        for (unsigned j = 0; j < NT; j++) {
+#pragma unroll
+            for (unsigned c = 0; c < 4u; c++) {
+                const unsigned m = j * 8u + 2u * t + (c & 1u), n = (c < 2u) ? na : nb;
+                if (m >= M || n >= N) continue;
+                float v = acc[j][c];
+                if (bias) v = __fadd_rn(v, bias[(bgroup ? m / bgroup * N : 0u) + n]);
+                if (res) v = __fadd_rn(v, res[(size_t)(m) * N + n]);
+                if (act == 1u) v = 0.5f * v * (1.f + erff(v * 0.70710678118654752f));
+                C[(size_t)(m) * N + n] = v;
+            }
+        }
+    }
+}
+
 static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, const unsigned short* __restrict__ W,
                                      const float* bias, unsigned bgroup, const float* res, const float* gamma,
                                      const float* beta, float eps, unsigned act, unsigned M, unsigned N, unsigned K,
@@ -602,12 +772,27 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
     if (!tiles) return;
     unsigned ks = max(1u, PLOW_NV_WARPS / tiles);
     ks = min(ks, K / 64u);
+    if (M && M <= 24u && K % 256u == 0u && (size_t)((M + 7u) / 8u) * 8u * K <= MMA_SMALL_X) {
+        if (M <= 8u)
+            gemv_f16w_mma_small<1>(C, x, W, bias, bgroup, res, gamma, beta, eps, act, M, N, K, t0, tiles, ks, arena);
+        else if (M <= 16u)
+            gemv_f16w_mma_small<2>(C, x, W, bias, bgroup, res, gamma, beta, eps, act, M, N, K, t0, tiles, ks, arena);
+        else
+            gemv_f16w_mma_small<3>(C, x, W, bias, bgroup, res, gamma, beta, eps, act, M, N, K, t0, tiles, ks, arena);
+        return;
+    }
     const unsigned my_tile = warp / ks, my_ks = warp % ks;
     const bool active = my_tile < tiles;
     __half* xs = (__half*)arena;
     float* st = arena + MMA_ROWS * MMA_KT / 2u;
     float* red = st + 2u * MMA_ROWS;
     const unsigned na = (t0 + my_tile) * 16u + g, nb = na + 8u;
+#if PLOW_NV_SPEECH
+    /* The quad staging loads float4s: x, gamma and beta bases must be 16-byte aligned (row and chunk offsets keep
+     * it); else one element per trip. Speech objects only: every other object keeps its staging text. */
+    const bool vec_ok =
+        ((((size_t)x) | (gamma ? ((size_t)gamma | (size_t)beta) : (size_t)0)) & (size_t)15) == 0;
+#endif
     for (unsigned mc = 0; mc < M; mc += MMA_ROWS) {
         const unsigned mr = min(MMA_ROWS, M - mc), nt8 = (mr + 7u) / 8u;
         __syncthreads();
@@ -635,6 +820,34 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
         for (unsigned kt = 0; kt < K; kt += MMA_KT) {
             const unsigned kw = min(MMA_KT, K - kt);
             __syncthreads();
+#if PLOW_NV_SPEECH
+            /* Thread (rg, c) stages the quad c of rows rg, rg + 4, ..: float4 loads, several rows in flight.
+             * (One element per thread and trip left the M >= 32 rungs bound by this loop's load latency.) */
+            if (vec_ok) {
+                const unsigned c = threadIdx.x & 63u, k = 4u * c;
+                if (k < kw) {
+                    const float4 gq = gamma ? *(const float4*)(gamma + kt + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+                    const float4 bq = gamma ? *(const float4*)(beta + kt + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll 4
+                    for (unsigned r = threadIdx.x >> 6; r < nt8 * 8u; r += PLOW_NV_THREADS / 64u) {
+                        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                        if (r < mr) {
+                            v = *(const float4*)(x + (size_t)(mc + r) * K + kt + k);
+                            if (gamma) {
+                                const float mu = st[2 * r], rs = st[2 * r + 1];
+                                v.x = __fmaf_rn((v.x - mu) * rs, gq.x, bq.x);
+                                v.y = __fmaf_rn((v.y - mu) * rs, gq.y, bq.y);
+                                v.z = __fmaf_rn((v.z - mu) * rs, gq.z, bq.z);
+                                v.w = __fmaf_rn((v.w - mu) * rs, gq.w, bq.w);
+                            }
+                        }
+                        __half2* d = (__half2*)(xs + r * MMA_KT + k);
+                        d[0] = __floats2half2_rn(v.x, v.y);
+                        d[1] = __floats2half2_rn(v.z, v.w);
+                    }
+                }
+            } else
+#endif
             for (unsigned i = threadIdx.x; i < nt8 * 8u * kw; i += PLOW_NV_THREADS) {
                 const unsigned r = i / kw, k = i % kw;
                 float v = 0.f;
@@ -713,17 +926,64 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
     }
 }
 
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+#include "op_gemv_f16_sm90.cuh"
+#endif
+
 static __device__ void d_gemv_f32out_mode(float* C, const void* x, const void* W, const float* bias,
                                           const float* res, const float* gamma, const float* beta, float eps,
                                           unsigned flags, unsigned bgroup, unsigned M, unsigned N, unsigned K,
-                                          unsigned slice, unsigned nblk, float* arena) {
+                                          unsigned slice, unsigned nblk, float* arena, const unsigned* vd) {
+    /* Row views (flag bit 12, descriptor vd) are not compiled in: plow_speech_caps bit 0 is clear and the
+     * loader refuses such a packet before launch. */
+    (void)vd;
+    if (flags & 4096u) { __trap(); return; }
     const unsigned act = (flags >> 4) & 15u;
     bgroup = (flags & 512u) ? bgroup : 0u;
     if ((flags & 512u) && !bgroup) { __trap(); return; }
     bias = (flags & 4u) ? bias : nullptr;
     res = (flags & 8u) ? res : nullptr;
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+    if ((flags & 16384u) && !(flags & 8192u)) { __trap(); return; }
+    if (flags & 8192u) {
+        if ((flags & (3u | 1024u | 256u)) != (3u | 1024u) || M < 16u || N % 64u || K % 64u ||
+            ((((size_t)x) | ((size_t)W)) & 15u) || ((flags & 16384u) && (const void*)C == (const void*)res)) {
+            __trap(); return;
+        }
+        const auto* h = (const unsigned short*)x;
+        if (flags & 16384u) {
+            if (M >= 256u && K % 128u == 0u) gemv_f16w_half<128, true, 128>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if (M >= 256u) gemv_f16w_half<128, true>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if (N <= 1024u) gemv_f16w_half<16, true>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if ((size_t)((M + 63u) / 64u) * (N / 64u) >= 96u)
+                gemv_f16w_half<64, true>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else gemv_f16w_half<32, true>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+        } else {
+            if (M >= 256u && K % 128u == 0u) gemv_f16w_half<128, false, 128>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if (M >= 256u) gemv_f16w_half<128, false>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if (N <= 1024u) gemv_f16w_half<16, false>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else if ((size_t)((M + 63u) / 64u) * (N / 64u) >= 96u)
+                gemv_f16w_half<64, false>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+            else gemv_f16w_half<32, false>(C, h, (const unsigned short*)W, bias, bgroup, res, act, M, N, K, slice, nblk, arena);
+        }
+        return;
+    }
+#endif
     if ((flags & 3u) == 3u && (flags & 1024u)) {
         if (K % 64u) { __trap(); return; }
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+        if (M >= 16u && N % 64u == 0u && K >= 192u && K <= 4096u &&
+            ((((size_t)x) | ((size_t)W) | (gamma ? ((size_t)gamma | (size_t)beta) : 0u)) & 15u) == 0u) {
+            if ((size_t)((M + 63u) / 64u) * (N / 64u) >= 96u && (!(flags & 256u) || K <= 1024u)) {
+                gemv_f16w_tiled<64>(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res,
+                                  (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
+            } else {
+                gemv_f16w_tiled<32>(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res,
+                                  (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
+            }
+            return;
+        }
+#endif
         gemv_f16w_mma(C, (const float*)x, (const unsigned short*)W, bias, bgroup, res,
                       (flags & 256u) ? gamma : nullptr, beta, eps, act, M, N, K, slice, nblk, arena);
         return;
@@ -764,6 +1024,27 @@ static __device__ __forceinline__ unsigned long long f32_key(float f, unsigned i
     const unsigned key = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
     return ((unsigned long long)key << 32) | (unsigned long long)(~i);
 }
+#if GV_GUMBEL_WARP
+/* argmax over i < n of sv[i] + sf_neg_log_exp1(seed, step, coord, 0, i) by one full warp: lanes scan
+ * i = lane, lane + 32, ... with strict >, then (max score, lowest i) across lanes = a serial strict->
+ * scan's pick; nothing above -inf (or NaN) picks 0. */
+static __device__ __forceinline__ unsigned gumbel_pick_warp(const float* sv, unsigned n, unsigned long long seed,
+                                                            unsigned step, unsigned coord) {
+    unsigned best = 0xFFFFFFFFu;
+    float bv = -INFINITY;
+    for (unsigned i = threadIdx.x & 31u; i < n; i += 32u) {
+        const float v = sv[i] + sf_neg_log_exp1(seed, step, coord, 0u, i);
+        if (v > bv) { bv = v; best = i; }
+    }
+#pragma unroll
+    for (unsigned d = 16; d; d >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, d);
+        const unsigned ob = __shfl_xor_sync(0xffffffffu, best, d);
+        if (ov > bv || (ov == bv && ob < best)) { bv = ov; best = ob; }
+    }
+    return best == 0xFFFFFFFFu ? 0u : best;
+}
+#endif
 static __device__ void d_sample_small(unsigned* __restrict__ out, const float* __restrict__ logits,
                                       const float* __restrict__ params, const unsigned* __restrict__ ctl,
                                       const unsigned long long* __restrict__ seed, unsigned* __restrict__ bitmap,
@@ -776,6 +1057,9 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
     unsigned* sel = (unsigned*)(fpart + PLOW_NV_WARPS);
     float* sv = (float*)(sel + 64);
     float* L = sv + 64;
+#if !defined(PLOW_HAS_SAMPLE_SMALL_F32) || PLOW_HAS_SAMPLE_SMALL_F32
+    if (!smem_fits(L + vocab)) { asm volatile("trap;"); return; }
+#endif
     unsigned long long* tk_buf = (unsigned long long*)(((size_t)(L + vocab) + 15u) & ~(size_t)15u);
     unsigned* tk_ctl = (unsigned*)(tk_buf + 64);
     const bool radix = PLOW_NV_SAMPLE_RADIX && smem_fits(tk_ctl + 4 + 256);
@@ -825,10 +1109,16 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
                 __syncthreads();
             }
         }
+#if GV_GUMBEL_WARP
+        if (threadIdx.x < 32u) {
+            const unsigned lane = threadIdx.x;
+#else
         if (threadIdx.x == 0) {
+            const unsigned lane = 0;
+#endif
             const unsigned step = ctl[2u * r + 1u];
             unsigned n = K;
-            if (p[1] < 1.f) {
+            if (p[1] < 1.f && lane == 0) {
                 float z = 0.f;
                 for (unsigned i = 0; i < K; i++) z += expf(sv[i] - sv[0]);
                 float cum = 0.f;
@@ -837,21 +1127,28 @@ static __device__ void d_sample_small(unsigned* __restrict__ out, const float* _
                     cum += expf(sv[i] - sv[0]) / z;
                 }
             }
+#if GV_GUMBEL_WARP
+            n = __shfl_sync(0xffffffffu, n, 0);
+            const unsigned best = gumbel_pick_warp(sv, n, seed[r], step, coord);
+#else
             unsigned best = 0;
             float bv = -INFINITY;
             for (unsigned i = 0; i < n; i++) {
                 const float v = sv[i] + sf_neg_log_exp1(seed[r], step, coord, 0u, i);
                 if (v > bv) { bv = v; best = i; }
             }
-            unsigned c = sel[best];
-            const size_t o = (size_t)r * out_stride + out_col0;
-            if (force && force[o] != 0xFFFFFFFFu) c = force[o];
-            if (bm) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
-            out[o] = c;
-            if (eidx) eidx[r] = c + eoff;
-            if (guide) {
-                out[o + out_stride] = c;
-                if (eidx) eidx[r + 1] = c + eoff;
+#endif
+            if (lane == 0) {
+                unsigned c = sel[best];
+                const size_t o = (size_t)r * out_stride + out_col0;
+                if (force && force[o] != 0xFFFFFFFFu) c = force[o];
+                if (bm) bitmap[(size_t)r * words + (c >> 5)] |= 1u << (c & 31u);
+                out[o] = c;
+                if (eidx) eidx[r] = c + eoff;
+                if (guide) {
+                    out[o + out_stride] = c;
+                    if (eidx) eidx[r + 1] = c + eoff;
+                }
             }
         }
         __syncthreads();

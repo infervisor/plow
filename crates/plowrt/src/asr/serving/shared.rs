@@ -184,7 +184,14 @@ impl SharedAsr {
         &self.slug
     }
 
-    fn load(slug: &str, dir: &Path, max_context: usize, batch: usize, device: u8) -> Result<Self> {
+    fn load(
+        slug: &str,
+        dir: &Path,
+        max_context: usize,
+        batch: usize,
+        device: u8,
+        buckets: &Arc<crate::obs::bucket::BucketDemand>,
+    ) -> Result<Self> {
         let checkpoint = crate::asset::serve::checkpoint_dir(dir);
         let checkpoint = if checkpoint.is_dir() {
             checkpoint
@@ -198,6 +205,7 @@ impl SharedAsr {
             "encoder.pkt",
         )?;
         let mut encoder = PacketAudioEncoder::load_on(&encoder_path, "cuda", device)?;
+        encoder.observe_buckets(buckets);
         let warm = Instant::now();
         encoder.warm()?;
         tracing::info!(
@@ -520,12 +528,14 @@ impl SharedAsr {
                 turn: opts.ids.as_ref().and_then(|i| i.turn_key.clone()),
                 continuing: false,
                 speech: Some(Box::new(SpeechJob {
+                    batch_delivery: false,
                     device_frames: false,
                     overlay,
                     overlay_pos,
                     pos_base: None,
                     cfg: None,
                     first_tokens: 0,
+                    first_audio: None,
                     depth: None,
                     encode: None,
                     frame_codes: Vec::new(),
@@ -697,7 +707,8 @@ fn shared_asr(state: &AppState, slug: &str, dir: &Path) -> Result<Option<Arc<Sha
                 (e.max_ctx(), e.batch())
             })
             .ok_or_else(|| RuntimeError::Rejected(format!("{slug} has no GPU engine")))?;
-        let m = SharedAsr::load(slug, dir, max_context, batch, device)?;
+        let buckets = &state.model_metrics(slug).buckets;
+        let m = SharedAsr::load(slug, dir, max_context, batch, device, buckets)?;
         tracing::info!(%slug, device, dir = %dir.display(), "asr: audio LM front bound to the serve mux");
         Some(Arc::new(m))
     } else {

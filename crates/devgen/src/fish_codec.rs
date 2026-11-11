@@ -27,7 +27,8 @@ use crate::codec::{fused_conv, p_handle, Conv};
 use crate::pipeline::{
     Activation, AttentionF32Stage, AttentionStream, BinaryF32Stage, BinaryOp, Conv1dF32Stage,
     CopyColsF32Stage, Emitted, GatherRowsF32Stage, LayerNormRowsF32Stage, PacketPrefix, PadMode,
-    StageProgram, StreamTailF32Mode, StreamTailF32Stage, TensorRef, UnaryF32Stage,
+    RingAttentionF32Stage, StageProgram, StreamTailF32Mode, StreamTailF32Stage, TensorRef,
+    UnaryF32Stage,
 };
 use crate::rewrite_lower::ConvFusions;
 
@@ -93,6 +94,7 @@ struct Block {
 struct Cfg {
     breeze: bool,
     mimi: bool,
+    ring_kv: bool,
     /// Mimi: stride of the causal ConvTranspose (k = 2 * stride) before the transformer; 0 = none.
     pre_up: u32,
     /// Residual-unit first conv kernel and the output conv kernel (Fish / Breeze: 7, 7).
@@ -156,6 +158,7 @@ impl Cfg {
         let cfg = Cfg {
             breeze,
             mimi,
+            ring_kv: false,
             pre_up,
             res_kernel: if mimi { u(d, "residual_kernel")? } else { 7 },
             out_kernel: if mimi { u(d, "out_kernel")? } else { 7 },
@@ -246,13 +249,14 @@ pub fn lower_fish_dac(
     max_rows: Option<u32>,
 ) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
     let (decode, steps) = capped(max_rows)?;
-    let cfg = Cfg::parse(
+    let mut cfg = Cfg::parse(
         &serde_json::from_slice(
             &std::fs::read(dir.join("config.json"))
                 .map_err(|e| format!("{}: {e}", dir.display()))?,
         )
         .map_err(|e| format!("fish codec config: {e}"))?,
     )?;
+    cfg.ring_kv = crate::emit_config::active().codec_ring_kv;
     let splits = split_bf16.then(|| std::cell::RefCell::new(BTreeMap::new()));
     let Lowered {
         mut prefix,
@@ -277,14 +281,25 @@ pub fn lower_fish_dac(
         let Some(name) = tensor.name.strip_prefix("w.") else {
             continue;
         };
-        let (dtype, mut bytes) = match name.strip_suffix(".a12") {
-            Some(unit) => {
+        let rep_stride = name.strip_suffix(".b_rep").and_then(|base| {
+            cfg.ups
+                .iter()
+                .enumerate()
+                .find(|(u, _)| base == format!("up{u}.convt"))
+                .map(|(_, &(stride, _))| (base, stride))
+        });
+        let (dtype, mut bytes) = match (name.strip_suffix(".a12"), rep_stride) {
+            (Some(unit), _) => {
                 let (d1, mut a) = reader.read(&format!("{unit}.a1"))?;
                 let (_, b) = reader.read(&format!("{unit}.a2"))?;
                 a.extend_from_slice(&b);
                 (d1, a)
             }
-            None => reader.read(name)?,
+            (None, Some((base, stride))) => {
+                let (d, b) = reader.read(&format!("{base}.b"))?;
+                (d, b.repeat(stride as usize))
+            }
+            (None, None) => reader.read(name)?,
         };
         // Every ConvT whose Conv takes phase-major weights (`codec::phase_major`): the decoder
         // blocks' upsamplers and the post-transformer ConvNeXt upsamplers (kernel = stride).
@@ -500,15 +515,43 @@ impl Seq {
         w: &str,
         b: Option<&str>,
     ) -> Result<u32, String> {
-        self.dense_with_math(
+        self.dense_with(
             splits,
             x,
-            out,
+            TensorRef::Named(out),
+            None,
             rows,
             k,
             n,
             w,
             b,
+            crate::pipeline::Conv1dMath::Tf32x3,
+        )
+    }
+
+    /// `res += x @ w^T` in place through the conv's residual epilogue: the same bits as the dense
+    /// into a scratch followed by a BinaryF32 add (`__fadd_rn(y, res)` with y the stored value),
+    /// one op and one tensor pass fewer.
+    pub(crate) fn dense_res(
+        &mut self,
+        splits: Splits<'_>,
+        x: u32,
+        res: u32,
+        rows: u32,
+        k: u32,
+        n: u32,
+        w: &str,
+    ) -> Result<u32, String> {
+        self.dense_with(
+            splits,
+            x,
+            TensorRef::Handle(res),
+            Some(res),
+            rows,
+            k,
+            n,
+            w,
+            None,
             crate::pipeline::Conv1dMath::Tf32x3,
         )
     }
@@ -519,6 +562,34 @@ impl Seq {
         splits: Splits<'_>,
         x: u32,
         out: &str,
+        rows: u32,
+        k: u32,
+        n: u32,
+        w: &str,
+        b: Option<&str>,
+        math: crate::pipeline::Conv1dMath,
+    ) -> Result<u32, String> {
+        self.dense_with(
+            splits,
+            x,
+            TensorRef::Named(out),
+            None,
+            rows,
+            k,
+            n,
+            w,
+            b,
+            math,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dense_with(
+        &mut self,
+        splits: Splits<'_>,
+        x: u32,
+        output: TensorRef<'_>,
+        residual: Option<u32>,
         rows: u32,
         k: u32,
         n: u32,
@@ -540,11 +611,11 @@ impl Seq {
             false,
             &[dep],
             Conv1dF32Stage {
-                output: TensorRef::Named(out),
+                output,
                 weight: TensorRef::Named(w),
                 bias: b.map(TensorRef::Named),
                 alpha: None,
-                residual: None,
+                residual,
                 lengths: None,
                 batch: 1,
                 in_rows: rows,
@@ -566,6 +637,10 @@ impl Seq {
                 wgmma: split,
                 weight_split: split,
                 dual_alpha: false,
+                pinned: true,
+                wgmma_ragged: false,
+                input_split: false,
+                output_split: false,
             },
             math,
         )?;
@@ -745,6 +820,9 @@ fn program_for(
     steps: Option<&[(u32, u32)]>,
     splits: Splits<'_>,
 ) -> Result<(PacketPrefix, u32), String> {
+    if cfg.ring_kv && !cfg.mimi {
+        return Err("codec ring KV needs a Mimi decoder".into());
+    }
     if cfg.mimi {
         return mimi_program_for(prefix, cfg, batch, frames, codes, lengths, steps, splits);
     }
@@ -899,7 +977,8 @@ fn program_for(
             input_is_temp: false,
             row_scale: None,
             alpha_out: None,
-            taps_wgmma: false,
+            taps_wgmma: crate::emit_config::active().codec_dec_in_wgmma,
+            wgmma_ragged: false,
         };
         last = stateful(&mut p, c, last, pre, "state.codec.pre".into(), 0)?.done;
     }
@@ -1004,24 +1083,13 @@ fn program_for(
             },
         )?;
         let at = s.done(e);
-        s.dense(splits, at, "act.codec.b", n, aw, dim, &w("wo_s"), None)?;
-        s.binary(x, h, BinaryOp::Add, n, dim)?;
+        s.dense_res(splits, at, x, n, aw, dim, &w("wo_s"))?;
         s.rms(x, h, n, dim, &w("ffn_norm"), cfg.eps)?;
         let g = s.dense(splits, h, "act.codec.c", n, dim, cfg.inter, &w("w1"), None)?;
         let u = s.dense(splits, h, "act.codec.s", n, dim, cfg.inter, &w("w3"), None)?;
         s.unary(g, Activation::Silu, n, cfg.inter)?;
         s.binary(g, u, BinaryOp::Mul, n, cfg.inter)?;
-        s.dense(
-            splits,
-            g,
-            "act.codec.b",
-            n,
-            cfg.inter,
-            dim,
-            &w("w2_s"),
-            None,
-        )?;
-        s.binary(x, h, BinaryOp::Add, n, dim)?;
+        s.dense_res(splits, g, x, n, cfg.inter, dim, &w("w2_s"))?;
     }
     s.rms(x, x, n, dim, "w.post.norm", cfg.eps)?;
     let stream = if cfg.breeze {
@@ -1040,6 +1108,7 @@ fn program_for(
     };
     let dim = cfg.latent;
 
+    let ragged = cfg.breeze && crate::emit_config::active().codec_wgmma_ragged;
     let conv = |output: &'static str,
                 weight: String,
                 bias: Option<String>,
@@ -1070,6 +1139,7 @@ fn program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        wgmma_ragged: ragged,
     };
     let other = |e: u32| if e == x { "act.codec.b" } else { "act.codec.a" };
     let snake = if cfg.breeze {
@@ -1084,19 +1154,41 @@ fn program_for(
     let mut rows = frames;
     for (u, &(stride, ln_eps)) in cfg.ups.iter().enumerate() {
         let w = |s: &str| format!("w.up{u}.{s}");
-        let mut c = conv(
-            other(cur.output),
-            w("convt.w"),
-            Some(w("convt.b")),
-            rows,
-            dim,
-            dim,
-            stride,
-        );
-        c.transpose = true;
-        c.stride = stride;
-        c.dilation = 0;
-        c.pad = 0;
+        // Breeze under split-bf16: kernel = stride, so the transposed conv is a pointwise conv to
+        // stride x dim columns over the phase-major weights ([stride][dim][dim]), whose rows read
+        // back as stride output rows each (bias repeated per phase, `.b_rep`). It leaves 3xTF32
+        // for the split-bf16 wgmma tile, so it shares the knob of the other PCM-changing routes.
+        let pointwise = cfg.breeze
+            && splits.is_some()
+            && crate::emit_config::active().codec_dec_in_wgmma
+            && dim % 4 == 0
+            && dim >= 16;
+        let mut c = if pointwise {
+            conv(
+                other(cur.output),
+                w("convt.w"),
+                Some(w("convt.b_rep")),
+                rows,
+                dim,
+                stride * dim,
+                1,
+            )
+        } else {
+            let mut c = conv(
+                other(cur.output),
+                w("convt.w"),
+                Some(w("convt.b")),
+                rows,
+                dim,
+                dim,
+                stride,
+            );
+            c.transpose = true;
+            c.stride = stride;
+            c.dilation = 0;
+            c.pad = 0;
+            c
+        };
         c.len = len(u);
         let mut p = s.p.take().unwrap();
         let up = fused_conv(&mut p, fuse, splits, cur.output, cur.done, c)?;
@@ -1132,6 +1224,7 @@ fn program_for(
                 epsilon: ln_eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s = Seq {
@@ -1177,6 +1270,7 @@ fn program_for(
     );
     let mut c = c;
     c.len = len(cfg.ups.len());
+    c.taps_wgmma = crate::emit_config::active().codec_dec_in_wgmma;
     cur = stateful(
         &mut p,
         cur.output,
@@ -1234,11 +1328,17 @@ fn program_for(
             c.dilation = d;
             c.pad = 6 * d;
             c.len = len_out;
-            if cfg.breeze {
+            // Breeze under split-bf16: the output SnakeBeta (`a2`) fuses into the taps epilogue.
+            let beta_fused = cfg.breeze && splits.is_some();
+            if cfg.breeze && !beta_fused {
                 c.alpha = Some(format!("{pre}.a1"));
             } else {
                 c.alpha_out = Some(format!("{pre}.a12"));
-                c.act_out = Activation::Snake;
+                c.act_out = if cfg.breeze {
+                    Activation::SnakeBeta
+                } else {
+                    Activation::Snake
+                };
             }
             let mut h = stateful(
                 &mut p,
@@ -1248,7 +1348,7 @@ fn program_for(
                 format!("state.codec.blk{i}.ru{j}"),
                 k_out,
             )?;
-            if cfg.breeze {
+            if cfg.breeze && !beta_fused {
                 h = snake_beta(&mut p, h, &format!("{pre}.a2"), batch * rows, b.cout)?;
             }
             let mut c = conv(
@@ -1431,6 +1531,7 @@ fn mimi_program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        wgmma_ragged: false,
     };
     // A causal ConvTranspose k = 2s: (rows - 1) * s + k outputs, the last k - s cropped.
     let convt = |mut c: Conv, stride: u32| {
@@ -1518,6 +1619,10 @@ fn mimi_program_for(
     if step && history == 0 {
         return Err("mimi codec step: needs a bounded attention window".into());
     }
+    let ring = step && cfg.ring_kv;
+    if ring && (hd != 64 || history == 0 || history > 255) {
+        return Err("codec ring KV needs 64-wide heads and a window of 2..256".into());
+    }
     let ln = |s: &mut Seq, w: String| -> Result<(), String> {
         let dep = s.last;
         let e = s.p().layer_norm_f32(
@@ -1532,6 +1637,7 @@ fn mimi_program_for(
                 epsilon: cfg.eps,
                 activation: Activation::None,
                 add_row: None,
+                output_split: false,
             },
         )?;
         s.done(e);
@@ -1551,7 +1657,43 @@ fn mimi_program_for(
                 d.f[0] = cfg.theta;
             },
         )?;
+        let current_qkv = qkv;
+        let ring_state = format!("state.codec.kv{l}");
         let (qkv, kv_rows, stream) = match &io {
+            Some(_) if ring && t <= 4 => (qkv, t, None),
+            Some((io, row_pos)) if ring => {
+                let dep = s.last;
+                let z = s.p().stream_tail_f32(
+                    &[dep],
+                    StreamTailF32Stage {
+                        mode: StreamTailF32Mode::RingGather {
+                            output: TensorRef::Named("act.codec.z"),
+                            src: qkv,
+                            pos: *row_pos,
+                            src_stride: 3 * aw,
+                        },
+                        state: TensorRef::Named(&ring_state),
+                        slot: io.slot,
+                        n: io.n[1],
+                        items: batch,
+                        slots: STREAM_SLOTS,
+                        tail: history,
+                        rows: t,
+                        cols: 2 * aw,
+                        z_cols: 3 * aw,
+                        z_col0: aw,
+                    },
+                )?;
+                s.last = z.done;
+                (
+                    z.output,
+                    history + t,
+                    Some(AttentionStream {
+                        pos: *row_pos,
+                        history,
+                    }),
+                )
+            }
             Some((io, row_pos)) => {
                 let dep = s.last;
                 let z = carry(
@@ -1560,7 +1702,7 @@ fn mimi_program_for(
                     1,
                     qkv,
                     dep,
-                    &format!("state.codec.kv{l}"),
+                    &ring_state,
                     batch,
                     t,
                     history,
@@ -1580,36 +1722,81 @@ fn mimi_program_for(
             None => (qkv, t, None),
         };
         let dep = s.last;
-        let e = s.p().attention_f32(
-            qkv,
-            qkv,
-            qkv,
-            &[dep],
-            AttentionF32Stage {
-                output: TensorRef::Named("act.codec.s"),
-                key_lengths: (!step).then(|| lengths[1]),
-                bias: None,
-                batch,
-                q_rows: t,
-                kv_rows,
-                heads,
-                head_width: hd,
-                in_stride: 3 * aw,
-                k_col0: aw,
-                v_col0: 2 * aw,
-                causal: true,
-                scale: 1.0 / (hd as f32).sqrt(),
-                bias_head_stride: 0,
-                relative: false,
-                key_length_heads: 0,
-                prefix: None,
-                window: cfg.window,
-                stream,
-            },
-        )?;
+        let e = if ring && t <= 4 {
+            let (io, row_pos) = io.as_ref().unwrap();
+            s.p().ring_attention_f32(
+                qkv,
+                &[dep],
+                RingAttentionF32Stage {
+                    output: TensorRef::Named("act.codec.s"),
+                    state: TensorRef::Named(&ring_state),
+                    slot: io.slot,
+                    lengths: io.n[1],
+                    positions: *row_pos,
+                    batch,
+                    rows: t,
+                    heads,
+                    history,
+                    slots: STREAM_SLOTS,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                },
+            )?
+        } else {
+            s.p().attention_f32(
+                qkv,
+                qkv,
+                qkv,
+                &[dep],
+                AttentionF32Stage {
+                    output: TensorRef::Named("act.codec.s"),
+                    key_lengths: (!step).then(|| lengths[1]),
+                    bias: None,
+                    batch,
+                    q_rows: t,
+                    kv_rows,
+                    heads,
+                    head_width: hd,
+                    in_stride: 3 * aw,
+                    k_col0: aw,
+                    v_col0: 2 * aw,
+                    causal: true,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                    bias_head_stride: 0,
+                    relative: false,
+                    key_length_heads: 0,
+                    prefix: None,
+                    window: cfg.window,
+                    stream,
+                },
+            )?
+        };
         let at = s.done(e);
-        s.dense(splits, at, "act.codec.b", nt, aw, dim, &w("wo_s"), None)?;
-        s.binary(x, h, BinaryOp::Add, nt, dim)?;
+        if ring {
+            let (io, row_pos) = io.as_ref().unwrap();
+            let dep = s.last;
+            let stored = s.p().stream_tail_f32(
+                &[dep],
+                StreamTailF32Stage {
+                    mode: StreamTailF32Mode::RingStore {
+                        src: current_qkv,
+                        pos: *row_pos,
+                        src_stride: 3 * aw,
+                    },
+                    state: TensorRef::Named(&ring_state),
+                    slot: io.slot,
+                    n: io.n[1],
+                    items: batch,
+                    slots: STREAM_SLOTS,
+                    tail: history,
+                    rows: t,
+                    cols: 2 * aw,
+                    z_cols: 3 * aw,
+                    z_col0: aw,
+                },
+            )?;
+            s.last = stored.done;
+        }
+        s.dense_res(splits, at, x, nt, aw, dim, &w("wo_s"))?;
         ln(&mut s, w("ln2"))?;
         let g = s.dense(
             splits,
@@ -1622,17 +1809,7 @@ fn mimi_program_for(
             None,
         )?;
         s.unary(g, Activation::GeluErf, nt, cfg.inter)?;
-        s.dense(
-            splits,
-            g,
-            "act.codec.b",
-            nt,
-            cfg.inter,
-            dim,
-            &w("fc2_s"),
-            None,
-        )?;
-        s.binary(x, h, BinaryOp::Add, nt, dim)?;
+        s.dense_res(splits, g, x, nt, cfg.inter, dim, &w("fc2_s"))?;
     }
 
     let mut p = s.p.take().unwrap();
@@ -1998,6 +2175,58 @@ mod tests {
         assert_eq!(pipe["parameters"]["stream.transformer_rows_per_frame"], 2);
         assert_eq!(pipe["parameters"]["lengths.1.rows_per_frame"], 2);
         assert!(pipe["tensors"]["stream.row_pos"].is_object());
+    }
+
+    #[test]
+    fn mimi_ring_store_follows_attention_for_short_and_long_chunks() {
+        let mut cfg = mimi();
+        cfg.ring_kv = true;
+        let steps = [(32, 1), (32, 17)];
+        let low = lower_programs(&cfg, 132, 90, None, &[(1, 8)], &steps).unwrap();
+        let model = &low.prefix.model;
+        assert!(crate::manifest::SpeechMasks::of(model).ring_kv);
+        let decode = &model.progs[low.roles["decode.b1.f8"] as usize];
+        assert!(!decode
+            .insts
+            .iter()
+            .any(|d| plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)));
+        for (b, n) in steps {
+            let prog = &model.progs[low.roles[&format!("step.b{b}.f{n}")] as usize];
+            let stores: Vec<_> = prog
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.op == DevOp::StreamTailF32 as u16 && d.i[7] == 2)
+                .collect();
+            assert_eq!(stores.len(), cfg.layers as usize);
+            for (k, store) in stores {
+                let attention = &prog.insts[k - 1];
+                assert_eq!(attention.op, DevOp::AttentionF32 as u16);
+                assert!(after(prog, k, k - 1));
+                assert!(after(prog, k + 1, k));
+                assert_eq!(
+                    model.tensors[store.t[5] as usize].name,
+                    "in.codec.stream.row_pos"
+                );
+                assert_eq!(
+                    plow_asset::speech_flag_layout::is_ring_attention(attention.i[6]),
+                    n == 1
+                );
+                if n == 17 {
+                    let gather = &prog.insts[k - 2];
+                    assert_eq!(gather.op, DevOp::StreamTailF32 as u16);
+                    assert_eq!(gather.i[7], 3);
+                    assert_eq!(gather.t[2], store.t[2]);
+                    assert!(after(prog, k - 1, k - 2));
+                }
+            }
+            assert_eq!(
+                plow_asset::speech_flag_layout::required_layout(
+                    prog.insts.iter().map(|d| (d.op, d.j[1], d.i))
+                ),
+                Some(3)
+            );
+        }
     }
 
     /// `state.codec.*` name -> bytes the step programs need: (tail rows, channels) per carry.

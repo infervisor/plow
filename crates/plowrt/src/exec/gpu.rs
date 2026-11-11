@@ -181,8 +181,11 @@ use prefix::VmmServe;
 mod decode_context;
 mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
+mod codec_tick;
+mod control_sample;
 mod decode_rung;
 mod fish_depth;
+pub use codec_tick::{CodecTick, CodecTickState};
 pub use fish_depth::{FishInfo, FishRow};
 mod fp8_block;
 mod gen_decode;
@@ -194,6 +197,7 @@ mod packed_terminal;
 pub mod packet_exec;
 pub mod rank;
 mod riders;
+mod row_decode;
 mod segment_gates;
 mod shared_tail;
 pub mod spec;
@@ -739,12 +743,13 @@ fn segment_role_metadata(blob: &DevBlob, raw: &[u8]) -> Result<Option<SegmentRol
 /// The narrowest decode rung whose program declares `MOE_DECODE_CUBLASLT` segments: where an
 /// unset `PLOW_MOE_DEC_LT` starts routing.
 fn moe_lt_decode_packet_min(blob: &DevBlob, roles: Option<&SegmentRoles>) -> Option<u32> {
-    let prefill = blob.prefill_progs().len();
     roles?
         .programs
         .iter()
         .filter(|program| {
-            program.index >= prefill
+            blob.progs
+                .get(program.index)
+                .is_some_and(|g| g.role.is_decode_rung())
                 && program
                     .roles
                     .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
@@ -2766,6 +2771,8 @@ pub struct GpuEngine {
     /// Wide-rung object selected for the widest decode chain.
     gemv_wide: Option<Arc<decode_object::BoundDecodeObject>>,
     gemv_wide_modules: [Option<Arc<decode_object::BoundDecodeObject>>; 2],
+    /// The `_gw` object at its full claim for depth programs below its wide-arm rung.
+    depth_gw: Option<(usize, Arc<decode_object::BoundDecodeObject>)>,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, tensor-table base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
@@ -2926,6 +2933,7 @@ pub struct GpuEngine {
     /// The slot's prompt rows are not determined by its ids (frame codes beside them): its first
     /// prefill chunk never attaches a cached prefix.
     prefix_attach_off: Vec<bool>,
+    prefix_needs_row_keys: bool,
     /// The slot was seated from a KV image ([`Self::import_kv_image`]): its rings hold only the
     /// image's window, so it publishes no boundary to the prefix cache until `begin_slot`.
     publish_off: Vec<bool>,
@@ -3004,6 +3012,7 @@ pub struct GpuEngine {
     /// The packed launch's Qwen requests as (slot, rows), taken by `launch_prefill_chain`.
     qwen_pack: Vec<(usize, u32)>,
     mixed_step: Option<mixed_step::MixedCudaStep>,
+    row_decode: Option<row_decode::RowDecode>,
     token_batch: Option<token_batch::CudaTokenBatch>,
     /// Split attention for decode rows riding a packed prefill launch (`riders.rs`).
     riders: Option<riders::Riders>,
@@ -3043,6 +3052,12 @@ pub struct GpuEngine {
     slot_generations: Vec<u32>,
     /// Fish S2 depth stage ([`fish_depth`]); `None` for every other packet.
     fish: Option<fish_depth::FishDepth>,
+    /// The serving model's bucket-demand counters (unobserved until `observe_buckets`).
+    buckets: Arc<crate::obs::bucket::BucketDemand>,
+    /// Slot extent of the last decode selection (highest fed slot + 1).
+    decode_extent: usize,
+    /// The family this engine's serial prefill launches count as.
+    prefill_family: crate::obs::bucket::Family,
     /// The serial prefill's last chunk's terminal row (its lm_head row of `act.hn`).
     pf_terminal_row: u32,
     /// Span-mode verify (`in.rowslot` packets); see [`spec`].
@@ -4485,6 +4500,8 @@ impl GpuEngine {
             blob.with_packet_view(|p| pack.validate(p, live))
                 .map_err(RuntimeError::Rejected)?;
         }
+        let keyed_overlays = crate::tts::SpeechContract::load(assets_dir)?
+            .is_some_and(|c| c.depth && c.slot_prefix_reuse);
         let prefix_layout = crate::memory::vmm::VmmOps::granularity(be.as_ref())
             .ok()
             .and_then(|granularity| {
@@ -4497,6 +4514,7 @@ impl GpuEngine {
                     live_kv_manifest
                         .as_ref()
                         .map_or(Some(false), |m| m.full_rows_interleaved()),
+                    keyed_overlays,
                 )
             });
         let prefix_requested = config.nv_prefix_requested(prefix_layout.is_some());
@@ -4570,7 +4588,9 @@ impl GpuEngine {
             .any(plow_asset::segment_roles::is_projection);
         let prefill_cublaslt_enabled = segment_roles.as_ref().is_some_and(|roles| {
             roles.programs.iter().any(|program| {
-                program.index < blob.prefill_progs().len()
+                blob.progs
+                    .get(program.index)
+                    .is_some_and(|g| g.role.is_prefill_side())
                     && program.roles.contains(&plow_asset::segment_roles::CUBLASLT)
             })
         });
@@ -4588,7 +4608,9 @@ impl GpuEngine {
             .unwrap_or_default();
         let moe_lt_decode_roles = segment_roles.as_ref().is_some_and(|roles| {
             roles.programs.iter().any(|program| {
-                program.index >= blob.prefill_progs().len()
+                blob.progs
+                    .get(program.index)
+                    .is_some_and(|g| g.role.is_decode_rung())
                     && program
                         .roles
                         .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
@@ -4603,7 +4625,9 @@ impl GpuEngine {
         // (`gen_decode.rs`): routed per rung from PLOW_GEN_DECODE_STEP rows.
         let gen_decode_declared = segment_roles.as_ref().is_some_and(|roles| {
             roles.programs.iter().any(|program| {
-                program.index >= blob.prefill_progs().len()
+                blob.progs
+                    .get(program.index)
+                    .is_some_and(|g| g.role.is_decode_rung())
                     && program
                         .roles
                         .iter()
@@ -4660,10 +4684,11 @@ impl GpuEngine {
         if decode_objects.is_some() || prepared_contexts.is_some() {
             decode_object::check_options(
                 segment_roles.as_ref().is_some_and(|roles| {
-                    roles
-                        .programs
-                        .iter()
-                        .any(|program| program.index >= blob.prefill_progs().len())
+                    roles.programs.iter().any(|program| {
+                        blob.progs
+                            .get(program.index)
+                            .is_some_and(|g| g.role.is_decode_rung())
+                    })
                 }),
                 cublaslt_enabled,
                 effective_multistep as usize,
@@ -4764,6 +4789,16 @@ impl GpuEngine {
                 let image_len = image.len();
                 let dec_source = dec.source.clone();
                 let module = DecodeModule::load(&be, &image)?;
+                // The regular programs run on this object, whatever was selected (a speech
+                // object can be: its entry is a decode entry too).
+                let layout = blob.speech_flag_layout(&raw)?;
+                packet_exec::check_speech_flag_layout(
+                    &be,
+                    &module,
+                    Path::new(&dec_source.to_string()),
+                    layout.declared,
+                    layout.regular,
+                )?;
                 check_norm_weight_offset(&be, &module, &blob)?;
                 if be
                     .module_global_u32(&module, "plow_kv_layout")?
@@ -8004,6 +8039,9 @@ impl GpuEngine {
                 gemv_wide.as_ref().map(|(_, (_, full))| Arc::clone(full)),
                 gemv_wide64.as_ref().map(|(_, full)| Arc::clone(full)),
             ],
+            depth_gw: gemv_wide
+                .as_ref()
+                .map(|(min_rows, (_, full))| (*min_rows, Arc::clone(full))),
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
@@ -8070,6 +8108,7 @@ impl GpuEngine {
             staged_speech_prefix: vec![None; batch],
             staged_prefix: vec![None; batch],
             prefix_attach_off: vec![false; batch],
+            prefix_needs_row_keys: blob.tensors.iter().any(|t| t.name == "in.encoder_overlay"),
             publish_off: vec![false; batch],
             session_end: vec![false; batch],
             disconnected: vec![false; batch],
@@ -8109,6 +8148,7 @@ impl GpuEngine {
             recurrent_packs: qwen_packs,
             qwen_pack: Vec::new(),
             mixed_step,
+            row_decode: None,
             token_batch: None,
             riders: None,
             gen_decode,
@@ -8134,6 +8174,9 @@ impl GpuEngine {
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
             fish: None,
+            buckets: Default::default(),
+            decode_extent: 0,
+            prefill_family: crate::obs::bucket::Family::Prefill,
             pf_terminal_row: 0,
             spec,
             spec_draft: None,
@@ -8150,10 +8193,15 @@ impl GpuEngine {
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
-        engine.fish = fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
+        if blob.reserved_metadata(raw, "block.json")?.is_none() {
+            engine.fish =
+                fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
+        }
+        engine.depth_calibrate()?;
         engine.speech_identities = prefix::SpeechIdentities::new(engine.token_input_vocab());
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
+        engine.row_decode = row_decode::RowDecode::load(&engine, &blob, raw, assets_dir)?;
         if token_batch::CudaTokenBatch::eligible(&engine) {
             engine.riders = riders::Riders::load(&engine, &blob)?;
             engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
@@ -9183,10 +9231,12 @@ impl GpuEngine {
         }
         let identities = self.staged_speech_prefix[b].clone();
         let cache_prompt = identities.as_deref().unwrap_or(prompt);
+        let keyed = !self.prefix_needs_row_keys || identities.is_some();
         // In-flight sharing: another slot is prefilling this prompt's shared prefix. Wait
         // for its whole-block checkpoint (one attach + the tail) instead of recomputing the
         // shared rows beside it; bounded, and released when the owner publishes or retires.
         if self.vmm_prefix_enabled()
+            && keyed
             && !self.prefix_attach_off[b]
             && crate::config::RuntimeConfig::get().prefix_inflight_wait()
         {
@@ -9213,7 +9263,7 @@ impl GpuEngine {
                 }
             }
         }
-        if self.vmm_prefix_enabled() && self.pos[b] == 0 && !self.prefix_attach_off[b] {
+        if self.vmm_prefix_enabled() && keyed && self.pos[b] == 0 && !self.prefix_attach_off[b] {
             let since = match self.packed_admission[b] {
                 PackedAdmission::WaitingPrefix(since) | PackedAdmission::WaitingRestore(since) => {
                     since
@@ -9934,11 +9984,15 @@ impl GpuEngine {
         decode_rung_index(self.decode_rungs.iter().map(|r| r.rows), highest_slot)
     }
 
-    fn select_decode(&self, slots: impl Iterator<Item = usize> + Clone) -> Result<DecodeSelection> {
+    fn select_decode(
+        &mut self,
+        slots: impl Iterator<Item = usize> + Clone,
+    ) -> Result<DecodeSelection> {
         let highest = slots
             .clone()
             .max()
             .ok_or_else(|| RuntimeError::Rejected("empty decode selection".into()))?;
+        self.decode_extent = highest + 1;
         let band = self
             .decode_contexts
             .as_ref()
@@ -9984,7 +10038,17 @@ impl GpuEngine {
             plan.extend(self.pos.iter().map(|&p| u64::from(p)));
             self.rank_arm(&plan)?;
         }
-        self.launch_decode_program(selection)
+        self.launch_decode_program(selection)?;
+        let cap = self
+            .selected_decode(selection)
+            .map_or(self.batch, |r| r.rows);
+        self.buckets.record(
+            crate::obs::bucket::Family::Decode,
+            self.decode_extent,
+            cap,
+            None,
+        );
+        Ok(())
     }
 
     /// Start a tensor-parallel launch unit: the previous unit has retired (stream drained),
@@ -11213,6 +11277,26 @@ impl GpuEngine {
             inferred_policy.fa256_gqa2 = true;
         }
         let module = be.module_load(&pf.image)?;
+        // The decode site checked the packet's declaration; this object runs the same regular
+        // programs and must read their flag layout too.
+        {
+            use plow_asset::speech_flag_layout as layout;
+            let used = layout::first_protected(
+                blob.progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .map(|d| (d.op, d.fj[2], d.i)),
+            );
+            let have = be.module_global_u32(&module, layout::OBJECT_SYMBOL)?;
+            let required = layout::required_layout(
+                blob.progs
+                    .iter()
+                    .flat_map(|p| &p.insts)
+                    .map(|d| (d.op, d.fj[2], d.i)),
+            );
+            layout::check(required, used, have)
+                .map_err(|e| RuntimeError::Rejected(format!("prefill interpreter: {e}")))?;
+        }
         if let Some(requirements) = requirements {
             check_object_requirements(be, &module, &requirements.prefill, "prefill interpreter")?;
         }
@@ -12920,6 +13004,7 @@ impl GpuEngine {
         // All uploads/memsets are enqueued on the engine stream — the launch
         // follows them in stream order (no context sync needed).
         self.launch_prefill_chain(bi, arg, f_pf, b, c0, n, tc, true)?;
+        self.buckets.record(self.prefill_family, real, tc, None);
         Ok(real)
     }
 
@@ -15102,6 +15187,8 @@ impl GpuEngine {
             let _ = self.be.stream_synchronize(&self.stream);
             return Err(error);
         }
+        self.buckets
+            .record(crate::obs::bucket::Family::Prefill, total, tc, None);
         if synchronize {
             if let Err(e) = self.be.stream_synchronize(&self.stream) {
                 tracing::warn!(

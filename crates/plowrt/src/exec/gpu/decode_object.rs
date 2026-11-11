@@ -45,12 +45,11 @@ pub(super) fn parse(blob: &DevBlob, raw: &[u8]) -> Result<Option<DecodeObjects>>
     };
     let metadata: DecodeObjects =
         serde_json::from_slice(bytes).map_err(|e| reject(&e.to_string()))?;
-    let start = blob.prefill_progs().len();
     let programs: Vec<_> = blob
         .progs
         .iter()
         .enumerate()
-        .skip(start)
+        .filter(|(_, g)| g.role.is_decode_rung())
         .map(|(i, g)| (i, g.t))
         .collect();
     metadata

@@ -22,6 +22,14 @@ pub struct TextEncoder {
 }
 
 impl TextEncoder {
+    /// Count the encoder's launches into the serving model's bucket-demand counters.
+    pub fn observe_buckets(&self, buckets: &Arc<crate::obs::bucket::BucketDemand>) {
+        let family = crate::obs::bucket::Family::TextEncoder;
+        self.e
+            .lock()
+            .observe_prefill_as(Arc::clone(buckets), family);
+    }
+
     pub fn load(dir: &Path, device: u8) -> Result<Self, String> {
         let be =
             Arc::new(crate::device::cuda::CudaBackend::new(device).map_err(|e| e.to_string())?);

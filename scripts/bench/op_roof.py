@@ -27,6 +27,9 @@ weights. Other activations use BF16; FP8 attention uses one-byte KV regardless o
 which applies to BF16 attention. Attention reads min(ctx, window) keys per row. Ceilings:
 --gpu (scripts/campaign/roofline.py registry), --bw / --tflops / --fp8-tflops override. Prefer
 calibrated bandwidth; an assumed or registry ceiling does not establish measured efficiency.
+For streaming speech attention, --ctx is the absolute transformer-row position before this step;
+the layer's emitted history and window bound the carried keys. State-copy traffic assumes all
+items are active; stopped/padded items need a separate floor.
 """
 import argparse
 import collections
@@ -40,7 +43,7 @@ from roofline import lookup_gpu  # noqa: E402
 
 LINE = re.compile(r"^#(\d+)\s+(\w+)\s+b=(\d+)\s*(.*)$")
 PROGRAM = re.compile(r"^===== program T=(\d+)")
-WEIGHT = re.compile(r"(?:W|B|Wg|W_gate|W_q|table)<-(\S+)")
+WEIGHT = re.compile(r"(?:W|B|Wg|W_gate|W_q|weight|table)<-(\S+)")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SITE = re.compile(r'sites="([^"]+)" count=(\d+) elapsed_ms="([0-9.]+)"')
 
@@ -62,6 +65,17 @@ def parse(text):
             continue
         head, _, tail = m.group(4).partition(" | ")
         p = {k: float(v) for k, v in re.findall(r"(\w+)=(-?[\d.]+)(?=\s|$)", tail)}
+        if m.group(2) in ("LayerNormF32", "AttentionF32"):
+            for slot in ("gamma", "beta", "add", "key_lengths"):
+                operand = re.search(rf"\b{slot}<-(\S+)", head)
+                p[f"has_{slot}"] = bool(operand and operand.group(1) != "—")
+        if m.group(2) == "GatherRowsF32":
+            operand = re.search(r"\bindex<-(\S+)", head)
+            p["has_index"] = bool(operand and operand.group(1) != "—")
+        if m.group(2) == "Conv1dF32":
+            for slot in ("bias", "alpha", "residual", "lengths", "row_scale"):
+                operand = re.search(rf"\b{slot}<-(\S+)", head)
+                p[f"has_{slot}"] = bool(operand and operand.group(1) != "—")
         if m.group(2) == "GemmGluFp8":
             scale = re.search(r"a_scale<-(\S+)", head)
             p["fp8_activation"] = bool(scale and scale.group(1) != "—")
@@ -207,10 +221,86 @@ def cost(op, p, rows, ctx, wb, kvb):
         return 12 * g("items", 1) * g("rows", rows) * g("width"), 0
     if op == "RmsNormF32":
         return 8 * g("rows", rows) * g("groups", 1) * g("group_width"), 0
+    if op == "GemvF32Out":
+        n, k, flags = g("N"), g("K"), int(g("flags", 0))
+        group = g("bias_group", 0) if flags & 512 else 0
+        bias_rows = (m + group - 1) // group if group else 1
+        traffic = 2 * n * k + (2 if flags & 8192 or not flags & 1 else 4) * m * k
+        traffic += (2 if flags & 16384 else 4) * m * n
+        if flags & 4:
+            traffic += 4 * bias_rows * n
+        if flags & 8:
+            traffic += 4 * m * n
+        if flags & 256:
+            traffic += 8 * k
+        return traffic, 2 * m * n * k
     if op == "LayerNormF32":
-        return 8 * g("rows", rows) * g("feat"), 0
+        n, k = g("rows", rows), g("feat")
+        output_bytes = 2 if int(g("flags", 0)) & 8 else 4
+        return ((4 + output_bytes + 4 * g("has_add", False)) * n * k
+                + 4 * k * (g("has_gamma", False) + g("has_beta", False))), 0
+    if op == "Conv1dF32":
+        flags = int(g("flags", 0))
+        if (g("kernel") != 1 or g("stride") != 1 or g("groups") != 1
+                or g("pads", 0) or g("has_lengths", False)
+                or g("has_alpha", False) or g("has_row_scale", False)
+                or flags & ((1 << 20) | (63 << 24) | (3 << 30))):
+            return None
+        count, k, n = g("batch") * g("in_rows"), g("in_channels"), g("out_channels")
+        weight_bytes = 2 if flags & (1 << 12) else 4
+        traffic = weight_bytes * n * k + 4 * count * (k + n)
+        traffic += 4 * n * g("has_bias", False) + 4 * count * n * g("has_residual", False)
+        return traffic, 2 * count * n * k
+    if op == "RopeAxialF32" and not int(g("flags", 0)) & ~3:
+        return 8 * g("rows", rows) * g("heads") * g("head_width") + 4 * g("rows", rows) * g("axes"), 0
+    if op == "StreamTailF32":
+        b, history, new, width, zwidth = (g("B"), g("L"), g("N"), g("C"), g("Cz"))
+        mode = g("mode")
+        if mode in (0, 3):
+            if ctx <= 0:
+                return None
+            carried = min(ctx, history) if mode == 3 else history
+            return 4 * b * (carried * width + new * zwidth + (history + new) * zwidth + (3 if mode == 3 else 2)), 0
+        if mode in (1, 2):
+            count = min(new, history) if mode == 2 else history
+            return 8 * b * count * width + 4 * b * (3 if mode == 2 else 2), 0
+        return None
     if op == "GatherRowsF32":
-        return (8 * g("width") + 4) * g("rows", rows), 0
+        flags = int(g("flags", 0))
+        source_bytes = 2 if flags & 1 else 4
+        traffic = (source_bytes + 4 + (4 if flags & 2 else 0)) * g("width")
+        return (traffic + 4 * g("has_index", True)) * g("rows", rows), 0
+    if op == "CopyColsF32" and not g("flags", 0):
+        return 8 * g("items", 1) * g("rows", rows) * g("cols"), 0
+    if op == "AttentionF32":
+        b, q, keys, h, d = (g("batch"), g("q_rows"), g("kv_rows"),
+                            g("heads"), g("head_width"))
+        flags = int(g("flags", 0))
+        low, window = flags & 0xffff, flags >> 16
+        if low == 0x109 or low == 9:
+            if ctx <= 0 or (low == 9 and g("has_key_lengths", False)):
+                return None
+            history = keys if low == 0x109 else g("bias_head_stride")
+            if history is None or (low == 0x109 and (d != 64 or q > 4 or window != history + 1)):
+                return None
+            if low == 9 and keys != history + q:
+                return None
+            past = min(ctx, history)
+            counts = [min(past + r + 1, window) if window else past + r + 1 for r in range(int(q))]
+            union = past + q - (max(0, past + 1 - window) if window else 0)
+            return 8 * b * h * d * (q + union), 4 * b * h * d * sum(counts)
+        if flags & ~3:
+            return None
+        if g("has_key_lengths", False):
+            if ctx <= 0:
+                return None
+            keys = min(keys, ctx)
+        pairs = q * keys
+        if int(g("flags", 0)) & 1:
+            ramp = min(q, keys)
+            pairs = ramp * (ramp + 1) / 2 + (q - ramp) * keys
+            keys = min(keys, q)
+        return 8 * b * h * d * (q + keys), 4 * b * h * d * pairs
     if op == "ChunkAttentionF32":
         t, hh, d = g("rows", rows), g("heads"), g("head_width")
         keys = g("chunk") + g("left") + g("future", 0)

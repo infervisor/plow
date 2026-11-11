@@ -1,4 +1,5 @@
 import argparse
+import base64
 import hashlib
 import importlib.util
 import io
@@ -109,6 +110,46 @@ class TtsCaptureTests(unittest.TestCase):
         rows = evaluation.tts_cases(self.args, "model")
         self.assertEqual([r["seed"] for r in rows], [1, 2])
         self.assertEqual([r["voice"] for r in rows], ["another-voice"] * 2)
+
+    def test_reference_requests_keep_exact_audio_and_optional_transcript_without_payload_in_capture(self):
+        cases = self.cases(2)
+        audio = wav(struct.pack("<3h", -100, 0, 100))
+        (self.root / "reference.wav").write_bytes(audio)
+        for i, case in enumerate(cases):
+            case.update(ref_audio_path="reference.wav", non_streaming_mode=bool(i))
+        cases[1]["ref_text"] = "Reference transcript."
+        self.manifest.write_text(json.dumps(cases))
+        seen = []
+
+        def call(method, endpoint, body):
+            self.assertEqual(base64.b64decode(body["ref_audio"], validate=True), audio)
+            seen.append(body)
+            return 200, wav(b"\0\0" * 4)
+
+        with mock.patch.object(evaluation, "call", side_effect=call):
+            directory, rows = evaluation.capture_tts(self.args, "model", self.root)
+        seen.sort(key=lambda b: b["seed"])
+        self.assertNotIn("ref_text", seen[0])
+        self.assertEqual(seen[1]["ref_text"], cases[1]["ref_text"])
+        self.assertEqual([b["non_streaming_mode"] for b in seen], [False, True])
+        for row in rows:
+            self.assertNotIn("ref_audio", row)
+            self.assertEqual(row["ref_audio_sha256"], hashlib.sha256(audio).hexdigest())
+            self.assertEqual(row["ref_audio_path"], str(self.root / "reference.wav"))
+        saved = json.loads((Path(directory) / "capture.json").read_text())
+        self.assertFalse(any("ref_audio" in row for row in saved))
+
+    def test_bad_reference_inputs_fail_before_any_request(self):
+        for extra in [dict(ref_audio_path="missing.wav"), dict(ref_audio_path=""),
+                      dict(ref_audio_path=42), dict(ref_text=""),
+                      dict(non_streaming_mode="false")]:
+            cases = self.cases(1)
+            cases[0].update(extra)
+            self.manifest.write_text(json.dumps(cases))
+            with mock.patch.object(evaluation, "call") as call:
+                with self.assertRaises((OSError, ValueError)):
+                    evaluation.capture_tts(self.args, "model", self.root)
+                call.assert_not_called()
 
     def test_empty_or_malformed_cases_fail_before_requests(self):
         for cases in [[], {}, [dict(text="")], [None]]:

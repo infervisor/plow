@@ -514,6 +514,8 @@ impl GpuEngine {
             tracing::warn!(launch_rows, rows, error = %e, "spec verify launch failed");
             e
         })?;
+        self.buckets
+            .record(crate::obs::bucket::Family::Verify, rows, launch_rows, None);
         // Plain launches after this one read the identity map again (stream order).
         self.spec_upload_identity()?;
         self.spec.as_mut().expect("checked").map_dirty = false;

@@ -46,26 +46,27 @@ use object::{
     build_requires, check_attn_res_f32mix_symbols, check_compiled_opcode_marker_set,
     check_compiled_opcode_markers, check_dec_stage_capacity, check_decode_object,
     check_dsa_decode_batch, check_dsa_pf_arm, check_dsa_select_local, check_fp8_weight_arms,
-    check_gate_hier_object, check_gemv_capacity, check_interpreter_waves, check_k3_arms,
-    check_kda_carry_regstate_symbols, check_kda_chunk, check_kda_conv_step_db,
-    check_kda_intra_wave_items_symbols, check_kv_encoding, check_materialized_residual_input,
-    check_mla_nope_arm, check_mla_v2_sv_raw_symbols, check_moe_ep_symbols, check_moe_gemma_arms,
-    check_moe_pf_a4w4, check_packed_family_kv_encoding, check_packed_prefill_abi,
-    check_packet_pairing_stamp, check_prefill_geometry, check_prefill_object, check_qwen_gdn_arms,
-    check_sparse_fp8_object, check_sparse_fp8_packet, check_xalltoall_heads,
-    check_xargmax_capacity, elf_symbol_u32, first_op_in, graph_phase_xreduce_segments,
-    l2_pairing_refusal, log_gate_hier_status, packet_decode_arm_requirements,
-    packet_prefill_arm_requirements, read_attn_res_f32mix_object, read_kda_carry_regstate_object,
-    read_kda_intra_wave_items_object, required_gemv_m, required_k3_op, required_kda_chunk,
-    required_kda_conv_step_db, required_kv_op, required_moe_pf_a4w4, required_moe_pf_accum,
-    required_qwen_gdn_op, resolve_flash_object_load, sparse_fp8, BF16_KV_OPS, FP8_KV_OPS,
-    FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM, GEMM_GROUP_LDS, KDA_CARRY_KEYFEED_MARKERS,
-    KDA_CARRY_REGSTATE_LDS, KDA_CHUNK_QPRE_SYM, KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM,
-    KDA_WU_LEAN_LDS, KDA_WU_LEAN_MARKERS, L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM,
-    MOE_ENC_MXFP4, MOE_GEMMA_OPS, MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM,
-    PACKED_PREFILL_BAND_SYM, PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM,
-    PACKED_PREFILL_MLA_FLASH_SEG_SYM, PACKED_PREFILL_MLA_NOPE_SYM, PACKED_PREFILL_MLA_NORM_SEG_SYM,
-    XR_ATTNRES_RESOURCE_SYM, XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
+    check_fused_gemv_capacity, check_gate_hier_object, check_gemv_capacity,
+    check_interpreter_waves, check_k3_arms, check_kda_carry_regstate_symbols, check_kda_chunk,
+    check_kda_conv_step_db, check_kda_intra_wave_items_symbols, check_kv_encoding,
+    check_materialized_residual_input, check_mla_nope_arm, check_mla_v2_sv_raw_symbols,
+    check_moe_ep_symbols, check_moe_gemma_arms, check_moe_pf_a4w4, check_packed_family_kv_encoding,
+    check_packed_prefill_abi, check_packet_pairing_stamp, check_prefill_geometry,
+    check_prefill_object, check_qwen_gdn_arms, check_sparse_fp8_object, check_sparse_fp8_packet,
+    check_xalltoall_heads, check_xargmax_capacity, elf_symbol_u32, first_op_in,
+    graph_phase_xreduce_segments, l2_pairing_refusal, log_gate_hier_status,
+    packet_decode_arm_requirements, packet_prefill_arm_requirements, read_attn_res_f32mix_object,
+    read_kda_carry_regstate_object, read_kda_intra_wave_items_object, required_gemv_m,
+    required_k3_op, required_kda_chunk, required_kda_conv_step_db, required_kv_op,
+    required_moe_pf_a4w4, required_moe_pf_accum, required_qwen_gdn_op, resolve_flash_object_load,
+    sparse_fp8, BF16_KV_OPS, FP8_KV_OPS, FP8_KV_SYM, FP8_WEIGHT_OPS, GATE_HIER_SYM, GEMM_GROUP_LDS,
+    KDA_CARRY_KEYFEED_MARKERS, KDA_CARRY_REGSTATE_LDS, KDA_CHUNK_QPRE_SYM,
+    KDA_CONV_STEP_DB_REPLACED_OPS, KDA_FAMILY_SEG_SYM, KDA_WU_LEAN_LDS, KDA_WU_LEAN_MARKERS,
+    L2_DISPATCH_SYM, MLA_PF_V2_FP8_SYM, MLA_PF_V2_SYM, MOE_ENC_MXFP4, MOE_GEMMA_OPS,
+    MOE_GEMMA_PF_OPS, PACKED_PREFILL_ABI_SYM, PACKED_PREFILL_BAND_SYM,
+    PACKED_PREFILL_KDA_CHUNK_SEG_SYM, PACKED_PREFILL_KDA_SEG_SYM, PACKED_PREFILL_MLA_FLASH_SEG_SYM,
+    PACKED_PREFILL_MLA_NOPE_SYM, PACKED_PREFILL_MLA_NORM_SEG_SYM, XR_ATTNRES_RESOURCE_SYM,
+    XR_ATTNRES_SEG_SYM, XR_TAGGED_SYM,
 };
 pub use object::{mla_pf_v2_enabled, object_name, symbol_name, Phase, PrefillArm, Sched, Variant};
 
@@ -8188,6 +8189,8 @@ pub struct AmdEngine {
     /// `--rowband` as read at engine build. Serve-start only: with it off the packet's
     /// full-width twins were never bound, so the siblings must never be dispatched either.
     rowband_on: bool,
+    /// The serving model's bucket-demand counters (unobserved until `observe_buckets`).
+    buckets: Arc<crate::obs::bucket::BucketDemand>,
     devp: Vec<DeviceMem>,
     /// Owner of the one allocation the ordinarily-allocated tensors are carved
     /// out of; `devp` then holds **views** into it. Unlike the CUDA side, this
@@ -9676,6 +9679,16 @@ impl AmdEngine {
                     Phase::Flash => unreachable!(),
                 };
                 check_gemv_capacity(&syms, &path, need)?;
+                // A decode tier (`gemv_need = Some(w)`) serves only the rungs up to `w`.
+                let fused: Vec<&DevProg> = match phase {
+                    Phase::Decode => blob.decode_progs(),
+                    Phase::Prefill => blob.prefill_progs(),
+                    Phase::Flash => unreachable!(),
+                }
+                .into_iter()
+                .filter(|p| gemv_need.is_none_or(|w| p.t <= w))
+                .collect();
+                check_fused_gemv_capacity(&syms, &path, fused)?;
             }
             if phase == Phase::Decode {
                 check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;
@@ -14393,6 +14406,7 @@ impl AmdEngine {
             rowband_sibling,
             a2a_sibling,
             rowband_on,
+            buckets: Default::default(),
             devp,
             _weight_slab: weight_slab,
             d_tens,
@@ -18495,6 +18509,14 @@ impl AmdEngine {
         let insts: &mut [DevInst64] = unsafe {
             std::slice::from_raw_parts_mut(self.h_pf_inst.as_mut_ptr() as *mut DevInst64, n)
         };
+        if let Err(pool) = crate::exec::kvrow::dsa_pool_chunk_base_aligned(insts, c0) {
+            return Err(RuntimeError::Device(format!(
+                "DSA chunk base {c0} is not a multiple of the key-pool size {pool}: \
+                 DsaPoolCompress files rows under chunk_base / pool_size (op_dsa_pool.h), so \
+                 this chunk's leading rows would land in the previous pool. Prefix snapshots \
+                 and chunk boundaries must stay pool-aligned (serve::engine::prefix_plan)."
+            )));
+        }
 
         rebase_chunk_rows(
             insts,
@@ -18959,10 +18981,27 @@ impl AmdEngine {
         plan_chunks_capped(&buckets, n_prompt, max_bucket)
     }
 
+    /// Declare the prefill buckets to `buckets` and count prefill launches into it.
+    pub fn observe_buckets(&mut self, buckets: Arc<crate::obs::bucket::BucketDemand>) {
+        let rungs = self.prefill_rungs().map(|(_, rows)| rows as usize);
+        buckets.declare(crate::obs::bucket::Family::Prefill, rungs);
+        self.buckets = buckets;
+    }
+
+    fn record_prefill(&self, bucket: usize, rows: usize) {
+        if let Some(t) = self.prefill_prog_t(bucket) {
+            self.buckets
+                .record(crate::obs::bucket::Family::Prefill, rows, t as usize, None);
+        }
+    }
+
     pub(crate) fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+        let bucket = step.prog;
         let step = self.chunk_program(step);
         self.prefill_prepare(prompt, step)?;
-        self.run_segmented(step.prog)
+        self.run_segmented(step.prog)?;
+        self.record_prefill(bucket, step.clen as usize);
+        Ok(())
     }
 
     pub(crate) fn prefill_packed_chunk(
@@ -18991,7 +19030,10 @@ impl AmdEngine {
                 span.program = prog as u32;
             }
             self.packed_prefill_prepare(prog, &routed, prompts, parked)?;
-            self.run_segmented(prog)
+            self.run_segmented(prog)?;
+            let rows = spans.iter().map(|s| s.n_rows as usize).sum();
+            self.record_prefill(first.program as usize, rows);
+            Ok(())
         })();
         self.clear_packed_prefill();
         result
@@ -19033,11 +19075,13 @@ impl AmdEngine {
         );
 
         for step in steps {
+            let bucket = step.prog;
             let step = self.chunk_program(step);
             let t = std::time::Instant::now();
             self.prefill_prepare(prompt, step)?;
             crate::obs::ttft::PF_PREPARE.add(t.elapsed().as_nanos() as u64);
             self.run_segmented(step.prog)?;
+            self.record_prefill(bucket, step.clen as usize);
         }
 
         // The device sampled into in.ids itself; the first decode step will
@@ -19500,6 +19544,19 @@ impl AmdEngine {
     /// Bytes one slot's carried recurrent state occupies.
     pub fn carried_bytes(&self) -> u64 {
         self.carried_slot.iter().map(|&(_, n)| n).sum()
+    }
+
+    /// The DSA key-pool size the prefill programs group rows by (non-packed `DsaPoolCompress`,
+    /// `i[6] != 1`, pool size `i[1]`), or 1. Every chunk base and prefix snapshot keeps this
+    /// alignment (`serve::engine::prefix_plan`, [`crate::exec::kvrow::dsa_pool_chunk_base_aligned`]).
+    pub fn dsa_pool_align(&self) -> u32 {
+        self.pf_src
+            .iter()
+            .flatten()
+            .filter(|d| d.op == DevOp::DsaPoolCompress as u16 && d.i[6] != 1)
+            .map(|d| d.i[1].max(1))
+            .max()
+            .unwrap_or(1)
     }
 
     /// Has slot `slot` got a prefix snapshot armed?
