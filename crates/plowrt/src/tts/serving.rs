@@ -1560,14 +1560,13 @@ async fn speech_with(
         .filter(|_| req.stream && model.codec.step_frames > 0)
     {
         sp.first_tokens = model.first_frames();
-        sp.first_audio = Some(Arc::new(crate::serve::mux::FirstAudio::new(
-            sp.first_tokens,
-        )));
-        if let Some(fa) = sp.first_audio.as_ref() {
-            fa.set_frame_period(std::time::Duration::from_secs_f64(
-                model.contract.frame_samples as f64 / model.contract.sample_rate as f64,
-            ));
-        }
+        sp.first_audio = Some(Arc::new(
+            crate::serve::mux::FirstAudio::new(sp.first_tokens).track_playback(
+                mux.mapped_rows() || sp.batch_delivery,
+                c.frame_samples,
+                c.sample_rate,
+            ),
+        ));
     }
     let first_audio = speech.as_ref().and_then(|sp| sp.first_audio.clone());
     let (tx, rx) = stream_mod::channel();
@@ -3301,7 +3300,9 @@ async fn stream_task(
                             }
                             return; // client gone: dropping frx ends the drain, which cancels the slot
                         }
-                        if let (Some(fa), Some(started)) = (audible.0.as_ref(), playing) {
+                        if let (Some(fa), Some(started)) =
+                            (audible.0.as_ref().and_then(|fa| fa.frame_budget()), playing)
+                        {
                             fa.set_playback_deadline(
                                 started + std::time::Duration::from_secs_f64(sent as f64 / sr),
                                 std::time::Duration::from_secs_f64(step_s),
