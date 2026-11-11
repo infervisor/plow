@@ -154,6 +154,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--prompt-set", choices=["veena", "chatterbox", "chatterbox-mtl"], default="veena")
     ap.add_argument("--voice", default=None, help="override every prompt's voice")
+    ap.add_argument("--tags", choices=("auto", "strict", "off"), help="speech tag policy")
     ap.add_argument("--ref-audio", default=None, help="clone every request's voice from this wav (a comma list: cycled)")
     ap.add_argument("--ref-text", default=None, help="transcripts of --ref-audio ('|' list, same order; Fish / Breeze)")
     ap.add_argument("--clone-list", default=None,
@@ -169,6 +170,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     tag = args.tag or f"{'ws' if args.ws else ('stream' if args.stream else 'full')}_c{args.conc}"
     extra = dict(temperature=0.0) if args.greedy else {}
+    if args.tags is not None:
+        extra["tags"] = args.tags
     if args.repetition_penalty is not None:
         extra["repetition_penalty"] = args.repetition_penalty
     refs = []

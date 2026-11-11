@@ -1091,3 +1091,25 @@ For existing packets without tag metadata, `PLOW_TTS_TAGS_DEFAULT=strip`
 It is unset by default, applies to speech drivers only, and never overrides a packet map.
 Per-request `tags: "off"` still selects the original path. New Maya2 profiles emit this
 map directly; they need no fallback setting. Native Maya2 events and styles remain dropped.
+
+`scripts/tts/tag_cases.json` contains 37 neutral request shapes in English and Hindi.
+Capture with `scripts/serve_test/eval.py --tts-manifest`: `reference` is the clean ASR
+reference, while `text` is the request. Supply the clone rows' reference WAVs from your own
+baseline captures. Explicit `voice: null` omits the field; `expected_status: 400` records an
+expected failure without producing an ASR row. Literal syntax remains literal; its expected
+spoken reference must account for the words it preserves.
+
+`scripts/tts/asr_check.py` accepts per-row `forbid` lists in `texts.json`, or
+`--forbid FILE` containing `{ "clip.wav": ["style", "equals"] }`. Matches use normalized
+whole words/phrases (substring matching for Chinese/Japanese). Any hit fails the gate.
+`--baseline-report FILE --cer-margin M` also gates every row against the uniquely matched
+baseline's CER plus the explicit margin. Baseline ASR model, language and clean reference
+must match; use a row's `baseline` to name the control's `case_id` or WAV basename.
+The existing median CER gate still applies.
+
+Signal metadata can declare `pauses: [{"ms":600,"position":"internal","window_ms":[900,1100]}]`
+and `duration_delta: {"baseline":"control.wav","ms":600}`. Internal pauses require a join
+window; leading/trailing positions require silence at that edge. Silence uses 5 ms RMS
+frames below −60 dBFS, with ±80 ms tolerance on both run length and duration delta.
+Compare against a control with the same segmentation and zero inserted pause.
+`tts_bench.py --tags auto|off` supports matching c1 latency measurements.
