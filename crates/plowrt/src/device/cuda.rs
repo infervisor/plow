@@ -395,6 +395,20 @@ fn cu_error_name(api: &Api, rc: CUresult) -> String {
     }
 }
 
+fn unretired_work(error: &RuntimeError) -> DeviceErrorInfo {
+    let mut info = error
+        .device_fault()
+        .cloned()
+        .unwrap_or_else(|| DeviceErrorInfo {
+            operation: "unretired device work".into(),
+            code: -1,
+            name: format!("UNRETIRED_WORK: {error}"),
+            fatal: true,
+        });
+    info.fatal = true;
+    info
+}
+
 /// Build the typed fault for a failed driver call (no poisoning — that is
 /// [`CudaBackend::check`]'s job, and bring-up in `new()` has no backend yet).
 fn cu_fault(api: &Api, rc: CUresult, what: &str) -> RuntimeError {
@@ -1687,6 +1701,12 @@ impl CudaBackend {
         Err(err)
     }
 
+    pub(crate) fn quarantine_unretired(&self, error: &RuntimeError) -> RuntimeError {
+        let info = unretired_work(error);
+        self.mark_poisoned(&info);
+        RuntimeError::DeviceFault { info }
+    }
+
     /// Has a fatal driver status permanently poisoned this context?
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.get().is_some()
@@ -2608,6 +2628,17 @@ impl CudaBackend {
         self.check(
             unsafe { (self.api.cuEventRecord)(event.raw as CUevent, stream.raw as CUstream) },
             "cuEventRecord",
+        )
+    }
+
+    pub(crate) fn stream_wait_event(&self, stream: &CudaStream, event: &CudaEvent) -> Result<()> {
+        self.bind()?;
+        self.check(
+            // SAFETY: both handles remain owned through completion of the wait.
+            unsafe {
+                (self.api.cuStreamWaitEvent)(stream.raw as CUstream, event.raw as CUevent, 0)
+            },
+            "cuStreamWaitEvent",
         )
     }
 
@@ -3746,6 +3777,28 @@ impl Backend for CudaBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unretired_work_preserves_driver_details_and_forces_quarantine() {
+        let original = crate::DeviceErrorInfo {
+            operation: "cuStreamSynchronize".into(),
+            code: 1,
+            name: "CUDA_ERROR_INVALID_VALUE".into(),
+            fatal: false,
+        };
+        let error = crate::RuntimeError::DeviceFault {
+            info: original.clone(),
+        };
+        let info = super::unretired_work(&error);
+        assert!(info.fatal);
+        assert_eq!(info.code, original.code);
+        assert_eq!(info.operation, original.operation);
+        assert_eq!(info.name, original.name);
+        let info = super::unretired_work(&crate::RuntimeError::Msg("untyped drain".into()));
+        assert!(info.fatal);
+        assert_eq!(info.code, -1);
+        assert!(info.name.contains("untyped drain"));
+    }
+
     /// A capture holds only its own device's exclusion; the same device shares one.
     #[test]
     fn capture_exclusion_is_per_device() {

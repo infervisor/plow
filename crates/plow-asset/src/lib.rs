@@ -20,6 +20,7 @@ pub mod certificates;
 pub mod chat;
 pub mod gemm_policy;
 pub mod logical_effects;
+pub mod packet_pipeline_native;
 
 /// The plowrt runtime contract this tree implements; plowrt refuses a bundle whose `build.json`
 /// `runtime_requires.plowrt_contract` is higher.

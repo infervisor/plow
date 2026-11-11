@@ -189,6 +189,8 @@ pub use codec_tick::{CodecTick, CodecTickState};
 pub use fish_depth::{FishInfo, FishRow};
 mod fp8_block;
 mod gen_decode;
+pub(crate) mod handoff;
+pub(crate) mod handoff_provider;
 mod mixed_step;
 mod moe_lt;
 mod native_decode;
@@ -9539,6 +9541,10 @@ impl GpuEngine {
 
     pub fn record_stream_event(&self, event: &CudaEvent) -> Result<()> {
         self.be.event_record(event, &self.stream)
+    }
+
+    pub(crate) fn quarantine_unretired(&self, error: &RuntimeError) -> RuntimeError {
+        self.be.quarantine_unretired(error)
     }
 
     fn step_slots_sampled_unchecked(
