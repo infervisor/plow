@@ -17,8 +17,11 @@ class QueueTests(unittest.TestCase):
     def test_submit_can_leave_the_queued_job_for_a_host_runner(self):
         for enqueue_only in (False, True):
             with self.subTest(enqueue_only=enqueue_only), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                argv = ["gpuq", "--root", directory, "--vendor", "nvidia", "submit"]
+                root = Path(directory).resolve() / "queue"
+                root.mkdir()
+                alias = Path(directory) / "queue-link"
+                alias.symlink_to(root, target_is_directory=True)
+                argv = ["gpuq", "--root", str(alias), "--vendor", "nvidia", "submit"]
                 if enqueue_only:
                     argv.append("--enqueue-only")
                 argv.extend(["m2s-test", "1", "printf", "%s", "hello world"])
