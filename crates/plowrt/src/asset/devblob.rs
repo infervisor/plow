@@ -1094,7 +1094,7 @@ impl DevBlob {
                 .chain(&aux)
                 .map(|d| (d.op, d.fj[2], d.i)),
         );
-        if required == Some(2) && declared.unwrap_or(0) < 2 {
+        if required.is_some_and(|minimum| minimum >= 2 && declared.unwrap_or(0) < minimum) {
             return Err(malformed(
                 "speech flag declaration is older than its instruction bits".into(),
             ));
@@ -2148,13 +2148,16 @@ mod tests {
     }
 
     #[test]
-    fn half_speech_bits_require_layout_two_declarations() {
+    fn speech_bits_require_their_minimum_layout_declarations() {
         for (op, slot, flag) in [
             (DevOp::LayerNormF32, 2, 8),
             (DevOp::GemvF32Out, 7, 8192),
             (DevOp::GemvF32Out, 7, 16384),
+            (DevOp::StreamTailF32, 7, 2),
+            (DevOp::StreamTailF32, 7, 3),
+            (DevOp::AttentionF32, 6, 0x109 | (250 << 16)),
         ] {
-            for declared in [None, Some(1), Some(2)] {
+            for declared in [None, Some(1), Some(2), Some(3)] {
                 let mut m = tiny_model();
                 m.progs[0].insts[0].op = op as u16;
                 m.progs[0].insts[0].i[slot] = flag;
@@ -2170,7 +2173,15 @@ mod tests {
                     data: serde_json::to_vec(&abi).unwrap(),
                 }]);
                 let b = DevBlob::parse(&raw).unwrap();
-                assert_eq!(b.speech_flag_layout(&raw).is_ok(), declared == Some(2));
+                let minimum = if matches!(op, DevOp::StreamTailF32 | DevOp::AttentionF32) {
+                    3
+                } else {
+                    2
+                };
+                assert_eq!(
+                    b.speech_flag_layout(&raw).is_ok(),
+                    declared.is_some_and(|d| d >= minimum)
+                );
             }
         }
     }

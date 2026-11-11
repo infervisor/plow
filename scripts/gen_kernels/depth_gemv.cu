@@ -16,19 +16,24 @@ struct DgArgs {
     const float* x;
     const unsigned short* w;
     const float *bias, *res, *gamma, *beta;
-    unsigned flags, m, n, k;
+    unsigned flags, m, n, k, bgroup;
 };
 
 __global__ void __launch_bounds__(256, 1) k_depth_gemv(DgArgs a) {
-    d_gemv_f32out_mode(a.c, a.x, a.w, a.bias, a.res, a.gamma, a.beta, 1e-5f, a.flags, 0u, a.m, a.n, a.k,
+    d_gemv_f32out_mode(a.c, a.x, a.w, a.bias, a.res, a.gamma, a.beta, 1e-5f, a.flags, a.bgroup, a.m, a.n, a.k,
                        blockIdx.x, gridDim.x, sp_smem, nullptr);
 }
 
 extern "C" {
 void* dg_make(float* c, const float* x, const unsigned short* w, const float* bias, const float* res,
               const float* gamma, const float* beta, unsigned flags, unsigned m, unsigned n, unsigned k) {
-    DgArgs* a = new DgArgs{c, x, w, bias, res, gamma, beta, flags, m, n, k};
+    DgArgs* a = new DgArgs{c, x, w, bias, res, gamma, beta, flags, m, n, k, 0};
     return a;
+}
+void* dg_make_grouped(float* c, const float* x, const unsigned short* w, const float* bias, const float* res,
+                     const float* gamma, const float* beta, unsigned flags, unsigned m, unsigned n,
+                     unsigned k, unsigned bgroup) {
+    return new DgArgs{c, x, w, bias, res, gamma, beta, flags, m, n, k, bgroup};
 }
 int dg_run(void* hp, int nblk, void* stream) {
     static bool init = false;
