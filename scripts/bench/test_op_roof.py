@@ -34,6 +34,62 @@ class SweepTests(unittest.TestCase):
 
 
 class QuantizedDecodeCostTests(unittest.TestCase):
+    def test_depth_projection_precision_and_grouped_epilogue(self):
+        shape = {"M": 200 * 26, "N": 1024, "K": 3072,
+                 "bias_group": 26, "flags": 3 | 4 | 8 | 512 | 1024 | 8192}
+        traffic, flops = op_roof.cost("GemvF32Out", shape, 200, 0, 2, 2)
+        self.assertEqual(traffic, 2 * 1024 * 3072 + 2 * 5200 * 3072
+                         + 8 * 5200 * 1024 + 4 * 200 * 1024)
+        self.assertEqual(flops, 2 * 5200 * 1024 * 3072)
+        shape.update(M=32, N=3072, K=1024, flags=3 | 1024 | 8192 | 16384)
+        self.assertEqual(op_roof.cost("GemvF32Out", shape, 32, 0, 2, 2),
+                         (2 * 3072 * 1024 + 2 * 32 * 1024 + 2 * 32 * 3072,
+                          2 * 32 * 3072 * 1024))
+
+    def test_depth_layer_norm_reads_affine_and_add_inputs(self):
+        text = ("===== program T=32 =====\n"
+                "#0 LayerNormF32 b=32 out<-a x<-x gamma<-g beta<-b add<-r "
+                "| rows=32 feat=1024 flags=8")
+        p = op_roof.parse(text)[0][2][0][3]
+        self.assertEqual(op_roof.cost("LayerNormF32", p, 32, 0, 2, 2),
+                         (10 * 32 * 1024 + 8 * 1024, 0))
+        self.assertEqual(op_roof.cost("GatherRowsF32", {"rows": 32, "width": 1024, "flags": 1},
+                                     32, 0, 2, 2), ((6 * 1024 + 4) * 32, 0))
+        self.assertEqual(op_roof.cost("CopyColsF32", {"items": 32, "rows": 26, "cols": 1024},
+                                     32, 0, 2, 2), (8 * 32 * 26 * 1024, 0))
+
+    def test_depth_attention_causal_and_dynamic_lengths_fail_closed(self):
+        p = {"batch": 32, "q_rows": 26, "kv_rows": 26,
+             "heads": 16, "head_width": 64, "flags": 3}
+        self.assertEqual(op_roof.cost("AttentionF32", p, 32, 0, 2, 2),
+                         (8 * 32 * 16 * 64 * 52, 4 * 32 * 16 * 64 * 351))
+        p.update(q_rows=1, kv_rows=32, flags=2, has_key_lengths=True)
+        self.assertIsNone(op_roof.cost("AttentionF32", p, 32, 0, 2, 2))
+        self.assertEqual(op_roof.cost("AttentionF32", p, 32, 26, 2, 2),
+                         (8 * 32 * 16 * 64 * 27, 4 * 32 * 16 * 64 * 26))
+        for flags in (8, 16, 64, 0x109):
+            p["flags"] = flags
+            self.assertIsNone(op_roof.cost("AttentionF32", p, 32, 26, 2, 2))
+
+    def test_depth_block_disassembly_is_fully_priced(self):
+        text = ("===== program T=200 =====\n"
+                "#0 LayerNormF32 b=132 out<-a x<-x gamma<-g beta<-b add<-— "
+                "| rows=200 feat=1024 flags=8\n"
+                "#1 GemvF32Out b=128 C<-q x<-a W<-maya2.depth.groups.10.0.qkv.weight "
+                "| M=200 N=3072 K=1024 bias_group=0 flags=9219\n"
+                "#2 CopyColsF32 b=132 out<-cache x<-q group<-— "
+                "| items=200 rows=1 cols=3072 flags=0\n"
+                "#3 AttentionF32 b=132 out<-at query<-q key<-cache value<-cache "
+                "key_lengths<-c.depth.len.31 bias<-— prefix<-— "
+                "| batch=200 q_rows=1 kv_rows=32 heads=16 head_width=64 flags=0\n")
+        prog = op_roof.parse(text)[0]
+        priced = op_roof.price(prog, 32, 2, 2, 3092.8, 781)
+        op_roof.require_priced(prog, priced)
+        self.assertEqual(len(priced), 4)
+        self.assertEqual(priced[1][2], 2 * 200 * 3072 * 1024)
+        with self.assertRaisesRegex(ValueError, "unpriced ops: AttentionF32"):
+            op_roof.require_priced(prog, op_roof.price(prog, 0, 2, 2, 3092.8, 781))
+
     def test_encoder_f32_ops_price_bf16_weights_and_f32_rows(self):
         self.assertEqual(op_roof.cost("DenseGemmF32", {"M": 250, "N": 4096, "K": 1024}, 250, 0, 2, 2),
                          (2 * 4096 * 1024 + 4 * 250 * 1024 + 4 * 250 * 4096, 2 * 250 * 4096 * 1024))

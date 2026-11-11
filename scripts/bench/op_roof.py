@@ -62,6 +62,13 @@ def parse(text):
             continue
         head, _, tail = m.group(4).partition(" | ")
         p = {k: float(v) for k, v in re.findall(r"(\w+)=(-?[\d.]+)(?=\s|$)", tail)}
+        if m.group(2) in ("LayerNormF32", "AttentionF32"):
+            for slot in ("gamma", "beta", "add", "key_lengths"):
+                operand = re.search(rf"\b{slot}<-(\S+)", head)
+                p[f"has_{slot}"] = bool(operand and operand.group(1) != "—")
+        if m.group(2) == "GatherRowsF32":
+            operand = re.search(r"\bindex<-(\S+)", head)
+            p["has_index"] = bool(operand and operand.group(1) != "—")
         if m.group(2) == "GemmGluFp8":
             scale = re.search(r"a_scale<-(\S+)", head)
             p["fp8_activation"] = bool(scale and scale.group(1) != "—")
@@ -207,10 +214,44 @@ def cost(op, p, rows, ctx, wb, kvb):
         return 12 * g("items", 1) * g("rows", rows) * g("width"), 0
     if op == "RmsNormF32":
         return 8 * g("rows", rows) * g("groups", 1) * g("group_width"), 0
+    if op == "GemvF32Out":
+        n, k, flags = g("N"), g("K"), int(g("flags", 0))
+        group = g("bias_group", 0) if flags & 512 else 0
+        bias_rows = (m + group - 1) // group if group else 1
+        traffic = 2 * n * k + (2 if flags & 8192 or not flags & 1 else 4) * m * k
+        traffic += (2 if flags & 16384 else 4) * m * n
+        if flags & 4:
+            traffic += 4 * bias_rows * n
+        if flags & 8:
+            traffic += 4 * m * n
+        if flags & 256:
+            traffic += 8 * k
+        return traffic, 2 * m * n * k
     if op == "LayerNormF32":
-        return 8 * g("rows", rows) * g("feat"), 0
+        n, k = g("rows", rows), g("feat")
+        output_bytes = 2 if int(g("flags", 0)) & 8 else 4
+        return ((4 + output_bytes + 4 * g("has_add", False)) * n * k
+                + 4 * k * (g("has_gamma", False) + g("has_beta", False))), 0
     if op == "GatherRowsF32":
-        return (8 * g("width") + 4) * g("rows", rows), 0
+        flags = int(g("flags", 0))
+        source_bytes = 2 if flags & 1 else 4
+        traffic = (source_bytes + 4 + (4 if flags & 2 else 0)) * g("width")
+        return (traffic + 4 * g("has_index", True)) * g("rows", rows), 0
+    if op == "CopyColsF32" and not g("flags", 0):
+        return 8 * g("items", 1) * g("rows", rows) * g("cols"), 0
+    if op == "AttentionF32" and not int(g("flags", 0)) & ~3:
+        b, q, keys, h, d = (g("batch"), g("q_rows"), g("kv_rows"),
+                            g("heads"), g("head_width"))
+        if g("has_key_lengths", False):
+            if ctx <= 0:
+                return None
+            keys = min(keys, ctx)
+        pairs = q * keys
+        if int(g("flags", 0)) & 1:
+            ramp = min(q, keys)
+            pairs = ramp * (ramp + 1) / 2 + (q - ramp) * keys
+            keys = min(keys, q)
+        return 8 * b * h * d * (q + keys), 4 * b * h * d * pairs
     if op == "ChunkAttentionF32":
         t, hh, d = g("rows", rows), g("heads"), g("head_width")
         keys = g("chunk") + g("left") + g("future", 0)
