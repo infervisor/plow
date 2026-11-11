@@ -855,6 +855,19 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
         list(APPEND _cubin_outs "${_f16_node_out}")
     endif()
 
+    if(PLOW_SM90A_CUBIN AND PLOW_CUBIN_DEVICE_CONTROL)
+        set(_control_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/control_sample.cu")
+        set(_control_out "${PLOW_CUBIN_DIR}/control_sample.cubin")
+        add_custom_command(OUTPUT "${_control_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_control_out}"
+                    handoff_control_sample required
+                    -arch=sm_90a -O3 -std=c++17 -cubin ${_cubin_inc} "${_control_src}"
+            DEPENDS "${_control_src}" "${_cubin_run}" ${_cubin_headers}
+            COMMENT "nvcc control_sample.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_control_out}")
+    endif()
+
     # The device stochastic sampler is NOT the megakernel and shares none of its
     # defines, so it is not a row in the table above. A failure here is non-fatal:
     # serving falls back to host sampling (hence `optional`).

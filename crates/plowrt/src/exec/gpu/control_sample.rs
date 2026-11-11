@@ -4,7 +4,7 @@ use crate::{Result, RuntimeError};
 use std::sync::Arc;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Plan {
     seed: u64,
     temperature: f32,
@@ -30,8 +30,8 @@ struct Plan {
     windows: [[u32; 2]; 16],
 }
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct State {
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct State {
     plan: Plan,
     ticks: u32,
     frames: u32,
@@ -57,7 +57,7 @@ const _: () = assert!(std::mem::align_of::<State>() == 8);
 const _: () = assert!(std::mem::offset_of!(State, last) == 224);
 const _: () = assert!(std::mem::offset_of!(State, stopped) == 236);
 
-fn state(p: crate::tts::maya2::Plan) -> Result<State> {
+pub(super) fn state(p: crate::tts::maya2::Plan) -> Result<State> {
     let c = p.cb0;
     let g = p.guard;
     if c.penalty_window > 256
@@ -182,13 +182,7 @@ impl ControlledSample {
             ));
         }
         let s = state(plan)?;
-        // State has no padding: the C layout sizes are checked on both sides of the ABI.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&s as *const State).cast::<u8>(),
-                std::mem::size_of::<State>(),
-            )
-        };
+        let bytes = bytemuck::bytes_of(&s);
         be.upload(&self.states, (slot * bytes.len()) as u64, bytes)
     }
     pub fn enqueue(
@@ -788,6 +782,92 @@ mod tests {
     }
     #[test]
     #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
+    fn checked_sampler_rejects_invalid_metadata() {
+        let case = std::env::var("CONTROL_SAMPLE_REJECT").unwrap();
+        let be = CudaBackend::new(0).unwrap();
+        let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
+        let module = be.module_load(&image).unwrap();
+        let stream = be.stream_create().unwrap();
+        let function = be.get_function(&module, "handoff_control_sample").unwrap();
+        be.set_max_dynamic_smem(function, 65540).unwrap();
+        let state_mem = be.alloc(0, std::mem::size_of::<State>() as u64).unwrap();
+        let slot_mem = be.alloc(0, 4).unwrap();
+        let row_mem = be.alloc(0, 4).unwrap();
+        let logits_mem = be.alloc(0, 8192).unwrap();
+        let codes_mem = be.alloc(0, 4).unwrap();
+        let mut value = state(plan(1, 64, 1.0)).unwrap();
+        let (mut slot, mut row) = (0u32, 0u32);
+        let (mut states, mut slots, mut rows, mut logits, mut codes) = (
+            state_mem.base,
+            slot_mem.base,
+            row_mem.base,
+            logits_mem.base,
+            codes_mem.base,
+        );
+        let (
+            mut count,
+            mut state_cap,
+            mut output_cap,
+            mut logits_cap,
+            mut stride,
+            mut classes,
+            mut stop,
+        ) = (1u32, 1u32, 1u32, 1u32, 4096u32, 2049u32, 2048u32);
+        let mut block = 256;
+        match case.as_str() {
+            "state_index" => slot = 1,
+            "logits_index" => row = 1,
+            "count" => count = 2,
+            "state_capacity" => state_cap = 0,
+            "output_capacity" => output_cap = 0,
+            "logits_capacity" => logits_cap = 0,
+            "classes" => classes = 4097,
+            "stop" => stop = 2047,
+            "stride" => stride = 2048,
+            "state_alignment" => states += 4,
+            "map_alignment" => slots += 2,
+            "null_state" => states = 0,
+            "block" => block = 128,
+            "history" => value.plan.hist = 257,
+            "temperature" => value.plan.temperature = f32::NAN,
+            "last" => value.last = stop,
+            _ => panic!("unknown invalid metadata case {case}"),
+        }
+        be.upload(&state_mem, 0, bytemuck::bytes_of(&value))
+            .unwrap();
+        be.upload(&slot_mem, 0, bytemuck::bytes_of(&slot)).unwrap();
+        be.upload(&row_mem, 0, bytemuck::bytes_of(&row)).unwrap();
+        be.upload(&logits_mem, 0, &[0; 8192]).unwrap();
+        be.upload(&codes_mem, 0, &[0xa5; 4]).unwrap();
+        be.synchronize().unwrap();
+        let mut args = [
+            &mut states as *mut u64 as *mut _,
+            &mut slots as *mut u64 as *mut _,
+            &mut rows as *mut u64 as *mut _,
+            &mut logits as *mut u64 as *mut _,
+            &mut codes as *mut u64 as *mut _,
+            &mut count as *mut u32 as *mut _,
+            &mut state_cap as *mut u32 as *mut _,
+            &mut output_cap as *mut u32 as *mut _,
+            &mut logits_cap as *mut u32 as *mut _,
+            &mut stride as *mut u32 as *mut _,
+            &mut classes as *mut u32 as *mut _,
+            &mut stop as *mut u32 as *mut _,
+        ];
+        be.launch_kernel(function, 1, block, 65540, &mut args, Some(&stream))
+            .unwrap();
+        let error = be
+            .stream_synchronize(&stream)
+            .expect_err("invalid metadata was accepted");
+        assert!(
+            error.to_string().contains("719"),
+            "expected explicit trap719 for {case}, got {error}"
+        );
+        println!("CONTROL_REJECT {case} trap719");
+    }
+
+    #[test]
+    #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
     fn controlled_sampler_device_matches_host() {
         let be = CudaBackend::new(0).unwrap();
         let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
@@ -795,7 +875,17 @@ mod tests {
         let stream = be.stream_create().unwrap();
         let sanitize = std::env::var_os("CONTROL_SAMPLE_SANITIZE").is_some();
         let production = std::env::var_os("CONTROL_SAMPLE_PRODUCTION").is_some();
-        let n = if sanitize { 33usize } else { 224usize };
+        let checked = std::env::var_os("CONTROL_SAMPLE_CHECKED").is_some();
+        let checked_kernel = checked.then(|| {
+            let function = be.get_function(&module, "handoff_control_sample").unwrap();
+            be.set_max_dynamic_smem(function, 65540).unwrap();
+            function
+        });
+        let n = std::env::var("CONTROL_SAMPLE_ROWS")
+            .ok()
+            .map(|s| s.parse::<usize>().unwrap())
+            .unwrap_or(if sanitize { 33usize } else { 224usize });
+        assert!((2..=320).contains(&n));
         let mut device = ControlledSample::load(&be, &stream, &module, n, n + 7, 32).unwrap();
         be.stream_synchronize(&stream).unwrap();
         let mut initial_codes = vec![u32::MAX; n + 7];
@@ -826,14 +916,79 @@ mod tests {
         }
         let mut rows: Vec<_> = (0..n)
             .rev()
-            .map(|r| Row {
+            .enumerate()
+            .map(|(i, r)| Row {
                 slot: r as u32,
-                output: ((r + 7) % n) as u32,
+                output: if checked {
+                    i as u32
+                } else {
+                    ((r + 7) % n) as u32
+                },
                 logits: ((r + 13) % n) as u32,
             })
             .collect();
         let logits = be.alloc(0, (n * 2057 * 2) as u64).unwrap();
         let final_codes = be.alloc(0, (n * 32 * 4) as u64).unwrap();
+        let checked_maps = checked.then(|| {
+            [
+                be.alloc(0, (n * 4) as u64).unwrap(),
+                be.alloc(0, (n * 4) as u64).unwrap(),
+            ]
+        });
+        let draw = |device: &mut ControlledSample, rows: &[Row]| -> Result<()> {
+            let Some(kernel) = checked_kernel else {
+                return device.enqueue(&be, &stream, rows, logits.base, 2057, 2049, 2048);
+            };
+            be.upload(&device.rows, 0, bytemuck::cast_slice(rows))?;
+            let maps = checked_maps.as_ref().unwrap();
+            let slots: Vec<_> = rows.iter().map(|r| r.slot).collect();
+            let logits_rows: Vec<_> = rows.iter().map(|r| r.logits).collect();
+            be.upload(&maps[0], 0, bytemuck::cast_slice(&slots))?;
+            be.upload(&maps[1], 0, bytemuck::cast_slice(&logits_rows))?;
+            device.count = rows.len();
+            device.slot_end = rows.iter().map(|r| r.slot as usize + 1).max().unwrap_or(0);
+            let (mut states, mut map, mut logit_map, mut source, mut output) = (
+                device.states.base,
+                maps[0].base,
+                maps[1].base,
+                logits.base,
+                device.codes.base,
+            );
+            let (mut count, mut state_capacity, mut output_capacity, mut logits_capacity) = (
+                rows.len() as u32,
+                device.slots as u32,
+                (device.codes.len / 4) as u32,
+                n as u32,
+            );
+            let (mut stride, mut classes, mut stop) = (2057u32, 2049u32, 2048u32);
+            let mut args: [*mut std::ffi::c_void; 12] = [
+                std::ptr::addr_of_mut!(states).cast(),
+                std::ptr::addr_of_mut!(map).cast(),
+                std::ptr::addr_of_mut!(logit_map).cast(),
+                std::ptr::addr_of_mut!(source).cast(),
+                std::ptr::addr_of_mut!(output).cast(),
+                std::ptr::addr_of_mut!(count).cast(),
+                std::ptr::addr_of_mut!(state_capacity).cast(),
+                std::ptr::addr_of_mut!(output_capacity).cast(),
+                std::ptr::addr_of_mut!(logits_capacity).cast(),
+                std::ptr::addr_of_mut!(stride).cast(),
+                std::ptr::addr_of_mut!(classes).cast(),
+                std::ptr::addr_of_mut!(stop).cast(),
+            ];
+            be.launch_kernel(kernel, count.max(1), 256, 65540, &mut args, Some(&stream))
+        };
+        if checked {
+            be.memset_d8_async(device.codes.base, 0xa5, device.codes.len as usize, &stream)
+                .unwrap();
+            draw(&mut device, &[]).unwrap();
+            be.stream_synchronize(&stream).unwrap();
+            let mut canary = vec![0; device.codes.len as usize];
+            be.download(&device.codes, 0, &mut canary).unwrap();
+            assert!(canary.iter().all(|&b| b == 0xa5));
+            be.memset_d8_async(device.codes.base, 0, device.codes.len as usize, &stream)
+                .unwrap();
+        }
+
         let mut raw = vec![0u16; n * 2057];
         let mut codes = vec![0u32; n + 7];
         let mut expected = vec![0u32; n];
@@ -867,9 +1022,7 @@ mod tests {
                 };
             }
             be.upload(&logits, 0, bytemuck::cast_slice(&raw)).unwrap();
-            device
-                .enqueue(&be, &stream, &rows, logits.base, 2057, 2049, 2048)
-                .unwrap();
+            draw(&mut device, &rows).unwrap();
             be.stream_synchronize(&stream).unwrap();
             be.download(&device.codes, 0, bytemuck::cast_slice_mut(&mut codes))
                 .unwrap();
@@ -913,9 +1066,43 @@ mod tests {
                     .iter()
                     .all(|&c| c == if expected[r] == 2048 { 0 } else { 0x12345678 }));
             }
+            assert!(codes[n..].iter().all(|&code| code == 0));
             rows.rotate_left(1);
+            if checked {
+                for (i, row) in rows.iter_mut().enumerate() {
+                    row.output = i as u32;
+                }
+            }
         }
-        if !sanitize {
+        if checked {
+            for b in [1, 8, 32, 64, 128, 200, 224, 300, 320]
+                .into_iter()
+                .filter(|&b| b <= n)
+            {
+                be.download(&device.codes, 0, bytemuck::cast_slice_mut(&mut codes))
+                    .unwrap();
+                let before = codes.clone();
+                for row in &rows[..b] {
+                    let r = row.logits as usize;
+                    let slot = &mut host[row.slot as usize];
+                    if let Tick::Code(code) =
+                        slot.tick(&raw[r * 2057..r * 2057 + 2049], &mut scratch)
+                    {
+                        slot.emitted(code);
+                    }
+                }
+                draw(&mut device, &rows[..b]).unwrap();
+                be.stream_synchronize(&stream).unwrap();
+                be.download(&device.codes, 0, bytemuck::cast_slice_mut(&mut codes))
+                    .unwrap();
+                for row in &rows[..b] {
+                    assert_eq!(codes[row.output as usize], host[row.slot as usize].last);
+                }
+                assert_eq!(&codes[b..], &before[b..]);
+                println!("CHECKED_SAMPLE_PREFIX rows={b} states={n} exact cb0/padding");
+            }
+        }
+        if !sanitize && !checked {
             let start = be.event_create(true).unwrap();
             let end = be.event_create(true).unwrap();
             for b in [1, 8, 32, 64, 128, 200, 224] {
