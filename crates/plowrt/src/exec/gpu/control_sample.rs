@@ -53,6 +53,9 @@ pub(super) struct Row {
 }
 const _: () = assert!(std::mem::size_of::<Plan>() == 216);
 const _: () = assert!(std::mem::size_of::<State>() == 2296);
+const _: () = assert!(std::mem::align_of::<State>() == 8);
+const _: () = assert!(std::mem::offset_of!(State, last) == 224);
+const _: () = assert!(std::mem::offset_of!(State, stopped) == 236);
 
 fn state(p: crate::tts::maya2::Plan) -> Result<State> {
     let c = p.cb0;
@@ -368,6 +371,140 @@ mod tests {
         q.cb0.top_p = f32::NAN;
         assert!(state(q).is_err());
         assert_eq!(std::mem::size_of::<Row>(), 12);
+    }
+    #[test]
+    #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
+    fn handoff_pcm16_device_matches_host() {
+        let be = CudaBackend::new(0).unwrap();
+        let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
+        let module = be.module_load(&image).unwrap();
+        assert_eq!(
+            be.module_global_u32(&module, "plow_control_sample_abi")
+                .unwrap(),
+            Some(1)
+        );
+        let kernel = be.get_function(&module, "handoff_pack_pcm16").unwrap();
+        let stream = be.stream_create().unwrap();
+        let capacity = 320usize;
+        let states = be
+            .alloc(0, (capacity * std::mem::size_of::<State>()) as u64)
+            .unwrap();
+        let slots = be.alloc(0, (capacity * 4) as u64).unwrap();
+        let map: Vec<u32> = (0..capacity)
+            .map(|r| ((r * 37 + 17) % capacity) as u32)
+            .collect();
+        be.upload(&slots, 0, bytemuck::cast_slice(&map)).unwrap();
+        for slot in 0..capacity {
+            let mut value = state(plan(slot as u64, 1, 1.0)).unwrap();
+            value.last = (slot * 71 % 2048) as u32;
+            value.stopped = (slot % 3 == 1) as u32;
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&value as *const State).cast::<u8>(),
+                    std::mem::size_of::<State>(),
+                )
+            };
+            be.upload(&states, (slot * bytes.len()) as u64, bytes)
+                .unwrap();
+        }
+        let edges = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -2.0,
+            2.0,
+            -1.0,
+            1.0,
+            -0.0,
+            0.0,
+            0.5 / 32767.0,
+            -0.5 / 32767.0,
+            1.5 / 32767.0,
+            -1.5 / 32767.0,
+            32766.5 / 32767.0,
+            -32766.5 / 32767.0,
+        ];
+        for samples in [1usize, 1537, 1920] {
+            let stride = (8 + samples * 2 + 3) & !3;
+            let values: Vec<f32> = (0..capacity * samples)
+                .map(|i| {
+                    if i % 31 < edges.len() {
+                        edges[i % 31]
+                    } else {
+                        (i * 7919 % 100003) as f32 / 40000.0 - 1.25
+                    }
+                })
+                .collect();
+            let pcm = be.alloc(0, (values.len() * 4) as u64).unwrap();
+            let packet = be.alloc(0, (capacity * stride + 64) as u64).unwrap();
+            be.upload(&pcm, 0, bytemuck::cast_slice(&values)).unwrap();
+            be.synchronize().unwrap();
+            for rows in [0usize, 1, 8, 32, 64, 128, 200, 224, 288, 300, 320] {
+                be.memset_d8_async(packet.base, 0xa5, packet.len as usize, &stream)
+                    .unwrap();
+                let (mut s, mut m, mut p, mut out) =
+                    (states.base, slots.base, pcm.base, packet.base);
+                let (mut n, mut cap, mut ns, mut pitch) =
+                    (rows as u32, capacity as u32, samples as u32, stride as u32);
+                let mut args = [
+                    &mut s as *mut u64 as *mut _,
+                    &mut m as *mut u64 as *mut _,
+                    &mut p as *mut u64 as *mut _,
+                    &mut out as *mut u64 as *mut _,
+                    &mut n as *mut u32 as *mut _,
+                    &mut cap as *mut u32 as *mut _,
+                    &mut ns as *mut u32 as *mut _,
+                    &mut pitch as *mut u32 as *mut _,
+                ];
+                be.launch_kernel(kernel, n.max(1), 256, 0, &mut args, Some(&stream))
+                    .unwrap();
+                be.stream_synchronize(&stream).unwrap();
+                let mut actual = vec![0u8; packet.len as usize];
+                be.download(&packet, 0, &mut actual).unwrap();
+                let mut expected = vec![0xa5u8; actual.len()];
+                for r in 0..rows {
+                    let slot = map[r] as usize;
+                    let stopped = slot % 3 == 1;
+                    let row = &mut expected[r * stride..(r + 1) * stride];
+                    row.fill(0);
+                    row[..4].copy_from_slice(&(stopped as u32).to_le_bytes());
+                    row[4..8].copy_from_slice(&((slot * 71 % 2048) as u32).to_le_bytes());
+                    if !stopped {
+                        let mut audio = Vec::with_capacity(samples * 2);
+                        crate::tts::pcm16(&values[r * samples..(r + 1) * samples], &mut audio);
+                        row[8..8 + samples * 2].copy_from_slice(&audio);
+                    }
+                }
+                assert!(
+                    actual == expected,
+                    "rows={rows}, samples={samples}, first mismatch {:?}",
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .enumerate()
+                        .find(|(_, (a, b))| a != b)
+                );
+                println!("HANDOFF_PCM rows={rows} samples={samples} exact header/PCM/padding/tail");
+                if samples == 1920 && [32, 64, 128, 200, 224].contains(&rows) {
+                    let begin = be.event_create(true).unwrap();
+                    let end = be.event_create(true).unwrap();
+                    let mut times = Vec::new();
+                    for _ in 0..5 {
+                        be.event_record(&begin, &stream).unwrap();
+                        for _ in 0..64 {
+                            be.launch_kernel(kernel, n, 256, 0, &mut args, Some(&stream))
+                                .unwrap();
+                        }
+                        be.event_record(&end, &stream).unwrap();
+                        be.stream_synchronize(&stream).unwrap();
+                        times.push(
+                            f64::from(be.event_elapsed_ms(&begin, &end).unwrap()) * 1000. / 64.,
+                        );
+                    }
+                    println!("HANDOFF_PCM_TIMING rows={rows} samples={samples} gpu_us={times:?}");
+                }
+            }
+        }
     }
     #[test]
     #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]

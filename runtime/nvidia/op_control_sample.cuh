@@ -2,6 +2,8 @@
 #include "control_sample.h"
 #include "op_elementwise.cuh"
 
+extern "C" __device__ const unsigned plow_control_sample_abi = 1;
+
 static __device__ unsigned long long cs_mix(unsigned long long z) {
     z += 0x9E3779B97F4A7C15ull;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -214,4 +216,29 @@ extern "C" __global__ void tick_codec_lengths(
     unsigned rows, unsigned capacity, unsigned codebooks, unsigned scale, unsigned stop) {
     const unsigned r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r < capacity) lengths[r] = r < rows && codes[(size_t)slots[r] * codebooks] != stop ? scale : 0;
+}
+
+extern "C" __global__ void handoff_pack_pcm16(
+    const ControlSampleState* states, const unsigned* slots, const float* pcm,
+    unsigned char* packet, unsigned rows, unsigned capacity, unsigned samples, unsigned stride) {
+    const unsigned r = blockIdx.x;
+    if (r >= rows) return;
+    if (!capacity || rows > capacity || !samples || stride < 8 || (stride & 3)
+        || samples > (stride - 8) / 2) { asm("trap;"); return; }
+    const unsigned slot = slots[r];
+    if (slot >= capacity) { asm("trap;"); return; }
+    const bool stopped = states[slot].stopped != 0;
+    auto* output = packet + (size_t)r * stride;
+    if (threadIdx.x == 0) {
+        ((unsigned*)output)[0] = stopped;
+        ((unsigned*)output)[1] = states[slot].last;
+    }
+    auto* audio = (short*)(output + 8);
+    for (size_t s = threadIdx.x; s < samples; s += blockDim.x) {
+        float x = stopped ? 0.f : pcm[(size_t)r * samples + s];
+        x = isnan(x) ? 0.f : fminf(1.f, fmaxf(-1.f, x));
+        audio[s] = (short)roundf(__fmul_rn(x, 32767.f));
+    }
+    for (size_t b = 8 + (size_t)samples * 2 + threadIdx.x; b < stride; b += blockDim.x)
+        output[b] = 0;
 }
