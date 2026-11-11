@@ -9537,6 +9537,10 @@ impl GpuEngine {
         self.be.stream_synchronize(&self.stream)
     }
 
+    pub fn record_stream_event(&self, event: &CudaEvent) -> Result<()> {
+        self.be.event_record(event, &self.stream)
+    }
+
     fn step_slots_sampled_unchecked(
         &mut self,
         feeds: &[(usize, u32)],

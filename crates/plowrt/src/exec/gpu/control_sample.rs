@@ -53,6 +53,9 @@ pub(super) struct Row {
 }
 const _: () = assert!(std::mem::size_of::<Plan>() == 216);
 const _: () = assert!(std::mem::size_of::<State>() == 2296);
+const _: () = assert!(std::mem::align_of::<State>() == 8);
+const _: () = assert!(std::mem::offset_of!(State, last) == 224);
+const _: () = assert!(std::mem::offset_of!(State, stopped) == 236);
 
 fn state(p: crate::tts::maya2::Plan) -> Result<State> {
     let c = p.cb0;
@@ -127,6 +130,7 @@ pub(super) struct ControlledSample {
     finish: KernelFn,
     slots: usize,
     count: usize,
+    slot_end: usize,
     seen_slots: Vec<bool>,
     seen_outputs: Vec<bool>,
 }
@@ -161,6 +165,7 @@ impl ControlledSample {
             finish,
             slots,
             count: 0,
+            slot_end: 0,
             seen_slots: vec![false; slots],
             seen_outputs: vec![false; outputs],
         })
@@ -211,6 +216,7 @@ impl ControlledSample {
         }
         self.seen_slots.fill(false);
         self.seen_outputs.fill(false);
+        let mut slot_end = 0;
         for row in rows {
             if std::mem::replace(&mut self.seen_slots[row.slot as usize], true)
                 || std::mem::replace(&mut self.seen_outputs[row.output as usize], true)
@@ -220,6 +226,7 @@ impl ControlledSample {
                     "controlled sampler rows overlap or exceed logits".into(),
                 ));
             }
+            slot_end = slot_end.max(row.slot as usize + 1);
         }
         be.memset_d8_async(self.codes.base, 0, self.codes.len as usize, stream)?;
         let stage = Arc::get_mut(&mut self.stage).ok_or_else(|| {
@@ -232,6 +239,7 @@ impl ControlledSample {
             be.memcpy_htod_async(self.rows.base, &stage.as_slice()[..bytes.len()], stream)?;
         }
         self.count = rows.len();
+        self.slot_end = slot_end;
         let (mut states, mut map, mut l, mut codes) =
             (self.states.base, self.rows.base, logits, self.codes.base);
         let (mut n, mut stride, mut classes, mut stop) = (rows.len() as u32, stride, classes, stop);
@@ -252,6 +260,7 @@ impl ControlledSample {
         be: &CudaBackend,
         stream: &CudaStream,
         codes: u64,
+        end_rows: usize,
         codebooks: u32,
         stop: u32,
     ) -> Result<()> {
@@ -260,10 +269,15 @@ impl ControlledSample {
                 "controller frame width changed".into(),
             ));
         }
+        if self.count == 0 || end_rows < self.slot_end || end_rows > self.slots {
+            return Err(RuntimeError::Rejected(
+                "controller readback prefix does not cover its slots".into(),
+            ));
+        }
         be.memcpy_dtod_async(
             self.readback_codes.base,
             codes,
-            self.readback_codes.len,
+            (end_rows * self.codebooks * 4) as u64,
             stream,
         )?;
         let (mut states, mut map, mut codes) =
@@ -357,6 +371,420 @@ mod tests {
         q.cb0.top_p = f32::NAN;
         assert!(state(q).is_err());
         assert_eq!(std::mem::size_of::<Row>(), 12);
+    }
+    #[test]
+    #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
+    fn handoff_pcm16_device_matches_host() {
+        let be = CudaBackend::new(0).unwrap();
+        let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
+        let module = be.module_load(&image).unwrap();
+        assert_eq!(
+            be.module_global_u32(&module, "plow_control_sample_abi")
+                .unwrap(),
+            Some(1)
+        );
+        let kernel = be.get_function(&module, "handoff_pack_pcm16").unwrap();
+        let stream = be.stream_create().unwrap();
+        let capacity = 320usize;
+        let states = be
+            .alloc(0, (capacity * std::mem::size_of::<State>()) as u64)
+            .unwrap();
+        let slots = be.alloc(0, (capacity * 4) as u64).unwrap();
+        let map: Vec<u32> = (0..capacity)
+            .map(|r| ((r * 37 + 17) % capacity) as u32)
+            .collect();
+        be.upload(&slots, 0, bytemuck::cast_slice(&map)).unwrap();
+        for slot in 0..capacity {
+            let mut value = state(plan(slot as u64, 1, 1.0)).unwrap();
+            value.last = (slot * 71 % 2048) as u32;
+            value.stopped = (slot % 3 == 1) as u32;
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&value as *const State).cast::<u8>(),
+                    std::mem::size_of::<State>(),
+                )
+            };
+            be.upload(&states, (slot * bytes.len()) as u64, bytes)
+                .unwrap();
+        }
+        let edges = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -2.0,
+            2.0,
+            -1.0,
+            1.0,
+            -0.0,
+            0.0,
+            0.5 / 32767.0,
+            -0.5 / 32767.0,
+            1.5 / 32767.0,
+            -1.5 / 32767.0,
+            32766.5 / 32767.0,
+            -32766.5 / 32767.0,
+        ];
+        for samples in [1usize, 1537, 1920] {
+            let stride = (8 + samples * 2 + 3) & !3;
+            let values: Vec<f32> = (0..capacity * samples)
+                .map(|i| {
+                    if i % 31 < edges.len() {
+                        edges[i % 31]
+                    } else {
+                        (i * 7919 % 100003) as f32 / 40000.0 - 1.25
+                    }
+                })
+                .collect();
+            let pcm = be.alloc(0, (values.len() * 4) as u64).unwrap();
+            let packet = be.alloc(0, (capacity * stride + 64) as u64).unwrap();
+            be.upload(&pcm, 0, bytemuck::cast_slice(&values)).unwrap();
+            be.synchronize().unwrap();
+            for rows in [0usize, 1, 8, 32, 64, 128, 200, 224, 288, 300, 320] {
+                be.memset_d8_async(packet.base, 0xa5, packet.len as usize, &stream)
+                    .unwrap();
+                let (mut s, mut m, mut p, mut out) =
+                    (states.base, slots.base, pcm.base, packet.base);
+                let (mut n, mut cap, mut ns, mut pitch) =
+                    (rows as u32, capacity as u32, samples as u32, stride as u32);
+                let mut args = [
+                    &mut s as *mut u64 as *mut _,
+                    &mut m as *mut u64 as *mut _,
+                    &mut p as *mut u64 as *mut _,
+                    &mut out as *mut u64 as *mut _,
+                    &mut n as *mut u32 as *mut _,
+                    &mut cap as *mut u32 as *mut _,
+                    &mut ns as *mut u32 as *mut _,
+                    &mut pitch as *mut u32 as *mut _,
+                ];
+                be.launch_kernel(kernel, n.max(1), 256, 0, &mut args, Some(&stream))
+                    .unwrap();
+                be.stream_synchronize(&stream).unwrap();
+                let mut actual = vec![0u8; packet.len as usize];
+                be.download(&packet, 0, &mut actual).unwrap();
+                let mut expected = vec![0xa5u8; actual.len()];
+                for r in 0..rows {
+                    let slot = map[r] as usize;
+                    let stopped = slot % 3 == 1;
+                    let row = &mut expected[r * stride..(r + 1) * stride];
+                    row.fill(0);
+                    row[..4].copy_from_slice(&(stopped as u32).to_le_bytes());
+                    row[4..8].copy_from_slice(&((slot * 71 % 2048) as u32).to_le_bytes());
+                    if !stopped {
+                        let mut audio = Vec::with_capacity(samples * 2);
+                        crate::tts::pcm16(&values[r * samples..(r + 1) * samples], &mut audio);
+                        row[8..8 + samples * 2].copy_from_slice(&audio);
+                    }
+                }
+                assert!(
+                    actual == expected,
+                    "rows={rows}, samples={samples}, first mismatch {:?}",
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .enumerate()
+                        .find(|(_, (a, b))| a != b)
+                );
+                println!("HANDOFF_PCM rows={rows} samples={samples} exact header/PCM/padding/tail");
+                if samples == 1920 && [32, 64, 128, 200, 224].contains(&rows) {
+                    let begin = be.event_create(true).unwrap();
+                    let end = be.event_create(true).unwrap();
+                    let mut times = Vec::new();
+                    for _ in 0..5 {
+                        be.event_record(&begin, &stream).unwrap();
+                        for _ in 0..64 {
+                            be.launch_kernel(kernel, n, 256, 0, &mut args, Some(&stream))
+                                .unwrap();
+                        }
+                        be.event_record(&end, &stream).unwrap();
+                        be.stream_synchronize(&stream).unwrap();
+                        times.push(
+                            f64::from(be.event_elapsed_ms(&begin, &end).unwrap()) * 1000. / 64.,
+                        );
+                    }
+                    println!("HANDOFF_PCM_TIMING rows={rows} samples={samples} gpu_us={times:?}");
+                }
+            }
+        }
+    }
+    #[test]
+    #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
+    fn handoff_codes_and_lengths_match_independent_slot_maps() {
+        let be = CudaBackend::new(0).unwrap();
+        let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
+        let module = be.module_load(&image).unwrap();
+        assert_eq!(
+            be.module_global_u32(&module, "plow_control_sample_abi")
+                .unwrap(),
+            Some(1)
+        );
+        let pack = be.get_function(&module, "handoff_pack_codes").unwrap();
+        let lengths_kernel = be.get_function(&module, "handoff_codec_lengths").unwrap();
+        let stream = be.stream_create().unwrap();
+        let (source_capacity, state_capacity) = (384u32, 353u32);
+        let states = be
+            .alloc(
+                0,
+                u64::from(state_capacity) * std::mem::size_of::<State>() as u64,
+            )
+            .unwrap();
+        let mut expected_states = Vec::with_capacity(states.len as usize);
+        for slot in 0..state_capacity {
+            let mut value = state(plan(u64::from(slot), 1, 1.)).unwrap();
+            value.stopped = u32::from(slot % 3 == 1);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&value as *const State).cast::<u8>(),
+                    std::mem::size_of::<State>(),
+                )
+            };
+            expected_states.extend_from_slice(bytes);
+        }
+        be.upload(&states, 0, &expected_states).unwrap();
+        let maps: [Vec<u32>; 2] = [source_capacity, state_capacity].map(|cap| {
+            (0..320)
+                .map(|r| if r == 0 { cap - 1 } else { (r * 37 + 17) % cap })
+                .collect()
+        });
+        let map_buffers = maps.each_ref().map(|map| {
+            let buffer = be.alloc(0, (map.len() * 4) as u64).unwrap();
+            be.upload(&buffer, 0, bytemuck::cast_slice(map)).unwrap();
+            buffer
+        });
+        be.synchronize().unwrap();
+        for codebooks in [1u32, 32] {
+            let values: Vec<u32> = (0..source_capacity * codebooks)
+                .map(|i| {
+                    if i % 17 == 0 {
+                        2048
+                    } else {
+                        i.wrapping_mul(7919)
+                    }
+                })
+                .collect();
+            let source = be.alloc(0, (values.len() * 4) as u64).unwrap();
+            be.upload(&source, 0, bytemuck::cast_slice(&values))
+                .unwrap();
+            let output = be.alloc(0, u64::from(320 * codebooks + 16) * 4).unwrap();
+            let lengths = be.alloc(0, (320 + 16) * 4).unwrap();
+            be.synchronize().unwrap();
+            for capacity in [1u32, 8, 32, 64, 128, 200, 224, 288, 300, 320] {
+                let rows_set: std::collections::BTreeSet<_> =
+                    [0, 1, capacity / 2, capacity - 1, capacity].into();
+                for rows in rows_set {
+                    let (mut src, mut map, mut dst) =
+                        (source.base, map_buffers[0].base, output.base);
+                    let (mut n, mut src_cap, mut cap, mut cb) =
+                        (rows, source_capacity, capacity, codebooks);
+                    let mut args = [
+                        &mut src as *mut u64 as *mut _,
+                        &mut map as *mut u64 as *mut _,
+                        &mut dst as *mut u64 as *mut _,
+                        &mut n as *mut u32 as *mut _,
+                        &mut src_cap as *mut u32 as *mut _,
+                        &mut cap as *mut u32 as *mut _,
+                        &mut cb as *mut u32 as *mut _,
+                    ];
+                    be.memset_d8_async(output.base, 0xa5, output.len as usize, &stream)
+                        .unwrap();
+                    be.launch_kernel(
+                        pack,
+                        (capacity * codebooks).div_ceil(256),
+                        256,
+                        0,
+                        &mut args,
+                        Some(&stream),
+                    )
+                    .unwrap();
+                    be.stream_synchronize(&stream).unwrap();
+                    let mut actual = vec![0u32; (output.len / 4) as usize];
+                    be.download(&output, 0, bytemuck::cast_slice_mut(&mut actual))
+                        .unwrap();
+                    let mut expected = vec![0xa5a5a5a5; actual.len()];
+                    for r in 0..capacity as usize {
+                        for k in 0..codebooks as usize {
+                            expected[r * codebooks as usize + k] = if r < rows as usize {
+                                values[maps[0][r] as usize * codebooks as usize + k]
+                            } else {
+                                0
+                            };
+                        }
+                    }
+                    assert!(
+                        actual == expected,
+                        "codes rows={rows} capacity={capacity} books={codebooks} first mismatch {:?}",
+                        actual.iter().zip(&expected).position(|(a, b)| a != b)
+                    );
+                    for scale in [1u32, 2, 1920] {
+                        let (mut src, mut map, mut dst) =
+                            (states.base, map_buffers[1].base, lengths.base);
+                        let (mut state_cap, mut unit) = (state_capacity, scale);
+                        let mut args = [
+                            &mut src as *mut u64 as *mut _,
+                            &mut map as *mut u64 as *mut _,
+                            &mut dst as *mut u64 as *mut _,
+                            &mut n as *mut u32 as *mut _,
+                            &mut state_cap as *mut u32 as *mut _,
+                            &mut cap as *mut u32 as *mut _,
+                            &mut unit as *mut u32 as *mut _,
+                        ];
+                        be.memset_d8_async(lengths.base, 0xa5, lengths.len as usize, &stream)
+                            .unwrap();
+                        be.launch_kernel(
+                            lengths_kernel,
+                            capacity.div_ceil(256),
+                            256,
+                            0,
+                            &mut args,
+                            Some(&stream),
+                        )
+                        .unwrap();
+                        be.stream_synchronize(&stream).unwrap();
+                        let mut actual = vec![0u32; (lengths.len / 4) as usize];
+                        be.download(&lengths, 0, bytemuck::cast_slice_mut(&mut actual))
+                            .unwrap();
+                        let mut expected = vec![0xa5a5a5a5; actual.len()];
+                        for r in 0..capacity as usize {
+                            expected[r] = if r < rows as usize && maps[1][r] % 3 != 1 {
+                                scale
+                            } else {
+                                0
+                            };
+                        }
+                        assert!(
+                            actual == expected,
+                            "lengths rows={rows} capacity={capacity} scale={scale} first mismatch {:?}",
+                            actual.iter().zip(&expected).position(|(a, b)| a != b)
+                        );
+                    }
+                }
+            }
+            let mut unchanged = vec![0u32; values.len()];
+            be.download(&source, 0, bytemuck::cast_slice_mut(&mut unchanged))
+                .unwrap();
+            assert_eq!(unchanged, values, "canonical source changed");
+        }
+        for (map, buffer) in maps.iter().zip(&map_buffers) {
+            let mut actual = vec![0u32; map.len()];
+            be.download(buffer, 0, bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            assert_eq!(&actual, map, "slot map changed");
+        }
+        let mut actual_states = vec![0u8; expected_states.len()];
+        be.download(&states, 0, &mut actual_states).unwrap();
+        assert!(actual_states == expected_states, "controller state changed");
+        println!("HANDOFF_CODES exact canonical gather, independent controller map, STOP/padding and guard tails PASS");
+    }
+    #[test]
+    #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
+    fn controlled_sampler_readback_prefix() {
+        let be = CudaBackend::new(0).unwrap();
+        let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
+        let module = be.module_load(&image).unwrap();
+        let stream = be.stream_create().unwrap();
+        let (slots, codebooks, stride) = (320usize, 32usize, 2057usize);
+        let mut device =
+            ControlledSample::load(&be, &stream, &module, slots, slots * 2, codebooks).unwrap();
+        let logits = be.alloc(0, (slots * stride * 2) as u64).unwrap();
+        let source = be.alloc(0, (slots * codebooks * 4) as u64).unwrap();
+        let canonical: Vec<u32> = (0..slots * codebooks)
+            .map(|i| ((i * 37 + 11) % 2048) as u32)
+            .collect();
+        let mut values = vec![((-8f32).to_bits() >> 16) as u16; slots * stride];
+        for slot in 0..slots {
+            values[slot * stride + 17] = (8f32.to_bits() >> 16) as u16;
+        }
+        be.upload(&logits, 0, bytemuck::cast_slice(&values))
+            .unwrap();
+        be.upload(&source, 0, bytemuck::cast_slice(&canonical))
+            .unwrap();
+        be.synchronize().unwrap();
+        for (prefix, last) in [
+            (1, 0),
+            (2, 1),
+            (8, 3),
+            (32, 31),
+            (33, 32),
+            (64, 33),
+            (128, 100),
+            (224, 199),
+            (224, 223),
+            (256, 255),
+            (288, 287),
+            (300, 299),
+            (320, 319),
+        ] {
+            let mut active = vec![last];
+            if last != 0 {
+                active.push(0);
+            }
+            let rows: Vec<_> = active
+                .iter()
+                .enumerate()
+                .map(|(i, &slot)| Row {
+                    slot: slot as u32,
+                    output: i as u32,
+                    logits: slot as u32,
+                })
+                .collect();
+            for &slot in &active {
+                let mut p = plan(slot as u64, 1, 1.0);
+                p.min_frames = if slot == last { 0 } else { u32::MAX };
+                p.cb0.stop_p = 0.0;
+                device.bind(&be, slot, p).unwrap();
+            }
+            be.memset_d8_async(
+                device.readback_codes.base,
+                0xa5,
+                device.readback_codes.len as usize,
+                &stream,
+            )
+            .unwrap();
+            be.synchronize().unwrap();
+            device
+                .enqueue(&be, &stream, &rows, logits.base, stride as u32, 2049, 2048)
+                .unwrap();
+            for invalid in [0, last, slots + 1, usize::MAX] {
+                assert!(device
+                    .finish(&be, &stream, source.base, invalid, codebooks as u32, 2048)
+                    .is_err());
+            }
+            be.stream_synchronize(&stream).unwrap();
+            let mut actual = vec![0u32; canonical.len()];
+            be.download(
+                &device.readback_codes,
+                0,
+                bytemuck::cast_slice_mut(&mut actual),
+            )
+            .unwrap();
+            assert!(actual.iter().all(|&v| v == 0xa5a5a5a5));
+            device
+                .finish(&be, &stream, source.base, prefix, codebooks as u32, 2048)
+                .unwrap();
+            be.stream_synchronize(&stream).unwrap();
+            be.download(
+                &device.readback_codes,
+                0,
+                bytemuck::cast_slice_mut(&mut actual),
+            )
+            .unwrap();
+            let mut expected = vec![0xa5a5a5a5u32; canonical.len()];
+            expected[..prefix * codebooks].copy_from_slice(&canonical[..prefix * codebooks]);
+            expected[last * codebooks..(last + 1) * codebooks].fill(0);
+            expected[last * codebooks] = 2048;
+            assert!(
+                actual == expected,
+                "prefix {prefix}, last slot {last}, first mismatch {:?}",
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b)
+            );
+            be.download(&source, 0, bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            assert_eq!(actual, canonical, "canonical codes were modified");
+            println!("CONTROL_PREFIX prefix={prefix} last_slot={last} exact, rejected prefixes and poisoned tail intact");
+        }
     }
     #[test]
     #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
@@ -459,7 +887,7 @@ mod tests {
             be.upload(&final_codes, 0, bytemuck::cast_slice(&frame_codes))
                 .unwrap();
             device
-                .finish(&be, &stream, final_codes.base, 32, 2048)
+                .finish(&be, &stream, final_codes.base, n, 32, 2048)
                 .unwrap();
             be.stream_synchronize(&stream).unwrap();
             let mut canonical = vec![0u32; n * 32];

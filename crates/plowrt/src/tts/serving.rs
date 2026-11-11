@@ -37,6 +37,8 @@ use crate::serve::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct SpeechRequest {
+    #[serde(default)]
+    pub tags: super::tags::Mode,
     pub model: String,
     /// At most [`super::MAX_INPUT_CHARS`] characters; a long input is spoken as sentence segments.
     pub input: String,
@@ -114,6 +116,36 @@ impl SpeechRequest {
             trace: self.trace.clone(),
         }
     }
+}
+
+fn stamp_tags(response: &mut Response, report: &super::tags::Report) {
+    if !report.active {
+        return;
+    }
+    for (key, names) in [
+        ("x-plow-tags-applied", &report.applied),
+        ("x-plow-tags-dropped", &report.dropped),
+    ] {
+        if let Ok(value) = names.join(",").parse() {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static(key), value);
+        }
+    }
+}
+
+fn silence_response(
+    out: &mut super::OutPcm,
+    ms: Option<u32>,
+    rate: u32,
+    report: &super::tags::Report,
+) -> Response {
+    let n = (f64::from(ms.unwrap_or(0)) * f64::from(rate) * f64::from(out.speed()) / 1000.0).round()
+        as usize;
+    out.keep_onset();
+    let mut response = whole_response(out, &vec![0.0; n], 0.0);
+    stamp_tags(&mut response, report);
+    response
 }
 
 type Bound<T> = Mutex<HashMap<(PathBuf, u8), Option<Arc<T>>>>;
@@ -259,6 +291,26 @@ async fn speech_on_guided(
     report_rx: Option<tokio::sync::oneshot::Receiver<crate::serve::session::CacheOutcome>>,
     mut run: crate::serve::turns::StageRun,
 ) -> Response {
+    let mut req = req;
+    let mut checked = checked;
+    let rendered = match super::tags::render(
+        w.spec.tags.as_deref(),
+        &req.input,
+        req.tags,
+        checked.language.as_deref(),
+        req.instructions.as_deref(),
+        checked.speed,
+    ) {
+        Ok(r) => r,
+        Err(e) => return bad(e, "tags"),
+    };
+    let tag_report = rendered.report.clone();
+    checked.speed = rendered.speed;
+    let (segs, trailing_pause) = rendered.segments(
+        w.segment_chars(&req.input, checked.language.as_deref()),
+        str::to_owned,
+    );
+    req.instructions = rendered.instructions;
     let lang = checked.language.clone();
     let voice = match (&req.ref_audio, w.clone_input()) {
         (None, _) => super::guided_speech::Voice::Named(checked.voice.clone()),
@@ -278,11 +330,6 @@ async fn speech_on_guided(
         }
         (Some(_), None) => return bad("this model has no voice cloning", "ref_audio"),
     };
-    let segs: Vec<String> =
-        super::segments(&req.input, w.segment_chars(&req.input, lang.as_deref()))
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
     // Later segments resume no session: the first one's ticket carries the voice prefix.
     let later_ids = RequestIds {
         session_end: false,
@@ -298,11 +345,19 @@ async fn speech_on_guided(
         Ok(o) => o,
         Err(e) => return server_error(e),
     };
+    if segs.is_empty() {
+        let mut response =
+            silence_response(&mut out_pcm, trailing_pause, w.sample_rate, &tag_report);
+        run.first();
+        run.done();
+        run.stamp(&mut response);
+        return response;
+    }
     if req.stream {
         let first = match w.synthesize_stream(
             &mux,
             voice.clone(),
-            segs[0].clone(),
+            segs[0].text.clone(),
             lang.as_deref(),
             &checked.sampling,
             checked.seed,
@@ -318,9 +373,23 @@ async fn speech_on_guided(
         let (head_tx, head_rx) = tokio::sync::oneshot::channel();
         let header = out_pcm.header(u32::MAX);
         tokio::spawn(guided_stream_task(
-            w, mux, voice, segs, checked, out_pcm, later_ids, first, out_tx, head_tx, t_arrive, run,
+            w,
+            mux,
+            voice,
+            segs,
+            trailing_pause,
+            checked,
+            out_pcm,
+            later_ids,
+            first,
+            out_tx,
+            head_tx,
+            t_arrive,
+            run,
         ));
-        return stream_response(out_rx, head_rx, header, in_flight, cache, false).await;
+        let mut response = stream_response(out_rx, head_rx, header, in_flight, cache, false).await;
+        stamp_tags(&mut response, &tag_report);
+        return response;
     }
     let (mut pcm, mut joiner) = (Vec::new(), super::Joins::new(w.sample_rate));
     let (mut tokens, mut t3_ms, mut s3gen_ms) = (0, 0.0, 0.0);
@@ -330,7 +399,7 @@ async fn speech_on_guided(
             .synthesize(
                 &mux,
                 voice.clone(),
-                text.clone(),
+                text.text.clone(),
                 lang.as_deref(),
                 &checked.sampling,
                 checked.seed.wrapping_add(k as u64),
@@ -343,14 +412,23 @@ async fn speech_on_guided(
             Err(e) => return speech_failure(e),
         };
         (tokens, t3_ms, s3gen_ms) = (tokens + a.tokens, t3_ms + a.t3_ms, s3gen_ms + a.s3gen_ms);
-        if segs.len() == 1 {
+        if segs.len() == 1 && segs[0].pause_before.is_none() && trailing_pause.is_none() {
             pcm = a.pcm;
         } else {
-            if k > 0 {
+            if let Some(ms) = text.pause_before {
+                joiner.pause(ms, checked.speed, &mut pcm);
+            } else if k > 0 {
                 joiner.next_segment();
             }
+            joiner.tagged_tail(
+                segs.get(k + 1)
+                    .map_or(trailing_pause.is_some(), |s| s.pause_before.is_some()),
+            );
             joiner.push(&a.pcm, f64::INFINITY, &mut pcm);
         }
+    }
+    if let Some(ms) = trailing_pause {
+        joiner.pause(ms, checked.speed, &mut pcm);
     }
     let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
     run.admitted(cache.and_then(|o| o.at));
@@ -369,6 +447,7 @@ async fn speech_on_guided(
         "tts: chatterbox speech"
     );
     let mut response = whole_response(&mut out_pcm, &pcm, t3_ms);
+    stamp_tags(&mut response, &tag_report);
     run.stamp(&mut response);
     if let Some(cache) = cache {
         cache.stamp(&mut response);
@@ -383,7 +462,8 @@ async fn guided_stream_task(
     w: Arc<super::guided_speech::GuidedSpeech>,
     mux: crate::serve::mux::ModelMux,
     voice: super::guided_speech::Voice,
-    segs: Vec<String>,
+    segs: Vec<super::tags::TextSegment>,
+    trailing_pause: Option<u32>,
     checked: Checked,
     mut out_pcm: super::OutPcm,
     later_ids: RequestIds,
@@ -409,7 +489,7 @@ async fn guided_stream_task(
             ev = match w.synthesize_stream(
                 &mux,
                 voice.clone(),
-                text.clone(),
+                text.text.clone(),
                 checked.language.as_deref(),
                 &checked.sampling,
                 checked.seed.wrapping_add(k as u64),
@@ -421,10 +501,35 @@ async fn guided_stream_task(
             };
             joiner.next_segment();
         }
+        if let Some(ms) = text.pause_before {
+            let mut pcm = Vec::new();
+            joiner.pause(ms, checked.speed, &mut pcm);
+            let mut bytes = Vec::new();
+            out_pcm.push(&pcm, &mut bytes);
+            sent += pcm.len();
+            if !bytes.is_empty() {
+                run.audio(pcm.len(), sr);
+                first.get_or_insert_with(|| t_arrive.elapsed());
+                playing.get_or_insert_with(Instant::now);
+                if let Some(h) = head.take() {
+                    let _ = h.send(run.headers());
+                }
+                if out.send(Ok(bytes)).await.is_err() {
+                    return;
+                }
+            }
+        }
+        joiner.tagged_tail(
+            segs.get(k + 1)
+                .map_or(trailing_pause.is_some(), |s| s.pause_before.is_some()),
+        );
         loop {
             match ev.recv().await {
                 Some(StreamEvent::Pcm(p)) => {
-                    let fresh = if segs.len() == 1 {
+                    let fresh = if segs.len() == 1
+                        && segs[0].pause_before.is_none()
+                        && trailing_pause.is_none()
+                    {
                         p
                     } else {
                         let lead = playing.map_or(f64::INFINITY, |t| {
@@ -466,6 +571,11 @@ async fn guided_stream_task(
         }
     }
     let mut tail = Vec::new();
+    if let Some(ms) = trailing_pause {
+        let mut pcm = Vec::new();
+        joiner.pause(ms, checked.speed, &mut pcm);
+        out_pcm.push(&pcm, &mut tail);
+    }
     out_pcm.finish(&mut tail);
     if !tail.is_empty() && out.send(Ok(tail)).await.is_err() {
         return;
@@ -1028,6 +1138,16 @@ async fn ws_speech_session(state: Arc<AppState>, mut socket: WebSocket, handshak
             continue;
         }
 
+        if response.headers().contains_key("x-plow-tags-applied") {
+            let report = serde_json::json!({"type":"tags", "applied":response.headers().get("x-plow-tags-applied").and_then(|v|v.to_str().ok()).unwrap_or(""), "dropped":response.headers().get("x-plow-tags-dropped").and_then(|v|v.to_str().ok()).unwrap_or("")});
+            if socket
+                .send(Message::Text(report.to_string()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
         let mut stream = response.into_body().into_data_stream();
         let mut sent_any = false;
         let mut stream_err: Option<String> = None;
@@ -1263,11 +1383,25 @@ async fn speech_with(
         }
     };
     let tok = bundle.tokenizer();
-    let checked = match check(model.spec(&**tok), &req) {
+    let mut checked = match check(model.spec(&**tok), &req) {
         Ok(c) => c,
         Err(r) => return r,
     };
     let c = &model.contract;
+    let rendered = match super::tags::render(
+        c.tags.as_deref(),
+        &req.input,
+        req.tags,
+        checked.language.as_deref(),
+        req.instructions.as_deref(),
+        checked.speed,
+    ) {
+        Ok(r) => r,
+        Err(e) => return bad(e, "tags"),
+    };
+    let tag_report = rendered.report.clone();
+    checked.speed = rendered.speed;
+    req.instructions = rendered.instructions.clone();
     // The guidance contrasts the instructed voice with the uninstructed one.
     if c.depth_cfg()
         && checked.sampling.cfg_weight.is_some_and(|w| w > 0.0)
@@ -1332,13 +1466,24 @@ async fn speech_with(
         }
         _ => None,
     };
-    // Maya 2 speaks numbers, dates, currency, ... as its server does: normalised in the language.
-    let input = match (&c.maya2, &language) {
-        (Some(_), Some(lang)) if req.normalize != Some(false) => {
-            super::maya2_text::normalise_text(&req.input, lang)
-        }
-        _ => req.input.clone(),
-    };
+    let (texts, trailing_pause) =
+        rendered.segments(c.segment_chars(), |text| match (&c.maya2, &language) {
+            (Some(_), Some(lang)) if req.normalize != Some(false) => {
+                super::maya2_text::normalise_text(text, lang)
+            }
+            _ => text.to_owned(),
+        });
+    if texts.first().is_some_and(|s| s.pause_before.is_some()) {
+        out_pcm.keep_onset();
+    }
+    if texts.is_empty() {
+        let mut response =
+            silence_response(&mut out_pcm, trailing_pause, c.sample_rate, &tag_report);
+        run.first();
+        run.done();
+        run.stamp(&mut response);
+        return response;
+    }
     let maker = SegmentMaker {
         tok: Arc::clone(tok),
         contract: c.clone(),
@@ -1364,13 +1509,20 @@ async fn speech_with(
         device_frames: req.stream,
     };
     let mut segs: Vec<Segment> = Vec::new();
-    for t in super::segments(&input, c.segment_chars()) {
+    for t in &texts {
+        let first = segs.len();
         if !maker.make_fitting(t, &mut segs) {
             return bad(
                 "`instructions` leave no room for text in the text encoder's prompt",
                 "instructions",
             );
         }
+        segs[first].pause_before = t.pause_before;
+    }
+    for k in 0..segs.len() {
+        segs[k].explicit_tail = segs
+            .get(k + 1)
+            .map_or(trailing_pause.is_some(), |s| s.pause_before.is_some());
     }
 
     let need = super::realtime::Need {
@@ -1495,8 +1647,9 @@ async fn speech_with(
             t_arrive,
             run,
             first_audio,
+            trailing_pause,
         ));
-        return stream_response(
+        let mut response = stream_response(
             out_rx,
             head_rx,
             header,
@@ -1505,6 +1658,8 @@ async fn speech_with(
             c.batch_delivery && crate::config::RuntimeConfig::process_get().tick_delivery,
         )
         .await;
+        stamp_tags(&mut response, &tag_report);
+        return response;
     }
     let (mut pcm, mut n_tokens, mut frames, mut t_lm) =
         (Vec::new(), 0, 0, std::time::Duration::ZERO);
@@ -1554,7 +1709,10 @@ async fn speech_with(
                 }
             };
             frames += f;
-            if later.segs.len() == 1 {
+            if later.segs.len() == 1
+                && later.segs[0].pause_before.is_none()
+                && trailing_pause.is_none()
+            {
                 pcm = p;
                 break;
             }
@@ -1572,14 +1730,20 @@ async fn speech_with(
                 }
                 Verdict::Fail => return server_error(format!("segment {k} produced no speech")),
             }
-            if !pcm.is_empty() {
+            if let Some(ms) = later.segs[k].pause_before {
+                joiner.pause(ms, checked.speed, &mut pcm);
+            } else if !pcm.is_empty() {
                 joiner.next_segment();
                 joins.push(pcm.len());
             }
+            joiner.tagged_tail(later.segs[k].explicit_tail);
             joiner.push(&p, f64::INFINITY, &mut pcm);
             break;
         }
         k += 1;
+    }
+    if let Some(ms) = trailing_pause {
+        joiner.pause(ms, checked.speed, &mut pcm);
     }
     drop(ticket);
     if frames == 0 {
@@ -1603,6 +1767,7 @@ async fn speech_with(
     run.first();
     run.done();
     let mut response = whole_response(&mut out_pcm, &pcm, t_lm.as_secs_f64() * 1e3);
+    stamp_tags(&mut response, &tag_report);
     run.stamp(&mut response);
     if let Some(cache) = cache {
         cache.stamp(&mut response);
@@ -1722,6 +1887,9 @@ fn ref_clip(
 /// One segment's LM job.
 #[derive(Clone)]
 struct Segment {
+    pause_before: Option<u32>,
+    explicit_tail: bool,
+    native: Vec<super::tags::Native>,
     text: String,
     /// With a text encoder: zeros sizing the prefill; every row is the encoder's row of
     /// `enc_ids`, encoded when the segment is submitted.
@@ -1932,6 +2100,9 @@ impl SegmentMaker {
             gen.params.temperature = 0.0;
         }
         Segment {
+            pause_before: None,
+            explicit_tail: false,
+            native: Vec::new(),
             text: text.to_owned(),
             prompt_ids,
             enc_ids,
@@ -1974,28 +2145,32 @@ impl SegmentMaker {
     /// Append `text`'s segments: a text-encoder prompt is one launch, so a segment whose prompt
     /// exceeds the encoder is halved (at whitespace when it can) until each fits. `false` when a
     /// single character does not fit.
-    fn make_fitting(&self, text: &str, out: &mut Vec<Segment>) -> bool {
-        let s = self.make(out.len(), text);
+    fn make_fitting(&self, text: &super::tags::TextSegment, out: &mut Vec<Segment>) -> bool {
+        let mut s = self.make(out.len(), &text.text);
+        s.native = text.native.clone();
         let rows = self.encoder.as_ref().map_or(usize::MAX, |e| e.rows());
         if s.enc_ids.as_ref().is_none_or(|ids| ids.len() <= rows) {
             out.push(s);
             return true;
         }
-        let chars: Vec<char> = text.chars().collect();
+        let chars: Vec<_> = text.text.char_indices().collect();
         if chars.len() < 2 {
             return false;
         }
         let mid = chars.len() / 2;
         let cut = (1..mid)
             .rev()
-            .find(|&i| chars[i].is_whitespace())
+            .find(|&i| chars[i].1.is_whitespace())
             .unwrap_or(mid);
-        let (a, b) = chars.split_at(cut);
-        [a, b].iter().all(|half| {
-            let half: String = half.iter().collect();
-            let half = half.trim();
-            half.is_empty() || self.make_fitting(half, out)
-        })
+        let Some(cut) = super::tags::safe_cut(&text.text, chars[cut].0, &text.native) else {
+            return false;
+        };
+        let Some(halves) = super::tags::split_at(text, cut) else {
+            return false;
+        };
+        halves
+            .iter()
+            .all(|half| half.text.is_empty() || self.make_fitting(half, out))
     }
 
     /// A depth-stage packet's per-segment sampling and, with a text encoder, its prompt rows
@@ -2210,7 +2385,7 @@ impl Later {
         if v != Verdict::Fail {
             return v;
         }
-        let Some(halves) = split_halves(&self.segs[k].text) else {
+        let Some(halves) = split_halves(&self.segs[k].text, &self.segs[k].native) else {
             tracing::warn!(
                 segment = k,
                 chars = self.segs[k].chars,
@@ -2223,7 +2398,16 @@ impl Later {
             chars = self.segs[k].chars,
             "tts: segment still mute; splitting it"
         );
-        let made: Vec<Segment> = halves.iter().map(|t| self.maker.make(k, t)).collect();
+        let mut made: Vec<Segment> = halves
+            .iter()
+            .map(|t| {
+                let mut s = self.maker.make(k, &t.text);
+                s.native = t.native.clone();
+                s
+            })
+            .collect();
+        made[0].pause_before = self.segs[k].pause_before;
+        made.last_mut().unwrap().explicit_tail = self.segs[k].explicit_tail;
         self.segs.splice(k..=k, made);
         *tries = 0;
         Verdict::Retry
@@ -2269,15 +2453,15 @@ impl Later {
 }
 
 /// `text` as two segments of about half its length, or `None` under `SPLIT_MIN_CHARS`.
-fn split_halves(text: &str) -> Option<Vec<String>> {
+fn split_halves(
+    text: &str,
+    native: &[super::tags::Native],
+) -> Option<Vec<super::tags::TextSegment>> {
     let n = text.chars().count();
     if n < SPLIT_MIN_CHARS {
         return None;
     }
-    let parts: Vec<String> = super::segments(text, n.div_ceil(2) + n / 8)
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let parts = super::tags::segment(text, n.div_ceil(2) + n / 8, native);
     (parts.len() >= 2).then_some(parts)
 }
 
@@ -2534,6 +2718,10 @@ fn step_need(emitted: usize, first: usize, cap: usize) -> usize {
 }
 
 enum SegMsg {
+    Start {
+        pause: Option<u32>,
+        explicit_tail: bool,
+    },
     Frame(super::codec::Codes),
     /// The current segment attempt generated its last frame. A multi-segment drain then waits for
     /// the emitter's verdict on it before it starts anything else.
@@ -2592,6 +2780,7 @@ async fn stream_task(
     t_arrive: Instant,
     mut run: crate::serve::turns::StageRun,
     first_audio: Option<Arc<crate::serve::mux::FirstAudio>>,
+    trailing_pause: Option<u32>,
 ) {
     use std::sync::atomic::Ordering::SeqCst;
     // However the stream ends, the decode loop stops handing it the device.
@@ -2663,6 +2852,16 @@ async fn stream_task(
                             Err(e) => return drop(ftx.send(SegMsg::Err(e))),
                         },
                     };
+                    if (later.segs[k].pause_before.is_some() || later.segs[k].explicit_tail)
+                        && ftx
+                            .send(SegMsg::Start {
+                                pause: later.segs[k].pause_before,
+                                explicit_tail: later.segs[k].explicit_tail,
+                            })
+                            .is_err()
+                    {
+                        return;
+                    }
                     let tag = attempt_tag(k, attempt);
                     lm.segment(k);
                     let (mut codes, mut frames) = (Vec::new(), 0);
@@ -2814,6 +3013,36 @@ async fn stream_task(
                 return drop(out.send(Err(std::io::Error::other(e))).await);
             }
             Some(SegMsg::Retry) => {}
+            Some(SegMsg::Start {
+                pause,
+                explicit_tail,
+            }) => {
+                if attempt == 0 {
+                    if let Some(ms) = pause {
+                        let mut pcm = Vec::new();
+                        joiner.pause(ms, out_pcm.speed(), &mut pcm);
+                        let mut bytes = Vec::new();
+                        out_pcm.push(&pcm, &mut bytes);
+                        sent += pcm.len();
+                        if !bytes.is_empty() {
+                            ticket.first_audio();
+                            ticket.sent(sent as f64 / sr);
+                            run.audio(sent - reported, sr);
+                            reported = sent;
+                            first.get_or_insert_with(|| t_arrive.elapsed());
+                            playing.get_or_insert_with(Instant::now);
+                            if let Some(h) = head.take() {
+                                let _ = h.send(run.headers());
+                            }
+                            if out.send(Ok(bytes)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                joiner.tagged_tail(explicit_tail);
+                continue;
+            }
             Some(SegMsg::Frame(f)) => {
                 frames.extend(f, fc);
                 while let Ok(m) = frx.try_recv() {
@@ -2824,6 +3053,12 @@ async fn stream_task(
                             break;
                         }
                         SegMsg::Retry => {}
+                        SegMsg::Start { .. } => {
+                            return drop(
+                                out.send(Err(std::io::Error::other("unexpected segment boundary")))
+                                    .await,
+                            );
+                        }
                         SegMsg::Err(e) => {
                             return drop(out.send(Err(std::io::Error::other(e))).await)
                         }
@@ -2998,7 +3233,7 @@ async fn stream_task(
                         );
                     };
                     let joined;
-                    let fresh = if n_segs == 1 {
+                    let fresh = if n_segs == 1 && !joiner.has_tagged_boundary() {
                         fresh
                     } else {
                         let lead = playing.map_or(f64::INFINITY, |t| {
@@ -3103,6 +3338,11 @@ async fn stream_task(
         }
     }
     let mut tail = Vec::new();
+    if let Some(ms) = trailing_pause {
+        let mut pcm = Vec::new();
+        joiner.pause(ms, out_pcm.speed(), &mut pcm);
+        out_pcm.push(&pcm, &mut tail);
+    }
     out_pcm.finish(&mut tail);
     if !tail.is_empty() {
         // A reply shorter than the onset trim's window: its held samples are its first audio.
@@ -3131,6 +3371,155 @@ async fn stream_task(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "GPU: existing-packet tag-map gate server, run through gpuq"]
+    async fn packet_tag_map_server() {
+        use crate::{device::cuda::CudaBackend, exec::ExecutorSet, orch::Registry};
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let assets = std::path::PathBuf::from(std::env::var_os("TTS_TAG_GATE_ASSETS").unwrap());
+        let path = std::env::var_os("TTS_TAG_GATE_MAPS").unwrap();
+        let profile = std::env::var("TTS_TAG_GATE_PROFILE").unwrap();
+        let maps: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let fixture = &maps[&profile];
+        let pipe: plow_asset::packet_pipeline::PacketPipeline =
+            serde_json::from_value(fixture["pipeline"].clone()).unwrap();
+        let map = super::super::tags::load(&pipe).unwrap().unwrap();
+        let port: u16 = std::env::var("TTS_TAG_GATE_PORT").unwrap().parse().unwrap();
+        let registry = Registry::new();
+        let slug = registry.load(&assets, None).unwrap();
+        let backend = Arc::new(CudaBackend::new(0).unwrap());
+        let executors = Arc::new(ExecutorSet::bringup(backend.clone()).unwrap());
+        let state = Arc::new(AppState::new(registry, executors));
+        let manager = Arc::new(
+            crate::serve::manager::ModelManager::new(
+                backend,
+                &state,
+                crate::serve::mux::MuxConfig {
+                    max_hold_ms: 0.0,
+                    ..Default::default()
+                },
+                vec![(
+                    slug.clone(),
+                    assets.clone(),
+                    crate::asset::serve::checkpoint_dir(&assets),
+                )],
+                None,
+            )
+            .unwrap(),
+        );
+        state.set_slug_group(&slug, 0);
+        state.install_turns_per_group(&[(None, true)]);
+        state.install_managers(vec![manager.clone()]);
+        manager.load_initial().await.unwrap();
+        super::bind(&state, &slug).unwrap();
+        let tok = state.registry.get(&slug).unwrap().tokenizer().clone();
+        {
+            let mut models = super::speech_models().lock();
+            let model =
+                Arc::get_mut(models.get_mut(&(assets, 0)).unwrap().as_mut().unwrap()).unwrap();
+            map.validate_binding(
+                model.contract.instructions.is_some()
+                    || model
+                        .contract
+                        .dual_stream
+                        .as_ref()
+                        .is_some_and(|d| d.instructions_template.is_some()),
+                |text| tok.encode_with_special_tokens(text, false).len() == 1,
+            )
+            .unwrap();
+            model.contract.tags = Some(map);
+            let languages: Vec<String> =
+                serde_json::from_value(fixture["languages"].clone()).unwrap();
+            if !languages.is_empty() {
+                model.contract.languages = languages;
+            }
+            model.spec = OnceLock::new();
+        }
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        axum::serve(listener, crate::serve::app(state))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn speech_tag_modes_and_headers_are_explicit() {
+        use super::super::tags::{Mode, Report};
+        for (value, expected) in [
+            ("auto", Mode::Auto),
+            ("strict", Mode::Strict),
+            ("off", Mode::Off),
+        ] {
+            let req: SpeechRequest = serde_json::from_value(
+                serde_json::json!({"model":"m","voice":"v","input":"Hello","tags":value}),
+            )
+            .unwrap();
+            assert_eq!(req.tags, expected);
+        }
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("bogus"),
+            serde_json::json!(7),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(true),
+            serde_json::json!(-7),
+            serde_json::json!(1.5),
+            serde_json::json!([{"nested": [null, "strict"]}]),
+            serde_json::json!({"nested": [null, "off"]}),
+        ] {
+            let req: SpeechRequest = serde_json::from_value(
+                serde_json::json!({"model":"m","voice":"v","input":"Hello","tags":value}),
+            )
+            .unwrap();
+            assert_eq!(req.tags, Mode::Auto);
+        }
+        let req: SpeechRequest =
+            serde_json::from_value(serde_json::json!({"model":"m","voice":"v","input":"Hello"}))
+                .unwrap();
+        assert_eq!(req.tags, Mode::Auto);
+        let mut response = Response::new(Body::empty());
+        stamp_tags(&mut response, &Report::default());
+        assert!(!response.headers().contains_key("x-plow-tags-applied"));
+        stamp_tags(
+            &mut response,
+            &Report {
+                active: true,
+                applied: vec!["pause".into()],
+                dropped: vec!["laugh".into()],
+            },
+        );
+        assert_eq!(response.headers()["x-plow-tags-applied"], "pause");
+        assert_eq!(response.headers()["x-plow-tags-dropped"], "laugh");
+    }
+
+    #[tokio::test]
+    async fn silence_only_reply_keeps_requested_duration_after_conversion() {
+        let report = super::super::tags::Report {
+            active: true,
+            applied: vec!["pause".into()],
+            dropped: Vec::new(),
+        };
+        for rate in [8000, 24000, 48000] {
+            for speed in [0.5, 1.0, 1.14, 2.0] {
+                let mut out = super::super::OutPcm::new(24000, rate, speed, false).unwrap();
+                let reply = silence_response(&mut out, Some(600), 24000, &report);
+                let bytes = axum::body::to_bytes(reply.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(bytes.iter().all(|&b| b == 0));
+                let ms = bytes.len() as f64 / 2.0 / f64::from(rate) * 1000.0;
+                assert!(
+                    (ms - 600.0).abs() <= 80.0,
+                    "rate={rate} speed={speed} duration={ms}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn delivery_audio_coalesces_ready_bytes_and_preserves_a_following_error() {
         use std::task::{Context, Poll};
@@ -3276,10 +3665,16 @@ mod tests {
         assert_eq!(verdict(40, true, MUTE_RETRIES), Verdict::Fail);
         assert_eq!(verdict(40, false, MUTE_RETRIES), Verdict::Keep);
         let t = "As for etchings they are of two kinds british and foreign, he laments most bitterly the divorce";
-        let h = split_halves(t).unwrap();
+        let h = split_halves(t, &[]).unwrap();
         assert_eq!(h.len(), 2);
-        assert_eq!(h.join(" "), t);
-        assert!(split_halves("Too short to split again.").is_none());
+        assert_eq!(
+            h.iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            t
+        );
+        assert!(split_halves("Too short to split again.", &[]).is_none());
     }
 
     /// Cuts and verdicts carry their segment attempt: a stale one (another segment, or an

@@ -1049,3 +1049,86 @@ co-serving".
 | `mtl_text_ref.py`, `crates/plowrt/examples/t3_text_check.rs` | text frontend gate: packet rules + tokenizer vs the reference ids (CPU) |
 
 Every GPU run goes through `perf-data/tools/gpulease`.
+
+## Text tags
+
+A speech pipeline can declare `text.tags` (JSON) and `text.tags_version = 1`.
+The model card then includes `x_plow_speech.tags`: accepted syntax, unknown-tag policy,
+and each canonical tag's action (`native`, `instruction`, `silence`, `speed`, or `dropped`).
+The runtime rejects unknown versions, fields, actions, alias cycles, unsupported instruction
+mappings and native mappings that violate a declared single-token constraint.
+
+Requests accept `tags: "auto"` (default), `"strict"`, or `"off"`.
+`auto` applies the packet's map. `strict` returns 400 with the first unsupported tag.
+`off` retains the original text path. A packet without a tag map keeps its original behavior.
+Text containing none of `[`, `<`, `*`, or `\` bypasses tag processing.
+
+Accepted forms include `[laughs]`, `[clears throat]`, `[pause 600ms]`, known comma-separated
+aliases such as `[warm, casual, friendly]`, and known asterisk aliases such as `*laughs*`.
+Unknown tag-shaped ASCII brackets follow the packet's policy. Numeric, non-ASCII and reference
+brackets such as `[1]`, `[कोई]`, and `[see p. 4]` remain literal.
+Parentheses, braces, prose prefixes and unknown asterisk phrases remain text.
+Use `\[` and `\<` to escape a bracket or angle opener. The shared map declares
+`syntax.markers: "strip"`: `<|...|>` markers are consumed; text between paired markers is kept.
+Older maps without this field retain neutralization to `< |`.
+Literal rewrites run before mandatory neutralization of any remaining special-token openers.
+
+The SSML subset consumes `speak`, `break` (`time` or `strength`), `prosody` (`rate` and `pitch`),
+`emphasis`, `express-as style`, `emotion name`, `amazon:effect name="whispered"`, and `style`.
+Bare event elements such as `<laugh>` are accepted. Comments are removed; other element
+markup is removed while its inner text is kept. `a < b` remains literal text.
+A consumed style or prosody control can still be dropped when the packet does not support it.
+Removed controls consume boundary formatting gaps: `[laughs] [laughs] Hello` becomes `Hello`
+when laughter is dropped. Other whitespace and literal forms are preserved.
+Instruction mappings append to client instructions once per request. Allowed rate mappings
+multiply the request's speed within its normal limits.
+An instruction-mapped rate supplies the validated rate label to the model instead.
+Native entries can restrict languages with `langs: ["en"]`, or select text with
+`langs: {"en":"(sigh)","zh":"[叹气]"}` beside their default `text`.
+Every alternative follows the same length and single-token constraints.
+
+Profile maps provide native events for Orpheus and Fish, English/Chinese events and style
+instructions for Breeze, and style/rate instructions for Qwen CustomVoice. Qwen Base and
+Veena strip unsupported controls. Every profile uses runtime silence for pauses and strips
+special-token markers. Fish passes unknown tag-shaped names through as its native bracket form.
+Breeze drops Chinese laughter and calm/friendly controls; their English mappings remain enabled.
+
+Pauses are runtime silence at segment boundaries, including leading or trailing pauses.
+The default is 400 ms; durations above 3000 ms are clamped. Native tags remain atomic across
+segments; mappings marked `carry` are repeated on later segments.
+Responses report canonical names in `x-plow-tags-applied` and `x-plow-tags-dropped`
+(up to 32 distinct names each). WebSocket speech sends one `{"type":"tags","applied":...,"dropped":...}`
+text message before its binary audio when tags were applied or dropped.
+
+For existing packets without tag metadata, `PLOW_TTS_TAGS_DEFAULT=strip`
+(`--tts-tags-default strip`) enables the shared strip-and-silence policy at load.
+It is unset by default, applies to speech drivers only, and never overrides a packet map.
+Per-request `tags: "off"` still selects the original path. New Maya2 profiles emit this
+map directly; they need no fallback setting. Native Maya2 events and styles remain dropped.
+
+`scripts/tts/tag_cases.json` contains 37 neutral request shapes in English and Hindi.
+Capture with `scripts/serve_test/eval.py --tts-manifest`: `reference` is the clean ASR
+reference, while `text` is the request. Supply the clone rows' reference WAVs from your own
+baseline captures. Explicit `voice: null` omits the field; `expected_status: 400` records an
+expected failure without producing an ASR row. Literal syntax remains literal; its expected
+spoken reference must account for the words it preserves.
+`reference_language` selects the ASR judge's language independently of the request's `language`;
+it is capture metadata and is never sent to the speech server.
+Gate accepted syntax with forbid lists and clean-reference CER. Check literal forms against
+`tags: "off"` rendered bytes on CPU, with ASR as a speaking sanity check. Check special-token
+markers for forbidden markup words too; their inner words remain ordinary text.
+
+`scripts/tts/asr_check.py` accepts per-row `forbid` lists in `texts.json`, or
+`--forbid FILE` containing `{ "clip.wav": ["style", "equals"] }`. Matches use normalized
+whole words/phrases (substring matching for Chinese/Japanese). Any hit fails the gate.
+`--baseline-report FILE --cer-margin M` also gates every row against the uniquely matched
+baseline's CER plus the explicit margin. Baseline ASR model, language and clean reference
+must match; use a row's `baseline` to name the control's `case_id` or WAV basename.
+The existing median CER gate still applies.
+
+Signal metadata can declare `pauses: [{"ms":600,"position":"internal","window_ms":[900,1100]}]`
+and `duration_delta: {"baseline":"control.wav","ms":600}`. Internal pauses require a join
+window; leading/trailing positions require silence at that edge. Silence uses 5 ms RMS
+frames below −60 dBFS, with ±80 ms tolerance on both run length and duration delta.
+Compare against a control with the same segmentation and zero inserted pause.
+`tts_bench.py --tags auto|off` supports matching c1 latency measurements.

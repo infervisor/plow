@@ -1,5 +1,9 @@
 # Configuration
 
+`PLOW_TTS_TAGS_DEFAULT=strip` (`--tts-tags-default strip`) enables strip-and-silence
+for speech packets without `text.tags`. It is unset by default. A packet map takes
+precedence, and per-request `tags: "off"` preserves the original text path.
+
 `PLOW_TTS_DEVICE_CONTROL=1` opts into device sampling for packets declaring the
 controlled speech-depth protocol. It defaults to off and requires a speech object
 built with `PLOW_CUBIN_DEVICE_CONTROL=ON` (`PLOW_NV_DEVICE_CONTROL=1`). The optional

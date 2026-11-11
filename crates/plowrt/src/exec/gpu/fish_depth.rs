@@ -310,7 +310,7 @@ struct Maya2 {
     device: Option<super::control_sample::ControlledSample>,
     slots: Vec<Option<crate::tts::maya2::Slot>>,
     memory: Vec<SpeakerMemory>,
-    logits: PinnedHost,
+    logits: Option<PinnedHost>,
     scratch: Vec<f32>,
     /// The depth levels' (temperature, top-k).
     depth: (f32, u32),
@@ -633,11 +633,16 @@ impl FishDepth {
                 } else {
                     None
                 };
+                let logits = if device.is_none() {
+                    Some(e.be.host_alloc_pinned(rows * e.vocab() * 2)?)
+                } else {
+                    None
+                };
                 Some(Maya2 {
                     device,
                     slots: vec![None; e.batch],
                     memory: vec![SpeakerMemory::Unbound; e.batch],
-                    logits: e.be.host_alloc_pinned(rows * e.vocab() * 2)?,
+                    logits,
                     scratch: Vec::new(),
                     depth: (f32::from_bits(t), k),
                     speech,
@@ -1224,18 +1229,20 @@ impl GpuEngine {
             return Err(reject("maya2 row on an unbound slot"));
         }
         let l = &self.devp[self.t_logits];
-        if m.device.is_none() {
+        let logits: &[u16] = if let Some(logits) = m.logits.as_mut() {
             // SAFETY: the pinned buffer is read only after this call's synchronize.
             unsafe {
                 self.be.memcpy_dtoh_async(
-                    &mut m.logits.as_mut_slice()[..width * vocab * 2],
+                    &mut logits.as_mut_slice()[..width * vocab * 2],
                     outputs.map_or(l.base, |o| o.logits),
                     &self.stream,
                 )?;
             }
             self.be.stream_synchronize(&self.stream)?;
-        }
-        let logits: &[u16] = bytemuck::cast_slice(&m.logits.as_slice()[..width * vocab * 2]);
+            bytemuck::cast_slice(&logits.as_slice()[..width * vocab * 2])
+        } else {
+            &[]
+        };
         let mut stops = Vec::with_capacity(rows.len());
         let sr = d.stage_rows;
         let (params, ctl, hrow, cb0) = (sr * 8, sr * 24, sr * 32, sr * 36);
@@ -1379,21 +1386,22 @@ impl GpuEngine {
                 )?;
             }
         }
-        if let Some(device) = d.maya2.as_ref().and_then(|m| m.device.as_ref()) {
-            device.finish(
-                &self.be,
-                &self.stream,
-                self.devp[usize::from(d.manifest.tensors.frame_codes)].base,
-                k as u32,
-                d.manifest.stop_class,
-            )?;
-        }
-        let codes_at = d.stage_rows * STAGE_CONTROL_BYTES;
         let end = if packed {
             width
         } else {
             d.plan.capacity(d.plan.windows()[0].program) as usize
         };
+        if let Some(device) = d.maya2.as_ref().and_then(|m| m.device.as_ref()) {
+            device.finish(
+                &self.be,
+                &self.stream,
+                self.devp[usize::from(d.manifest.tensors.frame_codes)].base,
+                end,
+                k as u32,
+                d.manifest.stop_class,
+            )?;
+        }
+        let codes_at = d.stage_rows * STAGE_CONTROL_BYTES;
         let mut depth_us = None;
         if let Some(tick) = tick {
             tick.end_depth(&self.stream)?;

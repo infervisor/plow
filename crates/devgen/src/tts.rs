@@ -6,11 +6,13 @@
 use crate::pipeline::{causal_pipeline_section, CausalPipelineSpec};
 use packet::devbuild::{Model, SectionData};
 use plow_asset::packet_pipeline::{PacketPipelines, SECTION};
+use plow_asset::speech_tags::{Entry, Langs, SpeechTags, Unknown};
 
 pub const DRIVER: &str = "tts.codec_lm.v1";
 
 /// One speech family's contract. Token ids are the checkpoint tokenizer's.
 pub struct SpeechProfile {
+    pub tags: Option<fn(bool) -> SpeechTags>,
     /// Prompt text between the prefix and suffix ids, with `{voice}` and `{input}`.
     pub prompt_template: &'static str,
     /// A voice is valid when this renders to one vocabulary token, unless `voices` lists them.
@@ -75,9 +77,131 @@ pub struct CloneLayout {
     pub eos_code: Option<u64>,
 }
 
+fn strip_tags(_: bool) -> SpeechTags {
+    SpeechTags::strip()
+}
+
+fn native_entry(text: &str, carry: bool) -> Entry {
+    Entry {
+        text: Some(text.into()),
+        carry,
+        budget_chars: Some(24),
+        ..Entry::default()
+    }
+}
+
+fn instruction_styles(map: &mut SpeechTags) {
+    for (name, instruction) in [
+        ("whisper", "Speak in a whisper."),
+        ("excited", "Speak excitedly."),
+        ("happy", "Speak happily."),
+        ("sad", "Speak sadly."),
+        ("angry", "Speak angrily."),
+        ("calm", "Speak calmly."),
+        ("serious", "Speak seriously."),
+        ("surprised", "Speak with surprise."),
+        ("friendly", "Speak in a friendly tone."),
+        ("casual", "Speak casually."),
+    ] {
+        map.tags.insert(
+            name.into(),
+            Entry {
+                instruction: Some(instruction.into()),
+                ..Entry::default()
+            },
+        );
+    }
+}
+
+fn orpheus_tags(_: bool) -> SpeechTags {
+    let mut map = SpeechTags::strip();
+    for (name, text) in [
+        ("laugh", "<laugh>"),
+        ("chuckle", "<chuckle>"),
+        ("sigh", "<sigh>"),
+        ("cough", "<cough>"),
+        ("sniff", "<sniffle>"),
+        ("groan", "<groan>"),
+        ("yawn", "<yawn>"),
+        ("gasp", "<gasp>"),
+    ] {
+        let mut entry = native_entry(text, false);
+        entry.langs = Langs::Only(vec!["en".into()]);
+        map.tags.insert(name.into(), entry);
+    }
+    map.tags.insert(
+        "giggle".into(),
+        Entry {
+            alias: Some("laugh".into()),
+            ..Entry::default()
+        },
+    );
+    map
+}
+
+fn fish_tags(_: bool) -> SpeechTags {
+    let mut map = SpeechTags::strip();
+    map.unknown = Unknown::Passthrough;
+    for (name, text, carry) in [
+        ("laugh", "[laughing]", false),
+        ("chuckle", "[chuckle]", false),
+        ("sigh", "[sigh]", false),
+        ("inhale", "[inhale]", false),
+        ("exhale", "[exhale]", false),
+        ("clear_throat", "[clearing throat]", false),
+        ("whisper", "[whisper]", true),
+        ("excited", "[excited]", true),
+        ("sad", "[sad]", true),
+        ("angry", "[angry]", true),
+        ("emphasis", "[emphasis]", true),
+    ] {
+        map.tags.insert(name.into(), native_entry(text, carry));
+    }
+    map
+}
+
+fn breeze_tags(_: bool) -> SpeechTags {
+    let mut map = SpeechTags::strip();
+    for (name, en, zh) in [
+        ("laugh", "(laugh)", "[笑]"),
+        ("cough", "(cough)", "[咳嗽]"),
+        ("clear_throat", "(clears throat)", "[清嗓子]"),
+        ("sigh", "(sigh)", "[叹气]"),
+    ] {
+        let mut entry = native_entry(en, false);
+        let mut forms = std::collections::BTreeMap::from([("en".into(), en.into())]);
+        if name != "laugh" {
+            forms.insert("zh".into(), zh.into());
+        }
+        entry.langs = Langs::Text(forms);
+        map.tags.insert(name.into(), entry);
+    }
+    instruction_styles(&mut map);
+    for name in ["calm", "friendly"] {
+        map.tags.get_mut(name).unwrap().langs = Langs::Only(vec!["en".into()]);
+    }
+    map
+}
+
+fn qwen_tags(instructions: bool) -> SpeechTags {
+    let mut map = SpeechTags::strip();
+    if instructions {
+        instruction_styles(&mut map);
+        map.tags.insert(
+            "rate".into(),
+            Entry {
+                instruction: Some("Speak at a {value} rate.".into()),
+                ..Entry::default()
+            },
+        );
+    }
+    map
+}
+
 /// maya-research/Veena (model card): [SOH] <spk_v> text [EOH] [SOA] [SOS] -> SNAC codes, stop on
 /// END_OF_SPEECH / END_OF_AI.
 pub const VEENA: SpeechProfile = SpeechProfile {
+    tags: Some(strip_tags),
     prompt_template: "<spk_{voice}> {input}",
     voice_token: "<spk_{voice}>",
     voices: &[],
@@ -112,6 +236,7 @@ pub const VEENA: SpeechProfile = SpeechProfile {
 /// canopylabs/orpheus-3b-0.1-ft (orpheus_tts `_format_prompt`): [SOH] BOS "voice: text" [EOT]
 /// [EOH] [SOA] [SOS] -> the same 7-code SNAC frames as Veena, stop on END_OF_SPEECH.
 pub const ORPHEUS: SpeechProfile = SpeechProfile {
+    tags: Some(orpheus_tags),
     prompt_template: "{voice}: {input}",
     voice_token: "{voice}",
     voices: &["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"],
@@ -138,7 +263,7 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
     instructions: None,
     text_encoder: None,
     clone: None,
-    languages: &[],
+    languages: &["en"],
     segment_frames: 0,
     dual_stream: false,
     onset_trim: None,
@@ -150,6 +275,7 @@ pub const ORPHEUS: SpeechProfile = SpeechProfile {
 /// frame (151678 + class) plus 9 depth codebooks, stop on <|im_end|>. Sampling: T 0.7, top-p 0.7,
 /// top-k 30 (RAS in the depth stage).
 pub const FISH: SpeechProfile = SpeechProfile {
+    tags: Some(fish_tags),
     prompt_template: "<|speaker:0|>{input}",
     voice_token: "{voice}",
     voices: &["default"],
@@ -199,6 +325,7 @@ pub const FISH: SpeechProfile = SpeechProfile {
 /// 15 depth codebooks. Sampling (`runtime.py`, `infer.py`): T 0.9, top-k 50, top-p 1.0,
 /// repetition penalty 1.1 on cb0, max 1500 frames.
 pub const BREEZE: SpeechProfile = SpeechProfile {
+    tags: Some(breeze_tags),
     prompt_template: "[{voice}]{instructions}{input}",
     voice_token: "[{voice}]",
     voices: &["S0"],
@@ -230,7 +357,7 @@ pub const BREEZE: SpeechProfile = SpeechProfile {
         tail: None,
         eos_code: Some(0),
     }),
-    languages: &[],
+    languages: &["en", "zh"],
     segment_frames: 0,
     dual_stream: false,
     onset_trim: None,
@@ -243,6 +370,7 @@ pub const BREEZE: SpeechProfile = SpeechProfile {
 /// top-k 64, presence penalty 0.8 over 12 frames, controlled stop (`maya2.controller`); depth T 0.7,
 /// top-k 64; text in pieces of about 20 s.
 pub const MAYA2: SpeechProfile = SpeechProfile {
+    tags: Some(strip_tags),
     prompt_template: "<|lang:{language}|>{voice}{input}<|audio|>",
     voice_token: "{voice}",
     voices: &[
@@ -310,6 +438,7 @@ pub const MAYA2: SpeechProfile = SpeechProfile {
 /// Talker and predictor: T 0.7 (the published config's 0.9 babbles on ~0.7% of Seed-TTS EN
 /// prompts; recipe .md), top-k 50, top-p 1; repetition penalty 1.05 on cb0.
 pub const QWEN3_TTS: SpeechProfile = SpeechProfile {
+    tags: Some(qwen_tags),
     prompt_template: "{input}",
     voice_token: "{voice}",
     voices: &[],
@@ -492,6 +621,7 @@ pub fn speech_pipeline_section(
     }
     pipe.strings
         .insert("codec.packet".into(), CODEC_PACKET.into());
+    let mut takes_instructions = p.instructions.is_some();
     if let Some(t) = p.instructions {
         pipe.strings.insert("prompt.instructions".into(), t.into());
     }
@@ -515,6 +645,7 @@ pub fn speech_pipeline_section(
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let d = DualStream::parse(&text)?;
+        takes_instructions |= d.instructions_template.is_some();
         if d.frame_codes as u64 != p.frame_codes {
             return Err(format!("{}: frame_codes != the profile's", path.display()));
         }
@@ -676,6 +807,18 @@ pub fn speech_pipeline_section(
         "sampling.repetition_penalty_f32".into(),
         u64::from(p.repetition_penalty.to_bits()),
     );
+    if let Some(build) = p.tags {
+        let map = build(takes_instructions);
+        map.validate_binding(takes_instructions, |_| true)?;
+        pipe.parameters.insert(
+            plow_asset::speech_tags::VERSION_KEY.into(),
+            plow_asset::speech_tags::VERSION,
+        );
+        pipe.strings.insert(
+            plow_asset::speech_tags::KEY.into(),
+            serde_json::to_string(&map).map_err(|e| e.to_string())?,
+        );
+    }
     meta.validate(model.progs.len(), |name| {
         model
             .tensors
@@ -696,6 +839,172 @@ mod speech_tests {
     use crate::pipeline::CausalPipelineTensors;
     use packet::devbuild::Builder;
     use plow_asset::dual_stream::{CONDITIONED_DRIVER, CONDITIONING_KEY};
+
+    fn check_tag_pipeline(
+        name: &str,
+        pipe: &plow_asset::packet_pipeline::PacketPipeline,
+        languages: &[&str],
+        instructions: bool,
+    ) {
+        use plow_asset::speech_tags::{KEY, VERSION, VERSION_KEY};
+        assert_eq!(pipe.parameters[VERSION_KEY], VERSION);
+        let map = SpeechTags::parse(&pipe.strings[KEY]).unwrap();
+        assert_eq!(map.syntax.markers, plow_asset::speech_tags::Markers::Strip);
+        if let Some(path) = std::env::var_os("TTS_TAG_TOKENIZERS") {
+            let paths: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let tokenizer =
+                tokenizers::Tokenizer::from_file(paths[name].as_str().unwrap()).unwrap();
+            map.validate_binding(instructions, |text| {
+                tokenizer.encode(text, false).unwrap().len() == 1
+            })
+            .unwrap();
+            for entry in map.tags.values() {
+                let mut forms: Vec<&str> = entry.text.iter().map(String::as_str).collect();
+                if let Langs::Text(extra) = &entry.langs {
+                    forms.extend(extra.values().map(String::as_str));
+                }
+                for text in forms {
+                    let encoded = tokenizer.encode(text, false).unwrap();
+                    assert!(!encoded.is_empty(), "{name}: {text}");
+                    assert!(
+                        encoded
+                            .get_ids()
+                            .iter()
+                            .all(|&id| (id as usize) < tokenizer.get_vocab_size(true)),
+                        "{name}: {text}"
+                    );
+                }
+            }
+        } else {
+            map.validate_binding(instructions, |_| true).unwrap();
+        }
+        if let Some(path) = std::env::var_os("TTS_TAG_MAP_OUTPUT") {
+            let path = std::path::PathBuf::from(path);
+            let mut output: serde_json::Map<String, serde_json::Value> = if path.exists() {
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+            } else {
+                Default::default()
+            };
+            output.insert(
+                name.into(),
+                serde_json::json!({"pipeline":pipe,"languages":languages}),
+            );
+            std::fs::write(path, serde_json::to_vec_pretty(&output).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn profile_tag_map_changes_only_versioned_metadata() {
+        use plow_asset::speech_tags::{SpeechTags, KEY, VERSION, VERSION_KEY};
+        let mut tensors = Builder::new(2);
+        let tokens = tensors.tensor("in.ids", 512 * 4);
+        let positions = tensors.tensor("in.pos", 512 * 4);
+        let kv_lengths = tensors.tensor("in.kvlen", 4);
+        let mut model = Model {
+            n_cu: 2,
+            target: 0,
+            tensors: tensors.tensors(),
+            progs: (0..2).map(|_| Builder::new(2).finish()).collect(),
+            kv_row_insts: Vec::new(),
+            prog_t: vec![512, 1],
+            gen: Vec::new(),
+        };
+        let spec = CausalPipelineSpec {
+            name: "speech",
+            max_context: 512,
+            hidden: 4,
+            decode_capacity: 1,
+            overlay_rows: 0,
+            ordered_dispatch: false,
+            tensors: CausalPipelineTensors {
+                tokens,
+                positions,
+                kv_lengths,
+                overlay: None,
+                overlay_index: None,
+            },
+        };
+        let mut untagged = VEENA;
+        untagged.tags = None;
+        let control: PacketPipelines = serde_json::from_slice(
+            &speech_pipeline_section(
+                &mut model,
+                spec,
+                &untagged,
+                200000,
+                std::path::Path::new(""),
+            )
+            .unwrap()
+            .data,
+        )
+        .unwrap();
+        let mut profile = VEENA;
+        profile.tags = MAYA2.tags;
+        let mut tagged: PacketPipelines = serde_json::from_slice(
+            &speech_pipeline_section(&mut model, spec, &profile, 200000, std::path::Path::new(""))
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        assert_eq!(
+            tagged.pipelines[0].parameters.remove(VERSION_KEY),
+            Some(VERSION)
+        );
+        let map = SpeechTags::parse(&tagged.pipelines[0].strings.remove(KEY).unwrap()).unwrap();
+        assert_eq!(map, SpeechTags::strip());
+        assert_eq!(tagged, control);
+        let dir = std::env::temp_dir().join(format!("plow-tag-profiles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MAYA2_CONTROLLER), "{}").unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        let dual = serde_json::json!({
+            "text_template":"{input}","instructions_template":"{instructions}","lead":3,"drop":5,
+            "text_pad":2,"text_bos":3,"text_eos":4,"none_code":3072,"frame_codes":16,
+            "codec_language":[2154,2156,2157],"language_at":2,"codec_auto":[2155,2156,2157],
+            "codec_pad":2148,"codec_bos":2149,"languages":{"english":2050},"voices":{"voice":{"code":3061,"dialect":null}},
+            "dialect_languages":["chinese","auto"]
+        });
+        std::fs::write(dir.join(DUAL_STREAM), dual.to_string()).unwrap();
+        for (name, profile, instructions) in [
+            ("veena", &VEENA, false),
+            ("orpheus", &ORPHEUS, false),
+            ("fish", &FISH, false),
+            ("breeze", &BREEZE, true),
+            ("maya2", &MAYA2, false),
+            ("qwen-customvoice", &QWEN3_TTS, true),
+        ] {
+            let meta: PacketPipelines = serde_json::from_slice(
+                &speech_pipeline_section(&mut model, spec, profile, 200000, &dir)
+                    .unwrap()
+                    .data,
+            )
+            .unwrap();
+            check_tag_pipeline(name, &meta.pipelines[0], profile.languages, instructions);
+        }
+        assert_eq!(qwen_tags(false), SpeechTags::strip());
+        assert_eq!(
+            orpheus_tags(false).tags["giggle"].alias.as_deref(),
+            Some("laugh")
+        );
+        assert_eq!(
+            fish_tags(false).tags["laugh"].text.as_deref(),
+            Some("[laughing]")
+        );
+        assert_eq!(
+            breeze_tags(true).tags["sigh"].native_text(Some("zh")),
+            Some("[叹气]")
+        );
+        assert_eq!(
+            breeze_tags(true).tags["laugh"].native_text(Some("zh")),
+            None
+        );
+        assert_eq!(
+            qwen_tags(true).tags["rate"].instruction.as_deref(),
+            Some("Speak at a {value} rate.")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn external_speaker_metadata_requires_a_new_driver_and_overlay() {
@@ -760,6 +1069,7 @@ mod speech_tests {
         let meta: PacketPipelines = serde_json::from_slice(&emit(spec).unwrap().data).unwrap();
         let pipe = &meta.pipelines[0];
         assert_eq!(pipe.driver, CONDITIONED_DRIVER);
+        check_tag_pipeline("qwen-base", pipe, &[], false);
         assert_eq!(pipe.parameters["conditioning.text_pad"], 2);
         assert_eq!(
             pipe.tensors["conditioning.text_embeddings"].name,

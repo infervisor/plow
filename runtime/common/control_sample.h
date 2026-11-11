@@ -1,4 +1,5 @@
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 struct ControlSamplePlan {
@@ -18,3 +19,6 @@ struct ControlSampleRow { uint32_t slot, output, logits; };
 static_assert(sizeof(ControlSamplePlan) == 216, "controlled sampler plan ABI");
 static_assert(sizeof(ControlSampleState) == 2296, "controlled sampler state ABI");
 static_assert(sizeof(ControlSampleRow) == 12, "controlled sampler row ABI");
+static_assert(alignof(ControlSampleState) == 8, "controlled sampler state alignment");
+static_assert(offsetof(ControlSampleState, last) == 224, "controlled sampler cb0 ABI");
+static_assert(offsetof(ControlSampleState, stopped) == 236, "controlled sampler stop ABI");

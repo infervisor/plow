@@ -1,6 +1,7 @@
 /* nvcc -gencode arch=compute_90a,code=sm_90a -O3 -I runtime/common -I runtime/nvidia
- *   runtime/tests/gemv_f16_sm90_test.cu -o gemv_f16_sm90_test */
+ *   runtime/tests/gemv_f16_sm90_test.cu -lcuda -o gemv_f16_sm90_test */
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cstdio>
@@ -13,6 +14,9 @@
 
 #define CK(call) do { auto e = (call); if (e != cudaSuccess) { \
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); return 1; } } while (0)
+#define DK(call) do { auto e = (call); if (e != CUDA_SUCCESS) { \
+    const char* name = nullptr; cuGetErrorName(e, &name); \
+    fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, name ? name : "CUDA driver error"); return 1; } } while (0)
 
 __global__ void project(float* c, const float* x, const unsigned short* w, const float* bias,
                         const float* res, const float* gamma, const float* beta,
@@ -26,9 +30,96 @@ __global__ void normalize(float* out, const float* x, const float* g, const floa
     d_layernorm_f32(out, x, g, b, rows, width, flags, 1e-5f, blockIdx.x, gridDim.x, sp_smem);
 }
 
+#if defined(PLOW_NV_GEMM_WIDE_PROBE) && PLOW_NV_GEMM_WIDE_PROBE
+template <unsigned BM, unsigned BK = 64>
+__global__ void project_wide(float* c, const unsigned short* x, const unsigned short* w,
+                             const float* bias, const float* res, unsigned flags, unsigned group,
+                             unsigned m, unsigned n, unsigned k) {
+    if (flags & 16384u)
+        gemv_f16w_wide<BM, true, BK>(c, x, w, bias, group, res, flags >> 4 & 15u, m, n, k,
+                               blockIdx.x, gridDim.x, sp_smem);
+    else
+        gemv_f16w_wide<BM, false, BK>(c, x, w, bias, group, res, flags >> 4 & 15u, m, n, k,
+                                blockIdx.x, gridDim.x, sp_smem);
+}
+#endif
+
 int main(int argc, char** argv) {
-    const bool sanitize = argc == 2 && !strcmp(argv[1], "--sanitize");
-    CK(cudaFuncSetAttribute(project, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024));
+    bool sanitize = false, wide = false;
+    const char* node_path = nullptr;
+    const char* reject_case = nullptr;
+    for (int arg = 1; arg < argc; arg++) {
+        if (!strcmp(argv[arg], "--sanitize")) sanitize = true;
+        else if (!strcmp(argv[arg], "--wide")) wide = true;
+        else if (!strcmp(argv[arg], "--reject") && arg + 1 < argc) reject_case = argv[++arg];
+        else if (!strcmp(argv[arg], "--node") && arg + 1 < argc) { node_path = argv[++arg]; wide = true; }
+        else return 2;
+    }
+    CUmodule node_module{};
+    CUfunction node_function[2]{};
+    PlowDevInst* node_instruction = nullptr;
+    uint64_t* node_table = nullptr;
+    if (node_path) {
+        CK(cudaFree(nullptr));
+        DK(cuModuleLoad(&node_module, node_path));
+        DK(cuModuleGetFunction(&node_function[0], node_module, "gemm_f16_sm90_f32_node"));
+        DK(cuModuleGetFunction(&node_function[1], node_module, "gemm_f16_sm90_f16_node"));
+        CUdeviceptr marker;
+        size_t marker_bytes;
+        DK(cuModuleGetGlobal(&marker, &marker_bytes, node_module, "plow_gemm_f16_node_abi"));
+        unsigned abi = 0;
+        if (marker_bytes != sizeof(abi)) return 2;
+        DK(cuMemcpyDtoH(&abi, marker, sizeof(abi)));
+        if (abi != 1) return 2;
+        for (unsigned half = 0; half < 2; half++) {
+            DK(cuFuncSetAttribute(node_function[half], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 103424));
+            int occupancy = 0;
+            DK(cuOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, node_function[half], 256, 103424));
+            printf("NODE_OCCUPANCY half=%u blocks_per_sm=%d threads=256 dynamic_shared=103424 abi=1\n", half, occupancy);
+        }
+        CK(cudaMalloc(&node_instruction, sizeof(PlowDevInst)));
+        CK(cudaMalloc(&node_table, 5 * sizeof(uint64_t)));
+    }
+    if (reject_case) {
+        if (!node_path) return 2;
+        PlowDevInst instruction{};
+        instruction.op = PLOW_DOP_GEMV_F32_OUT;
+        instruction.i[0] = 16; instruction.i[1] = 128; instruction.i[2] = 64;
+        instruction.i[7] = 3 | 1024 | 8192;
+        for (unsigned t = 0; t < 5; t++) instruction.t[t] = t;
+        unsigned count = 5;
+        if (!strcmp(reject_case, "rounded_rows")) instruction.i[0] = 0xffffffffu;
+        else if (!strcmp(reject_case, "tile_count")) { instruction.i[0] = 1u<<30; instruction.i[1] = 131072; }
+        else if (!strcmp(reject_case, "bias_index")) { instruction.i[0] = 1u<<26; instruction.i[3] = 1; instruction.i[7] |= 4|512; }
+        else if (!strcmp(reject_case, "table_count")) count = 65536;
+        else if (!strcmp(reject_case, "absent_handle")) instruction.t[0] = 0xffffu;
+        else if (!strcmp(reject_case, "unsupported_flag")) instruction.i[7] |= 32;
+        else return 2;
+        // Deliberately unmapped disjoint spans: a missing metadata reject faults with 700,
+        // distinguishable from the trap we require, or skips a wrapped zero-tile workload.
+        uint64_t table[] = {0x1000000000000000ull,0x3000000000000000ull,
+            0x5000000000000000ull,0x7000000000000000ull,0};
+        CK(cudaMemcpy(node_instruction,&instruction,sizeof(instruction),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(node_table,table,sizeof(table),cudaMemcpyHostToDevice));
+        void* params[] = {&node_instruction,&node_table,&count};
+        DK(cuLaunchKernel(node_function[0],2,1,1,256,1,1,103424,nullptr,params,nullptr));
+        const CUresult result = cuCtxSynchronize();
+        if (result != CUDA_ERROR_ILLEGAL_INSTRUCTION && result != CUDA_ERROR_LAUNCH_FAILED) {
+            fprintf(stderr,"FAIL expected metadata trap for %s, got %d\n",reject_case,(int)result); return 1;
+        }
+        printf("REJECT_PASS case=%s cuda_code=%d\n",reject_case,(int)result);
+        return 0;
+    }
+#if defined(PLOW_NV_GEMM_WIDE_PROBE) && PLOW_NV_GEMM_WIDE_PROBE
+    if (wide && !node_path) {
+        CK(cudaFuncSetAttribute(project_wide<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024));
+        CK(cudaFuncSetAttribute(project_wide<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024));
+        CK(cudaFuncSetAttribute(project_wide<64, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024));
+    }
+#else
+    if (wide && !node_path) return 2;
+#endif
+    if (!node_path) CK(cudaFuncSetAttribute(project, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024));
     unsigned rng = 1701;
     auto next = [&] { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
                      return (float)((int)(rng % 2001) - 1000) / 997.f; };
@@ -36,7 +127,7 @@ int main(int argc, char** argv) {
     double small_rel = 0;
     for (unsigned k : {192u, 256u, 448u, 1024u, 3072u, 4096u}) {
         if (sanitize && k != 192u && k != 1024u && k != 3072u) continue;
-        const unsigned n = (k == 192 || k == 1024 || k == 3072) ? 3072 : k == 448 ? 192 : 128, max_m = 257;
+        const unsigned n = wide ? 128 : (k == 192 || k == 1024 || k == 3072) ? 3072 : k == 448 ? 192 : 128, max_m = 257;
         std::vector<float> x(max_m * k), bias(max_m * n), residual(max_m * n), gamma(k), beta(k);
         std::vector<__half> w(n * k);
         for (auto& v : x) v = next();
@@ -57,7 +148,7 @@ int main(int argc, char** argv) {
         CK(cudaMemcpy(dr, residual.data(), residual.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dg, gamma.data(), k * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dt, beta.data(), k * 4, cudaMemcpyHostToDevice));
-        if (k >= 1024u) {
+        if (!wide && k >= 1024u) {
             float* ln; unsigned short* lnh;
             CK(cudaMalloc(&ln, max_m * k * 4)); CK(cudaMalloc(&lnh, (max_m * k + 32) * 2));
             CK(cudaMemset(lnh, 0x7f, (max_m * k + 32) * 2));
@@ -73,12 +164,17 @@ int main(int argc, char** argv) {
             }
             CK(cudaFree(ln)); CK(cudaFree(lnh));
         }
-        for (unsigned mode = 0; mode < 12; mode++) {
-            if (sanitize && mode != 4u && mode != 6u && mode != 8u && mode != 10u) continue;
-            const bool ln = mode & 1, gelu = mode & 2;
-            const bool half_out = mode & 8, half = mode & 12;
+        for (unsigned mode = 0; mode < (node_path ? 20u : 12u); mode++) {
+            const bool optional = mode >= 12;
+            if (optional && (mode & 3u) == 3u) continue;
+            if (sanitize && !optional && mode != 4u && mode != 6u && mode != 8u && mode != 10u) continue;
+            const unsigned base_mode = optional ? (mode >= 16 ? 8 : 4) : mode;
+            const bool use_bias = !optional || (mode & 1u), use_res = !optional || (mode & 2u);
+            const bool ln = base_mode & 1, gelu = base_mode & 2;
+            const bool half_out = base_mode & 8, half = base_mode & 12;
+            if (wide && !half) continue;
             const unsigned group = gelu ? 5 : 0;
-            const unsigned flags = 3 | 1024 | 4 | 8 | (ln && !half ? 256 : 0) | (gelu ? 16 | 512 : 0)
+            const unsigned flags = 3 | 1024 | (use_bias ? 4 : 0) | (use_res ? 8 : 0) | (ln && !half ? 256 : 0) | (gelu ? 16 | 512 : 0)
                                    | (half ? 8192 : 0) | (half_out ? 16384 : 0);
             std::vector<double> ref(max_m * n);
             std::vector<__half> xhalf(max_m * k);
@@ -98,67 +194,99 @@ int main(int argc, char** argv) {
                 for (unsigned col = 0; col < n; col++) {
                     double v = 0;
                     for (unsigned j = 0; j < k; j++) v += input[j] * (double)__half2float(w[col * k + j]);
-                    v = (float)((float)v + bias[(group ? row / group * n : 0) + col]);
-                    v = (float)(v + residual[row * n + col]);
+                    v = (float)v;
+                    if (use_bias) v = (float)(v + bias[(group ? row / group * n : 0) + col]);
+                    if (use_res) v = (float)(v + residual[row * n + col]);
                     if (gelu) v = .5 * v * (1 + erf(v * .70710678118654752));
                     if (half_out) v = __half2float(__float2half_rn((float)v));
                     ref[row * n + col] = v;
                 }
             }
             CK(cudaMemcpy(dxh, xhalf.data(), xhalf.size() * 2, cudaMemcpyHostToDevice));
-            std::vector<float> widest;
-            for (unsigned m : {257u, 256u, 225u, 224u, 201u, 200u, 129u, 128u, 65u, 64u, 33u, 32u, 31u, 20u, 17u, 16u, 8u, 1u}) {
-                if (sanitize && m != 257u && m != 224u && m != 200u && m != 33u && m != 16u) continue;
-                if (half && m < 16u) continue;
-                for (bool alias : {false, true}) {
-                    if (half_out && alias) continue;
-                    CK(cudaMemset(dc, 0x7f, (max_m * n + 32) * 4));
-                    if (alias) CK(cudaMemcpy(dc, dr, m * n * 4, cudaMemcpyDeviceToDevice));
-                    project<<<132, 256, 100 * 1024>>>(dc, half ? (const float*)dxh : dx, dw, db, alias ? dc : dr, dg, dt,
-                                                    flags, group, m, n, k);
-                    CK(cudaDeviceSynchronize());
-                    std::vector<float> got(m * n + 32);
-                    bool tail_bad = false;
-                    if (half_out) {
-                        std::vector<unsigned short> raw(got.size());
-                        CK(cudaMemcpy(raw.data(), dc, raw.size() * 2, cudaMemcpyDeviceToHost));
-                        for (unsigned j = 0; j < m * n; j++) got[j] = __half2float(__ushort_as_half(raw[j]));
-                        for (unsigned j = m * n; j < raw.size(); j++) tail_bad |= raw[j] != 0x7f7f;
-                    } else CK(cudaMemcpy(got.data(), dc, got.size() * 4, cudaMemcpyDeviceToHost));
-                    double error = 0, norm = 0;
-                    for (unsigned j = 0; j < m * n; j++) {
-                        error += (got[j] - ref[j]) * (got[j] - ref[j]); norm += ref[j] * ref[j];
-                    }
-                    const double rel = sqrt(error / norm);
-                    bool bad = tail_bad || !std::isfinite(rel) || rel > 2e-4;
-                    for (unsigned j = m * n; !half_out && j < got.size(); j++) {
-                        unsigned bits; memcpy(&bits, &got[j], 4); bad |= bits != 0x7f7f7f7fu;
-                    }
-                    if (m == max_m && !alias) widest = got;
-                    if (m >= 16) {
-                        bad |= memcmp(got.data(), widest.data(), m * n * 4) != 0;
-                    } else {
-                        /* Under 16 rows the split-K MMA arm runs: another accumulation order, so the
-                         * same row differs from its wider-capacity bits by rounding. Bounded, not equal. */
-                        double d = 0, w2 = 0;
+            for (unsigned variant = 1; variant <= (wide ? 3u : 1u); variant++) {
+                if (node_path && variant != 2) continue;
+                if (variant == 3 && k % 128u) continue;
+                std::vector<float> widest;
+                for (unsigned m : {257u, 256u, 225u, 224u, 201u, 200u, 129u, 128u, 65u, 64u, 33u, 32u, 31u, 20u, 17u, 16u, 8u, 1u}) {
+                    if (sanitize && m != 257u && m != 224u && m != 200u && m != 33u && m != 16u) continue;
+                    if (half && m < 16u) continue;
+                    for (bool alias : {false, true}) {
+                        if (alias && (half_out || !use_res)) continue;
+                        CK(cudaMemset(dc, 0x7f, (max_m * n + 32) * 4));
+                        if (alias) CK(cudaMemcpy(dc, dr, m * n * 4, cudaMemcpyDeviceToDevice));
+                        if (node_path) {
+                            PlowDevInst instruction{};
+                            instruction.op = PLOW_DOP_GEMV_F32_OUT;
+                            instruction.i[0] = m; instruction.i[1] = n; instruction.i[2] = k;
+                            instruction.i[3] = group; instruction.i[7] = flags;
+                            for (unsigned t = 0; t < 5; t++) instruction.t[t] = t;
+                            if (!use_bias) instruction.t[3] = 0xffffu;
+                            if (!use_res) instruction.t[4] = 0xffffu;
+                            uint64_t table[] = {(uint64_t)dc, (uint64_t)dxh, (uint64_t)dw,
+                                                use_bias ? (uint64_t)db : 0, use_res ? (uint64_t)(alias ? dc : dr) : 0};
+                            CK(cudaMemcpy(node_instruction, &instruction, sizeof(instruction), cudaMemcpyHostToDevice));
+                            CK(cudaMemcpy(node_table, table, sizeof(table), cudaMemcpyHostToDevice));
+                            unsigned count = 5;
+                            void* params[] = {&node_instruction, &node_table, &count};
+                            DK(cuLaunchKernel(node_function[half_out], 2, 1, 1, 256, 1, 1, 103424, nullptr, params, nullptr));
+                        } else
+#if defined(PLOW_NV_GEMM_WIDE_PROBE) && PLOW_NV_GEMM_WIDE_PROBE
+                        if (wide) {
+                            if (variant == 1)
+                                project_wide<64><<<2, 256, 100 * 1024>>>(dc, dxh, dw, db, alias ? dc : dr, flags, group, m, n, k);
+                            else if (variant == 2)
+                                project_wide<128><<<2, 256, 100 * 1024>>>(dc, dxh, dw, db, alias ? dc : dr, flags, group, m, n, k);
+                            else
+                                project_wide<64, 128><<<2, 256, 100 * 1024>>>(dc, dxh, dw, db, alias ? dc : dr, flags, group, m, n, k);
+                        } else
+#endif
+                        project<<<132, 256, 100 * 1024>>>(dc, half ? (const float*)dxh : dx, dw, db, alias ? dc : dr, dg, dt,
+                                                        flags, group, m, n, k);
+                        CK(cudaDeviceSynchronize());
+                        std::vector<float> got(m * n + 32);
+                        bool tail_bad = false;
+                        if (half_out) {
+                            std::vector<unsigned short> raw(got.size());
+                            CK(cudaMemcpy(raw.data(), dc, raw.size() * 2, cudaMemcpyDeviceToHost));
+                            for (unsigned j = 0; j < m * n; j++) got[j] = __half2float(__ushort_as_half(raw[j]));
+                            for (unsigned j = m * n; j < raw.size(); j++) tail_bad |= raw[j] != 0x7f7f;
+                        } else CK(cudaMemcpy(got.data(), dc, got.size() * 4, cudaMemcpyDeviceToHost));
+                        double error = 0, norm = 0;
                         for (unsigned j = 0; j < m * n; j++) {
-                            d += ((double)got[j] - widest[j]) * ((double)got[j] - widest[j]);
-                            w2 += (double)widest[j] * widest[j];
+                            error += (got[j] - ref[j]) * (got[j] - ref[j]); norm += ref[j] * ref[j];
                         }
-                        const double across = sqrt(d / w2);
-                        small++;
-                        small_differs += memcmp(got.data(), widest.data(), m * n * 4) != 0;
-                        small_rel = fmax(small_rel, across);
-                        bad |= !std::isfinite(across) || across > 4e-4;
+                        const double rel = sqrt(error / norm);
+                        bool bad = tail_bad || !std::isfinite(rel) || rel > 2e-4;
+                        for (unsigned j = m * n; !half_out && j < got.size(); j++) {
+                            unsigned bits; memcpy(&bits, &got[j], 4); bad |= bits != 0x7f7f7f7fu;
+                        }
+                        if (m == max_m && !alias) widest = got;
+                        if (m >= 16) {
+                            bad |= memcmp(got.data(), widest.data(), m * n * 4) != 0;
+                        } else {
+                            /* Under 16 rows the split-K MMA arm runs: another accumulation order, so the
+                             * same row differs from its wider-capacity bits by rounding. Bounded, not equal. */
+                            double d = 0, w2 = 0;
+                            for (unsigned j = 0; j < m * n; j++) {
+                                d += ((double)got[j] - widest[j]) * ((double)got[j] - widest[j]);
+                                w2 += (double)widest[j] * widest[j];
+                            }
+                            const double across = sqrt(d / w2);
+                            small++;
+                            small_differs += memcmp(got.data(), widest.data(), m * n * 4) != 0;
+                            small_rel = fmax(small_rel, across);
+                            bad |= !std::isfinite(across) || across > 4e-4;
+                        }
+                        if (bad) { fprintf(stderr, "FAIL K=%u M=%u mode=%u alias=%u relL2=%g\n", k, m, mode, alias, rel); return 1; }
+                        cases++;
                     }
-                    if (bad) { fprintf(stderr, "FAIL K=%u M=%u mode=%u alias=%u relL2=%g\n", k, m, mode, alias, rel); return 1; }
-                    cases++;
                 }
             }
         }
         CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(db)); CK(cudaFree(dr));
         CK(cudaFree(dg)); CK(cudaFree(dt)); CK(cudaFree(dc)); CK(cudaFree(dxh));
     }
+    if (node_path) { CK(cudaFree(node_instruction)); CK(cudaFree(node_table)); DK(cuModuleUnload(node_module)); }
     printf("PASS %u projection cases: oracle, row tails, grouped bias, residual alias, GELU, capacity invariance from 16 rows\n", cases);
     printf("below 16 rows vs the same rows at 257: %u of %u cases differ in bits, max relL2 %.3g (bound 4e-4)\n",
            small_differs, small, small_rel);
