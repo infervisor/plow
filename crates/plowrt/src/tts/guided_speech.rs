@@ -876,6 +876,12 @@ fn render_loop(
 }
 
 impl GuidedSpeech {
+    #[cfg(test)]
+    pub(super) fn set_test_tags(&mut self, map: Arc<plow_asset::speech_tags::SpeechTags>) {
+        self.c.tags = Some(map.clone());
+        self.spec.tags = Some(map);
+    }
+
     /// Bind the packet's prompt tables and start the render thread. `credit` is the serving
     /// model's downstream credit: the vocoder's backlog gates the model's admission, and a render
     /// holding a first chunk holds its ticks.
