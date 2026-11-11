@@ -2063,9 +2063,13 @@ def cmd_gate(a: argparse.Namespace) -> None:
     with open(a.recipe, "rb") as f:
         r = tomllib.load(f)
     gates = dict(r.get("gates", {}))
-    policy = recipe_common.speech_tag_policy(r)
+    policy = recipe_common.speech_tag_policy(r, Path(a.recipe))
+    notice = recipe_common.legacy_speech_tag_notice(r, Path(a.recipe))
+    if notice:
+        print(notice, file=sys.stderr)
+        gates = {k: v for k, v in gates.items() if gate_kind(k) != "tts_tags"}
     if policy is not None:
-        recipe_common.check_packet_speech_tags(Path(a.assets) / gates.get("packet", "model.pkt"), r)
+        recipe_common.check_packet_speech_tags(Path(a.assets) / gates.get("packet", "model.pkt"), r, Path(a.recipe))
         tag_keys = [k for k in gates if gate_kind(k) == "tts_tags"] or ["tts_tags"]
         for key in tag_keys:
             if "waiver" in policy:
@@ -2099,7 +2103,7 @@ def cmd_gate(a: argparse.Namespace) -> None:
             return {kk: xv(i) for kk, i in vv.items()}
         return x(vv) if isinstance(vv, str) else vv
     cfg = {k: {kk: xv(vv) for kk, vv in gates[k].items()} for k in kinds}
-    for key in [k for k in cfg if gate_kind(k) == "tts_tags" and "waiver" not in policy]:
+    for key in [k for k in cfg if gate_kind(k) == "tts_tags" and policy is not None and "waiver" not in policy]:
         sys.path.insert(0, str(REPO / "scripts/tts"))
         import tag_gate
         config = dict(policy=policy, settings={k: v for k, v in cfg[key].items() if k not in ("python", "env", "whisper", "timeout_s")}, mode="native-sweep" if getattr(a, "tag_sweep", False) else "gate",
@@ -2262,6 +2266,10 @@ def cmd_dist_gate(a: argparse.Namespace) -> None:
     recipe = Path(a.recipe).resolve()
     with open(recipe, "rb") as f:
         r = tomllib.load(f)
+    recipe_common.speech_tag_policy(r, recipe)
+    notice = recipe_common.legacy_speech_tag_notice(r, recipe)
+    if notice and not a.gate:
+        print(notice, file=sys.stderr)
     assets = Path(a.assets).resolve()
     objects = Path(a.objects).resolve() if a.objects else (
         assets.parent / "objects" if (assets.parent / "objects").is_dir() else assets)

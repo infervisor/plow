@@ -216,6 +216,7 @@ if [ -n "$ASSETS" ] && [ -f "$ASSETS/model.pkt" ]; then
     while IFS=$'\t' read -r lvl msg; do
         case "$lvl" in
             ok) pb_ok "$msg" ;;
+            NOTICE) printf '  NOTICE %s\n' "$msg" ;;
             WARN) pb_warn "$msg" ;;
             FAIL) pb_bad "$msg" ;;
             *) pb_bad "speech tag check: $lvl $msg" ;;

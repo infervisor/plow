@@ -286,9 +286,15 @@ are checked. Otherwise drop the native action.
 A waiver replaces the map: `[speech_tags] version = 1`, `waiver = "measured reason"`,
 `evidence = ["measurement reference and digest", ...]`. Record packet/tokenizer identities,
 cases/languages/seeds, observed failures and why the exception is accepted. Empty/unmeasured
-reasons fail; doctor warns and campaign reports **WAIVED**. The dated, content-pinned 2026-11-11
-checker allowlist only lists missing policies on existing recipes; it waives neither doctor,
-campaign gates nor packing. New/edited speech recipes require a declaration.
+reasons fail; doctor warns and campaign reports **WAIVED**. The dated legacy inventory in
+`crates/plow-asset/src/speech_tag_legacy.json` lives beside the shared recipe policy schema;
+Python tools read it and Rust embeds the same data. Canonical entries identify
+`infervisor/<model>/<label>.toml` (independent of the source directory name); two existing
+experimental recipe paths are also listed. Re-pins and threshold edits retain legacy status. Existing campaign build snapshots use their
+`build-record.json` recipe identity. Without `[speech_tags]`, listed recipes retain their
+ordinary gates and packing behavior with one explicit legacy notice; doctor reports NOTICE.
+The tag gate is skipped. Declaring `[speech_tags]` ends that exception and applies full checks.
+Unlisted speech recipes require a declaration, including new models.
 
 ### Per-rung gate and recipe selection
 
