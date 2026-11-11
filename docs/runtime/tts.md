@@ -1085,3 +1085,9 @@ segments; mappings marked `carry` are repeated on later segments.
 Responses report canonical names in `x-plow-tags-applied` and `x-plow-tags-dropped`
 (up to 32 distinct names each). WebSocket speech sends one `{"type":"tags","applied":...,"dropped":...}`
 text message before its binary audio when tags were applied or dropped.
+
+For existing packets without tag metadata, `PLOW_TTS_TAGS_DEFAULT=strip`
+(`--tts-tags-default strip`) enables the shared strip-and-silence policy at load.
+It is unset by default, applies to speech drivers only, and never overrides a packet map.
+Per-request `tags: "off"` still selects the original path. New Maya2 profiles emit this
+map directly; they need no fallback setting. Native Maya2 events and styles remain dropped.
