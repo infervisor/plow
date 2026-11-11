@@ -74,7 +74,64 @@ pub struct Entry {
     #[serde(default)]
     pub budget_chars: Option<usize>,
     #[serde(default)]
-    pub langs: Vec<String>,
+    pub langs: Langs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Langs {
+    Only(Vec<String>),
+    Text(BTreeMap<String, String>),
+}
+
+impl Default for Langs {
+    fn default() -> Self {
+        Self::Only(Vec::new())
+    }
+}
+
+impl Langs {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Only(v) => v.is_empty(),
+            Self::Text(v) => v.is_empty(),
+        }
+    }
+
+    pub fn allows(&self, language: Option<&str>) -> bool {
+        match self {
+            Self::Only(v) => v.is_empty() || language.is_some_and(|l| v.iter().any(|v| v == l)),
+            Self::Text(v) => language.is_none_or(|l| v.contains_key(l)),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        let language = |l: &str| {
+            !l.is_empty() && l.len() <= 16 && l.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        };
+        match self {
+            Self::Only(v) => v.len() <= 32 && v.iter().all(|l| language(l)),
+            Self::Text(v) => !v.is_empty() && v.len() <= 32 && v.keys().all(|l| language(l)),
+        }
+    }
+
+    fn texts(&self) -> impl Iterator<Item = &str> {
+        let values = match self {
+            Self::Only(_) => None,
+            Self::Text(v) => Some(v.values()),
+        };
+        values.into_iter().flatten().map(String::as_str)
+    }
+}
+
+impl Entry {
+    pub fn native_text(&self, language: Option<&str>) -> Option<&str> {
+        let text = self.text.as_deref()?;
+        match (&self.langs, language) {
+            (Langs::Text(v), Some(l)) => v.get(l).map(String::as_str),
+            _ => self.langs.allows(language).then_some(text),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -184,13 +241,7 @@ impl SpeechTags {
             {
                 return Err(format!("text.tags: invalid name {name:?}"));
             }
-            if e.langs.len() > 32
-                || e.langs.iter().any(|l| {
-                    l.is_empty()
-                        || l.len() > 16
-                        || !l.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
-                })
-            {
+            if !e.langs.valid() || matches!(&e.langs, Langs::Text(_)) && e.text.is_none() {
                 return Err(format!("text.tags: invalid languages for {name}"));
             }
             if e.speed.is_some() && name != "rate" {
@@ -219,15 +270,20 @@ impl SpeechTags {
                 return Err(format!("text.tags: invalid modifiers for {name}"));
             }
             if let Some(t) = &e.text {
-                if t.is_empty()
-                    || t.chars().count() > e.budget_chars.unwrap_or(64).min(64)
-                    || t.contains("<|")
-                {
+                if std::iter::once(t.as_str()).chain(e.langs.texts()).any(|t| {
+                    t.is_empty()
+                        || t.chars().count() > e.budget_chars.unwrap_or(64).min(64)
+                        || t.contains("<|")
+                }) {
                     return Err(format!("text.tags: invalid native text for {name}"));
                 }
             }
             if let Some(i) = &e.instruction {
-                if i.is_empty() || i.len() > 1024 || i.contains("<|") {
+                if i.is_empty()
+                    || i.len() > 1024
+                    || i.contains("<|")
+                    || i.contains("{value}") && name != "rate"
+                {
                     return Err(format!("text.tags: invalid instruction for {name}"));
                 }
             }
@@ -268,7 +324,11 @@ impl SpeechTags {
             if e.instruction.is_some() && !instructions {
                 return Err(format!("text.tags: {name} requires instructions"));
             }
-            if e.single_token && !single_token(e.text.as_deref().unwrap()) {
+            if e.single_token
+                && std::iter::once(e.text.as_deref().unwrap())
+                    .chain(e.langs.texts())
+                    .any(|t| !single_token(t))
+            {
                 return Err(format!(
                     "text.tags: {name} is not a single vocabulary token"
                 ));
@@ -308,6 +368,39 @@ mod tests {
             SpeechTags::parse(&serde_json::to_string(&map).unwrap()).unwrap(),
             map
         );
+    }
+
+    #[test]
+    fn language_forms_share_native_validation_and_binding() {
+        let mut m = map();
+        m.tags.insert(
+            "laugh".into(),
+            serde_json::from_str(
+                r#"{"text":"A","langs":{"en":"A","zh":"笑"},"single_token":true,"budget_chars":3}"#,
+            )
+            .unwrap(),
+        );
+        m.validate_binding(false, |t| t.chars().count() == 1)
+            .unwrap();
+        assert_eq!(m.tags["laugh"].native_text(Some("zh")), Some("笑"));
+        assert_eq!(m.tags["laugh"].native_text(Some("hi")), None);
+        assert_eq!(m.tags["laugh"].native_text(None), Some("A"));
+        for entry in [
+            r#"{"text":"A","langs":{"zh":"AB"},"single_token":true}"#,
+            r#"{"text":"A","langs":{"zh":"<|event|>"}}"#,
+            r#"{"text":"A","langs":{"zh":""}}"#,
+            r#"{"text":"A","langs":{}}"#,
+            r#"{"drop":true,"langs":{"zh":"笑"}}"#,
+            r#"{"instruction":"Speak {value}."}"#,
+        ] {
+            m.tags
+                .insert("laugh".into(), serde_json::from_str(entry).unwrap());
+            assert!(
+                m.validate_binding(true, |t| t.chars().count() == 1)
+                    .is_err(),
+                "{entry}"
+            );
+        }
     }
 
     #[test]

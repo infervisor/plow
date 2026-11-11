@@ -3371,6 +3371,80 @@ async fn stream_task(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "GPU: existing-packet tag-map gate server, run through gpuq"]
+    async fn packet_tag_map_server() {
+        use crate::{device::cuda::CudaBackend, exec::ExecutorSet, orch::Registry};
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let assets = std::path::PathBuf::from(std::env::var_os("TTS_TAG_GATE_ASSETS").unwrap());
+        let path = std::env::var_os("TTS_TAG_GATE_MAPS").unwrap();
+        let profile = std::env::var("TTS_TAG_GATE_PROFILE").unwrap();
+        let maps: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let fixture = &maps[&profile];
+        let pipe: plow_asset::packet_pipeline::PacketPipeline =
+            serde_json::from_value(fixture["pipeline"].clone()).unwrap();
+        let map = super::super::tags::load(&pipe).unwrap().unwrap();
+        let port: u16 = std::env::var("TTS_TAG_GATE_PORT").unwrap().parse().unwrap();
+        let registry = Registry::new();
+        let slug = registry.load(&assets, None).unwrap();
+        let backend = Arc::new(CudaBackend::new(0).unwrap());
+        let executors = Arc::new(ExecutorSet::bringup(backend.clone()).unwrap());
+        let state = Arc::new(AppState::new(registry, executors));
+        let manager = Arc::new(
+            crate::serve::manager::ModelManager::new(
+                backend,
+                &state,
+                crate::serve::mux::MuxConfig {
+                    max_hold_ms: 0.0,
+                    ..Default::default()
+                },
+                vec![(
+                    slug.clone(),
+                    assets.clone(),
+                    crate::asset::serve::checkpoint_dir(&assets),
+                )],
+                None,
+            )
+            .unwrap(),
+        );
+        state.set_slug_group(&slug, 0);
+        state.install_turns_per_group(&[(None, true)]);
+        state.install_managers(vec![manager.clone()]);
+        manager.load_initial().await.unwrap();
+        super::bind(&state, &slug).unwrap();
+        let tok = state.registry.get(&slug).unwrap().tokenizer().clone();
+        {
+            let mut models = super::speech_models().lock();
+            let model =
+                Arc::get_mut(models.get_mut(&(assets, 0)).unwrap().as_mut().unwrap()).unwrap();
+            map.validate_binding(
+                model.contract.instructions.is_some()
+                    || model
+                        .contract
+                        .dual_stream
+                        .as_ref()
+                        .is_some_and(|d| d.instructions_template.is_some()),
+                |text| tok.encode_with_special_tokens(text, false).len() == 1,
+            )
+            .unwrap();
+            model.contract.tags = Some(map);
+            let languages: Vec<String> =
+                serde_json::from_value(fixture["languages"].clone()).unwrap();
+            if !languages.is_empty() {
+                model.contract.languages = languages;
+            }
+            model.spec = OnceLock::new();
+        }
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        axum::serve(listener, crate::serve::app(state))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn speech_tag_modes_and_headers_are_explicit() {
         use super::super::tags::{Mode, Report};

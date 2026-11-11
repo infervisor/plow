@@ -964,6 +964,7 @@ dependencies = [
  "rewrite",
  "serde",
  "serde_json",
+ "tokenizers 0.23.2",
  "tracing",
  "tunedb",
 ]

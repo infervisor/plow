@@ -181,6 +181,8 @@ def tts_cases(a, model):
                 raise ValueError(f"TTS manifest row {i} non_streaming_mode must be boolean")
             if "reference" in case and (not isinstance(case["reference"], str) or not case["reference"].strip()):
                 raise ValueError(f"TTS manifest row {i} has an empty ASR reference")
+            if "reference_language" in case and (not isinstance(case["reference_language"], str) or not case["reference_language"].strip()):
+                raise ValueError(f"TTS manifest row {i} has an invalid ASR reference language")
             if case.get("tags", "auto") not in ("auto", "strict", "off"):
                 raise ValueError(f"TTS manifest row {i} has an invalid tags policy")
             status = case.get("expected_status", 200)
@@ -201,7 +203,7 @@ def tts_cases(a, model):
                       lang=c.get("language"),
                       seed=c.get("seed", 1 + i),
                       **{k: c[k] for k in ("ref_audio_path", "ref_audio_sha256", "ref_audio", "ref_text", "non_streaming_mode",
-                          "reference", "tags", "speed", "sample_rate", "instructions", "expected_status",
+                          "reference", "reference_language", "tags", "speed", "sample_rate", "instructions", "expected_status",
                           "forbid", "pauses", "duration_delta", "baseline") if k in c})
                  for i, c in enumerate(cases)]
     else:
@@ -266,9 +268,10 @@ def capture_tts(a, model, outdir):
             continue
         extra = {k: row[k] for k in ("forbid", "pauses", "duration_delta", "baseline") if k in row}
         reference = row.get("reference", row["text"])
-        texts[row["wav"]] = (dict(text=reference, language=row["lang"], case_id=row["case_id"], **extra)
+        language = row.get("reference_language", row["lang"])
+        texts[row["wav"]] = (dict(text=reference, language=language, case_id=row["case_id"], **extra)
                              if extra or "reference" in row else
-                             dict(text=reference, language=row["lang"]) if row["lang"] else reference)
+                             dict(text=reference, language=language) if language else reference)
     with open(os.path.join(wavdir, "texts.json"), "w") as f:
         json.dump(texts, f, ensure_ascii=False, indent=1)
     return wavdir, rows
@@ -297,16 +300,17 @@ def eval_tts(a, models, outdir):
                 x = pcm.astype(np.float32) / 32768.0
                 n16 = int(len(x) * 16000 / row["sample_rate"])
                 x16 = np.interp(np.linspace(0, len(x) - 1, n16), np.arange(len(x)), x).astype(np.float32)
-                kw = dict(generate_kwargs=dict(language=row["lang"], task="transcribe")) if row["lang"] else {}
+                language = row.get("reference_language", row["lang"])
+                kw = dict(generate_kwargs=dict(language=language, task="transcribe")) if language else {}
                 if len(x16) > 30 * 16000:
                     kw["return_timestamps"] = True
                 hyp = asr({"raw": x16, "sampling_rate": 16000}, **kw)["text"]
-                cer = jiwer.cer(norm_lang(row.get("reference", row["text"]), row["lang"]), norm_lang(hyp, row["lang"]))
+                cer = jiwer.cer(norm_lang(row.get("reference", row["text"]), language), norm_lang(hyp, language))
                 row.update(cer=round(cer, 4), hyp=hyp.strip())
         ok = [r for r in rows if "cer" in r]
         by_lang = {}
         for r in ok:
-            by_lang.setdefault(r["lang"] or "default", []).append(r["cer"])
+            by_lang.setdefault(r.get("reference_language", r["lang"]) or "default", []).append(r["cer"])
         res = dict(n=len(rows), errors=sum("error" in r for r in rows),
                    capture_only=a.tts_capture_only, concurrency=a.tts_concurrency, stream=a.tts_stream,
                    cer_median=round(statistics.median(r["cer"] for r in ok), 4) if ok else None,

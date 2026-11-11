@@ -1078,8 +1078,20 @@ The SSML subset consumes `speak`, `break` (`time` or `strength`), `prosody` (`ra
 Bare event elements such as `<laugh>` are accepted. Comments are removed; other element
 markup is removed while its inner text is kept. `a < b` remains literal text.
 A consumed style or prosody control can still be dropped when the packet does not support it.
+Removed controls consume boundary formatting gaps: `[laughs] [laughs] Hello` becomes `Hello`
+when laughter is dropped. Other whitespace and literal forms are preserved.
 Instruction mappings append to client instructions once per request. Allowed rate mappings
 multiply the request's speed within its normal limits.
+An instruction-mapped rate supplies the validated rate label to the model instead.
+Native entries can restrict languages with `langs: ["en"]`, or select text with
+`langs: {"en":"(sigh)","zh":"[叹气]"}` beside their default `text`.
+Every alternative follows the same length and single-token constraints.
+
+Profile maps provide native events for Orpheus and Fish, English/Chinese events and style
+instructions for Breeze, and style/rate instructions for Qwen CustomVoice. Qwen Base and
+Veena strip unsupported controls. Every profile uses runtime silence for pauses and strips
+special-token markers. Fish passes unknown tag-shaped names through as its native bracket form.
+Breeze drops Chinese laughter and calm/friendly controls; their English mappings remain enabled.
 
 Pauses are runtime silence at segment boundaries, including leading or trailing pauses.
 The default is 400 ms; durations above 3000 ms are clamped. Native tags remain atomic across
@@ -1100,6 +1112,8 @@ reference, while `text` is the request. Supply the clone rows' reference WAVs fr
 baseline captures. Explicit `voice: null` omits the field; `expected_status: 400` records an
 expected failure without producing an ASR row. Literal syntax remains literal; its expected
 spoken reference must account for the words it preserves.
+`reference_language` selects the ASR judge's language independently of the request's `language`;
+it is capture metadata and is never sent to the speech server.
 Gate accepted syntax with forbid lists and clean-reference CER. Check literal forms against
 `tags: "off"` rendered bytes on CPU, with ASR as a speaking sanity check. Check special-token
 markers for forbidden markup words too; their inner words remain ordinary text.
