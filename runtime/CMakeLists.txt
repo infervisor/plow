@@ -555,6 +555,7 @@ option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented
 option(PLOW_CUBIN_ROUTED_DECODE "Also emit the _routed decode cubin for cuBLASLt-routed MoE rungs" OFF)
 option(PLOW_CUBIN_SPEECH "Also emit the _speech decode cubin carrying the FP32 speech arms (ASR encoder)" OFF)
 option(PLOW_CUBIN_DEVICE_CONTROL "Include optional device sampling and chained codec entrypoints in speech objects" OFF)
+option(PLOW_CUBIN_GEMM_F16_NODE "Build the optional typed native FP16 GEMM node" OFF)
 option(PLOW_CUBIN_FP8_TC64_DEPTH2 "Emit a separate depth-2 FP8 TC64 decode cubin" OFF)
 option(PLOW_CUBIN_GEMV_WIDE "Also emit the _gw decode cubin carrying the wide-rung wgmma GEMV (sm_90a)" OFF)
 # Speculative-decode verify/draft launches need the row -> KV slot map (-DPLOW_NV_ROW_SLOT=1); it
@@ -839,6 +840,19 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
             COMMENT "nvcc interp_sm90a_pfgemm_w8a16_m1.cubin"
             VERBATIM)
         list(APPEND _cubin_outs "${_w8a16_m1_out}")
+    endif()
+
+    if(PLOW_SM90A_CUBIN AND PLOW_CUBIN_GEMM_F16_NODE)
+        set(_f16_node_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/gemm_f16_sm90.cu")
+        set(_f16_node_out "${PLOW_CUBIN_DIR}/gemm_f16_sm90.cubin")
+        add_custom_command(OUTPUT "${_f16_node_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_f16_node_out}"
+                    gemm_f16_sm90_f32_node required
+                    -arch=sm_90a -O3 -std=c++17 -cubin ${_cubin_inc} "${_f16_node_src}"
+            DEPENDS "${_f16_node_src}" "${_cubin_run}" ${_cubin_headers}
+            COMMENT "nvcc gemm_f16_sm90.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_f16_node_out}")
     endif()
 
     # The device stochastic sampler is NOT the megakernel and shares none of its

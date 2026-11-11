@@ -1574,3 +1574,285 @@ impl PacketRuntime for CudaPacketRuntime {
         self.last_us
     }
 }
+
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; single real layer native GEMM screen, run only through gpuq"]
+fn native_gemm_layer_matches_packet() {
+    use packet::dev::DevInst64;
+    enum Step {
+        Packet {
+            argument: DevProgram,
+            counters: usize,
+            _tables: Vec<DeviceMem>,
+        },
+        Gemm {
+            instruction: DeviceMem,
+            function: KernelFn,
+        },
+    }
+    let dir = std::path::PathBuf::from(std::env::var("DEPTH_GEMM_TEST_ASSETS").unwrap());
+    let image = std::fs::read(std::env::var("DEPTH_GEMM_NODE_CUBIN").unwrap()).unwrap();
+    let batches = std::env::var("DEPTH_GEMM_BATCHES").unwrap_or("32,64,128,200,224".into());
+    let selections = std::env::var("DEPTH_GEMM_SELECTIONS").unwrap_or("25:0,31:0,25:3".into());
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let module = be.module_load(&image).unwrap();
+    assert_eq!(
+        be.module_global_u32(&module, "plow_gemm_f16_node_abi")
+            .unwrap(),
+        Some(1)
+    );
+    let functions = ["gemm_f16_sm90_f32_node", "gemm_f16_sm90_f16_node"]
+        .map(|s| be.get_function(&module, s).unwrap());
+    for f in functions {
+        be.set_max_dynamic_smem(f, 103424).unwrap();
+    }
+    let compare = |a: &[u8], b: &[u8]| {
+        assert_eq!(a.len(), b.len());
+        let (mut delta, mut norm) = (0.0f64, 0.0f64);
+        for (a, b) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+            let a = f32::from_le_bytes(a.try_into().unwrap()) as f64;
+            let b = f32::from_le_bytes(b.try_into().unwrap()) as f64;
+            assert!(a.is_finite() && b.is_finite());
+            delta += (a - b) * (a - b);
+            norm += a * a;
+        }
+        let rel = (delta / norm.max(1e-30)).sqrt();
+        assert!(rel <= 2e-4, "native layer relative error {rel}");
+        rel
+    };
+    for batch in batches.split(',').map(|s| s.parse::<u32>().unwrap()) {
+        for selection in selections.split(',') {
+            let (level, layer) = selection.split_once(':').unwrap();
+            let (level, layer) = (level.parse::<u32>().unwrap(), layer.parse::<u32>().unwrap());
+            let path = dir.join(format!("b{batch}.l{level}.layer{layer}.pkt"));
+            let raw = std::fs::read(&path).unwrap();
+            let blob = DevBlob::parse(&raw).unwrap();
+            assert_eq!(blob.progs.len(), 1);
+            let rt = CudaPacketRuntime::load_on(be.clone(), &path).unwrap();
+            let g = &blob.progs[0];
+            let mut steps = Vec::new();
+            let mut span = Vec::new();
+            let mut routed = 0;
+            let emit_span = |span: &mut Vec<DevInst64>, steps: &mut Vec<Step>| {
+                if span.is_empty() {
+                    return;
+                }
+                let program = super::packed_terminal::chain(std::mem::take(span), rt.grid, g.t);
+                let (argument, _, counters, tables) =
+                    super::mixed_step::upload_program(&be, &program, rt._table.base, 0, 0).unwrap();
+                steps.push(Step::Packet {
+                    argument,
+                    counters,
+                    _tables: tables,
+                });
+            };
+            for instruction in &g.insts {
+                let flags = instruction.i[7];
+                let measured_shape = (instruction.i[1] == 3072
+                    && instruction.i[2] == 1024
+                    && instruction.i[0] >= 832)
+                    || (instruction.i[1] == 1024
+                        && instruction.i[2] == 3072
+                        && instruction.i[0] >= 1664);
+                let supported = instruction.op == DevOp::GemvF32Out as u16
+                    && measured_shape
+                    && instruction.i[1] % 128 == 0
+                    && instruction.i[2] % 64 == 0
+                    && flags & (3 | 1024 | 8192) == (3 | 1024 | 8192)
+                    && flags & !(3 | 4 | 8 | 16 | 512 | 1024 | 8192 | 16384) == 0;
+                if !supported {
+                    span.push(*instruction);
+                    continue;
+                }
+                let (m, n, k) = (
+                    u64::from(instruction.i[0]),
+                    u64::from(instruction.i[1]),
+                    u64::from(instruction.i[2]),
+                );
+                let half = flags & 16384 != 0;
+                let group = if flags & 512 != 0 {
+                    u64::from(instruction.i[3])
+                } else {
+                    0
+                };
+                assert!(flags & 512 == 0 || group > 0 && flags & 4 != 0);
+                let mut ranges = Vec::new();
+                for (index, bytes) in [
+                    (0, m * n * if half { 2 } else { 4 }),
+                    (1, m * k * 2),
+                    (2, n * k * 2),
+                    (
+                        3,
+                        if flags & 4 != 0 {
+                            (if group > 0 { m.div_ceil(group) } else { 1 }) * n * 4
+                        } else {
+                            0
+                        },
+                    ),
+                    (4, if flags & 8 != 0 { m * n * 4 } else { 0 }),
+                ] {
+                    if bytes == 0 {
+                        continue;
+                    }
+                    let memory = &rt.tensors[usize::from(instruction.t[index])];
+                    assert!(memory.len >= bytes && memory.base % 16 == 0);
+                    ranges.push((index, memory.base, memory.base + bytes));
+                }
+                let (_, c, ce) = ranges[0];
+                for &(index, p, pe) in &ranges[1..] {
+                    assert!(ce <= p || pe <= c || index == 4 && !half && c == p);
+                }
+                emit_span(&mut span, &mut steps);
+                let memory = be.alloc(0, 64).unwrap();
+                be.upload(&memory, 0, pod_bytes(std::slice::from_ref(instruction)))
+                    .unwrap();
+                steps.push(Step::Gemm {
+                    instruction: memory,
+                    function: functions[usize::from(half)],
+                });
+                routed += 1;
+            }
+            emit_span(&mut span, &mut steps);
+            let x = rt.tensor("act.depth.x").unwrap();
+            let cache = rt.tensor(&format!("act.depth.cache.{layer}")).unwrap();
+            let cross = rt.tensor(&format!("in.depth.cross.{layer}")).unwrap();
+            let input = |bytes: usize, salt: usize, scale: f32| -> Vec<u8> {
+                (0..bytes / 4)
+                    .flat_map(|i| {
+                        (((i * 37 + salt * 19) % 509) as f32 / 254. - 1.)
+                            .mul_add(scale, 0.001)
+                            .to_le_bytes()
+                    })
+                    .collect()
+            };
+            let inputs = [
+                (x, input(x.bytes, 1, 0.3)),
+                (cache, input(cache.bytes, 2, 0.1)),
+                (cross, input(cross.bytes, 3, 0.03)),
+            ];
+            let reset = || {
+                for (tensor, bytes) in &inputs {
+                    rt.upload(&rt.tensors[tensor.handle], 0, bytes).unwrap();
+                }
+            };
+            let enqueue = |native: bool| {
+                if !native {
+                    rt.enqueue_on(&[0], &rt.stream).unwrap();
+                    return;
+                }
+                for step in &steps {
+                    match step {
+                        Step::Packet {
+                            argument, counters, ..
+                        } => {
+                            be.memset_d8_async(argument.counters, 0, *counters, &rt.stream)
+                                .unwrap();
+                            let mut argument = *argument;
+                            let mut params =
+                                [&mut argument as *mut DevProgram as *mut std::ffi::c_void];
+                            be.launch_cooperative(
+                                rt.function,
+                                rt.grid,
+                                BLOCK,
+                                rt.smem,
+                                &mut params,
+                                Some(&rt.stream),
+                            )
+                            .unwrap();
+                        }
+                        Step::Gemm {
+                            instruction,
+                            function,
+                        } => {
+                            let mut inst = instruction.base;
+                            let mut table = rt._table.base;
+                            let mut count = u32::try_from(rt.tensors.len()).unwrap();
+                            let mut params = [
+                                &mut inst as *mut u64 as *mut std::ffi::c_void,
+                                &mut table as *mut u64 as *mut std::ffi::c_void,
+                                &mut count as *mut u32 as *mut std::ffi::c_void,
+                            ];
+                            be.launch_kernel(
+                                *function,
+                                be.sm_count() * 2,
+                                256,
+                                103424,
+                                &mut params,
+                                Some(&rt.stream),
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+            };
+            let read = |tensor: PacketTensor| {
+                let mut out = vec![0; tensor.bytes];
+                rt.download(&rt.tensors[tensor.handle], 0, &mut out)
+                    .unwrap();
+                out
+            };
+            reset();
+            enqueue(false);
+            be.stream_synchronize(&rt.stream).unwrap();
+            let baseline = [read(x), read(cache)];
+            reset();
+            enqueue(true);
+            be.stream_synchronize(&rt.stream).unwrap();
+            let treatment = [read(x), read(cache)];
+            let output_rows = if level == 25 && layer != 3 {
+                batch * 26
+            } else {
+                batch
+            };
+            let end = output_rows as usize * 1024 * 4;
+            let rel = compare(&baseline[0][..end], &treatment[0][..end]);
+            assert_eq!(&baseline[0][end..], &inputs[0].1[end..]);
+            assert_eq!(&treatment[0][end..], &inputs[0].1[end..]);
+            let mut cache_rel = 0.0f64;
+            let (lo, hi) = if level == 25 {
+                (0, 26)
+            } else {
+                (level as usize, level as usize + 1)
+            };
+            for row in 0..batch as usize {
+                let start = row * 32 * 3072 * 4;
+                let (a, b, end) = (
+                    start + lo * 3072 * 4,
+                    start + hi * 3072 * 4,
+                    start + 32 * 3072 * 4,
+                );
+                cache_rel = cache_rel.max(compare(&baseline[1][a..b], &treatment[1][a..b]));
+                for result in &baseline[1..2] {
+                    assert_eq!(&result[start..a], &inputs[1].1[start..a]);
+                    assert_eq!(&result[b..end], &inputs[1].1[b..end]);
+                }
+                assert_eq!(&treatment[1][start..a], &inputs[1].1[start..a]);
+                assert_eq!(&treatment[1][b..end], &inputs[1].1[b..end]);
+            }
+            let mut times = [Vec::new(), Vec::new()];
+            let timing = std::env::var_os("DEPTH_GEMM_TIMING").is_some();
+            for round in 0..if timing { 24 } else { 0 } {
+                let native = round % 2 == 1;
+                reset();
+                be.event_record(&rt.events.0, &rt.stream).unwrap();
+                enqueue(native);
+                be.event_record(&rt.events.1, &rt.stream).unwrap();
+                be.event_synchronize(&rt.events.1).unwrap();
+                if round >= 4 {
+                    times[usize::from(native)]
+                        .push(be.event_elapsed_ms(&rt.events.0, &rt.events.1).unwrap() * 1000.);
+                }
+            }
+            for t in &mut times {
+                t.sort_by(f32::total_cmp);
+            }
+            println!("NATIVE_LAYER_ORACLE batch={batch} level={level} layer={layer} routed={routed} rel={rel} cache_rel={cache_rel} tails=exact weights=published");
+            if timing {
+                println!("NATIVE_LAYER_TIME batch={batch} level={level} layer={layer} routed={routed} baseline_us={} native_us={} policy=after_same_H2D_input_reset samples=10_each",times[0][times[0].len()/2],times[1][times[1].len()/2]);
+            }
+        }
+    }
+    be.synchronize().unwrap();
+    be.module_unload(&module).unwrap();
+}
