@@ -72,6 +72,13 @@ class TagGateTests(unittest.TestCase):
             self.assertEqual(len(rows), 37)
             self.assertEqual(len({r["id"] for r in rows}), 37)
             self.assertEqual(sum(r.get("expected_status") == 400 for r in rows), 2)
+            literal = {"paren", "curly", "plain_prefix"}
+            for row in rows:
+                if row["id"].split("-", 1)[1] in literal:
+                    self.assertEqual(row["forbid"], [])
+                if row["id"].endswith("-chat_token"):
+                    self.assertEqual(row["forbid"], ["style"])
+                    self.assertEqual(row["text"].replace("<|style|>", "").replace("<|/style|>", ""), row["reference"])
 
     def test_invalid_forbid_and_relative_configuration_stop_before_asr(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1068,8 +1068,10 @@ aliases such as `[warm, casual, friendly]`, and known asterisk aliases such as `
 Unknown tag-shaped ASCII brackets follow the packet's policy. Numeric, non-ASCII and reference
 brackets such as `[1]`, `[कोई]`, and `[see p. 4]` remain literal.
 Parentheses, braces, prose prefixes and unknown asterisk phrases remain text.
-Use `\[` and `\<` to escape a bracket or angle opener. Special-token openers `<|` are
-neutralized to `< |` when tag processing is enabled.
+Use `\[` and `\<` to escape a bracket or angle opener. The shared map declares
+`syntax.markers: "strip"`: `<|...|>` markers are consumed; text between paired markers is kept.
+Older maps without this field retain neutralization to `< |`.
+Literal rewrites run before mandatory neutralization of any remaining special-token openers.
 
 The SSML subset consumes `speak`, `break` (`time` or `strength`), `prosody` (`rate` and `pitch`),
 `emphasis`, `express-as style`, `emotion name`, `amazon:effect name="whispered"`, and `style`.
@@ -1098,6 +1100,9 @@ reference, while `text` is the request. Supply the clone rows' reference WAVs fr
 baseline captures. Explicit `voice: null` omits the field; `expected_status: 400` records an
 expected failure without producing an ASR row. Literal syntax remains literal; its expected
 spoken reference must account for the words it preserves.
+Gate accepted syntax with forbid lists and clean-reference CER. Check literal forms against
+`tags: "off"` rendered bytes on CPU, with ASR as a speaking sanity check. Check special-token
+markers for forbidden markup words too; their inner words remain ordinary text.
 
 `scripts/tts/asr_check.py` accepts per-row `forbid` lists in `texts.json`, or
 `--forbid FILE` containing `{ "clip.wav": ["style", "equals"] }`. Matches use normalized
