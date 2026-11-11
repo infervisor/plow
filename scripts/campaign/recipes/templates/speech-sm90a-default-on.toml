@@ -96,3 +96,14 @@ languages = ["en"]
 # cer_max must be the model's owner-approved ceiling, not a new threshold.
 # [gates.tts_tags.texts]
 # en = "The weather is nice today. We are at home."
+
+# For models with no language selection, omit the request field while retaining ASR language:
+# [gates.tts_tags.request_languages]
+# en = ""
+# For a native candidate, declare its report in [speech_tags] as native_sweep,
+# then capture the same gate with --tag-sweep --only tts_tags in a fresh output directory:
+# [gates.tts_tags]
+# seeds = [1, 2, 3, 4, 5]
+# native_metric = "cer" # explicit speech-quality metric; requires a mean decrease at every cell
+# [gates.tts_tags.forbid]
+# zh = ["笑", "清嗓子", "叹气"] # applicable spoken event words, beside the fixture's markup terms
