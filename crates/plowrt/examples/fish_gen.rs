@@ -28,6 +28,162 @@ fn bf16(x: f32) -> f32 {
     f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
 }
 
+fn bind_ordering_screen(
+    e: &mut GpuEngine,
+    be: &plowrt::device::cuda::CudaBackend,
+    prompt: &[u32],
+    mut plan: plowrt::tts::maya2::Plan,
+    seed: u64,
+    same_memory: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let null = e.maya2_null_memory().ok_or("missing speaker memory")?;
+    let old: Arc<[f32]> = null.iter().map(|v| v * -3.0 + 0.125).collect();
+    let new: Arc<[f32]> = null.iter().map(|v| v * 0.25 - 0.0625).collect();
+    let mut poisoned_plan = plan;
+    if same_memory {
+        poisoned_plan.min_frames = 0;
+        poisoned_plan.cb0.stop_p = 0.0;
+        plan.min_frames = u32::MAX;
+    }
+    let info = e.fish_info()?;
+    let row = FishRow {
+        slot: 0,
+        hidden_row: 0,
+        seed,
+        step: 0,
+        temperature: bf16(0.7),
+        top_p: bf16(0.7),
+        top_k: 30,
+        ras_temperature: bf16(1.0),
+        ras_top_p: bf16(0.9),
+        repetition_penalty: 1.0,
+        cfg: None,
+    };
+    let mut outputs = Vec::new();
+    let mut activation_reference = None;
+    let mut poison_changed_codes = false;
+    let mut poison_changed_activations = false;
+    let completion = be.event_create(false)?;
+    let mut pending_binds = 0;
+    for iteration in 0..16 {
+        let mut pair = Vec::new();
+        for (fenced, poison) in [
+            (iteration % 2 == 0, false),
+            (iteration % 2 != 0, false),
+            (true, true),
+        ] {
+            e.begin_slot(0, prompt.len() + 3)?;
+            e.fish_reset_slot(0)?;
+            e.maya2_bind(
+                0,
+                if same_memory { poisoned_plan } else { plan },
+                Some(if same_memory { &new } else { &old }),
+            )?;
+            be.synchronize()?;
+            e.prefill_slot(0, prompt)?;
+            e.fish_logits_to_slot(0)?;
+            let mut codes = Vec::new();
+            e.fish_depth_step(
+                &[FishRow {
+                    hidden_row: e.prefill_terminal_row(),
+                    ..row
+                }],
+                &mut codes,
+            )?;
+            if same_memory && codes[0] != info.stop_class {
+                return Err(
+                    "inconclusive bind ordering screen: controller poison did not stop".into(),
+                );
+            }
+            let initial_codes = codes.clone();
+            let class = if codes[0] == info.stop_class {
+                0
+            } else {
+                codes[0]
+            };
+            e.step_slots_unread(&[(0, info.semantic_base + class)], &mut Vec::new())?;
+            e.record_stream_event(&completion)?;
+            if !fenced && !be.event_query(&completion)? {
+                pending_binds += 1;
+            }
+            if fenced {
+                e.sync_stream()?;
+            }
+            e.maya2_bind(
+                0,
+                if same_memory && poison {
+                    poisoned_plan
+                } else {
+                    plan
+                },
+                Some(if same_memory || !poison { &new } else { &old }),
+            )?;
+            if fenced {
+                be.synchronize()?;
+            }
+            codes.clear();
+            e.fish_depth_step(&[row], &mut codes)?;
+            if same_memory && (codes[0] == info.stop_class) != poison {
+                return Err(format!("controller bind stop mismatch: fenced={fenced}, poison={poison}, codes={codes:?}").into());
+            }
+            let mut activations = vec![0u8; 1024 * 4];
+            e.read_tensor_range("act.depth.x", 0, &mut activations)?;
+            let layout = e.depth_plan_describe().ok_or("missing depth plan")?;
+            let layout = layout.split(" cost_us ").next().unwrap().to_owned();
+            pair.push((fenced, codes, activations, layout, initial_codes));
+        }
+        if pair
+            .iter()
+            .any(|arm| arm.3 != pair[0].3 || arm.4 != pair[0].4)
+        {
+            return Err(
+                "inconclusive bind ordering screen: initialization or depth capacity differs"
+                    .into(),
+            );
+        }
+        if pair[0].1 != pair[1].1 || pair[0].2 != pair[1].2 {
+            return Err(format!("bind ordering mismatch at iteration {iteration}").into());
+        }
+        if outputs.first().is_some_and(|v| v != &pair[0].1)
+            || activation_reference
+                .as_ref()
+                .is_some_and(|v| v != &pair[0].2)
+        {
+            return Err(format!(
+                "inconclusive bind ordering screen: reference changed at iteration {iteration}"
+            )
+            .into());
+        }
+        poison_changed_codes |= pair[0].1 != pair[2].1;
+        poison_changed_activations |= pair[0].2 != pair[2].2;
+        activation_reference = Some(pair[0].2.clone());
+        outputs.push(pair.remove(0).1);
+    }
+    if !poison_changed_codes && !poison_changed_activations {
+        return Err(
+            "inconclusive bind ordering screen: poison did not change observed outputs".into(),
+        );
+    }
+    if pending_binds == 0 {
+        return Err("inconclusive bind ordering screen: no pending backbone at bind".into());
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "bind_ordering": "pass",
+            "case": if same_memory { "same_speaker_state_reset" } else { "changed_speaker" },
+            "fenced_unfenced_pairs": 16,
+            "observed_pending_binds": pending_binds,
+            "poison_changed_codes": poison_changed_codes,
+            "poison_changed_activations": poison_changed_activations,
+            "speaker_bytes": new.len() * 4,
+            "depth_plan": e.depth_plan_describe(),
+            "codes": outputs.first(),
+        })
+    );
+    Ok(())
+}
+
 /// `--depth-sweep STRIDE` (with `--slots N`): the depth program of the width covering N slots
 /// timed at every STRIDE-th instruction cap (median of 20 launches, JSON lines
 /// `{"cap":..,"op":..,"blocks":..,"us":..}`, `op` the instruction cap - 1 adds), so the marginal
@@ -111,7 +267,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let assets = PathBuf::from(&a[1]);
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
-    let mut e = GpuEngine::load(be, &assets, &PathBuf::from(&a[2]))?;
+    let bind_screen = a.iter().any(|v| v == "--bind-ordering-screen");
+    if bind_screen {
+        eprintln!("bind ordering: loading model");
+    }
+    let mut e = GpuEngine::load(be.clone(), &assets, &PathBuf::from(&a[2]))?;
+    if bind_screen {
+        eprintln!("bind ordering: model ready");
+    }
     let info = e.fish_info()?;
     let prompt = read_u32(&a[3]);
     // A Maya 2 depth stage needs its host cb0 controller bound per slot (the checkpoint's
@@ -123,6 +286,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|c| c.plan("fish_gen timing prompt", "en", Some(frames), c.cb0, seed));
     if let Some(p) = opt("--prompt-codes") {
         e.fish_prompt_codes(&read_u32(&p))?;
+    }
+    if bind_screen {
+        let plan = maya2.ok_or("missing controller plan")?;
+        bind_ordering_screen(&mut e, &be, &prompt, plan, seed, true)?;
+        return bind_ordering_screen(&mut e, &be, &prompt, plan, seed, false);
     }
     if let Some(n) = opt("--slots").map(|v| v.parse::<usize>().unwrap()) {
         let mut rows = Vec::new();
