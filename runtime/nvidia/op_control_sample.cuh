@@ -242,3 +242,34 @@ extern "C" __global__ void handoff_pack_pcm16(
     for (size_t b = 8 + (size_t)samples * 2 + threadIdx.x; b < stride; b += blockDim.x)
         output[b] = 0;
 }
+
+extern "C" __global__ void handoff_pack_codes(
+    const unsigned* source, const unsigned* slots, unsigned* target,
+    unsigned rows, unsigned source_capacity, unsigned capacity, unsigned codebooks) {
+    if (!source_capacity || !capacity || !codebooks || rows > capacity) { asm("trap;"); return; }
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)capacity * codebooks) return;
+    const size_t r = i / codebooks, k = i % codebooks;
+    unsigned value = 0;
+    if (r < rows) {
+        const unsigned slot = slots[r];
+        if (slot >= source_capacity) { asm("trap;"); return; }
+        value = source[(size_t)slot * codebooks + k];
+    }
+    target[i] = value;
+}
+
+extern "C" __global__ void handoff_codec_lengths(
+    const ControlSampleState* states, const unsigned* slots, unsigned* lengths,
+    unsigned rows, unsigned state_capacity, unsigned capacity, unsigned scale) {
+    if (!state_capacity || !capacity || !scale || rows > capacity) { asm("trap;"); return; }
+    const size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= capacity) return;
+    unsigned value = 0;
+    if (r < rows) {
+        const unsigned slot = slots[r];
+        if (slot >= state_capacity) { asm("trap;"); return; }
+        value = states[slot].stopped ? 0 : scale;
+    }
+    lengths[r] = value;
+}

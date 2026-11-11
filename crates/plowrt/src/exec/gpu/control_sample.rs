@@ -508,6 +508,174 @@ mod tests {
     }
     #[test]
     #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
+    fn handoff_codes_and_lengths_match_independent_slot_maps() {
+        let be = CudaBackend::new(0).unwrap();
+        let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
+        let module = be.module_load(&image).unwrap();
+        assert_eq!(
+            be.module_global_u32(&module, "plow_control_sample_abi")
+                .unwrap(),
+            Some(1)
+        );
+        let pack = be.get_function(&module, "handoff_pack_codes").unwrap();
+        let lengths_kernel = be.get_function(&module, "handoff_codec_lengths").unwrap();
+        let stream = be.stream_create().unwrap();
+        let (source_capacity, state_capacity) = (384u32, 353u32);
+        let states = be
+            .alloc(
+                0,
+                u64::from(state_capacity) * std::mem::size_of::<State>() as u64,
+            )
+            .unwrap();
+        let mut expected_states = Vec::with_capacity(states.len as usize);
+        for slot in 0..state_capacity {
+            let mut value = state(plan(u64::from(slot), 1, 1.)).unwrap();
+            value.stopped = u32::from(slot % 3 == 1);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&value as *const State).cast::<u8>(),
+                    std::mem::size_of::<State>(),
+                )
+            };
+            expected_states.extend_from_slice(bytes);
+        }
+        be.upload(&states, 0, &expected_states).unwrap();
+        let maps: [Vec<u32>; 2] = [source_capacity, state_capacity].map(|cap| {
+            (0..320)
+                .map(|r| if r == 0 { cap - 1 } else { (r * 37 + 17) % cap })
+                .collect()
+        });
+        let map_buffers = maps.each_ref().map(|map| {
+            let buffer = be.alloc(0, (map.len() * 4) as u64).unwrap();
+            be.upload(&buffer, 0, bytemuck::cast_slice(map)).unwrap();
+            buffer
+        });
+        be.synchronize().unwrap();
+        for codebooks in [1u32, 32] {
+            let values: Vec<u32> = (0..source_capacity * codebooks)
+                .map(|i| {
+                    if i % 17 == 0 {
+                        2048
+                    } else {
+                        i.wrapping_mul(7919)
+                    }
+                })
+                .collect();
+            let source = be.alloc(0, (values.len() * 4) as u64).unwrap();
+            be.upload(&source, 0, bytemuck::cast_slice(&values))
+                .unwrap();
+            let output = be.alloc(0, u64::from(320 * codebooks + 16) * 4).unwrap();
+            let lengths = be.alloc(0, (320 + 16) * 4).unwrap();
+            be.synchronize().unwrap();
+            for capacity in [1u32, 8, 32, 64, 128, 200, 224, 288, 300, 320] {
+                let rows_set: std::collections::BTreeSet<_> =
+                    [0, 1, capacity / 2, capacity - 1, capacity].into();
+                for rows in rows_set {
+                    let (mut src, mut map, mut dst) =
+                        (source.base, map_buffers[0].base, output.base);
+                    let (mut n, mut src_cap, mut cap, mut cb) =
+                        (rows, source_capacity, capacity, codebooks);
+                    let mut args = [
+                        &mut src as *mut u64 as *mut _,
+                        &mut map as *mut u64 as *mut _,
+                        &mut dst as *mut u64 as *mut _,
+                        &mut n as *mut u32 as *mut _,
+                        &mut src_cap as *mut u32 as *mut _,
+                        &mut cap as *mut u32 as *mut _,
+                        &mut cb as *mut u32 as *mut _,
+                    ];
+                    be.memset_d8_async(output.base, 0xa5, output.len as usize, &stream)
+                        .unwrap();
+                    be.launch_kernel(
+                        pack,
+                        (capacity * codebooks).div_ceil(256),
+                        256,
+                        0,
+                        &mut args,
+                        Some(&stream),
+                    )
+                    .unwrap();
+                    be.stream_synchronize(&stream).unwrap();
+                    let mut actual = vec![0u32; (output.len / 4) as usize];
+                    be.download(&output, 0, bytemuck::cast_slice_mut(&mut actual))
+                        .unwrap();
+                    let mut expected = vec![0xa5a5a5a5; actual.len()];
+                    for r in 0..capacity as usize {
+                        for k in 0..codebooks as usize {
+                            expected[r * codebooks as usize + k] = if r < rows as usize {
+                                values[maps[0][r] as usize * codebooks as usize + k]
+                            } else {
+                                0
+                            };
+                        }
+                    }
+                    assert!(
+                        actual == expected,
+                        "codes rows={rows} capacity={capacity} books={codebooks} first mismatch {:?}",
+                        actual.iter().zip(&expected).position(|(a, b)| a != b)
+                    );
+                    for scale in [1u32, 2, 1920] {
+                        let (mut src, mut map, mut dst) =
+                            (states.base, map_buffers[1].base, lengths.base);
+                        let (mut state_cap, mut unit) = (state_capacity, scale);
+                        let mut args = [
+                            &mut src as *mut u64 as *mut _,
+                            &mut map as *mut u64 as *mut _,
+                            &mut dst as *mut u64 as *mut _,
+                            &mut n as *mut u32 as *mut _,
+                            &mut state_cap as *mut u32 as *mut _,
+                            &mut cap as *mut u32 as *mut _,
+                            &mut unit as *mut u32 as *mut _,
+                        ];
+                        be.memset_d8_async(lengths.base, 0xa5, lengths.len as usize, &stream)
+                            .unwrap();
+                        be.launch_kernel(
+                            lengths_kernel,
+                            capacity.div_ceil(256),
+                            256,
+                            0,
+                            &mut args,
+                            Some(&stream),
+                        )
+                        .unwrap();
+                        be.stream_synchronize(&stream).unwrap();
+                        let mut actual = vec![0u32; (lengths.len / 4) as usize];
+                        be.download(&lengths, 0, bytemuck::cast_slice_mut(&mut actual))
+                            .unwrap();
+                        let mut expected = vec![0xa5a5a5a5; actual.len()];
+                        for r in 0..capacity as usize {
+                            expected[r] = if r < rows as usize && maps[1][r] % 3 != 1 {
+                                scale
+                            } else {
+                                0
+                            };
+                        }
+                        assert!(
+                            actual == expected,
+                            "lengths rows={rows} capacity={capacity} scale={scale} first mismatch {:?}",
+                            actual.iter().zip(&expected).position(|(a, b)| a != b)
+                        );
+                    }
+                }
+            }
+            let mut unchanged = vec![0u32; values.len()];
+            be.download(&source, 0, bytemuck::cast_slice_mut(&mut unchanged))
+                .unwrap();
+            assert_eq!(unchanged, values, "canonical source changed");
+        }
+        for (map, buffer) in maps.iter().zip(&map_buffers) {
+            let mut actual = vec![0u32; map.len()];
+            be.download(buffer, 0, bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            assert_eq!(&actual, map, "slot map changed");
+        }
+        let mut actual_states = vec![0u8; expected_states.len()];
+        be.download(&states, 0, &mut actual_states).unwrap();
+        assert!(actual_states == expected_states, "controller state changed");
+        println!("HANDOFF_CODES exact canonical gather, independent controller map, STOP/padding and guard tails PASS");
+    }
+    #[test]
+    #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
     fn controlled_sampler_readback_prefix() {
         let be = CudaBackend::new(0).unwrap();
         let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
