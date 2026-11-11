@@ -161,7 +161,7 @@ def speech_tag_map(value: dict) -> dict:
     require(set(value) <= {"syntax", "unknown", "literal_rewrite", "tags"}, "unknown field")
     syntax = value.get("syntax")
     require(isinstance(syntax, dict) and set(syntax) == {"bracket", "ssml", "asterisk", "markers"}, "declare every syntax")
-    require(syntax == default_speech_tag_map()["syntax"], "accepted syntax must be enabled and markers stripped")
+    require(type(syntax["bracket"]) is bool and type(syntax["ssml"]) is bool and syntax == default_speech_tag_map()["syntax"], "accepted syntax must be enabled and markers stripped")
     require(value.get("unknown") in ("strip", "literal", "passthrough", "reject"), "invalid unknown policy")
     rewrites = value.get("literal_rewrite", [])
     require(isinstance(rewrites, list) and len(rewrites) <= 16, "invalid literal_rewrite")
@@ -189,7 +189,7 @@ def speech_tag_map(value: dict) -> dict:
             if action == "instruction":
                 require(len(data.encode()) <= 1024 and ("{value}" not in data or name == "rate"), f"{name}: invalid instruction")
         elif action == "silence_ms":
-            require(name == "pause" and data == dict(default=400, max=3000), "pause requires 400 ms default / 3000 ms max")
+            require(name == "pause" and isinstance(data, dict) and set(data) == {"default", "max"} and all(type(v) is int for v in data.values()) and data == dict(default=400, max=3000), "pause requires 400 ms default / 3000 ms max")
         require(name != "pause" or action == "silence_ms", "pause must use runtime silence")
         e = {**defaults, **entry}
         require(type(e["carry"]) is bool and type(e["single_token"]) is bool, f"{name}: invalid modifier")
@@ -239,6 +239,8 @@ def speech_tag_policy(recipe: dict) -> dict | None:
         if not isinstance(policy.get("profile"), str) or not policy["profile"].strip():
             die("speech_tags: map needs an explicit profile name")
         speech_tag_map(policy["map"])
+        if recipe.get("status") == "validated" and any("text" in e for e in policy["map"]["tags"].values()) and not policy.get("native_sweep"):
+            die("speech_tags: a validated native map requires its measured native_sweep report")
         sweep = policy.get("native_sweep")
         if sweep is not None and (not isinstance(sweep, str) or not sweep.strip()):
             die("speech_tags: native_sweep must name its measured report")
@@ -261,7 +263,7 @@ def speech_pipelines(packet: Path) -> list[dict]:
     if raw is None:
         return []
     metadata = json.loads(raw)
-    if metadata.get("version") != 1 or not isinstance(metadata.get("pipelines"), list):
+    if type(metadata.get("version")) is not int or metadata["version"] != 1 or not isinstance(metadata.get("pipelines"), list):
         die("speech_tags: unsupported packet pipeline metadata")
     return [p for p in metadata["pipelines"] if p.get("driver", "").startswith("tts.")]
 
@@ -282,7 +284,7 @@ def check_packet_speech_tags(packet: Path, recipe: dict | None) -> list[tuple[st
     expected = speech_tag_map(policy["map"])
     for pipeline in pipelines:
         strings, params = pipeline.get("strings", {}), pipeline.get("parameters", {})
-        if "text.tags" not in strings or params.get("text.tags_version") != policy["version"]:
+        if "text.tags" not in strings or type(params.get("text.tags_version")) is not int or params["text.tags_version"] != policy["version"]:
             die(f"speech_tags: {pipeline['name']}: emitted text.tags/version absent or unsupported; re-emit")
         observed = speech_tag_map(json.loads(strings["text.tags"]))
         if observed != expected:

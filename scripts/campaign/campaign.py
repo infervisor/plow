@@ -49,6 +49,8 @@ except Exception:
 import rung_env
 import rung_sweep
 import spec_env
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import recipe_common as recipe_common
 
 REPO = Path(__file__).resolve().parents[2]
 GPUQ = REPO / "scripts" / "bench" / "gpuq.py"
@@ -1741,7 +1743,7 @@ def cmd_rung_sweep(a: argparse.Namespace) -> None:
 #                     refusal_image, refusal_audio, compressed), and after the server stops the encoder
 #                     sidecars vs HF rows (`mm_check`, `runner`; encoder = false skips it):
 #                     cases_pass_min (default all), refusals, encoder
-GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "s3gen_rel_l2", "vad_parity", "mm_parity")
+GATE_KINDS = ("llm_logit_parity", "llm_fp32_ref", "asr_wer", "tts_cer", "tts_tags", "s3gen_rel_l2", "vad_parity", "mm_parity")
 
 
 def gate_kind(key: str) -> str | None:
@@ -1785,6 +1787,21 @@ def gate_steps(key: str, g: dict, py: str, out: Path, assets: Path) -> tuple[lis
         return ([f"{q(py)} {sc('scripts/asr/nvidia/served_bench.py')} --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
                  f"--model \"$MODEL\" --manifest {q(g['manifest'])} --conc {q(str(g.get('conc', '1,16')))} {args} "
                  f"> {d}/served.jsonl 2>{d}/served.log"], [])
+    if kind == "tts_tags":
+        if "waiver" in g:
+            return [], []
+        if any((out / key / name).exists() for name in ("capture", "tags.json", "asr-raw.json")):
+            die("tag gate output already has captures/reports; use a fresh --out or --score-only")
+        config_path = out / key / "config.json"
+        (out / key).mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(g["config"], ensure_ascii=False, indent=2) + "\n")
+        cfg = q(str(config_path))
+        up = [f"PLOW_URL=\"http://127.0.0.1:$PB_SERVER_PORT\" {q(py)} {sc('scripts/serve_test/eval.py')} tts "
+              f"--models \"$MODEL\" --tts-concurrency 1 --tts-stream --tts-capture-only --tts-tag-config {cfg} "
+              f"--out {d}/capture > {d}/capture.log 2>&1"]
+        whisper = f" --model {q(g['whisper'])}" if g.get("whisper") else ""
+        return up, [f"{q(py)} {sc('scripts/tts/asr_check.py')} --tag-config {cfg} --tag-capture {d}/capture "
+                    f"--out {d}/tags.json{whisper} > {d}/asr.log 2>&1"]
     if kind == "tts_cer":
         steps = [f"{q(py)} {sc('scripts/tts/tts_bench.py')} --url \"http://127.0.0.1:$PB_SERVER_PORT\" --model \"$MODEL\" "
                  f"--out {d} {arm} --tag gate{i} >> {d}/bench.log 2>&1" for i, arm in enumerate(g["arms"])]
@@ -1909,6 +1926,21 @@ def gate_score(key: str, g: dict, d: Path) -> dict:
         res[metric] = value
         if key in g and value is not None and (value > g[key] if upper else value < g[key]):
             why.append(f"{metric} {value:.4g} {'>' if upper else '<'} {key} {g[key]}")
+    if kind == "tts_tags":
+        if "waiver" in g:
+            return {"pass": True, "waived": True, "why": [g["waiver"]], "evidence": g["evidence"]}
+        sys.path.insert(0, str(REPO / "scripts/tts"))
+        import tag_gate
+        raw = d / "asr-raw.json"
+        captures = list((d / "capture").glob("tts-*/capture.json"))
+        if not raw.is_file() or len(captures) != 1:
+            return {"pass": False, "why": ["no complete tag capture/ASR report (see capture.log/asr.log)"]}
+        try:
+            report = tag_gate.score(g["config"], json.loads(captures[0].read_text()), json.loads(raw.read_text()), captures[0].parent)
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            return {"pass": False, "why": [f"invalid tag gate evidence: {error}"]}
+        (d / "tags.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        return {k: report[k] for k in ("pass", "why", "n", "mode")}
     if kind == "llm_logit_parity":
         m = re.search(r"all: top1 (\d+)/(\d+) \(([\d.]+)\).*?KL mean ([\d.e+-]+) max ([\d.e+-]+)", txt("parity.md"))
         if not m:
@@ -2031,8 +2063,28 @@ def cmd_gate(a: argparse.Namespace) -> None:
     with open(a.recipe, "rb") as f:
         r = tomllib.load(f)
     gates = dict(r.get("gates", {}))
+    policy = recipe_common.speech_tag_policy(r)
+    if policy is not None:
+        recipe_common.check_packet_speech_tags(Path(a.assets) / gates.get("packet", "model.pkt"), r)
+        tag_keys = [k for k in gates if gate_kind(k) == "tts_tags"] or ["tts_tags"]
+        for key in tag_keys:
+            if "waiver" in policy:
+                print("speech_tags: WAIVED " + policy["waiver"] + "; evidence: " + "; ".join(policy["evidence"]), file=sys.stderr)
+                gates[key] = {"waiver": policy["waiver"], "evidence": policy["evidence"]}
+            else:
+                settings = dict(gates.get(key, {}))
+                settings.setdefault("languages", ["en"])
+                settings.setdefault("cer_margin", .05)
+                settings.setdefault("pause_tolerance_ms", 80)
+                if "cer_max" not in settings and "cer_median_max" in gates.get("tts_cer", {}):
+                    settings["cer_max"] = gates["tts_cer"]["cer_median_max"]
+                gates[key] = settings
+    if getattr(a, "tag_sweep", False) and (policy is None or "waiver" in policy):
+        die("--tag-sweep needs a declared native map")
+    if getattr(a, "tag_sweep", False) and a.only and not any(gate_kind(k) == "tts_tags" for k in a.only.split(",")):
+        die("--tag-sweep requires tts_tags in --only")
     kinds = [k for k in gates if isinstance(gates[k], dict) and gate_kind(k)
-             and (not a.only or k in a.only.split(","))]
+             and (not a.only or k in a.only.split(",") or gate_kind(k) == "tts_tags")]
     if not kinds:
         die(f"{a.recipe}: no [gates.<kind>] tables ({', '.join(GATE_KINDS)})")
     assets = Path(a.assets).resolve()
@@ -2047,6 +2099,26 @@ def cmd_gate(a: argparse.Namespace) -> None:
             return {kk: xv(i) for kk, i in vv.items()}
         return x(vv) if isinstance(vv, str) else vv
     cfg = {k: {kk: xv(vv) for kk, vv in gates[k].items()} for k in kinds}
+    for key in [k for k in cfg if gate_kind(k) == "tts_tags" and "waiver" not in policy]:
+        sys.path.insert(0, str(REPO / "scripts/tts"))
+        import tag_gate
+        config = dict(policy=policy, settings={k: v for k, v in cfg[key].items() if k not in ("python", "env", "whisper", "timeout_s")}, mode="native-sweep" if getattr(a, "tag_sweep", False) else "gate",
+                      packet_sha256=sha(assets / gates.get("packet", "model.pkt")), recipe_sha256=sha(Path(a.recipe)),
+                      asr_model=cfg[key].get("whisper", "openai/whisper-large-v3-turbo"),
+                      native_sweep=x(policy["native_sweep"]) if policy.get("native_sweep") else None)
+        if a.score_only:
+            saved = out / key / "config.json"
+            if not saved.is_file():
+                die("tag gate needs its captured config.json")
+            recorded = json.loads(saved.read_text())
+            if (recorded.get("recipe_sha256"), recorded.get("packet_sha256"), recorded.get("mode")) != (config["recipe_sha256"], config["packet_sha256"], config["mode"]):
+                die("tag gate captured recipe/packet/mode differs; use a fresh --out")
+            config = recorded
+        else:
+            runtime = Path(a.plowrt or r.get("serve", {}).get("plowrt") or Path(target) / "release/plowrt").resolve()
+            config["runtime_sha256"] = sha(runtime)
+        tag_gate.validate_config(config)
+        cfg[key] = {**cfg[key], "config": config}
     pkt = assets / gates.get("packet", "model.pkt")
     # serving_comparison.py render accepts the gate only for the exact packet the Infervisor arm served,
     # so the packet hash is the one captured with the run, never the --assets of a later re-score.
@@ -2076,6 +2148,9 @@ def cmd_gate(a: argparse.Namespace) -> None:
             genv = " ".join(f"{q}={shlex.quote(x(v))}" for q, v in cfg[k].get("env", {}).items())
             pre = f"env {genv} " if genv else ""
             tag = lambda step: f"{pre}{step} || echo 'GATE_STEP_FAIL {k}'"
+            if gate_kind(k) == "tts_tags" and "waiver" not in cfg[k]:
+                imports = shlex.quote("import torch, transformers, jiwer, soundfile, librosa")
+                before.append(f"{pre}{shlex.quote(py)} -c {imports} > {shlex.quote(str(out / k / 'deps.log'))} 2>&1 || exit 4")
             before += [tag(s) for s in gate_pre(k, cfg[k], out)]
             up += [tag(s) for s in s1]
             down += [tag(s) for s in s2]
@@ -2127,7 +2202,7 @@ def cmd_gate(a: argparse.Namespace) -> None:
     fmt = lambda v: ", ".join(f"{m}={val:.4g}" if isinstance(val, float) else f"{m}={val}"
                               for m, val in v.items() if m not in skip)
     for k, v in scores.items():
-        print(f"| {k} | {'PASS' if v['pass'] else '**FAIL**'} | {fmt(v)} | {'; '.join(v['why'])} |")
+        print(f"| {k} | {'WAIVED' if v.get('waived') else 'PASS' if v['pass'] else '**FAIL**'} | {fmt(v)} | {'; '.join(v['why'])} |")
         for c, row in v.get("by_concurrency", {}).items():
             print(f"| {k} @{c} | {'PASS' if row['pass'] else '**FAIL**'} | {fmt(row)} | {'; '.join(row['why'] + ([row['note']] if row.get('note') else []))} |")
     if not record["pass"]:
@@ -2415,6 +2490,7 @@ def main() -> None:
     ga.add_argument("--dry-run", action="store_true", help="write and print run.sh; no lease")
     ga.add_argument("--model", help="serve this pulled model (`serve --model`, store at $PLOW_HOME) instead of --assets")
     ga.add_argument("--queue", default=QUEUE, help="gpuq root for the GPU job")
+    ga.add_argument("--tag-sweep", action="store_true", help="tts_tags mode: position x native tag x language x >=5 seeds; strict mean CER improvement")
     ga.add_argument("--score-only", action="store_true", help="re-score an existing --out dir")
     ga.set_defaults(f=cmd_gate)
     dg = sp.add_parser("dist-gate", help="push -> load into a clean PLOW_HOME -> bundle == push input -> serve --model (smoke or --gate)")

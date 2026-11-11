@@ -16,6 +16,8 @@ class RenderPolicyTests(unittest.TestCase):
     def test_waiver_render(self):
         r = dict(name="model", label="test", emit=dict(args=[]), speech_tags=dict(version=1, waiver="CER 0.2 vs 0.01", evidence=["ab.json"]))
         self.assertIn("CER 0.2 vs 0.01", render.render(render.scaffold(r), r))
+        del r["emit"]
+        self.assertIn("CER 0.2 vs 0.01", render.render(render.scaffold(r), r))
 
     def test_existing_self_test(self):
         render.self_test()

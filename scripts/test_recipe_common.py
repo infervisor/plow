@@ -42,6 +42,15 @@ class SpeechPolicyTests(unittest.TestCase):
             with self.assertRaises(rc.Fail):
                 rc.speech_tag_policy(r)
 
+    def test_validated_native_policy_needs_a_sweep_reference(self):
+        r = self.policy()
+        r["status"] = "validated"
+        r["speech_tags"]["map"]["tags"]["laugh"] = dict(text="<laugh>")
+        with self.assertRaisesRegex(rc.Fail, "native_sweep"):
+            rc.speech_tag_policy(r)
+        r["speech_tags"]["native_sweep"] = "qualification/native.json"
+        rc.speech_tag_policy(r)
+
     def test_native_instruction_alias_and_language_defaults(self):
         m = self.policy()["speech_tags"]["map"]
         m["tags"].update(laugh=dict(text="(laugh)", langs={"en": "(laugh)"}),

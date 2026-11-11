@@ -36,6 +36,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(all(h["ids"] is None for h in report["pipelines"][0]["collisions"]))
 
     def test_actual_alias_table_and_rules(self):
+        import recipe_common as rc
+        self.assertEqual(set(aliases().values()), set(rc.CANONICAL_TAGS))
         self.assertEqual(aliases()["laughs softly"], "laugh")
         self.assertEqual(aliases()["cheerful"], "happy")
         text, unsupported = text_rules(" ［SIGH］  ", {"text.rules": "strip\nlowercase\nnfkd\nreplace\tsigh\tcalm"}, "hi")

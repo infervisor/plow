@@ -63,6 +63,8 @@ def read_section(path, name):
             if offset < 64 or offset + length > directory:
                 raise ValueError(f"{path}: invalid section range for {section_name}")
             if section_name == name:
+                if kind != 4:
+                    raise ValueError(f"{path}: {name} is not metadata")
                 if found is not None or length > 64 * 1024 * 1024:
                     raise ValueError(f"{path}: duplicate or oversized {name}")
                 found = offset, length

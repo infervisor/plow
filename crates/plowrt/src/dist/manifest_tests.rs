@@ -1863,3 +1863,18 @@ fn speech_recipe_packing_requires_a_map_or_measured_waiver() {
     assert!(read_recipe(&p, Overrides::default()).is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn validated_native_recipe_requires_its_sweep_reference() {
+    let dir = tmp("native-sweep");
+    let source =
+        include_str!("../../../../scripts/campaign/recipes/templates/speech-sm90a-default-on.toml")
+            .replace("status = \"emits\"", "status = \"validated\"")
+            .replace("laugh = { drop = true }", "laugh = { text = \"<laugh>\" }");
+    let p = write_recipe(&dir, &source);
+    assert!(read_recipe(&p, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("native_sweep"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
