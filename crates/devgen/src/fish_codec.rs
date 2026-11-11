@@ -27,7 +27,8 @@ use crate::codec::{fused_conv, p_handle, Conv};
 use crate::pipeline::{
     Activation, AttentionF32Stage, AttentionStream, BinaryF32Stage, BinaryOp, Conv1dF32Stage,
     CopyColsF32Stage, Emitted, GatherRowsF32Stage, LayerNormRowsF32Stage, PacketPrefix, PadMode,
-    StageProgram, StreamTailF32Mode, StreamTailF32Stage, TensorRef, UnaryF32Stage,
+    RingAttentionF32Stage, StageProgram, StreamTailF32Mode, StreamTailF32Stage, TensorRef,
+    UnaryF32Stage,
 };
 use crate::rewrite_lower::ConvFusions;
 
@@ -93,6 +94,7 @@ struct Block {
 struct Cfg {
     breeze: bool,
     mimi: bool,
+    ring_kv: bool,
     /// Mimi: stride of the causal ConvTranspose (k = 2 * stride) before the transformer; 0 = none.
     pre_up: u32,
     /// Residual-unit first conv kernel and the output conv kernel (Fish / Breeze: 7, 7).
@@ -156,6 +158,7 @@ impl Cfg {
         let cfg = Cfg {
             breeze,
             mimi,
+            ring_kv: false,
             pre_up,
             res_kernel: if mimi { u(d, "residual_kernel")? } else { 7 },
             out_kernel: if mimi { u(d, "out_kernel")? } else { 7 },
@@ -246,13 +249,14 @@ pub fn lower_fish_dac(
     max_rows: Option<u32>,
 ) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
     let (decode, steps) = capped(max_rows)?;
-    let cfg = Cfg::parse(
+    let mut cfg = Cfg::parse(
         &serde_json::from_slice(
             &std::fs::read(dir.join("config.json"))
                 .map_err(|e| format!("{}: {e}", dir.display()))?,
         )
         .map_err(|e| format!("fish codec config: {e}"))?,
     )?;
+    cfg.ring_kv = crate::emit_config::active().codec_ring_kv;
     let splits = split_bf16.then(|| std::cell::RefCell::new(BTreeMap::new()));
     let Lowered {
         mut prefix,
@@ -816,6 +820,9 @@ fn program_for(
     steps: Option<&[(u32, u32)]>,
     splits: Splits<'_>,
 ) -> Result<(PacketPrefix, u32), String> {
+    if cfg.ring_kv && !cfg.mimi {
+        return Err("codec ring KV needs a Mimi decoder".into());
+    }
     if cfg.mimi {
         return mimi_program_for(prefix, cfg, batch, frames, codes, lengths, steps, splits);
     }
@@ -1612,6 +1619,10 @@ fn mimi_program_for(
     if step && history == 0 {
         return Err("mimi codec step: needs a bounded attention window".into());
     }
+    let ring = step && cfg.ring_kv;
+    if ring && (hd != 64 || history == 0 || history > 255) {
+        return Err("codec ring KV needs 64-wide heads and a window of 2..256".into());
+    }
     let ln = |s: &mut Seq, w: String| -> Result<(), String> {
         let dep = s.last;
         let e = s.p().layer_norm_f32(
@@ -1646,7 +1657,43 @@ fn mimi_program_for(
                 d.f[0] = cfg.theta;
             },
         )?;
+        let current_qkv = qkv;
+        let ring_state = format!("state.codec.kv{l}");
         let (qkv, kv_rows, stream) = match &io {
+            Some(_) if ring && t <= 4 => (qkv, t, None),
+            Some((io, row_pos)) if ring => {
+                let dep = s.last;
+                let z = s.p().stream_tail_f32(
+                    &[dep],
+                    StreamTailF32Stage {
+                        mode: StreamTailF32Mode::RingGather {
+                            output: TensorRef::Named("act.codec.z"),
+                            src: qkv,
+                            pos: *row_pos,
+                            src_stride: 3 * aw,
+                        },
+                        state: TensorRef::Named(&ring_state),
+                        slot: io.slot,
+                        n: io.n[1],
+                        items: batch,
+                        slots: STREAM_SLOTS,
+                        tail: history,
+                        rows: t,
+                        cols: 2 * aw,
+                        z_cols: 3 * aw,
+                        z_col0: aw,
+                    },
+                )?;
+                s.last = z.done;
+                (
+                    z.output,
+                    history + t,
+                    Some(AttentionStream {
+                        pos: *row_pos,
+                        history,
+                    }),
+                )
+            }
             Some((io, row_pos)) => {
                 let dep = s.last;
                 let z = carry(
@@ -1655,7 +1702,7 @@ fn mimi_program_for(
                     1,
                     qkv,
                     dep,
-                    &format!("state.codec.kv{l}"),
+                    &ring_state,
                     batch,
                     t,
                     history,
@@ -1675,34 +1722,80 @@ fn mimi_program_for(
             None => (qkv, t, None),
         };
         let dep = s.last;
-        let e = s.p().attention_f32(
-            qkv,
-            qkv,
-            qkv,
-            &[dep],
-            AttentionF32Stage {
-                output: TensorRef::Named("act.codec.s"),
-                key_lengths: (!step).then(|| lengths[1]),
-                bias: None,
-                batch,
-                q_rows: t,
-                kv_rows,
-                heads,
-                head_width: hd,
-                in_stride: 3 * aw,
-                k_col0: aw,
-                v_col0: 2 * aw,
-                causal: true,
-                scale: 1.0 / (hd as f32).sqrt(),
-                bias_head_stride: 0,
-                relative: false,
-                key_length_heads: 0,
-                prefix: None,
-                window: cfg.window,
-                stream,
-            },
-        )?;
+        let e = if ring && t <= 4 {
+            let (io, row_pos) = io.as_ref().unwrap();
+            s.p().ring_attention_f32(
+                qkv,
+                &[dep],
+                RingAttentionF32Stage {
+                    output: TensorRef::Named("act.codec.s"),
+                    state: TensorRef::Named(&ring_state),
+                    slot: io.slot,
+                    lengths: io.n[1],
+                    positions: *row_pos,
+                    batch,
+                    rows: t,
+                    heads,
+                    history,
+                    slots: STREAM_SLOTS,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                },
+            )?
+        } else {
+            s.p().attention_f32(
+                qkv,
+                qkv,
+                qkv,
+                &[dep],
+                AttentionF32Stage {
+                    output: TensorRef::Named("act.codec.s"),
+                    key_lengths: (!step).then(|| lengths[1]),
+                    bias: None,
+                    batch,
+                    q_rows: t,
+                    kv_rows,
+                    heads,
+                    head_width: hd,
+                    in_stride: 3 * aw,
+                    k_col0: aw,
+                    v_col0: 2 * aw,
+                    causal: true,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                    bias_head_stride: 0,
+                    relative: false,
+                    key_length_heads: 0,
+                    prefix: None,
+                    window: cfg.window,
+                    stream,
+                },
+            )?
+        };
         let at = s.done(e);
+        if ring {
+            let (io, row_pos) = io.as_ref().unwrap();
+            let dep = s.last;
+            let stored = s.p().stream_tail_f32(
+                &[dep],
+                StreamTailF32Stage {
+                    mode: StreamTailF32Mode::RingStore {
+                        src: current_qkv,
+                        pos: *row_pos,
+                        src_stride: 3 * aw,
+                    },
+                    state: TensorRef::Named(&ring_state),
+                    slot: io.slot,
+                    n: io.n[1],
+                    items: batch,
+                    slots: STREAM_SLOTS,
+                    tail: history,
+                    rows: t,
+                    cols: 2 * aw,
+                    z_cols: 3 * aw,
+                    z_col0: aw,
+                },
+            )?;
+            s.last = stored.done;
+        }
         s.dense_res(splits, at, x, nt, aw, dim, &w("wo_s"))?;
         ln(&mut s, w("ln2"))?;
         let g = s.dense(
@@ -2082,6 +2175,58 @@ mod tests {
         assert_eq!(pipe["parameters"]["stream.transformer_rows_per_frame"], 2);
         assert_eq!(pipe["parameters"]["lengths.1.rows_per_frame"], 2);
         assert!(pipe["tensors"]["stream.row_pos"].is_object());
+    }
+
+    #[test]
+    fn mimi_ring_store_follows_attention_for_short_and_long_chunks() {
+        let mut cfg = mimi();
+        cfg.ring_kv = true;
+        let steps = [(32, 1), (32, 17)];
+        let low = lower_programs(&cfg, 132, 90, None, &[(1, 8)], &steps).unwrap();
+        let model = &low.prefix.model;
+        assert!(crate::manifest::SpeechMasks::of(model).ring_kv);
+        let decode = &model.progs[low.roles["decode.b1.f8"] as usize];
+        assert!(!decode
+            .insts
+            .iter()
+            .any(|d| plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)));
+        for (b, n) in steps {
+            let prog = &model.progs[low.roles[&format!("step.b{b}.f{n}")] as usize];
+            let stores: Vec<_> = prog
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.op == DevOp::StreamTailF32 as u16 && d.i[7] == 2)
+                .collect();
+            assert_eq!(stores.len(), cfg.layers as usize);
+            for (k, store) in stores {
+                let attention = &prog.insts[k - 1];
+                assert_eq!(attention.op, DevOp::AttentionF32 as u16);
+                assert!(after(prog, k, k - 1));
+                assert!(after(prog, k + 1, k));
+                assert_eq!(
+                    model.tensors[store.t[5] as usize].name,
+                    "in.codec.stream.row_pos"
+                );
+                assert_eq!(
+                    plow_asset::speech_flag_layout::is_ring_attention(attention.i[6]),
+                    n == 1
+                );
+                if n == 17 {
+                    let gather = &prog.insts[k - 2];
+                    assert_eq!(gather.op, DevOp::StreamTailF32 as u16);
+                    assert_eq!(gather.i[7], 3);
+                    assert_eq!(gather.t[2], store.t[2]);
+                    assert!(after(prog, k - 1, k - 2));
+                }
+            }
+            assert_eq!(
+                plow_asset::speech_flag_layout::required_layout(
+                    prog.insts.iter().map(|d| (d.op, d.j[1], d.i))
+                ),
+                Some(3)
+            );
+        }
     }
 
     /// `state.codec.*` name -> bytes the step programs need: (tail rows, channels) per carry.

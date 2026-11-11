@@ -398,6 +398,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_FISH_CODEC_MAX_ROWS")]
     pub fish_codec_max_rows: Option<u32>,
 
+    /// Slot-indexed codec KV rings and short-query attention (opt-in).
+    #[arg(long, env = "PLOW_CODEC_RING_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub codec_ring_kv: bool,
+
     /// Packed prefill for hd64/hd128 attention (the live-KV and packed contracts accept them).
     #[arg(long, env = "PLOW_EMIT_PACKED_PREFILL_SMALL_HD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub packed_prefill_small_hd: bool,
@@ -2018,6 +2022,7 @@ impl EmitConfig {
             codec_conv_classes: env_str("PLOW_EMIT_CODEC_CONV_CLASSES")
                 .map(std::path::PathBuf::from),
             fish_codec_max_rows: env_u32("PLOW_EMIT_FISH_CODEC_MAX_ROWS"),
+            codec_ring_kv: env_bool("PLOW_CODEC_RING_KV"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
             nv_fa_rg_wide: env_bool("PLOW_NV_FA_RG_WIDE"),

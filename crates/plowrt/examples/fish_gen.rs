@@ -4,6 +4,7 @@
 //!
 //!   fish_gen ASSETS CKPT PROMPT.u32 OUT.u32 [--prompt-codes CODES.u32] [--frames N] [--seed S]
 //!            [--temperature T] [--top-p P] [--top-k K] [--slots N [--depth-sweep STRIDE]]
+//!            [--unread-backbone] [--timing-json FILE] [--first-frame-repeats N]
 //!
 //! PROMPT.u32 holds token ids; prompt frame rows (reference audio) take their codes from
 //! `--prompt-codes` (`[prompt rows][codebooks]`). `--top-k 1` is greedy and matches the goldens.
@@ -103,6 +104,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let temperature = bf16(opt("--temperature").map_or(0.7, |v| v.parse().unwrap()));
     let top_p = bf16(opt("--top-p").map_or(0.7, |v| v.parse().unwrap()));
     let top_k: u32 = opt("--top-k").map_or(30, |v| v.parse().unwrap());
+    let unread = a.iter().any(|v| v == "--unread-backbone");
+    let first_repeats: usize = opt("--first-frame-repeats").map_or(1, |v| v.parse().unwrap());
+    if first_repeats == 0 || (first_repeats != 1 && opt("--slots").as_deref() != Some("1")) {
+        return Err("--first-frame-repeats requires a positive count and --slots 1".into());
+    }
     let assets = PathBuf::from(&a[1]);
     let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
     let mut e = GpuEngine::load(be, &assets, &PathBuf::from(&a[2]))?;
@@ -140,36 +146,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (mut off_by_memory, mut first_off) = (vec![0usize; period.unwrap_or(0)], None);
         // `--slot-stride K`: the N streams sit in slots 0, K, 2K, ..
         let stride = opt("--slot-stride").map_or(1, |v| v.parse::<usize>().unwrap().max(1));
+        let mut first_ms = Vec::new();
         for (index, slot) in (0..n).map(|i| (i, i * stride)) {
-            e.begin_slot(slot, prompt.len() + frames + 1)?;
-            e.fish_reset_slot(slot)?;
-            if let Some(p) = maya2 {
-                e.maya2_bind(slot, p, memories.get(index % memories.len().max(1)))?;
+            for repeat in 0..first_repeats {
+                e.begin_slot(slot, prompt.len() + frames + 1)?;
+                e.fish_reset_slot(slot)?;
+                if let Some(p) = maya2 {
+                    e.maya2_bind(slot, p, memories.get(index % memories.len().max(1)))?;
+                }
+                let first = std::time::Instant::now();
+                e.prefill_slot(slot, &prompt)?;
+                e.fish_logits_to_slot(slot)?;
+                let row = FishRow {
+                    slot,
+                    hidden_row: e.prefill_terminal_row(),
+                    seed: seed + if period.is_some() { 0 } else { index as u64 },
+                    step: 0,
+                    temperature,
+                    top_p,
+                    top_k,
+                    ras_temperature: bf16(1.0),
+                    ras_top_p: bf16(0.9),
+                    repetition_penalty: 1.0,
+                    cfg: None,
+                };
+                codes.clear();
+                e.fish_depth_step(&[row], &mut codes)?;
+                first_ms.push(first.elapsed().as_secs_f64() * 1e3);
+                if repeat + 1 == first_repeats {
+                    rows.push((row, codes[0]));
+                }
             }
-            e.prefill_slot(slot, &prompt)?;
-            e.fish_logits_to_slot(slot)?;
-            let row = FishRow {
-                slot,
-                hidden_row: e.prefill_terminal_row(),
-                seed: seed + if period.is_some() { 0 } else { index as u64 },
-                step: 0,
-                temperature,
-                top_p,
-                top_k,
-                ras_temperature: bf16(1.0),
-                ras_top_p: bf16(0.9),
-                repetition_penalty: 1.0,
-                cfg: None,
-            };
-            codes.clear();
-            e.fish_depth_step(&[row], &mut codes)?;
-            rows.push((row, codes[0]));
         }
         let mut toks = Vec::new();
         let (mut depth, mut backbone) = (0.0f64, 0.0f64);
         // `--codes-out FILE`: every frame's codes of every stream, `[frames][N][codebooks]` u32.
         let mut all_codes: Vec<u32> = Vec::new();
+        let mut frame_ms = Vec::new();
         for frame in 0..frames {
+            let tick = std::time::Instant::now();
             let feeds: Vec<(usize, u32)> = rows
                 .iter()
                 .map(|(r, class)| {
@@ -180,7 +195,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
             let t = std::time::Instant::now();
-            e.step_slots(&feeds, &mut toks)?;
+            if unread {
+                e.step_slots_unread(&feeds, &mut toks)?;
+            } else {
+                e.step_slots(&feeds, &mut toks)?;
+            }
             backbone += t.elapsed().as_secs_f64();
             let step: Vec<FishRow> = rows
                 .iter()
@@ -194,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = std::time::Instant::now();
             e.fish_depth_step(&step, &mut codes)?;
             depth += t.elapsed().as_secs_f64();
+            frame_ms.push(tick.elapsed().as_secs_f64() * 1e3);
             all_codes.extend_from_slice(&codes);
             for (k, (r, class)) in rows.iter_mut().enumerate() {
                 *r = step[k];
@@ -215,6 +235,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(path) = opt("--codes-out") {
             std::fs::write(path, bytemuck::cast_slice::<u32, u8>(&all_codes))?;
+        }
+        if let Some(path) = opt("--timing-json") {
+            std::fs::write(
+                path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "slots": n, "unread_backbone": unread, "first_frame_ms": first_ms,
+                    "frame_ms": frame_ms, "backbone_submit_ms": backbone * 1e3,
+                    "depth_complete_ms": depth * 1e3
+                }))?,
+            )?;
         }
         if let Some(plan) = e.depth_plan_describe() {
             println!("{plan}");

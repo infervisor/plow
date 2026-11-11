@@ -35,7 +35,7 @@ pub(crate) fn append(m: &Model, sections: &mut Vec<SectionData>, arch: &str, gpu
                 .unwrap_or_else(|e| panic!("section {}: {e}", s.name))
         })
         .collect();
-    let used = speech_flag_layout::first_protected(
+    let required = speech_flag_layout::required_layout(
         m.progs
             .iter()
             .flat_map(|p| &p.insts)
@@ -52,7 +52,7 @@ pub(crate) fn append(m: &Model, sections: &mut Vec<SectionData>, arch: &str, gpu
             tuned_on: (!gpu.is_empty()).then(|| gpu.to_string()),
         }),
         bindings: Some(bindings),
-        speech_flag_layout: speech_flag_layout::declare(used),
+        speech_flag_layout: required.map(|v| v.max(speech_flag_layout::DEFAULT_LAYOUT)),
     };
     sections.push(SectionData {
         kind: SECT_METADATA,
@@ -126,7 +126,7 @@ mod tests {
         let declared = format!(
             "{},\"{key}\":{}}}",
             &base[..base.len() - 1],
-            speech_flag_layout::LAYOUT
+            speech_flag_layout::DEFAULT_LAYOUT
         );
         for flags in [
             0x6e000 | 1 << 3,
@@ -138,7 +138,10 @@ mod tests {
         }
         assert_eq!(abi_json(0x6e000, Some(true)), declared);
         let parsed: Abi = serde_json::from_str(&declared).unwrap();
-        assert_eq!(parsed.speech_flag_layout, Some(speech_flag_layout::LAYOUT));
+        assert_eq!(
+            parsed.speech_flag_layout,
+            Some(speech_flag_layout::DEFAULT_LAYOUT)
+        );
         let parsed: Abi = serde_json::from_str(&base).unwrap();
         assert_eq!(parsed.speech_flag_layout, None);
     }

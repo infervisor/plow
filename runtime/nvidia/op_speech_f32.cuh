@@ -3558,6 +3558,10 @@ static __device__ __noinline__ void d_relative_attention_f32(float* __restrict__
 
 /* The interpreter arm for every op above (operand slots per f32_primitives.c). */
 #define SP_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+
+#if PLOW_NV_SPEECH && defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
+#include "op_stream_ring_f32.cuh"
+#endif
 /* ---- generic signal ops (195-203): golden f32_primitives.c, codes packet::dev::ACT_* ---------- */
 
 /* sin(y)^2 has period pi: Cody-Waite reduce by pi to [-pi/2, pi/2], then the SFU sine (the
@@ -3729,6 +3733,12 @@ static __device__ __noinline__ void d_copy_cols_f32(const PlowDevInst* in, void*
  * straddles the state window or a row, so the per-element cases hold per quad. */
 static __device__ __noinline__ void d_stream_tail_f32(const PlowDevInst* in, void* const* T, unsigned slice,
                                                       unsigned nblk) {
+#if PLOW_NV_SPEECH && defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
+    if (in->i[7] == 2u || in->i[7] == 3u) {
+        d_stream_ring_f32(in, T, slice, nblk);
+        return;
+    }
+#endif
     const float* src = (const float*)SP_TEN(1);
     float* state = (float*)SP_TEN(2);
     const unsigned* slot = (const unsigned*)SP_TEN(3);
@@ -7088,6 +7098,12 @@ static __device__ __noinline__ void sp_attention_short(const PlowDevInst* in, vo
 static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk,
                                        float* arena) {
     arena = sp_smem;
+#if PLOW_NV_SPEECH && defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
+    if (sp_is_ring_attention(in)) {
+        d_attention_ring_f32(in, T, slice, nblk);
+        return;
+    }
+#endif
 #if PLOW_NV_SPEECH
     if (in->i[4] == 64u && in->i[1] <= 32u && in->i[2] <= 32u &&
         !(in->i[6] & ~1u) && !SP_TEN(5) && !SP_TEN(6)) {

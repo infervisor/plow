@@ -6,6 +6,12 @@ built with `PLOW_CUBIN_DEVICE_CONTROL=ON` (`PLOW_NV_DEVICE_CONTROL=1`). The opti
 exports also support the shared codec enqueue API; caller integration is required.
 Default speech objects exclude these exports and preserve the native path.
 
+`PLOW_CODEC_RING_KV=1` opts into slot-indexed Mimi codec KV rings and short-query
+attention on sm_90a. It defaults to off. The packet derives `PLOW_SPEECH_RING_KV`
+for its speech object and requires speech flag layout 3 plus capability bit 3.
+Default packets and objects keep layout 2. Ring stores follow all attention
+producers; position zero resets visibility without clearing the entire state.
+
 Start with the defaults and a matching [model recipe](../recipes/infervisor/).
 Most deployments only need a model, a checkpoint, and a listening address.
 

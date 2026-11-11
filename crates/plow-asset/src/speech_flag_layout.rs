@@ -15,8 +15,9 @@ use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 /// wgmma tiles, 21..29 pinned arms, 30 / 31 split-image input / output; AttentionF32 `i6` bit 6
 /// query view, bit 7 split-image output; LayerNormF32 `i2` bit 2 split-image output; GemvF32Out
 /// `i7` bit 12 row view. Layout 2 adds LayerNormF32 bit 3 (f16 output) and GemvF32Out
-/// bits 13 / 14 (f16 input / output), preserving every layout 1 bit's meaning.
-pub const LAYOUT: u32 = 2;
+/// bits 13 / 14 (f16 input / output). Layout 3 adds slot-indexed ring attention and tail modes.
+pub const LAYOUT: u32 = 3;
+pub const DEFAULT_LAYOUT: u32 = 2;
 /// `extern "C" __device__ unsigned` exported by every speech interpreter object.
 pub const OBJECT_SYMBOL: &str = "plow_speech_flag_layout_speech";
 
@@ -29,12 +30,25 @@ pub const LAYER_NORM_I2: u32 = 0xc;
 /// GemvF32Out `i7` bits assigned since layout 0.
 pub const GEMV_F32_OUT_I7: u32 = 0x7000;
 
+pub fn is_ring_attention(flags: u32) -> bool {
+    flags & 0xff08 == 0x108
+}
+
+pub fn ring_kv(op: u16, i: &[u32; 8]) -> bool {
+    match DevOp::from_u16(op) {
+        Some(DevOp::AttentionF32) => is_ring_attention(i[6]),
+        Some(DevOp::StreamTailF32) => matches!(i[7], 2 | 3),
+        _ => false,
+    }
+}
+
 /// Whether an instruction (`j1` = `DevInst::j[1]` = `DevInst64::fj[2]`) sets a flag bit that
 /// layout 0 left clear.
 pub fn protected(op: u16, j1: u32, i: &[u32; 8]) -> bool {
     match DevOp::from_u16(op) {
         Some(DevOp::Conv1dF32 | DevOp::ConvTranspose1dF32) => j1 & CONV_FLAGS != 0,
-        Some(DevOp::AttentionF32) => i[6] & ATTENTION_I6 != 0,
+        Some(DevOp::AttentionF32) => i[6] & ATTENTION_I6 != 0 || ring_kv(op, i),
+        Some(DevOp::StreamTailF32) => ring_kv(op, i),
         Some(DevOp::LayerNormF32) => i[2] & LAYER_NORM_I2 != 0,
         Some(DevOp::GemvF32Out) => i[7] & GEMV_F32_OUT_I7 != 0,
         _ => false,
@@ -54,7 +68,9 @@ pub fn required_layout(insts: impl IntoIterator<Item = (u16, u32, [u32; 8])>) ->
         .into_iter()
         .filter_map(|(op, j1, i)| {
             protected(op, j1, &i).then(|| {
-                if (op == DevOp::LayerNormF32 as u16 && i[2] & 8 != 0)
+                if ring_kv(op, &i) {
+                    3
+                } else if (op == DevOp::LayerNormF32 as u16 && i[2] & 8 != 0)
                     || (op == DevOp::GemvF32Out as u16 && i[7] & 0x6000 != 0)
                 {
                     2
@@ -91,9 +107,9 @@ pub fn refuse_on_decode_objects<'a>(
     }
 }
 
-/// What an emit declares: [`LAYOUT`] when an instruction sets a protected bit, else nothing.
+/// The baseline object layout; ring programs use [`required_layout`].
 pub fn declare(used: Option<u16>) -> Option<u32> {
-    used.map(|_| LAYOUT)
+    used.map(|_| DEFAULT_LAYOUT)
 }
 
 /// Whether the instructions an object runs, whose first protected use is `used`, from a packet
@@ -135,6 +151,35 @@ mod tests {
         let mut i = [0; 8];
         i[slot] = v;
         (op as u16, j1, i)
+    }
+
+    #[test]
+    fn ring_modes_need_layout_three_without_reassigning_old_fields() {
+        assert_eq!(
+            required_layout([inst(DevOp::AttentionF32, 0, 6, 9 | (250 << 16))]),
+            None
+        );
+        assert_eq!(
+            required_layout([inst(DevOp::AttentionF32, 0, 6, 128)]),
+            Some(1)
+        );
+        assert_eq!(
+            required_layout([inst(DevOp::AttentionF32, 0, 6, 0x109 | (250 << 16))]),
+            Some(3)
+        );
+        for mode in [0, 1] {
+            assert_eq!(
+                required_layout([inst(DevOp::StreamTailF32, 0, 7, mode)]),
+                None
+            );
+        }
+        for mode in [2, 3] {
+            let i = inst(DevOp::StreamTailF32, 0, 7, mode);
+            assert_eq!(required_layout([i]), Some(3));
+            assert!(check(Some(3), first_protected([i]), Some(2)).is_err());
+            assert!(check(Some(3), first_protected([i]), Some(3)).is_ok());
+        }
+        assert_eq!(declare(Some(DevOp::AttentionF32 as u16)), Some(2));
     }
 
     /// Every bit the layout-0 (RC9, 45e1da259) emitters could set stays unprotected. The values
@@ -270,7 +315,7 @@ mod tests {
             assert!(e.contains("re-emit"), "{e}");
         }
         assert_eq!(declare(None), None);
-        assert_eq!(declare(conv), Some(LAYOUT));
+        assert_eq!(declare(conv), Some(DEFAULT_LAYOUT));
     }
 
     #[test]

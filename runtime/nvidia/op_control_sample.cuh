@@ -148,16 +148,17 @@ extern "C" __global__ void control_sample(
         *scratch = 0;
     }
     __syncthreads();
-    // Ascending class scan preserves the controller's strict-greater tie rule.
+    unsigned long long best = 0;
+    for (unsigned i = threadIdx.x; i < stop; i += blockDim.x) if (p[i] > 0) {
+        const auto h = cs_mix(cs_mix(c.seed ^ ((unsigned long long)s.ticks << 32)) ^ i);
+        const float u = __fmul_rn(__fadd_rn((float)(h >> 40), .5f), 0x1p-24f);
+        const float score = __fsub_rn(logf(p[i]), logf(-logf(u)));
+        // The shared helper normalizes signed zero and breaks ties at the lowest class.
+        if (score > -INFINITY) best = max(best, f32_key(score, i));
+    }
+    best = block_max_u64(best, keys);
     if (threadIdx.x == 0) {
-        float best = -INFINITY;
-        unsigned code = 0;
-        for (unsigned i = 0; i < stop; i++) if (p[i] > 0) {
-            const auto h = cs_mix(cs_mix(c.seed ^ ((unsigned long long)s.ticks << 32)) ^ i);
-            const float u = __fmul_rn(__fadd_rn((float)(h >> 40), .5f), 0x1p-24f);
-            const float score = __fsub_rn(logf(p[i]), logf(-logf(u)));
-            if (score > best) { best = score; code = i; }
-        }
+        const unsigned code = best ? ~(unsigned)best : 0u;
         ++s.ticks;
         for (unsigned i = 1; i < c.penalty_window; i++) s.recent[i - 1] = s.recent[i];
         if (c.penalty_window) s.recent[c.penalty_window - 1] = code;

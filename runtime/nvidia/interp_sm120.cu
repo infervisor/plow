@@ -1308,6 +1308,14 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SP
  * offered: the view addressing cost the M >= 40 rungs ~25 % with the view off, so a view packet is refused;
  * bit 1: AttentionF32 query view (flag bit 6); bit 2: f16 LayerNorm / projection operands. */
 #if PLOW_NV_SPEECH
+#if defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
+#if defined(PLOW_NV_HOPPER)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 14u;
+#else
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 10u;
+#endif
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 3u;
+#else
 #if defined(PLOW_NV_HOPPER)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 6u;
 #else
@@ -1316,6 +1324,7 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 2u;
 /* The speech-op flag layout this object reads (plow_asset::speech_flag_layout::LAYOUT): a packet
  * layout 2 preserves layout 1 meanings and also accepts its packets. */
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 2u;
+#endif
 #endif
 #if PLOW_PACKET_HASH != 0ull
 extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_lo) =

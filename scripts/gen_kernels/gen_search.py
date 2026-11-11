@@ -439,7 +439,7 @@ def build_current(spec, a):
     cmd = [os.environ.get("PLOW_NVCC", "nvcc"), "-shared", "-Xcompiler", "-fPIC", *lib["flags"],
            lib["src"], "-o", str(out)]
     print(shlex.join(cmd), flush=True)
-    subprocess.run(cmd, cwd=REPO, check=True)
+    subprocess.run(cmd, cwd=REPO, env={**os.environ, "TMPDIR": str(out.parent)}, check=True)
     print(out)
 
 
