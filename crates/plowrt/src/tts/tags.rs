@@ -392,6 +392,21 @@ fn duration(s: &str) -> Option<u32> {
     Some((v * mul).min(3000.0).round() as u32)
 }
 
+fn rate_factor(value: Option<&str>) -> Result<f32, String> {
+    Ok(match value {
+        Some("x-slow") => 0.5,
+        Some("slow") => 0.75,
+        Some("fast") => 1.25,
+        Some("x-fast") => 1.5,
+        Some("medium" | "default") | None => 1.0,
+        Some(v) => v
+            .strip_suffix('%')
+            .and_then(|s| s.parse::<f32>().ok())
+            .map(|n| n / 100.0)
+            .ok_or_else(|| "invalid prosody rate".to_string())?,
+    })
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Report {
     pub active: bool,
@@ -434,7 +449,7 @@ pub struct Rendered<'a> {
 fn resolve<'a>(map: &'a SpeechTags, name: &str, lang: Option<&str>) -> Option<&'a Entry> {
     let mut e = map.tags.get(name)?;
     loop {
-        if !e.langs.is_empty() && !lang.is_some_and(|l| e.langs.iter().any(|v| v == l)) {
+        if !e.langs.allows(lang) {
             return None;
         }
         match e.alias.as_deref() {
@@ -471,6 +486,7 @@ pub fn render<'a>(
     parser.push(text, &map.syntax);
     let mut current = String::with_capacity(text.len());
     let mut added = BTreeSet::new();
+    let mut gap = false;
     for span in parser.finish() {
         match span {
             Span::Text(t) => {
@@ -478,9 +494,22 @@ pub fn render<'a>(
                 for (from, to) in &map.literal_rewrite {
                     t = t.replace(from, to);
                 }
+                let t = if gap
+                    && (current.ends_with(char::is_whitespace)
+                        || current.is_empty()
+                            && !matches!(out.parts.last(), Some(Part::Native { .. })))
+                {
+                    t.trim_start()
+                } else {
+                    t.as_str()
+                };
                 current.push_str(&t.replace("<|", "< |"));
+                if !t.is_empty() {
+                    gap = false;
+                }
             }
             Span::Tag { name, value, raw } => {
+                let mut gap_after = true;
                 let e = resolve(map, &name, lang);
                 let supported = e.is_some_and(|e| {
                     e.text.is_some()
@@ -496,24 +525,36 @@ pub fn render<'a>(
                     if e.reject == Some(true) {
                         return Err(format!("rejected tag {name:?}"));
                     }
-                    if let Some(t) = &e.text {
+                    if let Some(t) = e.native_text(lang) {
                         if !current.is_empty() {
                             out.parts.push(Part::Text(
                                 std::mem::take(&mut current).replace("<|", "< |"),
                             ));
                         }
                         out.parts.push(Part::Native {
-                            text: t.clone(),
+                            text: t.to_owned(),
                             carry: e.carry,
                         });
+                        gap_after = false;
                     }
                     if let Some(i) = &e.instruction {
+                        let instruction = if i.contains("{value}") {
+                            let factor = rate_factor(value.as_deref())?;
+                            if !(super::stretch::MIN_SPEED..=super::stretch::MAX_SPEED)
+                                .contains(&factor)
+                            {
+                                return Err("tag rate exceeds speed limits".into());
+                            }
+                            Cow::Owned(i.replace("{value}", value.as_deref().unwrap_or("medium")))
+                        } else {
+                            Cow::Borrowed(i.as_str())
+                        };
                         if added.insert(i.as_str()) {
                             let dst = out.instructions.get_or_insert_with(String::new);
                             if !dst.is_empty() {
                                 dst.push(' ');
                             }
-                            dst.push_str(i);
+                            dst.push_str(&instruction);
                             if dst.chars().count() > super::MAX_INPUT_CHARS {
                                 return Err("tag instructions exceed input limit".into());
                             }
@@ -533,20 +574,10 @@ pub fn render<'a>(
                             ));
                         }
                         out.parts.push(Part::Silence(ms));
+                        gap_after = false;
                     }
                     if e.speed == Some(true) {
-                        let factor = match value.as_deref() {
-                            Some("x-slow") => 0.5,
-                            Some("slow") => 0.75,
-                            Some("fast") => 1.25,
-                            Some("x-fast") => 1.5,
-                            Some("medium" | "default") | None => 1.0,
-                            Some(v) => v
-                                .strip_suffix('%')
-                                .and_then(|s| s.parse::<f32>().ok())
-                                .map(|n| n / 100.0)
-                                .ok_or_else(|| "invalid prosody rate".to_string())?,
-                        };
+                        let factor = rate_factor(value.as_deref())?;
                         let speed = out.speed * factor;
                         if !(super::stretch::MIN_SPEED..=super::stretch::MAX_SPEED).contains(&speed)
                         {
@@ -563,6 +594,7 @@ pub fn render<'a>(
                                 raw = raw.replace(f, t);
                             }
                             current.push_str(&raw);
+                            gap_after = false;
                         }
                         Unknown::Passthrough => {
                             if !name.is_empty()
@@ -581,6 +613,7 @@ pub fn render<'a>(
                                     carry: false,
                                 });
                                 applied = true;
+                                gap_after = false;
                             }
                         }
                         Unknown::Strip => {}
@@ -594,8 +627,12 @@ pub fn render<'a>(
                     },
                     &name,
                 );
+                gap = gap_after;
             }
         }
+    }
+    if gap {
+        current.truncate(current.trim_end().len());
     }
     if !current.is_empty() {
         out.parts.push(Part::Text(current.replace("<|", "< |")));
@@ -626,10 +663,10 @@ mod tests {
     fn parser_shapes_and_unicode() {
         let m = map();
         for (input, expected) in [
-            ("[laughs] Hello.", " Hello."),
-            ("*laughs* नमस्ते।", " नमस्ते।"),
-            ("[warm, casual, friendly] Hello", " Hello"),
-            ("[conversational] Hello", " Hello"),
+            ("[laughs] Hello.", "Hello."),
+            ("*laughs* नमस्ते।", "नमस्ते।"),
+            ("[warm, casual, friendly] Hello", "Hello"),
+            ("[conversational] Hello", "Hello"),
             ("<speak><em>Hello</em><!-- note --></speak>", "Hello"),
             ("<express-as style=\"excited\">Hello</express-as>", "Hello"),
             ("<emotion name='sad'>Hello</emotion>", "Hello"),
@@ -708,6 +745,48 @@ mod tests {
             let auto = render(Some(&map), text, Mode::Auto, None, None, 1.0).unwrap();
             assert_eq!(auto.input, text);
             assert!(matches!(auto.input, Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn removed_controls_do_not_add_encoder_whitespace() {
+        let mut m = map();
+        for (input, expected) in [
+            ("[laughs] [laughs] 今天。", "今天。"),
+            ("नमस्ते। [laughs] [laughs] फिर मिलेंगे।", "नमस्ते। फिर मिलेंगे।"),
+            ("[calm] Hello [laughs]", "Hello"),
+            ("Hello  [laughs] there", "Hello  there"),
+            ("[laughs] Hello  there", "Hello  there"),
+        ] {
+            let r = render(Some(&m), input, Mode::Auto, None, None, 1.0).unwrap();
+            assert_eq!(r.input, expected);
+            assert_eq!(r.segments(128, str::to_owned).0[0].text, expected);
+        }
+        for input in [
+            "  (laughs) Hello  ",
+            "{laughs}  Hello",
+            "*ordinary  words* Hello",
+        ] {
+            let auto = render(Some(&m), input, Mode::Auto, None, None, 1.0).unwrap();
+            let off = render(Some(&m), input, Mode::Off, None, None, 1.0).unwrap();
+            assert_eq!(auto.input, off.input);
+            assert_eq!(
+                auto.segments(128, str::to_owned),
+                off.segments(128, str::to_owned)
+            );
+        }
+        m.tags.insert(
+            "laugh".into(),
+            serde_json::from_str(r#"{"text":"(laugh)"}"#).unwrap(),
+        );
+        for input in [
+            "[laughs] Hello",
+            "[laughs][calm] Hello",
+            "[laughs] [calm] Hello",
+        ] {
+            let r = render(Some(&m), input, Mode::Auto, None, None, 1.0).unwrap();
+            assert_eq!(r.input, "(laugh) Hello");
+            assert_eq!(r.segments(128, str::to_owned).0[0].native[0].range, 0..7);
         }
     }
 
@@ -965,6 +1044,84 @@ mod tests {
         assert!(forwarded.report.dropped.is_empty());
         m.unknown = Unknown::Reject;
         assert!(render(Some(&m), "[unlisted]Hi", Mode::Auto, None, None, 1.0).is_err());
+    }
+
+    #[test]
+    fn native_language_forms_and_rate_instructions_are_packet_data() {
+        let mut map = SpeechTags::strip();
+        map.tags.insert(
+            "laugh".into(),
+            serde_json::from_str(r#"{"text":"(laugh)","langs":{"en":"(laugh)","zh":"[笑]"}}"#)
+                .unwrap(),
+        );
+        map.tags.insert(
+            "rate".into(),
+            serde_json::from_str(r#"{"instruction":"Speak at a {value} rate."}"#).unwrap(),
+        );
+        map.validate_binding(true, |_| true).unwrap();
+        for (lang, expected) in [("en", "(laugh)Hello"), ("zh", "[笑]Hello")] {
+            let r = render(
+                Some(&map),
+                "[laughs]Hello",
+                Mode::Strict,
+                Some(lang),
+                None,
+                1.0,
+            )
+            .unwrap();
+            assert_eq!(r.input, expected);
+            assert_eq!(r.report.applied, ["laugh"]);
+        }
+        let r = render(
+            Some(&map),
+            "[laughs]नमस्ते",
+            Mode::Auto,
+            Some("hi"),
+            None,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(r.input, "नमस्ते");
+        assert_eq!(r.report.dropped, ["laugh"]);
+        assert!(render(
+            Some(&map),
+            "[laughs]नमस्ते",
+            Mode::Strict,
+            Some("hi"),
+            None,
+            1.0
+        )
+        .is_err());
+        let text = "<prosody rate='slow'>Hello</prosody><prosody rate='slow'> again</prosody>";
+        let r = render(
+            Some(&map),
+            text,
+            Mode::Auto,
+            Some("en"),
+            Some("Use a clear voice."),
+            1.14,
+        )
+        .unwrap();
+        assert_eq!(
+            r.instructions.as_deref(),
+            Some("Use a clear voice. Speak at a slow rate.")
+        );
+        assert_eq!(r.input, "Hello again");
+        assert_eq!(r.speed, 1.14);
+        for value in ["NaN%", "inf%", "-10%", "300%", "<|event|>"] {
+            assert!(
+                render(
+                    Some(&map),
+                    &format!("<prosody rate='{value}'>Hi</prosody>"),
+                    Mode::Auto,
+                    None,
+                    None,
+                    1.0
+                )
+                .is_err(),
+                "{value}"
+            );
+        }
     }
 
     #[test]

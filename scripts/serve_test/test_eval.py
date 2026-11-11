@@ -142,7 +142,8 @@ class TtsCaptureTests(unittest.TestCase):
     def test_bad_reference_inputs_fail_before_any_request(self):
         for extra in [dict(ref_audio_path="missing.wav"), dict(ref_audio_path=""),
                       dict(ref_audio_path=42), dict(ref_text=""),
-                      dict(non_streaming_mode="false")]:
+                      dict(non_streaming_mode="false"), dict(reference_language=""),
+                      dict(reference_language=42)]:
             cases = self.cases(1)
             cases[0].update(extra)
             self.manifest.write_text(json.dumps(cases))
@@ -150,6 +151,21 @@ class TtsCaptureTests(unittest.TestCase):
                 with self.assertRaises((OSError, ValueError)):
                     evaluation.capture_tts(self.args, "model", self.root)
                 call.assert_not_called()
+
+    def test_asr_language_is_independent_of_request_language(self):
+        cases = self.cases(2)
+        cases[0].update(reference_language="hi")
+        cases[1].update(language="english", reference_language="en")
+        self.manifest.write_text(json.dumps(cases))
+        with mock.patch.object(evaluation, "call", return_value=(200, wav(b"\0\0" * 4))) as call:
+            directory, rows = evaluation.capture_tts(self.args, "model", self.root)
+        bodies = [c.args[2] for c in call.call_args_list]
+        by_seed = {b["seed"]: b for b in bodies}
+        self.assertNotIn("language", by_seed[1])
+        self.assertEqual(by_seed[2]["language"], "english")
+        self.assertTrue(all("reference_language" not in b for b in bodies))
+        texts = json.loads((Path(directory) / "texts.json").read_text())
+        self.assertEqual([texts[f"{i:04d}.wav"]["language"] for i in range(2)], ["hi", "en"])
 
     def test_tag_controls_clean_reference_and_expected_errors(self):
         self.args.voice = "override"
