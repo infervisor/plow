@@ -4,13 +4,24 @@ use std::collections::BTreeSet;
 use plow_asset::speech_tags::{Asterisk, Entry, Markers, SpeechTags, Unknown};
 use serde::Deserialize;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Mode {
     #[default]
     Auto,
     Strict,
     Off,
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match serde_json::Value::deserialize(deserializer)?.as_str() {
+                Some("strict") => Self::Strict,
+                Some("off") => Self::Off,
+                _ => Self::Auto,
+            },
+        )
+    }
 }
 
 pub fn bypass(text: &str) -> bool {
@@ -1254,7 +1265,10 @@ mod tests {
         assert!(load(&p).is_err());
         p.strings.remove("text.tags");
         assert!(load(&p).is_err());
-        assert!(serde_json::from_str::<Mode>(r#""anything""#).is_err());
+        assert_eq!(
+            serde_json::from_str::<Mode>(r#""anything""#).unwrap(),
+            Mode::Auto
+        );
     }
 
     #[test]

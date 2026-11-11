@@ -3459,10 +3459,28 @@ mod tests {
             .unwrap();
             assert_eq!(req.tags, expected);
         }
-        assert!(serde_json::from_value::<SpeechRequest>(
-            serde_json::json!({"model":"m","voice":"v","input":"Hello","tags":"unknown"})
-        )
-        .is_err());
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("bogus"),
+            serde_json::json!(7),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(true),
+            serde_json::json!(-7),
+            serde_json::json!(1.5),
+            serde_json::json!([{"nested": [null, "strict"]}]),
+            serde_json::json!({"nested": [null, "off"]}),
+        ] {
+            let req: SpeechRequest = serde_json::from_value(
+                serde_json::json!({"model":"m","voice":"v","input":"Hello","tags":value}),
+            )
+            .unwrap();
+            assert_eq!(req.tags, Mode::Auto);
+        }
+        let req: SpeechRequest =
+            serde_json::from_value(serde_json::json!({"model":"m","voice":"v","input":"Hello"}))
+                .unwrap();
+        assert_eq!(req.tags, Mode::Auto);
         let mut response = Response::new(Body::empty());
         stamp_tags(&mut response, &Report::default());
         assert!(!response.headers().contains_key("x-plow-tags-applied"));
