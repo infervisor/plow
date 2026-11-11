@@ -1235,6 +1235,78 @@ mod tests {
     }
 
     #[test]
+    fn carried_tags_cannot_restore_special_token_openers() {
+        let mut m = map();
+        m.tags.insert(
+            "calm".into(),
+            Entry {
+                text: Some("<".into()),
+                carry: true,
+                ..Entry::default()
+            },
+        );
+        m.validate().unwrap();
+        let r = render(
+            Some(&m),
+            "[calm]Hello. |event|>",
+            Mode::Auto,
+            None,
+            None,
+            1.0,
+        )
+        .unwrap();
+        let (pieces, tail) = r.segments(12, str::to_owned);
+        assert_eq!(tail, None);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[1].text, "< |event|>");
+        assert_eq!(pieces[1].native[0].range, 0..1);
+        assert!(pieces.iter().all(|p| !p.text.contains("<|")));
+        let text = TextSegment {
+            text: "<Hello. |event|>".into(),
+            native: vec![Native {
+                range: 0..1,
+                carry: true,
+            }],
+            pause_before: None,
+        };
+        let halves = split_at(&text, 8).unwrap();
+        assert_eq!(halves[1].text, "< |event|>");
+        assert_eq!(halves[1].native[0].range, 0..1);
+        #[cfg(feature = "hf-tokenizer")]
+        {
+            let model = tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab([("[UNK]".into(), 0)].into_iter().collect())
+                .unk_token("[UNK]".into())
+                .build()
+                .unwrap();
+            let mut tokenizer = tokenizers::Tokenizer::new(model);
+            tokenizer
+                .add_special_tokens([tokenizers::AddedToken::from("<|event|>", true)])
+                .unwrap();
+            let id = tokenizer.token_to_id("<|event|>").unwrap();
+            assert_eq!(
+                tokenizer.encode("<|event|>", false).unwrap().get_ids(),
+                &[id]
+            );
+            for part in pieces.iter().chain(&halves) {
+                assert!(!tokenizer
+                    .encode(part.text.as_str(), false)
+                    .unwrap()
+                    .get_ids()
+                    .contains(&id));
+            }
+        }
+        let off = render(Some(&m), "<|event|>", Mode::Off, None, None, 1.0).unwrap();
+        assert_eq!(off.segments(128, str::to_owned).0[0].text, "<|event|>");
+        let literal = TextSegment {
+            text: "Hello. <|event|>".into(),
+            native: Vec::new(),
+            pause_before: None,
+        };
+        assert_eq!(split_at(&literal, 7).unwrap()[1].text, "<|event|>");
+    }
+
+    #[test]
     fn packet_tag_version_is_required_and_fail_closed() {
         let mut p = plow_asset::packet_pipeline::PacketPipeline {
             name: "speech".into(),
@@ -1485,6 +1557,9 @@ pub fn segment(text: &str, max: usize, native: &[Native]) -> Vec<TextSegment> {
                 active.push(t);
             }
         }
+        if text_out[..prefix].contains('<') {
+            neutralize(&mut text_out, &mut spans);
+        }
         if !body.is_empty() {
             out.push(TextSegment {
                 text: text_out,
@@ -1689,6 +1764,7 @@ pub fn split_at(text: &TextSegment, at: usize) -> Option<[TextSegment; 2]> {
                 carried.push(t);
             }
         }
+        let prefix_needs_check = prefix.contains('<');
         for n in &mut right.native {
             n.range.start += prefix.len();
             n.range.end += prefix.len();
@@ -1697,6 +1773,9 @@ pub fn split_at(text: &TextSegment, at: usize) -> Option<[TextSegment; 2]> {
         prefix.push_str(&right.text);
         right.text = prefix;
         right.native = spans;
+        if prefix_needs_check {
+            neutralize(&mut right.text, &mut right.native);
+        }
     }
     (left.text.len() < text.text.len() && right.text.len() < text.text.len())
         .then_some([left, right])
