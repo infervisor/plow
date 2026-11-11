@@ -1305,7 +1305,7 @@ fn rung_overrides_are_pinned_by_digest_and_sorted() {
 /// five Xeon recipes were refused outright for declaring `vendor = "intel"`
 /// beside `isa = "amx"`, which is the correct declaration for a CPU part.
 #[test]
-fn every_recipe_in_the_tree_is_readable() {
+fn every_recipe_in_the_tree_is_readable_or_needs_a_speech_policy() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recipes");
     if !root.is_dir() {
         eprintln!("skipped: {} is not present", root.display());
@@ -1329,6 +1329,7 @@ fn every_recipe_in_the_tree_is_readable() {
         plow_git: None,
         toolchain: Some("rocm-7.14.0-nix"),
     };
+    let mut speech_migrations = 0;
     let refused: Vec<String> = files
         .iter()
         .filter_map(|p| match read_recipe(p, over) {
@@ -1338,12 +1339,20 @@ fn every_recipe_in_the_tree_is_readable() {
             // carried by the distribution (`local:`, `pip:`, a re-keyed
             // local file set) was never packable; the rule only names it now.
             Err(e) if e.to_string().contains("is not `hf:<org>/<repo>` or `dist`") => None,
+            Err(e) if e.to_string().contains("speech_tags: missing policy") => {
+                speech_migrations += 1;
+                None
+            }
             Err(e) => Some(format!(
                 "{}: {e}",
                 p.strip_prefix(&root).unwrap_or(p).display()
             )),
         })
         .collect();
+    assert_eq!(
+        speech_migrations, 19,
+        "2026-11-11 speech recipe migration inventory"
+    );
     assert!(
         refused.is_empty(),
         "{} of {} recipes cannot be packed:\n{}",
@@ -1830,4 +1839,27 @@ fn only_a_prepared_checkpoint_is_recorded_as_a_view() {
     assert_eq!(with("{out}/prep/lm"), ["checkpoint"]);
     assert!(with("{hf:maya-research/Veena}").is_empty());
     assert!(with("{env:CKPT}").is_empty());
+}
+
+#[test]
+fn speech_recipe_packing_requires_a_map_or_measured_waiver() {
+    let dir = tmp("speech-policy");
+    let source = format!("{MINIMAL}\n[bench]\nkind = \"speech\"\n");
+    let p = write_recipe(&dir, &source);
+    assert!(read_recipe(&p, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("speech_tags: missing policy"));
+    let waived = format!("{source}\n[speech_tags]\nversion = 1\nwaiver = \"CER 0.23 vs 0.01 at seed 7; frontend correction required\"\nevidence = [\"qualification/tag-ab.json\"]\n");
+    let p = write_recipe(&dir, &waived);
+    read_recipe(&p, Overrides::default()).unwrap();
+    let p = write_recipe(
+        &dir,
+        &waived.replace(
+            "evidence = [\"qualification/tag-ab.json\"]",
+            "evidence = []",
+        ),
+    );
+    assert!(read_recipe(&p, Overrides::default()).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
 }

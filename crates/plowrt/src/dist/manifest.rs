@@ -243,6 +243,9 @@ struct Recipe {
     #[serde(default)]
     sub_emit: Vec<RecipeSubEmit>,
     build: Option<RecipeBuild>,
+    speech_tags: Option<plow_asset::speech_tag_policy::SpeechTagPolicy>,
+    bench: Option<serde_json::Value>,
+    gates: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -371,6 +374,27 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
         std::fs::read_to_string(path).map_err(|e| bad(format!("{}: {e}", path.display())))?;
     let r: Recipe = toml::from_str(&text)
         .map_err(|e| bad(format!("{}: not a valid recipe: {e}", path.display())))?;
+    let speech = r
+        .bench
+        .as_ref()
+        .and_then(|v| v.get("kind"))
+        .and_then(|v| v.as_str())
+        == Some("speech")
+        || r.gates
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .is_some_and(|g| {
+                g.keys()
+                    .any(|k| k.starts_with("tts_cer") || k.starts_with("tts_tags"))
+            });
+    if speech && r.speech_tags.is_none() {
+        return Err(bad(
+            "speech_tags: missing policy (packing requires an emitted map or measured waiver)",
+        ));
+    }
+    if let Some(policy) = &r.speech_tags {
+        policy.validate().map_err(bad)?;
+    }
     let at = |what: &str| format!("{}: {what}", path.display());
 
     let name = r
