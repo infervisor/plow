@@ -122,7 +122,7 @@ namespace = "infervisor"
 name = "qwen3.8-27b"
 label = "sm90a-h100-tp1"
 status = "validated"
-plow_git = "b224f22feeed735bbd3b367a6f14591fdb191d8c"
+plow_git = "832f894af6302835a2539e3ea3fdc6e2bf6495fd"
 network = "qwen3.5"
 
 [target]
