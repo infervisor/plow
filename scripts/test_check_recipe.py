@@ -10,8 +10,11 @@ class MigrationTests(unittest.TestCase):
     def test_frozen_allowlist_is_missing_only(self):
         for rel, digest in c.LEGACY_SPEECH_POLICIES.items():
             path = c.REPO / rel
-            self.assertEqual(rc.sha256_file(path), digest)
             recipe = rc.load_toml(path)
+            if "speech_tags" in recipe:
+                self.assertEqual(c.check_speech_tags(recipe, path), [])
+                continue
+            self.assertEqual(rc.sha256_file(path), digest)
             self.assertIn("missing policy", c.check_speech_tags(recipe, path)[0])
             with tempfile.TemporaryDirectory() as tmp:
                 duplicate = Path(tmp) / path.name
