@@ -214,10 +214,26 @@ def speech_tag_map(value: dict) -> dict:
     return result
 
 
-def speech_tag_policy(recipe: dict) -> dict | None:
+def legacy_speech_tag_notice(recipe: dict, path: Path | None) -> str | None:
+    if "speech_tags" in recipe or not is_speech_recipe(recipe) or path is None:
+        return None
+    path = path.resolve()
+    if path.name == "recipe.toml" and (path.parent / "build-record.json").is_file():
+        record = load_json(path.parent / "build-record.json")
+        if record.get("recipe_snapshot") == path.name:
+            path = Path(record.get("recipe", "")).resolve()
+    inventory = load_json(Path(__file__).resolve().parents[1] / "crates/plow-asset/src/speech_tag_legacy.json")
+    for identity, date in inventory.items():
+        parts = Path(identity).parts
+        if path.parts[-len(parts):] == parts:
+            return f"speech_tags: legacy recipe without tag policy (grandfathered {date})"
+    return None
+
+
+def speech_tag_policy(recipe: dict, path: Path | None = None) -> dict | None:
     policy = recipe.get("speech_tags")
     if policy is None:
-        if is_speech_recipe(recipe):
+        if is_speech_recipe(recipe) and not legacy_speech_tag_notice(recipe, path):
             die("speech_tags: missing policy (declare the emitted map or a measured waiver)")
         return None
     if not isinstance(policy, dict) or set(policy) - {"version", "profile", "map", "waiver", "evidence", "native_sweep"}:
@@ -268,7 +284,7 @@ def speech_pipelines(packet: Path) -> list[dict]:
     return [p for p in metadata["pipelines"] if p.get("driver", "").startswith("tts.")]
 
 
-def check_packet_speech_tags(packet: Path, recipe: dict | None) -> list[tuple[str, str]]:
+def check_packet_speech_tags(packet: Path, recipe: dict | None, path: Path | None = None) -> list[tuple[str, str]]:
     pipelines = speech_pipelines(packet)
     if not pipelines:
         if recipe and is_speech_recipe(recipe):
@@ -276,7 +292,10 @@ def check_packet_speech_tags(packet: Path, recipe: dict | None) -> list[tuple[st
         return [("ok", "speech_tags: n/a (no speech pipeline)")]
     if recipe is None:
         die("speech_tags: speech packet needs its recipe (../recipe.toml)")
-    policy = speech_tag_policy(recipe)
+    notice = legacy_speech_tag_notice(recipe, path)
+    if notice:
+        return [("NOTICE", notice)]
+    policy = speech_tag_policy(recipe, path)
     if policy is None:
         die("speech_tags: speech packet needs a declared policy")
     if "waiver" in policy:

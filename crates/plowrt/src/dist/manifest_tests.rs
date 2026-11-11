@@ -1305,7 +1305,7 @@ fn rung_overrides_are_pinned_by_digest_and_sorted() {
 /// five Xeon recipes were refused outright for declaring `vendor = "intel"`
 /// beside `isa = "amx"`, which is the correct declaration for a CPU part.
 #[test]
-fn every_recipe_in_the_tree_is_readable_or_needs_a_speech_policy() {
+fn every_recipe_in_the_tree_is_readable() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recipes");
     if !root.is_dir() {
         eprintln!("skipped: {} is not present", root.display());
@@ -1338,8 +1338,6 @@ fn every_recipe_in_the_tree_is_readable_or_needs_a_speech_policy() {
             // carried by the distribution (`local:`, `pip:`, a re-keyed
             // local file set) was never packable; the rule only names it now.
             Err(e) if e.to_string().contains("is not `hf:<org>/<repo>` or `dist`") => None,
-            // The checker admits only the dated, unchanged migration inventory without a policy.
-            Err(e) if e.to_string().contains("speech_tags: missing policy") => None,
             Err(e) => Some(format!(
                 "{}: {e}",
                 p.strip_prefix(&root).unwrap_or(p).display()
@@ -1866,6 +1864,71 @@ fn validated_native_recipe_requires_its_sweep_reference() {
             .replace("laugh = { drop = true }", "laugh = { text = \"<laugh>\" }");
     let p = write_recipe(&dir, &source);
     assert!(read_recipe(&p, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("native_sweep"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn legacy_speech_recipe_identity_survives_edits_but_not_a_declared_policy() {
+    let dir = tmp("speech-legacy");
+    let path = dir.join("recipes/infervisor/maya2-native/sm90a-h100-tp1.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let source = format!("{MINIMAL}\n[bench]\nkind = \"speech\"\n");
+    for edit in ["", "\n# routine recipe edit\n"] {
+        std::fs::write(&path, format!("{source}{edit}")).unwrap();
+        read_recipe(&path, Overrides::default()).unwrap();
+        assert_eq!(
+            plow_asset::speech_tag_policy::legacy_notice(&path).as_deref(),
+            Some("speech_tags: legacy recipe without tag policy (grandfathered 2026-11-11)")
+        );
+    }
+    let unlisted = path.with_file_name("new.toml");
+    std::fs::write(&unlisted, &source).unwrap();
+    assert!(read_recipe(&unlisted, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("speech_tags: missing policy"));
+    let snapshot = dir.join("recipe.toml");
+    std::fs::write(&snapshot, &source).unwrap();
+    std::fs::write(
+        dir.join("build-record.json"),
+        serde_json::to_vec(&serde_json::json!({"recipe": dir.join("ri/infervisor/maya2-native/sm90a-h100-tp1.toml"), "recipe_snapshot": "recipe.toml"}))
+            .unwrap(),
+    )
+    .unwrap();
+    read_recipe(&snapshot, Overrides::default()).unwrap();
+    let policy = r#"
+[speech_tags]
+version = 1
+waiver = "TBD"
+"#;
+    std::fs::write(&path, format!("{source}{policy}")).unwrap();
+    assert!(read_recipe(&path, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("waiver"));
+    let policy = r#"
+[speech_tags]
+version = 1
+waiver = "CER 0.23 vs 0.01 at seed 7"
+evidence = ["tag-ab.json"]
+"#;
+    std::fs::write(&path, format!("{source}{policy}")).unwrap();
+    read_recipe(&path, Overrides::default()).unwrap();
+    let template =
+        include_str!("../../../../scripts/campaign/recipes/templates/speech-sm90a-default-on.toml");
+    std::fs::write(&path, template).unwrap();
+    read_recipe(&path, Overrides::default()).unwrap();
+    std::fs::write(
+        &path,
+        template
+            .replace("status = \"emits\"", "status = \"validated\"")
+            .replace("laugh = { drop = true }", "laugh = { text = \"<laugh>\" }"),
+    )
+    .unwrap();
+    assert!(read_recipe(&path, Overrides::default())
         .unwrap_err()
         .to_string()
         .contains("native_sweep"));

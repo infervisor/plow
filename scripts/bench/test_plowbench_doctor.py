@@ -38,6 +38,35 @@ class DoctorSpeechTests(unittest.TestCase):
             with self.assertRaises(rc.Fail):
                 rc.check_packet_speech_tags(path, waiver)
 
+    def test_legacy_notice_and_declared_policy_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            recipe_path = root / "recipes/infervisor/maya2-native/sm90a-h100-tp1.toml"
+            recipe_path.parent.mkdir(parents=True)
+            recipe_path.write_text('[bench]\nkind = "speech"\n')
+            recipe = rc.load_toml(recipe_path)
+            packet = root / "model.pkt"
+            write_packet(packet, [dict(name="speech", driver="tts.codec_lm.v2")])
+            notice = "speech_tags: legacy recipe without tag policy (grandfathered 2026-11-11)"
+            self.assertEqual(rc.check_packet_speech_tags(packet, recipe, recipe_path), [("NOTICE", notice)])
+            recipe["plow_git"] = "a" * 40
+            self.assertEqual(rc.check_packet_speech_tags(packet, recipe, recipe_path), [("NOTICE", notice)])
+            with self.assertRaisesRegex(rc.Fail, "missing policy"):
+                rc.check_packet_speech_tags(packet, recipe, recipe_path.with_name("new.toml"))
+            snapshot = root / "recipe.toml"
+            snapshot.write_text(recipe_path.read_text())
+            (root / "build-record.json").write_text(json.dumps(dict(recipe=str(root / "ri/infervisor/maya2-native/sm90a-h100-tp1.toml"), recipe_snapshot="recipe.toml")))
+            self.assertEqual(rc.check_packet_speech_tags(packet, recipe, snapshot), [("NOTICE", notice)])
+            recipe["speech_tags"] = dict(version=1, profile="test", map=rc.default_speech_tag_map())
+            with self.assertRaisesRegex(rc.Fail, "emitted text.tags"):
+                rc.check_packet_speech_tags(packet, recipe, recipe_path)
+            pipeline = dict(name="speech", driver="tts.codec_lm.v2", parameters={"text.tags_version": 1},
+                            strings={"text.tags": json.dumps(recipe["speech_tags"]["map"])})
+            write_packet(packet, [pipeline])
+            self.assertEqual(rc.check_packet_speech_tags(packet, recipe, recipe_path)[0][0], "ok")
+        shell = Path(__file__).with_name("plowbench-doctor.sh").read_text()
+        self.assertIn("NOTICE) printf", shell)
+
     def test_non_speech_and_shell_wiring(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "model.pkt"

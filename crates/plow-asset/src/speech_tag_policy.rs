@@ -60,9 +60,60 @@ impl SpeechTagPolicy {
     }
 }
 
+pub fn legacy_notice(path: &std::path::Path) -> Option<String> {
+    let mut path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if path.file_name().is_some_and(|s| s == "recipe.toml") {
+        let record = std::fs::read(path.with_file_name("build-record.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        if let Some(record) = record {
+            if record["recipe_snapshot"] == "recipe.toml" {
+                path = std::path::PathBuf::from(record["recipe"].as_str()?);
+                path = path.canonicalize().unwrap_or(path);
+            }
+        }
+    }
+    let inventory: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(include_str!("speech_tag_legacy.json"))
+            .expect("legacy recipe inventory");
+    inventory.into_iter().find_map(|(identity, date)| {
+        path.ends_with(&identity).then(|| {
+            format!("speech_tags: legacy recipe without tag policy (grandfathered {date})")
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_inventory_has_dated_recipe_identities() {
+        let inventory: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(include_str!("speech_tag_legacy.json")).unwrap();
+        assert!(!inventory.is_empty());
+        for (identity, date) in inventory {
+            assert!(
+                identity.starts_with("infervisor/")
+                    || identity.starts_with("scripts/campaign/recipes/")
+            );
+            assert!(identity.ends_with(".toml"));
+            assert!(!identity.contains(".."));
+            chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap();
+            assert_eq!(
+                legacy_notice(std::path::Path::new(&identity)),
+                Some(format!(
+                    "speech_tags: legacy recipe without tag policy (grandfathered {date})"
+                ))
+            );
+            assert!(legacy_notice(
+                std::path::Path::new(&identity)
+                    .with_extension("new.toml")
+                    .as_path()
+            )
+            .is_none());
+        }
+    }
 
     #[test]
     fn map_or_measured_waiver() {

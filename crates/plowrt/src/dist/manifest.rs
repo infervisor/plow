@@ -388,9 +388,13 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
                     .any(|k| k.starts_with("tts_cer") || k.starts_with("tts_tags"))
             });
     if speech && r.speech_tags.is_none() {
-        return Err(bad(
-            "speech_tags: missing policy (packing requires an emitted map or measured waiver)",
-        ));
+        if let Some(notice) = plow_asset::speech_tag_policy::legacy_notice(path) {
+            eprintln!("{notice}");
+        } else {
+            return Err(bad(
+                "speech_tags: missing policy (packing requires an emitted map or measured waiver)",
+            ));
+        }
     }
     if let Some(policy) = &r.speech_tags {
         policy.validate().map_err(bad)?;

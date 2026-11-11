@@ -54,6 +54,41 @@ class SpeechCampaignTests(unittest.TestCase):
             self.assertEqual(len(make_cases(cfg)), 66)
             self.assertFalse(campaign.gate_score("tts_tags", {"config": cfg}, Path(a.out) / "tts_tags")["pass"])
 
+    def test_legacy_gate_preserves_cer_and_skips_tag_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = self.fixture(root)
+            recipe = root / "recipes/infervisor/maya2-native/sm90a-h100-tp1.toml"
+            recipe.parent.mkdir(parents=True)
+            r = rc.load_toml(Path(a.recipe))
+            del r["speech_tags"]
+            r["gates"]["tts_tags"] = {}
+            a.recipe = str(recipe)
+            for changed in (False, True):
+                if changed:
+                    r["plow_git"] = "a" * 40
+                    r["gates"]["tts_cer"]["cer_median_max"] = .07
+                recipe.write_text(to_toml(r))
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.run_quiet(a)
+                self.assertEqual(stderr.getvalue().count("speech_tags: legacy recipe without tag policy (grandfathered 2026-11-11)"), 1)
+                run = (Path(a.out) / "run.sh").read_text()
+                self.assertIn("asr_check.py", run)
+                self.assertNotIn("--tts-tag-config", run)
+                self.assertNotIn("--tag-capture", run)
+                self.assertFalse((Path(a.out) / "tts_tags").exists())
+            a.recipe = str(recipe.with_name("new.toml"))
+            Path(a.recipe).write_text(to_toml(r))
+            with self.assertRaisesRegex(rc.Fail, "missing policy"):
+                self.run_quiet(a)
+            a.recipe = str(recipe)
+            r["speech_tags"] = dict(version=1, profile="test", map=rc.default_speech_tag_map())
+            recipe.write_text(to_toml(r))
+            write_packet(Path(a.assets) / "model.pkt", [dict(name="speech", driver="tts.codec_lm.v2")])
+            with self.assertRaisesRegex(rc.Fail, "emitted text.tags"):
+                self.run_quiet(a)
+
     def test_suffixed_tag_gate_keeps_existing_campaign_convention(self):
         with tempfile.TemporaryDirectory() as tmp:
             a = self.fixture(Path(tmp))

@@ -129,42 +129,10 @@ def check_capabilities(recipe: dict) -> None:
         need(not UNMEASURED.search(reason), f"capabilities: {name}: an unmeasured route is not a waiver ({reason!r})")
 
 
-# Frozen 2026-11-11 migration inventory. This waives only a missing declaration, never packet checks.
-LEGACY_SPEECH_POLICIES = {
-    "recipes/infervisor/breeze-tts-2/sm90a-h100-tp1.toml": "6c9847cafc2b5ba32adeeaee01aa1fa48f09b8748bf4ac23c7131fe7b09daec8",
-    "recipes/infervisor/chatterbox/sm89-l4-tp1.toml": "0e5de327c636b1a29027bb00094c62f715978fd4e80cd49ca3a209305b91e0dc",
-    "recipes/infervisor/chatterbox/sm89-l40s-tp1.toml": "3cf51647e7a3008967a71c7f21fdab7fcbeffc4c777d14eb28a62f1fce861aef",
-    "recipes/infervisor/chatterbox/sm90a-h100-tp1.toml": "879c8baa059e5fced40b03a31c425ef219da21f5ca05df0b7d162b2d35537a8a",
-    "recipes/infervisor/chatterbox-mtl/sm89-l4-tp1.toml": "96353ba9af6d48385aed5fef1a5f8ff0dd08cb45e8852c56374dac09541ff62e",
-    "recipes/infervisor/chatterbox-mtl/sm89-l40s-tp1.toml": "d42d2ef25118d0a8317097b370bcf5d10aaafec157ed4dfa5031bb0afdde92b2",
-    "recipes/infervisor/chatterbox-mtl/sm90a-h100-tp1.toml": "799e184567ccfd5fba80a7feefac9d06d4f126e8e3b70d000a31988a5f4feba6",
-    "recipes/infervisor/fish-s2-pro/sm89-l4-tp1.toml": "38fdc6b98ec24247e4f759631476b14273ab20737c8ef9856baa18ff34b3ced1",
-    "recipes/infervisor/fish-s2-pro/sm90a-h100-tp1.toml": "76f55425c8107f83b854bc0dfd304c8324746a8b80f85adaf6ad40fbd7277a0e",
-    "recipes/infervisor/maya2-native/sm89-l4-tp1.toml": "7b31f9bb5a0ad67be0b50fe51bec37d9bbdd6574a0b26931ea97f2038e435ece",
-    "recipes/infervisor/maya2-native/sm89-l40s-tp1.toml": "3c24e536ececac806c553d331cfdd624f90c96c40554bf19221f87da0ee6ac3a",
-    "recipes/infervisor/maya2-native/sm90a-h100-tp1.toml": "a97fcf25d65d58360b1ef10f40351ca388ec9ffb8017c6110a6dcc36ea770575",
-    "recipes/infervisor/orpheus/sm89-l4-tp1.toml": "80cc5d22d4d127bcc8b076b0094f421d0744b04641ec476bf87472db38a929b7",
-    "recipes/infervisor/orpheus/sm89-l40s-tp1.toml": "8b9c8bf94df327204f69a7a386a81e230fbc65c9d70707f11a61a8e0b6c8c28a",
-    "recipes/infervisor/orpheus/sm90a-h100-tp1.toml": "9ffb5e020438b68b0607ac6d3035d117fda5722c4b5bc53c69e02086906489d8",
-    "recipes/infervisor/qwen3-tts-1.7b-customvoice/sm90a-h100-tp1-bf16.toml": "1384c491a5c2c608487764060f49e2a2ae40c99e87337088d2111731afb3d40b",
-    "recipes/infervisor/veena/sm89-l4-tp1.toml": "6046298fe7b1f71c93f98fef78782d47d2310d4afbc4b5fa77b5914ffa35f1e2",
-    "recipes/infervisor/veena/sm89-l40s-tp1.toml": "207f7d5874ce2c6dd155d8331beee75bdc55db56675c81aea1bb3b87d13d44d7",
-    "recipes/infervisor/veena/sm90a-h100-tp1.toml": "9576afb5b59615452d649dbf0594a1817a26bc8ae4061fc90ea0024f356d98b2",
-    "scripts/campaign/recipes/chatterbox.h100.s3gen-split-a.toml": "3d9a31e71fa1fb52ce048efcfbb9d5baf8f8fc9abaf00675241d7e3e7a89676e",
-    "scripts/campaign/recipes/qwen3-tts-1.7b-base.h100.bf16-clone.toml": "7b7fda7e0d446ae2ab3e639e3ff11a543aa4be564a431f80da5af97a7f942d39"
-}
-
-
 def check_speech_tags(recipe: dict, path: Path) -> list[str]:
-    if "speech_tags" not in recipe and rc.is_speech_recipe(recipe):
-        try:
-            rel = path.resolve().relative_to(REPO).as_posix()
-        except ValueError:
-            rel = ""
-        if LEGACY_SPEECH_POLICIES.get(rel) == rc.sha256_file(path):
-            return ["info: speech_tags: missing policy; dated migration allowlist 2026-11-11 (doctor/gate still require it)"]
-    rc.speech_tag_policy(recipe)
-    return []
+    rc.speech_tag_policy(recipe, path)
+    notice = rc.legacy_speech_tag_notice(recipe, path)
+    return ["info: " + notice] if notice else []
 
 
 def check_rung_choices(recipe: dict) -> None:
@@ -436,7 +404,7 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     need(not spec_errors, "; ".join(spec_errors))
 
     if bundle and (bundle / "model.pkt").exists():
-        notes += [f"{level}: {message}" for level, message in rc.check_packet_speech_tags(bundle / "model.pkt", recipe)]
+        notes += [f"{level}: {message}" for level, message in rc.check_packet_speech_tags(bundle / "model.pkt", recipe, recipe_path) if level != "NOTICE"]
     if bundle:
         bj = rc.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
         wj = rc.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}
@@ -472,7 +440,7 @@ def run() -> None:
         recipe_path = Path(args.recipe[0]) if args.recipe else args.speech_packet.parent.parent / "recipe.toml"
         try:
             recipe = rc.load_toml(recipe_path) if recipe_path.exists() else None
-            for level, message in rc.check_packet_speech_tags(args.speech_packet, recipe):
+            for level, message in rc.check_packet_speech_tags(args.speech_packet, recipe, recipe_path):
                 print(f"{level}\t{message}")
         except (rc.Fail, OSError, ValueError, KeyError, TypeError) as error:
             print(f"FAIL\t{error}")

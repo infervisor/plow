@@ -1,0 +1,23 @@
+{
+  "infervisor/breeze-tts-2/sm90a-h100-tp1.toml": "2026-11-11",
+  "infervisor/chatterbox/sm89-l4-tp1.toml": "2026-11-11",
+  "infervisor/chatterbox/sm89-l40s-tp1.toml": "2026-11-11",
+  "infervisor/chatterbox/sm90a-h100-tp1.toml": "2026-11-11",
+  "infervisor/chatterbox-mtl/sm89-l4-tp1.toml": "2026-11-11",
+  "infervisor/chatterbox-mtl/sm89-l40s-tp1.toml": "2026-11-11",
+  "infervisor/chatterbox-mtl/sm90a-h100-tp1.toml": "2026-11-11",
+  "infervisor/fish-s2-pro/sm89-l4-tp1.toml": "2026-11-11",
+  "infervisor/fish-s2-pro/sm90a-h100-tp1.toml": "2026-11-11",
+  "infervisor/maya2-native/sm89-l4-tp1.toml": "2026-11-11",
+  "infervisor/maya2-native/sm89-l40s-tp1.toml": "2026-11-11",
+  "infervisor/maya2-native/sm90a-h100-tp1.toml": "2026-11-11",
+  "infervisor/orpheus/sm89-l4-tp1.toml": "2026-11-11",
+  "infervisor/orpheus/sm89-l40s-tp1.toml": "2026-11-11",
+  "infervisor/orpheus/sm90a-h100-tp1.toml": "2026-11-11",
+  "infervisor/qwen3-tts-1.7b-customvoice/sm90a-h100-tp1-bf16.toml": "2026-11-11",
+  "infervisor/veena/sm89-l4-tp1.toml": "2026-11-11",
+  "infervisor/veena/sm89-l40s-tp1.toml": "2026-11-11",
+  "infervisor/veena/sm90a-h100-tp1.toml": "2026-11-11",
+  "scripts/campaign/recipes/chatterbox.h100.s3gen-split-a.toml": "2026-11-11",
+  "scripts/campaign/recipes/qwen3-tts-1.7b-base.h100.bf16-clone.toml": "2026-11-11"
+}
