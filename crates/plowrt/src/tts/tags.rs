@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-use plow_asset::speech_tags::{Asterisk, Entry, SpeechTags, Unknown};
+use plow_asset::speech_tags::{Asterisk, Entry, Markers, SpeechTags, Unknown};
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
@@ -69,6 +69,7 @@ pub struct Parser {
     comment: bool,
     style: Option<String>,
     comment_tail: u8,
+    marker_tail: Option<bool>,
 }
 
 impl Parser {
@@ -102,7 +103,7 @@ impl Parser {
     pub fn push(&mut self, chunk: &str, syntax: &plow_asset::speech_tags::Syntax) {
         let mut remaining = chunk;
         while !remaining.is_empty() {
-            if !self.comment && self.pending.is_empty() {
+            if !self.comment && self.marker_tail.is_none() && self.pending.is_empty() {
                 let end = remaining
                     .bytes()
                     .position(|b| matches!(b, b'[' | b'<' | b'*' | b'\\'))
@@ -115,6 +116,14 @@ impl Parser {
             }
             let c = remaining.chars().next().unwrap();
             remaining = &remaining[c.len_utf8()..];
+            if let Some(pipe) = &mut self.marker_tail {
+                if *pipe && c == '>' {
+                    self.marker_tail = None;
+                } else {
+                    *pipe = c == '|';
+                }
+                continue;
+            }
             if self.comment {
                 self.comment_tail = match (self.comment_tail, c) {
                     (0, '-') => 1,
@@ -130,7 +139,7 @@ impl Parser {
             if self.pending.is_empty() {
                 if c == '\\'
                     || c == '[' && syntax.bracket
-                    || c == '<' && syntax.ssml
+                    || c == '<' && (syntax.ssml || syntax.markers == Markers::Strip)
                     || c == '*' && syntax.asterisk == Asterisk::Known
                 {
                     self.pending.push(c);
@@ -154,14 +163,23 @@ impl Parser {
                 continue;
             }
             let start = self.pending.as_bytes()[0];
+            if start == b'<' && self.pending.starts_with("<|") && syntax.markers == Markers::Strip {
+                if self.pending.ends_with("|>") {
+                    self.pending.clear();
+                } else if self.pending.chars().count() > 64 {
+                    self.pending.clear();
+                    self.marker_tail = Some(c == '|');
+                }
+                continue;
+            }
             if start == b'<' && self.pending == "<|" {
-                self.literal("< |");
+                self.literal("<|");
                 self.pending.clear();
                 continue;
             }
             if start == b'<'
                 && self.pending.len() == 2
-                && !(c.is_ascii_alphabetic() || matches!(c, '/' | '!'))
+                && (!syntax.ssml || !(c.is_ascii_alphabetic() || matches!(c, '/' | '!')))
             {
                 let pending = std::mem::take(&mut self.pending);
                 self.literal(&pending);
@@ -456,7 +474,7 @@ pub fn render<'a>(
     for span in parser.finish() {
         match span {
             Span::Text(t) => {
-                let mut t = t.replace("<|", "< |");
+                let mut t = t;
                 for (from, to) in &map.literal_rewrite {
                     t = t.replace(from, to);
                 }
@@ -540,7 +558,7 @@ pub fn render<'a>(
                     match map.unknown {
                         Unknown::Reject => return Err(format!("unknown tag {name:?}")),
                         Unknown::Literal => {
-                            let mut raw = raw.replace("<|", "< |");
+                            let mut raw = raw;
                             for (f, t) in &map.literal_rewrite {
                                 raw = raw.replace(f, t);
                             }
@@ -652,6 +670,123 @@ mod tests {
             p.push(&input[..i], &m.syntax);
             p.push(&input[i..], &m.syntax);
             assert_eq!(p.finish(), expected, "{i}");
+        }
+    }
+
+    #[test]
+    fn fixture_syntax_and_literal_preservation() {
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../../../scripts/tts/tag_cases.json")).unwrap();
+        let map = SpeechTags::strip();
+        let compact = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(cases.len(), 74);
+        for case in cases {
+            let text = case["text"].as_str().unwrap();
+            let shape = case["id"].as_str().unwrap().split_once('-').unwrap().1;
+            let lang = case["language"].as_str();
+            let auto = render(Some(&map), text, Mode::Auto, lang, None, 1.0).unwrap();
+            if matches!(shape, "paren" | "curly" | "plain_prefix") {
+                let off = render(Some(&map), text, Mode::Off, lang, None, 1.0).unwrap();
+                assert_eq!(auto.input.as_bytes(), off.input.as_bytes(), "{shape}");
+                assert!(matches!(auto.input, Cow::Borrowed(_)), "{shape}");
+                for max in [8, 24, 128] {
+                    assert_eq!(
+                        auto.segments(max, str::to_owned),
+                        off.segments(max, str::to_owned),
+                        "{shape}"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    compact(&auto.input),
+                    compact(case["reference"].as_str().unwrap()),
+                    "{shape}"
+                );
+            }
+        }
+        for text in ["*ordinary words* Hello.", "*साधारण* नमस्ते।"] {
+            let auto = render(Some(&map), text, Mode::Auto, None, None, 1.0).unwrap();
+            assert_eq!(auto.input, text);
+            assert!(matches!(auto.input, Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn marker_stripping_is_controlled_by_literal_rewrites() {
+        let mut map = SpeechTags::strip();
+        map.syntax.markers = Markers::Neutralize;
+        map.literal_rewrite = vec![
+            ("<|style|>".into(), String::new()),
+            ("<|/style|>".into(), String::new()),
+        ];
+        map.validate().unwrap();
+        let text = "<|style|>friendly<|/style|> Hello <|other|>";
+        let auto = render(Some(&map), text, Mode::Auto, None, None, 1.0).unwrap();
+        assert_eq!(auto.input, "friendly Hello < |other|>");
+        assert_eq!(
+            render(Some(&map), text, Mode::Off, None, None, 1.0)
+                .unwrap()
+                .input,
+            text
+        );
+    }
+
+    #[test]
+    fn strip_markers_preserves_inner_text_at_every_push_boundary() {
+        let mut map = SpeechTags::strip();
+        for ssml in [false, true] {
+            map.syntax.ssml = ssml;
+            for text in [
+                "<|style|>Hello नमस्ते।<|/style|>",
+                "<|language:hi|>Hello नमस्ते।",
+            ] {
+                for (i, _) in text.char_indices() {
+                    let mut parser = Parser::default();
+                    parser.push(&text[..i], &map.syntax);
+                    parser.push(&text[i..], &map.syntax);
+                    assert_eq!(parser.finish(), vec![Span::Text("Hello नमस्ते।".into())]);
+                }
+                assert_eq!(
+                    render(Some(&map), text, Mode::Auto, None, None, 1.0)
+                        .unwrap()
+                        .input,
+                    "Hello नमस्ते।"
+                );
+            }
+        }
+        let mut parser = Parser::default();
+        parser.push("<|", &map.syntax);
+        for _ in 0..10000 {
+            parser.push("x", &map.syntax);
+            assert!(parser.pending.len() <= 64);
+        }
+        parser.push("|>Hello", &map.syntax);
+        assert_eq!(parser.finish(), vec![Span::Text("Hello".into())]);
+    }
+
+    #[cfg(feature = "hf-tokenizer")]
+    #[test]
+    fn neutralized_markers_cannot_encode_special_tokens() {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[UNK]".into(), 0)].into_iter().collect())
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        let markers = ["<|style|>", "<|/style|>", "<|event|>"];
+        tokenizer
+            .add_special_tokens(markers.map(|text| tokenizers::AddedToken::from(text, true)))
+            .unwrap();
+        let map = SpeechTags::strip();
+        for text in markers {
+            let id = tokenizer.token_to_id(text).unwrap();
+            assert_eq!(tokenizer.encode(text, false).unwrap().get_ids(), &[id]);
+            let rendered = render(Some(&map), text, Mode::Auto, None, None, 1.0).unwrap();
+            assert!(!tokenizer
+                .encode(rendered.input.as_ref(), false)
+                .unwrap()
+                .get_ids()
+                .contains(&id));
         }
     }
     #[test]

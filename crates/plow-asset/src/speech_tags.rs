@@ -22,6 +22,16 @@ pub struct Syntax {
     pub bracket: bool,
     pub ssml: bool,
     pub asterisk: Asterisk,
+    #[serde(default)]
+    pub markers: Markers,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Markers {
+    #[default]
+    Neutralize,
+    Strip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -129,6 +139,7 @@ impl SpeechTags {
                 bracket: true,
                 ssml: true,
                 asterisk: Asterisk::Known,
+                markers: Markers::Strip,
             },
             unknown: Unknown::Strip,
             literal_rewrite: vec![("<|".into(), "< |".into())],
@@ -278,6 +289,8 @@ mod tests {
         let map = SpeechTags::strip();
         map.validate_binding(false, |_| false).unwrap();
         assert_eq!(map.unknown, Unknown::Strip);
+        assert_eq!(map.syntax.markers, Markers::Strip);
+        assert_eq!(self::map().syntax.markers, Markers::Neutralize);
         for (name, entry) in &map.tags {
             if name == "pause" {
                 assert_eq!(
