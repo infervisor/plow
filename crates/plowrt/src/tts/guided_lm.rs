@@ -25,6 +25,7 @@ pub const DRIVER: &str = "tts.guided_lm.v1";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GuidedLmContract {
+    pub tags: Option<std::sync::Arc<plow_asset::speech_tags::SpeechTags>>,
     pub hidden: usize,
     pub overlay_rows: usize,
     pub decode_capacity: usize,
@@ -61,7 +62,13 @@ impl GuidedLmContract {
             })
         };
         let f = |k: &str| get(k).map(|v| f32::from_bits(v as u32));
+        let tags = super::tags::load(p)?;
+        if let Some(map) = &tags {
+            map.validate_binding(false, |_| true)
+                .map_err(RuntimeError::Rejected)?;
+        }
         Ok(GuidedLmContract {
+            tags,
             hidden: get("hidden")? as usize,
             overlay_rows: get("overlay_rows")? as usize,
             decode_capacity: get("decode_capacity")? as usize,
@@ -202,6 +209,12 @@ impl PromptTables {
         let tk = assets.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tk)
             .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", tk.display())))?;
+        if let Some(map) = super::tags::load(pipe)? {
+            map.validate_binding(false, |s| {
+                tokenizer.encode(s, false).is_ok_and(|e| e.len() == 1)
+            })
+            .map_err(RuntimeError::Rejected)?;
+        }
         Ok(PromptTables {
             hidden,
             text_emb,
@@ -455,6 +468,7 @@ mod tests {
 
     fn contract() -> GuidedLmContract {
         GuidedLmContract {
+            tags: None,
             hidden: 4,
             overlay_rows: 8,
             decode_capacity: 2,

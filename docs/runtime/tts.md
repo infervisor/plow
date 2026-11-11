@@ -1049,3 +1049,39 @@ co-serving".
 | `mtl_text_ref.py`, `crates/plowrt/examples/t3_text_check.rs` | text frontend gate: packet rules + tokenizer vs the reference ids (CPU) |
 
 Every GPU run goes through `perf-data/tools/gpulease`.
+
+## Text tags
+
+A speech pipeline can declare `text.tags` (JSON) and `text.tags_version = 1`.
+The model card then includes `x_plow_speech.tags`: accepted syntax, unknown-tag policy,
+and each canonical tag's action (`native`, `instruction`, `silence`, `speed`, or `dropped`).
+The runtime rejects unknown versions, fields, actions, alias cycles, unsupported instruction
+mappings and native mappings that violate a declared single-token constraint.
+
+Requests accept `tags: "auto"` (default), `"strict"`, or `"off"`.
+`auto` applies the packet's map. `strict` returns 400 with the first unsupported tag.
+`off` retains the original text path. A packet without a tag map keeps its original behavior.
+Text containing none of `[`, `<`, `*`, or `\` bypasses tag processing.
+
+Accepted forms include `[laughs]`, `[clears throat]`, `[pause 600ms]`, known comma-separated
+aliases such as `[warm, casual, friendly]`, and known asterisk aliases such as `*laughs*`.
+Unknown tag-shaped ASCII brackets follow the packet's policy. Numeric, non-ASCII and reference
+brackets such as `[1]`, `[कोई]`, and `[see p. 4]` remain literal.
+Parentheses, braces, prose prefixes and unknown asterisk phrases remain text.
+Use `\[` and `\<` to escape a bracket or angle opener. Special-token openers `<|` are
+neutralized to `< |` when tag processing is enabled.
+
+The SSML subset consumes `speak`, `break` (`time` or `strength`), `prosody` (`rate` and `pitch`),
+`emphasis`, `express-as style`, `emotion name`, `amazon:effect name="whispered"`, and `style`.
+Bare event elements such as `<laugh>` are accepted. Comments are removed; other element
+markup is removed while its inner text is kept. `a < b` remains literal text.
+A consumed style or prosody control can still be dropped when the packet does not support it.
+Instruction mappings append to client instructions once per request. Allowed rate mappings
+multiply the request's speed within its normal limits.
+
+Pauses are runtime silence at segment boundaries, including leading or trailing pauses.
+The default is 400 ms; durations above 3000 ms are clamped. Native tags remain atomic across
+segments; mappings marked `carry` are repeated on later segments.
+Responses report canonical names in `x-plow-tags-applied` and `x-plow-tags-dropped`
+(up to 32 distinct names each). WebSocket speech sends one `{"type":"tags","applied":...,"dropped":...}`
+text message before its binary audio when tags were applied or dropped.
