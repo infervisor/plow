@@ -248,6 +248,54 @@ the top); steps 3-6 run only for a block-level winner.
 | 8 | verify the patch | `scripts/campaign/verify_patch.sh <patch>`: applies to HEAD in a private index, archives `git write-tree`, builds bins/examples/tests, plowrt lib (cuda+hsa), knob tests, plow-asset + packet tests, `lean` (in-tree verifier build, proof audit, approved verifier, CPU-verifier suites via `scripts/lean_correctness_ci.sh`) for Lean/receipt changes, `perf` (checkpoint P, `perf_gate_ci.sh`) for knob registry changes, py_compile / `bash -n` / TOML of touched scripts |
 | 9 | re-measure | repeat steps 3–6 for affected rungs and the selected full model; A/B scoring as in §7 |
 
+### Speech tags for a new TTS model
+
+1. **Declare.** Copy `scripts/campaign/recipes/templates/speech-sm90a-default-on.toml`.
+   `[speech_tags]` names a version, profile and complete map: every canonical action, syntax,
+   language restriction and literal rewrite. Default = drop controls, runtime pause silence
+   (400 ms default / 3000 ms max), markers stripped. Run `check_recipe.py`; `render_recipe.py`
+   renders the declaration. Shared type: `SpeechTagPolicy` in plow-asset; table schema:
+   [speech-tag-policy-v1.schema.json](../schemas/speech-tag-policy-v1.schema.json).
+2. **Check the emit.** Run `plowbench-doctor.sh <assets> <objects> <plowrt> <arch>`.
+   Its CPU speech check requires actual `text.tags`/version to equal the recipe, including
+   language rules and rewrites. A runtime fallback setting or route waiver cannot replace it.
+3. **Discover on CPU.** Run `nix develop --command python3 scripts/tts/tag_discovery.py
+   --tokenizer <tokenizer.json> --packet <model.pkt> --out <scratch>/discovery.json`.
+   Add `--verify-ids` with the existing tokenizer reference Python for actual IDs. Inspect the
+   event/style/language/control inventory, canonical spellings, escapes, compatibility forms,
+   proposed map and rewrites. Unsupported rules are explicitly incomplete. NFKD/fullwidth
+   controls can bypass the ASCII parser; ASCII rewrites do not protect that scope. Resolve or
+   explicitly waive it with measurements; discovery is advisory.
+4. **Gate.** Run `campaign.py gate <recipe> --assets <assets> --out <fresh scratch>` inside
+   `nix develop`; it queues the GPU work and includes `tts_tags` even with `--only` another gate.
+   `[gates.tts_tags]` selects voices, ASR languages, neutral texts and translated `forbid` terms;
+   `request_languages.en = ""` omits request language selection. `cer_max` inherits the existing
+   `[gates.tts_cer] cer_median_max` unless explicitly owner-approved. Using `tag_cases.json`,
+   `eval.py` and `asr_check.py`, it checks accepted syntax, literal/untagged PCM identity,
+   pause energy/duration (±80 ms), headers and all JSON types of `tags` on clean input.
+   Relative CER keeps the 0.05 margin. `--score-only` recomputes from saved WAVs/transcripts and
+   rejects changed recipes/packets or incomplete evidence.
+
+Native text/aliases require the same gate's `--tag-sweep --only tts_tags` mode: start/mid/end/double
+× tag × language × >=5 distinct matched seeds. Explicit `native_metric = "cer"` requires mean CER
+improvement in every cell; it measures speech quality, not event/style semantics. Other efficacy
+metrics or new thresholds are owner proposals. Declare its passing report as `native_sweep` before
+normal qualification; map, packet, runtime, request/reference-audio identities and grid results
+are checked. Otherwise drop the native action.
+
+A waiver replaces the map: `[speech_tags] version = 1`, `waiver = "measured reason"`,
+`evidence = ["measurement reference and digest", ...]`. Record packet/tokenizer identities,
+cases/languages/seeds, observed failures and why the exception is accepted. Empty/unmeasured
+reasons fail; doctor warns and campaign reports **WAIVED**. The dated legacy inventory in
+`crates/plow-asset/src/speech_tag_legacy.json` lives beside the shared recipe policy schema;
+Python tools read it and Rust embeds the same data. Canonical entries identify
+`infervisor/<model>/<label>.toml` (independent of the source directory name); two existing
+experimental recipe paths are also listed. Re-pins and threshold edits retain legacy status. Existing campaign build snapshots use their
+`build-record.json` recipe identity. Without `[speech_tags]`, listed recipes retain their
+ordinary gates and packing behavior with one explicit legacy notice; doctor reports NOTICE.
+The tag gate is skipped. Declaring `[speech_tags]` ends that exception and applies full checks.
+Unlisted speech recipes require a declaration, including new models.
+
 ### Per-rung gate and recipe selection
 
 For every affected prefill bucket and decode batch/context rung, use the existing kernel harness

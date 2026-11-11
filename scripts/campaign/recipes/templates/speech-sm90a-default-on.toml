@@ -1,0 +1,109 @@
+# New speech-model bring-up. Copy under scripts/campaign/recipes/, pin the checkpoint,
+# set the network/voice/languages and run CPU discovery before emit. The emitted map must
+# equal this declaration. Drops are the conservative starting point; native actions need
+# a >=5-seed position x tag x language sweep before promotion.
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "MODEL"
+label = "sm90a-h100-tp1"
+status = "emits"
+plow_git = "099c249745333b7437323c2f7f876b3cf8f5a46e" # replace with the full compiler commit
+network = "NETWORK"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+toolchain = "cuda-12.9-nix"
+
+[checkpoint]
+source = "hf:ORG/MODEL"
+revision = "0000000000000000000000000000000000000000" # replace with the pinned checkpoint
+
+[cell]
+name = "MODEL.h100.bf16"
+hf_dir = "{env:MODEL_CHECKPOINT}"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 8192
+
+[emit]
+emit = "devblob+cubin"
+args = []
+
+[serve.env]
+PLOW_VMM_PREFIX = "1"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+
+[speech_tags]
+version = 1
+profile = "strip-silence-v1"
+
+[speech_tags.map]
+unknown = "strip"
+literal_rewrite = [["<|", "< |"]]
+[speech_tags.map.syntax]
+bracket = true
+ssml = true
+asterisk = "known"
+markers = "strip"
+
+[speech_tags.map.tags]
+laugh = { drop = true }
+chuckle = { drop = true }
+giggle = { drop = true }
+sigh = { drop = true }
+gasp = { drop = true }
+cough = { drop = true }
+clear_throat = { drop = true }
+inhale = { drop = true }
+exhale = { drop = true }
+sniff = { drop = true }
+yawn = { drop = true }
+groan = { drop = true }
+whisper = { drop = true }
+excited = { drop = true }
+happy = { drop = true }
+sad = { drop = true }
+angry = { drop = true }
+calm = { drop = true }
+serious = { drop = true }
+surprised = { drop = true }
+friendly = { drop = true }
+casual = { drop = true }
+rate = { drop = true }
+pitch = { drop = true }
+emphasis = { drop = true }
+pause = { silence_ms = { default = 400, max = 3000 } }
+
+# The tag gate inherits the existing recipe CER ceiling and uses the owner-set
+# relative margin 0.05 and pause tolerance 80 ms. Choose neutral sentences per language.
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --voice default"]
+# Set cer_median_max to the model's existing owner-approved ceiling before running.
+[gates.tts_tags]
+voice = "default"
+languages = ["en"]
+# cer_max must be the model's owner-approved ceiling, not a new threshold.
+# [gates.tts_tags.texts]
+# en = "The weather is nice today. We are at home."
+
+# For models with no language selection, omit the request field while retaining ASR language:
+# [gates.tts_tags.request_languages]
+# en = ""
+# For a native candidate, declare its report in [speech_tags] as native_sweep,
+# then capture the same gate with --tag-sweep --only tts_tags in a fresh output directory:
+# [gates.tts_tags]
+# seeds = [1, 2, 3, 4, 5]
+# native_metric = "cer" # explicit speech-quality metric; requires a mean decrease at every cell
+# [gates.tts_tags.forbid]
+# zh = ["笑", "清嗓子", "叹气"] # applicable spoken event words, beside the fixture's markup terms

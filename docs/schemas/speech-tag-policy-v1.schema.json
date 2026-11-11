@@ -1,0 +1,389 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://plow.dev/schemas/speech-tag-policy-v1.schema.json",
+  "title": "Recipe speech_tags policy v1",
+  "description": "The [speech_tags] recipe table; semantic validation also uses SpeechTagPolicy::validate and recipe_common.speech_tag_policy.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "profile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "waiver": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "native_sweep": {
+      "type": "string",
+      "minLength": 1
+    },
+    "map": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "syntax",
+        "unknown",
+        "tags"
+      ],
+      "properties": {
+        "syntax": {
+          "const": {
+            "bracket": true,
+            "ssml": true,
+            "asterisk": "known",
+            "markers": "strip"
+          }
+        },
+        "unknown": {
+          "enum": [
+            "strip",
+            "literal",
+            "passthrough",
+            "reject"
+          ]
+        },
+        "literal_rewrite": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            }
+          }
+        },
+        "tags": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "laugh",
+            "chuckle",
+            "giggle",
+            "sigh",
+            "gasp",
+            "cough",
+            "clear_throat",
+            "inhale",
+            "exhale",
+            "sniff",
+            "yawn",
+            "groan",
+            "whisper",
+            "excited",
+            "happy",
+            "sad",
+            "angry",
+            "calm",
+            "serious",
+            "surprised",
+            "friendly",
+            "casual",
+            "rate",
+            "pitch",
+            "emphasis",
+            "pause"
+          ],
+          "properties": {
+            "laugh": {
+              "$ref": "#/$defs/entry"
+            },
+            "chuckle": {
+              "$ref": "#/$defs/entry"
+            },
+            "giggle": {
+              "$ref": "#/$defs/entry"
+            },
+            "sigh": {
+              "$ref": "#/$defs/entry"
+            },
+            "gasp": {
+              "$ref": "#/$defs/entry"
+            },
+            "cough": {
+              "$ref": "#/$defs/entry"
+            },
+            "clear_throat": {
+              "$ref": "#/$defs/entry"
+            },
+            "inhale": {
+              "$ref": "#/$defs/entry"
+            },
+            "exhale": {
+              "$ref": "#/$defs/entry"
+            },
+            "sniff": {
+              "$ref": "#/$defs/entry"
+            },
+            "yawn": {
+              "$ref": "#/$defs/entry"
+            },
+            "groan": {
+              "$ref": "#/$defs/entry"
+            },
+            "whisper": {
+              "$ref": "#/$defs/entry"
+            },
+            "excited": {
+              "$ref": "#/$defs/entry"
+            },
+            "happy": {
+              "$ref": "#/$defs/entry"
+            },
+            "sad": {
+              "$ref": "#/$defs/entry"
+            },
+            "angry": {
+              "$ref": "#/$defs/entry"
+            },
+            "calm": {
+              "$ref": "#/$defs/entry"
+            },
+            "serious": {
+              "$ref": "#/$defs/entry"
+            },
+            "surprised": {
+              "$ref": "#/$defs/entry"
+            },
+            "friendly": {
+              "$ref": "#/$defs/entry"
+            },
+            "casual": {
+              "$ref": "#/$defs/entry"
+            },
+            "rate": {
+              "$ref": "#/$defs/entry"
+            },
+            "pitch": {
+              "$ref": "#/$defs/entry"
+            },
+            "emphasis": {
+              "$ref": "#/$defs/entry"
+            },
+            "pause": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/entry"
+                },
+                {
+                  "required": [
+                    "silence_ms"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "required": [
+        "profile",
+        "map"
+      ],
+      "not": {
+        "required": [
+          "waiver"
+        ]
+      }
+    },
+    {
+      "required": [
+        "waiver",
+        "evidence"
+      ],
+      "properties": {
+        "evidence": {
+          "minItems": 1
+        }
+      },
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "map"
+            ]
+          },
+          {
+            "required": [
+              "profile"
+            ]
+          },
+          {
+            "required": [
+              "native_sweep"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "instruction": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "silence_ms": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "default",
+            "max"
+          ],
+          "properties": {
+            "default": {
+              "const": 400
+            },
+            "max": {
+              "const": 3000
+            }
+          }
+        },
+        "speed": {
+          "const": true
+        },
+        "drop": {
+          "const": true
+        },
+        "reject": {
+          "const": true
+        },
+        "alias": {
+          "enum": [
+            "laugh",
+            "chuckle",
+            "giggle",
+            "sigh",
+            "gasp",
+            "cough",
+            "clear_throat",
+            "inhale",
+            "exhale",
+            "sniff",
+            "yawn",
+            "groan",
+            "whisper",
+            "excited",
+            "happy",
+            "sad",
+            "angry",
+            "calm",
+            "serious",
+            "surprised",
+            "friendly",
+            "casual",
+            "rate",
+            "pitch",
+            "emphasis",
+            "pause"
+          ]
+        },
+        "carry": {
+          "type": "boolean",
+          "default": false
+        },
+        "single_token": {
+          "type": "boolean",
+          "default": false
+        },
+        "budget_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "langs": {
+          "oneOf": [
+            {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z-]{1,16}$"
+              }
+            },
+            {
+              "type": "object",
+              "minProperties": 1,
+              "maxProperties": 32,
+              "propertyNames": {
+                "pattern": "^[a-z-]{1,16}$"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            }
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "text"
+          ]
+        },
+        {
+          "required": [
+            "instruction"
+          ]
+        },
+        {
+          "required": [
+            "silence_ms"
+          ]
+        },
+        {
+          "required": [
+            "speed"
+          ]
+        },
+        {
+          "required": [
+            "alias"
+          ]
+        },
+        {
+          "required": [
+            "drop"
+          ]
+        },
+        {
+          "required": [
+            "reject"
+          ]
+        }
+      ]
+    }
+  }
+}

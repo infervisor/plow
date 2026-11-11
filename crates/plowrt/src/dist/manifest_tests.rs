@@ -1831,3 +1831,106 @@ fn only_a_prepared_checkpoint_is_recorded_as_a_view() {
     assert!(with("{hf:maya-research/Veena}").is_empty());
     assert!(with("{env:CKPT}").is_empty());
 }
+
+#[test]
+fn speech_recipe_packing_requires_a_map_or_measured_waiver() {
+    let dir = tmp("speech-policy");
+    let source = format!("{MINIMAL}\n[bench]\nkind = \"speech\"\n");
+    let p = write_recipe(&dir, &source);
+    assert!(read_recipe(&p, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("speech_tags: missing policy"));
+    let waived = format!("{source}\n[speech_tags]\nversion = 1\nwaiver = \"CER 0.23 vs 0.01 at seed 7; frontend correction required\"\nevidence = [\"qualification/tag-ab.json\"]\n");
+    let p = write_recipe(&dir, &waived);
+    read_recipe(&p, Overrides::default()).unwrap();
+    let p = write_recipe(
+        &dir,
+        &waived.replace(
+            "evidence = [\"qualification/tag-ab.json\"]",
+            "evidence = []",
+        ),
+    );
+    assert!(read_recipe(&p, Overrides::default()).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validated_native_recipe_requires_its_sweep_reference() {
+    let dir = tmp("native-sweep");
+    let source =
+        include_str!("../../../../scripts/campaign/recipes/templates/speech-sm90a-default-on.toml")
+            .replace("status = \"emits\"", "status = \"validated\"")
+            .replace("laugh = { drop = true }", "laugh = { text = \"<laugh>\" }");
+    let p = write_recipe(&dir, &source);
+    assert!(read_recipe(&p, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("native_sweep"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn legacy_speech_recipe_identity_survives_edits_but_not_a_declared_policy() {
+    let dir = tmp("speech-legacy");
+    let path = dir.join("recipes/infervisor/maya2-native/sm90a-h100-tp1.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let source = format!("{MINIMAL}\n[bench]\nkind = \"speech\"\n");
+    for edit in ["", "\n# routine recipe edit\n"] {
+        std::fs::write(&path, format!("{source}{edit}")).unwrap();
+        read_recipe(&path, Overrides::default()).unwrap();
+        assert_eq!(
+            plow_asset::speech_tag_policy::legacy_notice(&path).as_deref(),
+            Some("speech_tags: legacy recipe without tag policy (grandfathered 2026-11-11)")
+        );
+    }
+    let unlisted = path.with_file_name("new.toml");
+    std::fs::write(&unlisted, &source).unwrap();
+    assert!(read_recipe(&unlisted, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("speech_tags: missing policy"));
+    let snapshot = dir.join("recipe.toml");
+    std::fs::write(&snapshot, &source).unwrap();
+    std::fs::write(
+        dir.join("build-record.json"),
+        serde_json::to_vec(&serde_json::json!({"recipe": dir.join("ri/infervisor/maya2-native/sm90a-h100-tp1.toml"), "recipe_snapshot": "recipe.toml"}))
+            .unwrap(),
+    )
+    .unwrap();
+    read_recipe(&snapshot, Overrides::default()).unwrap();
+    let policy = r#"
+[speech_tags]
+version = 1
+waiver = "TBD"
+"#;
+    std::fs::write(&path, format!("{source}{policy}")).unwrap();
+    assert!(read_recipe(&path, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("waiver"));
+    let policy = r#"
+[speech_tags]
+version = 1
+waiver = "CER 0.23 vs 0.01 at seed 7"
+evidence = ["tag-ab.json"]
+"#;
+    std::fs::write(&path, format!("{source}{policy}")).unwrap();
+    read_recipe(&path, Overrides::default()).unwrap();
+    let template =
+        include_str!("../../../../scripts/campaign/recipes/templates/speech-sm90a-default-on.toml");
+    std::fs::write(&path, template).unwrap();
+    read_recipe(&path, Overrides::default()).unwrap();
+    std::fs::write(
+        &path,
+        template
+            .replace("status = \"emits\"", "status = \"validated\"")
+            .replace("laugh = { drop = true }", "laugh = { text = \"<laugh>\" }"),
+    )
+    .unwrap();
+    assert!(read_recipe(&path, Overrides::default())
+        .unwrap_err()
+        .to_string()
+        .contains("native_sweep"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

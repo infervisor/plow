@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -62,6 +64,35 @@ class DistGateTests(unittest.TestCase):
             self.assertEqual(rec["tree"], {"files": 3, "missing": [], "differ": []})
             self.assertTrue(rec["inventory_equal"])
             self.assertIn("--checkpoint", (Path(a.out) / "home" / "load.args").read_text())
+
+    def test_speech_legacy_admission_and_policy_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = self.fixture(root)
+            path = root / "recipes/infervisor/maya2-native/sm90a-h100-tp1.toml"
+            path.parent.mkdir(parents=True)
+            source = Path(a.recipe).read_text() + '\n[bench]\nkind = "speech"\n'
+            path.write_text(source)
+            a.recipe = str(path)
+            a.name = "model-a"
+            for edit in ("", '\n# routine re-pin\n'):
+                path.write_text(source + edit)
+                stderr = io.StringIO()
+                with self.smoke("ready\n", 0), contextlib.redirect_stderr(stderr):
+                    campaign.cmd_dist_gate(a)
+                self.assertIn("speech_tags: legacy recipe without tag policy (grandfathered 2026-11-11)", stderr.getvalue())
+                self.assertTrue(json.loads((Path(a.out) / "dist-gate.json").read_text())["pass"])
+            unlisted = path.with_name("new.toml")
+            unlisted.write_text(source)
+            a.recipe = str(unlisted)
+            with mock.patch.object(campaign, "run") as run, self.assertRaisesRegex(campaign.recipe_common.Fail, "missing policy"):
+                campaign.cmd_dist_gate(a)
+            run.assert_not_called()
+            a.recipe = str(path)
+            path.write_text(source + '\n[speech_tags]\nversion = 1\nwaiver = "TBD"\n')
+            with mock.patch.object(campaign, "run") as run, self.assertRaises(campaign.recipe_common.Fail):
+                campaign.cmd_dist_gate(a)
+            run.assert_not_called()
 
     def test_differing_object_fails_before_gpu(self):
         with tempfile.TemporaryDirectory() as tmp:

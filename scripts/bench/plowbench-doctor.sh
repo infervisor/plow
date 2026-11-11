@@ -211,6 +211,22 @@ else
 fi
 
 echo
+echo "[9] speech tags (emitted map vs recipe; CPU only)"
+if [ -n "$ASSETS" ] && [ -f "$ASSETS/model.pkt" ]; then
+    while IFS=$'\t' read -r lvl msg; do
+        case "$lvl" in
+            ok) pb_ok "$msg" ;;
+            NOTICE) printf '  NOTICE %s\n' "$msg" ;;
+            WARN) pb_warn "$msg" ;;
+            FAIL) pb_bad "$msg" ;;
+            *) pb_bad "speech tag check: $lvl $msg" ;;
+        esac
+    done < <(python3 "$HERE/../check_recipe.py" --speech-packet "$ASSETS/model.pkt" 2>&1)
+else
+    pb_warn "speech tag check skipped (needs model.pkt)"
+fi
+
+echo
 if [ "$PB_FAIL" -gt 0 ]; then
     echo "RESULT: $PB_FAIL failure(s), $PB_WARN warning(s) — DO NOT lease a GPU yet."
     exit 1

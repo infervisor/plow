@@ -53,7 +53,7 @@ AUTH = {"Authorization": f"Bearer {os.environ['PLOW_API_KEY']}"} if os.environ.g
 
 
 
-def call(method, path, body=None, headers=None, timeout=600):
+def call(method, path, body=None, headers=None, timeout=600, with_headers=False):
     data = json.dumps(body).encode() if isinstance(body, dict) else body
     h = dict(AUTH)
     if isinstance(body, dict):
@@ -62,9 +62,11 @@ def call(method, path, body=None, headers=None, timeout=600):
     req = urllib.request.Request(URL + path, data=data, method=method, headers=h)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read()
+            result = (r.status, r.read())
+            return (*result, {k.lower(): v for k, v in r.headers.items()}) if with_headers else result
     except urllib.error.HTTPError as e:
-        return e.code, e.read()
+        result = (e.code, e.read())
+        return (*result, {k.lower(): v for k, v in e.headers.items()}) if with_headers else result
 
 
 def models_by_kind():
@@ -183,8 +185,6 @@ def tts_cases(a, model):
                 raise ValueError(f"TTS manifest row {i} has an empty ASR reference")
             if "reference_language" in case and (not isinstance(case["reference_language"], str) or not case["reference_language"].strip()):
                 raise ValueError(f"TTS manifest row {i} has an invalid ASR reference language")
-            if case.get("tags", "auto") not in ("auto", "strict", "off"):
-                raise ValueError(f"TTS manifest row {i} has an invalid tags policy")
             status = case.get("expected_status", 200)
             if type(status) is not int or (status != 200 and not 400 <= status <= 599):
                 raise ValueError(f"TTS manifest row {i} has an invalid expected status")
@@ -204,7 +204,8 @@ def tts_cases(a, model):
                       seed=c.get("seed", 1 + i),
                       **{k: c[k] for k in ("ref_audio_path", "ref_audio_sha256", "ref_audio", "ref_text", "non_streaming_mode",
                           "reference", "reference_language", "tags", "speed", "sample_rate", "instructions", "expected_status",
-                          "forbid", "pauses", "duration_delta", "baseline") if k in c})
+                          "forbid", "pauses", "duration_delta", "baseline", "gate_kind", "pair", "pause_ms", "pause_position",
+                          "expected_headers", "native_tag", "native_position") if k in c})
                  for i, c in enumerate(cases)]
     else:
         cases = [dict(i=i, case_id=str(i), voice=v, text=t, lang=l, seed=1 + i)
@@ -228,7 +229,11 @@ def capture_tts(a, model, outdir):
         body.update({k: case[k] for k in ("ref_audio", "ref_text", "non_streaming_mode", "tags",
                                         "speed", "sample_rate", "instructions") if k in case})
         try:
-            st, data = call("POST", "/v1/audio/speech", body)
+            if getattr(a, "tts_tag_config", None):
+                st, data, response_headers = call("POST", "/v1/audio/speech", body, with_headers=True)
+                row["response_headers"] = response_headers
+            else:
+                st, data = call("POST", "/v1/audio/speech", body)
             row["status"] = st
             if st != case.get("expected_status", 200):
                 row["error"] = f"{st} {data[:200]!r}"
@@ -280,6 +285,15 @@ def capture_tts(a, model, outdir):
 def eval_tts(a, models, outdir):
     if not models:
         raise ValueError("no requested TTS model is advertised by the server")
+    if getattr(a, "tts_tag_config", None):
+        from tag_gate import make_cases
+        from pathlib import Path
+        if len(models) != 1 or not a.tts_capture_only or a.limit:
+            raise ValueError("tag gate requires one model, capture-only and no limit")
+        config = json.loads(Path(a.tts_tag_config).read_text())
+        manifest = Path(outdir) / "tag-requests.json"
+        manifest.write_text(json.dumps(make_cases(config), ensure_ascii=False, indent=2))
+        a.tts_manifest = str(manifest)
     captures = [(m, *capture_tts(a, m, outdir)) for m in models]
     if not a.tts_capture_only:
         import numpy as np
@@ -401,6 +415,7 @@ def main():
     ap.add_argument("--tts-concurrency", type=int, default=1, help="bounded concurrent TTS quality requests")
     ap.add_argument("--tts-stream", action="store_true", help="synthesize through the streaming endpoint")
     ap.add_argument("--tts-capture-only", action="store_true", help="save WAVs/texts without loading an ASR model")
+    ap.add_argument("--tts-tag-config", help="campaign-generated speech-tag gate config; uses tag_cases.json")
     ap.add_argument("--tts-manifest", help="JSON list of {text, voice?, language?, seed?, id?, ref_audio_path?, ref_text?, non_streaming_mode?} requests")
     ap.add_argument("--voice", default=None, help="TTS voice for every prompt (default: the prompt set's)")
     ap.add_argument("--whisper", default="openai/whisper-large-v3-turbo")

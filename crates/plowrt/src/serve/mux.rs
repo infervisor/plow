@@ -276,9 +276,32 @@ mod delivery_tests {
 
     #[test]
     fn frame_budget_tracks_playback_and_reserves_downstream_work() {
-        let audio = FirstAudio::new(1);
-        assert_eq!(audio.frame_budget_ms(), None);
-        audio.set_frame_period(std::time::Duration::from_millis(80));
+        assert!(FrameBudget::for_stream(false, 0, 0).is_none());
+        let inactive = FirstAudio::new(2).track_playback(false, 0, 0);
+        assert!(inactive.frame_budget().is_none());
+        let boundary = FirstAudio::new(u32::MAX as usize);
+        assert_eq!(boundary.next(), u32::MAX as usize);
+        #[cfg(target_pointer_width = "64")]
+        {
+            boundary.set_next(u32::MAX as usize + 1);
+            assert_eq!(boundary.next(), u32::MAX as usize);
+            let speech = SpeechJob {
+                first_audio: Some(Arc::new(boundary)),
+                ..Default::default()
+            };
+            assert!(!first_handoff(
+                Some(&speech),
+                u32::MAX as usize - 1,
+                &mut true,
+                &mut 0
+            ));
+        }
+        assert_eq!(
+            std::mem::size_of::<FirstAudio>(),
+            2 * std::mem::size_of::<usize>()
+        );
+        let active = FirstAudio::new(2).track_playback(true, 1920, 24000);
+        let audio = active.frame_budget().unwrap();
         assert_eq!(audio.frame_budget_ms(), Some(80.0));
         audio.set_playback_deadline(
             Instant::now() + std::time::Duration::from_secs(1),
@@ -871,10 +894,8 @@ pub struct SpeechJob {
 #[derive(Debug)]
 pub struct FirstAudio {
     heard: std::sync::atomic::AtomicBool,
-    next: std::sync::atomic::AtomicUsize,
-    clock: Instant,
-    period_ns: std::sync::atomic::AtomicU64,
-    deadline_ns: std::sync::atomic::AtomicU64,
+    next: std::sync::atomic::AtomicU32,
+    frame_budget: Option<Box<FrameBudget>>,
 }
 
 impl FirstAudio {
@@ -882,11 +903,18 @@ impl FirstAudio {
     pub fn new(next: usize) -> Self {
         Self {
             heard: false.into(),
-            next: next.into(),
-            clock: Instant::now(),
-            period_ns: 0.into(),
-            deadline_ns: 0.into(),
+            next: u32::try_from(next).unwrap_or(u32::MAX).into(),
+            frame_budget: None,
         }
+    }
+
+    pub fn track_playback(mut self, active: bool, frame_samples: usize, sample_rate: u32) -> Self {
+        self.frame_budget = FrameBudget::for_stream(active, frame_samples, sample_rate);
+        self
+    }
+
+    pub fn frame_budget(&self) -> Option<&FrameBudget> {
+        self.frame_budget.as_deref()
     }
 
     pub fn heard(&self) -> bool {
@@ -899,18 +927,34 @@ impl FirstAudio {
     }
 
     pub fn next(&self) -> usize {
-        self.next.load(Ordering::Acquire)
+        self.next.load(Ordering::Acquire) as usize
     }
 
     pub fn set_next(&self, frames: usize) {
-        self.next.store(frames, Ordering::Release);
+        // A nonempty prompt leaves fewer than u32::MAX generated packet rows.
+        self.next
+            .store(u32::try_from(frames).unwrap_or(u32::MAX), Ordering::Release);
     }
+}
 
-    pub fn set_frame_period(&self, period: std::time::Duration) {
-        self.period_ns.store(
-            period.as_nanos().min(u64::MAX as u128) as u64,
-            Ordering::Release,
-        );
+#[derive(Debug)]
+pub struct FrameBudget {
+    clock: Instant,
+    period_ns: u64,
+    deadline_ns: std::sync::atomic::AtomicU64,
+}
+
+impl FrameBudget {
+    pub fn for_stream(active: bool, frame_samples: usize, sample_rate: u32) -> Option<Box<Self>> {
+        active.then(|| {
+            let period =
+                std::time::Duration::from_secs_f64(frame_samples as f64 / sample_rate as f64);
+            Box::new(Self {
+                clock: Instant::now(),
+                period_ns: period.as_nanos().min(u64::MAX as u128) as u64,
+                deadline_ns: 0.into(),
+            })
+        })
     }
 
     pub fn set_playback_deadline(&self, end: Instant, reserve: std::time::Duration) {
@@ -923,7 +967,7 @@ impl FirstAudio {
     }
 
     fn frame_budget_ms(&self) -> Option<f64> {
-        let period = self.period_ns.load(Ordering::Acquire);
+        let period = self.period_ns;
         if period == 0 {
             return None;
         }
@@ -1084,6 +1128,7 @@ pub struct ModelMux {
     queue_cap: usize,
     /// The engine prefix cache's block rows (0: no prefix cache), for [`Self::prefix_key`].
     prefix_block_rows: u32,
+    mapped_rows: bool,
 }
 
 /// Channel room past [`ModelMux::queue_cap`] jobs, for control messages.
@@ -1227,6 +1272,10 @@ fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgre
 }
 
 impl ModelMux {
+    pub(crate) fn mapped_rows(&self) -> bool {
+        self.mapped_rows
+    }
+
     pub(crate) fn retire(&self) {
         self.retiring.store(true, Ordering::Release);
     }
@@ -1778,6 +1827,12 @@ fn spawn_scoped(
     #[cfg(not(any(feature = "cuda", feature = "hsa")))]
     let prefix_probe: Option<crate::memory::vmm::PrefixProbe> = None;
     let prefix_block_rows = prefix_probe.as_ref().map_or(0, |p| p.block_rows());
+    #[cfg(feature = "cuda")]
+    let mapped_rows = state.gpu_engine(&slug).is_some_and(|e| {
+        matches!(&*e.lock(), crate::serve::engine::ServeEngine::Cuda(e) if e.row_decode_rungs().next().is_some())
+    });
+    #[cfg(not(feature = "cuda"))]
+    let mapped_rows = false;
     #[cfg(any(feature = "cuda", feature = "hsa"))]
     let (resume_supported, prefix_cache, kv_row_bytes) =
         state.gpu_engine(&slug).map_or((false, false, 0), |e| {
@@ -2900,6 +2955,7 @@ fn spawn_scoped(
         preempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         queue_cap: ingress_capacity,
         prefix_block_rows,
+        mapped_rows,
     }
 }
 
@@ -8211,6 +8267,7 @@ fn gpu_prefill_batched_pass(
                         .as_ref()?
                         .first_audio
                         .as_ref()?
+                        .frame_budget()?
                         .frame_budget_ms()
                 })
                 .min_by(f64::total_cmp);
@@ -11312,6 +11369,7 @@ pub(crate) fn scripted_mux(
         preempted: Arc::default(),
         queue_cap: usize::MAX,
         prefix_block_rows: 0,
+        mapped_rows: false,
     }
 }
 
@@ -12038,6 +12096,7 @@ mod tests {
                 preempted: Arc::default(),
                 queue_cap: capacity,
                 prefix_block_rows: 0,
+                mapped_rows: false,
             },
             rx,
         )

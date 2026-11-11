@@ -37,8 +37,46 @@ def parse(path):
     return h.hexdigest()[:16], sections
 
 
-for path in sys.argv[1:]:
-    dev, sections = parse(path)
-    print(f"{path}: device {dev}")
-    for k in sorted(sections):
-        print(f"    {k}: {sections[k]}")
+
+def read_section(path, name):
+    """Read one metadata section without loading weights or scanning arbitrary tensor bytes."""
+    import os
+    import struct
+
+    with open(path, "rb") as stream:
+        header = stream.read(64)
+        if len(header) != 64 or header[:7] != b"PLOWDEV" or header[7] not in (8, 9, 10, 11):
+            raise ValueError(f"{path}: expected a sectioned devblob")
+        size = os.fstat(stream.fileno()).st_size
+        directory = struct.unpack_from("<Q", header, 40)[0]
+        if not 64 <= directory <= size - 8:
+            raise ValueError(f"{path}: invalid section directory")
+        stream.seek(directory)
+        magic, count = struct.unpack("<4sI", stream.read(8))
+        if magic != b"SECT" or count > 4096 or directory + 8 + 48 * count > size:
+            raise ValueError(f"{path}: malformed section directory")
+        entries = stream.read(48 * count)
+        found = None
+        for i in range(count):
+            kind, flags, offset, length, raw_name = struct.unpack_from("<IIQQ24s", entries, 48 * i)
+            section_name = raw_name.split(b"\0", 1)[0].decode("utf-8")
+            if offset < 64 or offset + length > directory:
+                raise ValueError(f"{path}: invalid section range for {section_name}")
+            if section_name == name:
+                if kind != 4:
+                    raise ValueError(f"{path}: {name} is not metadata")
+                if found is not None or length > 64 * 1024 * 1024:
+                    raise ValueError(f"{path}: duplicate or oversized {name}")
+                found = offset, length
+        if found is None:
+            return None
+        stream.seek(found[0])
+        return stream.read(found[1])
+
+
+if __name__ == "__main__":
+    for path in sys.argv[1:]:
+        dev, sections = parse(path)
+        print(f"{path}: device {dev}")
+        for k in sorted(sections):
+            print(f"    {k}: {sections[k]}")

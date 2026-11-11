@@ -77,12 +77,9 @@ static __device__ void cs_emitted(ControlSampleState& s, unsigned code) {
     } else if (s.boost_at != 0xffffffffu) { s.aeos_bias = 0; s.boost_at = 0xffffffffu; }
 }
 
-extern "C" __global__ void control_sample(
-    ControlSampleState* states, const ControlSampleRow* rows, const unsigned short* logits,
-    unsigned* codes, unsigned count, unsigned stride, unsigned classes, unsigned stop) {
-    if (blockIdx.x >= count) return;
-    if (classes > 4096 || !classes || stop + 1 != classes || stride < classes) { asm("trap;"); return; }
-    const auto row = rows[blockIdx.x];
+static __device__ __forceinline__ void control_sample_run(
+    ControlSampleState* states, ControlSampleRow row, const unsigned short* logits,
+    unsigned* codes, unsigned stride, unsigned classes, unsigned stop) {
     auto& s = states[row.slot];
     const auto& c = s.plan;
     extern __shared__ unsigned long long cs_mem[];
@@ -168,6 +165,42 @@ extern "C" __global__ void control_sample(
         codes[row.output] = s.last;
     }
 }
+extern "C" __global__ void control_sample(
+    ControlSampleState* states, const ControlSampleRow* rows, const unsigned short* logits,
+    unsigned* codes, unsigned count, unsigned stride, unsigned classes, unsigned stop) {
+    if (blockIdx.x >= count) return;
+    if (classes > 4096 || !classes || stop + 1 != classes || stride < classes) { asm("trap;"); return; }
+    const auto row = rows[blockIdx.x];
+    control_sample_run(states, row, logits, codes, stride, classes, stop);
+}
+
+extern "C" __global__ void handoff_control_sample(
+    ControlSampleState* states, const unsigned* slots, const unsigned* logits_rows,
+    const unsigned short* logits, unsigned* codes, unsigned count, unsigned state_capacity, unsigned output_capacity,
+    unsigned logits_capacity, unsigned stride, unsigned classes, unsigned stop) {
+    if (!states || !slots || !logits_rows || !logits || !codes || ((uint64_t)states & 7u)
+        || ((uint64_t)slots & 3u) || ((uint64_t)logits_rows & 3u) || ((uint64_t)logits & 1u) || ((uint64_t)codes & 3u)
+        || blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1
+        || gridDim.y != 1 || gridDim.z != 1 || !state_capacity || !output_capacity || !logits_capacity
+        || count > state_capacity || count > output_capacity || classes < 2 || classes > 4096
+        || stop + 1 != classes || stride < classes
+        || (uint64_t)logits_capacity * stride > UINT64_MAX / 2) { asm("trap;"); return; }
+    const unsigned r = blockIdx.x;
+    if (r >= count) return;
+    const ControlSampleRow row{slots[r], r, logits_rows[r]};
+    if (row.slot >= state_capacity || row.logits >= logits_capacity) {
+        asm("trap;"); return;
+    }
+    const auto& c = states[row.slot].plan;
+    if (c.penalty_window > 256 || c.hist > 256 || c.pmax > 256 || c.n_windows > 16
+        || !isfinite(c.temperature) || c.temperature <= 0 || !isfinite(c.top_p)
+        || !isfinite(c.presence_penalty) || !isfinite(c.stop_p) || !isfinite(c.stop_hazard)
+        || !isfinite(c.period_thr) || !isfinite(c.boost) || states[row.slot].last >= stop) {
+        asm("trap;"); return;
+    }
+    control_sample_run(states, row, logits, codes, stride, classes, stop);
+}
+
 extern "C" __global__ void control_sample_finish(
     const ControlSampleState* states, const ControlSampleRow* rows, unsigned* codes,
     unsigned count, unsigned codebooks, unsigned stop) {

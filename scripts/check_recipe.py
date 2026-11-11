@@ -129,6 +129,12 @@ def check_capabilities(recipe: dict) -> None:
         need(not UNMEASURED.search(reason), f"capabilities: {name}: an unmeasured route is not a waiver ({reason!r})")
 
 
+def check_speech_tags(recipe: dict, path: Path) -> list[str]:
+    rc.speech_tag_policy(recipe, path)
+    notice = rc.legacy_speech_tag_notice(recipe, path)
+    return ["info: " + notice] if notice else []
+
+
 def check_rung_choices(recipe: dict) -> None:
     """A `validated` recipe states a rung-eligible knob (packet-wide or in `[emit.rung_env]`) only
     with `[rung_choices.<KNOB>]`: `label = "qualified"` and the per-rung measurement as `evidence`
@@ -389,6 +395,7 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     if recipe.get("status", "emits") == "refused":
         return check_provenance(recipe, strict)
 
+    notes += check_speech_tags(recipe, recipe_path)
     notes += check_lowrung_tiers(recipe)
     recipe_rung_env(recipe)
     check_rung_choices(recipe)
@@ -396,6 +403,8 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     spec_errors = spec_env.errors(recipe)
     need(not spec_errors, "; ".join(spec_errors))
 
+    if bundle and (bundle / "model.pkt").exists():
+        notes += [f"{level}: {message}" for level, message in rc.check_packet_speech_tags(bundle / "model.pkt", recipe, recipe_path) if level != "NOTICE"]
     if bundle:
         bj = rc.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
         wj = rc.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}
@@ -420,11 +429,22 @@ def run() -> None:
     ap.add_argument("--objects", help="the built object directory")
     ap.add_argument("--strict", action="store_true", help="promote reports to refusals")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--speech-packet", type=Path, help="CPU doctor check of the actual emitted tag map; recipe defaults to ../recipe.toml")
     args = ap.parse_args()
 
     if args.self_test:
         self_test()
         print("check_recipe selftest: PASS")
+        return
+    if args.speech_packet:
+        recipe_path = Path(args.recipe[0]) if args.recipe else args.speech_packet.parent.parent / "recipe.toml"
+        try:
+            recipe = rc.load_toml(recipe_path) if recipe_path.exists() else None
+            for level, message in rc.check_packet_speech_tags(args.speech_packet, recipe, recipe_path):
+                print(f"{level}\t{message}")
+        except (rc.Fail, OSError, ValueError, KeyError, TypeError) as error:
+            print(f"FAIL\t{error}")
+            raise SystemExit(1)
         return
     if not args.recipe:
         rc.die("give at least one recipe")

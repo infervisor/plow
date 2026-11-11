@@ -1092,13 +1092,22 @@ instructions for Breeze, and style/rate instructions for Qwen CustomVoice. Qwen 
 Veena strip unsupported controls. Every profile uses runtime silence for pauses and strips
 special-token markers. Fish passes unknown tag-shaped names through as its native bracket form.
 Breeze drops Chinese laughter and calm/friendly controls; their English mappings remain enabled.
+Chatterbox and Chatterbox Multilingual strip unsupported controls and rewrite remaining ASCII
+`[` / `]` to `(` / `)` before their text frontends run. This also covers escaped and malformed
+brackets, preventing user text from producing event or language tokens through those forms.
+The frontend still generates the selected language's trusted prefix. This protection requires
+the emitted map; the shared fallback map does not rewrite brackets. `tags: "off"` restores the
+original tokenizer behavior, including bracket tokens.
+This is an ASCII bracket policy: inputs without an ASCII tag-processing trigger retain their
+original behavior, including Unicode compatibility brackets normalized by a model's frontend.
 
 Pauses are runtime silence at segment boundaries, including leading or trailing pauses.
 The default is 400 ms; durations above 3000 ms are clamped. Native tags remain atomic across
 segments; mappings marked `carry` are repeated on later segments.
 Responses report canonical names in `x-plow-tags-applied` and `x-plow-tags-dropped`
 (up to 32 distinct names each). WebSocket speech sends one `{"type":"tags","applied":...,"dropped":...}`
-text message before its binary audio when tags were applied or dropped.
+text message before its binary audio when tag processing is active. Both lists can be empty
+when processing only markup or preserved literal forms. `tags: "off"` sends no tag report.
 
 For existing packets without tag metadata, `PLOW_TTS_TAGS_DEFAULT=strip`
 (`--tts-tags-default strip`) enables the shared strip-and-silence policy at load.
