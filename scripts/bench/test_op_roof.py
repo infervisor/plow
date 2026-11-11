@@ -34,6 +34,68 @@ class SweepTests(unittest.TestCase):
 
 
 class QuantizedDecodeCostTests(unittest.TestCase):
+    def test_codec_pointwise_projection_prices_actual_weights_and_residual(self):
+        text = ("===== program T=400 =====\n"
+                "#0 Conv1dF32 b=132 out<-x x<-s weight<-w.post.layers.0.wo_s "
+                "bias<-— alpha<-— residual<-x lengths<-— row_scale<-— "
+                "| batch=1 in_rows=400 in_channels=512 out_channels=512 kernel=1 "
+                "stride=1 dilation=1 groups=1 pads=0 flags=2105344")
+        program = op_roof.parse(text)[0]
+        p = program[2][0][3]
+        self.assertEqual(op_roof.cost("Conv1dF32", p, 400, 256, 2, 2),
+                         (4 * 512 * 512 + 12 * 400 * 512, 2 * 400 * 512 * 512))
+        self.assertEqual(program[2][0][2], "w.post.wo_s")
+        for change in (dict(kernel=3), dict(pads=1), dict(groups=2),
+                       dict(has_lengths=True), dict(flags=1 << 20)):
+            self.assertIsNone(op_roof.cost("Conv1dF32", dict(p, **change), 400, 256, 2, 2))
+        half = dict(p, flags=1 << 12, has_residual=False)
+        self.assertEqual(op_roof.cost("Conv1dF32", half, 400, 256, 2, 2)[0],
+                         2 * 512 * 512 + 8 * 400 * 512)
+
+    def test_streaming_codec_attention_counts_window_and_requires_context(self):
+        for pos in (1, 32, 249, 256):
+            for q in (1, 2, 4):
+                ring = dict(batch=32, q_rows=q, kv_rows=249, heads=8,
+                            head_width=64, flags=(250 << 16) | 0x109)
+                stream = dict(ring, kv_rows=249 + q, bias_head_stride=249,
+                              flags=(250 << 16) | 9)
+                counts = [min(min(pos, 249) + r + 1, 250) for r in range(q)]
+                expected = (8 * 32 * 8 * 64 * (q + min(pos, 249) + q),
+                            4 * 32 * 8 * 64 * sum(counts))
+                for p in (ring, stream):
+                    self.assertEqual(op_roof.cost("AttentionF32", p, 32, pos, 2, 2), expected)
+                    self.assertIsNone(op_roof.cost("AttentionF32", p, 32, 0, 2, 2))
+        ring["flags"] |= 16
+        self.assertIsNone(op_roof.cost("AttentionF32", ring, 32, 256, 2, 2))
+
+    def test_codec_carry_and_ring_have_distinct_traffic(self):
+        p = dict(B=200, L=249, N=2, C=1024, Cz=1536)
+        for mode, expected in (
+                (0, 4 * 200 * (249 * 1024 + 2 * 1536 + 251 * 1536 + 2)),
+                (1, 8 * 200 * 249 * 1024 + 8 * 200),
+                (2, 8 * 200 * 2 * 1024 + 12 * 200),
+                (3, 4 * 200 * (249 * 1024 + 2 * 1536 + 251 * 1536 + 3))):
+            self.assertEqual(op_roof.cost("StreamTailF32", dict(p, mode=mode), 200, 256, 2, 2),
+                             (expected, 0))
+        self.assertIsNone(op_roof.cost("StreamTailF32", dict(p, mode=4), 200, 256, 2, 2))
+        self.assertIsNone(op_roof.cost("StreamTailF32", dict(p, mode=0), 200, 0, 2, 2))
+        self.assertEqual(op_roof.cost("RopeAxialF32", dict(rows=400, heads=16, head_width=64,
+                                                          axes=1, flags=0), 400, 256, 2, 2),
+                         (8 * 400 * 16 * 64 + 4 * 400, 0))
+
+    def test_ring_codec_disassembly_uses_lengths_as_active_rows(self):
+        text = ("===== program T=400 =====\n"
+                "#0 AttentionF32 b=3200 out<-s query<-q key<-state value<-slot "
+                "key_lengths<-n bias<-pos prefix<-— prefix_index<-— "
+                f"| batch=200 q_rows=2 kv_rows=249 heads=8 head_width=64 "
+                f"in_stride=1536 flags={(250 << 16) | 0x109} bias_head_stride=320\n"
+                "#1 StreamTailF32 b=200 z<-— src<-q state<-state slot<-slot n<-n pos<-pos "
+                "| B=200 L=249 N=2 C=1024 Cz=1536 zc0=512 src_stride=1536 mode=2 slots=320")
+        program = op_roof.parse(text)[0]
+        priced = op_roof.price(program, 256, 2, 2, 3092.8, 781)
+        op_roof.require_priced(program, priced)
+        self.assertEqual(priced[0][2], 4 * 200 * 8 * 64 * 500)
+
     def test_depth_projection_precision_and_grouped_epilogue(self):
         shape = {"M": 200 * 26, "N": 1024, "K": 3072,
                  "bias_group": 26, "flags": 3 | 4 | 8 | 512 | 1024 | 8192}
