@@ -23,6 +23,12 @@ class DoctorSpeechTests(unittest.TestCase):
             pipeline["parameters"]["text.tags_version"] = 1
             write_packet(path, [pipeline])
             self.assertEqual(rc.check_packet_speech_tags(path, recipe)[0][0], "ok")
+            pipeline["parameters"]["text.tags_version"] = True
+            write_packet(path, [pipeline])
+            with self.assertRaisesRegex(rc.Fail, "unsupported"):
+                rc.check_packet_speech_tags(path, recipe)
+            pipeline["parameters"]["text.tags_version"] = 1
+            write_packet(path, [pipeline])
             recipe["speech_tags"]["map"]["literal_rewrite"].append(["[", "("])
             with self.assertRaisesRegex(rc.Fail, "differs"):
                 rc.check_packet_speech_tags(path, recipe)

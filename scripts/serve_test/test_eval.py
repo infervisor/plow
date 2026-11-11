@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
 from pathlib import Path
 import struct
 import tempfile
@@ -237,3 +238,75 @@ class CapabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TagGateWireTests(unittest.TestCase):
+    def test_local_http_capture_headers_lenient_values_and_cpu_rescore(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import sys
+        from tag_gate import score
+        from test_tag_gate import config
+        import asr_check
+
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen.append(body)
+                text = body["input"]
+                marker = re.search(r"\[pause (\d+)ms\]", text)
+                samples = [6500] * 100 + [9800] * 100
+                if marker:
+                    zeros = [0] * int(marker[1])
+                    if marker.start() == 0:
+                        samples = zeros + samples
+                    elif marker.end() == len(text):
+                        samples += zeros
+                    else:
+                        samples[100:100] = zeros
+                output = io.BytesIO()
+                with wave.open(output, "wb") as wav:
+                    wav.setparams((1, 2, 1000, 0, "NONE", "not compressed"))
+                    wav.writeframes(struct.pack("<" + "h" * len(samples), *samples))
+                self.send_response(200)
+                if marker and body.get("tags") != "off":
+                    self.send_header("x-plow-tags-applied", "pause")
+                    self.send_header("x-plow-tags-dropped", "laugh" if "[laugh]" in text else "")
+                self.end_headers()
+                self.wfile.write(output.getvalue())
+
+        with tempfile.TemporaryDirectory() as tmp, ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.shutdown)
+            root = Path(tmp)
+            cfg = config()
+            cfg["settings"]["sample_rate"] = 1000
+            path = root / "config.json"
+            path.write_text(json.dumps(cfg))
+            args = argparse.Namespace(tts_tag_config=str(path), tts_manifest=None, tts_capture_only=True,
+                                      tts_concurrency=1, tts_stream=True, limit=0, voice=None, tts_prompts="cbx")
+            with mock.patch.object(evaluation, "URL", f"http://127.0.0.1:{server.server_port}"):
+                result = evaluation.eval_tts(args, ["model"], root)["model"]
+            server.shutdown()
+            thread.join(timeout=5)
+            self.assertEqual(result["errors"], 0)
+            self.assertEqual(len(seen), 66)
+            self.assertTrue(any(body.get("tags") == {"mode": "off"} for body in seen))
+            self.assertTrue(any(body.get("tags") is None for body in seen))
+            rows = result["rows"]
+            asr = dict(rows=[dict(case_id=r["case_id"], text=r["reference"], language=r["reference_language"], hyp=r["reference"], cer=0)
+                             for r in rows])
+            raw = root / "asr-raw.json"
+            raw.write_text(json.dumps(asr))
+            report = root / "tags.json"
+            with mock.patch.object(sys, "argv", ["asr_check.py", "--tag-config", str(path), "--tag-capture", str(root),
+                                                "--tag-report", str(raw), "--out", str(report)]), \
+                    mock.patch.dict(sys.modules, torch=None, transformers=None), self.assertRaises(SystemExit) as result:
+                asr_check.main()
+            self.assertEqual(result.exception.code, 0)
+            self.assertTrue(json.loads(report.read_text())["pass"])

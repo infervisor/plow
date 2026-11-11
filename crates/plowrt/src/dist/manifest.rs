@@ -394,6 +394,17 @@ pub fn read_recipe(path: &Path, over: Overrides<'_>) -> Result<Identity> {
     }
     if let Some(policy) = &r.speech_tags {
         policy.validate().map_err(bad)?;
+        if r.status.as_deref() == Some("validated")
+            && policy
+                .map
+                .as_ref()
+                .is_some_and(|m| m.tags.values().any(|e| e.text.is_some()))
+            && policy.native_sweep.is_none()
+        {
+            return Err(bad(
+                "speech_tags: a validated native map requires its measured native_sweep report",
+            ));
+        }
     }
     let at = |what: &str| format!("{}: {what}", path.display());
 

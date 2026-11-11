@@ -20,6 +20,7 @@ script; ground-truth ASR parity must be checked before comparison. --transcripts
 saved {rows: [{text, hyp, language, ...}]} without ASR and labels that scope in the report.
 """
 import argparse, glob, hashlib, json, math, os, re, statistics, string, sys, unicodedata
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -304,6 +305,9 @@ def seed_wer_main(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("wavs", nargs="*")
+    ap.add_argument("--tag-capture", type=Path, help="eval.py tag capture directory; score all WAVs with the existing ASR protocol")
+    ap.add_argument("--tag-config", type=Path, help="campaign speech-tag config (also enables CPU report re-score)")
+    ap.add_argument("--tag-report", type=Path, help="saved full ASR JSON; CPU-only tag-gate re-score")
     ap.add_argument("--texts", help="json: {basename: text}")
     ap.add_argument("--max-cer", type=float, default=0.15)
     ap.add_argument("--model")
@@ -316,6 +320,29 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", help="write full transcripts and exact CER results as JSON")
     args = ap.parse_args()
+    if args.tag_config:
+        from tag_gate import score, validate_config
+        config = json.loads(args.tag_config.read_text())
+        validate_config(config)
+        if args.tag_capture is None or args.out is None:
+            ap.error("--tag-config requires --tag-capture and --out")
+        # eval.py emits exactly one model for this mode.
+        directories = list(args.tag_capture.glob("tts-*/capture.json"))
+        if len(directories) != 1:
+            ap.error("tag capture needs exactly one tts-*/capture.json")
+        directory = directories[0].parent
+        if args.tag_report:
+            report = score(config, json.loads(directories[0].read_text()),
+                           json.loads(args.tag_report.read_text()), directory)
+            Path(args.out).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+            sys.exit(0 if report["pass"] else 1)
+        if args.metric != "cer":
+            ap.error("tag capture requires --metric cer")
+        args.wavs = sorted(str(p) for p in directory.glob("*.wav"))
+        args.texts = str(directory / "texts.json")
+        args.max_cer = config["settings"]["cer_max"]
+    elif args.tag_capture or args.tag_report:
+        ap.error("--tag-capture/--tag-report require --tag-config")
     if args.max_wer is not None and (not math.isfinite(args.max_wer) or args.max_wer < 0):
         ap.error("--max-wer must be finite and nonnegative")
     if args.metric == "seed-tts-wer":
@@ -385,10 +412,15 @@ def main():
     print(f"MEDIAN_CER={med:.3f} n={len(cers)}")
     gates = tag_gates(rows, baseline, args.cer_margin)
     report = dict(cer_report(rows, args.model, args.max_cer), tag_gate=gates)
+    if args.tag_config:
+        raw_path = Path(args.out).with_name("asr-raw.json")
+        raw_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        report = score(config, json.loads(directories[0].read_text()), report, directory)
     if args.out:
         with open(args.out, "w") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
-    sys.exit(0 if med <= args.max_cer and gates["passed"] else 1)
+    passed = report["pass"] if args.tag_config else med <= args.max_cer and gates["passed"]
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":
