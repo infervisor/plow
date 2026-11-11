@@ -3415,7 +3415,20 @@ mod tests {
         manager.load_initial().await.unwrap();
         super::bind(&state, &slug).unwrap();
         let tok = state.registry.get(&slug).unwrap().tokenizer().clone();
-        {
+        let guided = {
+            let mut models = super::guided_models().lock();
+            if let Some(Some(model)) = models.get_mut(&(assets.clone(), 0)) {
+                map.validate_binding(false, |text| {
+                    tok.encode_with_special_tokens(text, false).len() == 1
+                })
+                .unwrap();
+                Arc::get_mut(model).unwrap().set_test_tags(map.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if !guided {
             let mut models = super::speech_models().lock();
             let model =
                 Arc::get_mut(models.get_mut(&(assets, 0)).unwrap().as_mut().unwrap()).unwrap();

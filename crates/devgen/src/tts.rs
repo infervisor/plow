@@ -5,7 +5,7 @@
 
 use crate::pipeline::{causal_pipeline_section, CausalPipelineSpec};
 use packet::devbuild::{Model, SectionData};
-use plow_asset::packet_pipeline::{PacketPipelines, SECTION};
+use plow_asset::packet_pipeline::{PacketPipeline, PacketPipelines, SECTION};
 use plow_asset::speech_tags::{Entry, Langs, SpeechTags, Unknown};
 
 pub const DRIVER: &str = "tts.codec_lm.v1";
@@ -79,6 +79,26 @@ pub struct CloneLayout {
 
 fn strip_tags(_: bool) -> SpeechTags {
     SpeechTags::strip()
+}
+
+fn guided_tags() -> SpeechTags {
+    let mut map = SpeechTags::strip();
+    map.literal_rewrite
+        .extend([("[".into(), "(".into()), ("]".into(), ")".into())]);
+    map
+}
+
+fn add_tags(pipe: &mut PacketPipeline, map: SpeechTags) -> Result<(), String> {
+    map.validate()?;
+    pipe.parameters.insert(
+        plow_asset::speech_tags::VERSION_KEY.into(),
+        plow_asset::speech_tags::VERSION,
+    );
+    pipe.strings.insert(
+        plow_asset::speech_tags::KEY.into(),
+        serde_json::to_string(&map).map_err(|e| e.to_string())?,
+    );
+    Ok(())
 }
 
 fn native_entry(text: &str, carry: bool) -> Entry {
@@ -504,6 +524,7 @@ pub fn t3_pipeline_section(
         .first_mut()
         .ok_or("causal section has no pipeline")?;
     pipe.driver = GUIDED_LM_DRIVER.into();
+    add_tags(pipe, guided_tags())?;
     let t = model
         .tensors
         .get(pos_base as usize)
@@ -810,14 +831,7 @@ pub fn speech_pipeline_section(
     if let Some(build) = p.tags {
         let map = build(takes_instructions);
         map.validate_binding(takes_instructions, |_| true)?;
-        pipe.parameters.insert(
-            plow_asset::speech_tags::VERSION_KEY.into(),
-            plow_asset::speech_tags::VERSION,
-        );
-        pipe.strings.insert(
-            plow_asset::speech_tags::KEY.into(),
-            serde_json::to_string(&map).map_err(|e| e.to_string())?,
-        );
+        add_tags(pipe, map)?;
     }
     meta.validate(model.progs.len(), |name| {
         model
@@ -839,6 +853,63 @@ mod speech_tests {
     use crate::pipeline::CausalPipelineTensors;
     use packet::devbuild::Builder;
     use plow_asset::dual_stream::{CONDITIONED_DRIVER, CONDITIONING_KEY};
+
+    #[test]
+    fn guided_tag_maps_protect_literal_brackets() {
+        let mut tensors = Builder::new(2);
+        let tokens = tensors.tensor("in.ids", 512 * 4);
+        let positions = tensors.tensor("in.pos", 512 * 4);
+        let kv_lengths = tensors.tensor("in.kvlen", 4);
+        let pos_base = tensors.tensor("pos_base", 4);
+        let model = Model {
+            n_cu: 2,
+            target: 0,
+            tensors: tensors.tensors(),
+            progs: (0..2).map(|_| Builder::new(2).finish()).collect(),
+            kv_row_insts: Vec::new(),
+            prog_t: vec![512, 1],
+            gen: Vec::new(),
+        };
+        let spec = CausalPipelineSpec {
+            name: "speech",
+            max_context: 512,
+            hidden: 4,
+            decode_capacity: 1,
+            overlay_rows: 0,
+            ordered_dispatch: false,
+            tensors: CausalPipelineTensors {
+                tokens,
+                positions,
+                kv_lengths,
+                overlay: None,
+                overlay_index: None,
+            },
+        };
+        let dir = std::env::temp_dir().join(format!("plow-guided-tags-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["chatterbox", "chatterbox-mtl"] {
+            if name == "chatterbox-mtl" {
+                std::fs::write(
+                    dir.join("text_frontend.json"),
+                    serde_json::json!({"rules":"[]","languages":{"en":"[]","hi":"[]"},"default_language":"en","tables":[]}).to_string(),
+                ).unwrap();
+            }
+            let meta: PacketPipelines = serde_json::from_slice(
+                &t3_pipeline_section(&model, spec, pos_base, &[], &dir, false)
+                    .unwrap()
+                    .data,
+            )
+            .unwrap();
+            let pipe = &meta.pipelines[0];
+            check_tag_pipeline(name, pipe, &[], false);
+            let map = SpeechTags::parse(&pipe.strings[plow_asset::speech_tags::KEY]).unwrap();
+            assert_eq!(map, guided_tags());
+            assert!(map.literal_rewrite.contains(&("[".into(), "(".into())));
+            assert!(map.literal_rewrite.contains(&("]".into(), ")".into())));
+            assert_eq!(pipe.driver, GUIDED_LM_DRIVER);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn check_tag_pipeline(
         name: &str,
