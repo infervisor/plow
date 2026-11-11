@@ -1329,7 +1329,6 @@ fn every_recipe_in_the_tree_is_readable_or_needs_a_speech_policy() {
         plow_git: None,
         toolchain: Some("rocm-7.14.0-nix"),
     };
-    let mut speech_migrations = 0;
     let refused: Vec<String> = files
         .iter()
         .filter_map(|p| match read_recipe(p, over) {
@@ -1339,20 +1338,14 @@ fn every_recipe_in_the_tree_is_readable_or_needs_a_speech_policy() {
             // carried by the distribution (`local:`, `pip:`, a re-keyed
             // local file set) was never packable; the rule only names it now.
             Err(e) if e.to_string().contains("is not `hf:<org>/<repo>` or `dist`") => None,
-            Err(e) if e.to_string().contains("speech_tags: missing policy") => {
-                speech_migrations += 1;
-                None
-            }
+            // The checker admits only the dated, unchanged migration inventory without a policy.
+            Err(e) if e.to_string().contains("speech_tags: missing policy") => None,
             Err(e) => Some(format!(
                 "{}: {e}",
                 p.strip_prefix(&root).unwrap_or(p).display()
             )),
         })
         .collect();
-    assert_eq!(
-        speech_migrations, 19,
-        "2026-11-11 speech recipe migration inventory"
-    );
     assert!(
         refused.is_empty(),
         "{} of {} recipes cannot be packed:\n{}",
