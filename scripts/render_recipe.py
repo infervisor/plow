@@ -87,7 +87,7 @@ def block_emit(r: dict) -> str:
         return "# This recipe does not emit: see `refusal`."
     if errs := spec_env.errors(r):
         raise SystemExit("render_recipe: " + "; ".join(errs))
-    out = ["nix develop --command env \\"]
+    out = rc.speech_tag_policy_lines(r) + ["nix develop --command env \\"]
     out += env_prefix({**spec_env.emit_env(r), **(e.get("env") or {})})
     src = rung_env.recipe_source_errors(r)
     if src:
