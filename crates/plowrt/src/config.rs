@@ -214,6 +214,10 @@ pub struct RuntimeConfig {
     )]
     pub tts_stream_first_frames: Option<usize>,
 
+    /// Strip markup and insert runtime pauses on speech packets without a tag map. Unset: legacy text path.
+    #[arg(long = "tts-tags-default", env = "PLOW_TTS_TAGS_DEFAULT", value_parser = ["strip"], global = true)]
+    pub tts_tags_default: Option<String>,
+
     /// A later stateful codec step of a stream waits up to this long before its playback
     /// would reach the end of the audio already sent, so steps of several streams share one
     /// launch (0: every step launches at once).
@@ -3841,6 +3845,31 @@ mod scope_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tts_tags_default_is_opt_in_and_rejects_unknown_policies() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "tts_tags_default")
+            .unwrap();
+        assert!(arg.get_default_values().is_empty());
+        let matches = command
+            .clone()
+            .try_get_matches_from(["test", "--tts-tags-default", "strip"])
+            .unwrap();
+        assert_eq!(
+            super::RuntimeConfig::from_arg_matches(&matches)
+                .unwrap()
+                .tts_tags_default
+                .as_deref(),
+            Some("strip")
+        );
+        assert!(command
+            .try_get_matches_from(["test", "--tts-tags-default", "typo"])
+            .is_err());
+    }
+
     /// Serve knobs the Gemma-4 H100 recipes used to pin: unset follows the engine or the packet,
     /// an explicit value wins, `0` rolls back.
     #[test]

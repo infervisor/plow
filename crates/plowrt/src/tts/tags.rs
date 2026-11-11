@@ -966,6 +966,43 @@ mod tests {
     }
 
     #[test]
+    fn fallback_is_opt_in_and_never_masks_packet_metadata() {
+        let mut p = plow_asset::packet_pipeline::PacketPipeline {
+            name: "speech".into(),
+            driver: "tts.codec_lm.v1".into(),
+            programs: Default::default(),
+            tensors: Default::default(),
+            parameters: Default::default(),
+            strings: Default::default(),
+        };
+        assert!(load_with_default(&p, false).unwrap().is_none());
+        let a = load_with_default(&p, true).unwrap().unwrap();
+        let b = load_with_default(&p, true).unwrap().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        assert_eq!(*a, SpeechTags::strip());
+        assert!(matches!(
+            render(Some(&a), "[laughs]Hello", Mode::Off, None, None, 1.0)
+                .unwrap()
+                .input,
+            Cow::Borrowed(_)
+        ));
+        let mut explicit = SpeechTags::strip();
+        explicit.unknown = Unknown::Reject;
+        p.strings.insert(
+            "text.tags".into(),
+            serde_json::to_string(&explicit).unwrap(),
+        );
+        assert!(load_with_default(&p, true).is_err());
+        p.parameters.insert("text.tags_version".into(), 1);
+        assert_eq!(
+            load_with_default(&p, true).unwrap().unwrap().unknown,
+            Unknown::Reject
+        );
+        p.parameters.insert("text.tags_version".into(), 2);
+        assert!(load_with_default(&p, true).is_err());
+    }
+
+    #[test]
     fn malformed_unicode_and_delimiters_are_chunk_independent() {
         let m = map();
         let alphabet = [
@@ -1009,8 +1046,28 @@ mod tests {
 pub fn load(
     p: &plow_asset::packet_pipeline::PacketPipeline,
 ) -> crate::Result<Option<std::sync::Arc<SpeechTags>>> {
+    load_with_default(
+        p,
+        crate::config::RuntimeConfig::get()
+            .tts_tags_default
+            .as_deref()
+            == Some("strip"),
+    )
+}
+
+fn load_with_default(
+    p: &plow_asset::packet_pipeline::PacketPipeline,
+    strip: bool,
+) -> crate::Result<Option<std::sync::Arc<SpeechTags>>> {
     use plow_asset::speech_tags::{KEY, VERSION, VERSION_KEY};
     match (p.strings.get(KEY), p.parameters.get(VERSION_KEY)) {
+        (None, None) if strip => {
+            static MAP: std::sync::OnceLock<std::sync::Arc<SpeechTags>> =
+                std::sync::OnceLock::new();
+            Ok(Some(std::sync::Arc::clone(
+                MAP.get_or_init(|| std::sync::Arc::new(SpeechTags::strip())),
+            )))
+        }
         (None, None) => Ok(None),
         (Some(json), Some(&VERSION)) => SpeechTags::parse(json)
             .map(|map| Some(std::sync::Arc::new(map)))

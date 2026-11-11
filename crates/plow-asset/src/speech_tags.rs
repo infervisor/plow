@@ -75,6 +75,67 @@ pub struct Silence {
 }
 
 impl SpeechTags {
+    pub fn strip() -> Self {
+        let mut tags: BTreeMap<String, Entry> = [
+            "laugh",
+            "chuckle",
+            "giggle",
+            "sigh",
+            "gasp",
+            "cough",
+            "clear_throat",
+            "inhale",
+            "exhale",
+            "sniff",
+            "yawn",
+            "groan",
+            "whisper",
+            "excited",
+            "happy",
+            "sad",
+            "angry",
+            "calm",
+            "serious",
+            "surprised",
+            "friendly",
+            "casual",
+            "rate",
+            "pitch",
+            "emphasis",
+        ]
+        .into_iter()
+        .map(|name| {
+            (
+                name.into(),
+                Entry {
+                    drop: Some(true),
+                    ..Entry::default()
+                },
+            )
+        })
+        .collect();
+        tags.insert(
+            "pause".into(),
+            Entry {
+                silence_ms: Some(Silence {
+                    default: 400,
+                    max: 3000,
+                }),
+                ..Entry::default()
+            },
+        );
+        Self {
+            syntax: Syntax {
+                bracket: true,
+                ssml: true,
+                asterisk: Asterisk::Known,
+            },
+            unknown: Unknown::Strip,
+            literal_rewrite: vec![("<|".into(), "< |".into())],
+            tags,
+        }
+    }
+
     pub fn parse(json: &str) -> Result<Self, String> {
         let map: Self = serde_json::from_str(json).map_err(|e| format!("text.tags: {e}"))?;
         map.validate()?;
@@ -212,6 +273,30 @@ mod tests {
     fn map() -> SpeechTags {
         SpeechTags::parse(r#"{"syntax":{"bracket":true,"ssml":true,"asterisk":"known"},"unknown":"strip","tags":{"pause":{"silence_ms":{"default":400,"max":3000}}}}"#).unwrap()
     }
+    #[test]
+    fn strip_policy_has_only_runtime_silence() {
+        let map = SpeechTags::strip();
+        map.validate_binding(false, |_| false).unwrap();
+        assert_eq!(map.unknown, Unknown::Strip);
+        for (name, entry) in &map.tags {
+            if name == "pause" {
+                assert_eq!(
+                    entry.silence_ms,
+                    Some(Silence {
+                        default: 400,
+                        max: 3000
+                    })
+                );
+            } else {
+                assert_eq!(entry.drop, Some(true), "{name}");
+            }
+        }
+        assert_eq!(
+            SpeechTags::parse(&serde_json::to_string(&map).unwrap()).unwrap(),
+            map
+        );
+    }
+
     #[test]
     fn fail_closed() {
         let m = map();
