@@ -49,6 +49,7 @@ pub mod ecapa;
 pub mod maya2;
 pub mod maya2_text;
 pub(crate) mod stretch;
+pub mod tags;
 
 use std::path::Path;
 
@@ -145,6 +146,7 @@ pub const DRIVER: &str = "tts.codec_lm.v1";
 /// The numeric contract of one `tts.codec_lm.v1` pipeline, read from packet metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpeechContract {
+    pub tags: Option<std::sync::Arc<plow_asset::speech_tags::SpeechTags>>,
     pub pipeline: String,
     /// Prompt text with `{voice}` and `{input}` placeholders.
     pub prompt_template: String,
@@ -278,6 +280,7 @@ impl SpeechContract {
             }
         };
         let mut c = SpeechContract {
+            tags: tags::load(p)?,
             pipeline: p.name.clone(),
             prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| {
                 RuntimeError::Rejected("speech pipeline lacks prompt.template".into())
@@ -441,6 +444,16 @@ impl SpeechContract {
                 text_pad,
             });
         }
+        if let Some(map) = &c.tags {
+            map.validate_binding(
+                c.instructions.is_some()
+                    || c.dual_stream
+                        .as_ref()
+                        .is_some_and(|d| d.instructions_template.is_some()),
+                |_| true,
+            )
+            .map_err(RuntimeError::Rejected)?;
+        }
         Ok(c)
     }
 
@@ -458,7 +471,25 @@ impl SpeechContract {
             .filter(|p| p.driver.starts_with("tts.codec_lm."));
         match (found.next(), found.next()) {
             (None, _) => Ok(None),
-            (Some(p), None) => Self::from_pipeline(p).map(Some),
+            (Some(p), None) => {
+                let c = Self::from_pipeline(p)?;
+                if let Some(map) = c
+                    .tags
+                    .as_ref()
+                    .filter(|map| map.tags.values().any(|e| e.single_token))
+                {
+                    let tok = crate::text::tokenizer::load_tokenizer(assets);
+                    map.validate_binding(
+                        c.instructions.is_some()
+                            || c.dual_stream
+                                .as_ref()
+                                .is_some_and(|d| d.instructions_template.is_some()),
+                        |s| tok.encode_with_special_tokens(s, false).len() == 1,
+                    )
+                    .map_err(RuntimeError::Rejected)?;
+                }
+                Ok(Some(c))
+            }
             (Some(_), Some(_)) => Err(RuntimeError::Rejected(
                 "ambiguous: several speech pipelines".into(),
             )),
@@ -540,6 +571,7 @@ impl SpeechContract {
         voices.sort_unstable();
         voices.dedup();
         let mut spec = api::SpeechSpec {
+            tags: self.tags.clone(),
             voices,
             languages: self.languages.clone(),
             // Maya 2 guesses a request's language from its script.
@@ -788,6 +820,8 @@ fn cuts(text: &str, r: (usize, usize), cut: Cut) -> Vec<(usize, usize)> {
 /// or "rrrr" with no syllable modulation for `DRONE_S`) is retried too. Silence is held only while
 /// the client has more than `HOLD_LEAD_S` of audio beyond it.
 pub(crate) struct Joins {
+    explicit_tail: bool,
+    explicit_lead: bool,
     rate: f64,
     /// Silent samples of the current run sent, and held back.
     sent: usize,
@@ -822,6 +856,8 @@ impl Joins {
 
     pub(crate) fn new(sample_rate: u32) -> Self {
         Joins {
+            explicit_tail: false,
+            explicit_lead: false,
             rate: f64::from(sample_rate),
             sent: 0,
             held: Vec::new(),
@@ -847,6 +883,22 @@ impl Joins {
         self.droned = false;
     }
 
+    pub(crate) fn has_tagged_boundary(&self) -> bool {
+        self.explicit_tail || self.explicit_lead
+    }
+
+    pub(crate) fn tagged_tail(&mut self, explicit: bool) {
+        self.explicit_tail = explicit;
+    }
+
+    pub(crate) fn pause(&mut self, ms: u32, speed: f32, out: &mut Vec<f32>) {
+        self.next_segment();
+        self.explicit_lead = true;
+        self.sent = 0;
+        let samples = (f64::from(ms) * self.rate * f64::from(speed) / 1000.0).round() as usize;
+        out.resize(out.len() + samples, 0.0);
+    }
+
     /// Append to `out` what of `pcm` to send now; `lead_s` is the audio the client has buffered.
     pub(crate) fn push(&mut self, pcm: &[f32], lead_s: f64, out: &mut Vec<f32>) {
         let rate = self.rate;
@@ -857,7 +909,9 @@ impl Joins {
             let rms = ms.sqrt();
             if rms >= Self::SILENCE {
                 self.loud += b.len();
-                let room = if self.speech || self.first {
+                let room = if self.explicit_lead {
+                    0
+                } else if self.speech || self.first {
                     self.held.len()
                 } else {
                     samples(Self::JOIN_PAUSE_S).saturating_sub(self.sent)
@@ -866,6 +920,7 @@ impl Joins {
                 self.held.clear();
                 self.sent = 0;
                 self.speech = true;
+                self.explicit_lead = false;
                 out.extend_from_slice(b);
                 continue;
             }
@@ -873,9 +928,11 @@ impl Joins {
                 self.quiet += b.len();
             }
             let held_s = (self.held.len() + b.len()) as f64 / self.rate;
-            let hold = (self.speech || !self.first)
-                && self.sent >= samples(Self::KEEP_S)
-                && lead_s - held_s > Self::HOLD_LEAD_S;
+            let hold = self.explicit_lead
+                || (self.explicit_tail && self.speech)
+                || (self.speech || !self.first)
+                    && self.sent >= samples(Self::KEEP_S)
+                    && lead_s - held_s > Self::HOLD_LEAD_S;
             if hold {
                 self.held.extend_from_slice(b);
             } else {
@@ -1090,6 +1147,10 @@ impl OutPcm {
             resampler,
             trim: None,
         })
+    }
+
+    pub fn keep_onset(&mut self) {
+        self.trim = None;
     }
 
     /// Trim the reply's leading silence (`policy`, `rate` = the model's).
@@ -1728,6 +1789,33 @@ mod tests {
         );
         s.push(&quiet(1.0), f64::INFINITY, &mut Vec::new());
         assert!(s.segment_failed());
+    }
+
+    #[test]
+    fn explicit_pause_replaces_model_silence_and_keeps_untagged_joins() {
+        let rate = 24000;
+        for speed in [0.75, 1.0, 1.14, 1.5] {
+            let mut joins = Joins::new(rate);
+            let mut pcm = Vec::new();
+            joins.tagged_tail(true);
+            let span = rate as usize / Joins::BLOCK * Joins::BLOCK;
+            let mut first = vec![0.1; span];
+            first.extend(vec![0.0; rate as usize]);
+            joins.push(&first, f64::INFINITY, &mut pcm);
+            assert_eq!(pcm.len(), span);
+            let before = pcm.len();
+            joins.pause(600, speed, &mut pcm);
+            let samples = (600.0 * f64::from(rate) * f64::from(speed) / 1000.0).round() as usize;
+            assert_eq!(pcm.len() - before, samples);
+            assert!(pcm[before..].iter().all(|&x| x == 0.0));
+            joins.tagged_tail(false);
+            let mut second = vec![0.0; rate as usize];
+            second.extend(vec![0.1; span]);
+            joins.push(&second, f64::INFINITY, &mut pcm);
+            // At most one energy block straddles the speech boundary.
+            assert!(pcm.len() <= 2 * span + samples + Joins::BLOCK);
+            assert!(pcm.len() >= 2 * span + samples - Joins::BLOCK);
+        }
     }
 
     #[test]

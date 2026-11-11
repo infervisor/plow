@@ -20,6 +20,7 @@ pub const MAX_OUT_RATE: u32 = crate::asr::frontend::MAX_INPUT_RATE;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpeechSpec {
+    pub tags: Option<std::sync::Arc<plow_asset::speech_tags::SpeechTags>>,
     /// Sorted.
     pub voices: Vec<String>,
     /// Sorted ISO 639-1 codes; empty: the model has no language selection.
@@ -369,7 +370,7 @@ impl SpeechSpec {
 
     /// The `/v1/models` card's `x_plow_speech`: what a client may send this model.
     pub fn card(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut card = serde_json::json!({
             "voices": self.voices,
             "languages": self.languages,
             "default_language": self.default_language,
@@ -393,7 +394,11 @@ impl SpeechSpec {
             "limits": {
                 "top_k_max": self.top_k_max,
             },
-        })
+        });
+        if let Some(map) = &self.tags {
+            card["tags"] = super::tags::card(map);
+        }
+        card
     }
 }
 
@@ -417,6 +422,7 @@ mod tests {
 
     fn spec(languages: &[&str]) -> SpeechSpec {
         SpeechSpec {
+            tags: None,
             voices: vec!["a".into(), "b".into()],
             languages: languages.iter().map(|s| s.to_string()).collect(),
             default_language: languages.first().map(|s| s.to_string()),

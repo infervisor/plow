@@ -957,6 +957,7 @@ impl GuidedSpeech {
         let mut languages: Vec<String> = tables.languages().map(str::to_owned).collect();
         languages.sort_unstable();
         let mut spec = SpeechSpec {
+            tags: c.tags.clone(),
             voices,
             languages,
             default_language: tables.language(None)?,
