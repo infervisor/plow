@@ -279,8 +279,13 @@ def speech_pipelines(packet: Path) -> list[dict]:
     if raw is None:
         return []
     metadata = json.loads(raw)
-    if type(metadata.get("version")) is not int or metadata["version"] != 1 or not isinstance(metadata.get("pipelines"), list):
+    if type(metadata.get("version")) is not int or metadata["version"] not in (1, 2) or not isinstance(metadata.get("pipelines"), list):
         die("speech_tags: unsupported packet pipeline metadata")
+    if metadata["version"] == 2:
+        plans = metadata.get("handoff_plans")
+        # The runtime validates native handoff proofs; this reader checks the tag policy.
+        if not isinstance(plans, dict) or not plans or any(not isinstance(p, dict) for p in plans.values()):
+            die("speech_tags: invalid v2 handoff plan container")
     return [p for p in metadata["pipelines"] if p.get("driver", "").startswith("tts.")]
 
 
