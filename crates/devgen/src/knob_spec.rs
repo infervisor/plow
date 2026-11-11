@@ -1199,6 +1199,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.decode_batch", Some("PLOW_DECODE_BATCH"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("emit.decode_ladder", Some("PLOW_DECODE_BATCH_LADDER"), Layer::Emit, Domain::Str, DECODE_LADDER_DEFAULT, DECODE_LADDER),
     KnobSpec::new("emit.decode_objects", None, Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.row_decode_object", None, Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.decode_projection_tuning", None, Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.max_chunk", Some("PLOW_MAX_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.max_request_chunk", Some("PLOW_MAX_REQUEST_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),

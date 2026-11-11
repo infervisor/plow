@@ -173,6 +173,8 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
             "modular"
         } else if pi >= dec_lo || dense_exact {
             "decode"
+        } else if packet::devbuild::is_row_decode_program(encoded_t) {
+            "row_decode"
         } else if packet::devbuild::is_token_batch_program(encoded_t) {
             "token_batch"
         } else {
@@ -2559,6 +2561,17 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
             },
         },
     });
+    let row_decode = phase("row_decode");
+    if !row_decode.is_empty() {
+        objects["ordinary"]["row_decode"] = json!({
+            "arms": keys(&row_decode),
+            "families": families(&row_decode),
+            "excluded_opcodes": excluded(&row_decode),
+            "resource_contract": resource_contract(false),
+            "inventory_prune_capable": true,
+            "capability": { "symbol": plow_asset::row_decode::CAPABILITY, "value": 1 },
+        });
+    }
     if packed_prefill.iter().any(|a| a.op == "FlashPrefillFp8") {
         objects["packed_prefill"]["fp8_capability"] = json!({
             "symbol": plow_asset::packed_prefill::FP8_CAPABILITY,
@@ -3328,6 +3341,7 @@ pub fn config_header(manifest: &Value) -> String {
     let prefill_ops = object_ops("prefill");
     let token_batch_ops = object_ops("token_batch");
     let decode_ops = object_ops("decode");
+    let row_decode_ops = object_ops("row_decode");
     let flash_ops = object_ops("flash");
     let decode_mla_ops = object_ops("decode_mla");
     let decode_mla_required = manifest
@@ -3460,8 +3474,17 @@ pub fn config_header(manifest: &Value) -> String {
             "#define {packet_m} {}\n",
             if present { 1 } else { 0 }
         ));
+        out.push_str(&format!("#ifndef {m}\n"));
+        if !row_decode_ops.is_empty() {
+            out.push_str(&format!(
+                "#if PLOW_NV_TOKEN_BATCH_BF16\n#define {m} {}\n#elif defined(PLOW_BUCKET_FLASH)\n",
+                u8::from(row_decode_ops.contains(&name))
+            ));
+        } else {
+            out.push_str("#if defined(PLOW_BUCKET_FLASH)\n");
+        }
         out.push_str(&format!(
-            "#ifndef {m}\n#if defined(PLOW_BUCKET_FLASH)\n#define {m} {}\n#elif defined(PLOW_BUCKET_DECODE_MLA)\n#define {m} {}\n#elif PLOW_TOKEN_BATCH\n#define {m} {}\n#elif PLOW_BUCKET_DECODE\n#define {m} {}\n#else\n#define {m} {}\n#endif\n#endif\n",
+            "#define {m} {}\n#elif defined(PLOW_BUCKET_DECODE_MLA)\n#define {m} {}\n#elif PLOW_TOKEN_BATCH\n#define {m} {}\n#elif PLOW_BUCKET_DECODE\n#define {m} {}\n#else\n#define {m} {}\n#endif\n#endif\n",
             if flash_ops.contains(&name) { 1 } else { 0 },
             if decode_mla_ops.contains(&name) { 1 } else { 0 },
             if token_batch_ops.contains(&name) { 1 } else { 0 },
@@ -4536,6 +4559,30 @@ mod tests {
             dense["objects"]["packed_prefill"]["arms"],
             dense["objects"]["ordinary"]["prefill"]["arms"]
         );
+    }
+
+    #[test]
+    fn row_decode_has_an_independent_object_inventory() {
+        let mut m = model();
+        m.progs.insert(
+            1,
+            prog(vec![inst(DevOp::FlashMerge, [8, 8, 1, 128, 0, 0, 0, 0])]),
+        );
+        m.prog_t
+            .insert(1, packet::devbuild::row_decode_program_t(8));
+        let manifest = build(&m, "sm_90a");
+        assert_eq!(manifest["programs"][1]["kind"], "row_decode");
+        assert!(manifest["objects"]["ordinary"]["row_decode"]["arms"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("FlashMerge/hd128")));
+        assert!(!manifest["objects"]["ordinary"]["decode"]["arms"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("FlashMerge/hd128")));
+        let header = config_header(&manifest);
+        assert!(header.contains("#if PLOW_NV_TOKEN_BATCH_BF16\n#define PLOW_HAS_FLASH_MERGE 1\n"));
+        assert!(!config_header(&build(&model(), "sm_90a")).contains("PLOW_NV_TOKEN_BATCH_BF16"));
     }
 
     /// cuBLASLt-routed decode rungs ask the object build for the routed decode object, and the

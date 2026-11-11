@@ -197,6 +197,7 @@ mod packed_terminal;
 pub mod packet_exec;
 pub mod rank;
 mod riders;
+mod row_decode;
 mod segment_gates;
 mod shared_tail;
 pub mod spec;
@@ -742,12 +743,13 @@ fn segment_role_metadata(blob: &DevBlob, raw: &[u8]) -> Result<Option<SegmentRol
 /// The narrowest decode rung whose program declares `MOE_DECODE_CUBLASLT` segments: where an
 /// unset `PLOW_MOE_DEC_LT` starts routing.
 fn moe_lt_decode_packet_min(blob: &DevBlob, roles: Option<&SegmentRoles>) -> Option<u32> {
-    let prefill = blob.prefill_progs().len();
     roles?
         .programs
         .iter()
         .filter(|program| {
-            program.index >= prefill
+            blob.progs
+                .get(program.index)
+                .is_some_and(|g| g.role.is_decode_rung())
                 && program
                     .roles
                     .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
@@ -3010,6 +3012,7 @@ pub struct GpuEngine {
     /// The packed launch's Qwen requests as (slot, rows), taken by `launch_prefill_chain`.
     qwen_pack: Vec<(usize, u32)>,
     mixed_step: Option<mixed_step::MixedCudaStep>,
+    row_decode: Option<row_decode::RowDecode>,
     token_batch: Option<token_batch::CudaTokenBatch>,
     /// Split attention for decode rows riding a packed prefill launch (`riders.rs`).
     riders: Option<riders::Riders>,
@@ -4585,7 +4588,9 @@ impl GpuEngine {
             .any(plow_asset::segment_roles::is_projection);
         let prefill_cublaslt_enabled = segment_roles.as_ref().is_some_and(|roles| {
             roles.programs.iter().any(|program| {
-                program.index < blob.prefill_progs().len()
+                blob.progs
+                    .get(program.index)
+                    .is_some_and(|g| g.role.is_prefill_side())
                     && program.roles.contains(&plow_asset::segment_roles::CUBLASLT)
             })
         });
@@ -4603,7 +4608,9 @@ impl GpuEngine {
             .unwrap_or_default();
         let moe_lt_decode_roles = segment_roles.as_ref().is_some_and(|roles| {
             roles.programs.iter().any(|program| {
-                program.index >= blob.prefill_progs().len()
+                blob.progs
+                    .get(program.index)
+                    .is_some_and(|g| g.role.is_decode_rung())
                     && program
                         .roles
                         .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
@@ -4618,7 +4625,9 @@ impl GpuEngine {
         // (`gen_decode.rs`): routed per rung from PLOW_GEN_DECODE_STEP rows.
         let gen_decode_declared = segment_roles.as_ref().is_some_and(|roles| {
             roles.programs.iter().any(|program| {
-                program.index >= blob.prefill_progs().len()
+                blob.progs
+                    .get(program.index)
+                    .is_some_and(|g| g.role.is_decode_rung())
                     && program
                         .roles
                         .iter()
@@ -4675,10 +4684,11 @@ impl GpuEngine {
         if decode_objects.is_some() || prepared_contexts.is_some() {
             decode_object::check_options(
                 segment_roles.as_ref().is_some_and(|roles| {
-                    roles
-                        .programs
-                        .iter()
-                        .any(|program| program.index >= blob.prefill_progs().len())
+                    roles.programs.iter().any(|program| {
+                        blob.progs
+                            .get(program.index)
+                            .is_some_and(|g| g.role.is_decode_rung())
+                    })
                 }),
                 cublaslt_enabled,
                 effective_multistep as usize,
@@ -8138,6 +8148,7 @@ impl GpuEngine {
             recurrent_packs: qwen_packs,
             qwen_pack: Vec::new(),
             mixed_step,
+            row_decode: None,
             token_batch: None,
             riders: None,
             gen_decode,
@@ -8182,11 +8193,15 @@ impl GpuEngine {
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
-        engine.fish = fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
+        if blob.reserved_metadata(raw, "block.json")?.is_none() {
+            engine.fish =
+                fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
+        }
         engine.depth_calibrate()?;
         engine.speech_identities = prefix::SpeechIdentities::new(engine.token_input_vocab());
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
+        engine.row_decode = row_decode::RowDecode::load(&engine, &blob, raw, assets_dir)?;
         if token_batch::CudaTokenBatch::eligible(&engine) {
             engine.riders = riders::Riders::load(&engine, &blob)?;
             engine.token_batch = token_batch::CudaTokenBatch::load(&engine);

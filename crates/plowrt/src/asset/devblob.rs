@@ -1169,6 +1169,7 @@ impl DevBlob {
                     packet::devbuild::packed_prefill_program_t(p.t)
                 }
                 ProgramRole::TokenBatchBody { .. } => packet::devbuild::token_batch_program_t(p.t),
+                ProgramRole::RowDecodeBody { .. } => packet::devbuild::row_decode_program_t(p.t),
                 ProgramRole::DenseExactRung { .. } => packet::devbuild::dense_exact_program_t(p.t),
                 ProgramRole::RowSplitSibling { .. } => {
                     packet::devbuild::rowsplit_prefill_program_t(p.t)

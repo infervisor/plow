@@ -102,6 +102,7 @@ mod projection_rewrite;
 mod residual_precision;
 mod rewrite_lower;
 pub mod rnnt;
+mod row_decode;
 pub mod s3gen;
 pub mod segment_resource;
 pub mod speaker_encoder;
@@ -4287,6 +4288,7 @@ fn emit_xreduce_gather(
 enum Mode {
     Prefill,
     Decode,
+    RowDecode,
     /// Decode shape, prefill kernels: tiled GEMM + FlashPrefill at one query row. Targets long
     /// context, where GEMV does not scale with batch (its split is over N, not M) and FlashDecode
     /// caps at n_cu. **Requires prefill opcodes in the interpreter** — the sm_120 build traps on
@@ -4297,11 +4299,11 @@ enum Mode {
 impl Mode {
     /// One query row, KV append + ring mask, decode's nsplit and one-shot all-reduce.
     fn decode_shape(self) -> bool {
-        matches!(self, Mode::Decode | Mode::DecodeTiled)
+        matches!(self, Mode::Decode | Mode::DecodeTiled | Mode::RowDecode)
     }
     /// The GEMV opcode family and every fusion that exists only to serve it, plus flash-decode.
     fn gemv(self) -> bool {
-        self == Mode::Decode
+        matches!(self, Mode::Decode | Mode::RowDecode)
     }
 }
 
@@ -4418,6 +4420,8 @@ fn emit_phase(
     // now one or the other: `decode` for shape, `gemv_family` for kernel family. (Not `gemv` —
     // the `hn_dep` closure below already binds a `gemv: u32` parameter that would shadow it.)
     let decode = mode.decode_shape();
+    let row_decode = mode == Mode::RowDecode;
+    let input_decode = decode && !row_decode;
     let gemv_family = mode.gemv();
     let fp8_lt_decode = gemv_family && fp8 && emit_config::active().decode_cublaslt_at(t);
     // The mixed AMD object has one GEMM tile, shared with its four-wave attention body.
@@ -4532,7 +4536,7 @@ fn emit_phase(
     let emit_frame = |b: &mut Builder, f: &FrameEmbed| {
         assert!(escale == 1.0, "a frame embedding has its own divisor");
         b.emit(DevOp::EmbedFrameBf16, rows.clone(), &[], |d| {
-            let codes = if decode {
+            let codes = if input_decode {
                 n.frame_dcodes
             } else {
                 n.frame_codes
@@ -4540,7 +4544,7 @@ fn emit_phase(
             // Maya 2: every decode row is a frame (token row dropped); prefill frame rows are the
             // reference's, marked by their token.
             let norm = if f.norm.is_some() { 2 } else { 0 };
-            let (lo, frame_rows, mode) = match (f.decode_only, decode) {
+            let (lo, frame_rows, mode) = match (f.decode_only, input_decode) {
                 (false, _) => (f.lo, f.rows, 0),
                 (true, false) => (f.lo, f.rows, 1 | norm),
                 (true, true) => (0, c.vocab, 1 | norm),
@@ -4565,7 +4569,7 @@ fn emit_phase(
     // layer's RmsNorm reads `act.x` directly (its dep is `&[]`; see below).
     let mut dep = if block_mode {
         0u32
-    } else if !decode && c.encoder_overlay_rows > 0 {
+    } else if !input_decode && c.encoder_overlay_rows > 0 {
         // A frame-embedding prompt embeds its frame rows first; their overlay index keeps them.
         let frame: Vec<u32> = c.frame.iter().map(|f| emit_frame(b, f)).collect();
         b.emit(DevOp::EmbedOverlayBf16, rows.clone(), &frame, |d| {
@@ -5858,6 +5862,7 @@ fn emit_phase(
         // whose split holds the new row writes k/v into the cache first. One item per KV head
         // (gqa == GF) and pos[]-addressed writes (n_batch_kv armed) are kernel preconditions.
         let hnr_fold = decode
+            && !row_decode
             && fuse_qkv
             && l < n.hnrd.len()
             && emit_config::active()
@@ -6030,7 +6035,7 @@ fn emit_phase(
             if shared {
                 return vec![Dep::Coarse(c_qn)];
             }
-            if !gemv_family {
+            if !gemv_family || row_decode {
                 return vec![Dep::Coarse(c_qn), Dep::Coarse(c_kn), Dep::Coarse(c_vn)];
             }
             let nblk_f = all.len() as u32;
@@ -6060,7 +6065,7 @@ fn emit_phase(
             // Span mode: rows of one sequence read each other's K/V rows written in this launch,
             // so the K/V edges wait for every row's store (all heads' items, scales included).
             let kv_edge = |producer: u32| {
-                if span_kv {
+                if span_kv || row_decode {
                     Dep::Coarse(producer)
                 } else {
                     Dep::Fine {
@@ -6089,7 +6094,7 @@ fn emit_phase(
         // just re-points its dep at the flash op with no threshold change.
         let fuse_merge = fuse_hnr && n.mrgc != TENSOR_NONE;
         // See nv_decode_merge_fold: flash writes `n.at` itself, j[1] = at | mrgc << 16.
-        let dec_fused = nv_fold;
+        let dec_fused = nv_fold && !row_decode;
         let mut c_fa = if fuse_hnr {
             // NRF fold packet: flash depends on the three RAW projections directly (the hnr
             // level is gone). Operands per the exec's unpacking map; kv_rows gets nothing —
@@ -6224,6 +6229,9 @@ fn emit_phase(
                 // only for B>1 so the B=1 packet stays byte-identical (j[0] default 0 => no check).
                 if t > 1 {
                     d.j[0] = t * kvh * kvr;
+                }
+                if row_decode {
+                    d.j[0] = n.rowslot_rows * kvh * kvr;
                 }
                 if span_kv {
                     // A row's slot is any engine slot, not a row of this rung.
@@ -11264,6 +11272,24 @@ fn emit_dense_gqa(
             t
         });
     }
+    if ecfg.row_decode_object.is_some() {
+        assert!(
+            !amd && !fp8 && !w8a8 && !fp8_kv && !c.moe && c.tp == 1,
+            "row-decode bodies require single-GPU dense BF16"
+        );
+        for &rows in &rungs {
+            let mut body = Builder::new(n_cu);
+            body.adopt_tensors(tensors.clone());
+            body.force_uniseg();
+            let mut unused = Vec::new();
+            emit_config::rung::with_rung(emit_config::rung::Rung::decode(rows), || {
+                emitter.emit_decode(&mut body, rows, Mode::RowDecode, &mut unused)
+            });
+            shared_tail_marks.push(body.shared_tail_mark());
+            progs.push(body.finish());
+            tlist.push(packet::devbuild::row_decode_program_t(rows));
+        }
+    }
     let mut kv_rows = Vec::new();
     // `dbatch` is the SAME clamped(1,32) value used by declare() above — emission and
     // allocation must agree, so we reuse it here rather than re-reading the env (an unclamped
@@ -11736,6 +11762,7 @@ fn emit_dense_gqa(
         let max_rows = m.prog_t[..packet::devbuild::decode_rung_lo(&m.prog_t)]
             .iter()
             .copied()
+            .filter(|&rows| !packet::devbuild::is_row_decode_program(rows))
             .max()
             .expect("prefill buckets");
         let batch = *m.prog_t.last().unwrap();
@@ -11812,7 +11839,8 @@ fn emit_dense_gqa(
             }
             Err(error)
                 if (ecfg.emit_packed_prefill.is_none() || ecfg.packed_prefill_fp8kv_default)
-                    && ecfg.max_request_chunk.is_none() =>
+                    && ecfg.max_request_chunk.is_none()
+                    && ecfg.row_decode_object.is_none() =>
             {
                 m.tensors.truncate(packed_tensor_base);
                 eprintln!("  packed prefill not selected: {error}");
@@ -11858,6 +11886,14 @@ fn emit_dense_gqa(
         )
     }
     .unwrap_or_else(|error| panic!("decode objects: {error}"));
+    row_decode::append(
+        &m,
+        &mut sections,
+        ecfg.row_decode_object.as_deref(),
+        &arch,
+        std::path::Path::new(&out),
+    )
+    .unwrap_or_else(|error| panic!("row-decode objects: {error}"));
     if fp8 && !ecfg.w8a8 && c.arch == Arch::Gemma4 {
         w8a16_prefill_role::apply_output_object(
             &m,

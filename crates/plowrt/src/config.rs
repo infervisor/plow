@@ -1051,6 +1051,12 @@ pub struct RuntimeConfig {
     /// carries the siblings costs only their program records.
     #[arg(long = "rowband", env = "PLOW_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub rowband: bool,
+    /// Enable packet-declared mapped decode bodies.
+    #[arg(long = "row-decode", env = "PLOW_ROW_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub row_decode: bool,
+    /// Enable packet-declared batched speech delivery.
+    #[arg(long = "tick-delivery", env = "PLOW_TICK_DELIVERY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tick_delivery: bool,
     /// Expert: widest decode rung a serving engine admits; unset = no ceiling.
     #[arg(
         long = "decode-max-rung",

@@ -320,7 +320,7 @@ async fn speech_on_guided(
         tokio::spawn(guided_stream_task(
             w, mux, voice, segs, checked, out_pcm, later_ids, first, out_tx, head_tx, t_arrive, run,
         ));
-        return stream_response(out_rx, head_rx, header, in_flight, cache).await;
+        return stream_response(out_rx, head_rx, header, in_flight, cache, false).await;
     }
     let (mut pcm, mut joiner) = (Vec::new(), super::Joins::new(w.sample_rate));
     let (mut tokens, mut t3_ms, mut s3gen_ms) = (0, 0.0, 0.0);
@@ -494,6 +494,7 @@ async fn stream_response(
     wav: Option<Vec<u8>>,
     in_flight: InFlight,
     cache: Option<crate::serve::session::CacheOutcome>,
+    coalesce: bool,
 ) -> Response {
     use futures::StreamExt;
     let first = match out_rx.recv().await {
@@ -508,9 +509,14 @@ async fn stream_response(
         "audio/pcm"
     };
     let lead = futures::stream::iter(wav.into_iter().chain([first]).map(Ok));
+    let mut pending_error = None;
     let rest = futures::stream::poll_fn(move |cx| {
         let _held = &in_flight;
-        out_rx.poll_recv(cx)
+        if coalesce {
+            poll_audio(&mut out_rx, &mut pending_error, cx)
+        } else {
+            out_rx.poll_recv(cx)
+        }
     });
     let mut response = (
         [(header::CONTENT_TYPE, content_type)],
@@ -522,6 +528,32 @@ async fn stream_response(
         cache.stamp(&mut response);
     }
     response
+}
+
+fn poll_audio(
+    rx: &mut tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    pending_error: &mut Option<std::io::Error>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Option<Result<Vec<u8>, std::io::Error>>> {
+    use std::task::Poll;
+    if let Some(error) = pending_error.take() {
+        return Poll::Ready(Some(Err(error)));
+    }
+    let mut bytes = match rx.poll_recv(cx) {
+        Poll::Ready(Some(Ok(bytes))) => bytes,
+        other => return other,
+    };
+    for _ in 0..rx.len() {
+        match rx.try_recv() {
+            Ok(Ok(next)) => bytes.extend_from_slice(&next),
+            Ok(Err(error)) => {
+                *pending_error = Some(error);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    Poll::Ready(Some(Ok(bytes)))
 }
 
 /// A whole reply: the audio and the same headers on every model.
@@ -1379,6 +1411,11 @@ async fn speech_with(
         sp.first_audio = Some(Arc::new(crate::serve::mux::FirstAudio::new(
             sp.first_tokens,
         )));
+        if let Some(fa) = sp.first_audio.as_ref() {
+            fa.set_frame_period(std::time::Duration::from_secs_f64(
+                model.contract.frame_samples as f64 / model.contract.sample_rate as f64,
+            ));
+        }
     }
     let first_audio = speech.as_ref().and_then(|sp| sp.first_audio.clone());
     let (tx, rx) = stream_mod::channel();
@@ -1459,7 +1496,15 @@ async fn speech_with(
             run,
             first_audio,
         ));
-        return stream_response(out_rx, head_rx, header, in_flight, cache).await;
+        return stream_response(
+            out_rx,
+            head_rx,
+            header,
+            in_flight,
+            cache,
+            c.batch_delivery && crate::config::RuntimeConfig::process_get().tick_delivery,
+        )
+        .await;
     }
     let (mut pcm, mut n_tokens, mut frames, mut t_lm) =
         (Vec::new(), 0, 0, std::time::Duration::ZERO);
@@ -2096,6 +2141,9 @@ impl SegmentMaker {
             let greedy = self.temperature <= 0.0;
             Ok(Some(Box::new(crate::serve::mux::SpeechJob {
                 device_frames: self.device_frames,
+                batch_delivery: c.batch_delivery
+                    && self.streaming
+                    && crate::config::RuntimeConfig::process_get().tick_delivery,
                 cfg,
                 slot_prefix_reuse: c.slot_prefix_reuse,
                 overlay,
@@ -3018,6 +3066,12 @@ async fn stream_task(
                             }
                             return; // client gone: dropping frx ends the drain, which cancels the slot
                         }
+                        if let (Some(fa), Some(started)) = (audible.0.as_ref(), playing) {
+                            fa.set_playback_deadline(
+                                started + std::time::Duration::from_secs_f64(sent as f64 / sr),
+                                std::time::Duration::from_secs_f64(step_s),
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -3077,6 +3131,29 @@ async fn stream_task(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delivery_audio_coalesces_ready_bytes_and_preserves_a_following_error() {
+        use std::task::{Context, Poll};
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut error = None;
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(super::poll_audio(&mut rx, &mut error, &mut cx).is_pending());
+        tx.try_send(Ok(vec![1, 2])).unwrap();
+        tx.try_send(Ok(vec![3, 4])).unwrap();
+        tx.try_send(Err(std::io::Error::other("broken"))).unwrap();
+        tx.try_send(Ok(vec![5])).unwrap();
+        assert!(matches!(super::poll_audio(&mut rx, &mut error, &mut cx),
+            Poll::Ready(Some(Ok(bytes))) if bytes == [1, 2, 3, 4]));
+        assert!(matches!(super::poll_audio(&mut rx, &mut error, &mut cx),
+            Poll::Ready(Some(Err(e))) if e.to_string() == "broken"));
+        assert!(matches!(super::poll_audio(&mut rx, &mut error, &mut cx),
+            Poll::Ready(Some(Ok(bytes))) if bytes == [5]));
+        drop(tx);
+        assert!(matches!(
+            super::poll_audio(&mut rx, &mut error, &mut cx),
+            Poll::Ready(None)
+        ));
+    }
     use super::*;
 
     #[test]

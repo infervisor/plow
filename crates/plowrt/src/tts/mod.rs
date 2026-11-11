@@ -199,6 +199,7 @@ pub struct SpeechContract {
     /// New frames a stream's first stateful codec step waits for (`stream.first_frames`).
     pub stream_first_frames: Option<usize>,
     pub slot_prefix_reuse: bool,
+    pub batch_delivery: bool,
 }
 
 /// A cloning prompt: `head`, the reference transcript's prompt text, `mid`, the reference frames
@@ -264,6 +265,15 @@ impl SpeechContract {
             Some(v) => {
                 return Err(RuntimeError::Rejected(format!(
                     "unsupported speech slot prefix version {v}"
+                )))
+            }
+        };
+        let batch_delivery = match p.parameters.get("stream.delivery_version") {
+            None | Some(0) => false,
+            Some(1) => true,
+            Some(v) => {
+                return Err(RuntimeError::Rejected(format!(
+                    "unsupported speech delivery version {v}"
                 )))
             }
         };
@@ -348,6 +358,7 @@ impl SpeechContract {
             }),
             stream_first_frames: p.parameters.get("stream.first_frames").map(|&n| n as usize),
             slot_prefix_reuse,
+            batch_delivery,
         };
         if let Some(encoder) = p.strings.get(crate::exec::packet_runtime::CLONE_ENCODER) {
             let listed = |k: &str, or: &[u32]| -> Result<Vec<u32>> {
@@ -1442,6 +1453,16 @@ mod tests {
         bad = pipeline();
         bad.driver = "causal.v1".into();
         assert!(SpeechContract::from_pipeline(&bad).is_err());
+    }
+
+    #[test]
+    fn delivery_capability_is_versioned_and_absent_on_old_packets() {
+        let mut p = pipeline();
+        assert!(!SpeechContract::from_pipeline(&p).unwrap().batch_delivery);
+        p.parameters.insert("stream.delivery_version".into(), 1);
+        assert!(SpeechContract::from_pipeline(&p).unwrap().batch_delivery);
+        p.parameters.insert("stream.delivery_version".into(), 2);
+        assert!(SpeechContract::from_pipeline(&p).is_err());
     }
 
     #[test]
