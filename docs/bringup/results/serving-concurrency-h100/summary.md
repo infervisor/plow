@@ -88,14 +88,45 @@ interleaved runs: WER unchanged, c64 RTFx 1355 / 1342 -> 1387 / 1373, c256 1473 
 GPU-alone cost per 6.7 s request: encoder 1.13 ms; decoder prefill 1.07 ms (a 512-row packed launch
 takes 5.15 ms and carries about 4.8 requests: 3.4 ms fixed + 3.6 us per row); decode 0.76 ms (one
 3.2-3.7 ms step per tick for ~105 live rows, ~23 ticks per request). 2.96 ms serialized against
-3.7 ms observed. Decode rows do not ride the prefill launch on this packet (its audio overlay
-excludes the unified launch), so every tick sweeps the decoder weights twice. With the encoder
+3.7 ms observed. Decode rows did not ride the prefill launch on this packet at that point (its
+audio overlay excluded the unified launch), so every tick swept the decoder weights twice. With the encoder
 running beside it a prefill launch stretches from 6.4 ms (p50) to 32-45 ms (p90-p99) and a decode
 step from 3.7 to 13.5 ms (p90).
 
 Larger rungs alone do not help: prefill rungs to 1024 rows with 256 decode slots gave c256 RTFx
 1562 / 1612 against 1542 / 1522, 250 req/s within SLO 15 % / 79 % against 95 % / 99 %, and p99 near
 5 s past saturation (2.9 s before). Rejected.
+
+### Decoder: decode rows ride the packed prefill launch (1.7B)
+
+The audio-overlay packet now takes the unified launch through the staged step (the overlay rows and
+their launch-row index are written per launch; decode rows index the token table). A launch at
+saturation holds about 85 decode rows and 430 prefill rows in the 512-row rung and takes 6.6 ms,
+against 5.2 + 3.3 ms for the two separate launches. One binary, control = the split-attention
+riders off (route not loaded), two interleaved runs, then two more runs of the unified arm:
+
+| Cell | separate | unified |
+|---|---:|---:|
+| c64 RTFx | 1384 / 1400 | 1418 / 1456 / 1456 / 1443 |
+| c256 RTFx | 1506 / 1532 | 1604 / 1572 / 1586 / 1559 |
+| 250 req/s within 1 s | 98.7 % / 98.6 % | 99.1 % / 93.6 % / 96.8 % / 99.5 % |
+| saturation, audio s/s | 1880 / 1837 | 1937 / 1974 / 1961 / 1968 |
+
+Gate WER 0.03826 at c1 and c16 in every run, 0 faults. With the larger-rung packet under the unified
+launch c256 reaches 1663 / 1713 and one run holds 300 req/s at 95 % within 1 s, but the other run
+collapses at 250 req/s (24 % within SLO, p99 5.1 s): not adopted until that is explained.
+
+Per-op table of the decoder (registry ceilings, not calibrated on this box):
+
+| Program | measured | floor | reading |
+|---|---:|---:|---|
+| prefill, 512 rows | 5.5 ms | 2.1 ms | 10 launches per layer at 12-50 us each: attention 49 us (floor ~2), q / k+v / o projections 13-14 us each (floor 4.4), gate+up 42 (26), down 26 (13), head norm + RoPE 21, residual + norm 2 x 15, GLU 12 |
+| prefill, 96 rows | 3.7 ms | 1.2 ms | the same segments at nearly the same cost: launch-latency bound |
+| decode, 1 row | 2.0 ms | 1.0 ms | GEMVs at 65-110 % of their floors; 0.57 ms is the instruction walk (285 instructions) |
+| decode, 16 rows | 2.3 ms | 1.1 ms | as above; walk 0.59 ms |
+| decode, 128 rows | 3.2-3.4 ms | 1.9 ms | library-routed rung, not swept per op |
+
+The k|v head-norm fusion does not apply to this layer shape (q and k are normed, v is not).
 
 ## TTS
 

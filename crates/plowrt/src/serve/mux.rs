@@ -8496,7 +8496,7 @@ fn gpu_prefill_batched_pass(
             let stepped = pen_synced.is_ok();
             let result = if let Err(err) = pen_synced {
                 Err(err)
-            } else if e.packed_depth_enabled() {
+            } else if e.packed_depth_enabled() || overlay_rows.is_some() {
                 let sampled = e.dev_sample_enabled();
                 *dev_sampled = sampled;
                 let spec = |slot: u32, j: u32| ride_row_spec(slots, feeds, spans, pen, slot, j);
@@ -8521,7 +8521,10 @@ fn gpu_prefill_batched_pass(
                             gpu_speech_pack_inputs(e, slots, &pack)?;
                         }
                         gpu_speech_pack_codes(e, slots, &pack)?;
-                        e.stage_depth_decode_codes(plan)
+                        if e.has_depth_stage() {
+                            e.stage_depth_decode_codes(plan)?;
+                        }
+                        Ok(())
                     },
                 )
             } else if !window.is_empty() {
@@ -9422,16 +9425,16 @@ fn gpu_prefill_advance(
 }
 
 /// Refuse a packet with per-row host inputs (`in.encoder_overlay`, `in.pos_base`) whose prefill
-/// may run through a route that does not stage them per launch row: the mixed step and the unified
-/// token batch. Serial and packed prefill stage every member's rows ([`gpu_speech_pack_inputs`]).
+/// may run through a route that does not stage them per launch row: the mixed step, and the
+/// unified token batch for a position base. Serial prefill, packed prefill and the staged token
+/// batch stage every member's overlay rows ([`gpu_speech_pack_inputs`]).
 #[cfg(feature = "cuda")]
 pub fn check_speech_packet(e: &crate::exec::gpu::GpuEngine) -> Result<()> {
     let overlay = e.tensor_bytes("in.encoder_overlay").is_some();
     if !overlay && e.tensor_bytes("in.pos_base").is_none() {
         return Ok(());
     }
-    if (e.token_batch_enabled() && !e.packed_depth_enabled())
-        || e.mixed_step_rows(1, 1).is_some()
+    if e.mixed_step_rows(1, 1).is_some()
         || (e.token_batch_enabled() && e.tensor_bytes("in.pos_base").is_some())
     {
         return Err(crate::RuntimeError::Rejected(
@@ -13428,6 +13431,27 @@ mod tests {
         speech_pack_overlay(&slots, &[(0, 100, 1), (2, 0, 2)], 5, &mut rows, &mut index);
         assert_eq!(index, [OVERLAY_KEEP, 0, OVERLAY_KEEP, u32::MAX, u32::MAX]);
         assert_eq!(rows, [9.0, 8.0]);
+    }
+
+    #[test]
+    fn audio_overlay_decode_riders_embed_from_the_token_table() {
+        let audio = |overlay: Vec<f32>, overlay_pos: Vec<u32>| {
+            let (mut slot, rx) = prefill_test_slot();
+            slot.as_mut().unwrap().speech = Some(Box::new(SpeechJob {
+                overlay,
+                overlay_pos,
+                ..Default::default()
+            }));
+            (slot, rx)
+        };
+        let (a, _rx_a) = audio(vec![1.0, 1.0, 2.0, 2.0], vec![1, 2]);
+        let (b, _rx_b) = audio(vec![5.0, 5.0, 6.0, 6.0], vec![1, 2]);
+        let slots = [a, b];
+        let (mut rows, mut index) = (Vec::new(), Vec::new());
+        // Slot 0 decodes past its prompt as a one-row rider; slot 1 prefills rows [1, 3).
+        speech_pack_overlay(&slots, &[(0, 7, 1), (1, 1, 2)], 4, &mut rows, &mut index);
+        assert_eq!(index, [u32::MAX, 0, 1, u32::MAX]);
+        assert_eq!(rows, [5.0, 5.0, 6.0, 6.0]);
     }
 
     /// A full downstream stage keeps a request queued, answered with nothing.
