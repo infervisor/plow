@@ -2100,7 +2100,7 @@ fn native_gemm_layer_matches_packet() {
 /// kernel entry (`speech_conv_node(const PlowDevInst*, void* const*)`) between interpreter spans,
 /// against the packet's program and against the same cuts with the conv as its own interpreter
 /// span (the split's cost alone). Every tensor is compared bit for bit after one run from the
-/// same initial bytes. Env: SPEECH_SPLIT_PKT (codec.pkt, PLOW_HSACO = its assets),
+/// same initial bytes. Env: SPEECH_SPLIT_PKT (codec.pkt, PLOW_HSACO = its assets), SPEECH_SPLIT_ROUTE,
 /// SPEECH_SPLIT_CUBIN, SPEECH_SPLIT_PROGRAMS (indices), SPEECH_SPLIT_SMEM, SPEECH_SPLIT_TIMING.
 #[cfg(test)]
 #[test]
@@ -2129,11 +2129,13 @@ fn speech_conv_node_split_matches_packet() {
     let raw = std::fs::read(&path).unwrap();
     let blob = DevBlob::parse(&raw).unwrap();
     let rt = CudaPacketRuntime::load_on(be.clone(), &path).unwrap();
+    // SPEECH_SPLIT_ROUTE=wgmma: every wgmma conv arm (flags bit 17, ConvTranspose1dF32 too).
+    let all_wgmma = std::env::var("SPEECH_SPLIT_ROUTE").is_ok_and(|r| r == "wgmma");
     let routed = |inst: &DevInst64| {
-        inst.op == DevOp::Conv1dF32 as u16
-            && inst.fj[2] & (1 << 17) != 0
-            && inst.fj[2] & (1 << 14) == 0
-            && inst.i[4] > 1
+        let conv = inst.op == DevOp::Conv1dF32 as u16;
+        let wgmma =
+            (conv || inst.op == DevOp::ConvTranspose1dF32 as u16) && inst.fj[2] & (1 << 17) != 0;
+        wgmma && (all_wgmma || conv && inst.fj[2] & (1 << 14) == 0 && inst.i[4] > 1)
     };
     let snapshot = || -> Vec<Vec<u8>> {
         rt.tensors

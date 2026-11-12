@@ -262,6 +262,10 @@ Codec step, one persistent interpreter launch, us (`packet_bench`, median of 20,
   The screen's spans are serial chains (no cross-instruction overlap), so the split column is an
   upper bound on the cost of splitting. A packet-declared conv object with the program's own
   dependency counters is the production form.
+- Routing every wgmma conv arm (81 instructions: the bf16 k7 convs, the k1 split convs, ConvT) to
+  the conv entry (ping-pong body), again bit-identical: b1 x f1 3927 -> 4165 us (split only 5018),
+  b8 x f17 13589 -> 11636 (-14 %), b64 x f17 83960 -> 65510 (-22 %). Small programs lose to the
+  extra launches, so routing has to be chosen per program.
 - Biggest instructions left at b8 x f17: the 96 -> 1 output conv (577 us, staged direct arm), the
   k7 convs (410-545 us each, a ~70 us roofline at 96 channels), ConvT (420-430 us).
 
