@@ -944,7 +944,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.overload_miss", Some("PLOW_OVERLOAD_MISS"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05,0.1,0.2")), DIAG),
     KnobSpec::new("rt.asr_partial_duty", Some("PLOW_ASR_PARTIAL_DUTY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), DIAG),
     KnobSpec::new("rt.asr_request_timeout_ms", Some("PLOW_ASR_REQUEST_TIMEOUT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(120_000)), OPT_IN),
-    KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(50)), OPT_IN),
     KnobSpec::new("rt.asr_encode_hold_inflight", Some("PLOW_ASR_ENCODE_HOLD_INFLIGHT"), Layer::Runtime, USIZE, Default::Static(Val::Nat(32)), DIAG),
     KnobSpec::new("rt.asr_context_max_tokens", Some("PLOW_ASR_CONTEXT_MAX_TOKENS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),

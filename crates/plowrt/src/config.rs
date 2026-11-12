@@ -340,11 +340,12 @@ pub struct RuntimeConfig {
     /// Packed audio-encoder hold (ms): while `PLOW_ASR_ENCODE_HOLD_INFLIGHT` requests are in flight
     /// and the queued audio is short of a full launch, the encoder waits up to this long from its
     /// oldest queued request for more, trading that wait for fewer per-launch fixed costs. 0 =
-    /// launch whatever is queued.
+    /// launch whatever is queued. 50 (Qwen3-ASR 1.7B, H100, open loop): holds 150 req/s at 99%
+    /// under 1 s where 0 holds 100, saturation 985 -> 1277 audio s/s, c1 and c16 unchanged.
     #[arg(
         long = "asr-encode-hold-ms",
         env = "PLOW_ASR_ENCODE_HOLD_MS",
-        default_value_t = 0,
+        default_value_t = 50,
         global = true
     )]
     pub asr_encode_hold_ms: u64,
