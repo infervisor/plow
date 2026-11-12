@@ -12093,7 +12093,11 @@ fn emit_dense_gqa(
                     .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
                 let lower = |bucket: &asr::qwen::AudioBucket| {
                     bucket
-                        .lower(n_cu, audio_dims)
+                        .lower_with(
+                            n_cu,
+                            audio_dims,
+                            emit_config::active().asr_dense_continuous,
+                        )
                         .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"))
                 };
                 let (base, rest) = buckets.split_first().expect("single-utterance capacities");

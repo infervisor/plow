@@ -239,6 +239,12 @@ pub struct EmitConfig {
     )]
     pub asr_packed_max_chunks: Option<u32>,
 
+    /// Qwen audio-encoder dense layers sum K in one k16 chain (DenseGemmF32 flag 0x800) in every
+    /// program, instead of split-K with a per-row reference in packed launches. Changes the
+    /// encoder's f32 sum order (bf16 products either way): re-gate WER.
+    #[arg(long = "emit-asr-dense-continuous", env = "PLOW_ASR_DENSE_CONTINUOUS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub asr_dense_continuous: bool,
+
     /// Emit the checkpoint's vision/audio towers as encoder sidecars and give the text packet
     /// soft-token rows (`MmRowsBf16`, `in.mm_slab`, the `plow.multimodal.v1` contract). Off: the
     /// text packet is unchanged.
@@ -1995,6 +2001,7 @@ impl EmitConfig {
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
             asr_packed_max_chunks: env_u32("PLOW_ASR_PACKED_MAX_CHUNKS"),
+            asr_dense_continuous: env_bool("PLOW_ASR_DENSE_CONTINUOUS"),
             multimodal: env_bool("PLOW_EMIT_MULTIMODAL"),
             mm_slab_rows: env_u32("PLOW_EMIT_MM_SLAB_ROWS"),
             mm_vision_ladder: env_str("PLOW_EMIT_MM_VISION_LADDER"),

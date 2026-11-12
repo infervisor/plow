@@ -194,6 +194,9 @@ pub enum DenseSplit {
     /// Every row sums K as a `Parallel` launch of `rows[row]` rows would (a u32 per row; flag
     /// 128): rows packed from several requests give each request's own bits.
     Reference(u32),
+    /// One accumulator per output over all of K in k16 steps (flag 0x800): the bits depend on
+    /// neither `rows`, the row's position nor the launch.
+    Continuous,
 }
 
 /// DenseGemmF32's LayerNorm prologue (flag bit 5): `A' = (A - mean) * inv * gamma + beta` with
@@ -1178,7 +1181,23 @@ impl PacketPrefix {
             _ => splitk,
         };
         let reference = matches!(stage.split, DenseSplit::Reference(_));
-        let flags = flags | (u32::from(reference) << 7);
+        let continuous = stage.split == DenseSplit::Continuous;
+        if continuous && (!tensor_cores || stage.layer_norm.is_some() || stage.input_width % 8 != 0)
+        {
+            return Err("continuous dense needs bf16 tensor cores and no prologue".into());
+        }
+        let scratch = if continuous {
+            packet::dev::TENSOR_NONE
+        } else {
+            scratch
+        };
+        let flags = flags
+            | (u32::from(reference) << 7)
+            | if continuous {
+                DenseAccumulation::Continuous16.flags()
+            } else {
+                0
+            };
         let n_cu = self.model.n_cu;
         builder.emit(
             DevOp::DenseGemmF32,

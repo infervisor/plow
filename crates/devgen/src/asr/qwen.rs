@@ -357,7 +357,7 @@ pub fn lower_audio_encoder(
     if !(50..=3000).contains(&feature_frames) {
         return Err("invalid Qwen audio encoder geometry".into());
     }
-    lower(feature_frames, n_cu, false, dims)
+    lower(feature_frames, n_cu, false, false, dims)
 }
 
 /// One encoder capacity rung: a packed bucket of 100-frame chunks or a single-utterance bucket.
@@ -376,10 +376,28 @@ impl AudioBucket {
     }
 
     pub fn lower(self, n_cu: u32, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
-        match self {
-            AudioBucket::Packed(chunks) => lower_packed_audio_encoder(chunks, n_cu, dims),
-            AudioBucket::Single(frames) => lower_audio_encoder(frames, n_cu, dims),
+        self.lower_with(n_cu, dims, false)
+    }
+
+    /// `continuous_dense` (`PLOW_ASR_DENSE_CONTINUOUS`): every dense sums K in one k16 chain
+    /// ([`DenseSplit::Continuous`]) in the packed and the single-utterance programs alike, in
+    /// place of the split-K sum and its per-row reference in packed launches.
+    pub fn lower_with(
+        self,
+        n_cu: u32,
+        dims: AudioDims,
+        continuous_dense: bool,
+    ) -> Result<AudioEncoderPackets, String> {
+        let frames = self.feature_frames();
+        let packed = matches!(self, AudioBucket::Packed(_));
+        if if packed {
+            !(100..=102_400).contains(&frames)
+        } else {
+            !(50..=3000).contains(&frames)
+        } {
+            return Err("invalid Qwen audio encoder geometry".into());
         }
+        lower(frames, n_cu, packed, continuous_dense, dims)
     }
 }
 
@@ -406,13 +424,14 @@ pub fn lower_packed_audio_encoder(
     if chunks == 0 || chunks > 1024 {
         return Err("invalid packed Qwen audio encoder geometry".into());
     }
-    lower(chunks * 100, n_cu, true, dims)
+    lower(chunks * 100, n_cu, true, false, dims)
 }
 
 fn lower(
     feature_frames: u32,
     n_cu: u32,
     packed: bool,
+    continuous_dense: bool,
     dims: AudioDims,
 ) -> Result<AudioEncoderPackets, String> {
     let AudioDims {
@@ -483,7 +502,9 @@ fn lower(
     // Per row: the rows of its utterance's single-utterance capacity, whose split-K it reproduces.
     let split_rows = builder.tensor("in.qwen.audio_split_rows", 4 * u64::from(rows));
     let attention_rows = if packed { groups } else { valid_rows };
-    let split = if packed {
+    let split = if continuous_dense {
+        DenseSplit::Continuous
+    } else if packed {
         DenseSplit::Reference(split_rows)
     } else {
         DenseSplit::Parallel
@@ -844,13 +865,13 @@ fn fuse_programs(prefix: &mut PacketPrefix, ops: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Leading run of reference-split DenseGemmF32 ops on one source (Q/K/V): independent, so they
-/// share their predecessor as the only dependency and each runs on its own share of the CUs (its
-/// tiles planned for that share). Concurrent, they cannot share the packed split-K scratch (t5), so
-/// the fuser drops it (K <= 1024 never splits).
+/// Leading run of reference-split or continuous DenseGemmF32 ops on one source (Q/K/V):
+/// independent, so they share their predecessor as the only dependency and each runs on its own
+/// share of the CUs (its tiles planned for that share). Concurrent, they cannot share the packed
+/// split-K scratch (t5), so the fuser drops it (K <= 1024 never splits; continuous has none).
 fn siblings(insts: &[(&packet::dev::DevInst, Vec<u32>)]) -> usize {
     let dense = |inst: &packet::dev::DevInst| {
-        inst.op == packet::dev::DevOp::DenseGemmF32 as u16 && inst.i[7] & 128 != 0
+        inst.op == packet::dev::DevOp::DenseGemmF32 as u16 && inst.i[7] & (128 | 0x800) != 0
     };
     let first = insts[0].0;
     if !dense(first) {
@@ -1201,6 +1222,33 @@ mod tests {
         assert_eq!(q.t[1], input);
         assert_eq!(q.t[5], stats);
         assert_eq!(prefix.model.progs[0].insts[0].i[2], 2);
+    }
+
+    #[test]
+    fn continuous_dense_is_the_same_op_in_packed_and_single_programs() {
+        let dense = |bucket: AudioBucket| {
+            let packets = bucket
+                .lower_with(4, AudioDims::QWEN3_ASR_1_7B, true)
+                .unwrap();
+            packets
+                .prefix
+                .model
+                .progs
+                .iter()
+                .flat_map(|p| p.insts.clone())
+                .filter(|i| DevOp::from_u16(i.op) == Some(DevOp::DenseGemmF32))
+                .map(|i| (i.i[7], i.t[4]))
+                .collect::<Vec<_>>()
+        };
+        let (packed, single) = (
+            dense(AudioBucket::Packed(2)),
+            dense(AudioBucket::Single(200)),
+        );
+        assert_eq!(packed, single);
+        assert!(!packed.is_empty());
+        assert!(packed.iter().all(
+            |&(flags, scratch)| flags & 0x18ac == 0x80c && scratch == packet::dev::TENSOR_NONE
+        ));
     }
 
     #[test]
