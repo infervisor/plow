@@ -244,6 +244,24 @@ Codec step, one persistent interpreter launch, us (`packet_bench`, median of 20,
   unchanged 384 / 768-channel convs lost 10-18 % to register allocation in the one shared function.
   A second inlined body of the arm put the function over its registers, and ptxas serialized every
   wgmma (C7512). Standalone timing of this arm does not predict its speed inside the interpreter.
+- With the input SnakeBeta in staging (`--bench-conv-bf16` "pre"), the standalone convs are
+  96: 264-285 us, 192: 354-364, 384: 326-342, 768: 374-399; ping-pong 214-236 / 254-276 for 96 /
+  192. In the packet the same convs take 371-482 us. The interpreter's shared code shape costs
+  them 30-40 %, which points to running them as their own code object.
+- Split screen (`packet_exec.rs` `speech_conv_node_split_matches_packet`, gpuq only): the 14 bf16
+  convs of a codec program run on their own kernel entry (`sp_wg_conv1d` alone, 256 threads,
+  same 130 KiB claim and plan) between interpreter spans. All tensors are bit-identical to the
+  packet's run. Codec step us:
+
+  | program | packet | split, conv as interpreter span | conv entry, same body | conv entry, ping-pong |
+  |---|---:|---:|---:|---:|
+  | b1 x f1 | 3922 | 4182 | 3994 | 3988 |
+  | b8 x f17 | 13598 | 14014 | 12739 | 12349 |
+  | b64 x f17 | 83996 | 84447 | 75026 | 72295 |
+
+  The screen's spans are serial chains (no cross-instruction overlap), so the split column is an
+  upper bound on the cost of splitting. A packet-declared conv object with the program's own
+  dependency counters is the production form.
 - Biggest instructions left at b8 x f17: the 96 -> 1 output conv (577 us, staged direct arm), the
   k7 convs (410-545 us each, a ~70 us roofline at 96 channels), ConvT (420-430 us).
 

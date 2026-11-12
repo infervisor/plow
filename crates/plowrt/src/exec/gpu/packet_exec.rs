@@ -2095,3 +2095,194 @@ fn native_gemm_layer_matches_packet() {
     be.synchronize().unwrap();
     be.module_unload(&module).unwrap();
 }
+
+/// The speech object's bf16 taps convs (Conv1dF32 flags bit 17 without 14, kernel > 1) on their own
+/// kernel entry (`speech_conv_node(const PlowDevInst*, void* const*)`) between interpreter spans,
+/// against the packet's program and against the same cuts with the conv as its own interpreter
+/// span (the split's cost alone). Every tensor is compared bit for bit after one run from the
+/// same initial bytes. Env: SPEECH_SPLIT_PKT (codec.pkt, PLOW_HSACO = its assets),
+/// SPEECH_SPLIT_CUBIN, SPEECH_SPLIT_PROGRAMS (indices), SPEECH_SPLIT_SMEM, SPEECH_SPLIT_TIMING.
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; speech conv split screen, run only through gpuq"]
+fn speech_conv_node_split_matches_packet() {
+    use packet::dev::DevInst64;
+    enum Step {
+        Packet {
+            argument: DevProgram,
+            counters: usize,
+            _tables: Vec<DeviceMem>,
+        },
+        Conv {
+            instruction: DeviceMem,
+            blocks: u32,
+        },
+    }
+    let path = std::path::PathBuf::from(std::env::var("SPEECH_SPLIT_PKT").unwrap());
+    let image = std::fs::read(std::env::var("SPEECH_SPLIT_CUBIN").unwrap()).unwrap();
+    let programs = std::env::var("SPEECH_SPLIT_PROGRAMS").unwrap_or("27".into());
+    let smem: u32 = std::env::var("SPEECH_SPLIT_SMEM").map_or(133120, |s| s.parse().unwrap());
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let module = be.module_load(&image).unwrap();
+    let node = be.get_function(&module, "speech_conv_node").unwrap();
+    be.set_max_dynamic_smem(node, smem).unwrap();
+    let raw = std::fs::read(&path).unwrap();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let rt = CudaPacketRuntime::load_on(be.clone(), &path).unwrap();
+    let routed = |inst: &DevInst64| {
+        inst.op == DevOp::Conv1dF32 as u16
+            && inst.fj[2] & (1 << 17) != 0
+            && inst.fj[2] & (1 << 14) == 0
+            && inst.i[4] > 1
+    };
+    let snapshot = || -> Vec<Vec<u8>> {
+        rt.tensors
+            .iter()
+            .map(|m| {
+                let mut out = vec![0; m.len as usize];
+                rt.download(m, 0, &mut out).unwrap();
+                out
+            })
+            .collect()
+    };
+    let initial = snapshot();
+    let reset = || {
+        for (m, bytes) in rt.tensors.iter().zip(&initial) {
+            rt.upload(m, 0, bytes).unwrap();
+        }
+    };
+    for p in programs.split(',').map(|s| s.parse::<usize>().unwrap()) {
+        let g = &blob.progs[p];
+        // [split only, conv node]
+        let mut plans: [Vec<Step>; 2] = [Vec::new(), Vec::new()];
+        for (mode, steps) in plans.iter_mut().enumerate() {
+            let mut span = Vec::new();
+            let emit_span = |span: &mut Vec<DevInst64>, steps: &mut Vec<Step>| {
+                if span.is_empty() {
+                    return;
+                }
+                let program = super::packed_terminal::chain(std::mem::take(span), rt.grid, g.t);
+                let (argument, _, counters, tables) =
+                    super::mixed_step::upload_program(&be, &program, rt._table.base, 0, 0).unwrap();
+                steps.push(Step::Packet {
+                    argument,
+                    counters,
+                    _tables: tables,
+                });
+            };
+            for inst in &g.insts {
+                if !routed(inst) {
+                    span.push(*inst);
+                    continue;
+                }
+                emit_span(&mut span, steps);
+                if mode == 0 {
+                    span.push(*inst);
+                    emit_span(&mut span, steps);
+                    continue;
+                }
+                let memory = be.alloc(0, 64).unwrap();
+                be.upload(&memory, 0, pod_bytes(std::slice::from_ref(inst)))
+                    .unwrap();
+                steps.push(Step::Conv {
+                    instruction: memory,
+                    blocks: u32::from(inst.blocks).max(1),
+                });
+            }
+            emit_span(&mut span, steps);
+        }
+        let n_routed = g.insts.iter().filter(|i| routed(i)).count();
+        let enqueue = |plan: Option<&Vec<Step>>| {
+            let Some(steps) = plan else {
+                rt.enqueue_on(&[p], &rt.stream).unwrap();
+                return;
+            };
+            for step in steps {
+                match step {
+                    Step::Packet {
+                        argument, counters, ..
+                    } => {
+                        be.memset_d8_async(argument.counters, 0, *counters, &rt.stream)
+                            .unwrap();
+                        let mut argument = *argument;
+                        let mut params =
+                            [&mut argument as *mut DevProgram as *mut std::ffi::c_void];
+                        be.launch_cooperative(
+                            rt.function,
+                            rt.grid,
+                            BLOCK,
+                            rt.smem,
+                            &mut params,
+                            Some(&rt.stream),
+                        )
+                        .unwrap();
+                    }
+                    Step::Conv {
+                        instruction,
+                        blocks,
+                    } => {
+                        let mut inst = instruction.base;
+                        let mut table = rt._table.base;
+                        let mut params = [
+                            &mut inst as *mut u64 as *mut std::ffi::c_void,
+                            &mut table as *mut u64 as *mut std::ffi::c_void,
+                        ];
+                        be.launch_kernel(node, *blocks, BLOCK, smem, &mut params, Some(&rt.stream))
+                            .unwrap();
+                    }
+                }
+            }
+        };
+        let plan = |mode: usize| {
+            if mode == 0 {
+                None
+            } else {
+                Some(&plans[mode - 1])
+            }
+        };
+        let mut results = Vec::new();
+        for mode in 0..3 {
+            reset();
+            enqueue(plan(mode));
+            be.stream_synchronize(&rt.stream).unwrap();
+            results.push(snapshot());
+        }
+        for mode in 1..3 {
+            let differ: Vec<usize> = (0..results[0].len())
+                .filter(|&t| results[0][t] != results[mode][t])
+                .collect();
+            println!(
+                "SPEECH_SPLIT_BITS program={p} mode={} routed={n_routed} differing_tensors={:?}",
+                ["packet", "split", "node"][mode],
+                differ
+            );
+            assert!(differ.is_empty());
+        }
+        if std::env::var_os("SPEECH_SPLIT_TIMING").is_none() {
+            continue;
+        }
+        let mut times = [Vec::new(), Vec::new(), Vec::new()];
+        for round in 0..36 {
+            let mode = round % 3;
+            reset();
+            be.event_record(&rt.events.0, &rt.stream).unwrap();
+            enqueue(plan(mode));
+            be.event_record(&rt.events.1, &rt.stream).unwrap();
+            be.event_synchronize(&rt.events.1).unwrap();
+            if round >= 6 {
+                times[mode].push(be.event_elapsed_ms(&rt.events.0, &rt.events.1).unwrap() * 1000.);
+            }
+        }
+        for t in &mut times {
+            t.sort_by(f32::total_cmp);
+        }
+        println!(
+            "SPEECH_SPLIT_TIME program={p} routed={n_routed} packet_us={} split_us={} node_us={} samples=10_each",
+            times[0][times[0].len() / 2],
+            times[1][times[1].len() / 2],
+            times[2][times[2].len() / 2]
+        );
+    }
+    be.synchronize().unwrap();
+    be.module_unload(&module).unwrap();
+}

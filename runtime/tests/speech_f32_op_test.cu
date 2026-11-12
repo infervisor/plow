@@ -3163,18 +3163,24 @@ int main(int argc, char** argv) {
     }
 #if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16
     if (argc > 1 && !strcmp(argv[1], "--bench-conv-bf16")) {
-        /* The 12 Hz codec decoder's k7 residual convs at step.b8.f17 (8 items, SnakeBeta in). */
+        /* The 12 Hz codec decoder's k7 residual convs at step.b8.f17 (8 items, output SnakeBeta;
+         * "pre": also the input SnakeBeta in the staging, as the codec's fused convs run). */
         const unsigned shapes[][2] = {{96, 32646}, {192, 10886}, {384, 2726}, {768, 550}};
-        for (auto& sh : shapes)
-            for (unsigned dil : {1u, 9u}) {
-                const unsigned C = sh[0], rows = sh[1];
-                ConvSpec s{8, rows + 6u * dil, C, C, 7, 1, dil, 1, 0, 0, 0, 0, 12, false, true, true, false, {}, 0.f, true};
-                s.wg = true; s.tapmajor = true; s.pin = 1; s.beta = true;
-                Case c; unsigned o; build_conv(c, s, false, o);
-                char name[96];
-                snprintf(name, sizeof(name), "Conv1dF32 bf16 k7 %u d%u [8][%u]", C, dil, rows);
-                bench(name, c, 2.0 * 8 * rows * C * C * 7, 8.0 * 8 * rows * C, 20);
-            }
+        for (bool pre : {false, true})
+            for (auto& sh : shapes)
+                for (unsigned dil : {1u, 9u}) {
+                    const unsigned C = sh[0], rows = sh[1];
+                    ConvSpec s{8, rows + 6u * dil, C, C, 7, 1, dil, 1, 0, 0, 0, 0, 12, false, true, true, false, {}, 0.f, true};
+                    s.wg = true; s.tapmajor = true; s.pin = 1; s.beta = true;
+                    Case c; unsigned o; build_conv(c, s, false, o);
+                    if (pre) {
+                        c.in.t[4] = c.f32(4u * C, 0.4f, 0.6f);
+                        c.in.fj[2].u |= (12u << 4) | (1u << 19);
+                    }
+                    char name[96];
+                    snprintf(name, sizeof(name), "Conv1dF32 bf16 k7 %u d%u [8][%u]%s", C, dil, rows, pre ? " pre" : "");
+                    bench(name, c, 2.0 * 8 * rows * C * C * 7, 8.0 * 8 * rows * C, 20);
+                }
         return 0;
     }
 #endif
