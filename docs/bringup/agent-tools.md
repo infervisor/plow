@@ -92,6 +92,47 @@ a perf campaign (extend the harness as its own change):
   ([05](05-single-block-sweep.md) "What tier 2 cannot score"): they go to `step_bench` per rung,
   still before any grid.
 
+## HARD RULE: optimisation order — fusion, then kernels to the roofline, then everything else
+
+Applies to every model and every stage of it: LLM blocks, speech encoders, depth / code-predictor
+stages, codecs, vocoders. No exceptions for "serving" or "capacity" work: a throughput or latency
+gap is first a statement about the programs and kernels that run per request.
+
+1. **Roofline table first.** Before any change, produce the block-vs-roofline table above for every
+   stage on the request path, per op, from the production packet on calibrated ceilings. Rank stages
+   by `share of device time x distance from floor`. No candidate is designed, and no serving number
+   is reported, before this table exists.
+2. **Op fusion.** From the disassembly of each ranked program, list every op that runs as its own
+   device pass over rows another op of the same program already owns (residual adds, norms, casts,
+   activations, packs, bias, split epilogues) and every sibling group that could share a launch.
+   Fuse what preserves the numeric contract; record the rest with the reason it cannot fuse.
+3. **Kernels to the roofline.** Each remaining hot op goes through [04](04-kernel-tuning.md):
+   ISA reference, design consult, single-op A/B with an oracle, then single block
+   ([05](05-single-block-sweep.md)), generator search when a hand pass stalls. State the target
+   fraction of the floor and the measured one. An op left more than 2x from its floor carries a
+   written reason (latency-bound size, numeric contract, measured generator result).
+4. **Only then** scheduling, holds, batching windows, admission, queue sizes, ladder widths or any
+   other runtime or serving knob. A knob change proposed while step 2 or 3 is open for a stage on
+   the request path is out of order and is not measured, except to restore correctness.
+5. **Peer comparison last.** The serving grid against the reference stack confirms steps 1-4; it
+   does not choose what to work on.
+
+Invariance contracts found on the way (a result that depends on packing, batch position or block
+count) are correctness failures: they stop the candidate at step 3, not at the serving gate.
+
+Speech stages use the same harness with these tools:
+
+| step | tool |
+|---|---|
+| per-op and per-program times | `packet_bench <pkt> <program> <role> N --each\|--sweep\|--seq` (in a queue job) |
+| ops, shapes, flags | `plowrt disasm --format json <pkt>` (CPU) |
+| floor + table | `scripts/campaign/speech_roofline.py DISASM.json PROGRAM SWEEP.jsonl` |
+| single-op oracle, parity and timing | `runtime/tests/speech_f32_op_test.cu` (extend it; `--conv-packing-only` is the packed-vs-alone bitwise case) |
+| demand per bucket | `scripts/campaign/bucket_demand.py` |
+
+A final report that lacks the roofline table, the fusion list or the per-op targets is incomplete,
+whatever its serving numbers say.
+
 ## Working rules (every agent)
 
 Product invariants:

@@ -97,7 +97,13 @@ def cost(inst, ctx):
         of, ow = (f + g("pad_before") + g("pad_after") - kk) // s + 1, (w + g("pad_before") + g("pad_after") - kk) // s + 1
         depthwise = g("flags") & 1
         flops = 2 * max(b, 1) * of * ow * cout * (1 if depthwise else cin) * kk * kk
-        return cout * cin * kk * kk * 4 + max(b, 1) * (f * w * cin + of * ow * cout) * 4, flops, "fp32"
+        # flag 256 = bf16-exact operands on tensor cores, 512 = 3xTF32 (three TF32 products per FP32 one).
+        fl = g("flags")
+        if fl & 512:
+            flops, prec = 3 * flops, "tf32"
+        else:
+            prec = "bf16" if fl & 256 else "fp32"
+        return cout * cin * kk * kk * 4 + max(b, 1) * (f * w * cin + of * ow * cout) * 4, flops, prec
     if op in ("LayerNormF32",):
         return g("rows") * g("feat") * 4 * 2, 0, "fp32"
     if op == "GemvF32Out":
