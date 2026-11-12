@@ -29,15 +29,28 @@ No row is a qualified plow-vs-baseline win or loss; the ratios are large enough 
 
 ## ASR (Qwen3-ASR 1.7B)
 
-| Cell | plowrt | plowrt, encoder hold 50 ms | vLLM |
-|---|---:|---:|---:|
-| c1 latency p50 | 53.8 ms | 54.1 ms | 67.0 ms |
-| c16 / c64 / c256 RTFx | 597 / 850 / 1169 | 594 / 1036 / 1155 | 821 / 1673 / 1778 |
-| 100 req/s p50 / p99 | 283 / 1041 ms | 222 / 822 ms | 119 / 513 ms |
-| 150 req/s within SLO | 0 % | 99 % | 99.9 % |
-| 300 req/s within SLO | 0 % | 0 % | 98 % |
-| saturation audio s/s | ~985 | ~1277 | 1974 at 300 req/s |
-| WER | 0.0391 | 0.0391 | 0.037 |
+"hold" = `PLOW_ASR_ENCODE_HOLD_MS=50` (the branch default). "hold + encoder" = that binary with the
+packet re-emitted from the branch (direct conv and reference-split dense paths on sm_90a; only the
+speech object differs from the released packet), mean of two interleaved runs.
+
+| Cell | plowrt shipping | hold | hold + encoder | vLLM |
+|---|---:|---:|---:|---:|
+| c1 latency p50 | 53.8 ms | 54.1 ms | 53.4 ms | 67.0 ms |
+| c64 / c256 RTFx | 850 / 1169 | 1041 / 1152 | 1190 / 1305 | 1673 / 1778 |
+| 150 req/s within SLO, p99 | 0 % | 99 %, 993 ms | 100 %, 747 ms | 99.9 %, 637 ms |
+| 200 req/s within SLO | 0 % | 0 % | 98 % | 99.7 % |
+| 300 req/s within SLO | 0 % | 0 % | not run (0 % at 250) | 98 % |
+| saturation audio s/s | ~985 | ~1270 | ~1425-1525 | 1974 at 300 req/s |
+| WER, gate cell (73 clips, c1 / c16) | 0.03913 | 0.03913 | 0.03826 | 0.037 (292 clips) |
+
+Qwen3-ASR 0.6B, hold vs hold + encoder (one run): c64 RTFx 1207 -> 1409, c256 1318 -> 1545,
+200 req/s within SLO 0 % -> 99.7 %, gate WER c1 0.04435 -> 0.04174, c16 0.04261 = 0.04261.
+
+Open: with the released packet every closed-loop cell of the 292-clip set scores exactly 0.03913
+whatever the concurrency; with the re-emit one cell in six scored 0.03783 instead of 0.03826, so a
+transcript can depend on what it was packed with. The conv-only re-emit shows it too. Not yet
+localized (conv2 / conv3 tiles vs padding rows); it must be resolved or accepted before a recipe
+is re-pinned.
 
 ## Where plowrt's time goes at saturation
 
@@ -47,11 +60,13 @@ No row is a qualified plow-vs-baseline win or loss; the ratios are large enough 
 - Maya2: over a saturated 94 s cell, depth 47 s, codec 38 s, talker 15 s; a 224-row frame is
   ~48 ms of depth. Codec step ~3.2 ms + ~0.06 ms per row-frame.
 - Qwen3-ASR with the hold: encoder packs of 64-128 chunks take ~63 % of the device (~0.40 ms per
-  chunk); without it ~2100 single-clip launches per 40 s.
+  chunk); without it ~2100 single-clip launches per 40 s. Isolated packed.128 launch: 42.2 ms, of
+  which the three front-end convolutions 19.6 ms; 33.1 ms with the sm_90a paths (conv 9.8 ms). The
+  22 transformer programs stay ~1 ms each (dense ~48 TFLOP/s effective).
 - Rejected here: codec hold / deadline order knobs and a longer codec burst gather (5-9 % more
   Qwen3-TTS audio s/s, but 2-6x more streams with small underruns and a Maya2 regression).
 
 ## Evidence
 
-`/opt/dlami/nvme/lava-tts/sconc`: `res/{base1,base2,peer1,steps1,w256b,codec1,asr2,asr3,asrhold,asrhold2,gather1,gather2}`,
+`/opt/dlami/nvme/lava-tts/sconc`: `res/{base1,base2,peer1,steps1,w256b,codec1,asr2,asr3,asrhold,asrhold2,gather1,gather2,encbench,enc2,gate3}`,
 lease scripts beside them, reference installs and launch notes in `peers/PEERS.md`.
