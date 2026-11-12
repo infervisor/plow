@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://pdist.infervisor.ai/install.sh | sh
 #
-# Reads `v1/runtime/latest` (or PLOWRT_VERSION), then that release's
+# Reads `v1/plow-runtime/latest` (or PLOWRT_VERSION), then that release's
 # `release.json` for this machine's platform triple, downloads the tarball,
 # verifies its sha256 against the `.sha256` the build wrote, and installs
 # `plowrt` into PLOWRT_INSTALL_DIR (default: /usr/local/bin when writable,
@@ -46,10 +46,10 @@ esac
 
 version="${PLOWRT_VERSION:-}"
 if [ -z "$version" ]; then
-  version=$(fetch "$REGISTRY/v1/runtime/latest" | tr -d '[:space:]') || die "cannot read $REGISTRY/v1/runtime/latest"
-  [ -n "$version" ] || die "$REGISTRY/v1/runtime/latest is empty"
+  version=$(fetch "$REGISTRY/v1/plow-runtime/latest" | tr -d '[:space:]') || die "cannot read $REGISTRY/v1/plow-runtime/latest"
+  [ -n "$version" ] || die "$REGISTRY/v1/plow-runtime/latest is empty"
 fi
-base="$REGISTRY/v1/runtime/$version/$triple"
+base="$REGISTRY/v1/plow-runtime/$version/$triple"
 release=$(fetch "$base/release.json") || die "no release $version for $triple at $base"
 file=$(printf '%s' "$release" | json_str file)
 [ -n "$file" ] || die "release.json names no file"

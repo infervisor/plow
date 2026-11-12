@@ -221,7 +221,7 @@
           gpu = gpuToolsFor pkgs;
 
           # The platform triple a release is keyed by, and the one a client
-          # matches itself against in `v1/runtime/index.json`.
+          # matches itself against in `v1/plow-runtime/index.json`.
           releaseTriple =
             {
               "x86_64-linux" = "x86_64-unknown-linux-gnu";
@@ -250,8 +250,20 @@
                 inherit src cargoLock;
                 buildFeatures = features;
                 cargoBuildFlags = [ "--package" "plowrt" ];
+                # What `plowrt --version` prints: the published version, commit
+                # included, not the bare semver.
+                env.PLOW_RELEASE_VERSION = releaseVersion;
                 # The release build is the artifact; its tests run in CI on the
                 # feature set that owns them, not again per triple.
+                doCheck = false;
+              };
+              # The compiler ships in the same tarball, built from the same
+              # commit for the same triple. `install.sh` installs `plowrt` only.
+              compiler = rustPlatform.buildRustPackage {
+                pname = "plowc";
+                version = cargoVersion;
+                inherit src cargoLock;
+                cargoBuildFlags = [ "--package" "plowc" "--bin" "plowc" ];
                 doCheck = false;
               };
               name = "plowrt-${releaseVersion}-${triple}${suffix}";
@@ -270,10 +282,10 @@
           in
             pkgs.runCommand name { nativeBuildInputs = [ pkgs.gnutar pkgs.gzip pkgs.coreutils ] ++ lib.optional (interp != null) pkgs.patchelf; } ''
               mkdir -p $out "$TMPDIR/${name}"
-              cp ${bin}/bin/plowrt "$TMPDIR/${name}/plowrt"
-              chmod u+w "$TMPDIR/${name}/plowrt"
+              cp ${bin}/bin/plowrt ${compiler}/bin/plowc "$TMPDIR/${name}/"
+              chmod u+w "$TMPDIR/${name}"/*
               ${lib.optionalString (interp != null) ''
-                patchelf --set-interpreter ${interp} --remove-rpath "$TMPDIR/${name}/plowrt"
+                patchelf --set-interpreter ${interp} --remove-rpath "$TMPDIR/${name}/plowrt" "$TMPDIR/${name}/plowc"
               ''}
               # Deterministic: a fixed mtime, sorted entries, owner stripped, and
               # no gzip timestamp, so rebuilding the same commit reproduces the
@@ -515,7 +527,7 @@
           #
           # A runtime release is a tarball per platform triple, named
           # `<semver>+<git12>`, plus the sha256 a client verifies it against.
-          # A registry records these in `v1/runtime/index.json`, which a `plowrt`
+          # A registry records these in `v1/plow-runtime/index.json`, which a `plowrt`
           # client reads.
           #
           # `dist` is in every feature set: the released binary is exactly the
@@ -540,6 +552,14 @@
             target = "x86_64-unknown-linux-musl";
             rustPlatform = pkgs.pkgsStatic.rustPlatform;
             suffix = "-static";
+          };
+
+          # The aarch64 Linux release, cross-built here so one CI runner
+          # publishes every Linux triple of a version from one commit.
+          plowrt-release-aarch64 = mkRelease {
+            features = [ "cuda" "hsa" "cpu" "dist" ];
+            target = "aarch64-unknown-linux-gnu";
+            rustPlatform = pkgs.pkgsCross.aarch64-multiplatform.rustPlatform;
           };
 
           # Cross-built from x86_64-linux; tests can't run on the build host.

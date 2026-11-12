@@ -29,7 +29,8 @@ a commit it does not correspond to.
 
 A dynamic Linux release is patched to the host's loader inside the build (glibc
 2.38 or newer on the host). `plowrt push-runtime --release <output dir>` records
-the binaries under `v1/runtime/` and publishes `scripts/install.sh`; `plowrt
+the binaries under `v1/plow-runtime/` and publishes `scripts/install.sh`. CI
+does this on every merge to `main`; nobody runs it by hand. `plowrt
 push` releases model assets, which advance on their own cadence. Full contract:
 [`DISTRIBUTION.md`](DISTRIBUTION.md).
 

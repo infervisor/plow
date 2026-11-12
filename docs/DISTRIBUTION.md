@@ -63,7 +63,8 @@ v1/<namespace>/<name>/sigs/<sha256>.sig         # ed25519 over that version of i
 v1/<namespace>/<name>/manifests/<label>@g<n>    # one variant → bundle.json
 v1/objsets/<objset-id>.json
 v1/blobs/sha256/<hex>[.zst]                     # shared by everything
-v1/runtime/index.json                           # released binaries, per triple
+v1/plow-runtime/index.json                      # released plowrt + plowc, per triple
+v1/<tool>/index.json                            # another tool's releases (plow-smi)
 catalog.json                                    # model names only (+ listed)
 ```
 
@@ -213,12 +214,32 @@ and the registry, never by a script. Nothing on a serving host runs nix, and a
 published manifest that references `/nix/store` is refused at pack time — an
 exported bundle must be portable.
 
-**Runtime binaries** (`<semver>+<git12>`, the semver saying what changed and the
-commit saying which source produced the bytes):
+**Runtime binaries** (`<semver>+<commit>`, the semver saying what changed and the
+commit saying which source produced the bytes). A merge to `main` is a
+release, made by the `release` job in `.github/workflows/build.yml`:
+
+1. `scripts/ci/release-version.sh` picks the version: one patch past the
+   newest `vX.Y.Z` tag, or Cargo's workspace version when someone raised it
+   past that tag (`nix run .#bump -- X.Y.0`, for a minor or major release).
+2. `nix run .#bump -- <version>` rewrites `Cargo.toml` and `Cargo.lock`, and
+   the job commits that. The commit is kept by its tag only and never reaches
+   `main`, so `main`'s version lags the tags.
+3. It builds `plowrt-release` and `plowrt-release-aarch64`, and
+   `scripts/ci/check_release.py` checks each. (`plowrt-release-static` does
+   not compile for musl today, so it is not released.)
+4. It pushes the tag `v<version>`, then runs `plowrt push-runtime`, with the
+   registry credentials from the `pdist` environment's secrets.
+
+A failed upload is retried by re-running the workflow: it takes the next
+version. Darwin has no CI builder yet; a Mac publishes its own triple of a
+tagged version by hand with the commands below.
 
 ```
 nix build .#plowrt-release --no-link --print-out-paths
 ```
+
+Each tarball holds `plowrt` and `plowc`, and `plowrt --version` prints the
+published version, commit included.
 
 The tarball is deterministic (sorted, fixed mtime, no gzip timestamp) and its
 sha256 is computed at build time. A dynamic Linux release is re-pointed at
@@ -229,13 +250,14 @@ refused at publish, because it names a commit it does not correspond to.
 
 ```
 plowrt push-runtime --release <nix output dir> [--release <another triple's>] \
-  [--install-script scripts/install.sh] [--keep-latest] [--dry-run] [--to r2://…]
+  [--install-script scripts/install.sh] [--keep-latest] [--dry-run] [--to r2://…] \
+  [--name <tool>]
 ```
 
-records each output under `v1/runtime/<version>/<triple>/` (the tarball,
+records each output under `v1/plow-runtime/<version>/<triple>/` (the tarball,
 its `.sha256`, `release.json`; create-only, so a version is never
-republished with other bytes), rewrites `v1/runtime/index.json` (every
-release and triple, newest first, for a models page) and `v1/runtime/latest`
+republished with other bytes), rewrites `v1/plow-runtime/index.json` (every
+release and triple, newest first, for a models page) and `v1/plow-runtime/latest`
 (the version string alone, always copied from the index's `latest` after the
 index write; each publisher re-reads the index after its own pointer write and
 corrects a write that landed late, so racing publishers, rollbacks included,
@@ -247,7 +269,11 @@ registry root when asked. The same credentials and conditional writes as
 curl -fsSL https://pdist.infervisor.ai/install.sh | sh     # PLOWRT_VERSION=… pins
 ```
 
-which reads `latest`, then that version's `release.json` for the machine's
+`--name <tool>` publishes another tool's release directories the same way
+under `v1/<tool>/`; plow-smi's CI uses it. Releases up to 0.1.3 are under
+`v1/runtime/`, which is no longer written.
+
+The installer reads `latest`, then that version's `release.json` for the machine's
 triple, verifies the tarball against its `.sha256`, and installs `plowrt`
 into `/usr/local/bin` or `~/.local/bin` (`PLOWRT_INSTALL_DIR` overrides).
 
