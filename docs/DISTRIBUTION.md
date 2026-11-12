@@ -64,7 +64,6 @@ v1/<namespace>/<name>/manifests/<label>@g<n>    # one variant → bundle.json
 v1/objsets/<objset-id>.json
 v1/blobs/sha256/<hex>[.zst]                     # shared by everything
 v1/plow-runtime/index.json                      # released plowrt + plowc, per triple
-v1/<tool>/index.json                            # another tool's releases (plow-smi)
 catalog.json                                    # model names only (+ listed)
 ```
 
@@ -219,13 +218,13 @@ commit saying which source produced the bytes). A merge to `main` that changes
 what `plowrt` or `plowc` is built from is a release, made by the `release` job
 in `.github/workflows/build.yml`:
 
-0. `scripts/ci/release-needed.sh` compares the last release's source with
-   the merge: the workspace crates either binary links (from `cargo
-   tree`), `runtime/`, `include/`, the lock files, the flake and
-   `install.sh`. If none changed, the job stops and nothing is released.
-1. `scripts/ci/release-version.sh` picks the version: one patch past the
-   newest `vX.Y.Z` tag, or Cargo's workspace version when someone raised it
-   past that tag (`nix run .#bump -- X.Y.0`, for a minor or major release).
+1. `scripts/ci/next-release.sh` compares the last release's source with the
+   merge: the workspace crates either binary links (from `cargo tree`),
+   `runtime/`, `include/`, the lock files, the flake and `install.sh`. If
+   none changed, the job stops and nothing is released. Otherwise it picks
+   the version: one patch past the newest `vX.Y.Z` tag, or Cargo's workspace
+   version when someone raised it past that tag (`nix run .#bump -- X.Y.0`,
+   for a minor or major release).
 2. `nix run .#bump -- <version>` rewrites `Cargo.toml` and `Cargo.lock`, and
    the job commits that. The commit is kept by its tag only and never reaches
    `main`, so `main`'s version lags the tags.
@@ -254,8 +253,7 @@ refused at publish, because it names a commit it does not correspond to.
 
 ```
 plowrt push-runtime --release <nix output dir> [--release <another triple's>] \
-  [--install-script scripts/install.sh] [--keep-latest] [--dry-run] [--to r2://…] \
-  [--name <tool>]
+  [--install-script scripts/install.sh] [--keep-latest] [--dry-run] [--to r2://…]
 ```
 
 records each output under `v1/plow-runtime/<version>/<triple>/` (the tarball,
@@ -273,9 +271,7 @@ registry root when asked. The same credentials and conditional writes as
 curl -fsSL https://pdist.infervisor.ai/install.sh | sh     # PLOWRT_VERSION=… pins
 ```
 
-`--name <tool>` publishes another tool's release directories the same way
-under `v1/<tool>/`; plow-smi's CI uses it. Releases up to 0.1.3 are under
-`v1/runtime/`, which is no longer written.
+Releases up to 0.1.3 are under `v1/runtime/`, which is no longer written.
 
 The installer reads `latest`, then that version's `release.json` for the machine's
 triple, verifies the tarball against its `.sha256`, and installs `plowrt`

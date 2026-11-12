@@ -3,15 +3,10 @@
 //! The producer is `nix build .#plowrt-release`: one directory per platform
 //! triple holding the tarball, its `.sha256` (as `sha256sum` writes it) and
 //! `release.json`. This module records those outputs under
-//! `v1/plow-runtime/<version>/<triple>/`, keeps `v1/plow-runtime/index.json`
-//! (every release, every triple: what a models page lists) and
-//! `v1/plow-runtime/latest` (the version string alone: what `install.sh`
-//! reads with `sed`), and optionally publishes `install.sh` itself at the
-//! registry root.
-//!
-//! `--name` publishes another tool's releases the same way under
-//! `v1/<name>/` (`plow-smi`). Releases before 0.1.4 are under `v1/runtime/`,
-//! which is no longer written.
+//! `v1/plow-runtime/<version>/<triple>/`, keeps `v1/plow-runtime/index.json` (every
+//! release, every triple: what a models page lists) and `v1/plow-runtime/latest`
+//! (the version string alone: what `install.sh` reads with `sed`), and
+//! optionally publishes `install.sh` itself at the registry root.
 //!
 //! The same write discipline as `push`: a release's files are create-only,
 //! so a version is never republished with other bytes — a second run of the
@@ -26,8 +21,6 @@ use super::sink::{Cond, Put, Sink};
 use crate::{Result, RuntimeError};
 
 pub const RUNTIME_INDEX_SCHEMA: &str = "plow.dist.runtime.v1";
-/// The directory `plowrt`'s own releases are published under.
-pub const DEFAULT_NAME: &str = "plow-runtime";
 pub const RUNTIME_INDEX: &str = "v1/plow-runtime/index.json";
 pub const RUNTIME_LATEST: &str = "v1/plow-runtime/latest";
 pub const INSTALL_SCRIPT: &str = "install.sh";
@@ -72,7 +65,7 @@ pub struct RuntimeRelease {
     pub triples: BTreeMap<String, RuntimeAsset>,
 }
 
-/// `v1/<name>/index.json`. Newest release first.
+/// `v1/plow-runtime/index.json`. Newest release first.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeIndex {
     pub schema: String,
@@ -97,9 +90,6 @@ pub struct Options {
     /// Publish this file as `install.sh` at the registry root.
     pub install_script: Option<PathBuf>,
     pub dry_run: bool,
-    /// The tool being released: its directory under `v1/`. `None` is
-    /// [`DEFAULT_NAME`].
-    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -171,8 +161,8 @@ impl ReleaseDir {
         })
     }
 
-    fn key_dir(&self, name: &str) -> String {
-        format!("v1/{name}/{}/{}", self.json.version, self.json.triple)
+    fn key_dir(&self) -> String {
+        format!("v1/plow-runtime/{}/{}", self.json.version, self.json.triple)
     }
 }
 
@@ -242,20 +232,6 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
         .first()
         .ok_or_else(|| dist("push-runtime: no release directory".into()))?;
     let version = first.json.version.clone();
-    let name = opts.name.as_deref().unwrap_or(DEFAULT_NAME);
-    // `v1/<name>/` shares `v1/` with the model store's own directories.
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        || ["objsets", "blobs"].contains(&name)
-    {
-        return Err(dist(format!(
-            "push-runtime: --name {name:?} is not a tool name (lowercase letters, digits, '-')"
-        )));
-    }
-    let index_key = format!("v1/{name}/index.json");
-    let index_key = index_key.as_str();
     for d in dirs {
         if d.json.version != version {
             return Err(dist(format!(
@@ -296,7 +272,7 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
     //    is what install.sh trusts, so both are written before the tarball is
     //    considered published.
     for d in dirs {
-        let dir = d.key_dir(name);
+        let dir = d.key_dir();
         let sums = format!("{}  {}\n", d.sha256, d.json.file);
         let same_sums = |there: &[u8]| {
             String::from_utf8_lossy(there).split_whitespace().next() == Some(d.sha256.as_str())
@@ -350,16 +326,16 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
 
     // 2. The index, replaced only if still the one read.
     for attempt in 0..4 {
-        let (mut index, cond) = match sink.get(index_key)? {
+        let (mut index, cond) = match sink.get(RUNTIME_INDEX)? {
             Some((raw, etag)) => (
-                super::push::parse_to_rewrite::<RuntimeIndex>(index_key, &raw)?,
+                super::push::parse_to_rewrite::<RuntimeIndex>(RUNTIME_INDEX, &raw)?,
                 Cond::IfMatch(etag),
             ),
             None => (RuntimeIndex::default(), Cond::IfNoneMatchAny),
         };
         if index.schema != RUNTIME_INDEX_SCHEMA {
             return Err(dist(format!(
-                "{index_key}: schema {} is not {RUNTIME_INDEX_SCHEMA}",
+                "{RUNTIME_INDEX}: schema {} is not {RUNTIME_INDEX_SCHEMA}",
                 index.schema
             )));
         }
@@ -378,7 +354,7 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
             row.triples.insert(
                 d.json.triple.clone(),
                 RuntimeAsset {
-                    file: format!("{}/{}", d.key_dir(name), d.json.file),
+                    file: format!("{}/{}", d.key_dir(), d.json.file),
                     sha256: d.sha256.clone(),
                     bytes: d.bytes,
                     features: d.json.features.clone(),
@@ -390,20 +366,20 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
             index.latest = version.clone();
         }
         let bytes = serde_json::to_vec_pretty(&index)
-            .map_err(|e| dist(format!("{index_key}: serialize: {e}")))?;
-        match put_bytes(sink, index_key, &bytes, "application/json", cond)? {
+            .map_err(|e| dist(format!("{RUNTIME_INDEX}: serialize: {e}")))?;
+        match put_bytes(sink, RUNTIME_INDEX, &bytes, "application/json", cond)? {
             Put::Stored(_) => break,
             Put::PreconditionFailed if attempt < 3 => continue,
             Put::PreconditionFailed => {
                 return Err(dist(format!(
-                    "{index_key} kept changing under this push; the files are published, \
+                    "{RUNTIME_INDEX} kept changing under this push; the files are published, \
                      run it again to record them"
                 )))
             }
         }
     }
     // 3. The pointer install.sh reads: the version string, nothing to parse.
-    out.latest = sync_latest(sink, name)?;
+    out.latest = sync_latest(sink)?;
 
     // 4. The installer. Not versioned: it reads `latest`.
     if let Some(script) = &opts.install_script {
@@ -440,18 +416,15 @@ pub fn push_runtime(sink: &dyn Sink, dirs: &[ReleaseDir], opts: &Options) -> Res
 /// re-reads the index, and if `latest` moved, goes round again. A publisher
 /// therefore returns only once the pointer it last saw agrees with the index,
 /// and a late write is put right by the publisher that made it.
-fn sync_latest(sink: &dyn Sink, name: &str) -> Result<String> {
-    let index_key = format!("v1/{name}/index.json");
-    let (index_key, latest_key) = (index_key.as_str(), format!("v1/{name}/latest"));
-    let latest_key = latest_key.as_str();
+fn sync_latest(sink: &dyn Sink) -> Result<String> {
     let index_latest = || -> Result<String> {
-        match sink.get(index_key)? {
-            Some((raw, _)) => Ok(parse::<RuntimeIndex>(index_key, &raw)?.latest),
-            None => Err(dist(format!("{index_key} is missing"))),
+        match sink.get(RUNTIME_INDEX)? {
+            Some((raw, _)) => Ok(parse::<RuntimeIndex>(RUNTIME_INDEX, &raw)?.latest),
+            None => Err(dist(format!("{RUNTIME_INDEX} is missing"))),
         }
     };
     for _ in 0..8 {
-        let pointer = sink.get(latest_key)?;
+        let pointer = sink.get(RUNTIME_LATEST)?;
         let latest = index_latest()?;
         let cond = match pointer {
             Some((raw, _)) if String::from_utf8_lossy(&raw).trim() == latest => return Ok(latest),
@@ -459,13 +432,13 @@ fn sync_latest(sink: &dyn Sink, name: &str) -> Result<String> {
             None => Cond::IfNoneMatchAny,
         };
         let body = format!("{latest}\n");
-        match put_bytes(sink, latest_key, body.as_bytes(), "text/plain", cond)? {
+        match put_bytes(sink, RUNTIME_LATEST, body.as_bytes(), "text/plain", cond)? {
             Put::Stored(_) if index_latest()? == latest => return Ok(latest),
             Put::Stored(_) | Put::PreconditionFailed => continue,
         }
     }
     Err(dist(format!(
-        "{latest_key} kept changing under this push; the index is published, run it again \
+        "{RUNTIME_LATEST} kept changing under this push; the index is published, run it again \
          to move the pointer"
     )))
 }
@@ -911,41 +884,5 @@ mod tests {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339(1_793_404_800), "2026-10-31T00:00:00Z");
-    }
-
-    #[test]
-    fn a_named_tool_publishes_beside_the_runtime() {
-        let root = tmp("named");
-        let sink = FileSink::new(root.join("reg"));
-        let d = release(&root, "0.2.0+abc1234", "x86_64-unknown-linux-gnu", b"smi");
-        let opts = Options {
-            name: Some("plow-smi".into()),
-            ..Default::default()
-        };
-        let out = push_runtime(&sink, &[d], &opts).unwrap();
-        assert_eq!(out.latest, "0.2.0+abc1234");
-        assert_eq!(
-            String::from_utf8(read(&sink, "v1/plow-smi/latest").unwrap()).unwrap(),
-            "0.2.0+abc1234\n"
-        );
-        let index: RuntimeIndex =
-            serde_json::from_slice(&read(&sink, "v1/plow-smi/index.json").unwrap()).unwrap();
-        assert!(index.releases[0].triples["x86_64-unknown-linux-gnu"]
-            .file
-            .starts_with("v1/plow-smi/0.2.0+abc1234/x86_64-unknown-linux-gnu/"));
-        // Nothing of it lands in plowrt's own directory.
-        assert!(sink.get(RUNTIME_INDEX).unwrap().is_none());
-
-        let d = release(&root, "0.2.1+abc1234", "x86_64-unknown-linux-gnu", b"smi");
-        for bad in ["", "blobs", "../x", "Plow"] {
-            let opts = Options {
-                name: Some(bad.into()),
-                ..Default::default()
-            };
-            assert!(
-                push_runtime(&sink, std::slice::from_ref(&d), &opts).is_err(),
-                "{bad:?}"
-            );
-        }
     }
 }

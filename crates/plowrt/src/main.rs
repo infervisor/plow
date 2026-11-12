@@ -937,10 +937,6 @@ enum Cmd {
         /// Report what would be written, and write nothing.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
-        /// The tool these releases are of: they go under `v1/<name>/`.
-        /// Another tool's CI publishes with its own name (`plow-smi`).
-        #[arg(long, default_value = plowrt::dist::runtime::DEFAULT_NAME)]
-        name: String,
     },
 
     /// Generate the ed25519 key `push` signs model indexes with. Prints the
@@ -1638,7 +1634,6 @@ async fn async_main(
             keep_latest,
             install_script,
             dry_run,
-            name,
         } => dist_cmd::report(dist_cmd::cmd_push_runtime(
             &releases,
             &to,
@@ -1646,7 +1641,6 @@ async fn async_main(
                 keep_latest,
                 install_script,
                 dry_run,
-                name: Some(name),
             },
         )),
         #[cfg(feature = "dist")]

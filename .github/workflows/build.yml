@@ -70,8 +70,7 @@ jobs:
       # fails on its pull request.
       - name: Check the release build publishes
         run: |
-          bash scripts/ci/release-version-selftest.sh
-          bash scripts/ci/release-needed-selftest.sh
+          bash scripts/ci/next-release.sh --self-test
           semver="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
           out="$(nix build .#plowrt-release --no-link --print-out-paths)"
           bash scripts/ci/check-release.sh "$semver" "$out"
@@ -239,7 +238,7 @@ jobs:
   # release: CI picks the next version, bumps it with `nix run .#bump`, builds
   # every Linux triple from that one commit, tags it and publishes to the
   # registry (pdist). A merge that touches only docs, recipes, perf data, CI
-  # or an unlinked crate releases nothing (scripts/ci/release-needed.sh).
+  # or an unlinked crate releases nothing (scripts/ci/next-release.sh).
   # The bump commit is kept by its tag only and never reaches main, so main's
   # Cargo.toml lags the tags by design.
   release:
@@ -257,23 +256,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Is there anything to release
-        id: gate
-        run: |
-          git fetch --tags --force --quiet origin
-          needed="$(nix develop .#ci --command bash scripts/ci/release-needed.sh)"
-          echo "needed=$needed" >> "$GITHUB_OUTPUT"
-          if [ "$needed" = false ]; then
-            echo "No release: nothing plowrt or plowc is built from changed." >> "$GITHUB_STEP_SUMMARY"
-          fi
       - name: Decide the version
         id: version
-        if: steps.gate.outputs.needed == 'true'
-        run: echo "next=$(bash scripts/ci/release-version.sh)" >> "$GITHUB_OUTPUT"
+        run: |
+          git fetch --tags --force --quiet origin
+          next="$(nix develop .#ci --command bash scripts/ci/next-release.sh)"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          if [ -z "$next" ]; then
+            echo "No release: nothing plowrt or plowc is built from changed." >> "$GITHUB_STEP_SUMMARY"
+          fi
       # A release names its commit (`<semver>+<rev>`) and a dirty tree is
       # refused at publish, so the bump is committed before the build.
       - name: Bump
-        if: steps.gate.outputs.needed == 'true'
+        if: steps.version.outputs.next != ''
         env:
           NEXT: ${{ steps.version.outputs.next }}
         run: |
@@ -285,7 +280,7 @@ jobs:
               commit --quiet -m "plow: v$NEXT [skip ci]"
           fi
       - name: Build the release
-        if: steps.gate.outputs.needed == 'true'
+        if: steps.version.outputs.next != ''
         id: build
         env:
           NEXT: ${{ steps.version.outputs.next }}
@@ -299,14 +294,14 @@ jobs:
       # the next run takes the next number instead of reusing this one for
       # other bytes.
       - name: Tag
-        if: steps.gate.outputs.needed == 'true'
+        if: steps.version.outputs.next != ''
         env:
           NEXT: ${{ steps.version.outputs.next }}
         run: |
           git tag "v$NEXT"
           git push origin "refs/tags/v$NEXT"
       - name: Publish to the registry
-        if: steps.gate.outputs.needed == 'true'
+        if: steps.version.outputs.next != ''
         env:
           DIRS: ${{ steps.build.outputs.dirs }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

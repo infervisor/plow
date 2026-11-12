@@ -1358,16 +1358,15 @@ pub fn cmd_push_runtime(
     } else {
         "published"
     };
-    let name = opts.name.as_deref().unwrap_or(dist::runtime::DEFAULT_NAME);
     for (triple, bytes) in &out.uploaded {
         println!(
-            "{verb} v1/{name}/{}/{triple} ({} MiB)",
+            "{verb} plowrt {} {triple} ({} MiB)",
             out.version,
             bytes >> 20
         );
     }
     for triple in &out.adopted {
-        println!("already published: v1/{name}/{}/{triple}", out.version);
+        println!("already published: plowrt {} {triple}", out.version);
     }
     if !out.latest.is_empty() {
         println!("latest: {}", out.latest);
