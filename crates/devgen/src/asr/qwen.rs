@@ -135,6 +135,18 @@ impl AudioEncoderPackets {
             if !tensor.name.starts_with("thinker.audio_tower.") || tensor.init.is_some() {
                 continue;
             }
+            if let Some(source) = tensor.name.strip_suffix(BLOCKED_480X9) {
+                let (dtype, bytes) = resolve(source)?;
+                if dtype != AudioWeightDType::Bf16 || bytes.len() as u64 != tensor.bytes {
+                    return Err(format!(
+                        "tensor {source} has dtype {dtype:?} and {} bytes, expected {} bf16 bytes",
+                        bytes.len(),
+                        tensor.bytes
+                    ));
+                }
+                tensor.init = Some(block_conv_weights(&bytes, 480, 9));
+                continue;
+            }
             let (dtype, bytes) = resolve(&tensor.name)?;
             let converted = match dtype {
                 AudioWeightDType::Bf16 if bytes.len() as u64 == tensor.bytes => bytes,
@@ -302,6 +314,27 @@ impl AudioEncoderPackets {
     }
 }
 
+/// Name suffix of a conv weight stored as [`ConvWeight::Bf16Blocked`] (480 input channels, 9 taps).
+const BLOCKED_480X9: &str = "#cb16";
+
+/// bf16 `[out][in][taps]` to `[out][in / 16][tap][16]`.
+fn block_conv_weights(bytes: &[u8], input_channels: usize, taps: usize) -> Vec<u8> {
+    let mut blocked = vec![0; bytes.len()];
+    for (src, dst) in bytes
+        .chunks_exact(input_channels * taps * 2)
+        .zip(blocked.chunks_exact_mut(input_channels * taps * 2))
+    {
+        for channel in 0..input_channels {
+            for tap in 0..taps {
+                let from = (channel * taps + tap) * 2;
+                let to = ((channel / 16 * taps + tap) * 16 + channel % 16) * 2;
+                dst[to..to + 2].copy_from_slice(&src[from..from + 2]);
+            }
+        }
+    }
+    blocked
+}
+
 /// The audio tower's widths; every Qwen3-ASR size shares the conv front end and 64-wide heads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioDims {
@@ -357,7 +390,19 @@ pub fn lower_audio_encoder(
     if !(50..=3000).contains(&feature_frames) {
         return Err("invalid Qwen audio encoder geometry".into());
     }
-    lower(feature_frames, n_cu, false, false, dims)
+    lower(feature_frames, n_cu, false, AudioLowering::default(), dims)
+}
+
+/// bf16-storage choices of the lowering, off by default (each needs its kernels on the target).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioLowering {
+    /// `PLOW_ASR_DENSE_CONTINUOUS`: every dense sums K in one k16 chain
+    /// ([`DenseSplit::Continuous`]) in the packed and the single-utterance programs alike, in
+    /// place of the split-K sum and its per-row reference in packed launches.
+    pub continuous_dense: bool,
+    /// `PLOW_ASR_CONV_BF16`: conv2 / conv3 weights as [`ConvWeight::Bf16Blocked`] (the same
+    /// values and sums as the FP32-stored ones).
+    pub conv_bf16: bool,
 }
 
 /// One encoder capacity rung: a packed bucket of 100-frame chunks or a single-utterance bucket.
@@ -376,17 +421,14 @@ impl AudioBucket {
     }
 
     pub fn lower(self, n_cu: u32, dims: AudioDims) -> Result<AudioEncoderPackets, String> {
-        self.lower_with(n_cu, dims, false)
+        self.lower_with(n_cu, dims, AudioLowering::default())
     }
 
-    /// `continuous_dense` (`PLOW_ASR_DENSE_CONTINUOUS`): every dense sums K in one k16 chain
-    /// ([`DenseSplit::Continuous`]) in the packed and the single-utterance programs alike, in
-    /// place of the split-K sum and its per-row reference in packed launches.
     pub fn lower_with(
         self,
         n_cu: u32,
         dims: AudioDims,
-        continuous_dense: bool,
+        lowering: AudioLowering,
     ) -> Result<AudioEncoderPackets, String> {
         let frames = self.feature_frames();
         let packed = matches!(self, AudioBucket::Packed(_));
@@ -397,7 +439,7 @@ impl AudioBucket {
         } {
             return Err("invalid Qwen audio encoder geometry".into());
         }
-        lower(frames, n_cu, packed, continuous_dense, dims)
+        lower(frames, n_cu, packed, lowering, dims)
     }
 }
 
@@ -424,14 +466,14 @@ pub fn lower_packed_audio_encoder(
     if chunks == 0 || chunks > 1024 {
         return Err("invalid packed Qwen audio encoder geometry".into());
     }
-    lower(chunks * 100, n_cu, true, false, dims)
+    lower(chunks * 100, n_cu, true, AudioLowering::default(), dims)
 }
 
 fn lower(
     feature_frames: u32,
     n_cu: u32,
     packed: bool,
-    continuous_dense: bool,
+    lowering: AudioLowering,
     dims: AudioDims,
 ) -> Result<AudioEncoderPackets, String> {
     let AudioDims {
@@ -445,10 +487,15 @@ fn lower(
     }
     let chunks = feature_frames.div_ceil(100);
     let chunk_frames = feature_frames.min(100);
+    let blocked = |index: usize| lowering.conv_bf16 && index > 0;
     let names: Vec<_> = (1..=3)
         .map(|index| {
             (
-                format!("thinker.audio_tower.conv2d{index}.weight"),
+                if blocked(index - 1) {
+                    format!("thinker.audio_tower.conv2d{index}.weight{BLOCKED_480X9}")
+                } else {
+                    format!("thinker.audio_tower.conv2d{index}.weight")
+                },
                 format!("thinker.audio_tower.conv2d{index}.bias"),
             )
         })
@@ -469,7 +516,11 @@ fn lower(
             kind: ConvKind::Standard,
             activation: ConvActivation::GeluErfBf16,
             output_layout: ConvLayout::ChannelsFramesWidth,
-            weight_type: ConvWeight::Bf16InF32,
+            weight_type: if blocked(index) {
+                ConvWeight::Bf16Blocked
+            } else {
+                ConvWeight::Bf16InF32
+            },
         })
         .collect();
     let packets = conv2d::lower(
@@ -502,7 +553,7 @@ fn lower(
     // Per row: the rows of its utterance's single-utterance capacity, whose split-K it reproduces.
     let split_rows = builder.tensor("in.qwen.audio_split_rows", 4 * u64::from(rows));
     let attention_rows = if packed { groups } else { valid_rows };
-    let split = if continuous_dense {
+    let split = if lowering.continuous_dense {
         DenseSplit::Continuous
     } else if packed {
         DenseSplit::Reference(split_rows)
@@ -1225,10 +1276,59 @@ mod tests {
     }
 
     #[test]
+    fn conv_bf16_blocks_the_tensor_core_conv_weights() {
+        let packets = AudioBucket::Packed(2)
+            .lower_with(
+                4,
+                AudioDims::QWEN3_ASR_1_7B,
+                AudioLowering {
+                    continuous_dense: false,
+                    conv_bf16: true,
+                },
+            )
+            .unwrap();
+        let convs: Vec<_> = packets
+            .prefix
+            .model
+            .progs
+            .iter()
+            .flat_map(|p| p.insts.clone())
+            .filter(|i| DevOp::from_u16(i.op) == Some(DevOp::Conv2dF32))
+            .collect();
+        let flags: Vec<_> = convs.iter().map(|i| i.j[0] & (64 | 256 | 1024)).collect();
+        assert_eq!(flags, [64, 256 | 1024, 256 | 1024]);
+        let weight = convs[1].t[2] as usize;
+        assert_eq!(
+            packets.prefix.model.tensors[weight].bytes,
+            480 * 480 * 9 * 2
+        );
+        let blocked = block_conv_weights(
+            &(0..2 * 32 * 9u16)
+                .flat_map(|i| (i % 288).to_le_bytes())
+                .collect::<Vec<_>>(),
+            32,
+            9,
+        );
+        let at = |i: usize| u16::from_le_bytes([blocked[2 * i], blocked[2 * i + 1]]);
+        // (out 1, block 1, tap 2, channel 3 of the block) = input channel 19, tap 2.
+        assert_eq!(at(288 + (9 + 2) * 16 + 3), 19 * 9 + 2);
+        assert_eq!(at(0), 0);
+        assert_eq!(at(16), 1);
+        assert_eq!(at(1), 9);
+    }
+
+    #[test]
     fn continuous_dense_is_the_same_op_in_packed_and_single_programs() {
         let dense = |bucket: AudioBucket| {
             let packets = bucket
-                .lower_with(4, AudioDims::QWEN3_ASR_1_7B, true)
+                .lower_with(
+                    4,
+                    AudioDims::QWEN3_ASR_1_7B,
+                    AudioLowering {
+                        continuous_dense: true,
+                        conv_bf16: false,
+                    },
+                )
                 .unwrap();
             packets
                 .prefix

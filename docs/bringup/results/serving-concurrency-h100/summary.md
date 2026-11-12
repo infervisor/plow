@@ -70,6 +70,33 @@ bounds are measured. The single-utterance program loses 7-10 % (no split-K over 
 
 The conv front end is now 46 % of the packed encoder and the next kernel target.
 
+### Conv front end (128-chunk packed launch, 1.7B)
+
+conv2 (480 -> 480, 3x3 stride 2) at 5.0 ms splits into input loads 1.6 ms, weight conversion 1.9 ms,
+MMAs 0.9 ms, the rest 1.1 ms (variants with each part skipped); conv3 1.6 ms the same way. Both are
+bound by L2 traffic (about 3 TB/s), not by the tensor cores.
+
+`PLOW_ASR_CONV_BF16=1` stores the conv2 / conv3 weights as bf16 in the kernel's channel-block order,
+so each tile copies them instead of converting FP32 rows: the same values and sums (op outputs
+bit-identical to the FP32-stored weights; encoder pack parity 0 of 73). conv2 5.0 -> 4.2 ms, conv3
+1.6 -> 1.5 ms; packed.128 encoder 20.4 -> 19.2 ms, forward.800 5.09 -> 4.94 ms. Served, two
+interleaved runs: WER unchanged, c64 RTFx 1355 / 1342 -> 1387 / 1373, c256 1473 / 1494 -> 1542 /
+1522, 250 req/s within SLO 32 % / 0 % -> 95 % / 99 %, 0 faults.
+
+### Where a served request's GPU time goes (1.7B, 300 req/s, continuous dense)
+
+GPU-alone cost per 6.7 s request: encoder 1.13 ms; decoder prefill 1.07 ms (a 512-row packed launch
+takes 5.15 ms and carries about 4.8 requests: 3.4 ms fixed + 3.6 us per row); decode 0.76 ms (one
+3.2-3.7 ms step per tick for ~105 live rows, ~23 ticks per request). 2.96 ms serialized against
+3.7 ms observed. Decode rows do not ride the prefill launch on this packet (its audio overlay
+excludes the unified launch), so every tick sweeps the decoder weights twice. With the encoder
+running beside it a prefill launch stretches from 6.4 ms (p50) to 32-45 ms (p90-p99) and a decode
+step from 3.7 to 13.5 ms (p90).
+
+Larger rungs alone do not help: prefill rungs to 1024 rows with 256 decode slots gave c256 RTFx
+1562 / 1612 against 1542 / 1522, 250 req/s within SLO 15 % / 79 % against 95 % / 99 %, and p99 near
+5 s past saturation (2.9 s before). Rejected.
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |

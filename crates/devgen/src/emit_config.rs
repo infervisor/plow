@@ -245,6 +245,11 @@ pub struct EmitConfig {
     #[arg(long = "emit-asr-dense-continuous", env = "PLOW_ASR_DENSE_CONTINUOUS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub asr_dense_continuous: bool,
 
+    /// Qwen audio-encoder conv2 / conv3 weights stored bf16 in the staged kernel's block order
+    /// (Conv2dF32 flag 1024): the same values and sums, copied instead of converted per tile.
+    #[arg(long = "emit-asr-conv-bf16", env = "PLOW_ASR_CONV_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub asr_conv_bf16: bool,
+
     /// Emit the checkpoint's vision/audio towers as encoder sidecars and give the text packet
     /// soft-token rows (`MmRowsBf16`, `in.mm_slab`, the `plow.multimodal.v1` contract). Off: the
     /// text packet is unchanged.
@@ -2002,6 +2007,7 @@ impl EmitConfig {
             max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
             asr_packed_max_chunks: env_u32("PLOW_ASR_PACKED_MAX_CHUNKS"),
             asr_dense_continuous: env_bool("PLOW_ASR_DENSE_CONTINUOUS"),
+            asr_conv_bf16: env_bool("PLOW_ASR_CONV_BF16"),
             multimodal: env_bool("PLOW_EMIT_MULTIMODAL"),
             mm_slab_rows: env_u32("PLOW_EMIT_MM_SLAB_ROWS"),
             mm_vision_ladder: env_str("PLOW_EMIT_MM_VISION_LADDER"),

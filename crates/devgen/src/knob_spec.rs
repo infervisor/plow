@@ -1205,6 +1205,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.max_request_chunk", Some("PLOW_MAX_REQUEST_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.asr_packed_max_chunks", Some("PLOW_ASR_PACKED_MAX_CHUNKS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.asr_dense_continuous", Some("PLOW_ASR_DENSE_CONTINUOUS"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.asr_conv_bf16", Some("PLOW_ASR_CONV_BF16"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.multimodal", Some("PLOW_EMIT_MULTIMODAL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.mm_slab_rows", Some("PLOW_EMIT_MM_SLAB_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.mm_vision_ladder", Some("PLOW_EMIT_MM_VISION_LADDER"), Layer::Emit, Domain::Str, UNSET, OPT_IN),

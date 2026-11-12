@@ -12096,7 +12096,10 @@ fn emit_dense_gqa(
                         .lower_with(
                             n_cu,
                             audio_dims,
-                            emit_config::active().asr_dense_continuous,
+                            asr::qwen::AudioLowering {
+                                continuous_dense: emit_config::active().asr_dense_continuous,
+                                conv_bf16: emit_config::active().asr_conv_bf16,
+                            },
                         )
                         .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"))
                 };
