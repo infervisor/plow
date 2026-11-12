@@ -2281,8 +2281,9 @@ static __device__ __noinline__ void d_q8_gemm_f32(float* __restrict__ out, const
 
 /* Conv2dF32 (176). flags (fj1): 1 depthwise, 2 relu, [3:2] out layout, [5:4] in layout,
  * 64 f32 weights (else f16), 128 bf16 erf-GELU, 256 input and f32 weights bf16-representable
- * (bf16 tensor cores), 512 3xTF32 tensor cores, [31:16] width stride (0 = i5). Layouts: 0 NFWC,
- * 1 NFCW, 2 NCFW. */
+ * (bf16 tensor cores), 512 3xTF32 tensor cores, 1024 bf16 weights as [oc][ic / 16][tap][16] (with
+ * 256, without 64; 3x3 stride 2 over NCFW), [31:16] width stride (0 = i5). Layouts: 0 NFWC, 1 NFCW,
+ * 2 NCFW. */
 struct SpConvEpi {
     float* out; const float* bias; unsigned oc, of, ow, layout, gelu, relu;
     __device__ void store(unsigned pos, unsigned c, float value) const {
@@ -2528,12 +2529,13 @@ __device__ __forceinline__ bool sp_cs_fits(unsigned W, unsigned OW, unsigned vec
     const unsigned rows = (OW + SpCs<1>::BM - 2u) / OW + 1u, slots = 2u * (rows - 1u) + 3u;
     return slots * (W + 2u) < SpCs<1>::ZE && slots * W * 2u <= 3u * (3u - vec) * PLOW_NV_THREADS * vec;
 }
-template <class C, class EP>
-static __device__ __forceinline__ void sp_cs_conv(const float* __restrict__ x, const float* __restrict__ w,
+template <class C, bool WB, class EP>
+static __device__ __forceinline__ void sp_cs_conv(const float* __restrict__ x, const void* __restrict__ wp,
                                                   const EP& ep, unsigned F, unsigned W, unsigned IC, unsigned N,
                                                   unsigned OF, unsigned OW, unsigned M, unsigned slice,
                                                   unsigned nblk, float* arena) {
     char* smem = (char*)arena;
+    const float* w = (const float*)wp;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const unsigned wm = (warp % C::WM) * C::TM, wn = (warp / C::WM) * C::TN, g = lane >> 2, t = lane & 3u;
     const unsigned K = IC * 9u, NCB = IC / 16u, FW = F * W, W2 = W + 2u;
@@ -2600,13 +2602,31 @@ static __device__ __forceinline__ void sp_cs_conv(const float* __restrict__ x, c
                     }
                 }
             }
+            if constexpr (!WB) {
 #pragma unroll
-            for (unsigned r = 0; r < C::BI; r++) {
-                const unsigned n = br + 7u * (part * C::BI + r);
-                bv[r] = tid < 252u && n < C::BN && n0 + n < N
-                            ? __ldcg((const float4*)(w + (size_t)(n0 + n) * K + cb * 144u + 4u * bj))
-                            : make_float4(0.f, 0.f, 0.f, 0.f);
+                for (unsigned r = 0; r < C::BI; r++) {
+                    const unsigned n = br + 7u * (part * C::BI + r);
+                    bv[r] = tid < 252u && n < C::BN && n0 + n < N
+                                ? __ldcg((const float4*)(w + (size_t)(n0 + n) * K + cb * 144u + 4u * bj))
+                                : make_float4(0.f, 0.f, 0.f, 0.f);
+                }
             }
+        };
+        /* Blocked bf16 weights ([n][channel block][tap][16], flag 1024): a channel block's 16-byte
+         * chunks are the stage's [half][tap][n][8] entries as stored. */
+        auto b_copy = [&](unsigned cb, unsigned buf) {
+            char* bs = smem + buf * C::STAGE + C::A_BYTES;
+#pragma unroll
+            for (unsigned i = 0; i < (C::BN * 18u + PLOW_NV_THREADS - 1u) / PLOW_NV_THREADS; i++) {
+                const unsigned e = tid + i * PLOW_NV_THREADS, n = e / 18u, r = e - n * 18u, tap = r >> 1, half = r & 1u;
+                const bool ok = n0 + n < N;
+                if (n < C::BN)
+                    sp_cp16(bs + half * C::B_PLANE + tap * C::B_TAP + n * 16u,
+                            (const __nv_bfloat16*)wp +
+                                (ok ? ((size_t)(n0 + n) * NCB * 9u + cb * 9u + tap) * 16u + half * 8u : 0u),
+                            ok);
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
         };
         auto store = [&](unsigned buf, unsigned part) {
             char* as = smem + buf * C::STAGE;
@@ -2626,14 +2646,16 @@ static __device__ __forceinline__ void sp_cs_conv(const float* __restrict__ x, c
                 }
             }
             char* bs = as + C::A_BYTES;
+            if constexpr (!WB) {
 #pragma unroll
-            for (unsigned r = 0; r < C::BI; r++) {
-                const unsigned n = br + 7u * (part * C::BI + r);
-                if (tid < 252u && n < C::BN) {
-                    *(__nv_bfloat16*)(bs + boff[0] + n * 16u) = __float2bfloat16_rn(bv[r].x);
-                    *(__nv_bfloat16*)(bs + boff[1] + n * 16u) = __float2bfloat16_rn(bv[r].y);
-                    *(__nv_bfloat16*)(bs + boff[2] + n * 16u) = __float2bfloat16_rn(bv[r].z);
-                    *(__nv_bfloat16*)(bs + boff[3] + n * 16u) = __float2bfloat16_rn(bv[r].w);
+                for (unsigned r = 0; r < C::BI; r++) {
+                    const unsigned n = br + 7u * (part * C::BI + r);
+                    if (tid < 252u && n < C::BN) {
+                        *(__nv_bfloat16*)(bs + boff[0] + n * 16u) = __float2bfloat16_rn(bv[r].x);
+                        *(__nv_bfloat16*)(bs + boff[1] + n * 16u) = __float2bfloat16_rn(bv[r].y);
+                        *(__nv_bfloat16*)(bs + boff[2] + n * 16u) = __float2bfloat16_rn(bv[r].z);
+                        *(__nv_bfloat16*)(bs + boff[3] + n * 16u) = __float2bfloat16_rn(bv[r].w);
+                    }
                 }
             }
         };
@@ -2660,10 +2682,16 @@ static __device__ __forceinline__ void sp_cs_conv(const float* __restrict__ x, c
             issue(0, part);
             store(0, part);
         }
+        if constexpr (WB) {
+            b_copy(0u, 0u);
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        }
         __syncthreads();
         for (unsigned cb = 0; cb < NCB; cb++) {
             const unsigned buf = cb & 1u;
             const bool more = cb + 1u < NCB;
+            if constexpr (WB)
+                if (more) b_copy(cb + 1u, buf ^ 1u);
             const char* as = smem + buf * C::STAGE + (lane >> 4) * C::A_PLANE;
             const char* bs = smem + buf * C::STAGE + C::A_BYTES + ((lane >> 3) & 1u) * C::B_PLANE;
 #pragma unroll
@@ -2692,6 +2720,7 @@ static __device__ __forceinline__ void sp_cs_conv(const float* __restrict__ x, c
                 if (((cb + tap) & 3u) == 3u) fold(); /* step 9 cb + tap */
                 if (more && tap % 3u == 2u) store(buf ^ 1u, tap / 3u);
             }
+            if constexpr (WB) asm volatile("cp.async.wait_group 0;\n" ::);
             __syncthreads();
         }
         if ((NCB * 9u) & 3u) fold();
@@ -2730,6 +2759,24 @@ static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const 
     const unsigned positions = (unsigned)positions64;
     const SpConvEpi ep{out, bias, oc, of, ow, out_layout, flags & 128u, flags & 2u};
     const SpConvGeom g{frames, width, ic, kernel, stride, pad_before, of, ow, in_layout, wstride};
+    if (flags & 1024u) {
+        /* Blocked bf16 weights exist only for the staged 3x3 / stride 2 path. */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
+        if (depthwise || !(flags & 256u) || (flags & 64u) || kernel != 3u || stride != 2u || wstride != 2u ||
+            pad_before != 1u || pad_after != 1u || in_layout != 2u || (ic & 15u) || !sp_aligned(w, 16) ||
+            (uint64_t)batches * ic * frames * width >= (1ull << 31))
+            __trap();
+        if ((width & 1u) == 0 && sp_aligned(x, 8) && sp_cs_fits(width, ow, 2u))
+            sp_cs_conv<SpCs<2>, true>(x, w, ep, frames, width, ic, oc, of, ow, positions, slice, nblk, arena);
+        else if (sp_cs_fits(width, ow, 1u))
+            sp_cs_conv<SpCs<1>, true>(x, w, ep, frames, width, ic, oc, of, ow, positions, slice, nblk, arena);
+        else
+            __trap();
+        return;
+#else
+        __trap();
+#endif
+    }
     if (!depthwise) {
         const unsigned k = ic * kernel * kernel;
         const SpRowConv la{x, g, k};
@@ -2752,11 +2799,11 @@ static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const 
                 in_layout == 2u &&
                 (ic & 15u) == 0 && sp_aligned(w, 16) && (uint64_t)batches * ic * frames * width < (1ull << 31)) {
                 if ((width & 1u) == 0 && sp_aligned(x, 8) && sp_cs_fits(width, ow, 2u)) {
-                    sp_cs_conv<SpCs<2>>(x, (const float*)w, ep, frames, width, ic, oc, of, ow, positions, slice, nblk, arena);
+                    sp_cs_conv<SpCs<2>, false>(x, w, ep, frames, width, ic, oc, of, ow, positions, slice, nblk, arena);
                     return;
                 }
                 if (sp_cs_fits(width, ow, 1u)) {
-                    sp_cs_conv<SpCs<1>>(x, (const float*)w, ep, frames, width, ic, oc, of, ow, positions, slice, nblk, arena);
+                    sp_cs_conv<SpCs<1>, false>(x, w, ep, frames, width, ic, oc, of, ow, positions, slice, nblk, arena);
                     return;
                 }
             }

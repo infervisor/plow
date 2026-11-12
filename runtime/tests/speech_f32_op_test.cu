@@ -242,6 +242,18 @@ static void round_bf16(Case& c, unsigned id) {
         memcpy(&p[i], &u, 4);
     }
 }
+/* Conv2dF32 flag 1024 weights from bf16-valued f32 [oc][ic][taps]: bf16 [oc][ic / 16][tap][16]. */
+static unsigned blocked_weights(Case& c, unsigned w, unsigned oc, unsigned ic, unsigned taps) {
+    const unsigned id = c.add((size_t)oc * ic * taps * 2);
+    const uint32_t* src = (const uint32_t*)c.host[w].data();
+    uint16_t* dst = (uint16_t*)c.host[id].data();
+    for (unsigned n = 0; n < oc; n++)
+        for (unsigned ch = 0; ch < ic; ch++)
+            for (unsigned t = 0; t < taps; t++)
+                dst[(((size_t)n * (ic / 16) + ch / 16) * taps + t) * 16 + ch % 16] =
+                    (uint16_t)(src[((size_t)n * ic + ch) * taps + t] >> 16);
+    return id;
+}
 /* Split-K scratch for the tensor-core GEMMs: tickets + one 64x64 partial per block, or the packed
  * reference split's slots. */
 static unsigned splitk_scratch(Case& c) {
@@ -470,8 +482,9 @@ static void t_conv(const char* name, unsigned batches, unsigned frames, unsigned
     unsigned o = c.out((size_t)batches * of * ow * oc);
     unsigned x = c.f32((size_t)batches * frames * width * ic, 1.f);
     const size_t wn = (size_t)oc * stored * kernel * kernel;
-    unsigned w = flags & 64u ? c.f32(wn, 0.1f) : c.f16(wn, 0.1f);
+    unsigned w = flags & (64u | 1024u) ? c.f32(wn, 0.1f) : c.f16(wn, 0.1f);
     if ((flags & 256u) || strstr(name, "same data")) { round_bf16(c, x); round_bf16(c, w); }
+    if (flags & 1024u) w = blocked_weights(c, w, oc, ic, kernel * kernel);
     unsigned b = c.f32(oc, 0.2f);
     c.in.op = PLOW_DOP_CONV2D_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
@@ -492,6 +505,8 @@ static void t_conv_packing(const char* name, unsigned batches, unsigned frames, 
         Case c;
         unsigned o = c.out(batches * on), x = c.f32(batches * xn, 1.f), w = c.f32((size_t)oc * ic * 9, 0.1f);
         if (flags & 256u) { round_bf16(c, x); round_bf16(c, w); }
+        const unsigned wf = w;
+        if (flags & 1024u) w = blocked_weights(c, w, oc, ic, 9);
         unsigned b = c.f32(oc, 0.2f), o1 = c.out(on), x1 = c.add(xn * 4);
         c.upload();
         PlowDevInst in = c.in;
@@ -504,9 +519,19 @@ static void t_conv_packing(const char* name, unsigned batches, unsigned frames, 
         CK(cudaDeviceSynchronize());
         std::vector<uint32_t> packed(batches * on), alone(on);
         CK(cudaMemcpy(packed.data(), c.dev[o], batches * on * 4, cudaMemcpyDeviceToHost));
-        in.t[0] = o1; in.t[1] = x1; in.fj[2].u = 1;
         size_t differ = 0, clips = 0;
         double maxd = 0;
+        if (flags & 1024u) {
+            /* The f32-stored weights give the same bits. */
+            std::vector<uint32_t> ref(batches * on);
+            in.t[2] = wf; in.fj[1].u = (flags & ~1024u) | 64u;
+            k_speech<<<nblk, 256, kSmem>>>(in, td);
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(ref.data(), c.dev[o], batches * on * 4, cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < ref.size(); i++) differ += ref[i] != packed[i];
+            in.t[2] = w; in.fj[1].u = flags;
+        }
+        in.t[0] = o1; in.t[1] = x1; in.fj[2].u = 1;
         for (unsigned pick : {0u, 1u, batches / 2, batches - 1}) {
             if (pick >= batches) continue;
             CK(cudaMemcpy(c.dev[x1], (float*)c.dev[x] + pick * xn, xn * 4, cudaMemcpyDeviceToDevice));
@@ -523,9 +548,21 @@ static void t_conv_packing(const char* name, unsigned batches, unsigned frames, 
             }
             differ += d; clips += d != 0;
         }
+        uint64_t fnv = 1469598103934665603ull;
+        for (uint32_t v : packed) fnv = (fnv ^ v) * 1099511628211ull;
+        in.t[0] = o; in.t[1] = x; in.fj[2].u = batches;
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+        const int reps = batches >= 64 ? 10 : 30;
+        CK(cudaEventRecord(e0));
+        for (int i = 0; i < reps; i++) k_speech<<<nblk, 256, kSmem>>>(in, td);
+        CK(cudaEventRecord(e1));
+        CK(cudaEventSynchronize(e1));
+        float ms;
+        CK(cudaEventElapsedTime(&ms, e0, e1));
         CK(cudaFree(td));
-        printf("  %-30s b=%-3u nblk=%-3u packed vs alone: %zu elements differ in %zu clips, max|d|=%.3g -> %s\n",
-               name, batches, nblk, differ, clips, maxd, differ ? "FAIL" : "PASS");
+        printf("  %-30s b=%-3u nblk=%-3u packed vs alone: %zu elements differ in %zu clips, max|d|=%.3g, fnv %016llx, %.0f us -> %s\n",
+               name, batches, nblk, differ, clips, maxd, (unsigned long long)fnv, 1e3 * ms / reps, differ ? "FAIL" : "PASS");
         if (differ) g_fail = 1;
     }
 }
@@ -2883,7 +2920,12 @@ int main(int argc, char** argv) {
             t_conv_packing("conv1 1->480 128x100", b, 128, 100, 1, 480, 744);
             t_conv_packing("conv2 480->480 64x50", b, 64, 50, 480, 480, 488);
             t_conv_packing("conv3 480->480 32x25", b, 32, 25, 480, 480, 488);
+            /* Blocked bf16 weights, also against the f32-stored weights' output. */
+            t_conv_packing("conv2 480->480 64x50 blocked", b, 64, 50, 480, 480, (488 & ~64) | 1024);
+            t_conv_packing("conv3 480->480 32x25 blocked", b, 32, 25, 480, 480, (488 & ~64) | 1024);
         }
+        t_conv("Conv2dF32 tc-bf16 blocked weights multi-tile", 8, 64, 50, 48, 320, 3, 2, 1, 1, 256 | 1024 | 128 | (2 << 2) | (2 << 4));
+        t_conv("Conv2dF32 tc-bf16 blocked weights odd width", 3, 16, 25, 64, 96, 3, 2, 1, 1, 256 | 1024 | 128 | (2 << 2) | (2 << 4));
         printf(g_fail ? "FAIL\n" : "ALL PASS\n");
         return g_fail;
     }

@@ -253,7 +253,10 @@ G_K(g_conv2d_f32) {
     const uint32_t depthwise = flags & 1u, relu = flags & 2u;
     const uint32_t output_layout = (flags >> 2u) & 3u, input_layout = (flags >> 4u) & 3u;
     const uint32_t weight_f32 = flags & 64u, gelu_erf_bf16 = flags & 128u;
+    /* bf16 weights as [oc][ic / 16][tap][16]. */
+    const uint32_t weight_blocked = flags & 1024u;
     if (output_layout > 2u || input_layout > 2u) return;
+    if (weight_blocked && (depthwise || weight_f32 || (input_channels & 15u))) return;
     const uint32_t stored_channels = depthwise ? 1u : input_channels;
     const uint64_t count64 = (uint64_t)batches * output_frames * output_width * output_channels;
     if (count64 > UINT32_MAX) return;
@@ -289,8 +292,12 @@ G_K(g_conv2d_f32) {
                     else
                         xi = (((size_t)batch * input_channels + input_channel) * frames +
                               input_frame) * width + input_x;
-                    const float w = weight_f32 ? ((const float*)weight)[wi]
-                                               : f16_to_f32(((const uint16_t*)weight)[wi]);
+                    const size_t bi = (((size_t)output_channel * (input_channels / 16u) +
+                                        input_channel / 16u) * kernel * kernel + ky * kernel + kx) * 16u +
+                                      input_channel % 16u;
+                    const float w = weight_blocked ? plow_bf2f(((const uint16_t*)weight)[bi])
+                                    : weight_f32   ? ((const float*)weight)[wi]
+                                                   : f16_to_f32(((const uint16_t*)weight)[wi]);
                     sum += (double)x[xi] * w;
                 }
             }
