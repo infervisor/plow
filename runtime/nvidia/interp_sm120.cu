@@ -1301,6 +1301,11 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) =
 #if PLOW_NV_SPEECH && PLOW_SPEECH_CONV_ARMS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_arms) = (unsigned)PLOW_SPEECH_CONV_ARMS;
 #endif
+/* The bf16 taps conv bodies a PLOW_SPEECH_CONV_BF16_VARIANTS object carries (speech_flag_layout::
+ * conv_bf16_variants); absent = all. */
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16 && PLOW_SPEECH_CONV_BF16_VARIANTS != 0xFFFull
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_bf16_variants) = (unsigned)PLOW_SPEECH_CONV_BF16_VARIANTS;
+#endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SPEECH_OPS >> 32);

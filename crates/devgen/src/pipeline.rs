@@ -3773,34 +3773,14 @@ pub(crate) fn conv_bf16_geometry(
     batch: u32,
     out_rows: u32,
 ) -> Option<(u32, u64)> {
-    // SP_LAUNCH_ARENA_FLOATS under PLOW_SPEECH_CONV_BF16, less the 1024-byte alignment slack.
-    const ARENA: u64 = 33280 * 4 - 1024;
-    let (cin, cout, k, dil) = (
-        u64::from(cin),
-        u64::from(cout),
-        u64::from(kernel),
-        u64::from(dilation),
-    );
-    if kernel < 2 || dil == 0 || cin % 16 != 0 || cin > 1024 || cout % 8 != 0 {
-        return None;
-    }
-    let rpad = |bm: u64| (bm + (k - 1) * dil + 7) & !7;
-    let fits = |bm: u64, nu: u64, pg: u64| pg * rpad(bm) * 128 + 2 * nu * 128 + 3 * nu * 4 <= ARENA;
-    let planes = cin.div_ceil(64);
-    let (batch, rows) = (u64::from(batch), u64::from(out_rows));
-    let units = |bm: u64, nu: u64| batch * rows.div_ceil(bm) * cout.div_ceil(nu);
-    if cout == 96 {
-        return fits(128, 96, planes).then(|| (128, units(128, 96)));
-    }
-    if cin % 64 != 0 || cout % 64 != 0 {
-        return None;
-    }
-    if fits(128, 64, planes) {
-        return Some((128, units(128, 64)));
-    }
-    (1..=planes)
-        .any(|pg| planes % pg == 0 && fits(64, 128, pg))
-        .then(|| (64, units(64, 128)))
+    let kind = plow_asset::speech_flag_layout::conv_bf16_kind(cin, cout, kernel, dilation)?;
+    let (bm, nu) = match kind {
+        1 => (128, 96),
+        2 => (128, 64),
+        _ => (64, 128),
+    };
+    let units = u64::from(batch) * u64::from(out_rows).div_ceil(bm) * u64::from(cout).div_ceil(nu);
+    Some((bm as u32, units))
 }
 
 fn conv1d_units(

@@ -23,6 +23,8 @@ pub const OBJECT_SYMBOL: &str = "plow_speech_flag_layout_speech";
 
 /// `extern "C" __device__ unsigned` of a speech object compiled with a conv arm subset.
 pub const CONV_ARMS_SYMBOL: &str = "plow_speech_conv_arms_speech";
+/// `extern "C" __device__ unsigned` of a speech object compiled with a bf16 conv variant subset.
+pub const CONV_BF16_VARIANTS_SYMBOL: &str = "plow_speech_conv_bf16_variants_speech";
 
 /// Conv arms of `PLOW_SPEECH_CONV_ARMS` (`op_speech_f32.cuh` `SPA_*`). A speech object compiled
 /// with a subset exports it as [`CONV_ARMS_SYMBOL`]; the loader refuses a packet whose convs
@@ -156,6 +158,52 @@ pub fn conv_arms(op: u16, i: &[u32; 8], pads: u32, f: u32) -> u64 {
     } else {
         TC | FFMA
     }
+}
+
+/// The bf16 taps conv's plan kind (`spb_plan`, `op_speech_f32.cuh`): 1 = cout 96 (128 rows x 96
+/// columns), 2 = 128 rows x 64 columns, 3 = 64 rows x 128 columns over plane groups; `None` = the
+/// shape does not fit the arm's arena.
+pub fn conv_bf16_kind(cin: u32, cout: u32, kernel: u32, dilation: u32) -> Option<u32> {
+    // SP_LAUNCH_ARENA_FLOATS under PLOW_SPEECH_CONV_BF16, less the 1024-byte alignment slack.
+    const ARENA: u64 = 33280 * 4 - 1024;
+    let (cin, cout, k, dil) = (
+        u64::from(cin),
+        u64::from(cout),
+        u64::from(kernel),
+        u64::from(dilation),
+    );
+    if kernel < 2 || dil == 0 || cin % 16 != 0 || cin > 1024 || cout % 8 != 0 {
+        return None;
+    }
+    let rpad = |bm: u64| (bm + (k - 1) * dil + 7) & !7;
+    let fits = |bm: u64, nu: u64, pg: u64| pg * rpad(bm) * 128 + 2 * nu * 128 + 3 * nu * 4 <= ARENA;
+    let planes = cin.div_ceil(64);
+    if cout == 96 {
+        return fits(128, 96, planes).then_some(1);
+    }
+    if cin % 64 != 0 || cout % 64 != 0 {
+        return None;
+    }
+    if fits(128, 64, planes) {
+        return Some(2);
+    }
+    (1..=planes)
+        .any(|pg| planes % pg == 0 && fits(64, 128, pg))
+        .then_some(3)
+}
+
+/// The `PLOW_SPEECH_CONV_BF16_VARIANTS` bit of a bf16 taps conv (Conv1dF32 flags bit 17 without
+/// bit 14): `4 * (kind - 1) + pre + 2 * stream`, pre = an input SnakeBeta (bits 19 and 2), stream
+/// = bit 22. 0 for any other instruction or a shape the arm does not take (the object traps).
+pub fn conv_bf16_variants(op: u16, i: &[u32; 8], f: u32) -> u64 {
+    if op != DevOp::Conv1dF32 as u16 || (f >> 17) & 1 == 0 || (f >> 14) & 1 == 1 {
+        return 0;
+    }
+    let pre = (f >> 19) & 1 == 1 && (f >> 2) & 1 == 1;
+    let stream = (f >> 22) & 1 == 1;
+    conv_bf16_kind(i[2], i[3], i[4], i[6]).map_or(0, |kind| {
+        1 << (4 * (kind - 1) + u32::from(pre) + 2 * u32::from(stream))
+    })
 }
 
 /// Conv1dF32 / ConvTranspose1dF32 flags (`j1`, wire `fj[2]`) assigned since layout 0.
@@ -515,6 +563,19 @@ mod tests {
             WG | STAGED | DIRECT
         );
         assert_eq!(arms(convt, [8, 17, 192, 96, 6, 3, 0, 1], 0x26e008), WG_CT);
+        // The fused codec unit c1 (stream + input SnakeBeta), the stream-only pre conv, a plain one.
+        let var = |i: [u32; 8], f: u32| conv_bf16_variants(conv, &i, f);
+        assert_eq!(var([8, 32694, 96, 96, 7, 1, 9, 1], 0x6eaccc), 1 << 3);
+        assert_eq!(var([8, 2774, 384, 384, 7, 1, 9, 1], 0x6eaccc), 1 << (8 + 3));
+        assert_eq!(var([8, 19, 512, 1024, 3, 1, 1, 1], 0x66a000), 1 << (8 + 2));
+        assert_eq!(
+            var([8, 10934, 192, 192, 7, 1, 9, 1], 0x26a00c | 12 << 8),
+            1 << 4
+        );
+        assert_eq!(var([8, 17, 512, 1024, 1, 1, 1, 1], 0x266000), 0);
+        assert_eq!(conv_bf16_kind(192, 192, 7, 9), Some(2));
+        assert_eq!(conv_bf16_kind(768, 768, 7, 9), Some(3));
+        assert_eq!(conv_bf16_kind(96, 1, 7, 1), None);
         // bf16 taps and split-image convs: their own defines.
         assert_eq!(
             arms(conv, [8, 71, 96, 96, 7, 1, 9, 1], 0x26a00c | 12 << 8),

@@ -12283,6 +12283,9 @@ fn emit_dense_gqa(
                 man["speech_conv_bf16"] = true.into();
             }
             man["speech_conv_arms"] = speech.conv_arms.into();
+            if speech.conv_bf16 {
+                man["speech_conv_bf16_variants"] = speech.conv_bf16_variants.into();
+            }
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes

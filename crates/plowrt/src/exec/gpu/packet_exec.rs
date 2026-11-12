@@ -110,6 +110,12 @@ fn speech_ops(blob: &DevBlob) -> u64 {
         .fold(0, |mask, op| mask | 1 << (op - SPEECH_OP0))
 }
 
+fn speech_conv_bf16_variants(blob: &DevBlob) -> u64 {
+    blob.progs.iter().flat_map(|p| &p.insts).fold(0, |m, d| {
+        m | plow_asset::speech_flag_layout::conv_bf16_variants(d.op, &d.i, d.fj[2])
+    })
+}
+
 fn speech_conv_arms(blob: &DevBlob) -> u64 {
     blob.progs.iter().flat_map(|p| &p.insts).fold(0, |m, d| {
         m | plow_asset::speech_flag_layout::conv_arms(d.op, &d.i, d.fj[1], d.fj[2])
@@ -757,16 +763,27 @@ impl CudaPacketRuntime {
                 )));
             }
         }
-        if let Some(compiled) =
-            be.module_global_u32(&module, plow_asset::speech_flag_layout::CONV_ARMS_SYMBOL)?
-        {
-            let missing = speech_conv_arms(&blob) & !u64::from(compiled);
-            if missing != 0 {
-                return Err(RuntimeError::Rejected(format!(
-                    "{}: {} lacks conv arms {missing:#x}; rebuild it for this packet",
-                    path.display(),
-                    object.display()
-                )));
+        for (symbol, required, what) in [
+            (
+                plow_asset::speech_flag_layout::CONV_ARMS_SYMBOL,
+                speech_conv_arms(&blob),
+                "conv arms",
+            ),
+            (
+                plow_asset::speech_flag_layout::CONV_BF16_VARIANTS_SYMBOL,
+                speech_conv_bf16_variants(&blob),
+                "bf16 conv variants",
+            ),
+        ] {
+            if let Some(compiled) = be.module_global_u32(&module, symbol)? {
+                let missing = required & !u64::from(compiled);
+                if missing != 0 {
+                    return Err(RuntimeError::Rejected(format!(
+                        "{}: {} lacks {what} {missing:#x}; rebuild it for this packet",
+                        path.display(),
+                        object.display()
+                    )));
+                }
             }
         }
         let caps = missing_speech_caps(

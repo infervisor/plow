@@ -5777,16 +5777,26 @@ __device__ __forceinline__ void spb_params(const SpConvArgs& a, float* par, unsi
 }
 /* Rows [t0, t0 + span) of item b, channels [64 p0, 64 p0 + cw), as bf16 (zero past in_rows): cw / 4
  * threads per row, plain loads (the activation may be written earlier in the same launch). */
+/* The (plan kind, fused input) variants the packet's bf16 convs use, bit 4 * (kind - 1) + (PRE | STREAM << 1)
+ * (devgen speech_conv_bf16_variants); unset = all. Only those spb_run bodies are compiled: the inlined
+ * body's shape, not unused arms, decides this arm's speed (the unused stream / pre staging cost 30-40 %). */
+#ifndef PLOW_SPEECH_CONV_BF16_VARIANTS
+#define PLOW_SPEECH_CONV_BF16_VARIANTS 0xFFFull
+#endif
+__host__ __device__ __forceinline__ constexpr bool spb_variant_on(unsigned kind, bool pre, bool stream) {
+    return (PLOW_SPEECH_CONV_BF16_VARIANTS >> (4u * (kind - 1u) + (pre ? 1u : 0u) + (stream ? 2u : 0u))) & 1ull;
+}
+template <bool PRE, bool STREAM>
 __device__ __forceinline__ void spb_stage(const SpConvArgs& a, const SpbIn& si, char* As, unsigned rpad,
                                           unsigned span, unsigned b, unsigned t0, unsigned p0, unsigned cw) {
     constexpr unsigned UL = 4u;
     const unsigned c4n = cw / 4u, rpp = blockDim.x / c4n, rl = threadIdx.x / c4n;
     if (rl >= rpp) return;
     const unsigned ch = (threadIdx.x - rl * c4n) * 4u, cp = ch & 63u, cg = 64u * p0 + ch;
-    const float* xc = si.state ? a.x + (size_t)b * si.N * a.cin + cg : a.x + ((size_t)b * a.in_rows) * a.cin + cg;
-    const float* sc = si.state && si.pos[b] ? si.state + (size_t)si.slot[b] * si.L * a.cin + cg : nullptr;
+    const float* xc = STREAM ? a.x + (size_t)b * si.N * a.cin + cg : a.x + ((size_t)b * a.in_rows) * a.cin + cg;
+    const float* sc = STREAM && si.pos[b] ? si.state + (size_t)si.slot[b] * si.L * a.cin + cg : nullptr;
     float4 pa = make_float4(0.f, 0.f, 0.f, 0.f), pr = pa;
-    if (si.pa) {
+    if constexpr (PRE) {
         pa = *(const float4*)(si.pa + cg);
         pr = *(const float4*)(si.pr + cg);
     }
@@ -5798,7 +5808,7 @@ __device__ __forceinline__ void spb_stage(const SpConvArgs& a, const SpbIn& si, 
             const unsigned r = r0 + j * rpp, t = t0 + r;
             v[j] = make_float4(0.f, 0.f, 0.f, 0.f);
             if (r >= span || t >= a.in_rows) continue;
-            if (!si.state) v[j] = *(const float4*)(xc + (size_t)t * a.cin);
+            if constexpr (!STREAM) v[j] = *(const float4*)(xc + (size_t)t * a.cin);
             else if (t >= si.L) v[j] = *(const float4*)(xc + (size_t)(t - si.L) * a.cin);
             else if (sc) v[j] = *(const float4*)(sc + (size_t)t * a.cin);
         }
@@ -5806,7 +5816,7 @@ __device__ __forceinline__ void spb_stage(const SpConvArgs& a, const SpbIn& si, 
         for (unsigned j = 0; j < UL; j++) {
             const unsigned r = r0 + j * rpp;
             if (r >= span) break;
-            if (si.pa) { /* UnaryF32 SnakeBeta's expression: bit-identical to the unfused pass */
+            if constexpr (PRE) { /* UnaryF32 SnakeBeta's expression: bit-identical to the unfused pass */
                 v[j].x = fmaf(pr.x, sp_sin2(v[j].x * pa.x), v[j].x);
                 v[j].y = fmaf(pr.y, sp_sin2(v[j].y * pa.y), v[j].y);
                 v[j].z = fmaf(pr.z, sp_sin2(v[j].z * pa.z), v[j].z);
@@ -5854,7 +5864,7 @@ __device__ __forceinline__ void spb_store(const SpConvArgs& a, const float* acc,
 }
 /* WN columns per warpgroup; ROWS: the warpgroups split BM = 128 rows (NU = WN), else BM = 64 and
  * they split NU = 2 WN columns. Shared [A: pg planes x rpad x 128 B][B: 2 x NU rows x 128 B][params]. */
-template <unsigned WN, bool ROWS>
+template <unsigned WN, bool ROWS, bool PRE, bool STREAM>
 __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, const char* whi, size_t ws, unsigned pg,
                                         unsigned slice, unsigned nblk) {
     constexpr unsigned BM = ROWS ? 128u : 64u, NU = ROWS ? WN : 2u * WN, BB = NU * 128u;
@@ -5869,7 +5879,12 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
     float* par = (float*)(Bs + 2u * BB);
     const unsigned mt = (a.out_rows + BM - 1u) / BM, tn = (a.cout + NU - 1u) / NU, units = a.batch * mt * tn;
     const unsigned rw = ROWS ? wg * 64u : 0u, cw = ROWS ? 0u : wg * WN;
-    for (unsigned u = slice; u < units; u += nblk) {
+    /* A contiguous run of units per block: consecutive units are the column tiles of one (item, row
+     * tile), so a one-group plan stages A (and its input SnakeBeta) once per row tile, not per tile. */
+    const unsigned per = units / nblk, extra = units % nblk;
+    const unsigned u0 = slice * per + (slice < extra ? slice : extra), u1 = u0 + per + (slice < extra ? 1u : 0u);
+    unsigned staged = ~0u;
+    for (unsigned u = u0; u < u1; u++) {
         const unsigned mu = u / tn, n0 = (u - mu * tn) * NU, b = mu / mt, t0 = (mu - b * mt) * BM;
         float acc[WN / 2u];
         for (unsigned gi = 0; gi < groups; gi++) {
@@ -5886,7 +5901,8 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
             };
             copy_b(0u, 0u);
             if (gi == 0u) spb_params(a, par, n0, NU);
-            spb_stage(a, si, As, rpad, span, b, t0, gi * pg, flat ? a.cin : pg * 64u);
+            if (!flat || staged != mu) spb_stage<PRE, STREAM>(a, si, As, rpad, span, b, t0, gi * pg, flat ? a.cin : pg * 64u);
+            staged = flat ? mu : ~0u;
             sm90_cp_wait<0>();
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
             __syncthreads();
@@ -5927,14 +5943,29 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
 }
 /* Inlined: out of line (C7510-serialized wgmma, a call frame) the kernel's stack grew to 7552 B and
  * ConvTranspose1d's arm ran 3x slower. */
-__device__ __forceinline__ void spb_conv1d(const SpConvArgs& a, const SpbIn& si, unsigned slice, unsigned nblk) {
-    const SpbPlan pl = spb_plan(a);
+template <bool PRE, bool STREAM>
+__device__ __forceinline__ void spb_kinds(const SpConvArgs& a, const SpbIn& si, const SpbPlan& pl, unsigned slice,
+                                          unsigned nblk) {
     const char* whi = (const char*)spwg_wsplit(a);
     const size_t ws = 2u * (size_t)((a.cout + 127u) & ~127u) * 128u;
-    if (pl.kind == 1u) spb_run<96, true>(a, si, whi, ws, pl.pg, slice, nblk);
-    else if (pl.kind == 2u) spb_run<64, true>(a, si, whi, ws, pl.pg, slice, nblk);
-    else if (pl.kind == 3u) spb_run<64, false>(a, si, whi, ws, pl.pg, slice, nblk);
-    else __trap();
+    if (pl.kind == 1u) {
+        if constexpr (spb_variant_on(1u, PRE, STREAM)) return spb_run<96, true, PRE, STREAM>(a, si, whi, ws, pl.pg, slice, nblk);
+    } else if (pl.kind == 2u) {
+        if constexpr (spb_variant_on(2u, PRE, STREAM)) return spb_run<64, true, PRE, STREAM>(a, si, whi, ws, pl.pg, slice, nblk);
+    } else if (pl.kind == 3u) {
+        if constexpr (spb_variant_on(3u, PRE, STREAM)) return spb_run<64, false, PRE, STREAM>(a, si, whi, ws, pl.pg, slice, nblk);
+    }
+    __trap();
+}
+__device__ __forceinline__ void spb_conv1d(const SpConvArgs& a, const SpbIn& si, unsigned slice, unsigned nblk) {
+    const SpbPlan pl = spb_plan(a);
+    if (si.state) {
+        if (si.pa) spb_kinds<true, true>(a, si, pl, slice, nblk);
+        else spb_kinds<false, true>(a, si, pl, slice, nblk);
+    } else {
+        if (si.pa) spb_kinds<true, false>(a, si, pl, slice, nblk);
+        else spb_kinds<false, false>(a, si, pl, slice, nblk);
+    }
 }
 /* Decodes the bf16 arm's instruction: the generic conv fields with the arm's own bits taken out,
  * then the fused input (SpbIn). False = not this arm's contract (the caller traps). */

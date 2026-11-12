@@ -3219,6 +3219,8 @@ pub struct SpeechMasks {
     pub conv_bf16: bool,
     /// `PLOW_SPEECH_CONV_ARMS`: the generic conv arms compiled into the speech object.
     pub conv_arms: u64,
+    /// `PLOW_SPEECH_CONV_BF16_VARIANTS`: the bf16 taps conv bodies (plan kind x fused input).
+    pub conv_bf16_variants: u64,
 }
 
 impl SpeechMasks {
@@ -3243,6 +3245,9 @@ impl SpeechMasks {
                     && i.j[1] & (1 << 14) == 0
             }),
             conv_arms: speech_conv_arms(model),
+            conv_bf16_variants: model.progs.iter().flat_map(|p| &p.insts).fold(0, |m, i| {
+                m | plow_asset::speech_flag_layout::conv_bf16_variants(i.op, &i.i, i.j[1])
+            }),
         }
     }
     pub fn add(&mut self, other: Self) {
@@ -3253,6 +3258,7 @@ impl SpeechMasks {
         self.ring_kv |= other.ring_kv;
         self.conv_bf16 |= other.conv_bf16;
         self.conv_arms |= other.conv_arms;
+        self.conv_bf16_variants |= other.conv_bf16_variants;
     }
 }
 
@@ -3324,6 +3330,15 @@ pub fn config_header(manifest: &Value) -> String {
         out.push_str(&format!(
             "/* Generic conv arms the packet's convs reach; the rest are not compiled. */\n\
              #ifndef PLOW_SPEECH_CONV_ARMS\n#define PLOW_SPEECH_CONV_ARMS 0x{arms:x}ull\n#endif\n\n"
+        ));
+    }
+    if let Some(v) = manifest
+        .get("speech_conv_bf16_variants")
+        .and_then(Value::as_u64)
+    {
+        out.push_str(&format!(
+            "/* bf16 taps conv bodies (plan kind x fused input) the packet's convs use. */\n\
+             #ifndef PLOW_SPEECH_CONV_BF16_VARIANTS\n#define PLOW_SPEECH_CONV_BF16_VARIANTS 0x{v:x}ull\n#endif\n\n"
         ));
     }
     if let Some(radix) = manifest.get("sample_radix").and_then(Value::as_bool) {
