@@ -229,9 +229,8 @@ in `.github/workflows/build.yml`:
 2. `nix run .#bump -- <version>` rewrites `Cargo.toml` and `Cargo.lock`, and
    the job commits that. The commit is kept by its tag only and never reaches
    `main`, so `main`'s version lags the tags.
-3. It builds `plowrt-release` and `plowrt-release-aarch64`, and
-   `scripts/ci/check-release.sh` checks each. (`plowrt-release-static` does
-   not compile for musl today, so it is not released.)
+3. It builds `plowrt-release`, `plowrt-release-static` and
+   `plowrt-release-aarch64`, and `scripts/ci/check-release.sh` checks each.
 4. It pushes the tag `v<version>`, then runs `plowrt push-runtime`, with the
    registry credentials from the `pdist` environment's secrets.
 

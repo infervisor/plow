@@ -290,11 +290,9 @@ jobs:
         env:
           NEXT: ${{ steps.version.outputs.next }}
         run: |
-          # plowrt-release-static (musl) does not compile today, so it is not
-          # released: exec/proc_group.rs and memory/sram.rs assume glibc types.
-          mapfile -t dirs < <(nix build .#plowrt-release .#plowrt-release-aarch64 \
-            --no-link --print-out-paths)
-          test "${#dirs[@]}" -eq 2
+          mapfile -t dirs < <(nix build .#plowrt-release .#plowrt-release-static \
+            .#plowrt-release-aarch64 --no-link --print-out-paths)
+          test "${#dirs[@]}" -eq 3
           nix develop .#ci --command bash scripts/ci/check-release.sh "$NEXT" "${dirs[@]}"
           echo "dirs=${dirs[*]}" >> "$GITHUB_OUTPUT"
       # Reserve the version before anything is uploaded: if the upload fails,
