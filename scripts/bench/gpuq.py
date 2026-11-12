@@ -114,6 +114,8 @@ def main():
                         "the ngpu argument must equal their count; default queue root /tmp/plow-gpuq.devices")
     sub = parser.add_subparsers(dest="action", required=True)
     submit = sub.add_parser("submit")
+    submit.add_argument("--enqueue-only", action="store_true",
+                        help="queue for a host runner without starting a local runner")
     submit.add_argument("label")
     submit.add_argument("ngpu", type=int)
     submit.add_argument("command", nargs=argparse.REMAINDER)
@@ -146,10 +148,11 @@ def main():
         save(root / (job_id + ".json"), dict(state="queued", label=args.label, ngpu=args.ngpu,
              command=args.command, cwd=os.getcwd(), submitted=time.time(), lease_timeout=lease_timeout,
              vendor=args.vendor, devices=args.devices))
-        with (root / "runner.log").open("ab") as log:
-            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--root", str(root), "run"],
-                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                             start_new_session=True)
+        if not args.enqueue_only:
+            with (root / "runner.log").open("ab") as log:
+                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--root", str(root), "run"],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
         print(job_id)
 
 

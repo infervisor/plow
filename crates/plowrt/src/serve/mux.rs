@@ -78,7 +78,18 @@ fn delivery_worker() -> &'static std::sync::mpsc::Sender<Vec<DeliveryEntry>> {
             .name("plow-delivery".into())
             .spawn(move || {
                 while let Ok(batch) = rx.recv() {
-                    for (permit, chunk) in batch {
+                    let mut copies = std::collections::BTreeMap::new();
+                    for (permit, mut chunk) in batch {
+                        if let StreamChunk::Token {
+                            frame: Some(frame), ..
+                        } = &mut chunk
+                        {
+                            if let Some(pcm) = frame.pcm_mut() {
+                                if let Err(error) = pcm.detach(&mut copies) {
+                                    chunk = StreamChunk::Err(error);
+                                }
+                            }
+                        }
                         permit.send(chunk);
                     }
                 }
@@ -323,16 +334,31 @@ mod delivery_tests {
             receivers.push(rx);
         }
         let mut times = Vec::new();
-        for tick in 0..1100 {
+        let mut pool = crate::exec::packet_runtime::PacketHostBufferPool::host(200 * 1920 * 2, 1);
+        let mut held = None;
+        for tick in 0..1100u32 {
+            assert!(
+                pool.begin(200 * 1920 * 2),
+                "delivery retained a pinned slab"
+            );
+            pool.writable().fill(tick as u8);
+            let slab = unsafe { pool.complete() };
+            let start = Instant::now();
             let chunks: Vec<_> = (0..200)
                 .map(|slot| StreamChunk::Token {
                     id: slot,
                     text: String::new(),
                     logprobs: None,
-                    frame: Some(vec![tick; 960].into_boxed_slice().into()),
+                    frame: Some(SpeechFrame::Pcm(
+                        crate::serve::stream::SpeechPcm::from_buffer(
+                            slab.clone(),
+                            slot as usize * 3840..(slot as usize + 1) * 3840,
+                        )
+                        .unwrap(),
+                    )),
                 })
                 .collect();
-            let start = Instant::now();
+            drop(slab);
             TickDelivery::run(true, || {
                 for (tx, chunk) in senders.iter().zip(chunks) {
                     tx.try_send(chunk).unwrap();
@@ -341,11 +367,25 @@ mod delivery_tests {
             if tick >= 100 {
                 times.push(start.elapsed().as_secs_f64() * 1e3);
             }
-            for rx in &mut receivers {
-                assert!(matches!(
-                    rx.blocking_recv(),
-                    Some(StreamChunk::Token { .. })
-                ));
+            if let Some((old_tick, old)) = held.take() {
+                let old: crate::serve::stream::SpeechPcm = old;
+                assert_eq!(old[0], i16::from_le_bytes([old_tick; 2]));
+            }
+            for (index, rx) in receivers.iter_mut().enumerate() {
+                let Some(StreamChunk::Token {
+                    frame: Some(frame), ..
+                }) = rx.blocking_recv()
+                else {
+                    panic!("PCM delivery frame missing")
+                };
+                let SpeechFrame::Pcm(pcm) = frame else {
+                    panic!("PCM payload missing")
+                };
+                assert_eq!(pcm.len(), 1920);
+                assert_eq!(pcm[0], i16::from_le_bytes([tick as u8; 2]));
+                if index == 0 {
+                    held = Some((tick as u8, pcm));
+                }
             }
         }
         times.sort_by(f64::total_cmp);
@@ -356,6 +396,61 @@ mod delivery_tests {
             times[500]
         );
         assert!(p99 < 1.5, "engine handoff p99 {p99}ms exceeds 1.5ms");
+    }
+
+    #[tokio::test]
+    async fn pcm_slab_cancel_terminal_and_reuse_preserve_frame_ownership() {
+        let mut pool = crate::exec::packet_runtime::PacketHostBufferPool::host(8, 1);
+        assert!(pool.begin(8));
+        pool.writable().copy_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0]);
+        let slab = unsafe { pool.complete() };
+        let chunk = |bytes| StreamChunk::Token {
+            id: 7,
+            text: String::new(),
+            logprobs: None,
+            frame: Some(SpeechFrame::Pcm(
+                crate::serve::stream::SpeechPcm::from_buffer(slab.clone(), bytes).unwrap(),
+            )),
+        };
+        let first = chunk(0..4);
+        let cancelled_frame = chunk(4..8);
+        let next_generation = chunk(4..8);
+        drop(slab);
+        let (tx, mut rx) = mpsc::channel(3);
+        let (cancel, cancelled) = mpsc::channel(1);
+        let tx = TickSender::new(tx, true);
+        let cancel = TickSender::new(cancel, true);
+        TickDelivery::run(true, || {
+            tx.try_send(first).unwrap();
+            cancel.try_send(cancelled_frame).unwrap();
+            drop(cancelled);
+            tx.try_send(StreamChunk::Done {
+                executed: 1,
+                reason: FinishReason::Stop,
+                usage: Default::default(),
+            })
+            .unwrap();
+        });
+        TickDelivery::run(true, || tx.try_send(next_generation).unwrap());
+        let StreamChunk::Token {
+            frame: Some(first), ..
+        } = next(&mut rx).await
+        else {
+            panic!("first PCM")
+        };
+        assert!(matches!(next(&mut rx).await, StreamChunk::Done { .. }));
+        let StreamChunk::Token {
+            frame: Some(reused),
+            ..
+        } = next(&mut rx).await
+        else {
+            panic!("reused PCM")
+        };
+        assert!(pool.begin(8), "a socket retained the pinned root");
+        pool.writable().fill(9);
+        let _next = unsafe { pool.complete() };
+        assert_eq!(&**first.pcm().unwrap(), [1, 2]);
+        assert_eq!(&**reused.pcm().unwrap(), [3, 4]);
     }
 }
 
@@ -1229,11 +1324,10 @@ fn advance_health(health: EngineHealth, fault: Option<crate::DeviceErrorInfo>) -
     }
 }
 
-/// Record the first device fault a tick sees (per-slot errors keep flowing to
-/// their waiters; this is only the dispatcher's health signal).
+/// A fatal fault overrides an earlier recoverable fault in the same tick.
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 fn note_fault(tick_fault: &mut Option<crate::DeviceErrorInfo>, err: &crate::RuntimeError) {
-    if tick_fault.is_none() {
+    if tick_fault.is_none() || (err.is_fatal() && tick_fault.as_ref().is_some_and(|f| !f.fatal)) {
         *tick_fault = err.device_fault().cloned();
     }
 }
@@ -1828,9 +1922,9 @@ fn spawn_scoped(
     let prefix_probe: Option<crate::memory::vmm::PrefixProbe> = None;
     let prefix_block_rows = prefix_probe.as_ref().map_or(0, |p| p.block_rows());
     #[cfg(feature = "cuda")]
-    let mapped_rows = state.gpu_engine(&slug).is_some_and(|e| {
-        matches!(&*e.lock(), crate::serve::engine::ServeEngine::Cuda(e) if e.row_decode_rungs().next().is_some())
-    });
+    let mapped_rows = state
+        .gpu_engine(&slug)
+        .is_some_and(|e| matches!(&*e.lock(), crate::serve::engine::ServeEngine::Cuda(e) if e.row_decode_rungs().next().is_some()));
     #[cfg(not(feature = "cuda"))]
     let mapped_rows = false;
     #[cfg(any(feature = "cuda", feature = "hsa"))]
@@ -3851,6 +3945,26 @@ fn fail_slot(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>, err: cr
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn quarantine_tick_resources<R>(
+    slots: &mut [Option<Slot>],
+    resources: R,
+    err: &crate::RuntimeError,
+) {
+    std::mem::forget(resources);
+    let (closed, receiver) = mpsc::channel(1);
+    drop(receiver);
+    let msg = err.to_string();
+    for slot in slots {
+        if let Some(mut retained) = slot.take() {
+            let respond = std::mem::replace(&mut retained.respond, closed.clone().into());
+            let _ = respond.try_send(StreamChunk::Err(fanout_err(err, &msg)));
+            // A failed drain cannot authorize freeing KV, overlays or pending copy sources.
+            std::mem::forget(retained);
+        }
+    }
+}
+
 /// Terminate all active feed slots with the given error.
 #[allow(dead_code)]
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
@@ -5162,7 +5276,7 @@ fn run_one_tick(
                                     host_engine_call(t_call, feeds.len(), tokens_this_tick);
                                 decode_progress = completed_decode(&feeds, 1);
                                 let depth = e.has_depth_stage();
-                                if let Err(err) = depth
+                                if let Err(mut err) = depth
                                     .then(|| {
                                         gpu_depth_frames(&mut *e, &feeds, &mut slots, &mut toks)
                                     })
@@ -5170,7 +5284,18 @@ fn run_one_tick(
                                 {
                                     if unread {
                                         // The unread step's staging is free only once it retires.
-                                        let _ = e.sync_stream();
+                                        if let Err(drain) = e.sync_stream() {
+                                            err = e.quarantine_unretired(if err.is_fatal() {
+                                                &err
+                                            } else {
+                                                &drain
+                                            });
+                                            quarantine_tick_resources(
+                                                &mut slots,
+                                                (eng.clone(), arena.clone()),
+                                                &err,
+                                            );
+                                        }
                                     }
                                     note_fault(&mut tick_fault, &err);
                                     fail_feeds(&mut slots, &feeds, &arena, &err);
@@ -10055,7 +10180,12 @@ fn attach_device_frame(
 ) -> crate::Result<()> {
     if let (Some(frame), Some(buffer)) = (frame, retained) {
         let bytes = frame.len() * 4;
-        frame.device = Some(buffer.slice(slot * bytes..(slot + 1) * bytes)?);
+        let SpeechFrame::Codes { device, .. } = frame else {
+            return Err(crate::RuntimeError::Rejected(
+                "cannot attach code storage to completed PCM".into(),
+            ));
+        };
+        *device = Some(buffer.slice(slot * bytes..(slot + 1) * bytes)?);
     }
     Ok(())
 }
@@ -13467,6 +13597,57 @@ mod tests {
             name: "CUDA_ERROR_LAUNCH_FAILED".into(),
             fatal,
         }
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    #[test]
+    fn fatal_tick_fault_overrides_recoverable_errors_in_either_order() {
+        let recoverable = crate::RuntimeError::DeviceFault { info: fault(false) };
+        let fatal = crate::RuntimeError::DeviceFault { info: fault(true) };
+        for errors in [[&recoverable, &fatal], [&fatal, &recoverable]] {
+            let mut tick = None;
+            for error in errors {
+                note_fault(&mut tick, error);
+            }
+            note_fault(&mut tick, &crate::RuntimeError::Msg("later message".into()));
+            assert!(tick.unwrap().fatal);
+        }
+    }
+
+    #[test]
+    fn unretired_tick_retains_resources_and_closes_full_and_empty_client_queues() {
+        let (empty, mut rx_empty) = prefill_test_slot();
+        let (full, mut rx_full) = prefill_test_slot();
+        let full = full.unwrap();
+        for id in 0..full.respond.capacity() {
+            full.respond
+                .try_send(StreamChunk::Token {
+                    id: id as u32,
+                    text: String::new(),
+                    logprobs: None,
+                    frame: None,
+                })
+                .unwrap();
+        }
+        let resource = Arc::new(());
+        let mut slots = [empty, Some(full)];
+        quarantine_tick_resources(
+            &mut slots,
+            resource.clone(),
+            &crate::RuntimeError::DeviceFault { info: fault(true) },
+        );
+        assert!(slots.iter().all(Option::is_none));
+        assert_eq!(Arc::strong_count(&resource), 2);
+        assert!(matches!(rx_empty.try_recv().unwrap(), StreamChunk::Err(e) if e.is_fatal()));
+        assert!(matches!(
+            rx_empty.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        while rx_full.try_recv().is_ok() {}
+        assert!(matches!(
+            rx_full.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]

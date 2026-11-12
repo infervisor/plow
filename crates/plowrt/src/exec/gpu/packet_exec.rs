@@ -19,6 +19,58 @@ use crate::exec::packet_runtime::{
 };
 use crate::{Result, RuntimeError};
 
+#[path = "handoff_packet.rs"]
+mod handoff;
+pub(crate) use handoff::PacketHandoffProvider;
+
+#[cfg(test)]
+#[test]
+#[ignore = "CPU-only actual packet check; HANDOFF_TEST_ASSETS contains codec.pkt; use a quiet build window"]
+fn handoff_native_codec_types_are_derived_from_actual_instructions() {
+    let path =
+        std::path::PathBuf::from(std::env::var("HANDOFF_TEST_ASSETS").unwrap()).join("codec.pkt");
+    let image = crate::asset::packet_image::PacketImage::open(&path).unwrap();
+    let asset = crate::exec::packet_runtime::PacketAsset::from_bytes(&image.raw).unwrap();
+    let codec = asset
+        .pipelines()
+        .iter()
+        .find(|p| p.driver == "codec.v1")
+        .unwrap();
+    let mut checked = 0;
+    image.blob.with_packet_view(|packet| {
+        for (role, &program) in &codec.programs {
+            if !role.starts_with("step.") || !role.ends_with(".f1") {
+                continue;
+            }
+            let inferred = plow_asset::packet_pipeline_native::NativePacketTypes::infer(
+                packet,
+                program as usize,
+            )
+            .unwrap();
+            for (name, tensor) in &codec.tensors {
+                if name != "codes" && name != "pcm" && !name.starts_with("stream.") {
+                    continue;
+                }
+                let handle = packet
+                    .tensors
+                    .iter()
+                    .position(|t| t.name == tensor.name)
+                    .unwrap();
+                if inferred.access(handle).is_some() {
+                    assert_eq!(
+                        inferred.dtype(handle).unwrap(),
+                        tensor.dtype,
+                        "{role}/{name}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    });
+    assert!(checked >= 6, "no real stateful codec interfaces checked");
+    eprintln!("native codec types/accesses checked={checked}");
+}
+
 /// The speech object and its entry symbol for a compute capability.
 pub(super) fn speech_object(cc: (u32, u32)) -> (&'static str, &'static str) {
     match cc {
@@ -273,6 +325,12 @@ struct Program {
     _tables: Vec<DeviceMem>,
 }
 
+pub(crate) struct SharedPacketTensors {
+    pub backend: Arc<CudaBackend>,
+    pub memory: Arc<DeviceMem>,
+    pub views: std::collections::BTreeMap<String, (u64, u64, bool)>,
+}
+
 pub struct CudaPacketRuntime {
     be: Arc<CudaBackend>,
     stream: CudaStream,
@@ -294,6 +352,7 @@ pub struct CudaPacketRuntime {
     last_us: f64,
     input_stage: Option<PinnedHost>,
     input_failed: bool,
+    shared: Option<SharedPacketTensors>,
     /// Last field: dropped after every allocation above, so [`resident_in`] turns false only once
     /// the device memory is back.
     _resident: Arc<()>,
@@ -526,10 +585,35 @@ impl CudaPacketRuntime {
     }
 
     pub fn load_on(be: Arc<CudaBackend>, path: &Path) -> Result<Self> {
+        Self::load_with_views(be, path, None)
+    }
+
+    pub(crate) fn load_with_views(
+        be: Arc<CudaBackend>,
+        path: &Path,
+        shared: Option<SharedPacketTensors>,
+    ) -> Result<Self> {
         let ordinal = be.device_ordinal;
         let image = crate::asset::packet_image::PacketImage::open(path)?;
         image.blob.check_l2_dispatch(false)?;
         let (blob, raw) = (&image.blob, &image.raw);
+        if let Some(shared) = &shared {
+            if !be.shares_context(&shared.backend)
+                || shared.views.iter().any(|(name, &(offset, bytes, _))| {
+                    !blob
+                        .tensors
+                        .iter()
+                        .any(|t| t.name == *name && t.bytes == bytes)
+                        || !offset
+                            .checked_add(bytes)
+                            .is_some_and(|end| end <= shared.memory.len)
+                })
+            {
+                return Err(RuntimeError::Rejected(
+                    "shared packet tensor binding mismatch".into(),
+                ));
+            }
+        }
         if !blob.gen.is_empty() || blob.tp.is_some() {
             return Err(RuntimeError::Rejected(format!(
                 "{}: generated tensors or TP are not supported by the CUDA packet runtime",
@@ -610,10 +694,20 @@ impl CudaPacketRuntime {
 
         let mut tensors = Vec::with_capacity(blob.tensors.len());
         for t in &blob.tensors {
-            let mem = be.alloc(0, t.bytes.max(4))?;
-            match &t.init {
-                Some(r) => be.upload(&mem, 0, &blob.init[r.clone()])?,
-                None => be.memset_d8(mem.base, 0, t.bytes as usize)?,
+            let external = shared
+                .as_ref()
+                .and_then(|s| s.views.get(&t.name).map(|v| (s, v)));
+            let (mem, initialize) = match external {
+                Some((s, &(offset, bytes, initialize))) => {
+                    (s.memory.subview(offset, bytes)?, initialize)
+                }
+                None => (be.alloc(0, t.bytes.max(4))?, true),
+            };
+            if initialize {
+                match &t.init {
+                    Some(r) => be.upload(&mem, 0, &blob.init[r.clone()])?,
+                    None => be.memset_d8(mem.base, 0, t.bytes as usize)?,
+                }
             }
             tensors.push(mem);
         }
@@ -733,6 +827,7 @@ impl CudaPacketRuntime {
             last_us: 0.0,
             input_stage: None,
             input_failed: false,
+            shared,
             _resident: {
                 let token = Arc::new(());
                 residents()
@@ -847,6 +942,9 @@ impl CudaPacketRuntime {
 
     pub(crate) fn quarantine_chain(&mut self) {
         self.input_failed = true;
+        if let Some(shared) = self.shared.take() {
+            std::mem::forget(shared);
+        }
         if let Some(stage) = self.input_stage.take() {
             std::mem::forget(stage);
         }

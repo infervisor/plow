@@ -16,6 +16,8 @@ pub mod guided_lm;
 #[cfg(feature = "cuda")]
 pub mod guided_speech;
 #[cfg(feature = "cuda")]
+pub(crate) mod handoff;
+#[cfg(feature = "cuda")]
 pub mod realtime;
 #[cfg(feature = "cuda")]
 pub mod ref_encoder;
@@ -653,12 +655,17 @@ impl SpeechContract {
         frame: Option<crate::serve::stream::SpeechFrame>,
     ) -> Option<Codes> {
         if self.depth {
-            frame.filter(|f| f.len() == self.frame_codes).map(|f| {
-                Codes::frame(
-                    f.codes.into_vec().into_iter().map(|x| x as i32).collect(),
-                    f.device,
-                )
-            })
+            match frame? {
+                crate::serve::stream::SpeechFrame::Codes { codes, device }
+                    if codes.len() == self.frame_codes =>
+                {
+                    Some(Codes::frame(
+                        codes.into_vec().into_iter().map(|x| x as i32).collect(),
+                        device,
+                    ))
+                }
+                _ => None,
+            }
         } else {
             self.push_codes(partial, id, None)
                 .then(|| std::mem::take(partial).into())
@@ -1203,6 +1210,21 @@ impl OutPcm {
         }
     }
 
+    pub(crate) fn push_i16(&mut self, pcm: &[i16], out: &mut Vec<u8>) {
+        if self.stretch.is_none()
+            && self.resampler.is_none()
+            && self.trim.as_ref().is_none_or(|trim| trim.max == 0)
+        {
+            out.extend(pcm.iter().flat_map(|sample| sample.to_le_bytes()));
+        } else {
+            let samples: Vec<_> = pcm
+                .iter()
+                .map(|&sample| f32::from(sample) / 32767.0)
+                .collect();
+            self.push(&samples, out);
+        }
+    }
+
     /// The stretch's last frame and the resampler's tail, neither of which a `push` could
     /// complete: dropping them would clip the end of every stretched or resampled reply.
     pub fn finish(&mut self, out: &mut Vec<u8>) {
@@ -1234,6 +1256,37 @@ impl OutPcm {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn completed_pcm_preserves_every_i16_and_uses_existing_transforms() {
+        let samples: Vec<i16> = (i16::MIN..=i16::MAX).collect();
+        let mut native = OutPcm::new(24000, 24000, 1.0, false).unwrap();
+        let mut actual = Vec::new();
+        for chunk in samples.chunks(1920) {
+            native.push_i16(chunk, &mut actual);
+        }
+        native.finish(&mut actual);
+        assert_eq!(
+            actual,
+            samples
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        let mut output = [
+            OutPcm::new(24000, 16000, 1.0, false).unwrap(),
+            OutPcm::new(24000, 16000, 1.0, false).unwrap(),
+        ];
+        let input = &samples[20_000..28_000];
+        let floats: Vec<_> = input.iter().map(|&v| f32::from(v) / 32767.0).collect();
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        output[0].push_i16(input, &mut actual);
+        output[1].push(&floats, &mut expected);
+        output[0].finish(&mut actual);
+        output[1].finish(&mut expected);
+        assert_eq!(actual, expected);
+    }
 
     /// Leading silence goes, the audible run starts the reply, nothing after it changes; a
     /// silent reply is trimmed at most `max_ms` and still plays.
