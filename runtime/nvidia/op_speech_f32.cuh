@@ -1989,13 +1989,12 @@ static __device__ __forceinline__ void sp_bd_gemm(unsigned M, unsigned N, unsign
         };
         a_fetch(0u);
         a_store(0u);
+        a_fetch(1u);
         b_issue(0u);
         b_issue(1u);
         for (unsigned kt = 0; kt < nk; kt++) {
             asm volatile("cp.async.wait_group 1;\n" ::);
             __syncthreads();
-            b_issue(kt + 2u);
-            a_fetch(kt + 1u);
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
             sm90_wg_fence();
             const char* as = sm + (kt & 1u) * OP + wg * (64u * 128u);
@@ -2004,8 +2003,11 @@ static __device__ __forceinline__ void sp_bd_gemm(unsigned M, unsigned N, unsign
             for (unsigned ks = 0; ks < 4u; ks++)
                 wgmma_m64n128k16(&acc[0][0], sm90_desc(as + ks * 32u), sm90_desc(bs + ks * 32u), (kt | ks) != 0u);
             sm90_wg_commit();
-            sm90_wg_wait<0>();
+            /* Under the MMAs: the stages they do not read (the barrier above retired step kt - 1). */
+            b_issue(kt + 2u);
             if (kt + 1u < nk) a_store((kt + 1u) & 1u);
+            a_fetch(kt + 2u);
+            sm90_wg_wait<0>();
         }
         asm volatile("cp.async.wait_group 0;\n" ::);
         __syncthreads();

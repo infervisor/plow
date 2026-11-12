@@ -37,6 +37,39 @@ against ~48, serial statistics chains kept); q/k/v as one N = 3072 launch only w
 reference chunking kept. LayerNorm into the dense prologue does not fuse: the reference-split dense
 path rejects a LayerNorm prologue.
 
+### Encoder dense: continuous bf16 accumulation (128-chunk packed launch, 1.7B)
+
+Reference servers run the encoder in bf16. The encoder's dense layers already multiply bf16 operands
+exactly; `PLOW_ASR_DENSE_CONTINUOUS=1` drops the split-K sum (and the per-row reference that kept
+packed launches equal to single ones) for one k16 accumulation chain per output, which a 128 x 128
+warpgroup tile computes at any batch. Packed vs single stays bit-identical (0 of 73 recordings differ
+at pack 4 and 16, both models).
+
+| Dense op, 1664 rows | split-K reference (64-row tiles) | continuous, 128 x 128 warpgroup | cuBLASLt bf16 operands |
+|---|---:|---:|---:|
+| 1024 x 1024 projection | 57 us | 30 us | 18 us |
+| 4096 x 1024 + erf-GELU (fc1) | 168 us | 132 us | 32 us (no GELU) |
+| 1024 x 4096 (fc2) | 224 us | 94 us | 30 us |
+| 1024 x 7680 (conv out) | 395 us | 162 us | 57 us |
+
+| Encoder, same tree | reference split | continuous |
+|---|---:|---:|
+| packed.128 (1.7B / 0.6B) | 31.2 / 23.0 ms | 20.4 / 16.5 ms |
+| packed.32 (1.7B / 0.6B) | 10.7 / 7.9 ms | 8.1 / 6.4 ms |
+| forward.800, one utterance (1.7B / 0.6B) | 4.64 / 3.57 ms | 5.09 / 3.81 ms |
+| conv front end program (1.7B) | 9.9 ms | 9.4 ms |
+| one transformer-layer program (1.7B) | 0.90-1.16 ms | 0.47-0.59 ms |
+
+Served, two interleaved runs each (1.7B): gate WER 0.03826 at c1 and c16 on both; c64 RTFx
+1218 / 1220 -> 1343 / 1331; c256 1302 / 1285 -> 1498 / 1463; 250 req/s within the 1 s SLO 0 % -> 84 % /
+98 %; 300 req/s 1538 / 1545 -> 1681 / 1815 audio s/s; 0 faults. 0.6B (one run): c64 1427 -> 1515, c256
+1532 -> 1623, 300 req/s 1582 -> 1925 audio s/s, but gate WER c1 0.04174 -> 0.04348 and c16 0.04261 ->
+0.04522 (limit 0.045): the 0.6B recipe stays on the reference split until its reference-server WER
+bounds are measured. The single-utterance program loses 7-10 % (no split-K over idle blocks); c1 RTFx
+109.3 -> 108.3.
+
+The conv front end is now 46 % of the packed encoder and the next kernel target.
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |
