@@ -147,7 +147,7 @@ __device__ __forceinline__ float sp_tanhf(float x) { return (float)tanh((double)
  * conv2 4.228 -> 3.739, fc1 0.146 -> 0.084. Same bf16 GELU as the double form for all 65536 bf16
  * inputs; the attention softmax keeps sp_expf (expf moved its probabilities). */
 __device__ __forceinline__ float sp_gelu_expf(float x) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
     return expf(x);
 #else
     return sp_expf(x);
@@ -167,9 +167,10 @@ __device__ __forceinline__ float sp_gelu_tanh(float x) {
 /* The erf-GELU's 1/d (d >= 1). On sm_120 rcp.approx and two Newton FMA steps equal __fdiv_rn(1, d) for
  * every d in [1, 2^126) (__fdiv_rn's general path is ~130 instructions); past 2^126 exp(-z^2) is 0 and t
  * does not matter, but inf would turn the Newton steps into NaN, hence the clamp. The GELU below then
- * equals the __fdiv_rn form on all 65536 bf16 inputs. */
+ * equals the __fdiv_rn form on all 65536 bf16 inputs. Both float forms also run on sm_90a (op test
+ * --gelu-only walks the 65536 inputs against the double exp / __fdiv_rn spelling). */
 __device__ __forceinline__ float sp_gelu_rcp(float d) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
     d = fminf(d, 0x1p126f);
     float r;
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
@@ -1476,6 +1477,35 @@ __device__ __forceinline__ void sp_ldsm2(unsigned (&r)[4], const void* p) {
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"((unsigned)__cvta_generic_to_shared(p)));
 }
+/* Warpgroup MMAs in the 64-row reference-split tiles (Hopper): the same bits as the m16n8k16 loop
+ * (op test --dense-ref-only), and at 1664 rows 68.7 -> 56.1 us (d 1024 projections), 233 -> 187 us
+ * (fc1). 0: the m16n8k16 loop. */
+#ifndef SPN_WGMMA
+#define SPN_WGMMA 1
+#endif
+#if defined(PLOW_NV_HOPPER) && SPN_WGMMA
+/* D += A * B, m64n(8 NJ)k16 .f32.bf16.bf16 on 128-byte-swizzled shared operands; d[j][r] is the
+ * m16n8k16 C fragment of column block j (sm90_wgmma.cuh "ACCUMULATOR"). */
+template <unsigned NJ>
+__device__ __forceinline__ void spn_wgmma(float (&d)[NJ][4], uint64_t da, uint64_t db) {
+    static_assert(NJ == 4u || NJ == 5u || NJ == 10u, "n32 / n40 / n80");
+    if constexpr (NJ == 4u)
+        asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %18, 0;\n"
+                     "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, %16, %17, p, 1, 1, 0, 0;\n}\n"
+                     : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3])
+                     : "l"(da), "l"(db), "r"(1));
+    if constexpr (NJ == 5u)
+        asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %22, 0;\n"
+                     "wgmma.mma_async.sync.aligned.m64n40k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19}, %20, %21, p, 1, 1, 0, 0;\n}\n"
+                     : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3])
+                     : "l"(da), "l"(db), "r"(1));
+    if constexpr (NJ == 10u)
+        asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %42, 0;\n"
+                     "wgmma.mma_async.sync.aligned.m64n80k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32,%33,%34,%35,%36,%37,%38,%39}, %40, %41, p, 1, 1, 0, 0;\n}\n"
+                     : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]), "+f"(d[5][0]), "+f"(d[5][1]), "+f"(d[5][2]), "+f"(d[5][3]), "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]), "+f"(d[8][0]), "+f"(d[8][1]), "+f"(d[8][2]), "+f"(d[8][3]), "+f"(d[9][0]), "+f"(d[9][1]), "+f"(d[9][2]), "+f"(d[9][3])
+                     : "l"(da), "l"(db), "r"(1));
+}
+#endif
 /* SPLIT: walk k-steps [s0, s1), store each chunk that starts in [s0, own) to its slot instead of
  * folding, and return the rows' chunks in `ch` (sp_tcn_gemm). */
 template <unsigned BN, bool SPLIT = false, unsigned BM = SPT_BM>
@@ -1487,8 +1517,19 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
     using C = SpN<BN, BM>;
     static_assert(!SPLIT || BM == SPT_BM, "split slots hold 64-row tiles");
     constexpr unsigned NJ = C::NJ;
+#if defined(PLOW_NV_HOPPER) && SPN_WGMMA
+    /* 64-row tiles on warpgroup MMAs: stages of 128-byte swizzled rows from a 1024-byte boundary. */
+    constexpr bool WG = BM == 64u;
+    static_assert(!WG || SPN_NS * BN * 128u + 2u * 64u * 128u + 1024u <= SP_ARENA_FLOATS * 4u, "swizzled stages");
+    constexpr unsigned BSTAGE = WG ? BN * 128u : C::B_BYTES, ALD = WG ? 64u : SPN_LD;
+    char* smem = WG ? (char*)sm90_align1024(arena) : (char*)arena;
+    __nv_bfloat16* abuf = (__nv_bfloat16*)(smem + (WG ? SPN_NS * BSTAGE : C::RING));
+#else
+    constexpr bool WG = false;
+    constexpr unsigned BSTAGE = C::B_BYTES, ALD = SPN_LD;
     char* smem = (char*)arena;
     __nv_bfloat16* abuf = (__nv_bfloat16*)(smem + C::RING);
+#endif
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const unsigned wm = (warp % C::WM) * 16u, wn = (warp / C::WM) * (BN / C::WN), g = lane >> 2;
     const unsigned nk = (K + 63u) / 64u;
@@ -1509,18 +1550,21 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
             uint2 u;
             u.x = sp_pack_bf16(make_float2(av[p].x, av[p].y));
             u.y = sp_pack_bf16(make_float2(av[p].z, av[p].w));
-            *(uint2*)(abuf + buf * (BM * SPN_LD) + (e >> 4) * SPN_LD + (e & 15u) * 4u) = u;
+            const unsigned r = e >> 4, c = (e & 15u) * 4u;
+            *(uint2*)(abuf + buf * (BM * ALD) + r * ALD + (WG ? (((c >> 3) ^ (r & 7u)) << 3) + (c & 4u) : c)) = u;
         }
     };
     auto issue_b = [&](unsigned kt) {
         if (kt < s1) {
-            __nv_bfloat16* bs = (__nv_bfloat16*)(smem + (kt % SPN_NS) * C::B_BYTES);
+            __nv_bfloat16* bs = (__nv_bfloat16*)(smem + (kt % SPN_NS) * BSTAGE);
             const unsigned k0 = kt * 64u;
 #pragma unroll
             for (unsigned p = 0; p < (BN * 8u + PLOW_NV_THREADS - 1) / PLOW_NV_THREADS; p++) {
                 const unsigned e = tid + p * PLOW_NV_THREADS, r = e >> 3, c = (e & 7u) * 8u;
                 const bool ok = n0 + r < N && k0 + c < K;
-                if (e < BN * 8u) sp_cp16(bs + r * SPN_LD + c, ok ? lb.p + (size_t)(n0 + r) * lb.stride + k0 + c : lb.p, ok);
+                if (e < BN * 8u)
+                    sp_cp16(bs + r * ALD + (WG ? ((e & 7u) ^ (r & 7u)) << 3 : c),
+                            ok ? lb.p + (size_t)(n0 + r) * lb.stride + k0 + c : lb.p, ok);
             }
         }
         asm volatile("cp.async.commit_group;\n" ::);
@@ -1553,13 +1597,26 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
         __syncthreads();
         issue_b(kt + SPN_NS - 1);
         a_fetch(kt + 1u);
-        const __nv_bfloat16* bs = (const __nv_bfloat16*)(smem + (kt % SPN_NS) * C::B_BYTES);
-        const __nv_bfloat16* ab = abuf + (kt & 1u) * (BM * SPN_LD);
+        const __nv_bfloat16* bs = (const __nv_bfloat16*)(smem + (kt % SPN_NS) * BSTAGE);
+        const __nv_bfloat16* ab = abuf + (kt & 1u) * (BM * ALD);
         float part[NJ][4];
 #pragma unroll
         for (unsigned j = 0; j < NJ; j++)
 #pragma unroll
             for (unsigned r = 0; r < 4; r++) part[j][r] = 0.f;
+#if defined(PLOW_NV_HOPPER) && SPN_WGMMA
+        if constexpr (WG) {
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            sm90_wg_fence();
+#pragma unroll
+            for (unsigned ks = 0; ks < 4u; ks++)
+                spn_wgmma<NJ>(part, sm90_desc((const char*)ab + ks * 32u),
+                              sm90_desc((const char*)bs + wn * 128u + ks * 32u));
+            sm90_wg_commit();
+            sm90_wg_wait<0>();
+        }
+#endif
+        if constexpr (!WG) {
 #pragma unroll
         for (unsigned ks = 0; ks < 64u; ks += 16) {
             unsigned a[4], b[C::NQ][4];
@@ -1574,6 +1631,7 @@ static __device__ __forceinline__ void sp_tcn_tile(unsigned m0, unsigned n0, uns
 #pragma unroll
             for (unsigned j = 0; j < NJ; j++)
                 sp_mma_bf16x(part[j], a, b[j >> 1][(j & 1u) * 2], b[j >> 1][(j & 1u) * 2 + 1]);
+        }
         }
         if (kt + 1 < s1) a_store((kt + 1u) & 1u);
 #pragma unroll
@@ -1880,6 +1938,125 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
         else sp_dense_run(m, n, k, la, lb, ep, flags, slice, nblk, arena, scratch);
     }
 }
+#if defined(PLOW_NV_HOPPER) && SPN_WGMMA
+/* DenseGemmF32 continuous k16 accumulation (flag 0x800) on Hopper: 128 x 128 tiles, each warpgroup
+ * m64n128k16 over its 64 rows, operands in 128-byte-swizzled bf16 stages (A packed from the f32 rows
+ * one k-step ahead, two buffers; B by cp.async, three). One f32 accumulator per output walks k in
+ * order: the m16n8k16 loop's bits (sp_tc_gemm MMA_K = 16), at any M, row position or block count. */
+template <class EP>
+static __device__ __forceinline__ void sp_bd_gemm(unsigned M, unsigned N, unsigned K, const SpRowF32& la,
+                                                  const SpRowBf16& lb, const EP& ep, unsigned slice, unsigned nblk,
+                                                  float* arena) {
+    constexpr unsigned OP = 128u * 128u; /* bytes of a 128-row stage */
+    static_assert(5u * OP + 1024u <= SP_ARENA_FLOATS * 4u, "dense warpgroup stages");
+    char* sm = (char*)sm90_align1024(arena);
+    const unsigned tid = threadIdx.x, wg = tid >> 7, sr = tid >> 4, sc = (tid & 15u) * 4u;
+    const unsigned tn = (N + 127u) / 128u, tiles = ((M + 127u) / 128u) * tn, nk = (K + 63u) / 64u;
+    for (unsigned t = slice; t < tiles; t += nblk) {
+        const unsigned m0 = (t / tn) * 128u, n0 = (t % tn) * 128u;
+        float acc[16][4];
+        float4 va[8];
+        auto a_fetch = [&](unsigned kt) {
+#pragma unroll
+            for (unsigned p = 0; p < 8; p++) {
+                const unsigned r = m0 + sr + 16u * p, k = kt * 64u + sc;
+                va[p] = kt < nk && r < M && k < K ? __ldcg((const float4*)(la.p + (size_t)r * la.k + k))
+                                                 : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        };
+        auto a_store = [&](unsigned buf) {
+#pragma unroll
+            for (unsigned p = 0; p < 8; p++) {
+                const unsigned r = sr + 16u * p;
+                uint2 u;
+                u.x = sp_pack_bf16(make_float2(va[p].x, va[p].y));
+                u.y = sp_pack_bf16(make_float2(va[p].z, va[p].w));
+                *(uint2*)(sm + buf * OP + (r * 64u + (((sc >> 3) ^ (r & 7u)) << 3) + (sc & 4u)) * 2u) = u;
+            }
+        };
+        auto b_issue = [&](unsigned kt) {
+            if (kt < nk) {
+                char* bs = sm + (2u + kt % 3u) * OP;
+#pragma unroll
+                for (unsigned p = 0; p < 4; p++) {
+                    const unsigned e = tid + p * PLOW_NV_THREADS, r = e >> 3, c = e & 7u, k = kt * 64u + c * 8u;
+                    const bool ok = n0 + r < N && k < K;
+                    sp_cp16(bs + (r * 64u + ((c ^ (r & 7u)) << 3)) * 2u,
+                            ok ? lb.p + (size_t)(n0 + r) * lb.stride + k : lb.p, ok);
+                }
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+        };
+        a_fetch(0u);
+        a_store(0u);
+        b_issue(0u);
+        b_issue(1u);
+        for (unsigned kt = 0; kt < nk; kt++) {
+            asm volatile("cp.async.wait_group 1;\n" ::);
+            __syncthreads();
+            b_issue(kt + 2u);
+            a_fetch(kt + 1u);
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            sm90_wg_fence();
+            const char* as = sm + (kt & 1u) * OP + wg * (64u * 128u);
+            const char* bs = sm + (2u + kt % 3u) * OP;
+#pragma unroll
+            for (unsigned ks = 0; ks < 4u; ks++)
+                wgmma_m64n128k16(&acc[0][0], sm90_desc(as + ks * 32u), sm90_desc(bs + ks * 32u), (kt | ks) != 0u);
+            sm90_wg_commit();
+            sm90_wg_wait<0>();
+            if (kt + 1u < nk) a_store((kt + 1u) & 1u);
+        }
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+        sp_tcn_store<128, 128>(m0, n0, M, N, ep, acc, arena);
+    }
+}
+/* Inlined at the dispatch (wgmma under a call boundary is serialized, ptxas C7510). False while the
+ * 128 x 128 tiles would leave most blocks idle: the 64 x 64 ones then spread further. */
+__device__ __forceinline__ bool sp_dense_cont_wg(float* __restrict__ out, const float* __restrict__ x,
+                                                 const void* __restrict__ w, const float* __restrict__ bias,
+                                                 unsigned m, unsigned n, unsigned k, unsigned activation,
+                                                 unsigned a_row0, unsigned wstride_op, unsigned onehot,
+                                                 unsigned flags, unsigned slice, unsigned nblk, const float* post) {
+    if (((m + 127u) / 128u) * ((n + 127u) / 128u) * 5u < nblk * 2u) return false;
+    const unsigned stride = wstride_op ? wstride_op : k;
+    x += (size_t)a_row0 * k;
+    SpDenseEpi ep{out, bias, w, n, stride, wstride_op ? onehot : 0xFFFFFFFFu, flags, activation == 1u};
+    if (flags & 0x700u) {
+        if (!post) __trap();
+        ep.lo0 = post[0]; ep.hi0 = post[1]; ep.lo1 = post[2]; ep.hi1 = post[3];
+    }
+    sp_bd_gemm(m, n, k, SpRowF32{x, k, true}, SpRowBf16{(const __nv_bfloat16*)w, k, stride, true}, ep, slice, nblk,
+               sp_smem);
+    return true;
+}
+#endif
+#if defined(PLOW_NV_HOPPER) && SPN_WGMMA
+/* The 64-row reference-split tiles, inlined at the dispatch: wgmma under a call boundary is
+ * serialized (ptxas C7510). False: not taken (d_dense_gemm_f32 runs the op). */
+__device__ __forceinline__ bool sp_dense_ref_wg(float* __restrict__ out, const float* __restrict__ x,
+                                                const void* __restrict__ w, const float* __restrict__ bias,
+                                                unsigned m, unsigned n, unsigned k, unsigned activation,
+                                                unsigned a_row0, unsigned wstride_op, unsigned onehot,
+                                                unsigned flags, unsigned slice, unsigned nblk, float* scratch,
+                                                const SpRefSplit& rs) {
+    const unsigned stride = wstride_op ? wstride_op : k, shape = sp_tcn_shape(m, n, k, nblk);
+    x += (size_t)a_row0 * k;
+    const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
+    /* Past 16 k-steps the f32 A reloads bound the tile and the inlined body loses 3-8 % (fc2, 7680-wide
+     * projection): those stay on the called one. */
+    if ((flags & 0x70cu) != 12u || (k & 7u) || k > 1024u || (stride & 7u) || !sp_aligned(x, 16) || !sp_aligned(wb, 16) ||
+        shape > 1u)
+        return false;
+    const SpRowF32 la{x, k, true};
+    const SpRowBf16 lb{wb, k, stride, true};
+    const SpDenseEpi ep{out, bias, w, n, stride, wstride_op ? onehot : 0xFFFFFFFFu, flags, activation == 1u};
+    if (shape == 0u) sp_tcn_gemm<80>(m, n, k, la, lb, ep, slice, nblk, sp_smem, scratch, rs);
+    else sp_tcn_gemm<160>(m, n, k, la, lb, ep, slice, nblk, sp_smem, scratch, rs);
+    return true;
+}
+#endif
 
 template <unsigned MMA_K>
 static __device__ __noinline__ void d_dense_gemm_f32_cont(float* __restrict__ out, const float* __restrict__ x,
@@ -7375,6 +7552,13 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
             if ((in->i[7] & 12u) != 12u || (in->i[7] & (32u | 64u | 128u)) || !(in->i[7] & 0x800u)) __trap();
             const unsigned k = in->i[2], stride = in->i[5] ? in->i[5] : k;
             const bool aligned = !(k & 7u) && !(stride & 7u) && sp_aligned(SP_TEN(1), 16) && sp_aligned(SP_TEN(2), 16);
+#if defined(PLOW_NV_HOPPER) && SPN_WGMMA
+            if (aligned && !(in->i[7] & 0x1000u) &&
+                sp_dense_cont_wg((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3),
+                    in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice, nblk,
+                    (in->i[7] & 0x700u) ? (const float*)SP_TEN(5) : nullptr))
+                break;
+#endif
             if (aligned && (in->i[7] & 0x1000u))
                 d_dense_gemm_f32_cont<8>((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3),
                     in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice, nblk,
@@ -7395,6 +7579,12 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         }
         if (in->i[7] & 128u) {
             const SpRefSplit rs{(const unsigned*)SP_TEN(4), in->fj[1].u};
+#if defined(PLOW_NV_HOPPER) && SPN_WGMMA
+            if (sp_dense_ref_wg((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],
+                                in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice, nblk,
+                                (float*)SP_TEN(5), rs))
+                break;
+#endif
             d_dense_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],
                              in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice, nblk, arena,
                              (float*)SP_TEN(5), nullptr, &rs);

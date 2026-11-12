@@ -324,6 +324,111 @@ static void t_dense_ref(unsigned n, unsigned k, std::vector<unsigned> items) {
     if (diff) g_fail = 1;
 }
 
+/* Reference-split DenseGemmF32 (flag 128) at M rows of `ref`-row requests, whole device. */
+static void bench_dense_ref(unsigned m, unsigned n, unsigned k, unsigned post, unsigned ref) {
+    Case c;
+    unsigned o = c.out((size_t)m * n), x = c.add((size_t)m * k * 4), w = c.add((size_t)n * k * 2);
+    unsigned b = c.f32(n, 0.5f), scratch = splitk_scratch(c), table = c.u32(std::vector<uint32_t>(m, ref));
+    c.upload();
+    void** td = upload_table(c.dev);
+    PlowDevInst in = c.in;
+    in.op = PLOW_DOP_DENSE_GEMM_F32;
+    in.t[0] = o; in.t[1] = x; in.t[2] = w; in.t[3] = b; in.t[4] = table; in.t[5] = scratch;
+    in.i[0] = m; in.i[1] = n; in.i[2] = k; in.i[7] = post | 4 | 8 | 128; in.fj[1].u = 132;
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    for (int i = 0; i < 3; i++) k_speech<<<g_nblk, 256, kSmem>>>(in, td);
+    const int reps = 50;
+    CK(cudaEventRecord(e0));
+    for (int i = 0; i < reps; i++) k_speech<<<g_nblk, 256, kSmem>>>(in, td);
+    CK(cudaEventRecord(e1));
+    CK(cudaEventSynchronize(e1));
+    float ms;
+    CK(cudaEventElapsedTime(&ms, e0, e1));
+    CK(cudaFree(td));
+    printf("  bench DenseGemmF32 ref-split M=%u N=%u K=%u ref=%u nblk=%d: %.1f us  %.1f TFLOP/s\n", m, n, k, ref,
+           g_nblk, 1e3 * ms / reps, 2.0 * m * n * k / (ms / reps * 1e9));
+}
+
+/* sp_gelu_erf_bf16 on every bf16 input against the double exp / __fdiv_rn spelling of the golden. */
+__global__ void k_gelu_all(unsigned* differ) {
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < 65536u; i += gridDim.x * blockDim.x) {
+        const float value = __uint_as_float(i << 16);
+        const float z = __fmul_rn(value, 0.7071067811865475f);
+        const float t = __fdiv_rn(1.0f, __fadd_rn(1.0f, __fmul_rn(0.3275911f, fabsf(z))));
+        float p = __fsub_rn(__fmul_rn(1.061405429f, t), 1.453152027f);
+        p = __fadd_rn(__fmul_rn(p, t), 1.421413741f);
+        p = __fsub_rn(__fmul_rn(p, t), 0.284496736f);
+        p = __fadd_rn(__fmul_rn(p, t), 0.254829592f);
+        const float r = __fmul_rn(__fmul_rn(p, t), (float)exp((double)__fmul_rn(-z, z)));
+        const float want = sp_bf16(__fmul_rn(__fmul_rn(0.5f, value), z < 0.0f ? r : __fsub_rn(2.0f, r)));
+        const float got = sp_gelu_erf_bf16(value);
+        if (__float_as_uint(want) != __float_as_uint(got) && !(want != want && got != got)) atomicAdd(differ, 1u);
+    }
+}
+static void t_gelu_all() {
+    unsigned* differ;
+    CK(cudaMalloc(&differ, 4));
+    CK(cudaMemset(differ, 0, 4));
+    k_gelu_all<<<64, 256>>>(differ);
+    CK(cudaDeviceSynchronize());
+    unsigned n;
+    CK(cudaMemcpy(&n, differ, 4, cudaMemcpyDeviceToHost));
+    CK(cudaFree(differ));
+    printf("  erf-GELU over the 65536 bf16 inputs: %u differ -> %s\n", n, n ? "FAIL" : "PASS");
+    if (n) g_fail = 1;
+}
+
+/* Continuous-accumulation DenseGemmF32 (flag 0x800): requests packed vs each alone (bitwise), an
+ * FNV-1a of the packed output (compare across builds), and the whole-device time. */
+static void t_dense_cont(unsigned n, unsigned k, unsigned post, std::vector<unsigned> items) {
+    Case c;
+    unsigned m = 0;
+    for (unsigned r : items) m += r;
+    unsigned o = c.out((size_t)m * n), x = c.f32((size_t)m * k, 1.f), w = c.bf16((size_t)n * k, 0.06f);
+    round_bf16(c, x);
+    unsigned b = c.f32(n, 0.5f);
+    c.upload();
+    void** td = upload_table(c.dev);
+    PlowDevInst in = c.in;
+    in.op = PLOW_DOP_DENSE_GEMM_F32;
+    in.t[0] = o; in.t[1] = x; in.t[2] = w; in.t[3] = b;
+    in.i[0] = m; in.i[1] = n; in.i[2] = k; in.i[7] = post | 4 | 8 | 0x800;
+    k_speech<<<g_nblk, 256, kSmem>>>(in, td);
+    CK(cudaDeviceSynchronize());
+    std::vector<uint32_t> packed((size_t)m * n), alone;
+    CK(cudaMemcpy(packed.data(), c.dev[o], packed.size() * 4, cudaMemcpyDeviceToHost));
+    uint64_t fnv = 1469598103934665603ull;
+    for (uint32_t v : packed) fnv = (fnv ^ v) * 1099511628211ull;
+    size_t diff = 0;
+    unsigned row0 = 0;
+    for (unsigned r : items) {
+        PlowDevInst one = in;
+        one.i[0] = r; one.i[4] = row0;
+        k_speech<<<44, 256, kSmem>>>(one, td);
+        CK(cudaDeviceSynchronize());
+        alone.resize((size_t)r * n);
+        CK(cudaMemcpy(alone.data(), c.dev[o], alone.size() * 4, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < alone.size(); i++) diff += alone[i] != packed[(size_t)row0 * n + i];
+        row0 += r;
+    }
+    in.i[4] = 0;
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    const int reps = 50;
+    CK(cudaEventRecord(e0));
+    for (int i = 0; i < reps; i++) k_speech<<<g_nblk, 256, kSmem>>>(in, td);
+    CK(cudaEventRecord(e1));
+    CK(cudaEventSynchronize(e1));
+    float ms;
+    CK(cudaEventElapsedTime(&ms, e0, e1));
+    CK(cudaFree(td));
+    printf("  DenseGemmF32 continuous M=%u N=%u K=%u, %zu requests: %zu differ, fnv %016llx, %.1f us  %.1f TFLOP/s -> %s\n",
+           m, n, k, items.size(), diff, (unsigned long long)fnv, 1e3 * ms / reps, 2.0 * m * n * k / (ms / reps * 1e9),
+           diff ? "FAIL" : "PASS");
+    if (diff) g_fail = 1;
+}
+
 static void t_gemm_bf16(unsigned m, unsigned n, unsigned k) {
     Case c;
     unsigned o = c.out((size_t)m * n), x = c.bf16((size_t)m * k, 1.f), w = c.bf16((size_t)n * k, 0.1f);
@@ -2729,6 +2834,47 @@ int main(int argc, char** argv) {
 
     if (argc > 1 && !strcmp(argv[1], "--conv-padding-only")) {
         t_conv_padding();
+        return g_fail;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--gelu-only")) {
+        t_gelu_all();
+        printf(g_fail ? "FAIL\n" : "ALL PASS\n");
+        return g_fail;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--dense-cont-only")) {
+        t_dense("DenseGemmF32 cont16 golden 390x1024x1024", 390, 1024, 1024, 1 | 4 | 8 | 0x800, 0, 0, 0, 0, true);
+        t_dense("DenseGemmF32 cont16 gelu 208x4096x1024", 208, 4096, 1024, 2 | 4 | 8 | 0x800, 0, 0, 0, 0, true);
+        t_dense("DenseGemmF32 cont16 ragged 77x200x328", 77, 200, 328, 1 | 4 | 8 | 0x800, 0, 3, 0, 0, true);
+        for (unsigned reqs : {2u, 8u, 16u}) {
+            t_dense_cont(1024, 1024, 1, std::vector<unsigned>(reqs, 104));
+            t_dense_cont(4096, 1024, 2, std::vector<unsigned>(reqs, 104));
+            t_dense_cont(1024, 4096, 1, std::vector<unsigned>(reqs, 104));
+        }
+        t_dense_cont(1024, 7680, 1, std::vector<unsigned>(16, 104));
+        t_dense_cont(1024, 1024, 1, {104, 52, 156, 13, 390, 208, 390, 390, 260});
+        t_dense_cont(896, 3584, 1, {91, 13, 26, 39, 52});
+        /* Unrounded sums: K % 16 == 8, ragged tiles. */
+        t_dense_cont(1024, 1016, 0, std::vector<unsigned>(16, 104));
+        t_dense_cont(1000, 4088, 0, {390, 77, 13, 390, 390, 131});
+        printf(g_fail ? "FAIL\n" : "ALL PASS\n");
+        return g_fail;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--dense-ref-only")) {
+        /* The Qwen3-ASR 1.7B encoder layer at a 128-chunk pack (16 requests of 104 rows). */
+        t_dense_ref(1024, 1024, std::vector<unsigned>(16, 104));
+        t_dense_ref(4096, 1024, std::vector<unsigned>(16, 104));
+        t_dense_ref(1024, 4096, std::vector<unsigned>(16, 104));
+        t_dense_ref(1024, 1024, {104, 52, 156, 13, 390, 208, 390, 390, 260});
+        t_dense_ref(1024, 4096, {104, 52, 260});
+        t_dense_ref(4096, 1024, {104, 52});
+        t_dense_ref(1024, 7680, {104, 52, 156});
+        for (unsigned m : {208u, 832u, 1664u}) {
+            bench_dense_ref(m, 1024, 1024, 1, 104);
+            bench_dense_ref(m, 4096, 1024, 2, 104);
+            bench_dense_ref(m, 1024, 4096, 1, 104);
+        }
+        bench_dense_ref(1664, 1024, 7680, 1, 104);
+        printf(g_fail ? "FAIL\n" : "ALL PASS\n");
         return g_fail;
     }
     if (argc > 1 && !strcmp(argv[1], "--conv-packing-only")) {
