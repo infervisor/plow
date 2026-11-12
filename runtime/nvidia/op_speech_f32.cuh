@@ -1854,7 +1854,7 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
     if (flags & 4u) {
         const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
         if ((flags & 8u) && (k & 7u) == 0 && (stride & 7u) == 0 && sp_aligned(x, 16) && sp_aligned(wb, 16)) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
             if (rs && !ln) {
                 const SpRowBf16 lb{wb, k, stride, true};
                 switch (sp_tcn_shape(m, n, k, nblk)) {
@@ -2561,14 +2561,16 @@ static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const 
             static_assert(TAB0 >= 4u * SpTc<false>::STAGE_BYTES / 4u, "conv table placement");
             SpConvTab* tab = (SpConvTab*)(arena + TAB0);
             const bool tabled = TAB0 + 2u * k <= SP_ARENA_FLOATS && (uint64_t)ic * frames * width < (1ull << 31);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
-            if (ic == 1u && kernel == 3u && stride == 2u && pad_before == 1u && pad_after == 1u && out_layout == 2u &&
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
+            if (ic == 1u && kernel == 3u && stride == 2u && wstride == 2u && pad_before == 1u && pad_after == 1u &&
+                out_layout == 2u &&
                 (flags & 128u) && oc * 13u <= SP_ARENA_FLOATS && positions64 * oc < (1ull << 31)) {
                 sp_conv1_direct(out, x, (const float*)w, bias, frames, width, oc, of, ow, batches, flags & 2u, slice,
                                 nblk, arena);
                 return;
             }
-            if ((flags & 256u) && kernel == 3u && stride == 2u && pad_before == 1u && pad_after == 1u && in_layout == 2u &&
+            if ((flags & 256u) && kernel == 3u && stride == 2u && wstride == 2u && pad_before == 1u && pad_after == 1u &&
+                in_layout == 2u &&
                 (ic & 15u) == 0 && sp_aligned(w, 16) && (uint64_t)batches * ic * frames * width < (1ull << 31)) {
                 if ((width & 1u) == 0 && sp_aligned(x, 8) && sp_cs_fits(width, ow, 2u)) {
                     sp_cs_conv<SpCs<2>>(x, (const float*)w, ep, frames, width, ic, oc, of, ow, positions, slice, nblk, arena);
