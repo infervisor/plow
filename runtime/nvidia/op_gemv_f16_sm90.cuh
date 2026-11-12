@@ -50,11 +50,25 @@ __device__ __forceinline__ void gemv_f16w_mma_tile(float* d, uint64_t a, uint64_
 #endif
 }
 
-template <unsigned BM, bool HALF_OUT, unsigned BK = 64>
-static __device__ __forceinline__ void gemv_f16w_half(
+template <unsigned BM, bool HALF_OUT, unsigned BK = 64
+#if defined(PLOW_NV_GEMM_WIDE_PROBE) && PLOW_NV_GEMM_WIDE_PROBE
+          , bool OUTPUT_VIEW = false
+#endif
+          >
+static __device__
+#if defined(PLOW_NV_GEMM_WIDE_PROBE) && PLOW_NV_GEMM_WIDE_PROBE == 2
+__noinline__
+#else
+__forceinline__
+#endif
+void gemv_f16w_half(
     void* C, const unsigned short* __restrict__ x, const unsigned short* __restrict__ W,
     const float* bias, unsigned bgroup, const float* res, unsigned act,
-    unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk, float* arena) {
+    unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk, float* arena
+#if defined(PLOW_NV_GEMM_WIDE_PROBE) && PLOW_NV_GEMM_WIDE_PROBE
+    , unsigned view_rows = 0, unsigned view_stride = 0, unsigned view_offset = 0
+#endif
+    ) {
     static_assert(PLOW_NV_THREADS == 256, "f16 operand GEMM needs two warpgroups");
     constexpr unsigned BN = 64, NS = BK == 128 ? 2 : 3, STAGE = (BM + BN) * BK;
     static_assert(NS * STAGE * 2 + 1024 <= 102400, "f16 operand GEMM arena");
@@ -111,7 +125,11 @@ static __device__ __forceinline__ void gemv_f16w_half(
             const unsigned n = n0 + ww * 16u + lane / 4u + ((c % 4u) / 2u) * 8u;
             const unsigned m = m0 + wg * (BM / 2u) + (c / 4u) * 8u + 2u * (lane % 4u) + c % 2u;
             if (m >= M) continue;
-            const size_t o = (size_t)m * N + n;
+            const size_t o =
+#if defined(PLOW_NV_GEMM_WIDE_PROBE) && PLOW_NV_GEMM_WIDE_PROBE
+                OUTPUT_VIEW ? (size_t)(m / view_rows) * view_stride + (m % view_rows) * N + view_offset + n :
+#endif
+                (size_t)m * N + n;
             float v = acc[c];
             if (bias) v = __fadd_rn(v, bias[(bgroup ? m / bgroup * N : 0u) + n]);
             if (res) v = __fadd_rn(v, res[o]);

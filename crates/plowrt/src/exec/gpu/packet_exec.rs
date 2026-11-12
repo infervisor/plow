@@ -362,6 +362,108 @@ type Residents = parking_lot::Mutex<Vec<(std::path::PathBuf, u8, std::sync::Weak
 
 #[cfg(test)]
 #[test]
+#[ignore = "CUDA; DEPTH_PREFIX_TEST_ASSETS contains devgen's emitted prefix blocks; run through gpuq"]
+fn persistent_depth_prefix_matches_embedding_rows() {
+    let dir = std::path::PathBuf::from(std::env::var("DEPTH_PREFIX_TEST_ASSETS").unwrap());
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let sanitize = std::env::var_os("DEPTH_PREFIX_SANITIZE").is_some();
+    let batches: &[usize] = if sanitize {
+        &[33]
+    } else {
+        &[1, 8, 32, 64, 128, 200, 224]
+    };
+    let table: Vec<u16> = (0..31 * 2048 * 1024)
+        .map(|i| {
+            0x3c00
+                | ((i / 1024 * 37 + i % 1024 * 11) % 1024) as u16
+                | ((((i / 1024 + i) % 2) as u16) << 15)
+        })
+        .collect();
+    for &batch in batches {
+        for level in [1, 9, 17, 25, 31] {
+            let mut runtimes = [false, true].map(|cached| {
+                let path = dir.join(format!("prefix.b{batch}.l{level}.cache{cached}.pkt"));
+                CudaPacketRuntime::load_on(be.clone(), &path).unwrap()
+            });
+            for rt in &mut runtimes {
+                let t = rt.tensor("w.maya2.depth.emb.weight").unwrap();
+                rt.write_tensor(t, bytemuck::cast_slice(&table)).unwrap();
+            }
+            let rows = if level == 31 { 1 } else { level + 1 };
+            for frame in 0..3 {
+                let p0: Vec<f32> = (0..batch * 1024)
+                    .map(|i| (i as f32 + frame as f32) / 1024.)
+                    .collect();
+                let indices: Vec<Vec<u32>> = (0..31)
+                    .map(|k| {
+                        (0..batch)
+                            .map(|r| (k * 2048 + (r * 37 + frame * 17) % 2048) as u32)
+                            .collect()
+                    })
+                    .collect();
+                let expected: Vec<f32> = (0..batch * rows * 1024)
+                    .map(|i| {
+                        let (b, p, d) = (i / (rows * 1024), i / 1024 % rows, i % 1024);
+                        let pos = if level == 31 { level } else { p };
+                        if pos == 0 {
+                            p0[b * 1024 + d]
+                        } else {
+                            let h = table[indices[pos - 1][b] as usize * 1024 + d];
+                            f32::from_bits(
+                                (u32::from(h & 0x8000) << 16)
+                                    | 0x3f80_0000
+                                    | (u32::from(h & 1023) << 13),
+                            )
+                        }
+                    })
+                    .collect();
+                for rt in &mut runtimes {
+                    for (name, data) in
+                        std::iter::once(("act.depth.p0".to_owned(), bytemuck::cast_slice(&p0)))
+                            .chain(indices.iter().enumerate().map(|(k, v)| {
+                                (format!("act.depth.eidx.{k}"), bytemuck::cast_slice(v))
+                            }))
+                    {
+                        if let Some(t) = rt.tensor(&name) {
+                            rt.write_tensor(t, data).unwrap();
+                        }
+                    }
+                    let x = rt.tensor("act.depth.x").unwrap();
+                    let poison = vec![12345f32; x.bytes / 4];
+                    rt.write_tensor(x, bytemuck::cast_slice(&poison)).unwrap();
+                }
+                runtimes[1].run_sequence(&[0]).unwrap();
+                let mut timing = Vec::new();
+                for arm in [0, 1, 0, 1] {
+                    let rt = &mut runtimes[arm];
+                    let mut times = Vec::new();
+                    for repeat in 0..if sanitize { 1 } else { 15 } {
+                        rt.run_sequence(&[arm]).unwrap();
+                        if repeat >= 3 || sanitize {
+                            times.push(rt.last_run_us());
+                        }
+                    }
+                    times.sort_by(f64::total_cmp);
+                    timing.push((arm, times[times.len() / 2]));
+                    let t = rt.tensor("act.depth.x").unwrap();
+                    let mut actual = vec![0f32; t.bytes / 4];
+                    rt.read_tensor_at(t, 0, bytemuck::cast_slice_mut(&mut actual))
+                        .unwrap();
+                    assert_eq!(
+                        &actual[..expected.len()],
+                        expected.as_slice(),
+                        "B{batch} L{level} frame{frame} arm{arm}"
+                    );
+                    assert!(actual[expected.len()..].iter().all(|&v| v == 12345.));
+                }
+                println!("depth-prefix batch={batch} level={level} frame={frame} exact=true abab_us={timing:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
 #[ignore = "CUDA; CODEC_RING_TEST_ASSETS holds the layout-3 speech object; run through gpuq"]
 fn ring_attention_matches_chronological_single_block() {
     use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};

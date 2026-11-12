@@ -1075,6 +1075,7 @@ fn speech_autoregressive_paths_trace_packet_sampling() {
                 rows: 1,
                 arg,
                 counter_bytes,
+                host_insts: prefix.insts.clone(),
                 _tables: tables,
             },
         );

@@ -7,12 +7,11 @@ prefix rows) at 32 streams. Generated bodies: gemm_f16.py (TileLang), gemm_f16_t
 Current kernel: the standalone probe depth_gemv.cu, which launches the interpreter's own arm
 (d_gemv_f32out_mode) with the flags and block count maya2_depth.rs emits for that projection, in
 the same lease and on the same cold weight sets as the generators. The arm does more than the
-generated GEMM: it reads f32 x, standardizes it (LayerNorm flag) and rounds it to f16, and adds a
-bias / residual (zeros here, so the result is the plain product). The generators get the already
-standardized f16 x. At M >= 16 the current arm receives the materialized f32 LayerNorm output;
-that separate op is timed by the depth-block harness. The current batched route receives f16 operands
-except for o, writes f1's GELU output as f16, and uses f2's per-stream grouped bias. `IN_MODEL_US`
-keeps older in-situ per-op times for reference.
+generated GEMM: below 16 rows it standardizes x in the LayerNorm prologue. At M >= 16 it receives
+materialized f16 LayerNorm output; that separate op is timed by the depth-block harness. The
+batched o input remains unrounded f32 and is converted by the GEMM. The native route writes f1's
+GELU output as f16 and uses f2's per-stream grouped bias. Bias/residual inputs default to zeros;
+the f1 generators include GELU and the output cast. `IN_MODEL_US` keeps older in-situ timings.
 """
 
 # flags i[7] and blocks as emitted (packet_bench --sweep of the production depth program)
@@ -57,7 +56,8 @@ def _inputs(c, seed):
         if c["M"] >= 16:
             x32 = xn  # materialized LayerNorm output, as emitted for batched projections
     else:
-        x32 = x32.half().float()
+        if c["shape"] != "o":
+            x32 = x32.half().float()
         xn = x32
     w = (torch.randn(c["N"], c["K"], device="cuda", generator=g) * 0.05).half()
     return {"x": xn.half(), "w": w, "x32": x32}
@@ -65,6 +65,13 @@ def _inputs(c, seed):
 
 def _reference(c, inp):
     value = inp["x"].double() @ inp["w"].double().T
+    if "bias" in inp:
+        bias = inp["bias"]
+        if bias.ndim == 2 and bias.shape[0] > 1:
+            bias = bias.repeat_interleave(c.get("prefix_rows", 1), dim=0)[:c["M"]]
+        value = value.float() + bias
+    if "residual" in inp:
+        value = value.float() + inp["residual"]
     if c["shape"] == "f1":
         import torch
         value = torch.nn.functional.gelu(value, approximate="none")
@@ -73,10 +80,12 @@ def _reference(c, inp):
     return value
 
 
-def _cur_bind(lib, c, inp, out, input_f16=None):
+def _cur_bind(lib, c, inp, out, input_f16=None, variant=0, nblk_override=None):
     import ctypes
     import torch
     flags, nblk = EMIT[c["shape"]]
+    if nblk_override is not None:
+        nblk = nblk_override
     if input_f16 is None:
         input_f16 = c["M"] >= 16 and c["shape"] != "o"
     if c["M"] >= 16:
@@ -85,19 +94,30 @@ def _cur_bind(lib, c, inp, out, input_f16=None):
             flags |= 16384
     if input_f16:
         flags |= 8192
-    group = c.get("prefix_rows", 1) if c["shape"] == "f2" else 0
+    group = c.get("prefix_rows", 1) if c["shape"] == "f2" and "bias" not in inp else 0
+    if "bias" in inp:
+        flags |= 4
+        if inp["bias"].ndim == 2 and inp["bias"].shape[0] > 1:
+            group = c.get("prefix_rows", 1)
+    if "residual" in inp:
+        flags |= 8
     if group:
         flags |= 512
     lib.dg_make_grouped.restype = ctypes.c_void_p
     lib.dg_make_grouped.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_uint] * 5
     lib.dg_run.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    if variant:
+        lib.dg_run_variant.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
     zeros = torch.zeros(max(c["M"] * c["N"], c["K"]), device="cuda")
     ones = torch.ones(c["K"], device="cuda")
-    h = lib.dg_make_grouped(out.data_ptr(), inp["x" if input_f16 else "x32"].data_ptr(), inp["w"].data_ptr(), zeros.data_ptr(), zeros.data_ptr(),
+    bias = inp.get("bias", zeros)
+    residual = inp.get("residual", zeros)
+    h = lib.dg_make_grouped(out.data_ptr(), inp["x" if input_f16 else "x32"].data_ptr(), inp["w"].data_ptr(), bias.data_ptr(), residual.data_ptr(),
                             ones.data_ptr(), zeros.data_ptr(), flags, c["M"], c["N"], c["K"], group)
 
-    def call(keep=(zeros, ones, inp)):
-        rc = lib.dg_run(h, nblk, torch.cuda.current_stream().cuda_stream)
+    def call(keep=(zeros, ones, inp, bias, residual)):
+        stream = torch.cuda.current_stream().cuda_stream
+        rc = lib.dg_run_variant(h, nblk, stream, variant) if variant else lib.dg_run(h, nblk, stream)
         assert rc == 0, f"dg_run rc {rc}"
     return call
 
@@ -139,6 +159,31 @@ def _generated_bind(c, out, bind):
     return call
 
 
+def _vendor_bind(cfg, c, inp, out):
+    import torch
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    product = out if out.dtype == torch.float32 else torch.empty_like(out, dtype=torch.float32)
+    operand = torch.empty_like(inp["x"]) if c["shape"] == "o" else inp["x"]
+    bias = inp.get("bias")
+    if bias is not None and bias.ndim == 2 and bias.shape[0] > 1:
+        bias = bias.repeat_interleave(c.get("prefix_rows", 1), dim=0)[:c["M"]]
+
+    def call():
+        torch.backends.cuda.preferred_blas_library(cfg["preferred"])
+        if c["shape"] == "o":
+            operand.copy_(inp["x32"])
+        torch.mm(operand, inp["w"].T, out_dtype=torch.float32, out=product)
+        if bias is not None:
+            product.add_(bias)
+        if "residual" in inp:
+            product.add_(inp["residual"])
+        if c["shape"] == "f1":
+            torch.ops.aten.gelu.out(product, approximate="none", out=product)
+        if product is not out:
+            out.copy_(product)
+    return call
+
+
 SPEC = {
     "name": "maya2_depth_gemv",
     "op": "GemvF32Out depth projection",
@@ -152,6 +197,11 @@ SPEC = {
     # the arm standardizes in f32 with its own summation order: an x element can land one f16 ulp off
     "tol": {"rel_l2": 2e-4},
     "generators": {
+        "vendor_blas": {
+            "grid": {"preferred": ["cublaslt", "cublas"]},
+            "build": lambda cfg, c: cfg,
+            "bind": _vendor_bind,
+        },
         "tilelang": {
             "grid": {"bm": [16, 32, 64, 128], "bn": [64, 128], "bk": [32, 64], "threads": [128, 256],
                      "stages": [2, 3]},

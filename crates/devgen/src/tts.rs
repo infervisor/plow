@@ -10,6 +10,653 @@ use plow_asset::speech_tags::{Entry, Langs, SpeechTags, Unknown};
 
 pub const DRIVER: &str = "tts.codec_lm.v1";
 
+pub struct SampleHandoff<'a> {
+    pub component: &'a str,
+    pub object_role: &'a str,
+    pub extent: &'a str,
+    pub live_capacity: u32,
+    pub classes: u32,
+    pub states: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub slots: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub logits_rows: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub logits: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub codes: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+}
+
+pub fn sampler_handoff_program(
+    spec: SampleHandoff<'_>,
+) -> Result<
+    (
+        plow_asset::packet_pipeline::HandoffProgram,
+        plow_asset::packet_pipeline::HandoffProgramProof,
+    ),
+    String,
+> {
+    use plow_asset::packet_pipeline::*;
+    let (_, states) = spec.states;
+    let (_, slots) = spec.slots;
+    let (_, logits_rows) = spec.logits_rows;
+    let (_, logits) = spec.logits;
+    let (_, codes) = spec.codes;
+    let dense = |view: &HandoffView, dtype, width: u32, stride: u64| {
+        view.dtype == dtype
+            && view.rows >= spec.live_capacity
+            && view.row_width == width
+            && view.row_stride == stride
+            && view.bytes >= u64::from(view.rows) * stride
+            && matches!(view.row_map, HandoffRowMap::Contiguous { .. })
+    };
+    let names = [
+        spec.states.0,
+        spec.slots.0,
+        spec.logits_rows.0,
+        spec.logits.0,
+        spec.codes.0,
+    ];
+    if spec.live_capacity == 0
+        || !(2..=4096).contains(&spec.classes)
+        || names.iter().any(|name| name.is_empty())
+        || names
+            .iter()
+            .enumerate()
+            .any(|(i, name)| names[..i].contains(name))
+        || !dense(slots, PipelineDType::U32, 1, 4)
+        || !dense(logits_rows, PipelineDType::U32, 1, 4)
+        || !slots.immutable
+        || !logits_rows.immutable
+        || codes.dtype != PipelineDType::U32
+        || codes.rows < spec.live_capacity
+        || codes.row_width != 1
+        || codes.row_stride != 4
+        || codes.bytes < u64::from(codes.rows) * 4
+        || codes.immutable
+        || match &codes.row_map {
+            HandoffRowMap::Contiguous { .. } => codes.row_map != slots.row_map,
+            HandoffRowMap::Gather { .. } => codes.row_map != states.row_map,
+        }
+        || logits_rows.row_map != slots.row_map
+        || states.dtype != PipelineDType::U8
+        || states.rows < spec.live_capacity
+        || states.row_width != 2296
+        || states.row_stride != 2296
+        || states.bytes < u64::from(states.rows) * 2296
+        || states.immutable
+        || states.lifetime != HandoffLifetime::Persistent
+        || !matches!(&states.row_map, HandoffRowMap::Gather { map, unique: true, .. } if map == spec.slots.0)
+        || logits.dtype != PipelineDType::Bf16
+        || logits.rows == 0
+        || logits.row_width < spec.classes
+        || logits.row_stride < u64::from(logits.row_width) * 2
+        || logits.row_stride % 2 != 0
+        || logits.row_stride / 2 > u64::from(u32::MAX)
+        || u64::from(logits.rows)
+            .checked_mul(logits.row_stride)
+            .is_none_or(|bytes| bytes > logits.bytes)
+        || !matches!(&logits.row_map, HandoffRowMap::Gather { map, .. } if map == spec.logits_rows.0)
+        || states.component != spec.component
+        || codes.component != spec.component
+        || [
+            (states, 8),
+            (slots, 4),
+            (logits_rows, 4),
+            (logits, 2),
+            (codes, 4),
+        ]
+        .iter()
+        .any(|(view, alignment)| view.offset % alignment != 0)
+    {
+        return Err("handoff sampler views do not match control-sample ABI1".into());
+    }
+    let live = HandoffRows::Live {
+        extent: spec.extent.into(),
+    };
+    let arguments = [
+        (
+            spec.states.0,
+            PipelineDType::U8,
+            HandoffAccessMode::ReadWrite,
+            8,
+        ),
+        (spec.slots.0, PipelineDType::U32, HandoffAccessMode::Read, 4),
+        (
+            spec.logits_rows.0,
+            PipelineDType::U32,
+            HandoffAccessMode::Read,
+            4,
+        ),
+        (
+            spec.logits.0,
+            PipelineDType::Bf16,
+            HandoffAccessMode::Read,
+            2,
+        ),
+        (
+            spec.codes.0,
+            PipelineDType::U32,
+            HandoffAccessMode::Write,
+            4,
+        ),
+    ];
+    let accesses: Vec<_> = arguments
+        .iter()
+        .map(|(name, _, mode, _)| HandoffAccess {
+            view: (*name).into(),
+            mode: *mode,
+            rows: live.clone(),
+            mask: None,
+        })
+        .collect();
+    let mut parameters: Vec<_> = arguments
+        .iter()
+        .map(
+            |(name, dtype, access, alignment)| HandoffParameter::Tensor {
+                view: (*name).into(),
+                dtype: *dtype,
+                access: *access,
+                alignment: *alignment,
+            },
+        )
+        .collect();
+    parameters.push(HandoffParameter::Scalar {
+        dtype: HandoffScalarType::U32,
+        value: HandoffExpr::LiveRows {
+            extent: spec.extent.into(),
+        },
+    });
+    for value in [
+        u64::from(states.rows),
+        u64::from(codes.rows),
+        u64::from(logits.rows),
+        logits.row_stride / 2,
+        u64::from(spec.classes),
+        u64::from(spec.classes - 1),
+    ] {
+        parameters.push(HandoffParameter::Scalar {
+            dtype: HandoffScalarType::U32,
+            value: HandoffExpr::Constant { value },
+        });
+    }
+    let entry = HandoffExecutable::Kernel {
+        object_role: spec.object_role.into(),
+        symbol: if matches!(codes.row_map, HandoffRowMap::Gather { .. }) {
+            "handoff_control_sample_scatter"
+        } else {
+            "handoff_control_sample"
+        }
+        .into(),
+        abi_version: 1,
+        capability: "plow_control_sample_abi".into(),
+        capability_value: 1,
+        parameters,
+        grid: [
+            HandoffExpr::LiveRows {
+                extent: spec.extent.into(),
+            },
+            HandoffExpr::Constant { value: 1 },
+            HandoffExpr::Constant { value: 1 },
+        ],
+        block: [256, 1, 1],
+        shared_bytes: 65540,
+    };
+    let proof = HandoffProgramProof {
+        entry: entry.clone(),
+        accesses: accesses.clone(),
+        copies: vec![],
+        private_transients_banked: true,
+        persistent_stop_safe: false,
+    };
+    Ok((HandoffProgram { entry, accesses }, proof))
+}
+
+pub struct CodesHandoff<'a> {
+    pub object_role: &'a str,
+    pub extent: &'a str,
+    pub live_capacity: u32,
+    pub capacity: u32,
+    pub source: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub slots: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub target: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+}
+
+pub fn codes_handoff_program(
+    spec: CodesHandoff<'_>,
+) -> Result<
+    (
+        plow_asset::packet_pipeline::HandoffProgram,
+        plow_asset::packet_pipeline::HandoffProgramProof,
+    ),
+    String,
+> {
+    use plow_asset::packet_pipeline::*;
+    let (_, source) = spec.source;
+    let (_, slots) = spec.slots;
+    let (_, target) = spec.target;
+    let books = source.row_width;
+    let elements = spec
+        .capacity
+        .checked_mul(books)
+        .ok_or("handoff code grid overflow")?;
+    if spec.live_capacity == 0
+        || spec.live_capacity > spec.capacity
+        || books == 0
+        || source.rows == 0
+        || source.dtype != PipelineDType::U32
+        || source.row_stride != u64::from(books) * 4
+        || u64::from(source.rows)
+            .checked_mul(source.row_stride)
+            .is_none_or(|bytes| bytes > source.bytes)
+        || !matches!(&source.row_map, HandoffRowMap::Gather { map, .. } if map == spec.slots.0)
+        || !dense_handoff_map(slots, spec.live_capacity)
+        || target.dtype != PipelineDType::U32
+        || target.row_width != books
+        || target.rows < spec.capacity
+        || target.row_stride != source.row_stride
+        || u64::from(target.rows)
+            .checked_mul(target.row_stride)
+            .is_none_or(|bytes| bytes > target.bytes)
+        || target.immutable
+        || target.row_map != slots.row_map
+        || [source, slots, target]
+            .iter()
+            .any(|view| view.offset % 4 != 0)
+        || spec.source.0 == spec.slots.0
+        || [spec.source.0, spec.slots.0].contains(&spec.target.0)
+    {
+        return Err("handoff code views do not match control-sample ABI1".into());
+    }
+    let live = HandoffRows::Live {
+        extent: spec.extent.into(),
+    };
+    let accesses = vec![
+        HandoffAccess {
+            view: spec.source.0.into(),
+            mode: HandoffAccessMode::Read,
+            rows: live.clone(),
+            mask: None,
+        },
+        HandoffAccess {
+            view: spec.slots.0.into(),
+            mode: HandoffAccessMode::Read,
+            rows: live.clone(),
+            mask: None,
+        },
+        HandoffAccess {
+            view: spec.target.0.into(),
+            mode: HandoffAccessMode::Write,
+            rows: HandoffRows::Fixed {
+                rows: spec.capacity,
+            },
+            mask: None,
+        },
+    ];
+    let (program, mut proof) = control_row_handoff(
+        spec.object_role,
+        spec.extent,
+        "handoff_pack_codes",
+        accesses,
+        [
+            (spec.source.0, PipelineDType::U32, 4),
+            (spec.slots.0, PipelineDType::U32, 4),
+            (spec.target.0, PipelineDType::U32, 4),
+        ],
+        [source.rows, spec.capacity, books],
+        elements.div_ceil(256),
+    );
+    proof.copies.push(HandoffCopyProof {
+        source: spec.source.0.into(),
+        destination: spec.target.0.into(),
+        rows: live,
+        mask: None,
+    });
+    Ok((program, proof))
+}
+
+pub struct LengthsHandoff<'a> {
+    pub object_role: &'a str,
+    pub extent: &'a str,
+    pub live_capacity: u32,
+    pub capacity: u32,
+    pub scale: u32,
+    pub states: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub slots: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub lengths: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+}
+
+pub fn lengths_handoff_program(
+    spec: LengthsHandoff<'_>,
+) -> Result<
+    (
+        plow_asset::packet_pipeline::HandoffProgram,
+        plow_asset::packet_pipeline::HandoffProgramProof,
+    ),
+    String,
+> {
+    use plow_asset::packet_pipeline::*;
+    let (_, states) = spec.states;
+    let (_, slots) = spec.slots;
+    let (_, lengths) = spec.lengths;
+    if spec.live_capacity == 0
+        || spec.live_capacity > spec.capacity
+        || spec.scale == 0
+        || states.dtype != PipelineDType::U8
+        || states.rows == 0
+        || states.row_width != 2296
+        || states.row_stride != 2296
+        || states.bytes < u64::from(states.rows) * 2296
+        || states.offset % 8 != 0
+        || states.lifetime != HandoffLifetime::Persistent
+        || !matches!(&states.row_map, HandoffRowMap::Gather { map, .. } if map == spec.slots.0)
+        || !dense_handoff_map(slots, spec.live_capacity)
+        || lengths.dtype != PipelineDType::U32
+        || lengths.row_width != 1
+        || lengths.rows < spec.capacity
+        || lengths.row_stride != 4
+        || lengths.bytes < u64::from(lengths.rows) * 4
+        || lengths.offset % 4 != 0
+        || lengths.immutable
+        || lengths.row_map != slots.row_map
+        || spec.states.0 == spec.slots.0
+        || [spec.states.0, spec.slots.0].contains(&spec.lengths.0)
+    {
+        return Err("handoff length views do not match control-sample ABI1".into());
+    }
+    let live = HandoffRows::Live {
+        extent: spec.extent.into(),
+    };
+    let accesses = vec![
+        HandoffAccess {
+            view: spec.states.0.into(),
+            mode: HandoffAccessMode::Read,
+            rows: live.clone(),
+            mask: None,
+        },
+        HandoffAccess {
+            view: spec.slots.0.into(),
+            mode: HandoffAccessMode::Read,
+            rows: live,
+            mask: None,
+        },
+        HandoffAccess {
+            view: spec.lengths.0.into(),
+            mode: HandoffAccessMode::Write,
+            rows: HandoffRows::Fixed {
+                rows: spec.capacity,
+            },
+            mask: None,
+        },
+    ];
+    Ok(control_row_handoff(
+        spec.object_role,
+        spec.extent,
+        "handoff_codec_lengths",
+        accesses,
+        [
+            (spec.states.0, PipelineDType::U8, 8),
+            (spec.slots.0, PipelineDType::U32, 4),
+            (spec.lengths.0, PipelineDType::U32, 4),
+        ],
+        [states.rows, spec.capacity, spec.scale],
+        spec.capacity.div_ceil(256),
+    ))
+}
+
+fn dense_handoff_map(view: &plow_asset::packet_pipeline::HandoffView, rows: u32) -> bool {
+    use plow_asset::packet_pipeline::*;
+    view.dtype == PipelineDType::U32
+        && view.row_width == 1
+        && view.row_stride == 4
+        && view.rows >= rows
+        && view.bytes >= u64::from(view.rows) * 4
+        && view.offset % 4 == 0
+        && view.immutable
+        && matches!(view.row_map, HandoffRowMap::Contiguous { .. })
+}
+
+fn control_row_handoff(
+    object_role: &str,
+    extent: &str,
+    symbol: &str,
+    accesses: Vec<plow_asset::packet_pipeline::HandoffAccess>,
+    pointers: [(&str, plow_asset::packet_pipeline::PipelineDType, u32); 3],
+    scalars: [u32; 3],
+    grid: u32,
+) -> (
+    plow_asset::packet_pipeline::HandoffProgram,
+    plow_asset::packet_pipeline::HandoffProgramProof,
+) {
+    use plow_asset::packet_pipeline::*;
+    let mut parameters: Vec<_> = pointers
+        .iter()
+        .enumerate()
+        .map(|(i, (view, dtype, alignment))| HandoffParameter::Tensor {
+            view: (*view).into(),
+            dtype: *dtype,
+            access: if i == 2 {
+                HandoffAccessMode::Write
+            } else {
+                HandoffAccessMode::Read
+            },
+            alignment: *alignment,
+        })
+        .collect();
+    parameters.push(HandoffParameter::Scalar {
+        dtype: HandoffScalarType::U32,
+        value: HandoffExpr::LiveRows {
+            extent: extent.into(),
+        },
+    });
+    parameters.extend(scalars.map(|value| HandoffParameter::Scalar {
+        dtype: HandoffScalarType::U32,
+        value: HandoffExpr::Constant {
+            value: u64::from(value),
+        },
+    }));
+    let entry = HandoffExecutable::Kernel {
+        object_role: object_role.into(),
+        symbol: symbol.into(),
+        abi_version: 1,
+        capability: "plow_control_sample_abi".into(),
+        capability_value: 1,
+        parameters,
+        grid: [
+            HandoffExpr::Constant {
+                value: u64::from(grid),
+            },
+            HandoffExpr::Constant { value: 1 },
+            HandoffExpr::Constant { value: 1 },
+        ],
+        block: [256, 1, 1],
+        shared_bytes: 0,
+    };
+    let proof = HandoffProgramProof {
+        entry: entry.clone(),
+        accesses: accesses.clone(),
+        copies: vec![],
+        private_transients_banked: true,
+        persistent_stop_safe: true,
+    };
+    (HandoffProgram { entry, accesses }, proof)
+}
+
+pub struct Pcm16Handoff<'a> {
+    pub producer: plow_asset::packet_pipeline::HandoffProgramRef,
+    pub object_role: &'a str,
+    pub extent: &'a str,
+    pub live_capacity: u32,
+    pub states: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub slots: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub pcm: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+    pub output: (&'a str, &'a plow_asset::packet_pipeline::HandoffView),
+}
+
+pub fn pcm16_handoff_program(
+    spec: Pcm16Handoff<'_>,
+) -> Result<
+    (
+        plow_asset::packet_pipeline::HandoffProgram,
+        plow_asset::packet_pipeline::HandoffProgramProof,
+        plow_asset::packet_pipeline::HandoffReadback,
+    ),
+    String,
+> {
+    use plow_asset::packet_pipeline::*;
+    let (_, states) = spec.states;
+    let (_, slots) = spec.slots;
+    let (_, pcm) = spec.pcm;
+    let (_, output) = spec.output;
+    let capacity = states.rows;
+    let samples = pcm.row_width;
+    let stride = 8u64
+        .checked_add(u64::from(samples) * 2)
+        .and_then(|n| n.checked_add(3))
+        .map(|n| n & !3)
+        .ok_or("handoff PCM stride overflow")?;
+    if spec.live_capacity == 0
+        || spec.live_capacity > capacity
+        || samples == 0
+        || stride > u64::from(u32::MAX)
+    {
+        return Err("handoff PCM empty/overflow geometry".into());
+    }
+    let dense = |view: &HandoffView, dtype, width: u32, pitch: u64| {
+        view.dtype == dtype
+            && view.rows >= spec.live_capacity
+            && view.row_width == width
+            && view.row_stride == pitch
+            && view.bytes >= u64::from(view.rows) * pitch
+            && matches!(view.row_map, HandoffRowMap::Contiguous { .. })
+    };
+    if states.dtype != PipelineDType::U8
+        || states.rows < spec.live_capacity
+        || states.row_width != 2296
+        || states.row_stride != 2296
+        || states.bytes < u64::from(states.rows) * 2296
+        || !matches!(&states.row_map, HandoffRowMap::Gather {map,..} if map == spec.slots.0)
+        || states.lifetime != HandoffLifetime::Persistent
+        || states.offset % 8 != 0
+        || !dense(slots, PipelineDType::U32, 1, 4)
+        || !slots.immutable
+        || !dense(pcm, PipelineDType::F32, samples, u64::from(samples) * 4)
+        || !dense(output, PipelineDType::U8, stride as u32, stride)
+        || slots.row_map != pcm.row_map
+        || pcm.row_map != output.row_map
+        || output.component != spec.producer.component
+        || [(slots, 4), (pcm, 4), (output, 4)]
+            .iter()
+            .any(|(v, a)| v.offset % a != 0)
+    {
+        return Err("handoff PCM views do not match control-sample ABI1".into());
+    }
+    let live = HandoffRows::Live {
+        extent: spec.extent.into(),
+    };
+    let accesses = vec![
+        HandoffAccess {
+            view: spec.states.0.into(),
+            mode: HandoffAccessMode::Read,
+            rows: live.clone(),
+            mask: None,
+        },
+        HandoffAccess {
+            view: spec.slots.0.into(),
+            mode: HandoffAccessMode::Read,
+            rows: live.clone(),
+            mask: None,
+        },
+        HandoffAccess {
+            view: spec.pcm.0.into(),
+            mode: HandoffAccessMode::Read,
+            rows: live.clone(),
+            mask: None,
+        },
+        HandoffAccess {
+            view: spec.output.0.into(),
+            mode: HandoffAccessMode::Write,
+            rows: live,
+            mask: None,
+        },
+    ];
+    let ptr = |name: &str, dtype, access, alignment| HandoffParameter::Tensor {
+        view: name.into(),
+        dtype,
+        access,
+        alignment,
+    };
+    let scalar = |value| HandoffParameter::Scalar {
+        dtype: HandoffScalarType::U32,
+        value,
+    };
+    let constant = |value| HandoffExpr::Constant { value };
+    let entry = HandoffExecutable::Kernel {
+        object_role: spec.object_role.into(),
+        symbol: "handoff_pack_pcm16".into(),
+        abi_version: 1,
+        capability: "plow_control_sample_abi".into(),
+        capability_value: 1,
+        parameters: vec![
+            ptr(spec.states.0, PipelineDType::U8, HandoffAccessMode::Read, 8),
+            ptr(spec.slots.0, PipelineDType::U32, HandoffAccessMode::Read, 4),
+            ptr(spec.pcm.0, PipelineDType::F32, HandoffAccessMode::Read, 4),
+            ptr(
+                spec.output.0,
+                PipelineDType::U8,
+                HandoffAccessMode::Write,
+                4,
+            ),
+            scalar(HandoffExpr::LiveRows {
+                extent: spec.extent.into(),
+            }),
+            scalar(constant(u64::from(capacity))),
+            scalar(constant(u64::from(samples))),
+            scalar(constant(stride)),
+        ],
+        grid: [
+            HandoffExpr::LiveRows {
+                extent: spec.extent.into(),
+            },
+            constant(1),
+            constant(1),
+        ],
+        block: [256, 1, 1],
+        shared_bytes: 0,
+    };
+    let proof = HandoffProgramProof {
+        entry: entry.clone(),
+        accesses: accesses.clone(),
+        copies: vec![],
+        private_transients_banked: true,
+        persistent_stop_safe: true,
+    };
+    let readback = HandoffReadback {
+        producer: spec.producer,
+        view: spec.output.0.into(),
+        extent: spec.extent.into(),
+        row_stride: stride,
+        fields: vec![
+            HandoffReadbackField {
+                name: "stop".into(),
+                offset: 0,
+                dtype: PipelineDType::U32,
+                elements: 1,
+            },
+            HandoffReadbackField {
+                name: "cb0".into(),
+                offset: 4,
+                dtype: PipelineDType::U32,
+                elements: 1,
+            },
+            HandoffReadbackField {
+                name: "pcm".into(),
+                offset: 8,
+                dtype: PipelineDType::I16,
+                elements: samples,
+            },
+        ],
+        sample_lengths: None,
+    };
+    Ok((HandoffProgram { entry, accesses }, proof, readback))
+}
+
 /// One speech family's contract. Token ids are the checkpoint tokenizer's.
 pub struct SpeechProfile {
     pub tags: Option<fn(bool) -> SpeechTags>,
@@ -1075,6 +1722,869 @@ mod speech_tests {
             Some("Speak at a {value} rate.")
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sampler_and_pcm_handoff_prove_shared_state_ordering() {
+        use crate::pipeline::handoff::SharedLayout;
+        use plow_asset::packet_pipeline::*;
+        use std::collections::BTreeMap;
+        let mut layout = SharedLayout::default();
+        let live = 200;
+        let slots = layout
+            .allocate(
+                "slots",
+                "control",
+                "slots",
+                PipelineDType::U32,
+                live,
+                1,
+                "packed",
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+        let logits_rows = layout
+            .allocate(
+                "logits_rows",
+                "control",
+                "logits_rows",
+                PipelineDType::U32,
+                live,
+                1,
+                "packed",
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+        layout
+            .allocate(
+                "states",
+                "control",
+                "states",
+                PipelineDType::U8,
+                353,
+                2296,
+                "physical",
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        let states = layout.gather("states", "slots", "physical", true).unwrap();
+        layout
+            .allocate(
+                "logits",
+                "control",
+                "logits",
+                PipelineDType::Bf16,
+                384,
+                4096,
+                "backbone",
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let logits = layout
+            .gather("logits", "logits_rows", "backbone", false)
+            .unwrap();
+        let codes = layout
+            .allocate(
+                "codes",
+                "control",
+                "codes",
+                PipelineDType::U32,
+                320,
+                1,
+                "packed",
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let pcm = layout
+            .allocate(
+                "pcm",
+                "control",
+                "pcm",
+                PipelineDType::F32,
+                320,
+                1920,
+                "packed",
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let output = layout
+            .allocate(
+                "readback",
+                "control",
+                "readback",
+                PipelineDType::U8,
+                320,
+                3848,
+                "packed",
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let reference = |program: &str| HandoffProgramRef {
+            component: "control".into(),
+            program: program.into(),
+        };
+        let (sample, sample_proof) = sampler_handoff_program(SampleHandoff {
+            component: "control",
+            object_role: "control",
+            extent: "live",
+            live_capacity: live,
+            classes: 2049,
+            states: ("states", &states),
+            slots: ("slots", &slots),
+            logits_rows: ("logits_rows", &logits_rows),
+            logits: ("logits", &logits),
+            codes: ("codes", &codes),
+        })
+        .unwrap();
+        let (pack, pack_proof, readback) = pcm16_handoff_program(Pcm16Handoff {
+            producer: reference("pack"),
+            object_role: "control",
+            extent: "live",
+            live_capacity: live,
+            states: ("states", &states),
+            slots: ("slots", &slots),
+            pcm: ("pcm", &pcm),
+            output: ("readback", &output),
+        })
+        .unwrap();
+        let facts = HandoffProofCatalog {
+            arena: Some(layout.arena()),
+            extents: BTreeMap::from([("live".into(), live)]),
+            views: layout.views().clone(),
+            programs: BTreeMap::from([
+                (reference("sample"), sample_proof),
+                (reference("pack"), pack_proof),
+            ]),
+            readbacks: BTreeMap::from([(reference("pack"), readback.clone())]),
+        };
+        let mut plan = HandoffPlan {
+            components: BTreeMap::from([(
+                "control".into(),
+                HandoffComponent {
+                    packet: "control.pkt".into(),
+                    driver: DRIVER.into(),
+                    objects: BTreeMap::from([("control".into(), "control_sample.cubin".into())]),
+                    programs: BTreeMap::from([("sample".into(), sample), ("pack".into(), pack)]),
+                },
+            )]),
+            arena: layout.arena(),
+            extents: facts.extents.clone(),
+            views: layout.views().clone(),
+            schedule: vec![reference("sample"), reference("pack")],
+            edges: vec![
+                HandoffEdge {
+                    producer: HandoffEndpoint {
+                        program: reference("sample"),
+                        view: "states".into(),
+                    },
+                    consumer: HandoffConsumer::Program {
+                        endpoint: HandoffEndpoint {
+                            program: reference("pack"),
+                            view: "states".into(),
+                        },
+                    },
+                    class: HandoffClass::Alias,
+                    dtype: PipelineDType::U8,
+                    rows: HandoffRows::Live {
+                        extent: "live".into(),
+                    },
+                    order: HandoffOrder::SameStream,
+                    generation_delta: 0,
+                },
+                HandoffEdge {
+                    producer: HandoffEndpoint {
+                        program: reference("pack"),
+                        view: "readback".into(),
+                    },
+                    consumer: HandoffConsumer::Host,
+                    class: HandoffClass::Host,
+                    dtype: PipelineDType::U8,
+                    rows: HandoffRows::Live {
+                        extent: "live".into(),
+                    },
+                    order: HandoffOrder::SameStream,
+                    generation_delta: 0,
+                },
+            ],
+            bind_writes: ["states", "slots", "logits_rows", "logits", "pcm"]
+                .map(|view| HandoffBindWrite {
+                    name: view.into(),
+                    view: view.into(),
+                    rows: HandoffRows::Live {
+                        extent: "live".into(),
+                    },
+                    order: HandoffOrder::SameStream,
+                    phase: HandoffBindPhase::Tick,
+                })
+                .into(),
+            readback,
+            execution: HandoffExecution::Synchronous,
+        };
+        plan.prove(&facts).unwrap();
+        plan.schedule.swap(0, 1);
+        assert!(plan.prove(&facts).is_err());
+        plan.schedule.swap(0, 1);
+        plan.execution = HandoffExecution::Overlap {
+            feedback: "codes".into(),
+        };
+        assert!(plan.prove(&facts).is_err());
+    }
+
+    #[test]
+    fn code_and_length_handoff_distinguish_live_reads_from_padded_writes() {
+        use crate::pipeline::handoff::SharedLayout;
+        use plow_asset::packet_pipeline::*;
+        for capacity in [1, 32, 64, 128, 200, 224, 300, 320] {
+            let live = capacity / 2 + 1;
+            let mut layout = SharedLayout::default();
+            let slots = layout
+                .allocate(
+                    "slots",
+                    "pack",
+                    "slots",
+                    PipelineDType::U32,
+                    live,
+                    1,
+                    "packed",
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+            layout
+                .allocate(
+                    "codes",
+                    "depth",
+                    "codes",
+                    PipelineDType::U32,
+                    384,
+                    32,
+                    "physical",
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+            let source = layout.gather("codes", "slots", "physical", false).unwrap();
+            let target = layout
+                .allocate(
+                    "codec_codes",
+                    "codec",
+                    "codes",
+                    PipelineDType::U32,
+                    320,
+                    32,
+                    "packed",
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            layout
+                .allocate(
+                    "states",
+                    "sample",
+                    "states",
+                    PipelineDType::U8,
+                    353,
+                    2296,
+                    "physical",
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+            let states = layout.gather("states", "slots", "physical", true).unwrap();
+            let lengths = layout
+                .allocate(
+                    "lengths",
+                    "codec",
+                    "lengths",
+                    PipelineDType::U32,
+                    320,
+                    1,
+                    "packed",
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            let codes = |s: &HandoffView, m: &HandoffView, t: &HandoffView, cap| {
+                codes_handoff_program(CodesHandoff {
+                    object_role: "control",
+                    extent: "live",
+                    live_capacity: live,
+                    capacity: cap,
+                    source: ("codes", s),
+                    slots: ("slots", m),
+                    target: ("codec_codes", t),
+                })
+            };
+            let lens = |s: &HandoffView, m: &HandoffView, l: &HandoffView, scale| {
+                lengths_handoff_program(LengthsHandoff {
+                    object_role: "control",
+                    extent: "live",
+                    live_capacity: live,
+                    capacity,
+                    scale,
+                    states: ("states", s),
+                    slots: ("slots", m),
+                    lengths: ("lengths", l),
+                })
+            };
+            let (program, proof) = codes(&source, &slots, &target, capacity).unwrap();
+            assert_eq!(
+                program.accesses[0].rows,
+                HandoffRows::Live {
+                    extent: "live".into()
+                }
+            );
+            assert_eq!(
+                program.accesses[2].rows,
+                HandoffRows::Fixed { rows: capacity }
+            );
+            assert_eq!(proof.copies.len(), 1);
+            assert_eq!(
+                proof.copies[0].rows,
+                HandoffRows::Live {
+                    extent: "live".into()
+                }
+            );
+            let HandoffExecutable::Kernel {
+                parameters, grid, ..
+            } = &program.entry
+            else {
+                panic!()
+            };
+            assert_eq!(parameters.len(), 7);
+            assert_eq!(
+                grid[0],
+                HandoffExpr::Constant {
+                    value: u64::from((capacity * 32).div_ceil(256))
+                }
+            );
+            for scale in [1, 2, 1920] {
+                let (program, proof) = lens(&states, &slots, &lengths, scale).unwrap();
+                assert_eq!(
+                    program.accesses[0].rows,
+                    HandoffRows::Live {
+                        extent: "live".into()
+                    }
+                );
+                assert_eq!(
+                    program.accesses[2].rows,
+                    HandoffRows::Fixed { rows: capacity }
+                );
+                assert!(proof.copies.is_empty());
+                assert!(proof.persistent_stop_safe);
+            }
+            let mut wrong = slots.clone();
+            wrong.immutable = false;
+            assert!(codes(&source, &wrong, &target, capacity).is_err());
+            assert!(lens(&states, &wrong, &lengths, 1).is_err());
+            let mut wrong = target.clone();
+            wrong.dtype = PipelineDType::F32;
+            assert!(codes(&source, &slots, &wrong, capacity).is_err());
+            let mut wrong = source.clone();
+            wrong.row_map = HandoffRowMap::Contiguous {
+                domain: "physical".into(),
+            };
+            assert!(codes(&wrong, &slots, &target, capacity).is_err());
+            wrong = source.clone();
+            wrong.rows = u32::MAX;
+            wrong.row_width = u32::MAX;
+            wrong.row_stride = u64::from(u32::MAX) * 4;
+            assert!(codes(&wrong, &slots, &target, capacity).is_err());
+            let mut wrong = states.clone();
+            wrong.offset += 4;
+            assert!(lens(&wrong, &slots, &lengths, 1).is_err());
+            let mut wrong = lengths.clone();
+            wrong.rows = capacity - 1;
+            assert!(lens(&states, &slots, &wrong, 1).is_err());
+            assert!(lens(&states, &slots, &lengths, 0).is_err());
+            assert!(codes(&source, &slots, &target, live - 1).is_err());
+        }
+    }
+
+    #[test]
+    fn sampler_handoff_checks_native_maps_and_capacity() {
+        use crate::pipeline::handoff::SharedLayout;
+        use plow_asset::packet_pipeline::*;
+        for live in [1, 32, 64, 128, 200, 224, 300, 320] {
+            let mut layout = SharedLayout::default();
+            let slots = layout
+                .allocate(
+                    "slots",
+                    "sample",
+                    "slots",
+                    PipelineDType::U32,
+                    live,
+                    1,
+                    "packed",
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+            let logits_rows = layout
+                .allocate(
+                    "logits_rows",
+                    "sample",
+                    "logits_rows",
+                    PipelineDType::U32,
+                    live,
+                    1,
+                    "packed",
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+            layout
+                .allocate(
+                    "states",
+                    "sample",
+                    "states",
+                    PipelineDType::U8,
+                    353,
+                    2296,
+                    "physical",
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+            let states = layout.gather("states", "slots", "physical", true).unwrap();
+            layout
+                .allocate(
+                    "logits",
+                    "backbone",
+                    "logits",
+                    PipelineDType::Bf16,
+                    384,
+                    4096,
+                    "backbone",
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            let logits = layout
+                .gather("logits", "logits_rows", "backbone", false)
+                .unwrap();
+            let codes = layout
+                .allocate(
+                    "codes",
+                    "sample",
+                    "codes",
+                    PipelineDType::U32,
+                    320,
+                    1,
+                    "packed",
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            let make = |s: &HandoffView,
+                        m: &HandoffView,
+                        r: &HandoffView,
+                        l: &HandoffView,
+                        c: &HandoffView,
+                        classes,
+                        capacity| {
+                sampler_handoff_program(SampleHandoff {
+                    component: "sample",
+                    object_role: "control",
+                    extent: "live",
+                    live_capacity: capacity,
+                    classes,
+                    states: ("states", s),
+                    slots: ("slots", m),
+                    logits_rows: ("logits_rows", r),
+                    logits: ("logits", l),
+                    codes: ("codes", c),
+                })
+            };
+            let (program, proof) =
+                make(&states, &slots, &logits_rows, &logits, &codes, 4096, live).unwrap();
+            assert_eq!(program.accesses.len(), 5);
+            assert_eq!(program.accesses[0].mode, HandoffAccessMode::ReadWrite);
+            assert!(program.accesses.iter().all(|a| a.rows
+                == HandoffRows::Live {
+                    extent: "live".into()
+                }));
+            assert_eq!(proof.accesses, program.accesses);
+            assert!(proof.private_transients_banked);
+            assert!(!proof.persistent_stop_safe);
+            let HandoffExecutable::Kernel {
+                parameters,
+                block,
+                shared_bytes,
+                symbol,
+                ..
+            } = &program.entry
+            else {
+                panic!("native sampler required")
+            };
+            assert_eq!(symbol, "handoff_control_sample");
+            assert_eq!(*block, [256, 1, 1]);
+            assert_eq!(*shared_bytes, 65540);
+            assert_eq!(parameters.len(), 12);
+            for (parameter, value) in parameters[6..]
+                .iter()
+                .zip([353, 320, 384, 4096, 4096, 4095])
+            {
+                assert_eq!(
+                    *parameter,
+                    HandoffParameter::Scalar {
+                        dtype: HandoffScalarType::U32,
+                        value: HandoffExpr::Constant { value }
+                    }
+                );
+            }
+            let mut scattered = codes.clone();
+            scattered.rows = states.rows;
+            scattered.bytes = u64::from(states.rows) * 4;
+            scattered.row_map = states.row_map.clone();
+            let (scatter, scatter_proof) = make(
+                &states,
+                &slots,
+                &logits_rows,
+                &logits,
+                &scattered,
+                4096,
+                live,
+            )
+            .unwrap();
+            assert!(
+                matches!(&scatter.entry, HandoffExecutable::Kernel {symbol, ..}
+                if symbol == "handoff_control_sample_scatter")
+            );
+            assert_eq!(scatter_proof.accesses, scatter.accesses);
+            scattered.row_map = HandoffRowMap::Gather {
+                map: "logits_rows".into(),
+                domain: "backbone".into(),
+                unique: true,
+            };
+            assert!(make(
+                &states,
+                &slots,
+                &logits_rows,
+                &logits,
+                &scattered,
+                4096,
+                live
+            )
+            .is_err());
+            let mut wrong = states.clone();
+            wrong.row_map = HandoffRowMap::Gather {
+                map: "slots".into(),
+                domain: "physical".into(),
+                unique: false,
+            };
+            assert!(make(&wrong, &slots, &logits_rows, &logits, &codes, 4096, live).is_err());
+            wrong.row_map = HandoffRowMap::Gather {
+                map: "other".into(),
+                domain: "physical".into(),
+                unique: true,
+            };
+            assert!(make(&wrong, &slots, &logits_rows, &logits, &codes, 4096, live).is_err());
+            wrong = states.clone();
+            wrong.offset += 4;
+            assert!(make(&wrong, &slots, &logits_rows, &logits, &codes, 4096, live).is_err());
+            let mut wrong = logits.clone();
+            wrong.bytes -= 1;
+            assert!(make(&states, &slots, &logits_rows, &wrong, &codes, 4096, live).is_err());
+            wrong = logits.clone();
+            wrong.row_stride = u64::MAX - 1;
+            assert!(make(&states, &slots, &logits_rows, &wrong, &codes, 4096, live).is_err());
+            wrong = logits.clone();
+            wrong.dtype = PipelineDType::F32;
+            assert!(make(&states, &slots, &logits_rows, &wrong, &codes, 4096, live).is_err());
+            let mut wrong = slots.clone();
+            wrong.immutable = false;
+            assert!(make(&states, &wrong, &logits_rows, &logits, &codes, 4096, live).is_err());
+            let mut wrong = logits_rows.clone();
+            wrong.row_map = HandoffRowMap::Contiguous {
+                domain: "physical".into(),
+            };
+            assert!(make(&states, &slots, &wrong, &logits, &codes, 4096, live).is_err());
+            let mut wrong = codes.clone();
+            wrong.rows = live - 1;
+            assert!(make(&states, &slots, &logits_rows, &logits, &wrong, 4096, live).is_err());
+            for classes in [0, 1, 4097] {
+                assert!(make(
+                    &states,
+                    &slots,
+                    &logits_rows,
+                    &logits,
+                    &codes,
+                    classes,
+                    live
+                )
+                .is_err());
+            }
+            assert!(make(&states, &slots, &logits_rows, &logits, &codes, 4096, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn pcm_handoff_proves_only_the_lowered_abi_and_layout() {
+        use crate::pipeline::handoff::SharedLayout;
+        use plow_asset::packet_pipeline::*;
+        use std::collections::BTreeMap;
+        for (capacity, samples) in [(1, 1), (200, 1920), (320, 1537)] {
+            let mut layout = SharedLayout::default();
+            layout
+                .allocate(
+                    "states",
+                    "pack",
+                    "states",
+                    PipelineDType::U8,
+                    capacity,
+                    2296,
+                    "physical",
+                    true,
+                    true,
+                    false,
+                )
+                .unwrap();
+            let slots = layout
+                .allocate(
+                    "slots",
+                    "pack",
+                    "slots",
+                    PipelineDType::U32,
+                    capacity,
+                    1,
+                    "packed",
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+            let states = layout.gather("states", "slots", "physical", true).unwrap();
+            let pcm = layout
+                .allocate(
+                    "pcm",
+                    "pack",
+                    "pcm",
+                    PipelineDType::F32,
+                    capacity,
+                    samples,
+                    "packed",
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            let stride = (8 + samples * 2 + 3) & !3;
+            let output = layout
+                .allocate(
+                    "readback",
+                    "pack",
+                    "readback",
+                    PipelineDType::U8,
+                    capacity,
+                    stride,
+                    "packed",
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            let reference = HandoffProgramRef {
+                component: "pack".into(),
+                program: "pcm".into(),
+            };
+            let make = |s, p, o| {
+                pcm16_handoff_program(Pcm16Handoff {
+                    producer: reference.clone(),
+                    object_role: "control",
+                    extent: "live",
+                    live_capacity: capacity,
+                    states: ("states", s),
+                    slots: ("slots", &slots),
+                    pcm: ("pcm", p),
+                    output: ("readback", o),
+                })
+            };
+            let (program, proof, readback) = make(&states, &pcm, &output).unwrap();
+            assert_eq!(
+                program.accesses[0].rows,
+                HandoffRows::Live {
+                    extent: "live".into()
+                }
+            );
+            let mut unmapped = states.clone();
+            unmapped.row_map = HandoffRowMap::Contiguous {
+                domain: "physical".into(),
+            };
+            assert!(make(&unmapped, &pcm, &output).is_err());
+            let mut wrong_map = states.clone();
+            wrong_map.row_map = HandoffRowMap::Gather {
+                map: "other".into(),
+                domain: "physical".into(),
+                unique: true,
+            };
+            assert!(make(&wrong_map, &pcm, &output).is_err());
+            let mut larger_pcm = pcm.clone();
+            larger_pcm.rows *= 2;
+            larger_pcm.bytes *= 2;
+            larger_pcm.component = "codec".into();
+            assert!(make(&states, &larger_pcm, &output).is_ok());
+            let catalog = HandoffProofCatalog {
+                arena: Some(layout.arena()),
+                extents: BTreeMap::from([("live".into(), capacity)]),
+                views: layout.views().clone(),
+                programs: BTreeMap::from([(reference.clone(), proof)]),
+                readbacks: BTreeMap::from([(reference.clone(), readback.clone())]),
+            };
+            let mut plan = HandoffPlan {
+                components: BTreeMap::from([(
+                    "pack".into(),
+                    HandoffComponent {
+                        packet: "model.pkt".into(),
+                        driver: DRIVER.into(),
+                        objects: BTreeMap::from([("control".into(), "control.cubin".into())]),
+                        programs: BTreeMap::from([("pcm".into(), program)]),
+                    },
+                )]),
+                arena: layout.arena(),
+                extents: catalog.extents.clone(),
+                views: layout.views().clone(),
+                schedule: vec![reference.clone()],
+                edges: vec![HandoffEdge {
+                    producer: HandoffEndpoint {
+                        program: reference.clone(),
+                        view: "readback".into(),
+                    },
+                    consumer: HandoffConsumer::Host,
+                    class: HandoffClass::Host,
+                    dtype: PipelineDType::U8,
+                    rows: HandoffRows::Live {
+                        extent: "live".into(),
+                    },
+                    order: HandoffOrder::SameStream,
+                    generation_delta: 0,
+                }],
+                bind_writes: ["slots", "pcm"]
+                    .map(|view| HandoffBindWrite {
+                        name: view.into(),
+                        view: view.into(),
+                        rows: HandoffRows::Live {
+                            extent: "live".into(),
+                        },
+                        order: HandoffOrder::SameStream,
+                        phase: HandoffBindPhase::Tick,
+                    })
+                    .into(),
+                readback,
+                execution: HandoffExecution::Synchronous,
+            };
+            plan.prove(&catalog).unwrap();
+            let mut builder = Builder::new(1);
+            builder.emit(packet::dev::DevOp::Nop, vec![0], &[], |_| {});
+            let model = Model {
+                n_cu: 1,
+                target: 0,
+                tensors: vec![],
+                progs: vec![builder.finish()],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
+            };
+            let legacy = serde_json::to_vec(&PacketPipelines {
+                version: VERSION,
+                pipelines: vec![PacketPipeline {
+                    name: "fixture".into(),
+                    driver: "test.v1".into(),
+                    programs: BTreeMap::from([("tick".into(), 0)]),
+                    tensors: BTreeMap::new(),
+                    parameters: BTreeMap::new(),
+                    strings: BTreeMap::new(),
+                }],
+            })
+            .unwrap();
+            let section = || SectionData {
+                kind: packet::devbuild::SECT_METADATA,
+                name: SECTION.into(),
+                data: legacy.clone(),
+            };
+            let emitted = crate::pipeline::handoff::section_with_plan(
+                &model,
+                section(),
+                "tick",
+                plan.clone(),
+                &catalog,
+            )
+            .unwrap();
+            let parsed = PipelineMetadata::parse(&emitted.data).unwrap();
+            assert_eq!(parsed.handoff_plans().unwrap()["tick"], plan);
+            assert_eq!(
+                PipelineMetadata::parse(&legacy).unwrap().handoff_plans(),
+                None
+            );
+            assert!(crate::pipeline::handoff::section_with_plan(
+                &model,
+                section(),
+                "bad plan name",
+                plan.clone(),
+                &catalog
+            )
+            .is_err());
+            plan.views.get_mut("pcm").unwrap().offset = output.offset;
+            assert!(plan.prove(&catalog).is_err());
+            assert!(crate::pipeline::handoff::section_with_plan(
+                &model,
+                section(),
+                "tick",
+                plan,
+                &catalog
+            )
+            .is_err());
+            let mut wrong = pcm.clone();
+            wrong.row_map = HandoffRowMap::Contiguous {
+                domain: "physical".into(),
+            };
+            assert!(make(&states, &wrong, &output).is_err());
+            let mut wrong = states.clone();
+            wrong.row_width -= 8;
+            assert!(make(&wrong, &pcm, &output).is_err());
+            let mut wrong = output.clone();
+            wrong.offset += 2;
+            assert!(make(&states, &pcm, &wrong).is_err());
+            assert_eq!(layout.views().len(), 4);
+            assert!(layout
+                .allocate(
+                    "pcm",
+                    "pack",
+                    "pcm",
+                    PipelineDType::F32,
+                    capacity,
+                    samples,
+                    "packed",
+                    false,
+                    false,
+                    false
+                )
+                .is_err());
+        }
     }
 
     #[test]
