@@ -49,8 +49,8 @@ pub const CAPACITIES: &[(u32, u32)] = &[
 ];
 
 /// (batch, new frames) of the stateful stream steps `step.b{B}.f{N}`: each decodes only its new
-/// frames, carrying every causal context in per-slot state (`state.codec.*`, [`STREAM_SLOTS`]
-/// streams, shared by all step programs).
+/// frames, carrying every causal context in per-slot state (`state.codec.*`, at least
+/// [`STREAM_SLOTS`] streams, shared by all step programs).
 /// Batched launches pad every stream to the launch's largest step, so short steps get their own
 /// widths: a 16-stream launch of 2-frame steps on `(16, 17)` costs ~6x `(16, 1)` (H100, 12 Hz codec).
 pub const STEP_CAPACITIES: &[(u32, u32)] = &[
@@ -95,6 +95,7 @@ struct Cfg {
     breeze: bool,
     mimi: bool,
     ring_kv: bool,
+    stream_slots: u32,
     /// Mimi: stride of the causal ConvTranspose (k = 2 * stride) before the transformer; 0 = none.
     pre_up: u32,
     /// Residual-unit first conv kernel and the output conv kernel (Fish / Breeze: 7, 7).
@@ -159,6 +160,7 @@ impl Cfg {
             breeze,
             mimi,
             ring_kv: false,
+            stream_slots: STREAM_SLOTS,
             pre_up,
             res_kernel: if mimi { u(d, "residual_kernel")? } else { 7 },
             out_kernel: if mimi { u(d, "out_kernel")? } else { 7 },
@@ -224,6 +226,49 @@ impl Cfg {
         self.pre_up.max(1)
     }
 
+    fn step_capacities(
+        &mut self,
+        defaults: &[(u32, u32)],
+        extra: Option<&str>,
+        max_rows: Option<u32>,
+    ) -> Result<Vec<(u32, u32)>, String> {
+        let Some(extra) = extra else {
+            return Ok(defaults.to_vec());
+        };
+        if !self.mimi || extra.trim().is_empty() {
+            return Err("extra codec steps require Mimi and batch:frames pairs".into());
+        }
+        let mut steps = defaults.to_vec();
+        for pair in extra.split(',') {
+            let (batch, frames) = pair
+                .trim()
+                .split_once(':')
+                .ok_or_else(|| format!("invalid codec step {pair}"))?;
+            let batch: u32 = batch
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid codec step {pair}"))?;
+            let frames: u32 = frames
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid codec step {pair}"))?;
+            let rows = batch
+                .checked_mul(frames)
+                .filter(|&n| n > 0)
+                .ok_or_else(|| format!("codec step {pair} overflows or is empty"))?;
+            if rows.checked_mul(self.frame_samples).is_none()
+                || max_rows.is_some_and(|max| rows > max)
+            {
+                return Err(format!("codec step {pair} exceeds the row/output capacity"));
+            }
+            steps.push((batch, frames));
+        }
+        steps.sort_unstable_by_key(|&(b, f)| (f, b));
+        steps.dedup();
+        self.stream_slots = STREAM_SLOTS.max(steps.iter().map(|&(b, _)| b).max().unwrap_or(1));
+        Ok(steps)
+    }
+
     /// Rows per frame after each resolution change: frames, the pre-transformer upsample (Mimi),
     /// each upsample, each decoder block.
     fn scales(&self) -> Vec<u32> {
@@ -248,15 +293,69 @@ pub fn lower_fish_dac(
     split_bf16: bool,
     max_rows: Option<u32>,
 ) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
-    let (decode, steps) = capped(max_rows)?;
-    let mut cfg = Cfg::parse(
-        &serde_json::from_slice(
-            &std::fs::read(dir.join("config.json"))
-                .map_err(|e| format!("{}: {e}", dir.display()))?,
-        )
-        .map_err(|e| format!("fish codec config: {e}"))?,
+    let (model, section, _) = lower_fish_dac_inner(dir, n_cu, target, split_bf16, max_rows, None)?;
+    Ok((model, section))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lower_fish_dac_handoff(
+    dir: &std::path::Path,
+    n_cu: u32,
+    target: u32,
+    split_bf16: bool,
+    max_rows: Option<u32>,
+    layout: &mut crate::pipeline::handoff::SharedLayout,
+    component: &str,
+    live_capacity: u32,
+) -> Result<
+    (
+        packet::devbuild::Model,
+        packet::devbuild::SectionData,
+        crate::pipeline::handoff::LoweredComponent,
+    ),
+    String,
+> {
+    let (model, section, facts) = lower_fish_dac_inner(
+        dir,
+        n_cu,
+        target,
+        split_bf16,
+        max_rows,
+        Some((layout, component, live_capacity)),
     )?;
-    cfg.ring_kv = crate::emit_config::active().codec_ring_kv;
+    Ok((
+        model,
+        section,
+        facts.ok_or("missing codec handoff lowering")?,
+    ))
+}
+
+type HandoffRequest<'a> = (&'a mut crate::pipeline::handoff::SharedLayout, &'a str, u32);
+
+fn lower_fish_dac_inner(
+    dir: &std::path::Path,
+    n_cu: u32,
+    target: u32,
+    split_bf16: bool,
+    max_rows: Option<u32>,
+    handoff: Option<HandoffRequest<'_>>,
+) -> Result<
+    (
+        packet::devbuild::Model,
+        packet::devbuild::SectionData,
+        Option<crate::pipeline::handoff::LoweredComponent>,
+    ),
+    String,
+> {
+    let (decode, steps) = capped(max_rows)?;
+    let mut cfg = read_cfg(dir)?;
+    let steps = cfg.step_capacities(
+        &steps,
+        crate::emit_config::active()
+            .codec_step_capacities
+            .as_deref(),
+        max_rows,
+    )?;
     let splits = split_bf16.then(|| std::cell::RefCell::new(BTreeMap::new()));
     let Lowered {
         mut prefix,
@@ -268,6 +367,304 @@ pub fn lower_fish_dac(
         max_rows,
     } = lower_programs(&cfg, n_cu, target, splits.as_ref(), &decode, &steps)?;
     let scales = cfg.scales();
+    read_checkpoint_weights(&mut prefix, &cfg, &positions, splits.as_ref(), dir)?;
+    let handoff = handoff
+        .map(|(layout, component, capacity)| {
+            step_handoff(
+                &prefix, &cfg, &roles, &steps, max_rows, layout, component, capacity,
+            )
+        })
+        .transpose()?;
+    let section = section(
+        &prefix, &cfg, roles, bmax, max_rows, &lengths, &scales, seed, &steps,
+    )?;
+    Ok((prefix.model, section, handoff))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_handoff(
+    prefix: &PacketPrefix,
+    cfg: &Cfg,
+    roles: &BTreeMap<String, u32>,
+    steps: &[(u32, u32)],
+    max_rows: u32,
+    layout: &mut crate::pipeline::handoff::SharedLayout,
+    component: &str,
+    live_capacity: u32,
+) -> Result<crate::pipeline::handoff::LoweredComponent, String> {
+    use plow_asset::packet_pipeline::*;
+    if !cfg.mimi || live_capacity == 0 {
+        return Err("handoff codec currently requires the typed Mimi one-frame lowering".into());
+    }
+    let batch = steps
+        .iter()
+        .filter(|&&(b, f)| f == 1 && b >= live_capacity)
+        .map(|&(b, _)| b)
+        .min()
+        .ok_or("handoff codec has no one-frame capacity")?;
+    let role = format!("step.b{batch}.f1");
+    let program = *roles.get(&role).ok_or("handoff codec step is missing")?;
+    let reference = HandoffProgramRef {
+        component: component.into(),
+        program: role.clone(),
+    };
+    let mut accesses = Vec::new();
+    let mut add = |role: &str, handle: u32, dtype, rows, width, mode| -> Result<(), String> {
+        let name = format!("{component}.{role}");
+        let tensor = &prefix.model.tensors[handle as usize];
+        layout.packet_tensor(
+            &name,
+            component,
+            &prefix.model,
+            handle,
+            dtype,
+            rows,
+            width,
+            "packed",
+            false,
+            tensor.init.is_some(),
+        )?;
+        accesses.push(HandoffAccess {
+            view: name,
+            mode,
+            rows: HandoffRows::Fixed { rows: batch },
+            mask: None,
+        });
+        Ok(())
+    };
+    add(
+        "codes",
+        prefix.input,
+        PipelineDType::U32,
+        max_rows,
+        cfg.sizes.len() as u32,
+        HandoffAccessMode::Read,
+    )?;
+    add(
+        "pcm",
+        prefix.output,
+        PipelineDType::F32,
+        max_rows,
+        cfg.frame_samples,
+        HandoffAccessMode::Write,
+    )?;
+    let scales = cfg.scales().len();
+    for (role, name, elements) in step_inputs(scales, steps, cfg.xf_rows_per_frame()) {
+        let handle = prefix
+            .model
+            .tensors
+            .iter()
+            .position(|t| t.name == name)
+            .ok_or("handoff codec stream input is missing")? as u32;
+        let width = if role == "stream.rope_pos" {
+            cfg.xf_rows_per_frame()
+        } else {
+            1
+        };
+        add(
+            &role,
+            handle,
+            PipelineDType::U32,
+            elements / width,
+            width,
+            HandoffAccessMode::Read,
+        )?;
+    }
+    let entry = HandoffExecutable::Packet {
+        section: "packet".into(),
+        program,
+    };
+    let declaration = HandoffComponent {
+        packet: "codec.pkt".into(),
+        driver: "codec.v1".into(),
+        objects: BTreeMap::new(),
+        programs: BTreeMap::from([(
+            role,
+            HandoffProgram {
+                entry: entry.clone(),
+                accesses: accesses.clone(),
+            },
+        )]),
+    };
+    let facts = HandoffProofCatalog {
+        views: layout
+            .views()
+            .iter()
+            .filter(|(_, v)| v.component == component)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        extents: BTreeMap::from([("live".into(), live_capacity)]),
+        programs: BTreeMap::from([(
+            reference,
+            HandoffProgramProof {
+                entry,
+                accesses,
+                copies: vec![],
+                private_transients_banked: false,
+                persistent_stop_safe: false,
+            },
+        )]),
+        ..Default::default()
+    };
+    Ok(crate::pipeline::handoff::LoweredComponent { declaration, facts })
+}
+
+fn read_cfg(dir: &std::path::Path) -> Result<Cfg, String> {
+    let mut cfg = Cfg::parse(
+        &serde_json::from_slice(
+            &std::fs::read(dir.join("config.json"))
+                .map_err(|e| format!("{}: {e}", dir.display()))?,
+        )
+        .map_err(|e| format!("fish codec config: {e}"))?,
+    )?;
+    cfg.ring_kv = crate::emit_config::active().codec_ring_kv;
+    Ok(cfg)
+}
+
+/// A stateful Mimi transformer layer, with explicit activation and stream-state inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_mimi_layer_block(
+    dir: &std::path::Path,
+    n_cu: u32,
+    target: u32,
+    split_bf16: bool,
+    max_rows: Option<u32>,
+    layer: u32,
+    batch: u32,
+    frames: u32,
+) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
+    let mut cfg = read_cfg(dir)?;
+    cfg.stream_slots = cfg.stream_slots.max(batch);
+    if max_rows.is_some_and(|max| batch.checked_mul(frames).is_none_or(|n| n > max)) {
+        return Err("Mimi block exceeds the requested row capacity".into());
+    }
+    cfg.step_capacities(
+        &[(batch, frames)],
+        crate::emit_config::active()
+            .codec_step_capacities
+            .as_deref(),
+        max_rows,
+    )?;
+    let splits = split_bf16.then(|| std::cell::RefCell::new(BTreeMap::new()));
+    let mut prefix = mimi_layer_block(&cfg, n_cu, target, splits.as_ref(), layer, batch, frames)?;
+    read_checkpoint_weights(&mut prefix, &cfg, &[], splits.as_ref(), dir)?;
+    let section = mimi_block_section(&prefix, &cfg, layer, batch, frames)?;
+    Ok((prefix.model, section))
+}
+
+fn mimi_layer_block(
+    cfg: &Cfg,
+    n_cu: u32,
+    target: u32,
+    splits: Splits<'_>,
+    layer: u32,
+    batch: u32,
+    frames: u32,
+) -> Result<PacketPrefix, String> {
+    if !cfg.mimi
+        || n_cu == 0
+        || layer >= cfg.layers
+        || batch == 0
+        || frames == 0
+        || batch
+            .checked_mul(frames)
+            .and_then(|n| n.checked_mul(cfg.frame_samples))
+            .is_none()
+    {
+        return Err("invalid Mimi block geometry".into());
+    }
+    let mut prefix = lower_programs(cfg, n_cu, target, splits, &[], &[(batch, frames)])?.prefix;
+    let ops = &prefix.model.progs[0].insts;
+    let name = |h: u32| {
+        prefix
+            .model
+            .tensors
+            .get(h as usize)
+            .map(|t| t.name.as_str())
+    };
+    let first = format!("w.post.layers.{layer}.ln1.w");
+    let next = format!("w.post.layers.{}.ln1.w", layer + 1);
+    let start = ops
+        .iter()
+        .position(|d| d.op == DevOp::LayerNormF32 as u16 && name(d.t[2]) == Some(first.as_str()))
+        .ok_or("Mimi layer start is missing")?;
+    let end = (start + 1..ops.len())
+        .find(|&i| {
+            let d = &ops[i];
+            (d.op == DevOp::LayerNormF32 as u16 && name(d.t[2]) == Some(next.as_str()))
+                || (d.op == DevOp::StreamTailF32 as u16
+                    && name(d.t[2]) == Some("state.codec.dec.in"))
+        })
+        .ok_or("Mimi layer end is missing")?;
+    let insts = ops[start..end].to_vec();
+    let input = insts[0].t[1];
+    if insts.last().unwrap().t[0] != input {
+        return Err("Mimi layer does not end in its residual output".into());
+    }
+    let rows = batch * frames * cfg.xf_rows_per_frame();
+    let active = u64::from(rows) * u64::from(cfg.dim.max(cfg.inter).max(3 * cfg.attn())) * 4;
+    let gathered = u64::from(batch)
+        * u64::from(cfg.window - 1 + frames * cfg.xf_rows_per_frame())
+        * u64::from(3 * cfg.attn())
+        * 4;
+    for t in &mut prefix.model.tensors {
+        let bytes = match t.name.as_str() {
+            "act.codec.a" | "act.codec.b" | "act.codec.c" | "act.codec.s" => Some(active),
+            "act.codec.z" => Some(active.max(gathered)),
+            _ => None,
+        };
+        if let Some(bytes) = bytes {
+            t.bytes = t.bytes.min(bytes);
+        }
+    }
+    prefix.retain_linear_program(&insts, input, input, rows)?;
+    prefix.input_shape = vec![
+        prefix.model.tensors[prefix.input as usize].bytes / (u64::from(cfg.dim) * 4),
+        u64::from(cfg.dim),
+    ];
+    Ok(prefix)
+}
+
+fn mimi_block_section(
+    prefix: &PacketPrefix,
+    cfg: &Cfg,
+    layer: u32,
+    batch: u32,
+    frames: u32,
+) -> Result<packet::devbuild::SectionData, String> {
+    use plow_asset::packet_pipeline::{PacketPipelines, PipelineDType};
+    let mut section = prefix.forward_pipeline_section(
+        "codec.layer.block",
+        PipelineDType::F32,
+        PipelineDType::F32,
+        prefix.input_shape.clone(),
+    )?;
+    let mut metadata: PacketPipelines =
+        serde_json::from_slice(&section.data).map_err(|e| e.to_string())?;
+    metadata.pipelines[0].parameters.extend([
+        ("block.layer".into(), u64::from(layer)),
+        ("block.batch".into(), u64::from(batch)),
+        ("block.frames".into(), u64::from(frames)),
+        (
+            "block.rows_per_item".into(),
+            u64::from(frames * cfg.xf_rows_per_frame()),
+        ),
+        ("block.width".into(), u64::from(cfg.dim)),
+        ("block.heads".into(), u64::from(cfg.heads)),
+        ("block.window".into(), u64::from(cfg.window)),
+        ("stream.slots".into(), u64::from(cfg.stream_slots)),
+    ]);
+    section.data = serde_json::to_vec(&metadata).map_err(|e| e.to_string())?;
+    Ok(section)
+}
+
+fn read_checkpoint_weights(
+    prefix: &mut PacketPrefix,
+    cfg: &Cfg,
+    positions: &[(u32, u32, u32)],
+    splits: Splits<'_>,
+    dir: &std::path::Path,
+) -> Result<(), String> {
     let reader = crate::checkpoint::TensorReader::open(dir)?;
     for (h, tensor) in prefix.model.tensors.iter_mut().enumerate() {
         if let Some(&(_, batch, frames)) = positions.iter().find(|(p, _, _)| *p as usize == h) {
@@ -324,7 +721,7 @@ pub fn lower_fish_dac(
                 bytes = crate::codec::to_phase_major(&bytes, cin, cout, kernel, stride);
             }
         }
-        if let Some((n, k, taps)) = splits.as_ref().and_then(|s| s.borrow().get(name).copied()) {
+        if let Some((n, k, taps)) = splits.and_then(|s| s.borrow().get(name).copied()) {
             if taps > 1 {
                 bytes = crate::s3gen::to_tap_major(&bytes, n, k / taps, taps);
             }
@@ -339,10 +736,7 @@ pub fn lower_fish_dac(
         }
         tensor.init = Some(bytes);
     }
-    let section = section(
-        &prefix, &cfg, roles, bmax, max_rows, &lengths, &scales, seed, &steps,
-    )?;
-    Ok((prefix.model, section))
+    Ok(())
 }
 
 /// [`CAPACITIES`] and [`STEP_CAPACITIES`] without the shapes over `max_rows` (batch x frames),
@@ -386,6 +780,9 @@ fn lower_programs(
     decode: &[(u32, u32)],
     steps: &[(u32, u32)],
 ) -> Result<Lowered, String> {
+    if cfg.stream_slots == 0 || steps.iter().any(|&(batch, _)| batch > cfg.stream_slots) {
+        return Err("codec step batch exceeds stream state slots".into());
+    }
     let fc = cfg.sizes.len() as u32;
     let scales = cfg.scales();
     let bmax = decode
@@ -735,6 +1132,7 @@ impl Seq {
 #[derive(Clone)]
 struct StreamIo {
     slot: u32,
+    slots: u32,
     pos: u32,
     rope_pos: u32,
     /// New rows per item at each resolution of [`Cfg::scales`].
@@ -783,7 +1181,7 @@ fn carry(
         slot: io.slot,
         n: io.n[scale],
         items: batch,
-        slots: STREAM_SLOTS,
+        slots: io.slots,
         tail,
         rows,
         cols,
@@ -838,6 +1236,7 @@ fn program_for(
             .collect();
         StreamIo {
             slot: h[0],
+            slots: cfg.stream_slots,
             pos: h[1],
             rope_pos: h[2],
             n: h[3..].to_vec(),
@@ -1442,6 +1841,7 @@ fn mimi_program_for(
             .collect();
         let io = StreamIo {
             slot: h[0],
+            slots: cfg.stream_slots,
             pos: h[1],
             rope_pos: h[2],
             n: h[3..3 + scales].to_vec(),
@@ -1676,7 +2076,7 @@ fn mimi_program_for(
                         slot: io.slot,
                         n: io.n[1],
                         items: batch,
-                        slots: STREAM_SLOTS,
+                        slots: cfg.stream_slots,
                         tail: history,
                         rows: t,
                         cols: 2 * aw,
@@ -1737,7 +2137,7 @@ fn mimi_program_for(
                     rows: t,
                     heads,
                     history,
-                    slots: STREAM_SLOTS,
+                    slots: cfg.stream_slots,
                     scale: 1.0 / (hd as f32).sqrt(),
                 },
             )?
@@ -1786,7 +2186,7 @@ fn mimi_program_for(
                     slot: io.slot,
                     n: io.n[1],
                     items: batch,
-                    slots: STREAM_SLOTS,
+                    slots: cfg.stream_slots,
                     tail: history,
                     rows: t,
                     cols: 2 * aw,
@@ -1990,7 +2390,7 @@ fn section(
         ("codec.breeze".into(), u64::from(cfg.breeze)),
         ("stream.lookahead_frames".into(), 0),
         ("stream.stateful".into(), 1),
-        ("stream.slots".into(), u64::from(STREAM_SLOTS)),
+        ("stream.slots".into(), u64::from(cfg.stream_slots)),
         (
             "stream.step_frames".into(),
             steps.iter().map(|&(_, n)| u64::from(n)).max().unwrap_or(1),
@@ -2115,6 +2515,84 @@ mod tests {
     }
 
     #[test]
+    fn handoff_facts_follow_actual_one_frame_lowering_without_changing_packet() {
+        use crate::pipeline::handoff::SharedLayout;
+        use plow_asset::packet_pipeline::*;
+        let mut cfg = mimi();
+        cfg.layers = 1;
+        cfg.stream_slots = 320;
+        let steps = [(32, 1), (64, 1), (128, 1), (200, 1), (224, 1), (320, 1)];
+        let low = lower_programs(&cfg, 132, 0, None, &[(1, 8)], &steps).unwrap();
+        let before = low.prefix.model.to_blob();
+        for (live, selected) in [(1, 32), (64, 64), (200, 200), (300, 320)] {
+            let mut layout = SharedLayout::default();
+            let component = step_handoff(
+                &low.prefix,
+                &cfg,
+                &low.roles,
+                &steps,
+                low.max_rows,
+                &mut layout,
+                "codec",
+                live,
+            )
+            .unwrap();
+            let role = format!("step.b{selected}.f1");
+            let program = &component.declaration.programs[&role];
+            assert_eq!(
+                program.entry,
+                HandoffExecutable::Packet {
+                    section: "packet".into(),
+                    program: low.roles[&role],
+                }
+            );
+            let view = &component.facts.views["codec.pcm"];
+            assert_eq!(
+                (view.dtype, view.row_width, view.rows),
+                (PipelineDType::F32, 1920, low.max_rows)
+            );
+            let position = &component.facts.views["codec.stream.rope_pos"];
+            assert_eq!(
+                (position.dtype, position.row_width, position.row_stride),
+                (PipelineDType::U32, 2, 8)
+            );
+            assert!(program
+                .accesses
+                .iter()
+                .all(|a| a.rows == HandoffRows::Fixed { rows: selected }));
+            assert!(component
+                .facts
+                .programs
+                .values()
+                .all(|p| !p.private_transients_banked && !p.persistent_stop_safe));
+            assert_eq!(low.prefix.model.to_blob(), before);
+        }
+        let mut layout = SharedLayout::default();
+        assert!(step_handoff(
+            &low.prefix,
+            &cfg,
+            &low.roles,
+            &steps,
+            low.max_rows,
+            &mut layout,
+            "codec",
+            321
+        )
+        .is_err());
+        assert!(step_handoff(
+            &low.prefix,
+            &fish(),
+            &low.roles,
+            &steps,
+            low.max_rows,
+            &mut layout,
+            "codec",
+            32
+        )
+        .is_err());
+    }
+
+    #[test]
     fn decoder_rotary_precision_matches_source_contract() {
         for (cfg, flags) in [(fish(), 2), (breeze(), 0), (mimi(), 0)] {
             let low = lower_programs(&cfg, 58, 0, None, &[(1, 8)], &[(1, 1)]).unwrap();
@@ -2129,6 +2607,209 @@ mod tests {
                     assert_eq!(inst.i[6], flags);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn extra_step_capacities_preserve_default_packets() {
+        let metadata = |low: &Lowered, cfg: &Cfg, steps: &[(u32, u32)]| {
+            section(
+                &low.prefix,
+                cfg,
+                low.roles.clone(),
+                low.bmax,
+                low.max_rows,
+                &low.lengths,
+                &cfg.scales(),
+                low.seed,
+                steps,
+            )
+            .unwrap()
+            .data
+        };
+        for make in [fish as fn() -> Cfg, breeze, mimi] {
+            let base = make();
+            let original =
+                lower_programs(&base, 132, 90, None, &[(1, 8)], &[(1, 1), (32, 1)]).unwrap();
+            let mut cfg = make();
+            assert_eq!(
+                cfg.step_capacities(STEP_CAPACITIES, None, None).unwrap(),
+                STEP_CAPACITIES
+            );
+            assert_eq!(cfg.stream_slots, STREAM_SLOTS);
+            let same = lower_programs(&cfg, 132, 90, None, &[(1, 8)], &[(1, 1), (32, 1)]).unwrap();
+            assert_eq!(original.prefix.model.to_blob(), same.prefix.model.to_blob());
+            assert_eq!(
+                metadata(&original, &base, &[(1, 1), (32, 1)]),
+                metadata(&same, &cfg, &[(1, 1), (32, 1)])
+            );
+        }
+    }
+
+    #[test]
+    fn extra_mimi_steps_grow_state_slots_without_growing_frame_arena() {
+        for ring in [false, true] {
+            let mut cfg = mimi();
+            cfg.ring_kv = ring;
+            let steps = cfg
+                .step_capacities(
+                    &[(1, 1), (256, 17)],
+                    Some("200:1,224:1,288:1,300:1,320:1,200:17,224:17,320:1"),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(cfg.stream_slots, 320);
+            assert_eq!(steps.len(), 9);
+            let low = lower_programs(&cfg, 132, 90, None, &[(1, 8)], &steps).unwrap();
+            assert_eq!((low.bmax, low.max_rows), (320, 256 * 17));
+            for &(batch, frames) in &steps {
+                let program = low.roles[&format!("step.b{batch}.f{frames}")];
+                for d in &low.prefix.model.progs[program as usize].insts {
+                    if d.op == DevOp::StreamTailF32 as u16 {
+                        assert_eq!(d.j[0], 320);
+                        assert_eq!(
+                            low.prefix.model.tensors[d.t[2] as usize].bytes,
+                            320 * u64::from(d.i[1]) * u64::from(d.i[3]) * 4
+                        );
+                    } else if plow_asset::speech_flag_layout::is_ring_attention(d.i[6])
+                        && d.op == DevOp::AttentionF32 as u16
+                    {
+                        assert_eq!(d.i[7], 320);
+                    }
+                }
+            }
+            let meta = section(
+                &low.prefix,
+                &cfg,
+                low.roles.clone(),
+                low.bmax,
+                low.max_rows,
+                &low.lengths,
+                &cfg.scales(),
+                low.seed,
+                &steps,
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&meta.data).unwrap();
+            assert_eq!(value["pipelines"][0]["parameters"]["stream.slots"], 320);
+        }
+        assert!(lower_programs(&mimi(), 132, 90, None, &[(1, 8)], &[(320, 1)]).is_err());
+    }
+
+    #[test]
+    fn extra_step_capacities_reject_invalid_or_dropped_shapes() {
+        for bad in [
+            "",
+            "320",
+            "0:1",
+            "1:0",
+            "-1:1",
+            "4294967295:17",
+            "4294967295:1",
+            "320:1,bad",
+        ] {
+            let mut cfg = mimi();
+            assert!(
+                cfg.step_capacities(&[(1, 1)], Some(bad), None).is_err(),
+                "{bad}"
+            );
+            assert_eq!(cfg.stream_slots, STREAM_SLOTS);
+        }
+        assert!(mimi()
+            .step_capacities(&[(1, 1)], Some("320:1"), Some(319))
+            .is_err());
+        assert_eq!(
+            mimi()
+                .step_capacities(&[(1, 1)], Some("320:1"), Some(320))
+                .unwrap(),
+            [(1, 1), (320, 1)]
+        );
+        assert!(fish()
+            .step_capacities(&[(1, 1)], Some("320:1"), None)
+            .is_err());
+        assert!(breeze()
+            .step_capacities(&[(1, 1)], Some("320:1"), None)
+            .is_err());
+    }
+
+    #[test]
+    fn mimi_layer_blocks_preserve_native_instructions_and_keep_only_layer_tensors() {
+        for ring in [false, true] {
+            let mut cfg = mimi();
+            cfg.ring_kv = ring;
+            cfg.stream_slots = 320;
+            for (batch, frames, layer) in
+                [(1, 1, 0), (32, 1, 3), (200, 1, 7), (300, 1, 0), (32, 17, 7)]
+            {
+                let full = lower_programs(&cfg, 132, 90, None, &[], &[(batch, frames)]).unwrap();
+                let block = mimi_layer_block(&cfg, 132, 90, None, layer, batch, frames).unwrap();
+                let weight = format!("w.post.layers.{layer}.");
+                assert!(block
+                    .model
+                    .tensors
+                    .iter()
+                    .filter(|t| t.name.starts_with("w."))
+                    .all(|t| t.name.starts_with(&weight)));
+                assert_eq!(
+                    block
+                        .model
+                        .tensors
+                        .iter()
+                        .filter(|t| t.name.starts_with("state.codec."))
+                        .count(),
+                    1
+                );
+                assert_eq!(block.programs, [0]);
+                let ops = &block.model.progs[0].insts;
+                let start = full.prefix.model.progs[0]
+                    .insts
+                    .iter()
+                    .position(|d| {
+                        d.op == DevOp::LayerNormF32 as u16
+                            && full.prefix.model.tensors[d.t[2] as usize].name
+                                == format!("{weight}ln1.w")
+                    })
+                    .unwrap();
+                let signature = |d: &packet::dev::DevInst, model: &packet::devbuild::Model| {
+                    (
+                        d.op,
+                        d.blocks,
+                        d.i,
+                        d.f,
+                        d.j,
+                        d.t.map(|h| model.tensors.get(h as usize).map(|t| t.name.clone())),
+                    )
+                };
+                for (old, new) in full.prefix.model.progs[0].insts[start..start + ops.len()]
+                    .iter()
+                    .zip(ops)
+                {
+                    assert_eq!(
+                        signature(old, &full.prefix.model),
+                        signature(new, &block.model)
+                    );
+                }
+                let selected = mimi_block_section(&block, &cfg, layer, batch, frames).unwrap();
+                let metadata: serde_json::Value = serde_json::from_slice(&selected.data).unwrap();
+                assert_eq!(
+                    metadata["pipelines"][0]["parameters"]["block.rows_per_item"],
+                    frames * 2
+                );
+                let activation_limit = u64::from(batch * frames * 2 * 2048) * 4;
+                assert!(block
+                    .model
+                    .tensors
+                    .iter()
+                    .filter(
+                        |t| ["act.codec.a", "act.codec.b", "act.codec.c", "act.codec.s"]
+                            .contains(&t.name.as_str())
+                    )
+                    .all(|t| t.bytes <= activation_limit));
+            }
+        }
+        assert!(mimi_layer_block(&fish(), 132, 90, None, 0, 1, 1).is_err());
+        for (layer, batch, frames) in [(8, 1, 1), (0, 0, 1), (0, 1, 0), (0, u32::MAX, 1)] {
+            assert!(mimi_layer_block(&mimi(), 132, 90, None, layer, batch, frames).is_err());
         }
     }
 

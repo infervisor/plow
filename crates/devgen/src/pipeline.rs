@@ -1,6 +1,9 @@
 use packet::dev::DevOp;
 use packet::devbuild::{Builder, Model};
 
+#[path = "pipeline_handoff.rs"]
+pub mod handoff;
+
 #[derive(Clone, Copy)]
 pub struct CausalPipelineTensors {
     pub tokens: u32,
@@ -923,6 +926,76 @@ pub struct StageProgram {
 }
 
 impl PacketPrefix {
+    pub(crate) fn retain_linear_program(
+        &mut self,
+        insts: &[packet::dev::DevInst],
+        input: u32,
+        output: u32,
+        rows: u32,
+    ) -> Result<(), String> {
+        use std::collections::{BTreeMap, BTreeSet};
+        if insts.is_empty()
+            || rows == 0
+            || !self.model.gen.is_empty()
+            || !self.model.kv_row_insts.is_empty()
+        {
+            return Err(
+                "linear block requires instructions, rows and static tensor bindings".into(),
+            );
+        }
+        let used: BTreeSet<_> = insts
+            .iter()
+            .flat_map(|i| i.t)
+            .chain([input, output])
+            .filter(|&h| h != packet::dev::TENSOR_NONE)
+            .collect();
+        let handles: BTreeMap<_, _> = used
+            .iter()
+            .enumerate()
+            .map(|(n, &h)| (h, n as u32))
+            .collect();
+        let tensors: Vec<_> = used
+            .iter()
+            .map(|&h| {
+                self.model
+                    .tensors
+                    .get(h as usize)
+                    .cloned()
+                    .ok_or("linear block tensor is missing".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        let mut builder = Builder::new(self.model.n_cu);
+        builder.force_uniseg();
+        builder.adopt_tensors(tensors.clone());
+        let mut last = None;
+        for i in insts {
+            if i.blocks == 0 {
+                return Err("linear block has an empty instruction".into());
+            }
+            last = Some(builder.emit(
+                DevOp::from_u16(i.op).ok_or("unknown linear block opcode")?,
+                (0..u32::from(i.blocks)).collect(),
+                &last.into_iter().collect::<Vec<_>>(),
+                |d| {
+                    d.t =
+                        i.t.map(|h| handles.get(&h).copied().unwrap_or(packet::dev::TENSOR_NONE));
+                    d.i = i.i;
+                    d.f = i.f;
+                    d.j = i.j;
+                },
+            ));
+        }
+        self.input = *handles.get(&input).ok_or("linear block input is missing")?;
+        self.output = *handles
+            .get(&output)
+            .ok_or("linear block output is missing")?;
+        self.model.tensors = tensors;
+        self.model.progs = vec![builder.finish()];
+        self.model.prog_t = vec![rows];
+        self.programs = vec![0];
+        Ok(())
+    }
+
     pub fn forward_pipeline_section(
         &self,
         name: &str,

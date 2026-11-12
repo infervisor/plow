@@ -1239,6 +1239,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.codec_conv_arms", Some("PLOW_EMIT_CODEC_CONV_ARMS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.codec_conv_classes", Some("PLOW_EMIT_CODEC_CONV_CLASSES"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.fish_codec_max_rows", Some("PLOW_EMIT_FISH_CODEC_MAX_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.codec_step_capacities", Some("PLOW_EMIT_CODEC_STEP_CAPACITIES"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.codec_ring_kv", Some("PLOW_CODEC_RING_KV"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_fa_mma_hd128", Some("PLOW_NV_FA_MMA_HD128"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_gemv_k8_b1", Some("PLOW_NV_GEMV_K8_B1"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

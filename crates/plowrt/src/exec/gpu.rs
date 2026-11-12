@@ -190,6 +190,8 @@ pub use fish_depth::{FishInfo, FishRow};
 mod fp8_block;
 mod gen_decode;
 pub(crate) mod handoff;
+pub(crate) mod handoff_aux;
+pub(crate) mod handoff_causal;
 pub(crate) mod handoff_provider;
 mod mixed_step;
 mod moe_lt;
@@ -2804,6 +2806,7 @@ pub struct GpuEngine {
     /// Per-tensor device buffers, indexed by blob tensor handle. Ordinarily
     /// **views** into `_weight_slab`, not owners — see it for why.
     devp: Vec<DeviceMem>,
+    handoff_shared: Option<handoff_causal::SharedCausalTensors>,
     /// Owner of the one span every non-VMM-prefix tensor is carved out of.
     ///
     /// The blob declares every tensor and its size before a byte moves, so the
@@ -4169,7 +4172,26 @@ impl GpuEngine {
         be: Arc<CudaBackend>,
         assets_dir: &Path,
         checkpoint_dir: &Path,
+        rank_bind: Option<rank::RankBind>,
+    ) -> Result<Self> {
+        Self::load_rank_inner(be, assets_dir, checkpoint_dir, rank_bind, None)
+    }
+
+    pub(crate) fn load_handoff_shared(
+        be: Arc<CudaBackend>,
+        assets_dir: &Path,
+        checkpoint_dir: &Path,
+        shared: handoff_causal::SharedCausalTensors,
+    ) -> Result<Self> {
+        Self::load_rank_inner(be, assets_dir, checkpoint_dir, None, Some(shared))
+    }
+
+    fn load_rank_inner(
+        be: Arc<CudaBackend>,
+        assets_dir: &Path,
+        checkpoint_dir: &Path,
         mut rank_bind: Option<rank::RankBind>,
+        handoff_shared: Option<handoff_causal::SharedCausalTensors>,
     ) -> Result<Self> {
         let t0 = std::time::Instant::now();
         crate::knob_spec::check_assets(&assets_dir.join("model.pkt"))?;
@@ -5098,11 +5120,30 @@ impl GpuEngine {
             }
         };
         let config = RuntimeConfig::get();
+        if let Some(shared) = &handoff_shared {
+            if rank_bind.is_some() {
+                return Err(RuntimeError::Rejected(
+                    "shared causal tensors do not support rank bindings".into(),
+                ));
+            }
+            shared.validate(&be, &blob, |id, name| {
+                vmm_va_of(id).is_none()
+                    && !name.starts_with("kv.")
+                    && !vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(&id))
+                    && !is_checkpoint_tensor(id, name, packed_prefill_metadata.as_ref())
+                    && !blob.gen.iter().any(|g| g.tensor == id as u32)
+            })?;
+        }
         let slab_bytes: u64 = blob
             .tensors
             .iter()
             .enumerate()
-            .filter(|(id, _)| vmm_va_of(*id).is_none())
+            .filter(|(id, td)| {
+                vmm_va_of(*id).is_none()
+                    && !handoff_shared
+                        .as_ref()
+                        .is_some_and(|s| s.contains(&td.name))
+            })
             .map(|(_, td)| carve_bytes(td.bytes))
             .sum();
         // Brought up BEFORE the checkpoint opens: the VMM reserve returns in
@@ -5267,23 +5308,32 @@ impl GpuEngine {
             for (i, td) in blob.tensors.iter().enumerate() {
                 let vmm_va = vmm_va_of(i);
                 let packet_cache = vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(&i));
-                let t_alloc =
-                    (load_prof && vmm_va.is_none() && matches!(weight_slab, WeightSlab::PerTensor))
-                        .then(std::time::Instant::now);
+                let shared = handoff_shared.as_ref().filter(|s| s.contains(&td.name));
+                let t_alloc = (load_prof
+                    && shared.is_none()
+                    && vmm_va.is_none()
+                    && matches!(weight_slab, WeightSlab::PerTensor))
+                .then(std::time::Instant::now);
                 let tensor_bytes = td.bytes;
-                let mem = match (vmm_va, &weight_slab) {
-                    (Some(va), _) => DeviceMem::view(va, td.bytes),
-                    (None, WeightSlab::Vmm(slab)) => {
-                        let m = DeviceMem::view(slab.base() + slab_off, tensor_bytes);
-                        slab_off += carve_bytes(tensor_bytes);
-                        m
+                let mem = if let Some(s) = shared {
+                    s.memory(&td.name)?.ok_or_else(|| {
+                        RuntimeError::Rejected("missing shared tensor binding".into())
+                    })?
+                } else {
+                    match (vmm_va, &weight_slab) {
+                        (Some(va), _) => DeviceMem::view(va, td.bytes),
+                        (None, WeightSlab::Vmm(slab)) => {
+                            let m = DeviceMem::view(slab.base() + slab_off, tensor_bytes);
+                            slab_off += carve_bytes(tensor_bytes);
+                            m
+                        }
+                        (None, WeightSlab::Flat(slab)) => {
+                            let m = slab.subview(slab_off, tensor_bytes)?;
+                            slab_off += carve_bytes(tensor_bytes);
+                            m
+                        }
+                        (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                     }
-                    (None, WeightSlab::Flat(slab)) => {
-                        let m = slab.subview(slab_off, tensor_bytes)?;
-                        slab_off += carve_bytes(tensor_bytes);
-                        m
-                    }
-                    (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                 };
                 // Producers use the mirror only after every interpreter candidate passed the guard.
                 let mem = match (&tp_shards, td.name.as_str()) {
@@ -5323,6 +5373,17 @@ impl GpuEngine {
                         td.name
                     )));
                 }
+                if shared.is_some_and(|s| !s.initialize(&td.name)) {
+                    devp.push(mem);
+                    continue;
+                }
+                let commit = |end, wait: &mut f64| -> Result<()> {
+                    if shared.is_some() {
+                        Ok(())
+                    } else {
+                        slab_commit_wait(&weight_slab, end, wait)
+                    }
+                };
                 if !packet_cache
                     && td.init.is_none()
                     && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
@@ -5352,11 +5413,7 @@ impl GpuEngine {
                         let wide = wide?;
                         for (o, chunk) in wide.chunks(STAGE).enumerate() {
                             let dst = mem.base + (o * STAGE) as u64;
-                            slab_commit_wait(
-                                &weight_slab,
-                                dst + chunk.len() as u64,
-                                &mut slab_wait_ms,
-                            )?;
+                            commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
                             pipe.push(dst, chunk)?;
                         }
                         wb += td.bytes;
@@ -5399,11 +5456,7 @@ impl GpuEngine {
                     prefetch_ahead(&mut pf, 1);
                     for (o, chunk) in src.chunks(STAGE).enumerate() {
                         let dst = mem.base + (o * STAGE) as u64;
-                        slab_commit_wait(
-                            &weight_slab,
-                            dst + chunk.len() as u64,
-                            &mut slab_wait_ms,
-                        )?;
+                        commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
                         if pipe.is_direct() && matches!(src, std::borrow::Cow::Borrowed(_)) {
                             // SAFETY: `chunk` borrows the checkpoint mmap
                             // (`ckpt`, whose Arc outlives pipe.finish()).
@@ -5417,11 +5470,7 @@ impl GpuEngine {
                 } else if let Some(r) = &td.init {
                     for (o, chunk) in blob.init[r.clone()].chunks(STAGE).enumerate() {
                         let dst = mem.base + (o * STAGE) as u64;
-                        slab_commit_wait(
-                            &weight_slab,
-                            dst + chunk.len() as u64,
-                            &mut slab_wait_ms,
-                        )?;
+                        commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
                         if pipe.is_direct() {
                             // SAFETY: `chunk` borrows `blob.init`, which lives
                             // past pipe.finish().
@@ -5447,11 +5496,7 @@ impl GpuEngine {
                     }
                     for (o, chunk) in data.chunks(STAGE).enumerate() {
                         let dst = mem.base + (o * STAGE) as u64;
-                        slab_commit_wait(
-                            &weight_slab,
-                            dst + chunk.len() as u64,
-                            &mut slab_wait_ms,
-                        )?;
+                        commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
                         pipe.push(dst, chunk)?;
                     }
                     tracing::debug!(
@@ -5459,7 +5504,7 @@ impl GpuEngine {
                         "materialised generated tensor"
                     );
                 } else if vmm_va.is_none() && !packet_cache && !td.name.starts_with("kv.") {
-                    slab_commit_wait(&weight_slab, mem.base + td.bytes, &mut slab_wait_ms)?;
+                    commit(mem.base + td.bytes, &mut slab_wait_ms)?;
                     let t_ms = load_prof.then(std::time::Instant::now);
                     be.memset_d8(mem.base, 0, td.bytes as usize)?;
                     if let (Some(t), Some(tm)) = (t_ms, load_tim.as_mut()) {
@@ -8063,6 +8108,7 @@ impl GpuEngine {
             ctr_bytes,
             cursor_bytes,
             devp,
+            handoff_shared,
             _weight_slab: Arc::new(weight_slab),
             d_inst,
             _ctr_block: ctr_block,
@@ -8199,7 +8245,9 @@ impl GpuEngine {
             engine.fish =
                 fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
         }
-        engine.depth_calibrate()?;
+        if engine.handoff_shared.is_none() {
+            engine.depth_calibrate()?;
+        }
         engine.speech_identities = prefix::SpeechIdentities::new(engine.token_input_vocab());
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;

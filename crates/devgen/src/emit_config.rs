@@ -398,6 +398,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_FISH_CODEC_MAX_ROWS")]
     pub fish_codec_max_rows: Option<u32>,
 
+    /// Extra Mimi stateful step capacities as comma-separated batch:frames pairs.
+    #[arg(long, env = "PLOW_EMIT_CODEC_STEP_CAPACITIES")]
+    pub codec_step_capacities: Option<String>,
+
     /// Slot-indexed codec KV rings and short-query attention (opt-in).
     #[arg(long, env = "PLOW_CODEC_RING_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub codec_ring_kv: bool,
@@ -491,7 +495,8 @@ pub struct EmitConfig {
     pub decode_hnr_fold: Option<u32>,
     /// Maya 2 depth stage (DepthV2) op-chain reductions, a bit set: 1 = row views (the prefix
     /// embedding rows persist in `act.depth.xin`, qkv writes the K|V cache in place, the head reads
-    /// the last row in place; addressing only, codes bit-identical). Unset / 0 = off.
+    /// the last row in place; addressing only, codes bit-identical); 2 = persistent prefix
+    /// embeddings packed into contiguous projection rows, without projection views. Unset / 0 = off.
     #[arg(long, env = "PLOW_DEPTH_FUSE")]
     pub depth_fuse: Option<u32>,
     /// Staged depth programs: extra row capacities beside the decode rungs (comma list, each below
@@ -2022,6 +2027,7 @@ impl EmitConfig {
             codec_conv_classes: env_str("PLOW_EMIT_CODEC_CONV_CLASSES")
                 .map(std::path::PathBuf::from),
             fish_codec_max_rows: env_u32("PLOW_EMIT_FISH_CODEC_MAX_ROWS"),
+            codec_step_capacities: env_str("PLOW_EMIT_CODEC_STEP_CAPACITIES"),
             codec_ring_kv: env_bool("PLOW_CODEC_RING_KV"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),

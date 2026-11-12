@@ -174,7 +174,8 @@ extern "C" __global__ void control_sample(
     control_sample_run(states, row, logits, codes, stride, classes, stop);
 }
 
-extern "C" __global__ void handoff_control_sample(
+template<bool Scatter>
+static __device__ __forceinline__ void handoff_control_sample_run(
     ControlSampleState* states, const unsigned* slots, const unsigned* logits_rows,
     const unsigned short* logits, unsigned* codes, unsigned count, unsigned state_capacity, unsigned output_capacity,
     unsigned logits_capacity, unsigned stride, unsigned classes, unsigned stop) {
@@ -187,9 +188,13 @@ extern "C" __global__ void handoff_control_sample(
         || (uint64_t)logits_capacity * stride > UINT64_MAX / 2) { asm("trap;"); return; }
     const unsigned r = blockIdx.x;
     if (r >= count) return;
-    const ControlSampleRow row{slots[r], r, logits_rows[r]};
+    const unsigned slot = slots[r];
+    const ControlSampleRow row{slot, Scatter ? slot : r, logits_rows[r]};
     if (row.slot >= state_capacity || row.logits >= logits_capacity) {
         asm("trap;"); return;
+    }
+    if constexpr (Scatter) {
+        if (row.output >= output_capacity) { asm("trap;"); return; }
     }
     const auto& c = states[row.slot].plan;
     if (c.penalty_window > 256 || c.hist > 256 || c.pmax > 256 || c.n_windows > 16
@@ -199,6 +204,22 @@ extern "C" __global__ void handoff_control_sample(
         asm("trap;"); return;
     }
     control_sample_run(states, row, logits, codes, stride, classes, stop);
+}
+
+extern "C" __global__ void handoff_control_sample(
+    ControlSampleState* states, const unsigned* slots, const unsigned* logits_rows,
+    const unsigned short* logits, unsigned* codes, unsigned count, unsigned state_capacity, unsigned output_capacity,
+    unsigned logits_capacity, unsigned stride, unsigned classes, unsigned stop) {
+    handoff_control_sample_run<false>(states, slots, logits_rows, logits, codes, count,
+        state_capacity, output_capacity, logits_capacity, stride, classes, stop);
+}
+
+extern "C" __global__ void handoff_control_sample_scatter(
+    ControlSampleState* states, const unsigned* slots, const unsigned* logits_rows,
+    const unsigned short* logits, unsigned* codes, unsigned count, unsigned state_capacity, unsigned output_capacity,
+    unsigned logits_capacity, unsigned stride, unsigned classes, unsigned stop) {
+    handoff_control_sample_run<true>(states, slots, logits_rows, logits, codes, count,
+        state_capacity, output_capacity, logits_capacity, stride, classes, stop);
 }
 
 extern "C" __global__ void control_sample_finish(
