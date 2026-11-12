@@ -3,10 +3,12 @@
 //! The producer is `nix build .#plowrt-release`: one directory per platform
 //! triple holding the tarball, its `.sha256` (as `sha256sum` writes it) and
 //! `release.json`. This module records those outputs under
-//! `v1/plow-runtime/<version>/<triple>/`, keeps `v1/plow-runtime/index.json` (every
-//! release, every triple: what a models page lists) and `v1/plow-runtime/latest`
-//! (the version string alone: what `install.sh` reads with `sed`), and
-//! optionally publishes `install.sh` itself at the registry root.
+//! `v1/plow-runtime/<version>/<triple>/`, keeps `v1/plow-runtime/index.json`
+//! (every release, every triple: what a models page lists) and
+//! `v1/plow-runtime/latest` (the version string alone: what `install.sh`
+//! reads with `sed`), and optionally publishes `install.sh` itself at the
+//! registry root. Releases up to 0.1.3 are under `v1/runtime/`, no longer
+//! written.
 //!
 //! The same write discipline as `push`: a release's files are create-only,
 //! so a version is never republished with other bytes — a second run of the
@@ -32,7 +34,7 @@ fn dist(msg: String) -> RuntimeError {
 /// `release.json`, as the flake writes it beside the tarball.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReleaseJson {
-    /// `<semver>+<git12>`.
+    /// `<semver>+<commit>`.
     pub version: String,
     pub semver: String,
     pub commit: String,

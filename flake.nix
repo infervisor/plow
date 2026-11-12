@@ -19,7 +19,7 @@
       # and cargo could disagree about what they had just built.
       cargoVersion =
         (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-      # A release is `<semver>+<git12>`: the semver says what changed, the commit
+      # A release is `<semver>+<commit>`: the semver says what changed, the commit
       # says exactly which source produced the bytes. `self.shortRev` exists only
       # for a clean tree, which is the point — an artifact built from a dirty
       # checkout must not claim a commit it does not correspond to.
@@ -526,7 +526,7 @@
           # --- release assets --------------------------------------------------
           #
           # A runtime release is a tarball per platform triple, named
-          # `<semver>+<git12>`, plus the sha256 a client verifies it against.
+          # `<semver>+<commit>`, plus the sha256 a client verifies it against.
           # A registry records these in `v1/plow-runtime/index.json`, which a `plowrt`
           # client reads.
           #
