@@ -217,6 +217,8 @@ Codec step, one persistent interpreter launch, us (`packet_bench`, median of 20,
 | fused stream convs, v2 arm (130 KiB arena, B streamed) | 218 | 4118 | 15763 | 99806 |
 | + compiled variants of this packet only | 218 | 4108 | 15495 | 97924 |
 | + one A staging per row tile | 218 | 4109 | 14601 | 91815 |
+| + branch-free tail k-tile (no wgmma serialization) | 218 | 3866 | 13869 | 87290 |
+| + 16 staging loads in flight per thread (was 4) | 218 | 3890 | 13548 | 83950 |
 
 - Stream fusion: the residual unit's StreamTail gather and input SnakeBeta move into the conv's
   staging; the state update is one StreamTail store from (state, new rows). StreamTail + Unary per
@@ -228,6 +230,20 @@ Codec step, one persistent interpreter launch, us (`packet_bench`, median of 20,
   op and epilogue masks; the loader refuses a packet that needs an arm the object lacks. Dropping
   unused out-of-line arms cut STACK 7368 -> 5656 and the cubin 10 -> 6.8 MB with no change in step
   time (REG stays 255 at one block per SM); compiling only the used inlined bf16 bodies gained 1.7 %.
+- The flat plan's last k-tile used to break out of the k16 loop between wgmmas. ptxas then
+  serialized every wgmma in the speech object (C7520, a function-wide verdict), so ConvT and the
+  k1 convs lost time too. The tail groups now read zero B past K: -5 %, CER gate PASS.
+- A bulk-copy B ring (mbarrier full/empty, thread 0 producing, up to 6 stages) was 8 % slower
+  than the per-thread `cp.async` double buffer and is not kept. B transport is not the limit.
+  Probes on the 96-channel k7 conv (op test `--bench-conv-bf16`, 8 x 32646 rows, 286 us)
+  attribute ~7 us to B copies, ~95 us to A staging, ~113 us to MMA (~300 TFLOP/s, one k-tile
+  in flight) and ~43 us to the store. All four run back to back within a unit.
+- Ping-pong warpgroups (each its own 64-row units, A, B and named barrier; the same bits) cut the
+  standalone 96 / 192-channel convs 21 / 29 %. Inside the interpreter the step was 3 % slower. The
+  codec's convs stage the input SnakeBeta, which the 64-row halo repeats ~30 % more often, and the
+  unchanged 384 / 768-channel convs lost 10-18 % to register allocation in the one shared function.
+  A second inlined body of the arm put the function over its registers, and ptxas serialized every
+  wgmma (C7512). Standalone timing of this arm does not predict its speed inside the interpreter.
 - Biggest instructions left at b8 x f17: the 96 -> 1 output conv (577 us, staged direct arm), the
   k7 convs (410-545 us each, a ~70 us roofline at 96 channels), ConvT (420-430 us).
 

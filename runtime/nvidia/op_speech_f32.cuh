@@ -5789,7 +5789,7 @@ __host__ __device__ __forceinline__ constexpr bool spb_variant_on(unsigned kind,
 template <bool PRE, bool STREAM>
 __device__ __forceinline__ void spb_stage(const SpConvArgs& a, const SpbIn& si, char* As, unsigned rpad,
                                           unsigned span, unsigned b, unsigned t0, unsigned p0, unsigned cw) {
-    constexpr unsigned UL = 4u;
+    constexpr unsigned UL = 16u; /* loads in flight per thread: staging is latency-bound (4 -> 16: -13 % at 96 ch) */
     const unsigned c4n = cw / 4u, rpp = blockDim.x / c4n, rl = threadIdx.x / c4n;
     if (rl >= rpp) return;
     const unsigned ch = (threadIdx.x - rl * c4n) * 4u, cp = ch & 63u, cg = 64u * p0 + ch;
