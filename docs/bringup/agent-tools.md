@@ -128,6 +128,7 @@ Speech stages use the same harness with these tools:
 | ops, shapes, flags | `plowrt disasm --format json <pkt>` (CPU) |
 | floor + table | `scripts/campaign/speech_roofline.py DISASM.json PROGRAM SWEEP.jsonl` |
 | single-op oracle, parity and timing | `runtime/tests/speech_f32_op_test.cu` (extend it; `--conv-packing-only` is the packed-vs-alone bitwise case) |
+| encoder packed-vs-single parity | `asr_encoder_pack_check ASSETS PACK AUDIO.wav...` (plowrt example; bitwise, exits 1 on a difference) |
 | demand per bucket | `scripts/campaign/bucket_demand.py` |
 
 A final report that lacks the roofline table, the fusion list or the per-op targets is incomplete,

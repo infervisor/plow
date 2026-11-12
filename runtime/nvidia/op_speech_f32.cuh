@@ -2561,9 +2561,7 @@ static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const 
             static_assert(TAB0 >= 4u * SpTc<false>::STAGE_BYTES / 4u, "conv table placement");
             SpConvTab* tab = (SpConvTab*)(arena + TAB0);
             const bool tabled = TAB0 + 2u * k <= SP_ARENA_FLOATS && (uint64_t)ic * frames * width < (1ull << 31);
-            /* sm_120 only: on sm_90a either route changes 11-12 of 292 served Qwen3-ASR transcripts between a
-             * clip encoded alone and the same clip in a packed launch (the generic routes: 0-1). */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
             if (ic == 1u && kernel == 3u && stride == 2u && wstride == 2u && pad_before == 1u && pad_after == 1u &&
                 out_layout == 2u &&
                 (flags & 128u) && oc * 13u <= SP_ARENA_FLOATS && positions64 * oc < (1ull << 31)) {

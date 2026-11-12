@@ -377,6 +377,54 @@ static void t_conv(const char* name, unsigned batches, unsigned frames, unsigned
     run(name, c, g_conv2d_f32, {o}, flags & 128u ? BF16 : FP32, 1e-5, flags & 128u ? n / 20000 : 0);
 }
 
+/* Packing parity: clip `pick` of a `batches`-wide launch against the same clip launched alone,
+ * bitwise, at each block count. Device against device, no golden. */
+static void t_conv_packing(const char* name, unsigned batches, unsigned frames, unsigned width, unsigned ic,
+                           unsigned oc, unsigned flags) {
+    const unsigned of = (frames - 1) / 2 + 1, ow = (width - 1) / 2 + 1;
+    const size_t xn = (size_t)frames * width * ic, on = (size_t)of * ow * oc;
+    for (unsigned nblk : {132u, 44u}) {
+        Case c;
+        unsigned o = c.out(batches * on), x = c.f32(batches * xn, 1.f), w = c.f32((size_t)oc * ic * 9, 0.1f);
+        if (flags & 256u) { round_bf16(c, x); round_bf16(c, w); }
+        unsigned b = c.f32(oc, 0.2f), o1 = c.out(on), x1 = c.add(xn * 4);
+        c.upload();
+        PlowDevInst in = c.in;
+        in.op = PLOW_DOP_CONV2D_F32;
+        in.t[0] = o; in.t[1] = x; in.t[2] = w; in.t[3] = b;
+        in.i[0] = frames; in.i[1] = width; in.i[2] = ic; in.i[3] = oc; in.i[4] = 3; in.i[5] = 2;
+        in.i[6] = 1; in.i[7] = 1; in.fj[1].u = flags; in.fj[2].u = batches;
+        void** td = upload_table(c.dev);
+        k_speech<<<nblk, 256, kSmem>>>(in, td);
+        CK(cudaDeviceSynchronize());
+        std::vector<uint32_t> packed(batches * on), alone(on);
+        CK(cudaMemcpy(packed.data(), c.dev[o], batches * on * 4, cudaMemcpyDeviceToHost));
+        in.t[0] = o1; in.t[1] = x1; in.fj[2].u = 1;
+        size_t differ = 0, clips = 0;
+        double maxd = 0;
+        for (unsigned pick : {0u, 1u, batches / 2, batches - 1}) {
+            if (pick >= batches) continue;
+            CK(cudaMemcpy(c.dev[x1], (float*)c.dev[x] + pick * xn, xn * 4, cudaMemcpyDeviceToDevice));
+            k_speech<<<nblk, 256, kSmem>>>(in, td);
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(alone.data(), c.dev[o1], on * 4, cudaMemcpyDeviceToHost));
+            size_t d = 0;
+            for (size_t i = 0; i < on; i++) {
+                if (alone[i] == packed[pick * on + i]) continue;
+                float g, r;
+                memcpy(&g, &packed[pick * on + i], 4); memcpy(&r, &alone[i], 4);
+                maxd = std::max(maxd, fabs((double)g - r));
+                d++;
+            }
+            differ += d; clips += d != 0;
+        }
+        CK(cudaFree(td));
+        printf("  %-30s b=%-3u nblk=%-3u packed vs alone: %zu elements differ in %zu clips, max|d|=%.3g -> %s\n",
+               name, batches, nblk, differ, clips, maxd, differ ? "FAIL" : "PASS");
+        if (differ) g_fail = 1;
+    }
+}
+
 static void t_layernorm(const char* name, unsigned rows, unsigned feat, unsigned flags, bool affine, bool add = false) {
     Case c;
     unsigned o = c.out((size_t)rows * feat), x = c.f32((size_t)rows * feat, 2.f, 0.5f);
@@ -2681,6 +2729,16 @@ int main(int argc, char** argv) {
 
     if (argc > 1 && !strcmp(argv[1], "--conv-padding-only")) {
         t_conv_padding();
+        return g_fail;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--conv-packing-only")) {
+        /* The Qwen3-ASR front end: conv1 (3xTF32, f32 input), conv2 / conv3 (bf16-exact tensor cores). */
+        for (unsigned b : {2u, 16u, 128u}) {
+            t_conv_packing("conv1 1->480 128x100", b, 128, 100, 1, 480, 744);
+            t_conv_packing("conv2 480->480 64x50", b, 64, 50, 480, 480, 488);
+            t_conv_packing("conv3 480->480 32x25", b, 32, 25, 480, 480, 488);
+        }
+        printf(g_fail ? "FAIL\n" : "ALL PASS\n");
         return g_fail;
     }
     if (argc > 1 && !strcmp(argv[1], "--conv-pinned-only")) {

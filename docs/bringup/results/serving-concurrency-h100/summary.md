@@ -14,6 +14,29 @@ No row is a qualified plow-vs-baseline win or loss; the ratios are large enough 
   vLLM 0.32.0 for Qwen3-ASR (vLLM-Omni has no Qwen3-ASR pipeline).
 - TTS SLO: first audio within 500 ms and no playback underrun over 100 ms. ASR SLO: answer in 1 s.
 
+## Block vs roofline (Qwen3-ASR 1.7B encoder, 128-chunk packed launch)
+
+Ceilings measured on this box: HBM read 3093 GB/s, BF16 781 TFLOP/s. Released packet, per-op times
+from `packet_bench --sweep`, floors from `speech_roofline.py`. Only this model has its table so far;
+the TTS depth and codec stages are owed theirs before any further change to them.
+
+| Block (rung 128 chunks = 1664 rows) | Block time | Roofline floor | % of floor | Delta vs current |
+|---|---:|---:|---:|---:|
+| conv front end (3 convs + pack + first layer head) | 20.6 ms | 1.04 ms | 5.1 % | 10.4 ms with the sm_90a conv paths |
+| conv2 480->480, 64x50 | 11.9 ms | 0.54 ms | 4.5 % | |
+| conv1 1->480, 128x100 (3xTF32) | 4.2 ms | 0.25 ms | 5.9 % | |
+| conv3 480->480, 32x25 | 3.4 ms | 0.14 ms | 4.1 % | |
+| transformer layer (x22) | 1.19 ms | 0.11 ms | 9.1 % | |
+| fc1 + fc2 per layer | 0.53 ms | 0.036 ms | 6.9 % | |
+| q/k/v + attention per layer (one launch) | 0.19 ms | 0.014 ms | 7 % | |
+| residual add + LayerNorm, 4 passes per layer | 0.10 ms | 0.022 ms | 22 % | |
+
+Fusion list: residual add into the preceding GEMM epilogue (2 passes per layer, ~49 us, bit
+preserving after the GEMM's own round); residual add + LayerNorm in one row-owning pass (~20-30 us
+against ~48, serial statistics chains kept); q/k/v as one N = 3072 launch only with per-projection
+reference chunking kept. LayerNorm into the dense prologue does not fuse: the reference-split dense
+path rejects a LayerNorm prologue.
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |
@@ -46,11 +69,14 @@ speech object differs from the released packet), mean of two interleaved runs.
 Qwen3-ASR 0.6B, hold vs hold + encoder (one run): c64 RTFx 1207 -> 1409, c256 1318 -> 1545,
 200 req/s within SLO 0 % -> 99.7 %, gate WER c1 0.04435 -> 0.04174, c16 0.04261 = 0.04261.
 
-Open: with the released packet every closed-loop cell of the 292-clip set scores exactly 0.03913
-whatever the concurrency; with the re-emit one cell in six scored 0.03783 instead of 0.03826, so a
-transcript can depend on what it was packed with. The conv-only re-emit shows it too. Not yet
-localized (conv2 / conv3 tiles vs padding rows); it must be resolved or accepted before a recipe
-is re-pinned.
+Packing: the encoder is bit-exact under packing with every route. `speech_f32_op_test
+--conv-packing-only` (each front-end conv, a clip alone vs inside batches of 2 / 16 / 128, at 132 and
+44 blocks) and `asr_encoder_pack_check` (73 recordings, each alone vs in packed launches of 4 and 16)
+report 0 differing elements for the released packet, both conv-path re-emits, the dense-only re-emit
+and the released 0.6B packet. Served transcripts still depend on concurrency in a few clips (292-clip
+set, c1 vs c64: released 1.7B 0-1, re-emit 7-12, released 0.6B 8), so that dependence enters after
+the encoder, in batched prefill / decode, and is present in the released packets. Open: localize it
+in the decoder.
 
 ## Where plowrt's time goes at saturation
 
@@ -68,5 +94,5 @@ is re-pinned.
 
 ## Evidence
 
-`/opt/dlami/nvme/lava-tts/sconc`: `res/{base1,base2,peer1,steps1,w256b,codec1,asr2,asr3,asrhold,asrhold2,gather1,gather2,encbench,enc2,gate3}`,
+Campaign scratch `sconc`: `res/{base1,base2,peer1,steps1,w256b,codec1,asr2,asr3,asrhold,asrhold2,gather1,gather2,encbench,enc2,gate3,final1,roof}`,
 lease scripts beside them, reference installs and launch notes in `peers/PEERS.md`.
