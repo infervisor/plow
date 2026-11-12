@@ -206,6 +206,31 @@ k16; the 96-channel weight (132 KiB as bf16) stays resident in shared memory, wi
 their bf16 half one k-tile at a time. Against the f32 reference the relative error is 2.2e-3
 (operand rounding). Not in the interpreter yet.
 
+### Codec in the interpreter: bf16 taps arm, stream fusion, per-packet object
+
+Codec step, one persistent interpreter launch, us (`packet_bench`, median of 20, 2 passes):
+
+| packet / object | instructions | b1 x f1 | b8 x f17 | b64 x f17 |
+|---|---:|---:|---:|---:|
+| f32 baseline (split-bf16 taps tile) | 244 | 3930 | 17327 | 113459 |
+| bf16 taps arm v1 (188 KiB arena, B resident) | 244 | 3926 | 15140 | 95794 |
+| fused stream convs, v2 arm (130 KiB arena, B streamed) | 218 | 4118 | 15763 | 99806 |
+| + compiled variants of this packet only | 218 | 4108 | 15495 | 97924 |
+| + one A staging per row tile | 218 | 4109 | 14601 | 91815 |
+
+- Stream fusion: the residual unit's StreamTail gather and input SnakeBeta move into the conv's
+  staging; the state update is one StreamTail store from (state, new rows). StreamTail + Unary per
+  b8 x f17 step 3171 -> 1163 us. Fused output and state equal the unfused chain bit for bit.
+- The 188 KiB arena made the bf16 convs fastest but moved the carve-out and slowed every other
+  speech arm; the arm stays inside the 130 KiB arena.
+- Per-packet object: the speech object compiles only the conv arms (`PLOW_SPEECH_CONV_ARMS`) and
+  bf16 bodies (`PLOW_SPEECH_CONV_BF16_VARIANTS`) the packet's instructions reach, on top of the
+  op and epilogue masks; the loader refuses a packet that needs an arm the object lacks. Dropping
+  unused out-of-line arms cut STACK 7368 -> 5656 and the cubin 10 -> 6.8 MB with no change in step
+  time (REG stays 255 at one block per SM); compiling only the used inlined bf16 bodies gained 1.7 %.
+- Biggest instructions left at b8 x f17: the 96 -> 1 output conv (577 us, staged direct arm), the
+  k7 convs (410-545 us each, a ~70 us roofline at 96 channels), ConvT (420-430 us).
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |
