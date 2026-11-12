@@ -187,7 +187,7 @@ fn bind_ordering_screen(
 /// `--depth-sweep STRIDE` (with `--slots N`): the depth program of the width covering N slots
 /// timed at every STRIDE-th instruction cap (median of 20 launches, JSON lines
 /// `{"cap":..,"op":..,"blocks":..,"us":..}`, `op` the instruction cap - 1 adds), so the marginal
-/// cost of instruction i is us(cap = i + 1) - us(cap = i). Library-routed backbone rungs refuse caps.
+/// cost of instruction i is us(cap = i + 1) - us(cap = i).
 fn depth_sweep(
     e: &mut GpuEngine,
     assets: &std::path::Path,
@@ -222,15 +222,22 @@ fn depth_sweep(
         .collect();
     let mut codes = Vec::new();
     for cap in (0..=insts.len()).step_by(stride) {
-        e.set_debug_max_inst(cap as u32, n)?;
-        let mut us: Vec<f64> = (0..23)
+        e.set_depth_debug_max_inst(cap as u32)?;
+        let us: Result<Vec<f64>, _> = (0..23)
             .map(|_| {
                 codes.clear();
                 let t = std::time::Instant::now();
                 e.fish_depth_step(&step, &mut codes)
                     .map(|_| t.elapsed().as_secs_f64() * 1e6)
             })
-            .collect::<Result<_, _>>()?;
+            .collect();
+        let mut us = match us {
+            Ok(us) => us,
+            Err(err) => {
+                e.set_depth_debug_max_inst(u32::MAX)?;
+                return Err(err.into());
+            }
+        };
         us.drain(..3);
         us.sort_by(f64::total_cmp);
         let (op, blocks) = cap.checked_sub(1).map_or((String::new(), 0), |i| {
@@ -244,7 +251,7 @@ fn depth_sweep(
             us[us.len() / 2]
         );
     }
-    e.set_debug_max_inst(u32::MAX, n)?;
+    e.set_depth_debug_max_inst(u32::MAX)?;
     Ok(())
 }
 

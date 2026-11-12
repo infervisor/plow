@@ -631,6 +631,8 @@ impl Encoder<'_> {
                 &[dep],
                 Conv1dF32Stage {
                     input_split: false,
+                    bf16_taps: false,
+                    stream_in: None,
                     output_split: false,
                     output: TensorRef::Named(out_name),
                     weight: TensorRef::Named(&weight_name),

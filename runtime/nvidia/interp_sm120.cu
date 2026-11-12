@@ -1291,12 +1291,15 @@ extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_O
 #if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
 /* Speech-op semantics beyond the op set (packet_exec::speech_features): bit 1 = conv flag bit 3
  * (ragged wgmma tiles; bit 0 is retired), bit 2 = conv flag bit 30 (split-image input,
- * PLOW_SPEECH_SPLIT_A). A packet relying on a bit is refused by an object without it. */
-#if defined(PLOW_SPEECH_SPLIT_A) && PLOW_SPEECH_SPLIT_A
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u | 4u;
-#else
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u;
+ * PLOW_SPEECH_SPLIT_A), bit 3 = conv flag bit 17 without bit 14 (bf16 taps conv,
+ * PLOW_SPEECH_CONV_BF16). A packet relying on a bit is refused by an object without it. */
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) =
+    2u | (PLOW_SPEECH_SPLIT_A ? 4u : 0u) | (PLOW_SPEECH_CONV_BF16 ? 8u : 0u);
 #endif
+/* The conv arms a PLOW_SPEECH_CONV_ARMS object carries (SPA_*); the loader refuses a packet whose
+ * convs reach another (plow_asset::speech_flag_layout::conv_arms). Absent = all. */
+#if PLOW_NV_SPEECH && PLOW_SPEECH_CONV_ARMS != (~0ull)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_arms) = (unsigned)PLOW_SPEECH_CONV_ARMS;
 #endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
@@ -2225,8 +2228,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             d_gemv_tp_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
                          in->i[1], in->i[2], slice, nblk);
 #else
+        {
+#if PLOW_NV_HEAD_MMA && PLOW_NV_GEMV_MMA && !PLOW_NV_SPEECH && !PLOW_NV_PREFILL
+            if (d_gemv_f32out_mma((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                                  in->i[0], in->i[1], in->i[2], in->i[7] != 0u, slice, nblk))
+                break;
+#endif
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
                           in->i[1], in->i[2], in->i[7] != 0u, slice, nblk, arena);
+        }
 #endif
         break;
     case PLOW_DOP_SAMPLE_SMALL_F32:

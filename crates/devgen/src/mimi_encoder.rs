@@ -245,6 +245,7 @@ fn program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        stream_in: None,
         wgmma_ragged: false,
     };
     let x = p_handle(&p, "act.codec.a");
@@ -284,6 +285,8 @@ fn program_for(
             pinned: false,
             wgmma_ragged: false,
             input_split: false,
+            bf16_taps: false,
+            stream_in: None,
             output_split: false,
         },
     )?;
@@ -485,6 +488,8 @@ fn program_for(
             pinned: false,
             wgmma_ragged: false,
             input_split: false,
+            bf16_taps: false,
+            stream_in: None,
             output_split: false,
         },
     )?;

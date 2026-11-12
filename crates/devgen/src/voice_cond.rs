@@ -56,6 +56,8 @@ fn conv<'a>(
         pinned: false,
         wgmma_ragged: false,
         input_split: false,
+        bf16_taps: false,
+        stream_in: None,
         output_split: false,
     }
 }

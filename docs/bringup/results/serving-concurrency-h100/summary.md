@@ -128,6 +128,84 @@ Per-op table of the decoder (registry ceilings, not calibrated on this box):
 
 The k|v head-norm fusion does not apply to this layer shape (q and k are normed, v is not).
 
+### Qwen3-TTS: depth stage vs rows, and what serving is bound by
+
+Wide decode ladder (rungs to 256 rows, live KV). `fish_gen --slots N` isolated frame step, ms
+(backbone / depth), and the depth stage per instruction at 128 rows (`--depth-sweep`, 961
+instructions per frame):
+
+| rows | backbone | depth | + attention fold | + tensor-core head |
+|---:|---:|---:|---:|---:|
+| 16 | 2.04 | 5.16 | 4.58 | 4.38 |
+| 64 | 2.51 | 10.65 | 9.32 | 8.02 |
+| 128 | 2.77 | 18.77 | 16.47 | 12.66 |
+| 256 | 3.58 | 33.25 | 29.86 | 22.03 |
+
+| op (count per frame) | us each at 128 rows |
+|---|---:|
+| Gemv (176) / GemvGlu (80) / GemvQkv (80) | 25.7 / 24.4 / 19.8 |
+| GemvF32Out, codebook heads (16) | 288.7 |
+| FlashDecode (80) / FlashMerge (80) | 18.5 / 7.3 |
+| AddNorm (160) / HeadNormRope (240) / SampleSmallF32 (16) | 3.3 / 2.5 / 18.2 |
+| instruction walk (cap 0) | 2520 per frame |
+
+- Attention fold (`PLOW_DEPTH_ATTN_FOLD=1`, 961 -> 641 instructions) and the heads on the decode
+  walk's tensor cores (`-DPLOW_NV_HEAD_MMA=1`: fp32 accumulate, the same bf16 rounding of the
+  logits): depth -33 % at 128 and 256 rows. Sampled codes of 48 frames x 16 codebooks are equal to
+  the dot-product heads at 6 of 7 widths (one flip at 16 rows).
+- Projections: a block pulls ~20 GB/s of operands, so a projection has to use every block. The
+  row-block walk does and re-reads the activations per block (132 x 256 KB at 128 rows = its
+  24 us); a weight-tile-owner variant on wgmma is bit-identical (wgmma k16 and mma.sync m16n8k16
+  agree when each MMA gets the same 16 elements in the same accumulation order) but uses 8-16
+  blocks and is slower below 256 rows; the stream-K arm with its byte floor lowered is a wash
+  (15.8 vs 16.5 ms at 128 rows): its park / wait / reduce costs what the K split saves. Open: a
+  K split with a cheaper reduce.
+
+Served, same lease per row group (branch binary, live KV, closed loop c32 / c128 and open loop
+30 / 40 req/s; audio s/s, first audio p50 at 30 req/s):
+
+| packet | c32 | c128 | 30 req/s | 40 req/s |
+|---|---:|---:|---|---|
+| wide ladder | 88 | 106 | 123 (123 failed), 4.6 s | - |
+| + attention fold | 99 | 106 | 142, 2.1 s | - |
+| + tensor-core head | 104 | 125 | 150, 0.56 s | 146 (362 failed) |
+| + codec wgmma knobs | 106 | 142 | 153, 0.11 s (p99 0.51 s) | 170 (79 failed) |
+
+Recipe gate on the last row (Whisper CER, c1 / c32 / c128, 208 clips): median 0.
+
+The codec is the bound from c64 up. Its launches run serialized with the talker tick; a stream
+steps every 17 frames on its own phase, so a tick carries one or two launches of ~5 streams x 17
+frames. Device ms per audio frame: talker 0.19 at 64 rows, 0.12 at 128 (fold + head), 0.10 at 256;
+codec 0.21 at the served launch sizes, 0.12 at 32 x 17. The reference's 371 audio s/s is 0.2 ms per
+frame all-in.
+
+Codec step per instruction (`packet_bench --sweep`, released packet): 1 x 1 4.5 ms (registry
+roofline 0.16), 64 x 1 13.6 (2.6), 64 x 17 133 (33). At 1 x 1 the cost is weight traffic through
+the 8-24 blocks an op's column tiles give it (f32 weights): `dec.in` 1024 -> 1536 k7 565 us,
+768-channel k7 115-143 us x 3, the transformer's pointwise convs 41 x ~25 us. At 64 x 17 the
+96-channel block is 50 of 133 ms (ConvT 192 -> 96 11.0, k7 96 -> 96 3 x 7.5, output conv 4.3).
+
+Single-block screen of the k7 residual-unit conv (fused SnakeBeta output, f32 in / out), us per
+launch on 132 blocks; "taps" is the wgmma taps tile the codec knobs select (split-bf16, three
+products per k16):
+
+| channels | streams x frames | wide tile | taps tile | staged-once bf16 |
+|---:|---|---:|---:|---:|
+| 96 | 64 x 1 | 446 | 340 | 89 |
+| 96 | 8 x 17 | 908 | 694 | 173 |
+| 192 | 8 x 17 | 616 | 615 | 273 |
+| 384 | 8 x 17 | 553 | 554 | 271 |
+| 768 | 8 x 17 | 525 | 526 | 227 |
+| 768 | 1 x 1 | 129 | 130 | 51 |
+
+Staged-once bf16: the tile's input rows are converted to bf16 and staged once (one 128-byte-swizzled
+plane per 64 channels); every tap is the same staged rows at a row offset (the swizzle is a
+function of the absolute shared address, so a plain descriptor at the offset row is correct: 5.7e-7
+against a bf16-operand oracle; the descriptor's base-offset field must stay 0); one product per
+k16; the 96-channel weight (132 KiB as bf16) stays resident in shared memory, wider ones stream
+their bf16 half one k-tile at a time. Against the f32 reference the relative error is 2.2e-3
+(operand rounding). Not in the interpreter yet.
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |

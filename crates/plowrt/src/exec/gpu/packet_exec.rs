@@ -110,6 +110,12 @@ fn speech_ops(blob: &DevBlob) -> u64 {
         .fold(0, |mask, op| mask | 1 << (op - SPEECH_OP0))
 }
 
+fn speech_conv_arms(blob: &DevBlob) -> u64 {
+    blob.progs.iter().flat_map(|p| &p.insts).fold(0, |m, d| {
+        m | plow_asset::speech_flag_layout::conv_arms(d.op, &d.i, d.fj[1], d.fj[2])
+    })
+}
+
 /// Speech-object capability bits the instructions need (`plow_speech_caps_speech`): bit 0 a
 /// GemvF32Out row view (flag bit 12), bit 1 an AttentionF32 query view (flag bit 6),
 /// bit 2 FP16 LayerNorm output / projection operands.
@@ -141,14 +147,16 @@ pub(super) fn missing_speech_caps(required: u32, compiled: Option<u32>) -> u32 {
 /// Speech-op semantics a packet needs beyond its op set, as the object's
 /// `plow_speech_features_speech` bits (absent = none): bit 1 = Conv1dF32 / ConvTranspose1dF32
 /// flag bit 3 (wgmma tiles spanning taps / phases at widths % 4), bit 2 = Conv1dF32 flag bit 30
-/// (a split-image input). Bit 0 is retired: it named the ragged semantics on flag bit 21, which
-/// now carries the pinned-arms field.
+/// (a split-image input), bit 3 = Conv1dF32 flag bit 17 without bit 14 (the bf16 taps conv).
+/// Bit 0 is retired: it named the ragged semantics on flag bit 21, which now carries the
+/// pinned-arms field.
 pub(super) fn speech_features(insts: impl IntoIterator<Item = (u16, u32)>) -> u32 {
     insts.into_iter().fold(0, |m, (op, flags)| {
         let conv = op == DevOp::Conv1dF32 as u16;
         let ragged = (conv || op == DevOp::ConvTranspose1dF32 as u16) && flags >> 3 & 1 != 0;
         let split = conv && flags >> 30 & 1 != 0;
-        m | u32::from(ragged) << 1 | u32::from(split) << 2
+        let bf16 = conv && flags >> 17 & 1 != 0 && flags >> 14 & 1 == 0;
+        m | u32::from(ragged) << 1 | u32::from(split) << 2 | u32::from(bf16) << 3
     })
 }
 
@@ -281,6 +289,8 @@ fn ragged_conv_flags_require_the_speech_feature() {
     assert_eq!(speech_features([(DevOp::UnaryF32 as u16, 1 << 3)]), 0);
     assert_eq!(speech_features([(conv, 0x6e000 | 1 << 30)]), 4);
     assert_eq!(speech_features([(convt, 0xa000 | 1 << 30)]), 0);
+    assert_eq!(speech_features([(conv, 0x6a000)]), 8);
+    assert_eq!(speech_features([(convt, 0x6a000)]), 0);
 }
 
 #[cfg(test)]
@@ -742,6 +752,18 @@ impl CudaPacketRuntime {
             if !ops.is_empty() {
                 return Err(RuntimeError::Rejected(format!(
                     "{}: {} lacks speech ops {ops:?}; rebuild it for this packet",
+                    path.display(),
+                    object.display()
+                )));
+            }
+        }
+        if let Some(compiled) =
+            be.module_global_u32(&module, plow_asset::speech_flag_layout::CONV_ARMS_SYMBOL)?
+        {
+            let missing = speech_conv_arms(&blob) & !u64::from(compiled);
+            if missing != 0 {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {} lacks conv arms {missing:#x}; rebuild it for this packet",
                     path.display(),
                     object.display()
                 )));

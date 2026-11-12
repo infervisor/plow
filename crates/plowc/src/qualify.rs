@@ -1147,6 +1147,8 @@ mod tests {
             &[],
             Conv1dF32Stage {
                 input_split: false,
+                bf16_taps: false,
+                stream_in: None,
                 output_split: false,
                 output: TensorRef::Named("y"),
                 weight: TensorRef::Named("w"),

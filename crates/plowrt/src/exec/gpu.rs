@@ -15831,6 +15831,21 @@ impl GpuEngine {
             .module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
     }
 
+    /// [`Self::set_debug_max_inst`] for the depth stage alone: its programs run in the interpreter
+    /// objects whatever route serves the backbone rung, so a library-routed backbone does not
+    /// refuse the cap. The caller steps only the depth stage while a cap is set.
+    pub fn set_depth_debug_max_inst(&self, limit: u32) -> Result<bool> {
+        if !self.has_depth_stage() {
+            return Err(RuntimeError::Rejected("packet has no depth stage".into()));
+        }
+        for gw in self.gemv_wide_modules.iter().flatten() {
+            self.be
+                .module_global_set_u32(gw.module(), "plow_debug_max_inst_gw", limit)?;
+        }
+        self.be
+            .module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
+    }
+
     /// Reset the PLOW_NV_TRACE packet counter so [`Self::trace_summary`]
     /// reports only launches after this call (drop prefill/warmup). No-op on
     /// a normal cubin.

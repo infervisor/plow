@@ -920,7 +920,8 @@ struct ConvSpec {
     bool row_scale = false; /* t7 (Conv1d) */
     bool wide = false; /* flags bit 14: split-bf16 wide tiles */
     bool tapmajor = false; /* flags bit 15: weights [cout][kernel][cin/groups] */
-    bool wg = false; /* flags bit 17: the wgmma arm of the pointwise wide tile (sm_90a) */
+    bool wg = false; /* flags bit 17: the wgmma arm of the pointwise wide tile (sm_90a); without
+                      * `wide` (bit 14) the bf16 taps arm (PLOW_SPEECH_CONV_BF16) */
     bool dual = false; /* flags bit 19: alpha [cin | cout], an input then an output snake */
     bool rows = false; /* flags bit 16: the small-M rows arm (else the warp arm at cout <= 4) */
     bool splitk = false; /* flags bit 20: t7 is the wgmma tile's split-K scratch */
@@ -999,6 +1000,16 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
                 for (unsigned k = 0; k < s.kernel; k++)
                     memcpy(&c.host[w][(((size_t)o * s.kernel + k) * cg + i) * es], &src[(((size_t)o * cg + i) * s.kernel + k) * es], es);
     }
+    /* The bf16 taps arm reads bf16 operands: the golden gets the same rounded values, so it differs
+     * only by the sum order. */
+    if (s.wg && !s.wide && !s.f16 && !transpose)
+        for (unsigned id : {x, w})
+            for (size_t i = 0; i < c.host[id].size() / 4; i++) {
+                float v;
+                memcpy(&v, &c.host[id][i * 4], 4);
+                const uint32_t h = (uint32_t)bf16_rn(v) << 16;
+                memcpy(&c.host[id][i * 4], &h, 4);
+            }
     /* ConvTranspose: the merged-phase image [stride*cout][2*cin] of phase-major weights. */
     const bool wsplit = s.wg && s.groups == 1 && !s.f16 && (!transpose || (s.tapmajor && s.kernel == 2 * s.stride));
     if (wsplit && transpose) append_wsplit(c.host[w], s.stride * s.cout, 2 * s.cin);
@@ -1079,7 +1090,7 @@ static void t_conv_invariant(const char* name, const ConvSpec& s, bool transpose
     Case c; unsigned o;
     build_conv(c, s, transpose, o);
     const PlowDevInst ref = c.in;
-    if (s.wg && (transpose || s.cin % 64u == 0)) {
+    if (s.wg && (transpose || s.cin % 64u == 0 || !s.wide)) {
         const unsigned w = c.in.t[2], wp = c.add(c.host[w].size());
         c.host[wp] = c.host[w];
         const float nan = NAN;
@@ -1195,7 +1206,85 @@ static void t_conv_pair(const char* name, const ConvSpec& a, const ConvSpec& b, 
  * the flags, never from the batch. Mimi's ELU-pre k3 convs at both pins; the 12 Hz codec's 96->1
  * output conv on the warp arm at M 1 / 32 / 33 and batched; the wide and wgmma tiles at both
  * widths (bit-identical: per output the k order is the tile's). */
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16
+/* The bf16 taps arm (flags bit 17 without 14): 128 x 96 units with k-tiles spanning taps, 128 x 64
+ * and 64 x 128 units, input planes staged in groups, SnakeBeta / plain / residual epilogues, a
+ * partial M tile. The f32 weights are NaN
+ * (only the image is read); the golden runs on the same bf16-rounded operands (build_conv). */
+static void t_conv_bf16() {
+    struct G { const char* name; unsigned batch, rows, ch, dil; bool beta, res; };
+    const G gs[] = {{"Conv1dF32 bf16 n96 d9 beta", 5, 300, 96, 9, true, false},
+                    {"Conv1dF32 bf16 n96 d1 +res", 3, 200, 96, 1, false, true},
+                    {"Conv1dF32 bf16 n96 d3 M7", 1, 25, 96, 3, true, false},
+                    {"Conv1dF32 bf16 128x64 192 d9 beta", 4, 260, 192, 9, true, false},
+                    {"Conv1dF32 bf16 64x128 384 d3 beta", 3, 150, 384, 3, true, false},
+                    {"Conv1dF32 bf16 64x128 768 d1 groups", 4, 90, 768, 1, true, false},
+                    {"Conv1dF32 bf16 64x128 768 d9 groups +res", 2, 120, 768, 9, false, true}};
+    for (const G& g : gs) {
+        ConvSpec s{g.batch, g.rows, g.ch, g.ch, 7, 1, g.dil, 1, 0, 0, 0, 0, g.beta ? 12u : 0u, false, true, g.beta,
+                   g.res, {}, 0.f, true};
+        s.wg = true; s.tapmajor = true; s.pin = 1; s.beta = g.beta;
+        t_conv_invariant(g.name, s, false, 3e-4);
+    }
+}
+#endif
+
+/* The fused stream step (flags bit 22, dual + beta bits): a stream-input bf16 conv with the input
+ * SnakeBeta in its staging, then StreamTailF32 store mode 4 from [state; src], against the unfused
+ * chain StreamTail gather -> store -> UnaryF32 SnakeBeta -> bf16 conv. Output and state bit for bit:
+ * fresh streams (pos 0), n < L (the state shifts in place), n == L, n == N, n == 0 (n <= N). */
+static void t_conv_bf16_stream(const char* name, unsigned C, unsigned dil, unsigned N) {
+    const unsigned B = 4, slots = 6, L = 6u * dil;
+    ConvSpec s{B, L + N, C, C, 7, 1, dil, 1, 0, 0, 0, 0, 12, false, true, true, false, {}, 0.f, true};
+    s.wg = true; s.tapmajor = true; s.pin = 1; s.beta = true;
+    Case c; unsigned o;
+    build_conv(c, s, false, o);
+    const PlowDevInst conv = c.in;
+    const unsigned src = c.f32((size_t)B * N * C, 1.f), z = c.out((size_t)B * (L + N) * C);
+    const unsigned st_r = c.f32((size_t)slots * L * C, 1.f), st_f = c.add(c.host[st_r].size());
+    c.host[st_f] = c.host[st_r];
+    const unsigned a12 = c.f32(4u * C, 0.4f, 0.6f), a1 = c.add(8u * C), a2 = c.add(8u * C);
+    memcpy(c.host[a1].data(), c.host[a12].data(), 8u * C);
+    memcpy(c.host[a2].data(), c.host[a12].data() + 8u * C, 8u * C);
+    const unsigned slot = c.u32({3, 0, 5, 1}), n = c.u32({N, std::min(L - 2u, N - 1u), std::min(L, N), 0u}), pos = c.u32({0, 7, 4, 9});
+    const unsigned o_f = c.out((size_t)B * N * C);
+    c.upload();
+    void** td = upload_table(c.dev);
+    auto launch = [&](const PlowDevInst& in) {
+        k_speech<<<g_nblk, 256, kSmem>>>(in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+    };
+    PlowDevInst g{}, st{}, un{}, cr = conv, cf = conv, sf{};
+    for (auto* i : {&g, &st, &un, &sf})
+        for (auto& t : i->t) t = PLOW_TENSOR_NONE;
+    st_inst(g, z, src, st_r, slot, n, pos, B, slots, L, N, C, C, 0, C, 0);
+    st_inst(st, PLOW_TENSOR_NONE, z, st_r, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, C, 0, 0, 1);
+    un.op = PLOW_DOP_UNARY_F32; un.t[0] = z; un.t[1] = z; un.t[2] = a1;
+    un.i[0] = B * (L + N); un.i[1] = C; un.i[2] = 19;
+    cr.t[1] = z; cr.t[4] = a2;
+    for (const PlowDevInst& i : {g, st, un, cr}) launch(i);
+    cf.t[0] = o_f; cf.t[1] = src; cf.t[4] = a12; cf.t[5] = st_f; cf.t[6] = slot; cf.t[7] = pos;
+    cf.fj[2].u |= (12u << 4) | (1u << 19) | (1u << 22);
+    st_inst(sf, PLOW_TENSOR_NONE, src, st_f, slot, n, pos, B, slots, L, N, C, C, 0, C, 4);
+    launch(cf);
+    launch(sf);
+    auto same = [&](unsigned x, unsigned y) {
+        std::vector<uint8_t> hx(c.host[x].size()), hy(c.host[y].size());
+        CK(cudaMemcpy(hx.data(), c.dev[x], hx.size(), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hy.data(), c.dev[y], hy.size(), cudaMemcpyDeviceToHost));
+        return hx == hy;
+    };
+    const bool out_ok = same(o, o_f), state_ok = same(st_r, st_f);
+    printf("  %-34s fused == chain: out %s, state %s\n", name, out_ok ? "PASS" : "FAIL", state_ok ? "PASS" : "FAIL");
+    if (!out_ok || !state_ok) g_fail = 1;
+    CK(cudaFree(td));
+}
+
 static void t_conv_pinned() {
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16
+    t_conv_bf16();
+#endif
     {
         ConvSpec tc{4, 1024, 512, 256, 3, 1, 1, 1, 1, 1, 0, 8, 0, false, true, false, false, {}, 1.f, true};
         tc.pin = 1;
@@ -1354,6 +1443,13 @@ static void t_conv_pinned() {
         p1.sk = 1;
         t_conv_pair("Conv1dF32 pinned splitk P1 vs unsplit", p1, wo, false, true, 1e-4);
     }
+#endif
+    /* Last: the shared RNG sequence of the cases above stays as it was. */
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16
+    t_conv_bf16_stream("Conv1dF32 bf16 stream 96 d1", 96, 1, 40);
+    t_conv_bf16_stream("Conv1dF32 bf16 stream 96 d9", 96, 9, 136);
+    t_conv_bf16_stream("Conv1dF32 bf16 stream 192 d3", 192, 3, 70);
+    t_conv_bf16_stream("Conv1dF32 bf16 stream 768 d9 groups", 768, 9, 32);
 #endif
 }
 

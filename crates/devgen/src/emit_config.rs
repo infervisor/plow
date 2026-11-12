@@ -392,6 +392,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_CODEC_DEC_IN_WGMMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub codec_dec_in_wgmma: bool,
 
+    /// Codec split-bf16 taps convs that fit the arm (`conv_bf16_plan`) run one bf16 product on
+    /// staged-once input rows (sm_90a speech object, `PLOW_SPEECH_CONV_BF16`) instead of the
+    /// three-product split-bf16 tile. Changes PCM: a recipe sets it once its audio gates pass.
+    #[arg(long, env = "PLOW_EMIT_CODEC_CONV_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub codec_conv_bf16: bool,
+
     /// Measured Conv1dF32 arms per codec conv shape (tuning `codec_conv_arms.jsonl`): a shape
     /// listed with arm `rows` or `warp` takes flag bit 16 (sm_90 speech object); every other
     /// conv keeps the GEMM paths.
@@ -2036,6 +2042,7 @@ impl EmitConfig {
             snac_split_bf16: env_bool("PLOW_EMIT_SNAC_SPLIT_BF16"),
             codec_wgmma_ragged: env_bool("PLOW_EMIT_CODEC_WGMMA_RAGGED"),
             codec_dec_in_wgmma: env_bool("PLOW_EMIT_CODEC_DEC_IN_WGMMA"),
+            codec_conv_bf16: env_bool("PLOW_EMIT_CODEC_CONV_BF16"),
             codec_conv_arms: env_str("PLOW_EMIT_CODEC_CONV_ARMS").map(std::path::PathBuf::from),
             codec_conv_classes: env_str("PLOW_EMIT_CODEC_CONV_CLASSES")
                 .map(std::path::PathBuf::from),

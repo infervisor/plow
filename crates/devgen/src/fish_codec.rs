@@ -1037,6 +1037,8 @@ impl Seq {
                 pinned: true,
                 wgmma_ragged: false,
                 input_split: false,
+                bf16_taps: false,
+                stream_in: None,
                 output_split: false,
             },
             math,
@@ -1271,6 +1273,45 @@ fn program_for(
         } else {
             (c.kernel - 1) * c.dilation
         };
+        let rows = c.in_rows;
+        c.in_rows += tail;
+        (c.pad, c.pad_after) = if c.transpose {
+            (c.stride, Some(c.kernel - c.stride))
+        } else {
+            (0, Some(0))
+        };
+        c.len = packet::dev::TENSOR_NONE;
+        // The bf16 taps arm reads [state; x] in place (no z, no separate input SnakeBeta); the
+        // state takes its new tail after the conv has read the old one.
+        if crate::codec::bf16_taps_ok(&c, splits.is_some()) {
+            c.stream_in = Some((state.clone(), io.slot, io.pos));
+            let cin = c.cin;
+            let e = fused_conv(p, fuse, splits, x, dep, c)?;
+            let s = p.stream_tail_f32(
+                &[e.done],
+                StreamTailF32Stage {
+                    mode: StreamTailF32Mode::StoreSrc {
+                        src: x,
+                        pos: io.pos,
+                        src_stride: cin,
+                    },
+                    state: TensorRef::Named(&state),
+                    slot: io.slot,
+                    n: io.n[k],
+                    items: batch,
+                    slots: io.slots,
+                    tail,
+                    rows,
+                    cols: cin,
+                    z_cols: cin,
+                    z_col0: 0,
+                },
+            )?;
+            return Ok(Emitted {
+                output: e.output,
+                done: s.done,
+            });
+        }
         let z = carry(
             p,
             io,
@@ -1279,18 +1320,11 @@ fn program_for(
             dep,
             &state,
             batch,
-            c.in_rows,
+            rows,
             tail,
             c.cin,
             (c.cin, 0),
         )?;
-        c.in_rows += tail;
-        (c.pad, c.pad_after) = if c.transpose {
-            (c.stride, Some(c.kernel - c.stride))
-        } else {
-            (0, Some(0))
-        };
-        c.len = packet::dev::TENSOR_NONE;
         c.input_is_temp = true;
         fused_conv(p, fuse, splits, z.output, z.done, c)
     };
@@ -1377,6 +1411,7 @@ fn program_for(
             row_scale: None,
             alpha_out: None,
             taps_wgmma: crate::emit_config::active().codec_dec_in_wgmma,
+            stream_in: None,
             wgmma_ragged: false,
         };
         last = stateful(&mut p, c, last, pre, "state.codec.pre".into(), 0)?.done;
@@ -1538,6 +1573,7 @@ fn program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        stream_in: None,
         wgmma_ragged: ragged,
     };
     let other = |e: u32| if e == x { "act.codec.b" } else { "act.codec.a" };
@@ -1931,6 +1967,7 @@ fn mimi_program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        stream_in: None,
         wgmma_ragged: false,
     };
     // A causal ConvTranspose k = 2s: (rows - 1) * s + k outputs, the last k - s cropped.

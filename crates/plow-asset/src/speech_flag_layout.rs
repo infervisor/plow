@@ -21,6 +21,143 @@ pub const DEFAULT_LAYOUT: u32 = 2;
 /// `extern "C" __device__ unsigned` exported by every speech interpreter object.
 pub const OBJECT_SYMBOL: &str = "plow_speech_flag_layout_speech";
 
+/// `extern "C" __device__ unsigned` of a speech object compiled with a conv arm subset.
+pub const CONV_ARMS_SYMBOL: &str = "plow_speech_conv_arms_speech";
+
+/// Conv arms of `PLOW_SPEECH_CONV_ARMS` (`op_speech_f32.cuh` `SPA_*`). A speech object compiled
+/// with a subset exports it as [`CONV_ARMS_SYMBOL`]; the loader refuses a packet whose convs
+/// reach an arm outside it (the object would trap).
+pub mod conv_arm {
+    pub const ROWS: u64 = 1 << 0;
+    pub const DEPTHWISE: u64 = 1 << 1;
+    pub const STAGED: u64 = 1 << 2;
+    pub const DIRECT: u64 = 1 << 3;
+    pub const WIDE: u64 = 1 << 4;
+    pub const TC: u64 = 1 << 5;
+    pub const FFMA: u64 = 1 << 6;
+    pub const WG: u64 = 1 << 7;
+    pub const WG_CT: u64 = 1 << 8;
+    pub const ALL: u64 = (1 << 9) - 1;
+}
+
+/// The conv arms one Conv1dF32 / ConvTranspose1dF32 instruction can reach, mirroring the static
+/// half of `sp_wg_conv1d` and `d_conv1d_f32` (`op_speech_f32.cuh`): where the device choice also depends on operand
+/// alignment (the emitter aligns every tensor to 16 bytes) or the launch width, every outcome
+/// is included. The split-image and bf16 taps convs have their own defines and fail closed.
+pub fn conv_arms(op: u16, i: &[u32; 8], pads: u32, f: u32) -> u64 {
+    use conv_arm::*;
+    let transpose = op == DevOp::ConvTranspose1dF32 as u16;
+    if !transpose && op != DevOp::Conv1dF32 as u16 {
+        return 0;
+    }
+    let bit = |n: u32| (f >> n) & 1 == 1;
+    if !transpose && (bit(30) || (bit(17) && !bit(14))) {
+        return 0;
+    }
+    let (cin, cout, kernel, stride, groups) = (i[2], i[3], i[4], i[5], i[7].max(1));
+    let (cg, ng) = (cin / groups, cout / groups);
+    let (mode, pre, post) = (
+        if transpose { 0 } else { f & 3 },
+        (f >> 4) & 15,
+        (f >> 8) & 15,
+    );
+    let (wf16, tapmajor, ragged) = (bit(12), !transpose && bit(15), bit(3));
+    let pin = (f >> 21) & 0x1FF;
+    let pinned = pin & 1 != 0;
+    let pre_ok = pre == 0 || pre == 9;
+    let mut m = 0;
+    if transpose {
+        if bit(17) && bit(18) {
+            m |= WG_CT;
+            let ct = bit(15)
+                && kernel == 2 * stride
+                && groups == 1
+                && i[6] == 0
+                && pre == 0
+                && post == 0
+                && !wf16
+                && cin % 64 == 0
+                && (cout % 64 == 0 || (ragged && cout % 4 == 0 && cout >= 64));
+            if ct {
+                return m;
+            }
+        }
+    } else if bit(17) && !bit(16) {
+        m |= WG;
+        let pw = kernel == 1 && stride == 1 && pads == 0 && cg % 4 == 0 && pre == 0;
+        let taps = |channel_tiled: bool| {
+            kernel > 1
+                && (tapmajor || channel_tiled)
+                && stride == 1
+                && mode == 0
+                && groups == 1
+                && (cin % 64 == 0 || (ragged && !channel_tiled && cin % 4 == 0))
+                && pre_ok
+        };
+        let eligible = |channel_tiled: bool| {
+            (pw || taps(channel_tiled)) && (!bit(2) || taps(channel_tiled)) && cout % 4 == 0
+        };
+        let wide_static =
+            bit(14) && groups == 1 && cin % 4 == 0 && !wf16 && pre_ok && (kernel == 1 || tapmajor);
+        let takes = if !tapmajor && kernel > 1 {
+            eligible(true) && pre == 0 && post == 0 && !wf16 && bit(14) && bit(18) && !bit(20)
+        } else {
+            let grouped = groups > 1
+                && kernel == 1
+                && post == 0
+                && ng % 4 == 0
+                && cin % 4 == 0
+                && !wf16
+                && bit(14);
+            eligible(false) && (grouped || (bit(18) && wide_static))
+        };
+        if takes {
+            return m;
+        }
+    }
+    if !transpose && bit(16) && groups == 1 {
+        m |= ROWS;
+        if cout <= 4 {
+            return m;
+        }
+    }
+    if !transpose && cg == 1 && ng == 1 {
+        m |= DEPTHWISE;
+    }
+    if ng < 16 || cg * kernel < 16 {
+        if !transpose && pinned && groups == 1 && cout <= 4 {
+            m |= STAGED;
+        }
+        return m | DIRECT;
+    }
+    if !transpose
+        && bit(14)
+        && groups == 1
+        && cin % 4 == 0
+        && !wf16
+        && pre_ok
+        && (kernel == 1 || tapmajor)
+    {
+        m |= WIDE;
+        if mode == 0 {
+            return m;
+        }
+    }
+    m | if !bit(13) {
+        FFMA
+    } else if pinned {
+        if pin & 2 != 0 {
+            FFMA
+        } else {
+            TC
+        }
+    } else if !transpose && pre == 0 {
+        TC
+    } else {
+        TC | FFMA
+    }
+}
+
 /// Conv1dF32 / ConvTranspose1dF32 flags (`j1`, wire `fj[2]`) assigned since layout 0.
 pub const CONV_FLAGS: u32 = 0xffe0_000c;
 /// AttentionF32 `i6` bits assigned since layout 0.
@@ -358,6 +495,42 @@ mod tests {
         assert_eq!(
             required_layout([inst(DevOp::LayerNormF32, 0, 2, 8)]),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn conv_arms_of_the_qwen3_tts_codec() {
+        use conv_arm::*;
+        let (conv, convt) = (DevOp::Conv1dF32 as u16, DevOp::ConvTranspose1dF32 as u16);
+        // [batch, in_rows, cin, cout, kernel, stride, dil, groups], wire flags as emitted.
+        let arms = |op, i: [u32; 8], f: u32| conv_arms(op, &i, 0, f);
+        assert_eq!(arms(conv, [8, 17, 512, 1024, 1, 1, 1, 1], 0x266000), WG);
+        assert_eq!(arms(conv, [8, 19, 512, 1024, 3, 1, 1, 1], 0x26e000), WG);
+        assert_eq!(
+            arms(conv, [8, 23, 1024, 1024, 7, 1, 1, 1024], 0xa26000),
+            WG | DEPTHWISE | DIRECT
+        );
+        assert_eq!(
+            arms(conv, [8, 23, 96, 1, 7, 1, 1, 1], 0x226000),
+            WG | STAGED | DIRECT
+        );
+        assert_eq!(arms(convt, [8, 17, 192, 96, 6, 3, 0, 1], 0x26e008), WG_CT);
+        // bf16 taps and split-image convs: their own defines.
+        assert_eq!(
+            arms(conv, [8, 71, 96, 96, 7, 1, 9, 1], 0x26a00c | 12 << 8),
+            0
+        );
+        assert_eq!(
+            arms(conv, [8, 17, 512, 1024, 1, 1, 1, 1], 0x266000 | 1 << 30),
+            0
+        );
+        // Not pinned: the launch width picks tensor cores or FFMA for a transposed conv.
+        assert_eq!(arms(convt, [1, 9, 64, 64, 4, 2, 0, 1], 1 << 13), TC | FFMA);
+        assert_eq!(arms(conv, [1, 9, 64, 2, 3, 1, 1, 1], 1 << 16), ROWS);
+        assert_eq!(arms(conv, [1, 9, 64, 64, 3, 1, 1, 1], 0), FFMA);
+        assert_eq!(
+            arms(conv, [1, 9, 64, 64, 1, 1, 1, 1], 1 << 14 | 1 << 13),
+            WIDE
         );
     }
 }

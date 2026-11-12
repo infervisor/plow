@@ -817,6 +817,8 @@ impl<'s> Ops<'s> {
                     pinned: false,
                     wgmma_ragged: false,
                     input_split: c.in_split,
+                    bf16_taps: false,
+                    stream_in: None,
                     output_split: c.out_split,
                 },
             )
