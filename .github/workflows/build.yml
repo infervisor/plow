@@ -71,6 +71,7 @@ jobs:
       - name: Check the release build publishes
         run: |
           bash scripts/ci/release-version-selftest.sh
+          bash scripts/ci/release-needed-selftest.sh
           semver="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
           out="$(nix build .#plowrt-release --no-link --print-out-paths)"
           python3 scripts/ci/check_release.py "$semver" "$out"
@@ -234,10 +235,13 @@ jobs:
           test "$HOSTED_RESULT" = success
           test "$SELF_HOSTED_RESULT" = success || test "$SELF_HOSTED_RESULT" = skipped
 
-  # A merge to main is a release: CI picks the next version, bumps it with
-  # `nix run .#bump`, builds every Linux triple from that one commit, tags it
-  # and publishes to the registry (pdist). The bump commit is kept by its tag
-  # only and never reaches main, so main's Cargo.toml lags the tags by design.
+  # A merge to main that changes what plowrt or plowc is built from is a
+  # release: CI picks the next version, bumps it with `nix run .#bump`, builds
+  # every Linux triple from that one commit, tags it and publishes to the
+  # registry (pdist). A merge that touches only docs, recipes, perf data, CI
+  # or an unlinked crate releases nothing (scripts/ci/release_needed.py).
+  # The bump commit is kept by its tag only and never reaches main, so main's
+  # Cargo.toml lags the tags by design.
   release:
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -249,15 +253,27 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Full history: the last release's source is compared with this commit.
       - uses: actions/checkout@v4
-      - name: Decide the version
-        id: version
+        with:
+          fetch-depth: 0
+      - name: Is there anything to release
+        id: gate
         run: |
           git fetch --tags --force --quiet origin
-          echo "next=$(bash scripts/ci/release-version.sh)" >> "$GITHUB_OUTPUT"
+          needed="$(nix develop .#ci --command python3 scripts/ci/release_needed.py)"
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+          if [ "$needed" = false ]; then
+            echo "No release: nothing plowrt or plowc is built from changed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Decide the version
+        id: version
+        if: steps.gate.outputs.needed == 'true'
+        run: echo "next=$(bash scripts/ci/release-version.sh)" >> "$GITHUB_OUTPUT"
       # A release names its commit (`<semver>+<rev>`) and a dirty tree is
       # refused at publish, so the bump is committed before the build.
       - name: Bump
+        if: steps.gate.outputs.needed == 'true'
         env:
           NEXT: ${{ steps.version.outputs.next }}
         run: |
@@ -269,6 +285,7 @@ jobs:
               commit --quiet -m "plow: v$NEXT [skip ci]"
           fi
       - name: Build the release
+        if: steps.gate.outputs.needed == 'true'
         id: build
         env:
           NEXT: ${{ steps.version.outputs.next }}
@@ -284,12 +301,14 @@ jobs:
       # the next run takes the next number instead of reusing this one for
       # other bytes.
       - name: Tag
+        if: steps.gate.outputs.needed == 'true'
         env:
           NEXT: ${{ steps.version.outputs.next }}
         run: |
           git tag "v$NEXT"
           git push origin "refs/tags/v$NEXT"
       - name: Publish to the registry
+        if: steps.gate.outputs.needed == 'true'
         env:
           DIRS: ${{ steps.build.outputs.dirs }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

@@ -215,9 +215,14 @@ published manifest that references `/nix/store` is refused at pack time — an
 exported bundle must be portable.
 
 **Runtime binaries** (`<semver>+<commit>`, the semver saying what changed and the
-commit saying which source produced the bytes). A merge to `main` is a
-release, made by the `release` job in `.github/workflows/build.yml`:
+commit saying which source produced the bytes). A merge to `main` that changes
+what `plowrt` or `plowc` is built from is a release, made by the `release` job
+in `.github/workflows/build.yml`:
 
+0. `scripts/ci/release_needed.py` compares the last release's source with
+   the merge: the workspace crates either binary links (from `cargo
+   metadata`), `runtime/`, `include/`, the lock files, the flake and
+   `install.sh`. If none changed, the job stops and nothing is released.
 1. `scripts/ci/release-version.sh` picks the version: one patch past the
    newest `vX.Y.Z` tag, or Cargo's workspace version when someone raised it
    past that tag (`nix run .#bump -- X.Y.0`, for a minor or major release).
