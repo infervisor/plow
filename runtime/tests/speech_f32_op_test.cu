@@ -3161,6 +3161,23 @@ int main(int argc, char** argv) {
                 }
         return 0;
     }
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16
+    if (argc > 1 && !strcmp(argv[1], "--bench-conv-bf16")) {
+        /* The 12 Hz codec decoder's k7 residual convs at step.b8.f17 (8 items, SnakeBeta in). */
+        const unsigned shapes[][2] = {{96, 32646}, {192, 10886}, {384, 2726}, {768, 550}};
+        for (auto& sh : shapes)
+            for (unsigned dil : {1u, 9u}) {
+                const unsigned C = sh[0], rows = sh[1];
+                ConvSpec s{8, rows + 6u * dil, C, C, 7, 1, dil, 1, 0, 0, 0, 0, 12, false, true, true, false, {}, 0.f, true};
+                s.wg = true; s.tapmajor = true; s.pin = 1; s.beta = true;
+                Case c; unsigned o; build_conv(c, s, false, o);
+                char name[96];
+                snprintf(name, sizeof(name), "Conv1dF32 bf16 k7 %u d%u [8][%u]", C, dil, rows);
+                bench(name, c, 2.0 * 8 * rows * C * C * 7, 8.0 * 8 * rows * C, 20);
+            }
+        return 0;
+    }
+#endif
     if (argc > 1 && !strcmp(argv[1], "--bench-codec")) {
         for (bool tc : {false, true}) {
             ConvSpec s{32, 16384, 64, 64, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true,

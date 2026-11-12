@@ -5912,13 +5912,14 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
                 sm90_wg_fence();
 #pragma unroll
                 for (unsigned s2 = 0; s2 < 4u; s2++) {
-                    /* k16 group: (tap, channel group c16 within the staged planes). */
+                    /* k16 group: (tap, channel group c16 within the staged planes). Past K (the last
+                     * flat k-tile) the image's B is zero, so the group adds exact zeros reading tap 0:
+                     * any branch between the wgmmas makes ptxas serialize all of them (C7520). */
                     unsigned tap, c16;
                     if (flat) {
-                        const unsigned g = 4u * j + s2;
-                        if (g >= ng) break;
-                        tap = g / gpt;
-                        c16 = g - tap * gpt;
+                        const unsigned g = 4u * j + s2, gv = g < ng ? g : 0u;
+                        tap = gv / gpt;
+                        c16 = gv - tap * gpt;
                     } else {
                         tap = j / pg;
                         c16 = (j - tap * pg) * 4u + s2;
