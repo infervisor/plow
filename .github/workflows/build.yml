@@ -74,7 +74,7 @@ jobs:
           bash scripts/ci/release-needed-selftest.sh
           semver="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
           out="$(nix build .#plowrt-release --no-link --print-out-paths)"
-          python3 scripts/ci/check_release.py "$semver" "$out"
+          bash scripts/ci/check-release.sh "$semver" "$out"
           work="$(mktemp -d)"
           tar -xzf "$out"/*.tar.gz -C "$work" --strip-components=1
           "$work/plowrt" push-runtime --release "$out" --install-script scripts/install.sh \
@@ -239,7 +239,7 @@ jobs:
   # release: CI picks the next version, bumps it with `nix run .#bump`, builds
   # every Linux triple from that one commit, tags it and publishes to the
   # registry (pdist). A merge that touches only docs, recipes, perf data, CI
-  # or an unlinked crate releases nothing (scripts/ci/release_needed.py).
+  # or an unlinked crate releases nothing (scripts/ci/release-needed.sh).
   # The bump commit is kept by its tag only and never reaches main, so main's
   # Cargo.toml lags the tags by design.
   release:
@@ -261,7 +261,7 @@ jobs:
         id: gate
         run: |
           git fetch --tags --force --quiet origin
-          needed="$(nix develop .#ci --command python3 scripts/ci/release_needed.py)"
+          needed="$(nix develop .#ci --command bash scripts/ci/release-needed.sh)"
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
           if [ "$needed" = false ]; then
             echo "No release: nothing plowrt or plowc is built from changed." >> "$GITHUB_STEP_SUMMARY"
@@ -295,7 +295,7 @@ jobs:
           mapfile -t dirs < <(nix build .#plowrt-release .#plowrt-release-aarch64 \
             --no-link --print-out-paths)
           test "${#dirs[@]}" -eq 2
-          nix develop .#ci --command python3 scripts/ci/check_release.py "$NEXT" "${dirs[@]}"
+          nix develop .#ci --command bash scripts/ci/check-release.sh "$NEXT" "${dirs[@]}"
           echo "dirs=${dirs[*]}" >> "$GITHUB_OUTPUT"
       # Reserve the version before anything is uploaded: if the upload fails,
       # the next run takes the next number instead of reusing this one for

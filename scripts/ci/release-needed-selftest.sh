@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# release_needed.py against a throwaway repository.
+# release-needed.sh against a throwaway repository.
 set -euo pipefail
-script="$(cd "$(dirname "$0")" && pwd)/release_needed.py"
+script="$(cd "$(dirname "$0")" && pwd)/release-needed.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir "$work/repo"
@@ -15,14 +15,14 @@ export PLOW_REGISTRY="file://$work/registry"
 index() {
   mkdir -p "$work/registry/v1/plow-runtime"
   local rows="" v
-  for v in "$@"; do rows="$rows{\"semver\":\"$v\"},"; done
+  for v in "$@"; do rows="$rows{\"semver\": \"$v\"},"; done
   echo "{\"releases\":[${rows%,}]}" > "$work/registry/v1/plow-runtime/index.json"
 }
 
 commit() { mkdir -p "$(dirname "$1")"; echo "$RANDOM$RANDOM" >> "$1"; git add -A; git commit -qm "${2:-change $1}"; }
 expect() { # $1 = want, $2 = why
   local got
-  got="$(python3 "$script" --watch crates/plowrt Cargo.lock 2>/dev/null)"
+  got="$(bash "$script" --watch crates/plowrt Cargo.lock 2>/dev/null)"
   [ "$got" = "$1" ] || { echo "$2: got $got, want $1" >&2; exit 1; }
 }
 
