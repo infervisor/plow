@@ -235,8 +235,8 @@ impl Cfg {
         let Some(extra) = extra else {
             return Ok(defaults.to_vec());
         };
-        if !self.mimi || extra.trim().is_empty() {
-            return Err("extra codec steps require Mimi and batch:frames pairs".into());
+        if extra.trim().is_empty() {
+            return Err("extra codec steps require batch:frames pairs".into());
         }
         let mut steps = defaults.to_vec();
         for pair in extra.split(',') {
@@ -260,6 +260,12 @@ impl Cfg {
                 || max_rows.is_some_and(|max| rows > max)
             {
                 return Err(format!("codec step {pair} exceeds the row/output capacity"));
+            }
+            // Only Mimi's state tensors grow past STREAM_SLOTS.
+            if !self.mimi && batch > STREAM_SLOTS {
+                return Err(format!(
+                    "codec step {pair} exceeds {STREAM_SLOTS} stream slots"
+                ));
             }
             steps.push((batch, frames));
         }
@@ -2767,6 +2773,12 @@ mod tests {
         assert!(breeze()
             .step_capacities(&[(1, 1)], Some("320:1"), None)
             .is_err());
+        assert_eq!(
+            breeze()
+                .step_capacities(&[(1, 1), (16, 17)], Some("16:8"), None)
+                .unwrap(),
+            [(1, 1), (16, 8), (16, 17)]
+        );
     }
 
     #[test]

@@ -3052,6 +3052,11 @@ async fn stream_task(
     let mut primed = false;
     let mut windowed = model.codec.step_frames == 0;
     let stream_deadline = crate::config::RuntimeConfig::get().tts_stream_deadline;
+    let step_cap = crate::config::RuntimeConfig::get()
+        .tts_stream_step_frames
+        .map_or(model.codec.step_frames, |n| {
+            n.clamp(1, model.codec.step_frames.max(1))
+        });
     // This stream's codec step time (seconds, running average): what an urgent step still costs.
     let mut step_s = 0.02f64;
     loop {
@@ -3336,14 +3341,7 @@ async fn stream_task(
                 }
             } else if let Some(slot) = slot.as_mut() {
                 let urgent = stream_deadline && step_urgent(due, pace.since(), n, step_s);
-                let Some(k) = step_plan(
-                    n,
-                    emitted,
-                    done,
-                    first_frames,
-                    model.codec.step_frames,
-                    urgent,
-                ) else {
+                let Some(k) = step_plan(n, emitted, done, first_frames, step_cap, urgent) else {
                     break;
                 };
                 let codes = frames.slice(emitted * fc..(emitted + k) * fc, fc);
@@ -3410,7 +3408,7 @@ async fn stream_task(
                                 upto + if tick_audio {
                                     1
                                 } else {
-                                    step_need(upto, first_frames, model.codec.step_frames)
+                                    step_need(upto, first_frames, step_cap)
                                 },
                             );
                         }

@@ -323,6 +323,36 @@ Codec step, one persistent interpreter launch, us (`packet_bench`, median of 20,
     - fuller codec launches without holding the talker (codec beside the talker tick, not serial with it);
     - the served talker frame vs isolated (39 vs ~26 ms).
 
+### Where c512 throughput stops (admission, codec padding, rung controller)
+
+- KV admission: each Qwen3-TTS slot commits its full 2048-row KV (224 MiB), and the codec's
+  b128 / b256 x f17 step capacities sized a 29 GiB arena. Capping codec steps at 1088 rows
+  (`PLOW_EMIT_FISH_CODEC_MAX_ROWS=1088`: those two capacities ran 2 and 0 times at c512) cuts the
+  codec to 8.9 GiB and lifts the KV budget 36.7 -> 56.9 GiB (163 -> 260 sequences). Throughput did
+  not move: memory was not the limit.
+- Realtime admission (`PLOW_TTS_REALTIME=0` A/B): c512 198.7 aps either way; the best open-loop
+  cell with it off is 257 aps with stalls. The cap is GPU time per frame (~0.35 ms: codec ~0.18,
+  talker ~0.17 at 80-100 rows per tick).
+- Codec steps pay their full padded shape: b16 x f17 is 18.9 ms with every stream carrying 1, 2,
+  4, 8 or 17 new frames, b64 x f17 65.4 ms (`packet_bench`, `PB_STEP_FRAMES`). Served launches
+  mixed the 2, 2, 4, 8, 16, 17 step ramp and padded every job to the longest.
+- `PLOW_TTS_STREAM_STEP_FRAMES` caps a stream's later steps (runtime, opt-in). Equal short steps
+  pad less: codec ms per frame at c512 0.231 (packet cap 17) -> 0.189 (4) -> 0.179 (2). Gaps drop
+  sharply (c512 544 -> 98, 30 req/s first audio p90 344 -> 109 ms); peak throughput stays ~200.
+- The decode rung controller narrowed 256 -> 128 with 200+ requests queued, and at 40-60 req/s
+  to 16-48 rows. Its throughput seat compares rungs by tick service time, and the codec's work
+  inside a tick lags the rows that caused it, so narrow rungs read cheap. With a coupled stage
+  the seat now follows demand only (step cap 2, 4 vs 4 runs, audio s/s):
+
+  | binary | c128 | c256 | c512 | 40 req/s | 50 req/s | 60 req/s |
+  |---|---:|---:|---:|---:|---:|---:|
+  | throughput seat | 170.5 | 174.2 | 212.4 | 197.6 | 226.9 (20 refused, p99 first audio 6.3 s) | 229.3 |
+  | demand seat with a coupled codec | 176.5 | 177.7 | 223.3 | 197.3 | 234.5 (0 refused, 3.6 s) | 234.5 |
+
+  Rung switches 359 -> 46 over the run. No faults.
+- Open: GPU time per frame. The codec pays for padded frames (ragged step rows) and a ~3.9 ms
+  floor per launch; the talker runs 80-100 rows per tick at ~0.17 ms per frame.
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |

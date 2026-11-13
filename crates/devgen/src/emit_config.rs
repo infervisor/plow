@@ -421,7 +421,8 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_FISH_CODEC_MAX_ROWS")]
     pub fish_codec_max_rows: Option<u32>,
 
-    /// Extra Mimi stateful step capacities as comma-separated batch:frames pairs.
+    /// Extra stateful codec step capacities as comma-separated batch:frames pairs (batch over
+    /// the 256 stream slots: Mimi only).
     #[arg(long, env = "PLOW_EMIT_CODEC_STEP_CAPACITIES")]
     pub codec_step_capacities: Option<String>,
 

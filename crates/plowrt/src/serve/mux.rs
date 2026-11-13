@@ -2351,6 +2351,7 @@ fn spawn_scoped(
                 );
                 if let Some(rc) = rung_controller.as_mut() {
                     rc.set_fast_probe(crate::serve::policy::fast_probe());
+                    rc.set_throughput(!downstream.coupled());
                 }
                 if admission != before {
                     Metrics::inc(&metrics.decode_rung_switches);
