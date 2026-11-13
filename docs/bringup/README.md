@@ -47,6 +47,8 @@ Stages 4/5 iterate; stage 8 is the steady-state optimization loop after stage 6.
 - FP32, multimodal and serve-golden gates, gate relaxation: "Gates".
 - Same-session A/B, repeats and noise: "A/B rule".
 - Measurement hazards: "Measurement hazards".
+- ASR/TTS stages: served split (step time vs occupancy), codec invariance before timing,
+  per-bucket objects, fail-closed variants: §9 "Speech serving campaigns".
 - Final plow-vs-baseline comparison: "Final performance report (strict)".
 
 ## Results

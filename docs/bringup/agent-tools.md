@@ -132,7 +132,8 @@ Speech stages use the same harness with these tools:
 | demand per bucket | `scripts/campaign/bucket_demand.py` |
 
 A final report that lacks the roofline table, the fusion list or the per-op targets is incomplete,
-whatever its serving numbers say.
+whatever its serving numbers say. Speech campaigns also follow §9 "Speech serving campaigns"
+(served split, per-bucket objects, fail-closed variants, codec invariance before timing).
 
 ## Working rules (every agent)
 
@@ -961,6 +962,49 @@ Each rule cost at least one campaign a day of misattributed results.
   `PYTHONPATH` produced results that had to be voided after the lease.
 * Recipe gates serve `--assets` from the emit tree with the prepared checkpoint; they prove the
   packet, not the distribution path (below).
+
+**Speech serving campaigns (lessons from the 2026-11 serving-concurrency campaign)**
+
+Mandatory for ASR/TTS stages (encoder, talker, depth / code predictor, codec, vocoder). Each step
+names its output; a report without it is incomplete.
+
+1. **Served split first.** For every served cell take `/metrics` *deltas* for that cell (the
+   counters are cumulative across cells): launches, mean rows per launch and padded rows per family
+   and capacity, single-row ticks, tick time per phase, playback stalls and underrun seconds. From
+   the full-batch step time compute the ideal rate (`concurrency x audio per step / step time`) and
+   split the gap to the peer into **step time** (kernel work, the roofline table) and **occupancy**
+   (rows per tick below concurrency, single-row ticks, stalls). Report both. Maya2 c128: full-batch
+   tick ~44 ms gives ~230 audio-s/s, the served rate was 141, and half the ticks carried one row.
+   A kernel win that the occupancy term cannot pass through is not reported as a serving win.
+2. **Codec numeric contract before any timing.** Every codec candidate runs `codec_stream_check`
+   (stream / whole / mixed, chunk 2 and random) against the production packet: PCM rel-L2 / SNR and
+   the invariance line. A new DIFFERS that the production packet does not show stops the candidate;
+   a pre-existing one is recorded as an open item, never folded into a verdict.
+3. **Per-packet-bucket objects.** An interpreter object compiles only the bodies its packet's
+   classes use (variant mask symbol such as `PLOW_SPEECH_CONV_BF16_VARIANTS`, conv object
+   ladders). Before timing a new body, read `cuobjdump --dump-resource-usage` for every variant:
+   STACK above the control's or LOCAL spill is fixed first (a second accumulator set spilled at the
+   register cap and slowed every conv 6-10%).
+4. **Fail closed on new arithmetic.** A packet whose ops need a new body sets a capability bit or
+   symbol that the loader checks; an object without it must refuse the packet at load. Prove it once:
+   the old object against the new packet fails with the capability error.
+5. **Pins and knobs must be seen to apply.** After an emit with class pins or a new emit knob, count
+   the affected stages in `plowrt disasm --format json` (flags, units). A pin file that matched no
+   class is an error: a key built from the activation's flag code instead of its class code matched
+   nothing and cost a lease.
+6. **Every binary the lease runs is rebuilt and named.** `plowrt`, each example
+   (`packet_bench`, `codec_stream_check`, `step_bench`) and any lib-test binary are rebuilt from the
+   same tree and their sha256 printed in the lease log. Stale examples computed an old variant mask
+   and refused a valid packet.
+7. **Interleaved arms, frozen inputs.** Program and step timings run A/B/A/B in one lease with >= 2
+   repeats per arm; no compile, emit or cargo build in or beside a timing lease. Attribute a block
+   regression per variant (variant mask bisection) before redesigning it: uncoalesced partial
+   stores, not the suspected arithmetic, cost 120 us at b64.
+8. **Lands only where it wins.** A mechanism that is correct but loses at served rungs lands only
+   as a per-class tuning pin no recipe sets (never a default-off `PLOW_*` knob, "Builds"); the
+   results doc records the loss table.
+9. **Disk.** Speech packets are 6+ GB each. Check free space before an emit, remove your own
+   superseded packets when a decision is made (keep any a kept packet symlinks into), never others'.
 
 **Release and distribution**
 
