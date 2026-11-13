@@ -639,7 +639,7 @@ fn lower(
             width,
             head_width: 64,
             group_rows: output_shape[3] * 8,
-            round_score_bf16: true,
+            round_score_bf16: false,
             round_probability_bf16: true,
             round_output_bf16: true,
         },
@@ -1071,7 +1071,7 @@ pub fn append_audio_transformer_layers(
                 width: spec.width,
                 head_width: spec.head_width,
                 group_rows: spec.group_rows,
-                round_score_bf16: true,
+                round_score_bf16: false,
                 round_probability_bf16: true,
                 round_output_bf16: true,
             },
@@ -1502,7 +1502,8 @@ mod tests {
             .flat_map(|p| &p.insts)
             .find(|i| DevOp::from_u16(i.op) == Some(DevOp::GroupedAttentionF32))
             .unwrap();
-        assert_eq!(attention.i[4], 7 | 8);
+        // f32 scores (the peer's FlashAttention), bf16 probability and output, group table.
+        assert_eq!(attention.i[4], 6 | 8);
         assert_eq!(attention.t[4], packets.groups);
         let dense: Vec<_> = packets.packed_programs[&2]
             .iter()
