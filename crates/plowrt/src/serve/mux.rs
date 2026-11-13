@@ -2316,6 +2316,7 @@ fn spawn_scoped(
                     .front()
                     .map(|(_, arrived)| now.saturating_duration_since(*arrived).as_secs_f64() * 1e3)
                     .unwrap_or(0.0);
+                controller.set_throughput(!downstream.coupled());
                 let decision = controller.decide(RungLoad {
                     occupied_extent,
                     queued,
@@ -2351,7 +2352,6 @@ fn spawn_scoped(
                 );
                 if let Some(rc) = rung_controller.as_mut() {
                     rc.set_fast_probe(crate::serve::policy::fast_probe());
-                    rc.set_throughput(!downstream.coupled());
                 }
                 if admission != before {
                     Metrics::inc(&metrics.decode_rung_switches);
