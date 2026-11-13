@@ -3793,8 +3793,36 @@ pub(crate) fn conv_bf16_geometry(
         2 => (128, 64),
         _ => (64, 128),
     };
-    let units = u64::from(batch) * u64::from(out_rows).div_ceil(bm) * u64::from(cout).div_ceil(nu);
+    let tn = u64::from(cout).div_ceil(nu);
+    if kind == 3 {
+        if let Some(ipt) = conv_bf16_items(cin, kernel, dilation, out_rows) {
+            return Some((bm as u32, u64::from(batch).div_ceil(ipt) * tn));
+        }
+    }
+    let units = u64::from(batch) * u64::from(out_rows).div_ceil(bm) * tn;
     Some((bm as u32, units))
+}
+
+/// Items per unit of a kind-3 bf16 taps conv over items of at most 8 output rows (op_speech_f32.cuh
+/// `spb_ipt` over `spb_plan`'s planes per group): the widest of 8 / 4 / 2 whose 8-row-aligned item
+/// windows and the dropped groups' read pad (`spb_items_pad`) fit beside B and the parameters.
+fn conv_bf16_items(cin: u32, kernel: u32, dilation: u32, out_rows: u32) -> Option<u64> {
+    const ARENA: u64 = 33280 * 4 - 1024;
+    const BB: u64 = 128 * 128;
+    if out_rows > 8 {
+        return None;
+    }
+    let (k, dil) = (u64::from(kernel), u64::from(dilation));
+    let planes = u64::from(cin).div_ceil(64);
+    let rpad64 = (64 + (k - 1) * dil + 7) & !7;
+    let pg = (1..=planes)
+        .rev()
+        .find(|&pg| planes % pg == 0 && pg * rpad64 * 128 + 2 * BB + 3 * 128 * 4 <= ARENA)?;
+    let w = (u64::from(out_rows) + (k - 1) * dil + 7) & !7;
+    [8u64, 4, 2].into_iter().find(|&ipt| {
+        let pad = ((7 * w + (k - 1) * dil + 8).saturating_sub(ipt * w) + 7) & !7;
+        (pg * ipt * w + pad) * 128 + 2 * BB + 3 * 128 * 4 <= ARENA
+    })
 }
 
 fn conv1d_units(
@@ -3878,6 +3906,22 @@ fn repeated(n_cu: u32, blocks: u32) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bf16_taps_short_items_share_a_unit() {
+        // The codec's dec.in (1024 -> 1536 k7) at 2 frames (8 rows per item): 4 items per unit.
+        assert_eq!(conv_bf16_items(1024, 7, 1, 8), Some(4));
+        assert_eq!(
+            conv_bf16_geometry(1024, 1536, 7, 1, 64, 8),
+            Some((64, 16 * 12))
+        );
+        assert_eq!(conv_bf16_geometry(1024, 1536, 7, 1, 1, 4), Some((64, 12)));
+        assert_eq!(
+            conv_bf16_geometry(1024, 1536, 7, 1, 16, 68),
+            Some((64, 16 * 2 * 12))
+        );
+        assert_eq!(conv_bf16_items(1024, 7, 1, 9), None);
+    }
 
     #[test]
     fn fp32_convolution_math_rejects_split_storage() {
