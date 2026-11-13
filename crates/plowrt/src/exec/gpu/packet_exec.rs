@@ -2220,6 +2220,87 @@ fn native_gemm_layer_matches_packet() {
     be.module_unload(&module).unwrap();
 }
 
+/// Per-segment device time of one program (SPEECH_SEG_PKT, SPEECH_SEG_PROGRAM): every segment
+/// launched alone between two events, median of 10 rounds. `conv` rows ran on the conv object.
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; per-segment timing, run only through gpuq"]
+fn speech_segment_times() {
+    let path = std::path::PathBuf::from(std::env::var("SPEECH_SEG_PKT").unwrap());
+    let program: usize = std::env::var("SPEECH_SEG_PROGRAM")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let rt = CudaPacketRuntime::load_on(be.clone(), &path).unwrap();
+    let p = &rt.programs[program];
+    let events: Vec<_> = (0..=p.segments)
+        .map(|_| be.event_create(true).unwrap())
+        .collect();
+    let mut times = vec![Vec::new(); p.segments];
+    for round in 0..14 {
+        be.memset_d8_async(p.counters, 0, p.counter_bytes, &rt.stream)
+            .unwrap();
+        be.event_record(&events[0], &rt.stream).unwrap();
+        for seg in 0..p.segments {
+            if let (Some(c), Some((mut inst, blocks))) = (&rt.conv, p.conv_segments[seg]) {
+                let mut tensors = p.kernarg.tensors;
+                let mut params = [
+                    &mut inst as *mut u64 as *mut std::ffi::c_void,
+                    &mut tensors as *mut u64 as *mut std::ffi::c_void,
+                ];
+                be.launch_kernel(
+                    c.function,
+                    blocks,
+                    BLOCK,
+                    c.smem,
+                    &mut params,
+                    Some(&rt.stream),
+                )
+                .unwrap();
+            } else {
+                let mut arg = p.kernarg;
+                arg.gq_seg_ofs += (seg * 4) as u64;
+                arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                be.launch_cooperative(
+                    rt.function,
+                    rt.grid,
+                    BLOCK,
+                    rt.smem,
+                    &mut params,
+                    Some(&rt.stream),
+                )
+                .unwrap();
+            }
+            be.event_record(&events[seg + 1], &rt.stream).unwrap();
+        }
+        be.event_synchronize(&events[p.segments]).unwrap();
+        if round >= 4 {
+            for (seg, t) in times.iter_mut().enumerate() {
+                t.push(be.event_elapsed_ms(&events[seg], &events[seg + 1]).unwrap() * 1000.);
+            }
+        }
+    }
+    let mut total = 0.0;
+    for (seg, t) in times.iter_mut().enumerate() {
+        t.sort_by(f32::total_cmp);
+        total += t[5];
+        let kind = match p.conv_segments[seg] {
+            Some((_, blocks)) => format!("conv blocks={blocks}"),
+            None => "interp".into(),
+        };
+        println!(
+            "SPEECH_SEG program={program} seg={seg} {kind} us={:.1}",
+            t[5]
+        );
+    }
+    println!(
+        "SPEECH_SEG program={program} segments={} total_us={total:.1}",
+        p.segments
+    );
+}
+
 /// The conv object runs a packet's conv segments with the speech object's bits: every tensor after
 /// one run from the same initial bytes, with and without it. Env: SPEECH_CONV_PKT (its assets hold
 /// the `_speechconv` cubin), SPEECH_CONV_PROGRAMS (indices; default every program with a conv

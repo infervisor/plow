@@ -387,6 +387,16 @@ ring, so the per-layer carry gather / store pairs are gone.
   (256 rows instead of 128 at 130 KiB). Staging keeps four float4 loads in flight per thread instead
   of one scalar load. PCM is bit-identical (stream, whole and mixed, chunks 2 and random). Step:
   b64 x f2 11.32 -> 11.03 ms, b32 x f2 7.47 -> 7.31, b16 x f17 18.70 -> 18.05, b1 x f1 unchanged.
+- Per-segment device time (`speech_segment_times`, each segment launched alone): b64 x f2 10.74 ms =
+  33 conv-object segments 7.15 ms + 22 interpreter segments 3.60 ms. The first interpreter segment
+  (embed, pre-conv, 8-layer transformer at 128 rows) is 2.05 ms.
+- Split-K class pins on that segment's pointwise convs (1024 -> 512 at 16 blocks, 512 -> 1024,
+  512 -> 3072; 2-8 parts): segment 2.05 -> 1.99 ms, step -0.6 %, b16 x f17 +0.6 to +4.7 %. Not
+  adopted. The segment is bound by per-instruction latency, not by those convs' parallelism.
+- Reference conv library (bf16, channels-last, same shapes, standalone): 61-80 us for the 768-96
+  channel k7 convs vs 225-350 us here, 24 us for dec.in vs 647, 37 us for a 96-channel k1 vs 210.
+  Its fp32 path is 4x slower than these convs. The k7 convs already run single-product bf16, so the
+  3.7-5x gap is the kernel: synchronous A staging per unit, one k-tile in flight, per-item row tiles.
 
 ## TTS
 
