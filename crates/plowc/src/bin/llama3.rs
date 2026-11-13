@@ -76,19 +76,12 @@ fn cfg_from(dir: &Path) -> Cfg {
 
 /// Pick the GEMM tile for one shape.
 ///
-/// DELEGATES to [`devgen::gfx950_prefill_tile`], which is the picker the
-/// emitters actually use. This function used to be a second implementation —
-/// three hardcoded rungs and a 17-line inline `rounds * work / intensity`
-/// heuristic — and it had drifted: the real ladder is FIVE rungs in each of
-/// three weight encodings (`devgen`'s `GFX950_RUNGS`), chosen against measured
-/// `tunedb` records with an analytical fallback, keyed by hardware fingerprint.
-/// So this binary reported a tile the build would not emit.
-///
-/// `kernelcaps::select` names this exact pair as the problem it exists to end
-/// ("two of those exist today … they disagree with each other"), and
-/// `docs/arch/10-implementation-status.md` still lists it as the highest
-/// outstanding item. `gfx950_prefill_tile` is `pub` precisely so a caller
-/// outside the emitters can ask what the build would emit.
+/// DELEGATES to [`devgen::gfx950_prefill_tile`], which routes through
+/// [`kernelcaps::select_kernel`] over the 5-rung gfx950 inventory (`GFX950_RUNGS`)
+/// with `tunedb` measurements and an analytical `costmodel` fallback. This
+/// function used to be a second implementation — three hardcoded rungs and a
+/// 17-line inline `rounds * work / intensity` heuristic — that drifted from the
+/// real emitters.
 fn pick_tile(m: u32, n: u32, k: u32, n_cu: u32) -> DevOp {
     devgen::gfx950_prefill_tile(m, n, k, n_cu, kernelcaps::QuantScheme::None)
 }
@@ -290,10 +283,18 @@ fn emit_phase(b: &mut Builder, c: &Cfg, n: &Tn, t: u32, ctx: u32, decode: bool, 
                 deps: &[u32]|
      -> u32 {
         let fold = decode && gamma != TENSOR_NONE;
+        // When the 256x256 tile count already fits inside the partition (`cus.len()`),
+        // rank narrower candidates against the CU slice this op actually runs on (`split3` /
+        // `split2`), matching `devgen`'s `proj` budget rule.
+        let budget = if tiles(m, nn) <= cus.len() as u32 {
+            cus.len() as u32
+        } else {
+            n_cu
+        };
         let op = if decode {
             DevOp::Gemv
         } else {
-            pick_tile(m, nn, k, n_cu)
+            pick_tile(m, nn, k, budget)
         };
         b.emit(op, cus, deps, |d| {
             d.t[0] = out;
@@ -467,9 +468,13 @@ fn emit_phase(b: &mut Builder, c: &Cfg, n: &Tn, t: u32, ctx: u32, decode: bool, 
         });
         let (mlp_src, mlp_g) = (n.hn, TENSOR_NONE);
 
-        // SwiGLU fusion (decode: GemvGlu, prefill: GemmGlu when the tile is 256x256).
+        // SwiGLU fusion (decode: GemvGlu, prefill: GemmGlu when the 256x256 fused epilogue
+        // beats the unfused triple). Uses `gfx950_glu_fusion_wins` rather than
+        // `pick_tile(..) == DevOp::Gemm`: once `pick_tile` migrated to the 5-rung selector,
+        // a shape where `GemmWide` or `GemmC5` wins for a single GEMM would otherwise unfuse
+        // the MLP into two GEMMs + `Glu` and materialize both halves to HBM.
         let glu_fused = decode && (t as u64 * c.hidden as u64) <= gm_lds_halves();
-        let gemm_glu = !decode && pick_tile(t, c.inter, c.hidden, n_cu) == DevOp::Gemm;
+        let gemm_glu = !decode && devgen::gfx950_glu_fusion_wins(t, c.inter, c.hidden, n_cu);
         let c_d = if glu_fused {
             let c_gl = b.emit(DevOp::GemvGlu, all.clone(), &[c_pn], |d| {
                 d.t[0] = n.fu;
@@ -746,4 +751,71 @@ fn split3(n: u32, a: u32, b: u32, c: u32) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         (sa..sa + sb).collect(),
         (sa + sb..n).collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn llama3_8b_cfg() -> Cfg {
+        Cfg {
+            hidden: 4096,
+            inter: 14336,
+            layers: 1,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            vocab: 128256,
+            eps: 1e-5,
+            rope_theta: 500_000.0,
+            tie_word_embeddings: false,
+        }
+    }
+
+    #[test]
+    fn pick_tile_matches_shared_gfx950_selector() {
+        for &(m, n, k, n_cu) in &[
+            (128u32, 4096u32, 4096u32, 256u32),
+            (128, 1024, 4096, 256),
+            (512, 1024, 4096, 256),
+            (4096, 4096, 4096, 256),
+            (4096, 1024, 4096, 256),
+            (4096, 14336, 4096, 256),
+            (8192, 1024, 4096, 256),
+            (1, 128256, 4096, 256),
+        ] {
+            assert_eq!(
+                pick_tile(m, n, k, n_cu),
+                devgen::gfx950_prefill_tile(m, n, k, n_cu, kernelcaps::QuantScheme::None),
+                "shape {m}x{n}x{k} at {n_cu} CUs"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_emit_uses_shared_glu_fusion_gate_and_partition_budget() {
+        let c = llama3_8b_cfg();
+        let n_cu = 256;
+        let ctx = 4096;
+        let t = 4096;
+        let ns_pre = n_cu
+            .div_ceil((t.div_ceil(Q_TILE_ROWS) * c.heads).max(1))
+            .max(1);
+
+        let mut tb = Builder::new(n_cu);
+        let tn = declare(&mut tb, &c, ctx, ns_pre);
+        let mut b = Builder::new(n_cu);
+        b.adopt_tensors(tb.tensors());
+        emit_phase(&mut b, &c, &tn, t, ctx, false, n_cu);
+        let prog = b.finish();
+
+        assert!(
+            prog.insts.iter().any(|i| i.op == DevOp::GemmGlu as u16),
+            "4k prefill on LLaMA-3 8B must fuse gate/up into GemmGlu"
+        );
+        assert!(
+            !prog.insts.iter().any(|i| i.op == DevOp::Glu as u16),
+            "fused 4k prefill must not emit a standalone Glu packet"
+        );
+    }
 }

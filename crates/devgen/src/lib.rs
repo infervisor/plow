@@ -718,9 +718,8 @@ fn nvidia_prefill_gemm_op(quant: kernelcaps::QuantScheme) -> DevOp {
 
 /// [`pick_tile`], public, so a caller outside the emitters can ask what this build would emit.
 ///
-/// `plowc tune` reports a selection it re-derives with `NoMeasurements`, which is how it came
-/// to print a different tile than the build emits. Anything that wants to *report* the choice
-/// should ask the same function that *makes* it.
+/// Anything that wants to *report* or reuse the compiler's choice (`llama3`, tests, or external
+/// tools) should ask the same function that *makes* it rather than maintaining a parallel heuristic.
 pub fn gfx950_prefill_tile(
     m: u32,
     n: u32,
@@ -730,6 +729,13 @@ pub fn gfx950_prefill_tile(
 ) -> DevOp {
     // Public AMD entry — always the gfx950 inventory regardless of ambient emit target.
     with_emit_target_amd(true, || pick_tile(m, n, k, n_cu, quant))
+}
+
+/// [`glu_fusion_wins`], public, so a standalone emitter outside `devgen` (such as `llama3`)
+/// applies the same 3-rung (`Gemm` / `GemmMed` / `GemmSmall`) `GemmGlu` fusion gate rather than
+/// testing `gfx950_prefill_tile(..) == DevOp::Gemm` against the 5-rung single-GEMM ladder.
+pub fn gfx950_glu_fusion_wins(m: u32, n: u32, k: u32, n_cu: u32) -> bool {
+    with_emit_target_amd(true, || glu_fusion_wins(m, n, k, n_cu))
 }
 
 /// What DECIDED the tile for this shape: `SkuCalibrated` if a measurement did, `Portable` if

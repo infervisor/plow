@@ -1,14 +1,16 @@
 //! Kernel capability registry: what the runtime can *actually execute*.
 //!
-//! The compiler currently picks kernels in two unrelated ways. The generic path
-//! synthesizes a `TileShape` from the analytical cost model and passes
-//! `bm/bn/bk` as packet fields. The model emitters call a per-model `pick_tile`
-//! that returns a [`DevOp`] whose tile is baked into the opcode. Neither asks
-//! whether the interpreter it is compiling for contains that kernel.
+//! The compiler lowers matmuls in two ways: the schedule path synthesizes a
+//! `TileShape` for `OpKind::Gemm` (filtered by `plowc::tuned::CompilerOracle`
+//! against the probed [`Inventory`]), and the device-blob emitters (`devgen`
+//! and `crates/plowc/src/bin/llama3.rs`) route dense prefill GEMM selection
+//! through [`select::select_kernel`] to pick a [`DevOp`] whose tile is baked
+//! into the opcode. Both paths ask this registry whether the interpreter object
+//! being compiled for actually instantiates the candidate kernel before
+//! ranking it.
 //!
-//! It usually does, so this mostly works. Where it does not, the failure is
-//! quiet: AMD's dispatch default no-ops an unknown opcode
-//! (`runtime/amd/interp.hip:785`) where NVIDIA traps
+//! Without that capability filter, the failure is quiet: AMD's dispatch default
+//! no-ops an unknown opcode (`runtime/amd/interp.hip:785`) where NVIDIA traps
 //! (`runtime/nvidia/interp_sm120.cu:1214`), so a kernel the build did not
 //! instantiate reads as a slightly wrong answer rather than a crash.
 //!
