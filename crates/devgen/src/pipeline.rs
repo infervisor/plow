@@ -2402,14 +2402,29 @@ impl StageProgram {
             && bf16.is_none())
         .then(|| conv1d_splitk(&stage, transpose, out_rows, n_cu))
         .flatten();
+        // Chunk-canonical K of a pinned bf16 taps conv: the class table's `sk` chunks, the same at
+        // every batch; the (unit, chunk) tasks fill otherwise idle blocks.
+        let chunks = bf16.filter(|_| stage.pinned).and_then(|(_, units)| {
+            let p = conv_class_pins()
+                .get(&conv_class(&stage, transpose))?
+                .parts
+                .filter(|&p| p > 1)?;
+            Some((units, p))
+        });
         let units = fixed
             .map(|f| f.0)
             .or(splitk)
+            .or(chunks.map(|(units, p)| units * u64::from(p)))
             .or(bf16.map(|b| b.1))
             .unwrap_or_else(|| conv1d_units(&stage, transpose, out_rows, n_cu, policy));
         let flags = flags
             | (u32::from(splitk.is_some() || fixed.is_some()) << 20)
-            | fixed.map_or(0, |f| f.1 << 24);
+            | fixed.map_or(0, |f| f.1 << 24)
+            | chunks.map_or(0, |(_, p)| p << 24);
+        let chunk_scratch = chunks
+            .map(|(_, p)| conv_bf16_chunk_scratch(p, n_cu))
+            .transpose()?
+            .map(|bytes| self.builder.tensor(CONV_SPLITK_SCRATCH, bytes));
         let row_scale = if let Some((_, _, bytes)) = fixed {
             self.builder.tensor(CONV_SPLITK_SCRATCH, bytes)
         } else if splitk.is_some() {
@@ -2422,7 +2437,9 @@ impl StageProgram {
         } else {
             row_scale
         };
-        let splitk = splitk.or(fixed.map(|f| f.0));
+        let splitk = splitk
+            .or(fixed.map(|f| f.0))
+            .or(chunks.map(|(units, _)| units));
         if stage.pinned {
             conv_pin_registry(conv_class(&stage, transpose), flags)?;
         }
@@ -2456,7 +2473,10 @@ impl StageProgram {
                 stage.dilation_or_output_padding,
                 stage.groups,
             ];
-            d.f[0] = stage.slope;
+            d.f[0] = match chunk_scratch {
+                Some(handle) => f32::from_bits(0x8000_0000 | handle),
+                None => stage.slope,
+            };
             d.j = [stage.pad_before | (stage.pad_after << 16), flags];
         })?;
         if splitk.is_some() {
@@ -3625,6 +3645,16 @@ fn conv_fixed_splitk(
         .checked_mul(4)
         .ok_or("conv split-K scratch overflow")?;
     Ok((tiles * u64::from(p), p, bytes))
+}
+
+/// Scratch of a chunked bf16 taps conv (op_speech_f32.cuh `spb_chunks`, `spb_slot`): the tickets,
+/// then 256 threads x at most 48 f32 accumulators per chunk of each key (a unit when the units leave
+/// blocks idle, else a block: at most one per block of the machine).
+fn conv_bf16_chunk_scratch(chunks: u32, n_cu: u32) -> Result<u64, String> {
+    if chunks > 63 {
+        return Err(format!("bf16 taps conv: {chunks} chunks exceed 63"));
+    }
+    Ok((u64::from(CONV_SPLITK_TICKETS) + u64::from(n_cu) * u64::from(chunks) * 256 * 48) * 4)
 }
 
 /// Split-K scratch of the pinned codec convs (every program's split convs share it; consecutive

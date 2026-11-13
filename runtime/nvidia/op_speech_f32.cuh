@@ -5770,7 +5770,78 @@ struct SpbIn {
     const float* pa = nullptr; const float* pr = nullptr;
     const float* state = nullptr; const unsigned* slot = nullptr; const unsigned* pos = nullptr;
     unsigned L = 0u, N = 0u;
+    unsigned parts = 0u; char* scratch = nullptr; /* chunk-canonical K (spb_chunks) */
 };
+/* Chunk-canonical K (flags bits 24..29 = P > 1, the scratch handle in fj[0]): a unit's T k-tiles (in
+ * its plan's order) are cut into chunks of C = ceil(T / P); each chunk runs its own accumulator chain
+ * from zero and the output is ((c0 + c1) + c2) + ... in f32 before bias, activations and residual.
+ * A block that runs every chunk of a unit folds in registers; when units are few (2 units <= blocks)
+ * the (unit, chunk) tasks spread over the blocks, park their chunks in the scratch and the unit's last
+ * arriver folds them in chunk order. Both give the same bits, so the choice follows the launch. */
+#define SPB_TICKETS 4096u
+struct SpbChunks {
+    unsigned C, P;   /* k-tiles per chunk, chunks */
+    bool split;
+    unsigned* tickets; float* parts;
+};
+template <bool CK>
+__device__ __forceinline__ SpbChunks spb_chunks(const SpbIn& si, unsigned T, unsigned units, unsigned nblk) {
+    SpbChunks k;
+    k.C = CK && si.parts > 1u ? (T + si.parts - 1u) / si.parts : T;
+    k.P = CK ? (T + k.C - 1u) / k.C : 1u;
+    k.split = CK && k.P > 1u && units < nblk;
+    k.tickets = (unsigned*)si.scratch;
+    k.parts = (float*)(si.scratch + SPB_TICKETS * 4u);
+    return k;
+}
+/* Chunk partials live in the scratch, not in a second register set (the kernels sit at the register
+ * cap): slot (key, c) of this thread, key = the unit when split (units < blocks), else the block; devgen
+ * sizes one key per block of the machine. */
+/* Float4 q of this thread at slot + q * blockDim.x: a warp's accesses are one contiguous 512 B. */
+template <unsigned N>
+__device__ __forceinline__ float4* spb_slot(const SpbChunks& k, unsigned key, unsigned c) {
+    return (float4*)k.parts + ((size_t)key * k.P + c) * (N / 4u) * blockDim.x + threadIdx.x;
+}
+template <unsigned N>
+__device__ __forceinline__ void spb_put(float4* dst, const float (&acc)[N]) {
+#pragma unroll
+    for (unsigned q = 0; q < N / 4u; q++)
+        __stcg(dst + (size_t)q * blockDim.x, make_float4(acc[4u * q], acc[4u * q + 1u], acc[4u * q + 2u], acc[4u * q + 3u]));
+}
+/* acc = ((s0 + s1) + ...) + s(P-1), in place: each slot's loads issue together. */
+template <unsigned N>
+__device__ __forceinline__ void spb_sum(const SpbChunks& k, unsigned key, float (&acc)[N]) {
+    for (unsigned o = 0; o < k.P; o++) {
+        const float4* src = spb_slot<N>(k, key, o);
+#pragma unroll
+        for (unsigned q = 0; q < N / 4u; q++) {
+            const float4 v = __ldcg(src + (size_t)q * blockDim.x);
+            if (o) {
+                acc[4u * q] = __fadd_rn(acc[4u * q], v.x); acc[4u * q + 1u] = __fadd_rn(acc[4u * q + 1u], v.y);
+                acc[4u * q + 2u] = __fadd_rn(acc[4u * q + 2u], v.z); acc[4u * q + 3u] = __fadd_rn(acc[4u * q + 3u], v.w);
+            } else {
+                acc[4u * q] = v.x; acc[4u * q + 1u] = v.y; acc[4u * q + 2u] = v.z; acc[4u * q + 3u] = v.w;
+            }
+        }
+    }
+}
+/* Split chunk c of unit u: park its accumulators; true (acc = the ordered fold) on the unit's last
+ * arriver. `last_s` is a word of the free B buffers. */
+template <unsigned N>
+__device__ __forceinline__ bool spb_park(const SpbChunks& k, unsigned u, unsigned c, float (&acc)[N], unsigned& last_s) {
+    spb_put<N>(spb_slot<N>(k, u, c), acc);
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last_s = atomicAdd(k.tickets + u, 1u);
+    __syncthreads();
+    const bool last = last_s == k.P - 1u;
+    __syncthreads();
+    if (!last) return false;
+    __threadfence();
+    spb_sum<N>(k, u, acc);
+    if (threadIdx.x == 0) k.tickets[u] = 0u;
+    return true;
+}
 /* The unit's [bias | a | r] for columns n0 + [0, nu). */
 __device__ __forceinline__ void spb_params(const SpConvArgs& a, float* par, unsigned n0, unsigned nu,
                                            unsigned tid = threadIdx.x, unsigned nthr = blockDim.x) {
@@ -5787,10 +5858,11 @@ __device__ __forceinline__ void spb_params(const SpConvArgs& a, float* par, unsi
  * (devgen speech_conv_bf16_variants); unset = all. Only those spb_run bodies are compiled: the inlined
  * body's shape, not unused arms, decides this arm's speed (the unused stream / pre staging cost 30-40 %). */
 #ifndef PLOW_SPEECH_CONV_BF16_VARIANTS
-#define PLOW_SPEECH_CONV_BF16_VARIANTS 0xFFFull
+#define PLOW_SPEECH_CONV_BF16_VARIANTS 0xFFFFFFull
 #endif
-__host__ __device__ __forceinline__ constexpr bool spb_variant_on(unsigned kind, bool pre, bool stream) {
-    return (PLOW_SPEECH_CONV_BF16_VARIANTS >> (4u * (kind - 1u) + (pre ? 1u : 0u) + (stream ? 2u : 0u))) & 1ull;
+/* Bits 12..23: the same bodies with chunk-canonical K (flags bits 24..29 > 1). */
+__host__ __device__ __forceinline__ constexpr bool spb_variant_on(unsigned kind, bool pre, bool stream, bool ck) {
+    return (PLOW_SPEECH_CONV_BF16_VARIANTS >> (4u * (kind - 1u) + (pre ? 1u : 0u) + (stream ? 2u : 0u) + (ck ? 12u : 0u))) & 1ull;
 }
 template <bool PRE, bool STREAM>
 __device__ __forceinline__ void spb_stage(const SpConvArgs& a, const SpbIn& si, char* As, unsigned rpad,
@@ -5937,7 +6009,7 @@ __device__ __forceinline__ void spb_pingpong(const SpConvArgs& a, const SpbIn& s
 #endif
 /* WN columns per warpgroup; ROWS: the warpgroups split BM = 128 rows (NU = WN), else BM = 64 and
  * they split NU = 2 WN columns. Shared [A: pg planes x rpad x 128 B][B: 2 x NU rows x 128 B][params]. */
-template <unsigned WN, bool ROWS, bool PRE, bool STREAM>
+template <unsigned WN, bool ROWS, bool PRE, bool STREAM, bool CK>
 __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, const char* whi, size_t ws, unsigned pg,
                                         unsigned slice, unsigned nblk) {
     constexpr unsigned BM = ROWS ? 128u : 64u, NU = ROWS ? WN : 2u * WN, BB = NU * 128u;
@@ -5949,7 +6021,7 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
 #if PLOW_SPEECH_CONV_OBJECT
     if constexpr (ROWS) {
         const unsigned wgb = ((unsigned)pg * spb_rpad(a, 64u) * 128u + 2u * BB + 3u * NU * 4u + 1023u) & ~1023u;
-        if (flat && 2u * wgb <= SPB_ARENA_BYTES) return spb_pingpong<WN, PRE, STREAM>(a, si, whi, ws, pg, wgb, slice, nblk);
+        if (!CK && flat && 2u * wgb <= SPB_ARENA_BYTES) return spb_pingpong<WN, PRE, STREAM>(a, si, whi, ws, pg, wgb, slice, nblk);
     }
 #endif
     const unsigned nkt = flat ? (a.cin * a.kernel + 63u) / 64u : a.kernel * pg, ng = a.kernel * gpt;
@@ -5958,15 +6030,21 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
     float* par = (float*)(Bs + 2u * BB);
     const unsigned mt = (a.out_rows + BM - 1u) / BM, tn = (a.cout + NU - 1u) / NU, units = a.batch * mt * tn;
     const unsigned rw = ROWS ? wg * 64u : 0u, cw = ROWS ? 0u : wg * WN;
+    const SpbChunks ck = spb_chunks<CK>(si, groups * nkt, units, nblk);
+    const unsigned tasks = ck.split ? units * ck.P : units;
     /* A contiguous run of units per block: consecutive units are the column tiles of one (item, row
      * tile), so a one-group plan stages A (and its input SnakeBeta) once per row tile, not per tile. */
-    const unsigned per = units / nblk, extra = units % nblk;
+    const unsigned per = tasks / nblk, extra = tasks % nblk;
     const unsigned u0 = slice * per + (slice < extra ? slice : extra), u1 = u0 + per + (slice < extra ? 1u : 0u);
     unsigned staged = ~0u;
-    for (unsigned u = u0; u < u1; u++) {
+    for (unsigned task = u0; task < u1; task++) {
+        const unsigned u = ck.split ? task / ck.P : task, c = ck.split ? task - u * ck.P : 0u;
+        const unsigned s0 = CK ? c * ck.C : 0u, s1 = ck.split ? min(groups * nkt, s0 + ck.C) : groups * nkt;
         const unsigned mu = u / tn, n0 = (u - mu * tn) * NU, b = mu / mt, t0 = (mu - b * mt) * BM;
         float acc[WN / 2u];
-        for (unsigned gi = 0; gi < groups; gi++) {
+        unsigned kc = 0u, kch = CK ? c : 0u; /* k-tile within the chunk, chunk */
+        for (unsigned gi = CK ? s0 / nkt : 0u; CK ? gi * nkt < s1 : gi < groups; gi++) {
+            const unsigned j0 = CK && gi * nkt <= s0 ? s0 - gi * nkt : 0u, j1 = CK ? min(nkt, s1 - gi * nkt) : nkt;
             /* Image k-tile of the group's j-th k-tile. */
             auto ktile = [&](unsigned j) { return flat ? j : (j / pg) * planes + gi * pg + j % pg; };
             /* k-tile j's weight rows [n0, n0 + NU) into buffer bf, 32 rows per pass (the image pads
@@ -5978,16 +6056,16 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
                 for (unsigned q = 0; q < NU / 32u; q++) sm90_cp16(dst + q * 4096u, src + q * 4096u, 16);
                 sm90_cp_commit();
             };
-            copy_b(0u, 0u);
-            if (gi == 0u) spb_params(a, par, n0, NU);
+            copy_b(j0, 0u);
+            if (CK ? gi * nkt <= s0 : gi == 0u) spb_params(a, par, n0, NU);
             if (!flat || staged != mu) spb_stage<PRE, STREAM>(a, si, As, rpad, span, b, t0, gi * pg, flat ? a.cin : pg * 64u);
             staged = flat ? mu : ~0u;
             sm90_cp_wait<0>();
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
             __syncthreads();
-            for (unsigned j = 0; j < nkt; j++) {
-                const unsigned bf = j & 1u;
-                if (j + 1u < nkt) copy_b(j + 1u, bf ^ 1u);
+            for (unsigned j = j0; j < j1; j++) {
+                const unsigned bf = (j - j0) & 1u, sk = gi * nkt + j;
+                if (j + 1u < j1) copy_b(j + 1u, bf ^ 1u);
                 sm90_wg_fence();
 #pragma unroll
                 for (unsigned s2 = 0; s2 < 4u; s2++) {
@@ -6006,7 +6084,7 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
                     const uint64_t da = sm90_desc(As + (size_t)(c16 >> 2) * rpad * 128u + (size_t)(tap * a.dil + rw) * 128u) +
                                         (((c16 & 3u) * 32u) >> 4);
                     const uint64_t db = sm90_desc(Bs + bf * BB + cw * 128u) + ((s2 * 32u) >> 4);
-                    const int acc_on = gi || j || s2 ? 1 : 0;
+                    const int acc_on = (CK ? kc != 0u : gi || j) || s2 ? 1 : 0;
                     if constexpr (WN == 96u) spb_m64n96k16(acc, da, db, acc_on);
                     else spwg_m64n64k16(acc, da, db, acc_on);
                 }
@@ -6015,7 +6093,18 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
                 sm90_cp_wait<0>();
                 asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                 __syncthreads();
+                if constexpr (CK)
+                    if (++kc == ck.C || sk + 1u == s1) {
+                        if (!ck.split && ck.P > 1u) spb_put<WN / 2u>(spb_slot<WN / 2u>(ck, slice, kch), acc);
+                        kc = 0u;
+                        kch++;
+                    }
             }
+        }
+        if constexpr (CK) {
+            if (ck.split) {
+                if (!spb_park<WN / 2u>(ck, u, c, acc, *(unsigned*)Bs)) continue;
+            } else if (ck.P > 1u) spb_sum<WN / 2u>(ck, slice, acc);
         }
         if (n0 + cw < a.cout) spb_store<WN / 8u>(a, acc, par + cw, NU, b, t0 + rw, n0 + cw);
         __syncthreads(); /* the next unit restages A, B and the parameters */
@@ -6045,7 +6134,7 @@ __device__ __forceinline__ unsigned spb_ipt(const SpConvArgs& a, unsigned pg) {
  * stride W rows (SBO), so group i, row r is item i's output row r. Rows >= out_rows and groups >= ipt
  * read stale shared memory (item slots, the pad) and are dropped at the store. Per output the instruction, K order and
  * accumulator chain are spb_run's: the same bits. */
-template <bool PRE, bool STREAM>
+template <bool PRE, bool STREAM, bool CK>
 __device__ __forceinline__ void spb_items(const SpConvArgs& a, const SpbIn& si, const char* whi, size_t ws,
                                           unsigned pg, unsigned ipt, unsigned slice, unsigned nblk) {
     constexpr unsigned WN = 64u, NU = 128u, BB = NU * 128u;
@@ -6059,13 +6148,19 @@ __device__ __forceinline__ void spb_items(const SpConvArgs& a, const SpbIn& si, 
     float* par = (float*)(Bs + 2u * BB);
     const unsigned mt = (a.batch + ipt - 1u) / ipt, tn = (a.cout + NU - 1u) / NU, units = mt * tn;
     const unsigned cw = wg * WN;
-    const unsigned per = units / nblk, extra = units % nblk;
+    const SpbChunks ck = spb_chunks<CK>(si, groups * nkt, units, nblk);
+    const unsigned tasks = ck.split ? units * ck.P : units;
+    const unsigned per = tasks / nblk, extra = tasks % nblk;
     const unsigned u0 = slice * per + (slice < extra ? slice : extra), u1 = u0 + per + (slice < extra ? 1u : 0u);
     unsigned staged = ~0u;
-    for (unsigned u = u0; u < u1; u++) {
+    for (unsigned task = u0; task < u1; task++) {
+        const unsigned u = ck.split ? task / ck.P : task, c = ck.split ? task - u * ck.P : 0u;
+        const unsigned s0 = CK ? c * ck.C : 0u, s1 = ck.split ? min(groups * nkt, s0 + ck.C) : groups * nkt;
         const unsigned mu = u / tn, n0 = (u - mu * tn) * NU, b0 = mu * ipt;
         float acc[WN / 2u];
-        for (unsigned gi = 0; gi < groups; gi++) {
+        unsigned kc = 0u, kch = CK ? c : 0u; /* k-tile within the chunk, chunk */
+        for (unsigned gi = CK ? s0 / nkt : 0u; CK ? gi * nkt < s1 : gi < groups; gi++) {
+            const unsigned j0 = CK && gi * nkt <= s0 ? s0 - gi * nkt : 0u, j1 = CK ? min(nkt, s1 - gi * nkt) : nkt;
             auto ktile = [&](unsigned j) { return flat ? j : (j / pg) * planes + gi * pg + j % pg; };
             auto copy_b = [&](unsigned j, unsigned bf) {
                 const char* src = whi + (size_t)ktile(j) * ws + (size_t)n0 * 128u + tid * 16u;
@@ -6074,8 +6169,8 @@ __device__ __forceinline__ void spb_items(const SpConvArgs& a, const SpbIn& si, 
                 for (unsigned q = 0; q < NU / 32u; q++) sm90_cp16(dst + q * 4096u, src + q * 4096u, 16);
                 sm90_cp_commit();
             };
-            copy_b(0u, 0u);
-            if (gi == 0u) spb_params(a, par, n0, NU);
+            copy_b(j0, 0u);
+            if (CK ? gi * nkt <= s0 : gi == 0u) spb_params(a, par, n0, NU);
             if (!flat || staged != mu)
                 for (unsigned i = 0; i < ipt && b0 + i < a.batch; i++)
                     spb_stage<PRE, STREAM>(a, si, As + (size_t)i * w * 128u, rp, span, b0 + i, 0u, gi * pg,
@@ -6084,9 +6179,9 @@ __device__ __forceinline__ void spb_items(const SpConvArgs& a, const SpbIn& si, 
             sm90_cp_wait<0>();
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
             __syncthreads();
-            for (unsigned j = 0; j < nkt; j++) {
-                const unsigned bf = j & 1u;
-                if (j + 1u < nkt) copy_b(j + 1u, bf ^ 1u);
+            for (unsigned j = j0; j < j1; j++) {
+                const unsigned bf = (j - j0) & 1u, sk = gi * nkt + j;
+                if (j + 1u < j1) copy_b(j + 1u, bf ^ 1u);
                 sm90_wg_fence();
 #pragma unroll
                 for (unsigned s2 = 0; s2 < 4u; s2++) {
@@ -6103,34 +6198,52 @@ __device__ __forceinline__ void spb_items(const SpConvArgs& a, const SpbIn& si, 
                                                        PLOW_SM90_LBO, (uint64_t)w * 128u) +
                                         (((c16 & 3u) * 32u) >> 4);
                     const uint64_t db = sm90_desc(Bs + bf * BB + cw * 128u) + ((s2 * 32u) >> 4);
-                    spwg_m64n64k16(acc, da, db, gi || j || s2 ? 1 : 0);
+                    spwg_m64n64k16(acc, da, db, (CK ? kc != 0u : gi || j) || s2 ? 1 : 0);
                 }
                 sm90_wg_commit();
                 sm90_wg_wait<0>();
                 sm90_cp_wait<0>();
                 asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                 __syncthreads();
+                if constexpr (CK)
+                    if (++kc == ck.C || sk + 1u == s1) {
+                        if (!ck.split && ck.P > 1u) spb_put<WN / 2u>(spb_slot<WN / 2u>(ck, slice, kch), acc);
+                        kc = 0u;
+                        kch++;
+                    }
             }
+        }
+        if constexpr (CK) {
+            if (ck.split) {
+                if (!spb_park<WN / 2u>(ck, u, c, acc, *(unsigned*)Bs)) continue;
+            } else if (ck.P > 1u) spb_sum<WN / 2u>(ck, slice, acc);
         }
         if (n0 + cw < a.cout) spb_store<WN / 8u>(a, acc, par + cw, NU, b0, 0u, n0 + cw, ipt);
         __syncthreads();
     }
 }
-template <bool PRE, bool STREAM>
-__device__ __forceinline__ void spb_kinds(const SpConvArgs& a, const SpbIn& si, const SpbPlan& pl, unsigned slice,
-                                          unsigned nblk) {
+template <bool PRE, bool STREAM, bool CK>
+__device__ __forceinline__ bool spb_kinds_ck(const SpConvArgs& a, const SpbIn& si, const SpbPlan& pl, unsigned slice,
+                                             unsigned nblk) {
     const char* whi = (const char*)spwg_wsplit(a);
     const size_t ws = 2u * (size_t)((a.cout + 127u) & ~127u) * 128u;
     if (pl.kind == 1u) {
-        if constexpr (spb_variant_on(1u, PRE, STREAM)) return spb_run<96, true, PRE, STREAM>(a, si, whi, ws, pl.pg, slice, nblk);
+        if constexpr (spb_variant_on(1u, PRE, STREAM, CK)) return spb_run<96, true, PRE, STREAM, CK>(a, si, whi, ws, pl.pg, slice, nblk), true;
     } else if (pl.kind == 2u) {
-        if constexpr (spb_variant_on(2u, PRE, STREAM)) return spb_run<64, true, PRE, STREAM>(a, si, whi, ws, pl.pg, slice, nblk);
+        if constexpr (spb_variant_on(2u, PRE, STREAM, CK)) return spb_run<64, true, PRE, STREAM, CK>(a, si, whi, ws, pl.pg, slice, nblk), true;
     } else if (pl.kind == 3u) {
-        if constexpr (spb_variant_on(3u, PRE, STREAM)) {
-            if (const unsigned ipt = spb_ipt(a, pl.pg)) return spb_items<PRE, STREAM>(a, si, whi, ws, pl.pg, ipt, slice, nblk);
-            return spb_run<64, false, PRE, STREAM>(a, si, whi, ws, pl.pg, slice, nblk);
+        if constexpr (spb_variant_on(3u, PRE, STREAM, CK)) {
+            if (const unsigned ipt = spb_ipt(a, pl.pg)) return spb_items<PRE, STREAM, CK>(a, si, whi, ws, pl.pg, ipt, slice, nblk), true;
+            return spb_run<64, false, PRE, STREAM, CK>(a, si, whi, ws, pl.pg, slice, nblk), true;
         }
     }
+    return false;
+}
+template <bool PRE, bool STREAM>
+__device__ __forceinline__ void spb_kinds(const SpConvArgs& a, const SpbIn& si, const SpbPlan& pl, unsigned slice,
+                                          unsigned nblk) {
+    if (si.parts > 1u ? spb_kinds_ck<PRE, STREAM, true>(a, si, pl, slice, nblk) : spb_kinds_ck<PRE, STREAM, false>(a, si, pl, slice, nblk))
+        return;
     __trap();
 }
 __device__ __forceinline__ void spb_conv1d(const SpConvArgs& a, const SpbIn& si, unsigned slice, unsigned nblk) {
@@ -6150,7 +6263,14 @@ __device__ __forceinline__ bool spb_args(const PlowDevInst* in, void* const* T, 
     const bool pre = ((f >> 19) & 1u) && ((f >> 2) & 1u), stream = (f >> 22) & 1u;
     if (pre && ((f >> 4) & 15u) != 12u) return false;
     PlowDevInst c = *in;
-    c.fj[2].u &= ~((pre ? (15u << 4) | (1u << 19) : 0u) | (1u << 22));
+    c.fj[2].u &= ~((pre ? (15u << 4) | (1u << 19) : 0u) | (1u << 22) | (63u << 24));
+    /* Chunk-canonical K: bits 24..29 = chunks, fj[0] = 0x80000000 | the scratch handle. */
+    si.parts = (f >> 24) & 63u;
+    if (si.parts > 1u) {
+        if ((in->fj[0].u >> 31) == 0u) return false;
+        si.scratch = (char*)T[in->fj[0].u & 0xFFFFu];
+        c.fj[0].u = 0u;
+    }
     if (!sp_conv_args(&c, T, false, a)) return false;
     if (pre) {
         si.pa = a.alpha;

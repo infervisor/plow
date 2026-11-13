@@ -417,6 +417,21 @@ ring, so the per-layer carry gather / store pairs are gone.
 - One stream, one frame (b1 x f1, 3.6 ms) is the per-launch floor: its convs take 2.5 ms on 6-16
   blocks each (dec.in 124 us on 12 blocks, each 768-channel k7 ~120 us on 6), so a small launch
   streams the codec's weights through a few SMs.
+- Chunk-canonical K for the bf16 conv (class pin `sk` = P chunks): each output is the f32 sum, in
+  chunk order, of P accumulator chains over fixed k-tile ranges. A few units spread their chunks
+  over idle blocks; otherwise a block runs every chunk. Partials go through a scratch, since a second
+  register set spills at the register cap and slowed every conv 6-10 %. Both modes give the same
+  bits (stream alone vs a 16-stream mix: bit-identical). Without pins, PCM and step times equal the
+  previous build. A packet with chunks needs speech capability bit 4, which older objects lack.
+
+| Pins | b1 x f1 | b32 x f2 | b64 x f2 | b16 x f17 |
+|---|---:|---:|---:|---:|
+| none (ms) | 3.52 | 6.98 | 10.44 | 18.02 |
+| dec.in P = 10 | -2.6 % | +0.5 % | +0.6 % | +0.2 % |
+| every k7 (P = 4-10) | -9.7 % | +11.6 % | +12.7 % | +15 % |
+
+  dec.in at b1 runs 120 -> 39 us. At served launch sizes (~47 frames) the net is about zero, and it
+  changes numerics, so no recipe pin. The mechanism stays opt-in for latency-bound small launches.
 
 ## TTS
 

@@ -194,16 +194,24 @@ pub fn conv_bf16_kind(cin: u32, cout: u32, kernel: u32, dilation: u32) -> Option
 
 /// The `PLOW_SPEECH_CONV_BF16_VARIANTS` bit of a bf16 taps conv (Conv1dF32 flags bit 17 without
 /// bit 14): `4 * (kind - 1) + pre + 2 * stream`, pre = an input SnakeBeta (bits 19 and 2), stream
-/// = bit 22. 0 for any other instruction or a shape the arm does not take (the object traps).
+/// = bit 22, plus 12 for chunk-canonical K (bits 24..29 above 1). 0 for any other instruction or a
+/// shape the arm does not take (the object traps).
 pub fn conv_bf16_variants(op: u16, i: &[u32; 8], f: u32) -> u64 {
     if op != DevOp::Conv1dF32 as u16 || (f >> 17) & 1 == 0 || (f >> 14) & 1 == 1 {
         return 0;
     }
     let pre = (f >> 19) & 1 == 1 && (f >> 2) & 1 == 1;
     let stream = (f >> 22) & 1 == 1;
+    let chunked = conv_bf16_chunked(op, f);
     conv_bf16_kind(i[2], i[3], i[4], i[6]).map_or(0, |kind| {
-        1 << (4 * (kind - 1) + u32::from(pre) + 2 * u32::from(stream))
+        1 << (4 * (kind - 1) + u32::from(pre) + 2 * u32::from(stream) + 12 * u32::from(chunked))
     })
+}
+
+/// A bf16 taps conv with chunk-canonical K (Conv1dF32 flags bit 17 without bit 14, bits 24..29
+/// above 1): its scratch handle is `fj[0] & 0x7FFF_FFFF`, and it needs speech capability bit 4.
+pub fn conv_bf16_chunked(op: u16, f: u32) -> bool {
+    op == DevOp::Conv1dF32 as u16 && (f >> 17) & 1 == 1 && (f >> 14) & 1 == 0 && (f >> 24) & 63 > 1
 }
 
 /// A conv on a wgmma arm (Conv1dF32 / ConvTranspose1dF32 flags bit 17): what the conv-only speech
@@ -627,6 +635,10 @@ mod tests {
             1 << 4
         );
         assert_eq!(var([8, 17, 512, 1024, 1, 1, 1, 1], 0x266000), 0);
+        assert_eq!(
+            var([8, 19, 512, 1024, 3, 1, 1, 1], 0x66a000 | 10 << 24),
+            1 << (12 + 8 + 2)
+        );
         assert_eq!(conv_bf16_kind(192, 192, 7, 9), Some(2));
         assert_eq!(conv_bf16_kind(768, 768, 7, 9), Some(3));
         assert_eq!(conv_bf16_kind(96, 1, 7, 1), None);

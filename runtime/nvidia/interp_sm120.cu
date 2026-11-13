@@ -1318,7 +1318,7 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_arms) = (unsigned)PLOW_
 #endif
 /* The bf16 taps conv bodies a PLOW_SPEECH_CONV_BF16_VARIANTS object carries (speech_flag_layout::
  * conv_bf16_variants); absent = all. */
-#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16 && PLOW_SPEECH_CONV_BF16_VARIANTS != 0xFFFull
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16 && PLOW_SPEECH_CONV_BF16_VARIANTS != 0xFFFFFFull
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_bf16_variants) = (unsigned)PLOW_SPEECH_CONV_BF16_VARIANTS;
 #endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
@@ -1336,16 +1336,22 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_posts_hi) = (unsigned)(
  * offered: the view addressing cost the M >= 40 rungs ~25 % with the view off, so a view packet is refused;
  * bit 1: AttentionF32 query view (flag bit 6); bit 2: f16 LayerNorm / projection operands. */
 #if PLOW_NV_SPEECH
+/* bit 4: chunk-canonical K bf16 taps convs (PLOW_SPEECH_CONV_BF16_VARIANTS bits 12..23). */
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16 && ((PLOW_SPEECH_CONV_BF16_VARIANTS >> 12) & 0xFFFull)
+#define PLOW_SPEECH_CAP_CHUNKS 16u
+#else
+#define PLOW_SPEECH_CAP_CHUNKS 0u
+#endif
 #if defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 14u;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 14u | PLOW_SPEECH_CAP_CHUNKS;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 10u;
 #endif
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 3u;
 #else
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 6u;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 6u | PLOW_SPEECH_CAP_CHUNKS;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 2u;
 #endif

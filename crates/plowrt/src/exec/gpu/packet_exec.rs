@@ -124,7 +124,8 @@ fn speech_conv_arms(blob: &DevBlob) -> u64 {
 
 /// Speech-object capability bits the instructions need (`plow_speech_caps_speech`): bit 0 a
 /// GemvF32Out row view (flag bit 12), bit 1 an AttentionF32 query view (flag bit 6),
-/// bit 2 FP16 LayerNorm output / projection operands.
+/// bit 2 FP16 LayerNorm output / projection operands, bit 3 ring KV, bit 4 a chunk-canonical K
+/// bf16 taps conv (an object without it would run the unchunked chain).
 pub(super) fn speech_caps_required<'a>(
     insts: impl IntoIterator<Item = &'a packet::dev::DevInst64>,
 ) -> u32 {
@@ -140,6 +141,11 @@ pub(super) fn speech_caps_required<'a>(
             }
             Some(DevOp::StreamTailF32) if plow_asset::speech_flag_layout::ring_kv(d.op, &d.i) => 8,
             Some(DevOp::LayerNormF32) if d.i[2] & 8 != 0 => 4,
+            Some(DevOp::Conv1dF32)
+                if plow_asset::speech_flag_layout::conv_bf16_chunked(d.op, d.fj[2]) =>
+            {
+                16
+            }
             _ => 0,
         }
     })
@@ -283,6 +289,23 @@ fn ring_speech_operands_require_layout_capability() {
         d.i[7] = mode;
         assert_eq!(speech_caps_required([&d]), 8);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn chunked_bf16_convs_require_the_capability() {
+    let mut d = packet::dev::DevInst64::default();
+    d.op = DevOp::Conv1dF32 as u16;
+    d.fj[2] = 0x66a000;
+    assert_eq!(speech_caps_required([&d]), 0);
+    d.fj[2] |= 1 << 24;
+    assert_eq!(speech_caps_required([&d]), 0);
+    d.fj[2] |= 10 << 24;
+    assert_eq!(speech_caps_required([&d]), 16);
+    assert_eq!(missing_speech_caps(16, Some(14)), 16);
+    assert_eq!(missing_speech_caps(16, None), 16);
+    d.fj[2] |= 1 << 14;
+    assert_eq!(speech_caps_required([&d]), 0);
 }
 
 #[cfg(test)]
