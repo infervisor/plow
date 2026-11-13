@@ -441,6 +441,8 @@ ring, so the per-layer carry gather / store pairs are gone.
 | Maya2 | c1 first audio p50 | 21 ms | 16 ms |
 | Maya2 | highest open-loop rate within SLO | 20 req/s (108 audio s/s) | 40 req/s at 100 %, 60 req/s at 95 % (275 audio s/s) |
 | Maya2 | 40 req/s | 2 % within SLO, 4526 stalls | 100 %, 0 stalls |
+| Maya2, split-bf16 codec (2026-11-13) | c32 / c128 audio s/s | 72 / 141 (same-commit base 65 / 110) | 114 / 231 |
+| Maya2, split-bf16 codec | 20 req/s median first audio; 40 req/s | 70 ms (base 129); 161 aps, saturated | 40 req/s clean |
 | Qwen3-TTS | c32 / c128 / c512 audio s/s | 102 / 119 / 123 | 174 / 356 / 371 |
 | Qwen3-TTS | highest open-loop rate within SLO | 20 req/s (106 audio s/s) | none: every stream has one 100-260 ms underrun after its first 80 ms chunk |
 | Qwen3-TTS | 40 req/s | 4 % within SLO, first audio ~10 s, 603 of 2388 refused | all complete, first audio p99 41 ms, one underrun per stream |
@@ -479,6 +481,9 @@ in the decoder.
 - Qwen3-TTS: isolated talker step 2.6-3.5 ms at 64 rows; in-serve frame 26.8 ms at 64 rows and
   ~0.36 ms per row to 128 rows (code predictor). Stateful codec step: ~4.4 ms per launch +
   ~0.12 ms per row-frame (4.6 ms at 1x1, 133 ms at 64x17). A 256-row ladder gave no throughput.
+- Maya2 codec on the split-bf16 wgmma arms (recipe knobs above): step b64 x f17 68.6 -> 36.4 ms,
+  b256 x f17 263 -> 137, PCM 94 dB SNR vs 3xTF32, CER unchanged. The stream-alone vs in-mix codec
+  check differs on both packets (max 0.58 at 2-frame chunks): open, not from this change.
 - Maya2: over a saturated 94 s cell, depth 47 s, codec 38 s, talker 15 s; a 224-row frame is
   ~48 ms of depth. Codec step ~3.2 ms + ~0.06 ms per row-frame.
 - Qwen3-ASR with the hold: encoder packs of 64-128 chunks take ~63 % of the device (~0.40 ms per
