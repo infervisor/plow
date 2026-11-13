@@ -8067,13 +8067,24 @@ static __device__ __noinline__ void sp_attention_w256(const PlowDevInst* in, voi
 }
 
 #if PLOW_NV_SPEECH
+/* H (j1 bit 31): Q / K / V and the output are fp16 rows (stride and column offsets in halves), the
+ * normalized probabilities are rounded to fp16 before the value sum (fp16 SDPA: f32 scores, softmax
+ * and accumulate). */
+template <bool H> struct SpShortElem { using type = float; };
+template <> struct SpShortElem<true> { using type = __half; };
+template <bool H>
 static __device__ __noinline__ void sp_attention_short(const PlowDevInst* in, void* const* T,
                                                      unsigned slice, unsigned nblk) {
-    auto* out = (float*)SP_TEN(0);
-    const auto* query = (const float*)SP_TEN(1);
-    const auto* key = (const float*)SP_TEN(2);
-    const auto* value = (const float*)SP_TEN(3);
+    using E = typename SpShortElem<H>::type;
+    auto* out = (E*)SP_TEN(0);
+    const auto* query = (const E*)SP_TEN(1);
+    const auto* key = (const E*)SP_TEN(2);
+    const auto* value = (const E*)SP_TEN(3);
     const auto* lengths = (const unsigned*)SP_TEN(4);
+    const unsigned k_col0 = in->fj[1].u, v_col0 = in->fj[2].u & 0x7FFFFFFFu;
+    auto ld = [](const E* p, size_t i) -> float {
+        if constexpr (H) return __half2float(p[i]); else return p[i];
+    };
     const unsigned batch = in->i[0], qr = in->i[1], kr = in->i[2], heads = in->i[3];
     const unsigned width = heads * 64u, stride = in->i[5] ? in->i[5] : width;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -8082,11 +8093,11 @@ static __device__ __noinline__ void sp_attention_short(const PlowDevInst* in, vo
         unsigned len = lengths ? min(lengths[b], kr) : kr;
         if (in->i[6] & 1u) len = min(len, r + 1u);
         const size_t qoff = ((size_t)b * qr + r) * stride + h * 64u + lane;
-        const float q0 = query[qoff], q1 = query[qoff + 32u];
+        const float q0 = ld(query, qoff), q1 = ld(query, qoff + 32u);
         float score = -INFINITY;
         for (unsigned j = 0; j < len; j++) {
-            const size_t off = ((size_t)b * kr + j) * stride + h * 64u + lane + in->fj[1].u;
-            float dot = __fmaf_rn(q1, key[off + 32u], __fmul_rn(q0, key[off]));
+            const size_t off = ((size_t)b * kr + j) * stride + h * 64u + lane + k_col0;
+            float dot = __fmaf_rn(q1, ld(key, off + 32u), __fmul_rn(q0, ld(key, off)));
 #pragma unroll
             for (unsigned d = 16; d; d >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, d);
             if (lane == j) score = dot * in->fj[0].f;
@@ -8097,16 +8108,22 @@ static __device__ __noinline__ void sp_attention_short(const PlowDevInst* in, vo
 #pragma unroll
         for (unsigned d = 16; d; d >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, d);
         p = sum > 0.f ? p / sum : 0.f;
+        if constexpr (H) p = __half2float(__float2half_rn(p));
         float v0 = 0.f, v1 = 0.f;
         for (unsigned j = 0; j < len; j++) {
             const float w = __shfl_sync(0xffffffffu, p, j);
-            const size_t off = ((size_t)b * kr + j) * stride + h * 64u + lane + in->fj[2].u;
-            v0 = __fmaf_rn(w, value[off], v0);
-            v1 = __fmaf_rn(w, value[off + 32u], v1);
+            const size_t off = ((size_t)b * kr + j) * stride + h * 64u + lane + v_col0;
+            v0 = __fmaf_rn(w, ld(value, off), v0);
+            v1 = __fmaf_rn(w, ld(value, off + 32u), v1);
         }
         const size_t off = ((size_t)b * qr + r) * width + h * 64u + lane;
-        out[off] = v0;
-        out[off + 32u] = v1;
+        if constexpr (H) {
+            out[off] = __float2half_rn(v0);
+            out[off + 32u] = __float2half_rn(v1);
+        } else {
+            out[off] = v0;
+            out[off + 32u] = v1;
+        }
     }
 }
 #endif
@@ -8114,6 +8131,18 @@ static __device__ __noinline__ void sp_attention_short(const PlowDevInst* in, vo
 static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk,
                                        float* arena) {
     arena = sp_smem;
+    /* j1 bit 31: fp16 operands, the short body only; anywhere else the offsets would be misread. */
+    if (in->fj[2].u >> 31) {
+#if PLOW_NV_SPEECH
+        if (in->i[4] == 64u && in->i[1] <= 32u && in->i[2] <= 32u && !(in->i[6] & ~1u) && !SP_TEN(5) &&
+            !SP_TEN(6)) {
+            sp_attention_short<true>(in, T, slice, nblk);
+            return;
+        }
+#endif
+        __trap();
+        return;
+    }
 #if PLOW_NV_SPEECH && defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
     if (sp_is_ring_attention(in)) {
         d_attention_ring_f32(in, T, slice, nblk);
@@ -8123,7 +8152,7 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
 #if PLOW_NV_SPEECH
     if (in->i[4] == 64u && in->i[1] <= 32u && in->i[2] <= 32u &&
         !(in->i[6] & ~1u) && !SP_TEN(5) && !SP_TEN(6)) {
-        sp_attention_short(in, T, slice, nblk);
+        sp_attention_short<false>(in, T, slice, nblk);
         return;
     }
 #endif

@@ -12130,11 +12130,6 @@ fn emit_dense_gqa(
             !ecfg.codec_ring_kv || arch == "sm_90a",
             "codec ring KV needs sm_90a"
         );
-        // Speech flag layout 4 is exported by the Hopper ring objects only.
-        assert!(
-            !ecfg.codec_bf16_1p || ecfg.codec_ring_kv,
-            "PLOW_EMIT_CODEC_BF16_1P needs PLOW_CODEC_RING_KV"
-        );
         let sites = whole_graph_audio_sites().0;
         let fish = std::fs::read(dir.join("config.json"))
             .ok()

@@ -125,7 +125,8 @@ fn speech_conv_arms(blob: &DevBlob) -> u64 {
 /// Speech-object capability bits the instructions need (`plow_speech_caps_speech`): bit 0 a
 /// GemvF32Out row view (flag bit 12), bit 1 an AttentionF32 query view (flag bit 6),
 /// bit 2 FP16 LayerNorm output / projection operands, bit 3 ring KV, bit 4 a chunk-canonical K
-/// bf16 taps conv (an object without it would run the unchunked chain).
+/// bf16 taps conv (an object without it would run the unchunked chain), bit 5 the fp16 short
+/// AttentionF32 (`j1` bit 31).
 pub(super) fn speech_caps_required<'a>(
     insts: impl IntoIterator<Item = &'a packet::dev::DevInst64>,
 ) -> u32 {
@@ -138,6 +139,7 @@ pub(super) fn speech_caps_required<'a>(
             Some(DevOp::AttentionF32) => {
                 u32::from(d.i[6] & 64 != 0) << 1
                     | u32::from(plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)) << 3
+                    | u32::from(plow_asset::speech_flag_layout::half_attention(d.op, d.fj[2])) << 5
             }
             Some(DevOp::StreamTailF32) if plow_asset::speech_flag_layout::ring_kv(d.op, &d.i) => 8,
             Some(DevOp::LayerNormF32) if d.i[2] & 8 != 0 => 4,
@@ -289,6 +291,19 @@ fn ring_speech_operands_require_layout_capability() {
         d.i[7] = mode;
         assert_eq!(speech_caps_required([&d]), 8);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn half_short_attention_requires_the_capability() {
+    let mut d = packet::dev::DevInst64::default();
+    d.op = DevOp::AttentionF32 as u16;
+    d.fj[2] = 2048;
+    assert_eq!(speech_caps_required([&d]), 0);
+    d.fj[2] |= 1 << 31;
+    assert_eq!(speech_caps_required([&d]), 32);
+    assert_eq!(missing_speech_caps(32, Some(6 | 16)), 32);
+    assert_eq!(missing_speech_caps(32, Some(38)), 0);
 }
 
 #[cfg(test)]

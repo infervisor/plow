@@ -1344,25 +1344,31 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_posts_hi) = (unsigned)(
 #endif
 #if defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 14u | PLOW_SPEECH_CAP_CHUNKS;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 46u | PLOW_SPEECH_CAP_CHUNKS;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 10u;
 #endif
-/* Layout 4 adds the single-product bf16 wgmma convs (Conv1dF32 / ConvTranspose1dF32 i6 bit 31). */
+/* Layout 4 adds the single-product bf16 wgmma convs (Conv1dF32 / ConvTranspose1dF32 i6 bit 31), 5 the
+ * fp16 short attention (AttentionF32 j1 bit 31); every Hopper object runs both. */
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 4u;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 5u;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 3u;
 #endif
 #else
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 6u | PLOW_SPEECH_CAP_CHUNKS;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 38u | PLOW_SPEECH_CAP_CHUNKS;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 2u;
 #endif
 /* The speech-op flag layout this object reads (plow_asset::speech_flag_layout::LAYOUT): a packet
- * layout 2 preserves layout 1 meanings and also accepts its packets. */
+ * layout 2 preserves layout 1 meanings and also accepts its packets. Hopper objects read layout 5
+ * (single-product convs, fp16 short attention); ring KV stays behind capability bit 3. */
+#if defined(PLOW_NV_HOPPER)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 5u;
+#else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 2u;
+#endif
 #endif
 #endif
 #if PLOW_PACKET_HASH != 0ull

@@ -17,8 +17,9 @@ use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 /// `i7` bit 12 row view. Layout 2 adds LayerNormF32 bit 3 (f16 output) and GemvF32Out
 /// bits 13 / 14 (f16 input / output). Layout 3 adds slot-indexed ring attention and tail modes.
 /// Layout 4 adds single-product bf16 wgmma convs (Conv1dF32 / ConvTranspose1dF32 `i6` bit 31,
-/// above the dilation / output padding); Hopper ring objects export it.
-pub const LAYOUT: u32 = 4;
+/// above the dilation / output padding). Layout 5 adds the fp16 short attention (AttentionF32 `j1`
+/// bit 31, above `v_col0`). Every Hopper speech object exports 5; ring KV stays a capability.
+pub const LAYOUT: u32 = 5;
 pub const DEFAULT_LAYOUT: u32 = 2;
 /// `extern "C" __device__ unsigned` exported by every speech interpreter object.
 pub const OBJECT_SYMBOL: &str = "plow_speech_flag_layout_speech";
@@ -268,6 +269,11 @@ pub fn single_product(op: u16, i: &[u32; 8]) -> bool {
     ) && i[6] >> 31 != 0
 }
 
+/// An AttentionF32 on fp16 Q / K / V and output rows (the short body only).
+pub fn half_attention(op: u16, j1: u32) -> bool {
+    op == DevOp::AttentionF32 as u16 && j1 >> 31 != 0
+}
+
 pub fn ring_kv(op: u16, i: &[u32; 8]) -> bool {
     match DevOp::from_u16(op) {
         Some(DevOp::AttentionF32) => is_ring_attention(i[6]),
@@ -283,7 +289,9 @@ pub fn protected(op: u16, j1: u32, i: &[u32; 8]) -> bool {
         Some(DevOp::Conv1dF32 | DevOp::ConvTranspose1dF32) => {
             j1 & CONV_FLAGS != 0 || single_product(op, i)
         }
-        Some(DevOp::AttentionF32) => i[6] & ATTENTION_I6 != 0 || ring_kv(op, i),
+        Some(DevOp::AttentionF32) => {
+            i[6] & ATTENTION_I6 != 0 || ring_kv(op, i) || half_attention(op, j1)
+        }
         Some(DevOp::StreamTailF32) => ring_kv(op, i),
         Some(DevOp::LayerNormF32) => i[2] & LAYER_NORM_I2 != 0,
         Some(DevOp::GemvF32Out) => i[7] & GEMV_F32_OUT_I7 != 0,
@@ -304,7 +312,9 @@ pub fn required_layout(insts: impl IntoIterator<Item = (u16, u32, [u32; 8])>) ->
         .into_iter()
         .filter_map(|(op, j1, i)| {
             protected(op, j1, &i).then(|| {
-                if single_product(op, &i) {
+                if half_attention(op, j1) {
+                    5
+                } else if single_product(op, &i) {
                     4
                 } else if ring_kv(op, &i) {
                     3
@@ -459,6 +469,16 @@ mod tests {
         assert_eq!(base, conv_arm::WG_CT);
         i[6] = 1 << 31;
         assert_eq!(conv_arms(DevOp::ConvTranspose1dF32 as u16, &i, 0, f), base);
+    }
+
+    #[test]
+    fn half_attention_needs_layout_five() {
+        let (op, i) = (DevOp::AttentionF32 as u16, [16, 3, 4, 16, 64, 3072, 1, 0]);
+        assert_eq!(required_layout([(op, 2048, i)]), None);
+        let half = (op, 2048 | 1 << 31, i);
+        assert_eq!(required_layout([half]), Some(5));
+        assert!(check(Some(5), first_protected([half]), Some(4)).is_err());
+        assert!(check(Some(5), first_protected([half]), Some(5)).is_ok());
     }
 
     /// Every bit the layout-0 (RC9, 45e1da259) emitters could set stays unprotected. The values

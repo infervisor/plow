@@ -442,7 +442,7 @@ the reference does not do.
 | Model | Stage | Reference | plowrt | Status |
 |---|---|---|---|---|
 | Maya2 | backbone | bf16, matmul TF32 off | bf16 | match |
-| Maya2 | depth (31 x 4 blocks) | fp16 weights, activations, KV; add+LN rounded to fp16 | fp16 weights, f16 LN outputs into the projections; f32 qkv, KV, o-proj input and residual; attention in fp32 FFMA (3xTF32 on prefix rows) | plowrt wider |
+| Maya2 | depth (31 x 4 blocks) | fp16 weights, activations, KV; add+LN rounded to fp16; SDPA on fp16 | batch >= 16: fp16 weights, LN outputs, q/k/v, KV cache and attention output (fp16 P, f32 scores and accumulate); f32 residual and projection epilogues. batch < 16: f32 q/k/v, KV, attention | qkv/KV/attention match at batch >= 16; residual, epilogues and small batches wider |
 | Maya2 | Mimi decoder | f32 weights, cuDNN convs TF32 (framework default) | split-bf16 projections/k1/ConvT, 3xTF32 k7/k3 | at or above |
 | Qwen3-TTS | talker + code predictor | bf16 | bf16 | match |
 | Qwen3-TTS | codec (code2wav) | bf16 GEMMs, depthwise conv in f32, decode TF32 off | single-product bf16 for every pointwise / transformer projection, ConvTranspose and k3 / k7 conv (bf16-rounded input and weights, f32 accumulate); depthwise k7 f32; 96 -> 1 output conv f32 FFMA; attention 3xTF32 or fp32 FFMA (stream mode); f32 activations | convs match; attention wider |
@@ -461,8 +461,17 @@ the reference does not do.
     noise (the talker bounds it). Stalls are equal across the two arms (27 vs 26 over two runs).
     Stream-vs-whole at 2-frame chunks stays bit-identical; random chunks already differed (max |d|
     3e-3) and now differ by up to 5e-2.
-  Still wider: Maya2 depth qkv, KV, attention and residual (to fp16); the Qwen3-TTS codec attention
-  (to bf16 operands).
+  - Maya2 depth at batch >= 16: q/k/v, the K/V cache and attention in fp16 (speech flag layout 5,
+    AttentionF32 `j1` bit 31, capability bit 5). Depth program b32 / b64 / b128 / b224 18.13 / 21.18 /
+    29.27 / 42.67 -> 16.36 / 19.42 / 26.51 / 41.07 ms; b1 / b8 unchanged. CER median 0, mean 0.0299 vs
+    0.0303 (n 48). Served (two rounds vs one): c128 146.2 / 155.0 vs 147.0 audio s/s, r20 median
+    latency 2.43 / 2.47 vs 2.71 s, r40 169.5 / 171.8 vs 169.0; at r60 (past capacity, 429s in both) 157 /
+    162 vs 169, unresolved on one baseline round. The 18- and 26-row first layers of levels 17 and 25
+    moved from 3xTF32 tensor cores to the FFMA body (0.04 -> 0.23 ms per op); an fp16 MMA body for them
+    is the next step.
+  Still wider: Maya2 depth residual adds and projection epilogues (fp16 rounding boundaries), prepared
+  constants and batch < 16; the Qwen3-TTS codec attention (bf16 operands; ring attention is 8 ops per
+  step, at most ~3 % of the step by bytes, not yet measured).
 
 ## TTS
 

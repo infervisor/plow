@@ -2322,6 +2322,10 @@ pub enum DevOp {
     /// Old keys are at absolute_position modulo history; current QKV supplies new keys.
     /// Zero-length items produce zero without reading their slot or position. Ring stores
     /// must depend on every attention producer, before any current key overwrites history.
+    /// `j1` bit 31 (layout 5, `v_col0` below it): Q / K / V and the output are fp16 rows (stride
+    /// and column offsets in halves), probabilities rounded to fp16 after normalization; only the
+    /// short geometry (head width 64, q_rows and kv_rows <= 32, flags but causal 0, no bias or
+    /// prefix), anything else traps.
     /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias|prefix_rows? t6=prefix?
     /// t7=prefix_index(u32[batch])?` ·
     /// `i0=batch i1=q_rows i2=kv_rows i3=heads i4=head_width i5=in_stride i6=flags

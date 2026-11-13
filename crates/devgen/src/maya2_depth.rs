@@ -362,6 +362,8 @@ struct Epilogue<'a> {
     /// x is bf16 (the LM's gathered final hidden), not f32.
     x_bf16: bool,
     x_half: bool,
+    /// f16 output rows (`GemvF32Out` flag bit 14) on half chains; needs an f16 x.
+    out_half: bool,
     /// The bias has a row per this many rows (per stream: the slot's depth memory); 0 broadcasts.
     bias_group: u32,
     /// Row addressing of x, the output and the residual (`GemvF32Out` flag bit 12).
@@ -376,6 +378,7 @@ impl Epilogue<'_> {
         ln: None,
         x_bf16: false,
         x_half: false,
+        out_half: false,
         bias_group: 0,
         view: None,
     };
@@ -538,9 +541,13 @@ impl Chain {
                     0
                 }
                 | if view.is_some() { 1 << 12 } else { 0 };
+            let half_out = self.half && (ep.gelu || ep.out_half);
+            if half_out && !x_half {
+                return Err(format!("depth projection {w}: f16 output needs an f16 input"));
+            }
             let flags = flags
                 | if x_half { 1 << 13 } else { 0 }
-                | if self.half && ep.gelu { 1 << 14 } else { 0 };
+                | if half_out { 1 << 14 } else { 0 };
             let none = packet::dev::TENSOR_NONE;
             let e = self.p.raw(
                 DevOp::GemvF32Out,
@@ -1015,6 +1022,8 @@ fn program_for(
                 };
                 c.dense_ep(at, "act.depth.x", rows, dim, dim, &w("o.weight"), res)?;
             } else {
+                // Half chains keep q|k|v, the cache and the attention output in fp16 (the
+                // reference's depth dtype); their copies move halves as 4-byte words.
                 let qkv = c.dense_ep(
                     x,
                     "act.depth.qkv",
@@ -1022,8 +1031,13 @@ fn program_for(
                     dim,
                     qkv_w,
                     &w("qkv.weight"),
-                    pre,
+                    Epilogue {
+                        out_half: c.half,
+                        ..pre
+                    },
                 )?;
+                let half = c.half;
+                let hw = move |v: u32| if half { v / 2 } else { v };
                 let (k, kv_rows, key_lengths) = if full {
                     if keep {
                         c.copy(
@@ -1033,12 +1047,12 @@ fn program_for(
                                 output: TensorRef::Named(&cache),
                                 items: batch,
                                 rows: p,
-                                cols: qkv_w,
-                                in_item_stride: p * qkv_w,
-                                in_stride: qkv_w,
+                                cols: hw(qkv_w),
+                                in_item_stride: hw(p * qkv_w),
+                                in_stride: hw(qkv_w),
                                 in_offset: 0,
-                                out_item_stride: np * qkv_w,
-                                out_stride: qkv_w,
+                                out_item_stride: hw(np * qkv_w),
+                                out_stride: hw(qkv_w),
                                 out_offset: 0,
                             },
                         )?;
@@ -1052,13 +1066,13 @@ fn program_for(
                             output: TensorRef::Named(&cache),
                             items: batch,
                             rows: 1,
-                            cols: qkv_w,
-                            in_item_stride: qkv_w,
-                            in_stride: qkv_w,
+                            cols: hw(qkv_w),
+                            in_item_stride: hw(qkv_w),
+                            in_stride: hw(qkv_w),
                             in_offset: 0,
-                            out_item_stride: np * qkv_w,
-                            out_stride: qkv_w,
-                            out_offset: level * qkv_w,
+                            out_item_stride: hw(np * qkv_w),
+                            out_stride: hw(qkv_w),
+                            out_offset: hw(level * qkv_w),
                         },
                     )?;
                     let len = p_handle(&c.p, &format!("c.depth.len.{level}"));
@@ -1072,12 +1086,12 @@ fn program_for(
                             output: TensorRef::Named("act.depth.qlast"),
                             items: batch,
                             rows: 1,
-                            cols: qkv_w,
-                            in_item_stride: p * qkv_w,
-                            in_stride: qkv_w,
-                            in_offset: (p - 1) * qkv_w,
-                            out_item_stride: qkv_w,
-                            out_stride: qkv_w,
+                            cols: hw(qkv_w),
+                            in_item_stride: hw(p * qkv_w),
+                            in_stride: hw(qkv_w),
+                            in_offset: hw((p - 1) * qkv_w),
+                            out_item_stride: hw(qkv_w),
+                            out_stride: hw(qkv_w),
                             out_offset: 0,
                         },
                     )?
@@ -1106,7 +1120,17 @@ fn program_for(
                 };
                 let query_rows = if last_only { 1 } else { p };
                 let deps = c.deps();
-                let e = if batch >= 16 && geo.head_dim == 64 && query_rows <= 16 && kv_rows <= 32 {
+                // The short body (sp_attention_short); half chains read fp16 rows there only.
+                let short = batch >= 16
+                    && geo.head_dim == 64
+                    && query_rows <= if c.half { 32 } else { 16 }
+                    && kv_rows <= 32;
+                if c.half && !short {
+                    return Err(format!(
+                        "depth level {level}: fp16 attention needs the short body ({query_rows} x {kv_rows} rows)"
+                    ));
+                }
+                let e = if short {
                     let at = p_handle(&c.p, "act.depth.at");
                     let none = packet::dev::TENSOR_NONE;
                     c.p.raw(
@@ -1136,7 +1160,7 @@ fn program_for(
                                 0,
                             ];
                             i.f[0] = 1.0 / (geo.head_dim as f32).sqrt();
-                            i.j = [dim, 2 * dim];
+                            i.j = [dim, 2 * dim | u32::from(c.half) << 31];
                         },
                     )?
                 } else {
@@ -1172,6 +1196,7 @@ fn program_for(
                 // x += o(attn); x += f2(gelu(f1(LN(x)))) + cross_l (the one-token cross-attention).
                 let res = Epilogue {
                     residual: Some(residual),
+                    x_half: c.half,
                     ..Epilogue::NONE
                 };
                 c.dense_ep(at, "act.depth.x", rows, dim, dim, &w("o.weight"), res)?;
@@ -2144,11 +2169,30 @@ mod tests {
                         )
                         .unwrap();
                     }
-                    // Native emitter fields frozen before prefix/block changes.
+                    // Native emitter fields frozen before prefix/block changes (refrozen with the
+                    // fp16 q|k|v, cache and attention of half chains, asserted below).
                     assert_eq!(
                         plow_asset::decode_objects::image_sha256(wire.as_bytes()),
-                        "54f0eb3f1ae7cdc0e44b2bc615693509d09b010d3c700bbe49bf53cc5bb1a5dc"
+                        "71392a1e24e242ddf11a134e9e612177acc599823089927174d24641f895592d"
                     );
+                    let attention: Vec<_> = ops
+                        .iter()
+                        .filter(|i| i.op == DevOp::AttentionF32 as u16)
+                        .collect();
+                    assert_eq!(attention.len(), 124);
+                    assert!(attention.iter().all(|i| i.j[1] == (2 * 1024 | 1 << 31)
+                        && i.i[1] <= 32
+                        && i.i[2] <= 32
+                        && i.i[6] & !1 == 0));
+                    let gemv = |n: u32, k: u32| {
+                        ops.iter()
+                            .filter(move |i| {
+                                i.op == DevOp::GemvF32Out as u16 && i.i[1] == n && i.i[2] == k
+                            })
+                            .map(|i| i.i[7] & 0x6000)
+                    };
+                    assert!(gemv(3 * 1024, 1024).all(|f| f == 0x6000));
+                    assert!(gemv(1024, 1024).all(|f| f == 0x2000));
                 }
                 if persistent {
                     let xin = p
