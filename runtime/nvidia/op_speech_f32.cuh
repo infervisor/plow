@@ -3914,6 +3914,36 @@ static __device__ __noinline__ void d_gather_rows_f32(const PlowDevInst* in, voi
     const unsigned per_item = in->i[3] ? in->i[3] : rows, repeat = in->i[4] ? in->i[4] : 1u;
     const unsigned flags = in->i[7], out_stride = in->fj[1].u ? in->fj[1].u : width, col0 = in->fj[2].u;
     if (!width || !per_item || (uint64_t)rows * width > 0xFFFFFFFFull) return;
+#if PLOW_NV_SPEECH
+    /* f32 table, every row 16-byte aligned: a warp per output row, float4 quads, 8 in flight per lane. */
+    if (!(flags & 1u) && !((width | out_stride | col0) & 3u) && !((((size_t)table) | ((size_t)out)) & 15u)) {
+        const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK, q = width / 4u;
+        for (unsigned row = slice * PLOW_NV_WARPS + (threadIdx.x >> PLOW_NV_WARP_SHIFT); row < rows;
+             row += nblk * PLOW_NV_WARPS) {
+            const unsigned item = row / per_item, local = (row - item * per_item) / repeat;
+            const unsigned src = index ? index[(size_t)item * in->i[5] + local] : local;
+            const float4* s = (const float4*)((const float*)table + ((size_t)item * in->i[6] + src) * width);
+            float4* d = (float4*)(out + (size_t)row * out_stride + col0);
+            for (unsigned c = lane; c < q; c += 32u * 8u) {
+                float4 v[8];
+#pragma unroll
+                for (unsigned u = 0; u < 8u; u++)
+                    if (c + 32u * u < q) v[u] = src < vocab ? s[c + 32u * u] : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+                for (unsigned u = 0; u < 8u; u++) {
+                    if (c + 32u * u >= q) continue;
+                    if (flags & 2u) {
+                        const float4 o = d[c + 32u * u];
+                        v[u] = make_float4(__fadd_rn(o.x, v[u].x), __fadd_rn(o.y, v[u].y), __fadd_rn(o.z, v[u].z),
+                                           __fadd_rn(o.w, v[u].w));
+                    }
+                    d[c + 32u * u] = v[u];
+                }
+            }
+        }
+        return;
+    }
+#endif
     sp_batched<8>(
         rows * width, slice, nblk,
         [&](unsigned e) {
@@ -3960,6 +3990,31 @@ static __device__ __noinline__ void d_copy_cols_f32(const PlowDevInst* in, void*
     unsigned base;
     if (!sp_copy_group(in, T, base)) return;
     if (!rows || !cols || (uint64_t)items * rows * cols > 0xFFFFFFFFull) return;
+#if PLOW_NV_SPEECH
+    /* Every row 16-byte aligned: a warp per (item, row), float4 quads, 8 in flight per lane (the
+     * element path pays three integer divisions per element and per side). */
+    const unsigned isrc = in->fj[1].u, idst = in->fj[2].u;
+    if (!((cols | in->i[3] | in->i[4] | in->i[5] | in->i[6] | isrc | idst) & 3u) &&
+        !((((size_t)x) | ((size_t)out)) & 15u)) {
+        const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK, q = cols / 4u, total = items * rows;
+        for (unsigned rr = slice * PLOW_NV_WARPS + (threadIdx.x >> PLOW_NV_WARP_SHIFT); rr < total;
+             rr += nblk * PLOW_NV_WARPS) {
+            const unsigned item = rr / rows, row = rr - item * rows;
+            const float4* s = (const float4*)(x + (size_t)item * isrc + (size_t)row * in->i[3] + in->i[4]);
+            float4* d = (float4*)(out + ((size_t)base + item) * idst + (size_t)row * in->i[5] + in->i[6]);
+            for (unsigned c = lane; c < q; c += 32u * 8u) {
+                float4 v[8];
+#pragma unroll
+                for (unsigned u = 0; u < 8u; u++)
+                    if (c + 32u * u < q) v[u] = s[c + 32u * u];
+#pragma unroll
+                for (unsigned u = 0; u < 8u; u++)
+                    if (c + 32u * u < q) d[c + 32u * u] = v[u];
+            }
+        }
+        return;
+    }
+#endif
     sp_batched<8>(
         items * rows * cols, slice, nblk,
         [&](unsigned e) {

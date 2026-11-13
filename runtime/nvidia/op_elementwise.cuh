@@ -758,6 +758,118 @@ static __device__ void gemv_f16w_mma_small(float* C, const float* __restrict__ x
     }
 }
 
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+/* Small-M arm of gemv_f16w_mma (below the 16-row capacity-invariance line: bounded, not bit-equal to the
+ * wide arms): x is staged once as f16 (LayerNorm applied and rounded as the MMA arms do), and warp w of a
+ * block owns W row 8g + w of each 8-row group g = slice, slice + nblk, ..; a warp keeps R = 16 / NP of its
+ * rows (NP = K / 256 16-byte pieces per lane each) in flight, the first batch issued before the x staging,
+ * where the small MMA arm keeps 16-column tiles (N / 16 blocks) and four computing warps. Per output:
+ * lane partials in increasing k (exact f16 products, fp32 FMA), then warp_sum32. M <= GEMV_STREAM_MAX_M,
+ * M * K <= MMA_SMALL_X. Arena: MMA_SMALL_X halves of x, then 2 * M floats of statistics. */
+#define GEMV_STREAM_MAX_M 4u
+template <unsigned NP>
+static __device__ void gemv_f16w_stream(float* C, const float* __restrict__ x, const unsigned short* __restrict__ W,
+                                        const float* bias, unsigned bgroup, const float* res, const float* gamma,
+                                        const float* beta, float eps, unsigned act, unsigned M, unsigned N,
+                                        unsigned slice, unsigned nblk, float* arena) {
+    constexpr unsigned K = NP * 256u, R = 16u / NP < 4u ? 16u / NP : 4u;
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    __half* xs = (__half*)arena;
+    float* st = arena + MMA_SMALL_X / 2u;
+    const auto row = [&](unsigned j) { return (slice + j * nblk) * 8u + warp; };
+    uint4 w[R][NP];
+    const auto load = [&](unsigned j0) {
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const unsigned n = row(j0 + r);
+#pragma unroll
+            for (unsigned p = 0; p < NP; p++)
+                w[r][p] = n < N ? *(const uint4*)(W + (size_t)n * K + p * 256u + lane * 8u) : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    load(0);
+    __syncthreads();
+    if (gamma) {
+        for (unsigned r = warp; r < M; r += PLOW_NV_WARPS) {
+            const float* xr = x + (size_t)r * K;
+            float s = 0.f;
+            for (unsigned k = lane; k < K; k += 32u) s += xr[k];
+            const float mean = warp_sum32(s) / (float)K;
+            float v = 0.f;
+            for (unsigned k = lane; k < K; k += 32u) {
+                const float d = xr[k] - mean;
+                v = __fmaf_rn(d, d, v);
+            }
+            const float var = warp_sum32(v) / (float)K;
+            if (lane == 0) {
+                st[2 * r] = mean;
+                st[2 * r + 1] = rsqrtf(var + eps);
+            }
+        }
+        __syncthreads();
+    }
+    for (unsigned r = 0; r < M; r++) {
+        const float* xr = x + (size_t)r * K;
+        for (unsigned k = threadIdx.x; k < K; k += PLOW_NV_THREADS) {
+            float v = xr[k];
+            if (gamma) v = __fmaf_rn((v - st[2 * r]) * st[2 * r + 1], gamma[k], beta[k]);
+            xs[r * K + k] = __float2half_rn(v);
+        }
+    }
+    __syncthreads();
+    for (unsigned j0 = 0; (slice + j0 * nblk) * 8u < N; j0 += R) {
+        if (j0) load(j0);
+        float acc[R][GEMV_STREAM_MAX_M];
+#pragma unroll
+        for (unsigned r = 0; r < R; r++)
+#pragma unroll
+            for (unsigned m = 0; m < GEMV_STREAM_MAX_M; m++) acc[r][m] = 0.f;
+#pragma unroll
+        for (unsigned p = 0; p < NP; p++) {
+#pragma unroll
+            for (unsigned m = 0; m < GEMV_STREAM_MAX_M; m++) {
+                if (m >= M) break;
+                const uint4 xr = *(const uint4*)(xs + m * K + p * 256u + lane * 8u);
+                const __half2* xh = (const __half2*)&xr;
+                const float2 a0 = __half22float2(xh[0]), a1 = __half22float2(xh[1]);
+                const float2 a2 = __half22float2(xh[2]), a3 = __half22float2(xh[3]);
+#pragma unroll
+                for (unsigned r = 0; r < R; r++) {
+                    const __half2* h = (const __half2*)&w[r][p];
+                    const float2 w0 = __half22float2(h[0]), w1 = __half22float2(h[1]);
+                    const float2 w2 = __half22float2(h[2]), w3 = __half22float2(h[3]);
+                    float s = acc[r][m];
+                    s = __fmaf_rn(a0.x, w0.x, s); s = __fmaf_rn(a0.y, w0.y, s);
+                    s = __fmaf_rn(a1.x, w1.x, s); s = __fmaf_rn(a1.y, w1.y, s);
+                    s = __fmaf_rn(a2.x, w2.x, s); s = __fmaf_rn(a2.y, w2.y, s);
+                    s = __fmaf_rn(a3.x, w3.x, s); s = __fmaf_rn(a3.y, w3.y, s);
+                    acc[r][m] = s;
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            const unsigned n = row(j0 + r);
+            if (n >= N) break;
+#pragma unroll
+            for (unsigned m = 0; m < GEMV_STREAM_MAX_M; m++) {
+                if (m >= M) break;
+                const float sum = warp_sum32(acc[r][m]);
+                if (lane == 0) {
+                    const size_t o = (size_t)m * N + n;
+                    float v = sum;
+                    if (bias) v = __fadd_rn(v, bias[(bgroup ? m / bgroup * N : 0u) + n]);
+                    if (res) v = __fadd_rn(v, res[o]);
+                    if (act == 1u) v = 0.5f * v * (1.f + erff(v * 0.70710678118654752f));
+                    C[o] = v;
+                }
+            }
+        }
+    }
+}
+#endif
+
 static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, const unsigned short* __restrict__ W,
                                      const float* bias, unsigned bgroup, const float* res, const float* gamma,
                                      const float* beta, float eps, unsigned act, unsigned M, unsigned N, unsigned K,
@@ -765,6 +877,16 @@ static __device__ void gemv_f16w_mma(float* C, const float* __restrict__ x, cons
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned g = lane >> 2, t = lane & 3u;
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
+    if (M && M <= GEMV_STREAM_MAX_M && (size_t)M * K <= MMA_SMALL_X && ((size_t)W & 15u) == 0u) {
+        switch (K) {
+        case 1024u: gemv_f16w_stream<4>(C, x, W, bias, bgroup, res, gamma, beta, eps, act, M, N, slice, nblk, arena); return;
+        case 2048u: gemv_f16w_stream<8>(C, x, W, bias, bgroup, res, gamma, beta, eps, act, M, N, slice, nblk, arena); return;
+        case 3072u: gemv_f16w_stream<12>(C, x, W, bias, bgroup, res, gamma, beta, eps, act, M, N, slice, nblk, arena); return;
+        default: break;
+        }
+    }
+#endif
     const unsigned ntiles = (N + 15u) / 16u;
     const unsigned per = (ntiles + nblk - 1) / nblk;
     const unsigned t0 = slice * per;

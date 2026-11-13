@@ -10,7 +10,7 @@
  * Build (standalone):
  *   gcc -O2 -ffp-contract=off -c -I runtime/common -I runtime/cpu/dev \
  *       runtime/cpu/dev/golden/f32_primitives.c
- *   nvcc -arch=sm_90a -O3 -DPLOW_NV_HOPPER=1 -I runtime/common -I runtime/nvidia -I runtime/cpu/dev \
+ *   nvcc -arch=sm_90a -O3 -DPLOW_NV_HOPPER=1 -DPLOW_NV_SPEECH=1 -I runtime/common -I runtime/nvidia -I runtime/cpu/dev \
  *        runtime/tests/speech_f32_op_test.cu f32_primitives.o -o speech_f32_op_test
  *   speech_f32_op_test [--bench | --bench-only]
  */
@@ -797,6 +797,25 @@ static void t_gather() {
         c.in.fj[1].u = stride; c.in.fj[2].u = 17;
         run("GatherRowsF32 f16 upsample accumulate", c, g_gather_rows_f32, {o}, FP32);
     }
+    {
+        /* Bitwise (INT) incl. signed zeros and untouched columns. Restores the shared stream:
+         * later cases keep their data (knife-edge GELU flip budgets). */
+        const uint32_t seed = rng_s;
+        Case c; const unsigned items = 3, per_item = 7, vocab = 9, width = 2112, stride = 2176;
+        unsigned o = c.f32(items * per_item * stride, 1.f), t = c.f32(items * vocab * width, 1.f);
+        float* po = (float*)c.host[o].data();
+        float* pt = (float*)c.host[t].data();
+        for (unsigned i = 0; i < items * vocab * width; i += 13) pt[i] = i % 2 ? -0.f : 0.f;
+        for (unsigned i = 0; i < items * per_item * stride; i += 7) po[i] = i % 3 ? -0.f : 0.f;
+        std::vector<uint32_t> idx(items * 7);
+        for (unsigned i = 0; i < idx.size(); i++) idx[i] = i % 5 == 2 ? vocab : (i * 4) % vocab;
+        unsigned ix = c.u32(idx);
+        c.in.op = PLOW_DOP_GATHER_ROWS_F32; c.in.t[0] = o; c.in.t[1] = t; c.in.t[2] = ix;
+        c.in.i[0] = items * per_item; c.in.i[1] = width; c.in.i[2] = vocab; c.in.i[3] = per_item;
+        c.in.i[5] = 7; c.in.i[6] = vocab; c.in.i[7] = 2; c.in.fj[1].u = stride; c.in.fj[2].u = 64;
+        run("GatherRowsF32 f32 rows accumulate", c, g_gather_rows_f32, {o}, INT);
+        rng_s = seed;
+    }
 }
 
 static void t_copy_cols() {
@@ -806,6 +825,14 @@ static void t_copy_cols() {
     c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = cols; c.in.i[3] = in_stride; c.in.i[4] = 0;
     c.in.i[5] = out_stride; c.in.i[6] = 160; c.in.fj[1].u = 0; c.in.fj[2].u = rows * out_stride;
     run("CopyColsF32 broadcast into concat", c, g_copy_cols_f32, {o}, FP32);
+    const uint32_t seed = rng_s;
+    Case d; const unsigned di = 5, dr = 26, dc = 3072, dis = 30 * 3072, dos = 32 * 3072;
+    unsigned od = d.f32(di * dos, 1.f), xd = d.f32(di * dis, 1.f);
+    d.in.op = PLOW_DOP_COPY_COLS_F32; d.in.t[0] = od; d.in.t[1] = xd;
+    d.in.i[0] = di; d.in.i[1] = dr; d.in.i[2] = dc; d.in.i[3] = 3072; d.in.i[4] = 0;
+    d.in.i[5] = 3072; d.in.i[6] = 0; d.in.fj[1].u = dis; d.in.fj[2].u = dos;
+    run("CopyColsF32 item-strided prefix rows", d, g_copy_cols_f32, {od}, INT);
+    rng_s = seed;
 }
 
 /* StreamTailF32: gather (fresh streams zero their tail, column window zc0) and store (z rows

@@ -44,11 +44,88 @@ __global__ void project_wide(float* c, const unsigned short* x, const unsigned s
 }
 #endif
 
+/* The M <= 8 small MMA arm called directly (what gemv_f16w_mma ran there before the streaming arm). */
+__global__ void project_small(float* c, const float* x, const unsigned short* w, const float* bias,
+                              const float* res, const float* gamma, const float* beta,
+                              unsigned flags, unsigned m, unsigned n, unsigned k) {
+    const unsigned ntiles = (n + 15u) / 16u, per = (ntiles + gridDim.x - 1) / gridDim.x, t0 = blockIdx.x * per;
+    const unsigned tiles = t0 < ntiles ? min(per, ntiles - t0) : 0u;
+    if (!tiles) return;
+    const unsigned ks = min(max(1u, PLOW_NV_WARPS / tiles), k / 64u);
+    gemv_f16w_mma_small<1>(c, x, w, (flags & 4u) ? bias : nullptr, 0u, (flags & 8u) ? res : nullptr,
+                           (flags & 256u) ? gamma : nullptr, beta, 1e-5f, (flags >> 4) & 15u, m, n, k, t0, tiles,
+                           ks, sp_smem);
+}
+
+/* --bench: Maya 2 depth projection shapes at M <= 8, current dispatch vs the small MMA arm, weights rotated
+ * over 112 MB so every launch streams W from HBM; prints us per launch and relL2 between the arms
+ * (fails above the 4e-4 small-row bound). */
+static int bench() {
+    CK(cudaFuncSetAttribute(project, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024));
+    CK(cudaFuncSetAttribute(project_small, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 * 1024));
+    const unsigned shapes[][3] = {{1024, 3072, 0x40f}, {3072, 1024, 0x513}, {3072, 1024, 0x503},
+                                  {2048, 1024, 0x503}, {1024, 1024, 0x40b}};
+    unsigned rng = 7;
+    auto next = [&] { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                     return (float)((int)(rng % 2001) - 1000) / 997.f; };
+    int rc = 0;
+    for (const auto& s : shapes) {
+        const unsigned n = s[0], k = s[1], flags = s[2];
+        const size_t wbytes = (size_t)n * k * 2;
+        const unsigned copies = (unsigned)((112ull << 20) / wbytes);
+        std::vector<__half> w((size_t)n * k);
+        std::vector<float> x(8 * k), v(8 * n), g(k), b(k);
+        for (auto& e : w) e = __float2half_rn(next() * .05f);
+        for (auto& e : x) e = next();
+        for (auto& e : v) e = next() * .1f;
+        for (auto& e : g) e = 1.f + next() * .1f;
+        for (auto& e : b) e = next() * .1f;
+        unsigned short* dw; float *dx, *dv, *dg, *db, *c0, *c1;
+        CK(cudaMalloc(&dw, wbytes * copies));
+        for (unsigned i = 0; i < copies; i++) CK(cudaMemcpy((char*)dw + i * wbytes, w.data(), wbytes, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dx, x.size() * 4)); CK(cudaMalloc(&dv, v.size() * 4));
+        CK(cudaMalloc(&dg, k * 4)); CK(cudaMalloc(&db, k * 4));
+        CK(cudaMalloc(&c0, 8 * n * 4)); CK(cudaMalloc(&c1, 8 * n * 4));
+        CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dv, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dg, g.data(), k * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(db, b.data(), k * 4, cudaMemcpyHostToDevice));
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+        for (unsigned m : {1u, 2u, 4u, 8u}) {
+            float us[2];
+            for (unsigned arm = 0; arm < 2; arm++) {
+                for (unsigned it = 0; it < 2 * copies + 400; it++) {
+                    if (it == 2 * copies) CK(cudaEventRecord(e0));
+                    const unsigned short* wi = (const unsigned short*)((char*)dw + (it % copies) * wbytes);
+                    float* c = arm ? c1 : c0;
+                    if (arm) project<<<132, 256, 100 * 1024>>>(c, dx, wi, dv, dv, dg, db, flags, 0, m, n, k);
+                    else project_small<<<132, 256, 100 * 1024>>>(c, dx, wi, dv, dv, dg, db, flags, m, n, k);
+                }
+                CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
+                float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); us[arm] = ms * 1000.f / 400.f;
+            }
+            std::vector<float> a(m * n), bb(m * n);
+            CK(cudaMemcpy(a.data(), c0, m * n * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(bb.data(), c1, m * n * 4, cudaMemcpyDeviceToHost));
+            double d = 0, q = 0;
+            for (unsigned j = 0; j < m * n; j++) { d += ((double)a[j] - bb[j]) * ((double)a[j] - bb[j]); q += (double)a[j] * a[j]; }
+            printf("BENCH M=%u N=%u K=%u flags=0x%x small_mma_us=%.2f dispatch_us=%.2f floor_us=%.2f relL2=%.3g\n", m, n, k,
+                   flags, us[0], us[1], (double)wbytes / 3.1e6, sqrt(d / q));
+            if (!(sqrt(d / q) <= 4e-4)) rc = 1;
+        }
+        CK(cudaFree(dw)); CK(cudaFree(dx)); CK(cudaFree(dv)); CK(cudaFree(dg)); CK(cudaFree(db));
+        CK(cudaFree(c0)); CK(cudaFree(c1));
+    }
+    return rc;
+}
+
 int main(int argc, char** argv) {
     bool sanitize = false, wide = false;
     const char* node_path = nullptr;
     const char* reject_case = nullptr;
     for (int arg = 1; arg < argc; arg++) {
+        if (!strcmp(argv[arg], "--bench")) return bench();
         if (!strcmp(argv[arg], "--sanitize")) sanitize = true;
         else if (!strcmp(argv[arg], "--wide")) wide = true;
         else if (!strcmp(argv[arg], "--reject") && arg + 1 < argc) reject_case = argv[++arg];
@@ -125,9 +202,12 @@ int main(int argc, char** argv) {
                      return (float)((int)(rng % 2001) - 1000) / 997.f; };
     unsigned cases = 0, small = 0, small_differs = 0;
     double small_rel = 0;
-    for (unsigned k : {192u, 256u, 448u, 1024u, 3072u, 4096u}) {
-        if (sanitize && k != 192u && k != 1024u && k != 3072u) continue;
-        const unsigned n = wide ? 128 : (k == 192 || k == 1024 || k == 3072) ? 3072 : k == 448 ? 192 : 128, max_m = 257;
+    for (unsigned k : {192u, 256u, 448u, 1024u, 2048u, 3072u, 4096u}) {
+        if (sanitize && k != 192u && k != 1024u && k != 2048u && k != 3072u) continue;
+        /* K = 2048 at N = 1088 (= 132 x 8 + 32, a whole number of the half arm's 64-col tiles): the M <= 4
+         * streaming arm's second row pass is partial. */
+        const unsigned n = wide ? 128 : (k == 192 || k == 1024 || k == 3072) ? 3072 : k == 2048 ? 1088 : k == 448 ? 192 : 128,
+                       max_m = 257;
         std::vector<float> x(max_m * k), bias(max_m * n), residual(max_m * n), gamma(k), beta(k);
         std::vector<__half> w(n * k);
         for (auto& v : x) v = next();
@@ -167,13 +247,13 @@ int main(int argc, char** argv) {
         for (unsigned mode = 0; mode < (node_path ? 20u : 12u); mode++) {
             const bool optional = mode >= 12;
             if (optional && (mode & 3u) == 3u) continue;
-            if (sanitize && !optional && mode != 4u && mode != 6u && mode != 8u && mode != 10u) continue;
+            if (sanitize && !optional && mode != 3u && mode != 4u && mode != 6u && mode != 8u && mode != 10u) continue;
             const unsigned base_mode = optional ? (mode >= 16 ? 8 : 4) : mode;
             const bool use_bias = !optional || (mode & 1u), use_res = !optional || (mode & 2u);
             const bool ln = base_mode & 1, gelu = base_mode & 2;
             const bool half_out = base_mode & 8, half = base_mode & 12;
             if (wide && !half) continue;
-            const unsigned group = gelu ? 5 : 0;
+            const unsigned group = gelu ? 3 : 0; /* rows 0-2 | 3-5: M = 4 crosses a bias group */
             const unsigned flags = 3 | 1024 | (use_bias ? 4 : 0) | (use_res ? 8 : 0) | (ln && !half ? 256 : 0) | (gelu ? 16 | 512 : 0)
                                    | (half ? 8192 : 0) | (half_out ? 16384 : 0);
             std::vector<double> ref(max_m * n);
@@ -207,8 +287,9 @@ int main(int argc, char** argv) {
                 if (node_path && variant != 2) continue;
                 if (variant == 3 && k % 128u) continue;
                 std::vector<float> widest;
-                for (unsigned m : {257u, 256u, 225u, 224u, 201u, 200u, 129u, 128u, 65u, 64u, 33u, 32u, 31u, 20u, 17u, 16u, 8u, 1u}) {
-                    if (sanitize && m != 257u && m != 224u && m != 200u && m != 33u && m != 16u) continue;
+                for (unsigned m : {257u, 256u, 225u, 224u, 201u, 200u, 129u, 128u, 65u, 64u, 33u, 32u, 31u, 20u, 17u, 16u, 8u, 4u, 3u,
+                                   2u, 1u}) {
+                    if (sanitize && m != 257u && m != 224u && m != 200u && m != 33u && m != 16u && m != 4u && m != 2u) continue;
                     if (half && m < 16u) continue;
                     for (bool alias : {false, true}) {
                         if (alias && (half_out || !use_res)) continue;
