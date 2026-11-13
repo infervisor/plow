@@ -398,6 +398,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_CODEC_CONV_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub codec_conv_bf16: bool,
 
+    /// Wgmma convs (flags bit 17) of at least this many million MACs take their own segment, which
+    /// plowrt runs on the conv-only `_speechconv` object (its own registers and ping-pong
+    /// warpgroups). Same bits; smaller convs lose to the extra launches.
+    #[arg(long, env = "PLOW_EMIT_CODEC_CONV_OBJECT")]
+    pub codec_conv_object: Option<u32>,
+
     /// Measured Conv1dF32 arms per codec conv shape (tuning `codec_conv_arms.jsonl`): a shape
     /// listed with arm `rows` or `warp` takes flag bit 16 (sm_90 speech object); every other
     /// conv keeps the GEMM paths.
@@ -2043,6 +2049,7 @@ impl EmitConfig {
             codec_wgmma_ragged: env_bool("PLOW_EMIT_CODEC_WGMMA_RAGGED"),
             codec_dec_in_wgmma: env_bool("PLOW_EMIT_CODEC_DEC_IN_WGMMA"),
             codec_conv_bf16: env_bool("PLOW_EMIT_CODEC_CONV_BF16"),
+            codec_conv_object: env_u32("PLOW_EMIT_CODEC_CONV_OBJECT"),
             codec_conv_arms: env_str("PLOW_EMIT_CODEC_CONV_ARMS").map(std::path::PathBuf::from),
             codec_conv_classes: env_str("PLOW_EMIT_CODEC_CONV_CLASSES")
                 .map(std::path::PathBuf::from),

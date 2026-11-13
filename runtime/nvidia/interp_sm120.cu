@@ -268,6 +268,19 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #if PLOW_NV_SPEECH
 #include "op_speech_f32.cuh"
 #endif
+/* The conv-only speech object: plowrt launches speech_conv_node for each segment devgen isolated to
+ * one wgmma conv (PLOW_EMIT_CODEC_CONV_OBJECT), grid = the conv's blocks, the rest of the program
+ * on the full speech object. A kernel entry, not the interpreter: inside the interpreter function the
+ * ping-pong body spills (10300 LDL), here it holds its registers. */
+#if defined(PLOW_SPEECH_CONV_OBJECT) && PLOW_SPEECH_CONV_OBJECT
+#if !(PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER))
+#error "PLOW_SPEECH_CONV_OBJECT is a Hopper speech object"
+#endif
+extern "C" __global__ void __launch_bounds__(256, 1) speech_conv_node(const PlowDevInst* in, void* const* T) {
+    if (sp_wg_conv1d(in, T, blockIdx.x, gridDim.x)) return;
+    d_conv1d_f32(in, T, in->op == PLOW_DOP_CONV_TRANSPOSE1D_F32, blockIdx.x, gridDim.x, sp_smem);
+}
+#endif
 #ifndef PLOW_NV_PREFILL
 #define PLOW_NV_PREFILL 0
 #endif
@@ -887,6 +900,8 @@ extern "C" __device__ __constant__ unsigned plow_fp8_kv_abi = 1;
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _fp8m1)
 #elif PLOW_NV_GEMV512_ROLE
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gemv512)
+#elif PLOW_NV_SPEECH && defined(PLOW_SPEECH_CONV_OBJECT) && PLOW_SPEECH_CONV_OBJECT
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _speechconv)
 #elif PLOW_NV_SPEECH
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _speech)
 #elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_SEG_GEMM
@@ -1310,6 +1325,11 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_bf16_variants) = (unsig
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SPEECH_OPS >> 32);
 #endif
+/* The conv epilogues compiled in: the loader requires the conv object's to equal the speech object's. */
+#if PLOW_NV_SPEECH && PLOW_SPEECH_CONV_POSTS != (~0ull)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_posts_lo) = (unsigned)(PLOW_SPEECH_CONV_POSTS & 0xFFFFFFFFull);
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_posts_hi) = (unsigned)(PLOW_SPEECH_CONV_POSTS >> 32);
+#endif
 /* Speech-object capabilities behind instruction flag bits (the op mask cannot see a flag): the
  * loader derives the required set from each program's instructions and refuses an object without
  * them (symbol absent = none). bit 0: GemvF32Out row view (flag bit 12, descriptor in t7) - not
@@ -1397,6 +1417,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     d_gemm_w8a8_m1_tma_sm90((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1),
         (const uint8_t*)TEN(2), T[in->i[7]], (const float*)TEN(3), (const float*)TEN(4),
         in->i[1], in->i[2], in->i[4], slice, nblk, (__nv_bfloat16*)arena);
+#elif PLOW_NV_SPEECH && defined(PLOW_SPEECH_CONV_OBJECT) && PLOW_SPEECH_CONV_OBJECT
+    /* The conv object runs its convs on speech_conv_node, never through the interpreter. */
+    (void)tw_; (void)in; (void)T; (void)slice; (void)nblk; (void)arena;
+    __trap();
 #elif PLOW_NV_GEMV512_ROLE
     if (in->i[0] != 1 || !in->i[2] || in->i[2] > 32768u) { __trap(); return; }
     switch (in->op) {

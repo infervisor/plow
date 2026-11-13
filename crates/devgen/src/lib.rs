@@ -12286,6 +12286,9 @@ fn emit_dense_gqa(
             if speech.conv_bf16 {
                 man["speech_conv_bf16_variants"] = speech.conv_bf16_variants.into();
             }
+            if speech.conv_object {
+                man["objects"]["speech_conv"] = serde_json::json!({ "required": true });
+            }
             // The speech fields above feed the pairing hash (split-image, ring KV, bf16 arms).
             man["pairing"]["hash"] =
                 serde_json::json!(format!("0x{:016x}", manifest::pairing_hash(&man)));

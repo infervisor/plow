@@ -3221,6 +3221,9 @@ pub struct SpeechMasks {
     pub conv_arms: u64,
     /// `PLOW_SPEECH_CONV_BF16_VARIANTS`: the bf16 taps conv bodies (plan kind x fused input).
     pub conv_bf16_variants: u64,
+    /// A segment is one wgmma conv (`PLOW_EMIT_CODEC_CONV_OBJECT`): the conv-only `_speechconv`
+    /// object runs it (`objects.speech_conv.required`).
+    pub conv_object: bool,
 }
 
 impl SpeechMasks {
@@ -3248,6 +3251,18 @@ impl SpeechMasks {
             conv_bf16_variants: model.progs.iter().flat_map(|p| &p.insts).fold(0, |m, i| {
                 m | plow_asset::speech_flag_layout::conv_bf16_variants(i.op, &i.i, i.j[1])
             }),
+            conv_object: model.progs.iter().any(|p| {
+                plow_asset::speech_flag_layout::conv_object_segments(
+                    &p.gq_seg_ofs,
+                    &p.gq_stream,
+                    |i| {
+                        let d = &p.insts[i as usize];
+                        plow_asset::speech_flag_layout::conv_object_inst(d.op, d.j[1])
+                    },
+                )
+                .iter()
+                .any(Option::is_some)
+            }),
         }
     }
     pub fn add(&mut self, other: Self) {
@@ -3259,6 +3274,7 @@ impl SpeechMasks {
         self.conv_bf16 |= other.conv_bf16;
         self.conv_arms |= other.conv_arms;
         self.conv_bf16_variants |= other.conv_bf16_variants;
+        self.conv_object |= other.conv_object;
     }
 }
 

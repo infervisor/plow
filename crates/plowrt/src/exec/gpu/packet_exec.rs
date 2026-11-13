@@ -336,6 +336,9 @@ fn speech_object_symbols_follow_the_cmake_mangling() {
 struct Program {
     kernarg: DevProgram,
     segments: usize,
+    /// Per segment: one wgmma conv alone (its device instruction, blocks), launched on the conv
+    /// object's kernel entry when loaded.
+    conv_segments: Vec<Option<(u64, u32)>>,
     counters: u64,
     counter_bytes: usize,
     _tables: Vec<DeviceMem>,
@@ -355,6 +358,7 @@ pub struct CudaPacketRuntime {
     function: KernelFn,
     grid: u32,
     smem: u32,
+    conv: Option<ConvObject>,
     names: Vec<String>,
     tensors: Vec<DeviceMem>,
     _table: DeviceMem,
@@ -372,6 +376,82 @@ pub struct CudaPacketRuntime {
     /// Last field: dropped after every allocation above, so [`resident_in`] turns false only once
     /// the device memory is back.
     _resident: Arc<()>,
+}
+
+/// The conv-only speech object (`<speech stem>conv.cubin`, sm_90a): `speech_conv_node(inst, tensors)`
+/// runs one wgmma conv over `blocks` CTAs, for the segments devgen isolated to it (raw segments: the
+/// stream orders them, no counters cross them).
+struct ConvObject {
+    _module: Module,
+    function: KernelFn,
+    smem: u32,
+}
+
+/// Loads the conv object beside `object` when a program has a conv segment. Absent, those
+/// segments run on the speech object (same bits). Both objects come from one build: an object
+/// whose layout, feature or arm stamps differ from the speech object's is stale.
+fn load_conv_object(
+    be: &CudaBackend,
+    main: &Module,
+    object: &Path,
+    blob: &DevBlob,
+) -> Result<Option<ConvObject>> {
+    use plow_asset::speech_flag_layout as layout;
+    let wanted = blob.progs.iter().any(|p| {
+        layout::conv_object_segments(&p.gq_seg_ofs, &p.gq_stream, |i| {
+            let d = &p.insts[i as usize];
+            layout::conv_object_inst(d.op, d.fj[2])
+        })
+        .iter()
+        .any(Option::is_some)
+    });
+    let stem = object
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let path = object.with_file_name(format!("{stem}conv.cubin"));
+    if !wanted {
+        return Ok(None);
+    }
+    let image = match std::fs::read(&path) {
+        Ok(image) => image,
+        Err(_) => {
+            tracing::warn!(object = %path.display(), "packet has conv segments but no conv object: they run on the speech object");
+            return Ok(None);
+        }
+    };
+    let module = be.module_load(&image)?;
+    let function = be.get_function(&module, "speech_conv_node")?;
+    for symbol in [
+        layout::OBJECT_SYMBOL,
+        layout::CONV_ARMS_SYMBOL,
+        layout::CONV_BF16_VARIANTS_SYMBOL,
+        "plow_speech_features_speech",
+        "plow_speech_conv_posts_lo_speech",
+        "plow_speech_conv_posts_hi_speech",
+        "plow_speech_ops_lo_speech",
+        "plow_speech_ops_hi_speech",
+    ] {
+        if be.module_global_u32(main, symbol)?
+            != be.module_global_u32(&module, &format!("{symbol}conv"))?
+        {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: {symbol} differs from {}; rebuild both objects",
+                path.display(),
+                object.display()
+            )));
+        }
+    }
+    let smem = be
+        .module_global_u32(&module, "plow_arena_bytes_speechconv")?
+        .unwrap_or(49152);
+    be.set_max_dynamic_smem(function, smem)?;
+    tracing::info!(object = %path.display(), smem, "speech conv object loaded");
+    Ok(Some(ConvObject {
+        _module: module,
+        function,
+        smem,
+    }))
 }
 
 type Residents = parking_lot::Mutex<Vec<(std::path::PathBuf, u8, std::sync::Weak<()>)>>;
@@ -832,6 +912,7 @@ impl CudaPacketRuntime {
                 blob.n_cu
             )));
         }
+        let conv = load_conv_object(&be, &module, &object, blob)?;
 
         let mut tensors = Vec::with_capacity(blob.tensors.len());
         for t in &blob.tensors {
@@ -928,9 +1009,35 @@ impl CudaPacketRuntime {
                 n_prefill_rows: 0,
                 token_batch: 0,
             };
+            let conv_segments = if conv.is_some() {
+                plow_asset::speech_flag_layout::conv_object_segments(
+                    &p.gq_seg_ofs,
+                    &p.gq_stream,
+                    |i| {
+                        let d = &p.insts[i as usize];
+                        plow_asset::speech_flag_layout::conv_object_inst(d.op, d.fj[2])
+                    },
+                )
+                .into_iter()
+                .map(|inst| {
+                    inst.map(|i| {
+                        let size = std::mem::size_of::<packet::dev::DevInst64>() as u64;
+                        // 0 = the interpreter's grid, as the interpreter reads it.
+                        let blocks = match p.insts[i as usize].blocks {
+                            0 => blob.n_cu,
+                            b => u32::from(b),
+                        };
+                        (d_inst.base + u64::from(i) * size, blocks)
+                    })
+                })
+                .collect()
+            } else {
+                vec![None; segments]
+            };
             programs.push(Program {
                 kernarg,
                 segments,
+                conv_segments,
                 counters,
                 counter_bytes: counter_only + cursor_bytes,
                 _tables: vec![
@@ -959,6 +1066,7 @@ impl CudaPacketRuntime {
             function,
             grid: blob.n_cu,
             smem,
+            conv,
             names: blob.tensors.iter().map(|t| t.name.clone()).collect(),
             tensors,
             _table: table,
@@ -1137,6 +1245,22 @@ impl CudaPacketRuntime {
                     .memset_d8_async(p.counters, 0, p.counter_bytes, stream)?;
             }
             for seg in 0..p.segments {
+                if let (Some(c), Some((mut inst, blocks))) = (&self.conv, p.conv_segments[seg]) {
+                    let mut tensors = p.kernarg.tensors;
+                    let mut params = [
+                        &mut inst as *mut u64 as *mut std::ffi::c_void,
+                        &mut tensors as *mut u64 as *mut std::ffi::c_void,
+                    ];
+                    self.be.launch_kernel(
+                        c.function,
+                        blocks,
+                        BLOCK,
+                        c.smem,
+                        &mut params,
+                        Some(stream),
+                    )?;
+                    continue;
+                }
                 let mut arg = p.kernarg;
                 arg.gq_seg_ofs += (seg * 4) as u64;
                 arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
@@ -2094,6 +2218,95 @@ fn native_gemm_layer_matches_packet() {
     }
     be.synchronize().unwrap();
     be.module_unload(&module).unwrap();
+}
+
+/// The conv object runs a packet's conv segments with the speech object's bits: every tensor after
+/// one run from the same initial bytes, with and without it. Env: SPEECH_CONV_PKT (its assets hold
+/// the `_speechconv` cubin), SPEECH_CONV_PROGRAMS (indices; default every program with a conv
+/// segment), SPEECH_CONV_TIMING (interleaved event timing of both, median of 10 each).
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; speech conv object equivalence, run only through gpuq"]
+fn speech_conv_object_matches_speech_object() {
+    let path = std::path::PathBuf::from(std::env::var("SPEECH_CONV_PKT").unwrap());
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut rt = CudaPacketRuntime::load_on(be.clone(), &path).unwrap();
+    let mut parked: Option<ConvObject> = None;
+    assert!(rt.conv.is_some(), "no conv object loaded");
+    let programs: Vec<usize> = match std::env::var("SPEECH_CONV_PROGRAMS") {
+        Ok(list) => list.split(',').map(|s| s.parse().unwrap()).collect(),
+        Err(_) => (0..rt.programs.len())
+            .filter(|&p| rt.programs[p].conv_segments.iter().any(Option::is_some))
+            .collect(),
+    };
+    let snapshot = |rt: &CudaPacketRuntime| -> Vec<Vec<u8>> {
+        rt.tensors
+            .iter()
+            .map(|m| {
+                let mut out = vec![0; m.len as usize];
+                rt.download(m, 0, &mut out).unwrap();
+                out
+            })
+            .collect()
+    };
+    let initial = snapshot(&rt);
+    let reset = |rt: &CudaPacketRuntime| {
+        for (m, bytes) in rt.tensors.iter().zip(&initial) {
+            rt.upload(m, 0, bytes).unwrap();
+        }
+    };
+    // mode 0: speech object only, 1: conv segments on the conv object.
+    let mut set = |rt: &mut CudaPacketRuntime, mode: usize| {
+        if rt.conv.is_some() != (mode == 1) {
+            std::mem::swap(&mut rt.conv, &mut parked);
+        }
+    };
+    for p in programs {
+        let conv_segments = rt.programs[p]
+            .conv_segments
+            .iter()
+            .filter(|c| c.is_some())
+            .count();
+        let mut results = Vec::new();
+        for mode in 0..2 {
+            set(&mut rt, mode);
+            reset(&rt);
+            rt.enqueue_on(&[p], &rt.stream).unwrap();
+            be.stream_synchronize(&rt.stream).unwrap();
+            results.push(snapshot(&rt));
+        }
+        let differ: Vec<usize> = (0..results[0].len())
+            .filter(|&t| results[0][t] != results[1][t])
+            .collect();
+        println!(
+            "SPEECH_CONV_BITS program={p} segments={} conv_segments={conv_segments} differing_tensors={differ:?}",
+            rt.programs[p].segments
+        );
+        assert!(differ.is_empty());
+        if std::env::var_os("SPEECH_CONV_TIMING").is_none() {
+            continue;
+        }
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..24 {
+            let mode = round % 2;
+            set(&mut rt, mode);
+            reset(&rt);
+            be.event_record(&rt.events.0, &rt.stream).unwrap();
+            rt.enqueue_on(&[p], &rt.stream).unwrap();
+            be.event_record(&rt.events.1, &rt.stream).unwrap();
+            be.event_synchronize(&rt.events.1).unwrap();
+            if round >= 4 {
+                times[mode].push(be.event_elapsed_ms(&rt.events.0, &rt.events.1).unwrap() * 1000.);
+            }
+        }
+        for t in &mut times {
+            t.sort_by(f32::total_cmp);
+        }
+        println!(
+            "SPEECH_CONV_TIME program={p} conv_segments={conv_segments} speech_us={} conv_us={} samples=10_each",
+            times[0][5], times[1][5]
+        );
+    }
 }
 
 /// The speech object's bf16 taps convs (Conv1dF32 flags bit 17 without 14, kernel > 1) on their own

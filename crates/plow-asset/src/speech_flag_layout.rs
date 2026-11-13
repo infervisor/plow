@@ -206,6 +206,37 @@ pub fn conv_bf16_variants(op: u16, i: &[u32; 8], f: u32) -> u64 {
     })
 }
 
+/// A conv on a wgmma arm (Conv1dF32 / ConvTranspose1dF32 flags bit 17): what the conv-only speech
+/// object (`_speechconv`) runs.
+pub fn conv_object_inst(op: u16, f: u32) -> bool {
+    (op == DevOp::Conv1dF32 as u16 || op == DevOp::ConvTranspose1dF32 as u16) && (f >> 17) & 1 == 1
+}
+
+/// Per global-queue segment (`seg_ofs` windows over `stream`): the instruction when every entry is
+/// the same [`conv_object_inst`] (`conv(inst)`) with no counter obligation (a raw segment: no
+/// waits, successors or cross-segment counter), which the conv object's kernel entry then runs
+/// alone. A conv the interpreter must signal stays on the interpreter.
+pub fn conv_object_segments(
+    seg_ofs: &[u32],
+    stream: &[packet::dev::StreamEnt],
+    conv: impl Fn(u32) -> bool,
+) -> Vec<Option<u32>> {
+    seg_ofs
+        .windows(2)
+        .map(|w| {
+            let entries = &stream[w[0] as usize..w[1] as usize];
+            let first = entries.first()?.inst;
+            (entries.iter().all(|e| {
+                e.inst == first
+                    && e.wait_len == 0
+                    && e.succ_len == 0
+                    && e.flags & packet::dev::SE_XCTR == 0
+            }) && conv(first))
+            .then_some(first)
+        })
+        .collect()
+}
+
 /// Conv1dF32 / ConvTranspose1dF32 flags (`j1`, wire `fj[2]`) assigned since layout 0.
 pub const CONV_FLAGS: u32 = 0xffe0_000c;
 /// AttentionF32 `i6` bits assigned since layout 0.
@@ -331,6 +362,29 @@ pub fn check(declared: Option<u32>, used: Option<u16>, object: Option<u32>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conv_object_segments_hold_only_wgmma_convs() {
+        let wg = 1 << 17;
+        assert!(conv_object_inst(DevOp::Conv1dF32 as u16, wg));
+        assert!(conv_object_inst(
+            DevOp::ConvTranspose1dF32 as u16,
+            wg | 1 << 14
+        ));
+        assert!(!conv_object_inst(DevOp::Conv1dF32 as u16, 1 << 14));
+        assert!(!conv_object_inst(DevOp::UnaryF32 as u16, wg));
+        // Segments [0, 2) mixed, [2, 3) one conv, [3, 3) empty, [3, 5) one conv's slices, [5, 7)
+        // two convs, [7, 8) a conv that signals a successor.
+        let conv = [false, true, true, true, true, true];
+        let entry = |inst: u32| packet::dev::StreamEnt {
+            inst,
+            ..Default::default()
+        };
+        let mut stream: Vec<_> = [0, 1, 2, 3, 3, 3, 4, 5].into_iter().map(entry).collect();
+        stream[7].succ_len = 1;
+        let segments = conv_object_segments(&[0, 2, 3, 3, 5, 7, 8], &stream, |i| conv[i as usize]);
+        assert_eq!(segments, [None, Some(2), None, Some(3), None, None]);
+    }
 
     fn inst(op: DevOp, j1: u32, slot: usize, v: u32) -> (u16, u32, [u32; 8]) {
         let mut i = [0; 8];

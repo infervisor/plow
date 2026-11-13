@@ -2462,6 +2462,20 @@ impl StageProgram {
         if splitk.is_some() {
             self.splitk_last = Some(emitted.done);
         }
+        if flags & (1 << 17) != 0 {
+            if let Some(min) = crate::emit_config::active().codec_conv_object {
+                // A transposed conv's input row feeds `kernel` taps of every output channel.
+                let rows = if transpose { stage.in_rows } else { out_rows };
+                let macs = u64::from(stage.batch)
+                    * u64::from(rows)
+                    * u64::from(stage.in_channels / stage.groups.max(1))
+                    * u64::from(stage.out_channels)
+                    * u64::from(stage.kernel);
+                if macs >= u64::from(min) * 1_000_000 {
+                    self.builder.isolate(emitted.done);
+                }
+            }
+        }
         Ok(emitted)
     }
 

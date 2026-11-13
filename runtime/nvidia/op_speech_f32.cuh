@@ -5711,6 +5711,11 @@ __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const
  * and the other speech arms, which re-read activations through L1, lose 15-100 %.
  * Devgen mirrors spb_plan (conv_bf16_plan). */
 #define SPB_ARENA_BYTES (SP_LAUNCH_ARENA_FLOATS * 4u - 1024u)
+/* The conv-only speech object (interp_sm120.cu): its own register allocation fits the ping-pong body,
+ * which inlined beside the other arms loses (C7512 with both bodies, -3 % in-packet). */
+#ifndef PLOW_SPEECH_CONV_OBJECT
+#define PLOW_SPEECH_CONV_OBJECT 0
+#endif
 static_assert(PLOW_NV_WARPS == 8, "spb arms: two warpgroups");
 /* m64n96k16 .f32.bf16.bf16, both operands from shared memory, 48 f32 accumulators per thread. */
 __device__ __forceinline__ void spb_m64n96k16(float* d, uint64_t da, uint64_t db, int scale_d) {
@@ -5767,8 +5772,9 @@ struct SpbIn {
     unsigned L = 0u, N = 0u;
 };
 /* The unit's [bias | a | r] for columns n0 + [0, nu). */
-__device__ __forceinline__ void spb_params(const SpConvArgs& a, float* par, unsigned n0, unsigned nu) {
-    for (unsigned q = threadIdx.x; q < 3u * nu; q += blockDim.x) {
+__device__ __forceinline__ void spb_params(const SpConvArgs& a, float* par, unsigned n0, unsigned nu,
+                                           unsigned tid = threadIdx.x, unsigned nthr = blockDim.x) {
+    for (unsigned q = tid; q < 3u * nu; q += nthr) {
         const unsigned which = q / nu, c = n0 + q - which * nu;
         par[q] = c >= a.cout ? 0.0f
                  : which == 0u ? (a.bias ? a.bias[c] : 0.0f)
@@ -5788,11 +5794,12 @@ __host__ __device__ __forceinline__ constexpr bool spb_variant_on(unsigned kind,
 }
 template <bool PRE, bool STREAM>
 __device__ __forceinline__ void spb_stage(const SpConvArgs& a, const SpbIn& si, char* As, unsigned rpad,
-                                          unsigned span, unsigned b, unsigned t0, unsigned p0, unsigned cw) {
+                                          unsigned span, unsigned b, unsigned t0, unsigned p0, unsigned cw,
+                                          unsigned tid = threadIdx.x, unsigned nthr = blockDim.x) {
     constexpr unsigned UL = 16u; /* loads in flight per thread: staging is latency-bound (4 -> 16: -13 % at 96 ch) */
-    const unsigned c4n = cw / 4u, rpp = blockDim.x / c4n, rl = threadIdx.x / c4n;
+    const unsigned c4n = cw / 4u, rpp = nthr / c4n, rl = tid / c4n;
     if (rl >= rpp) return;
-    const unsigned ch = (threadIdx.x - rl * c4n) * 4u, cp = ch & 63u, cg = 64u * p0 + ch;
+    const unsigned ch = (tid - rl * c4n) * 4u, cp = ch & 63u, cg = 64u * p0 + ch;
     const float* xc = STREAM ? a.x + (size_t)b * si.N * a.cin + cg : a.x + ((size_t)b * a.in_rows) * a.cin + cg;
     const float* sc = STREAM && si.pos[b] ? si.state + (size_t)si.slot[b] * si.L * a.cin + cg : nullptr;
     float4 pa = make_float4(0.f, 0.f, 0.f, 0.f), pr = pa;
@@ -5862,6 +5869,71 @@ __device__ __forceinline__ void spb_store(const SpConvArgs& a, const float* acc,
         }
     }
 }
+#if PLOW_SPEECH_CONV_OBJECT
+/* Ping-pong (one-group plans with rows split, when two copies fit): each warpgroup runs its own
+ * 64-row units with its own A, B and parameters and a named barrier, so one warpgroup's staging and
+ * store overlap the other's wgmma. Per output the instruction, K order and accumulator chain are the
+ * shared-unit path's: the same bits. */
+template <unsigned WN, bool PRE, bool STREAM>
+__device__ __forceinline__ void spb_pingpong(const SpConvArgs& a, const SpbIn& si, const char* whi, size_t ws,
+                                             unsigned pg, unsigned wgb, unsigned slice, unsigned nblk) {
+    constexpr unsigned NU = WN, BB = NU * 128u;
+    const unsigned tid = threadIdx.x & 127u, wg = threadIdx.x >> 7, bar = 1u + wg;
+    const unsigned span = 64u + (a.kernel - 1u) * a.dil, rpad = spb_rpad(a, 64u);
+    char* As = (char*)sm90_align1024(sp_smem) + (size_t)wg * wgb;
+    char* Bs = As + (size_t)pg * rpad * 128u;
+    float* par = (float*)(Bs + 2u * BB);
+    const unsigned gpt = a.cin / 16u, nkt = (a.cin * a.kernel + 63u) / 64u, ng = a.kernel * gpt;
+    const unsigned mt = (a.out_rows + 63u) / 64u, tn = (a.cout + NU - 1u) / NU, units = a.batch * mt * tn;
+    const unsigned per = units / nblk, extra = units % nblk;
+    const unsigned c0 = slice * per + (slice < extra ? slice : extra), c1 = c0 + per + (slice < extra ? 1u : 0u);
+    /* Each warpgroup walks one half of the block's run, keeping A across a row tile's column tiles. */
+    const unsigned half = c0 + (c1 - c0 + 1u) / 2u, u0 = wg ? half : c0, u1 = wg ? c1 : half;
+    unsigned staged = ~0u, pn = ~0u;
+    for (unsigned u = u0; u < u1; u++) {
+        const unsigned mu = u / tn, n0 = (u - mu * tn) * NU, b = mu / mt, t0 = (mu - b * mt) * 64u;
+        float acc[WN / 2u];
+        auto copy_b = [&](unsigned j, unsigned bf) {
+            const char* src = whi + (size_t)j * ws + (size_t)n0 * 128u + tid * 16u;
+            char* dst = Bs + bf * BB + tid * 16u;
+#pragma unroll
+            for (unsigned q = 0; q < NU / 16u; q++) sm90_cp16(dst + q * 2048u, src + q * 2048u, 16);
+            sm90_cp_commit();
+        };
+        copy_b(0u, 0u);
+        if (pn != n0) spb_params(a, par, n0, NU, tid, 128u);
+        pn = n0;
+        if (staged != mu) spb_stage<PRE, STREAM>(a, si, As, rpad, span, b, t0, 0u, a.cin, tid, 128u);
+        staged = mu;
+        sm90_cp_wait<0>();
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        asm volatile("bar.sync %0, 128;\n" ::"r"(bar) : "memory");
+        for (unsigned j = 0; j < nkt; j++) {
+            const unsigned bf = j & 1u;
+            if (j + 1u < nkt) copy_b(j + 1u, bf ^ 1u);
+            sm90_wg_fence();
+#pragma unroll
+            for (unsigned s2 = 0; s2 < 4u; s2++) {
+                const unsigned g = 4u * j + s2, gv = g < ng ? g : 0u, tap = gv / gpt, c16 = gv - tap * gpt;
+                const uint64_t da = sm90_desc(As + (size_t)(c16 >> 2) * rpad * 128u + (size_t)(tap * a.dil) * 128u) +
+                                    (((c16 & 3u) * 32u) >> 4);
+                const uint64_t db = sm90_desc(Bs + bf * BB) + ((s2 * 32u) >> 4);
+                const int acc_on = j || s2 ? 1 : 0;
+                if constexpr (WN == 96u) spb_m64n96k16(acc, da, db, acc_on);
+                else spwg_m64n64k16(acc, da, db, acc_on);
+            }
+            sm90_wg_commit();
+            sm90_wg_wait<0>();
+            sm90_cp_wait<0>();
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            asm volatile("bar.sync %0, 128;\n" ::"r"(bar) : "memory");
+        }
+        if (n0 < a.cout) spb_store<WN / 8u>(a, acc, par, NU, b, t0, n0);
+        asm volatile("bar.sync %0, 128;\n" ::"r"(bar) : "memory");
+    }
+    __syncthreads();
+}
+#endif
 /* WN columns per warpgroup; ROWS: the warpgroups split BM = 128 rows (NU = WN), else BM = 64 and
  * they split NU = 2 WN columns. Shared [A: pg planes x rpad x 128 B][B: 2 x NU rows x 128 B][params]. */
 template <unsigned WN, bool ROWS, bool PRE, bool STREAM>
@@ -5873,6 +5945,12 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
     const unsigned planes = (a.cin + 63u) / 64u, groups = planes / pg, gpt = a.cin / 16u;
     /* One group covering every plane runs the flattened (tap, channel) k-tiles, which may span taps. */
     const bool flat = groups == 1u;
+#if PLOW_SPEECH_CONV_OBJECT
+    if constexpr (ROWS) {
+        const unsigned wgb = ((unsigned)pg * spb_rpad(a, 64u) * 128u + 2u * BB + 3u * NU * 4u + 1023u) & ~1023u;
+        if (flat && 2u * wgb <= SPB_ARENA_BYTES) return spb_pingpong<WN, PRE, STREAM>(a, si, whi, ws, pg, wgb, slice, nblk);
+    }
+#endif
     const unsigned nkt = flat ? (a.cin * a.kernel + 63u) / 64u : a.kernel * pg, ng = a.kernel * gpt;
     const unsigned span = BM + (a.kernel - 1u) * a.dil, rpad = spb_rpad(a, BM);
     char* Bs = As + (size_t)pg * rpad * 128u;

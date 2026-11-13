@@ -269,6 +269,38 @@ Codec step, one persistent interpreter launch, us (`packet_bench`, median of 20,
 - Biggest instructions left at b8 x f17: the 96 -> 1 output conv (577 us, staged direct arm), the
   k7 convs (410-545 us each, a ~70 us roofline at 96 channels), ConvT (420-430 us).
 
+### Codec convs on a conv object (production form of the split screen)
+
+- Devgen (`PLOW_EMIT_CODEC_CONV_OBJECT` = minimum million MACs) isolates each large wgmma conv
+  (flags bit 17: the bf16 k7 convs, the k1 split convs, ConvT) into its own raw segment. Stream
+  order replaces its counter edges. plowc then builds `interp_sm90a_speechconv.cubin`, whose kernel
+  entry `speech_conv_node` runs that conv over its blocks with the ping-pong bf16 body.
+- plowrt launches the entry for every counter-free single-conv segment and the speech interpreter
+  for the rest. Without the object those segments run on the interpreter with the same bits.
+- First form: the conv object was the speech interpreter compiled a second time with only the
+  conv arms. Bits matched, but it was 50-70 % slower. Inside the interpreter function the ping-pong
+  body spilled (10300 LDL / 6574 STL). Without ping-pong it equalled the speech object (14109 vs
+  14188 us), so a separate register budget for the same body gains nothing. The kernel entry
+  holds the body at 254 registers.
+- Every tensor is bit-identical to the speech-object-only run of the same packet on programs
+  0-18, 27, 30 (`packet_exec.rs` `speech_conv_object_matches_speech_object`). The tts_cer gate
+  passes (median 0, n = 80).
+- Codec step us (`packet_bench`, median of 20): the unsegmented packet vs the conv object
+  (threshold 1000 M MACs, ConvT counted per input row). Isolation alone, on the interpreter, costs
+  1-4 %. Small programs isolate nothing:
+
+  | step | f1 before | f1 after | f4 before | f4 after | f17 before | f17 after |
+  |---|---:|---:|---:|---:|---:|---:|
+  | b1 | 3887 | 3889 | 4116 | 4107 | 4703 | 4608 |
+  | b4 | 4213 | 4208 | 4824 | 4727 | 8554 | 7485 |
+  | b16 | 5427 | 5304 | 8908 | 7861 | 23404 | 18916 |
+  | b64 | 11563 | 10348 | 24062 | 19899 | 84030 | 65445 (-22 %) |
+
+  b8 x f17 13560 -> 11286 (-17 %), b32 x f17 43640 -> 34450 (-21 %).
+- Served A/B (m9 vs conv object, same binary, audio s/s): c32 101.7 -> 126.0, c64 137.6 -> 146.1,
+  c128 150.6 -> 165.9, c256 175.2 -> 176.4. Median latency r20 1.18 -> 0.92 s, r30 1.84 -> 1.56 s.
+  No faults.
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |
