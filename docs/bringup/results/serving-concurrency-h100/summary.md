@@ -300,6 +300,28 @@ Codec step, one persistent interpreter launch, us (`packet_bench`, median of 20,
 - Served A/B (m9 vs conv object, same binary, audio s/s): c32 101.7 -> 126.0, c64 137.6 -> 146.1,
   c128 150.6 -> 165.9, c256 175.2 -> 176.4. Median latency r20 1.18 -> 0.92 s, r30 1.84 -> 1.56 s.
   No faults.
+- With the codec cheaper, the 256-row talker ladder pays off. Rungs to 64 vs to 256, conv object
+  on both:
+
+  | ladder | c32 | c128 | c256 | c512 | 40 req/s |
+  |---|---:|---:|---:|---:|---:|
+  | to 64 rows | 126.3 | 150.4 | 181.0 | 176.7 (699 of 1024 rejected) | 193.3 |
+  | to 256 rows | 118.5 | 162.3 | 201.6 | 221.7 (0 rejected) | 198.3 |
+
+- Where a c512 cell's 24.4 s of ticks go (256-row ladder):
+  - Codec: 15.1 s over 1272 launches, ~57 frames each. That is ~0.21 ms per frame, against 0.06 for
+    a full 64 x 17 launch.
+  - Talker: 192-row frames take 39 ms served, against ~26 ms isolated at 256 rows.
+  - Interpreter walk: a codec step with no instruction executed (`--sweep` cap 0) costs 1.40 ms, about
+    6.4 us per instruction. On a 1 x 17 step the convs add 2.10 ms and the other 141 instructions 1.09 ms.
+- Codec scheduling knobs at that point (audio s/s, c128 / c256 / c512):
+  - Default: 170 / 190 / 210.
+  - `PLOW_TTS_STREAM_DEADLINE=0`: 174 / 179 / 227.
+  - `PLOW_TTS_CODEC_HOLD_MS=60`: 76 / 77 / 169.
+  - Holding steps to gather larger launches stalls the talker more than it saves; neither knob is the
+    lever. Open:
+    - fuller codec launches without holding the talker (codec beside the talker tick, not serial with it);
+    - the served talker frame vs isolated (39 vs ~26 ms).
 
 ## TTS
 
