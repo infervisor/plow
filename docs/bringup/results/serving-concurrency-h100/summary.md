@@ -353,6 +353,27 @@ Codec step, one persistent interpreter launch, us (`packet_bench`, median of 20,
 - Open: GPU time per frame. The codec pays for padded frames (ragged step rows) and a ~3.9 ms
   floor per launch; the talker runs 80-100 rows per tick at ~0.17 ms per frame.
 
+### Codec attention on a slot-indexed KV ring (Qwen3-TTS codec)
+
+The Qwen3-TTS codec's step programs now take the KV ring the Mimi codec already had
+(`PLOW_CODEC_RING_KV=1` at emit). A step of up to 4 frames attends to each layer's ring in place.
+A longer step gathers the ring first. Every step then stores its new rotated K | V rows into the
+ring, so the per-layer carry gather / store pairs are gone.
+
+- Accuracy (`codec_stream_check`, 160 frames, 16 streams sharing launches): stream-vs-whole rel-L2
+  and max |d| equal the carry packet's at chunks 2, 17 and random. Batch invariance is
+  bit-identical at fixed chunks. At random chunks both packets differ by ~3e-3.
+- Step time (`packet_bench`): b64 x f2 13.26 -> 11.31 ms (-15 %), b32 x f4 11.78 -> 10.88 (-8 %),
+  b16 x f17 18.89 -> 18.70.
+- Served, step cap 2, same binary (audio s/s): c256 201.7 -> 208.7, c512 216.1 -> 233.4 (191 -> 150
+  refused), 50 req/s 233.2 -> 239.5 (median latency 5.7 -> 4.2 s), 60 req/s 235.7 -> 245.1 (365 ->
+  176 refused). No faults.
+- Recipe tts_cer gate: PASS, median CER 0 over 80 clips.
+- Where the time goes at 40 req/s (199 audio s/s, 50 s): codec launches 21.4 s, ticks 41.7 s with
+  the codec interleaved, so the talker is ~20 s (~11 ms per tick at ~100 rows, isolated speed).
+  2620 codec launches average ~47 frames; the ~3.9 ms per-launch floor is about half the codec's
+  time.
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |
