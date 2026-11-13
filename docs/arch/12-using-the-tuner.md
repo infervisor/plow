@@ -300,9 +300,7 @@ Stated plainly so nobody plans around them:
   qualifying NVIDIA measurement.
 - **No gfx950 inventory has been probed.** The pipeline and recipe are in place;
   it needs one run on a ROCm machine.
-- **Nothing consumes measurements yet.** `select_kernel` accepts a
-  `MeasuredCosts` and the store can serve one, but no caller wires them together
-  — so every selection today reports tier `portable`.
+- **Dense GEMM measurements are wired into `devgen`, `plowc::tuned::CompilerOracle`, and `plowc tune select`.** Extending `select_kernel` and `MeasuredCosts` beyond dense GEMM remains open work.
 - **Bundles carry no tuning provenance.** `Manifest` still records only
   `gpu: String` and `WeightTiling{bn,bk}`.
 - **Only dense GEMM is wired**, 3 of 84 opcodes. See `11-tuning-coverage.md` for

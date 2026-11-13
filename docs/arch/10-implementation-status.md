@@ -82,7 +82,7 @@ behind its `hub` feature and architecture builders behind its `models` feature.
 | Alias detection (`alias_groups`) | ✅ | Reports opcodes that share one body (NVIDIA GEMM/MED/SMALL) |
 | Resource gates (`resource`) | 🔧 | Parses both vendors' register/spill reports; NVIDIA build not yet wired to fail |
 | Inventory probe from built object | 🔧 | Derives inventory from a built object; gfx950 awaits a ROCm probe run |
-| `select_kernel` | 🔧 | `gemma4::pick_tile` routes through it; other model pickers not yet migrated |
+| `select_kernel` | ✅ | Shared by `devgen::pick_tile`, `llama3::pick_tile`, and `plowc tune select` |
 
 ### `crates/tunedb/` — Calibrated Measurement Store
 
@@ -382,7 +382,7 @@ These items are described in the design documents but have no corresponding impl
 |----------------|-----|----------|
 | Kernel tuning architecture | `crates/kernelcaps` lands `KernelSpec`, capability filtering, alias detection, resource gates, and a probe that derives the inventory from a built object. gfx950 awaits a probe run on ROCm | 🔧 Highest |
 | Block-driven tuning | `crates/tunedb` lands the normalized store, states, and atomic publication. `NetworkBlockDefinition` → manifest is open | 🔧 Highest |
-| Compiler selection | `gemma4::pick_tile` (in `devgen`) now goes through `kernelcaps::select_kernel` (differential-verified over 5760 shapes). The `llama3` binary (`crates/plowc/src/bin/llama3.rs`) still has its own `pick_tile` | 🔧 Highest |
+| Compiler selection | `devgen::pick_tile`, `llama3` (`crates/plowc/src/bin/llama3.rs`), and `plowc tune select` all route dense GEMM tile selection through `kernelcaps::select_kernel` (differential-verified over 5760 shapes) and shared `tunedb` measurements | ✅ Closed |
 | Interpreter readiness | Resource-compatible dense/MoE/latent/Mamba profiles and complete-object gates | High |
 | Extended ops | SM120 MLA/DSA completion, MLA prefill, then Mamba state/scan support | High |
 | §7.4 Wavefront clustering | Counter tree for >200 tiles/boundary | Low (not needed for current models) |
