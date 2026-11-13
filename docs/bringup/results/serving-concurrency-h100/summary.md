@@ -397,6 +397,26 @@ ring, so the per-layer carry gather / store pairs are gone.
   channel k7 convs vs 225-350 us here, 24 us for dec.in vs 647, 37 us for a 96-channel k1 vs 210.
   Its fp32 path is 4x slower than these convs. The k7 convs already run single-product bf16, so the
   3.7-5x gap is the kernel: synchronous A staging per unit, one k-tile in flight, per-item row tiles.
+- dec.in packs up to 8 items of at most 8 output rows into one unit (8-row core groups stride an
+  item slot): 647 -> 235 us, PCM bit-identical, step b64 x f2 11.02 -> 10.51 ms. A 222 KiB arena
+  for the conv object alone (8 items per unit, ping-pong for the 384-channel k7) took dec.in to 137
+  us and the 384 d1 k7 355 -> 239, but the smaller L1 cost every other conv ~10 us: step -0.8 %,
+  b16 x f17 +0.8 %. Not adopted as one arena; a per-launch claim is open.
+- Conv-object segments of the b64 x f2 step after that (us, effective TFLOP/s):
+
+| Family (x3 each: d1 / d3 / d9) | k7 | k1 + residual | ConvTranspose into it |
+|---|---|---|---|
+| 768 ch, 64 rows per item | 296 / 300 / 315 (125-198) | 73 x 3 (66) | 291 (75) |
+| 384 ch, 320 rows | 355 / 340 / 352 (121-140) | 110 x 3 (55) | 275 (89) |
+| 192 ch, 1280 rows | 261 / 266 / 284 (155-163) | 145 x 3 (42) | 293 (83) |
+| 96 ch, 3840 rows | 212 / 227 / 240 (134-150) | 210 x 3 (22) | 280 (65) |
+
+  k7 3.45 ms, k1 1.62 ms, ConvTranspose 1.14 ms, dec.in 0.24 ms, the pre-transformer's four large
+  pointwise convs 0.28 ms. A 96-channel k1 reads and writes ~283 MB (input, residual, output): a
+  ~92 us floor at 3.1 TB/s against 210 us.
+- One stream, one frame (b1 x f1, 3.6 ms) is the per-launch floor: its convs take 2.5 ms on 6-16
+  blocks each (dec.in 124 us on 12 blocks, each 768-channel k7 ~120 us on 6), so a small launch
+  streams the codec's weights through a few SMs.
 
 ## TTS
 
