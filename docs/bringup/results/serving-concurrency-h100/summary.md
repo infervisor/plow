@@ -374,6 +374,20 @@ ring, so the per-layer carry gather / store pairs are gone.
   2620 codec launches average ~47 frames; the ~3.9 ms per-launch floor is about half the codec's
   time.
 
+### Codec convs vs roofline (b64 x f2 step)
+
+- Per-conv cost: sweep a copy of the packet without the conv object, so every conv runs on the
+  interpreter with the same bits. 637 GFLOP of convs take 11.4 ms (56 TFLOP/s): k7 convs 90-100
+  TFLOP/s, the residual units' k1 convs (split-bf16 + residual) 17-55, dec.in (1024 -> 1536 k7, 8
+  output rows per item in 64-row tiles) 15. At ~500 TFLOP/s the convs would take ~1.3 ms.
+- The wgmma conv streams its whole weight slice from L2 for every 64-row unit. Per conv that is
+  ~0.5 GB at 96 channels, 0.5-0.7 GB at 384 / 768, and 1.4 GB for dec.in: a 90-250 us floor from
+  L2 bandwidth alone.
+- Output conv (96 -> 1 k7, the staged few-output arm): tiles now size against the launch's claim
+  (256 rows instead of 128 at 130 KiB). Staging keeps four float4 loads in flight per thread instead
+  of one scalar load. PCM is bit-identical (stream, whole and mixed, chunks 2 and random). Step:
+  b64 x f2 11.32 -> 11.03 ms, b32 x f2 7.47 -> 7.31, b16 x f17 18.70 -> 18.05, b1 x f1 unchanged.
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |

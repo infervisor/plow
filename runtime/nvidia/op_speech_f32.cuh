@@ -6395,10 +6395,12 @@ static __device__ __noinline__ bool sp_conv1d_rows(const SpConvArgs& a, unsigned
  * activation is applied once per staged element. False when no TB fits (uniform per launch). */
 static __device__ __noinline__ bool sp_conv1d_staged(const SpConvArgs& a, unsigned slice, unsigned nblk, float* arena) {
     const unsigned ld = a.cin | 1u, K = a.kernel * a.cin, span = a.dil * (a.kernel - 1u);
+    /* Tiles size against the launch's claim: the rows only change which block computes an output. */
     unsigned TB = 256u;
-    while (TB >= 32u && (size_t)((TB - 1u) * a.stride + span + 1u) * ld + (size_t)a.cout * K > SP_ARENA_FLOATS) TB >>= 1;
+    while (TB >= 32u && (size_t)((TB - 1u) * a.stride + span + 1u) * ld + (size_t)a.cout * K > SP_LAUNCH_ARENA_FLOATS) TB >>= 1;
     if (TB < 32u) return false;
     const unsigned window = (TB - 1u) * a.stride + span + 1u, tpb = (a.out_rows + TB - 1u) / TB;
+    const bool vec = a.cin % 4u == 0u && sp_aligned(a.x, 16);
     float* xs = arena;
     float* ws = arena + (size_t)window * ld;
     for (unsigned tile = slice; tile < a.batch * tpb; tile += nblk) {
@@ -6406,10 +6408,36 @@ static __device__ __noinline__ bool sp_conv1d_staged(const SpConvArgs& a, unsign
         const int length = (int)a.length(b), lo = (int)(t0 * a.stride) - (int)a.before;
         const float* xb = a.x + (size_t)b * a.in_rows * a.cin;
         __syncthreads();
-        for (unsigned e = threadIdx.x; e < window * a.cin; e += PLOW_NV_THREADS) {
-            const unsigned r = e / a.cin, i = e - r * a.cin;
-            const int u = sp_pad_row(lo + (int)r, length, a.mode);
-            xs[r * ld + i] = u >= 0 ? a.pre_at(xb[(size_t)u * a.cin + i], i) : 0.f;
+        if (vec) {
+            /* Four float4 loads in flight per thread: one scalar load at a time is latency-bound. */
+            const unsigned C4 = a.cin / 4u, n4 = window * C4;
+            for (unsigned e0 = threadIdx.x; e0 < n4; e0 += 4u * PLOW_NV_THREADS) {
+                float4 v[4];
+                int u[4];
+#pragma unroll
+                for (unsigned q = 0; q < 4u; q++) {
+                    const unsigned e = e0 + q * PLOW_NV_THREADS, r = e / C4, c = (e - r * C4) * 4u;
+                    u[q] = e < n4 ? sp_pad_row(lo + (int)r, length, a.mode) : -1;
+                    v[q] = u[q] >= 0 ? __ldcg((const float4*)(xb + (size_t)u[q] * a.cin + c)) : make_float4(0.f, 0.f, 0.f, 0.f);
+                }
+#pragma unroll
+                for (unsigned q = 0; q < 4u; q++) {
+                    const unsigned e = e0 + q * PLOW_NV_THREADS, r = e / C4, c = (e - r * C4) * 4u;
+                    if (e >= n4) break;
+                    float* d = xs + (size_t)r * ld + c;
+                    const bool in = u[q] >= 0;
+                    d[0] = in ? a.pre_at(v[q].x, c) : 0.f;
+                    d[1] = in ? a.pre_at(v[q].y, c + 1u) : 0.f;
+                    d[2] = in ? a.pre_at(v[q].z, c + 2u) : 0.f;
+                    d[3] = in ? a.pre_at(v[q].w, c + 3u) : 0.f;
+                }
+            }
+        } else {
+            for (unsigned e = threadIdx.x; e < window * a.cin; e += PLOW_NV_THREADS) {
+                const unsigned r = e / a.cin, i = e - r * a.cin;
+                const int u = sp_pad_row(lo + (int)r, length, a.mode);
+                xs[r * ld + i] = u >= 0 ? a.pre_at(xb[(size_t)u * a.cin + i], i) : 0.f;
+            }
         }
         for (unsigned e = threadIdx.x; e < a.cout * K; e += PLOW_NV_THREADS) {
             const unsigned o = e / K, j = e - o * K, k = j / a.cin, i = j - k * a.cin;
