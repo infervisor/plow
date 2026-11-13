@@ -274,8 +274,11 @@ curl -fsSL https://pdist.infervisor.ai/install.sh | sh     # PLOWRT_VERSION=… 
 Releases up to 0.1.3 are under `v1/runtime/`, which is no longer written.
 
 The installer reads `latest`, then that version's `release.json` for the machine's
-triple, verifies the tarball against its `.sha256`, and installs `plowrt`
-into `/usr/local/bin` or `~/.local/bin` (`PLOWRT_INSTALL_DIR` overrides).
+triple, verifies the tarball against its `.sha256`, and installs `plowrt` and
+`plowc` into `/usr/local/bin` or `~/.local/bin` (`PLOWRT_INSTALL_DIR`
+overrides). An x86_64 Linux host without glibc's loader (Alpine) gets the
+static `x86_64-unknown-linux-musl` build. The dynamic builds need glibc 2.38
+or newer.
 
 **Model assets**, which advance independently — a new generation needs no new
 binary — are published by `plowrt` alone, straight into the bucket a client
