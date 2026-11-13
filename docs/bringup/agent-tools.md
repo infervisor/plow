@@ -115,7 +115,8 @@ gap is first a statement about the programs and kernels that run per request.
    other runtime or serving knob. A knob change proposed while step 2 or 3 is open for a stage on
    the request path is out of order and is not measured, except to restore correctness.
 5. **Peer comparison last.** The serving grid against the reference stack confirms steps 1-4; it
-   does not choose what to work on.
+   does not choose what to work on. It runs only after the per-stage precision parity table below
+   exists.
 
 Invariance contracts found on the way (a result that depends on packing, batch position or block
 count) are correctness failures: they stop the candidate at step 3, not at the serving gate.
@@ -134,6 +135,49 @@ Speech stages use the same harness with these tools:
 A final report that lacks the roofline table, the fusion list or the per-op targets is incomplete,
 whatever its serving numbers say. Speech campaigns also follow §9 "Speech serving campaigns"
 (served split, per-bucket objects, fail-closed variants, codec invariance before timing).
+
+## HARD RULE: precision parity with the peer, stage by stage
+
+A ratio against a peer (vLLM, vLLM-Omni, a provider engine) is valid only when both sides run the
+same arithmetic in every stage. A model-level label such as "bf16" is not enough. Depth and code
+predictor stages, codecs, encoders, attention and KV often run a different precision from the
+backbone, on both sides.
+
+1. **Read the peer's precision from the peer.** Do this before its first served cell. Sources:
+   - its launch log (`dtype=`);
+   - per-stage deploy or stage configs (`dtype`, TF32 switches such as `decode_enable_tf32`);
+   - its engine source: `allow_tf32` and `cudnn.allow_tf32` (framework defaults: cuDNN conv TF32
+     on, matmul TF32 off), explicit casts, and kernel-internal rounding (an add + LayerNorm that
+     writes fp16 makes the activations fp16).
+
+   A CLI default counts: record it when no flag is passed. Never infer precision from the
+   checkpoint or a model card. A stage config can override the checkpoint's dtype, as in a codec
+   whose config says float32 but whose stage runs bf16.
+2. **Read plowrt's precision from the served packet**, not from the recipe. Per stage, take it from
+   `plowrt disasm --format json` op flags:
+   - weight dtype;
+   - half input and half output bits;
+   - split-bf16, bf16 taps, 3xTF32;
+   - KV dtype.
+3. **Write the parity table before any ratio.** Put it in the campaign results doc with the
+   columns Model | Stage | Peer (with the source line or log line) | plowrt | Status, where Status
+   is match, plowrt wider or plowrt narrower. Every report that quotes a peer ratio links this
+   table.
+4. **Never narrower than the peer.** If any plowrt stage runs below the peer's precision, every
+   ratio for that model is NOT MATCHED, whatever the quality gate says. Examples: fp8 against bf16,
+   bf16 against fp16 activations, one-pass TF32 against f32. A quantized checkpoint matches only
+   when the peer serves the same published checkpoint.
+5. **A wider stage is a work item.** Each plowrt-wider stage either moves to the peer's precision or
+   carries a written, measured reason to stay wider, such as a codec PCM contract the narrower
+   arithmetic fails.
+   - The move goes through the kernel harness above and requalifies the CER, WER or FP32-reference
+     gate.
+   - A ratio quoted while a wider stage is open names that stage next to the number.
+6. **Re-audit on any change** to the peer's version or flags, and on any emit flag or pin that
+   changes a stage's arithmetic.
+
+The quality gates decide whether the output is acceptable. The parity table decides whether the
+comparison is fair. A report needs both.
 
 ## Working rules (every agent)
 
@@ -454,6 +498,9 @@ Rules (enforced in `serving_comparison.py`, tested in `scripts/bench/test_servin
 * Exactly these 12 rows, in this order. Every cell is filled; missing data is an error, not a blank.
 * "Same as baseline" only when the recorded value is literally identical; otherwise the Infervisor
   value is shown and the cell is **NOT MATCHED**. Matched = the first five rows identical.
+  The Precision row is per stage. It is "Same as baseline" only when the precision parity table
+  (HARD RULE above) shows no plowrt-narrower stage. An open plowrt-wider stage is named in the note
+  under the table.
   Input/output also compares the per-request length lists.
 * Serving stack: Baseline = stack, version and serve flags; Infervisor =
   `Infervisor (plowrt <commit>, packet <model.pkt sha256 prefix>)`.
@@ -1003,7 +1050,14 @@ names its output; a report without it is incomplete.
 8. **Lands only where it wins.** A mechanism that is correct but loses at served rungs lands only
    as a per-class tuning pin no recipe sets (never a default-off `PLOW_*` knob, "Builds"); the
    results doc records the loss table.
-9. **Disk.** Speech packets are 6+ GB each. Check free space before an emit, remove your own
+9. **Precision parity per stage** (HARD RULE above). The campaign audit found three plowrt stages
+   wider than the peers:
+   - Maya2 depth residual and KV in f32, against provider fp16;
+   - Qwen3-TTS codec attention in 3xTF32, against vLLM-Omni bf16;
+   - Qwen3-ASR encoder convs and attention in 3xTF32, against vLLM bf16.
+
+   Each one was paying for arithmetic the peer skips.
+10. **Disk.** Speech packets are 6+ GB each. Check free space before an emit, remove your own
    superseded packets when a decision is made (keep any a kept packet symlinks into), never others'.
 
 **Release and distribution**

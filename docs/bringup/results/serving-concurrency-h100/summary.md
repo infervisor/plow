@@ -433,6 +433,25 @@ ring, so the per-layer carry gather / store pairs are gone.
   dec.in at b1 runs 120 -> 39 us. At served launch sizes (~47 frames) the net is about zero, and it
   changes numerics, so no recipe pin. The mechanism stays opt-in for latency-bound small launches.
 
+## Precision vs reference (per stage)
+
+The reference precision comes from each reference server's own config, launch log and source. A
+ratio below is fair only where the two columns match. Where plowrt is wider, it pays for arithmetic
+the reference does not do.
+
+| Model | Stage | Reference | plowrt | Status |
+|---|---|---|---|---|
+| Maya2 | backbone | bf16, matmul TF32 off | bf16 | match |
+| Maya2 | depth (31 x 4 blocks) | fp16 weights, activations, KV; add+LN rounded to fp16 | fp16 weights, f16 LN outputs into the projections; f32 residual stream, qkv and KV | plowrt wider (residual, KV) |
+| Maya2 | Mimi decoder | f32 weights, cuDNN convs TF32 (framework default) | split-bf16 projections/k1/ConvT, 3xTF32 k7/k3 | at or above |
+| Qwen3-TTS | talker + code predictor | bf16 | bf16 | match |
+| Qwen3-TTS | codec (code2wav) | bf16, decode TF32 off | bf16 taps convs, f32 activations, 3xTF32 attention | plowrt wider |
+| Qwen3-ASR | audio encoder | bf16 | f32 activations, 3xTF32 convs and attention, bf16 dense | plowrt wider |
+| Qwen3-ASR | decoder | bf16 | bf16 | match |
+
+  No stage runs below its reference. Next, the three wide stages move down to the reference
+  precision, and the CER/WER gates are requalified at each move: Maya2 depth qkv and KV to f16, Qwen3-TTS codec attention to bf16, and the ASR encoder convs and attention to bf16.
+
 ## TTS
 
 | Model | Cell | plowrt | Reference |
