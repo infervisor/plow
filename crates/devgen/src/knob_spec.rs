@@ -1239,6 +1239,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.codec_wgmma_ragged", Some("PLOW_EMIT_CODEC_WGMMA_RAGGED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.codec_dec_in_wgmma", Some("PLOW_EMIT_CODEC_DEC_IN_WGMMA"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.codec_conv_bf16", Some("PLOW_EMIT_CODEC_CONV_BF16"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.codec_bf16_1p", Some("PLOW_EMIT_CODEC_BF16_1P"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.codec_conv_object", Some("PLOW_EMIT_CODEC_CONV_OBJECT"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.codec_conv_arms", Some("PLOW_EMIT_CODEC_CONV_ARMS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.codec_conv_classes", Some("PLOW_EMIT_CODEC_CONV_CLASSES"), Layer::Emit, Domain::Str, UNSET, OPT_IN),

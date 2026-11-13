@@ -442,15 +442,27 @@ the reference does not do.
 | Model | Stage | Reference | plowrt | Status |
 |---|---|---|---|---|
 | Maya2 | backbone | bf16, matmul TF32 off | bf16 | match |
-| Maya2 | depth (31 x 4 blocks) | fp16 weights, activations, KV; add+LN rounded to fp16 | fp16 weights, f16 LN outputs into the projections; f32 residual stream, qkv and KV | plowrt wider (residual, KV) |
+| Maya2 | depth (31 x 4 blocks) | fp16 weights, activations, KV; add+LN rounded to fp16 | fp16 weights, f16 LN outputs into the projections; f32 qkv, KV, o-proj input and residual; attention in fp32 FFMA (3xTF32 on prefix rows) | plowrt wider |
 | Maya2 | Mimi decoder | f32 weights, cuDNN convs TF32 (framework default) | split-bf16 projections/k1/ConvT, 3xTF32 k7/k3 | at or above |
 | Qwen3-TTS | talker + code predictor | bf16 | bf16 | match |
-| Qwen3-TTS | codec (code2wav) | bf16, decode TF32 off | bf16 taps convs, f32 activations, 3xTF32 attention | plowrt wider |
-| Qwen3-ASR | audio encoder | bf16 | f32 activations, 3xTF32 convs and attention, bf16 dense | plowrt wider |
+| Qwen3-TTS | codec (code2wav) | bf16 GEMMs, depthwise conv in f32, decode TF32 off | single-product bf16 for every pointwise / transformer projection, ConvTranspose and k3 / k7 conv (bf16-rounded input and weights, f32 accumulate); depthwise k7 f32; 96 -> 1 output conv f32 FFMA; attention 3xTF32 or fp32 FFMA (stream mode); f32 activations | convs match; attention wider |
+| Qwen3-ASR | audio encoder | bf16 (mel cast to bf16; FlashAttention: f32 scores, bf16 P and output) | bf16 semantics: bf16 mel, conv1 exact over it, bf16 tensor-core dense and conv2/conv3, f32 attention scores with bf16 probability and output | match |
 | Qwen3-ASR | decoder | bf16 | bf16 | match |
 
-  No stage runs below its reference. Next, the three wide stages move down to the reference
-  precision, and the CER/WER gates are requalified at each move: Maya2 depth qkv and KV to f16, Qwen3-TTS codec attention to bf16, and the ASR encoder convs and attention to bf16.
+  Read from `plowrt disasm --format json` of the served packets. No stage runs below its
+  reference. Moves so far, each with its gate requalified:
+  - Qwen3-ASR attention scores were bf16-rounded, narrower than the reference: now f32. WER 1.7B
+    0.0391, 0.6B 0.0426 (limit 0.045); encoder pack parity 0 differing; encoder time +0.2-0.8 %.
+  - Qwen3-TTS codec convs: single-product bf16 on the wgmma arms (speech flag layout 4, emit knob
+    `PLOW_EMIT_CODEC_BF16_1P`). Bit-identical to the split products on bf16-exact operands (op test).
+    CER median 0, mean 0.032 vs 0.035 (n 80). Codec step b64 11.02 -> 9.69 ms, b32 7.30 -> 6.46,
+    b16x17 18.06 -> 16.67, b1 3.62 -> 3.18. Served open loop: r25 median latency 1.30 -> 1.12 s,
+    first audio p50 55.6 -> 50.6 ms; r20 / r30 first audio -3 to -6 %; closed-loop audio s/s within
+    noise (the talker bounds it). Stalls are equal across the two arms (27 vs 26 over two runs).
+    Stream-vs-whole at 2-frame chunks stays bit-identical; random chunks already differed (max |d|
+    3e-3) and now differ by up to 5e-2.
+  Still wider: Maya2 depth qkv, KV, attention and residual (to fp16); the Qwen3-TTS codec attention
+  (to bf16 operands).
 
 ## TTS
 

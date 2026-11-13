@@ -810,6 +810,7 @@ pub(crate) fn fused_conv(
         wgmma_ragged: c.wgmma_ragged && (ct || taps),
         input_split: false,
         bf16_taps: false,
+        single_bf16: crate::emit_config::active().codec_bf16_1p,
         stream_in: None,
         output_split: false,
     };

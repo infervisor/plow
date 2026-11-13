@@ -1348,7 +1348,12 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 14u | PLOW_SPEECH_CA
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 10u;
 #endif
+/* Layout 4 adds the single-product bf16 wgmma convs (Conv1dF32 / ConvTranspose1dF32 i6 bit 31). */
+#if defined(PLOW_NV_HOPPER)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 4u;
+#else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 3u;
+#endif
 #else
 #if defined(PLOW_NV_HOPPER)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 6u | PLOW_SPEECH_CAP_CHUNKS;

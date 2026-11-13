@@ -4514,6 +4514,9 @@ struct SpConvArgs {
      * wide / wgmma tile instead of 64, bits 3..8 the split-K parts (0: unsplit; with flags bit
      * 20, t7 is the conv-own scratch of SPC_TICKETS tickets then the partials). */
     unsigned pin;
+    /* i6 bit 31 (dilation / output padding below it): single-product bf16 on the wgmma arms, one
+     * hi x hi product per k16 (the reference's bf16 operands, f32 accumulate) instead of three. */
+    unsigned one;
     __device__ bool pinned() const { return pin & 1u; }
     __device__ unsigned pin_bn() const { return pin & 4u ? 128u : 64u; }
     __device__ unsigned pin_parts() const { return (pin >> 3) & 63u; }
@@ -4570,8 +4573,9 @@ __device__ __forceinline__ bool sp_conv_args(const PlowDevInst* in, void* const*
     a.splitk = splitk ? (float*)SP_TEN(7) : nullptr;
     a.batch = in->i[0]; a.in_rows = in->i[1]; a.cin = in->i[2]; a.cout = in->i[3];
     a.kernel = in->i[4]; a.stride = in->i[5]; a.groups = in->i[7];
-    a.dil = transpose ? 1u : in->i[6];
-    a.opad = transpose ? in->i[6] : 0u;
+    a.dil = transpose ? 1u : in->i[6] & 0x7FFFFFFFu;
+    a.opad = transpose ? in->i[6] & 0x7FFFFFFFu : 0u;
+    a.one = in->i[6] >> 31;
     a.before = in->fj[1].u & 0xFFFFu; a.after = in->fj[1].u >> 16;
     const unsigned flags = in->fj[2].u;
     a.mode = transpose ? 0u : flags & 3u;
@@ -5123,6 +5127,14 @@ __device__ __forceinline__ void spwg_split_store(char* hi_base, unsigned half, u
     __nv_bfloat16* hi = (__nv_bfloat16*)hi_base + off;
     sp_split4(hi, hi + half / 2u, v);
 }
+/* The hi half alone (single-product convs): round-to-nearest bf16, as sp_split4's hi. */
+__device__ __forceinline__ void spwg_hi_store(char* hi_base, unsigned r, unsigned c4, float4 v) {
+    const unsigned off = (unsigned)sm90_swz_off<SPWG_BK, 8>((int)r, (int)(c4 >> 3)) + (c4 & 4u);
+    const __nv_bfloat162 h0 = __floats2bfloat162_rn(v.x, v.y), h1 = __floats2bfloat162_rn(v.z, v.w);
+    uint2 uh;
+    uh.x = *(const unsigned*)&h0; uh.y = *(const unsigned*)&h1;
+    *(uint2*)((__nv_bfloat16*)hi_base + off) = uh;
+}
 __device__ __forceinline__ void spwg_bulk_store(float* g, const float* s, unsigned bytes) {
     asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n" ::"l"(g),
                  "r"((unsigned)__cvta_generic_to_shared(s)), "r"(bytes)
@@ -5213,6 +5225,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, wg = warp >> 2;
     const unsigned sr = tid >> 4, sc = (tid & 15u) * 4u; /* 16 threads per 64-float row, 16 rows per pass */
     const SpConvArgs& a = ep.a;
+    const bool one = a.one;
     /* GR (pointwise groups): N and K per group, A rows cin apart; group g's tiles read columns
      * g * K of A and write columns g * N. */
     const unsigned G = GR ? a.groups : 1u, lda = GR ? a.cin : K;
@@ -5305,11 +5318,20 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             }
         };
         auto store = [&](unsigned b) {
+            if (one) {
 #pragma unroll
-            for (unsigned p = 0; p < 8; p++) spwg_split_store(aoff(b), SPWG_OP, sr + 16u * p, sc, va[p]);
-            if constexpr (!WS) {
+                for (unsigned p = 0; p < 8; p++) spwg_hi_store(aoff(b), sr + 16u * p, sc, va[p]);
+                if constexpr (!WS) {
 #pragma unroll
-                for (unsigned p = 0; p < BN / 16u; p++) spwg_split_store(boff(b), BOP, sr + 16u * p, sc, vb[p]);
+                    for (unsigned p = 0; p < BN / 16u; p++) spwg_hi_store(boff(b), sr + 16u * p, sc, vb[p]);
+                }
+            } else {
+#pragma unroll
+                for (unsigned p = 0; p < 8; p++) spwg_split_store(aoff(b), SPWG_OP, sr + 16u * p, sc, va[p]);
+                if constexpr (!WS) {
+#pragma unroll
+                    for (unsigned p = 0; p < BN / 16u; p++) spwg_split_store(boff(b), BOP, sr + 16u * p, sc, vb[p]);
+                }
             }
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         };
@@ -5320,7 +5342,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
 #pragma unroll
             for (unsigned j = 0; j < BN / 32u; j++) {
                 sm90_cp16(dst + j * 4096u, src + j * 4096u, 16);
-                sm90_cp16(dst + BOP + j * 4096u, src + wsn + j * 4096u, 16);
+                if (!one) sm90_cp16(dst + BOP + j * 4096u, src + wsn + j * 4096u, 16);
             }
             sm90_cp_commit();
         };
@@ -5349,7 +5371,10 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
 #pragma unroll
             for (unsigned s = 0; s < SPWG_BK / 16u; s++) {
                 const uint64_t o = (s * 32u) >> 4; /* +32 B per k16 in the start-address field */
-                if constexpr (BN == 128u) {
+                if (one) {
+                    if constexpr (BN == 128u) wgmma_m64n128k16(acc, dah + o, dbh + o, kt != kb || s ? 1 : 0);
+                    else spwg_m64n64k16(acc, dah + o, dbh + o, kt != kb || s ? 1 : 0);
+                } else if constexpr (BN == 128u) {
                     wgmma_m64n128k16(acc, dal + o, dbh + o, kt != kb || s ? 1 : 0);
                     wgmma_m64n128k16(acc, dah + o, dbl + o, 1);
                     wgmma_m64n128k16(acc, dah + o, dbh + o, 1);
@@ -6351,7 +6376,7 @@ __device__ __forceinline__ bool spb_args(const PlowDevInst* in, void* const* T, 
 #if defined(PLOW_NV_HOPPER)
 /* The wgmma arm of Conv1dF32 (flags bit 17), dispatched from the interpreter's inlined body:
  * wgmma in a called function is serialized (ptxas C7510). False when the op does not qualify. */
-__device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+__device__ __forceinline__ bool sp_wg_conv1d_body(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
     if (in->op == PLOW_DOP_CONV_TRANSPOSE1D_F32) {
         if (!sp_op_on(PLOW_DOP_CONV_TRANSPOSE1D_F32) || ((in->fj[2].u >> 17) & 3u) != 3u) return false;
         if (!sp_arm_on(SPA_WG_CT)) { __trap(); return true; }
@@ -6369,7 +6394,7 @@ __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const*
          * ever reads image bytes. Devgen sets it only on ungrouped pointwise pre-split wgmma convs
          * over 64-channel multiples without input activation, warp arm, split-K or row scale, and
          * bit 31 (image out) only with cout % 64 == 0: anything else is a lowering error (fail closed). */
-        if (((in->fj[2].u >> 16) & 1u) || !sp_conv_args(in, T, false, a) || !spg_eligible(a) || a.kernel != 1u ||
+        if (((in->fj[2].u >> 16) & 1u) || !sp_conv_args(in, T, false, a) || a.one || !spg_eligible(a) || a.kernel != 1u ||
             a.groups != 1u || a.cin % 64u || !((in->fj[2].u >> 18) & 1u) || a.splitk || a.row_scale ||
             (((in->fj[2].u >> 31) & 1u) && a.cout % 64u))
             __trap();
@@ -6410,6 +6435,13 @@ __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const*
     if (!grouped && (!((in->fj[2].u >> 18) & 1u) || !sp_w_conv_width(in, a, nblk))) return false;
     sp_wg_run(a, slice, nblk);
     return true;
+}
+/* A single-product conv (i6 bit 31) runs only on the wgmma arms: anywhere else it would silently
+ * take the wider products, so it traps (fail closed). */
+__device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    if (sp_wg_conv1d_body(in, T, slice, nblk)) return true;
+    if ((in->op == PLOW_DOP_CONV1D_F32 || in->op == PLOW_DOP_CONV_TRANSPOSE1D_F32) && (in->i[6] >> 31)) __trap();
+    return false;
 }
 #endif
 /* Out of line so d_conv1d_f32's 64x64 paths do not share its register allocation. Callers
@@ -6743,6 +6775,7 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
     arena = sp_smem;
     SpConvArgs a;
     if (!sp_conv_args(in, T, transpose, a)) return;
+    if (a.one) { __trap(); return; }
     if (!transpose && ((in->fj[2].u >> 16) & 1u) && a.groups == 1u) {
         if (!sp_arm_on(SPA_ROWS)) { __trap(); return; }
         /* Pinned: the warp arm only (the rows arm's M <= 32 gate and its other k order would make

@@ -16,7 +16,9 @@ use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 /// query view, bit 7 split-image output; LayerNormF32 `i2` bit 2 split-image output; GemvF32Out
 /// `i7` bit 12 row view. Layout 2 adds LayerNormF32 bit 3 (f16 output) and GemvF32Out
 /// bits 13 / 14 (f16 input / output). Layout 3 adds slot-indexed ring attention and tail modes.
-pub const LAYOUT: u32 = 3;
+/// Layout 4 adds single-product bf16 wgmma convs (Conv1dF32 / ConvTranspose1dF32 `i6` bit 31,
+/// above the dilation / output padding); Hopper ring objects export it.
+pub const LAYOUT: u32 = 4;
 pub const DEFAULT_LAYOUT: u32 = 2;
 /// `extern "C" __device__ unsigned` exported by every speech interpreter object.
 pub const OBJECT_SYMBOL: &str = "plow_speech_flag_layout_speech";
@@ -74,7 +76,7 @@ pub fn conv_arms(op: u16, i: &[u32; 8], pads: u32, f: u32) -> u64 {
             let ct = bit(15)
                 && kernel == 2 * stride
                 && groups == 1
-                && i[6] == 0
+                && i[6] & 0x7FFF_FFFF == 0
                 && pre == 0
                 && post == 0
                 && !wf16
@@ -258,6 +260,14 @@ pub fn is_ring_attention(flags: u32) -> bool {
     flags & 0xff08 == 0x108
 }
 
+/// A Conv1dF32 / ConvTranspose1dF32 whose wgmma products are one bf16 product per k16.
+pub fn single_product(op: u16, i: &[u32; 8]) -> bool {
+    matches!(
+        DevOp::from_u16(op),
+        Some(DevOp::Conv1dF32 | DevOp::ConvTranspose1dF32)
+    ) && i[6] >> 31 != 0
+}
+
 pub fn ring_kv(op: u16, i: &[u32; 8]) -> bool {
     match DevOp::from_u16(op) {
         Some(DevOp::AttentionF32) => is_ring_attention(i[6]),
@@ -270,7 +280,9 @@ pub fn ring_kv(op: u16, i: &[u32; 8]) -> bool {
 /// layout 0 left clear.
 pub fn protected(op: u16, j1: u32, i: &[u32; 8]) -> bool {
     match DevOp::from_u16(op) {
-        Some(DevOp::Conv1dF32 | DevOp::ConvTranspose1dF32) => j1 & CONV_FLAGS != 0,
+        Some(DevOp::Conv1dF32 | DevOp::ConvTranspose1dF32) => {
+            j1 & CONV_FLAGS != 0 || single_product(op, i)
+        }
         Some(DevOp::AttentionF32) => i[6] & ATTENTION_I6 != 0 || ring_kv(op, i),
         Some(DevOp::StreamTailF32) => ring_kv(op, i),
         Some(DevOp::LayerNormF32) => i[2] & LAYER_NORM_I2 != 0,
@@ -292,7 +304,9 @@ pub fn required_layout(insts: impl IntoIterator<Item = (u16, u32, [u32; 8])>) ->
         .into_iter()
         .filter_map(|(op, j1, i)| {
             protected(op, j1, &i).then(|| {
-                if ring_kv(op, &i) {
+                if single_product(op, &i) {
+                    4
+                } else if ring_kv(op, &i) {
                     3
                 } else if (op == DevOp::LayerNormF32 as u16 && i[2] & 8 != 0)
                     || (op == DevOp::GemvF32Out as u16 && i[7] & 0x6000 != 0)
@@ -427,6 +441,24 @@ mod tests {
             assert!(check(Some(3), first_protected([i]), Some(3)).is_ok());
         }
         assert_eq!(declare(Some(DevOp::AttentionF32 as u16)), Some(2));
+    }
+
+    #[test]
+    fn single_product_convs_need_layout_four_and_keep_their_geometry() {
+        for op in [DevOp::Conv1dF32, DevOp::ConvTranspose1dF32] {
+            let i = inst(op, 0, 6, 1 << 31);
+            assert_eq!(required_layout([i]), Some(4));
+            assert!(check(Some(4), first_protected([i]), Some(3)).is_err());
+            assert!(check(Some(4), first_protected([i]), Some(4)).is_ok());
+            assert_eq!(required_layout([inst(op, 0, 6, 2)]), None);
+        }
+        // The merged-phase ConvTranspose arm reads the output padding below bit 31.
+        let f = (1 << 15) | (1 << 17) | (1 << 18);
+        let mut i = [1, 64, 128, 128, 8, 4, 0, 1];
+        let base = conv_arms(DevOp::ConvTranspose1dF32 as u16, &i, 0, f);
+        assert_eq!(base, conv_arm::WG_CT);
+        i[6] = 1 << 31;
+        assert_eq!(conv_arms(DevOp::ConvTranspose1dF32 as u16, &i, 0, f), base);
     }
 
     /// Every bit the layout-0 (RC9, 45e1da259) emitters could set stays unprotected. The values

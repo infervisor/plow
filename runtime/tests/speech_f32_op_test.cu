@@ -956,6 +956,8 @@ struct ConvSpec {
     unsigned sk = 0; /* flags bits 24..29 (pinned): fixed split-K parts; t7 = the conv-own scratch */
     bool beta = false; /* flags bit 2 (post snake): SnakeBeta output, alpha [a | r] of 2 * cout */
     bool ragged = false; /* flags bit 3: wgmma tiles may span taps (widths % 4, not % 64) */
+    bool one = false; /* i6 bit 31: single-product bf16 on the wgmma arms */
+    bool round = false; /* x and w rounded to bf16 on the host (the lo halves are zero) */
 };
 /* Pinned split-K scratch: SPC_TICKETS zeroed tickets, then tiles x parts 128x64 partials. */
 static unsigned splitk_scratch_pinned(Case& c, const ConvSpec& s, unsigned out_rows) {
@@ -1029,7 +1031,7 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     }
     /* The bf16 taps arm reads bf16 operands: the golden gets the same rounded values, so it differs
      * only by the sum order. */
-    if (s.wg && !s.wide && !s.f16 && !transpose)
+    if ((s.wg && !s.wide && !s.f16 && !transpose) || s.round)
         for (unsigned id : {x, w})
             for (size_t i = 0; i < c.host[id].size() / 4; i++) {
                 float v;
@@ -1053,7 +1055,7 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.op = transpose ? PLOW_DOP_CONV_TRANSPOSE1D_F32 : PLOW_DOP_CONV1D_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b; c.in.t[4] = a; c.in.t[5] = r; c.in.t[6] = l;
     c.in.i[0] = s.batch; c.in.i[1] = s.in_rows; c.in.i[2] = s.cin; c.in.i[3] = s.cout;
-    c.in.i[4] = s.kernel; c.in.i[5] = s.stride; c.in.i[6] = s.dil_or_opad; c.in.i[7] = s.groups;
+    c.in.i[4] = s.kernel; c.in.i[5] = s.stride; c.in.i[6] = s.dil_or_opad | (s.one ? 1u << 31 : 0u); c.in.i[7] = s.groups;
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
                    (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u) |
@@ -1434,6 +1436,35 @@ static void t_conv_pinned() {
         cu.pin = 1 | 4;
         t_conv_pair("ConvT pinned wgmma s8 1024->512 bn64 vs bn128", ct, cu, true, true, 1e-4);
         t_conv_invariant("ConvT pinned wgmma s8 1024->512 bn128", cu, true);
+        /* Single-product (i6 bit 31) on bf16-exact operands: the split products' lo terms are zero,
+         * so one product per k16 is bit-identical to three; on f32 data it is the bf16 conv. */
+        for (ConvSpec* p : {&a, &b, &ct, &cu}) {
+            const bool tr = p == &ct || p == &cu;
+            ConvSpec r = *p;
+            r.round = true;
+            r.lengths.clear();
+            ConvSpec q = r;
+            q.one = true;
+            char nm[96];
+            snprintf(nm, sizeof(nm), "%s 1p bn%u vs 3p", tr ? "ConvT wgmma s8" : "Conv1dF32 wgmma pw", p->pin & 4 ? 128 : 64);
+            t_conv_pair(nm, r, q, tr, true, 1e-4);
+            ConvSpec f = *p;
+            f.one = true;
+            snprintf(nm, sizeof(nm), "%s 1p bn%u f32 data", tr ? "ConvT wgmma s8" : "Conv1dF32 wgmma pw", p->pin & 4 ? 128 : 64);
+            /* bf16 operands: ~2^-8 relative per product over K = 512 (pointwise) / 2048 (ConvT). */
+            if (tr) t_convt1d(nm, f, 3e-2); else t_conv1d(nm, f, 3e-2);
+            t_conv_invariant(nm, f, tr, 3e-2);
+        }
+        ConvSpec g{3, 200, 768, 768, 1, 1, 1, 4, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+        g.wide = true; g.wg = true; g.pin = 1; g.round = true;
+        ConvSpec h = g;
+        h.one = true;
+        t_conv_pair("Conv1dF32 wgmma grouped 1p vs 3p", g, h, false, true, 1e-4);
+        ConvSpec k{5, 300, 384, 384, 7, 1, 3, 1, 9, 9, 0, 0, 0, false, true, false, true, {}, 0.f, true};
+        k.wide = true; k.wg = true; k.tapmajor = true; k.pin = 1; k.round = true;
+        ConvSpec m = k;
+        m.one = true;
+        t_conv_pair("Conv1dF32 wgmma k7 384 1p vs 3p", k, m, false, true, 1e-4);
     }
     {
         /* Fixed split-K (bits 24..29): the transformer denses at the step's 64 rows (8 tiles of

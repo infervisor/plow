@@ -634,6 +634,10 @@ pub struct Conv1dF32Stage<'a> {
     /// With `dual_alpha` and SnakeBeta in and out, `alpha` = `[a1 | a2]` (each `[a | r]`): the input
     /// SnakeBeta runs in the arm's staging.
     pub bf16_taps: bool,
+    /// `i6` bit 31 (speech flag layout 4): a split-bf16 conv that statically takes only the wgmma
+    /// arm ([`plow_asset::speech_flag_layout::conv_arms`]) runs one bf16 product per k16 (bf16-rounded input
+    /// and weights, f32 accumulate) instead of three; elsewhere it keeps the split products.
+    pub single_bf16: bool,
     /// A `bf16_taps` conv's stream input (flag bit 22): `(state, slot, pos)` of the
     /// [`StreamTailF32Mode::Gather`] it replaces; `in_rows` counts the `(kernel - 1) * dilation`
     /// carried rows, the input holds the other rows per item. A [`StreamTailF32Mode::StoreSrc`]
@@ -2478,6 +2482,20 @@ impl StageProgram {
                 None => stage.slope,
             };
             d.j = [stage.pad_before | (stage.pad_after << 16), flags];
+            // No input activation: the wgmma eligibility of a fused one also depends on its alpha.
+            if stage.single_bf16
+                && !stage.bf16_taps
+                && (flags >> 4) & 15 == 0
+                && stage.dilation_or_output_padding >> 31 == 0
+            {
+                use plow_asset::speech_flag_layout::{conv_arm, conv_arms};
+                let mut i = d.i;
+                i[6] |= 1 << 31;
+                let arms = conv_arms(d.op, &i, d.j[0], d.j[1]);
+                if arms == conv_arm::WG || arms == conv_arm::WG_CT {
+                    d.i = i;
+                }
+            }
         })?;
         if splitk.is_some() {
             self.splitk_last = Some(emitted.done);
@@ -3967,6 +3985,7 @@ mod tests {
             let stage = Conv1dF32Stage {
                 input_split: false,
                 bf16_taps: false,
+                single_bf16: false,
                 stream_in: None,
                 output_split: false,
                 output: TensorRef::Named("y"),
@@ -4123,6 +4142,7 @@ mod tests {
             wgmma_ragged: false,
             input_split: false,
             bf16_taps: false,
+            single_bf16: false,
             stream_in: None,
             output_split: false,
         };
@@ -4450,6 +4470,7 @@ mod tests {
                 wgmma_ragged: false,
                 input_split: false,
                 bf16_taps: false,
+                single_bf16: false,
                 stream_in: None,
                 output_split: false,
             };
@@ -4570,6 +4591,7 @@ mod tests {
                     wgmma_ragged: false,
                     input_split: false,
                     bf16_taps: false,
+                    single_bf16: false,
                     stream_in: None,
                     output_split: false,
                 },
@@ -4629,6 +4651,7 @@ mod tests {
             wgmma_ragged: false,
             input_split: false,
             bf16_taps: false,
+            single_bf16: false,
             stream_in: None,
             output_split: false,
         };

@@ -364,6 +364,7 @@ fn program_for(
             wgmma_ragged: false,
             input_split: false,
             bf16_taps: false,
+            single_bf16: false,
             stream_in: None,
             output_split: false,
         },

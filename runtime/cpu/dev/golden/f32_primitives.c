@@ -1234,7 +1234,7 @@ G_K(g_conv1d_f32) {
     /* flags bit 20: t7 is the split-K scratch of the sm_90a wgmma tile, not a row scale. */
     const float* row_scale = (in->fj[2].u >> 20) & 1u ? NULL : PLOW_CPU_TEN(in, T, 7);
     const uint32_t batch = in->i[0], in_rows = in->i[1], cin = in->i[2], cout = in->i[3];
-    const uint32_t kernel = in->i[4], stride = in->i[5], dilation = in->i[6], groups = in->i[7];
+    const uint32_t kernel = in->i[4], stride = in->i[5], dilation = in->i[6] & 0x7FFFFFFFu, groups = in->i[7];
     const uint32_t pad_before = in->fj[1].u & 0xFFFFu, pad_after = in->fj[1].u >> 16;
     const uint32_t flags = in->fj[2].u, mode = flags & 3u;
     const uint32_t pre = (flags >> 4) & 15u, post = (flags >> 8) & 15u;
@@ -1302,7 +1302,7 @@ G_K(g_conv_transpose1d_f32) {
     const float* residual = PLOW_CPU_TEN(in, T, 5);
     const uint32_t* lengths = PLOW_CPU_TEN(in, T, 6);
     const uint32_t batch = in->i[0], in_rows = in->i[1], cin = in->i[2], cout = in->i[3];
-    const uint32_t kernel = in->i[4], stride = in->i[5], output_padding = in->i[6];
+    const uint32_t kernel = in->i[4], stride = in->i[5], output_padding = in->i[6] & 0x7FFFFFFFu;
     const uint32_t groups = in->i[7];
     const uint32_t crop_before = in->fj[1].u & 0xFFFFu, crop_after = in->fj[1].u >> 16;
     const uint32_t flags = in->fj[2].u;

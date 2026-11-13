@@ -818,6 +818,7 @@ impl<'s> Ops<'s> {
                     wgmma_ragged: false,
                     input_split: c.in_split,
                     bf16_taps: false,
+                    single_bf16: false,
                     stream_in: None,
                     output_split: c.out_split,
                 },

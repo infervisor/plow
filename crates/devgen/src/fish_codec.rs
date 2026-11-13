@@ -1044,6 +1044,7 @@ impl Seq {
                 wgmma_ragged: false,
                 input_split: false,
                 bf16_taps: false,
+                single_bf16: crate::emit_config::active().codec_bf16_1p,
                 stream_in: None,
                 output_split: false,
             },

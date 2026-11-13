@@ -398,6 +398,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_CODEC_CONV_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub codec_conv_bf16: bool,
 
+    /// Codec split-bf16 convs that statically take only the wgmma arm (pointwise, merged-phase
+    /// ConvTranspose, codec-transformer projections) run one bf16 product per k16 (speech flag
+    /// layout 4), the bf16 conv a bf16 peer runs. Changes PCM: a recipe sets it once its audio
+    /// gates pass.
+    #[arg(long, env = "PLOW_EMIT_CODEC_BF16_1P", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub codec_bf16_1p: bool,
+
     /// Wgmma convs (flags bit 17) of at least this many million MACs take their own segment, which
     /// plowrt runs on the conv-only `_speechconv` object (its own registers and ping-pong
     /// warpgroups). Same bits; smaller convs lose to the extra launches.
@@ -2050,6 +2057,7 @@ impl EmitConfig {
             codec_wgmma_ragged: env_bool("PLOW_EMIT_CODEC_WGMMA_RAGGED"),
             codec_dec_in_wgmma: env_bool("PLOW_EMIT_CODEC_DEC_IN_WGMMA"),
             codec_conv_bf16: env_bool("PLOW_EMIT_CODEC_CONV_BF16"),
+            codec_bf16_1p: env_bool("PLOW_EMIT_CODEC_BF16_1P"),
             codec_conv_object: env_u32("PLOW_EMIT_CODEC_CONV_OBJECT"),
             codec_conv_arms: env_str("PLOW_EMIT_CODEC_CONV_ARMS").map(std::path::PathBuf::from),
             codec_conv_classes: env_str("PLOW_EMIT_CODEC_CONV_CLASSES")
