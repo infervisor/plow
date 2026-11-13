@@ -3,10 +3,12 @@
 //! The producer is `nix build .#plowrt-release`: one directory per platform
 //! triple holding the tarball, its `.sha256` (as `sha256sum` writes it) and
 //! `release.json`. This module records those outputs under
-//! `v1/runtime/<version>/<triple>/`, keeps `v1/runtime/index.json` (every
-//! release, every triple: what a models page lists) and `v1/runtime/latest`
-//! (the version string alone: what `install.sh` reads with `sed`), and
-//! optionally publishes `install.sh` itself at the registry root.
+//! `v1/plow-runtime/<version>/<triple>/`, keeps `v1/plow-runtime/index.json`
+//! (every release, every triple: what a models page lists) and
+//! `v1/plow-runtime/latest` (the version string alone: what `install.sh`
+//! reads with `sed`), and optionally publishes `install.sh` itself at the
+//! registry root. Releases up to 0.1.3 are under `v1/runtime/`, no longer
+//! written.
 //!
 //! The same write discipline as `push`: a release's files are create-only,
 //! so a version is never republished with other bytes — a second run of the
@@ -21,8 +23,8 @@ use super::sink::{Cond, Put, Sink};
 use crate::{Result, RuntimeError};
 
 pub const RUNTIME_INDEX_SCHEMA: &str = "plow.dist.runtime.v1";
-pub const RUNTIME_INDEX: &str = "v1/runtime/index.json";
-pub const RUNTIME_LATEST: &str = "v1/runtime/latest";
+pub const RUNTIME_INDEX: &str = "v1/plow-runtime/index.json";
+pub const RUNTIME_LATEST: &str = "v1/plow-runtime/latest";
 pub const INSTALL_SCRIPT: &str = "install.sh";
 
 fn dist(msg: String) -> RuntimeError {
@@ -32,7 +34,7 @@ fn dist(msg: String) -> RuntimeError {
 /// `release.json`, as the flake writes it beside the tarball.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReleaseJson {
-    /// `<semver>+<git12>`.
+    /// `<semver>+<commit>`.
     pub version: String,
     pub semver: String,
     pub commit: String,
@@ -65,7 +67,7 @@ pub struct RuntimeRelease {
     pub triples: BTreeMap<String, RuntimeAsset>,
 }
 
-/// `v1/runtime/index.json`. Newest release first.
+/// `v1/plow-runtime/index.json`. Newest release first.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeIndex {
     pub schema: String,
@@ -162,7 +164,7 @@ impl ReleaseDir {
     }
 
     fn key_dir(&self) -> String {
-        format!("v1/runtime/{}/{}", self.json.version, self.json.triple)
+        format!("v1/plow-runtime/{}/{}", self.json.version, self.json.triple)
     }
 }
 
@@ -551,7 +553,7 @@ mod tests {
         let asset = &index.releases[0].triples["x86_64-unknown-linux-gnu"];
         assert_eq!(
             asset.file,
-            "v1/runtime/0.1.3+abcdef123456/x86_64-unknown-linux-gnu/plowrt-0.1.3+abcdef123456-x86_64-unknown-linux-gnu.tar.gz"
+            "v1/plow-runtime/0.1.3+abcdef123456/x86_64-unknown-linux-gnu/plowrt-0.1.3+abcdef123456-x86_64-unknown-linux-gnu.tar.gz"
         );
         assert!(read(&sink, &asset.file).is_some());
         assert!(index.releases[0].released.is_some());

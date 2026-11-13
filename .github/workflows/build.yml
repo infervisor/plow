@@ -9,9 +9,11 @@ on:
 permissions:
   contents: read
 
+# A run on main ends in a release; cancelling it mid-upload would leave a
+# version half published until the next run adopts it.
 concurrency:
   group: build-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The nix build runs on self-hosted hardware, so it must never be triggered by
@@ -63,6 +65,21 @@ jobs:
         run: nix develop --command python3 scripts/tests/test_recipe_objects_env.py
       - name: Build default package
         run: nix build
+      # The release job below runs only on main. Build and publish the same
+      # artifact here, into a directory, so a change that breaks the release
+      # fails on its pull request.
+      - name: Check the release build publishes
+        run: |
+          bash scripts/ci/next-release.sh --self-test
+          semver="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          out="$(nix build .#plowrt-release --no-link --print-out-paths)"
+          bash scripts/ci/check-release.sh "$semver" "$out"
+          work="$(mktemp -d)"
+          tar -xzf "$out"/*.tar.gz -C "$work" --strip-components=1
+          "$work/plowrt" push-runtime --release "$out" --install-script scripts/install.sh \
+            --to "file://$work/registry"
+          test -s "$work/registry/v1/plow-runtime/latest"
+          rm -rf "$work"
       - name: Test workspace
         run: nix develop --command cargo test --locked --workspace
       # The engine unit tests under exec/{amd,gpu} are feature-gated, so the
@@ -216,3 +233,92 @@ jobs:
           test "$FMT_RESULT" = success
           test "$HOSTED_RESULT" = success
           test "$SELF_HOSTED_RESULT" = success || test "$SELF_HOSTED_RESULT" = skipped
+
+  # A merge to main that changes what plowrt or plowc is built from is a
+  # release: CI picks the next version, bumps it with `nix run .#bump`, builds
+  # every Linux triple from that one commit, tags it and publishes to the
+  # registry (pdist). A merge that touches only docs, recipes, perf data, CI
+  # or an unlinked crate releases nothing (scripts/ci/next-release.sh).
+  # The bump commit is kept by its tag only and never reaches main, so main's
+  # Cargo.toml lags the tags by design.
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 120
+    # The registry credentials are this environment's secrets, so no other job
+    # and no pull request can read them.
+    environment: pdist
+    permissions:
+      contents: write
+    steps:
+      # Full history: the last release's source is compared with this commit.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decide the version
+        id: version
+        run: |
+          git fetch --tags --force --quiet origin
+          next="$(nix develop .#ci --command bash scripts/ci/next-release.sh)"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          if [ -z "$next" ]; then
+            echo "No release: nothing plowrt or plowc is built from changed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # A release names its commit (`<semver>+<rev>`) and a dirty tree is
+      # refused at publish, so the bump is committed before the build.
+      - name: Bump
+        if: steps.version.outputs.next != ''
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          nix run .#bump -- "$NEXT"
+          git add Cargo.toml Cargo.lock
+          if ! git diff --cached --quiet; then
+            git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -m "plow: v$NEXT [skip ci]"
+          fi
+      - name: Build the release
+        if: steps.version.outputs.next != ''
+        id: build
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          mapfile -t dirs < <(nix build .#plowrt-release .#plowrt-release-static \
+            .#plowrt-release-aarch64 --no-link --print-out-paths)
+          test "${#dirs[@]}" -eq 3
+          nix develop .#ci --command bash scripts/ci/check-release.sh "$NEXT" "${dirs[@]}"
+          echo "dirs=${dirs[*]}" >> "$GITHUB_OUTPUT"
+      # Reserve the version before anything is uploaded: if the upload fails,
+      # the next run takes the next number instead of reusing this one for
+      # other bytes.
+      - name: Tag
+        if: steps.version.outputs.next != ''
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          git tag "v$NEXT"
+          git push origin "refs/tags/v$NEXT"
+      - name: Publish to the registry
+        if: steps.version.outputs.next != ''
+        env:
+          DIRS: ${{ steps.build.outputs.dirs }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
+          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+        run: |
+          read -r -a dirs <<<"$DIRS"
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          # The publisher is the x86_64 binary this run just built and checked.
+          args=()
+          for d in "${dirs[@]}"; do
+            args+=(--release "$d")
+            for t in "$d"/*-x86_64-unknown-linux-gnu.tar.gz; do
+              if [ -f "$t" ]; then tar -xzf "$t" -C "$work" --strip-components=1; fi
+            done
+          done
+          test -x "$work/plowrt"
+          "$work/plowrt" push-runtime "${args[@]}" --install-script scripts/install.sh

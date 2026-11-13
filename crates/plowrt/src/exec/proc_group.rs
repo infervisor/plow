@@ -374,13 +374,14 @@ impl Link {
         msg.msg_iovlen = 1;
         if let Some(fd) = fd {
             msg.msg_control = control.as_mut_ptr().cast();
+            // `msg_controllen` and `cmsg_len` are size_t on glibc, socklen_t on musl.
             msg.msg_controllen =
-                unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+                unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as _;
             unsafe {
                 let h = libc::CMSG_FIRSTHDR(&msg);
                 (*h).cmsg_level = libc::SOL_SOCKET;
                 (*h).cmsg_type = libc::SCM_RIGHTS;
-                (*h).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+                (*h).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
                 std::ptr::write_unaligned(libc::CMSG_DATA(h).cast::<RawFd>(), fd.as_raw_fd());
             }
         }
@@ -409,7 +410,7 @@ impl Link {
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
         let n = loop {
-            msg.msg_controllen = std::mem::size_of_val(&control);
+            msg.msg_controllen = std::mem::size_of_val(&control) as _;
             msg.msg_flags = 0;
             let n = unsafe { libc::recvmsg(self.s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
             if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
@@ -426,12 +427,13 @@ impl Link {
             let mut h = libc::CMSG_FIRSTHDR(&msg);
             while !h.is_null() {
                 let header = libc::CMSG_LEN(0) as usize;
-                if (*h).cmsg_len < header {
+                let len = (*h).cmsg_len as usize;
+                if len < header {
                     invalid = true;
                     break;
                 }
                 if (*h).cmsg_level == libc::SOL_SOCKET && (*h).cmsg_type == libc::SCM_RIGHTS {
-                    let bytes = (*h).cmsg_len - header;
+                    let bytes = len - header;
                     invalid |= bytes % std::mem::size_of::<RawFd>() != 0;
                     for i in 0..bytes / std::mem::size_of::<RawFd>() {
                         let fd =

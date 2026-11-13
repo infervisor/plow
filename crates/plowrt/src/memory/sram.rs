@@ -95,7 +95,7 @@ impl PseudoLock {
             .map_err(|e| RuntimeError::Device(format!("{DEVICE}: {e}")))?;
         let mut caps = Caps::default();
         // SAFETY: IOC_CAPS writes exactly one `Caps`.
-        if unsafe { libc::ioctl(file.as_raw_fd(), IOC_CAPS, &mut caps) } != 0 {
+        if unsafe { libc::ioctl(file.as_raw_fd(), IOC_CAPS as _, &mut caps) } != 0 {
             return Err(RuntimeError::Device(format!(
                 "{DEVICE} CAPS: {} (driver older than ABI v3?)",
                 std::io::Error::last_os_error()
@@ -138,7 +138,7 @@ impl PseudoLock {
             level,
             ..Default::default()
         };
-        if unsafe { libc::ioctl(self.file.as_raw_fd(), IOC_LOCK, &mut req) } != 0 {
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), IOC_LOCK as _, &mut req) } != 0 {
             return Err(RuntimeError::Device(format!(
                 "pseudo-lock L{level} cpu {cpu} {len} B: {}",
                 std::io::Error::last_os_error()
@@ -148,7 +148,7 @@ impl PseudoLock {
             id: req.id,
             ..Default::default()
         };
-        if unsafe { libc::ioctl(self.file.as_raw_fd(), IOC_MEASURE, &mut m) } != 0 {
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), IOC_MEASURE as _, &mut m) } != 0 {
             return Err(RuntimeError::Device(format!(
                 "pseudo-lock measure {}: {}",
                 req.id,
@@ -162,7 +162,7 @@ impl PseudoLock {
     /// L3-locked data keeps it locked) until the process exits.
     pub fn set_worker(&self, cpu: u32, on: bool) -> Result<()> {
         let req: [u32; 2] = [cpu, on as u32];
-        if unsafe { libc::ioctl(self.file.as_raw_fd(), IOC_WORKER, &req) } != 0 {
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), IOC_WORKER as _, &req) } != 0 {
             return Err(RuntimeError::Device(format!(
                 "pseudo-lock worker CLOS cpu {cpu}: {}",
                 std::io::Error::last_os_error()

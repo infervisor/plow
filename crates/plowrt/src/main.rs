@@ -31,7 +31,12 @@ use plowrt::serve::{app, AppState};
 #[command(
     name = "plowrt",
     about = "plow host runtime",
-    version,
+    // A release build names its commit (`<semver>+<rev>`, set by the flake),
+    // so a host can say which published build it runs.
+    version = match option_env!("PLOW_RELEASE_VERSION") {
+        Some(v) => v,
+        None => env!("CARGO_PKG_VERSION"),
+    },
     disable_version_flag = true
 )]
 struct Cli {
@@ -909,7 +914,7 @@ enum Cmd {
     },
 
     /// Publish released `plowrt` binaries (`nix build .#plowrt-release`
-    /// outputs) into a registry: `v1/runtime/<version>/<triple>/`, the
+    /// outputs) into a registry: `v1/plow-runtime/<version>/<triple>/`, the
     /// runtime index, the `latest` pointer, and optionally `install.sh`.
     ///
     /// Each `--release` directory holds the tarball, its `.sha256` and
